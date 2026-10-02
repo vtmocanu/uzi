@@ -17,7 +17,7 @@
 // hasUsableCredential accepts either harness.)
 
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
-import { api, type SecretMeta } from "../lib/api";
+import { api, type SecretMeta, type TestSecretResult } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { isVaultLocked } from "../lib/api";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
@@ -214,6 +214,15 @@ function replacementBadges(s: SecretMeta) {
   );
 }
 
+function testOutcome(result: TestSecretResult): string {
+  if (result.status === "ok") return result.display ? `Connection works: ${result.display}.` : "Connection works.";
+  if (result.status === "rejected") return "Credential rejected. Replace its value and try again.";
+  if (result.status === "permission_denied") return "Credential lacks permission for this check.";
+  if (result.reason === "vault_locked") return "Test inconclusive: unlock your vault and try again.";
+  if (result.reason === "superseded") return "Test inconclusive: credential changed during the check. Test it again.";
+  return "Test inconclusive. Try again later.";
+}
+
 // CredentialRow is one stored Codex credential: its label, the kind, the stateless
 // status badge, the default badge, and the per-row actions. Rename and set-default
 // are inline; value rotation opens the shared form below (a value is pasted, never
@@ -221,6 +230,7 @@ function replacementBadges(s: SecretMeta) {
 function CredentialRow({
   secret,
   busy,
+  testRevision,
   soleCredential,
   disabledLeft,
   checkingUsage,
@@ -231,6 +241,7 @@ function CredentialRow({
 }: {
   secret: SecretMeta;
   busy: boolean;
+  testRevision: number;
   // The only ENABLED credential in the shared slot (PRD #1732): the server lets the
   // default go only when no other enabled credential remains.
   soleCredential: boolean;
@@ -246,7 +257,28 @@ function CredentialRow({
   const [renaming, setRenaming] = useState(false);
   const [label, setLabel] = useState(secret.label);
   const [rowBusy, setRowBusy] = useState(false);
-  const disabled = busy || rowBusy;
+  const [testing, setTesting] = useState(false);
+  const [verdict, setVerdict] = useState("");
+  const testRun = useRef(0);
+  useEffect(() => {
+    testRun.current++;
+    setTesting(false);
+    setVerdict("");
+  }, [secret.updated_at, testRevision]);
+  const disabled = busy || rowBusy || testing;
+  const testConnection = async () => {
+    const runId = ++testRun.current;
+    setTesting(true);
+    setVerdict("");
+    try {
+      const result = await api.testSecret(secret.kind as CodexKind, secret.id);
+      if (runId === testRun.current) setVerdict(testOutcome(result));
+    } catch {
+      if (runId === testRun.current) setVerdict("Test could not complete. Try again.");
+    } finally {
+      if (runId === testRun.current) setTesting(false);
+    }
+  };
   const blockedByD6 = secret.is_default && !soleCredential;
   const d6HintId = `codex-d6-${secret.id}`;
   const kindApi = apiForKind(secret.kind);
@@ -369,6 +401,9 @@ function CredentialRow({
                 Make default
               </Button>
             )}
+            <Button variant="ghost" size="sm" disabled={disabled} onClick={() => void testConnection()} aria-label={`Test ${sanitizeLabel(secret.label)}`}>
+              Test
+            </Button>
             {/* PRD #1732: reversible suspension, beside Rename / Make default / Delete. */}
             <Button
               id={disableButtonId(secret.id)}
@@ -417,6 +452,9 @@ function CredentialRow({
             )}
           </div>
         )}
+      </div>
+      <div role="status" aria-live="polite" className="mt-1 text-xs text-muted">
+        {testing ? "Testing connection…" : verdict}
       </div>
       <div className="mt-1 text-xs text-faint">
         updated {new Date(secret.updated_at).toLocaleString()}
@@ -640,6 +678,7 @@ export function CodexCredentials({
 }) {
   const [rotateFor, setRotateFor] = useState("");
   const [rotateValue, setRotateValue] = useState("");
+  const [testRevisions, setTestRevisions] = useState<Record<string, number>>({});
   const [rotateBusy, setRotateBusy] = useState(false);
   // Same in-memory, value-free wrong-shape guard as the add form, for a codex_auth
   // rotation (issue #1174 item 2 / AC 2). Inline, never the shared banner.
@@ -790,6 +829,7 @@ export function CodexCredentials({
     setRotateBusy(true);
     try {
       await apiForKind(row.kind).patch(rotateFor, { token: rotateValue });
+      setTestRevisions((previous) => ({ ...previous, [rotateFor]: (previous[rotateFor] ?? 0) + 1 }));
       setRotateValue("");
       setRotateFor("");
       onNotice("Credential value replaced and re-sealed.");
@@ -837,6 +877,7 @@ export function CodexCredentials({
               key={s.id}
               secret={s}
               busy={anyBusy || shelfBusy}
+              testRevision={testRevisions[s.id] ?? 0}
               soleCredential={active.length === 1}
               disabledLeft={disabled.length}
               checkingUsage={checking.has(s.id)}

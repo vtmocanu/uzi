@@ -25,6 +25,21 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("testSecret request", () => {
+  it("posts to the selected credential without a provider body and returns the flat verdict", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(200, { status: "inconclusive", reason: "vault_locked" }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "" });
+
+    await expect(api.testSecret("openai_api_key", "sec-2")).resolves.toEqual({ status: "inconclusive", reason: "vault_locked" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/me/secrets/openai_api_key/sec-2/test");
+    expect(init.method).toBe("POST");
+    expect(init.body).toBeUndefined();
+  });
+});
+
 describe("request() global 401 handling", () => {
   it("runs against the real API client (not mock mode)", () => {
     expect(MOCK_MODE).toBe(false);

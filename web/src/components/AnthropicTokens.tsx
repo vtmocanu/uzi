@@ -7,7 +7,7 @@
 // and not an edit-in-place field.
 
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
-import { api, type AutoStatus, type SecretMeta } from "../lib/api";
+import { api, type AutoStatus, type SecretMeta, type TestSecretResult } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { isVaultLocked } from "../lib/api";
 import { autoChipFor } from "../lib/rateLimits";
@@ -110,12 +110,22 @@ function deleteWarning(
   return `Delete “${label}”? ${subject} ${verb} back to your default token.${poolClause}`;
 }
 
+function testOutcome(result: TestSecretResult): string {
+  if (result.status === "ok") return result.display ? `Connection works: ${result.display}.` : "Connection works.";
+  if (result.status === "rejected") return "Credential rejected. Replace its value and try again.";
+  if (result.status === "permission_denied") return "Credential lacks permission for this check.";
+  if (result.reason === "vault_locked") return "Test inconclusive: unlock your vault and try again.";
+  if (result.reason === "superseded") return "Test inconclusive: credential changed during the check. Test it again.";
+  return "Test inconclusive. Try again later.";
+}
+
 // TokenRow is one stored credential: its label, the default badge, when it was
 // last updated, and the per-row actions. Rename and set-default are inline; the
 // value rotation opens the shared form below (a value is pasted, never edited).
 function TokenRow({
   secret,
   busy,
+  testRevision,
   soleToken,
   disabledLeft,
   judgeBound,
@@ -131,6 +141,7 @@ function TokenRow({
 }: {
   secret: SecretMeta;
   busy: boolean;
+  testRevision: number;
   // The only ENABLED token (PRD #1732): the server lets the default go only when no
   // other enabled token remains, whatever sits on the Disabled shelf.
   soleToken: boolean;
@@ -163,6 +174,14 @@ function TokenRow({
   const [renaming, setRenaming] = useState(false);
   const [label, setLabel] = useState(secret.label);
   const [rowBusy, setRowBusy] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [verdict, setVerdict] = useState("");
+  const testRun = useRef(0);
+  useEffect(() => {
+    testRun.current++;
+    setTesting(false);
+    setVerdict("");
+  }, [secret.updated_at, testRevision]);
   // The Delete click awaits a worker read before confirming; a row that unmounted
   // meanwhile (the user left the page) must not confirm, delete or report.
   const mounted = useRef(true);
@@ -172,7 +191,20 @@ function TokenRow({
       mounted.current = false;
     };
   }, []);
-  const disabled = busy || rowBusy;
+  const disabled = busy || rowBusy || testing;
+  const testConnection = async () => {
+    const runId = ++testRun.current;
+    setTesting(true);
+    setVerdict("");
+    try {
+      const result = await api.testSecret("anthropic_token", secret.id);
+      if (mounted.current && runId === testRun.current) setVerdict(testOutcome(result));
+    } catch {
+      if (mounted.current && runId === testRun.current) setVerdict("Test could not complete. Try again.");
+    } finally {
+      if (mounted.current && runId === testRun.current) setTesting(false);
+    }
+  };
   const blockedByD6 = secret.is_default && !soleToken;
   const d6HintId = `d6-${secret.id}`;
   const autoHintId = `auto-${secret.id}`;
@@ -266,6 +298,9 @@ function TokenRow({
                 Make default
               </Button>
             )}
+            <Button variant="ghost" size="sm" disabled={disabled} onClick={() => void testConnection()} aria-label={`Test ${sanitizeLabel(secret.label)}`}>
+              Test
+            </Button>
             {/* PRD #1732: reversible suspension, beside Rename / Make default / Delete. */}
             <Button
               id={disableButtonId(secret.id)}
@@ -354,6 +389,9 @@ function TokenRow({
             )}
           </div>
         )}
+      </div>
+      <div role="status" aria-live="polite" className="mt-1 text-xs text-muted">
+        {testing ? "Testing connection…" : verdict}
       </div>
       {/* Auto-selection pool (PRD #111 M2, D2). The toggle and the live status sit
           together on purpose: a token without a gauge cannot be ranked, while a
@@ -492,6 +530,7 @@ export function AnthropicTokens({
   const [addBusy, setAddBusy] = useState(false);
   const [rotateFor, setRotateFor] = useState("");
   const [rotateValue, setRotateValue] = useState("");
+  const [testRevisions, setTestRevisions] = useState<Record<string, number>>({});
   // Per-token live auto-selection eligibility (PRD #111 M2), fetched here for the
   // same reason the workers are: the consequence of the toggle belongs beside the
   // toggle, and no caller has this data. Re-fetched whenever `secrets` changes, so
@@ -637,7 +676,7 @@ export function AnthropicTokens({
       await api.createAnthropicToken(token, first ? "default" : label.trim(), false);
       setToken("");
       setLabel("");
-      onNotice("Token saved. It is sealed with your login password and validated on the first agent run.");
+      onNotice("Token saved and encrypted. Use Test to check it now.");
       await reload();
     } catch (err) {
       onError(errText(err, "Failed to save token"));
@@ -653,6 +692,7 @@ export function AnthropicTokens({
     setAddBusy(true);
     try {
       await api.patchAnthropicToken(rotateFor, { token: rotateValue });
+      setTestRevisions((previous) => ({ ...previous, [rotateFor]: (previous[rotateFor] ?? 0) + 1 }));
       setRotateValue("");
       setRotateFor("");
       onNotice("Token value replaced. The new value is used on the next agent run.");
@@ -675,7 +715,7 @@ export function AnthropicTokens({
           <code className="rounded bg-raised px-1 py-0.5 text-fg">claude setup-token</code> or a
           Console API key. Give each one a name so you can point individual workers at it. The{" "}
           <strong className="text-fg">default</strong> is what every unbound worker spends.{" "}
-          <DocLink slug={DOC_ANTHROPIC_TOKEN}>How to obtain a token</DocLink>.
+          <DocLink slug={DOC_ANTHROPIC_TOKEN}>How to obtain a token</DocLink>. Testing an Anthropic token may send a Messages request that uses about one token.
         </p>
       </div>
 
@@ -705,6 +745,7 @@ export function AnthropicTokens({
               key={s.id}
               secret={s}
               busy={anyBusy || shelfBusy}
+              testRevision={testRevisions[s.id] ?? 0}
               soleToken={active.length === 1}
               disabledLeft={disabled.length}
               judgeBound={judgeSecretId === s.id}

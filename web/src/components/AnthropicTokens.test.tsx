@@ -15,6 +15,7 @@ vi.mock("../lib/api", async (importActual) => {
     ...actual,
     api: {
       createAnthropicToken: vi.fn(),
+      testSecret: vi.fn(),
       patchAnthropicToken: vi.fn(),
       deleteAnthropicTokenById: vi.fn(),
       // The card fetches workers itself so a delete can NAME the affected ones
@@ -93,6 +94,50 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   vi.restoreAllMocks();
+});
+
+describe("Anthropic Test action", () => {
+  it("tests only on click, announces pending and the result, and clears on rotation", async () => {
+    let resolve!: (value: { status: "ok" }) => void;
+    mockApi.testSecret.mockReturnValue(new Promise((done) => { resolve = done; }));
+    mockApi.patchAnthropicToken.mockResolvedValue({ secret: secret() });
+    renderList([secret()]);
+    const row = screen.getByTestId("token-sec-1");
+    expect(mockApi.testSecret).not.toHaveBeenCalled();
+    expect(screen.getByText(/may send a Messages request that uses about one token/i)).toBeTruthy();
+    fireEvent.click(within(row).getByRole("button", { name: "Test default" }));
+    expect(mockApi.testSecret).toHaveBeenCalledWith("anthropic_token", "sec-1");
+    expect(within(row).getByRole("status").textContent).toContain("Testing connection");
+    expect((within(row).getByRole("button", { name: "Test default" }) as HTMLButtonElement).disabled).toBe(true);
+    await act(async () => { resolve({ status: "ok" }); });
+    await waitFor(() => expect(within(row).getByRole("status").textContent).toBe("Connection works."));
+
+    fireEvent.change(screen.getByLabelText("Token to replace"), { target: { value: "sec-1" } });
+    fireEvent.change(screen.getByPlaceholderText("Paste the replacement token"), { target: { value: "replacement" } });
+    fireEvent.click(screen.getByRole("button", { name: "Replace value" }));
+    await waitFor(() => expect(mockApi.patchAnthropicToken).toHaveBeenCalledWith("sec-1", { token: "replacement" }));
+    await waitFor(() => expect(within(row).getByRole("status").textContent).toBe(""));
+    expect(mockApi.testSecret).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not test automatically when saving a token", async () => {
+    mockApi.createAnthropicToken.mockResolvedValue({ secret: secret() });
+    renderList([]);
+    fireEvent.change(screen.getByPlaceholderText("Paste your Anthropic token"), { target: { value: "new-token" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save token" }));
+    await waitFor(() => expect(mockApi.createAnthropicToken).toHaveBeenCalled());
+    expect(mockApi.testSecret).not.toHaveBeenCalled();
+  });
+
+  it("announces a locked vault without showing provider content and removes the action when disabled", async () => {
+    mockApi.testSecret.mockResolvedValue({ status: "inconclusive", reason: "vault_locked" });
+    const view = renderList([secret()]);
+    const row = screen.getByTestId("token-sec-1");
+    fireEvent.click(within(row).getByRole("button", { name: "Test default" }));
+    await waitFor(() => expect(within(row).getByRole("status").textContent).toMatch(/unlock your vault/i));
+    view.rerender(<MemoryRouter><AnthropicTokens secrets={[secret({ enabled: false })]} loading={false} busy={false} reload={noop} onError={() => {}} onNotice={() => {}} judgeSecretId={null} sidebarTokenIds={[]} onToggleSidebarToken={async () => {}} /></MemoryRouter>);
+    expect(screen.queryByRole("button", { name: "Test default" })).toBeNull();
+  });
 });
 
 describe("AnthropicTokens — always-visible anthropic-token guide link (PRD #57 M2)", () => {

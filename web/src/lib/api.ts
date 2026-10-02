@@ -114,6 +114,7 @@ import type {
   SchedulePreviewInput,
   SecretDependents,
   SecretMeta,
+  TestSecretResult,
   SelfUsage,
   SessionResponse,
   SettingsResponse,
@@ -578,6 +579,8 @@ const realApi = {
     return request<{ user: User }>("PUT", "/me/judge", body);
   },
   listSecrets: () => request<{ secrets: SecretMeta[] }>("GET", "/me/secrets"),
+  testSecret: (kind: "anthropic_token" | "codex_auth" | "openai_api_key", id: string) =>
+    request<TestSecretResult>("POST", `/me/secrets/${kind}/${id}/test`),
   // PRD #104 M2 token CRUD. create/rename/set-default/rotate/delete are all
   // cookie-only (D8) — the SPA is the only client that can reach them.
   createAnthropicToken: (token: string, label: string, isDefault: boolean) =>
@@ -2037,7 +2040,8 @@ const realApi = {
     request<{ ensured: string[] }>("POST", `/repos/${repoId}/labels/ensure`, { labels }),
 };
 
-// The one client the app talks to. `mockApi` implements the identical surface
-// (typechecked against realApi's shape here), so pages never know which mode
-// they run in.
-export const api: typeof realApi = MOCK_MODE ? mockApi : realApi;
+// The one client the app talks to. The mock build keeps Test local and inconclusive
+// because it has no provider connection. Other mock routes come from mockApi.
+export const api: typeof realApi = MOCK_MODE
+  ? { ...mockApi, testSecret: async (): Promise<TestSecretResult> => ({ status: "inconclusive", reason: "generic" }) }
+  : realApi;

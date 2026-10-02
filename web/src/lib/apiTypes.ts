@@ -80,6 +80,13 @@ export interface SecretDependents {
   enabled_siblings: SecretDependentPage<{ id: string; label: string }>;
 }
 
+// TestSecretResult is the flat, sanitized response from the explicit credential Test action.
+export interface TestSecretResult {
+  status: "ok" | "rejected" | "permission_denied" | "inconclusive";
+  reason?: "vault_locked" | "superseded" | "generic";
+  display?: string;
+}
+
 // SecretMeta is the metadata-only view of ONE stored per-user secret. The secret
 // value is never returned by the API, so it never appears here.
 //

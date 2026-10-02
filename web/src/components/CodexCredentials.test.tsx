@@ -21,6 +21,7 @@ vi.mock("../lib/api", async (importActual) => {
     api: {
       // ONLY the six Codex wrappers — this card uses no workers/rate-limit/pool APIs.
       createCodexAuth: vi.fn(),
+      testSecret: vi.fn(),
       patchCodexAuth: vi.fn(),
       deleteCodexAuthById: vi.fn(),
       createOpenAIApiKey: vi.fn(),
@@ -77,6 +78,37 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   vi.restoreAllMocks();
+});
+
+describe("Codex/OpenAI Test action", () => {
+  it("routes both kinds, announces sanitized outcomes, and never tests on save", async () => {
+    mockApi.testSecret.mockResolvedValueOnce({ status: "ok", display: "models endpoint accessible" })
+      .mockResolvedValueOnce({ status: "permission_denied" });
+    renderCard([secret(), secret({ id: "sec-2", kind: "openai_api_key", label: "console-key", is_default: false })]);
+    expect(mockApi.testSecret).not.toHaveBeenCalled();
+    const login = screen.getByTestId("codex-sec-1");
+    const key = screen.getByTestId("codex-sec-2");
+    fireEvent.click(within(key).getByRole("button", { name: "Test console-key" }));
+    await waitFor(() => expect(within(key).getByRole("status").textContent).toContain("models endpoint accessible"));
+    fireEvent.click(within(login).getByRole("button", { name: "Test default" }));
+    await waitFor(() => expect(within(login).getByRole("status").textContent).toMatch(/lacks permission/i));
+    expect(mockApi.testSecret).toHaveBeenNthCalledWith(1, "openai_api_key", "sec-2");
+    expect(mockApi.testSecret).toHaveBeenNthCalledWith(2, "codex_auth", "sec-1");
+  });
+
+  it("clears the verdict when a credential is replaced", async () => {
+    mockApi.testSecret.mockResolvedValue({ status: "rejected" });
+    mockApi.patchOpenAIApiKey.mockResolvedValue({ secret: secret() });
+    renderCard([secret(), secret({ id: "sec-2", kind: "openai_api_key", label: "console-key", is_default: false })]);
+    const row = screen.getByTestId("codex-sec-2");
+    fireEvent.click(within(row).getByRole("button", { name: "Test console-key" }));
+    await waitFor(() => expect(within(row).getByRole("status").textContent).toMatch(/rejected/i));
+    fireEvent.change(screen.getByLabelText("Credential to replace"), { target: { value: "sec-2" } });
+    fireEvent.change(screen.getByPlaceholderText("Paste the replacement credential"), { target: { value: "replacement" } });
+    fireEvent.click(screen.getByRole("button", { name: "Replace value" }));
+    await waitFor(() => expect(within(row).getByRole("status").textContent).toBe(""));
+    expect(mockApi.testSecret).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("CodexCredentials", () => {
