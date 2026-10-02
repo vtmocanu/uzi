@@ -38,10 +38,9 @@ import (
 //
 // The three /requests routes require the cookie session AND the browser-binding cookie that
 // authorize set, so a /connect link opened in another browser can neither read nor decide the
-// request (consent fixation, PRD #1910 D3). Every handler in this file sets Cache-Control:
-// no-store before anything else, so every response it writes (redirect, error page, JSON, error
-// JSON) carries it. A 401, 403 or 429 written by the middleware in front of a route (the rate
-// limiter, the session check, the CSRF check) is not from this file and carries no such header.
+// request (consent fixation, PRD #1910 D3). oauthNoStore wraps the entire OAuth route group, so
+// every response carries Cache-Control: no-store, including middleware refusals (the rate limiter,
+// the session check, the CSRF check) and router errors.
 
 const (
 	// oauthBindCookieName / oauthBindCookiePath: the browser-binding cookie, HttpOnly, SameSite=Lax
