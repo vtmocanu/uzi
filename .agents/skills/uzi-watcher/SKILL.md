@@ -47,8 +47,15 @@ Plan steering is done with the buddy bound by `session-peers` (`buddy: @NAME`);
 - **Conditional approve**: deltas the implementation needs → `revise`, since
   `approve` starts implementing at once. Only for non-blocking advice: approve, then
   send it with `uzi run follow-up`; it may arrive after work starts.
-- **Reply budget**: a co-steer takes several rounds, and a Codex buddy's fourth
-  consecutive reply is held. When co-steering starts, run `peers.py budget allow buddy
+- **Revise cap**: a run accepts `PLAN_MAX_REVISIONS` revises in its lifetime (default
+  3, `docs/configuration.md`); the next is refused with `plan revision limit reached`.
+  Put every blocking item in one revise, never one per round. When blocking items
+  remain and only one revise is left, take both positions to the user before sending
+  it: past the cap only approve (plus `follow-up`, non-blocking only) or reject remain.
+- **Reply budget**: a co-steer takes several rounds. When it starts, check
+  `peers.py buddy`: a Codex buddy bound by a Claude session normally shows a reply
+  total ("replies left"), which covers the session. Only when it reports "no buddy
+  reply total recorded", or the buddy is not Codex, run `peers.py budget allow buddy
   --replies 10` once (session-peers *Longer loops*), not a reset per round.
 - **Issues you file**: buddy-review the final draft; label `reviewed` per the root `CLAUDE.md` rule.
 
