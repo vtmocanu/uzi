@@ -555,7 +555,8 @@ describe("launchCodexRoot: trusted construction contract", () => {
         const fake = newFake();
         await assert.rejects(
           launchCodexRoot(baseSpec({ ownedDataRoot: root }), baseDeps(fake, { makeRunnerTrees: undefined })),
-          /runner-owned tree creation failed/,
+          // EEXIST specifically: a reuse-permitting create would fail later (or not at all), never here.
+          /runner-owned tree creation failed[\s\S]*File exists/,
         );
         assert.equal(await fs.readFile(marker, "utf8"), "existing root must survive");
         assert.equal(spawnCalls.length, 0, "the provider supervisor was never launched");
