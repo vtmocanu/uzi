@@ -8997,7 +8997,7 @@ describe("CodexExecutor: mid-turn vault_locked refresh deferral (issue #1789)", 
     assert.equal(rig.epochs[0]!.transport.turnStartCount, 1, "the re-driven turn never started");
   });
 
-  it("C6: while a plan gate is open (a revise turn), the latch changes nothing: the turn fails as today", async () => {
+  it("C6: a lock seen while a plan gate is open (a revise turn) is not latched: the turn fails as today", async () => {
     const responder: Responder = (c) => {
       if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
       if (c.method === "turn/start") {
@@ -9116,6 +9116,24 @@ describe("CodexExecutor: mid-turn vault_locked refresh deferral (issue #1789)", 
       deferral: "vault_locked",
     });
     assert.equal(calls, 0);
+  });
+
+  it("R5b: the run-lane wiring: after a mid-turn deferral the runner's finalize boundary reconcile defers with no credential call", async () => {
+    const rig = makeMultiEpochRig([refreshThenFail()]);
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+    rig.client.refreshCodex = async (runId, req) => {
+      rig.client.refreshCalls.push({ runId, operation_id: req.operation_id, observed_generation: req.observed_generation });
+      throw vaultLocked409("refresh");
+    };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const err = await withTimeout(exec.run(makeCtx().ctx), 5000, "mid-turn deferral").then(() => undefined, (e: unknown) => e);
+    assert.ok(err instanceof CodexCredentialDeferredError, `got ${String(err)}`);
+    assert.ok(exec.safety, "safety survives for the runner's sinks");
+    const boundary = await exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 200 }, async () => {}).then(() => undefined, (e: unknown) => e);
+    assert.ok(boundary instanceof Error, "the latched reconcile blocks the boundary");
+    assert.equal((boundary as { deferral?: unknown }).deferral, "vault_locked");
+    assert.equal(rig.client.refreshCalls.length, 1, "no refresh after the mid-turn deferral");
+    assert.equal(rig.client.releaseCalls.length, 1, "no release after the mid-turn deferral");
   });
 });
 
