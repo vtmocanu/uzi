@@ -21,7 +21,9 @@ func TestWallSweepAfterEmptyHeartbeatLiveDB(t *testing.T) {
 		{name: "stale-under-cap", stale: true, want: "paused"},
 		{name: "stale-over-cap", stale: true, overCap: true, want: "paused"},
 		{name: "live-within-grace", want: "running"},
+		{name: "live-over-cap-within-grace", overCap: true, want: "running"},
 		{name: "live-after-grace", graceExpired: true, want: "paused"},
+		{name: "live-over-cap-after-grace", overCap: true, graceExpired: true, want: "paused"},
 		{name: "extended", extension: 4 * 3600, want: "queued"},
 		{name: "postattempt-completion-route", postattempt: true, want: "running"},
 		{name: "interactive-exempt", interactive: true, want: "queued"},
@@ -46,7 +48,7 @@ func TestWallSweepAfterEmptyHeartbeatLiveDB(t *testing.T) {
 			runID := uuid.New()
 			requeues := 0
 			if tc.overCap {
-				requeues = 3
+				requeues = p.RunMaxRequeues
 			}
 			attempts := 0
 			if tc.postattempt {
@@ -77,8 +79,13 @@ func TestWallSweepAfterEmptyHeartbeatLiveDB(t *testing.T) {
 				t.Fatalf("valid empty heartbeat: %v", err)
 			}
 			if tc.want == "paused" || tc.want == "running" {
-				if got := mustRun(t, env, runID); got.Status != "running" {
+				got := mustRun(t, env, runID)
+				if got.Status != "running" {
 					t.Fatalf("heartbeat changed wall-eligible run to %q", got.Status)
+				}
+				if tc.overCap && !tc.stale && (got.FinishedAt.Valid || got.FailOrigin.Valid || got.FailureReason.Valid) {
+					t.Fatalf("heartbeat terminalized live over-cap run: finished_at=%v fail_origin=%v failure_reason=%v",
+						got.FinishedAt, got.FailOrigin, got.FailureReason)
 				}
 			}
 			if tc.stale {
@@ -93,6 +100,15 @@ func TestWallSweepAfterEmptyHeartbeatLiveDB(t *testing.T) {
 			}
 			if tc.want == "paused" && (!got.HoldReason.Valid || got.HoldReason.String != "budget_exhausted") {
 				t.Fatalf("parked hold = %q, want budget_exhausted", got.HoldReason.String)
+			}
+			if tc.overCap && !tc.stale {
+				if got.FinishedAt.Valid || got.FailOrigin.Valid || got.FailureReason.Valid {
+					t.Fatalf("sweep terminalized live over-cap run: finished_at=%v fail_origin=%v failure_reason=%v",
+						got.FinishedAt, got.FailOrigin, got.FailureReason)
+				}
+				if got.ClaimReleasedAt.Valid != tc.graceExpired {
+					t.Fatalf("claim_released_at valid = %v, want %v", got.ClaimReleasedAt.Valid, tc.graceExpired)
+				}
 			}
 			if tc.postattempt && !got.CompletionBudgetExhaustedAt.Valid {
 				t.Fatal("postattempt live run did not receive completion budget steer")
