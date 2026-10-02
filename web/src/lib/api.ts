@@ -2043,5 +2043,5 @@ const realApi = {
 // The one client the app talks to. The mock build keeps Test local and inconclusive
 // because it has no provider connection. Other mock routes come from mockApi.
 export const api: typeof realApi = MOCK_MODE
-  ? { ...mockApi, testSecret: async (): Promise<TestSecretResult> => ({ status: "inconclusive", reason: "generic" }) }
+  ? { ...mockApi, testSecret: async () => ({ status: "inconclusive" as const, reason: "generic" as const }) }
   : realApi;
