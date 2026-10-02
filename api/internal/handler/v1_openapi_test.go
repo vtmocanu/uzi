@@ -211,8 +211,9 @@ func TestV1OpenAPIRouteParity(t *testing.T) {
 		t.Fatalf("GET /api/v1/whoami missing: router=%v spec=%v", routerOps["GET /api/v1/whoami"], specOps["GET /api/v1/whoami"].OperationID != "")
 	}
 
-	// Every operation is authenticated by the bearer scheme and documents the 401 that
-	// RequireV1Caller answers for every failure (it is mounted on the whole subtree).
+	// Every operation is authenticated by the bearer scheme and documents what RequireV1Caller
+	// (mounted on the whole subtree) answers: the 401 for every credential refusal, and the 503
+	// auth_unavailable when a token-store lookup fails (issue #1992).
 	if _, ok := spec.Comps.SecuritySchemes["bearerAuth"]; !ok {
 		t.Error("components.securitySchemes.bearerAuth is missing")
 	}

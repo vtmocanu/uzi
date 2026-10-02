@@ -9,10 +9,12 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/producttoken"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -40,6 +42,15 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 	readOnly := v1MintProductToken(t, e.h.q, owner, product, []string{producttoken.ScopeJobsRead}, nil)
 	runOnly := v1MintProductToken(t, e.h.q, owner, product, []string{producttoken.ScopeJobsRun}, nil)
 	unknown := v1UnknownProductToken(t)
+
+	// Issue #1992: a production router over a CLOSED pool, so RequireV1Caller's token lookup
+	// fails with a store error (not pgx.ErrNoRows) and answers the auth 503 auth_unavailable on
+	// every operation. A closed pool of its own, never DDL on the shared database other packages'
+	// LiveDB tests use concurrently.
+	downH, downPool := v1LiveDBMax(t, 0)
+	downLim := func() *mw.Limiter { return mw.NewLimiter(1_000_000, time.Hour, nil) }
+	down := downH.Routes(downLim(), downLim(), downLim(), downLim(), downLim(), downLim(), downLim(), downLim(), downLim(), downLim(), downLim())
+	downPool.Close()
 
 	// A job with a result, messages and findings for the read cases, and one to cancel.
 	seeded := e.create(pTok.token, `{"type":"research","title":"seeded","prompt":"p","requested_by_label":"someone",`+
@@ -79,6 +90,8 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 		// binary: the 200 body is the file's raw bytes (GET /files/{id}); its headers are checked
 		// instead of a JSON schema.
 		binary bool
+		// down: run through the closed-pool router (the auth 503 auth_unavailable cases).
+		down bool
 	}
 	id := seeded.ID
 	cases := []tc{
@@ -193,6 +206,16 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 			pre: func() { e.h.wsvc.SetJobFiles(nil) }},
 		{name: "download 503", method: "GET", specPath: "/files/{id}", url: "/api/v1/files/" + uuid.NewString(), token: uzc, want: 503},
 		{name: "job create 503 files_unavailable", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research","prompt":"p","input_file_ids":["` + uuid.NewString() + `"]}`, want: 503},
+
+		// The auth 503 (issue #1992): the token lookup fails, on every operation that has no
+		// other reachable 503.
+		{name: "whoami 503 auth_unavailable", method: "GET", specPath: "/whoami", url: "/api/v1/whoami", token: uzc, want: 503, down: true},
+		{name: "list 503 auth_unavailable", method: "GET", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, want: 503, down: true},
+		{name: "get 503 auth_unavailable", method: "GET", specPath: "/jobs/{id}", url: "/api/v1/jobs/" + id, token: uzc, want: 503, down: true},
+		{name: "result 503 auth_unavailable", method: "GET", specPath: "/jobs/{id}/result", url: "/api/v1/jobs/" + id + "/result", token: uzc, want: 503, down: true},
+		{name: "messages 503 auth_unavailable", method: "GET", specPath: "/jobs/{id}/messages", url: "/api/v1/jobs/" + id + "/messages", token: uzc, want: 503, down: true},
+		{name: "cancel 503 auth_unavailable", method: "POST", specPath: "/jobs/{id}/cancel", url: "/api/v1/jobs/" + id + "/cancel", token: pTok.token, want: 503, down: true},
+		{name: "files 503 auth_unavailable", method: "GET", specPath: "/jobs/{id}/files", url: "/api/v1/jobs/" + id + "/files", token: pTok.token, want: 503, down: true},
 	}
 
 	produced := map[string]bool{} // "METHOD /path STATUS"
@@ -206,6 +229,9 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 					t.Fatalf("priming request: %d %s", r.status, r.body)
 				}
 				router = e.tight
+			}
+			if c.down {
+				router = down
 			}
 			if c.pre != nil {
 				c.pre()
