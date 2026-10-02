@@ -16242,8 +16242,8 @@ type SupersedeRunByWorkerParams struct {
 // race is NOT mis-classified as 'agent_failure' (and is not judged — status 'cancelled',
 // Gate 0). Distinct from CancelRunByWorker in that it STAMPS stop_kind='branch_moved' +
 // a static stop_reason in the same statement (branch_moved has no pre-stamp, unlike a
-// CreateStopVerdictInput cancel). Terminal cleanup + guard mirror CancelRunByWorker, so a
-// report onto an already-terminal run is a 0-row no-op.
+// CreateStopVerdictInput cancel). Terminal cleanup mirrors CancelRunByWorker. Its extra
+// hold guard keeps a late failed report from cancelling a wall or completion hold.
 func (q *Queries) SupersedeRunByWorker(ctx context.Context, arg SupersedeRunByWorkerParams) (int64, error) {
 	result, err := q.db.Exec(ctx, supersedeRunByWorker, arg.ID, arg.WorkerID)
 	if err != nil {
