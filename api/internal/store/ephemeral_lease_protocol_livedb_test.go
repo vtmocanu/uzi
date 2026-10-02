@@ -50,6 +50,12 @@ func TestEphemeralLeasePlacementProtocolMirrorLiveDB(t *testing.T) {
 			if got := listedUnplaceable(fx, 1000, iv); got[run] == tc.placed {
 				t.Fatalf("gap trigger: listed %v; run %s provisioned-for = %v, want %v", got, run, got[run], !tc.placed)
 			}
+			// With no persistent worker, the leased worker alone decides the saturation trigger's
+			// "a capable worker exists" arm: one that cannot claim the run must not make it read as
+			// capable-but-full (that run is the gap trigger's), and one that can has a free slot.
+			if got := listedSaturation(fx, 1000, iv); got[run] {
+				t.Fatalf("saturation trigger without a persistent worker: listed %v; run %s must not be listed", got, run)
+			}
 			want := int64(0)
 			if tc.placed {
 				want = 1
