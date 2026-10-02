@@ -396,7 +396,7 @@ function decodeSize(v: PrDescriptionSize): PrDescriptionSize {
 }
 
 const diagramKey = /^[a-z0-9_]{1,16}$/;
-const diagramLabel = /^[\p{L}\p{N}.,_\/+'()-]+(?: [\p{L}\p{N}.,_\/+'()-]+)*$/u;
+const diagramLabel = /^[\p{L}\p{N}.,_/+'()-]+(?: [\p{L}\p{N}.,_/+'()-]+)*$/u;
 
 function isDiagramLabel(v: unknown, cap: number, optional: boolean): v is string {
   return typeof v === "string" &&
