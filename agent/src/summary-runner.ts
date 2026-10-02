@@ -579,10 +579,11 @@ function parseDeliverySummary(text: string): DeliverySummary | null {
 // Clipping must not erase text that the api would reject before its D4 allowlist.
 // On over-cap originals, allow only characters that cannot introduce markdown, entities,
 // markup, references or mentions, and reject the whole closing-keyword family even when
-// its issue reference is beyond the clip. Markup/entity/markdown joins all contain a
-// character outside this set; the api still checks every label we stage.
-const DIAGRAM_CLIP_UNSAFE_SYNTAX = /[^\p{L}\p{N}\p{So} .,_/+'()-]/u;
-const DIAGRAM_CLOSING_STEM = /\b(?:clos|fix|resolv|implement)/i;
+// its issue reference is beyond the clip. Markup/entity/markdown joins and the
+// punctuation in known token families contain a character outside this set; the api
+// still checks every label we stage.
+const DIAGRAM_CLIP_UNSAFE_SYNTAX = /[^\p{L}\p{N}\p{So} .,/+'()]/u;
+const DIAGRAM_CLOSING_STEM = /(?:clos|fix|resolv|implement)/i;
 
 function unsafeDiagramClip(raw: string, maxBytes: number): boolean {
   return UTF8.encode(raw).length > maxBytes &&

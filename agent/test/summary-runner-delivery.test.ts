@@ -293,6 +293,9 @@ describe("SummaryRunner.generateDeliverySummary (PRD #1798 M5)", () => {
       { field: "node", value: "A".repeat(60) + " Fix&#101;s GH-7" },
       { field: "edge", value: "A".repeat(60) + " Fix**es** #7" },
       { field: "title", value: "A".repeat(80) + " Resolves GH-7" },
+      { field: "node", value: "A".repeat(60) + "_Fixes GH-7" },
+      { field: "edge", value: "A".repeat(60) + " glpat-" + "A".repeat(20) },
+      { field: "title", value: "A".repeat(80) + " ghp_" + "A".repeat(20) },
     ] as const;
     for (const { field, value } of cases) {
       const raw = field === "title"
