@@ -285,6 +285,26 @@ describe("SummaryRunner.generateDeliverySummary (PRD #1798 M5)", () => {
     assert.equal(Buffer.byteLength(out.diagram!.edges[0]!.label!), 59);
   });
 
+  it("drops a diagram when clipping would hide directive or mention syntax in any label", async () => {
+    const cases = [
+      { field: "node", value: "A".repeat(60) + " Fixes #1" },
+      { field: "edge", value: "A".repeat(60) + " @user" },
+      { field: "title", value: "A".repeat(80) + " Fix<b></b>es #7" },
+      { field: "node", value: "A".repeat(60) + " Fix&#101;s GH-7" },
+      { field: "edge", value: "A".repeat(60) + " Fix**es** #7" },
+      { field: "title", value: "A".repeat(80) + " Resolves GH-7" },
+    ] as const;
+    for (const { field, value } of cases) {
+      const raw = field === "title"
+        ? { ...diagram, title: value }
+        : field === "node"
+          ? { ...diagram, nodes: [{ ...diagram.nodes[0]!, label: value }, diagram.nodes[1]!] }
+          : { ...diagram, edges: [{ ...diagram.edges[0]!, label: value }, diagram.edges[1]!] };
+      const r = await runner(claudeQueryFn(JSON.stringify({ ...good, diagram: raw })));
+      assert.deepEqual(await r.generateDeliverySummary(await deliveryInput()), good, field + ": " + value);
+    }
+  });
+
   it("keeps hostile diff instructions inside the untrusted frame, not in a mocked editor's diagram", async () => {
     const seen: Seen = { calls: 0 };
     const ctx = await context();

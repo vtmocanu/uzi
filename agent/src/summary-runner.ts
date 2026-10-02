@@ -576,6 +576,19 @@ function parseDeliverySummary(text: string): DeliverySummary | null {
   };
 }
 
+// Clipping must not erase text that the api would reject before its D4 allowlist.
+// On over-cap originals, allow only characters that cannot introduce markdown, entities,
+// markup, references or mentions, and reject the whole closing-keyword family even when
+// its issue reference is beyond the clip. Markup/entity/markdown joins all contain a
+// character outside this set; the api still checks every label we stage.
+const DIAGRAM_CLIP_UNSAFE_SYNTAX = /[^\p{L}\p{N}\p{So} .,_/+'()-]/u;
+const DIAGRAM_CLOSING_STEM = /\b(?:clos|fix|resolv|implement)/i;
+
+function unsafeDiagramClip(raw: string, maxBytes: number): boolean {
+  return UTF8.encode(raw).length > maxBytes &&
+    (DIAGRAM_CLIP_UNSAFE_SYNTAX.test(raw) || DIAGRAM_CLOSING_STEM.test(raw));
+}
+
 /** Validate the graph shape before stage; the api remains the authority for label sanitization. */
 export function parseDeliveryDiagram(raw: unknown): PrDescriptionDiagram | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
@@ -583,8 +596,9 @@ export function parseDeliveryDiagram(raw: unknown): PrDescriptionDiagram | null 
   if (d.kind !== "flow" && d.kind !== "sequence") return null;
   if (!Array.isArray(d.nodes) || !Array.isArray(d.edges)) return null;
   if (d.nodes.length < (d.kind === "flow" ? 3 : 2) || d.nodes.length > 12 || d.edges.length < 2 || d.edges.length > 20) return null;
-  const label = (v: unknown): string | null => typeof v === "string" && v.trim() ? clipBytes(v.trim(), 60) : null;
-  if (d.title !== undefined && typeof d.title !== "string") return null;
+  const label = (v: unknown): string | null =>
+    typeof v === "string" && v.trim() && !unsafeDiagramClip(v, 60) ? clipBytes(v.trim(), 60) : null;
+  if (d.title !== undefined && (typeof d.title !== "string" || unsafeDiagramClip(d.title, 80))) return null;
   const title = d.title === undefined ? undefined : clipBytes(d.title.trim(), 80);
   const nodes: PrDescriptionDiagram["nodes"] = [];
   const keys = new Set<string>();
@@ -602,7 +616,7 @@ export function parseDeliveryDiagram(raw: unknown): PrDescriptionDiagram | null 
     if (!rawEdge || typeof rawEdge !== "object" || Array.isArray(rawEdge)) return null;
     const e = rawEdge as Record<string, unknown>;
     if (typeof e.from !== "string" || typeof e.to !== "string" || !keys.has(e.from) || !keys.has(e.to) || (d.kind === "flow" && e.from === e.to)) return null;
-    if (e.label !== undefined && typeof e.label !== "string") return null;
+    if (e.label !== undefined && (typeof e.label !== "string" || unsafeDiagramClip(e.label, 60))) return null;
     edges.push({ from: e.from, to: e.to, ...(e.label !== undefined ? { label: clipBytes(e.label, 60) } : {}) });
   }
   return { kind: d.kind, ...(title !== undefined ? { title } : {}), nodes, edges };
