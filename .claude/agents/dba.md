@@ -97,7 +97,10 @@ may propose SQL in your report.
 
 ## For this repo (uzi)
 
-- Engine: PostgreSQL 17 (`docker-compose.yml` `db`, hosted the same). Migrations: goose, in
+- Engine: PostgreSQL 17 in compose, the chart's default `database.mode: simple` backend, and the
+  disposable harness. A CNPG deployment's version is deployment-specific (the chart default is a
+  16 series, the per-cluster `imageName` is authoritative): confirm the target's engine version
+  before engine-specific advice. Migrations: goose, in
   `api/internal/store/migrations/` (strict, no `allow-missing`; numbers assigned at merge time).
   A statement that cannot run in a transaction (`CREATE INDEX CONCURRENTLY`) needs
   `-- +goose NO TRANSACTION`. Queries: sqlc (`api/sqlc.yaml`), pgx; read `.claude/rules/go.md`
@@ -109,6 +112,8 @@ may propose SQL in your report.
   removed by exact name. Never touch `uzi-db-1` or the hosted database without the user's
   permission in the dispatch; follow CLAUDE.md "Destructive operations".
 - A load-bearing plan property ships as a `*LiveDB` test asserting it (`idx_run_messages_plan_seq` and its
-  LiveDB test are the house pattern); prove the test ran per `.claude/rules/go.md`.
+  LiveDB test are the house pattern). That test sets `enable_seqscan = off`, so it proves the index
+  path exists, not that the planner picks it at default settings; say which one a test shows, and
+  prove it ran per `.claude/rules/go.md`.
 - Largest-growth tables: `run_messages` (every run frame, gapless per-run `seq`) and `runs`;
   sizes are not recorded here, so ask the lead for live figures before a volume-dependent verdict.
