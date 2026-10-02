@@ -515,7 +515,7 @@ changelog_guard() {
     if bash "$HERE/changelog-union.sh" --collapse "$gd/base.collapsed" > /dev/null 2>&1 \
       && ! cmp -s "$gd/base" "$gd/base.collapsed"; then
       if ! moved=$({ diff -U0 "$gd/base.collapsed" "$gd/head.raw" || [ "$?" -eq 1 ]; } \
-        | awk '/^--- |^\+\+\+ / {next} /^-/ {l = substr($0, 2); if (l !~ /^[ \t]*$/) print "-" l}'); then
+        | awk '/^@@/ {inh = 1; next} !inh {next} /^-/ {l = substr($0, 2); if (l !~ /^[ \t]*$/) print "-" l}'); then
         rm -rf "$gd"; echo "cannot diff CHANGELOG.md against the collapsed base" >&2; exit 3
       fi
       if [ -z "$moved" ]; then

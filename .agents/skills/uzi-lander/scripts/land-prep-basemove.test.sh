@@ -32,7 +32,9 @@
 #   R. main's [Unreleased] repeats `### Added` with `### Fixed` between the copies: the
 #      collapse MOVES the later copy's bullet up under the first, which the guard accepts
 #      as a move (no line removed relative to main's own --collapse);
-#   R2. ...but a real deletion beside that move is still refused (exit 9).
+#   R2. ...but a real deletion beside that move is still refused (exit 9);
+#   R3. ...including a deleted line that starts with `-- `, whose diff line `--- ...` must not
+#      be mistaken for a file header.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -409,5 +411,17 @@ commit_push br2 'branch r2'
 run br2 223 --no-push --gate none
 [ "$rc" -eq 9 ] || fail "R2: a deletion beside a collapse move returned rc=$rc, want 9: $(cat "$WORK/out.223")"
 grep -qF -- '- **added one**' "$WORK/out.223" || fail "R2: the removed bullet was not printed: $(cat "$WORK/out.223")"
+
+# R3. main gains a `-- preserved note` line in the first Added section; the branch deletes it
+#     beside the same collapse move. Its diff line reads `--- preserved note`.
+git -C "$SEED" switch -q main
+awk '{print} $0=="- **added one**"{print "-- preserved note"}' "$SEED/CHANGELOG.md" > "$SEED/CHANGELOG.md.tmp"; mv "$SEED/CHANGELOG.md.tmp" "$SEED/CHANGELOG.md"
+git -C "$SEED" commit -qam 'note line'; git -C "$SEED" push -q origin main
+mk_branch br3; cl_fixed "$SEED/CHANGELOG.md" '- **branch r3**'
+grep -vxF -- '-- preserved note' "$SEED/CHANGELOG.md" > "$SEED/CHANGELOG.md.tmp"; mv "$SEED/CHANGELOG.md.tmp" "$SEED/CHANGELOG.md"
+commit_push br3 'branch r3'
+run br3 224 --no-push --gate none
+[ "$rc" -eq 9 ] || fail "R3: deleting a '-- ' line beside a collapse move returned rc=$rc, want 9: $(cat "$WORK/out.224")"
+grep -qF -- 'preserved note' "$WORK/out.224" || fail "R3: the removed line was not printed: $(cat "$WORK/out.224")"
 
 echo "PASS land-prep base move: disjoint tolerated without re-gate, overlap/conflict refused, CHANGELOG union auto-resolve, heading collapse and guard (incl. a cross-section move), blank-separated and sparse union"
