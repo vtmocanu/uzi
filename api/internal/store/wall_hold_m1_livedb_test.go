@@ -36,12 +36,38 @@ func TestWallHoldRejectsLateFailuresLiveDB(t *testing.T) {
 				if err != nil || n != 0 {
 					t.Fatalf("SetRunFailedPlanRejected = (%d,%v), want (0,nil)", n, err)
 				}
+				n, err = fx.q.SupersedeRunByWorker(fx.ctx, store.SupersedeRunByWorkerParams{
+					ID: id, WorkerID: pgtype.UUID{Bytes: worker, Valid: true},
+				})
+				if err != nil || n != 0 {
+					t.Fatalf("SupersedeRunByWorker = (%d,%v), want (0,nil)", n, err)
+				}
 				if got := fx.status(id); got != "paused" {
 					t.Fatalf("status = %s", got)
 				}
 			})
 		}
 	}
+	t.Run("ordinary-owner-pause", func(t *testing.T) {
+		id := fx.run(wpRun{worker: &worker, status: "paused"})
+		n, err := fx.q.SetRunFailed(fx.ctx, store.SetRunFailedParams{
+			ID: id, WorkerID: pgtype.UUID{Bytes: worker, Valid: true},
+			FailureReason: pgtype.Text{String: "failed", Valid: true},
+			FailOrigin:    pgtype.Text{String: "agent_failure", Valid: true},
+		})
+		if err != nil || n != 1 {
+			t.Fatalf("SetRunFailed ordinary pause = (%d,%v), want (1,nil)", n, err)
+		}
+		id = fx.run(wpRun{worker: &worker, status: "paused"})
+		n, err = fx.q.SetRunFailedPlanRejected(fx.ctx, store.SetRunFailedPlanRejectedParams{
+			ID: id, WorkerID: pgtype.UUID{Bytes: worker, Valid: true},
+			FailureReason: pgtype.Text{String: "rejected", Valid: true},
+			FailOrigin:    pgtype.Text{String: "plan_rejected", Valid: true},
+		})
+		if err != nil || n != 1 {
+			t.Fatalf("SetRunFailedPlanRejected ordinary pause = (%d,%v), want (1,nil)", n, err)
+		}
+	})
 }
 
 func TestMissingSnapshotDefersToWallSweepLiveDB(t *testing.T) {

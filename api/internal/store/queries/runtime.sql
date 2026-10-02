@@ -3476,7 +3476,7 @@ UPDATE runs SET
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (status = 'paused' AND hold_reason IN ('budget_exhausted', 'completion_blocked'))
+  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
   -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
   -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
   -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
@@ -3527,7 +3527,7 @@ WITH failed AS (
         updated_at         = now()
     WHERE runs.id = @id AND worker_id = @worker_id
       AND status NOT IN ('completed', 'failed', 'cancelled')
-      AND NOT (status = 'paused' AND hold_reason IN ('budget_exhausted', 'completion_blocked'))
+      AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
       -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
       -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
       -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
@@ -3736,7 +3736,8 @@ UPDATE runs SET
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
   AND claim_released_at IS NULL
-  AND status NOT IN ('completed', 'failed', 'cancelled');
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE));
 
 -- name: FailRunAutoStop :execrows
 -- Server-side auto-stop (PRD #108 M5) for a run whose message writes are in a
