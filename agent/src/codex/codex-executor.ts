@@ -3639,6 +3639,9 @@ export class CodexExecutor implements Executor {
       // instructions alone are not enough on a turn that bypasses implementPrompt.
       prompt = [prompt, "", delegatesLine(Object.keys(agents)), ...(repoSourced ? [REPO_SUBAGENT_UNTRUSTED_APPEND] : [])].join("\n");
     }
+    if (ctx.config?.override_subagent_model) {
+      for (const agent of Object.values(agents)) agent.model = undefined;
+    }
     const systemPrompt = buildLeadSystemPrompt(leadBody, { kind: ctx.kind, harness: "codex", repoSourced }).append;
     const leadSkills = (ctx.skills ?? []).map((s) => s.name);
     const effort = codexEffort(ctx);

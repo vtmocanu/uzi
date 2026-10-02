@@ -79,6 +79,7 @@ import type {
 import { SupervisedChildExitTimeoutError } from "../src/codex/launcher.js";
 import { CommandDeadlineError } from "../src/codex/broker.js";
 import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "../src/codex/config.js";
+import { renderCodexRun } from "../src/codex/render.js";
 import { MAX_LEAD_FINAL_MESSAGE_LEN, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING } from "../src/plan-missing.js";
 
 /** Issue #1718: every implement prompt now ends with the roster line; makeCtx has no agents. */
@@ -9503,7 +9504,7 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
     const admitted = await probeSpawns(rig.transport, "th-1", roles);
     const result = await withTimeout(run, 5000, "pre-approved selection run");
-    return { rig, emitted, admitted, result };
+    return { rig, ctx, emitted, admitted, result };
   };
   /** Gated run: plan epoch, approval with `selection`, then the implement epoch probes `roles`. */
   const gated = async (selection: unknown, extra: Partial<RunContext>, roles: string[]) => {
@@ -9519,6 +9520,97 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     const result = await withTimeout(run, 5000, "gated selection run");
     return { rig, emitted, admitted, result };
   };
+
+  // The pin differs from both the curated request model and the custom worker default.
+  const pinnedOwn = tmpl("pinned-own", "own body", { model: "gpt-5.6-sol" });
+  const pinnedRepo = tmpl("pinned-repo", "repo body", { model: "gpt-5.6-sol" });
+  const childModel = (t: FakeTransport): unknown => {
+    const starts = t.requests.filter((r) => r.method === "thread/start");
+    assert.equal(starts.length, 2, "root and selected child started");
+    return rec(starts[1]!.params).model;
+  };
+  const renderedModels = (ctx: RunContext, source?: "own" | "repo") => {
+    const rig = makeRig();
+    const request = makeExecutor(rig, bindingOf(SUBSCRIPTION))["buildRunRequest"](
+      ctx, source === undefined ? "plan" : "implement", "p", undefined,
+      new AbortController().signal,
+      source === undefined ? undefined : { source, exclusions: [] },
+    );
+    return renderCodexRun(request);
+  };
+
+  for (const source of ["own", "repo"] as const) {
+    for (const override of [false, true]) {
+      it(`implement/${source}: ${override ? "override" : "pin"} selects the child thread model`, async () => {
+        const { rig, admitted, ctx } = await preApproved({
+          agents: [ownAgents[0]!, pinnedOwn],
+          repoAgents: source === "repo" ? [pinnedRepo] : [],
+          approvedSelection: { source, exclusions: [] },
+          config: { default_model: "gpt-6-astra", override_subagent_model: override },
+        }, [source === "own" ? "pinned-own" : "pinned-repo"]);
+        assert.deepEqual(Object.values(admitted), [true]);
+        assert.equal(rec(rig.transport.requests.find((r) => r.method === "thread/start")?.params).model, "gpt-6-astra");
+        const expected = override ? "gpt-6-astra" : "gpt-5.6-sol";
+        assert.equal(childModel(rig.transport), expected);
+        const rendered = renderedModels(ctx, source);
+        assert.equal(rendered.lead.model, "gpt-6-astra");
+        assert.deepEqual([...rendered.perRoleModels.values()].map((role) => role.model), [expected]);
+      });
+    }
+  }
+
+  for (const override of [false, true]) {
+    it(`custom worker default: ${override ? "override" : "pin"} selects the child thread model`, async () => {
+      const { rig, admitted, ctx } = await preApproved({
+        agents: [ownAgents[0]!, pinnedOwn],
+        config: { default_model: "gpt-7-custom-preview", override_subagent_model: override },
+      }, ["pinned-own"]);
+      assert.deepEqual(admitted, { "pinned-own": true });
+      assert.equal(rec(rig.transport.requests.find((r) => r.method === "thread/start")?.params).model, "gpt-7-custom-preview");
+      const expected = override ? "gpt-7-custom-preview" : "gpt-5.6-sol";
+      assert.equal(childModel(rig.transport), expected);
+      const rendered = renderedModels(ctx, "own");
+      assert.equal(rendered.lead.model, "gpt-7-custom-preview");
+      assert.deepEqual([...rendered.perRoleModels.values()].map((role) => role.model), [expected]);
+    });
+  }
+
+  it("plan/own: the override replaces a pinned child model", async () => {
+    for (const override of [false, true]) {
+      const rig = makeRig({ responder: spawnResponder("th-plan", false) });
+      const { ctx } = makeCtx({
+        planApproved: false, approvedPlan: undefined,
+        agents: [ownAgents[0]!, pinnedOwn],
+        config: { default_model: "gpt-6-astra", override_subagent_model: override },
+      });
+      const run = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "plan model run");
+      const admitted = await probeSpawns(rig.transport, "th-plan", ["pinned-own"]);
+      await run;
+      assert.deepEqual(admitted, { "pinned-own": true });
+      assert.equal(rec(rig.transport.requests.find((r) => r.method === "thread/start")?.params).model, "gpt-6-astra");
+      const expected = override ? "gpt-6-astra" : "gpt-5.6-sol";
+      assert.equal(childModel(rig.transport), expected);
+      const rendered = renderedModels(ctx);
+      assert.equal(rendered.lead.model, "gpt-6-astra");
+      assert.deepEqual([...rendered.perRoleModels.values()].map((role) => role.model), [expected]);
+    }
+  });
+
+  it("override admits a noncurated opus role at the request model without a role model diagnostic", async () => {
+    const rig = makeRig({ responder: spawnResponder("th-1", false) });
+    const { ctx } = makeCtx({
+      agents: [ownAgents[0]!, tmpl("opus", "opus body", { model: "opus" })],
+      config: { default_model: "gpt-6-astra", override_subagent_model: true },
+    });
+    const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    const admitted = await probeSpawns(rig.transport, "th-1", ["opus"]);
+    await withTimeout(run, 5000, "opus override run");
+    assert.deepEqual(admitted, { opus: true });
+    assert.equal(childModel(rig.transport), "gpt-6-astra");
+    const rendered = renderedModels(ctx, "own");
+    assert.equal(rendered.perRoleModels.get("opus")?.model, "gpt-6-astra");
+    assert.ok(!rendered.diagnostics.some((d) => d.kind === "unknown_model" && d.role === "opus"));
+  });
 
   it("REGRESSION: a pre-approved run with a repo roster and no selection delegates to the repo agents, not the owner templates", async () => {
     const { admitted, result, emitted } = await preApproved({ repoAgents: [repoReviewer] }, ["repo-reviewer", "coder"]);
