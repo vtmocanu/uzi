@@ -71,7 +71,8 @@ If the preferred folder is present, it is final, even when it is empty, holds
 only invalid files, or is rejected as unsafe (see below): uzi does not then look
 at the other folder. The detected roster is shown with its source folder at the
 plan gate, in the run view, and in the feed lines. When the API is older than
-the worker and cannot record the folder, the UI shows `.claude/agents`.
+the worker and cannot record the folder, the plan-gate card and the run view
+show `.claude/agents`; the feed lines still name the real folder.
 
 ### `.codex/agents/*.toml` files
 
@@ -82,9 +83,10 @@ Each TOML file becomes one subagent:
   the agent's prompt. The `name` and `description` rules match the Markdown
   agents.
 - **No tools, no model:** a TOML agent declares neither, so it runs with the
-  run's default tools and model. `model`, `model_reasoning_effort`,
+  run's full default tool set, which can include `Bash`, and the run's model.
+  `model`, `model_reasoning_effort`,
   `nickname_candidates`, `config_file`, `includes`, and any other key are ignored.
-- **Skipped, not run:** a file that declares `features`, `skills`,
+- **Skipped, not run:** an otherwise valid file that declares `features`, `skills`,
   `sandbox_mode`, or `tools` (with any value) is skipped with a "declares a Codex
   restriction uzi cannot honour yet" note, rather than running without the
   restriction its author asked for.
