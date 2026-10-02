@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Admin Health no longer expects a controller when chart hosting is disabled ([#1982](https://github.com/vtmocanu/uzi/issues/1982)).**
+  The chart emits HOSTED_WORKER_VERSION only when workers.enabled is true, so an installation with no hosted workers does not show a false controller-report Danger banner after startup. External worker upgrade targets are unaffected.
+
 - **The standalone worker setup command now supports hardened startup ([#1987](https://github.com/vtmocanu/uzi/issues/1987)).**
   The documented build uses the repository root as its context, and the run command grants only the five capabilities required by the entrypoint while retaining no-new-privileges. The join token is delivered through a file instead of the worker's environment.
 

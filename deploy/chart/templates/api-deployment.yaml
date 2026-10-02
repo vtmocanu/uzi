@@ -143,12 +143,15 @@ spec:
                   key: {{ $fetcherToken.hashKey | quote }}
                   optional: true
             {{- end }}
+            {{- if .Values.workers.enabled }}
             # The api compares hosted workers' reported version against this pinned tag
             # for the upgrade badge (PRD #422), so an intentionally-pinned worker is not
             # flagged `outdated` when appVersion has moved ahead. workers.image.tag is a
-            # concrete pinned value after M1, so this is always non-empty in a normal deploy.
+            # concrete pinned value after M1. Emit it only when hosting is enabled:
+            # a non-empty pin also tells health checks to expect controller reports.
             - name: HOSTED_WORKER_VERSION
               value: {{ .Values.workers.image.tag | quote }}
+            {{- end }}
             # PRD #837 M4 disk-pressure threshold. The api derives a hosted worker's
             # `disk_pressure` boolean by comparing each reported volume's used/total
             # against this fraction in (0,1] (default 0.90); the controller then

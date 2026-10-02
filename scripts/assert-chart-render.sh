@@ -1042,6 +1042,41 @@ awk '
 ' "$CHART_DIR/Chart.yaml" > "$STRIPPED/Chart.yaml"
 
 DEFAULT_OFF="$WORK/default-off.yaml"
+# Issue #1982: the hosted-worker pin also tells healthsvc to expect a controller.
+# Render only the API Deployment so an unrelated object's env cannot satisfy the
+# check. Every render must succeed and contain a Deployment, including the negative
+# case: missing/broken output must never count as proof the pin was omitted.
+for hosting in default false true; do
+  HOSTED_RENDER="$WORK/hosted-$hosting.yaml"
+  set -- --set api.tls.enabled=true --set workers.image.tag=0.0.0-regression
+  if [ "$hosting" != default ]; then
+    set -- "$@" --set "workers.enabled=$hosting"
+  fi
+  if ! helm template uzi "$STRIPPED" --show-only templates/api-deployment.yaml \
+       "$@" > "$HOSTED_RENDER" 2> "$WORK/err"; then
+    echo "BROKEN: helm template of the API with workers.enabled=$hosting failed:" >&2
+    cat "$WORK/err" >&2
+    exit 2
+  fi
+  awk -v hosting="$hosting" '
+    /^kind: Deployment$/ { deployment++ }
+    /- name: HOSTED_WORKER_VERSION$/ { pins++; want_value = 1; next }
+    want_value && /^[[:space:]]*value:/ { value = $2; want_value = 0 }
+    END {
+      if (deployment != 1) {
+        print "BROKEN: expected exactly one API Deployment"; exit 2
+      }
+      if (hosting != "true" && pins != 0) {
+        print "FAIL: HOSTED_WORKER_VERSION must be absent when hosting is disabled"; exit 1
+      }
+      if (hosting == "true" && (pins != 1 || value != "\"0.0.0-regression\"")) {
+        print "FAIL: enabled hosting must emit exactly one HOSTED_WORKER_VERSION with the pinned tag"; exit 1
+      }
+    }
+  ' "$HOSTED_RENDER" || exit $?
+done
+echo "OK: HOSTED_WORKER_VERSION is absent by default and with hosting disabled, and carries the pinned tag with hosting enabled"
+
 if ! helm template uzi "$STRIPPED" \
      --set workers.enabled=true --set api.tls.enabled=true > "$DEFAULT_OFF" 2> "$WORK/err"; then
   echo "BROKEN: helm template of the chart defaults failed:" >&2
