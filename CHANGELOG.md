@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Codex commands resolve the worker's GNU toolchain before BusyBox ([#2122](https://github.com/vtmocanu/uzi/issues/2122)).**
+  A Codex run's command PATH now puts `/opt/uzi-toolchain/bin` first, so `stat`, `timeout` and the other coreutils are the GNU ones, matching Claude commands; the Codex launch PATH is deliberately unchanged (#2129).
+
 - **Codex runs now honour “Apply model also to agents” ([#2115](https://github.com/vtmocanu/uzi/issues/2115)).**
   When enabled, plan agents and selected owner or repo subagents follow the resolved run model instead of their pinned model; with it off, their model pins still apply.
 
