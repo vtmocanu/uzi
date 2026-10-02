@@ -71,6 +71,19 @@ describe("mockApi findings backlog (PRD #333 M7)", () => {
     }
   });
 
+  it("the completed run exposes two distinct fileable findings and retains settled rows", async () => {
+    const api = await freshApi();
+    const open = await api.listFindings("to_file", undefined, "run-done");
+    expect(open.run).toBe("run-done");
+    expect(open.findings.map((f) => f.finding_id).sort()).toEqual(["find-1", "find-2"]);
+    expect(open.findings.every((f) => f.status === "open" && f.repo_id === "repo-uzi" && f.evidence_preview && f.occurrences?.some((o) => o.run_id === "run-done"))).toBe(true);
+
+    const all = await api.listFindings("all", undefined, "run-done");
+    expect(all.findings.filter((f) => f.status === "open").map((f) => f.finding_id).sort()).toEqual(["find-1", "find-2"]);
+    expect(all.findings.map((f) => f.status)).toEqual(expect.arrayContaining(["filed", "dismissed", "done"]));
+    expect(all.findings.every((f) => f.repo_id === "repo-uzi" || f.status !== "open")).toBe(true);
+  });
+
   it("file flips an open coordinate to filed and a second file on it is a 409", async () => {
     const api = await freshApi();
     const res = await api.fileFinding("find-1");

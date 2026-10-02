@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Findings } from "./Findings";
+import { findingsApi } from "../mocks/mockApi/findings";
 import { AppShell } from "../components/AppShell";
 import { useAuth } from "../auth/AuthContext";
 import {
@@ -862,6 +863,19 @@ describe("Findings page - File as one issue (issue #1724)", () => {
       labels: ["uzi"],
     });
   }
+
+  it("shows the completed mock run's two open findings as a selectable group", async () => {
+    mockApi.listFindings.mockImplementation(findingsApi.listFindings);
+    renderFindings(["/findings?run=run-done"]);
+    const first = await screen.findByRole("checkbox", { name: "Select Leaked ticker in sweepLoop never stopped on shutdown" });
+    const second = screen.getByRole("checkbox", { name: "Select Retry loop can never succeed — it retries a non-idempotent POST" });
+    expect(screen.getByText("Filtered to one run's findings.")).toBeTruthy();
+    expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "run-done");
+    fireEvent.click(first);
+    fireEvent.click(second);
+    expect(groupButton().disabled).toBe(false);
+    expect(screen.queryByText("Boot key-check skips the JWT audience claim")).toBeNull();
+  });
 
   it("uses the run filter with the existing grouped filing flow", async () => {
     mockApi.listFindings.mockResolvedValue(backlog({

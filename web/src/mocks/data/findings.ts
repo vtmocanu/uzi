@@ -60,7 +60,7 @@ export const mockFindings: MockFinding[] = [
       "The `time.Ticker` started in `sweepLoop` is never `Stop()`ed, so a cancelled sweeper leaks the ticker's goroutine.",
     occurrences: [
       { run_id: "run-live", run_title: "Wire the findings store", reported_at: minsAgo(30), confidence: "high" },
-      { run_id: "run-done", run_title: "Sweeper refactor", reported_at: minsAgo(600), confidence: "medium" },
+      { run_id: "run-done", run_title: "Run view: fold tool results under their calls", reported_at: minsAgo(600), confidence: "medium" },
     ],
     filed_issue_iid: null,
     filed_issue_url: null,
@@ -79,11 +79,17 @@ export const mockFindings: MockFinding[] = [
     description_md:
       "`doWithRetry` re-issues the same POST on a 5xx, but the upstream is non-idempotent, so a retry after a partial write always 409s. The retry is dead code that only delays the failure.",
     labels: ["bug", "reliability"],
-    seen_in_runs: 1,
+    seen_in_runs: 2,
+    evidence_preview:
+      "`doWithRetry` re-issues the same POST on a 5xx, but the upstream is non-idempotent, so a retry after a partial write always 409s.",
+    occurrences: [
+      { run_id: "run-live", run_title: "Wire the findings store", reported_at: minsAgo(25), confidence: "high" },
+      { run_id: "run-done", run_title: "Run view: fold tool results under their calls", reported_at: minsAgo(590), confidence: "medium" },
+    ],
     filed_issue_iid: null,
     filed_issue_url: null,
     resolved_at: null,
-    run_ids: ["run-live"],
+    run_ids: ["run-live", "run-done"],
   },
   {
     finding_id: "find-3",
