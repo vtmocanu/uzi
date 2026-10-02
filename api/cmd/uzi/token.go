@@ -296,10 +296,9 @@ type tokenListItem struct {
 // Three cases, and the distinctions are the point:
 //   - NOT pooled: "-", because the POOL column beside it already says so and
 //     repeating "not in pool" would be noise on every row a user has not opted in.
-//   - pooled with a status: the SERVER's word, rendered verbatim. The vocabulary is
-//     autoselect.Status and this function deliberately does not interpret it — a
-//     status this binary has never heard of prints as itself rather than being
-//     mapped to something wrong or dropped.
+//   - pooled with a status: known server statuses use the same human labels as the
+//     web UI. An unknown status prints verbatim so a newer server's answer remains
+//     visible rather than being guessed or dropped.
 //   - pooled with NO status: "?", meaning "the meters read failed or did not
 //     mention this token". NOT "-" and not blank: a pooled token whose eligibility
 //     is unknown must not look like one that is fine, which is the silent no-op the
@@ -311,7 +310,22 @@ func eligibilityCell(pooled bool, status string) string {
 	if status == "" {
 		return "?"
 	}
-	return status
+	switch status {
+	case "eligible":
+		return "in pool"
+	case "rejected":
+		return "rejected by Anthropic"
+	case "no_reading":
+		return "never polled"
+	case "unmeasured":
+		return "no usage data"
+	case "stale":
+		return "stale reading"
+	case "below_threshold":
+		return "low headroom"
+	default:
+		return status
+	}
 }
 
 // Secret kind values as stored server-side and carried in SecretDTO.Kind (PRD

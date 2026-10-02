@@ -56,8 +56,8 @@ func TestTokenListStateColumn(t *testing.T) {
 	if strings.Join(header, " ") != strings.Join(want, " ") {
 		t.Fatalf("header = %v, want %v", header, want)
 	}
-	if row := tokenRow(t, out, "work"); len(row) != 9 || row[8] != "enabled" || row[5] != "eligible" {
-		t.Errorf("enabled row = %v, want STATE enabled and ELIGIBLE eligible", row)
+	if row := tokenRow(t, out, "work"); len(row) != 10 || row[9] != "enabled" || strings.Join(row[5:7], " ") != "in pool" {
+		t.Errorf("enabled row = %v, want STATE enabled and ELIGIBLE in pool", row)
 	}
 	// "disabled since 2026-09-20" splits into three fields: STATE spans row[8:].
 	off := tokenRow(t, out, "old-key")

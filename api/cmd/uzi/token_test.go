@@ -285,7 +285,7 @@ func TestTokenListSanitizesLabel(t *testing.T) {
 // TestTokenListShowsLiveEligibility is the CLI half of D23. Before the auth move
 // `uzi token pool x --on` could opt a token in and give a script NO WAY to learn
 // that x can never be picked — R7's silent no-op surviving on the CLI side. The
-// column closes it, and this pins that it renders the SERVER's word per row.
+// column closes it, and this pins that it renders the server's status as a human label per row.
 func TestTokenListShowsLiveEligibility(t *testing.T) {
 	fc := poolFake()
 	fc.SelfMeters = []apitypes.TokenRateLimitDTO{
@@ -308,12 +308,11 @@ func TestTokenListShowsLiveEligibility(t *testing.T) {
 		t.Fatalf("no row for %q in:\n%s", label, out)
 		return nil
 	}
-	// The pooled token carries the server's status verbatim — this is the whole
-	// point of the column, and of D21: the string is autoselect.Classify's answer,
-	// not something the CLI re-derived from percentages it does not have.
-	if got := rowOf("console-key")[5]; got != "no_reading" {
-		t.Errorf("pooled token's ELIGIBLE = %q, want the server's no_reading — a pooled "+
-			"token that can never be picked must SAY so", got)
+	// The human label comes from the server's status, without deriving eligibility
+	// from percentages the CLI does not have.
+	row := rowOf("console-key")
+	if got := strings.Join(row[5:len(row)-3], " "); got != "never polled" {
+		t.Errorf("pooled token's ELIGIBLE = %q, want never polled", got)
 	}
 	// An un-pooled token reads "-": the POOL column beside it already says it is out,
 	// and repeating "not in pool" would be noise on every row.
@@ -325,6 +324,87 @@ func TestTokenListShowsLiveEligibility(t *testing.T) {
 	// exists to remove.
 	if got := rowOf("spare-key")[5]; got != "-" {
 		t.Errorf("un-pooled spare-key's ELIGIBLE = %q, want -", got)
+	}
+}
+
+// TestTokenListHumanEligibilityLabels exercises the public CLI output for each
+// known pooled status, a future status, a missing reading, and an unpooled token.
+func TestTokenListHumanEligibilityLabels(t *testing.T) {
+	cases := []struct {
+		id, status, want string
+	}{
+		{"eligible", "eligible", "in pool"},
+		{"rejected", "rejected", "rejected by Anthropic"},
+		{"no-reading", "no_reading", "never polled"},
+		{"unmeasured", "unmeasured", "no usage data"},
+		{"stale", "stale", "stale reading"},
+		{"below-threshold", "below_threshold", "low headroom"},
+		{"future", "future_status", "future_status"},
+		{"missing", "", "?"},
+	}
+	fc := &uzicli.FakeClient{}
+	for _, tc := range cases {
+		fc.Secrets = append(fc.Secrets, apitypes.SecretDTO{
+			ID: tc.id, Kind: kindAnthropicToken, Label: tc.id, AutoEligible: true,
+		})
+		if tc.status != "" {
+			fc.SelfMeters = append(fc.SelfMeters, apitypes.TokenRateLimitDTO{
+				SecretID: tc.id, AutoStatus: tc.status,
+			})
+		}
+	}
+	fc.Secrets = append(fc.Secrets, apitypes.SecretDTO{
+		ID: "unpooled", Kind: kindAnthropicToken, Label: "unpooled",
+	})
+	fc.SelfMeters = append(fc.SelfMeters, apitypes.TokenRateLimitDTO{
+		SecretID: "unpooled", AutoStatus: "not_pooled",
+	})
+
+	out, _, code := runCLI(t, fakeEnv(fc), "token", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	for _, tc := range cases {
+		t.Run(tc.id, func(t *testing.T) {
+			row := tokenRow(t, out, tc.id)
+			got := strings.Join(row[5:len(row)-3], " ")
+			if got != tc.want {
+				t.Errorf("ELIGIBLE = %q, want %q in:\n%s", got, tc.want, out)
+			}
+		})
+	}
+	if row := tokenRow(t, out, "unpooled"); row[5] != "-" {
+		t.Errorf("unpooled ELIGIBLE = %q, want -", row[5])
+	}
+
+	jsonOut, _, code := runCLI(t, fakeEnv(fc), "token", "list", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("JSON exit = %d, want 0", code)
+	}
+	var items []struct {
+		ID         string  `json:"id"`
+		AutoStatus *string `json:"auto_status"`
+	}
+	if err := json.Unmarshal([]byte(jsonOut), &items); err != nil {
+		t.Fatalf("decode JSON: %v", err)
+	}
+	byID := make(map[string]*string, len(items))
+	for _, item := range items {
+		byID[item.ID] = item.AutoStatus
+	}
+	for _, tc := range cases {
+		if tc.status == "" {
+			if byID[tc.id] != nil {
+				t.Errorf("JSON %s auto_status = %q, want null", tc.id, *byID[tc.id])
+			}
+			continue
+		}
+		if got := byID[tc.id]; got == nil || *got != tc.status {
+			t.Errorf("JSON %s auto_status = %v, want raw %q", tc.id, got, tc.status)
+		}
+	}
+	if got := byID["unpooled"]; got == nil || *got != "not_pooled" {
+		t.Errorf("JSON unpooled auto_status = %v, want raw not_pooled", got)
 	}
 }
 
