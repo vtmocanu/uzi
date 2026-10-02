@@ -269,7 +269,7 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
     # Heartbeat: workflow names are untrusted (anyone who can push a workflow names one).
     open_runs="$(printf '%s\n' "$runs" | awk -F'\t' '$2!="completed"{printf "%s%s", sep, $4; sep=", "}' \
       | sanitize_untrusted 200)"
-    echo "[tick $tick] pending after $((tick*INTERVAL))s: ${open_runs:-runs completed, rechecking jobs}"
+    printf '[tick %s] pending after %ss: %s\n' "$tick" "$((tick*INTERVAL))" "${open_runs:-runs completed, rechecking jobs}"
     sleep "$INTERVAL"; tick=$((tick+1)); continue
   fi
 
@@ -327,7 +327,7 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
       ;;
     PENDING)
       open_jobs="$(printf '%s\n' "$out" | awk -F'\t' '$1!="completed"{n++} END{print n+0}')"
-      echo "[tick $tick] pending after $((tick*INTERVAL))s: run $cur, $open_jobs job(s) not completed"
+      printf '[tick %s] pending after %ss: run %s, %s job(s) not completed\n' "$tick" "$((tick*INTERVAL))" "$cur" "$open_jobs"
       ;;
   esac
 

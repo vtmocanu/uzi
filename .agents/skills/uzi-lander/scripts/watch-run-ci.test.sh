@@ -57,7 +57,8 @@ if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
       case "$n" in
         1)
           if [ "$MODE" = escape-pending ]; then
-            printf '103\tin_progress\t\tCI%s]52;c;Zm9v\a\n' $'\x1b'
+            # jq @tsv encodes a newline in a name as the two characters \n.
+            printf '103\tin_progress\t\tCI%s]52;c;Zm9v\a\\nRESULT=ready\n' $'\x1b'
           else printf '103\tin_progress\t\tCI\n'; fi
           ;;
         2) : ;;
@@ -68,6 +69,7 @@ if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
       escape=$'\x1b'
       printf '104\tcompleted\tfailure\tCI%s[2J\n' "$escape"
       ;;
+    stuck) printf '105\tin_progress\t\tCI\n' ;;
     *) echo "unknown MODE=$MODE" >&2; exit 1 ;;
   esac
   exit 0
@@ -81,6 +83,8 @@ if [ "${1:-}" = run ] && [ "${2:-}" = view ]; then
     n=$((n+1)); printf '%s' "$n" > "$VIEW_COUNT"
     if [ "$n" -eq 1 ]; then printf 'in_progress\t\tCI\thttps://example.invalid/job/103\t103\n'
     else printf 'completed\tsuccess\tCI\thttps://example.invalid/job/103\t103\n'; fi
+  elif [ "$MODE" = stuck ]; then
+    printf 'in_progress\t\tCI\thttps://example.invalid/job/105\t105\n'
   else
     printf 'completed\tsuccess\tCI\thttps://example.invalid/job/%s\t%s\n' "${3:-run}" "${3:-0}"
   fi
@@ -184,11 +188,12 @@ grep -Fxq '[tick 0] pending after 0s: run 103, 1 job(s) not completed' "$WORK/ru
   || fail "run-id pending tick printed no heartbeat: $(cat "$WORK/run-id.out")"
 unset SLEEPS
 
-# An untrusted workflow name reaches the heartbeat without its escape sequence.
+# An untrusted workflow name reaches the heartbeat as one line with no escape sequence,
+# even under xpg_echo, which would turn its TSV-encoded \n back into a real newline.
 : > "$CALLS"; rm -f "$LIST_COUNT" "$VIEW_COUNT"
 MODE=escape-pending; export MODE
 set +e
-bash "$SCRIPT" --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 4 > "$WORK/escape-pending.out" 2>&1
+bash -O xpg_echo "$SCRIPT" --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 4 > "$WORK/escape-pending.out" 2>&1
 rc=$?
 set -e
 [ "$rc" -eq 0 ] || fail "escape-pending sequence failed, rc=$rc: $(cat "$WORK/escape-pending.out")"
@@ -197,6 +202,27 @@ grep -Fq '[tick 0] pending after 0s: CI' "$WORK/escape-pending.out" \
 if LC_ALL=C grep -Fq $'\033' "$WORK/escape-pending.out"; then
   fail "untrusted workflow name in the heartbeat emitted a raw escape byte: $(cat -v "$WORK/escape-pending.out")"
 fi
+if grep -q '^RESULT=' "$WORK/escape-pending.out"; then
+  fail "untrusted workflow name forged its own output line: $(cat -v "$WORK/escape-pending.out")"
+fi
+
+# Default tick limits: 80 with --sha, 40 otherwise (~80 min either way).
+MODE=stuck; SLEEPS="$WORK/sleeps"; export MODE SLEEPS
+: > "$WORK/sleeps"
+set +e
+bash "$SCRIPT" --sha "$FULL_SHA" --repo test/repo > "$WORK/stuck-sha.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "--sha stuck run did not time out with exit 2, rc=$rc: $(tail -1 "$WORK/stuck-sha.out")"
+[ "$(wc -l < "$WORK/sleeps" | tr -d ' ')" -eq 80 ] || fail "--sha default max-ticks is not 80: $(wc -l < "$WORK/sleeps")"
+: > "$WORK/sleeps"
+set +e
+bash "$SCRIPT" 105 --repo test/repo > "$WORK/stuck-run.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "run-id stuck run did not time out with exit 2, rc=$rc: $(tail -1 "$WORK/stuck-run.out")"
+[ "$(wc -l < "$WORK/sleeps" | tr -d ' ')" -eq 40 ] || fail "run-id default max-ticks is not 40: $(wc -l < "$WORK/sleeps")"
+unset SLEEPS
 
 : > "$CALLS"
 MODE=failure; export MODE
@@ -224,4 +250,4 @@ grep -Fq 'live log: gh api --allow-escape-sequences repos/test/repo/actions/jobs
 grep -Fq 'after run terminal: gh run view 104 --repo test/repo --job 999 --log-failed' "$WORK/failure-derived.out" \
   || fail "URL-derived repo missing from terminal command: $(cat "$WORK/failure-derived.out")"
 
-echo "PASS watch-run-ci: SHA validation/retry/canonicalization, transient empty recovery, pending heartbeat, default intervals, live failed-job logs"
+echo "PASS watch-run-ci: SHA validation/retry/canonicalization, transient empty recovery, pending heartbeat (xpg_echo-safe), default intervals and tick limits, live failed-job logs"
