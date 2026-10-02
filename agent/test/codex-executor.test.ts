@@ -2424,19 +2424,33 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
     assert.ok(emitted.indexOf(completions[0]!) < terminal, "the completion precedes the terminal result");
   }
 
-  it("(m2-10) a child turn that completes FAILED gives exactly one is_error lead completion before the terminal", async () => {
+  it("(m2-10) a classified failed child projects a bounded error without changing the root terminal", async () => {
+    const providerText = "private provider diagnostic";
     const rig = makeRig({
       responder: delegationResponder((t, th, tn) => {
-        t.push(agentMessage("child tried", th)).push(turnCompleted("failed", th, tn));
+        t.push(agentMessage("child tried", th)).push({
+          kind: "turn_completed", method: "turn/completed", threadId: th, turnId: tn, status: "failed",
+          params: { threadId: th, turn: { id: tn, status: "failed",
+            error: { codexErrorInfo: "serverOverloaded", message: providerText } } },
+        });
       }),
     });
     rig.transport.push(threadStarted()).push(spawn(1, "c-root", { subagent_type: "coder", description: "[m1] fails", prompt: "p" }));
     const { ctx, emitted } = makeCtx({ agents });
     const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
     await finishRoot(rig, [1]);
-    await withTimeout(runP, 3000, "failed-child run");
+    const result = await withTimeout(runP, 3000, "failed-child run");
     assertOneErrorCompletion(emitted);
-    assert.match(String(resultsFor(emitted, agentUses(emitted)[0]!.payload.id)[0]!.payload.content), /child turn failed/);
+    const reply = rec(rec(rig.transport.responses.find((r) => r.requestId === 1)?.response).result);
+    assert.equal(reply.success, false);
+    assert.ok(JSON.stringify(reply).includes("the delegated child turn failed (transport)"));
+    assert.ok(!JSON.stringify(reply).includes(providerText));
+    const completion = resultsFor(emitted, agentUses(emitted)[0]!.payload.id)[0]!;
+    assert.equal(completion.payload.is_error, true);
+    assert.ok(String(completion.payload.content).includes("the delegated child turn failed (transport)"));
+    assert.ok(!String(completion.payload.content).includes(providerText));
+    assert.equal(result.branch, "agent/issue-42", "the root completes after the child failure");
+    assert.equal(emitted.filter((m) => m.kind === "status" && m.payload.event === "result").length, 1);
     assert.equal(responsesFor(rig, 1), 1);
   });
 
