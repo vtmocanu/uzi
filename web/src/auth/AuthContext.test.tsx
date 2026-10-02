@@ -9,7 +9,7 @@ import type { SessionResponse } from "../lib/api";
 // stay real so the provider's effects compose as they do in the app.
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
-  return { ...actual, api: { ...actual.api, me: vi.fn(), logout: vi.fn() } };
+  return { ...actual, api: { ...actual.api, me: vi.fn(), logout: vi.fn(), login: vi.fn() } };
 });
 
 const mockApi = vi.mocked(api);
@@ -45,7 +45,7 @@ const baseSession = (over: Partial<SessionResponse> = {}): SessionResponse => ({
 // A tiny consumer that renders the uzi label and the resolved appearance so the
 // test can assert on what the provider exposes (PRD #764, PRD #1167).
 function Probe() {
-  const { uziLabel, appearance, user, loading, serverUnreachable, logout, retry } = useAuth();
+  const { uziLabel, appearance, user, loading, serverUnreachable, logout, retry, login } = useAuth();
   return (
     <div>
       <span data-testid="loading">{String(loading)}</span>
@@ -56,6 +56,9 @@ function Probe() {
       </button>
       <button type="button" onClick={() => void retry()}>
         do retry
+      </button>
+      <button type="button" onClick={() => void login("a@b.c", "pw")}>
+        do login
       </button>
       <span data-testid="uzi">{uziLabel}</span>
       <span data-testid="mode">{appearance.mode}</span>
@@ -163,25 +166,34 @@ describe("AuthContext — server unreachable (#1991)", () => {
     expect(screen.getByTestId("unreachable").textContent).toBe("false");
   });
 
-  it("drops an older probe's 503 that settles after a newer probe's 401", async () => {
-    let rejectOlder: (err: unknown) => void = () => {};
-    let rejectNewer: (err: unknown) => void = () => {};
-    mockApi.me
-      .mockImplementationOnce(() => new Promise((_, reject) => (rejectOlder = reject)))
-      .mockImplementationOnce(() => new Promise((_, reject) => (rejectNewer = reject)));
+  it("a retry while a probe is pending joins it instead of starting another", async () => {
+    let rejectProbe: (err: unknown) => void = () => {};
+    mockApi.me.mockImplementationOnce(() => new Promise((_, reject) => (rejectProbe = reject)));
     renderProbe();
     await act(async () => {
       screen.getByRole("button", { name: "do retry" }).click();
     });
-    expect(mockApi.me).toHaveBeenCalledTimes(2);
+    expect(mockApi.me).toHaveBeenCalledTimes(1);
     await act(async () => {
-      rejectNewer(new ApiError(401, "unauthorized"));
+      rejectProbe(new ApiError(503, "service unavailable"));
     });
+    expect(screen.getByTestId("loading").textContent).toBe("false");
+    expect(screen.getByTestId("unreachable").textContent).toBe("true");
+  });
+
+  it("a probe that started before a login cannot sign the new session out", async () => {
+    let rejectProbe: (err: unknown) => void = () => {};
+    mockApi.me.mockImplementationOnce(() => new Promise((_, reject) => (rejectProbe = reject)));
+    mockApi.login.mockResolvedValue(baseSession());
+    renderProbe();
     await act(async () => {
-      rejectOlder(new ApiError(503, "service unavailable"));
+      screen.getByRole("button", { name: "do login" }).click();
     });
-    await waitFor(() => expect(screen.getByTestId("loading").textContent).toBe("false"));
-    expect(screen.getByTestId("unreachable").textContent).toBe("false");
-    expect(screen.getByTestId("user").textContent).toBe("none");
+    expect(screen.getByTestId("user").textContent).toBe("vlad@uzi.local");
+    await act(async () => {
+      rejectProbe(new ApiError(401, "unauthorized"));
+    });
+    expect(screen.getByTestId("user").textContent).toBe("vlad@uzi.local");
+    expect(screen.getByTestId("loading").textContent).toBe("false");
   });
 });

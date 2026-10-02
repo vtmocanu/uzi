@@ -130,10 +130,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [judgeEnforcedByAdmin, setJudgeEnforcedByAdmin] = useState(false);
   const [effectiveJudgeModel, setEffectiveJudgeModel] = useState("");
   const [serverUnreachable, setServerUnreachable] = useState(false);
-  // Session-probe generation. Each me() probe captures the value it started at and
-  // drops its result if anything newer has started or changed the session since
-  // (another probe, login, register, logout, a global 401), so probes that finish
-  // out of order cannot overwrite a newer answer.
+  // At most one session probe is in flight: a refresh while one is pending joins it,
+  // so probe results can never settle out of order. sessionGen is bumped only by an
+  // explicit login, register or logout; a probe that started before one of those
+  // drops its result, so it cannot undo the newer session state.
+  const probeInFlight = useRef<Promise<void> | null>(null);
   const sessionGen = useRef(0);
 
   // applySession records the user and the instance labels from a session
@@ -144,9 +145,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // the deprecated single-theme trio so the app still paints. applyAppearance
   // stamps data-theme/data-font and arms the live system-mode listener.
   const applySession = useCallback((session: SessionResponse) => {
-    sessionGen.current += 1;
     setUser(session.user);
     setServerUnreachable(false);
+    setLoading(false);
     setUziLabel(session.uzi_label || DEFAULT_UZI_LABEL);
     setAutopilotLabel(session.autopilot_label || DEFAULT_AUTOPILOT_LABEL);
     // Read as possibly-absent: an older server omits `appearance` entirely, so we
@@ -173,23 +174,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setEffectiveJudgeModel(session.effective_judge_model ?? "");
   }, []);
 
-  const refresh = useCallback(async () => {
-    const gen = ++sessionGen.current;
-    try {
-      const session = await api.me();
-      if (gen !== sessionGen.current) return;
-      applySession(session);
-    } catch (err) {
-      if (gen !== sessionGen.current) return;
-      if (err instanceof ApiError && err.status === 401) {
-        setUser(null);
-        setServerUnreachable(false);
-      } else {
-        // A 503 (transient DB outage), another non-401 status, or a network
-        // failure: the session state is unknown, so leave user untouched.
-        setServerUnreachable(true);
+  const refresh = useCallback(() => {
+    if (probeInFlight.current) return probeInFlight.current;
+    const gen = sessionGen.current;
+    const probe = (async () => {
+      try {
+        const session = await api.me();
+        if (gen !== sessionGen.current) return;
+        applySession(session);
+      } catch (err) {
+        if (gen !== sessionGen.current) return;
+        if (err instanceof ApiError && err.status === 401) {
+          setUser(null);
+          setServerUnreachable(false);
+        } else {
+          // A 503 (transient DB outage), another non-401 status, or a network
+          // failure: the session state is unknown, so leave user untouched.
+          setServerUnreachable(true);
+        }
+        setLoading(false);
+      } finally {
+        probeInFlight.current = null;
       }
-    }
+    })();
+    probeInFlight.current = probe;
+    return probe;
   }, [applySession]);
 
   // Any authenticated request that comes back 401 (a session expired or deleted
@@ -199,7 +208,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // already-empty session and leaves a signed-out visitor on their public page.
   useEffect(() => {
     setUnauthorizedHandler(() => {
-      sessionGen.current += 1;
       setUser(null);
       setServerUnreachable(false);
     });
@@ -228,11 +236,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => window.removeEventListener("focus", onFocus);
   }, [user, refresh]);
 
+  // The initial probe. refresh() clears loading when its result is applied; a
+  // StrictMode re-run joins the same in-flight probe instead of starting another.
   useEffect(() => {
-    (async () => {
-      await refresh();
-      setLoading(false);
-    })();
+    void refresh();
   }, [refresh]);
 
   // While the server is unreachable and nobody is signed in, re-probe on a timer.
@@ -257,14 +264,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const register = useCallback(
     async (email: string, password: string, displayName: string) => {
-      applySession(await api.register(email, password, displayName));
+      const session = await api.register(email, password, displayName);
+      sessionGen.current += 1;
+      applySession(session);
     },
     [applySession],
   );
 
   const login = useCallback(
     async (email: string, password: string) => {
-      applySession(await api.login(email, password));
+      const session = await api.login(email, password);
+      sessionGen.current += 1;
+      applySession(session);
     },
     [applySession],
   );
@@ -276,6 +287,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       sessionGen.current += 1;
       setUser(null);
       setServerUnreachable(false);
+      setLoading(false);
     }
   }, []);
 
