@@ -9,7 +9,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 cases=0
 passed=0
-FLOOR=17
+FLOOR=18
 
 workflow() {
   cat > "$TMP/ci.yml" <<'YML'
@@ -81,6 +81,10 @@ expect 1 'other SEMGREP_VERSION assignment' 'another SEMGREP_VERSION assignment'
 workflow
 printf '          pipx install "semgrep==${SEMGREP_VERSION}"; pipx install semgrep==1.178.0\n' >> "$TMP/ci.yml"
 expect 1 'outside the lock-derived line' 'a pin chained onto the approved install text'
+
+workflow
+printf '          pipx install semgrep==1.178.0 # pipx install "semgrep==${SEMGREP_VERSION}"\n' >> "$TMP/ci.yml"
+expect 1 'outside the lock-derived line' 'the approved text in a comment exempts nothing'
 
 workflow
 awk '/pipx install/ { print "          true" } { print }' "$TMP/ci.yml" > "$TMP/ci2.yml" && mv "$TMP/ci2.yml" "$TMP/ci.yml"
