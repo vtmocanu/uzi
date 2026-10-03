@@ -296,6 +296,12 @@ func TestHealthChecksLiveDB(t *testing.T) {
 	}
 }
 
+type rollRepoAllowlist []uuid.UUID
+
+func (r rollRepoAllowlist) DockerRepoAllowlist(context.Context) ([]uuid.UUID, error) {
+	return []uuid.UUID(r), nil
+}
+
 type rollHealthSettings struct{}
 
 func (rollHealthSettings) HealthEnabled(context.Context) (bool, error)       { return true, nil }
@@ -454,6 +460,7 @@ func TestHealthRollStrictLeaseEligibilityLiveDB(t *testing.T) {
 			}
 			svc := workersvc.New(fx.q, nil, workersvc.Params{WorkerHeartbeatStale: 45 * time.Second, WorkerAffinityCeiling: 2 * time.Hour})
 			svc.SetEphemeralLease(2 * time.Hour)
+			svc.SetDockerAllowlist(rollRepoAllowlist{fx.repoID})
 			row, err := svc.WorkerEligibilityForHealth(fx.ctx, time.Now(), target)
 			if err != nil {
 				t.Fatal(err)
@@ -474,11 +481,10 @@ func TestHealthRollAffinityAndLegacyAvailabilityLiveDB(t *testing.T) {
 	now := time.Now()
 	owner := fx.worker("owner", nil, false)
 	peer := fx.worker("peer", nil, false)
-	target := queuedRunWithCaps(fx, nil)
+	target := queuedRunWithCaps(fx, []string{"gpu"})
 	mustExec(fx.ctx, t, fx.pool, "UPDATE runs SET worker_id=$2,updated_at=$3 WHERE id=$1", target, owner, now)
 	mustExec(fx.ctx, t, fx.pool, "UPDATE workers SET capabilities='{gpu}',draining_since=$2 WHERE id=$1", peer, now.Add(-time.Hour))
 	// The owner fails static requirements but still pins affinity.
-	mustExec(fx.ctx, t, fx.pool, "UPDATE runs SET required_capabilities='{gpu}' WHERE id=$1", target)
 	svc := workersvc.New(fx.q, nil, workersvc.Params{WorkerHeartbeatStale: 45 * time.Second, WorkerAffinityCeiling: 2 * time.Hour})
 	row, err := svc.WorkerEligibilityForHealth(fx.ctx, now, target)
 	if err != nil || row.DrainingEligible != 0 {
