@@ -77,10 +77,15 @@ type repoSlug struct {
 // runs in VerifyToken, so a bad version surfaces to the user rather than as a
 // generic "could not initialize forge client".
 func newForgejo(baseURL, token string, timeout time.Duration) *forgejo {
+	// Same timeout and redirect guard as timeoutClient, plus a response-size cap:
+	// the gitea SDK buffers whole bodies, so a hostile forge must not be able to
+	// stream an unbounded one.
+	client := timeoutClient(timeout)
+	client.Transport = cappedTransport{base: client.Transport}
 	return &forgejo{
 		baseURL:   strings.TrimSuffix(baseURL, "/"),
 		token:     token,
-		client:    timeoutClient(timeout),
+		client:    client,
 		redact:    newRedactor(token),
 		ancClient: ancestryClient(timeout),
 		slugs:     map[int64]repoSlug{},
