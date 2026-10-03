@@ -156,7 +156,7 @@ The general discipline is in `.claude/agent-team.md`; the Go-specific instances 
 - It carries an explicit `|| exit 2`, so fail-closed is a property of the line rather than of the shell Task runs it under: `||` puts the assignment in a condition context, errexit stops firing, and the explicit exit does all the work.
 - The status `2` reproduces gofmt's own and keeps the red modes distinguishable, `2` = does not parse, `1` = misformatted, where Task's own rc is 201 for both.
 - The fail-open window is exactly a tree with no other drift, because gofmt still lists every other misformatted file while erroring on the unparseable one. Clearing the drift arms the hole: watch for any check whose success removes the noise masking its own blind spot.
-- The slot runs `$(go env GOROOT)/bin/gofmt`, the gofmt of the toolchain `go.mod` selects, never a bare `gofmt`: a PATH gofmt older than the `toolchain` line lists files the module's gofmt accepts and reddens `gate:api` on a clean tree. So a hand-run `gofmt -l` from PATH listing untouched files is drift between toolchains, not a defect; never `gofmt -w` with it. `test:fmt-check-toolchain` pins this.
+- The slot runs `$(go env GOROOT)/bin/gofmt`, the gofmt of the toolchain `go.mod` selects, never a bare `gofmt`: a PATH gofmt older than the `toolchain` line can list files the module's gofmt accepts (measured: a go1.26.7 PATH gofmt against go1.27.1 listed two untouched api files) and redden `gate:api` on a clean tree. So a hand-run `gofmt -l` from PATH listing untouched files is drift between toolchains, not a defect; never `gofmt -w` with it. `test:fmt-check-toolchain` pins this.
 
 ## Never report a gate you did not run
 

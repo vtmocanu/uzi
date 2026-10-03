@@ -49,7 +49,7 @@ expect() {
     [ "$rc" -eq 0 ] || ok=0
   else
     [ "$rc" -ne 0 ] || ok=0
-    grep -q -F "exit status $2" "$TMP/out" || ok=0
+    grep -q -E "exit status $2\$" "$TMP/out" || ok=0
   fi
   if [ -n "$3" ]; then grep -q -F "$3" "$TMP/out" || ok=0; fi
   if [ "$ok" = 1 ]; then
