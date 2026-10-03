@@ -500,26 +500,32 @@ async function crashBeforePromotion(iid: number): Promise<{ s: Stores; gen2Claim
   const outboxRoot = path.join(fx.dataDir, "outbox");
   const outbox1 = await mkOutbox(outboxRoot);
   const snapRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-settle-crash-"));
-  let restore: Array<() => void> = [];
-  // The "crash": the completion ACK came back, and the process dies at the instant it would
-  // promote the write-ahead `pushed` record (freeze the durable state BEFORE that write).
-  const put = s.settlement.put.bind(s.settlement);
-  s.settlement.put = async (rec) => {
-    if (rec.state === "pending_settle" && restore.length === 0) {
-      restore = [
-        snapshot(outboxRoot, path.join(snapRoot, "outbox")),
-        snapshot(git.recoverySettlementRoot, path.join(snapRoot, "settlement")),
-        snapshot(git.recoveryRoot, path.join(snapRoot, "recovery")),
-      ];
-    }
-    return put(rec);
-  };
-  await runGen2(s, gen2Claim, new FakeSettleClient(released), outbox1);
-  assert.ok(restore.length > 0, "precondition: the promotion was reached");
-  for (const r of restore) r();
-  const [atCrash] = await s.settlement.listRun(gen2Claim.run_id);
-  assert.equal(atCrash!.state, "pushed", "at the crash the record is write-ahead only (never sendable)");
-  return { s, gen2Claim, gen1Head, outboxRoot, snapRoot };
+  // The caller removes snapRoot once this returns; a setup failure before then must not leak it.
+  try {
+    let restore: Array<() => void> = [];
+    // The "crash": the completion ACK came back, and the process dies at the instant it would
+    // promote the write-ahead `pushed` record (freeze the durable state BEFORE that write).
+    const put = s.settlement.put.bind(s.settlement);
+    s.settlement.put = async (rec) => {
+      if (rec.state === "pending_settle" && restore.length === 0) {
+        restore = [
+          snapshot(outboxRoot, path.join(snapRoot, "outbox")),
+          snapshot(git.recoverySettlementRoot, path.join(snapRoot, "settlement")),
+          snapshot(git.recoveryRoot, path.join(snapRoot, "recovery")),
+        ];
+      }
+      return put(rec);
+    };
+    await runGen2(s, gen2Claim, new FakeSettleClient(released), outbox1);
+    assert.ok(restore.length > 0, "precondition: the promotion was reached");
+    for (const r of restore) r();
+    const [atCrash] = await s.settlement.listRun(gen2Claim.run_id);
+    assert.equal(atCrash!.state, "pushed", "at the crash the record is write-ahead only (never sendable)");
+    return { s, gen2Claim, gen1Head, outboxRoot, snapRoot };
+  } catch (e) {
+    fs.rmSync(snapRoot, { recursive: true, force: true });
+    throw e;
+  }
 }
 
 describe("settlement crash boundaries (issue #1582 M2)", () => {
