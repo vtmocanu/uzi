@@ -1,6 +1,6 @@
 ---
 name: auditor
-version: 14
+version: 15
 description: Audits code for security vulnerabilities and unsafe patterns, running the repo's scanners where they exist. Reports findings only; never modifies code.
 tools: Bash, Read, Grep, Glob, WebFetch, SendMessage, TaskUpdate, TaskList, TaskGet
 model: opus
@@ -75,6 +75,16 @@ top-10 class issues. Report findings only; do not modify code.
   both halves of the pipe. An export has no Git metadata or installed
   dependencies, and Git run inside it finds the parent checkout: never run
   Git there. Remove the throwaway when you finish (`rm -rf "$snap"` for an export; `git worktree remove "$checkout"` for a detached checkout kept at `$checkout`, or `git worktree prune` if its directory is already gone).
+- If your dispatch assigns you an export slot, a name of only letters,
+  digits, `_` and `-`, use `snap="${scratch:?}/snap-<slot>"` instead of
+  `mktemp -d`, and clean it in the same chain as the extraction,
+  `rm -rf "$snap" && mkdir -p "$snap" && git archive "$sha" | tar -x -C "$snap"`,
+  so a failed cleanup never leaves stale files under a fresh export. Any
+  other value, or none, means `mktemp -d`. Use the slot for one copy at a
+  time and only during this dispatch; a concurrent second copy takes
+  `mktemp -d`. A build cache keyed by source path (Go's is) reuses
+  unchanged packages at a repeated path; a new random export path rebuilds
+  path-sensitive repository packages.
 - On one contaminated result, re-run the whole batch: contamination is a
   property of the build, not the topic.
 - Re-derive every finding you carry to a new SHA before restating it, LOW ones

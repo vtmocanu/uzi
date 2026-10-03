@@ -1,6 +1,6 @@
 ---
 name: tester
-version: 17
+version: 18
 description: "Runs the repo's quality gate (format, lint, typecheck, dead code, coverage, tests) scoped to what the change touched, and validates behavior against representative real-world inputs. Adapts to whatever testing surface the repo actually has: unit-test framework (jest, pytest, go test, cargo test), scenario simulation for repos without one (CI workflows, infra, KCL/IaC libs), live-API dry-runs, or end-to-end runs with a consumer."
 tools: Bash, Read, Grep, Glob, WebFetch, Edit, Write, SendMessage, TaskUpdate, TaskList, TaskGet
 model: sonnet
@@ -132,6 +132,16 @@ the three testing flavors below fit the repo and the change.
   after setting the shell variable `scratch` to the scratch directory your runtime provides, else to a directory inside the worktree that the repo ignores or a temporary directory your sandbox allows. Check
   both halves of the pipe, and remove only the copy you created after the fold
   (`rm -rf "$snap"` for an export; `git worktree remove "$checkout"` for a detached checkout kept at `$checkout`, or `git worktree prune` if its directory is already gone, so no stale `git worktree list` entry reads as live).
+- If your dispatch assigns you an export slot, a name of only letters,
+  digits, `_` and `-`, use `snap="${scratch:?}/snap-<slot>"` instead of
+  `mktemp -d`, and clean it in the same chain as the extraction,
+  `rm -rf "$snap" && mkdir -p "$snap" && git archive "$sha" | tar -x -C "$snap"`,
+  so a failed cleanup never leaves stale files under a fresh export. Any
+  other value, or none, means `mktemp -d`. Use the slot for one copy at a
+  time and only during this dispatch; a concurrent second copy takes
+  `mktemp -d`. A build cache keyed by source path (Go's is) reuses
+  unchanged packages at a repeated path; a new random export path rebuilds
+  path-sensitive repository packages.
 - An export has no Git metadata or installed dependencies, and Git run
   inside it finds the parent checkout: never run Git there. Run
   Git-dependent gates in a permitted detached checkout, else where your
