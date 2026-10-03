@@ -33,6 +33,7 @@ import { PlanRejectedError } from "./executor.js";
 import type { BoundaryPermit, BoundaryRequest, BoundarySink, BoundaryStep, SafeBoundary } from "./harness.js";
 import { SinkGate } from "./sink-gate.js";
 import { cloneKeyOf } from "./attempt-path.js";
+import type { RunProcessReap } from "./run-procs.js";
 import {
   LiveAttemptRegistry,
   describeProcesses,
@@ -859,6 +860,44 @@ class RunResidueBlockedError extends Error {
     this.detail = clean;
     this.name = "RunResidueBlockedError";
   }
+}
+
+/** Most pids a HOME-attributed reap verdict names in its detail (the detail reaches failure_reason). */
+const ATTRIBUTED_REAP_DETAIL_PIDS = 5;
+
+/** Why a HOME-attributed reap is not a clean pass, or undefined when it is. `left` wins over
+ *  `incomplete`: a named survivor is the stronger statement. */
+function attributedReapCause(reap: RunProcessReap | { failure: string }): { state: "survivors" | "unverified"; detail: string } | undefined {
+  if ("failure" in reap) return { state: "unverified", detail: `run HOME-attributed reap failed: ${reap.failure}` };
+  if (reap.left.length > 0) {
+    const shown = reap.left.slice(0, ATTRIBUTED_REAP_DETAIL_PIDS).join(",");
+    const more = reap.left.length > ATTRIBUTED_REAP_DETAIL_PIDS ? `,+${reap.left.length - ATTRIBUTED_REAP_DETAIL_PIDS} more` : "";
+    return { state: "survivors", detail: `run HOME-attributed reap left ${reap.left.length} process(es): pids ${shown}${more}` };
+  }
+  if (!reap.complete) return { state: "unverified", detail: "run HOME-attributed reap incomplete" };
+  return undefined;
+}
+
+/**
+ * issue #1828: fold the run's HOME-attributed reap into the process verdict quiesceRun returns.
+ * A reap that left survivors makes the verdict `survivors`, an otherwise incomplete (or failed)
+ * one `unverified`; both block every caller. An already non-quiescent verdict keeps its state and
+ * processes and gains the cause in its detail. The reap's killed pids join `killed` either way.
+ */
+function foldAttributedReap(outcome: QuiesceRunOutcome, reap: RunProcessReap | { failure: string }): QuiesceRunOutcome {
+  const killed = "failure" in reap ? [] : reap.killed;
+  const cause = attributedReapCause(reap);
+  const prior = outcome.process;
+  if (!prior) {
+    if (!cause) return outcome;
+    return { ...outcome, process: { state: cause.state, processes: [], killed, detail: cause.detail } };
+  }
+  const merged = [...killed, ...prior.killed];
+  if (!cause) return { ...outcome, process: { ...prior, killed: merged } };
+  if (prior.state === "quiescent") {
+    return { ...outcome, process: { state: cause.state, processes: [], killed: merged, detail: cause.detail } };
+  }
+  return { ...outcome, process: { ...prior, killed: merged, detail: `${prior.detail}; ${cause.detail}` } };
 }
 
 /**
@@ -7516,6 +7555,31 @@ export class RunRunner {
     // phase), before the clone/fetch writes to it. An optimisation only: free-space checks cannot
     // remove races, so the typed handling around ensureClone below is the guarantee.
     await this.preflightDataVolume(claim, flight);
+    // issue #1828: a RESUMED run's HOME (agent-home/<runId>) is already on disk, and a process the
+    // pinned CLI detached during its earlier attempt can still hold it. The clone fetch below runs
+    // git children with the forge PAT in their environment, which such a survivor could read from
+    // /proc, so reap the run's HOME-attributed processes first and fail closed. Placed OUTSIDE the
+    // try below: a RunResidueBlockedError is a worker fault, never a forge-unreachable park, and
+    // executeClaim's generic arm fails the run worker_residue_blocked with no credentialed settle.
+    // A fresh run has no HOME yet, so nothing is reaped.
+    const executor = flight.executor;
+    if (flight.runHome && !executor.safety && process.platform === "linux" && executor.reapAttributedProcesses) {
+      const homeExists = await fs.stat(flight.runHome).then(
+        () => true,
+        () => false,
+      );
+      if (homeExists) {
+        const reap = await executor.reapAttributedProcesses();
+        if (!reap.complete || reap.left.length > 0) {
+          const detail = attributedReapCause(reap)?.detail ?? "run HOME-attributed reap incomplete";
+          runLog.warn("resumed run: HOME-attributed processes survive; failing before the clone fetch", {
+            run_id: runId,
+            detail: sanitizeForLog(detail),
+          });
+          throw new RunResidueBlockedError(detail);
+        }
+      }
+    }
     let barePath: string;
     try {
       // PRD #1809 D6: a clone/fetch that fails because the data volume is full runs the D7
@@ -9249,12 +9313,13 @@ export class RunRunner {
     // finally; this is the explicit, load-bearing call at the security boundary.
     // The group kill alone misses a subprocess the agent backgrounded from a Bash
     // command (the pinned CLI runs each one detached, in its own session and
-    // group), so the attributed reap (PRD #1809 D4, run-procs.ts: every process
-    // carrying this run's HOME or working inside its trees) follows it, awaited
-    // before this returns to the push. A process that has dropped both (another
-    // HOME and a working directory outside the run) is beyond either reap.
+    // group). The HOME-attributed reap (PRD #1809 D4, run-procs.ts: every process carrying this
+    // run's HOME or working inside its trees) no longer runs here: it is part of quiesceRun and
+    // fails closed in the finalize gate (quiesceRun site `finalize`) before any push, so an
+    // incomplete reap or a survivor blocks the push instead of being logged and ignored. A
+    // process that has dropped both (another HOME and a working directory outside the run) is
+    // beyond either reap.
     executor.killAgentTree?.();
-    await executor.reapAttributedProcesses?.();
     flight.result = result;
     return result;
   }
@@ -9429,6 +9494,10 @@ export class RunRunner {
    * issue #1783 — quiesce this flight's clone, INSIDE the flight's sink gate: the literal
    * `killAgentTree` reap, then the process reaper (Claude/stub only: a Codex run, `executor.safety`
    * set, has its supervisor prove process drain), then the Docker teardown (every executor).
+   * issue #1828: for a non-Codex run in mode `own` (or a predecessor capture) on Linux, the
+   * executor's HOME-attributed reap (`reapAttributedProcesses`) runs first and is folded into the
+   * process verdict: survivors it left make it `survivors`, an incomplete or failed reap
+   * `unverified`.
    * `blocked` is true when the process half is `survivors` or `unverified`; every caller fails
    * closed on both identically. The Docker result never blocks; it is logged. Never throws.
    *
@@ -9452,12 +9521,30 @@ export class RunRunner {
         mode = "capture";
         pinnedTargets = [flight.worktreePath];
       }
+      // issue #1828: the HOME-attributed reap (executor.reapAttributedProcesses) catches what the
+      // clone-scoped sweep cannot: a process the pinned CLI detached that holds this run's HOME.
+      // It runs in mode `own` and for a predecessor capture (the same run's HOME, no agent started
+      // yet), never for a Codex run (its supervisor proves drain) and, like the `processes` flag
+      // below, only on Linux. It runs BEFORE the no-clone early return so a missing clone cannot
+      // skip the HOME reap, and its rejection (the contract says never) reads as unverified.
+      let attributedReap: RunProcessReap | { failure: string } | undefined;
+      if (
+        (mode === "own" || flight.predecessorCapture) &&
+        !executor.safety &&
+        process.platform === "linux" &&
+        executor.reapAttributedProcesses
+      ) {
+        try {
+          attributedReap = await executor.reapAttributedProcesses();
+        } catch (err) {
+          attributedReap = { failure: errMessage(err) };
+        }
+      }
+      const fold = (o: QuiesceRunOutcome): QuiesceRunOutcome => (attributedReap ? foldAttributedReap(o, attributedReap) : o);
       const clonePath = opts.clonePath ?? (flight.predecessorCapture ? flight.worktreePath : undefined) ?? flight.attempt?.clonePath ?? flight.worktreePath;
       if (!clonePath) {
-        return {
-          outcome: { process: undefined, docker: { state: "not_wired", removed: [], detail: "no clone to quiesce" } },
-          blocked: false,
-        };
+        const noClone = fold({ process: undefined, docker: { state: "not_wired", removed: [], detail: "no clone to quiesce" } });
+        return { outcome: noClone, blocked: noClone.process !== undefined && noClone.process.state !== "quiescent" };
       }
       const { cloneKey, canonicalPath } = cloneKeyOf(clonePath);
       // issue #1783 M2: an attempt clone's own PATH footprint is its attempt path alone: the key's
@@ -9494,6 +9581,7 @@ export class RunRunner {
           docker: { state: "docker_error", removed: [], detail: errMessage(err) },
         };
       }
+      outcome = fold(outcome);
       const blocked = outcome.process !== undefined && outcome.process.state !== "quiescent";
       if (blocked) {
         flight.runLog.warn("run clone is not quiescent", {
