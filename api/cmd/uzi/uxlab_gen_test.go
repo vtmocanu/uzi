@@ -184,6 +184,10 @@ func splitScene(dark bool, now time.Time, scene string) string {
 	repo := apitypes.RepoDTO{ID: "r1", PathWithNamespace: "vtmocanu/uzi", Enabled: true,
 		WebURL: "https://github.com/vtmocanu/uzi"}
 	fake := &uzicli.FakeClient{Runs: boardRuns(now), Repos: []apitypes.RepoDTO{repo}}
+	if scene == "needs-you" {
+		fake.Runs = []apitypes.RunListItemDTO{fake.Runs[1]}
+		fake.Runs[0].CurrentActivity = activityFor("lead", "Review the plan before approval", now)
+	}
 	m := uxModel(fake, "", dark)
 	width, height := 100, 60
 	if scene == "min" {

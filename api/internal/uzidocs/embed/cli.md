@@ -1452,7 +1452,8 @@ shared header, separator, footer, each pane's worst-case headings and
 spacers, and eight actual list rows per pane; the layout changes only on
 a resize. If the
 terminal is too small, `s` shows `terminal too small to split` and keeps
-the current layout.
+the current layout. Split hints and size notes yield to the existing keys
+and version readout when the footer is too narrow.
 
 To keep the full-screen lists at every terminal size, set this in
 `~/.config/uzi/config.toml`:

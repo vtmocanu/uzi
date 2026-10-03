@@ -803,8 +803,13 @@ func (m tuiModel) pullTitleColor(band int, sel bool) color.Color {
 // when the forge reported mergeability, the conflicts note against the target branch.
 func (m tuiModel) pullSecondLine(pr apitypes.PullDTO) string {
 	bg := m.pal.selBg
+	prefix := paintSeg(m.pal.tungsten, bg, false, "  ▸ ")
+	if m.splitDrawn() && m.view != viewPulls {
+		bg = nil
+		prefix = paintSeg(m.pal.faintC, bg, false, "  › ")
+	}
 	var b strings.Builder
-	b.WriteString(paintSeg(m.pal.tungsten, bg, false, "  ▸ "))
+	b.WriteString(prefix)
 	b.WriteString(paintSeg(m.pal.faintC, bg, false, "updated "+relAge(pr.UpdatedAt)))
 	if pr.Conflicts != nil {
 		note := "no conflicts with "
@@ -916,7 +921,7 @@ func (m tuiModel) pullsFooter() string {
 	}
 	parts = append(parts, m.keyHint("tab", "views"), m.keyHint("r", "refresh"),
 		m.keyHint("?", "keys"), m.keyHint("q", "quit"))
-	return " " + strings.Join(parts, m.pal.faint.Render(" · "))
+	return m.withSplitNote(" " + strings.Join(parts, m.pal.faint.Render(" · ")))
 }
 
 // ---- links + errors -------------------------------------------------------

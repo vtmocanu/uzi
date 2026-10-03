@@ -528,6 +528,11 @@ func (m tuiModel) boardShowSecondLine(r apitypes.RunListItemDTO) bool {
 // padded to the full width so the selection bar spans the row.
 func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 	bg := m.pal.selBg
+	prefix := paintSeg(m.pal.tungsten, bg, false, "  ▸ ")
+	if m.splitDrawn() && m.view != viewBoard {
+		bg = nil
+		prefix = paintSeg(m.pal.faintC, bg, false, "  › ")
+	}
 	// PRD #1590 D6: a run held on its Codex account has no live activity; its second line is
 	// what the account needs next, in the wait ink (a relogin_required hold reads "codex login" and
 	// bands into NEEDS YOU via runBandOf; its line keeps the wait ink). The line carries
@@ -540,7 +545,7 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 		line = credentialDisabledLine(r.RunDTO)
 	}
 	if line != "" {
-		out := paintSeg(m.pal.tungsten, bg, false, "  ▸ ") + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 120))
+		out := prefix + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 120))
 		return padSeg(clampVisual(out, m.width), m.width, bg)
 	}
 	// Issue #1766: a vault_locked park likewise has no live activity; its second line is the
@@ -551,13 +556,13 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 	// narrow terminal. The 240-rune Plain cap (D7 sanitize backstop) sits above the full
 	// sentence's length so the wide form is never cut.
 	if line := fitVaultParkLine(r.RunDTO, m.width-4); line != "" {
-		out := paintSeg(m.pal.tungsten, bg, false, "  ▸ ") + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 240))
+		out := prefix + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 240))
 		return padSeg(clampVisual(out, m.width), m.width, bg)
 	}
 	// PRD #1809 M5: a data_volume_full park, in the same slot, ink and shedding as the vault
 	// park above (the two are distinct recovery_wait causes, so at most one draws).
 	if line := fitDiskParkLine(r.RunDTO, m.width-4); line != "" {
-		out := paintSeg(m.pal.tungsten, bg, false, "  ▸ ") + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 240))
+		out := prefix + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 240))
 		return padSeg(clampVisual(out, m.width), m.width, bg)
 	}
 	act := r.CurrentActivity
@@ -565,7 +570,7 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString(paintSeg(m.pal.tungsten, bg, false, "  ▸ "))
+	b.WriteString(prefix)
 	if id, title := milestoneInProgress(r.RunDTO); id != "" {
 		b.WriteString(paintSeg(m.pal.wait, bg, false, m.renderer.Plain(id, 12)))
 		if title != "" {

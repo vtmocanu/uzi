@@ -657,8 +657,13 @@ func (m tuiModel) ciJobBar(done, total int, bg color.Color) string {
 func (m tuiModel) ciSecondLine(r apitypes.CIRunDTO) string {
 	t := ciTextOf(r)
 	bg := m.pal.selBg
+	prefix := paintSeg(m.pal.tungsten, bg, false, "  ▸ ")
+	if m.splitDrawn() && m.view != viewCI {
+		bg = nil
+		prefix = paintSeg(m.pal.faintC, bg, false, "  › ")
+	}
 	var b strings.Builder
-	b.WriteString(paintSeg(m.pal.tungsten, bg, false, "  ▸ "))
+	b.WriteString(prefix)
 	b.WriteString(paintSeg(m.pal.faintC, bg, false, m.renderer.Plain(t.runSHA, ciSHAWidth)))
 	b.WriteString(paintSeg(m.pal.faintC, bg, false, " · "))
 	b.WriteString(paintSeg(m.pal.sage, bg, false, m.renderer.Plain(t.actorLogin, 20)))
@@ -765,7 +770,7 @@ func (m tuiModel) ciFooter() string {
 	}
 	parts = append(parts, m.keyHint("tab", "views"), m.keyHint("r", "refresh"),
 		m.keyHint("?", "keys"), m.keyHint("q", "quit"))
-	return " " + strings.Join(parts, m.pal.faint.Render(" · "))
+	return m.withSplitNote(" " + strings.Join(parts, m.pal.faint.Render(" · ")))
 }
 
 // ciLink wraps an already-styled `<Name> #<Number>` segment in an OSC-8 hyperlink to the run's

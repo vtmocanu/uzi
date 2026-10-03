@@ -16,6 +16,8 @@ Acceptance examples:
 2. With the split showing and the floor focused, `enter` on a run opens run detail full-screen; `esc` returns to the split with the floor focused and its cursor where it was. Same for `enter` on a CI run or a PR from the focused bottom pane: `esc` returns to the split with the bottom pane focused on the same tab, cursor and repo.
 3. The window shrinks below the split threshold while the bottom pane has focus: the TUI shows the floor full-screen. Growing back restores the split with the bottom pane on the tab, cursor and repo it had, floor focused. `s` collapses the split the same way and keeps it collapsed through later resizes until `s` is pressed again; while collapsed on a tall-enough terminal the footer shows a faint `s split` hint. With `[tui] split = "off"` in `~/.config/uzi/config.toml` the TUI behaves exactly as today at any size.
 
+Collapsed restore hints and size notes yield to the existing footer when they do not fit; they never truncate keys or the version readout.
+
 ## Out of scope
 
 - A vertical (side-by-side) split, more than two panes, user-resizable pane ratios, a configurable default bottom tab.
@@ -80,7 +82,7 @@ The split keys are handled in `handleKey` after the modal and `filtering()` chec
 
 - with the split drawn: session-off, collapse to the floor full-screen;
 - session-off: clear it; the split returns if eligible;
-- latch off (too short or narrow) and session-off unset: no state change, one-line footer note `terminal too small to split` until the next key;
+- latch off (too short or narrow) and session-off unset: no state change, footer note `terminal too small to split` until the next key, when it fits alongside the existing keys and version readout;
 - config `off`: no effect at all (config wins).
 
 When the split is not drawn, every other key behaves exactly as today.
@@ -184,3 +186,4 @@ A linked `acceptance` issue: on a real terminal against the hosted server, check
 - **D11: the separator carries the bottom list's tabs, filter, summary and repo; the header carries only the floor tab.** Two bold tabs in one strip could not say which has focus; the list brand line those readouts used to sit on does not exist in a pane.
 - **D12: no sketch-harness milestone; uxlab scenes plus a visual review gate at landing.** The uxlab generator drives the shipped `tuiModel`, so its scenes preview the real thing; a sketch would be thrown away (`.claude/rules/tui.md`). The PNG review runs in the landing session because it needs the devbox render toolchain.
 - **D13: pulls ships with the split, not as its own milestone.** Without it `2` in the split has no defined meaning and the pulls poll gate stays focus-only; it has no value on its own.
+- **D14: collapsed split notes never cost existing footer content.** Drop a note when it cannot fit alongside the complete footer. With no room for the note, the frame matches config `off` at the same size. Pre-existing full-screen hint clipping is separate work.

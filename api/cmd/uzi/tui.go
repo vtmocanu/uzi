@@ -1692,17 +1692,6 @@ func (m tuiModel) View() tea.View {
 	default:
 		body = m.renderBoard()
 	}
-	if m.listView() && !m.splitDrawn() && !m.quitting && !m.showHelp && !m.updatePrompt.showing && (m.splitNote != "" || (m.splitOff && m.splitLatch && m.splitMode != "off")) {
-		lines := strings.Split(body, "\n")
-		if len(lines) > 0 {
-			note := m.splitNote
-			if note == "" {
-				note = "s split"
-			}
-			lines[len(lines)-1] = clampVisual(" "+m.pal.faint.Render(note)+" · "+strings.TrimPrefix(lines[len(lines)-1], " "), m.width)
-			body = strings.Join(lines, "\n")
-		}
-	}
 	v.SetContent(body)
 	return v
 }
@@ -1710,7 +1699,17 @@ func (m tuiModel) View() tea.View {
 func (m tuiModel) renderHelp() string {
 	lines := helpLines(m.view)
 	if m.splitEligible() && m.listView() {
-		lines = append(lines, "tab / shift+tab  cycle floor, ci, pulls", "ctrl+w           switch pane focus", "1 / 2 / 3        focus floor / pulls / ci", "s                collapse / restore split")
+		for i, line := range lines {
+			if strings.HasPrefix(line, "tab ") {
+				lines[i] = "tab        cycle floor, ci, pulls"
+			} else if strings.HasPrefix(line, "1 / 2 / 3 ") {
+				lines[i] = "1 / 2 / 3  focus floor / pulls / ci"
+			}
+		}
+		if m.view == viewBoard {
+			lines = append(lines, "1 / 2 / 3  focus floor / pulls / ci")
+		}
+		lines = append(lines, "shift+tab  cycle floor, pulls, ci", "ctrl+w     switch pane focus", "s          collapse / restore split")
 	}
 	return m.pal.title.Render("keybindings") + "\n\n" +
 		strings.Join(lines, "\n") + "\n\n" +

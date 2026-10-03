@@ -178,7 +178,9 @@ func (m tuiModel) splitSeparatorLine() string {
 	}
 	line += "   " + summary
 	if repo, ok := m.currentRepo(); ok {
-		line += "   " + m.renderer.Plain(repo.PathWithNamespace, 16)
+		if width := m.width - visualWidth(line) - 3; width >= 16 {
+			line += "   " + clampVisual(m.renderer.Plain(repo.PathWithNamespace, width), width)
+		}
 	}
 	line = clampVisual(line, m.width)
 	if rest := m.width - visualWidth(line); rest > 0 {
@@ -186,6 +188,25 @@ func (m tuiModel) splitSeparatorLine() string {
 	}
 	return line
 }
+
+// A split note yields to the complete footer, including its version readout.
+func (m tuiModel) withSplitNote(footer string) string {
+	if m.splitMode == "off" || !m.listView() || m.splitDrawn() {
+		return footer
+	}
+	note := m.splitNote
+	if note == "" && m.splitOff && m.splitLatch {
+		note = "s split"
+	}
+	if note != "" {
+		candidate := " " + m.pal.faint.Render(note) + " · " + strings.TrimPrefix(footer, " ")
+		if visualWidth(candidate) <= m.width {
+			return candidate
+		}
+	}
+	return footer
+}
+
 func (m tuiModel) splitFooterLine() string {
 	var hints []string
 	if m.view == viewBoard {
