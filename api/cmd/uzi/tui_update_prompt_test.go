@@ -329,8 +329,18 @@ func TestUpdatePromptStripsControlBytes(t *testing.T) {
 
 func TestBrewOwnerAndPromptChannels(t *testing.T) {
 	for _, tc := range []struct{ name, current, stable, rc, owner, want string }{
-		{"rc owner", "v0.84.0-rc.1", "v0.90.0", "v0.84.0-rc.2", "uzi-cli-rc", "v0.84.0-rc.2"},
-		{"rc ignores stable", "v0.84.0-rc.1", "v0.90.0", "", "uzi-cli-rc", ""},
+		{"rc owner selects newer stable", "v0.84.0-rc.1", "v0.90.0", "v0.84.0-rc.2", "uzi-cli-rc", "v0.90.0"},
+		{"rc offers stable without rc", "v0.85.0-rc.11", "v0.85.0", "", "uzi-cli-rc", "v0.85.0"},
+		{"rc selects higher rc", "v0.85.0-rc.11", "v0.85.0", "v0.86.0-rc.1", "uzi-cli-rc", "v0.86.0-rc.1"},
+		{"stable binary on rc channel offers rc", "v0.85.0", "v0.85.0", "v0.86.0-rc.1", "uzi-cli-rc", "v0.86.0-rc.1"},
+		{"stable binary on rc channel offers stable", "v0.85.0", "v0.86.0", "", "uzi-cli-rc", "v0.86.0"},
+		{"rc already on stable", "v0.85.0", "v0.85.0", "v0.85.0-rc.11", "uzi-cli-rc", ""},
+		{"rc rejects malformed stable", "v0.85.0-rc.11", "v0.90.0.1", "", "uzi-cli-rc", ""},
+		{"rc rejects beta stable fact", "v0.85.0-rc.11", "v0.90.0-beta.1", "", "uzi-cli-rc", ""},
+		{"rc stable fact must be stable", "v0.85.0-rc.11", "v0.90.0-rc.1", "", "uzi-cli-rc", ""},
+		{"rc ignores malformed rc when stable valid", "v0.85.0-rc.11", "v0.85.0", "v0.90.0-rc.01", "uzi-cli-rc", "v0.85.0"},
+		{"rc ignores malformed stable when rc valid", "v0.85.0-rc.11", "dev", "v0.86.0-rc.1", "uzi-cli-rc", "v0.86.0-rc.1"},
+		{"stable accepts version metadata", "v0.83.0", "v0.85.0+build", "", "uzi-cli", "v0.85.0+build"},
 		{"stable ignores rc", "v0.83.0", "", "v0.90.0-rc.1", "uzi-cli", ""},
 		{"stable rejects beta", "v0.83.0", "v0.85.0-beta.1", "", "uzi-cli", ""},
 		{"unknown stable rejects beta", "v0.83.0", "v0.85.0-beta.1", "", "", ""},
@@ -338,7 +348,8 @@ func TestBrewOwnerAndPromptChannels(t *testing.T) {
 		{"rc rejects extended rc", "v0.84.0-rc.1", "", "v0.85.0-rc.1.extra", "uzi-cli-rc", ""},
 		{"rc rejects beta", "v0.84.0-rc.1", "", "v0.85.0-beta.1", "uzi-cli-rc", ""},
 		{"stable rejects malformed", "v0.83.0", "v0.85.0-beta.01", "", "uzi-cli", ""},
-		{"unknown rc without fact", "v0.84.0-rc.1", "v0.90.0", "", "", ""},
+		{"unknown rc offers stable notes", "v0.85.0-rc.11", "v0.85.0", "", "", "v0.85.0"},
+		{"unknown rc offers newer rc notes", "v0.85.0-rc.11", "v0.85.0", "v0.86.0-rc.1", "", "v0.86.0-rc.1"},
 		{"handbuilt with both installed", "v0.83.0", "v0.85.0", "v0.90.0-rc.1", "", "v0.85.0"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -442,10 +453,10 @@ func TestUpdatePromptUsesNewRCFactOnLaterPoll(t *testing.T) {
 	withVersion(t, "v0.84.0-rc.1")
 	m := updatePromptModel(t)
 	m.updatePrompt.owner = "uzi-cli-rc"
-	next, _ := m.Update(buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: "v0.84.0"}})
+	next, _ := m.Update(buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: "v0.83.0"}})
 	m = next.(tuiModel)
 	if m.updatePrompt.showing || m.updatePrompt.shownThisSession {
-		t.Fatal("a missing RC fact must not latch the prompt")
+		t.Fatal("no newer release fact must not latch the prompt")
 	}
 	next, _ = m.Update(buildInfoMsg{latestRC: &apitypes.LatestReleaseDTO{Version: "v0.84.0-rc.2"}})
 	m = next.(tuiModel)
@@ -617,7 +628,7 @@ func TestBuildInfoCarriesLatestRCAndRendersSafely(t *testing.T) {
 	nasty := "\x1b[2J" + string(rune(0x202e)) + "\x07\x01"
 	fake := &uzicli.FakeClient{Build: apitypes.BuildInfoDTO{
 		Version:  "v0.83.0-rc.1",
-		Latest:   &apitypes.LatestReleaseDTO{Version: "v0.90.0"},
+		Latest:   &apitypes.LatestReleaseDTO{Version: "v0.82.0"},
 		LatestRC: &apitypes.LatestReleaseDTO{Version: "v0.83.0-rc.2", Name: nasty + "rcname", NotesURL: nasty + "rcurl"},
 	}}
 	m := updatePromptModel(t)

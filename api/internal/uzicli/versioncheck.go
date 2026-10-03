@@ -46,7 +46,8 @@ func normSemver(v string) string {
 func IsStampedVersion(v string) bool { return semver.IsValid(normSemver(v)) }
 
 // SkewWarning reports whether the CLI is BEHIND the server, and the line to print.
-// ok == false means print nothing.
+// ok == false means print nothing. owner is a proven Homebrew formula name, or
+// empty to infer the remedy from the stamped release channel.
 //
 // 🔴 THE CALLER MUST SANITIZE serverVersion BEFORE CALLING THIS, AT PRINT TIME.
 // serverVersion is attacker-controlled: GET /api/version passes the server's stamp
@@ -65,7 +66,7 @@ func IsStampedVersion(v string) bool { return semver.IsValid(normSemver(v)) }
 // "warn" and would tell every developer running a `go build` binary to
 // `brew upgrade`. Copy the SHAPE (re-prefix -> IsValid -> Compare), not the
 // disposition.
-func SkewWarning(cliVersion, serverVersion string) (string, bool) {
+func SkewWarning(cliVersion, serverVersion, owner string) (string, bool) {
 	cli, srv := normSemver(cliVersion), normSemver(serverVersion)
 	// The two guards cover different populations — the CLI side covers `dev` (every
 	// developer build and every test binary), the server side covers a compose
@@ -106,9 +107,14 @@ func SkewWarning(cliVersion, serverVersion string) (string, bool) {
 	// instruction has been EXECUTED. `uzi:` (colon) and `uzi-cli` (hyphen) each miss
 	// that class by one character. If a future reword reddens that test, reword
 	// again — never register.
-	formula := "uzi-cli"
-	if isRCPrerelease(cli) {
-		formula = "uzi-cli-rc"
+	// Ownership is independent of the binary's version: the RC formula also
+	// ships stable releases. Unknown ownership retains the stamped-channel fallback.
+	formula := owner
+	if formula != "uzi-cli" && formula != "uzi-cli-rc" {
+		formula = "uzi-cli"
+		if isRCPrerelease(cli) {
+			formula = "uzi-cli-rc"
+		}
 	}
 	return fmt.Sprintf(
 		"uzi: CLI %s is behind server %s; some fields may be missing. Run: brew upgrade %s",

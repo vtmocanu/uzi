@@ -1222,8 +1222,9 @@ also the TUI's own fallback when the live channel is unreachable (below).
 
 At startup, `uzi tui` checks for a newer release in the running CLI's channel
 and, if one exists, shows a modal on top of the board. A stable
-`uzi-cli` install checks stable releases; an `uzi-cli-rc` install checks release
-candidates. A stable install looks like this:
+`uzi-cli` install checks stable releases; an `uzi-cli-rc` install checks the newer
+of the latest stable and latest release candidate, while staying on its opt-in
+formula. A stable install looks like this:
 
 ```
 ▲ Update available
@@ -1238,8 +1239,8 @@ A newer release is available.
 
 - **A Homebrew install** gets the "Update now" action for the formula that owns
   the running binary: `brew upgrade uzi-cli` for stable or
-  `brew upgrade uzi-cli-rc` for an RC. Choosing it exits the TUI and runs the
-  command in the foreground, so the source-build output and any failure stay
+  `brew upgrade uzi-cli-rc` for the RC channel, even when it currently runs a stable
+  version. Choosing it exits the TUI and runs the command in the foreground, so the source-build output and any failure stay
   visible, then tells you to rerun
   `uzi tui`. It never upgrades silently in the background while the TUI keeps
   running. For an eligible **stamped** binary whose formula ownership cannot be
@@ -1251,9 +1252,10 @@ A newer release is available.
 - **Gating mirrors** [the CLI-vs-server skew warning](#when-your-cli-is-older-than-the-server):
   shown only for a stamped release build (a `go build`/`dev` binary never
   prompts), and it honours the same off-switches — `UZI_VERSION_CHECK=0` and
-  `--quiet`. A stable install never offers a prerelease (`-rc.N`); an RC install
-  only offers a newer RC. If no newer RC exists, it shows nothing, even when a
-  stable release is newer.
+  `--quiet`. A stable install never offers a prerelease (`-rc.N`); an RC-channel
+  install offers whichever valid stable or RC release is newest, when newer than
+  the running binary. An unknown owner running an RC build uses the same selection
+  but only gets release notes, never a Homebrew action.
 - **"Don't remind me for `<version>`"** is remembered per release version (a
   later release re-prompts anyway); **"Not now"** (or `esc`) just closes the
   modal for this session, with nothing persisted, and it shows at most once
@@ -2412,7 +2414,10 @@ one line to **stderr** when it is behind:
 uzi: CLI v0.11.8 is behind server 0.14.0; some fields may be missing. Run: brew upgrade uzi-cli
 ```
 
-An RC-stamped CLI names the RC formula instead, for example:
+A CLI owned by the RC formula names that formula even when it runs a stable
+version. Ownership is resolved from the executable's Homebrew path without running
+`brew`; if ownership is unknown, the stamped `-rc.N` suffix selects the RC remedy.
+For example:
 
 ```
 uzi: CLI v0.85.0-rc.2 is behind server 0.85.0-rc.3; some fields may be missing. Run: brew upgrade uzi-cli-rc

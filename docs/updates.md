@@ -65,8 +65,10 @@ The instance update signal and the `uzi-cli` TUI prompt use GitHub's
 `releases/latest`, which excludes prereleases. Stable users never see a candidate
 as an available update. Separately, the api checks the published releases list
 for the newest `vX.Y.Z-rc.N` and makes it available to the TUI. An
-`uzi-cli-rc` install is prompted only for a newer candidate and upgrades with
-`brew upgrade uzi-cli-rc`. A stable release alone does not prompt an RC install.
+`uzi-cli-rc` install compares against the newer of the latest stable and latest
+candidate and upgrades with `brew upgrade uzi-cli-rc`, staying on its opt-in channel
+even when stable is newest. An unknown owner running an RC build uses the same
+selection but gets release notes without a Homebrew action.
 The check clears its cached RC fact when no candidate remains in the published
 release list, as happens after stable promotion prunes superseded RC entries.
 

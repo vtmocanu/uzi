@@ -751,7 +751,7 @@ Completes Feature #64/#175: `uzi version` reported both versions and never compa
   [user 2026-08-03, chosen from three placements]
 - The warning goes to stderr. stdout and the exit code are unchanged. [user 2026-08-03]
 - The server's version is probed on a cache, never once per command. [user 2026-08-03]
-- The warning's remedy follows the CLI's stamped channel: `-rc.N` builds say `brew upgrade uzi-cli-rc`; stable builds say `brew upgrade uzi-cli`. (AI-synced 2026-09-29, #1890)
+- The warning's remedy names the Homebrew formula owning the executable, resolved without a `brew` subprocess; unknown ownership falls back to the stamped channel (`-rc.N` selects `uzi-cli-rc`, otherwise `uzi-cli`). (AI-synced 2026-10-03, #2180)
 
 ## Feature #325 — TUI redesign ("factory shift board")
 
@@ -816,7 +816,7 @@ Tracked as GitHub issue vtmocanu/uzi#1226 (parent epic #1225); PRD at `prds/done
 
 Tracked as GitHub issue vtmocanu/uzi#1265; PRD at `prds/1265-rc-release-train.md`.
 
-- Releases are cut as release candidates by default; a stable release is promoted from the candidate's own commit. Stable-facing update surfaces (the `uzi-cli` formula, the GitHub Release marked latest, and the TUI update prompt for stable installs) never surface a candidate; the TUI update prompt for a `uzi-cli-rc` install offers newer candidates only. (AI-synced 2026-09-29, #1890)
+- Releases are cut as release candidates by default; a stable release is promoted from the candidate's own commit. Stable-facing update surfaces (the `uzi-cli` formula, the GitHub Release marked latest, and the TUI update prompt for stable installs) never surface a candidate; the `uzi-cli-rc` formula and its TUI prompt follow the newer of stable and RC releases without changing formula ownership. Unknown-owner RC builds get the same selection with release notes only. Tap writes skip equal/older versions and refuse unreadable or malformed current versions. (AI-synced 2026-10-03, #2180)
 
 ## Feature #1349 — Recovery custody hardening
 

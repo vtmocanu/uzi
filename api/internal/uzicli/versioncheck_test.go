@@ -80,7 +80,7 @@ var skewRows = []skewRow{
 func TestSkewWarning(t *testing.T) {
 	for _, r := range skewRows {
 		t.Run(r.name, func(t *testing.T) {
-			msg, ok := SkewWarning(r.cli, r.srv)
+			msg, ok := SkewWarning(r.cli, r.srv, "")
 			if ok != r.want {
 				t.Fatalf("SkewWarning(%q, %q) ok = %v, want %v (msg %q)", r.cli, r.srv, ok, r.want, msg)
 			}
@@ -116,7 +116,7 @@ func TestSkewWarningUsesStampedChannel(t *testing.T) {
 		{"other prerelease", "v0.85.0-beta.2", "0.85.0", "uzi-cli"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			msg, ok := SkewWarning(tc.cli, tc.server)
+			msg, ok := SkewWarning(tc.cli, tc.server, "")
 			if !ok {
 				t.Fatal("expected a skew warning")
 			}

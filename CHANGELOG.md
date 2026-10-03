@@ -27,6 +27,11 @@ through `[0.52.0]`.)
 - **Admin tabs group Site lists and Products after Branding, before Health.**
   Instance and Branding stay together; Site lists precedes Products to follow setup order, and Health remains last.
 
+### Fixed
+
+- **The opt-in RC Homebrew channel follows stable when it is newest ([#2180](https://github.com/vtmocanu/uzi/issues/2180)).**
+  Stable tags also advance `uzi-cli-rc`, and delayed or repeated publishes cannot downgrade either formula. The TUI offers the newer of stable and RC releases to RC-channel installs, while the CLI skew warning names the formula that owns the binary even when its version is stable. Unknown-owner prompts remain notes-only. Existing rc.10/rc.11 users should run `brew upgrade uzi-cli-rc` once after the tap is refreshed; upgrading to v0.85.0 clears the warning against a 0.85.0 server, but v0.85.0 does not contain the new prompt or remedy logic, which arrives in the first release containing this fix.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added

@@ -1,10 +1,11 @@
 # Regenerate a uzi CLI Homebrew formula for a v* tag and push it to vtmocanu/homebrew-tap.
 #
-# Two channels, routed by the tag (PRD #1378): a STABLE tag (vX.Y.Z) renders the `uzi-cli`
-# formula via `task brew:formula`; an RC tag (vX.Y.Z-rc.N) renders the separate, opt-in
-# `uzi-cli-rc` formula via `task brew-rc:formula`. Both compute the tag tarball's sha256,
-# substitute the url/sha256 placeholders in the matching Formula/*.rb template, and push
-# the rendered copy into the tap with `task <channel>:publish`. The mechanics live in the
+# Two channels (PRD #1378, issue #2180): a stable tag renders BOTH `uzi-cli` and
+# `uzi-cli-rc`; an RC tag renders only the opt-in `uzi-cli-rc` formula. Each channel
+# advances only when the incoming tag is newer than its current tap version.
+# Both compute the tag tarball's sha256, substitute the url/sha256 placeholders in
+# the matching Formula/*.rb template, and push the rendered copy into the tap with
+# `task <channel>:publish`. The mechanics live in the
 # vendored homebrew-tap.yml, included by uzi's Taskfile.yml under `brew:` and `brew-rc:`
 # (the two sanctioned includes, local vendored copies; see that file's rule 3).
 #
@@ -32,11 +33,8 @@ name: Brew
 # Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`.
 "on":
   push:
-    # Every v* tag, both channels (PRD #1378). A STABLE tag (vX.Y.Z) publishes the
-    # `uzi-cli` formula; an RC tag (vX.Y.Z-rc.N) publishes the separate, opt-in
-    # `uzi-cli-rc` formula, so stable users on `uzi-cli` never see a candidate while a
-    # dogfooder can `brew install vtmocanu/tap/uzi-cli-rc`. (Before #1378 the negative
-    # `!v*-*` pattern excluded RC tags entirely; now the Detect channel step routes them.)
+    # Stable tags advance both formulas; RC tags advance only `uzi-cli-rc`.
+    # Stable users never see a candidate; RC users stay at max(stable, RC).
     # The Validate step's regex is the SemVer gate for both channels, esp. workflow_dispatch.
     tags: ["v*"]
   workflow_dispatch:
@@ -54,8 +52,9 @@ concurrency:
   # from a fresh clone with no rebase/retry. A per-ref group would let them run
   # concurrently and collide on a non-fast-forward push, reddening one (PRD #1378 R5). One
   # shared group + cancel-in-progress:false serializes the promote's two publishes: one
-  # runs, the other pends, then runs (the channels render different formula files, so
-  # ordering is enough). A 3rd tag pushed inside that ~3-min window would displace the
+  # runs, the other pends, then runs. This serialization also protects the version
+  # guard's read-then-push interval; delayed runs skip instead of downgrading the tap.
+  # A 3rd tag pushed inside that ~3-min window would displace the
   # single pending slot; `queue: max` (a real GH Actions key since 2026-05-07) would hold
   # all pending runs, but the pinned actionlint rejects the `queue` key, so it is deferred
   # until that pin catches up -- and three simultaneous release tags is not a cadence the
@@ -90,42 +89,40 @@ jobs:
           fi
           echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
 
-      # Route the tag to a channel: a prerelease suffix (vX.Y.Z-rc.N) publishes the opt-in
-      # `uzi-cli-rc` formula via the `brew-rc:` task include; a stable tag publishes
-      # `uzi-cli` via `brew:`. The output is a fixed literal from this case (`brew` or
-      # `brew-rc`), never the raw tag, so it is safe to splice into the task target below.
-      - name: Detect channel
-        id: channel
-        env:
-          TAG: ${{ steps.tag.outputs.tag }}
-        run: |
-          set -euo pipefail
-          case "$TAG" in
-            *-*) ns=brew-rc ;;
-            *)   ns=brew ;;
-          esac
-          echo "ns=$ns" >> "$GITHUB_OUTPUT"
-
       - uses: arduino/setup-task@c0bc642852239c2689f73f4ea6459c29405f3c52  # v3.0.0
         with:
           version: 3.x
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Renders dist/<channel>.rb (auto-archive url + computed sha256) for the routed
-      # channel. Fails loudly on the empty-input digest (a bad tag / network failure).
-      # VERSION and CHANNEL_NS flow via env: (never string-interpolated into the run body),
-      # matching this repo's zizmor template-injection convention -- release.yml uses env:
-      # the same way. CHANNEL_NS is the fixed `brew`/`brew-rc` literal from Detect channel.
-      - name: Render formula
+      # The public tap API provides its current source, read as text (never Ruby
+      # eval). The shared concurrency group serializes each guard + publish pair.
+      # Git/read/parse failures refuse the write; only guard exit 3 means skip.
+      - name: Guard, render and publish channels
         env:
           VERSION: ${{ steps.tag.outputs.tag }}
-          CHANNEL_NS: ${{ steps.channel.outputs.ns }}
-        run: task --yes "${CHANNEL_NS}:formula" VERSION="$VERSION"
-
-      # Clones the tap with HOMEBREW_TAP_TOKEN, copies the rendered formula, commits + pushes.
-      - name: Publish to tap
-        env:
-          VERSION: ${{ steps.tag.outputs.tag }}
-          CHANNEL_NS: ${{ steps.channel.outputs.ns }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: task --yes "${CHANNEL_NS}:publish" VERSION="$VERSION" HOMEBREW_TAP_TOKEN="$HOMEBREW_TAP_TOKEN"
+        run: |
+          set -euo pipefail
+          case "$VERSION" in
+            *-*) channels=(brew-rc) ;;
+            *)   channels=(brew brew-rc) ;;
+          esac
+          for ns in "${channels[@]}"; do
+            case "$ns" in
+              brew) formula=uzi-cli ;;
+              brew-rc) formula=uzi-cli-rc ;;
+            esac
+            current="${RUNNER_TEMP}/current-${formula}.rb"
+            gh api --header 'Accept: application/vnd.github.raw+json' \
+              "repos/vtmocanu/homebrew-tap/contents/Formula/${formula}.rb?ref=main" > "$current"
+            if python3 scripts/brew-tap-guard.py "$VERSION" "$current"; then
+              task --yes "${ns}:formula" VERSION="$VERSION"
+              task --yes "${ns}:publish" VERSION="$VERSION" HOMEBREW_TAP_TOKEN="$HOMEBREW_TAP_TOKEN"
+            else
+              rc=$?
+              if [ "$rc" -ne 3 ]; then
+                exit "$rc"
+              fi
+            fi
+          done

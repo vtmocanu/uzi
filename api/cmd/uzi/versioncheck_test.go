@@ -2,6 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -728,5 +731,40 @@ func assertNoControlChars(t *testing.T, s string) {
 			t.Errorf("control or exotic-whitespace character %U at byte %d survived into output:\n%q", r, i, s)
 			return
 		}
+	}
+}
+
+// A stable binary can still belong to the opt-in RC formula after promotion.
+func TestSkewWarningUsesExecutableOwner(t *testing.T) {
+	for _, tc := range []struct{ name, current, owner, want string }{
+		{"stable binary on rc channel", "v0.85.0", "uzi-cli-rc", "uzi-cli-rc"},
+		{"rc binary on stable channel", "v0.85.0-rc.11", "uzi-cli", "uzi-cli"},
+		{"unknown stable", "v0.85.0", "", "uzi-cli"},
+		{"unknown rc", "v0.85.0-rc.11", "", "uzi-cli-rc"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withVersion(t, tc.current)
+			fc := &uzicli.FakeClient{Build: apitypes.BuildInfoDTO{Version: "0.86.0-rc.1"}}
+			env := skewEnv(t, fc)
+			exe := filepath.Join(t.TempDir(), "Cellar", tc.owner, "0.85.0", "bin", "uzi")
+			if tc.owner == "" {
+				exe = filepath.Join(t.TempDir(), "handbuilt", "uzi")
+			}
+			if err := os.MkdirAll(filepath.Dir(exe), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(exe, nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			env.Executable = func() (string, error) { return exe, nil }
+			env.Brew = func(bool, ...string) (string, error) {
+				t.Fatal("per-command skew check must not fork brew")
+				return "", errors.New("unexpected brew call")
+			}
+			_, errOut, code := runCLI(t, env, "run", "list", "--url", skewURL)
+			if code != uzicli.ExitOK || !strings.Contains(errOut, "Run: brew upgrade "+tc.want+"\n") {
+				t.Fatalf("code=%d, stderr=%q; want formula %s", code, errOut, tc.want)
+			}
+		})
 	}
 }

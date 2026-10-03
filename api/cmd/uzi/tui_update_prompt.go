@@ -83,18 +83,20 @@ func (m *tuiModel) maybeShowUpdatePrompt(latest, latestRC *apitypes.LatestReleas
 		}
 		return nil
 	}
-	if m.updatePrompt.owner == "uzi-cli-rc" || (m.updatePrompt.owner == "" && isRCTag(version)) {
-		latest = latestRC
+	wantRC := m.updatePrompt.owner == "uzi-cli-rc" || (m.updatePrompt.owner == "" && isRCTag(version))
+	// Validate each channel fact before choosing the newer one. An invalid fact
+	// cannot hide a valid release on the other channel or become an update target.
+	if latest != nil && !isStableTag(latest.Version) {
+		latest = nil
+	}
+	if wantRC && latestRC != nil && isRCTag(latestRC.Version) {
+		if latest == nil {
+			latest = latestRC
+		} else if cmp, ok := uzicli.CompareServerVersion(latest.Version, latestRC.Version); ok && cmp < 0 {
+			latest = latestRC
+		}
 	}
 	if latest == nil {
-		return nil
-	}
-	wantRC := m.updatePrompt.owner == "uzi-cli-rc" || (m.updatePrompt.owner == "" && isRCTag(version))
-	if wantRC {
-		if !isRCTag(latest.Version) {
-			return nil
-		}
-	} else if isPrereleaseTag(latest.Version) {
 		return nil
 	}
 	// Recompute the CLI axis locally: is THIS binary behind the latest? IsValid-guarded, so a
@@ -194,9 +196,9 @@ func isRCTag(tag string) bool {
 		semver.Build(tag) == "" && semver.Canonical(base) == base
 }
 
-func isPrereleaseTag(tag string) bool {
+func isStableTag(tag string) bool {
 	v := "v" + strings.TrimPrefix(tag, "v")
-	return semver.Prerelease(v) != ""
+	return semver.IsValid(v) && semver.Prerelease(v) == ""
 }
 
 // updateChoice is one selectable action in the modal.

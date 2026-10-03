@@ -232,7 +232,7 @@ func warnVersionSkew(env Env, serverVersion string) {
 	if serverVersion == "" {
 		return
 	}
-	if msg, ok := uzicli.SkewWarning(version, cellText(serverVersion)); ok {
+	if msg, ok := uzicli.SkewWarning(version, cellText(serverVersion), brewOwnerFromExecutable(env.Executable)); ok {
 		// Write error dropped explicitly: this whole path is best-effort and must
 		// never affect the command it runs before.
 		_, _ = fmt.Fprintln(env.Stderr, msg)

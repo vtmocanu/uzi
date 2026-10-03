@@ -51,9 +51,9 @@
 #    resolves an include EAGERLY on every `task` call, so a `{{if .CI}}` remote include
 #    would fetch over the network on every GATE job in CI (and fail there without
 #    TASK_X_REMOTE_TASKFILES). Vendoring keeps them (a) reached by no gate target -- only
-#    the release path renders them (`brew:` via .github/workflows/brew.yml, `brew-rc:` via
-#    scripts/brew-local-test.sh and `task brew-rc:formula` until its brew.yml wiring lands
-#    separately); (b) local, so no network and no remote code touches any run; (c)
+#    the release path renders both via .github/workflows/brew.yml, with offline
+#    render coverage in scripts/brew-local-test.sh; (b) local, so no network and no
+#    remote code touches any run; (c)
 #    reviewable in-repo. To update, diff against the upstream file named in its header and
 #    bump that SHA.
 #
@@ -180,9 +180,9 @@ vars:
 # remote include would fetch over the network on every gate job in CI and break them; a
 # vendored local file resolves identically everywhere with no network and no remote code.
 # It provides Homebrew formula render + tap publish, reached by no gate target: `brew:` is
-# run by .github/workflows/brew.yml on a v* tag, while `brew-rc:` renders the RC formula
-# and is exercised offline by scripts/brew-local-test.sh and `task brew-rc:formula` (its
-# release-time wiring into brew.yml is a separate maintainer change). The formula BODIES
+# run by .github/workflows/brew.yml on stable tags, while `brew-rc:` runs on both
+# stable and RC tags, advancing only to a newer version (issue #2180). Both have
+# offline render coverage in scripts/brew-local-test.sh. The formula BODIES
 # are Formula/uzi-cli.rb and Formula/uzi-cli-rc.rb (two templates with url/sha256
 # placeholders); the rendered copy lands in the tap.
 includes:
@@ -353,6 +353,7 @@ tasks:
       # hermetic (~1s, fake go + gofmt on PATH): fmt-check:api and fmt-check:controller run
       # the module toolchain's gofmt, not a stale PATH gofmt, and still fail closed.
       - task: test:fmt-check-toolchain
+      - task: test:brew-tap-guard
       # cheapest-first: this whole-file duplicate check is sub-second, so it runs
       # before `scan:secrets`, which is deliberately last because it dominates.
       - task: check:spec-numbering
@@ -1048,6 +1049,11 @@ tasks:
       - ./.agents/skills/uzi-watcher/scripts/backup-loop.test.sh
       - ./.agents/skills/uzi-watcher/scripts/create-run.test.sh
       - ./.agents/skills/uzi-watcher/scripts/watch-run.test.sh
+
+  test:brew-tap-guard:
+    desc: hermetic tests of stable/RC tap version ordering and fail-closed formula parsing
+    cmds:
+      - python3 -B scripts/brew-tap-guard.test.py
 
   test:fmt-check-toolchain:
     desc: hermetic test that fmt-check:api and fmt-check:controller use the module toolchain's gofmt (go env GOROOT), not PATH's, and fail closed (fake go + gofmt)
