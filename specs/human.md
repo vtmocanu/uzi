@@ -312,7 +312,7 @@ Tracked as GitLab issue vtmocanu/uzi#40; PRD at `prds/done/40-token-usage-report
 - Failed and cancelled runs still count their spend. [user]
 - Chat runs are out of scope (not counted). [user]
 - Shipped surfaces validated against the approved mock (+ addendum). [user 2026-07-12]
-- A run's usage not covered by any SDK result (an interrupted session's tail) is recorded and shown apart from the metered total, labelled estimated with its price provenance, as unknown cost when unpriced (never $0), with a coverage indicator. (AI-synced 2026-10-03)
+- A Claude run's usage not covered by any SDK result (an interrupted session's tail) is recorded and shown apart from the metered total, labelled estimated with its price provenance, as unknown cost when unpriced (never $0), with a coverage indicator. (AI-synced 2026-10-03)
 
 ## Feature — Run retrospective (LLM judge) & self-improvement job
 

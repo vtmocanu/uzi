@@ -110,8 +110,9 @@ documented stream events (`message_start`, `content_block_start` / `_delta` / `_
   aborts the pending HTTP request** (an `AbortController`), not merely stops waiting on
   it; the batcher proceeds. Abandoned records surface as `leg_not_closed` or
   `ordinal_gap`.
-- **Typed errors.** A typed `stale` 404 or 409 stops only that run's recorder. An
-  untyped 404 or 405 streak disables the route for the whole process, the same pattern
+- **Typed errors.** Three answers stop only that run's recorder: the typed `stale` 404
+  (run not owned), the fence 409 `{disposition: "stale_claim"}`, and the
+  `ErrMissingClaimGeneration` 409. An untyped 404 or 405 streak disables the route for the whole process, the same pattern
   as `INCLUSION_ROUTE_MISSING_LIMIT` in `agent/src/inclusion-reporter.ts`, so a new
   worker against an old api does not retry forever.
 - **No disk spill.** A hard kill loses unsent records; coverage says so.
@@ -120,7 +121,8 @@ documented stream events (`message_start`, `content_block_start` / `_delta` / `_
 
 **Leg identity and order.** The worker stamps `leg_id` and the SDK `session_id` (as
 `sdk_session_id`) into the leg's persisted `init` frame (`projectInit`).
-`foldUsageFrames` upserts `run_usage_legs` with `init_seq = COALESCE(existing, frame
+The incremental fold (`foldRunUsage`, the wrapper `appendMessages` calls; never the
+shared body `RefoldRunUsage` replays) upserts `run_usage_legs` with `init_seq = COALESCE(existing, frame
 seq)` and `sdk_session_id = COALESCE(existing, stamped)`. Leg order is `init_seq`.
 
 **Result stamp.** Both `projectResult` emit sites in `agent/src/harness-messages.ts`
@@ -211,7 +213,9 @@ A new Go package, `api/internal/anthropicprice`, holds the price table with
 ## D7 — Budget semantics
 
 No usage-based budget exists: run budgets are iterations and wall-clock seconds, and
-the only cost bound is the SDK's `maxCostUSD`. The tail therefore counts toward
+no cost bound exists: the SDK's `maxBudgetUsd` option is unset in `agent/src`, and
+`maxCostUSD` in `api/internal/workersvc/service.go` is only the `numeric(12,6)` storage
+clamp. The tail therefore counts toward
 nothing. It is **not** added to `run_usage_totals`, and every metered reader stays
 byte-identical: `GetRunUsageTotal`, `ListRunUsageTotalsForRuns`, `SelfUsage`,
 `AdminUsageTotals`, `AdminUsagePerUser`, `GetJudgeRunUsageForTarget`.
@@ -238,17 +242,24 @@ are assigned at merge time).
 
 Upserts are monotone and touch only their own columns; rows are written in
 `(leg_id, message_id)` order. The tail and its coverage are read in one REPEATABLE READ
-snapshot. The boot refold (`RefoldRunUsage`) is unaffected.
+snapshot. The boot refold (`RefoldRunUsage`) is unaffected: the leg extension lives in
+the incremental wrapper `foldRunUsage`, not in the shared `foldUsageFrames` body the
+refold runs inside its transaction after `DeleteRunUsage`, so the refold never takes the
+advisory lock after a row write.
 
 ## D9 — The `/usage` route matches `/messages`
 
-The route is registered beside `/runs/{id}/messages` and copies its fence exactly:
-worker auth and ownership (404 typed `stale`), `ErrMissingClaimGeneration`, the
+The route is registered beside `/runs/{id}/messages` and matches its claim fence:
+worker auth, `ErrMissingClaimGeneration` (409), the
 `InsertRunMessage` claim-generation fence inside the route's own transaction (a miss is
 a `{disposition: "stale_claim"}` 409), `httpx.DecodeJSONLimited` (413) with
 `DisallowUnknownFields`, NUL stripping and rune caps (400 for bad input, 500 for
-server faults), the lane-worker guard (403), and a row in
-`route_limiter_mounts_test.go`. A request carries at most 500 records and 16 leg
+server faults), and a row in `route_limiter_mounts_test.go`. It **deviates** from
+`/messages` on two points, deliberately: it answers `ErrRunNotOwned` with a typed
+`stale` 404 (`httpx.ErrorReason`, as the inclusion receipt route does) where
+`WorkerRunMessages` answers an untyped 404, so an ownership change never counts toward
+the recorder's route-missing streak; and it is not in `laneWorkerAllowlist`, so a lane
+worker gets 403 (`/messages` is allowlisted). A request carries at most 500 records and 16 leg
 markers; more is a 400.
 
 The route rejects chat and Codex runs, and the leg-coverage fold extension runs only
