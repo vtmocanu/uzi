@@ -49,7 +49,9 @@ trap 'rm -rf "$TMP"' EXIT
 printf '%s' "$prs" > "$TMP/prs.json" && printf '%s' "$runs" > "$TMP/runs.json" \
   && printf '%s' "$claims" > "$TMP/claims.json" || die "cannot stage lookups"
 rows=$(jq -n --slurpfile prs "$TMP/prs.json" --slurpfile runs "$TMP/runs.json" --slurpfile claims "$TMP/claims.json" --arg repo "$repo_id" '
-  $prs[0] as $prs | $runs[0] as $runs | $claims[0] as $claims |
+  def one_array($v; $n): if ($v|length) == 1 and ($v[0]|type) == "array" then $v[0]
+    else error("\($n) lookup is not exactly one JSON array") end;
+  one_array($prs; "pr") as $prs | one_array($runs; "run") as $runs | one_array($claims; "claim") as $claims |
   def claim($k): [$claims[]|select(.key==$k)]|first;
   def verdict($pc; $rc):
     if $pc != null and $pc.registry_live != "dead" then "claimed"

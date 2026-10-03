@@ -147,4 +147,9 @@ BIG_RUNS="$WORK/big-runs.json" bash "$HERE/orphans.sh" --repo test/repo --json >
 [ "$(jq -r '.[]|select(.run=="dddddddd-1")|.verdict' "$WORK/big.json")" = orphan ] \
   || fail "big run list: dddddddd-1 not classified: $(head -c 400 "$WORK/big.json")"
 
+# A lookup carrying two JSON values is unreadable, never its first value alone.
+printf '[] []' > "$WORK/two-values.json"
+rc=0; BIG_RUNS="$WORK/two-values.json" bash "$HERE/orphans.sh" --repo test/repo > "$WORK/two.out" 2> /dev/null || rc=$?
+[ "$rc" = 3 ] && [ ! -s "$WORK/two.out" ] || fail "two-value run lookup: exit $rc: $(cat "$WORK/two.out")"
+
 echo "PASS orphans: run PRs and in-flight runs classified by #PR / run-<RUN_ID> claim, fail-closed incl. a corrupt claim; unverifiable owners are never orphaned or reaped; reap drops finished run keys"
