@@ -135,3 +135,23 @@ your merge is fine — re-point at the CURRENT `origin/main` HEAD (`git fetch or
 and confirm *that* commit's run goes green, since it exercises your change plus whatever
 superseded it. If a peer session owns that newer commit (coordinate via SendMessage), its
 green is theirs to watch and report.
+
+## Post-merge publish steps
+
+A plan may end with a publish after the merge: a `workflow_dispatch`, a tag push, a tap
+publish. Check the gate before promising one.
+
+- **An environment-gated workflow deploys only from the refs its policy admits.** For a job
+  with `environment: <env>`, read `gh api repos/O/R/environments/<env> --jq
+  .deployment_branch_policy` first (`null` = any ref, `protected_branches: true` =
+  protected-branch mode); when `custom_branch_policies` is true, list the patterns
+  with `gh api repos/O/R/environments/<env>/deployment-branch-policies`.
+  `brew.yml` and `release.yml` use `release`, which admits only `v*` tags: a dispatch from
+  `main` is rejected before any step runs (run 37106948839, #2180).
+- **A dispatch runs the workflow as it exists on the selected ref.** `--ref vX.Y.Z` runs
+  that tag's copy, so a workflow fix merged after the tag does not apply. Publishing with
+  the newer logic means a local run from `main` (for the tap: `brew-tap-guard.py` exit 0,
+  then `task brew-rc:formula` + `brew-rc:publish`) or waiting for the next tag.
+- **Run each outward action in its own Bash call.** A classifier denial drops the whole
+  call, including the reads and trail writes chained with it. Hand the user the exact
+  `!` command when it is denied.

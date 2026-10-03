@@ -92,6 +92,8 @@ the `session-peers` skill (`buddy: @NAME`), or else a **local buddy**, a subagen
 - **A local buddy waives only the peer buddy**, never independent review, CI or a user
   review. Spawn one fresh subagent per request, brief it as below, pin it to the head;
   it shares your model's blind spots, so name it in the trail.
+- **A buddy never reviews a diff it wrote.** When the buddy implemented the change, the
+  independent review is a bot or a fresh local reviewer; the buddy only verifies findings.
 - **Decide together when unsure.** Consult the buddy on a call the rules do not settle:
   a major, low or neutral Merge Confidence, red CI a fix on our side might clear, a rule
   that does not clearly apply. Brief facts (diff, CI evidence, release notes, the
@@ -384,6 +386,8 @@ changes it); trust it over a handover's claim.
    file), 3 no run appeared, 4 superseded → re-watch the current `main` head
    (references/merge-mechanics.md). Append the terminal result to the preserved trail
    (`main ci green`, `main ci red`, or `main ci superseded`) and print the whole line.
+   A post-merge publish step (a workflow dispatch, tag push, or tap publish) follows
+   references/merge-mechanics.md, *Post-merge publish steps*.
 8. **Finish.** Remove the worktrees and branches you or your local reviewer created
    (`git worktree list`, then `git worktree remove` / `git branch -D`), purge the completed
    trail with `S/claims.sh release '#PR' --purge`, then run
