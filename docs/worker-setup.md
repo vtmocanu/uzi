@@ -173,7 +173,8 @@ caches, including `node_modules` and pip's, are not individually tracked or
 trimmed by the mechanisms below. These reduce pressure; periodic selection
 cannot guarantee a particular failing run parks before failure. Admission
 and hard thresholds use the higher valid byte or inode used fraction;
-missing or invalid accounting falls back to the valid pair. Thresholds
+missing or invalid accounting, including missing or zero inode totals,
+falls back to the valid pair. Thresholds
 and switches are unchanged. Five mechanisms:
 
 1. **Cache drop on park.** A Claude run parked with its process ended
@@ -244,10 +245,15 @@ and switches are unchanged. Five mechanisms:
    This requires exact-generation running ownership, a compatible API and
    fresh valid byte and inode accounting confirming fullness on the actual
    worktree and HOME's data-volume device. Setup, finalize, bookkeeping and
-   settlement errors, typed/security outcomes and owner controls keep their
-   existing handling; approval revisions are unchanged, including in-place
-   cache relief. This is current-fullness policy, not write attribution: an
-   unrelated opaque error can coincide with fullness and be deferred.
+   settlement errors, typed recovery outcomes and owner controls keep their
+   existing handling; every
+   recognizable typed, wrapped or trusted security/guardrail failure remains
+   excluded, as pinned by the exclusion fixtures in
+   `agent/test/runner-terminal-disk-deferral.test.ts`. Approval revisions are
+   unchanged, including in-place cache relief. This is current-fullness policy, not write attribution: an
+   unrelated opaque error can coincide with fullness and be deferred. Fully
+   opaque failures whose security origin was erased remain eligible under
+   this accepted coincidence residual.
    Capture retries are bounded; a safely quiescent run can park with an
    unverified capture while retaining its original clone, HOME, session,
    journal and custody. That degraded recovery requires this worker and can

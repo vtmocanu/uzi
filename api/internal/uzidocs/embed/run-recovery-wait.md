@@ -274,10 +274,15 @@ valid byte and inode sample confirms fullness. After execution and reports
 settle, uzi waits for one bounded reclaim pass, then parks even if room
 returns; it does not replay the command, provider or executor. This does not
 attribute the failed write: an unrelated opaque error can coincide with
-fullness and be deferred. The cap bounds repetition, not misclassification;
-`0` remains unlimited. Setup, finalize and settlement failures, typed/security
-outcomes, cancellation, pause and shutdown keep their handling. Unknown
-accounting, incompatible APIs and plan-approval revisions are not covered;
+fullness and be deferred. Fully opaque failures whose security origin was
+erased remain eligible under this accepted coincidence residual. The cap
+bounds repetition, not misclassification;
+`0` remains unlimited. Every recognizable typed, wrapped or trusted
+security/guardrail failure remains excluded, as pinned by the exclusion
+fixtures in `agent/test/runner-terminal-disk-deferral.test.ts`. Setup,
+finalize and settlement failures, typed recovery outcomes, cancellation,
+pause and shutdown keep their handling. Unknown accounting, incompatible
+APIs and plan-approval revisions are not covered;
 existing cache relief at approval gates stays unchanged.
 
 For this executor-failure policy, three nonblocked unverified captures or
