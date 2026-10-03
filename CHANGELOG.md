@@ -51,6 +51,8 @@ through `[0.52.0]`.)
   On a Claude run, a process carrying the run's HOME that the worker could not kill, or a reap that could not finish, now blocks every step that publishes or settles the run (finalize push, failure settlement, pause, completion hold, wall park, credential switch, recovery and checkpoint publishes) the same way an unproven clone does: the run keeps custody, keeps running (a failed pause) or fails with `worker_residue_blocked`. A re-claimed run reaps its HOME before its clone fetch, and a park or the periodic disk reclaim drops the run's rebuildable caches only once no such process is left.
 - **Worker upgrade waits no longer trigger premature capacity alarms (#2184).**
   Run health identifies currently suitable draining workers; admin capacity confirms each upgrade wait, preserves genuine five-minute alarms, and reports overdue upgrade waits after 24 hours of overlap.
+- **Codex refresh recovery preserves vault-lock replies after a lost response ([#1770](https://github.com/vtmocanu/uzi/issues/1770)).**
+  A refresh retry can recognize its own durably retained login and defer without releasing credentials or exchanging its token again, while older workers keep their existing first-request vault-lock reply.
 
 ## [0.85.1] - 2026-10-03
 
