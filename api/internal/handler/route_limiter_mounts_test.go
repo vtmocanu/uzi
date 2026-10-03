@@ -883,6 +883,10 @@ var wantRouteMounts = []routeMount{
 	// PRD #1909 M4: the worker output-file upload, worker-authenticated and unlimited like the download above (bounded by the upload slots).
 	{"POST", "/api/worker/runs/{id}/files", noLimiter},
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
+	// Worker-authenticated, generation-fenced plan cross-check protocol.
+	{"POST", "/api/worker/runs/{id}/cross-checks", noLimiter},
+	{"GET", "/api/worker/runs/{id}/cross-checks/plan/{round}", noLimiter},
+	{"POST", "/api/worker/runs/{id}/cross-check-verdict", noLimiter},
 	// PRD #362 M1: the run-lane executor posts its intent/plan summaries back. Worker
 	// writes scoped to the worker's own run, no forge call → noLimiter. Bounded by the
 	// intent idempotency + the plan stale-write guard rather than a per-user limiter.

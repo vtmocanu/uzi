@@ -4381,6 +4381,7 @@ WITH requested AS (
                                   + budget_extension_seconds
                                   + budget_finalize_seconds))
       AND kind NOT IN ('chat', 'judge', 'job', 'cross_check')
+      AND NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan' AND cc.verdict = 'pending' AND cc.deadline_at > now())
       AND interactive = false
       -- idempotent across ticks: a row already carrying a 'wall' request is not re-requested.
       AND pause_mode IS DISTINCT FROM 'wall'
@@ -4447,6 +4448,7 @@ WITH locked AS (
         WHERE r.worker_id = w.id
           AND r.status = 'running'
           AND r.kind NOT IN ('chat', 'judge', 'job', 'cross_check')
+          AND NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = r.id AND cc.stage = 'plan' AND cc.verdict = 'pending' AND cc.deadline_at > now())
           AND r.interactive = false
           AND r.started_at < (sqlc.arg('now')::timestamptz
                 - make_interval(secs => COALESCE(r.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
@@ -4477,6 +4479,7 @@ parked AS (
     WHERE runs.worker_id = l.id
       AND runs.status = 'running'
       AND runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check')
+      AND NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan' AND cc.verdict = 'pending' AND cc.deadline_at > now())
       AND runs.interactive = false
       AND runs.started_at < (sqlc.arg('now')::timestamptz
             - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
@@ -4562,6 +4565,7 @@ WHERE status = 'running'
                               + budget_finalize_seconds
                               + budget_paused_seconds))
   AND kind NOT IN ('chat', 'judge', 'job', 'cross_check')
+  AND NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan' AND cc.verdict = 'pending' AND cc.deadline_at > now())
   AND interactive = false
   AND completion_attempts > 0
   AND completion_contract_version IS NOT NULL
@@ -8049,3 +8053,76 @@ SELECT count(*) FROM (
     GROUP BY u.id
     HAVING count(*) FILTER (WHERE rs.enabled) >= 1
 ) paused_users;
+
+-- name: GetPlanCrossCheck :one
+SELECT * FROM cross_checks WHERE lead_run_id = @lead_run_id AND stage = 'plan' AND round = 1 FOR UPDATE;
+
+-- name: CreatePlanCrossCheckChild :one
+INSERT INTO runs (id, user_id, repo_id, kind, target_run_id, harness, priority,
+                  report_only, budget_wall_seconds, dispatched_at, auto_approve,
+                  issue_title, issue_description, required_capabilities, trigger_source)
+SELECT @child_id, lead.user_id, lead.repo_id, 'cross_check', lead.id, 'codex', 2,
+       true, 1800, now(), true, lead.issue_title, lead.issue_description,
+       COALESCE(repo.required_capabilities, '{}'), 'cross_check'
+FROM runs lead JOIN repos repo ON repo.id = lead.repo_id
+WHERE lead.id = @lead_run_id AND lead.user_id = @user_id
+  AND lead.worker_id = @worker_id AND lead.claim_generation = @claim_generation
+  AND lead.status IN ('claimed', 'running') AND lead.harness = 'claude'
+  AND lead.plan_cross_check_required AND lead.auto_approve
+RETURNING *;
+
+-- name: InsertPlanCrossCheck :one
+INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation,
+    plan_md, milestones, required_capabilities, required_tools, size_class,
+    base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, deadline_at)
+VALUES (@lead_run_id, 'plan', 1, @lead_claim_generation,
+    @plan_md, @milestones::jsonb, @required_capabilities::text[], @required_tools::text[],
+    @size_class, @base_commit, @planning_diff, @candidate_digest, @checker_run_id,
+    'codex', now() + interval '30 minutes')
+RETURNING *;
+
+-- name: GetOwnedPlanCrossCheck :one
+SELECT cc.* FROM cross_checks cc JOIN runs lead ON lead.id = cc.lead_run_id
+WHERE lead.id = @lead_run_id AND lead.worker_id = @worker_id
+  AND lead.claim_generation = @claim_generation AND lead.status IN ('claimed', 'running')
+  AND cc.stage = 'plan' AND cc.round = @round;
+
+-- name: DecidePlanCrossCheck :one
+UPDATE cross_checks cc SET verdict = @verdict, reason_class = @reason_class,
+    findings = @findings::jsonb, decided_at = now()
+FROM runs child, runs lead
+WHERE child.id = cc.checker_run_id AND lead.id = cc.lead_run_id
+  AND child.id = @child_id AND child.worker_id = @worker_id
+  AND child.claim_generation = @claim_generation
+  AND child.kind = 'cross_check' AND child.status IN ('claimed', 'running')
+  AND lead.status IN ('claimed', 'running')
+  AND lead.claim_generation = cc.lead_claim_generation
+  AND cc.stage = 'plan' AND cc.verdict = 'pending' AND now() < cc.deadline_at
+RETURNING cc.*;
+
+-- name: BankPlanCrossCheckWait :execrows
+UPDATE runs lead SET budget_paused_seconds = lead.budget_paused_seconds +
+    GREATEST(0, CEIL(EXTRACT(EPOCH FROM (cc.decided_at - cc.created_at)))::int)
+FROM cross_checks cc
+WHERE lead.id = cc.lead_run_id AND cc.id = @check_id
+  AND cc.decided_at IS NOT NULL AND cc.lead_claim_generation = lead.claim_generation;
+
+-- name: ExpirePlanCrossCheck :one
+WITH expired AS (
+    UPDATE cross_checks cc SET verdict = 'failed', reason_class = 'timed_out', decided_at = cc.deadline_at
+    FROM runs lead
+    WHERE cc.lead_run_id = lead.id AND lead.id = @lead_run_id
+      AND lead.worker_id = @worker_id AND lead.claim_generation = @claim_generation
+      AND lead.status IN ('claimed', 'running') AND cc.stage = 'plan' AND cc.round = 1
+      AND cc.verdict = 'pending' AND cc.deadline_at <= now()
+    RETURNING cc.*
+), cancelled AS (
+    UPDATE runs child SET status = 'cancelled', finished_at = now(), updated_at = now(),
+        claim_released_at = now()
+    FROM expired e WHERE child.id = e.checker_run_id AND child.status NOT IN ('completed', 'failed', 'cancelled')
+), banked AS (
+    UPDATE runs lead SET budget_paused_seconds = lead.budget_paused_seconds +
+        GREATEST(0, CEIL(EXTRACT(EPOCH FROM (e.decided_at - e.created_at)))::int)
+    FROM expired e WHERE lead.id = e.lead_run_id
+)
+SELECT * FROM expired;

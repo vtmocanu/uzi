@@ -456,6 +456,22 @@ func (q *Queries) ApplyRunInputRows(ctx context.Context, arg ApplyRunInputRowsPa
 	return result.RowsAffected(), nil
 }
 
+const bankPlanCrossCheckWait = `-- name: BankPlanCrossCheckWait :execrows
+UPDATE runs lead SET budget_paused_seconds = lead.budget_paused_seconds +
+    GREATEST(0, CEIL(EXTRACT(EPOCH FROM (cc.decided_at - cc.created_at)))::int)
+FROM cross_checks cc
+WHERE lead.id = cc.lead_run_id AND cc.id = $1
+  AND cc.decided_at IS NOT NULL AND cc.lead_claim_generation = lead.claim_generation
+`
+
+func (q *Queries) BankPlanCrossCheckWait(ctx context.Context, checkID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, bankPlanCrossCheckWait, checkID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const bumpContractRevision = `-- name: BumpContractRevision :one
 UPDATE runs SET
     contract_revision = $1,
@@ -2816,6 +2832,199 @@ func (q *Queries) CreatePauseInput(ctx context.Context, arg CreatePauseInputPara
 	return i, err
 }
 
+const createPlanCrossCheckChild = `-- name: CreatePlanCrossCheckChild :one
+INSERT INTO runs (id, user_id, repo_id, kind, target_run_id, harness, priority,
+                  report_only, budget_wall_seconds, dispatched_at, auto_approve,
+                  issue_title, issue_description, required_capabilities, trigger_source)
+SELECT $1, lead.user_id, lead.repo_id, 'cross_check', lead.id, 'codex', 2,
+       true, 1800, now(), true, lead.issue_title, lead.issue_description,
+       COALESCE(repo.required_capabilities, '{}'), 'cross_check'
+FROM runs lead JOIN repos repo ON repo.id = lead.repo_id
+WHERE lead.id = $2 AND lead.user_id = $3
+  AND lead.worker_id = $4 AND lead.claim_generation = $5
+  AND lead.status IN ('claimed', 'running') AND lead.harness = 'claude'
+  AND lead.plan_cross_check_required AND lead.auto_approve
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required
+`
+
+type CreatePlanCrossCheckChildParams struct {
+	ChildID         uuid.UUID   `json:"child_id"`
+	LeadRunID       uuid.UUID   `json:"lead_run_id"`
+	UserID          uuid.UUID   `json:"user_id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration int64       `json:"claim_generation"`
+}
+
+func (q *Queries) CreatePlanCrossCheckChild(ctx context.Context, arg CreatePlanCrossCheckChildParams) (Run, error) {
+	row := q.db.QueryRow(ctx, createPlanCrossCheckChild,
+		arg.ChildID,
+		arg.LeadRunID,
+		arg.UserID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+	)
+	var i Run
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.IssueIid,
+		&i.IssueTitle,
+		&i.IssueDescription,
+		&i.Status,
+		&i.RequeueCount,
+		&i.WorkerID,
+		&i.SessionID,
+		&i.LastSeq,
+		&i.Branch,
+		&i.MrIid,
+		&i.FailureReason,
+		&i.PlanMd,
+		&i.IterationCount,
+		&i.ClaimedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OriginColumn,
+		&i.BoardColumn,
+		&i.MovePendingSince,
+		&i.MrState,
+		&i.AutoApprove,
+		&i.AutopilotCommentedAt,
+		&i.Kind,
+		&i.PipelineID,
+		&i.PipelineRef,
+		&i.FailureSnapshot,
+		&i.FixVerdict,
+		&i.StopKind,
+		&i.AgentSource,
+		&i.AgentExclusions,
+		&i.RepoAgents,
+		&i.Title,
+		&i.ResumeOfRunID,
+		&i.LastActivityAt,
+		&i.Health,
+		&i.HealthReason,
+		&i.HealthSince,
+		&i.HealthNotifiedAt,
+		&i.TargetRunID,
+		&i.MrWebUrl,
+		&i.PrdDonePath,
+		&i.PrdPatchSettledAt,
+		&i.AnthropicSecretID,
+		&i.AnthropicSecretLabel,
+		&i.AnthropicSelectReason,
+		&i.AnthropicHeadroomPct,
+		&i.WaitOnLimit,
+		&i.LimitResetsAt,
+		&i.RetryNotBefore,
+		&i.LimitWaitCount,
+		&i.RateLimitType,
+		&i.OpenQuestionID,
+		&i.ReviseCount,
+		&i.PlanSource,
+		&i.PlannedBaseCommit,
+		&i.RequireBaseMatch,
+		&i.MilestonesCandidate,
+		&i.MilestonesFrozen,
+		&i.MilestonesCompleted,
+		&i.MilestonesInProgress,
+		&i.BudgetMaxIterations,
+		&i.BudgetWallSeconds,
+		&i.ScheduleID,
+		&i.LimitDeadSecretID,
+		&i.ReportOnly,
+		&i.ReportMd,
+		&i.CiConfigPaths,
+		&i.Model,
+		&i.OverrideSubagentModel,
+		&i.FailOrigin,
+		&i.Priority,
+		&i.SummaryIntent,
+		&i.SummaryPlan,
+		&i.SummaryDeltas,
+		&i.IssueComments,
+		&i.BaseBranch,
+		&i.OpenMr,
+		&i.DispatchedAt,
+		&i.ReviewTargetRunID,
+		&i.ReviewRequested,
+		&i.ThenFixRequested,
+		&i.ThenFixOfRunID,
+		&i.PreservedPatch,
+		&i.RequiredCapabilities,
+		&i.StopReason,
+		&i.RequiredTools,
+		&i.SizeClass,
+		&i.Interactive,
+		&i.OpenFollowupID,
+		&i.PlanChangedFiles,
+		&i.ScopeCeiling,
+		&i.StatusSince,
+		&i.ReviewComments,
+		&i.BudgetPausedSeconds,
+		&i.MrReworkEnabled,
+		&i.TriggerSource,
+		&i.CheckpointTip,
+		&i.UsageRefolded,
+		&i.CodexSecretID,
+		&i.CodexAuthMode,
+		&i.CodexSecretLabel,
+		&i.CodexAccountKey,
+		&i.CodexMaterialRevision,
+		&i.CodexAccountRevision,
+		&i.CodexClaimEpoch,
+		&i.CodexCapHash,
+		&i.PauseRequestedAt,
+		&i.PauseMode,
+		&i.PauseAfterCount,
+		&i.CheckpointTipAt,
+		&i.RecoveryWaitCount,
+		&i.RecoveryRetryNotBefore,
+		&i.CompletionContractVersion,
+		&i.ContractRevision,
+		&i.CompletionContract,
+		&i.CompletionAttempts,
+		&i.LatestCompletionAttempt,
+		&i.MilestonesAgents,
+		&i.HoldReason,
+		&i.HoldCapturedHead,
+		&i.CompletionBudgetExhaustedAt,
+		&i.CompletionQuestionAt,
+		&i.BudgetExtensionSeconds,
+		&i.ClaimGeneration,
+		&i.Harness,
+		&i.RecoveryWaitCause,
+		&i.ForgeParkCount,
+		&i.CredentialOverrideMode,
+		&i.CredentialOverrideSecretID,
+		&i.ClaimReleasedAt,
+		&i.CredentialSwitchRequestedAt,
+		&i.CredentialSwitchGeneration,
+		&i.StaleRequeueGeneration,
+		&i.BudgetFinalizeSeconds,
+		&i.ReleasedWorkerID,
+		&i.ReleasedWorkerNonce,
+		&i.GateRevision,
+		&i.GatePresentationID,
+		&i.GatePresentedPayload,
+		&i.GatePayloadDigest,
+		&i.GateRefusalCount,
+		&i.GateRefusalGeneration,
+		&i.DiskParkCount,
+		&i.CheckpointContainsLatest,
+		&i.EgressProfileID,
+		&i.EgressSnapshot,
+		&i.JobType,
+		&i.FinalizeResumeGeneration,
+		&i.JobProtocol,
+		&i.FirstStartedAt,
+		&i.PlanCrossCheckRequired,
+	)
+	return i, err
+}
+
 const createRun = `-- name: CreateRun :one
 
 INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source, completion_contract_version, harness, credential_override_mode, credential_override_secret_id, plan_cross_check_required)
@@ -3618,6 +3827,67 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 	return i, err
 }
 
+const decidePlanCrossCheck = `-- name: DecidePlanCrossCheck :one
+UPDATE cross_checks cc SET verdict = $1, reason_class = $2,
+    findings = $3::jsonb, decided_at = now()
+FROM runs child, runs lead
+WHERE child.id = cc.checker_run_id AND lead.id = cc.lead_run_id
+  AND child.id = $4 AND child.worker_id = $5
+  AND child.claim_generation = $6
+  AND child.kind = 'cross_check' AND child.status IN ('claimed', 'running')
+  AND lead.status IN ('claimed', 'running')
+  AND lead.claim_generation = cc.lead_claim_generation
+  AND cc.stage = 'plan' AND cc.verdict = 'pending' AND now() < cc.deadline_at
+RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at
+`
+
+type DecidePlanCrossCheckParams struct {
+	Verdict         string      `json:"verdict"`
+	ReasonClass     pgtype.Text `json:"reason_class"`
+	Findings        []byte      `json:"findings"`
+	ChildID         uuid.UUID   `json:"child_id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration int64       `json:"claim_generation"`
+}
+
+func (q *Queries) DecidePlanCrossCheck(ctx context.Context, arg DecidePlanCrossCheckParams) (CrossCheck, error) {
+	row := q.db.QueryRow(ctx, decidePlanCrossCheck,
+		arg.Verdict,
+		arg.ReasonClass,
+		arg.Findings,
+		arg.ChildID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+	)
+	var i CrossCheck
+	err := row.Scan(
+		&i.ID,
+		&i.LeadRunID,
+		&i.Stage,
+		&i.Round,
+		&i.LeadClaimGeneration,
+		&i.PlanMd,
+		&i.Milestones,
+		&i.RequiredCapabilities,
+		&i.RequiredTools,
+		&i.SizeClass,
+		&i.BaseCommit,
+		&i.PlanningDiff,
+		&i.CandidateDigest,
+		&i.CheckerRunID,
+		&i.CheckerHarness,
+		&i.CheckerModel,
+		&i.CheckerEffort,
+		&i.Verdict,
+		&i.ReasonClass,
+		&i.Findings,
+		&i.DecidedAt,
+		&i.DeadlineAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const deleteOrdinaryWorkerActiveRunsNotIn = `-- name: DeleteOrdinaryWorkerActiveRunsNotIn :execrows
 DELETE FROM worker_active_runs
 WHERE worker_id = $1
@@ -3725,6 +3995,90 @@ func (q *Queries) DiscardRunInputRows(ctx context.Context, arg DiscardRunInputRo
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const expirePlanCrossCheck = `-- name: ExpirePlanCrossCheck :one
+WITH expired AS (
+    UPDATE cross_checks cc SET verdict = 'failed', reason_class = 'timed_out', decided_at = cc.deadline_at
+    FROM runs lead
+    WHERE cc.lead_run_id = lead.id AND lead.id = $1
+      AND lead.worker_id = $2 AND lead.claim_generation = $3
+      AND lead.status IN ('claimed', 'running') AND cc.stage = 'plan' AND cc.round = 1
+      AND cc.verdict = 'pending' AND cc.deadline_at <= now()
+    RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at
+), cancelled AS (
+    UPDATE runs child SET status = 'cancelled', finished_at = now(), updated_at = now(),
+        claim_released_at = now()
+    FROM expired e WHERE child.id = e.checker_run_id AND child.status NOT IN ('completed', 'failed', 'cancelled')
+), banked AS (
+    UPDATE runs lead SET budget_paused_seconds = lead.budget_paused_seconds +
+        GREATEST(0, CEIL(EXTRACT(EPOCH FROM (e.decided_at - e.created_at)))::int)
+    FROM expired e WHERE lead.id = e.lead_run_id
+)
+SELECT id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at FROM expired
+`
+
+type ExpirePlanCrossCheckParams struct {
+	LeadRunID       uuid.UUID   `json:"lead_run_id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration int64       `json:"claim_generation"`
+}
+
+type ExpirePlanCrossCheckRow struct {
+	ID                   uuid.UUID          `json:"id"`
+	LeadRunID            uuid.UUID          `json:"lead_run_id"`
+	Stage                string             `json:"stage"`
+	Round                int32              `json:"round"`
+	LeadClaimGeneration  int64              `json:"lead_claim_generation"`
+	PlanMd               pgtype.Text        `json:"plan_md"`
+	Milestones           []byte             `json:"milestones"`
+	RequiredCapabilities []string           `json:"required_capabilities"`
+	RequiredTools        []string           `json:"required_tools"`
+	SizeClass            pgtype.Text        `json:"size_class"`
+	BaseCommit           pgtype.Text        `json:"base_commit"`
+	PlanningDiff         pgtype.Text        `json:"planning_diff"`
+	CandidateDigest      []byte             `json:"candidate_digest"`
+	CheckerRunID         pgtype.UUID        `json:"checker_run_id"`
+	CheckerHarness       pgtype.Text        `json:"checker_harness"`
+	CheckerModel         pgtype.Text        `json:"checker_model"`
+	CheckerEffort        pgtype.Text        `json:"checker_effort"`
+	Verdict              string             `json:"verdict"`
+	ReasonClass          pgtype.Text        `json:"reason_class"`
+	Findings             []byte             `json:"findings"`
+	DecidedAt            pgtype.Timestamptz `json:"decided_at"`
+	DeadlineAt           pgtype.Timestamptz `json:"deadline_at"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) ExpirePlanCrossCheck(ctx context.Context, arg ExpirePlanCrossCheckParams) (ExpirePlanCrossCheckRow, error) {
+	row := q.db.QueryRow(ctx, expirePlanCrossCheck, arg.LeadRunID, arg.WorkerID, arg.ClaimGeneration)
+	var i ExpirePlanCrossCheckRow
+	err := row.Scan(
+		&i.ID,
+		&i.LeadRunID,
+		&i.Stage,
+		&i.Round,
+		&i.LeadClaimGeneration,
+		&i.PlanMd,
+		&i.Milestones,
+		&i.RequiredCapabilities,
+		&i.RequiredTools,
+		&i.SizeClass,
+		&i.BaseCommit,
+		&i.PlanningDiff,
+		&i.CandidateDigest,
+		&i.CheckerRunID,
+		&i.CheckerHarness,
+		&i.CheckerModel,
+		&i.CheckerEffort,
+		&i.Verdict,
+		&i.ReasonClass,
+		&i.Findings,
+		&i.DecidedAt,
+		&i.DeadlineAt,
+		&i.CreatedAt,
+	)
+	return i, err
 }
 
 const extendAndResumeWallPark = `-- name: ExtendAndResumeWallPark :one
@@ -4561,6 +4915,91 @@ func (q *Queries) GetForgeTypeForRepo(ctx context.Context, repoID uuid.UUID) (st
 	var forge_type string
 	err := row.Scan(&forge_type)
 	return forge_type, err
+}
+
+const getOwnedPlanCrossCheck = `-- name: GetOwnedPlanCrossCheck :one
+SELECT cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at FROM cross_checks cc JOIN runs lead ON lead.id = cc.lead_run_id
+WHERE lead.id = $1 AND lead.worker_id = $2
+  AND lead.claim_generation = $3 AND lead.status IN ('claimed', 'running')
+  AND cc.stage = 'plan' AND cc.round = $4
+`
+
+type GetOwnedPlanCrossCheckParams struct {
+	LeadRunID       uuid.UUID   `json:"lead_run_id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration int64       `json:"claim_generation"`
+	Round           int32       `json:"round"`
+}
+
+func (q *Queries) GetOwnedPlanCrossCheck(ctx context.Context, arg GetOwnedPlanCrossCheckParams) (CrossCheck, error) {
+	row := q.db.QueryRow(ctx, getOwnedPlanCrossCheck,
+		arg.LeadRunID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+		arg.Round,
+	)
+	var i CrossCheck
+	err := row.Scan(
+		&i.ID,
+		&i.LeadRunID,
+		&i.Stage,
+		&i.Round,
+		&i.LeadClaimGeneration,
+		&i.PlanMd,
+		&i.Milestones,
+		&i.RequiredCapabilities,
+		&i.RequiredTools,
+		&i.SizeClass,
+		&i.BaseCommit,
+		&i.PlanningDiff,
+		&i.CandidateDigest,
+		&i.CheckerRunID,
+		&i.CheckerHarness,
+		&i.CheckerModel,
+		&i.CheckerEffort,
+		&i.Verdict,
+		&i.ReasonClass,
+		&i.Findings,
+		&i.DecidedAt,
+		&i.DeadlineAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getPlanCrossCheck = `-- name: GetPlanCrossCheck :one
+SELECT id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at FROM cross_checks WHERE lead_run_id = $1 AND stage = 'plan' AND round = 1 FOR UPDATE
+`
+
+func (q *Queries) GetPlanCrossCheck(ctx context.Context, leadRunID uuid.UUID) (CrossCheck, error) {
+	row := q.db.QueryRow(ctx, getPlanCrossCheck, leadRunID)
+	var i CrossCheck
+	err := row.Scan(
+		&i.ID,
+		&i.LeadRunID,
+		&i.Stage,
+		&i.Round,
+		&i.LeadClaimGeneration,
+		&i.PlanMd,
+		&i.Milestones,
+		&i.RequiredCapabilities,
+		&i.RequiredTools,
+		&i.SizeClass,
+		&i.BaseCommit,
+		&i.PlanningDiff,
+		&i.CandidateDigest,
+		&i.CheckerRunID,
+		&i.CheckerHarness,
+		&i.CheckerModel,
+		&i.CheckerEffort,
+		&i.Verdict,
+		&i.ReasonClass,
+		&i.Findings,
+		&i.DecidedAt,
+		&i.DeadlineAt,
+		&i.CreatedAt,
+	)
+	return i, err
 }
 
 const getPriorRunCredentialEpoch = `-- name: GetPriorRunCredentialEpoch :one
@@ -6347,6 +6786,74 @@ func (q *Queries) IncludeRunInputRows(ctx context.Context, arg IncludeRunInputRo
 		return nil, err
 	}
 	return items, nil
+}
+
+const insertPlanCrossCheck = `-- name: InsertPlanCrossCheck :one
+INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation,
+    plan_md, milestones, required_capabilities, required_tools, size_class,
+    base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, deadline_at)
+VALUES ($1, 'plan', 1, $2,
+    $3, $4::jsonb, $5::text[], $6::text[],
+    $7, $8, $9, $10, $11,
+    'codex', now() + interval '30 minutes')
+RETURNING id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at
+`
+
+type InsertPlanCrossCheckParams struct {
+	LeadRunID            uuid.UUID   `json:"lead_run_id"`
+	LeadClaimGeneration  int64       `json:"lead_claim_generation"`
+	PlanMd               pgtype.Text `json:"plan_md"`
+	Milestones           []byte      `json:"milestones"`
+	RequiredCapabilities []string    `json:"required_capabilities"`
+	RequiredTools        []string    `json:"required_tools"`
+	SizeClass            pgtype.Text `json:"size_class"`
+	BaseCommit           pgtype.Text `json:"base_commit"`
+	PlanningDiff         pgtype.Text `json:"planning_diff"`
+	CandidateDigest      []byte      `json:"candidate_digest"`
+	CheckerRunID         pgtype.UUID `json:"checker_run_id"`
+}
+
+func (q *Queries) InsertPlanCrossCheck(ctx context.Context, arg InsertPlanCrossCheckParams) (CrossCheck, error) {
+	row := q.db.QueryRow(ctx, insertPlanCrossCheck,
+		arg.LeadRunID,
+		arg.LeadClaimGeneration,
+		arg.PlanMd,
+		arg.Milestones,
+		arg.RequiredCapabilities,
+		arg.RequiredTools,
+		arg.SizeClass,
+		arg.BaseCommit,
+		arg.PlanningDiff,
+		arg.CandidateDigest,
+		arg.CheckerRunID,
+	)
+	var i CrossCheck
+	err := row.Scan(
+		&i.ID,
+		&i.LeadRunID,
+		&i.Stage,
+		&i.Round,
+		&i.LeadClaimGeneration,
+		&i.PlanMd,
+		&i.Milestones,
+		&i.RequiredCapabilities,
+		&i.RequiredTools,
+		&i.SizeClass,
+		&i.BaseCommit,
+		&i.PlanningDiff,
+		&i.CandidateDigest,
+		&i.CheckerRunID,
+		&i.CheckerHarness,
+		&i.CheckerModel,
+		&i.CheckerEffort,
+		&i.Verdict,
+		&i.ReasonClass,
+		&i.Findings,
+		&i.DecidedAt,
+		&i.DeadlineAt,
+		&i.CreatedAt,
+	)
+	return i, err
 }
 
 const insertRunGatePresentation = `-- name: InsertRunGatePresentation :exec
@@ -11113,6 +11620,7 @@ WITH locked AS (
         WHERE r.worker_id = w.id
           AND r.status = 'running'
           AND r.kind NOT IN ('chat', 'judge', 'job', 'cross_check')
+          AND NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = r.id AND cc.stage = 'plan' AND cc.verdict = 'pending' AND cc.deadline_at > now())
           AND r.interactive = false
           AND r.started_at < ($1::timestamptz
                 - make_interval(secs => COALESCE(r.budget_wall_seconds, $2::int)
@@ -11143,6 +11651,7 @@ parked AS (
     WHERE runs.worker_id = l.id
       AND runs.status = 'running'
       AND runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check')
+      AND NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan' AND cc.verdict = 'pending' AND cc.deadline_at > now())
       AND runs.interactive = false
       AND runs.started_at < ($1::timestamptz
             - make_interval(secs => COALESCE(runs.budget_wall_seconds, $2::int)
@@ -12360,6 +12869,7 @@ WITH requested AS (
                                   + budget_extension_seconds
                                   + budget_finalize_seconds))
       AND kind NOT IN ('chat', 'judge', 'job', 'cross_check')
+      AND NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan' AND cc.verdict = 'pending' AND cc.deadline_at > now())
       AND interactive = false
       -- idempotent across ticks: a row already carrying a 'wall' request is not re-requested.
       AND pause_mode IS DISTINCT FROM 'wall'
@@ -16159,6 +16669,7 @@ WHERE status = 'running'
                               + budget_finalize_seconds
                               + budget_paused_seconds))
   AND kind NOT IN ('chat', 'judge', 'job', 'cross_check')
+  AND NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan' AND cc.verdict = 'pending' AND cc.deadline_at > now())
   AND interactive = false
   AND completion_attempts > 0
   AND completion_contract_version IS NOT NULL
