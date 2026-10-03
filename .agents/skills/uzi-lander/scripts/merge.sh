@@ -213,12 +213,24 @@ fi
 # ---- a release cut waiting on main CI — FAIL CLOSED -----------------------------------------
 # A merge supersedes main's in-flight runs (concurrency), so landing while a
 # `chore(release):` commit's CI runs cancels it and forces the release to re-cut (exit 10).
-# Ordinary in-flight main CI does not block. An unreadable run list refuses (exit 2).
-mr=$(gh run list --repo "$REPO" --branch main --limit 50 --json status,headSha,displayTitle,name,databaseId 2>/dev/null) \
-  || { echo "cannot read main's workflow runs; not merging"; exit 2; }
-rel=$(printf '%s' "$mr" | jq -r 'if type=="array" then [.[]|select(.status!="completed" and ((.displayTitle // "")|startswith("chore(release):")))
-  |"\(.name) #\(.databaseId) \(.headSha[0:8]) \(.displayTitle)"]|join("\n") else error("not an array") end' 2>/dev/null) \
-  || { echo "cannot parse main's workflow runs; not merging"; exit 2; }
+# Ordinary in-flight main CI does not block. Every non-completed run is enumerated (one
+# paginated Actions query per active status, no recency window); a failed page or a record
+# missing the fields the decision reads refuses (exit 2).
+rel=""
+for st in queued in_progress waiting requested pending; do
+  pg=$(gh api --paginate --slurp "repos/$REPO/actions/runs?branch=main&status=$st&per_page=100" 2>/dev/null) \
+    || { echo "cannot read main's $st workflow runs; not merging"; exit 2; }
+  hit=$(printf '%s' "$pg" | jq -r '
+    if type != "array" then error("pages") else . end
+    | [.[] | if (type == "object" and (.workflow_runs|type) == "array") then .workflow_runs[] else error("page") end]
+    | map(if type == "object" and (.status|type) == "string" and (.display_title|type) == "string"
+            and (.head_sha|type) == "string" and (.id|type) == "number" then . else error("record") end)
+    | [.[] | select(.status != "completed" and (.display_title|startswith("chore(release):")))
+        | "\(.name // "?") #\(.id) \(.head_sha[0:8]) \(.display_title)"] | join("\n")' 2>/dev/null) \
+    || { echo "cannot parse main's $st workflow runs; not merging"; exit 2; }
+  [ -n "$hit" ] && rel="${rel:+$rel
+}$hit"
+done
 if [ -n "$rel" ]; then
   printf '%s\n' "$rel" | sed 's/^/  in flight on main: /'
   echo "a release cut is waiting on main CI; wait for it (or ask its releaser), then re-run"; exit 10

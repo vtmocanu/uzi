@@ -97,10 +97,29 @@ if [ "\${1:-}" = api ]; then
   esac
 fi
 if [ "\${1:-}" = pr ] && [ "\${2:-}" = checks ]; then printf '%s\n' "\${CHECKS_JSON:-}"; exit "\${CHECKS_RC:-0}"; fi
-# main's in-flight workflow runs (gh run list --branch main). MAIN_RUNS_JSON = the list; RUNS_FAIL=1 = unreadable.
-if [ "\${1:-}" = run ] && [ "\${2:-}" = list ]; then
+# main's workflow runs via the Actions API, one paginated query per status: MAIN_RUNS_JSON is
+# the full run list (Actions shape); the stub filters by status and splits it into pages of 2,
+# so a release run past any recency window is still reached. RUNS_FAIL=1 = an unreadable page.
+# MAIN_RUNS_PAGE overrides the raw slurped pages (malformed payloads).
+if [ "\${1:-}" = api ] && case "\$*" in *actions/runs*) true;; *) false;; esac; then
   [ "\${RUNS_FAIL:-0}" = 1 ] && { echo 'HTTP 502' >&2; exit 1; }
-  printf '%s\n' "\${MAIN_RUNS_JSON:-[]}"; exit 0
+  [ -n "\${MAIN_RUNS_PAGE:-}" ] && { printf '%s\n' "\$MAIN_RUNS_PAGE"; exit 0; }
+  st=\$(printf '%s' "\$*" | sed -n 's/.*status=\\([a-z_]*\\).*/\\1/p')
+  printf '%s' "\${MAIN_RUNS_JSON:-[]}" | jq -c --arg s "\$st" '[.[]|select(.status==\$s)] as \$r
+    | if (\$r|length)==0 then [{workflow_runs:[]}] else [range(0; \$r|length; 2) as \$i | {workflow_runs: \$r[\$i:\$i+2]}] end'
+  exit 0
+fi
+# The same data through the older gh run list --limit N lookup, so this case also proves the
+# window and malformed-record regressions against a recency-capped implementation.
+if [ "\${1:-}" = run ] && [ "\${2:-}" = list ]; then
+  [ "\${RUNS_FAIL:-0}" = 1 ] && exit 1
+  lim=20; prev=; for a in "\$@"; do [ "\$prev" = --limit ] && lim=\$a; prev=\$a; done
+  if [ -n "\${MAIN_RUNS_PAGE:-}" ]; then
+    printf '%s' "\$MAIN_RUNS_PAGE" | jq -c '[.[]?|.workflow_runs[]?|with_entries(.key |= ({display_title:"displayTitle",head_sha:"headSha",id:"databaseId"}[.] // .))]' 2>/dev/null || echo '[]'
+  else
+    printf '%s' "\${MAIN_RUNS_JSON:-[]}" | jq -c --argjson n "\$lim" '.[:\$n]|map({status,displayTitle:.display_title,headSha:.head_sha,name,databaseId:.id})'
+  fi
+  exit 0
 fi
 if [ "\${1:-}" = pr ] && [ "\${2:-}" = merge ]; then echo "\$*" >> "$WORK/merge.log"; exit 0; fi
 echo "unexpected gh call: \$*" >&2
@@ -349,21 +368,39 @@ grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "an ackno
 unset COMMENTS_FILE
 
 # 8. A release cut waiting on main CI (#2191 merged over v0.85.1's run and cancelled it):
-#    an in-flight `chore(release):` run on main refuses (exit 10); ordinary in-flight main CI
-#    does not; an unreadable run list refuses (exit 2).
-export MAIN_RUNS_JSON='[{"status":"in_progress","headSha":"5f9145cbaaaa","displayTitle":"chore(release): v0.85.1","name":"CI","databaseId":101}]'
+#    an in-flight `chore(release):` run on main refuses (exit 10), however many runs precede it;
+#    ordinary in-flight main CI does not; an unreadable page or record refuses (exit 2).
+run() { jq -nc --arg s "$1" --arg t "$2" --argjson id "$3" '{status:$s,display_title:$t,head_sha:"5f9145cbaaaa0000",name:"CI",id:$id}'; }
+MAIN_RUNS_JSON="[$(for i in $(seq 1 60); do run in_progress "fix(x): y" "$i"; printf ','; done)$(run in_progress 'chore(release): v0.85.1' 900)]"
+export MAIN_RUNS_JSON
 merge_run release
-[ "$rc" -eq 10 ] || fail "an in-flight release run did not refuse, rc=$rc: $(cat "$WORK/m.release")"
+[ "$rc" -eq 10 ] || fail "an in-flight release run (61st of 61) did not refuse, rc=$rc: $(cat "$WORK/m.release")"
 grep -q 'a release cut is waiting on main CI' "$WORK/m.release" || fail "release refusal not explained: $(cat "$WORK/m.release")"
 [ ! -e "$WORK/merge.log" ] || fail "merged over an in-flight release run"
-export MAIN_RUNS_JSON='[{"status":"completed","headSha":"5f9145cbaaaa","displayTitle":"chore(release): v0.85.1","name":"CI","databaseId":101},{"status":"in_progress","headSha":"a6382c58bbbb","displayTitle":"fix(x): y (#2186)","name":"CI","databaseId":102}]'
+MAIN_RUNS_JSON="[$(run completed 'chore(release): v0.85.1' 101),$(run in_progress 'fix(x): y (#2186)' 102),$(run queued 'docs: z' 103)]"
+export MAIN_RUNS_JSON
 merge_run ordinary
 grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "ordinary in-flight main CI blocked the merge: $(cat "$WORK/m.ordinary")"
 unset MAIN_RUNS_JSON
 export RUNS_FAIL=1
 merge_run runsfail
-[ "$rc" -eq 2 ] || fail "an unreadable main run list did not refuse, rc=$rc: $(cat "$WORK/m.runsfail")"
+[ "$rc" -eq 2 ] || fail "an unreadable main run page did not refuse, rc=$rc: $(cat "$WORK/m.runsfail")"
 [ ! -e "$WORK/merge.log" ] || fail "merged with an unreadable main run list"
+unset RUNS_FAIL
+for bad in '{}' '[{}]' '[{"workflow_runs":[{}]}]' '[{"workflow_runs":[{"status":"queued","display_title":"x","head_sha":"a"}]}]' '[{"workflow_runs":{}}]'; do
+  export MAIN_RUNS_PAGE="$bad"
+  merge_run malformed
+  [ "$rc" -eq 2 ] || fail "malformed run page $bad did not refuse, rc=$rc: $(cat "$WORK/m.malformed")"
+  [ ! -e "$WORK/merge.log" ] || fail "merged on malformed run page $bad"
+done
+unset MAIN_RUNS_PAGE
+# --confirm-only never reads the run list.
+MERGE_STATE=MERGED; export MERGE_STATE RUNS_FAIL=1
+seed_state
+set +e; bash "$SCRIPT" test/repo 42 --confirm-only > "$WORK/confirm-runs.out" 2>&1; rc=$?; set -e
+[ "$rc" -eq 0 ] || fail "--confirm-only read main's run list, rc=$rc: $(cat "$WORK/confirm-runs.out")"
+bash "$HERE/claims.sh" release '#42' --purge > /dev/null
+MERGE_STATE=OPEN; export MERGE_STATE
 unset RUNS_FAIL CHECKS_JSON CHECKS_RC
 
 echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses"
