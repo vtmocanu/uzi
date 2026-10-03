@@ -554,8 +554,9 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	// If you are adding a revise_plan write anywhere else: bump runs.revise_count in the
 	// same statement, or the cap stops meaning anything.
 	if kind == "revise_plan" {
+		cleanBody, _ := stripNUL(body)
 		row, err := s.q.CreateRunReviseInputIfUnderCap(ctx, store.CreateRunReviseInputIfUnderCapParams{
-			RunID: runID, Body: pgconv.TextOrNull(body), MaxRevisions: int32(s.p.PlanMaxRevisions), //nolint:gosec // G115: PlanMaxRevisions is a small bounded config int (env PLAN_MAX_REVISIONS), never near int32 range
+			RunID: runID, Body: pgconv.TextOrNull(cleanBody), MaxRevisions: int32(s.p.PlanMaxRevisions), //nolint:gosec // G115: PlanMaxRevisions is a small bounded config int (env PLAN_MAX_REVISIONS), never near int32 range
 			ExpectedGateRevision: pgconv.Int8Ptr(opts.ExpectedGateRevision),
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -579,8 +580,9 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 // the plan-gate binding it was sent against. expected is the D5 expected revision (nil = none);
 // a mismatch returns pgx.ErrNoRows and writes nothing.
 func (s *Service) enqueueGateApproval(ctx context.Context, run store.Run, body string, expected *int64) (SubmitInputResult, store.RunUserInput, error) {
+	cleanBody, _ := stripNUL(body)
 	row, err := s.q.CreateGateVerdictInput(ctx, store.CreateGateVerdictInputParams{
-		RunID: run.ID, Body: pgconv.TextOrNull(body), ExpectedGateRevision: pgconv.Int8Ptr(expected),
+		RunID: run.ID, Body: pgconv.TextOrNull(cleanBody), ExpectedGateRevision: pgconv.Int8Ptr(expected),
 	})
 	if err != nil {
 		return SubmitInputResult{}, store.RunUserInput{}, err
@@ -594,8 +596,9 @@ func (s *Service) enqueueGateApproval(ctx context.Context, run store.Run, body s
 // (approve_plan / reject_plan / revise_plan): those are stamped with their gate binding by
 // the dedicated verdict queries (PRD #1795 M2).
 func (s *Service) enqueueRunInput(ctx context.Context, runID uuid.UUID, kind, body string) (SubmitInputResult, error) {
+	cleanBody, _ := stripNUL(body)
 	row, err := s.q.CreateRunInput(ctx, store.CreateRunInputParams{
-		RunID: runID, Kind: kind, Body: pgconv.TextOrNull(body),
+		RunID: runID, Kind: kind, Body: pgconv.TextOrNull(cleanBody),
 	})
 	if err != nil {
 		return SubmitInputResult{}, err

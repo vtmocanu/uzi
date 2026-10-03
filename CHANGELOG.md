@@ -33,6 +33,8 @@ through `[0.52.0]`.)
   Stable tags also advance `uzi-cli-rc`, and delayed or repeated publishes cannot downgrade either formula. The TUI offers the newer of stable and RC releases to RC-channel installs, while the CLI skew warning names the formula that owns the binary even when its version is stable. Unknown-owner prompts remain notes-only. Existing rc.10/rc.11 users should run `brew upgrade uzi-cli-rc` once after the tap is refreshed; upgrading to v0.85.0 clears the warning against a 0.85.0 server, but v0.85.0 does not contain the new prompt or remedy logic, which arrives in the first release containing this fix.
 - **Codex resumes keep their saved session when a run parks before the provider starts ([#2175](https://github.com/vtmocanu/uzi/issues/2175)).**
   A fresh provider epoch now waits until launch before saving its session, so an owner pause or wall park cannot replace the previously saved thread with an empty session.
+- **Owner run inputs and chat messages containing NUL bytes now save successfully.**
+  The API removes NUL bytes before writing plan revisions, gate approvals, plain inputs, and chat messages to PostgreSQL TEXT columns, while retaining each path's whitespace handling, validation, and limits.
 
 ## [0.85.0] - 2026-09-26
 

@@ -416,6 +416,7 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 // (Decision 2). The message becomes both the run's stored prompt (issue_description)
 // and, derived down to a short line, its conversation title.
 func (s *Service) CreateChatRun(ctx context.Context, userID uuid.UUID, message string) (store.Run, error) {
+	message, _ = stripNUL(message)
 	message = strings.TrimSpace(message)
 	if err := validateChatMessage(message); err != nil {
 		return store.Run{}, err
@@ -492,6 +493,7 @@ func (s *Service) GetChatRun(ctx context.Context, userID, runID uuid.UUID) (stor
 // enqueuing, counting persisted follow_ups so a compromised worker can't burn spend
 // past CHAT_MAX_TURNS.
 func (s *Service) SubmitChatMessage(ctx context.Context, userID, runID uuid.UUID, message string) (SubmitInputResult, error) {
+	message, _ = stripNUL(message)
 	message = strings.TrimSpace(message)
 	if err := validateChatMessage(message); err != nil {
 		return SubmitInputResult{}, err

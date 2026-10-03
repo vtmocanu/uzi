@@ -231,8 +231,8 @@ func completionQuestionOpen(run store.Run) bool {
 // DecideCompletion is the widened owner-scoped completion-decision entry point (PRD #1227 M1). It
 // dispatches on req.Decision:
 //
-//   - "continue": preserved EXACTLY as #1226 — owner-only via ContinueCompletionDecision, no
-//     transaction, no contract change.
+//   - "continue": owner-only via ContinueCompletionDecision, with the existing NUL stripping;
+//     no transaction or contract change.
 //   - "partial" / "accept": OWNER-SCOPED (GetRun authorizes the caller, exactly like continue and
 //     CreateRunInput), then ONE transaction that, under the run's FOR UPDATE row lock (the mutex,
 //     like completeRunWithPermitLease): re-checks ownership against the locked row, fences on the
