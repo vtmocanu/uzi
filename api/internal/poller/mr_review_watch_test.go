@@ -41,7 +41,7 @@ type mrwStore struct {
 
 	upserts   []store.UpsertMRReworkLedgerParams
 	haltSets  []store.SetMRReworkHaltNotifiedParams
-	evicts    []store.DeleteMRReworkLedgerNotInParams
+	evicts    []uuid.UUID
 	upsertErr error
 	haltErr   error
 
@@ -105,8 +105,8 @@ func (s *mrwStore) SetMRReworkHaltNotified(_ context.Context, arg store.SetMRRew
 	return nil
 }
 
-func (s *mrwStore) DeleteMRReworkLedgerNotIn(_ context.Context, arg store.DeleteMRReworkLedgerNotInParams) (int64, error) {
-	s.evicts = append(s.evicts, arg)
+func (s *mrwStore) DeleteMRReworkLedgerNotIn(_ context.Context, repoID uuid.UUID) (int64, error) {
+	s.evicts = append(s.evicts, repoID)
 	return 0, nil
 }
 
@@ -601,11 +601,9 @@ func TestMRReworkAdminGateErrorFailsClosed(t *testing.T) {
 	}
 }
 
-func TestMRReworkStopEvictsStaleLedger(t *testing.T) {
-	// Stop-on-merge / stop-on-close cleanup: when a watched MR leaves the opened-only
-	// candidate set (merged/closed via PRD #24's SyncMRStates, which ran FIRST this
-	// tick), it produces no candidate, so the reconcile eviction clears its ledger row
-	// with an empty keep-set — and nothing is acted on (no double-fire).
+func TestMRReworkEmptyCandidatesReconcilesRepo(t *testing.T) {
+	// Wiring only: even an empty candidate list reconciles the correct repo.
+	// Real structural eviction and eligibility retention are covered by live-DB tests.
 	st := &mrwStore{
 		candidates: nil, // the merged/closed MR is excluded by the candidate query
 		ledgers:    map[string]store.MrReworkLedger{mrwRef: {Ref: mrwRef, AttemptCount: 3, HighWater: 200}},
@@ -618,8 +616,8 @@ func TestMRReworkStopEvictsStaleLedger(t *testing.T) {
 	if len(runs.calls) != 0 {
 		t.Fatalf("a merged/closed MR must not be acted on, got %d runs", len(runs.calls))
 	}
-	if len(st.evicts) != 1 || len(st.evicts[0].KeepRefs) != 0 {
-		t.Fatalf("expected one eviction with an empty keep-set, got %+v", st.evicts)
+	if len(st.evicts) != 1 || st.evicts[0] != mrwRepoID {
+		t.Fatalf("expected one reconciliation for the repo, got %+v", st.evicts)
 	}
 }
 
