@@ -800,6 +800,45 @@ function runnerTrackingOwnerKey(branch: string): string {
   return `uzi-trackowner.${branch}.owner`;
 }
 
+type OrphanRetireStage = "journal_read" | "journal_validation" | "containment" | "holding_parent" | "rename" | "retained_copy" | "intra_device_rename" | "journal_clear";
+export type OrphanStage = OrphanRetireStage | "classification" | "identity" | "branch" | "path" | "quiescence" | "attempt_ledger" | "attempt_journal" | "retirement" | "complete";
+export type OrphanReason = "http" | "transport_unknown" | "nonterminal_owner" | "repo_mismatch" | "malformed_identity" | "branch_mismatch" | "path_error" | "path_mismatch" | "quiescence_blocked" | "quiescence_error" | "attempt_release_failure" | "canonical_retirement_failure" | "retained-in-place" | RunnerCloneRetireResult;
+export type RunnerCloneRetireResult = "quarantined" | "source-already-absent";
+export interface OrphanDiagnostics {
+  logger: Logger;
+  claimantId: string;
+  ownerId: string;
+  repoId: string;
+  pathShape: "canonical" | "attempt" | "unknown";
+}
+
+/** Only fixed vocabulary, UUIDs and a path digest leave this boundary. Diagnostic failures
+ * never replace a refusal or turn completed retirement into failure. */
+export function emitOrphanDiagnostic(
+  context: OrphanDiagnostics,
+  journaledPath: string,
+  event: "orphan_reclaim_refused" | "orphan_retirement_failed" | "orphan_reclaim_succeeded",
+  stage: OrphanStage,
+  reason: OrphanReason,
+  error?: unknown,
+  httpStatus?: number,
+): void {
+  try {
+    const safeId = (id: string): string =>
+      typeof id === "string" && id.length === 36 && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ? id : "invalid";
+    let fingerprint = "0".repeat(64);
+    try { fingerprint = createHash("sha256").update(journaledPath).digest("hex"); } catch { /* best effort */ }
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    const errno = typeof code === "string" && ["EACCES", "EPERM", "ENOENT", "EXDEV", "EIO", "ENOTEMPTY", "EEXIST", "ENOTDIR", "EINVAL", "ENOSPC", "EROFS", "ELOOP", "EMFILE", "ENFILE"].includes(code) ? code : "unknown";
+    context.logger[event === "orphan_reclaim_succeeded" ? "info" : "warn"](event, {
+      event, stage, reason,
+      claimant_id: safeId(context.claimantId), owner_id: safeId(context.ownerId), repo_id: safeId(context.repoId),
+      path_shape: context.pathShape === "canonical" || context.pathShape === "attempt" ? context.pathShape : "unknown", path_fingerprint: fingerprint, errno,
+      ...(Number.isInteger(httpStatus) && httpStatus! >= 100 && httpStatus! <= 599 ? { http_status: httpStatus } : {}),
+    });
+  } catch { /* best effort, including hostile logger or error accessors */ }
+}
+
 /** A same-run clone survived recovery; the runner must capture it before reseeding. */
 export class PendingRecoveryCaptureError extends Error {
   constructor(readonly clonePath: string, readonly branch: string) {
@@ -4642,13 +4681,15 @@ export class GitCache {
     clonePath: string,
     branch: string,
     ownerRunId: string,
-    opts: { discard: boolean; attemptId?: string },
-  ): Promise<void> {
-    const result = await this.withLock(barePath, async (): Promise<{ holding?: string; scratch?: string }> => {
+    opts: { discard: boolean; attemptId?: string; orphanDiagnostics?: OrphanDiagnostics },
+  ): Promise<RunnerCloneRetireResult> {
+    let stage: OrphanRetireStage = "journal_read";
+    const result = await this.withLock(barePath, async (): Promise<{ holding?: string; scratch?: string; disposition: RunnerCloneRetireResult }> => {
       // 1. Pre-rename pair validation. Require the EXACT (ownerRunId, clonePath) pair
       //    to STILL be journaled before moving anything. A missing/malformed journal, or
       //    a lock-gap rewrite to a different runId/path, moves NOTHING and fails closed.
       const pending = await this.readRecoveryCapture(barePath, branch);
+      stage = "journal_validation";
       if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath) {
         throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, ownerRunId);
       }
@@ -4656,6 +4697,7 @@ export class GitCache {
       //    sides and require a path-separator boundary so a sibling like
       //    `<runnerRoot>-evil` cannot satisfy a bare prefix test. A path outside
       //    runnerRoot (whatever the journal claims) fails closed and moves nothing.
+      stage = "containment";
       const resolvedClone = path.resolve(clonePath);
       const resolvedRoot = path.resolve(this.runnerRoot);
       if (!resolvedClone.startsWith(resolvedRoot + path.sep)) {
@@ -4672,12 +4714,14 @@ export class GitCache {
         this.runnerHoldingRoot,
         `${ownerRunId.replace(/[^A-Za-z0-9_-]/g, "_")}-${randomUUID()}`,
       );
+      stage = "holding_parent";
       await fs.mkdir(path.dirname(holdingDest), { recursive: true, mode: 0o700 });
       // 4. Atomic move + ENOENT disambiguation, with an EXDEV fallback (issue #1354).
       let renamed = true;
       let holding: string | undefined;
       let scratch: string | undefined;
       let exdev = false;
+      stage = "rename";
       try {
         await fs.rename(clonePath, holdingDest);
       } catch (err) {
@@ -4695,6 +4739,7 @@ export class GitCache {
             // Hot path (G1 rename-first): the owner's own terminal trash. Free the
             // canonical and copy NOTHING — an fs.cp here would throw on a git fsmonitor
             // socket / FIFO the clone may carry. No holdingDest is used on this path.
+            stage = "intra_device_rename";
             const scratchParent = await this.createRetireScratchParent();
             renamed = await this.renameCanonicalOrConfirmFree(clonePath, path.join(scratchParent, "clone"));
             scratch = scratchParent;
@@ -4703,6 +4748,7 @@ export class GitCache {
             // cross-crash retention is a hard requirement → copy-before-free. COMPLETE the
             // symlink-safe copy into holdingDest FIRST, while the canonical AND the journal
             // still protect a retry.
+            stage = "retained_copy";
             try {
               await fs.cp(clonePath, holdingDest, {
                 recursive: true,
@@ -4728,6 +4774,7 @@ export class GitCache {
             // intra-device atomic rename. A REAL rename failure here must RETAIN the
             // completed holdingDest AND leave the canonical + journal intact — so this
             // rename is deliberately OUTSIDE the copy's cleanup catch above.
+            stage = "intra_device_rename";
             const scratchParent = await this.createRetireScratchParent();
             renamed = await this.renameCanonicalOrConfirmFree(clonePath, path.join(scratchParent, "clone"));
             holding = holdingDest; // retained; step 6 no-ops since discard === false
@@ -4760,6 +4807,7 @@ export class GitCache {
       // 5. Journal clear — ONLY after a confirmed rename or a confirmed source-already-
       //    free. Re-read and clear only if it STILL matches (ownerRunId, clonePath); a
       //    concurrent successor must never have its journal cleared by us.
+      stage = "journal_clear";
       const still = await this.readRecoveryCapture(barePath, branch);
       if (still?.runId === ownerRunId && still.clonePath === clonePath) {
         await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
@@ -4778,7 +4826,10 @@ export class GitCache {
             }),
         );
       }
-      return { holding, scratch };
+      return { holding, scratch, disposition: holding ? "quarantined" : "source-already-absent" };
+    }).catch((error: unknown) => {
+      if (opts.orphanDiagnostics) emitOrphanDiagnostic(opts.orphanDiagnostics, clonePath, "orphan_retirement_failed", stage, "canonical_retirement_failure", error);
+      throw error;
     });
     // 6. Disposal, OUTSIDE the lock. Terminal trash (discard) — best-effort delete the
     //    holding dir. Foreign quarantine (!discard) — RETAIN it forever (never delete).
@@ -4797,6 +4848,7 @@ export class GitCache {
     if (scratch) {
       await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
     }
+    return result.disposition;
   }
 
   /** issue #1354 — create an intra-device scratch parent directly under runnerRoot (the

@@ -6,8 +6,10 @@ import path from "node:path";
 import net from "node:net";
 import { execFileSync } from "node:child_process";
 import { ForeignCaptureBlockedError, CapturePathMismatchError } from "../src/git.js";
+import type { Logger } from "../src/log.js";
+import { RequestError } from "../src/client.js";
 import { type ExecutorFactory } from "../src/runner.js";
-import { randomUUID } from "node:crypto";
+import { Hash, randomUUID } from "node:crypto";
 import { formatAttemptId } from "../src/attempt-path.js";
 import type { AttemptSeedOptions } from "../src/git.js";
 import type { QuiesceRunOutcome, QuiesceRunRequest } from "../src/run-quiescence.js";
@@ -94,6 +96,27 @@ async function seedResidueForBranch(
   return { bare, branch, clonePath: clone.path };
 }
 
+function diagnosticLogger() {
+  const events: Record<string, unknown>[] = [];
+  const capture = (level: "info" | "warn"): Logger["info"] => (event, fields) => {
+    if (!event.startsWith("orphan_")) return;
+    assert.equal(level, event === "orphan_reclaim_succeeded" ? "info" : "warn");
+    events.push({ ...fields });
+  };
+  const logger: Logger = { ...nullLogger(), info: capture("info"), warn: capture("warn") };
+  return { logger, events };
+}
+
+function assertSafeEvents(events: Record<string, unknown>[], forbidden: string[] = []): void {
+  assert.ok(events.length > 0);
+  for (const event of events) {
+    assert.deepEqual(Object.keys(event).sort(), ["claimant_id", "errno", "event", "owner_id", "path_fingerprint", "path_shape", "reason", "repo_id", "stage", ...(event.http_status === undefined ? [] : ["http_status"])].sort());
+    assert.match(String(event.path_fingerprint), /^[a-f0-9]{64}$/);
+    assert.ok(JSON.stringify(event).length < 700);
+    for (const value of forbidden) assert.ok(!JSON.stringify(event).includes(value));
+  }
+}
+
 describe("1848 M1: moved terminal mr_rework custody", () => {
   const branch = "agent/issue-1810";
   const slug = "agent-issue-1810";
@@ -167,7 +190,7 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
     return matches[0]!;
   }
 
-  function execution(s: Seed, enabled: boolean, blocked?: "survivors" | "unverified") {
+  function execution(s: Seed, enabled: boolean, blocked?: "survivors" | "unverified", loggerOverride?: Logger) {
     const { gitlab } = fakeGitlab();
     const calls: QuiesceRunRequest[] = [];
     let entry: { clonePath: string; journal: ReturnType<typeof readJournal>; clean: string; contents: string; hasMarker: boolean; retainedPath: string; ledgerState: string | undefined } | undefined;
@@ -197,18 +220,22 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
     const quiesceRun = async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
       calls.push(req);
       return {
-        process: { state: req.site === "orphan_reclaim" && blocked ? blocked : "quiescent", processes: [], killed: [], detail: "1848 scripted proof" },
+        process: { state: req.site === "orphan_reclaim" && blocked ? blocked : "quiescent", processes: [], killed: [], detail: "/private/owner-path\n1848 scripted proof" },
         docker: { state: "not_wired", removed: [], detail: "" },
       };
     };
-    const runner = runnerWith(factory, gitlab, undefined, nullLogger(), {
+    const logs = diagnosticLogger();
+    const runner = runnerWith(factory, gitlab, undefined, loggerOverride ?? logs.logger, {
       recoveryRetryMs: 5, ...(enabled ? { dockerHost: "unix:///1848-scripted-only.sock", quiesceRun } : {}),
     });
     return { run: () => runner.execute(gitlabClaim(1810, { run_id: s.claimant, kind: "mr_rework", branch })),
-      entry: () => entry, entryError: () => entryError, calls };
+      entry: () => entry, entryError: () => entryError, calls, events: logs.events, runner };
   }
 
   function assertEntry(s: Seed, e: ReturnType<typeof execution>, enabled: boolean, expectReclaimProof = true): void {
+    if (expectReclaimProof) assertSafeEvents(e.events, [s.clonePath]);
+    if (expectReclaimProof) assert.equal(e.events.filter((event) => event.event === "orphan_reclaim_succeeded").at(-1)?.reason,
+      s.attemptId ? "retained-in-place" : "quarantined");
     assert.equal(e.entryError(), undefined, "predecessor bytes survived through model entry");
     const entry = e.entry();
     assert.ok(entry, "successor model entered");
@@ -291,6 +318,9 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
         const beforeLedger = configValues(s.bare, `uzi-attempts.${branch}.entry`);
         const e = execution(s, true, blocked);
         await e.run();
+        assertSafeEvents(e.events, [s.clonePath, "/private/owner-path"]);
+        assert.equal(e.events.at(-1)?.reason, "quiescence_blocked");
+        assert.ok(!JSON.stringify(api.states).includes("/private/owner-path"));
         assert.equal(e.entry(), undefined);
         assert.deepEqual(configValues(s.bare, `uzi-recovery.${branch}.clone`), journal);
         assert.deepEqual(configValues(s.bare, `uzi-attempts.${branch}.entry`), beforeLedger);
@@ -327,6 +357,9 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
       const failed = execution(s, true);
       try { await failed.run(); } finally { seam.runGit = real; }
       assert.ok(injected > 0, "requested write failure was exercised");
+      assertSafeEvents(failed.events, [s.clonePath]);
+      assert.equal(failed.events.at(-1)?.stage, stage === "attempt-ledger" ? "attempt_ledger" : stage === "attempt-journal" ? "attempt_journal" : "retirement");
+      if (stage === "canonical-journal") assert.equal(failed.events[0]?.stage, "journal_clear");
       assert.equal(failed.entry(), undefined);
       assert.deepEqual(configValues(s.bare, `uzi-recovery.${branch}.clone`), journal);
       if (stage === "attempt-ledger") {
@@ -352,6 +385,141 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
       assertBytes(retained, s);
     });
   }
+  for (const malformed of ["null", "missing-fields", "status-accessor", "repo-accessor"] as const) {
+    it(`1848 M2 malformed classification ${malformed} preserves fixed refusal`, async (t) => {
+      const s = await seed(false, "completed");
+      const leaked = s.clonePath + "\nprivate classification accessor";
+      const value = malformed === "null" ? null : malformed === "missing-fields" ? {} :
+        Object.defineProperty({ status: "completed", repo_id: "r1" },
+          malformed === "status-accessor" ? "status" : "repo_id", { get: () => { throw new Error(leaked); } });
+      t.mock.method(client, "getRunOrphanClassification", async () => value);
+      const e = execution(s, false);
+      await e.run();
+      assert.equal(e.entry(), undefined);
+      assertSafeEvents(e.events, [s.clonePath, leaked]);
+      assert.equal(e.events.at(-1)?.stage, "identity");
+      assert.equal(e.events.at(-1)?.reason, "malformed_identity");
+      assert.equal(api.states.filter((state) => state.runId === s.claimant && state.body.status === "failed").at(-1)?.body.failure_reason,
+        "refusing to replace a retained clone owned by another run");
+      assertBytes(s.clonePath, s);
+      assert.deepEqual(readJournal(s.bare, branch), { runId: s.owner, clonePath: s.clonePath });
+    });
+  }
+
+  // This unwired reclaim path never reads flight; keep the private seam's fixture minimal.
+  function reclaim(e: ReturnType<typeof execution>, s: Seed, original: Error): Promise<void> {
+    const seam = e.runner as unknown as {
+      reclaimTerminalOrphan: (bare: string, claim: ReturnType<typeof gitlabClaim>, flight: Record<string, never>,
+        clonePath: string, branch: string, owner: string, original: Error) => Promise<void>;
+    };
+    return seam.reclaimTerminalOrphan(s.bare,
+      gitlabClaim(1810, { run_id: s.claimant, kind: "mr_rework", branch }), {}, s.clonePath, branch, s.owner, original);
+  }
+
+  for (const refusal of ["foreign", "path-mismatch"] as const) {
+    for (const diagnosticFault of ["logger", "fingerprint"] as const) {
+      it(`1848 M2 404 ${refusal} keeps exact original with ${diagnosticFault} failure`, async (t) => {
+        const s = await seed(false, "completed");
+        const original = refusal === "foreign"
+          ? new ForeignCaptureBlockedError(s.clonePath, branch, s.owner)
+          : new CapturePathMismatchError(s.clonePath, "/private/claimant", branch, s.owner);
+        const error = new RequestError("GET", "/private/classification", 404, "private body");
+        t.mock.method(client, "getRunOrphanClassification", async () => { throw error; });
+        const logs = diagnosticLogger();
+        const logger: Logger = { ...logs.logger, warn: (event, fields) => {
+          logs.logger.warn(event, fields);
+          if (diagnosticFault === "logger") throw new Error(s.clonePath);
+        } };
+        if (diagnosticFault === "fingerprint") {
+          const update = Hash.prototype.update;
+          t.mock.method(Hash.prototype, "update", function(this: Hash, ...args: Parameters<Hash["update"]>) {
+            if (args[0] === s.clonePath) throw new Error(s.clonePath);
+            return Reflect.apply(update, this, args) as Hash;
+          });
+        }
+        await assert.rejects(reclaim(execution(s, false, undefined, logger), s, original), (error) => error === original);
+        assertSafeEvents(logs.events, [s.clonePath, error.path, error.body]);
+        assert.equal(logs.events.at(-1)?.http_status, 404);
+        if (diagnosticFault === "fingerprint") assert.equal(logs.events.at(-1)?.path_fingerprint, "0".repeat(64));
+        assertBytes(s.clonePath, s);
+        assert.deepEqual(readJournal(s.bare, branch), { runId: s.owner, clonePath: s.clonePath });
+      });
+    }
+  }
+
+  it("1848 M2 runner reports source-already-absent success", async () => {
+    const s = await seed(false, "completed");
+    fs.rmSync(s.clonePath, { recursive: true });
+    const e = execution(s, false);
+    await reclaim(e, s, new ForeignCaptureBlockedError(s.clonePath, branch, s.owner));
+    assertSafeEvents(e.events, [s.clonePath]);
+    assert.equal(e.events.at(-1)?.event, "orphan_reclaim_succeeded");
+    assert.equal(e.events.at(-1)?.reason, "source-already-absent");
+    assert.equal(readJournal(s.bare, branch), undefined);
+  });
+
+  for (const fault of ["transport", "derive", "path", "quiescence"] as const) {
+    it(`1848 M2 ${fault} exception is a safe original refusal`, async (t) => {
+      const s = await seed(false, "completed");
+      const secret = "glpat-" + "0123456789abcdefghij";
+      const error = new Error(`/private/owner-path\n${secret}`);
+      if (fault === "transport") t.mock.method(client, "getRunOrphanClassification", async () => { throw error; });
+      if (fault === "derive") t.mock.method(client, "getRunOrphanClassification", async () => ({
+        status: "completed", repo_id: "r1", kind: "mr_rework", pipeline_ref: 42,
+      }));
+      if (fault === "path") t.mock.method(git, "classifyOwnerClonePath", async () => { throw error; });
+      const e = execution(s, true);
+      if (fault === "quiescence") {
+        // Stub at the approved quiesceRun seam, without depending on process attribution.
+        const original = e.runner;
+        t.mock.method(original as unknown as { quiesceRun: () => Promise<unknown> }, "quiesceRun", async () => { throw error; });
+      }
+      await e.run();
+      assert.equal(e.entry(), undefined);
+      assertSafeEvents(e.events, [s.clonePath, secret, "/private/owner-path"]);
+      assert.equal(e.events.at(-1)?.reason, { transport: "transport_unknown", derive: "malformed_identity", path: "path_error", quiescence: "quiescence_error" }[fault]);
+      assert.equal(api.states.filter((state) => state.runId === s.claimant && state.body.status === "failed").at(-1)?.body.failure_reason,
+        "refusing to replace a retained clone owned by another run");
+      assertBytes(s.clonePath, s);
+      assert.deepEqual(readJournal(s.bare, branch), { runId: s.owner, clonePath: s.clonePath });
+    });
+  }
+
+  it("1848 M2 logger and fingerprint failures cannot undo completed reclaim", async (t) => {
+    const s = await seed(false, "completed");
+    const realHashUpdate = Hash.prototype.update;
+    t.mock.method(Hash.prototype, "update", function(this: Hash, ...args: Parameters<Hash["update"]>) {
+      if (args[0] === s.clonePath) throw new Error("hash failed");
+      return Reflect.apply(realHashUpdate, this, args) as Hash;
+    });
+    const logs = diagnosticLogger();
+    const e = execution(s, true, undefined, { ...logs.logger, info: (event, fields) => {
+      logs.logger.info(event, fields);
+      if (event.startsWith("orphan_")) throw new Error("logger failed");
+    } });
+    await e.run();
+    assert.ok(e.entry());
+    assertBytes(heldPath(s), s);
+    assertSafeEvents(logs.events, [s.clonePath]);
+    assert.equal(logs.events.at(-1)?.reason, "quarantined");
+    assert.equal(logs.events.at(-1)?.path_fingerprint, "0".repeat(64));
+  });
+
+  it("1848 M2 HTTP refusal contains only numeric status; throwing logger preserves refusal", async (t) => {
+    const s = await seed(false, "completed");
+    const error = new RequestError("GET", "/private/path", 503, "glpat-" + "0123456789abcdefghij");
+    t.mock.method(client, "getRunOrphanClassification", async () => { throw error; });
+    const e = execution(s, true);
+    await e.run();
+    assertSafeEvents(e.events, [error.body, error.path]);
+    assert.equal(e.events.at(-1)?.http_status, 503);
+    const logger = { ...nullLogger(), warn: () => { throw error; } };
+    const retry = execution(s, true, undefined, logger);
+    await retry.run();
+    assert.equal(api.states.filter((state) => state.runId === s.claimant && state.body.status === "failed").at(-1)?.body.failure_reason,
+      "refusing to replace a retained clone owned by another run");
+  });
+
 });
 
 describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", () => {
@@ -676,16 +844,24 @@ describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", 
           },
         },
       });
-      const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 });
+      const logs = diagnosticLogger();
+      const runner = runnerWith(factory, gitlab, undefined, logs.logger, { recoveryRetryMs: 5 });
       try {
         await runner.execute(gitlabClaim(row.iid, { run_id: claimantRunId, ...row.claimOverrides }));
       } finally {
         git.retireRunnerClone = origRetire;
       }
 
+      assertSafeEvents(logs.events);
+      assert.equal(logs.events.at(-1)?.event, "orphan_reclaim_refused");
       assert.equal(ran, false, "the model never starts");
+      assert.equal(logs.events.at(-1)?.reason, row.iid === 1411 ? "repo_mismatch" : row.iid === 1413 ? "path_mismatch" : row.iid === 1414 ? "malformed_identity" : "branch_mismatch");
       assert.equal(retireCalls, 0, "retireRunnerClone is NEVER called on an unmet predicate");
-      assert.ok(api.states.some((s) => s.body.status === "failed"), "the run fails closed");
+      const failure = api.states.filter((s) => s.runId === claimantRunId && s.body.status === "failed").at(-1)?.body.failure_reason;
+      assert.equal(failure, row.iid === 1413 || row.iid === 1415
+        ? "recovery journal points at a different clone path than this branch's computed clone"
+        : "refusing to replace a retained clone owned by another run");
+      assert.ok(!String(failure).includes(residuePath), "failure_reason excludes the journaled worker path");
       assert.deepEqual(readJournal(bare, branch), expectJournal, "the journal is untouched");
       assert.equal(
         fs.readFileSync(path.join(residuePath, "FOREIGN.txt"), "utf8"),
@@ -737,14 +913,19 @@ describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", 
           },
         },
       });
-      const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 });
+      const logs = diagnosticLogger();
+      const runner = runnerWith(factory, gitlab, undefined, logs.logger, { recoveryRetryMs: 5 });
       try {
         await runner.execute(gitlabClaim(iid, { run_id: claimantRunId }));
       } finally {
         git.retireRunnerClone = origRetire;
       }
 
+      assertSafeEvents(logs.events);
+      assert.equal(logs.events.at(-1)?.event, "orphan_reclaim_refused");
       assert.equal(ran, false, "the model never starts");
+      assert.equal(logs.events.at(-1)?.reason, scenario === "non-terminal" ? "nonterminal_owner" : "http");
+      assert.equal(logs.events.at(-1)?.http_status, scenario === "non-terminal" ? undefined : scenario === "404" ? 404 : 503);
       assert.equal(retireCalls, 0, "no reclaim on a non-terminal / 404 / transient probe");
       assert.ok(api.states.some((s) => s.body.status === "failed"), "the run fails closed");
       assert.deepEqual(readJournal(bare, branch), { runId: ownerRunId, clonePath }, "the journal is untouched");
@@ -1356,5 +1537,165 @@ describe("retireRunnerClone EXDEV fallback (#1354)", () => {
     assert.equal(fs.existsSync(clonePath), true, "the canonical is intact after the fail-closed scratch mkdir");
     assert.equal(fs.readFileSync(path.join(clonePath, "KEEP.txt"), "utf8"), "owner-only bytes\n");
     assert.deepEqual(readJournal(bare, branch), { runId: ownerRunId, clonePath }, "the journal is intact");
+  });
+});
+
+describe("1848 M2 local retirement disposition and stage diagnostics", () => {
+  const owner = "12345678-1234-4234-8234-123456789abc";
+  function diagnostics(logger: Logger) {
+    return { logger, claimantId: "hostile\n" + "x".repeat(2000), ownerId: owner,
+      repoId: "glpat-" + "0123456789abcdefghij", pathShape: "canonical" as const };
+  }
+
+  for (const stage of ["journal_read", "journal_validation", "containment", "holding_parent", "rename", "retained_copy", "intra_device_rename", "journal_clear"] as const) {
+    it(`1848 M2 retirement failure at ${stage} retains original exception and custody`, async (t) => {
+      const seeded = await seedResidue(1890, owner, "M2.txt");
+      let clonePath = seeded.clonePath;
+      if (stage === "containment") {
+        clonePath = path.join(fx.dataDir, "outside-runner");
+        fs.mkdirSync(clonePath);
+        fs.writeFileSync(path.join(clonePath, "M2.txt"), "owner-only bytes\n");
+        await git.markRecoveryCapture(seeded.bare, clonePath, seeded.branch, owner);
+      }
+      const logs = diagnosticLogger();
+      const fault = Object.assign(new Error("/private/path\n" + "glpat-" + "0123456789abcdefghij"), { code: stage === "rename" ? "ENOENT" : "EIO" });
+      const readSeam = git as unknown as { readRecoveryCapture: (bare: string, branch: string) => Promise<{ runId: string; clonePath: string } | undefined> };
+      const realRead = readSeam.readRecoveryCapture.bind(git);
+      let reads = 0;
+      if (stage === "journal_read" || stage === "journal_validation") {
+        t.mock.method(readSeam, "readRecoveryCapture", async (...args: Parameters<typeof realRead>) => {
+          if (++reads === 1) {
+            if (stage === "journal_read") throw fault;
+            return undefined;
+          }
+          return realRead(...args);
+        });
+      }
+      const realMkdir = fsp.mkdir.bind(fsp);
+      if (stage === "holding_parent") t.mock.method(fsp, "mkdir", async (...args: Parameters<typeof realMkdir>) => {
+        if (String(args[0]) === holdingRoot()) throw fault;
+        return realMkdir(...args);
+      });
+      const realRename = fsp.rename.bind(fsp);
+      if (["rename", "retained_copy", "intra_device_rename"].includes(stage)) {
+        t.mock.method(fsp, "rename", async (...args: Parameters<typeof realRename>) => {
+          if (String(args[0]) === clonePath) {
+            if (stage === "rename" || String(args[1]).startsWith(runnerRoot() + path.sep)) throw fault;
+            throw Object.assign(new Error("cross-device"), { code: "EXDEV" });
+          }
+          return realRename(...args);
+        });
+      }
+      if (stage === "retained_copy") t.mock.method(fsp, "cp", async () => { throw fault; });
+      type RunGit = (cwd: string | undefined, args: string[]) => Promise<string>;
+      const seam = git as unknown as { runGit: RunGit };
+      const realRunGit = seam.runGit.bind(git);
+      if (stage === "journal_clear") t.mock.method(seam, "runGit", async (cwd: string | undefined, args: string[]) => {
+        if (args[0] === "config" && args.at(-1) === "") throw fault;
+        return realRunGit(cwd, args);
+      });
+      let caught: unknown;
+      try { await git.retireRunnerClone(seeded.bare, clonePath, seeded.branch, owner, { discard: false, orphanDiagnostics: diagnostics(logs.logger) }); }
+      catch (error) { caught = error; }
+      assert.ok(caught);
+      if (stage === "journal_validation" || stage === "containment") assert.ok(caught instanceof CapturePathMismatchError);
+      else assert.equal(caught, fault);
+      assertSafeEvents(logs.events, [clonePath, fault.message]);
+      assert.equal(logs.events.length, 1);
+      assert.equal(logs.events[0]?.stage, stage);
+      assert.equal(logs.events[0]?.claimant_id, "invalid");
+      assert.equal(logs.events[0]?.repo_id, "invalid");
+      assert.equal(logs.events[0]?.owner_id, owner);
+      assert.deepEqual(readJournal(seeded.bare, seeded.branch), { runId: owner, clonePath });
+      if (stage === "journal_clear") assert.equal(fs.existsSync(clonePath), false);
+      else assert.equal(fs.readFileSync(path.join(clonePath, "M2.txt"), "utf8"), "owner-only bytes\n");
+      const priorHeld = fs.existsSync(holdingRoot()) ? fs.readdirSync(holdingRoot()).map((name) => path.join(holdingRoot(), name)) : [];
+      if (stage === "intra_device_rename" || stage === "journal_clear") {
+        assert.equal(priorHeld.length, 1);
+        assert.equal(fs.readFileSync(path.join(priorHeld[0]!, "M2.txt"), "utf8"), "owner-only bytes\n");
+      }
+      t.mock.restoreAll();
+      if (stage === "containment") {
+        // The refusal above left both fixtures untouched; restore canonical custody
+        // before retrying a path that retirement is permitted to move.
+        assert.equal(fs.readFileSync(path.join(seeded.clonePath, "M2.txt"), "utf8"), "owner-only bytes\n");
+        await git.markRecoveryCapture(seeded.bare, seeded.clonePath, seeded.branch, owner);
+        clonePath = seeded.clonePath;
+      }
+      assert.equal(await git.retireRunnerClone(seeded.bare, clonePath, seeded.branch, owner, {
+        discard: false, orphanDiagnostics: diagnostics(logs.logger),
+      }), stage === "journal_clear" ? "source-already-absent" : "quarantined");
+      assert.equal(readJournal(seeded.bare, seeded.branch), undefined);
+      assert.equal(fs.existsSync(clonePath), false);
+      const heldAfter = fs.readdirSync(holdingRoot()).map((name) => path.join(holdingRoot(), name));
+      assert.ok(heldAfter.length > 0);
+      for (const held of heldAfter) {
+        assert.equal(fs.readFileSync(path.join(held, "M2.txt"), "utf8"), "owner-only bytes\n");
+      }
+      for (const held of priorHeld) assert.ok(heldAfter.includes(held), "retry retains prior complete holding bytes");
+      if (stage === "journal_clear") assert.deepEqual(heldAfter, priorHeld);
+      if (stage === "containment") {
+        assert.equal(fs.readFileSync(path.join(fx.dataDir, "outside-runner", "M2.txt"), "utf8"), "owner-only bytes\n");
+      }
+    });
+  }
+
+  for (const crossDevice of [false, true]) {
+    it(`1848 M2 completed retirement returns quarantined, cross-device=${crossDevice}`, async (t) => {
+      const { bare, branch, clonePath } = await seedResidue(1891, owner, "M2.txt");
+      const realRename = fsp.rename.bind(fsp);
+      if (crossDevice) t.mock.method(fsp, "rename", async (...args: Parameters<typeof realRename>) => {
+        if (String(args[1]).startsWith(holdingRoot())) throw Object.assign(new Error("cross-device"), { code: "EXDEV" });
+        return realRename(...args);
+      });
+      assert.equal(await git.retireRunnerClone(bare, clonePath, branch, owner, { discard: false,
+        orphanDiagnostics: diagnostics({ ...nullLogger(), info: () => { throw new Error("logger failed"); } }) }), "quarantined");
+      assert.equal(fs.existsSync(clonePath), false);
+      assert.equal(readJournal(bare, branch), undefined);
+      const held = fs.readdirSync(holdingRoot());
+      assert.equal(fs.readFileSync(path.join(holdingRoot(), held[0]!, "M2.txt"), "utf8"), "owner-only bytes\n");
+    });
+  }
+
+  it("1848 M2 retirement never clears a successor journal written after the rename", async (t) => {
+    const { bare, branch, clonePath } = await seedResidue(1894, owner, "M2.txt");
+    const successor = randomUUID();
+    const realRename = fsp.rename.bind(fsp);
+    t.mock.method(fsp, "rename", async (...args: Parameters<typeof realRename>) => {
+      await realRename(...args);
+      if (String(args[0]) === clonePath) execFileSync("git", ["-C", bare, "config", "--local", `uzi-recovery.${branch}.clone`,
+        JSON.stringify({ runId: successor, clonePath })], { env: GIT_ENV, stdio: "pipe" });
+    });
+    assert.equal(await git.retireRunnerClone(bare, clonePath, branch, owner, { discard: false }), "quarantined");
+    assert.deepEqual(readJournal(bare, branch), { runId: successor, clonePath });
+    const held = fs.readdirSync(holdingRoot());
+    assert.equal(fs.readFileSync(path.join(holdingRoot(), held[0]!, "M2.txt"), "utf8"), "owner-only bytes\n");
+  });
+
+  it("1848 M2 confirmed source absence returns source-already-absent", async () => {
+    const { bare, branch, clonePath } = await seedResidue(1892, owner, "M2.txt");
+    fs.rmSync(clonePath, { recursive: true });
+    assert.equal(await git.retireRunnerClone(bare, clonePath, branch, owner, { discard: false }), "source-already-absent");
+    assert.equal(readJournal(bare, branch), undefined);
+  });
+
+  it("1848 M2 fingerprint and logger failures cannot replace the retirement exception", async (t) => {
+    const { bare, branch, clonePath } = await seedResidue(1893, owner, "M2.txt");
+    const fault = Object.assign(new Error("/private/path"), { code: "/private/secret-errno" });
+    t.mock.method(fsp, "rename", async () => { throw fault; });
+    const realHashUpdate = Hash.prototype.update;
+    t.mock.method(Hash.prototype, "update", function(this: Hash, ...args: Parameters<Hash["update"]>) {
+      if (args[0] === clonePath) throw new Error("hash failed");
+      return Reflect.apply(realHashUpdate, this, args) as Hash;
+    });
+    const logs = diagnosticLogger();
+    await assert.rejects(git.retireRunnerClone(bare, clonePath, branch, owner, { discard: false,
+      orphanDiagnostics: { ...diagnostics(logs.logger), ownerId: "hostile\n" + "x".repeat(2000) } }), (error) => error === fault);
+    assert.equal(logs.events[0]?.errno, "unknown");
+    assert.equal(logs.events[0]?.owner_id, "invalid");
+    assertSafeEvents(logs.events, [clonePath, "/private/secret-errno"]);
+    assert.equal(logs.events[0]?.path_fingerprint, "0".repeat(64));
+    await assert.rejects(git.retireRunnerClone(bare, clonePath, branch, owner, { discard: false,
+      orphanDiagnostics: diagnostics({ ...nullLogger(), warn: () => { throw new Error("logger failed"); } }) }), (error) => error === fault);
   });
 });
