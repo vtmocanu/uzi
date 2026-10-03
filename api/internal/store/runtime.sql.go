@@ -11731,7 +11731,14 @@ WITH ins AS (
       -- PRD #1497 M1 (D16): claim_released_at IS NULL is a STANDALONE conjunct, so a released claim
       -- is rejected even for a generation-less (legacy) report; a live claim still honours a NULL gen.
       AND r.claim_released_at IS NULL
-      AND (NOT (r.plan_cross_check_required AND r.auto_approve) OR r.plan_md IS NOT NULL)
+      -- Match SetRunCompleted: parking clears auto_approve, and a later status change
+      -- must not make an unapproved plan eligible for a completion attempt.
+      AND (NOT r.plan_cross_check_required OR
+           (r.plan_md IS NOT NULL AND (r.auto_approve OR EXISTS (
+               SELECT 1 FROM run_user_inputs i
+               WHERE i.run_id = r.id AND i.kind = 'approve_plan'
+                 AND i.applied_at IS NOT NULL
+                 AND i.disposition IS DISTINCT FROM 'superseded'))))
       AND ($7::bigint IS NULL
            OR r.claim_generation = $7::bigint)
     RETURNING run_completion_attempts.id
@@ -14142,7 +14149,7 @@ UPDATE runs SET
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
-WHERE id = $11 AND worker_id = $12
+WHERE runs.id = $11 AND runs.worker_id = $12
   -- PRD #1497 M1 (DEVIATION-3): a legacy (nil-generation, non-interlocked) ` + "`" + `completed` + "`" + ` from an
   -- old flight must never complete a run the wall-park sweep just server-parked. ParkRunsAtWall
   -- leaves the row status='paused' with claim_released_at set and KEEPS worker_id (informational),
@@ -14159,7 +14166,14 @@ WHERE id = $11 AND worker_id = $12
   -- fail_origin 'run_timeout' to completed: the runner's result POST is refused as terminal, so
   -- that flip would yield a completed job with no result.
   AND (kind <> 'job' OR status IN ('claimed', 'running'))
-  AND (NOT (plan_cross_check_required AND auto_approve) OR plan_md IS NOT NULL)
+  -- A required run that parked for review cleared auto_approve. The applied verdict,
+  -- rather than status, keeps the gate closed if requeue/reclaim changes status.
+  AND (NOT plan_cross_check_required OR
+       (plan_md IS NOT NULL AND (auto_approve OR EXISTS (
+           SELECT 1 FROM run_user_inputs i
+           WHERE i.run_id = runs.id AND i.kind = 'approve_plan'
+             AND i.applied_at IS NOT NULL
+             AND i.disposition IS DISTINCT FROM 'superseded'))))
   -- issue #329: a genuine worker completion (it opened the MR) supersedes a
   -- wall-clock RUN_TIMEOUT failure. Scoped to fail_origin='run_timeout' ONLY: a
   -- human 'cancelled' still wins, and a worker's own 'failed'/'worker_lost' is never

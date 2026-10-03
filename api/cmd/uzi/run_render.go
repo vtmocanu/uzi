@@ -106,6 +106,15 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		// and still carries the raw enum (machine-facing, D1).
 		{"HEALTH", displayHealth(r.Health)},
 	}
+	// The M1 cross-check gate has no checker yet. Show its fixed reason only while
+	// the owner can decide the parked plan; the snapshot remains set afterward.
+	if r.Status == "awaiting_approval" && r.PlanCrossCheckRequired {
+		reason := "plan cross-check: checker unavailable"
+		if r.Harness == "codex" {
+			reason = "plan cross-check: not yet supported for a Codex lead"
+		}
+		rows = append(rows, []string{"PLAN_CROSS_CHECK", reason})
+	}
 	// DEADLINE (PRD #1170): the run's wall-clock stop time and countdown, emitted only when
 	// the server set a deadline (a running issue run) — right after HEALTH, and emit-only-
 	// when-set like HEALTH_REASON below, so a chat/judge/non-running run prints no new row.
