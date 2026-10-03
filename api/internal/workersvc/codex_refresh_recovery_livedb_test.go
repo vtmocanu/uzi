@@ -268,6 +268,88 @@ func TestCodexRefreshRecoveryNonVaultBranchesLiveDB(t *testing.T) {
 	}
 }
 
+// The store hook promotes only after the fenced recovery write, before the first
+// response recheck. This is a response-selection interleaving, not an E2E proof.
+type recoverySlotAfterWriteStore struct {
+	*store.Queries
+	afterWrite func()
+}
+
+func (h *recoverySlotAfterWriteStore) SetCodexRecoverySlot(ctx context.Context, arg store.SetCodexRecoverySlotParams) (int64, error) {
+	n, err := h.Queries.SetCodexRecoverySlot(ctx, arg)
+	if err == nil && n == 1 {
+		h.afterWrite()
+	}
+	return n, err
+}
+
+func TestCodexRefreshRecoveryPromotedBeforeFirstResponseLiveDB(t *testing.T) {
+	for _, capable := range []bool{false, true} {
+		t.Run(map[bool]string{false: "old worker", true: "new worker"}[capable], func(t *testing.T) {
+			cases := []struct {
+				name   string
+				sql    string
+				target string
+				want   error
+			}{
+				{"authorized", "", "", ErrCodexVaultLocked},
+				{"released claim", "UPDATE runs SET claim_released_at=now() WHERE id=$1", "run", ErrCodexRunNotActivelyClaimed},
+				{"capability epoch", "UPDATE runs SET codex_claim_epoch=codex_claim_epoch+1 WHERE id=$1", "run", ErrCodexCapabilityEpoch},
+				{"worker ownership", "UPDATE runs SET worker_id=NULL WHERE id=$1", "run", ErrCodexWorkerMismatch},
+				{"material revision", "UPDATE codex_credential_state SET material_revision=material_revision+1 WHERE user_secret_id=$1", "alias", ErrCodexMaterialRevisionStale},
+				{"credential revision", "UPDATE codex_provider_account SET credential_revision=credential_revision+1 WHERE id=$1", "account", ErrCodexAccountRevisionStale},
+				{"identity tuple", "UPDATE codex_provider_account SET provider_user_id='changed' WHERE id=$1", "account", ErrCodexAccountTupleMismatch},
+				{"frozen binding", "UPDATE runs SET codex_account_key=NULL WHERE id=$1", "run", ErrCodexAccountKeyUnfrozen},
+			}
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					e := setupCodexLiveDB(t)
+					fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: codexToken("promoted")}}
+					f := newRefreshFixture(t, e, fake)
+					cleanupCodexRecoveryUser(t, e.pool, f.userID)
+					cap := e.mintCap(t, f.runID, f.workerID)
+					if capable {
+						f.wkr.ProtocolCapabilities = []string{capability.CodexRefreshRecoveryV1}
+					}
+					v := vault.New(e.box, e.q)
+					f.svc.SetVault(v)
+					before := e.mustAccount(t, f.userID, f.accountID)
+					f.svc.q = &recoverySlotAfterWriteStore{Queries: e.q, afterWrite: func() {
+						acct := e.mustAccount(t, f.userID, f.accountID)
+						if !acct.RecoveryCause.Valid || acct.RecoveryCause.String != "vault_locked" {
+							t.Fatal("missing fenced vault-lock recovery")
+						}
+						if err := v.Unlock(e.ctx, f.userID, "first-response-password"); err != nil {
+							t.Fatal(err)
+						}
+						if changed, err := f.svc.promoteCodexRecovery(e.ctx, e.q, f.userID, acct); err != nil || !changed {
+							t.Fatalf("promotion=(%v,%v)", changed, err)
+						}
+						acct = e.mustAccount(t, f.userID, f.accountID)
+						if acct.CoordState != "idle" || acct.Generation != 1 || acct.CredentialRevision != before.CredentialRevision || acct.RecoveryCause.Valid || len(acct.RecoverySealed) != 0 {
+							t.Fatal("promotion did not clear evidence with credential revision unchanged")
+						}
+						if tc.sql != "" {
+							target := map[string]uuid.UUID{"run": f.runID, "alias": f.aliasID, "account": f.accountID}[tc.target]
+							e.exec(tc.sql, target)
+						}
+					}}
+					res, err := f.svc.CoordinatedCodexRefresh(e.ctx, f.wkr, f.runID, cap, uuid.New(), 0)
+					if !errors.Is(err, tc.want) || errors.Is(err, ErrCodexVaultLocked) != (tc.want == ErrCodexVaultLocked) {
+						t.Fatalf("first response=(%+v,%v), want %v", res, err, tc.want)
+					}
+					if res != (CodexRefreshResult{Outcome: CodexRefreshQuarantined}) {
+						t.Fatalf("first response exposed credential coordinates: %+v", res)
+					}
+					if fake.calls != 1 || fake.discoverCalls != 1 {
+						t.Fatalf("provider calls=%d discover=%d", fake.calls, fake.discoverCalls)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestCodexRefreshRecoveryRegistrationDowngradeLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	cleanupCodexRecoveryUser(t, e.pool, e.userID)
