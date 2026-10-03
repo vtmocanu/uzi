@@ -16,6 +16,8 @@ import { Outbox } from "../src/outbox.js";
 import { nullLogger } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
+import { trustedCaptureCases, trustedEnvelopeCases, trustedExecutionCases } from "./fixtures/trusted-execution-refusals.js";
+
 installHarness();
 const GIB = 1024 ** 3;
 const ROOMY: StatfsSample = { bsize: 4096, blocks: 25 * GIB / 4096, bfree: 10 * GIB / 4096,
@@ -424,6 +426,49 @@ describe("terminal execution disk deferral", () => {
       assert.equal(parks().length, 0);
       assert.equal(api.states.some((s) => s.body.status === "failed"), false);
     });
+  }
+
+  // Audit data travels with the reusable cases in the milestone checkpoint.
+  for (const entry of [...trustedExecutionCases, ...trustedEnvelopeCases]) {
+    it(`trusted refusal: ${entry.reason} [${entry.representation}]`, async () => {
+      const f = fixture({ error: entry.error() });
+      await f.runner.execute(f.claim);
+      assert.equal(f.calls(), 1, "one executor call");
+      assert.equal(f.forge.calls.length, 0, "no finalize/MR");
+      assert.equal(f.reclaims(), 0, "trusted rejection must precede reclaim");
+      assert.equal(parks().length, 0, "trusted rejection must never park");
+      const failures = api.states.filter((s) => s.body.status === "failed");
+      assert.equal(failures.length, 1, "one terminal failure");
+      assert.equal(failures[0]!.body.failure_reason, entry.display, "preserve original display reason");
+      if (entry.display === "the planning turn ended without a plan or a structured question after a corrective nudge") {
+        assert.equal(failures[0]!.body.fail_origin, "plan_missing", "retain plan-missing disposition");
+      }
+      if (entry.display === "no Anthropic OAuth token was provided for this run") {
+        assert.equal(failures[0]!.body.fail_origin, "credential_unavailable", "retain credential disposition");
+      }
+      assert.equal(api.states.some((s) => s.body.status === "completed"), false);
+    });
+  }
+
+  for (const entry of trustedCaptureCases) {
+    for (const site of ["source", "fetch"] as const) {
+      it(`trusted capture ${site}: ${entry.reason} [${entry.representation}]`, async () => {
+        let captures = 0;
+        const reject = async () => { captures++; throw entry.error(); };
+        if (site === "source") git.commitWipMarker = reject;
+        else git.fetchAgentBranch = reject;
+        const f = fixture();
+        await f.runner.execute(f.claim);
+        assert.equal(f.calls(), 1, "one executor call");
+        assert.equal(f.forge.calls.length, 0, "no finalize/MR");
+        assert.equal(captures, 1, "propagate once, without capture retry");
+        assert.equal(f.reclaims(), 1, "only original opaque rejection reclaims");
+        assert.equal(parks().length, 0, "capture refusal cannot park");
+        const failures = api.states.filter((s) => s.body.status === "failed");
+        assert.equal(failures.length, 1, "one terminal failure");
+        assert.equal(failures[0]!.body.failure_reason, entry.display);
+      });
+    }
   }
 
   class UnknownError extends Error {}
