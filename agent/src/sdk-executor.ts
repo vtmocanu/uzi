@@ -1061,7 +1061,7 @@ export class SdkExecutor implements Executor {
   }
 
   /** issue #1830: false from the start of {@link run} until the background JS-deps install has been
-   *  joined (or torn down in run()'s finally); true before any run, when no install exists. */
+   *  joined (or torn down in run()'s finally or by {@link reapAttributedProcesses}); true before any run, when no install exists. */
   private depsJoined = true;
   /** The in-flight background deps install, so {@link reapAttributedProcesses} can tear it down. */
   private activeDeps: { abort: AbortController; install: Promise<unknown> } | undefined;

@@ -517,11 +517,21 @@ describe("SdkExecutor — PRD #1809 D4 process attribution (BLOCKING 1)", () => 
 
   it("reapAttributedProcesses aborts and awaits an unjoined deps install before the attribution reap", async () => {
     const order: string[] = [];
+    const npm = path.join(homeDir, ".npm", "_cacache");
+    fs.mkdirSync(path.join(npm, "index-v5"), { recursive: true });
     const installDeps: SdkExecutorOptions["installDeps"] = (_root, _env, opts) =>
       new Promise((resolve) => {
+        // Settles on a later tick after the abort, so only an awaited install orders before the reap.
+        // The bounded timer lets a regression fail on the order assertion instead of hanging.
+        const finish = (label: string): void => {
+          clearTimeout(bound);
+          order.push(label);
+          resolve({ results: [], truncated: false });
+        };
+        const bound = setTimeout(() => finish("install-timer"), 2000);
         opts?.signal?.addEventListener("abort", () => {
           order.push("install-aborted");
-          resolve({ results: [], truncated: false });
+          setTimeout(() => finish("install-settled"), 20);
         });
       });
     const exec = new SdkExecutor(nullLogger(), homeDir, {
@@ -538,14 +548,21 @@ describe("SdkExecutor — PRD #1809 D4 process attribution (BLOCKING 1)", () => 
         },
       },
     });
+    let npmKeptAfterReap: boolean | undefined;
     const { ctx } = makeCtx({
       gatePlan: async () => {
         await exec.reapAttributedProcesses();
+        // The reap marks the install joined, so the in-place drop now takes the npm cache too.
+        if (fs.existsSync(path.join("/pro" + "c", "self", "fd"))) {
+          await exec.reclaimCachesInPlace();
+          npmKeptAfterReap = fs.existsSync(npm);
+        }
         return { kind: "approve", selection: { status: "absent" } };
       },
     });
     await exec.run(ctx);
-    assert.deepStrictEqual(order.slice(0, 2), ["install-aborted", "reap"]);
+    assert.deepStrictEqual(order.slice(0, 3), ["install-aborted", "install-settled", "reap"]);
+    if (npmKeptAfterReap !== undefined) assert.strictEqual(npmKeptAfterReap, false, "reap marks the install joined: .npm/_cacache dropped");
   });
 });
 

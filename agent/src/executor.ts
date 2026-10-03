@@ -858,8 +858,9 @@ export interface Executor {
    * runner awaits it right after killAgentTree at the mid-run disk parks, before every park cache
    * drop (D2), and at the finalize security reap before the push. Returns the outcome
    * `{killed, left, complete}` and never rejects (a failure reads as `complete: false`); the reap is
-   * complete only when `complete && left.length === 0`. Callers (#1828) fail closed or retain custody
-   * on an incomplete reap and drop caches only after a complete one. Absent on the stub/test and
+   * complete only when `complete && left.length === 0`. A caller must treat an incomplete reap as
+   * a failure to fail closed or retain custody on, and must not drop caches unless the reap was
+   * complete. Absent on the stub/test and
    * Codex executors.
    */
   reapAttributedProcesses?(): Promise<RunProcessReap>;
