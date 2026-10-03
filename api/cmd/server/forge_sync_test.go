@@ -80,7 +80,7 @@ func (s *wiringStore) ListAllWorkers(context.Context) ([]store.ListAllWorkersRow
 func (s *wiringStore) ListLargestRunDiskForWorkers(context.Context, store.ListLargestRunDiskForWorkersParams) ([]store.WorkerRunDisk, error) {
 	return nil, nil
 }
-func (s *wiringStore) ListOwnersWaitingNoCapacity(context.Context, pgtype.Timestamptz) ([]store.ListOwnersWaitingNoCapacityRow, error) {
+func (s *wiringStore) ListOwnersWaitingNoCapacity(context.Context, store.ListOwnersWaitingNoCapacityParams) ([]store.ListOwnersWaitingNoCapacityRow, error) {
 	return nil, nil
 }
 func (s *wiringStore) OldestWaitingWorkerRun(context.Context) (pgtype.Timestamptz, error) {
