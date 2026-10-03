@@ -227,6 +227,14 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		}
 	}
 
+	// Settle plan cross-check children whose lead left its claim or generation.
+	// The query locks lead rows first and is idempotent across sweep ticks.
+	if q, ok := s.q.(*store.Queries); ok {
+		if _, err := q.SupersedeExitedPlanCrossChecks(ctx); err != nil {
+			return res, fmt.Errorf("supersede exited plan cross-checks: %w", err)
+		}
+	}
+
 	// Chat idle backstop (PRD #39 Decision 3): a chat run whose last message is
 	// older than ChatIdleTimeout is completed even though its worker is alive (so no
 	// stale-worker sweep above fired for it). Disabled when ChatIdleTimeout is 0.

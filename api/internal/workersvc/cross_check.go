@@ -150,16 +150,13 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 	return existing, nil
 }
 
-func (s *Service) PlanCrossCheckStatus(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64, round int32) (store.CrossCheck, error) {
-	if round != 1 {
-		return store.CrossCheck{}, ErrCrossCheckRefused
-	}
-	if s.txBeginner == nil {
-		return store.CrossCheck{}, ErrCrossCheckRefused
+func (s *Service) PlanCrossCheckStatus(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64, round int32) (store.CrossCheck, int32, error) {
+	if round != 1 || s.txBeginner == nil {
+		return store.CrossCheck{}, 0, ErrCrossCheckRefused
 	}
 	tx, err := s.txBeginner.Begin(ctx)
 	if err != nil {
-		return store.CrossCheck{}, err
+		return store.CrossCheck{}, 0, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := store.New(tx)
@@ -167,34 +164,34 @@ func (s *Service) PlanCrossCheckStatus(ctx context.Context, worker store.Worker,
 		ID: leadID, WorkerID: pgconv.UUID(worker.ID),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return store.CrossCheck{}, ErrCrossCheckRefused
+		return store.CrossCheck{}, 0, ErrCrossCheckRefused
 	}
 	if err != nil {
-		return store.CrossCheck{}, err
+		return store.CrossCheck{}, 0, err
 	}
 	if lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid ||
 		(lead.Status != "claimed" && lead.Status != "running") {
-		return store.CrossCheck{}, ErrCrossCheckRefused
+		return store.CrossCheck{}, 0, ErrCrossCheckRefused
 	}
 	_, err = q.ExpirePlanCrossCheck(ctx, store.ExpirePlanCrossCheckParams{
 		LeadRunID: leadID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation,
 	})
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return store.CrossCheck{}, err
+		return store.CrossCheck{}, 0, err
 	}
 	cc, err := q.GetOwnedPlanCrossCheck(ctx, store.GetOwnedPlanCrossCheckParams{
 		LeadRunID: leadID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation, Round: round,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return cc, ErrCrossCheckRefused
+		return cc, 0, ErrCrossCheckRefused
 	}
 	if err != nil {
-		return cc, err
+		return cc, 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return cc, err
+		return cc, 0, err
 	}
-	return cc, nil
+	return cc, lead.LastSeq, nil
 }
 
 func (s *Service) DecidePlanCrossCheck(ctx context.Context, worker store.Worker, childID uuid.UUID, generation int64, verdict, reason string, findings []byte) (store.CrossCheck, error) {
@@ -249,7 +246,7 @@ func (s *Service) DecidePlanCrossCheck(ctx context.Context, worker store.Worker,
 		if nextErr != nil {
 			return cc, nextErr
 		}
-		seq = next + int32(attempt)
+		seq = next
 		result, insertErr := q.InsertRunMessage(ctx, store.InsertRunMessageParams{
 			RunID: lead.ID, Seq: seq, Kind: "cross_check", Payload: payload,
 			ClaimGeneration: pgconv.Int8Ptr(&lead.ClaimGeneration),

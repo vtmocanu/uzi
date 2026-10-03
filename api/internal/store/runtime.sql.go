@@ -464,6 +464,7 @@ WHERE lead.id = cc.lead_run_id AND cc.id = $1
   AND cc.decided_at IS NOT NULL AND cc.lead_claim_generation = lead.claim_generation
 `
 
+// Called only after a successful pending-to-decided transition, in its transaction.
 func (q *Queries) BankPlanCrossCheckWait(ctx context.Context, checkID uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, bankPlanCrossCheckWait, checkID)
 	if err != nil {
@@ -13070,9 +13071,13 @@ WITH requested AS (
             - make_interval(secs => COALESCE(budget_wall_seconds, $2::int)
                                   + budget_paused_seconds
                                   + budget_extension_seconds
-                                  + budget_finalize_seconds))
+                                  + budget_finalize_seconds
+                                  + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                      (LEAST($1::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                      FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                        AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0)))
       AND kind NOT IN ('chat', 'judge', 'job', 'cross_check')
-      AND NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan' AND cc.verdict = 'pending' AND cc.deadline_at > now())
+      AND NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan' AND cc.verdict = 'pending' AND cc.deadline_at > $1::timestamptz)
       AND interactive = false
       -- idempotent across ticks: a row already carrying a 'wall' request is not re-requested.
       AND pause_mode IS DISTINCT FROM 'wall'
@@ -17077,6 +17082,62 @@ func (q *Queries) StopWallPark(ctx context.Context, arg StopWallParkParams) (uui
 	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err
+}
+
+const supersedeExitedPlanCrossChecks = `-- name: SupersedeExitedPlanCrossChecks :many
+WITH leads AS MATERIALIZED (
+    SELECT lead.id, lead.claim_generation FROM runs lead
+    WHERE EXISTS (SELECT 1 FROM cross_checks cc
+                  WHERE cc.lead_run_id = lead.id AND cc.stage = 'plan' AND cc.verdict = 'pending')
+      AND (lead.status NOT IN ('claimed', 'running') OR lead.claim_released_at IS NOT NULL
+           OR NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = lead.id
+                          AND cc.stage = 'plan' AND cc.verdict = 'pending'
+                          AND cc.lead_claim_generation = lead.claim_generation))
+    ORDER BY lead.id LIMIT 100 FOR UPDATE OF lead SKIP LOCKED
+), superseded AS (
+    UPDATE cross_checks cc SET verdict = 'failed', reason_class = 'superseded',
+        decided_at = LEAST(now(), cc.deadline_at)
+    FROM leads lead WHERE cc.lead_run_id = lead.id AND cc.stage = 'plan'
+      AND cc.verdict = 'pending'
+    RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at
+), cancelled AS (
+    UPDATE runs child SET status = 'cancelled', finished_at = now(), updated_at = now(),
+        claim_released_at = now()
+    FROM superseded cc WHERE child.id = cc.checker_run_id
+      AND child.status NOT IN ('completed', 'failed', 'cancelled')
+    RETURNING child.id
+), banked AS (
+    UPDATE runs lead SET budget_paused_seconds = lead.budget_paused_seconds +
+        GREATEST(0, CEIL(EXTRACT(EPOCH FROM (cc.decided_at - cc.created_at)))::int)
+    FROM superseded cc WHERE lead.id = cc.lead_run_id
+    RETURNING lead.id
+)
+SELECT cc.lead_run_id FROM superseded cc JOIN banked b ON b.id = cc.lead_run_id
+`
+
+// Run after a lead exit while its lead row remains locked, and from a periodic
+// sweep. Lock leads before cross_checks to match submit, status and verdict paths.
+// SKIP LOCKED lets another lifecycle transaction settle its own lead; a later
+// sweep retries it. One pending-to-failed transition owns the child cancellation
+// and budget credit, so repeated sweeps have no effect.
+func (q *Queries) SupersedeExitedPlanCrossChecks(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, supersedeExitedPlanCrossChecks)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var lead_run_id uuid.UUID
+		if err := rows.Scan(&lead_run_id); err != nil {
+			return nil, err
+		}
+		items = append(items, lead_run_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const supersedeRunByWorker = `-- name: SupersedeRunByWorker :execrows

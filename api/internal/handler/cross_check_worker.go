@@ -148,13 +148,14 @@ func (h *Handler) WorkerPlanCrossCheckStatus(w http.ResponseWriter, r *http.Requ
 		httpx.Error(w, http.StatusBadRequest, "invalid cross-check status request")
 		return
 	}
-	cc, err := h.wsvc.PlanCrossCheckStatus(r.Context(), worker, id, gen, int32(round))
+	cc, leadLastSeq, err := h.wsvc.PlanCrossCheckStatus(r.Context(), worker, id, gen, int32(round))
 	if err != nil {
 		crossCheckError(w, err)
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"round": cc.Round, "verdict": cc.Verdict,
-		"reason_class": cc.ReasonClass.String, "findings": json.RawMessage(cc.Findings), "deadline_at": cc.DeadlineAt.Time})
+		"reason_class": cc.ReasonClass.String, "findings": json.RawMessage(cc.Findings), "deadline_at": cc.DeadlineAt.Time,
+		"lead_last_seq": leadLastSeq})
 }
 
 func (h *Handler) WorkerCrossCheckVerdict(w http.ResponseWriter, r *http.Request) {

@@ -4379,9 +4379,13 @@ WITH requested AS (
             - make_interval(secs => COALESCE(budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
                                   + budget_paused_seconds
                                   + budget_extension_seconds
-                                  + budget_finalize_seconds))
+                                  + budget_finalize_seconds
+                                  + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                      (LEAST(sqlc.arg('now')::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                      FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                        AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0)))
       AND kind NOT IN ('chat', 'judge', 'job', 'cross_check')
-      AND NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan' AND cc.verdict = 'pending' AND cc.deadline_at > now())
+      AND NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan' AND cc.verdict = 'pending' AND cc.deadline_at > sqlc.arg('now')::timestamptz)
       AND interactive = false
       -- idempotent across ticks: a row already carrying a 'wall' request is not re-requested.
       AND pause_mode IS DISTINCT FROM 'wall'
@@ -8119,6 +8123,7 @@ WHERE child.id = cc.checker_run_id AND lead.id = cc.lead_run_id
 RETURNING cc.*;
 
 -- name: BankPlanCrossCheckWait :execrows
+-- Called only after a successful pending-to-decided transition, in its transaction.
 UPDATE runs lead SET budget_paused_seconds = lead.budget_paused_seconds +
     GREATEST(0, CEIL(EXTRACT(EPOCH FROM (cc.decided_at - cc.created_at)))::int)
 FROM cross_checks cc
@@ -8145,3 +8150,38 @@ WITH expired AS (
     FROM expired e WHERE lead.id = e.lead_run_id
 )
 SELECT * FROM expired;
+
+-- name: SupersedeExitedPlanCrossChecks :many
+-- Run after a lead exit while its lead row remains locked, and from a periodic
+-- sweep. Lock leads before cross_checks to match submit, status and verdict paths.
+-- SKIP LOCKED lets another lifecycle transaction settle its own lead; a later
+-- sweep retries it. One pending-to-failed transition owns the child cancellation
+-- and budget credit, so repeated sweeps have no effect.
+WITH leads AS MATERIALIZED (
+    SELECT lead.id, lead.claim_generation FROM runs lead
+    WHERE EXISTS (SELECT 1 FROM cross_checks cc
+                  WHERE cc.lead_run_id = lead.id AND cc.stage = 'plan' AND cc.verdict = 'pending')
+      AND (lead.status NOT IN ('claimed', 'running') OR lead.claim_released_at IS NOT NULL
+           OR NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = lead.id
+                          AND cc.stage = 'plan' AND cc.verdict = 'pending'
+                          AND cc.lead_claim_generation = lead.claim_generation))
+    ORDER BY lead.id LIMIT 100 FOR UPDATE OF lead SKIP LOCKED
+), superseded AS (
+    UPDATE cross_checks cc SET verdict = 'failed', reason_class = 'superseded',
+        decided_at = LEAST(now(), cc.deadline_at)
+    FROM leads lead WHERE cc.lead_run_id = lead.id AND cc.stage = 'plan'
+      AND cc.verdict = 'pending'
+    RETURNING cc.*
+), cancelled AS (
+    UPDATE runs child SET status = 'cancelled', finished_at = now(), updated_at = now(),
+        claim_released_at = now()
+    FROM superseded cc WHERE child.id = cc.checker_run_id
+      AND child.status NOT IN ('completed', 'failed', 'cancelled')
+    RETURNING child.id
+), banked AS (
+    UPDATE runs lead SET budget_paused_seconds = lead.budget_paused_seconds +
+        GREATEST(0, CEIL(EXTRACT(EPOCH FROM (cc.decided_at - cc.created_at)))::int)
+    FROM superseded cc WHERE lead.id = cc.lead_run_id
+    RETURNING lead.id
+)
+SELECT cc.lead_run_id FROM superseded cc JOIN banked b ON b.id = cc.lead_run_id;
