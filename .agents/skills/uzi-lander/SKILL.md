@@ -83,13 +83,21 @@ this lander's second pair of eyes.
   installed). If `peers.py buddy` is an unknown command, say the CLI lacks buddy
   support, which is not the same as no buddy bound, and ask the user as below.
 - **On entry run `peers.py buddy`.** None bound → ask the user once: name a buddy
-  or authorize solo. Without either, keep preparing (poll, review, fix, rebase) but
-  stop before the merge and report the missing requirement once.
+  or use a local buddy (a subagent, the fallback without Codex or session-peers).
+  Without an answer, keep preparing (poll, review, fix, rebase) but stop before the
+  merge and report the missing requirement once; Renovate-class PRs proceed with a
+  local buddy instead, named in the trail.
 - **Bound but unavailable** (not live, no route, or no verdict after two requests)
-  → ask for a replacement or solo authorization. Never downgrade silently.
-- **Solo waives only the buddy**, never independent review, CI or a user review. Where
-  the table below names the buddy, solo substitutes one local reviewer pinned to the
-  head; every other required review stays.
+  → ask for a replacement or a local buddy. Never downgrade silently.
+- **A local buddy waives only the peer buddy**, never independent review, CI or a user
+  review. Spawn one fresh subagent per request, brief it as below, pin it to the head;
+  it shares your model's blind spots, so name it in the trail.
+- **Decide together when unsure.** Consult the buddy on a call the rules do not settle:
+  a major, low or neutral Merge Confidence, red CI a fix on our side might clear, a rule
+  that does not clearly apply. Brief facts (diff, CI evidence, release notes, the
+  question) and ask for its call before stating yours. Agreement → act. Disagreement
+  after one exchange → hold, and report both views in the batch report; never stall
+  the batch on it. Clear cases (a green, high-confidence patch) skip the consult.
 - Prefer a cross-family buddy (Claude with Codex); name a same-family one in the trail.
 - **One request per pushed head.** The buddy reviews the exact head SHA; reuse its
   verdict until the head moves. Re-request on the same head only when the findings
@@ -102,7 +110,7 @@ this lander's second pair of eyes.
 - **Issues you file** (follow-ups, inherited or incidental findings): label `reviewed`
   per the root `CLAUDE.md` rule.
 - **Skill or script PRs you open**: the buddy reviews the final draft, then add the
-  `reviewed` label, so the user sees both agents agreed. Solo: a local reviewer.
+  `reviewed` label, so the user sees both agents agreed. Same with a local buddy.
 - The buddy's `APPROVE` is required where this skill says so below. It never
   replaces a user approval.
 
@@ -511,7 +519,7 @@ wrapper always completes with 0.
   end-of-session ask** ("these three improvements to `uzi-lander`, ok?"), not applied
   silently.
 - A skill-maintenance PR is titled with `[skip-cr]` (no bot review), reviewed by the buddy
-  (solo: a local reviewer) and by the user. Re-run `agnix` on `SKILL.md` after editing;
+  (or a local buddy) and by the user. Re-run `agnix` on `SKILL.md` after editing;
   `task check:skill-size` gates the size; the reply budget for a long buddy loop is in *Buddy*.
 
 ## Files

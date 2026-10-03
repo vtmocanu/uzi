@@ -94,7 +94,7 @@ done as a close-candidate list; close only those the user confirms
 ## 6. Batch report
 
 One table: every PR merged (PR | issue | what it delivered | review lane), every PR closed
-unmerged with the reason, and every issue closed from a report-only run. Then: milestones
+or held unmerged with the reason (a hold also names what unblocks it and the buddy's view), and every issue closed from a report-only run. Then: milestones
 reframed or deferred (never silently skipped), behaviour changes, merge mechanics handled
 (renumbers, conflict resolutions, lockfile regen, `--admin`), and follow-ups: review gaps,
 SDK adoption findings and deferred majors (references/renovate.md). Offer to file issues.
