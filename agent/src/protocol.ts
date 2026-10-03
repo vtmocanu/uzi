@@ -1184,6 +1184,10 @@ export interface ClaimResponse {
    *  fact. Re-delivered on every resume/requeue of the same run (the server reads
    *  it from the row), so an unattended resume never hangs at the gate. */
   auto_approve?: boolean;
+  /** PRD #2149 M1: this autopilot plan requires an opposite-family cross-check before
+   *  implementation. The M1 worker parks it for human review while the checker is unavailable.
+   *  Omitted by older servers and on runs without the requirement. */
+  plan_cross_check_required?: boolean;
   /** PRD #400 M2: gates whether a TASK run opens a merge request. Meaningful only for
    *  kind="task": a task ALWAYS pushes its branch back (the deliverable is commits the
    *  user pulls), but opens an MR only when this is true (`uzi handoff --mr`). Every

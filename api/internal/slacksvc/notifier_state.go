@@ -443,7 +443,18 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 				n.logf("post plan in thread", err)
 			}
 		}
-		ts, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, "Plan ready for review in uzi", gateBlocks(rc.ID, base, rc.RepoAgentNames))
+		// A required run was parked by the worker's forced human gate. Read its
+		// frozen requirement and harness so the card names the same M1 reason.
+		crossCheckReason := ""
+		if run, rerr := n.store.GetRunByID(ctx, rc.ID); rerr != nil {
+			n.logf("load gate cross-check reason", rerr)
+		} else if run.PlanCrossCheckRequired {
+			crossCheckReason = "checker unavailable"
+			if run.Harness == "codex" {
+				crossCheckReason = "not yet supported for a Codex lead"
+			}
+		}
+		ts, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, "Plan ready for review in uzi", gateBlocks(rc.ID, base, rc.RepoAgentNames, crossCheckReason))
 		if err != nil {
 			n.logf("post gate", err)
 			return

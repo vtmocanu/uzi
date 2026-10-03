@@ -12,7 +12,8 @@ type UserDTO struct {
 	IsActive    bool    `json:"is_active"`
 	// AutopilotEnabled is the user's per-user opt-in to unattended autopilot runs
 	// (PRD #19 M3, Decision 4). Default false; toggled from the user's Settings page.
-	AutopilotEnabled bool `json:"autopilot_enabled"`
+	AutopilotEnabled      bool `json:"autopilot_enabled"`
+	PlanCrossCheckEnabled bool `json:"plan_cross_check_enabled"`
 	// WaitOnLimit is the user's DEFAULT for the usage-limit park (PRD #35
 	// Decision 7): whether a NEW run parks until their Anthropic window reopens
 	// rather than failing. Default false.

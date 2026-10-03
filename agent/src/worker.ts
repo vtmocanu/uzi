@@ -521,6 +521,10 @@ export class Worker {
           // clause then lets only a worker advertising 'job_files_v1' claim it, so an api rolled
           // ahead of the fleet never hands a new-protocol job to an image without this.
           "job_files_v1",
+          // PRD #2149 M1: claims requiring a plan cross-check park at the human gate
+          // until the checker arrives in M2. The server only offers them to workers
+          // that advertise this fail-closed gate.
+          "cross_check_v1",
         ];
         // PRD #1906 M4: advertise isolated_fetch_v1 ONLY when this worker is configured for the
         // isolated lane (UZI_FETCHER_URL and UZI_FETCHER_CA_FILE both set, which the chart does

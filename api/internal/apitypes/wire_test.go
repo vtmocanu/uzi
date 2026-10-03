@@ -46,7 +46,7 @@ func assertTags(t *testing.T, name string, v any, want ...string) {
 func TestUserDTOTags(t *testing.T) {
 	assertTags(t, "UserDTO", UserDTO{},
 		"id", "email", "display_name", "is_admin", "is_active",
-		"autopilot_enabled", "judge_enabled", "ci_autofix_enabled",
+		"autopilot_enabled", "plan_cross_check_enabled", "judge_enabled", "ci_autofix_enabled",
 		// issue #916: the per-user AI-attribution opt-out. Default true (current
 		// behavior); when false the worker suppresses the Co-Authored-By trailer.
 		"attribution_enabled",

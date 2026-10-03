@@ -198,7 +198,7 @@ Tracked as GitLab issue vtmocanu/uzi#19; PRD at `prds/done/19-admin-settings-and
 
 - Generic admin-only instance-settings infrastructure; the PRD label and the autopilot label are its first two configurable keys.
 - Admins can change the PRD label and the autopilot label; the board reflects the new label set after a resync (no code fork).
-- Autopilot: adding the autopilot label (alongside the PRD label) to an issue in GitLab runs it end to end with zero uzi interaction.
+- Autopilot: adding the autopilot label (alongside the PRD label) to an issue in GitLab normally runs it end to end without uzi interaction. An owner opted in to Plan cross-check may need to decide at the human plan gate: the M1 checker-unavailable park always requires that decision; later, a check that does not approve the plan does too. (AI-synced 2026-10-03)
 - (AI-synced 2026-08-29) PRD #764 removed the `prd_label` setting (and its special-casing) and added a configurable `uzi_label` (default `uzi`) as the single run-eligibility key; autopilot now rides alongside `uzi`, not `PRD`. The generic admin-settings infrastructure and the configurable `autopilot_label` are unchanged.
 - Progress is visible via the existing board label moves; the user need never open uzi.
 - Outcome returns as one GitLab issue comment: MR link on success; on failure, one comment with a run link.

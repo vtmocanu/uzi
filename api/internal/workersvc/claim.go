@@ -67,6 +67,8 @@ type ClaimPayload struct {
 	// reads it from the row, a requeued/resumed autopilot run re-delivers it
 	// unchanged; without that an unattended resume would hang at the gate forever.
 	AutoApprove bool `json:"auto_approve"`
+	// PlanCrossCheckRequired is frozen on the run at creation and re-delivered on every claim.
+	PlanCrossCheckRequired bool `json:"plan_cross_check_required,omitempty"`
 	// OpenMr gates whether the worker opens a merge request for a task run (PRD #400
 	// M2). Meaningful only for kind='task': a task ALWAYS pushes its branch back (the
 	// deliverable is commits the user pulls), but opens an MR only when this is true

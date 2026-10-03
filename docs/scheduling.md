@@ -64,6 +64,12 @@ Each schedule also has its own **auto-approve** toggle, **on by default** —
 the point of a 02:00 fire is that it actually proceeds instead of sitting at
 the plan-approval gate waiting for someone awake. Turn it off for a given
 schedule to make its runs stop and wait for a human, same as a manual start.
+For an owner who opted in to [Plan cross-check](./cross-check.md), an
+auto-approved schedule run must pass that gate before implementing. In this
+release the checker is unavailable, so these runs park for a human plan
+decision even though the schedule has auto-approve on. Turning auto-approve
+off keeps the ordinary human plan gate.
+
 Either way, the plan is still recorded on the run to read afterwards, and a
 human still merges the resulting MR: `main` is never written under any
 target, timing, or approval setting.

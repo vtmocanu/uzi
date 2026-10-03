@@ -125,7 +125,7 @@ const maxSlackSectionRunes = 2900
 // Descriptions are NEVER rendered (repo-authored free text); names are
 // IsValidName-validated kebab-case and additionally mrkdwn-escaped as defense in
 // depth.
-func gateBlocks(runID uuid.UUID, base string, repoAgentNames []string) []slack.Block {
+func gateBlocks(runID uuid.UUID, base string, repoAgentNames []string, crossCheckReason ...string) []slack.Block {
 	var section *slack.SectionBlock
 	var approveElems []slack.BlockElement
 
@@ -165,6 +165,10 @@ func gateBlocks(runID uuid.UUID, base string, repoAgentNames []string) []slack.B
 			slack.NewTextBlockObject(slack.PlainTextType, "Cancel", false, false),
 		)
 		approveElems = []slack.BlockElement{approve}
+	}
+
+	if len(crossCheckReason) > 0 && crossCheckReason[0] != "" {
+		section.Text.Text += "\nPlan cross-check: " + EscapeMrkdwn(crossCheckReason[0])
 	}
 
 	// Request changes (PRD #41): the default-styled sibling of Reject — parks the run

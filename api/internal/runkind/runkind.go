@@ -43,6 +43,12 @@ func All() []string {
 	return []string{Issue, CIFix, Chat, Judge, SelfImprove, Prompt, Task, MRRework, Job}
 }
 
+// PlanCrossCheckable reports whether the executor reaches the plan gate on an
+// auto-approved run. Task has no plan gate despite being planning-capable.
+func PlanCrossCheckable(kind string) bool {
+	return kind == Issue || kind == Prompt || kind == SelfImprove || kind == CIFix || kind == MRRework
+}
+
 // JudgeEligible reports whether a run of this kind may be reviewed by the judge
 // (PRD #46 allowlist: issue, ci_fix). Consolidates the former per-package
 // judge-eligibility allowlist that workersvc held.

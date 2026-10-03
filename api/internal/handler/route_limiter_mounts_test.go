@@ -916,6 +916,8 @@ var wantRouteMounts = []routeMount{
 	{"PUT", "/api/agent-templates/{id}/skills", noLimiter},
 	{"PUT", "/api/forge/connections/{id}", limForge},
 	{"PUT", "/api/me/autopilot", noLimiter},
+	// Consent update reads credentials and worker availability without spending tokens.
+	{"PUT", "/api/me/cross-check", noLimiter},
 	// PRD #71: a single boolean UPDATE on the caller's own users row, spends no
 	// Anthropic token at toggle time — noLimiter, matching /me/autopilot beside it.
 	{"PUT", "/api/me/ci-autofix", noLimiter},

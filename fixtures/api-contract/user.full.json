@@ -5,6 +5,7 @@
   "is_admin": true,
   "is_active": true,
   "autopilot_enabled": true,
+  "plan_cross_check_enabled": true,
   "wait_on_limit": true,
   "notify_early_limit_reset": true,
   "judge_enabled": true,

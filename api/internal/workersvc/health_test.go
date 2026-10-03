@@ -23,8 +23,10 @@ var t0 = time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
 // path reaches panics, keeping the tests honest about what the detector touches.
 type healthFakeStore struct {
 	Store
-	active []store.ListActiveRunsForHealthRow
-	window map[uuid.UUID][]store.ListRunToolWindowRow
+	active            []store.ListActiveRunsForHealthRow
+	crossCheckRun     store.Run
+	crossCheckWorkers []store.ListWorkersByUserRow
+	window            map[uuid.UUID][]store.ListRunToolWindowRow
 	// messages is an optional per-run run_messages log (seq ascending or not; the
 	// fake orders it). When a run has one, BOTH tool-window reads derive from it with
 	// the real queries' filter + ORDER BY seq DESC + LIMIT semantics, so a test can
@@ -118,6 +120,13 @@ type healthFakeStore struct {
 	// custodyLimitCalls records every lookup's custody_hold_limit (issue #1751: the per-run
 	// exemption bound is the same limit ClaimRun is passed).
 	custodyLimitCalls []int32
+}
+
+func (f *healthFakeStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
+	return f.crossCheckRun, nil
+}
+func (f *healthFakeStore) ListWorkersByUser(context.Context, uuid.UUID) ([]store.ListWorkersByUserRow, error) {
+	return f.crossCheckWorkers, nil
 }
 
 func (f *healthFakeStore) ListActiveRunsForHealth(context.Context, []string) ([]store.ListActiveRunsForHealthRow, error) {

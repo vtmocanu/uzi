@@ -181,7 +181,8 @@ const (
 	// job in a fleet of old-image or docker-only workers is unclaimable until a job-capable worker
 	// comes online. PRD #1909 M1: a job stamped with runs.job_protocol additionally needs
 	// 'job_files_v1', so the text names both. Maps to the SAME healthWaitingWorker enum (runs.health_reason is free text).
-	reasonNoJobCapableWorker = "no online worker supports jobs (job_runner_v1, job_files_v1); update or provision a non-Docker worker"
+	reasonNoJobCapableWorker        = "no online worker supports jobs (job_runner_v1, job_files_v1); update or provision a non-Docker worker"
+	reasonNoCrossCheckCapableWorker = "no online worker supports plan cross-check (cross_check_v1); update or provision a capable worker"
 	// reasonWaitingIsolatedLane (PRD #1906 M5) is the queued reason for a PROFILE-BOUND run: only
 	// a worker the api provisions into the isolated lane can claim it (ClaimRun's two-way lane
 	// clause), so no ordinary worker reason applies. Maps to the SAME healthWaitingWorker enum.
@@ -1040,6 +1041,29 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			slog.Error("health: count workers satisfying Codex completion protocol", "run_id", r.ID, "error", cerr)
 		} else if c == 0 {
 			return reasonNoCodexCompletionCapableWorker
+		}
+	}
+	// The snapshot is absent from ListActiveRunsForHealth's projection. Read it only
+	// after the queued threshold, then inspect the owner's fleet for the protocol
+	// capability ClaimRun requires. A failed read falls through.
+	if run, rerr := s.q.GetRunByID(ctx, r.ID); rerr != nil {
+		slog.Error("health: read cross-check requirement", "run_id", r.ID, "error", rerr)
+	} else if run.PlanCrossCheckRequired || run.Kind == "cross_check" {
+		workers, werr := s.q.ListWorkersByUser(ctx, r.UserID)
+		if werr != nil {
+			slog.Error("health: read cross-check capable workers", "run_id", r.ID, "error", werr)
+		} else {
+			capable := false
+			for _, worker := range workers {
+				if worker.Status == "online" && !worker.DrainingSince.Valid && !worker.Ephemeral && !worker.IsolatedLane &&
+					slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckV1) {
+					capable = true
+					break
+				}
+			}
+			if !capable {
+				return reasonNoCrossCheckCapableWorker
+			}
 		}
 	}
 	// A queued run the kind-derived priority DEMOTED (PRD #320 D9) is not stuck — it is

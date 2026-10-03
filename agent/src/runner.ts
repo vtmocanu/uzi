@@ -8901,7 +8901,14 @@ export class RunRunner {
         // force the gate by passing autoApprove=false for that case; gatePlan is otherwise
         // unchanged. Non-ci_fix and code-plan ci_fix runs keep today's behavior exactly.
         const forceGate = claim.kind === "ci_fix" && isCIConfigPlan(planMd);
-        const effectiveAutoApprove = (claim.auto_approve ?? false) && !forceGate;
+        // PRD #2149 M1: no checker runs yet. A required autopilot plan must use
+        // the existing human gate; the Codex lead gets its own actionable reason.
+        const crossCheckReason = claim.auto_approve && claim.plan_cross_check_required
+          ? claim.secrets.codex
+            ? "plan cross-check: not yet supported for a Codex lead"
+            : "plan cross-check: checker unavailable"
+          : undefined;
+        const effectiveAutoApprove = (claim.auto_approve ?? false) && !forceGate && !crossCheckReason;
         // Issue #1604 (D3): a resumed claim with an unapproved persisted plan reports no
         // awaiting_approval before the inputs sent before the release are read (the replayed
         // backlog drained), whatever the executor. A gate shown first would bump the epoch, and a
@@ -8918,6 +8925,7 @@ export class RunRunner {
           reportState,
           runLog,
           effectiveAutoApprove,
+          crossCheckReason,
           repoAgents,
           repoAgentFolder,
           toolchainDetection,
@@ -13572,6 +13580,7 @@ export class RunRunner {
     reportState: (body: StateRequest) => Promise<StateAck>,
     runLog: Logger,
     autoApprove: boolean,
+    crossCheckReason: string | undefined,
     repoAgents: AgentTemplate[],
     // Issue #2085: the folder the roster came from (null when neither exists).
     repoAgentFolder: RepoAgentFolder | null,
@@ -13701,6 +13710,11 @@ export class RunRunner {
       // UNCHANGED — this arms guidance beside the approve, it does not alter it.
       if (proposesRewrite) steering.pushSafetySteer(composePlanGateNudge(publishedTip!));
       return { kind: "approve", selection: { status: "ok", selection } };
+    }
+
+    if (crossCheckReason) {
+      batcher.emit({ kind: "status", agent: "worker", payload: { text: crossCheckReason } });
+      await batcher.flush().catch(() => undefined);
     }
 
     // PRD #41 round-awareness (Decision 3): the gate epoch is advanced at the

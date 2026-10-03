@@ -14,6 +14,8 @@ export interface User {
   // autopilot_enabled is the per-user opt-in to unattended autopilot runs (PRD #19
   // M3). Default false; toggled from the user's own Settings page.
   autopilot_enabled: boolean;
+  // Per-user consent for the required plan cross-check on new auto-approved runs.
+  plan_cross_check_enabled?: boolean;
   // judge_enabled is the per-user opt-in to run retrospectives (PRD #46). Default
   // false; the user toggles their own from Settings, an admin can force any user's.
   judge_enabled: boolean;

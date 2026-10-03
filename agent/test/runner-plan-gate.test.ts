@@ -694,6 +694,42 @@ describe("RunRunner — plan gate + steering end to end", () => {
   });
 });
 
+describe("RunRunner — M1 plan cross-check gate", () => {
+  for (const codexLead of [false, true]) {
+    it(`parks a required ${codexLead ? "Codex" : "Claude"} autopilot plan and stops after human refusal`, async () => {
+      const { gitlab, calls } = fakeGitlab();
+      const claim = gitlabClaim(codexLead ? 21492 : 21491, {
+        auto_approve: true,
+        plan_cross_check_required: true,
+        ...(codexLead ? { secrets: {
+          forge_pat: "fixture-forge-pat-000000",
+          codex: {
+            auth_mode: "subscription" as const,
+            access_token: "fixture-codex-access-token-abc123",
+            capability: "fixture-codex-capability-abc123",
+            generation: 1,
+            chatgpt_account_id: "verified-account",
+            chatgpt_plan_type: null,
+          },
+        } } : {}),
+      });
+      api.setInputs(claim.run_id, [input("reject_plan")]);
+      await runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab).execute(claim);
+      const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+      assert.ok(states.some((s) => s.status === "awaiting_approval" && s.plan_md));
+      assert.ok(!states.some((s) => s.status === "running" && s.plan_md), "no autopilot approval report");
+      assert.ok(states.some((s) => s.status === "failed"), "human refusal terminates the run");
+      assert.ok(!states.some((s) => s.iteration_count === 1), "refusal never starts implementation");
+      assert.ok(!states.some((s) => s.status === "completed"), "refusal never completes");
+      assert.equal(calls.length, 0, "refusal never publishes an MR");
+      const reason = codexLead
+        ? "plan cross-check: not yet supported for a Codex lead"
+        : "plan cross-check: checker unavailable";
+      assert.ok(api.messages(claim.run_id).some((m) => m.kind === "status" && m.payload.text === reason));
+    });
+  }
+});
+
 // PRD #71 M5: the CI-config gate override at the gatePlan call site. An auto_approve
 // ci_fix run whose plan is CI-config-classified (CI_CONFIG_MARKER first line) must NOT
 // take the auto-approve short-circuit — it parks for human review; a code-plan ci_fix

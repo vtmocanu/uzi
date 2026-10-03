@@ -656,6 +656,7 @@ func toDTO(u store.User) apitypes.UserDTO {
 		IsAdmin:                 u.IsAdmin,
 		IsActive:                u.IsActive,
 		AutopilotEnabled:        u.AutopilotEnabled,
+		PlanCrossCheckEnabled:   u.PlanCrossCheckEnabled,
 		WaitOnLimit:             u.WaitOnLimit,
 		NotifyEarlyLimitReset:   u.NotifyEarlyLimitReset,
 		JudgeEnabled:            u.JudgeEnabled,

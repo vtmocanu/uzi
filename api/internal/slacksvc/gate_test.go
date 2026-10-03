@@ -14,6 +14,22 @@ func gateSummary(blocks []slack.Block) ([]string, string) {
 	return blockSummary(blocks)
 }
 
+func TestGateBlocksCrossCheckReason(t *testing.T) {
+	for _, reason := range []string{"checker unavailable", "not yet supported for a Codex lead"} {
+		_, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, reason))
+		if !strings.Contains(section, "Plan cross-check: "+reason) {
+			t.Fatalf("gate card omitted reason %q: %q", reason, section)
+		}
+		if strings.Contains(section, "findings") {
+			t.Fatalf("gate card included findings: %q", section)
+		}
+	}
+	_, ordinary := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil))
+	if strings.Contains(ordinary, "Plan cross-check:") {
+		t.Fatalf("ordinary gate gained cross-check reason: %q", ordinary)
+	}
+}
+
 // No detected roster (nil or []) renders the single legacy Approve button (source
 // own), byte-identical to the pre-M7 shape.
 func TestGateBlocksNoRosterSingleApprove(t *testing.T) {

@@ -477,8 +477,9 @@ WHERE status = 'online'
 -- query's own "name every column" convention so an unstamped path is visible in a diff
 -- of THIS file, and guarded by a per-path test rather than the compiler (the narg trap
 -- above applies identically).
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source, completion_contract_version, harness, credential_override_mode, credential_override_secret_id)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'), @harness, sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id'))
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source, completion_contract_version, harness, credential_override_mode, credential_override_secret_id, plan_cross_check_required)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'), @harness, sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id'),
+    (@auto_approve AND @plan_source <> 'seeded' AND (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id)))
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -919,6 +920,8 @@ WITH target AS (
       AND (r.completion_contract_version IS NULL
            OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
            OR 'codex_completion_interlock_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
+           OR 'cross_check_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #1551 M4 (D6): the NON-BYPASSABLE custom-Codex-model claim clause, a SIBLING of the
       -- codex-harness clause directly above. A Codex run whose EFFECTIVE worker-root model is a
       -- CUSTOM (non-curated) id may be claimed ONLY by a worker whose protocol_capabilities contain
@@ -1137,6 +1140,8 @@ WITH target AS (
                 AND (r.completion_contract_version IS NULL
                      OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                      OR 'codex_completion_interlock_v1' = ANY(p.protocol_capabilities))
+      AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
+           OR 'cross_check_v1' = ANY(p.protocol_capabilities))
                 -- PRD #1551 M4 (D6): MIRROR the non-bypassable custom-Codex-model clause for the peer, or
                 -- fleet-spread could DEFER a CUSTOM-root Codex run to an INCAPABLE peer that could never
                 -- claim it (its OWN custom-model clause above blocks it) — making the run permanently
@@ -1706,17 +1711,19 @@ UPDATE runs SET
     -- LOAD-BEARING — a nil text[] param encodes SQL NULL and `arr || NULL = NULL` would
     -- WIPE the NOT-NULL column — so an absent param unions with '{}' (no change) and a
     -- present set adds its members, deduped; `<@` is order-independent so it stays unsorted.
-    required_capabilities = ARRAY(SELECT DISTINCT unnest(
-        required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))),
+    required_capabilities = CASE WHEN plan_cross_check_required AND auto_approve THEN required_capabilities
+        ELSE ARRAY(SELECT DISTINCT unnest(required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))) END,
     -- required_tools is SET, absent-safe: a present set REPLACES (the run's single
     -- authoritative inferred toolchain list), an absent (NULL) param COALESCEs back to the
     -- existing column. The service only passes a non-empty filtered set, so a garbled/empty
     -- report leaves the param nil rather than wiping the column.
-    required_tools = COALESCE(sqlc.narg('inferred_tools')::text[], required_tools),
+    required_tools = CASE WHEN plan_cross_check_required AND auto_approve THEN required_tools
+        ELSE COALESCE(sqlc.narg('inferred_tools')::text[], required_tools) END,
     -- size_class is SET, absent-safe like required_tools: a present (clamped s/m/l) value
     -- REPLACES, an absent (NULL) param COALESCEs back. The service clamps to {s,m,l} before
     -- passing, so a garbled report becomes a nil param (no change) rather than a bad value.
-    size_class = COALESCE(sqlc.narg('size_class'), size_class),
+    size_class = CASE WHEN plan_cross_check_required AND auto_approve THEN size_class
+        ELSE COALESCE(sqlc.narg('size_class'), size_class) END,
     -- PRD #122 M1: the FROZEN milestone list an AUTOPILOT run resolved for itself,
     -- with a SAFETY-NET fallback to milestones_candidate (issue #259). Written
     -- IMMUTABLY — COALESCE keeps the EXISTING value, so a later `running` report can
@@ -1740,7 +1747,8 @@ UPDATE runs SET
     --      round-1 resume already froze round-1's candidate, so the already-frozen list
     --      wins and the stale round-2 candidate cannot overwrite it. The common heartbeat
     --      is likewise a no-op via clause 1.
-    milestones_frozen = COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate),
+    milestones_frozen = CASE WHEN plan_cross_check_required AND auto_approve THEN milestones_frozen
+        ELSE COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate) END,
     -- PRD #1226 M1 (D1): freeze the STRUCTURAL COMPLETION CONTRACT at the SAME point the
     -- AUTOPILOT path freezes milestones_frozen (the FIRST report that resolves a milestone
     -- list), IDEMPOTENTLY and by the SAME rules as the human approve path
@@ -1871,6 +1879,10 @@ WHERE runs.id = @id AND worker_id = @worker_id
   -- negative predicate above admits it; a resume lands it at 'queued' server-side before any
   -- worker reports, so this never blocks a legitimate resume.
   AND status <> 'paused'
+  AND (NOT (plan_cross_check_required AND auto_approve) OR plan_md IS NOT NULL
+       OR (sqlc.narg('milestones_completed')::jsonb IS NULL
+           AND sqlc.narg('milestones_in_progress')::jsonb IS NULL
+           AND sqlc.narg('milestones_frozen')::jsonb IS NULL))
   AND (status <> 'awaiting_approval' OR EXISTS (
         SELECT 1 FROM run_user_inputs
         WHERE run_user_inputs.run_id = @id
@@ -2231,13 +2243,36 @@ WHERE id = @id AND user_id = @user_id AND status = 'awaiting_approval'
 --     refused).
 UPDATE runs SET
     plan_md     = @plan_md,
+    required_capabilities = CASE WHEN plan_cross_check_required THEN
+        ARRAY(SELECT DISTINCT unnest(required_capabilities || sqlc.narg('inferred_capabilities')::text[]))
+        ELSE required_capabilities END,
+    required_tools = CASE WHEN plan_cross_check_required THEN sqlc.narg('inferred_tools')::text[] ELSE required_tools END,
+    size_class = CASE WHEN plan_cross_check_required THEN sqlc.narg('size_class')::text ELSE size_class END,
+    milestones_frozen = CASE WHEN plan_cross_check_required THEN sqlc.narg('milestones_frozen')::jsonb ELSE milestones_frozen END,
     plan_source = 'agent',
     updated_at  = now()
-WHERE id = @id AND worker_id = @worker_id
-  AND status IN ('claimed', 'running')
-  AND auto_approve = true
-  AND plan_source = 'agent'
-  AND (plan_md IS NULL OR plan_md = @plan_md);
+WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND runs.status IN ('claimed', 'running')
+  AND runs.auto_approve = true
+  AND runs.plan_source = 'agent'
+  AND (runs.plan_md IS NULL OR runs.plan_md = @plan_md)
+  AND (NOT runs.plan_cross_check_required OR EXISTS (
+      SELECT 1 FROM cross_checks cc
+      JOIN runs checker ON checker.id = cc.checker_run_id
+      WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan'
+        AND cc.round = (SELECT max(latest.round) FROM cross_checks latest
+                        WHERE latest.lead_run_id = runs.id AND latest.stage = 'plan')
+        AND cc.verdict = 'approve' AND cc.checker_harness <> runs.harness
+        AND checker.kind = 'cross_check' AND checker.harness = cc.checker_harness
+        AND cc.lead_claim_generation = runs.claim_generation
+        AND cc.candidate_digest = sqlc.arg('candidate_digest')::bytea
+        AND cc.plan_md = @plan_md
+        AND cc.milestones = sqlc.narg('milestones_frozen')::jsonb
+        AND cc.required_capabilities <@ sqlc.narg('inferred_capabilities')::text[]
+        AND sqlc.narg('inferred_capabilities')::text[] <@ cc.required_capabilities
+        AND cc.required_tools <@ sqlc.narg('inferred_tools')::text[]
+        AND sqlc.narg('inferred_tools')::text[] <@ cc.required_tools
+        AND cc.size_class = sqlc.narg('size_class')::text));
 
 -- name: SetRunIntentSummary :execrows
 -- PRD #362 M1: persist a run's plain-English INTENT summary ("what this run will
@@ -3225,7 +3260,8 @@ WHERE id = @id AND worker_id = @worker_id
 -- worker cannot wipe the current owner's live progress.
 UPDATE runs SET milestones_completed = '[]'::jsonb, updated_at = now()
 WHERE id = @id AND worker_id = @worker_id
-  AND status IN ('claimed', 'running');
+  AND status IN ('claimed', 'running')
+  AND (NOT (plan_cross_check_required AND auto_approve) OR plan_md IS NOT NULL);
 
 -- name: SetRunAwaitingFollowup :execrows
 -- PRD #517 M2/M3: the interactive-task park. On signal_done an interactive task run
@@ -3422,6 +3458,7 @@ WHERE id = @id AND worker_id = @worker_id
   -- fail_origin 'run_timeout' to completed: the runner's result POST is refused as terminal, so
   -- that flip would yield a completed job with no result.
   AND (kind <> 'job' OR status IN ('claimed', 'running'))
+  AND (NOT (plan_cross_check_required AND auto_approve) OR plan_md IS NOT NULL)
   -- issue #329: a genuine worker completion (it opened the MR) supersedes a
   -- wall-clock RUN_TIMEOUT failure. Scoped to fail_origin='run_timeout' ONLY: a
   -- human 'cancelled' still wins, and a worker's own 'failed'/'worker_lost' is never
@@ -6843,6 +6880,8 @@ WHERE run.id = @run_id
   AND (run.completion_contract_version IS NULL
        OR NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
        OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
+      AND (NOT (run.plan_cross_check_required OR run.kind = 'cross_check')
+           OR 'cross_check_v1' = ANY(w.protocol_capabilities))
   -- PRD #1551 M4 (D6): MIRROR ClaimRun's non-bypassable custom-Codex-model clause, so this
   -- claimable count and the claim gate never disagree. The effective-root expression is written
   -- IDENTICALLY to ClaimRun (run.model/curated-else-lane, NULL-safe via COALESCE), reading the
@@ -7207,6 +7246,8 @@ WHERE r.status = 'queued'
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
+      AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
+           OR 'cross_check_v1' = ANY(w.protocol_capabilities))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -7357,6 +7398,8 @@ WHERE r.status = 'queued'
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
+      AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
+           OR 'cross_check_v1' = ANY(w.protocol_capabilities))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -7402,6 +7445,8 @@ WHERE r.status = 'queued'
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
+      AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
+           OR 'cross_check_v1' = ANY(w.protocol_capabilities))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -7696,6 +7741,7 @@ WITH ins AS (
       -- PRD #1497 M1 (D16): claim_released_at IS NULL is a STANDALONE conjunct, so a released claim
       -- is rejected even for a generation-less (legacy) report; a live claim still honours a NULL gen.
       AND r.claim_released_at IS NULL
+      AND (NOT (r.plan_cross_check_required AND r.auto_approve) OR r.plan_md IS NOT NULL)
       AND (sqlc.narg('claim_generation')::bigint IS NULL
            OR r.claim_generation = sqlc.narg('claim_generation')::bigint)
     RETURNING run_completion_attempts.id
