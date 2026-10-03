@@ -6,6 +6,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/freshness.sh
 . "$HERE/freshness.sh"
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+WORK=$(cd -P "$WORK" && pwd)
+# A TMPDIR inside a checkout (a worker's .uzi/scratch) must not let the "non-git dir"
+# case discover that parent repository: stop Git discovery above $WORK.
+export GIT_CEILING_DIRECTORIES="${WORK%/*}"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 g() { git -C "$WORK/repo" -c user.name=t -c user.email=t@example.com "$@"; }
 

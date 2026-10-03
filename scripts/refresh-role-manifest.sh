@@ -171,7 +171,10 @@ else
             [ -e "$backup" ] || continue
             grep -qxF "$(basename "$backup")" <<<"$before" && continue
             target="${backup%%.pre-sync*}"
-            lines="$(diff <(body_of "$backup") <(body_of "$target") | grep -E '^< ' || true)"
+            # Unified output: BusyBox diff (Alpine workers) has no normal format, so a
+            # '^< ' filter silently reported nothing there. NR > 2 skips the ---/+++
+            # header, so a dropped line that itself starts with '--' is still listed.
+            lines="$(diff -U0 <(body_of "$backup") <(body_of "$target") | awk 'NR > 2 && /^-/ { print "< " substr($0, 2) }' || true)"
             [ -n "$lines" ] && dropped="$(printf '%s\n%s:\n%s' "$dropped" "$(basename "$target")" "$lines")"
             rm -f "$backup"
           done
