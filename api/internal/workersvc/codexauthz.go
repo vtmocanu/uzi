@@ -559,6 +559,12 @@ type CodexAuthContext struct {
 // are preserved, plus the audit-added ErrCodexKindModeMismatch and
 // ErrCodexAccountQuarantined, so callers/tests still branch on WHY authority was refused.
 func (s *Service) AuthorizeCodexCredentialOp(ctx context.Context, wkr store.Worker, runID uuid.UUID, presentedCapability string, scope CodexOpScope) (CodexAuthContext, error) {
+	return s.authorizeCodexCredentialOp(ctx, wkr, runID, presentedCapability, scope, false)
+}
+
+// authorizeCodexCredentialOp retains coordinates on a quarantine-only refresh refusal.
+// Those coordinates authorize only an evidence check, never credential access.
+func (s *Service) authorizeCodexCredentialOp(ctx context.Context, wkr store.Worker, runID uuid.UUID, presentedCapability string, scope CodexOpScope, deferQuarantine bool) (CodexAuthContext, error) {
 	q, ok := s.codexStore()
 	if !ok {
 		return CodexAuthContext{}, errCodexStoreUnavailable
@@ -637,6 +643,10 @@ func (s *Service) AuthorizeCodexCredentialOp(ctx context.Context, wkr store.Work
 	//     persist recoverable material before parking even after a revoke or while
 	//     quarantined (D4 persist-before-park). Losing release permission must not lose the
 	//     authority to protect material. See evalCodexPersistRecoveryPredicate.
+	if row.ClaimReleasedAt.Valid {
+		return CodexAuthContext{}, ErrCodexRunNotActivelyClaimed
+	}
+	var decisionErr error
 	inputs := codexReleaseInputsFromAuthRow(row)
 	switch scope {
 	case ScopePersistRecovery:
@@ -645,7 +655,10 @@ func (s *Service) AuthorizeCodexCredentialOp(ctx context.Context, wkr store.Work
 		}
 	case ScopeReleaseAccessToken, ScopeStartRefresh:
 		if perr := evalCodexReleasePredicate(inputs); perr != nil {
-			return CodexAuthContext{}, perr
+			if !deferQuarantine || scope != ScopeStartRefresh || !errors.Is(perr, ErrCodexAccountQuarantined) {
+				return CodexAuthContext{}, perr
+			}
+			decisionErr = perr
 		}
 	default:
 		// Unreachable: scope.valid() and appliesTo() above already constrained the scope.
@@ -677,7 +690,7 @@ func (s *Service) AuthorizeCodexCredentialOp(ctx context.Context, wkr store.Work
 		authCtx.AccountID = uuid.UUID(st.ProviderAccountID.Bytes)
 	}
 
-	return authCtx, nil
+	return authCtx, decisionErr
 }
 
 // FreezeCodexBinding freezes a run's Codex binding at creation (PRD #1147 M2, B6),
