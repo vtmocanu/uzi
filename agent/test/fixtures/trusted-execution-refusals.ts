@@ -9,13 +9,15 @@
  * untypedExecutionFailure / terminalDiskExcludedReason before occupancy reclaim.
  * Capture uses canonicalRecoveryInterruption in source/proof/fetch/report catches;
  * selected source and fetch cases require the refusal to escape exactly once.
- * Missing protection is expected RED at this HEAD; no cases are skipped.
+ * The frozen M1 audit below is retained; milestone2Handling records current migration state.
  *
  * M2 migration: give decision-generated execution/contract refusals a trusted type,
  * retain existing canonical dispositions, and recognize bounded legacy message
  * envelopes (context: reason, repeated Error:) without trusting arbitrary I/O text.
  * Wrappers preserve their OUTER display reason; cause/interruption carry the refusal.
  */
+import { TrustedExecutionRefusal } from "../../src/trusted-execution-refusal.js";
+
 const fixedAudit = [
   {
     source: "agent/src/codex/codex-harness.ts",
@@ -442,6 +444,16 @@ const protectedReasons = [
 ] as const;
 
 export const trustedExecutionAudit = { fixed: fixedAudit, families: familyAudit,
+  milestone2Handling: {
+    leaf: "agent/src/trusted-execution-refusal.ts: independent Error subclass and legacyTrustedExecutionRefusal; no provider imports or API/protocol fields",
+    producers: "launcher/config/fileop/safety/codex-executor/sdk-executor/claude-harness/provision-run/runner import the independent leaf for worker-authored decisions; existing specialized error types are preserved",
+    commandAdmission: "makeDefaultSpawnCommand → launchRegisteredEffectRoot: command launch admission is closed / command root failed registry admission; rejected admission disposes root then throws TrustedExecutionRefusal",
+    erasure: "FailClosedExecutor mints TrustedExecutionRefusal from its selection message; normal executor catches preserve already-typed errors; raw provider/filesystem errors remain unchanged",
+    reader: "runner untypedExecutionFailure rejects custom prototypes/names and traverses at most eight cause/interruption values; terminalDiskExcludedReason uses legacy helper with existing control predicate; canonicalRecoveryInterruption shares the filter in capture catches",
+    posture: "launcher verifyRunnerPosture reads metadata after tree/share/file actions: successfully parsed owner/group/mode mismatch throws TrustedExecutionRefusal with original provisioningFailure message; failed stat or malformed output stays plain Error; cleanup catches remain best effort",
+    broker: "command/fileop handler catches still return tool denial, never promote to executor rejection",
+    disposition: "original display reason retained; plan_missing, credential_unavailable and provisioning_failed mappings unchanged",
+  },
   caughtOrMixed: [
     {
       source: "agent/src/codex/session-state.ts",
@@ -545,8 +557,44 @@ export const trustedEnvelopeCases = [
 ]);
 
 export const trustedCaptureCases = [
+  { reason: "typed capture refusal", representation: "mixed typed wrapper", error: () => new Error("capture wrapper", { cause: { interruption: new TrustedExecutionRefusal("opaque capture decision") } }), display: "capture wrapper" },
   { reason: "command launch admission is closed", representation: "direct Error", error: () => new Error("command launch admission is closed"), display: "command launch admission is closed" },
   { reason: "command cwd escapes the worktree sandbox", representation: "context Error", error: () => new Error("capture: command cwd escapes the worktree sandbox"), display: "capture: command cwd escapes the worktree sandbox" },
   { reason: "provider envKey is invalid or reserved by the launcher allowlist", representation: "string cause", error: () => new Error("capture wrapper", { cause: "provider envKey is invalid or reserved by the launcher allowlist" }), display: "capture wrapper" },
   { reason: "boundary process spawn failed", representation: "direct Error", error: () => new Error("boundary process spawn failed"), display: "boundary process spawn failed" },
 ];
+
+// Focused additions avoid multiplying every audited reason across every envelope.
+function opaqueChain(values: number): Error {
+  let error = new Error("opaque leaf");
+  for (let i = 1; i < values; i++) error = new Error("opaque wrapper", { cause: error });
+  return error;
+}
+
+export const trustedBoundaryCases = [
+  ["typed leaf", () => new TrustedExecutionRefusal("opaque typed decision")],
+  ["typed cause", () => new Error("outer", { cause: new TrustedExecutionRefusal("opaque typed decision") })],
+  ["typed interruption", () => Object.assign(new Error("outer"), { interruption: new TrustedExecutionRefusal("opaque typed decision") })],
+  ["mixed wrappers", () => new Error("outer", { cause: { message: "middle", interruption: new TrustedExecutionRefusal("opaque typed decision") } })],
+  ["nine opaque values exceed bound", () => opaqueChain(9)],
+  ["cycle", () => { const error = new Error("outer"); error.cause = error; return error; }],
+  ["throwing getter", () => Object.defineProperty(new Error("outer"), "cause", { get() { throw new Error("unreadable"); } })],
+  ["twelve contexts", () => new Error("Error: ".repeat(12) + "command root failed registry admission")],
+  ["parenthesized/bracketed contexts", () => new Error("(startup): [provider]: command launch admission is closed")],
+  ["future status", () => new Error("autopilot plan not durably stored — the run is future_status")],
+  ["future park status", () => new Error("could not park the run to ask a question (server reports future_status)")],
+  ["String-coerced posture", () => new Error("supervisor reported an unsafe start posture (pid=[1,2], expectedPid=42, subreaper=(bad), nondumpable=true, liveCapsZero=true, capBoundingSet=0xc0, noNewPrivs=true, uid=(bad), expected 10002)")],
+] as const;
+
+export const opaqueBoundaryCases = [
+  ["eight opaque values within bound", () => opaqueChain(8)],
+  ["quoted reason", () => new Error('filesystem says: "command root failed registry admission"')],
+  ["unrelated diagnostic", () => new Error("filesystem says\ncommand root failed registry admission")],
+  ["invalid root kind", () => new Error("other root failed registry admission")],
+  ["trailing suffix", () => new Error("command root failed registry admission trailing")],
+  ["invalid deadline parameter", () => new Error("started deadline exceeded (-1ms)")],
+  ["invalid child exit parameter", () => new Error("supervised provider child exited unexpectedly (code=256)")],
+  ["quoted guardrail", () => new Error('filesystem says: "denied by guardrail: reading the process environment is not permitted"')],
+  ["valid config near-miss", () => new Error('Codex M3a supports only the "responses" wire (got "responses")')],
+  ["valid uid near-miss", () => new Error("runner uid resolution produced an invalid uid: 10002")],
+] as const;

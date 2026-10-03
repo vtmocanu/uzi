@@ -1,3 +1,4 @@
+import { TrustedExecutionRefusal, legacyTrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { AsyncResource } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
@@ -416,95 +417,16 @@ function isInputReceiptError(err: unknown): boolean {
  *  counted one); it keeps the custody hold. The pre-clone D6 disk park is a separate flow
  *  (RunRunner.handleDataVolumeFull). */
 // These are trusted runner/provider control and security failures, never occupancy deferrals.
-// Fixed Codex selection/posture messages are mirrored locally to keep this policy harness agnostic.
-const TERMINAL_DISK_EXCLUDED_REASONS = new Set<string>([
-  "run exceeded its wall-clock timeout",
-  "run stalled: no agent activity within the idle timeout",
-  "run cancelled",
-  "run paused (now)",
-  "run released for a credential switch",
-  "no Anthropic OAuth token was provided for this run",
-  "the agent ended the planning turn without submitting a plan",
-  "the agent kept asking clarifying questions without ever submitting a plan",
-  "run reached its milestone-scaled implement/review iteration budget without completing",
-  "the lead declined the task and made no progress: it repeated the same response with no new commits, no working-tree changes, and no subagent activity across consecutive iterations. Stopped early rather than exhausting the iteration budget; see the lead's response on the run feed.",
-  "codex run idle timeout",
-  "codex run wall-clock timeout",
-  "codex run paused",
-  "codex run deferred: vault locked",
-  "codex run reached its implement/review iteration budget without completing",
-  "completion blocked: the lead declared the run complete but the frozen completion contract still has unmet milestones, and repeated completion attempts made no progress (the same unmet set, branch head and worktree across attempts). Held for an owner decision rather than shipping an incomplete run.",
-  "completion budget exhausted: the server flagged this run past its completion budget after a completion attempt. Held for an owner decision rather than continuing to spend budget.",
-  "denied by guardrail: git push is not permitted (the worker opens MRs; the agent never pushes)",
-  "denied by guardrail: git remote mutation is not permitted",
-  "denied by guardrail: forced git operations are not permitted",
-  "denied by guardrail: reading git config values is not permitted",
-  "denied by guardrail: modifying remote/core/http/credential git config is not permitted",
-  "denied by guardrail: reading the process environment is not permitted",
-  "denied by guardrail: inspecting the process table is not permitted",
-  "denied by guardrail: reading /proc is not permitted",
-  "denied by guardrail: mass-signal kill commands (pkill, killall, skill, fuser -k, kill of a broadcast/process-group target, or kill of PIDs enumerated by lsof/pgrep/ps/fuser/pidof) can kill the agent's own process tree; stop a background task through the harness, or kill \"$pid\" with the exact PID saved at launch (run it as its own command, without lsof/pgrep/ps/fuser/pidof in the same command)",
-  "denied by guardrail: reading the worker credential file is not permitted",
-  "denied by guardrail: docker requires a daemon sidecar, which this worker has none wired",
-  "denied by guardrail: redirecting the docker client to a different daemon is not permitted",
-  "denied by guardrail: command wrapping is nested too deeply to screen safely",
-  "denied by guardrail: command screening failed; refusing to run Bash",
-  "denied by guardrail: file access outside the run worktree is not permitted; use .uzi/scratch/ inside the run worktree for temporary files",
-  "denied by guardrail: accessing the .git directory is not permitted",
-  "denied by guardrail: only the run's assembled subagents may be invoked",
-  "denied by guardrail: this dispatch has no text prompt to carry the run's operator constraints",
-  "denied by guardrail: operator constraints could not be loaded; retry the run",
-  "denied by guardrail: the run's operator constraints are too large to attach to a subagent; shorten or consolidate them",
-  "Codex claim block is present but is not an object",
-  "Codex claim block has a missing or unrecognized auth_mode",
-  "Codex claim block is missing a valid access_token",
-  "Codex claim block is missing a valid capability",
-  "Codex subscription claim is missing its generation",
-  "Codex subscription claim generation is not a finite number",
-  "Codex subscription claim generation is not a safe integer",
-  "Codex subscription claim generation must be nonnegative",
-  "Codex subscription claim is missing its verified account id",
-  "Codex subscription claim plan type must be null",
-  "Codex api_key claim must not carry subscription metadata",
-  "codex boundary process refused: stale permit",
-  "codex boundary process refused: boundary deadline exceeded",
-  "codex boundary process timeout must be positive and finite",
-  "recoverable child timeout is checkpoint-only",
-  "codex boundary process refused: admission not closed",
-  "codex boundary process refused: command roots live",
-  "boundary process failed registry admission",
-  "boundary process child deadline exceeded during launch",
-  "checkpoint child disposal failed",
-  "checkpoint child root did not reap cleanly before boundary deadline",
-  "boundary process root did not reap cleanly",
-  "boundary process produced no terminal result",
-  "Codex shared data directory has an unexpected owner or group",
-  "Codex shared data directory has an unexpected mode",
-  "Codex run HOME must be a canonical absolute non-root path",
-  "Codex run HOME must be prepared by the worker identity",
-  "codex clarification rounds exhausted during planning",
-  "codex plan turn produced no plan",
-  "codex plan revision budget exhausted",
-  "codex plan turn produced no plan on revision",
-  "codex clarification rounds exhausted during implementation",
-  "Codex command worktree lacks the required runner-group setgid/write posture",
-  "command cwd escapes the worktree sandbox",
-  "command private tmp must be an absolute non-root path",
-  "command cache must be a clean child of the command cache root",
-  "boundary process executable must be absolute",
-  "boundary process launch unavailable",
-  "boundary process spawn failed",
-]);
-
+// The shared leaf catalogue keeps legacy selection/posture policy harness agnostic.
 function terminalDiskExcludedReason(reason: unknown): boolean {
-  return typeof reason === "string" && (failOriginForReason(reason) !== undefined
-    || TERMINAL_DISK_EXCLUDED_REASONS.has(reason)
-    || reason === REASON_QUESTION_TIMEOUT || reason === PLAN_APPROVAL_TIMEOUT_REASON
-    || reason.startsWith(`${REASON_QUESTION_NOT_PARKED} (`)
-    || reason.startsWith(`${REASON_FOLLOWUP_NOT_PARKED} (`)
-    || reason.startsWith("denied by guardrail: ")
-    || reason.startsWith("plan-gate input delivery failed: ")
-    || reason.startsWith("unexpected plan verdict: "));
+  return typeof reason === "string" && legacyTrustedExecutionRefusal(reason, (candidate) =>
+    failOriginForReason(candidate) !== undefined
+    || candidate === REASON_QUESTION_TIMEOUT || candidate === PLAN_APPROVAL_TIMEOUT_REASON
+    || candidate.startsWith(`${REASON_QUESTION_NOT_PARKED} (`)
+    || candidate.startsWith(`${REASON_FOLLOWUP_NOT_PARKED} (`)
+    || candidate.startsWith("denied by guardrail: ")
+    || candidate.startsWith("plan-gate input delivery failed: ")
+    || candidate.startsWith("unexpected plan verdict: "));
 }
 
 /** Only an untyped execution failure is eligible. Bounded traversal rejects uncertain wrappers. */
@@ -9255,7 +9177,7 @@ export class RunRunner {
           });
           const parked = (ack as { status?: string } | undefined)?.status;
           if (parked !== "awaiting_followup") {
-            throw new Error(
+            throw new TrustedExecutionRefusal(
               `${REASON_FOLLOWUP_NOT_PARKED} (server reports ${parked ?? "an unreadable status"})`,
             );
           }
@@ -9281,7 +9203,7 @@ export class RunRunner {
             ownershipStatus = (await this.client.getRunOwnership(runId)).status;
           } catch (err) {
             if (err instanceof RequestError && err.status === 404) {
-              throw new Error(
+              throw new TrustedExecutionRefusal(
                 `${REASON_FOLLOWUP_NOT_PARKED} (server reports the run is not owned by this worker)`,
               );
             }
@@ -9293,7 +9215,7 @@ export class RunRunner {
             );
           }
           if (ownershipStatus !== undefined && FOLLOWUP_TERMINAL_STATUSES.has(ownershipStatus)) {
-            throw new Error(
+            throw new TrustedExecutionRefusal(
               `${REASON_FOLLOWUP_NOT_PARKED} (server reports ${ownershipStatus})`,
             );
           }
@@ -13883,7 +13805,7 @@ export class RunRunner {
       await steering.awaitInitialDelivery(signal);
     } catch (err) {
       if (!(err instanceof GateInputDeliveryError)) throw err;
-      if (err.definitive) throw new Error(`plan-gate input delivery failed: ${err.message}`);
+      if (err.definitive) throw new TrustedExecutionRefusal(`plan-gate input delivery failed: ${err.message}`, { cause: err });
       runLog.warn("could not read plan-gate inputs after the resume; parking for recovery", {
         run_id: runId,
         error: err.message,
@@ -14033,7 +13955,7 @@ export class RunRunner {
       // here rather than returning an approve verdict. Only a 200 (applied) proceeds.
       const ack = await reportState(autopilotState);
       if (!ack.applied) {
-        throw new Error(
+        throw new TrustedExecutionRefusal(
           `autopilot plan not durably stored — the run is ${ack.status ?? "no longer running"}`,
         );
       }
@@ -14372,7 +14294,7 @@ export class RunRunner {
     const parked = (ack as { status?: string } | undefined)?.status;
     if (parked !== "awaiting_input") {
       this.openQuestionIds.delete(runId);
-      throw new Error(
+      throw new TrustedExecutionRefusal(
         `${REASON_QUESTION_NOT_PARKED} (server reports ${parked ?? "an unreadable status"})`,
       );
     }

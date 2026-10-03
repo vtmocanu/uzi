@@ -35,6 +35,7 @@ import {
   type CodexExecutorDeps,
   type CodexCommittedGenerationCell,
 } from "../src/codex/codex-executor.js";
+import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { RequestError } from "../src/client.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { WORKER_UID, RUNNER_UID } from "../src/runner-uid.js";
@@ -2957,6 +2958,38 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
       };
     };
   }
+
+  it("trusted refusal: closed command admission rejects before launching", async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    await registry.disposeTools(1000);
+    let launches = 0;
+    const spawnCommand = makeDefaultSpawnCommand(registry, async (spec) => {
+      launches++;
+      return supervisedOutput(Buffer.alloc(0))(spec);
+    }, 1000, "/data/runner/repo/run-1", runEnv, "required");
+    await assert.rejects(spawnCommand(["/bin/true"], { cwd: "/data/runner/repo/run-1" }),
+      (error: unknown) => error instanceof TrustedExecutionRefusal && error.message === "command launch admission is closed");
+    assert.equal(launches, 0);
+  });
+
+  it("trusted refusal: command reservation invalidated during launch disposes the unadmitted root", async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    let disposes = 0;
+    const spawnCommand = makeDefaultSpawnCommand(registry, async (spec) => {
+      assert.equal(registry.pendingLaunchCount(), 1);
+      const handle = await supervisedOutput(Buffer.alloc(0))(spec);
+      await registry.disposeTools(1000);
+      return { ...handle, dispose: async (deadline) => {
+        disposes++;
+        return handle.dispose(deadline);
+      } };
+    }, 1000, "/data/runner/repo/run-1", runEnv, "required");
+    await assert.rejects(spawnCommand(["/bin/true"], { cwd: "/data/runner/repo/run-1" }),
+      (error: unknown) => error instanceof TrustedExecutionRefusal && error.message === "command root failed registry admission");
+    assert.equal(disposes, 1);
+    assert.equal(registry.pendingLaunchCount(), 0);
+    assert.equal(registry.hasLiveCommandRoot(), false);
+  });
 
   it("(A) caps combined stdout+stderr at MAX_COMMAND_CAPTURE_BYTES, SIGKILLs the child, and RESOLVES (never rejects) with the truncated result", async () => {
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));

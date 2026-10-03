@@ -25,6 +25,7 @@
 // / `E_MALFORMED`) the broker renders as a neutral `fileop_denied`; the helper's own
 // codes are already bounded and path/content-free.
 
+import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import type { Readable, Writable } from "node:stream";
 
 import type { FileopClient, FileopRequest, FileopResponse } from "./broker.js";
@@ -247,7 +248,7 @@ export interface SpawnFileopHelperDeps {
  */
 export function wireFileopHelper(proc: FileopProcess, deps: SpawnFileopHelperDeps = {}): FileopHelperHandle {
   if (!proc.stdin || !proc.stdout) {
-    throw new Error("fileop helper process is missing a stdin/stdout channel");
+    throw new TrustedExecutionRefusal("fileop helper process is missing a stdin/stdout channel");
   }
   const client = new FileopHelperClient({
     inbound: proc.stdout,

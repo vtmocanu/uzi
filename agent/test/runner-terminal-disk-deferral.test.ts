@@ -16,7 +16,7 @@ import { Outbox } from "../src/outbox.js";
 import { nullLogger } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
-import { trustedCaptureCases, trustedEnvelopeCases, trustedExecutionCases } from "./fixtures/trusted-execution-refusals.js";
+import { opaqueBoundaryCases, trustedBoundaryCases, trustedCaptureCases, trustedEnvelopeCases, trustedExecutionCases } from "./fixtures/trusted-execution-refusals.js";
 
 installHarness();
 const GIB = 1024 ** 3;
@@ -443,10 +443,38 @@ describe("terminal execution disk deferral", () => {
       if (entry.display === "the planning turn ended without a plan or a structured question after a corrective nudge") {
         assert.equal(failures[0]!.body.fail_origin, "plan_missing", "retain plan-missing disposition");
       }
+      if (entry.display === "tool provisioning failed before the agent could start: invalid run id") {
+        assert.equal(failures[0]!.body.fail_origin, "provisioning_failed", "retain provisioning disposition");
+      }
       if (entry.display === "no Anthropic OAuth token was provided for this run") {
         assert.equal(failures[0]!.body.fail_origin, "credential_unavailable", "retain credential disposition");
       }
       assert.equal(api.states.some((s) => s.body.status === "completed"), false);
+    });
+  }
+
+  for (const [name, error] of trustedBoundaryCases) {
+    it(`trusted boundary: ${name}`, async () => {
+      const rejection = error();
+      const f = fixture({ error: rejection });
+      await f.runner.execute(f.claim);
+      assert.equal(f.reclaims(), 0);
+      assert.equal(parks().length, 0);
+      assert.equal(f.forge.calls.length, 0);
+      const failures = api.states.filter((s) => s.body.status === "failed");
+      assert.equal(failures.length, 1);
+      assert.equal(failures[0]!.body.failure_reason, rejection.message);
+    });
+  }
+  for (const [name, error] of opaqueBoundaryCases) {
+    it(`opaque boundary defers: ${name}`, async () => {
+      const f = fixture({ error: error() });
+      await f.runner.execute(f.claim);
+      assert.equal(f.reclaims(), 1);
+      assert.equal(parks().length, 1);
+      assert.equal(parks()[0]!.body.recovery_cause, "data_volume_full");
+      assert.equal(api.states.some((s) => s.body.status === "failed" || s.body.status === "completed"), false);
+      assert.equal(f.forge.calls.length, 0);
     });
   }
 

@@ -31,6 +31,7 @@
 // dispose) reports FAILURE / not-clean-disposal for exactly THIS owned root; we never
 // mint a run-level permit or `observed_empty`.
 
+import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { spawn, spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
 import { lstatSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -343,10 +344,10 @@ const DEFAULT_DEADLINES: LauncherDeadlines = { started: 10000, snapshot: 5000, d
 function defaultResolveRunnerUid(): number {
   const r = spawnSync("id", ["-u", "runner"], { encoding: "utf8" });
   if (r.status !== 0) {
-    throw new Error(`cannot resolve the runner uid (id -u runner exited ${String(r.status)})`);
+    throw new TrustedExecutionRefusal(`cannot resolve the runner uid (id -u runner exited ${String(r.status)})`);
   }
   const uid = Number.parseInt(String(r.stdout).trim(), 10);
-  if (!Number.isInteger(uid) || uid <= 0) throw new Error(`runner uid resolution produced an invalid uid: ${String(r.stdout)}`);
+  if (!Number.isInteger(uid) || uid <= 0) throw new TrustedExecutionRefusal(`runner uid resolution produced an invalid uid: ${String(r.stdout)}`);
   return uid;
 }
 
@@ -379,6 +380,41 @@ function provisioningFailure(
   return new Error(`${msg}: ${tail}`);
 }
 
+/** Read filesystem metadata separately from the worker's posture decision. A failed
+ * stat remains an opaque provisioning failure; only a successful, parsed observation
+ * that violates the requested owner/group/mode becomes a trusted refusal. Each path
+ * is checked once in order, with a 5000ms timeout per stat; any failure stops this
+ * provisioning step and its remaining paths. */
+function verifyRunnerPosture(
+  request: RunnerTreeRequest,
+  paths: readonly { path: string; mode: string; gid?: number }[],
+  step: string,
+  opts: ProvisionOptions,
+  target?: string,
+): void {
+  const wrap = request.kind === "command" ? commandRootCommand : runnerCommand;
+  for (const expected of paths) {
+    const command = wrap("/bin/sh", ["-ceu", 'stat -c "%u:%g:%a" -- "$1"', "sh", expected.path]);
+    const result = (opts.spawn ?? spawnSync)(command.command, command.args, {
+      env: workerSpawnEnv({ PATH: "/usr/bin:/bin", LANG: "C" }),
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 5000,
+    });
+    if (result.status !== 0 || result.error !== undefined) {
+      throw provisioningFailure(step, result, opts.redact, target);
+    }
+    const output = String(result.stdout);
+    const observation = /^(\d+):(\d+):([0-7]{1,4})\n?$/.exec(output);
+    // The old shell comparison exited 1 with empty stderr for a posture mismatch.
+    const mismatch = { ...result, status: 1, stderr: "" };
+    if (observation === null || observation[0] !== output) throw provisioningFailure(step, mismatch, opts.redact, target);
+    if (Number(observation[1]) !== request.uid || observation[3] !== expected.mode
+      || (expected.gid !== undefined && Number(observation[2]) !== expected.gid)) {
+      throw new TrustedExecutionRefusal(provisioningFailure(step, mismatch, opts.redact, target).message);
+    }
+  }
+}
+
 /** Default privileged provisioning: create the dirs as the runner uid via setpriv
  * (`runnerCommand`) and write the config 0600, never chown. Trees stay 0700 except
  * for the narrow managed-auth session export posture on RunnerTreeRequest.
@@ -393,25 +429,32 @@ function defaultMakeRunnerTrees(request: RunnerTreeRequest, opts: ProvisionOptio
   const wrap = request.kind === "command" ? commandRootCommand : runnerCommand;
   const mk = wrap("/bin/sh", [
     "-ceu",
-    `root="$1"; uid="$2"; shift 2; umask 077; mkdir -m 700 -- "$root"; trap 'rc=$?; [ "$rc" -eq 0 ] || rm -rf -- "$root"; exit "$rc"' EXIT; chmod 700 "$root"; for d in "$@"; do mkdir -m 700 -- "$d"; chmod 700 "$d"; done; for d in "$root" "$@"; do [ "$(stat -c %u "$d")" = "$uid" ] && [ "$(stat -c %a "$d")" = 700 ]; done; trap - EXIT`,
+    `root="$1"; uid="$2"; shift 2; umask 077; mkdir -m 700 -- "$root"; trap 'rc=$?; [ "$rc" -eq 0 ] || rm -rf -- "$root"; exit "$rc"' EXIT; chmod 700 "$root"; for d in "$@"; do mkdir -m 700 -- "$d"; chmod 700 "$d"; done; trap - EXIT`,
     "sh", request.root, String(request.uid), ...request.dirs,
   ]);
   const r = run(mk.command, mk.args, { env: provisionEnv, stdio: ["ignore", "ignore", "pipe"] });
   if (r.status !== 0 || r.error !== undefined) throw provisioningFailure("runner-owned tree creation", r, opts.redact);
   try {
+    verifyRunnerPosture(request, [request.root, ...request.dirs].map((path) => ({ path, mode: "700" })),
+      "runner-owned tree creation", opts);
     const shared = request.sharedSessionRead;
     if (shared !== undefined) {
       const share = wrap("/bin/sh", [
         "-ceu",
-        `root="$1"; codex="$2"; sessions="$3"; uid="$4"; gid="$5"; chgrp "$gid" "$root" "$codex"; chmod 710 "$root" "$codex"; mkdir -m 2750 -- "$sessions"; chgrp "$gid" "$sessions"; chmod 2750 "$sessions"; [ "$(stat -c %u "$root")" = "$uid" ] && [ "$(stat -c %g "$root")" = "$gid" ] && [ "$(stat -c %a "$root")" = 710 ] && [ "$(stat -c %u "$codex")" = "$uid" ] && [ "$(stat -c %g "$codex")" = "$gid" ] && [ "$(stat -c %a "$codex")" = 710 ] && [ "$(stat -c %u "$sessions")" = "$uid" ] && [ "$(stat -c %g "$sessions")" = "$gid" ] && [ "$(stat -c %a "$sessions")" = 2750 ]`,
+        `root="$1"; codex="$2"; sessions="$3"; uid="$4"; gid="$5"; chgrp "$gid" "$root" "$codex"; chmod 710 "$root" "$codex"; mkdir -m 2750 -- "$sessions"; chgrp "$gid" "$sessions"; chmod 2750 "$sessions"`,
         "sh", request.root, shared.codexHome, shared.sessionDir, String(request.uid), String(shared.gid),
       ]);
       const sr = run(share.command, share.args, { env: provisionEnv, stdio: ["ignore", "ignore", "pipe"] });
       if (sr.status !== 0 || sr.error !== undefined) throw provisioningFailure("runner-owned session export posture", sr, opts.redact);
+      verifyRunnerPosture(request, [
+        { path: request.root, mode: "710", gid: shared.gid },
+        { path: shared.codexHome, mode: "710", gid: shared.gid },
+        { path: shared.sessionDir, mode: "2750", gid: shared.gid },
+      ], "runner-owned session export posture", opts);
     }
     if (request.sessionSeedDir !== undefined) {
       if (shared === undefined || request.kind !== "provider") {
-        throw new Error("runner-owned session seed requires a managed-auth provider tree");
+        throw new TrustedExecutionRefusal("runner-owned session seed requires a managed-auth provider tree");
       }
       const inv = sessionSeedInvocation(SESSION_SEED_APP_ROOT, request.sessionSeedDir, shared.sessionDir);
       const seed = wrap(inv.command, inv.args);
@@ -428,9 +471,10 @@ function defaultMakeRunnerTrees(request: RunnerTreeRequest, opts: ProvisionOptio
     }
     for (const file of request.files) {
       const octal = (file.mode & 0o777).toString(8).padStart(3, "0");
-      const w = wrap("/bin/sh", ["-ceu", `umask 077; cat > "$1"; chmod ${octal} "$1"; [ "$(stat -c %u "$1")" = "$2" ] && [ "$(stat -c %a "$1")" = ${octal} ]`, "sh", file.path, String(request.uid)]);
+      const w = wrap("/bin/sh", ["-ceu", `umask 077; cat > "$1"; chmod ${octal} "$1"`, "sh", file.path, String(request.uid)]);
       const wr = run(w.command, w.args, { env: provisionEnv, input: file.content, stdio: ["pipe", "ignore", "pipe"] });
       if (wr.status !== 0 || wr.error !== undefined) throw provisioningFailure("runner-owned file write", wr, opts.redact, file.path);
+      verifyRunnerPosture(request, [{ path: file.path, mode: octal }], "runner-owned file write", opts, file.path);
     }
   } catch (error) {
     const rm = wrap("/bin/rm", ["-rf", "--", request.root]);
@@ -534,33 +578,33 @@ function pathsOverlap(a: string, b: string): boolean {
 
 /** Validate the trusted construction contract for every caller, not only the JSON CLI. */
 function validateLaunchContract(spec: CodexLaunchSpec): void {
-  if (spec.kind !== "provider" && spec.kind !== "command") throw new Error("kind must be provider or command");
+  if (spec.kind !== "provider" && spec.kind !== "command") throw new TrustedExecutionRefusal("kind must be provider or command");
   if (!isAbsolute(spec.ownedDataRoot) || resolve(spec.ownedDataRoot) === sep || resolve(spec.ownedDataRoot) !== spec.ownedDataRoot) {
-    throw new Error("ownedDataRoot must be a canonical absolute non-root path");
+    throw new TrustedExecutionRefusal("ownedDataRoot must be a canonical absolute non-root path");
   }
-  if (!isAbsolute(spec.cwd)) throw new Error("cwd must be an absolute path");
+  if (!isAbsolute(spec.cwd)) throw new TrustedExecutionRefusal("cwd must be an absolute path");
   if (pathsOverlap(spec.ownedDataRoot, spec.cwd)) {
-    throw new Error("ownedDataRoot and cwd must be disjoint");
+    throw new TrustedExecutionRefusal("ownedDataRoot and cwd must be disjoint");
   }
   if (spec.supervisorBin !== SUPERVISOR_BIN) {
-    throw new Error(`supervisorBin must equal the immutable image path ${SUPERVISOR_BIN}`);
+    throw new TrustedExecutionRefusal(`supervisorBin must equal the immutable image path ${SUPERVISOR_BIN}`);
   }
-  if (!isAbsolute(spec.codexBin)) throw new Error("child executable must be absolute");
+  if (!isAbsolute(spec.codexBin)) throw new TrustedExecutionRefusal("child executable must be absolute");
   if (spec.kind === "provider") {
     if (spec.codexBin !== CODEX_BIN || spec.childArgv.length !== PROVIDER_CHILD_ARGV.length
       || spec.childArgv.some((arg, index) => arg !== PROVIDER_CHILD_ARGV[index])) {
-      throw new Error("provider roots must use the pinned Codex app-server target");
+      throw new TrustedExecutionRefusal("provider roots must use the pinned Codex app-server target");
     }
   }
   if (!/^[A-Z][A-Z0-9_]*$/.test(spec.provider.envKey) || RESERVED_PROVIDER_ENV_KEYS.has(spec.provider.envKey)) {
-    throw new Error("provider envKey is invalid or reserved by the launcher allowlist");
+    throw new TrustedExecutionRefusal("provider envKey is invalid or reserved by the launcher allowlist");
   }
   if (spec.useAppServerAuth) {
     if (spec.kind !== "provider") {
-      throw new Error("app-server auth is only supported for a provider root");
+      throw new TrustedExecutionRefusal("app-server auth is only supported for a provider root");
     }
     if (spec.authMode !== "subscription" && spec.authMode !== "api_key") {
-      throw new Error("app-server auth requires an explicit subscription or api_key mode");
+      throw new TrustedExecutionRefusal("app-server auth requires an explicit subscription or api_key mode");
     }
   }
 }
@@ -602,7 +646,7 @@ export class SupervisedChildExitTimeoutError extends Error {
 
 function withDeadline<T>(p: Promise<T>, ms: number, label: string, timeoutError?: () => Error): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(timeoutError?.() ?? new Error(`${label} deadline exceeded (${ms}ms)`)), ms);
+    const timer = setTimeout(() => reject(timeoutError?.() ?? new TrustedExecutionRefusal(`${label} deadline exceeded (${ms}ms)`)), ms);
     if (typeof timer.unref === "function") timer.unref();
     p.then(
       (value) => { clearTimeout(timer); resolve(value); },
@@ -612,11 +656,11 @@ function withDeadline<T>(p: Promise<T>, ms: number, label: string, timeoutError?
 }
 
 function asWritable(stream: Readable | Writable | null | undefined, label: string): Writable {
-  if (!stream || typeof (stream as Writable).write !== "function") throw new Error(`supervisor ${label} channel (fd) is unavailable`);
+  if (!stream || typeof (stream as Writable).write !== "function") throw new TrustedExecutionRefusal(`supervisor ${label} channel (fd) is unavailable`);
   return stream as Writable;
 }
 function asReadable(stream: Readable | Writable | null | undefined, label: string): Readable {
-  if (!stream || typeof (stream as Readable).on !== "function") throw new Error(`supervisor ${label} channel (fd) is unavailable`);
+  if (!stream || typeof (stream as Readable).on !== "function") throw new TrustedExecutionRefusal(`supervisor ${label} channel (fd) is unavailable`);
   return stream as Readable;
 }
 
@@ -637,17 +681,17 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
 
   validateLaunchContract(spec);
   if (deps.appServerAuthOpenAIBaseUrlForTest !== undefined && !spec.useAppServerAuth) {
-    throw new Error("Codex loopback test base URL requires app-server auth");
+    throw new TrustedExecutionRefusal("Codex loopback test base URL requires app-server auth");
   }
   if (spec.seedSession && (spec.kind !== "provider" || !spec.useAppServerAuth)) {
-    throw new Error("Codex session seeding requires a managed-auth provider root");
+    throw new TrustedExecutionRefusal("Codex session seeding requires a managed-auth provider root");
   }
 
   // Resolve the intended runner uid <N> for --expect-uid and the runner-owned trees.
   const uid = spec.kind === "command"
     ? (deps.resolveCommandUid ?? (() => COMMAND_UID))()
     : (deps.resolveRunnerUid ?? defaultResolveRunnerUid)();
-  if (!Number.isInteger(uid) || uid <= 0) throw new Error(`resolved runner uid is invalid: ${String(uid)}`);
+  if (!Number.isInteger(uid) || uid <= 0) throw new TrustedExecutionRefusal(`resolved runner uid is invalid: ${String(uid)}`);
 
   // 2. Reject unexpected system config (a fresh HOME does not neutralize /etc/codex).
   (deps.assertNoUnexpectedSystemConfig ?? defaultAssertNoUnexpectedSystemConfig)(deps.etcCodexDir);
@@ -668,7 +712,7 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
     // (non-optional) production builder input rather than assert non-null.
     const authMode = spec.authMode;
     if (authMode !== "subscription" && authMode !== "api_key") {
-      throw new Error("app-server auth requires an explicit subscription or api_key mode");
+      throw new TrustedExecutionRefusal("app-server auth requires an explicit subscription or api_key mode");
     }
     const configOpts = { model: spec.model, projectPath: spec.cwd, authMode, codeModeHost: spec.codeModeHost ?? false };
     configText = deps.appServerAuthOpenAIBaseUrlForTest === undefined
@@ -761,20 +805,20 @@ export async function launchCodexEffectRoot(
     throw new CodexUnsupportedProfileError("Codex effect roots require the A1 uid split; refusing to launch");
   }
   if (spec.supervisorBin !== SUPERVISOR_BIN) {
-    throw new Error(`supervisorBin must equal the immutable image path ${SUPERVISOR_BIN}`);
+    throw new TrustedExecutionRefusal(`supervisorBin must equal the immutable image path ${SUPERVISOR_BIN}`);
   }
   if (!isAbsolute(spec.command) || !isAbsolute(spec.cwd)) {
-    throw new Error("effect command and cwd must be absolute paths");
+    throw new TrustedExecutionRefusal("effect command and cwd must be absolute paths");
   }
   const expectedUid = spec.identity === "command"
     ? (deps.resolveCommandUid ?? (() => COMMAND_UID))()
     : (deps.resolveWorkerUid ?? (() => process.getuid?.() ?? WORKER_UID))();
   const requiredUid = spec.identity === "command" ? COMMAND_UID : WORKER_UID;
   if (expectedUid !== requiredUid) {
-    throw new Error(`effect identity resolved unexpected uid ${String(expectedUid)}`);
+    throw new TrustedExecutionRefusal(`effect identity resolved unexpected uid ${String(expectedUid)}`);
   }
   if (spec.cleanupToken !== undefined && !LOWERCASE_UUID_RE.test(spec.cleanupToken)) {
-    throw new Error("effect cleanup token must be a lowercase UUID");
+    throw new TrustedExecutionRefusal("effect cleanup token must be a lowercase UUID");
   }
   const supervisorArgv = [
     "--expect-uid", String(expectedUid),
@@ -850,24 +894,24 @@ async function createHandle(
   const lines = createInterface({ input: evidence });
   lines.on("line", (line) => {
     lineCount += 1;
-    if (lineCount > MAX_EVIDENCE_LINES) { fail(new Error(`evidence line budget exceeded (> ${MAX_EVIDENCE_LINES})`)); lines.close(); return; }
-    if (Buffer.byteLength(line) > MAX_EVIDENCE_LINE_BYTES) { fail(new Error(`oversized evidence line (> ${MAX_EVIDENCE_LINE_BYTES} bytes)`)); return; }
+    if (lineCount > MAX_EVIDENCE_LINES) { fail(new TrustedExecutionRefusal(`evidence line budget exceeded (> ${MAX_EVIDENCE_LINES})`)); lines.close(); return; }
+    if (Buffer.byteLength(line) > MAX_EVIDENCE_LINE_BYTES) { fail(new TrustedExecutionRefusal(`oversized evidence line (> ${MAX_EVIDENCE_LINE_BYTES} bytes)`)); return; }
     let value: unknown;
-    try { value = JSON.parse(line); } catch { fail(new Error("malformed evidence line (not JSON)")); return; }
+    try { value = JSON.parse(line); } catch { fail(new TrustedExecutionRefusal("malformed evidence line (not JSON)")); return; }
     dispatch(value);
   });
-  lines.on("error", (err: Error) => fail(new Error(`evidence stream error: ${err.message}`)));
+  lines.on("error", (err: Error) => fail(new TrustedExecutionRefusal(`evidence stream error: ${err.message}`, { cause: err })));
   lines.on("close", () => {
     if (failure || cleanDisposed || exited) return;
-    if (pending.size > 0 || !disposeInFlight) fail(new Error("evidence stream closed before confirmed disposal"));
+    if (pending.size > 0 || !disposeInFlight) fail(new TrustedExecutionRefusal("evidence stream closed before confirmed disposal"));
   });
-  control.on("error", (err: Error) => fail(new Error(`control stream error: ${err.message}`)));
+  control.on("error", (err: Error) => fail(new TrustedExecutionRefusal(`control stream error: ${err.message}`, { cause: err })));
 
   function dispatch(value: unknown): void {
-    if (typeof value !== "object" || value === null) { fail(new Error("evidence line is not a JSON object")); return; }
+    if (typeof value !== "object" || value === null) { fail(new TrustedExecutionRefusal("evidence line is not a JSON object")); return; }
     const record = value as Record<string, unknown>;
     if ("tmpCleanup" in record && (!tmpCleanupAllowed(record) || !isValidTmpCleanup(record.tmpCleanup))) {
-      fail(new Error("malformed tmpCleanup evidence"));
+      fail(new TrustedExecutionRefusal("malformed tmpCleanup evidence"));
       return;
     }
     switch (record.event) {
@@ -882,7 +926,7 @@ async function createHandle(
           // Re-validate every posture field, including nondumpability and the explicit
           // bounding-set residue — the controller's independent
           // check must be symmetric with the fields it receives, not a subset of them.
-          fail(new Error(
+          fail(new TrustedExecutionRefusal(
             `supervisor reported an unsafe start posture (pid=${String(ev.supervisorPid)} expectedPid=${String(child.pid)}, `
             + `subreaper=${String(ev.subreaper)}, nondumpable=${String(ev.nondumpable)}, liveCapsZero=${String(ev.liveCapsZero)}, `
             + `capBoundingSet=${String(ev.capBoundingSet)}, noNewPrivs=${String(ev.noNewPrivs)}, uid=${String(ev.uid)} expected ${expectedUid})`,
@@ -903,26 +947,26 @@ async function createHandle(
       case "child_exit": {
         const code = record.code;
         if (!Number.isInteger(code) || Number(code) < 0 || Number(code) > 255 || childExitEvent) {
-          fail(new Error("malformed or duplicate child_exit evidence"));
+          fail(new TrustedExecutionRefusal("malformed or duplicate child_exit evidence"));
           return;
         }
         const ev: ChildExitEvidence = { event: "child_exit", code: Number(code) };
         childExitEvent = ev;
         resolveChildExit(ev);
         if (kind === "provider") {
-          fail(new Error(`supervised provider child exited unexpectedly (code=${ev.code})`));
+          fail(new TrustedExecutionRefusal(`supervised provider child exited unexpectedly (code=${ev.code})`));
         }
         return;
       }
       case "abnormal": {
         // Validated above: record it so the unclean dispose outcome still reports it.
         if ("tmpCleanup" in record) abnormalTmpCleanup = record.tmpCleanup as TmpCleanupEvidence;
-        fail(new Error(`supervisor abnormal: ${String(record.reason ?? "unknown")}`));
+        fail(new TrustedExecutionRefusal(`supervisor abnormal: ${String(record.reason ?? "unknown")}`));
         return;
       }
       default:
         // An unknown event is a protocol breach — fail closed rather than guess.
-        fail(new Error(`unknown supervisor evidence event: ${String(record.event)}`));
+        fail(new TrustedExecutionRefusal(`unknown supervisor evidence event: ${String(record.event)}`));
     }
   }
 
@@ -934,18 +978,18 @@ async function createHandle(
     // still be buffered and read AFTER this event — Node's `exit` can precede the final
     // pipe read). A spontaneous exit with no dispose pending is a failure.
     if (!disposeInFlight && !cleanDisposed) {
-      fail(new Error(`supervisor exited (code=${String(code)}, signal=${String(signal)}) without confirmed disposal`));
+      fail(new TrustedExecutionRefusal(`supervisor exited (code=${String(code)}, signal=${String(signal)}) without confirmed disposal`));
     }
   });
-  child.on("error", (err: Error) => fail(new Error(`supervisor process error: ${err.message}`)));
+  child.on("error", (err: Error) => fail(new TrustedExecutionRefusal(`supervisor process error: ${err.message}`, { cause: err })));
   child.once("close", () => {
-    if (pending.size > 0) fail(new Error("supervisor channels closed with an unanswered control request"));
+    if (pending.size > 0) fail(new TrustedExecutionRefusal("supervisor channels closed with an unanswered control request"));
   });
 
   function writeControl(frame: Record<string, unknown>): boolean {
     if (control.destroyed || exited) return false;
     const encoded = `${JSON.stringify(frame)}\n`;
-    if (Buffer.byteLength(encoded) > MAX_CONTROL_BYTES) throw new Error(`control frame exceeds ${MAX_CONTROL_BYTES} bytes`);
+    if (Buffer.byteLength(encoded) > MAX_CONTROL_BYTES) throw new TrustedExecutionRefusal(`control frame exceeds ${MAX_CONTROL_BYTES} bytes`);
     try { control.write(encoded); return true; } catch { return false; }
   }
 
@@ -953,16 +997,16 @@ async function createHandle(
     return new Promise<SnapshotEvidence | DisposeEvidence>((resolve, reject) => {
       if (failure) { reject(failure); return; }
       pending.set(id, { resolve, reject });
-      if (!writeControl(frame)) { pending.delete(id); reject(new Error("control write failure (channel unavailable)")); }
+      if (!writeControl(frame)) { pending.delete(id); reject(new TrustedExecutionRefusal("control write failure (channel unavailable)")); }
     });
   }
 
   async function snapshot(timeoutMs: number = deadlines.snapshot): Promise<SnapshotEvidence> {
     if (failure) throw failure;
-    if (exited) throw new Error("supervisor has exited; snapshot unavailable");
+    if (exited) throw new TrustedExecutionRefusal("supervisor has exited; snapshot unavailable");
     const id = nextId++;
     const ev = await withDeadline(sendAndWait(id, { op: "snapshot", id }), timeoutMs, "snapshot");
-    if (ev.event !== "snapshot") throw new Error(`expected snapshot evidence, got ${String(ev.event)}`);
+    if (ev.event !== "snapshot") throw new TrustedExecutionRefusal(`expected snapshot evidence, got ${String(ev.event)}`);
     return ev;
   }
 
