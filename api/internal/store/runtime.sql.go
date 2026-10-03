@@ -4420,7 +4420,11 @@ WHERE runs.worker_id = $2
     AND runs.started_at < ($5::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $6::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
-                            + runs.budget_finalize_seconds)))
+                            + runs.budget_finalize_seconds
+                            + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                (LEAST($5::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
                   WHERE a.worker_id = $2 AND a.run_id = runs.id
                     AND a.claim_generation = runs.claim_generation)
@@ -13148,7 +13152,8 @@ type RequestWallParksRow struct {
 // per-run interval, the 8h ceiling and the #1189 extension term is preserved below and still holds.
 //
 // The DEADLINE is now the THREE-TERM total (PRD #1497): COALESCE(budget_wall_seconds,
-// global_timeout_seconds) + budget_paused_seconds + budget_extension_seconds + budget_finalize_seconds.
+// global_timeout_seconds) + budget_paused_seconds + budget_extension_seconds + budget_finalize_seconds
+// + live pending plan-check wait (capped at its deadline).
 //   - Per-run interval (PRD #122 M2 Decision 5b): a scaled-budget run carries budget_wall_seconds;
 //     a NULL-budget run falls back to global_timeout_seconds (RUN_TIMEOUT). Computed against now so
 //     the per-run interval applies in SQL.
@@ -13379,7 +13384,11 @@ WHERE runs.worker_id = $1
     AND runs.started_at < ($4::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $5::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
-                            + runs.budget_finalize_seconds)))
+                            + runs.budget_finalize_seconds
+                            + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                (LEAST($4::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
                   WHERE a.worker_id = $1 AND a.run_id = runs.id
                     AND a.claim_generation = runs.claim_generation)
@@ -16486,7 +16495,11 @@ WITH consumed_wall AS (
                   - make_interval(secs => COALESCE(r.budget_wall_seconds, $6::int)
                                         + r.budget_paused_seconds
                                         + r.budget_extension_seconds
-                                        + r.budget_finalize_seconds))
+                                        + r.budget_finalize_seconds
+                                        + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                            (LEAST($5::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                            FROM cross_checks cc WHERE cc.lead_run_id = r.id
+                                              AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0)))
             AND ($7::bigint IS NULL
                  OR r.claim_generation = $7::bigint))
 )
@@ -16510,7 +16523,11 @@ WHERE runs.id = $3 AND runs.worker_id = $4
         - make_interval(secs => COALESCE(runs.budget_wall_seconds, $6::int)
                               + runs.budget_paused_seconds
                               + runs.budget_extension_seconds
-                              + runs.budget_finalize_seconds))
+                              + runs.budget_finalize_seconds
+                              + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                  (LEAST($5::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                  FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                    AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0)))
   AND runs.claim_released_at IS NULL
   AND ($7::bigint IS NULL
        OR runs.claim_generation = $7::bigint)
@@ -16925,7 +16942,7 @@ type StampCompletionBudgetExhaustedParams struct {
 // the property that matters: a post-attempt live run is steered into the hold at the SAME instant a
 // pre-attempt run would be parked. The total is
 // COALESCE(budget_wall_seconds, global_timeout_seconds) + budget_extension_seconds +
-// budget_finalize_seconds + budget_paused_seconds. Before #1497 this statement added
+// budget_finalize_seconds + budget_paused_seconds + live pending plan-check wait. Before #1497 this statement added
 // budget_paused_seconds but NOT budget_extension_seconds, so an EXTENDED post-attempt run was
 // steered into the hold at its ORIGINAL deadline (the stale-deadline bug this fix closes);
 // budget_finalize_seconds is the new #1497 term. completion_contract_version IS NOT NULL keeps a

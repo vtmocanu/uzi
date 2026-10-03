@@ -2,10 +2,12 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/store"
 
@@ -68,6 +70,49 @@ func TestPlanCrossCheckExitSweepLiveDB(t *testing.T) {
 		}
 	}
 	mustExec(ctx, t, f.pool, `UPDATE workers SET last_heartbeat_at = now() WHERE id = $1`, f.workerID)
+	mustExec(ctx, t, f.pool, `UPDATE runs SET completion_attempts = 1,
+        completion_contract_version = 1 WHERE id = $1`, f.runID)
+	if _, err := f.q.StampCompletionBudgetExhausted(ctx, store.StampCompletionBudgetExhaustedParams{
+		Now: pgtype.Timestamptz{Time: time.Now(), Valid: true}, GlobalTimeoutSeconds: 60,
+		WorkerStaleCutoff: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var stamped bool
+	if err := f.pool.QueryRow(ctx, `SELECT completion_budget_exhausted_at IS NOT NULL
+        FROM runs WHERE id = $1`, f.runID).Scan(&stamped); err != nil {
+		t.Fatal(err)
+	}
+	if stamped {
+		t.Fatal("completion budget stamped before credited deadline")
+	}
+	mustExec(ctx, t, f.pool, `UPDATE runs SET completion_attempts = 0,
+        status_since = now() - interval '120 seconds' WHERE id = $1`, f.runID)
+	missing, err := f.q.RequeueRunsMissingFromSnapshot(ctx, store.RequeueRunsMissingFromSnapshotParams{
+		WorkerID:      pgtype.UUID{Bytes: f.workerID, Valid: true},
+		MissingCutoff: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true},
+		MaxRequeues:   2, Now: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		GlobalTimeoutSeconds: 60,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundMissing := false
+	for _, row := range missing {
+		foundMissing = foundMissing || row.ID == f.runID
+	}
+	if !foundMissing {
+		t.Fatalf("credited lead was excluded from missing-snapshot recovery: %v", missing)
+	}
+	mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'running', status_since = now(),
+        requeue_count = 0 WHERE id = $1`, f.runID)
+	if _, err := f.q.SetRunWallPark(ctx, store.SetRunWallParkParams{
+		ID: f.runID, WorkerID: pgtype.UUID{Bytes: f.workerID, Valid: true},
+		Now: pgtype.Timestamptz{Time: time.Now(), Valid: true}, GlobalTimeoutSeconds: 60,
+		ClaimGeneration: pgtype.Int8{Int64: 3, Valid: true},
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("worker wall park before credited deadline: %v", err)
+	}
 	// A budget shorter than the non-wait work must still request a park. This
 	// proves the no-request assertion above reached the wall decision predicate.
 	mustExec(ctx, t, f.pool, `UPDATE runs SET budget_wall_seconds = 1 WHERE id = $1`, f.runID)
