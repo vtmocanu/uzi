@@ -9,7 +9,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 cases=0
 passed=0
-FLOOR=13
+FLOOR=17
 
 workflow() {
   cat > "$TMP/ci.yml" <<'YML'
@@ -55,7 +55,7 @@ printf '      - run: pipx install semgrep==1.178.0\n' >> "$TMP/ci.yml"
 expect 1 'outside the lock-derived line' 'an extra literal pin (a Renovate bump)'
 
 printf 'jobs:\n  lint:\n    steps:\n      - run: pipx install semgrep==1.172.0\n' > "$TMP/ci.yml"
-expect 1 'found 0' 'a literal pin replacing the derivation'
+expect 1 'derive=0' 'a literal pin replacing the derivation'
 
 workflow
 printf '      - run: pip install semgrep\n' >> "$TMP/ci.yml"
@@ -63,11 +63,28 @@ expect 1 'outside the lock-derived line' 'an unpinned pip install'
 
 workflow
 printf '          SEMGREP_VERSION="$(./scripts/semgrep-worker-version.sh)"\n' >> "$TMP/ci.yml"
-expect 1 'found 2' 'a duplicated derivation is ambiguous'
+expect 1 'derive=2' 'a duplicated derivation is ambiguous'
 
 workflow
 gsed -i 's/^\( *\)\(SEMGREP_VERSION=\)/\1# \2/' "$TMP/ci.yml" 2>/dev/null || sed -i 's/^\( *\)\(SEMGREP_VERSION=\)/\1# \2/' "$TMP/ci.yml"
-expect 1 'found 0' 'a commented derivation cannot pass'
+expect 1 'derive=0' 'a commented derivation cannot pass'
+
+# Each case below passed the earlier line-counting check (false greens).
+workflow
+awk '{ print } /SEMGREP_VERSION="/ { print "          SEMGREP_VERSION=1.178.0" }' "$TMP/ci.yml" > "$TMP/ci2.yml" && mv "$TMP/ci2.yml" "$TMP/ci.yml"
+expect 1 'paired=0' 'an override between derive and install'
+
+workflow
+printf '      - env:\n          SEMGREP_VERSION: 1.178.0\n' >> "$TMP/ci.yml"
+expect 1 'other SEMGREP_VERSION assignment' 'another SEMGREP_VERSION assignment'
+
+workflow
+printf '          pipx install "semgrep==${SEMGREP_VERSION}"; pipx install semgrep==1.178.0\n' >> "$TMP/ci.yml"
+expect 1 'outside the lock-derived line' 'a pin chained onto the approved install text'
+
+workflow
+awk '/pipx install/ { print "          true" } { print }' "$TMP/ci.yml" > "$TMP/ci2.yml" && mv "$TMP/ci2.yml" "$TMP/ci.yml"
+expect 1 'paired=0' 'derive and install not adjacent'
 
 workflow
 printf '{broken json\n' > "$TMP/devbox.lock"

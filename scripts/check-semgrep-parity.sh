@@ -5,7 +5,7 @@
 # Usage: check-semgrep-parity.sh [ci.yml devbox.lock]
 # Exit 0 = CI derives from a readable lock, 1 = CI pins or installs semgrep any
 # other way, 2 = missing or ambiguous input/tool.
-# The CI install is exactly the two DERIVE/INSTALL lines below; changing that
+# The CI install is exactly the adjacent DERIVE/INSTALL lines below; changing that
 # shape requires updating this check, never silently skipping it.
 set -eu
 
@@ -20,26 +20,26 @@ esac
 
 DERIVE='SEMGREP_VERSION="$(./scripts/semgrep-worker-version.sh)"'
 INSTALL='pipx install "semgrep==${SEMGREP_VERSION}"'
-count() { awk -v want="$1" '{ line = $0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line); if (line == want) n++ } END { print n + 0 }' "$workflow"; }
 
 worker_version="$("$ROOT/scripts/semgrep-worker-version.sh" "$lock")" || exit 2
 
-fail=0
-derive="$(count "$DERIVE")"
-install="$(count "$INSTALL")"
-if [ "$derive" != 1 ] || [ "$install" != 1 ]; then
-  echo "check-semgrep-parity: FAIL: CI needs exactly one '$DERIVE' (found $derive) and one '$INSTALL' (found $install)" >&2
-  fail=1
-fi
-# Any other semgrep install (a literal pin, an unpinned install) is a second source.
-# awk, not grep -E: this host's grep mishandles negated bracket expressions (CLAUDE.md).
-others="$(awk -v ok="$INSTALL" '{ code = $0; sub(/#.*/, "", code) } code ~ /pip[x3]?[[:space:]]+install.*semgrep/ && index($0, ok) == 0 { print NR ": " $0 }' "$workflow")"
-if [ -n "$others" ]; then
-  echo "check-semgrep-parity: FAIL: CI installs semgrep outside the lock-derived line:" >&2
-  echo "$others" >&2
-  fail=1
-fi
-if [ "$fail" != 0 ]; then
+# One awk pass over trimmed lines (awk, not grep -E: this host's grep mishandles
+# negated bracket expressions, see CLAUDE.md). DERIVE must sit exactly once, with
+# INSTALL on the very next line; any other SEMGREP_VERSION assignment and any other
+# semgrep install line is a second version source.
+problems="$(awk -v derive="$DERIVE" -v install="$INSTALL" '
+  { line = $0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line)
+    code = line; sub(/#.*/, "", code) }
+  prev_derive { if (line == install) paired++; prev_derive = 0 }
+  line == derive { derives++; prev_derive = 1; next }
+  line == install { next }
+  code ~ /SEMGREP_VERSION[[:space:]]*[=:]/ { print NR ": other SEMGREP_VERSION assignment: " $0 }
+  code ~ /pip[x3]?[[:space:]]+install.*semgrep/ { print NR ": semgrep install outside the lock-derived line: " $0 }
+  END { if (derives != 1 || paired != 1) print "expected exactly one derive line immediately followed by the install line (derive=" derives + 0 ", paired=" paired + 0 ")" }
+' "$workflow")"
+if [ -n "$problems" ]; then
+  echo "check-semgrep-parity: FAIL:" >&2
+  echo "$problems" >&2
   echo "CI must install the worker lock's semgrep; a CI-side pin or Renovate bump must not land." >&2
   exit 1
 fi
