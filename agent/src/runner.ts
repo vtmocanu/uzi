@@ -3765,7 +3765,9 @@ export class RunRunner {
           : err instanceof ScratchPublicationError
             ? scratchPublicationFailureReason(err, redactText)
             : (codexBoundaryDiagnosticOf(err) ?? errMessage(err));
-    const reason = redactText(rawReason);
+    // Issue #2196: redact before replacing controls, so a control-split secret still
+    // matches. Keep the full log/feed diagnostic; only the terminal report is capped below.
+    const reason = sanitizeForLog(redactText(rawReason), Number.POSITIVE_INFINITY);
     // PRD #69 M7a: derive the TRUSTED failure class from the RAW reason (before
     // redaction) so a fatal pre-start failure (provisioning / no token) carries a
     // structured origin the judge can key on; an ordinary agent failure maps to

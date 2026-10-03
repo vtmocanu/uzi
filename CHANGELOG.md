@@ -26,6 +26,8 @@ through `[0.52.0]`.)
 
 - **TUI split view fills the terminal height ([#2197](https://github.com/vtmocanu/uzi/issues/2197)).**
   Pane sizes use the shared header rows actually drawn, keeping the footer on the last terminal row when meters or optional hints are absent. The resize threshold and its hysteresis stay unchanged.
+- **Run failure diagnostics replace unsafe control characters ([#2196](https://github.com/vtmocanu/uzi/issues/2196)).**
+  Generic failure logs, feed events and stored reasons replace control and bidirectional formatting characters after secret redaction, while preserving the existing 512-character report limit.
 
 ## [0.85.1] - 2026-10-03
 
