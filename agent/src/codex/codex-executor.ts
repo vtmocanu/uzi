@@ -2005,7 +2005,8 @@ export class CodexExecutor implements Executor {
     const pauseNow = new CodexPauseNowState(ctx.signal);
     ctx.onPauseNow?.(() => pauseNow.interrupt());
     // Issue #1764: the lifecycle signal for epoch startup. It forwards only a genuine (non-pause)
-    // abort of ctx.signal; the listener is removed in the finally below.
+    // abort of ctx.signal; deferred safety retains the listener until terminal disposal,
+    // otherwise the finally below removes it.
     const lifecycleAbort = new AbortController();
     const forwardLifecycleAbort = (): void => {
       if (!(ctx.signal?.reason instanceof PauseNowSignal)) lifecycleAbort.abort(ctx.signal?.reason);
