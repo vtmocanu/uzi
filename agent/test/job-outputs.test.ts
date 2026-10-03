@@ -337,6 +337,27 @@ describe("uploadJobOutputs (PRD #1909 M4 rework)", { skip: process.platform !== 
     assert.deepStrictEqual(summary.dropped, [{ display_name: "a.txt", reason: "worker_upload_failed" }]);
   });
 
+  it("never retries after a wait cut to the deadline, even when the timer fires before the clock reaches it", async () => {
+    const { work } = await workspace();
+    await fsp.writeFile(path.join(work, "outputs/a.txt"), "a");
+    const c = client(async () => {
+      throw new RequestError("POST", "/x", 503, '{"reason":"uploads_busy"}', 600_000);
+    });
+    // The injected sleep returns at once: the clock is still well before deadlineAt, which is
+    // what an early-firing timer looks like to the loop.
+    const waits: number[] = [];
+    const summary = await run(work, c.client, ["outputs/a.txt"], {
+      deadlineAt: Date.now() + 60_000,
+      sleep: async (ms: number) => {
+        waits.push(ms);
+      },
+    });
+    assert.strictEqual(c.attempts(), 1, "no second attempt before the requested Retry-After elapsed");
+    assert.strictEqual(waits.length, 1);
+    assert.ok(waits[0]! <= 60_000, "the ten-minute Retry-After was cut to the time left");
+    assert.deepStrictEqual(summary.dropped, [{ display_name: "a.txt", reason: "worker_upload_failed" }]);
+  });
+
   it("never logs an untrusted path or name raw: control and invisible characters are escaped", async () => {
     const { work } = await workspace();
     const { logger, lines } = recordingLogger();

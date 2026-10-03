@@ -331,6 +331,9 @@ export interface UploadJobOutputsArgs {
   /** Aborts the phase (checked while hashing and passed to every upload). */
   signal?: AbortSignal;
   retryDelaysMs?: readonly number[];
+  /** The retry wait; defaults to util's sleep. Injected by tests to model a timer that fires
+   *  before the wall clock reaches the deadline. */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
 /** What the upload phase did. */
@@ -490,7 +493,15 @@ async function uploadWithRetry(
       log.warn("job output upload failed", { file: logSafe(meta.display_name), attempt: attempt + 1, error: logSafe(errMessage(err)) });
       if (attempt + 1 >= OUTPUT_UPLOAD_ATTEMPTS) break;
       const wait = retryAfterMs ?? delays[attempt] ?? delays[delays.length - 1] ?? 0;
-      await sleep(Math.min(wait, Math.max(0, args.deadlineAt - Date.now())), args.signal);
+      const left = Math.max(0, args.deadlineAt - Date.now());
+      await (args.sleep ?? sleep)(Math.min(wait, left), args.signal);
+      // A wait cut to the time left ends at the deadline: stop instead of retrying. The timer
+      // can fire before Date.now() reaches deadlineAt, so the loop's own remaining<=0 check
+      // would otherwise start one more attempt before the requested wait has elapsed.
+      if (wait >= left) {
+        if (args.signal?.aborted) return { kind: "stop", reason: "the upload phase was aborted", deadline: true };
+        return { kind: "stop", reason: "the upload phase's time is spent", deadline: true };
+      }
     }
   }
   log.warn("job output file not uploaded after retries", { file: logSafe(label) });
