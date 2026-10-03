@@ -573,6 +573,41 @@ describe("issue #1828: the pre-clone reap", { skip: process.platform !== "linux"
     assert.match(String(failed?.failure_reason), /HOME-attributed reap failed: proc exploded/);
   });
 
+  it("a first claim (claim_generation 1) skips the pre-clone reap: ensureClone runs without it", TIMEOUT, async () => {
+    const { gitlab } = fakeGitlab();
+    const iid = 18354;
+    simulateCommittedWork();
+    const claim = gitlabClaim(iid, { claim_generation: 1 });
+    const { quiesceRun } = quiescentProof();
+    // An incomplete answer would fail the run if the pre-clone reap ran; later proofs are complete.
+    const reap = reapScript([COMPLETE]);
+    const spy = spyEnsureClone(reap);
+    try {
+      await runnerWith(withReap(finalizeFactory, reap), gitlab, undefined, undefined, { quiesceRun }).execute(claim);
+    } finally {
+      spy.restore();
+    }
+    assert.deepEqual(spy.reapCallsAtClone, [0], "no reap preceded the clone fetch");
+    assert.ok(statuses(claim.run_id).includes("completed"), statuses(claim.run_id).join(","));
+  });
+
+  it("a second claim (claim_generation 2) with an incomplete reap blocks before the clone", TIMEOUT, async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(18355, { claim_generation: 2 });
+    const { quiesceRun } = quiescentProof();
+    const reap = reapScript([INCOMPLETE]);
+    const spy = spyEnsureClone(reap);
+    try {
+      await runnerWith(withReap(finalizeFactory, reap), gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun }).execute(claim);
+    } finally {
+      spy.restore();
+    }
+    assert.deepEqual(spy.reapCallsAtClone, [], "ensureClone never ran");
+    const failed = lastFailed(claim.run_id);
+    assert.equal(failed?.fail_origin, "worker_residue_blocked");
+    assert.match(String(failed?.failure_reason), /HOME-attributed reap incomplete/);
+  });
+
   it("control: HOME exists and the reap is complete: it ran once before the clone, and the run proceeds", TIMEOUT, async () => {
     const { gitlab } = fakeGitlab();
     const iid = 18352;
@@ -646,7 +681,7 @@ describe("issue #1828: the no-clone quiesceRun early return", { skip: process.pl
   }
 });
 
-describe("issue #1828: the no-clone proof and the credential switch", { skip: process.platform !== "linux" }, () => {
+describe("issue #1828: the credential switch", { skip: process.platform !== "linux" }, () => {
   for (const c of BLOCKING) {
     it(`credential switch, ${c.name}: the capture is unverified, so the switch is not released`, TIMEOUT, async () => {
       const { gitlab } = fakeGitlab();
@@ -671,4 +706,38 @@ describe("issue #1828: the no-clone proof and the credential switch", { skip: pr
       assert.ok(!statuses(claim.run_id).includes("credential_switch"), "the release was never reported");
     });
   }
+});
+
+// ─── processOnly re-proof ──────────────────────────────────────────────────────────────────
+
+describe("issue #1828: the processOnly re-proof", { skip: process.platform !== "linux" }, () => {
+  it("a pause park's first proof reaps by HOME; the processOnly re-proof after the wip marker does not", TIMEOUT, async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(18395, { claim_generation: 1 });
+    const reap = reapScript([COMPLETE]);
+    const sites: Array<{ site: string; reapCalls: number }> = [];
+    const quiesceRun = async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
+      sites.push({ site: req.site ?? "", reapCalls: reap.calls() });
+      return { process: { state: "quiescent", processes: [], killed: [], detail: "" }, docker: { state: "not_wired", removed: [], detail: "" } };
+    };
+    const factory: ExecutorFactory = (runId) => ({
+      homeDir: path.join(homeDir, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          commitWork(ctx.worktreePath);
+          const at = { completedCount: 1, total: 2 };
+          const parked = await ctx.parkForPause?.(at);
+          return parked ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
+        },
+      },
+    });
+    spyPublish();
+    await runnerWith(withReap(factory, reap), gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun }).execute(claim);
+    const first = sites.find((x) => x.site === "pause_park");
+    const reproof = sites.find((x) => x.site === "pause_park:after_runner_git");
+    assert.ok(first && reproof, `both proofs ran: ${JSON.stringify(sites)}`);
+    // First claim: no pre-clone reap, so the first proof's reap is the only one so far.
+    assert.equal(first.reapCalls, 1, "the first proof reaped by HOME");
+    assert.equal(reproof.reapCalls, first.reapCalls, "the re-proof added no attributed reap");
+  });
 });

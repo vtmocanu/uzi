@@ -7561,17 +7561,25 @@ export class RunRunner {
     // phase), before the clone/fetch writes to it. An optimisation only: free-space checks cannot
     // remove races, so the typed handling around ensureClone below is the guarantee.
     await this.preflightDataVolume(claim, flight);
-    // issue #1828: a RESUMED run's HOME (agent-home/<runId>) is already on disk, and a process the
-    // pinned CLI detached during its earlier attempt can still hold it. The clone fetch below runs
+    // issue #1828: on any claim but a run's first, a process the pinned CLI detached during an
+    // earlier attempt can still hold the run's HOME (agent-home/<runId>). The clone fetch below runs
     // git children with the forge PAT in their environment, which such a survivor could read from
     // /proc, so reap the run's HOME-attributed processes first and fail closed. Placed OUTSIDE the
     // try below: a RunResidueBlockedError is a worker fault, never a forge-unreachable park, and
     // executeClaim's generic arm fails the run worker_residue_blocked with no credentialed settle.
     // The reap attributes by the `HOME=<path>` environ string, not by the directory existing, so a
-    // survivor that deleted or renamed the HOME still matches: no HOME-exists gate. A fresh run's
-    // reap returns complete and empty. Codex is excluded by the method's absence (`safety` set).
+    // survivor that deleted or renamed the HOME still matches: no HOME-exists gate. A run's first
+    // claim (claim_generation 1: ClaimRun increments from a 0 default) cannot have such a survivor,
+    // so it skips the reap; an absent, 0 or >=2 generation (an older api) still reaps, failing
+    // closed. Codex is excluded by the method's absence only.
     const executor = flight.executor;
-    if (flight.runHome && !executor.safety && process.platform === "linux" && executor.reapAttributedProcesses) {
+    if (
+      claim.claim_generation !== 1 &&
+      flight.runHome &&
+      !executor.safety &&
+      process.platform === "linux" &&
+      executor.reapAttributedProcesses
+    ) {
       let reap: RunProcessReap | { failure: string };
       try {
         reap = await executor.reapAttributedProcesses();
@@ -9536,9 +9544,10 @@ export class RunRunner {
       // below, only on Linux. It runs BEFORE the no-clone early return so a missing clone cannot
       // skip the HOME reap, and its rejection (the contract says never) reads as unverified.
       let attributedReap: RunProcessReap | { failure: string } | undefined;
-      // A processOnly re-proof follows only runner-clone git, which runs with the worker's env (not
-      // the run's HOME) and whatever it starts has its cwd in the clone, so the clone sweep in the
-      // same re-proof catches it; the sink's first proof already ran the attributed reap.
+      // A processOnly re-proof follows only runner-clone git, which runs with the worker's HOME
+      // (git.ts gitEnv), so nothing it starts carries the run's HOME unless it sets it deliberately;
+      // the sink's first proof already ran the attributed reap. A child that deliberately escapes
+      // both the clone and the HOME escapes both reaps alike (the documented worker-level residual).
       if (
         !opts.processOnly &&
         (mode === "own" || flight.predecessorCapture) &&
