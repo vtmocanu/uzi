@@ -247,11 +247,12 @@ describe("terminal execution disk deferral", () => {
     }
   }
 
-  for (const location of ["source", "proof", "report"] as const) {
+  for (const location of ["source", "proof", "post-WIP proof", "report"] as const) {
     it(`typed plan rejection raised during ${location} uses canonical failure`, async () => {
       const error = new PlanRejectedError("capture policy rejected");
       const f = fixture({ runner: { quiesceRun: async (req) => {
-        if (location === "proof" && req.site === "terminal_disk:after_runner_git") throw error;
+        if ((location === "proof" && req.site === "terminal_disk:after_runner_git")
+          || (location === "post-WIP proof" && req.site === "recovery_capture:after_runner_git")) throw error;
         return QUIESCENT;
       } } });
       if (location === "source") git.commitWipMarker = async () => { throw error; };
@@ -349,7 +350,7 @@ describe("terminal execution disk deferral", () => {
     const f = fixture(options);
     const report = client.reportState.bind(client);
     let counted = 0;
-    const records: { body: StateRequest; ack: StateAck; fail_origin?: string }[] = [];
+    const records: { body: StateRequest; ack: StateAck }[] = [];
     client.reportState = async (id, body, signal) => {
       if (body.status !== "recovery_wait") return report(id, body, signal);
       assert.equal(body.claim_generation, options.generation);
@@ -360,7 +361,7 @@ describe("terminal execution disk deferral", () => {
       api.overrideStateStatus(id, status);
       const ack = await report(id, body, signal);
       api.setOwnershipStatus(id, status, options.generation);
-      records.push({ body, ack, ...(status === "failed" ? { fail_origin: "data_volume_full" } : {}) });
+      records.push({ body, ack });
       return ack;
     };
     try {
@@ -382,7 +383,7 @@ describe("terminal execution disk deferral", () => {
       }
       assert.deepEqual(records.map((r) => r.ack.status), ["recovery_wait", "recovery_wait", "recovery_wait", "failed"]);
       assert.deepEqual(records.map((r) => r.body.claim_generation), [4, 5, 6, 7]);
-      assert.equal(records[3]!.fail_origin, "data_volume_full", "cap model stamps origin on the terminal ACK");
+      // Server origin stamping is proved by TestDiskParkCapFailsRunLiveDB, not this ACK model.
       assert.equal(api.states.filter((s) => s.body.status === "failed").length, 0, "no second generic failure report");
       assert.equal(f.forge.calls.length, 0, "no finalize/MR");
       assert.equal(fs.existsSync(f.clone()), false, "terminal cap ACK cleans up the clone");
@@ -447,6 +448,38 @@ describe("terminal execution disk deferral", () => {
       assert.equal(f.reclaims(), 0);
       assert.equal(parks().length, 0);
       assert.equal(api.states.some((s) => s.body.status === "failed"), true);
+    });
+  }
+
+  for (const [name, error] of [
+    ["plain object", { message: "command cwd escapes the worktree sandbox" }],
+    ["string", "denied by guardrail: reading the process environment is not permitted"],
+    ["string cause", new Error("wrapped", { cause: "denied by guardrail: reading the process environment is not permitted" })],
+  ] as const) {
+    it(`protects security rejection represented as ${name}`, async () => {
+      const f = fixture({ error });
+      await f.runner.execute(f.claim);
+      assert.equal(f.reclaims(), 0);
+      assert.equal(parks().length, 0);
+      assert.equal(api.states.filter((s) => s.body.status === "failed").length, 1);
+    });
+  }
+
+  for (const error of [
+    new Error("wrapped", { cause: new PlanRejectedError("capture policy rejected") }),
+    new Error("denied by guardrail: other trusted policy"),
+    { message: "command cwd escapes the worktree sandbox" },
+    new Error("wrapped", { cause: "denied by guardrail: other trusted policy" }),
+  ]) {
+    it(`propagates protected capture failure: ${String(error)}`, async () => {
+      let markers = 0;
+      git.commitWipMarker = async () => { markers++; throw error; };
+      const f = fixture();
+      await f.runner.execute(f.claim);
+      assert.equal(markers, 1, "protected failures cannot become repeated capture attempts");
+      assert.equal(f.reclaims(), 1);
+      assert.equal(parks().length, 0);
+      assert.equal(api.states.filter((s) => s.body.status === "failed").length, 1);
     });
   }
 

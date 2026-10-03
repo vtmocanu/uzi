@@ -496,6 +496,17 @@ const TERMINAL_DISK_EXCLUDED_REASONS = new Set<string>([
   "boundary process spawn failed",
 ]);
 
+function terminalDiskExcludedReason(reason: unknown): boolean {
+  return typeof reason === "string" && (failOriginForReason(reason) !== undefined
+    || TERMINAL_DISK_EXCLUDED_REASONS.has(reason)
+    || reason === REASON_QUESTION_TIMEOUT || reason === PLAN_APPROVAL_TIMEOUT_REASON
+    || reason.startsWith(`${REASON_QUESTION_NOT_PARKED} (`)
+    || reason.startsWith(`${REASON_FOLLOWUP_NOT_PARKED} (`)
+    || reason.startsWith("denied by guardrail: ")
+    || reason.startsWith("plan-gate input delivery failed: ")
+    || reason.startsWith("unexpected plan verdict: "));
+}
+
 /** Only an untyped execution failure is eligible. Bounded traversal rejects uncertain wrappers. */
 function untypedExecutionFailure(value: unknown): boolean {
   const pending = [value];
@@ -503,6 +514,7 @@ function untypedExecutionFailure(value: unknown): boolean {
   for (let visited = 0; pending.length > 0; visited++) {
     if (visited >= 8) return false;
     const current = pending.pop();
+    if (terminalDiskExcludedReason(current)) return false;
     if (current === null || typeof current !== "object") continue;
     try {
       if (seen.has(current)) return false;
@@ -511,17 +523,8 @@ function untypedExecutionFailure(value: unknown): boolean {
       if (prototype !== Error.prototype && prototype !== Object.prototype && prototype !== null) return false;
       const wrapper = current as { name?: unknown; message?: unknown; cause?: unknown; interruption?: unknown };
       if (wrapper.name !== undefined && wrapper.name !== "Error") return false;
-      if (prototype === Error.prototype) {
-        if (typeof wrapper.message !== "string") return false;
-        const reason = wrapper.message;
-        if (failOriginForReason(reason) !== undefined || TERMINAL_DISK_EXCLUDED_REASONS.has(reason)
-          || reason === REASON_QUESTION_TIMEOUT || reason === PLAN_APPROVAL_TIMEOUT_REASON
-          || reason.startsWith(`${REASON_QUESTION_NOT_PARKED} (`)
-          || reason.startsWith(`${REASON_FOLLOWUP_NOT_PARKED} (`)
-          || reason.startsWith("denied by guardrail: ")
-          || reason.startsWith("plan-gate input delivery failed: ")
-          || reason.startsWith("unexpected plan verdict: ")) return false;
-      }
+      if (prototype === Error.prototype && typeof wrapper.message !== "string") return false;
+      if (terminalDiskExcludedReason(wrapper.message)) return false;
       if (wrapper.cause !== undefined) pending.push(wrapper.cause);
       if (wrapper.interruption !== undefined) pending.push(wrapper.interruption);
     } catch {
@@ -542,8 +545,7 @@ function canonicalRecoveryInterruption(value: unknown): boolean {
     || value instanceof GateInputDeliveryError || value instanceof PlanRejectedError
     || value instanceof PushSecretBlockedSignal || value instanceof ScratchPublicationError
     || value instanceof HistoryRewrittenError || codexDeferralOf(value) !== undefined
-    || (value instanceof Error && (TERMINAL_DISK_EXCLUDED_REASONS.has(value.message)
-      || failOriginForReason(value.message) !== undefined));
+    || !untypedExecutionFailure(value);
 }
 
 interface ExecutionRejection {
@@ -4218,25 +4220,7 @@ export class RunRunner {
     return true;
   }
 
-  /**
-   * PRD #1809 D6 — run `op`, a write whose destination is `destination`; when it fails and the
-   * data-volume guard classifies the failure as data-volume disk-full, run the D7 reclaim once and
-   * retry `op` once. A retry that is still classified full throws {@link DataVolumeFullError}
-   * (executeClaim parks the run on it); any other failure, and an "unknown" or "not_disk_full"
-   * verdict, rethrows the error unchanged, so the caller keeps today's handling. With no guard
-   * wired this is just `op()`.
-   *
-   * Each attempt samples the volume BEFORE `op` and classifies with the lower of that sample and
-   * the one taken after the failure (N1): git removes a failed cold clone's partial bare before it
-   * returns, so the after-failure sample alone can show room the failing write never had.
-   *
-   * The reclaim wait is bounded and abortable ({@link awaitDataVolumeReclaim}). On a timeout the
-   * retry still runs. When the owner cancels the run during the wait, the retry is skipped and the
-   * full verdict already in hand parks the run: the park is claim-fenced, and a stamped stop
-   * verdict turns it into a cancel server-side. A worker shutdown or any other abort of the flight
-   * (a pause, a credential switch, a claim fence) ends the wait by throwing to that reason's own
-   * handling instead, never a counted disk park.
-   */
+  /** Recheck higher-priority interruptions throughout the terminal-failure policy. */
   private terminalDiskInterruption(flight: RunFlight): void {
     if (flight.steering.claimFence() !== undefined) {
       flight.preserveRecoveryClone = false;
@@ -4318,6 +4302,25 @@ export class RunRunner {
     }
   }
 
+  /**
+   * PRD #1809 D6 — run `op`, a write whose destination is `destination`; when it fails and the
+   * data-volume guard classifies the failure as data-volume disk-full, run the D7 reclaim once and
+   * retry `op` once. A retry that is still classified full throws {@link DataVolumeFullError}
+   * (executeClaim parks the run on it); any other failure, and an "unknown" or "not_disk_full"
+   * verdict, rethrows the error unchanged, so the caller keeps today's handling. With no guard
+   * wired this is just `op()`.
+   *
+   * Each attempt samples the volume BEFORE `op` and classifies with the lower of that sample and
+   * the one taken after the failure (N1): git removes a failed cold clone's partial bare before it
+   * returns, so the after-failure sample alone can show room the failing write never had.
+   *
+   * The reclaim wait is bounded and abortable ({@link awaitDataVolumeReclaim}). On a timeout the
+   * retry still runs. When the owner cancels the run during the wait, the retry is skipped and the
+   * full verdict already in hand parks the run: the park is claim-fenced, and a stamped stop
+   * verdict turns it into a cancel server-side. A worker shutdown or any other abort of the flight
+   * (a pause, a credential switch, a claim fence) ends the wait by throwing to that reason's own
+   * handling instead, never a counted disk park.
+   */
   private async withDataVolumeRetry<T>(
     flight: RunFlight,
     operation: string,
@@ -9758,8 +9761,12 @@ export class RunRunner {
   }
 
   /** {@link reproveAfterRunnerGit}, returning the blocked proof's detail (undefined when quiescent). */
-  private async reproveDetailAfterRunnerGit(flight: RunFlight, site: string): Promise<string | undefined> {
-    const q = await this.quiesceRun(flight, flight.executor, { mode: "own", site: `${site}:after_runner_git`, processOnly: true });
+  private async reproveDetailAfterRunnerGit(
+    flight: RunFlight, site: string, opts: { propagateControl?: boolean } = {},
+  ): Promise<string | undefined> {
+    const q = await this.quiesceRun(flight, flight.executor, {
+      mode: "own", site: `${site}:after_runner_git`, processOnly: true, ...opts,
+    });
     return q.blocked ? (q.outcome.process?.detail ?? "not quiescent") : undefined;
   }
 
@@ -13026,7 +13033,7 @@ export class RunRunner {
     }
     // issue #1783 (auditor M1): re-prove after the status read / marker (either can start an agent-
     // planted filter) and before the fetch-back, the overlay's PAT fetch and the publish.
-    const reproofDetail = await this.reproveDetailAfterRunnerGit(flight, site);
+    const reproofDetail = await this.reproveDetailAfterRunnerGit(flight, site, { propagateControl: opts.terminalDisk });
     if (opts.terminalDisk) this.terminalDiskInterruption(flight);
     if (reproofDetail !== undefined) {
       runLog.warn("recovery capture: clone not provably quiescent after the WIP marker; nothing captured or published", { site });
