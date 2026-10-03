@@ -7,8 +7,9 @@
 #   other when it can: a run's mr_iid -> PR; a PR -> the newest non-rework uzi run that
 #   opened it. --repo defaults to the checkout's origin (gh repo view).
 #   Unless --no-claim, an open PR is CLAIMED for this session (claims.sh) so other landers
-#   see it; a PR, or a run-<RUN_ID> dispatch claim, another live session holds stops here
-#   with NEXT=claimed_by_other. Claiming the PR releases the run-<RUN_ID> key.
+#   see it, and a resolved run's run-<RUN_ID> key is claimed first (under its lock); either
+#   held by another live session stops here with NEXT=claimed_by_other. Claiming the PR
+#   releases the run key if it is still ours.
 #
 # SKILL_SCRIPTS_STALE=1 means these scripts differ from the local origin/main ref (a stale
 # checkout, or a local edit): rerun from a fresh detached origin/main worktree.
@@ -57,7 +58,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --repo) REPO="${2:?}"; shift 2;;
     --no-claim) CLAIM=0; shift;;
-    -h|--help) sed -n '2,43p' "$0"; exit 3;;
+    -h|--help) sed -n '2,44p' "$0"; exit 3;;
     -*) echo "unknown flag: $1" >&2; exit 3;;
     *) if [ -z "$TARGET" ]; then TARGET="$1"; else echo "unexpected arg: $1" >&2; exit 3; fi; shift;;
   esac
@@ -125,9 +126,14 @@ if [ -n "$run_json" ]; then
   report_mr_rework "$rw_json"
   RUN_KEY="run-$(printf '%s' "$run_json" | jq -r '.id')"
   # The dispatching session claims run-<RUN_ID> (uzi-watcher hand-off): it lands its own run.
-  if [ "$CLAIM" -eq 1 ] && ! rk_out=$("$HERE/claims.sh" held "$RUN_KEY" 2>&1); then
+  # Take the key under its lock (claims.sh claim), so two takeovers of one run cannot both
+  # proceed; another live session's key stops here.
+  if [ "$CLAIM" -eq 1 ]; then
+    if ! rk_out=$("$HERE/claims.sh" claim "$RUN_KEY" --repo "$REPO" 2>&1); then
+      printf '%s\n' "$rk_out"
+      echo "NEXT=claimed_by_other"; exit 4
+    fi
     printf '%s\n' "$rk_out"
-    echo "NEXT=claimed_by_other"; exit 4
   fi
   run_status=$(printf '%s' "$run_json" | jq -r '.status')
   case "$run_status" in
@@ -399,9 +405,10 @@ if [ "$CLAIM" -eq 1 ]; then
     echo "NEXT=claimed_by_other"; exit 4
   fi
   printf '%s\n' "$cl_out"
-  # The PR claim supersedes this session's (or a dead owner's) dispatch-time run claim.
-  if [ -n "$RUN_KEY" ] && "$HERE/claims.sh" show "$RUN_KEY" > /dev/null 2>&1; then
-    "$HERE/claims.sh" release "$RUN_KEY"
+  # The PR claim supersedes this session's run claim. --if-mine checks ownership under the
+  # key's lock, so a key another session took meanwhile is never deleted.
+  if [ -n "$RUN_KEY" ]; then
+    "$HERE/claims.sh" release "$RUN_KEY" --if-mine || true
   fi
 fi
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# orphans.sh — which uzi run PRs and in-flight runs have nobody landing them.
+# orphans.sh: which uzi run PRs and in-flight runs have nobody landing them.
 #
 # Usage: orphans.sh [--repo OWNER/REPO] [--json]
 #
@@ -11,8 +11,8 @@
 #   claimed             '#<PR>' held by a live or unverifiable session: message the owner
 #   originator-claimed  'run-<RUN_ID>' held by a live or unverifiable session: it lands it
 #   orphan              no claim, or only a dead owner's: ask (references/orphans.md), then claim
-# Liveness is claims.sh's (session-peers registry, else the last_seen TTL); an unverifiable
-# owner is never an orphan.
+# Liveness is the session-peers registry alone (claims.sh registry_live): an owner it cannot
+# verify is never an orphan, however old its last heartbeat.
 #
 # Exit: 0 table printed; 2 usage; 3 a lookup failed or was unreadable (gh, uzi, claims):
 # nothing is printed, so an unknown is never reported as an orphan.
@@ -40,21 +40,21 @@ repo_id=$(printf '%s' "$repos" | jq -er --arg p "$REPO" '[.[]|select(.path_with_
   || die "repo $REPO not found in uzi repo list"
 runs=$(uzi run list --json 2>/dev/null) || die "uzi run list failed"
 printf '%s' "$runs" | jq -e 'type=="array"' >/dev/null 2>&1 || die "uzi run list unreadable"
-claims=$("$HERE/claims.sh" list --json 2>/dev/null) || die "claims.sh list failed"
+claims=$("$HERE/claims.sh" list --json 2>/dev/null) || die "claims.sh list failed (an unreadable claim file?)"
 printf '%s' "$claims" | jq -e 'type=="array"' >/dev/null 2>&1 || die "claims.sh list unreadable"
 
 rows=$(jq -n --argjson prs "$prs" --argjson runs "$runs" --argjson claims "$claims" --arg repo "$repo_id" '
   def claim($k): [$claims[]|select(.key==$k)]|first;
   def verdict($pc; $rc):
-    if $pc != null and $pc.live != "dead" then "claimed"
-    elif $rc != null and $rc.live != "dead" then "originator-claimed"
+    if $pc != null and $pc.registry_live != "dead" then "claimed"
+    elif $rc != null and $rc.registry_live != "dead" then "originator-claimed"
     else "orphan" end;
   def row($pr; $title; $r):
     (claim(if $pr == null then "" else "#\($pr)" end)) as $pc
     | (if $r == null then null else claim("run-\($r.id)") end) as $rc
     | ($pc // $rc) as $c
     | {pr:$pr, run:($r.id // null), issue:($r.issue_iid // null), status:($r.status // null),
-       title:$title, claim:($c.key // null), owner:($c.owner // null), live:($c.live // null),
+       title:$title, claim:($c.key // null), owner:($c.owner // null), live:($c.registry_live // null),
        verdict:verdict($pc; $rc)};
   ($runs|map(select(.repo_id==$repo))) as $mine
   | ($prs|map(select(.headRefName|test("^(agent|uzi)/")))) as $runprs

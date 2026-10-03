@@ -44,7 +44,7 @@ case "$*" in
   "run get h-live --field status") echo running ;;
   "run get i-merged --field status") echo completed ;;
   "run get i-merged --field mr_iid") echo 70 ;;
-  "run get j-unreadable --field status") exit 6 ;;
+  "run get j-unreadable --field status"|"run get j2-unreadable --field status") exit 6 ;;
   *) echo "unexpected uzi call: $*" >&2; exit 99 ;;
 esac
 STUB
@@ -60,14 +60,15 @@ export PATH="$WORK/bin:$PATH" UZI_LANDER_STATE_DIR="$WORK/state" SESSION_PEERS_P
 export SESSION_PEERS_NAME=me SESSION_PEERS_UUID=uuid-me SESSION_PEERS_KIND=claude
 CL="$WORK/state/claims"
 now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-seed() {  # seed KEY OWNER UUID [PR]
+stale=2026-01-01T00:00:00Z   # far past the 6 h TTL
+seed() {  # seed KEY OWNER UUID [PR] [LAST_SEEN]
   printf '{"key":"%s","repo":"test/repo","pr":%s,"owner":"%s","owner_uuid":"%s","kind":"claude","priority":0,"size_files":0,"depends_on":[],"last_seen":"%s","state":""}\n' \
-    "$1" "${4:-null}" "$2" "$3" "$now" > "$CL/$1.json"
+    "$1" "${4:-null}" "$2" "$3" "${5:-$now}" > "$CL/$1.json"
 }
 seed '#10' other uuid-other 10
 seed 'run-bbbbbbbb-1' other uuid-other
 seed '#14' ghost uuid-gone 14
-seed '#15' unverified unknown-host-1 15
+seed '#15' unverified unknown-host-1 15 "$stale"   # stale heartbeat, owner unverifiable
 
 bash "$HERE/orphans.sh" --repo test/repo --json > "$WORK/o.json" 2> "$WORK/o.err" || fail "orphans exited $?: $(cat "$WORK/o.err")"
 v() { jq -r --arg k "$1" '[.[]|select((.pr|tostring)==$k or .run==$k)]|if length==1 then .[0].verdict else "rows=\(length)" end' "$WORK/o.json"; }
@@ -76,7 +77,7 @@ want 10 claimed
 want 11 originator-claimed           # the mr_rework run is not the PR's run
 want 12 orphan
 want 14 orphan                       # only a dead owner's claim
-want 15 claimed                      # unverifiable owner: never an orphan
+want 15 claimed                      # unverifiable owner: never an orphan, however stale
 want dddddddd-1 orphan               # in-flight run, no PR yet
 [ "$(jq '[.[]|select(.pr==13)]|length' "$WORK/o.json")" = 0 ] || fail "renovate PR listed"
 for r in dddddddd-2 dddddddd-3 dddddddd-4; do
@@ -93,6 +94,23 @@ for f in UZI_FAIL GH_FAIL; do
   [ ! -s "$WORK/fc.out" ] || fail "$f: printed rows on a failed lookup: $(cat "$WORK/fc.out")"
 done
 
+# Fail closed: a corrupt claim file is never read as "no claim".
+printf '{"key":"#10",' > "$CL/#10.json"
+rc=0; bash "$HERE/orphans.sh" --repo test/repo > "$WORK/corrupt.out" 2> /dev/null || rc=$?
+[ "$rc" = 3 ] || fail "corrupt claim: exit $rc, want 3: $(cat "$WORK/corrupt.out")"
+[ ! -s "$WORK/corrupt.out" ] || fail "corrupt claim: printed rows: $(cat "$WORK/corrupt.out")"
+rc=0; bash "$HERE/claims.sh" list --json > /dev/null 2>&1 || rc=$?
+[ "$rc" = 3 ] || fail "claims.sh list on a corrupt claim: exit $rc, want 3"
+
+# A run key's unverifiable owner is never taken over on the TTL (no heartbeat while the run
+# implements); a '#PR' key keeps the documented TTL takeover.
+rm -f "$CL"/*.json
+seed run-x-1 unverified unknown-host-1 null "$stale"
+rc=0; bash "$HERE/claims.sh" claim run-x-1 > "$WORK/rk.out" 2>&1 || rc=$?
+[ "$rc" = 4 ] || fail "run key: stale unverifiable owner taken over (exit $rc): $(cat "$WORK/rk.out")"
+seed '#20' unverified unknown-host-1 20 "$stale"
+bash "$HERE/claims.sh" claim '#20' > "$WORK/pk.out" 2>&1 || fail "#PR key: TTL takeover refused: $(cat "$WORK/pk.out")"
+
 # claims.sh reap: a finished run key goes, a live or unreadable one stays.
 rm -f "$CL"/*.json
 seed run-g-done other uuid-other
@@ -100,8 +118,9 @@ seed run-h-live other uuid-other
 seed run-i-merged other uuid-other
 seed run-j-unreadable other uuid-other
 seed run-k-dead ghost uuid-gone
+seed run-j2-unreadable unverified unknown-host-1 null "$stale"
 bash "$HERE/claims.sh" reap --repo test/repo > "$WORK/reap.out" 2>&1 || fail "reap exited $?: $(cat "$WORK/reap.out")"
 for k in run-g-done run-i-merged run-k-dead; do [ ! -f "$CL/$k.json" ] || fail "reap kept $k: $(cat "$WORK/reap.out")"; done
-for k in run-h-live run-j-unreadable; do [ -f "$CL/$k.json" ] || fail "reap dropped $k: $(cat "$WORK/reap.out")"; done
+for k in run-h-live run-j-unreadable run-j2-unreadable; do [ -f "$CL/$k.json" ] || fail "reap dropped $k: $(cat "$WORK/reap.out")"; done
 
-echo "PASS orphans: run PRs and in-flight runs classified by #PR / run-<RUN_ID> claim, fail-closed; reap drops finished run keys"
+echo "PASS orphans: run PRs and in-flight runs classified by #PR / run-<RUN_ID> claim, fail-closed incl. a corrupt claim; unverifiable owners are never orphaned or reaped; reap drops finished run keys"

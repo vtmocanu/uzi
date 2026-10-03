@@ -9,7 +9,8 @@ them and settles who lands each. `S` is `.agents/skills/uzi-lander/scripts/`.
   run's quirks. `uzi-watcher` claims `run-<RUN_ID>` at hand-off; `takeover.sh` stops any
   other session at `NEXT=claimed_by_other` and converts the owner's key to `#<PR>`.
 - **An orphan goes to whoever asks first.** A run is an orphan when it has no claim, or
-  only a dead owner's, and its dispatching session is gone or declines.
+  only a dead owner's (registry-confirmed: an owner the registry cannot verify is not
+  dead), and its dispatching session is gone or declines.
 
 ## 1. Discover
 

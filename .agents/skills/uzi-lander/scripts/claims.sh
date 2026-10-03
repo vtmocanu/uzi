@@ -13,10 +13,11 @@
 #   claims.sh claim <key> [--repo O/R] [--pr N] [--size FILES] [--lines N] [--priority N]
 #                         [--depends-on '#a,#b'] [--note TEXT] [--as NAME --uuid UUID --kind K] [--force]
 #   claims.sh release <key> [--purge]      # --purge also drops the trail (after a merge)
+#   claims.sh release <key> --if-mine      # under the key's lock: drop it only if THIS session owns it
 #   claims.sh touch <key> [--state TEXT]   # heartbeat + last state (trail.sh calls this)
 #   claims.sh show <key>
-#   claims.sh held <key>                   # exit 4 + CLAIM_HELD_BY when ANOTHER live (or unverifiable) session holds it
-#   claims.sh list [--json] [--all]        # this repo's claims, priority-desc; --all = every state dir key
+#   claims.sh list [--json] [--all]        # this repo's claims, priority-desc; --all = every state dir key;
+#                                          # exit 3 on an unreadable claim file (never a silent drop)
 #   claims.sh reap [--repo O/R] [--dry-run] # drop terminal/dead claims and stale orphan trails
 #   claims.sh whoami
 #
@@ -24,6 +25,12 @@
 # dispatching session claims it, so the board names the run's lander; takeover.sh converts
 # it to '#<PR>'). reap drops a run key whose owner is dead, or whose run is terminal with no
 # PR or a merged/closed one; an unreadable run lookup keeps it.
+#
+# Liveness: the session-peers registry. A '#<PR>' claim whose owner the registry cannot
+# verify is treated as dead after STALE_HOURS without a heartbeat (trail.sh bumps it). A
+# run-<RUN_ID> claim gets no heartbeat while its run implements, so for it unknown stays
+# unknown: never taken over, never reaped. `list --json` carries both `live` (the rule
+# above) and `registry_live` (the registry alone).
 #
 # Priority: sessions decide. The default is the PR's file count (bigger first), because
 # CodeRabbit reviews are the scarce resource and are worth spending on the large PRs; a
@@ -35,15 +42,15 @@
 #   0  ok
 #   2  usage
 #   3  error (state dir, jq, gh)
-#   4  claim/held: held by ANOTHER LIVE session (its name/uuid printed: message it, do not
-#      steal; claim --force takes it anyway, say why in the trail)
+#   4  claim: held by ANOTHER LIVE session (its name/uuid printed: message it, do not steal;
+#      --force takes it anyway, say why in the trail); release --if-mine: not ours, kept
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/state.sh
 . "$HERE/lib/state.sh"
 
-usage() { sed -n '2,39p' "$0" >&2; exit 2; }
+usage() { sed -n '2,46p' "$0" >&2; exit 2; }
 [ $# -ge 1 ] || usage
 verb=$1; shift
 
@@ -51,14 +58,36 @@ key_check() { case "$1" in ""|*/*) echo "bad key '$1' (non-empty, no '/')" >&2; 
 SD=$(state_dir) || exit 3
 CL="$SD/claims"
 
-# owner_live <uuid> -> prints live|dead|unknown ; a dead-or-stale claim may be taken over.
+# registry_live <uuid> -> live|dead|unknown from the session-peers registry alone.
+registry_live() {
+  local rc
+  is_live "$1"; rc=$?
+  case "$rc" in 0) echo live;; 1) echo dead;; *) echo unknown;; esac
+}
+
+# owner_live <uuid> <file> -> live|dead|unknown ; a dead-or-stale claim may be taken over.
+# The last_seen TTL applies to '#<PR>' claims only (see the header).
 owner_live() {
-  local u="$1" ls rc
-  is_live "$u"; rc=$?
-  if [ "$rc" -eq 0 ]; then echo live; return; fi
-  if [ "$rc" -eq 1 ]; then echo dead; return; fi
+  local u="$1" ls st
+  st=$(registry_live "$u")
+  if [ "$st" != unknown ]; then echo "$st"; return; fi
+  case "${2##*/}" in run-*) echo unknown; return;; esac
   ls=$(jq -r '.last_seen // ""' "$2" 2>/dev/null)
   if [ -n "$ls" ] && [ "$(( $(date +%s) - $(iso2epoch "$ls") ))" -gt "$(( STALE_HOURS * 3600 ))" ]; then echo dead; else echo unknown; fi
+}
+
+# key_lock <key>: take the per-key mkdir lock (atomic on POSIX); released on exit. A lock
+# older than 60 s belongs to a crashed holder and is broken. Exit 3 when it stays busy.
+key_lock() {
+  lock="$CL/.lock.$1"; local got=0 lage
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if mkdir "$lock" 2>/dev/null; then got=1; break; fi
+    lage=$(( $(date +%s) - $(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || date +%s) ))
+    [ "$lage" -gt 60 ] && rm -rf "$lock"
+    sleep 0.3
+  done
+  [ "$got" -eq 1 ] || { echo "claim lock busy for $1; retry" >&2; exit 3; }
+  trap 'rm -rf "$lock"' EXIT
 }
 
 case "$verb" in
@@ -80,18 +109,9 @@ case "$verb" in
     done
     me=$(self_identity "$as" "$uuid" "$kind"); my_name=$(printf '%s' "$me" | cut -f1); my_uuid=$(printf '%s' "$me" | cut -f2); my_kind=$(printf '%s' "$me" | cut -f3)
     f="$CL/$key.json"
-    # Acquisition is serialised per key with a mkdir lock (atomic on POSIX): two fresh claims
-    # cannot both succeed, the check-then-write below runs under it. A lock older than 60 s
-    # belongs to a crashed claimer and is broken.
-    lock="$CL/.lock.$key"; got=0
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-      if mkdir "$lock" 2>/dev/null; then got=1; break; fi
-      lage=$(( $(date +%s) - $(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || date +%s) ))
-      [ "$lage" -gt 60 ] && rm -rf "$lock"
-      sleep 0.3
-    done
-    [ "$got" -eq 1 ] || { echo "claim lock busy for $key; retry" >&2; exit 3; }
-    trap 'rm -rf "$lock"' EXIT
+    # Acquisition is serialised per key: two fresh claims cannot both succeed, the
+    # check-then-write below runs under the key's lock.
+    key_lock "$key"
     if [ -f "$f" ]; then
       o_uuid=$(jq -r '.owner_uuid // ""' "$f"); o_name=$(jq -r '.owner // ""' "$f")
       if [ "$o_uuid" != "$my_uuid" ] && [ "$force" -eq 0 ]; then
@@ -109,7 +129,7 @@ case "$verb" in
     tmp=$(mktemp "$CL/.tmp.XXXXXX")
     jq -n --arg key "$key" --arg repo "$repo" --arg pr "$pr" --arg owner "$my_name" --arg uuid "$my_uuid" --arg kind "$my_kind" \
           --arg now "$(now_iso)" --argjson size "${size:-0}" --argjson lines "${lines:-0}" --argjson prio "$prio" \
-          --argjson deps "$deps_json" --arg note "$note" \
+          --argjson deps "$deps_json" --arg note "${note:-$( [ -f "$f" ] && jq -r '.note // ""' "$f" || true)}" \
           --arg prev_claimed "$( [ -f "$f" ] && jq -r '.claimed_at // ""' "$f" || true)" \
           --arg prev_state "$( [ -f "$f" ] && jq -r '.state // ""' "$f" || true)" '
       {key:$key, repo:$repo, pr:(if $pr=="" then null else ($pr|tonumber) end), owner:$owner, owner_uuid:$uuid, kind:$kind,
@@ -120,6 +140,14 @@ case "$verb" in
 
   release)
     key=${1:-}; key_check "$key"; shift
+    if [ "${1:-}" = "--if-mine" ]; then
+      key_lock "$key"
+      f="$CL/$key.json"; [ -f "$f" ] || { echo "RELEASED=$key (absent)"; exit 0; }
+      my_uuid=$(self_identity | cut -f2)
+      o_uuid=$(jq -r '.owner_uuid // ""' "$f" 2>/dev/null) || { echo "unreadable claim $f" >&2; exit 3; }
+      if [ "$o_uuid" != "$my_uuid" ]; then echo "KEPT=$key (held by $(jq -r '.owner // ""' "$f"))"; exit 4; fi
+      rm -f "$f"; echo "RELEASED=$key"; exit 0
+    fi
     purge=0; [ "${1:-}" = "--purge" ] && purge=1
     rm -f "$CL/$key.json"
     suffix=""
@@ -134,26 +162,21 @@ case "$verb" in
     jq --arg now "$(now_iso)" --arg s "$state" '.last_seen=$now | if $s!="" then .state=$s else . end' "$f" > "$tmp" && mv -f "$tmp" "$f"
     exit 0;;
 
-  held)
-    key=${1:-}; key_check "$key"; shift
-    f="$CL/$key.json"; [ -f "$f" ] || exit 0
-    me=$(self_identity); my_uuid=$(printf '%s' "$me" | cut -f2)
-    o_uuid=$(jq -r '.owner_uuid // ""' "$f"); o_name=$(jq -r '.owner // ""' "$f")
-    [ "$o_uuid" = "$my_uuid" ] && exit 0
-    st=$(owner_live "$o_uuid" "$f")
-    [ "$st" = dead ] && exit 0
-    echo "CLAIM_HELD_BY=$o_name"; echo "CLAIM_HELD_UUID=$o_uuid"; echo "CLAIM_OWNER_LIVENESS=$st"; echo "CLAIM_KEY=$key"
-    exit 4;;
-
   show)
     key=${1:-}; key_check "$key"
     [ -f "$CL/$key.json" ] && cat "$CL/$key.json" || { echo "no claim for $key"; exit 1; };;
 
   list)
     json=0; [ "${1:-}" = "--json" ] && json=1
-    rows=$(for f in "$CL"/*.json; do [ -f "$f" ] || continue
-      u=$(jq -r '.owner_uuid' "$f"); l=$(owner_live "$u" "$f")
-      jq -c --arg live "$l" '. + {live:$live}' "$f"; done | jq -s 'sort_by(-.priority)')
+    rows=""
+    for f in "$CL"/*.json; do [ -f "$f" ] || continue
+      u=$(jq -er '.owner_uuid | strings' "$f" 2>/dev/null) || { echo "unreadable claim file $f" >&2; exit 3; }
+      l=$(owner_live "$u" "$f"); r=$(registry_live "$u")
+      row=$(jq -c --arg live "$l" --arg reg "$r" '. + {live:$live, registry_live:$reg}' "$f" 2>/dev/null) \
+        || { echo "unreadable claim file $f" >&2; exit 3; }
+      rows="$rows$row"$'\n'
+    done
+    rows=$(printf '%s' "$rows" | jq -s 'sort_by(-(.priority // 0))') || { echo "claims unreadable" >&2; exit 3; }
     if [ "$json" -eq 1 ]; then printf '%s\n' "$rows"; exit 0; fi
     printf '%-9s %-22s %-8s %-4s %-6s %-9s %-14s %s\n' KEY OWNER KIND PRIO FILES LIVE DEPENDS_ON STATE
     printf '%s' "$rows" | jq -r '.[]|[.key, .owner, .kind, (.priority|tostring), (.size_files|tostring), .live, (.depends_on|join(",")|if .=="" then "-" else . end), (.state|if .=="" then "-" else . end)]|@tsv' \
