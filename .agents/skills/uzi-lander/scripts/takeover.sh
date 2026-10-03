@@ -402,6 +402,8 @@ echo "SIZE_FILES=$n_files"; echo "SIZE_LINES=$n_lines"
 if [ "$CLAIM" -eq 1 ]; then
   if ! cl_out=$("$HERE/claims.sh" claim "#$PR" --repo "$REPO" --pr "$PR" --size "$n_files" --lines "$n_lines" 2>&1); then
     printf '%s\n' "$cl_out"
+    # Do not strand the run key: the PR's lander owns this run now.
+    [ -n "$RUN_KEY" ] && { "$HERE/claims.sh" release "$RUN_KEY" --if-mine > /dev/null 2>&1 || true; }
     echo "NEXT=claimed_by_other"; exit 4
   fi
   printf '%s\n' "$cl_out"

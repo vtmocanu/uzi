@@ -52,6 +52,7 @@ STUB
 # `python3 peers.py list --json`; a python3 stub serves it, so the test needs no Python.
 cat > "$WORK/bin/python3" <<'STUB'
 #!/usr/bin/env bash
+[ -n "${REGISTRY:-}" ] && { echo "$REGISTRY"; exit 0; }
 echo '{"claude":[{"sessionId":"uuid-me","name":"me","socket":"/x"},{"sessionId":"uuid-other","name":"other","socket":"/y"}],"codex":[],"codex_schema_recognised":true}'
 STUB
 : > "$WORK/peers.py"
@@ -102,6 +103,17 @@ rc=0; bash "$HERE/orphans.sh" --repo test/repo > "$WORK/corrupt.out" 2> /dev/nul
 rc=0; bash "$HERE/claims.sh" list --json > /dev/null 2>&1 || rc=$?
 [ "$rc" = 3 ] || fail "claims.sh list on a corrupt claim: exit $rc, want 3"
 
+# A claim missing its required fields is unreadable too.
+printf '{"owner_uuid":"uuid-other"}\n' > "$CL/#10.json"
+rc=0; bash "$HERE/orphans.sh" --repo test/repo > "$WORK/partial.out" 2> /dev/null || rc=$?
+[ "$rc" = 3 ] && [ ! -s "$WORK/partial.out" ] || fail "partial claim: exit $rc: $(cat "$WORK/partial.out")"
+
+# A malformed registry ({}) proves nothing: a listed owner's claim is never an orphan.
+rm -f "$CL"/*.json
+seed '#10' other uuid-other 10
+REGISTRY='{}' bash "$HERE/orphans.sh" --repo test/repo --json > "$WORK/o.json" 2> /dev/null || fail "registry {}: exit $?"
+want 10 claimed
+
 # A run key's unverifiable owner is never taken over on the TTL (no heartbeat while the run
 # implements); a '#PR' key keeps the documented TTL takeover.
 rm -f "$CL"/*.json
@@ -119,8 +131,9 @@ seed run-i-merged other uuid-other
 seed run-j-unreadable other uuid-other
 seed run-k-dead ghost uuid-gone
 seed run-j2-unreadable unverified unknown-host-1 null "$stale"
+printf '{"key":' > "$CL/run-z-corrupt.json"
 bash "$HERE/claims.sh" reap --repo test/repo > "$WORK/reap.out" 2>&1 || fail "reap exited $?: $(cat "$WORK/reap.out")"
 for k in run-g-done run-i-merged run-k-dead; do [ ! -f "$CL/$k.json" ] || fail "reap kept $k: $(cat "$WORK/reap.out")"; done
-for k in run-h-live run-j-unreadable run-j2-unreadable; do [ -f "$CL/$k.json" ] || fail "reap dropped $k: $(cat "$WORK/reap.out")"; done
+for k in run-h-live run-j-unreadable run-j2-unreadable run-z-corrupt; do [ -f "$CL/$k.json" ] || fail "reap dropped $k: $(cat "$WORK/reap.out")"; done
 
 echo "PASS orphans: run PRs and in-flight runs classified by #PR / run-<RUN_ID> claim, fail-closed incl. a corrupt claim; unverifiable owners are never orphaned or reaped; reap drops finished run keys"

@@ -108,4 +108,15 @@ has steal 'CLAIMED=#42 OWNER=me'
 [ "$(jq -r .owner_uuid "$CL/run-run-1.json")" = uuid-other ] || fail "steal: run key owner changed"
 rm -f "$CL"/*.json
 
+# 7. The PR is another live session's: the run key this takeover just took is released, so
+# it never blocks the PR's lander on its next takeover.
+rm -f "$CL"/*.json
+printf '{"key":"#42","repo":"test/repo","pr":42,"owner":"other","owner_uuid":"uuid-other","kind":"claude","last_seen":"%s","state":""}\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$CL/#42.json"
+export RUN_STATUS=completed RUN_PR=42
+snap strand run-1
+has strand 'NEXT=claimed_by_other'; rc_is strand 4
+[ ! -f "$CL/run-run-1.json" ] || fail "strand: run key left behind: $(cat "$CL/run-run-1.json")"
+rm -f "$CL"/*.json
+
 echo "PASS takeover-run-claim: a live dispatcher's run-<RUN_ID> claim stops other landers; an own or dead one converts to the PR claim; acquisition and conversion are serialised"

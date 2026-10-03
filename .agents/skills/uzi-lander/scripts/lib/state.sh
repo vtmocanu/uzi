@@ -72,11 +72,13 @@ self_identity() {
 # verify: `codex_schema_recognised=false`, `codex_unverified`, `claude_unverified`). Being
 # listed is positive evidence and wins; being ABSENT proves death only when the registry
 # is verified, otherwise it is unknown, so an unverifiable live owner is never "dead" and
-# its claim or merge lock is never stolen on that basis.
+# its claim or merge lock is never stolen on that basis. A registry without `claude` and
+# `codex` arrays is malformed, so absence from it is unknown too.
 is_live() {
   local pj n unver
   case "$1" in unknown-*) return 2;; esac
   pj=$(peers_json); [ -n "$pj" ] || return 2
+  printf '%s' "$pj" | jq -e '(.claude|type)=="array" and (.codex|type)=="array"' >/dev/null 2>&1 || return 2
   n=$(printf '%s' "$pj" | jq -r --arg u "$1" \
     '([.claude[]?|select(.sessionId==$u)] + [.codex[]?|select(.id==$u and .holder_pid!=null)])|length' 2>/dev/null) || return 2
   [ "${n:-0}" -gt 0 ] && return 0

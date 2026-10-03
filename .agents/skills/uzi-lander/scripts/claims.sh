@@ -58,6 +58,13 @@ key_check() { case "$1" in ""|*/*) echo "bad key '$1' (non-empty, no '/')" >&2; 
 SD=$(state_dir) || exit 3
 CL="$SD/claims"
 
+# claim_ok <file>: the claim parses and carries a non-empty key and owner_uuid and a string
+# owner. A claim that fails is unknown: list exits 3, reap keeps it, claim/release refuse.
+claim_ok() {
+  jq -e '(.key|type)=="string" and (.key|length)>0 and (.owner_uuid|type)=="string"
+         and (.owner_uuid|length)>0 and (.owner|type)=="string"' "$1" >/dev/null 2>&1
+}
+
 # registry_live <uuid> -> live|dead|unknown from the session-peers registry alone.
 registry_live() {
   local rc
@@ -113,6 +120,7 @@ case "$verb" in
     # check-then-write below runs under the key's lock.
     key_lock "$key"
     if [ -f "$f" ]; then
+      claim_ok "$f" || { echo "unreadable claim file $f: fix or remove it by hand" >&2; exit 3; }
       o_uuid=$(jq -r '.owner_uuid // ""' "$f"); o_name=$(jq -r '.owner // ""' "$f")
       if [ "$o_uuid" != "$my_uuid" ] && [ "$force" -eq 0 ]; then
         st=$(owner_live "$o_uuid" "$f")
@@ -144,7 +152,8 @@ case "$verb" in
       key_lock "$key"
       f="$CL/$key.json"; [ -f "$f" ] || { echo "RELEASED=$key (absent)"; exit 0; }
       my_uuid=$(self_identity | cut -f2)
-      o_uuid=$(jq -r '.owner_uuid // ""' "$f" 2>/dev/null) || { echo "unreadable claim $f" >&2; exit 3; }
+      claim_ok "$f" || { echo "unreadable claim $f" >&2; exit 3; }
+      o_uuid=$(jq -r '.owner_uuid' "$f")
       if [ "$o_uuid" != "$my_uuid" ]; then echo "KEPT=$key (held by $(jq -r '.owner // ""' "$f"))"; exit 4; fi
       rm -f "$f"; echo "RELEASED=$key"; exit 0
     fi
@@ -170,7 +179,8 @@ case "$verb" in
     json=0; [ "${1:-}" = "--json" ] && json=1
     rows=""
     for f in "$CL"/*.json; do [ -f "$f" ] || continue
-      u=$(jq -er '.owner_uuid | strings' "$f" 2>/dev/null) || { echo "unreadable claim file $f" >&2; exit 3; }
+      claim_ok "$f" || { echo "unreadable claim file $f" >&2; exit 3; }
+      u=$(jq -r '.owner_uuid' "$f")
       l=$(owner_live "$u" "$f"); r=$(registry_live "$u")
       row=$(jq -c --arg live "$l" --arg reg "$r" '. + {live:$live, registry_live:$reg}' "$f" 2>/dev/null) \
         || { echo "unreadable claim file $f" >&2; exit 3; }
@@ -189,6 +199,7 @@ case "$verb" in
     n=0
     for f in "$CL"/*.json; do
       [ -f "$f" ] || continue
+      if ! claim_ok "$f"; then echo "kept unreadable claim $f (fix or remove it by hand)" >&2; continue; fi
       key=$(jq -r '.key' "$f"); pr=$(jq -r '.pr // ""' "$f"); r=$(jq -r '.repo // ""' "$f"); u=$(jq -r '.owner_uuid' "$f"); o=$(jq -r '.owner' "$f")
       [ -n "$repo" ] && [ -n "$r" ] && [ "$r" != "$repo" ] && continue
       why=""
