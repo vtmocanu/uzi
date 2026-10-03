@@ -721,7 +721,7 @@ describe("ExecutionRegistry: settleForCapture (issue #1766)", () => {
     const result = await reg.settleForCapture(500, POLL);
     assert.deepEqual(result, { kind: "observed_empty" });
     assert.equal(reg.state(), "poisoned");
-    assert.ok(reg.poisonErrors().some((e) => e.message === "codex vault deferral: settling for capture"));
+    assert.ok(reg.poisonErrors().some((e) => e.message === "codex credential deferral: settling for capture"));
     assert.deepEqual(reg.reserveLaunch("provider"), { kind: "denied", reason: "admission_closed" });
     assert.deepEqual(reg.reserveLaunch("boundary_action"), { kind: "denied", reason: "admission_closed" });
     assert.deepEqual(reg.reserveCallback(cb("late")), { kind: "denied", reason: "admission_closed" });

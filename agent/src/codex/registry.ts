@@ -674,7 +674,7 @@ export class ExecutionRegistry {
   }
 
   /**
-   * Issue #1766: drain this epoch for a CREDENTIAL-FREE capture after a vault-locked deferral.
+   * Issue #1766: drain this epoch for a CREDENTIAL-FREE capture after a vault_locked or refresh_unknown deferral.
    *
    * A registry `disposeTools` has run on answers `incomplete` at once, whether the disposal
    * succeeded ("disposed") or failed (left "poisoned"): it cleared the callback and launch
@@ -700,7 +700,7 @@ export class ExecutionRegistry {
     const deadlineAt = Date.now() + Math.max(0, deadlineMs);
     const remaining = (): number => Math.max(0, deadlineAt - Date.now());
     if (this.currentState !== "poisoned") {
-      this.poison({ category: "protocol", message: "codex vault deferral: settling for capture" });
+      this.poison({ category: "protocol", message: "codex credential deferral: settling for capture" });
     }
     const failed = new Set<RootRecord>();
     const drained = (): boolean =>

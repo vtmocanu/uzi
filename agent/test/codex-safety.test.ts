@@ -2,6 +2,10 @@ import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import * as codexLauncher from "../src/codex/launcher.js";
+import { WorkerClient } from "../src/client.js";
+import { buildRunLaneReconcile } from "../src/codex/codex-executor.js";
+import { nullLogger } from "./helpers.js";
+import { selectCodexBinding } from "../src/codex/select.js";
 
 import {
   CodexBoundaryError,
@@ -1419,5 +1423,47 @@ describe("CodexBoundaryError.diagnostic (issue #1864)", () => {
       },
     );
     assert.equal(called, 0);
+  });
+});
+
+describe("M2 first-send deadline safety propagation", () => {
+  it("keeps refresh_unknown on the poisoned reconcile error and never admits the action", async (t) => {
+    let fire!: () => void;
+    let sends = 0;
+    const events: string[] = [];
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(9));
+    t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
+      sends++;
+      const waiting = new Promise<Response>((_resolve, reject) => {
+        init.signal!.addEventListener("abort", () => reject(new Error("private-canary")), { once: true });
+      });
+      fire();
+      return waiting;
+    });
+    const client = new WorkerClient("http://fixture.invalid", "fixture-token", "test", nullLogger());
+    const selected = selectCodexBinding({ codex: {
+      auth_mode: "subscription", access_token: "fixture-token", capability: "fixture-cap", generation: 3,
+      chatgpt_account_id: "fixture-account", chatgpt_plan_type: null,
+    } });
+    assert.equal(selected.kind, "codex");
+    if (selected.kind !== "codex") assert.fail("fixture binding");
+    const reconcile = buildRunLaneReconcile("run-1", client, selected.binding, () => assert.fail("no token"));
+    const safety = new CodexExecutionSafetyImpl(reg, {
+      armDeadline: (_request, _ms, callback) => { fire = callback; return () => {}; },
+      quiesce: async () => { events.push("quiesce"); return { kind: "quiescent", epoch: 9 }; },
+      reap: async () => { events.push("reap"); return { kind: "observed_empty", evidence: "supervisor_echild", epoch: 9 }; },
+      dispose: async () => ({ kind: "disposed" }),
+      spawnRoot: spawnCounter().seam,
+    }, reconcile);
+    await assert.rejects(safety.withBoundary(req("finalize"), async () => { events.push("action"); }), (err: unknown) => {
+      assert.ok(err instanceof CodexBoundaryError);
+      assert.equal(err.stage, "reconcile");
+      assert.equal(err.deferral, "refresh_unknown");
+      assert.doesNotMatch(err.message, /private-canary|fixture.invalid|fixture-cap/);
+      return true;
+    });
+    assert.equal(sends, 1);
+    assert.deepEqual(events, []);
+    assert.equal(reg.state(), "poisoned");
   });
 });

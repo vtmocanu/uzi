@@ -4,7 +4,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { FakeApi } from "./fake-api.js";
 import { makeClaim, nullLogger } from "./helpers.js";
-import { WorkerClient, RequestError, isTransient, isTransientStatus, codexDeferralReason } from "../src/client.js";
+import { WorkerClient, RequestError, isTransient, isTransientStatus, codexDeferralReason, CodexRequestFailure, codexRefreshFailure } from "../src/client.js";
 import { MessageBatcher } from "../src/batcher.js";
 
 const TOKEN = "worker-join-token-0123456789";
@@ -363,7 +363,7 @@ describe("Codex credential bridge", () => {
         { ...req, observed_generation: Number.MAX_SAFE_INTEGER },
         expected,
       ),
-      /invalid codex credential response/,
+      /codex credential request failed: local/,
     );
     assert.equal(api.codexRequests.length, callsBefore, "unsafe observed generation is rejected before HTTP/provider work");
   });
@@ -1085,4 +1085,60 @@ describe("codexDeferralReason", () => {
     ];
     for (const err of cases) assert.equal(codexDeferralReason(err), undefined, String(err));
   });
+});
+
+
+describe("M2 secret-free WorkerClient refresh failure classification", () => {
+  it("distinguishes local and received malformed replies from transport and lost body", async () => {
+    const original = globalThis.fetch;
+    const client = newClient();
+    const req = { capability: "fixture-cap", operation_id: "fixture-operation", observed_generation: 3 };
+    const expected = { authMode: "subscription" as const, chatgptAccountId: "verified-account" };
+    const check = (kind: string) => (err: unknown) => {
+      assert.ok(err instanceof CodexRequestFailure);
+      assert.equal(err.kind, kind);
+      assert.doesNotMatch(err.message, /secret-canary|fixture-cap|fixture-operation/);
+      assert.equal(err.cause, undefined);
+      return true;
+    };
+    try {
+      globalThis.fetch = async () => { throw new Error("secret-canary"); };
+      await assert.rejects(client.refreshCodex("subscription-run", { ...req, observed_generation: -1 }, expected), check("local"));
+      await assert.rejects(client.refreshCodex("subscription-run", req, expected), check("transport"));
+      globalThis.fetch = async () => new Response(new ReadableStream({ start(c) { c.error(new Error("secret-canary")); } }));
+      await assert.rejects(client.refreshCodex("subscription-run", req, expected), check("transport"));
+      globalThis.fetch = async () => new Response("");
+      await assert.rejects(client.refreshCodex("subscription-run", req, expected), check("transport"));
+      const circular = { ...req } as typeof req & { self?: unknown };
+      circular.self = circular;
+      let sends = 0;
+      globalThis.fetch = async () => { sends++; throw new Error("secret-canary"); };
+      await assert.rejects(client.refreshCodex("subscription-run", circular, expected), check("local"));
+      assert.equal(sends, 0);
+      globalThis.fetch = async () => new Response("secret-canary");
+      await assert.rejects(client.refreshCodex("subscription-run", req, expected), check("response"));
+      const abort = new AbortController();
+      abort.abort(new Error("secret-canary"));
+      globalThis.fetch = async () => { throw new Error("secret-canary"); };
+      await assert.rejects(client.refreshCodex("subscription-run", req, expected, abort.signal), check("parent_abort"));
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});
+
+describe("M2 API refresh wire classification", () => {
+  for (const [body, result] of [
+    [{ error: "codex refresh is contended; retry" }, "contended"],
+    [{ error: "codex credential is not available" }, "unavailable"],
+    [{ error: "codex refresh is unavailable" }, "unavailable"],
+    [{ reason: "refresh_contended" }, "refused"],
+    [{ reason: "refresh_unknown" }, "refused"],
+    [{ error: "codex refresh is contended; retry", extra: true }, "refused"],
+    [{ error: "codex refresh is unavailable", extra: true }, "refused"],
+  ] as const) {
+    it(`classifies ${JSON.stringify(body)} as ${result}`, () => {
+      assert.equal(codexRefreshFailure(new RequestError("POST", "/fixture", 409, JSON.stringify(body))), result);
+    });
+  }
 });
