@@ -425,7 +425,9 @@ async function bootAndSettle(
   onPromote?: (outbox: Outbox) => void,
   /** `slowBundleMs` delays every recovery bundle the restarted worker's boot sweep produces, so a
    *  sweep still mid-record when the settlement journal empties is deterministic (issue #2020). */
-  opts: { slowBundleMs?: number; bundleStarts?: { n: number } } = {},
+  /** `passes` collects every background recovery pass the worker started, and counts those that
+   *  settled, so a caller can assert they all settled before this helper returned (issue #2020). */
+  opts: { slowBundleMs?: number; bundleStarts?: { n: number }; passes?: { started: Promise<void>[]; settled: number } } = {},
 ): Promise<{ events: string[]; calls: FakeSettleClient["calls"]; s2: Stores }> {
   const events: string[] = [];
   const git2 = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
@@ -468,6 +470,12 @@ async function bootAndSettle(
     (runner2 as unknown as Record<string, unknown>)[name] = (...a: unknown[]) => {
       const p = orig(...a);
       background.push(p);
+      const passes = opts.passes;
+      if (passes) {
+        passes.started.push(p);
+        // Registered before the drain's allSettled, so it runs first once p settles.
+        p.then(() => { passes.settled++; }, () => { passes.settled++; });
+      }
       return p;
     };
   }
@@ -609,8 +617,12 @@ describe("settlement crash boundaries (issue #1582 M2)", () => {
     fs.renameSync(fx.originPath, `${fx.originPath}.gone`);
     try {
       const bundleStarts = { n: 0 };
-      await bootAndSettle(gen2Claim.run_id, outboxRoot, undefined, { slowBundleMs: 800, bundleStarts });
-      assert.ok(bundleStarts.n >= 1, "precondition: the boot sweep reached its (slowed) bundle production");
+      const passes = { started: [] as Promise<void>[], settled: 0 };
+      await bootAndSettle(gen2Claim.run_id, outboxRoot, undefined, { slowBundleMs: 800, bundleStarts, passes });
+      // The slowed bundle keeps a pass running past the abort, so without the drain this fails
+      // deterministically, whatever the scheduling.
+      assert.ok(passes.started.length >= 1, "precondition: the worker started a boot recovery pass");
+      assert.equal(passes.settled, passes.started.length, "every boot recovery pass settled before bootAndSettle returned");
       const tree = (): string[] => {
         const out: string[] = [];
         const walk = (d: string): void => {
@@ -624,7 +636,8 @@ describe("settlement crash boundaries (issue #1582 M2)", () => {
         return out.sort();
       };
       const atReturn = tree();
-      await sleep(1500); // longer than the slowed bundle: any late journal write lands here
+      await Promise.allSettled(passes.started); // any late journal write from a pass has landed
+      assert.ok(bundleStarts.n >= 1, "precondition: the boot sweep reached its (slowed) bundle production");
       assert.deepEqual(tree(), atReturn, "no recovery journal write after bootAndSettle returned");
     } finally {
       fs.renameSync(`${fx.originPath}.gone`, fx.originPath);
