@@ -246,14 +246,16 @@ and switches are unchanged. Five mechanisms:
    fresh valid byte and inode accounting confirming fullness on the actual
    worktree and HOME's data-volume device. Setup, finalize, bookkeeping and
    settlement errors, typed recovery outcomes and owner controls keep their
-   existing handling; every
-   recognizable typed, wrapped or trusted security/guardrail failure remains
-   excluded, as pinned by the exclusion fixtures in
+   existing handling. Recognizable security/guardrail and trusted admission,
+   launcher or plan-wiring refusals remain excluded, including preserved
+   leading diagnostic context prefixes and `cause`/`interruption` wrappers.
+   Trusted refusal types retain their identity; complete legacy reasons are
+   recognized. Ordinary opaque failures keep their existing handling. The exclusion fixtures pin this boundary in
    `agent/test/runner-terminal-disk-deferral.test.ts`. Approval revisions are
    unchanged, including in-place cache relief. This is current-fullness policy, not write attribution: an
-   unrelated opaque error can coincide with fullness and be deferred. Fully
-   opaque failures whose security origin was erased remain eligible under
-   this accepted coincidence residual.
+   unrelated opaque error can coincide with fullness and be deferred. For
+   refusals, only completely erased-origin opaque failures remain eligible
+   under this accepted coincidence residual.
    Capture retries are bounded; a safely quiescent run can park with an
    unverified capture while retaining its original clone, HOME, session,
    journal and custody. That degraded recovery requires this worker and can
