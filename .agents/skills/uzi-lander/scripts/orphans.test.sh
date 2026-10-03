@@ -28,6 +28,7 @@ case "$*" in
   "repo list --json") echo '[{"id":"r1","path_with_namespace":"test/repo"},{"id":"r2","path_with_namespace":"other/repo"}]' ;;
   "run list --json")
     [ "${UZI_FAIL:-0}" = 1 ] && exit 1
+    [ -n "${BIG_RUNS:-}" ] && { cat "$BIG_RUNS"; exit 0; }
     echo '[{"id":"aaaaaaaa-1","repo_id":"r1","mr_iid":10,"issue_iid":1,"kind":"issue","status":"completed","created_at":"2026-01-01T00:00:00Z"},
            {"id":"bbbbbbbb-1","repo_id":"r1","mr_iid":11,"issue_iid":2,"kind":"issue","status":"completed","created_at":"2026-01-01T00:00:00Z"},
            {"id":"bbbbbbbb-2","repo_id":"r1","mr_iid":11,"issue_iid":2,"kind":"mr_rework","status":"running","created_at":"2026-01-02T00:00:00Z"},
@@ -135,5 +136,15 @@ printf '{"key":' > "$CL/run-z-corrupt.json"
 bash "$HERE/claims.sh" reap --repo test/repo > "$WORK/reap.out" 2>&1 || fail "reap exited $?: $(cat "$WORK/reap.out")"
 for k in run-g-done run-i-merged run-k-dead; do [ ! -f "$CL/$k.json" ] || fail "reap kept $k: $(cat "$WORK/reap.out")"; done
 for k in run-h-live run-j-unreadable run-j2-unreadable run-z-corrupt; do [ -f "$CL/$k.json" ] || fail "reap dropped $k: $(cat "$WORK/reap.out")"; done
+
+# A real run list is megabytes: it must never travel through argv (E2BIG, "Argument list too long").
+rm -f "$CL"/*.json
+jq -n '[range(0;6000)|{id:"bulk-\(.)",repo_id:"r1",mr_iid:null,issue_iid:null,kind:"chat",status:"completed",created_at:"2026-01-01T00:00:00Z",title:("x"*200)}]
+  + [{id:"dddddddd-1",repo_id:"r1",mr_iid:null,issue_iid:7,kind:"issue",status:"running",created_at:"2026-01-01T00:00:00Z"}]' > "$WORK/big-runs.json"
+[ "$(wc -c < "$WORK/big-runs.json")" -gt 1100000 ] || fail "big run list fixture too small to exceed ARG_MAX"
+BIG_RUNS="$WORK/big-runs.json" bash "$HERE/orphans.sh" --repo test/repo --json > "$WORK/big.json" 2> "$WORK/big.err" \
+  || fail "big run list: exit $?: $(cat "$WORK/big.err")"
+[ "$(jq -r '.[]|select(.run=="dddddddd-1")|.verdict' "$WORK/big.json")" = orphan ] \
+  || fail "big run list: dddddddd-1 not classified: $(head -c 400 "$WORK/big.json")"
 
 echo "PASS orphans: run PRs and in-flight runs classified by #PR / run-<RUN_ID> claim, fail-closed incl. a corrupt claim; unverifiable owners are never orphaned or reaped; reap drops finished run keys"

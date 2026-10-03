@@ -43,7 +43,13 @@ printf '%s' "$runs" | jq -e 'type=="array"' >/dev/null 2>&1 || die "uzi run list
 claims=$("$HERE/claims.sh" list --json 2>/dev/null) || die "claims.sh list failed (an unreadable claim file?)"
 printf '%s' "$claims" | jq -e 'type=="array"' >/dev/null 2>&1 || die "claims.sh list unreadable"
 
-rows=$(jq -n --argjson prs "$prs" --argjson runs "$runs" --argjson claims "$claims" --arg repo "$repo_id" '
+# The lookups go to jq through files, never argv: a real run list is megabytes, past ARG_MAX.
+TMP=$(mktemp -d) || die "mktemp failed"
+trap 'rm -rf "$TMP"' EXIT
+printf '%s' "$prs" > "$TMP/prs.json" && printf '%s' "$runs" > "$TMP/runs.json" \
+  && printf '%s' "$claims" > "$TMP/claims.json" || die "cannot stage lookups"
+rows=$(jq -n --slurpfile prs "$TMP/prs.json" --slurpfile runs "$TMP/runs.json" --slurpfile claims "$TMP/claims.json" --arg repo "$repo_id" '
+  $prs[0] as $prs | $runs[0] as $runs | $claims[0] as $claims |
   def claim($k): [$claims[]|select(.key==$k)]|first;
   def verdict($pc; $rc):
     if $pc != null and $pc.registry_live != "dead" then "claimed"
