@@ -10,11 +10,25 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/vault"
 )
+
+// Registered after the pool-close cleanup, so the user cascade runs first.
+// Each cleanup has one attempt with a five-second deadline; errors fail its test.
+func cleanupCodexRecoveryUser(t *testing.T, pool *pgxpool.Pool, userID uuid.UUID) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := pool.Exec(ctx, "DELETE FROM users WHERE id=$1", userID); err != nil {
+			t.Errorf("delete recovery fixture user %s: %v", userID, err)
+		}
+	})
+}
 
 // Lock only after the exchange. The first reply is discarded; each retry uses a
 // fresh service, including while unlocked but before any survivor promotion.
@@ -22,6 +36,7 @@ func TestCodexRefreshRecoveryLostReplyLiveDB(t *testing.T) {
 	e := setupCodexLiveDB(t)
 	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: codexToken("recovered")}}
 	f := newRefreshFixture(t, e, fake)
+	cleanupCodexRecoveryUser(t, e.pool, f.userID)
 	cap := e.mintCap(t, f.runID, f.workerID)
 	v := vault.New(e.box, e.q)
 	if err := v.Unlock(e.ctx, f.userID, "recovery-fixture-password"); err != nil {
@@ -108,6 +123,7 @@ func TestCodexRefreshRecoveryRefusalsLiveDB(t *testing.T) {
 			e := setupCodexLiveDB(t)
 			fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: codexToken("new")}}
 			f := newRefreshFixture(t, e, fake)
+			cleanupCodexRecoveryUser(t, e.pool, f.userID)
 			cap := e.mintCap(t, f.runID, f.workerID)
 			f.svc.SetVault(vault.New(e.box, e.q))
 			op := uuid.New()
@@ -132,6 +148,7 @@ func TestCodexRefreshRecoveryPendingCompatibilityLiveDB(t *testing.T) {
 			e := setupCodexLiveDB(t)
 			fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: codexToken("new")}}
 			f := newRefreshFixture(t, e, fake)
+			cleanupCodexRecoveryUser(t, e.pool, f.userID)
 			cap := e.mintCap(t, f.runID, f.workerID)
 			f.svc.SetVault(vault.New(e.box, e.q))
 			if capable {
@@ -185,6 +202,7 @@ func TestCodexRefreshRecoveryReleasedDuringExchangeLiveDB(t *testing.T) {
 	e := setupCodexLiveDB(t)
 	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: codexToken("new")}}
 	f := newRefreshFixture(t, e, fake)
+	cleanupCodexRecoveryUser(t, e.pool, f.userID)
 	cap := e.mintCap(t, f.runID, f.workerID)
 	f.svc.SetVault(vault.New(e.box, e.q))
 	fake.onRefresh = func() { e.exec("UPDATE runs SET claim_released_at=now() WHERE id=$1", f.runID) }
@@ -206,6 +224,7 @@ func TestCodexRefreshRecoveryNonVaultBranchesLiveDB(t *testing.T) {
 			e := setupCodexLiveDB(t)
 			fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: codexToken("non-vault")}}
 			f := newRefreshFixture(t, e, fake)
+			cleanupCodexRecoveryUser(t, e.pool, f.userID)
 			cap := e.mintCap(t, f.runID, f.workerID)
 			f.svc.txBeginner = e.pool
 			wantSlot := false
@@ -251,6 +270,7 @@ func TestCodexRefreshRecoveryNonVaultBranchesLiveDB(t *testing.T) {
 
 func TestCodexRefreshRecoveryRegistrationDowngradeLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
+	cleanupCodexRecoveryUser(t, e.pool, e.userID)
 	svc := e.permitService(t)
 	id := e.seedWorker(t, nil)
 	w := store.Worker{ID: id, UserID: e.userID}
