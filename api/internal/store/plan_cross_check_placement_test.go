@@ -103,8 +103,8 @@ func TestPlanCrossCheckReleasedWorkerPlacementLiveDB(t *testing.T) {
 			countParams := store.CountOnlineWorkersClaimableForRunParams{RunID: runID,
 				HeartbeatCutoff: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true}}
 			count, err := fx.q.CountOnlineWorkersClaimableForRun(fx.ctx, countParams)
-			if err != nil || count != 0 {
-				t.Fatalf("released worker placement count=%d err=%v, want 0", count, err)
+			if err != nil || count.Claimable != 0 {
+				t.Fatalf("released worker placement count=%d err=%v, want 0", count.Claimable, err)
 			}
 			params := store.ClaimRunParams{WorkerID: pgU(workerID), UserID: fx.userID,
 				AffinityCutoff:  pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Minute), Valid: true},
@@ -116,8 +116,8 @@ func TestPlanCrossCheckReleasedWorkerPlacementLiveDB(t *testing.T) {
 			capable := append(releasedCaps, capability.CrossCheckV1)
 			mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET protocol_capabilities=$2 WHERE id=$1`, workerID, capable)
 			count, err = fx.q.CountOnlineWorkersClaimableForRun(fx.ctx, countParams)
-			if err != nil || count != 1 {
-				t.Fatalf("capable worker placement count=%d err=%v, want 1", count, err)
+			if err != nil || count.Claimable != 1 {
+				t.Fatalf("capable worker placement count=%d err=%v, want 1", count.Claimable, err)
 			}
 			params.WorkerProtocolCaps = capable
 			claimed, err := fx.q.ClaimRun(fx.ctx, params)
