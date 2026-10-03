@@ -218,6 +218,14 @@ func TestSplitMinHeightShowsEightRowsInBothPanes(t *testing.T) {
 		}
 		m.bottomTab = bottom
 		frame := strings.Split(stripANSI(m.View().Content), "\n")
+		for _, meter := range m.boardMeterLayout(now).lines {
+			if !strings.Contains(strings.Join(frame, "\n"), stripANSI(meter)) {
+				t.Errorf("%v min-height frame lost meter line %q", bottom, stripANSI(meter))
+			}
+		}
+		if !strings.Contains(strings.Join(frame, "\n"), stripANSI(m.vaultIndicatorLine())) {
+			t.Errorf("%v min-height frame lost vault hint", bottom)
+		}
 		if len(frame) > m.height {
 			t.Fatalf("%v frame has %d lines, height %d", bottom, len(frame), m.height)
 		}
