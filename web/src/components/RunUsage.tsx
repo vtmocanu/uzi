@@ -415,7 +415,7 @@ export function RunUsageTailBlock({ tail }: { tail: UsageTail | null | undefined
     >
       <div className={K_CLASS}>Estimated, not metered</div>
       <p className="mt-1 text-[11px] text-faint">
-        Usage after the last reported total of an interrupted session. It is not included in the metered total above.
+        Usage after the last reported total of an interrupted session. It is not included in the metered total.
       </p>
       <div className="mt-2 flex flex-wrap items-baseline gap-x-6 gap-y-1 font-mono text-[13px] tabular-nums">
         <span>

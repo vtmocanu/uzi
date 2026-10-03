@@ -33,8 +33,10 @@ export function tailVisible(t: UsageTail | null | undefined): t is UsageTail {
   return tokens > 0 || t.coverage !== "complete";
 }
 
-/** "~$1.23 estimated" or "cost unknown". A null cost is never rendered as $0. */
+/** "~$1.23 estimated", "<$0.01 estimated" or "cost unknown". A null cost is never rendered as $0. */
 export function tailCostText(costUsd: number | null, status: string): string {
   if (status !== "estimated" || costUsd === null || !Number.isFinite(costUsd)) return "cost unknown";
+  // A real but sub-half-cent cost must not round to "~$0.00", which reads as nothing spent.
+  if (costUsd > 0 && costUsd < 0.005) return "<$0.01 estimated";
   return `~${formatCost(costUsd)} estimated`;
 }

@@ -92,17 +92,21 @@ carries it as `usage_estimated_tail`). The design is in
 - **It is an estimate, with provenance.** The dollar figure is priced from
   Anthropic's official standard pricing page as fetched on 2026-10-03 and
   recorded as a version id (`anthropic-standard-2026-10-03`), shown beside the
-  figure and rendered as "~$X.XX estimated".
-- **Unpriced means unknown, never $0.** A model the table does not know, or a
-  non-standard service tier, speed or inference geo, leaves the cost unknown:
-  the tokens are still shown, and the cost reads "cost unknown".
+  figure and rendered as "~$X.XX estimated" ("<$0.01 estimated" under half a
+  cent).
+- **Unpriced means unknown, never $0.** A model the table does not know, a
+  non-standard service tier, speed or inference geo, or cache writes without a
+  consistent 5-minute/1-hour split leaves the cost unknown: the tokens are
+  still shown, and the cost reads "cost unknown". `uzi run get` then shows
+  "cost unknown (unpriced)" with no price-table version, since no table was
+  applied.
 - **Coverage is stated.** A tail is `complete` or `partial`. A partial tail
   lists why, in these words: the last session was cut off before it reported
   its total (`leg_not_closed`); some model calls were never received
-  (`ordinal_gap`); output of the last call was still streaming
+  (`ordinal_gap`); output tokens of the last call were still streaming
   (`output_not_final`); it is unclear whether a later total already counted
   some calls (`superseded_uncertain`); some usage records were dropped
-  (`records_dropped`); the per-run record limit was reached
+  (`records_dropped`); the per-run usage record limit was reached
   (`record_cap_reached`); coverage could not be determined (`unresolved`). A
   partial tail means real usage may be higher.
 - **Hidden when empty.** A finished run normally has an all-zero, complete

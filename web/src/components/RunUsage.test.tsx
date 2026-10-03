@@ -620,6 +620,20 @@ describe("RunUsageTailBlock", () => {
     expect(container.textContent).not.toContain("$0");
   });
 
+  it("renders a sub-cent estimated cost as <$0.01, and an estimated nil cost as unknown", () => {
+    const tiny = render(<RunUsageTailBlock tail={tail({ cost_usd: 0.001 })} />);
+    expect(tiny.container.textContent).toContain("<$0.01 estimated");
+    expect(tiny.container.textContent).not.toContain("~$0.00");
+    cleanup();
+    const zero = render(<RunUsageTailBlock tail={tail({ cost_usd: 0 })} />);
+    expect(zero.container.textContent).toContain("~$0.00 estimated");
+    cleanup();
+    const nil = render(<RunUsageTailBlock tail={tail({ cost_usd: null, cost_status: "estimated" })} />);
+    expect(nil.container.textContent).toContain("cost unknown");
+    expect(nil.container.textContent).not.toContain("$0");
+    expect(nil.container.textContent).not.toContain("metered total above");
+  });
+
   it("hides a zero-token complete tail but shows a zero-token partial one", () => {
     const zero = { input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0 };
     const hidden = render(<RunUsageTailBlock tail={tail({ ...zero, coverage: "complete", coverage_reasons: [] })} />);
@@ -642,8 +656,17 @@ describe("RunUsageTailBlock", () => {
     const { container } = render(<RunUsageTailBlock tail={tail({ coverage_reasons: [...reasons, "new‮reason"] })} />);
     const text = container.textContent ?? "";
     for (const r of reasons) expect(text).not.toContain(r);
-    expect(text).toContain("cut off");
-    expect(text).toContain("record limit");
+    for (const sentence of [
+      "the last session was cut off before it reported its total",
+      "some model calls were never received",
+      "output tokens of the last call were still streaming",
+      "it is unclear whether a later total already counted some calls",
+      "some usage records were dropped",
+      "the per-run usage record limit was reached",
+      "coverage could not be determined",
+    ]) {
+      expect(text).toContain(sentence);
+    }
     expect(text).toContain("newreason");
     expect(text).not.toContain("‮");
   });
