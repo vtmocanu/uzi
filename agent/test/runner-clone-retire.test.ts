@@ -147,7 +147,7 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
     return configValues(bare, `uzi-attempts.${branch}.entry`).map((raw) => JSON.parse(raw));
   }
 
-  async function seed(attempt: boolean, status: "failed" | "completed") {
+  async function seed(attempt: boolean, status: "failed" | "completed", cloneSlug: string = slug) {
     const owner = randomUUID();
     const claimant = randomUUID();
     localGit(fx.originPath, "checkout", "-b", branch);
@@ -158,7 +158,7 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
     localGit(fx.originPath, "checkout", "main");
     const bare = await git.ensureClone(fx.originPath);
     const attemptId = attempt ? formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0123456789abcdef") : undefined;
-    const clone = await git.runnerCloneForBranch(bare, branch, slug, noProofReseed, owner, false, undefined,
+    const clone = await git.runnerCloneForBranch(bare, branch, cloneSlug, noProofReseed, owner, false, undefined,
       attemptId ? attemptOptions(attemptId) : undefined);
     assert.equal(localGit(clone.path, "rev-parse", "HEAD").trim(), publishedHead);
     fs.writeFileSync(path.join(clone.path, tracked), dirty);
@@ -387,10 +387,11 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
   }
   for (const malformed of ["null", "missing-fields", "status-accessor", "repo-accessor", "object-kind", "unknown-kind", "missing-kind", "null-kind"] as const) {
     it(`1848 M2 malformed classification ${malformed} preserves fixed refusal`, async (t) => {
-      const s = await seed(false, "completed");
+      // missing-kind / null-kind seed the canonical clone an ISSUE owner of this branch would have
+      // (`issue-1810`), so a kind defaulted to "issue" passes every later predicate and reclaims.
+      const kindless = malformed === "missing-kind" || malformed === "null-kind";
+      const s = await seed(false, "completed", kindless ? "issue-1810" : slug);
       const leaked = s.clonePath + "\nprivate classification accessor";
-      // missing-kind / null-kind are otherwise a valid terminal issue owner for this branch, so a
-      // default to "issue" would reclaim; the raw kind must be refused first.
       const value = malformed === "null" ? null : malformed === "missing-fields" ? {} :
         malformed === "missing-kind" ? { status: "completed", repo_id: "r1", issue_iid: 1810 } :
         malformed === "null-kind" ? { status: "completed", repo_id: "r1", issue_iid: 1810, kind: null } :
@@ -406,8 +407,11 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
       assertSafeEvents(e.events, [s.clonePath, leaked]);
       assert.equal(e.events.at(-1)?.stage, "identity");
       assert.equal(e.events.at(-1)?.reason, "malformed_identity");
+      // The kindless fixture's journal names the issue-keyed path, so the claimant reaches the
+      // reclaim through the path-mismatch arm; both original refusals are content-free.
       assert.equal(api.states.filter((state) => state.runId === s.claimant && state.body.status === "failed").at(-1)?.body.failure_reason,
-        "refusing to replace a retained clone owned by another run");
+        kindless ? "recovery journal points at a different clone path than this branch's computed clone"
+          : "refusing to replace a retained clone owned by another run");
       assertBytes(s.clonePath, s);
       assert.deepEqual(readJournal(s.bare, branch), { runId: s.owner, clonePath: s.clonePath });
     });
