@@ -3003,6 +3003,10 @@ export interface Run {
    *  Since PRD #111 M1 it can be read together with the credential above: what the
    *  run cost, and which account it cost it against. */
   usage?: RunUsage | null;
+  /** Issue #2014 (ADR-2014): the ESTIMATED usage of model calls no SDK result frame covered
+   *  (the tail of an interrupted Claude session). Omitted when the run has none. Always shown
+   *  APART from `usage` and never added to it. */
+  usage_estimated_tail?: UsageTail | null;
   /** PRD #35: this run's usage-limit opt-in — on a sustained Anthropic usage limit
    *  the run parks at status "limit_wait" and resumes when the window reopens,
    *  instead of failing. Present on every run from creation, so it is what a "will
@@ -3379,6 +3383,33 @@ export interface RunUsage {
    *  per-WINDOW aggregate (SelfUsage.lifetime/last_7_days) a single status does not apply and
    *  it is "" — the window's truth is the subscription/unreported counts on SelfUsage. */
   cost_status: CostStatus | "";
+}
+
+// UsageTail is the estimated, not metered, usage of an interrupted Claude session (issue
+// #2014). cost_usd is null (never 0) when cost_status is "unpriced". coverage_reasons is a
+// closed set today (see lib/usageTail.ts) but a newer server may add one: render unknown
+// reasons honestly.
+export interface UsageTailModel {
+  model: string;
+  input_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  output_tokens: number;
+  cost_usd: number | null;
+  cost_status: "estimated" | "unpriced";
+}
+
+export interface UsageTail {
+  input_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  output_tokens: number;
+  cost_usd: number | null;
+  cost_status: "estimated" | "unpriced";
+  price_table_version: string;
+  coverage: "complete" | "partial";
+  coverage_reasons: string[];
+  models: UsageTailModel[];
 }
 
 // RunListItem is a run row for the index + admin overview: the run plus display

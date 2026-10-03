@@ -5,6 +5,7 @@ import type {
 import { daysAgo, minsAgo, minsAhead, secsAgo } from "./time";
 import { LIVE_RUN_ID } from "./boards";
 import { SAMPLE_PLAN, SEEDED_PLAN } from "./plans";
+import { demoTailEstimated, demoTailUnpriced } from "./runHistories";
 
 // ── Runs ─────────────────────────────────────────────────────────────────────
 
@@ -1334,6 +1335,7 @@ export const mockRuns: Run[] = [
   },
   {
     id: "run-failed",
+    usage_estimated_tail: demoTailEstimated,
     repo_id: "repo-atlas",
     issue_iid: 7,
     issue_title: "Postgres connection pool tuning",
@@ -1524,6 +1526,7 @@ export const mockRuns: Run[] = [
   },
   {
     id: "run-cancelled",
+    usage_estimated_tail: demoTailUnpriced,
     repo_id: "repo-atlas",
     issue_iid: 5,
     issue_title: "Healthcheck should ping the DB pool",

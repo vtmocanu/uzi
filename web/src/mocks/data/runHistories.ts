@@ -3,6 +3,7 @@ import type {
   RunListItem,
   RunMessage,
   RunUsage,
+  UsageTail,
 } from "../../lib/api";
 import { daysAgo, minsAgo, minsAhead } from "./time";
 import { mockRepos } from "./forge";
@@ -279,6 +280,55 @@ export const mockOtherUserRuns: Run[] = [
     updated_at: minsAgo(7),
   },
 ];
+
+// Issue #2014: demo estimated tails of interrupted Claude sessions, attached to the
+// "run-failed" and "run-cancelled" fixtures (data/runs.ts). One priced and partial, one
+// unpriced (cost unknown, never $0) and partial with an unrecognised reason.
+export const demoTailEstimated: UsageTail = {
+  input_tokens: 9_200,
+  cache_read_tokens: 410_000,
+  cache_creation_tokens: 6_000,
+  output_tokens: 3_100,
+  cost_usd: 0.42,
+  cost_status: "estimated",
+  price_table_version: "anthropic-standard-2026-10-03",
+  coverage: "partial",
+  coverage_reasons: ["leg_not_closed"],
+  models: [
+    {
+      model: "claude-opus-4-8",
+      input_tokens: 9_200,
+      cache_read_tokens: 410_000,
+      cache_creation_tokens: 6_000,
+      output_tokens: 3_100,
+      cost_usd: 0.42,
+      cost_status: "estimated",
+    },
+  ],
+};
+
+export const demoTailUnpriced: UsageTail = {
+  input_tokens: 4_800,
+  cache_read_tokens: 120_000,
+  cache_creation_tokens: 0,
+  output_tokens: 1_900,
+  cost_usd: null,
+  cost_status: "unpriced",
+  price_table_version: "anthropic-standard-2026-10-03",
+  coverage: "partial",
+  coverage_reasons: ["ordinal_gap", "output_not_final", "future_reason"],
+  models: [
+    {
+      model: "claude-experimental-9",
+      input_tokens: 4_800,
+      cache_read_tokens: 120_000,
+      cache_creation_tokens: 0,
+      output_tokens: 1_900,
+      cost_usd: null,
+      cost_status: "unpriced",
+    },
+  ],
+};
 
 // runListItem decorates a Run into the list shape the API returns.
 // PRD #40 demo: usage for a run that actually ran (terminal or running); a queued /

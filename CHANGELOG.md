@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **See the estimated usage of an interrupted Claude session apart from the metered total ([#2014](https://github.com/vtmocanu/uzi/issues/2014)).**
+  Usage after the last SDK result of a parked, stopped or crashed Claude run is recorded and shown as "Estimated, not metered" on the run page and as an EST. TAIL row in `uzi run get` (and `usage_estimated_tail` in its JSON), with price-table provenance, "cost unknown" when unpriced and a plain-words coverage note; it is never added to the metered total, usage aggregates or any budget.
+
 ### Fixed
 
 - **TUI split view fills the terminal height ([#2197](https://github.com/vtmocanu/uzi/issues/2197)).**

@@ -74,7 +74,7 @@ import {
 import { CredentialDisabledPanel, isCredentialDisabledHold } from "../components/CredentialDisabledPanel";
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
 import { formatDuration } from "../components/RunEvent";
-import { RunUsagePanel } from "../components/RunUsage";
+import { RunUsagePanel, RunUsageTailBlock } from "../components/RunUsage";
 import { RunParkDiskFacts } from "../components/RunParkDiskFacts";
 import { ActivityFeed } from "../components/ActivityFeed";
 import { SteerQueueCard } from "../components/SteerQueueCard";
@@ -3004,6 +3004,11 @@ export function RunView() {
           <RunUsagePanel usage={usage} costStatus={run.usage?.cost_status ?? ""} harness={run.harness} />
         </Card>
       )}
+
+      {/* Issue #2014: the estimated tail of an interrupted session, its own block apart from the
+          metered total. Not gated on the message-derived usage above: an interrupted run may
+          have no result frame at all. Self-hides for the all-zero complete tail. */}
+      <RunUsageTailBlock tail={run.usage_estimated_tail} />
 
       <Card className="p-4">
         <ActivityFeed

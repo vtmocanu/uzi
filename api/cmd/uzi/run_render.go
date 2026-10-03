@@ -291,6 +291,12 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if r.Usage != nil {
 		rows = append(rows, []string{"COST", costDetailCell(*r.Usage)})
 	}
+	// EST. TAIL (issue #2014, ADR-2014): the ESTIMATED usage of an interrupted Claude
+	// session, a separate row beside COST and never folded into it. Absent for the all-zero
+	// complete tail every normally finished run carries.
+	if r.UsageEstimatedTail != nil && usageTailVisible(*r.UsageEstimatedTail) {
+		rows = append(rows, []string{"EST. TAIL", usageTailCell(*r.UsageEstimatedTail)})
+	}
 	// Which Anthropic credential this run spent (PRD #111 M1). Emitted only when the
 	// server recorded one — a pre-feature or still-queued run has nothing to say and
 	// must not print a blank row.
