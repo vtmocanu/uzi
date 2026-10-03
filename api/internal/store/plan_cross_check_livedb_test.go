@@ -241,12 +241,33 @@ func TestPlanCrossCheckSecondParkLiveDB(t *testing.T) {
 	check("same plan, changed milestones after publication", false)
 	mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'running' WHERE id = $1`, f.runID)
 	park("plan B", []byte(`[]`))
+	resume := func(stage string, caps []string, want int64) {
+		t.Helper()
+		rows, err := f.q.SetRunRunning(ctx, store.SetRunRunningParams{
+			ID: f.runID, WorkerID: pgU(f.workerID), InferredCapabilities: caps,
+		})
+		if err != nil || rows != want {
+			t.Fatalf("%s SetRunRunning: rows=%d err=%v, want %d", stage, rows, err, want)
+		}
+	}
+	resume("before B publication", nil, 0)
 	check("before B publication", false)
 	publishPlanCrossCheckGate(ctx, t, f, "plan B")
+	resume("after B publication with A approval", nil, 0)
 	check("after B publication", false)
+	claimApproved := func(stage string, want bool) {
+		t.Helper()
+		claim, err := f.q.GetRunClaimContext(ctx, f.runID)
+		if err != nil || claim.HumanPlanApproved != want {
+			t.Fatalf("%s claim approval=%v err=%v, want %v", stage, claim.HumanPlanApproved, err, want)
+		}
+	}
+	claimApproved("B with A approval", false)
 	mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'queued' WHERE id = $1`, f.runID)
 	check("requeued", false)
-	mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'running' WHERE id = $1`, f.runID)
+	mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'claimed' WHERE id = $1`, f.runID)
+	claimApproved("reclaimed B with A approval", false)
+	resume("reclaimed B with A approval", nil, 0)
 	check("reclaimed", false)
 	mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'awaiting_approval' WHERE id = $1`, f.runID)
 	var revision int64
@@ -254,7 +275,29 @@ func TestPlanCrossCheckSecondParkLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	approve(revision)
-	mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'running' WHERE id = $1`, f.runID)
+	rows, err := f.q.ClearRunRequiredCapabilities(ctx, store.ClearRunRequiredCapabilitiesParams{
+		ID: f.runID, UserID: f.userID, GateRevision: revision,
+	})
+	if err != nil || rows != 1 {
+		t.Fatalf("owner capability clear: rows=%d err=%v", rows, err)
+	}
+	claimApproved("approved B", true)
+	resume("approved B with new capability", []string{"docker"}, 1)
+	rows, err = f.q.SetRunRunning(ctx, store.SetRunRunningParams{
+		ID: f.runID, WorkerID: pgU(f.workerID), InferredCapabilities: []string{"python"},
+		InferredTools: []string{"go"}, SizeClass: pgT("m"),
+	})
+	if err != nil || rows != 1 {
+		t.Fatalf("postapproval running report: rows=%d err=%v", rows, err)
+	}
+	var caps, tools []string
+	var size pgtype.Text
+	if err := f.pool.QueryRow(ctx, `SELECT required_capabilities, required_tools, size_class FROM runs WHERE id = $1`, f.runID).Scan(&caps, &tools, &size); err != nil {
+		t.Fatal(err)
+	}
+	if len(caps) != 0 || len(tools) != 0 || size.String != "" {
+		t.Fatalf("postapproval running report changed frozen requirements: caps=%v tools=%v size=%v", caps, tools, size)
+	}
 	check("approved B", true)
 }
 

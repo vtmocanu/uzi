@@ -1381,27 +1381,9 @@ SELECT
 -- columns, and an uncast EXISTS(...) types as interface{}, which is unusable as a
 -- Go bool (measured on PRD #113 M5's `IS NOT NULL` projection).
 --
--- 🔴 THE INVARIANT THIS RELIES ON, WRITTEN HERE BECAUSE THIS IS WHERE IT IS READ.
--- The predicate is SetRunRunning's, whose own comment records an accepted residual:
--- a consumed round-1 approve_plan lets a stale round-2 pre-gate report through. For
--- SetRunRunning that residual hides a gate. Here it would tell the worker to skip
--- Phase 1 and IMPLEMENT AN UNREVIEWED plan_md — the same residual with a materially
--- worse blast radius, which is why it is spelled out rather than inherited.
---
--- It is sound today, and the reason is structural rather than lucky, so it is a
--- property of the QUERY PAIR and not of the worker's loop:
---   * a park is running-only (SetRunLimitWait's positive source guard), and
---   * a revise round sits at awaiting_approval, which SetRunRunning refuses to
---     leave for 'running' unless a consumed approve_plan exists (applied, and not
---     settled as discarded with disposition 'superseded', issue #1604).
--- So the ordinary multi-round revise flow cannot reach a park at all. The one
--- surviving residual is the stale round-2 pre-gate report SetRunRunning's comment
--- already names: if that admits a run to 'running' and it then parks, the resume
--- skips the gate on an unreviewed plan_md. Required invariant, stated so a future
--- change can be checked against it: NO awaiting_approval REPORT REWRITES plan_md
--- AFTER THE APPLIED approve_plan THAT MADE human_plan_approved TRUE. A tighter
--- derivation is not cheaply available — runs carries no plan_md_set_at to compare
--- consumed_at against, and inventing one is out of this PRD's scope.
+-- For required cross-check runs, SetRunRunning binds the awaiting_approval exit to
+-- the currently published plan and revision. GetRunClaimContext independently reads
+-- the applied approval when constructing a resumed claim's plan_approved flag.
 --
 -- 🔴 PRD #209 adds a FOURTH source of plan_approved beyond the two named above
 -- (auto_approve, human_plan_approved): a run born plan_source='seeded' (service.go's
@@ -1437,9 +1419,16 @@ SELECT r.checkpoint_tip,
                 WHERE i.run_id = r.id
                   AND i.kind = 'approve_plan'
                   AND i.applied_at IS NOT NULL
-                  -- Issue #1604: a discarded (stale) approve is settled with applied_at AND
-                  -- disposition 'superseded' (DiscardRunInputRows); it is not an approval.
-                  AND i.disposition IS DISTINCT FROM 'superseded'))::boolean AS human_plan_approved
+                  AND i.disposition IS DISTINCT FROM 'superseded'
+                  AND (NOT r.plan_cross_check_required OR
+                       (r.plan_md IS NOT NULL
+                        AND i.gate_binding = 'bound'
+                        AND i.gate_revision = r.gate_revision
+                        AND r.gate_presented_payload->>'plan_md' = r.plan_md
+                        AND r.gate_presented_payload->'milestones' = COALESCE(r.milestones_candidate, 'null'::jsonb)
+                        AND r.gate_presented_payload->'required_tools' = to_jsonb(ARRAY(
+                            SELECT DISTINCT tool FROM unnest(r.required_tools) AS tool ORDER BY tool))
+                        AND r.gate_presented_payload->'size_class' = COALESCE(to_jsonb(NULLIF(r.size_class, '')), 'null'::jsonb)))))::boolean AS human_plan_approved
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id -- #1688: owner-scoped token
@@ -1608,8 +1597,8 @@ WHERE id = @id AND user_id = @user_id;
 -- that row never opens the gate.
 -- claimed→running and running→running are unaffected (the guard only narrows the
 -- awaiting_approval source status); autopilot never enters awaiting_approval.
--- Accepted residual (out of scope, see specs/ai.md): in a multi-round re-gate a
--- consumed round-1 input lets a stale round-2 pre-gate report through.
+-- Required cross-check runs additionally match the current published payload and
+-- an applied, bound approval for its current gate revision.
 UPDATE runs SET
     status           = 'running',
     -- Stamped only on ENTRY to running. This statement is ALSO the running→running
@@ -1706,23 +1695,27 @@ UPDATE runs SET
     -- ABSENT-SAFE so the ordinary session-id/iteration heartbeats (which omit them) never
     -- disturb the columns, mirroring SetRunAwaitingApproval byte-for-byte:
     --
-    -- required_capabilities is UNION-MERGED (escalation-only): the M2 enqueue seam already
-    -- copied the repo's static hint, and inference can only ADD. The COALESCE is
+    -- Before a required plan is stored, required_capabilities is UNION-MERGED
+    -- (escalation-only): the M2 enqueue seam already copied the repo's static hint,
+    -- and inference can only ADD. The COALESCE is
     -- LOAD-BEARING — a nil text[] param encodes SQL NULL and `arr || NULL = NULL` would
     -- WIPE the NOT-NULL column — so an absent param unions with '{}' (no change) and a
     -- present set adds its members, deduped; `<@` is order-independent so it stays unsorted.
-    required_capabilities = CASE WHEN plan_cross_check_required AND auto_approve THEN required_capabilities
+    -- A required plan's capabilities belong to the presented plan once plan_md is stored.
+    -- Keep ClearRunRequiredCapabilities's owner clear intact, including an empty approved set.
+    required_capabilities = CASE WHEN plan_cross_check_required AND (auto_approve OR plan_md IS NOT NULL)
+        THEN required_capabilities
         ELSE ARRAY(SELECT DISTINCT unnest(required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))) END,
     -- required_tools is SET, absent-safe: a present set REPLACES (the run's single
     -- authoritative inferred toolchain list), an absent (NULL) param COALESCEs back to the
     -- existing column. The service only passes a non-empty filtered set, so a garbled/empty
     -- report leaves the param nil rather than wiping the column.
-    required_tools = CASE WHEN plan_cross_check_required AND auto_approve THEN required_tools
+    required_tools = CASE WHEN plan_cross_check_required AND (auto_approve OR plan_md IS NOT NULL) THEN required_tools
         ELSE COALESCE(sqlc.narg('inferred_tools')::text[], required_tools) END,
     -- size_class is SET, absent-safe like required_tools: a present (clamped s/m/l) value
     -- REPLACES, an absent (NULL) param COALESCEs back. The service clamps to {s,m,l} before
     -- passing, so a garbled report becomes a nil param (no change) rather than a bad value.
-    size_class = CASE WHEN plan_cross_check_required AND auto_approve THEN size_class
+    size_class = CASE WHEN plan_cross_check_required AND (auto_approve OR plan_md IS NOT NULL) THEN size_class
         ELSE COALESCE(sqlc.narg('size_class'), size_class) END,
     -- PRD #122 M1: the FROZEN milestone list an AUTOPILOT run resolved for itself,
     -- with a SAFETY-NET fallback to milestones_candidate (issue #259). Written
@@ -1740,13 +1733,9 @@ UPDATE runs SET
     --      report re-freeze from the candidate column, closing that gap idempotently. On
     --      the normal path it never freezes a not-yet-approved list: during planning the
     --      candidate column is still NULL, and the WHERE guard below admits
-    --      awaiting_approval → running only once an approve_plan input was consumed. In the
-    --      one residual that guard DOES admit — a stale round-2 pre-gate report riding a
-    --      consumed round-1 approve_plan (see the accepted-residual note on this query's
-    --      guard) — it is clause 1, NOT the guard, that keeps the freeze correct: the
-    --      round-1 resume already froze round-1's candidate, so the already-frozen list
-    --      wins and the stale round-2 candidate cannot overwrite it. The common heartbeat
-    --      is likewise a no-op via clause 1.
+    --      awaiting_approval → running only once an approve_plan input was consumed;
+    --      required cross-check runs also bind it to the current published gate.
+    --      The common heartbeat is a no-op via clause 1.
     milestones_frozen = CASE WHEN plan_cross_check_required AND auto_approve THEN milestones_frozen
         ELSE COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb, milestones_candidate) END,
     -- PRD #1226 M1 (D1): freeze the STRUCTURAL COMPLETION CONTRACT at the SAME point the
@@ -1883,15 +1872,40 @@ WHERE runs.id = @id AND worker_id = @worker_id
        OR (sqlc.narg('milestones_completed')::jsonb IS NULL
            AND sqlc.narg('milestones_in_progress')::jsonb IS NULL
            AND sqlc.narg('milestones_frozen')::jsonb IS NULL))
-  AND (status <> 'awaiting_approval' OR EXISTS (
-        SELECT 1 FROM run_user_inputs
-        WHERE run_user_inputs.run_id = @id
-          AND run_user_inputs.kind = 'approve_plan'
-          AND run_user_inputs.applied_at IS NOT NULL
-          -- Issue #1604: an approve the worker discarded as stale is settled (applied_at set,
-          -- disposition 'superseded', DiscardRunInputRows) but never applied, so it must not
-          -- open the plan gate.
-          AND run_user_inputs.disposition IS DISTINCT FROM 'superseded'))
+  -- A resumed claim or heartbeat must not use an earlier plan's approval.
+  -- The initial pre-plan running report remains admissible.
+  AND (NOT plan_cross_check_required OR auto_approve OR plan_md IS NULL OR
+       (gate_presented_payload->>'plan_md' = plan_md
+        AND gate_presented_payload->'milestones' = COALESCE(milestones_candidate, 'null'::jsonb)
+        AND gate_presented_payload->'required_tools' = to_jsonb(ARRAY(
+            SELECT DISTINCT tool FROM unnest(required_tools) AS tool ORDER BY tool))
+        AND gate_presented_payload->'size_class' = COALESCE(to_jsonb(NULLIF(size_class, '')), 'null'::jsonb)
+        AND EXISTS (
+            SELECT 1 FROM run_user_inputs i
+            WHERE i.run_id = runs.id AND i.kind = 'approve_plan'
+              AND i.applied_at IS NOT NULL
+              AND i.disposition IS DISTINCT FROM 'superseded'
+              AND i.gate_binding = 'bound'
+              AND i.gate_revision = runs.gate_revision)))
+  AND (status <> 'awaiting_approval' OR
+       (plan_cross_check_required AND NOT auto_approve AND plan_md IS NOT NULL
+        AND gate_presented_payload->>'plan_md' = plan_md
+        AND gate_presented_payload->'milestones' = COALESCE(milestones_candidate, 'null'::jsonb)
+        AND gate_presented_payload->'required_tools' = to_jsonb(ARRAY(
+            SELECT DISTINCT tool FROM unnest(required_tools) AS tool ORDER BY tool))
+        AND gate_presented_payload->'size_class' = COALESCE(to_jsonb(NULLIF(size_class, '')), 'null'::jsonb)
+        AND EXISTS (
+            SELECT 1 FROM run_user_inputs i
+            WHERE i.run_id = runs.id AND i.kind = 'approve_plan'
+              AND i.applied_at IS NOT NULL
+              AND i.disposition IS DISTINCT FROM 'superseded'
+              AND i.gate_binding = 'bound'
+              AND i.gate_revision = runs.gate_revision))
+       OR (NOT plan_cross_check_required AND EXISTS (
+            SELECT 1 FROM run_user_inputs i
+            WHERE i.run_id = runs.id AND i.kind = 'approve_plan'
+              AND i.applied_at IS NOT NULL
+              AND i.disposition IS DISTINCT FROM 'superseded')))
   -- awaiting_input → running is guarded the same way and for the same reason
   -- (PRD #88 M1), as a SECOND, INDEPENDENT clause. Never merge the two into
   -- `status NOT IN (...) OR kind IN (...)`: that would let a consumed `answer`
