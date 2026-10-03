@@ -11731,14 +11731,22 @@ WITH ins AS (
       -- PRD #1497 M1 (D16): claim_released_at IS NULL is a STANDALONE conjunct, so a released claim
       -- is rejected even for a generation-less (legacy) report; a live claim still honours a NULL gen.
       AND r.claim_released_at IS NULL
-      -- Match SetRunCompleted: parking clears auto_approve, and a later status change
-      -- must not make an unapproved plan eligible for a completion attempt.
+      -- Match SetRunCompleted: compare the fields approval does not mutate;
+      -- the owner's capability override clears required_capabilities after approval.
       AND (NOT r.plan_cross_check_required OR
-           (r.plan_md IS NOT NULL AND (r.auto_approve OR EXISTS (
-               SELECT 1 FROM run_user_inputs i
-               WHERE i.run_id = r.id AND i.kind = 'approve_plan'
-                 AND i.applied_at IS NOT NULL
-                 AND i.disposition IS DISTINCT FROM 'superseded'))))
+           (r.plan_md IS NOT NULL AND (r.auto_approve OR
+               (r.gate_presented_payload->>'plan_md' = r.plan_md
+                AND r.gate_presented_payload->'milestones' = COALESCE(r.milestones_candidate, 'null'::jsonb)
+                AND r.gate_presented_payload->'required_tools' = to_jsonb(ARRAY(
+                    SELECT DISTINCT tool FROM unnest(r.required_tools) AS tool ORDER BY tool))
+                AND r.gate_presented_payload->'size_class' = COALESCE(to_jsonb(NULLIF(r.size_class, '')), 'null'::jsonb)
+                AND EXISTS (
+                   SELECT 1 FROM run_user_inputs i
+                   WHERE i.run_id = r.id AND i.kind = 'approve_plan'
+                     AND i.applied_at IS NOT NULL
+                     AND i.disposition IS DISTINCT FROM 'superseded'
+                     AND i.gate_binding = 'bound'
+                     AND i.gate_revision = r.gate_revision)))))
       AND ($7::bigint IS NULL
            OR r.claim_generation = $7::bigint)
     RETURNING run_completion_attempts.id
@@ -13696,6 +13704,41 @@ UPDATE runs SET
     -- never reaches this statement (it short-circuits in gatePlan and never parks), so
     -- the ONLY run this newly affects is the forceGate ci_fix case — the intent.
     auto_approve = false,
+    -- Invalidate a published gate when any approval-bearing value changes. Compare
+    -- the effective values written below, so an exact retry retains its snapshot.
+    gate_presentation_id = CASE WHEN plan_cross_check_required AND (
+        plan_md IS DISTINCT FROM $1
+        OR milestones_candidate IS DISTINCT FROM $2::jsonb
+        OR NOT (
+            required_capabilities @> (required_capabilities || COALESCE($3::text[], '{}'))
+            AND required_capabilities <@ (required_capabilities || COALESCE($3::text[], '{}'))
+        )
+        OR required_tools IS DISTINCT FROM COALESCE($4::text[], required_tools)
+        OR size_class IS DISTINCT FROM COALESCE($5, size_class)
+    )
+        THEN NULL ELSE gate_presentation_id END,
+    gate_presented_payload = CASE WHEN plan_cross_check_required AND (
+        plan_md IS DISTINCT FROM $1
+        OR milestones_candidate IS DISTINCT FROM $2::jsonb
+        OR NOT (
+            required_capabilities @> (required_capabilities || COALESCE($3::text[], '{}'))
+            AND required_capabilities <@ (required_capabilities || COALESCE($3::text[], '{}'))
+        )
+        OR required_tools IS DISTINCT FROM COALESCE($4::text[], required_tools)
+        OR size_class IS DISTINCT FROM COALESCE($5, size_class)
+    )
+        THEN NULL ELSE gate_presented_payload END,
+    gate_payload_digest = CASE WHEN plan_cross_check_required AND (
+        plan_md IS DISTINCT FROM $1
+        OR milestones_candidate IS DISTINCT FROM $2::jsonb
+        OR NOT (
+            required_capabilities @> (required_capabilities || COALESCE($3::text[], '{}'))
+            AND required_capabilities <@ (required_capabilities || COALESCE($3::text[], '{}'))
+        )
+        OR required_tools IS DISTINCT FROM COALESCE($4::text[], required_tools)
+        OR size_class IS DISTINCT FROM COALESCE($5, size_class)
+    )
+        THEN NULL ELSE gate_payload_digest END,
     -- PRD #122 M1: the CANDIDATE milestone list this pre-approval report carries.
     -- DIRECT assignment, not COALESCE — the candidate is REPLACED each revision round
     -- (Decision 2), so a fresh awaiting_approval report overwrites the prior proposal.
@@ -13739,12 +13782,12 @@ UPDATE runs SET
     -- worker sends this on EVERY awaiting_approval round (empty {} when the plan turn
     -- was clean) so each gate reflects that round's tree; a pre-#212 worker omits it,
     -- sending a nil pointer -> SQL NULL -> COALESCE preserves the column.
-    plan_changed_files = COALESCE($5::text[], plan_changed_files),
+    plan_changed_files = COALESCE($6::text[], plan_changed_files),
     -- size_class is SET, absent-safe like required_tools: a present (clamped s/m/l) value
     -- REPLACES the column, and an absent (NULL) param COALESCEs back to the existing value,
     -- leaving it untouched. The service clamps to the {s,m,l} vocabulary before passing it,
     -- so a garbled worker report becomes a nil param (no change) rather than a bad value.
-    size_class = COALESCE($6, size_class),
+    size_class = COALESCE($5, size_class),
     session_id = COALESCE($7, session_id),
     -- 🔴 INVARIANT, carried by TWO call sites and by nothing else:
     -- NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND. The sibling clear is in
@@ -13840,8 +13883,8 @@ type SetRunAwaitingApprovalParams struct {
 	MilestonesCandidate  []byte      `json:"milestones_candidate"`
 	InferredCapabilities []string    `json:"inferred_capabilities"`
 	InferredTools        []string    `json:"inferred_tools"`
-	PlanChangedFiles     []string    `json:"plan_changed_files"`
 	SizeClass            pgtype.Text `json:"size_class"`
+	PlanChangedFiles     []string    `json:"plan_changed_files"`
 	SessionID            pgtype.Text `json:"session_id"`
 	ID                   uuid.UUID   `json:"id"`
 	WorkerID             pgtype.UUID `json:"worker_id"`
@@ -13853,8 +13896,8 @@ func (q *Queries) SetRunAwaitingApproval(ctx context.Context, arg SetRunAwaiting
 		arg.MilestonesCandidate,
 		arg.InferredCapabilities,
 		arg.InferredTools,
-		arg.PlanChangedFiles,
 		arg.SizeClass,
+		arg.PlanChangedFiles,
 		arg.SessionID,
 		arg.ID,
 		arg.WorkerID,
@@ -14166,14 +14209,24 @@ WHERE runs.id = $11 AND runs.worker_id = $12
   -- fail_origin 'run_timeout' to completed: the runner's result POST is refused as terminal, so
   -- that flip would yield a completed job with no result.
   AND (kind <> 'job' OR status IN ('claimed', 'running'))
-  -- A required run that parked for review cleared auto_approve. The applied verdict,
-  -- rather than status, keeps the gate closed if requeue/reclaim changes status.
+  -- A required plan needs an applied verdict bound to its current published snapshot.
+  -- Compare the fields approval does not itself mutate: the owner's capability
+  -- override deliberately clears required_capabilities after approval.
+  -- This remains closed between a new park and publication, and after requeue/reclaim.
   AND (NOT plan_cross_check_required OR
-       (plan_md IS NOT NULL AND (auto_approve OR EXISTS (
-           SELECT 1 FROM run_user_inputs i
-           WHERE i.run_id = runs.id AND i.kind = 'approve_plan'
-             AND i.applied_at IS NOT NULL
-             AND i.disposition IS DISTINCT FROM 'superseded'))))
+       (plan_md IS NOT NULL AND (auto_approve OR
+           (gate_presented_payload->>'plan_md' = plan_md
+            AND gate_presented_payload->'milestones' = COALESCE(milestones_candidate, 'null'::jsonb)
+            AND gate_presented_payload->'required_tools' = to_jsonb(ARRAY(
+                SELECT DISTINCT tool FROM unnest(required_tools) AS tool ORDER BY tool))
+            AND gate_presented_payload->'size_class' = COALESCE(to_jsonb(NULLIF(size_class, '')), 'null'::jsonb)
+            AND EXISTS (
+               SELECT 1 FROM run_user_inputs i
+               WHERE i.run_id = runs.id AND i.kind = 'approve_plan'
+                 AND i.applied_at IS NOT NULL
+                 AND i.disposition IS DISTINCT FROM 'superseded'
+                 AND i.gate_binding = 'bound'
+                 AND i.gate_revision = runs.gate_revision)))))
   -- issue #329: a genuine worker completion (it opened the MR) supersedes a
   -- wall-clock RUN_TIMEOUT failure. Scoped to fail_origin='run_timeout' ONLY: a
   -- human 'cancelled' still wins, and a worker's own 'failed'/'worker_lost' is never

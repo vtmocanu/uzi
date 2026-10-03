@@ -2004,6 +2004,41 @@ UPDATE runs SET
     -- never reaches this statement (it short-circuits in gatePlan and never parks), so
     -- the ONLY run this newly affects is the forceGate ci_fix case — the intent.
     auto_approve = false,
+    -- Invalidate a published gate when any approval-bearing value changes. Compare
+    -- the effective values written below, so an exact retry retains its snapshot.
+    gate_presentation_id = CASE WHEN plan_cross_check_required AND (
+        plan_md IS DISTINCT FROM @plan_md
+        OR milestones_candidate IS DISTINCT FROM sqlc.narg('milestones_candidate')::jsonb
+        OR NOT (
+            required_capabilities @> (required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
+            AND required_capabilities <@ (required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
+        )
+        OR required_tools IS DISTINCT FROM COALESCE(sqlc.narg('inferred_tools')::text[], required_tools)
+        OR size_class IS DISTINCT FROM COALESCE(sqlc.narg('size_class'), size_class)
+    )
+        THEN NULL ELSE gate_presentation_id END,
+    gate_presented_payload = CASE WHEN plan_cross_check_required AND (
+        plan_md IS DISTINCT FROM @plan_md
+        OR milestones_candidate IS DISTINCT FROM sqlc.narg('milestones_candidate')::jsonb
+        OR NOT (
+            required_capabilities @> (required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
+            AND required_capabilities <@ (required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
+        )
+        OR required_tools IS DISTINCT FROM COALESCE(sqlc.narg('inferred_tools')::text[], required_tools)
+        OR size_class IS DISTINCT FROM COALESCE(sqlc.narg('size_class'), size_class)
+    )
+        THEN NULL ELSE gate_presented_payload END,
+    gate_payload_digest = CASE WHEN plan_cross_check_required AND (
+        plan_md IS DISTINCT FROM @plan_md
+        OR milestones_candidate IS DISTINCT FROM sqlc.narg('milestones_candidate')::jsonb
+        OR NOT (
+            required_capabilities @> (required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
+            AND required_capabilities <@ (required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
+        )
+        OR required_tools IS DISTINCT FROM COALESCE(sqlc.narg('inferred_tools')::text[], required_tools)
+        OR size_class IS DISTINCT FROM COALESCE(sqlc.narg('size_class'), size_class)
+    )
+        THEN NULL ELSE gate_payload_digest END,
     -- PRD #122 M1: the CANDIDATE milestone list this pre-approval report carries.
     -- DIRECT assignment, not COALESCE — the candidate is REPLACED each revision round
     -- (Decision 2), so a fresh awaiting_approval report overwrites the prior proposal.
@@ -3458,14 +3493,24 @@ WHERE runs.id = @id AND runs.worker_id = @worker_id
   -- fail_origin 'run_timeout' to completed: the runner's result POST is refused as terminal, so
   -- that flip would yield a completed job with no result.
   AND (kind <> 'job' OR status IN ('claimed', 'running'))
-  -- A required run that parked for review cleared auto_approve. The applied verdict,
-  -- rather than status, keeps the gate closed if requeue/reclaim changes status.
+  -- A required plan needs an applied verdict bound to its current published snapshot.
+  -- Compare the fields approval does not itself mutate: the owner's capability
+  -- override deliberately clears required_capabilities after approval.
+  -- This remains closed between a new park and publication, and after requeue/reclaim.
   AND (NOT plan_cross_check_required OR
-       (plan_md IS NOT NULL AND (auto_approve OR EXISTS (
-           SELECT 1 FROM run_user_inputs i
-           WHERE i.run_id = runs.id AND i.kind = 'approve_plan'
-             AND i.applied_at IS NOT NULL
-             AND i.disposition IS DISTINCT FROM 'superseded'))))
+       (plan_md IS NOT NULL AND (auto_approve OR
+           (gate_presented_payload->>'plan_md' = plan_md
+            AND gate_presented_payload->'milestones' = COALESCE(milestones_candidate, 'null'::jsonb)
+            AND gate_presented_payload->'required_tools' = to_jsonb(ARRAY(
+                SELECT DISTINCT tool FROM unnest(required_tools) AS tool ORDER BY tool))
+            AND gate_presented_payload->'size_class' = COALESCE(to_jsonb(NULLIF(size_class, '')), 'null'::jsonb)
+            AND EXISTS (
+               SELECT 1 FROM run_user_inputs i
+               WHERE i.run_id = runs.id AND i.kind = 'approve_plan'
+                 AND i.applied_at IS NOT NULL
+                 AND i.disposition IS DISTINCT FROM 'superseded'
+                 AND i.gate_binding = 'bound'
+                 AND i.gate_revision = runs.gate_revision)))))
   -- issue #329: a genuine worker completion (it opened the MR) supersedes a
   -- wall-clock RUN_TIMEOUT failure. Scoped to fail_origin='run_timeout' ONLY: a
   -- human 'cancelled' still wins, and a worker's own 'failed'/'worker_lost' is never
@@ -7748,14 +7793,22 @@ WITH ins AS (
       -- PRD #1497 M1 (D16): claim_released_at IS NULL is a STANDALONE conjunct, so a released claim
       -- is rejected even for a generation-less (legacy) report; a live claim still honours a NULL gen.
       AND r.claim_released_at IS NULL
-      -- Match SetRunCompleted: parking clears auto_approve, and a later status change
-      -- must not make an unapproved plan eligible for a completion attempt.
+      -- Match SetRunCompleted: compare the fields approval does not mutate;
+      -- the owner's capability override clears required_capabilities after approval.
       AND (NOT r.plan_cross_check_required OR
-           (r.plan_md IS NOT NULL AND (r.auto_approve OR EXISTS (
-               SELECT 1 FROM run_user_inputs i
-               WHERE i.run_id = r.id AND i.kind = 'approve_plan'
-                 AND i.applied_at IS NOT NULL
-                 AND i.disposition IS DISTINCT FROM 'superseded'))))
+           (r.plan_md IS NOT NULL AND (r.auto_approve OR
+               (r.gate_presented_payload->>'plan_md' = r.plan_md
+                AND r.gate_presented_payload->'milestones' = COALESCE(r.milestones_candidate, 'null'::jsonb)
+                AND r.gate_presented_payload->'required_tools' = to_jsonb(ARRAY(
+                    SELECT DISTINCT tool FROM unnest(r.required_tools) AS tool ORDER BY tool))
+                AND r.gate_presented_payload->'size_class' = COALESCE(to_jsonb(NULLIF(r.size_class, '')), 'null'::jsonb)
+                AND EXISTS (
+                   SELECT 1 FROM run_user_inputs i
+                   WHERE i.run_id = r.id AND i.kind = 'approve_plan'
+                     AND i.applied_at IS NOT NULL
+                     AND i.disposition IS DISTINCT FROM 'superseded'
+                     AND i.gate_binding = 'bound'
+                     AND i.gate_revision = r.gate_revision)))))
       AND (sqlc.narg('claim_generation')::bigint IS NULL
            OR r.claim_generation = sqlc.narg('claim_generation')::bigint)
     RETURNING run_completion_attempts.id

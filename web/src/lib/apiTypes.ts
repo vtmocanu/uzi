@@ -2699,6 +2699,8 @@ export interface Run {
   /** PRD #19: an autopilot run (poller-started, plan auto-approved). Drives the
    *  "autopilot" badge; a manually-started run is false. */
   auto_approve: boolean;
+  /** The run's snapshot of the owner's plan cross-check setting. */
+  plan_cross_check_required: boolean;
   /** issue #857: what/how/who started the run (manual, autopilot, schedule,
    *  self_improve, ci_fix, mr_rework, chat, task, task_review, then_fix, judge,
    *  judge_rerun, resume). A NOT NULL server column (DEFAULT 'manual'), so it is

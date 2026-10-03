@@ -15,6 +15,7 @@
   "iteration_count": 1,
   "is_planning": true,
   "auto_approve": true,
+  "plan_cross_check_required": true,
   "trigger_source": "x",
   "milestones": [
     {

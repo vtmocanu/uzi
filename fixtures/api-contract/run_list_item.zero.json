@@ -15,6 +15,7 @@
   "iteration_count": 0,
   "is_planning": false,
   "auto_approve": false,
+  "plan_cross_check_required": false,
   "trigger_source": "",
   "milestones": null,
   "milestones_candidate": null,
