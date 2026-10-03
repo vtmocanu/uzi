@@ -45,6 +45,7 @@ var checkMeta = map[string]struct {
 	"controller.report":  {groupControl, "Controller reporting", "hosted-workers"},
 	"db":                 {groupControl, "Database", ""},
 	"loops":              {groupControl, "Background loops", ""},
+	"forge.sync":         {groupIntegrations, "Forge issue sync", ""},
 	"forge.ciwatch":      {groupIntegrations, "CI watch capacity", ""},
 	"slack.socket":       {groupIntegrations, "Slack socket", ""},
 	"schedules.paused":   {groupHousekeeping, "Paused schedules", ""},

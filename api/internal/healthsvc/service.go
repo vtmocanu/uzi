@@ -70,6 +70,7 @@ const (
 // it structurally, so healthsvc never depends on the concrete Queries and its severity
 // logic is driven by a fake in unit tests.
 type Store interface {
+	ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error)
 	// fleet.roll + fleet.disk read every worker with its roll-health join.
 	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
 	// fleet.rundisk (PRD #1809 M6): each listed worker's largest fresh run HOME size (per_worker 1).
@@ -160,7 +161,9 @@ type Config struct {
 	// Registry is the shared loop-beat registry (main.go builds ONE and injects the SAME
 	// one here and into each loop's Beat callback). The loops check reads its Snapshot. nil
 	// (a struct-literal test handler that never wired loops) makes loops degrade to `na`.
-	Registry *BeatRegistry
+	Registry          *BeatRegistry
+	ForgeSyncRegistry *SyncRegistry
+	ForgeSyncInterval time.Duration
 }
 
 // Service holds the injected deps plus the process-memory slack "first-saw-non-connected"
@@ -252,6 +255,7 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		s.checkDB(ctx),
 		s.checkLoops(now),
 		s.checkForgeCIWatch(ctx, now),
+		s.checkForgeSync(ctx, now),
 		s.checkSlackSocket(now),
 		s.checkSchedulesPaused(ctx, now),
 		s.checkBoardDrift(ctx, now),

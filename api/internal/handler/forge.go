@@ -887,6 +887,10 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.invalidateRepoSync != nil {
+		h.invalidateRepoSync(id)
+	}
+
 	// issue #1432 rework: a successful enable makes any pending override request for this
 	// repo moot. Settle it so it does not linger in the admin queue
 	// (ListPendingGuardrailOverrideRequests is not filtered by enabled state). Best-effort —

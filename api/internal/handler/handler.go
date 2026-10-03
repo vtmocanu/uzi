@@ -246,11 +246,12 @@ type Handler struct {
 	// and recovery(). The endpoint caches one evaluation for healthCacheTTL under
 	// healthCacheMu so a fleet of open admin tabs polling every 10 s cost one evaluation
 	// per window rather than one per request.
-	healthSvc      *healthsvc.Service
-	healthSvcOnce  sync.Once
-	healthCacheMu  sync.Mutex
-	healthCachedAt time.Time
-	healthCached   *apitypes.HealthDocDTO
+	invalidateRepoSync func(uuid.UUID)
+	healthSvc          *healthsvc.Service
+	healthSvcOnce      sync.Once
+	healthCacheMu      sync.Mutex
+	healthCachedAt     time.Time
+	healthCached       *apitypes.HealthDocDTO
 }
 
 // ReleaseCheckReconciler is the slice of *releasecheck.Reconciler the admin
@@ -340,6 +341,11 @@ func (h *Handler) SetReleaseCheckReconciler(r ReleaseCheckReconciler) { h.releas
 // struct-literal test handlers that never call this) never overwrites it. Leaving it unset
 // keeps the M1 lazy-construction behaviour, whose registry is empty (loops degrades to na).
 func (h *Handler) SetHealthService(s *healthsvc.Service) { h.healthSvc = s }
+
+// SetRepoSyncInvalidator wires health-history reset after a successful enabled write.
+func (h *Handler) SetRepoSyncInvalidator(invalidate func(uuid.UUID)) {
+	h.invalidateRepoSync = invalidate
+}
 
 // clock reads the classification clock seam, nil-safe.
 //

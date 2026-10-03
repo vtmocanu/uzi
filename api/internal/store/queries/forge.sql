@@ -776,3 +776,6 @@ LIMIT @lim;
 -- cannot both consume it — the same guard ApplyFiledIssueCloseEdge's stamp uses.
 UPDATE runs SET prd_patch_settled_at = now()
 WHERE id = @id AND prd_patch_settled_at IS NULL;
+
+-- name: ListEnabledRepoIDs :many
+SELECT id FROM repos WHERE enabled = true;

@@ -28,6 +28,8 @@ import (
 // ---- fakes -----------------------------------------------------------------
 
 type fakeStore struct {
+	enabledIDs    []uuid.UUID
+	enabledErr    error
 	workers       []store.ListAllWorkersRow
 	workersErr    error
 	capacityRows  []store.ListOwnersWaitingNoCapacityRow
@@ -48,6 +50,10 @@ type fakeStore struct {
 	ciwatchErr    error
 	runDisk       []store.WorkerRunDisk
 	runDiskErr    error
+}
+
+func (f *fakeStore) ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error) {
+	return f.enabledIDs, f.enabledErr
 }
 
 func (f *fakeStore) ListAllWorkers(context.Context) ([]store.ListAllWorkersRow, error) {
@@ -642,10 +648,11 @@ func TestEvaluateRollupAndRegistry(t *testing.T) {
 	}
 	// The full registry, in a stable order (PRD "Checks in v1" table order), always
 	// present. M2-B added controller.report + loops (control) and forge.ciwatch
-	// (integrations), so it is 14, not 11; PRD #1809 M6 added fleet.rundisk (workers), 15.
+	// (integrations), so it is 14, not 11; PRD #1809 M6 added fleet.rundisk
+	// (workers), and issue #2203 adds forge.sync (integrations), making 16.
 	wantIDs := []string{
 		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "queue.waiting", "queue.undispatched",
-		"controller.report", "db", "loops", "forge.ciwatch", "slack.socket",
+		"controller.report", "db", "loops", "forge.ciwatch", "forge.sync", "slack.socket",
 		"schedules.paused", "board.drift", "custody.holds", "release.check",
 	}
 	if len(doc.Checks) != len(wantIDs) {

@@ -60,6 +60,25 @@ func TestHealthChecksLiveDB(t *testing.T) {
 		return userID, repoID
 	}
 
+	t.Run("enabled repository IDs", func(t *testing.T) {
+		_, enabled := seedUserRepo("sync-enabled")
+		_, disabled := seedUserRepo("sync-disabled")
+		_, deleted := seedUserRepo("sync-deleted")
+		mustExec(ctx, t, pool, `UPDATE repos SET enabled = false WHERE id = $1`, disabled)
+		mustExec(ctx, t, pool, `DELETE FROM repos WHERE id = $1`, deleted)
+		ids, err := q.ListEnabledRepoIDs(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := map[uuid.UUID]bool{}
+		for _, id := range ids {
+			found[id] = true
+		}
+		if !found[enabled] || found[disabled] || found[deleted] {
+			t.Fatalf("enabled enumeration: %v", ids)
+		}
+	})
+
 	seedWorker := func(userID uuid.UUID, kind string, hbAgo *time.Duration, draining bool) uuid.UUID {
 		id := uuid.New()
 		var size, tmpl any
