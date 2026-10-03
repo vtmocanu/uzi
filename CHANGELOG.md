@@ -37,6 +37,8 @@ through `[0.52.0]`.)
   A fresh provider epoch now waits until launch before saving its session, so an owner pause or wall park cannot replace the previously saved thread with an empty session.
 - **Owner run inputs and chat messages containing NUL bytes now save successfully.**
   The API removes NUL bytes before writing plan revisions, gate approvals, plain inputs, and chat messages to PostgreSQL TEXT columns, while retaining each path's whitespace handling, validation, and limits.
+- **Codex provisioning failures name their cause ([#2187](https://github.com/vtmocanu/uzi/issues/2187)).**
+  When a runner-owned provisioning step (including the session seed) fails, the run's failure reason and the worker log now carry its exit status, signal, spawn-error code and a bounded tail of its stderr, redacted for the run's secrets before it is cut; where no redactor is available (the advice lane) stderr is withheld, and the seed helper now names why it exited 2.
 
 ## [0.85.0] - 2026-09-26
 
