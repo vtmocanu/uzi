@@ -1499,3 +1499,70 @@ func TestForgejoListIssuesMapsAssignees(t *testing.T) {
 		t.Fatalf("unassigned issue must have no assignees, got %v", issues[1].Assignees)
 	}
 }
+
+// withForgejoCap lowers forgejoMaxResponseBytes for one test.
+func withForgejoCap(t *testing.T, n int64) {
+	t.Helper()
+	old := forgejoMaxResponseBytes
+	forgejoMaxResponseBytes = n
+	t.Cleanup(func() { forgejoMaxResponseBytes = old })
+}
+
+func TestForgejoResponseCap(t *testing.T) {
+	const capBytes = 4096
+	validIssues := `[{"id":100,"number":11,"title":"t","state":"open","user":{"login":"alice"}}]`
+	pad := strings.Repeat(" ", capBytes*2)
+
+	t.Run("oversize 2xx body fails closed", func(t *testing.T) {
+		withForgejoCap(t, capBytes)
+		m := newMockForgejo(t, map[string]http.HandlerFunc{
+			"/repos/acme/widgets/issues": func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(validIssues + pad))
+			},
+		})
+		d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+		issues, err := d.ListIssues(context.Background(), 7, ListIssuesOptions{})
+		if err == nil {
+			t.Fatalf("expected an error for an over-cap body, got %d issues", len(issues))
+		}
+		// The redactor flattens the chain, so match on the message.
+		if !strings.Contains(err.Error(), errForgeResponseTooLarge.Error()) {
+			t.Fatalf("error should carry the too-large failure: %v", err)
+		}
+	})
+
+	t.Run("oversize error body fails closed", func(t *testing.T) {
+		withForgejoCap(t, capBytes)
+		m := newMockForgejo(t, map[string]http.HandlerFunc{
+			"/repos/acme/widgets/issues": func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(strings.Repeat("x", capBytes*2)))
+			},
+		})
+		d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+		_, err := d.ListIssues(context.Background(), 7, ListIssuesOptions{})
+		if err == nil {
+			t.Fatal("expected an error for an over-cap 503 body")
+		}
+		if !strings.Contains(err.Error(), errForgeResponseTooLarge.Error()) {
+			t.Fatalf("error should carry the too-large failure: %v", err)
+		}
+	})
+
+	t.Run("under-cap body succeeds", func(t *testing.T) {
+		withForgejoCap(t, capBytes)
+		m := newMockForgejo(t, map[string]http.HandlerFunc{
+			"/repos/acme/widgets/issues": func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(validIssues))
+			},
+		})
+		d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+		issues, err := d.ListIssues(context.Background(), 7, ListIssuesOptions{})
+		if err != nil {
+			t.Fatalf("ListIssues: %v", err)
+		}
+		if len(issues) != 1 {
+			t.Fatalf("got %d issues, want 1", len(issues))
+		}
+	})
+}
