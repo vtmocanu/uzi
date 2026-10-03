@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
+import type { SpawnSyncOptions } from "node:child_process";
 import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -1009,16 +1010,16 @@ describe("launchCodexRoot: provisioning failure diagnostics", () => {
   const SEED_ARG = "/app/src/codex/session-seed-cli.ts";
   type Step = "tree" | "share" | "seed" | "write" | "rm";
   type Result = Partial<{ status: number | null; signal: NodeJS.Signals | null; stderr: string; error: Error }>;
-  const provisionCalls: { command: string; args: readonly string[]; step: Step }[] = [];
+  const provisionCalls: { command: string; args: readonly string[]; step: Step; options: SpawnSyncOptions }[] = [];
 
   function scripted(results: Partial<Record<Step, Result>>): ProvisionSpawnSync {
-    return (command, args) => {
+    return (command, args, options) => {
       const a = [...args];
       const step: Step = a.includes(SEED_ARG) ? "seed"
         : a.includes("--") && a.includes("-rf") ? "rm"
         : provisionCalls.length === 0 ? "tree"
         : a.some((x) => x.includes("chgrp")) ? "share" : "write";
-      provisionCalls.push({ command, args: a, step });
+      provisionCalls.push({ command, args: a, step, options });
       const r = results[step] ?? {};
       return {
         pid: 1, output: [], stdout: Buffer.alloc(0),
@@ -1051,6 +1052,14 @@ describe("launchCodexRoot: provisioning failure diagnostics", () => {
     const msg = await failure({ seed: { status: 1, stderr: "seed boom: EACCES" } }, { redactDiagnostic: makeTextRedactor([]) });
     assert.match(msg, /^runner-owned session seed failed \(exit 1\): seed boom: EACCES$/);
     assert.ok(provisionCalls.find((c) => c.step === "seed")?.args.includes(SESSION_SEED_ENTRYPOINT));
+  });
+
+  it("spawns the seed with stderr piped, stdin/stdout ignored, and HOME/TMPDIR under the root", async () => {
+    await failure({ seed: { status: 1, stderr: "x" } }, { redactDiagnostic: (t) => t });
+    const opts = provisionCalls.find((c) => c.step === "seed")?.options;
+    assert.deepEqual(opts?.stdio, ["ignore", "ignore", "pipe"]);
+    assert.equal(opts?.env?.HOME, `${DATA_ROOT}/home`);
+    assert.equal(opts?.env?.TMPDIR, `${DATA_ROOT}/tmp`);
   });
 
   it("keeps only a bounded tail of oversized stderr", async () => {

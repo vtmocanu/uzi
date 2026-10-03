@@ -4,15 +4,17 @@
 // as uid `runner`, after the final 0710/2750 tree exists and before app-server
 // spawn, so only the provider identity writes its sessions directory.
 //
-// Exit codes: 0 = seeded. 2 = this helper's own handled failure, with exactly one
-// content-free reason line on stderr (never an error message, path or session content).
+// Exit codes: 0 = seeded. 2 = normally this helper's own handled failure, with exactly one
+// content-free reason line on stderr (never an error message, path or session content);
+// the runtime itself can also exit 2 (a missing TMPDIR did, with the tsx version tested),
+// in which case its own stderr is what the launcher publishes.
 // 1 = a failure outside runSessionSeedCli: runtime startup or an uncaught exception at
 // module load. Reproduced: (a) under the `tsx` CLI, a TMPDIR long enough that
 // `${TMPDIR}/tsx-<uid>/<pid>.pipe` exceeds the 107-byte unix socket path limit gives
 // `Error: listen EINVAL`, exit 1 (#2187 incident; root cause fixed separately by #2190);
 // (b) an entrypoint that throws at module load exits 1 with the thrown error, under both
-// `tsx <script>` and `node --import tsx <script>`. A missing TMPDIR exited 2, not 1, with
-// the tsx version tested. The launcher surfaces the redacted stderr tail in every case.
+// `tsx <script>` and `node --import tsx <script>`. The launcher surfaces the redacted
+// stderr tail in every case.
 
 import { pathToFileURL } from "node:url";
 

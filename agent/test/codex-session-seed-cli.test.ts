@@ -68,9 +68,10 @@ describe("session seed failure outside runSessionSeedCli reaches the launcher er
   it("a module-load throw exits 1 and its stderr is published by launchCodexRoot", async () => {
     const agentRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
     const appRoot = await fs.mkdtemp(path.join(os.tmpdir(), "seed-app-"));
-    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "seed-tmp-"));
+    let tmpDir = "";
     const probe = "SEED-PROBE-module-load-throw-71c2";
     try {
+      tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "seed-tmp-"));
       await fs.symlink(path.join(agentRoot, "node_modules"), path.join(appRoot, "node_modules"));
       await fs.mkdir(path.join(appRoot, "src", "codex"), { recursive: true });
       await fs.writeFile(path.join(appRoot, "src", "codex", "session-seed-cli.ts"), `throw new Error(${JSON.stringify(probe)});\n`);
@@ -80,6 +81,7 @@ describe("session seed failure outside runSessionSeedCli reaches the launcher er
       const real = spawnSync(inv.command, inv.args, {
         env: { PATH: process.env.PATH, HOME: tmpDir, TMPDIR: tmpDir },
         stdio: ["ignore", "ignore", "pipe"],
+        timeout: 30_000, // a sync spawn cannot be interrupted by --test-timeout
       });
       assert.equal(real.status, 1, `stderr: ${String(real.stderr)}`);
       assert.ok(String(real.stderr).includes(probe));
@@ -118,7 +120,7 @@ describe("session seed failure outside runSessionSeedCli reaches the launcher er
       });
     } finally {
       await fs.rm(appRoot, { recursive: true, force: true });
-      await fs.rm(tmpDir, { recursive: true, force: true });
+      if (tmpDir !== "") await fs.rm(tmpDir, { recursive: true, force: true });
     }
   });
 });
