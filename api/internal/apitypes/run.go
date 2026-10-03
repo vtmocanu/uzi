@@ -657,6 +657,12 @@ type RunDTO struct {
 	// Since PRD #111 M1 it can finally be read TOGETHER with the two fields above:
 	// what a run cost, and which credential it cost it against.
 	Usage *UsageDTO `json:"usage,omitempty"`
+	// UsageEstimatedTail is the ESTIMATED usage of an interrupted Claude session's uncovered
+	// tail (issue #2014, ADR-2014), shown apart from the metered Usage above and never added to
+	// it. Present only when the run has recorded usage legs or a tail state (nil otherwise, so a
+	// pre-feature run and every run on an old worker omit it); filled on the single-run detail
+	// read (GetRun) only.
+	UsageEstimatedTail *UsageTailDTO `json:"usage_estimated_tail,omitempty"`
 	// Anthropic usage-limit park (PRD #35). A run that exhausts the owner's
 	// subscription window is parked at status "limit_wait" rather than failed, and
 	// resumes once the window reopens.

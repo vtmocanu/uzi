@@ -264,6 +264,20 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 //     the upsert, so no worker string reaches the CHECK-closed column. `lineage_index`
 //     is a server-side int32 count (CountRunLineageRestartsBefore), bounded like
 //     lineage_epoch, so it always fits and satisfies its >= 0 CHECK.
+//   - foldRunUsage → foldUsageTailStamps (issue #2014, ADR-2014 D4/D11) — the estimated
+//     tail's leg identity and coverage writes (UpsertRunUsageLegInit, UpsertRunUsageLegCoverage,
+//     UpsertRunUsageTailState). A second CLEARED suspect, and for a stronger reason: it runs
+//     AFTER the metered fold and can never fail the append at all. Every worker-controlled value
+//     it reads out of the frame payload is validated BEFORE any write and a bad one is SKIPPED,
+//     never an error: `leg_id` must parse as a non-nil UUID; `sdk_session_id` is NUL-stripped,
+//     rune-capped (maxUsageIDRunes, matching its CHECK) and must be non-empty; `usage_through`
+//     must be an integer in 0..MaxInt32 (its column is int4 with a >= 0 CHECK); `usage_basis`
+//     reduces to one boolean. The frame's seq is server-side (already validated > 0 above) and
+//     the claim generation is the fenced one. The legs cap (maxUsageLegsPerRun) is applied under
+//     the per-run advisory lock, which is the FIRST statement of the stamp transaction, so an
+//     oversized or hostile stream of distinct leg ids is bounded and sets record_cap_reached
+//     instead of growing the table. The write runs in its own transaction and its error is
+//     logged and dropped, so a failure here is never a 500, never a 400 and never re-delivered.
 //
 // A broader wrap was considered and rejected: with the above holding it catches
 // nothing extra, while reintroducing exactly the misattribution this narrowness
@@ -539,8 +553,20 @@ type usageFoldQuerier interface {
 // calls foldUsageFrames directly through a tx-bound querier over a run's full history.
 // Malformed/absent usage is skipped (never fails the append); a DB error propagates so
 // the append fails and the worker re-delivers.
+//
+// After the unchanged metered fold it also records the leg identity and coverage stamps for the
+// estimated usage tail (ADR-2014 D4, D11) through foldUsageTailStamps. That extension lives HERE,
+// in the incremental wrapper, and deliberately NOT inside foldUsageFrames: RefoldRunUsage runs
+// foldUsageFrames inside its own transaction after DeleteRunUsage, and the stamp writes take the
+// per-run usage advisory lock first in a transaction of their own, so putting them in the shared
+// body would make the refold take that lock after a row write. The tail never fails the append:
+// a bad stamp is skipped and a database error is logged inside foldUsageTailStamps.
 func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []IncomingMessage) error {
-	return foldUsageFrames(ctx, s.q, run, msgs)
+	if err := foldUsageFrames(ctx, s.q, run, msgs); err != nil {
+		return err
+	}
+	s.foldUsageTailStamps(ctx, run, msgs)
+	return nil
 }
 
 // foldUsageFrames folds every result frame in `frames` into run_usage, keyed per SDK

@@ -27,6 +27,44 @@ type UsageDTO struct {
 	CostStatus string `json:"cost_status"`
 }
 
+// UsageTailDTO is the ESTIMATED usage of model calls that no SDK result frame covered (issue
+// #2014, ADR-2014): the tail of an interrupted Claude session. It rides RunDTO.UsageEstimatedTail
+// and is ALWAYS shown apart from the metered UsageDTO; it is never added to it, counts toward no
+// budget and never enters run_usage_totals.
+//
+// CostUSD is a pointer so an unpriced tail marshals as JSON null, never 0: CostStatus
+// "estimated" means every tail message was priced from the recorded table
+// (PriceTableVersion), "unpriced" means at least one was not (unknown model, a non-standard
+// service tier, speed or inference geo, cache writes without a 5m/1h split) and the dollar
+// figure is unknown. Coverage is "complete" or "partial"; CoverageReasons is the closed set the
+// ADR names (leg_not_closed, ordinal_gap, output_not_final, superseded_uncertain,
+// records_dropped, record_cap_reached, unresolved) and is empty exactly when coverage is
+// complete. A client must render an unrecognised reason honestly: the API is deployed
+// separately and a newer server can add one.
+type UsageTailDTO struct {
+	InputTokens         int64               `json:"input_tokens"`
+	CacheReadTokens     int64               `json:"cache_read_tokens"`
+	CacheCreationTokens int64               `json:"cache_creation_tokens"`
+	OutputTokens        int64               `json:"output_tokens"`
+	CostUSD             *float64            `json:"cost_usd"`
+	CostStatus          string              `json:"cost_status"`
+	PriceTableVersion   string              `json:"price_table_version"`
+	Coverage            string              `json:"coverage"`
+	CoverageReasons     []string            `json:"coverage_reasons"`
+	Models              []UsageTailModelDTO `json:"models"`
+}
+
+// UsageTailModelDTO is one model's share of the estimated tail, with its own cost or null.
+type UsageTailModelDTO struct {
+	Model               string   `json:"model"`
+	InputTokens         int64    `json:"input_tokens"`
+	CacheReadTokens     int64    `json:"cache_read_tokens"`
+	CacheCreationTokens int64    `json:"cache_creation_tokens"`
+	OutputTokens        int64    `json:"output_tokens"`
+	CostUSD             *float64 `json:"cost_usd"`
+	CostStatus          string   `json:"cost_status"`
+}
+
 // RunOutcomesDTO is the failed-run rate aggregate for one scope+window (PRD #1293).
 // Counted over `runs` directly, NOT the usage rollup (D1): a run that fails before
 // spending a token has no usage row but must still count. All five counts are always

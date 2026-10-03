@@ -1123,6 +1123,49 @@ type RunUsage struct {
 	LineageIndex        int32              `json:"lineage_index"`
 }
 
+type RunUsageLeg struct {
+	RunID             uuid.UUID          `json:"run_id"`
+	LegID             uuid.UUID          `json:"leg_id"`
+	InitSeq           pgtype.Int8        `json:"init_seq"`
+	SdkSessionID      pgtype.Text        `json:"sdk_session_id"`
+	ClosedThrough     pgtype.Int4        `json:"closed_through"`
+	CoveredThrough    pgtype.Int4        `json:"covered_through"`
+	CoveredCumulative bool               `json:"covered_cumulative"`
+	DroppedRecords    int64              `json:"dropped_records"`
+	ClaimGeneration   pgtype.Int8        `json:"claim_generation"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+}
+
+type RunUsageMessage struct {
+	RunID                      uuid.UUID          `json:"run_id"`
+	MessageID                  string             `json:"message_id"`
+	LegID                      uuid.UUID          `json:"leg_id"`
+	Ordinal                    int32              `json:"ordinal"`
+	FrameSessionID             pgtype.Text        `json:"frame_session_id"`
+	Model                      string             `json:"model"`
+	Subagent                   bool               `json:"subagent"`
+	InputTokens                int64              `json:"input_tokens"`
+	CacheReadInputTokens       int64              `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens   int64              `json:"cache_creation_input_tokens"`
+	CacheCreation5mInputTokens pgtype.Int8        `json:"cache_creation_5m_input_tokens"`
+	CacheCreation1hInputTokens pgtype.Int8        `json:"cache_creation_1h_input_tokens"`
+	OutputTokens               int64              `json:"output_tokens"`
+	OutputFinal                bool               `json:"output_final"`
+	ServiceTier                pgtype.Text        `json:"service_tier"`
+	Speed                      pgtype.Text        `json:"speed"`
+	InferenceGeo               pgtype.Text        `json:"inference_geo"`
+	Conflict                   bool               `json:"conflict"`
+	ClaimGeneration            pgtype.Int8        `json:"claim_generation"`
+	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
+}
+
+type RunUsageTailState struct {
+	RunID            uuid.UUID `json:"run_id"`
+	RecordCapReached bool      `json:"record_cap_reached"`
+	CappedRecords    int64     `json:"capped_records"`
+	CappedLegs       int64     `json:"capped_legs"`
+}
+
 type RunUsageTotal struct {
 	RunID               uuid.UUID      `json:"run_id"`
 	InputTokens         int64          `json:"input_tokens"`

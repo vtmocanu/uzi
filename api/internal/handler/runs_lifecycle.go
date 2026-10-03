@@ -672,6 +672,14 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Error("get run usage total", "run_id", run.ID, "error", err)
 	}
+	// Issue #2014 (ADR-2014): the ESTIMATED usage tail of an interrupted Claude session, a separate
+	// figure that is never added to the metered Usage above. nil (no recorded legs) leaves the
+	// field omitted. Best-effort like Usage: a lookup error must not fail the read.
+	if tail, err := h.wsvc.RunUsageTail(r.Context(), run.ID); err != nil {
+		slog.Error("get run usage tail", "run_id", run.ID, "error", err)
+	} else if tail != nil {
+		dto.UsageEstimatedTail = tail
+	}
 	// issue #403 F1/F6: stamp the branch-wide `uzi handoff rm` preconditions for a task run so
 	// the CLI can refuse rm when the branch still has a live run (a running original or an
 	// in-flight review/fix child) or belongs to a task that opened an MR. Owner-scoped query.

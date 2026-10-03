@@ -1140,6 +1140,9 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Post("/heartbeat", h.WorkerHeartbeat)
 		r.Post("/runs/claim", h.WorkerClaim)
 		r.Post("/runs/{id}/messages", h.WorkerRunMessages)
+		// Issue #2014: per-message usage for the estimated tail of an interrupted Claude session.
+		// NOT lane-allowlisted: an isolated-lane run is not a Claude run-lane flight that posts it.
+		r.Post("/runs/{id}/usage", h.WorkerRunUsage)
 		r.Post("/runs/{id}/state", h.WorkerRunState)
 		r.Get("/runs/{id}/inputs", h.WorkerRunInputs)
 		r.Post("/runs/{id}/inputs/ack", h.WorkerRunInputsAck)
