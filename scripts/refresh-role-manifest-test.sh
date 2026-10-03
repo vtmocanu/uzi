@@ -11,6 +11,19 @@ fail=0
 tmp_root="$(mktemp -d)"
 trap 'rm -rf "$tmp_root"' EXIT
 
+# A unified-only `diff` first on PATH, like BusyBox on Alpine workers: a call without
+# -u/-U fails, so a normal-format dependency in the script reddens this test on a
+# GNU-diff host (CI) too, not only where BusyBox happens to be first.
+real_diff="$(command -v diff)"
+mkdir "$tmp_root/bin"
+cat > "$tmp_root/bin/diff" <<SH
+#!/usr/bin/env bash
+for a in "\$@"; do case "\$a" in -u|-U*|--unified*) exec "$real_diff" "\$@" ;; esac; done
+echo "diff: unified output only (BusyBox stand-in)" >&2; exit 2
+SH
+chmod +x "$tmp_root/bin/diff"
+export PATH="$tmp_root/bin:$PATH"
+
 ok() { pass=$((pass + 1)); echo "ok   $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL $1${2:+: $2}"; }
 
