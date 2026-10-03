@@ -217,7 +217,7 @@ func TestCountOnlineWorkersClaimableForRunJobLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return n
+		return n.Claimable
 	}
 	e.seedWorkerRow(t, u, false, nil)                     // old image
 	e.seedWorkerRow(t, u, true, nil, jobCap, jobFilesCap) // docker, advertising

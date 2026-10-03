@@ -12,6 +12,8 @@ import (
 // PRD means by "constants in v1, named in one place, not settings". A test overrides a
 // check's behaviour by controlling the injected clock/data, never by editing a literal.
 const (
+	// fleetCapacityRollDanger is the wait/drain overlap ceiling, independent of controller deadlines.
+	fleetCapacityRollDanger = 24 * time.Hour
 	// fleetCapacityDanger: an owner with a waiting_worker run and zero usable workers is
 	// a danger once the oldest such wait has lasted this long. Below it the capacity gap
 	// may be a transient claim delay, so it does not yet alarm.

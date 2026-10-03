@@ -821,7 +821,7 @@ func TestCountOnlineWorkersClaimableForRunLiveDB(t *testing.T) {
 		if err != nil {
 			fx.t.Fatalf("CountOnlineWorkersClaimableForRun: %v", err)
 		}
-		return n
+		return n.Claimable
 	}
 
 	t.Run("excludes the released incarnation, counts a re-registered one", func(t *testing.T) {

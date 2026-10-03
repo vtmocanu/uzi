@@ -75,7 +75,7 @@ type Store interface {
 	// fleet.rundisk (PRD #1809 M6): each listed worker's largest fresh run HOME size (per_worker 1).
 	ListLargestRunDiskForWorkers(ctx context.Context, arg store.ListLargestRunDiskForWorkersParams) ([]store.WorkerRunDisk, error)
 	// fleet.capacity: owners waiting with zero usable (online, non-draining, fresh) workers.
-	ListOwnersWaitingNoCapacity(ctx context.Context, heartbeatCutoff pgtype.Timestamptz) ([]store.ListOwnersWaitingNoCapacityRow, error)
+	ListOwnersWaitingNoCapacity(ctx context.Context, arg store.ListOwnersWaitingNoCapacityParams) ([]store.ListOwnersWaitingNoCapacityRow, error)
 	// queue.waiting: oldest waiting_worker run's health_since (nullable).
 	OldestWaitingWorkerRun(ctx context.Context) (pgtype.Timestamptz, error)
 	// queue.undispatched: oldest undispatched task run's created_at (nullable).
@@ -118,9 +118,12 @@ type dbStat struct {
 
 // Config carries the injected collaborators. Every field is a seam a unit test overrides.
 type Config struct {
-	Store    Store
-	Pool     *pgxpool.Pool
-	Settings Settings
+	// WorkerEligibilityForHealth confirms a stored roll reason against current composed eligibility.
+	// A nil callback or an error leaves the row on the genuine-capacity path.
+	WorkerEligibilityForHealth func(context.Context, time.Time, uuid.UUID) (store.CountOnlineWorkersClaimableForRunRow, error)
+	Store                      Store
+	Pool                       *pgxpool.Pool
+	Settings                   Settings
 	// SlackState reports the live Slack socket state (slacksvc.State* strings); nil reads
 	// as StateDisabled, so slack.socket is `na`.
 	SlackState func() string

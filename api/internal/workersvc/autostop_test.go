@@ -1057,8 +1057,8 @@ func (f *autoStopSweepStore) SetRunWallPark(context.Context, store.SetRunWallPar
 func (f *autoStopSweepStore) RecordWallParkCapturedHead(context.Context, store.RecordWallParkCapturedHeadParams) (int64, error) {
 	return 0, nil
 }
-func (f *autoStopSweepStore) CountOnlineWorkersClaimableForRun(context.Context, store.CountOnlineWorkersClaimableForRunParams) (int64, error) {
-	return 0, nil
+func (f *autoStopSweepStore) CountOnlineWorkersClaimableForRun(context.Context, store.CountOnlineWorkersClaimableForRunParams) (store.CountOnlineWorkersClaimableForRunRow, error) {
+	return store.CountOnlineWorkersClaimableForRunRow{}, nil
 }
 func (f *autoStopSweepStore) ExtendAndResumeWallPark(context.Context, store.ExtendAndResumeWallParkParams) (int32, error) {
 	return 0, pgx.ErrNoRows

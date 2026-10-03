@@ -3,6 +3,7 @@ package healthsvc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -52,7 +53,7 @@ type fakeStore struct {
 func (f *fakeStore) ListAllWorkers(context.Context) ([]store.ListAllWorkersRow, error) {
 	return f.workers, f.workersErr
 }
-func (f *fakeStore) ListOwnersWaitingNoCapacity(context.Context, pgtype.Timestamptz) ([]store.ListOwnersWaitingNoCapacityRow, error) {
+func (f *fakeStore) ListOwnersWaitingNoCapacity(context.Context, store.ListOwnersWaitingNoCapacityParams) ([]store.ListOwnersWaitingNoCapacityRow, error) {
 	return f.capacityRows, f.capacityErr
 }
 func (f *fakeStore) OldestWaitingWorkerRun(context.Context) (pgtype.Timestamptz, error) {
@@ -246,8 +247,8 @@ func TestFleetRoll(t *testing.T) {
 func TestFleetCapacity(t *testing.T) {
 	waitRow := func(ago time.Duration) store.ListOwnersWaitingNoCapacityRow {
 		return store.ListOwnersWaitingNoCapacityRow{
-			UserID:            uuid.New(),
-			OldestHealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-ago), Valid: true},
+			UserID:      uuid.New(),
+			HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-ago), Valid: true},
 		}
 	}
 	tests := []struct {
@@ -891,6 +892,187 @@ func assertClean(t *testing.T, where, s string) {
 	for _, r := range s {
 		if unicode.IsControl(r) {
 			t.Fatalf("%s carries a control character %U: %q", where, r, s)
+		}
+	}
+}
+
+func TestFleetCapacityRollConfirmation(t *testing.T) {
+	owner := uuid.New()
+	row := store.ListOwnersWaitingNoCapacityRow{UserID: owner, RunID: uuid.New(), HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-48 * time.Hour), Valid: true}, HasRollReason: true}
+	eligible := store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 2, LatestSuitableDrainingSince: pgtype.Timestamptz{Time: fixedNow.Add(-time.Hour), Valid: true}}
+	for _, tc := range []struct {
+		name        string
+		change      func(*store.ListOwnersWaitingNoCapacityRow, *store.CountOnlineWorkersClaimableForRunRow)
+		err         error
+		nilCallback bool
+		want        string
+		since       time.Time
+	}{
+		{name: "ordinary roll informational", want: sevOK},
+		{name: "older unrelated health uses drain overlap", want: sevOK},
+		{name: "24h equality", change: func(_ *store.ListOwnersWaitingNoCapacityRow, e *store.CountOnlineWorkersClaimableForRunRow) {
+			e.LatestSuitableDrainingSince.Time = fixedNow.Add(-24 * time.Hour)
+		}, want: sevDanger, since: fixedNow.Add(-24 * time.Hour)},
+		{name: "just below 24h", change: func(_ *store.ListOwnersWaitingNoCapacityRow, e *store.CountOnlineWorkersClaimableForRunRow) {
+			e.LatestSuitableDrainingSince.Time = fixedNow.Add(-24*time.Hour + time.Second)
+		}, want: sevOK},
+		{name: "health newer than drain", change: func(r *store.ListOwnersWaitingNoCapacityRow, e *store.CountOnlineWorkersClaimableForRunRow) {
+			r.HealthSince.Time = fixedNow.Add(-time.Hour)
+			e.LatestSuitableDrainingSince.Time = fixedNow.Add(-48 * time.Hour)
+		}, want: sevOK},
+		{name: "stale or incompatible now", change: func(_ *store.ListOwnersWaitingNoCapacityRow, e *store.CountOnlineWorkersClaimableForRunRow) {
+			e.DrainingEligible = 0
+		}, want: sevDanger, since: row.HealthSince.Time},
+		{name: "non draining suitable", change: func(_ *store.ListOwnersWaitingNoCapacityRow, e *store.CountOnlineWorkersClaimableForRunRow) {
+			e.NonDrainingEligible = 1
+		}, want: sevDanger, since: row.HealthSince.Time},
+		{name: "own veto one", change: func(_ *store.ListOwnersWaitingNoCapacityRow, e *store.CountOnlineWorkersClaimableForRunRow) {
+			e.DrainingEligible = 1
+			e.SuitableOwnDraining = 1
+		}, want: sevDanger, since: row.HealthSince.Time},
+		{name: "own veto several", change: func(_ *store.ListOwnersWaitingNoCapacityRow, e *store.CountOnlineWorkersClaimableForRunRow) {
+			e.SuitableOwnDraining = 1
+		}, want: sevDanger, since: row.HealthSince.Time},
+		{name: "different stored reason", change: func(r *store.ListOwnersWaitingNoCapacityRow, _ *store.CountOnlineWorkersClaimableForRunRow) {
+			r.HasRollReason = false
+		}, want: sevDanger, since: row.HealthSince.Time},
+		{name: "failed callback", err: errors.New("eligibility failed"), want: sevDanger, since: row.HealthSince.Time},
+		{name: "nil callback", nilCallback: true, want: sevDanger, since: row.HealthSince.Time},
+		{name: "null latest drain", change: func(_ *store.ListOwnersWaitingNoCapacityRow, e *store.CountOnlineWorkersClaimableForRunRow) {
+			e.LatestSuitableDrainingSince.Valid = false
+		}, want: sevDanger, since: row.HealthSince.Time},
+		{name: "infinite drain", change: func(_ *store.ListOwnersWaitingNoCapacityRow, e *store.CountOnlineWorkersClaimableForRunRow) {
+			e.LatestSuitableDrainingSince.InfinityModifier = pgtype.Infinity
+		}, want: sevDanger, since: row.HealthSince.Time},
+		{name: "future drain", change: func(_ *store.ListOwnersWaitingNoCapacityRow, e *store.CountOnlineWorkersClaimableForRunRow) {
+			e.LatestSuitableDrainingSince.Time = fixedNow.Add(time.Hour)
+		}, want: sevDanger, since: row.HealthSince.Time},
+		{name: "null health since", change: func(r *store.ListOwnersWaitingNoCapacityRow, _ *store.CountOnlineWorkersClaimableForRunRow) {
+			r.HealthSince.Valid = false
+		}, want: sevOK},
+		{name: "genuine exact five minutes", change: func(r *store.ListOwnersWaitingNoCapacityRow, _ *store.CountOnlineWorkersClaimableForRunRow) {
+			r.HasRollReason = false
+			r.HealthSince.Time = fixedNow.Add(-5 * time.Minute)
+		}, want: sevDanger, since: fixedNow.Add(-5 * time.Minute)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, e := row, eligible
+			if tc.change != nil {
+				tc.change(&r, &e)
+			}
+			svc := newSvc(&fakeStore{capacityRows: []store.ListOwnersWaitingNoCapacityRow{r}}, &fakeSettings{})
+			calls := 0
+			if !tc.nilCallback {
+				svc.cfg.WorkerEligibilityForHealth = func(_ context.Context, now time.Time, id uuid.UUID) (store.CountOnlineWorkersClaimableForRunRow, error) {
+					calls++
+					if id != r.RunID || !now.Equal(fixedNow) {
+						t.Fatal("callback arguments")
+					}
+					return e, tc.err
+				}
+			}
+			c := svc.checkFleetCapacity(context.Background(), fixedNow, healthDetectorEnabled)
+			if c.Severity != tc.want {
+				t.Fatalf("severity=%s want=%s summary=%s", c.Severity, tc.want, c.Summary)
+			}
+			if !tc.since.IsZero() && (c.Since == nil || *c.Since != tc.since.UTC().Format(time.RFC3339)) {
+				t.Fatalf("since=%v want=%s", c.Since, tc.since)
+			}
+			if tc.name == "different stored reason" && calls != 0 {
+				t.Fatal("different reason called eligibility")
+			}
+			if c.Severity == sevOK && r.HasRollReason && r.HealthSince.Valid && !strings.Contains(c.Summary, "upgrade") {
+				t.Fatalf("missing informative upgrade summary: %s", c.Summary)
+			}
+		})
+	}
+}
+
+func TestFleetCapacityGenuineThresholdActions(t *testing.T) {
+	for _, age := range []time.Duration{5*time.Minute - time.Second, 5 * time.Minute} {
+		t.Run(age.String(), func(t *testing.T) {
+			svc := newSvc(&fakeStore{capacityRows: []store.ListOwnersWaitingNoCapacityRow{{UserID: uuid.New(), RunID: uuid.New(), HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-age), Valid: true}}}}, &fakeSettings{})
+			c := svc.checkFleetCapacity(context.Background(), fixedNow, healthDetectorEnabled)
+			if age < 5*time.Minute {
+				if c.Severity != sevOK || c.Since != nil || c.Action != nil || c.Command != nil {
+					t.Fatalf("transient=%+v", c)
+				}
+			} else {
+				if c.Severity != sevDanger || c.Since == nil || *c.Since != fixedNow.Add(-age).Format(time.RFC3339) || c.Action == nil || !strings.Contains(strings.ToLower(*c.Action), "provision") {
+					t.Fatalf("genuine danger=%+v", c)
+				}
+			}
+		})
+	}
+}
+
+func TestFleetCapacityYoungGenuineAndRoll(t *testing.T) {
+	for _, sameOwner := range []bool{false, true} {
+		t.Run(fmt.Sprint("same owner=", sameOwner), func(t *testing.T) {
+			owner, other := uuid.New(), uuid.New()
+			if sameOwner {
+				other = owner
+			}
+			roll := uuid.New()
+			rows := []store.ListOwnersWaitingNoCapacityRow{
+				{UserID: owner, RunID: uuid.New(), HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-5*time.Minute + time.Second), Valid: true}},
+				{UserID: other, RunID: roll, HasRollReason: true, HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-48 * time.Hour), Valid: true}},
+			}
+			svc := newSvc(&fakeStore{capacityRows: rows}, &fakeSettings{})
+			svc.cfg.WorkerEligibilityForHealth = func(context.Context, time.Time, uuid.UUID) (store.CountOnlineWorkersClaimableForRunRow, error) {
+				return store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 1, LatestSuitableDrainingSince: pgtype.Timestamptz{Time: fixedNow.Add(-23 * time.Hour), Valid: true}}, nil
+			}
+			c := svc.checkFleetCapacity(context.Background(), fixedNow, healthDetectorEnabled)
+			if c.Severity != sevOK || c.Since != nil || c.Action != nil || c.Command != nil {
+				t.Fatalf("young verdict=%+v", c)
+			}
+			if sameOwner && c.Summary != "Owners waiting for a worker are within the transient window." {
+				t.Errorf("mixed owner must retain genuine transient summary: %q", c.Summary)
+			}
+		})
+	}
+}
+
+func TestFleetCapacityOverdueOnlyAction(t *testing.T) {
+	svc := newSvc(&fakeStore{capacityRows: []store.ListOwnersWaitingNoCapacityRow{{UserID: uuid.New(), RunID: uuid.New(), HasRollReason: true, HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-48 * time.Hour), Valid: true}}}}, &fakeSettings{})
+	svc.cfg.WorkerEligibilityForHealth = func(context.Context, time.Time, uuid.UUID) (store.CountOnlineWorkersClaimableForRunRow, error) {
+		return store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 1, LatestSuitableDrainingSince: pgtype.Timestamptz{Time: fixedNow.Add(-24 * time.Hour), Valid: true}}, nil
+	}
+	c := svc.checkFleetCapacity(context.Background(), fixedNow, healthDetectorEnabled)
+	if c.Severity != sevDanger || c.Action == nil || c.Command == nil {
+		t.Fatalf("overdue verdict=%+v", c)
+	}
+	if strings.Contains(strings.ToLower(*c.Action), "provision") || strings.Contains(strings.ToLower(*c.Action), "recover") || !strings.Contains(*c.Action, "fleet.roll") {
+		t.Errorf("overdue-only action must direct roll investigation: %q", *c.Action)
+	}
+}
+
+func TestFleetCapacityMixedOwnersAndAges(t *testing.T) {
+	a, b := uuid.New(), uuid.New()
+	genuine, overdue := uuid.New(), uuid.New()
+	rows := []store.ListOwnersWaitingNoCapacityRow{
+		{UserID: a, RunID: genuine, HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-7 * time.Minute), Valid: true}, HasRollReason: true},
+		{UserID: a, RunID: overdue, HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-72 * time.Hour), Valid: true}, HasRollReason: true},
+		{UserID: b, RunID: uuid.New(), HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-10 * time.Minute), Valid: true}},
+	}
+	svc := newSvc(&fakeStore{capacityRows: rows}, &fakeSettings{})
+	svc.cfg.WorkerEligibilityForHealth = func(_ context.Context, _ time.Time, id uuid.UUID) (store.CountOnlineWorkersClaimableForRunRow, error) {
+		if id == genuine {
+			return store.CountOnlineWorkersClaimableForRunRow{}, errors.New("one row failed")
+		}
+		return store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 2, LatestSuitableDrainingSince: pgtype.Timestamptz{Time: fixedNow.Add(-25 * time.Hour), Valid: true}}, nil
+	}
+	c := svc.checkFleetCapacity(context.Background(), fixedNow, healthDetectorEnabled)
+	if c.Severity != sevDanger || c.Since == nil || *c.Since != fixedNow.Add(-25*time.Hour).Format(time.RFC3339) {
+		t.Fatalf("mixed verdict: %+v", c)
+	}
+	values := map[string]string{}
+	for _, e := range c.Evidence {
+		values[e.Label] = e.Value
+	}
+	for label, want := range map[string]string{"Owners affected": "2", "Owners without capacity": "2", "Owners overdue during upgrade": "1", "Capacity wait since": fixedNow.Add(-10 * time.Minute).Format(time.RFC3339), "Upgrade overlap since": fixedNow.Add(-25 * time.Hour).Format(time.RFC3339)} {
+		if values[label] != want {
+			t.Errorf("%s=%s want=%s", label, values[label], want)
 		}
 	}
 }

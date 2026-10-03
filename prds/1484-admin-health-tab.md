@@ -128,7 +128,7 @@ Thresholds are constants in v1, named in one place, not settings.
 | id | group | warn | danger | unknown / na |
 |---|---|---|---|---|
 | `fleet.roll` | workers | some hosted workers `upgrade_failed` | every hosted worker `upgrade_failed` | `unknown` when the newest roll signal is older than `ControllerSignalTTL` and `controller.report` is not `ok`; `na` when hosted workers are not configured |
-| `fleet.capacity` | workers | none | for 5 min, at least one owner has a run with `health = 'waiting_worker'` and zero online workers with `draining_since IS NULL` | `unknown` when `health_enabled` is off |
+| `fleet.capacity` | workers | none; confirmed worker-roll waits are informational `ok` | genuine zero-capacity wait at least 5 min; confirmed roll overlap at least 24h, using the latest currently suitable drain and a suitable-own-draining veto (D18) | `unknown` when `health_enabled` is off or unreadable |
 | `fleet.disk` | workers | any worker with a fresh heartbeat and `stats_disk_pressure_streak >= 2` | none | none |
 | `queue.waiting` | queue | oldest `waiting_worker` run at least 10 min | at least 30 min | `unknown` when `health_enabled` is off |
 | `queue.undispatched` | queue | none | any `kind = 'task'`, `status = 'queued'` run with `dispatched_at IS NULL` older than 10 min | none |
@@ -295,3 +295,5 @@ A single uzi run executes these in order. M3, M4 and M6 share no files except th
 - **D15: the scheduler is one of the four beating loops.** A dead scheduler silently stops every scheduled job, a different failure from a user's pause-all.
 - **D16 (review, 2026-09-20): the CLI is its own milestone (M3)**, split out of M1 so a late CLI failure cannot reopen the registry. Two reviewers (scope and trust boundary; adversarial fact-check) found no blocking issue and no refuted fact; their corrections are folded in above: the `worker_upgrade_reports` table name, the `fleet.disk` source, the `health_enabled` dependency, the eligible-branch wording of `forge.ciwatch`, the episode storage, the exit-code implementation site, and the live-DB package trap for `healthsvc` and `slacksvc`.
 - **D17 (user, 2026-10-03): Admin tab order updated.** Site lists and Products follow Branding, in that order, with Health still last. This supersedes D1's adjacency to Branding while preserving its last-tab decision.
+
+- **D18 (AI, 2026-10-03, per issue #2184): Worker-roll capacity waits.** This supersedes the fleet.capacity row: ordinary confirmed roll waits are informational `ok`, never warn; genuine waits remain danger at five minutes. Confirm the exact stored roll reason against current composed eligibility, with a diagnosis-wide suitable-own-draining veto. Roll danger starts when the overlap of health_since and the latest currently suitable other persistent worker drain reaches 24h, independently of controller deadlines. Failed, missing or negative confirmation follows genuine capacity treatment per run.

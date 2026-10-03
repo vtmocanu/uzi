@@ -315,8 +315,8 @@ func TestLaneMirrorsLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The busy lane worker has a free slot (1 of 4), the ordinary peer is excluded by the lane.
-	if n != 1 {
-		t.Fatalf("CountOnlineWorkersClaimableForRun = %d, want 1 (the lane worker only)", n)
+	if n.Claimable != 1 {
+		t.Fatalf("CountOnlineWorkersClaimableForRun = %d, want 1 (the lane worker only)", n.Claimable)
 	}
 
 	// Spread: the lane claimant must not defer to the idle ordinary peer.

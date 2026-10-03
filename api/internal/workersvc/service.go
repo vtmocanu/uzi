@@ -1003,7 +1003,7 @@ type Store interface {
 	// CountOnlineWorkersClaimableForRun (PRD #1497 M1, D19) counts the owner's workers that could
 	// actually claim THIS run now (ClaimRun's full per-worker conjunction, incl. the released
 	// incarnation exclusion), for the new queued-health rung.
-	CountOnlineWorkersClaimableForRun(ctx context.Context, arg store.CountOnlineWorkersClaimableForRunParams) (int64, error)
+	CountOnlineWorkersClaimableForRun(ctx context.Context, arg store.CountOnlineWorkersClaimableForRunParams) (store.CountOnlineWorkersClaimableForRunRow, error)
 	// ExtendAndResumeWallPark / StopWallPark (PRD #1497 M1, D7/D9) are the owner's Extend and Stop on
 	// a budget_exhausted wall park, each in one statement: bank the overrun, resume, and (Stop) cap
 	// the scope + grant the 1800s finalize allowance. ExtendAndResumeWallPark returns the new total

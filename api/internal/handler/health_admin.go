@@ -37,15 +37,20 @@ const healthSnoozeDuration = time.Hour
 func (h *Handler) healthService() *healthsvc.Service {
 	h.healthSvcOnce.Do(func() {
 		if h.healthSvc == nil {
+			var eligibility func(context.Context, time.Time, uuid.UUID) (store.CountOnlineWorkersClaimableForRunRow, error)
+			if h.wsvc != nil {
+				eligibility = h.wsvc.WorkerEligibilityForHealth
+			}
 			h.healthSvc = healthsvc.New(healthsvc.Config{
-				Store:               h.q,
-				Pool:                h.pool,
-				Settings:            h.settings,
-				SlackState:          h.slackState,
-				Now:                 h.now,
-				HostedWorkerVersion: h.cfg.HostedWorkerVersion,
-				RunningVersion:      h.version,
-				HeartbeatStale:      h.cfg.WorkerHeartbeatStale,
+				WorkerEligibilityForHealth: eligibility,
+				Store:                      h.q,
+				Pool:                       h.pool,
+				Settings:                   h.settings,
+				SlackState:                 h.slackState,
+				Now:                        h.now,
+				HostedWorkerVersion:        h.cfg.HostedWorkerVersion,
+				RunningVersion:             h.version,
+				HeartbeatStale:             h.cfg.WorkerHeartbeatStale,
 				// The custody admission ceiling ClaimRun/recovery gate on, so custody.holds
 				// never disagrees with the claim path. int32() is a compile-time conversion.
 				CustodyHoldLimit: int32(workersvc.CustodyHoldLimit),

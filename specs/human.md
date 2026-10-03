@@ -579,6 +579,7 @@ Mock at `prds/mockups/113-worker-upgrade-status-mock.html`.
 
 - A worker's reported version must be the release it is actually running — no more a frozen informational string. [user, accepted from the mock 2026-07-22]
 - Workers needing attention are those that **failed to upgrade** or are **behind**; a worker mid-upgrade is informational and must not raise an alert. [user 2026-07-22]
+- Worker-roll waiting is informational until its overlap with the current suitable-worker drain reaches 24h; fleet.capacity then reports danger for an overdue wait while workers upgrade. (AI-synced 2026-10-03)
 - Diagnostics are **read-only** in v1: no restart, retry, or auto-rollback of a failed upgrade. [user 2026-07-22]
 - Dark-only, matching the product's two dark themes; no light variant. [user 2026-07-22] [superseded by PRD #1167: the panel is token-driven and now renders in every theme, light included; the light themes were approved in that PRD's decision log 2026-09-07 (AI-synced 2026-09-08)]
 - The mock is the accepted design for the fleet panel, the per-worker badges, the failed-worker detail strip, and the Workers-menu alert badge. [user 2026-07-22]

@@ -119,9 +119,25 @@ Thresholds below are named constants in code
 | Check | What it means | `warn` | `danger` | `unknown` / `na` |
 |---|---|---|---|---|
 | `fleet.roll` | Whether hosted worker pods are rolling cleanly to their target image tag, from the controller's per-pod roll signal | some hosted workers are stuck | every hosted worker is stuck | `unknown` when the newest roll signal is older than the controller-signal freshness window *and* `controller.report` is not `ok` (a genuinely silent controller, not just an idle fleet); `na` when no hosted workers are configured |
-| `fleet.capacity` | Whether an owner with queued work has no worker of their own that can take it (workers are per-owner, so this is a per-owner question) | — | for at least 5 minutes, some owner has a run waiting for a worker and zero of their own workers online, non-draining, and heartbeat-fresh | `unknown` when the run-health detector (`health_enabled`) is off, or its state could not be read |
+| `fleet.capacity` | Owners waiting without a fresh non-draining worker; stored upgrade reasons are confirmed against current composed eligibility | — | genuine wait at least 5 minutes, or confirmed upgrade-wait overlap at least 24 hours | `unknown` when the run-health detector is off or its state could not be read |
 | `fleet.disk` | Whether any worker is under sustained disk pressure | any worker with a fresh heartbeat has a disk-pressure streak of 2+ consecutive polls | — | — |
 | `fleet.rundisk` | Whether one run is close to filling its worker's data volume (PRD #1809 M6, D8) | a fresh worker's largest reported run HOME is 40%+ of the data volume's total bytes, or the volume has less than 5% of its inodes free | — | `unknown` when the largest-run-size lookup itself fails |
+
+Worker-roll waiting is informational (`ok`, no warning) while suitable workers finish
+current runs before an upgrade. Each stored upgrade reason is confirmed against current
+fresh online eligibility, including all static requirements on one worker, affinity,
+released incarnation and strict lease guards. Slots are ignored. A suitable own draining
+worker vetoes confirmation, including an admissible bound ephemeral worker; other
+eligible drainers must be persistent. A stale or incompatible worker, a different stored
+reason, a missing callback or a failed read leaves that run on the genuine five-minute
+capacity path; one such run prevents blanket suppression of its owner.
+
+The overlap starts at the later of the run's `health_since` and the **latest** drain start
+among currently suitable other persistent workers. An incompatible later drainer cannot
+reset it. At 24 hours (including equality), `fleet.capacity` reports danger for an
+**overdue wait while workers upgrade**, independently of the controller drain deadline.
+Genuine and overdue owners have separate counts and ages; the combined count is their
+union, so an owner in both groups is counted once.
 
 ### Queue
 

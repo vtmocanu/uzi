@@ -1083,19 +1083,20 @@ func run() error {
 	// debounced claimed fan-out is M6). Wired beside the custody-episode reconciler above: a
 	// standalone reconciler with a boot pass then a one-minute ticker.
 	healthSvc := healthsvc.New(healthsvc.Config{
-		Store:               q,
-		Pool:                pool,
-		Settings:            settingsCache,
-		SlackState:          slackManager.State,
-		Now:                 time.Now,
-		HostedWorkerVersion: cfg.HostedWorkerVersion,
-		RunningVersion:      version,
-		HeartbeatStale:      cfg.WorkerHeartbeatStale,
-		CustodyHoldLimit:    int32(workersvc.CustodyHoldLimit),
-		BootTime:            time.Now(),
-		CIWatchMaxRefs:      cfg.CIWatchMaxRefs,
-		CIWatchRunWindow:    cfg.CIWatchRunWindow,
-		Registry:            healthBeats,
+		WorkerEligibilityForHealth: wsvc.WorkerEligibilityForHealth,
+		Store:                      q,
+		Pool:                       pool,
+		Settings:                   settingsCache,
+		SlackState:                 slackManager.State,
+		Now:                        time.Now,
+		HostedWorkerVersion:        cfg.HostedWorkerVersion,
+		RunningVersion:             version,
+		HeartbeatStale:             cfg.WorkerHeartbeatStale,
+		CustodyHoldLimit:           int32(workersvc.CustodyHoldLimit),
+		BootTime:                   time.Now(),
+		CIWatchMaxRefs:             cfg.CIWatchMaxRefs,
+		CIWatchRunWindow:           cfg.CIWatchRunWindow,
+		Registry:                   healthBeats,
 	})
 	// M6 wires the notice fan-out into the SAME reconciler: the persist-first notifysvc
 	// seam, the store (ListAdmins fan-out set + the atomic ClaimHealthEpisodeNotice slot),

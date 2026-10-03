@@ -11,7 +11,10 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vtmocanu/uzi/api/internal/healthsvc"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // TestHealthChecksLiveDB exercises the admin-health read queries (PRD #1484 M1) against a
@@ -133,7 +136,7 @@ func TestHealthChecksLiveDB(t *testing.T) {
 
 	// -------------------------------------------------------------------------
 	// ListOwnersWaitingNoCapacity: an owner waiting with no usable worker is returned
-	// with the oldest health_since; a fresh non-draining worker excludes its owner; a
+	// with every waiting run's health_since; a fresh non-draining worker excludes its owner; a
 	// draining or stale worker does not count as capacity.
 	// -------------------------------------------------------------------------
 	// noCap: two waiting runs, no workers → returned, oldest health_since.
@@ -158,13 +161,15 @@ func TestHealthChecksLiveDB(t *testing.T) {
 	seedWorker(staleUser, "external", durPtr(5*time.Minute), false)
 
 	cutoff := ts(now.Add(-45 * time.Second))
-	capRows, err := q.ListOwnersWaitingNoCapacity(ctx, cutoff)
+	capRows, err := q.ListOwnersWaitingNoCapacity(ctx, store.ListOwnersWaitingNoCapacityParams{HeartbeatCutoff: cutoff, RollReason: workersvc.ReasonWorkersUpgrading})
 	if err != nil {
 		t.Fatalf("ListOwnersWaitingNoCapacity: %v", err)
 	}
 	got := map[uuid.UUID]pgtype.Timestamptz{}
 	for _, r := range capRows {
-		got[r.UserID] = r.OldestHealthSince
+		if !got[r.UserID].Valid || (r.HealthSince.Valid && r.HealthSince.Time.Before(got[r.UserID].Time)) {
+			got[r.UserID] = r.HealthSince
+		}
 	}
 	if _, ok := got[hasCapUser]; ok {
 		t.Errorf("owner with a fresh non-draining worker must NOT be waiting-no-capacity")
@@ -288,6 +293,214 @@ func TestHealthChecksLiveDB(t *testing.T) {
 	}
 	if head <= 0 {
 		t.Errorf("SchemaVersionStatus head = %d, want a positive embedded head", head)
+	}
+}
+
+type rollHealthSettings struct{}
+
+func (rollHealthSettings) HealthEnabled(context.Context) (bool, error)       { return true, nil }
+func (rollHealthSettings) ReleaseCheckEnabled(context.Context) (bool, error) { return false, nil }
+func (rollHealthSettings) ReleaseStatus(context.Context) (settings.ReleaseStatus, error) {
+	return settings.ReleaseStatus{}, nil
+}
+
+// Scope the shared database's owner aggregate while preserving every SQL-produced
+// row for this owner. Evaluate still executes the real health service.
+type rollHealthStore struct {
+	*store.Queries
+	owner uuid.UUID
+}
+
+func (s rollHealthStore) ListOwnersWaitingNoCapacity(ctx context.Context, p store.ListOwnersWaitingNoCapacityParams) ([]store.ListOwnersWaitingNoCapacityRow, error) {
+	rows, err := s.Queries.ListOwnersWaitingNoCapacity(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	out := []store.ListOwnersWaitingNoCapacityRow{}
+	for _, r := range rows {
+		if r.UserID == s.owner {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+func TestHealthRollCapacityEvaluationLiveDB(t *testing.T) {
+	for _, name := range []string{"older health latest suitable", "incompatible later ignored", "24h equality", "just below 24h", "own veto one peer", "own veto several peers", "stale suitable fresh incompatible", "null reason", "mixed reason rows", "null timestamp row"} {
+		t.Run(name, func(t *testing.T) {
+			fx := newFleetFixture(t)
+			now := time.Now().UTC().Truncate(time.Second)
+			run := queuedRunWithCaps(fx, []string{"gpu"})
+			mustExec(fx.ctx, t, fx.pool, "UPDATE runs SET health='waiting_worker',health_reason=$2,health_since=$3,updated_at=$3 WHERE id=$1", run, workersvc.ReasonWorkersUpgrading, now.Add(-48*time.Hour))
+			seed := func(tag string, drain time.Time, compatible bool) uuid.UUID {
+				w := fx.worker(tag, nil, false)
+				caps := []string{}
+				if compatible {
+					caps = []string{"gpu"}
+				}
+				mustExec(fx.ctx, t, fx.pool, "UPDATE workers SET capabilities=$2,draining_since=$3,last_heartbeat_at=$4 WHERE id=$1", w, caps, drain, now)
+				return w
+			}
+			latest := now.Add(-23 * time.Hour)
+			if name == "24h equality" {
+				latest = now.Add(-24 * time.Hour)
+			} else if name == "just below 24h" {
+				latest = now.Add(-24*time.Hour + time.Second)
+			}
+			seed("older", now.Add(-40*time.Hour), true)
+			own := seed("latest", latest, true)
+			want := "ok"
+			switch name {
+			case "incompatible later ignored":
+				seed("incompatible", now.Add(-time.Minute), false)
+			case "own veto one peer", "own veto several peers":
+				mustExec(fx.ctx, t, fx.pool, "UPDATE runs SET worker_id=$2 WHERE id=$1", run, own)
+				if name == "own veto several peers" {
+					seed("extra", now.Add(-time.Hour), true)
+				}
+				want = "danger"
+			case "stale suitable fresh incompatible":
+				mustExec(fx.ctx, t, fx.pool, "UPDATE workers SET last_heartbeat_at=$2 WHERE user_id=$1", fx.userID, now.Add(-time.Hour))
+				fresh := fx.worker("fresh-incompatible", nil, false)
+				mustExec(fx.ctx, t, fx.pool, "UPDATE workers SET last_heartbeat_at=$2,draining_since=$2 WHERE id=$1", fresh, now)
+				want = "danger"
+			case "24h equality":
+				want = "danger"
+			case "null reason":
+				mustExec(fx.ctx, t, fx.pool, "UPDATE runs SET health_reason=NULL WHERE id=$1", run)
+				want = "danger"
+			case "mixed reason rows", "null timestamp row":
+				other := queuedRunWithCaps(fx, []string{"gpu"})
+				var since any
+				if name == "mixed reason rows" {
+					since = now.Add(-7 * time.Minute)
+					want = "danger"
+				}
+				mustExec(fx.ctx, t, fx.pool, "UPDATE runs SET health='waiting_worker',health_reason=NULL,health_since=$2 WHERE id=$1", other, since)
+				rows, err := (rollHealthStore{Queries: fx.q, owner: fx.userID}).ListOwnersWaitingNoCapacity(fx.ctx, store.ListOwnersWaitingNoCapacityParams{HeartbeatCutoff: ts(now.Add(-45 * time.Second)), RollReason: workersvc.ReasonWorkersUpgrading})
+				if err != nil || len(rows) != 2 {
+					t.Fatalf("all waiting rows=%+v err=%v", rows, err)
+				}
+				for _, r := range rows {
+					if r.RunID == other && (r.HasRollReason || (name == "null timestamp row" && r.HealthSince.Valid)) {
+						t.Fatalf("NULL reason/timestamp projection=%+v", r)
+					}
+				}
+			}
+			worker := workersvc.New(fx.q, nil, workersvc.Params{WorkerHeartbeatStale: 45 * time.Second, WorkerAffinityCeiling: 2 * time.Hour})
+			eligible, err := worker.WorkerEligibilityForHealth(fx.ctx, now, run)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if name == "older health latest suitable" || name == "incompatible later ignored" || name == "24h equality" || name == "just below 24h" {
+				if eligible.DrainingEligible != 2 || !eligible.LatestSuitableDrainingSince.Time.Equal(latest) {
+					t.Fatalf("max suitable=%+v", eligible)
+				}
+			}
+			svc := healthsvc.New(healthsvc.Config{Store: rollHealthStore{Queries: fx.q, owner: fx.userID}, Pool: fx.pool, Settings: rollHealthSettings{}, Now: func() time.Time { return now }, WorkerEligibilityForHealth: worker.WorkerEligibilityForHealth})
+			doc, err := svc.Evaluate(fx.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, c := range doc.Checks {
+				if c.ID != "fleet.capacity" {
+					continue
+				}
+				found = true
+				if c.Severity != want {
+					t.Fatalf("capacity=%+v want=%s", c, want)
+				}
+				if want == "ok" && c.Since != nil {
+					t.Errorf("ordinary roll since=%v", c.Since)
+				}
+				if name == "null timestamp row" && c.Summary != "Owners waiting for a worker are within the transient window." {
+					t.Errorf("NULL row must prevent roll-only owner summary: %q", c.Summary)
+				}
+				if want == "danger" {
+					since := now.Add(-48 * time.Hour)
+					if name == "24h equality" {
+						since = latest
+					} else if name == "mixed reason rows" {
+						since = now.Add(-7 * time.Minute)
+					}
+					if c.Since == nil || *c.Since != since.Format(time.RFC3339) {
+						t.Errorf("since=%v want=%s", c.Since, since)
+					}
+				}
+			}
+			if !found {
+				t.Fatal("capacity missing")
+			}
+		})
+	}
+}
+
+func TestHealthRollStrictLeaseEligibilityLiveDB(t *testing.T) {
+	for _, name := range []string{"lease clear", "lease custody", "lease already bound", "direct bound custody"} {
+		t.Run(name, func(t *testing.T) {
+			fx := newFleetFixture(t)
+			leased := seedLeasedWorker(fx, leaseRun{iid: i64p(700)}, 0)
+			target := insertLeaseRun(fx, leaseRun{iid: i64p(700)})
+			if name == "lease custody" || name == "direct bound custody" {
+				insertCustodyHold(fx, leased.served, pgtype.UUID{Bytes: fx.repoID, Valid: true}, pgtype.UUID{Bytes: leased.id, Valid: true}, "open")
+			}
+			if name == "lease already bound" {
+				bound := seedEphemeralWorkerBound(fx, target)
+				mustExec(fx.ctx, t, fx.pool, "UPDATE workers SET last_heartbeat_at=NULL WHERE id=$1", bound)
+			}
+			if name == "direct bound custody" {
+				target = leased.served
+			}
+			svc := workersvc.New(fx.q, nil, workersvc.Params{WorkerHeartbeatStale: 45 * time.Second, WorkerAffinityCeiling: 2 * time.Hour})
+			svc.SetEphemeralLease(2 * time.Hour)
+			row, err := svc.WorkerEligibilityForHealth(fx.ctx, time.Now(), target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			strict := int64(1)
+			if name == "lease custody" || name == "lease already bound" {
+				strict = 0
+			}
+			if row.Claimable != 1 || row.NonDrainingEligible != strict || row.DrainingEligible != 0 || row.SuitableOwnDraining != 0 || row.LatestSuitableDrainingSince.Valid {
+				t.Fatalf("legacy/strict=%+v want strict=%d", row, strict)
+			}
+		})
+	}
+}
+
+func TestHealthRollAffinityAndLegacyAvailabilityLiveDB(t *testing.T) {
+	fx := newFleetFixture(t)
+	now := time.Now()
+	owner := fx.worker("owner", nil, false)
+	peer := fx.worker("peer", nil, false)
+	target := queuedRunWithCaps(fx, nil)
+	mustExec(fx.ctx, t, fx.pool, "UPDATE runs SET worker_id=$2,updated_at=$3 WHERE id=$1", target, owner, now)
+	mustExec(fx.ctx, t, fx.pool, "UPDATE workers SET capabilities='{gpu}',draining_since=$2 WHERE id=$1", peer, now.Add(-time.Hour))
+	// The owner fails static requirements but still pins affinity.
+	mustExec(fx.ctx, t, fx.pool, "UPDATE runs SET required_capabilities='{gpu}' WHERE id=$1", target)
+	svc := workersvc.New(fx.q, nil, workersvc.Params{WorkerHeartbeatStale: 45 * time.Second, WorkerAffinityCeiling: 2 * time.Hour})
+	row, err := svc.WorkerEligibilityForHealth(fx.ctx, now, target)
+	if err != nil || row.DrainingEligible != 0 {
+		t.Fatalf("affinity=%+v err=%v", row, err)
+	}
+	mustExec(fx.ctx, t, fx.pool, "UPDATE runs SET updated_at=$2 WHERE id=$1", target, now.Add(-3*time.Hour))
+	row, err = svc.WorkerEligibilityForHealth(fx.ctx, now, target)
+	if err != nil || row.DrainingEligible != 1 {
+		t.Fatalf("expired affinity=%+v err=%v", row, err)
+	}
+	// Offline advisory candidates and saturated strict candidates preserve the old
+	// Claimable projection while strict suitability ignores slots and requires online.
+	mustExec(fx.ctx, t, fx.pool, "UPDATE workers SET draining_since=NULL,status='offline' WHERE id=$1", peer)
+	row, err = svc.WorkerEligibilityForHealth(fx.ctx, now, target)
+	if err != nil || row.Claimable != 1 || row.NonDrainingEligible != 0 {
+		t.Fatalf("legacy offline=%+v err=%v", row, err)
+	}
+	mustExec(fx.ctx, t, fx.pool, "UPDATE workers SET status='online',max_concurrent_runs=1 WHERE id=$1", peer)
+	fx.holdActive(peer, 1)
+	row, err = svc.WorkerEligibilityForHealth(fx.ctx, now, target)
+	if err != nil || row.Claimable != 0 || row.NonDrainingEligible != 1 {
+		t.Fatalf("saturated=%+v err=%v", row, err)
 	}
 }
 

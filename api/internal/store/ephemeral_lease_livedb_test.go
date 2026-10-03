@@ -823,7 +823,7 @@ func claimableCount(fx *fleetFixture, run uuid.UUID, iv pgtype.Interval) int64 {
 	if err != nil {
 		fx.t.Fatalf("CountOnlineWorkersClaimableForRun: %v", err)
 	}
-	return n
+	return n.Claimable
 }
 
 // TestEphemeralLeasePlacementMirrorLiveDB: wherever ephemeral eligibility is computed, a run a live

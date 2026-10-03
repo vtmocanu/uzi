@@ -22,6 +22,10 @@ var t0 = time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
 // plus the queued-run worker count. Embedding Store means any other method a stray
 // path reaches panics, keeping the tests honest about what the detector touches.
 type healthFakeStore struct {
+	eligibility      store.CountOnlineWorkersClaimableForRunRow
+	eligibilityErr   error
+	eligibilityCalls []store.CountOnlineWorkersClaimableForRunParams
+
 	Store
 	active []store.ListActiveRunsForHealthRow
 	window map[uuid.UUID][]store.ListRunToolWindowRow
@@ -1306,6 +1310,85 @@ func TestRunDeadline(t *testing.T) {
 			}
 			if !got.Equal(tc.want) {
 				t.Fatalf("RunDeadline = %v, want %v", *got, tc.want)
+			}
+		})
+	}
+}
+
+func (f *healthFakeStore) CountOnlineWorkersClaimableForRun(_ context.Context, arg store.CountOnlineWorkersClaimableForRunParams) (store.CountOnlineWorkersClaimableForRunRow, error) {
+	f.eligibilityCalls = append(f.eligibilityCalls, arg)
+	return f.eligibility, f.eligibilityErr
+}
+
+// Every affected rung must yield to a confirmed whole-worker roll diagnosis.
+func TestHealthQueuedUpgradeSevenRungs(t *testing.T) {
+	for _, name := range []string{"ordinary caps", "completion", "Codex harness", "Codex runtime", "Codex completion", "Codex custom", "job runner and files"} {
+		t.Run(name, func(t *testing.T) {
+			r := runRow("queued")
+			r.Kind = "issue"
+			r.StatusSince = ago(time.Hour)
+			switch name {
+			case "ordinary caps":
+				r.RequiredCapabilities = []string{"gpu"}
+			case "completion":
+				r.CompletionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
+			case "Codex harness", "Codex runtime":
+				r.Harness = "codex"
+			case "Codex completion":
+				r.Harness = "codex"
+				r.CompletionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
+			case "Codex custom":
+				r.Harness = "codex"
+				r.CodexCustomRoot = true
+			case "job runner and files":
+				r.Kind = "job"
+				r.JobProtocol = pgtype.Int2{Int16: 2, Valid: true}
+			}
+			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}, eligibility: store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 1}}
+			svc := healthSvc(fs, defaultHealthSettings())
+			svc.capabilitySettings = fakeCapabilitySettings{on: true}
+			if got := svc.queuedReason(context.Background(), t0, r); got != ReasonWorkersUpgrading {
+				t.Fatalf("reason=%q", got)
+			}
+			if got := svc.detectRunHealth(context.Background(), t0); got != 1 {
+				t.Fatalf("writes=%d", got)
+			}
+			w := lastWrite(t, fs, r.ID)
+			if w.Health != healthWaitingWorker || w.HealthReason.String != ReasonWorkersUpgrading {
+				t.Fatalf("stored health=%+v", w)
+			}
+		})
+	}
+}
+
+func TestHealthQueuedWorkersUpgrading(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		eligible store.CountOnlineWorkersClaimableForRunRow
+		err      error
+		want     string
+	}{
+		{"one drainer", store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 1}, nil, ReasonWorkersUpgrading},
+		{"several drainers", store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 3}, nil, ReasonWorkersUpgrading},
+		{"own veto one", store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 1, SuitableOwnDraining: 1}, nil, reasonNoWorker},
+		{"own veto several", store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 3, SuitableOwnDraining: 1}, nil, reasonNoWorker},
+		{"non draining eligible", store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 1, NonDrainingEligible: 1}, nil, reasonNoWorker},
+		{"incompatible drainers", store.CountOnlineWorkersClaimableForRunRow{}, nil, reasonNoWorker},
+		{"read failure", store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 1}, errors.New("read failed"), reasonNoWorker},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := runRow("queued")
+			fs := &healthFakeStore{eligibility: tc.eligible, eligibilityErr: tc.err}
+			svc := healthSvc(fs, defaultHealthSettings())
+			if got := svc.queuedReason(context.Background(), t0, r); got != tc.want {
+				t.Fatalf("reason=%q want=%q", got, tc.want)
+			}
+			if len(fs.eligibilityCalls) != 1 {
+				t.Fatalf("eligibility calls=%d", len(fs.eligibilityCalls))
+			}
+			arg := fs.eligibilityCalls[0]
+			if arg.RunID != r.ID || !arg.HeartbeatCutoff.Time.Equal(t0.Add(-svc.p.WorkerHeartbeatStale)) || !arg.AffinityCutoff.Time.Equal(t0.Add(-svc.p.WorkerAffinityCeiling)) || len(arg.CodexCuratedModels) == 0 {
+				t.Fatalf("wrong configured arguments: %+v", arg)
 			}
 		})
 	}

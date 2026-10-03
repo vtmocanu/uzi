@@ -1885,7 +1885,29 @@ func (q *Queries) CountOnlineEligibleWorkersForRepo(ctx context.Context, arg Cou
 }
 
 const countOnlineWorkersClaimableForRun = `-- name: CountOnlineWorkersClaimableForRun :one
-SELECT count(*)
+WITH candidates AS (
+SELECT w.draining_since,
+       (w.status = 'online') AS online,
+       (w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs) AS free_slot,
+       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR fn_ephemeral_lease_admits(
+              w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+              $1::interval, now(),
+              run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)) AS advisory_binding,
+       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (
+           fn_ephemeral_lease_admits(
+              w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+              $1::interval, now(),
+              run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
+           AND NOT EXISTS (SELECT 1 FROM workers bw WHERE bw.ephemeral AND bw.ephemeral_run_id = run.id)
+           AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds ch WHERE ch.live_worker_id = w.id AND ch.state = 'open')
+       )) AS strict_binding,
+       (run.worker_id = w.id) AS own_worker,
+       (NOT w.ephemeral) AS persistent,
+       (run.worker_id IS NULL OR run.worker_id = w.id
+        OR NOT EXISTS (SELECT 1 FROM workers ow WHERE ow.id = run.worker_id
+                       AND (ow.draining_since IS NOT NULL OR
+                            (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= $2)))
+        OR run.updated_at < $3) AS affinity
 FROM runs run
 JOIN workers w ON w.user_id = run.user_id
 CROSS JOIN LATERAL (
@@ -1894,19 +1916,17 @@ CROSS JOIN LATERAL (
       AND pr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
       AND pr.kind <> 'chat'
 ) wa
-WHERE run.id = $1
+WHERE run.id = $4
   AND w.last_heartbeat_at IS NOT NULL
   AND w.last_heartbeat_at >= $2
-  AND w.draining_since IS NULL
-  AND (w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs)
   AND fn_worker_can_claim(
         COALESCE(w.docker_enabled, false),
-        $3::uuid[],
+        $5::uuid[],
         run.repo_id,
         run.kind,
         COALESCE(w.capabilities, '{}')::text[],
         run.required_capabilities,
-        $4::boolean)
+        $6::boolean)
   AND (run.completion_contract_version IS NULL
        OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
@@ -1924,9 +1944,9 @@ WHERE run.id = $1
           AND run.kind NOT IN ('judge', 'chat')
           AND run.review_target_run_id IS NULL
           AND COALESCE(
-              NOT ((CASE WHEN run.model = ANY($5::text[]) THEN run.model
+              NOT ((CASE WHEN run.model = ANY($7::text[]) THEN run.model
                          ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id) END)
-                   = ANY($5::text[])),
+                   = ANY($7::text[])),
               false)
       )
       OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
@@ -1943,25 +1963,34 @@ WHERE run.id = $1
            AND (run.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
            -- PRD #1976 M1: and the isolated_job_v1 arm for a profile-bound job.
            AND (run.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
-  -- PRD #2006: a leased ephemeral worker also counts when it may claim THIS run through its lease
-  -- (advisory mirror of ClaimRun's lease arm, so now()).
-  AND (NOT w.ephemeral OR w.ephemeral_run_id = run.id
-       OR fn_ephemeral_lease_admits(
-              w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
-              $6::interval, now(),
-              run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id))
   AND (run.released_worker_id IS NULL
        OR run.released_worker_id <> w.id
        OR run.released_worker_nonce IS DISTINCT FROM w.snapshot_register_nonce)
+)
+SELECT count(*) FILTER (WHERE draining_since IS NULL AND free_slot AND advisory_binding)::bigint AS claimable,
+       count(*) FILTER (WHERE online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::bigint AS draining_eligible,
+       count(*) FILTER (WHERE online AND draining_since IS NULL AND affinity AND strict_binding)::bigint AS non_draining_eligible,
+       count(*) FILTER (WHERE online AND draining_since IS NOT NULL AND own_worker AND affinity AND strict_binding)::bigint AS suitable_own_draining,
+       max(draining_since) FILTER (WHERE online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::timestamptz AS latest_suitable_draining_since
+FROM candidates
 `
 
 type CountOnlineWorkersClaimableForRunParams struct {
-	RunID               uuid.UUID          `json:"run_id"`
+	EphemeralLease      pgtype.Interval    `json:"ephemeral_lease"`
 	HeartbeatCutoff     pgtype.Timestamptz `json:"heartbeat_cutoff"`
+	AffinityCutoff      pgtype.Timestamptz `json:"affinity_cutoff"`
+	RunID               uuid.UUID          `json:"run_id"`
 	DockerRepoAllowlist []uuid.UUID        `json:"docker_repo_allowlist"`
 	CapabilityAware     bool               `json:"capability_aware"`
 	CodexCuratedModels  []string           `json:"codex_curated_models"`
-	EphemeralLease      pgtype.Interval    `json:"ephemeral_lease"`
+}
+
+type CountOnlineWorkersClaimableForRunRow struct {
+	Claimable                   int64              `json:"claimable"`
+	DrainingEligible            int64              `json:"draining_eligible"`
+	NonDrainingEligible         int64              `json:"non_draining_eligible"`
+	SuitableOwnDraining         int64              `json:"suitable_own_draining"`
+	LatestSuitableDrainingSince pgtype.Timestamptz `json:"latest_suitable_draining_since"`
 }
 
 // PRD #1497 M1 (D19): how many of the run's owner's workers could ACTUALLY claim THIS ONE run right
@@ -1985,18 +2014,27 @@ type CountOnlineWorkersClaimableForRunParams struct {
 // ClaimRun's claimant-custody guard (an open custody hold on the claimant) and its already-bound
 // guard (a run another ephemeral worker is bound to), so this count can read one higher than the
 // claim would allow. That only softens a "restart worker" hint and never grants a claim.
-func (q *Queries) CountOnlineWorkersClaimableForRun(ctx context.Context, arg CountOnlineWorkersClaimableForRunParams) (int64, error) {
+// Issue #2184: preserve the advisory availability projection separately from strict health
+// eligibility. Static requirements compose on ONE candidate; strict counts ignore slots.
+func (q *Queries) CountOnlineWorkersClaimableForRun(ctx context.Context, arg CountOnlineWorkersClaimableForRunParams) (CountOnlineWorkersClaimableForRunRow, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersClaimableForRun,
-		arg.RunID,
+		arg.EphemeralLease,
 		arg.HeartbeatCutoff,
+		arg.AffinityCutoff,
+		arg.RunID,
 		arg.DockerRepoAllowlist,
 		arg.CapabilityAware,
 		arg.CodexCuratedModels,
-		arg.EphemeralLease,
 	)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
+	var i CountOnlineWorkersClaimableForRunRow
+	err := row.Scan(
+		&i.Claimable,
+		&i.DrainingEligible,
+		&i.NonDrainingEligible,
+		&i.SuitableOwnDraining,
+		&i.LatestSuitableDrainingSince,
+	)
+	return i, err
 }
 
 const countOnlineWorkersForUser = `-- name: CountOnlineWorkersForUser :one
@@ -7748,24 +7786,29 @@ func (q *Queries) ListLimitWaitReeval(ctx context.Context, now pgtype.Timestampt
 
 const listOwnersWaitingNoCapacity = `-- name: ListOwnersWaitingNoCapacity :many
 
-SELECT r.user_id,
-       min(r.health_since)::timestamptz AS oldest_health_since
+SELECT r.user_id, r.id AS run_id, r.health_since,
+       (COALESCE(r.health_reason = $1::text, false))::boolean AS has_roll_reason
 FROM runs r
 WHERE r.health = 'waiting_worker'
-  AND r.health_since IS NOT NULL
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.draining_since IS NULL
         AND w.last_heartbeat_at IS NOT NULL
-        AND w.last_heartbeat_at >= $1
+        AND w.last_heartbeat_at >= $2
   )
-GROUP BY r.user_id
 `
 
+type ListOwnersWaitingNoCapacityParams struct {
+	RollReason      string             `json:"roll_reason"`
+	HeartbeatCutoff pgtype.Timestamptz `json:"heartbeat_cutoff"`
+}
+
 type ListOwnersWaitingNoCapacityRow struct {
-	UserID            uuid.UUID          `json:"user_id"`
-	OldestHealthSince pgtype.Timestamptz `json:"oldest_health_since"`
+	UserID        uuid.UUID          `json:"user_id"`
+	RunID         uuid.UUID          `json:"run_id"`
+	HealthSince   pgtype.Timestamptz `json:"health_since"`
+	HasRollReason bool               `json:"has_roll_reason"`
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════
@@ -7776,16 +7819,16 @@ type ListOwnersWaitingNoCapacityRow struct {
 // ════════════════════════════════════════════════════════════════════════════════════════
 // health fleet.capacity: the owners who have at least one run parked in
 // health='waiting_worker' AND own ZERO usable workers — online (fresh heartbeat), not
-// draining. Per owner the OLDEST health_since (the wait's start); healthsvc applies the
-// 5-minute danger threshold. The heartbeat-freshness definition (last_heartbeat_at >=
+// draining. Each waiting run is returned, including NULL health_since; healthsvc applies
+// current roll confirmation and the distinct wait thresholds. The heartbeat-freshness definition (last_heartbeat_at >=
 // @heartbeat_cutoff, cutoff = now - WORKER_HEARTBEAT_STALE) mirrors the "online worker"
 // window the recovery/claim queries use, so this stays truthful even when the controller
 // is silent (a heartbeat-based signal, not status-based). The conjunction with "zero
 // usable workers" is what makes waiting_worker a CAPACITY failure rather than one of its
 // other causes (vault locked, custody limit, all workers busy) — those surface through
 // queue.waiting by age instead.
-func (q *Queries) ListOwnersWaitingNoCapacity(ctx context.Context, heartbeatCutoff pgtype.Timestamptz) ([]ListOwnersWaitingNoCapacityRow, error) {
-	rows, err := q.db.Query(ctx, listOwnersWaitingNoCapacity, heartbeatCutoff)
+func (q *Queries) ListOwnersWaitingNoCapacity(ctx context.Context, arg ListOwnersWaitingNoCapacityParams) ([]ListOwnersWaitingNoCapacityRow, error) {
+	rows, err := q.db.Query(ctx, listOwnersWaitingNoCapacity, arg.RollReason, arg.HeartbeatCutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -7793,7 +7836,12 @@ func (q *Queries) ListOwnersWaitingNoCapacity(ctx context.Context, heartbeatCuto
 	items := []ListOwnersWaitingNoCapacityRow{}
 	for rows.Next() {
 		var i ListOwnersWaitingNoCapacityRow
-		if err := rows.Scan(&i.UserID, &i.OldestHealthSince); err != nil {
+		if err := rows.Scan(
+			&i.UserID,
+			&i.RunID,
+			&i.HealthSince,
+			&i.HasRollReason,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

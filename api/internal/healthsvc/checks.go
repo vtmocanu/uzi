@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -243,13 +244,9 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 	return c
 }
 
-// checkFleetCapacity is danger when, for at least fleetCapacityDanger, an owner has a
-// waiting_worker run and zero usable (online, non-draining, fresh-heartbeat) workers.
-// `unknown` when health_enabled is off — the sole writer of waiting_worker is gated by it,
-// so the signal is absent, not green (D6) — AND `unknown` when the kill-switch read itself
-// failed (we cannot tell whether the writer is running, so the run tables must not be
-// queried for a green verdict). Below the threshold it is ok (a transient claim delay), and
-// there is no warn band.
+// checkFleetCapacity confirms stored roll waits against current composed eligibility.
+// The loop is bounded by the waiting rows; each callback runs once and a failed row
+// follows genuine capacity treatment without suppressing any sibling row.
 func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health healthDetectorState) apitypes.HealthCheckDTO {
 	c := s.base("fleet.capacity")
 	switch health {
@@ -258,7 +255,9 @@ func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health 
 	case healthDetectorUnknown:
 		return unknownHealthReadFailed(c)
 	}
-	rows, err := s.cfg.Store.ListOwnersWaitingNoCapacity(ctx, pgconv.Time(now.Add(-s.heartbeatStale())))
+	rows, err := s.cfg.Store.ListOwnersWaitingNoCapacity(ctx, store.ListOwnersWaitingNoCapacityParams{
+		HeartbeatCutoff: pgconv.Time(now.Add(-s.heartbeatStale())), RollReason: workersvc.ReasonWorkersUpgrading,
+	})
 	if err != nil {
 		return degradeUnknown(c, "fleet.capacity", err)
 	}
@@ -267,25 +266,77 @@ func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health 
 		c.Summary = "Every owner with queued work has a usable worker."
 		return c
 	}
-	var oldest time.Time
-	haveOldest := false
+	genuine, overdue, affected, rolling := map[uuid.UUID]bool{}, map[uuid.UUID]bool{}, map[uuid.UUID]bool{}, map[uuid.UUID]bool{}
+	unconfirmed := map[uuid.UUID]bool{}
+	var genuineSince, overdueSince time.Time
 	for _, r := range rows {
-		if r.OldestHealthSince.Valid && (!haveOldest || r.OldestHealthSince.Time.Before(oldest)) {
-			oldest = r.OldestHealthSince.Time
-			haveOldest = true
+		confirmed := false
+		var overlap time.Time
+		if r.HasRollReason && r.HealthSince.Valid && r.HealthSince.InfinityModifier == pgtype.Finite && !r.HealthSince.Time.IsZero() && !r.HealthSince.Time.After(now) && s.cfg.WorkerEligibilityForHealth != nil {
+			e, err := s.cfg.WorkerEligibilityForHealth(ctx, now, r.RunID)
+			drain := e.LatestSuitableDrainingSince
+			if err == nil && e.DrainingEligible > 0 && e.NonDrainingEligible == 0 && e.SuitableOwnDraining == 0 && drain.Valid && drain.InfinityModifier == pgtype.Finite && !drain.Time.IsZero() && !drain.Time.After(now) {
+				confirmed = true
+				overlap = r.HealthSince.Time
+				if drain.Time.After(overlap) {
+					overlap = drain.Time
+				}
+			}
+		}
+		if confirmed {
+			rolling[r.UserID] = true
+			if now.Sub(overlap) >= fleetCapacityRollDanger {
+				overdue[r.UserID], affected[r.UserID] = true, true
+				if overdueSince.IsZero() || overlap.Before(overdueSince) {
+					overdueSince = overlap
+				}
+			}
+			continue
+		}
+		unconfirmed[r.UserID] = true
+		if r.HealthSince.Valid && r.HealthSince.InfinityModifier == pgtype.Finite && !r.HealthSince.Time.IsZero() && now.Sub(r.HealthSince.Time) >= fleetCapacityDanger {
+			genuine[r.UserID], affected[r.UserID] = true, true
+			if genuineSince.IsZero() || r.HealthSince.Time.Before(genuineSince) {
+				genuineSince = r.HealthSince.Time
+			}
 		}
 	}
-	if haveOldest && now.Sub(oldest) >= fleetCapacityDanger {
+	// Only owners whose every waiting row was confirmed can be described as rolling.
+	for owner := range unconfirmed {
+		delete(rolling, owner)
+	}
+	if len(affected) > 0 {
 		c.Severity = sevDanger
-		c.Summary = fmt.Sprintf("%d owner(s) have queued runs and no usable worker (oldest waiting %s).", len(rows), humanDur(now.Sub(oldest)))
-		c.Since = sincePtr(oldest)
-		c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Owners affected", Value: fmt.Sprintf("%d", len(rows))}}
-		c.Action = strPtr("Recover or provision a worker for the affected owners, or check fleet.roll for stuck pods.")
+		c.Summary = fmt.Sprintf("%d owner(s) affected.", len(affected))
+		c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Owners affected", Value: fmt.Sprint(len(affected))}}
+		if len(genuine) > 0 {
+			c.Summary += fmt.Sprintf(" %d owner(s) have queued runs and no usable worker (oldest waiting %s).", len(genuine), humanDur(now.Sub(genuineSince)))
+			c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Owners without capacity", Value: fmt.Sprint(len(genuine))}, apitypes.HealthEvidenceDTO{Label: "Capacity wait since", Value: genuineSince.UTC().Format(time.RFC3339)})
+			c.Since = sincePtr(genuineSince)
+		}
+		if len(overdue) > 0 {
+			c.Summary += fmt.Sprintf(" %d owner(s) have an overdue wait while workers upgrade (oldest overlap %s).", len(overdue), humanDur(now.Sub(overdueSince)))
+			c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Owners overdue during upgrade", Value: fmt.Sprint(len(overdue))}, apitypes.HealthEvidenceDTO{Label: "Upgrade overlap since", Value: overdueSince.UTC().Format(time.RFC3339)})
+			if genuineSince.IsZero() || overdueSince.Before(genuineSince) {
+				c.Since = sincePtr(overdueSince)
+			}
+		}
+		switch {
+		case len(genuine) > 0 && len(overdue) > 0:
+			c.Action = strPtr("Recover or provision a worker for owners without capacity; investigate overdue upgrades in fleet.roll and check worker pods.")
+		case len(genuine) > 0:
+			c.Action = strPtr("Recover or provision a worker for the affected owners, or check fleet.roll for stuck pods.")
+		default:
+			c.Action = strPtr("Investigate overdue upgrades in fleet.roll and check worker pods and their running runs.")
+		}
 		c.Command = strPtr("kubectl -n <worker-namespace> get pods")
 		return c
 	}
 	c.Severity = sevOK
 	c.Summary = "Owners waiting for a worker are within the transient window."
+	if len(rolling) > 0 {
+		c.Summary = fmt.Sprintf("%d owner(s) are waiting while workers finish their current runs before an upgrade.", len(rolling))
+	}
 	return c
 }
 

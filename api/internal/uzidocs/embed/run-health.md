@@ -23,6 +23,13 @@ left to the deadline (e.g. `1h 5m left`).
 | ⚠ waiting for worker | Queued longer than expected with no worker claiming it. | The reason names why, if you own the run: no worker online, your vault is locked, or just a wait — start a worker or unlock your vault as needed. A judge or self-improve run instead reads **deprioritized** (yielding to interactive work on purpose, not stuck) or, once it's waited past the grace window, **priority restored** — see [Queue priority](#queue-priority). |
 | ⚠ needs approval | Sitting at `awaiting_approval` longer than expected (never shown for autopilot runs, which approve themselves). | Approve, reject, or request changes to the plan — see [Plan approval gate](./run-activity.md#plan-approval-gate). |
 
+When suitable persistent workers are finishing runs before an upgrade, the reason is
+**your workers are finishing their current runs before an upgrade; this run starts after**.
+Every static requirement must be satisfied by the same fresh online worker; occupied
+slots do not prevent this diagnosis. A suitable draining worker already assigned to the
+run vetoes it, because that worker can resume its own work. Incompatible own workers do
+not veto it. Account, vault, custody and isolated-profile guards keep precedence.
+
 One **waiting for worker** reason worth calling out is the Docker-worker
 allowlist. When every online worker is a Docker worker and the run's repo
 isn't on the Docker-worker allowlist, no worker is eligible to claim it, so

@@ -6814,7 +6814,31 @@ WHERE w.user_id = @user_id
 -- ClaimRun's claimant-custody guard (an open custody hold on the claimant) and its already-bound
 -- guard (a run another ephemeral worker is bound to), so this count can read one higher than the
 -- claim would allow. That only softens a "restart worker" hint and never grants a claim.
-SELECT count(*)
+-- Issue #2184: preserve the advisory availability projection separately from strict health
+-- eligibility. Static requirements compose on ONE candidate; strict counts ignore slots.
+WITH candidates AS (
+SELECT w.draining_since,
+       (w.status = 'online') AS online,
+       (w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs) AS free_slot,
+       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR fn_ephemeral_lease_admits(
+              w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+              @ephemeral_lease::interval, now(),
+              run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)) AS advisory_binding,
+       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (
+           fn_ephemeral_lease_admits(
+              w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+              @ephemeral_lease::interval, now(),
+              run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
+           AND NOT EXISTS (SELECT 1 FROM workers bw WHERE bw.ephemeral AND bw.ephemeral_run_id = run.id)
+           AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds ch WHERE ch.live_worker_id = w.id AND ch.state = 'open')
+       )) AS strict_binding,
+       (run.worker_id = w.id) AS own_worker,
+       (NOT w.ephemeral) AS persistent,
+       (run.worker_id IS NULL OR run.worker_id = w.id
+        OR NOT EXISTS (SELECT 1 FROM workers ow WHERE ow.id = run.worker_id
+                       AND (ow.draining_since IS NOT NULL OR
+                            (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= @heartbeat_cutoff)))
+        OR run.updated_at < @affinity_cutoff) AS affinity
 FROM runs run
 JOIN workers w ON w.user_id = run.user_id
 CROSS JOIN LATERAL (
@@ -6826,8 +6850,6 @@ CROSS JOIN LATERAL (
 WHERE run.id = @run_id
   AND w.last_heartbeat_at IS NOT NULL
   AND w.last_heartbeat_at >= @heartbeat_cutoff
-  AND w.draining_since IS NULL
-  AND (w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs)
   AND fn_worker_can_claim(
         COALESCE(w.docker_enabled, false),
         @docker_repo_allowlist::uuid[],
@@ -6872,16 +6894,16 @@ WHERE run.id = @run_id
            AND (run.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
            -- PRD #1976 M1: and the isolated_job_v1 arm for a profile-bound job.
            AND (run.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
-  -- PRD #2006: a leased ephemeral worker also counts when it may claim THIS run through its lease
-  -- (advisory mirror of ClaimRun's lease arm, so now()).
-  AND (NOT w.ephemeral OR w.ephemeral_run_id = run.id
-       OR fn_ephemeral_lease_admits(
-              w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
-              @ephemeral_lease::interval, now(),
-              run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id))
   AND (run.released_worker_id IS NULL
        OR run.released_worker_id <> w.id
-       OR run.released_worker_nonce IS DISTINCT FROM w.snapshot_register_nonce);
+       OR run.released_worker_nonce IS DISTINCT FROM w.snapshot_register_nonce)
+)
+SELECT count(*) FILTER (WHERE draining_since IS NULL AND free_slot AND advisory_binding)::bigint AS claimable,
+       count(*) FILTER (WHERE online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::bigint AS draining_eligible,
+       count(*) FILTER (WHERE online AND draining_since IS NULL AND affinity AND strict_binding)::bigint AS non_draining_eligible,
+       count(*) FILTER (WHERE online AND draining_since IS NOT NULL AND own_worker AND affinity AND strict_binding)::bigint AS suitable_own_draining,
+       max(draining_since) FILTER (WHERE online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::timestamptz AS latest_suitable_draining_since
+FROM candidates;
 
 -- name: ListDockerBlockedReposForUser :many
 -- The caller's repo ids that a Docker-allowlist gap is ACTIVELY blocking (PRD #361 M3):
@@ -7868,27 +7890,25 @@ WHERE run_id = @run_id AND consumed_at IS NULL AND contract_revision < @new_revi
 -- name: ListOwnersWaitingNoCapacity :many
 -- health fleet.capacity: the owners who have at least one run parked in
 -- health='waiting_worker' AND own ZERO usable workers — online (fresh heartbeat), not
--- draining. Per owner the OLDEST health_since (the wait's start); healthsvc applies the
--- 5-minute danger threshold. The heartbeat-freshness definition (last_heartbeat_at >=
+-- draining. Each waiting run is returned, including NULL health_since; healthsvc applies
+-- current roll confirmation and the distinct wait thresholds. The heartbeat-freshness definition (last_heartbeat_at >=
 -- @heartbeat_cutoff, cutoff = now - WORKER_HEARTBEAT_STALE) mirrors the "online worker"
 -- window the recovery/claim queries use, so this stays truthful even when the controller
 -- is silent (a heartbeat-based signal, not status-based). The conjunction with "zero
 -- usable workers" is what makes waiting_worker a CAPACITY failure rather than one of its
 -- other causes (vault locked, custody limit, all workers busy) — those surface through
 -- queue.waiting by age instead.
-SELECT r.user_id,
-       min(r.health_since)::timestamptz AS oldest_health_since
+SELECT r.user_id, r.id AS run_id, r.health_since,
+       (COALESCE(r.health_reason = @roll_reason::text, false))::boolean AS has_roll_reason
 FROM runs r
 WHERE r.health = 'waiting_worker'
-  AND r.health_since IS NOT NULL
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.draining_since IS NULL
         AND w.last_heartbeat_at IS NOT NULL
         AND w.last_heartbeat_at >= @heartbeat_cutoff
-  )
-GROUP BY r.user_id;
+  );
 
 -- name: OldestWaitingWorkerRun :one
 -- health queue.waiting: the oldest health_since across every run in

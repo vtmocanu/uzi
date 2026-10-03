@@ -28,6 +28,34 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+// ReasonWorkersUpgrading is shared with fleet.capacity's stored-reason confirmation.
+const ReasonWorkersUpgrading = "your workers are finishing their current runs before an upgrade; this run starts after"
+
+// WorkerEligibilityForHealth composes current worker eligibility using the claim configuration.
+func (s *Service) WorkerEligibilityForHealth(ctx context.Context, now time.Time, runID uuid.UUID) (store.CountOnlineWorkersClaimableForRunRow, error) {
+	return s.workerEligibilityForHealth(ctx, now, runID, s.capabilityAwareOn(ctx))
+}
+
+func (s *Service) workerEligibilityForHealth(ctx context.Context, now time.Time, runID uuid.UUID, capAware bool) (store.CountOnlineWorkersClaimableForRunRow, error) {
+	var allowlist []uuid.UUID
+	if s.dockerAllowlist != nil {
+		var err error
+		allowlist, err = s.dockerAllowlist.DockerRepoAllowlist(ctx)
+		if err != nil {
+			return store.CountOnlineWorkersClaimableForRunRow{}, err
+		}
+	}
+	return s.q.CountOnlineWorkersClaimableForRun(ctx, store.CountOnlineWorkersClaimableForRunParams{
+		RunID:               runID,
+		HeartbeatCutoff:     pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
+		AffinityCutoff:      pgconv.Time(now.Add(-s.p.WorkerAffinityCeiling)),
+		DockerRepoAllowlist: allowlist,
+		CapabilityAware:     capAware,
+		CodexCuratedModels:  codexCuratedModelsSlice(),
+		EphemeralLease:      LeaseInterval(s.ephemeralLease),
+	})
+}
+
 // Settings is the narrow read surface the health detector needs from the instance
 // settings cache (PRD #47 Decision 5). *settings.Cache satisfies it; tests use a
 // small fake. Declared here rather than importing settings' concrete type so
@@ -919,6 +947,16 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	if r.EgressProfileID.Valid {
 		return s.isolatedLaneReason(ctx, r)
 	}
+	// Read the capability-aware kill-switch ONCE and thread the same value into both the
+	// capability-gap rung (below) and the claim-time eligibility rung (rung 5), so the two
+	// counts and the claim path can never disagree on whether capabilities are enforced.
+	capAware := s.capabilityAwareOn(ctx)
+	eligibility, eligibilityErr := s.workerEligibilityForHealth(ctx, now, r.ID, capAware)
+	if eligibilityErr != nil {
+		slog.Error("health: read current worker eligibility", "run_id", r.ID, "error", eligibilityErr)
+	} else if eligibility.DrainingEligible > 0 && eligibility.NonDrainingEligible == 0 && eligibility.SuitableOwnDraining == 0 {
+		return ReasonWorkersUpgrading
+	}
 	n, err := s.q.CountOnlineWorkersForUser(ctx, r.UserID)
 	if err != nil {
 		slog.Error("health: count online workers", "error", err)
@@ -927,10 +965,6 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	if n == 0 {
 		return reasonNoWorker
 	}
-	// Read the capability-aware kill-switch ONCE and thread the same value into both the
-	// capability-gap rung (below) and the claim-time eligibility rung (rung 5), so the two
-	// counts and the claim path can never disagree on whether capabilities are enforced.
-	capAware := s.capabilityAwareOn(ctx)
 	// A run whose required_capabilities no online worker can satisfy is genuinely
 	// UNPLACEABLE (PRD #84 M3) — the most actionable reason once a worker IS online — so it
 	// is resolved BEFORE the priority-class re-label below: a yield/restored message would
@@ -1109,13 +1143,15 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 		}
 		if claimable, cerr := s.q.CountOnlineWorkersClaimableForRun(ctx, store.CountOnlineWorkersClaimableForRunParams{
 			RunID:               r.ID,
+			CodexCuratedModels:  codexCuratedModelsSlice(),
+			AffinityCutoff:      pgconv.Time(now.Add(-s.p.WorkerAffinityCeiling)),
 			HeartbeatCutoff:     pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
 			DockerRepoAllowlist: allowlist,
 			CapabilityAware:     capAware,
 			EphemeralLease:      LeaseInterval(s.ephemeralLease),
 		}); cerr != nil {
 			slog.Error("health: count workers claimable for run", "run_id", r.ID, "error", cerr)
-		} else if claimable == 0 {
+		} else if claimable.Claimable == 0 {
 			if wkr, werr := s.q.GetWorkerByID(ctx, uuid.UUID(r.ReleasedWorkerID.Bytes)); werr == nil &&
 				wkr.LastHeartbeatAt.Valid && !wkr.LastHeartbeatAt.Time.Before(now.Add(-s.p.WorkerHeartbeatStale)) {
 				return fmt.Sprintf("waiting for another worker, or restart worker %s (its previous process was released at the time limit)", wkr.Name)
