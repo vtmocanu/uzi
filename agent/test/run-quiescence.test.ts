@@ -231,13 +231,14 @@ const CLI = `
 const { spawn } = require("node:child_process");
 const [tool, sock, src] = process.argv.slice(1);
 const c = spawn(process.execPath, ["-e", tool, sock, src], { detached: true,
-  stdio: sock === "/dev/fd/3/d.sock" ? ["ignore", "ignore", "ignore", 3] : "ignore" });
+  stdio: sock.startsWith("/dev/fd/3/") ? ["ignore", "ignore", "ignore", 3] : "ignore" });
 process.stdout.write(String(c.pid) + "\\n");
 setInterval(() => {}, 1000);`;
 
 /** Start a stand-in CLI group whose tool keeps creating containers bound under `bindSrc`. */
 async function startAgent(a: RunAttempt, daemon: FakeDaemon, bindSrc: string): Promise<{ cli: ChildProcess; toolPid: number }> {
-  const sock = daemon.directoryFd === undefined ? daemon.socket : "/dev/fd/3/d.sock";
+  const sock = daemon.directoryFd === undefined ? daemon.socket :
+    daemon.socket.replace(`/dev/fd/${daemon.directoryFd}/`, "/dev/fd/3/");
   const cli = spawn(process.execPath, ["-e", CLI, TOOL, sock, bindSrc], {
     cwd: a.clonePath,
     env: markerEnv(a),
