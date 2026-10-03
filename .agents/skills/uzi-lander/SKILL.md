@@ -436,6 +436,10 @@ and they precede every merge (step 6):
 - **The PR description is yours to edit.** A uzi rework cannot change it, so disclosures a
   rework reports (deferred items, behaviour changes, follow-ups) reach the PR body only
   through you: `gh pr edit PR --body-file FILE`, keeping the existing text.
+- **The closing keyword matches the outcome.** uzi writes `Closes #N` whenever every
+  milestone reports complete (#2172), even when the plan or the run's final message says the
+  issue stays open. Then edit `Closes` to `Refs` and confirm
+  `gh pr view PR --json closingIssuesReferences` is empty before merging.
 - **A code-scanning alert on the PR ref may be an old one.** When the PR only touches
   lines near a known alert, compare rule and path with `main`'s alerts
   (`gh api repos/OWNER/REPO/code-scanning/alerts?ref=refs/heads/main`). Dismiss the
