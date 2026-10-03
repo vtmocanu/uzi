@@ -46,14 +46,14 @@ func (q *lostReplyStore) SetCodexRecoverySlot(ctx context.Context, p store.SetCo
 	q.mu.Unlock()
 	if delay {
 		// Check the generation and operation before quarantining the leased account.
-		account, err := q.Queries.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{ID: p.ID, UserID: p.UserID})
+		account, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{ID: p.ID, UserID: p.UserID})
 		if err != nil {
 			return 0, err
 		}
 		if account.Generation != p.Gen || !account.CoordOperationID.Valid || account.CoordOperationID.Bytes != p.Op {
 			return 0, errors.New("fixture retention fence lost")
 		}
-		if _, err := q.Queries.QuarantineCodexAccount(ctx, store.QuarantineCodexAccountParams{ID: p.ID, UserID: p.UserID, Op: p.Op}); err != nil {
+		if _, err := q.QuarantineCodexAccount(ctx, store.QuarantineCodexAccountParams{ID: p.ID, UserID: p.UserID, Op: p.Op}); err != nil {
 			return 0, err
 		}
 		return 0, errors.New("fixture retention not released")
@@ -137,7 +137,7 @@ func (f *lostReplyForge) BranchHead(ctx context.Context, _ int64, branch string)
 }
 
 func (f *lostReplyForge) RefHead(ctx context.Context, _ int64, ref string) (string, error) {
-	out, err := exec.CommandContext(ctx, "git", "-C", f.origin, "rev-parse", "--verify", ref+"^{commit}").Output()
+	out, err := exec.CommandContext(ctx, "git", "-C", f.origin, "rev-parse", "--verify", ref+"^{commit}").Output() //nolint:gosec // G204: fixed Git binary, owned fixture directory and server-derived ref; no shell.
 	if err != nil {
 		return "", forge.ErrRefNotFound
 	}
@@ -145,7 +145,7 @@ func (f *lostReplyForge) RefHead(ctx context.Context, _ int64, ref string) (stri
 }
 
 func (f *lostReplyForge) CompareAncestry(ctx context.Context, _ int64, head, candidate string) (forge.Ancestry, error) {
-	err := exec.CommandContext(ctx, "git", "-C", f.origin, "merge-base", "--is-ancestor", candidate, head).Run()
+	err := exec.CommandContext(ctx, "git", "-C", f.origin, "merge-base", "--is-ancestor", candidate, head).Run() //nolint:gosec // G204: fixed Git binary and validated fixture commit SHAs; no shell.
 	if err == nil {
 		return forge.AncestryAncestor, nil
 	}
@@ -200,7 +200,11 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer os.RemoveAll(dir)
+			defer func() {
+				if err := os.RemoveAll(dir); err != nil {
+					t.Errorf("cleanup fixture directory: %v", err)
+				}
+			}()
 			origin := filepath.Join(dir, "origin.git")
 			q := store.New(pool)
 			delayed := &lostReplyStore{Queries: q, delay: variant == "pending-retention"}
@@ -215,7 +219,7 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 			// Only the forge transport is replaced: packs, ancestry, CAS and fetch-back use Git.
 			svc.SetPublishFn(func(ctx context.Context, o pushbroker.Options) (pushbroker.Result, error) {
 				git := func(input []byte, args ...string) (string, error) {
-					cmd := exec.CommandContext(ctx, "git", append([]string{"-C", origin}, args...)...)
+					cmd := exec.CommandContext(ctx, "git", append([]string{"-C", origin}, args...)...) //nolint:gosec // G204: only the fixed Git subcommands below, server-validated refs/SHAs and owned paths; no shell.
 					cmd.Stdin = bytes.NewReader(input)
 					out, err := cmd.CombinedOutput()
 					if err != nil {
@@ -257,16 +261,20 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 				if err != nil {
 					return pushbroker.Result{}, err
 				}
-				defer os.RemoveAll(verify)
+				defer func() {
+					if err := os.RemoveAll(verify); err != nil {
+						t.Errorf("cleanup fetch-back directory: %v", err)
+					}
+				}()
 				for _, args := range [][]string{{"init", "--bare", verify}, {"-C", verify, "fetch", "--no-tags", origin, ref}, {"-C", verify, "cat-file", "-e", o.DeclaredTip + "^{commit}"}} {
-					if err := exec.CommandContext(ctx, "git", args...).Run(); err != nil {
+					if err := exec.CommandContext(ctx, "git", args...).Run(); err != nil { //nolint:gosec // G204: literal fetch-back commands and owned fixture paths below; no shell.
 						return pushbroker.Result{}, fmt.Errorf("fetch-back proof: %w", err)
 					}
 				}
 				return pushbroker.Result{Ref: ref}, nil
 			})
 			svc.SetDeleteCheckpointFn(func(ctx context.Context, o pushbroker.DeleteOptions) error {
-				return exec.CommandContext(ctx, "git", "-C", origin, "update-ref", "-d", "refs/uzi-checkpoints/"+o.Branch).Run()
+				return exec.CommandContext(ctx, "git", "-C", origin, "update-ref", "-d", "refs/uzi-checkpoints/"+o.Branch).Run() //nolint:gosec // G204: fixed Git binary, owned directory and server-derived branch; no shell.
 			})
 			owner, conn, repo, worker, run := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
 			defer func() {
@@ -451,7 +459,7 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if strings.HasPrefix(r.URL.Path, "/fixture/") {
 					if r.Header.Get("Authorization") != "Bearer "+token {
-						http.Error(w, "unauthorized", 403)
+						http.Error(w, "unauthorized", http.StatusForbidden)
 						return
 					}
 					state, err := control(strings.TrimPrefix(r.URL.Path, "/fixture/"))
@@ -570,8 +578,10 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 				t.Error("terminal FAILED appeared in state feed")
 			}
 			mu.Lock()
-			if len(attempts) > 0 && strings.Contains(feed+string(out), attempts[0].Capability) {
-				t.Error("capability escaped to feed or output")
+			for _, attempt := range attempts {
+				if attempt.Capability != "" && strings.Contains(feed+string(out), attempt.Capability) {
+					t.Error("capability escaped to feed or output")
+				}
 			}
 			if strings.Contains(feed+string(out), token) {
 				t.Error("worker token escaped to feed or output")

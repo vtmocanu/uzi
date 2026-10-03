@@ -215,6 +215,7 @@ try {
   assert.equal(resumed.secrets.codex?.auth_mode, "subscription");
   assert.ok(resumed.secrets.codex && "generation" in resumed.secrets.codex);
   assert.equal(resumed.secrets.codex.generation, 1);
+  assert.ok(resumed.secrets.codex.capability !== first.secrets.codex?.capability, "reclaim minted a fresh capability");
   await runner.execute(resumed);
   assert.ok(resumeObserved);
   if (Number(mrCreates) !== 1) {
@@ -229,7 +230,7 @@ try {
   assert.equal(completed.inputs[1], "1", "resume refreshed promoted lineage");
   assert.ok(description.includes("Closes #1770"), "exact-head verified full delivery");
   const logs = lines.join("\n");
-  for (const canary of ["access-canary-", "refresh-canary-", cfg.token, first.secrets.codex?.capability ?? ""]) {
+  for (const canary of ["access-canary-", "refresh-canary-", cfg.token, first.secrets.codex?.capability ?? "", resumed.secrets.codex.capability]) {
     if (canary) assert.ok(!logs.includes(canary), "no credential canary in worker logs");
   }
   console.log("combined worker park, sweep, reclaim, completion and custody assertions passed: " + cfg.variant);
