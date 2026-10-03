@@ -502,7 +502,10 @@ func (s *Service) CoordinatedCodexRefresh(ctx context.Context, wkr store.Worker,
 		if rechecked.AccountID != authCtx.AccountID {
 			return CodexRefreshResult{}, ErrCodexAccountKeyUnfrozen
 		}
-		if errors.Is(err, errCodexVaultRecoveryPersisted) {
+		// A quarantine-only recheck needs coherent durable recovery evidence. If
+		// promotion already restored full authorization, this invocation's actual
+		// vault-lock observation still determines its credential-free first reply.
+		if errors.Is(err, errCodexVaultRecoveryPersisted) && errors.Is(rerr, ErrCodexAccountQuarantined) {
 			_, derr := s.codexRecoveryDeferral(operationCtx, wkr, runID, capability, authCtx, operationID, observedGeneration)
 			if !errors.Is(derr, ErrCodexVaultLocked) {
 				return CodexRefreshResult{}, derr
@@ -967,7 +970,8 @@ func (s *Service) recordCodexRefreshRejection(ctx context.Context, userID, accou
 // closure — and returns nil (a RETAINED-pending outcome, NOT an established loss). It
 // returns errCodexRecoveryLost ONLY when loss is genuinely established synchronously: no
 // background seam is wired to hand off to. It preserves the store's coord_operation_id +
-// generation fences and recovery_sealed_with metadata (the SQL is unchanged).
+// generation fences and recovery_sealed_with metadata unchanged; the recovery write
+// now also accepts a nullable recovery_cause.
 func (s *Service) persistCodexRecoverySlot(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID, fromGeneration int64, sealedMerged []byte, sealedWith string) error {
 	_, err := s.persistCodexRecoverySlotWithCause(ctx, q, userID, accountID, operationID, fromGeneration, sealedMerged, sealedWith, pgtype.Text{})
 	return err
