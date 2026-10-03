@@ -326,7 +326,7 @@ describe("RunRunner — PRD #1809 D4 both layers disabled", () => {
 });
 
 /** Count the runner's custody settles, and snapshot the HOME's caches when the capture runs. */
-function instrument(runner: RunRunner, home: () => string): { settles: () => number; cachesAtCapture: () => boolean[] | undefined } {
+function instrument(runner: RunRunner, home: () => string, order?: string[]): { settles: () => number; cachesAtCapture: () => boolean[] | undefined } {
   const r = runner as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
   let settles = 0;
   let atCapture: boolean[] | undefined;
@@ -337,6 +337,7 @@ function instrument(runner: RunRunner, home: () => string): { settles: () => num
   };
   const capture = r.captureRecoveryRestorePoint!.bind(runner);
   r.captureRecoveryRestorePoint = async (...a) => {
+    order?.push("capture-start");
     atCapture ??= CACHES.map((rel) => fs.existsSync(path.join(home(), rel)));
     return await capture(...a);
   };
@@ -377,12 +378,16 @@ describe("RunRunner — PRD #1809 D4 the mid-run disk park's reap, cache drop an
       const { gitlab } = fakeGitlab();
       const runId = "18090000-0000-4000-8000-00000000d405";
       const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { diskGovernor: probe.gov });
-      const spy = instrument(runner, () => home);
+      const spy = instrument(runner, () => home, order);
       await runner.execute(gitlabClaim(1814, { run_id: runId, claim_generation: 3 }));
       assert.strictEqual(parks(runId).length, 1, "parked");
       // #1828: order[0] is the pre-clone HOME reap; the park's own reap is the next one.
       const first = order.indexOf("attributed-reap", 1);
       assert.ok(first > 0 && order[first - 1] === "group-reap", `the attributed reap follows the group reap: ${JSON.stringify(order)}`);
+      // The real quiesceRun also reaps (inside the capture's proof), so pin the disk park's OWN reap
+      // pair: it must complete before the capture starts.
+      const captureStart = order.indexOf("capture-start");
+      assert.ok(captureStart > first, `the disk park's own reap ran before the capture began: ${JSON.stringify(order)}`);
       assert.deepStrictEqual(spy.cachesAtCapture(), [false, false, false], "the caches were gone before the capture ran");
       assert.strictEqual(spy.settles(), 0, "the disk park keeps the custody hold: no settle");
     });

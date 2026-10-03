@@ -217,6 +217,42 @@ describe("RunRunner — cache drop on a process-ending park (PRD #1809 M1)", () 
     }
   });
 
+  for (const [label, reapResult] of [
+    ["left a live process", async () => ({ killed: [], left: [4242], complete: true })],
+    ["was incomplete", async () => ({ killed: [], left: [], complete: false })],
+    ["rejected", async () => Promise.reject(new Error("reap exploded"))],
+  ] as const) {
+    it(`a process-ending park keeps the caches when the attributed reap ${label} (#1828)`, async (t) => {
+      if (!fs.existsSync("/proc/self/fd")) return t.skip("no fd dir on this host: the cache drop refuses here by design");
+      const { gitlab } = fakeGitlab();
+      const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1828-keep-"));
+      try {
+        let home = "";
+        const factory: ExecutorFactory = (id) => {
+          home = path.join(homeRoot, id);
+          return {
+            homeDir: home,
+            executor: {
+              run: async (): Promise<ExecutorResult> => {
+                seedHome(home);
+                throw new LimitReachedError({ resetsAtMs: Date.now() + 5 * 3600_000, rateLimitType: "five_hour" });
+              },
+              killAgentTree: () => undefined,
+              reapAttributedProcesses: reapResult,
+            },
+          };
+        };
+        const runId = "18090000-0000-4000-8000-000000001828";
+        await runnerWith(factory, gitlab).execute(gitlabClaim(1828, { run_id: runId, wait_on_limit: true, claim_generation: 1 }));
+        assert.ok(api.states.some((s) => s.runId === runId && s.body.status === "limit_wait"), "precondition: parked");
+        assertCachesKept(home);
+        assertResumeStateKept(home);
+      } finally {
+        forceRm(homeRoot);
+      }
+    });
+  }
+
   it("the finalize security reap awaits the attributed reap BEFORE the PAT-bearing push (N-a)", async () => {
     const { gitlab } = fakeGitlab();
     simulateCommittedWork();

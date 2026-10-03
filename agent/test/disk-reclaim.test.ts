@@ -102,6 +102,8 @@ function deps(d: { home: string; provision: string }, over: Partial<DiskReclaimD
     isRunLive: () => false,
     locks: new RunDiskLocks(),
     log: nullLogger(),
+    // Hermetic: the default scans /proc for processes attributed to the run's HOME.
+    processesClear: async () => true,
     ...over,
   };
 }
@@ -271,6 +273,60 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     status = "running"; // resumed elsewhere
     await runDiskReclaimPass(base);
     assert.equal(memo.has(run.id), false, "a non-park status forgets the drop too");
+  });
+
+  it("keeps a parked run's caches while a process is attributed to its HOME, without memoizing, and drops them once clear", { skip: SKIP_ROOT }, async () => {
+    const d = dataDir();
+    const run = seedRun(d);
+    const memo = new CachesDroppedMemo();
+    let clear = false;
+    const asked: string[] = [];
+    let drops = 0;
+    const base = deps(d, {
+      cachesDropped: memo,
+      statusOf: async () => "limit_wait",
+      processesClear: async (home) => {
+        asked.push(home);
+        return clear;
+      },
+      dropCaches: async (home, log, opts) => {
+        drops += 1;
+        return dropRunCaches(home, log, opts);
+      },
+    });
+
+    const kept = await runDiskReclaimPass(base);
+    assert.deepEqual(asked, [run.home]);
+    assert.equal(drops, 0, "no drop while a process is attributed");
+    assert.equal(kept.cachesKeptLiveProcesses, 1);
+    assert.equal(kept.cachesDropped, 0);
+    assert.equal(memo.has(run.id), false, "not memoized, so the next pass retries");
+    for (const rel of CACHES) assert.equal(exists(path.join(run.home, rel)), true, `${rel} kept`);
+
+    clear = true;
+    const dropped = await runDiskReclaimPass(base);
+    assert.equal(drops, 1);
+    assert.equal(dropped.cachesDropped, 1);
+    assert.equal(dropped.cachesKeptLiveProcesses, 0);
+    assert.equal(memo.has(run.id), true);
+    for (const rel of CACHES) assert.equal(exists(path.join(run.home, rel)), false, `${rel} dropped`);
+  });
+
+  it("does not run the process check for a terminal run", { skip: SKIP_ROOT }, async () => {
+    const d = dataDir();
+    const terminal = seedRun(d);
+    let asked = 0;
+    await runDiskReclaimPass(
+      deps(d, {
+        statusOf: async () => "completed",
+        processesClear: async () => {
+          asked += 1;
+          return false;
+        },
+      }),
+    );
+    assert.equal(asked, 0, "terminal removal is not gated on the scan");
+    assert.equal(exists(terminal.home), false);
   });
 
   it("a run that resumes here, rebuilds its caches and parks again between two passes is dropped again", { skip: SKIP_ROOT }, async () => {

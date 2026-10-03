@@ -9,6 +9,7 @@ import type { ExecutorFactory, RunRunner } from "../src/runner.js";
 import { DiskParkSignal } from "../src/cache-cap.js";
 import type { RecoveryCoordinator } from "../src/recovery.js";
 import type { ProcessQuiescenceState, QuiesceRunOutcome, QuiesceRunRequest } from "../src/run-quiescence.js";
+import type { RunProcessReap } from "../src/run-procs.js";
 import type { StateRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
@@ -101,11 +102,12 @@ function fakeRecovery(): { recovery: RecoveryCoordinator; captures: () => number
  * the worker retries), which ends handleRecoveryExhausted's loop non-parked with the preserve flags
  * still set.
  */
-function quiescer(state: ProcessQuiescenceState, runId: string, order: string[]) {
+function quiescer(state: ProcessQuiescenceState, runId: string, order: string[], cachesAtProof: boolean[] = []) {
   const calls: QuiesceRunRequest[] = [];
   const quiesceRun = async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
     calls.push(req);
     order.push(`proof:${req.site ?? "?"}`);
+    cachesAtProof.push(fs.existsSync(path.join(homeDir, runId, ".cache", "go-build")));
     if (state !== "quiescent" && calls.filter((c) => c.site === "recovery_capture").length >= BLOCKED_ATTEMPTS) {
       api.setOwnershipStatus(runId, "paused");
     }
@@ -129,7 +131,7 @@ interface Seen {
 
 /** An executor that commits work, leaves an UNCOMMITTED file (so a capture would commit a
  *  `wip(park):` marker), then throws the cache cap's preventive disk park mid-run. */
-function diskParkFactory(seen: Seen, order: string[]): ExecutorFactory {
+function diskParkFactory(seen: Seen, order: string[], reap?: () => Promise<RunProcessReap>): ExecutorFactory {
   return (runId) => ({
     homeDir: path.join(homeDir, runId),
     executor: {
@@ -138,10 +140,12 @@ function diskParkFactory(seen: Seen, order: string[]): ExecutorFactory {
       },
       reapAttributedProcesses: async () => {
         order.push("attributed-reap");
-        return { killed: [], left: [], complete: true };
+        return reap ? await reap() : { killed: [], left: [], complete: true };
       },
       run: async (ctx: RunContext): Promise<ExecutorResult> => {
         seen.clone = ctx.worktreePath;
+        fs.mkdirSync(path.join(homeDir, runId, ".cache", "go-build", "0a"), { recursive: true });
+        fs.writeFileSync(path.join(homeDir, runId, ".cache", "go-build", "0a", "entry"), "x");
         fs.writeFileSync(path.join(ctx.worktreePath, "WORK.txt"), "work\n");
         gitOut(ctx.worktreePath, ["add", "WORK.txt"]);
         gitOut(ctx.worktreePath, [...IDENT, "commit", "-m", "work"]);
@@ -174,7 +178,7 @@ function instrument(runner: RunRunner): { overlays: () => number; settles: () =>
 
 const statesOf = (runId: string): StateRequest[] => api.states.filter((s) => s.runId === runId).map((s) => s.body);
 
-async function runDiskPark(iid: number, state: ProcessQuiescenceState) {
+async function runDiskPark(iid: number, state: ProcessQuiescenceState, reap?: () => Promise<RunProcessReap>) {
   client.protocolFeatures = [FEATURE, FENCE];
   const { gitlab, calls: mrCalls } = fakeGitlab();
   const claim = gitlabClaim(iid, { claim_generation: 3 });
@@ -182,11 +186,12 @@ async function runDiskPark(iid: number, state: ProcessQuiescenceState) {
   const seen: Seen = { clone: "" };
   const pub = spyPublish();
   const { recovery, captures, releases } = fakeRecovery();
-  const { calls, quiesceRun } = quiescer(state, claim.run_id, order);
-  const runner = runnerWith(diskParkFactory(seen, order), gitlab, undefined, nullLogger(), { ...RUNNER_OPTS, quiesceRun, recovery });
+  const cachesAtProof: boolean[] = [];
+  const { calls, quiesceRun } = quiescer(state, claim.run_id, order, cachesAtProof);
+  const runner = runnerWith(diskParkFactory(seen, order, reap), gitlab, undefined, nullLogger(), { ...RUNNER_OPTS, quiesceRun, recovery });
   const spy = instrument(runner);
   await runner.execute(claim);
-  return { claim, order, seen, pub, captures, releases, calls, spy, mrCalls };
+  return { claim, order, seen, pub, captures, releases, calls, spy, mrCalls, cachesAtProof };
 }
 
 describe("issue #1783 x PRD #1826: a mid-run data_volume_full park whose clone is not provably quiescent", () => {
@@ -197,9 +202,17 @@ describe("issue #1783 x PRD #1826: a mid-run data_volume_full park whose clone i
 
       // #1826's reap ran (and "succeeded"), BEFORE the capture's proof: it does not substitute for it.
       // #1828: order[0] is the pre-clone HOME reap; the park's own reap is the next one.
+      // The capture's own sink step also runs a group-reap + attributed-reap pair just before its
+      // proof, so the pair at the tail alone cannot tell the disk park's explicit reap from it: pin
+      // BOTH pairs between the pre-clone reap (order[0]) and the first proof.
       const reap = order.indexOf("attributed-reap", 1);
       const firstProof = order.indexOf("proof:recovery_capture");
       assert.ok(reap > 0 && order[reap - 1] === "group-reap", `attributed reap after the group reap: ${JSON.stringify(order)}`);
+      assert.deepEqual(
+        order.slice(1, firstProof),
+        ["group-reap", "attributed-reap", "group-reap", "attributed-reap"],
+        `the disk park's own reap pair, then the capture's, precede the first proof: ${JSON.stringify(order)}`,
+      );
       assert.ok(firstProof > reap, `the capture's proof runs after the reap and still blocks: ${JSON.stringify(order)}`);
       const captureProofs = calls.filter((c) => c.site === "recovery_capture");
       assert.equal(captureProofs.length, BLOCKED_ATTEMPTS, "every capture attempt was proof-gated and blocked (retain-and-retry)");
@@ -232,6 +245,24 @@ describe("issue #1783 x PRD #1826: a mid-run data_volume_full park whose clone i
       assert.ok(fs.existsSync(path.join(seen.clone, ".git")), "the runner clone is kept");
       assert.ok(fs.existsSync(path.join(seen.clone, "WORK.txt")), "the committed work is on disk");
       assert.ok(fs.existsSync(path.join(seen.clone, "UNCOMMITTED.txt")), "the uncommitted work is on disk");
+    });
+  }
+
+  for (const [label, reap] of [
+    ["left a live process", async () => ({ killed: [], left: [4242], complete: true })],
+    ["was incomplete", async () => ({ killed: [], left: [], complete: false })],
+  ] as const) {
+    it(`the early cache drop is skipped when the park's attributed reap ${label} (#1828)`, async () => {
+      let reaps = 0;
+      const { claim, cachesAtProof, order } = await runDiskPark(1830 + (label === "was incomplete" ? 1 : 0), "survivors", () => {
+        // The first reap is the pre-clone one (claim_generation 3): clean, so the run starts.
+        reaps += 1;
+        return reaps === 1 ? Promise.resolve({ killed: [], left: [], complete: true }) : reap();
+      });
+      const firstProof = order.indexOf("proof:recovery_capture");
+      assert.ok(firstProof > 0, "precondition: the capture's proof ran");
+      assert.equal(cachesAtProof[0], true, "the caches were still there when the capture's first proof ran: no early drop");
+      assert.ok(fs.existsSync(path.join(homeDir, claim.run_id, ".cache", "go-build")), "and they are kept at the end");
     });
   }
 

@@ -5,6 +5,7 @@ import type { Logger } from "./log.js";
 import { rmTreePinned } from "./rmtree.js";
 import { dropRunCaches, isNoop, type DropRunCachesOptions, type RunCacheDropResult } from "./run-caches.js";
 import { isLiveModelPassHome } from "./model-pass.js";
+import { scanRunProcesses } from "./run-procs.js";
 import { DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES, TERMINAL_RUN_STATUSES, type RunStatusLookup } from "./home-reclaim.js";
 import type { RunDiskLocks } from "./run-disk-locks.js";
 import { errMessage, RUN_ID_RE, sleep } from "./util.js";
@@ -132,6 +133,13 @@ export interface DiskReclaimDeps {
   removeTree?: (parent: string, name: string, deadline: number) => Promise<unknown>;
   dropCaches?: (home: string, log: Logger, opts: DropRunCachesOptions) => Promise<RunCacheDropResult>;
   isModelPassLive?: (dir: string) => boolean;
+  /**
+   * issue #1828: whether no process is attributed to the run's HOME, so its caches may be dropped
+   * (false keeps them and retries next pass). `budgetMs` is the time left in the pass. Default:
+   * on Linux a complete `scanRunProcesses` that finds nothing; elsewhere true, the platform rule of
+   * the runner's quiesceRun fold (runner.ts), which is skipped off Linux too.
+   */
+  processesClear?: (home: string, budgetMs: number) => Promise<boolean>;
   now?: () => number;
   modelPassMinAgeMs?: number;
   maxEntries?: number;
@@ -173,6 +181,8 @@ export interface DiskReclaimSummary {
   cachesDropped: number;
   /** A parked run whose caches were already gone (remembered from an earlier pass, or a no-op drop). */
   cachesAlreadyClear: number;
+  /** A parked run whose caches were kept because a process attributed to its HOME was alive or unproven. */
+  cachesKeptLiveProcesses: number;
   skippedLive: number;
   /**
    * A listed run whose directories are none of them a real directory owned by the worker:
@@ -411,6 +421,24 @@ async function listDirs(
   return { lists, read: skipped + read, kept: read, capped, deadline: pastDeadline, next, whole: atEnd && skip === 0 };
 }
 
+/** Budget cap for the default liveness scan (run-procs.ts SCAN_BUDGET_MS is its own default). */
+const PROCESSES_CLEAR_MAX_BUDGET_MS = 30_000;
+
+/**
+ * The default {@link DiskReclaimDeps.processesClear}. Linux only, the same platform rule as the
+ * runner's quiesceRun fold so the two gates cannot disagree; elsewhere there is no scan to run.
+ * A scan that throws, is incomplete or names a pid reads as not clear.
+ */
+async function defaultProcessesClear(home: string, budgetMs: number): Promise<boolean> {
+  if (process.platform !== "linux") return true;
+  try {
+    const scan = await scanRunProcesses(home, undefined, [], { budgetMs: Math.max(1, Math.min(PROCESSES_CLEAR_MAX_BUDGET_MS, budgetMs)) });
+    return scan.complete && scan.pids.length === 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * One reclaim pass. Best-effort in every direction: it never throws, and every failure is
  * counted and logged in the summary line.
@@ -418,6 +446,7 @@ async function listDirs(
 export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskReclaimSummary> {
   const removeTree = deps.removeTree ?? ((parent: string, name: string, deadline: number) => rmTreePinned(parent, name, { deadline }));
   const dropCaches = deps.dropCaches ?? dropRunCaches;
+  const processesClear = deps.processesClear ?? defaultProcessesClear;
   const memo = deps.cachesDropped;
   const isModelPassLive = deps.isModelPassLive ?? isLiveModelPassHome;
   const now = deps.now ?? Date.now;
@@ -439,6 +468,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
     provisionDirsNotOwned: 0,
     cachesDropped: 0,
     cachesAlreadyClear: 0,
+    cachesKeptLiveProcesses: 0,
     skippedLive: 0,
     skippedNotOwned: 0,
     skippedStatusUnknown: 0,
@@ -617,6 +647,14 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
         return;
       }
       if (!terminal) {
+        // issue #1828: a process the pinned CLI detached can outlive the park and still write the
+        // caches. Past the pass deadline, or with a live or unproven one, keep them and do not
+        // memoize, so the next pass retries.
+        const remaining = passDeadline - now();
+        if (remaining <= 0 || !(await processesClear(dirs.home as string, remaining))) {
+          summary.cachesKeptLiveProcesses += 1;
+          return;
+        }
         // dropRunCaches never throws; it logs what it dropped and what it could not, under
         // its own message, and nothing for a no-op.
         const r = await dropCaches(dirs.home as string, log, {
@@ -724,6 +762,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
     provision_dirs_not_owned: summary.provisionDirsNotOwned,
     caches_dropped: summary.cachesDropped,
     caches_already_clear: summary.cachesAlreadyClear,
+    caches_kept_live_processes: summary.cachesKeptLiveProcesses,
     skipped_live: summary.skippedLive,
     skipped_not_owned: summary.skippedNotOwned,
     skipped_status_unknown: summary.skippedStatusUnknown,

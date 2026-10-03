@@ -885,6 +885,28 @@ function attributedReapCause(reap: RunProcessReap | { failure: string }): { stat
 }
 
 /**
+ * issue #1828: reap the run's HOME-attributed processes and say whether a cache drop may follow
+ * (the contract on Executor.reapAttributedProcesses: drop only after a complete reap that left
+ * nothing). An executor without the method (a stub, a test double) has nothing to reap and may
+ * drop; a rejection reads as incomplete. Warns when the drop must be skipped.
+ */
+async function reapThenMayDropCaches(executor: Executor, runLog: Logger): Promise<boolean> {
+  if (!executor.reapAttributedProcesses) return true;
+  let reap: RunProcessReap | undefined;
+  try {
+    reap = await executor.reapAttributedProcesses();
+  } catch {
+    reap = undefined;
+  }
+  if (reap && reap.complete && reap.left.length === 0) return true;
+  runLog.warn("run caches kept: the process reap left live processes or was incomplete", {
+    left: reap ? reap.left.slice(0, ATTRIBUTED_REAP_DETAIL_PIDS) : [],
+    incomplete: !reap || !reap.complete,
+  });
+  return false;
+}
+
+/**
  * issue #1828: fold the run's HOME-attributed reap into the process verdict quiesceRun returns.
  * A reap that left survivors makes the verdict `survivors`, an otherwise incomplete (or failed)
  * one `unverified`; both block every caller. An already non-quiescent verdict keeps its state and
@@ -3479,10 +3501,12 @@ export class RunRunner {
         // session and group), so a detached `go test &` could still be writing the caches this
         // drop removes. Reap every process attributed to the run (run-procs.ts) first. Never
         // rejects; after a disk park's own reap it finds nothing left.
-        await executor.reapAttributedProcesses?.();
-        // A disk park already dropped them before its capture (N3): this pass only finishes what
-        // that one could not, and says nothing when there was nothing left.
-        await dropRunCaches(runHome, runLog, flight.cachesDroppedEarly ? { quietNoop: true } : {});
+        // A reap that left survivors or was incomplete keeps the caches (Executor contract).
+        if (await reapThenMayDropCaches(executor, runLog)) {
+          // A disk park already dropped them before its capture (N3): this pass only finishes what
+          // that one could not, and says nothing when there was nothing left.
+          await dropRunCaches(runHome, runLog, flight.cachesDroppedEarly ? { quietNoop: true } : {});
+        }
       }
       if (flight.preClonePark) {
         // PRD #1392 M2: a pre-clone forge-unreachable park. It preserves HOME/session only when a
@@ -7569,8 +7593,9 @@ export class RunRunner {
     // executeClaim's generic arm fails the run worker_residue_blocked with no credentialed settle.
     // The reap attributes by the `HOME=<path>` environ string, not by the directory existing, so a
     // survivor that deleted or renamed the HOME still matches: no HOME-exists gate. A run's first
-    // claim (claim_generation 1: ClaimRun increments from a 0 default) cannot have such a survivor,
-    // so it skips the reap; an absent, 0 or >=2 generation (an older api) still reaps, failing
+    // claim (claim_generation 1 is the first claim since migration 00223, which backfilled 0, so only a
+    // run claimed before it and still live could differ, and none is left) cannot have such a
+    // survivor, so it skips the reap; an absent, 0 or >=2 generation (an older api) still reaps, failing
     // closed. Codex is excluded by the method's absence only.
     const executor = flight.executor;
     if (
@@ -11873,12 +11898,12 @@ export class RunRunner {
       // The group reap above misses what the agent backgrounded: the pinned CLI runs every Bash
       // command detached, in its own session and process group. Kill every process attributed to
       // the run by HOME or working directory too (run-procs.ts), before anything is captured.
-      await executor.reapAttributedProcesses?.();
+      const mayDrop = await reapThenMayDropCaches(executor, runLog);
       // N3: drop the rebuildable caches NOW, before the capture and fetch-back below: they are not
       // part of the capture, and on a truly full volume the capture's own writes need the space.
       // Claude runs only (a Codex run's caches sit on its own volume). The finally's park drop then
       // finds them gone. Never throws.
-      if (flight.runHome && !executor.safety) {
+      if (mayDrop && flight.runHome && !executor.safety) {
         await dropRunCaches(flight.runHome, runLog, { message: "run caches dropped before the disk park's capture" });
         flight.cachesDroppedEarly = true;
       }
