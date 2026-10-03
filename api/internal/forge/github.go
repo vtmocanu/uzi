@@ -113,6 +113,7 @@ func newGitHub(baseURL, token string, timeout time.Duration) (*github, error) {
 	// refuses every redirect (H5 guards (a) and (b)). Guard (c) — https + host
 	// validation — lives in fetchJobLog so it can be relaxed for the test harness.
 	logClient := &http.Client{
+		Transport:     forgeTransport(),
 		Timeout:       timeoutClient(timeout).Timeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}

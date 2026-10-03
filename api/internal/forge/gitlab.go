@@ -76,6 +76,7 @@ func newGitLab(baseURL, token string, timeout time.Duration, backoff ...retryabl
 	// per-call timeout but REFUSES every redirect, so a cross-host 302 cannot replay
 	// the PAT header to the redirect target (mirrors the GitHub driver's logClient).
 	logClient := &http.Client{
+		Transport:     forgeTransport(),
 		Timeout:       hc.Timeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}

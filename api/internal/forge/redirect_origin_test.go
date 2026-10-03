@@ -57,10 +57,9 @@ func (w *wireLog) count(scheme string) int {
 	return n
 }
 
-// installTrustingWire swaps http.DefaultTransport for one that trusts the
-// httptest certificate (every httptest TLS server shares it) and records the wire.
-// Drivers capture DefaultTransport when they are built, so call this first. Tests
-// using it must not run in parallel: DefaultTransport is process-global.
+// installTrustingWire injects a forge transport trusting the httptest certificate
+// (every httptest TLS server shares it) and records the wire. Call before building
+// drivers; these tests must not run in parallel because the override is shared.
 func installTrustingWire(t *testing.T) *wireLog {
 	t.Helper()
 	tlsSrv := httptest.NewTLSServer(http.NotFoundHandler())
@@ -76,9 +75,10 @@ func installTrustingWire(t *testing.T) *wireLog {
 		return d.DialContext(ctx, network, addr)
 	}
 	w := &wireLog{next: trusting}
-	prev := http.DefaultTransport
-	http.DefaultTransport = w
-	t.Cleanup(func() { http.DefaultTransport = prev })
+	prev := forgeTransportOverride
+	forgeTransportOverride = w
+	t.Cleanup(func() { forgeTransportOverride = prev })
+	t.Cleanup(trusting.CloseIdleConnections)
 	return w
 }
 

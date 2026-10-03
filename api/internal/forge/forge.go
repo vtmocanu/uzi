@@ -975,5 +975,5 @@ func timeoutClient(timeout time.Duration) *http.Client {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
-	return &http.Client{Timeout: timeout, CheckRedirect: createIssueRedirectGuard(redirectguard.SameOrigin)}
+	return &http.Client{Transport: forgeTransport(), Timeout: timeout, CheckRedirect: createIssueRedirectGuard(redirectguard.SameOrigin)}
 }

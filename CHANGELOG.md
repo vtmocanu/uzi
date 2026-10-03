@@ -28,6 +28,8 @@ through `[0.52.0]`.)
   The base worker image exercises privileged creation and ownership assertions, with a source-derived check that rejects missing or skipped tests.
 - **A job's output upload no longer retries past a deadline-capped wait.**
   When an upload's wait was cut to the time left before the phase deadline, a timer firing a moment early could start one more attempt before the requested Retry-After elapsed. The phase now stops after such a wait.
+- **Forge HTTP/2 connections recover after an unanswered health ping ([#2204](https://github.com/vtmocanu/uzi/issues/2204)).**
+  Forge clients share a dedicated connection pool that probes HTTP/2 connections after 30 seconds without received frames and closes them if the ping remains unanswered for 15 seconds. Later calls can establish a fresh connection, while request deadlines, redirect restrictions, token redaction and test transport injection retain their existing behavior.
 - **TUI split view fills the terminal height ([#2197](https://github.com/vtmocanu/uzi/issues/2197)).**
   Pane sizes use the shared header rows actually drawn, keeping the footer on the last terminal row when meters or optional hints are absent. The resize threshold and its hysteresis stay unchanged.
 - **Run failure diagnostics replace unsafe control characters ([#2196](https://github.com/vtmocanu/uzi/issues/2196)).**
