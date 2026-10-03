@@ -9191,8 +9191,10 @@ export class RunRunner {
     // waits for FULL settlement (every tick child exited, the sink gate released, the publish
     // rejected, lock custody done) — no Promise.race abandonment — before the report chain drains
     // and before anything after this (the killAgentTree reap, finalize, or the catch's park /
-    // shutdown sinks) can touch the clone or the bare. A shutdown aborts flight.cancel, which the
-    // tick is linked to, so the same settlement happens before the shutdown branch runs.
+    // shutdown sinks) can touch the clone or the bare. The tick follows the steering lifecycle
+    // signal (steering.lifecycleSignal(), re-armed after a declined pause or refused wall park),
+    // not flight.cancel; a shutdown aborts that lifecycle as well as flight.cancel, so the same
+    // settlement happens before the shutdown branch runs.
     const ticker = barePath
       ? this.startMidTurnTicker(flight, barePath, runnerClone.path, runnerClone.branch, (tickOpts) =>
           checkpointBody({ reap: false, quiet: true, ...tickOpts }),
