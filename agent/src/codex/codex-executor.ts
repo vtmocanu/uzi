@@ -3510,6 +3510,11 @@ export class CodexExecutor implements Executor {
           // The owner extended: re-drive the turn. It skips reportIteration, so re-arm the run-wide
           // wall from the refusal's own budget first, or the re-drive would trip at once.
           refreshWallAfterRefusal(wall, ctx.takeWallParkRefresh?.(), this.deps.redriveAllowanceMs ?? REDRIVE_RACE_ALLOWANCE_MS);
+          // Issue #1789: a vault lock latched before or during the refused park defers now
+          // (cancel first): recreating the epoch would release a new credential for a turn the
+          // latch drops at its start anyway.
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+          if (pauseNow.vaultLock.latched) throw new CodexCredentialDeferredError();
           // Issue #1782: the refused capture may have reaped the provider root (closing the
           // registry for good), so the re-drive runs on a freshly recreated epoch.
           const fresh = await recreateEpoch();

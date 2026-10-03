@@ -9286,6 +9286,33 @@ describe("CodexExecutor: mid-turn vault_locked refresh deferral (issue #1789)", 
     assert.equal(rig.epochs[0]!.transport.turnStartCount, 1, "the re-driven turn never started");
   });
 
+  it("M11c: a wall trip, then a latch, then a refused wall park defers without recreating the epoch (no new credential release, #1782)", async () => {
+    const controller = new AbortController();
+    const rig = makeMultiEpochRig([refreshThenFail()]);
+    let mode: "wall" | null = null;
+    const originalRelease = rig.client.releaseCodex.bind(rig.client);
+    let releases = 0;
+    rig.client.releaseCodex = async (...args) => {
+      releases++;
+      if (releases > 1) throw new RequestError("POST", "/x", 503, "unavailable");
+      return originalRelease(...args);
+    };
+    rig.client.refreshCodex = async () => {
+      mode = "wall";
+      controller.abort(new PauseNowSignal());
+      throw vaultLocked409("refresh");
+    };
+    const { ctx } = makeCtx({
+      signal: controller.signal,
+      pauseModeRequested: () => mode,
+      clearWallMode: () => { mode = null; },
+      parkForWall: async () => "refused",
+    });
+    const err = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "wall then latch, refused").then(() => undefined, (e: unknown) => e);
+    assert.ok(err instanceof CodexCredentialDeferredError, `got ${String(err)}`);
+    assert.equal(releases, 1, "a latched lock defers before a recreated epoch releases a credential");
+  });
+
   it("C6: a lock seen while a plan gate is open (a revise turn) is not latched: the turn fails as today", async () => {
     const responder: Responder = (c) => {
       if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
