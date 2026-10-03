@@ -385,11 +385,15 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
       assertBytes(retained, s);
     });
   }
-  for (const malformed of ["null", "missing-fields", "status-accessor", "repo-accessor", "object-kind", "unknown-kind"] as const) {
+  for (const malformed of ["null", "missing-fields", "status-accessor", "repo-accessor", "object-kind", "unknown-kind", "missing-kind", "null-kind"] as const) {
     it(`1848 M2 malformed classification ${malformed} preserves fixed refusal`, async (t) => {
       const s = await seed(false, "completed");
       const leaked = s.clonePath + "\nprivate classification accessor";
+      // missing-kind / null-kind are otherwise a valid terminal issue owner for this branch, so a
+      // default to "issue" would reclaim; the raw kind must be refused first.
       const value = malformed === "null" ? null : malformed === "missing-fields" ? {} :
+        malformed === "missing-kind" ? { status: "completed", repo_id: "r1", issue_iid: 1810 } :
+        malformed === "null-kind" ? { status: "completed", repo_id: "r1", issue_iid: 1810, kind: null } :
         malformed === "object-kind" || malformed === "unknown-kind" ? {
           status: "completed", repo_id: "r1",
           kind: malformed === "object-kind" ? { branch, slug } : "/private/unknown-kind",

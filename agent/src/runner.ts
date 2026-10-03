@@ -7366,8 +7366,10 @@ export class RunRunner {
     // persisted branch is never the source (predicate (c) IS the equality check for them).
     let owner: ReturnType<typeof deriveCloneKey>;
     try {
-      const ownerKind = resolveRunKind(id.kind);
-      if (!RUN_KINDS.includes(ownerKind)) throw new Error("malformed owner kind");
+      // The raw kind must already be a known kind: resolveRunKind defaults a missing one to "issue".
+      const rawKind: unknown = id.kind;
+      if (typeof rawKind !== "string" || !(RUN_KINDS as readonly string[]).includes(rawKind)) throw new Error("malformed owner kind");
+      const ownerKind = resolveRunKind(rawKind as RunKind);
       owner = deriveCloneKey({
         kind: ownerKind,
         runId: ownerRunId,
