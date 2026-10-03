@@ -110,8 +110,8 @@ documented stream events (`message_start`, `content_block_start` / `_delta` / `_
   boundary deadline is shorter. Past it the recorder abandons unsent records **and
   aborts the pending HTTP request** (an `AbortController`), not merely stops waiting on
   it; the batcher proceeds. Abandoned records surface as `leg_not_closed` or
-  `ordinal_gap`. A failed post also ends the drain early; its records stay pending for the
-  debounced retry and, if still unsent when the batcher closes, are abandoned the same way
+  `ordinal_gap`. A retryable post failure also ends the drain early; its records stay pending
+  for the backoff-paced retry and, if still unsent when the batcher closes, are abandoned the same way
   (review of !2214, `runner.ts` park path).
 - **Typed errors.** Three answers stop only that run's recorder: the typed `stale` 404
   (run not owned), the fence 409 `{disposition: "stale_claim"}`, and the

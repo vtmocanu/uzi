@@ -29,8 +29,8 @@ import { errMessage } from "./util.js";
 export const USAGE_PENDING_MAX = 2000;
 /** Dropped message ids remembered per leg, so a later frame of a dropped message is not recorded
  *  half-way. Past it a new rejection is still counted in dropped_records but not remembered, so a
- *  later frame of that message may be counted again, or recorded once room frees: an over-count of
- *  dropped_records only, which the api reads as a > 0 flag (records_dropped). */
+ *  later frame of that message may be counted again, or recorded from that later frame once room
+ *  frees; dropped_records stays > 0, so coverage still reads records_dropped. */
 export const USAGE_DROPPED_IDS_MAX = 2000;
 /** Records one /usage request carries (the api's maxUsagePostRecords). */
 export const USAGE_POST_MAX_RECORDS = 500;
