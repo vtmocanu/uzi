@@ -495,13 +495,18 @@ async function bootAndSettle(
 /** Scenario (c)'s crash state: gen2 completed and its ACK was observed, and the durable state
  *  (outbox, settlement journal, recovery journal) is frozen just BEFORE the pushed -> pending_settle
  *  promotion. Restores that state before returning. The caller removes `snapRoot`. */
-async function crashBeforePromotion(iid: number): Promise<{ s: Stores; gen2Claim: ClaimResponse; gen1Head: string; outboxRoot: string; snapRoot: string }> {
+async function crashBeforePromotion(
+  iid: number,
+  /** `failSetup` throws right after snapRoot exists, to exercise the error-path cleanup. */
+  opts: { failSetup?: Error } = {},
+): Promise<{ s: Stores; gen2Claim: ClaimResponse; gen1Head: string; outboxRoot: string; snapRoot: string }> {
   const { s, gen2Claim, gen1Head } = await trackingScenario(iid);
   const outboxRoot = path.join(fx.dataDir, "outbox");
   const outbox1 = await mkOutbox(outboxRoot);
   const snapRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-settle-crash-"));
   // The caller removes snapRoot once this returns; a setup failure before then must not leak it.
   try {
+    if (opts.failSetup) throw opts.failSetup;
     let restore: Array<() => void> = [];
     // The "crash": the completion ACK came back, and the process dies at the instant it would
     // promote the write-ahead `pushed` record (freeze the durable state BEFORE that write).
@@ -529,6 +534,14 @@ async function crashBeforePromotion(iid: number): Promise<{ s: Stores; gen2Claim
 }
 
 describe("settlement crash boundaries (issue #1582 M2)", () => {
+  it("crashBeforePromotion removes its snapRoot when setup fails after creating it (issue #2020)", async () => {
+    const snaps = (): string[] => fs.readdirSync(os.tmpdir()).filter((e) => e.startsWith("uzi-settle-crash-")).sort();
+    const before = snaps();
+    const boom = new Error("forced setup failure");
+    await assert.rejects(crashBeforePromotion(6204, { failSetup: boom }), (e) => e === boom);
+    assert.deepEqual(snaps(), before, "no uzi-settle-crash-* directory left behind");
+  });
+
   it("(a) completion ACK applied + outbox retired, crash at the post-completion settle → restart: the sweep settles with no PAT", async () => {
     const iid = 6201;
     const { s, gen2Claim, gen1Head } = await trackingScenario(iid);
