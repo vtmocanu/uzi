@@ -41,7 +41,8 @@ const MAX_PIDS = 200_000;
 const SCAN_BUDGET_MS = 10_000;
 /** A reap pass's own wall-time budget (it scans, kills and scans again). */
 const REAP_BUDGET_MS = 20_000;
-const HELPER_SLACK_MS = 5_000;
+/** How long the helper may run beyond its scan budget (exported for disk-reclaim's budget math). */
+export const HELPER_SLACK_MS = 5_000;
 /** The run's CLI pids handed to one pass, at most. */
 const MAX_SPAWNED = 64;
 

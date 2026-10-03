@@ -262,7 +262,7 @@ describe("issue #1783 x PRD #1826: a mid-run data_volume_full park whose clone i
       const firstProof = order.indexOf("proof:recovery_capture");
       assert.ok(firstProof > 0, "precondition: the capture's proof ran");
       assert.equal(cachesAtProof[0], true, "the caches were still there when the capture's first proof ran: no early drop");
-      assert.ok(fs.existsSync(path.join(homeDir, claim.run_id, ".cache", "go-build")), "and they are kept at the end");
+      assert.ok(fs.existsSync(path.join(homeDir, claim.run_id, ".cache", "go-build")), "and the caches survive the blocked park (the run never ends parked, so no finally drop is exercised here)");
     });
   }
 

@@ -3499,8 +3499,9 @@ export class RunRunner {
         // "Only a park that ended the run's processes drops": the park's process-group reap misses
         // what the agent backgrounded (the pinned CLI runs each Bash command detached, in its own
         // session and group), so a detached `go test &` could still be writing the caches this
-        // drop removes. Reap every process attributed to the run (run-procs.ts) first. Never
-        // rejects; after a disk park's own reap it finds nothing left.
+        // drop removes. Reap every process attributed to the run (run-procs.ts) first. The
+        // helper reads a rejection as an incomplete reap and keeps the caches; after a disk park's own
+        // complete reap it normally finds nothing left.
         // A reap that left survivors or was incomplete keeps the caches (Executor contract).
         if (await reapThenMayDropCaches(executor, runLog)) {
           // A disk park already dropped them before its capture (N3): this pass only finishes what
@@ -11901,8 +11902,9 @@ export class RunRunner {
       const mayDrop = await reapThenMayDropCaches(executor, runLog);
       // N3: drop the rebuildable caches NOW, before the capture and fetch-back below: they are not
       // part of the capture, and on a truly full volume the capture's own writes need the space.
-      // Claude runs only (a Codex run's caches sit on its own volume). The finally's park drop then
-      // finds them gone. Never throws.
+      // Claude runs only (a Codex run's caches sit on its own volume). When they were dropped
+      // here, the finally's park drop finds them gone; otherwise (a reap that left survivors or was
+      // incomplete) the finally drop runs its own complete-reap check. Never throws.
       if (mayDrop && flight.runHome && !executor.safety) {
         await dropRunCaches(flight.runHome, runLog, { message: "run caches dropped before the disk park's capture" });
         flight.cachesDroppedEarly = true;

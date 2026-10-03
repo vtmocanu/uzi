@@ -5,7 +5,7 @@ import type { Logger } from "./log.js";
 import { rmTreePinned } from "./rmtree.js";
 import { dropRunCaches, isNoop, type DropRunCachesOptions, type RunCacheDropResult } from "./run-caches.js";
 import { isLiveModelPassHome } from "./model-pass.js";
-import { scanRunProcesses } from "./run-procs.js";
+import { HELPER_SLACK_MS, scanRunProcesses } from "./run-procs.js";
 import { DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES, TERMINAL_RUN_STATUSES, type RunStatusLookup } from "./home-reclaim.js";
 import type { RunDiskLocks } from "./run-disk-locks.js";
 import { errMessage, RUN_ID_RE, sleep } from "./util.js";
@@ -181,7 +181,10 @@ export interface DiskReclaimSummary {
   cachesDropped: number;
   /** A parked run whose caches were already gone (remembered from an earlier pass, or a no-op drop). */
   cachesAlreadyClear: number;
-  /** A parked run whose caches were kept because a process attributed to its HOME was alive or unproven. */
+  /**
+   * A parked run whose caches were kept because a process attributed to its HOME was alive or
+   * unproven, or because the pass deadline left no time for the check.
+   */
   cachesKeptLiveProcesses: number;
   skippedLive: number;
   /**
@@ -427,12 +430,18 @@ const PROCESSES_CLEAR_MAX_BUDGET_MS = 30_000;
 /**
  * The default {@link DiskReclaimDeps.processesClear}. Linux only, the same platform rule as the
  * runner's quiesceRun fold so the two gates cannot disagree; elsewhere there is no scan to run.
- * A scan that throws, is incomplete or names a pid reads as not clear.
+ * A scan that throws, is incomplete or names a pid reads as not clear, and so does a pass with no
+ * time left for one (the budget is `min(30 s, budgetMs - helper slack)`; at or below 0 no scan runs).
+ *
+ * It attributes by the run's HOME only (`scanRunProcesses(home, undefined, [])`: no worktree, no
+ * CLI pids); it shares with the runner's fold only the platform rule, not the attribution.
  */
 async function defaultProcessesClear(home: string, budgetMs: number): Promise<boolean> {
   if (process.platform !== "linux") return true;
+  const scanBudgetMs = Math.min(PROCESSES_CLEAR_MAX_BUDGET_MS, budgetMs - HELPER_SLACK_MS);
+  if (scanBudgetMs <= 0) return false;
   try {
-    const scan = await scanRunProcesses(home, undefined, [], { budgetMs: Math.max(1, Math.min(PROCESSES_CLEAR_MAX_BUDGET_MS, budgetMs)) });
+    const scan = await scanRunProcesses(home, undefined, [], { budgetMs: scanBudgetMs });
     return scan.complete && scan.pids.length === 0;
   } catch {
     return false;

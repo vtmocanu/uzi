@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 
 import {
   CachesDroppedMemo,
@@ -23,6 +24,7 @@ import type { WorkerClient } from "../src/client.js";
 import type { GitCache } from "../src/git.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { makeClaim, nullLogger, recordingLogger } from "./helpers.js";
+import { realProcfsSkip } from "./real-procfs.js";
 
 // PRD #1809 M3 (D5, D7): the running disk reclaim, its per-run lock and the soft-threshold
 // controller. The reclaim tests drive the real pass against a real data-dir fixture (the real
@@ -308,6 +310,36 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     assert.equal(drops, 1);
     assert.equal(dropped.cachesDropped, 1);
     assert.equal(dropped.cachesKeptLiveProcesses, 0);
+    assert.equal(memo.has(run.id), true);
+    for (const rel of CACHES) assert.equal(exists(path.join(run.home, rel)), false, `${rel} dropped`);
+  });
+
+  it("the DEFAULT process check reads this host's real proc tree: a live HOME-attributed process keeps the caches, its exit lets the drop", {
+    skip: SKIP_ROOT || (process.platform !== "linux" ? "the default check scans only on Linux" : realProcfsSkip("disk reclaim default processesClear: real proc tree")),
+  }, async () => {
+    const d = dataDir();
+    const run = seedRun(d);
+    const memo = new CachesDroppedMemo();
+    const base = deps(d, { cachesDropped: memo, statusOf: async () => "limit_wait" });
+    delete base.processesClear; // the production default
+    const child = spawn("sleep", ["60"], { detached: true, stdio: "ignore", env: { ...process.env, HOME: run.home } });
+    let exited = false;
+    const gone = new Promise<void>((resolve) => child.once("exit", () => ((exited = true), resolve())));
+    try {
+      await new Promise((r) => setTimeout(r, 200)); // let it exec, so its environ carries the HOME
+      const kept = await runDiskReclaimPass(base);
+      assert.equal(kept.cachesKeptLiveProcesses, 1);
+      assert.equal(kept.cachesDropped, 0);
+      assert.equal(memo.has(run.id), false, "not memoized");
+      for (const rel of CACHES) assert.equal(exists(path.join(run.home, rel)), true, `${rel} kept`);
+    } finally {
+      child.kill("SIGKILL");
+    }
+    await gone;
+    assert.equal(exited, true);
+    const dropped = await runDiskReclaimPass(base);
+    assert.equal(dropped.cachesKeptLiveProcesses, 0);
+    assert.equal(dropped.cachesDropped, 1);
     assert.equal(memo.has(run.id), true);
     for (const rel of CACHES) assert.equal(exists(path.join(run.home, rel)), false, `${rel} dropped`);
   });
@@ -908,6 +940,7 @@ describe("RunDiskLocks × RunRunner (PRD #1809 D7)", () => {
       isRunLive: (id) => runner.isExecuting(id),
       locks,
       log: nullLogger(),
+      processesClear: async () => true,
       dropCaches: async () => {
         events.push("drop:start");
         dropEntered();
