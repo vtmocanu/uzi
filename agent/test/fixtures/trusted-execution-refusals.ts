@@ -557,6 +557,7 @@ export const trustedEnvelopeCases = [
 ]);
 
 export const trustedCaptureCases = [
+  { reason: "apostrophe context", representation: "context Error", error: () => new Error("worker's capture: command root failed registry admission"), display: "worker's capture: command root failed registry admission" },
   ...["command root failed registry admission", "plan gate is not wired for this run"].flatMap((reason) => [
     { reason, representation: "context Error", error: () => new Error(`capture: ${reason}`), display: `capture: ${reason}` },
     { reason, representation: "Error cause", error: () => new Error("capture wrapper", { cause: new Error(reason) }), display: "capture wrapper" },
@@ -576,6 +577,7 @@ function opaqueChain(values: number): Error {
 }
 
 export const trustedBoundaryCases = [
+  ["apostrophe context", () => new Error("worker's startup: command launch admission is closed")],
   ["typed leaf", () => new TrustedExecutionRefusal("opaque typed decision")],
   ["typed cause", () => new Error("outer", { cause: new TrustedExecutionRefusal("opaque typed decision") })],
   ["typed interruption", () => Object.assign(new Error("outer"), { interruption: new TrustedExecutionRefusal("opaque typed decision") })],
@@ -591,6 +593,7 @@ export const trustedBoundaryCases = [
 ] as const;
 
 export const opaqueBoundaryCases = [
+  ["newline after colon", () => new Error("startup:\ncommand launch admission is closed")],
   ["snapshot near-miss", () => new Error("expected snapshot evidence, got snapshot")],
   ["eight opaque values within bound", () => opaqueChain(8)],
   ["quoted reason", () => new Error('filesystem says: "command root failed registry admission"')],

@@ -237,8 +237,8 @@ function configReason(reason: string): boolean {
 }
 
 /** Recognize legacy text while preserving the runner's existing control mappings.
- * Leading diagnostic contexts are peeled while each consumes text. Quotes and
- * newlines cannot introduce a context, so quoted reason text is never searched.
+ * Leading diagnostic contexts are peeled while each consumes text. Double quotes and
+ * CR/LF prevent context peeling; apostrophes are ordinary context characters.
  * The optional predicate is the runner's existing reason/prefix policy. */
 export function legacyTrustedExecutionRefusal(reason: string, existingReason?: (reason: string) => boolean): boolean {
   let candidate = reason;
@@ -246,7 +246,7 @@ export function legacyTrustedExecutionRefusal(reason: string, existingReason?: (
     if ((candidate.length <= MAX_FIXED_REASON_LENGTH && FIXED_REASONS.has(candidate))
       || existingReason?.(candidate) || configReason(candidate) || numericReason(candidate) || postureReason(candidate)
       || REASON_FAMILIES.some((family) => family.exec(candidate)?.[0] === candidate)) return true;
-    const context = /^[^"'\r\n]+?: /.exec(candidate);
+    const context = /^[^"\r\n]+?: /.exec(candidate);
     if (context === null) return false;
     candidate = candidate.slice(context[0].length);
   }

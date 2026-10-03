@@ -892,14 +892,33 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
   it("(5) a watchdog (idle) trip beats a later terminal", async () => {
     const rig = makeRig();
     rig.deps = { ...rig.deps, idleMs: 25 };
-    // Go quiet after the init frame; the idle timer trips before any terminal.
+    // Go quiet after the init frame; retain the real idle timer.
     rig.transport.push(threadStarted());
-    // A terminal pushed AFTER the trip must NOT turn the run into a success.
-    setTimeout(() => rig.transport.push(turnCompleted("completed")).end(), 80).unref?.();
-    await assert.rejects(
-      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "idle run"),
-      /idle timeout/,
-    );
+    let lateTerminalDelivered = false;
+    let removeAbortListener = (): void => {};
+    rig.transport.requestOverride = (c, opts) => {
+      if (c.method !== "turn/start") return undefined;
+      const signal = opts?.signal;
+      assert.ok(signal, "turn/start carries the watchdog's turn signal");
+      assert.equal(signal.aborted, false, "the turn starts before the idle trip");
+      // Emit only when the active turn aborts, regardless of provider startup duration.
+      const deliverLateTerminal = (): void => {
+        c.transport.push(turnCompleted("completed")).end();
+        lateTerminalDelivered = true;
+      };
+      signal.addEventListener("abort", deliverLateTerminal, { once: true });
+      removeAbortListener = () => signal.removeEventListener("abort", deliverLateTerminal);
+      return undefined;
+    };
+    try {
+      await assert.rejects(
+        withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "idle run"),
+        /idle timeout/,
+      );
+      assert.equal(lateTerminalDelivered, true, "the idle trip wins despite delivery of a late terminal");
+    } finally {
+      removeAbortListener();
+    }
   });
 
   it("(6) a cancel beats the raw aborted error the transport throws mid-setup", async () => {

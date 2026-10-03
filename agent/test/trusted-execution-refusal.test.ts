@@ -48,6 +48,17 @@ it("trusted refusal: legacy context peeling exceeds eight prefixes and allows br
   assert.equal(legacyTrustedExecutionRefusal("context\nmore: " + reason), false);
 });
 
+it("trusted refusal: apostrophe contexts preserve the literal colon-space envelope", () => {
+  const reason = "command launch admission is closed";
+  assert.equal(legacyTrustedExecutionRefusal("worker's startup: " + reason), true);
+  assert.equal(legacyTrustedExecutionRefusal("worker's startup: Error: Error: " + reason), true);
+  assert.equal(legacyTrustedExecutionRefusal('quoted "context": ' + reason), false);
+  assert.equal(legacyTrustedExecutionRefusal("context\nmore: " + reason), false);
+  assert.equal(legacyTrustedExecutionRefusal("context\rmore: " + reason), false);
+  assert.equal(legacyTrustedExecutionRefusal("filesystem says: '" + reason + "'"), false);
+  assert.equal(legacyTrustedExecutionRefusal("startup:\n" + reason), false);
+});
+
 it("trusted refusal: legacy helper honors the caller's existing control predicate", () => {
   const reason = "denied by guardrail: other trusted policy";
   const existing = (candidate: string) => candidate.startsWith("denied by guardrail: ");
