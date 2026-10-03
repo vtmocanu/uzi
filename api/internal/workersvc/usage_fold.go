@@ -266,8 +266,9 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 //     lineage_epoch, so it always fits and satisfies its >= 0 CHECK.
 //   - foldRunUsage → foldUsageTailStamps (issue #2014, ADR-2014 D4/D11) — the estimated
 //     tail's leg identity and coverage writes (UpsertRunUsageLegInit, UpsertRunUsageLegCoverage,
-//     UpsertRunUsageTailState). A second CLEARED suspect, and for a stronger reason: it runs
-//     AFTER the metered fold; a cap hit never fails the append, a database error does (500, the worker re-delivers). Every worker-controlled value
+//     UpsertRunUsageTailState). A second CLEARED suspect, on the same ground as UpsertRunUsage:
+//     it runs AFTER the metered fold; a cap hit never fails the append, but a database error does
+//     (500, the worker re-delivers), so it is cleared by validation alone. Every worker-controlled value
 //     it reads out of the frame payload is validated BEFORE any write and a bad one is SKIPPED,
 //     never an error: `leg_id` must parse as a non-nil UUID; `sdk_session_id` is NUL-stripped,
 //     rune-capped (maxUsageIDRunes, matching its CHECK) and must be non-empty; `usage_through`

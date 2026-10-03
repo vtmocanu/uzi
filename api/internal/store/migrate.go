@@ -259,7 +259,9 @@ const StoredFilesLockClass int32 = 0x757A7366 // "uzsf"
 // TestProductTokenMintLockClassMatchesSQL's source enumeration fails on any collision with another
 // *LockClass. It is the FIRST statement of both transactions that take it, before any usage row
 // write, and neither takes it while holding a row lock a peer could wait on in the other order, so
-// the two paths cannot deadlock. XACT-scoped. An objid collision only serializes two unrelated
+// the two paths cannot deadlock. The route's transaction then takes the runs row FOR SHARE (its
+// fence recheck) while holding this lock; nothing holding a runs row lock takes this lock, so
+// that adds no cycle. XACT-scoped. An objid collision only serializes two unrelated
 // runs' usage writes for a moment.
 const RunUsageLockClass int32 = 0x757A7573 // "uzus"
 

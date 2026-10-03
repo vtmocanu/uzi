@@ -31,7 +31,7 @@ SELECT EXISTS (SELECT 1 FROM runs r
 -- plus the claimant's worker_id, and it row-locks the runs row with FOR SHARE. READ COMMITTED and
 -- the release/reclaim UPDATEs do not take the usage advisory lock, so a per-statement fence is
 -- insufficient: a release that committed before this statement is seen here (re-checked on the new
--- row version), and one that starts after it waits for our commit. The FK leg inserts already hold
+-- row version), and one that starts after it waits for our commit. An FK leg insert may already hold
 -- FOR KEY SHARE on the row; this upgrades it. Precedent: judge.sql's `live` CTE.
 SELECT EXISTS (SELECT 1 FROM runs r
                WHERE r.id = sqlc.arg(run_id)

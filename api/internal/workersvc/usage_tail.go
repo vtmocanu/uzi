@@ -232,8 +232,8 @@ func (s *Service) RecordRunUsage(ctx context.Context, wkr store.Worker, runID uu
 	// whole write. RunUsageFenceLiveLocked row-locks the runs row (FOR SHARE), so a release that
 	// committed before it is seen here (ErrStaleClaim, the deferred Rollback discards every
 	// write) and one that starts after it waits for our commit. It is last so runs UPDATEs are not
-	// blocked across up to 500 upserts; the FK leg inserts already hold FOR KEY SHARE on the row,
-	// which this upgrades.
+	// blocked across up to 500 upserts; a post that inserted a leg row may already hold FOR KEY SHARE
+	// on the row (the FK), which this upgrades.
 	live, err = q.RunUsageFenceLiveLocked(ctx, store.RunUsageFenceLiveLockedParams{RunID: runID, WorkerID: pgconv.UUID(wkr.ID), ClaimGeneration: pgconv.Int8Ptr(claimGen)})
 	if err != nil {
 		return err

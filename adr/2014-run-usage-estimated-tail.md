@@ -303,7 +303,10 @@ separate decision.
   `InsertRunMessage`'s `generation_live` fence, and a fence here would turn a valid stamp into a
   409 and lose it permanently.
 - **Lock order.** The advisory lock is always taken before any row write, on both
-  paths; no path takes them in the reverse order, so the two cannot deadlock.
+  paths; no path takes them in the reverse order, so the two cannot deadlock. The route
+  then row-locks the `runs` row (`FOR SHARE`, the fence recheck) last, while holding the
+  advisory lock; no path that holds a `runs` row lock ever takes the usage advisory lock,
+  so that adds no cycle.
 - `record_cap_reached` always yields that coverage reason; a capped run is never
   `complete`.
 
