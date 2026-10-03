@@ -4458,7 +4458,11 @@ WITH locked AS (
                 - make_interval(secs => COALESCE(r.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
                                       + r.budget_paused_seconds
                                       + r.budget_extension_seconds
-                                      + r.budget_finalize_seconds)))
+                                      + r.budget_finalize_seconds
+                                      + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                          (LEAST(sqlc.arg('now')::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                          FROM cross_checks cc WHERE cc.lead_run_id = r.id
+                                            AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
     ORDER BY w.id
     FOR UPDATE
 ),
@@ -4489,7 +4493,11 @@ parked AS (
             - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
                                   + runs.budget_paused_seconds
                                   + runs.budget_extension_seconds
-                                  + runs.budget_finalize_seconds))
+                                  + runs.budget_finalize_seconds
+                                  + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                      (LEAST(sqlc.arg('now')::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                      FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                        AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0)))
       -- PRD #1226 M3 (D3): completion-interlock carve-out (KEPT). A post-attempt run with a LIVE
       -- worker is spared; a post-attempt run whose worker went STALE is NOT protected and parks.
       AND NOT (
@@ -4567,7 +4575,11 @@ WHERE status = 'running'
         - make_interval(secs => COALESCE(budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
                               + budget_extension_seconds
                               + budget_finalize_seconds
-                              + budget_paused_seconds))
+                              + budget_paused_seconds
+                              + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                  (LEAST(sqlc.arg('now')::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                  FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                    AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0)))
   AND kind NOT IN ('chat', 'judge', 'job', 'cross_check')
   AND NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan' AND cc.verdict = 'pending' AND cc.deadline_at > now())
   AND interactive = false

@@ -43,9 +43,31 @@ func TestPlanCrossCheckExitSweepLiveDB(t *testing.T) {
 		Now: pgtype.Timestamptz{Time: time.Now(), Valid: true}, GlobalTimeoutSeconds: 60,
 		WorkerStaleCutoff: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true},
 	})
-	if err != nil || len(wall) != 0 {
-		t.Fatalf("pending wait consumed wall budget: requested=%v err=%v", wall, err)
+	if err != nil {
+		t.Fatal(err)
 	}
+	for _, row := range wall {
+		if row.ID == f.runID {
+			t.Fatalf("pending wait consumed wall budget: requested=%v", wall)
+		}
+	}
+	// A stale worker uses the server park path. It must honor the same
+	// pending-wait credit before the sweep can supersede the row.
+	mustExec(ctx, t, f.pool, `UPDATE workers SET last_heartbeat_at = now() - interval '10 minutes' WHERE id = $1`, f.workerID)
+	parked, err := f.q.ParkRunsAtWall(ctx, store.ParkRunsAtWallParams{
+		Now: pgtype.Timestamptz{Time: time.Now(), Valid: true}, GlobalTimeoutSeconds: 60,
+		WorkerStaleCutoff: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true},
+		GraceSeconds:      5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range parked {
+		if row.ID == f.runID {
+			t.Fatalf("server parked lead before credited deadline: %v", parked)
+		}
+	}
+	mustExec(ctx, t, f.pool, `UPDATE workers SET last_heartbeat_at = now() WHERE id = $1`, f.workerID)
 	// A budget shorter than the non-wait work must still request a park. This
 	// proves the no-request assertion above reached the wall decision predicate.
 	mustExec(ctx, t, f.pool, `UPDATE runs SET budget_wall_seconds = 1 WHERE id = $1`, f.runID)
@@ -53,18 +75,31 @@ func TestPlanCrossCheckExitSweepLiveDB(t *testing.T) {
 		Now: pgtype.Timestamptz{Time: time.Now(), Valid: true}, GlobalTimeoutSeconds: 60,
 		WorkerStaleCutoff: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true},
 	})
-	if err != nil || len(wall) != 1 || wall[0].ID != f.runID {
-		t.Fatalf("short non-wait budget: requested=%v err=%v", wall, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, row := range wall {
+		found = found || row.ID == f.runID
+	}
+	if !found {
+		t.Fatalf("short non-wait budget did not request fixture lead: %v", wall)
 	}
 
 	sweep := func(want int) {
 		t.Helper()
 		ids, err := f.q.SupersedeExitedPlanCrossChecks(ctx)
-		if err != nil || len(ids) != want {
-			t.Fatalf("sweep: ids=%v err=%v, want %d", ids, err, want)
+		if err != nil {
+			t.Fatal(err)
 		}
-		if want == 1 && ids[0] != f.runID {
-			t.Fatalf("swept lead %s, want %s", ids[0], f.runID)
+		got := 0
+		for _, id := range ids {
+			if id == f.runID {
+				got++
+			}
+		}
+		if got != want {
+			t.Fatalf("sweep: fixture count=%d, want %d (all ids=%v)", got, want, ids)
 		}
 	}
 	sweep(0) // a live lead must keep its child
