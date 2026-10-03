@@ -225,8 +225,8 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 //
 //   - UpdateRunLastSeq — takes the run id and an int32 seq. No worker text.
 //   - CountRunInitFramesBefore — foldRunUsage's per-frame leg-index READ (PRD
-//     #1079). It takes only the run id (a uuid) and a server-side int32 seq (the
-//     frame's own seq, already validated > 0 in the loop above), and it READS a
+//     #1079). It takes only the run id (a uuid) and an int32 seq (the frame's own
+//     seq: worker-supplied in the request body, already validated > 0 in the loop above), and it READS a
 //     COUNT rather than writing anything — no worker-controlled text or value
 //     reaches the store through it, and a read cannot poison a row. So its error is
 //     correctly returned RAW (500): a failure is a genuine server error the worker
@@ -235,7 +235,7 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 //     the check is what keeps this placement defensible.
 //   - CountRunLineageRestartsBefore — foldRunUsage's per-frame lineage-index READ
 //     (ADR-1562). Identical shape and clearance to CountRunInitFramesBefore above: run
-//     id (uuid) + server-side int32 seq, a COUNT read, no worker-controlled value written
+//     id (uuid) + the worker-supplied, validated int32 seq, a COUNT read, no worker-controlled value written
 //     and a read cannot poison a row, so its error is returned RAW (500).
 //   - foldRunUsage → UpsertRunUsage — every column it writes, checked one by one
 //     because "I cannot think of a case" is not the same as "there is no case".

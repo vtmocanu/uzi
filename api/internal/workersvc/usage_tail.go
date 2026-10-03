@@ -475,7 +475,6 @@ type usageStamp struct {
 // frames (agent projectInit / projectResult).
 type usageStampPayload struct {
 	Event        string          `json:"event"`
-	ModelUsage   json.RawMessage `json:"modelUsage"`
 	UsageBasis   json.RawMessage `json:"usage_basis"`
 	LegID        json.RawMessage `json:"leg_id"`
 	SDKSessionID json.RawMessage `json:"sdk_session_id"`
