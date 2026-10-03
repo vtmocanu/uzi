@@ -214,15 +214,22 @@ fi
 # A merge supersedes main's in-flight runs (concurrency), so landing while a
 # `chore(release):` commit's CI runs cancels it and forces the release to re-cut (exit 10).
 # Ordinary in-flight main CI does not block. Every non-completed run is enumerated (one
-# paginated Actions query per active status, no recency window); a failed page or a record
-# missing the fields the decision reads refuses (exit 2).
+# paginated Actions query per active status, no recency window). Refuses (exit 2) on a failed
+# or empty page set, a record missing the fields the decision reads, or an incomplete listing:
+# every page's total_count must agree and equal the records fetched, and GitHub caps filtered
+# run searches at 1,000 results, so a total_count above 1000 cannot be enumerated.
 rel=""
 for st in queued in_progress waiting requested pending; do
   pg=$(gh api --paginate --slurp "repos/$REPO/actions/runs?branch=main&status=$st&per_page=100" 2>/dev/null) \
     || { echo "cannot read main's $st workflow runs; not merging"; exit 2; }
   hit=$(printf '%s' "$pg" | jq -r '
-    if type != "array" then error("pages") else . end
-    | [.[] | if (type == "object" and (.workflow_runs|type) == "array") then .workflow_runs[] else error("page") end]
+    if type != "array" or length == 0 then error("pages") else . end
+    | if all(.[]; type == "object" and (.workflow_runs|type) == "array" and (.total_count|type) == "number")
+      then . else error("page") end
+    | (.[0].total_count) as $total
+    | if all(.[]; .total_count == $total) and $total <= 1000 and ([.[].workflow_runs|length]|add) == $total
+      then . else error("incomplete") end
+    | [.[].workflow_runs[]]
     | map(if type == "object" and (.status|type) == "string" and (.display_title|type) == "string"
             and (.head_sha|type) == "string" and (.id|type) == "number" then . else error("record") end)
     | [.[] | select(.status != "completed" and (.display_title|startswith("chore(release):")))

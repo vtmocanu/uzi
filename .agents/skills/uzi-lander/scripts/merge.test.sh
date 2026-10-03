@@ -104,9 +104,10 @@ if [ "\${1:-}" = pr ] && [ "\${2:-}" = checks ]; then printf '%s\n' "\${CHECKS_J
 if [ "\${1:-}" = api ] && case "\$*" in *actions/runs*) true;; *) false;; esac; then
   [ "\${RUNS_FAIL:-0}" = 1 ] && { echo 'HTTP 502' >&2; exit 1; }
   [ -n "\${MAIN_RUNS_PAGE:-}" ] && { printf '%s\n' "\$MAIN_RUNS_PAGE"; exit 0; }
+  [ -n "\${MAIN_RUNS_PAGE_FILE:-}" ] && { cat "\$MAIN_RUNS_PAGE_FILE"; exit 0; }
   st=\$(printf '%s' "\$*" | sed -n 's/.*status=\\([a-z_]*\\).*/\\1/p')
   printf '%s' "\${MAIN_RUNS_JSON:-[]}" | jq -c --arg s "\$st" '[.[]|select(.status==\$s)] as \$r
-    | if (\$r|length)==0 then [{workflow_runs:[]}] else [range(0; \$r|length; 2) as \$i | {workflow_runs: \$r[\$i:\$i+2]}] end'
+    | (\$r|length) as \$n | if \$n==0 then [{total_count:0,workflow_runs:[]}] else [range(0; \$n; 2) as \$i | {total_count:\$n,workflow_runs: \$r[\$i:\$i+2]}] end'
   exit 0
 fi
 # The same data through the older gh run list --limit N lookup, so this case also proves the
@@ -387,13 +388,22 @@ merge_run runsfail
 [ "$rc" -eq 2 ] || fail "an unreadable main run page did not refuse, rc=$rc: $(cat "$WORK/m.runsfail")"
 [ ! -e "$WORK/merge.log" ] || fail "merged with an unreadable main run list"
 unset RUNS_FAIL
-for bad in '{}' '[{}]' '[{"workflow_runs":[{}]}]' '[{"workflow_runs":[{"status":"queued","display_title":"x","head_sha":"a"}]}]' '[{"workflow_runs":{}}]'; do
+for bad in '{}' '[]' '[{}]' '[{"total_count":1,"workflow_runs":[{}]}]' '[{"total_count":1,"workflow_runs":[{"status":"queued","display_title":"x","head_sha":"a"}]}]' '[{"total_count":0,"workflow_runs":{}}]' \
+    '[{"workflow_runs":[]}]' '[{"total_count":3,"workflow_runs":[]}]' '[{"total_count":1,"workflow_runs":[]},{"total_count":2,"workflow_runs":[]}]'; do
   export MAIN_RUNS_PAGE="$bad"
   merge_run malformed
   [ "$rc" -eq 2 ] || fail "malformed run page $bad did not refuse, rc=$rc: $(cat "$WORK/m.malformed")"
   [ ! -e "$WORK/merge.log" ] || fail "merged on malformed run page $bad"
 done
 unset MAIN_RUNS_PAGE
+# GitHub returns at most 1,000 results for a filtered run search: 1,000 fetched records of a
+# total_count of 1001 is an incomplete listing, never "no release running".
+jq -n '[range(0;10) as $p | {total_count:1001,workflow_runs:[range($p*100;($p+1)*100)|{status:"in_progress",display_title:"ordinary",head_sha:"5f9145cbaaaa0000",name:"CI",id:(.+1)}]}]' > "$WORK/capped-pages.json"
+export MAIN_RUNS_PAGE_FILE="$WORK/capped-pages.json"
+merge_run capped
+[ "$rc" -eq 2 ] || fail "1,000 of total_count 1001 did not refuse, rc=$rc: $(cat "$WORK/m.capped")"
+[ ! -e "$WORK/merge.log" ] || fail "merged on a capped run listing"
+unset MAIN_RUNS_PAGE_FILE
 # --confirm-only never reads the run list.
 MERGE_STATE=MERGED; export MERGE_STATE RUNS_FAIL=1
 seed_state
