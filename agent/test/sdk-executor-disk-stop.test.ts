@@ -528,7 +528,7 @@ describe("SdkExecutor — PRD #1809 D4 process attribution (BLOCKING 1)", () => 
           order.push(label);
           resolve({ results: [], truncated: false });
         };
-        const bound = setTimeout(() => finish("install-timer"), 2000);
+        const bound = setTimeout(() => finish("install-timer"), 10_000);
         opts?.signal?.addEventListener("abort", () => {
           order.push("install-aborted");
           setTimeout(() => finish("install-settled"), 20);
