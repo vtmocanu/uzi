@@ -10888,28 +10888,80 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     assert.equal(rig.transport.turnStartCount, 1, "no provider turn started after the cancel");
   });
 
-  it("(d2) a wall budget spent during the backoff takes the wall path, never TransientRecoveryError", async () => {
-    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
-    // The backoff (1s x attempt) is capped at the remaining wall and debited from it.
-    tinyBackoff(rig, { transientBackoffBaseMs: 1000, wallMs: 300, idleMs: 5000 });
-    await assert.rejects(
-      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "wall in backoff"),
-      (e: Error) => {
-        assert.ok(!(e instanceof TransientRecoveryError));
-        assert.match(e.message, /codex run wall-clock timeout/);
-        return true;
-      },
-    );
-    assert.equal(rig.transport.turnStartCount, 1, "no provider turn started with the budget spent");
-
-    const parkRig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
-    tinyBackoff(parkRig, { transientBackoffBaseMs: 1000, wallMs: 300, idleMs: 5000 });
-    let wallParks = 0;
-    const { ctx } = makeCtx({ parkForWall: async () => { wallParks++; return "parked"; } });
-    const result = await withTimeout(makeExecutor(parkRig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "wall park in backoff");
-    assert.deepStrictEqual(result.walled, { reason: "codex run wall-clock timeout" });
-    assert.equal(wallParks, 1);
-    assert.equal(parkRig.transport.turnStartCount, 1);
+  it("(d2) a wall budget spent during the backoff takes the wall path, never TransientRecoveryError", async (t) => {
+    for (const wired of [false, true]) {
+      await t.test(wired ? "parked wall" : "unwired wall rejection", async (t) => {
+        const realSetTimeout = globalThis.setTimeout;
+        const realClearTimeout = globalThis.clearTimeout;
+        const controller = new AbortController();
+        const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
+        tinyBackoff(rig, { transientBackoffBaseMs: 1000, wallMs: 300, idleMs: 5000 });
+        let wallParks = 0;
+        const { ctx, emitted } = makeCtx({
+          signal: controller.signal,
+          ...(wired ? { parkForWall: async () => { wallParks++; return "parked" as const; } } : {}),
+        });
+        let watchdogHandle: ReturnType<typeof setTimeout> | undefined;
+        let cleanupHandle: ReturnType<typeof setTimeout> | undefined;
+        let settled = false;
+        let running: Promise<
+          { result: Awaited<ReturnType<CodexExecutor["run"]>>; error?: never } |
+          { error: unknown; result?: never }
+        > | undefined;
+        const watchdog = new Promise<never>((_, reject) => {
+          watchdogHandle = realSetTimeout(() => reject(new Error("timed out setting up or completing wall in backoff")), 3000);
+        });
+        const bounded = <T,>(promise: Promise<T>): Promise<T> => Promise.race([promise, watchdog]);
+        try {
+          // Freeze startup so the first retry still has the entire 300 ms wall budget.
+          t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+          running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx).then(
+            (result) => { settled = true; return { result }; },
+            (error: unknown) => { settled = true; return { error }; },
+          );
+          // tick uses real setImmediate; waitFor's Date.now deadline would be frozen.
+          while (retryNotices(emitted).length === 0) await bounded(tick());
+          assert.equal(retryNotices(emitted).length, 1, "the first retry notice confirms backoff began");
+          await bounded(tick());
+          assert.equal(rig.transport.turnStartCount, 1);
+          t.mock.timers.tick(250);
+          await bounded(tick());
+          assert.equal(rig.transport.turnStartCount, 1);
+          assert.equal(settled, false, "50 ms of wall budget remains after the first slice");
+          t.mock.timers.tick(50);
+          await bounded(tick());
+          const outcome = await bounded(running);
+          if (wired) {
+            assert.ok(outcome.result);
+            assert.deepStrictEqual(outcome.result.walled, { reason: "codex run wall-clock timeout" });
+            assert.equal(wallParks, 1);
+          } else {
+            assert.ok(outcome.error instanceof Error);
+            assert.ok(!(outcome.error instanceof TransientRecoveryError));
+            assert.match(outcome.error.message, /codex run wall-clock timeout/);
+          }
+          assert.equal(rig.transport.turnStartCount, 1, "no provider turn started with the budget spent");
+        } finally {
+          if (watchdogHandle !== undefined) realClearTimeout(watchdogHandle);
+          try {
+            if (running !== undefined && !settled) {
+              // Abort only this run, queue any pending slice, then wake it before resetting mocks.
+              controller.abort();
+              const cleanupWatchdog = new Promise<never>((_, reject) => {
+                cleanupHandle = realSetTimeout(() => reject(new Error("timed out settling aborted wall test")), 3000);
+              });
+              await Promise.race([tick(), cleanupWatchdog]);
+              t.mock.timers.tick(250);
+              await Promise.race([running, cleanupWatchdog]);
+            }
+          } finally {
+            if (cleanupHandle !== undefined) realClearTimeout(cleanupHandle);
+            t.mock.timers.reset();
+            t.mock.restoreAll();
+          }
+        }
+      });
+    }
   });
 
   it("(d3) an early timer wake cannot finish a wall-capped backoff with budget left", async (t) => {
