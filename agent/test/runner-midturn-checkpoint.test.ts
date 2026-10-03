@@ -3144,7 +3144,9 @@ describe("mid-turn checkpoint lifecycle after a refused wall park (issue #1785)"
   it("publishes a later tick after real wall input and a refused park", async () => {
     const tmp = scratchDir("wall-rearm");
     const ctl = control();
-    const claim = gitlabClaim(1785_206);
+    const claim = gitlabClaim(1785_206, { claim_generation: 1 });
+    // A refused park finalizes only after an ownership probe proves this generation (#2042).
+    api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation);
     api.setWallParkResponse("running", 409, { total: 7200, used: 3600 });
     const pub = stubPublish(async (_n, _tip, pack) => {
       await drain(pack);
