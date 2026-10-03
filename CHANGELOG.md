@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Slack plan gates show the detected repo agent folder ([#2113](https://github.com/vtmocanu/uzi/issues/2113)).**
+  The gate message and repo approval confirmation now name `.codex/agents/` for a detected Codex roster, with `.claude/agents/` as the fallback for older or unsupported folder metadata; template and no-roster approvals keep their existing behavior.
+
 - **Worker UID ownership regressions run in required CI ([#2134](https://github.com/vtmocanu/uzi/issues/2134)).**
   The base worker image exercises privileged creation and ownership assertions, with a source-derived check that rejects missing or skipped tests.
 - **A job's output upload no longer retries past a deadline-capped wait.**

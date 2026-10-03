@@ -651,6 +651,7 @@ func TestNotifierPostsPlanInThreadAtGate(t *testing.T) {
 func TestNotifierGateOffersRepoAndOwnWhenRosterDetected(t *testing.T) {
 	rc := baseRun("awaiting_approval")
 	rc.RepoAgentNames = []string{"coder", "reviewer", "tester"}
+	rc.RepoAgentFolder = ".codex/agents"
 	fs := &fakeNotifStore{
 		rc:        rc,
 		delivery:  txt("U1"),
@@ -673,6 +674,10 @@ func TestNotifierGateOffersRepoAndOwnWhenRosterDetected(t *testing.T) {
 		if ids[i] != w {
 			t.Fatalf("gate button %d = %q, want %q (all: %v)", i, ids[i], w, ids)
 		}
+	}
+	if !strings.Contains(fp.blocks[0].sectionText, "`.codex/agents/`") ||
+		strings.Contains(fp.blocks[0].sectionText, ".claude/agents/") {
+		t.Fatalf("gate post must forward the detected Codex folder: %q", fp.blocks[0].sectionText)
 	}
 	// The names ride the body; descriptions never do (there are none in the row).
 	if !strings.Contains(fp.blocks[0].sectionText, "coder") {

@@ -203,7 +203,11 @@ SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
             FROM jsonb_array_elements(COALESCE(r.repo_agents, '[]'::jsonb)) WITH ORDINALITY AS names(elem, ord)
             WHERE elem->>'name' IS NOT NULL),
            ARRAY[]::text[]
-       )::text[] AS repo_agent_names
+       )::text[] AS repo_agent_names,
+       (CASE WHEN r.repo_agents->0->>'folder' = '.codex/agents'
+             THEN '.codex/agents'
+             ELSE '.claude/agents'
+        END)::text AS repo_agent_folder
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the MR/PR noun (PRD #65 D2); repo-ful runs only, same rows the repos join already keeps
