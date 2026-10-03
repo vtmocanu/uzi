@@ -938,7 +938,16 @@ export class SdkExecutor implements Executor {
    * spawns every Bash command detached (its own session and process group), so a backgrounded
    * build survives the group kill. Never throws.
    */
-  async reapAttributedProcesses(): Promise<void> {
+  async reapAttributedProcesses(): Promise<RunProcessReap> {
+    // The background deps install carries the run's HOME, so the HOME-attributed reap would count
+    // it as a survivor and kill npm's children. Tear it down first. A switch that gives up and
+    // continues in place loses it: best-effort by design (the agent installs the dependencies itself).
+    const deps = this.activeDeps;
+    if (deps && !this.depsJoined) {
+      deps.abort.abort();
+      await deps.install;
+      this.depsJoined = true;
+    }
     const r = await this.runProcesses.reap(this.homeDir, this.runWorktree, [...this.spawnedPids]).catch(
       (): RunProcessReap => ({ killed: [], left: [], complete: false }),
     );
@@ -950,6 +959,7 @@ export class SdkExecutor implements Executor {
         ...(r.complete ? {} : { incomplete: true }),
       });
     }
+    return r;
   }
 
   /**
@@ -1053,9 +1063,12 @@ export class SdkExecutor implements Executor {
   /** issue #1830: false from the start of {@link run} until the background JS-deps install has been
    *  joined (or torn down in run()'s finally); true before any run, when no install exists. */
   private depsJoined = true;
+  /** The in-flight background deps install, so {@link reapAttributedProcesses} can tear it down. */
+  private activeDeps: { abort: AbortController; install: Promise<unknown> } | undefined;
 
   async run(ctx: RunContext): Promise<ExecutorResult> {
     this.depsJoined = false;
+    this.activeDeps = undefined;
     this.spawnedPids.clear();
     this.deadCliPids.clear();
     this.rootStartTimes.clear();
@@ -1083,6 +1096,7 @@ export class SdkExecutor implements Executor {
       drive.depsAbort.abort();
       await drive.depsInstall;
       this.depsJoined = true;
+      this.activeDeps = undefined;
       // Reap every agent subprocess before returning, so none survives into the
       // worker's PAT-bearing push (B1). Covers the failure/cancel/no-plan paths
       // too, not just the runner's explicit pre-push call.
@@ -1208,6 +1222,7 @@ export class SdkExecutor implements Executor {
     // throw the overlap away, which is the entire wall-clock argument for doing this.
     const depsAbort = new AbortController();
     const depsInstall = this.startDepsInstall(ctx, toolEnv, depsAbort.signal);
+    this.activeDeps = { abort: depsAbort, install: depsInstall };
     // The install's per-dir verdicts, kept alive to the END of the run rather than
     // consumed and dropped at the join. The install fires BEFORE the plan turn, so by
     // the time anything downstream asks "were the deps actually there?" the answer is

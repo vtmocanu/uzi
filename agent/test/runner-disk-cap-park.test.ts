@@ -362,6 +362,7 @@ describe("RunRunner — PRD #1809 D4 the mid-run disk park's reap, cache drop an
             },
             reapAttributedProcesses: async () => {
               order.push("attributed-reap");
+              return { killed: [], left: [], complete: true };
             },
             run: async (ctx: RunContext): Promise<ExecutorResult> => {
               seedHome(home);

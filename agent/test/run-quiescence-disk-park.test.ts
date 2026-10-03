@@ -138,6 +138,7 @@ function diskParkFactory(seen: Seen, order: string[]): ExecutorFactory {
       },
       reapAttributedProcesses: async () => {
         order.push("attributed-reap");
+        return { killed: [], left: [], complete: true };
       },
       run: async (ctx: RunContext): Promise<ExecutorResult> => {
         seen.clone = ctx.worktreePath;

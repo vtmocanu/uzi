@@ -35,6 +35,7 @@ import { LimitReachedError } from "./limit.js";
 import { provisionRunTools, removeProvisionDir } from "./provision-run.js";
 import type { provisionTools } from "./provision.js";
 import { AGENT_GIT_IDENTITY, gitEnv, runnerGitSpawnEnv } from "./git.js";
+import type { RunProcessReap } from "./run-procs.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 import type { SdkAttemptEnv } from "./sdk-env.js";
 import { unmarkedSpawnEnv, type RecordedRoot } from "./worker-spawn-mark.js";
@@ -855,10 +856,13 @@ export interface Executor {
    * misses (the pinned Claude CLI runs every Bash command detached, in its own session and group):
    * every live process attributed to the run by `HOME` or working directory (run-procs.ts). The
    * runner awaits it right after killAgentTree at the mid-run disk parks, before every park cache
-   * drop (D2), and at the finalize security reap before the push. Never rejects. Absent on the
-   * stub/test and Codex executors.
+   * drop (D2), and at the finalize security reap before the push. Returns the outcome
+   * `{killed, left, complete}` and never rejects (a failure reads as `complete: false`); the reap is
+   * complete only when `complete && left.length === 0`. Callers (#1828) fail closed or retain custody
+   * on an incomplete reap and drop caches only after a complete one. Absent on the stub/test and
+   * Codex executors.
    */
-  reapAttributedProcesses?(): Promise<void>;
+  reapAttributedProcesses?(): Promise<RunProcessReap>;
   /**
    * issue #1830: drop the run's rebuildable HOME caches IN PLACE (run-caches.ts dropRunCaches), for
    * a run the hard disk layer cannot park (it waits at a gate, or is finalizing). Kills no process

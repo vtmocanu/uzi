@@ -200,6 +200,7 @@ describe("RunRunner — cache drop on a process-ending park (PRD #1809 M1)", () 
             reapAttributedProcesses: async () => {
               events.push("reap");
               cachesAtReap = CACHES.map((rel) => fs.existsSync(path.join(home, rel)));
+              return { killed: [], left: [], complete: true };
             },
           },
         };
@@ -227,6 +228,7 @@ describe("RunRunner — cache drop on a process-ending park (PRD #1809 M1)", () 
         // Resolves on a later tick: a push that did not await it would be recorded first.
         await new Promise((r) => setTimeout(r, 20));
         events.push("reap");
+        return { killed: [], left: [], complete: true };
       },
     };
     const origPush = git.pushBranch.bind(git);
