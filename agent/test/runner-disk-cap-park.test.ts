@@ -380,7 +380,8 @@ describe("RunRunner — PRD #1809 D4 the mid-run disk park's reap, cache drop an
       const spy = instrument(runner, () => home);
       await runner.execute(gitlabClaim(1814, { run_id: runId, claim_generation: 3 }));
       assert.strictEqual(parks(runId).length, 1, "parked");
-      const first = order.indexOf("attributed-reap");
+      // #1828: order[0] is the pre-clone HOME reap; the park's own reap is the next one.
+      const first = order.indexOf("attributed-reap", 1);
       assert.ok(first > 0 && order[first - 1] === "group-reap", `the attributed reap follows the group reap: ${JSON.stringify(order)}`);
       assert.deepStrictEqual(spy.cachesAtCapture(), [false, false, false], "the caches were gone before the capture ran");
       assert.strictEqual(spy.settles(), 0, "the disk park keeps the custody hold: no settle");

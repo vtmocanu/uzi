@@ -196,7 +196,8 @@ describe("issue #1783 x PRD #1826: a mid-run data_volume_full park whose clone i
       const { claim, order, seen, pub, captures, releases, calls, spy, mrCalls } = await runDiskPark(iid, state);
 
       // #1826's reap ran (and "succeeded"), BEFORE the capture's proof: it does not substitute for it.
-      const reap = order.indexOf("attributed-reap");
+      // #1828: order[0] is the pre-clone HOME reap; the park's own reap is the next one.
+      const reap = order.indexOf("attributed-reap", 1);
       const firstProof = order.indexOf("proof:recovery_capture");
       assert.ok(reap > 0 && order[reap - 1] === "group-reap", `attributed reap after the group reap: ${JSON.stringify(order)}`);
       assert.ok(firstProof > reap, `the capture's proof runs after the reap and still blocks: ${JSON.stringify(order)}`);

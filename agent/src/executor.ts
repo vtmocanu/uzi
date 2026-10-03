@@ -856,7 +856,8 @@ export interface Executor {
    * misses (the pinned Claude CLI runs every Bash command detached, in its own session and group):
    * every live process attributed to the run by `HOME` or working directory (run-procs.ts). The
    * runner awaits it right after killAgentTree at the mid-run disk parks, before every park cache
-   * drop (D2), and at the finalize security reap before the push. Returns the outcome
+   * drop (D2), in quiesceRun (every own-mode proof and the predecessor capture, not the processOnly
+   * re-proofs) and in phaseClone's pre-clone reap. Returns the outcome
    * `{killed, left, complete}` and never rejects (a failure reads as `complete: false`); the reap is
    * complete only when `complete && left.length === 0`. A caller must treat an incomplete reap as
    * a failure to fail closed or retain custody on, and must not drop caches unless the reap was

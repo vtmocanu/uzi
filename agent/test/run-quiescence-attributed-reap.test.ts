@@ -12,6 +12,7 @@ import type { RecoveryCoordinator } from "../src/recovery.js";
 import type { RunProcessReap } from "../src/run-procs.js";
 import { LiveAttemptRegistry, mintAttemptId, type QuiesceRunOutcome, type QuiesceRunRequest } from "../src/run-quiescence.js";
 import type { AttemptSeedOptions } from "../src/git.js";
+import type { Logger } from "../src/log.js";
 import { nullLogger, noProofReseed } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith, simulateCommittedWork, worktreeDirFor } from "./runner-harness.js";
 
@@ -51,6 +52,9 @@ function reapScript(results: Array<RunProcessReap | Error>) {
     },
   };
 }
+
+// Every run now makes one pre-clone reap (phaseClone) before any boundary, so the scripts below
+// that exercise a LATER boundary lead with a COMPLETE answer for it.
 
 /** Give every executor `base` makes the scripted attributed reap. */
 function withReap(base: ExecutorFactory, reap: { fn: () => Promise<RunProcessReap> }): ExecutorFactory {
@@ -123,7 +127,7 @@ describe("issue #1828: the finalize gate", { skip: process.platform !== "linux" 
       const iid = 18280 + (c.reap === LEFT ? 1 : 0);
       simulateCommittedWork();
       const { quiesceRun } = quiescentProof();
-      const reap = reapScript([c.reap]);
+      const reap = reapScript([COMPLETE, c.reap]);
       const claim = gitlabClaim(iid);
       await runnerWith(withReap(finalizeFactory, reap), gitlab, undefined, undefined, { quiesceRun }).execute(claim);
       const failed = lastFailed(claim.run_id);
@@ -145,7 +149,7 @@ describe("issue #1828: the finalize gate", { skip: process.platform !== "linux" 
     simulateCommittedWork();
     const { quiesceRun } = quiescentProof();
     const claim = gitlabClaim(iid);
-    await runnerWith(withReap(finalizeFactory, reapScript([new Error("proc exploded")])), gitlab, undefined, undefined, { quiesceRun }).execute(claim);
+    await runnerWith(withReap(finalizeFactory, reapScript([COMPLETE, new Error("proc exploded")])), gitlab, undefined, undefined, { quiesceRun }).execute(claim);
     const failed = lastFailed(claim.run_id);
     assert.equal(failed?.fail_origin, "worker_residue_blocked");
     assert.match(String(failed?.failure_reason), /HOME-attributed reap failed: proc exploded/);
@@ -214,7 +218,7 @@ describe("issue #1828: generic failure settlement", { skip: process.platform !==
       const { recovery, captures } = fakeRecovery();
       const { quiesceRun } = quiescentProof();
       const claim = gitlabClaim(iid);
-      await runnerWith(withReap(crashFactory, reapScript([c.reap])), gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun, recovery }).execute(claim);
+      await runnerWith(withReap(crashFactory, reapScript([COMPLETE, c.reap])), gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun, recovery }).execute(claim);
       assert.ok(statuses(claim.run_id).includes("failed"));
       assert.equal(captures(), 0, "no credentialed capture/settle ran");
       assert.equal(fs.existsSync(path.join(worktreeDirFor(iid), "WORK.txt")), true, "the clone is kept");
@@ -264,7 +268,7 @@ describe("issue #1828: the owner pause", { skip: process.platform !== "linux" },
       const pub = spyPublish();
       const { quiesceRun } = quiescentProof();
       // Blocked at the pause sink only; the finalize gate then passes like any pause_failed run.
-      const reap = reapScript([c.reap, COMPLETE]);
+      const reap = reapScript([COMPLETE, c.reap, COMPLETE]);
       const seen: PauseSnapshot[] = [];
       const claim = gitlabClaim(iid);
       await runnerWith(withReap(pauseFactory(iid, pub, seen), reap), gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun }).execute(claim);
@@ -331,7 +335,7 @@ describe("issue #1828: the wall park and the completion hold", { skip: process.p
       const { quiesceRun } = quiescentProof();
       const outcomes: unknown[] = [];
       const claim = gitlabClaim(iid);
-      await runnerWith(withReap(wallFactory(outcomes), reapScript([c.reap])), gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun }).execute(claim);
+      await runnerWith(withReap(wallFactory(outcomes), reapScript([COMPLETE, c.reap])), gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun }).execute(claim);
       assert.deepEqual(outcomes, ["parked"], "the wall park stands");
       assert.deepEqual(api.wallParkRequests[0]!.body, { ...api.wallParkRequests[0]!.body, head: "", published: false });
       assert.ok(!statuses(claim.run_id).includes("failed"));
@@ -347,7 +351,7 @@ describe("issue #1828: the wall park and the completion hold", { skip: process.p
       const { quiesceRun } = quiescentProof();
       const held: Array<boolean | undefined> = [];
       const claim = gitlabClaim(iid);
-      await runnerWith(withReap(holdFactory(held), reapScript([c.reap])), gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun }).execute(claim);
+      await runnerWith(withReap(holdFactory(held), reapScript([COMPLETE, c.reap])), gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun }).execute(claim);
       assert.deepEqual(held, [true], "the hold stands");
       assert.equal((api.completionHoldRequests[0]!.body as { head: string }).head, "");
       assert.ok(!statuses(claim.run_id).includes("failed"));
@@ -403,7 +407,7 @@ describe("issue #1828: the recovery capture", { skip: process.platform !== "linu
       const iid = 18330 + (c.reap === LEFT ? 1 : 0);
       const { calls, quiesceRun } = quiescentProof();
       const claim = gitlabClaim(iid, { claim_generation: 3 });
-      await runnerWith(withReap(recoveryFactory, reapScript([c.reap])), gitlab, undefined, nullLogger(), { ...RUNNER_OPTS, quiesceRun }).execute(claim);
+      await runnerWith(withReap(recoveryFactory, reapScript([COMPLETE, c.reap])), gitlab, undefined, nullLogger(), { ...RUNNER_OPTS, quiesceRun }).execute(claim);
       const st = statuses(claim.run_id);
       assert.ok(!st.includes("recovery_wait"), `never parked over an uncaptured clone: ${st.join(",")}`);
       const failed = lastFailed(claim.run_id);
@@ -463,7 +467,7 @@ describe("issue #1828: the predecessor capture", { skip: process.platform !== "l
       });
       const { gitlab } = fakeGitlab();
       const { calls, quiesceRun } = quiescentProof();
-      await runnerWith(withReap(factory, reapScript([c.reap])), gitlab, undefined, undefined, {
+      await runnerWith(withReap(factory, reapScript([COMPLETE, c.reap])), gitlab, undefined, undefined, {
         ...RUNNER_OPTS,
         quiesceRun,
         dockerHost: "unix:///nonexistent-docker.sock",
@@ -514,35 +518,60 @@ function spyEnsureClone(reap: { calls: () => number }) {
   return { reapCallsAtClone, restore: () => { git.ensureClone = realEnsure; } };
 }
 
-describe("issue #1828: the pre-clone reap of a resumed run", { skip: process.platform !== "linux" }, () => {
+describe("issue #1828: the pre-clone reap", { skip: process.platform !== "linux" }, () => {
+  // The reap attributes by the HOME=<path> environ string, so it must run whether or not the HOME
+  // directory still exists (a survivor can delete or rename it): both cases block.
   for (const c of BLOCKING) {
-    it(`${c.name}: HOME exists: ensureClone is not called, the run fails worker_residue_blocked (not a forge park)`, TIMEOUT, async () => {
-      const { gitlab, calls: mrCalls } = fakeGitlab();
-      const iid = 18350 + (c.reap === LEFT ? 1 : 0);
-      const claim = gitlabClaim(iid);
-      fs.mkdirSync(path.join(homeDir, claim.run_id), { recursive: true });
-      const { quiesceRun } = quiescentProof();
-      const reap = reapScript([c.reap]);
-      const spy = spyEnsureClone(reap);
-      let started = 0;
-      const factory: ExecutorFactory = (runId) => ({
-        homeDir: path.join(homeDir, runId),
-        executor: { run: async (): Promise<ExecutorResult> => { started++; throw new Error("must not start"); } },
+    for (const homeOnDisk of [true, false]) {
+      it(`${c.name}, HOME ${homeOnDisk ? "exists" : "absent"}: ensureClone is not called, the run fails worker_residue_blocked (not a forge park)`, TIMEOUT, async () => {
+        const { gitlab, calls: mrCalls } = fakeGitlab();
+        const iid = 18350 + (c.reap === LEFT ? 1 : 0) + (homeOnDisk ? 0 : 10);
+        const claim = gitlabClaim(iid);
+        if (homeOnDisk) fs.mkdirSync(path.join(homeDir, claim.run_id), { recursive: true });
+        else assert.equal(fs.existsSync(path.join(homeDir, claim.run_id)), false);
+        const { quiesceRun } = quiescentProof();
+        const reap = reapScript([c.reap]);
+        const spy = spyEnsureClone(reap);
+        let started = 0;
+        const factory: ExecutorFactory = (runId) => ({
+          homeDir: path.join(homeDir, runId),
+          executor: { run: async (): Promise<ExecutorResult> => { started++; throw new Error("must not start"); } },
+        });
+        try {
+          await runnerWith(withReap(factory, reap), gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun }).execute(claim);
+        } finally {
+          spy.restore();
+        }
+        assert.deepEqual(spy.reapCallsAtClone, [], "ensureClone (the PAT-bearing fetch) never ran");
+        assert.equal(started, 0);
+        const failed = lastFailed(claim.run_id);
+        assert.equal(failed?.fail_origin, "worker_residue_blocked");
+        const reason = String(failed?.failure_reason);
+        assert.match(reason, c.reason);
+        assert.match(reason, /no clone was fetched/);
+        assert.doesNotMatch(reason, /kept for inspection/, "no clone exists at this site");
+        assert.ok(!statuses(claim.run_id).includes("recovery_wait"), "not classified as a forge-unreachable park");
+        assert.equal(mrCalls.length, 0);
       });
-      try {
-        await runnerWith(withReap(factory, reap), gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun }).execute(claim);
-      } finally {
-        spy.restore();
-      }
-      assert.deepEqual(spy.reapCallsAtClone, [], "ensureClone (the PAT-bearing fetch) never ran");
-      assert.equal(started, 0);
-      const failed = lastFailed(claim.run_id);
-      assert.equal(failed?.fail_origin, "worker_residue_blocked");
-      assert.match(String(failed?.failure_reason), c.reason);
-      assert.ok(!statuses(claim.run_id).includes("recovery_wait"), "not classified as a forge-unreachable park");
-      assert.equal(mrCalls.length, 0);
-    });
+    }
   }
+
+  it("a rejecting reap reads as incomplete: ensureClone is not called, the run fails worker_residue_blocked", TIMEOUT, async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(18372);
+    const { quiesceRun } = quiescentProof();
+    const reap = reapScript([new Error("proc exploded")]);
+    const spy = spyEnsureClone(reap);
+    try {
+      await runnerWith(withReap(finalizeFactory, reap), gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun }).execute(claim);
+    } finally {
+      spy.restore();
+    }
+    assert.deepEqual(spy.reapCallsAtClone, []);
+    const failed = lastFailed(claim.run_id);
+    assert.equal(failed?.fail_origin, "worker_residue_blocked");
+    assert.match(String(failed?.failure_reason), /HOME-attributed reap failed: proc exploded/);
+  });
 
   it("control: HOME exists and the reap is complete: it ran once before the clone, and the run proceeds", TIMEOUT, async () => {
     const { gitlab } = fakeGitlab();
@@ -562,20 +591,84 @@ describe("issue #1828: the pre-clone reap of a resumed run", { skip: process.pla
     assert.ok(statuses(claim.run_id).includes("completed"), statuses(claim.run_id).join(","));
   });
 
-  it("control: no HOME on disk (a fresh run): the reap is not called before the clone", TIMEOUT, async () => {
+  it("control: a fresh run (no HOME on disk) with a complete, empty reap: the reap ran once, then ensureClone", TIMEOUT, async () => {
     const { gitlab } = fakeGitlab();
     const iid = 18353;
     simulateCommittedWork();
     const claim = gitlabClaim(iid);
     assert.equal(fs.existsSync(path.join(homeDir, claim.run_id)), false);
     const { quiesceRun } = quiescentProof();
-    const reap = reapScript([LEFT]);
+    const reap = reapScript([{ killed: [], left: [], complete: true }]);
     const spy = spyEnsureClone(reap);
     try {
       await runnerWith(withReap(finalizeFactory, reap), gitlab, undefined, undefined, { quiesceRun }).execute(claim);
     } finally {
       spy.restore();
     }
-    assert.deepEqual(spy.reapCallsAtClone, [0], "ensureClone ran with no reap before it, though a reap would have blocked");
+    assert.deepEqual(spy.reapCallsAtClone, [1], "one reap preceded the clone fetch");
+    assert.ok(statuses(claim.run_id).includes("completed"), statuses(claim.run_id).join(","));
   });
+});
+
+// ─── no-clone proof and credential switch ──────────────────────────────────────────────────
+
+/** A logger that records every warn message (children share the sink). */
+function warnLogger(): { log: Logger; warns: string[] } {
+  const warns: string[] = [];
+  const log = nullLogger();
+  const self: Logger = { ...log, warn: (msg: string) => { warns.push(msg); }, child: () => self };
+  return { log: self, warns };
+}
+
+const NOT_QUIESCENT_WARN = "recovery: clone not provably quiescent; skipping the credentialed settle and retaining the generation hold (reporting unaffected)";
+
+describe("issue #1828: the no-clone quiesceRun early return", { skip: process.platform !== "linux" }, () => {
+  // The bare clone exists (flight.barePath) but the working clone was never created, so the
+  // pre-settle reap's quiesceRun takes its no-clone early return: it must still fold the reap.
+  for (const blocking of [true, false]) {
+    it(`${blocking ? "an incomplete reap blocks" : "a complete reap does not block"} the pre-settle proof`, TIMEOUT, async () => {
+      const { gitlab } = fakeGitlab();
+      const iid = blocking ? 18390 : 18391;
+      const { recovery } = fakeRecovery();
+      const { quiesceRun } = quiescentProof();
+      const { log, warns } = warnLogger();
+      const realCreate = git.createOrAttachRunnerClone.bind(git);
+      git.createOrAttachRunnerClone = (async () => { throw new Error("clone creation exploded"); }) as typeof git.createOrAttachRunnerClone;
+      const reap = reapScript(blocking ? [COMPLETE, INCOMPLETE] : [COMPLETE]);
+      try {
+        await runnerWith(withReap(crashFactory, reap), gitlab, undefined, log, { ...RUNNER_OPTS, quiesceRun, recovery }).execute(gitlabClaim(iid));
+      } finally {
+        git.createOrAttachRunnerClone = realCreate;
+      }
+      assert.ok(reap.calls() >= 2, "the no-clone proof reaped");
+      assert.equal(warns.includes(NOT_QUIESCENT_WARN), blocking, warns.join(" | "));
+    });
+  }
+});
+
+describe("issue #1828: the no-clone proof and the credential switch", { skip: process.platform !== "linux" }, () => {
+  for (const c of BLOCKING) {
+    it(`credential switch, ${c.name}: the capture is unverified, so the switch is not released`, TIMEOUT, async () => {
+      const { gitlab } = fakeGitlab();
+      const iid = 18380 + (c.reap === LEFT ? 1 : 0);
+      const { quiesceRun } = quiescentProof();
+      const outcomes: unknown[] = [];
+      const factory: ExecutorFactory = (runId) => ({
+        homeDir: path.join(homeDir, runId),
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            outcomes.push(await ctx.attemptCredentialSwitch!());
+            return { branch: ctx.branch, reportOnly: true, summary: "continued" };
+          },
+        },
+      });
+      // The pre-clone reap consumes the first scripted answer; every later proof is blocked.
+      const reap = reapScript([COMPLETE, c.reap]);
+      const claim = gitlabClaim(iid);
+      await runnerWith(withReap(factory, reap), gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun }).execute(claim);
+      assert.notDeepEqual(outcomes, ["released"]);
+      assert.deepEqual(outcomes, ["gave_up"]);
+      assert.ok(!statuses(claim.run_id).includes("credential_switch"), "the release was never reported");
+    });
+  }
 });

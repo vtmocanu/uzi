@@ -853,10 +853,16 @@ export { REASON_WORKER_RESIDUE_BLOCKED };
  */
 class RunResidueBlockedError extends Error {
   readonly detail: string;
-  constructor(detail: string) {
+  /** `preClone` marks the phaseClone reap, which fails before any clone exists: its text must not
+   *  claim a clone was kept. The reason prefix is the same, so failOriginForReason maps both. */
+  constructor(detail: string, opts: { preClone?: boolean } = {}) {
     // The detail reaches the run's failure_reason: short, and stripped of control/bidi characters.
     const clean = sanitizeForLog(detail, 160);
-    super(`${REASON_WORKER_RESIDUE_BLOCKED}: the run's clone could not be proven quiescent (${clean}); the clone is kept for inspection`);
+    super(
+      opts.preClone
+        ? `${REASON_WORKER_RESIDUE_BLOCKED}: the run's HOME-attributed processes could not be proven gone before the clone fetch (${clean}); no clone was fetched`
+        : `${REASON_WORKER_RESIDUE_BLOCKED}: the run's clone could not be proven quiescent (${clean}); the clone is kept for inspection`,
+    );
     this.detail = clean;
     this.name = "RunResidueBlockedError";
   }
@@ -7561,23 +7567,25 @@ export class RunRunner {
     // /proc, so reap the run's HOME-attributed processes first and fail closed. Placed OUTSIDE the
     // try below: a RunResidueBlockedError is a worker fault, never a forge-unreachable park, and
     // executeClaim's generic arm fails the run worker_residue_blocked with no credentialed settle.
-    // A fresh run has no HOME yet, so nothing is reaped.
+    // The reap attributes by the `HOME=<path>` environ string, not by the directory existing, so a
+    // survivor that deleted or renamed the HOME still matches: no HOME-exists gate. A fresh run's
+    // reap returns complete and empty. Codex is excluded by the method's absence (`safety` set).
     const executor = flight.executor;
     if (flight.runHome && !executor.safety && process.platform === "linux" && executor.reapAttributedProcesses) {
-      const homeExists = await fs.stat(flight.runHome).then(
-        () => true,
-        () => false,
-      );
-      if (homeExists) {
-        const reap = await executor.reapAttributedProcesses();
-        if (!reap.complete || reap.left.length > 0) {
-          const detail = attributedReapCause(reap)?.detail ?? "run HOME-attributed reap incomplete";
-          runLog.warn("resumed run: HOME-attributed processes survive; failing before the clone fetch", {
-            run_id: runId,
-            detail: sanitizeForLog(detail),
-          });
-          throw new RunResidueBlockedError(detail);
-        }
+      let reap: RunProcessReap | { failure: string };
+      try {
+        reap = await executor.reapAttributedProcesses();
+      } catch (err) {
+        // The contract says never throws; a rejection reads as incomplete, like quiesceRun.
+        reap = { failure: errMessage(err) };
+      }
+      const cause = attributedReapCause(reap);
+      if (cause) {
+        runLog.warn("HOME-attributed processes survive or the reap is unverified; failing before the clone fetch", {
+          run_id: runId,
+          detail: sanitizeForLog(cause.detail),
+        });
+        throw new RunResidueBlockedError(cause.detail, { preClone: true });
       }
     }
     let barePath: string;
@@ -9528,7 +9536,11 @@ export class RunRunner {
       // below, only on Linux. It runs BEFORE the no-clone early return so a missing clone cannot
       // skip the HOME reap, and its rejection (the contract says never) reads as unverified.
       let attributedReap: RunProcessReap | { failure: string } | undefined;
+      // A processOnly re-proof follows only runner-clone git, which runs with the worker's env (not
+      // the run's HOME) and whatever it starts has its cwd in the clone, so the clone sweep in the
+      // same re-proof catches it; the sink's first proof already ran the attributed reap.
       if (
+        !opts.processOnly &&
         (mode === "own" || flight.predecessorCapture) &&
         !executor.safety &&
         process.platform === "linux" &&

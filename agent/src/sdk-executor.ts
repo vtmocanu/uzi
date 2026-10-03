@@ -934,7 +934,8 @@ export class SdkExecutor implements Executor {
    * run's HOME) or working directory (inside the run's worktree or HOME), each by exact pid as the
    * uid that owns it, re-verified immediately before the kill (run-procs.ts). The runner calls it
    * right after {@link killAgentTree} wherever that reap must be complete: the disk parks, every
-   * park whose HOME cache drop runs, and the finalize security reap before the push. The pinned CLI
+   * park whose HOME cache drop runs, quiesceRun (every own-mode proof and the predecessor capture, not
+   * the processOnly re-proofs) and phaseClone's pre-clone reap. The pinned CLI
    * spawns every Bash command detached (its own session and process group), so a backgrounded
    * build survives the group kill. Never throws.
    */
