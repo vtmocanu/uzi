@@ -108,7 +108,7 @@ func TestCrossCheckRunShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	up := strings.SplitN(string(raw), "-- +goose Down", 2)[0]
-	shape := regexp.MustCompile(`(?m)^ OR \(kind = 'cross_check'\s+AND repo_id IS NOT NULL AND issue_iid IS NULL AND target_run_id IS NOT NULL AND job_type IS NULL\)`)
+	shape := regexp.MustCompile(`(?m)^ OR \(kind = 'cross_check'\s+AND repo_id IS NOT NULL AND issue_iid IS NULL AND target_run_id IS NOT NULL AND job_type IS NULL\s+AND harness = 'codex' AND report_only = true AND budget_wall_seconds IS NOT NULL\)`)
 	if !shape.MatchString(up) {
 		t.Fatal("cross-check shape must require a repo and parent, with no issue or job type")
 	}

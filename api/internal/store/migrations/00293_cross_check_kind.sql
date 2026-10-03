@@ -17,11 +17,13 @@ ALTER TABLE runs ADD CONSTRAINT runs_kind_shape CHECK (
  OR (kind = 'task'         AND repo_id IS NOT NULL AND issue_iid IS NULL AND branch IS NOT NULL)
  OR (kind = 'mr_rework'    AND repo_id IS NOT NULL AND pipeline_ref IS NOT NULL AND mr_iid IS NOT NULL AND target_run_id IS NOT NULL)
  OR (kind = 'job'          AND repo_id IS NULL AND issue_iid IS NULL AND branch IS NULL AND job_type IS NOT NULL)
- OR (kind = 'cross_check'  AND repo_id IS NOT NULL AND issue_iid IS NULL AND target_run_id IS NOT NULL AND job_type IS NULL));
+ OR (kind = 'cross_check'  AND repo_id IS NOT NULL AND issue_iid IS NULL AND target_run_id IS NOT NULL AND job_type IS NULL
+     AND harness = 'codex' AND report_only = true AND budget_wall_seconds IS NOT NULL));
 
 -- +goose Down
 -- cross_checks.checker_run_id is a non-cascading FK to runs.
-DELETE FROM cross_checks WHERE checker_run_id IN (SELECT id FROM runs WHERE kind = 'cross_check');
+DELETE FROM cross_checks WHERE checker_run_id IN (SELECT id FROM runs WHERE kind = 'cross_check')
+    OR lead_run_id IN (SELECT id FROM runs WHERE kind = 'cross_check');
 DELETE FROM runs WHERE kind = 'cross_check';
 
 ALTER TABLE runs DROP CONSTRAINT runs_kind_shape;

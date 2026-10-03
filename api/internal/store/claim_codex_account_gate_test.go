@@ -9,7 +9,7 @@ import (
 // codexAccountGateAnchor opens PRD #1590's shared Codex account-hold predicate. The predicate
 // is this anchor plus its balanced EXISTS (...) body.
 const codexAccountGateAnchor = "r.harness = 'codex' AND r.codex_auth_mode = 'subscription' " +
-	"AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework') AND EXISTS ("
+	"AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework', 'cross_check') AND EXISTS ("
 
 // generatedQuery returns the SQL text of one generated sqlc constant, comment lines dropped and
 // whitespace collapsed to single spaces.
