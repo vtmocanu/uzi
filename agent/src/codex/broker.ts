@@ -878,17 +878,21 @@ export class CodexCallbackBroker {
         const stat = await searchOp({ op: "stat", path: rel });
         if (!stat.ok) return this.mapFileopError(stat);
         if (typeof stat.size !== "number" || !Number.isSafeInteger(stat.size) || stat.size < 0) return deny("fileop_denied", "Search file size unavailable");
-        if (stat.size > 64 * 1024) continue;
+        if (stat.size > 64 * 1024) return deny("search_limit", "Search file size limit reached");
         if (bytes + stat.size > 256 * 1024) return deny("search_limit", "Search byte limit reached");
         const read = await searchOp({ op: "read", path: rel });
         if (!read.ok) return this.mapFileopError(read);
+        if (read.truncated) return deny("search_limit", "Search file read incomplete");
         if (typeof read.data !== "string") return deny("fileop_denied", "Search file body unavailable");
         const body = Buffer.from(read.data, "base64");
         bytes += body.length;
         if (bytes > 256 * 1024) return deny("search_limit", "Search byte limit reached");
         for (const [index, line] of body.toString("utf8").split("\n").entries()) {
-          if (line.includes(query)) matches.push({ path: rel, line: index + 1, text: line.slice(0, 256) });
+          const matchAt = line.indexOf(query);
+          if (matchAt < 0) continue;
           if (matches.length === 20) return { ok: true, output: { matches, truncated: true, bytes } };
+          const excerptStart = Math.max(0, matchAt - Math.floor((256 - query.length) / 2));
+          matches.push({ path: rel, line: index + 1, text: line.slice(excerptStart, excerptStart + 256) });
         }
       }
     }
