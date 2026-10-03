@@ -8239,6 +8239,11 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
     assert.equal(parks.length, 1, "parkForPause ran once");
     assert.equal(rig.epochs[0]!.transport.turnStartCount, 1, "the reaped epoch got no further turn/start");
     assert.notEqual(exec.safety, safetyAtPark, "the refused park recreated the epoch before the pause was handled");
+    // The recreated epoch never launched, so its home never adopted the session: persisting it
+    // would replace the generation persisted before the park with an empty one.
+    assert.equal(rig.providerLaunches(), 1, "the recreated epoch never launched a provider root");
+    assert.deepEqual(events, [`persist:${homeOf(0)}`, `reap:${homeOf(0)}`],
+      "the never-launched recreated epoch's empty home is never persisted");
     assertNoPersistAfterReap(events);
   });
 

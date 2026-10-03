@@ -2171,10 +2171,13 @@ export class CodexExecutor implements Executor {
       // recreates the epoch. The session was persisted by beforeReapingSink before the park and the
       // reaped home is gone, so the old epoch is NOT persisted again. If startProviderEpoch throws,
       // `epoch` and `reapedSinceLastPersist` stay as they were, so the finally skips the persist.
+      // The fresh epoch's home stays empty until its provider launches, so it persists nothing
+      // before then (persistAfterLaunchOnly): a pause or second park that stops the run first
+      // leaves the pre-park generation in the store.
       const recreateEpochAfterReap = async (): Promise<ProviderEpoch> => {
         const old = epoch!;
         lastSessionId = old.harness.rootThreadId ?? lastSessionId;
-        epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochNamespace, ++epochIndex);
+        epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochNamespace, ++epochIndex, { persistAfterLaunchOnly: true });
         this.safety = epoch.safety;
         reapedSinceLastPersist = false;
         await old.dispose();
@@ -2805,6 +2808,7 @@ export class CodexExecutor implements Executor {
     resumeSessionId: string | undefined,
     epochNamespace: string,
     epochIndex: number,
+    opts: { persistAfterLaunchOnly?: boolean } = {},
   ): Promise<ProviderEpoch> {
     const {
       provider, binding, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
@@ -2831,6 +2835,9 @@ export class CodexExecutor implements Executor {
     const codexHome = path.join(ownedDataRoot, "codex");
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(epochIndex));
     this.unverifiedEpochRegistries.add(registry);
+    // Issue #1782: the session subset is adopted into codexHome only when the provider root
+    // launches (providerLaunchSeam), so until then the home holds no session.
+    let launched = false;
     // The safety facade is bound to THIS registry but carries the SHARED reconcile + eviction
     // closures (so credential/generation state is continuous across epochs). Only the FINAL
     // epoch's safety.dispose ever runs evictTokens (an abandoned epoch's dispose tears its
@@ -2981,7 +2988,11 @@ export class CodexExecutor implements Executor {
 
       harness = new CodexHarness({
         registry,
-        launchRoot: async (spec) => this.trackProviderRoot(await providerLaunchSeam(spec)),
+        launchRoot: async (spec) => {
+          const root = this.trackProviderRoot(await providerLaunchSeam(spec));
+          launched = true;
+          return root;
+        },
         broker: planBroker,
         provider,
         workspace: worktreePath,
@@ -3016,7 +3027,11 @@ export class CodexExecutor implements Executor {
         // Persist THIS epoch's credential-free session subset into the SHARED store. Best-effort:
         // a persist failure never blocks the reap/recreation (the store fails safe to a fresh
         // session on the next adopt).
+        // Issue #1782: an epoch recreated after a refused wall park persists nothing until its
+        // provider has launched and adopted the session, so an unpopulated home never replaces the
+        // generation persisted before the park.
         persistSession: async (): Promise<void> => {
+          if (opts.persistAfterLaunchOnly && !launched) return;
           await this.sessionStore.persist(codexHome, storeDir).catch(() => undefined);
         },
         // Full teardown of an ABANDONED epoch on recreation: quiesce + reap (best-effort) +
