@@ -1,5 +1,6 @@
 import { Readable } from "node:stream";
 import type { Logger } from "./log.js";
+import type { UsageWireRequest } from "./usage-recorder.js";
 import {
   WORKER_API_PREFIX,
   type ActiveSnapshot,
@@ -1098,6 +1099,28 @@ export class WorkerClient {
       const body: MessagesRequest = { messages };
       if (includeField) body.claim_generation = generation;
       return this.postJSON(path, body, this.httpTimeoutMs, signal);
+    });
+  }
+
+  /**
+   * Issue #2014 (ADR-2014 D3): post one usage-tail report (POST /worker/runs/{id}/usage). The claim
+   * generation is stamped exactly as postMessages does, through the same send-gate and skew-safe
+   * strict-decode fallback. `signal` aborts the request in flight (a drain that ran out of time).
+   * Throws RequestError on 4xx/5xx; the recorder branches on the status and the typed `reason`.
+   */
+  async postUsage(
+    runId: string,
+    body: UsageWireRequest,
+    generation?: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (body.messages.length === 0 && body.legs.length === 0) return;
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/usage`;
+    const included = this.includeClaimGeneration(generation);
+    await this.withGenerationFallback(included, (includeField) => {
+      const wire: UsageWireRequest & { claim_generation?: number } = { ...body };
+      if (includeField) wire.claim_generation = generation;
+      return this.postJSON(path, wire, this.httpTimeoutMs, signal);
     });
   }
 

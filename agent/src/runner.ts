@@ -8618,6 +8618,8 @@ export class RunRunner {
       // floor. Absent (fresh branch) ⇒ no note.
       publishedTip: flight.publishedTip,
       emit: (m) => batcher.emit(m),
+      // Issue #2014: the run's usage-tail recorder; the batcher drains it first at every flush/close.
+      usage: batcher.usage,
       // Issue #1583: the claim-secret text redactor, for projections that bound text pre-batcher.
       redactText: flight.redactText,
       oauthToken: claim.secrets.anthropic_oauth_token,
@@ -12096,6 +12098,9 @@ export class RunRunner {
             // Nothing published: the field is omitted (the work is on this worker only).
             ...this.checkpointDurabilityField(capture.published ? true : undefined),
           };
+          // Issue #2014: the usage tail lands before the park report (flush drains the usage recorder
+          // first, bounded by USAGE_DRAIN_DEADLINE_MS); the batcher stays open for the park's feed lines.
+          await batcher.flush().catch(() => undefined);
           const ack = await reportState(parkBody);
           if (ack.status === "recovery_wait" && disk) {
             runLog.info("run parked mid-run for its data volume; its caches are dropped and it resumes automatically", {
@@ -12867,6 +12872,10 @@ export class RunRunner {
         },
       });
     }
+    // Issue #2014: the usage tail of the leg the wall just cut lands before the park report, like
+    // the limit-wait, pause and credential-switch parks (flush drains the usage recorder first,
+    // bounded by USAGE_DRAIN_DEADLINE_MS). The batcher stays OPEN: a refused park continues the run.
+    await batcher.flush().catch(() => undefined);
     // 6. Report the wall park. A thrown response gets one identical retry; an unresolved answer
     //    gets one ownership read before any finalize credential reconcile.
     const report = {

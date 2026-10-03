@@ -223,6 +223,9 @@ export type HarnessEvent = HarnessEventMeta &
         model?: string;
         freshSession?: boolean;
         pluginErrors?: readonly PluginLoadError[];
+        // issue #2014: the usage leg (one query()) this init opens; stamped on the persisted init
+        // frame with the SDK session id. Claude run lane only; absent on a Codex init.
+        legId?: string;
       }
     | {
         kind: "frame";
@@ -240,7 +243,13 @@ export type HarnessEvent = HarnessEventMeta &
         // Never set on a user, tool_result or replay frame. Read by evidencesModelProcessing.
         assistantAuthored?: true;
       }
-    | { kind: "turn_finished"; terminal: HarnessTerminal }
+    | {
+        kind: "turn_finished";
+        terminal: HarnessTerminal;
+        // issue #2014: the usage leg and its highest ordinal when this result was decoded,
+        // stamped on the persisted result frame (`leg_id`, `usage_through`). Claude run lane only.
+        usageStamp?: { legId: string; usageThrough: number };
+      }
   );
 
 /** The SDK's placeholder model name on a worker-synthesized assistant frame (e.g. the
