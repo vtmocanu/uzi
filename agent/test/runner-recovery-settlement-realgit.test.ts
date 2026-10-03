@@ -493,8 +493,12 @@ async function bootAndSettle(
   } finally {
     controller.abort();
     await done;
-    if (opts.beforeDrain) await opts.beforeDrain();
-    await drainBackground(background);
+    try {
+      if (opts.beforeDrain) await opts.beforeDrain();
+    } finally {
+      // Even when the hook throws: a pass left running would write after the fixture is removed.
+      await drainBackground(background);
+    }
   }
   return { events, calls: settleClient2.calls, s2 };
 }
@@ -682,6 +686,40 @@ describe("settlement crash boundaries (issue #1582 M2)", () => {
       const atReturn = tree();
       await Promise.allSettled(passes.started); // any late journal write from a pass has landed
       assert.deepEqual(tree(), atReturn, "no recovery journal write after bootAndSettle returned");
+    } finally {
+      fs.renameSync(`${fx.originPath}.gone`, fx.originPath);
+      fs.rmSync(snapRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("bootAndSettle still drains the background passes when its beforeDrain hook throws (issue #2020)", async () => {
+    const { gen2Claim, outboxRoot, snapRoot } = await crashBeforePromotion(6205);
+    fs.renameSync(fx.originPath, `${fx.originPath}.gone`);
+    try {
+      let markStarted!: () => void;
+      const bundleStarted = new Promise<void>((resolve) => { markStarted = resolve; });
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      const passes = { started: [] as Promise<void>[], settled: 0 };
+      const boom = new Error("forced beforeDrain failure");
+      let settledAtReject: boolean | undefined;
+      await assert.rejects(
+        bootAndSettle(gen2Claim.run_id, outboxRoot, undefined, {
+          bundleGate: { onStart: markStarted, release: released },
+          passes,
+          beforeDrain: async () => {
+            await bundleStarted;
+            release();
+            throw boom;
+          },
+        }).catch((e: unknown) => {
+          settledAtReject = passes.settled === passes.started.length;
+          throw e;
+        }),
+        (e) => e === boom,
+      );
+      assert.ok(passes.started.length >= 1, "precondition: the worker started a boot recovery pass");
+      assert.equal(settledAtReject, true, "every boot recovery pass settled before bootAndSettle rejected");
     } finally {
       fs.renameSync(`${fx.originPath}.gone`, fx.originPath);
       fs.rmSync(snapRoot, { recursive: true, force: true });
