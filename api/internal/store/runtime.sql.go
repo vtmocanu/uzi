@@ -4017,7 +4017,8 @@ WITH expired AS (
       AND cc.verdict = 'pending' AND cc.deadline_at <= now()
     RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at
 ), cancelled AS (
-    UPDATE runs child SET status = 'cancelled', finished_at = now(), updated_at = now(),
+    UPDATE runs child SET plan_cross_check_gate_reason = NULL,
+    status = 'cancelled', finished_at = now(), updated_at = now(),
         claim_released_at = now()
     FROM expired e WHERE child.id = e.checker_run_id AND child.status NOT IN ('completed', 'failed', 'cancelled')
 ), banked AS (
@@ -4178,7 +4179,8 @@ func (q *Queries) ExtendAndResumeWallPark(ctx context.Context, arg ExtendAndResu
 }
 
 const failAttestedFinalizeRunsOverCap = `-- name: FailAttestedFinalizeRunsOverCap :many
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = $1,
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), failure_reason = $1,
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     milestones_in_progress = NULL,
@@ -4242,6 +4244,7 @@ func (q *Queries) FailAttestedFinalizeRunsOverCap(ctx context.Context, arg FailA
 
 const failClaimAssemblyExact = `-- name: FailClaimAssemblyExact :execrows
 UPDATE runs SET
+    plan_cross_check_gate_reason = NULL,
     status = 'failed', status_since = now(), failure_reason = $1,
     fail_origin = $2,
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,
@@ -4283,7 +4286,8 @@ func (q *Queries) FailClaimAssemblyExact(ctx context.Context, arg FailClaimAssem
 }
 
 const failRunAutoStop = `-- name: FailRunAutoStop :execrows
-UPDATE runs SET status = 'failed', status_since = now(),
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(),
     failure_reason     = $1,
     stop_kind          = 'auto_stopped',
     -- PRD #69 M7a: the trusted failure class for the auto-stop. Overlaps stop_kind
@@ -4408,7 +4412,8 @@ func (q *Queries) FailRunAutoStop(ctx context.Context, arg FailRunAutoStopParams
 }
 
 const failRunsMissingFromSnapshot = `-- name: FailRunsMissingFromSnapshot :many
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = $1,
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), failure_reason = $1,
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     milestones_in_progress = NULL,
@@ -4501,7 +4506,8 @@ WITH locked AS (
     ORDER BY workers.id
     FOR UPDATE
 )
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = $1,
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), failure_reason = $1,
     -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
@@ -4582,7 +4588,8 @@ func (q *Queries) FailRunsOfStaleWorkersOverCap(ctx context.Context, arg FailRun
 
 const failWorkerRunsOverCap = `-- name: FailWorkerRunsOverCap :many
 
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = $1,
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), failure_reason = $1,
     -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
@@ -13045,7 +13052,8 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 }
 
 const rejectRunServerSide = `-- name: RejectRunServerSide :execrows
-UPDATE runs SET status = 'failed', status_since = now(), stop_kind = 'plan_rejected',
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), stop_kind = 'plan_rejected',
     -- PRD #69 M7a: trusted failure class, overlapping stop_kind deliberately (see 00126).
     fail_origin = 'plan_rejected',
     failure_reason = $1, move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
@@ -14487,6 +14495,10 @@ UPDATE runs SET
             OR runs.required_tools IS DISTINCT FROM COALESCE($4::text[], runs.required_tools)
             OR runs.size_class IS DISTINCT FROM COALESCE($5, runs.size_class))
             THEN NULL
+        -- An exact retry of a revised human presentation must retain its cleared
+        -- current reason instead of restoring dissent about the historical candidate.
+        WHEN runs.status = 'awaiting_approval' AND NOT runs.auto_approve
+             AND runs.plan_md IS NOT NULL AND runs.plan_cross_check_gate_reason IS NULL THEN NULL
         WHEN EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan'
                      AND (cc.lead_claim_generation <> runs.claim_generation OR cc.reason_class = 'superseded'))
             THEN 'interrupted'
@@ -17253,7 +17265,8 @@ WITH leads AS MATERIALIZED (
       AND cc.verdict = 'pending'
     RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at
 ), cancelled AS (
-    UPDATE runs child SET status = 'cancelled', finished_at = now(), updated_at = now(),
+    UPDATE runs child SET plan_cross_check_gate_reason = NULL,
+    status = 'cancelled', finished_at = now(), updated_at = now(),
         claim_released_at = now()
     FROM superseded cc WHERE child.id = cc.checker_run_id
       AND child.status NOT IN ('completed', 'failed', 'cancelled')
@@ -17294,6 +17307,7 @@ func (q *Queries) SupersedeExitedPlanCrossChecks(ctx context.Context) ([]uuid.UU
 
 const supersedeRunByWorker = `-- name: SupersedeRunByWorker :execrows
 UPDATE runs SET
+    plan_cross_check_gate_reason = NULL,
     status             = 'cancelled',
     stop_kind          = 'branch_moved',
     stop_reason        = 'The MR branch was advanced by a concurrent writer, so this rework was superseded and not applied. The branch and the concurrent commits are intact.',
@@ -17395,7 +17409,8 @@ func (q *Queries) SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Ti
 }
 
 const sweepTaskNeverDispatched = `-- name: SweepTaskNeverDispatched :many
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = $1,
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), failure_reason = $1,
     fail_origin = 'task_undispatched',
     finished_at = now(),
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag or in-progress snapshot.

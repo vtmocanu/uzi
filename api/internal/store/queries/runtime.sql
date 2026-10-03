@@ -1991,6 +1991,10 @@ UPDATE runs SET
             OR runs.required_tools IS DISTINCT FROM COALESCE(sqlc.narg('inferred_tools')::text[], runs.required_tools)
             OR runs.size_class IS DISTINCT FROM COALESCE(sqlc.narg('size_class'), runs.size_class))
             THEN NULL
+        -- An exact retry of a revised human presentation must retain its cleared
+        -- current reason instead of restoring dissent about the historical candidate.
+        WHEN runs.status = 'awaiting_approval' AND NOT runs.auto_approve
+             AND runs.plan_md IS NOT NULL AND runs.plan_cross_check_gate_reason IS NULL THEN NULL
         WHEN EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan'
                      AND (cc.lead_claim_generation <> runs.claim_generation OR cc.reason_class = 'superseded'))
             THEN 'interrupted'
@@ -3865,6 +3869,7 @@ WHERE id = @id AND worker_id = @worker_id
 -- CreateStopVerdictInput cancel). Terminal cleanup mirrors CancelRunByWorker. Its extra
 -- hold guard keeps a late failed report from cancelling a wall or completion hold.
 UPDATE runs SET
+    plan_cross_check_gate_reason = NULL,
     status             = 'cancelled',
     stop_kind          = 'branch_moved',
     stop_reason        = 'The MR branch was advanced by a concurrent writer, so this rework was superseded and not applied. The branch and the concurrent commits are intact.',
@@ -3912,7 +3917,8 @@ WHERE id = @id AND worker_id = @worker_id
 -- driven by the server's own sweeper, which has no user to scope to. The
 -- authorization that matters happened upstream — every failure that built this
 -- run's streak was recorded only after runOwnedByWorker succeeded.
-UPDATE runs SET status = 'failed', status_since = now(),
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(),
     failure_reason     = @failure_reason,
     stop_kind          = 'auto_stopped',
     -- PRD #69 M7a: the trusted failure class for the auto-stop. Overlaps stop_kind
@@ -3999,7 +4005,8 @@ WHERE runs.id = @id
 -- stamped 'plan_rejected' in the same statement as the status/failure_reason write
 -- (PRD #33 Decision 3), so this failed run is recognised as a deliberate stop
 -- regardless of the failure_reason text.
-UPDATE runs SET status = 'failed', status_since = now(), stop_kind = 'plan_rejected',
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), stop_kind = 'plan_rejected',
     -- PRD #69 M7a: trusted failure class, overlapping stop_kind deliberately (see 00126).
     fail_origin = 'plan_rejected',
     failure_reason = @failure_reason, move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
@@ -4249,6 +4256,7 @@ WHERE id = @id AND status = 'recovery_wait' AND recovery_wait_cause = 'codex_acc
 -- move_pending_since stamp (a card-less judge or prompt run keeps it NULL). It adds only
 -- the claim-capability revoke and the exact-claim WHERE.
 UPDATE runs SET
+    plan_cross_check_gate_reason = NULL,
     status = 'failed', status_since = now(), failure_reason = @failure_reason,
     fail_origin = @fail_origin,
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,
@@ -4362,7 +4370,8 @@ WHERE id = @id AND user_id = @user_id
 -- vacuously false. status='queued' AND dispatched_at IS NULL makes this the single winner against
 -- a racing DispatchTaskRun (which now also guards status='queued'): exactly one conditional
 -- UPDATE matches the row.
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), failure_reason = @failure_reason,
     fail_origin = 'task_undispatched',
     finished_at = now(),
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag or in-progress snapshot.
@@ -4677,7 +4686,8 @@ WITH locked AS (
     ORDER BY workers.id
     FOR UPDATE
 )
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), failure_reason = @failure_reason,
     -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
@@ -4760,7 +4770,8 @@ RETURNING id, user_id, status;
 -- it stamps move_pending_since. RETURNING id so the caller can funnel these
 -- committed-terminal (worker-lost) runs into the judge (PRD #46 Decision 2), exactly
 -- as the sweeper's FailRunsOfStaleWorkersOverCap does.
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), failure_reason = @failure_reason,
     -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
@@ -4836,7 +4847,8 @@ RETURNING id, (finalize_resume_generation IS NOT NULL AND finalize_resume_genera
 -- name: FailAttestedFinalizeRunsOverCap :many
 -- An attested run that is over budget and not eligible for the one-shot allowance (allowance
 -- already used, or RUN_MAX_REQUEUES = 0) fails exactly as FailWorkerRunsOverCap fails it.
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), failure_reason = @failure_reason,
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     milestones_in_progress = NULL,
@@ -5040,7 +5052,8 @@ RETURNING r.id, r.user_id, r.status;
 -- restore). Held states are never targeted (status = 'running' only). Chat is a target restriction
 -- (kind <> 'chat', D10) — these writers only ever touch run-lane runs. @missing_cutoff is the stale
 -- window plus one heartbeat interval (D4); @max_requeues is RUN_MAX_REQUEUES.
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), failure_reason = @failure_reason,
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     milestones_in_progress = NULL,
@@ -8201,7 +8214,8 @@ WITH expired AS (
       AND cc.verdict = 'pending' AND cc.deadline_at <= now()
     RETURNING cc.*
 ), cancelled AS (
-    UPDATE runs child SET status = 'cancelled', finished_at = now(), updated_at = now(),
+    UPDATE runs child SET plan_cross_check_gate_reason = NULL,
+    status = 'cancelled', finished_at = now(), updated_at = now(),
         claim_released_at = now()
     FROM expired e WHERE child.id = e.checker_run_id AND child.status NOT IN ('completed', 'failed', 'cancelled')
 ), banked AS (
@@ -8233,7 +8247,8 @@ WITH leads AS MATERIALIZED (
       AND cc.verdict = 'pending'
     RETURNING cc.*
 ), cancelled AS (
-    UPDATE runs child SET status = 'cancelled', finished_at = now(), updated_at = now(),
+    UPDATE runs child SET plan_cross_check_gate_reason = NULL,
+    status = 'cancelled', finished_at = now(), updated_at = now(),
         claim_released_at = now()
     FROM superseded cc WHERE child.id = cc.checker_run_id
       AND child.status NOT IN ('completed', 'failed', 'cancelled')

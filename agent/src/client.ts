@@ -1162,11 +1162,13 @@ export class WorkerClient {
    */
   async submitPlanCrossCheck(runId: string, claimGeneration: number, candidate: PlanCrossCheckCandidate): Promise<PlanCrossCheckResponse> {
     return await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
-      { stage: "plan", claim_generation: claimGeneration, ...candidate }) as PlanCrossCheckResponse;
+      { stage: "plan", claim_generation: claimGeneration, ...candidate },
+      this.httpTimeoutMs, undefined, CROSS_CHECK_RESPONSE_MAX_BYTES) as PlanCrossCheckResponse;
   }
 
   async planCrossCheckStatus(runId: string, claimGeneration: number, round = 1): Promise<PlanCrossCheckResponse> {
-    return await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks/plan/${round}?claim_generation=${claimGeneration}`) as PlanCrossCheckResponse;
+    return await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks/plan/${round}?claim_generation=${claimGeneration}`,
+      undefined, CROSS_CHECK_RESPONSE_MAX_BYTES) as PlanCrossCheckResponse;
   }
 
   async reportCrossCheckVerdict(runId: string, claimGeneration: number, result:
@@ -1175,7 +1177,8 @@ export class WorkerClient {
           reason_class: "malformed" | "model_error" | "model_timeout" | "checker_unavailable" | "confinement_failed" })
     & PlanCrossCheckFindings): Promise<void> {
     await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-check-verdict`,
-      { claim_generation: claimGeneration, ...result });
+      { claim_generation: claimGeneration, ...result },
+      this.httpTimeoutMs, undefined, CROSS_CHECK_RESPONSE_MAX_BYTES);
   }
 
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
@@ -2442,11 +2445,12 @@ export class WorkerClient {
     body: unknown,
     timeoutMs = this.httpTimeoutMs,
     callerSignal?: AbortSignal,
+    maxResponseBytes?: number,
   ): Promise<unknown> {
     const res = await this.fetchRaw("POST", path, body, timeoutMs, callerSignal);
     if (res.status >= 400) throw await this.toError("POST", path, res);
     if (res.status === 204) return undefined;
-    const text = await res.text();
+    const text = maxResponseBytes === undefined ? await res.text() : await readBoundedText(res, maxResponseBytes, true);
     return text ? JSON.parse(text) : undefined;
   }
 
@@ -2462,10 +2466,10 @@ export class WorkerClient {
     }
   }
 
-  private async getJSON(path: string, timeoutMs?: number): Promise<unknown> {
+  private async getJSON(path: string, timeoutMs?: number, maxResponseBytes?: number): Promise<unknown> {
     const res = await this.fetchRaw("GET", path, undefined, timeoutMs);
     if (res.status >= 400) throw await this.toError("GET", path, res);
-    const text = await res.text();
+    const text = maxResponseBytes === undefined ? await res.text() : await readBoundedText(res, maxResponseBytes, true);
     return text ? JSON.parse(text) : undefined;
   }
 
@@ -2516,21 +2520,34 @@ function retryAfterMsOf(h: string | null): number | undefined {
   return Math.min(Number(h.trim()), 3600) * 1000;
 }
 
+/** Cross-check response budget, including Go JSON escaping (up to 6 bytes per input byte).
+ * NormalizePlanCrossCheckCandidate caps plan/diff at 256/512 KiB, milestones JSON at 256 KiB,
+ * and 128 capability/tool names at 256 bytes each (32 KiB). NormalizeCrossCheckFindings caps
+ * serialized findings at 32 KiB. Thus 6 * (256 + 512 + 32) + 256 + 32 = 5088 KiB;
+ * reserving another 64 KiB for keys/metadata stays below 6 MiB. Count actual streamed bytes,
+ * never Content-Length; only the three cross-check methods opt in. */
+const CROSS_CHECK_RESPONSE_MAX_BYTES = 6 * 1024 * 1024;
+
 /** Most bytes of an error response body toError reads. */
 const ERROR_BODY_MAX_BYTES = 4096;
 
 /** Read at most `maxBytes` of `res`'s body as UTF-8 text, then cancel the stream so a hostile or
  *  unending body neither fills memory nor holds the connection. A body that ends sooner is read
- *  whole, so a small body yields exactly what Response#text() would. A read failure rejects. */
-async function readBoundedText(res: Response, maxBytes: number): Promise<string> {
+ *  whole, so a small body yields exactly what Response#text() would. A read failure rejects.
+ *  With rejectOverflow, read through EOF (including at the exact cap) and reject any chunk
+ *  exceeding the remaining byte budget before retaining or decoding it. */
+async function readBoundedText(res: Response, maxBytes: number, rejectOverflow = false): Promise<string> {
   if (!res.body) return "";
   const reader = res.body.getReader();
   const parts: Uint8Array[] = [];
   let total = 0;
   try {
-    while (total < maxBytes) {
+    while (total < maxBytes || rejectOverflow) {
       const { done, value } = await reader.read();
       if (done) break;
+      if (rejectOverflow && value.byteLength > maxBytes - total) {
+        throw new Error(`response body exceeds ${maxBytes} bytes`);
+      }
       parts.push(value.length > maxBytes - total ? value.subarray(0, maxBytes - total) : value);
       total += parts[parts.length - 1]!.length;
     }

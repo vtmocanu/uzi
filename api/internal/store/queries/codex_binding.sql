@@ -290,6 +290,7 @@ SELECT ins.seq FROM ins;
 -- touches no custody hold: like every failed run, the run retains custody for capture or
 -- discard (ListReleasableCustodyHolds never qualifies a failed run without a ready capture).
 UPDATE runs SET
+    plan_cross_check_gate_reason = NULL,
     status = 'failed', status_since = now(), failure_reason = @failure_reason,
     fail_origin = @fail_origin,
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,

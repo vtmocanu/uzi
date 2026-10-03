@@ -94,6 +94,8 @@ func TestPlanCrossCheckGateReasonPersistedOutcomeLiveDB(t *testing.T) {
 			plan = "Review a revised human candidate"
 			presentation = uuid.New()
 			report("")
+			// Lost acknowledgments may replay B; historical A must stay historical.
+			report("")
 			after, err := env.q.GetPlanCrossCheck(env.ctx, leadID)
 			if err != nil {
 				t.Fatal(err)
@@ -116,6 +118,7 @@ func TestPlanCrossCheckGateReasonNoRowDeclarationsLiveDB(t *testing.T) {
 		{name: "interrupted recovered generation without a row", harness: "claude", reason: "interrupted"},
 		{name: "owned bounded diff refusal", harness: "claude", reason: "planning_diff_refused", refusal: "diff_too_large"},
 		{name: "arbitrary reason", harness: "claude", reason: "made_up", invalid: true},
+		{name: "explicit empty reason", harness: "claude", reason: "", invalid: true},
 		{name: "false no-row revise", harness: "claude", reason: "revise", invalid: true},
 		{name: "false no-row block", harness: "claude", reason: "block", invalid: true},
 		{name: "false unsupported Claude lead", harness: "claude", reason: "codex_lead_unsupported", invalid: true},

@@ -1173,7 +1173,8 @@ func (q *Queries) StampFiledProposal(ctx context.Context, arg StampFiledProposal
 }
 
 const sweepIdleChatRuns = `-- name: SweepIdleChatRuns :many
-UPDATE runs SET status = 'completed', status_since = now(), finished_at = now(), updated_at = now()
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'completed', status_since = now(), finished_at = now(), updated_at = now()
 WHERE kind = 'chat'
   AND status IN ('claimed', 'running')
   AND id IN (

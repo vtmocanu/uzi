@@ -247,6 +247,7 @@ func (q *Queries) CommitCodexRefresh(ctx context.Context, arg CommitCodexRefresh
 
 const failCodexAccountWaitRun = `-- name: FailCodexAccountWaitRun :execrows
 UPDATE runs SET
+    plan_cross_check_gate_reason = NULL,
     status = 'failed', status_since = now(), failure_reason = $1,
     fail_origin = $2,
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,

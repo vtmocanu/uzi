@@ -15,6 +15,9 @@ func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store,
 	reason := ""
 	if req.PlanCrossCheckGateReason != nil {
 		reason = *req.PlanCrossCheckGateReason
+		if reason == "" {
+			return ErrInvalidState
+		}
 	}
 	switch reason {
 	case "", "revise", "block", "malformed", "model_error", "model_timeout",

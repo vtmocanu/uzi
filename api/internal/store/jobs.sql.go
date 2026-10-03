@@ -307,6 +307,7 @@ func (q *Queries) DeleteJobFindingsForRun(ctx context.Context, runID uuid.UUID) 
 
 const failJobRunWithoutResult = `-- name: FailJobRunWithoutResult :execrows
 UPDATE runs SET
+    plan_cross_check_gate_reason = NULL,
     status             = 'failed',
     status_since       = now(),
     failure_reason     = $1,
@@ -362,7 +363,8 @@ func (q *Queries) FailJobRunWithoutResult(ctx context.Context, arg FailJobRunWit
 }
 
 const failJobsPastWallDeadline = `-- name: FailJobsPastWallDeadline :many
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = $1,
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), failure_reason = $1,
     fail_origin = 'run_timeout',
     finished_at = now(),
     milestones_in_progress = NULL,
@@ -427,7 +429,8 @@ func (q *Queries) FailJobsPastWallDeadline(ctx context.Context, arg FailJobsPast
 }
 
 const failUnservedJobRun = `-- name: FailUnservedJobRun :many
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = $1,
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), failure_reason = $1,
     fail_origin = $2::text,
     finished_at = now(),
     milestones_in_progress = NULL,

@@ -134,6 +134,12 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 	if timeout <= 0 || timeout > 2*time.Hour || (s.p.RunTimeout > 0 && timeout >= s.p.RunTimeout) {
 		return store.CrossCheck{}, ErrCrossCheckRefused
 	}
+	budgetSeconds := (timeout + time.Second - 1) / time.Second
+	// Keep the checked bound adjacent to the narrowing conversion (including
+	// fractional-second ceilings), rather than relying on the duration guard.
+	if budgetSeconds < 1 || budgetSeconds > 7200 {
+		return store.CrossCheck{}, ErrCrossCheckRefused
+	}
 	// Creation rechecks the lead and attempt under lock after harness resolution.
 	if worker.IsolatedLane {
 		return store.CrossCheck{}, ErrCrossCheckUnavailable
@@ -171,7 +177,7 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 		}
 		childID := uuid.New()
 		child, e := txq.CreatePlanCrossCheckChild(ctx, store.CreatePlanCrossCheckChildParams{
-			ChildID: childID, LeadRunID: leadID, UserID: lead.UserID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation, BudgetWallSeconds: int32((timeout + time.Second - 1) / time.Second),
+			ChildID: childID, LeadRunID: leadID, UserID: lead.UserID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation, BudgetWallSeconds: int32(budgetSeconds),
 		})
 		if e != nil {
 			return store.Run{}, e
