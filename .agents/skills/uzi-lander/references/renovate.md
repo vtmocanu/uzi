@@ -34,10 +34,10 @@ around it. `S` is `.agents/skills/uzi-lander/scripts/`.
 Decide unattended; consult the buddy (SKILL.md *Buddy*, *Decide together when unsure*) on
 anything the rules below do not settle.
 
-- **Merge Confidence** is a Mend badge image in the PR body's table, not text. Read it:
-  `curl -s '<badge url>' | grep -oE 'base64,[^"]+' | cut -c8- | base64 -d > c.png`, then
-  view the PNG. Low or neutral prompts closer assessment, especially on a major; it never
-  blocks a merge by itself, nor replaces usage-specific compatibility review and green CI.
+- **Merge Confidence** is a Mend badge image in the PR body's table, not text: fetch the
+  badge into your scratch directory and view it; unreadable means unknown, never inferred.
+  Low or neutral prompts closer assessment, especially on a major; it never blocks a
+  merge by itself, nor replaces usage-specific compatibility review and green CI.
 - **Red on an upstream pin** (e.g. an audit advisory in a transitive dependency another
   package pins exactly): hold until upstream moves. Fix on our own branch (below) only
   when the change belongs in our code; overriding a transitive pin (npm `overrides`) is a

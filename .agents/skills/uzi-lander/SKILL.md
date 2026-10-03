@@ -76,14 +76,14 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
 
 ## Buddy
 
-A buddy is the peer bound with the `session-peers` skill (`buddy: @NAME`). It is
-this lander's second pair of eyes.
+A buddy is this lander's second pair of eyes: a **peer buddy**, the session bound with
+the `session-peers` skill (`buddy: @NAME`), or else a **local buddy**, a subagent.
 
-- **Requires the session-peers `buddy` command** (vtmocanu/skills#73 or later,
-  installed). If `peers.py buddy` is an unknown command, say the CLI lacks buddy
-  support, which is not the same as no buddy bound, and ask the user as below.
-- **On entry run `peers.py buddy`.** None bound → ask the user once: name a buddy
-  or use a local buddy (a subagent, the fallback without Codex or session-peers).
+- **A peer buddy needs the session-peers `buddy` command** (vtmocanu/skills#73 or
+  later). Without session-peers, or when `peers.py buddy` is an unknown command, go
+  straight to the local-buddy offer below.
+- **On entry run `peers.py buddy`.** None bound → ask the user once: name a peer buddy
+  or use a local buddy.
   Without an answer, keep preparing (poll, review, fix, rebase) but stop before the
   merge and report the missing requirement once; Renovate-class PRs proceed with a
   local buddy instead, named in the trail.
@@ -302,7 +302,7 @@ changes it); trust it over a handover's claim.
    commit is still reviewed, references/mr-rework.md): wait for it when the fix changed logic or
    a trust boundary; merge on green CI alone when it did not (docs, comments, renames:
    `watch-pr.sh --reviewer none`, which scopes Greptile's comments to its last verdict);
-   ask when unsure and the user is present. Say which in the merge note. Greptile does not
+   when unsure, decide with the buddy (*Buddy*). Say which in the merge note. Greptile does not
    re-review on its own; re-comment if you want its second pass.
 5. **Base hygiene, when needed, unprompted.** `BEHIND` alone is fine under an admin merge.
    A conflicting PR gets no CI at all, even right after uzi's own `mr_rework` push: read
