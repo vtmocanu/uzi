@@ -13,6 +13,26 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+func TestCrossCheckMilestonesScrubEscapedContent(t *testing.T) {
+	token := "glpat-" + "abcdefghijklmnopqrst"
+	raw := []byte(`[{"title":"` + "glpat-" + `\u0061bcdefghijklmnopqrst \u202e"}]`)
+	clean, ok := scrubPlanCrossCheckMilestones(raw)
+	if !ok {
+		t.Fatal("valid escaped milestones rejected")
+	}
+	if strings.Contains(string(clean), token) || strings.Contains(string(clean), "\\u202e") {
+		t.Fatalf("escaped credential or bidi control survived scrub: %s", clean)
+	}
+	for _, key := range []string{
+		`[{"` + "glpat-" + `\u0061bcdefghijklmnopqrst":"ok"}]`,
+		`[{"\u202e":"ok"}]`,
+	} {
+		if _, accepted := scrubPlanCrossCheckMilestones([]byte(key)); accepted {
+			t.Fatalf("unsafe milestone key accepted: %s", key)
+		}
+	}
+}
+
 func TestCrossCheckWorkerRoutesRejectUnfencedAndUnknownBodies(t *testing.T) {
 	h := &Handler{}
 	worker := store.Worker{ID: uuid.New(), UserID: uuid.New()}

@@ -8054,6 +8054,11 @@ SELECT count(*) FROM (
     HAVING count(*) FILTER (WHERE rs.enabled) >= 1
 ) paused_users;
 
+-- name: NextPlanCrossCheckMessageSeq :one
+SELECT GREATEST(r.last_seq, COALESCE((SELECT max(m.seq) FROM run_messages m WHERE m.run_id = r.id), 0))::int + 1 AS next_seq
+FROM runs r WHERE r.id = @lead_run_id AND r.claim_generation = @claim_generation
+  AND r.claim_released_at IS NULL AND r.status IN ('claimed', 'running');
+
 -- name: GetPlanCrossCheck :one
 SELECT * FROM cross_checks WHERE lead_run_id = @lead_run_id AND stage = 'plan' AND round = 1 FOR UPDATE;
 
@@ -8067,8 +8072,8 @@ SELECT @child_id, lead.user_id, lead.repo_id, 'cross_check', lead.id, 'codex', 2
 FROM runs lead JOIN repos repo ON repo.id = lead.repo_id
 WHERE lead.id = @lead_run_id AND lead.user_id = @user_id
   AND lead.worker_id = @worker_id AND lead.claim_generation = @claim_generation
-  AND lead.status IN ('claimed', 'running') AND lead.harness = 'claude'
-  AND lead.plan_cross_check_required AND lead.auto_approve
+  AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
+  AND lead.harness = 'claude' AND lead.plan_cross_check_required AND lead.auto_approve
 RETURNING *;
 
 -- name: InsertPlanCrossCheck :one
@@ -8085,7 +8090,20 @@ RETURNING *;
 SELECT cc.* FROM cross_checks cc JOIN runs lead ON lead.id = cc.lead_run_id
 WHERE lead.id = @lead_run_id AND lead.worker_id = @worker_id
   AND lead.claim_generation = @claim_generation AND lead.status IN ('claimed', 'running')
+  AND lead.claim_released_at IS NULL AND cc.lead_claim_generation = lead.claim_generation
   AND cc.stage = 'plan' AND cc.round = @round;
+
+-- name: LockPlanCrossCheckLeadForVerdict :one
+SELECT lead.* FROM runs lead
+JOIN cross_checks cc ON cc.lead_run_id = lead.id
+JOIN runs child ON child.id = cc.checker_run_id
+WHERE child.id = @child_id AND child.worker_id = @worker_id
+  AND child.claim_generation = @claim_generation AND child.claim_released_at IS NULL
+  AND child.kind = 'cross_check' AND child.status IN ('claimed', 'running')
+  AND cc.stage = 'plan' AND cc.verdict = 'pending' AND now() < cc.deadline_at
+  AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
+  AND lead.claim_generation = cc.lead_claim_generation
+FOR UPDATE OF lead;
 
 -- name: DecidePlanCrossCheck :one
 UPDATE cross_checks cc SET verdict = @verdict, reason_class = @reason_class,
@@ -8093,9 +8111,9 @@ UPDATE cross_checks cc SET verdict = @verdict, reason_class = @reason_class,
 FROM runs child, runs lead
 WHERE child.id = cc.checker_run_id AND lead.id = cc.lead_run_id
   AND child.id = @child_id AND child.worker_id = @worker_id
-  AND child.claim_generation = @claim_generation
+  AND child.claim_generation = @claim_generation AND child.claim_released_at IS NULL
   AND child.kind = 'cross_check' AND child.status IN ('claimed', 'running')
-  AND lead.status IN ('claimed', 'running')
+  AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
   AND lead.claim_generation = cc.lead_claim_generation
   AND cc.stage = 'plan' AND cc.verdict = 'pending' AND now() < cc.deadline_at
 RETURNING cc.*;
@@ -8113,7 +8131,8 @@ WITH expired AS (
     FROM runs lead
     WHERE cc.lead_run_id = lead.id AND lead.id = @lead_run_id
       AND lead.worker_id = @worker_id AND lead.claim_generation = @claim_generation
-      AND lead.status IN ('claimed', 'running') AND cc.stage = 'plan' AND cc.round = 1
+      AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
+      AND cc.stage = 'plan' AND cc.round = 1
       AND cc.verdict = 'pending' AND cc.deadline_at <= now()
     RETURNING cc.*
 ), cancelled AS (

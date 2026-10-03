@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -39,6 +41,53 @@ func crossCheckError(w http.ResponseWriter, err error) {
 	httpx.Error(w, http.StatusInternalServerError, "cross-check failed")
 }
 
+// Decode before scrubbing so escaped Unicode, bidi controls and credential text
+// cannot bypass the ingest boundary by hiding in JSON escapes.
+func scrubPlanCrossCheckMilestones(raw json.RawMessage) (json.RawMessage, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var values []any
+	if err := decoder.Decode(&values); err != nil || len(values) > 64 {
+		return nil, false
+	}
+	var scrub func(any, int) (any, bool)
+	scrub = func(value any, depth int) (any, bool) {
+		if depth > 32 {
+			return nil, false
+		}
+		switch item := value.(type) {
+		case string:
+			return scrubThenBoundMarkdown(item, 256*1024), true
+		case []any:
+			for i := range item {
+				var ok bool
+				item[i], ok = scrub(item[i], depth+1)
+				if !ok {
+					return nil, false
+				}
+			}
+		case map[string]any:
+			for key, child := range item {
+				if key != scrubThenBoundSelfReported(key, 128) {
+					return nil, false
+				}
+				next, ok := scrub(child, depth+1)
+				if !ok {
+					return nil, false
+				}
+				item[key] = next
+			}
+		}
+		return value, true
+	}
+	clean, ok := scrub(values, 0)
+	if !ok {
+		return nil, false
+	}
+	encoded, err := json.Marshal(clean)
+	return encoded, err == nil && len(encoded) <= 256*1024
+}
+
 func (h *Handler) WorkerSubmitPlanCrossCheck(w http.ResponseWriter, r *http.Request) {
 	worker, ok := mw.WorkerFromContext(r.Context())
 	if !ok {
@@ -61,12 +110,12 @@ func (h *Handler) WorkerSubmitPlanCrossCheck(w http.ResponseWriter, r *http.Requ
 	}
 	c.PlanMd = scrubThenBoundMarkdown(c.PlanMd, 256*1024)
 	c.PlanningDiff = scrubThenBoundMarkdown(c.PlanningDiff, 512*1024)
-	c.Milestones = json.RawMessage(workersvc.ScrubKnownTokens(string(c.Milestones)))
-	var milestones []json.RawMessage
-	if json.Unmarshal(c.Milestones, &milestones) != nil || len(milestones) > 64 {
+	scrubbedMilestones, ok := scrubPlanCrossCheckMilestones(c.Milestones)
+	if !ok {
 		httpx.Error(w, http.StatusBadRequest, "invalid milestones")
 		return
 	}
+	c.Milestones = scrubbedMilestones
 	for i := range c.RequiredCapabilities {
 		c.RequiredCapabilities[i] = scrubThenBoundSelfReported(c.RequiredCapabilities[i], 256)
 	}
@@ -79,7 +128,7 @@ func (h *Handler) WorkerSubmitPlanCrossCheck(w http.ResponseWriter, r *http.Requ
 		crossCheckError(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"round": cc.Round, "checker_run_id": cc.CheckerRunID.Bytes,
+	httpx.JSON(w, http.StatusOK, map[string]any{"round": cc.Round, "checker_run_id": uuid.UUID(cc.CheckerRunID.Bytes).String(),
 		"candidate_digest": hex.EncodeToString(cc.CandidateDigest), "deadline_at": cc.DeadlineAt.Time})
 }
 

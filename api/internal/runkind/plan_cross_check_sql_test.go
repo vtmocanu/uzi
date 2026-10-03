@@ -28,7 +28,7 @@ func TestPlanCrossCheckInsertParity(t *testing.T) {
 	others := map[string]bool{
 		"CreateChatRun": true, "CreateChatContinueRun": true, "CreateJobRun": true,
 		"CreateJudgeRun": true, "CreateTaskRun": true, "CreateThenFixRun": true,
-		"CreateTaskReviewRun": true,
+		"CreateTaskReviewRun": true, "CreatePlanCrossCheckChild": true,
 	}
 	paths, err := filepath.Glob(filepath.Join("..", "store", "queries", "*.sql"))
 	if err != nil {
@@ -62,7 +62,10 @@ func TestPlanCrossCheckInsertParity(t *testing.T) {
 			if !eligible[name] && !others[name] {
 				t.Errorf("unenumerated runs INSERT %s", name)
 			}
-			got := strings.Contains(sql.String(), "plan_cross_check_required")
+			// The child SELECT checks its lead's flag without setting its own.
+			at := insert.FindStringIndex(sql.String())
+			columns := strings.SplitN(sql.String()[at[0]:], ")", 2)[0]
+			got := strings.Contains(columns, "plan_cross_check_required")
 			if got != eligible[name] {
 				t.Errorf("%s: snapshot column = %t, eligible = %t", name, got, eligible[name])
 			}
