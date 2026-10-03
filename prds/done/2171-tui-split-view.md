@@ -46,7 +46,7 @@ Collapsed restore hints and size notes yield to the existing footer when they do
 - Worst-case chrome, from named per-band constants rather than live state: shared header = wordmark/tab line + meters (2 lines max, `boardMeterLayout`) + vault hint (1) + admin-denied (1) + board error (1); floor pane chrome = pane heading + selected-row second line (1) + three band headings + two band spacers; bottom pane chrome = forge header note (1) + pane heading + selected-row second line (1) + three band headings + two band spacers; plus separator (1) and footer (1). The band allowance is threshold-only: live list capacities still count band headings and spacers as display items.
 - `minHeight = sharedChrome + separator + footer + 2 × (max(floorPaneChrome, bottomPaneChrome) + 8)`. The split leaves at least 8 actual list rows per pane in the worst case.
 - Hysteresis: the latch turns on when height ≥ `minHeight + 2` and off when height < `minHeight`. It also needs width ≥ 80 (the board footer's width). The latch updates only in the `tea.WindowSizeMsg` case (`tui.go:884`), never in `View`, so a cursor move, a new error line or a meter tick can never flip the layout.
-- Pane sizes come from the rows left after shared chrome, separator and footer: each pane gets its worst-case chrome + 8, the rest is halved, the odd row to the floor. Each pane's live chrome is subtracted inside its own fixed pane height.
+- Pane sizes come from the rows left after the live shared header, separator and footer (the resize threshold still uses worst-case shared chrome): each pane gets its worst-case chrome + 8, the rest is halved, the odd row to the floor. Each pane's live chrome is subtracted inside its own fixed pane height.
 
 ### View composition (`tuiModel.View`, `tui.go:1571`)
 

@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **TUI split view fills the terminal height ([#2197](https://github.com/vtmocanu/uzi/issues/2197)).**
+  Pane sizes use the shared header rows actually drawn, keeping the footer on the last terminal row when meters or optional hints are absent. The resize threshold and its hysteresis stay unchanged.
+
 ## [0.85.1] - 2026-10-03
 
 ### Added

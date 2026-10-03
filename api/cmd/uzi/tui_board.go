@@ -533,8 +533,10 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 	// combined-vs-split once and returns the rendered header meter line(s). The SAME snapshot
 	// feeds both the draw below and the row reservation (boardCapacityWith), so the reserved
 	// chrome can never disagree with what is drawn.
-	now := time.Now()
-	meters := m.boardMeterLayout(now)
+	var meters boardMeterLayout
+	if fullScreen {
+		meters = m.boardMeterLayout(time.Now())
+	}
 
 	// The wordmark is now a tab strip (PRD #1255 D1): ▚▚ uzi · floor  pulls  ci, the active
 	// tab bold. tabStrip relabels the floor tab "active runs" on the admin board (AdminListRuns

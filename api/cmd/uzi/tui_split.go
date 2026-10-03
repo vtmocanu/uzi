@@ -94,12 +94,19 @@ func (m *tuiModel) activateSplit() tea.Cmd {
 	return nil
 }
 func (m tuiModel) splitHeights() (int, int) {
-	avail := m.height - splitSharedChrome - splitSeparator - splitFooter
+	return m.splitHeightsWithHeader(len(m.splitHeader(time.Now())))
+}
+
+// The resize threshold stays worst-case; pane sizes charge only the drawn header.
+func (m tuiModel) splitHeightsWithHeader(headerRows int) (int, int) {
+	avail := max(2, m.height-headerRows-splitSeparator-splitFooter)
 	baseFloor := splitFloorChrome + splitRows
 	baseForge := splitForgeChrome + splitRows
 	extra := avail - baseFloor - baseForge
+	// If future header chrome exceeds the threshold allowance, shrink the panes
+	// rather than letting their base allocations push the footer off screen.
 	if extra < 0 {
-		extra = 0
+		return (avail + 1) / 2, avail / 2
 	}
 	return baseFloor + (extra+1)/2, baseForge + extra/2
 }
@@ -135,6 +142,11 @@ func splitPane(body string, height int) string {
 	return strings.Join(lines, "\n")
 }
 func (m tuiModel) splitSeparatorLine() string {
+	_, paneHeight := m.splitHeights()
+	return m.splitSeparatorAt(paneHeight)
+}
+
+func (m tuiModel) splitSeparatorAt(paneHeight int) string {
 	tab := m.bottom()
 	focus := m.view == tab
 	var tabs string
@@ -151,7 +163,6 @@ func (m tuiModel) splitSeparatorLine() string {
 	}
 	line := " " + tabs
 	filter, summary, filtering := m.ci.filter, m.ciSummary(), m.ci.filtering
-	_, paneHeight := m.splitHeights()
 	if tab == viewPulls {
 		filter, summary, filtering = m.pulls.filter, m.pullsSummary(), m.pulls.filtering
 		rows := m.pulls.visible()
@@ -246,7 +257,10 @@ func (m tuiModel) splitFooterLine() string {
 	}
 	return clampVisual(" "+strings.Join(hints, " · ")+suffix, m.width)
 }
-func (m tuiModel) renderSplit() string {
+
+// splitHeader is the sole source of shared header lines and their row count.
+// Build it once per render: time-dependent meter widths can change its height.
+func (m tuiModel) splitHeader(now time.Time) []string {
 	var lines []string
 	floor := "floor"
 	if m.board.admin {
@@ -256,7 +270,7 @@ func (m tuiModel) renderSplit() string {
 		floor = "[" + floor + "]"
 	}
 	lines = append(lines, clampVisual(" "+m.pal.title.Render("▚▚ uzi")+" · "+m.pal.title.Render(floor), m.width))
-	lines = append(lines, m.boardMeterLayout(time.Now()).lines...)
+	lines = append(lines, m.boardMeterLayout(now).lines...)
 	if vault := m.vaultIndicatorLine(); vault != "" {
 		lines = append(lines, vault)
 	}
@@ -266,9 +280,16 @@ func (m tuiModel) renderSplit() string {
 	if m.board.err != nil {
 		lines = append(lines, clampVisual(m.pal.faint.Render(" could not refresh: "+fmtErr(m.board.err)), m.width))
 	}
-	top, bottom := m.splitHeights()
+	// Retain one row per pane, separator and footer even if future header
+	// additions outgrow the worst-case allowance used by the resize latch.
+	return lines[:min(len(lines), max(0, m.height-splitSeparator-splitFooter-2))]
+}
+
+func (m tuiModel) renderSplit() string {
+	lines := m.splitHeader(time.Now())
+	top, bottom := m.splitHeightsWithHeader(len(lines))
 	lines = append(lines, splitPane(m.renderBoardBody(top, false), top))
-	lines = append(lines, m.splitSeparatorLine())
+	lines = append(lines, m.splitSeparatorAt(bottom))
 	if m.bottom() == viewPulls {
 		lines = append(lines, splitPane(m.renderPullsBody(bottom, false), bottom))
 	} else {
