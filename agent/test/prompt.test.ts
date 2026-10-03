@@ -1145,6 +1145,23 @@ describe("buildRevisePlanPrompt (PRD #41)", () => {
   });
 });
 
+// Issue #2013: a new random export path per review rebuilds the Go build cache (keyed by
+// package directory), so the lead assigns each validator a stable export slot. The rule
+// rides the runtime append, so a customized lead template body still carries it.
+describe("lead export-slot assignment (issue #2013)", () => {
+  const SLOT_PHRASES = [
+    "name an export slot in each validator dispatch",
+    "the same slot in every later wave",
+    "Never reassign a slot until the dispatch that held it has returned.",
+  ];
+  for (const [label, body] of [["builtin lead", undefined], ["customized lead", "custom lead prompt"]] as const) {
+    it(`${label}: the composed system prompt carries the slot rule`, () => {
+      const sp = buildLeadSystemPrompt(body);
+      for (const phrase of SLOT_PHRASES) assert.ok(sp.append.includes(phrase), `missing ${JSON.stringify(phrase)}`);
+    });
+  }
+});
+
 describe("buildLeadSystemPrompt", () => {
   it("returns the claude_code preset with an appended reminder (not a bare replace)", () => {
     const sp = buildLeadSystemPrompt(undefined);

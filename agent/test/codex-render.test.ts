@@ -418,6 +418,9 @@ describe("renderCodexRun — prompts", () => {
     for (const prompt of rendered.perRolePrompts.values()) {
       assert.match(prompt, /\.uzi\/scratch\//);
       assert.match(prompt, /mktemp -d \.uzi\/scratch\/snap\.XXXXXX/);
+      // Issue #2013: an assigned slot takes precedence over the role body's mktemp recipe.
+      assert.ok(prompt.includes("snap=.uzi/scratch/snap-<slot>"), "names the stable slot path");
+      assert.ok(prompt.includes("this replaces any `mktemp -d` snapshot recipe in your role guidance"), "slot overrides the role recipe");
       // PRD #1849 M2: the uzi runtime facts the upstream-verbatim bodies no longer carry.
       assert.ok(prompt.includes("scratch=.uzi/scratch"), "names the $scratch value");
       assert.ok(prompt.includes("does not permit\na detached checkout"), "forbids a detached checkout");

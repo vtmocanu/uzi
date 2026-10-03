@@ -30,6 +30,8 @@ through `[0.52.0]`.)
   When an upload's wait was cut to the time left before the phase deadline, a timer firing a moment early could start one more attempt before the requested Retry-After elapsed. The phase now stops after such a wait.
 - **Forge HTTP/2 connections recover after an unanswered health ping ([#2204](https://github.com/vtmocanu/uzi/issues/2204)).**
   Forge clients share a dedicated connection pool that probes HTTP/2 connections after 30 seconds without received frames and closes them if the ping remains unanswered for 15 seconds. Detection takes about 45 seconds after the last received frame, so two or three consecutive calls with the default 15-second deadline may still time out before a later call establishes a fresh connection. Request deadlines, redirect restrictions and token redaction retain their existing behavior.
+- **Review exports reuse the build cache across waves ([#2013](https://github.com/vtmocanu/uzi/issues/2013)).**
+  The lead assigns each validator a stable export slot (`.uzi/scratch/snap-<slot>`) instead of a new random export per review, so Go's path-keyed build cache stops re-growing by the whole module each wave. Unassigned or invalid slots keep the random path.
 - **TUI split view fills the terminal height ([#2197](https://github.com/vtmocanu/uzi/issues/2197)).**
   Pane sizes use the shared header rows actually drawn, keeping the footer on the last terminal row when meters or optional hints are absent. The resize threshold and its hysteresis stay unchanged.
 - **Run failure diagnostics replace unsafe control characters ([#2196](https://github.com/vtmocanu/uzi/issues/2196)).**
