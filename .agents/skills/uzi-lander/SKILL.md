@@ -473,7 +473,7 @@ and they precede every merge (step 6):
 ## Several landers on one repo
 
 The shared state (`lib/state.sh`: the main checkout's `.git/uzi-lander/`, seen by every
-worktree, never tracked) holds one claim per PR: owner name, durable session uuid, kind,
+worktree, never tracked) holds one claim per PR (`#N`) or dispatched run (`run-<RUN_ID>`): owner name, durable session uuid, kind,
 size, priority, `depends_on`, and the last trail state. Identity and liveness come from the
 session-peers registry, so a Codex thread with a shim is a peer like any Claude session.
 
@@ -488,6 +488,8 @@ session-peers registry, so a Codex thread with a shim is a peer like any Claude 
   the user overrides with `--priority`.
 - **Dependencies.** `S/claims.sh claim '#B' --depends-on '#A'` when B must land after A;
   `list` shows it, and B's lander waits on A's owner (trail `waiting #A`).
+- **Unclaimed run PRs.** `S/orphans.sh` lists them; the dispatching session lands its own
+  run (`run-<RUN_ID>` claim), an orphan goes to whoever asks first: references/orphans.md.
 - **Contested PR.** Never `--force` a live session's claim; message the owner. A dead or
   stale owner (registry says gone, or no heartbeat for 6 h) is taken over silently.
 - **Cleanup spans the post-merge watch.** `merge.sh` releases the live claim on `MERGED`
@@ -549,7 +551,7 @@ wrapper always completes with 0.
   rework; `references/merge-mechanics.md` ruleset, red `main`, post-merge CI;
   `references/batch.md` landing the whole open-PR set in order; `references/renovate.md`
   Renovate, devbox and other dependency PRs; `references/advisory.md` landing and
-  publishing a private GHSA fix.
+  publishing a private GHSA fix; `references/orphans.md` + `scripts/orphans.sh` unclaimed run PRs.
 
 ## Safety
 

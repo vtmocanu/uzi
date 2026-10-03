@@ -7,7 +7,8 @@
 #   other when it can: a run's mr_iid -> PR; a PR -> the newest non-rework uzi run that
 #   opened it. --repo defaults to the checkout's origin (gh repo view).
 #   Unless --no-claim, an open PR is CLAIMED for this session (claims.sh) so other landers
-#   see it; a PR another live session holds stops here with NEXT=claimed_by_other.
+#   see it; a PR, or a run-<RUN_ID> dispatch claim, another live session holds stops here
+#   with NEXT=claimed_by_other. Claiming the PR releases the run-<RUN_ID> key.
 #
 # SKILL_SCRIPTS_STALE=1 means these scripts differ from the local origin/main ref (a stale
 # checkout, or a local edit): rerun from a fresh detached origin/main worktree.
@@ -39,7 +40,7 @@
 # absent/null, where null means the run inherits the owner default). On true a one-line
 # warning goes to stderr: uzi's poller may auto-start an mr_rework on new review comments.
 # This script only reads; it never changes the setting.
-# Exit 0 on a snapshot, 3 on usage / could not resolve the target.
+# Exit 0 on a snapshot, 3 on usage / could not resolve the target, 4 on NEXT=claimed_by_other.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,7 +57,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --repo) REPO="${2:?}"; shift 2;;
     --no-claim) CLAIM=0; shift;;
-    -h|--help) sed -n '2,38p' "$0"; exit 3;;
+    -h|--help) sed -n '2,43p' "$0"; exit 3;;
     -*) echo "unknown flag: $1" >&2; exit 3;;
     *) if [ -z "$TARGET" ]; then TARGET="$1"; else echo "unexpected arg: $1" >&2; exit 3; fi; shift;;
   esac
@@ -86,7 +87,7 @@ if [ "$have_uzi" -eq 1 ]; then
 fi
 
 # ---- resolve run <-> PR --------------------------------------------------------------
-PR=""; run_json=""; BY_PR=0
+PR=""; run_json=""; BY_PR=0; RUN_KEY=""
 if printf '%s' "$TARGET" | grep -qE '^[0-9]+$'; then
   PR="$TARGET"; BY_PR=1
   if [ "$have_uzi" -eq 1 ] && [ -n "$repo_id" ]; then
@@ -122,6 +123,12 @@ if [ -n "$run_json" ]; then
     rw_json=$(uzi run get "$(printf '%s' "$run_json" | jq -r '.id')" --json 2>/dev/null || true)
   fi
   report_mr_rework "$rw_json"
+  RUN_KEY="run-$(printf '%s' "$run_json" | jq -r '.id')"
+  # The dispatching session claims run-<RUN_ID> (uzi-watcher hand-off): it lands its own run.
+  if [ "$CLAIM" -eq 1 ] && ! rk_out=$("$HERE/claims.sh" held "$RUN_KEY" 2>&1); then
+    printf '%s\n' "$rk_out"
+    echo "NEXT=claimed_by_other"; exit 4
+  fi
   run_status=$(printf '%s' "$run_json" | jq -r '.status')
   case "$run_status" in
     completed|failed|cancelled) ;;
@@ -392,6 +399,10 @@ if [ "$CLAIM" -eq 1 ]; then
     echo "NEXT=claimed_by_other"; exit 4
   fi
   printf '%s\n' "$cl_out"
+  # The PR claim supersedes this session's (or a dead owner's) dispatch-time run claim.
+  if [ -n "$RUN_KEY" ] && "$HERE/claims.sh" show "$RUN_KEY" > /dev/null 2>&1; then
+    "$HERE/claims.sh" release "$RUN_KEY"
+  fi
 fi
 
 # ---- NEXT -------------------------------------------------------------------------------

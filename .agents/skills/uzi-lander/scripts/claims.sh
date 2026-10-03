@@ -15,9 +15,15 @@
 #   claims.sh release <key> [--purge]      # --purge also drops the trail (after a merge)
 #   claims.sh touch <key> [--state TEXT]   # heartbeat + last state (trail.sh calls this)
 #   claims.sh show <key>
+#   claims.sh held <key>                   # exit 4 + CLAIM_HELD_BY when ANOTHER live (or unverifiable) session holds it
 #   claims.sh list [--json] [--all]        # this repo's claims, priority-desc; --all = every state dir key
 #   claims.sh reap [--repo O/R] [--dry-run] # drop terminal/dead claims and stale orphan trails
 #   claims.sh whoami
+#
+# Keys: '#<PR>' for a PR; 'run-<RUN_ID>' for a dispatched run before its PR exists (the
+# dispatching session claims it, so the board names the run's lander; takeover.sh converts
+# it to '#<PR>'). reap drops a run key whose owner is dead, or whose run is terminal with no
+# PR or a merged/closed one; an unreadable run lookup keeps it.
 #
 # Priority: sessions decide. The default is the PR's file count (bigger first), because
 # CodeRabbit reviews are the scarce resource and are worth spending on the large PRs; a
@@ -29,15 +35,15 @@
 #   0  ok
 #   2  usage
 #   3  error (state dir, jq, gh)
-#   4  claim: held by ANOTHER LIVE session (its name/uuid printed: message it, do not steal;
-#      --force takes it anyway, say why in the trail)
+#   4  claim/held: held by ANOTHER LIVE session (its name/uuid printed: message it, do not
+#      steal; claim --force takes it anyway, say why in the trail)
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/state.sh
 . "$HERE/lib/state.sh"
 
-usage() { sed -n '2,32p' "$0" >&2; exit 2; }
+usage() { sed -n '2,39p' "$0" >&2; exit 2; }
 [ $# -ge 1 ] || usage
 verb=$1; shift
 
@@ -128,6 +134,17 @@ case "$verb" in
     jq --arg now "$(now_iso)" --arg s "$state" '.last_seen=$now | if $s!="" then .state=$s else . end' "$f" > "$tmp" && mv -f "$tmp" "$f"
     exit 0;;
 
+  held)
+    key=${1:-}; key_check "$key"; shift
+    f="$CL/$key.json"; [ -f "$f" ] || exit 0
+    me=$(self_identity); my_uuid=$(printf '%s' "$me" | cut -f2)
+    o_uuid=$(jq -r '.owner_uuid // ""' "$f"); o_name=$(jq -r '.owner // ""' "$f")
+    [ "$o_uuid" = "$my_uuid" ] && exit 0
+    st=$(owner_live "$o_uuid" "$f")
+    [ "$st" = dead ] && exit 0
+    echo "CLAIM_HELD_BY=$o_name"; echo "CLAIM_HELD_UUID=$o_uuid"; echo "CLAIM_OWNER_LIVENESS=$st"; echo "CLAIM_KEY=$key"
+    exit 4;;
+
   show)
     key=${1:-}; key_check "$key"
     [ -f "$CL/$key.json" ] && cat "$CL/$key.json" || { echo "no claim for $key"; exit 1; };;
@@ -156,6 +173,22 @@ case "$verb" in
         st=$(gh pr view "$pr" --repo "$r" --json state -q .state 2>/dev/null || echo "")
         case "$st" in MERGED|CLOSED) why="PR $st";; esac
       fi
+      case "$key" in run-*)
+        if [ -z "$why" ]; then
+          # A dispatched run's claim: terminal run with no PR, or with a merged/closed PR.
+          rid=${key#run-}
+          rst=$(uzi run get "$rid" --field status 2>/dev/null || echo "")
+          case "$rst" in completed|failed|cancelled)
+            rpr=$(uzi run get "$rid" --field mr_iid 2>/dev/null) && {
+              if [ -z "$rpr" ]; then why="run $rst, no PR"
+              elif [ -n "$r" ]; then
+                st=$(gh pr view "$rpr" --repo "$r" --json state -q .state 2>/dev/null || echo "")
+                case "$st" in MERGED|CLOSED) why="run $rst, PR $st";; esac
+              fi
+            };;
+          esac
+        fi;;
+      esac
       if [ -z "$why" ] && [ "$(owner_live "$u" "$f")" = "dead" ]; then why="owner $o dead/stale"; fi
       [ -n "$why" ] || continue
       n=$((n+1))
