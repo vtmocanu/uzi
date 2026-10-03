@@ -619,8 +619,8 @@ describe("settlement crash boundaries (issue #1582 M2)", () => {
       const bundleStarts = { n: 0 };
       const passes = { started: [] as Promise<void>[], settled: 0 };
       await bootAndSettle(gen2Claim.run_id, outboxRoot, undefined, { slowBundleMs: 800, bundleStarts, passes });
-      // The slowed bundle keeps a pass running past the abort, so without the drain this fails
-      // deterministically, whatever the scheduling.
+      // The slowed bundle exercises a pass still unfinished at the abort; the assertion checks
+      // settlement directly, so it does not depend on the delay outlasting any other wait.
       assert.ok(passes.started.length >= 1, "precondition: the worker started a boot recovery pass");
       assert.equal(passes.settled, passes.started.length, "every boot recovery pass settled before bootAndSettle returned");
       const tree = (): string[] => {
