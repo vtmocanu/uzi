@@ -11,7 +11,11 @@ func TestConfigRoundtripAndPerms(t *testing.T) {
 	dir := t.TempDir()
 	s := NewStore(filepath.Join(dir, "uzi"))
 
-	cfg := &Config{Contexts: map[string]Context{"default": {URL: "https://uzi.example"}}}
+	cfg := &Config{
+		Current:  "default",
+		Contexts: map[string]Context{"default": {URL: "https://uzi.example"}},
+		TUI:      TUIConfig{Split: "custom-layout"},
+	}
 	if err := s.SaveConfig(cfg); err != nil {
 		t.Fatalf("SaveConfig: %v", err)
 	}
@@ -34,6 +38,38 @@ func TestConfigRoundtripAndPerms(t *testing.T) {
 	}
 	if got.Contexts["default"].URL != "https://uzi.example" {
 		t.Errorf("roundtrip URL = %q", got.Contexts["default"].URL)
+	}
+	if got.Current != "default" {
+		t.Errorf("roundtrip current = %q, want default", got.Current)
+	}
+	if got.TUI.Split != "custom-layout" {
+		t.Errorf("roundtrip TUI split = %q, want custom-layout", got.TUI.Split)
+	}
+}
+
+func TestLoadConfigTUISplitWithContexts(t *testing.T) {
+	s := NewStore(t.TempDir())
+	body := "current = \"work\"\n\n[contexts.work]\nurl = \"https://work.example\"\n\n[tui]\nsplit = \"future-layout\"\n"
+	if err := os.WriteFile(s.configPath(), []byte(body), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := s.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Current != "work" || cfg.Contexts["work"].URL != "https://work.example" || cfg.TUI.Split != "future-layout" {
+		t.Errorf("LoadConfig = %+v, want current, context URL, and arbitrary TUI split preserved", cfg)
+	}
+	if err := s.SaveConfig(cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	got, err := s.LoadConfig()
+	if err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	if got.Current != cfg.Current || got.Contexts["work"] != cfg.Contexts["work"] || got.TUI != cfg.TUI {
+		t.Errorf("reload config = %+v, want %+v", got, cfg)
 	}
 }
 

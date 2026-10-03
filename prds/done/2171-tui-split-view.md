@@ -1,6 +1,6 @@
 # PRD #2171: TUI split view, floor on top and CI or pulls below on tall terminals
 
-**Status**: Draft. Resolved facts below were read at `main` `43161ccf`.
+**Status**: Done. Resolved facts below were read at `main` `43161ccf`; implementation and automated checks completed on issue #2171.
 
 ## Problem
 
@@ -140,28 +140,28 @@ All automated gates are at the `Update→msg` / `View()→string` seam (`tui_mod
 
 ### M1: lists and the tab strip render at a given pane height (prefactor)
 
-- [ ] Board, CI and pulls bodies and capacity functions take a pane height; the scroll helpers take the pane capacity; zero-arg full-screen wrappers remain.
-- [ ] `tabStrip` takes its admin-relabel, marked-tab and repo-suffix inputs explicitly.
-- [ ] Capacity-parity tests at a smaller-than-screen height; existing TUI tests pass untouched.
+- [x] Board, CI and pulls bodies and capacity functions take a pane height; the scroll helpers take the pane capacity; zero-arg full-screen wrappers remain.
+- [x] `tabStrip` takes its admin-relabel, marked-tab and repo-suffix inputs explicitly.
+- [x] Capacity-parity tests at a smaller-than-screen height; existing TUI tests pass untouched.
 
 Blocked by: none. Acceptance: `task gate:api` green; full-screen frames unchanged (the existing render tests are the oracle).
 
 ### M2: the split, with CI and pulls in the bottom pane
 
-- [ ] Split state, the bottom-tab/`m.view` invariant and its setter, `splitEligible` / `splitDrawn`, worst-case threshold with the `WindowSizeMsg`-only latch, pane sizing.
-- [ ] Shared header, separator, bottom pane, footer with the version readout, focus marker, unfocused-pane rendering.
-- [ ] Keys `tab` / `shift+tab` / `ctrl+w` / `esc` / `1` / `2` / `3` / `R`; collapse to the floor with filter commit; drill-in `fromSplit` return.
-- [ ] Repo resolution on activation; `reposMsg`, tick and self-heal gates on "displayed"; modals pause the forge polls.
-- [ ] Help overlay entries; the tests above for threshold, parity, keys, collapse/return, polling, header/footer, monochrome, D7; uxlab scenes.
-- [ ] `docs/cli.md` section, `task docs:sync`, CHANGELOG line.
+- [x] Split state, the bottom-tab/`m.view` invariant and its setter, `splitEligible` / `splitDrawn`, worst-case threshold with the `WindowSizeMsg`-only latch, pane sizing.
+- [x] Shared header, separator, bottom pane, footer with the version readout, focus marker, unfocused-pane rendering.
+- [x] Keys `tab` / `shift+tab` / `ctrl+w` / `esc` / `1` / `2` / `3` / `R`; collapse to the floor with filter commit; drill-in `fromSplit` return.
+- [x] Repo resolution on activation; `reposMsg`, tick and self-heal gates on "displayed"; modals pause the forge polls.
+- [x] Help overlay entries; the tests above for threshold, parity, keys, collapse/return, polling, header/footer, monochrome, D7; uxlab scenes.
+- [x] `docs/cli.md` section, `task docs:sync`, CHANGELOG line.
 
 Blocked by: M1. Acceptance: examples 1 and 2 and the resize half of example 3 hold under tests.
 
 ### M3: turning the split off
 
-- [ ] `s` with the behaviour above; `[tui] split = "auto" | "off"` on `Config`, round-trip, exit-2 validation in `uzi tui`.
-- [ ] The `s` and config tests above.
-- [ ] `docs/cli.md` config key and `s`, `task docs:sync`.
+- [x] `s` with the behaviour above; `[tui] split = "auto" | "off"` on `Config`, round-trip, exit-2 validation in `uzi tui`.
+- [x] The `s` and config tests above.
+- [x] `docs/cli.md` config key and `s`, `task docs:sync`.
 
 Blocked by: M2. Acceptance: example 3 in full.
 

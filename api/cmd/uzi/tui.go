@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -1715,6 +1716,28 @@ func (m tuiModel) renderHelp() string {
 		m.pal.faint.Render("any key returns")
 }
 
+// tuiSplitConfigMode validates the real TUI's preference before opening a screen.
+// Demo and sketch return before this call, so their layout remains automatic.
+func tuiSplitConfigMode(store *uzicli.Store) (string, error) {
+	if store == nil {
+		return "auto", nil
+	}
+	cfg, err := store.LoadConfig()
+	if err != nil {
+		return "", err
+	}
+	switch cfg.TUI.Split {
+	case "", "auto":
+		return "auto", nil
+	case "off":
+		return "off", nil
+	default:
+		return "", uzicli.Exitf(uzicli.ExitUsage,
+			"%s: [tui] split=%q; accepted values are \"auto\" or \"off\"",
+			filepath.Join(store.Dir(), "config.toml"), cfg.TUI.Split)
+	}
+}
+
 // newTUICmd wires `uzi tui [run-id]`.
 func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 	var demo bool
@@ -1745,6 +1768,10 @@ func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 			if cmd.Flags().Changed("sketch") {
 				return runTUISketch(cmd.Context(), env, sketch)
 			}
+			mode, err := tuiSplitConfigMode(env.Store)
+			if err != nil {
+				return err
+			}
 			c, err := env.client(gf)
 			if err != nil {
 				return err
@@ -1754,6 +1781,7 @@ func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 				runID = args[0]
 			}
 			m := newTUIModel(cmd.Context(), c, runID)
+			m.splitMode = mode
 			// Gate the footer version readout and its auto-probe. showVersion is the off-switch
 			// gate alone (versionCheckEnabled: the injection/quiet/env switches) and governs
 			// whether the readout renders — a `dev` build still shows its version. The auto-probe

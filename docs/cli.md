@@ -1391,10 +1391,11 @@ A tab strip in the header — `▚▚ uzi · floor  pulls  ci` — sits beside t
 board (labelled `floor` on screen) and adds two more top-level screens, both
 read straight through the API's stored forge connection PAT: no `gh`, no
 personal token, no leaving the terminal to see whether a PR went green.
-`tab` cycles floor → pulls → ci → floor; `1`/`2`/`3` jump directly. Both
-screens scope to one repo at a time — `R` cycles your enabled repos (hidden
-when only one is enabled), defaulting to the repo of your newest run — and
-`/` filters a list by title, branch, author, or workflow name.
+Without a split, `tab` cycles floor → pulls → ci → floor; `1`/`2`/`3`
+jump directly. Both forge lists scope to one repo at a time — `R` cycles
+your enabled repos (hidden when only one is enabled), defaulting to the
+repo of your newest run — and `/` filters a list by title, branch, author,
+or workflow name.
 
 - **`pulls`** lists every open PR/MR on the scoped repo, banded **NEEDS
   YOU** (changes requested, or a conflict), **IN FLIGHT** (a draft, or a
@@ -1422,9 +1423,48 @@ A rate-limited forge read draws `~ rate-limited · retry in Ns` in the
 header in place of an error and keeps polling once the wait is over — the
 same per-connection budget `FORGE_INTERACTIVE_RATE_MAX` documents in
 [Configuration](./configuration.md). `esc` (or `←`) backs a drill-in out
-to the list it opened from; `esc` on a list returns to the floor. The run
-detail view above gains its own cross-link into this: `m` opens the PR view
-for that run's merge request, when it has one.
+to the list it opened from; `esc` on a forge list returns to the floor. The
+run detail view above gains its own cross-link into this: `m` opens the PR
+view for that run's merge request, when it has one.
+
+### Split view on a tall terminal
+
+With the default `auto` setting, a terminal at least 80 columns wide and
+tall enough shows the floor on top and the scoped repo's CI list below it.
+The header and footer are shared; a separator names the bottom tab and
+repo. The bracketed label (`[floor]`, `[ci]`, or `[pulls]`) shows which
+pane has focus. Both visible lists keep refreshing. Press `tab` to cycle
+floor → CI → pulls → floor, or `shift+tab` to cycle backwards. `ctrl+w`
+switches focus between the floor and the currently selected bottom tab;
+`1` focuses the floor, `2` opens pulls below, and `3` opens CI below.
+`esc` from the bottom focuses the floor. `R` cycles the scoped repo when
+the bottom pane has focus. Run, PR, and CI run detail still open full-screen;
+`esc` returns to the originating pane with its tab and selection.
+
+Press `s` on a list to collapse the split to the full-screen floor for this
+session; press it again to restore the split when the terminal is large
+enough. A resize that makes the terminal too small also collapses to the
+floor. The bottom tab, cursor, filter, and repo are kept for the next
+split, while the floor takes focus after collapse. The split enters at
+42 rows (`minHeight + 2`) and leaves below 40 rows (`minHeight`), avoiding
+a layout flip on a one-row resize. The 40-row minimum is derived from the
+shared header, separator, footer, each pane's worst-case headings and
+spacers, and eight actual list rows per pane; the layout changes only on
+a resize. If the
+terminal is too small, `s` shows `terminal too small to split` and keeps
+the current layout.
+
+To keep the full-screen lists at every terminal size, set this in
+`~/.config/uzi/config.toml`:
+
+```toml
+[tui]
+split = "off"
+```
+
+`split = "auto"` is the default; `auto` and `off` are the supported values.
+The `off` setting also disables `s`. `uzi tui --demo` and
+`uzi tui --sketch` use `auto` regardless of this setting.
 
 ### Keybindings
 
@@ -1478,9 +1518,12 @@ The `pulls`, `ci`, and their two drill-ins (PR view, CI run view) share a
 second set of bindings:
 
 ```
-tab          switch screens: floor → pulls → ci → floor (pulls, ci)
-1 / 2 / 3    jump straight to floor / pulls / ci
-R            cycle the scoped repo (pulls, ci; hidden with one enabled repo)
+tab          unsplit: floor → pulls → ci → floor; split: floor → ci → pulls → floor
+shift+tab    split: cycle backwards through floor, ci, pulls
+ctrl+w       split: switch focus between floor and the selected bottom tab
+1 / 2 / 3    focus floor / pulls / ci
+s            collapse or restore the split for this session (list screens)
+R            cycle the scoped repo (forge list focused; hidden with one enabled repo)
 enter / →    open the selected row (pulls → PR view · ci → CI run view)
 ←            back out of a drill-in (PR view, CI run view) to its list — the symmetric partner of →
 ↑ / ↓        move the cursor (PR view: over CHECKS · CI run view: over JOBS)

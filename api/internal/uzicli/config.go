@@ -46,6 +46,12 @@ func (s *Store) credentialsPath() string { return filepath.Join(s.dir, "credenti
 type Config struct {
 	Current  string             `toml:"current,omitempty"`
 	Contexts map[string]Context `toml:"contexts"`
+	TUI      TUIConfig          `toml:"tui,omitempty"`
+}
+
+// TUIConfig holds the CLI's non-secret TUI preferences.
+type TUIConfig struct {
+	Split string `toml:"split,omitempty"`
 }
 
 // Context is one named endpoint's non-secret settings.

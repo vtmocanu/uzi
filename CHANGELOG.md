@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Watch the floor and forge activity together in the TUI on tall terminals ([#2171](https://github.com/vtmocanu/uzi/issues/2171)).**
+  At 80 columns and sufficient height, `uzi tui` shows the floor above a CI list that can switch to pulls, with keyboard focus and full-screen drill-ins; resizing or `s` collapses to the floor, while `[tui] split = "off"` in `~/.config/uzi/config.toml` keeps the full-screen layout. The split reserves eight list rows per pane and uses a two-row resize margin to avoid layout flapping; demo and sketch use the automatic layout.
+
 ### Changed
 
 - **Admin tabs group Site lists and Products after Branding, before Health.**
