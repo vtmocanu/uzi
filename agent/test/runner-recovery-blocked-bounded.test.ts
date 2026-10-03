@@ -364,8 +364,8 @@ describe("issue #1783 M3: a recovery capture whose proof keeps blocking is bound
             else {
               api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
               const until = Date.now() + 10_000;
-              while (!ctxRef?.signal.aborted && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 5));
-              assert.ok(ctxRef?.signal.aborted, "sticky owner cancellation reached the active wait");
+              while (!ctxRef?.signal?.aborted && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 5));
+              assert.ok(ctxRef?.signal?.aborted, "sticky owner cancellation reached the active wait");
             }
             await pending;
           } else await wait(flight, cancelStopsWait, ms);

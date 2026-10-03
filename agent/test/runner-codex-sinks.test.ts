@@ -3646,3 +3646,27 @@ describe("RunRunner M2 — unknown refresh sink retries and local recovery", () 
     } finally { publication.restore(); }
   });
 });
+
+describe("M2 existing completion hold deferral control", () => {
+  it("unknown refresh during a verified hold capture stays nonterminal", async () => {
+    api.setCompletionHoldResponse("paused");
+    const { gitlab, calls } = fakeGitlab();
+    const rig = codexRig({ refreshUnknown: true });
+    let entered = false;
+    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "HOLD.txt", "committed work before an existing completion hold\n");
+      fs.writeFileSync(path.join(ctx.worktreePath, "DIRTY.txt"), "dirty work\n");
+      entered = await ctx.enterCompletionHold!("existing pending owner decision");
+      return entered ? { branch: ctx.branch, completionHeld: { reason: "existing pending owner decision" } } : { branch: ctx.branch };
+    }, rig.settle);
+    const claim = gitlabClaim(177090, { claim_generation: 3 });
+    await runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute(claim);
+    assert.ok(!statuses(claim.run_id).includes("failed"), "an unknown refresh must not fail this hold");
+    assert.equal(rig.refreshCalls(), 2, "verified local-only hold ends the flight without more credential requests");
+    assert.equal(entered, true, "existing completion hold is preserved after verified local capture");
+    assert.equal(api.completionHoldRequests.length, 1);
+    assert.ok(trackingTip(177090), "verified tracking snapshot survives the local-only hold");
+    assert.equal(calls.length, 0);
+    assert.equal(api.completionPermitRequests.length, 0);
+  });
+});

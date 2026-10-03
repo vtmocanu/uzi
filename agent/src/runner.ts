@@ -2770,7 +2770,7 @@ export class RunRunner {
             // credentialed settle below: a surviving process must not see a PAT git.
             if (err instanceof RunResidueBlockedError) {
               parkResidueBlocked = true;
-            } else if (!isCodexBoundaryError(err) || codexDeferralOf(err) !== undefined) {
+            } else if (!isCodexBoundaryError(err)) {
               throw err;
             }
             runLog.warn("park checkpoint boundary blocked; nothing published to origin", {
@@ -12837,7 +12837,7 @@ export class RunRunner {
         },
       );
     } catch (err) {
-      if (!isCodexBoundaryError(err) || codexDeferralOf(err) !== undefined) throw err;
+      if (!isCodexBoundaryError(err) || (site === "recovery_capture" && codexDeferralOf(err) !== undefined)) throw err;
       runLog.warn("recovery checkpoint boundary blocked; restore point saved locally but not published", {
         error: errMessage(err),
         ...codexBoundaryDiagnosticField(err, flight.redactText),
@@ -13433,7 +13433,7 @@ export class RunRunner {
         },
       );
     } catch (err) {
-      if (!isCodexBoundaryError(err) || codexDeferralOf(err) !== undefined) throw err;
+      if (!isCodexBoundaryError(err)) throw err;
       runLog.warn("completion hold checkpoint boundary blocked; restore point saved locally but not published", {
         error: errMessage(err),
         ...codexBoundaryDiagnosticField(err, flight.redactText),
