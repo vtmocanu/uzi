@@ -158,9 +158,21 @@ func TestSplitFrameFocusAndHostileRepo(t *testing.T) {
 
 func TestSplitMinHeightShowsEightRowsInBothPanes(t *testing.T) {
 	now := time.Now()
-	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
-	m = resizeSplit(m, 120, splitMinHeight+2)
-	m = resizeSplit(m, 120, splitMinHeight)
+	m := bothProvidersModel(t, 100,
+		[]apitypes.TokenRateLimitDTO{
+			okMeter("sec-personal", "personal", true, 35, 62),
+			okMeter("sec-meta", "meta", false, 88, 44),
+		},
+		[]apitypes.CodexAccountRateLimitDTO{
+			codexAcct("cx-primary", "primary", true, "fresh", cwin(71), cwin(29)),
+			codexAcct("cx-team", "team", false, "fresh", cwin(66), cwin(13)),
+		})
+	m = resizeSplit(m, 100, splitMinHeight+2)
+	m = resizeSplit(m, 100, splitMinHeight)
+	m.vaultLocked = true
+	if got := len(m.boardMeterLayout(now).lines); got != 2 || m.vaultIndicatorLine() == "" {
+		t.Fatalf("worst-case header precondition: meter rows=%d vault=%q", got, m.vaultIndicatorLine())
+	}
 	m.repos, m.reposLoaded, m.repoChosen = []apitypes.RepoDTO{oneRepo()}, true, true
 	m.ci.loaded, m.pulls.loaded = true, true
 	m.board.adminDenied = true
