@@ -6,6 +6,7 @@ import { RequestError, WorkerClient } from "../src/client.js";
 import { MessageBatcher } from "../src/batcher.js";
 import {
   USAGE_DRAIN_DEADLINE_MS,
+  USAGE_DROPPED_IDS_MAX,
   USAGE_PENDING_MAX,
   USAGE_POST_MAX_RECORDS,
   USAGE_ROUTE_MISSING_LIMIT,
@@ -231,7 +232,8 @@ describe("UsageRecorder bounds", () => {
     const leg = rec.startLeg();
     const over = 5;
     for (let i = 0; i < USAGE_PENDING_MAX + over; i++) leg.observeAssistant(assistant(`m${i}`, { output_tokens: 1 }));
-    // a re-sighting of a dropped id does not resurrect it half-way, and one of a kept id still merges
+    // while a dropped id is remembered (up to USAGE_DROPPED_IDS_MAX) a re-sighting does not resurrect it
+    // half-way, and one of a kept id still merges
     leg.observeAssistant(assistant(`m${USAGE_PENDING_MAX + 1}`, { output_tokens: 7 }));
     leg.observeAssistant(assistant("m0", { output_tokens: 9 }));
     leg.close();
@@ -249,6 +251,26 @@ describe("UsageRecorder bounds", () => {
     assert.deepEqual(client.legs, [{ leg_id: leg.legId, closed_through: USAGE_PENDING_MAX, dropped_records: over }]);
     assert.deepEqual(client.calls.at(-1)!.body.legs.length, 1, "the marker rides the request that empties the leg");
     assert.deepEqual(client.calls.slice(0, -1).flatMap((c) => c.body.legs), [], "a close never overtakes the records it closes");
+  });
+
+  it("dropped ids are remembered only up to USAGE_DROPPED_IDS_MAX; later rejections are counted, not remembered", async () => {
+    const client = new FakeUsageClient();
+    const rec = makeRecorder(client);
+    const leg = rec.startLeg();
+    const extra = 50;
+    for (let i = 0; i < USAGE_PENDING_MAX; i++) leg.observeAssistant(assistant(`k${i}`, { output_tokens: 1 }));
+    const rejected = USAGE_DROPPED_IDS_MAX + extra;
+    for (let i = 0; i < rejected; i++) leg.observeAssistant(assistant(`d${i}`, { output_tokens: 1 }));
+    // an early rejected id is remembered (not counted again); a late one is not (counted again)
+    leg.observeAssistant(assistant("d0", { output_tokens: 1 }));
+    leg.observeAssistant(assistant(`d${rejected - 1}`, { output_tokens: 1 }));
+    leg.close();
+    await rec.drain();
+
+    assert.equal(client.records.length, USAGE_PENDING_MAX);
+    const dropped = client.legs.at(-1)?.dropped_records ?? 0;
+    assert.ok(dropped > 0);
+    assert.equal(dropped, rejected + 1, "only the untracked re-sighting was counted again");
   });
 
   it("the pending cap is recorder-wide: legs together never hold more than USAGE_PENDING_MAX", async () => {

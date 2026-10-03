@@ -27,6 +27,11 @@ import { errMessage } from "./util.js";
 
 /** Distinct unsent messages held in memory before new ones are dropped (and counted). */
 export const USAGE_PENDING_MAX = 2000;
+/** Dropped message ids remembered per leg, so a later frame of a dropped message is not recorded
+ *  half-way. Past it a new rejection is still counted in dropped_records but not remembered, so a
+ *  later frame of that message may be counted again, or recorded once room frees: an over-count of
+ *  dropped_records only, which the api reads as a > 0 flag (records_dropped). */
+export const USAGE_DROPPED_IDS_MAX = 2000;
 /** Records one /usage request carries (the api's maxUsagePostRecords). */
 export const USAGE_POST_MAX_RECORDS = 500;
 /** Leg markers one /usage request carries (the api's maxUsagePostLegs). */
@@ -127,7 +132,8 @@ const COLUMNS = [
 export class UsageLeg {
   readonly legId = randomUUID();
   private readonly byId = new Map<string, Rec>();
-  /** Ids dropped for memory, so a later frame of the same message is not recorded half-way. */
+  /** Ids dropped for memory (up to USAGE_DROPPED_IDS_MAX), so a later frame of the same message is
+   *  not recorded half-way. Past the cap a rejection is counted but not remembered. */
   private readonly droppedIds = new Set<string>();
   /** The current message id per lane (`parent_tool_use_id ?? "main"`), set by message_start. */
   private readonly lane = new Map<string, string>();
@@ -217,7 +223,7 @@ export class UsageLeg {
     }
     if (this.droppedIds.has(id)) return undefined;
     if (this.byId.size >= USAGE_LEG_MAX_MESSAGES || this.owner.pendingTotal(this) >= USAGE_PENDING_MAX) {
-      this.droppedIds.add(id);
+      if (this.droppedIds.size < USAGE_DROPPED_IDS_MAX) this.droppedIds.add(id);
       this.droppedCount++;
       this.touchMarker();
       return undefined;

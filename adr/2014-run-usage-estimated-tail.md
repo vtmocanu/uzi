@@ -91,6 +91,7 @@ documented stream events (`message_start`, `content_block_start` / `_delta` / `_
 |---|---|---|
 | `USAGE_POST_MAX_RECORDS` | 500 | records per post |
 | `USAGE_PENDING_MAX` | 2000 | distinct messages pending in memory |
+| `USAGE_DROPPED_IDS_MAX` | 2000 | dropped message ids remembered per leg; past it drops are still counted |
 | `USAGE_DRAIN_DEADLINE_MS` | 3000 | total drain wait at a flush or close |
 
 - **Prompt posting.** About 250 ms debounce, at most 500 records per post, bounded
@@ -109,7 +110,9 @@ documented stream events (`message_start`, `content_block_start` / `_delta` / `_
   boundary deadline is shorter. Past it the recorder abandons unsent records **and
   aborts the pending HTTP request** (an `AbortController`), not merely stops waiting on
   it; the batcher proceeds. Abandoned records surface as `leg_not_closed` or
-  `ordinal_gap`.
+  `ordinal_gap`. A failed post also ends the drain early; its records stay pending for the
+  debounced retry and, if still unsent when the batcher closes, are abandoned the same way
+  (review of !2214, `runner.ts` park path).
 - **Typed errors.** Three answers stop only that run's recorder: the typed `stale` 404
   (run not owned), the fence 409 `{disposition: "stale_claim"}`, and the
   `ErrMissingClaimGeneration` 409. An untyped 404 or 405 streak disables the route for the whole process, the same pattern
