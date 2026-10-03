@@ -3169,6 +3169,9 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
     const rig = codexRig();
     const originalPublish = client.publishCheckpoint.bind(client);
     let uploads = 0;
+    let softDeadlines = 0;
+    let softExpiries = 0;
+    let fireSoftDeadline: (() => void) | undefined;
     let abortSettled = false;
     let confirmed = 0;
     const publishedStates: Array<{ lastPublishedTip?: string; checkpointFloor?: string }> = [];
@@ -3179,9 +3182,13 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
       await drain(pack);
       if (uploads === 1) {
         assert.ok(signal, "the milestone passes its soft and hard abort signals to the broker request");
+        assert.equal(signal.aborted, false, "the broker is reached before the test fires soft expiry");
         await new Promise<void>((resolve) => {
           if (signal.aborted) resolve();
           else signal.addEventListener("abort", () => resolve(), { once: true });
+          assert.ok(fireSoftDeadline, "the checkpoint soft deadline is armed before the broker upload");
+          softExpiries += 1;
+          fireSoftDeadline();
         });
         abortSettled = true;
         throw new DOMException("checkpoint upload aborted", "AbortError");
@@ -3225,13 +3232,22 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
         checkpointIntervalMs: 0,
         checkpointTickIntervalMs: 0,
         checkpointTestHooks: {
-          softDeadlineMs: 2_500,
+          armSoftDeadline: (fire) => {
+            softDeadlines += 1;
+            fireSoftDeadline = fire;
+            // Expire only once the first broker request can observe abort. The retry
+            // keeps its real hard boundary without racing a test-only soft clock.
+            return { cancel: () => { fireSoftDeadline = undefined; } };
+          },
           afterUnpinnedPublish: (state) => publishedStates.push(state),
         },
       }).execute(claim);
     } finally {
       (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = originalPublish;
     }
+    assert.equal(softDeadlines, 2, "each upload checkpoint arms its own soft deadline");
+    assert.equal(softExpiries, 1, "only the unacknowledged upload expires");
+    assert.equal(fireSoftDeadline, undefined, "the acknowledged retry cancels its soft deadline");
     assert.equal(firstReturned, true, "the soft-skipped upload returned to the executor");
     assert.equal(secondReturned, true, "the next guarded checkpoint retried publication");
     assert.ok(statuses(claim.run_id).includes("completed"));
