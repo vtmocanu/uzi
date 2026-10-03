@@ -245,8 +245,9 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 }
 
 // checkFleetCapacity confirms stored roll waits against current composed eligibility.
-// The loop is bounded by the waiting rows; each callback runs once and a failed row
-// follows genuine capacity treatment without suppressing any sibling row.
+// The loop is bounded by the waiting rows and fleetCapacityMaxRollConfirmations; each
+// callback runs at most once under fleetCapacityConfirmTimeout, and a failed, timed-out
+// or over-cap row follows genuine capacity treatment without suppressing any sibling row.
 func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health healthDetectorState) apitypes.HealthCheckDTO {
 	c := s.base("fleet.capacity")
 	switch health {
@@ -269,11 +270,15 @@ func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health 
 	genuine, overdue, affected, rolling := map[uuid.UUID]bool{}, map[uuid.UUID]bool{}, map[uuid.UUID]bool{}, map[uuid.UUID]bool{}
 	unconfirmed := map[uuid.UUID]bool{}
 	var genuineSince, overdueSince time.Time
+	confirmations := 0
 	for _, r := range rows {
 		confirmed := false
 		var overlap time.Time
-		if r.HasRollReason && r.HealthSince.Valid && r.HealthSince.InfinityModifier == pgtype.Finite && !r.HealthSince.Time.IsZero() && !r.HealthSince.Time.After(now) && s.cfg.WorkerEligibilityForHealth != nil {
-			e, err := s.cfg.WorkerEligibilityForHealth(ctx, now, r.RunID)
+		if r.HasRollReason && r.HealthSince.Valid && r.HealthSince.InfinityModifier == pgtype.Finite && !r.HealthSince.Time.IsZero() && !r.HealthSince.Time.After(now) && s.cfg.WorkerEligibilityForHealth != nil && confirmations < fleetCapacityMaxRollConfirmations {
+			confirmations++
+			cctx, cancel := context.WithTimeout(ctx, fleetCapacityConfirmTimeout)
+			e, err := s.cfg.WorkerEligibilityForHealth(cctx, now, r.RunID)
+			cancel()
 			drain := e.LatestSuitableDrainingSince
 			if err == nil && e.DrainingEligible > 0 && e.NonDrainingEligible == 0 && e.SuitableOwnDraining == 0 && drain.Valid && drain.InfinityModifier == pgtype.Finite && !drain.Time.IsZero() && !drain.Time.After(now) {
 				confirmed = true

@@ -988,6 +988,34 @@ func TestFleetCapacityRollConfirmation(t *testing.T) {
 	}
 }
 
+// TestFleetCapacityRollConfirmationBounded pins the per-evaluation callback cap and the
+// per-callback deadline: a fleet-wide roll with more waiting rows than the cap makes at
+// most the cap's callbacks, each under a deadline, and an over-cap row stays unconfirmed.
+func TestFleetCapacityRollConfirmationBounded(t *testing.T) {
+	eligible := store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 1, LatestSuitableDrainingSince: pgtype.Timestamptz{Time: fixedNow.Add(-time.Hour), Valid: true}}
+	rows := make([]store.ListOwnersWaitingNoCapacityRow, fleetCapacityMaxRollConfirmations+1)
+	for i := range rows {
+		rows[i] = store.ListOwnersWaitingNoCapacityRow{UserID: uuid.New(), RunID: uuid.New(), HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-time.Hour), Valid: true}, HasRollReason: true}
+	}
+	svc := newSvc(&fakeStore{capacityRows: rows}, &fakeSettings{})
+	calls := 0
+	svc.cfg.WorkerEligibilityForHealth = func(ctx context.Context, _ time.Time, _ uuid.UUID) (store.CountOnlineWorkersClaimableForRunRow, error) {
+		calls++
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) > fleetCapacityConfirmTimeout {
+			t.Fatalf("callback deadline=%v ok=%v, want within %s", deadline, ok, fleetCapacityConfirmTimeout)
+		}
+		return eligible, nil
+	}
+	c := svc.checkFleetCapacity(context.Background(), fixedNow, healthDetectorEnabled)
+	if calls != fleetCapacityMaxRollConfirmations {
+		t.Fatalf("calls=%d want=%d", calls, fleetCapacityMaxRollConfirmations)
+	}
+	if c.Severity != sevDanger || !strings.Contains(c.Summary, "1 owner(s) affected") {
+		t.Fatalf("over-cap row must stay unconfirmed: severity=%s summary=%s", c.Severity, c.Summary)
+	}
+}
+
 func TestFleetCapacityGenuineThresholdActions(t *testing.T) {
 	for _, age := range []time.Duration{5*time.Minute - time.Second, 5 * time.Minute} {
 		t.Run(age.String(), func(t *testing.T) {
