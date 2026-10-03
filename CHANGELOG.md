@@ -29,6 +29,8 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **MR rework keeps handled review history across temporary opt-outs and token replacement ([#1811](https://github.com/vtmocanu/uzi/issues/1811)).**
+  Removing the owner's last Anthropic token or turning automatic rework off temporarily no longer resets consumed review comments or the attempt cap; history is retained while a qualifying source MR remains open.
 - **Worker UID ownership regressions run in required CI ([#2134](https://github.com/vtmocanu/uzi/issues/2134)).**
   The base worker image exercises privileged creation and ownership assertions, with a source-derived check that rejects missing or skipped tests.
 - **A job's output upload no longer retries past a deadline-capped wait.**

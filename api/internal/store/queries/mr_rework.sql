@@ -111,15 +111,26 @@ SET halt_notified = true,
     updated_at    = now();
 
 -- name: DeleteMRReworkLedgerNotIn :execrows
--- Reconcile eviction: drop ledger rows for refs no longer in the opened-MR candidate
--- set (a merged/closed MR, or a run branch that aged out), mirroring
--- DeleteCIAutofixAttemptsNotIn with the same keep-set semantics. This is ALSO the
--- stop-on-merge / stop-on-close cleanup: an mr_state that leaves 'opened' drops the
--- ref from the candidate set, so its ledger row evicts here and a reused agent branch
--- (agent/issue-N, uzi/prompt-…, uzi/self-improve/…) never inherits a stale count. An
--- empty keep-set clears the repo's ledger.
-DELETE FROM mr_rework_ledger
-WHERE repo_id = @repo_id::uuid AND ref <> ALL(@keep_refs::text[]);
+-- Reconcile structural lifetime, independently of temporary detection eligibility.
+-- Retain the ledger while ANY qualifying completed source run in the same repo/ref
+-- has an opened MR, even if a newer source is terminal. Token removal, opt-out and
+-- pipeline state must not reset the consumed high-water, attempt budget or halt latch.
+-- Evict only when no such source remains (closed/merged or missing source).
+DELETE FROM mr_rework_ledger AS ledger
+WHERE ledger.repo_id = @repo_id::uuid
+  AND NOT EXISTS (
+      SELECT 1
+      FROM runs r
+      JOIN repos rp ON rp.id = r.repo_id
+      WHERE r.repo_id = ledger.repo_id
+        AND r.branch = ledger.ref
+        AND r.kind IN ('issue', 'prompt', 'self_improve')
+        AND r.status = 'completed'
+        AND r.branch IS NOT NULL AND r.branch <> ''
+        AND r.branch <> rp.default_branch
+        AND r.mr_iid IS NOT NULL
+        AND r.mr_state = 'opened'
+  );
 
 -- name: CreateAutoMRReworkRun :one
 -- Queue an mr_rework run (PRD #700 M3, sibling of CreateCIFixRun). The NAME is
