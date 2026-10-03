@@ -443,7 +443,7 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 				n.logf("post plan in thread", err)
 			}
 		}
-		ts, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, "Plan ready for review in uzi", gateBlocks(rc.ID, base, rc.RepoAgentNames))
+		ts, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, "Plan ready for review in uzi", gateBlocks(rc.ID, base, rc.RepoAgentNames, rc.RepoAgentFolder))
 		if err != nil {
 			n.logf("post gate", err)
 			return

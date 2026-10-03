@@ -18,7 +18,7 @@ func gateSummary(blocks []slack.Block) ([]string, string) {
 // own), byte-identical to the pre-M7 shape.
 func TestGateBlocksNoRosterSingleApprove(t *testing.T) {
 	for _, names := range [][]string{nil, {}} {
-		ids, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", names))
+		ids, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", names, ""))
 		want := []string{ActionGateApprove, ActionGateRequestChanges, ActionGateReject, ActionGateOpen}
 		if len(ids) != len(want) {
 			t.Fatalf("names=%v: buttons = %v, want %v", names, ids, want)
@@ -38,7 +38,7 @@ func TestGateBlocksNoRosterSingleApprove(t *testing.T) {
 // listed in the body — and NEVER any description text.
 func TestGateBlocksRosterTwoApproves(t *testing.T) {
 	names := []string{"coder", "reviewer", "tester", "auditor"}
-	blocks := gateBlocks(uuid.New(), "https://uzi.example", names)
+	blocks := gateBlocks(uuid.New(), "https://uzi.example", names, "")
 	ids, section := gateSummary(blocks)
 
 	want := []string{ActionGateApproveRepo, ActionGateApproveOwn, ActionGateRequestChanges, ActionGateReject, ActionGateOpen}
@@ -76,13 +76,64 @@ func TestGateBlocksRosterTruncates(t *testing.T) {
 	for i := range names {
 		names[i] = "agent-" + string(rune('a'+i))
 	}
-	_, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", names))
+	_, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", names, ""))
 	if !strings.Contains(section, "+4 more") {
 		t.Fatalf("expected a '+4 more' tail past the cap of %d: %q", maxGateAgentNames, section)
 	}
 	// The 11th name (index 10) is past the cap and must not appear.
 	if strings.Contains(section, names[10]) {
 		t.Fatalf("a name past the cap leaked into the body: %q", section)
+	}
+}
+
+func TestGateBlocksRepoAgentFolder(t *testing.T) {
+	for _, tc := range []struct {
+		name, folder, want string
+	}{
+		{"Codex", ".codex/agents", ".codex/agents/"},
+		{"Claude", ".claude/agents", ".claude/agents/"},
+		{"missing", "", ".claude/agents/"},
+		{"unexpected", "<https://evil.example|agents>", ".claude/agents/"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			blocks := gateBlocks(uuid.New(), "https://uzi.example", []string{"tester", "coder"}, tc.folder)
+			_, body := gateSummary(blocks)
+			if !strings.Contains(body, "`"+tc.want+"`") {
+				t.Fatalf("gate body = %q, want folder %q", body, tc.want)
+			}
+			if !strings.Contains(body, "Repo agents: `tester`, `coder`") {
+				t.Fatalf("ordered names missing: %q", body)
+			}
+			repo := firstButton(blocks, ActionGateApproveRepo)
+			if repo == nil || repo.Confirm == nil {
+				t.Fatal("repo approve confirmation missing")
+			}
+			wantConfirm := "The run will implement the plan using the 2 agent(s) the repository defines in " + tc.want +
+				" — not your uzi templates. They are authored by the repo, so their review is not uzi's own."
+			if repo.Confirm.Text.Text != wantConfirm {
+				t.Fatalf("repo confirm = %q, want %q", repo.Confirm.Text.Text, wantConfirm)
+			}
+			own := firstButton(blocks, ActionGateApproveOwn)
+			if own == nil || own.Confirm == nil || own.Confirm.Title.Text != "Use your agent templates?" ||
+				own.Confirm.Text.Text != "The run will implement the plan using your uzi agent templates." {
+				t.Fatalf("own confirmation changed: %+v", own)
+			}
+			if strings.Contains(body, "evil.example") {
+				t.Fatalf("unexpected folder leaked: %q", body)
+			}
+			for _, names := range [][]string{nil, {}} {
+				empty := gateBlocks(uuid.New(), "https://uzi.example", names, tc.folder)
+				_, emptyBody := gateSummary(empty)
+				if emptyBody != "*Plan ready for review.* Approve to let the run continue, or reject to send it back. The plan is in uzi." {
+					t.Fatalf("no-roster body changed: %q", emptyBody)
+				}
+				approve := firstButton(empty, ActionGateApprove)
+				if approve == nil || approve.Confirm == nil || approve.Confirm.Title.Text != "Approve this plan?" ||
+					approve.Confirm.Text.Text != "The run will continue and implement the plan." {
+					t.Fatalf("no-roster confirmation changed: %+v", approve)
+				}
+			}
+		})
 	}
 }
 

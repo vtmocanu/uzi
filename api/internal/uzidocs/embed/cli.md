@@ -237,8 +237,11 @@ A few worth knowing:
 - **`run approve` picks the subagent roster explicitly.** By default a run
   uses its own default roster; `--agent-source own|repo` overrides it
   (`own` = your template roster, `repo` = the agents the worker detected in
-  the clone's `.claude/agents/`), and `--exclude-agents a,b` drops individual
-  subagents from that source. `--exclude-agents` requires `--agent-source`.
+  the clone's `.claude/agents/` or `.codex/agents/`), and `--exclude-agents a,b`
+  drops individual subagents from that source. `--exclude-agents` requires
+  `--agent-source`. Detection reads one folder, never merges rosters, and prefers
+  the run harness's native folder; a present preferred folder is final even if
+  empty or invalid. See [Repo agents](repo-agents.md#which-folder-is-read).
   `run create --plan-file` takes the same two flags, for the seeded run's
   roster.
 - **`run revise <id> -m "<feedback>"`** steers a plan at the approval gate

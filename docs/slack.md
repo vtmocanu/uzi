@@ -156,14 +156,19 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   a full round — see plan, request changes, reply with feedback, see the
   new plan, approve — works from Slack alone. See [Plan approval
   gate](./run-activity.md#plan-approval-gate) for the web-side equivalent.
-- **Choosing agents from Slack**: when the repo ships its own agents in
-  `.claude/agents/`, the gate shows **two** approve buttons — **Approve · repo
-  agents (N)** and **Approve · my templates** — and lists the repo agent names
-  in the message. Each button's confirm dialog states which roster it uses; that
-  confirm is your opt-in record. The repo card is a whole-roster choice only;
-  to exclude individual agents, approve from the web UI instead. A repo with no
-  `.claude/agents/` shows the single **Approve** button (your templates), exactly
-  as before, and so do gate messages posted before this feature shipped.
+- **Choosing agents from Slack**: when the worker detects a repo roster in
+  `.claude/agents/` or `.codex/agents/`, the gate shows **two** approve buttons —
+  **Approve · repo agents (N)** and **Approve · my templates** — and lists the
+  repo agent names. The message and repo confirmation show the same detected
+  folder; missing or unsupported folder metadata displays `.claude/agents/`.
+  Each button's confirm dialog states which roster it uses; that confirm is
+  your opt-in record. Detection reads one folder, never merges rosters, and
+  prefers the run harness's native folder. A present preferred folder is final
+  even if empty or invalid; see [Repo agents](./repo-agents.md#which-folder-is-read).
+  The repo card is a whole-roster choice only; to exclude individual agents,
+  approve from the web UI instead. With no detected roster, the gate shows the
+  single **Approve** button (your templates). Mere directory existence does not
+  enable the repo choice.
 - **Answering a question**: an agent that hits a fork it shouldn't resolve
   alone can stop and ask you. The run parks, its status reads **needs your
   answer**, and the question is posted into the run thread with any suggested
@@ -338,10 +343,12 @@ message.
   members' emails to match them to uzi accounts. Turning Slack on also means
   run status metadata (status, repository paths, issue numbers and titles, MR
   links, failure reasons) leaves the box for Slack's cloud — nothing
-  sensitive, but it's no longer loopback-only once enabled. When a repo ships
-  `.claude/agents/`, the agent **names** (short kebab-case identifiers, at most
-  16, ≤64 chars each) also appear in the gate DM so you can choose that roster;
-  their **descriptions** are never sent.
+  sensitive, but it's no longer loopback-only once enabled. When a repo roster
+  is detected in `.claude/agents/` or `.codex/agents/`, its folder and agent
+  **names** (short kebab-case identifiers, at most 16, ≤64 chars each) also
+  appear in the gate DM so you can choose that roster. Directory existence
+  alone sends no roster; agent **descriptions** and full roster JSON are never
+  sent. See [folder selection](./repo-agents.md#which-folder-is-read).
 - **Question content also leaves the box, on the same terms as the plan.**
   When an agent asks you something, the question text (and any suggested
   answers) is posted into your run thread, with the same credential-pattern
