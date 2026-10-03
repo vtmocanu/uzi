@@ -6,11 +6,13 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -23,6 +25,7 @@ type planCrossCheckRequest struct {
 type crossCheckVerdictRequest struct {
 	ClaimGeneration *int64 `json:"claim_generation"`
 	Verdict         string `json:"verdict"`
+	ReasonClass     string `json:"reason_class"`
 	Summary         string `json:"summary"`
 	Items           []struct {
 		File      string `json:"file"`
@@ -77,8 +80,13 @@ func (h *Handler) WorkerSubmitPlanCrossCheck(w http.ResponseWriter, r *http.Requ
 		crossCheckError(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"round": cc.Round, "checker_run_id": uuid.UUID(cc.CheckerRunID.Bytes).String(),
-		"candidate_digest": hex.EncodeToString(cc.CandidateDigest), "deadline_at": cc.DeadlineAt.Time})
+	cc, seq, err := h.wsvc.PlanCrossCheckStatus(r.Context(), worker, id, *req.ClaimGeneration, cc.Round)
+	if err != nil {
+		crossCheckError(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, crossCheckResponse(cc, seq))
+
 }
 
 func (h *Handler) WorkerPlanCrossCheckStatus(w http.ResponseWriter, r *http.Request) {
@@ -98,13 +106,16 @@ func (h *Handler) WorkerPlanCrossCheckStatus(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	cc, leadLastSeq, err := h.wsvc.PlanCrossCheckStatus(r.Context(), worker, id, gen, int32(round))
+	if errors.Is(err, workersvc.ErrCrossCheckNoRow) {
+		httpx.JSON(w, http.StatusOK, planCrossCheckNoRowResponse{Result: "no_row", ReasonClass: "no_candidate", LeadLastSeq: leadLastSeq})
+		return
+	}
 	if err != nil {
 		crossCheckError(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"round": cc.Round, "verdict": cc.Verdict,
-		"reason_class": cc.ReasonClass.String, "findings": json.RawMessage(cc.Findings), "deadline_at": cc.DeadlineAt.Time,
-		"lead_last_seq": leadLastSeq})
+	httpx.JSON(w, http.StatusOK, crossCheckResponse(cc, leadLastSeq))
+
 }
 
 func (h *Handler) WorkerCrossCheckVerdict(w http.ResponseWriter, r *http.Request) {
@@ -123,26 +134,58 @@ func (h *Handler) WorkerCrossCheckVerdict(w http.ResponseWriter, r *http.Request
 		httpx.Error(w, http.StatusBadRequest, "invalid cross-check verdict")
 		return
 	}
-	items := make([]map[string]string, 0, len(req.Items))
-	for _, item := range req.Items {
-		if len(item.File)+len(item.Severity)+len(item.Summary)+len(item.Rationale) > 2*1024 ||
-			(item.Severity != "info" && item.Severity != "warning" && item.Severity != "error") {
-			httpx.Error(w, http.StatusBadRequest, "invalid cross-check item")
-			return
-		}
-		items = append(items, map[string]string{"file": scrubThenBoundSelfReported(item.File, 512),
-			"severity": item.Severity, "summary": scrubThenBoundMarkdown(item.Summary, 1024),
-			"rationale": scrubThenBoundMarkdown(item.Rationale, 2048)})
-	}
-	findings, err := json.Marshal(map[string]any{"summary": scrubThenBoundMarkdown(req.Summary, 4*1024), "items": items})
-	if err != nil || len(findings) > 32*1024 {
-		httpx.Error(w, http.StatusBadRequest, "findings exceed limit")
+	raw, err := json.Marshal(map[string]any{"summary": req.Summary, "items": req.Items})
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid cross-check findings")
 		return
 	}
-	_, err = h.wsvc.DecidePlanCrossCheck(r.Context(), worker, id, *req.ClaimGeneration, req.Verdict, req.Verdict, findings)
+	findings, err := workersvc.NormalizeCrossCheckFindings(req.Verdict, req.ReasonClass, raw)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid cross-check reason or findings")
+		return
+	}
+	_, err = h.wsvc.DecidePlanCrossCheck(r.Context(), worker, id, *req.ClaimGeneration, req.Verdict, req.ReasonClass, findings)
 	if err != nil {
 		crossCheckError(w, err)
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+type planCrossCheckNoRowResponse struct {
+	Result      string `json:"result"`
+	ReasonClass string `json:"reason_class"`
+	LeadLastSeq int32  `json:"lead_last_seq"`
+}
+
+type planCrossCheckCandidateResponse struct {
+	Result              string                            `json:"result"`
+	Round               int32                             `json:"round"`
+	CheckerRunID        *string                           `json:"checker_run_id"`
+	CandidateDigest     string                            `json:"candidate_digest"`
+	CandidateGeneration int64                             `json:"candidate_generation"`
+	Candidate           workersvc.PlanCrossCheckCandidate `json:"candidate"`
+	Verdict             string                            `json:"verdict"`
+	ReasonClass         string                            `json:"reason_class"`
+	Findings            json.RawMessage                   `json:"findings"`
+	DeadlineAt          time.Time                         `json:"deadline_at"`
+	LeadLastSeq         int32                             `json:"lead_last_seq"`
+}
+
+// crossCheckResponse publishes the canonical stored candidate and server digest.
+func crossCheckResponse(cc store.CrossCheck, lastSeq int32) planCrossCheckCandidateResponse {
+	var childID *string
+	if cc.CheckerRunID.Valid {
+		value := uuid.UUID(cc.CheckerRunID.Bytes).String()
+		childID = &value
+	}
+	return planCrossCheckCandidateResponse{
+		Result: "candidate", Round: cc.Round, CheckerRunID: childID,
+		CandidateDigest: hex.EncodeToString(cc.CandidateDigest), CandidateGeneration: cc.LeadClaimGeneration,
+		Candidate: workersvc.PlanCrossCheckCandidate{PlanMd: cc.PlanMd.String, Milestones: json.RawMessage(cc.Milestones),
+			RequiredCapabilities: cc.RequiredCapabilities, RequiredTools: cc.RequiredTools, SizeClass: cc.SizeClass.String,
+			BaseCommit: cc.BaseCommit.String, PlanningDiff: cc.PlanningDiff.String},
+		Verdict: cc.Verdict, ReasonClass: cc.ReasonClass.String, Findings: json.RawMessage(cc.Findings),
+		DeadlineAt: cc.DeadlineAt.Time, LeadLastSeq: lastSeq,
+	}
 }

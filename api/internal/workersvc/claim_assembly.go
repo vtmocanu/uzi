@@ -608,10 +608,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		RequeueCount:   run.RequeueCount,
 		// PRD #1296 M1 (D2): the claim-lane counter the ClaimRun CTE just incremented, read
 		// straight off the returned run row and returned in the claim payload.
-		ClaimGeneration:        run.ClaimGeneration,
-		PlanMd:                 textPtr(run.PlanMd),
-		AutoApprove:            run.AutoApprove,
-		PlanCrossCheckRequired: run.PlanCrossCheckRequired,
+		ClaimGeneration:          run.ClaimGeneration,
+		PlanMd:                   textPtr(run.PlanMd),
+		AutoApprove:              run.AutoApprove,
+		PlanCrossCheckRequired:   run.PlanCrossCheckRequired,
+		PlanCrossCheckGateReason: textPtr(run.PlanCrossCheckGateReason),
 		// PRD #400 M2: task-run MR gate + source ref. open_mr is a plain bool (false
 		// for every non-task run); base_branch is pgtype.Text (nil for a run that has
 		// none). Both re-read from the row on every claim, like AutoApprove above.

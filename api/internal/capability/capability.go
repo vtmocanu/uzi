@@ -193,7 +193,7 @@ const IsolatedFetchV1 = "isolated_fetch_v1"
 // below, NEVER in `vocabulary`, `required_capabilities` or the web capability picker.
 const IsolatedJobV1 = "isolated_job_v1"
 
-// CrossCheckV1 identifies workers that honor the plan cross-check gate on lead claims.
+// CrossCheckV1 identifies workers that honor the plan gate on required leads and run cross-check children.
 const CrossCheckV1 = "cross_check_v1"
 
 // protocolVocabulary is the closed set of legal PROTOCOL capability names — kept

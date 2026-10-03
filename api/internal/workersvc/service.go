@@ -1341,8 +1341,9 @@ type Store interface {
 
 // Params are the runtime knobs the service needs, mirrored from config.
 type Params struct {
-	RunTimeout     time.Duration
-	RunIdleTimeout time.Duration
+	PlanCrossCheckTimeout time.Duration
+	RunTimeout            time.Duration
+	RunIdleTimeout        time.Duration
 	// WorkerTaskIdleTimeout (PRD #517 M5, WORKER_TASK_IDLE_TIMEOUT) is the interactive-task
 	// park's worker-side idle backstop. Mirrored from config and shipped in the claim (like
 	// RunIdleTimeout) so the worker's own park idle timer matches what the server configured
@@ -3517,11 +3518,13 @@ type StateRequest struct {
 	// byte-identical to before. The field MUST exist here because httpx.DecodeJSON sets
 	// DisallowUnknownFields — a fence-capable worker that sends it would 400 otherwise. A negative
 	// value is invalid (ErrInvalidState). Ignored on every non-terminal report.
-	MessagesThroughSeq *int64  `json:"messages_through_seq"`
-	CandidateDigest    string  `json:"candidate_digest,omitempty"`
-	PlanMd             *string `json:"plan_md"`
-	Branch             *string `json:"branch"`
-	MrIID              *int64  `json:"mr_iid"`
+	MessagesThroughSeq        *int64  `json:"messages_through_seq"`
+	CandidateDigest           string  `json:"candidate_digest,omitempty"`
+	PlanCrossCheckGateReason  *string `json:"plan_cross_check_gate_reason"`
+	PlanCrossCheckDiffRefusal string  `json:"plan_cross_check_diff_refusal"`
+	PlanMd                    *string `json:"plan_md"`
+	Branch                    *string `json:"branch"`
+	MrIID                     *int64  `json:"mr_iid"`
 	// Head is the EXACT source-branch tip H a `completed` report is being made against
 	// (PRD #1226 M2, D5). It is REQUIRED for an INTERLOCKED run's completion: SetState routes
 	// such a completion through completeRunWithPermitLease, which consumes the permit issued for
@@ -4239,8 +4242,20 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// as an absent-safe pgtype.Text, so an off-vocabulary or absent value is an invalid
 		// (SQL NULL) param the query's COALESCE keeps out of the column.
 		inferredCaps, inferredTools, sizeClass := inferredRequirementParams(req)
+		if owned.PlanCrossCheckRequired {
+			if req.ClaimGeneration == nil {
+				return owned, false, ErrClaimGenerationRequired
+			}
+			if err := s.validatePlanCrossCheckGateReason(ctx, q, wkr, owned, req); err != nil {
+				return owned, false, err
+			}
+		} else if req.PlanCrossCheckGateReason != nil || req.PlanCrossCheckDiffRefusal != "" {
+			return owned, false, ErrInvalidState
+		}
 		approvalParams := store.SetRunAwaitingApprovalParams{
-			PlanMd: stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+			PlanCrossCheckGateReason: pgconv.TextPtr(req.PlanCrossCheckGateReason),
+			ClaimGeneration:          pgconv.Int8Ptr(req.ClaimGeneration),
+			PlanMd:                   stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			// Issue #1626: an interlocked run's FIRST plan-bearing report with no milestones is the
 			// explicit `[]` (planMilestonesParam), so the approve freeze builds a criteria:[]
 			// contract. `owned` predates this report's plan_md write, which is what lets

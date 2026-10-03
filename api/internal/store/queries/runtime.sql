@@ -1597,6 +1597,7 @@ WHERE id = @id AND user_id = @user_id;
 -- Required cross-check runs additionally match the current published payload and
 -- an applied, bound approval for its current gate revision.
 UPDATE runs SET
+    plan_cross_check_gate_reason = NULL,
     status           = 'running',
     -- Stamped only on ENTRY to running. This statement is ALSO the running→running
     -- heartbeat (claim, post-checkout roster report, and every session-id/iteration
@@ -1978,6 +1979,29 @@ WHERE runs.id = @id AND worker_id = @worker_id
 
 -- name: SetRunAwaitingApproval :execrows
 UPDATE runs SET
+    plan_cross_check_gate_reason = CASE
+        WHEN NOT plan_cross_check_required THEN NULL
+        -- A human revision replaces the presented candidate. Its old findings
+        -- remain history; they are no longer the current gate's reason.
+        WHEN runs.plan_md IS NOT NULL AND (
+            runs.plan_md IS DISTINCT FROM @plan_md
+            OR runs.milestones_candidate IS DISTINCT FROM sqlc.narg('milestones_candidate')::jsonb
+            OR NOT (runs.required_capabilities @> (runs.required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
+                    AND runs.required_capabilities <@ (runs.required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}')))
+            OR runs.required_tools IS DISTINCT FROM COALESCE(sqlc.narg('inferred_tools')::text[], runs.required_tools)
+            OR runs.size_class IS DISTINCT FROM COALESCE(sqlc.narg('size_class'), runs.size_class))
+            THEN NULL
+        WHEN EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan'
+                     AND (cc.lead_claim_generation <> runs.claim_generation OR cc.reason_class = 'superseded'))
+            THEN 'interrupted'
+        WHEN EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan'
+                     AND cc.lead_claim_generation = runs.claim_generation AND cc.verdict <> 'pending')
+            THEN (SELECT CASE WHEN cc.verdict = 'approve' THEN NULL ELSE COALESCE(cc.reason_class, cc.verdict) END
+                  FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan' AND cc.round = 1)
+        WHEN NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan')
+            THEN COALESCE(sqlc.narg('plan_cross_check_gate_reason')::text,
+                CASE WHEN runs.plan_md IS NOT DISTINCT FROM @plan_md THEN plan_cross_check_gate_reason END)
+        ELSE 'interrupted' END,
     status     = 'awaiting_approval',
     status_since = now(),
     plan_md    = @plan_md,
@@ -2018,36 +2042,36 @@ UPDATE runs SET
     -- Invalidate a published gate when any approval-bearing value changes. Compare
     -- the effective values written below, so an exact retry retains its snapshot.
     gate_presentation_id = CASE WHEN plan_cross_check_required AND (
-        plan_md IS DISTINCT FROM @plan_md
+        runs.plan_md IS DISTINCT FROM @plan_md
         OR milestones_candidate IS DISTINCT FROM sqlc.narg('milestones_candidate')::jsonb
         OR NOT (
-            required_capabilities @> (required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
-            AND required_capabilities <@ (required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
+            runs.required_capabilities @> (runs.required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
+            AND runs.required_capabilities <@ (runs.required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
         )
-        OR required_tools IS DISTINCT FROM COALESCE(sqlc.narg('inferred_tools')::text[], required_tools)
-        OR size_class IS DISTINCT FROM COALESCE(sqlc.narg('size_class'), size_class)
+        OR runs.required_tools IS DISTINCT FROM COALESCE(sqlc.narg('inferred_tools')::text[], runs.required_tools)
+        OR runs.size_class IS DISTINCT FROM COALESCE(sqlc.narg('size_class'), runs.size_class)
     )
         THEN NULL ELSE gate_presentation_id END,
     gate_presented_payload = CASE WHEN plan_cross_check_required AND (
-        plan_md IS DISTINCT FROM @plan_md
+        runs.plan_md IS DISTINCT FROM @plan_md
         OR milestones_candidate IS DISTINCT FROM sqlc.narg('milestones_candidate')::jsonb
         OR NOT (
-            required_capabilities @> (required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
-            AND required_capabilities <@ (required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
+            runs.required_capabilities @> (runs.required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
+            AND runs.required_capabilities <@ (runs.required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
         )
-        OR required_tools IS DISTINCT FROM COALESCE(sqlc.narg('inferred_tools')::text[], required_tools)
-        OR size_class IS DISTINCT FROM COALESCE(sqlc.narg('size_class'), size_class)
+        OR runs.required_tools IS DISTINCT FROM COALESCE(sqlc.narg('inferred_tools')::text[], runs.required_tools)
+        OR runs.size_class IS DISTINCT FROM COALESCE(sqlc.narg('size_class'), runs.size_class)
     )
         THEN NULL ELSE gate_presented_payload END,
     gate_payload_digest = CASE WHEN plan_cross_check_required AND (
-        plan_md IS DISTINCT FROM @plan_md
+        runs.plan_md IS DISTINCT FROM @plan_md
         OR milestones_candidate IS DISTINCT FROM sqlc.narg('milestones_candidate')::jsonb
         OR NOT (
-            required_capabilities @> (required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
-            AND required_capabilities <@ (required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
+            runs.required_capabilities @> (runs.required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
+            AND runs.required_capabilities <@ (runs.required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))
         )
-        OR required_tools IS DISTINCT FROM COALESCE(sqlc.narg('inferred_tools')::text[], required_tools)
-        OR size_class IS DISTINCT FROM COALESCE(sqlc.narg('size_class'), size_class)
+        OR runs.required_tools IS DISTINCT FROM COALESCE(sqlc.narg('inferred_tools')::text[], runs.required_tools)
+        OR runs.size_class IS DISTINCT FROM COALESCE(sqlc.narg('size_class'), runs.size_class)
     )
         THEN NULL ELSE gate_payload_digest END,
     -- PRD #122 M1: the CANDIDATE milestone list this pre-approval report carries.
@@ -2083,11 +2107,11 @@ UPDATE runs SET
     -- deduped. The claim predicate uses the order-independent `<@` subset test, so the
     -- merged array is intentionally left unsorted.
     required_capabilities = ARRAY(SELECT DISTINCT unnest(
-        required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))),
+        runs.required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))),
     -- required_tools is SET, absent-safe: a present set REPLACES (it is the run's single
     -- authoritative inferred toolchain list, not merged with a prior source), and an
     -- absent (NULL) param COALESCEs back to the existing column, leaving it untouched.
-    required_tools = COALESCE(sqlc.narg('inferred_tools')::text[], required_tools),
+    required_tools = COALESCE(sqlc.narg('inferred_tools')::text[], runs.required_tools),
     -- PRD #212: the changed-file list the plan turn produced (git status --porcelain,
     -- run as the RUNNER uid). Absent-safe COALESCE like required_tools, but note the
     -- worker sends this on EVERY awaiting_approval round (empty {} when the plan turn
@@ -2098,7 +2122,7 @@ UPDATE runs SET
     -- REPLACES the column, and an absent (NULL) param COALESCEs back to the existing value,
     -- leaving it untouched. The service clamps to the {s,m,l} vocabulary before passing it,
     -- so a garbled worker report becomes a nil param (no change) rather than a bad value.
-    size_class = COALESCE(sqlc.narg('size_class'), size_class),
+    size_class = COALESCE(sqlc.narg('size_class'), runs.size_class),
     session_id = COALESCE(sqlc.narg('session_id'), session_id),
     -- 🔴 INVARIANT, carried by TWO call sites and by nothing else:
     -- NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND. The sibling clear is in
@@ -2135,7 +2159,9 @@ UPDATE runs SET
     -- this transition's fresh status_since; health_notified_at is preserved.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE id = @id AND worker_id = @worker_id
+WHERE runs.id = @id AND worker_id = @worker_id
+  AND (NOT plan_cross_check_required OR (claim_generation = sqlc.narg('claim_generation')::bigint
+       AND claim_released_at IS NULL))
   AND status NOT IN ('completed', 'failed', 'cancelled')
   -- Symmetric with SetRunRunning's guard (PRD #35): the negative predicate above
   -- admits limit_wait, and a re-delivered gate report must not un-park a run. Kept
@@ -3410,6 +3436,7 @@ WHERE id = @id AND worker_id = @worker_id
 -- stamped here (same statement as the status write) so a crash before the forge
 -- move still leaves the reconcile loop a marker to heal from.
 UPDATE runs SET
+    plan_cross_check_gate_reason = NULL,
     status             = 'completed',
     status_since       = now(),
     branch             = @branch,
@@ -3561,6 +3588,7 @@ WHERE id = @id AND worker_id = @worker_id;
 -- failed restores the origin column → move_pending_since stamped in the same
 -- statement (same-tx crash-window closure, as for completed).
 UPDATE runs SET
+    plan_cross_check_gate_reason = NULL,
     status             = 'failed',
     status_since       = now(),
     failure_reason     = @failure_reason,
@@ -3612,7 +3640,8 @@ WHERE id = @id AND worker_id = @worker_id
 -- worker already APPLIED still reports 1.
 WITH failed AS (
     UPDATE runs SET
-        status             = 'failed',
+        plan_cross_check_gate_reason = NULL,
+    status             = 'failed',
         status_since       = now(),
         failure_reason     = @failure_reason,
         -- PRD #69 M7a: the TRUSTED failure class, always set from Go (the worker-reported
@@ -3664,6 +3693,7 @@ SELECT count(*) FROM failed;
 -- the run was just claimed by this worker but cannot run. failed → origin
 -- restore, so it stamps move_pending_since like the other failed paths.
 UPDATE runs SET
+    plan_cross_check_gate_reason = NULL,
     status             = 'failed',
     status_since       = now(),
     failure_reason     = @failure_reason,
@@ -3693,7 +3723,8 @@ WHERE id = @id
 -- that will never come. cancelled restores the origin column → stamp. stop_kind is
 -- stamped 'cancelled' for uniformity (PRD #33 Decision 3), though isStoppedRun's
 -- status='cancelled' branch already treats this run as a deliberate stop.
-UPDATE runs SET status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     -- PRD #503 M3: persist the operator's OPTIONAL cancel reason. @stop_reason binds a
     -- nullable pgtype.Text: an invalid/zero value stores NULL (no reason supplied).
     stop_reason = @stop_reason,
@@ -3747,7 +3778,8 @@ SELECT EXISTS (
 -- first, this matches 0 rows (status NOT IN protects it); if this wins, the replay's no-op 409
 -- returns `cancelled`, the journal retires and completion side effects never fire. Field-for-field
 -- identical to CancelRunServerSide's terminal cleanup; only the WHERE differs.
-UPDATE runs SET status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     stop_reason = @stop_reason,
     milestones_in_progress = NULL,
     milestones_agents = NULL,
@@ -3803,6 +3835,7 @@ LIMIT 1;
 -- stop_kind is left untouched (already 'cancelled'). Terminal-run cleanup + guard mirror
 -- SetRunFailed exactly, so a report onto an already-terminal run is a 0-row no-op.
 UPDATE runs SET
+    plan_cross_check_gate_reason = NULL,
     status             = 'cancelled',
     status_since       = now(),
     fail_origin        = NULL,
@@ -6405,7 +6438,8 @@ SELECT COALESCE((SELECT budget_extension_seconds FROM extended), 0)::int AS budg
 WITH stopped AS (
     -- Outer refs qualified `runs.` for the shared-scope reason above (sibling run_user_inputs CTEs).
     UPDATE runs SET
-        scope_ceiling = sqlc.arg('scope_ceiling')::int,
+        plan_cross_check_gate_reason = NULL,
+    scope_ceiling = sqlc.arg('scope_ceiling')::int,
         budget_finalize_seconds = 1800,
         budget_paused_seconds = runs.budget_paused_seconds
             + GREATEST(0, (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds)
@@ -7324,7 +7358,7 @@ WHERE r.status = 'queued'
   -- original leading AND something to attach to.
   AND (
       TRUE
-  AND cardinality(r.required_capabilities) > 0
+  AND (cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check')
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
@@ -7338,20 +7372,16 @@ WHERE r.status = 'queued'
                     w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
                     @ephemeral_lease::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
-                 -- ...and only when the leased worker also meets the non-bypassable protocol clauses
-                 -- ClaimRun enforces, written as in CountOnlineWorkersClaimableForRun (a leased worker
-                 -- that cannot claim r must not read as a placement). The lane half is
-                 -- NOT w.isolated_lane: the lease only admits a run with no egress profile.
-                 AND NOT w.isolated_lane
-                 AND (r.completion_contract_version IS NULL
+                 -- The lease admits only runs outside the isolated lane.
+                 AND NOT w.isolated_lane))
+        -- Protocol requirements apply to persistent and leased workers alike.
+        AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
-      AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
-           OR 'cross_check_v1' = ANY(w.protocol_capabilities))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -7364,7 +7394,9 @@ WHERE r.status = 'queued'
                              false)
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
-                 )))
+                 )
+        AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
+             OR 'cross_check_v1' = ANY(w.protocol_capabilities))
         AND r.required_capabilities <@ (COALESCE(w.capabilities, '{}') || CASE WHEN COALESCE(w.docker_enabled, false) THEN ARRAY['docker'] ELSE ARRAY[]::text[] END)
   )
   -- The job arm: a job is placeable ONLY on an online, non-draining, non-ephemeral, NON-docker
@@ -7490,20 +7522,16 @@ WHERE r.status = 'queued'
                     w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
                     @ephemeral_lease::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
-                 -- ...and only when the leased worker also meets the non-bypassable protocol clauses
-                 -- ClaimRun enforces, written as in CountOnlineWorkersClaimableForRun (a leased worker
-                 -- that cannot claim r must not read as a placement). The lane half is
-                 -- NOT w.isolated_lane: the lease only admits a run with no egress profile.
-                 AND NOT w.isolated_lane
-                 AND (r.completion_contract_version IS NULL
+                 -- The lease admits only runs outside the isolated lane.
+                 AND NOT w.isolated_lane))
+        -- Protocol requirements apply to persistent and leased workers alike.
+        AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
-      AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
-           OR 'cross_check_v1' = ANY(w.protocol_capabilities))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -7516,7 +7544,9 @@ WHERE r.status = 'queued'
                              false)
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
-                 )))
+                 )
+        AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
+             OR 'cross_check_v1' = ANY(w.protocol_capabilities))
         AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
         -- PRD #1908 (D-A): for a 'job' the capable set is the job-runner set (non-docker AND
         -- 'job_runner_v1'), ClaimRun's non-bypassable clause; the same arm sits in the free-slot test.
@@ -7537,20 +7567,16 @@ WHERE r.status = 'queued'
                     w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
                     @ephemeral_lease::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
-                 -- ...and only when the leased worker also meets the non-bypassable protocol clauses
-                 -- ClaimRun enforces, written as in CountOnlineWorkersClaimableForRun (a leased worker
-                 -- that cannot claim r must not read as a placement). The lane half is
-                 -- NOT w.isolated_lane: the lease only admits a run with no egress profile.
-                 AND NOT w.isolated_lane
-                 AND (r.completion_contract_version IS NULL
+                 -- The lease admits only runs outside the isolated lane.
+                 AND NOT w.isolated_lane))
+        -- Protocol requirements apply to persistent and leased workers alike.
+        AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
-      AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
-           OR 'cross_check_v1' = ANY(w.protocol_capabilities))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -7563,7 +7589,9 @@ WHERE r.status = 'queued'
                              false)
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
-                 )))
+                 )
+        AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
+             OR 'cross_check_v1' = ANY(w.protocol_capabilities))
         AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
         AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
                                  AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
@@ -8103,7 +8131,7 @@ INSERT INTO runs (id, user_id, repo_id, kind, target_run_id, harness, priority,
                   report_only, budget_wall_seconds, dispatched_at, auto_approve,
                   issue_title, issue_description, required_capabilities, trigger_source)
 SELECT @child_id, lead.user_id, lead.repo_id, 'cross_check', lead.id, 'codex', 2,
-       true, 1800, now(), true, lead.issue_title, lead.issue_description,
+       true, @budget_wall_seconds::int, now(), true, lead.issue_title, lead.issue_description,
        COALESCE(repo.required_capabilities, '{}'), 'cross_check'
 FROM runs lead JOIN repos repo ON repo.id = lead.repo_id
 WHERE lead.id = @lead_run_id AND lead.user_id = @user_id
@@ -8119,14 +8147,14 @@ INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation,
 VALUES (@lead_run_id, 'plan', 1, @lead_claim_generation,
     @plan_md, @milestones::jsonb, @required_capabilities::text[], @required_tools::text[],
     @size_class, @base_commit, @planning_diff, @candidate_digest, @checker_run_id,
-    'codex', now() + interval '30 minutes')
+    'codex', @deadline_at::timestamptz)
 RETURNING *;
 
 -- name: GetOwnedPlanCrossCheck :one
 SELECT cc.* FROM cross_checks cc JOIN runs lead ON lead.id = cc.lead_run_id
 WHERE lead.id = @lead_run_id AND lead.worker_id = @worker_id
   AND lead.claim_generation = @claim_generation AND lead.status IN ('claimed', 'running')
-  AND lead.claim_released_at IS NULL AND cc.lead_claim_generation = lead.claim_generation
+  AND lead.claim_released_at IS NULL
   AND cc.stage = 'plan' AND cc.round = @round;
 
 -- name: LockPlanCrossCheckLeadForVerdict :one

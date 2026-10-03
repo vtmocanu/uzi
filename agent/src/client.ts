@@ -22,7 +22,7 @@ import {
   type PublishResponse,
   type PublishResult,
   type ChatClaimResponse,
-  type ClaimResponse,
+  type ClaimResponse as ProtocolClaimResponse,
   type CreateProposalRequest,
   type JobResultRequest,
   type CompletionAttemptRequest,
@@ -45,8 +45,8 @@ import {
   type RunOrphanClassificationResponse,
   type MessageGapsResponse,
   type WorkerProposal,
-  type WorkerRunDetail,
-  type WorkerRunListItem,
+  type WorkerRunDetail as ProtocolWorkerRunDetail,
+  type WorkerRunListItem as ProtocolWorkerRunListItem,
   type WorkerRunMessage,
   type JudgeTraceResponse,
   type ReviewRequest,
@@ -79,6 +79,39 @@ import {
   type RecoverySettleRequest,
   type RecoverySettleResponse,
 } from "./protocol.js";
+
+export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model_error" | "model_timeout"
+  | "checker_unavailable" | "confinement_failed" | "timed_out" | "superseded"
+  | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted";
+export type ClaimResponse = ProtocolClaimResponse & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
+export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
+export type WorkerRunListItem = ProtocolWorkerRunListItem & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
+export type PlanCrossCheckDiffRefusal = "base_unavailable" | "diff_failed" | "diff_too_large"
+  | "too_many_untracked" | "secret_detected" | "scan_failed";
+export interface PlanCrossCheckCandidate {
+  plan_md: string;
+  milestones: unknown[];
+  required_capabilities: string[];
+  required_tools: string[];
+  size_class: "s" | "m" | "l";
+  base_commit: string;
+  planning_diff: string;
+}
+export interface PlanCrossCheckFindings {
+  summary: string;
+  items: { file: string; severity: "info" | "warning" | "error"; summary: string; rationale: string }[];
+}
+export type PlanCrossCheckResponse =
+  | { result: "no_row"; reason_class: "no_candidate"; lead_last_seq: number }
+  | { result: "candidate"; round: number; checker_run_id: string | null; candidate_digest: string;
+      candidate_generation: number; candidate: PlanCrossCheckCandidate;
+      verdict: "pending" | "approve" | "revise" | "block" | "failed";
+      reason_class: "" | "approve" | PlanCrossCheckGateReason;
+      findings: PlanCrossCheckFindings | null; deadline_at: string; lead_last_seq: number };
+export type PlanCrossCheckStateRequest = StateRequest & {
+  plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null;
+  plan_cross_check_diff_refusal?: PlanCrossCheckDiffRefusal;
+};
 
 /** A job input file download hit its per-file timeout (WorkerClient#downloadJobFile), before or
  *  after the response headers. Distinct from a torn stream so the job reports a timeout. */
@@ -1127,7 +1160,25 @@ export class WorkerClient {
    * so parsing a 409's status back out of the error text would work in tests and
    * fail on real runs.
    */
-  async reportState(runId: string, body: StateRequest, signal?: AbortSignal): Promise<StateAck> {
+  async submitPlanCrossCheck(runId: string, claimGeneration: number, candidate: PlanCrossCheckCandidate): Promise<PlanCrossCheckResponse> {
+    return await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
+      { stage: "plan", claim_generation: claimGeneration, ...candidate }) as PlanCrossCheckResponse;
+  }
+
+  async planCrossCheckStatus(runId: string, claimGeneration: number, round = 1): Promise<PlanCrossCheckResponse> {
+    return await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks/plan/${round}?claim_generation=${claimGeneration}`) as PlanCrossCheckResponse;
+  }
+
+  async reportCrossCheckVerdict(runId: string, claimGeneration: number, result:
+    ({ verdict: "approve"; reason_class: "approve" } | { verdict: "revise"; reason_class: "revise" }
+      | { verdict: "block"; reason_class: "block" } | { verdict: "failed";
+          reason_class: "malformed" | "model_error" | "model_timeout" | "checker_unavailable" | "confinement_failed" })
+    & PlanCrossCheckFindings): Promise<void> {
+    await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-check-verdict`,
+      { claim_generation: claimGeneration, ...result });
+  }
+
+  async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
     // PRD #1247 fix round (E): /state carries claim_generation on EVERY mutating report (M5b's
     // reportState closure stamps it), but /state DisallowUnknownFields-decodes, so a rolled-back api
@@ -1159,7 +1210,7 @@ export class WorkerClient {
    *  handling, 200/409 single-body ACK parse, already-terminal handling and logging. Split out of
    *  reportState (PRD #1247 fix round E) so the claim_generation send-gate + strict-decode
    *  strip-and-retry can drive it through withGenerationFallback, exactly as postMessages. */
-  private async reportStateOnce(runId: string, path: string, body: StateRequest, signal?: AbortSignal): Promise<StateAck> {
+  private async reportStateOnce(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted();
       try {

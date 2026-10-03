@@ -50,10 +50,10 @@ func TestPlanCrossCheckProtocolLiveDB(t *testing.T) {
 	if _, err := svc.SubmitPlanCrossCheck(env.ctx, f.wkr, leadID, 1, changed); !errors.Is(err, ErrCrossCheckInterrupted) {
 		t.Fatalf("changed candidate resubmitted: %v", err)
 	}
-	// Usability is rechecked even for a pending lost-ACK retry.
+	// Immutable same-generation retries precede current credential availability.
 	env.exec(`UPDATE user_secrets SET disabled_at=now(),enablement_rev=enablement_rev+1 WHERE id=$1`, f.aliasID)
-	if _, err := svc.SubmitPlanCrossCheck(env.ctx, f.wkr, leadID, 1, candidate); !errors.Is(err, ErrCrossCheckUnavailable) {
-		t.Fatalf("disabled checker accepted: %v", err)
+	if retry, err := svc.SubmitPlanCrossCheck(env.ctx, f.wkr, leadID, 1, candidate); err != nil || retry.ID != cc.ID {
+		t.Fatalf("disabled credential prevented immutable retry: %v", err)
 	}
 	env.exec(`UPDATE user_secrets SET disabled_at=NULL,enablement_rev=enablement_rev+1 WHERE id=$1`, f.aliasID)
 	env.exec(`UPDATE runs SET status='running',worker_id=$2,claim_generation=1 WHERE id=$1`, childID, f.workerID)
@@ -91,7 +91,7 @@ func TestPlanCrossCheckProtocolLiveDB(t *testing.T) {
 	if _, _, err := svc.PlanCrossCheckStatus(env.ctx, f.wkr, leadID, 2, 1); !errors.Is(err, ErrCrossCheckRefused) {
 		t.Fatalf("stale owner status accepted: %v", err)
 	}
-	if _, err := svc.SubmitPlanCrossCheck(env.ctx, f.wkr, leadID, 1, candidate); !errors.Is(err, ErrCrossCheckInterrupted) {
-		t.Fatalf("decided round resubmitted: %v", err)
+	if retry, err := svc.SubmitPlanCrossCheck(env.ctx, f.wkr, leadID, 1, candidate); err != nil || retry.ID != cc.ID || retry.Verdict != "approve" {
+		t.Fatalf("decided lost-ACK retry not reused: %v", err)
 	}
 }

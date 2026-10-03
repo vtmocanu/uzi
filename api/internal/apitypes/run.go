@@ -190,7 +190,8 @@ type RunDTO struct {
 	AutoApprove bool `json:"auto_approve"`
 	// PlanCrossCheckRequired is the run's snapshot of the owner's plan cross-check
 	// setting at creation. It remains true after the approval gate is decided.
-	PlanCrossCheckRequired bool `json:"plan_cross_check_required"`
+	PlanCrossCheckRequired   bool    `json:"plan_cross_check_required"`
+	PlanCrossCheckGateReason *string `json:"plan_cross_check_gate_reason"`
 	// TriggerSource records what/how/who started the run (issue #857): one of
 	// manual, autopilot, schedule, self_improve, ci_fix, mr_rework, chat, task,
 	// task_review, then_fix, judge, judge_rerun, resume, cross_check. Always set (NOT NULL column,

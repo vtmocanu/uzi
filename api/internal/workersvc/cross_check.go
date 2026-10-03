@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -19,6 +20,7 @@ import (
 
 var ErrCrossCheckRefused = errors.New("plan cross-check refused")
 var ErrCrossCheckInterrupted = fmt.Errorf("%w: interrupted", ErrCrossCheckRefused)
+var ErrCrossCheckNoRow = fmt.Errorf("%w: no candidate", ErrCrossCheckRefused)
 var ErrCrossCheckUnavailable = fmt.Errorf("%w: checker unavailable", ErrCrossCheckRefused)
 
 // PlanCrossCheckCandidate contains only the fields the checker approves. The caller
@@ -63,7 +65,7 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 	}
 	if len(candidate.PlanMd) == 0 || len(candidate.PlanMd) > 256*1024 || len(candidate.PlanningDiff) > 512*1024 ||
 		len(candidate.Milestones) > 256*1024 || len(candidate.BaseCommit) != 40 || strings.Trim(candidate.BaseCommit, "0123456789abcdefABCDEF") != "" ||
-		candidate.SizeClass == "" || len(candidate.RequiredCapabilities) > 64 || len(candidate.RequiredTools) > 64 {
+		(candidate.SizeClass != "s" && candidate.SizeClass != "m" && candidate.SizeClass != "l") || len(candidate.RequiredCapabilities) > 64 || len(candidate.RequiredTools) > 64 {
 		return store.CrossCheck{}, ErrCrossCheckRefused
 	}
 	var milestones []json.RawMessage
@@ -92,8 +94,50 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 		(lead.Status != "claimed" && lead.Status != "running") {
 		return store.CrossCheck{}, ErrCrossCheckRefused
 	}
-	// A retry is read under the lead lock in the creation closure below. This
-	// availability read is repeated inside createRunAtomic by the explicit resolver.
+	// Recover the immutable attempt before resolving checker credentials. A lost
+	// ACK does not authorize another round, even if the checker already decided.
+	if s.txBeginner == nil {
+		return store.CrossCheck{}, ErrCrossCheckRefused
+	}
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return store.CrossCheck{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	retryQ := store.New(tx)
+	locked, err := retryQ.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: leadID, WorkerID: pgconv.UUID(worker.ID)})
+	if err != nil || locked.UserID != worker.UserID || locked.ClaimGeneration != generation || locked.ClaimReleasedAt.Valid ||
+		locked.Harness != string(HarnessClaude) || !locked.PlanCrossCheckRequired || !locked.AutoApprove ||
+		(locked.Status != "claimed" && locked.Status != "running") {
+		return store.CrossCheck{}, ErrCrossCheckRefused
+	}
+	prior, err := retryQ.GetPlanCrossCheck(ctx, leadID)
+	if err == nil {
+		if prior.LeadClaimGeneration != generation || !bytes.Equal(prior.CandidateDigest, digest) {
+			return store.CrossCheck{}, ErrCrossCheckInterrupted
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return store.CrossCheck{}, err
+		}
+		return prior, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return store.CrossCheck{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.CrossCheck{}, err
+	}
+	timeout := s.p.PlanCrossCheckTimeout
+	if timeout == 0 {
+		timeout = 30 * time.Minute
+	}
+	if timeout <= 0 || timeout > 2*time.Hour || (s.p.RunTimeout > 0 && timeout >= s.p.RunTimeout) {
+		return store.CrossCheck{}, ErrCrossCheckRefused
+	}
+	// Creation rechecks the lead and attempt under lock after harness resolution.
+	if worker.IsolatedLane {
+		return store.CrossCheck{}, ErrCrossCheckUnavailable
+	}
 	childHarness := HarnessCodex
 	var existing store.CrossCheck
 	errRetry := errors.New("existing plan cross-check")
@@ -113,7 +157,7 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 		}
 		prior, e := txq.GetPlanCrossCheck(ctx, leadID)
 		if e == nil {
-			if prior.Verdict != "pending" || prior.LeadClaimGeneration != generation || !bytes.Equal(prior.CandidateDigest, digest) {
+			if prior.LeadClaimGeneration != generation || !bytes.Equal(prior.CandidateDigest, digest) {
 				return store.Run{}, ErrCrossCheckInterrupted
 			}
 			existing = prior
@@ -127,7 +171,7 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 		}
 		childID := uuid.New()
 		child, e := txq.CreatePlanCrossCheckChild(ctx, store.CreatePlanCrossCheckChildParams{
-			ChildID: childID, LeadRunID: leadID, UserID: lead.UserID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation,
+			ChildID: childID, LeadRunID: leadID, UserID: lead.UserID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation, BudgetWallSeconds: int32((timeout + time.Second - 1) / time.Second),
 		})
 		if e != nil {
 			return store.Run{}, e
@@ -137,7 +181,7 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 			Milestones: candidate.Milestones, RequiredCapabilities: candidate.RequiredCapabilities, RequiredTools: candidate.RequiredTools,
 			SizeClass: pgtype.Text{String: candidate.SizeClass, Valid: true}, BaseCommit: pgtype.Text{String: candidate.BaseCommit, Valid: true},
 			PlanningDiff: pgtype.Text{String: candidate.PlanningDiff, Valid: true}, CandidateDigest: digest,
-			CheckerRunID: pgconv.UUID(child.ID),
+			CheckerRunID: pgconv.UUID(child.ID), DeadlineAt: pgtype.Timestamptz{Time: s.now().Add(timeout), Valid: true},
 		})
 		if e != nil {
 			return store.Run{}, e
@@ -176,7 +220,7 @@ func (s *Service) PlanCrossCheckStatus(ctx context.Context, worker store.Worker,
 	if err != nil {
 		return store.CrossCheck{}, 0, err
 	}
-	if lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid ||
+	if lead.UserID != worker.UserID || !lead.PlanCrossCheckRequired || lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid ||
 		(lead.Status != "claimed" && lead.Status != "running") {
 		return store.CrossCheck{}, 0, ErrCrossCheckRefused
 	}
@@ -190,10 +234,15 @@ func (s *Service) PlanCrossCheckStatus(ctx context.Context, worker store.Worker,
 		LeadRunID: leadID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation, Round: round,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return cc, 0, ErrCrossCheckInterrupted
+		return cc, lead.LastSeq, ErrCrossCheckNoRow
 	}
 	if err != nil {
 		return cc, 0, err
+	}
+	if cc.LeadClaimGeneration != generation {
+		// This response is historical human presentation, never an approval.
+		cc.Verdict = "failed"
+		cc.ReasonClass = pgtype.Text{String: "interrupted", Valid: true}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return cc, 0, err
@@ -202,8 +251,10 @@ func (s *Service) PlanCrossCheckStatus(ctx context.Context, worker store.Worker,
 }
 
 func (s *Service) DecidePlanCrossCheck(ctx context.Context, worker store.Worker, childID uuid.UUID, generation int64, verdict, reason string, findings []byte) (store.CrossCheck, error) {
-	if verdict != "approve" && verdict != "revise" && verdict != "block" && verdict != "failed" {
-		return store.CrossCheck{}, ErrCrossCheckRefused
+	var err error
+	findings, err = NormalizeCrossCheckFindings(verdict, reason, findings)
+	if err != nil {
+		return store.CrossCheck{}, err
 	}
 	if s.txBeginner == nil {
 		return store.CrossCheck{}, ErrCrossCheckRefused
@@ -223,6 +274,9 @@ func (s *Service) DecidePlanCrossCheck(ctx context.Context, worker store.Worker,
 	if err != nil {
 		return store.CrossCheck{}, err
 	}
+	if lead.UserID != worker.UserID {
+		return store.CrossCheck{}, ErrCrossCheckRefused
+	}
 	cc, err := q.DecidePlanCrossCheck(ctx, store.DecidePlanCrossCheckParams{
 		Verdict: verdict, ReasonClass: pgtype.Text{String: reason, Valid: true}, Findings: findings,
 		ChildID: childID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation,
@@ -240,7 +294,7 @@ func (s *Service) DecidePlanCrossCheck(ctx context.Context, worker store.Worker,
 	if banked != 1 {
 		return cc, ErrCrossCheckRefused
 	}
-	payload, err := json.Marshal(map[string]any{"stage": "plan", "verdict": verdict, "reason_class": reason, "findings": json.RawMessage(findings), "checker_run_id": childID})
+	payload, err := json.Marshal(map[string]any{"stage": "plan", "verdict": verdict, "reason_class": reason, "findings": json.RawMessage(findings), "checker_run_id": childID, "findings_author": "model"})
 	if err != nil {
 		return cc, err
 	}
