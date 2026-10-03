@@ -278,7 +278,7 @@ describe("recovery capture retry and restart safety (#1197)", () => {
     let removals = 0;
     git.retireRunnerClone = async (bareArg, clone, branchArg, runIdArg, opts) => {
       if (++removals === 1) { cleanupReached.resolve(); await releaseCleanup.promise; }
-      await originalRetire(bareArg, clone, branchArg, runIdArg, opts);
+      return originalRetire(bareArg, clone, branchArg, runIdArg, opts);
     };
     const pages: Array<{ after: number; count: number }> = [];
     client.getChatRunMessages = async (runId, after = 0, limit = 200) => {

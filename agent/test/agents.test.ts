@@ -857,6 +857,10 @@ describe("uzi runtime facts reach every subagent through the append (PRD #1849)"
   const UZI_RUNTIME_PHRASES = [
     "mktemp .uzi/scratch/gate-log.XXXXXX",
     "mktemp -d .uzi/scratch/snap.XXXXXX",
+    // Issue #2013: an assigned export slot keeps the build-cache path stable across waves.
+    "snap=.uzi/scratch/snap-<slot>",
+    "this replaces any `mktemp -d` snapshot recipe in your role guidance",
+    "extract in one chain, so a failed cleanup never",
     "set -o pipefail",
     "scratch=.uzi/scratch",
     "does not permit\na detached checkout",

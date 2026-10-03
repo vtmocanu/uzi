@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
+import type { UsageSink } from "./usage-recorder.js";
 import type { RunCacheDropResult } from "./run-caches.js";
 import type { BoundarySink, CodexExecutionSafety, HarnessError } from "./harness.js";
 import type {
@@ -172,6 +173,10 @@ export interface RunContext {
   interactive?: boolean;
   /** Append a message to the run's live stream. */
   emit(msg: EmittedMessage): void;
+  /** Issue #2014 (ADR-2014): where the Claude run lane records per-message usage, drained by the
+   *  run's MessageBatcher at every flush/close. Absent (tests, the stub, Codex) ⇒ nothing recorded
+   *  and no usage stamps on the init/result frames. */
+  usage?: UsageSink;
   /** Issue #1583: the run's claim-secret TextRedactor, the same secret set the batcher's payload
    *  redactor is built from. The Codex executor applies it to projected tool text BEFORE bounding,
    *  so a claim secret straddling the cut cannot leave an unredacted prefix. Absent ⇒ identity. */

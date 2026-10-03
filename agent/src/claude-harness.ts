@@ -51,6 +51,7 @@ import {
   type RateLimitObservation,
 } from "./limit.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
+import type { UsageLeg, UsageSink } from "./usage-recorder.js";
 import { ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import { parsePluginErrors } from "./plugin-errors.js";
 import type {
@@ -181,7 +182,11 @@ function buildSdkOptions(config: ClaudeTurnConfig): SdkOptions {
     allowDangerouslySkipPermissions: true,
     disallowedTools: [...ASYNC_DEFERRAL_TOOLS],
     hooks: { PreToolUse: config.preToolUse },
-    includePartialMessages: false,
+    // issue #2014 (ADR-2014 D1/D2): the run lane asks for stream_event frames so each message's
+    // FINAL usage (message_delta) and any message that never arrives as an assistant frame reach the
+    // usage recorder. decode drops them from the event stream, so liveness, session latches and
+    // projection never see them. Every other lane keeps this false.
+    includePartialMessages: true,
   };
   if (config.model) options.model = config.model;
   if (config.effort) options.effort = config.effort;
@@ -240,7 +245,15 @@ export class ClaudeHarness implements RunHarness {
     get: () => this.ctxPending ?? Promise.resolve(undefined),
   };
 
+  /** issue #2014: where each leg's per-message usage is recorded; set by the owner per run
+   *  (RunContext.usage). Absent ⇒ nothing recorded and no usage stamps on init/result frames. */
+  private usageSink: UsageSink | undefined;
+
   constructor(private readonly deps: ClaudeHarnessDeps) {}
+
+  setUsageSink(sink: UsageSink | undefined): void {
+    this.usageSink = sink;
+  }
 
   async inspectSession(id: string): Promise<SessionPresence> {
     const resolvable = await sessionTranscriptResolvable(
@@ -285,6 +298,13 @@ export class ClaudeHarness implements RunHarness {
     else request.signal.addEventListener("abort", onOwnerAbort, { once: true });
 
     const turnOptions: SdkOptions = { ...base, abortController: sdkAbort };
+    // issue #2014 (D1): the CLI never forwards a subagent's stream_events (its partial-message
+    // emitter pins parent_tool_use_id to null and its nested-progress path takes only assistant and
+    // user frames), so a text-only or thinking-only subagent message is visible ONLY as a forwarded
+    // assistant frame. With a usage sink the turn asks for them; decode records their usage, then
+    // strips the text/thinking items so the projected transcript is what it was without the flag.
+    // Without a sink nothing records usage, so the option stays off and nothing changes.
+    if (this.usageSink) turnOptions.forwardSubagentText = true;
     if (request.resumeSessionId) turnOptions.resume = request.resumeSessionId;
     else delete turnOptions.resume;
     // issue #1562: record the requested resume id for this turn so decode's init
@@ -310,8 +330,12 @@ export class ClaudeHarness implements RunHarness {
 
     let queryInstance: SdkQueryInstance | undefined;
     const deps = this.deps;
-    const decode = (msg: unknown, latest: RateLimitObservation | undefined): HarnessEvent =>
-      this.decode(msg, latest);
+    const sink = this.usageSink;
+    const decode = (
+      msg: unknown,
+      latest: RateLimitObservation | undefined,
+      leg: UsageLeg | undefined,
+    ): HarnessEvent | undefined => this.decode(msg, latest, leg);
     const setReader = (qi: SdkQueryInstance): void => {
       this.ctxReader = () => readLeadContext(qi, deps.contextUsageTimeoutMs);
     };
@@ -326,15 +350,20 @@ export class ClaudeHarness implements RunHarness {
       });
       setReader(queryInstance);
       const rateLimits = new RateLimitObserver();
+      // issue #2014: one usage leg per query(); its close marker is enqueued in the finally below.
+      const leg = sink?.startLeg();
       try {
         for await (const msg of queryInstance) {
           // Feed the observer before decode: a rate_limit_event maps to an activity
           // event, so any later placement would never see one (as today).
           rateLimits.observe(msg);
-          yield decode(msg, rateLimits.latest);
+          const event = decode(msg, rateLimits.latest, leg);
+          // A stream_event (partial message) is consumed by the usage recorder and never yielded.
+          if (event !== undefined) yield event;
         }
       } finally {
         request.signal.removeEventListener("abort", onOwnerAbort);
+        leg?.close();
       }
     }
 
@@ -352,27 +381,45 @@ export class ClaudeHarness implements RunHarness {
   }
 
   /** Decode one raw SDK frame into exactly one neutral event (every input is
-   *  liveness). IDs / the orphan detector run on every frame, including ignored
-   *  kinds. Throws nothing. */
+   *  liveness), except a `stream_event` partial message: that goes to the usage leg
+   *  and yields NO event (issue #2014), so it is never liveness, never a session id
+   *  source, never an orphan-instance candidate and never projected. IDs / the orphan
+   *  detector run on every other frame, including ignored kinds. Throws nothing. */
   private decode(
     msg: unknown,
     latest: RateLimitObservation | undefined,
-  ): HarnessEvent {
+    leg: UsageLeg | undefined,
+  ): HarnessEvent | undefined {
+    const rec = asRecord(msg);
+    if (rec?.["type"] === "stream_event") {
+      leg?.observeStream(rec);
+      return undefined;
+    }
     const sessionId = sessionIdOf(msg);
     const orphanInstanceFrameKind = orphanInstanceKind(msg);
-    const rec = asRecord(msg);
     if (!rec) return { kind: "activity", sessionId, orphanInstanceFrameKind };
 
     const type = rec["type"];
     if (type === "assistant") {
-      const items = decodeAssistantItems(rec);
+      // issue #2014: record the per-call usage BEFORE projection and signal filtering, so a
+      // text-only, thinking-only, signal-only or subagent message is counted too.
+      leg?.observeAssistant(rec);
+      const subagent = isSubagentFrame(rec);
+      let items = decodeAssistantItems(rec);
+      if (subagent && leg) {
+        // forwardSubagentText only ever ADDS subagent text/thinking blocks: strip them, and drop a
+        // frame left with nothing, so a subagent frame the CLI would not have sent before (no
+        // liveness, no latch, no persisted row) stays invisible. The usage was recorded above.
+        items = items.filter((i) => i.kind === "tool");
+        if (items.length === 0) return undefined;
+      }
       // The adapter marks recognized signal tool_uses so the reducer can drop them
       // from persisted output (group-before-filter); results are never marked.
       markSignals(items);
       const usageObj = assistantUsageOf(msg);
       return {
         kind: "frame",
-        origin: isSubagentFrame(rec) ? { kind: "subagent" } : { kind: "main" },
+        origin: subagent ? { kind: "subagent" } : { kind: "main" },
         attribution: decodeAttribution(rec),
         items,
         usage:
@@ -389,11 +436,16 @@ export class ClaudeHarness implements RunHarness {
       };
     }
     if (type === "user") {
+      const subagent = isSubagentFrame(rec);
+      const items = decodeUserItems(rec);
+      // A forwarded subagent user frame with no tool_result (its prompt text) never existed before
+      // issue #2014's forwardSubagentText: drop it, as above.
+      if (subagent && leg && items.length === 0) return undefined;
       return {
         kind: "frame",
-        origin: isSubagentFrame(rec) ? { kind: "subagent" } : { kind: "main" },
+        origin: subagent ? { kind: "subagent" } : { kind: "main" },
         attribution: decodeAttribution(rec),
-        items: decodeUserItems(rec),
+        items,
         // Non-assistant frames carry no signals (scanSignals returns {}).
         signals: scanSignals(msg) as Readonly<Partial<TurnSignals>>,
         sessionId,
@@ -404,6 +456,7 @@ export class ClaudeHarness implements RunHarness {
       return {
         kind: "turn_finished",
         terminal: buildTerminal(rec, latest),
+        ...(leg ? { usageStamp: { legId: leg.legId, usageThrough: leg.maxOrdinal } } : {}),
         sessionId,
         orphanInstanceFrameKind,
       };
@@ -429,6 +482,7 @@ export class ClaudeHarness implements RunHarness {
         model: asString(rec["model"]),
         freshSession,
         ...(pluginErrors !== undefined ? { pluginErrors } : {}),
+        ...(leg ? { legId: leg.legId } : {}),
         sessionId,
         orphanInstanceFrameKind,
       };

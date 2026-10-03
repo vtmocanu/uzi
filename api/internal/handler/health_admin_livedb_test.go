@@ -1,11 +1,16 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
+	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/healthsvc"
 )
 
 // TestAdminHealthAuthLiveDB proves the GET /api/admin/health mount (PRD #1484 M1) enforces
@@ -18,12 +23,30 @@ import (
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; ./e2e/run-store-it.sh
 // provides one and sweeps this package for the LiveDB suffix.
 func TestAdminHealthAuthLiveDB(t *testing.T) {
-	_, router, pool := cliLiveDB(t)
+	h, router, pool := cliLiveDB(t)
 
 	admin := cliSeedUser(t, pool, true)
 	nonAdmin := cliSeedUser(t, pool, false)
 	adminUza := cliMintToken(t, pool, admin, clitoken.ScopeAdminRO) // read-only admin
 	adminUzc := cliMintToken(t, pool, admin, clitoken.ScopeUser)    // admin owner, masked to non-admin
+
+	// Inject a real registry with a real enabled row, while preserving router auth.
+	now := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	id, conn := uuid.New(), uuid.New()
+	mustExecT(context.Background(), t, pool, `INSERT INTO forge_connections (id,user_id,forge_type,base_url,bot_username,bot_forge_user_id,token_ciphertext) VALUES ($1,$2,'gitlab','https://health.example','bot',1,$3)`, conn, admin, []byte{1})
+	mustExecT(context.Background(), t, pool, `INSERT INTO repos (id,connection_id,forge_project_id,path_with_namespace,web_url,enabled) VALUES ($1,$2,1,'g/health','https://health.example/g/health',true)`, id, conn)
+	registry := healthsvc.NewSyncRegistry(func() time.Time { return now })
+	ids, err := h.q.ListEnabledRepoIDs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, enabledID := range ids {
+		registry.Begin(enabledID)(true, forge.ErrorClassOther)
+	}
+	registry.Begin(id)(false, forge.ErrorClassTimeout)
+	now = now.Add(10 * time.Minute)
+	h.SetHealthService(healthsvc.New(healthsvc.Config{Store: h.q, Pool: pool, Settings: h.settings, Now: func() time.Time { return now }, ForgeSyncRegistry: registry, ForgeSyncInterval: time.Minute}))
+	h.now = func() time.Time { return now }
 
 	const path = "/api/admin/health"
 
@@ -54,10 +77,47 @@ func TestAdminHealthAuthLiveDB(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
 		t.Fatalf("decode health doc: %v (body %s)", err, rec.Body.String())
 	}
-	if len(doc.Checks) != 15 {
-		t.Fatalf("health doc carries %d checks, want the 15 checks (11 M1 + controller.report, loops, forge.ciwatch from M2 + fleet.rundisk from PRD #1809 M6)\nbody: %s", len(doc.Checks), rec.Body.String())
+	if len(doc.Checks) != 16 {
+		t.Fatalf("health doc carries %d checks, want the 16 checks (11 M1 + controller.report, loops, forge.ciwatch from M2 + forge.sync from M3 + fleet.rundisk from PRD #1809 M6)\nbody: %s", len(doc.Checks), rec.Body.String())
 	}
 	if doc.Status == "" {
 		t.Fatalf("health doc status is empty\nbody: %s", rec.Body.String())
 	}
+	foundSync := false
+	for _, c := range doc.Checks {
+		if c.ID == "forge.sync" {
+			foundSync = true
+			if c.Severity != "danger" {
+				t.Fatalf("forge.sync = %+v", c)
+			}
+		}
+	}
+	if !foundSync {
+		t.Fatal("missing forge.sync")
+	}
+	// Recovery remains cached inside the existing TTL, then appears after expiry.
+	registry.Begin(id)(true, forge.ErrorClassOther)
+	cached := bearerReq(router, http.MethodGet, path, adminUza)
+	if err := json.Unmarshal(cached.Body.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range doc.Checks {
+		if c.ID == "forge.sync" && c.Severity != "danger" {
+			t.Fatal("health cache changed within TTL")
+		}
+	}
+	now = now.Add(healthCacheTTL + time.Second)
+	recovered := bearerReq(router, http.MethodGet, path, adminUza)
+	if recovered.Code != http.StatusOK {
+		t.Fatal(recovered.Body.String())
+	}
+	if err := json.Unmarshal(recovered.Body.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range doc.Checks {
+		if c.ID == "forge.sync" && c.Severity != "ok" {
+			t.Fatalf("recovery: %+v", c)
+		}
+	}
+
 }

@@ -82,6 +82,10 @@ export function projectResult(f: {
   subtype: string;
   errors: readonly string[];
   usageBasis?: "session_cumulative";
+  /** issue #2014 (ADR-2014 D4): the usage leg and its highest ordinal when the result was decoded.
+   *  When set, `leg_id` and `usage_through` are APPENDED after `usage_basis` in BOTH branches; when
+   *  unset the payload is byte-identical to before. */
+  usageStamp?: { legId: string; usageThrough: number };
   wire: {
     usage: unknown;
     modelUsage: unknown;
@@ -105,6 +109,7 @@ export function projectResult(f: {
       },
     };
     if (f.usageBasis !== undefined) em.payload["usage_basis"] = f.usageBasis;
+    stampUsage(em, f.usageStamp);
     return em;
   }
   const em: EmittedMessage = {
@@ -122,7 +127,14 @@ export function projectResult(f: {
     },
   };
   if (f.usageBasis !== undefined) em.payload["usage_basis"] = f.usageBasis;
+  stampUsage(em, f.usageStamp);
   return em;
+}
+
+function stampUsage(em: EmittedMessage, stamp: { legId: string; usageThrough: number } | undefined): void {
+  if (stamp === undefined) return;
+  em.payload["leg_id"] = stamp.legId;
+  em.payload["usage_through"] = stamp.usageThrough;
 }
 
 /**
@@ -142,6 +154,9 @@ export function projectInit(
   model: string | undefined,
   freshSession?: boolean,
   pluginErrorCount?: number,
+  /** issue #2014 (ADR-2014 D4): the usage leg this init opens and the SDK session it runs; both
+   *  keys are appended when `legId` is set (`sdk_session_id` only when the session id is known). */
+  usageLeg?: { legId: string; sdkSessionId?: string },
 ): EmittedMessage {
   const em: EmittedMessage = {
     kind: "status",
@@ -151,6 +166,10 @@ export function projectInit(
   if (freshSession === true) em.payload["fresh_session"] = true;
   if (pluginErrorCount !== undefined && pluginErrorCount > 0) {
     em.payload["plugin_error_count"] = pluginErrorCount;
+  }
+  if (usageLeg !== undefined) {
+    em.payload["leg_id"] = usageLeg.legId;
+    if (usageLeg.sdkSessionId) em.payload["sdk_session_id"] = usageLeg.sdkSessionId;
   }
   return em;
 }

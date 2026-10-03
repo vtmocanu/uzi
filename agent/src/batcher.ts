@@ -6,6 +6,7 @@ import type { Outbox } from "./outbox.js";
 import type { OutgoingMessage } from "./protocol.js";
 import type { PayloadRedactor, TextRedactor } from "./redact.js";
 import { emptyCounts, countsTotal, sanitizePayload, sanitizeText } from "./sanitize.js";
+import { UsageRecorder } from "./usage-recorder.js";
 import { errMessage, sleep } from "./util.js";
 
 /**
@@ -307,6 +308,10 @@ export class MessageBatcher {
   /** Cancels the current post even when a timer, rather than close(), started it. */
   private inFlightAbort: AbortController | undefined;
 
+  /** Issue #2014: the run's usage-tail sender. Executors record into it (RunContext.usage); this
+   *  batcher is its single drain owner (flush and close). */
+  readonly usage: UsageRecorder;
+
   /** Scrubs known secrets from every payload before it leaves the worker. */
   private readonly redact: PayloadRedactor;
   /**
@@ -338,6 +343,7 @@ export class MessageBatcher {
     this.generation = opts.generation ?? 0;
     this.transientTripMs = opts.transientTripMs ?? TRANSIENT_TRIP_MS;
     this.spillBufferBytes = opts.spillBufferBytes ?? 2 * 1024 * 1024;
+    this.usage = new UsageRecorder({ client, runId, claimGeneration: this.generation, log });
   }
 
   emit(msg: EmittedMessage): void {
@@ -587,7 +593,7 @@ export class MessageBatcher {
     if (this.timer || this.closed) return;
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      void this.flush();
+      void this.flushMessages();
     }, this.nextDelayMs());
     // Don't keep the event loop alive just for a pending flush.
     this.timer.unref?.();
@@ -623,7 +629,19 @@ export class MessageBatcher {
     return this.buffer.splice(0, n);
   }
 
+  /**
+   * Issue #2014 (ADR-2014 D3): the usage-tail drain comes FIRST at every explicit flush and at close,
+   * so the usage of a leg lands before a claim-releasing state report that follows the flush. It
+   * waits at most USAGE_DRAIN_DEADLINE_MS (less when `signal`, the durability boundary, fires
+   * sooner), then abandons what is unsent and aborts the request; it never throws. The batch timer
+   * calls {@link flushMessages} directly: the recorder has its own debounce.
+   */
   async flush(signal?: AbortSignal): Promise<void> {
+    await this.usage.drain(undefined, signal);
+    await this.flushMessages(signal);
+  }
+
+  private async flushMessages(signal?: AbortSignal): Promise<void> {
     // A pending dropped-range is work in BOTH modes even with an empty buffer (PRD #1391
     // M2): SPILLED → doSpillFlush writes it durably; network → doFlush drains it as
     // bounded tombstone chunks.
@@ -1165,6 +1183,9 @@ export class MessageBatcher {
    * close cannot outlive the owning boundary on an independent HTTP timeout. */
   async close(signal?: AbortSignal): Promise<void> {
     this.closed = true;
+    await this.usage.drain(undefined, signal);
+    // Past close nothing can be retried: stop the recorder so a failing api cannot keep it retrying.
+    this.usage.release();
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = undefined;
@@ -1219,7 +1240,7 @@ export class MessageBatcher {
     while (failed < CLOSE_MAX_FAILED_ATTEMPTS && (this.buffer.length > 0 || this.pendingRangeFirst !== undefined)) {
       if (signal?.aborted) break;
       const before = this.buffer.length + this.pendingRangeWidth();
-      await this.flush(signal);
+      await this.flushMessages(signal);
       const remaining = this.buffer.length + this.pendingRangeWidth();
       if (remaining === 0) break;
       if (signal?.aborted) break;

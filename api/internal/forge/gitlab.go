@@ -76,6 +76,7 @@ func newGitLab(baseURL, token string, timeout time.Duration, backoff ...retryabl
 	// per-call timeout but REFUSES every redirect, so a cross-host 302 cannot replay
 	// the PAT header to the redirect target (mirrors the GitHub driver's logClient).
 	logClient := &http.Client{
+		Transport:     forgeTransport(),
 		Timeout:       hc.Timeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
@@ -99,8 +100,7 @@ func gitLabClientOptions(baseURL string, hc *http.Client, backoff ...retryableht
 
 // wrapErr adds op context and routes the error through the PAT redactor so no
 // error this driver surfaces can carry the token. A nil error passes through as
-// nil. (No rate-limit classification: the go-gitlab client handles 429/Retry-After
-// at the transport layer; see the client-construction comment.)
+// nil. Classification observes the final SDK error after transport retries.
 func (g *gitLab) wrapErr(op string, err error) error {
 	if err == nil {
 		return nil

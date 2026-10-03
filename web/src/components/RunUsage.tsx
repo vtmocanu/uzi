@@ -1,7 +1,9 @@
 import type { ReactNode } from "react";
 import type { AgentUsage, RunUsage } from "../lib/runUsage";
 import { cacheDisplayPct } from "../lib/runUsage";
-import type { CostStatus, Harness } from "../lib/api";
+import type { CostStatus, Harness, UsageTail } from "../lib/api";
+import { coverageReasonText, tailCostText, tailVisible } from "../lib/usageTail";
+import { stripUnsafeChars } from "../lib/safeText";
 import { costDisplay, costHeadline, costSubLabel, costCellText } from "../lib/costStatus";
 import { formatTokens } from "../lib/formatTokens";
 import { formatDuration } from "./RunEvent";
@@ -391,5 +393,76 @@ export function RunUsagePanel({
         </div>
       )}
     </div>
+  );
+}
+
+// Issue #2014 (ADR-2014): the ESTIMATED usage tail of an interrupted Claude session — model
+// calls no SDK result frame covered. Rendered as its own block, visibly apart from the
+// metered total above and never added to it. Hidden for the all-zero, complete tail every
+// normal finished run has. A null cost reads "cost unknown", never $0. Every worker-supplied
+// string (model ids, unknown coverage reasons) is untrusted text: React escapes it, and
+// stripUnsafeChars removes control/bidi characters that escaping does not touch.
+export function RunUsageTailBlock({ tail }: { tail: UsageTail | null | undefined }) {
+  if (!tailVisible(tail)) return null;
+  const fresh = tail.input_tokens;
+  const cached = tail.cache_read_tokens + tail.cache_creation_tokens;
+  const partial = tail.coverage !== "complete";
+  const version = stripUnsafeChars(tail.price_table_version);
+  return (
+    <section
+      aria-label="Estimated usage, not metered"
+      className="rounded-lg border border-dashed border-edge bg-raised/40 px-3.5 py-3"
+    >
+      <div className={K_CLASS}>Estimated, not metered</div>
+      <p className="mt-1 text-[11px] text-faint">
+        Usage after the last reported total of an interrupted session. It is not included in the metered total.
+      </p>
+      <div className="mt-2 flex flex-wrap items-baseline gap-x-6 gap-y-1 font-mono text-[13px] tabular-nums">
+        <span>
+          {formatTokens(fresh + cached)} in{" "}
+          <span className="text-[11px] text-muted">
+            ({formatTokens(fresh)} fresh, {formatTokens(cached)} cached)
+          </span>
+        </span>
+        <span>{formatTokens(tail.output_tokens)} out</span>
+        <span className="font-semibold">{tailCostText(tail.cost_usd, tail.cost_status)}</span>
+      </div>
+      {version && <div className="mt-1 text-[11px] text-muted">Price table {version}</div>}
+      {partial && (
+        <div className="mt-1.5 text-[11px] text-muted">
+          Partial coverage
+          {tail.coverage_reasons.length > 0 && (
+            <>
+              :{" "}
+              {tail.coverage_reasons.map((r, i) => (
+                <span key={`${i}-${r}`}>
+                  {i > 0 && "; "}
+                  {coverageReasonText(r)}
+                </span>
+              ))}
+            </>
+          )}
+          . Real usage may be higher.
+        </div>
+      )}
+      {tail.models.length > 0 && (
+        <ul aria-label="Estimated usage by model" className="mt-2 space-y-0.5 text-[11px] text-muted">
+          {tail.models.map((m, i) => {
+            const model = stripUnsafeChars(m.model);
+            return (
+              <li key={`${i}-${model}`} className="flex flex-wrap gap-x-3">
+                <span className="max-w-[220px] truncate font-mono text-fg" title={model}>
+                  {model}
+                </span>
+                <span className="font-mono tabular-nums">
+                  {formatTokens(m.input_tokens + m.cache_read_tokens + m.cache_creation_tokens)} in /{" "}
+                  {formatTokens(m.output_tokens)} out · {tailCostText(m.cost_usd, m.cost_status)}
+                </span>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
   );
 }

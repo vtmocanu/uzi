@@ -1,0 +1,60 @@
+{
+  "_comment": "Frozen seam for issue #2014 (ADR-2014): the worker->api route body, the leg stamps the worker puts on persisted init/result frames, and the run DTO field the api returns. The agent (m3) and the surfaces (m4) code against exactly these shapes. Change it only together with every consumer.",
+  "route": "POST /api/worker/runs/{id}/usage",
+  "request": {
+    "claim_generation": 3,
+    "legs": [
+      {"leg_id": "6f1d2a40-7c1e-4a0e-9f0b-1a2b3c4d5e01", "closed_through": 5, "dropped_records": 0},
+      {"leg_id": "6f1d2a40-7c1e-4a0e-9f0b-1a2b3c4d5e02"}
+    ],
+    "messages": [
+      {
+        "message_id": "msg_01ABC",
+        "leg_id": "6f1d2a40-7c1e-4a0e-9f0b-1a2b3c4d5e01",
+        "ordinal": 1,
+        "frame_session_id": "c0ffee00-0000-4000-8000-000000000001",
+        "model": "claude-sonnet-5-5",
+        "subagent": false,
+        "input_tokens": 120,
+        "cache_read_input_tokens": 4000,
+        "cache_creation_input_tokens": 300,
+        "cache_creation_5m_input_tokens": 200,
+        "cache_creation_1h_input_tokens": 100,
+        "output_tokens": 55,
+        "output_final": true,
+        "service_tier": "standard",
+        "speed": "standard",
+        "inference_geo": "global"
+      }
+    ]
+  },
+  "init_frame_payload": {
+    "event": "init",
+    "leg_id": "6f1d2a40-7c1e-4a0e-9f0b-1a2b3c4d5e01",
+    "sdk_session_id": "c0ffee00-0000-4000-8000-000000000001"
+  },
+  "result_frame_payload": {
+    "event": "result",
+    "usage_basis": "session_cumulative",
+    "leg_id": "6f1d2a40-7c1e-4a0e-9f0b-1a2b3c4d5e01",
+    "usage_through": 3,
+    "modelUsage": {"claude-sonnet-5-5": {"inputTokens": 120, "outputTokens": 55, "cacheReadInputTokens": 4000, "cacheCreationInputTokens": 300, "costUSD": 0.01}}
+  },
+  "response": {"success_status": 204, "stale_claim": {"status": 409, "body": {"disposition": "stale_claim"}}, "not_owned": {"status": 404, "body": {"error": "run not found for this worker", "reason": "stale"}}},
+  "dto": {
+    "usage_estimated_tail": {
+      "input_tokens": 120,
+      "cache_read_tokens": 4000,
+      "cache_creation_tokens": 300,
+      "output_tokens": 55,
+      "cost_usd": null,
+      "cost_status": "unpriced",
+      "price_table_version": "anthropic-standard-2026-10-03",
+      "coverage": "partial",
+      "coverage_reasons": ["leg_not_closed", "ordinal_gap"],
+      "models": [
+        {"model": "claude-sonnet-5-5", "input_tokens": 120, "cache_read_tokens": 4000, "cache_creation_tokens": 300, "output_tokens": 55, "cost_usd": null, "cost_status": "unpriced"}
+      ]
+    }
+  }
+}

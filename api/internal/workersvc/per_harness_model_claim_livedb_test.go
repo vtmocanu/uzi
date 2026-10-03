@@ -130,7 +130,7 @@ func (e interlockLiveDB) claimableForRun(t *testing.T, runID uuid.UUID) int64 {
 	if err != nil {
 		t.Fatalf("CountOnlineWorkersClaimableForRun: %v", err)
 	}
-	return n
+	return n.Claimable
 }
 
 // healthRowFor fetches the SQL-computed ListActiveRunsForHealth row for runID (the shared DB holds

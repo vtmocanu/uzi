@@ -76,7 +76,7 @@ import type {
   StateAck,
   StateRequest,
 } from "./protocol.js";
-import { resolveAgentSelection } from "./protocol.js";
+import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
 import { RecoveryCoordinator, isCodePublishingKind, type RecoveryRecord } from "./recovery.js";
@@ -130,6 +130,10 @@ import { selectCodexBinding } from "./codex/select.js";
 import { errMessage, RUN_ID_RE, sleep } from "./util.js";
 import {
   AttemptReleaseError,
+  emitOrphanDiagnostic,
+  type OrphanDiagnostics,
+  type OrphanStage,
+  type OrphanReason,
   CHECKPOINT_SCAN_TIMEOUT_MS,
   CapturePathMismatchError,
   CloneResidueBlockedError,
@@ -7327,63 +7331,105 @@ export class RunRunner {
     ownerRunId: string,
     original: Error,
   ): Promise<void> {
+    const diagnostics: OrphanDiagnostics = {
+      logger: this.log, claimantId: claim.run_id, ownerId: ownerRunId, repoId: claim.repo.id, pathShape: "unknown",
+    };
+    const refuse = (stage: OrphanStage, reason: OrphanReason, error?: unknown, status?: number): never => {
+      emitOrphanDiagnostic(diagnostics, journaledPath, "orphan_reclaim_refused", stage, reason, error, status);
+      throw original;
+    };
     let id: RunOrphanClassificationResponse;
     try {
       id = await this.client.getRunOrphanClassification(claim.run_id, ownerRunId);
-    } catch {
-      throw original; // 404 (owner not in this owner+repo scope) or any transport error
+    } catch (error) {
+      return refuse("classification", error instanceof RequestError ? "http" : "transport_unknown", undefined,
+        error instanceof RequestError ? error.status : undefined);
     }
-    if (!TERMINAL_RUN_STATUSES.has(id.status)) throw original;           // (a) terminal owner
-    if (id.repo_id !== claim.repo.id) throw original;                    // (b) same repo
+    try {
+      // Snapshot the classification inside the guard: malformed JSON and throwing
+      // accessors must preserve the original fixed refusal.
+      if (!id || typeof id !== "object" || Array.isArray(id)) throw new Error("malformed classification");
+      id = {
+        status: id.status, repo_id: id.repo_id, kind: id.kind,
+        issue_iid: id.issue_iid, branch: id.branch,
+        pipeline_id: id.pipeline_id, pipeline_ref: id.pipeline_ref,
+      };
+      if (typeof id.status !== "string" || typeof id.repo_id !== "string") throw new Error("malformed classification");
+    } catch {
+      return refuse("identity", "malformed_identity");
+    }
+    if (!TERMINAL_RUN_STATUSES.has(id.status)) refuse("classification", "nonterminal_owner"); // (a) terminal owner
+    if (id.repo_id !== claim.repo.id) refuse("classification", "repo_mismatch"); // (b) same repo
     // (c)+(d): the OWNER's own kind/identity must reproduce this branch and the journaled path.
     // mr_rework carries its branch in pipeline_ref (runs.branch is NULL) — mirror the server's
     // claim_assembly normalization. self_improve/prompt derive from the owner runId, so the
     // persisted branch is never the source (predicate (c) IS the equality check for them).
-    const ownerKind = resolveRunKind(id.kind);
-    const owner = deriveCloneKey({
-      kind: ownerKind,
-      runId: ownerRunId,
-      issueIid: id.issue_iid,
-      branch: ownerKind === "mr_rework" ? id.pipeline_ref : id.branch,
-      pipelineId: id.pipeline_id,
-      pipelineRef: id.pipeline_ref,
-      defaultBranch: claim.repo.default_branch,
-    });
-    if (!owner) throw original;                                          // malformed identity
-    if (owner.branch !== branch) throw original;                         // (c) owner-derived branch
+    let owner: ReturnType<typeof deriveCloneKey>;
+    try {
+      // The raw kind must already be a known kind: resolveRunKind defaults a missing one to "issue".
+      const rawKind: unknown = id.kind;
+      if (typeof rawKind !== "string" || !(RUN_KINDS as readonly string[]).includes(rawKind)) throw new Error("malformed owner kind");
+      const ownerKind = resolveRunKind(rawKind as RunKind);
+      owner = deriveCloneKey({
+        kind: ownerKind,
+        runId: ownerRunId,
+        issueIid: id.issue_iid,
+        branch: ownerKind === "mr_rework" ? id.pipeline_ref : id.branch,
+        pipelineId: id.pipeline_id,
+        pipelineRef: id.pipeline_ref,
+        defaultBranch: claim.repo.default_branch,
+      });
+    } catch {
+      return refuse("identity", "malformed_identity");
+    }
+    if (!owner) return refuse("identity", "malformed_identity");
+    if (owner.branch !== branch) refuse("branch", "branch_mismatch"); // (c) owner-derived branch
     // (d′) issue #1783 M2: the journaled path is the owner's canonical path, OR it parses as
     // `<that canonical>.attempt-<id>` AND the ledger records that attemptId for the owner. A
     // different key, a traversal or an unrecorded id fails closed with the path untouched.
     let shape: "canonical" | "attempt" | undefined;
     try {
       shape = await this.git.classifyOwnerClonePath(barePath, branch, owner.slug, ownerRunId, journaledPath);
-    } catch {
-      throw original;
+    } catch (error) {
+      return refuse("path", "path_error", error);
     }
-    if (!shape) throw original;                                           // (d′)
+    if (!shape) return refuse("path", "path_mismatch"); // (d′)
+    diagnostics.pathShape = shape;
     if (this.attemptPaths) {
       // The same predecessor-scoped capture-mode proof the C′ capture runs, and the same blocking
       // rule: survivors or unverified leave journal, ledger and path untouched.
-      const proof = await this.quiesceRun(flight, flight.executor, {
-        mode: "capture",
-        site: "orphan_reclaim",
-        targetPaths: [journaledPath],
-        clonePath: journaledPath,
-      });
-      if (proof.blocked) throw new RunResidueBlockedError(proof.outcome.process?.detail ?? "not quiescent");
+      let proof: { outcome: QuiesceRunOutcome; blocked: boolean };
+      try {
+        proof = await this.quiesceRun(flight, flight.executor, {
+          mode: "capture",
+          site: "orphan_reclaim",
+          targetPaths: [journaledPath],
+          clonePath: journaledPath,
+        });
+      } catch {
+        return refuse("quiescence", "quiescence_error");
+      }
+      if (proof.blocked) {
+        emitOrphanDiagnostic(diagnostics, journaledPath, "orphan_reclaim_refused", "quiescence", "quiescence_blocked");
+        throw new RunResidueBlockedError("orphan reclaim quiescence blocked");
+      }
     }
+    let disposition: "retained-in-place" | Awaited<ReturnType<GitCache["retireRunnerClone"]>>;
     try {
       if (this.attemptPaths && shape === "attempt") {
         // The foreign owner's work is retained IN PLACE (never moved) and was NOT captured, so it
         // may be the only copy: the ledger says `reclaimed`, which the retention sweep never counts
         // or deletes — the attempt-path twin of the foreign quarantine below (discard:false).
         await this.git.releaseAttemptInPlace(barePath, journaledPath, branch, ownerRunId, "reclaimed");
+        disposition = "retained-in-place";
       } else {
-        await this.git.retireRunnerClone(barePath, journaledPath, branch, ownerRunId, { discard: false });
+        disposition = await this.git.retireRunnerClone(barePath, journaledPath, branch, ownerRunId, { discard: false, orphanDiagnostics: diagnostics });
       }
-    } catch {
-      throw original; // journal moved under us / containment failure -> fail closed
+    } catch (error) {
+      return refuse(error instanceof AttemptReleaseError ? (error.stage === "ledger" ? "attempt_ledger" : "attempt_journal") : "retirement",
+        this.attemptPaths && shape === "attempt" ? "attempt_release_failure" : "canonical_retirement_failure", error);
     }
+    emitOrphanDiagnostic(diagnostics, journaledPath, "orphan_reclaim_succeeded", "complete", disposition);
   }
 
   /** issue #1783 M2: the attempt-seed options a Docker-wired worker hands the git layer (see
@@ -8724,6 +8770,8 @@ export class RunRunner {
       // floor. Absent (fresh branch) ⇒ no note.
       publishedTip: flight.publishedTip,
       emit: (m) => batcher.emit(m),
+      // Issue #2014: the run's usage-tail recorder; the batcher drains it first at every flush/close.
+      usage: batcher.usage,
       // Issue #1583: the claim-secret text redactor, for projections that bound text pre-batcher.
       redactText: flight.redactText,
       oauthToken: claim.secrets.anthropic_oauth_token,
@@ -12240,6 +12288,9 @@ export class RunRunner {
             // Nothing published: the field is omitted (the work is on this worker only).
             ...this.checkpointDurabilityField(capture.published ? true : undefined),
           };
+          // Issue #2014: the usage tail lands before the park report (flush drains the usage recorder
+          // first, bounded by USAGE_DRAIN_DEADLINE_MS); the batcher stays open for the park's feed lines.
+          await batcher.flush().catch(() => undefined);
           const ack = await reportState(parkBody);
           if (ack.status === "recovery_wait" && disk) {
             runLog.info("run parked mid-run for its data volume; its caches are dropped and it resumes automatically", {
@@ -13011,6 +13062,10 @@ export class RunRunner {
         },
       });
     }
+    // Issue #2014: the usage tail of the leg the wall just cut lands before the park report, like
+    // the limit-wait, pause and credential-switch parks (flush drains the usage recorder first,
+    // bounded by USAGE_DRAIN_DEADLINE_MS). The batcher stays OPEN: a refused park continues the run.
+    await batcher.flush().catch(() => undefined);
     // 6. Report the wall park. A thrown response gets one identical retry; an unresolved answer
     //    gets one ownership read before any finalize credential reconcile.
     const report = {

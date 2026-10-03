@@ -54,10 +54,16 @@ const RUN_SCRATCH_GUIDANCE = [
   "Never transfer scratch or use an alternate checkout. Do not delete it during active",
   "work or checkpoint capture. Git ignore helps ordinary staging; `git add -f` can",
   "override it, and publication refuses any history containing scratch content.",
-  "For each commit review, resolve the SHA, then `set -o pipefail`; use",
-  "`snap=$(mktemp -d .uzi/scratch/snap.XXXXXX)` and",
-  "`git archive \"$sha\" | tar -x -C \"$snap\"`. Check both archive and extraction",
-  "status, remove that snapshot after review, and create a new one for each review.",
+  "For each commit review, resolve the SHA, then `set -o pipefail`. If your dispatch",
+  "names an export slot (letters, digits, `_` and `-` only), use",
+  "`snap=.uzi/scratch/snap-<slot>` and extract in one chain, so a failed cleanup never",
+  "leaves stale files under a fresh extraction:",
+  "`rm -rf \"$snap\" && mkdir -p \"$snap\" && git archive \"$sha\" | tar -x -C \"$snap\"`;",
+  "this replaces any `mktemp -d` snapshot recipe in your role guidance. Use the slot only",
+  "during that dispatch and for one copy at a time. With no slot, or any other value, use",
+  "`snap=$(mktemp -d .uzi/scratch/snap.XXXXXX) && git archive \"$sha\" | tar -x -C \"$snap\"`.",
+  "Check the whole chain's status, remove that snapshot after review, and extract afresh",
+  "for each review.",
   "Remove only snapshots, logs and other artifacts you created: one another agent",
   "created or handed you may still be in use.",
   "Exports contain no Git metadata or installed dependencies. Git commands run inside an",
@@ -88,9 +94,24 @@ const WORKER_TOOLBOX_RULE = [
   "a bare `tsc` or `vitest` is usually not on PATH.",
 ].join("\n");
 
+/**
+ * Issue #2013: Go's build cache keys entries by package directory, so a fresh random
+ * export per review rebuilt the module each wave (measured 750 MB per new path vs 46 MB
+ * at a reused one). Lead-side half of the slot recipe in RUN_SCRATCH_GUIDANCE; in the
+ * runtime append so a customized lead template still carries it.
+ */
+const LEAD_EXPORT_SLOT_RULE = [
+  "When you dispatch read-only validators, name an export slot in each validator dispatch",
+  "(`export slot: reviewer-1`; letters, digits, `_` and `-` only). Give concurrent",
+  "validators distinct slots and give each validator the same slot in every later wave, so a",
+  "build cache keyed by source path reuses unchanged packages instead of rebuilding them.",
+  "Never reassign a slot until the dispatch that held it has returned.",
+].join("\n");
+
 export const LEAD_GUARDRAIL_APPEND = [
   "You are the lead agent for a software task in an isolated git worktree.",
   RUN_SCRATCH_GUIDANCE,
+  LEAD_EXPORT_SLOT_RULE,
   COMMAND_LIFETIME_RULE,
   WORKER_TOOLBOX_RULE,
   "Work only inside the checked-out worktree and make local commits on the",

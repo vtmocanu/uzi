@@ -78,6 +78,44 @@ An aggregate (Self usage, Admin usage) totals only the metered subset and
 discloses what it left out, e.g. "Cost excludes 2 Codex subscription runs
 and 1 unreported run".
 
+## Estimated tail of an interrupted session
+
+A Claude run's metered cost comes from the SDK's result frames. When a
+session is parked, stopped or crashes mid-turn, the model calls made after
+the last result frame are covered by no result, so the metered total
+silently leaves them out. uzi records those calls and shows them as an
+**estimated tail**, apart from the metered total: the run page's "Estimated,
+not metered" block and `uzi run get`'s EST. TAIL row (`uzi run get --json`
+carries it as `usage_estimated_tail`). The design is in
+`adr/2014-run-usage-estimated-tail.md`.
+
+- **It is an estimate, with provenance.** The dollar figure is priced from
+  Anthropic's official standard pricing page as fetched on 2026-10-03 and
+  recorded as a version id (`anthropic-standard-2026-10-03`), shown beside the
+  figure and rendered as "~$X.XX estimated" ("<$0.01 estimated" under half a
+  cent).
+- **Unpriced means unknown, never $0.** A model the table does not know, a
+  non-standard service tier, speed or inference geo, or cache writes without a
+  consistent 5-minute/1-hour split leaves the cost unknown: the tokens are
+  still shown, and the cost reads "cost unknown". `uzi run get` then shows
+  "cost unknown (unpriced)" with no price-table version, since no table was
+  applied.
+- **Coverage is stated.** A tail is `complete` or `partial`. A partial tail
+  lists why, in these words: the last session was cut off before it reported
+  its total (`leg_not_closed`); some model calls were never received
+  (`ordinal_gap`); output tokens of the last call were still streaming
+  (`output_not_final`); it is unclear whether a later total already counted
+  some calls (`superseded_uncertain`); some usage records were dropped
+  (`records_dropped`); the per-run usage record limit was reached
+  (`record_cap_reached`); coverage could not be determined (`unresolved`). A
+  partial tail means real usage may be higher.
+- **Hidden when empty.** A finished run normally has an all-zero, complete
+  tail; nothing is shown for it.
+- **Never added to anything.** The tail is not part of the metered total, of
+  the user or admin usage aggregates, or of any budget (no usage budget
+  exists). It is shown on the run only.
+- **Claude runs only.** Codex and chat runs record no tail.
+
 ## The model tier is not the difference
 
 `override_subagent_model` (added by migration `00119_schedule_run_override_subagent_model.sql`,

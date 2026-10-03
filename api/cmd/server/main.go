@@ -696,6 +696,7 @@ func run() error {
 	// enabled repo. Its lifetime is tracked so shutdown waits for it before the
 	// pool is closed (a mid-tick query must not race pool.Close).
 	engine := poller.New(svc, q, cfg.ForgePollInterval, cfg.ForgeReconcileEvery)
+	forgeHealth := wireForgeSync(engine, time.Now)
 	// Floor the per-tick deadline at the forge HTTP timeout so a poll interval shorter
 	// than a single forge call (the e2e harness pins 2s, under the 15s default) can't
 	// cancel an in-flight sync call — decouples the tick DEADLINE from the poll cadence
@@ -1084,19 +1085,22 @@ func run() error {
 	// debounced claimed fan-out is M6). Wired beside the custody-episode reconciler above: a
 	// standalone reconciler with a boot pass then a one-minute ticker.
 	healthSvc := healthsvc.New(healthsvc.Config{
-		Store:               q,
-		Pool:                pool,
-		Settings:            settingsCache,
-		SlackState:          slackManager.State,
-		Now:                 time.Now,
-		HostedWorkerVersion: cfg.HostedWorkerVersion,
-		RunningVersion:      version,
-		HeartbeatStale:      cfg.WorkerHeartbeatStale,
-		CustodyHoldLimit:    int32(workersvc.CustodyHoldLimit),
-		BootTime:            time.Now(),
-		CIWatchMaxRefs:      cfg.CIWatchMaxRefs,
-		CIWatchRunWindow:    cfg.CIWatchRunWindow,
-		Registry:            healthBeats,
+		WorkerEligibilityForHealth: wsvc.WorkerEligibilityForHealth,
+		Store:                      q,
+		Pool:                       pool,
+		Settings:                   settingsCache,
+		SlackState:                 slackManager.State,
+		Now:                        time.Now,
+		HostedWorkerVersion:        cfg.HostedWorkerVersion,
+		RunningVersion:             version,
+		HeartbeatStale:             cfg.WorkerHeartbeatStale,
+		CustodyHoldLimit:           int32(workersvc.CustodyHoldLimit),
+		BootTime:                   time.Now(),
+		CIWatchMaxRefs:             cfg.CIWatchMaxRefs,
+		CIWatchRunWindow:           cfg.CIWatchRunWindow,
+		Registry:                   healthBeats,
+		ForgeSyncRegistry:          forgeHealth.ForgeSyncRegistry,
+		ForgeSyncInterval:          forgeHealth.ForgeSyncInterval,
 	})
 	// M6 wires the notice fan-out into the SAME reconciler: the persist-first notifysvc
 	// seam, the store (ListAdmins fan-out set + the atomic ClaimHealthEpisodeNotice slot),
@@ -1379,6 +1383,7 @@ func run() error {
 	// GET /api/admin/health and the evaluator agree on the beats. Without this the handler
 	// would lazily build its own registry-less Service (loops → na); production always sets it.
 	h.SetHealthService(healthSvc)
+	wireHandlerForgeSync(h, forgeHealth)
 	// Share the vault with the HTTP handlers: unlock at login, DEK-seal on secret
 	// save, the /api/vault endpoints, and vault status on /api/me (PRD #32). M3 adds
 	// the same instance to workersvc for claim-time gating + open.

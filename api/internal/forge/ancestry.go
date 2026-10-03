@@ -35,6 +35,7 @@ var errAncestryOversize = errors.New("response body exceeds the ancestry read ce
 // is never read as proof. The callers treat any 3xx as an error.
 func ancestryClient(timeout time.Duration) *http.Client {
 	return &http.Client{
+		Transport:     forgeTransport(),
 		Timeout:       timeoutClient(timeout).Timeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}

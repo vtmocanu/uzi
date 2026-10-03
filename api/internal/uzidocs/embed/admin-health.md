@@ -88,9 +88,10 @@ the right home for that, as its own PRD.
 Every check reports one of five severities: `ok`, `warn`, `danger`, `unknown`,
 or `na`.
 
-- A **stale or missing signal is `unknown`, never `ok`.** A health page that
-  reads green while it is actually blind is worse than one that says it
-  cannot tell.
+- A **stale or missing liveness signal is `unknown`, never `ok`.** A health
+  page that reads green while it is actually blind is worse than one that
+  says it cannot tell. `forge.sync` measures completed attempt outcomes,
+  not the freshness of a prior success; see [Forge issue-sync failures](#forge-issue-sync-failures).
 - A check that **cannot apply on this deployment** (no hosted workers, Slack
   not configured) is `na`. It stays in the checks list — it never disappears
   and never silently counts as passing.
@@ -112,16 +113,33 @@ interpolated as-is.
 ## The checks
 
 Thresholds below are named constants in code
-(`api/internal/healthsvc/thresholds.go`), not admin-configurable settings.
+(`api/internal/healthsvc/thresholds.go`), not admin-configurable settings,
+except `forge.sync`, whose windows follow the effective forge poll interval.
 
 ### Workers
 
 | Check | What it means | `warn` | `danger` | `unknown` / `na` |
 |---|---|---|---|---|
 | `fleet.roll` | Whether hosted worker pods are rolling cleanly to their target image tag, from the controller's per-pod roll signal | some hosted workers are stuck | every hosted worker is stuck | `unknown` when the newest roll signal is older than the controller-signal freshness window *and* `controller.report` is not `ok` (a genuinely silent controller, not just an idle fleet); `na` when no hosted workers are configured |
-| `fleet.capacity` | Whether an owner with queued work has no worker of their own that can take it (workers are per-owner, so this is a per-owner question) | — | for at least 5 minutes, some owner has a run waiting for a worker and zero of their own workers online, non-draining, and heartbeat-fresh | `unknown` when the run-health detector (`health_enabled`) is off, or its state could not be read |
+| `fleet.capacity` | Owners waiting without a fresh non-draining worker; stored upgrade reasons are confirmed against current composed eligibility | — | genuine wait at least 5 minutes, or confirmed upgrade-wait overlap at least 24 hours | `unknown` when the run-health detector is off or its state could not be read |
 | `fleet.disk` | Whether any worker is under sustained disk pressure | any worker with a fresh heartbeat has a disk-pressure streak of 2+ consecutive polls | — | — |
 | `fleet.rundisk` | Whether one run is close to filling its worker's data volume (PRD #1809 M6, D8) | a fresh worker's largest reported run HOME is 40%+ of the data volume's total bytes, or the volume has less than 5% of its inodes free | — | `unknown` when the largest-run-size lookup itself fails |
+
+Worker-roll waiting is informational (`ok`, no warning) while suitable workers finish
+current runs before an upgrade. Each stored upgrade reason is confirmed against current
+fresh online eligibility, including all static requirements on one worker, affinity,
+released incarnation and strict lease guards. Slots are ignored. A suitable own draining
+worker vetoes confirmation, including an admissible bound ephemeral worker; other
+eligible drainers must be persistent. A stale or incompatible worker, a different stored
+reason, a missing callback or a failed read leaves that run on the genuine five-minute
+capacity path; one such run prevents blanket suppression of its owner.
+
+The overlap starts at the later of the run's `health_since` and the **latest** drain start
+among currently suitable other persistent workers. An incompatible later drainer cannot
+reset it. At 24 hours (including equality), `fleet.capacity` reports danger for an
+**overdue wait while workers upgrade**, independently of the controller drain deadline.
+Genuine and overdue owners have separate counts and ages; the combined count is their
+union, so an owner in both groups is counted once.
 
 ### Queue
 
@@ -142,8 +160,93 @@ Thresholds below are named constants in code
 
 | Check | What it means | `warn` | `danger` | `unknown` / `na` |
 |---|---|---|---|---|
+| `forge.sync` | Completed poller issue-sync outcomes for each currently enabled repo; `I` is the effective poll interval | some repo's failure streak is 3+ `I`, unless danger applies | any streak is 10+ `I`, or every enabled repo has a streak of 3+ `I` (pending repos block this second condition) | `unknown` when enabled-repo enumeration fails, or any repo is pending without warn/danger; `na` when no repos are enabled |
 | `forge.ciwatch` | Whether a repo has more eligible run branches than the CI watch's per-repo cap (`CI_WATCH_MAX_REFS`), so some go unwatched | any repo over the cap | — | `na` when the CI watch is disabled (`CI_WATCH_MAX_REFS=0`) |
 | `slack.socket` | The Slack socket's connection state | configured but disconnected for 5+ minutes | — | `na` when Slack is not configured |
+
+### Forge issue-sync failures
+
+`forge.sync` ([#2203](https://github.com/vtmocanu/uzi/issues/2203)) covers
+the poller's forge-client construction and the returned outcome of
+`FullSync` or `IncrementalSync` for each currently enabled repo.
+Success is recorded before sibling work such as MR-state, pipeline, or
+project sync; errors in that work do not change this outcome. Arbitrary
+forge calls, handler/seed syncs, and independent issue/board freshness are
+outside this check. An internally tolerated incomplete finding-group marker
+scan can still return a successful full sync; this check follows that return,
+not each internal operation.
+
+A repo whose latest completed attempt succeeded is `ok`. A repo without a
+completed attempt since api startup or its history reset is **pending**.
+The first failed completion after the last success or reset starts
+`failingSince` at that completion's time; repeated failures preserve that
+baseline and update the error class. A successful completion clears the
+streak immediately. With `I` equal to the poller's effective interval
+(`FORGE_POLL_INTERVAL`, with a non-positive value clamped to one minute),
+the evaluator applies these rules in order:
+
+| Severity | Condition |
+|---|---|
+| `unknown` | The current enabled-repo SQL read failed; history is not pruned |
+| `na` | No currently enabled repos |
+| `danger` | Any failure streak is at least 10 `I`, or every enabled repo has a streak of at least 3 `I`; a pending repo blocks the latter condition |
+| `warn` | Some failure streak is at least 3 `I`, without danger |
+| `unknown` | Some repo is pending, without warn or danger |
+| `ok` | No pending repos and each repo's latest attempt succeeded or its failure streak is less than 3 `I` |
+
+Evidence reports **N of M failing**, a separate pending count, and, when
+there are failures, the longest failure age and the latest failing
+completion's closed error class. `since` is the earliest current failure
+baseline. Evidence carries no raw error text or repo/connection identifiers.
+Typed errors and HTTP status are classified before PAT redaction; the safe
+error retains a scrubbed message and a closed class, with no original error
+chain. The classes are `timeout`, `auth`, `server_error`, `rate_limited`,
+and `other`. Warn/danger actions use the latest failure class:
+
+| Class | Action |
+|---|---|
+| `timeout` | check outbound reachability from the api pod. If other pods reach the forge and only the api process times out, restarting the api pod is a workaround, not a fix. |
+| `auth` | the connection's token is invalid or lacks scope; re-check the forge connection. |
+| `server_error` / `rate_limited` | forge-side; check the forge's status and rate limits, and wait. |
+| `other` | read the api logs for `poller:` errors. |
+
+#### Membership, resets, and consistency
+
+The authoritative membership read selects only currently enabled repo IDs
+from SQL. Disabled or deleted repos are excluded, and their captured history
+is pruned after a successful enumeration. The registry lives in the single
+api replica's process, starts empty after seed and before polling, and has no
+persisted state, schema, or generations. Api restart clears it, leaving
+enabled repos pending until an attempt completes.
+
+**Every successful enable/disable write resets this repo's health history,
+including an idempotent write.** Re-saving an already enabled repo therefore
+clears its warning and restarts its failure grace period; repeated saves can
+postpone an alarm. Refused or failed writes do not reset history. Re-enabled
+repos become pending even if the poller missed the disabled interval.
+Completion callbacks bound before invalidation cannot restore the old
+result. This reset does not reset the poller's incremental marks or poll
+counts.
+
+These are bounded observations, not a globally ordered snapshot:
+
+- An attempt binds its history at `Begin` inside `syncRepo`, after the
+  poller's earlier DB enumeration. Queued old work that starts after a reset
+  remains eligible with its older inputs; the next normal poll refreshes them.
+- Health snapshots copy entry values and identities before enumerating
+  enabled IDs. A concurrent toggle or new completion can produce a
+  conservative `unknown` or a preceding observation; there is no global
+  snapshot ordering.
+- The enabled write and invalidation callback are not one DB transaction.
+  An evaluation before the callback can observe the preceding history.
+- An out-of-band SQL toggle that bypasses the writer hook and whose disabled
+  interval is missed is not detected. Observed absence still prunes history.
+- The GET check cache remains five seconds, with concurrent cache misses
+  evaluating independently and the last cache write winning. A recovery
+  clears the streak in direct evaluation without extra hysteresis, then
+  becomes visible through that cache.
+- A last success without further attempts does not become a freshness
+  failure. Poller liveness remains the separate `loops` check.
 
 ### Housekeeping
 
@@ -155,8 +258,8 @@ Thresholds below are named constants in code
 | `release.check` | Whether this instance is far behind the latest release, per the same derivation [Update checks](updates.md) uses | far behind | — | `na` when the upstream release check is disabled |
 
 `unknown` and `na` are first-class outcomes, not edge cases to squint past: a
-check reading `unknown` means its signal's writer is stale, silent, or turned
-off, and a check reading `na` means it genuinely does not apply here (no
+check reading `unknown` means its observation is missing, stale, unreadable,
+or turned off, and a check reading `na` means it genuinely does not apply here (no
 hosted workers, no Slack). Neither is ever folded into, or displayed as, `ok`.
 
 ## What it cannot see
@@ -170,7 +273,9 @@ Two checks shown in the accepted mock are **deferred**, not shipped:
 - **Per-forge-connection sync freshness** — whether a connection's issue/board
   sync is current. `synced_at`/`last_synced_at` exist per cached issue, per
   pipeline row, and per repo, but never per forge connection, so there is no
-  per-connection bookkeeping to read yet.
+  per-connection bookkeeping to read yet. The delivered `forge.sync` check
+  measures per-repo poller failure streaks, not this independent freshness
+  signal or a fix for an underlying transport problem.
 
 And **pod-level health of the api, web, database, and controller pods is out
 of scope entirely** — see [the boundary](#the-boundary-no-kubernetes-access-ever)

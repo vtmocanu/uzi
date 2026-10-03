@@ -127,6 +127,9 @@ func (e *RateLimitError) Error() string {
 // message could carry the token).
 func (e *RateLimitError) Unwrap() error { return e.Err }
 
+// Class identifies a neutral rate limit, including a locally reserved budget.
+func (e *RateLimitError) Class() ErrorClass { return ErrorClassRateLimited }
+
 // Type identifies a forge driver. It maps 1:1 to the forge_connections.forge_type
 // column, which is CHECK-constrained to the same set.
 type Type string
@@ -975,5 +978,5 @@ func timeoutClient(timeout time.Duration) *http.Client {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
-	return &http.Client{Timeout: timeout, CheckRedirect: createIssueRedirectGuard(redirectguard.SameOrigin)}
+	return &http.Client{Transport: forgeTransport(), Timeout: timeout, CheckRedirect: createIssueRedirectGuard(redirectguard.SameOrigin)}
 }

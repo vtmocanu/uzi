@@ -70,12 +70,13 @@ const (
 // it structurally, so healthsvc never depends on the concrete Queries and its severity
 // logic is driven by a fake in unit tests.
 type Store interface {
+	ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error)
 	// fleet.roll + fleet.disk read every worker with its roll-health join.
 	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
 	// fleet.rundisk (PRD #1809 M6): each listed worker's largest fresh run HOME size (per_worker 1).
 	ListLargestRunDiskForWorkers(ctx context.Context, arg store.ListLargestRunDiskForWorkersParams) ([]store.WorkerRunDisk, error)
 	// fleet.capacity: owners waiting with zero usable (online, non-draining, fresh) workers.
-	ListOwnersWaitingNoCapacity(ctx context.Context, heartbeatCutoff pgtype.Timestamptz) ([]store.ListOwnersWaitingNoCapacityRow, error)
+	ListOwnersWaitingNoCapacity(ctx context.Context, arg store.ListOwnersWaitingNoCapacityParams) ([]store.ListOwnersWaitingNoCapacityRow, error)
 	// queue.waiting: oldest waiting_worker run's health_since (nullable).
 	OldestWaitingWorkerRun(ctx context.Context) (pgtype.Timestamptz, error)
 	// queue.undispatched: oldest undispatched task run's created_at (nullable).
@@ -118,9 +119,12 @@ type dbStat struct {
 
 // Config carries the injected collaborators. Every field is a seam a unit test overrides.
 type Config struct {
-	Store    Store
-	Pool     *pgxpool.Pool
-	Settings Settings
+	// WorkerEligibilityForHealth confirms a stored roll reason against current composed eligibility.
+	// A nil callback or an error leaves the row on the genuine-capacity path.
+	WorkerEligibilityForHealth func(context.Context, time.Time, uuid.UUID) (store.CountOnlineWorkersClaimableForRunRow, error)
+	Store                      Store
+	Pool                       *pgxpool.Pool
+	Settings                   Settings
 	// SlackState reports the live Slack socket state (slacksvc.State* strings); nil reads
 	// as StateDisabled, so slack.socket is `na`.
 	SlackState func() string
@@ -157,7 +161,9 @@ type Config struct {
 	// Registry is the shared loop-beat registry (main.go builds ONE and injects the SAME
 	// one here and into each loop's Beat callback). The loops check reads its Snapshot. nil
 	// (a struct-literal test handler that never wired loops) makes loops degrade to `na`.
-	Registry *BeatRegistry
+	Registry          *BeatRegistry
+	ForgeSyncRegistry *SyncRegistry
+	ForgeSyncInterval time.Duration
 }
 
 // Service holds the injected deps plus the process-memory slack "first-saw-non-connected"
@@ -249,6 +255,7 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		s.checkDB(ctx),
 		s.checkLoops(now),
 		s.checkForgeCIWatch(ctx, now),
+		s.checkForgeSync(ctx, now),
 		s.checkSlackSocket(now),
 		s.checkSchedulesPaused(ctx, now),
 		s.checkBoardDrift(ctx, now),

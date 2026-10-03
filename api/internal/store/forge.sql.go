@@ -718,6 +718,30 @@ func (q *Queries) ListBoardFreeMRStateWatchCandidates(ctx context.Context, repoI
 	return items, nil
 }
 
+const listEnabledRepoIDs = `-- name: ListEnabledRepoIDs :many
+SELECT id FROM repos WHERE enabled = true
+`
+
+func (q *Queries) ListEnabledRepoIDs(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listEnabledRepoIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listEnabledReposByConnection = `-- name: ListEnabledReposByConnection :many
 SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog FROM repos WHERE connection_id = $1 AND enabled = true
 ORDER BY path_with_namespace ASC

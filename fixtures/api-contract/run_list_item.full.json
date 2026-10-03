@@ -282,6 +282,30 @@
     "cost_usd": 1.5,
     "cost_status": "x"
   },
+  "usage_estimated_tail": {
+    "input_tokens": 1,
+    "cache_read_tokens": 1,
+    "cache_creation_tokens": 1,
+    "output_tokens": 1,
+    "cost_usd": 1.5,
+    "cost_status": "x",
+    "price_table_version": "x",
+    "coverage": "x",
+    "coverage_reasons": [
+      "x"
+    ],
+    "models": [
+      {
+        "model": "x",
+        "input_tokens": 1,
+        "cache_read_tokens": 1,
+        "cache_creation_tokens": 1,
+        "output_tokens": 1,
+        "cost_usd": 1.5,
+        "cost_status": "x"
+      }
+    ]
+  },
   "wait_on_limit": true,
   "mr_rework_enabled": true,
   "mr_rework_auto_cycles": 1,

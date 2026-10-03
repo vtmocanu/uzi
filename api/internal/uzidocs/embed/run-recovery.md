@@ -297,6 +297,87 @@ touches a ready archive or any other hold. See
 [the CLI reference](cli.md#recovering-unpublished-work-uzi-run-export) for the
 `uzi run export` flag and exit-code contract.
 
+### When retained work blocks a new run on the same branch
+
+A new run can be refused because the worker's recovery journal still names a
+clone belonging to another run, with a message such as
+`refusing to replace a retained clone owned by another run`.
+Orphan reclaim checks that older owner before freeing the new run's path;
+a terminal status alone does not make the older work disposable.
+
+1. Use the diagnostic's `owner_id` to find the owning run's claim holds in
+   **Workers** settings or `uzi run recovery <run-id>`. Check the originating
+   worker and generation for each hold: a run that finished on another worker
+   can still have an older hold here. The events contain no `hold_id`; use
+   the existing recovery view to identify it. A `source_only` hold without an
+   archive may be the only copy, including dirty or untracked files.
+2. Confirm the owner is terminal and belongs to the same repository and branch
+   lineage. The worker derives that branch from the owner's run identity;
+   for merge-request rework (`mr_rework`), it uses `pipeline_ref` even when
+   the stored branch is null. This comparison is not forge ancestry proof.
+3. Rerun with a worker containing this fix so its existing verification can
+   quarantine canonical residue, retain a proven attempt clone in place, or
+   confirm the source is already absent. The path must match the owner's
+   canonical clone or an attempt recorded for that owner in the worker ledger.
+   Attempt-enabled workers also require their scoped capture quiescence check
+   to pass; this does not promise process quiescence on unwired workers.
+4. If reclaim still refuses, retain the source and custody hold and investigate
+   the named guard below. Do not manually delete the clone, edit its journal,
+   or discard the hold as a repair. Hold discard changes database custody;
+   it does not repair the worker journal. Known commits pushed to the forge
+   do not prove dirty or untracked bytes disposable during orphan reclaim.
+
+This reclaim does not request custody release. The server-proof automatic
+settlement described above continues to govern eligible older holds.
+
+#### Reading orphan-reclaim diagnostics
+
+These worker events identify the failed guard or completed disposition:
+
+| Event | Level | Meaning |
+|---|---|---|
+| `orphan_reclaim_refused` | warn | Reclaim stopped at `stage` for `reason`; keep the held work and investigate that guard. |
+| `orphan_retirement_failed` | warn | Canonical retirement failed at an inner stage, with `canonical_retirement_failure`; inspect its safe `errno`. |
+| `orphan_reclaim_succeeded` | info | `stage: complete`; `reason` is exactly `quarantined`, `retained-in-place`, or `source-already-absent`. |
+
+| Refusal stage | Reasons and investigation |
+|---|---|
+| `classification` | `http` (check `http_status`), `transport_unknown` (check connectivity), `nonterminal_owner` (owner is not terminal), or `repo_mismatch` (different repository). |
+| `identity` | `malformed_identity`: owner identity cannot be derived, including an unknown run kind; reclaim fails closed. |
+| `branch` | `branch_mismatch`: owner-derived branch does not match the blocked branch. |
+| `path` | `path_error` or `path_mismatch`: owner path verification failed or ownership was not proven. |
+| `quiescence` | `quiescence_blocked` or `quiescence_error`: the scoped capture check blocked or failed. |
+| `attempt_ledger` / `attempt_journal` | `attempt_release_failure`: recording retained attempt state or clearing its journal failed. |
+| `retirement` | `canonical_retirement_failure`, or `attempt_release_failure` when attempt validation falls through to this generic stage. |
+
+Inner retirement stages are `journal_read`, `journal_validation`, `containment`,
+`holding_parent`, `rename`, `retained_copy`, `intra_device_rename`, and
+`journal_clear`. The worker validates the old owner/path pair under the bare
+repository lock and does not clear a successor's journal. For canonical
+retirement, success describes retained quarantine or confirmed source absence
+established under that lock,
+not merely a retirement call returning. A completed quarantine stays retained
+if a later journal clear fails; reclaimed attempt bytes stay in place and are
+excluded from the later retention sweep. A refusal after a move or copy need
+not restore the original layout.
+
+The new events carry `event`, `stage`, `reason`, `claimant_id`, `owner_id`,
+`repo_id`, `path_shape`, `path_fingerprint`, and `errno`. IDs are UUID strings
+or `invalid`; path shape is `canonical`, `attempt`, or `unknown`. The fingerprint
+is a 64-hex SHA-256 digest of the path, with 64 zeroes if hashing is unavailable.
+`errno` is allowlisted or `unknown`; optional `http_status` is an integer from
+100 through 599 supplied for a classification `RequestError`, without its
+response body. Logging and hashing are best effort; an event may be absent.
+
+These new events omit raw branches, journals, paths, status/kind values, error
+messages, stacks, HTTP bodies, and credentials. They do not rewrite historical
+logs or apply to ordinary terminal discard cleanup. A recurrence supplies safe
+IDs, a path digest, stage, and available HTTP status or errno for investigation;
+it does not establish the cause of the historical refusal in
+[issue #1848](https://github.com/vtmocanu/uzi/issues/1848): the supplied report
+lacked the deployed worker revision, classification request status, and
+underlying retirement error.
+
 ## What this is not: the threat model
 
 This is **server-side encryption at rest**, not end-to-end encryption. The

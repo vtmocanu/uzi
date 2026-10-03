@@ -31,6 +31,11 @@ type projectReverseSyncer interface {
 	ReverseSync(ctx context.Context, repoID uuid.UUID) error
 }
 
+// RepoStore is the poller's read-only enabled-repository enumeration seam.
+type RepoStore interface {
+	ListEnabledReposWithConnections(context.Context) ([]store.ListEnabledReposWithConnectionsRow, error)
+}
+
 // defaultMaxConcurrency bounds how many repos are synced in parallel per tick.
 const defaultMaxConcurrency = 4
 
@@ -40,7 +45,7 @@ const defaultMaxConcurrency = 4
 // their state is discarded; newly enabled repos start with a full reconcile.
 type Engine struct {
 	svc            *forgesvc.Service
-	q              *store.Queries
+	q              RepoStore
 	interval       time.Duration
 	reconcileEvery int
 	maxConcurrency int
@@ -108,7 +113,8 @@ type Engine struct {
 	// still ticking. Optional and nil-safe (nil = no beat), so existing tests that
 	// construct the Engine with no beat keep working. It is a plain func — this package
 	// must NOT import healthsvc (the registry is a leaf; the loop only receives a callback).
-	beat func()
+	beat        func()
+	syncAttempt func(uuid.UUID) func(bool, forge.ErrorClass)
 }
 
 // repoState is one repo's in-memory sync state. marks holds a SEPARATE
@@ -126,7 +132,7 @@ type repoState struct {
 // New constructs an Engine. reconcileEvery < 1 is clamped to 1 (every poll is a
 // full reconcile), so a misconfigured value degrades to "always correct, less
 // efficient" rather than "never reconciles".
-func New(svc *forgesvc.Service, q *store.Queries, interval time.Duration, reconcileEvery int) *Engine {
+func New(svc *forgesvc.Service, q RepoStore, interval time.Duration, reconcileEvery int) *Engine {
 	if interval <= 0 {
 		interval = time.Minute
 	}
@@ -190,6 +196,11 @@ func (e *Engine) SetForgeTimeout(d time.Duration) { e.forgeTimeout = d }
 // before Run. A nil beat (the default) disables it, so tests that never wire one behave
 // exactly as before. The callback fires once per tick.
 func (e *Engine) SetBeat(beat func()) { e.beat = beat }
+
+// SetSyncAttempt wires issue-sync observations before Run or PollOnce.
+func (e *Engine) SetSyncAttempt(begin func(uuid.UUID) func(bool, forge.ErrorClass)) {
+	e.syncAttempt = begin
+}
 
 // Interval reports the poll cadence the loop actually ticks at (after New's clamp), so
 // main.go registers the loop-beat with the effective interval rather than duplicating the
@@ -279,7 +290,7 @@ func (e *Engine) Run(ctx context.Context) {
 			if e.beat != nil {
 				e.beat() // admin-health loop-beat: this loop ticked (PRD #1484 M2)
 			}
-			e.tick(ctx)
+			e.PollOnce(ctx)
 		}
 	}
 }
@@ -297,11 +308,12 @@ func guardPanic(repo string, fn func()) {
 	fn()
 }
 
-// tick syncs every enabled repo once, with bounded concurrency and a hard per-tick
+// PollOnce syncs every enabled repo once, with bounded concurrency and a hard per-tick
 // deadline (tickBudget) so a dead or wedged forge can neither stall the cycle nor
 // let a tick run unbounded. Errors on one repo are logged and skipped so a single
-// bad connection (revoked PAT, forge down) never stalls the others.
-func (e *Engine) tick(ctx context.Context) {
+// bad connection (revoked PAT, forge down) never stalls the others. Call serially;
+// do not call PollOnce concurrently with Run or another PollOnce.
+func (e *Engine) PollOnce(ctx context.Context) {
 	// Bound the whole tick at tickBudget — the poll interval, but floored at 3x the
 	// forge HTTP timeout so a poll interval shorter than the tick's forge calls (the
 	// e2e 2s cadence) can't preempt an in-flight sync call (issue #139). When the
@@ -361,9 +373,29 @@ func (e *Engine) pruneStates(seen map[uuid.UUID]struct{}) {
 // syncRepo runs one repo's sync using the caller-provided state (which only this
 // worker touches this tick).
 func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, st *repoState) {
+	var complete func(bool, forge.ErrorClass)
+	if e.syncAttempt != nil {
+		complete = e.syncAttempt(r.ID)
+	}
+	finished := false
+	report := func(ok bool, class forge.ErrorClass) {
+		if !finished {
+			finished = true
+			if complete != nil {
+				complete(ok, class)
+			}
+		}
+	}
+	// A panic before issue-sync succeeds reports Other; guardPanic still owns recovery.
+	defer func() {
+		if !finished {
+			report(false, forge.ErrorClassOther)
+		}
+	}()
 	f, err := e.svc.ForgeForConnection(r.ForgeType, r.BaseUrl, r.TokenCiphertext)
 	if err != nil {
 		slog.Error("poller: build forge client", "repo", r.PathWithNamespace, "error", err)
+		report(false, forge.Class(err))
 		return
 	}
 
@@ -373,6 +405,7 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 		observed, err := e.svc.FullSync(ctx, r.ID, r.ForgeProjectID, f)
 		if err != nil {
 			slog.Error("poller: full sync", "repo", r.PathWithNamespace, "error", err)
+			report(false, forge.Class(err))
 			return
 		}
 		// FullSync is unbounded and reports what it observed, not an advance; the
@@ -383,11 +416,14 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 		next, err := e.svc.IncrementalSync(ctx, r.ID, r.ForgeProjectID, f, st.marks)
 		if err != nil {
 			slog.Error("poller: incremental sync", "repo", r.PathWithNamespace, "error", err)
+			report(false, forge.Class(err))
 			return
 		}
 		// Already clamped inside, and held at the caller's pair on any fetch error.
 		st.marks = next
 	}
+
+	report(true, forge.ErrorClassOther)
 
 	// MR-close watcher (PRD #24): after the issue cache is fresh, check each
 	// watched card's MR for an opened↔closed edge and move the card accordingly.

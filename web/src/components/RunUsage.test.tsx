@@ -574,3 +574,108 @@ describe("RunUsagePanel live in-flight surface (issue #237)", () => {
     expect(queryByText(/In-flight tokens/)).toBeNull();
   });
 });
+
+// ── Issue #2014: the estimated tail block ───────────────────────────────────
+import { RunUsageTailBlock } from "./RunUsage";
+import type { UsageTail } from "../lib/api";
+
+function tail(over: Partial<UsageTail> = {}): UsageTail {
+  return {
+    input_tokens: 1_000,
+    cache_read_tokens: 200_000,
+    cache_creation_tokens: 0,
+    output_tokens: 3_000,
+    cost_usd: 1.23,
+    cost_status: "estimated",
+    price_table_version: "anthropic-standard-2026-10-03",
+    coverage: "partial",
+    coverage_reasons: ["leg_not_closed"],
+    models: [],
+    ...over,
+  };
+}
+
+describe("RunUsageTailBlock", () => {
+  it("shows the tail apart from, and never inside, the metered total", () => {
+    const { container, getByText } = render(
+      <div>
+        <RunUsagePanel usage={deriveRunUsage([result({ input: 100, cacheRead: 0, output: 50, cost: 2 }, { turns: 1, durationMs: 1000 })])} costStatus="metered" />
+        <RunUsageTailBlock tail={tail()} />
+      </div>,
+    );
+    const block = container.querySelector('section[aria-label="Estimated usage, not metered"]')!;
+    expect(block).toBeTruthy();
+    expect(getByText("Estimated, not metered")).toBeTruthy();
+    expect(block.textContent).toContain("~$1.23 estimated");
+    expect(block.textContent).toContain("anthropic-standard-2026-10-03");
+    // The metered group does not contain the tail block.
+    const metered = container.querySelector('[aria-label="Run usage totals"]')!;
+    expect(metered.contains(block)).toBe(false);
+    expect(metered.textContent).not.toContain("1.23");
+  });
+
+  it("renders an unpriced tail as cost unknown, never $0", () => {
+    const { container } = render(<RunUsageTailBlock tail={tail({ cost_usd: null, cost_status: "unpriced" })} />);
+    expect(container.textContent).toContain("cost unknown");
+    expect(container.textContent).not.toContain("$0");
+  });
+
+  it("renders a sub-cent estimated cost as <$0.01, and an estimated nil cost as unknown", () => {
+    const tiny = render(<RunUsageTailBlock tail={tail({ cost_usd: 0.001 })} />);
+    expect(tiny.container.textContent).toContain("<$0.01 estimated");
+    expect(tiny.container.textContent).not.toContain("~$0.00");
+    cleanup();
+    const zero = render(<RunUsageTailBlock tail={tail({ cost_usd: 0 })} />);
+    expect(zero.container.textContent).toContain("~$0.00 estimated");
+    cleanup();
+    const nil = render(<RunUsageTailBlock tail={tail({ cost_usd: null, cost_status: "estimated" })} />);
+    expect(nil.container.textContent).toContain("cost unknown");
+    expect(nil.container.textContent).not.toContain("$0");
+    expect(nil.container.textContent).not.toContain("metered total above");
+  });
+
+  it("hides a zero-token complete tail but shows a zero-token partial one", () => {
+    const zero = { input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0 };
+    const hidden = render(<RunUsageTailBlock tail={tail({ ...zero, coverage: "complete", coverage_reasons: [] })} />);
+    expect(hidden.container.textContent).toBe("");
+    cleanup();
+    const shown = render(<RunUsageTailBlock tail={tail({ ...zero, cost_usd: null, cost_status: "unpriced" })} />);
+    expect(shown.container.textContent).toContain("Estimated, not metered");
+  });
+
+  it("explains each coverage reason in words and shows an unknown reason safely", () => {
+    const reasons = [
+      "leg_not_closed",
+      "ordinal_gap",
+      "output_not_final",
+      "superseded_uncertain",
+      "records_dropped",
+      "record_cap_reached",
+      "unresolved",
+    ];
+    const { container } = render(<RunUsageTailBlock tail={tail({ coverage_reasons: [...reasons, "new‮reason"] })} />);
+    const text = container.textContent ?? "";
+    for (const r of reasons) expect(text).not.toContain(r);
+    for (const sentence of [
+      "the last session was cut off before it reported its total",
+      "some model calls were never received",
+      "output tokens of the last call were still streaming",
+      "it is unclear whether a later total already counted some calls",
+      "some usage records were dropped",
+      "the per-run usage record limit was reached",
+      "coverage could not be determined",
+    ]) {
+      expect(text).toContain(sentence);
+    }
+    expect(text).toContain("newreason");
+    expect(text).not.toContain("‮");
+  });
+
+  it("strips control and bidi characters from model names", () => {
+    const m = { model: "evil‮model\u001b[31m", input_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 1, cost_usd: null, cost_status: "unpriced" as const };
+    const { container } = render(<RunUsageTailBlock tail={tail({ models: [m] })} />);
+    expect(container.textContent).not.toContain("‮");
+    expect(container.textContent).not.toContain("\u001b");
+    expect(container.textContent).toContain("evilmodel");
+  });
+});

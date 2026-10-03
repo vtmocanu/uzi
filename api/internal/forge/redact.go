@@ -1,7 +1,6 @@
 package forge
 
 import (
-	"errors"
 	"strings"
 )
 
@@ -38,15 +37,19 @@ func (r redactor) string(s string) string {
 	return s
 }
 
-// error wraps err so its message (and Unwrap chain via the original) carries no
-// secret. Returns nil for a nil error. The wrapped error deliberately does NOT
+// error classifies err before scrubbing its message and severing its chain.
+// Returns nil for a nil error. The wrapped error deliberately does NOT
 // implement Unwrap: the whole point is to sever access to the original message,
 // which might contain the token; callers get a clean string and the redacted
 // text is authoritative.
 func (r redactor) error(err error) error {
+	return r.errorStatus(err, 0)
+}
+
+func (r redactor) errorStatus(err error, status int) error {
 	if err == nil {
 		return nil
 	}
-	msg := r.string(err.Error())
-	return errors.New(msg)
+	class := classifyError(err, status)
+	return &classifiedError{message: r.string(err.Error()), class: class}
 }

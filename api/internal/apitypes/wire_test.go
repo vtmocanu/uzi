@@ -287,12 +287,36 @@ func TestRunDTOTags(t *testing.T) {
 	if !contains(got, "usage") {
 		t.Fatalf("RunDTO with Usage set must include usage key, got %v", got)
 	}
+	// Issue #2014: usage_estimated_tail is omitempty (only a run with recorded usage legs): absent
+	// when nil, present when set, and never folded into the metered usage key.
+	if contains(tagSet(t, RunDTO{}), "usage_estimated_tail") {
+		t.Fatal("RunDTO without a tail must not carry the usage_estimated_tail key")
+	}
+	if got := tagSet(t, RunDTO{UsageEstimatedTail: &UsageTailDTO{}}); !contains(got, "usage_estimated_tail") {
+		t.Fatalf("RunDTO with a tail must include usage_estimated_tail, got %v", got)
+	}
 	// PRD #1908 D-D: job is omitempty (job runs' detail read only): absent when nil, present when set.
 	if contains(tagSet(t, RunDTO{}), "job") {
 		t.Fatal("RunDTO without a Job must not carry the job key")
 	}
 	if got := tagSet(t, RunDTO{Job: &RunJobDTO{}}); !contains(got, "job") {
 		t.Fatalf("RunDTO with Job set must include job key, got %v", got)
+	}
+}
+
+func TestUsageTailDTOTags(t *testing.T) {
+	assertTags(t, "UsageTailDTO", UsageTailDTO{},
+		"input_tokens", "cache_read_tokens", "cache_creation_tokens", "output_tokens",
+		"cost_usd", "cost_status", "price_table_version", "coverage", "coverage_reasons", "models")
+	assertTags(t, "UsageTailModelDTO", UsageTailModelDTO{},
+		"model", "input_tokens", "cache_read_tokens", "cache_creation_tokens", "output_tokens", "cost_usd", "cost_status")
+	// An unpriced tail marshals cost_usd as null, never 0.
+	raw, err := json.Marshal(UsageTailDTO{CostStatus: "unpriced"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"cost_usd":null`) {
+		t.Fatalf("unpriced tail = %s, want cost_usd null", raw)
 	}
 }
 

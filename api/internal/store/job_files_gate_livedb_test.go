@@ -124,7 +124,7 @@ func TestJobFilesGateCountsLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CountOnlineWorkersClaimableForRun: %v", err)
 		}
-		return n
+		return n.Claimable
 	}
 	satisfying := func(requiresFiles bool) int64 {
 		t.Helper()

@@ -27,18 +27,33 @@ through `[0.52.0]`.)
 - **Plan cross-check opt-in establishes a required gate for auto-approved plans ([#2149](https://github.com/vtmocanu/uzi/issues/2149)).**
   Settings → Run defaults offers a per-user Plan cross-check switch when Claude and Codex are usable. In this first stage, an opted-in run parks for human plan approval with `plan cross-check: checker unavailable`; the checker integration follows in the next stage. The Cross-check docs describe the future advisory Code cross-check separately.
 
+- **See the estimated usage of an interrupted Claude session apart from the metered total ([#2014](https://github.com/vtmocanu/uzi/issues/2014)).**
+  Usage after the last SDK result of a parked, stopped or crashed Claude run is recorded and shown as "Estimated, not metered" on the run page and as an EST. TAIL row in `uzi run get` (and `usage_estimated_tail` in its JSON), with price-table provenance, "cost unknown" when unpriced and a plain-words coverage note; it is never added to the metered total, usage aggregates or any budget.
+
 ### Fixed
 
 - **Worker UID ownership regressions run in required CI ([#2134](https://github.com/vtmocanu/uzi/issues/2134)).**
   The base worker image exercises privileged creation and ownership assertions, with a source-derived check that rejects missing or skipped tests.
 - **A job's output upload no longer retries past a deadline-capped wait.**
   When an upload's wait was cut to the time left before the phase deadline, a timer firing a moment early could start one more attempt before the requested Retry-After elapsed. The phase now stops after such a wait.
+- **Forge HTTP/2 connections recover after an unanswered health ping ([#2204](https://github.com/vtmocanu/uzi/issues/2204)).**
+  Forge clients share a dedicated connection pool that probes HTTP/2 connections after 30 seconds without received frames and closes them if the ping remains unanswered for 15 seconds. Detection takes about 45 seconds after the last received frame, so two or three consecutive calls with the default 15-second deadline may still time out before a later call establishes a fresh connection. Request deadlines, redirect restrictions and token redaction retain their existing behavior.
+- **Review exports reuse the build cache across waves ([#2013](https://github.com/vtmocanu/uzi/issues/2013)).**
+  The lead assigns each validator a stable export slot (`.uzi/scratch/snap-<slot>`) instead of a new random export per review, so Go's path-keyed build cache stops re-growing by the whole module each wave. Unassigned or invalid slots keep the random path.
+- **Admin health warns when enabled repos repeatedly fail issue sync ([#2203](https://github.com/vtmocanu/uzi/issues/2203)).**
+  The new `forge.sync` check tracks poller client-construction and full/incremental issue-sync outcomes per currently enabled repo, warning after three effective poll intervals and raising danger after ten for any repo or three for every repo; pending repos block the latter condition. Evidence carries counts, failure age and a safe error class with targeted advice. Success clears a streak immediately, while api restart and every successful enable/disable write (including idempotent writes) reset history and failure grace; repeated saves can postpone warnings. This diagnoses failure streaks, not independent sync freshness or a fix for the underlying transport problem. See [Admin health](docs/admin-health.md#forge-issue-sync-failures) for consistency limits.
+
+- **Retained clones blocking branch reworks now report the failed safety check ([#1848](https://github.com/vtmocanu/uzi/issues/1848)).**
+  New worker diagnostics identify the owning run and refusal stage without exposing paths or error bodies, distinguish retained quarantine from source absence, and reject malformed run kinds before reclaim. Recovery guidance explains how to retry verified reclaim while keeping custody holds and dirty or untracked work; the original production refusal remains unproven.
+
 - **TUI split view fills the terminal height ([#2197](https://github.com/vtmocanu/uzi/issues/2197)).**
   Pane sizes use the shared header rows actually drawn, keeping the footer on the last terminal row when meters or optional hints are absent. The resize threshold and its hysteresis stay unchanged.
 - **Run failure diagnostics replace unsafe control characters ([#2196](https://github.com/vtmocanu/uzi/issues/2196)).**
   Generic failure logs, feed events and stored reasons replace control and bidirectional formatting characters after secret redaction, while preserving the existing 512-character report limit.
 - **A run's forge token and caches stay protected when a leftover process survives the reap ([#1828](https://github.com/vtmocanu/uzi/issues/1828)).**
   On a Claude run, a process carrying the run's HOME that the worker could not kill, or a reap that could not finish, now blocks every step that publishes or settles the run (finalize push, failure settlement, pause, completion hold, wall park, credential switch, recovery and checkpoint publishes) the same way an unproven clone does: the run keeps custody, keeps running (a failed pause) or fails with `worker_residue_blocked`. A re-claimed run reaps its HOME before its clone fetch, and a park or the periodic disk reclaim drops the run's rebuildable caches only once no such process is left.
+- **Worker upgrade waits no longer trigger premature capacity alarms (#2184).**
+  Run health identifies currently suitable draining workers; admin capacity confirms each upgrade wait, preserves genuine five-minute alarms, and reports overdue upgrade waits after 24 hours of overlap.
 
 ## [0.85.1] - 2026-10-03
 

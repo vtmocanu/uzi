@@ -109,13 +109,16 @@ func (f *forgejo) newClient(ctx context.Context) (*gitea.Client, error) {
 
 // wrapErr adds op context and routes the error through the PAT redactor so no
 // error this driver surfaces can carry the token. A nil error passes through as
-// nil. (No rate-limit classification: the gitea SDK never surfaces a typed
-// rate-limit error, so there is no equivalent to github's errors.As branch.)
+// nil. HTTP status must be supplied separately for gitea SDK response errors.
 func (f *forgejo) wrapErr(op string, err error) error {
+	return f.wrapErrStatus(op, err, 0)
+}
+
+func (f *forgejo) wrapErrStatus(op string, err error, status int) error {
 	if err == nil {
 		return nil
 	}
-	return f.redact.error(fmt.Errorf("forgejo: %s: %w", op, err))
+	return f.redact.errorStatus(fmt.Errorf("forgejo: %s: %w", op, err), status)
 }
 
 // repoSlugFor resolves a numeric projectID to its owner/repo pair, caching the
@@ -130,9 +133,13 @@ func (f *forgejo) repoSlugFor(c *gitea.Client, projectID int64) (repoSlug, error
 	if ok {
 		return s, nil
 	}
-	r, _, err := c.GetRepoByID(projectID)
+	r, resp, err := c.GetRepoByID(projectID)
 	if err != nil {
-		return repoSlug{}, f.wrapErr(fmt.Sprintf("resolve repo %d", projectID), err)
+		status := 0
+		if resp != nil && resp.Response != nil {
+			status = resp.StatusCode
+		}
+		return repoSlug{}, f.wrapErrStatus(fmt.Sprintf("resolve repo %d", projectID), err, status)
 	}
 	if r == nil || r.Owner == nil {
 		return repoSlug{}, fmt.Errorf("forgejo: resolve repo %d: incomplete repository payload", projectID)
@@ -243,10 +250,10 @@ func (f *forgejo) rawGetLimited(ctx context.Context, path string, limit int64) (
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, limit))
 	if err != nil {
-		return nil, f.wrapErr("read response", err)
+		return nil, f.wrapErrStatus("read response", err, resp.StatusCode)
 	}
 	if resp.StatusCode/100 != 2 {
-		return body, f.wrapErr(fmt.Sprintf("GET %s", path), fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
+		return body, f.wrapErrStatus(fmt.Sprintf("GET %s", path), fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body))), resp.StatusCode)
 	}
 	return body, nil
 }
@@ -290,10 +297,10 @@ func (f *forgejo) patchIssue(ctx context.Context, slug repoSlug, issueIID int64,
 	defer func() { _ = resp.Body.Close() }()
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, forgejoPatchErrBodyLimit))
 	if err != nil {
-		return f.wrapErr(op, err)
+		return f.wrapErrStatus(op, err, resp.StatusCode)
 	}
 	if resp.StatusCode/100 != 2 {
-		return f.wrapErr(op, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody))))
+		return f.wrapErrStatus(op, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody))), resp.StatusCode)
 	}
 	return nil
 }

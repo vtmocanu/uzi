@@ -88,7 +88,12 @@ export class RunTurnReducerImpl implements RunTurnReducer {
         // requested session. Codex leaves it undefined (unflagged).
         // issue #1888: only the COUNT of plugin load errors reaches the persisted frame.
         reduction.messages.push(
-          projectInit(event.model, event.freshSession, event.pluginErrors?.length),
+          projectInit(
+            event.model,
+            event.freshSession,
+            event.pluginErrors?.length,
+            event.legId !== undefined ? { legId: event.legId, sdkSessionId: event.sessionId } : undefined,
+          ),
         );
         break;
       case "frame":
@@ -234,6 +239,7 @@ export class RunTurnReducerImpl implements RunTurnReducer {
       // also unmarked.
       usageBasis:
         terminal.usage?.basis === "session" ? "session_cumulative" : undefined,
+      usageStamp: event.usageStamp,
       wire: {
         usage: terminal.usage?.wire?.usage,
         modelUsage: terminal.usage?.wire?.modelUsage,

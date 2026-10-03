@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/big"
 	"strconv"
+	"strings"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
@@ -244,4 +245,65 @@ func costDetailCell(u apitypes.UsageDTO) string {
 		total := u.InputTokens + u.CacheReadTokens + u.CacheCreationTokens + u.OutputTokens
 		return fmtTokens(total) + " tokens · cost unavailable"
 	}
+}
+
+// usageTailReasonText is the plain-words sentence for each reason of the closed coverage-reason
+// set the server emits (ADR-2014). The strings are identical to REASON_TEXT in web
+// lib/usageTail.ts and to the list in docs/run-cost.md; TestUsageTailReasonSentences pins all
+// seven here, and the web test pins the same wording.
+var usageTailReasonText = map[string]string{
+	"leg_not_closed":       "the last session was cut off before it reported its total",
+	"ordinal_gap":          "some model calls were never received",
+	"output_not_final":     "output tokens of the last call were still streaming",
+	"superseded_uncertain": "it is unclear whether a later total already counted some calls",
+	"records_dropped":      "some usage records were dropped",
+	"record_cap_reached":   "the per-run usage record limit was reached",
+	"unresolved":           "coverage could not be determined",
+}
+
+// usageTailVisible reports whether the estimated tail has anything to say: any tokens, or a
+// coverage other than complete. The all-zero complete tail is hidden.
+func usageTailVisible(t apitypes.UsageTailDTO) bool {
+	tokens := t.InputTokens + t.CacheReadTokens + t.CacheCreationTokens + t.OutputTokens
+	return tokens > 0 || t.Coverage != "complete"
+}
+
+// usageTailCell is the human EST. TAIL cell: "~$1.23 estimated (version) · 1.2M in/34k out ·
+// partial: the last session was cut off before it reported its total". Anything but an
+// estimated status with a cost (unpriced, or a nil cost) reads "cost unknown (unpriced)" with no
+// price-table version, since no table was applied; never a dollar figure. A cost under half a
+// cent reads "<$0.01 estimated" rather than "~$0.00". Every server-supplied string goes through cellText; an unknown coverage
+// reason is shown raw but scrubbed.
+func usageTailCell(t apitypes.UsageTailDTO) string {
+	var cost string
+	if t.CostStatus == "estimated" && t.CostUSD != nil {
+		if *t.CostUSD > 0 && *t.CostUSD < 0.005 {
+			cost = "<$0.01 estimated"
+		} else {
+			cost = "~" + fmtCostCents(*t.CostUSD) + " estimated"
+		}
+		if v := cellText(t.PriceTableVersion); v != "" {
+			cost += " (" + v + ")"
+		}
+	} else {
+		cost = "cost unknown (unpriced)"
+	}
+	in := t.InputTokens + t.CacheReadTokens + t.CacheCreationTokens
+	parts := []string{cost, fmtTokens(in) + " in/" + fmtTokens(t.OutputTokens) + " out"}
+	if t.Coverage != "complete" {
+		reasons := make([]string, 0, len(t.CoverageReasons))
+		for _, r := range t.CoverageReasons {
+			if txt, ok := usageTailReasonText[r]; ok {
+				reasons = append(reasons, txt)
+			} else if c := cellText(r); c != "" {
+				reasons = append(reasons, c)
+			}
+		}
+		note := "partial"
+		if len(reasons) > 0 {
+			note += ": " + strings.Join(reasons, "; ")
+		}
+		parts = append(parts, note)
+	}
+	return strings.Join(parts, " · ")
 }

@@ -1,6 +1,6 @@
 # ADR-238: GitHub — the third forge driver
 
-**Status**: Accepted (PRD #238, milestones M1–M9 landed; M10 go-live pending)
+**Status**: Accepted (PRD #238, milestones M1–M10 landed; live since the M10 go-live)
 **Date**: 2026-08-08
 **Deciders**: Vlad + agent team (architect, coders, review waves — architect, fact-checker, reviewer, auditor)
 **PRD**: [prds/done/238-github-forge-support.md](../prds/done/238-github-forge-support.md) (GitLab issue [vtmocanu/uzi#238](https://github.com/vtmocanu/uzi/issues/238)) — the PRD carries the milestones, the full evidence base, and the decision log; this ADR carries the durable design shape and its rationale, for a reader rebuilding from specs who should not have to reread it.
@@ -9,7 +9,7 @@
 
 A `github` driver behind the existing `Forge` interface, at **full parity** with GitLab and Forgejo (board sync, runs, pull-request creation and watching, privilege guardrails, the GitHub Actions CI-fix loop), built on `github.com/google/go-github/v90`, classic-PAT auth, **github.com only**. The Go call sites did not change — `ForgeForConnection`/`ForgeForToken` already thread `forge.Type` through every one, and (unlike Forgejo's ADR-0065) the `Forge` interface method set itself did not change either, so no test fake needed touching. The driver landed cleanly on the seams ADR-0065 built and predicted a third driver would need: a driver file, its per-forge scope set, a `forgeNoun`/`pipelinestatus` vocabulary entry, and a `forge_types` advert.
 
-**Everything ships dark.** Milestones M1–M9 are committed but `handler/forge.go` still advertises and accepts only `gitlab`/`forgejo` — the `github` connect-form option is unreachable until the go-live milestone (M10) flips the advert and validation. This ADR records the design as-built; it does not claim GitHub connections are live.
+**Live since M10.** Milestones M1–M9 landed dark; the go-live milestone (M10) then flipped the advert and validation, so `handler/forge.go` advertises and accepts `github` alongside `gitlab`/`forgejo` and a GitHub connection can be created through the connect form.
 
 ## Context
 
@@ -68,4 +68,4 @@ ADR-0065 deferred the plugin/registry question to "the third driver." This is th
 - **The branch-protection guarantee is now honestly forge-dependent in its detectability, not just its default.** GitLab is safe by platform default; Forgejo is user-supplied but bot-scoped-detectable; GitHub is user-supplied **and**, on legacy protection, undetectable at write role. `docs/github-bot-setup.md` states this to the operator; #66 inherits an explicit, named obligation (fail-closed on `ProtectionUnverified`) rather than a silent gap.
 - **Least-privilege on GitHub is coarser by platform, not by choice.** `{repo}` is the finest classic scope available; uzi cannot narrow it further without a fine-grained-PAT follow-up, which is out of scope here and recorded as a future option, not a plan.
 - **CI-tamper resistance is a first-class, deliberate side effect of D7a**, not merely a limitation: the bot token that can push agent branches cannot also edit the workflows that gate `main`.
-- **Everything in this ADR is dark until M10.** `handler/forge.go` does not yet advertise or accept `github`; no GitHub connection can be created through the product today. This ADR records the design that M10's flip will make live, not a live system.
+- **This ADR now describes a live system.** M1–M9 landed dark and M10's flip made the design live: `handler/forge.go` advertises and accepts `github`, so GitHub connections are created through the product.

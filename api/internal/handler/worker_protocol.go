@@ -1111,6 +1111,57 @@ func (h *Handler) WorkerRunMessages(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// WorkerRunUsage records the per-message usage of a Claude run's SDK legs, the side channel that
+// lets the api show an estimated, clearly separate tail for a leg interrupted before its result
+// frame (issue #2014, ADR-2014). It is NOT run_messages: no frame, no seq, no broadcast, and
+// nothing it writes feeds run_usage_totals.
+//
+// It matches WorkerRunMessages' claim fence (decode limits, ErrMissingClaimGeneration 409, the
+// {"disposition":"stale_claim"} 409) and deliberately deviates on two points: a run the worker does
+// not own is a TYPED stale 404 (the recorder stops that run only; an untyped 404 would count toward
+// its route-missing streak), and the route is not in laneWorkerAllowlist, so an isolated-lane
+// worker answers 403 before this handler runs.
+func (h *Handler) WorkerRunUsage(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	var req workersvc.UsagePostBody
+	if err := httpx.DecodeJSONLimited(w, r, &req); err != nil {
+		httpx.RespondDecodeError(w, err, "invalid request body")
+		return
+	}
+	err := h.wsvc.RecordRunUsage(r.Context(), wkr, runID, req.UsageRequest, req.ClaimGeneration)
+	if err != nil {
+		switch {
+		case errors.Is(err, workersvc.ErrRunNotOwned):
+			httpx.ErrorReason(w, http.StatusNotFound, "run not found for this worker", workersvc.ReceiptStale)
+		case errors.Is(err, workersvc.ErrMissingClaimGeneration):
+			httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on every usage report")
+		case errors.Is(err, workersvc.ErrStaleClaim):
+			httpx.JSON(w, http.StatusConflict, map[string]any{"disposition": "stale_claim"})
+		case errors.Is(err, workersvc.ErrUsageTooLarge):
+			httpx.Error(w, http.StatusBadRequest, "a usage report carries at most 500 records and 16 leg markers; split it")
+		case errors.Is(err, workersvc.ErrUsageRunUnsupported):
+			httpx.Error(w, http.StatusBadRequest, "usage is not recorded for this run")
+		case errors.Is(err, workersvc.ErrUsageInvalid):
+			httpx.Error(w, http.StatusBadRequest, "invalid usage report")
+		default:
+			// The wrapped store error is logged as an error value, never as fields: a *pgconn.PgError
+			// renders only severity, message and SQLSTATE, not the offending (worker-supplied) value.
+			slog.Error("worker run usage", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // forgeParkRefusalReason maps a forge-park precedence refusal (PRD #1392 M1) to the token the
 // WorkerRunState 409 {run, reason} body carries, which the worker dispatches on:
 //   - "stale_claim": a newer claim superseded this worker's, nothing was mutated — the worker

@@ -1959,7 +1959,7 @@ bound. A run whose outcome stays pending for 60 seconds
 (with the default heartbeat) is flagged stalled; see
 [run health](./run-health.md#what-the-flags-mean).
 
-`uzi run get` gains three rows, each emitted only when the server has
+`uzi run get` gains four rows, each emitted only when the server has
 something to say:
 
 | Row | When it appears | What it shows |
@@ -1967,6 +1967,7 @@ something to say:
 | `HOME` | the server has a fresh worker report of the run's size | the run's HOME and cache size, e.g. `4.2 GiB (cache 3.0 GiB)`; `at least` leads when the size walk was truncated (both numbers are then lower bounds) |
 | `CHECKPOINT` | the run is parked (`limit_wait`, `recovery_wait`, or `paused`) and the worker reported it | whether the checkpoint published for this park contains the run's latest committed work: `contains the latest work`, or `does NOT contain the latest committed work (the worker keeps it)` |
 | `DISK` | the run is parked with cause `data_volume_full` | the [waiting-for-disk-space sentence](run-recovery-wait.md#worker-data-volume-full), the next retry time, and the run's lifetime count of counted disk parks |
+| `EST. TAIL` | a Claude run has usage no result frame covered (an interrupted session) | the [estimated tail](run-cost.md#estimated-tail-of-an-interrupted-session), kept apart from `COST`: `~$1.23 estimated (price-table version) · 1.2M in/34k out · partial: <reasons>`, `<$0.01 estimated` under half a cent, or `cost unknown (unpriced)`; hidden for the all-zero, complete tail |
 
 `CHECKPOINT` shows while the run is actually parked (`limit_wait`,
 `recovery_wait`, or `paused`); the API clears the underlying flag on every

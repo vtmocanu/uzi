@@ -251,6 +251,20 @@ const CheckpointRetentionLockClass int32 = 0x757A6372 // "uzcr"
 // fails on any collision.
 const StoredFilesLockClass int32 = 0x757A7366 // "uzsf"
 
+// RunUsageLockClass is the class half of the two-int advisory lock that serializes every writer
+// of ONE run's estimated-usage-tail rows (issue #2014, ADR-2014 D11): the /usage route's
+// transaction and the incremental fold's leg upsert. Taken in SQL by LockRunUsage
+// (queries/run_usage_tail.sql), which carries this value as the literal 1970959731 with the objid
+// derived there from the run id; TestRunUsageLockClassMatchesSQL fails if the two disagree and
+// TestProductTokenMintLockClassMatchesSQL's source enumeration fails on any collision with another
+// *LockClass. It is the FIRST statement of both transactions that take it, before any usage row
+// write, and neither takes it while holding a row lock a peer could wait on in the other order, so
+// the two paths cannot deadlock. The route's transaction then takes the runs row FOR SHARE (its
+// fence recheck) while holding this lock; nothing holding a runs row lock takes this lock, so
+// that adds no cycle. XACT-scoped. An objid collision only serializes two unrelated
+// runs' usage writes for a moment.
+const RunUsageLockClass int32 = 0x757A7573 // "uzus"
+
 // Migrate runs all pending goose migrations against the database at dsn. It
 // retries the initial connection so the API can start slightly ahead of
 // Postgres becoming ready.

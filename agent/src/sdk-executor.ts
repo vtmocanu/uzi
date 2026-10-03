@@ -1078,6 +1078,8 @@ export class SdkExecutor implements Executor {
     // second run() on this instance (one executor per run is the norm, but keep
     // the latch honest regardless).
     this.reducer = new RunTurnReducerImpl(this.harness.contextHook);
+    // Issue #2014: each query() of this run records its per-message usage into the run's recorder.
+    this.harness.setUsageSink(ctx.usage);
     this.latestPlanSummary = undefined;
     const drive = await this.phaseSetup(ctx);
     try {
