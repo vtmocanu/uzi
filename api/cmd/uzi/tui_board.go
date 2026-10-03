@@ -752,18 +752,24 @@ func (m tuiModel) boardFooterLine() string {
 	helpW := visualWidth(help)
 	readout := m.versionReadout()
 	if helpW+gap+visualWidth(readout) <= m.width {
-		return m.withSplitNote(padVisual(help, m.width-visualWidth(readout)) + readout)
+		if candidate := m.withSplitNote(help); visualWidth(candidate)+gap+visualWidth(readout) <= m.width {
+			help = candidate
+		}
+		return padVisual(help, m.width-visualWidth(readout)) + readout
 	}
 	// Too narrow for the full readout: drop the "<arrow> <server>" suffix and show the
 	// client version alone (still red when behind, so the alarm survives the drop).
 	client := m.versionClientOnly()
 	cw := visualWidth(client)
 	if helpW+gap+cw <= m.width {
-		return m.withSplitNote(padVisual(help, m.width-cw) + client)
+		if candidate := m.withSplitNote(help); visualWidth(candidate)+gap+cw <= m.width {
+			help = candidate
+		}
+		return padVisual(help, m.width-cw) + client
 	}
 	// Still too narrow: give the client version the right edge, let help truncate.
 	left := clampVisual(help, m.width-cw-gap)
-	return m.withSplitNote(padVisual(left, m.width-cw) + client)
+	return padVisual(left, m.width-cw) + client
 }
 
 // versionReadout is the compact CLI-vs-server version line. The client version renders

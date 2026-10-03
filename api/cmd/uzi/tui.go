@@ -1699,17 +1699,20 @@ func (m tuiModel) View() tea.View {
 func (m tuiModel) renderHelp() string {
 	lines := helpLines(m.view)
 	if m.splitEligible() && m.listView() {
-		for i, line := range lines {
+		var splitLines []string
+		for _, line := range lines {
 			if strings.HasPrefix(line, "tab ") {
-				lines[i] = "tab        cycle floor, ci, pulls"
+				splitLines = append(splitLines, "tab        cycle floor, ci, pulls")
+				if m.view == viewBoard {
+					splitLines = append(splitLines, "1 / 2 / 3  focus floor / pulls / ci")
+				}
 			} else if strings.HasPrefix(line, "1 / 2 / 3 ") {
-				lines[i] = "1 / 2 / 3  focus floor / pulls / ci"
+				splitLines = append(splitLines, "1 / 2 / 3  focus floor / pulls / ci")
+			} else {
+				splitLines = append(splitLines, line)
 			}
 		}
-		if m.view == viewBoard {
-			lines = append(lines, "1 / 2 / 3  focus floor / pulls / ci")
-		}
-		lines = append(lines, "shift+tab  cycle floor, pulls, ci", "ctrl+w     switch pane focus", "s          collapse / restore split")
+		lines = append(splitLines, "shift+tab  cycle floor, pulls, ci", "ctrl+w     switch pane focus", "s          collapse / restore split")
 	}
 	return m.pal.title.Render("keybindings") + "\n\n" +
 		strings.Join(lines, "\n") + "\n\n" +

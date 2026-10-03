@@ -171,6 +171,45 @@ func TestSplitReviewSecondLinesRespectFocus(t *testing.T) {
 	}
 }
 
+func TestSplitReviewVersionedFooterShowsFittingNote(t *testing.T) {
+	oldVersion := version
+	version = "v0.84.0"
+	t.Cleanup(func() { version = oldVersion })
+	for _, tc := range []struct {
+		width, height int
+		server, note  string
+		fullReadout   bool
+	}{
+		{120, 60, "0.85.0", "s split", true},
+		{180, 30, "0.85.0", "terminal too small to split", true},
+		{120, 60, "0.99999999999999999999999999999999999999999999999999.0", "s split", false},
+	} {
+		t.Run(fmt.Sprintf("%dx%d/full=%v", tc.width, tc.height, tc.fullReadout), func(t *testing.T) {
+			m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+			m.showVersion, m.serverVersion = true, tc.server
+			m = resizeSplit(m, tc.width, tc.height)
+			m = press(t, m, "s")
+			fullFits := visualWidth(m.boardFooter())+1+visualWidth(m.versionReadout()) <= m.width
+			if fullFits != tc.fullReadout {
+				t.Fatal("fixture did not select the expected readout")
+			}
+			lines := strings.Split(stripANSI(m.View().Content), "\n")
+			footer := lines[len(lines)-1]
+			for _, want := range []string{tc.note, "q quit", "v0.84.0"} {
+				if !strings.Contains(footer, want) {
+					t.Errorf("footer lost %q: %q", want, footer)
+				}
+			}
+			if tc.fullReadout && !strings.Contains(footer, "⇢ 0.85.0") {
+				t.Errorf("footer lost full skew cue: %q", footer)
+			}
+			if visualWidth(footer) > m.width {
+				t.Errorf("footer overflow: %q", footer)
+			}
+		})
+	}
+}
+
 func TestSplitReviewHelpHasOneAlignedNavigationEntry(t *testing.T) {
 	for _, view := range []tuiView{viewBoard, viewCI, viewPulls} {
 		m := tuiTestModel(t, &uzicli.FakeClient{}, "")
@@ -179,11 +218,14 @@ func TestSplitReviewHelpHasOneAlignedNavigationEntry(t *testing.T) {
 		m = resizeSplit(m, 120, 60)
 		lines := strings.Split(stripANSI(m.renderHelp()), "\n")
 		tabs := 0
-		for _, line := range lines {
+		for i, line := range lines {
 			if strings.HasPrefix(line, "tab ") {
 				tabs++
 				if line != "tab        cycle floor, ci, pulls" {
 					t.Errorf("wrong tab help: %q", line)
+				}
+				if view == viewBoard && (i+1 == len(lines) || lines[i+1] != "1 / 2 / 3  focus floor / pulls / ci") {
+					t.Error("board numbered navigation is not grouped after tab")
 				}
 			}
 			for _, key := range []string{"shift+tab", "ctrl+w", "s"} {

@@ -189,7 +189,7 @@ func (m tuiModel) splitSeparatorLine() string {
 	return line
 }
 
-// A split note yields to the complete footer, including its version readout.
+// A split note yields to the supplied footer; callers reserve any separate readout.
 func (m tuiModel) withSplitNote(footer string) string {
 	if m.splitMode == "off" || !m.listView() || m.splitDrawn() {
 		return footer
