@@ -272,8 +272,9 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 //     never an error: `leg_id` must parse as a non-nil UUID; `sdk_session_id` is NUL-stripped,
 //     rune-capped (maxUsageIDRunes, matching its CHECK) and must be non-empty; `usage_through`
 //     must be an integer in 0..MaxInt32 (its column is int4 with a >= 0 CHECK); `usage_basis`
-//     reduces to one boolean. The frame's seq is server-side (already validated > 0 above) and
-//     the claim generation is the fenced one. The legs cap (maxUsageLegsPerRun) is applied under
+//     reduces to one boolean. The frame's seq is WORKER-supplied (IncomingMessage.Seq from the request body,
+//     validated > 0 above), so leg order (init_seq) is worker-controlled within its own run; the
+//     claim generation is the fenced one. The legs cap (maxUsageLegsPerRun) is applied under
 //     the per-run advisory lock, which is the FIRST statement of the stamp transaction, so an
 //     oversized or hostile stream of distinct leg ids is bounded and sets record_cap_reached
 //     instead of growing the table. The write runs in its own transaction and its error is

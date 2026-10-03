@@ -13,8 +13,9 @@
 // Units. Anthropic quotes USD per million tokens, which is exactly microdollars per token. Some
 // rates carry cents (12.50, 0.25), so a rate is held as an integer count of hundredths of a
 // microdollar per token, and a cost as an integer count of hundredths of a microdollar
-// (1e-8 USD). All arithmetic is integer (math/big, so a hostile token count cannot overflow);
-// nothing is float64 until USD converts the final exact figure for display.
+// (1e-8 USD). All arithmetic is integer (math/big, so a hostile token count cannot overflow the COST
+// computation; token COUNTS summed elsewhere are the caller's to saturate); nothing is float64
+// until USD converts the final exact figure for display.
 package anthropicprice
 
 import (

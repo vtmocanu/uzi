@@ -165,22 +165,28 @@ ORDER BY l.init_seq NULLS LAST, l.leg_id;
 -- side of a comparison is not a match):
 --   arm (a) the message's own leg's result covered its ordinal, or
 --   arm (b) a LATER leg of the SAME SDK session reported a session-cumulative total.
+-- Arm (b) is evaluated once per leg (lg), not once per message.
+WITH lg AS (
+    SELECT l.leg_id, l.covered_through
+    FROM run_usage_legs l
+    WHERE l.run_id = $1
+      AND l.init_seq IS NOT NULL
+      AND l.sdk_session_id IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM run_usage_legs c
+          WHERE c.run_id = l.run_id
+            AND c.covered_through IS NOT NULL
+            AND c.covered_cumulative
+            AND c.sdk_session_id = l.sdk_session_id
+            AND c.init_seq > l.init_seq)
+)
 SELECT m.message_id, m.leg_id, m.ordinal, m.model, m.subagent,
        m.input_tokens, m.cache_read_input_tokens, m.cache_creation_input_tokens,
        m.cache_creation_5m_input_tokens, m.cache_creation_1h_input_tokens, m.output_tokens,
        m.output_final, m.service_tier, m.speed, m.inference_geo
 FROM run_usage_messages m
-JOIN run_usage_legs l ON l.run_id = m.run_id AND l.leg_id = m.leg_id
+JOIN lg ON lg.leg_id = m.leg_id
 WHERE m.run_id = $1
   AND NOT m.conflict
-  AND l.init_seq IS NOT NULL
-  AND l.sdk_session_id IS NOT NULL
-  AND NOT EXISTS (
-      SELECT 1 FROM run_usage_legs c
-      WHERE c.run_id = m.run_id
-        AND c.covered_through IS NOT NULL
-        AND ((c.leg_id = m.leg_id AND m.ordinal <= c.covered_through)
-             OR (c.covered_cumulative
-                 AND c.sdk_session_id = l.sdk_session_id
-                 AND c.init_seq > l.init_seq)))
+  AND (lg.covered_through IS NULL OR m.ordinal > lg.covered_through)
 ORDER BY m.leg_id, m.ordinal, m.message_id;

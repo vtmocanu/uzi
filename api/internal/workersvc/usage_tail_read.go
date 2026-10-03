@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/google/uuid"
@@ -113,6 +114,15 @@ func supersededLegs(legs []store.ListRunUsageLegsForTailRow) map[uuid.UUID]bool 
 	return out
 }
 
+// satAdd adds two non-negative token counts, clamping at MaxInt64 instead of wrapping negative.
+// Every stored count is a bigint a worker may set arbitrarily high, so a sum can overflow.
+func satAdd(a, b int64) int64 {
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
+}
+
 // modelAcc accumulates one model's share of the tail.
 type modelAcc struct {
 	in, cacheRead, cacheCreate, out int64
@@ -173,19 +183,19 @@ func buildUsageTail(legs []store.ListRunUsageLegsForTailRow, tail []store.ListRu
 		if !m.OutputFinal {
 			reasons[UsageTailReasonOutputNotFinal] = true
 		}
-		dto.InputTokens += m.InputTokens
-		dto.CacheReadTokens += m.CacheReadInputTokens
-		dto.CacheCreationTokens += m.CacheCreationInputTokens
-		dto.OutputTokens += m.OutputTokens
+		dto.InputTokens = satAdd(dto.InputTokens, m.InputTokens)
+		dto.CacheReadTokens = satAdd(dto.CacheReadTokens, m.CacheReadInputTokens)
+		dto.CacheCreationTokens = satAdd(dto.CacheCreationTokens, m.CacheCreationInputTokens)
+		dto.OutputTokens = satAdd(dto.OutputTokens, m.OutputTokens)
 		acc := byModel[m.Model]
 		if acc == nil {
 			acc = &modelAcc{allPriced: true}
 			byModel[m.Model] = acc
 		}
-		acc.in += m.InputTokens
-		acc.cacheRead += m.CacheReadInputTokens
-		acc.cacheCreate += m.CacheCreationInputTokens
-		acc.out += m.OutputTokens
+		acc.in = satAdd(acc.in, m.InputTokens)
+		acc.cacheRead = satAdd(acc.cacheRead, m.CacheReadInputTokens)
+		acc.cacheCreate = satAdd(acc.cacheCreate, m.CacheCreationInputTokens)
+		acc.out = satAdd(acc.out, m.OutputTokens)
 		u := anthropicprice.Usage{
 			Model:                    m.Model,
 			InputTokens:              m.InputTokens,

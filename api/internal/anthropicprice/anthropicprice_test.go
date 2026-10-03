@@ -37,26 +37,40 @@ func TestPriceFractionalMicrodollarIsExact(t *testing.T) {
 }
 
 func TestPriceEveryRowMatchesTheFetchedTable(t *testing.T) {
-	// 1M input, 1M output, 1M cache read, 1M 5m write, 1M 1h write per model, in USD/MTok.
-	want := map[string]float64{
-		"claude-fable-5-1":          10 + 50 + 0.25 + 12.5 + 20,
-		"claude-opus-5-5":           4 + 20 + 0.20 + 5 + 8,
-		"claude-opus-5":             5 + 25 + 0.50 + 6.25 + 10,
-		"claude-opus-4-8":           5 + 25 + 0.50 + 6.25 + 10,
-		"claude-sonnet-5-5":         2 + 10 + 0.20 + 2.5 + 4,
-		"claude-haiku-4-5":          1 + 5 + 0.10 + 1.25 + 2,
-		"claude-haiku-4-5-20251001": 1 + 5 + 0.10 + 1.25 + 2,
+	// The fetched table, USD per MTok, typed in by hand per column (pricing page "Model pricing").
+	// Each column is priced alone with 1M tokens, so a swapped or mistyped column fails by name
+	// rather than cancelling inside a sum.
+	type row struct{ input, cacheRead, write5m, write1h, output float64 }
+	want := map[string]row{
+		"claude-fable-5-1":          {10, 0.25, 12.5, 20, 50},
+		"claude-opus-5-5":           {4, 0.20, 5, 8, 20},
+		"claude-opus-5":             {5, 0.50, 6.25, 10, 25},
+		"claude-opus-4-8":           {5, 0.50, 6.25, 10, 25},
+		"claude-sonnet-5-5":         {2, 0.20, 2.5, 4, 10},
+		"claude-haiku-4-5":          {1, 0.10, 1.25, 2, 5},
+		"claude-haiku-4-5-20251001": {1, 0.10, 1.25, 2, 5},
 	}
 	if len(table) != len(want) {
 		t.Fatalf("table has %d rows, test expects %d", len(table), len(want))
 	}
-	for model, usd := range want {
-		got, ok := Price(Usage{
-			Model: model, InputTokens: 1_000_000, OutputTokens: 1_000_000, CacheReadInputTokens: 1_000_000,
-			CacheCreationInputTokens: 2_000_000, CacheCreation5mTokens: i64(1_000_000), CacheCreation1hTokens: i64(1_000_000),
-		})
-		if !ok || got.USD() != usd {
-			t.Errorf("%s: USD = %v ok=%v, want %v", model, got.USD(), ok, usd)
+	const m = int64(1_000_000)
+	for model, w := range want {
+		cols := []struct {
+			name string
+			u    Usage
+			usd  float64
+		}{
+			{"input", Usage{Model: model, InputTokens: m}, w.input},
+			{"cache read", Usage{Model: model, CacheReadInputTokens: m}, w.cacheRead},
+			{"5m write", Usage{Model: model, CacheCreationInputTokens: m, CacheCreation5mTokens: i64(m)}, w.write5m},
+			{"1h write", Usage{Model: model, CacheCreationInputTokens: m, CacheCreation1hTokens: i64(m)}, w.write1h},
+			{"output", Usage{Model: model, OutputTokens: m}, w.output},
+		}
+		for _, c := range cols {
+			got, ok := Price(c.u)
+			if !ok || got.USD() != c.usd {
+				t.Errorf("%s %s: USD per MTok = %v ok=%v, want %v", model, c.name, got.USD(), ok, c.usd)
+			}
 		}
 	}
 }

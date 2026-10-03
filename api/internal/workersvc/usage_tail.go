@@ -11,6 +11,7 @@ import (
 	"sort"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -201,6 +202,10 @@ func (s *Service) RecordRunUsage(ctx context.Context, wkr store.Worker, runID uu
 	if err != nil {
 		return err
 	}
+	if err := setUsageWriteIsolation(ctx, tx); err != nil {
+		_ = tx.Rollback(ctx)
+		return err
+	}
 	// A no-op after a successful Commit; on every early return it releases the advisory lock.
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := store.New(tx)
@@ -220,6 +225,18 @@ func (s *Service) RecordRunUsage(ctx context.Context, wkr store.Worker, runID uu
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// setUsageWriteIsolation pins a usage writer's transaction to READ COMMITTED. It must be the
+// transaction's first statement. The cap argument depends on it: the caps are counted AFTER
+// the per-run advisory lock is held, and under READ COMMITTED each statement sees everything the
+// previous lock holder committed, whereas a REPEATABLE READ snapshot (a pool whose default
+// isolation is stricter) would be fixed at the first statement and could count stale rows.
+func setUsageWriteIsolation(ctx context.Context, tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+		return fmt.Errorf("run usage: set isolation: %w", err)
+	}
+	return nil
 }
 
 // legMarker is the merged marker for one leg across a request (GREATEST on repeats).
@@ -340,14 +357,21 @@ func writeUsagePost(ctx context.Context, q *store.Queries, runID uuid.UUID, req 
 			}
 		}
 	}
-	// Count each distinct dropped new id once: ids whose leg the cap blocked, and ids the message
+	// keep reports whether a record is written: an existing id is always updated (its leg is
+	// never inserted, so the foreign key is not exercised), a NEW id needs the message cap AND an
+	// admitted leg for THIS record. Checking the leg per record matters: the same new id posted
+	// under an admitted leg and under a leg the legs cap refused is admitted by id, and writing
+	// the refused-leg copy would violate the (run_id, leg_id) foreign key on every retry.
+	keep := func(m UsageRecord) bool {
+		return existingMsg[m.MessageID] || (admittedMsg[m.MessageID] && admittedLeg[m.LegID])
+	}
+	// Count each distinct dropped id once: records whose leg the cap blocked, and ids the message
 	// cap blocked.
 	dropped := map[string]bool{}
 	for _, m := range req.Messages {
-		if existingMsg[m.MessageID] || admittedMsg[m.MessageID] {
-			continue
+		if !keep(m) {
+			dropped[m.MessageID] = true
 		}
-		dropped[m.MessageID] = true
 	}
 	cappedRecords = int64(len(dropped))
 
@@ -373,7 +397,7 @@ func writeUsagePost(ctx context.Context, q *store.Queries, runID uuid.UUID, req 
 	}
 	msgs := make([]UsageRecord, 0, len(req.Messages))
 	for _, m := range req.Messages {
-		if existingMsg[m.MessageID] || admittedMsg[m.MessageID] {
+		if keep(m) {
 			msgs = append(msgs, m)
 		}
 	}
@@ -458,6 +482,22 @@ type usageStampPayload struct {
 	UsageThrough json.RawMessage `json:"usage_through"`
 }
 
+// resultFrameMetered reports whether the metered fold (foldUsageFrames) would meter this result
+// frame: it decodes into resultUsagePayload, is a result event, and carries at least one
+// non-empty model key.
+func resultFrameMetered(payload json.RawMessage) bool {
+	var p resultUsagePayload
+	if json.Unmarshal(payload, &p) != nil || p.Event != "result" {
+		return false
+	}
+	for model := range p.ModelUsage {
+		if model != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // collectUsageStamps lifts the valid stamps out of a delivered batch. A bad stamp is SKIPPED, never
 // an error: the append and the metered fold already landed and must stay untouched by a hostile
 // or garbled stamp.
@@ -492,10 +532,10 @@ func collectUsageStamps(msgs []IncomingMessage) []usageStamp {
 			}
 			out = append(out, usageStamp{kind: usageStampInit, legID: legID, seq: m.Seq, sessionID: sess, claimGen: m.ClaimGeneration})
 		case p.Event == "result":
-			// The same skip as the metered fold: a result frame with no per-model usage is not a
-			// result the metered total counted, so it covers nothing.
-			var mu map[string]json.RawMessage
-			if json.Unmarshal(p.ModelUsage, &mu) != nil || len(mu) == 0 {
+			// The SAME acceptance as the metered fold (foldUsageFrames): the frame must decode
+			// into resultUsagePayload, and at least one model key must be non-empty. A frame the
+			// fold did not meter covers nothing, so it must never set covered_through.
+			if !resultFrameMetered(m.Payload) {
 				continue
 			}
 			var through int64
@@ -521,7 +561,9 @@ func collectUsageStamps(msgs []IncomingMessage) []usageStamp {
 // and a database error is logged (the error carries no worker text) and dropped; the worker's
 // next delivery of the same frames re-runs the same idempotent, monotone upserts.
 func (s *Service) foldUsageTailStamps(ctx context.Context, run store.Run, msgs []IncomingMessage) {
-	if run.Kind == runkind.Chat || run.Harness == harnessCodex || s.txBeginner == nil {
+	// An isolated-lane run (profile-bound) is refused by the /usage route and must not grow legs
+	// through the stamp path either.
+	if run.Kind == runkind.Chat || run.Harness == harnessCodex || run.EgressProfileID.Valid || s.txBeginner == nil {
 		return
 	}
 	stamps := collectUsageStamps(msgs)
@@ -539,8 +581,12 @@ func (s *Service) applyUsageStamps(ctx context.Context, runID uuid.UUID, stamps 
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := setUsageWriteIsolation(ctx, tx); err != nil {
+		return err
+	}
 	q := store.New(tx)
-	// FIRST statement: the per-run usage lock, before any row write (ADR-2014 D11).
+	// FIRST statement after the isolation pin: the per-run usage lock, before any row write
+	// (ADR-2014 D11).
 	if err := q.LockRunUsage(ctx, runID); err != nil {
 		return err
 	}

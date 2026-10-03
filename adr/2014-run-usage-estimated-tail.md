@@ -127,8 +127,10 @@ seq)` and `sdk_session_id = COALESCE(existing, stamped)`. Leg order is `init_seq
 
 **Result stamp.** Both `projectResult` emit sites in `agent/src/harness-messages.ts`
 (the `status` and the `error` result) stamp `leg_id` and `usage_through`, the leg's
-highest ordinal at that point. `foldUsageFrames`, **after** the unchanged
-`UpsertRunUsage` loop and only past the `len(p.ModelUsage) == 0` skip, sets:
+highest ordinal at that point. The incremental wrapper `foldRunUsage` (not the shared
+`foldUsageFrames` body), **after** the unchanged metered fold and only for a frame the metered
+fold accepts (it decodes as `resultUsagePayload`, is a `result` event, and has at least one
+non-empty model key), sets:
 
 ```sql
 covered_through    = GREATEST(covered_through, usage_through)
