@@ -162,6 +162,7 @@ import {
   type CodexRootHandle,
   type CommandCacheHolder,
   type DisposeOutcome,
+  type LauncherDeps,
   SupervisedChildExitTimeoutError,
 } from "./launcher.js";
 import { createCodexTransport } from "./transport.js";
@@ -1495,6 +1496,9 @@ export interface CodexExecutorDeps {
    * selecting only a validated in-container HTTP loopback provider with WebSockets off.
    * Production leaves this absent and keeps pinned Codex's built-in provider. */
   readonly appServerAuthOpenAIBaseUrlForTest?: string;
+  /** Test seam replacing the real launcher inside the DEFAULT provider launch path (when
+   * `launchProviderRoot` is absent), so a test can observe the deps the run lane hands it. */
+  readonly launchCodexRootForTest?: typeof launchCodexRoot;
   /** issue #1783 (R0): reads a launched supervisor pid's start time when it is recorded as a root
    *  (default procfs); a test whose fake launcher returns a fake pid injects it. */
   readonly rootStartTime?: StartTimeReader;
@@ -2001,9 +2005,9 @@ export class CodexExecutor implements Executor {
       // the per-run home itself, so the create-only gid repair still fires. `prepareCodexRunHome`
       // then creates the fresh per-run home (created=true → repair → worker:runner 3770) BEFORE
       // devbox materializes it with the wrong (inherited) gid. Gated on the same
-      // `launchProviderRoot === undefined` production gate the per-epoch prepare uses, so injected
+      // `providerLaunchInjected()` production gate the per-epoch prepare uses, so injected
       // launcher tests keep owning their synthetic filesystem.
-      if (this.deps.launchProviderRoot === undefined) {
+      if (!this.providerLaunchInjected()) {
         await fs.mkdir(this.provisionHomeDir, { recursive: true });
         await prepareCodexRunHome(this.homeRoot);
       }
@@ -2784,6 +2788,13 @@ export class CodexExecutor implements Executor {
     }
   }
 
+  /** A unit seam replaces the real provider launch (and so owns a synthetic filesystem). The
+   * launcher-level test seam counts too: it replaces the launcher but keeps the default
+   * launch closure, whose wiring a test observes. */
+  private providerLaunchInjected(): boolean {
+    return this.deps.launchProviderRoot !== undefined || this.deps.launchCodexRootForTest !== undefined;
+  }
+
   // ─── the per-epoch provider bundle (m4: new-root resume) ──────────────────────
   /**
    * Build ONE fresh provider epoch: a NEW {@link ExecutionRegistry} (a distinct local-execution
@@ -2824,7 +2835,7 @@ export class CodexExecutor implements Executor {
     // idempotent: on the already-initialized home (run() initialized it before provisioning) it
     // hits created=false and validates the correct worker:runner 3770, or throws if tampered.
     // Injected launchProviderRoot tests own their synthetic filesystem and skip this production step.
-    if (this.deps.launchProviderRoot === undefined) {
+    if (!this.providerLaunchInjected()) {
       await prepareCodexRunHome(homeRoot);
     }
 
@@ -2921,6 +2932,10 @@ export class CodexExecutor implements Executor {
           spec,
           authMode,
           this.deps.appServerAuthOpenAIBaseUrlForTest,
+          // The complete live redactor (claim secrets + runtime-released tokens), so a
+          // provisioning failure never publishes a credential from the helper's stderr.
+          scrubProjected,
+          this.deps.launchCodexRootForTest,
         ));
       const buildPhaseBroker = (phase: "plan" | "implement", signal?: AbortSignal): CodexCallbackBroker => {
         const runPlan = buildCodexRunPlan(
@@ -2962,7 +2977,7 @@ export class CodexExecutor implements Executor {
       // command identity out of the dedicated session-reader path. The staging tree is gone before
       // the harness can send initialize or any model-bearing request.
       const providerLaunchSeam: LaunchRootSeam = async (spec) => {
-        if (this.deps.launchProviderRoot !== undefined) {
+        if (this.providerLaunchInjected()) {
           // Unit seams own a synthetic filesystem and retain the direct adopt call so
           // their established control-flow timing and session-operation evidence stay
           // independent of the production launcher staging protocol.
@@ -4544,8 +4559,14 @@ async function defaultLaunchProviderRoot(
   spec: CodexLaunchRootSpec,
   authMode: CodexAppServerAuthMode,
   openAIBaseUrlForTest?: string,
+  redactDiagnostic?: (s: string) => string,
+  launch: typeof launchCodexRoot = launchCodexRoot,
 ): Promise<CodexLaunchRootResult> {
-  const handle = await launchCodexRoot({
+  const launcherDeps: LauncherDeps = {
+    ...(openAIBaseUrlForTest === undefined ? {} : { appServerAuthOpenAIBaseUrlForTest: openAIBaseUrlForTest }),
+    ...(redactDiagnostic === undefined ? {} : { redactDiagnostic }),
+  };
+  const handle = await launch({
     ownedDataRoot: spec.ownedDataRoot,
     // No credentialValue: the token flows over `account/login/start`, never the launcher env.
     provider: {
@@ -4567,9 +4588,7 @@ async function defaultLaunchProviderRoot(
     // app-server share the host.
     codeModeHost: true,
     seedSession: spec.seedSession,
-  }, openAIBaseUrlForTest === undefined
-    ? undefined
-    : { appServerAuthOpenAIBaseUrlForTest: openAIBaseUrlForTest });
+  }, launcherDeps);
   const stdout = handle.transport.stdout;
   const stdin = handle.transport.stdin;
   if (!stdout || !stdin) throw new Error("codex provider root is missing a stdio transport channel");

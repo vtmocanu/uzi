@@ -1490,6 +1490,35 @@ describe("CodexExecutor: credential bridge + isolation", () => {
     assert.equal(added, removed, "every registration is balanced by an eviction (releasedTokens ends empty)");
   });
 
+  it("the default provider launch hands the launcher the complete live redactor (claim secrets + released tokens)", async () => {
+    const rig = makeRig();
+    const claimSecret = "claim-" + "secret-abcdefgh1234";
+    let captured: ((s: string) => string) | undefined;
+    let scrubbedAtLaunch = "";
+    // launchProviderRoot is NOT set, so the production default path runs; only the real
+    // launcher is replaced, and it records what the run lane gave it.
+    const { launchProviderRoot: _unused, ...rest } = rig.deps;
+    void _unused;
+    rig.deps = {
+      ...rest,
+      launchCodexRootForTest: async (_spec, launcherDeps) => {
+        captured = launcherDeps?.redactDiagnostic;
+        scrubbedAtLaunch = captured?.(`claim ${claimSecret} token ${FRESH_TOKEN}`) ?? "";
+        throw new Error("sentinel launch stop");
+      },
+    };
+    const redactClaim = makeTextRedactor([claimSecret]);
+    const { ctx } = makeCtx({ redactText: redactClaim });
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "default launch wiring"),
+      /sentinel launch stop/,
+    );
+    assert.ok(captured, "the run lane passed a redactDiagnostic to the launcher");
+    assert.ok(!scrubbedAtLaunch.includes(claimSecret), "the claim secret is scrubbed");
+    assert.ok(!scrubbedAtLaunch.includes(FRESH_TOKEN), "the runtime-released token is scrubbed");
+    assert.equal(scrubbedAtLaunch, "claim ***REDACTED*** token ***REDACTED***");
+  });
+
   it("(11b) an api_key run logs in with an api key (not chatgptAuthTokens) and constructs the auth session", async () => {
     const rig = makeRig();
     rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();

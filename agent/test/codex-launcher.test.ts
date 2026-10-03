@@ -22,6 +22,9 @@ import {
   type RunnerTreeRequest,
   type SupervisorProcess,
 } from "../src/codex/launcher.js";
+import { makeTextRedactor } from "../src/redact.js";
+import { SESSION_SEED_ENTRYPOINT } from "../src/codex/session-seed-cli.js";
+import type { ProvisionSpawnSync } from "../src/codex/launcher.js";
 import { runLaunchCli, type LaunchCliDeps } from "../src/codex/launch-cli.js";
 import { WORKER_SPAWN_ENV, workerRunnerRootPids } from "../src/worker-spawn-mark.js";
 
@@ -630,7 +633,7 @@ describe("launchCodexRoot: trusted construction contract", () => {
         await fs.writeFile(marker, "existing root must survive");
         const fake = newFake();
         await assert.rejects(
-          launchCodexRoot(baseSpec({ ownedDataRoot: root }), baseDeps(fake, { makeRunnerTrees: undefined })),
+          launchCodexRoot(baseSpec({ ownedDataRoot: root }), baseDeps(fake, { makeRunnerTrees: undefined, redactDiagnostic: (t) => t })),
           // EEXIST specifically: a reuse-permitting create would fail later (or not at all), never here.
           /runner-owned tree creation failed[\s\S]*File exists/,
         );
@@ -999,5 +1002,115 @@ describe("runLaunchCli: packaged entrypoint (knip-visible import)", () => {
     });
     assert.equal(code, 2);
     assert.match(lines.join(""), /"event":"spec-error"/);
+  });
+});
+
+describe("launchCodexRoot: provisioning failure diagnostics", () => {
+  const SEED_ARG = "/app/src/codex/session-seed-cli.ts";
+  type Step = "tree" | "share" | "seed" | "write" | "rm";
+  type Result = Partial<{ status: number | null; signal: NodeJS.Signals | null; stderr: string; error: Error }>;
+  const provisionCalls: { command: string; args: readonly string[]; step: Step }[] = [];
+
+  function scripted(results: Partial<Record<Step, Result>>): ProvisionSpawnSync {
+    return (command, args) => {
+      const a = [...args];
+      const step: Step = a.includes(SEED_ARG) ? "seed"
+        : a.includes("--") && a.includes("-rf") ? "rm"
+        : provisionCalls.length === 0 ? "tree"
+        : a.some((x) => x.includes("chgrp")) ? "share" : "write";
+      provisionCalls.push({ command, args: a, step });
+      const r = results[step] ?? {};
+      return {
+        pid: 1, output: [], stdout: Buffer.alloc(0),
+        status: r.status === undefined ? 0 : r.status,
+        signal: r.signal ?? null,
+        stderr: Buffer.from(r.stderr ?? ""),
+        ...(r.error === undefined ? {} : { error: r.error }),
+      } as ReturnType<ProvisionSpawnSync>;
+    };
+  }
+  function seedSpec(): CodexLaunchSpec {
+    return baseSpec({ useAppServerAuth: true, authMode: "subscription", seedSession: true });
+  }
+  async function failure(results: Partial<Record<Step, Result>>, deps: Partial<LauncherDeps>, spec = seedSpec()): Promise<string> {
+    provisionCalls.length = 0;
+    const fake = newFake();
+    try {
+      await launchCodexRoot(spec, baseDeps(fake, { makeRunnerTrees: undefined, provisionSpawnSync: scripted(results), ...deps }));
+    } catch (e) {
+      return (e as Error).message;
+    }
+    assert.fail("expected the launch to fail");
+  }
+  const SECRET = "tok-" + "abcdefgh12345678";
+  function noFragment(text: string, secret: string): void {
+    for (let i = 0; i + 8 <= secret.length; i++) assert.ok(!text.includes(secret.slice(i, i + 8)), `leaked fragment ${secret.slice(i, i + 8)}`);
+  }
+
+  it("the seed step names the stderr when a redactor is supplied", async () => {
+    const msg = await failure({ seed: { status: 1, stderr: "seed boom: EACCES" } }, { redactDiagnostic: makeTextRedactor([]) });
+    assert.match(msg, /^runner-owned session seed failed \(exit 1\): seed boom: EACCES$/);
+    assert.ok(provisionCalls.find((c) => c.step === "seed")?.args.includes(SESSION_SEED_ENTRYPOINT));
+  });
+
+  it("keeps only a bounded tail of oversized stderr", async () => {
+    const big = "HEAD-MARK" + "x".repeat(10_000) + "TAIL-MARK";
+    const msg = await failure({ seed: { status: 1, stderr: big } }, { redactDiagnostic: (t) => t });
+    assert.ok(msg.includes("…[truncated]"));
+    assert.ok(msg.endsWith("TAIL-MARK"));
+    assert.ok(!msg.includes("HEAD-MARK"));
+    assert.ok(msg.length < 4096 + 200, `message length ${msg.length}`);
+  });
+
+  it("reports the signal, and a spawn error code but never its message", async () => {
+    const killed = await failure({ seed: { status: null, signal: "SIGKILL", stderr: "" } }, { redactDiagnostic: (t) => t });
+    assert.match(killed, /\(exit null, signal SIGKILL\)/);
+    const err = Object.assign(new Error("argv-echo UNIQUE-ERR-MSG"), { code: "ENOENT" });
+    const spawnErr = await failure({ tree: { status: null, error: err } }, { redactDiagnostic: (t) => t });
+    assert.match(spawnErr, /spawn error ENOENT/);
+    assert.ok(!spawnErr.includes("UNIQUE-ERR-MSG"));
+  });
+
+  it("redacts a secret in stderr", async () => {
+    const msg = await failure({ seed: { status: 1, stderr: `cannot read ${SECRET} now` } }, { redactDiagnostic: makeTextRedactor([SECRET]) });
+    assert.ok(msg.includes("***REDACTED***"), msg);
+    noFragment(msg, SECRET);
+  });
+
+  it("redacts before truncating, so a secret straddling the tail boundary leaves no fragment", async () => {
+    // Cutting the RAW stderr to its last 4096 chars would land 12 chars into SECRET and keep
+    // its final 8 chars; redacting the whole text first must leave nothing of it.
+    const stderr = "z".repeat(500) + SECRET + "y".repeat(4096 - 12);
+    assert.equal(stderr.length - 4096, 500 + SECRET.length - 12, "fixture places the raw cut inside the secret");
+    const msg = await failure({ seed: { status: 1, stderr } }, { redactDiagnostic: makeTextRedactor([SECRET]) });
+    assert.ok(msg.includes("…[truncated]"));
+    noFragment(msg, SECRET);
+  });
+
+  it("withholds stderr entirely without a redactor, on every step", async () => {
+    const marker = "UNIQUE-STDERR-MARK";
+    const tree = await failure({ tree: { status: 3, stderr: marker } }, {});
+    assert.match(tree, /^runner-owned tree creation failed \(exit 3\): stderr withheld \(no redactor\)$/);
+    const seed = await failure({ seed: { status: null, signal: "SIGTERM", stderr: marker } }, {});
+    assert.match(seed, /^runner-owned session seed failed \(exit null, signal SIGTERM\): stderr withheld \(no redactor\)$/);
+    const share = await failure({ share: { status: 2, stderr: marker } }, {});
+    assert.ok(share.endsWith("stderr withheld (no redactor)") && !share.includes(marker));
+    for (const m of [tree, seed]) assert.ok(!m.includes(marker));
+  });
+
+  it("removes the tree and never spawns the supervisor after a seed failure", async () => {
+    await failure({ seed: { status: 1, stderr: "x" } }, {});
+    const rm = provisionCalls.find((c) => c.step === "rm");
+    assert.ok(rm, "cleanup rm -rf was issued through the injected spawn");
+    assert.deepEqual(rm.args.slice(-3), ["-rf", "--", DATA_ROOT]);
+    assert.equal(spawnCalls.length, 0);
+  });
+
+  it("carries the bounded tail for tree creation and file write failures with a redactor", async () => {
+    const redactDiagnostic = makeTextRedactor([SECRET]);
+    const tree = await failure({ tree: { status: 1, stderr: `mkdir: ${SECRET} exists` } }, { redactDiagnostic });
+    assert.match(tree, /^runner-owned tree creation failed \(exit 1\): mkdir: \*\*\*REDACTED\*\*\* exists$/);
+    const write = await failure({ write: { status: 1, stderr: "cat: denied" } }, { redactDiagnostic });
+    assert.match(write, /^runner-owned file write failed for \S+ \(exit 1\): cat: denied$/);
   });
 });

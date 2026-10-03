@@ -31,7 +31,7 @@
 // dispose) reports FAILURE / not-clean-disposal for exactly THIS owned root; we never
 // mint a run-level permit or `observed_empty`.
 
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
 import { lstatSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
@@ -54,7 +54,7 @@ import {
   buildCodexProductionConfigToml,
 } from "./config.js";
 import type { CodexAppServerAuthMode } from "./appserver-auth.js";
-import { SESSION_SEED_ENTRYPOINT } from "./session-seed-cli.js";
+import { SESSION_SEED_APP_ROOT, sessionSeedInvocation } from "./session-seed-cli.js";
 
 // ─── Bounds (fixture-derived; supervisor-side limits are matched, not trusted) ────
 const MAX_EVIDENCE_LINES = 256;
@@ -185,6 +185,13 @@ export interface LauncherDeadlines {
   readonly exit: number;
 }
 
+/** A spawnSync-shaped function; tests inject one to script provisioning outcomes. */
+export type ProvisionSpawnSync = (
+  command: string,
+  args: readonly string[],
+  options: SpawnSyncOptions,
+) => SpawnSyncReturns<Buffer>;
+
 export interface LauncherDeps {
   /** Env consulted for the supported-profile gate (defaults to process.env). */
   readonly env?: NodeJS.ProcessEnv;
@@ -193,6 +200,11 @@ export interface LauncherDeps {
   readonly resolveCommandUid?: () => number;
   readonly resolveWorkerUid?: () => number;
   readonly makeRunnerTrees?: MakeRunnerTrees;
+  /** Scrubs provisioning stderr before it is published in a launch error. Absent: the
+   * stderr is withheld entirely. Must be the complete live redactor. */
+  readonly redactDiagnostic?: (s: string) => string;
+  /** Spawn used by the default tree provisioning/removal (default: spawnSync). */
+  readonly provisionSpawnSync?: ProvisionSpawnSync;
   /** Remove the runner-owned launch tree after, and only after, its supervisor
    * proves a drained disposal. Tests inject this alongside makeRunnerTrees. */
   readonly removeRunnerTree?: RemoveRunnerTree;
@@ -338,11 +350,41 @@ function defaultResolveRunnerUid(): number {
   return uid;
 }
 
+const PROVISION_STDERR_TAIL_MAX = 4096;
+
+interface ProvisionOptions {
+  readonly redact?: ((s: string) => string) | undefined;
+  readonly spawn?: ProvisionSpawnSync | undefined;
+}
+
+/** Build the error for a failed provisioning step: exit/signal/spawn-error code (never the
+ * spawn error's message, which echoes argv). Stderr is published only through a redactor,
+ * applied to the WHOLE text before the tail cut so a secret straddling the cut cannot
+ * survive as a fragment; with no redactor it is withheld. */
+function provisioningFailure(
+  step: string,
+  r: SpawnSyncReturns<Buffer | string>,
+  redact: ((s: string) => string) | undefined,
+  target?: string,
+): Error {
+  let msg = `${step} failed${target === undefined ? "" : ` for ${target}`} (exit ${String(r.status)}`;
+  if (r.signal !== null && r.signal !== undefined) msg += `, signal ${r.signal}`;
+  if (r.error !== undefined) msg += `, spawn error ${(r.error as NodeJS.ErrnoException).code ?? r.error.name}`;
+  msg += ")";
+  if (redact === undefined) return new Error(`${msg}: stderr withheld (no redactor)`);
+  const clean = redact(String(r.stderr ?? ""));
+  const tail = clean.length > PROVISION_STDERR_TAIL_MAX
+    ? `…[truncated]${clean.slice(-PROVISION_STDERR_TAIL_MAX)}`
+    : clean;
+  return new Error(`${msg}: ${tail}`);
+}
+
 /** Default privileged provisioning: create the dirs as the runner uid via setpriv
  * (`runnerCommand`) and write the config 0600, never chown. Trees stay 0700 except
  * for the narrow managed-auth session export posture on RunnerTreeRequest.
  * File content is fed on stdin so it is never embedded in an argv. */
-function defaultMakeRunnerTrees(request: RunnerTreeRequest): void {
+function defaultMakeRunnerTrees(request: RunnerTreeRequest, opts: ProvisionOptions = {}): void {
+  const run = opts.spawn ?? spawnSync;
   // The helper itself runs as the shared runner uid, so it must not inherit the worker
   // process environment: another concurrent runner can read a normal helper process via
   // /proc/<pid>/environ. Only inert locale/path values cross this short provisioning step.
@@ -354,8 +396,8 @@ function defaultMakeRunnerTrees(request: RunnerTreeRequest): void {
     `root="$1"; uid="$2"; shift 2; umask 077; mkdir -m 700 -- "$root"; trap 'rc=$?; [ "$rc" -eq 0 ] || rm -rf -- "$root"; exit "$rc"' EXIT; chmod 700 "$root"; for d in "$@"; do mkdir -m 700 -- "$d"; chmod 700 "$d"; done; for d in "$root" "$@"; do [ "$(stat -c %u "$d")" = "$uid" ] && [ "$(stat -c %a "$d")" = 700 ]; done; trap - EXIT`,
     "sh", request.root, String(request.uid), ...request.dirs,
   ]);
-  const r = spawnSync(mk.command, mk.args, { env: provisionEnv, stdio: ["ignore", "ignore", "pipe"] });
-  if (r.status !== 0) throw new Error(`runner-owned tree creation failed (exit ${String(r.status)}): ${String(r.stderr)}`);
+  const r = run(mk.command, mk.args, { env: provisionEnv, stdio: ["ignore", "ignore", "pipe"] });
+  if (r.status !== 0 || r.error !== undefined) throw provisioningFailure("runner-owned tree creation", r, opts.redact);
   try {
     const shared = request.sharedSessionRead;
     if (shared !== undefined) {
@@ -364,24 +406,16 @@ function defaultMakeRunnerTrees(request: RunnerTreeRequest): void {
         `root="$1"; codex="$2"; sessions="$3"; uid="$4"; gid="$5"; chgrp "$gid" "$root" "$codex"; chmod 710 "$root" "$codex"; mkdir -m 2750 -- "$sessions"; chgrp "$gid" "$sessions"; chmod 2750 "$sessions"; [ "$(stat -c %u "$root")" = "$uid" ] && [ "$(stat -c %g "$root")" = "$gid" ] && [ "$(stat -c %a "$root")" = 710 ] && [ "$(stat -c %u "$codex")" = "$uid" ] && [ "$(stat -c %g "$codex")" = "$gid" ] && [ "$(stat -c %a "$codex")" = 710 ] && [ "$(stat -c %u "$sessions")" = "$uid" ] && [ "$(stat -c %g "$sessions")" = "$gid" ] && [ "$(stat -c %a "$sessions")" = 2750 ]`,
         "sh", request.root, shared.codexHome, shared.sessionDir, String(request.uid), String(shared.gid),
       ]);
-      const sr = spawnSync(share.command, share.args, { env: provisionEnv, stdio: ["ignore", "ignore", "pipe"] });
-      if (sr.status !== 0) {
-        throw new Error(`runner-owned session export posture failed (exit ${String(sr.status)}): ${String(sr.stderr)}`);
-      }
+      const sr = run(share.command, share.args, { env: provisionEnv, stdio: ["ignore", "ignore", "pipe"] });
+      if (sr.status !== 0 || sr.error !== undefined) throw provisioningFailure("runner-owned session export posture", sr, opts.redact);
     }
     if (request.sessionSeedDir !== undefined) {
       if (shared === undefined || request.kind !== "provider") {
         throw new Error("runner-owned session seed requires a managed-auth provider tree");
       }
-      // The tsx CLI opens an IPC socket under TMPDIR; an epoch's long private
-      // path exceeds Unix socket limits. The resolved loader needs no CLI socket.
-      const seed = wrap(process.execPath, [
-        "--import", import.meta.resolve("tsx"),
-        SESSION_SEED_ENTRYPOINT,
-        request.sessionSeedDir,
-        shared.sessionDir,
-      ]);
-      const seeded = spawnSync(seed.command, seed.args, {
+      const inv = sessionSeedInvocation(SESSION_SEED_APP_ROOT, request.sessionSeedDir, shared.sessionDir);
+      const seed = wrap(inv.command, inv.args);
+      const seeded = run(seed.command, seed.args, {
         env: workerSpawnEnv({
           PATH: "/usr/local/bin:/usr/bin:/bin",
           LANG: "C",
@@ -390,19 +424,17 @@ function defaultMakeRunnerTrees(request: RunnerTreeRequest): void {
         }),
         stdio: ["ignore", "ignore", "pipe"],
       });
-      if (seeded.status !== 0) {
-        throw new Error(`runner-owned session seed failed (exit ${String(seeded.status)})`);
-      }
+      if (seeded.status !== 0 || seeded.error !== undefined) throw provisioningFailure("runner-owned session seed", seeded, opts.redact);
     }
     for (const file of request.files) {
       const octal = (file.mode & 0o777).toString(8).padStart(3, "0");
       const w = wrap("/bin/sh", ["-ceu", `umask 077; cat > "$1"; chmod ${octal} "$1"; [ "$(stat -c %u "$1")" = "$2" ] && [ "$(stat -c %a "$1")" = ${octal} ]`, "sh", file.path, String(request.uid)]);
-      const wr = spawnSync(w.command, w.args, { env: provisionEnv, input: file.content, stdio: ["pipe", "ignore", "pipe"] });
-      if (wr.status !== 0) throw new Error(`runner-owned file write failed for ${file.path} (exit ${String(wr.status)}): ${String(wr.stderr)}`);
+      const wr = run(w.command, w.args, { env: provisionEnv, input: file.content, stdio: ["pipe", "ignore", "pipe"] });
+      if (wr.status !== 0 || wr.error !== undefined) throw provisioningFailure("runner-owned file write", wr, opts.redact, file.path);
     }
   } catch (error) {
     const rm = wrap("/bin/rm", ["-rf", "--", request.root]);
-    spawnSync(rm.command, rm.args, { env: provisionEnv, stdio: "ignore" });
+    run(rm.command, rm.args, { env: provisionEnv, stdio: "ignore" });
     throw error;
   }
 }
@@ -410,7 +442,7 @@ function defaultMakeRunnerTrees(request: RunnerTreeRequest): void {
 /** Remove one private launch tree as the identity that owns it. The caller has
  * already validated the immutable launch spec; re-check the destructive target
  * here so a future caller cannot turn this helper into a broad delete. */
-function defaultRemoveRunnerTree(request: Pick<RunnerTreeRequest, "uid" | "kind" | "root">): void {
+function defaultRemoveRunnerTree(request: Pick<RunnerTreeRequest, "uid" | "kind" | "root">, opts: ProvisionOptions = {}): void {
   if (!isAbsolute(request.root) || resolve(request.root) === sep || resolve(request.root) !== request.root) {
     throw new Error("refusing to remove a non-canonical owned data root");
   }
@@ -422,10 +454,8 @@ function defaultRemoveRunnerTree(request: Pick<RunnerTreeRequest, "uid" | "kind"
   const wrap = request.kind === "command" ? commandRootCommand : runnerCommand;
   const rm = wrap("/bin/rm", ["-rf", "--", request.root]);
   const cleanupEnv: NodeJS.ProcessEnv = workerSpawnEnv({ PATH: "/usr/bin:/bin", LANG: "C" }); // issue #1783 (R4)
-  const result = spawnSync(rm.command, rm.args, { env: cleanupEnv, stdio: ["ignore", "ignore", "pipe"] });
-  if (result.status !== 0) {
-    throw new Error(`runner-owned tree removal failed (exit ${String(result.status)}): ${String(result.stderr)}`);
-  }
+  const result = (opts.spawn ?? spawnSync)(rm.command, rm.args, { env: cleanupEnv, stdio: ["ignore", "ignore", "pipe"] });
+  if (result.status !== 0 || result.error !== undefined) throw provisioningFailure("runner-owned tree removal", result, opts.redact);
 }
 
 /** Bind the runner-owned tree to the same proven lifecycle as its supervisor.
@@ -651,7 +681,8 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
       projectPath: spec.cwd,
     });
   }
-  (deps.makeRunnerTrees ?? defaultMakeRunnerTrees)({
+  const provisionOpts: ProvisionOptions = { redact: deps.redactDiagnostic, spawn: deps.provisionSpawnSync };
+  (deps.makeRunnerTrees ?? ((request) => defaultMakeRunnerTrees(request, provisionOpts)))({
     uid,
     kind: spec.kind,
     root: spec.ownedDataRoot,
@@ -699,7 +730,7 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   return withOwnedTreeCleanup(
     handle,
     { uid, kind: spec.kind, root: spec.ownedDataRoot },
-    deps.removeRunnerTree ?? defaultRemoveRunnerTree,
+    deps.removeRunnerTree ?? ((request) => defaultRemoveRunnerTree(request, provisionOpts)),
     deps.reportRunnerTreeCleanupFailure
       ?? (() => process.stderr.write("codex runner-owned tree cleanup failed; retaining the tree\n")),
   );
