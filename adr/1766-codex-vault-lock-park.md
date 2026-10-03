@@ -3,11 +3,14 @@
 **Status**: Accepted (issue #1766): the server typed 409 + recheck, the `vault_locked` recovery
 cause, migration and protocol feature, the worker's credential-free park (settle Codex processes,
 verified capture, custody kept, report `recovery_wait`/`vault_locked`) and the web/CLI/TUI surfaces.
+Issue #1770 extends this decision with durable recovery evidence and bounded
+same-operation reconciliation; the former lost-reply waiver is closed for upgraded workers.
+The combined acceptance proof remains required before merge (see below).
 **Date**: 2026-09-26
 **Deciders**: architect (design), coder (implementation), reviewer.
 **Related**: issue #1766; ADR-1590 (`adr/1590-codex-binding-same-identity-readmission.md`, the
 sibling Codex-hold decision this one follows in shape: hold in `recovery_wait` rather than fail,
-one typed cause, no ad-hoc new run status); issue #1770 (the waived path this ADR carves out,
+one typed cause, no ad-hoc new run status); issue #1770 (closing the former lost-reply waiver,
 below); PRD #1147 (`evalCodexReleasePredicate`, the single release-authority gate this decision's
 recheck relies on unchanged, adding `vault_locked` as a new outcome of the refresh/release routes
 that call it, not of the predicate itself).
@@ -15,12 +18,14 @@ that call it, not of the predicate itself).
 ## Decision (summary)
 
 A Codex subscription or api_key credential refresh or release (`/worker/runs/{id}/codex/refresh`,
-`/worker/runs/{id}/codex/release`) that reaches a locked owner vault is answered **409
-`{"reason":"vault_locked"}`** — a typed, secret-free refusal — but only after the request was
+`/worker/runs/{id}/codex/release`) that reaches a locked owner vault normally answers **409
+`{"reason":"vault_locked"}`** — a typed, secret-free refusal (pending persistence for an upgraded
+worker instead answers contended, as described below) — but only after the request was
 **authorized** and authority still held on a **recheck**. This is not a bypass of the
 release predicate; `vault_locked` is a new outcome of the refresh/release routes' own later
-open/seal calls, returned only after the predicate has passed both before the network call and on
-that recheck, distinguished from every other refusal so the caller can act on it differently.
+open/seal calls or a same-operation retry's coherent durable recovery evidence. The authority
+checks still precede the vault outcome and are revalidated before the reply; the narrowly tolerated
+quarantine refusal grants evidence-check coordinates, not credential release authority (D1).
 
 Rather than fail the run, the worker **parks** it: it confirms the run is still `running`, brings
 its Codex processes to a stop without touching the credential (a **credential-free settle**), then
@@ -30,19 +35,16 @@ reports `recovery_wait` with cause `vault_locked`, **keeps custody** of the run'
 on the ordinary recovery timer, not on an unlock signal; while the vault is still locked at that
 point, claiming it idles and the run shows queued with "your vault is locked, so this run can't
 start" until the vault is actually unlocked. After unlock it is re-claimed and resumes — the resume
-costs at least one model turn, then finalize opens the merge request.
+costs at least one model turn, then finalize may open the merge request after the existing
+completion checks.
 
-The direct post-exchange case is covered by this same park: a vault that locks while resealing
-credential material the exchange just landed is answered `vault_locked` and parked like any other
-case here (`api/internal/workersvc/codexrefresh.go`, the seal branch around lines 687-720, surfaced
-through the caller's recheck around lines 492-497), provided the worker receives that answer. That
-seal failure quarantines the account whether or not the reply arrives — it is how the refreshed
-login is held pending vault unlock. One narrower path is explicitly **not** covered and is waived
-rather than closed here: a vault that locks while sealing after the provider exchange, when the
-worker does not receive the reply — a dropped connection between the api's answer and the worker
-learning it — still fails the run. The worker's own reconcile treats the lost reply as a plain
-block with no deferral, so the run fails; a same-operation retry would not help anyway, because
-authorization refuses it while the account is quarantined. This is issue #1770, tracked separately (see "The waived path" below).
+A vault lock while sealing the completed provider exchange retains the new login in a protected
+recovery slot and quarantines the account. Issue #1770 closes the former lost-response waiver:
+the worker reconciles the same operation at most once immediately, then holds its work and custody
+if the outcome is still unknown. A retry with coherent, explicitly recorded vault-lock evidence
+can receive `vault_locked` even after unlock, before the recovery sweep promotes the login.
+That cause describes why sealing failed; it is not a statement of current vault state and grants
+no working credential, ready result, boundary permit or merge-request authority.
 
 ## Context
 
@@ -54,7 +56,7 @@ it as a generic 500 (`codexErrInternal`, `"codex operation failed"`,
 post-exchange seal — a vault lock hit while resealing credential material a completed exchange had
 just landed — instead quarantined the account and surfaced `ErrCodexRefreshQuarantined`, which the
 route already answered as a typed 409 `"codex refresh is unavailable"`. Either way, the worker's
-boundary reconcile treats any error outcome the same way — it blocks and does not proceed — so
+boundary reconcile treated any error outcome the same way — it blocks and does not proceed — so
 either failure ran the same path as a genuine defect: the run failed terminally, throwing away
 completed work and the custody hold,
 for a cause that is the owner's current state, not a defect in the run's binding, and that clears
@@ -63,30 +65,43 @@ reason a quarantined Codex account was wrong before ADR-1590. No caller ever pro
 boundary on an unresolved vault lock; that is the alternative D2 considers and rejects below, not
 what happened before this issue.
 
-`evalCodexReleasePredicate` (`api/internal/workersvc/codexauthz.go`) is the single source of truth
-for "may this run act on its credential right now" — the same predicate ADR-1590 relies on for the
-Codex-account hold. `vault_locked` is a new outcome of the refresh/release routes themselves, not of
-that predicate: the predicate is unchanged (it gains a comment, not a new check), and the outcome is
-returned only from the later open/seal calls, and only after the predicate passed both before the
-network call and on a recheck afterward, described in the next section.
+`evalCodexReleasePredicate` (`api/internal/workersvc/codexauthz.go`) remains the source of
+release authority, as in ADR-1590. The original #1766 change left this predicate unchanged.
+Issue #1770 keeps its release checks and adds a private refresh authorization path that retains
+coordinates on a quarantine-only refusal. Those coordinates permit a credential-free evidence
+check; ordinary release still refuses quarantined accounts.
 
-## D1: the vault check happens after authorization, and it is the LAST check
+## D1: authorization precedes the vault outcome, and quarantine is the LAST predicate check
 
-`evalCodexReleasePredicate` runs, in order: kind/mode consistency, actively-claimed status,
-per-alias material revision, and — subscription only — the frozen identity tuple, the account
-credential revision, and finally `coord_state != 'quarantined'`. The vault-locked path is reached
-only through a **separate, later** open/seal call that fires after this predicate has already
-passed: the request is authorized, the run's binding is exactly who it says it is, and only then
-does opening or resealing the owner's vault fail because the vault itself is locked.
+The authorization wrapper checks worker ownership, scope, capability epoch and hash, and an
+active claim with `claim_released_at IS NULL`. `evalCodexReleasePredicate` then checks kind/mode
+consistency, actively-claimed status, per-alias material revision and, for a subscription, the
+frozen identity tuple and account credential revision, with `coord_state != 'quarantined'` last.
+The initial open/seal path follows successful authorization. A first vault-lock response still
+requires the full post-operation recheck and an explicitly unreleased claim.
 
-The comment on the predicate states the invariant explicitly: **keep the quarantine check LAST**.
-`CoordinatedCodexRefresh`'s vault-locked recheck tolerates `ErrCodexAccountQuarantined` alone on its
-retry — it re-runs the predicate and accepts only that one sentinel as still consistent with "the
-run remains authorized, the vault just will not open" — and that tolerance is sound only because
-reaching the quarantine check already proves every earlier check in the predicate held. Moving the
-quarantine check earlier, or adding a vault check that could short-circuit ahead of it, would break
-that soundness silently: a future refactor that reorders the predicate's checks must re-derive this
-recheck's correctness, not just re-run the same test suite.
+**Keep the quarantine check LAST.** A quarantine-only refusal is tolerable for evidence checking
+because reaching that sentinel proves the earlier predicate checks held. It does not authorize
+opening the vault, calling the provider or releasing a credential. Moving that check earlier
+requires re-deriving the recheck's correctness.
+
+For a same-operation retry, `CoordinatedCodexRefresh` routes that private quarantine-only result to
+`codexRecoveryDeferral` (`api/internal/workersvc/codexrefresh.go`). It checks account and intent
+evidence in one snapshot, reauthorizes ownership, the unreleased active claim, capability and
+binding checks, verifies the resolved account still matches, then checks the evidence again.
+Only coherent evidence for this owner, account, operation and observed generation returns
+`vault_locked`: the account is quarantined, not marked for reauthentication, and has a protected
+slot, key discriminator and matching recovery/current generation; the associated intent is
+`rotating` or `reconciled` with the same operation and starting generation.
+
+The account's `recovery_cause = 'vault_locked'` must have been explicitly supplied by the actual
+post-exchange seal-lock branch and written atomically with the slot metadata and quarantine
+(`SetCodexRecoverySlot`, `api/internal/store/queries/codex_binding.sql`). Neither slot existence,
+operation state nor the current vault state infers or backfills that cause. Background persistence
+uses the same immutable operation/generation parameters and cause. Non-vault quarantines retain
+their existing refusal, without a vault-state oracle. The evidence path opens no vault or login,
+calls no provider and releases no credential; it is eligible both while locked and after unlock
+before promotion. A lost authority or evidence recheck returns its own refusal, never a deferral.
 
 ## D2: park credential-free, not fail — and never cross the boundary anyway
 
@@ -125,6 +140,21 @@ This mirrors the credential-free discipline the reconcile closure already keeps 
 vault is known to be locked, nothing on the park path may assume it can still reach the credential,
 even to clean up.
 
+Issue #1770 also routes the internal `refresh_unknown` deferral through this credential-free
+hold. It reports untyped `recovery_wait` with neutral notices: no vault classification, token,
+operation metadata or raw response errors reach the feed. The typed vault park's existing
+`recovery_cause_vault_locked` feature check is separate from the first-response compatibility flag
+described below.
+
+The blocked-proof retention exception is limited to `vault_locked` and `refresh_unknown`.
+Settlement must still be observed empty; quiescence, WIP commit, fetch-back, tracking-ref
+verification, canonical and foreign-residue checks, and completion proofs remain required.
+A blocked proof retains the clone, session and custody with capped waits and no terminal
+blocked-capture cap for these two deferrals; it does not permit a park or completion without the
+proof. Noncredential recovery keeps its existing terminal blocked-proof cap. Cancellation,
+shutdown and claim loss take precedence and retain their existing exit and stale-claim cleanup
+semantics (`handleRecoveryExhausted`, `agent/src/runner.ts`).
+
 ## D4: promotion is the ordinary recovery timer, not an unlock signal
 
 Unlike the Codex-account hold (ADR-1590), which has no timer and resumes only when the account
@@ -147,22 +177,93 @@ exists and already bounds the delay to at most one backoff interval, so an unloc
 of parked runs would only shave that bound — a UX-latency improvement, not something correctness
 needs. It stays a possible follow-up rather than part of this decision.
 
-## The waived path (issue #1770)
+## Closing the former lost-reply waiver (issue #1770)
 
-**A vault that locks while sealing after the provider exchange, when the worker does not receive
-the reply, still fails the run — waived and tracked separately as issue #1770.** If the vault
-locks **after** the provider exchange has already landed with the account — the credential
-material was minted, but resealing it durably failed because the vault was locked at that moment —
-the recheck this ADR adds (D1) still answers `vault_locked` and parks the run, exactly like the
-pre-exchange case, as long as the worker receives that answer. Either way the seal failure
-quarantines the account, to hold the refreshed login until the vault unlocks. The gap is narrower:
-if the worker then **loses the reply** to that exchange — a transport error between the api's
-answer and the worker learning it — the worker's reconcile treats it as a plain block with no
-deferral, so the run fails with no park. A same-operation retry would then be refused by
-authorization anyway, because the account is already quarantined. This ADR does not close that
-gap: the fix needs its own investigation into safely retrying (or reconciling) a post-exchange seal
-failure without risking a double-mint, and is deliberately left to #1770 rather than folded in
-here.
+The original #1766 decision waived a post-exchange seal lock whose reply was lost: the worker
+treated the transport error as an ordinary block, and quarantine refused a retry. The revised
+behavior closes that gap for workers with the complete reconciliation and retention logic.
+It does not extend the mid-turn app-server refresh scope of #1770; the existing #1789 behavior
+described below is a separate change.
+
+`buildRunLaneReconcile` (`agent/src/codex/codex-executor.ts`) makes at most two immediate
+attempts in the same flight, with identical operation ID, capability and observed generation.
+An ambiguous response or a contended reply permits one retry. A validated success registers the
+credential and clears the frozen operation; a typed vault refusal defers. A generic unavailable
+409 after ambiguity, or a remaining ambiguous 500, holds as `refresh_unknown`. A first definite
+refusal keeps its prior behavior. Unknown does not become a vault cause, a working credential,
+a ready reconcile, a boundary/completion permit or an MR. Lifecycle cancellation and claim-loss
+checks still win.
+
+### First-response compatibility
+
+The exact flag `codex_refresh_recovery_v1`, stored in `workers.protocol_capabilities`, is the sole
+compatibility gate for the first response when seal-lock persistence has been handed to the
+background and is still pending. It is not scheduler eligibility or credential authority, adds no wire shape and requires
+no new `protocol_features` advertisement.
+
+A released worker without the flag keeps its typed first `vault_locked` reply after the full
+authorization recheck, including an explicitly unreleased claim, even for a pending background
+handoff. A complete worker advertising the flag gets contended for that pending first response
+and then safely reconciles or holds unknown. A durable slot gives a typed first reply to either.
+A same-operation retry, regardless of flag, gets a typed deferral only from the coherent durable
+cause and authorization/evidence rechecks in D1.
+
+### Unlock and resume
+
+Unlock alone neither releases the retained login nor proves completion. The existing recovery
+sweep opens the protected slot with its recorded key, verifies the frozen identity through
+nonrotating discovery, reseals under the owner's DEK and promotes with the generation fence.
+Until that promotion, the historical vault-lock cause can still justify a credential-free
+deferral. Resume retains the existing claim, binding and completion checks. The original refresh
+token is not spent again; later boundaries use distinct operations and the promoted credential
+lineage. An MR requires successful resume and fresh completion authority.
+
+### Coordinated rollout and rollback
+
+Migration `00292_codex_refresh_recovery_cause.sql` adds a nullable, constrained account cause:
+`vault_locked` requires quarantine and populated recovery-slot metadata. Existing slots stay
+NULL without inference or backfill. PostgreSQL takes an AccessExclusive lock on
+`codex_provider_account` while validating these constraints; schedule a coordinated pause
+without assuming a lock duration.
+
+Drain and **stop all old API processes and background writers before new constrained cause
+writes**. The chart's existing `api.replicaCount: 1` and API Deployment `strategy: Recreate`
+already prevent old/new API overlap; no chart change is needed. Other deployments must stop
+old writers before starting the new API. Deploy API first, worker second. Advertise
+`codex_refresh_recovery_v1` only with the complete revised worker logic. #1770 is resolved for
+affected runs only after those workers are upgraded; old workers retain the lost-reply behavior.
+
+For rollback, stop writers first, then clear only cause metadata:
+
+```sql
+UPDATE codex_provider_account SET recovery_cause=NULL WHERE recovery_cause IS NOT NULL;
+```
+
+Preserve the protected slot, live login, generations and intents. Optional goose Down for 00292
+drops only the cause column and its two constraints, matching the migration; it does not remove
+recovery material. Restart the rollback API only after this coordinated metadata step.
+
+### Required combined acceptance proof
+
+Before merge, the dedicated opt-in `task test:codex-refresh-lostreply-e2e` target must run,
+including the LiveDB sweep and a real HTTP/PostgreSQL `RunRunner` recovery, unlock and MR proof.
+Its preflight must require Node, npm and the agent dependencies; the fixture must need no secrets
+or provider, model or forge network. It executes the combined fixture after the serial LiveDB
+sweep against the same throwaway database; separate server and worker regressions do not
+establish that combined proof.
+
+Existing CI Go LiveDB server tests and `agent/test/*.test.ts` worker tests cover the M1/M2
+pieces separately, not the combined proof. The worker HTTP reconciliation cases in
+`agent/test/runner-codex-sinks.test.ts` use fixed API replies without a provider exchange;
+`agent/test/runner-recovery-blocked-bounded.test.ts` covers the two credential deferrals retaining
+custody beyond the noncredential blocked-proof cap. These are not substitutes for the dedicated
+target. A maintainer-only follow-up must wire it into `.github/workflows/ci.yml` with the Node
+and agent prerequisites; workflow wiring is outside this change.
+
+The dedicated target, including LiveDB, remains required acceptance before merge. If Docker is
+actually unavailable, record blocked/not run rather than passed and leave acceptance required
+for the maintainer. An executed red result blocks merge. This is an enforcement requirement,
+not a claim that the combined test has passed.
 
 A lock during a long turn — a mid-turn app-server refresh hitting the same 409 — was first left
 out of this park and is now covered by issue #1789. The run-lane refresh bridge
@@ -187,17 +288,18 @@ One related path is not covered by this decision:
 
 ## Consequences and residuals
 
-- A run whose owner locks their vault mid-flight now survives the lock: it parks with its work
-  captured and its custody intact, and resumes on its own once the vault is unlocked and the next
-  recovery timer fires, at the cost of at least one extra model turn on resume.
-- The merge request for a run parked this way is delayed exactly as long as the vault stays locked
-  past the run's next promotion attempt — never opened early, never opened on stale credential
-  material.
+- An authorized run deferred by a vault lock retains its work and custody. It parks after verified
+  capture and can resume after unlock, recovery promotion and the ordinary retry/claim checks,
+  at the cost of at least one extra model turn on resume.
+- The merge request waits for recovery promotion, successful resume and fresh completion
+  authority; unlock alone does not establish any of those checks.
 - `evalCodexReleasePredicate`'s check order is now a correctness invariant for a second reason
   (D1): a future change to that function must preserve "quarantine check last" or re-verify the
   vault-locked recheck's tolerance from scratch.
-- A post-exchange seal failure combined with a lost reply remains a real, if rare, way for a run
-  to still fail outright on a vault lock; issue #1770 owns closing it.
+- Issue #1770 closes the lost-reply waiver with durable cause evidence, bounded reconciliation
+  and credential-free custody retention for upgraded workers. Unknown outcomes stay neutral;
+  non-vault quarantine and noncredential recovery limits remain unchanged. Full rollout and the
+  required combined acceptance proof remain explicit boundaries, not an assumed test pass.
 - A mid-turn app-server refresh now parks through the same path (issue #1789), except during a
   plan revise round, where the run is `awaiting_approval`: a lock there does not defer the run,
   and the revise turn fails only if the turn itself fails.

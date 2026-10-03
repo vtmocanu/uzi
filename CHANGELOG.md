@@ -24,8 +24,8 @@ through `[0.52.0]`.)
 
 ### Fixed
 
-- **Codex refresh recovery preserves vault-lock replies after a lost response ([#1770](https://github.com/vtmocanu/uzi/issues/1770)).**
-  A refresh retry can recognize its own durably retained login and defer without releasing credentials or exchanging its token again, while older workers keep their existing first-request vault-lock reply.
+- **Codex runs keep their work when a refresh response is lost ([#1770](https://github.com/vtmocanu/uzi/issues/1770)).**
+  Updated workers reconcile the refresh once, then keep the work, session and custody while a vault lock or unknown outcome prevents safe recovery. Runs resume after unlock and recovery checks without spending the original refresh token again; no merge request opens before a successful resume. Deploy the API before the updated workers; older workers keep their first-request vault-lock reply but still need the worker update to survive a lost response.
 
 ## [0.85.1] - 2026-10-03
 
