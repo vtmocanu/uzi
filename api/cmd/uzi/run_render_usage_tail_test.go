@@ -16,7 +16,7 @@ func TestRenderRunDetailEstTail(t *testing.T) {
 	priced := &apitypes.UsageTailDTO{
 		InputTokens: 200_000, CacheReadTokens: 1_000_000, OutputTokens: 34_000,
 		CostUSD: f64(12.34), CostStatus: "estimated", PriceTableVersion: "anthropic-standard-2026-10-03",
-		Coverage: "partial", CoverageReasons: []string{"leg_not_closed", "brand_new\x1b[31m‮reason"},
+		Coverage: "partial", CoverageReasons: []string{"leg_not_closed", "brand_new\x1b[31m\u202ereason"},
 	}
 	out := renderDetail(t, apitypes.RunDTO{
 		ID: "run-1", Kind: "issue", Status: "failed",
@@ -33,7 +33,7 @@ func TestRenderRunDetailEstTail(t *testing.T) {
 			t.Errorf("tail merged into the COST row: %q", line)
 		}
 	}
-	if strings.ContainsAny(out, "\x1b‮") {
+	if strings.ContainsAny(out, "\x1b\u202e") {
 		t.Errorf("raw control or bidi characters leaked into the human view:\n%q", out)
 	}
 
