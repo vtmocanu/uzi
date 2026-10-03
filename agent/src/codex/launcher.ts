@@ -373,7 +373,10 @@ function defaultMakeRunnerTrees(request: RunnerTreeRequest): void {
       if (shared === undefined || request.kind !== "provider") {
         throw new Error("runner-owned session seed requires a managed-auth provider tree");
       }
-      const seed = wrap("/app/node_modules/.bin/tsx", [
+      // The tsx CLI opens an IPC socket under TMPDIR; an epoch's long private
+      // path exceeds Unix socket limits. The resolved loader needs no CLI socket.
+      const seed = wrap(process.execPath, [
+        "--import", import.meta.resolve("tsx"),
         SESSION_SEED_ENTRYPOINT,
         request.sessionSeedDir,
         shared.sessionDir,

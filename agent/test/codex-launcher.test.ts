@@ -1,12 +1,15 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { PassThrough, Writable } from "node:stream";
+import { fileURLToPath } from "node:url";
 
 import { CODEX_SESSION_GID, COMMAND_UID, WORKER_UID, setprivArgsForUid, setprivRunnerArgs } from "../src/runner-uid.js";
 import {
@@ -363,6 +366,78 @@ describe("launchCodexRoot: app-server auth (production config, no env credential
     assert.equal(treeCalls[0]?.sessionSeedDir, `${DATA_ROOT}.session-seed/sessions`);
     assert.ok(treeCalls[0]?.sharedSessionRead, "the final 0710/2750 posture is provisioned before seeding");
     assert.equal(spawnCalls.length, 1, "the supervisor starts only after makeRunnerTrees completes");
+  });
+
+  it("the real session seed succeeds with an epoch TMPDIR longer than a Unix socket path", {
+    skip: process.platform === "linux" ? false : "the real seed copier requires Linux /proc/self/fd; it runs in Linux CI without a worker-uid gate",
+  }, async (t) => {
+    const parent = await fs.mkdtemp(path.join(os.tmpdir(), "codex-seed-long-"));
+    const root = path.join(parent, "agent-home", "a".repeat(36), "codex-data", `${"b".repeat(36)}-epoch-1`);
+    const seedDir = `${root}.session-seed/sessions`;
+    const sessions = path.join(root, "codex", "sessions");
+    const tmp = path.join(root, "tmp");
+    const helper = fileURLToPath(new URL("../src/codex/session-seed-cli.ts", import.meta.url));
+    const spawnSync = childProcess.spawnSync;
+    let seedCalls = 0;
+    try {
+      await fs.mkdir(seedDir, { recursive: true });
+      await fs.mkdir(sessions, { recursive: true });
+      await fs.mkdir(path.join(root, "home"), { recursive: true });
+      await fs.mkdir(tmp, { recursive: true });
+      await fs.writeFile(path.join(seedDir, "rollout-planted.jsonl"), "saved session\n");
+      assert.ok(Buffer.byteLength(path.join(tmp, `tsx-${process.getuid?.() ?? 0}`, "1.pipe")) > 108,
+        "even the shortest CLI socket name exceeds Linux and macOS Unix socket limits");
+
+      // Keep the launcher's real provisioning/seed command construction. Stub only the
+      // privileged shell steps and translate image paths/uid wrapper for this host; the
+      // seed subprocess, loader, helper, TMPDIR, environment and stdio are real.
+      const mocked = t.mock.method(childProcess, "spawnSync", (command: string, args: readonly string[], options: childProcess.SpawnSyncOptions) => {
+        assert.equal(command, "/bin/setpriv");
+        const prefix = setprivRunnerArgs();
+        assert.deepEqual(args.slice(0, prefix.length), prefix);
+        const executable = args[prefix.length]!;
+        if (executable === "/bin/sh" || executable === "/bin/rm") {
+          return { status: 0, signal: null, pid: 0, output: [], stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+        }
+        seedCalls++;
+        const argv = args.slice(prefix.length + 1).map((arg) => arg === "/app/src/codex/session-seed-cli.ts" ? helper : arg);
+        const localExecutable = executable === "/app/node_modules/.bin/tsx"
+          ? process.execPath : executable;
+        if (executable === "/app/node_modules/.bin/tsx") argv.unshift(fileURLToPath(import.meta.resolve("tsx/cli")));
+        assert.equal(options.env?.PATH, "/usr/local/bin:/usr/bin:/bin");
+        assert.equal(options.env?.TMPDIR, tmp);
+        assert.equal(options.env?.HOME, path.join(root, "home"));
+        assert.equal(options.env?.CODEX_CANARY_LEAK, undefined);
+        assert.deepEqual(options.stdio, ["ignore", "ignore", "pipe"]);
+        const result = spawnSync(localExecutable, argv, options);
+        if (seedCalls === 1 && result.status !== 0) t.diagnostic(String(result.stderr));
+        return result;
+      });
+      syncBuiltinESMExports();
+      try {
+        await launchCodexRoot(
+          baseSpec({ ownedDataRoot: root, useAppServerAuth: true, authMode: "subscription", seedSession: true }),
+          baseDeps(newFake(), { makeRunnerTrees: undefined }),
+        );
+        assert.equal(seedCalls, 1);
+        assert.equal(await fs.readFile(path.join(sessions, "rollout-planted.jsonl"), "utf8"), "saved session\n");
+        assert.equal(spawnCalls.length, 1, "the supervisor starts after the real seed succeeds");
+
+        // An empty seed still fails closed; changing the interpreter must not turn a
+        // rejected helper invocation into permission to start the provider.
+        await fs.rm(path.join(seedDir, "rollout-planted.jsonl"));
+        await assert.rejects(launchCodexRoot(
+          baseSpec({ ownedDataRoot: root, useAppServerAuth: true, authMode: "subscription", seedSession: true }),
+          baseDeps(newFake(), { makeRunnerTrees: undefined }),
+        ), /runner-owned session seed failed \(exit 2\)/);
+        assert.equal(spawnCalls.length, 1, "the failed seed never starts another supervisor");
+      } finally {
+        mocked.mock.restore();
+        syncBuiltinESMExports();
+      }
+    } finally {
+      await fs.rm(parent, { recursive: true, force: true });
+    }
   });
 
   it("refuses the M3b redirect without app-server auth", async () => {
