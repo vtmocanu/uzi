@@ -350,6 +350,9 @@ tasks:
       # Hermetic regressions for the landing scripts: no network, forge or live PR.
       # They pin review routing, fail-closed quota timing and stale-base push behavior.
       - task: test:uzi-lander
+      # hermetic (~1s, fake go + gofmt on PATH): fmt-check:api and fmt-check:controller run
+      # the module toolchain's gofmt, not a stale PATH gofmt, and still fail closed.
+      - task: test:fmt-check-toolchain
       # cheapest-first: this whole-file duplicate check is sub-second, so it runs
       # before `scan:secrets`, which is deliberately last because it dominates.
       - task: check:spec-numbering
@@ -1046,6 +1049,11 @@ tasks:
       - ./.agents/skills/uzi-watcher/scripts/create-run.test.sh
       - ./.agents/skills/uzi-watcher/scripts/watch-run.test.sh
 
+  test:fmt-check-toolchain:
+    desc: hermetic test that fmt-check:api and fmt-check:controller use the module toolchain's gofmt (go env GOROOT), not PATH's, and fail closed (fake go + gofmt)
+    cmds:
+      - ./scripts/fmt-check-toolchain.test.sh
+
   test:uzi-lander:
     desc: hermetic tests of uzi-lander review routing, quota timing, CI discovery, required-check completeness, stale-base push guards, base-move tolerance, CHANGELOG union and release fold, and the post-rebase CHANGELOG placement guard
     cmds:
@@ -1476,7 +1484,15 @@ tasks:
       # -w` and "a bare `fmt` target" named explicitly - so a target called `fmt`
       # would be declined by the role that is supposed to run it. Do not tidy the
       # suffix away.
-      - 'out="$(gofmt -l .)" || exit 2; [ -z "$out" ] || { echo "$out"; exit 1; }'
+      #
+      # THE GOFMT IS THE MODULE TOOLCHAIN'S, `$(go env GOROOT)/bin/gofmt`, NEVER A BARE
+      # `gofmt`. go.mod's `toolchain` line selects the compiler (GOTOOLCHAIN=auto), but a
+      # bare `gofmt` is whatever comes first on PATH, and an older one lists files the
+      # module's own gofmt accepts (a go1.26.7 PATH gofmt flagged two untouched files under
+      # go1.27.1, measured 2026-10-03), reddening this slot on a clean tree and skipping
+      # every later gate:api slot. A failing `go env` is an instrument failure: exit 2.
+      # scripts/fmt-check-toolchain.test.sh (test:fmt-check-toolchain) pins all of this.
+      - 'root="$(go env GOROOT)" || exit 2; out="$("$root/bin/gofmt" -l .)" || exit 2; [ -z "$out" ] || { echo "$out"; exit 1; }'
 
   vet:api:
     desc: go vet over the api module
@@ -1955,8 +1971,9 @@ tasks:
       # editing either. This module was ALREADY gofmt-clean when PRD #103 M2 landed
       # (measured 2026-08-02 at 755861e8, go1.26.5: `gofmt -l ./controller` empty
       # while ./api listed 16 files); the target exists to keep it that way. It
-      # ships with an empty backlog, which is not the same thing as a no-op.
-      - 'out="$(gofmt -l .)" || exit 2; [ -z "$out" ] || { echo "$out"; exit 1; }'
+      # ships with an empty backlog, which is not the same thing as a no-op. The gofmt
+      # is the module toolchain's for the same reason (see fmt-check:api).
+      - 'root="$(go env GOROOT)" || exit 2; out="$("$root/bin/gofmt" -l .)" || exit 2; [ -z "$out" ] || { echo "$out"; exit 1; }'
 
   vet:controller:
     desc: go vet over the controller module
