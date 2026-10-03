@@ -297,14 +297,14 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 				m.board.clampCursor()
 			}
 		}
-		m.board.scroll = m.syncedScrollAt(m.boardCapacity())
+		m.board.scroll = m.syncedScrollAt(m.boardScrollCapacity())
 		return m, nil
 	}
 
 	if d := motionDelta(k); d != 0 {
 		m.board.cursor += d
 		m.board.clampCursor()
-		m.board.scroll = m.syncedScrollAt(m.boardCapacity())
+		m.board.scroll = m.syncedScrollAt(m.boardScrollCapacity())
 		return m, nil
 	}
 
@@ -349,6 +349,7 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		if !ok {
 			return m, nil
 		}
+		m.fromSplit = m.splitDrawn()
 		m.view = viewDetail
 		m.detail = newDetailState(sel.ID)
 		// A fresh session generation per drill-in: a reply still in flight from a previous

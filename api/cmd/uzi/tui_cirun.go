@@ -208,7 +208,12 @@ func (m tuiModel) ciRunKey(k string) (tea.Model, tea.Cmd) {
 		// ←/esc both return to the ci list — the only entry point — which is never clobbered (m.ci
 		// persists on the model), so it is still loaded on return (D1). → opens a row, so ← is its
 		// symmetric back (issue #1335).
-		m.view = viewCI
+		if m.fromSplit && !m.splitEligible() {
+			m.setListView(viewBoard)
+		} else {
+			m.setListView(viewCI)
+		}
+		m.fromSplit = false
 		return m, nil
 	case keyRefresh:
 		// A keypress is intent: never gated on the in-flight guard, mirroring the PR view's r.

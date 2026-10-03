@@ -287,9 +287,15 @@ type tuiModel struct {
 	pal           palette
 	renderer      *tuiRenderer
 
-	view   tuiView
-	board  boardState
-	detail detailState
+	view tuiView
+	// splitLatch changes only on resize; bottomTab survives collapse and drill-ins.
+	splitLatch, splitOff, fromSplit bool
+	splitMode                       string
+	bottomTab                       tuiView
+	boardReplied                    bool
+	splitNote                       string
+	board                           boardState
+	detail                          detailState
 	// pulls is the forge `pulls` screen's state (PRD #1255 M4a). It carries its OWN
 	// reqSeq/waitID/tickGen poll-guard counters (a copy of the board's chain, not a share)
 	// so the two lists poll independently.
@@ -468,9 +474,10 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 	m := tuiModel{
 		client: c, ctx: ctx,
 		width: 100, height: 30, dark: true,
-		profile: colorprofile.TrueColor,
-		pal:     newPalette(true),
-		view:    viewBoard,
+		profile:   colorprofile.TrueColor,
+		pal:       newPalette(true),
+		view:      viewBoard,
+		bottomTab: viewCI,
 	}
 	m.renderer, _ = newTUIRenderer(m.width, m.dark)
 	m.board = newBoardState()
@@ -884,6 +891,18 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.renderer, _ = newTUIRenderer(m.transcriptWidth(), m.dark)
+		was := m.splitDrawn()
+		if m.width < 80 || m.height < splitMinHeight {
+			m.splitLatch = false
+		} else if m.height >= splitMinHeight+2 {
+			m.splitLatch = true
+		}
+		if was && !m.splitDrawn() {
+			m.collapseSplit()
+		}
+		if !was && m.splitDrawn() {
+			return m, m.activateSplit()
+		}
 		return m, nil
 
 	case tea.BackgroundColorMsg:
@@ -973,13 +992,19 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.board.waitID = 0
 		m.board.apply(msg)
+		firstReply := !m.boardReplied
+		m.boardReplied = true
+		var activation tea.Cmd
+		if firstReply {
+			activation = m.activateSplit()
+		}
 		// Reschedule the tick HERE, after apply updated errStreak (PRD #1130 M3): this is what
 		// makes the first retry after a failed poll use the backed-off interval
 		// (boardTickInterval of the fresh streak) rather than the stale pre-failure one. Bump
 		// tickGen first so this new chain supersedes any tick a manual/admin refresh left
 		// pending — only one tick chain stays live.
 		m.board.tickGen++
-		return m, tea.Batch(tickAfter(boardTickInterval(m.board.errStreak), m.board.tickGen), m.maybeArmBlink())
+		return m, tea.Batch(tickAfter(boardTickInterval(m.board.errStreak), m.board.tickGen), m.maybeArmBlink(), activation)
 
 	case reposMsg:
 		// The forge views' repo scope (PRD #1255 D2). A failure is recorded (the pulls scope
@@ -999,7 +1024,10 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// If the user is already on a forge screen, resolve the default repo and fetch now so they
 		// are not stuck on "loading…" until the next 10s tick. Both forge lists share the repo scope
 		// (D2), so whichever is in focus kicks off its own fetch.
-		switch m.view {
+		if m.splitDrawn() && !m.boardReplied && !m.repoChosen {
+			return m, nil
+		}
+		switch m.displayedForge() {
 		case viewPulls:
 			(&m).resolveDefaultRepo()
 			if m.pulls.waitID == 0 && m.pullsRepoReady() {
@@ -1019,7 +1047,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		// Keep the chain alive across the cancellable quit modal without polling.
-		if m.quitting {
+		if m.quitting || m.showHelp || m.updatePrompt.showing {
 			return m, pullsTickAfter(pullsTickInterval(m.pulls.errStreak), m.pulls.tickGen)
 		}
 		// Self-heal the shared repo scope (PRD #1255): a transient ListRepos failure at Init has
@@ -1030,7 +1058,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// It is gated on view==viewPulls like the pulls fetch so an idle board pays no forge cost
 		// (the D4 forge-budget guard). A later successful reposMsg clears reposErr and resolves the
 		// default repo, bringing the screen alive.
-		if m.view == viewPulls && !m.reposReady() {
+		if m.displayedForge() == viewPulls && !m.reposReady() {
 			cmds := []tea.Cmd{pullsTickAfter(pullsTickInterval(m.pulls.errStreak), m.pulls.tickGen)}
 			if !m.reposInFlight {
 				m.reposInFlight = true
@@ -1044,7 +1072,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// fetch, the reply re-arms the chain (as on the board). When it does NOT, this tick must
 		// re-arm ITSELF — here the fetch is conditional, so the reply is the only OTHER re-arm
 		// site and a non-fetching tick would otherwise let the chain lapse.
-		if m.view == viewPulls && m.pulls.waitID == 0 && m.pullsRepoReady() {
+		if m.displayedForge() == viewPulls && m.pulls.waitID == 0 && m.pullsRepoReady() {
 			return m, (&m).startPullsReq()
 		}
 		return m, pullsTickAfter(pullsTickInterval(m.pulls.errStreak), m.pulls.tickGen)
@@ -1070,7 +1098,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.gen != m.ci.tickGen {
 			return m, nil
 		}
-		if m.quitting {
+		if m.quitting || m.showHelp || m.updatePrompt.showing {
 			return m, ciTickAfter(ciTickInterval(m.ci.errStreak), m.ci.tickGen)
 		}
 		// Self-heal the shared repo scope (PRD #1255): a transient ListRepos failure at Init has no
@@ -1078,7 +1106,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// whole session. While the ci screen is in focus and repos are NOT ready, re-issue
 		// fetchReposCmd — gated on the reposInFlight guard so it never stacks a second live repos
 		// fetch — and re-arm this tick. Gated on view==viewCI so an idle board pays no forge cost.
-		if m.view == viewCI && !m.reposReady() {
+		if m.displayedForge() == viewCI && !m.reposReady() {
 			cmds := []tea.Cmd{ciTickAfter(ciTickInterval(m.ci.errStreak), m.ci.tickGen)}
 			if !m.reposInFlight {
 				m.reposInFlight = true
@@ -1090,7 +1118,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// budget is shared with the board poller — D4), and only when no poll is outstanding (the
 		// in-flight guard). When it DOES fetch, the reply re-arms the chain; when it does NOT, this
 		// tick re-arms ITSELF (the fetch is conditional, so the reply is the only OTHER re-arm site).
-		if m.view == viewCI && m.ci.waitID == 0 && m.pullsRepoReady() {
+		if m.displayedForge() == viewCI && m.ci.waitID == 0 && m.pullsRepoReady() {
 			return m, (&m).startCIReq()
 		}
 		return m, ciTickAfter(ciTickInterval(m.ci.errStreak), m.ci.tickGen)
@@ -1538,6 +1566,64 @@ func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if !m.filtering() && m.listView() {
+		if k != "" {
+			m.splitNote = ""
+		}
+		if k == "s" && m.splitMode != "off" {
+			if m.splitDrawn() {
+				m.splitOff = true
+				m.collapseSplit()
+				return m, nil
+			}
+			if m.splitOff {
+				m.splitOff = false
+				return m, m.activateSplit()
+			}
+			m.splitNote = "terminal too small to split"
+			return m, nil
+		}
+		if m.splitDrawn() {
+			switch k {
+			case keyTab, "shift+tab":
+				if k == keyTab {
+					switch m.view {
+					case viewBoard:
+						return m.gotoCI()
+					case viewCI:
+						return m.gotoPulls()
+					default:
+						m.setListView(viewBoard)
+						return m, nil
+					}
+				}
+				switch m.view {
+				case viewBoard:
+					return m.gotoPulls()
+				case viewPulls:
+					return m.gotoCI()
+				default:
+					m.setListView(viewBoard)
+					return m, nil
+				}
+			case "ctrl+w":
+				if m.view == viewBoard {
+					return m.focusBottom()
+				}
+				m.setListView(viewBoard)
+				return m, nil
+			case keyEsc, keyViewFloor:
+				if m.view != viewBoard {
+					m.setListView(viewBoard)
+					return m, nil
+				}
+			case keyViewPulls:
+				return m.gotoPulls()
+			case keyViewCI:
+				return m.gotoCI()
+			}
+		}
+	}
 	switch m.view {
 	case viewBoard:
 		return m.boardKey(k)
@@ -1584,6 +1670,8 @@ func (m tuiModel) View() tea.View {
 		// Placed AFTER quitting/showHelp so ctrl+c can still reach the quit modal (PRD #1251 M1);
 		// the modal captures every other key in handleKey.
 		body = m.renderUpdatePrompt()
+	case m.splitDrawn():
+		body = m.renderSplit()
 	case m.view == viewDetail:
 		body = m.renderDetail()
 	case m.view == viewPulls:
@@ -1597,12 +1685,26 @@ func (m tuiModel) View() tea.View {
 	default:
 		body = m.renderBoard()
 	}
+	if m.listView() && !m.splitDrawn() && !m.quitting && !m.showHelp && !m.updatePrompt.showing && (m.splitNote != "" || (m.splitOff && m.splitLatch && m.splitMode != "off")) {
+		lines := strings.Split(body, "\n")
+		if len(lines) > 0 {
+			note := m.splitNote
+			if note == "" {
+				note = "s split"
+			}
+			lines[len(lines)-1] = clampVisual(" "+m.pal.faint.Render(note)+" · "+strings.TrimPrefix(lines[len(lines)-1], " "), m.width)
+			body = strings.Join(lines, "\n")
+		}
+	}
 	v.SetContent(body)
 	return v
 }
 
 func (m tuiModel) renderHelp() string {
 	lines := helpLines(m.view)
+	if m.splitEligible() && m.listView() {
+		lines = append(lines, "tab / shift+tab  cycle floor, ci, pulls", "ctrl+w           switch pane focus", "1 / 2 / 3        focus floor / pulls / ci", "s                collapse / restore split")
+	}
 	return m.pal.title.Render("keybindings") + "\n\n" +
 		strings.Join(lines, "\n") + "\n\n" +
 		m.pal.faint.Render("any key returns")

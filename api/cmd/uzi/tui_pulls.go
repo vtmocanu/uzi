@@ -351,8 +351,10 @@ func (m *tuiModel) startPullsReq() tea.Cmd {
 // default repo (once) and, when a repo is ready and no poll is in flight, issues an immediate
 // fetch so the screen is not stuck on "loading…" until the next tick.
 func (m tuiModel) gotoPulls() (tea.Model, tea.Cmd) {
-	m.view = viewPulls
-	(&m).resolveDefaultRepo()
+	m.setListView(viewPulls)
+	if !m.splitDrawn() || m.boardReplied || m.repoChosen {
+		(&m).resolveDefaultRepo()
+	}
 	if m.pulls.waitID == 0 && m.pullsRepoReady() {
 		return m, (&m).startPullsReq()
 	}
@@ -384,14 +386,14 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 				m.pulls.clampCursor()
 			}
 		}
-		m.pulls.scroll = m.pullsSyncedScrollAt(m.pullsCapacity())
+		m.pulls.scroll = m.pullsSyncedScrollAt(m.pullsScrollCapacity())
 		return m, nil
 	}
 
 	if d := motionDelta(k); d != 0 {
 		m.pulls.cursor += d
 		m.pulls.clampCursor()
-		m.pulls.scroll = m.pullsSyncedScrollAt(m.pullsCapacity())
+		m.pulls.scroll = m.pullsSyncedScrollAt(m.pullsScrollCapacity())
 		return m, nil
 	}
 
@@ -409,6 +411,7 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.pr = newPRState(repo.ID, pr.IID)
+		m.fromSplit = m.splitDrawn()
 		m.view = viewPR
 		m.prReturn = viewPulls
 		m.forgeNotice = ""
@@ -477,7 +480,7 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 		return m.gotoCI()
 	case keyViewFloor:
 		// 1 jumps to the floor directly.
-		m.view = viewBoard
+		m.setListView(viewBoard)
 		return m, nil
 	case keyViewPulls:
 		return m, nil // already here
@@ -486,7 +489,7 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 		return m.gotoCI()
 	case keyEsc:
 		// esc on a list returns to the floor (D1).
-		m.view = viewBoard
+		m.setListView(viewBoard)
 		return m, nil
 	}
 	return m, nil
@@ -541,7 +544,10 @@ func (m tuiModel) renderPullsBody(height int, fullScreen bool) string {
 	start, end := boardWindow(selItem, m.pulls.scroll, len(items), capacity)
 
 	summary := m.pullsSummary()
-	if len(rows) > 0 {
+	if !fullScreen {
+		summary = ""
+	}
+	if fullScreen && len(rows) > 0 {
 		lo, hi := windowRunSpan(items, start, end)
 		summary += m.pal.faint.Render(" · " + itoa(lo) + "–" + itoa(hi))
 	}
@@ -663,6 +669,10 @@ func (m tuiModel) pullEyebrow(it boardItem) string {
 // and a `↳ <run>` link when a uzi run opened it. The list carries no checks cell by design (D4:
 // the cold list must not fan out a per-PR checks call — checks live only in the PR drill-in).
 func (m tuiModel) pullRow(pr apitypes.PullDTO, sel bool, runLinkW int) string {
+	unfocused := sel && m.splitDrawn() && m.view != viewPulls
+	if unfocused {
+		sel = false
+	}
 	band := pullBand(pr)
 	glyph, glyphC := m.pullGlyph(pr)
 
@@ -678,6 +688,8 @@ func (m tuiModel) pullRow(pr apitypes.PullDTO, sel bool, runLinkW int) string {
 	cursor := paintSeg(nil, bg, false, " ")
 	if sel {
 		cursor = paintSeg(m.pal.tungsten, bg, true, "▸")
+	} else if unfocused {
+		cursor = paintSeg(m.pal.faintC, nil, false, "›")
 	}
 	gap := paintSeg(nil, bg, false, "  ")
 

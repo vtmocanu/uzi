@@ -253,6 +253,9 @@ func (m tuiModel) openLinkedRun(runID *string, from tuiView) (tea.Model, tea.Cmd
 	if m.detail.stream != nil {
 		m.detail.stream.Close()
 	}
+	if m.splitDrawn() {
+		m.fromSplit = true
+	}
 	m.view = viewDetail
 	m.detail = newDetailState(*runID)
 	m.detailGen++
@@ -277,7 +280,16 @@ func (m tuiModel) prKey(k string) (tea.Model, tea.Cmd) {
 		// on the detail→m→PR path. → opens a row, so ← is its symmetric back (issue #1335). The state
 		// returned to persists on the model (m.pulls / m.detail are never clobbered), so it is still
 		// loaded. Reset to the default for the next open.
-		m.view = m.prReturn
+		target := m.prReturn
+		if m.fromSplit && !m.splitEligible() {
+			target = viewBoard
+		}
+		if target == viewBoard || target == viewCI || target == viewPulls {
+			m.setListView(target)
+			m.fromSplit = false
+		} else {
+			m.view = target
+		}
 		m.prReturn = viewPulls
 		return m, nil
 	case keyRefresh:

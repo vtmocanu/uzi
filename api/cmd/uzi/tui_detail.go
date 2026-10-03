@@ -453,7 +453,16 @@ func (m tuiModel) exitToBoard() (tea.Model, tea.Cmd) {
 	if m.detail.stream != nil {
 		m.detail.stream.Close()
 	}
-	m.view = m.detailReturn
+	target := m.detailReturn
+	if m.fromSplit && !m.splitEligible() {
+		target = viewBoard
+	}
+	if target == viewBoard || target == viewCI || target == viewPulls {
+		m.setListView(target)
+		m.fromSplit = false
+	} else {
+		m.view = target
+	}
 	m.detailReturn = viewBoard // reset to the default for the next drill-in
 	m.detail = detailState{}
 	// Mint a new id via startBoardReq so this refetch can't clear a periodic poll's guard: a

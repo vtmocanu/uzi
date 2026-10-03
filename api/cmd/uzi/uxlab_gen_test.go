@@ -114,6 +114,14 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"cirun-failing":                func(d bool) string { return ciRunFailing(d, now) },
 		"help":                         helpFrame,
 		"quit":                         quitFrame,
+		"split-floor-focus":            func(d bool) string { return splitScene(d, now, "floor") },
+		"split-ci-focus":               func(d bool) string { return splitScene(d, now, "ci") },
+		"split-pulls-focus":            func(d bool) string { return splitScene(d, now, "pulls") },
+		"split-min":                    func(d bool) string { return splitScene(d, now, "min") },
+		"split-80col":                  func(d bool) string { return splitScene(d, now, "80col") },
+		"split-needs-you-unfocused":    func(d bool) string { return splitScene(d, now, "needs-you") },
+		"split-ci-empty":               func(d bool) string { return splitScene(d, now, "ci-empty") },
+		"split-filtering":              func(d bool) string { return splitScene(d, now, "filtering") },
 	}
 
 	names := make([]string, 0, len(scenes))
@@ -169,6 +177,38 @@ func TestGenerateUXLabFrames(t *testing.T) {
 			}
 		}
 	}
+}
+
+// splitScene exercises the real resize path. Each scene owns its terminal size.
+func splitScene(dark bool, now time.Time, scene string) string {
+	repo := apitypes.RepoDTO{ID: "r1", PathWithNamespace: "vtmocanu/uzi", Enabled: true,
+		WebURL: "https://github.com/vtmocanu/uzi"}
+	fake := &uzicli.FakeClient{Runs: boardRuns(now), Repos: []apitypes.RepoDTO{repo}}
+	m := uxModel(fake, "", dark)
+	width, height := 100, 60
+	if scene == "min" {
+		height = splitMinHeight + 2
+	}
+	if scene == "80col" {
+		width = 80
+	}
+	m = step(m, tea.WindowSizeMsg{Width: width, Height: height})
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: fake.Runs})
+	m = step(m, reposMsg{repos: fake.Repos})
+	m = step(m, ciMsg{reqID: m.ci.waitID, runs: sampleCIRuns(now)})
+	switch scene {
+	case "ci", "needs-you", "filtering":
+		m = key(m, keyViewCI)
+	case "pulls":
+		m = key(m, keyViewPulls)
+		m = step(m, pullsMsg{reqID: m.pulls.waitID, pulls: samplePulls(now)})
+	}
+	if scene == "filtering" {
+		m = key(m, keyFilter)
+		m = key(m, "r")
+		m = key(m, "u")
+	}
+	return m.View().Content
 }
 
 // ---- board fixtures -------------------------------------------------------

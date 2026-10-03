@@ -218,6 +218,10 @@ func (m tuiModel) boardEmptyState() string {
 // selected row rides the full-width warm selection bar with a ▸ cursor; a DONE-band row is
 // faint end to end.
 func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCols) string {
+	unfocused := sel && m.splitDrawn() && m.view != viewBoard
+	if unfocused {
+		sel = false
+	}
 	band := runBandOf(r)
 	terminal := band == bandDone
 	tok := m.pal.runStateToken(r.RunDTO, r.IsRevising)
@@ -260,6 +264,8 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	cursor := paintSeg(nil, bg, false, " ")
 	if sel {
 		cursor = paintSeg(m.pal.tungsten, bg, true, "▸")
+	} else if unfocused {
+		cursor = paintSeg(m.pal.faintC, nil, false, "›")
 	}
 	gap := paintSeg(nil, bg, false, "  ")
 	row := cursor +
