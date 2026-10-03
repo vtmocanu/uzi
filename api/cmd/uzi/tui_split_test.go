@@ -315,3 +315,137 @@ func TestSplitDisplayedPollAndModalPause(t *testing.T) {
 		t.Fatal("help modal polled CI")
 	}
 }
+
+func TestSplitResizeUnderModalCommitsFocusedFilter(t *testing.T) {
+	for _, modal := range []string{"help", "quit", "update"} {
+		for _, bottom := range []tuiView{viewCI, viewPulls} {
+			t.Run(fmt.Sprintf("%s/%v", modal, bottom), func(t *testing.T) {
+				m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+				m = resizeSplit(m, 120, splitMinHeight+2)
+				m.setListView(bottom)
+				if bottom == viewCI {
+					m.ci.filter, m.ci.filtering = "pending", true
+				} else {
+					m.pulls.filter, m.pulls.filtering = "pending", true
+				}
+				switch modal {
+				case "help":
+					m.showHelp = true
+				case "quit":
+					m.quitting = true
+				case "update":
+					m.updatePrompt.showing = true
+				}
+				m = resizeSplit(m, 120, splitMinHeight-1)
+				if m.view != viewBoard || m.splitLatch {
+					t.Fatalf("resize kept bottom focus: view=%v latch=%v", m.view, m.splitLatch)
+				}
+				if bottom == viewCI && (m.ci.filtering || m.ci.filter != "pending") {
+					t.Fatalf("CI filter was not committed: %+v", m.ci)
+				}
+				if bottom == viewPulls && (m.pulls.filtering || m.pulls.filter != "pending") {
+					t.Fatalf("pulls filter was not committed: %+v", m.pulls)
+				}
+			})
+		}
+	}
+}
+
+func TestSplitFirstRepliesUnderModalActivateOnDismiss(t *testing.T) {
+	for _, modal := range []string{"help", "update", "quit"} {
+		for _, order := range []string{"repos-first", "board-first", "board-failed"} {
+			for _, bottom := range []tuiView{viewCI, viewPulls} {
+				t.Run(fmt.Sprintf("%s/%s/%v", modal, order, bottom), func(t *testing.T) {
+					first, second := oneRepo(), oneRepo()
+					second.ID, second.PathWithNamespace = "r2", "example/second"
+					m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+					m = resizeSplit(m, 120, splitMinHeight+2)
+					m.bottomTab = bottom
+					switch modal {
+					case "help":
+						m.showHelp = true
+					case "update":
+						m.updatePrompt.showing = true
+					case "quit":
+						m.quitting = true
+					}
+					runs := []apitypes.RunListItemDTO{{RunDTO: apitypes.RunDTO{
+						ID: "latest", RepoID: sp(second.ID), Status: "running", CreatedAt: time.Now(),
+					}}}
+					deliverRepos := func() {
+						next, _ := m.Update(reposMsg{repos: []apitypes.RepoDTO{first, second}})
+						m = next.(tuiModel)
+					}
+					deliverBoard := func() {
+						msg := boardRunsMsg{reqID: m.board.waitID, runs: runs}
+						if order == "board-failed" {
+							msg.err, msg.runs = fmt.Errorf("first board failed"), nil
+						}
+						next, _ := m.Update(msg)
+						m = next.(tuiModel)
+					}
+					if order == "repos-first" {
+						deliverRepos()
+						if m.repoChosen {
+							t.Fatal("repo chosen before first board reply")
+						}
+						deliverBoard()
+					} else {
+						deliverBoard()
+						deliverRepos()
+					}
+					if m.repoChosen || m.ci.waitID != 0 || m.pulls.waitID != 0 {
+						t.Fatalf("modal fetched early: chosen=%v ci=%d pulls=%d", m.repoChosen, m.ci.waitID, m.pulls.waitID)
+					}
+					m = press(t, m, keyEsc)
+					repo, ok := m.currentRepo()
+					wantRepo := second.ID
+					if order == "board-failed" {
+						wantRepo = first.ID
+						if m.board.errStreak != 1 {
+							t.Fatalf("failed board reply lost retry streak: %d", m.board.errStreak)
+						}
+					}
+					if !ok || repo.ID != wantRepo || !m.boardReplied || m.board.waitID != 0 {
+						t.Fatalf("dismiss did not resolve board repo: repo=%+v ok=%v replied=%v wait=%d", repo, ok, m.boardReplied, m.board.waitID)
+					}
+					wait := m.ci.waitID
+					if bottom == viewPulls {
+						wait = m.pulls.waitID
+					}
+					if wait == 0 || !m.splitDrawn() {
+						t.Fatalf("dismiss did not fetch displayed bottom: bottom=%v wait=%d", bottom, wait)
+					}
+					m = press(t, m, keyEsc)
+					if bottom == viewCI && m.ci.reqSeq != 1 || bottom == viewPulls && m.pulls.reqSeq != 1 {
+						t.Fatal("dismissal issued duplicate forge fetch")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestSplitFilterReadoutOnlyInSeparator(t *testing.T) {
+	for _, bottom := range []tuiView{viewCI, viewPulls} {
+		m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+		m = resizeSplit(m, 120, splitMinHeight+2)
+		m.setListView(bottom)
+		if bottom == viewCI {
+			m.ci.filter, m.ci.filtering = "needle", true
+		} else {
+			m.pulls.filter, m.pulls.filtering = "needle", true
+		}
+		frame := stripANSI(m.View().Content)
+		if got := strings.Count(frame, "/needle"); got != 1 {
+			t.Fatalf("%v split readout count=%d:\n%s", bottom, got, frame)
+		}
+		if !strings.Contains(stripANSI(m.splitSeparatorLine()), "/needle") {
+			t.Fatalf("%v separator lost filter", bottom)
+		}
+		m.splitOff = true
+		if !strings.Contains(stripANSI(m.View().Content), "/needle") {
+			t.Fatalf("%v full-screen lost filter", bottom)
+		}
+	}
+}

@@ -891,13 +891,13 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.renderer, _ = newTUIRenderer(m.transcriptWidth(), m.dark)
-		was := m.splitDrawn()
+		was := m.splitEligible() && m.listView()
 		if m.width < 80 || m.height < splitMinHeight {
 			m.splitLatch = false
 		} else if m.height >= splitMinHeight+2 {
 			m.splitLatch = true
 		}
-		if was && !m.splitDrawn() {
+		if was && !m.splitEligible() {
 			m.collapseSplit()
 		}
 		if !was && m.splitDrawn() {
@@ -1024,7 +1024,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// If the user is already on a forge screen, resolve the default repo and fetch now so they
 		// are not stuck on "loading…" until the next 10s tick. Both forge lists share the repo scope
 		// (D2), so whichever is in focus kicks off its own fetch.
-		if m.splitDrawn() && !m.boardReplied && !m.repoChosen {
+		if m.splitEligible() && m.listView() && !m.boardReplied && !m.repoChosen {
 			return m, nil
 		}
 		switch m.displayedForge() {
@@ -1546,17 +1546,22 @@ func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		default:
 			m.quitting, m.ctrlCSeen = false, false
-			return m, nil
+			return m, m.activateSplit()
 		}
 	}
 	if m.showHelp {
 		m.showHelp = false
-		return m, nil
+		return m, m.activateSplit()
 	}
 	// The startup update prompt (PRD #1251 M1) is modal: it captures every key except the
 	// ctrl+c quit handled above, so it sits before the q/? shortcuts and the view dispatch.
 	if m.updatePrompt.showing {
-		return m.updatePromptKey(k)
+		next, cmd := m.updatePromptKey(k)
+		updated := next.(tuiModel)
+		if !updated.updatePrompt.showing && !updated.updatePrompt.pendingUpgrade {
+			return updated, tea.Batch(cmd, updated.activateSplit())
+		}
+		return next, cmd
 	}
 	if k == keyQuit && !m.filtering() {
 		return m, tea.Quit

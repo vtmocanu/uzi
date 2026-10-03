@@ -137,7 +137,7 @@ func splitPane(body string, height int) string {
 func (m tuiModel) splitSeparatorLine() string {
 	tab := m.bottom()
 	focus := m.view == tab
-	tabs := m.pal.faint.Render("pulls · ci")
+	var tabs string
 	if focus {
 		if tab == viewPulls {
 			tabs = m.pal.title.Render("[pulls]") + m.pal.faint.Render(" · ci")
@@ -235,9 +235,7 @@ func (m tuiModel) renderSplit() string {
 		floor = "[" + floor + "]"
 	}
 	lines = append(lines, clampVisual(" "+m.pal.title.Render("▚▚ uzi")+" · "+m.pal.title.Render(floor), m.width))
-	for _, line := range m.boardMeterLayout(time.Now()).lines {
-		lines = append(lines, line)
-	}
+	lines = append(lines, m.boardMeterLayout(time.Now()).lines...)
 	if vault := m.vaultIndicatorLine(); vault != "" {
 		lines = append(lines, vault)
 	}

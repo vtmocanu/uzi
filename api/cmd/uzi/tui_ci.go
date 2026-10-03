@@ -357,7 +357,7 @@ func (m tuiModel) renderCIBody(height int, fullScreen bool) string {
 	if fullScreen {
 		brand = m.tabStrip(m.board.admin && m.view == viewBoard, m.view, true)
 	}
-	if m.ci.filter != "" || m.ci.filtering {
+	if fullScreen && (m.ci.filter != "" || m.ci.filtering) {
 		brand += m.pal.faint.Render("   /" + cellText(m.ci.filter))
 		if m.ci.filtering {
 			brand += m.pal.title.Render("▌")

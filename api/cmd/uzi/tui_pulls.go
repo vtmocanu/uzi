@@ -531,7 +531,7 @@ func (m tuiModel) renderPullsBody(height int, fullScreen bool) string {
 	if fullScreen {
 		brand = m.tabStrip(m.board.admin && m.view == viewBoard, m.view, true)
 	}
-	if m.pulls.filter != "" || m.pulls.filtering {
+	if fullScreen && (m.pulls.filter != "" || m.pulls.filtering) {
 		brand += m.pal.faint.Render("   /" + cellText(m.pulls.filter))
 		if m.pulls.filtering {
 			brand += m.pal.title.Render("▌")
