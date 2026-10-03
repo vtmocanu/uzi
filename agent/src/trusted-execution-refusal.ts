@@ -165,7 +165,7 @@ const REASON_FAMILIES = [
   /^supervisor (?:control|evidence) channel \(fd\) is unavailable$/,
   /^supervised provider child exited unexpectedly \(code=(?:\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\)$/,
   /^supervisor exited \(code=(?:null|-?\d+), signal=(?:null|SIG(?:ABRT|ALRM|BUS|CHLD|CONT|FPE|HUP|ILL|INT|IO|IOT|KILL|PIPE|POLL|PROF|PWR|QUIT|SEGV|STKFLT|STOP|SYS|TERM|TRAP|TSTP|TTIN|TTOU|URG|USR1|USR2|VTALRM|WINCH|XCPU|XFSZ|BREAK|INFO|LOST|UNUSED))\) without confirmed disposal$/,
-  /^expected snapshot evidence, got (?:snapshot|dispose)$/,
+  /^expected snapshot evidence, got dispose$/,
   // Posture evidence has arbitrary String-coerced fields; parsed separately below.
   /^autopilot plan not durably stored — the run is [\s\S]*$/, // StateAck.status is a free string.
   /^could not park (?:the run to ask a question|the interactive task to await a follow-up) \(server reports [\s\S]*\)$/, // Same status domain.
@@ -246,7 +246,7 @@ export function legacyTrustedExecutionRefusal(reason: string, existingReason?: (
     if ((candidate.length <= MAX_FIXED_REASON_LENGTH && FIXED_REASONS.has(candidate))
       || existingReason?.(candidate) || configReason(candidate) || numericReason(candidate) || postureReason(candidate)
       || REASON_FAMILIES.some((family) => family.exec(candidate)?.[0] === candidate)) return true;
-    const context = /^[^"\'\r\n]+?: /.exec(candidate);
+    const context = /^[^"'\r\n]+?: /.exec(candidate);
     if (context === null) return false;
     candidate = candidate.slice(context[0].length);
   }

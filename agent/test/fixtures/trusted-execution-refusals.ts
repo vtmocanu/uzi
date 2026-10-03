@@ -557,6 +557,10 @@ export const trustedEnvelopeCases = [
 ]);
 
 export const trustedCaptureCases = [
+  ...["command root failed registry admission", "plan gate is not wired for this run"].flatMap((reason) => [
+    { reason, representation: "context Error", error: () => new Error(`capture: ${reason}`), display: `capture: ${reason}` },
+    { reason, representation: "Error cause", error: () => new Error("capture wrapper", { cause: new Error(reason) }), display: "capture wrapper" },
+  ]),
   { reason: "typed capture refusal", representation: "mixed typed wrapper", error: () => new Error("capture wrapper", { cause: { interruption: new TrustedExecutionRefusal("opaque capture decision") } }), display: "capture wrapper" },
   { reason: "command launch admission is closed", representation: "direct Error", error: () => new Error("command launch admission is closed"), display: "command launch admission is closed" },
   { reason: "command cwd escapes the worktree sandbox", representation: "context Error", error: () => new Error("capture: command cwd escapes the worktree sandbox"), display: "capture: command cwd escapes the worktree sandbox" },
@@ -587,6 +591,7 @@ export const trustedBoundaryCases = [
 ] as const;
 
 export const opaqueBoundaryCases = [
+  ["snapshot near-miss", () => new Error("expected snapshot evidence, got snapshot")],
   ["eight opaque values within bound", () => opaqueChain(8)],
   ["quoted reason", () => new Error('filesystem says: "command root failed registry admission"')],
   ["unrelated diagnostic", () => new Error("filesystem says\ncommand root failed registry admission")],

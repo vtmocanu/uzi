@@ -384,6 +384,7 @@ describe("launchCodexRoot: app-server auth (production config, no env credential
     const helper = fileURLToPath(new URL("../src/codex/session-seed-cli.ts", import.meta.url));
     const spawnSync = childProcess.spawnSync;
     let seedCalls = 0;
+    let sharedSessionPosture = false;
     try {
       await fs.mkdir(seedDir, { recursive: true });
       await fs.mkdir(sessions, { recursive: true });
@@ -402,7 +403,26 @@ describe("launchCodexRoot: app-server auth (production config, no env credential
         assert.deepEqual(args.slice(0, prefix.length), prefix);
         const executable = args[prefix.length]!;
         if (executable === "/bin/sh" || executable === "/bin/rm") {
-          return { status: 0, signal: null, pid: 0, output: [], stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+          let stdout = Buffer.alloc(0);
+          const shellArgs = args.slice(prefix.length + 1);
+          if (executable === "/bin/sh" && shellArgs[1] === 'stat -c "%u:%g:%a" -- "$1"') {
+            const requestedPath = shellArgs[3];
+            assert.equal(typeof requestedPath, "string");
+            const codexHome = path.join(root, "codex");
+            const configPath = path.join(codexHome, "config.toml");
+            assert.ok([
+              root, codexHome, sessions, configPath, tmp, path.join(root, "home"),
+              ...["config", "cache", "data", "state"].map((dir) => path.join(root, `xdg-${dir}`)),
+            ].includes(requestedPath!));
+            const shared = sharedSessionPosture && [root, codexHome, sessions].includes(requestedPath!);
+            const mode = requestedPath === configPath ? "600"
+              : shared ? (requestedPath === sessions ? "2750" : "710") : "700";
+            stdout = Buffer.from(`${RUNNER_UID}:${shared ? CODEX_SESSION_GID : RUNNER_UID}:${mode}\n`);
+          } else if (executable === "/bin/sh") {
+            if (shellArgs[1]?.includes("chgrp")) sharedSessionPosture = true;
+            else if (shellArgs[1]?.includes("mkdir -m 700")) sharedSessionPosture = false;
+          }
+          return { status: 0, signal: null, pid: 0, output: [], stdout, stderr: Buffer.alloc(0) };
         }
         seedCalls++;
         const argv = args.slice(prefix.length + 1).map((arg) => arg === "/app/src/codex/session-seed-cli.ts" ? helper : arg);

@@ -5,6 +5,7 @@ import { legacyTrustedExecutionRefusal } from "../src/trusted-execution-refusal.
 it("trusted refusal: legacy parameter guards accept only complete producer domains", () => {
   for (const reason of [
     "command root failed registry admission",
+    "expected snapshot evidence, got dispose",
     "supervised provider child exited unexpectedly (code=255)",
     "started deadline exceeded (0ms)",
     "runner uid resolution produced an invalid uid: garbage",
@@ -18,6 +19,8 @@ it("trusted refusal: legacy parameter guards accept only complete producer domai
   ]) assert.equal(legacyTrustedExecutionRefusal(reason), true, reason);
 
   for (const reason of [
+    "expected snapshot evidence, got snapshot",
+    "startup: Error: expected snapshot evidence, got snapshot",
     "invalid root failed registry admission",
     "command root failed registry admission trailing",
     "supervised provider child exited unexpectedly (code=256)",
