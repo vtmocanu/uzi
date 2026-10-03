@@ -15,7 +15,10 @@ reuse the same connection and each reach their request deadline.
 ## Decision
 
 Forge API, ancestry and log clients share a package-owned clone of Go's default
-transport. Native HTTP2Config sends a health ping after 30 seconds without
+transport when it is a standard http.Transport. If a wrapper was installed
+before package initialization, use a fresh transport with the standard proxy,
+dial, pooling and TLS timeout settings instead of an unchecked type assertion.
+Native HTTP2Config sends a health ping after 30 seconds without
 received frames and closes the connection after a further 15 seconds without
 the ping response. Subsequent calls may establish a fresh connection. Sharing
 the transport across driver rebuilds preserves pooling; the process-global
@@ -28,6 +31,11 @@ and ETag wrapper, and token redaction remain separate safeguards. A failed
 request is still returned to its caller; this adds no application retry loop.
 
 ## Validation and limits
+
+Detection takes about 45 seconds after the last received frame (30 seconds idle
+plus the 15-second ping timeout), longer than the default 15-second per-call
+deadline. Two or three immediately consecutive calls can still time out before
+recovery; request timing and scheduling affect the observed delay and count.
 
 The regression uses the real GitHub constructor and trace connection identity.
 Each mode runs in a child process with a private pool trusting only the test

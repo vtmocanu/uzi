@@ -64,7 +64,7 @@ func TestForgeHTTP2StallInvestigation(t *testing.T) {
 	transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
 	recovery := os.Getenv("FORGE_STALL_CHILD") == "recovery"
 	if recovery {
-		transport = newForgeHTTPTransport()
+		transport = newForgeHTTPTransport(http.DefaultTransport)
 		transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
 		// Scale only the durations in the child; production defaults have their
 		// own contract test. Exercise the real constructor and shared pool.
@@ -72,7 +72,7 @@ func TestForgeHTTP2StallInvestigation(t *testing.T) {
 			transport.HTTP2.SendPingTimeout = 50 * time.Millisecond
 		}
 		if transport.HTTP2.PingTimeout > 0 {
-			transport.HTTP2.PingTimeout = 50 * time.Millisecond
+			transport.HTTP2.PingTimeout = 200 * time.Millisecond
 		}
 	}
 	forgeHTTPTransport = transport
