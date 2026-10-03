@@ -1,5 +1,5 @@
-// AdminShell: one header + tab bar shared by the admin surfaces (Users, Products,
-// Rate limits, Tool allowlist, Blocked repos, Site lists, Instance, Branding, Health). The same
+// AdminShell: one header + tab bar shared by the admin surfaces (Users, Rate limits,
+// Tool allowlist, Blocked repos, Instance, Branding, Site lists, Products, Health). The same
 // treatment SettingsShell gives the user-scoped settings: the pages used to be separate
 // top-level sidebar entries wired together only by proximity, which crowded the
 // sidebar for admins and hid that they are one area — this instance's controls.
@@ -12,19 +12,20 @@ import { CountPill, cx, PageHeader } from "./ui";
 import { healthPipLabel } from "../lib/healthView";
 import { useHealthStatus } from "../lib/useAdminHealth";
 
-// Health is LAST (PRD #1484 D1), after Branding — its entry points are the sidebar pip
+// Health is last (PRD #1484 D1); its entry points are the sidebar pip
 // (M5) and the Overview card (M5), not tab position. `pip: true` marks the one tab that
 // carries the health severity pip when checks need attention.
 const TABS = [
   { to: "/admin/users", label: "Users" },
-  // PRD #1907: products sit beside Users, the other "who can act on this instance" tab.
-  { to: "/admin/products", label: "Products" },
   { to: "/admin/rate-limits", label: "Rate limits" },
   { to: "/admin/tool-allowlist", label: "Tool allowlist" },
   { to: "/admin/blocked-repos", label: "Blocked repos" },
-  { to: "/admin/egress-profiles", label: "Site lists" },
   { to: "/admin/settings", label: "Instance" },
   { to: "/admin/branding", label: "Branding" },
+  // Optional external-products/jobs controls follow instance configuration. Site lists
+  // come first: jobs use them, and products can only allow lists that already exist.
+  { to: "/admin/egress-profiles", label: "Site lists" },
+  { to: "/admin/products", label: "Products" },
   { to: "/admin/health", label: "Health", pip: true },
 ];
 

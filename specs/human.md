@@ -939,7 +939,8 @@ Tracked as GitHub issue vtmocanu/uzi#1995; ADR at `adr/1296-durable-run-recovery
 Tracked as GitHub issue vtmocanu/uzi#1484; PRD at `prds/1484-admin-health-tab.md`.
 
 - An admin gets a read-only, closed registry of checks over what uzi knows about itself (worker rolls, queue and capacity, controller liveness, background loops, the database, integrations, housekeeping), surfaced as an Admin → Health tab, an Overview card, an app-wide Danger banner, `uzi admin health`, and one notice per admin per danger episode. [AI-synced 2026-09-20, #1484]
-- Health is the **last** admin tab, after Branding, not the first; the sidebar pip and the Overview card are the entry points. [AI-synced 2026-09-20, #1484]
+- Health is the **last** admin tab, not the first; the sidebar pip and the Overview card are the entry points. [AI-synced 2026-10-03, #1484]
+  - Admin tab order: Users, Rate limits, Tool allowlist, Blocked repos, Instance, Branding, Site lists, Products, Health. Site lists and Products follow Branding, with Health still last. (AI-synced 2026-10-03)
 - The Danger banner carries a "Snooze 1 h", per admin, per open episode; a new episode shows the banner again. [AI-synced 2026-09-20, #1484]
 - A non-admin gets a platform line on Overview instead of the admin card, derived only from their own runs and workers, so they can tell a platform problem from a problem with their own run. [AI-synced 2026-09-20, #1484]
 - In-app health never reads the Kubernetes API; the api holds no kube credential, and no action (restart, retry, rollback, cordon) is offered — diagnosis only. [AI-synced 2026-09-20, #1484]

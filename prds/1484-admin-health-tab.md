@@ -152,7 +152,7 @@ Every `summary`, `action` and `command` is composed by the server from a fixed t
 
 ### The Health tab
 
-Last in `TABS`, after Branding. `/admin` keeps redirecting to `/admin/users`. On a narrow screen the tab strip scrolls, so the active tab is scrolled into view, and the two real entry points are the sidebar Admin pip and the Overview card. The tab label carries a severity pip and a count when anything needs attention.
+Last in `TABS`. `/admin` keeps redirecting to `/admin/users`. On a narrow screen the tab strip scrolls, so the active tab is scrolled into view, and the two real entry points are the sidebar Admin pip and the Overview card. The tab label carries a severity pip and a count when anything needs attention.
 
 Layout, top to bottom: verdict with per-severity tally; the needs-attention list (links that open and scroll to the check); "Checked N s ago" and a Copy diagnostics button; then one card per group. `danger` and `unknown` checks render expanded. The workers group ends with the cross-user fleet table: Owner, Worker, Kind, Status, Version, Upgrade, Blocking, Since. The table reads `GET /api/admin/workers`, which now carries roll health.
 
@@ -294,3 +294,4 @@ A single uzi run executes these in order. M3, M4 and M6 share no files except th
 - **D14: episodes are explicit rows**, not the custody precedent's implicit per-owner row, because the episode id is exposed in the API and keys the per-admin snooze and the per-admin notice claim. The evaluator lands in M2 (open and close only) so the banner's snooze works before the notice milestone.
 - **D15: the scheduler is one of the four beating loops.** A dead scheduler silently stops every scheduled job, a different failure from a user's pause-all.
 - **D16 (review, 2026-09-20): the CLI is its own milestone (M3)**, split out of M1 so a late CLI failure cannot reopen the registry. Two reviewers (scope and trust boundary; adversarial fact-check) found no blocking issue and no refuted fact; their corrections are folded in above: the `worker_upgrade_reports` table name, the `fleet.disk` source, the `health_enabled` dependency, the eligible-branch wording of `forge.ciwatch`, the episode storage, the exit-code implementation site, and the live-DB package trap for `healthsvc` and `slacksvc`.
+- **D17 (user, 2026-10-03): Admin tab order updated.** Site lists and Products follow Branding, in that order, with Health still last. This supersedes D1's adjacency to Branding while preserving its last-tab decision.

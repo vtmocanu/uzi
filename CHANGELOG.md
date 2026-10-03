@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **Admin tabs group Site lists and Products after Branding, before Health.**
+  Instance and Branding stay together; Site lists precedes Products to follow setup order, and Health remains last.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added
