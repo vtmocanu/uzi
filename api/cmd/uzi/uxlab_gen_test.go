@@ -195,7 +195,11 @@ func splitScene(dark bool, now time.Time, scene string) string {
 	m = step(m, tea.WindowSizeMsg{Width: width, Height: height})
 	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: fake.Runs})
 	m = step(m, reposMsg{repos: fake.Repos})
-	m = step(m, ciMsg{reqID: m.ci.waitID, runs: sampleCIRuns(now)})
+	ciRuns := sampleCIRuns(now)
+	if scene == "ci-empty" {
+		ciRuns = nil // an empty successful CI reply, so the bottom pane shows its empty state
+	}
+	m = step(m, ciMsg{reqID: m.ci.waitID, runs: ciRuns})
 	switch scene {
 	case "ci", "needs-you", "filtering":
 		m = key(m, keyViewCI)

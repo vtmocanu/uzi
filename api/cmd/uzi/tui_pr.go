@@ -284,6 +284,13 @@ func (m tuiModel) prKey(k string) (tea.Model, tea.Cmd) {
 		if m.fromSplit && !m.splitEligible() {
 			target = viewBoard
 		}
+		if m.prReturn == viewDetail && target != viewDetail {
+			// The collapse skips the run view this PR was opened from, so leave it the way
+			// exitToBoard does: close its stream and drop the session, so a late stream reply
+			// no longer matches and is closed on arrival.
+			m.prReturn = viewPulls
+			return m.exitToBoard()
+		}
 		if target == viewBoard || target == viewCI || target == viewPulls {
 			m.setListView(target)
 			m.fromSplit = false

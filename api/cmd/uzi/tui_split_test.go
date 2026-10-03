@@ -469,3 +469,54 @@ func TestSplitFilterReadoutOnlyInSeparator(t *testing.T) {
 		}
 	}
 }
+
+// splitPRFromDetail drills split floor → run detail → m (PR view), then collapses the split, so
+// the PR view's esc can no longer return to the run view it was opened from.
+func splitPRFromDetail(t *testing.T) (tuiModel, apitypes.RunDTO) {
+	t.Helper()
+	run := apitypes.RunDTO{ID: prLinkedRunID, Kind: "issue", Status: "running", RepoID: sp("r1"), MrIID: ip(1254)}
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	m.board.runs = []apitypes.RunListItemDTO{{RunDTO: run}}
+	m = resizeSplit(m, 120, splitMinHeight+2)
+	m = press(t, m, keyEnter)
+	m = applyDetail(m, run, nil)
+	return m, run
+}
+
+func TestSplitCollapsedPRReturnClosesRunStream(t *testing.T) {
+	m, run := splitPRFromDetail(t)
+	own := streamOf(t, m.openStreamCmd(run.ID))
+	next, _ := m.Update(own)
+	m = next.(tuiModel)
+	m = press(t, m, keyPRView)
+	m = resizeSplit(m, 120, splitMinHeight-1)
+	m = press(t, m, keyEsc)
+	if m.view != viewBoard {
+		t.Fatalf("collapsed PR esc returned to view=%v, want the board", m.view)
+	}
+	requireStreamClosed(t, own.stream, "the run stream left behind by a collapsed PR return")
+	if m.detail.runID != "" {
+		t.Fatalf("collapsed PR return kept the run detail session %q", m.detail.runID)
+	}
+}
+
+func TestSplitCollapsedPRReturnClosesLateRunStream(t *testing.T) {
+	m, run := splitPRFromDetail(t)
+	late := streamOf(t, m.openStreamCmd(run.ID)) // opened before the exit, delivered after it
+	m = press(t, m, keyPRView)
+	m = resizeSplit(m, 120, splitMinHeight-1)
+	m = press(t, m, keyEsc)
+	next, _ := m.Update(late)
+	m = next.(tuiModel)
+	if m.detail.stream != nil {
+		t.Fatalf("a stream arriving after the collapsed PR return was adopted")
+	}
+	requireStreamClosed(t, late.stream, "a run stream arriving after the collapsed PR return")
+}
+
+func TestSplitCIEmptySceneIsEmpty(t *testing.T) {
+	frame := stripANSI(splitScene(true, time.Now(), "ci-empty"))
+	if !strings.Contains(frame, "No CI runs yet") {
+		t.Fatalf("the split-ci-empty scene renders CI runs instead of the empty state:\n%s", frame)
+	}
+}
