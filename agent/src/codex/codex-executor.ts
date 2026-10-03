@@ -2162,7 +2162,7 @@ export class CodexExecutor implements Executor {
       // cross-worker resume) or starts a fresh session. `lastSessionId` tracks the most recent
       // turn's session id so a recreated epoch resumes the RIGHT thread.
       let lastSessionId = ctx.sessionId ?? undefined;
-      epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochNamespace, epochIndex);
+      epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochNamespace, epochIndex, { persistAfterLaunchOnly: true });
       this.safety = epoch.safety;
 
       // Issue #1782: a refused in-turn wall park may already have reaped the provider root (the
@@ -2361,7 +2361,7 @@ export class CodexExecutor implements Executor {
         // propagates out of run() unchanged (startProviderEpoch rethrows it unwrapped and
         // `this.safety` is still the OLD live epoch, since it is swapped only after a
         // successful start), and the runner does the fenced positive running report itself.
-        epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochNamespace, ++epochIndex);
+        epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochNamespace, ++epochIndex, { persistAfterLaunchOnly: true });
         this.safety = epoch.safety;
         reapedSinceLastPersist = false;
         await old.dispose();
@@ -2541,7 +2541,7 @@ export class CodexExecutor implements Executor {
         if (reapedSinceLastPersist) epochNeedsRecreate = true;
         if (epochNeedsRecreate) {
           const old = epoch;
-          epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochNamespace, ++epochIndex);
+          epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochNamespace, ++epochIndex, { persistAfterLaunchOnly: true });
           this.safety = epoch.safety;
           await old.dispose();
           epochNeedsRecreate = false;

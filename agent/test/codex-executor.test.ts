@@ -7823,6 +7823,158 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
       return home;
     } };
   };
+  // The store publishes a new generation on every persist, including an empty source. Keep
+  // home state separate from the saved generation: an unlaunched home has not adopted
+  // the session, so publishing it would replace the stored generation with an empty one.
+  const sessionGenerationSpy = (rig: MultiRig, seed: { generation: number; files: number } = { generation: 0, files: 0 }) => {
+    const homes = new Map<string, { populated: boolean; launched: boolean }>();
+    const sources: { home: string; populated: boolean; launched: boolean }[] = [];
+    let savedGeneration = seed.generation;
+    let savedFiles = seed.files;
+    const launch = rig.deps.launchProviderRoot!;
+    (rig.deps as { launchProviderRoot?: CodexExecutorDeps["launchProviderRoot"] }).launchProviderRoot = async (spec, authMode) => {
+      const result = await launch(spec, authMode);
+      const home = `${spec.ownedDataRoot}/codex`;
+      homes.set(home, { populated: true, launched: true });
+      return result;
+    };
+    (rig.deps as { sessionStore?: CodexExecutorDeps["sessionStore"] }).sessionStore = {
+      adopt: async (_storeDir, home) => {
+        rig.sessionOps.adopt++;
+        homes.set(home, { populated: savedFiles > 0, launched: false });
+        return { files: savedFiles };
+      },
+      inspect: async () => { rig.sessionOps.inspect++; return savedFiles > 0 ? "present" : "absent"; },
+      remove: async () => { rig.sessionOps.removeCalls++; savedFiles = 0; },
+      persist: async (home) => {
+        rig.sessionOps.persist++;
+        const source = homes.get(home) ?? { populated: false, launched: false };
+        sources.push({ home, ...source });
+        savedGeneration++;
+        savedFiles = source.populated ? 1 : 0;
+        return { files: savedFiles, bytes: savedFiles };
+      },
+    };
+    return { sources, generation: () => savedGeneration, files: () => savedFiles };
+  };
+
+  it("an owner now pause after loop-top recreation preserves the launched epoch's generation", async () => {
+    const rig = makeMultiEpochRig([checkpointEpoch()]);
+    const store = sessionGenerationSpy(rig);
+    let interrupt: (() => void) | undefined;
+    let now = false;
+    const { ctx } = makeCtx({
+      checkpoint: async () => undefined,
+      onPauseNow: (cb) => { interrupt = cb; },
+      pauseModeRequested: () => now ? "now" : null,
+      pullSafetySteer: () => {
+        if (rig.client.releaseCalls.length === 2) { now = true; interrupt?.(); }
+        return undefined;
+      },
+      parkForPause: async () => true,
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "recreated owner pause");
+    assert.ok(result.pausedAt);
+    assert.equal(rig.providerLaunches(), 1, "the recreated epoch did not launch");
+    assert.equal(store.sources.length, 1, "only the launched home was a persist source");
+    assert.equal(store.sources[0]!.launched, true);
+    assert.equal(store.generation(), 1);
+    assert.equal(store.files(), 1);
+  });
+
+  it("a seeded wall park on re-claim keeps the prior generation without launching epoch zero", async () => {
+    const rig = makeMultiEpochRig([doneEpoch()]);
+    const store = sessionGenerationSpy(rig, { generation: 7, files: 1 });
+    const { ctx } = makeCtx({
+      sessionId: "th-1",
+      pauseModeRequested: () => "wall",
+      parkForWall: async () => "parked",
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "seeded re-claim wall");
+    assert.ok(result.walled);
+    assert.equal(rig.providerLaunches(), 0);
+    assert.deepEqual(store.sources, [], "no source was read before epoch zero launched");
+    assert.equal(store.generation(), 7);
+    assert.equal(store.files(), 1);
+
+    const resumed = makeMultiEpochRig([resumedDone("th-1", "tn-2")]);
+    const resumedStore = sessionGenerationSpy(resumed, { generation: store.generation(), files: store.files() });
+    const resumedCtx = makeCtx({ sessionId: "th-1", pauseModeRequested: () => "wall" });
+    await withTimeout(makeExecutor(resumed, bindingOf(SUBSCRIPTION)).run(resumedCtx.ctx), 5000, "unwired re-claim resume");
+    assert.equal(resumed.epochs[0]!.transport.requests.some((r) => r.method === "thread/resume"), true);
+    assert.equal(resumed.epochs[0]!.transport.turnStartCount, 1);
+    assert.deepEqual(resumedStore.sources.map((s) => s.launched), [true]);
+  });
+
+  it("plan approval recreation stopped at reportIteration leaves the plan generation intact", async () => {
+    const rig = makeMultiEpochRig([epochResponder("th-plan", "tn-plan", (t, th, tn) => {
+      t.push(toolCall(1, "submit_plan", { plan_md: "the plan" }, th, tn, "c-plan"))
+        .push(turnCompleted("completed", th, tn));
+    })]);
+    const store = sessionGenerationSpy(rig);
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } }) as never,
+      reportIteration: async () => { throw new Error("stop at running report"); },
+    });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "approval report stop"), /stop at running report/);
+    assert.equal(rig.providerLaunches(), 1);
+    assert.deepEqual(store.sources.map((s) => s.launched), [true]);
+    assert.equal(store.generation(), 1);
+    assert.equal(store.files(), 1);
+  });
+
+  it("launched epoch zero persists at finally and before a reaping sink", async () => {
+    const terminalRig = makeMultiEpochRig([doneEpoch()]);
+    const terminalStore = sessionGenerationSpy(terminalRig);
+    await withTimeout(makeExecutor(terminalRig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 5000, "epoch zero terminal");
+    assert.deepEqual(terminalStore.sources.map((s) => s.launched), [true]);
+    assert.equal(terminalStore.generation(), 1);
+
+    const reapRig = makeMultiEpochRig([checkpointEpoch()]);
+    const reapStore = sessionGenerationSpy(reapRig);
+    let generationAtReap = -1;
+    const { ctx } = makeCtx({
+      checkpoint: async () => { generationAtReap = reapStore.generation(); },
+      reportIteration: async (iteration) => ({ pauseRequested: iteration === 2 }),
+      parkForPause: async () => true,
+    });
+    await withTimeout(makeExecutor(reapRig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "epoch zero pre-reap");
+    assert.deepEqual(reapStore.sources.map((s) => s.launched), [true]);
+    assert.equal(generationAtReap, 1, "the launched epoch persisted before the reaping sink");
+    assert.equal(reapStore.generation(), 1);
+  });
+
+  it("a launched loop-top recreation persists its new generation at finally", async () => {
+    const rig = makeMultiEpochRig([checkpointEpoch(), resumedDone("th-1", "tn-2")]);
+    const store = sessionGenerationSpy(rig);
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx({ checkpoint: async () => undefined }).ctx), 5000, "launched loop-top recreation");
+    assert.equal(rig.providerLaunches(), 2);
+    assert.deepEqual(store.sources.map((s) => s.launched), [true, true]);
+    assert.notEqual(store.sources[0]!.home, store.sources[1]!.home);
+    assert.equal(store.generation(), 2);
+  });
+
+  it("a launched plan-approval recreation persists its new generation at finally", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-plan", "tn-plan", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "the plan" }, th, tn, "c-plan"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+      resumedDone("th-plan", "tn-implement"),
+    ]);
+    const store = sessionGenerationSpy(rig);
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } }) as never,
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "launched approval recreation");
+    assert.equal(rig.providerLaunches(), 2);
+    assert.deepEqual(store.sources.map((s) => s.launched), [true, true]);
+    assert.notEqual(store.sources[0]!.home, store.sources[1]!.home);
+    assert.equal(store.generation(), 2);
+  });
+
   const assertNoPersistAfterReap = (events: string[]): void => {
     events.forEach((event, i) => {
       if (!event.startsWith("reap:")) return;
@@ -7900,16 +8052,17 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
     assertNoPersistAfterReap(events);
   });
 
-  it("(N2 loop-top) a seeded `wall` park that reaps persists the live session first and never after", async () => {
+  it("(N2 loop-top) a seeded `wall` park before launch never persists the empty epoch", async () => {
     const rig = makeMultiEpochRig([doneEpoch()]);
-    const { events, homeOf } = persistSpy(rig);
+    const { events } = persistSpy(rig);
     const { ctx } = makeCtx({
       pauseModeRequested: () => "wall",
-      parkForWall: async () => { events.push(`reap:${homeOf(0)}`); return "parked"; },
+      parkForWall: async () => { events.push("reap:unlaunched"); return "parked"; },
     });
     const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "N2 loop-top wall");
     assert.deepEqual(result.walled, { reason: "codex run wall-clock timeout" });
-    assert.deepEqual(events, [`persist:${homeOf(0)}`, `reap:${homeOf(0)}`]);
+    assert.equal(rig.providerLaunches(), 0);
+    assert.deepEqual(events, ["reap:unlaunched"]);
     assertNoPersistAfterReap(events);
   });
 
@@ -8000,7 +8153,7 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
     const { ctx } = makeCtx({
       pauseModeRequested: () => mode,
       clearWallMode: () => { mode = null; },
-      parkForWall: async () => { events.push(`reap:${homeOf(0)}`); return "refused"; },
+      parkForWall: async () => { events.push("reap:unlaunched"); return "refused"; },
     });
     const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "N2 refused");
     assert.equal(result.walled, undefined);
@@ -8009,8 +8162,8 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
     // persisted at the terminal), never on the possibly-reaped epoch-0.
     assert.equal(rig.providerLaunches(), 1, "exactly one provider root ran a turn");
     assert.equal(rig.epochs[0]!.transport.turnStartCount, 1, "the turn after the refusal ran");
-    assert.deepEqual(events, [`persist:${homeOf(0)}`, `reap:${homeOf(0)}`, `persist:${homeOf(1)}`],
-      "the reaped epoch-0 is never re-persisted; the live epoch-1 is persisted at the terminal");
+    assert.deepEqual(events, ["reap:unlaunched", `persist:${homeOf(0)}`],
+      "the unlaunched epoch-0 is never persisted; the live epoch-1 is persisted at the terminal");
   });
 
   // M3 (issue #1764): pins for the m1 round-3 persist/reap bookkeeping.
