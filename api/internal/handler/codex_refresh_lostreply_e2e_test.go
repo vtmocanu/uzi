@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -185,6 +186,42 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
+	// LiveDB leaves unresolved accounts sealed by other test boxes. The real global
+	// survivor must see only this proof's fixtures, including on pooled transactions.
+	admin, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatal("cannot open fixture schema administration pool")
+	}
+	defer admin.Close()
+	schema := "lostreply_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		// Preserve failed custody proofs until the dedicated target destroys its DB.
+		if t.Failed() {
+			return
+		}
+		cleanup, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		if _, err := admin.Exec(cleanup, "DROP SCHEMA "+schema+" CASCADE"); err != nil {
+			t.Errorf("cleanup fixture schema: %v", err)
+		}
+	}()
+	// Set the startup parameter on the DSN used by BOTH goose and every pool
+	// connection; a one-off SET would not cover new sessions or transactions.
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			t.Fatal("cannot parse fixture database URL")
+		}
+		params := u.Query()
+		params.Set("search_path", schema)
+		u.RawQuery = params.Encode()
+		dsn = u.String()
+	} else {
+		dsn += " search_path=" + schema
+	}
 	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatal(err)
 	}
