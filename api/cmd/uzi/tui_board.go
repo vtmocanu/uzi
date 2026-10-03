@@ -369,23 +369,23 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 
 // tabStrip builds the wordmark + the floor · pulls · ci tab strip shared by the board
 // and the forge views (PRD #1255 D1): the active screen's tab is tungsten-bold, the rest
-// faint. The active tab is read from m.view, so M4b adds the ci screen's active state in
-// exactly one place. The board's admin sub-mode relabels its own tab "active runs"
+// faint. The marked tab and admin relabel are explicit so a split header can
+// mark the focused pane independently. The board's admin sub-mode relabels its own tab "active runs"
 // (AdminListRuns returns non-terminal runs only), keeping the board's wordmark promise.
 // The per-repo forge screens name the scoped repo (D2) after the tabs; the board is
 // cross-repo and names none.
-func (m tuiModel) tabStrip() string {
+func (m tuiModel) tabStrip(admin bool, marked tuiView, repoSuffix bool) string {
 	floorLabel := "floor"
-	if m.view == viewBoard && m.board.admin {
+	if admin {
 		floorLabel = "active runs"
 	}
 	tabs := []struct {
 		label  string
 		active bool
 	}{
-		{floorLabel, m.view == viewBoard},
-		{"pulls", m.view == viewPulls},
-		{"ci", m.view == viewCI},
+		{floorLabel, marked == viewBoard},
+		{"pulls", marked == viewPulls},
+		{"ci", marked == viewCI},
 	}
 	out := m.pal.title.Render("▚▚ uzi") + m.pal.faint.Render(" · ")
 	for i, t := range tabs {
@@ -398,7 +398,7 @@ func (m tuiModel) tabStrip() string {
 			out += m.pal.faint.Render(t.label)
 		}
 	}
-	if m.view == viewPulls || m.view == viewCI {
+	if repoSuffix {
 		if repo, ok := m.currentRepo(); ok {
 			// PathWithNamespace is forge-authored (D7) → renderer.Plain.
 			out += m.pal.faint.Render("   " + m.renderer.Plain(repo.PathWithNamespace, 40))
@@ -521,6 +521,10 @@ func (m tuiModel) vaultBand(n int) string {
 }
 
 func (m tuiModel) renderBoard() string {
+	return m.renderBoardBody(m.height, true)
+}
+
+func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 	var sb strings.Builder
 	rows := m.board.visible()
 
@@ -535,7 +539,10 @@ func (m tuiModel) renderBoard() string {
 	// tab bold. tabStrip relabels the floor tab "active runs" on the admin board (AdminListRuns
 	// returns non-terminal runs only, so promising completed rows would be a claim the API
 	// cannot satisfy).
-	brand := m.tabStrip()
+	brand := ""
+	if fullScreen {
+		brand = m.tabStrip(m.board.admin, m.view, false)
+	}
 	if m.board.hideDone && !m.board.admin {
 		brand += m.pal.faint.Render("   active only")
 	}
@@ -550,7 +557,7 @@ func (m tuiModel) renderBoard() string {
 	// cursor still indexes RUN rows only (via visible()), so selection/enter/clamp are unchanged.
 	// The window keeps the selected run row on screen so the wordmark and footer never scroll off.
 	items := m.buildBoardItems(rows)
-	capacity := m.boardCapacityWith(len(meters.lines))
+	capacity := m.boardCapacityAt(height, len(meters.lines), fullScreen)
 	selItem := selectedBoardItem(items, m.board.cursor)
 	start, end := boardWindow(selItem, m.board.scroll, len(items), capacity)
 
@@ -567,22 +574,26 @@ func (m tuiModel) renderBoard() string {
 	// header line when they fit m.width, or on two lines (Claude, then Codex) when they do not.
 	// len(meters.lines) is 0, 1, or 2, and boardCapacityWith reserved exactly that many rows from
 	// the SAME snapshot, so this loop can never overdraw the run list.
-	for _, line := range meters.lines {
-		sb.WriteString(line + "\n")
+	if fullScreen {
+		for _, line := range meters.lines {
+			sb.WriteString(line + "\n")
+		}
 	}
 	// The tier-1 vault-locked hint (PRD #1251 M2, D5): its OWN line directly under the strip,
 	// never replacing or hiding it — both are distinct signals and can show together. Its row
 	// is reserved in boardCapacity via the SAME vaultIndicatorLine() check, so the two spots
 	// cannot drift.
-	if vault := m.vaultIndicatorLine(); vault != "" {
-		sb.WriteString(vault + "\n")
+	if fullScreen {
+		if vault := m.vaultIndicatorLine(); vault != "" {
+			sb.WriteString(vault + "\n")
+		}
+		sb.WriteString("\n")
 	}
-	sb.WriteString("\n")
 
-	if m.board.adminDenied {
+	if fullScreen && m.board.adminDenied {
 		sb.WriteString(clampVisual(m.pal.faint.Render(" the factory-wide board needs an admin (uza_) token — showing your runs"), m.width) + "\n")
 	}
-	if m.board.err != nil {
+	if fullScreen && m.board.err != nil {
 		sb.WriteString(clampVisual(m.pal.faint.Render(" could not refresh: "+fmtErr(m.board.err)), m.width) + "\n")
 	}
 
@@ -614,7 +625,9 @@ func (m tuiModel) renderBoard() string {
 		}
 	}
 
-	sb.WriteString(clampVisual(m.boardFooterLine(), m.width))
+	if fullScreen {
+		sb.WriteString(clampVisual(m.boardFooterLine(), m.width))
+	}
 	return sb.String()
 }
 
@@ -947,20 +960,27 @@ func (m tuiModel) boardCapacity() int {
 // line, the blank below it, the footer (3), the meter rows, plus the optional adminDenied, error,
 // vault-hint, and selected-row second lines. At least one content line is always shown.
 func (m tuiModel) boardCapacityWith(meterLines int) int {
-	chrome := 3
-	if m.board.adminDenied {
-		chrome++
+	return m.boardCapacityAt(m.height, meterLines, true)
+}
+
+func (m tuiModel) boardCapacityAt(height, meterLines int, fullScreen bool) int {
+	chrome := 1 // pane title, filter and summary
+	if fullScreen {
+		chrome += 2 // blank line and footer
+		if m.board.adminDenied {
+			chrome++
+		}
+		if m.board.err != nil {
+			chrome++
+		}
+		// The adaptive rate-limit meter line(s) (PRD 1519 M4): reserve exactly the row count the caller
+		// is drawing from its snapshot, so the combined-vs-split decision cannot drift by a line.
+		chrome += meterLines
 	}
-	if m.board.err != nil {
-		chrome++
-	}
-	// The adaptive rate-limit meter line(s) (PRD 1519 M4): reserve exactly the row count the caller
-	// is drawing from its snapshot, so the combined-vs-split decision cannot drift by a line.
-	chrome += meterLines
 	// The tier-1 vault-locked hint (PRD #1251 M2) is its own line under the strip when shown;
 	// reserve one row for it the SAME way (calling vaultIndicatorLine, not re-deriving the
 	// show-condition) so the row window and renderBoard's layout cannot drift by a line.
-	if m.vaultIndicatorLine() != "" {
+	if fullScreen && m.vaultIndicatorLine() != "" {
 		chrome++
 	}
 	// The selected row's variable-height second "now" line (D4) reserves one physical line, so
@@ -969,7 +989,7 @@ func (m tuiModel) boardCapacityWith(meterLines int) int {
 	if r, ok := m.board.selected(); ok && m.boardShowSecondLine(r) {
 		chrome++
 	}
-	c := m.height - chrome
+	c := height - chrome
 	if c < 1 {
 		c = 1
 	}
@@ -1008,9 +1028,13 @@ func boardWindow(cursor, scroll, n, capacity int) (int, int) {
 // syncedScroll returns the scroll offset that keeps the selected row visible, for the key
 // handler to persist so in-window navigation does not shift the viewport on every keystroke.
 func (m tuiModel) syncedScroll() int {
+	return m.syncedScrollAt(m.boardCapacity())
+}
+
+func (m tuiModel) syncedScrollAt(capacity int) int {
 	items := m.buildBoardItems(m.board.visible())
 	sel := selectedBoardItem(items, m.board.cursor)
-	start, _ := boardWindow(sel, m.board.scroll, len(items), m.boardCapacity())
+	start, _ := boardWindow(sel, m.board.scroll, len(items), capacity)
 	return start
 }
 

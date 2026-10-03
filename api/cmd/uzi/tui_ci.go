@@ -346,10 +346,17 @@ func ciRowPrefixWidth(c ciCols) int {
 }
 
 func (m tuiModel) renderCI() string {
+	return m.renderCIBody(m.height, true)
+}
+
+func (m tuiModel) renderCIBody(height int, fullScreen bool) string {
 	var sb strings.Builder
 	rows := m.ci.visible()
 
-	brand := m.tabStrip()
+	brand := ""
+	if fullScreen {
+		brand = m.tabStrip(m.board.admin, m.view, true)
+	}
 	if m.ci.filter != "" || m.ci.filtering {
 		brand += m.pal.faint.Render("   /" + cellText(m.ci.filter))
 		if m.ci.filtering {
@@ -358,7 +365,7 @@ func (m tuiModel) renderCI() string {
 	}
 
 	items := buildCIItems(rows)
-	capacity := m.ciCapacity()
+	capacity := m.ciCapacityAt(height, fullScreen)
 	selItem := selectedBoardItem(items, m.ci.cursor)
 	start, end := boardWindow(selItem, m.ci.scroll, len(items), capacity)
 
@@ -373,7 +380,9 @@ func (m tuiModel) renderCI() string {
 	if note := m.ciHeaderNote(); note != "" {
 		sb.WriteString(clampVisual(note, m.width) + "\n")
 	}
-	sb.WriteString("\n")
+	if fullScreen {
+		sb.WriteString("\n")
+	}
 
 	switch {
 	case !m.pullsRepoReady():
@@ -402,7 +411,9 @@ func (m tuiModel) renderCI() string {
 		}
 	}
 
-	sb.WriteString(clampVisual(m.ciFooter(), m.width))
+	if fullScreen {
+		sb.WriteString(clampVisual(m.ciFooter(), m.width))
+	}
 	return sb.String()
 }
 
@@ -433,14 +444,21 @@ func buildCIItems(runs []apitypes.CIRunDTO) []boardItem {
 // of pullsCapacity: tab strip + blank + footer (3), plus the optional sub-header note, plus the
 // selected row's reserved second line.
 func (m tuiModel) ciCapacity() int {
-	chrome := 3
+	return m.ciCapacityAt(m.height, true)
+}
+
+func (m tuiModel) ciCapacityAt(height int, fullScreen bool) int {
+	chrome := 1 // pane title
+	if fullScreen {
+		chrome += 2 // blank line and footer
+	}
 	if m.ciHeaderNote() != "" {
 		chrome++
 	}
 	if _, ok := m.ci.selected(); ok {
 		chrome++
 	}
-	c := m.height - chrome
+	c := height - chrome
 	if c < 1 {
 		c = 1
 	}
@@ -448,9 +466,13 @@ func (m tuiModel) ciCapacity() int {
 }
 
 func (m tuiModel) ciSyncedScroll() int {
+	return m.ciSyncedScrollAt(m.ciCapacity())
+}
+
+func (m tuiModel) ciSyncedScrollAt(capacity int) int {
 	items := buildCIItems(m.ci.visible())
 	sel := selectedBoardItem(items, m.ci.cursor)
-	start, _ := boardWindow(sel, m.ci.scroll, len(items), m.ciCapacity())
+	start, _ := boardWindow(sel, m.ci.scroll, len(items), capacity)
 	return start
 }
 

@@ -517,10 +517,17 @@ func pullRowPrefixWidth(branch bool) int {
 }
 
 func (m tuiModel) renderPulls() string {
+	return m.renderPullsBody(m.height, true)
+}
+
+func (m tuiModel) renderPullsBody(height int, fullScreen bool) string {
 	var sb strings.Builder
 	rows := m.pulls.visible()
 
-	brand := m.tabStrip()
+	brand := ""
+	if fullScreen {
+		brand = m.tabStrip(m.board.admin, m.view, true)
+	}
 	if m.pulls.filter != "" || m.pulls.filtering {
 		brand += m.pal.faint.Render("   /" + cellText(m.pulls.filter))
 		if m.pulls.filtering {
@@ -529,7 +536,7 @@ func (m tuiModel) renderPulls() string {
 	}
 
 	items := buildPullItems(rows)
-	capacity := m.pullsCapacity()
+	capacity := m.pullsCapacityAt(height, fullScreen)
 	selItem := selectedBoardItem(items, m.pulls.cursor)
 	start, end := boardWindow(selItem, m.pulls.scroll, len(items), capacity)
 
@@ -544,7 +551,9 @@ func (m tuiModel) renderPulls() string {
 	if note := m.pullsHeaderNote(); note != "" {
 		sb.WriteString(clampVisual(note, m.width) + "\n")
 	}
-	sb.WriteString("\n")
+	if fullScreen {
+		sb.WriteString("\n")
+	}
 
 	switch {
 	case !m.pullsRepoReady():
@@ -578,7 +587,9 @@ func (m tuiModel) renderPulls() string {
 		}
 	}
 
-	sb.WriteString(clampVisual(m.pullsFooter(), m.width))
+	if fullScreen {
+		sb.WriteString(clampVisual(m.pullsFooter(), m.width))
+	}
 	return sb.String()
 }
 
@@ -609,14 +620,21 @@ func buildPullItems(pulls []apitypes.PullDTO) []boardItem {
 // pulls twin of boardCapacity: tab strip + blank + footer (3), plus the optional sub-header
 // note, plus the selected row's reserved second line.
 func (m tuiModel) pullsCapacity() int {
-	chrome := 3
+	return m.pullsCapacityAt(m.height, true)
+}
+
+func (m tuiModel) pullsCapacityAt(height int, fullScreen bool) int {
+	chrome := 1 // pane title
+	if fullScreen {
+		chrome += 2 // blank line and footer
+	}
 	if m.pullsHeaderNote() != "" {
 		chrome++
 	}
 	if _, ok := m.pulls.selected(); ok {
 		chrome++
 	}
-	c := m.height - chrome
+	c := height - chrome
 	if c < 1 {
 		c = 1
 	}
@@ -624,9 +642,13 @@ func (m tuiModel) pullsCapacity() int {
 }
 
 func (m tuiModel) pullsSyncedScroll() int {
+	return m.pullsSyncedScrollAt(m.pullsCapacity())
+}
+
+func (m tuiModel) pullsSyncedScrollAt(capacity int) int {
 	items := buildPullItems(m.pulls.visible())
 	sel := selectedBoardItem(items, m.pulls.cursor)
-	start, _ := boardWindow(sel, m.pulls.scroll, len(items), m.pullsCapacity())
+	start, _ := boardWindow(sel, m.pulls.scroll, len(items), capacity)
 	return start
 }
 
