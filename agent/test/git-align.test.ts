@@ -119,6 +119,77 @@ describe("fetchWorkflowTargetTip", () => {
     assert.deepStrictEqual(await git.fetchWorkflowTargetTip(bare, "agent/published"), { kind: "unavailable" });
   });
 
+  for (const cancellation of ["hard", "soft"] as const) {
+    it(`cleans a real fetched ref before lock release after ${cancellation}-signal cancellation`, async () => {
+      gitIn(fx.originPath, ["branch", "agent/published"]);
+      const bare = await git.ensureClone(fx.originPath);
+      assert.strictEqual(gitIn(bare, ["config", "--get", "maintenance.auto"]), "false");
+      assert.strictEqual(gitIn(bare, ["config", "--get", "gc.auto"]), "0");
+      assert.ok(!fs.existsSync(path.join(bare, "reftable")), "worker bare uses files refs");
+      const hard = new AbortController();
+      const soft = new AbortController();
+      const seen: string[][] = [];
+      let tempRef = "";
+      let fetched = false;
+      let spawnsAfterAbort = 0;
+      let releaseObserved = false;
+      let cleanBeforeRelease = false;
+      const artifacts = () => [
+        path.join(bare, tempRef),
+        path.join(bare, `${tempRef}.lock`),
+        path.join(bare, "logs", tempRef),
+        path.join(bare, "logs", `${tempRef}.lock`),
+      ];
+      const spawner: BoundaryProcessSpawner = async (request) => {
+        if (hard.signal.aborted || soft.signal.aborted) {
+          spawnsAfterAbort++;
+          throw new Error("unexpected subprocess after abort");
+        }
+        seen.push([...request.argv]);
+        const output = execFileSync(request.argv[0]!, request.argv.slice(1), {
+          cwd: request.cwd, env: request.env, encoding: "utf8",
+        });
+        if (request.argv.includes("fetch")) {
+          tempRef = request.argv.at(-1)!.split(":")[1]!;
+          assert.match(tempRef, /^refs\/uzi-workflow-target\/[0-9a-f-]{36}$/);
+          assert.match(fs.readFileSync(path.join(bare, tempRef), "utf8"), /^[0-9a-f]{40}\n$/);
+          const packed = path.join(bare, "packed-refs");
+          assert.ok(!fs.existsSync(packed) || !fs.readFileSync(packed, "utf8").includes(tempRef));
+          // Model only this fresh UUID's residual files after the fetch child has settled.
+          for (const artifact of artifacts().slice(1)) {
+            fs.mkdirSync(path.dirname(artifact), { recursive: true });
+            fs.writeFileSync(artifact, "fixture residue\n");
+          }
+          fetched = true;
+          (cancellation === "hard" ? hard : soft).abort();
+        }
+        const stdin = new PassThrough();
+        const stdout = new PassThrough();
+        const stderr = new PassThrough();
+        stdout.end(output);
+        stderr.end();
+        return { stdin, stdout, stderr, completed: Promise.resolve({ code: 0 }) };
+      };
+      await assert.rejects(git.withBoundaryProcessSpawner(spawner, hard.signal,
+        () => git.fetchWorkflowTargetTip(bare, "agent/published"), {
+          softSignal: soft.signal,
+          beforeLockRelease: async (key) => {
+            releaseObserved = key === bare;
+            cleanBeforeRelease = fetched && artifacts().every((artifact) => !fs.existsSync(artifact));
+          },
+        }), (error: unknown) => error instanceof Error && error.name === "AbortError"
+          && (cancellation === "hard"
+            ? error.message.includes("boundary deadline exceeded")
+            : error.message.includes("soft deadline exceeded")));
+      assert.strictEqual(spawnsAfterAbort, 0, "no subprocess after abort");
+      assert.ok(fetched, "actual local fetch created a loose UUID ref before cancellation");
+      assert.ok(releaseObserved, "bare-lock release hook ran");
+      assert.ok(cleanBeforeRelease, "UUID ref, own locks and reflog removed before bare lock release");
+      assert.strictEqual(seen.at(-1)?.includes("fetch"), true, "fetch was the last subprocess");
+      assert.ok(artifacts().every((artifact) => !fs.existsSync(artifact)));
+    });
+  }
+
   for (const mode of ["malformed", "fetch-failure", "resolve-failure", "abort"] as const) {
     it(`cleans the dedicated ref and distinguishes ${mode}`, async () => {
       const bare = await git.ensureClone(fx.originPath);
