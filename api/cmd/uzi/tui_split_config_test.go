@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -40,6 +42,19 @@ func TestTUISplitConfigModeAndUsageError(t *testing.T) {
 	}
 	if mode, err := tuiSplitConfigMode(nil); err != nil || mode != "auto" {
 		t.Fatalf("nil store mode=%q err=%v", mode, err)
+	}
+	for _, value := range []string{"true", "42", "[\"auto\"]"} {
+		t.Run("invalid TOML type "+value, func(t *testing.T) {
+			body := "[tui]\nsplit = " + value + "\n"
+			if err := os.WriteFile(filepath.Join(store.Dir(), "config.toml"), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := newTUICmd(Env{Store: store, StdoutTTY: true}, &globalFlags{})
+			err := cmd.RunE(cmd, nil)
+			if uzicli.ExitCodeFor(err) != uzicli.ExitUsage || !strings.Contains(err.Error(), "[tui] split") || !strings.Contains(err.Error(), "config.toml") || !strings.Contains(err.Error(), "auto") || !strings.Contains(err.Error(), "off") {
+				t.Fatalf("invalid TOML type %s: %v", value, err)
+			}
+		})
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/BurntSushi/toml"
 	"github.com/charmbracelet/colorprofile"
 	"github.com/spf13/cobra"
 
@@ -1724,6 +1725,19 @@ func tuiSplitConfigMode(store *uzicli.Store) (string, error) {
 	}
 	cfg, err := store.LoadConfig()
 	if err != nil {
+		// A valid TOML value of the wrong type fails typed decoding before
+		// Split can be validated. Inspect that one key without changing how
+		// unrelated config errors are reported.
+		if body, readErr := os.ReadFile(filepath.Join(store.Dir(), "config.toml")); readErr == nil {
+			var raw map[string]any
+			if decodeErr := toml.Unmarshal(body, &raw); decodeErr == nil {
+				if section, ok := raw["tui"].(map[string]any); ok {
+					if value, present := section["split"]; present {
+						return "", tuiSplitValueError(store, fmt.Sprint(value))
+					}
+				}
+			}
+		}
 		return "", err
 	}
 	switch cfg.TUI.Split {
@@ -1732,10 +1746,14 @@ func tuiSplitConfigMode(store *uzicli.Store) (string, error) {
 	case "off":
 		return "off", nil
 	default:
-		return "", uzicli.Exitf(uzicli.ExitUsage,
-			"%s: [tui] split=%q; accepted values are \"auto\" or \"off\"",
-			filepath.Join(store.Dir(), "config.toml"), cfg.TUI.Split)
+		return "", tuiSplitValueError(store, cfg.TUI.Split)
 	}
+}
+
+func tuiSplitValueError(store *uzicli.Store, value string) error {
+	return uzicli.Exitf(uzicli.ExitUsage,
+		"%s: [tui] split=%q; accepted values are \"auto\" or \"off\"",
+		filepath.Join(store.Dir(), "config.toml"), value)
 }
 
 // newTUICmd wires `uzi tui [run-id]`.

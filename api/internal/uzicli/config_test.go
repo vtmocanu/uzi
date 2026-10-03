@@ -50,7 +50,7 @@ func TestConfigRoundtripAndPerms(t *testing.T) {
 func TestLoadConfigTUISplitWithContexts(t *testing.T) {
 	s := NewStore(t.TempDir())
 	body := "current = \"work\"\n\n[contexts.work]\nurl = \"https://work.example\"\n\n[tui]\nsplit = \"future-layout\"\n"
-	if err := os.WriteFile(s.configPath(), []byte(body), 0o644); err != nil {
+	if err := os.WriteFile(s.configPath(), []byte(body), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 
@@ -91,7 +91,7 @@ func TestCredentialsPermsAndRefuse(t *testing.T) {
 	}
 
 	// A group/world-readable credentials file is refused.
-	if err := os.Chmod(s.credentialsPath(), 0o644); err != nil {
+	if err := os.Chmod(s.credentialsPath(), 0o644); err != nil { //nolint:gosec // This test verifies rejection of insecure permissions.
 		t.Fatalf("chmod: %v", err)
 	}
 	if _, err := s.LoadCredentials(); err == nil {
