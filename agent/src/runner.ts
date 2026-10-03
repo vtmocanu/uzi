@@ -76,7 +76,7 @@ import type {
   StateAck,
   StateRequest,
 } from "./protocol.js";
-import { resolveAgentSelection } from "./protocol.js";
+import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
 import { RecoveryCoordinator, isCodePublishingKind, type RecoveryRecord } from "./recovery.js";
@@ -7367,6 +7367,7 @@ export class RunRunner {
     let owner: ReturnType<typeof deriveCloneKey>;
     try {
       const ownerKind = resolveRunKind(id.kind);
+      if (!RUN_KINDS.includes(ownerKind)) throw new Error("malformed owner kind");
       owner = deriveCloneKey({
         kind: ownerKind,
         runId: ownerRunId,

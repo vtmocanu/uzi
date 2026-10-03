@@ -385,12 +385,15 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
       assertBytes(retained, s);
     });
   }
-  for (const malformed of ["null", "missing-fields", "status-accessor", "repo-accessor"] as const) {
+  for (const malformed of ["null", "missing-fields", "status-accessor", "repo-accessor", "object-kind", "unknown-kind"] as const) {
     it(`1848 M2 malformed classification ${malformed} preserves fixed refusal`, async (t) => {
       const s = await seed(false, "completed");
       const leaked = s.clonePath + "\nprivate classification accessor";
       const value = malformed === "null" ? null : malformed === "missing-fields" ? {} :
-        Object.defineProperty({ status: "completed", repo_id: "r1" },
+        malformed === "object-kind" || malformed === "unknown-kind" ? {
+          status: "completed", repo_id: "r1",
+          kind: malformed === "object-kind" ? { branch, slug } : "/private/unknown-kind",
+        } : Object.defineProperty({ status: "completed", repo_id: "r1" },
           malformed === "status-accessor" ? "status" : "repo_id", { get: () => { throw new Error(leaked); } });
       t.mock.method(client, "getRunOrphanClassification", async () => value);
       const e = execution(s, false);
