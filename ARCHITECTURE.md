@@ -80,7 +80,7 @@ Read-through forge views in the TUI (open PRs, live PR checks, CI runs — PRD #
 
 ### Forge abstraction
 
-`api/internal/forge` defines the `Forge` interface (`VerifyToken`, `ListProjects`, `ListLabels`, `EnsureLabels`, `ListIssues`, `UpdateIssueLabels`, `UpdateIssueDescription`, the four CI reads, plus the guardrail reads `ProjectRole`/`DefaultBranchProtection`) and a neutral domain vocabulary (`BotIdentity`, `Project`, `Label`, `Issue`, `Role`, `BranchProtection`); `forge.New` selects a driver by `forge.Type` — **`gitlab.go`, `forgejo.go`, or `github.go`** — so no other package ever imports a driver directly. Test fakes embed the shared `api/internal/forge/forgetest.BaseFake` (PRD #922), which implements the whole interface with loud `ErrNotStubbed` defaults, so an interface change costs three drivers plus that one fake rather than one edit per hand-written fake. Every driver call goes through an `*http.Client` bounded by `FORGE_HTTP_TIMEOUT` (`timeoutClient` in `forge.go`) — never an untimeouted `http.DefaultClient` — and every returned error is passed through a `redactor` (`redact.go`) that scrubs the PAT and any `Authorization`/`PRIVATE-TOKEN`/`token`-scheme header value before the error can reach a log line or an HTTP response body.
+`api/internal/forge` defines the `Forge` interface (`VerifyToken`, `ListProjects`, `ListLabels`, `EnsureLabels`, `ListIssues`, `UpdateIssueLabels`, `UpdateIssueDescription`, the four CI reads, plus the guardrail reads `ProjectRole`/`DefaultBranchProtection`) and a neutral domain vocabulary (`BotIdentity`, `Project`, `Label`, `Issue`, `Role`, `BranchProtection`); `forge.New` selects a driver by `forge.Type` — **`gitlab.go`, `forgejo.go`, or `github.go`** — so no other package ever imports a driver directly. Test fakes embed the shared `api/internal/forge/forgetest.BaseFake` (PRD #922), which implements the whole interface with loud `ErrNotStubbed` defaults, so an interface change costs three drivers plus that one fake rather than one edit per hand-written fake. Every driver call goes through an `*http.Client` bounded by `FORGE_HTTP_TIMEOUT` (`timeoutClient` in `forge.go`) — never an untimeouted `http.DefaultClient` — and every returned error is passed through a `redactor` (`redact.go`) that scrubs the PAT and any `Authorization`/`PRIVATE-TOKEN`/`token`-scheme header value before the error can reach a log line or an HTTP response body. `error_class.go` classifies typed errors and HTTP status before scrubbing; the returned error retains only the scrubbed message and a closed `timeout`/`auth`/`server_error`/`rate_limited`/`other` class, with no original error chain. Poller issue-sync health consumes that safe class rather than raw error text.
 
 The Forgejo driver (`code.gitea.io/sdk/gitea`, Forgejo ≥16.0.0 — [ADR-65](adr/0065-forgejo-driver.md) for why both) proved the abstraction was more than Go-deep by finding the three places it was **not**: (1) the worker held a second, un-abstracted GitLab client, now a minimal TS forge seam (`agent/src/forge.ts`, `GitLabClient`/`ForgejoClient`/`GitHubClient`); (2) the web reconstructed forge URLs by string surgery, now a per-card/run `forge_type` DTO field mapped only at `web/src/lib/forgeNoun.ts` (`forgeNoun`/`forgePlatform`, one Go twin in `slacksvc/notifier_state.go`, one CLI twin in `api/cmd/uzi/render.go`); (3) each forge stored its pipeline status verbatim, so `api/internal/pipelinestatus` is the one Go-side classifier that folds all three vocabularies — the domain twin of `web/src/lib/pipelineBadge.ts`, kept in sync by `TestMirrorsWebPipelineBadge`. Merge-permission is now modelled on all three forges (`BranchProtection.WriteRoleCanMerge`/`BotCanMerge`); the drivers **report** it, and **enforcement is implemented** — [PRD #66](prds/done/66-guardrail-enforcement.md) refuses a run whenever the bot could push or merge to the default branch, at repo-enable, at run creation, and at claim, live and fail-closed, with an admin-only per-repo override for the deliberate, audited exception.
 
@@ -1884,7 +1884,38 @@ existing controller report; pod-level health of the `api`/`web`/database/control
 pods themselves stays out of scope, owned by cluster monitoring. See
 [PRD #1484](prds/1484-admin-health-tab.md) and
 [ADR-1484](adr/1484-in-app-health-boundary.md) for the checks, the boundary
-rationale, and the deferred items (version skew, forge sync freshness).
+rationale, and the deferred items (version skew, per-connection sync freshness).
+
+Issue-sync failure streaks have shipped as `forge.sync`
+([#2203](https://github.com/vtmocanu/uzi/issues/2203)), separate from deferred
+freshness. The private `api/cmd/server/forge_sync.go` wiring used by startup and
+tests connects `poller.SetSyncAttempt` to an empty process-local
+`healthsvc.SyncRegistry` after seed and before polling, and gives health the
+same engine's effective interval. Each repo attempt binds at `syncRepo`
+start; client-construction failures and returned `FullSync`/`IncrementalSync`
+outcomes feed the registry. Success is reported before sibling sync work,
+and internally tolerated marker-scan failures do not override a successful
+return. Health reads enabled repo IDs from SQL, excludes disabled/deleted
+repos, and prunes captured entries whose identity is unchanged; failed
+enumeration returns unknown without pruning. There is no persisted health
+state, schema, or generation counter.
+
+The production handler invalidates this history after every successful
+`SetRepoEnabledForUser` write, including idempotent enable/disable writes;
+refused or failed writes do not invalidate. This clears warnings and restarts
+failure grace even on a repeated enable, leaves incremental marks and poll
+counts alone, and rejects completions bound before reset by entry identity.
+It does not establish global ordering: queued work starting after reset can
+use earlier enumerated inputs, snapshots can conservatively report unknown
+during concurrent changes, and the write/hook pair is not a DB transaction.
+Unobserved out-of-band SQL toggles bypass this reset. Api restart leaves
+enabled repos pending; a prior success does not independently age into a
+freshness failure (`loops` owns poller liveness). Recovery has no extra
+hysteresis, while GET retains its five-second cache and concurrent
+last-write-wins behavior. See
+[Admin health](docs/admin-health.md#forge-issue-sync-failures) for thresholds,
+safe evidence, actions, and consistency limits. This diagnoses failures;
+it does not establish or fix an underlying HTTP/2 transport cause.
 
 ## Not yet in scope
 
