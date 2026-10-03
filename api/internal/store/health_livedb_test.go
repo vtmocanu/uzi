@@ -348,9 +348,10 @@ func TestHealthRollCapacityEvaluationLiveDB(t *testing.T) {
 				return w
 			}
 			latest := now.Add(-23 * time.Hour)
-			if name == "24h equality" {
+			switch name {
+			case "24h equality":
 				latest = now.Add(-24 * time.Hour)
-			} else if name == "just below 24h" {
+			case "just below 24h":
 				latest = now.Add(-24*time.Hour + time.Second)
 			}
 			seed("older", now.Add(-40*time.Hour), true)
@@ -425,9 +426,10 @@ func TestHealthRollCapacityEvaluationLiveDB(t *testing.T) {
 				}
 				if want == "danger" {
 					since := now.Add(-48 * time.Hour)
-					if name == "24h equality" {
+					switch name {
+					case "24h equality":
 						since = latest
-					} else if name == "mixed reason rows" {
+					case "mixed reason rows":
 						since = now.Add(-7 * time.Minute)
 					}
 					if c.Since == nil || *c.Since != since.Format(time.RFC3339) {
