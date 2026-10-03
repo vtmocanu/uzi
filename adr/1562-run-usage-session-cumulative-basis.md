@@ -4,6 +4,7 @@
 **Date**: 2026-09-23
 **Deciders**: architect (design), coder (implementation), reviewer.
 **Amends**: [ADR-1079](1079-run-usage-per-leg-fold.md) — its per-leg SUM rule (`run_usage_totals` MAXes within a leg, then SUMs across legs) is now the `per_leg` half of a two-basis fold; the leg key (`lineage_epoch`, one `init` frame per leg) is unchanged. [ADR-195](0195-run-usage-per-model-fold.md) is unchanged: the client still folds `modelUsage` per model, never the frame's top-level `usage`, and both readers still agree by mechanism, pinned by a third fixture pair.
+**Amended by**: [ADR-2014](2014-run-usage-estimated-tail.md) — the estimated tail of an interrupted session (usage no `result` frame covered) is recorded and shown apart from this fold's metered total, which is unchanged.
 **PRD**: none — this issue's spec lived in the issue body and its live measurement; the fixture at [`fixtures/run-usage/README.md`](../fixtures/run-usage/README.md) (section "The `cumulative` pair") carries the authoritative rule text this ADR restates.
 
 ## Decision (summary)
