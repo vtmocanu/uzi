@@ -42,8 +42,8 @@ anything the rules below do not settle.
   package pins exactly): hold until upstream moves. Fix on our own branch (below) only
   when the change belongs in our code; overriding a transitive pin (npm `overrides`) is a
   buddy decision.
-- **Red on a parity gate** (`check:semgrep-parity`: the CI semgrep pin must equal the worker
-  devbox lock): hold; the bump lands together with the worker lock.
+- **A semgrep CI-pin PR** predates CI deriving semgrep from the worker lock: close it;
+  the devbox refresh moves semgrep for CI and the worker together.
 - **Every hold goes in the batch report** (references/batch.md §6) with its reason, what
   unblocks it, and the buddy's view.
 

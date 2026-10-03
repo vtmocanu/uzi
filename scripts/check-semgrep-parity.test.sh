@@ -1,23 +1,33 @@
 #!/bin/sh
-# Hermetic fixtures for the parity gate's 0/1/2 contract; no installs or network.
+# Hermetic fixtures for the parity gate's 0/1/2 contract and the worker-version
+# reader it shares with CI; no installs or network.
 set -eu
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 CHECK="$ROOT/scripts/check-semgrep-parity.sh"
+VERSION="$ROOT/scripts/semgrep-worker-version.sh"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 cases=0
 passed=0
-FLOOR=10
+FLOOR=13
 
 workflow() {
-  printf 'jobs:\n  lint:\n    steps:\n      - name: Install semgrep\n        run: pipx install semgrep==%s\n' "$1" > "$TMP/ci.yml"
+  cat > "$TMP/ci.yml" <<'YML'
+jobs:
+  lint:
+    steps:
+      - name: Install semgrep
+        run: |
+          SEMGREP_VERSION="$(./scripts/semgrep-worker-version.sh)"
+          pipx install "semgrep==${SEMGREP_VERSION}"
+YML
 }
 lock() {
-  cat > "$TMP/devbox.lock" <<EOF
+  cat > "$TMP/devbox.lock" <<JSON
 {"packages":{"semgrep":{"systems":{"x86_64-linux":{"outputs":[
   {"path":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-python3.14-semgrep-$1","default":true}
 ]}}}}}
-EOF
+JSON
 }
 expect() {
   cases=$((cases + 1))
@@ -31,26 +41,35 @@ expect() {
   fi
 }
 
-workflow 1.172.0; lock 1.172.0
-expect 0 'OK: CI and worker lock use semgrep 1.172.0' 'matching pins'
+workflow; lock 1.172.0
+expect 0 "OK: CI installs the worker lock's semgrep 1.172.0" 'lock-derived install'
 
-workflow 1.178.0
-expect 1 'CI 1.178.0 != worker lock 1.172.0' 'independent CI bump'
+lock 1.178.0
+expect 0 "OK: CI installs the worker lock's semgrep 1.178.0" 'a lock refresh needs no CI edit'
 
-workflow 1.172.0; lock 1.173.0
-expect 1 'CI 1.172.0 != worker lock 1.173.0' 'worker lock bump needs CI update'
+cases=$((cases + 1))
+if [ "$("$VERSION" "$TMP/devbox.lock")" = 1.178.0 ]; then passed=$((passed + 1)); else echo "FAIL: version reader output" >&2; fi
 
-workflow 1.172.0; lock 1.172.0
-printf '        run: pipx install semgrep==1.172.0\n' >> "$TMP/ci.yml"
-expect 2 'INSTRUMENT BROKEN' 'duplicate CI pins are ambiguous'
+workflow
+printf '      - run: pipx install semgrep==1.178.0\n' >> "$TMP/ci.yml"
+expect 1 'outside the lock-derived line' 'an extra literal pin (a Renovate bump)'
 
-printf '# run: pipx install semgrep==1.172.0\n' > "$TMP/ci.yml"
-expect 2 'INSTRUMENT BROKEN' 'commented pin cannot pass'
+printf 'jobs:\n  lint:\n    steps:\n      - run: pipx install semgrep==1.172.0\n' > "$TMP/ci.yml"
+expect 1 'found 0' 'a literal pin replacing the derivation'
 
-workflow latest
-expect 2 'INSTRUMENT BROKEN' 'unparseable CI version'
+workflow
+printf '      - run: pip install semgrep\n' >> "$TMP/ci.yml"
+expect 1 'outside the lock-derived line' 'an unpinned pip install'
 
-workflow 1.172.0
+workflow
+printf '          SEMGREP_VERSION="$(./scripts/semgrep-worker-version.sh)"\n' >> "$TMP/ci.yml"
+expect 1 'found 2' 'a duplicated derivation is ambiguous'
+
+workflow
+gsed -i 's/^\( *\)\(SEMGREP_VERSION=\)/\1# \2/' "$TMP/ci.yml" 2>/dev/null || sed -i 's/^\( *\)\(SEMGREP_VERSION=\)/\1# \2/' "$TMP/ci.yml"
+expect 1 'found 0' 'a commented derivation cannot pass'
+
+workflow
 printf '{broken json\n' > "$TMP/devbox.lock"
 expect 2 'INSTRUMENT BROKEN' 'invalid lock JSON'
 
@@ -65,6 +84,10 @@ jq '.packages.semgrep.systems["x86_64-linux"].outputs += .packages.semgrep.syste
   "$TMP/devbox.lock" > "$TMP/duplicate.lock"
 mv "$TMP/duplicate.lock" "$TMP/devbox.lock"
 expect 2 'INSTRUMENT BROKEN' 'multiple default worker outputs are ambiguous'
+
+lock 1.172.0
+rm -f "$TMP/ci.yml"
+expect 2 'INSTRUMENT BROKEN' 'unreadable workflow'
 
 echo "check-semgrep-parity.test.sh: cases=$cases passed=$passed"
 [ "$cases" -ge "$FLOOR" ] && [ "$passed" = "$cases" ]

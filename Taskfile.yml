@@ -401,8 +401,8 @@ tasks:
       # without one. Its hermetic suite runs first so a gutted check cannot read green.
       - task: test:changelog-entry
       - task: check:changelog-entry
-      # CI and the baked worker share one SAST engine (#2093). A lone Renovate
-      # CI bump must fail here until the worker lock moves with it.
+      # CI and the baked worker share one SAST engine (#2093): CI installs the
+      # worker lock's semgrep, and this fails if CI grows a pin of its own.
       - task: test:semgrep-parity
       - task: check:semgrep-parity
       # Provider-token source-hygiene guard (PRD #1120 M3): an ADDITIONAL, independent
@@ -959,7 +959,7 @@ tasks:
       - ./scripts/check-semgrep-parity.test.sh
 
   check:semgrep-parity:
-    desc: CI semgrep pin matches the worker lock's default x86_64-linux output
+    desc: CI installs the worker lock's semgrep (default x86_64-linux output), never a pin of its own
     cmds:
       - ./scripts/check-semgrep-parity.sh
 

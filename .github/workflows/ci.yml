@@ -689,17 +689,17 @@ jobs:
           # maintain (pip verifies from PyPI), so Renovate bumps this fully automatically.
           # renovate: datasource=pypi depName=zizmor versioning=pep440
           pipx install zizmor==1.30.1
-      - name: Install semgrep (pinned; matches the baked worker toolchain)
+      - name: Install semgrep (the worker lock's version)
         # semgrep is a PyPI-packaged tool, so pipx mirrors the yamllint/zizmor
-        # installs above. Pinned to the SAME version baked into the worker toolchain
-        # (agent/devbox-global/devbox.lock's default x86_64-linux output is the
-        # source of truth: 1.172.0), so CI and a uzi worker enforce the SAST rules with the
-        # identical engine -- a version split there would let a rule pass on one and
-        # fail on the other. A newer semgrep can change rule/pattern semantics, the
-        # same drift the pinned zizmor/shellcheck above guard against.
-        # check:semgrep-parity blocks an independent bump until the worker lock matches.
-        # renovate: datasource=pypi depName=semgrep versioning=pep440
-        run: pipx install semgrep==1.172.0
+        # installs above. CI holds no version of its own: it installs the version baked
+        # into the worker toolchain (agent/devbox-global/devbox.lock's default
+        # x86_64-linux output), so CI and a uzi worker enforce the SAST rules with the
+        # identical engine and the weekly devbox refresh moves both. A newer semgrep can
+        # change rule/pattern semantics, the drift the pinned zizmor/shellcheck above
+        # guard against. check:semgrep-parity pins this two-line shape (#2093).
+        run: |
+          SEMGREP_VERSION="$(./scripts/semgrep-worker-version.sh)"
+          pipx install "semgrep==${SEMGREP_VERSION}"
       - name: gate:repo (shell + yaml + formula + actions + secrets + sast)
         env:
           UZI_LINT_SHELL_REQUIRED: "1"
