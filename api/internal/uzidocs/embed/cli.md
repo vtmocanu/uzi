@@ -139,7 +139,8 @@ uzi review undo <id> <rec> | stats [--json]
 uzi review file <id> <rec> [--repo <repo-id>]
 uzi findings list [--repo <id>] [--bucket to_file|filed|done|dismissed|all] [--run <id>]
 uzi findings draft <finding-id> [<finding-id>...] [--json]
-uzi findings file <finding-id>
+uzi findings file <finding-id> [<finding-id>...]
+uzi findings release <operation-id> --confirm-no-issue
 uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
 uzi findings resolve <finding-id>
 uzi findings undo <disposition-id>
