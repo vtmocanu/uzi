@@ -2900,6 +2900,9 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
     let markAcquired!: () => void;
     const acquired = new Promise<void>((resolve) => { markAcquired = resolve; });
     let fetches = 0;
+    let softDeadlines = 0;
+    let softExpiries = 0;
+    let fireSoftDeadline: (() => void) | undefined;
     const uploadedTips: string[] = [];
     git.fetchDefaultTip = (async (...args: Parameters<typeof git.fetchDefaultTip>) => {
       fetches += 1;
@@ -2913,7 +2916,13 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
       });
       await acquired;
       try {
-        return await originalFetch(...args);
+        // fetchDefaultTip installs its lock waiter synchronously. Expire only AFTER it
+        // is queued, so CPU load cannot spend the budget before reaching this seam.
+        const pending = originalFetch(...args);
+        assert.ok(fireSoftDeadline, "the checkpoint soft deadline is armed before the queued fetch");
+        softExpiries += 1;
+        fireSoftDeadline();
+        return await pending;
       } finally {
         releaseHolder();
         await holder;
@@ -2961,7 +2970,15 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
         codexBoundaryDeadlineMs: 8_000,
         checkpointIntervalMs: 0,
         checkpointTickIntervalMs: 0,
-        checkpointTestHooks: { softDeadlineMs: 2_500 },
+        checkpointTestHooks: {
+          armSoftDeadline: (fire) => {
+            softDeadlines += 1;
+            fireSoftDeadline = fire;
+            // Signal-driven soft expiry leaves child timing to the real hard Codex
+            // boundary, so a slow successful retry cannot spend a test-only soft budget.
+            return { cancel: () => { fireSoftDeadline = undefined; } };
+          },
+        },
       }).execute(claim);
     } finally {
       releaseHolder();
@@ -2969,6 +2986,9 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
       (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = originalPublish;
     }
 
+    assert.equal(softDeadlines, 2, "each checkpoint arms its own soft deadline");
+    assert.equal(softExpiries, 1, "only the queued first checkpoint expires");
+    assert.equal(fireSoftDeadline, undefined, "the retry cancels its soft deadline on settlement");
     assert.ok(fetches >= 2, `the retry performed a fresh default-tip fetch; saw ${fetches}`);
     assert.equal(firstReturned, true, "the soft-skipped milestone returned to the executor");
     assert.equal(secondReturned, true, "the next milestone settled the owed publication");

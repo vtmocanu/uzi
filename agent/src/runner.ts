@@ -1653,6 +1653,8 @@ function snapshotPhaseOf(status: StateRequest["status"]): ActiveSnapshotPhase | 
 export interface CheckpointTestHooks {
   /** Test-only checkpoint publication budget; production is fixed at 10 seconds. */
   softDeadlineMs?: number;
+  /** Test-only expiry control; omit deadlineAt for signal-driven expiry. Production keeps its real 10s budget. */
+  armSoftDeadline?: (fire: () => void, ms: number) => { deadlineAt?: number; cancel: () => void };
   /** Awaited just before a tick's git-busy probe (a test can hold a tick in its pre-scope phase). */
   beforeBusyProbe?: () => Promise<void>;
   /** Fires between the pinned secret scan and the pack of an overlay-less checkpoint publish. */
@@ -8115,7 +8117,7 @@ export class RunRunner {
       // issue #1597 M2: the class this body ended in — read by the mid-turn tick (the gated
       // ctx.checkpoint discards it). Default: nothing new to publish.
       let bodyOutcome: CheckpointBodyOutcome = "no_new_work";
-      let checkpointSoft: { signal: AbortSignal; deadlineAt: number; permit: BoundaryPermit } | undefined;
+      let checkpointSoft: { signal: AbortSignal; deadlineAt: number | undefined; permit: BoundaryPermit } | undefined;
       const withCheckpointSoftGit = <T>(action: () => Promise<T>): Promise<T> => {
         const soft = checkpointSoft;
         return soft
@@ -8472,9 +8474,20 @@ export class RunRunner {
         // child reap and boundary drain; local fetch-back still runs first.
         const softController = executor.safety ? new AbortController() : undefined;
         const softBudgetMs = this.checkpointTestHooks?.softDeadlineMs ?? 10_000;
-        const softDeadlineAt = Date.now() + softBudgetMs;
-        const softTimer = softController ? setTimeout(() => softController.abort(), softBudgetMs) : undefined;
-        softTimer?.unref();
+        let softDeadlineAt: number | undefined = Date.now() + softBudgetMs;
+        let cancelSoftTimer: (() => void) | undefined;
+        if (softController) {
+          if (this.checkpointTestHooks?.armSoftDeadline) {
+            const deadline = this.checkpointTestHooks.armSoftDeadline(() => softController.abort(), softBudgetMs);
+            softDeadlineAt = deadline.deadlineAt;
+            cancelSoftTimer = deadline.cancel;
+          } else {
+            // Production keeps one real budget for both soft abort and every permit-owned child.
+            const softTimer = setTimeout(() => softController.abort(), softBudgetMs);
+            softTimer.unref();
+            cancelSoftTimer = () => clearTimeout(softTimer);
+          }
+        }
         try {
           await this.reapForSink(
             executor,
@@ -8525,7 +8538,7 @@ export class RunRunner {
             });
           }
         } finally {
-          if (softTimer) clearTimeout(softTimer);
+          cancelSoftTimer?.();
           checkpointSoft = undefined;
           checkpointSteps?.end(checkpointFailed ? "failed" : "ok");
         }
