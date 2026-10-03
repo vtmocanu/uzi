@@ -55,12 +55,19 @@ func TestKindPropertyHelpersForJob(t *testing.T) {
 		t.Error("a job must not be JudgeEligible")
 	}
 	for _, k := range All() {
-		if k == Chat || k == Judge || k == Job {
+		if k == Chat || k == Judge || k == Job || k == CrossCheck {
 			continue
 		}
 		if !Listed(k) || !PlanningCapable(k) || !WallTimed(k) {
 			t.Errorf("kind %q must stay Listed, PlanningCapable and WallTimed", k)
 		}
+	}
+}
+
+func TestKindPropertyHelpersForCrossCheck(t *testing.T) {
+	if Listed(CrossCheck) || PlanningCapable(CrossCheck) || WallTimed(CrossCheck) ||
+		JudgeEligible(CrossCheck) || PlanCrossCheckable(CrossCheck) {
+		t.Fatal("cross-check must be hidden, non-planning and non-parking")
 	}
 }
 

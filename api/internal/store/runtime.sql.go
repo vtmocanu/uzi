@@ -107,18 +107,18 @@ SELECT
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
-              AND r2.kind NOT IN ('chat', 'judge')
+              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               GROUP BY 1) o) AS lifetime_fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
-              AND r2.kind NOT IN ('chat', 'judge')
+              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               AND r2.created_at >= now() - interval '7 days'
               GROUP BY 1) o) AS last7_fail_origins
 FROM runs
 WHERE status IN ('completed', 'failed', 'cancelled')
-  AND kind NOT IN ('chat', 'judge')
+  AND kind NOT IN ('chat', 'judge', 'cross_check')
 `
 
 type AdminRunOutcomesRow struct {
@@ -190,12 +190,12 @@ SELECT u.id AS user_id, u.email,
               FROM runs r2
               WHERE r2.user_id = u.id
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
-              AND r2.kind NOT IN ('chat', 'judge')
+              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               GROUP BY 1) o) AS fail_origins
 FROM runs r
 JOIN users u ON u.id = r.user_id
 WHERE r.status IN ('completed', 'failed', 'cancelled')
-  AND r.kind NOT IN ('chat', 'judge')
+  AND r.kind NOT IN ('chat', 'judge', 'cross_check')
 GROUP BY u.id, u.email
 ORDER BY u.id
 `
@@ -882,7 +882,7 @@ WITH target AS (
       AND NOT (
           r.harness = 'codex'
           AND r.codex_auth_mode = 'subscription'
-          AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+          AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework', 'cross_check')
           AND EXISTS (
               SELECT 1 FROM codex_credential_state ccs
               LEFT JOIN codex_provider_account cpa
@@ -1061,7 +1061,7 @@ WITH target AS (
                 AND NOT (
                     r.harness = 'codex'
                     AND r.codex_auth_mode = 'subscription'
-                    AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+                    AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework', 'cross_check')
                     AND EXISTS (
                         SELECT 1 FROM codex_credential_state ccs
                         LEFT JOIN codex_provider_account cpa
@@ -1819,12 +1819,12 @@ func (q *Queries) CountCredentialSwitchMessages(ctx context.Context, arg CountCr
 const countInProgressRunsForUser = `-- name: CountInProgressRunsForUser :one
 SELECT count(*) FROM runs
 WHERE user_id = $1
-  AND kind NOT IN ('chat', 'judge')
+  AND kind NOT IN ('chat', 'judge', 'cross_check')
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
 // The Runs nav badge count (PRD #239): the caller's non-terminal runs, scoped to the
-// same kinds the Runs page (ListRunsForUser) shows — chat and judge excluded, so the
+// same kinds the Runs page (ListRunsForUser) shows — chat, judge and cross-check children excluded, so the
 // badge is a strict subset of what /runs lists.
 func (q *Queries) CountInProgressRunsForUser(ctx context.Context, userID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countInProgressRunsForUser, userID)
@@ -2624,7 +2624,7 @@ WITH extended AS (
                     updated_at = now()
     WHERE id = $1
       AND status NOT IN ('completed', 'failed', 'cancelled')
-      AND kind NOT IN ('chat', 'judge', 'job')
+      AND kind NOT IN ('chat', 'judge', 'job', 'cross_check')
       AND interactive = false
       AND budget_extension_seconds + $3::int <= $4::int
     RETURNING id, budget_extension_seconds
@@ -4059,7 +4059,7 @@ WHERE runs.worker_id = $2
   AND runs.claim_released_at IS NULL                        -- #1247 fence
   AND runs.status_since < $3                   -- fence: stale window + one heartbeat interval, D4
   AND runs.requeue_count >= $4
-  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job') AND runs.interactive = false
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
     AND runs.completion_attempts = 0
     AND runs.started_at < ($5::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $6::int)
@@ -5235,7 +5235,7 @@ SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid, r
        rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
 FROM runs r
 LEFT JOIN repos rp ON rp.id = r.repo_id
-WHERE r.id = $1 AND r.user_id = $2 AND r.kind NOT IN ('judge', 'job')
+WHERE r.id = $1 AND r.user_id = $2 AND r.kind NOT IN ('judge', 'job', 'cross_check')
 `
 
 type GetRunForWorkerUserParams struct {
@@ -5264,8 +5264,8 @@ type GetRunForWorkerUserRow struct {
 }
 
 // One run's detail, scoped to the worker's user (foreign/unknown id -> no row -> 404).
-// judge and job runs are excluded here too (see ListRunsForWorkerUser): a chat agent asking
-// for either's detail gets a 404, exactly like an unknown id. self_improve is visible.
+// judge, job and cross-check runs are excluded here too (see ListRunsForWorkerUser).
+// A chat agent asking for their detail gets a 404. self_improve is visible.
 func (q *Queries) GetRunForWorkerUser(ctx context.Context, arg GetRunForWorkerUserParams) (GetRunForWorkerUserRow, error) {
 	row := q.db.QueryRow(ctx, getRunForWorkerUser, arg.ID, arg.UserID)
 	var i GetRunForWorkerUserRow
@@ -6664,9 +6664,8 @@ LEFT JOIN issues i ON i.repo_id = r.repo_id AND i.forge_issue_iid = r.issue_iid 
 LEFT JOIN workers w ON w.id = r.worker_id
 JOIN users u ON u.id = r.user_id
 WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
-  -- Exclude chat AND judge (PRD #46): repo-less meta-runs the admin overview omits.
-  -- self_improve has a real repo and stays visible (same rationale as ListRunsForUser).
-  AND r.kind NOT IN ('chat', 'judge')
+  -- Omit chat and judge meta-runs and cross-check children, as in ListRunsForUser.
+  AND r.kind NOT IN ('chat', 'judge', 'cross_check')
 ORDER BY r.created_at DESC
 LIMIT 500
 `
@@ -6894,7 +6893,7 @@ SELECT id, user_id, status, auto_approve,
            WHERE r.id = runs.id
              AND r.harness = 'codex'
              AND r.codex_auth_mode = 'subscription'
-             AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+             AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework', 'cross_check')
              AND EXISTS (
                  SELECT 1 FROM codex_credential_state ccs
                  LEFT JOIN codex_provider_account cpa
@@ -8473,11 +8472,9 @@ LEFT JOIN run_reviews rv
        ON rv.target_run_id = r.id      -- UNIQUE target_run_id → at most one row (PRD #98 M4)
       AND rv.user_id = r.user_id       -- self-standing owner scope; see the note above
 WHERE r.user_id = $2
-  -- Exclude chat AND judge (PRD #46): both are repo-less meta-runs the general Runs
-  -- list never shows. self_improve has a real repo and stays visible. The repos join is a
-  -- LEFT JOIN since PRD #1908 (a job run is repo-less and listed), so this predicate is now the
-  -- ONLY thing keeping the repo-less chat and judge meta-runs out (runkind.Listed mirrors it).
-  AND r.kind NOT IN ('chat', 'judge')
+  -- Chat and judge are repo-less meta-runs; cross-check children surface through their lead.
+  -- Self-improve and job remain listed (runkind.Listed mirrors this filter).
+  AND r.kind NOT IN ('chat', 'judge', 'cross_check')
   AND ($3::uuid IS NULL OR r.repo_id = $3)
   AND ($4::bigint IS NULL OR r.issue_iid = $4)
 ORDER BY r.created_at DESC
@@ -8738,7 +8735,7 @@ SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid,
        rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
 FROM runs r
 LEFT JOIN repos rp ON rp.id = r.repo_id
-WHERE r.user_id = $1 AND r.kind NOT IN ('judge', 'job')
+WHERE r.user_id = $1 AND r.kind NOT IN ('judge', 'job', 'cross_check')
 ORDER BY r.created_at DESC
 LIMIT $2
 `
@@ -8774,7 +8771,8 @@ type ListRunsForWorkerUserRow struct {
 // (PRD #46, M1-review carry-forward): a judge is a repo-less internal retrospective
 // with no investigable task, same rationale as excluding it from the general run
 // lists (f55b37e). job runs (PRD #1908) are excluded too: an API-created, repo-less job is
-// the product's, not something the chat agent may browse or steer. self_improve stays visible —
+// the product's, not something the chat agent may browse or steer. Cross-check
+// children surface through their lead. self_improve stays visible —
 // it is real work with a repo + MR.
 // The judge WORKER reads its own run through the M3 judge-scoped trace path, not
 // this chat surface, so hiding judge here does not affect judging.
@@ -10402,7 +10400,7 @@ parked AS (
       AND r.status = 'queued'
       AND r.harness = 'codex'
       AND r.codex_auth_mode = 'subscription'
-      AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+      AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework', 'cross_check')
       AND EXISTS (
           SELECT 1 FROM codex_credential_state ccs
           LEFT JOIN codex_provider_account cpa
@@ -10490,7 +10488,7 @@ UPDATE runs SET
     ), runs.worker_id),
     updated_at = now()
 WHERE runs.id = $1 AND runs.worker_id = $2 AND runs.claim_generation = $3
-  AND runs.status = 'claimed' AND runs.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+  AND runs.status = 'claimed' AND runs.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework', 'cross_check')
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required
 `
 
@@ -10683,7 +10681,7 @@ UPDATE runs SET
     updated_at                = now()
 WHERE id = $4 AND worker_id = $5
   AND status = 'running'
-  AND kind NOT IN ('judge', 'job')
+  AND kind NOT IN ('judge', 'job', 'cross_check')
   AND claim_released_at IS NULL
   AND ($6::bigint IS NULL
        OR claim_generation = $6::bigint)
@@ -10905,7 +10903,7 @@ UPDATE runs SET
     updated_at                = now()
 WHERE id = $3 AND worker_id = $4
   AND status = 'running'
-  AND kind NOT IN ('judge', 'job')
+  AND kind NOT IN ('judge', 'job', 'cross_check')
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required
 `
 
@@ -11114,7 +11112,7 @@ WITH locked AS (
         SELECT 1 FROM runs r
         WHERE r.worker_id = w.id
           AND r.status = 'running'
-          AND r.kind NOT IN ('chat', 'judge', 'job')
+          AND r.kind NOT IN ('chat', 'judge', 'job', 'cross_check')
           AND r.interactive = false
           AND r.started_at < ($1::timestamptz
                 - make_interval(secs => COALESCE(r.budget_wall_seconds, $2::int)
@@ -11144,7 +11142,7 @@ parked AS (
     FROM locked l
     WHERE runs.worker_id = l.id
       AND runs.status = 'running'
-      AND runs.kind NOT IN ('chat', 'judge', 'job')
+      AND runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check')
       AND runs.interactive = false
       AND runs.started_at < ($1::timestamptz
             - make_interval(secs => COALESCE(runs.budget_wall_seconds, $2::int)
@@ -12361,7 +12359,7 @@ WITH requested AS (
                                   + budget_paused_seconds
                                   + budget_extension_seconds
                                   + budget_finalize_seconds))
-      AND kind NOT IN ('chat', 'judge', 'job')
+      AND kind NOT IN ('chat', 'judge', 'job', 'cross_check')
       AND interactive = false
       -- idempotent across ticks: a row already carrying a 'wall' request is not re-requested.
       AND pause_mode IS DISTINCT FROM 'wall'
@@ -12564,7 +12562,7 @@ UPDATE runs SET
     updated_at = now()
 WHERE id = $2 AND worker_id = $3 AND claim_generation = $4
   AND status = 'claimed'
-  AND (NOT $1::boolean OR kind NOT IN ('judge', 'job'))
+  AND (NOT $1::boolean OR kind NOT IN ('judge', 'job', 'cross_check'))
 `
 
 type RequeueClaimAssemblyExactParams struct {
@@ -12650,7 +12648,7 @@ WHERE runs.worker_id = $1
   AND runs.claim_released_at IS NULL                        -- #1247 fence
   AND runs.status_since < $2                   -- fence: stale window + one heartbeat interval, D4
   AND runs.requeue_count < $3
-  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job') AND runs.interactive = false
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
     AND runs.completion_attempts = 0
     AND runs.started_at < ($4::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $5::int)
@@ -13320,20 +13318,20 @@ SELECT
               FROM runs r2
               WHERE r2.user_id = $2
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
-              AND r2.kind NOT IN ('chat', 'judge')
+              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               GROUP BY 1) o) AS lifetime_fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = $2
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
-              AND r2.kind NOT IN ('chat', 'judge')
+              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               AND r2.created_at >= now() - interval '7 days'
               GROUP BY 1) o) AS last7_fail_origins
 FROM runs
 WHERE runs.user_id = $2
   AND status IN ('completed', 'failed', 'cancelled')
-  AND kind NOT IN ('chat', 'judge')
+  AND kind NOT IN ('chat', 'judge', 'cross_check')
 `
 
 type SelfRunOutcomesParams struct {
@@ -13363,8 +13361,8 @@ type SelfRunOutcomesRow struct {
 // provisioning / credential lookup / guardrail has no usage row, so a rate computed
 // over the usage join would systematically hide the infra failures this number exists
 // to surface. The predicate matches what the Runs page lists: terminal runs only
-// (status IN ('completed','failed','cancelled')) and kind NOT IN ('chat','judge') (D2 —
-// a chat/judge failure is not a factory failure). Windowed on created_at (D3), the same
+// (status IN ('completed','failed','cancelled')) and the ListRunsForUser kind filter
+// (D2: chat/judge failures and cross-check child outcomes are not factory run outcomes). Windowed on created_at (D3), the same
 // axis as the usage 7-day figures, so the two 7-day numbers on one card describe the
 // same set of runs. plan_rejected is split out of failed (D4): rejecting a plan is the
 // owner's decision, kept in the denominator and its own bar segment but out of the
@@ -14842,7 +14840,7 @@ UPDATE runs SET
     updated_at           = now()
 WHERE id = $6 AND worker_id = $7
   AND status = 'running'
-  AND kind NOT IN ('judge', 'job')
+  AND kind NOT IN ('judge', 'job', 'cross_check')
   -- PRD #1247 M5a-1 rework (reviewer NB1): the per-query generation fence, the SAME nil-guarded
   -- shape as InsertRunMessage. A CAPABILITY worker stamps claim_generation on the park report;
   -- a stale report from an OLD flight — reclaimed to a NEW generation under same-worker affinity
@@ -15150,7 +15148,7 @@ UPDATE runs SET
     updated_at                = now()
 WHERE id = $4 AND worker_id = $5
   AND status = 'running'
-  AND kind NOT IN ('judge', 'job')
+  AND kind NOT IN ('judge', 'job', 'cross_check')
   -- PRD #1247 M5a-1 rework (reviewer NB1): the per-query generation fence, identical to
   -- SetRunLimitWait's and the SAME nil-guarded shape as InsertRunMessage. A stale report from an
   -- OLD flight — reclaimed to a NEW generation under same-worker affinity, or against a released
@@ -15755,7 +15753,7 @@ WITH consumed_wall AS (
           SELECT 1 FROM runs r
           WHERE r.id = u.run_id AND r.id = $3 AND r.worker_id = $4
             AND r.status = 'running'
-            AND r.kind <> 'job'
+            AND r.kind NOT IN ('job', 'cross_check')
             AND r.completion_attempts = 0
             AND r.claim_released_at IS NULL
             AND r.started_at < ($5::timestamptz
@@ -15779,8 +15777,8 @@ UPDATE runs SET
     updated_at         = now()
 WHERE runs.id = $3 AND runs.worker_id = $4
   AND runs.status = 'running'
-  -- PRD #1908 D-E: a job never parks; its wall limit fails it (FailJobsPastWallDeadline).
-  AND runs.kind <> 'job'
+  -- Jobs fail at their wall; cross-checks use their own deadline and never wall-park.
+  AND runs.kind NOT IN ('job', 'cross_check')
   AND runs.completion_attempts = 0
   AND runs.started_at < ($5::timestamptz
         - make_interval(secs => COALESCE(runs.budget_wall_seconds, $6::int)
@@ -16160,7 +16158,7 @@ WHERE status = 'running'
                               + budget_extension_seconds
                               + budget_finalize_seconds
                               + budget_paused_seconds))
-  AND kind NOT IN ('chat', 'judge', 'job')
+  AND kind NOT IN ('chat', 'judge', 'job', 'cross_check')
   AND interactive = false
   AND completion_attempts > 0
   AND completion_contract_version IS NOT NULL
