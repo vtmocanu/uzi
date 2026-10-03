@@ -429,11 +429,17 @@ func (s *Service) BindPrDescription(ctx context.Context, wkr store.Worker, runID
 		// The recorded hash is immutable: the region it names may already be on the forge with
 		// only its ack lost, and lost-ack recovery and human-edit protection both key on it. An
 		// identical rebind is an idempotent retry; a different region needs a new staged version.
-		if v.RenderedRegionSha256.Valid && v.RenderedRegionSha256.String != req.RenderedRegionSha256 {
+		if v.RenderedRegionSha256.Valid && (v.RenderedRegionSha256.String != req.RenderedRegionSha256 ||
+			v.RegionHasDiagram.Valid != (req.RegionHasDiagram != nil) ||
+			(req.RegionHasDiagram != nil && v.RegionHasDiagram.Bool != *req.RegionHasDiagram)) {
 			return ErrPrDescriptionVersionConflict
 		}
+		var regionHasDiagram pgtype.Bool
+		if req.RegionHasDiagram != nil {
+			regionHasDiagram = pgtype.Bool{Bool: *req.RegionHasDiagram, Valid: true}
+		}
 		bound, err := q.BindPrDescriptionVersion(ctx, store.BindPrDescriptionVersionParams{
-			ID: v.ID, RunID: run.ID, MrIid: req.MrIid, RenderedRegionSha256: req.RenderedRegionSha256,
+			ID: v.ID, RunID: run.ID, MrIid: req.MrIid, RenderedRegionSha256: req.RenderedRegionSha256, RegionHasDiagram: regionHasDiagram,
 		})
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -823,6 +829,7 @@ func (s *Service) RunPrDescription(ctx context.Context, run store.Run) (*apitype
 		out = &apitypes.RunPrDescriptionDTO{
 			MrIid: st.MrIid, Source: v.Source, Fields: v.Fields, Size: v.Size,
 			BaseSha: v.BaseSha, HeadSha: v.HeadSha, TargetBranch: v.TargetBranch, PublishedAt: v.PublishedAt,
+			DiagramPublished: v.RegionHasDiagram != nil && *v.RegionHasDiagram,
 		}
 	}
 	return out, st.LastOutcome, nil
@@ -866,6 +873,10 @@ func prDescVersionDTO(v store.PrDescriptionVersion) apitypes.PrDescriptionVersio
 	if v.RenderedRegionSha256.Valid {
 		h := v.RenderedRegionSha256.String
 		dto.RenderedRegionSha256 = &h
+	}
+	if v.RegionHasDiagram.Valid {
+		b := v.RegionHasDiagram.Bool
+		dto.RegionHasDiagram = &b
 	}
 	if v.PublishedAt.Valid {
 		t := v.PublishedAt.Time

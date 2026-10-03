@@ -1062,7 +1062,29 @@ function verificationLines(fields: SanitizedPrDescriptionFields, input: RegionIn
   return out;
 }
 
-function fieldsRegion(fields: SanitizedPrDescriptionFields, input: RegionInput): string {
+function diagramBlock(fields: SanitizedPrDescriptionFields): string[] {
+  const diagram = fields.diagram;
+  if (!diagram) return [];
+  const ids = new Map(diagram.nodes.map((node, i) => [node.key, `n${i + 1}`]));
+  const connected = new Set(diagram.edges.flatMap((edge) => [edge.from, edge.to]));
+  const source = diagram.kind === "flow"
+    ? ["flowchart LR", ...diagram.nodes.filter((node) => !connected.has(node.key)).map((node) => `  ${ids.get(node.key)}["${node.label}"]`), ...diagram.edges.map((edge) => {
+      const from = diagram.nodes.find((node) => node.key === edge.from)!;
+      const to = diagram.nodes.find((node) => node.key === edge.to)!;
+      return `  ${ids.get(edge.from)}["${from.label}"] -->${edge.label ? `|"${edge.label}"|` : ""} ${ids.get(edge.to)}["${to.label}"]`;
+    })]
+    : ["sequenceDiagram", ...diagram.nodes.map((node) => `  participant ${ids.get(node.key)} as ${sequenceLabel(node.label)}`),
+      ...diagram.edges.map((edge) => `  ${ids.get(edge.from)}->>${ids.get(edge.to)}: ${sequenceLabel(edge.label || diagram.nodes.find((node) => node.key === edge.to)!.label)}`)];
+  const mermaid = source.join("\n");
+  if (Buffer.byteLength(mermaid, "utf8") > 1500 || mermaid.includes("`")) return [];
+  return [...(diagram.title ? [`_${escapeInline(diagram.title)}_`, ""] : []), "```mermaid", ...source, "```"];
+}
+
+function sequenceLabel(label: string): string {
+  return label.replace(/\bend\b/giu, "(end)");
+}
+
+function fieldsRegion(fields: SanitizedPrDescriptionFields, input: RegionInput, withoutDiagram = false): string {
   const blocks: string[][] = [];
   const summary = fields.summary.trim();
   if (summary) blocks.push([summary]);
@@ -1072,6 +1094,10 @@ function fieldsRegion(fields: SanitizedPrDescriptionFields, input: RegionInput):
   const size = sizeLineOf(input);
   if (size) blocks.push([size]);
   if (fields.changes.length) blocks.push(["### What changed", ...fields.changes.map((c) => `- ${c}`)]);
+  if (!withoutDiagram) {
+    const diagram = diagramBlock(fields);
+    if (diagram.length) blocks.push(diagram);
+  }
   const verification = verificationLines(fields, input);
   if (verification.length) blocks.push(["### Verification", ...verification]);
   const notes = [
@@ -1092,7 +1118,7 @@ function fieldsRegion(fields: SanitizedPrDescriptionFields, input: RegionInput):
  * region over REGION_CAP_BYTES (6 KiB) also falls back to it. The fields are published as the api
  * returned them: no re-escaping.
  */
-export function renderRegion(input: RegionInput, fields?: SanitizedPrDescriptionFields): RenderedRegion {
+export function renderRegion(input: RegionInput, fields?: SanitizedPrDescriptionFields, withoutDiagram = false): RenderedRegion {
   if (fields === undefined) return { text: deterministicRegion(input), withFields: false, fallback: "no_fields" };
   if (!SanitizedPrDescriptionFields.is(fields)) {
     return { text: deterministicRegion(input), withFields: false, fallback: "not_sanitized" };
@@ -1100,7 +1126,10 @@ export function renderRegion(input: RegionInput, fields?: SanitizedPrDescription
   if (input.source === "deterministic_only") {
     return { text: deterministicRegion(input), withFields: false, fallback: "deterministic_only" };
   }
-  const text = fieldsRegion(fields, input);
+  let text = fieldsRegion(fields, input, withoutDiagram);
+  if (!withoutDiagram && fields.diagram && Buffer.byteLength(text, "utf8") > REGION_CAP_BYTES) {
+    text = fieldsRegion(fields, input, true);
+  }
   if (Buffer.byteLength(text, "utf8") > REGION_CAP_BYTES) {
     return { text: deterministicRegion(input), withFields: false, fallback: "region_cap" };
   }
@@ -1699,8 +1728,13 @@ export function capBody(
   compose: (region: string) => string | undefined,
   region: string,
   sizeOnlyRegion: string,
-): { body: string | undefined; capped: boolean } {
+  diagramLessRegion?: string,
+): { body: string | undefined; capped: boolean; diagramless?: boolean } {
   const body = compose(region);
   if (body === undefined || body.length <= BODY_CAP_CHARS || region === sizeOnlyRegion) return { body, capped: false };
+  if (diagramLessRegion && diagramLessRegion !== region) {
+    const less = compose(diagramLessRegion);
+    if (less !== undefined && less.length <= BODY_CAP_CHARS) return { body: less, capped: false, diagramless: true };
+  }
   return { body: compose(sizeOnlyRegion), capped: true };
 }

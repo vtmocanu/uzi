@@ -126,6 +126,7 @@ function version(over: Partial<WireVersion> = {}): WireVersion {
     target_branch: "main",
     source: "generated",
     rendered_region_sha256: null,
+    region_has_diagram: null,
     state: "pending",
     created_at: "2026-09-27T10:00:00Z",
     published_at: null,
@@ -260,6 +261,66 @@ describe("pr-description client wire (PRD #1798 M4, D9)", () => {
     }
   });
 
+  it("preserves a sanitized diagram, freezes every nested value, and returns a deep mutable copy", async () => {
+    const diagram = {
+      kind: "flow" as const,
+      title: "Overview",
+      nodes: [{ key: "start", label: "Start" }, { key: "work", label: "Do work" }, { key: "end", label: "Finish" }],
+      edges: [{ from: "start", to: "work", label: "Next" }, { from: "work", to: "end", label: "" }],
+    };
+    respond = () => ({ status: 200, body: JSON.stringify({ version: version({ fields: { ...version().fields, diagram }, region_has_diagram: true }) }) });
+    const { version: decoded } = await newClient().stagePrDescription(RUN_ID, stageReq());
+    const d = decoded.fields.diagram;
+    assert.ok(d);
+    assert.deepEqual(plain(d), diagram);
+    assert.equal(decoded.region_has_diagram, true);
+    for (const value of [decoded.fields, d, d.nodes, d.nodes[0], d.edges, d.edges[0]]) assert.ok(Object.isFrozen(value));
+    const raw = decoded.fields.toRaw();
+    assert.ok(raw.diagram);
+    raw.diagram.nodes[0]!.label = "Changed";
+    raw.diagram.edges[0]!.label = "Changed";
+    raw.diagram.nodes.push({ key: "extra", label: "Extra" });
+    assert.deepEqual(plain(d), diagram);
+  });
+
+  it("accepts a two-participant sequence diagram", async () => {
+    const diagram = { kind: "sequence" as const, title: "", nodes: [{ key: "worker", label: "Worker" }, { key: "api", label: "API" }], edges: [{ from: "worker", to: "api", label: "Stage" }, { from: "api", to: "worker", label: "Bound" }] };
+    respond = () => ({ status: 200, body: JSON.stringify({ version: version({ fields: { ...version().fields, diagram } }) }) });
+    const { version: decoded } = await newClient().stagePrDescription(RUN_ID, stageReq());
+    assert.deepEqual(plain(decoded.fields.diagram), diagram);
+  });
+
+  it("accepts a legacy response without diagram and sends the optional bind flag", async () => {
+    respond = () => ({ status: 200, body: JSON.stringify({ version: version() }) });
+    const staged = await newClient().stagePrDescription(RUN_ID, stageReq());
+    assert.equal(staged.version.fields.diagram, undefined);
+    assert.equal("diagram" in staged.version.fields.toRaw(), false);
+    respond = () => ({ status: 200, body: JSON.stringify({ version: version(), pr: prState() }) });
+    await newClient().bindPrDescription(RUN_ID, { ...bindReq(), region_has_diagram: false });
+    assert.equal((JSON.parse(recorded.at(-1)!.body) as PrDescriptionBindRequest).region_has_diagram, false);
+  });
+
+  it("rejects malformed diagram data in a successful response", async () => {
+    const good = { kind: "flow", title: "Overview", nodes: [{ key: "a", label: "A" }, { key: "b", label: "B" }, { key: "c", label: "C" }], edges: [{ from: "a", to: "b", label: "" }, { from: "b", to: "c", label: "" }] };
+    const bad = [
+      null, { ...good, kind: "unknown" }, { ...good, nodes: good.nodes.slice(0, 2) },
+      { ...good, nodes: [...good.nodes, { key: "a", label: "Duplicate" }] },
+      { ...good, nodes: [{ key: "Bad-Key", label: "A" }, ...good.nodes.slice(1)] },
+      { ...good, nodes: [{ key: "a", label: "@person" }, ...good.nodes.slice(1)] },
+      { ...good, nodes: [{ key: "a", label: "x".repeat(61) }, ...good.nodes.slice(1)] },
+      { ...good, title: "x".repeat(81) }, { ...good, edges: good.edges.slice(0, 1) },
+      { ...good, edges: [{ from: "a", to: "missing", label: "" }, good.edges[1]] },
+      { ...good, edges: [{ from: "a", to: "a", label: "" }, good.edges[1]] },
+      { ...good, edges: [{ from: "a", to: "b", label: "@person" }, good.edges[1]] },
+      { ...good, nodes: [{ key: "a", label: "é".repeat(31) }, ...good.nodes.slice(1)] },
+      { ...good, title: 42 }, { ...good, edges: [{ from: "a", to: "b", label: 1 }, good.edges[1]] },
+    ];
+    for (const diagram of bad) {
+      respond = () => ({ status: 200, body: JSON.stringify({ version: version({ fields: { ...version().fields, diagram: diagram as never } }) }) });
+      await assert.rejects(newClient().stagePrDescription(RUN_ID, stageReq()), PrDescriptionMalformedResponse);
+    }
+  });
+
   it("an unknown last_outcome string is kept (forward skew), not refused", async () => {
     const ack = { pr: prState({ lock_version: 8, last_outcome: "skipped_future_reason" }), recovered_version_id: null };
     respond = () => ({ status: 200, body: JSON.stringify(ack) });
@@ -322,6 +383,7 @@ describe("pr-description client wire (PRD #1798 M4, D9)", () => {
         {},
         { version: { ...version(), fields: { ...version().fields, changes: null } } },
         { version: { ...version(), source: "model" } },
+        { version: { ...version(), region_has_diagram: "yes" } },
         { version: { ...version(), fields: { ...version().fields, scope_notes: [{ kind: "removed", text: "x" }] } } },
       ],
       bind: [{ version: version() }, { version: version(), pr: { ...prState(), lock_version: "7" } }],

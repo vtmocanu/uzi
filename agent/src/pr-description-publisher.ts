@@ -84,7 +84,7 @@ import type {
   RawPrDescriptionFields,
 } from "./protocol.js";
 import type { PrSummaryClaim } from "./signals.js";
-import type { DeliverySummary, DeliverySummaryClaimView, DeliverySummaryInput } from "./summary-runner.js";
+import { parseDeliveryDiagram, type DeliverySummary, type DeliverySummaryClaimView, type DeliverySummaryInput } from "./summary-runner.js";
 
 // ── Seams ──────────────────────────────────────────────────────────────────────────────────
 
@@ -444,6 +444,8 @@ interface Staged {
   version?: PrDescriptionVersionDTO;
   /** The full region for this version (fields when staged with any). */
   region: string;
+  /** The same sanitized fields rendered without their optional diagram. */
+  diagramLess: string;
   /** The size-and-provenance-only region for the same snapshot (the D15 fallback). */
   sizeOnly: string;
   /** The hash this version was bound with, once bound. */
@@ -463,6 +465,8 @@ interface Composition {
   skip?: RegionSkip;
   /** The D15 cap replaced the region with its size-only form. */
   capped: boolean;
+  /** The body cap selected the diagram-less region. */
+  diagramless?: boolean;
   /** The amended-D10 scan forced a whole-body non-closing rewrite. */
   interlockRewrite: boolean;
   /** A refresh on a legacy PR (no markers): nothing is written, nothing is acked. */
@@ -565,7 +569,7 @@ export class PrDescriptionPublication {
   /** The body a NEW PR is created with: the region and the completion block, no preserved text
    *  (D15-capped like any other body). */
   initialBody(completion: string): string {
-    return capBody((r) => renderBody(r, completion), this.staged.region, this.staged.sizeOnly).body ?? renderBody(this.staged.sizeOnly, completion);
+    return capBody((r) => renderBody(r, completion), this.staged.region, this.staged.sizeOnly, this.staged.diagramLess).body ?? renderBody(this.staged.sizeOnly, completion);
   }
 
   /** @internal prepare()'s staging. */
@@ -576,7 +580,7 @@ export class PrDescriptionPublication {
 
   // ── Staging (step 1, and every restage) ──
 
-  private async stage(snapshot: PrSnapshot, deterministic: boolean): Promise<Staged> {
+  private async stage(snapshot: PrSnapshot, deterministic: boolean, diagramlessFields?: RawPrDescriptionFields): Promise<Staged> {
     const { spec, deps } = this;
     let facts: SnapshotFacts | undefined;
     try {
@@ -589,12 +593,24 @@ export class PrDescriptionPublication {
     let fields: RawPrDescriptionFields = EMPTY_FIELDS;
     // A stopped publication (a 409 stale_claim/run_terminal) no longer owns the run: skip the
     // model pass, whose result would be thrown away, rather than spend the owner's credential on it.
-    if (!deterministic && !this.stopped && !this.apiUnreachable) {
+    if (diagramlessFields) {
+      source = "generated";
+      fields = diagramlessFields;
+    } else if (!deterministic && !this.stopped && !this.apiUnreachable) {
       const generated = await this.editorPass(snapshot);
       const lead = leadFields(spec.lead);
       if (generated) {
         source = "generated";
-        fields = { ...generated, scope_notes: generated.scope_notes.map((n) => ({ ...n })), verification: leadVerification(spec.lead) };
+        const zeroCode = facts && !facts.size.size.unavailable &&
+          facts.size.size.code.added + facts.size.size.code.deleted === 0;
+        fields = {
+          ...generated,
+          scope_notes: generated.scope_notes.map((n) => ({ ...n })),
+          verification: leadVerification(spec.lead),
+        };
+        const diagram = !zeroCode && parseDeliveryDiagram(generated.diagram);
+        if (diagram) fields.diagram = diagram;
+        else delete fields.diagram;
       } else if (lead) {
         source = "lead_only";
         fields = lead;
@@ -638,6 +654,7 @@ export class PrDescriptionPublication {
       snapshot,
       version,
       region: renderRegion({ ...input, source: version?.source }, version?.fields).text,
+      diagramLess: renderRegion({ ...input, source: version?.source }, version?.fields, true).text,
       sizeOnly: renderRegion(input).text,
     };
   }
@@ -658,14 +675,14 @@ export class PrDescriptionPublication {
 
   // ── api calls ──
 
-  private async bind(mrIid: number, staged: Staged, hash: string): Promise<void> {
+  private async bind(mrIid: number, staged: Staged, hash: string, region: string): Promise<void> {
     if (this.stopped || this.apiUnreachable || !staged.version || staged.boundHash !== undefined) return;
     try {
       const res = await replay(
         () =>
           this.deps.api.bindPrDescription(
             this.spec.runId,
-            { claim_generation: this.spec.claimGeneration, version_id: staged.version!.id, mr_iid: mrIid, rendered_region_sha256: hash },
+            { claim_generation: this.spec.claimGeneration, version_id: staged.version!.id, mr_iid: mrIid, rendered_region_sha256: hash, region_has_diagram: staged.version!.fields.diagram !== undefined && region.includes("```mermaid\n") },
             this.signal,
           ),
         this.sleep,
@@ -849,10 +866,10 @@ export class PrDescriptionPublication {
     let region: string | undefined;
     let capped = false;
     if (writeRegion) {
-      const res = capBody((r) => build(r), staged.region, staged.sizeOnly);
+      const res = capBody((r) => build(r), staged.region, staged.sizeOnly, staged.diagramLess);
       body = res.body;
       capped = res.capped;
-      region = capped ? staged.sizeOnly : staged.region;
+      region = capped ? staged.sizeOnly : res.diagramless ? staged.diagramLess : staged.region;
     } else {
       body = build(undefined);
     }
@@ -863,15 +880,15 @@ export class PrDescriptionPublication {
     let interlockRewrite = false;
     let completion = completionFor(region !== undefined);
     if (this.scans()) {
-      const ownRegion = region ?? staged.region;
+      const ownRegion = staged.region;
       const result = body ?? read.description;
       if (this.memo.closingOutside(result, spec.interlockIssueIid!, completion, spec.repoPath)) {
         completion = completionFor(true);
         const wholeCompletion = completion;
-        const whole = capBody((r) => renderBody(r, wholeCompletion), ownRegion, staged.sizeOnly);
+        const whole = capBody((r) => renderBody(r, wholeCompletion), ownRegion, staged.sizeOnly, staged.diagramLess);
         body = whole.body ?? renderBody(staged.sizeOnly, wholeCompletion);
-        region = whole.capped ? staged.sizeOnly : ownRegion;
-        capped = capped || whole.capped;
+        region = whole.capped ? staged.sizeOnly : whole.diagramless ? staged.diagramLess : ownRegion;
+        capped = whole.capped;
         interlockRewrite = true;
         skip = undefined;
       }
@@ -954,13 +971,21 @@ export class PrDescriptionPublication {
     return this.closingIn(this.forgeBody, this.expectedCompletion ?? this.spec.completion());
   }
 
-  private async restage(snapshot: PrSnapshot, deterministic: boolean): Promise<void> {
-    this.staged = await this.stage(snapshot, deterministic);
+  private async restage(snapshot: PrSnapshot, deterministic: boolean, diagramlessFields?: RawPrDescriptionFields): Promise<void> {
+    this.staged = await this.stage(snapshot, deterministic, diagramlessFields);
     this.remember();
+  }
+
+  private async restageDiagramless(): Promise<void> {
+    const fields = this.staged.version?.fields.toRaw();
+    if (!fields) return;
+    delete fields.diagram;
+    await this.restage(this.staged.snapshot, false, fields);
   }
 
   private remember(): void {
     this.rendered.add(toLf(this.staged.region));
+    this.rendered.add(toLf(this.staged.diagramLess));
     this.rendered.add(toLf(this.staged.sizeOnly));
   }
 
@@ -1004,6 +1029,10 @@ export class PrDescriptionPublication {
         deps.log.info("PR description: a refresh leaves a PR without uzi markers untouched", { run_id: this.spec.runId });
         return { region: this.staged.region, wrote: false, interlockRewrite: false, closingRemains: false };
       }
+      if (comp.region !== undefined && this.staged.version?.fields.diagram && !comp.region.includes("```mermaid\n")) {
+        await this.restageDiagramless();
+        comp = await this.composeFrom(mrIid, read, budgetSkip === undefined);
+      }
       if (comp.capped && this.staged.version && this.staged.version.source !== "deterministic_only") {
         // D15: the cap dropped the fields, so the staged version no longer matches what is written.
         // It is still unbound, so it simply stays pending; a deterministic_only version replaces it.
@@ -1013,7 +1042,7 @@ export class PrDescriptionPublication {
       // A stopped publication neither binds nor revalidates; step 8 then writes nothing.
       if (this.stopped) break;
       // Step 6: bind with the FINAL region hash (the region this version would write).
-      await this.bind(mrIid, this.staged, regionSha256(comp.region ?? this.staged.region));
+      await this.bind(mrIid, this.staged, regionSha256(comp.region ?? this.staged.region), comp.region ?? this.staged.region);
       // Step 7: read 2 revalidates the snapshot and the description.
       const read2 = await this.read(mrIid);
       latest = read2;
@@ -1042,7 +1071,8 @@ export class PrDescriptionPublication {
             // bound version superseded this way (there is no "abandoned" outcome to send); the
             // replacement is a deterministic_only version, bound and revalidated with a new read.
             await this.ack(mrIid, this.staged, "skipped_snapshot_moved");
-            await this.restage(this.staged.snapshot, true);
+            if (next.region === this.staged.diagramLess && this.staged.version.fields.diagram) await this.restageDiagramless();
+            else await this.restage(this.staged.snapshot, true);
             continue;
           }
           comp = next;

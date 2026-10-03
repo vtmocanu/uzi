@@ -1047,6 +1047,11 @@ Tracked as GitHub issue vtmocanu/uzi#1798; PRD at `prds/1798-plain-english-pr-de
 - A Claude run and a Codex run produce the same layout. (AI-synced 2026-09-28)
 - The PR body shows the size as a file count plus a small table (one row per
   category, a Total row); the web and CLI keep the one-line form. (AI-synced 2026-10-01, #2061)
+- An editor-grounded multi-component or order-dependent code change may add one
+  structured diagram inside the description region; uzi renders Mermaid, omits
+  the diagram for zero-code or uncertain changes, and drops it before the size
+  table on size limits. Web and CLI show its text outline only when the bound
+  region was published with the diagram. (AI-synced 2026-10-02, #1840)
 - Generated or lead-written text can never close an issue. (AI-synced 2026-09-28)
 - Text outside uzi's own blocks is preserved on an ordinary refresh; a few
   named cases (no uzi markers yet, malformed markers — the publisher skips

@@ -248,6 +248,126 @@ func TestPrDescriptionSkippedWriteKeepsPublishedLiveDB(t *testing.T) {
 	}
 }
 
+func TestPrDescriptionDiagramBindAndLostAckLiveDB(t *testing.T) {
+	p := setupPrDescLive(t)
+	lost := p.stage(t, 1, "Diagram written, ack lost.", nil)
+	bind := func(id, hash string, flag *bool) (apitypes.PrDescriptionBindResponse, error) {
+		return p.svc.BindPrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionBindRequest{
+			ClaimGeneration: gen(1), VersionID: id, MrIid: 5, RenderedRegionSha256: hash, RegionHasDiagram: flag,
+		})
+	}
+	first, err := bind(lost.ID, prDescLiveHashA, genBool(true))
+	if err != nil || first.Version.RegionHasDiagram == nil || !*first.Version.RegionHasDiagram {
+		t.Fatalf("bind diagram flag = %+v, %v", first.Version, err)
+	}
+	if retry, err := bind(lost.ID, prDescLiveHashA, genBool(true)); err != nil || retry.Version.RegionHasDiagram == nil || !*retry.Version.RegionHasDiagram {
+		t.Fatalf("idempotent bind = %+v, %v", retry.Version, err)
+	}
+	for _, flag := range []*bool{nil, genBool(false)} {
+		if _, err := bind(lost.ID, prDescLiveHashA, flag); !errors.Is(err, ErrPrDescriptionVersionConflict) {
+			t.Fatalf("changed flag %v: %v", flag, err)
+		}
+	}
+	next := p.stage(t, 1, "Next write.", gen(5))
+	if _, err := bind(next.ID, prDescLiveHashB, nil); err != nil {
+		t.Fatalf("legacy bind: %v", err)
+	}
+	observed := prDescLiveHashA
+	ack, err := p.ack(1, next.ID, "skipped_human_edit", 0, &observed)
+	if err != nil || ack.RecoveredVersionID == nil || *ack.RecoveredVersionID != lost.ID ||
+		ack.PR.PublishedVersion == nil || ack.PR.PublishedVersion.RegionHasDiagram == nil || !*ack.PR.PublishedVersion.RegionHasDiagram {
+		t.Fatalf("lost ack recovery = %+v, %v", ack, err)
+	}
+	run := mustRun(t, p.env, p.runID)
+	desc, _, err := p.svc.RunPrDescription(p.env.ctx, run)
+	if err != nil || desc == nil || !desc.DiagramPublished {
+		t.Fatalf("run diagram published = %+v, %v", desc, err)
+	}
+}
+
+func TestPrDescriptionDiagramPublishedTransitionsLiveDB(t *testing.T) {
+	p := setupPrDescLive(t)
+	v, err := p.svc.StagePrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionStageRequest{
+		ClaimGeneration: gen(1), Source: "generated",
+		Fields: apitypes.PrDescriptionFields{Summary: "With diagram.", Diagram: &apitypes.PrDescriptionDiagram{
+			Kind: "flow", Title: "Flow",
+			Nodes: []apitypes.PrDescriptionDiagramNode{{Key: "a", Label: "Start"}, {Key: "b", Label: "Work"}, {Key: "c", Label: "Done"}},
+			Edges: []apitypes.PrDescriptionDiagramEdge{{From: "a", To: "b"}, {From: "b", To: "c"}},
+		}},
+		BaseSha: strings.Repeat("1", 40), HeadSha: strings.Repeat("2", 40), TargetBranch: "main",
+	})
+	if err != nil || v.Fields.Diagram == nil {
+		t.Fatalf("stage diagram = %+v, %v", v, err)
+	}
+	bind := func(id, hash string, flag bool) apitypes.PrDescriptionBindResponse {
+		t.Helper()
+		r, err := p.svc.BindPrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionBindRequest{
+			ClaimGeneration: gen(1), VersionID: id, MrIid: 5, RenderedRegionSha256: hash, RegionHasDiagram: genBool(flag),
+		})
+		if err != nil {
+			t.Fatalf("bind %s: %v", id, err)
+		}
+		return r
+	}
+	checkRun := func(want *bool) {
+		t.Helper()
+		desc, _, err := p.svc.RunPrDescription(p.env.ctx, mustRun(t, p.env, p.runID))
+		if err != nil || (want == nil && desc != nil) || (want != nil && (desc == nil || desc.DiagramPublished != *want)) {
+			t.Fatalf("RunPrDescription = %+v, %v; want diagram_published %v", desc, err, want)
+		}
+	}
+	checkFlag := func(id string, want bool) {
+		t.Helper()
+		var flag *bool
+		if err := p.env.pool.QueryRow(p.env.ctx, `SELECT region_has_diagram FROM pr_description_versions WHERE id = $1`, id).Scan(&flag); err != nil || flag == nil || *flag != want {
+			t.Fatalf("stored region_has_diagram for %s = %v, %v; want %t", id, flag, err, want)
+		}
+	}
+	checkRun(nil) // A staged version is not a published run description.
+	b := bind(v.ID, prDescLiveHashA, true)
+	if b.Version.RegionHasDiagram == nil || !*b.Version.RegionHasDiagram || b.PR.PublishedVersion != nil {
+		t.Fatalf("bound pending version = %+v", b)
+	}
+	checkFlag(v.ID, true)
+	checkRun(nil) // Binding alone cannot expose pending content in the run DTO.
+	a, err := p.ack(1, v.ID, "published", 0, nil)
+	if err != nil || a.PR.PublishedVersion == nil || a.PR.PublishedVersion.ID != v.ID ||
+		a.PR.PublishedVersion.RegionHasDiagram == nil || !*a.PR.PublishedVersion.RegionHasDiagram {
+		t.Fatalf("publish diagram = %+v, %v", a, err)
+	}
+	checkRun(genBool(true))
+	if retry, err := p.ack(1, v.ID, "published", 0, nil); err != nil || retry.PR.PublishedVersion == nil ||
+		retry.PR.PublishedVersion.ID != v.ID || retry.PR.PublishedVersion.RegionHasDiagram == nil || !*retry.PR.PublishedVersion.RegionHasDiagram {
+		t.Fatalf("lost ack retry = %+v, %v", retry, err)
+	}
+	checkFlag(v.ID, true)
+	checkRun(genBool(true))
+
+	attempt := p.stage(t, 1, "Attempt without diagram.", gen(5))
+	bind(attempt.ID, prDescLiveHashB, false)
+	if skipped, err := p.ack(1, attempt.ID, "skipped_human_edit", 1, nil); err != nil ||
+		skipped.PR.PublishedVersion == nil || skipped.PR.PublishedVersion.ID != v.ID ||
+		skipped.PR.PublishedVersion.RegionHasDiagram == nil || !*skipped.PR.PublishedVersion.RegionHasDiagram {
+		t.Fatalf("skipped attempt changed publication = %+v, %v", skipped, err)
+	}
+	checkRun(genBool(true))
+	checkFlag(v.ID, true)
+
+	plain := p.stage(t, 1, "Published without diagram.", gen(5))
+	if plain.Fields.Diagram != nil {
+		t.Fatalf("diagram-less stage = %+v", plain.Fields)
+	}
+	bind(plain.ID, prDescLiveHashC, false)
+	if final, err := p.ack(1, plain.ID, "published", 2, nil); err != nil || final.PR.PublishedVersion == nil ||
+		final.PR.PublishedVersion.ID != plain.ID || final.PR.PublishedVersion.RegionHasDiagram == nil || *final.PR.PublishedVersion.RegionHasDiagram {
+		t.Fatalf("publish diagram-less version = %+v, %v", final, err)
+	}
+	checkFlag(plain.ID, false)
+	checkRun(genBool(false))
+}
+
+func genBool(v bool) *bool { return &v }
+
 // TestPrDescriptionLostAckRecoveryLiveDB: a version whose forge write landed but whose ack was
 // lost is recovered by the next ack that observes its region hash, before that ack applies.
 func TestPrDescriptionLostAckRecoveryLiveDB(t *testing.T) {

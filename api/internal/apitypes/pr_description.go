@@ -14,6 +14,26 @@ type PrDescriptionFields struct {
 	ScopeNotes     []PrDescriptionScopeNote    `json:"scope_notes"`
 	ReviewPointers []string                    `json:"review_pointers"`
 	Verification   []PrDescriptionVerification `json:"verification"`
+	Diagram        *PrDescriptionDiagram       `json:"diagram,omitempty"`
+}
+
+// PrDescriptionDiagram is a bounded, plain-text flow or sequence graph.
+type PrDescriptionDiagram struct {
+	Kind  string                     `json:"kind"`
+	Title string                     `json:"title"`
+	Nodes []PrDescriptionDiagramNode `json:"nodes"`
+	Edges []PrDescriptionDiagramEdge `json:"edges"`
+}
+
+type PrDescriptionDiagramNode struct {
+	Key   string `json:"key"`
+	Label string `json:"label"`
+}
+
+type PrDescriptionDiagramEdge struct {
+	From  string `json:"from"`
+	To    string `json:"to"`
+	Label string `json:"label"`
 }
 
 // PrDescriptionScopeNote is one difference from the ask. Kind is added|changed|dropped|deferred.
@@ -67,6 +87,7 @@ type PrDescriptionVersionDTO struct {
 	TargetBranch         string              `json:"target_branch"`
 	Source               string              `json:"source"`
 	RenderedRegionSha256 *string             `json:"rendered_region_sha256"`
+	RegionHasDiagram     *bool               `json:"region_has_diagram"`
 	State                string              `json:"state"`
 	CreatedAt            time.Time           `json:"created_at"`
 	PublishedAt          *time.Time          `json:"published_at"`
@@ -114,6 +135,7 @@ type PrDescriptionBindRequest struct {
 	VersionID            string `json:"version_id"`
 	MrIid                int64  `json:"mr_iid"`
 	RenderedRegionSha256 string `json:"rendered_region_sha256"`
+	RegionHasDiagram     *bool  `json:"region_has_diagram"`
 }
 
 // PrDescriptionBindResponse is the bound version plus the PR's current state, so the worker can
@@ -166,12 +188,13 @@ type PrDescriptionAckResponse struct {
 // that is on the forge), for the run view and `uzi run get`. Fields are api-sanitized but still
 // untrusted display text: render them as plain text.
 type RunPrDescriptionDTO struct {
-	MrIid        int64               `json:"mr_iid"`
-	Source       string              `json:"source"`
-	Fields       PrDescriptionFields `json:"fields"`
-	Size         *PrDescriptionSize  `json:"size"`
-	BaseSha      string              `json:"base_sha"`
-	HeadSha      string              `json:"head_sha"`
-	TargetBranch string              `json:"target_branch"`
-	PublishedAt  *time.Time          `json:"published_at"`
+	MrIid            int64               `json:"mr_iid"`
+	Source           string              `json:"source"`
+	Fields           PrDescriptionFields `json:"fields"`
+	Size             *PrDescriptionSize  `json:"size"`
+	BaseSha          string              `json:"base_sha"`
+	HeadSha          string              `json:"head_sha"`
+	TargetBranch     string              `json:"target_branch"`
+	PublishedAt      *time.Time          `json:"published_at"`
+	DiagramPublished bool                `json:"diagram_published"`
 }

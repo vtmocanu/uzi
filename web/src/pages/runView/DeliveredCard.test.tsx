@@ -62,6 +62,7 @@ function desc(over: Partial<RunPrDescription["fields"]> = {}, rest: Partial<RunP
     head_sha: "2222222",
     target_branch: "main",
     published_at: "2026-09-27T10:00:00Z",
+    diagram_published: false,
     ...rest,
   };
 }
@@ -134,6 +135,60 @@ describe("prDescriptionOutcomeNote", () => {
 });
 
 describe("DeliveredCard", () => {
+  const outlineOnly = { summary: "", changes: [], scope_notes: [], review_pointers: [], verification: [] };
+  const diagram = {
+    kind: "flow",
+    title: "Request path",
+    nodes: [
+      { key: "editor", label: "Editor pass" },
+      { key: "api", label: "API" },
+      { key: "web", label: "Web" },
+    ],
+    edges: [
+      { from: "editor", to: "api", label: "sanitized fields" },
+      { from: "api", to: "web", label: "published outline" },
+    ],
+  };
+
+  it("shows published diagram edges in their original order for an outline-only description", () => {
+    render(<DeliveredCard run={run({ pr_description: desc({ ...outlineOnly, diagram }, { size: null, diagram_published: true }) })} />);
+    const section = screen.getByRole("region", { name: "Delivered" });
+    const lines = within(section).getAllByRole("listitem");
+    expect(lines.map((line) => line.textContent)).toEqual([
+      "Editor pass → API: sanitized fields",
+      "API → Web: published outline",
+    ]);
+  });
+
+  it("hides an unpublished diagram, including an otherwise empty Delivered section", () => {
+    const { container } = render(
+      <DeliveredCard run={run({ pr_description: desc({ ...outlineOnly, diagram }, { size: null, diagram_published: false }) })} />,
+    );
+    expect(container.innerHTML).toBe("");
+  });
+
+  it("shows no outline when a published diagram is absent", () => {
+    render(<DeliveredCard run={run({ pr_description: desc({}, { diagram_published: true }) })} />);
+    expect(screen.queryByText("Editor pass → API: sanitized fields")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Diagram outline" })).toBeNull();
+  });
+
+  it("renders hostile diagram labels as inert, decoded text", () => {
+    const hostile = {
+      ...diagram,
+      nodes: [
+        { key: "editor", label: "&lt;img src=x onerror=alert(1)&gt;" },
+        { key: "api", label: "\\[API\\]" },
+      ],
+      edges: [{ from: "editor", to: "api", label: "&lt;script&gt;alert(1)&lt;/script&gt;" }],
+    };
+    const { container } = render(
+      <DeliveredCard run={run({ pr_description: desc({ ...outlineOnly, diagram: hostile }, { size: null, diagram_published: true }) })} />,
+    );
+    expect(screen.getByText("<img src=x onerror=alert(1)> → [API]: <script>alert(1)</script>")).toBeTruthy();
+    expect(container.querySelector("img, script")).toBeNull();
+  });
+
   it("renders nothing when the run has no published description", () => {
     for (const pr of [null, undefined]) {
       const { container } = render(<DeliveredCard run={run({ pr_description: pr })} />);

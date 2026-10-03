@@ -9,6 +9,7 @@ import {
   type PrDescriptionBindResponse,
   type PrDescriptionLookupRequest,
   type PrDescriptionLookupResponse,
+  type PrDescriptionDiagram,
   type PrDescriptionScopeNote,
   type PrDescriptionSize,
   type PrDescriptionStageRequest,
@@ -294,6 +295,10 @@ export class SanitizedPrDescriptionFields {
   readonly scope_notes: readonly Readonly<PrDescriptionScopeNote>[];
   readonly review_pointers: readonly string[];
   readonly verification: readonly Readonly<PrDescriptionVerification>[];
+  readonly diagram?: Readonly<Omit<PrDescriptionDiagram, "nodes" | "edges">> & {
+    readonly nodes: readonly Readonly<PrDescriptionDiagram["nodes"][number]>[];
+    readonly edges: readonly Readonly<PrDescriptionDiagram["edges"][number]>[];
+  };
   readonly #sanitized = true;
 
   constructor(mint: typeof MINT, fields: RawPrDescriptionFields) {
@@ -307,6 +312,15 @@ export class SanitizedPrDescriptionFields {
         Object.freeze({ command: e.command, result: e.result, verified_at_sha: e.verified_at_sha }),
       ),
     );
+    if (fields.diagram !== undefined) {
+      const d = fields.diagram;
+      this.diagram = Object.freeze({
+        kind: d.kind,
+        title: d.title,
+        nodes: Object.freeze(d.nodes.map((n) => Object.freeze({ key: n.key, label: n.label }))),
+        edges: Object.freeze(d.edges.map((e) => Object.freeze({ from: e.from, to: e.to, label: e.label }))),
+      });
+    }
     Object.freeze(this);
   }
 
@@ -327,6 +341,12 @@ export class SanitizedPrDescriptionFields {
         result: e.result,
         verified_at_sha: e.verified_at_sha,
       })),
+      ...(this.diagram === undefined ? {} : { diagram: {
+        kind: this.diagram.kind,
+        title: this.diagram.title,
+        nodes: this.diagram.nodes.map((n) => ({ key: n.key, label: n.label })),
+        edges: this.diagram.edges.map((e) => ({ from: e.from, to: e.to, label: e.label })),
+      } }),
     };
   }
 }
@@ -375,12 +395,37 @@ function decodeSize(v: PrDescriptionSize): PrDescriptionSize {
   });
 }
 
+const diagramKey = /^[a-z0-9_]{1,16}$/;
+const diagramLabel = /^[\p{L}\p{N}.,_/+'()-]+(?: [\p{L}\p{N}.,_/+'()-]+)*$/u;
+
+function isDiagramLabel(v: unknown, cap: number, optional: boolean): v is string {
+  return typeof v === "string" &&
+    (optional && v === "" || (Buffer.byteLength(v, "utf8") <= cap && diagramLabel.test(v)));
+}
+
+function isDiagram(v: unknown): v is PrDescriptionDiagram {
+  if (!isRecord(v) || (v.kind !== "flow" && v.kind !== "sequence") ||
+      !isDiagramLabel(v.title, 80, true) ||
+      !Array.isArray(v.nodes) || v.nodes.length < (v.kind === "flow" ? 3 : 2) || v.nodes.length > 12 ||
+      !Array.isArray(v.edges) || v.edges.length < 2 || v.edges.length > 20) return false;
+  const keys = new Set<string>();
+  for (const n of v.nodes) {
+    if (!isRecord(n) || typeof n.key !== "string" || !diagramKey.test(n.key) ||
+        !isDiagramLabel(n.label, 60, false) || keys.has(n.key)) return false;
+    keys.add(n.key);
+  }
+  return v.edges.every((e) => isRecord(e) && typeof e.from === "string" && typeof e.to === "string" &&
+    keys.has(e.from) && keys.has(e.to) && (v.kind !== "flow" || e.from !== e.to) &&
+    isDiagramLabel(e.label, 60, true));
+}
+
 function decodeFields(v: unknown): SanitizedPrDescriptionFields | undefined {
   const ok =
     isRecord(v) &&
     typeof v.summary === "string" &&
     isStrArray(v.changes) &&
     isStrArray(v.review_pointers) &&
+    (v.diagram === undefined || isDiagram(v.diagram)) &&
     Array.isArray(v.scope_notes) &&
     v.scope_notes.every(
       (n) =>
@@ -416,6 +461,7 @@ function decodeVersion(v: unknown): PrDescriptionVersionDTO | undefined {
     typeof v.target_branch !== "string" ||
     (source !== "generated" && source !== "lead_only" && source !== "deterministic_only") ||
     !isStrOrNull(v.rendered_region_sha256) ||
+    !(v.region_has_diagram === null || typeof v.region_has_diagram === "boolean") ||
     (state !== "pending" && state !== "published" && state !== "abandoned") ||
     typeof v.created_at !== "string" ||
     !isStrOrNull(v.published_at)
@@ -434,6 +480,7 @@ function decodeVersion(v: unknown): PrDescriptionVersionDTO | undefined {
     target_branch: v.target_branch,
     source,
     rendered_region_sha256: v.rendered_region_sha256,
+    region_has_diagram: v.region_has_diagram,
     state,
     created_at: v.created_at,
     published_at: v.published_at,

@@ -86,11 +86,13 @@ func (f *prDescFakeStore) GetPrDescriptionVersionForRunForUpdate(_ context.Conte
 
 func (f *prDescFakeStore) BindPrDescriptionVersion(_ context.Context, a store.BindPrDescriptionVersionParams) (store.PrDescriptionVersion, error) {
 	v, ok := f.versions[a.ID]
-	if !ok || v.RunID != a.RunID || v.State != "pending" || (v.MrIid.Valid && v.MrIid.Int64 != a.MrIid) {
+	if !ok || v.RunID != a.RunID || v.State != "pending" || (v.MrIid.Valid && v.MrIid.Int64 != a.MrIid) ||
+		(v.RenderedRegionSha256.Valid && (v.RenderedRegionSha256.String != a.RenderedRegionSha256 || v.RegionHasDiagram != a.RegionHasDiagram)) {
 		return store.PrDescriptionVersion{}, pgx.ErrNoRows
 	}
 	v.MrIid = pgtype.Int8{Int64: a.MrIid, Valid: true}
 	v.RenderedRegionSha256 = pgtype.Text{String: a.RenderedRegionSha256, Valid: true}
+	v.RegionHasDiagram = a.RegionHasDiagram
 	f.versions[v.ID] = v
 	return v, nil
 }
@@ -336,6 +338,8 @@ func prDescReason(t *testing.T, rec *httptest.ResponseRecorder) string {
 	return body.Reason
 }
 
+func prDescBool(v bool) *bool { return &v }
+
 const (
 	prDescHashA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	prDescHashB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -408,8 +412,20 @@ func TestWorkerPrDescriptionSeamThroughRouter(t *testing.T) {
 	if bound.PR.MrIid != 41 || bound.PR.LockVersion != 0 || bound.PR.PublishedVersion != nil || bound.PR.LastOutcome != nil {
 		t.Fatalf("bind pr state = %+v", bound.PR)
 	}
-	if bound.Version.MrIid == nil || *bound.Version.MrIid != 41 || *bound.Version.RenderedRegionSha256 != prDescHashA {
+	if bound.Version.MrIid == nil || *bound.Version.MrIid != 41 || *bound.Version.RenderedRegionSha256 != prDescHashA || bound.Version.RegionHasDiagram != nil {
 		t.Fatalf("bound version = %+v", bound.Version)
+	}
+	rec = prDescPost(t, router, runID, "bind", apitypes.PrDescriptionBindRequest{
+		ClaimGeneration: i64(3), VersionID: v.ID, MrIid: 41, RenderedRegionSha256: prDescHashA,
+	}, &bound)
+	if rec.Code != http.StatusOK || bound.Version.RegionHasDiagram != nil {
+		t.Fatalf("absent flag bind retry = %d %+v", rec.Code, bound.Version)
+	}
+	rec = prDescPost(t, router, runID, "bind", apitypes.PrDescriptionBindRequest{
+		ClaimGeneration: i64(3), VersionID: v.ID, MrIid: 41, RenderedRegionSha256: prDescHashA, RegionHasDiagram: prDescBool(false),
+	}, nil)
+	if rec.Code != http.StatusConflict || prDescReason(t, rec) != "version_conflict" {
+		t.Fatalf("flag change after bind = %d %s", rec.Code, rec.Body.String())
 	}
 
 	// Lookup before the ack: the forge region matches a PENDING version (a lost ack).
@@ -532,6 +548,15 @@ func TestWorkerPrDescriptionValidation(t *testing.T) {
 		}), http.StatusBadRequest},
 		{"change over raw cap", mut(func(b *apitypes.PrDescriptionStageRequest) {
 			b.Fields.Changes = []string{strings.Repeat("c", workersvc.MaxPrDescItemRawBytes+1)}
+		}), http.StatusBadRequest},
+		{"diagram title over raw cap", mut(func(b *apitypes.PrDescriptionStageRequest) {
+			b.Fields.Diagram = &apitypes.PrDescriptionDiagram{Title: strings.Repeat("t", workersvc.MaxPrDescDiagramRawLabelBytes+1)}
+		}), http.StatusBadRequest},
+		{"diagram node label over raw cap", mut(func(b *apitypes.PrDescriptionStageRequest) {
+			b.Fields.Diagram = &apitypes.PrDescriptionDiagram{Nodes: []apitypes.PrDescriptionDiagramNode{{Key: "a", Label: strings.Repeat("n", workersvc.MaxPrDescDiagramRawLabelBytes+1)}}}
+		}), http.StatusBadRequest},
+		{"diagram edge count over raw cap", mut(func(b *apitypes.PrDescriptionStageRequest) {
+			b.Fields.Diagram = &apitypes.PrDescriptionDiagram{Edges: make([]apitypes.PrDescriptionDiagramEdge, workersvc.MaxPrDescDiagramRawEntries+1)}
 		}), http.StatusBadRequest},
 		{"unknown source", mut(func(b *apitypes.PrDescriptionStageRequest) { b.Source = "model" }), http.StatusBadRequest},
 		{"bad head sha", mut(func(b *apitypes.PrDescriptionStageRequest) { b.HeadSha = "not-a-sha" }), http.StatusBadRequest},

@@ -38,18 +38,21 @@ func (q *Queries) AbandonStalePrDescriptionVersionsForRun(ctx context.Context, a
 
 const bindPrDescriptionVersion = `-- name: BindPrDescriptionVersion :one
 UPDATE pr_description_versions
-SET mr_iid = $1::bigint, rendered_region_sha256 = $2::text
-WHERE id = $3 AND run_id = $4 AND state = 'pending'
+SET mr_iid = $1::bigint, rendered_region_sha256 = $2::text,
+    region_has_diagram = $3::boolean
+WHERE id = $4 AND run_id = $5 AND state = 'pending'
   AND (mr_iid IS NULL OR mr_iid = $1::bigint)
   AND (rendered_region_sha256 IS NULL OR rendered_region_sha256 = $2::text)
-RETURNING id, run_id, claim_generation, repo_id, mr_iid, fields, size, base_sha, head_sha, target_branch, source, rendered_region_sha256, state, created_at, published_at
+  AND (rendered_region_sha256 IS NULL OR region_has_diagram IS NOT DISTINCT FROM $3::boolean)
+RETURNING id, run_id, claim_generation, repo_id, mr_iid, fields, size, base_sha, head_sha, target_branch, source, rendered_region_sha256, state, created_at, published_at, region_has_diagram
 `
 
 type BindPrDescriptionVersionParams struct {
-	MrIid                int64     `json:"mr_iid"`
-	RenderedRegionSha256 string    `json:"rendered_region_sha256"`
-	ID                   uuid.UUID `json:"id"`
-	RunID                uuid.UUID `json:"run_id"`
+	MrIid                int64       `json:"mr_iid"`
+	RenderedRegionSha256 string      `json:"rendered_region_sha256"`
+	RegionHasDiagram     pgtype.Bool `json:"region_has_diagram"`
+	ID                   uuid.UUID   `json:"id"`
+	RunID                uuid.UUID   `json:"run_id"`
 }
 
 // Bind a pending version to its PR and record the hash of the exact region text the renderer
@@ -61,6 +64,7 @@ func (q *Queries) BindPrDescriptionVersion(ctx context.Context, arg BindPrDescri
 	row := q.db.QueryRow(ctx, bindPrDescriptionVersion,
 		arg.MrIid,
 		arg.RenderedRegionSha256,
+		arg.RegionHasDiagram,
 		arg.ID,
 		arg.RunID,
 	)
@@ -81,6 +85,7 @@ func (q *Queries) BindPrDescriptionVersion(ctx context.Context, arg BindPrDescri
 		&i.State,
 		&i.CreatedAt,
 		&i.PublishedAt,
+		&i.RegionHasDiagram,
 	)
 	return i, err
 }
@@ -135,7 +140,7 @@ func (q *Queries) EnsurePrDescription(ctx context.Context, arg EnsurePrDescripti
 }
 
 const findPrDescriptionVersionByRegionHash = `-- name: FindPrDescriptionVersionByRegionHash :one
-SELECT id, run_id, claim_generation, repo_id, mr_iid, fields, size, base_sha, head_sha, target_branch, source, rendered_region_sha256, state, created_at, published_at FROM pr_description_versions
+SELECT id, run_id, claim_generation, repo_id, mr_iid, fields, size, base_sha, head_sha, target_branch, source, rendered_region_sha256, state, created_at, published_at, region_has_diagram FROM pr_description_versions
 WHERE repo_id = $1 AND mr_iid = $2::bigint AND state = $3::text
   AND rendered_region_sha256 = $4::text
 ORDER BY created_at DESC, id DESC
@@ -176,6 +181,7 @@ func (q *Queries) FindPrDescriptionVersionByRegionHash(ctx context.Context, arg 
 		&i.State,
 		&i.CreatedAt,
 		&i.PublishedAt,
+		&i.RegionHasDiagram,
 	)
 	return i, err
 }
@@ -243,7 +249,7 @@ func (q *Queries) GetPrDescriptionForUpdate(ctx context.Context, arg GetPrDescri
 }
 
 const getPrDescriptionVersionByID = `-- name: GetPrDescriptionVersionByID :one
-SELECT id, run_id, claim_generation, repo_id, mr_iid, fields, size, base_sha, head_sha, target_branch, source, rendered_region_sha256, state, created_at, published_at FROM pr_description_versions WHERE id = $1
+SELECT id, run_id, claim_generation, repo_id, mr_iid, fields, size, base_sha, head_sha, target_branch, source, rendered_region_sha256, state, created_at, published_at, region_has_diagram FROM pr_description_versions WHERE id = $1
 `
 
 func (q *Queries) GetPrDescriptionVersionByID(ctx context.Context, id uuid.UUID) (PrDescriptionVersion, error) {
@@ -265,12 +271,13 @@ func (q *Queries) GetPrDescriptionVersionByID(ctx context.Context, id uuid.UUID)
 		&i.State,
 		&i.CreatedAt,
 		&i.PublishedAt,
+		&i.RegionHasDiagram,
 	)
 	return i, err
 }
 
 const getPrDescriptionVersionForRunForUpdate = `-- name: GetPrDescriptionVersionForRunForUpdate :one
-SELECT id, run_id, claim_generation, repo_id, mr_iid, fields, size, base_sha, head_sha, target_branch, source, rendered_region_sha256, state, created_at, published_at FROM pr_description_versions WHERE id = $1 AND run_id = $2 FOR UPDATE
+SELECT id, run_id, claim_generation, repo_id, mr_iid, fields, size, base_sha, head_sha, target_branch, source, rendered_region_sha256, state, created_at, published_at, region_has_diagram FROM pr_description_versions WHERE id = $1 AND run_id = $2 FOR UPDATE
 `
 
 type GetPrDescriptionVersionForRunForUpdateParams struct {
@@ -298,6 +305,7 @@ func (q *Queries) GetPrDescriptionVersionForRunForUpdate(ctx context.Context, ar
 		&i.State,
 		&i.CreatedAt,
 		&i.PublishedAt,
+		&i.RegionHasDiagram,
 	)
 	return i, err
 }
@@ -311,7 +319,7 @@ INSERT INTO pr_description_versions (
     $1, $2, $3, $4, $5, $6,
     $7, $8, $9, $10
 )
-RETURNING id, run_id, claim_generation, repo_id, mr_iid, fields, size, base_sha, head_sha, target_branch, source, rendered_region_sha256, state, created_at, published_at
+RETURNING id, run_id, claim_generation, repo_id, mr_iid, fields, size, base_sha, head_sha, target_branch, source, rendered_region_sha256, state, created_at, published_at, region_has_diagram
 `
 
 type InsertPrDescriptionVersionParams struct {
@@ -363,12 +371,13 @@ func (q *Queries) InsertPrDescriptionVersion(ctx context.Context, arg InsertPrDe
 		&i.State,
 		&i.CreatedAt,
 		&i.PublishedAt,
+		&i.RegionHasDiagram,
 	)
 	return i, err
 }
 
 const latestBoundPrDescriptionVersionForRun = `-- name: LatestBoundPrDescriptionVersionForRun :one
-SELECT id, run_id, claim_generation, repo_id, mr_iid, fields, size, base_sha, head_sha, target_branch, source, rendered_region_sha256, state, created_at, published_at FROM pr_description_versions
+SELECT id, run_id, claim_generation, repo_id, mr_iid, fields, size, base_sha, head_sha, target_branch, source, rendered_region_sha256, state, created_at, published_at, region_has_diagram FROM pr_description_versions
 WHERE run_id = $1 AND mr_iid IS NOT NULL
 ORDER BY created_at DESC, id DESC
 LIMIT 1
@@ -395,6 +404,7 @@ func (q *Queries) LatestBoundPrDescriptionVersionForRun(ctx context.Context, run
 		&i.State,
 		&i.CreatedAt,
 		&i.PublishedAt,
+		&i.RegionHasDiagram,
 	)
 	return i, err
 }

@@ -25,6 +25,7 @@ interface Version {
   target_branch: string;
   source: string;
   rendered_region_sha256: string | null;
+  region_has_diagram: boolean | null;
   state: "pending" | "published" | "abandoned";
   created_at: string;
   published_at: string | null;
@@ -53,7 +54,33 @@ function sanitize(s: unknown): string {
     .replace(/\b(clos|fix|resolv|implement)/giu, (m) => `${m[0]}${ZW}${m.slice(1)}`);
 }
 
+function sanitizeDiagram(raw: unknown): Json | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const d = raw as Json;
+  if ((d.kind !== "flow" && d.kind !== "sequence") || !Array.isArray(d.nodes) || !Array.isArray(d.edges)) return undefined;
+  if (d.nodes.length < (d.kind === "flow" ? 3 : 2) || d.nodes.length > 12 || d.edges.length < 2 || d.edges.length > 20) return undefined;
+  // Narrow D4 stand-in for the hostile editor fixture. The API owns the full directive scan.
+  const labels = [d.title, ...(d.nodes as Json[]).map((n) => n.label), ...(d.edges as Json[]).map((e) => e.label)];
+  if (labels.some((v) => typeof v === "string" && /\bFixes\s+#1\b/iu.test(v))) return undefined;
+  const label = (v: unknown, max: number): string => {
+    const clean = String(v ?? "").replace(/[^\p{L}\p{N} .,\-_/+'()]/gu, " ").replace(/\s+/gu, " ").trim();
+    let out = "";
+    for (const ch of clean) {
+      if (Buffer.byteLength(out + ch) > max) break;
+      out += ch;
+    }
+    return out.trim();
+  };
+  const nodes = (d.nodes as Json[]).map((n) => ({ key: n.key, label: label(n.label, 60) }));
+  const keys = new Set(nodes.map((n) => n.key));
+  if (nodes.some((n) => typeof n.key !== "string" || !/^[a-z0-9_]{1,16}$/.test(n.key) || !n.label) || keys.size !== nodes.length) return undefined;
+  const edges = (d.edges as Json[]).map((e) => ({ from: e.from, to: e.to, label: label(e.label, 60) }));
+  if (edges.some((e) => !keys.has(e.from) || !keys.has(e.to) || (d.kind === "flow" && e.from === e.to))) return undefined;
+  return { kind: d.kind, title: label(d.title, 80), nodes, edges };
+}
+
 function sanitizeFields(f: Json): Json {
+  const diagram = sanitizeDiagram(f.diagram);
   const list = (v: unknown): string[] => (Array.isArray(v) ? v.map(sanitize) : []);
   return {
     summary: sanitize(f.summary),
@@ -62,6 +89,7 @@ function sanitizeFields(f: Json): Json {
       ? (f.scope_notes as Json[]).map((n) => ({ kind: n.kind, text: sanitize(n.text) }))
       : [],
     review_pointers: list(f.review_pointers),
+    ...(diagram ? { diagram } : {}),
     verification: Array.isArray(f.verification)
       ? (f.verification as Json[]).map((v) => ({ command: sanitize(v.command), result: v.result, verified_at_sha: v.verified_at_sha }))
       : [],
@@ -94,6 +122,7 @@ export class FakePrDescApi {
       target_branch: "main",
       source: "generated",
       rendered_region_sha256: region.sha256,
+      region_has_diagram: region.fields?.diagram ? true : false,
       state: "published",
       created_at: "2026-09-27T10:00:00Z",
       published_at: "2026-09-27T10:00:00Z",
@@ -108,7 +137,7 @@ export class FakePrDescApi {
     const pr = this.prs.get(mrIid);
     if (!pr) return null;
     const pub = pr.published_version_id ? this.versions.get(pr.published_version_id) : undefined;
-    return { mr_iid: pr.mr_iid, lock_version: pr.lock_version, last_outcome: pr.last_outcome, published_version: pub ? { ...pub } : null };
+    return { mr_iid: pr.mr_iid, lock_version: pr.lock_version, last_outcome: pr.last_outcome, diagram_published: pub?.region_has_diagram === true, published_version: pub ? { ...pub } : null };
   }
 
   acks(): string[] {
@@ -133,6 +162,7 @@ export class FakePrDescApi {
           target_branch: String(body.target_branch),
           source: String(body.source),
           rendered_region_sha256: null,
+          region_has_diagram: null,
           state: "pending",
           created_at: "2026-09-27T10:00:00Z",
           published_at: null,
@@ -145,11 +175,14 @@ export class FakePrDescApi {
         const mrIid = Number(body.mr_iid);
         if (!v) return { status: 404, body: { error: "not found" } };
         if (v.state !== "pending" || (v.mr_iid !== null && v.mr_iid !== mrIid)) return this.conflict("version_conflict");
-        if (v.rendered_region_sha256 !== null && v.rendered_region_sha256 !== body.rendered_region_sha256) {
+        const hasDiagram = typeof body.region_has_diagram === "boolean" ? body.region_has_diagram : null;
+        if (v.rendered_region_sha256 !== null &&
+            (v.rendered_region_sha256 !== body.rendered_region_sha256 || v.region_has_diagram !== hasDiagram)) {
           return this.conflict("version_conflict");
         }
         v.mr_iid = mrIid;
         v.rendered_region_sha256 = String(body.rendered_region_sha256);
+        v.region_has_diagram = hasDiagram;
         if (!this.prs.has(mrIid)) this.prs.set(mrIid, { mr_iid: mrIid, lock_version: 0, last_outcome: null, published_version_id: null });
         return { status: 200, body: { version: { ...v }, pr: this.state(mrIid) } };
       }

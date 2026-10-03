@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { SanitizedPrDescriptionFields, WorkerClient } from "../src/client.js";
 import {
   BODY_CAP_CHARS,
@@ -54,13 +55,16 @@ async function mint(fields: Partial<RawPrDescriptionFields>): Promise<SanitizedP
       run_id: "11111111-2222-3333-4444-555555555555",
       claim_generation: 1,
       mr_iid: null,
-      fields: { summary: "", changes: [], scope_notes: [], review_pointers: [], verification: [], ...fields },
+      fields: { summary: "", changes: [], scope_notes: [], review_pointers: [], verification: [], ...fields,
+        ...(fields.diagram ? { diagram: { ...fields.diagram, title: fields.diagram.title ?? "", edges: fields.diagram.edges.map((edge) => ({ ...edge, label: edge.label ?? "" })) } } : {}),
+      },
       size: null,
       base_sha: "a".repeat(40),
       head_sha: HEAD,
       target_branch: "main",
       source: "generated",
       rendered_region_sha256: null,
+      region_has_diagram: null,
       state: "pending",
       created_at: "2026-09-27T10:00:00Z",
       published_at: null,
@@ -211,6 +215,66 @@ describe("renderRegion (D5, D8, D12)", () => {
     const ok = renderRegion({ sizeLine: SIZE }, small);
     assert.equal(ok.withFields, true);
     assert.ok(Buffer.byteLength(ok.text) <= REGION_CAP_BYTES);
+  });
+});
+
+describe("diagram regions (PRD #1840 D5/D6/D9)", () => {
+  const table = ["**Size:** 3 files", "", "| Category | Added | Deleted |", "|:---------|------:|--------:|", "| Code | +3 | −1 |", "| **Total** | **+3** | **−1** |"].join("\n");
+  const nodes = [{ key: "lead", label: "Lead" }, { key: "editor", label: "Editor" }, { key: "api", label: "API" }];
+  const cases = [
+    ["flow", { kind: "flow", title: "Delivery flow", nodes, edges: [{ from: "lead", to: "editor" }, { from: "editor", to: "api", label: "sanitized fields" }] }],
+    ["sequence-two", { kind: "sequence", nodes: nodes.slice(1), edges: [{ from: "editor", to: "api", label: "stage" }, { from: "api", to: "editor" }] }],
+    ["sequence-many", { kind: "sequence", nodes, edges: [{ from: "lead", to: "editor", label: "request" }, { from: "editor", to: "api", label: "stage" }] }],
+    ["sequence-end", { kind: "sequence", nodes: [{ key: "lead", label: "end" }, { key: "editor", label: "THE END" }], edges: [{ from: "lead", to: "editor", label: "end" }, { from: "editor", to: "lead" }] }],
+    ["unicode", { kind: "flow", nodes: [{ key: "lead", label: "Résumé" }, { key: "editor", label: "変更" }, { key: "api", label: "مرحبا" }], edges: [{ from: "lead", to: "editor", label: "更新" }, { from: "editor", to: "api" }] }],
+  ] as const;
+  for (const [name, diagram] of cases) {
+    it(`matches the full-region ${name} golden`, async () => {
+      const fields = await mint({ summary: "Diagram summary.", changes: ["One change."], diagram: { ...diagram, nodes: [...diagram.nodes], edges: [...diagram.edges] } });
+      const region = renderRegion({ sizeLine: table, source: "generated" }, fields).text;
+      const golden = await readFile(new URL(`../../fixtures/pr-diagram/${name}.md`, import.meta.url), "utf8");
+      assert.equal(region + "\n", golden);
+      assert.ok(region.includes(table));
+      assert.equal(closingDirectiveFor(region, 7, "o/r"), false);
+      const body = renderBody(region, renderCompletionBlock({ issueIid: 7, branch: "agent/issue-7", closes: false }));
+      const parsed = parseOwnedBlocks(body);
+      assert.equal(parsed.kind === "ok" && parsed.region, region);
+      assert.equal(parsed.kind === "ok" && parsed.completion !== undefined, true);
+      assert.notEqual(regionSha256(region), regionSha256(renderRegion({ sizeLine: table, source: "generated" }, await mint({ summary: "Diagram summary.", changes: ["One change."] })).text));
+    });
+  }
+  it("keeps an API-valid flow node even when no edge refers to it", async () => {
+    const fields = await mint({ diagram: { kind: "flow", nodes, edges: [
+      { from: "lead", to: "editor" }, { from: "editor", to: "lead" },
+    ] } });
+    const region = renderRegion({ sizeLine: table }, fields).text;
+    assert.match(region, /\n  n3\["API"\]\n/u);
+    assert.match(region, /\n  n1\["Lead"\] --> n2\["Editor"\]\n/u);
+  });
+
+  it("emits exactly 1,500 UTF-8 bytes and omits a larger Mermaid source", async () => {
+    const edges = Array.from({ length: 20 }, () => ({ from: "worker", to: "api", label: "a".repeat(59) }));
+    const diagram = { kind: "sequence" as const, nodes: [{ key: "worker", label: "Worker12345678901234" }, { key: "api", label: "API" }], edges };
+    const fields = await mint({ summary: "Diagram summary.", changes: ["One change."], diagram });
+    const region = renderRegion({ sizeLine: table }, fields).text;
+    const golden = await readFile(new URL("../../fixtures/pr-diagram/max-size.md", import.meta.url), "utf8");
+    assert.equal(region + "\n", golden);
+    const source = region.match(/```mermaid\n([\s\S]*?)\n```/u)?.[1];
+    assert.ok(source);
+    assert.equal(Buffer.byteLength(source, "utf8"), 1500);
+    assert.equal(closingDirectiveFor(region, 7, "o/r"), false);
+    assert.equal((parseOwnedBlocks(renderBody(region, renderCompletionBlock({ issueIid: 7, branch: "agent/issue-7", closes: false }))) as OwnedBlocks).region, region);
+    const over = await mint({ diagram: { ...diagram, nodes: [{ key: "worker", label: "Worker123456789012345" }, diagram.nodes[1]!] } });
+    assert.doesNotMatch(renderRegion({ sizeLine: table }, over).text, /```mermaid/u);
+  });
+
+  it("retries a region over 6 KiB without its diagram and keeps the size table", async () => {
+    const fields = await mint({ summary: "x".repeat(5850), changes: ["One change."], diagram: { ...cases[0]![1], nodes: [...cases[0]![1].nodes], edges: [...cases[0]![1].edges] } });
+    const full = renderRegion({ sizeLine: table }, fields);
+    assert.equal(full.withFields, true);
+    assert.equal(full.text.includes("```mermaid"), false);
+    assert.ok(full.text.includes("x".repeat(5850)));
+    assert.ok(full.text.includes(table));
   });
 });
 

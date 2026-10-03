@@ -2851,6 +2851,25 @@ export interface PrDescriptionVerification {
   verified_at_sha: string;
 }
 
+/** Go: apitypes.PrDescriptionDiagram. Optional bounded flow or sequence graph. */
+export interface PrDescriptionDiagram {
+  kind: "flow" | "sequence";
+  title?: string;
+  nodes: PrDescriptionDiagramNode[];
+  edges: PrDescriptionDiagramEdge[];
+}
+
+export interface PrDescriptionDiagramNode {
+  key: string;
+  label: string;
+}
+
+export interface PrDescriptionDiagramEdge {
+  from: string;
+  to: string;
+  label?: string;
+}
+
 /** Go: apitypes.PrDescriptionFields. The model- or lead-authored part of a PR description, as a
  *  bare shape. Use {@link RawPrDescriptionFields} or {@link SanitizedPrDescriptionFields}. */
 interface PrDescriptionFields {
@@ -2859,6 +2878,7 @@ interface PrDescriptionFields {
   scope_notes: PrDescriptionScopeNote[];
   review_pointers: string[];
   verification: PrDescriptionVerification[];
+  diagram?: PrDescriptionDiagram;
 }
 
 /** RAW fields: model- or lead-authored text the api has NOT sanitized yet. Only a stage request
@@ -2909,6 +2929,7 @@ export interface PrDescriptionVersionDTO {
   target_branch: string;
   source: PrDescriptionSource;
   rendered_region_sha256: string | null;
+  region_has_diagram: boolean | null;
   state: PrDescriptionVersionState;
   created_at: string;
   published_at: string | null;
@@ -2977,6 +2998,7 @@ export interface PrDescriptionBindRequest {
   version_id: string;
   mr_iid: number;
   rendered_region_sha256: string;
+  region_has_diagram?: boolean;
 }
 
 /** Go: apitypes.PrDescriptionBindResponse. The bound version plus the PR's current state. */

@@ -2638,6 +2638,12 @@ export interface PrDescriptionFields {
   scope_notes: { kind: string; text: string }[];
   review_pointers: string[];
   verification: { command: string; result: string; verified_at_sha: string }[];
+  diagram?: {
+    kind: string;
+    title: string;
+    nodes: { key: string; label: string }[];
+    edges: { from: string; to: string; label: string }[];
+  };
 }
 
 /** PRD #1798: `Run.pr_description`, the published version of the run's PR. */
@@ -2650,6 +2656,7 @@ export interface RunPrDescription {
   head_sha: string;
   target_branch: string;
   published_at: string | null;
+  diagram_published: boolean;
 }
 
 export interface Run {

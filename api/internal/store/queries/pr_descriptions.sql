@@ -26,10 +26,12 @@ SELECT * FROM pr_description_versions WHERE id = @id AND run_id = @run_id FOR UP
 -- needs a new staged version, since the recorded hash may already be on the forge with only its
 -- ack lost). The service checks both before calling; these guards are the backstop.
 UPDATE pr_description_versions
-SET mr_iid = @mr_iid::bigint, rendered_region_sha256 = @rendered_region_sha256::text
+SET mr_iid = @mr_iid::bigint, rendered_region_sha256 = @rendered_region_sha256::text,
+    region_has_diagram = sqlc.narg('region_has_diagram')::boolean
 WHERE id = @id AND run_id = @run_id AND state = 'pending'
   AND (mr_iid IS NULL OR mr_iid = @mr_iid::bigint)
   AND (rendered_region_sha256 IS NULL OR rendered_region_sha256 = @rendered_region_sha256::text)
+  AND (rendered_region_sha256 IS NULL OR region_has_diagram IS NOT DISTINCT FROM sqlc.narg('region_has_diagram')::boolean)
 RETURNING *;
 
 -- name: EnsurePrDescription :exec

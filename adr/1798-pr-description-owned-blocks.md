@@ -60,6 +60,21 @@ Issue text, PRD text, the plan, the lead's own claims, and diff content are all 
 
 An `mr_rework` run, or a `ci_fix` that adopts an existing agent branch rather than opening a fresh one, refreshes the description region against the whole PR diff (not only its own commits) but never touches the completion block's closing decision: it replaces only the staleness line inside the existing completion block. **A refresh never falls back to a whole-body rewrite**, unlike an `own`-mode publication under I1: a PR with no uzi markers is left untouched (`legacyUntouched`), malformed markers skip the write entirely, and a missing completion block simply stays missing — none of these compose a replacement body. A refresh run therefore cannot turn a non-closing PR into a closing one, or vice versa, by the act of refreshing it.
 
+## Addendum (2026-10-02): PRD #1840 diagrams
+
+[PRD #1840](../prds/1840-pr-description-diagrams.md) D1 makes a diagram ordinary content inside I1's existing
+description region, after "What changed" and before "Verification"; it
+creates no third owned block and inherits I1's edit protection and
+precedence. The grounded editor returns structured nodes and edges, never
+Mermaid syntax. The renderer alone emits the fenced Mermaid source from the
+api-sanitized fields (I3). The api normalizes labels, limits their characters,
+and rejects a whole diagram containing a closing directive or mention;
+I5's whole-body closing scan still applies. Lead-only and deterministic
+fallbacks contain no diagram. The published region's bind-time flag governs
+whether web and CLI show a plain-text outline, including after lost-ack
+recovery. The diagram is dropped before the computed size table when either
+region or body caps require it.
+
 ## Amends ADR-1225
 
 ADR-1225's I4 states: "If the add itself fails the run **holds** rather than reporting completion." This PRD narrows that: if the `Closes #N` add cannot be *confirmed* — the write fails, the confirming re-read fails, or the PR's head moves between the write and the re-read — uzi strips `Closes` back out. The run holds when that strip is *confirmed*, or when the MR was unreadable and the strip fell back to writing the non-closing body *blind* (no re-read, but no closing directive by construction). It fails closed rather than holding only when the strip write is refused, or is written but a confirming re-read shows it did not land. See ADR-1225's own addendum for the amendment note pointing back here.

@@ -184,6 +184,65 @@ func TestRenderRunDetailPrDescription(t *testing.T) {
 	}
 }
 
+func TestRenderRunDetailPrDescriptionDiagram(t *testing.T) {
+	diagram := &apitypes.PrDescriptionDiagram{
+		Nodes: []apitypes.PrDescriptionDiagramNode{
+			{Key: "editor", Label: "Editor pass"},
+			{Key: "api", Label: "API"},
+			{Key: "forge", Label: "Forge"},
+		},
+		Edges: []apitypes.PrDescriptionDiagramEdge{
+			{From: "editor", To: "api", Label: "sanitized fields"},
+			{From: "api", To: "forge"},
+		},
+	}
+	d := &apitypes.RunPrDescriptionDTO{
+		DiagramPublished: true,
+		Fields:           apitypes.PrDescriptionFields{Diagram: diagram},
+	}
+	out := renderDetail(t, prDescRun(d, nil))
+	first := "Editor pass → API: sanitized fields"
+	second := "API → Forge"
+	if strings.Count(out, "DIAGRAM") != 2 || strings.Count(out, first) != 1 || strings.Count(out, second) != 1 ||
+		strings.Index(out, first) > strings.Index(out, second) {
+		t.Errorf("published diagram edges must appear once each in order, got:\n%s", out)
+	}
+
+	d.DiagramPublished = false
+	if out := renderDetail(t, prDescRun(d, nil)); strings.Contains(out, "DIAGRAM") || strings.Contains(out, first) {
+		t.Errorf("unpublished diagram must be hidden, got:\n%s", out)
+	}
+	d.DiagramPublished = true
+	d.Fields.Diagram = nil
+	if out := renderDetail(t, prDescRun(d, nil)); strings.Contains(out, "DIAGRAM") {
+		t.Errorf("missing diagram must have no outline, got:\n%s", out)
+	}
+}
+
+func TestRenderRunDetailPrDescriptionDiagramHostile(t *testing.T) {
+	d := &apitypes.RunPrDescriptionDTO{
+		DiagramPublished: true,
+		Fields: apitypes.PrDescriptionFields{Diagram: &apitypes.PrDescriptionDiagram{
+			Nodes: []apitypes.PrDescriptionDiagramNode{
+				{Key: "a", Label: "Start &lt;x&gt;\x1b[31m"},
+				{Key: "b", Label: "End\u202e"},
+			},
+			Edges: []apitypes.PrDescriptionDiagramEdge{
+				{From: "a", To: "b", Label: "go\n\\[now\\]\u200b"},
+			},
+		}},
+	}
+	out := renderDetail(t, prDescRun(d, nil))
+	if !strings.Contains(out, "Start <x>") || !strings.Contains(out, "End: go [now]") {
+		t.Errorf("diagram labels must be displayed as text, got:\n%q", out)
+	}
+	for _, bad := range []string{"\x1b", "\u202e", "\u200b", "&lt;", "\ngo"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("hostile diagram text reached terminal carrying %q, got:\n%q", bad, out)
+		}
+	}
+}
+
 // TestRenderRunDetailPrDescriptionHostile: the summary is untrusted; after the display unescape
 // it still goes through cellText, so an ANSI escape, a bidi override and a newline never reach
 // the terminal, while the (inert, in a terminal) `<script>` and `Closes #1` text is shown as is.

@@ -69,6 +69,11 @@ const CTX: DeliveryContext = {
   truncated: { issue: false, prd: false, plan: false, previous: false, claims: false, commits: false, paths: false, diff: false },
   bytes: 0,
 };
+const DIAGRAM = {
+  kind: "sequence" as const,
+  nodes: [{ key: "worker", label: "Worker" }, { key: "api", label: "API" }],
+  edges: [{ from: "worker", to: "api", label: "stage" }, { from: "api", to: "worker", label: "ack" }],
+};
 const SUMMARY: DeliverySummary = {
   summary: "Reviewers can now mark a finding done from the Findings page.",
   changes: ["Web: a Mark done button on each row."],
@@ -299,6 +304,136 @@ const OLD_REGION = [REGION_START, "An older summary of this PR.", "", SIZE_LINE,
 // ── Step 1 and the fallback ladder (D8) ──────────────────────────────────────────────────────
 
 describe("publisher: staging and the fallback ladder (D8)", () => {
+  it("the fake bind records an optional diagram flag and rejects a changed flag or hash", async () => {
+    const r = rig(new FakePass({ ...SUMMARY, diagram: DIAGRAM }));
+    await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    const version = [...api.versions.values()][0]!;
+    assert.equal(version.region_has_diagram, null);
+    assert.deepEqual(version.fields.diagram, { ...DIAGRAM, title: "" });
+    const body = { version_id: version.id, mr_iid: MR, rendered_region_sha256: "a".repeat(64), region_has_diagram: true };
+    assert.equal(api.handle("bind", RUN, body).status, 200);
+    assert.equal(version.region_has_diagram, true);
+    assert.equal(api.state(MR)?.diagram_published, false);
+    assert.equal(api.handle("bind", RUN, { ...body, region_has_diagram: false }).status, 409);
+    assert.equal(api.handle("bind", RUN, { version_id: version.id, mr_iid: MR, rendered_region_sha256: body.rendered_region_sha256 }).status, 409);
+    assert.equal(api.handle("bind", RUN, { ...body, rendered_region_sha256: "b".repeat(64) }).status, 409);
+  });
+
+  it("binds a diagram only when the final region contains it", async () => {
+    const r = rig(new FakePass({ ...SUMMARY, diagram: DIAGRAM }));
+    const { pub } = await newPr(r);
+    assert.ok(pub.region.includes("```mermaid\n"));
+    const bind = api.calls.find((c) => c.op === "bind")!;
+    assert.equal(bind.body.region_has_diagram, true);
+    assert.equal(bind.body.rendered_region_sha256, regionSha256(pub.region));
+    assert.equal(api.state(MR)?.diagram_published, true);
+  });
+
+  it("restages prose before bind when the body cap drops a diagram, keeping the size table", async () => {
+    const r = rig(new FakePass({ ...SUMMARY, diagram: DIAGRAM }));
+    const spec = makeSpec({ facts: async () => ({ baseSha: BASE, size: { line: SIZE_TABLE, size: SIZE } }) });
+    const pub = await r.publisher.prepare(spec, { headSha: H1, targetBranch: "main" });
+    const less = pub.region.replace(/```mermaid\n[\s\S]*?```\n\n/u, "");
+    assert.notEqual(less, pub.region);
+    const prefix = `${"p".repeat(BODY_CAP_CHARS - renderBody(less, completion(true)).length - 1)}\n`;
+    r.forge.pr.description = prefix + pub.initialBody(completion(true));
+    await pub.publish(MR);
+    assert.deepEqual(stages().map((s) => s.source), ["generated", "generated"]);
+    assert.equal((stages()[1]!.fields as { diagram?: unknown }).diagram, undefined);
+    assert.equal(api.calls.find((c) => c.op === "bind")!.body.region_has_diagram, false);
+    const parsed = parseOwnedBlocks(r.forge.pr.description);
+    assert.ok(parsed.kind === "ok" && parsed.region?.includes(SIZE_TABLE));
+    assert.equal(parsed.kind === "ok" && parsed.region?.includes("```mermaid"), false);
+    assert.equal(api.state(MR)?.diagram_published, false);
+  });
+
+  it("restages when the renderer's 6 KiB cap omits a diagram", async () => {
+    const r = rig(new FakePass({ ...SUMMARY, summary: "x".repeat(5850), diagram: DIAGRAM }));
+    const { pub } = await newPr(r);
+    assert.ok(!pub.region.includes("```mermaid"));
+    assert.ok(pub.region.includes("x".repeat(5850)));
+    assert.deepEqual(stages().map((s) => s.source), ["generated", "generated"]);
+    assert.equal((stages()[1]!.fields as { diagram?: unknown }).diagram, undefined);
+    assert.equal(api.calls.find((c) => c.op === "bind")!.body.region_has_diagram, false);
+  });
+
+  it("the closing interlock's whole-body rewrite retries without the diagram", async () => {
+    const r = rig(new FakePass({ ...SUMMARY, diagram: DIAGRAM }));
+    const pub = await r.publisher.prepare(makeSpec({ interlockIssueIid: IID, completionCloses: false }), { headSha: H1, targetBranch: "main" });
+    const less = pub.region.replace(/```mermaid\n[\s\S]*?```\n\n/u, "");
+    const base = completion(false);
+    const longCompletion = `${base}\n${"q".repeat(BODY_CAP_CHARS - renderBody(less, base).length - 1)}`;
+    const spec = makeSpec({ interlockIssueIid: IID, completionCloses: false, completion: () => longCompletion });
+    const prepared = await r.publisher.prepare(spec, { headSha: H1, targetBranch: "main" });
+    r.forge.pr.description = `Closes #7\n\n${prepared.initialBody(longCompletion)}`;
+    await prepared.publish(MR);
+    assert.ok(!r.forge.pr.description.includes("Closes #7"));
+    assert.ok(r.forge.pr.description.includes(SUMMARY.summary));
+    assert.ok(!r.forge.pr.description.includes("```mermaid"));
+    assert.equal(api.calls.filter((c) => c.op === "bind").at(-1)!.body.region_has_diagram, false);
+  });
+
+  it("initialBody tries diagram-less prose before the size-only region", async () => {
+    const r = rig(new FakePass({ ...SUMMARY, diagram: DIAGRAM }));
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    const less = pub.region.replace(/```mermaid\n[\s\S]*?```\n\n/u, "");
+    const completionText = `${completion(true)}\n${"q".repeat(BODY_CAP_CHARS - renderBody(less, completion(true)).length - 1)}`;
+    const body = pub.initialBody(completionText);
+    assert.ok(body.includes(SUMMARY.summary));
+    assert.ok(!body.includes("```mermaid"));
+    assert.ok(body.length <= BODY_CAP_CHARS);
+  });
+
+  it("a bound diagram replaced by a diagram-less recompose gets a new bind", async () => {
+    const r = rig(new FakePass({ ...SUMMARY, diagram: DIAGRAM }));
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    r.forge.pr.description = pub.initialBody(completion(true));
+    const less = pub.region.replace(/```mermaid\n[\s\S]*?```\n\n/u, "");
+    const prefix = `${"p".repeat(BODY_CAP_CHARS - renderBody(less, completion(true)).length - 1)}\n`;
+    r.forge.beforeRead = (n, pr) => { if (n === 2) pr.description = prefix + pr.description; };
+    await pub.publish(MR);
+    const binds = api.calls.filter((c) => c.op === "bind");
+    assert.deepEqual(binds.map((c) => c.body.region_has_diagram), [true, false]);
+    assert.deepEqual(stages().map((s) => s.source), ["generated", "generated"]);
+    assert.deepEqual(api.acks(), ["skipped_snapshot_moved", "published"]);
+    assert.equal(api.state(MR)?.diagram_published, false);
+  });
+
+  it("drops malformed diagrams from a custom delivery pass while retaining prose", async () => {
+    const malformed = { ...DIAGRAM, edges: [{ from: "worker", to: "missing" }, { from: "api", to: "worker", label: "ack" }] };
+    const r = rig(new FakePass({ ...SUMMARY, diagram: malformed }));
+    await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    const stage = stages().at(-1)!;
+    assert.equal(stage.source, "generated");
+    assert.equal((stage.fields as { diagram?: unknown }).diagram, undefined);
+    assert.equal((stage.fields as { summary: string }).summary, SUMMARY.summary);
+  });
+
+  it("keeps prose when the API rejects a hostile diagram label from the editor", async () => {
+    const hostile = { ...DIAGRAM, edges: [{ ...DIAGRAM.edges[0]!, label: "Fixes #1" }, DIAGRAM.edges[1]!] };
+    const r = rig(new FakePass({ ...SUMMARY, diagram: hostile }));
+    await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    const stage = stages().at(-1)!;
+    assert.equal((stage.fields as { diagram?: unknown }).diagram !== undefined, true);
+    const stored = [...api.versions.values()][0]!;
+    assert.equal(stored.fields.diagram, undefined);
+    assert.equal(stored.fields.summary, SUMMARY.summary);
+    assert.deepEqual(stored.fields.changes, SUMMARY.changes);
+  });
+
+  it("drops diagrams for docs-only and binary-only zero-code sizes, but keeps them when size is unavailable", async () => {
+    for (const [name, size, kept] of [
+      ["docs", { ...SIZE, code: ZERO, docs: { added: 3, deleted: 0 } }, false],
+      ["binary", { ...SIZE, code: ZERO }, false],
+      ["unavailable", { ...SIZE, unavailable: true, code: ZERO }, true],
+    ] as const) {
+      const r = rig(new FakePass({ ...SUMMARY, diagram: DIAGRAM }));
+      await r.publisher.prepare(makeSpec({ facts: async () => ({ baseSha: BASE, size: { line: SIZE_LINE, size } }) }), { headSha: H1, targetBranch: "main" });
+      const stage = stages().at(-1)!;
+      assert.equal((stage.fields as { diagram?: unknown }).diagram !== undefined, kept, name);
+    }
+  });
+
   it("rung 1: the editor pass stages `generated` with the lead's stamped checks, and a new PR is published as created", async () => {
     const r = rig();
     const { pub, out } = await newPr(r, makeSpec({ lead: LEAD }));
