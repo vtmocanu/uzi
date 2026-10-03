@@ -65,6 +65,7 @@ export const chatApi = {
       requeue_count: 0,
       iteration_count: 0,
       auto_approve: false,
+      plan_cross_check_required: false,
       worker_id: "w-laptop",
       branch: null,
       model: null,
