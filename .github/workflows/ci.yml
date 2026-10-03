@@ -699,7 +699,7 @@ jobs:
         # same drift the pinned zizmor/shellcheck above guard against.
         # check:semgrep-parity blocks an independent bump until the worker lock matches.
         # renovate: datasource=pypi depName=semgrep versioning=pep440
-        run: pipx install semgrep==1.172.0
+        run: pipx install semgrep==1.178.0
       - name: gate:repo (shell + yaml + formula + actions + secrets + sast)
         env:
           UZI_LINT_SHELL_REQUIRED: "1"
