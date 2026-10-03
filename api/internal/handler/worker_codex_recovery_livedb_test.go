@@ -42,6 +42,13 @@ func TestWorkerCodexRecoveryExactRepliesLiveDB(t *testing.T) {
 	router := h.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil))
 
 	ownerID, connectionID, repoID, workerID, runID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := pool.Exec(cleanupCtx, "DELETE FROM users WHERE id=$1", ownerID); err != nil {
+			t.Errorf("delete recovery fixture user %s: %v", ownerID, err)
+		}
+	})
 	mustExecT(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
 		ownerID, fmt.Sprintf("codex-route-%s@example.test", uuid.NewString()))
 	mustExecT(ctx, t, pool, `INSERT INTO forge_connections

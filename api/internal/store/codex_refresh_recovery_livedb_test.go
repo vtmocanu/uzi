@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -14,6 +15,13 @@ func TestCodexRefreshRecoveryClearersLiveDB(t *testing.T) {
 	for _, clearer := range []string{"commit", "promote", "relogin", "mismatch"} {
 		t.Run(clearer, func(t *testing.T) {
 			ctx, pool, q, user := codexLiveDB(t)
+			t.Cleanup(func() {
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if _, err := pool.Exec(cleanupCtx, "DELETE FROM users WHERE id=$1", user); err != nil {
+					t.Errorf("delete recovery fixture user %s: %v", user, err)
+				}
+			})
 			acc, err := q.InsertCodexProviderAccount(ctx, store.InsertCodexProviderAccountParams{UserID: user, ProviderUserID: uuid.NewString(), WorkspaceAccountID: uuid.NewString(), SealedLogin: []byte("login"), SealedWith: store.SealedWithMaster})
 			if err != nil {
 				t.Fatal(err)
@@ -75,6 +83,13 @@ func TestCodexRefreshRecoveryClearersLiveDB(t *testing.T) {
 
 func TestCodexRefreshRecoveryEvidenceLiveDB(t *testing.T) {
 	ctx, pool, q, user := codexLiveDB(t)
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := pool.Exec(cleanupCtx, "DELETE FROM users WHERE id=$1", user); err != nil {
+			t.Errorf("delete recovery fixture user %s: %v", user, err)
+		}
+	})
 	acc, err := q.InsertCodexProviderAccount(ctx, store.InsertCodexProviderAccountParams{UserID: user, ProviderUserID: uuid.NewString(), WorkspaceAccountID: uuid.NewString(), SealedLogin: []byte("unreadable"), SealedWith: store.SealedWithMaster})
 	if err != nil {
 		t.Fatal(err)
