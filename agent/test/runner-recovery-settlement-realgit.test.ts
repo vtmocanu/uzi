@@ -423,19 +423,25 @@ async function bootAndSettle(
   runId: string,
   outboxRoot: string,
   onPromote?: (outbox: Outbox) => void,
-  /** `slowBundleMs` delays every recovery bundle the restarted worker's boot sweep produces, so a
-   *  sweep still mid-record when the settlement journal empties is deterministic (issue #2020). */
-  /** `passes` collects every background recovery pass the worker started, and counts those that
-   *  settled, so a caller can assert they all settled before this helper returned (issue #2020). */
-  opts: { slowBundleMs?: number; bundleStarts?: { n: number }; passes?: { started: Promise<void>[]; settled: number } } = {},
+  /** Issue #2020 hooks. `bundleGate` holds every recovery bundle the restarted worker's boot sweep
+   *  produces until `release` resolves (`onStart` fires as each one is reached). `beforeDrain` runs
+   *  after the abort and before the background passes are drained, so a caller can observe a pass
+   *  still unfinished at the abort and then release the gate. `passes` collects every background
+   *  recovery pass the worker started and counts those that settled. */
+  opts: {
+    bundleGate?: { onStart: () => void; release: Promise<void> };
+    beforeDrain?: () => Promise<void>;
+    passes?: { started: Promise<void>[]; settled: number };
+  } = {},
 ): Promise<{ events: string[]; calls: FakeSettleClient["calls"]; s2: Stores }> {
   const events: string[] = [];
   const git2 = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
-  if (opts.slowBundleMs) {
+  const gate = opts.bundleGate;
+  if (gate) {
     const produce = git2.produceRecoveryBundle.bind(git2);
     git2.produceRecoveryBundle = async (...args) => {
-      if (opts.bundleStarts) opts.bundleStarts.n++;
-      await sleep(opts.slowBundleMs!);
+      gate.onStart();
+      await gate.release;
       return produce(...args);
     };
   }
@@ -487,6 +493,7 @@ async function bootAndSettle(
   } finally {
     controller.abort();
     await done;
+    if (opts.beforeDrain) await opts.beforeDrain();
     await drainBackground(background);
   }
   return { events, calls: settleClient2.calls, s2 };
@@ -630,17 +637,35 @@ describe("settlement crash boundaries (issue #1582 M2)", () => {
 
   it("the restarted worker's boot recovery sweep is drained: the journal is quiescent once bootAndSettle returns (issue #2020)", async () => {
     // Scenario (c)'s restart. Its boot sweep (fire-and-forget in Worker.run) re-bundles gen2's pinned
-    // journal record; the slowed bundle keeps that sweep mid-record past the point where the
-    // settlement journal is already empty and the worker is aborted.
+    // journal record; the gated bundle holds that sweep mid-record until after the settlement
+    // journal is empty and the worker is aborted.
     const { gen2Claim, outboxRoot, snapRoot } = await crashBeforePromotion(6203);
     fs.renameSync(fx.originPath, `${fx.originPath}.gone`);
     try {
-      const bundleStarts = { n: 0 };
+      let markStarted!: () => void;
+      const bundleStarted = new Promise<void>((resolve) => { markStarted = resolve; });
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
       const passes = { started: [] as Promise<void>[], settled: 0 };
-      await bootAndSettle(gen2Claim.run_id, outboxRoot, undefined, { slowBundleMs: 800, bundleStarts, passes });
-      // The slowed bundle exercises a pass still unfinished at the abort; the assertion checks
-      // settlement directly, so it does not depend on the delay outlasting any other wait.
-      assert.ok(passes.started.length >= 1, "precondition: the worker started a boot recovery pass");
+      let unfinishedAtAbort: boolean | undefined;
+      await bootAndSettle(gen2Claim.run_id, outboxRoot, undefined, {
+        bundleGate: { onStart: markStarted, release: released },
+        passes,
+        beforeDrain: async () => {
+          try {
+            await Promise.race([
+              bundleStarted,
+              new Promise<never>((_, reject) => {
+                setTimeout(() => reject(new Error("the boot sweep never reached bundle production")), 10_000).unref();
+              }),
+            ]);
+            unfinishedAtAbort = passes.settled < passes.started.length;
+          } finally {
+            release();
+          }
+        },
+      });
+      assert.equal(unfinishedAtAbort, true, "precondition: a boot recovery pass was still unfinished at the abort");
       assert.equal(passes.settled, passes.started.length, "every boot recovery pass settled before bootAndSettle returned");
       const tree = (): string[] => {
         const out: string[] = [];
@@ -656,7 +681,6 @@ describe("settlement crash boundaries (issue #1582 M2)", () => {
       };
       const atReturn = tree();
       await Promise.allSettled(passes.started); // any late journal write from a pass has landed
-      assert.ok(bundleStarts.n >= 1, "precondition: the boot sweep reached its (slowed) bundle production");
       assert.deepEqual(tree(), atReturn, "no recovery journal write after bootAndSettle returned");
     } finally {
       fs.renameSync(`${fx.originPath}.gone`, fx.originPath);
