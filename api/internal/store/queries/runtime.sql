@@ -1597,7 +1597,13 @@ WHERE id = @id AND user_id = @user_id;
 -- Required cross-check runs additionally match the current published payload and
 -- an applied, bound approval for its current gate revision.
 UPDATE runs SET
-    plan_cross_check_gate_reason = NULL,
+    -- Startup/recovery reports do not resolve an interrupted required plan check.
+    -- SetRunAutopilotPlan clears on canonical application; the guards below admit
+    -- a stored human plan only with its bound, applied approval.
+    plan_cross_check_gate_reason = CASE
+        WHEN plan_cross_check_required AND (auto_approve OR plan_md IS NULL)
+            THEN plan_cross_check_gate_reason
+        ELSE NULL END,
     status           = 'running',
     -- Stamped only on ENTRY to running. This statement is ALSO the running→running
     -- heartbeat (claim, post-checkout roster report, and every session-id/iteration
@@ -2322,6 +2328,7 @@ WHERE id = @id AND user_id = @user_id AND status = 'awaiting_approval'
 -- The same guarded statement freezes those fields before SetRunRunning acknowledges it.
 UPDATE runs SET
     plan_md     = @plan_md,
+    plan_cross_check_gate_reason = NULL,
     required_capabilities = CASE WHEN plan_cross_check_required THEN
         ARRAY(SELECT DISTINCT unnest(required_capabilities || sqlc.narg('inferred_capabilities')::text[]))
         ELSE required_capabilities END,

@@ -53,6 +53,7 @@ func TestPlanCrossCheckCompletionAfterParkLiveDB(t *testing.T) {
 		auto_approve = true, completion_contract_version = 1 WHERE id = $1`, f.runID)
 	rows, err := f.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
 		ID: f.runID, WorkerID: pgU(f.workerID), PlanMd: pgT("review me"),
+		ClaimGeneration: pgtype.Int8{Int64: 0, Valid: true},
 	})
 	if err != nil || rows != 1 {
 		t.Fatalf("park: rows=%d err=%v", rows, err)
@@ -182,6 +183,7 @@ func TestPlanCrossCheckSecondParkLiveDB(t *testing.T) {
 		t.Helper()
 		rows, err := f.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
 			ID: f.runID, WorkerID: pgU(f.workerID), PlanMd: pgT(plan),
+			ClaimGeneration:     pgtype.Int8{Int64: 0, Valid: true},
 			MilestonesCandidate: milestones,
 		})
 		if err != nil || rows != 1 {
@@ -241,6 +243,7 @@ func TestPlanCrossCheckSecondParkLiveDB(t *testing.T) {
 	check("same plan, changed milestones after publication", false)
 	mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'running' WHERE id = $1`, f.runID)
 	park("plan B", []byte(`[]`))
+	mustExec(ctx, t, f.pool, `UPDATE runs SET plan_cross_check_gate_reason = 'interrupted' WHERE id = $1`, f.runID)
 	resume := func(stage string, caps []string, want int64) {
 		t.Helper()
 		rows, err := f.q.SetRunRunning(ctx, store.SetRunRunningParams{
@@ -283,6 +286,13 @@ func TestPlanCrossCheckSecondParkLiveDB(t *testing.T) {
 	}
 	claimApproved("approved B", true)
 	resume("approved B with new capability", []string{"docker"}, 1)
+	var reason pgtype.Text
+	if err := f.pool.QueryRow(ctx, `SELECT plan_cross_check_gate_reason FROM runs WHERE id = $1`, f.runID).Scan(&reason); err != nil {
+		t.Fatal(err)
+	}
+	if reason.Valid {
+		t.Fatalf("applied human approval retained gate reason %q", reason.String)
+	}
 	rows, err = f.q.SetRunRunning(ctx, store.SetRunRunningParams{
 		ID: f.runID, WorkerID: pgU(f.workerID), InferredCapabilities: []string{"python"},
 		InferredTools: []string{"go"}, SizeClass: pgT("m"),
@@ -299,6 +309,96 @@ func TestPlanCrossCheckSecondParkLiveDB(t *testing.T) {
 		t.Fatalf("postapproval running report changed frozen requirements: caps=%v tools=%v size=%v", caps, tools, size)
 	}
 	check("approved B", true)
+}
+
+func TestPlanCrossCheckInterruptedReasonLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	f, done := setupAwaitingInput(ctx, t, dsn)
+	t.Cleanup(done)
+	t.Cleanup(func() {
+		mustExec(ctx, t, f.pool, `DELETE FROM users WHERE id = $1`, f.userID)
+	})
+	mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'claimed', plan_cross_check_required = true,
+		auto_approve = true, plan_source = 'agent', harness = 'claude', claim_generation = 1,
+		plan_cross_check_gate_reason = 'interrupted' WHERE id = $1`, f.runID)
+	assertReason := func(stage string, want string) {
+		t.Helper()
+		var reason pgtype.Text
+		if err := f.pool.QueryRow(ctx, `SELECT plan_cross_check_gate_reason FROM runs WHERE id = $1`, f.runID).Scan(&reason); err != nil {
+			t.Fatal(err)
+		}
+		if reason.Valid != (want != "") || reason.String != want {
+			t.Fatalf("%s: gate reason=%v, want %q", stage, reason, want)
+		}
+	}
+	start := func(stage string) {
+		t.Helper()
+		rows, err := f.q.SetRunRunning(ctx, store.SetRunRunningParams{
+			ID: f.runID, WorkerID: pgU(f.workerID),
+		})
+		if err != nil || rows != 1 {
+			t.Fatalf("%s startup: rows=%d err=%v, want 1", stage, rows, err)
+		}
+		assertReason(stage, "interrupted")
+	}
+	start("first startup")
+	start("heartbeat")
+	// Recovery changes the claim generation without resolving the interrupted check.
+	mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'claimed', claim_generation = 2 WHERE id = $1`, f.runID)
+	start("recovered startup")
+
+	childID := uuid.New()
+	mustExec(ctx, t, f.pool, `INSERT INTO runs (id, user_id, repo_id, kind, target_run_id, harness, report_only,
+		budget_wall_seconds, issue_title, issue_description, status)
+		VALUES ($1,$2,$3,'cross_check',$4,'codex',true,1800,'checker','candidate','running')`,
+		childID, f.userID, f.repoID, f.runID)
+	mustExec(ctx, t, f.pool, `INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation, plan_md,
+		milestones, required_capabilities, required_tools, size_class, base_commit, candidate_digest,
+		checker_run_id, checker_harness, verdict, deadline_at)
+		VALUES ($1,'plan',1,2,'approved','[]','{}','{}','s',repeat('a',40),$2,$3,'codex','revise',now()+interval '30 minutes')`,
+		f.runID, []byte("digest"), childID)
+	p := store.SetRunAutopilotPlanParams{
+		ID: f.runID, WorkerID: pgU(f.workerID), PlanMd: pgT("approved"),
+		CandidateDigest: []byte("digest"), InferredCapabilities: []string{},
+		InferredTools: []string{}, SizeClass: pgT("s"), MilestonesFrozen: []byte(`[]`),
+	}
+	apply := func(stage string, want int64) {
+		t.Helper()
+		rows, err := f.q.SetRunAutopilotPlan(ctx, p)
+		if err != nil || rows != want {
+			t.Fatalf("%s application: rows=%d err=%v, want %d", stage, rows, err, want)
+		}
+		if want == 0 {
+			assertReason(stage, "interrupted")
+			var untouched bool
+			if err := f.pool.QueryRow(ctx, `SELECT plan_md IS NULL AND milestones_frozen IS NULL FROM runs WHERE id = $1`, f.runID).Scan(&untouched); err != nil {
+				t.Fatal(err)
+			}
+			if !untouched {
+				t.Fatalf("%s: refused application mutated canonical plan", stage)
+			}
+		}
+	}
+	apply("REVISE", 0)
+	mustExec(ctx, t, f.pool, `UPDATE cross_checks SET verdict = 'approve' WHERE lead_run_id = $1`, f.runID)
+	p.CandidateDigest = []byte("different")
+	apply("APPROVE with wrong digest", 0)
+	p.CandidateDigest = []byte("digest")
+	apply("exact APPROVE", 1)
+	assertReason("exact APPROVE", "")
+	var canonical bool
+	if err := f.pool.QueryRow(ctx, `SELECT plan_md = 'approved' AND milestones_frozen = '[]'::jsonb
+		AND required_capabilities = '{}' AND required_tools = '{}' AND size_class = 's'
+		FROM runs WHERE id = $1`, f.runID).Scan(&canonical); err != nil {
+		t.Fatal(err)
+	}
+	if !canonical {
+		t.Fatal("exact APPROVE did not apply the canonical plan fields")
+	}
 }
 
 func TestPlanCrossCheckGuardsLiveDB(t *testing.T) {

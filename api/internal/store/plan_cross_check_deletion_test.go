@@ -121,9 +121,9 @@ func insertPlanCrossCheckDeletionRows(ctx context.Context, t *testing.T, fixture
 		 'codex', true, 300, $4)`, fixture.checkerID, f.userID, f.repoID, f.runID)
 	mustExec(ctx, t, f.pool, `INSERT INTO cross_checks
 		(id, lead_run_id, checker_run_id, stage, round, lead_claim_generation,
-		 plan_md, milestones, size_class, base_commit, candidate_digest, deadline_at)
+		 plan_md, milestones, size_class, base_commit, candidate_digest, checker_harness, deadline_at)
 		VALUES ($1, $2, $3, 'plan', 1, 1, 'plan', '[]'::jsonb, 's', repeat('a', 40),
-		 $4, now() + interval '5 minutes')`,
+		 $4, 'codex', now() + interval '5 minutes')`,
 		fixture.crossCheckID, f.runID, fixture.checkerID, []byte("test-digest"))
 	assertPlanCrossCheckDeletionRows(ctx, t, fixture, true)
 }

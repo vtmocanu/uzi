@@ -29,4 +29,9 @@ func TestCrossCheckActiveRepoDeleteRetainsRowsLiveDB(t *testing.T) {
  AND EXISTS(SELECT 1 FROM runs WHERE id=$2) AND EXISTS(SELECT 1 FROM runs WHERE id=$3)`, cc, lead, child).Scan(&intact); err != nil || !intact {
 		t.Fatalf("refusal removed cross-check rows: intact=%v err=%v", intact, err)
 	}
+	// Retention is asserted before cleanup; the queued checker must not survive
+	// into subsequent tests that query provisionable runs across all users.
+	t.Cleanup(func() {
+		cliMustExec(t, pool, `DELETE FROM users WHERE id=$1`, owner)
+	})
 }

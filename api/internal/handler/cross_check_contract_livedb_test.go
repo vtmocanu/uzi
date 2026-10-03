@@ -77,7 +77,9 @@ func TestCrossCheckAuthoritativeRoutesLiveDB(t *testing.T) {
 	if historical.Code != 200 || json.Unmarshal(historical.Body.Bytes(), &got) != nil || got.Verdict != "failed" || got.ReasonClass != "interrupted" || got.LeadLastSeq != 7 || got.CandidateGeneration != 1 {
 		t.Fatalf("historical approval became authority: %d %s", historical.Code, historical.Body.String())
 	}
-	foreign := rmSeedRun(t, pool, owner, repo, "running")
+	foreignOwner := cliSeedUser(t, pool, false)
+	foreignRepo := rmSeedRepo(t, pool, rmSeedConn(t, pool, foreignOwner), 993, true)
+	foreign := rmSeedRun(t, pool, foreignOwner, foreignRepo, "running")
 	if rec := call(http.MethodGet, "/api/worker/runs/"+foreign.String()+"/cross-checks/plan/1?claim_generation=1", ""); rec.Code != 409 {
 		t.Fatalf("foreign ownership: %d %s", rec.Code, rec.Body.String())
 	}
