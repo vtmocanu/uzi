@@ -31,7 +31,7 @@ cd agent && node --import tsx --test --test-timeout=120000 test/worker.test.ts  
 
 ## `npm ci` / `npm install` in `agent/` clobber the host's `agent-browser`
 
-`agent/package.json` pins `agent-browser` (0.35.1) and that package's `postinstall` rewrites `/opt/homebrew/bin/agent-browser` into whatever `node_modules` just installed it, over the brew formula's symlink (0.31.1 here). Both commands do it, so adding a devDependency triggers it too; delete the worktree afterwards and the CLI is off `PATH` host-wide with a dangling link.
+`agent/package.json` pins `agent-browser`, and that package's `postinstall` rewrites `/opt/homebrew/bin/agent-browser` into whatever `node_modules` just installed it, over the brew formula's symlink. Both commands do it, so adding a devDependency triggers it too; delete the worktree afterwards and the CLI is off `PATH` host-wide with a dangling link.
 
 - npm 11.17's `npm warn allow-scripts N packages have install scripts not yet covered by allowScripts:` naming `agent-browser` is advisory: the postinstall ran anyway.
 - `web/` is not exposed: `agent-browser` is in `agent/package.json` and in neither `web/package.json` nor `web/package-lock.json` (which does carry 4 `hasInstallScript` packages, esbuild x3 and fsevents, none of them this one).
@@ -39,7 +39,7 @@ cd agent && node --import tsx --test --test-timeout=120000 test/worker.test.ts  
 - Otherwise do not install at all: a validator needing deps in a throwaway worktree should symlink `node_modules` from a long-lived worktree. No install, no postinstall, no clobber, and faster than `npm ci`.
 - Do not assume the `main` checkout has a `node_modules` to borrow. Symlink from any sibling worktree whose `agent/package-lock.json` is byte-identical to yours (`shasum` both first; a mismatch is a version skew the symlink would silently import), or run `npm ci --ignore-scripts` in the `main` checkout to populate a borrow source.
 - Matching lockfiles is necessary but not sufficient: the source worktree's installed tree can be stale even when its lockfile matches. After linking, run `task deps-check:agent` in the borrowing worktree before a gate. If it reports version drift, remove the symlink and run `npm ci --ignore-scripts` in the target worktree (or refresh the source tree); never treat the matching hash as proof that dependencies are current.
-- The tell is silent: a clobbered link still resolves while the worktree exists, so `agent-browser --version` answers happily and differs only in the version printed (npm 0.35.1 vs brew 0.31.1). The check that discriminates is `ls -l /opt/homebrew/bin/agent-browser` — target under `/opt/homebrew/Cellar`, or under somebody's `node_modules`?
+- The tell is silent: a clobbered link still resolves while the worktree exists, so `agent-browser --version` answers happily and differs only in the version printed (the npm pin vs the brew formula). The check that discriminates is `ls -l /opt/homebrew/bin/agent-browser` — target under `/opt/homebrew/Cellar`, or under somebody's `node_modules`?
 - Repair with `brew unlink agent-browser` then `brew link --overwrite agent-browser`. Each alone fails: `brew link --overwrite` answers "Already linked" and refuses; `brew unlink && brew link` removes 0 symlinks and then refuses because a file is in the way. The repair does not hold — the next `npm ci` in `agent/` undoes it.
 - To drive a browser without that cycle, call the Cellar binary directly: `/opt/homebrew/Cellar/agent-browser/<version>/libexec/bin/agent-browser`, which no npm postinstall touches.
 
