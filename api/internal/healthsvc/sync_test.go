@@ -2,6 +2,7 @@ package healthsvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -170,7 +171,14 @@ func TestForgeSyncBaselinesActionsAndDeterministicClass(t *testing.T) {
 			if *c.Since != fixedNow.Add(time.Hour).Format(time.RFC3339) || *c.Action != tc.action {
 				t.Fatalf("%+v", c)
 			}
-			if strings.Contains(c.Summary, "canary") {
+			if tc.class == forge.ErrorClass("raw-error-canary") && c.Evidence[3].Value != "other" {
+				t.Fatalf("invalid class escaped normalization: %+v", c)
+			}
+			serialized, err := json.Marshal(c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(serialized), "canary") {
 				t.Fatal(c)
 			}
 		})
