@@ -297,14 +297,14 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 				m.board.clampCursor()
 			}
 		}
-		m.board.scroll = m.syncedScroll()
+		m.board.scroll = m.syncedScrollAt(m.boardCapacity())
 		return m, nil
 	}
 
 	if d := motionDelta(k); d != 0 {
 		m.board.cursor += d
 		m.board.clampCursor()
-		m.board.scroll = m.syncedScroll()
+		m.board.scroll = m.syncedScrollAt(m.boardCapacity())
 		return m, nil
 	}
 
@@ -1025,12 +1025,8 @@ func boardWindow(cursor, scroll, n, capacity int) (int, int) {
 	return start, start + capacity
 }
 
-// syncedScroll returns the scroll offset that keeps the selected row visible, for the key
-// handler to persist so in-window navigation does not shift the viewport on every keystroke.
-func (m tuiModel) syncedScroll() int {
-	return m.syncedScrollAt(m.boardCapacity())
-}
-
+// syncedScrollAt keeps the selected row visible at the drawn list pane's capacity.
+// The key handler persists it so in-window navigation does not shift the viewport.
 func (m tuiModel) syncedScrollAt(capacity int) int {
 	items := m.buildBoardItems(m.board.visible())
 	sel := selectedBoardItem(items, m.board.cursor)

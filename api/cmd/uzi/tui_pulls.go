@@ -384,14 +384,14 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 				m.pulls.clampCursor()
 			}
 		}
-		m.pulls.scroll = m.pullsSyncedScroll()
+		m.pulls.scroll = m.pullsSyncedScrollAt(m.pullsCapacity())
 		return m, nil
 	}
 
 	if d := motionDelta(k); d != 0 {
 		m.pulls.cursor += d
 		m.pulls.clampCursor()
-		m.pulls.scroll = m.pullsSyncedScroll()
+		m.pulls.scroll = m.pullsSyncedScrollAt(m.pullsCapacity())
 		return m, nil
 	}
 
@@ -526,7 +526,7 @@ func (m tuiModel) renderPullsBody(height int, fullScreen bool) string {
 
 	brand := ""
 	if fullScreen {
-		brand = m.tabStrip(m.board.admin, m.view, true)
+		brand = m.tabStrip(m.board.admin && m.view == viewBoard, m.view, true)
 	}
 	if m.pulls.filter != "" || m.pulls.filtering {
 		brand += m.pal.faint.Render("   /" + cellText(m.pulls.filter))
@@ -639,10 +639,6 @@ func (m tuiModel) pullsCapacityAt(height int, fullScreen bool) int {
 		c = 1
 	}
 	return c
-}
-
-func (m tuiModel) pullsSyncedScroll() int {
-	return m.pullsSyncedScrollAt(m.pullsCapacity())
 }
 
 func (m tuiModel) pullsSyncedScrollAt(capacity int) int {

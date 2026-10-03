@@ -355,7 +355,7 @@ func (m tuiModel) renderCIBody(height int, fullScreen bool) string {
 
 	brand := ""
 	if fullScreen {
-		brand = m.tabStrip(m.board.admin, m.view, true)
+		brand = m.tabStrip(m.board.admin && m.view == viewBoard, m.view, true)
 	}
 	if m.ci.filter != "" || m.ci.filtering {
 		brand += m.pal.faint.Render("   /" + cellText(m.ci.filter))
@@ -463,10 +463,6 @@ func (m tuiModel) ciCapacityAt(height int, fullScreen bool) int {
 		c = 1
 	}
 	return c
-}
-
-func (m tuiModel) ciSyncedScroll() int {
-	return m.ciSyncedScrollAt(m.ciCapacity())
 }
 
 func (m tuiModel) ciSyncedScrollAt(capacity int) int {
@@ -817,14 +813,14 @@ func (m tuiModel) ciKey(k string) (tea.Model, tea.Cmd) {
 				m.ci.clampCursor()
 			}
 		}
-		m.ci.scroll = m.ciSyncedScroll()
+		m.ci.scroll = m.ciSyncedScrollAt(m.ciCapacity())
 		return m, nil
 	}
 
 	if d := motionDelta(k); d != 0 {
 		m.ci.cursor += d
 		m.ci.clampCursor()
-		m.ci.scroll = m.ciSyncedScroll()
+		m.ci.scroll = m.ciSyncedScrollAt(m.ciCapacity())
 		return m, nil
 	}
 
