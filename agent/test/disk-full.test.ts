@@ -118,6 +118,65 @@ describe("sampleVolume (PRD #1809 D6, stats.ts)", () => {
   });
 });
 
+describe("DataVolumeGuard.currentOccupancy", () => {
+  it("uses only current bytes or inodes on the directly statted clone and HOME", async () => {
+    for (const sample of [FULL, volume(10 * GIB, { ffree: 3 })]) {
+      const paths: string[] = [];
+      const guard = new DataVolumeGuard({
+        dataDir: "/data", statfs: () => sample,
+        stat: async (p) => { paths.push(p); return { dev: 7 }; },
+      });
+      assert.equal(await guard.currentOccupancy("/clone", "/home"), "data_volume_full");
+      assert.deepEqual(paths.sort(), ["/clone", "/data", "/home"]);
+    }
+  });
+
+  for (const [name, sample] of [
+    ["roomy", ROOMY], ["missing files", { ...FULL, files: undefined }],
+    ["missing ffree with positive files", { ...FULL, ffree: undefined }],
+    ["zero files", { ...FULL, files: 0 }], ["nonfinite files", { ...FULL, files: NaN }],
+    ["excess free inodes", { ...FULL, ffree: FULL.files! + 1 }],
+    ["available exceeds free", { ...FULL, bavail: 2, bfree: 1 }],
+    ["free exceeds total", { ...FULL, bfree: FULL.blocks + 1 }],
+    ["negative ffree", { ...FULL, ffree: -1 }], ["overflow bytes", { ...FULL, blocks: Number.MAX_VALUE }],
+  ] as const) {
+    it(name, async () => {
+      const guard = new DataVolumeGuard({ dataDir: "/data", statfs: () => sample, stat: async () => ({ dev: 7 }) });
+      assert.equal(await guard.currentOccupancy("/clone", "/home"), name === "roomy" ? "not_disk_full" : "unknown");
+    });
+  }
+
+  for (const missing of ["/clone", "/home", "/data"]) {
+    it(`does not stat ancestors when ${missing} is absent`, async () => {
+      const visited: string[] = [];
+      const guard = new DataVolumeGuard({
+        dataDir: "/data", statfs: () => FULL,
+        stat: async (p) => { visited.push(p); if (p === missing) throw new Error("missing"); return { dev: 7 }; },
+      });
+      assert.equal(await guard.currentOccupancy("/clone", "/home"), "unknown");
+      assert.equal(visited.includes("/"), false);
+    });
+  }
+
+  for (const mismatch of ["/clone", "/home"]) {
+    it(`rejects a different device for ${mismatch}`, async () => {
+      const guard = new DataVolumeGuard({
+        dataDir: "/data", statfs: () => FULL,
+        stat: async (p) => ({ dev: p === mismatch ? 8 : 7 }),
+      });
+      assert.equal(await guard.currentOccupancy("/clone", "/home"), "not_disk_full");
+    });
+  }
+  it("never throws for unknown statfs or device identity", async () => {
+    assert.equal(await new DataVolumeGuard({
+      dataDir: "/data", statfs: () => { throw new Error("unknown"); }, stat: async () => ({ dev: 7 }),
+    }).currentOccupancy("/clone", "/home"), "unknown");
+    assert.equal(await new DataVolumeGuard({
+      dataDir: "/data", statfs: () => FULL, stat: async () => ({ dev: NaN }),
+    }).currentOccupancy("/clone", "/home"), "unknown");
+  });
+});
+
 describe("DataVolumeGuard.classify (PRD #1809 D6)", () => {
   it(
     "a signal on the data volume below the floor is data_volume_full; a roomy volume is not",
