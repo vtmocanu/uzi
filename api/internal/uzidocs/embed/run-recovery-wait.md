@@ -200,18 +200,27 @@ until the vault is actually unlocked. After that, it is re-claimed and
 resumes where it left off — the resume costs at least one model turn before
 finalize opens the merge request.
 
-The direct case — the vault locks right after the provider exchange, and the
-worker gets the answer — is covered by this park too: it is still answered
-`vault_locked` and parked like any other case above. Sealing after the
-exchange quarantines the account either way, to hold the refreshed login
-until the vault unlocks, whether or not the worker ever hears back. A vault
-that locks while sealing after the provider exchange, when the worker does
-not receive the reply (a dropped connection between the api's answer and the
-worker learning it), still fails the run: the worker sees a plain transport
-error, not a typed `vault_locked` answer, so it blocks the boundary and fails
-as before. A retry would not help either, because the quarantined account
-refuses the same operation at authorization. This is tracked separately; see
-[issue #1770](https://github.com/vtmocanu/uzi/issues/1770).
+A vault lock while sealing a refreshed login also keeps the login protected
+for recovery. Updated workers survive a lost refresh reply: they reconcile
+the same operation once, then retain the work, session and custody if the
+outcome remains unknown. A confirmed vault-lock reply uses the vault park;
+an unknown outcome uses an ordinary recovery wait without claiming that the
+vault is locked. Neither path opens a merge request or completes the run
+before a successful resume through the existing completion checks.
+
+If capture proof is temporarily blocked, these credential deferrals retain
+the source and retry visibly with bounded backoff instead of failing after
+the ordinary blocked-capture limit. Verified capture is still required to
+park. Cancellation, shutdown and loss of the claim retain precedence; other
+recovery causes keep their existing limit. After unlock, the recovery sweep
+promotes the protected login before the run can resume. The original refresh
+token is never exchanged again.
+
+Deploy the API before upgrading the affected workers. Older workers keep
+their existing first-request vault-lock reply, including pending retention,
+but still need the worker update to survive a lost response. See
+[ADR-1766](https://github.com/vtmocanu/uzi/blob/main/adr/1766-codex-vault-lock-park.md)
+for coordinated API replacement and rollback instructions.
 
 Because the account is quarantined in the directly covered case too, a
 resumed claim that arrives before the recovery sweep promotes the refreshed
