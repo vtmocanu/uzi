@@ -349,18 +349,30 @@ export class StatsCollector {
 }
 
 /**
- * PRD #1809 D5: the data volume's used fraction from one {@link StatsCollector} sample
- * (`disk_data_bytes / disk_data_total_bytes`, the same statfs reading the heartbeat
- * reports), or undefined when the sample is missing, omitted the pair (a statfs failure)
- * or reports a zero-size volume. Undefined is "unknown", never "empty": the admission
- * stop fails open on it.
+ * PRD #1809 D5: the maximum valid byte or inode used fraction from one
+ * {@link StatsCollector} heartbeat sample. Each complete pair must have finite,
+ * non-negative usage and a finite positive total; its fraction is clamped to one.
+ * Missing or invalid inode accounting falls back to bytes, and vice versa.
+ * Undefined means neither pair is usable: "unknown", never "empty".
  */
 export function dataVolumeUsedFraction(stats: WorkerStats | undefined): number | undefined {
-  const used = stats?.disk_data_bytes;
-  const total = stats?.disk_data_total_bytes;
-  if (used === undefined || total === undefined || !(total > 0)) return undefined;
-  const fraction = used / total;
-  return Number.isFinite(fraction) && fraction >= 0 ? Math.min(fraction, 1) : undefined;
+  let pressure: number | undefined;
+  for (const [used, total] of [
+    [stats?.disk_data_bytes, stats?.disk_data_total_bytes],
+    [stats?.disk_data_inodes, stats?.disk_data_total_inodes],
+  ]) {
+    if (
+      used === undefined ||
+      total === undefined ||
+      !Number.isFinite(used) ||
+      !Number.isFinite(total) ||
+      used < 0 ||
+      total <= 0
+    ) continue;
+    const fraction = Math.min(used / total, 1);
+    pressure = pressure === undefined ? fraction : Math.max(pressure, fraction);
+  }
+  return pressure;
 }
 
 /** Parse a non-negative integer that occupies the whole (trimmed) string. */

@@ -10,6 +10,7 @@ import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import type { StateAck, StateRequest } from "../src/protocol.js";
 import { type CacheCapConfig, DiskGovernor, DiskParkSignal } from "../src/cache-cap.js";
 import { PauseNowSignal } from "../src/steering.js";
+import { dataVolumeUsedFraction } from "../src/stats.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { makeClaim, nullLogger } from "./helpers.js";
 import { TOKEN, api, baseUrl, client, fakeGitlab, git, gitlabClaim, input, fx, installHarness, runnerWith } from "./runner-harness.js";
@@ -226,69 +227,101 @@ describe("RunRunner — PRD #1809 D4 soft layer: a run that stays over the cap p
 });
 
 describe("RunRunner — PRD #1809 D4 hard layer: the mid-turn pressure stop", () => {
-  it("a volume crossing the hard threshold mid-turn stops the largest run, reaps its tree and parks it COUNTED with the data_volume_full cause", async (t) => {
-    if (!HAS_PROC_FD) return t.skip("no /proc/self/fd on this host: the cache drop refuses here by design");
-    await withHomeRoot(async (homeRoot) => {
-      client.protocolFeatures = [FEATURE, FENCE];
-      const probe = governor();
-      // Another running Claude run on the worker, with smaller caches: it must not be the one stopped.
-      let otherStopped = 0;
-      probe.sizes.set("/other/home", GIB);
-      registerRunning(probe, "other-run", "/other/home", () => otherStopped++);
-      await probe.gov.boundary("other-run", async () => false);
+  for (const resource of ["bytes", "inodes"] as const) {
+    it(`a volume crossing the ${resource} hard threshold mid-turn stops the largest run, reaps its tree and parks it COUNTED with the data_volume_full cause`, async (t) => {
+      if (!HAS_PROC_FD) return t.skip("no /proc/self/fd on this host: the cache drop refuses here by design");
+      await withHomeRoot(async (homeRoot) => {
+        client.protocolFeatures = [FEATURE, FENCE];
+        const probe = governor();
+        // Another running Claude run on the worker, with smaller caches: it must not be the one stopped.
+        let otherStopped = 0;
+        probe.sizes.set("/other/home", GIB);
+        registerRunning(probe, "other-run", "/other/home", () => otherStopped++);
+        await probe.gov.boundary("other-run", async () => false);
 
-      let home = "";
-      let reaped = 0;
-      let inTurn: () => void = () => {};
-      const turnStarted = new Promise<void>((r) => (inTurn = r));
-      const factory: ExecutorFactory = (id) => {
-        home = path.join(homeRoot, id);
-        probe.sizes.set(home, 3 * GIB);
-        return {
-          homeDir: home,
-          executor: {
-            killAgentTree: () => {
-              reaped++;
+        let home = "";
+        let reaped = 0;
+        let providerRuns = 0;
+        let commandError: Error | undefined;
+        const activeRuns = new ActiveRunRegistry();
+        let inTurn: () => void = () => {};
+        const turnStarted = new Promise<void>((r) => (inTurn = r));
+        const factory: ExecutorFactory = (id) => {
+          home = path.join(homeRoot, id);
+          probe.sizes.set(home, 3 * GIB);
+          return {
+            homeDir: home,
+            executor: {
+              killAgentTree: () => {
+                reaped++;
+              },
+              run: async (ctx: RunContext): Promise<ExecutorResult> => {
+                seedHome(home);
+                providerRuns++;
+                // The boundary before the turn: under the cap.
+                assert.strictEqual(await ctx.cacheCapBoundary?.(async () => false), "continue");
+                // A long build mid-turn, until the turn is dropped.
+                await new Promise<void>((resolve) => {
+                  if (ctx.signal?.aborted) return resolve();
+                  ctx.signal?.addEventListener("abort", () => resolve(), { once: true });
+                  setTimeout(resolve, 3000); // bound a missing stop without hanging the flight
+                  inTurn();
+                });
+                // An opaque command failure after the stop: the SDK turn catch uses the
+                // requested disk mode, without needing to classify this error or rerun a provider.
+                commandError = new Error("opaque command failed: ENOSPC");
+                try {
+                  throw commandError;
+                } catch (err) {
+                  if (ctx.pauseModeRequested?.() === "disk") throw new DiskParkSignal(false);
+                  throw err;
+                }
+              },
             },
-            run: async (ctx: RunContext): Promise<ExecutorResult> => {
-              seedHome(home);
-              // The boundary before the turn: under the cap.
-              assert.strictEqual(await ctx.cacheCapBoundary?.(async () => false), "continue");
-              // A long build mid-turn, until the turn is dropped.
-              await new Promise<void>((resolve) => {
-                if (ctx.signal?.aborted) return resolve();
-                ctx.signal?.addEventListener("abort", () => resolve(), { once: true });
-                inTurn();
-              });
-              // What the SdkExecutor's turn catch does with a `disk` stop.
-              if (ctx.pauseModeRequested?.() === "disk") throw new DiskParkSignal(false);
-              throw new Error("the turn was dropped for another reason");
-            },
-          },
+          };
         };
-      };
-      const { gitlab } = fakeGitlab();
-      const runId = "18090000-0000-4000-8000-00000000d403";
-      const done = runnerWith(factory, gitlab, undefined, nullLogger(), { diskGovernor: probe.gov }).execute(
-        gitlabClaim(1812, { run_id: runId, claim_generation: 4 }),
-      );
-      await turnStarted;
-      probe.gov.observe(0.86);
-      probe.gov.observe(0.9); // the stats tick: over 0.90 - 0.03
-      await done;
+        const { gitlab } = fakeGitlab();
+        const runId = "18090000-0000-4000-8000-00000000d403";
+        const done = runnerWith(factory, gitlab, undefined, nullLogger(), { diskGovernor: probe.gov, activeRuns }).execute(
+          gitlabClaim(1812, { run_id: runId, claim_generation: 4 }),
+        );
+        await turnStarted;
+        assert.ok(activeRuns.has(runId), "the selected run is registered during its turn");
+        const sample = {
+          mem_bytes: 1,
+          mem_limit_bytes: null,
+          source: "process" as const,
+          disk_data_bytes: resource === "bytes" ? 86 : 10,
+          disk_data_total_bytes: 100,
+          disk_data_inodes: 20,
+          disk_data_total_inodes: 100,
+        };
+        probe.gov.observe(dataVolumeUsedFraction(sample));
+        await new Promise((r) => setTimeout(r, 10));
+        assert.strictEqual(reaped, 0, "below the hard threshold, the turn keeps running");
+        probe.gov.observe(dataVolumeUsedFraction({
+          ...sample,
+          disk_data_bytes: resource === "bytes" ? 90 : 10,
+          disk_data_inodes: resource === "inodes" ? 100 : 20,
+        })); // the stats tick: byte or inode pressure over 0.90 - 0.03
+        await done;
 
-      assert.strictEqual(otherStopped, 0, "the smaller run keeps running");
-      assert.ok(reaped >= 1, "the stopped run's process tree was reaped");
-      const [park, ...more] = parks(runId);
-      assert.deepStrictEqual(more, []);
-      assert.strictEqual(park?.recovery_cause, "data_volume_full");
-      assert.strictEqual(park?.claim_generation, 4);
-      assert.strictEqual("disk_park_preventive" in (park ?? {}), false, "the hard stop is a COUNTED park: the flag is absent");
-      assert.ok(!api.states.some((s) => s.runId === runId && (s.body.status === "paused" || s.body.status === "failed")), "not an owner pause, not a failure");
-      for (const rel of CACHES) assert.strictEqual(fs.existsSync(path.join(home, rel)), false, `${rel} dropped on the park`);
-      assert.strictEqual(probe.reclaims(), 1, "the D7 reclaim ran after the park");
+        assert.strictEqual(providerRuns, 1, "the stopped provider is never rerun");
+        assert.ok(commandError?.message.includes("ENOSPC"), "the opaque command error reached the disk-stop signal path");
+        assert.strictEqual(activeRuns.has(runId), false, "the parked run leaves the active registry");
+        assert.strictEqual(otherStopped, 0, "the smaller run keeps running");
+        assert.ok(reaped >= 1, "the stopped run's process tree was reaped");
+        const [park, ...more] = parks(runId);
+        assert.deepStrictEqual(more, []);
+        assert.strictEqual(park?.recovery_cause, "data_volume_full");
+        assert.strictEqual(park?.claim_generation, 4);
+        assert.strictEqual("disk_park_preventive" in (park ?? {}), false, "the hard stop is a COUNTED park: the flag is absent");
+        assert.ok(!api.states.some((s) => s.runId === runId && (s.body.status === "paused" || s.body.status === "failed")), "not an owner pause, not a failure");
+        for (const rel of CACHES) assert.strictEqual(fs.existsSync(path.join(home, rel)), false, `${rel} dropped on the park`);
+        assert.strictEqual(probe.reclaims(), 1, "the D7 reclaim ran after the park");
+      });
     });
-  });
+  }
 });
 
 describe("RunRunner — PRD #1809 D4 both layers disabled", () => {
