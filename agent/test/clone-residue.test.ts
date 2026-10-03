@@ -198,10 +198,11 @@ function orphanIn(cwd: string, extraEnv: Record<string, string> = {}): number {
   return pid;
 }
 
+/** The fixture is alive while it can execute work. A killed orphan may remain a zombie until
+ *  its adopting parent collects it; PID removal is not part of the residue proof. */
 function alive(pid: number): boolean {
   try {
-    process.kill(pid, 0);
-    return true;
+    return !/^State:\s*[ZX]/m.test(fs.readFileSync(`/proc/${pid}/status`, "utf8"));
   } catch {
     return false;
   }
