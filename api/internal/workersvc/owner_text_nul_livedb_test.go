@@ -119,6 +119,10 @@ func TestOwnerTextNULCreateChatRunLiveDB(t *testing.T) {
 	check(" \x00hello\x00 world\x00 ", "hello world", "hello world")
 	check("hello world", "hello world", "hello world")
 	check(strings.Repeat("a", MaxChatMessageBytes)+"\x00", strings.Repeat("a", MaxChatMessageBytes), strings.Repeat("a", 80)+"…")
+	var runsBefore int
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM runs WHERE user_id = $1 AND kind = 'chat'`, f.userID).Scan(&runsBefore); err != nil {
+		t.Fatal(err)
+	}
 	for _, input := range []string{"", "\x00\x00", "\x00 \t\x00"} {
 		if _, err := f.svc.CreateChatRun(f.ctx, f.userID, input); !errors.Is(err, ErrEmptyChatMessage) {
 			t.Fatalf("CreateChatRun(%q) error = %v, want empty message", input, err)
@@ -127,6 +131,13 @@ func TestOwnerTextNULCreateChatRunLiveDB(t *testing.T) {
 	if _, err := f.svc.CreateChatRun(f.ctx, f.userID, strings.Repeat("a", MaxChatMessageBytes+1)+"\x00"); !errors.Is(err, ErrChatMessageTooLarge) {
 		t.Fatalf("over-limit stripped chat error = %v, want size limit", err)
 	}
+	var runsAfter int
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM runs WHERE user_id = $1 AND kind = 'chat'`, f.userID).Scan(&runsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if runsAfter != runsBefore {
+		t.Fatalf("rejected chat creation changed run count from %d to %d", runsBefore, runsAfter)
+	}
 }
 
 func TestOwnerTextNULSubmitChatMessageLiveDB(t *testing.T) {
@@ -134,6 +145,10 @@ func TestOwnerTextNULSubmitChatMessageLiveDB(t *testing.T) {
 	run := f.newRun("chat")
 	check := func(input, want string) {
 		t.Helper()
+		var before int
+		if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id = $1`, run).Scan(&before); err != nil {
+			t.Fatal(err)
+		}
 		res, err := f.svc.SubmitChatMessage(f.ctx, f.userID, run, input)
 		if err != nil {
 			t.Fatalf("SubmitChatMessage(%q): %v", input, err)
@@ -142,8 +157,12 @@ func TestOwnerTextNULSubmitChatMessageLiveDB(t *testing.T) {
 			t.Fatalf("SubmitChatMessage(%q) was server-side", input)
 		}
 		var body string
-		if err := f.pool.QueryRow(f.ctx, `SELECT body FROM run_user_inputs WHERE run_id = $1 ORDER BY id DESC LIMIT 1`, run).Scan(&body); err != nil {
+		var after int
+		if err := f.pool.QueryRow(f.ctx, `SELECT count(*), (SELECT body FROM run_user_inputs WHERE run_id = $1 ORDER BY id DESC LIMIT 1) FROM run_user_inputs WHERE run_id = $1`, run).Scan(&after, &body); err != nil {
 			t.Fatal(err)
+		}
+		if after != before+1 {
+			t.Fatalf("successful chat submission changed input count from %d to %d, want +1", before, after)
 		}
 		if body != want {
 			t.Fatalf("persisted chat body = %q, want %q", body, want)
