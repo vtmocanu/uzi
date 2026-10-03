@@ -457,7 +457,11 @@ describe("SdkExecutor with the usage recorder", () => {
         if (rec.type === "assistant") {
           // the CLI never forwards a subagent's own stream_events: only the main lane is wrapped
           if (rec.parent_tool_use_id === undefined) out.push(...withPartials(frame, 10));
-          else out.push(frame);
+          else if (rec.message?.id === "s1") {
+            // a MIXED subagent frame: forwardSubagentText adds the subagent's narration text next to
+            // its tool_use; the projection must keep the tool_use and drop the added text.
+            out.push(asst("s1", [text("subagent narration"), toolUse("sub-bash", "Bash", { command: "ls" })], SUBAGENT));
+          } else out.push(frame);
           if (rec.message?.id === "s1") {
             out.push(
               asst("s2", [text("subagent text-only")], SUBAGENT),

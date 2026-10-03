@@ -112,6 +112,8 @@ interface Rec {
   /** Bumped on every change, so a post that raced a change leaves the record dirty. */
   version: number;
   sentVersion: number;
+  /** A change to this already-sent record was lost for want of pending room (counted once). */
+  lost?: boolean;
 }
 
 const COLUMNS = [
@@ -214,7 +216,7 @@ export class UsageLeg {
       return existing;
     }
     if (this.droppedIds.has(id)) return undefined;
-    if (this.byId.size >= USAGE_LEG_MAX_MESSAGES || this.dirty.size >= USAGE_PENDING_MAX) {
+    if (this.byId.size >= USAGE_LEG_MAX_MESSAGES || this.owner.pendingTotal(this) >= USAGE_PENDING_MAX) {
       this.droppedIds.add(id);
       this.droppedCount++;
       this.touchMarker();
@@ -280,9 +282,18 @@ export class UsageLeg {
 
   private bump(rec: Rec): void {
     rec.version++;
-    // A record already sent re-enters the pending set only while there is room for it.
+    // A record already sent re-enters the pending set only while there is room for it (the cap is
+    // recorder-wide). A change it could not carry (a final output count) is counted as dropped, once
+    // per record, so coverage reads partial rather than complete-but-undercounted.
     if (!this.dirty.has(rec)) {
-      if (this.dirty.size >= USAGE_PENDING_MAX) return;
+      if (this.owner.pendingTotal(this) >= USAGE_PENDING_MAX) {
+        if (!rec.lost) {
+          rec.lost = true;
+          this.droppedCount++;
+          this.touchMarker();
+        }
+        return;
+      }
       this.dirty.add(rec);
     }
     this.owner.changed();
@@ -400,6 +411,30 @@ export class UsageRecorder implements UsageSink {
       void this.pump();
     }, wait);
     this.timer.unref?.();
+  }
+
+  /** @internal Distinct pending messages across every leg (plus `leg` itself when unregistered). */
+  pendingTotal(leg: UsageLeg): number {
+    let n = this.legs.includes(leg) ? 0 : leg.pendingCount;
+    for (const l of this.legs) n += l.pendingCount;
+    return n;
+  }
+
+  /**
+   * The run's batcher closed: nothing more can be delivered or retried. Abort the in-flight request,
+   * drop what is unsent and stop scheduling, so a persistently failing api cannot keep a closed
+   * recorder retrying (the unsent tail surfaces server-side as leg_not_closed / ordinal_gap).
+   */
+  release(): void {
+    if (this.stopped) return;
+    const unsent = this.hasWork();
+    this.stopped = true;
+    this.inFlight?.abort.abort();
+    this.abandonUnsent();
+    this.legs.length = 0;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    if (unsent) this.opts.log.warn("usage: closed with unsent usage records; abandoned them", { run_id: this.opts.runId });
   }
 
   private hasWork(): boolean {

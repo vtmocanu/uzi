@@ -251,6 +251,39 @@ describe("UsageRecorder bounds", () => {
     assert.deepEqual(client.calls.slice(0, -1).flatMap((c) => c.body.legs), [], "a close never overtakes the records it closes");
   });
 
+  it("the pending cap is recorder-wide: legs together never hold more than USAGE_PENDING_MAX", async () => {
+    const client = new FakeUsageClient();
+    const rec = makeRecorder(client);
+    const legs = [rec.startLeg(), rec.startLeg(), rec.startLeg()];
+    const each = 800; // 3 x 800 = 2400 > USAGE_PENDING_MAX, though no leg alone is over it
+    for (const leg of legs) for (let i = 0; i < each; i++) leg.observeAssistant(assistant(`${leg.legId}-${i}`, { output_tokens: 1 }));
+    for (const leg of legs) leg.close();
+    await rec.drain();
+    await rec.drain();
+
+    assert.equal(client.records.length, USAGE_PENDING_MAX, "the cap held across legs");
+    const dropped = client.legs.reduce((n, l) => n + (l.dropped_records ?? 0), 0);
+    assert.equal(dropped, legs.length * each - USAGE_PENDING_MAX, "the overflow is counted");
+  });
+
+  it("a final output count lost to a full pending set is counted as dropped, once", async () => {
+    const client = new FakeUsageClient();
+    const rec = makeRecorder(client);
+    const leg = rec.startLeg();
+    leg.observeStream(messageStart("m1", { input_tokens: 5, output_tokens: 1 }));
+    await rec.drain(); // m1 is on the wire; its record leaves the pending set
+    for (let i = 0; i < USAGE_PENDING_MAX; i++) leg.observeAssistant(assistant(`f${i}`, { output_tokens: 1 }));
+    // m1's final output count arrives with the pending set full: it cannot be carried
+    leg.observeStream(streamEvent({ type: "message_delta", usage: { output_tokens: 50 } }));
+    leg.observeStream(streamEvent({ type: "message_delta", usage: { output_tokens: 60 } }));
+    leg.close();
+    await rec.drain();
+    await rec.drain();
+
+    assert.ok(client.records.every((r) => r.message_id !== "m1" || r.output_tokens === 1), "m1 was not resent");
+    assert.equal(client.legs.at(-1)?.dropped_records, 1, "the lost update is reported so coverage is partial");
+  });
+
   it("posts promptly after the debounce, before the leg ends", async () => {
     const client = new FakeUsageClient();
     const rec = makeRecorder(client, { debounceMs: 20 });
@@ -395,6 +428,20 @@ describe("MessageBatcher owns the usage drain", () => {
       assert.ok(took < USAGE_DRAIN_DEADLINE_MS + 1500, `${op} took ${took} ms`);
       assert.equal(usageClient.calls[0]!.signal?.aborted, true, `${op} aborted the request`);
     }
+  });
+
+  it("close() stops the recorder: a persistently failing api is not retried after close", async () => {
+    const usageClient = new FakeUsageClient();
+    usageClient.respond = async () => {
+      throw new RequestError("POST", "/usage", 503, "down");
+    };
+    const batcher = batcherWith(usageClient);
+    batcher.usage.startLeg().observeAssistant(assistant("m1", { output_tokens: 1 }));
+    await batcher.close();
+    assert.equal(usageClient.calls.length, 1);
+    await sleep(900); // past the recorder's first 500 ms backoff
+    assert.equal(usageClient.calls.length, 1, "no retry is scheduled after close");
+    assert.equal(batcher.usage.inactive, true);
   });
 
   it("a durability-boundary signal that fires sooner shortens the drain", async () => {
@@ -565,5 +612,40 @@ describe("WorkerClient.postUsage", () => {
     const client = new WorkerClient(baseUrl, "tok", "0.0.0", nullLogger(), { sleep: async () => {} });
     await client.postUsage("run-9", body, 5);
     assert.equal("claim_generation" in seen[0]!.body, false);
+  });
+});
+
+describe("WorkerClient.postUsage abort", () => {
+  it("aborting the signal rejects promptly AND closes the request socket on the server", async () => {
+    let reqStarted!: () => void;
+    const started = new Promise<void>((r) => (reqStarted = r));
+    let closed!: () => void;
+    const serverSawClose = new Promise<void>((r) => (closed = r));
+    const server = http.createServer((req) => {
+      if (!req.url?.endsWith("/usage")) return;
+      req.resume();
+      req.socket.on("close", () => closed());
+      reqStarted(); // never answered: a hung route
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      const client = new WorkerClient(baseUrl, "tok", "0.0.0", nullLogger(), { sleep: async () => {} });
+      const abort = new AbortController();
+      const posted = client.postUsage("run-9", { legs: [{ leg_id: "6f1d2a40-7c1e-4a0e-9f0b-1a2b3c4d5e01", closed_through: 1 }], messages: [] }, 3, abort.signal);
+      const outcome = posted.then(() => "resolved", () => "rejected");
+      await started;
+      const t0 = Date.now();
+      abort.abort();
+      assert.equal(await outcome, "rejected");
+      assert.ok(Date.now() - t0 < 1000, "rejected promptly, not after the client's own timeout");
+      await Promise.race([
+        serverSawClose,
+        sleep(2000).then(() => assert.fail("the server never saw the request socket close")),
+      ]);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });

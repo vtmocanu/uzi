@@ -1184,6 +1184,8 @@ export class MessageBatcher {
   async close(signal?: AbortSignal): Promise<void> {
     this.closed = true;
     await this.usage.drain(undefined, signal);
+    // Past close nothing can be retried: stop the recorder so a failing api cannot keep it retrying.
+    this.usage.release();
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = undefined;
