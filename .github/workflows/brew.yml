@@ -11,7 +11,14 @@
 #
 # TRIGGERS: a `v*` tag push (auto-publish the formula on release, matching release.yml)
 # AND workflow_dispatch (re-publish for any existing tag by hand). Both feed the same job
-# through INPUT_TAG below. brew:formula fetches the ANONYMOUS auto-archive
+# through INPUT_TAG below. Dispatch on the tag itself (`gh workflow run brew.yml --ref
+# vX.Y.Z -f tag=vX.Y.Z`): the `release` environment admits only `v*` tag refs, so a
+# dispatch from `main` is rejected before any step runs, and a tag dispatch runs the
+# workflow as it was at that tag. To publish with a newer workflow than the tag carries,
+# render and publish locally from `main` (`task brew-rc:formula` + `task brew-rc:publish`):
+# run scripts/brew-tap-guard.py against the tap's current formula first and publish only
+# when it exits 0; exit 3 skips, any other failure refuses (the publish task has no guard).
+# brew:formula fetches the ANONYMOUS auto-archive
 # (https://github.com/vtmocanu/uzi/archive/refs/tags/<tag>.tar.gz); the reusable task
 # guards the empty-input digest and refuses to render on a 404. A release tags vX.Y.Z (or
 # vX.Y.Z-rc.N), release.yml publishes the images + chart, and this publishes the matching
