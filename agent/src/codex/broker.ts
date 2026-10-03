@@ -885,6 +885,7 @@ export class CodexCallbackBroker {
         if (read.truncated) return deny("search_limit", "Search file read incomplete");
         if (typeof read.data !== "string") return deny("fileop_denied", "Search file body unavailable");
         const body = Buffer.from(read.data, "base64");
+        if (body.length > 64 * 1024) return deny("search_limit", "Search file size limit reached");
         bytes += body.length;
         if (bytes > 256 * 1024) return deny("search_limit", "Search byte limit reached");
         for (const [index, line] of body.toString("utf8").split("\n").entries()) {

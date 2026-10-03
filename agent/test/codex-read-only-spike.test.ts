@@ -35,11 +35,12 @@ describe("read-only Codex spike", () => {
     for (const [size, truncated, expected] of [
       [64 * 1024 + 1, false, "Search file size limit reached"],
       [1, true, "Search file read incomplete"],
+      [1, false, "Search file size limit reached"],
     ] as const) {
       const fileop: FileopClient = { op: async (request) => {
         if (request.op === "list") return { ok: true, entries: [{ name: "sample.txt", type: "file" }] };
         if (request.op === "stat") return { ok: true, size };
-        if (request.op === "read") return { ok: true, data: Buffer.from("x").toString("base64"), truncated };
+        if (request.op === "read") return { ok: true, data: Buffer.from(size === 1 && !truncated ? "x".repeat(64 * 1024 + 1) : "x").toString("base64"), truncated };
         throw new Error(`unexpected operation: ${request.op}`);
       } };
       const broker = new CodexCallbackBroker({
@@ -86,8 +87,8 @@ describe("read-only Codex spike", () => {
       assert.equal(output.matches.length, count);
       assert.equal(output.truncated, truncated);
       if (content === lateLine) {
-        assert.ok(output.matches[0].text.includes("needle"));
-        assert.ok(output.matches[0].text.length <= 256);
+        assert.ok(output.matches[0]?.text.includes("needle"));
+        assert.ok((output.matches[0]?.text.length ?? Infinity) <= 256);
       }
     }
   });
