@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"math"
 	"slices"
 	"sort"
@@ -221,8 +220,29 @@ func (s *Service) RecordRunUsage(ctx context.Context, wkr store.Worker, runID uu
 	if !live {
 		return ErrStaleClaim
 	}
+	if s.usageAfterFenceHook != nil {
+		s.usageAfterFenceHook()
+	}
 	if err := writeUsagePost(ctx, q, runID, req, claimGen); err != nil {
 		return err
+	}
+	// Locked recheck as the LAST statement before Commit. The early RunUsageFenceLive read is not
+	// enough: under READ COMMITTED a release or reclaim does not take the usage advisory lock, so
+	// it can commit after that read and before ours, and a per-statement fence cannot cover the
+	// whole write. RunUsageFenceLiveLocked row-locks the runs row (FOR SHARE), so a release that
+	// committed before it is seen here (ErrStaleClaim, the deferred Rollback discards every
+	// write) and one that starts after it waits for our commit. It is last so runs UPDATEs are not
+	// blocked across up to 500 upserts; the FK leg inserts already hold FOR KEY SHARE on the row,
+	// which this upgrades.
+	live, err = q.RunUsageFenceLiveLocked(ctx, store.RunUsageFenceLiveLockedParams{RunID: runID, WorkerID: pgconv.UUID(wkr.ID), ClaimGeneration: pgconv.Int8Ptr(claimGen)})
+	if err != nil {
+		return err
+	}
+	if !live {
+		return ErrStaleClaim
+	}
+	if s.usageBeforeCommitHook != nil {
+		s.usageBeforeCommitHook()
 	}
 	return tx.Commit(ctx)
 }
@@ -555,25 +575,33 @@ func collectUsageStamps(msgs []IncomingMessage) []usageStamp {
 
 // foldUsageTailStamps records the leg identity and coverage stamps a delivered batch carried
 // (ADR-2014 D4, D11). It runs AFTER the unchanged metered fold, for Claude non-chat runs only, in
-// its own short transaction that takes the per-run usage lock FIRST and applies the legs cap. It
-// never fails the append or the metering: a cap hit sets record_cap_reached and skips the write,
-// and a database error is logged (the error carries no worker text) and dropped; the worker's
-// next delivery of the same frames re-runs the same idempotent, monotone upserts.
-func (s *Service) foldUsageTailStamps(ctx context.Context, run store.Run, msgs []IncomingMessage) {
+// its own short transaction that takes the per-run usage lock FIRST and applies the legs cap. A cap
+// hit sets record_cap_reached, skips the write and still commits, so it never fails the append. A
+// database error is returned (it carries no worker text) and fails the append, exactly like the
+// metered fold, so the worker re-delivers; every write is idempotent or monotone on re-delivery:
+// run_messages is ON CONFLICT (run_id, seq) DO NOTHING, UpsertRunUsage merges with GREATEST,
+// UpsertRunUsageLegInit COALESCEs, UpsertRunUsageLegCoverage merges with GREATEST/OR, and a failed
+// stamp transaction rolls back whole.
+func (s *Service) foldUsageTailStamps(ctx context.Context, run store.Run, msgs []IncomingMessage) error {
 	// An isolated-lane run (profile-bound) is refused by the /usage route and must not grow legs
 	// through the stamp path either.
 	if run.Kind == runkind.Chat || run.Harness == harnessCodex || run.EgressProfileID.Valid || s.txBeginner == nil {
-		return
+		return nil
 	}
 	stamps := collectUsageStamps(msgs)
 	if len(stamps) == 0 {
-		return
+		return nil
 	}
 	if err := s.applyUsageStamps(ctx, run.ID, stamps); err != nil {
-		slog.Warn("workersvc: usage tail stamp write failed", "run_id", run.ID.String(), "error", err)
+		return fmt.Errorf("usage tail stamp write for run %s: %w", run.ID, err)
 	}
+	return nil
 }
 
+// applyUsageStamps deliberately takes NO claim fence. Its stamps derive from frames the caller
+// already stored under InsertRunMessage's generation_live fence; fencing again here would turn a
+// valid stamp into a 409 (a release between the insert and this transaction) and lose it
+// permanently, because the fenced re-delivery is rejected too.
 func (s *Service) applyUsageStamps(ctx context.Context, runID uuid.UUID, stamps []usageStamp) error {
 	tx, err := s.txBeginner.Begin(ctx)
 	if err != nil {

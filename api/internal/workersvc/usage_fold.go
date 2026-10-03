@@ -267,7 +267,7 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 //   - foldRunUsage → foldUsageTailStamps (issue #2014, ADR-2014 D4/D11) — the estimated
 //     tail's leg identity and coverage writes (UpsertRunUsageLegInit, UpsertRunUsageLegCoverage,
 //     UpsertRunUsageTailState). A second CLEARED suspect, and for a stronger reason: it runs
-//     AFTER the metered fold and can never fail the append at all. Every worker-controlled value
+//     AFTER the metered fold; a cap hit never fails the append, a database error does (500, the worker re-delivers). Every worker-controlled value
 //     it reads out of the frame payload is validated BEFORE any write and a bad one is SKIPPED,
 //     never an error: `leg_id` must parse as a non-nil UUID; `sdk_session_id` is NUL-stripped,
 //     rune-capped (maxUsageIDRunes, matching its CHECK) and must be non-empty; `usage_through`
@@ -277,8 +277,10 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 //     claim generation is the fenced one. The legs cap (maxUsageLegsPerRun) is applied under
 //     the per-run advisory lock, which is the FIRST statement of the stamp transaction, so an
 //     oversized or hostile stream of distinct leg ids is bounded and sets record_cap_reached
-//     instead of growing the table. The write runs in its own transaction and its error is
-//     logged and dropped, so a failure here is never a 500, never a 400 and never re-delivered.
+//     instead of growing the table. The write runs in its own transaction; a database error fails the
+//     append (a 500, never a 400) and the worker re-delivers, which is safe because every write
+//     is idempotent or monotone (run_messages ON CONFLICT DO NOTHING, UpsertRunUsage GREATEST,
+//     LegInit COALESCE, LegCoverage GREATEST/OR) and a failed stamp transaction rolls back whole.
 //
 // A broader wrap was considered and rejected: with the above holding it catches
 // nothing extra, while reintroducing exactly the misattribution this narrowness
@@ -560,14 +562,14 @@ type usageFoldQuerier interface {
 // in the incremental wrapper, and deliberately NOT inside foldUsageFrames: RefoldRunUsage runs
 // foldUsageFrames inside its own transaction after DeleteRunUsage, and the stamp writes take the
 // per-run usage advisory lock first in a transaction of their own, so putting them in the shared
-// body would make the refold take that lock after a row write. The tail never fails the append:
-// a bad stamp is skipped and a database error is logged inside foldUsageTailStamps.
+// body would make the refold take that lock after a row write. A bad stamp is skipped
+// and a cap hit commits without failing the append; a database error from foldUsageTailStamps
+// fails the append (500) so the worker re-delivers, and every write is idempotent on re-delivery.
 func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []IncomingMessage) error {
 	if err := foldUsageFrames(ctx, s.q, run, msgs); err != nil {
 		return err
 	}
-	s.foldUsageTailStamps(ctx, run, msgs)
-	return nil
+	return s.foldUsageTailStamps(ctx, run, msgs)
 }
 
 // foldUsageFrames folds every result frame in `frames` into run_usage, keyed per SDK

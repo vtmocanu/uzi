@@ -1746,6 +1746,10 @@ type Service struct {
 	genWG           sync.WaitGroup
 	genTimeout      time.Duration
 	genReplyBound   time.Duration
+	// usageAfterFenceHook / usageBeforeCommitHook are test seams in RecordRunUsage: after the early
+	// fence and before writeUsagePost, and after the locked recheck and before Commit. Nil in production.
+	usageAfterFenceHook   func()
+	usageBeforeCommitHook func()
 	// now is time.Now in production; overridable in tests for deterministic
 	// cutoffs.
 	now func() time.Time

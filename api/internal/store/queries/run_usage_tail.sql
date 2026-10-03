@@ -26,6 +26,21 @@ SELECT EXISTS (SELECT 1 FROM runs r
                  AND (sqlc.narg('claim_generation')::bigint IS NULL
                       OR r.claim_generation = sqlc.narg('claim_generation')::bigint)) AS live;
 
+-- name: RunUsageFenceLiveLocked :one
+-- RecordRunUsage's recheck, the LAST statement before Commit. Same predicate as RunUsageFenceLive
+-- plus the claimant's worker_id, and it row-locks the runs row with FOR SHARE. READ COMMITTED and
+-- the release/reclaim UPDATEs do not take the usage advisory lock, so a per-statement fence is
+-- insufficient: a release that committed before this statement is seen here (re-checked on the new
+-- row version), and one that starts after it waits for our commit. The FK leg inserts already hold
+-- FOR KEY SHARE on the row; this upgrades it. Precedent: judge.sql's `live` CTE.
+SELECT EXISTS (SELECT 1 FROM runs r
+               WHERE r.id = sqlc.arg(run_id)
+                 AND r.worker_id = sqlc.arg(worker_id)
+                 AND r.claim_released_at IS NULL
+                 AND (sqlc.narg('claim_generation')::bigint IS NULL
+                      OR r.claim_generation = sqlc.narg('claim_generation')::bigint)
+               FOR SHARE) AS live;
+
 -- name: CountRunUsageLegs :one
 SELECT count(*) FROM run_usage_legs WHERE run_id = $1;
 

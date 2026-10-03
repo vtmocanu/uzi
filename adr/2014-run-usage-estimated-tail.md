@@ -264,6 +264,10 @@ the recorder's route-missing streak; and it is not in `laneWorkerAllowlist`, so 
 worker gets 403 (`/messages` is allowlisted). A request carries at most 500 records and 16 leg
 markers; more is a 400.
 
+The fence is rechecked with `FOR SHARE` (`RunUsageFenceLiveLocked`) as the **last statement before
+Commit**, binding `worker_id` as well, so a release or reclaim that commits after the early check
+still discards the whole post and one that starts later waits for our commit.
+
 The route rejects chat and Codex runs, and the leg-coverage fold extension runs only
 for Claude non-chat runs. **The Codex exclusion is new**, not parity:
 `foldUsageFrames` does fold Codex result frames into the metered total. Codex has no
@@ -292,8 +296,12 @@ separate decision.
   `run_usage_tail_state` with the dropped counts.
 - **Fold.** The init and result leg upsert takes the **same** lock first, applies the
   same cap, and runs in its own short transaction after `UpsertRunUsage`. A cap hit sets
-  `record_cap_reached` and skips the leg write; it never fails the append or the
-  metering.
+  `record_cap_reached` and skips the leg write; a cap hit never fails the append. A
+  database error fails the append (500) so the worker re-delivers, the metered fold's contract;
+  all writes are idempotent or monotone. Chosen over read-time derivation (review of !2214). The
+  stamp transaction takes **no claim fence**: its stamps derive from frames already stored under
+  `InsertRunMessage`'s `generation_live` fence, and a fence here would turn a valid stamp into a
+  409 and lose it permanently.
 - **Lock order.** The advisory lock is always taken before any row write, on both
   paths; no path takes them in the reverse order, so the two cannot deadlock.
 - `record_cap_reached` always yields that coverage reason; a capped run is never
@@ -322,6 +330,11 @@ separate decision.
   `stream_event` are not captured.
 - **A hard kill before a post** loses those records (no disk spill); coverage reports
   `leg_not_closed` or `ordinal_gap`.
+- **A stamp lost to a release.** If the stamp write fails and the claim is released before
+  re-delivery, the fenced re-delivery is rejected and that stamp is lost: a lost result stamp makes
+  the tail over-estimate, a lost init leaves the leg absent.
+- **Stamp failures count like metered-fold failures** toward the auto-stop streak, and frames of a
+  failed attempt are not broadcast live.
 - **The tail is an estimate.** It is priced from a recorded public price table, not
   billed amounts, and is never merged into the metered total.
 

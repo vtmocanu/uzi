@@ -345,6 +345,35 @@ func (q *Queries) RunUsageFenceLive(ctx context.Context, arg RunUsageFenceLivePa
 	return live, err
 }
 
+const runUsageFenceLiveLocked = `-- name: RunUsageFenceLiveLocked :one
+SELECT EXISTS (SELECT 1 FROM runs r
+               WHERE r.id = $1
+                 AND r.worker_id = $2
+                 AND r.claim_released_at IS NULL
+                 AND ($3::bigint IS NULL
+                      OR r.claim_generation = $3::bigint)
+               FOR SHARE) AS live
+`
+
+type RunUsageFenceLiveLockedParams struct {
+	RunID           uuid.UUID   `json:"run_id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration pgtype.Int8 `json:"claim_generation"`
+}
+
+// RecordRunUsage's recheck, the LAST statement before Commit. Same predicate as RunUsageFenceLive
+// plus the claimant's worker_id, and it row-locks the runs row with FOR SHARE. READ COMMITTED and
+// the release/reclaim UPDATEs do not take the usage advisory lock, so a per-statement fence is
+// insufficient: a release that committed before this statement is seen here (re-checked on the new
+// row version), and one that starts after it waits for our commit. The FK leg inserts already hold
+// FOR KEY SHARE on the row; this upgrades it. Precedent: judge.sql's `live` CTE.
+func (q *Queries) RunUsageFenceLiveLocked(ctx context.Context, arg RunUsageFenceLiveLockedParams) (bool, error) {
+	row := q.db.QueryRow(ctx, runUsageFenceLiveLocked, arg.RunID, arg.WorkerID, arg.ClaimGeneration)
+	var live bool
+	err := row.Scan(&live)
+	return live, err
+}
+
 const upsertRunUsageLegCoverage = `-- name: UpsertRunUsageLegCoverage :exec
 INSERT INTO run_usage_legs (run_id, leg_id, covered_through, covered_cumulative, claim_generation)
 VALUES ($1, $2, $3::int, $4::boolean, $5::bigint)
