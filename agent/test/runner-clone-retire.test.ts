@@ -521,9 +521,12 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
     assertSafeEvents(e.events, [error.body, error.path]);
     assert.equal(e.events.at(-1)?.http_status, 503);
     const logger = { ...nullLogger(), warn: () => { throw error; } };
+    const failedStates = () => api.states.filter((state) => state.runId === s.claimant && state.body.status === "failed");
+    const before = failedStates().length;
     const retry = execution(s, true, undefined, logger);
     await retry.run();
-    assert.equal(api.states.filter((state) => state.runId === s.claimant && state.body.status === "failed").at(-1)?.body.failure_reason,
+    assert.equal(failedStates().length, before + 1, "the retry reported its own refusal");
+    assert.equal(failedStates().at(-1)?.body.failure_reason,
       "refusing to replace a retained clone owned by another run");
   });
 
