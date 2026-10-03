@@ -2417,6 +2417,12 @@ tasks:
       # PRD 1287 C1 / D7 point 5: M4 runs once after the complete local unit suite.
       - task: test:codex-m4
 
+  test:agent:worker-uid:
+    desc: agent - require real worker UID ownership tests inside the base image
+    cmds:
+      - python3 e2e/worker-uid/gate_test.py
+      - bash e2e/worker-uid/run.sh
+
   test:agent:shard:
     desc: agent unit-test shard for CI (exactly 1/2 or 2/2; no M4)
     preconditions:

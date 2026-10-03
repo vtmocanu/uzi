@@ -29,9 +29,9 @@ import type { ProvisionSpawnSync } from "../src/codex/launcher.js";
 import { runLaunchCli, type LaunchCliDeps } from "../src/codex/launch-cli.js";
 import { WORKER_SPAWN_ENV, workerRunnerRootPids } from "../src/worker-spawn-mark.js";
 
-// PRD #1156 (M3a) — the isolated per-root launcher. NO real Go binary, NO network,
-// NO setpriv/root: the supervisor is a FAKE process, every privileged/uid-resolving
-// step is injected.
+// PRD #1156 (M3a): the isolated per-root launcher uses a fake supervisor.
+// Most privileged steps are injected; the worker-UID regression exercises the
+// production runner-tree creator with real setpriv and the worker image binaries.
 
 const CODEX_BIN = "/opt/uzi-codex/0.159.3/bin/codex";
 const SUPERVISOR_BIN = "/usr/local/bin/uzi-codex-supervisor";
@@ -625,7 +625,9 @@ describe("launchCodexRoot: trusted construction contract", () => {
   it("the production tree creator refuses the chosen existing provider root before launch and preserves its contents",
     { skip: process.getuid?.() === WORKER_UID ? false : "requires the worker uid to launch the runner-owned creator" },
     async () => {
-      const parent = await fs.mkdtemp(path.join(os.tmpdir(), "uzi-codex-existing-"));
+      // The root entrypoint makes TMPDIR worker-private (0700). The real runner
+      // must traverse this fixture's parent to observe EEXIST, rather than EACCES.
+      const parent = await fs.mkdtemp(path.join("/tmp", "uzi-codex-existing-"));
       const root = path.join(parent, "chosen-provider-root");
       const marker = path.join(root, "keep.txt");
       try {
