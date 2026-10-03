@@ -632,12 +632,12 @@ describe("RunRunner — finalize ancestry bridge (PRD #1416 M3)", () => {
     );
   });
 
-  it("(merge arm) overlay skipped (null diff) → merge-aligned+bridged tip has BOTH P and H as ancestors", async () => {
+  it("(published workflows) null diff bypasses alignment and the bridged tip has BOTH P and H as ancestors", async () => {
     commitToOriginMain({ ".github/workflows/ci.yml": CI_V1 }, "seed workflows");
     const branch = "feature/rewritten-merge";
     const P = publishBranch(branch);
     const { github } = fakeGitHub();
-    // A null diff (D6 fail-open) makes canOverlay false → the merge fallback aligns.
+    // A null diff cannot prove alignment safe; preserve the permitted published workflow.
     git.changedFiles = (async () => null) as typeof git.changedFiles;
     const obs: { H?: string } = {};
     const claim = githubTaskClaim(branch, { open_mr: false });
@@ -645,7 +645,9 @@ describe("RunRunner — finalize ancestry bridge (PRD #1416 M3)", () => {
 
     assert.ok(statusesFor(claim.run_id).includes("completed"), "the run completed");
     assert.ok(originAncestor(P, branch), "P is an ancestor of the pushed tip");
-    assert.ok(obs.H && originAncestor(obs.H, branch), "H is an ancestor of the pushed tip (merge preserved it)");
+    assert.ok(obs.H && originAncestor(obs.H, branch), "H is an ancestor of the pushed tip (bridge preserved it)");
+    assert.strictEqual(gitIn(fx.originPath, ["show", `${branch}:.github/workflows/ci.yml`]).trim(), CI_V1.trim(),
+      "the permitted published workflow is preserved when the diff is unavailable");
   });
 
   it("(rebase fallback) merge push rejected for workflow scope → rebase → bridged + pushed with P an ancestor", async () => {
