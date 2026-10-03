@@ -28,6 +28,8 @@ through `[0.52.0]`.)
   Pane sizes use the shared header rows actually drawn, keeping the footer on the last terminal row when meters or optional hints are absent. The resize threshold and its hysteresis stay unchanged.
 - **Run failure diagnostics replace unsafe control characters ([#2196](https://github.com/vtmocanu/uzi/issues/2196)).**
   Generic failure logs, feed events and stored reasons replace control and bidirectional formatting characters after secret redaction, while preserving the existing 512-character report limit.
+- **A run's forge token and caches stay protected when a leftover process survives the reap ([#1828](https://github.com/vtmocanu/uzi/issues/1828)).**
+  On a Claude run, a process carrying the run's HOME that the worker could not kill, or a reap that could not finish, now blocks every credentialed git step (finalize push, failure settlement, pause, completion hold, wall park, credential switch, recovery and checkpoint publishes) the same way an unproven clone does: the run keeps custody or fails with `worker_residue_blocked`. A re-claimed run reaps its HOME before its clone fetch, and a park or the periodic disk reclaim drops the run's rebuildable caches only once no such process is left.
 
 ## [0.85.1] - 2026-10-03
 
