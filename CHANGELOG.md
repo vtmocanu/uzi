@@ -34,6 +34,9 @@ through `[0.52.0]`.)
 
 - **Forgejo responses are capped at 32 MiB ([#2220](https://github.com/vtmocanu/uzi/issues/2220)).**
   The Forgejo driver's client fails a request whose response body exceeds 32 MiB instead of buffering it whole, so an allowlisted but hostile forge can no longer make the api buffer an unbounded response through issue sync or any other Forgejo call. The weekly role-refresh script now reports dropped body lines under BusyBox `diff` too, and two uzi-lander fixture tests no longer depend on where `TMPDIR` points.
+- **Slack plan gates show the detected repo agent folder ([#2113](https://github.com/vtmocanu/uzi/issues/2113)).**
+  The gate message and repo approval confirmation now name `.codex/agents/` for a detected Codex roster, with `.claude/agents/` as the fallback for older or unsupported folder metadata; template and no-roster approvals keep their existing behavior.
+
 - **Worker UID ownership regressions run in required CI ([#2134](https://github.com/vtmocanu/uzi/issues/2134)).**
   The base worker image exercises privileged creation and ownership assertions, with a source-derived check that rejects missing or skipped tests.
 - **A job's output upload no longer retries past a deadline-capped wait.**

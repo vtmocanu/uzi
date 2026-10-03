@@ -125,14 +125,15 @@ const maxSlackSectionRunes = 2900
 // Descriptions are NEVER rendered (repo-authored free text); names are
 // IsValidName-validated kebab-case and additionally mrkdwn-escaped as defense in
 // depth.
-func gateBlocks(runID uuid.UUID, base string, repoAgentNames []string) []slack.Block {
+func gateBlocks(runID uuid.UUID, base string, repoAgentNames []string, repoAgentFolder string) []slack.Block {
+	repoAgentFolder = slackRepoAgentFolder(repoAgentFolder)
 	var section *slack.SectionBlock
 	var approveElems []slack.BlockElement
 
 	if len(repoAgentNames) > 0 {
 		section = slack.NewSectionBlock(
 			slack.NewTextBlockObject(slack.MarkdownType,
-				"*Plan ready for review.* This repo defines its own agents in `.claude/agents/`. "+
+				"*Plan ready for review.* This repo defines its own agents in `"+repoAgentFolder+"/`. "+
 					"Approve with the repo's agents, or with your own uzi templates.\n"+
 					gateAgentNamesLine(repoAgentNames),
 				false, false),
@@ -141,11 +142,11 @@ func gateBlocks(runID uuid.UUID, base string, repoAgentNames []string) []slack.B
 		repoBtn := slack.NewButtonBlockElement(ActionGateApproveRepo, runID.String(),
 			slack.NewTextBlockObject(slack.PlainTextType, fmt.Sprintf("Approve · repo agents (%d)", len(repoAgentNames)), false, false))
 		repoBtn.Style = slack.StylePrimary
-		repoBtn.Confirm = approveConfirm("repo", len(repoAgentNames))
+		repoBtn.Confirm = approveConfirm("repo", len(repoAgentNames), repoAgentFolder)
 
 		ownBtn := slack.NewButtonBlockElement(ActionGateApproveOwn, runID.String(),
 			slack.NewTextBlockObject(slack.PlainTextType, "Approve · my templates", false, false))
-		ownBtn.Confirm = approveConfirm("own", 0)
+		ownBtn.Confirm = approveConfirm("own", 0, repoAgentFolder)
 
 		approveElems = []slack.BlockElement{repoBtn, ownBtn}
 	} else {
@@ -190,13 +191,13 @@ func gateBlocks(runID uuid.UUID, base string, repoAgentNames []string) []slack.B
 // approveConfirm is the native confirm dialog for a source-scoped approve (PRD #37
 // M7): the opt-in record for choosing the repo's agents (vs the user's templates).
 // A repo confirm names the count; an own confirm needs none.
-func approveConfirm(source string, n int) *slack.ConfirmationBlockObject {
+func approveConfirm(source string, n int, repoAgentFolder string) *slack.ConfirmationBlockObject {
 	title, body := "Use your agent templates?", "The run will implement the plan using your uzi agent templates."
 	if source == "repo" {
 		title = "Use the repo's agents?"
 		body = fmt.Sprintf(
-			"The run will implement the plan using the %d agent(s) the repository defines in .claude/agents/ — not your uzi templates. "+
-				"They are authored by the repo, so their review is not uzi's own.", n)
+			"The run will implement the plan using the %d agent(s) the repository defines in %s/ — not your uzi templates. "+
+				"They are authored by the repo, so their review is not uzi's own.", n, slackRepoAgentFolder(repoAgentFolder))
 	}
 	return slack.NewConfirmationBlockObject(
 		slack.NewTextBlockObject(slack.PlainTextType, title, false, false),
@@ -204,6 +205,14 @@ func approveConfirm(source string, n int) *slack.ConfirmationBlockObject {
 		slack.NewTextBlockObject(slack.PlainTextType, "Approve", false, false),
 		slack.NewTextBlockObject(slack.PlainTextType, "Cancel", false, false),
 	)
+}
+
+// slackRepoAgentFolder limits rendered paths to the two supported roster folders.
+func slackRepoAgentFolder(folder string) string {
+	if folder == ".codex/agents" {
+		return folder
+	}
+	return ".claude/agents"
 }
 
 // gateAgentNamesLine renders the repo agent names as a mrkdwn line, capped at
