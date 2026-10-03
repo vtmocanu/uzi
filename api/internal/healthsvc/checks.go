@@ -246,8 +246,9 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 
 // checkFleetCapacity confirms stored roll waits against current composed eligibility.
 // The loop is bounded by the waiting rows and fleetCapacityMaxRollConfirmations; each
-// callback runs at most once under fleetCapacityConfirmTimeout, and a failed, timed-out
-// or over-cap row follows genuine capacity treatment without suppressing any sibling row.
+// callback runs at most once under fleetCapacityConfirmTimeout within the shared
+// fleetCapacityConfirmBudget, and a failed, timed-out, over-cap or over-budget row
+// follows genuine capacity treatment without suppressing any sibling row.
 func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health healthDetectorState) apitypes.HealthCheckDTO {
 	c := s.base("fleet.capacity")
 	switch health {
@@ -271,12 +272,15 @@ func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health 
 	unconfirmed := map[uuid.UUID]bool{}
 	var genuineSince, overdueSince time.Time
 	confirmations := 0
+	// One shared budget for every confirmation; ctx itself stays intact for later checks.
+	budgetCtx, cancelBudget := context.WithTimeout(ctx, fleetCapacityConfirmBudget)
+	defer cancelBudget()
 	for _, r := range rows {
 		confirmed := false
 		var overlap time.Time
-		if r.HasRollReason && r.HealthSince.Valid && r.HealthSince.InfinityModifier == pgtype.Finite && !r.HealthSince.Time.IsZero() && !r.HealthSince.Time.After(now) && s.cfg.WorkerEligibilityForHealth != nil && confirmations < fleetCapacityMaxRollConfirmations {
+		if r.HasRollReason && r.HealthSince.Valid && r.HealthSince.InfinityModifier == pgtype.Finite && !r.HealthSince.Time.IsZero() && !r.HealthSince.Time.After(now) && s.cfg.WorkerEligibilityForHealth != nil && confirmations < fleetCapacityMaxRollConfirmations && budgetCtx.Err() == nil {
 			confirmations++
-			cctx, cancel := context.WithTimeout(ctx, fleetCapacityConfirmTimeout)
+			cctx, cancel := context.WithTimeout(budgetCtx, fleetCapacityConfirmTimeout)
 			e, err := s.cfg.WorkerEligibilityForHealth(cctx, now, r.RunID)
 			cancel()
 			drain := e.LatestSuitableDrainingSince

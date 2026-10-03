@@ -20,6 +20,9 @@ const (
 	// fleetCapacityConfirmTimeout bounds each eligibility callback so a slow database
 	// cannot hold the health request; a timed-out row stays unconfirmed.
 	fleetCapacityConfirmTimeout = 2 * time.Second
+	// fleetCapacityConfirmBudget bounds all confirmations of one evaluation together, well
+	// under the api's 15s write timeout; rows left when it runs out stay unconfirmed.
+	fleetCapacityConfirmBudget = 4 * time.Second
 	// fleetCapacityDanger: an owner with a waiting_worker run and zero usable workers is
 	// a danger once the oldest such wait has lasted this long. Below it the capacity gap
 	// may be a transient claim delay, so it does not yet alarm.

@@ -1016,6 +1016,43 @@ func TestFleetCapacityRollConfirmationBounded(t *testing.T) {
 	}
 }
 
+// TestFleetCapacityRollConfirmationBudget pins the shared confirmation budget: slow
+// callbacks that each run to their own deadline stop being made once the budget is
+// spent, the evaluation returns well inside the api write timeout, the unconfirmed
+// rows take genuine treatment, and the caller's context survives for later checks.
+func TestFleetCapacityRollConfirmationBudget(t *testing.T) {
+	rows := make([]store.ListOwnersWaitingNoCapacityRow, 10)
+	for i := range rows {
+		rows[i] = store.ListOwnersWaitingNoCapacityRow{UserID: uuid.New(), RunID: uuid.New(), HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-time.Hour), Valid: true}, HasRollReason: true}
+	}
+	svc := newSvc(&fakeStore{capacityRows: rows}, &fakeSettings{})
+	calls := 0
+	svc.cfg.WorkerEligibilityForHealth = func(ctx context.Context, _ time.Time, _ uuid.UUID) (store.CountOnlineWorkersClaimableForRunRow, error) {
+		calls++
+		<-ctx.Done()
+		return store.CountOnlineWorkersClaimableForRunRow{}, ctx.Err()
+	}
+	ctx := context.Background()
+	start := time.Now()
+	c := svc.checkFleetCapacity(ctx, fixedNow, healthDetectorEnabled)
+	elapsed := time.Since(start)
+	// The api's WriteTimeout (api/cmd/server/main.go) is the absolute ceiling: a
+	// constant-relative bound would pass a mutation that inflated the budget itself.
+	const apiWriteTimeout = 15 * time.Second
+	if elapsed >= apiWriteTimeout/2 {
+		t.Fatalf("evaluation took %s, want well under the %s api write timeout", elapsed, apiWriteTimeout)
+	}
+	if calls >= len(rows) {
+		t.Fatalf("calls=%d for %d rows: confirmations continued after the budget ran out", calls, len(rows))
+	}
+	if ctx.Err() != nil {
+		t.Fatal("caller context was cancelled")
+	}
+	if c.Severity != sevDanger || !strings.Contains(c.Summary, fmt.Sprintf("%d owner(s) affected", len(rows))) {
+		t.Fatalf("over-budget rows must stay unconfirmed: severity=%s summary=%s", c.Severity, c.Summary)
+	}
+}
+
 func TestFleetCapacityGenuineThresholdActions(t *testing.T) {
 	for _, age := range []time.Duration{5*time.Minute - time.Second, 5 * time.Minute} {
 		t.Run(age.String(), func(t *testing.T) {
