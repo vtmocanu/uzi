@@ -231,9 +231,13 @@ func (s *Service) PlanCrossCheckStatus(ctx context.Context, worker store.Worker,
 		(lead.Status != "claimed" && lead.Status != "running") {
 		return store.CrossCheck{}, 0, ErrCrossCheckRefused
 	}
-	_, err = q.ExpirePlanCrossCheck(ctx, store.ExpirePlanCrossCheckParams{
+	expired, err := q.ExpirePlanCrossCheck(ctx, store.ExpirePlanCrossCheckParams{
 		LeadRunID: leadID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation,
 	})
+	var eventPayload []byte
+	if err == nil {
+		lead.LastSeq, eventPayload, err = appendPlanCrossCheckEvent(ctx, q, lead, store.CrossCheck(expired), "server")
+	}
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return store.CrossCheck{}, 0, err
 	}
@@ -253,6 +257,9 @@ func (s *Service) PlanCrossCheckStatus(ctx context.Context, worker store.Worker,
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return cc, 0, err
+	}
+	if eventPayload != nil && s.bcast != nil {
+		s.bcast.PublishMessage(lead.ID, lead.LastSeq, "cross_check", "", "", "", eventPayload, s.now())
 	}
 	return cc, lead.LastSeq, nil
 }
@@ -301,43 +308,9 @@ func (s *Service) DecidePlanCrossCheck(ctx context.Context, worker store.Worker,
 	if banked != 1 {
 		return cc, ErrCrossCheckRefused
 	}
-	payload, err := json.Marshal(map[string]any{"stage": "plan", "verdict": verdict, "reason_class": reason, "findings": json.RawMessage(findings), "checker_run_id": childID, "findings_author": "model"})
+	seq, payload, err := appendPlanCrossCheckEvent(ctx, q, lead, cc, "model")
 	if err != nil {
 		return cc, err
-	}
-	inserted := false
-	var seq int32
-	for attempt := 0; attempt < 32; attempt++ {
-		next, nextErr := q.NextPlanCrossCheckMessageSeq(ctx, store.NextPlanCrossCheckMessageSeqParams{
-			LeadRunID: lead.ID, ClaimGeneration: lead.ClaimGeneration,
-		})
-		if nextErr != nil {
-			return cc, nextErr
-		}
-		seq = next
-		result, insertErr := q.InsertRunMessage(ctx, store.InsertRunMessageParams{
-			RunID: lead.ID, Seq: seq, Kind: "cross_check", Payload: payload,
-			ClaimGeneration: pgconv.Int8Ptr(&lead.ClaimGeneration),
-		})
-		if insertErr != nil {
-			return cc, insertErr
-		}
-		if result.Inserted {
-			inserted = true
-			break
-		}
-	}
-	if !inserted {
-		return cc, ErrCrossCheckRefused
-	}
-	advanced, err := q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{
-		ID: lead.ID, Seq: seq, ClaimGeneration: pgconv.Int8Ptr(&lead.ClaimGeneration),
-	})
-	if err != nil {
-		return cc, err
-	}
-	if advanced != 1 {
-		return cc, ErrCrossCheckRefused
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return cc, err
@@ -346,4 +319,61 @@ func (s *Service) DecidePlanCrossCheck(ctx context.Context, worker store.Worker,
 		s.bcast.PublishMessage(lead.ID, seq, "cross_check", "", "", "", payload, s.now())
 	}
 	return cc, nil
+}
+
+// appendPlanCrossCheckEvent is used by current-generation poll expiry and verdict
+// transactions holding the lead lock. It tries at most 32 sequence collisions;
+// any query or generation-fence failure aborts the transaction. Queries use ctx.
+// Worker ingestion continues to reject this reserved message kind.
+func appendPlanCrossCheckEvent(ctx context.Context, q *store.Queries, lead store.Run, cc store.CrossCheck, author string) (int32, []byte, error) {
+	if cc.LeadRunID != lead.ID || cc.LeadClaimGeneration != lead.ClaimGeneration || cc.Verdict == "pending" {
+		return 0, nil, ErrCrossCheckRefused
+	}
+	var childID *uuid.UUID
+	if cc.CheckerRunID.Valid {
+		id := uuid.UUID(cc.CheckerRunID.Bytes)
+		childID = &id
+	}
+	payload, err := json.Marshal(map[string]any{"stage": "plan", "verdict": cc.Verdict, "reason_class": cc.ReasonClass.String, "findings": json.RawMessage(cc.Findings), "checker_run_id": childID, "findings_author": author})
+	if err != nil {
+		return 0, nil, err
+	}
+	inserted := false
+	var seq int32
+	for attempt := 0; attempt < 32; attempt++ {
+		next, nextErr := q.NextPlanCrossCheckMessageSeq(ctx, store.NextPlanCrossCheckMessageSeqParams{
+			LeadRunID: lead.ID, ClaimGeneration: lead.ClaimGeneration,
+		})
+		if nextErr != nil {
+			return 0, nil, nextErr
+		}
+		seq = next
+		result, insertErr := q.InsertRunMessage(ctx, store.InsertRunMessageParams{
+			RunID: lead.ID, Seq: seq, Kind: "cross_check", Payload: payload,
+			ClaimGeneration: pgconv.Int8Ptr(&lead.ClaimGeneration),
+		})
+		if insertErr != nil {
+			return 0, nil, insertErr
+		}
+		if !result.GenerationLive {
+			return 0, nil, ErrCrossCheckRefused
+		}
+		if result.Inserted {
+			inserted = true
+			break
+		}
+	}
+	if !inserted {
+		return 0, nil, ErrCrossCheckRefused
+	}
+	advanced, err := q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{
+		ID: lead.ID, Seq: seq, ClaimGeneration: pgconv.Int8Ptr(&lead.ClaimGeneration),
+	})
+	if err != nil {
+		return 0, nil, err
+	}
+	if advanced != 1 {
+		return 0, nil, ErrCrossCheckRefused
+	}
+	return seq, payload, nil
 }

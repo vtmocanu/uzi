@@ -55,7 +55,11 @@ func NormalizeCrossCheckFindings(verdict, reason string, raw []byte) ([]byte, er
 		default:
 			return nil, ErrCrossCheckRefused
 		}
-		item.File = normalizeCrossCheckIdentifier(item.File, 512)
+		file, err := normalizeCrossCheckIdentifier(item.File, 512)
+		if err != nil {
+			return nil, err
+		}
+		item.File = file
 		item.Summary = scrubThenBound(item.Summary, 1024)
 		item.Rationale = scrubThenBound(item.Rationale, 2048)
 		if len(item.File)+len(item.Severity)+len(item.Summary)+len(item.Rationale) > 2*1024 {

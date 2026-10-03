@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -22,9 +23,32 @@ func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store,
 	switch reason {
 	case "", "revise", "block", "malformed", "model_error", "model_timeout",
 		"checker_unavailable", "confinement_failed", "timed_out", "superseded",
-		"codex_lead_unsupported", "planning_diff_refused", "interrupted":
+		"codex_lead_unsupported", "planning_diff_refused", "interrupted", "candidate_refused", "checker_failed":
 	default:
 		return ErrInvalidState
+	}
+	if req.PlanCrossCheckRefusal != "" && reason != "candidate_refused" && reason != "checker_failed" {
+		return ErrInvalidState
+	}
+	if reason == "candidate_refused" || reason == "checker_failed" {
+		if !lead.PlanCrossCheckRequired || !lead.AutoApprove || lead.Harness != string(HarnessClaude) ||
+			req.ClaimGeneration == nil || *req.ClaimGeneration != lead.ClaimGeneration ||
+			lead.ClaimReleasedAt.Valid || lead.WorkerID != pgconv.UUID(worker.ID) || lead.UserID != worker.UserID ||
+			(lead.Status != "claimed" && lead.Status != "running") {
+			return ErrInvalidState
+		}
+		switch reason {
+		case "candidate_refused":
+			switch req.PlanCrossCheckRefusal {
+			case "candidate_too_large", "candidate_invalid", "envelope_too_large":
+			default:
+				return ErrInvalidState
+			}
+		case "checker_failed":
+			if req.PlanCrossCheckRefusal != "submit_failed" {
+				return ErrInvalidState
+			}
+		}
 	}
 	if req.PlanCrossCheckDiffRefusal != "" && reason != "planning_diff_refused" {
 		return ErrInvalidState
@@ -78,6 +102,10 @@ func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store,
 		if err != nil {
 			return err
 		}
+	case "candidate_refused", "checker_failed":
+		// GetPlanCrossCheck proved absence under the owning lead transaction's
+		// lock. This attestation only parks the lead; it grants no plan authority.
+		return nil
 	case "planning_diff_refused":
 		// This bounded declaration attests capture failure; it never authorizes a pass.
 		if lead.Harness != string(HarnessClaude) || worker.IsolatedLane {

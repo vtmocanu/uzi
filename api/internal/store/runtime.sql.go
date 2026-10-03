@@ -4052,6 +4052,7 @@ WITH expired AS (
       AND lead.worker_id = $2 AND lead.claim_generation = $3
       AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
       AND cc.stage = 'plan' AND cc.round = 1
+      AND cc.lead_claim_generation = lead.claim_generation
       AND cc.verdict = 'pending' AND cc.deadline_at <= now()
     RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at
 ), cancelled AS (
@@ -14556,8 +14557,10 @@ UPDATE runs SET
             THEN (SELECT CASE WHEN cc.verdict = 'approve' THEN NULL ELSE COALESCE(cc.reason_class, cc.verdict) END
                   FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan' AND cc.round = 1)
         WHEN NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan')
-            THEN COALESCE($6::text,
-                CASE WHEN runs.plan_md IS NOT DISTINCT FROM $1 THEN plan_cross_check_gate_reason END)
+            THEN CASE WHEN runs.claim_generation > 1 OR runs.plan_cross_check_gate_reason = 'interrupted'
+                THEN 'interrupted'
+                ELSE COALESCE($6::text,
+                    CASE WHEN runs.plan_md IS NOT DISTINCT FROM $1 THEN plan_cross_check_gate_reason END) END
         ELSE 'interrupted' END,
     status     = 'awaiting_approval',
     status_since = now(),

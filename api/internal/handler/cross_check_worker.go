@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -61,18 +62,30 @@ func (h *Handler) WorkerSubmitPlanCrossCheck(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	var req planCrossCheckRequest
-	if httpx.DecodeJSONStrict(r, &req) != nil || req.Stage != "plan" || req.ClaimGeneration == nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid cross-check request")
+	if err := httpx.DecodeJSONStrictBounded(r, &req, 8<<20); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			httpx.ErrorReason(w, http.StatusRequestEntityTooLarge, "cross-check envelope exceeds limit", "envelope_too_large")
+		} else {
+			httpx.ErrorReason(w, http.StatusBadRequest, "invalid cross-check request", "candidate_invalid")
+		}
+		return
+	}
+	if req.Stage != "plan" || req.ClaimGeneration == nil {
+		httpx.ErrorReason(w, http.StatusBadRequest, "invalid cross-check request", "candidate_invalid")
 		return
 	}
 	c := req.PlanCrossCheckCandidate
-	if len(c.PlanMd) > 256*1024 || len(c.PlanningDiff) > 512*1024 || len(c.Milestones) > 256*1024 {
-		httpx.Error(w, http.StatusBadRequest, "candidate exceeds limit")
+	if len(c.PlanMd) > 256*1024 || len(c.PlanningDiff) > 512*1024 || len(c.Milestones) > 256*1024 ||
+		len(c.RequiredCapabilities) > 64 || len(c.RequiredTools) > 64 {
+		httpx.ErrorReason(w, http.StatusBadRequest, "candidate exceeds limit", "candidate_too_large")
 		return
 	}
 	c, normalizeErr := workersvc.NormalizePlanCrossCheckCandidate(c)
-	if normalizeErr != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid cross-check candidate")
+	if normalizeErr != nil || c.PlanMd == "" || len(c.BaseCommit) != 40 ||
+		strings.Trim(c.BaseCommit, "0123456789abcdefABCDEF") != "" ||
+		(c.SizeClass != "s" && c.SizeClass != "m" && c.SizeClass != "l") {
+		httpx.ErrorReason(w, http.StatusBadRequest, "invalid cross-check candidate", "candidate_invalid")
 		return
 	}
 	cc, err := h.wsvc.SubmitPlanCrossCheck(r.Context(), worker, id, *req.ClaimGeneration, c)

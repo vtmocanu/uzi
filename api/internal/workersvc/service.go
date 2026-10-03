@@ -3526,6 +3526,7 @@ type StateRequest struct {
 	CandidateDigest           string  `json:"candidate_digest,omitempty"`
 	PlanCrossCheckGateReason  *string `json:"plan_cross_check_gate_reason"`
 	PlanCrossCheckDiffRefusal string  `json:"plan_cross_check_diff_refusal"`
+	PlanCrossCheckRefusal     string  `json:"plan_cross_check_refusal"`
 	PlanMd                    *string `json:"plan_md"`
 	Branch                    *string `json:"branch"`
 	MrIID                     *int64  `json:"mr_iid"`
@@ -4253,7 +4254,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			if err := s.validatePlanCrossCheckGateReason(ctx, q, wkr, owned, req); err != nil {
 				return owned, false, err
 			}
-		} else if req.PlanCrossCheckGateReason != nil || req.PlanCrossCheckDiffRefusal != "" {
+		} else if req.PlanCrossCheckGateReason != nil || req.PlanCrossCheckDiffRefusal != "" || req.PlanCrossCheckRefusal != "" {
 			return owned, false, ErrInvalidState
 		}
 		approvalParams := store.SetRunAwaitingApprovalParams{

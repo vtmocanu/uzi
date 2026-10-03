@@ -14,8 +14,13 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
 
-func normalizeCrossCheckIdentifier(s string, max int) string {
-	return scrubThenBound(strings.TrimSpace(termsafe.CellText(s)), max)
+func normalizeCrossCheckIdentifier(s string, max int) (string, error) {
+	// Printable sentinels let Validate inspect the original bytes without rejecting
+	// edge spaces that this boundary has always trimmed. Controls remain interior.
+	if len(s) > max || termsafe.Validate("cross-check identifier", "x"+s+"x") != nil {
+		return "", ErrCrossCheckRefused
+	}
+	return scrubThenBound(strings.TrimSpace(s), max), nil
 }
 
 // NormalizePlanCrossCheckCandidate defines the sole canonical text boundary for
@@ -25,6 +30,17 @@ func NormalizePlanCrossCheckCandidate(c PlanCrossCheckCandidate) (PlanCrossCheck
 	if len(c.PlanMd) > 256*1024 || len(c.PlanningDiff) > 512*1024 || len(c.Milestones) > 256*1024 ||
 		len(c.RequiredCapabilities) > 64 || len(c.RequiredTools) > 64 {
 		return c, ErrCrossCheckRefused
+	}
+	// Decode the actual apitypes.Milestone shape before prose scrubbing can
+	// erase an unsafe ID. Unknown nested fields are prose, not milestone IDs.
+	milestones, err := DecodeMilestones(c.Milestones)
+	if err != nil {
+		return c, ErrCrossCheckRefused
+	}
+	for _, milestone := range milestones {
+		if len(milestone.ID) > 64 || termsafe.Validate("milestone id", "x"+milestone.ID+"x") != nil {
+			return c, ErrCrossCheckRefused
+		}
 	}
 	c.PlanMd = scrubThenBound(c.PlanMd, 256*1024)
 	c.PlanningDiff = scrubThenBound(c.PlanningDiff, 512*1024)
@@ -56,7 +72,8 @@ func NormalizePlanCrossCheckCandidate(c PlanCrossCheckCandidate) (PlanCrossCheck
 			}
 		case map[string]any:
 			for key, child := range item {
-				if key != normalizeCrossCheckIdentifier(key, 128) {
+				cleanKey, err := normalizeCrossCheckIdentifier(key, 128)
+				if err != nil || key != cleanKey {
 					return nil, ErrCrossCheckRefused
 				}
 				next, err := scrub(child, depth+1)
@@ -77,13 +94,19 @@ func NormalizePlanCrossCheckCandidate(c PlanCrossCheckCandidate) (PlanCrossCheck
 		return c, ErrCrossCheckRefused
 	}
 	for i, s := range c.RequiredCapabilities {
-		c.RequiredCapabilities[i] = normalizeCrossCheckIdentifier(s, 256)
+		c.RequiredCapabilities[i], err = normalizeCrossCheckIdentifier(s, 256)
+		if err != nil {
+			return c, err
+		}
 	}
 	for i, s := range c.RequiredTools {
-		c.RequiredTools[i] = normalizeCrossCheckIdentifier(s, 256)
+		c.RequiredTools[i], err = normalizeCrossCheckIdentifier(s, 256)
+		if err != nil {
+			return c, err
+		}
 	}
-	c.SizeClass = normalizeCrossCheckIdentifier(c.SizeClass, 64)
-	return c, nil
+	c.SizeClass, err = normalizeCrossCheckIdentifier(c.SizeClass, 64)
+	return c, err
 }
 
 func bindPlanCrossCheckWrite(p *store.SetRunAutopilotPlanParams, run store.Run, req *StateRequest) error {

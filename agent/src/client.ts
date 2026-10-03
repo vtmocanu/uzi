@@ -83,7 +83,7 @@ import {
 
 export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model_error" | "model_timeout"
   | "checker_unavailable" | "confinement_failed" | "timed_out" | "superseded"
-  | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted";
+  | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted" | "candidate_refused" | "checker_failed";
 export type ClaimResponse = ProtocolClaimResponse & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunListItem = ProtocolWorkerRunListItem & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
@@ -112,6 +112,7 @@ export type PlanCrossCheckResponse =
 export type PlanCrossCheckStateRequest = StateRequest & {
   plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null;
   plan_cross_check_diff_refusal?: PlanCrossCheckDiffRefusal;
+  plan_cross_check_refusal?: "candidate_too_large" | "candidate_invalid" | "envelope_too_large" | "submit_failed";
 };
 
 /** A job input file download hit its per-file timeout (WorkerClient#downloadJobFile), before or
@@ -2545,7 +2546,7 @@ function retryAfterMsOf(h: string | null): number | undefined {
 
 /** Cross-check response budget, including Go JSON escaping (up to 6 bytes per input byte).
  * NormalizePlanCrossCheckCandidate caps plan/diff at 256/512 KiB, milestones JSON at 256 KiB,
- * and 128 capability/tool names at 256 bytes each (32 KiB). NormalizeCrossCheckFindings caps
+ * and 64 capability plus 64 tool names at 256 bytes each (32 KiB). NormalizeCrossCheckFindings caps
  * serialized findings at 32 KiB. Thus 6 * (256 + 512 + 32) + 256 + 32 = 5088 KiB;
  * reserving another 64 KiB for keys/metadata stays below 6 MiB. Count actual streamed bytes,
  * never Content-Length; only the three cross-check methods opt in. */

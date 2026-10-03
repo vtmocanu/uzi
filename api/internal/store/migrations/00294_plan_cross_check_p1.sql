@@ -6,7 +6,7 @@ ALTER TABLE cross_checks DROP CONSTRAINT cross_checks_checker_run_id_fkey,
 ALTER TABLE runs ADD COLUMN plan_cross_check_gate_reason text
     CHECK (plan_cross_check_gate_reason IN ('revise', 'block', 'malformed', 'model_error', 'model_timeout',
         'checker_unavailable', 'confinement_failed', 'timed_out', 'superseded', 'codex_lead_unsupported',
-        'planning_diff_refused', 'interrupted'));
+        'planning_diff_refused', 'interrupted', 'candidate_refused', 'checker_failed'));
 ALTER TABLE cross_checks ADD CONSTRAINT cross_checks_reason_class_check CHECK (
     reason_class IS NULL
     OR (verdict IN ('approve', 'revise', 'block') AND reason_class = verdict)
