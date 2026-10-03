@@ -274,14 +274,18 @@ valid byte and inode sample confirms fullness. After execution and reports
 settle, uzi waits for one bounded reclaim pass, then parks even if room
 returns; it does not replay the command, provider or executor. This does not
 attribute the failed write: an unrelated opaque error can coincide with
-fullness and be deferred. For refusals, only completely erased-origin opaque
+fullness and be deferred. For actual trusted refusals, only completely erased-origin opaque
 failures remain eligible under this accepted coincidence residual. The cap
 bounds repetition, not misclassification;
-`0` remains unlimited. Recognizable security/guardrail and trusted
-admission, launcher or plan-wiring refusals remain excluded, including
-preserved leading diagnostic context prefixes and `cause`/`interruption`
-wrappers. Trusted refusal types retain their identity; complete legacy
-reasons are recognized. Ordinary opaque failures keep their existing handling. This boundary is pinned by the exclusion fixtures
+`0` remains unlimited. Recognizable typed, wrapped or trusted
+security/guardrail failures remain excluded, including admission, launcher
+and plan-wiring refusals. Preserved trusted types and `cause`/`interruption`
+wrappers remain excluded. Complete legacy reasons are recognized directly
+and through leading `<context>: <reason>` envelopes with a literal colon
+and space. Contexts may contain apostrophes; double-quoted or multiline
+contexts, alternate separators, quoted reason diagnostics and
+producer-domain near-misses are not legacy refusal envelopes. Ordinary
+opaque failures keep their existing handling. This boundary is pinned by the exclusion fixtures
 in `agent/test/runner-terminal-disk-deferral.test.ts`. Setup,
 finalize and settlement failures, typed recovery outcomes, cancellation,
 pause and shutdown keep their handling. Unknown accounting, incompatible

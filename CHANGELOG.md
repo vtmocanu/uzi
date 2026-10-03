@@ -25,7 +25,7 @@ through `[0.52.0]`.)
 ### Fixed
 
 - **Trusted launch, admission and plan-gate refusals no longer park a run as a disk-full failure ([#1829](https://github.com/vtmocanu/uzi/issues/1829)).**
-  These refusals keep their failure handling even when the data volume is full, including when diagnostic context is added or another error wraps them. Ordinary opaque failures are unchanged; a refusal whose origin has been completely erased can still coincide with fullness and be deferred.
+  These refusals keep their failure handling even when the data volume is full, including preserved trusted types, cause/interruption wrappers and complete legacy reasons prefixed by `<context>: <reason>` (a literal colon and space). Apostrophes in context are supported; double-quoted or multiline contexts, alternate separators, quoted reasons and producer-domain near-misses are not legacy refusal envelopes. Ordinary opaque failures are unchanged; a refusal whose origin has been completely erased can still coincide with fullness and be deferred.
 
 - **Worker UID ownership regressions run in required CI ([#2134](https://github.com/vtmocanu/uzi/issues/2134)).**
   The base worker image exercises privileged creation and ownership assertions, with a source-derived check that rejects missing or skipped tests.
