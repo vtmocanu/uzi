@@ -11,6 +11,8 @@ import path from "node:path";
 // Fixtures take a short socket path from shortUnixSocket and bind through listenUnix, which fails
 // fast and names the path.
 const UNIX_SOCKET_PATH_MAX_BYTES = 103;
+// FD numbers recycle; each fallback endpoint needs its own HTTP connection-pool key.
+let socketSequence = 0;
 
 function assertSocketPathFits(socket: string): void {
   const bytes = Buffer.byteLength(socket);
@@ -39,7 +41,7 @@ export function shortUnixSocket(base = os.tmpdir()): { socket: string; directory
     if (process.platform === "linux" && Buffer.byteLength(socket) > UNIX_SOCKET_PATH_MAX_BYTES &&
         Buffer.byteLength(path.relative(process.cwd(), socket)) <= UNIX_SOCKET_PATH_MAX_BYTES) {
       directoryFd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
-      socket = `/dev/fd/${directoryFd}/d.sock`;
+      socket = `/dev/fd/${directoryFd}/d-${++socketSequence}.sock`;
       if (fs.realpathSync(path.dirname(socket)) !== fs.realpathSync(dir)) {
         throw new Error("unix socket directory FD does not resolve to its owned directory");
       }

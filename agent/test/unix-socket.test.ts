@@ -32,6 +32,69 @@ after(() => {
 });
 
 if (process.platform === "linux") {
+  it("successive directory-FD socket lifetimes isolate HTTP endpoints when the FD is reused", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "socket-reuse-"));
+    const cwd = process.cwd();
+    const base = path.join(root, "p".repeat(Math.max(1, 104 - Buffer.byteLength(root))));
+    fs.mkdirSync(base);
+    const makeFixture = (): ReturnType<typeof shortUnixSocket> => {
+      try {
+        process.chdir(root);
+        return shortUnixSocket(base);
+      } finally {
+        process.chdir(cwd);
+      }
+    };
+    let fixture: ReturnType<typeof shortUnixSocket> | undefined;
+    const reserved: number[] = [];
+    try {
+      fixture = makeFixture();
+      const firstSocket = fixture.socket;
+      const firstFd = fixture.directoryFd;
+      assert.ok(firstFd !== undefined);
+      // Reserve lower slots released by HTTP so the next factory reuses this directory FD.
+      for (const body of ["first daemon", "second daemon"]) {
+        const socket = fixture.socket;
+        const server = http.createServer((_req, res) => res.end(body));
+        try {
+          await listenUnix(server, fixture.socket);
+          const response = await new Promise<string>((resolve, reject) => {
+            const req = http.get({ socketPath: socket, path: "/ping" }, res => {
+              let received = "";
+              res.on("data", chunk => received += chunk);
+              res.on("end", () => resolve(received));
+            });
+            req.on("error", reject);
+            req.setTimeout(3000, () => req.destroy(new Error("HTTP timeout")));
+          });
+          assert.equal(response, body);
+        } finally {
+          server.closeAllConnections();
+          await new Promise<void>(resolve => server.close(() => resolve()));
+          if (body === "first daemon") {
+            // At most firstFd + 1 opens fill lower slots; an open failure aborts this test.
+            for (let attempt = 0; attempt <= firstFd; attempt++) {
+              const fd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+              reserved.push(fd);
+              if (fd > firstFd) break;
+            }
+          }
+          fixture.dispose();
+        }
+        if (body === "first daemon") {
+          fixture = makeFixture();
+          assert.equal(fixture.directoryFd, firstFd, "the parent directory FD is recycled");
+          assert.ok(path.isAbsolute(fixture.socket));
+          assert.notEqual(fixture.socket, firstSocket, "factory lifetimes have distinct HTTP pool keys");
+        }
+      }
+    } finally {
+      fixture?.dispose();
+      for (const fd of reserved) fs.closeSync(fd);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("long physical socket round-trips HTTP through owned directory FDs in child and grandchild", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "socket-fd-"));
     const cwd = process.cwd();
@@ -40,7 +103,8 @@ if (process.platform === "linux") {
     let fixture: ReturnType<typeof shortUnixSocket> | undefined;
     let child: ChildProcess | undefined;
     let childExit: Promise<void> | undefined;
-    const server = http.createServer((_req, res) => res.end("owned socket HTTP"));
+    const body = "owned socket HTTP";
+    const server = http.createServer((_req, res) => res.end(body));
     try {
       try {
         process.chdir(root);
@@ -50,11 +114,12 @@ if (process.platform === "linux") {
       }
       const { socket, directoryFd } = fixture;
       assert.ok(directoryFd !== undefined);
-      assert.equal(socket, `/dev/fd/${directoryFd}/d.sock`);
+      assert.ok(socket.startsWith(`/dev/fd/${directoryFd}/`));
+      const childSocket = socket.replace(`/dev/fd/${directoryFd}/`, "/dev/fd/3/");
       assert.ok(path.isAbsolute(socket));
       assert.ok(Buffer.byteLength(socket) <= 103);
       const physicalDir = fs.realpathSync(path.dirname(socket));
-      const physical = path.join(physicalDir, "d.sock");
+      const physical = path.join(physicalDir, path.basename(socket));
       assert.ok(physicalDir.startsWith(`${root}${path.sep}`));
       assert.ok(Buffer.byteLength(physical) > 103);
       assert.ok(Buffer.byteLength(path.relative(root, physical)) <= 103);
@@ -62,13 +127,23 @@ if (process.platform === "linux") {
       assert.equal(fs.realpathSync(socket), physical);
       assert.ok(fs.lstatSync(physical).isSocket());
       assert.equal(fs.statSync(socket).ino, fs.statSync(physical).ino);
+      const parentBody = await new Promise<string>((resolve, reject) => {
+        const req = http.get({ socketPath: socket, path: "/ping" }, res => {
+          let response = "";
+          res.on("data", chunk => response += chunk);
+          res.on("end", () => resolve(response));
+        });
+        req.on("error", reject);
+        req.setTimeout(3000, () => req.destroy(new Error("HTTP timeout")));
+      });
+      assert.equal(parentBody, body);
       const request = `
 const http = require("node:http");
-const req = http.get({ socketPath: "/dev/fd/3/d.sock", path: "/ping" }, res => {
+const req = http.get({ socketPath: ${JSON.stringify(childSocket)}, path: "/ping" }, res => {
   let body = "";
   res.on("data", chunk => body += chunk);
   res.on("end", () => {
-    if (res.statusCode !== 200 || body !== "owned socket HTTP") process.exitCode = 1;
+    if (res.statusCode !== 200 || body !== ${JSON.stringify(body)}) process.exitCode = 1;
     else process.stdout.write(body + "\\n");
   });
 });
@@ -99,7 +174,7 @@ ${request}`;
         });
       });
       await childExit;
-      assert.deepEqual(stdout.trim().split("\n"), ["owned socket HTTP", "owned socket HTTP"]);
+      assert.deepEqual(stdout.trim().split("\n"), [body, body]);
       await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
       fixture.dispose();
       fixture.dispose();
