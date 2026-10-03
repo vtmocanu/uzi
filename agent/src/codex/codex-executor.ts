@@ -52,6 +52,7 @@
 // post-run sinks and the runner disposes it via `safety.dispose` after the last sink (F1);
 // STANDALONE, run()'s finally backstops the registry teardown itself.
 
+import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -761,7 +762,7 @@ export function buildAppServerRefreshBridge(
 ): CodexSubscriptionRefreshBridge {
   if (binding.authMode !== "subscription") {
     // Fail-closed guard: an api_key credential can never refresh (mirrors the reconcile).
-    throw new Error("codex app-server refresh bridge requires a subscription binding");
+    throw new TrustedExecutionRefusal("codex app-server refresh bridge requires a subscription binding");
   }
   const { capability, chatgptAccountId } = binding;
   let lastSeenOperationId: string | undefined;
@@ -786,7 +787,7 @@ export function buildAppServerRefreshBridge(
       const observedGeneration = committed.value;
       if (observedGeneration === undefined) {
         // A subscription binding always carries a generation; its absence is a protocol fault.
-        throw new Error("codex app-server refresh has no observed generation");
+        throw new TrustedExecutionRefusal("codex app-server refresh has no observed generation");
       }
       let res: Awaited<ReturnType<typeof client.refreshCodex>>;
       try {
@@ -1129,7 +1130,7 @@ export class FailClosedExecutor implements Executor {
   constructor(private readonly message: string) {}
 
   run(_ctx: RunContext): Promise<ExecutorResult> {
-    return Promise.reject(new Error(this.message));
+    return Promise.reject(new TrustedExecutionRefusal(this.message));
   }
 }
 
@@ -1313,7 +1314,7 @@ async function ensureCodexSharedDirectoryInner(
   try {
     let before = await handle.stat();
     if (!before.isDirectory()) {
-      throw new Error("Codex shared data directory has an unexpected owner or group");
+      throw new TrustedExecutionRefusal("Codex shared data directory has an unexpected owner or group");
     }
 
     // Opt-in destructive recovery of a PRE-EXISTING disposable worker-group parent (PRD #58
@@ -1352,7 +1353,7 @@ async function ensureCodexSharedDirectoryInner(
       handle = await fs.open(dir, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
       before = await handle.stat();
       if (!before.isDirectory()) {
-        throw new Error("Codex shared data directory has an unexpected owner or group");
+        throw new TrustedExecutionRefusal("Codex shared data directory has an unexpected owner or group");
       }
       // Dispose of the transient tombstone SAFELY: relocate it under a worker-only-parented, 0700
       // quarantine beneath <dataDir> and recursively remove only that private subtree. If the
@@ -1377,7 +1378,7 @@ async function ensureCodexSharedDirectoryInner(
     }
     const owned = await handle.stat();
     if (owned.uid !== expect.uid || owned.gid !== expect.gid) {
-      throw new Error("Codex shared data directory has an unexpected owner or group");
+      throw new TrustedExecutionRefusal("Codex shared data directory has an unexpected owner or group");
     }
     // PRD #1493 M3 (D7): enforce 3770 — sticky PLUS setgid — for EVERY caller (per-run
     // HOME, codex-data, and the two disposable advice parents). The sticky bit makes a
@@ -1390,7 +1391,7 @@ async function ensureCodexSharedDirectoryInner(
     await handle.chmod(0o3770);
     const after = await handle.stat();
     if ((after.mode & 0o7777) !== 0o3770) {
-      throw new Error("Codex shared data directory has an unexpected mode");
+      throw new TrustedExecutionRefusal("Codex shared data directory has an unexpected mode");
     }
   } finally {
     await handle.close();
@@ -1463,10 +1464,10 @@ async function disposeCodexRecoveryTombstone(
 
 export async function prepareCodexRunHome(homeRoot: string): Promise<void> {
   if (!path.isAbsolute(homeRoot) || path.resolve(homeRoot) !== homeRoot || homeRoot === path.parse(homeRoot).root) {
-    throw new Error("Codex run HOME must be a canonical absolute non-root path");
+    throw new TrustedExecutionRefusal("Codex run HOME must be a canonical absolute non-root path");
   }
   if (process.getuid?.() !== WORKER_UID) {
-    throw new Error("Codex run HOME must be prepared by the worker identity");
+    throw new TrustedExecutionRefusal("Codex run HOME must be prepared by the worker identity");
   }
   await ensureCodexSharedDirectory(homeRoot);
   await ensureCodexSharedDirectory(path.join(homeRoot, "codex-data"));
@@ -2288,7 +2289,7 @@ export class CodexExecutor implements Executor {
             continue;
           }
           if (!result.questions?.length) return turn;
-          if (round >= maxClarificationRounds) throw new Error("codex clarification rounds exhausted during planning");
+          if (round >= maxClarificationRounds) throw new TrustedExecutionRefusal("codex clarification rounds exhausted during planning");
           round++;
           const followUp = await clarify(result.questions);
           prompt = `${followUp}\n\nNow produce the implementation plan and submit it with submit_plan. Do not begin implementing.`;
@@ -2312,7 +2313,7 @@ export class CodexExecutor implements Executor {
         let planResult = planTurn.result;
         let planMd = planResult.plan;
         if (planMd === undefined || planMd.trim().length === 0) {
-          throw new Error("codex plan turn produced no plan");
+          throw new TrustedExecutionRefusal("codex plan turn produced no plan");
         }
         // Issue #1626: a malformed milestone list (any entry dropped, or a non-array) rides the
         // report as rejectedMilestones, so the server rejects the candidate as a unit instead of
@@ -2329,7 +2330,7 @@ export class CodexExecutor implements Executor {
           const settles = verdict.inputId;
           ctx.emit({ kind: "plan_feedback", agent: "worker", payload: { feedback } });
           if (revisions >= maxRevisions) {
-            throw new Error("codex plan revision budget exhausted");
+            throw new TrustedExecutionRefusal("codex plan revision budget exhausted");
           }
           revisions++;
           ctx.emit({ kind: "plan_revising", agent: "worker", payload: { round: revisions } });
@@ -2339,7 +2340,7 @@ export class CodexExecutor implements Executor {
           planResult = reviseTurn.result;
           planMd = planResult.plan;
           if (planMd === undefined || planMd.trim().length === 0) {
-            throw new Error("codex plan turn produced no plan on revision");
+            throw new TrustedExecutionRefusal("codex plan turn produced no plan on revision");
           }
           verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, undefined, settles);
         }
@@ -2625,7 +2626,7 @@ export class CodexExecutor implements Executor {
           if (!result.questions?.length) break;
           // With max_iterations=1, clarify inside this same iteration before the cap check.
           // This improves on Claude's order, which checks its iteration budget first.
-          if (round >= maxClarificationRounds) throw new Error("codex clarification rounds exhausted during implementation");
+          if (round >= maxClarificationRounds) throw new TrustedExecutionRefusal("codex clarification rounds exhausted during implementation");
           const followUp = await clarify(result.questions);
           nextPrompt = withMilestoneNote(`${followUp}\n\nContinue the implementation.`, milestoneNote());
         }
@@ -3788,7 +3789,7 @@ export class CodexExecutor implements Executor {
         agents[t.name] = toHarnessAgent(t);
       }
     } else {
-      if (!selection) throw new Error("codex implement request built without a resolved agent selection");
+      if (!selection) throw new TrustedExecutionRefusal("codex implement request built without a resolved agent selection");
       repoSourced = selection.source === "repo";
       // The lead body is ALWAYS the owner's `lead` template (uzi's builtin) under either source;
       // a repo file named `lead` is only ever a subagent (selectSubagentTemplates).
@@ -3956,7 +3957,7 @@ async function assertCommandWorktreePosture(worktreePath: string): Promise<void>
   const stat = await fs.stat(worktreePath);
   const required = 0o2070; // setgid plus group rwx
   if (stat.gid !== RUNNER_UID || (stat.mode & required) !== required) {
-    throw new Error("Codex command worktree lacks the required runner-group setgid/write posture");
+    throw new TrustedExecutionRefusal("Codex command worktree lacks the required runner-group setgid/write posture");
   }
 }
 
@@ -4170,7 +4171,7 @@ async function launchRegisteredEffectRoot(
   log?: Pick<Logger, "warn">,
 ): Promise<RegisteredEffectRoot> {
   const reservation = registry.reserveLaunch(kind);
-  if (reservation.kind !== "reserved") throw new Error(`${kind} launch admission is closed`);
+  if (reservation.kind !== "reserved") throw new TrustedExecutionRefusal(`${kind} launch admission is closed`);
   let handle: CodexRootHandle;
   try {
     handle = await launch(spec, deadlineMs);
@@ -4182,7 +4183,7 @@ async function launchRegisteredEffectRoot(
   const admitted = registry.registerRoot(reservation.reservation, root);
   if (!admitted.ok) {
     await root.dispose(deadlineMs).catch(() => undefined);
-    throw new Error(`${kind} root failed registry admission`);
+    throw new TrustedExecutionRefusal(`${kind} root failed registry admission`);
   }
   return { handle, root };
 }
@@ -4219,13 +4220,13 @@ export function commandSandboxArgv(
   const workCwd = path.resolve(cwd);
   const rel = path.relative(worktree, workCwd);
   if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
-    throw new Error("command cwd escapes the worktree sandbox");
+    throw new TrustedExecutionRefusal("command cwd escapes the worktree sandbox");
   }
   if (!path.isAbsolute(privateTmp) || privateTmp === path.parse(privateTmp).root) {
-    throw new Error("command private tmp must be an absolute non-root path");
+    throw new TrustedExecutionRefusal("command private tmp must be an absolute non-root path");
   }
   if (cacheDir !== undefined && (path.dirname(cacheDir) !== CODEX_COMMAND_CACHE_ROOT || path.resolve(cacheDir) !== cacheDir)) {
-    throw new Error("command cache must be a clean child of the command cache root");
+    throw new TrustedExecutionRefusal("command cache must be a clean child of the command cache root");
   }
   return [
     "--root", worktree,
@@ -4591,7 +4592,7 @@ async function defaultLaunchProviderRoot(
   }, launcherDeps);
   const stdout = handle.transport.stdout;
   const stdin = handle.transport.stdin;
-  if (!stdout || !stdin) throw new Error("codex provider root is missing a stdio transport channel");
+  if (!stdout || !stdin) throw new TrustedExecutionRefusal("codex provider root is missing a stdio transport channel");
   // Provider stderr is never model-visible or logged, but it must be drained: an
   // unread pipe can fill and deadlock the app-server before the registry can reap it.
   handle.transport.stderr?.resume();

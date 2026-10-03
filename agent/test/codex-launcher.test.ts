@@ -23,6 +23,7 @@ import {
   type RunnerTreeRequest,
   type SupervisorProcess,
 } from "../src/codex/launcher.js";
+import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { makeTextRedactor } from "../src/redact.js";
 import { SESSION_SEED_ENTRYPOINT } from "../src/codex/session-seed-cli.js";
 import type { ProvisionSpawnSync } from "../src/codex/launcher.js";
@@ -383,6 +384,7 @@ describe("launchCodexRoot: app-server auth (production config, no env credential
     const helper = fileURLToPath(new URL("../src/codex/session-seed-cli.ts", import.meta.url));
     const spawnSync = childProcess.spawnSync;
     let seedCalls = 0;
+    let sharedSessionPosture = false;
     try {
       await fs.mkdir(seedDir, { recursive: true });
       await fs.mkdir(sessions, { recursive: true });
@@ -401,7 +403,26 @@ describe("launchCodexRoot: app-server auth (production config, no env credential
         assert.deepEqual(args.slice(0, prefix.length), prefix);
         const executable = args[prefix.length]!;
         if (executable === "/bin/sh" || executable === "/bin/rm") {
-          return { status: 0, signal: null, pid: 0, output: [], stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+          let stdout = Buffer.alloc(0);
+          const shellArgs = args.slice(prefix.length + 1);
+          if (executable === "/bin/sh" && shellArgs[1] === 'stat -c "%u:%g:%a" -- "$1"') {
+            const requestedPath = shellArgs[3];
+            assert.equal(typeof requestedPath, "string");
+            const codexHome = path.join(root, "codex");
+            const configPath = path.join(codexHome, "config.toml");
+            assert.ok([
+              root, codexHome, sessions, configPath, tmp, path.join(root, "home"),
+              ...["config", "cache", "data", "state"].map((dir) => path.join(root, `xdg-${dir}`)),
+            ].includes(requestedPath!));
+            const shared = sharedSessionPosture && [root, codexHome, sessions].includes(requestedPath!);
+            const mode = requestedPath === configPath ? "600"
+              : shared ? (requestedPath === sessions ? "2750" : "710") : "700";
+            stdout = Buffer.from(`${RUNNER_UID}:${shared ? CODEX_SESSION_GID : RUNNER_UID}:${mode}\n`);
+          } else if (executable === "/bin/sh") {
+            if (shellArgs[1]?.includes("chgrp")) sharedSessionPosture = true;
+            else if (shellArgs[1]?.includes("mkdir -m 700")) sharedSessionPosture = false;
+          }
+          return { status: 0, signal: null, pid: 0, output: [], stdout, stderr: Buffer.alloc(0) };
         }
         seedCalls++;
         const argv = args.slice(prefix.length + 1).map((arg) => arg === "/app/src/codex/session-seed-cli.ts" ? helper : arg);
@@ -606,12 +627,16 @@ describe("launchCodexRoot: trusted construction contract", () => {
     );
   });
 
-  it("rejects allowlist-reserved provider env keys", async () => {
-    const fake = newFake();
-    await assert.rejects(
-      launchCodexRoot(baseSpec({ provider: { ...baseSpec().provider, envKey: "PATH" } }), baseDeps(fake)),
-      /envKey is invalid or reserved/,
-    );
+  it("trusted refusal: rejects allowlist-reserved and malformed provider env keys", async () => {
+    for (const envKey of ["PATH", "BAD-KEY"]) {
+      await assert.rejects(
+        launchCodexRoot(baseSpec({ provider: { ...baseSpec().provider, envKey } }), baseDeps(newFake())),
+        (error: unknown) => error instanceof TrustedExecutionRefusal
+          && error.message === "provider envKey is invalid or reserved by the launcher allowlist",
+      );
+    }
+    assert.equal(treeCalls.length, 0);
+    assert.equal(spawnCalls.length, 0);
   });
 
   it("rejects an owned data root that overlaps the target repository", async () => {
@@ -1010,21 +1035,28 @@ describe("runLaunchCli: packaged entrypoint (knip-visible import)", () => {
 
 describe("launchCodexRoot: provisioning failure diagnostics", () => {
   const SEED_ARG = "/app/src/codex/session-seed-cli.ts";
-  type Step = "tree" | "share" | "seed" | "write" | "rm";
-  type Result = Partial<{ status: number | null; signal: NodeJS.Signals | null; stderr: string; error: Error }>;
+  type Step = "tree" | "share" | "seed" | "write" | "rm" | "statTree" | "statShare" | "statWrite";
+  type Result = Partial<{ status: number | null; signal: NodeJS.Signals | null; stderr: string; stdout: string; error: Error }>;
   const provisionCalls: { command: string; args: readonly string[]; step: Step; options: SpawnSyncOptions }[] = [];
 
   function scripted(results: Partial<Record<Step, Result>>): ProvisionSpawnSync {
+    let action: "tree" | "share" | "write" = "tree";
     return (command, args, options) => {
       const a = [...args];
-      const step: Step = a.includes(SEED_ARG) ? "seed"
+      const metadata = a.includes('stat -c "%u:%g:%a" -- "$1"');
+      const step: Step = metadata ? (action === "tree" ? "statTree" : action === "share" ? "statShare" : "statWrite")
+        : a.includes(SEED_ARG) ? "seed"
         : a.includes("--") && a.includes("-rf") ? "rm"
         : provisionCalls.length === 0 ? "tree"
         : a.some((x) => x.includes("chgrp")) ? "share" : "write";
+      if (step === "tree" || step === "share" || step === "write") action = step;
       provisionCalls.push({ command, args: a, step, options });
       const r = results[step] ?? {};
+      const sharedSession = a.at(-1)?.endsWith("/sessions") === true;
+      const mode = action === "share" ? (sharedSession ? "2750" : "710") : action === "write" ? "600" : "700";
+      const gid = action === "share" ? CODEX_SESSION_GID : RUNNER_UID;
       return {
-        pid: 1, output: [], stdout: Buffer.alloc(0),
+        pid: 1, output: [], stdout: Buffer.from(r.stdout ?? (metadata ? `${RUNNER_UID}:${gid}:${mode}\n` : "")),
         status: r.status === undefined ? 0 : r.status,
         signal: r.signal ?? null,
         stderr: Buffer.from(r.stderr ?? ""),
@@ -1045,18 +1077,65 @@ describe("launchCodexRoot: provisioning failure diagnostics", () => {
     }
     assert.fail("expected the launch to fail");
   }
+  for (const [name, step, result, typed, expected] of [
+    ["owner mismatch", "statTree", { stdout: "999:10002:700\n" }, true, "runner-owned tree creation failed (exit 1): "],
+    ["mode mismatch", "statTree", { stdout: "10002:10002:755\n" }, true, "runner-owned tree creation failed (exit 1): "],
+    ["group mismatch", "statShare", { stdout: "10002:999:710\n" }, true, "runner-owned session export posture failed (exit 1): "],
+    ["file mode mismatch", "statWrite", { stdout: "10002:10002:644\n" }, true, "runner-owned file write failed for /data/run/root-1/codex/config.toml (exit 1): "],
+    ["malformed shared metadata", "statShare", { stdout: "(bad)" }, false, "runner-owned session export posture failed (exit 1): "],
+    ["malformed file metadata", "statWrite", { stdout: "[1,2]" }, false, "runner-owned file write failed for /data/run/root-1/codex/config.toml (exit 1): "],
+    ["metadata I/O", "statTree", { status: 1, stderr: "stat: EIO" }, false, "runner-owned tree creation failed (exit 1): stat: EIO"],
+    ["malformed metadata", "statTree", { stdout: "10002:10002:700\nextra" }, false, "runner-owned tree creation failed (exit 1): "],
+    ["raw creation I/O", "tree", { status: 1, stderr: "mkdir: EIO" }, false, "runner-owned tree creation failed (exit 1): mkdir: EIO"],
+  ] as const) {
+    it(`trusted refusal: provisioning distinguishes ${name}`, async () => {
+      provisionCalls.length = 0;
+      await assert.rejects(launchCodexRoot(seedSpec(), baseDeps(newFake(), {
+        makeRunnerTrees: undefined, provisionSpawnSync: scripted({ [step]: result }), redactDiagnostic: (text) => text,
+      })), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error instanceof TrustedExecutionRefusal, typed);
+        assert.equal(error.message, expected);
+        return true;
+      });
+      assert.equal(spawnCalls.length, 0);
+      if (step !== "tree") {
+        assert.ok(provisionCalls.some((call) => call.step === "rm"));
+        const observation = provisionCalls.find((call) => call.step === step);
+        assert.deepEqual(observation?.options.stdio, ["ignore", "pipe", "pipe"]);
+        assert.equal(observation?.options.timeout, 5000);
+      }
+    });
+  }
+
+  it("trusted refusal: valid metadata permits tree, share, seed and file provisioning", async () => {
+    provisionCalls.length = 0;
+    const handle = await launchCodexRoot(seedSpec(), baseDeps(newFake(), {
+      makeRunnerTrees: undefined, provisionSpawnSync: scripted({}), redactDiagnostic: (text) => text,
+    }));
+    try {
+      assert.equal(spawnCalls.length, 1);
+      assert.ok(provisionCalls.some((call) => call.step === "statTree"));
+      assert.equal(provisionCalls.filter((call) => call.step === "statShare").length, 3);
+      assert.equal(provisionCalls.filter((call) => call.step === "seed").length, 1);
+      assert.equal(provisionCalls.filter((call) => call.step === "statWrite").length, 1);
+    } finally {
+      await handle.dispose(1000);
+    }
+  });
+
   const SECRET = "tok-" + "abcdefgh12345678";
   function noFragment(text: string, secret: string): void {
     for (let i = 0; i + 8 <= secret.length; i++) assert.ok(!text.includes(secret.slice(i, i + 8)), `leaked fragment ${secret.slice(i, i + 8)}`);
   }
 
-  it("the seed step names the stderr when a redactor is supplied", async () => {
+  it("trusted refusal: the seed step names the stderr when a redactor is supplied", async () => {
     const msg = await failure({ seed: { status: 1, stderr: "seed boom: EACCES" } }, { redactDiagnostic: makeTextRedactor([]) });
     assert.match(msg, /^runner-owned session seed failed \(exit 1\): seed boom: EACCES$/);
     assert.ok(provisionCalls.find((c) => c.step === "seed")?.args.includes(SESSION_SEED_ENTRYPOINT));
   });
 
-  it("spawns the seed with stderr piped, stdin/stdout ignored, and HOME/TMPDIR under the root", async () => {
+  it("trusted refusal: spawns the seed with stderr piped, stdin/stdout ignored, and HOME/TMPDIR under the root", async () => {
     await failure({ seed: { status: 1, stderr: "x" } }, { redactDiagnostic: (t) => t });
     const opts = provisionCalls.find((c) => c.step === "seed")?.options;
     assert.deepEqual(opts?.stdio, ["ignore", "ignore", "pipe"]);
@@ -1064,7 +1143,7 @@ describe("launchCodexRoot: provisioning failure diagnostics", () => {
     assert.equal(opts?.env?.TMPDIR, `${DATA_ROOT}/tmp`);
   });
 
-  it("keeps only a bounded tail of oversized stderr", async () => {
+  it("trusted refusal: keeps only a bounded tail of oversized stderr", async () => {
     const big = "HEAD-MARK" + "x".repeat(10_000) + "TAIL-MARK";
     const msg = await failure({ seed: { status: 1, stderr: big } }, { redactDiagnostic: (t) => t });
     assert.ok(msg.includes("…[truncated]"));
@@ -1073,7 +1152,7 @@ describe("launchCodexRoot: provisioning failure diagnostics", () => {
     assert.ok(msg.length < 4096 + 200, `message length ${msg.length}`);
   });
 
-  it("reports the signal, and a spawn error code but never its message", async () => {
+  it("trusted refusal: reports the signal, and a spawn error code but never its message", async () => {
     const killed = await failure({ seed: { status: null, signal: "SIGKILL", stderr: "" } }, { redactDiagnostic: (t) => t });
     assert.match(killed, /\(exit null, signal SIGKILL\)/);
     const err = Object.assign(new Error("argv-echo UNIQUE-ERR-MSG"), { code: "ENOENT" });
@@ -1082,13 +1161,13 @@ describe("launchCodexRoot: provisioning failure diagnostics", () => {
     assert.ok(!spawnErr.includes("UNIQUE-ERR-MSG"));
   });
 
-  it("redacts a secret in stderr", async () => {
+  it("trusted refusal: redacts a secret in stderr", async () => {
     const msg = await failure({ seed: { status: 1, stderr: `cannot read ${SECRET} now` } }, { redactDiagnostic: makeTextRedactor([SECRET]) });
     assert.ok(msg.includes("***REDACTED***"), msg);
     noFragment(msg, SECRET);
   });
 
-  it("redacts before truncating, so a secret straddling the tail boundary leaves no fragment", async () => {
+  it("trusted refusal: redacts before truncating, so a secret straddling the tail boundary leaves no fragment", async () => {
     // Cutting the RAW stderr to its last 4096 chars would land 12 chars into SECRET and keep
     // its final 8 chars; redacting the whole text first must leave nothing of it.
     const stderr = "z".repeat(500) + SECRET + "y".repeat(4096 - 12);
@@ -1098,7 +1177,7 @@ describe("launchCodexRoot: provisioning failure diagnostics", () => {
     noFragment(msg, SECRET);
   });
 
-  it("withholds stderr entirely without a redactor, on every step", async () => {
+  it("trusted refusal: withholds stderr entirely without a redactor, on every step", async () => {
     const marker = "UNIQUE-STDERR-MARK";
     const tree = await failure({ tree: { status: 3, stderr: marker } }, {});
     assert.match(tree, /^runner-owned tree creation failed \(exit 3\): stderr withheld \(no redactor\)$/);
@@ -1109,7 +1188,7 @@ describe("launchCodexRoot: provisioning failure diagnostics", () => {
     for (const m of [tree, seed]) assert.ok(!m.includes(marker));
   });
 
-  it("removes the tree and never spawns the supervisor after a seed failure", async () => {
+  it("trusted refusal: removes the tree and never spawns the supervisor after a seed failure", async () => {
     await failure({ seed: { status: 1, stderr: "x" } }, {});
     const rm = provisionCalls.find((c) => c.step === "rm");
     assert.ok(rm, "cleanup rm -rf was issued through the injected spawn");
@@ -1117,7 +1196,7 @@ describe("launchCodexRoot: provisioning failure diagnostics", () => {
     assert.equal(spawnCalls.length, 0);
   });
 
-  it("carries the bounded tail for tree creation and file write failures with a redactor", async () => {
+  it("trusted refusal: carries the bounded tail for tree creation and file write failures with a redactor", async () => {
     const redactDiagnostic = makeTextRedactor([SECRET]);
     const tree = await failure({ tree: { status: 1, stderr: `mkdir: ${SECRET} exists` } }, { redactDiagnostic });
     assert.match(tree, /^runner-owned tree creation failed \(exit 1\): mkdir: \*\*\*REDACTED\*\*\* exists$/);

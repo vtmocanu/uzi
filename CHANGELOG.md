@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Trusted launch, admission and plan-gate refusals no longer park a run as a disk-full failure ([#1829](https://github.com/vtmocanu/uzi/issues/1829)).**
+  These refusals keep their failure handling even when the data volume is full, including preserved trusted types, cause/interruption wrappers and complete legacy reasons prefixed by `<context>: <reason>` (a literal colon and space). Apostrophes in context are supported; double-quoted or multiline contexts, alternate separators, quoted reasons and producer-domain near-misses are not legacy refusal envelopes. Ordinary opaque failures are unchanged; a refusal whose origin has been completely erased can still coincide with fullness and be deferred.
+
 - **Worker UID ownership regressions run in required CI ([#2134](https://github.com/vtmocanu/uzi/issues/2134)).**
   The base worker image exercises privileged creation and ownership assertions, with a source-derived check that rejects missing or skipped tests.
 - **A job's output upload no longer retries past a deadline-capped wait.**
@@ -51,6 +54,11 @@ through `[0.52.0]`.)
   On a Claude run, a process carrying the run's HOME that the worker could not kill, or a reap that could not finish, now blocks every step that publishes or settles the run (finalize push, failure settlement, pause, completion hold, wall park, credential switch, recovery and checkpoint publishes) the same way an unproven clone does: the run keeps custody, keeps running (a failed pause) or fails with `worker_residue_blocked`. A re-claimed run reaps its HOME before its clone fetch, and a park or the periodic disk reclaim drops the run's rebuildable caches only once no such process is left.
 - **Worker upgrade waits no longer trigger premature capacity alarms (#2184).**
   Run health identifies currently suitable draining workers; admin capacity confirms each upgrade wait, preserves genuine five-minute alarms, and reports overdue upgrade waits after 24 hours of overlap.
+- **Worker disk-pressure protection now notices inode exhaustion ([#1829](https://github.com/vtmocanu/uzi/issues/1829)).**
+  Admission and the periodic hard-stop layer use the higher of byte and inode utilization, so a data volume running out of inodes can trigger protection while byte usage stays low. Missing or invalid accounting, including missing or zero inode totals, falls back to the valid resource sample.
+
+- **An issue run can wait for disk space after an otherwise-terminal execution failure ([#1829](https://github.com/vtmocanu/uzi/issues/1829)).**
+  When fresh byte and inode accounting confirms a full data volume and the worker still owns the running generation, uzi waits for one bounded reclaim pass and takes one counted disk park, without restarting the command or provider, even if space returns. This does not identify the failed write: an unrelated opaque execution error can coincide with fullness and be deferred, with the accepted coincidence residual for refusals limited to completely erased-origin opaque failures; the cap bounds repetition rather than misclassification (`0` remains unlimited). Capture retries are bounded; safely quiescent runs can retain unverified work on the original worker without claiming it was checkpointed or published, so recovery on another worker can lose newer work. Every recognizable typed, wrapped or trusted security/guardrail failure remains excluded, as pinned by existing exclusion tests; setup, finalize and approval revisions keep their existing handling. Periodic cache selection cannot guarantee this failing run parks before failure. See [Worker data volume full](docs/run-recovery-wait.md#worker-data-volume-full).
 
 ## [0.85.1] - 2026-10-03
 

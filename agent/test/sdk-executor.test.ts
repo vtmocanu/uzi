@@ -9,6 +9,7 @@ import { realProcfsSkip } from "./real-procfs.js";
 const HAS_PROCFS = process.platform === "linux";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, resolveLeadModel, embedSeededPlan, TransientRecoveryError, ProviderTransientError, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
+import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { LimitReachedError } from "../src/limit.js";
 import { EnvProbeCleanupError } from "../src/env-probe.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
@@ -317,6 +318,18 @@ afterEach(() => {
 });
 
 describe("SdkExecutor plan gate", () => {
+  it("trusted refusal: submitted plan without a wired gate never starts implementation", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      [assistantText("implementing"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ gatePlan: undefined });
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx),
+      (error: unknown) => error instanceof TrustedExecutionRefusal && error.message === "plan gate is not wired for this run");
+    assert.equal(turns.length, 1);
+    assert.deepEqual(probe.iterations, []);
+  });
+
   it("captures the plan, gates on it, then runs the loop to done and reports the branch", async () => {
     const { queryFn, turns } = fakeTurns([
       [submitPlan("# The Plan\n- step 1"), resultSuccess()], // planning turn

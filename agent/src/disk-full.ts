@@ -138,6 +138,32 @@ export class DataVolumeGuard {
   }
 
   /**
+   * Current occupancy of the data volume shared by the existing clone and actual run HOME.
+   * This has no error/write attribution and never falls back to an ancestor or an old sample.
+   * Missing raw inode accounting is unknown, including a present files count without ffree.
+   */
+  async currentOccupancy(worktree: string, home: string): Promise<DiskFullVerdict> {
+    try {
+      const devices = await Promise.all([this.stat(this.opts.dataDir), this.stat(worktree), this.stat(home)]);
+      if (devices.some(({ dev }) => !Number.isFinite(dev) || dev < 0)) return "unknown";
+      if (devices.some(({ dev }) => dev !== devices[0].dev)) return "not_disk_full";
+      const raw = this.statfs(this.opts.dataDir);
+      if ([raw.bsize, raw.blocks, raw.bavail, raw.bfree, raw.files, raw.ffree]
+        .some((v) => typeof v !== "number" || !Number.isFinite(v) || v < 0)
+        || !(raw.bsize > 0) || !(raw.blocks > 0) || !(raw.files! > 0)
+        || raw.ffree! > raw.files! || raw.bavail > raw.bfree || raw.bfree > raw.blocks) return "unknown";
+      const bytesTotal = raw.blocks * raw.bsize;
+      const bytesAvailable = raw.bavail * raw.bsize;
+      if (!Number.isFinite(bytesTotal) || !Number.isFinite(bytesAvailable)) return "unknown";
+      return volumeBelowFloor({
+        bytesTotal, bytesAvailable, inodesTotal: raw.files!, inodesFree: raw.ffree!,
+      }) ? "data_volume_full" : "not_disk_full";
+    } catch {
+      return "unknown";
+    }
+  }
+
+  /**
    * Classify a failed write whose destination is `destination`. See the module header. `before`
    * is an optional sample taken before the write; the verdict then uses the lower free bytes and
    * free inodes of it and the sample taken now. A current statfs failure stays "unknown".

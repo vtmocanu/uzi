@@ -1,3 +1,4 @@
+import { TrustedExecutionRefusal, legacyTrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { AsyncResource } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
@@ -419,6 +420,65 @@ function isInputReceiptError(err: unknown): boolean {
  *  PRD #1809 D4's MID-RUN disk park (the cache cap's preventive park, or the hard pressure stop's
  *  counted one); it keeps the custody hold. The pre-clone D6 disk park is a separate flow
  *  (RunRunner.handleDataVolumeFull). */
+// These are trusted runner/provider control and security failures, never occupancy deferrals.
+// The shared leaf catalogue keeps legacy selection/posture policy harness agnostic.
+function terminalDiskExcludedReason(reason: unknown): boolean {
+  return typeof reason === "string" && legacyTrustedExecutionRefusal(reason, (candidate) =>
+    failOriginForReason(candidate) !== undefined
+    || candidate === REASON_QUESTION_TIMEOUT || candidate === PLAN_APPROVAL_TIMEOUT_REASON
+    || candidate.startsWith(`${REASON_QUESTION_NOT_PARKED} (`)
+    || candidate.startsWith(`${REASON_FOLLOWUP_NOT_PARKED} (`)
+    || candidate.startsWith("denied by guardrail: ")
+    || candidate.startsWith("plan-gate input delivery failed: ")
+    || candidate.startsWith("unexpected plan verdict: "));
+}
+
+/** Only an untyped execution failure is eligible. Bounded traversal rejects uncertain wrappers. */
+function untypedExecutionFailure(value: unknown): boolean {
+  const pending = [value];
+  const seen = new Set<object>();
+  for (let visited = 0; pending.length > 0; visited++) {
+    if (visited >= 8) return false;
+    const current = pending.pop();
+    if (terminalDiskExcludedReason(current)) return false;
+    if (current === null || typeof current !== "object") continue;
+    try {
+      if (seen.has(current)) return false;
+      seen.add(current);
+      const prototype = Object.getPrototypeOf(current);
+      if (prototype !== Error.prototype && prototype !== Object.prototype && prototype !== null) return false;
+      const wrapper = current as { name?: unknown; message?: unknown; cause?: unknown; interruption?: unknown };
+      if (wrapper.name !== undefined && wrapper.name !== "Error") return false;
+      if (prototype === Error.prototype && typeof wrapper.message !== "string") return false;
+      if (terminalDiskExcludedReason(wrapper.message)) return false;
+      if (wrapper.cause !== undefined) pending.push(wrapper.cause);
+      if (wrapper.interruption !== undefined) pending.push(wrapper.interruption);
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Errors with an existing canonical disposition must escape local capture/retry catches. */
+function canonicalRecoveryInterruption(value: unknown): boolean {
+  return value instanceof LimitReachedError || value instanceof DiskParkSignal
+    || value instanceof TransientRecoveryError || value instanceof PauseNowSignal
+    || value instanceof CredentialSwitchSignal || value instanceof CredentialSwitchRetainedStop
+    || value instanceof DataVolumeFullError || value instanceof DataVolumeWaitShutdown
+    || value instanceof StaleClaimError || value instanceof ServerWallParkedError
+    || value instanceof RunningAckTerminalError || value instanceof RunResidueBlockedError
+    || value instanceof GateInputDeliveryError || value instanceof PlanRejectedError
+    || value instanceof PushSecretBlockedSignal || value instanceof ScratchPublicationError
+    || value instanceof HistoryRewrittenError || codexDeferralOf(value) !== undefined
+    || !untypedExecutionFailure(value);
+}
+
+interface ExecutionRejection {
+  rejected: boolean;
+  value?: unknown;
+}
+
 type RecoveryParkCause =
   | { kind: "transient" }
   | { kind: "vault_locked" }
@@ -2563,93 +2623,8 @@ export class RunRunner {
         },
       });
     }
-    try {
-      await this.phaseClone(claim, flight);
-      const sessionId = await this.phaseResume(claim, flight);
-      // PRD #1349 M2 (D1/D3): after clone/reseed and BEFORE model work, record this run's exact
-      // claim generation into the durable journal (the restore point it starts from) and
-      // inventory any prior open holds by exact id + generation. The early generation-evidence
-      // pin lets a later empty-turn park or early terminal exit disposition the EXACT hold
-      // without inferring `current - 1`; the inventory is observational only (settlement is
-      // deferred to the final durable head). Credential-free and best-effort.
-      await this.recordRecoveryGenerationEvidence(claim, flight);
-      await this.phasePreflightHandoff(claim, flight, sessionId);
-      // PRD #1171 m4: the finalize sink. phasePreflightHandoff already ran the
-      // security-boundary reap (its killAgentTree?.() — no-op for Codex); this wrapper adds the
-      // Codex-ONLY finalize withBoundary so that, for a Codex run, the WHOLE phasePublish
-      // (push/base-align/MR, or the not_code/report-only/undeliverable-park/switch-release early
-      // returns) runs under the held permit (an owner pause, confirmed hold/wall park, or unresolved
-      // wall park without same-generation running proof bypasses it) — its per-sink reconcile and
-      // quiesce/reap close admission and tear down the
-      // provider root before any PAT git op. For Claude/stub this is a plain call (the legacy
-      // reap already happened at the untouched security boundary). A CodexBoundaryError before
-      // a committed publish still propagates to the failed-run report below, unless it carries a
-      // vault-locked deferral (issue #1766), which the catch chain parks instead. Once phasePublish
-      // registers the committed terminal callback, however, the pushed branch/open MR is the
-      // authoritative outcome and must be reported after the boundary releases.
-      let postFinalizeTerminal: (() => Promise<void>) | undefined;
-      if (
-        flight.result?.pausedAt ||
-        ((flight.result?.walled || flight.result?.completionHeld) && flight.holdOrWallParkConfirmed) ||
-        (flight.result?.walled && flight.uncertainWallPark)
-      ) {
-        // Issues #1764/#1784: an owner-pause, or a completion hold / wall park the server CONFIRMED
-        // (`paused`), PARKED the run, so phasePublish takes its non-terminal early return and
-        // finalizes nothing. Call it OUTSIDE the Codex finalize boundary: that boundary's per-sink
-        // credential reconcile (refreshCodex/releaseCodex) is refused by the server once the run is
-        // `paused` (not an actively-claimed status), which would fail a durably parked run. An
-        // unresolved wall park bypasses it unless the ownership probe proves this generation is
-        // still running. A credential-switch release goes through the boundary.
-        // The finally's terminal safety.dispose still tears the Codex registry down. For Claude/stub the boundary wrapper
-        // is a plain call, so this path is unchanged for them.
-        await this.phasePublish(claim, flight, undefined, undefined);
-      } else {
-        // Issue #1900: the finalize step tracker names the step a deadline fired in and logs
-        // each step's duration (Claude/stub runs get the logging only).
-        const finalizeSteps = new BoundaryStepTracker(runLog, this.now, "finalize step");
-        let finalizeFailed = false;
-        let finalizeError: unknown;
-        try {
-          await this.withCodexBoundaryOnly(
-            executor,
-            {
-              boundary: "finalize",
-              deadlineMs: this.codexFinalizeBoundaryDeadlineMs,
-              activeStep: () => finalizeSteps.current(),
-            },
-            (permit) => this.phasePublish(
-              claim,
-              flight,
-              permit?.signal,
-              executor.safety
-                ? (report) => { postFinalizeTerminal = report; }
-                : undefined,
-              finalizeSteps,
-            ),
-          );
-        } catch (err) {
-          finalizeFailed = true;
-          finalizeError = err;
-        }
-        // A boundary error after phasePublish registered the committed terminal callback is not a
-        // failed finalize: the pushed branch/open MR is the outcome reported below, so the last
-        // step log says "committed" rather than "failed".
-        const committed = finalizeFailed && postFinalizeTerminal !== undefined && isCodexBoundaryError(finalizeError);
-        finalizeSteps.end(!finalizeFailed ? "ok" : committed ? "committed" : "failed");
-        if (finalizeFailed) {
-          if (!committed) throw finalizeError;
-          runLog.warn(
-            "Codex finalize boundary failed after committed publish; reporting committed terminal outcome",
-            { error: errMessage(finalizeError) },
-          );
-        }
-      }
-      // Once a branch push or MR creation succeeds, its terminal record is irreversible
-      // bookkeeping for an already-committed forge side effect. Deliver it only after the
-      // Codex boundary has released, with the normal terminal retry schedule and without
-      // the boundary's expiring signal, so a near-deadline MR cannot become a failed run.
-      await postFinalizeTerminal?.();
-    } catch (err) {
+    const executionRejection: ExecutionRejection = { rejected: false };
+    const dispatchFailure = async (err: unknown, allowDiskDeferral = false): Promise<void> => {
       // PRD #35: a usage-limit death is not an ordinary failure. Handled before the
       // generic path below because that path is terminal in both senses — it reports
       // `failed` and it lets the finally erase the session this run wants to resume from.
@@ -2885,6 +2860,10 @@ export class RunRunner {
         );
         // Issue #1742 retirement site (c): the api accepted the recovery_wait park for this generation.
         if (flight.parked) await this.retireFinalizeRecord(flight, "recovery_park_accepted");
+      } else if (err instanceof DataVolumeWaitShutdown && err.operation === "terminal execution") {
+        flight.preserveRecoveryClone = true;
+        flight.preserveSession = true;
+        await batcher.close().catch(() => undefined);
       } else if (flight.active?.shuttingDown) {
         // PRD #218 M1 — the worker is shutting down (SIGTERM/SIGINT) and aborted this
         // run mid-flight. The DISCRIMINATOR is the flag, never the error: a user
@@ -3260,8 +3239,110 @@ export class RunRunner {
         // Issue #1742 retirement site (c): the api accepted the vault_locked recovery park.
         if (flight.parked) await this.retireFinalizeRecord(flight, "vault_lock_park_accepted");
       } else {
+        await batcher.awaitPermanentFailureSettled();
+        if (allowDiskDeferral && executionRejection.rejected && Object.is(executionRejection.value, err)
+          && !flight.terminalResolved
+          && !this.outbox?.hasPendingTerminal(flight.runId, flight.claimGeneration)) {
+          try {
+            if (await this.deferTerminalExecutionForDisk(err, claim, flight)) return;
+          } catch (interruption) {
+            // An interrupt raised inside this catch must use the same dispatcher. It cannot
+            // re-enter the occupancy policy, even when it is the original rejected value.
+            await dispatchFailure(interruption);
+            return;
+          }
+        }
         await this.reportGenericFailure(claim, flight, err);
       }
+    };
+    try {
+      await this.phaseClone(claim, flight);
+      const sessionId = await this.phaseResume(claim, flight);
+      // PRD #1349 M2 (D1/D3): after clone/reseed and BEFORE model work, record this run's exact
+      // claim generation into the durable journal (the restore point it starts from) and
+      // inventory any prior open holds by exact id + generation. The early generation-evidence
+      // pin lets a later empty-turn park or early terminal exit disposition the EXACT hold
+      // without inferring `current - 1`; the inventory is observational only (settlement is
+      // deferred to the final durable head). Credential-free and best-effort.
+      await this.recordRecoveryGenerationEvidence(claim, flight);
+      await this.phasePreflightHandoff(claim, flight, sessionId, executionRejection);
+      // PRD #1171 m4: the finalize sink. phasePreflightHandoff already ran the
+      // security-boundary reap (its killAgentTree?.() — no-op for Codex); this wrapper adds the
+      // Codex-ONLY finalize withBoundary so that, for a Codex run, the WHOLE phasePublish
+      // (push/base-align/MR, or the not_code/report-only/undeliverable-park/switch-release early
+      // returns) runs under the held permit (an owner pause, confirmed hold/wall park, or unresolved
+      // wall park without same-generation running proof bypasses it) — its per-sink reconcile and
+      // quiesce/reap close admission and tear down the
+      // provider root before any PAT git op. For Claude/stub this is a plain call (the legacy
+      // reap already happened at the untouched security boundary). A CodexBoundaryError before
+      // a committed publish still propagates to the failed-run report below, unless it carries a
+      // vault-locked deferral (issue #1766), which the catch chain parks instead. Once phasePublish
+      // registers the committed terminal callback, however, the pushed branch/open MR is the
+      // authoritative outcome and must be reported after the boundary releases.
+      let postFinalizeTerminal: (() => Promise<void>) | undefined;
+      if (
+        flight.result?.pausedAt ||
+        ((flight.result?.walled || flight.result?.completionHeld) && flight.holdOrWallParkConfirmed) ||
+        (flight.result?.walled && flight.uncertainWallPark)
+      ) {
+        // Issues #1764/#1784: an owner-pause, or a completion hold / wall park the server CONFIRMED
+        // (`paused`), PARKED the run, so phasePublish takes its non-terminal early return and
+        // finalizes nothing. Call it OUTSIDE the Codex finalize boundary: that boundary's per-sink
+        // credential reconcile (refreshCodex/releaseCodex) is refused by the server once the run is
+        // `paused` (not an actively-claimed status), which would fail a durably parked run. An
+        // unresolved wall park bypasses it unless the ownership probe proves this generation is
+        // still running. A credential-switch release goes through the boundary.
+        // The finally's terminal safety.dispose still tears the Codex registry down. For Claude/stub the boundary wrapper
+        // is a plain call, so this path is unchanged for them.
+        await this.phasePublish(claim, flight, undefined, undefined);
+      } else {
+        // Issue #1900: the finalize step tracker names the step a deadline fired in and logs
+        // each step's duration (Claude/stub runs get the logging only).
+        const finalizeSteps = new BoundaryStepTracker(runLog, this.now, "finalize step");
+        let finalizeFailed = false;
+        let finalizeError: unknown;
+        try {
+          await this.withCodexBoundaryOnly(
+            executor,
+            {
+              boundary: "finalize",
+              deadlineMs: this.codexFinalizeBoundaryDeadlineMs,
+              activeStep: () => finalizeSteps.current(),
+            },
+            (permit) => this.phasePublish(
+              claim,
+              flight,
+              permit?.signal,
+              executor.safety
+                ? (report) => { postFinalizeTerminal = report; }
+                : undefined,
+              finalizeSteps,
+            ),
+          );
+        } catch (err) {
+          finalizeFailed = true;
+          finalizeError = err;
+        }
+        // A boundary error after phasePublish registered the committed terminal callback is not a
+        // failed finalize: the pushed branch/open MR is the outcome reported below, so the last
+        // step log says "committed" rather than "failed".
+        const committed = finalizeFailed && postFinalizeTerminal !== undefined && isCodexBoundaryError(finalizeError);
+        finalizeSteps.end(!finalizeFailed ? "ok" : committed ? "committed" : "failed");
+        if (finalizeFailed) {
+          if (!committed) throw finalizeError;
+          runLog.warn(
+            "Codex finalize boundary failed after committed publish; reporting committed terminal outcome",
+            { error: errMessage(finalizeError) },
+          );
+        }
+      }
+      // Once a branch push or MR creation succeeds, its terminal record is irreversible
+      // bookkeeping for an already-committed forge side effect. Deliver it only after the
+      // Codex boundary has released, with the normal terminal retry schedule and without
+      // the boundary's expiring signal, so a near-deadline MR cannot become a failed run.
+      await postFinalizeTerminal?.();
+    } catch (err) {
+      await dispatchFailure(err, true);
     } finally {
       // #1539: AWAIT the permanent-failure hook's settlement BEFORE the Codex registry disposal
       // below. The arms that do NOT go through reportGenericFailure (limit, pause, forge-unreachable,
@@ -4063,6 +4144,88 @@ export class RunRunner {
       return false;
     }
     return true;
+  }
+
+  /** Recheck higher-priority interruptions throughout the terminal-failure policy. */
+  private terminalDiskInterruption(flight: RunFlight): void {
+    if (flight.steering.claimFence() !== undefined) {
+      flight.preserveRecoveryClone = false;
+      flight.preserveSession = false;
+      throw new StaleClaimError();
+    }
+    if (this.shuttingDownGlobal || flight.active?.shuttingDown) {
+      flight.preserveRecoveryClone = true;
+      flight.preserveSession = true;
+      throw new DataVolumeWaitShutdown("terminal execution");
+    }
+    if (flight.steering.isCancelled()) {
+      flight.preserveRecoveryClone = false;
+      flight.preserveSession = false;
+      throw new Error("run cancelled");
+    }
+    const pause = flight.steering.getPauseMode();
+    if (pause === "now" || pause === "milestone") throw new PauseNowSignal();
+    if (flight.cancel.signal.aborted) throw flight.cancel.signal.reason;
+  }
+
+  private async deferTerminalExecutionForDisk(
+    err: unknown, claim: ClaimResponse, flight: RunFlight,
+  ): Promise<boolean> {
+    const guard = this.dataVolume;
+    if (!guard || resolveRunKind(claim.kind) !== "issue" || !untypedExecutionFailure(err)
+      || !this.client.protocolFeatures.includes("recovery_cause_data_volume_full")
+      || !this.client.stampsClaimGeneration(claim.claim_generation)
+      || !flight.worktreePath || !flight.runHome) return false;
+    this.terminalDiskInterruption(flight);
+    let own: RunOwnershipResponse;
+    try {
+      own = await this.client.getRunOwnership(flight.runId);
+    } catch {
+      this.terminalDiskInterruption(flight);
+      return false;
+    }
+    this.terminalDiskInterruption(flight);
+    if (own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration
+      || TERMINAL_RUN_STATUSES.has(own.status)) {
+      await flight.batcher.close().catch(() => undefined);
+      return true;
+    }
+    if (own.status !== "running" || own.claim_generation === undefined) return false;
+    const occupancy = await guard.currentOccupancy(flight.worktreePath, flight.runHome);
+    this.terminalDiskInterruption(flight);
+    if (occupancy !== "data_volume_full") return false;
+    await this.awaitDataVolumeReclaim(guard, flight, "terminal execution");
+    this.terminalDiskInterruption(flight);
+    flight.parked = await this.handleRecoveryExhausted(
+      new DataVolumeFullError("terminal execution", err), claim, flight, flight.executor,
+      flight.batcher, flight.reportState, flight.runLog,
+      { kind: "data_volume_full", preventive: false }, { terminalDisk: true },
+    );
+    if (flight.parked) await this.retireFinalizeRecord(flight, "disk_park_accepted");
+    return true;
+  }
+
+  /** An empty supervised sink proves Codex drain even when recovery custody is disabled.
+   * Claude/stub require an affirmative Linux process proof. No git mutation runs here. */
+  private async terminalDiskQuiescence(flight: RunFlight): Promise<boolean> {
+    try {
+      if (flight.executor.safety) {
+        let supervisedEmpty = false;
+        await this.reapForSink(flight.executor,
+          { boundary: "shutdown", deadlineMs: this.codexBoundaryDeadlineMs },
+          async () => { supervisedEmpty = true; });
+        if (!supervisedEmpty) return false;
+      }
+      const proof = await this.quiesceRun(flight, flight.executor, {
+        mode: "own", site: "terminal_disk:after_runner_git", processOnly: true, propagateControl: true,
+      });
+      return !proof.blocked && (flight.executor.safety && !flight.predecessorCapture
+        ? true : process.platform === "linux" && proof.outcome.process?.state === "quiescent");
+    } catch (error) {
+      this.terminalDiskInterruption(flight);
+      if (canonicalRecoveryInterruption(error)) throw error;
+      return false;
+    }
   }
 
   /**
@@ -8030,6 +8193,7 @@ export class RunRunner {
     claim: ClaimResponse,
     flight: RunFlight,
     sessionId: string | undefined,
+    executionRejection: ExecutionRejection,
   ): Promise<ExecutorResult> {
     const { runLog, reportState, batcher, steering, cancel, executor } = flight;
     const runId = claim.run_id;
@@ -9061,7 +9225,7 @@ export class RunRunner {
           });
           const parked = (ack as { status?: string } | undefined)?.status;
           if (parked !== "awaiting_followup") {
-            throw new Error(
+            throw new TrustedExecutionRefusal(
               `${REASON_FOLLOWUP_NOT_PARKED} (server reports ${parked ?? "an unreadable status"})`,
             );
           }
@@ -9087,7 +9251,7 @@ export class RunRunner {
             ownershipStatus = (await this.client.getRunOwnership(runId)).status;
           } catch (err) {
             if (err instanceof RequestError && err.status === 404) {
-              throw new Error(
+              throw new TrustedExecutionRefusal(
                 `${REASON_FOLLOWUP_NOT_PARKED} (server reports the run is not owned by this worker)`,
               );
             }
@@ -9099,7 +9263,7 @@ export class RunRunner {
             );
           }
           if (ownershipStatus !== undefined && FOLLOWUP_TERMINAL_STATUSES.has(ownershipStatus)) {
-            throw new Error(
+            throw new TrustedExecutionRefusal(
               `${REASON_FOLLOWUP_NOT_PARKED} (server reports ${ownershipStatus})`,
             );
           }
@@ -9373,9 +9537,25 @@ export class RunRunner {
       : undefined;
     let result: ExecutorResult;
     let diskParked = false;
+    const settleExecution = async (): Promise<void> => {
+      try {
+        this.diskGovernor?.leftLoop(flight.runId, diskParked);
+        await ticker?.stop();
+        await runningReportChain;
+      } catch (settlementError) {
+        executionRejection.rejected = false;
+        throw settlementError;
+      }
+    };
     try {
       this.diskGovernor?.enterRun(flight.runId);
-      result = await executor.run(ctx);
+      try {
+        result = await executor.run(ctx);
+      } catch (value) {
+        executionRejection.rejected = true;
+        executionRejection.value = value;
+        throw value;
+      }
       // Issue #1742: the executor returned. If the result is finalize-bound, journal a durable
       // finalize-pending record NOW, before the finally's ticker stop and report-chain drain and
       // before every later finalize await, so a worker restart anywhere in finalize leaves proof
@@ -9390,9 +9570,7 @@ export class RunRunner {
       // PRD #1809 D4 (N4), issue #1830: the run has left its executor, so it can no longer take a
       // stop (a finalizing run is only ever reclaimed in place). A stop that it never turned into
       // a disk park is released, so the hard layer can stop another run.
-      this.diskGovernor?.leftLoop(flight.runId, diskParked);
-      await ticker?.stop();
-      await runningReportChain;
+      await settleExecution();
     }
 
     // Reap any agent-backgrounded subprocess BEFORE the PAT touches a git child
@@ -9553,8 +9731,12 @@ export class RunRunner {
   }
 
   /** {@link reproveAfterRunnerGit}, returning the blocked proof's detail (undefined when quiescent). */
-  private async reproveDetailAfterRunnerGit(flight: RunFlight, site: string): Promise<string | undefined> {
-    const q = await this.quiesceRun(flight, flight.executor, { mode: "own", site: `${site}:after_runner_git`, processOnly: true });
+  private async reproveDetailAfterRunnerGit(
+    flight: RunFlight, site: string, opts: { propagateControl?: boolean } = {},
+  ): Promise<string | undefined> {
+    const q = await this.quiesceRun(flight, flight.executor, {
+      mode: "own", site: `${site}:after_runner_git`, processOnly: true, ...opts,
+    });
     return q.blocked ? (q.outcome.process?.detail ?? "not quiescent") : undefined;
   }
 
@@ -9598,7 +9780,7 @@ export class RunRunner {
   private async quiesceRun(
     flight: RunFlight,
     executor: Executor,
-    opts: { mode: QuiesceMode; site: string; targetPaths?: string[]; processOnly?: boolean; clonePath?: string },
+    opts: { mode: QuiesceMode; site: string; targetPaths?: string[]; processOnly?: boolean; clonePath?: string; propagateControl?: boolean },
   ): Promise<{ outcome: QuiesceRunOutcome; blocked: boolean }> {
     return flight.sinkGate.run(async () => {
       executor.killAgentTree?.();
@@ -9671,6 +9853,7 @@ export class RunRunner {
           site: opts.site,
         });
       } catch (err) {
+        if (opts.propagateControl && canonicalRecoveryInterruption(err)) throw err;
         outcome = {
           process: { state: "unverified", processes: [], killed: [], detail: `quiescence failed: ${errMessage(err)}` },
           docker: { state: "docker_error", removed: [], detail: errMessage(err) },
@@ -11935,6 +12118,7 @@ export class RunRunner {
     reportState: (body: StateRequest) => Promise<StateAck>,
     runLog: Logger,
     cause: RecoveryParkCause = { kind: "transient" },
+    opts: { terminalDisk?: boolean } = {},
   ): Promise<boolean> {
     const vault = cause.kind === "vault_locked";
     // PRD #1809 D4: the mid-run disk park (the cache cap's preventive park, or the hard pressure
@@ -11965,6 +12149,8 @@ export class RunRunner {
     // issue #1783 M3: consecutive capture attempts whose quiescence proof blocked (see
     // RECOVERY_CAPTURE_BLOCKED_ATTEMPTS); reset by any capture outcome that is not a blocked proof.
     let blockedCaptures = 0;
+    let unverifiedCaptures = 0;
+    let degraded = false;
     // #1539: the outcome of the cancel branch's pre-report reap, run ONCE while the run is
     // still actively-claimed. undefined = not yet attempted; true = reaped (settle after the
     // terminal report); false = a blocked/failed reap (RETAIN the hold, still report the cancel).
@@ -12047,6 +12233,7 @@ export class RunRunner {
     };
     try {
       for (;;) {
+        if (opts.terminalDisk) this.terminalDiskInterruption(flight);
         if (flight.active?.shuttingDown) return false;
         if (!confirmedRunning && !flight.steering.isCancelled()) {
           const confirm = await this.confirmRunningForVaultPark(flight, reportState, runLog);
@@ -12102,14 +12289,19 @@ export class RunRunner {
         try {
           const own = await this.client.getRunOwnership(flight.runId);
           status = own.status;
-          if (vault && own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration) {
+          if ((vault || opts.terminalDisk) && own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration) {
             flight.preserveRecoveryClone = false;
             flight.preserveSession = false;
             return false;
           }
+          if (opts.terminalDisk && own.claim_generation === undefined) {
+            await retryWait();
+            continue;
+          }
         } catch (probeError) {
           if (probeError instanceof RequestError && probeError.status === 404) {
             if (vault) keepUnlessCaptured(capture !== undefined);
+            if (opts.terminalDisk) { flight.preserveRecoveryClone = false; flight.preserveSession = false; }
             return false;
           }
           if (vault) await note(VAULT_PARK_FEED.confirmUnknown);
@@ -12211,6 +12403,7 @@ export class RunRunner {
           try {
             const attempt = await this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
               credentialFree: vault,
+              terminalDisk: opts.terminalDisk,
             });
             if (attempt.residueBlocked) blockedDetail = attempt.residueDetail ?? "not quiescent";
             if (attempt.verified) {
@@ -12220,11 +12413,19 @@ export class RunRunner {
               retries = 0;
             }
           } catch (captureError) {
+            if (opts.terminalDisk) {
+              this.terminalDiskInterruption(flight);
+              if (canonicalRecoveryInterruption(captureError)) throw captureError;
+            }
             runLog.warn("recovery capture failed; retaining work for retry", {
               error: errMessage(captureError),
             });
           }
           blockedCaptures = blockedDetail === undefined ? 0 : blockedCaptures + 1;
+          if (opts.terminalDisk) {
+            this.terminalDiskInterruption(flight);
+            if (!capture && blockedDetail === undefined) unverifiedCaptures++;
+          }
           // Cancellation/shutdown may have arrived during local git or publish. Either takes
           // precedence over the blocked bound below: the loop's top routes a shutdown to the
           // retained posture and a cancel to the cancel report, never to worker_residue_blocked.
@@ -12245,8 +12446,32 @@ export class RunRunner {
               attempts: blockedCaptures,
               detail: sanitizeForLog(blockedDetail),
             });
-            await this.reportGenericFailure(claim, flight, new RunResidueBlockedError(blockedDetail), { keepCustody: vault });
+            await this.reportGenericFailure(claim, flight, new RunResidueBlockedError(blockedDetail), { keepCustody: vault || opts.terminalDisk });
             return false;
+          }
+          if (opts.terminalDisk && !capture && unverifiedCaptures >= COMPLETION_HOLD_CAPTURE_ATTEMPTS) {
+            // Captures never restart after this disposition, including lost/statusless park ACKs.
+            // Up to four blocked calls can precede each of three nonblocked failures (15 total).
+            // Final proof is separately bounded to five calls and performs no capture/git mutation.
+            let quiescent = false;
+            for (let proof = 0; proof < RECOVERY_CAPTURE_BLOCKED_ATTEMPTS; proof++) {
+              this.terminalDiskInterruption(flight);
+              quiescent = await this.terminalDiskQuiescence(flight);
+              this.terminalDiskInterruption(flight);
+              if (quiescent) break;
+              if (proof + 1 < RECOVERY_CAPTURE_BLOCKED_ATTEMPTS) await retryWait();
+            }
+            if (!quiescent) {
+              await this.reportGenericFailure(claim, flight,
+                new RunResidueBlockedError("terminal disk capture: final quiescence unproven"), { keepCustody: true });
+              return false;
+            }
+            degraded = true;
+            capture = { verified: false, published: false };
+            // This is a local retention disposition, never a verified restore point.
+            flight.preserveRecoveryClone = true;
+            flight.preserveSession = true;
+            await note("Disk recovery capture could not be verified. Keeping the original clone, journal and session on this worker; recovery requires this worker and cannot transfer to another worker until capture succeeds.");
           }
           if (!capture) {
             if (vault) {
@@ -12268,6 +12493,35 @@ export class RunRunner {
         }
         // Cancellation/shutdown may have arrived during local git or publish.
         if (flight.active?.shuttingDown || flight.steering.isCancelled()) continue;
+        if (opts.terminalDisk) {
+          this.terminalDiskInterruption(flight);
+          let own: RunOwnershipResponse;
+          try {
+            own = await this.client.getRunOwnership(flight.runId);
+          } catch {
+            await retryWait();
+            continue;
+          }
+          this.terminalDiskInterruption(flight);
+          if (own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration
+            || TERMINAL_RUN_STATUSES.has(own.status)) {
+            flight.preserveRecoveryClone = false;
+            flight.preserveSession = false;
+            return false;
+          }
+          if (own.status !== "running" || own.claim_generation === undefined) {
+            await retryWait();
+            continue;
+          }
+          await batcher.awaitPermanentFailureSettled();
+          this.terminalDiskInterruption(flight);
+          if (flight.terminalResolved || this.outbox?.hasPendingTerminal(flight.runId, flight.claimGeneration)) {
+            flight.preserveRecoveryClone = false;
+            flight.preserveSession = false;
+            await this.reportGenericFailure(claim, flight, err);
+            return false;
+          }
+        }
         try {
           const parkBody: StateRequest = {
             ...(vault && this.client.protocolFeatures.includes("recovery_cause_vault_locked")
@@ -12296,7 +12550,9 @@ export class RunRunner {
               kind: "status",
               agent: "worker",
               payload: {
-                text: disk.preventive
+                text: degraded
+                  ? "paused for a full data volume; the unverified work and session are retained on this worker only until capture succeeds"
+                  : disk.preventive
                   ? "paused because this run's build caches stayed over their size cap; the caches are dropped and it resumes automatically"
                   : "paused because the worker's data volume is nearly full; this run's build caches are dropped and it resumes automatically",
               },
@@ -12359,15 +12615,19 @@ export class RunRunner {
           // ownership: returning while it is still running would strand the row
           // because this healthy worker's heartbeats prevent stale-worker requeue.
         } catch (reportError) {
-          if (vault && reportError instanceof StaleClaimError) {
+          if ((vault || opts.terminalDisk) && reportError instanceof StaleClaimError) {
             // #1247: the run moved on under this worker. Stop silently, normal teardown.
             flight.preserveRecoveryClone = false;
             flight.preserveSession = false;
             return false;
           }
-          if (vault && reportError instanceof ServerWallParkedError) {
+          if ((vault || opts.terminalDisk) && reportError instanceof ServerWallParkedError) {
             flight.preserveRecoveryClone = true;
             return true;
+          }
+          if (opts.terminalDisk) {
+            this.terminalDiskInterruption(flight);
+            if (canonicalRecoveryInterruption(reportError)) throw reportError;
           }
           // Bounded HTTP retries can fail while this worker keeps heartbeating.
           // Retain ownership and retry the idempotent park until its ACK is known.
@@ -12691,7 +12951,7 @@ export class RunRunner {
     flight: RunFlight,
     runLog: Logger,
     site: "recovery_capture" | "credential_switch",
-    opts: { credentialFree?: boolean; publish?: boolean } = {},
+    opts: { credentialFree?: boolean; publish?: boolean; terminalDisk?: boolean } = {},
   ): Promise<RecoveryCaptureResult> {
     const barePath = flight.barePath;
     const worktreePath = flight.worktreePath;
@@ -12710,7 +12970,15 @@ export class RunRunner {
     // fails the run worker_residue_blocked; the credential switch retries up to
     // CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS, then gives up with custody kept. The callers set
     // preserveRecoveryClone up front.
-    const proof = await this.quiesceRun(flight, flight.executor, { mode: "own", site });
+    if (opts.terminalDisk) {
+      this.terminalDiskInterruption(flight);
+      if (!await this.terminalDiskQuiescence(flight)) {
+        return { verified: false, published: false, residueBlocked: true, residueDetail: "terminal disk capture: quiescence unproven" };
+      }
+      this.terminalDiskInterruption(flight);
+    }
+    const proof = await this.quiesceRun(flight, flight.executor, { mode: "own", site, propagateControl: opts.terminalDisk });
+    if (opts.terminalDisk) this.terminalDiskInterruption(flight);
     if (proof.blocked) {
       runLog.warn("recovery capture skipped: the clone is not provably quiescent; nothing captured or published", { site });
       return { verified: false, published: false, residueBlocked: true, residueDetail: proof.outcome.process?.detail ?? "not quiescent" };
@@ -12720,6 +12988,7 @@ export class RunRunner {
     // worktreeStatus returns null on an UNREADABLE status → cannot assert clean → not
     // verified. Retain this clone and retry; a prior checkpoint may lack its work.
     const status = await this.git.worktreeStatus(worktreePath);
+    if (opts.terminalDisk) this.terminalDiskInterruption(flight);
     if (status === null) {
       runLog.warn("recovery capture: worktree status unreadable (cannot assert clean)");
       return { verified: false, published: false };
@@ -12729,6 +12998,7 @@ export class RunRunner {
       // tree is dirty, a `false` here is unambiguously a commit FAILURE (not the clean-tree
       // no-op case), so the local restore point is not verified for this attempt.
       const committed = await this.git.commitWipMarker(worktreePath);
+      if (opts.terminalDisk) this.terminalDiskInterruption(flight);
       if (!committed) {
         runLog.warn("recovery capture: WIP commit of a dirty tree failed");
         return { verified: false, published: false };
@@ -12736,7 +13006,8 @@ export class RunRunner {
     }
     // issue #1783 (auditor M1): re-prove after the status read / marker (either can start an agent-
     // planted filter) and before the fetch-back, the overlay's PAT fetch and the publish.
-    const reproofDetail = await this.reproveDetailAfterRunnerGit(flight, site);
+    const reproofDetail = await this.reproveDetailAfterRunnerGit(flight, site, { propagateControl: opts.terminalDisk });
+    if (opts.terminalDisk) this.terminalDiskInterruption(flight);
     if (reproofDetail !== undefined) {
       runLog.warn("recovery capture: clone not provably quiescent after the WIP marker; nothing captured or published", { site });
       return { verified: false, published: false, residueBlocked: true, residueDetail: reproofDetail };
@@ -12747,6 +13018,10 @@ export class RunRunner {
     try {
       await this.git.fetchAgentBranch(barePath, worktreePath, branch, flight.runId);
     } catch (e) {
+      if (opts.terminalDisk) {
+        this.terminalDiskInterruption(flight);
+        if (canonicalRecoveryInterruption(e)) throw e;
+      }
       runLog.warn("recovery capture: fetch-back failed", { error: errMessage(e) });
       return { verified: false, published: false };
     }
@@ -12758,6 +13033,7 @@ export class RunRunner {
       worktreePath,
       branch,
     );
+    if (opts.terminalDisk) this.terminalDiskInterruption(flight);
     if (!verified) return { verified: false, published: false };
     // PRD #1416 M3 (C8): bridge a divergent tracking tip AFTER the fetch-back + verify (so the verify
     // still confirms the tracking ref covered the run's HEAD H) and BEFORE the capture publish, so
@@ -12809,6 +13085,7 @@ export class RunRunner {
         ...codexBoundaryDiagnosticField(err, flight.redactText),
       });
     }
+    if (opts.terminalDisk) this.terminalDiskInterruption(flight);
     return { verified, published };
   }
 
@@ -13583,7 +13860,7 @@ export class RunRunner {
       await steering.awaitInitialDelivery(signal);
     } catch (err) {
       if (!(err instanceof GateInputDeliveryError)) throw err;
-      if (err.definitive) throw new Error(`plan-gate input delivery failed: ${err.message}`);
+      if (err.definitive) throw new TrustedExecutionRefusal(`plan-gate input delivery failed: ${err.message}`, { cause: err });
       runLog.warn("could not read plan-gate inputs after the resume; parking for recovery", {
         run_id: runId,
         error: err.message,
@@ -13733,7 +14010,7 @@ export class RunRunner {
       // here rather than returning an approve verdict. Only a 200 (applied) proceeds.
       const ack = await reportState(autopilotState);
       if (!ack.applied) {
-        throw new Error(
+        throw new TrustedExecutionRefusal(
           `autopilot plan not durably stored — the run is ${ack.status ?? "no longer running"}`,
         );
       }
@@ -14072,7 +14349,7 @@ export class RunRunner {
     const parked = (ack as { status?: string } | undefined)?.status;
     if (parked !== "awaiting_input") {
       this.openQuestionIds.delete(runId);
-      throw new Error(
+      throw new TrustedExecutionRefusal(
         `${REASON_QUESTION_NOT_PARKED} (server reports ${parked ?? "an unreadable status"})`,
       );
     }

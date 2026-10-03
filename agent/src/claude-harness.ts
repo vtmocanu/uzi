@@ -23,6 +23,7 @@
 // finalizes each turn (resume, the shared abort controller, the pid-recording spawn)
 // and runs the query.
 
+import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import type {
   Options as SdkOptions,
   SDKMessage,
@@ -286,7 +287,7 @@ export class ClaudeHarness implements RunHarness {
     const base = this.nextOptions;
     const currentChild = this.nextChild;
     if (!base || !currentChild) {
-      throw new Error("claude harness: prepareTurn was not called for this turn");
+      throw new TrustedExecutionRefusal("claude harness: prepareTurn was not called for this turn");
     }
 
     // The SDK reads this controller; link it to the owner's neutral signal (trip /

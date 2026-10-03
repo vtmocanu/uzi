@@ -22,6 +22,7 @@
 // (testing-credentials policy). The plan/done signals are observed from that
 // stream (see signals.ts), so a scripted fake proves them without a live SDK.
 
+import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "./worker-spawn-mark.js";
 import { scopeCapAtDone, scopeSteerAckPayload } from "./scope-cap.js";
 import fs from "node:fs/promises";
@@ -2034,7 +2035,7 @@ export class SdkExecutor implements Executor {
         // time a revise is taken. FAIL-CLOSED: the while-condition + the post-loop guards
         // guarantee the only way past this block is an `approve` (see the explicit guard).
         if (!ctx.gatePlan)
-          throw new Error("plan gate is not wired for this run");
+          throw new TrustedExecutionRefusal("plan gate is not wired for this run");
         // PRD #362 M3c PLAN hook (Decision 2): generate + post the plan summary as the
         // gate's onAwaitingApproval callback, so it fires AFTER the gate persists plan_md
         // (the summary's stale-write guard value) and BEFORE the verdict wait — blocking
@@ -2174,7 +2175,7 @@ export class SdkExecutor implements Executor {
         // FAIL-CLOSED: the loop + guards above leave only `approve`; any other kind is a
         // bug (e.g. a future verdict variant) and must never fall through into implement.
         if (verdict.kind !== "approve")
-          throw new Error(
+          throw new TrustedExecutionRefusal(
             `unexpected plan verdict: ${(verdict as { kind: string }).kind}`,
           );
         approvedSelection = verdict.selection;
