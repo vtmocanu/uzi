@@ -11,13 +11,15 @@ import (
 	"github.com/google/uuid"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 func TestCrossCheckMilestonesScrubEscapedContent(t *testing.T) {
 	token := "glpat-" + "abcdefghijklmnopqrst"
 	raw := []byte(`[{"title":"` + "glpat-" + `\u0061bcdefghijklmnopqrst \u202e"}]`)
-	clean, ok := scrubPlanCrossCheckMilestones(raw)
-	if !ok {
+	candidate, err := workersvc.NormalizePlanCrossCheckCandidate(workersvc.PlanCrossCheckCandidate{Milestones: raw})
+	clean := candidate.Milestones
+	if err != nil {
 		t.Fatal("valid escaped milestones rejected")
 	}
 	if strings.Contains(string(clean), token) || strings.Contains(string(clean), "\\u202e") {
@@ -27,7 +29,7 @@ func TestCrossCheckMilestonesScrubEscapedContent(t *testing.T) {
 		`[{"` + "glpat-" + `\u0061bcdefghijklmnopqrst":"ok"}]`,
 		`[{"\u202e":"ok"}]`,
 	} {
-		if _, accepted := scrubPlanCrossCheckMilestones([]byte(key)); accepted {
+		if _, err := workersvc.NormalizePlanCrossCheckCandidate(workersvc.PlanCrossCheckCandidate{Milestones: []byte(key)}); err == nil {
 			t.Fatalf("unsafe milestone key accepted: %s", key)
 		}
 	}

@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -35,57 +34,17 @@ type crossCheckVerdictRequest struct {
 
 func crossCheckError(w http.ResponseWriter, err error) {
 	if errors.Is(err, workersvc.ErrCrossCheckRefused) {
-		httpx.Error(w, http.StatusConflict, "cross-check refused")
+		reason := "cross_check_refused"
+		switch {
+		case errors.Is(err, workersvc.ErrCrossCheckInterrupted):
+			reason = "interrupted"
+		case errors.Is(err, workersvc.ErrCrossCheckUnavailable):
+			reason = "checker_unavailable"
+		}
+		httpx.ErrorReason(w, http.StatusConflict, "cross-check refused", reason)
 		return
 	}
 	httpx.Error(w, http.StatusInternalServerError, "cross-check failed")
-}
-
-// Decode before scrubbing so escaped Unicode, bidi controls and credential text
-// cannot bypass the ingest boundary by hiding in JSON escapes.
-func scrubPlanCrossCheckMilestones(raw json.RawMessage) (json.RawMessage, bool) {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	var values []any
-	if err := decoder.Decode(&values); err != nil || len(values) > 64 {
-		return nil, false
-	}
-	var scrub func(any, int) (any, bool)
-	scrub = func(value any, depth int) (any, bool) {
-		if depth > 32 {
-			return nil, false
-		}
-		switch item := value.(type) {
-		case string:
-			return scrubThenBoundMarkdown(item, 256*1024), true
-		case []any:
-			for i := range item {
-				var ok bool
-				item[i], ok = scrub(item[i], depth+1)
-				if !ok {
-					return nil, false
-				}
-			}
-		case map[string]any:
-			for key, child := range item {
-				if key != scrubThenBoundSelfReported(key, 128) {
-					return nil, false
-				}
-				next, ok := scrub(child, depth+1)
-				if !ok {
-					return nil, false
-				}
-				item[key] = next
-			}
-		}
-		return value, true
-	}
-	clean, ok := scrub(values, 0)
-	if !ok {
-		return nil, false
-	}
-	encoded, err := json.Marshal(clean)
-	return encoded, err == nil && len(encoded) <= 256*1024
 }
 
 func (h *Handler) WorkerSubmitPlanCrossCheck(w http.ResponseWriter, r *http.Request) {
@@ -108,21 +67,11 @@ func (h *Handler) WorkerSubmitPlanCrossCheck(w http.ResponseWriter, r *http.Requ
 		httpx.Error(w, http.StatusBadRequest, "candidate exceeds limit")
 		return
 	}
-	c.PlanMd = scrubThenBoundMarkdown(c.PlanMd, 256*1024)
-	c.PlanningDiff = scrubThenBoundMarkdown(c.PlanningDiff, 512*1024)
-	scrubbedMilestones, ok := scrubPlanCrossCheckMilestones(c.Milestones)
-	if !ok {
-		httpx.Error(w, http.StatusBadRequest, "invalid milestones")
+	c, normalizeErr := workersvc.NormalizePlanCrossCheckCandidate(c)
+	if normalizeErr != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid cross-check candidate")
 		return
 	}
-	c.Milestones = scrubbedMilestones
-	for i := range c.RequiredCapabilities {
-		c.RequiredCapabilities[i] = scrubThenBoundSelfReported(c.RequiredCapabilities[i], 256)
-	}
-	for i := range c.RequiredTools {
-		c.RequiredTools[i] = scrubThenBoundSelfReported(c.RequiredTools[i], 256)
-	}
-	c.SizeClass = scrubThenBoundSelfReported(c.SizeClass, 64)
 	cc, err := h.wsvc.SubmitPlanCrossCheck(r.Context(), worker, id, *req.ClaimGeneration, c)
 	if err != nil {
 		crossCheckError(w, err)

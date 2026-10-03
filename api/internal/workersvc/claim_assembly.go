@@ -844,6 +844,12 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		payload.SelfImproveDogfood = rc.FoldImproveUziBacklog
 	}
 
+	if run.Kind == runkind.CrossCheck {
+		if err := s.assemblePlanCrossCheckInput(ctx, wkr, run, payload); err != nil {
+			return nil, err
+		}
+	}
+
 	// PRD #1906 M3: last, so nothing attached above survives the strip. An unbound run
 	// skips this and its claim is byte-identical to before.
 	if isolated {

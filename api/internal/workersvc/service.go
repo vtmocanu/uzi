@@ -3518,6 +3518,7 @@ type StateRequest struct {
 	// DisallowUnknownFields — a fence-capable worker that sends it would 400 otherwise. A negative
 	// value is invalid (ErrInvalidState). Ignored on every non-terminal report.
 	MessagesThroughSeq *int64  `json:"messages_through_seq"`
+	CandidateDigest    string  `json:"candidate_digest,omitempty"`
 	PlanMd             *string `json:"plan_md"`
 	Branch             *string `json:"branch"`
 	MrIID              *int64  `json:"mr_iid"`
@@ -4136,11 +4137,15 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				q = store.New(tx)
 			}
 			var planRows int64
-			planRows, err = q.SetRunAutopilotPlan(ctx, store.SetRunAutopilotPlanParams{
-				PlanMd:   planBody,
-				ID:       runID,
-				WorkerID: pgconv.UUID(wkr.ID),
-			})
+			planParams := store.SetRunAutopilotPlanParams{
+				PlanMd: planBody, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+			}
+			if owned.PlanCrossCheckRequired {
+				if err := bindPlanCrossCheckWrite(&planParams, owned, &req); err != nil {
+					return store.Run{}, false, err
+				}
+			}
+			planRows, err = q.SetRunAutopilotPlan(ctx, planParams)
 			if err != nil {
 				return store.Run{}, false, err
 			}

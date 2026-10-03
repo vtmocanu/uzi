@@ -2,6 +2,12 @@
 -- A cross-check is a repo-backed Codex child with its own clone. Its target_run_id
 -- points to the lead; cross_checks.checker_run_id records the corresponding attempt.
 -- The branch may start NULL: checkout identity comes from the child's run id.
+ALTER TABLE runs DROP CONSTRAINT runs_trigger_source_check,
+    ADD CONSTRAINT runs_trigger_source_check CHECK (trigger_source IN (
+        'manual', 'autopilot', 'schedule', 'self_improve', 'ci_fix', 'mr_rework',
+        'chat', 'task', 'task_review', 'then_fix', 'judge', 'judge_rerun', 'resume', 'cross_check'
+    ));
+
 ALTER TABLE runs DROP CONSTRAINT runs_kind_check;
 ALTER TABLE runs ADD CONSTRAINT runs_kind_check
     CHECK (kind IN ('issue', 'ci_fix', 'chat', 'judge', 'self_improve', 'prompt', 'task', 'mr_rework', 'job', 'cross_check'));
@@ -41,3 +47,9 @@ ALTER TABLE runs ADD CONSTRAINT runs_kind_shape CHECK (
 ALTER TABLE runs DROP CONSTRAINT runs_kind_check;
 ALTER TABLE runs ADD CONSTRAINT runs_kind_check
     CHECK (kind IN ('issue', 'ci_fix', 'chat', 'judge', 'self_improve', 'prompt', 'task', 'mr_rework', 'job'));
+
+ALTER TABLE runs DROP CONSTRAINT runs_trigger_source_check,
+    ADD CONSTRAINT runs_trigger_source_check CHECK (trigger_source IN (
+        'manual', 'autopilot', 'schedule', 'self_improve', 'ci_fix', 'mr_rework',
+        'chat', 'task', 'task_review', 'then_fix', 'judge', 'judge_rerun', 'resume'
+    ));

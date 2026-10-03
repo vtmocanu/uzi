@@ -12561,6 +12561,69 @@ func (q *Queries) RecordCompletionAttempt(ctx context.Context, arg RecordComplet
 	return completion_attempts, err
 }
 
+const recordPlanCrossCheckClaim = `-- name: RecordPlanCrossCheckClaim :one
+UPDATE cross_checks cc SET checker_model = $1::text,
+    checker_effort = $2::text
+FROM runs child, runs lead
+WHERE child.id = cc.checker_run_id AND lead.id = cc.lead_run_id
+  AND child.id = $3 AND child.worker_id = $4
+  AND child.claim_generation = $5 AND child.claim_released_at IS NULL
+  AND child.kind = 'cross_check' AND child.harness = cc.checker_harness
+  AND child.status IN ('claimed', 'running')
+  AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
+  AND lead.claim_generation = cc.lead_claim_generation
+  AND lead.harness <> cc.checker_harness
+  AND cc.stage = 'plan' AND cc.verdict = 'pending' AND now() < cc.deadline_at
+RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at
+`
+
+type RecordPlanCrossCheckClaimParams struct {
+	CheckerModel    pgtype.Text `json:"checker_model"`
+	CheckerEffort   pgtype.Text `json:"checker_effort"`
+	ChildID         uuid.UUID   `json:"child_id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration int64       `json:"claim_generation"`
+}
+
+// Claim assembly locks the lead first, as verdict and lifecycle settlement do.
+// The returned candidate belongs to this live child claim, never a different attempt.
+func (q *Queries) RecordPlanCrossCheckClaim(ctx context.Context, arg RecordPlanCrossCheckClaimParams) (CrossCheck, error) {
+	row := q.db.QueryRow(ctx, recordPlanCrossCheckClaim,
+		arg.CheckerModel,
+		arg.CheckerEffort,
+		arg.ChildID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+	)
+	var i CrossCheck
+	err := row.Scan(
+		&i.ID,
+		&i.LeadRunID,
+		&i.Stage,
+		&i.Round,
+		&i.LeadClaimGeneration,
+		&i.PlanMd,
+		&i.Milestones,
+		&i.RequiredCapabilities,
+		&i.RequiredTools,
+		&i.SizeClass,
+		&i.BaseCommit,
+		&i.PlanningDiff,
+		&i.CandidateDigest,
+		&i.CheckerRunID,
+		&i.CheckerHarness,
+		&i.CheckerModel,
+		&i.CheckerEffort,
+		&i.Verdict,
+		&i.ReasonClass,
+		&i.Findings,
+		&i.DecidedAt,
+		&i.DeadlineAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const recordRunColumnMove = `-- name: RecordRunColumnMove :execrows
 UPDATE runs SET board_column = $1, move_pending_since = NULL, updated_at = now()
 WHERE id = $2
@@ -14354,7 +14417,7 @@ type SetRunAutopilotPlanParams struct {
 // idempotent write whose affected-row count PROVES the intended plan is stored: rows>0
 // ⟺ @plan_md is now the durable plan; rows=0 ⟺ refusal (no mutation).
 //
-// The four positive guards, all load-bearing (GetRunOwnedByWorker filters only
+// The four base guards, all load-bearing (GetRunOwnedByWorker filters only
 // id+worker_id and runOwnedByWorker adds no state check, so this query is the ONLY
 // protection):
 //   - status IN ('claimed','running') — the legitimate running-report source only;
@@ -14369,6 +14432,10 @@ type SetRunAutopilotPlanParams struct {
 //   - plan_md IS NULL OR plan_md = @plan_md — write-once, but a re-send of the SAME body
 //     matches idempotently (a retry succeeds; a DIFFERENT body on an already-set row is
 //     refused).
+//
+// Required cross-check plans additionally bind the latest opposite-harness approval,
+// current claim generation, server digest and every canonical approval-bearing field.
+// The same guarded statement freezes those fields before SetRunRunning acknowledges it.
 func (q *Queries) SetRunAutopilotPlan(ctx context.Context, arg SetRunAutopilotPlanParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setRunAutopilotPlan,
 		arg.PlanMd,

@@ -1114,7 +1114,24 @@ export interface ClaimJob {
  * `plan_md` used to be in that ignored list and no longer is — PRD #35's resume
  * path consumes it, so it is declared below.
  */
+/** Server-stored, bounded plan candidate for one live read-only child claim. */
+export interface ClaimPlanCrossCheck {
+  stage: "plan";
+  lead_run_id: string;
+  round: number;
+  candidate_digest: string;
+  deadline_at: string;
+  plan_md: string;
+  milestones: Milestone[];
+  required_capabilities: string[];
+  required_tools: string[];
+  size_class: string;
+  base_commit: string;
+  planning_diff: string;
+}
+
 export interface ClaimResponse {
+  cross_check?: ClaimPlanCrossCheck;
   run_id: string;
   /** Run kind (PRD #6). "issue": work issue_iid's card. "ci_fix": diagnose + fix
    *  the failed `pipeline`. Absent on older servers ⇒ treat as "issue". */
@@ -2190,6 +2207,8 @@ export type PublishResult =
   | { ok: false; httpStatus: number };
 
 export interface StateRequest {
+  /** Required for an opted-in autopilot plan write; server-computed at submission. */
+  candidate_digest?: string;
   status: RunState;
   /** PRD #1392 M2 (#1247 generation fence): the exact claim generation THIS report is made
    *  against, so the api's park transaction settles only the hold that generation opened. Sent on

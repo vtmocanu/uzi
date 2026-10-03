@@ -499,6 +499,7 @@ func TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB(t *testing.T) {
 		// middleware, so an implementation that widened all three passes it.
 		{"autopilot opt-in (spends unattended, D23 group split)", http.MethodPut, "/api/me/autopilot"},
 		{"judge opt-in (spends unattended, D23 group split)", http.MethodPut, "/api/me/judge"},
+		{"plan cross-check opt-in (spends the other credential)", http.MethodPut, "/api/me/cross-check"},
 		// PRD #35 Decision 7. Both wait-on-limit routes are cookie-only for the same
 		// reason as their neighbours: consent to uzi holding an issue's one-active lock
 		// and a worker's disk for up to RUN_LIMIT_MAX_PARK on the caller's behalf. Listed

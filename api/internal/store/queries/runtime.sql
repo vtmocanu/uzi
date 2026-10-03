@@ -2272,7 +2272,7 @@ WHERE id = @id AND user_id = @user_id AND status = 'awaiting_approval'
 -- idempotent write whose affected-row count PROVES the intended plan is stored: rows>0
 -- ⟺ @plan_md is now the durable plan; rows=0 ⟺ refusal (no mutation).
 --
--- The four positive guards, all load-bearing (GetRunOwnedByWorker filters only
+-- The four base guards, all load-bearing (GetRunOwnedByWorker filters only
 -- id+worker_id and runOwnedByWorker adds no state check, so this query is the ONLY
 -- protection):
 --   * status IN ('claimed','running') — the legitimate running-report source only;
@@ -2287,6 +2287,9 @@ WHERE id = @id AND user_id = @user_id AND status = 'awaiting_approval'
 --   * plan_md IS NULL OR plan_md = @plan_md — write-once, but a re-send of the SAME body
 --     matches idempotently (a retry succeeds; a DIFFERENT body on an already-set row is
 --     refused).
+-- Required cross-check plans additionally bind the latest opposite-harness approval,
+-- current claim generation, server digest and every canonical approval-bearing field.
+-- The same guarded statement freezes those fields before SetRunRunning acknowledges it.
 UPDATE runs SET
     plan_md     = @plan_md,
     required_capabilities = CASE WHEN plan_cross_check_required THEN
@@ -8214,3 +8217,20 @@ WITH leads AS MATERIALIZED (
     RETURNING lead.id
 )
 SELECT cc.lead_run_id FROM superseded cc JOIN banked b ON b.id = cc.lead_run_id;
+
+-- name: RecordPlanCrossCheckClaim :one
+-- Claim assembly locks the lead first, as verdict and lifecycle settlement do.
+-- The returned candidate belongs to this live child claim, never a different attempt.
+UPDATE cross_checks cc SET checker_model = sqlc.narg('checker_model')::text,
+    checker_effort = sqlc.narg('checker_effort')::text
+FROM runs child, runs lead
+WHERE child.id = cc.checker_run_id AND lead.id = cc.lead_run_id
+  AND child.id = @child_id AND child.worker_id = @worker_id
+  AND child.claim_generation = @claim_generation AND child.claim_released_at IS NULL
+  AND child.kind = 'cross_check' AND child.harness = cc.checker_harness
+  AND child.status IN ('claimed', 'running')
+  AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
+  AND lead.claim_generation = cc.lead_claim_generation
+  AND lead.harness <> cc.checker_harness
+  AND cc.stage = 'plan' AND cc.verdict = 'pending' AND now() < cc.deadline_at
+RETURNING cc.*;

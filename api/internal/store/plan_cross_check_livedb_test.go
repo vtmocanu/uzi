@@ -312,6 +312,7 @@ func TestPlanCrossCheckGuardsLiveDB(t *testing.T) {
 	mustExec(ctx, t, f.pool, `UPDATE runs SET plan_cross_check_required = true, auto_approve = true, plan_source = 'agent' WHERE id = $1`, f.runID)
 	planRows, err := f.q.SetRunAutopilotPlan(ctx, store.SetRunAutopilotPlanParams{
 		ID: f.runID, WorkerID: pgU(f.workerID), PlanMd: pgT("unchecked"), CandidateDigest: []byte("digest"),
+		InferredCapabilities: []string{}, InferredTools: []string{}, SizeClass: pgT("s"), MilestonesFrozen: []byte(`[]`),
 	})
 	if err != nil {
 		t.Fatalf("SetRunAutopilotPlan: %v", err)

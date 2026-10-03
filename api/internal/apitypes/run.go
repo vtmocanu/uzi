@@ -193,7 +193,7 @@ type RunDTO struct {
 	PlanCrossCheckRequired bool `json:"plan_cross_check_required"`
 	// TriggerSource records what/how/who started the run (issue #857): one of
 	// manual, autopilot, schedule, self_improve, ci_fix, mr_rework, chat, task,
-	// task_review, then_fix, judge, judge_rerun, resume. Always set (NOT NULL column,
+	// task_review, then_fix, judge, judge_rerun, resume, cross_check. Always set (NOT NULL column,
 	// DEFAULT 'manual'); historical rows carry a best-effort backfilled value.
 	TriggerSource string `json:"trigger_source"`
 	// Milestones is the run's FROZEN, human-approved milestone list (PRD #122 M1),

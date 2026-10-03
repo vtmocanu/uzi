@@ -24,7 +24,8 @@ import (
 // structured templates (PRD #3 provides several subagents that map to
 // programmatic SDK AgentDefinitions), not a single `template`.
 type ClaimPayload struct {
-	RunID string `json:"run_id"`
+	CrossCheck *ClaimPlanCrossCheck `json:"cross_check,omitempty"`
+	RunID      string               `json:"run_id"`
 	// Kind is the run kind (one of the runkind values; PRD #6). The worker branches on it: an
 	// issue run works IssueIID's card; a ci_fix run diagnoses + fixes Pipeline.
 	Kind string `json:"kind"`

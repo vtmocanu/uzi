@@ -18,6 +18,8 @@ import (
 )
 
 var ErrCrossCheckRefused = errors.New("plan cross-check refused")
+var ErrCrossCheckInterrupted = fmt.Errorf("%w: interrupted", ErrCrossCheckRefused)
+var ErrCrossCheckUnavailable = fmt.Errorf("%w: checker unavailable", ErrCrossCheckRefused)
 
 // PlanCrossCheckCandidate contains only the fields the checker approves. The caller
 // scrubs untrusted text before this value is stored and digested.
@@ -54,6 +56,11 @@ func (c PlanCrossCheckCandidate) Digest() ([]byte, error) {
 }
 
 func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64, candidate PlanCrossCheckCandidate) (store.CrossCheck, error) {
+	var normalizeErr error
+	candidate, normalizeErr = NormalizePlanCrossCheckCandidate(candidate)
+	if normalizeErr != nil {
+		return store.CrossCheck{}, normalizeErr
+	}
 	if len(candidate.PlanMd) == 0 || len(candidate.PlanMd) > 256*1024 || len(candidate.PlanningDiff) > 512*1024 ||
 		len(candidate.Milestones) > 256*1024 || len(candidate.BaseCommit) != 40 || strings.Trim(candidate.BaseCommit, "0123456789abcdefABCDEF") != "" ||
 		candidate.SizeClass == "" || len(candidate.RequiredCapabilities) > 64 || len(candidate.RequiredTools) > 64 {
@@ -107,7 +114,7 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 		prior, e := txq.GetPlanCrossCheck(ctx, leadID)
 		if e == nil {
 			if prior.Verdict != "pending" || prior.LeadClaimGeneration != generation || !bytes.Equal(prior.CandidateDigest, digest) {
-				return store.Run{}, ErrCrossCheckRefused
+				return store.Run{}, ErrCrossCheckInterrupted
 			}
 			existing = prior
 			return store.Run{}, errRetry
@@ -141,7 +148,7 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 		return existing, nil
 	}
 	if errors.Is(err, ErrNoCredentialForHarness) || errors.Is(err, ErrHarnessCredentialDisabled) {
-		return store.CrossCheck{}, ErrCrossCheckRefused
+		return store.CrossCheck{}, ErrCrossCheckUnavailable
 	}
 	if err != nil {
 		return store.CrossCheck{}, fmt.Errorf("create plan cross-check: %w", err)
@@ -183,7 +190,7 @@ func (s *Service) PlanCrossCheckStatus(ctx context.Context, worker store.Worker,
 		LeadRunID: leadID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation, Round: round,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return cc, 0, ErrCrossCheckRefused
+		return cc, 0, ErrCrossCheckInterrupted
 	}
 	if err != nil {
 		return cc, 0, err

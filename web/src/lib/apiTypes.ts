@@ -2568,7 +2568,7 @@ export interface MilestoneLive {
 }
 
 /** The create-entrypoint family that started a run (server column `trigger_source`,
- *  a closed 13-value enum). Mirrors the Go CHECK constraint / RunDTO. */
+ *  a closed 14-value enum). Mirrors the Go CHECK constraint / RunDTO. */
 export type RunTriggerSource =
   | "manual"
   | "autopilot"
@@ -2582,7 +2582,8 @@ export type RunTriggerSource =
   | "then_fix"
   | "judge"
   | "judge_rerun"
-  | "resume";
+  | "resume"
+  | "cross_check";
 
 /** PRD #1227 M1: one owner-deferred (out-of-scope) milestone on a revised completion contract —
  *  the milestone id, the owner's reason, and the contract revision the deferral was recorded at. */
@@ -2703,7 +2704,7 @@ export interface Run {
   plan_cross_check_required: boolean;
   /** issue #857: what/how/who started the run (manual, autopilot, schedule,
    *  self_improve, ci_fix, mr_rework, chat, task, task_review, then_fix, judge,
-   *  judge_rerun, resume). A NOT NULL server column (DEFAULT 'manual'), so it is
+   *  judge_rerun, resume, cross_check). A NOT NULL server column (DEFAULT 'manual'), so it is
    *  always present on a live read; OPTIONAL here only to avoid forcing mock-object
    *  updates. RunListItem extends Run, so list rows inherit it. */
   trigger_source?: RunTriggerSource;
