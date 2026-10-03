@@ -43,6 +43,8 @@ through `[0.52.0]`.)
   On a Claude run, a process carrying the run's HOME that the worker could not kill, or a reap that could not finish, now blocks every step that publishes or settles the run (finalize push, failure settlement, pause, completion hold, wall park, credential switch, recovery and checkpoint publishes) the same way an unproven clone does: the run keeps custody, keeps running (a failed pause) or fails with `worker_residue_blocked`. A re-claimed run reaps its HOME before its clone fetch, and a park or the periodic disk reclaim drops the run's rebuildable caches only once no such process is left.
 - **Worker upgrade waits no longer trigger premature capacity alarms (#2184).**
   Run health identifies currently suitable draining workers; admin capacity confirms each upgrade wait, preserves genuine five-minute alarms, and reports overdue upgrade waits after 24 hours of overlap.
+- **Worker disk-pressure protection now notices inode exhaustion ([#1829](https://github.com/vtmocanu/uzi/issues/1829)).**
+  Admission and the periodic hard-stop layer use the higher of byte and inode utilization, so a data volume running out of inodes can trigger protection while byte usage stays low. Missing or invalid accounting falls back to the valid resource sample.
 
 ## [0.85.1] - 2026-10-03
 
