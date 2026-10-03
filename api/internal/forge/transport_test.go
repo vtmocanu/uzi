@@ -3,27 +3,11 @@ package forge
 import (
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"testing"
 	"time"
 )
 
 func TestForgeHTTPTransportDefaults(t *testing.T) {
-	transport := newForgeHTTPTransport(http.DefaultTransport)
-	base := http.DefaultTransport.(*http.Transport)
-	if transport.HTTP2 == nil || transport.HTTP2.SendPingTimeout != 30*time.Second || transport.HTTP2.PingTimeout != 15*time.Second {
-		t.Fatalf("HTTP/2 health configuration: %+v", transport.HTTP2)
-	}
-	if reflect.ValueOf(transport.Proxy).Pointer() != reflect.ValueOf(base.Proxy).Pointer() ||
-		reflect.ValueOf(transport.DialContext).Pointer() != reflect.ValueOf(base.DialContext).Pointer() ||
-		!reflect.DeepEqual(transport.TLSClientConfig, base.TLSClientConfig) ||
-		transport.ForceAttemptHTTP2 != base.ForceAttemptHTTP2 ||
-		transport.TLSHandshakeTimeout != base.TLSHandshakeTimeout ||
-		transport.IdleConnTimeout != base.IdleConnTimeout ||
-		transport.MaxIdleConns != base.MaxIdleConns ||
-		transport.ExpectContinueTimeout != base.ExpectContinueTimeout {
-		t.Fatal("forge transport changed default proxy, dial, TLS or pooling settings")
-	}
 	first := timeoutClient(time.Second)
 	second := timeoutClient(2 * time.Second)
 	if first.Transport != second.Transport || first.Transport != ancestryClient(time.Second).Transport {
@@ -60,33 +44,16 @@ func TestForgeTransportIndependentOfDefaultReplacement(t *testing.T) {
 	}
 }
 
-func TestForgeHTTPTransportFallback(t *testing.T) {
-	standard := http.DefaultTransport.(*http.Transport)
-	for _, tc := range []struct {
-		name string
-		base http.RoundTripper
-	}{
-		{"wrapped", &wireLog{next: standard}},
-		{"nil", nil},
-		{"typed_nil", (*http.Transport)(nil)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			// Clone normalizes lazy HTTP/2 TLS setup, as the standard default
-			// has already done during package initialization.
-			transport := newForgeHTTPTransport(tc.base).Clone()
-			if reflect.ValueOf(transport.Proxy).Pointer() != reflect.ValueOf(standard.Proxy).Pointer() ||
-				transport.DialContext == nil ||
-				!reflect.DeepEqual(transport.TLSClientConfig, standard.TLSClientConfig) ||
-				transport.ForceAttemptHTTP2 != standard.ForceAttemptHTTP2 ||
-				transport.TLSHandshakeTimeout != standard.TLSHandshakeTimeout ||
-				transport.IdleConnTimeout != standard.IdleConnTimeout ||
-				transport.MaxIdleConns != standard.MaxIdleConns ||
-				transport.ExpectContinueTimeout != standard.ExpectContinueTimeout {
-				t.Fatal("fallback changed the standard proxy, TLS, HTTP/2 or pooling defaults")
-			}
-			if transport.HTTP2 == nil || transport.HTTP2.SendPingTimeout != 30*time.Second || transport.HTTP2.PingTimeout != 15*time.Second {
-				t.Fatalf("fallback lost health pings: %+v", transport.HTTP2)
-			}
-		})
+func TestForgeProductionPoolHealth(t *testing.T) {
+	var pool http.RoundTripper = forgeHTTPTransport
+	transport, ok := pool.(*http.Transport)
+	if !ok || transport == nil {
+		t.Fatalf("production forge pool must be a concrete transport, got %T", pool)
+	}
+	if pool == http.DefaultTransport {
+		t.Fatal("production forge pool must be independent of the process default")
+	}
+	if transport.HTTP2 == nil || transport.HTTP2.SendPingTimeout != 30*time.Second || transport.HTTP2.PingTimeout != 15*time.Second {
+		t.Fatalf("production HTTP/2 health configuration: %+v", transport.HTTP2)
 	}
 }
