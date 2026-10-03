@@ -7,9 +7,14 @@ import net from "node:net";
 import { execFileSync } from "node:child_process";
 import { ForeignCaptureBlockedError, CapturePathMismatchError } from "../src/git.js";
 import { type ExecutorFactory } from "../src/runner.js";
+import { randomUUID } from "node:crypto";
+import { formatAttemptId } from "../src/attempt-path.js";
+import type { AttemptSeedOptions } from "../src/git.js";
+import type { QuiesceRunOutcome, QuiesceRunRequest } from "../src/run-quiescence.js";
 import { nullLogger, noProofReseed } from "./helpers.js";
 import {
   api,
+  client,
   fakeGitlab,
   fx,
   git,
@@ -88,6 +93,266 @@ async function seedResidueForBranch(
   await git.markRecoveryCapture(bare, clone.path, branch, ownerRunId);
   return { bare, branch, clonePath: clone.path };
 }
+
+describe("1848 M1: moved terminal mr_rework custody", () => {
+  const branch = "agent/issue-1810";
+  const slug = "agent-issue-1810";
+  const tracked = "1848-committed.txt";
+  const marker = "1848-untracked.txt";
+  const committed = "already published work\n";
+  const dirty = "DIRTY tracked owner bytes\n";
+  const untracked = "UNTRACKED owner bytes\n";
+
+  function localGit(repo: string, ...args: string[]): string {
+    return execFileSync("git", ["-C", repo, ...args], { env: GIT_ENV, encoding: "utf8", stdio: "pipe" });
+  }
+
+  function configValues(bare: string, key: string): string[] {
+    try {
+      return localGit(bare, "config", "--local", "--get-all", key).trim().split("\n");
+    } catch (error) {
+      assert.equal((error as { status?: number }).status, 1, "only an absent config key is empty");
+      return [];
+    }
+  }
+
+  function attemptOptions(attemptId: string): AttemptSeedOptions {
+    return { attemptId, isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true };
+  }
+
+  function ledger(bare: string): { attemptId: string; clonePath: string; runId: string; state: string }[] {
+    return configValues(bare, `uzi-attempts.${branch}.entry`).map((raw) => JSON.parse(raw));
+  }
+
+  async function seed(attempt: boolean, status: "failed" | "completed") {
+    const owner = randomUUID();
+    const claimant = randomUUID();
+    localGit(fx.originPath, "checkout", "-b", branch);
+    fs.writeFileSync(path.join(fx.originPath, tracked), committed);
+    localGit(fx.originPath, "add", tracked);
+    localGit(fx.originPath, "commit", "-m", "fixture published MR work");
+    const publishedHead = localGit(fx.originPath, "rev-parse", "HEAD").trim();
+    localGit(fx.originPath, "checkout", "main");
+    const bare = await git.ensureClone(fx.originPath);
+    const attemptId = attempt ? formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0123456789abcdef") : undefined;
+    const clone = await git.runnerCloneForBranch(bare, branch, slug, noProofReseed, owner, false, undefined,
+      attemptId ? attemptOptions(attemptId) : undefined);
+    assert.equal(localGit(clone.path, "rev-parse", "HEAD").trim(), publishedHead);
+    fs.writeFileSync(path.join(clone.path, tracked), dirty);
+    fs.writeFileSync(path.join(clone.path, marker), untracked);
+    await git.markRecoveryCapture(bare, clone.path, branch, owner, attemptId);
+    // Worker A's ownership probe no longer sees the run moved to B. The owner-scoped
+    // response supplies persisted MR identity; the real DB test covers the worker transitions.
+    api.setOwnershipNotOwned(owner);
+    api.setOrphanClassification(owner, {
+      status, repo_id: "r1", kind: "mr_rework", issue_iid: null,
+      branch: null, pipeline_ref: "agent/issue-1810", pipeline_id: null,
+    });
+    return { bare, owner, claimant, clonePath: clone.path, attemptId, publishedHead };
+  }
+
+  type Seed = Awaited<ReturnType<typeof seed>>;
+  function assertBytes(dir: string, s: Seed): void {
+    assert.equal(fs.readFileSync(path.join(dir, tracked), "utf8"), dirty);
+    assert.equal(fs.readFileSync(path.join(dir, marker), "utf8"), untracked);
+    assert.equal(localGit(dir, "rev-parse", "HEAD").trim(), s.publishedHead);
+    assert.equal(localGit(dir, "show", `HEAD:${tracked}`), committed);
+  }
+
+  function heldPath(s: Seed): string {
+    if (s.attemptId) return s.clonePath;
+    const matches = fs.readdirSync(holdingRoot()).map((name) => path.join(holdingRoot(), name))
+      .filter((dir) => fs.existsSync(path.join(dir, marker)));
+    assert.equal(matches.length, 1, "one complete predecessor quarantine");
+    return matches[0]!;
+  }
+
+  function execution(s: Seed, enabled: boolean, blocked?: "survivors" | "unverified") {
+    const { gitlab } = fakeGitlab();
+    const calls: QuiesceRunRequest[] = [];
+    let entry: { clonePath: string; journal: ReturnType<typeof readJournal>; clean: string; contents: string; hasMarker: boolean; retainedPath: string; ledgerState: string | undefined } | undefined;
+    let entryError: unknown;
+    const factory: ExecutorFactory = () => ({
+      homeDir: path.join(homeDir, s.claimant),
+      executor: { run: async (ctx) => {
+        // Check predecessor custody at model entry, before ordinary terminal cleanup.
+        let retainedPath: string;
+        try {
+          retainedPath = heldPath(s);
+          assertBytes(retainedPath, s);
+        } catch (error) {
+          entryError = error;
+          throw error;
+        }
+        entry = {
+          retainedPath, ledgerState: ledger(s.bare).filter((item) => item.attemptId === s.attemptId).at(-1)?.state,
+          clonePath: ctx.worktreePath, journal: readJournal(s.bare, branch),
+          clean: localGit(ctx.worktreePath, "status", "--porcelain"),
+          contents: fs.readFileSync(path.join(ctx.worktreePath, tracked), "utf8"),
+          hasMarker: fs.existsSync(path.join(ctx.worktreePath, marker)),
+        };
+        throw new Error("1848 stop at model entry");
+      } },
+    });
+    const quiesceRun = async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
+      calls.push(req);
+      return {
+        process: { state: req.site === "orphan_reclaim" && blocked ? blocked : "quiescent", processes: [], killed: [], detail: "1848 scripted proof" },
+        docker: { state: "not_wired", removed: [], detail: "" },
+      };
+    };
+    const runner = runnerWith(factory, gitlab, undefined, nullLogger(), {
+      recoveryRetryMs: 5, ...(enabled ? { dockerHost: "unix:///1848-scripted-only.sock", quiesceRun } : {}),
+    });
+    return { run: () => runner.execute(gitlabClaim(1810, { run_id: s.claimant, kind: "mr_rework", branch })),
+      entry: () => entry, entryError: () => entryError, calls };
+  }
+
+  function assertEntry(s: Seed, e: ReturnType<typeof execution>, enabled: boolean, expectReclaimProof = true): void {
+    assert.equal(e.entryError(), undefined, "predecessor bytes survived through model entry");
+    const entry = e.entry();
+    assert.ok(entry, "successor model entered");
+    if (s.attemptId) {
+      assert.equal(entry.retainedPath, s.clonePath, "attempt retained in place at model entry");
+      assert.equal(entry.ledgerState, "reclaimed");
+    } else assert.ok(entry.retainedPath.startsWith(holdingRoot() + path.sep));
+    assert.equal(entry.clean, "", "successor clone is clean before model work");
+    assert.equal(entry.contents, committed);
+    assert.equal(entry.hasMarker, false);
+    assert.deepEqual(entry.journal, {
+      runId: s.claimant, clonePath: entry.clonePath,
+      ...(enabled ? { attemptId: path.basename(entry.clonePath).split(".attempt-")[1] } : {}),
+    });
+    const canonical = git.runnerClonePath(s.bare, slug);
+    if (enabled) {
+      assert.ok(entry.clonePath.startsWith(`${canonical}.attempt-`));
+      assert.notEqual(entry.clonePath, s.clonePath);
+      const proof = e.calls.filter((req) => req.site === "orphan_reclaim");
+      assert.equal(proof.length, expectReclaimProof ? 1 : 0);
+      if (expectReclaimProof) {
+        assert.equal(proof[0]!.mode, "capture");
+        assert.deepEqual(proof[0]!.targetPaths, [s.clonePath]);
+      }
+    } else assert.equal(entry.clonePath, canonical);
+  }
+
+  for (const row of [
+    { status: "failed", attempt: false, enabled: false },
+    { status: "completed", attempt: false, enabled: false },
+    { status: "completed", attempt: false, enabled: true },
+    { status: "failed", attempt: true, enabled: true },
+  ] as const) {
+    it(`1848 ${row.status} MR owner moved A→B: ${row.attempt ? "attempt" : "canonical"}, attempts=${row.enabled}`, async (t) => {
+      const s = await seed(row.attempt, row.status);
+      const rpcCalls: { method: string; runId: string; beforeEntry: boolean }[] = [];
+      const e = execution(s, row.enabled);
+      for (const method of ["releaseRecoveryCustody", "settleRecoveryHold", "settleRecoveryHoldLive"] as const) {
+        const real = client[method].bind(client);
+        t.mock.method(client, method, async (...args: Parameters<typeof real>) => {
+          rpcCalls.push({ method, runId: args[0], beforeEntry: !e.entry() });
+          return Reflect.apply(real, client, args);
+        });
+      }
+      try {
+        await e.run();
+        assertEntry(s, e, row.enabled);
+        assertBytes(heldPath(s), s);
+        assert.deepEqual(rpcCalls.filter((call) => call.beforeEntry || call.runId === s.owner), [],
+          "phaseClone never releases custody, including already-published predecessor work");
+        if (row.attempt) {
+          assert.equal(ledger(s.bare).filter((item) => item.attemptId === s.attemptId).at(-1)?.state, "reclaimed");
+          const canonical = git.runnerClonePath(s.bare, slug);
+          // Four newer abandoned entries force a real retention deletion on the next seed.
+          const abandoned: string[] = [];
+          for (let i = 1; i <= 4; i++) {
+            const id = formatAttemptId(new Date(`2026-02-0${i}T00:00:00Z`), 1, `000000000000000${i}`);
+            const clonePath = `${canonical}.attempt-${id}`;
+            abandoned.push(clonePath);
+            fs.mkdirSync(clonePath);
+            localGit(s.bare, "config", "--local", "--add", `uzi-attempts.${branch}.entry`,
+              JSON.stringify({ attemptId: id, runId: randomUUID(), clonePath, state: "abandoned" }));
+          }
+          await git.runnerCloneForBranch(s.bare, branch, slug, noProofReseed, randomUUID(), false, undefined,
+            attemptOptions(formatAttemptId(new Date("2026-03-01T00:00:00Z"), 1, "fedcba9876543210")));
+          assertBytes(s.clonePath, s);
+          assert.equal(ledger(s.bare).find((item) => item.attemptId === s.attemptId)?.state, "reclaimed");
+          assert.equal(fs.existsSync(abandoned[0]!), false, "retention deleted the oldest disposable attempt");
+          assert.equal(fs.existsSync(abandoned.at(-1)!), true, "retention kept a newer disposable attempt");
+        }
+      } finally { t.mock.restoreAll(); }
+    });
+  }
+
+  for (const attempt of [false, true]) {
+    for (const blocked of ["survivors", "unverified"] as const) {
+      it(`1848 ${attempt ? "attempt" : "canonical"} orphan_reclaim ${blocked} preserves all custody`, async () => {
+        const s = await seed(attempt, "completed");
+        const journal = configValues(s.bare, `uzi-recovery.${branch}.clone`);
+        const beforeLedger = configValues(s.bare, `uzi-attempts.${branch}.entry`);
+        const e = execution(s, true, blocked);
+        await e.run();
+        assert.equal(e.entry(), undefined);
+        assert.deepEqual(configValues(s.bare, `uzi-recovery.${branch}.clone`), journal);
+        assert.deepEqual(configValues(s.bare, `uzi-attempts.${branch}.entry`), beforeLedger);
+        assertBytes(s.clonePath, s);
+        const proof = e.calls.filter((req) => req.site === "orphan_reclaim");
+        assert.equal(proof.length, 1);
+        assert.equal(proof[0]!.mode, "capture");
+        assert.deepEqual(proof[0]!.targetPaths, [s.clonePath]);
+        assert.equal(api.states.filter((state) => state.runId === s.claimant && state.body.status === "failed")
+          .at(-1)?.body.fail_origin, "worker_residue_blocked");
+      });
+    }
+  }
+
+  for (const stage of ["attempt-ledger", "attempt-journal", "canonical-journal"] as const) {
+    it(`1848 ${stage} failure preserves protecting metadata and retries safely`, async () => {
+      const s = await seed(stage !== "canonical-journal", "failed");
+      const journal = configValues(s.bare, `uzi-recovery.${branch}.clone`);
+      const beforeLedger = configValues(s.bare, `uzi-attempts.${branch}.entry`);
+      type RunGit = (cwd: string | undefined, args: string[], ...rest: unknown[]) => Promise<string>;
+      const seam = git as unknown as { runGit: RunGit };
+      const real = seam.runGit;
+      let injected = 0;
+      seam.runGit = async (cwd, args, ...rest) => {
+        const ledgerWrite = args[0] === "config" && args.includes("--add")
+          && args.includes(`uzi-attempts.${branch}.entry`) && args.at(-1)?.includes('"state":"reclaimed"');
+        const journalClear = args[0] === "config" && args.at(-2) === `uzi-recovery.${branch}.clone` && args.at(-1) === "";
+        if (stage === "attempt-ledger" ? ledgerWrite : journalClear) {
+          injected++;
+          throw new Error(`1848 injected ${stage}`);
+        }
+        return Reflect.apply(real, git, [cwd, args, ...rest]);
+      };
+      const failed = execution(s, true);
+      try { await failed.run(); } finally { seam.runGit = real; }
+      assert.ok(injected > 0, "requested write failure was exercised");
+      assert.equal(failed.entry(), undefined);
+      assert.deepEqual(configValues(s.bare, `uzi-recovery.${branch}.clone`), journal);
+      if (stage === "attempt-ledger") {
+        assert.deepEqual(configValues(s.bare, `uzi-attempts.${branch}.entry`), beforeLedger);
+      } else if (stage === "attempt-journal") {
+        assert.equal(ledger(s.bare).filter((item) => item.attemptId === s.attemptId).at(-1)?.state, "reclaimed");
+      } else {
+        assert.equal(fs.existsSync(s.clonePath), false, "post-rename failure already freed canonical layout");
+      }
+      const retained = heldPath(s);
+      assertBytes(retained, s);
+      const retry = execution(s, true);
+      const clearedDuringClone: ReturnType<typeof readJournal>[] = [];
+      seam.runGit = async (cwd, args, ...rest) => {
+        if (!retry.entry() && args[0] === "config" && args.at(-2) === `uzi-recovery.${branch}.clone` && args.at(-1) === "") {
+          clearedDuringClone.push(readJournal(s.bare, branch));
+        }
+        return Reflect.apply(real, git, [cwd, args, ...rest]);
+      };
+      try { await retry.run(); } finally { seam.runGit = real; }
+      assert.ok(clearedDuringClone.every((capture) => capture?.runId !== s.claimant), "retry never clears successor custody during clone preparation");
+      assertEntry(s, retry, true, stage !== "canonical-journal");
+      assertBytes(retained, s);
+    });
+  }
+});
 
 describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", () => {
   it("Test 1 (Gap 1, Case A cross-kind): an mr_rework reclaims a TERMINAL issue owner's residue and reseeds at its own slug", async () => {
