@@ -370,7 +370,8 @@ changes it); trust it over a handover's claim.
 
    It refuses on a moved head, an active rework, red, pending or no passing required checks, a
    git conflict, or (exit 5) any unresolved thread, open code-scanning alert or
-   unacknowledged comment, takes the repo-wide merge lock (exit 7 = another lander is merging; wait
+   unacknowledged comment, or (exit 10) a `chore(release):` commit's CI still running on
+   `main` (merging would cancel it; wait), takes the repo-wide merge lock (exit 7 = another lander is merging; wait
    for its `main` run to appear), confirms `MERGED`, prints `MERGE_SHA`, writes the trail
    line and releases the claim. A classifier block prints the exact command for the
    user's `!` line; after they run it, reconcile the evidence the out-of-band merge skipped

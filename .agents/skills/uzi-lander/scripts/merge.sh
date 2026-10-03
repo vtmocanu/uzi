@@ -47,6 +47,8 @@
 #   8  head mismatch vs --expect-head
 #   9  the merge command returned but the PR is not MERGED (auto-merge deferred / async
 #      mergeability lag) — poll `gh pr view --json state` yourself before the CI watch
+#  10  a `chore(release):` commit's CI is still running on main: merging now would supersede
+#      it and force the release to re-cut. Wait for it (or ask its releaser), then re-run
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -206,6 +208,20 @@ if [ "$(printf '%s' "$blk" | jq 'length')" -gt 0 ]; then
   print_items "$blk"
   echo "BLOCKED: open_threads=$(printf '%s' "$ot" | jq length) code_scanning=$(printf '%s' "$cs_items" | jq length) unacknowledged=$(printf '%s' "$ua" | jq length) on #$PR — resolve each thread, fix or dismiss each alert, read each comment in full (ack-comments.sh $REPO $PR --show ID) and ack that version (ID@DIGEST); not merging"
   exit 5
+fi
+
+# ---- a release cut waiting on main CI — FAIL CLOSED -----------------------------------------
+# A merge supersedes main's in-flight runs (concurrency), so landing while a
+# `chore(release):` commit's CI runs cancels it and forces the release to re-cut (exit 10).
+# Ordinary in-flight main CI does not block. An unreadable run list refuses (exit 2).
+mr=$(gh run list --repo "$REPO" --branch main --limit 50 --json status,headSha,displayTitle,name,databaseId 2>/dev/null) \
+  || { echo "cannot read main's workflow runs; not merging"; exit 2; }
+rel=$(printf '%s' "$mr" | jq -r 'if type=="array" then [.[]|select(.status!="completed" and ((.displayTitle // "")|startswith("chore(release):")))
+  |"\(.name) #\(.databaseId) \(.headSha[0:8]) \(.displayTitle)"]|join("\n") else error("not an array") end' 2>/dev/null) \
+  || { echo "cannot parse main's workflow runs; not merging"; exit 2; }
+if [ -n "$rel" ]; then
+  printf '%s\n' "$rel" | sed 's/^/  in flight on main: /'
+  echo "a release cut is waiting on main CI; wait for it (or ask its releaser), then re-run"; exit 10
 fi
 
 # ---- merge lock (repo-wide, 10-min TTL) ----------------------------------------------------

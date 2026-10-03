@@ -97,6 +97,11 @@ if [ "\${1:-}" = api ]; then
   esac
 fi
 if [ "\${1:-}" = pr ] && [ "\${2:-}" = checks ]; then printf '%s\n' "\${CHECKS_JSON:-}"; exit "\${CHECKS_RC:-0}"; fi
+# main's in-flight workflow runs (gh run list --branch main). MAIN_RUNS_JSON = the list; RUNS_FAIL=1 = unreadable.
+if [ "\${1:-}" = run ] && [ "\${2:-}" = list ]; then
+  [ "\${RUNS_FAIL:-0}" = 1 ] && { echo 'HTTP 502' >&2; exit 1; }
+  printf '%s\n' "\${MAIN_RUNS_JSON:-[]}"; exit 0
+fi
 if [ "\${1:-}" = pr ] && [ "\${2:-}" = merge ]; then echo "\$*" >> "$WORK/merge.log"; exit 0; fi
 echo "unexpected gh call: \$*" >&2
 exit 1
@@ -341,6 +346,24 @@ d777=$(bash "$HERE/ack-comments.sh" test/repo 42 --show c777 | grep -F '[comment
 bash "$HERE/ack-comments.sh" test/repo 42 "c777@$d777" > "$WORK/ack.out" 2>&1 || fail "ack failed: $(cat "$WORK/ack.out")"
 merge_run acked
 grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "an acknowledged comment still blocked the merge: $(cat "$WORK/m.acked")"
-unset COMMENTS_FILE CHECKS_JSON CHECKS_RC
+unset COMMENTS_FILE
 
-echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse"
+# 8. A release cut waiting on main CI (#2191 merged over v0.85.1's run and cancelled it):
+#    an in-flight `chore(release):` run on main refuses (exit 10); ordinary in-flight main CI
+#    does not; an unreadable run list refuses (exit 2).
+export MAIN_RUNS_JSON='[{"status":"in_progress","headSha":"5f9145cbaaaa","displayTitle":"chore(release): v0.85.1","name":"CI","databaseId":101}]'
+merge_run release
+[ "$rc" -eq 10 ] || fail "an in-flight release run did not refuse, rc=$rc: $(cat "$WORK/m.release")"
+grep -q 'a release cut is waiting on main CI' "$WORK/m.release" || fail "release refusal not explained: $(cat "$WORK/m.release")"
+[ ! -e "$WORK/merge.log" ] || fail "merged over an in-flight release run"
+export MAIN_RUNS_JSON='[{"status":"completed","headSha":"5f9145cbaaaa","displayTitle":"chore(release): v0.85.1","name":"CI","databaseId":101},{"status":"in_progress","headSha":"a6382c58bbbb","displayTitle":"fix(x): y (#2186)","name":"CI","databaseId":102}]'
+merge_run ordinary
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "ordinary in-flight main CI blocked the merge: $(cat "$WORK/m.ordinary")"
+unset MAIN_RUNS_JSON
+export RUNS_FAIL=1
+merge_run runsfail
+[ "$rc" -eq 2 ] || fail "an unreadable main run list did not refuse, rc=$rc: $(cat "$WORK/m.runsfail")"
+[ ! -e "$WORK/merge.log" ] || fail "merged with an unreadable main run list"
+unset RUNS_FAIL CHECKS_JSON CHECKS_RC
+
+echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses"
