@@ -39,6 +39,8 @@ through `[0.52.0]`.)
 
 - **Three more outbound clients use independent HTTP/2 health-ping pools ([#2211](https://github.com/vtmocanu/uzi/issues/2211)).**
   Pushbroker, agent-source fetches and release checks each own a persistent connection pool built by the shared transport constructor, configured to send a health ping after 30 seconds without received frames and close the connection after a further 15 seconds without a ping response. Detection takes about 45 seconds after the last received frame, so individual requests may still time out; existing operation budgets, redirect policies and response limits remain in place.
+- **MR rework keeps handled review history across temporary opt-outs and token replacement ([#1811](https://github.com/vtmocanu/uzi/issues/1811)).**
+  Removing the owner's last Anthropic token or turning automatic rework off temporarily no longer resets consumed review comments or the attempt cap; history is retained while a qualifying source MR remains open.
 - **Worker UID ownership regressions run in required CI ([#2134](https://github.com/vtmocanu/uzi/issues/2134)).**
   The base worker image exercises privileged creation and ownership assertions, with a source-derived check that rejects missing or skipped tests.
 - **A job's output upload no longer retries past a deadline-capped wait.**

@@ -263,12 +263,20 @@ func TestMRReworkLiveDB(t *testing.T) {
 		t.Fatalf("attempt_count = %d, want 2", led.AttemptCount)
 	}
 
-	// Reconcile eviction with an empty keep-set clears the ledger (stop-on-merge cleanup).
-	if _, err := q.DeleteMRReworkLedgerNotIn(ctx, store.DeleteMRReworkLedgerNotInParams{RepoID: repoID, KeepRefs: []string{}}); err != nil {
+	// An opened source retains the ledger regardless of candidate eligibility.
+	if _, err := q.DeleteMRReworkLedgerNotIn(ctx, repoID); err != nil {
 		t.Fatalf("DeleteMRReworkLedgerNotIn: %v", err)
 	}
-	if _, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repoID, Ref: "agent/issue-7"}); err == nil {
-		t.Fatal("expected the ledger row to be evicted")
+	retained, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repoID, Ref: "agent/issue-7"})
+	if err != nil || retained != led {
+		t.Fatalf("opened source must retain unchanged ledger: got %+v, err %v", retained, err)
+	}
+	exec("UPDATE runs SET mr_state='merged' WHERE id=$1", src7)
+	if _, err := q.DeleteMRReworkLedgerNotIn(ctx, repoID); err != nil {
+		t.Fatalf("DeleteMRReworkLedgerNotIn after merge: %v", err)
+	}
+	if _, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repoID, Ref: "agent/issue-7"}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("terminal source must evict ledger: %v", err)
 	}
 }
 
@@ -390,4 +398,183 @@ func TestMRReworkCoalesceLiveDB(t *testing.T) {
 	if _, ok := got["agent/issue-105"]; ok {
 		t.Fatal("reused branch: the NEWEST run's mr_rework_enabled=false must exclude the branch, even though an older run on it is true")
 	}
+}
+
+// TestMRReworkLedgerLifetimeLiveDB separates structural lifetime from eligibility,
+// including the any-qualifying-opened-source boundary on reused branches.
+func TestMRReworkLedgerLifetimeLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; use a throwaway PostgreSQL database")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	owner, conn, repo, otherRepo := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	exec("INSERT INTO users (id,email,password_hash) VALUES ($1,$2,'x')", owner, fmt.Sprintf("%s@lifetime.test", owner))
+	exec("INSERT INTO forge_connections (id,user_id,forge_type,base_url,bot_username,bot_forge_user_id,token_ciphertext) VALUES ($1,$2,'gitlab','https://forge.test','bot',777,$3)", conn, owner, []byte{1})
+	for i, id := range []uuid.UUID{repo, otherRepo} {
+		exec("INSERT INTO repos (id,connection_id,forge_project_id,path_with_namespace,web_url,default_branch,enabled) VALUES ($1,$2,$3,$4,'https://forge.test/g/r','main',true)", id, conn, i+1, id.String())
+	}
+	addToken := func() {
+		exec("INSERT INTO user_secrets (user_id,kind,label,is_default,ciphertext,sealed_with) VALUES ($1,'anthropic_token','default',true,$2,'master')", owner, []byte{2})
+	}
+	addToken()
+	seed := func(repoID uuid.UUID, kind, ref string) uuid.UUID {
+		t.Helper()
+		id := uuid.New()
+		var issueIID any
+		if kind != "prompt" {
+			issueIID = int64(7)
+		}
+		exec("INSERT INTO runs (id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,branch,mr_iid,mr_state,status,created_at) VALUES ($1,$2,$3,$4,$5,'t','d',$6,55,'opened','completed','2020-01-01')", id, owner, repoID, kind, issueIID, ref)
+		return id
+	}
+	seedLedger := func(repoID uuid.UUID, ref string) store.MrReworkLedger {
+		t.Helper()
+		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repoID, Ref: ref, HighWater: 120}); err != nil {
+			t.Fatal(err)
+		}
+		if err := q.SetMRReworkHaltNotified(ctx, store.SetMRReworkHaltNotifiedParams{RepoID: repoID, Ref: ref}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repoID, Ref: ref})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	reconcile := func(want int64) {
+		t.Helper()
+		got, err := q.DeleteMRReworkLedgerNotIn(ctx, repo)
+		if err != nil || got != want {
+			t.Fatalf("eviction rows=%d err=%v, want %d", got, err, want)
+		}
+	}
+	retained := func(want store.MrReworkLedger) {
+		t.Helper()
+		got, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: want.RepoID, Ref: want.Ref})
+		if err != nil || got != want {
+			t.Fatalf("ledger changed: got=%+v err=%v want=%+v", got, err, want)
+		}
+	}
+	evicted := func(ref string) {
+		t.Helper()
+		_, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repo, Ref: ref})
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("ledger %q must be evicted: %v", ref, err)
+		}
+	}
+	for _, kind := range []string{"issue", "prompt", "self_improve"} {
+		t.Run(kind, func(t *testing.T) {
+			ref := "review/" + kind
+			source := seed(repo, kind, ref)
+			before := seedLedger(repo, ref)
+			// Each opt-out is independently excluded by the candidate query. No pipeline
+			// is seeded: its absence must not shorten ledger lifetime.
+			excluded := func() {
+				t.Helper()
+				candidates, err := q.ListMRReworkCandidates(ctx, repo)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, cand := range candidates {
+					if cand.Ref.String == ref {
+						t.Fatalf("opted-out ref %q remained eligible", ref)
+					}
+				}
+				reconcile(0)
+				retained(before) // includes count, high-water, halt latch and updated_at
+			}
+			t.Run("token", func(t *testing.T) {
+				exec("DELETE FROM user_secrets WHERE user_id=$1 AND kind='anthropic_token'", owner)
+				excluded()
+				addToken()
+			})
+			t.Run("run", func(t *testing.T) {
+				exec("UPDATE runs SET mr_rework_enabled=false WHERE id=$1", source)
+				excluded()
+				exec("UPDATE runs SET mr_rework_enabled=NULL WHERE id=$1", source)
+			})
+			t.Run("account", func(t *testing.T) {
+				exec("UPDATE users SET mr_rework_enabled=false WHERE id=$1", owner)
+				excluded()
+				exec("UPDATE users SET mr_rework_enabled=NULL WHERE id=$1", owner)
+			})
+			for _, terminal := range []string{"closed", "merged", "missing"} {
+				t.Run(terminal, func(t *testing.T) {
+					terminalRef := ref + "/" + terminal
+					id := seed(repo, kind, terminalRef)
+					seedLedger(repo, terminalRef)
+					if terminal == "missing" {
+						exec("DELETE FROM runs WHERE id=$1", id)
+					} else {
+						exec("UPDATE runs SET mr_state=$2 WHERE id=$1", id, terminal)
+					}
+					reconcile(1)
+					evicted(terminalRef)
+					retained(before)
+				})
+			}
+		})
+	}
+	t.Run("any_opened_source", func(t *testing.T) {
+		ref := "review/reused"
+		old := seed(repo, "issue", ref)
+		newer := seed(repo, "prompt", ref)
+		exec("UPDATE runs SET mr_state='merged',created_at='2020-01-02' WHERE id=$1", newer)
+		before := seedLedger(repo, ref)
+		reconcile(0)
+		retained(before)
+		exec("UPDATE runs SET mr_state='closed' WHERE id=$1", old)
+		reconcile(1)
+		evicted(ref)
+	})
+	t.Run("same_ref_cross_repo", func(t *testing.T) {
+		ref := "review/shared"
+		seed(otherRepo, "issue", ref)
+		foreign := seedLedger(otherRepo, ref)
+		seedLedger(repo, ref)
+		reconcile(1) // a source in another repo cannot retain this repo's ledger
+		evicted(ref)
+		retained(foreign) // this repo's reconciliation cannot delete the other repo
+		source := seed(repo, "issue", ref)
+		local := seedLedger(repo, ref)
+		reconcile(0)
+		retained(local)
+		retained(foreign)
+		exec("UPDATE runs SET mr_state='merged' WHERE id=$1", source)
+		reconcile(1)
+		evicted(ref)
+		retained(foreign)
+	})
+	t.Run("invalid_structural_sources", func(t *testing.T) {
+		for _, ref := range []string{"", "main", "review/no-mr", "review/incomplete", "review/no-state"} {
+			source := seed(repo, "prompt", ref)
+			switch ref {
+			case "review/no-mr":
+				exec("UPDATE runs SET mr_iid=NULL WHERE id=$1", source)
+			case "review/incomplete":
+				exec("UPDATE runs SET status='failed' WHERE id=$1", source)
+			case "review/no-state":
+				exec("UPDATE runs SET mr_state=NULL WHERE id=$1", source)
+			}
+			seedLedger(repo, ref)
+			reconcile(1)
+			evicted(ref)
+		}
+	})
 }
