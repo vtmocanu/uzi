@@ -56,6 +56,18 @@ func TestTUISplitConfigModeAndUsageError(t *testing.T) {
 			}
 		})
 	}
+	for _, value := range []string{"auto", "off"} {
+		t.Run("unrelated config error with "+value, func(t *testing.T) {
+			body := "current = 42\n[tui]\nsplit = \"" + value + "\"\n"
+			if err := os.WriteFile(filepath.Join(store.Dir(), "config.toml"), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := tuiSplitConfigMode(store)
+			if err == nil || uzicli.ExitCodeFor(err) == uzicli.ExitUsage || strings.Contains(err.Error(), "accepted values") {
+				t.Fatalf("unrelated config decode error misreported as split: %v", err)
+			}
+		})
+	}
 }
 
 func TestTUISplitOffAndSessionToggle(t *testing.T) {

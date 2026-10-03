@@ -1733,6 +1733,9 @@ func tuiSplitConfigMode(store *uzicli.Store) (string, error) {
 			if decodeErr := toml.Unmarshal(body, &raw); decodeErr == nil {
 				if section, ok := raw["tui"].(map[string]any); ok {
 					if value, present := section["split"]; present {
+						if split, isString := value.(string); isString && (split == "" || split == "auto" || split == "off") {
+							return "", err
+						}
 						return "", tuiSplitValueError(store, fmt.Sprint(value))
 					}
 				}
