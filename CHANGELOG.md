@@ -35,6 +35,9 @@ through `[0.52.0]`.)
 - **Admin health warns when enabled repos repeatedly fail issue sync ([#2203](https://github.com/vtmocanu/uzi/issues/2203)).**
   The new `forge.sync` check tracks poller client-construction and full/incremental issue-sync outcomes per currently enabled repo, warning after three effective poll intervals and raising danger after ten for any repo or three for every repo; pending repos block the latter condition. Evidence carries counts, failure age and a safe error class with targeted advice. Success clears a streak immediately, while api restart and every successful enable/disable write (including idempotent writes) reset history and failure grace; repeated saves can postpone warnings. This diagnoses failure streaks, not independent sync freshness or a fix for the underlying transport problem. See [Admin health](docs/admin-health.md#forge-issue-sync-failures) for consistency limits.
 
+- **Retained clones blocking branch reworks now report the failed safety check ([#1848](https://github.com/vtmocanu/uzi/issues/1848)).**
+  New worker diagnostics identify the owning run and refusal stage without exposing paths or error bodies, distinguish retained quarantine from source absence, and reject malformed run kinds before reclaim. Recovery guidance explains how to retry verified reclaim while keeping custody holds and dirty or untracked work; the original production refusal remains unproven.
+
 - **TUI split view fills the terminal height ([#2197](https://github.com/vtmocanu/uzi/issues/2197)).**
   Pane sizes use the shared header rows actually drawn, keeping the footer on the last terminal row when meters or optional hints are absent. The resize threshold and its hysteresis stay unchanged.
 - **Run failure diagnostics replace unsafe control characters ([#2196](https://github.com/vtmocanu/uzi/issues/2196)).**
