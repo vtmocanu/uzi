@@ -4975,18 +4975,26 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     assert.ok(!args.includes("best-effort"), "the tool env's best-effort value is nowhere in the sandbox argv");
   });
 
-  it("the worker Config best-effort mode flows into the emitted --mode token", async () => {
-    const rig = makeRig();
-    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
-    const { ctx } = makeCtx();
-    const executor = new CodexExecutor(
-      noopLog,
-      "/data/agent-home/run-1",
-      { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider, commandSandbox: "best-effort" },
-      rig.deps,
-    );
-    await withTimeout(executor.run(ctx), 3000, "best-effort mode run");
-    assert.equal(modeFlagOf(rig.fileopSpawns[0]!.args), "best-effort", "the worker's best-effort mode reaches the sandbox argv");
+  it("the fileop root uses required mode only for cross_check runs", async () => {
+    for (const { kind, configuredMode, expectedMode } of [
+      { kind: undefined, configuredMode: "best-effort", expectedMode: "best-effort" },
+      { kind: undefined, configuredMode: "off", expectedMode: "off" },
+      { kind: "cross_check", configuredMode: "best-effort", expectedMode: "required" },
+      { kind: "cross_check", configuredMode: "off", expectedMode: "required" },
+    ] as const) {
+      const rig = makeRig();
+      rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+      // M2 will add cross_check to RunKind; widen only this fixture until then.
+      const { ctx } = makeCtx({ kind: kind as RunContext["kind"] });
+      const executor = new CodexExecutor(
+        noopLog,
+        "/data/agent-home/run-1",
+        { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider, commandSandbox: configuredMode },
+        rig.deps,
+      );
+      await withTimeout(executor.run(ctx), 3000, `${kind ?? "ordinary"} ${configuredMode} mode run`);
+      assert.equal(modeFlagOf(rig.fileopSpawns[0]!.args), expectedMode, `${kind ?? "ordinary"} run with ${configuredMode} mode`);
+    }
   });
 
   it("writes ONE degraded-mode line into the run feed when commandSandboxDegraded is set, none otherwise", async () => {

@@ -2903,7 +2903,10 @@ export class CodexExecutor implements Executor {
       const fileopRoot = await launchRegisteredEffectRoot(
         registry,
         launchEffectRoot,
-        commandEffectSpec(worktreePath, worktreePath, FILEOP_BIN, ["--root", worktreePath], commandEnv, commandSandbox),
+        commandEffectSpec(
+          worktreePath, worktreePath, FILEOP_BIN, ["--root", worktreePath], commandEnv,
+          (ctx.kind as string | undefined) === "cross_check" ? "required" : commandSandbox,
+        ),
         boundaryDeadlineMs,
         "command",
         this.log,
