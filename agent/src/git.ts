@@ -4968,7 +4968,18 @@ export class GitCache {
           if (abort) throw abort;
           return { kind: "unavailable" } as const;
         } finally {
-          await this.runGit(barePath, ["update-ref", "-d", tempRef]);
+          await this.runGit(barePath, ["update-ref", "-d", tempRef]).catch(async (cause: unknown) => {
+            if (!(cause instanceof GitBoundaryAbortError || cause instanceof CheckpointSoftDeadlineError)) throw cause;
+            // execScoped has settled every child before reporting abort. The worker-owned
+            // files-ref bare has auto-maintenance disabled by gitEnv/disableAutoMaintenance,
+            // and withLock still excludes other bare mutations: this fresh UUID stays loose.
+            // Attempt exactly these four files, concurrently; no sibling is skipped on failure.
+            await Promise.allSettled([
+              tempRef, `${tempRef}.lock`, `logs/${tempRef}`, `logs/${tempRef}.lock`,
+            ].map((refFile) => fs.rm(path.join(barePath, refFile), { force: true })));
+            // A cleanup I/O failure must not turn cancellation into an unavailable snapshot.
+            throw cause;
+          });
         }
       });
     } catch (cause) {
