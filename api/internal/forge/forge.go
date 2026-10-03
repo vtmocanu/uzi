@@ -127,6 +127,9 @@ func (e *RateLimitError) Error() string {
 // message could carry the token).
 func (e *RateLimitError) Unwrap() error { return e.Err }
 
+// Class identifies a neutral rate limit, including a locally reserved budget.
+func (e *RateLimitError) Class() ErrorClass { return ErrorClassRateLimited }
+
 // Type identifies a forge driver. It maps 1:1 to the forge_connections.forge_type
 // column, which is CHECK-constrained to the same set.
 type Type string

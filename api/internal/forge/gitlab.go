@@ -100,8 +100,7 @@ func gitLabClientOptions(baseURL string, hc *http.Client, backoff ...retryableht
 
 // wrapErr adds op context and routes the error through the PAT redactor so no
 // error this driver surfaces can carry the token. A nil error passes through as
-// nil. (No rate-limit classification: the go-gitlab client handles 429/Retry-After
-// at the transport layer; see the client-construction comment.)
+// nil. Classification observes the final SDK error after transport retries.
 func (g *gitLab) wrapErr(op string, err error) error {
 	if err == nil {
 		return nil

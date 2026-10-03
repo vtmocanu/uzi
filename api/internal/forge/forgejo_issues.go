@@ -51,7 +51,11 @@ func (f *forgejo) ListIssues(ctx context.Context, projectID int64, opts ListIssu
 		page++
 		issues, resp, err := c.ListRepoIssues(slug.owner, slug.repo, opt)
 		if err != nil {
-			return nil, f.wrapErr("list issues", err)
+			status := 0
+			if resp != nil && resp.Response != nil {
+				status = resp.StatusCode
+			}
+			return nil, f.wrapErrStatus("list issues", err, status)
 		}
 		for _, i := range issues {
 			if i == nil || i.PullRequest != nil {
