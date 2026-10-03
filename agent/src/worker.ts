@@ -490,6 +490,8 @@ export class Worker {
           // is safe to land now. An image WITHOUT this flag keeps working on legacy claims, and the
           // held-state `set-token` verb 409s naming the worker.
           "credential_switch_v1",
+          // M2: this image reconciles unknown Codex refresh outcomes before recovery capture.
+          "codex_refresh_recovery_v1",
           // PRD #1497 M2 (D13): this image parks a run at its wall-clock limit instead of failing it
           // — BOTH harnesses (Claude and Codex) drop the turn in flight, capture the tree, and report
           // the wall_park transition. Advertised UNCONDITIONALLY: the sweep's RequestWallParks join
