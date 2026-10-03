@@ -163,6 +163,17 @@ if run_case old; then
   if grep -q 'generic after heading' "$ghout"; then ok "$case_name"; else bad "$case_name" "$(cat "$ghout")"; fi
 fi
 
+# 7d. a dropped body line that itself starts with '--' is still listed (the unified-diff
+# extraction skips only the ---/+++ header, so BusyBox and GNU diff report it alike).
+case_name="dropped line starting with -- is listed"; new_case dashline
+printf -- 'body line\n-- dashed old line\n## For this repo\ntail\n' > "$repo/.claude/agents/coder.md"
+(cd "$repo" && git add -A && git -c user.email=t@t -c user.name=t commit -qm dl)
+printf 'coder         1 -> 2     tail 5B    LEGACY    body -1/+0 vs library\n' > "$stub/check.txt"; echo 1 > "$stub/check.rc"
+printf 'body line\n## For this repo\ntail\n' > "$stub/new/coder.md"
+if run_case old; then
+  if grep -qF '< -- dashed old line' "$ghout"; then ok "$case_name"; else bad "$case_name" "$(cat "$ghout")"; fi
+fi
+
 # 8. allowlisted tester model is silent; another MODIFIED is reported.
 case_name="allowlisted MODIFIED is silent, others reported"; new_case allow
 printf 'tester\tmodel sonnet vs library opus\n' > "$case_dir/allow.tsv"
