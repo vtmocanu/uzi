@@ -26,6 +26,8 @@
 # PRD #104 M5 repointed anthropic_rate_limits from PRIMARY KEY (user_id) to
 # (user_secret_id), so the seed now targets the admin's DEFAULT token id (seeded from
 # UZI_SEED_ANTHROPIC_TOKEN) and the response is a per-token ARRAY, not a single reading.
+# Stamp the token's current enablement_rev: phase 34 rotates its value, and the read
+# query hides gauges from earlier revisions. RETURNING also makes a missing token fail.
 say "PRD #53/#104: per-token rate-limit meters (seeded gauge row → /me)"
 login  # refresh the admin session
 ADMIN_ID="$(db_psql "SELECT id FROM users WHERE email = '$ADMIN_EMAIL'")"
@@ -33,11 +35,15 @@ ADMIN_ID="$(db_psql "SELECT id FROM users WHERE email = '$ADMIN_EMAIL'")"
 ADMIN_SECRET_ID="$(db_psql "SELECT id FROM user_secrets WHERE user_id = '$ADMIN_ID' AND kind = 'anthropic_token' AND is_default")"
 [ -n "$ADMIN_SECRET_ID" ] || fail "the admin has no default anthropic_token to attach a gauge row to"
 
-db_psql "INSERT INTO anthropic_rate_limits
-           (user_secret_id, user_id, five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, source, synced_at)
-         VALUES ('$ADMIN_SECRET_ID', '$ADMIN_ID', 55, now() + interval '2 hours', 12, now() + interval '3 days', 'usage_endpoint', now())
+[ "$(db_psql "INSERT INTO anthropic_rate_limits
+           (user_secret_id, user_id, five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, source, synced_at, enablement_rev)
+         SELECT s.id, s.user_id, 55, now() + interval '2 hours', 12, now() + interval '3 days', 'usage_endpoint', now(), s.enablement_rev
+         FROM user_secrets s WHERE s.id = '$ADMIN_SECRET_ID' AND s.user_id = '$ADMIN_ID'
          ON CONFLICT (user_secret_id) DO UPDATE SET
-           five_hour_pct = 55, seven_day_pct = 12, source = 'usage_endpoint', synced_at = now()" >/dev/null
+           five_hour_pct = 55, seven_day_pct = 12, source = 'usage_endpoint', synced_at = now(),
+           enablement_rev = EXCLUDED.enablement_rev
+         RETURNING user_secret_id")" = "$ADMIN_SECRET_ID" ] \
+  || fail "could not seed the admin token rate-limit gauge at its current revision (missing secret or seed failed)"
 
 apiget /api/me/rate-limits \
   | jq -e '.tokens | length == 1 and (.[0] | .is_default == true and .limits.status == "ok" and .limits.five_hour.pct == 55 and .limits.seven_day.pct == 12 and .limits.source == "usage_endpoint")' >/dev/null \

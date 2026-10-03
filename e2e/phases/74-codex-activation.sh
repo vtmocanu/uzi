@@ -257,11 +257,15 @@ wait_status "$CX_ONLY_RUN" cancelled
 CX_NEW_ANTH_ID="$(apiput /api/me/secrets/anthropic_token "{\"token\":\"$DUMMY_ANTHROPIC\"}" | jq -r '.secret.id')"
 { [ -n "$CX_NEW_ANTH_ID" ] && [ "$CX_NEW_ANTH_ID" != null ]; } || fail "could not recreate the admin's default anthropic_token"
 trap - EXIT  # explicit restore confirmed; drop the fail-safe
-db_psql "INSERT INTO anthropic_rate_limits
-           (user_secret_id, user_id, five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, source, synced_at)
-         VALUES ('$CX_NEW_ANTH_ID', '$ADMIN_ID', 55, now() + interval '2 hours', 12, now() + interval '3 days', 'usage_endpoint', now())
+[ "$(db_psql "INSERT INTO anthropic_rate_limits
+           (user_secret_id, user_id, five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, source, synced_at, enablement_rev)
+         SELECT s.id, s.user_id, 55, now() + interval '2 hours', 12, now() + interval '3 days', 'usage_endpoint', now(), s.enablement_rev
+         FROM user_secrets s WHERE s.id = '$CX_NEW_ANTH_ID' AND s.user_id = '$ADMIN_ID'
          ON CONFLICT (user_secret_id) DO UPDATE SET
-           five_hour_pct = 55, seven_day_pct = 12, source = 'usage_endpoint', synced_at = now()" >/dev/null
+           five_hour_pct = 55, seven_day_pct = 12, source = 'usage_endpoint', synced_at = now(),
+           enablement_rev = EXCLUDED.enablement_rev
+         RETURNING user_secret_id")" = "$CX_NEW_ANTH_ID" ] \
+  || fail "could not restore the admin token rate-limit gauge at its current revision (missing secret or seed failed)"
 pass "restored the admin's default anthropic_token ($CX_NEW_ANTH_ID) and its 55/12 rate-limit gauge (phase 47's values)"
 
 # --- (7) teardown: leave admin secrets exactly as this phase found them -----------

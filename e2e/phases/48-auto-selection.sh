@@ -55,13 +55,17 @@ done
 # is that the two answers DIFFER: a selector that ignored the gauge, or that just
 # returned the owner default, produces the default token here and is caught.
 as_gauge() {  # as_gauge SECRET_ID FIVE_PCT SEVEN_PCT SYNCED_SQL
-  db_psql "INSERT INTO anthropic_rate_limits
+  [ "$(db_psql "INSERT INTO anthropic_rate_limits
              (user_secret_id, user_id, five_hour_pct, five_hour_resets_at,
-              seven_day_pct, seven_day_resets_at, source, synced_at)
-           VALUES ('$1', '$AS_ADMIN_ID', $2, now() + interval '1 hour',
-                   $3, now() + interval '3 days', 'usage_endpoint', $4)
+              seven_day_pct, seven_day_resets_at, source, synced_at, enablement_rev)
+           SELECT s.id, s.user_id, $2, now() + interval '1 hour',
+                  $3, now() + interval '3 days', 'usage_endpoint', $4, s.enablement_rev
+           FROM user_secrets s WHERE s.id = '$1' AND s.user_id = '$AS_ADMIN_ID'
            ON CONFLICT (user_secret_id) DO UPDATE SET
-             five_hour_pct = $2, seven_day_pct = $3, synced_at = $4" >/dev/null
+             five_hour_pct = $2, seven_day_pct = $3, synced_at = $4,
+             enablement_rev = EXCLUDED.enablement_rev
+           RETURNING user_secret_id")" = "$1" ] \
+    || fail "could not seed auto-selection gauge for token $1 at its current revision (missing secret or seed failed)"
 }
 as_gauge "$AS_DEFAULT_SECRET" 92 40 "now()"   # headroom 8
 as_gauge "$AS_SPARE_SECRET"    5  5 "now()"   # headroom 95
