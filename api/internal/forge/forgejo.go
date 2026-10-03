@@ -250,7 +250,7 @@ func (f *forgejo) rawGetLimited(ctx context.Context, path string, limit int64) (
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, limit))
 	if err != nil {
-		return nil, f.wrapErr("read response", err)
+		return nil, f.wrapErrStatus("read response", err, resp.StatusCode)
 	}
 	if resp.StatusCode/100 != 2 {
 		return body, f.wrapErrStatus(fmt.Sprintf("GET %s", path), fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body))), resp.StatusCode)
@@ -297,7 +297,7 @@ func (f *forgejo) patchIssue(ctx context.Context, slug repoSlug, issueIID int64,
 	defer func() { _ = resp.Body.Close() }()
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, forgejoPatchErrBodyLimit))
 	if err != nil {
-		return f.wrapErr(op, err)
+		return f.wrapErrStatus(op, err, resp.StatusCode)
 	}
 	if resp.StatusCode/100 != 2 {
 		return f.wrapErrStatus(op, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody))), resp.StatusCode)

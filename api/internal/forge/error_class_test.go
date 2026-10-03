@@ -191,6 +191,67 @@ func TestForgejoResponseErrorClasses(t *testing.T) {
 	}
 }
 
+func TestForgejoTruncatedResponseErrorClasses(t *testing.T) {
+	token := strings.Join([]string{"deadbeef", "CANARY", strings.Repeat("d", 26)}, "")
+	for _, method := range []string{http.MethodGet, http.MethodPatch} {
+		for _, tc := range []struct {
+			status int
+			want   ErrorClass
+		}{
+			{401, ErrorClassAuth},
+			{429, ErrorClassRateLimited},
+			{503, ErrorClassServerError},
+		} {
+			t.Run(fmt.Sprintf("%s/%d", method, tc.status), func(t *testing.T) {
+				var requests atomic.Int64
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					if r.Method == http.MethodGet && r.URL.Path == "/api/v1/repositories/7" {
+						_, _ = w.Write([]byte("{\"id\":7,\"name\":\"widgets\",\"owner\":{\"login\":\"acme\"}}"))
+						return
+					}
+					if r.Method != method {
+						t.Errorf("method = %s, want %s", r.Method, method)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					requests.Add(1)
+					body := "CANARY echo " + token
+					// Closing the response short of its declared length makes the
+					// real HTTP client's body read fail with unexpected EOF.
+					w.Header().Set("Content-Length", fmt.Sprint(len(body)+1))
+					w.WriteHeader(tc.status)
+					_, _ = w.Write([]byte(body))
+				}))
+				defer srv.Close()
+				d, err := New(TypeForgejo, srv.URL, token, time.Second)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if method == http.MethodGet {
+					_, err = d.ListIssueLabelEvents(context.Background(), 7, 1)
+				} else {
+					err = d.UpdateIssueDescription(context.Background(), 7, 1, "description")
+				}
+				if requests.Load() != 1 {
+					t.Fatalf("target requests = %d, want 1", requests.Load())
+				}
+				wantMessage := "forgejo: read response: unexpected EOF"
+				if method == http.MethodPatch {
+					wantMessage = "forgejo: update issue description: unexpected EOF"
+				}
+				if err == nil || err.Error() != wantMessage {
+					t.Fatalf("error = %v, want %q", err, wantMessage)
+				}
+				assertClassifiedSafe(t, err, tc.want, token)
+				if errors.Unwrap(err) != nil {
+					t.Fatal("classified error retained original read error")
+				}
+			})
+		}
+	}
+}
+
 func TestRawTypedErrorSevered(t *testing.T) {
 	token := strings.Join([]string{"glpat-", "CANARY", strings.Repeat("E", 14)}, "")
 	response := &http.Response{StatusCode: 503, Request: &http.Request{Header: http.Header{"Private-Token": {token}}}}
