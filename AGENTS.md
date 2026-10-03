@@ -20,8 +20,8 @@ git update-ref -d refs/reviews/pr-<number>-<reviewer>
 Always loaded: a path-scoped rule fires on a file READ, i.e. after the decision to act, and everything here is irreversible.
 
 - 🔴 **`docker compose -p uzi down -v`, from any directory holding a compose file, destroys real data.** It removes `uzi_pgdata` and `uzi_agentdata`, which carry the real admin and forge data. `cd main && docker compose -p uzi up` brings the stack back; the volumes do not come back.
-- **Never pass `-p uzi` to a `down`, and never add `-v` to one.**
-- **Never `docker compose down` from a worktree.** Belt-and-braces today: the recorded `config_files` path no longer exists (see the `.env` note in `.claude/rules/stack.md`), so discovery cannot reach project `uzi` and a bare `down` resolves the worktree's own project. Re-creating that file restores the hazard.
+- **Never pass `-p uzi` to a `down`, and never run a bare `down -v`.** `down -v` is allowed only with an explicit `-p <project>` naming a throwaway project you started this session (never `uzi`, never `uzi-*`), with the same `-f` files its `up` used. First check the rendered volume names (`docker compose -p <project> -f … config`): a volume with a custom `name:` escapes the project prefix. Proceed only if every volume that would be removed belongs to your session's throwaway stack; otherwise stop.
+- **Never a `docker compose down` without `-p` from a worktree.** An explicit `-p <your throwaway project>` (rule above) is fine from anywhere, since `-p` overrides directory-derived discovery. Belt-and-braces today: the recorded `config_files` path no longer exists (see the `.env` note in `.claude/rules/stack.md`), so discovery cannot reach project `uzi` and a bare `down` resolves the worktree's own project. Re-creating that file restores the hazard.
 - 🔴 **Never glob `uzi-` when tearing down containers.** The dev stack (`uzi-web-1`, `uzi-api-1`, `uzi-agent-1`, `uzi-db-1`) shares a daemon with throwaway test containers, and `uzi-db-1` shares `postgres:17` with them, so neither `--filter name=uzi-` nor `--filter ancestor=postgres:17` can tell them apart:
 
 ```
@@ -31,7 +31,7 @@ uzi-db-1         postgres:17   Up 2 weeks      <- the REAL database
 ```
 
 1. **Name throwaways OUTSIDE the `uzi-` namespace** (`cdr-*`, `aud-*`, `vm-rev-*`). Load-bearing: it removes the failure mode instead of relying on discipline.
-2. **Tear down only your own container, by exact name.** Never a `uzi-*` glob, never `docker compose down` from a worktree.
+2. **Tear down only your own container, by exact name.** Never a `uzi-*` glob, never a `docker compose down` without `-p <your throwaway project>`.
 3. **If you see a container you did not create, leave it.** Same for processes: a stray `run-e2e.sh` or `run-store-it.sh` may belong to another session, and refusing to kill an unowned process is correct, not obstructive.
    - Attribute a process by the **redirected log path alone**, and only when its name is distinctive. Shell-snapshot path is per-CLI-session, not per-agent; cwd is shared across agents in one worktree. Both manufacture a confident false match (measured 2026-08-02).
    - **If you cannot attribute a process, leave it.**

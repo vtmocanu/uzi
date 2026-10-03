@@ -5,8 +5,11 @@
 # protection, byte-stable render, frontmatter-injection rejection, and a DB dump
 # that contains only ciphertext).
 #
-# Expects a FRESH stack (empty users table):
-#   docker compose down -v && docker compose up -d --build && ./scripts/smoke-prd3.sh
+# Expects a FRESH stack (empty users table). Start a throwaway project, never the
+# real `uzi` one (a bare `down -v` in the main checkout deletes its real data); the
+# isolated recipe is in .claude/rules/stack.md (smoke.sh section):
+#   docker compose -p smk-$$ ... up -d --wait ... && BASE=... ./scripts/smoke-prd3.sh
+#   docker compose -p smk-$$ ... down -v      # teardown: your own project only
 #
 # Overrides:
 #   BASE=http://127.0.0.1:8083 ./scripts/smoke-prd3.sh        # non-default port

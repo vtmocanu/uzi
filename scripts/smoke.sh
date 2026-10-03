@@ -2,8 +2,11 @@
 # End-to-end smoke test for the uzi auth API. Exercises the full journey plus a
 # concurrent first-registration race check.
 #
-# Expects a FRESH stack (empty users table):
-#   docker compose down -v && docker compose up -d --build && ./scripts/smoke.sh
+# Expects a FRESH stack (empty users table). Start a throwaway project, never the
+# real `uzi` one (a bare `down -v` in the main checkout deletes its real data); the
+# isolated recipe is in .claude/rules/stack.md (smoke.sh section):
+#   docker compose -p smk-$$ ... up -d --wait ... && BASE=... ./scripts/smoke.sh
+#   docker compose -p smk-$$ ... down -v      # teardown: your own project only
 #
 # Override the base URL with BASE=... (defaults to the nginx origin).
 set -euo pipefail
@@ -52,7 +55,7 @@ for n in 1 2 3 4 5; do
     regular_email="$email"
   fi
 done
-[ "$admins" -eq 1 ] || fail "expected exactly 1 admin from the race, got $admins (need a fresh DB: docker compose down -v)"
+[ "$admins" -eq 1 ] || fail "expected exactly 1 admin from the race, got $admins (need a fresh DB: a new throwaway project, see .claude/rules/stack.md)"
 pass "exactly one admin elected: $admin_email"
 [ -n "$regular_email" ] || fail "no regular user produced by the race"
 

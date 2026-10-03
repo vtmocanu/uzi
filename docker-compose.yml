@@ -399,8 +399,10 @@ services:
       # a toolchain-changing image roll (the k8s seed is version-aware; compose is not,
       # by decision — no reseed machinery is built for compose). So after rolling to an
       # image whose baked toolchain changed (go/python3/gcc/pip), you MUST force a
-      # re-seed: `docker compose down -v` (or `docker volume rm <project>_agentnix`)
-      # before `up`, or the worker runs against the OLD store with a dead PATH. The M3
+      # re-seed: stop and remove the agent container (`docker compose -p <project> rm -s -f
+      # agent`), then `docker volume rm <project>_agentnix` by exact name
+      # before `up` (never `down -v`: on the real `uzi` project it also deletes pgdata
+      # and agentdata), or the worker runs against the OLD store with a dead PATH. The M3
       # boot toolchain preflight converts any such staleness into a LOUD boot failure
       # rather than a silent mid-run 127.
       - agentnix:/nix
@@ -560,8 +562,10 @@ volumes:
   # The worker's nix store (PRD #18): seeded from the image on first use, then
   # persisted so provisioning is a first-run-only fetch. PRD #92 M2: this auto-seed
   # is EMPTY-only and has no version marker, so a toolchain-changing image roll leaves
-  # it stale — `docker compose down -v` (or `docker volume rm <project>_agentnix`) to
-  # force a re-seed; the M3 boot preflight makes any staleness a loud boot failure.
+  # it stale — stop and remove the agent container (`docker compose -p <project> rm -s -f
+  # agent`), then `docker volume rm <project>_agentnix` by exact name, to
+  # force a re-seed (never `down -v`: on the real `uzi` project it also deletes pgdata
+  # and agentdata); the M3 boot preflight makes any staleness a loud boot failure.
   agentnix:
   # PRD #83 M2: the DinD socket-share (carries ONLY the daemon socket) and the DinD data
   # root (images/layers/build cache — its own isolated store, Decision 3). Both are

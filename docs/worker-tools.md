@@ -111,8 +111,10 @@ the admin's own responsibility to match what the image actually bakes.
   (`agentnix` at `/nix`); the first run downloads, later runs on the same
   worker warm-start from it. It survives `docker compose down`/`up`.
 - **Eviction.** The store only grows. To reclaim space, remove the volume
-  (`docker compose down -v`, or `docker volume rm <project>_agentnix`); the
-  next run re-downloads what it needs.
+  (stop and remove the agent container with `docker compose -p <project> rm -s -f agent`,
+  then `docker volume rm <project>_agentnix` by exact name;
+  a `docker compose down -v` would also delete the database volume); the next
+  run re-downloads what it needs.
 
 See [ARCHITECTURE.md](../ARCHITECTURE.md#services) for the worker's egress and
 provisioning trust model, and [Worker setup](./worker-setup.md#tool-provisioning)
