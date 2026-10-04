@@ -619,7 +619,7 @@ describe("#1604 — (a) a verdict still unACKed when a switch releases the claim
       assertRevisedOnResume(s, flight, FEEDBACK, "kept");
       assert.ok(s.appliedAt(row.id, flight.timelineFrom) > gateAt, "applied only after the revised plan was persisted");
       assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
-    }));
+    }, {}, "(a) unACKed revise: reclaim revises the submitted plan"));
 
   it("approve: the reclaim offers the submitted plan and the replayed approve (and its selection) applies", () =>
     scenario(async (s) => {
@@ -1658,7 +1658,7 @@ describe("#1604 round 3 — a disposed approve is never applied, so no later cla
         assert.ok(!api.inputReceiptCalls.some((c) => c.kind === "applied" && c.ids.includes(row.id)), "the stale approve is never sent to /inputs/applied");
         if (route === "404") assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve never is applied");
         assert.equal(s.model.count("implement"), 1);
-      }));
+      }, {}, `round 3 B1 Path B: second interruption gates B again; route=${route}`));
 
     it(`Path A, then a second interruption at the fresh plan's gate: the reclaim is not approved and gates again${label}`, () =>
       scenario(async (s) => {
