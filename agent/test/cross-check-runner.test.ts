@@ -109,7 +109,7 @@ function rig(options: {
  };
  const log = { addSecret: (s: string) => secrets.add(s), removeSecret: (s: string) => secrets.delete(s) } as unknown as Logger;
  const checker = new CodexCrossCheck(client, log, deps);
- return { deps, requests, ops, specs, disposed, secrets, usage, refreshes, terminal, fail: () => failProvider(new Error("root failed")),
+ return { deps, log, requests, ops, specs, disposed, secrets, usage, refreshes, terminal, fail: () => failProvider(new Error("root failed")),
   run: (signal = new AbortController().signal) => checker.run(claim(options.subscription), "/checkout", "/owned", signal,
    async (payload) => { usage.push(payload); }) };
 }
@@ -125,7 +125,15 @@ import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { Outbox } from "../src/outbox.js";
 import { nullLogger } from "./helpers.js";
 
-it("outer checker uses real Read broker, actual HTTP verdict delivery and journaled child completion", async () => {
+for (const mode of ["approve", "invalidfinding"] as const) {
+it("outer checker uses real Read broker, actual HTTP verdict delivery and journaled child completion: " + mode, async () => {
+ const expectedVerdict = mode === "approve" ? "approve" : "failed";
+ const expectedReason = mode === "approve" ? "approve" : "malformed";
+ const expectedStatus = mode === "approve" ? "completed" : "failed";
+ const assistantText = mode === "approve" ? verdict : JSON.stringify({
+  verdict: "approve", summary: "Anchors checked",
+  items: [{ file: "anchor.ts", severity: "invalid", summary: "Finding", rationale: "Read anchor" }],
+ });
  const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/cross-check-test-"));
  const outbox = new Outbox({ root: path.join(root, "outbox"), log: nullLogger(),
   runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 86400000 });
@@ -138,7 +146,7 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
   onToolReply: (frame, emit) => {
    assert.equal(frame.result.success, true);
    assert.match(frame.result.contentItems[0].text, /contentBase64/);
-   r.terminal(emit);
+   r.terminal(emit, assistantText);
   },
  });
  const c = { ...claim(), claim_generation: 7 };
@@ -152,11 +160,18 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
   else if (req.url?.endsWith("/inputs")) res.end(JSON.stringify({ inputs: [] }));
   else if (req.url?.endsWith("/cross-check-verdict")) {
    assert.equal(body.claim_generation, 7);
-   assert.equal(body.verdict, "approve");
-   assert.equal(body.reason_class, "approve");
+   assert.equal(body.verdict, expectedVerdict);
+   assert.equal(body.reason_class, expectedReason);
    res.end("{}");
   } else if (req.url?.endsWith("/state")) {
-   if (body.status === "completed") assert.equal(outbox.hasPendingTerminal(c.run_id, 7), true);
+   if (body.status === "completed" || body.status === "failed") {
+    assert.equal(body.status, expectedStatus);
+    assert.equal(outbox.hasPendingTerminal(c.run_id, 7), true);
+    const journal = await outbox.readTerminalJournal(c.run_id, 7);
+    assert.equal(journal?.body.status, expectedStatus);
+    assert.equal(journal?.body.claim_generation, 7);
+    assert.equal(journal?.messagesThroughSeq, 2);
+   }
    res.end(JSON.stringify({ applied: true, status: body.status }));
   } else res.end("{}");
  });
@@ -175,17 +190,21 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
  } as unknown as GitCache;
  try {
   await new CrossCheckRunner(client, git, nullLogger(), { homeRoot: root, pollMs: 1,
-   activeRuns: registry, outbox, model: new CodexCrossCheck(client, nullLogger(), r.deps) }).execute(c);
+   activeRuns: registry, outbox, model: new CodexCrossCheck(client, r.log, r.deps) }).execute(c);
   assert.deepEqual(clones, [["/bare", c.cross_check!.base_commit, c.run_id]]);
   assert.deepEqual(r.ops, ["stat", "read"]);
   assert.deepEqual(r.disposed, ["provider", "fileop"]);
   const delivered = posts.filter((p) => p.url.endsWith("/messages"));
   assert.deepEqual(delivered.map((p) => p.body.messages[0].seq), [1, 2]);
   assert.deepEqual(delivered.map((p) => p.body.messages[0].payload.event), ["init", "result"]);
+  assert.equal(delivered[1]!.body.messages[0].payload.is_error, mode !== "approve");
+  assert.equal(r.secrets.size, 0);
   assert.ok(posts.every((p) => p.url.includes("/runs/check/")));
   const verdictIndex = posts.findIndex((p) => p.url.endsWith("/cross-check-verdict"));
   assert.ok(verdictIndex > 0);
-  assert.equal(posts[verdictIndex + 1]!.body.status, "completed");
+  assert.equal(posts[verdictIndex]!.body.verdict, expectedVerdict);
+  assert.equal(posts[verdictIndex]!.body.reason_class, expectedReason);
+  assert.equal(posts[verdictIndex + 1]!.body.status, expectedStatus);
   assert.equal(outbox.hasPendingTerminal(c.run_id, 7), false);
   assert.equal(registry.size, 0);
   assert.deepEqual(removed, ["/checkout"]);
@@ -195,6 +214,7 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
   await fs.rm(root, { recursive: true, force: true });
  }
 });
+}
 
 for (const mode of ["stale-running", "stale-verdict", "malformed", "delivery", "timeout", "cancel", "lost-ack", "lost-terminal-ack", "cancel-probe", "timeout-probe", "finding-schema"] as const) {
  it("outer checker fails closed or abandons: " + mode, async () => {

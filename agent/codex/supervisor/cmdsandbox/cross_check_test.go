@@ -114,8 +114,8 @@ func TestCrossCheckArgsRejectWidening(t *testing.T) {
 
 func TestCrossCheckTruncateRequiresABI3(t *testing.T) {
 	for _, abi := range []int{1, 2} {
-		if err := confine("/checkout", grantFds{readOnly: true}, abi); err == nil {
-			t.Fatalf("accepted ABI %d without truncate enforcement", abi)
+		if err := confine("/checkout", grantFds{readOnly: true}, abi); err == nil || err.Error() != "checker confinement requires Landlock ABI 3 for truncate denial" {
+			t.Fatalf("ABI %d: expected truncate guard refusal, got %v", abi, err)
 		}
 	}
 }
