@@ -21,6 +21,7 @@
 // unset value is unsafe. We emit an explicit `[projects."<cwd>"] trust_level =
 // "untrusted"` to avoid that branch.
 
+import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { lstatSync } from "node:fs";
 
 import type { CodexAppServerAuthMode } from "./appserver-auth.js";
@@ -125,10 +126,10 @@ function nativeDisabledConfigLines(
 export function buildCodexConfigToml(opts: CodexConfigOptions): string {
   const { model, provider, projectPath } = opts;
   if (!PROVIDER_NAME_RE.test(provider.name)) {
-    throw new Error(`Codex provider name must match ${PROVIDER_NAME_RE} (got ${JSON.stringify(provider.name)})`);
+    throw new TrustedExecutionRefusal(`Codex provider name must match ${PROVIDER_NAME_RE} (got ${JSON.stringify(provider.name)})`);
   }
   if (provider.wireApi !== "responses") {
-    throw new Error(`Codex M3a supports only the "responses" wire (got ${JSON.stringify(provider.wireApi)})`);
+    throw new TrustedExecutionRefusal(`Codex M3a supports only the "responses" wire (got ${JSON.stringify(provider.wireApi)})`);
   }
   // A single deterministic template — no caller-shaped branches, no repo config.
   return [
@@ -161,13 +162,13 @@ export interface CodexProductionConfigOptions {
 function validateProductionConfigOptions(opts: CodexProductionConfigOptions): void {
   const keys = Object.keys(opts);
   if (keys.some((key) => key !== "model" && key !== "projectPath" && key !== "authMode" && key !== "codeModeHost")) {
-    throw new Error("Codex production config received an unsupported option");
+    throw new TrustedExecutionRefusal("Codex production config received an unsupported option");
   }
   if (opts.authMode !== "api_key" && opts.authMode !== "subscription") {
-    throw new Error("Codex production config requires an explicit supported auth mode");
+    throw new TrustedExecutionRefusal("Codex production config requires an explicit supported auth mode");
   }
   if (opts.codeModeHost !== undefined && typeof opts.codeModeHost !== "boolean") {
-    throw new Error("Codex production config codeModeHost must be a boolean");
+    throw new TrustedExecutionRefusal("Codex production config codeModeHost must be a boolean");
   }
 }
 
@@ -213,7 +214,7 @@ export function buildCodexLoopbackTestConfigToml(
   try {
     parsed = new URL(openAIBaseUrl);
   } catch {
-    throw new Error("Codex loopback test base URL is invalid");
+    throw new TrustedExecutionRefusal("Codex loopback test base URL is invalid");
   }
   const normalizedBaseUrl = `http://127.0.0.1:${parsed.port}/v1`;
   if (
@@ -227,7 +228,7 @@ export function buildCodexLoopbackTestConfigToml(
     || parsed.hash !== ""
     || openAIBaseUrl !== normalizedBaseUrl
   ) {
-    throw new Error("Codex loopback test base URL must be http://127.0.0.1:<port>/v1 with no credentials or query");
+    throw new TrustedExecutionRefusal("Codex loopback test base URL must be http://127.0.0.1:<port>/v1 with no credentials or query");
   }
   validateProductionConfigOptions(opts);
   const providerName = CODEX_M3B_LOOPBACK_PROVIDER_NAME;

@@ -170,8 +170,12 @@ on the last-resort [disk self-heal recycle](hosted-workers.md#disk-self-heal).
 The bounded subtrees are the Go build cache (`.cache/go-build`), the Go
 module cache (`go/pkg/mod`), and the npm cache (`.npm/_cacache`); other
 caches, including `node_modules` and pip's, are not individually tracked or
-trimmed by any of the mechanisms below. Four mechanisms, from routine to
-last resort:
+trimmed by the mechanisms below. These reduce pressure; periodic selection
+cannot guarantee a particular failing run parks before failure. Admission
+and hard thresholds use the higher valid byte or inode used fraction;
+missing or invalid accounting, including missing or zero inode totals,
+falls back to the valid pair. Thresholds
+and switches are unchanged. Five mechanisms:
 
 1. **Cache drop on park.** A Claude run parked with its process ended
    (`limit_wait`, `recovery_wait`, `paused`) has its rebuildable caches
@@ -189,7 +193,7 @@ last resort:
    run). A *hard* layer watches the data volume itself on every stats tick,
    independent of turn boundaries, and — only once the volume nears the
    api's disk-pressure threshold — acts on the Claude run with the largest
-   caches. It stops that run and parks it with a **counted**
+   measured cache bytes among registered runs. It stops that run and parks it with a **counted**
    `data_volume_full` park only while its executor is running and the server
    has acknowledged `running` for a status report newer than its last
    non-`running` report and newer than any declined or unreadable reply
@@ -219,22 +223,51 @@ last resort:
    `UZI_DISK_ADMISSION_MAX_WAIT` after the crossing, claims reopen (with a
    warning) so a worker with nothing left to reclaim does not idle forever;
    they close again only on the next fresh crossing.
-4. **Disk-full classification and a bounded park** (D6). This reclaim-retry-
-   park treatment covers only two writes: the claim/resume preflight (before
-   anything is cloned) and the clone/fetch itself. If either fails
-   disk-full — a recognised `ENOSPC`/`EDQUOT` signal or git's own
-   diagnostics, confirmed against the volume's actual free space and inodes
-   — the worker runs one more reclaim pass, retries once, and parks the run
+4. **Strict disk-full classification and safe retry** (D6). This treatment
+   covers the claim/resume preflight and worker-owned clone/fetch writes.
+   A preflight below the free-space floor, or a recognised `ENOSPC`/`EDQUOT`
+   signal or git diagnostic attributed to the data volume and confirmed
+   against its free bytes and inodes, triggers one more reclaim pass and
+   one safe retry or recheck. If still full, the worker parks the run
    as `recovery_wait`/`data_volume_full` instead of failing it outright. A
-   disk-full write *after* the clone exists (e.g. a build failing mid-turn)
-   takes the normal failure path instead — it is not retried or parked here.
-   Mid-run disk parks come only from mechanism 2 above: the soft cache-cap
-   park (uncounted) and the hard pressure stop (counted). The claim/resume
-   and clone/fetch park has the same lifetime cap
+   later write is not added to this classification or retry. The separate
+   executor-failure deferral below can also produce a counted park. The
+   claim/resume and clone/fetch park shares the lifetime cap
    (`UZI_RUN_DISK_PARK_MAX`, shared with the hard-stop park); past it, the
    run fails with `fail_origin=data_volume_full`. See [Worker data volume
    full](run-recovery-wait.md#worker-data-volume-full) for exactly what an
    owner sees and how counted parks differ from preventive ones.
+
+5. **Full-volume terminal-failure deferral** (#1829). An issue run's direct,
+   otherwise-untyped executor rejection can take one counted disk park after
+   its writers and reports settle and one bounded reclaim wait, without
+   restarting the command, provider or executor, even if reclaim frees room.
+   This requires exact-generation running ownership, a compatible API and
+   fresh valid byte and inode accounting confirming fullness on the actual
+   worktree and HOME's data-volume device. Setup, finalize, bookkeeping and
+   settlement errors, typed recovery outcomes and owner controls keep their
+   existing handling. Recognizable typed, wrapped or trusted security/guardrail
+   failures remain excluded, including admission, launcher and plan-wiring
+   refusals. Preserved trusted types and `cause`/`interruption` wrappers remain
+   excluded. Complete legacy reasons are recognized directly and through leading
+   `<context>: <reason>` envelopes with a literal colon and space. Contexts may
+   contain apostrophes; double-quoted or multiline contexts, alternate separators,
+   quoted reason diagnostics and producer-domain near-misses are not legacy
+   refusal envelopes. Ordinary opaque failures keep their existing handling.
+   The exclusion fixtures pin this boundary in
+   `agent/test/runner-terminal-disk-deferral.test.ts`. Approval revisions are
+   unchanged, including in-place cache relief. This is current-fullness policy, not write attribution: an
+   unrelated opaque error can coincide with fullness and be deferred. For
+   actual trusted refusals, only completely erased-origin opaque failures remain eligible
+   under this accepted coincidence residual.
+   Capture retries are bounded; a safely quiescent run can park with an
+   unverified capture while retaining its original clone, HOME, session,
+   journal and custody. That degraded recovery requires this worker and can
+   lose newer work on another worker. The cap bounds repetition, not
+   misclassification; an unlimited configured cap remains unlimited. See
+   [Worker data volume full](run-recovery-wait.md#worker-data-volume-full)
+   for recovery limits and [ADR-1809](../adr/1809-per-run-cache-bounds.md#full-volume-terminal-failure-deferral-1829)
+   for the policy boundary.
 
 **The [disk self-heal recycle](hosted-workers.md#disk-self-heal) (PRD #837)
 is still the last resort**, unchanged by any of the above: a hosted worker's

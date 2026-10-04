@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 import { launchCodexRoot, type CodexLaunchSpec, type LauncherDeps, type ProvisionSpawnSync } from "../src/codex/launcher.js";
 import { SESSION_SEED_ENTRYPOINT, runSessionSeedCli, sessionSeedInvocation } from "../src/codex/session-seed-cli.js";
+import { CODEX_SESSION_GID, setprivRunnerArgs } from "../src/runner-uid.js";
 
 const ARGV = ["node", "session-seed-cli.ts", "/stage/sessions", "/dest/sessions"];
 
@@ -86,12 +87,34 @@ describe("session seed failure outside runSessionSeedCli reaches the launcher er
       assert.equal(real.status, 1, `stderr: ${String(real.stderr)}`);
       assert.ok(String(real.stderr).includes(probe));
 
-      const provisionSpawnSync: ProvisionSpawnSync = (_command, args) => {
+      const root = "/data/run/root-seed";
+      const codexHome = path.join(root, "codex");
+      const sessions = path.join(codexHome, "sessions");
+      let sharedSessionPosture = false;
+      const provisionSpawnSync: ProvisionSpawnSync = (command, args) => {
         if (args.includes(SESSION_SEED_ENTRYPOINT)) return real as SpawnSyncReturns<Buffer>;
-        return { pid: 1, output: [], stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), status: 0, signal: null } as SpawnSyncReturns<Buffer>;
+        let stdout = Buffer.alloc(0);
+        const prefixLength = command === "/bin/setpriv" ? setprivRunnerArgs().length : 0;
+        const executable = prefixLength === 0 ? command : args[prefixLength];
+        const shellArgs = prefixLength === 0 ? args : args.slice(prefixLength + 1);
+        if (executable === "/bin/sh" && shellArgs[1] === 'stat -c "%u:%g:%a" -- "$1"') {
+          const requestedPath = shellArgs[3];
+          assert.equal(typeof requestedPath, "string");
+          assert.ok([
+            root, codexHome, sessions, path.join(root, "home"), path.join(root, "tmp"),
+            ...["config", "cache", "data", "state"].map((dir) => path.join(root, `xdg-${dir}`)),
+          ].includes(requestedPath!));
+          const shared = sharedSessionPosture && [root, codexHome, sessions].includes(requestedPath!);
+          const mode = shared ? (requestedPath === sessions ? "2750" : "710") : "700";
+          stdout = Buffer.from(`10002:${shared ? CODEX_SESSION_GID : 10002}:${mode}\n`);
+        } else if (executable === "/bin/sh") {
+          if (shellArgs[1]?.includes("chgrp")) sharedSessionPosture = true;
+          else if (shellArgs[1]?.includes("mkdir -m 700")) sharedSessionPosture = false;
+        }
+        return { pid: 1, output: [], stdout, stderr: Buffer.alloc(0), status: 0, signal: null } as SpawnSyncReturns<Buffer>;
       };
       const spec: CodexLaunchSpec = {
-        ownedDataRoot: "/data/run/root-seed",
+        ownedDataRoot: root,
         provider: { name: "uzi-codex", baseUrl: "http://127.0.0.1:9/v1", envKey: "CODEX_PROVIDER_KEY", credentialValue: "dummy-key" },
         model: "gpt-5-codex",
         codexBin: "/opt/uzi-codex/0.159.3/bin/codex",

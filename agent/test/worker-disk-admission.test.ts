@@ -11,11 +11,12 @@ import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import type { ChatClaimResponse, ClaimResponse } from "../src/protocol.js";
 import { DiskPressureController } from "../src/disk-reclaim.js";
-import { StatsCollector } from "../src/stats.js";
+import { StatsCollector, type StatfsSample } from "../src/stats.js";
 import { nullLogger } from "./helpers.js";
 
 // PRD #1809 D5: the admission stop, driven through the REAL Worker heartbeat and claim loops
-// with the real StatsCollector sampling a real directory (os.tmpdir()). The volume's actual
+// with the real StatsCollector sampling os.tmpdir() by default, or injected statfs counters
+// for inode pressure without filling a filesystem. The real volume's actual
 // used fraction is whatever it is, so the test moves the THRESHOLD instead: a soft threshold
 // of 0 puts any known sample at or over it, and one of 1 puts any not-completely-full volume
 // under it.
@@ -37,8 +38,8 @@ interface Harness {
 }
 
 /** The real Worker loops over a stub client, with a controller built from `over`. */
-function harness(over: { admission?: boolean; admissionMaxWaitMs?: number; reclaim?: boolean } = {}): Harness {
-  let threshold = 0; // soft = 0: any known sample is over it
+function harness(over: { admission?: boolean; admissionMaxWaitMs?: number; reclaim?: boolean; threshold?: number; statfs?: () => StatfsSample } = {}): Harness {
+  let threshold = over.threshold ?? 0; // soft = 0: any known sample is over it
   let claims = 0;
   let passes = 0;
   const observed: Array<number | undefined> = [];
@@ -97,9 +98,9 @@ function harness(over: { admission?: boolean; admissionMaxWaitMs?: number; recla
     undefined,
     pressure,
     undefined,
-    // issue #1863: stub only the RSS read (the default reads the proc filesystem, which the
-    // Landlock test sandbox denies); the disk sample stays the real statfs of os.tmpdir().
-    (dataDir) => new StatsCollector({ dataDir, processRss: () => 64 * 1024 * 1024 }),
+    // issue #1863: stub RSS (the default proc read is denied in the Landlock test sandbox).
+    // Disk sampling uses os.tmpdir() unless the test supplies statfs counters.
+    (dataDir) => new StatsCollector({ dataDir, processRss: () => 64 * 1024 * 1024, ...(over.statfs ? { statfs: over.statfs } : {}) }),
   );
   const ac = new AbortController();
   const running = worker.run(ac.signal);
@@ -119,6 +120,29 @@ function harness(over: { admission?: boolean; admissionMaxWaitMs?: number; recla
 }
 
 describe("Worker × disk admission (PRD #1809 D5)", () => {
+  it("blocks claims on inode-full heartbeats with low byte usage, then resumes when inodes recover", async () => {
+    let freeInodes = 0;
+    const h = harness({
+      threshold: 0.9,
+      statfs: () => ({ bsize: 4096, blocks: 100, bfree: 90, bavail: 90, files: 100, ffree: freeInodes }),
+    });
+    try {
+      await until(() => h.observed.length >= 3, "inode-full heartbeat samples");
+      assert.ok(h.observed.every((f) => f === 1), "the real collector and heartbeat feed inode pressure, despite 10% byte usage");
+      assert.strictEqual(h.pressure.claimsBlocked(), true);
+      const at = h.claims();
+      await tick(40);
+      assert.ok(h.claims() <= at + 1, "no new claims while inode-full");
+      assert.ok(h.passes() >= 1, "inode pressure triggered reclaim");
+      freeInodes = 80;
+      await until(() => h.observed.includes(0.2) && !h.pressure.claimsBlocked(), "inode pressure recovers");
+      const resumed = h.claims();
+      await until(() => h.claims() > resumed + 3, "claims resume at the unchanged threshold");
+    } finally {
+      await h.stop();
+    }
+  });
+
   it("claims no new run at or over the soft threshold, reclaims, and resumes claiming under it", async () => {
     const h = harness();
     try {

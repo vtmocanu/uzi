@@ -5,6 +5,7 @@
 // unchanged — synthesize a packages-only devbox.json OUTSIDE the clone, install in
 // a secret-scrubbed subprocess, and filter `devbox shellenv` to the allowlist.
 
+import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import path from "node:path";
 import type { Logger } from "./log.js";
 import type { RunContext } from "./executor.js";
@@ -102,7 +103,7 @@ export async function provisionRunTools(ctx: RunContext, deps: ProvisionRunDeps)
   }
 
   if (toolPackages.length === 0) return { toolEnv: {} };
-  if (!RUN_ID_RE.test(ctx.runId)) throw new Error(`${REASON_PROVISION_FAILED}: invalid run id`);
+  if (!RUN_ID_RE.test(ctx.runId)) throw new TrustedExecutionRefusal(`${REASON_PROVISION_FAILED}: invalid run id`);
 
   const provisionDir = path.join(deps.provisionRoot, ctx.runId);
 
@@ -142,10 +143,10 @@ export async function provisionRunTools(ctx: RunContext, deps: ProvisionRunDeps)
         return await install(tier1);
       } catch (retryErr) {
         await removeProvisionDir(provisionDir, deps.log);
-        throw new Error(`${REASON_PROVISION_FAILED}: ${errMessage(retryErr)}`);
+        throw new TrustedExecutionRefusal(`${REASON_PROVISION_FAILED}: ${errMessage(retryErr)}`, { cause: retryErr });
       }
     }
     // Pure tier-1 (or opt-in off) — fatal, exactly as before.
-    throw new Error(`${REASON_PROVISION_FAILED}: ${errMessage(err)}`);
+    throw new TrustedExecutionRefusal(`${REASON_PROVISION_FAILED}: ${errMessage(err)}`, { cause: err });
   }
 }
