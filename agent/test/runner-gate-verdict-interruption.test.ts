@@ -458,23 +458,10 @@ function scenarioFailureDiagnostic(s: Scenario, label: string): string {
     items: values.slice(0, limit),
     omitted: Math.max(0, values.length - limit),
   });
-  const flights = s.flights.map((flight, index) => {
-    const states = api.states
-      .slice(flight.stateFrom, s.flights[index + 1]?.stateFrom)
-      .filter((state) => state.runId === s.runId)
-      .map((state) => state.body);
+  const summarizeReports = (states: StateRequest[]) => {
     const failed = states.filter((state) => state.status === "failed");
     const gateReports = states.filter((state) => state.status === "awaiting_approval");
-    const hasError = Object.hasOwn(flight, "error");
-    const error = flight.error;
-    const errorDescription = error instanceof Error
-      ? `${text(error.name)}: ${text(error.message)}`
-      : error === null || (typeof error !== "object" && typeof error !== "function")
-        ? String(error)
-        : `<${typeof error} rejection; body omitted>`;
     return {
-      generation: flight.claim.claim_generation,
-      finished: flight.finished,
       statuses: bounded(states.map((state) => text(state.status)), 40),
       gateObservations: gateReports.length === 0 ? "<no gate report>" : bounded(gateReports.map((state) => ({
         planPresent: Boolean(state.plan_md),
@@ -485,6 +472,46 @@ function scenarioFailureDiagnostic(s: Scenario, label: string): string {
         failure_reason: text(state.failure_reason),
         fail_origin: text(state.fail_origin),
       })), 8),
+    };
+  };
+  const stampedReports = new Map<number, StateRequest[]>();
+  for (const state of api.states) {
+    if (state.runId !== s.runId || state.body.claim_generation === undefined) continue;
+    const generation = state.body.claim_generation;
+    const reports = stampedReports.get(generation);
+    if (reports === undefined) stampedReports.set(generation, [state.body]);
+    else reports.push(state.body);
+  }
+  const generationReports = Array.from(stampedReports, ([generation, reports]) => ({
+    generation,
+    ...summarizeReports(reports),
+  }));
+  const arrivalWindowObservations = s.flights.map((flight, flightIndex) => {
+    const stateFrom = flight.stateFrom;
+    const stateTo = s.flights[flightIndex + 1]?.stateFrom ?? api.states.length;
+    const reports = api.states
+      .slice(stateFrom, stateTo)
+      .filter((state) => state.runId === s.runId && state.body.claim_generation === undefined)
+      .map((state) => state.body);
+    return {
+      label: "arrival-window observations",
+      flightIndex,
+      stateFrom,
+      stateTo,
+      ...summarizeReports(reports),
+    };
+  });
+  const flights = s.flights.map((flight) => {
+    const hasError = Object.hasOwn(flight, "error");
+    const error = flight.error;
+    const errorDescription = error instanceof Error
+      ? `${text(error.name)}: ${text(error.message)}`
+      : error === null || (typeof error !== "object" && typeof error !== "function")
+        ? String(error)
+        : `<${typeof error} rejection; body omitted>`;
+    return {
+      generation: flight.claim.claim_generation,
+      finished: flight.finished,
       execution: hasError ? { rejected: true, error: text(errorDescription) } : "<no rejected execution>",
     };
   });
@@ -492,6 +519,8 @@ function scenarioFailureDiagnostic(s: Scenario, label: string): string {
     label: text(label),
     resumedFlight: s.flights.length > 1 ? "present" : "<no resumed flight>",
     flights: bounded(flights, 12),
+    generationReports: bounded(generationReports, 12),
+    arrivalWindowObservations: bounded(arrivalWindowObservations, 12),
     cancellationRows: s.rowsOf("cancel").length > 0 ? "present" : "<no cancellation row>",
   });
 }
