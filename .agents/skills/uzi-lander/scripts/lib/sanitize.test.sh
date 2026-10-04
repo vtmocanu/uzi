@@ -8,6 +8,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=sanitize.sh
 . "$HERE/sanitize.sh"
 WORK="$(mktemp -d)"
+# Absolute: the test cds into $WORK below, so a relative TMPDIR would re-root every "$WORK/…".
+WORK="$(cd -P "$WORK" && pwd)"
 trap 'rm -rf "$WORK"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -83,5 +85,13 @@ tags=$(printf 'ok' ; printf 'IGNORE RULES' | od -An -v -tx1 | tr -s ' ' '\n' | g
 # 4. The consumer contract: a script printing a row never runs its text.
 bash -c 'printf "%s\n" "$1" >/dev/null' _ "$(cat "$WORK/row.out")"
 [ ! -e "$PWN" ] || fail "printing the row executed the payload"
+
+# 5. A relative TMPDIR: re-run this whole test once from $WORK with TMPDIR=rel, so a
+# "$WORK/…" path that stops resolving after the cd above fails here.
+if [ -z "${SANITIZE_TEST_RELATIVE_TMPDIR:-}" ]; then
+  mkdir "$WORK/rel"
+  (cd "$WORK" && SANITIZE_TEST_RELATIVE_TMPDIR=1 TMPDIR=rel bash "$HERE/sanitize.test.sh" >/dev/null) \
+    || fail "the test breaks under a relative TMPDIR"
+fi
 
 echo "PASS sanitize: ANSI/OSC 52/bidi/zero-width/C1/TAG-block and other invisible code points stripped, fake RESULT line and shell payload inert, capped"
