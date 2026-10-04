@@ -2476,6 +2476,17 @@ export interface StateRequest {
   messages_through_seq?: number;
 }
 
+/** Atomic server snapshot. Candidate authority still requires the exact applied running ACK. */
+export interface PlanCrossCheckReconciliation {
+  leadLastSeq: number;
+  claimGeneration: number;
+  planCrossCheckSettled: boolean;
+  gateRevision: number;
+  gatePresentationId?: string;
+  gatePayloadDigest?: string;
+  currentPlanSHA256: string;
+}
+
 /**
  * What the server answered a state report with (PRD #35's park acknowledgement
  * contract). Both the 200 and the 409 path return `{"run": <RunDTO>}`, so the run's
@@ -2498,6 +2509,7 @@ export interface StateRequest {
  * construction. An enumeration would go stale; this cannot.
  */
 export interface StateAck {
+  reconciliation?: PlanCrossCheckReconciliation;
   /** Whether the server applied the transition. Diagnostics and logging only —
    *  see the warning above before branching on it. */
   applied: boolean;

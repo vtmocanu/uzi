@@ -1,4 +1,5 @@
 import { Readable } from "node:stream";
+import { readPlanCrossCheckReconciliation } from "./cross-check-reconciliation.js";
 import type { Logger } from "./log.js";
 import type { UsageWireRequest } from "./usage-recorder.js";
 import {
@@ -39,6 +40,7 @@ import {
   type RegisterRequest,
   type RegisterResponse,
   type StateAck,
+  type PlanCrossCheckReconciliation,
   type StateRequest,
   type UserInput,
   type InputsResponse,
@@ -102,13 +104,33 @@ export interface PlanCrossCheckFindings {
   summary: string;
   items: { file: string; severity: "info" | "warning" | "error"; summary: string; rationale: string }[];
 }
-export type PlanCrossCheckResponse =
+export type PlanCrossCheckResponse = ({ reconciliation?: PlanCrossCheckReconciliation } & (
+  | { result: "parked"; verdict: string; reason_class: string; lead_last_seq: number; reconciliation: PlanCrossCheckReconciliation }
   | { result: "no_row"; reason_class: "no_candidate"; lead_last_seq: number }
   | { result: "candidate"; round: number; checker_run_id: string | null; candidate_digest: string;
       candidate_generation: number; candidate: PlanCrossCheckCandidate;
       verdict: "pending" | "approve" | "revise" | "block" | "failed";
       reason_class: "" | "approve" | PlanCrossCheckGateReason;
-      findings: PlanCrossCheckFindings | null; deadline_at: string; lead_last_seq: number };
+      findings: PlanCrossCheckFindings | null; deadline_at: string; lead_last_seq: number }));
+function decodePlanCrossCheckResponse(value: unknown, generation: number): PlanCrossCheckResponse {
+  // Preserve legacy active/no-row decoding; only the derived group carries proof.
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value as PlanCrossCheckResponse;
+  const wire = value as Record<string, unknown>;
+  const decoded = { ...wire };
+  delete decoded.reconciliation;
+  const proof = readPlanCrossCheckReconciliation(wire);
+  const reconciliation = proof?.claimGeneration === generation ? proof : undefined;
+  if (wire.result === "parked" && (!reconciliation || reconciliation.gateRevision < 1 ||
+      typeof wire.verdict !== "string" || typeof wire.reason_class !== "string"))
+    throw new Error("invalid parked cross-check reconciliation");
+  if (wire.result === "parked" && reconciliation !== undefined) {
+    return { result: "parked", verdict: wire.verdict as string, reason_class: wire.reason_class as string,
+      lead_last_seq: reconciliation.leadLastSeq, reconciliation };
+  }
+  if (reconciliation !== undefined) decoded.reconciliation = reconciliation;
+  return decoded as PlanCrossCheckResponse;
+}
+
 export type PlanCrossCheckStateRequest = StateRequest & {
   plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null;
   plan_cross_check_diff_refusal?: PlanCrossCheckDiffRefusal;
@@ -1196,15 +1218,15 @@ export class WorkerClient {
    * so parsing a 409's status back out of the error text would work in tests and
    * fail on real runs.
    */
-  async submitPlanCrossCheck(runId: string, claimGeneration: number, candidate: PlanCrossCheckCandidate): Promise<PlanCrossCheckResponse> {
-    return await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
+  async submitPlanCrossCheck(runId: string, claimGeneration: number, candidate: PlanCrossCheckCandidate, signal?: AbortSignal): Promise<PlanCrossCheckResponse> {
+    return decodePlanCrossCheckResponse(await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
       { stage: "plan", claim_generation: claimGeneration, ...candidate },
-      this.httpTimeoutMs, undefined, CROSS_CHECK_RESPONSE_MAX_BYTES) as PlanCrossCheckResponse;
+      this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES), claimGeneration);
   }
 
-  async planCrossCheckStatus(runId: string, claimGeneration: number, round = 1): Promise<PlanCrossCheckResponse> {
-    return await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks/plan/${round}?claim_generation=${claimGeneration}`,
-      undefined, CROSS_CHECK_RESPONSE_MAX_BYTES) as PlanCrossCheckResponse;
+  async planCrossCheckStatus(runId: string, claimGeneration: number, round = 1, signal?: AbortSignal): Promise<PlanCrossCheckResponse> {
+    return decodePlanCrossCheckResponse(await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks/plan/${round}?claim_generation=${claimGeneration}`,
+      undefined, CROSS_CHECK_RESPONSE_MAX_BYTES, signal), claimGeneration);
   }
 
   async reportCrossCheckVerdict(runId: string, claimGeneration: number, result:
@@ -1320,6 +1342,9 @@ export class WorkerClient {
           // PRD #1795 M1 (decision 5): the revision an awaiting_approval report was answered with,
           // read like contractRevision off the same single-use body (top-level, beside `run`).
           if (fields.gateRevision !== undefined) ack.gateRevision = fields.gateRevision;
+          if (ack.applied && fields.reconciliation !== undefined &&
+              fields.reconciliation.claimGeneration === body.claim_generation)
+            ack.reconciliation = fields.reconciliation;
           if (!ack.applied) {
             this.log.info("state report not applied server-side", {
               run_id: runId,
@@ -2502,8 +2527,8 @@ export class WorkerClient {
     }
   }
 
-  private async getJSON(path: string, timeoutMs?: number, maxResponseBytes?: number): Promise<unknown> {
-    const res = await this.fetchRaw("GET", path, undefined, timeoutMs);
+  private async getJSON(path: string, timeoutMs?: number, maxResponseBytes?: number, signal?: AbortSignal): Promise<unknown> {
+    const res = await this.fetchRaw("GET", path, undefined, timeoutMs, signal);
     if (res.status >= 400) throw await this.toError("GET", path, res);
     const text = maxResponseBytes === undefined ? await res.text() : await readBoundedText(res, maxResponseBytes, true);
     return text ? JSON.parse(text) : undefined;
@@ -2628,6 +2653,7 @@ export async function readRunAck(res: Response): Promise<{
   staleClaim?: boolean;
   credentialSwitchReleased?: boolean;
   gateRevision?: number;
+  reconciliation?: PlanCrossCheckReconciliation;
 }> {
   try {
     const text = await res.text();
@@ -2680,6 +2706,7 @@ export async function readRunAck(res: Response): Promise<{
       staleClaim?: boolean;
       credentialSwitchReleased?: boolean;
       gateRevision?: number;
+      reconciliation?: PlanCrossCheckReconciliation;
     } = {};
     if (typeof run?.status === "string") out.status = run.status;
     // PRD #1497 M2: the RunDTO's hold_reason rides the SAME body as `status`. A string only — a
@@ -2763,6 +2790,10 @@ export async function readRunAck(res: Response): Promise<{
     // leaves it undefined, which the gate reads as "no revision confirmed" (bound verdicts wait).
     const gateRev = parsed?.gate_revision;
     if (typeof gateRev === "number" && Number.isSafeInteger(gateRev) && gateRev >= 1) out.gateRevision = gateRev;
+    const reconciliation = readPlanCrossCheckReconciliation(parsed);
+    if (res.status === 200 && reconciliation !== undefined &&
+        (out.status !== "awaiting_approval" || reconciliation.gateRevision > 0))
+      out.reconciliation = reconciliation;
     return out;
   } catch {
     return {};
