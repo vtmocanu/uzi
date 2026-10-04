@@ -1,4 +1,5 @@
 import { Readable } from "node:stream";
+import type { DindMeterSample } from "./dind-meter.js";
 import type { Logger } from "./log.js";
 import type { UsageWireRequest } from "./usage-recorder.js";
 import {
@@ -33,6 +34,8 @@ import {
   type WallParkRequest,
   type ReportFindingRequest,
   type HeartbeatRequest,
+  type DindMaintenance,
+  type DindMaintenanceReadyACK,
   type MessagesRequest,
   type OutboxHeartbeatEntry,
   type OutgoingMessage,
@@ -749,6 +752,42 @@ export interface CompletionPermitResult {
   permit?: CompletionPermit;
 }
 
+function isDindUUID(value: unknown): value is string {
+  return typeof value === "string" && value.length === 36 && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+function decodeDindMaintenance(value: unknown): DindMaintenance | null | undefined {
+  if (value === null) return null;
+  if (!isRecord(value)) return undefined;
+  const boundedIdentity = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= 128;
+  if (!isDindUUID(value.id) || !isDindUUID(value.register_nonce) ||
+      !boundedIdentity(value.nonce) || !boundedIdentity(value.deployment_uid) || !boundedIdentity(value.pvc_uid) ||
+      typeof value.fenced !== "boolean" || typeof value.ready_ack !== "boolean") return undefined;
+  switch (value.phase) {
+    case "requested": case "ready": case "stopping": case "recycling": case "complete": case "cancelled":
+      break;
+    default:
+      return undefined;
+  }
+  if (value.reason !== undefined && value.reason !== "below_threshold" && value.reason !== "recycle_disabled") return undefined;
+  return {
+    id: value.id, nonce: value.nonce, phase: value.phase,
+    deployment_uid: value.deployment_uid, pvc_uid: value.pvc_uid,
+    register_nonce: value.register_nonce, fenced: value.fenced, ready_ack: value.ready_ack,
+    ...(value.reason === undefined ? {} : { reason: value.reason }),
+  };
+}
+
+function validDindSample(sample: DindMeterSample | null | undefined): sample is DindMeterSample {
+  if (!sample || ![sample.epochS, sample.bytesUsed, sample.bytesTotal, sample.inodesUsed, sample.inodesTotal]
+    .every((v) => Number.isSafeInteger(v) && v >= 0)) return false;
+  const sampledMs = sample.epochS * 1000;
+  const ageMs = Date.now() - sampledMs;
+  return Number.isSafeInteger(sampledMs) && ageMs >= 0 && ageMs <= 45_000 &&
+    sample.bytesTotal > 0 && sample.bytesUsed <= sample.bytesTotal &&
+    sample.inodesTotal > 0 && sample.inodesUsed <= sample.inodesTotal;
+}
+
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
   private readonly sleep: (ms: number) => Promise<void>;
@@ -788,6 +827,13 @@ export class WorkerClient {
    * register (process restart) regardless.
    */
   private registerNonce: string | undefined;
+
+  private latestDindMaintenanceValue: DindMaintenance | null | undefined;
+
+  /** Latest heartbeat observation: null means known none; undefined means unknown. */
+  get latestDindMaintenance(): DindMaintenance | null | undefined {
+    return this.latestDindMaintenanceValue;
+  }
 
   /**
    * PRD #1391 Run B M4: the api's server-side terminal-pending outbox cap
@@ -855,6 +901,8 @@ export class WorkerClient {
     protocolCapabilities?: string[],
     initialSnapshot?: ActiveSnapshot,
   ): Promise<RegisterResponse> {
+    this.latestDindMaintenanceValue = undefined;
+    this.registerNonce = undefined;
     const body: RegisterRequest = { name, version: this.version };
     // Only send the field when known: an image without ENV WORKER_TEMPLATE reports
     // no template, and the server stores NULL (PRD #18). The server's decoder
@@ -924,13 +972,16 @@ export class WorkerClient {
    *  restarts (a re-register would re-populate it). */
   clearFeatures(): void {
     this.serverFeatures.clear();
+    this.latestDindMaintenanceValue = undefined;
   }
 
   async heartbeat(
     stats?: WorkerStats,
     outbox?: OutboxHeartbeatEntry[],
     activeSnapshot?: ActiveSnapshot,
+    maintenance?: { sample?: DindMeterSample | null; ack?: DindMaintenanceReadyACK },
   ): Promise<boolean | undefined> {
+    this.latestDindMaintenanceValue = undefined;
     const body: HeartbeatRequest = { version: this.version };
     // Only attach stats when the collector produced a sample (PRD #49): an absent
     // field is the same wire shape as today, so a pre-#49 server ignores the extra
@@ -947,14 +998,37 @@ export class WorkerClient {
     // as `outbox`.
     const includeSnapshot = this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined;
     if (includeSnapshot) body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
-    const includeExtension = includeOutbox || includeSnapshot;
+    if (this.hasFeature("dind_maintenance_v1") && isDindUUID(this.registerNonce)) {
+      const sample = maintenance?.sample;
+      if (validDindSample(sample)) {
+        body.dind_meter = {
+          register_nonce: this.registerNonce,
+          epoch: sample.epochS,
+          sampled_at: new Date(sample.epochS * 1000).toISOString(),
+        };
+      }
+      if (maintenance?.ack) {
+        body.dind_maintenance_ready_ack = { ...maintenance.ack, register_nonce: this.registerNonce };
+      }
+    }
+    const includeExtension = includeOutbox || includeSnapshot || body.dind_meter !== undefined ||
+      body.dind_maintenance_ready_ack !== undefined;
     try {
-      return await this.postHeartbeat(body);
+      try {
+        return await this.postHeartbeat(body);
+      } catch (err) {
+        // A stale ACK gets one ACK-free resync; sibling extensions remain intact.
+        // Any failure of that request reaches the usual strict-decode fallback below.
+        if (!body.dind_maintenance_ready_ack || !(err instanceof RequestError) || err.status !== 409) throw err;
+        const resync = { ...body };
+        delete resync.dind_maintenance_ready_ack;
+        return await this.postHeartbeat(resync);
+      }
     } catch (err) {
       // Rollback fallback (PRD #1391 M5, extended by #1390 M2a): a rolled-back api that no
       // longer knows a negotiated heartbeat extension strict-decodes it as an unknown field
       // and answers a generic `invalid request body` 400. Retry the SAME heartbeat ONCE with
-      // EVERY negotiated extension stripped (both `outbox` AND `active_snapshot`); if the
+      // EVERY negotiated extension stripped (outbox, snapshot, meter and ACK); if the
       // stripped retry SUCCEEDS, clear the WHOLE cached feature set so nothing negotiated is
       // sent again until process restart. A heartbeat must NEVER be lost to a rolled-back api,
       // so a stripped success is the outcome, not the original 400. Deliberately WHOLE-SET, not
@@ -985,6 +1059,7 @@ export class WorkerClient {
    * body does not parse is still a successful heartbeat.
    */
   private async postHeartbeat(body: HeartbeatRequest): Promise<boolean | undefined> {
+    this.latestDindMaintenanceValue = undefined;
     const path = `${WORKER_API_PREFIX}/heartbeat`;
     const res = await this.fetchRaw("POST", path, body);
     if (res.status >= 400) throw await this.toError("POST", path, res);
@@ -996,6 +1071,11 @@ export class WorkerClient {
       return undefined;
     }
     if (typeof decoded !== "object" || decoded === null) return undefined;
+    if (this.hasFeature("dind_maintenance_v1")) {
+      this.latestDindMaintenanceValue = decodeDindMaintenance(
+        (decoded as { dind_maintenance?: unknown }).dind_maintenance,
+      );
+    }
     const worker = (decoded as { worker?: unknown }).worker;
     if (typeof worker !== "object" || worker === null) return undefined;
     const threshold = (worker as { disk_pressure_threshold?: unknown }).disk_pressure_threshold;

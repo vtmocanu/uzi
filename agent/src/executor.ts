@@ -269,6 +269,8 @@ export interface RunContext {
    *  lead is warned before a queued follow-up written against the destroyed tree arrives.
    *  Optional; absent ⇒ false (the stub executor and older callers ignore it). */
   resumed?: boolean;
+  /** Docker-wired resumed attempt: pre-pause Docker fixtures may be gone, even without a session. */
+  dockerScratchResume?: boolean;
   /** PRD #35 Decision 6b + PRD #209 D4: this run's plan is ALREADY APPROVED, so the
    *  executor skips the Phase-1 planning turn and the gate and goes straight to
    *  implement⇄review with `approvedPlan` below.

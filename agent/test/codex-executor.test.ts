@@ -5497,10 +5497,33 @@ describe("CodexExecutor: production tool-handler map (item 5)", () => {
   });
 });
 
-// PRD #1416 M1: the Codex executor's planPrompt/implementPrompt are trivial string builders that
-// bypass the shared buildPlanPrompt/buildImplementPrompt, so the published-floor paragraph is
-// prepended directly (from publishedTipNote). These assert it rides both prompts when
-// ctx.publishedTip is set (with AND without an approved plan) and is absent otherwise.
+describe("Docker scratch resume Codex prompts", () => {
+  const note = "Docker containers and volumes from before the pause may be gone. Recreate your Docker fixtures before relying on them.";
+  const exec = makeExecutor(makeRig(), bindingOf(SUBSCRIPTION));
+  const builders = exec as unknown as {
+    planPrompt(c: RunContext): string;
+    implementPrompt(c: RunContext, gatedPlan?: string): string;
+  };
+
+  for (const phase of ["planPrompt", "implementPrompt"] as const) {
+    it(`${phase} appends the note for a cold resume without a session`, () => {
+      const fresh = makeCtx({ sessionId: undefined, resumed: false }).ctx;
+      const baseline = builders[phase](fresh);
+      assert.ok(!baseline.includes(note));
+      assert.equal(builders[phase]({ ...fresh, dockerScratchResume: false }), baseline);
+      assert.equal(builders[phase]({ ...fresh, dockerScratchResume: true }), `${baseline}\n\n${note}`);
+    });
+  }
+
+  it("preserves gated plan framing while appending the note", () => {
+    const ctx = makeCtx({ sessionId: undefined, approvedPlan: undefined }).ctx;
+    const baseline = builders.implementPrompt(ctx, "approved steps");
+    assert.equal(builders.implementPrompt({ ...ctx, dockerScratchResume: true }, "approved steps"), `${baseline}\n\n${note}`);
+  });
+});
+
+// PRD #1416 M1: the Codex executor's planPrompt/implementPrompt bypass the shared builders.
+// Assert the published-floor paragraph rides both prompts when ctx.publishedTip is set.
 describe("CodexExecutor prompts — published-tip note (PRD #1416 M1)", () => {
   const P = "0123456789abcdef0123456789abcdef01234567";
   const DFLT = "fedcba9876543210fedcba9876543210fedcba98";

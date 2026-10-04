@@ -70,6 +70,7 @@ import {
   buildRepoInstructionsContext,
   buildRevisePlanPrompt,
   buildSelfImprovePlanPrompt,
+  dockerScratchResumeNote,
   isNotCodePlan,
 } from "./prompt.js";
 import { resolveRunKind } from "./run-kind.js";
@@ -1925,6 +1926,8 @@ export class SdkExecutor implements Executor {
             environmentFacts,
           });
         }
+        const dockerResume = dockerScratchResumeNote(ctx.dockerScratchResume);
+        if (dockerResume) planPrompt += `\n\n${dockerResume}`;
         // PRD #1247 M5b (D13): both paths below set `approvedPlan` + the candidate milestone list,
         // then share the gate + revision loop. A resume-at-gate run does NOT run a planning turn —
         // it re-presents the ALREADY-CAPTURED plan (the persisted plan_md → ctx.approvedPlan) at the
@@ -2710,6 +2713,7 @@ export class SdkExecutor implements Executor {
             // written against the old tree is not acted on as if that work survived. The
             // reseedNote gate is first-turn-only, so later turns are unchanged.
             resumed: ctx.resumed,
+            dockerScratchResume: ctx.dockerScratchResume,
             // PRD #759 M2/R1: the reseed recovered an uncommitted WIP snapshot, so the
             // first implement turn tells a cold resumed lead to reconcile the dirty tree
             // against the plan (and supersedes the now-false reseedNote). First turn only.

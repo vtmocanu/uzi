@@ -24,6 +24,7 @@ import { JobRunner } from "./job-runner.js";
 import { stubJobQueryFn } from "./job-runner-stub.js";
 import { Worker } from "./worker.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
+import { DindMaintenanceController } from "./dind-maintenance.js";
 import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js";
 import { CachesDroppedMemo, DiskPressureController, modelPassMinAgeMs, runDiskReclaimPass } from "./disk-reclaim.js";
 import { RunDiskSampler } from "./run-disk.js";
@@ -702,16 +703,27 @@ async function main(): Promise<void> {
   // report, so it takes the same outbox + re-arm registry the runners spill into. The
   // `undefined` preserves the default boot toolchain preflight (only tests inject one).
   // issue #1759 M3: the DinD prune, built only on a docker worker with
-  // UZI_DIND_PRUNE_ENABLED=true (undefined otherwise, so no loop and no claim gate). Its idle
+  // UZI_DIND_PRUNE_ENABLED=true. Server maintenance shares its gate even when cache prune is off. Its idle
   // probe reads the worker's own active sets, hence the late-bound `worker` reference: the
-  // probe is only ever called from the prune loop, which the worker itself starts.
+  // probe is called from the controller loops, which the worker itself starts.
   let worker: Worker | undefined;
+  const dindGate = new DindPruneGate();
   const dindPrune = createDindPrune(config, {
-    gate: new DindPruneGate(),
+    gate: dindGate,
     isIdle: () => worker?.isIdle() ?? false,
     log,
   });
   if (dindPrune) log.info("dind prune enabled", { docker_host_wired: true });
+  const dindMaintenance = config.dockerWiring.dockerHost !== undefined
+    ? new DindMaintenanceController({
+        gate: dindGate,
+        dockerHost: config.dockerWiring.dockerHost,
+        heartbeatIntervalMs: config.heartbeatIntervalMs,
+        isIdle: () => worker?.isIdle() ?? false,
+        log,
+        threshold: () => client.diskPressureThreshold,
+      })
+    : undefined;
   // A run's api status for both HOME reclaims. A 404 is the API ANSWERING not-found (the
   // run's row is gone, which is exactly what the oldest stranded HOMEs look like): return
   // undefined so a sweep SKIPS without counting it toward the outage bail; every other error
@@ -795,6 +807,7 @@ async function main(): Promise<void> {
     undefined,
     isolatedRunner,
     jobRunner,
+    dindMaintenance,
   );
 
   // Signal handlers FIRST, before anything that can take real time. Until these

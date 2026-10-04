@@ -13,6 +13,7 @@ import type { Config } from "./config.js";
 import type { ActiveSnapshot, ClaimResponse, OutboxHeartbeatEntry, StateAck, StateRequest, WorkerStats } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { DindPruneController } from "./dind-prune.js";
+import type { DindMaintenanceController } from "./dind-maintenance.js";
 import { makeTerminalOutboxDeps, resolvePendingTerminal, type SendTerminalState } from "./terminal-resolve.js";
 import { dataVolumeUsedFraction, StatsCollector } from "./stats.js";
 import type { DiskPressureController } from "./disk-reclaim.js";
@@ -110,6 +111,7 @@ export class Worker {
     private readonly jobRunner: Pick<JobRunner, "execute"> = {
       execute: () => Promise.reject(new Error("no job runner wired")),
     },
+    private readonly dindMaintenance?: DindMaintenanceController,
   ) {}
 
   /** The run lane's in-flight executions (issue #1759: a field so {@link isIdle} can read it). */
@@ -203,9 +205,10 @@ export class Worker {
     // issue #1759 M3: the DinD prune loop, only when enabled (createDindPrune returned a
     // controller). Its loop never throws.
     const dindPrune = this.dindPrune ? this.dindPrune.loop(signal) : Promise.resolve();
+    const dindMaintenance = this.dindMaintenance?.loop(signal) ?? Promise.resolve();
     // PRD #1809 D7: the periodic disk reclaim, only when enabled. Its loop never throws.
     const diskReclaim = this.diskPressure ? this.diskPressure.loop(signal) : Promise.resolve();
-    await Promise.all([heartbeat, settlement, dindPrune, diskReclaim, this.claimLoop(signal), this.chatClaimLoop(signal)]);
+    await Promise.all([heartbeat, settlement, dindPrune, dindMaintenance, diskReclaim, this.claimLoop(signal), this.chatClaimLoop(signal)]);
   }
 
   /** issue #1582 M2: sweep the settlement journal now, then every `settlementSweepMs` until the
@@ -558,6 +561,7 @@ export class Worker {
           // gate. The API holds a custom-root Codex run for a worker that lacks it.
           protocolCapabilities.push(CODEX_CUSTOM_MODEL_CAPABILITY);
         }
+        if (this.dindMaintenance) protocolCapabilities.push("dind_maintenance_v1");
         const res = await this.client.register(
           this.config.workerName,
           this.config.workerTemplate,
@@ -574,6 +578,7 @@ export class Worker {
           worker_id: res.worker_id ?? null,
         });
         this.dindPrune?.setWorkerId(res.worker_id);
+        this.dindMaintenance?.register(res.register_nonce, this.client.hasFeature("dind_maintenance_v1"));
         // Issue #1742: the api accepted this register, so retire the offered finalize records
         // (`sentFinalizes`, what the snapshot carried) and any lower-generation records of the same
         // offered runs. A failed register never reaches here. A
@@ -620,6 +625,7 @@ export class Worker {
     while (!signal.aborted) {
       let ok = false;
       let sample: WorkerStats | undefined;
+      const sentAtMs = Date.now();
       let sampledAtMs: number | undefined;
       try {
         // PRD #1391 M5: report per-run outbox depth alongside the resource sample. The
@@ -628,7 +634,6 @@ export class Worker {
         // the first recovered heartbeat carries the depth ahead of that tick's drain.
         // PRD #1390 M2a: the active-run snapshot rides the same send (built here so its
         // epoch is drawn from the ONE monotonic counter the claim loop also draws from).
-        const sentAtMs = Date.now();
         sampledAtMs = sentAtMs;
         sample = this.collectStats(stats);
         // PRD #1809 D8: the latest finished per-run HOME sample (the call starts the next one in
@@ -639,6 +644,7 @@ export class Worker {
           sample,
           this.outboxEntries(),
           this.buildActiveSnapshot(),
+          { sample: stats.latestDindSample, ack: this.dindMaintenance?.acknowledgement() },
         );
         ok = true;
         // issue #1759 M3: the api's custody flag, stamped here with this heartbeat's SEND
@@ -647,7 +653,9 @@ export class Worker {
         // run end). The controller ages the stamp out, so a run of failed heartbeats makes
         // the prune fail closed on a stale flag.
         this.dindPrune?.recordCustody(retaining, sentAtMs);
+        this.dindMaintenance?.observe(this.client.latestDindMaintenance, retaining, sentAtMs);
       } catch (err) {
+        this.dindMaintenance?.observe(undefined, undefined, sentAtMs);
         this.log.warn("heartbeat failed", { error: errMessage(err) });
       }
       // PRD #1809 D5: the data volume's used fraction from THIS tick's sample, checked
@@ -826,7 +834,7 @@ export class Worker {
   private async claimLoop(signal: AbortSignal): Promise<void> {
     const cap = this.config.maxConcurrentRuns;
     const active = this.runActive;
-    const gate = this.dindPrune?.gate;
+    const gate = this.dindMaintenance?.gate ?? this.dindPrune?.gate;
     let loggedAtCapacity = false;
     while (!signal.aborted) {
       // PRD #1390 M4 (e2e ONLY): the env-gated drop-execution seam pauses claiming (via the
@@ -936,6 +944,7 @@ export class Worker {
           void run.finally(() => {
             active.delete(run);
             this.dindPrune?.noteActivityEnded();
+            this.dindMaintenance?.noteActivityEnded();
           });
         }
       } catch (err) {
@@ -1001,7 +1010,7 @@ export class Worker {
    */
   private async chatClaimLoop(signal: AbortSignal): Promise<void> {
     const active = this.chatActive;
-    const gate = this.dindPrune?.gate;
+    const gate = this.dindMaintenance?.gate ?? this.dindPrune?.gate;
     while (!signal.aborted) {
       if (active.size >= this.config.chatSessions) {
         // All chat slots busy: wake when one frees or after a poll, then re-check.
@@ -1028,6 +1037,7 @@ export class Worker {
           void run.finally(() => {
             active.delete(run);
             this.dindPrune?.noteActivityEnded();
+            this.dindMaintenance?.noteActivityEnded();
           });
         }
       } catch (err) {

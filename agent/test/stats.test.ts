@@ -326,6 +326,44 @@ describe("StatsCollector — DinD data-root sample (issue #1759)", () => {
     for (const k of DIND_KEYS) assert.ok(!(k in s), `${k} absent: ${why}`);
   }
 
+  it("exposes exactly the latest attached sample and resets on missing, throwing or failed collect", () => {
+    const sample = { epochS: EPOCH, bytesUsed: 10, bytesTotal: 100, inodesUsed: 2, inodesTotal: 20 };
+    let reads = 0;
+    let mode = "sample";
+    let failCollect = false;
+    const c = new StatsCollector({
+      cgroupRoot: "/nonexistent-cgroup", procCgroupPath: "/nonexistent-proc-cgroup",
+      now: () => 0n, cpuCount: () => 1,
+      processRss: () => { if (failCollect) throw new Error("RSS failed"); return 1024; },
+      statfs: () => ({ bsize: 4096, blocks: 10, bfree: 5, bavail: 5 }),
+      dindMeter: () => {
+        reads++;
+        if (mode === "throw") throw new Error("meter failed");
+        return mode === "missing" ? null : sample;
+      },
+    });
+    assert.equal(c.latestDindSample, null);
+    const stats = c.collect()!;
+    assert.equal(c.latestDindSample, sample, "same object, no second read");
+    assert.equal(c.latestDindSample, sample);
+    assert.equal(reads, 1);
+    assert.deepEqual([stats.disk_dind_bytes, stats.disk_dind_total_bytes,
+      stats.disk_dind_inodes, stats.disk_dind_total_inodes], [10, 100, 2, 20]);
+    assert.ok(!("latestDindSample" in stats), "sample stays internal");
+    for (const next of ["missing", "throw"]) {
+      mode = next;
+      const current = c.collect()!;
+      assert.equal(c.latestDindSample, null);
+      for (const key of DIND_KEYS) assert.ok(!(key in current));
+    }
+    mode = "sample";
+    c.collect();
+    failCollect = true;
+    assert.equal(c.collect(), undefined);
+    assert.equal(c.latestDindSample, null);
+    assert.equal(reads, 4, "failed collect never reads the meter");
+  });
+
   it("attaches all four fields from a valid fresh sample", () => {
     const s = collectWith(meterFile(`v1 ${EPOCH} 4096 1000 250 500 100\n`));
     assert.strictEqual(s.disk_dind_bytes, 750 * 4096, "used = (blocks - bfree) * frsize");

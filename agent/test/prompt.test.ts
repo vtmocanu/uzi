@@ -38,6 +38,33 @@ import type {
   RunKind,
 } from "../src/protocol.js";
 
+describe("Docker scratch resume prompts", () => {
+  const note = "Docker containers and volumes from before the pause may be gone. Recreate your Docker fixtures before relying on them.";
+  const base = { branch: "b", subagentNames: ["coder"], first: true, iteration: 1 };
+
+  it("omits the note for absent and false flags", () => {
+    const fresh = buildImplementPrompt(base);
+    assert.ok(!fresh.includes(note));
+    assert.equal(buildImplementPrompt({ ...base, dockerScratchResume: false }), fresh);
+  });
+
+  it("includes the note once on the first cold resume turn", () => {
+    const prompt = buildImplementPrompt({ ...base, resumed: false, dockerScratchResume: true });
+    assert.equal(prompt.split(note).length - 1, 1);
+    assert.ok(!prompt.includes("rebuilt at the start"));
+  });
+
+  it("omits the note on later SDK implement turns", () => {
+    const prompt = buildImplementPrompt({ ...base, first: false, iteration: 2, dockerScratchResume: true });
+    assert.ok(!prompt.includes(note));
+  });
+
+  it("includes the note when WIP was recovered", () => {
+    const prompt = buildImplementPrompt({ ...base, resumed: true, wipRecovered: true, dockerScratchResume: true });
+    assert.equal(prompt.split(note).length - 1, 1);
+  });
+});
+
 // Untrusted-content discipline (both auditors): issue_title/issue_description and
 // a user follow_up are attacker-influenceable. They must be delimited as data and
 // framed as untrusted input, never concatenated as instructions.

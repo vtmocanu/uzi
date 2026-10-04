@@ -9067,6 +9067,8 @@ export class RunRunner {
       // a dropped-session resume still had its tree destroyed. Same discriminator the
       // reseed feed-status uses (this.emit "starting from the default branch" above).
       resumed: claim.session_id != null,
+      dockerScratchResume: this.dockerHost !== undefined &&
+        (claim.session_id != null || (claim.claim_generation ?? 0) > 1),
       // PRD #35 Decision 6b + PRD #209 D4. The RUNNER is the only layer that knows
       // all the facts, which is why it resolves them here rather than the executor
       // reading the claim: the server said the plan is approved, and EITHER a session

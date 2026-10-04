@@ -863,6 +863,13 @@ function priorWorkNote(prior: PriorWork | undefined): string {
 // above — uzi's own statement of fact about the clone. It does not restate the base commit:
 // baseCommitNote renders that immediately after, in the same first-turn block.
 
+/** Docker scratch is transient across pauses, independent of session and working-tree recovery. */
+export function dockerScratchResumeNote(dockerScratchResume: boolean | undefined): string {
+  return dockerScratchResume
+    ? "Docker containers and volumes from before the pause may be gone. Recreate your Docker fixtures before relying on them."
+    : "";
+}
+
 /** The reseed warning: the working tree was rebuilt on this resume, so local-only prior
  *  work is gone and a later correction may reference work that is no longer here. Renders
  *  only when `resumed` is true; a fresh run (no prior tree to lose) adds nothing.
@@ -1454,6 +1461,8 @@ export interface ImplementPromptInput {
    *  against the destroyed tree cannot be acted on as if that work is still present.
    *  Absent/false ⇒ no note (a fresh run had no prior tree to lose). See reseedNote. */
   resumed?: boolean;
+  /** First implement turn: warn that a Docker-wired resumed attempt must recreate fixtures. */
+  dockerScratchResume?: boolean;
   /** PRD #759 M2/R1: the reseed recovered an uncommitted WIP snapshot (a wip(park): marker
    *  reset --soft back to the tree at adopt time), so the working tree carries UNCOMMITTED
    *  mid-edit changes. FIRST TURN ONLY, like reseedNote. Drives the wip-recovery note so a
@@ -1670,6 +1679,8 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
   if (wipNote) lines.push("", wipNote);
   const reseed = input.first ? reseedNote(input.resumed, input.wipRecovered) : "";
   if (reseed) lines.push("", reseed);
+  const dockerResume = input.first ? dockerScratchResumeNote(input.dockerScratchResume) : "";
+  if (dockerResume) lines.push("", dockerResume);
   // The base commit, first turn only — this is the phase where the lead delegates a
   // "review the diff" task to a subagent, which is where the wrong diff spec was observed.
   const baseNote = input.first
