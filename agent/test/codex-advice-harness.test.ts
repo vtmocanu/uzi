@@ -426,6 +426,22 @@ describe("CodexAdviceHarness: kind + a text advice pass", () => {
     );
   });
 
+  it("#1566 appends async question text to advice without a delivery filter", async () => {
+    const bits = makeHarness();
+    bits.transport.push(threadStarted()).push({
+      kind: "activity", method: "item/completed",
+      params: { threadId: "th-1", item: { type: "agentMessage", text: "Choose validation",
+        delivery: "async", questions: [{ title: "Which validation?", options: ["Focused", "Defer"] }] } },
+    }).push(agentMessage('{"verdict":"approve"}')).push(turnCompleted("completed")).end();
+    const result = await bits.harness.run(makeAdviceRequest(), noThrowPolicy);
+    assert.equal(result.text, 'Choose validation{"verdict":"approve"}');
+    // Characterize contamination, not a filter fix: structured-verdict validation may fail.
+    assert.throws(() => JSON.parse(result.text));
+    assert.equal(result.end.kind, "terminal");
+    assert.deepEqual(bits.transport.responses, []);
+    assert.equal(bits.disposeCalls(), 1);
+  });
+
   it("accumulates assistant text and returns the terminal with turn-basis usage", async () => {
     const bits = makeHarness();
     bits.transport
@@ -569,8 +585,8 @@ describe("CodexAdviceHarness: policy timing", () => {
   });
 });
 
-describe("CodexAdviceHarness: the tool-less advice ceiling (by construction)", () => {
-  it("offers NO tool surface: a server→client request is refused fail-closed and runs nothing", async () => {
+describe("CodexAdviceHarness: the advice ceiling without worker callbacks", () => {
+  it("offers NO worker tool surface: a server→client request is refused fail-closed and runs nothing", async () => {
     const bits = makeHarness();
     bits.transport
       .push(threadStarted())
@@ -584,13 +600,28 @@ describe("CodexAdviceHarness: the tool-less advice ceiling (by construction)", (
     assert.equal(bits.transport.responses.length, 1);
     const reply = bits.transport.responses[0]!;
     assert.equal(reply.requestId, 7);
-    const response = reply.response as { error?: { code?: number } };
+    const response = reply.response as { error?: { code?: number; message?: string } };
     assert.ok(response.error, "the tool call was refused, never executed");
     assert.equal(response.error.code, -32601);
+    assert.equal(response.error.message, "codex advice is tool-less");
     assert.equal(result.end.kind, "terminal");
   });
 
-  it("thread/start pins untrusted project + doc_max 0, disables native tools/agents/MCP, and never a hook-trust bypass", async () => {
+  it("#1566 refuses currentTime/read with the existing advice error", async () => {
+    const bits = makeHarness();
+    bits.transport.push(threadStarted()).push({
+      kind: "activity", method: "currentTime/read", requestId: 18,
+      params: { threadId: "th-1" },
+    }).push(turnCompleted("completed")).end();
+    const result = await bits.harness.run(makeAdviceRequest(), noThrowPolicy);
+    assert.deepEqual(bits.transport.responses, [{
+      requestId: 18,
+      response: { error: { code: -32601, message: "codex advice is tool-less" } },
+    }]);
+    assert.equal(result.end.kind, "terminal");
+  });
+
+  it("thread/start pins untrusted project + doc_max 0, disables effectful native tools/agents/MCP, and never a hook-trust bypass", async () => {
     const bits = makeHarness({ cwd: "/isolated/advice/proj" });
     bits.transport.push(threadStarted()).push(turnCompleted("completed")).end();
     await bits.harness.run(makeAdviceRequest(), noThrowPolicy);

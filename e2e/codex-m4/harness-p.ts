@@ -19,13 +19,15 @@
 import { EventEmitter } from "node:events";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
+import { probeCodexRuntime } from "../../agent/src/codex/codex-runtime-probe.js";
+import type { CodexNotification } from "../../agent/src/codex/transport.js";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 
-import { deadline } from "../codex-m0/harness.mjs";
+import { deadline, message } from "../codex-m0/harness.mjs";
 import { FakeProvider, type ResponseItem, type ResponsesBody } from "./fake-provider.js";
-import { resolveCodexBin } from "./provision.js";
+import { resolveCodexBin, parseLock, resolveArch, assertBinaryVersion } from "./provision.js";
 import { buildProviderLaunchPlan } from "./provider-launch-plan.js";
 import {
   loadPackagedLauncher,
@@ -122,6 +124,8 @@ export interface ProtocolObservation {
   readonly elapsedMs: number;
   /** How the pinned binary was resolved (image-baked / cache-install). */
   readonly binSource: string;
+  readonly binaryEvidence: { path: string; version: string; archiveDigest: string; receipt: string; integrity: true };
+  readonly notes: readonly CodexNotification[];
 }
 
 /** Inputs to one driven turn. Only the policy-relevant knobs; the launch plumbing is fixed. */
@@ -156,6 +160,8 @@ export interface ProtocolTurnOptions {
    *  (a nested `exec` cell's worker callback then reaches the broker); `false`/absent keeps it
    *  disabled (the same exec cell fails with "code-mode host is disabled" and no callback fires). */
   readonly codeModeHost?: boolean;
+  /** #1566: worker-created child, saved-root resume, or isolated advice protocol posture. */
+  readonly lifecycle?: "start" | "resume" | "child" | "advice";
   /** How long to wait for the single turn to complete (default 60s). */
   readonly turnDeadlineMs?: number;
 }
@@ -285,12 +291,24 @@ function advertisedToolsOf(requests: readonly ResponsesBody[]): Record<string, u
 export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnOptions): Promise<ProtocolObservation> {
   const startedAt = Date.now();
   const resolved = resolveCodexBin();
+  const lock = parseLock(readFileSync(path.resolve(__dirname, "../../agent/codex/codex-package.lock"), "utf8"));
+  const arch = resolveArch(process.arch);
+  const prefix = path.dirname(resolved.prefix);
+  const integrity = await probeCodexRuntime({ prefix, expectedVersion: lock.version, arch, expectedLockDigest: lock.sha256[arch] });
+  if (!integrity.capable) throw new Error(`Codex integrity prerequisite failed: ${integrity.reason}`);
+  assertBinaryVersion(resolved.codexBin, lock.version);
+  const binaryEvidence = { path: resolved.codexBin, version: `codex-cli ${lock.version}`, archiveDigest: lock.sha256[arch],
+    receipt: path.join(prefix, `${lock.version}.receipt.json`), integrity: true as const };
   const runnerUid = process.getuid?.() ?? 10001;
   const model = opts.model ?? "gpt-6-astra";
   const origin = opts.origin ?? "root";
 
-  const provider = await FakeProvider.start({ credential: opts.credential, respond: opts.respond });
-  const base = realpathSync(mkdtempSync(path.join(tmpdir(), "codex-m4-p-")));
+  let priming = opts.lifecycle === "resume";
+  const provider = await FakeProvider.start({ credential: opts.credential,
+    respond: (body, p) => priming ? [message("saved root control") as ResponseItem] : opts.respond(body, p) });
+  const scratch = path.resolve(__dirname, "../../.uzi/scratch");
+  mkdirSync(scratch, { recursive: true });
+  const base = realpathSync(mkdtempSync(path.join(scratch, "codex-m4-p-")));
   const ownedDataRoot = path.join(base, "root");
   const cwd = path.join(base, "cwd");
   mkdirSync(cwd, { recursive: true, mode: 0o700 });
@@ -311,6 +329,7 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
 
   const envSink: { env?: NodeJS.ProcessEnv } = {};
   const callbacks: ObservedCallback[] = [];
+  const rawNotes: CodexNotification[] = [];
   let handle: Awaited<ReturnType<ProtocolModules["launchCodexRoot"]>> | undefined;
   let transport: ReturnType<ProtocolModules["createCodexTransport"]> | undefined;
 
@@ -343,26 +362,36 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
     let threadId: string | undefined;
     let turnId: string | undefined;
     let turnStatus: string | undefined;
+    let primeFinished!: () => void;
+    const primeCompletion = new Promise<void>(resolve => { primeFinished = resolve; });
     const notes = transport.notifications();
     const consume = (async (): Promise<void> => {
       for await (const note of notes) {
+        rawNotes.push(note);
         if (note.kind === "turn_completed" && note.threadId === threadId && note.turnId === turnId) {
+          if (priming) { primeFinished(); continue; }
           turnStatus = note.status;
           return;
         }
         if (note.kind === "activity" && note.requestId !== undefined && note.method === "item/tool/call") {
           const p = (note.params ?? {}) as Record<string, unknown>;
           const rt = { threadId: String(p.threadId), turnId: String(p.turnId), callId: String(p.callId) };
+          if (opts.lifecycle === "advice") {
+            transport!.respond(note.requestId, { error: { code: -32601, message: "codex advice is tool-less" } });
+            continue;
+          }
           const result = await broker.handleToolCall(rt, p.tool, p.arguments, origin);
           callbacks.push({ tool: String(p.tool), callId: rt.callId, result });
           const text = result.ok ? JSON.stringify(result.output) : result.message;
           transport!.respond(note.requestId, { result: { success: result.ok, contentItems: [{ type: "inputText", text }] } });
+        } else if (note.kind === "activity" && note.requestId !== undefined) {
+          transport!.respond(note.requestId, { error: { code: -32601, message: opts.lifecycle === "advice" ? "codex advice is tool-less" : "unsupported request" } });
         }
       }
     })();
     void consume.catch(() => undefined);
 
-    const threadRes = await transport.request<{ thread?: { id?: string } }>("thread/start", {
+    const threadParams = {
       model,
       modelProvider: mods.CODEX_M3B_LOOPBACK_PROVIDER_NAME,
       cwd,
@@ -371,12 +400,31 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       sandbox: "danger-full-access",
       ephemeral: false,
       environments: [],
-      dynamicTools: mods.buildCodexDynamicTools(opts.grants),
+      dynamicTools: opts.lifecycle === "advice" ? [] : mods.buildCodexDynamicTools(opts.grants),
       config: { project_doc_max_bytes: 0, projects: { [cwd]: { trust_level: "untrusted" } } },
       developerInstructions: "M4 C3 P developer instructions",
-    });
+    };
+    if (opts.lifecycle === "child") {
+      // A separate worker-created thread, never Codex's upstream spawn_agent.
+      await transport.request("thread/start", threadParams);
+    }
+    const threadRes = await transport.request<{ thread?: { id?: string } }>("thread/start", threadParams);
     threadId = threadRes.thread?.id;
     if (threadId === undefined) throw new Error("thread/start returned no thread id");
+
+    if (opts.lifecycle === "resume") {
+      const prime = await transport.request<{ turn?: { id?: string } }>("turn/start", {
+        threadId, model, environments: [], input: [{ type: "text", text: "save root before resume" }],
+      });
+      turnId = prime.turn?.id;
+      await deadline(primeCompletion, "saved root completion", opts.turnDeadlineMs ?? 60_000);
+      priming = false;
+      const resumed = await transport.request<{ thread?: { id?: string } }>("thread/resume", {
+        threadId, model, modelProvider: mods.CODEX_M3B_LOOPBACK_PROVIDER_NAME, cwd,
+        approvalPolicy: "never", config: threadParams.config, developerInstructions: threadParams.developerInstructions,
+      });
+      if (resumed.thread?.id !== threadId) throw new Error("resume did not retain the saved root");
+    }
 
     const turnRes = await transport.request<{ turn?: { id?: string } }>("turn/start", {
       threadId,
@@ -399,6 +447,8 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       providerErrors: [...provider.errors],
       elapsedMs: Date.now() - startedAt,
       binSource: resolved.source,
+      binaryEvidence,
+      notes: rawNotes,
     };
   } finally {
     try {

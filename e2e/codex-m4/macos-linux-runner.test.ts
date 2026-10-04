@@ -128,8 +128,9 @@ describe("buildMacosLinuxRunPlan argv invariants", () => {
     assert.ok(!plan.execute.some((a) => a.includes(":/home/")), "execute mounts no HOME");
   });
 
-  it("execute runs the complete strict P suite (all three P files)", () => {
-    for (const f of ["startup-smoke.test.ts", "policy-real.test.ts", "native-bypass.test.ts"]) {
+  it("execute includes the native-exception characterization in the strict P suite", () => {
+    assert.ok(plan.execute.includes("/work/.uzi/scratch:uid=1000,gid=1000,mode=0700"));
+    for (const f of ["startup-smoke.test.ts", "policy-real.test.ts", "native-bypass.test.ts", "native-exceptions.test.ts"]) {
       assert.ok(
         plan.execute.includes(`../e2e/codex-m4/${f}`),
         `execute runs ${f}`,

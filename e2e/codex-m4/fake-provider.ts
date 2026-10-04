@@ -236,11 +236,10 @@ export function nativeApplyPatchStep(callId: string, filename = "native-marker")
   };
 }
 
-/** Representative NATIVE Codex tool identities that must NEVER be advertised to the model on the
- *  production native-disabled path (config.ts turns shell/exec/unified_exec/apply_patch_freeform/
- *  code_mode/view_image/web_search/… off). A dynamic WORKER tool is `uzi_*` / a recognized
- *  callback name — deliberately distinct from every entry here, so an allowed worker callback is
- *  never mistaken for native execution. */
+/** Historical representative deny probes, NOT an exhaustive native inventory. In particular
+ *  exec/wait are authority-free code-host plumbing when enabled; request_user_input_async and
+ *  clock.curr_time are characterized exceptions (#1566). Inspect namespace tools in additional_tools
+ *  and the nested exec declarations as well as the top-level tools array. */
 export const CODEX_NATIVE_TOOL_NAMES: readonly string[] = [
   "shell",
   "shell_command",

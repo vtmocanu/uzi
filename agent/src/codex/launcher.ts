@@ -701,7 +701,7 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   const trees = deriveOwnedTrees(spec.ownedDataRoot);
   const configPath = join(trees.codexHome, "config.toml");
   const sessionSeedDir = join(`${spec.ownedDataRoot}.session-seed`, "sessions");
-  // 4. config.toml (native-off; canonical project untrusted), written 0600 as runner. An
+  // 4. config.toml (native effectful surfaces off, #1566 async/UTC exceptions; canonical project untrusted), written 0600 as runner. An
   //    app-server-auth provider root emits the PRODUCTION config (the built-in `openai`
   //    provider, no re-declared table that would bypass the login). The explicit M3b-only
   //    dependency instead emits its authenticated HTTP loopback provider. Every other root
