@@ -166,7 +166,8 @@ export type DockerExec = (
 
 export const execDocker: DockerExec = (argv, opts) =>
   new Promise((resolve, reject) => {
-    execFile(
+    let result: { err: Error | null; stdout: string } | undefined;
+    const child = execFile(
       opts.file,
       [...argv],
       {
@@ -176,8 +177,15 @@ export const execDocker: DockerExec = (argv, opts) =>
         maxBuffer: MAX_STDOUT_BYTES,
         ...(opts.signal ? { signal: opts.signal } : {}),
       },
-      (err, stdout) => (err ? reject(err) : resolve(String(stdout))),
+      (err, stdout) => { result = { err, stdout: String(stdout) }; },
     );
+    // execFile can call back on AbortSignal before the child exits. The close event
+    // confirms termination and closed stdio before controllers release their claims.
+    child.once("close", () => {
+      if (!result) return; // Unconfirmed completion must keep claims fenced.
+      if (result.err) reject(result.err);
+      else resolve(result.stdout);
+    });
   });
 
 /**

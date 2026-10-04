@@ -117,7 +117,9 @@ describe("Worker server-fenced DinD maintenance", () => {
   it("advertises only when wired and binds each registration to nonce and negotiation", async (t) => {
     const h = build(t);
     await h.loops.registerWithRetry(new AbortController().signal);
-    assert.ok(h.registrations[0][4]?.includes("dind_maintenance_v1"));
+    const registration = h.registrations[0];
+    assert.ok(registration);
+    assert.ok(registration[4]?.includes("dind_maintenance_v1"));
     await h.heartbeat();
     await h.fresh();
     await h.maintenance.tick();
@@ -140,7 +142,9 @@ describe("Worker server-fenced DinD maintenance", () => {
     assert.equal(h.maintenance.acknowledgement(), undefined);
     const plain = build(t, false);
     await plain.loops.registerWithRetry(new AbortController().signal);
-    assert.equal(plain.registrations[0][4]?.includes("dind_maintenance_v1"), false);
+    const plainRegistration = plain.registrations[0];
+    assert.ok(plainRegistration);
+    assert.equal(plainRegistration[4]?.includes("dind_maintenance_v1"), false);
   });
 
   it("passes exact meter and ACK in argument four and stamps custody before collecting", async (t) => {

@@ -1,8 +1,10 @@
-import { after, describe, it } from "node:test";
+import { after, describe, it, type TestContext } from "node:test";
+import childProcess, { type ExecFileOptionsWithStringEncoding, type ExecFileException } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import assert from "node:assert/strict";
 import { statSync, readdirSync, rmSync } from "node:fs";
 import { DindMaintenanceController } from "../src/dind-maintenance.js";
-import { DindPruneController, DindPruneGate, assertDockerArgvAllowed, type DockerExec } from "../src/dind-prune.js";
+import { DindPruneController, DindPruneGate, assertDockerArgvAllowed, execDocker, type DockerExec } from "../src/dind-prune.js";
 import type { DindMaintenance } from "../src/protocol.js";
 import type { DindMeterSample } from "../src/dind-meter.js";
 import { recordingLogger } from "./helpers.js";
@@ -57,7 +59,113 @@ function harness() {
     advance: (ms: number) => { time += ms; }, observe };
 }
 
+// Capture only children launched by this test, delegating to Node's real transport.
+function ownedExec(t: TestContext) {
+  const original = childProcess.execFile;
+  let child: ReturnType<typeof original> | undefined;
+  let closed = false;
+  let abortCallbackBeforeClose = false;
+  let started!: () => void;
+  let close!: () => void;
+  const spawned = new Promise<void>((resolve) => { started = resolve; });
+  const closure = new Promise<void>((resolve) => { close = resolve; });
+  const spy = t.mock.method(childProcess, "execFile", (
+    file: string, argv: string[], opts: ExecFileOptionsWithStringEncoding,
+    callback: (err: ExecFileException | null, stdout: string, stderr: string) => void,
+  ) => {
+    assert.equal(child, undefined, "each test owns exactly one child");
+    child = original(file, argv, opts, (err, stdout, stderr) => {
+      if (err?.name === "AbortError") abortCallbackBeforeClose = !closed;
+      callback(err, stdout, stderr);
+    });
+    child.once("spawn", started);
+    child.once("close", () => { closed = true; close(); });
+    return child;
+  });
+  syncBuiltinESMExports();
+  return {
+    spawned, closure, closed: () => closed,
+    abortCallbackBeforeClose: () => abortCallbackBeforeClose,
+    async cleanup() {
+      try {
+        if (child) {
+          if (!closed) child.kill("SIGKILL");
+          await closure;
+        }
+      } finally {
+        spy.mock.restore();
+        syncBuiltinESMExports();
+      }
+    },
+  };
+}
+
+const INERT_CHILD_ARGV = ["-e", "setInterval(() => {}, 1000)"];
+
 describe("server-fenced maintenance", () => {
+  for (const command of ["version", "prune"]) {
+    it(`real abort during ${command} holds claims and tick until owned child close`, async (t) => {
+      const owned = ownedExec(t);
+      const h = harness();
+      let helperClosed: boolean | undefined;
+      h.state.exec = (argv, opts) => {
+        if (command === "prune" && argv[0] === "version") return Promise.resolve("1.42");
+        return execDocker(INERT_CHILD_ARGV, { ...opts, file: process.execPath, timeoutMs: 2000 })
+          .catch((err: unknown) => { helperClosed = owned.closed(); throw err; });
+      };
+      let tickClosed: boolean | undefined;
+      const work = h.ctl.tick().then(() => { tickClosed = owned.closed(); });
+      try {
+        await owned.spawned;
+        h.observe({ ...operation, phase: "cancelled" });
+        assert.equal(owned.closed(), false);
+        assert.equal(h.gate.tryEnterClaim(), false);
+        assert.equal(h.ctl.acknowledgement(), undefined);
+        await work;
+        assert.equal(owned.abortCallbackBeforeClose(), true, "exercise Node's early abort callback");
+        assert.equal(helperClosed, true, "helper must reject only after child close");
+        assert.equal(tickClosed, true, "maintenance must finish only after child close");
+        assert.equal(h.gate.claimsClosed(), false);
+      } finally {
+        await owned.cleanup();
+        await work;
+      }
+    });
+  }
+
+  it("real short command timeout closes owned child before rejection and permits fresh ready ACK", async (t) => {
+    const owned = ownedExec(t);
+    const h = harness();
+    let helperClosed: boolean | undefined;
+    let failure: unknown;
+    h.state.exec = (argv, opts) => {
+      if (argv[0] === "version") return Promise.resolve("1.42");
+      return execDocker(INERT_CHILD_ARGV, { ...opts, file: process.execPath, timeoutMs: 25 })
+        .catch((err: unknown) => {
+          helperClosed = owned.closed();
+          failure = err;
+          throw err;
+        });
+    };
+    const start = performance.now();
+    const work = h.ctl.tick();
+    try {
+      await work;
+      assert.equal(helperClosed, true, "timeout rejection must follow child close");
+      assert.ok(failure instanceof Error);
+      assert.equal((failure as ExecFileException).signal, "SIGKILL");
+      assert.ok(performance.now() - start < 2000, "short timeout must return within two seconds");
+      h.advance(1);
+      h.observe();
+      assert.equal(h.ctl.acknowledgement()?.phase, "ready");
+      assert.equal(h.ctl.acknowledgement()?.pruned, false);
+      assert.equal(h.gate.claimsClosed(), true);
+    } finally {
+      await owned.cleanup();
+      await work;
+    }
+  });
+
   it("requested drain allows resumes; ready fences every local claim lane", async () => {
     const h = harness();
     h.observe({ ...operation, phase: "cancelled" });
@@ -208,7 +316,7 @@ describe("server-fenced maintenance", () => {
     }
   });
 
-  for (const failure of ["version", "prune", "timeout"]) {
+  for (const failure of ["version", "prune"]) {
     it(`optional ${failure} failure still permits fresh ready ACK`, async () => {
       const h = harness();
       h.state.exec = async (argv) => {
