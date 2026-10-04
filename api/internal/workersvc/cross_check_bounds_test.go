@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -34,7 +35,7 @@ func TestCheckerContextPayloadBounds(t *testing.T) {
 		{"title", 4096, true}, {"body", 262144, false},
 	} {
 		for _, extra := range []int{0, 1} {
-			t.Run(tc.name+string(rune('0'+extra)), func(t *testing.T) {
+			t.Run(tc.name+strconv.Itoa(extra), func(t *testing.T) {
 				p := boundedCheckerFixture(t)
 				value := strings.Repeat("é", tc.cap/2) + strings.Repeat("x", extra)
 				if tc.title {

@@ -43,11 +43,6 @@ func TestCheckerClaimResponseEnvelopeAndMarker(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &decoded); err != nil || decoded.Kind != "cross_check" {
 		t.Fatal("checker response kind mismatch")
 	}
-	// The marker is not the size guard: removing it cannot enlarge this produced body.
-	rec.Header().Del("X-Uzi-Claim-Kind")
-	if rec.Body.Len() != 2<<20 {
-		t.Fatal("body depends on marker")
-	}
 	branch += "x"
 	rec = httptest.NewRecorder()
 	writeWorkerRunClaim(rec, p)

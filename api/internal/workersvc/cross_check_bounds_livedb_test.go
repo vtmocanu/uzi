@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -29,7 +30,7 @@ func TestCheckerSubmitContextBoundsLiveDB(t *testing.T) {
 		{"title", 4096, true}, {"body", 262144, false},
 	} {
 		for _, extra := range []int{0, 1} {
-			t.Run(tc.name+string(rune('0'+extra)), func(t *testing.T) {
+			t.Run(tc.name+strconv.Itoa(extra), func(t *testing.T) {
 				id := uuid.New()
 				title, body := "title", "body"
 				value := strings.Repeat("é", tc.cap/2) + strings.Repeat("x", extra)
@@ -147,7 +148,7 @@ func TestCheckerStoredAssemblyContextBoundsLiveDB(t *testing.T) {
 		title bool
 	}{{"title", 4096, true}, {"body", 262144, false}} {
 		for _, extra := range []int{0, 1} {
-			t.Run(tc.name+string(rune('0'+extra)), func(t *testing.T) {
+			t.Run(tc.name+strconv.Itoa(extra), func(t *testing.T) {
 				title, body := "title", "body"
 				value := strings.Repeat("é", tc.cap/2) + strings.Repeat("x", extra)
 				if tc.title {
