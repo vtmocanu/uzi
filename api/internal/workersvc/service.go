@@ -3852,7 +3852,7 @@ func (s *Service) terminalMessageFence(ctx context.Context, q Store, runID uuid.
 // "already terminal" as success and learns it was cancelled), per the M2 wire
 // contract.
 func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest) (run store.Run, applied bool, err error) {
-	return s.setState(ctx, wkr, runID, req, nil)
+	return s.setState(ctx, wkr, runID, req, nil, nil)
 }
 
 // SetStateReport is SetState plus the plan-gate revision (PRD #1795 M1) an applied
@@ -3861,11 +3861,11 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 // commit. 0 when the report allocated nothing (every other state, a declined report, a chat or
 // judge run, or a refusal).
 func (s *Service) SetStateReport(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest) (run store.Run, applied bool, gateRevision int64, err error) {
-	run, applied, err = s.setState(ctx, wkr, runID, req, &gateRevision)
+	run, applied, err = s.setState(ctx, wkr, runID, req, &gateRevision, nil)
 	return run, applied, gateRevision, err
 }
 
-func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, gateRevisionOut *int64) (run store.Run, applied bool, err error) {
+func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, gateRevisionOut *int64, reconciliationOut **LeadReconciliation) (run store.Run, applied bool, err error) {
 	// PRD #1392 M1: validate the TYPED recovery cause against the server enum BEFORE any state
 	// SQL, so an unknown non-nil value is a loud 400 (ErrInvalidState) rather than a
 	// constraint violation at the park write. Absent (nil) is fine (an ordinary report or a
@@ -4000,6 +4000,10 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		if req.AdoptGateRevision != nil && *req.AdoptGateRevision <= 0 {
 			return store.Run{}, false, fmt.Errorf("%w: adopt_gate_revision must be positive", ErrInvalidState)
 		}
+	}
+	// Required reconciliation cannot infer authority from an unfenced report.
+	if reconciliationOut != nil && owned.PlanCrossCheckRequired && (req.State == "running" || req.State == "awaiting_approval") && req.ClaimGeneration == nil {
+		return owned, false, ErrClaimGenerationRequired
 	}
 	q := Store(s.q)
 	var fenceTx pgx.Tx
@@ -4694,6 +4698,20 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	if err != nil {
 		return store.Run{}, false, err
 	}
+	// Capture after state, trigger settlement, and presentation writes, while the
+	// owning lock is still held. Early returns, refusals and zero-row writes grant no proof.
+	var reconciliation *LeadReconciliation
+	if reconciliationOut != nil && owned.PlanCrossCheckRequired && rows > 0 && gateRefusal == nil &&
+		(req.State == "awaiting_approval" || req.State == "running") {
+		reader, ok := q.(reconciliationReader)
+		if fenceTx == nil || req.ClaimGeneration == nil || !ok {
+			return store.Run{}, false, ErrCrossCheckRefused
+		}
+		reconciliation, err = captureLeadReconciliation(ctx, reader, wkr, runID, *req.ClaimGeneration)
+		if err != nil {
+			return store.Run{}, false, err
+		}
+	}
 	// PRD #1247 M5 (D3): the fenced transition applied — COMMIT it, releasing the FOR UPDATE
 	// lock, BEFORE the post-transition automation below. That automation runs on s.q (a
 	// separate pool connection) and re-reads the run, so it must not run while this tx holds
@@ -4713,6 +4731,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			return store.Run{}, false, cerr
 		}
 		fenceTx = nil
+	}
+	if reconciliationOut != nil {
+		*reconciliationOut = reconciliation
 	}
 	// issue #329: record the MR the worker opened INDEPENDENT of the terminal status
 	// the switch above wrote. If SetRunCompleted applied, ReconcileRunMR is a COALESCE

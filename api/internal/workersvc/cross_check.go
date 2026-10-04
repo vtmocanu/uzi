@@ -214,6 +214,10 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 }
 
 func (s *Service) PlanCrossCheckStatus(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64, round int32) (store.CrossCheck, int32, error) {
+	return s.planCrossCheckStatus(ctx, worker, leadID, generation, round, nil)
+}
+
+func (s *Service) planCrossCheckStatus(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64, round int32, result *PlanCrossCheckStatusResult) (store.CrossCheck, int32, error) {
 	if round != 1 || s.txBeginner == nil {
 		return store.CrossCheck{}, 0, ErrCrossCheckRefused
 	}
@@ -233,8 +237,34 @@ func (s *Service) PlanCrossCheckStatus(ctx context.Context, worker store.Worker,
 		return store.CrossCheck{}, 0, err
 	}
 	if lead.UserID != worker.UserID || !lead.PlanCrossCheckRequired || lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid ||
-		(lead.Status != "claimed" && lead.Status != "running") {
+		(lead.Status != "claimed" && lead.Status != "running" && lead.Status != "awaiting_approval") {
 		return store.CrossCheck{}, 0, ErrCrossCheckRefused
+	}
+	if lead.Status == "awaiting_approval" {
+		// Read only under the owning lead lock. No expiry, approval, or child write.
+		cc, readErr := q.GetPlanCrossCheck(ctx, leadID)
+		if readErr != nil && !errors.Is(readErr, pgx.ErrNoRows) {
+			return store.CrossCheck{}, 0, readErr
+		}
+		if readErr == nil && cc.LeadClaimGeneration != generation {
+			cc.Verdict = "failed"
+			cc.ReasonClass = pgtype.Text{String: "interrupted", Valid: true}
+		}
+		proof, err := captureLeadReconciliation(ctx, q, worker, leadID, generation)
+		if err != nil {
+			return store.CrossCheck{}, 0, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return store.CrossCheck{}, 0, err
+		}
+		if result != nil {
+			result.Parked = true
+			result.Reconciliation = proof
+		}
+		if errors.Is(readErr, pgx.ErrNoRows) {
+			return cc, proof.LeadLastSeq, ErrCrossCheckNoRow
+		}
+		return cc, proof.LeadLastSeq, nil
 	}
 	expired, err := q.ExpirePlanCrossCheck(ctx, store.ExpirePlanCrossCheckParams{
 		LeadRunID: leadID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation,
@@ -249,22 +279,36 @@ func (s *Service) PlanCrossCheckStatus(ctx context.Context, worker store.Worker,
 	cc, err := q.GetOwnedPlanCrossCheck(ctx, store.GetOwnedPlanCrossCheckParams{
 		LeadRunID: leadID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation, Round: round,
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	noRow := errors.Is(err, pgx.ErrNoRows)
+	if noRow && result == nil {
 		return cc, lead.LastSeq, ErrCrossCheckNoRow
 	}
-	if err != nil {
+	if err != nil && !noRow {
 		return cc, 0, err
 	}
-	if cc.LeadClaimGeneration != generation {
+	if !noRow && cc.LeadClaimGeneration != generation {
 		// This response is historical human presentation, never an approval.
 		cc.Verdict = "failed"
 		cc.ReasonClass = pgtype.Text{String: "interrupted", Valid: true}
 	}
+	var proof *LeadReconciliation
+	if result != nil {
+		proof, err = captureLeadReconciliation(ctx, q, worker, leadID, generation)
+		if err != nil {
+			return store.CrossCheck{}, 0, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
-		return cc, 0, err
+		return store.CrossCheck{}, 0, err
+	}
+	if result != nil {
+		result.Reconciliation = proof
 	}
 	if eventPayload != nil && s.bcast != nil {
 		s.bcast.PublishMessage(lead.ID, lead.LastSeq, "cross_check", "", "", "", eventPayload, s.now())
+	}
+	if noRow {
+		return cc, lead.LastSeq, ErrCrossCheckNoRow
 	}
 	return cc, lead.LastSeq, nil
 }

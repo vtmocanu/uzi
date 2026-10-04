@@ -31,10 +31,13 @@ func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store,
 		return ErrInvalidState
 	}
 	if reason == "candidate_refused" || reason == "checker_failed" {
-		if !lead.PlanCrossCheckRequired || !lead.AutoApprove || lead.Harness != string(HarnessClaude) ||
+		// A lost ACK may replay the bounded declaration on its persisted human gate.
+		// Presentation classification still rejects historical IDs and changed payloads.
+		active := lead.AutoApprove && (lead.Status == "claimed" || lead.Status == "running")
+		retained := lead.Status == "awaiting_approval" && !lead.AutoApprove && lead.PlanCrossCheckGateReason.String == reason
+		if !lead.PlanCrossCheckRequired || (!active && !retained) || lead.Harness != string(HarnessClaude) ||
 			req.ClaimGeneration == nil || *req.ClaimGeneration != lead.ClaimGeneration ||
-			lead.ClaimReleasedAt.Valid || lead.WorkerID != pgconv.UUID(worker.ID) || lead.UserID != worker.UserID ||
-			(lead.Status != "claimed" && lead.Status != "running") {
+			lead.ClaimReleasedAt.Valid || lead.WorkerID != pgconv.UUID(worker.ID) || lead.UserID != worker.UserID {
 			return ErrInvalidState
 		}
 		switch reason {

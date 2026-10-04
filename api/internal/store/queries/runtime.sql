@@ -2030,7 +2030,12 @@ UPDATE runs SET
             THEN 'interrupted'
         WHEN EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan'
                      AND cc.lead_claim_generation = runs.claim_generation AND cc.verdict <> 'pending')
-            THEN (SELECT CASE WHEN cc.verdict = 'approve' THEN NULL ELSE COALESCE(cc.reason_class, cc.verdict) END
+            -- An approval racing a refused workflow does not erase its forced human gate.
+            -- The service validates this declaration; it grants no implementation authority.
+            THEN (SELECT CASE WHEN cc.verdict = 'approve'
+                         THEN COALESCE(sqlc.narg('plan_cross_check_gate_reason')::text,
+                             CASE WHEN runs.plan_md IS NOT DISTINCT FROM @plan_md THEN runs.plan_cross_check_gate_reason END)
+                         ELSE COALESCE(cc.reason_class, cc.verdict) END
                   FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan' AND cc.round = 1)
         WHEN NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan')
             THEN CASE WHEN runs.claim_generation > 1 OR runs.plan_cross_check_gate_reason = 'interrupted'

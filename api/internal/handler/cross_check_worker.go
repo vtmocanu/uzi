@@ -93,12 +93,8 @@ func (h *Handler) WorkerSubmitPlanCrossCheck(w http.ResponseWriter, r *http.Requ
 		crossCheckError(w, err)
 		return
 	}
-	cc, seq, err := h.wsvc.PlanCrossCheckStatus(r.Context(), worker, id, *req.ClaimGeneration, cc.Round)
-	if err != nil {
-		crossCheckError(w, err)
-		return
-	}
-	httpx.JSON(w, http.StatusOK, crossCheckResponse(cc, seq))
+	status, err := h.wsvc.PlanCrossCheckStatusWithReconciliation(r.Context(), worker, id, *req.ClaimGeneration, cc.Round)
+	writeCrossCheckStatus(w, status, err)
 
 }
 
@@ -118,16 +114,31 @@ func (h *Handler) WorkerPlanCrossCheckStatus(w http.ResponseWriter, r *http.Requ
 		httpx.Error(w, http.StatusBadRequest, "invalid cross-check status request")
 		return
 	}
-	cc, leadLastSeq, err := h.wsvc.PlanCrossCheckStatus(r.Context(), worker, id, gen, int32(round))
+	status, err := h.wsvc.PlanCrossCheckStatusWithReconciliation(r.Context(), worker, id, gen, int32(round))
+	writeCrossCheckStatus(w, status, err)
+}
+
+func writeCrossCheckStatus(w http.ResponseWriter, status workersvc.PlanCrossCheckStatusResult, err error) {
+	if status.Parked && status.Reconciliation != nil && (err == nil || errors.Is(err, workersvc.ErrCrossCheckNoRow)) {
+		httpx.JSON(w, http.StatusOK, struct {
+			Result      string `json:"result"`
+			Verdict     string `json:"verdict"`
+			ReasonClass string `json:"reason_class"`
+			*workersvc.LeadReconciliation
+		}{"parked", status.Verdict, status.ReasonClass, status.Reconciliation})
+		return
+	}
 	if errors.Is(err, workersvc.ErrCrossCheckNoRow) {
-		httpx.JSON(w, http.StatusOK, planCrossCheckNoRowResponse{Result: "no_row", ReasonClass: "no_candidate", LeadLastSeq: leadLastSeq})
+		httpx.JSON(w, http.StatusOK, planCrossCheckNoRowResponse{Result: "no_row", ReasonClass: "no_candidate", leadReconciliationResponse: reconciliationResponse(status.LeadLastSeq, status.Reconciliation)})
 		return
 	}
 	if err != nil {
 		crossCheckError(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, crossCheckResponse(cc, leadLastSeq))
+	candidate := crossCheckResponse(status.CrossCheck, status.LeadLastSeq)
+	candidate.leadReconciliationResponse = reconciliationResponse(status.LeadLastSeq, status.Reconciliation)
+	httpx.JSON(w, http.StatusOK, candidate)
 
 }
 
@@ -165,10 +176,47 @@ func (h *Handler) WorkerCrossCheckVerdict(w http.ResponseWriter, r *http.Request
 	httpx.JSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
+// leadReconciliationResponse owns the cursor; the optional proof details exclude
+// that field so encoding/json cannot shadow it through anonymous embedding.
+type leadReconciliationResponse struct {
+	LeadLastSeq int32 `json:"lead_last_seq"`
+	*LeadReconciliationDetails
+}
+
+// LeadReconciliationDetails contains optional wire proof fields other than the cursor.
+type LeadReconciliationDetails struct {
+	ClaimGeneration       int64      `json:"claim_generation"`
+	PlanCrossCheckSettled bool       `json:"plan_cross_check_settled"`
+	GatePresentationID    *uuid.UUID `json:"gate_presentation_id,omitempty"`
+	GateRevision          int64      `json:"gate_revision"`
+	GatePayloadDigest     string     `json:"gate_payload_digest,omitempty"`
+	CurrentPlanSHA256     string     `json:"current_plan_sha256"`
+}
+
+func reconciliationResponse(seq int32, proof *workersvc.LeadReconciliation) leadReconciliationResponse {
+	response := leadReconciliationResponse{LeadLastSeq: seq}
+	if proof != nil {
+		response.LeadLastSeq = proof.LeadLastSeq
+		response.LeadReconciliationDetails = &LeadReconciliationDetails{
+			ClaimGeneration: proof.ClaimGeneration, PlanCrossCheckSettled: proof.PlanCrossCheckSettled,
+			GatePresentationID: proof.GatePresentationID, GateRevision: proof.GateRevision,
+			GatePayloadDigest: proof.GatePayloadDigest, CurrentPlanSHA256: proof.CurrentPlanSHA256,
+		}
+	}
+	return response
+}
+
+type workerReconciledStateAck struct {
+	Run              any `json:"run"`
+	CredentialSwitch any `json:"credential_switch,omitempty"`
+	Disposition      any `json:"disposition,omitempty"`
+	leadReconciliationResponse
+}
+
 type planCrossCheckNoRowResponse struct {
 	Result      string `json:"result"`
 	ReasonClass string `json:"reason_class"`
-	LeadLastSeq int32  `json:"lead_last_seq"`
+	leadReconciliationResponse
 }
 
 type planCrossCheckCandidateResponse struct {
@@ -182,7 +230,7 @@ type planCrossCheckCandidateResponse struct {
 	ReasonClass         string                            `json:"reason_class"`
 	Findings            json.RawMessage                   `json:"findings"`
 	DeadlineAt          time.Time                         `json:"deadline_at"`
-	LeadLastSeq         int32                             `json:"lead_last_seq"`
+	leadReconciliationResponse
 }
 
 // crossCheckResponse publishes the canonical stored candidate and server digest.
@@ -199,6 +247,6 @@ func crossCheckResponse(cc store.CrossCheck, lastSeq int32) planCrossCheckCandid
 			RequiredCapabilities: cc.RequiredCapabilities, RequiredTools: cc.RequiredTools, SizeClass: cc.SizeClass.String,
 			BaseCommit: cc.BaseCommit.String, PlanningDiff: cc.PlanningDiff.String},
 		Verdict: cc.Verdict, ReasonClass: cc.ReasonClass.String, Findings: json.RawMessage(cc.Findings),
-		DeadlineAt: cc.DeadlineAt.Time, LeadLastSeq: lastSeq,
+		DeadlineAt: cc.DeadlineAt.Time, leadReconciliationResponse: reconciliationResponse(lastSeq, nil),
 	}
 }

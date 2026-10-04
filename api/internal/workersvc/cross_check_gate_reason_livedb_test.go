@@ -26,6 +26,8 @@ func TestPlanCrossCheckGateReasonPersistedOutcomeLiveDB(t *testing.T) {
 		{"revise with repository requirement", "revise", "block", "revise", 1, 1, true},
 		{"block with repository requirement", "block", "revise", "block", 1, 1, true},
 		{"old generation approve", "approve", "", "interrupted", 1, 2, false},
+		{"current approve without refusal", "approve", "", "", 1, 1, false},
+		{"current approve with forced interruption", "approve", "interrupted", "interrupted", 1, 1, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := setupCodexLiveDB(t)
@@ -111,11 +113,13 @@ func TestPlanCrossCheckGateReasonPersistedOutcomeLiveDB(t *testing.T) {
 
 func TestPlanCrossCheckGateReasonNoRowDeclarationsLiveDB(t *testing.T) {
 	for _, tc := range []struct {
-		name, harness, reason, refusal string
-		stale, foreignOwner, invalid   bool
+		name, harness, reason, refusal          string
+		stale, foreignOwner, invalid, recovered bool
 	}{
 		{name: "Codex lead unsupported", harness: "codex", reason: "codex_lead_unsupported"},
-		{name: "interrupted recovered generation without a row", harness: "claude", reason: "interrupted"},
+		{name: "interrupted recovered generation without a row", harness: "claude", reason: "interrupted", recovered: true},
+		{name: "recovered Codex declaration stays interrupted", harness: "codex", reason: "codex_lead_unsupported", recovered: true},
+		{name: "recovered diff declaration stays interrupted", harness: "claude", reason: "planning_diff_refused", refusal: "diff_too_large", recovered: true},
 		{name: "owned bounded diff refusal", harness: "claude", reason: "planning_diff_refused", refusal: "diff_too_large"},
 		{name: "arbitrary reason", harness: "claude", reason: "made_up", invalid: true},
 		{name: "explicit empty reason", harness: "claude", reason: "", invalid: true},
@@ -131,15 +135,23 @@ func TestPlanCrossCheckGateReasonNoRowDeclarationsLiveDB(t *testing.T) {
 			env := setupCodexLiveDB(t)
 			userID, workerID, repoID := env.seedCodexInfra(t)
 			leadID := env.seedCodexRun(t, userID, workerID, repoID)
+			generation := int64(1)
+			if tc.recovered || tc.stale {
+				generation = 2
+			}
+			wantReason := tc.reason
+			if tc.recovered {
+				wantReason = "interrupted"
+			}
 			env.exec(`UPDATE runs SET status='running',harness=$2,auto_approve=true,
-				plan_source='agent',plan_cross_check_required=true,claim_generation=2 WHERE id=$1`, leadID, tc.harness)
+				plan_source='agent',plan_cross_check_required=true,claim_generation=$3 WHERE id=$1`, leadID, tc.harness, generation)
 			svc := New(env.q, env.box, testParams())
 			svc.SetTxBeginner(env.pool)
 			worker := store.Worker{ID: workerID, UserID: userID}
 			if tc.foreignOwner {
 				worker.ID = uuid.New()
 			}
-			gen := int64(2)
+			gen := generation
 			if tc.stale {
 				gen = 1
 			}
@@ -165,7 +177,7 @@ func TestPlanCrossCheckGateReasonNoRowDeclarationsLiveDB(t *testing.T) {
 						got.Status, got.PlanMd, got.PlanCrossCheckGateReason, got.AutoApprove)
 				}
 			} else if err != nil || !applied || got.Status != "awaiting_approval" || got.AutoApprove ||
-				got.PlanMd.String != plan || !got.PlanCrossCheckGateReason.Valid || got.PlanCrossCheckGateReason.String != tc.reason {
+				got.PlanMd.String != plan || !got.PlanCrossCheckGateReason.Valid || got.PlanCrossCheckGateReason.String != wantReason {
 				t.Fatalf("valid refusal not persisted: applied=%v err=%v status=%s reason=%+v",
 					applied, err, got.Status, got.PlanCrossCheckGateReason)
 			}
