@@ -3387,7 +3387,7 @@ export interface PlanCrossCheckSummary {
   round: number;
   verdict: string;
   reason_class: string | null;
-  findings: { summary: string; items: PlanCrossCheckFinding[] } | null;
+  findings: { summary: string; items: PlanCrossCheckFinding[] | null } | null;
   checker_run_id: string | null;
   checker_model: string | null;
   checker_effort: string | null;

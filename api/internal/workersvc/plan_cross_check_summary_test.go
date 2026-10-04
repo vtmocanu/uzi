@@ -92,6 +92,25 @@ func TestPlanCrossCheckSummaryAbsenceAndErrors(t *testing.T) {
 	}
 }
 
+// The writer accepts absent/null item arrays; the owner DTO preserves that wire
+// shape, so consumers must not assume a present findings object has an array.
+func TestPlanCrossCheckSummaryNullableItems(t *testing.T) {
+	for _, raw := range []string{`{"summary":"ok","items":null}`, `{"summary":"ok"}`} {
+		q := &summaryTestStore{row: store.GetLatestPlanCrossCheckSummaryRow{
+			Round: 1, Verdict: "approve", ReasonClass: pgtype.Text{String: "approve", Valid: true},
+			Findings: []byte(raw),
+		}}
+		got, err := (&Service{q: q}).PlanCrossCheckSummary(t.Context(), uuid.New(), uuid.New())
+		if err != nil || got == nil || got.Findings == nil || got.Findings.Items != nil {
+			t.Fatalf("nullable items: %+v %v", got, err)
+		}
+		emitted, err := json.Marshal(got)
+		if err != nil || !strings.Contains(string(emitted), `"findings":{"summary":"ok","items":null}`) {
+			t.Fatalf("nullable wire shape: %s %v", emitted, err)
+		}
+	}
+}
+
 func TestPlanCrossCheckSummaryUsage(t *testing.T) {
 	for _, tc := range []struct {
 		name, status string
