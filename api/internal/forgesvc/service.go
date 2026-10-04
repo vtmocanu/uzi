@@ -183,6 +183,9 @@ type Service struct {
 	groupCursors  map[uuid.UUID]store.FindingGroupCursor
 	forgeBuilder  ForgeBuilder
 
+	// findingGroupSince is the optional pending-warning age clock; nil uses time.Since.
+	findingGroupSince func(time.Time) time.Duration
+
 	// reworkCanceller aborts an in-flight mr_rework run when its MR leaves the opened
 	// state (issue #853). Optional (nil-safe): set via SetReworkCanceller, unset means
 	// the mid-flight abort is skipped — every other MR-sync behaviour is unaffected.
@@ -251,7 +254,11 @@ func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([
 		}
 		attrs := []any{"repo_id", repoID, "pending_group_operations", count}
 		if oldest != nil {
-			age := time.Since(*oldest)
+			since := s.findingGroupSince
+			if since == nil {
+				since = time.Since
+			}
+			age := since(*oldest)
 			if age < 0 {
 				age = 0
 			}

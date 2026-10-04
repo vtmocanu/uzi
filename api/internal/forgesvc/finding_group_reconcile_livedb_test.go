@@ -483,6 +483,9 @@ func (h *captureHandler) find(msg string, repo uuid.UUID) (slog.Record, bool) {
 
 func TestFindingGroupReconcileWarnCarriesPendingCountAndOldestAgeLiveDB(t *testing.T) {
 	e := newRCEnv(t)
+	// A fixed shared clock avoids PostgreSQL/Go skew in the pending-warning age.
+	fixedNow := time.Date(2026, time.October, 4, 12, 0, 0, 0, time.UTC)
+	e.svc.findingGroupSince = fixedNow.Sub
 	capture := &captureHandler{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(capture))
@@ -490,8 +493,8 @@ func TestFindingGroupReconcileWarnCarriesPendingCountAndOldestAgeLiveDB(t *testi
 
 	oldest, _ := e.inFlight(e.user, 1)
 	newer, _ := e.inFlight(e.user, 1)
-	e.exec(`UPDATE finding_group_operations SET created_at = now() - interval '3 hours' WHERE id=$1`, oldest.ID)
-	e.exec(`UPDATE finding_group_operations SET created_at = now() - interval '1 hour' WHERE id=$1`, newer.ID)
+	e.exec(`UPDATE finding_group_operations SET created_at = $2 WHERE id=$1`, oldest.ID, fixedNow.Add(-3*time.Hour))
+	e.exec(`UPDATE finding_group_operations SET created_at = $2 WHERE id=$1`, newer.ID, fixedNow.Add(-time.Hour))
 	e.fake.set()
 	if err := e.fullSync(); err != nil {
 		t.Fatalf("FullSync: %v", err)
@@ -509,8 +512,8 @@ func TestFindingGroupReconcileWarnCarriesPendingCountAndOldestAgeLiveDB(t *testi
 		t.Errorf("pending_group_operations = %v, want 2", attrs["pending_group_operations"])
 	}
 	age, ok := attrs["oldest_age"].(time.Duration)
-	if !ok || age < 3*time.Hour || age > 3*time.Hour+5*time.Minute {
-		t.Errorf("oldest_age = %v, want about 3h (the oldest operation, not the newest)", attrs["oldest_age"])
+	if !ok || age != 3*time.Hour {
+		t.Errorf("oldest_age = %v, want time.Duration exactly 3h (the oldest operation, not the newest)", attrs["oldest_age"])
 	}
 	if _, has := attrs["error"]; has {
 		t.Errorf("unexpected error attr: %v", attrs["error"])
