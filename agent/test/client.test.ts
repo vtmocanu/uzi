@@ -1151,27 +1151,45 @@ describe("Codex success body byte cap (#2232 M1)", () => {
       return { stream, stats };
     }
 
-    for (const contentLength of [undefined, "1", "999999"]) {
-      it(`${route} accepts exactly 65536 bytes through EOF with Content-Length ${contentLength}`, async () => {
-        const original = globalThis.fetch;
-        // Split both multibyte codepoints across chunks; the byte cap includes whitespace.
-        const euro = prefix.indexOf(0xe2);
-        const emoji = prefix.indexOf(0xf0);
-        const chunks = [prefix.subarray(0, euro + 1), prefix.subarray(euro + 1, emoji + 2), prefix.subarray(emoji + 2)];
-        const { stream, stats } = controlled(chunks);
-        try {
-          globalThis.fetch = async () => new Response(stream, {
-            headers: contentLength === undefined ? {} : { "Content-Length": contentLength },
-          });
-          assert.deepStrictEqual(await request(), envelope);
-          assert.equal(stats.reads, chunks.length + 1, "must read EOF at the exact limit");
-          assert.equal(stats.releases, 1);
-          assert.equal(stream.locked, false);
-        } finally {
-          globalThis.fetch = original;
-        }
-      });
+    for (const singleChunk of [true, false]) {
+      for (const contentLength of [undefined, "1", "999999"]) {
+        it(`${route} accepts exactly 65536 bytes through EOF (${singleChunk ? "single chunk" : "split UTF-8"}, Content-Length ${contentLength})`, async () => {
+          const original = globalThis.fetch;
+          // Split both multibyte codepoints across chunks; the byte cap includes whitespace.
+          const euro = prefix.indexOf(0xe2);
+          const emoji = prefix.indexOf(0xf0);
+          const chunks = singleChunk ? [prefix] : [prefix.subarray(0, euro + 1), prefix.subarray(euro + 1, emoji + 2), prefix.subarray(emoji + 2)];
+          const { stream, stats } = controlled(chunks);
+          try {
+            globalThis.fetch = async () => new Response(stream, {
+              headers: contentLength === undefined ? {} : { "Content-Length": contentLength },
+            });
+            assert.deepStrictEqual(await request(), envelope);
+            assert.equal(stats.reads, chunks.length + 1, "must read EOF at the exact limit");
+            assert.equal(stats.releases, 1);
+            assert.equal(stream.locked, false);
+          } finally {
+            globalThis.fetch = original;
+          }
+        });
+      }
     }
+
+    it(`${route} refuses a complete valid 65537-byte body`, async () => {
+      const original = globalThis.fetch;
+      const oversized = encoder.encode(json + " ".repeat(limit + 1 - encoder.encode(json).byteLength));
+      assert.equal(oversized.byteLength, limit + 1);
+      assert.deepStrictEqual(JSON.parse(new TextDecoder().decode(oversized)), envelope);
+      const { stream, stats } = controlled([oversized]);
+      try {
+        globalThis.fetch = async () => new Response(stream);
+        await assert.rejects(request(), check("response"));
+        assert.deepStrictEqual(stats, { reads: 1, cancels: 1, releases: 1 });
+        assert.equal(stream.locked, false);
+      } finally {
+        globalThis.fetch = original;
+      }
+    });
 
     for (const split of [false, true]) {
       for (const cleanup of [undefined, "reject", "throw"] as const) {
