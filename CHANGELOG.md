@@ -37,6 +37,9 @@ through `[0.52.0]`.)
 - **Automatic MR rework works for Codex-only owners ([#2084](https://github.com/vtmocanu/uzi/issues/2084)).**
   Codex source runs can enter automatic MR rework without an Anthropic token; creation still refuses an unusable inherited Codex harness without falling back to Claude. Claude source runs require an enabled Anthropic token.
 
+- **Codex credential success responses are capped at 64 KiB ([#2232](https://github.com/vtmocanu/uzi/issues/2232)).**
+  Release and refresh reject oversized bodies as invalid responses without exposing body fragments.
+
 - **The TUI update prompt avoids repeating the release tag as its body ([#1978](https://github.com/vtmocanu/uzi/issues/1978)).**
   When the sanitized release name equals the version, stable and RC prompts show the normal or security fallback sentence. Distinct release names retain their capped rendering, and the dismissal label still includes the version.
 

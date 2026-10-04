@@ -2486,8 +2486,9 @@ export class WorkerClient {
     }
     let text: string;
     try {
-      text = await res.text();
-    } catch {
+      text = await readCodexSuccessText(res);
+    } catch (err) {
+      if (err instanceof CodexRequestFailure && err.kind === "response") throw err;
       throw failure();
     }
     if (!text) throw new CodexRequestFailure("transport");
@@ -2550,6 +2551,34 @@ export class WorkerClient {
 function retryAfterMsOf(h: string | null): number | undefined {
   if (h === null || !/^\d{1,6}$/.test(h.trim())) return undefined;
   return Math.min(Number(h.trim()), 3600) * 1000;
+}
+
+/** Maximum success body size for the Codex release and refresh envelopes. */
+const CODEX_SUCCESS_BODY_MAX_BYTES = 64 * 1024;
+
+/** Read through EOF, including at the exact cap; never retain or decode an overflowing chunk. */
+async function readCodexSuccessText(res: Response): Promise<string> {
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  try {
+    // EOF or the byte cap bounds retained data; fetch's signal bounds stalled reads.
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.byteLength > CODEX_SUCCESS_BODY_MAX_BYTES - total) throw codexResponseError();
+      total += value.byteLength;
+      parts.push(value);
+    }
+    return new TextDecoder().decode(Buffer.concat(parts, total));
+  } catch (err) {
+    // One best-effort cancel; cleanup failure must not replace the original classification.
+    try { await reader.cancel(); } catch { /* ignore cleanup failure */ }
+    throw err;
+  } finally {
+    try { reader.releaseLock(); } catch { /* ignore cleanup failure */ }
+  }
 }
 
 /** Most bytes of an error response body toError reads. */
