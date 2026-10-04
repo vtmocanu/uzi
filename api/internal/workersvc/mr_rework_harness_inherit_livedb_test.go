@@ -102,14 +102,26 @@ func TestCreateAutoMRReworkRunSourceHarnessUnusableRefusesLiveDB(t *testing.T) {
 		t.Fatalf("source run harness = %q, want codex", source.Harness)
 	}
 
-	// The user's only Codex credential is removed AFTER the source run froze it: Codex is no
-	// longer usable for this user, but the source run's own harness stays 'codex' (M1's
-	// deletion-proof coherence). No Anthropic token either, so the explicit inherited harness has
-	// nothing to fall back to even if it tried.
+	ref := "agent/issue-9"
+	env.exec(`UPDATE runs SET status = 'completed', mr_state = 'opened', branch = $2, mr_iid = 90 WHERE id = $1`,
+		sourceRunID, ref)
+	// Candidate admission follows the persisted source harness even after its only
+	// Codex alias is deleted, and while no Anthropic token exists.
 	env.exec(`DELETE FROM user_secrets WHERE id = $1`, alias)
+	candidates, err := env.q.ListMRReworkCandidates(env.ctx, repoID)
+	if err != nil {
+		t.Fatalf("ListMRReworkCandidates: %v", err)
+	}
+	if len(candidates) != 1 || !candidates[0].Ref.Valid || candidates[0].Ref.String != ref ||
+		candidates[0].SourceRunID != sourceRunID {
+		t.Fatalf("candidates = %+v, want exactly ref %q with source %s", candidates, ref, sourceRunID)
+	}
 
+	// Claude is now usable, so refusal proves creation cannot fall back from
+	// the explicit inherited Codex harness to an available Claude credential.
+	seedAnthropicToken(t, env, userID)
 	svc := atomicMRReworkSvc(env)
-	_, err := svc.CreateAutoMRReworkRun(env.ctx, userID, repoID, "agent/issue-9", 90, sourceRunID, "Rework MR review", "desc", sampleReviewSnapshot())
+	_, err = svc.CreateAutoMRReworkRun(env.ctx, userID, repoID, ref, 90, sourceRunID, "Rework MR review", "desc", sampleReviewSnapshot())
 	if !errors.Is(err, ErrNoCredentialForHarness) {
 		t.Fatalf("CreateAutoMRReworkRun err = %v, want ErrNoCredentialForHarness (inherited codex harness now unusable, no fallback)", err)
 	}

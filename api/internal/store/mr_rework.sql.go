@@ -566,7 +566,7 @@ const listMRReworkCandidates = `-- name: ListMRReworkCandidates :many
 
 WITH per_branch AS (
     SELECT DISTINCT ON (r.branch)
-           r.branch, r.mr_iid, r.user_id, r.id AS source_run_id, r.mr_rework_enabled
+           r.branch, r.mr_iid, r.user_id, r.id AS source_run_id, r.mr_rework_enabled, r.harness
     FROM runs r
     WHERE r.repo_id = $1::uuid
       AND r.kind IN ('issue', 'prompt', 'self_improve')
@@ -593,9 +593,13 @@ LEFT JOIN pipeline_statuses ps
     ON ps.repo_id = $1::uuid AND ps.ref = per_branch.branch
 WHERE per_branch.branch <> rp.default_branch
   AND COALESCE(per_branch.mr_rework_enabled, u.mr_rework_enabled) IS NOT FALSE
-  AND EXISTS (
-      SELECT 1 FROM user_secrets s
-      WHERE s.user_id = per_branch.user_id AND s.kind = 'anthropic_token'
+  AND (
+      per_branch.harness = 'codex'
+      OR EXISTS (
+          SELECT 1 FROM user_secrets s
+          WHERE s.user_id = per_branch.user_id AND s.kind = 'anthropic_token'
+            AND s.disabled_at IS NULL
+      )
   )
 `
 
@@ -638,12 +642,14 @@ type ListMRReworkCandidatesRow struct {
 //     default (users.mr_rework_enabled, nullable, default-ON per 00165): a non-NULL run
 //     column wins, and a NULL run column falls through to the owner default. Either
 //     layer explicitly false excludes the branch; NULL/absent at both = ON. The run
-//     column read is the newest issue run's per the DISTINCT ON below. The owner must
-//     ALSO have an Anthropic token on file. The token gate mirrors ListCIAutofixCandidateRefs: an mr_rework
-//     run executes on the OWNER's Anthropic token, so a token-less owner would only
-//     spawn a doomed run that burns the per-MR cap and posts a halt comment. It is an
-//     EXISTS over user_secrets (kind='anthropic_token'), not a users column. The admin
-//     global kill-switch is read separately by the detector (settings.MrReworkEnabled).
+//     column read is the newest source run's per the DISTINCT ON below. A rework
+//     inherits that source run's harness (PRD #1429 D4): Claude sources require an
+//     enabled owner Anthropic token (disabled_at IS NULL, matching the manual door).
+//     Codex sources are admitted without an Anthropic token; createRunResolved
+//     transactionally checks Codex usability and refuses an unusable inherited
+//     harness with ErrNoCredentialForHarness, without falling back or spending a
+//     rework attempt. The admin global kill-switch is read separately by the
+//     detector (settings.MrReworkEnabled).
 //
 // The default-branch exclusion is defensive (an agent MR branch is never the default
 // branch by construction). bot_forge_user_id powers the snapshot's bot self-filter.

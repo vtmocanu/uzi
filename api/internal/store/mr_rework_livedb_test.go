@@ -52,9 +52,10 @@ func TestMRReworkLiveDB(t *testing.T) {
 	connID, repoID := uuid.New(), uuid.New()
 	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, inUser, fmt.Sprintf("in-%s@e2e", inUser))
 	exec(`INSERT INTO users (id, email, password_hash, mr_rework_enabled) VALUES ($1, $2, 'x', false)`, outUser, fmt.Sprintf("out-%s@e2e", outUser))
-	// The candidate query gates on the owner having an Anthropic token on file (an
-	// mr_rework run executes on the owner's token), mirroring ListCIAutofixCandidateRefs.
-	// Give the opted-in owner one so it surfaces as a candidate.
+	// These sources use the default Claude harness, so the candidate query requires
+	// an enabled owner Anthropic token. Codex sources instead defer credential
+	// usability to the inherited-harness resolver at creation time.
+	// Give the opted-in owner an enabled token so it surfaces as a candidate.
 	exec(`INSERT INTO user_secrets (user_id, kind, label, is_default, ciphertext, sealed_with)
 	      VALUES ($1, 'anthropic_token', 'default', true, $2, 'master')`, inUser, []byte{0x2})
 	// Give the opted-OUT owner a token too. Without it, outUser would be excluded for

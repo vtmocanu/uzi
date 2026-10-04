@@ -1,7 +1,12 @@
 package poller
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -559,6 +564,62 @@ func TestMRReworkBranchInUseSwallows(t *testing.T) {
 	}
 	if len(f.notes) != 0 || len(notifier.calls) != 0 {
 		t.Fatalf("a swallowed create must not comment/notify: notes=%d notifs=%d", len(f.notes), len(notifier.calls))
+	}
+}
+
+// This test stays serial because it captures the process-wide slog default.
+func TestMRReworkNoCredentialForHarnessSkipsWithoutErrorDetail(t *testing.T) {
+	const detail = "arbitrary fixture resolver detail"
+	ledger := store.MrReworkLedger{
+		RepoID: mrwRepoID, Ref: mrwRef, AttemptCount: 1, HighWater: 100,
+	}
+	st := &mrwStore{
+		candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
+		ledgers:    map[string]store.MrReworkLedger{mrwRef: ledger},
+	}
+	runs := &mrwRuns{err: fmt.Errorf("%s: %w", detail, workersvc.ErrNoCredentialForHarness)}
+	notifier := &mrwNotifier{}
+	f := landedForge(mrwComment(140, landed(), mrwHeadSHA))
+
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+
+	if len(runs.calls) != 1 {
+		t.Fatalf("expected one create attempt, got %+v", runs.calls)
+	}
+	call := runs.calls[0]
+	if call.userID != mrwUserID || call.repoID != mrwRepoID || call.sourceRunID != mrwSourceRunID ||
+		call.ref != mrwRef || call.mrIID != mrwMrIID {
+		t.Fatalf("create attempt targeted wrong source: %+v", call)
+	}
+	if !reflect.DeepEqual(st.ledgers, map[string]store.MrReworkLedger{mrwRef: ledger}) ||
+		len(st.upserts) != 0 || len(st.haltSets) != 0 {
+		t.Fatalf("credential refusal changed ledger: ledgers=%+v upserts=%+v halts=%+v", st.ledgers, st.upserts, st.haltSets)
+	}
+	if len(notifier.calls) != 0 || len(f.notes) != 0 {
+		t.Fatalf("credential refusal must not notify/comment: notifications=%+v notes=%+v", notifier.calls, f.notes)
+	}
+	var record map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &record); err != nil {
+		t.Fatalf("expected one JSON skip log: %v; logs=%q", err, logs.String())
+	}
+	want := map[string]any{
+		"level":      "WARN",
+		"msg":        "poller: mr-rework skipped: source-run harness has no usable credential",
+		"repo":       mrwRepoRow().PathWithNamespace,
+		"ref":        mrwRef,
+		"source_run": mrwSourceRunID.String(),
+	}
+	delete(record, "time")
+	if !reflect.DeepEqual(record, want) {
+		t.Fatalf("skip log = %+v, want static fields %+v", record, want)
+	}
+	if strings.Contains(logs.String(), detail) || strings.Contains(logs.String(), runs.err.Error()) {
+		t.Fatalf("skip log contains resolver error detail: %q", logs.String())
 	}
 }
 
