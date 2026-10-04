@@ -2451,6 +2451,8 @@ func (s *Service) publishRegisterSweeps(ctx context.Context, failed, requeued []
 // scheduling path ever reads the columns it writes. A nil *WorkerStats writes NULLs
 // (the tick carried no stats), so a downgrade / collector error self-clears the gauge.
 type WorkerStats struct {
+	DindMeter *DindMeter
+
 	// CPUPct is finite and clamped to [0, MaxWorkerCPUPct]; nil when the worker
 	// omitted it (the first tick after start, per Decision 2).
 	CPUPct *float64
@@ -2548,6 +2550,15 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		// when false; a nil stats leaves this false, which correctly resets the streak
 		// (the tick carried no evidence of pressure).
 		arg.DiskOverThreshold = diskOverThreshold(stats, s.p.DiskPressureThreshold)
+		arg.NixPressure = diskPairOver(stats.DiskNixBytes, stats.DiskNixTotalBytes, s.p.DiskPressureThreshold)
+		arg.DataPressure = diskPairOver(stats.DiskDataBytes, stats.DiskDataTotalBytes, s.p.DiskPressureThreshold)
+		if m := stats.DindMeter; m != nil {
+			arg.DindRegisterNonce = m.RegisterNonce
+			arg.DindMeterEpoch = m.Epoch
+			arg.DindMeterAt = pgconv.Time(m.SampledAt)
+			arg.DindSampleValid = m.Epoch > 0 && m.SampledAt.Equal(time.Unix(m.Epoch, 0)) && slices.Contains(wkr.ProtocolCapabilities, capability.DindMaintenanceV1) && s.p.DiskPressureThreshold > 0 && s.p.DiskPressureThreshold <= 1 && validDiskPair(stats.DiskDindBytes, stats.DiskDindTotalBytes) && validDiskPair(stats.DiskDindInodes, stats.DiskDindTotalInodes)
+			arg.DindOverThreshold = diskPairOver(stats.DiskDindBytes, stats.DiskDindTotalBytes, s.p.DiskPressureThreshold) || diskPairOver(stats.DiskDindInodes, stats.DiskDindTotalInodes, s.p.DiskPressureThreshold)
+		}
 	}
 	// No snapshot (an old worker, or the field absent), or no pool wired (tests): the plain
 	// single-statement liveness write, unchanged.

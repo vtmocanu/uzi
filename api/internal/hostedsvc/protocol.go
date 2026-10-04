@@ -9,7 +9,10 @@
 // module. What crosses is this wire contract and nothing else.
 package hostedsvc
 
-import "time"
+import (
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
+	"time"
+)
 
 // The poll is a GET and carries no request body.
 //
@@ -95,7 +98,9 @@ type DesiredWorker struct {
 	// PVC is filling, and it NEVER feeds claim or scheduling. Always present on the
 	// wire (no omitempty) so a drop is a visible contract change, not a silent false,
 	// exactly like Busy. Purely "under pressure": it does NOT bake in Ephemeral.
-	DiskPressure bool `json:"disk_pressure"`
+	DiskPressure        bool                       `json:"disk_pressure"`
+	DiskPressureVolumes []string                   `json:"disk_pressure_volumes"`
+	DindMaintenance     *workersvc.DindMaintenance `json:"dind_maintenance,omitempty"`
 	// Ephemeral is true for a run-bound throwaway worker (PRD #529). The controller's
 	// disk-pressure recycle skips ephemeral workers (materializer.go gates it on
 	// !w.Ephemeral): a disk-pressured ephemeral worker is not rolled for pressure, and it is

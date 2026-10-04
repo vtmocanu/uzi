@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -40,6 +41,9 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 
 	// A worker whose token is still awaiting delivery.
 	pending := resp.Workers[0]
+	if !slices.Equal(pending.DiskPressureVolumes, []string{"dind"}) {
+		t.Fatalf("disk_pressure_volumes = %v, want [dind]", pending.DiskPressureVolumes)
+	}
 	if pending.ID != "11111111-1111-1111-1111-111111111111" {
 		t.Fatalf("id = %q", pending.ID)
 	}
@@ -102,6 +106,9 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	// nil is load-bearing — it means "write nothing", not "this worker has no token"
 	// — so the pointer type must survive the round trip rather than collapsing to "".
 	noToken := resp.Workers[1]
+	if noToken.DiskPressureVolumes == nil || len(noToken.DiskPressureVolumes) != 0 {
+		t.Fatalf("disk_pressure_volumes = %v, want non-nil empty array", noToken.DiskPressureVolumes)
+	}
 	if noToken.JoinToken != nil {
 		t.Fatal("a null join_token must parse as nil")
 	}

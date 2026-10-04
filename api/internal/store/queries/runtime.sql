@@ -215,7 +215,7 @@ WITH prev AS (
         -- without it, a drained worker stays cordoned forever. HeartbeatWorker deliberately
         -- does NOT touch draining_since: a draining worker heartbeats and must STAY draining
         -- until it actually rolls.
-        draining_since      = NULL,
+        draining_since      = CASE WHEN maintenance_phase IN ('requested', 'ready', 'stopping', 'recycling') THEN draining_since ELSE NULL END,
         -- PRD #2006: a register is a FRESH pod incarnation, so it ends any ephemeral lease: the
         -- row's warm state (the pod the lease kept) is gone. The reaper then releases the row.
         lease_since         = NULL,
@@ -227,6 +227,12 @@ WITH prev AS (
         -- before the poll re-derives disk_pressure. (Distinct from HeartbeatWorker's
         -- increment/reset CASE: this is reset-on-action, unconditional.)
         stats_disk_pressure_streak = 0,
+        nix_pressure = false, data_pressure = false,
+        dind_register_floor = now(), dind_meter_epoch = 0, dind_meter_at = NULL,
+        dind_pressure_streak = 0, dind_meter_over = false, dind_below_threshold = false,
+        maintenance_ready_ack = false, maintenance_ack_at = NULL,
+        maintenance_phase = CASE WHEN maintenance_phase = 'ready' THEN 'requested' ELSE maintenance_phase END,
+        maintenance_activity_floor = now(),
         -- PRD #1390 M2a: rotate the register nonce every snapshot must echo and RESET the
         -- snapshot epoch to 0 under it (D3). A fresh worker process starts its epoch at 1, so
         -- resetting to 0 here means its very first post-register snapshot (epoch 1) is accepted
@@ -338,6 +344,72 @@ UPDATE workers SET
     -- service (diskOverThreshold): a nil/absent stats sample lands here as false, which
     -- correctly resets. The poll derives disk_pressure = streak>=2 AND fresh; this column
     -- is display/lifecycle-only and never a scheduling input (Decision 5).
+    nix_pressure = sqlc.arg('nix_pressure')::boolean,
+    data_pressure = sqlc.arg('data_pressure')::boolean,
+    -- Duplicate fresh samples preserve evidence; invalid/reversed samples clear
+    -- the streak and below evidence without advancing the last accepted watermark.
+    dind_pressure_streak = CASE
+        WHEN sqlc.arg('dind_sample_valid')::boolean
+          AND sqlc.arg('dind_register_nonce')::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM sqlc.arg('dind_meter_at')::timestamptz) = sqlc.arg('dind_meter_epoch')::bigint
+          AND sqlc.arg('dind_meter_at')::timestamptz > dind_register_floor
+          AND sqlc.arg('dind_meter_at')::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND sqlc.arg('dind_meter_epoch')::bigint = dind_meter_epoch
+          AND sqlc.arg('dind_meter_at')::timestamptz = dind_meter_at
+          AND sqlc.arg('dind_over_threshold')::boolean = dind_meter_over THEN dind_pressure_streak
+        WHEN sqlc.arg('dind_sample_valid')::boolean
+          AND sqlc.arg('dind_register_nonce')::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM sqlc.arg('dind_meter_at')::timestamptz) = sqlc.arg('dind_meter_epoch')::bigint
+          AND sqlc.arg('dind_meter_at')::timestamptz > dind_register_floor
+          AND sqlc.arg('dind_meter_at')::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND sqlc.arg('dind_meter_epoch')::bigint > dind_meter_epoch
+          AND (dind_meter_at IS NULL OR sqlc.arg('dind_meter_at')::timestamptz > dind_meter_at)
+          AND sqlc.arg('dind_over_threshold')::boolean
+        THEN CASE WHEN dind_meter_at IS NOT NULL
+                    AND sqlc.arg('dind_meter_at')::timestamptz - dind_meter_at <= interval '45 seconds'
+                  THEN LEAST(dind_pressure_streak + 1, 100) ELSE 1 END
+        ELSE 0 END,
+    dind_below_threshold = CASE
+        WHEN sqlc.arg('dind_sample_valid')::boolean
+          AND sqlc.arg('dind_register_nonce')::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM sqlc.arg('dind_meter_at')::timestamptz) = sqlc.arg('dind_meter_epoch')::bigint
+          AND sqlc.arg('dind_meter_at')::timestamptz > dind_register_floor
+          AND sqlc.arg('dind_meter_at')::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND sqlc.arg('dind_meter_epoch')::bigint = dind_meter_epoch
+          AND sqlc.arg('dind_meter_at')::timestamptz = dind_meter_at
+          AND sqlc.arg('dind_over_threshold')::boolean = dind_meter_over THEN dind_below_threshold
+        WHEN sqlc.arg('dind_sample_valid')::boolean
+          AND sqlc.arg('dind_register_nonce')::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM sqlc.arg('dind_meter_at')::timestamptz) = sqlc.arg('dind_meter_epoch')::bigint
+          AND sqlc.arg('dind_meter_at')::timestamptz > dind_register_floor
+          AND sqlc.arg('dind_meter_at')::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND sqlc.arg('dind_meter_epoch')::bigint > dind_meter_epoch
+          AND (dind_meter_at IS NULL OR sqlc.arg('dind_meter_at')::timestamptz > dind_meter_at) THEN NOT sqlc.arg('dind_over_threshold')::boolean
+        ELSE false END,
+    dind_meter_over = CASE WHEN sqlc.arg('dind_sample_valid')::boolean
+          AND sqlc.arg('dind_register_nonce')::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM sqlc.arg('dind_meter_at')::timestamptz) = sqlc.arg('dind_meter_epoch')::bigint
+          AND sqlc.arg('dind_meter_at')::timestamptz > dind_register_floor
+          AND sqlc.arg('dind_meter_at')::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND sqlc.arg('dind_meter_epoch')::bigint > dind_meter_epoch
+          AND (dind_meter_at IS NULL OR sqlc.arg('dind_meter_at')::timestamptz > dind_meter_at)
+        THEN sqlc.arg('dind_over_threshold')::boolean ELSE dind_meter_over END,
+    dind_meter_epoch = CASE WHEN sqlc.arg('dind_sample_valid')::boolean
+          AND sqlc.arg('dind_register_nonce')::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM sqlc.arg('dind_meter_at')::timestamptz) = sqlc.arg('dind_meter_epoch')::bigint
+          AND sqlc.arg('dind_meter_at')::timestamptz > dind_register_floor
+          AND sqlc.arg('dind_meter_at')::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND sqlc.arg('dind_meter_epoch')::bigint > dind_meter_epoch
+          AND (dind_meter_at IS NULL OR sqlc.arg('dind_meter_at')::timestamptz > dind_meter_at)
+        THEN sqlc.arg('dind_meter_epoch')::bigint ELSE dind_meter_epoch END,
+    dind_meter_at = CASE WHEN sqlc.arg('dind_sample_valid')::boolean
+          AND sqlc.arg('dind_register_nonce')::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM sqlc.arg('dind_meter_at')::timestamptz) = sqlc.arg('dind_meter_epoch')::bigint
+          AND sqlc.arg('dind_meter_at')::timestamptz > dind_register_floor
+          AND sqlc.arg('dind_meter_at')::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND sqlc.arg('dind_meter_epoch')::bigint > dind_meter_epoch
+          AND (dind_meter_at IS NULL OR sqlc.arg('dind_meter_at')::timestamptz > dind_meter_at)
+        THEN sqlc.arg('dind_meter_at')::timestamptz ELSE dind_meter_at END,
     stats_disk_pressure_streak = CASE
         WHEN @disk_over_threshold::boolean THEN LEAST(workers.stats_disk_pressure_streak + 1, 100)
         ELSE 0
@@ -803,9 +875,14 @@ FROM runs WHERE id = @id AND user_id = @user_id AND repo_id = @repo_id;
 -- statement is `UPDATE runs ... RETURNING *`, so the :one result is still store.Run — the
 -- hold is a side effect. target and hold share target's single snapshot/lock, so the hold's
 -- t.claim_generation + 1 equals the UPDATE's own increment.
-WITH target AS (
+WITH claimant AS MATERIALIZED (
+    SELECT * FROM workers WHERE id = @worker_id FOR UPDATE
+), target AS (
     SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id FROM runs r
     WHERE r.user_id = @user_id
+      AND EXISTS (SELECT 1 FROM claimant c WHERE NOT c.maintenance_fenced
+        AND (c.draining_since IS NULL AND c.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+             OR r.worker_id = c.id))
       AND r.kind <> 'chat'
       -- PRD #400 Decision 6: a task run is claimable ONLY after the CLI has seeded its
       -- uzi/task/<id> branch and stamped dispatched_at — otherwise a worker could claim
@@ -833,7 +910,7 @@ WITH target AS (
            OR NOT EXISTS (
                SELECT 1 FROM workers ow
                WHERE ow.id = r.worker_id
-                 AND (ow.draining_since IS NOT NULL
+                 AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced
                       OR (ow.last_heartbeat_at IS NOT NULL
                           AND ow.last_heartbeat_at >= @heartbeat_cutoff)))
            -- Generous ceiling bounding the live-but-can't-serve case; @affinity_cutoff is
@@ -1102,7 +1179,7 @@ WITH target AS (
                 AND p.last_heartbeat_at >= @heartbeat_cutoff
                 -- A draining peer claims nothing (PRD #422 Decision 7), so never DEFER a
                 -- run to it — it would never pick the run up.
-                AND p.draining_since IS NULL
+                AND p.draining_since IS NULL AND NOT p.maintenance_fenced AND p.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
                 -- PRD #529 Decision 4: an ephemeral peer claims ONLY its own bound run
                 -- (ClaimRun's claimant clause above), so it would never pick up a
                 -- FOREIGN run — same failure mode as the draining-peer guard. Deferring
@@ -6842,7 +6919,7 @@ WHERE w.user_id = @user_id
 -- Issue #2184: preserve the advisory availability projection separately from strict health
 -- eligibility. Static requirements compose on ONE candidate; strict counts ignore slots.
 WITH candidates AS (
-SELECT w.draining_since,
+SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','ready','stopping','recycling') THEN COALESCE(w.draining_since, w.maintenance_activity_floor) ELSE w.draining_since END AS draining_since,
        (w.status = 'online') AS online,
        (w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs) AS free_slot,
        (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR fn_ephemeral_lease_admits(
@@ -6861,7 +6938,7 @@ SELECT w.draining_since,
        (NOT w.ephemeral) AS persistent,
        (run.worker_id IS NULL OR run.worker_id = w.id
         OR NOT EXISTS (SELECT 1 FROM workers ow WHERE ow.id = run.worker_id
-                       AND (ow.draining_since IS NOT NULL OR
+                       AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced OR
                             (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= @heartbeat_cutoff)))
         OR run.updated_at < @affinity_cutoff) AS affinity
 FROM runs run
@@ -6979,7 +7056,7 @@ WHERE w.user_id = @user_id
   AND w.status = 'online'
   -- A draining worker has no free slot for NEW work (it claims nothing), so the
   -- queued-run reason resolver must not count it as an idle worker (PRD #422 Decision 7).
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   -- AND NOT w.ephemeral (PRD #529 M2, Correction B; issue #1624): an ephemeral worker is
   -- bound to ONE run (it can claim only its ephemeral_run_id), so it never has a free
   -- slot for ANOTHER run, even when idle, with a NULL cap, or below an advertised cap.
@@ -7018,7 +7095,7 @@ WHERE w.user_id = @user_id
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -7047,7 +7124,7 @@ WHERE w.user_id = @user_id
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -7076,7 +7153,7 @@ WHERE w.user_id = @user_id
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -7089,7 +7166,7 @@ WHERE w.user_id = @user_id
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -7104,7 +7181,7 @@ WHERE w.user_id = @user_id
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -7137,7 +7214,7 @@ WHERE w.user_id = @user_id
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -7157,7 +7234,7 @@ WHERE w.user_id = @user_id
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   AND NOT COALESCE(w.docker_enabled, false)
   AND 'job_runner_v1' = ANY(w.protocol_capabilities)
@@ -7233,7 +7310,7 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
-        AND w.draining_since IS NULL
+        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
         AND (NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
@@ -7276,7 +7353,7 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers wj
       WHERE wj.user_id = r.user_id
         AND wj.status = 'online'
-        AND wj.draining_since IS NULL
+        AND wj.draining_since IS NULL AND NOT wj.maintenance_fenced AND wj.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
         AND NOT wj.ephemeral
         AND NOT COALESCE(wj.docker_enabled, false)
         AND 'job_runner_v1' = ANY(wj.protocol_capabilities)
@@ -7383,7 +7460,7 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
-        AND w.draining_since IS NULL
+        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
         AND (NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
@@ -7428,7 +7505,7 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
-        AND w.draining_since IS NULL
+        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
         AND (NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
@@ -7930,7 +8007,7 @@ WHERE r.health = 'waiting_worker'
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
-        AND w.draining_since IS NULL
+        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
         AND w.last_heartbeat_at IS NOT NULL
         AND w.last_heartbeat_at >= @heartbeat_cutoff
   );

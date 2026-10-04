@@ -691,9 +691,14 @@ func (q *Queries) ClaimAutopilotTerminalComment(ctx context.Context, id uuid.UUI
 }
 
 const claimRun = `-- name: ClaimRun :one
-WITH target AS (
+WITH claimant AS MATERIALIZED (
+    SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor FROM workers WHERE id = $1 FOR UPDATE
+), target AS (
     SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id FROM runs r
     WHERE r.user_id = $2
+      AND EXISTS (SELECT 1 FROM claimant c WHERE NOT c.maintenance_fenced
+        AND (c.draining_since IS NULL AND c.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+             OR r.worker_id = c.id))
       AND r.kind <> 'chat'
       -- PRD #400 Decision 6: a task run is claimable ONLY after the CLI has seeded its
       -- uzi/task/<id> branch and stamped dispatched_at — otherwise a worker could claim
@@ -721,7 +726,7 @@ WITH target AS (
            OR NOT EXISTS (
                SELECT 1 FROM workers ow
                WHERE ow.id = r.worker_id
-                 AND (ow.draining_since IS NOT NULL
+                 AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced
                       OR (ow.last_heartbeat_at IS NOT NULL
                           AND ow.last_heartbeat_at >= $3)))
            -- Generous ceiling bounding the live-but-can't-serve case; @affinity_cutoff is
@@ -990,7 +995,7 @@ WITH target AS (
                 AND p.last_heartbeat_at >= $3
                 -- A draining peer claims nothing (PRD #422 Decision 7), so never DEFER a
                 -- run to it — it would never pick the run up.
-                AND p.draining_since IS NULL
+                AND p.draining_since IS NULL AND NOT p.maintenance_fenced AND p.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
                 -- PRD #529 Decision 4: an ephemeral peer claims ONLY its own bound run
                 -- (ClaimRun's claimant clause above), so it would never pick up a
                 -- FOREIGN run — same failure mode as the draining-peer guard. Deferring
@@ -1886,7 +1891,7 @@ func (q *Queries) CountOnlineEligibleWorkersForRepo(ctx context.Context, arg Cou
 
 const countOnlineWorkersClaimableForRun = `-- name: CountOnlineWorkersClaimableForRun :one
 WITH candidates AS (
-SELECT w.draining_since,
+SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','ready','stopping','recycling') THEN COALESCE(w.draining_since, w.maintenance_activity_floor) ELSE w.draining_since END AS draining_since,
        (w.status = 'online') AS online,
        (w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs) AS free_slot,
        (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR fn_ephemeral_lease_admits(
@@ -1905,7 +1910,7 @@ SELECT w.draining_since,
        (NOT w.ephemeral) AS persistent,
        (run.worker_id IS NULL OR run.worker_id = w.id
         OR NOT EXISTS (SELECT 1 FROM workers ow WHERE ow.id = run.worker_id
-                       AND (ow.draining_since IS NOT NULL OR
+                       AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced OR
                             (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= $2)))
         OR run.updated_at < $3) AS affinity
 FROM runs run
@@ -2058,7 +2063,7 @@ const countOnlineWorkersSatisfyingCaps = `-- name: CountOnlineWorkersSatisfyingC
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -2106,7 +2111,7 @@ const countOnlineWorkersSatisfyingCodexCompletion = `-- name: CountOnlineWorkers
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -2137,7 +2142,7 @@ const countOnlineWorkersSatisfyingCodexHarness = `-- name: CountOnlineWorkersSat
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -2174,7 +2179,7 @@ const countOnlineWorkersSatisfyingCodexRuntime = `-- name: CountOnlineWorkersSat
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -2196,7 +2201,7 @@ const countOnlineWorkersSatisfyingCustomCodex = `-- name: CountOnlineWorkersSati
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -2235,7 +2240,7 @@ const countOnlineWorkersSatisfyingJobRunner = `-- name: CountOnlineWorkersSatisf
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   AND NOT COALESCE(w.docker_enabled, false)
   AND 'job_runner_v1' = ANY(w.protocol_capabilities)
@@ -2266,7 +2271,7 @@ const countOnlineWorkersSatisfyingProtocol = `-- name: CountOnlineWorkersSatisfy
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -2305,7 +2310,7 @@ WHERE w.user_id = $1
   AND w.status = 'online'
   -- A draining worker has no free slot for NEW work (it claims nothing), so the
   -- queued-run reason resolver must not count it as an idle worker (PRD #422 Decision 7).
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   -- AND NOT w.ephemeral (PRD #529 M2, Correction B; issue #1624): an ephemeral worker is
   -- bound to ONE run (it can claim only its ephemeral_run_id), so it never has a free
   -- slot for ANOTHER run, even when idle, with a NULL cap, or below an advertised cap.
@@ -3551,7 +3556,7 @@ const createWorker = `-- name: CreateWorker :one
 
 INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id, anthropic_bind_mode)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor
 `
 
 type CreateWorkerParams struct {
@@ -3642,6 +3647,25 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 		&i.LeaseSince,
 		&i.LeaseRepoID,
 		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
 	)
 	return i, err
 }
@@ -5938,7 +5962,7 @@ func (q *Queries) GetUnconsumedCompletionPermit(ctx context.Context, arg GetUnco
 }
 
 const getWorkerByID = `-- name: GetWorkerByID :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch FROM workers WHERE id = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor FROM workers WHERE id = $1
 `
 
 func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, error) {
@@ -5992,12 +6016,31 @@ func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, erro
 		&i.LeaseSince,
 		&i.LeaseRepoID,
 		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
 	)
 	return i, err
 }
 
 const getWorkerByIDForUser = `-- name: GetWorkerByIDForUser :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch FROM workers WHERE id = $1 AND user_id = $2
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor FROM workers WHERE id = $1 AND user_id = $2
 `
 
 type GetWorkerByIDForUserParams struct {
@@ -6056,12 +6099,31 @@ func (q *Queries) GetWorkerByIDForUser(ctx context.Context, arg GetWorkerByIDFor
 		&i.LeaseSince,
 		&i.LeaseRepoID,
 		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
 	)
 	return i, err
 }
 
 const getWorkerByTokenHash = `-- name: GetWorkerByTokenHash :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch FROM workers WHERE token_hash = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor FROM workers WHERE token_hash = $1
 `
 
 // Worker auth: Bearer join token → sha256 → this lookup.
@@ -6116,12 +6178,31 @@ func (q *Queries) GetWorkerByTokenHash(ctx context.Context, tokenHash []byte) (W
 		&i.LeaseSince,
 		&i.LeaseRepoID,
 		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
 	)
 	return i, err
 }
 
 const getWorkerForUpdate = `-- name: GetWorkerForUpdate :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch FROM workers WHERE id = $1 FOR UPDATE
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor FROM workers WHERE id = $1 FOR UPDATE
 `
 
 // PRD #1390 M2a: lock the worker row FOR UPDATE at the top of the Register transaction, in
@@ -6180,6 +6261,25 @@ func (q *Queries) GetWorkerForUpdate(ctx context.Context, id uuid.UUID) (Worker,
 		&i.LeaseSince,
 		&i.LeaseRepoID,
 		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
 	)
 	return i, err
 }
@@ -6223,32 +6323,105 @@ UPDATE workers SET
     -- service (diskOverThreshold): a nil/absent stats sample lands here as false, which
     -- correctly resets. The poll derives disk_pressure = streak>=2 AND fresh; this column
     -- is display/lifecycle-only and never a scheduling input (Decision 5).
+    nix_pressure = $15::boolean,
+    data_pressure = $16::boolean,
+    -- Duplicate fresh samples preserve evidence; invalid/reversed samples clear
+    -- the streak and below evidence without advancing the last accepted watermark.
+    dind_pressure_streak = CASE
+        WHEN $17::boolean
+          AND $18::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM $19::timestamptz) = $20::bigint
+          AND $19::timestamptz > dind_register_floor
+          AND $19::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND $20::bigint = dind_meter_epoch
+          AND $19::timestamptz = dind_meter_at
+          AND $21::boolean = dind_meter_over THEN dind_pressure_streak
+        WHEN $17::boolean
+          AND $18::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM $19::timestamptz) = $20::bigint
+          AND $19::timestamptz > dind_register_floor
+          AND $19::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND $20::bigint > dind_meter_epoch
+          AND (dind_meter_at IS NULL OR $19::timestamptz > dind_meter_at)
+          AND $21::boolean
+        THEN CASE WHEN dind_meter_at IS NOT NULL
+                    AND $19::timestamptz - dind_meter_at <= interval '45 seconds'
+                  THEN LEAST(dind_pressure_streak + 1, 100) ELSE 1 END
+        ELSE 0 END,
+    dind_below_threshold = CASE
+        WHEN $17::boolean
+          AND $18::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM $19::timestamptz) = $20::bigint
+          AND $19::timestamptz > dind_register_floor
+          AND $19::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND $20::bigint = dind_meter_epoch
+          AND $19::timestamptz = dind_meter_at
+          AND $21::boolean = dind_meter_over THEN dind_below_threshold
+        WHEN $17::boolean
+          AND $18::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM $19::timestamptz) = $20::bigint
+          AND $19::timestamptz > dind_register_floor
+          AND $19::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND $20::bigint > dind_meter_epoch
+          AND (dind_meter_at IS NULL OR $19::timestamptz > dind_meter_at) THEN NOT $21::boolean
+        ELSE false END,
+    dind_meter_over = CASE WHEN $17::boolean
+          AND $18::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM $19::timestamptz) = $20::bigint
+          AND $19::timestamptz > dind_register_floor
+          AND $19::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND $20::bigint > dind_meter_epoch
+          AND (dind_meter_at IS NULL OR $19::timestamptz > dind_meter_at)
+        THEN $21::boolean ELSE dind_meter_over END,
+    dind_meter_epoch = CASE WHEN $17::boolean
+          AND $18::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM $19::timestamptz) = $20::bigint
+          AND $19::timestamptz > dind_register_floor
+          AND $19::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND $20::bigint > dind_meter_epoch
+          AND (dind_meter_at IS NULL OR $19::timestamptz > dind_meter_at)
+        THEN $20::bigint ELSE dind_meter_epoch END,
+    dind_meter_at = CASE WHEN $17::boolean
+          AND $18::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM $19::timestamptz) = $20::bigint
+          AND $19::timestamptz > dind_register_floor
+          AND $19::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND $20::bigint > dind_meter_epoch
+          AND (dind_meter_at IS NULL OR $19::timestamptz > dind_meter_at)
+        THEN $19::timestamptz ELSE dind_meter_at END,
     stats_disk_pressure_streak = CASE
-        WHEN $15::boolean THEN LEAST(workers.stats_disk_pressure_streak + 1, 100)
+        WHEN $22::boolean THEN LEAST(workers.stats_disk_pressure_streak + 1, 100)
         ELSE 0
     END,
     updated_at            = now()
-WHERE id = $16
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch
+WHERE id = $23
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor
 `
 
 type HeartbeatWorkerParams struct {
-	StatsCpuPct              pgtype.Float4 `json:"stats_cpu_pct"`
-	StatsMemBytes            pgtype.Int8   `json:"stats_mem_bytes"`
-	StatsMemLimitBytes       pgtype.Int8   `json:"stats_mem_limit_bytes"`
-	StatsSource              pgtype.Text   `json:"stats_source"`
-	StatsDiskNixBytes        pgtype.Int8   `json:"stats_disk_nix_bytes"`
-	StatsDiskNixTotalBytes   pgtype.Int8   `json:"stats_disk_nix_total_bytes"`
-	StatsDiskDataBytes       pgtype.Int8   `json:"stats_disk_data_bytes"`
-	StatsDiskDataTotalBytes  pgtype.Int8   `json:"stats_disk_data_total_bytes"`
-	StatsDiskDindBytes       pgtype.Int8   `json:"stats_disk_dind_bytes"`
-	StatsDiskDindTotalBytes  pgtype.Int8   `json:"stats_disk_dind_total_bytes"`
-	StatsDiskDindInodes      pgtype.Int8   `json:"stats_disk_dind_inodes"`
-	StatsDiskDindTotalInodes pgtype.Int8   `json:"stats_disk_dind_total_inodes"`
-	StatsDiskDataInodes      pgtype.Int8   `json:"stats_disk_data_inodes"`
-	StatsDiskDataTotalInodes pgtype.Int8   `json:"stats_disk_data_total_inodes"`
-	DiskOverThreshold        bool          `json:"disk_over_threshold"`
-	ID                       uuid.UUID     `json:"id"`
+	StatsCpuPct              pgtype.Float4      `json:"stats_cpu_pct"`
+	StatsMemBytes            pgtype.Int8        `json:"stats_mem_bytes"`
+	StatsMemLimitBytes       pgtype.Int8        `json:"stats_mem_limit_bytes"`
+	StatsSource              pgtype.Text        `json:"stats_source"`
+	StatsDiskNixBytes        pgtype.Int8        `json:"stats_disk_nix_bytes"`
+	StatsDiskNixTotalBytes   pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
+	StatsDiskDataBytes       pgtype.Int8        `json:"stats_disk_data_bytes"`
+	StatsDiskDataTotalBytes  pgtype.Int8        `json:"stats_disk_data_total_bytes"`
+	StatsDiskDindBytes       pgtype.Int8        `json:"stats_disk_dind_bytes"`
+	StatsDiskDindTotalBytes  pgtype.Int8        `json:"stats_disk_dind_total_bytes"`
+	StatsDiskDindInodes      pgtype.Int8        `json:"stats_disk_dind_inodes"`
+	StatsDiskDindTotalInodes pgtype.Int8        `json:"stats_disk_dind_total_inodes"`
+	StatsDiskDataInodes      pgtype.Int8        `json:"stats_disk_data_inodes"`
+	StatsDiskDataTotalInodes pgtype.Int8        `json:"stats_disk_data_total_inodes"`
+	NixPressure              bool               `json:"nix_pressure"`
+	DataPressure             bool               `json:"data_pressure"`
+	DindSampleValid          bool               `json:"dind_sample_valid"`
+	DindRegisterNonce        string             `json:"dind_register_nonce"`
+	DindMeterAt              pgtype.Timestamptz `json:"dind_meter_at"`
+	DindMeterEpoch           int64              `json:"dind_meter_epoch"`
+	DindOverThreshold        bool               `json:"dind_over_threshold"`
+	DiskOverThreshold        bool               `json:"disk_over_threshold"`
+	ID                       uuid.UUID          `json:"id"`
 }
 
 // Refresh liveness AND overwrite the worker's latest resource sample (PRD #49). The
@@ -6274,6 +6447,13 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 		arg.StatsDiskDindTotalInodes,
 		arg.StatsDiskDataInodes,
 		arg.StatsDiskDataTotalInodes,
+		arg.NixPressure,
+		arg.DataPressure,
+		arg.DindSampleValid,
+		arg.DindRegisterNonce,
+		arg.DindMeterAt,
+		arg.DindMeterEpoch,
+		arg.DindOverThreshold,
 		arg.DiskOverThreshold,
 		arg.ID,
 	)
@@ -6326,6 +6506,25 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 		&i.LeaseSince,
 		&i.LeaseRepoID,
 		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
 	)
 	return i, err
 }
@@ -7153,7 +7352,7 @@ func (q *Queries) ListActiveRunsForWorkers(ctx context.Context, workerIds []uuid
 }
 
 const listAllWorkers = `-- name: ListAllWorkers :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
@@ -7275,6 +7474,25 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.Worker.LeaseSince,
 			&i.Worker.LeaseRepoID,
 			&i.Worker.LeaseBranch,
+			&i.Worker.DindRegisterFloor,
+			&i.Worker.DindMeterEpoch,
+			&i.Worker.DindMeterAt,
+			&i.Worker.DindPressureStreak,
+			&i.Worker.DindMeterOver,
+			&i.Worker.DindBelowThreshold,
+			&i.Worker.MaintenanceOwnsDrain,
+			&i.Worker.NixPressure,
+			&i.Worker.DataPressure,
+			&i.Worker.MaintenanceID,
+			&i.Worker.MaintenanceNonce,
+			&i.Worker.MaintenancePhase,
+			&i.Worker.MaintenanceDeploymentUid,
+			&i.Worker.MaintenancePvcUid,
+			&i.Worker.MaintenanceRegisterNonce,
+			&i.Worker.MaintenanceFenced,
+			&i.Worker.MaintenanceReadyAck,
+			&i.Worker.MaintenanceAckAt,
+			&i.Worker.MaintenanceActivityFloor,
 			&i.Busy,
 			&i.ActiveRuns,
 			&i.OwnerEmail,
@@ -7793,7 +8011,7 @@ WHERE r.health = 'waiting_worker'
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
-        AND w.draining_since IS NULL
+        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
         AND w.last_heartbeat_at IS NOT NULL
         AND w.last_heartbeat_at >= $2
   )
@@ -9072,7 +9290,7 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
-        AND w.draining_since IS NULL
+        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
         AND (NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
@@ -9117,7 +9335,7 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
-        AND w.draining_since IS NULL
+        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
         AND (NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
@@ -9314,7 +9532,7 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
-        AND w.draining_since IS NULL
+        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
         AND (NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
@@ -9357,7 +9575,7 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers wj
       WHERE wj.user_id = r.user_id
         AND wj.status = 'online'
-        AND wj.draining_since IS NULL
+        AND wj.draining_since IS NULL AND NOT wj.maintenance_fenced AND wj.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
         AND NOT wj.ephemeral
         AND NOT COALESCE(wj.docker_enabled, false)
         AND 'job_runner_v1' = ANY(wj.protocol_capabilities)
@@ -9514,7 +9732,7 @@ func (q *Queries) ListWorkerPendingSince(ctx context.Context, workerID uuid.UUID
 }
 
 const listWorkersByUser = `-- name: ListWorkersByUser :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor,
        s.label AS anthropic_secret_label,
        EXISTS (
            SELECT 1 FROM runs r
@@ -9609,6 +9827,25 @@ type ListWorkersByUserRow struct {
 	LeaseSince               pgtype.Timestamptz `json:"lease_since"`
 	LeaseRepoID              pgtype.UUID        `json:"lease_repo_id"`
 	LeaseBranch              pgtype.Text        `json:"lease_branch"`
+	DindRegisterFloor        pgtype.Timestamptz `json:"dind_register_floor"`
+	DindMeterEpoch           int64              `json:"dind_meter_epoch"`
+	DindMeterAt              pgtype.Timestamptz `json:"dind_meter_at"`
+	DindPressureStreak       int32              `json:"dind_pressure_streak"`
+	DindMeterOver            bool               `json:"dind_meter_over"`
+	DindBelowThreshold       bool               `json:"dind_below_threshold"`
+	MaintenanceOwnsDrain     bool               `json:"maintenance_owns_drain"`
+	NixPressure              bool               `json:"nix_pressure"`
+	DataPressure             bool               `json:"data_pressure"`
+	MaintenanceID            pgtype.UUID        `json:"maintenance_id"`
+	MaintenanceNonce         string             `json:"maintenance_nonce"`
+	MaintenancePhase         string             `json:"maintenance_phase"`
+	MaintenanceDeploymentUid string             `json:"maintenance_deployment_uid"`
+	MaintenancePvcUid        string             `json:"maintenance_pvc_uid"`
+	MaintenanceRegisterNonce string             `json:"maintenance_register_nonce"`
+	MaintenanceFenced        bool               `json:"maintenance_fenced"`
+	MaintenanceReadyAck      bool               `json:"maintenance_ready_ack"`
+	MaintenanceAckAt         pgtype.Timestamptz `json:"maintenance_ack_at"`
+	MaintenanceActivityFloor pgtype.Timestamptz `json:"maintenance_activity_floor"`
 	AnthropicSecretLabel     pgtype.Text        `json:"anthropic_secret_label"`
 	Busy                     bool               `json:"busy"`
 	ActiveRuns               int64              `json:"active_runs"`
@@ -9701,6 +9938,25 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.LeaseSince,
 			&i.LeaseRepoID,
 			&i.LeaseBranch,
+			&i.DindRegisterFloor,
+			&i.DindMeterEpoch,
+			&i.DindMeterAt,
+			&i.DindPressureStreak,
+			&i.DindMeterOver,
+			&i.DindBelowThreshold,
+			&i.MaintenanceOwnsDrain,
+			&i.NixPressure,
+			&i.DataPressure,
+			&i.MaintenanceID,
+			&i.MaintenanceNonce,
+			&i.MaintenancePhase,
+			&i.MaintenanceDeploymentUid,
+			&i.MaintenancePvcUid,
+			&i.MaintenanceRegisterNonce,
+			&i.MaintenanceFenced,
+			&i.MaintenanceReadyAck,
+			&i.MaintenanceAckAt,
+			&i.MaintenanceActivityFloor,
 			&i.AnthropicSecretLabel,
 			&i.Busy,
 			&i.ActiveRuns,
@@ -12049,7 +12305,7 @@ WITH prev AS (
         -- without it, a drained worker stays cordoned forever. HeartbeatWorker deliberately
         -- does NOT touch draining_since: a draining worker heartbeats and must STAY draining
         -- until it actually rolls.
-        draining_since      = NULL,
+        draining_since      = CASE WHEN maintenance_phase IN ('requested', 'ready', 'stopping', 'recycling') THEN draining_since ELSE NULL END,
         -- PRD #2006: a register is a FRESH pod incarnation, so it ends any ephemeral lease: the
         -- row's warm state (the pod the lease kept) is gone. The reaper then releases the row.
         lease_since         = NULL,
@@ -12061,6 +12317,12 @@ WITH prev AS (
         -- before the poll re-derives disk_pressure. (Distinct from HeartbeatWorker's
         -- increment/reset CASE: this is reset-on-action, unconditional.)
         stats_disk_pressure_streak = 0,
+        nix_pressure = false, data_pressure = false,
+        dind_register_floor = now(), dind_meter_epoch = 0, dind_meter_at = NULL,
+        dind_pressure_streak = 0, dind_meter_over = false, dind_below_threshold = false,
+        maintenance_ready_ack = false, maintenance_ack_at = NULL,
+        maintenance_phase = CASE WHEN maintenance_phase = 'ready' THEN 'requested' ELSE maintenance_phase END,
+        maintenance_activity_floor = now(),
         -- PRD #1390 M2a: rotate the register nonce every snapshot must echo and RESET the
         -- snapshot epoch to 0 under it (D3). A fresh worker process starts its epoch at 1, so
         -- resetting to 0 here means its very first post-register snapshot (epoch 1) is accepted
@@ -12072,7 +12334,7 @@ WITH prev AS (
         last_heartbeat_at   = now(),
         updated_at          = now()
     WHERE workers.id = $1
-    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch
+    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor
 ), cleared AS (
     UPDATE worker_upgrade_reports r
        SET upgrading_since    = NULL,
@@ -12124,7 +12386,7 @@ WITH prev AS (
        -- preserves that.
        AND split_part($2::text, '+', 1) IS DISTINCT FROM split_part(prev.old_version, '+', 1)
 )
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch FROM upd
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor FROM upd
 `
 
 type RegisterWorkerParams struct {
@@ -12185,6 +12447,25 @@ type RegisterWorkerRow struct {
 	LeaseSince               pgtype.Timestamptz `json:"lease_since"`
 	LeaseRepoID              pgtype.UUID        `json:"lease_repo_id"`
 	LeaseBranch              pgtype.Text        `json:"lease_branch"`
+	DindRegisterFloor        pgtype.Timestamptz `json:"dind_register_floor"`
+	DindMeterEpoch           int64              `json:"dind_meter_epoch"`
+	DindMeterAt              pgtype.Timestamptz `json:"dind_meter_at"`
+	DindPressureStreak       int32              `json:"dind_pressure_streak"`
+	DindMeterOver            bool               `json:"dind_meter_over"`
+	DindBelowThreshold       bool               `json:"dind_below_threshold"`
+	MaintenanceOwnsDrain     bool               `json:"maintenance_owns_drain"`
+	NixPressure              bool               `json:"nix_pressure"`
+	DataPressure             bool               `json:"data_pressure"`
+	MaintenanceID            pgtype.UUID        `json:"maintenance_id"`
+	MaintenanceNonce         string             `json:"maintenance_nonce"`
+	MaintenancePhase         string             `json:"maintenance_phase"`
+	MaintenanceDeploymentUid string             `json:"maintenance_deployment_uid"`
+	MaintenancePvcUid        string             `json:"maintenance_pvc_uid"`
+	MaintenanceRegisterNonce string             `json:"maintenance_register_nonce"`
+	MaintenanceFenced        bool               `json:"maintenance_fenced"`
+	MaintenanceReadyAck      bool               `json:"maintenance_ready_ack"`
+	MaintenanceAckAt         pgtype.Timestamptz `json:"maintenance_ack_at"`
+	MaintenanceActivityFloor pgtype.Timestamptz `json:"maintenance_activity_floor"`
 }
 
 // Worker announces version + its self-reported template and comes online;
@@ -12293,6 +12574,25 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		&i.LeaseSince,
 		&i.LeaseRepoID,
 		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
 	)
 	return i, err
 }
@@ -15944,7 +16244,7 @@ SET anthropic_secret_id = $1,
     anthropic_bind_mode = $2,
     updated_at = now()
 WHERE id = $3 AND user_id = $4
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor
 `
 
 type SetWorkerAnthropicSecretParams struct {
@@ -16032,6 +16332,25 @@ func (q *Queries) SetWorkerAnthropicSecret(ctx context.Context, arg SetWorkerAnt
 		&i.LeaseSince,
 		&i.LeaseRepoID,
 		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
 	)
 	return i, err
 }

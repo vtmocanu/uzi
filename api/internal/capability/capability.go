@@ -199,7 +199,10 @@ const IsolatedJobV1 = "isolated_job_v1"
 // CodexRefreshRecoveryV1 opts into durable refresh deferral acknowledgements.
 const CodexRefreshRecoveryV1 = "codex_refresh_recovery_v1"
 
+const DindMaintenanceV1 = "dind_maintenance_v1"
+
 var protocolVocabulary = map[string]struct{}{
+	DindMaintenanceV1:          {},
 	CompletionInterlockV1:      {},
 	RecoveryArchiveV1:          {},
 	RecoveryArchiveV2:          {},
@@ -222,7 +225,7 @@ var protocolVocabulary = map[string]struct{}{
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1}
+var protocolOrder = []string{DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

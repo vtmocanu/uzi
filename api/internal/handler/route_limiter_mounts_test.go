@@ -708,6 +708,7 @@ var wantRouteMounts = []routeMount{
 	// route behind RequireController, not a per-user credential, so no per-user
 	// limiter — like the poll and status routes above.
 	{"POST", "/api/controller/workers/{workerID}/drain", noLimiter},
+	{"POST", "/api/controller/workers/{workerID}/dind-maintenance", noLimiter},
 	// Controller uncordon control-write (issue #458): same fleet-scoped controller-only
 	// route (same path, DELETE) behind RequireController, so no per-user limiter either.
 	{"DELETE", "/api/controller/workers/{workerID}/drain", noLimiter},

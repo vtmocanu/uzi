@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -392,10 +394,11 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 // worker never sends the snapshot — the same shape an old worker sees.
 func protocolFeatures(activeSnapshotEnabled bool) []string {
 	groups := [][]string{
+		{"dind_maintenance_v1"},
 		{"recovery_park_cause", "recovery_release_exact_echo"}, // PRD #1392 M1
-		{"heartbeat_outbox"},       // PRD #1391 M5, Run A
-		{"claim_generation_fence"}, // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker
-		{"terminal_fence"},         // PRD #1391 Run B M3c: this api fences a terminal transition on messages_through_seq contiguity
+		{"heartbeat_outbox"},                                   // PRD #1391 M5, Run A
+		{"claim_generation_fence"},                             // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker
+		{"terminal_fence"},                                     // PRD #1391 Run B M3c: this api fences a terminal transition on messages_through_seq contiguity
 		// Issue #1766 M2: this api accepts {status:"recovery_wait", recovery_cause:"vault_locked"}
 		// and stores the cause. Advertised UNCONDITIONALLY (no config gates the park): a worker
 		// must see it before sending the cause, because an older api 400s an unknown recovery_cause.
@@ -471,7 +474,9 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// The worker sends it only when the register response advertised
 		// `heartbeat_outbox` AND a run has depth, so an older api never sees it and a
 		// current worker on a rolled-back api strips it on the generic-400 retry (D8).
-		Outbox json.RawMessage `json:"outbox"`
+		Outbox                  json.RawMessage                    `json:"outbox"`
+		DindMeter               json.RawMessage                    `json:"dind_meter"`
+		DindMaintenanceReadyACK *workersvc.DindMaintenanceReadyACK `json:"dind_maintenance_ready_ack"`
 		// ActiveSnapshot is the worker's active-run snapshot (PRD #1390 M2a), its OWN isolated
 		// json.RawMessage like Stats/Outbox and for the same reason: a malformed body must drop
 		// the snapshot WITHOUT failing the heartbeat's liveness. The worker sends it only when
@@ -488,6 +493,12 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// Second step: validate + clamp the isolated stats (Decision 5). A malformed or
 	// invalid sample drops to nil (columns written NULL) and the heartbeat still 200s.
 	stats := parseWorkerStats(req.Stats, wkr.ID)
+	if stats != nil && len(req.DindMeter) > 0 {
+		var meter workersvc.DindMeter
+		if json.Unmarshal(req.DindMeter, &meter) == nil {
+			stats.DindMeter = &meter
+		}
+	}
 	// Same defensive second step for the isolated outbox (PRD #1391 M5): validate
 	// drop-not-fail and hand the parsed entries to the service, which records them in
 	// its in-process tracker. An absent/empty/malformed body yields nil — which CLEARS
@@ -540,7 +551,24 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if t := h.wsvc.DiskPressureThreshold(); t > 0 && t <= 1 {
 		dto.DiskPressureThreshold = &t
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"worker": dto})
+	maintenance := workersvc.DindMaintenanceFromWorker(updated)
+	if req.DindMaintenanceReadyACK != nil {
+		var ackErr error
+		maintenance, ackErr = h.wsvc.AckDindMaintenance(r.Context(), wkr.ID, *req.DindMaintenanceReadyACK)
+		if errors.Is(ackErr, workersvc.ErrDindMaintenanceConflict) {
+			httpx.Error(w, http.StatusConflict, "maintenance precondition failed")
+			return
+		}
+		if ackErr != nil {
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+	response := map[string]any{"worker": dto}
+	if slices.Contains(updated.ProtocolCapabilities, capability.DindMaintenanceV1) {
+		response["dind_maintenance"] = maintenance
+	}
+	httpx.JSON(w, http.StatusOK, response)
 }
 
 // Outbox heartbeat validation bounds (PRD #1391 M5). The report is untrusted
