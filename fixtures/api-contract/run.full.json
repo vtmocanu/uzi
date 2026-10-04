@@ -16,6 +16,7 @@
   "is_planning": true,
   "auto_approve": true,
   "plan_cross_check_required": true,
+  "plan_cross_check_gate_reason": "x",
   "trigger_source": "x",
   "milestones": [
     {

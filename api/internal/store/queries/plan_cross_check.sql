@@ -38,7 +38,9 @@ WITH candidates AS MATERIALIZED (
 )
 SELECT target.id, target.kind, target.target_run_id, target.worker_id,
        target.claim_generation, target.cross_check_id, target.parent_lead_id,
-       locks.locked_parent_ids
+       -- Return the parent set once, avoiding targets × parents output growth.
+       CASE WHEN row_number() OVER (ORDER BY target.id, target.cross_check_id) = 1
+           THEN locks.locked_parent_ids ELSE ARRAY[]::uuid[] END AS locked_parent_ids
 FROM parent_lock_set locks CROSS JOIN frozen_targets target
 ORDER BY target.id, target.cross_check_id;
 

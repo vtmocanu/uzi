@@ -44,6 +44,7 @@ type stateRequestMinusGateRevision struct {
 	CandidateDigest           string                     `json:"candidate_digest,omitempty"`
 	PlanCrossCheckGateReason  *string                    `json:"plan_cross_check_gate_reason"`
 	PlanCrossCheckDiffRefusal string                     `json:"plan_cross_check_diff_refusal"`
+	PlanCrossCheckRefusal     string                     `json:"plan_cross_check_refusal"`
 	PlanMd                    *string                    `json:"plan_md"`
 	Branch                    *string                    `json:"branch"`
 	MrIID                     *int64                     `json:"mr_iid"`

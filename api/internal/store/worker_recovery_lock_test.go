@@ -73,14 +73,18 @@ func TestWorkerRecoveryLockIdentitiesLiveDB(t *testing.T) {
 	if len(rows) != len(wantTargets) {
 		t.Fatalf("targets=%v, want IDs=%v", rows, wantTargets)
 	}
+	parentSetRows := 0
 	for _, row := range rows {
 		generation, ok := wantTargets[row.ID]
 		if !ok || row.ClaimGeneration != generation || row.WorkerID != pgU(f.workerID) {
 			t.Fatalf("unexpected frozen identity: %+v", row)
 		}
 		delete(wantTargets, row.ID)
-		if !reflect.DeepEqual(row.LockedParentIds, wantParents) {
-			t.Fatalf("parents=%v, want=%v", row.LockedParentIds, wantParents)
+		if len(row.LockedParentIds) > 0 {
+			parentSetRows++
+			if !reflect.DeepEqual(row.LockedParentIds, wantParents) {
+				t.Fatalf("parents=%v, want=%v", row.LockedParentIds, wantParents)
+			}
 		}
 		switch row.ID {
 		case fx.checkerID:
@@ -102,6 +106,9 @@ func TestWorkerRecoveryLockIdentitiesLiveDB(t *testing.T) {
 				t.Fatalf("ordinary target is not its own parent: %+v", row)
 			}
 		}
+	}
+	if parentSetRows != 1 {
+		t.Fatalf("parent set returned %d times, want once", parentSetRows)
 	}
 	empty, err := f.q.LockWorkerRecoveryParents(ctx, store.LockWorkerRecoveryParentsParams{
 		WorkerID: pgU(otherWorker), SnapshotRunIds: []uuid.UUID{f.runID},
@@ -190,13 +197,20 @@ func TestWorkerRecoveryParentLockOrderLiveDB(t *testing.T) {
 	if len(rows) != 2 {
 		t.Fatalf("frozen targets=%v", rows)
 	}
+	parentSetRows := 0
 	for _, row := range rows {
 		if row.ID == fx.checkerID && row.ClaimGeneration != 0 {
 			t.Fatalf("checker identity changed during parent wait: %+v", row)
 		}
-		if !reflect.DeepEqual(row.LockedParentIds, parents) {
-			t.Fatalf("actual parent set=%v, want=%v", row.LockedParentIds, parents)
+		if len(row.LockedParentIds) > 0 {
+			parentSetRows++
+			if !reflect.DeepEqual(row.LockedParentIds, parents) {
+				t.Fatalf("actual parent set=%v, want=%v", row.LockedParentIds, parents)
+			}
 		}
+	}
+	if parentSetRows != 1 {
+		t.Fatalf("parent set returned %d times, want once", parentSetRows)
 	}
 	probeWorkerRecoveryLock(ctx, t, f, "SELECT id FROM runs WHERE id=$1 FOR UPDATE NOWAIT", parents[1], true)
 	probeWorkerRecoveryLock(ctx, t, f, "SELECT id FROM runs WHERE id=$1 FOR UPDATE NOWAIT", fx.checkerID, false)
