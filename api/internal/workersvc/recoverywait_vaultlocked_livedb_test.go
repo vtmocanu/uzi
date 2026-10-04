@@ -190,6 +190,57 @@ func TestRecoveryWaitVaultUnlockEarlyPromoteReclaimLiveDB(t *testing.T) {
 	}
 }
 
+// Issue #1792 review: a promoted run keeps worker_id and claim_generation, so the previous
+// worker's delayed running report at the SAME generation passes the service fence. SetRunRunning
+// must refuse it against the queued row; only a fresh Claim moves the run on.
+func TestRecoveryWaitVaultUnlockPromoteRefusesStaleRunningReportLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, _, repoID := env.seedCodexInfra(t)
+	enableClaimAssembly(t, env, userID)
+	wk := seedSnapshotWorker(t, env, userID, "nonce-stale-running")
+	svc := snapshotSvc(env, testParams())
+	runID := seedOutageRun(t, env, userID, repoID, wk, "running", "issue", 3, 0)
+	cause := "vault_locked"
+	if _, applied, err := svc.SetState(env.ctx, wkrRow(t, env, wk), runID,
+		StateRequest{State: "recovery_wait", RecoveryCause: &cause, ClaimGeneration: i64Ptr(3)}); err != nil || !applied {
+		t.Fatalf("park: applied=%v err=%v", applied, err)
+	}
+	vlt := vault.New(env.box, env.q)
+	svc.SetVault(vlt)
+	if err := vlt.Unlock(env.ctx, userID, codexVaultLockedTestPassword); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.PromoteVaultLockedRecoveryWaitRuns(env.ctx, userID); err != nil {
+		t.Fatal(err)
+	}
+	if got := statusOf(t, env, runID); got != "queued" {
+		t.Fatalf("after the unlock promotion status = %q, want queued", got)
+	}
+
+	// The old worker's delayed running report, same generation: refused, row stays queued.
+	if _, applied, err := svc.SetState(env.ctx, wkrRow(t, env, wk), runID,
+		StateRequest{State: "running", ClaimGeneration: i64Ptr(3)}); applied || (err != nil && !errors.Is(err, ErrStaleClaim)) {
+		t.Fatalf("stale same-generation running report: applied=%v err=%v, want refused (not applied, nil or ErrStaleClaim)", applied, err)
+	}
+	if got := statusOf(t, env, runID); got != "queued" {
+		t.Fatalf("stale running report flipped the promoted run: status = %q, want queued", got)
+	}
+
+	// A fresh claim, then a running report at the new generation, succeeds.
+	env.exec(`UPDATE runs SET updated_at = now() - interval '3 hours' WHERE id = $1`, runID)
+	payload, err := svc.Claim(env.ctx, wkrRow(t, env, wk), nil)
+	if err != nil || payload == nil || payload.RunID != runID.String() || payload.ClaimGeneration != 4 {
+		t.Fatalf("reclaim: payload=%+v err=%v, want generation 4", payload, err)
+	}
+	if _, applied, err := svc.SetState(env.ctx, wkrRow(t, env, wk), runID,
+		StateRequest{State: "running", ClaimGeneration: i64Ptr(4)}); err != nil || !applied {
+		t.Fatalf("running at the new generation: applied=%v err=%v", applied, err)
+	}
+	if got := statusOf(t, env, runID); got != "running" {
+		t.Fatalf("status after the new-generation report = %q, want running", got)
+	}
+}
+
 // A worker can finish reporting its park after the explicit unlock's UPDATE has
 // passed. There is no background promotion; this late park still waits for the timer.
 func TestRecoveryWaitVaultUnlockDelayedParkUsesTimerLiveDB(t *testing.T) {
