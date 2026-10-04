@@ -464,6 +464,7 @@ function scenarioFailureDiagnostic(s: Scenario, label: string): string {
       .filter((state) => state.runId === s.runId)
       .map((state) => state.body);
     const failed = states.filter((state) => state.status === "failed");
+    const gateReports = states.filter((state) => state.status === "awaiting_approval");
     const hasError = Object.hasOwn(flight, "error");
     const error = flight.error;
     const errorDescription = error instanceof Error
@@ -475,6 +476,11 @@ function scenarioFailureDiagnostic(s: Scenario, label: string): string {
       generation: flight.claim.claim_generation,
       finished: flight.finished,
       statuses: bounded(states.map((state) => text(state.status)), 40),
+      gateObservations: gateReports.length === 0 ? "<no gate report>" : bounded(gateReports.map((state) => ({
+        planPresent: Boolean(state.plan_md),
+        matchesPlanV1: state.plan_md === PLAN_V1,
+        matchesRevisedPlan1: state.plan_md === revisedPlan(1),
+      })), 8),
       failedReports: failed.length === 0 ? "<no failed report>" : bounded(failed.map((state) => ({
         failure_reason: text(state.failure_reason),
         fail_origin: text(state.fail_origin),
