@@ -219,7 +219,7 @@ token is never exchanged again.
 Deploy the API before upgrading the affected workers. Older workers keep
 their existing first-request vault-lock reply, including pending retention,
 but still need the worker update to survive a lost response. See
-[ADR-1766](https://github.com/vtmocanu/uzi/blob/main/adr/1766-codex-vault-lock-park.md)
+[ADR-1766](../adr/1766-codex-vault-lock-park.md)
 for coordinated API replacement and rollback instructions.
 
 Because the account is quarantined in the directly covered case too, a
