@@ -339,6 +339,12 @@ describe("RunRunner — settle transfers the clone-only head into the trusted ba
       assert.equal(fakeClient.uploadCalls.length, 1, "the first upload was attempted and failed");
       const before = await coord.inspect(claim.run_id);
       assert.equal(before[0]!.state, "needs_action", "the first attempt left a journaled bundle");
+      const bare = git.barePathFor(fx.originPath);
+      const pinRef = `refs/uzi-recovery-pin/${claim.run_id}/${claim.claim_generation}`;
+      assert.equal(before[0]!.recoveryPinBareDir, path.basename(bare));
+      assert.equal(before[0]!.generation, 12);
+      assert.equal(before[0]!.finalizationPin, undefined);
+      assert.equal(gitRead(bare, "rev-parse", pinRef), before[0]!.sourceSha);
 
       // A FRESH coordinator over the SAME recoveryRoot + SAME worker token (so the MAC
       // authenticates), with a NEW client whose upload succeeds. resumePending re-uploads the
@@ -350,6 +356,8 @@ describe("RunRunner — settle transfers the clone-only head into the trusted ba
       const freshClient = new FakeRecoveryClient();
       const newCoord = coordOver(root, freshClient);
       await newCoord.resumePending();
+      assert.throws(() => gitRead(bare, "rev-parse", "--verify", pinRef));
+      assert.equal(fs.existsSync(before[0]!.bundlePath!), false);
       assert.equal(freshClient.uploadCalls.length, 1, "the journaled bundle bytes were re-uploaded");
       const after = await newCoord.inspect(claim.run_id);
       assert.equal(after.length, 1);

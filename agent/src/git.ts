@@ -1423,6 +1423,32 @@ export class GitCache {
     return path.join(this.reposRoot, bareDirName(repoUrl));
   }
 
+  /** Resolve a recovery journal basename to a real bare directly under the private repos root. */
+  async resolveRecoveryBareDir(bareDir: string): Promise<string | undefined> {
+    if (
+      !bareDir ||
+      bareDir === "." ||
+      bareDir === ".." ||
+      bareDir !== path.basename(bareDir) ||
+      bareDir.includes("\\") ||
+      bareDir.includes("\0")
+    ) {
+      return undefined;
+    }
+    const barePath = path.join(this.reposRoot, bareDir);
+    if (path.dirname(barePath) !== this.reposRoot) return undefined;
+    try {
+      const st = await fs.lstat(barePath);
+      if (st.isSymbolicLink() || !st.isDirectory()) return undefined;
+      const [realBare, realRoot] = await Promise.all([fs.realpath(barePath), fs.realpath(this.reposRoot)]);
+      if (path.dirname(realBare) !== realRoot) return undefined;
+    } catch {
+      return undefined;
+    }
+    if (!(await isBareRepo(barePath))) return undefined;
+    return barePath;
+  }
+
   /**
    * issue #1742 D4(a) — resolve a journaled bare-dir BASENAME (the `bareDirName` recorded on a
    * finalization-pinned recovery record) to the private bare under this cache's repos root and
@@ -1447,27 +1473,8 @@ export class GitCache {
     sourceSha: string,
     defaultBranch: string,
   ): Promise<{ status: "missing_bare" | "missing_sha" | "on_default" | "unpublished"; barePath?: string }> {
-    if (
-      !bareDir ||
-      bareDir === "." ||
-      bareDir === ".." ||
-      bareDir !== path.basename(bareDir) ||
-      bareDir.includes("\\") ||
-      bareDir.includes("\0")
-    ) {
-      return { status: "missing_bare" };
-    }
-    const barePath = path.join(this.reposRoot, bareDir);
-    if (path.dirname(barePath) !== this.reposRoot) return { status: "missing_bare" };
-    try {
-      const st = await fs.lstat(barePath);
-      if (st.isSymbolicLink() || !st.isDirectory()) return { status: "missing_bare" };
-      const [realBare, realRoot] = await Promise.all([fs.realpath(barePath), fs.realpath(this.reposRoot)]);
-      if (path.dirname(realBare) !== realRoot) return { status: "missing_bare" };
-    } catch {
-      return { status: "missing_bare" };
-    }
-    if (!(await isBareRepo(barePath))) return { status: "missing_bare" };
+    const barePath = await this.resolveRecoveryBareDir(bareDir);
+    if (!barePath) return { status: "missing_bare" };
     if (!/^[0-9a-f]{40}$/.test(sourceSha)) return { status: "missing_sha", barePath };
     return this.withLock(barePath, async () => {
       if ((await this.tryGit(barePath, ["rev-parse", "--verify", "--quiet", `${sourceSha}^{commit}`])) !== 0) {

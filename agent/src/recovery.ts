@@ -99,6 +99,8 @@ export interface RecoveryRecord {
   state: RecoveryLocalState;
   /** Absolute path of the verified bundle FILE (set at `bundled`). */
   bundlePath?: string;
+  /** MAC-covered basename for the transient recovery pin; installed only with fresh bundle bytes. */
+  recoveryPinBareDir?: string;
   /** Complete-bundle byte size (set at `bundled`). */
   byteSize?: number;
   /** Lowercase hex SHA-256 of the bundle bytes (set at `bundled`). */
@@ -175,6 +177,9 @@ export interface RecoveryBundleProducer {
     cloneUrl?: string,
     username?: string,
   ): Promise<string>;
+  /** Optional best-effort cleanup of the transient pin after durable upload. */
+  resolveRecoveryBareDir?(bareDir: string): Promise<string | undefined>;
+  deleteRecoveryPin?(barePath: string, runId: string, generation: number): Promise<void>;
   /** issue #1742 D4(a): resolve a journaled bare-dir basename under the private repos root and
    *  classify `sourceSha` against it (see `GitCache.resolveRestartSource`). Optional: a producer
    *  without it makes every finalization-pinned record `source_not_verifiable_after_restart`. */
@@ -784,7 +789,7 @@ export class RecoveryCoordinator {
       await fs.rm(tmpPath, { force: true }).catch(() => undefined);
       return { kind: "already_published" };
     }
-    const installed = await this.installBundle(record, result, tmpPath);
+    const installed = await this.installBundle(record, result, tmpPath, path.basename(input.barePath));
     if (installed.kind === "source_advanced") {
       this.log.warn("recovery: pinned source advanced while the bundle was produced; bytes discarded", {
         run_id: record.runId,
@@ -813,6 +818,7 @@ export class RecoveryCoordinator {
     snapshot: RecoveryRecord,
     result: RecoveryBundleResult,
     tmpPath: string,
+    recoveryPinBareDir?: string,
   ): Promise<{ kind: "bundled"; record: RecoveryRecord } | { kind: "source_advanced" }> {
     const finalPath = this.bundlePath(snapshot);
     try {
@@ -825,6 +831,7 @@ export class RecoveryCoordinator {
           ...cur,
           state: "bundled",
           bundlePath: finalPath,
+          ...(recoveryPinBareDir !== undefined ? { recoveryPinBareDir } : {}),
           byteSize: result.byteSize,
           checksum: result.checksum,
           chunkCount: result.chunkCount,
@@ -917,7 +924,8 @@ export class RecoveryCoordinator {
     }
     // A stream already in flight when cleanup ran cannot be recalled; this guarded write then
     // throws RecordGoneError instead of recreating the removed record.
-    await this.writeExistingRecord(current, (cur) => ({ ...cur, state: "uploaded", reason: undefined }));
+    const uploaded = await this.writeExistingRecord(current, (cur) => ({ ...cur, state: "uploaded", reason: undefined }));
+    await this.cleanupUploadedRecoveryPin(uploaded);
     // Bytes are durable on the server; free the local copy. The small journal record stays
     // (state=uploaded) so a restart sweep skips it.
     await fs.rm(current.bundlePath!, { force: true }).catch(() => undefined);
@@ -928,6 +936,22 @@ export class RecoveryCoordinator {
       server_state: status.state,
     });
     return { state: "uploaded", captureId: current.captureId };
+  }
+
+  /** One best-effort attempt after the authenticated uploaded write. A crash here may retain
+   * the transient ref indefinitely; settlement evidence and journals have their own lifecycle. */
+  private async cleanupUploadedRecoveryPin(record: RecoveryRecord): Promise<void> {
+    if (!record.recoveryPinBareDir || !this.git.resolveRecoveryBareDir || !this.git.deleteRecoveryPin) return;
+    try {
+      const barePath = await this.git.resolveRecoveryBareDir(record.recoveryPinBareDir);
+      if (!barePath) return;
+      await this.git.deleteRecoveryPin(barePath, record.runId, record.generation ?? 0);
+    } catch (err) {
+      this.log.warn("recovery: uploaded bundle pin cleanup failed", {
+        run_id: record.runId,
+        error: errText(err).slice(0, 512),
+      });
+    }
   }
 
   /** Classify a reserve/upload RPC failure and journal its disposition on the CURRENT record. */
@@ -1277,7 +1301,7 @@ export class RecoveryCoordinator {
         await this.sweepMark(record, reason, done);
         return;
       }
-      const installed = await this.installBundle(record, result, tmpPath);
+      const installed = await this.installBundle(record, result, tmpPath, record.bareDir);
       if (installed.kind === "source_advanced") {
         done("needs_action", "source_advanced");
         return;
@@ -1756,6 +1780,10 @@ function coerceRecord(obj: Record<string, unknown>): RecoveryRecord | null {
   if (str(obj.reason)) record.reason = obj.reason;
   // issue #1742 D4(a): the restart-sweep facts. A wrongly-typed value refuses the record (like
   // any other shape error); an unsafe bareDir is refused HERE, before it can reach a path join.
+  if (obj.recoveryPinBareDir !== undefined) {
+    if (!str(obj.recoveryPinBareDir) || !isSafeBareDirName(obj.recoveryPinBareDir)) return null;
+    record.recoveryPinBareDir = obj.recoveryPinBareDir;
+  }
   if (obj.bareDir !== undefined) {
     if (!str(obj.bareDir) || !isSafeBareDirName(obj.bareDir)) return null;
     record.bareDir = obj.bareDir;

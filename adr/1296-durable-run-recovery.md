@@ -468,3 +468,20 @@ briefly; the bytes are immutable and a byte-identical re-upload is idempotent.
 **Known gap, outside this change.** `release()`'s sibling count can treat a momentarily unreadable
 sibling record as absent and remove the run dir with that sibling's bundle; it predates this change
 (#1349/#1751) and was reported for separate follow-up.
+
+
+### Issue #2021: transient recovery pin cleanup after durable upload
+
+Fresh bundle installation adds the MAC-covered `recoveryPinBareDir` basename, independently of
+finalization restart facts. Existing bundled records are never backfilled. After the server accepts
+the bytes and the guarded authenticated `uploaded` write succeeds, one best-effort attempt resolves
+the private bare and deletes only the transient run/generation recovery pin (`generation ?? 0`).
+Missing metadata or capabilities, failed resolution and deletion failures retain the pin. Local
+bundle removal still proceeds. A crash between the uploaded write and cleanup may leave the pin
+indefinitely: no retry or cleanup scheduler is added. Settlement evidence pins and journals remain
+until their exact release.
+
+This accepts the MAC compatibility boundary noted above: an old worker refuses journals carrying
+this new field, while the new worker reads old field-absent journals. Rollback restores retries,
+inspection and adoption by returning to a compatible worker; refusal erases neither bytes nor pins.
+No server rollout is required.
