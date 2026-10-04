@@ -1185,7 +1185,13 @@ const WORKTREE_HEAD_SHA_ARGS = ["rev-parse", "--verify", "HEAD^{commit}"] as con
  * (runnerGitSpawnEnv).
  */
 export function worktreeHeadShaEnv(): NodeJS.ProcessEnv {
-  const env = runnerGitSpawnEnv(WORKTREE_HEAD_SHA_ARGS, { ...gitEnv(), PATH: runnerPath() });
+  const env = runnerGitSpawnEnv(WORKTREE_HEAD_SHA_ARGS, {
+    ...gitEnv(),
+    PATH: runnerPath(),
+    ...(process.env.GIT_CEILING_DIRECTORIES !== undefined
+      ? { GIT_CEILING_DIRECTORIES: process.env.GIT_CEILING_DIRECTORIES }
+      : {}),
+  });
   const tmp = runnerTmpdir();
   if (tmp) env.TMPDIR = tmp;
   return env;
