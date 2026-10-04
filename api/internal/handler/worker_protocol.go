@@ -1652,6 +1652,7 @@ func (h *Handler) WorkerRunCompletionPermit(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var body struct {
+		ScopeCapped      *bool  `json:"scope_capped"`
 		ContractRevision int    `json:"contract_revision"`
 		Branch           string `json:"branch"`
 		Head             string `json:"head"`
@@ -1672,7 +1673,7 @@ func (h *Handler) WorkerRunCompletionPermit(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	res, err := h.wsvc.RequestCompletionPermit(r.Context(), wkr, runID, workersvc.CompletionPermitRequest{
-		ContractRevision: body.ContractRevision, Branch: branch, Head: head, ClaimGeneration: body.ClaimGeneration,
+		ContractRevision: body.ContractRevision, Branch: branch, Head: head, ClaimGeneration: body.ClaimGeneration, ScopeCapped: body.ScopeCapped,
 	})
 	if err != nil {
 		switch {

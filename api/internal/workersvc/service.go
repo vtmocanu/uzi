@@ -4426,11 +4426,15 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// (the scope_ceiling directive did not drive this finalize). A scope_reduced completion
 		// then falls to the else-if and settles 'declined' ONLY if the run ALSO carried a
 		// scope_ceiling directive; a run with deferrals but no scope_ceiling settles nothing.
-		if scopeStopKind.Valid && scopeStopKind.String == "scope_capped" {
-			settleScopeDisposition = "applied"
-		} else if owned.ScopeCeiling.Valid {
-			settleScopeDisposition = "declined"
+		if !owned.CompletionContractVersion.Valid {
+			if scopeStopKind.Valid && scopeStopKind.String == "scope_capped" {
+				settleScopeDisposition = "applied"
+			} else if owned.ScopeCeiling.Valid {
+				settleScopeDisposition = "declined"
+			}
 		}
+		// Interlocked completion derives its stamp from the locked row; leave audit
+		// settlement to the committed reread below, including directives racing owned.
 		completedParams := store.SetRunCompletedParams{
 			Branch: stripNULParam(req.Branch), MrIid: pgconv.Int8Ptr(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
 			FixVerdict:          clampWireFixVerdict(req.FixVerdict),
