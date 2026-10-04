@@ -126,14 +126,38 @@ func TestScopeCapCompletionLiveDB(t *testing.T) {
 			if consumed != tc.applied {
 				t.Fatalf("consumed=%v want=%v", consumed, tc.applied)
 			}
-			// Multiple directives create multiple audit rows; every pending row follows the transition.
-			var pending, wrong int
-			if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FILTER (WHERE disposition IS NULL), count(*) FILTER (WHERE disposition IS NOT NULL AND disposition <> 'applied') FROM run_user_inputs WHERE run_id=$1 AND kind='scope'`, runID).Scan(&pending, &wrong); err != nil {
+			rows, err := e.pool.Query(e.ctx, `SELECT disposition FROM run_user_inputs WHERE run_id=$1 AND kind='scope' ORDER BY id`, runID)
+			if err != nil {
 				t.Fatal(err)
 			}
+			dispositions, err := pgx.CollectRows(rows, pgx.RowTo[*string])
+			if err != nil {
+				t.Fatal(err)
+			}
+			var latest *string
 			if tc.applied {
-				if run.Status != "completed" || run.StopKind.String != "scope_capped" || pending != 0 || wrong != 0 {
-					t.Fatalf("status=%s stop=%v pending=%d wrong=%d", run.Status, run.StopKind, pending, wrong)
+				latest = strPtr("applied")
+			}
+			wantDispositions := []*string{latest}
+			if tc.raise != 0 {
+				wantDispositions = []*string{strPtr("superseded"), latest}
+			}
+			if len(dispositions) != len(wantDispositions) {
+				t.Fatalf("scope audit rows=%d want=%d", len(dispositions), len(wantDispositions))
+			}
+			for i, want := range wantDispositions {
+				got := dispositions[i]
+				if want == nil {
+					if got != nil {
+						t.Fatalf("scope audit row %d disposition=%q want=NULL", i, *got)
+					}
+				} else if got == nil || *got != *want {
+					t.Fatalf("scope audit row %d disposition=%v want=%q", i, got, *want)
+				}
+			}
+			if tc.applied {
+				if run.Status != "completed" || run.StopKind.String != "scope_capped" {
+					t.Fatalf("status=%s stop=%v", run.Status, run.StopKind)
 				}
 				// A later edit must not invalidate a response-loss retry of an already consumed permit.
 				e.exec(t, `UPDATE runs SET scope_ceiling=4 WHERE id=$1`, runID)
@@ -141,8 +165,8 @@ func TestScopeCapCompletionLiveDB(t *testing.T) {
 				if err != nil || !ok || retry.Status != "completed" || retry.StopKind.String != "scope_capped" {
 					t.Fatalf("retry=%+v applied=%v err=%v", retry, ok, err)
 				}
-			} else if run.Status != "running" || pending == 0 || wrong != 0 {
-				t.Fatalf("rejected status=%s pending=%d wrong=%d", run.Status, pending, wrong)
+			} else if run.Status != "running" {
+				t.Fatalf("rejected status=%s", run.Status)
 			}
 		})
 	}
