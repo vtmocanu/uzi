@@ -617,5 +617,8 @@ UPDATE workers
 -- unambiguously "no such hosted worker" (clean 404), not "already clear". kind='hosted'
 -- mirrors CordonHostedWorker: never touch an external worker.
 UPDATE workers
-   SET draining_since = CASE WHEN maintenance_phase IN ('requested','ready','stopping','recycling') THEN draining_since ELSE NULL END, updated_at = now()
+   -- Releasing the legacy cordon hands a pending drain to maintenance for cleanup.
+   SET draining_since = CASE WHEN maintenance_phase IN ('requested','ready','stopping','recycling') THEN draining_since ELSE NULL END,
+       maintenance_owns_drain = maintenance_phase IN ('requested','ready','stopping','recycling'),
+       updated_at = now()
  WHERE id = @id AND kind = 'hosted';

@@ -215,7 +215,9 @@ WITH prev AS (
         -- without it, a drained worker stays cordoned forever. HeartbeatWorker deliberately
         -- does NOT touch draining_since: a draining worker heartbeats and must STAY draining
         -- until it actually rolls.
+        -- Clear-on-roll releases the legacy cordon; pending maintenance inherits its drain.
         draining_since      = CASE WHEN maintenance_phase IN ('requested', 'ready', 'stopping', 'recycling') THEN draining_since ELSE NULL END,
+        maintenance_owns_drain = maintenance_phase IN ('requested', 'ready', 'stopping', 'recycling'),
         -- PRD #2006: a register is a FRESH pod incarnation, so it ends any ephemeral lease: the
         -- row's warm state (the pod the lease kept) is gone. The reaper then releases the row.
         lease_since         = NULL,

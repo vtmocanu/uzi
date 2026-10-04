@@ -1034,7 +1034,10 @@ func (q *Queries) RebindLeasedEphemeralWorker(ctx context.Context, arg RebindLea
 
 const uncordonHostedWorker = `-- name: UncordonHostedWorker :execrows
 UPDATE workers
-   SET draining_since = CASE WHEN maintenance_phase IN ('requested','ready','stopping','recycling') THEN draining_since ELSE NULL END, updated_at = now()
+   -- Releasing the legacy cordon hands a pending drain to maintenance for cleanup.
+   SET draining_since = CASE WHEN maintenance_phase IN ('requested','ready','stopping','recycling') THEN draining_since ELSE NULL END,
+       maintenance_owns_drain = maintenance_phase IN ('requested','ready','stopping','recycling'),
+       updated_at = now()
  WHERE id = $1 AND kind = 'hosted'
 `
 

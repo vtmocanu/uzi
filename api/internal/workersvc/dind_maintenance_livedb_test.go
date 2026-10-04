@@ -497,16 +497,31 @@ func TestDindMaintenanceMeterDistinctEpochsLiveDB(t *testing.T) {
 					DiskDindInodes: &inodes, DiskDindTotalInodes: &total,
 				}
 			}
-			current, err := svc.Heartbeat(env.ctx, w, stats, nil, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if current.DindPressureStreak != 0 || current.DindBelowThreshold {
-				t.Fatalf("invalid meter retained evidence: streak=%d below=%v", current.DindPressureStreak, current.DindBelowThreshold)
-			}
-			if current.DindMeterEpoch != accepted.DindMeterEpoch || !current.DindMeterAt.Valid ||
-				!current.DindMeterAt.Time.Equal(accepted.DindMeterAt.Time) {
-				t.Fatal("invalid meter changed the last accepted watermark")
+			for _, evidence := range []struct {
+				name   string
+				streak int32
+				below  bool
+			}{
+				{name: "pressure", streak: 2, below: false},
+				{name: "below", streak: 0, below: true},
+			} {
+				t.Run(evidence.name, func(t *testing.T) {
+					env.exec(`UPDATE workers SET dind_meter_epoch = $2, dind_meter_at = $3,
+						dind_pressure_streak = $4, dind_below_threshold = $5
+						WHERE id = $1`, w.ID, accepted.DindMeterEpoch, accepted.DindMeterAt.Time,
+						evidence.streak, evidence.below)
+					current, err := svc.Heartbeat(env.ctx, w, stats, nil, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if current.DindPressureStreak != 0 || current.DindBelowThreshold {
+						t.Fatalf("invalid meter retained evidence: streak=%d below=%v", current.DindPressureStreak, current.DindBelowThreshold)
+					}
+					if current.DindMeterEpoch != accepted.DindMeterEpoch || !current.DindMeterAt.Valid ||
+						!current.DindMeterAt.Time.Equal(accepted.DindMeterAt.Time) {
+						t.Fatal("invalid meter changed the last accepted watermark")
+					}
+				})
 			}
 		})
 	}
@@ -524,6 +539,61 @@ func TestDindMaintenanceMeterDistinctEpochsLiveDB(t *testing.T) {
 	beat(base.Add(5*time.Second), nonce, 0, false)
 	beat(base.Add(6*time.Second), freshNonce, 1, false)
 	beat(base.Add(7*time.Second), freshNonce, 2, false)
+}
+
+func TestDindMaintenanceLegacyDrainHandoffLiveDB(t *testing.T) {
+	for _, release := range []string{"uncordon", "registration"} {
+		t.Run(release, func(t *testing.T) {
+			env, w, svc, target := dindLiveFixture(t)
+			env.exec(`UPDATE workers SET maintenance_phase = '', maintenance_fenced = false,
+				maintenance_owns_drain = false, draining_since = NULL WHERE id = $1`, w.ID)
+			if rows, err := env.q.CordonHostedWorker(env.ctx, w.ID); err != nil || rows != 1 {
+				t.Fatalf("legacy cordon: rows=%d err=%v", rows, err)
+			}
+			request := DindMaintenance{Phase: "requested", DeploymentUID: target.DeploymentUID, PVCUID: target.PVCUID}
+			op, err := svc.TransitionDindMaintenance(env.ctx, w.ID, request)
+			if err != nil || op == nil {
+				t.Fatalf("request: %+v err=%v", op, err)
+			}
+			op.Phase = "ready"
+			op, err = svc.TransitionDindMaintenance(env.ctx, w.ID, *op)
+			if err != nil || op == nil {
+				t.Fatalf("ready: %+v err=%v", op, err)
+			}
+			before, err := env.q.GetWorkerByID(env.ctx, w.ID)
+			if err != nil || before.MaintenanceOwnsDrain || !before.MaintenanceFenced || !before.DrainingSince.Valid {
+				t.Fatalf("legacy drain before release: %+v err=%v", before, err)
+			}
+			wantPhase := "ready"
+			if release == "uncordon" {
+				if rows, err := env.q.UncordonHostedWorker(env.ctx, w.ID); err != nil || rows != 1 {
+					t.Fatalf("legacy uncordon: rows=%d err=%v", rows, err)
+				}
+			} else {
+				wantPhase = "requested"
+				if _, err := env.q.RegisterWorker(env.ctx, store.RegisterWorkerParams{
+					ID: w.ID, ProtocolCapabilities: []string{capability.DindMaintenanceV1},
+					SnapshotRegisterNonce: pgconv.TextOrNull(uuid.NewString()),
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			current, err := env.q.GetWorkerByID(env.ctx, w.ID)
+			if err != nil || current.MaintenancePhase != wantPhase || !current.MaintenanceOwnsDrain || !current.MaintenanceFenced ||
+				!current.DrainingSince.Valid || !current.DrainingSince.Time.Equal(before.DrainingSince.Time) {
+				t.Fatalf("legacy release lost pending drain/fence or ownership: %+v err=%v", current, err)
+			}
+			op.Phase, op.Reason = "cancelled", "recycle_disabled"
+			if cancelled, err := svc.TransitionDindMaintenance(env.ctx, w.ID, *op); err != nil || cancelled == nil {
+				t.Fatalf("controller cancellation: %+v err=%v", cancelled, err)
+			}
+			current, err = env.q.GetWorkerByID(env.ctx, w.ID)
+			if err != nil || current.MaintenancePhase != "cancelled" || current.MaintenanceOwnsDrain ||
+				current.MaintenanceFenced || current.DrainingSince.Valid {
+				t.Fatalf("cancellation retained handed-off drain/fence: %+v err=%v", current, err)
+			}
+		})
+	}
 }
 
 func TestDindMaintenanceDrainCancellationRegistrationLiveDB(t *testing.T) {
