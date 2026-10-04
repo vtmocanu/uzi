@@ -5641,11 +5641,16 @@ export class RunRunner {
         failure_reason: composeWorkflowScopeReason(paths, patch !== undefined).slice(0, MAX_FAILURE_REASON_LEN),
         preserved_patch: patch });
     };
-    const freshWorkflowFiles = async (tip: string, latchUnavailable = false): Promise<string[] | null> => {
-      const defaultBranch = claim.repo.default_branch?.trim() ||
-        (await this.git.defaultBranchName(workflowBarePath)) || "main";
-      const freshDefault = await this.git.fetchDefaultTip(workflowBarePath, defaultBranch,
-        claim.secrets.forge_pat, claim.repo.clone_url, claim.secrets.forge_username);
+    const freshWorkflowFiles = async (
+      tip: string, latchUnavailable = false, fetchedDefault?: string,
+    ): Promise<string[] | null> => {
+      let freshDefault = fetchedDefault;
+      if (freshDefault === undefined) {
+        const defaultBranch = claim.repo.default_branch?.trim() ||
+          (await this.git.defaultBranchName(workflowBarePath)) || "main";
+        freshDefault = await this.git.fetchDefaultTip(workflowBarePath, defaultBranch,
+          claim.secrets.forge_pat, claim.repo.clone_url, claim.secrets.forge_username);
+      }
       const target = await this.git.fetchWorkflowTargetTip(workflowBarePath, result.branch,
         claim.secrets.forge_pat, claim.repo.clone_url, claim.secrets.forge_username);
       if (target.kind === "unavailable") {
@@ -6083,9 +6088,28 @@ export class RunRunner {
             { run_id: runId, error: errMessage(e) },
           );
         }
+        if (defaultTip && differs && !workflowUnavailable) {
+          try {
+            const hits = await freshWorkflowFiles(trackingRef, true, defaultTip);
+            if (hits === null) {
+              workflowUnavailable = true;
+            } else {
+              workflowPermitted = hits.length === 0;
+              workflowBranchChanges = await this.git.changedFiles(alignBarePath, trackingRef);
+              workflowOverlayForbidden = hits.length > 0 && workflowBranchChanges === null;
+            }
+          } catch (e) {
+            rethrowWorkflowAbort(e);
+            if (e instanceof WorkflowScopeBlockedSignal) throw e;
+            workflowUnavailable = true;
+            runLog.warn("finalize base-align: workflow eligibility unavailable; pushing without aligning", {
+              run_id: runId, error: errMessage(e),
+            });
+          }
+        }
         const bypassAlignment = workflowPermitted && (workflowBranchChanges === null ||
           workflowBranchChanges.some((file) => file.startsWith(".github/workflows/")));
-        if (defaultTip && differs && !bypassAlignment) {
+        if (defaultTip && differs && !workflowUnavailable && !bypassAlignment) {
           // The pre-align committed agent tip — the base every align strategy starts from, so
           // a rebase FALLBACK after a clean merge replays the ORIGINAL commits, not the merge.
           const originalAgentTip = await this.git.branchTip(
