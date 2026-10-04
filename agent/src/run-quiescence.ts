@@ -11,8 +11,8 @@
 //     them to this run's clone, SIGKILLs the ones this run owns, rescans until the scan is empty,
 //     and reports `quiescent`, `survivors` or `unverified`. Both non-quiescent results fail
 //     closed at every caller: the worker never treats "could not prove it" as "proved it".
-//   - The DOCKER TEARDOWN force-removes every container with a bind mount under the clone, then
-//     lists until two consecutive listings are clean. It never reports quiescence: a create the
+//   - The DOCKER TEARDOWN force-removes every container with a bind mount under the clone, with
+//     its anonymous volumes (`v=1`; named volumes survive), then lists until two consecutive listings are clean. It never reports quiescence: a create the
 //     daemon already accepted can still complete after the last listing, so its best result is
 //     `docker_unconfirmed`.
 //
@@ -1254,8 +1254,9 @@ function boundContainers(body: string, targetPaths: string[]): string[] {
 }
 
 /**
- * Force-remove every container with a mount source under a target path, then keep listing (1 s
- * apart) until two consecutive listings are clean. The overall deadline (15 s default) is checked
+ * Force-remove every container with a mount source under a target path, together with its
+ * anonymous volumes (`v=1`; named volumes survive, as Docker never removes them on container
+ * removal), then keep listing (1 s apart) until two consecutive listings are clean. The overall deadline (15 s default) is checked
  * before EVERY request, list and delete alike: once it has passed no further request starts and
  * the result is `docker_error`. Each request is bounded by min(per-request timeout (5 s default),
  * time left to the deadline), applied both as the socket inactivity timeout and as an absolute
@@ -1312,7 +1313,7 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
           const del = await dockerRequest(
             ep,
             "DELETE",
-            `/containers/${encodeURIComponent(id)}?force=1`,
+            `/containers/${encodeURIComponent(id)}?force=1&v=1`,
             Math.min(reqTimeout, remaining),
             opts.maxBodyBytes,
           );

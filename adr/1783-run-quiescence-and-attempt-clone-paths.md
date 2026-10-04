@@ -50,7 +50,8 @@ removes the tree.
    unattributable process, a helper timeout, a malformed answer) and `survivors` both **fail closed**: the
    worker never treats "could not prove it" as "proved it."
 3. **A Docker Engine API teardown** force-removes every container with a bind
-   mount under the clone, then lists until two consecutive listings are clean. Its
+   mount under the clone, together with its anonymous volumes (`v=1`, #2236;
+   named volumes survive), then lists until two consecutive listings are clean. Its
    results are `not_wired` (no daemon configured), `docker_unconfirmed`, or
    `docker_error`. **It never reports `quiescent`**: a `create` the daemon already
    accepted can still complete after the last listing, so no Docker result may

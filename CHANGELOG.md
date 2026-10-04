@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Per-run Docker teardown no longer leaks anonymous volumes ([#2236](https://github.com/vtmocanu/uzi/issues/2236)).**
+  When a run ends, each container bound under the run's clone is now removed together with its anonymous volumes, so they no longer pile up on a docker-tier worker's `dind-data` volume. Named volumes and containers not bound under the clone are left untouched.
+
 - **Oversized Forgejo error responses fail without exposing body fragments ([#2231](https://github.com/vtmocanu/uzi/issues/2231)).**
   Non-success responses are capped at 4 KiB and an overflowing body is discarded before redaction, preventing a token split at the read boundary from leaking through SDK, raw GET or issue PATCH errors. HTTP error classification is preserved, and successful responses retain the 32 MiB transport cap.
 
