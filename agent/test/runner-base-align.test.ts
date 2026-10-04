@@ -223,28 +223,99 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.strictEqual(calls.length, 0);
   });
 
-  it("an unavailable target at precheck latches fail-open instead of implying absence", async () => {
-    seedWorkflowsOnOrigin();
-    const { github, calls } = fakeGitHub();
-    let targetReads = 0;
-    let classified = 0;
-    const classify = git.branchWorkflowFiles.bind(git);
-    git.fetchWorkflowTargetTip = (async () => {
-      targetReads++;
-      return { kind: "unavailable" };
-    }) as typeof git.fetchWorkflowTargetTip;
-    git.branchWorkflowFiles = (async (...args: Parameters<typeof git.branchWorkflowFiles>) => {
-      classified++;
-      return classify(...args);
-    }) as typeof git.branchWorkflowFiles;
-    const claim = githubClaim(1876);
-    await githubRunner(github, committingExecutor({ "impl.ts": "unavailable target task\n" })).execute(claim);
-    assert.strictEqual(api.states.filter((s) => s.runId === claim.run_id).at(-1)?.body.status, "completed");
-    assert.strictEqual(targetReads, 1, "earlier unavailability skips the final local guard");
-    assert.strictEqual(classified, 0, "unavailable must not become default-only comparison");
-    assert.strictEqual(calls.length, 1);
-    assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-1876:impl.ts"]), "unavailable target task");
-  });
+  for (const [index, failure] of ["unavailable", "ordinary error"].entries()) {
+    it(`recovers from first precheck target lookup ${failure} with fresh alignment and final reads`, async () => {
+      seedWorkflowsOnOrigin();
+      const initialDefault = gitIn(fx.originPath, ["rev-parse", "main"]);
+      const { github, calls } = fakeGitHub();
+      const strategies = spyAlign();
+      const alignedDefaults: string[] = [];
+      const align = git.alignBranchWithDefault.bind(git);
+      git.alignBranchWithDefault = (async (...args: Parameters<typeof git.alignBranchWithDefault>) => {
+        alignedDefaults.push(args[3]);
+        return align(...args);
+      }) as typeof git.alignBranchWithDefault;
+
+      const defaultTips: string[] = [];
+      const fetch = git.fetchDefaultTip.bind(git);
+      git.fetchDefaultTip = (async (...args: Parameters<typeof git.fetchDefaultTip>) => {
+        if (defaultTips.length === 1) {
+          commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "advance after unavailable precheck");
+        }
+        const sha = await fetch(...args);
+        defaultTips.push(sha);
+        return sha;
+      }) as typeof git.fetchDefaultTip;
+      let targetReads = 0;
+      const target = git.fetchWorkflowTargetTip.bind(git);
+      git.fetchWorkflowTargetTip = (async (...args: Parameters<typeof git.fetchWorkflowTargetTip>) => {
+        if (++targetReads === 1) {
+          if (failure === "ordinary error") throw new Error("precheck target lookup failed");
+          return { kind: "unavailable" };
+        }
+        return target(...args);
+      }) as typeof git.fetchWorkflowTargetTip;
+      const snapshots: { defaultTip: string; files: string[] | null }[] = [];
+      const classify = git.branchWorkflowFiles.bind(git);
+      git.branchWorkflowFiles = (async (...args: Parameters<typeof git.branchWorkflowFiles>) => {
+        const files = await classify(...args);
+        snapshots.push({ defaultTip: args[1], files });
+        return files;
+      }) as typeof git.branchWorkflowFiles;
+
+      let pushes = 0;
+      const push = git.pushBranch.bind(git);
+      git.pushBranch = (async (...args: Parameters<typeof git.pushBranch>) => {
+        pushes++;
+        return push(...args);
+      }) as typeof git.pushBranch;
+      const pushArgs: string[][] = [];
+      const commands = git as unknown as {
+        runGit: (cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string) => Promise<string>;
+      };
+      const runGit = commands.runGit.bind(git);
+      commands.runGit = async (...args: Parameters<typeof commands.runGit>) => {
+        if (args[1][0] === "push") pushArgs.push([...args[1]]);
+        return runGit(...args);
+      };
+
+      let implementationSha = "";
+      const executor = committingExecutor({ "impl.ts": "recovered implementation\n" });
+      const claim = githubClaim(1876 + index);
+      await githubRunner(github, {
+        run: async (ctx: RunContext) => {
+          const result = await executor.run(ctx);
+          implementationSha = gitIn(ctx.worktreePath, ["rev-parse", "HEAD"]);
+          return result;
+        },
+      }).execute(claim);
+
+      const freshDefault = gitIn(fx.originPath, ["rev-parse", "main"]);
+      assert.notStrictEqual(freshDefault, initialDefault, "main advanced after the failed precheck");
+      assert.strictEqual(targetReads, 3, "precheck failure must not skip fresh eligibility or the final read");
+      assert.deepStrictEqual(defaultTips, [initialDefault, freshDefault, freshDefault]);
+      assert.deepStrictEqual(snapshots, [
+        { defaultTip: freshDefault, files: [".github/workflows/ci.yml"] },
+        { defaultTip: freshDefault, files: [] },
+      ], "real fresh eligibility uses the fetched align SHA and final classification sees aligned workflows");
+      assert.deepStrictEqual(alignedDefaults, [defaultTips[1]], "align uses the exact eligibility snapshot");
+      assert.deepStrictEqual(strategies, ["workflow-subtree"], "real workflow-subtree alignment ran");
+      const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+      assert.deepStrictEqual(states.map((s) => s.status), ["running", "running", "completed"]);
+      assert.ok(states.every((s) => s.fail_origin !== "workflow_scope_missing"));
+      assert.strictEqual(pushes, 1, "one real pushBranch call");
+      assert.strictEqual(pushArgs.length, 1, "one real git push");
+      assert.ok(pushArgs[0]!.every((arg) => !arg.startsWith("--force") && arg !== "-f" && !arg.startsWith("+")),
+        "no force flags or forced refspec");
+      const published = gitIn(fx.originPath, ["rev-parse", `agent/issue-${1876 + index}`]);
+      assert.ok(implementationSha, "captured executor commit before alignment");
+      assert.strictEqual(gitIn(fx.originPath, ["merge-base", "--is-ancestor", implementationSha, published]), "");
+      assert.strictEqual(gitIn(fx.originPath, ["show", `${published}:impl.ts`]), "recovered implementation");
+      assert.strictEqual(gitIn(fx.originPath, ["rev-parse", `${published}:.github/workflows`]),
+        gitIn(fx.originPath, ["rev-parse", `${freshDefault}:.github/workflows`]), "published workflows match fresh main");
+      assert.strictEqual(calls.length, 1);
+    });
+  }
 
   for (const [index, failure] of [
     "unavailable target", "null classifier", "thrown target", "thrown classifier",

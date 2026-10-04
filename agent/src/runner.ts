@@ -5664,7 +5664,7 @@ export class RunRunner {
       let hits: string[] | null = null;
       try {
         steps?.enter("default_fetch");
-        hits = await freshWorkflowFiles(trackingRef, true);
+        hits = await freshWorkflowFiles(trackingRef);
         workflowPermitted = hits !== null && hits.length === 0;
         if (hits !== null) {
           workflowBranchChanges = await this.git.changedFiles(workflowBarePath, trackingRef);
@@ -5672,8 +5672,7 @@ export class RunRunner {
         }
       } catch (error) {
         rethrowWorkflowAbort(error);
-        workflowUnavailable = true;
-        runLog.warn("workflow precheck unavailable; pushing normally", { run_id: runId, error: errMessage(error) });
+        runLog.warn("workflow precheck unavailable; deferring to fresh alignment eligibility", { run_id: runId, error: errMessage(error) });
       }
       if (hits && hits.length > 0 && workflowBranchChanges?.some((file) => file.startsWith(".github/workflows/"))) {
         await failWorkflowScope(hits);
