@@ -65,9 +65,10 @@ func TestHealthCrossCheckWaiting(t *testing.T) {
 				}
 				w = lastWrite(t, fs, r.ID)
 				want, reason := healthStalled, reasonStalled
-				if mode == "near budget" {
+				switch mode {
+				case "near budget":
 					want, reason = healthSlow, reasonNearTimeout
-				} else if mode == "long tool call" {
+				case "long tool call":
 					reason = reasonLongToolCall
 				}
 				if w.Health != want || w.HealthReason.String != reason || w.HealthNotifiedAt.Valid || b.healthNudges[1] {

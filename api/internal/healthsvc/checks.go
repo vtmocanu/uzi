@@ -450,7 +450,8 @@ func runDiskWarnPercent() int {
 // queue group
 // -------------------------------------------------------------------------
 
-// checkQueueWaiting bands the oldest waiting_worker run by age: warn at queueWaitingWarn,
+// checkQueueWaiting bands the oldest admission-related waiting_worker run by age;
+// expected plan cross-check waits are excluded. Warn at queueWaitingWarn,
 // danger at queueWaitingDanger. `unknown` when health_enabled is off (the writer is gated
 // by it, D6), and `unknown` when the kill-switch read itself failed (the signal cannot be
 // trusted to read green, so the run tables are not queried).

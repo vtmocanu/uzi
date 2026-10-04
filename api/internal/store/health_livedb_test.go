@@ -203,7 +203,7 @@ func TestHealthChecksLiveDB(t *testing.T) {
 	}
 
 	// -------------------------------------------------------------------------
-	// OldestWaitingWorkerRun: the global min health_since across every waiting run.
+	// OldestWaitingWorkerRun: the global min health_since across admission waits.
 	// (The noCap owner's 9-minute wait above is the oldest seeded so far.)
 	// -------------------------------------------------------------------------
 	oldest, err := q.OldestWaitingWorkerRun(ctx)

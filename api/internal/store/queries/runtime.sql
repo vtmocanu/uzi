@@ -9894,11 +9894,13 @@ WHERE run_id = @run_id AND consumed_at IS NULL AND contract_revision < @new_revi
 -- is silent (a heartbeat-based signal, not status-based). The conjunction with "zero
 -- usable workers" is what makes waiting_worker a CAPACITY failure rather than one of its
 -- other causes (vault locked, custody limit, all workers busy) — those surface through
--- queue.waiting by age instead.
+-- queue.waiting by age instead. Expected plan cross-check waits are excluded:
+-- an owned check finishing is not a lead waiting for worker admission.
 SELECT r.user_id, r.id AS run_id, r.health_since,
        (COALESCE(r.health_reason = @roll_reason::text, false))::boolean AS has_roll_reason
 FROM runs r
 WHERE r.health = 'waiting_worker'
+  AND r.health_reason IS DISTINCT FROM 'waiting for plan cross-check'
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
@@ -9909,13 +9911,15 @@ WHERE r.health = 'waiting_worker'
 
 -- name: OldestWaitingWorkerRun :one
 -- health queue.waiting: the oldest health_since across every run in
--- health='waiting_worker', or NULL when none is waiting. healthsvc applies warn >= 10 min
+-- health='waiting_worker', excluding expected plan cross-check waits, or NULL when
+-- none is waiting for admission. healthsvc applies warn >= 10 min
 -- and danger >= 30 min. This is the sole reader of the age; the writer (detectRunHealth)
 -- is gated by health_enabled, so when that setting is off the check reports unknown, not
 -- ok, rather than reading this NULL as "nothing waiting".
 SELECT min(health_since)::timestamptz AS oldest_health_since
 FROM runs
-WHERE health = 'waiting_worker';
+WHERE health = 'waiting_worker'
+  AND health_reason IS DISTINCT FROM 'waiting for plan cross-check';
 
 -- name: OldestUndispatchedTaskRun :one
 -- health queue.undispatched: the oldest created_at across every task run stuck queued
