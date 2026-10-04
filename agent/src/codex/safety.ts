@@ -15,6 +15,7 @@
 // injected {@link SpawnRootSeam} (the real one lands in m4 behind the M3a
 // supervisor); everything here is unit-testable with fakes.
 
+import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import type {
   BoundaryPermit,
   BoundaryProcessHandle,
@@ -546,29 +547,29 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     permit: BoundaryPermit,
     request: BoundaryProcessRequest,
   ): Promise<BoundaryProcessHandle> {
-    if (this.heldPermit !== permit) throw new Error("codex boundary process refused: stale permit");
-    if (permit.signal.aborted) throw new Error("codex boundary process refused: boundary deadline exceeded");
+    if (this.heldPermit !== permit) throw new TrustedExecutionRefusal("codex boundary process refused: stale permit");
+    if (permit.signal.aborted) throw new TrustedExecutionRefusal("codex boundary process refused: boundary deadline exceeded");
     if (request.timeoutMs !== undefined && (!Number.isFinite(request.timeoutMs) || request.timeoutMs <= 0)) {
-      throw new Error("codex boundary process timeout must be positive and finite");
+      throw new TrustedExecutionRefusal("codex boundary process timeout must be positive and finite");
     }
     if (request.recoverableTimeout && permit.boundary !== "checkpoint") {
-      throw new Error("recoverable child timeout is checkpoint-only");
+      throw new TrustedExecutionRefusal("recoverable child timeout is checkpoint-only");
     }
     if (!request.argv[0]?.startsWith("/")) {
       const error: HarnessError = { category: "protocol", message: "boundary process executable must be absolute" };
       this.registry.poison(error);
-      throw new Error(error.message);
+      throw new TrustedExecutionRefusal(error.message);
     }
     if (request.identity === "worker_pat") {
-      if (this.registry.state() !== "closed") throw new Error("codex boundary process refused: admission not closed");
-      if (this.registry.hasLiveCommandRoot()) throw new Error("codex boundary process refused: command roots live");
+      if (this.registry.state() !== "closed") throw new TrustedExecutionRefusal("codex boundary process refused: admission not closed");
+      if (this.registry.hasLiveCommandRoot()) throw new TrustedExecutionRefusal("codex boundary process refused: command roots live");
     }
     const reservation = this.registry.reserveLaunch("boundary_action");
     if (reservation.kind !== "reserved" || !this.seams.spawnProcess) {
       if (reservation.kind === "reserved") this.registry.cancelReservation(reservation.reservation);
       const error: HarnessError = { category: "protocol", message: "boundary process launch unavailable" };
       this.registry.poison(error);
-      throw new Error(error.message);
+      throw new TrustedExecutionRefusal(error.message);
     }
     const childDeadlineAt = Date.now() + Math.min(request.timeoutMs ?? Infinity, remainingMs(this.currentDeadlineAt));
     let launched: SpawnedBoundaryProcess;
@@ -578,12 +579,12 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       this.registry.cancelReservation(reservation.reservation);
       const error: HarnessError = { category: "tool", message: "boundary process spawn failed" };
       this.registry.poison(error);
-      throw new Error(error.message);
+      throw new TrustedExecutionRefusal(error.message);
     }
     const registered = this.registry.registerRoot(reservation.reservation, launched.root);
     if (!registered.ok) {
       await launched.root.dispose(remainingMs(this.currentDeadlineAt)).catch(() => undefined);
-      throw new Error("boundary process failed registry admission");
+      throw new TrustedExecutionRefusal("boundary process failed registry admission");
     }
     const completed = (async (): Promise<{ readonly code: number; readonly softTimedOut?: true }> => {
       let terminal: { readonly code: number } | undefined;
@@ -593,7 +594,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
           if (request.recoverableTimeout && !permit.signal.aborted && remainingMs(this.currentDeadlineAt) > 0) {
             throw new SupervisedChildExitTimeoutError(request.timeoutMs);
           }
-          throw new Error("boundary process child deadline exceeded during launch");
+          throw new TrustedExecutionRefusal("boundary process child deadline exceeded during launch");
         }
         terminal = await this.waitChildOrAbort(
           launched,
@@ -612,20 +613,20 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
           await launched.root.dispose(remainingMs(this.currentDeadlineAt));
         } catch {
           this.registry.poison({ category: "tool", message: "checkpoint child disposal failed" });
-          throw new Error("checkpoint child disposal failed");
+          throw new TrustedExecutionRefusal("checkpoint child disposal failed");
         }
         const reaped = await this.registry.reapRoot(launched.root, remainingMs(this.currentDeadlineAt));
         if (!reaped.ok || permit.signal.aborted || remainingMs(this.currentDeadlineAt) <= 0) {
-          throw new Error("checkpoint child root did not reap cleanly before boundary deadline");
+          throw new TrustedExecutionRefusal("checkpoint child root did not reap cleanly before boundary deadline");
         }
         launched.stdout?.destroy();
         launched.stderr?.destroy();
         return { code: -1, softTimedOut: true };
       }
       const reaped = await this.registry.reapRoot(launched.root, remainingMs(this.currentDeadlineAt));
-      if (!reaped.ok) throw new Error("boundary process root did not reap cleanly");
+      if (!reaped.ok) throw new TrustedExecutionRefusal("boundary process root did not reap cleanly");
       if (terminalError !== undefined) throw terminalError;
-      if (!terminal) throw new Error("boundary process produced no terminal result");
+      if (!terminal) throw new TrustedExecutionRefusal("boundary process produced no terminal result");
       return terminal;
     })();
     // Track synchronously before returning the streams. Even a caller that forgets
@@ -644,9 +645,9 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     signal: AbortSignal,
     deadlineMs: number,
   ): Promise<{ readonly code: number }> {
-    if (signal.aborted) return Promise.reject(new Error("boundary process deadline exceeded"));
+    if (signal.aborted) return Promise.reject(new TrustedExecutionRefusal("boundary process deadline exceeded"));
     return new Promise((resolve, reject) => {
-      const onAbort = (): void => reject(new Error("boundary process deadline exceeded"));
+      const onAbort = (): void => reject(new TrustedExecutionRefusal("boundary process deadline exceeded"));
       signal.addEventListener("abort", onAbort, { once: true });
       launched.waitChild(deadlineMs).then(resolve, reject).finally(() => {
         signal.removeEventListener("abort", onAbort);

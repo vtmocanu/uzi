@@ -399,6 +399,40 @@ describe("StatsCollector — DinD data-root sample (issue #1759)", () => {
 
 // PRD #1809 D5: the data volume's used fraction the admission stop reads, from one sample.
 describe("dataVolumeUsedFraction (PRD #1809 D5)", () => {
+  const base = { mem_bytes: 1, mem_limit_bytes: null, source: "process" as const };
+  const pairs = [
+    ["disk_data_bytes", "disk_data_total_bytes"],
+    ["disk_data_inodes", "disk_data_total_inodes"],
+  ] as const;
+
+  it("uses the maximum valid byte or inode pressure and clamps each to one", () => {
+    assert.strictEqual(dataVolumeUsedFraction({ ...base, disk_data_bytes: 10, disk_data_total_bytes: 100, disk_data_inodes: 100, disk_data_total_inodes: 100 }), 1);
+    assert.strictEqual(dataVolumeUsedFraction({ ...base, disk_data_bytes: 90, disk_data_total_bytes: 100, disk_data_inodes: 20, disk_data_total_inodes: 100 }), 0.9);
+    for (const [used, total] of pairs) {
+      assert.strictEqual(dataVolumeUsedFraction({ ...base, [used]: 0, [total]: 100 }), 0);
+      assert.strictEqual(dataVolumeUsedFraction({ ...base, [used]: 80, [total]: 100 }), 0.8);
+      assert.strictEqual(dataVolumeUsedFraction({ ...base, [used]: 120, [total]: 100 }), 1);
+      assert.strictEqual(dataVolumeUsedFraction({ ...base, [used]: Number.MAX_VALUE, [total]: Number.MIN_VALUE }), 1);
+    }
+  });
+
+  it("validates complete finite pairs independently, falling back to the other resource", () => {
+    for (const [used, total] of pairs) {
+      const other = pairs.find(([key]) => key !== used)!;
+      const invalid: Array<Record<string, number>> = [
+        {},
+        { [used]: 50 },
+        { [total]: 100 },
+        ...[-1, NaN, Infinity, -Infinity].map((n) => ({ [used]: n, [total]: 100 })),
+        ...[0, -1, NaN, Infinity, -Infinity].map((n) => ({ [used]: 50, [total]: n })),
+      ];
+      for (const fields of invalid) {
+        assert.strictEqual(dataVolumeUsedFraction({ ...base, ...fields }), undefined, `invalid ${used}: ${String(fields[used])}/${String(fields[total])}`);
+        assert.strictEqual(dataVolumeUsedFraction({ ...base, ...fields, [other[0]]: 25, [other[1]]: 100 }), 0.25, "the valid other pair survives");
+      }
+    }
+  });
+
   it("is used / total from the data volume pair", () => {
     const f = dataVolumeUsedFraction({ mem_bytes: 1, mem_limit_bytes: null, source: "process", disk_data_bytes: 80, disk_data_total_bytes: 100 });
     assert.strictEqual(f, 0.8);

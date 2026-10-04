@@ -57,8 +57,8 @@ const ALLOWLIST: Record<string, { count: number; mark: Mark; disposition: string
   "run-quiescence.ts#runnerCommand&": { count: 1, mark: "marked", disposition: "the helper's private-TMPDIR mktemp/rm wrap (fixed argv, async + time-bounded): workerSpawnEnv" },
   "codex/launcher.ts#runnerCommand()": { count: 1, mark: "unmarked", disposition: "Codex provider root supervisor: NOT marked (model-directed app-server); a recorded worker-launched root (pid + start time) instead" },
   "codex/launcher.ts#commandRootCommand()": { count: 4, mark: "conditional", disposition: "Codex command root + effect root: NOT marked (model-directed shells); standalone modes + kill (fixed argv): workerSpawnEnv" },
-  "codex/launcher.ts#runnerCommand&": { count: 2, mark: "marked", disposition: "owned-tree create/remove wrap (fixed scripts): workerSpawnEnv on the inert env" },
-  "codex/launcher.ts#commandRootCommand&": { count: 2, mark: "marked", disposition: "owned-tree create/remove wrap (fixed scripts): workerSpawnEnv on the inert env" },
+  "codex/launcher.ts#runnerCommand&": { count: 3, mark: "marked", disposition: "owned-tree create/remove wrap (fixed scripts) + verifyRunnerPosture wrap (fixed metadata checks): workerSpawnEnv on the inert env" },
+  "codex/launcher.ts#commandRootCommand&": { count: 3, mark: "marked", disposition: "owned-tree create/remove wrap (fixed scripts) + verifyRunnerPosture wrap (fixed metadata checks): workerSpawnEnv on the inert env" },
 };
 
 function listTs(dir: string): string[] {

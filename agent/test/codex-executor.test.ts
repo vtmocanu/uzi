@@ -35,6 +35,7 @@ import {
   type CodexExecutorDeps,
   type CodexCommittedGenerationCell,
 } from "../src/codex/codex-executor.js";
+import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { RequestError } from "../src/client.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { WORKER_UID, RUNNER_UID } from "../src/runner-uid.js";
@@ -891,14 +892,33 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
   it("(5) a watchdog (idle) trip beats a later terminal", async () => {
     const rig = makeRig();
     rig.deps = { ...rig.deps, idleMs: 25 };
-    // Go quiet after the init frame; the idle timer trips before any terminal.
+    // Go quiet after the init frame; retain the real idle timer.
     rig.transport.push(threadStarted());
-    // A terminal pushed AFTER the trip must NOT turn the run into a success.
-    setTimeout(() => rig.transport.push(turnCompleted("completed")).end(), 80).unref?.();
-    await assert.rejects(
-      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "idle run"),
-      /idle timeout/,
-    );
+    let lateTerminalDelivered = false;
+    let removeAbortListener = (): void => {};
+    rig.transport.requestOverride = (c, opts) => {
+      if (c.method !== "turn/start") return undefined;
+      const signal = opts?.signal;
+      assert.ok(signal, "turn/start carries the watchdog's turn signal");
+      assert.equal(signal.aborted, false, "the turn starts before the idle trip");
+      // Emit only when the active turn aborts, regardless of provider startup duration.
+      const deliverLateTerminal = (): void => {
+        c.transport.push(turnCompleted("completed")).end();
+        lateTerminalDelivered = true;
+      };
+      signal.addEventListener("abort", deliverLateTerminal, { once: true });
+      removeAbortListener = () => signal.removeEventListener("abort", deliverLateTerminal);
+      return undefined;
+    };
+    try {
+      await assert.rejects(
+        withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "idle run"),
+        /idle timeout/,
+      );
+      assert.equal(lateTerminalDelivered, true, "the idle trip wins despite delivery of a late terminal");
+    } finally {
+      removeAbortListener();
+    }
   });
 
   it("(6) a cancel beats the raw aborted error the transport throws mid-setup", async () => {
@@ -2957,6 +2977,38 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
       };
     };
   }
+
+  it("trusted refusal: closed command admission rejects before launching", async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    await registry.disposeTools(1000);
+    let launches = 0;
+    const spawnCommand = makeDefaultSpawnCommand(registry, async (spec) => {
+      launches++;
+      return supervisedOutput(Buffer.alloc(0))(spec);
+    }, 1000, "/data/runner/repo/run-1", runEnv, "required");
+    await assert.rejects(spawnCommand(["/bin/true"], { cwd: "/data/runner/repo/run-1" }),
+      (error: unknown) => error instanceof TrustedExecutionRefusal && error.message === "command launch admission is closed");
+    assert.equal(launches, 0);
+  });
+
+  it("trusted refusal: command reservation invalidated during launch disposes the unadmitted root", async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    let disposes = 0;
+    const spawnCommand = makeDefaultSpawnCommand(registry, async (spec) => {
+      assert.equal(registry.pendingLaunchCount(), 1);
+      const handle = await supervisedOutput(Buffer.alloc(0))(spec);
+      await registry.disposeTools(1000);
+      return { ...handle, dispose: async (deadline) => {
+        disposes++;
+        return handle.dispose(deadline);
+      } };
+    }, 1000, "/data/runner/repo/run-1", runEnv, "required");
+    await assert.rejects(spawnCommand(["/bin/true"], { cwd: "/data/runner/repo/run-1" }),
+      (error: unknown) => error instanceof TrustedExecutionRefusal && error.message === "command root failed registry admission");
+    assert.equal(disposes, 1);
+    assert.equal(registry.pendingLaunchCount(), 0);
+    assert.equal(registry.hasLiveCommandRoot(), false);
+  });
 
   it("(A) caps combined stdout+stderr at MAX_COMMAND_CAPTURE_BYTES, SIGKILLs the child, and RESOLVES (never rejects) with the truncated result", async () => {
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));

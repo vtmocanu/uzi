@@ -56,14 +56,14 @@ limit, still parks here as `recovery_wait`.
   before the park. The feed distinguishes a checkpoint saved on this worker
   from one successfully published for recovery on another worker.
 
-If local capture cannot be verified, the run remains active while the
+For the empty-turn and provider recovery above, if local capture cannot be verified, the run remains active while the
 worker keeps its local work and session and retries capture. The feed says
 so explicitly. It does not enter an automatically resumable park with only
 an unverified capture attempt.
 
 ## What happens automatically
 
-After verified capture, the server parks the run on a capped exponential
+For these empty-turn and provider recoveries, after verified capture, the server parks the run on a capped exponential
 backoff and returns it to `queued` when that delay passes. There is no
 lifetime cap on recovery parks and no manual resume step.
 
@@ -89,7 +89,7 @@ turn; an approval flag alone is not an implementation-ready plan.
 
 ## If it never recovers
 
-The recovery park itself has no timeout or lifetime-attempt failure. You
+The empty-turn and provider recovery park has no timeout or lifetime-attempt failure. You
 can **cancel** the run at any time. Normal watchdogs still apply while it
 is running, including while it retries capture; recovery does not override
 a genuine timeout or cancellation.
@@ -240,9 +240,8 @@ resumes.
 
 A `recovery_wait` park can also come from the worker's own storage: its
 data volume filled up, or came close enough that uzi decided not to wait
-for it to. Unlike every park above, this one can also **fail** the run
-outright, after enough repeated parks — a full data volume is a
-recoverable, bounded condition, not an unlimited retry.
+for it to. This cause has a lifetime cap by default and can **fail** the run
+after enough counted parks; operators can configure that cap as unlimited.
 
 Two kinds of park share the cause `data_volume_full`, and only one of them
 counts toward the failure cap:
@@ -256,8 +255,10 @@ counts toward the failure cap:
   tick that finds the volume at or over a hard threshold and stops
   whichever running Claude run holds the largest caches (a Claude run that
   is not running, such as one at its plan gate or waiting on a question, is
-  not stopped; its rebuildable caches are dropped in place instead) — and an actual
-  write that failed disk-full (a recognised `ENOSPC`/`EDQUOT` signal, or
+  not stopped; its rebuildable caches are dropped in place instead). Selection
+  depends on registered runs with measured cache bytes, so it cannot guarantee
+  a particular failing run parks before failure. Counted parks also cover a
+  worker-owned clone/fetch write that failed disk-full (a recognised `ENOSPC`/`EDQUOT` signal, or
   git's own disk-full diagnostics, confirmed against the volume's own free
   space and inodes) after uzi ran its background reclaim and retried once,
   or a claim/resume preflight whose re-sampled statfs is still below the
@@ -266,6 +267,44 @@ counts toward the failure cap:
   `UZI_RUN_DISK_PARK_MAX` (default 3; `0` means unlimited). Past the cap,
   the next counted disk-full park fails the run instead, with
   `fail_origin = data_volume_full`.
+
+A counted park can also defer an issue run's otherwise-untyped executor
+failure when its worktree and HOME are on the data-volume device and a fresh,
+valid byte and inode sample confirms fullness. After execution and reports
+settle, uzi waits for one bounded reclaim pass, then parks even if room
+returns; it does not replay the command, provider or executor. This does not
+attribute the failed write: an unrelated opaque error can coincide with
+fullness and be deferred. For actual trusted refusals, only completely erased-origin opaque
+failures remain eligible under this accepted coincidence residual. The cap
+bounds repetition, not misclassification;
+`0` remains unlimited. Recognizable typed, wrapped or trusted
+security/guardrail failures remain excluded, including admission, launcher
+and plan-wiring refusals. Preserved trusted types and `cause`/`interruption`
+wrappers remain excluded. Complete legacy reasons are recognized directly
+and through leading `<context>: <reason>` envelopes with a literal colon
+and space. Contexts may contain apostrophes; double-quoted or multiline
+contexts, alternate separators, quoted reason diagnostics and
+producer-domain near-misses are not legacy refusal envelopes. Ordinary
+opaque failures keep their existing handling. This boundary is pinned by the exclusion fixtures
+in `agent/test/runner-terminal-disk-deferral.test.ts`. Setup,
+finalize and settlement failures, typed recovery outcomes, cancellation,
+pause and shutdown keep their handling. Unknown accounting, incompatible
+APIs and plan-approval revisions are not covered;
+existing cache relief at approval gates stays unchanged.
+
+For this executor-failure policy, three nonblocked unverified captures or
+five consecutive blocked safety proofs end capture retries. Alternating
+blocks allow at most 15 capture calls plus five final proof attempts, using
+existing waits and deadlines. Blocked or unverified quiescence fails the run
+`worker_residue_blocked`. An affirmative process/supervisor proof can instead
+allow a degraded park retaining the original clone, HOME, session, journal
+and custody, without claiming a verified checkpoint or published latest work.
+ACK reconciliation does not restart capture retries and has no fixed wall-time
+promise. A same-worker resume captures dirty work before fresh execution;
+newer worker-local work can be lost on another worker. Normal terminal,
+cancellation, stale-claim and disk-cap cleanup still applies. See the
+[operator policy](../adr/1809-per-run-cache-bounds.md#full-volume-terminal-failure-deferral-1829)
+for the exact proof requirements.
 
 Both kinds park and resume on the same capped exponential backoff as an
 empty-turn park (`RUN_RECOVERY_PARK_BASE` up to `RUN_RECOVERY_MAX_PARK`);
