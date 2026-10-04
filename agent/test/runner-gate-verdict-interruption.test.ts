@@ -449,10 +449,64 @@ class Scenario {
   }
 }
 
-async function scenario(fn: (s: Scenario) => Promise<void>, overrides: Partial<ClaimResponse> = {}): Promise<void> {
+/** Only selected callback failures collect diagnostics, before Scenario.teardown changes the evidence. */
+function scenarioFailureDiagnostic(s: Scenario, label: string): string {
+  const text = (value: string | undefined): string =>
+    value === undefined ? "<absent>" : value.length > 400 ? value.slice(0, 400) + "...<truncated>" : value;
+  const bounded = <T,>(values: T[], limit: number): { total: number; items: T[]; omitted: number } => ({
+    total: values.length,
+    items: values.slice(0, limit),
+    omitted: Math.max(0, values.length - limit),
+  });
+  const flights = s.flights.map((flight, index) => {
+    const states = api.states
+      .slice(flight.stateFrom, s.flights[index + 1]?.stateFrom)
+      .filter((state) => state.runId === s.runId)
+      .map((state) => state.body);
+    const failed = states.filter((state) => state.status === "failed");
+    const hasError = Object.hasOwn(flight, "error");
+    const error = flight.error;
+    const errorDescription = error instanceof Error
+      ? `${text(error.name)}: ${text(error.message)}`
+      : error === null || (typeof error !== "object" && typeof error !== "function")
+        ? String(error)
+        : `<${typeof error} rejection; body omitted>`;
+    return {
+      generation: flight.claim.claim_generation,
+      finished: flight.finished,
+      statuses: bounded(states.map((state) => text(state.status)), 40),
+      failedReports: failed.length === 0 ? "<no failed report>" : bounded(failed.map((state) => ({
+        failure_reason: text(state.failure_reason),
+        fail_origin: text(state.fail_origin),
+      })), 8),
+      execution: hasError ? { rejected: true, error: text(errorDescription) } : "<no rejected execution>",
+    };
+  });
+  return JSON.stringify({
+    label: text(label),
+    resumedFlight: s.flights.length > 1 ? "present" : "<no resumed flight>",
+    flights: bounded(flights, 12),
+    cancellationRows: s.rowsOf("cancel").length > 0 ? "present" : "<no cancellation row>",
+  });
+}
+
+async function scenario(
+  fn: (s: Scenario) => Promise<void>,
+  overrides: Partial<ClaimResponse> = {},
+  diagnosticLabel?: string,
+): Promise<void> {
   const s = new Scenario(overrides);
   try {
     await fn(s);
+  } catch (error) {
+    if (diagnosticLabel !== undefined) {
+      try {
+        console.error(`#1604 scenario failure: ${scenarioFailureDiagnostic(s, diagnosticLabel)}`);
+      } catch {
+        // A diagnostic failure must not replace the callback's original error.
+      }
+    }
+    throw error;
   } finally {
     await s.teardown();
   }
@@ -863,7 +917,7 @@ describe("#1604 — boundaries of the revise receipt", () => {
       // turn AFTER the current one, and this scripted lead signals done on its first implement
       // turn, so on the base code too it never reaches a prompt (independent of #1604).
       assert.ok(s.statuses(first).includes("completed"), s.statuses(first).join(","));
-    }));
+    }, {}, "mixed revise / follow_up / answer batch"));
 
   it("repeated GETs of the deferred revise neither re-ACK nor re-route it, while newer inputs still flow", () =>
     scenario(async (s) => {
@@ -932,7 +986,7 @@ describe("#1604 — boundaries of the revise receipt", () => {
       assert.ok(s.texts(first).includes(STALE_REJECT_NOTICE), s.texts(first).join(" | "));
       assert.ok(api.isApplied(s.runId, rej!.id), "the stale reject is applied");
       assert.ok(s.statuses(first).includes("completed"), s.statuses(first).join(","));
-    }));
+    }, {}, "stale reject during revision"));
 
   it("a reject superseded in the buffer by a newer same-epoch verdict is applied with a notice", () =>
     scenario(async (s) => {
@@ -1279,7 +1333,7 @@ describe("#1604 review — a replayed verdict never applies to a plan no human s
         await s.finish(flight);
         assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
         assert.equal(s.model.count("revise", flight.turnFrom), 0, "no second revision");
-      }));
+      }, {}, kind === "reject_plan" ? "Path B (reject_plan)" : undefined));
   }
 
   it("a replayed revise older than the persisted revised plan is stale: no second revision", () =>
