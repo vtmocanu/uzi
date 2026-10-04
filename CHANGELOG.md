@@ -34,6 +34,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **The TUI update prompt avoids repeating the release tag as its body ([#1978](https://github.com/vtmocanu/uzi/issues/1978)).**
+  When the sanitized release name equals the version, stable and RC prompts show the normal or security fallback sentence. Distinct release names retain their capped rendering, and the dismissal label still includes the version.
+
 - **Per-run Docker teardown no longer leaks anonymous volumes ([#2236](https://github.com/vtmocanu/uzi/issues/2236)).**
   When a run ends, each container bound under the run's clone is now removed together with its anonymous volumes, so they no longer pile up on a docker-tier worker's `dind-data` volume. Named volumes and containers not bound under the clone are left untouched.
 

@@ -238,6 +238,105 @@ func TestUpdatePromptRenderNormal(t *testing.T) {
 	}
 }
 
+// Compare the version/body pair only: notes and the dismissal label may repeat the tag.
+func TestUpdatePromptRenderReleaseName(t *testing.T) {
+	withVersion(t, "v0.83.0")
+	for _, channel := range []struct {
+		name  string
+		tag   string
+		owner string
+	}{
+		{name: "stable", tag: "v0.85.0", owner: "uzi-cli"},
+		{name: "rc", tag: "v0.85.0-rc.1", owner: "uzi-cli-rc"},
+	} {
+		t.Run(channel.name, func(t *testing.T) {
+			longTag := channel.tag + strings.Repeat("x", 90)
+			for _, tc := range []struct {
+				name    string
+				tag     string
+				release string
+				body    string // empty means the variant-specific fallback
+			}{
+				{name: "equal", tag: channel.tag, release: channel.tag},
+				{name: "BEL", tag: channel.tag, release: "\x07" + channel.tag},
+				{name: "SOH", tag: channel.tag, release: channel.tag + "\x01"},
+				{name: "edge_whitespace", tag: channel.tag, release: " \t" + channel.tag + "\n "},
+				{name: "bidi", tag: channel.tag, release: string(rune(0x202e)) + channel.tag},
+				{name: "both_sanitized", tag: "\x01" + channel.tag + " ", release: "\x07" + channel.tag},
+				{name: "long_equal", tag: longTag, release: longTag},
+				{name: "distinct", tag: channel.tag, release: "\x07Highlights\x01", body: "Highlights"},
+				{name: "empty", tag: channel.tag},
+				{name: "sanitized_empty", tag: channel.tag, release: " \x07\x01 "},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					for _, security := range []bool{false, true} {
+						t.Run(fmt.Sprintf("security=%t", security), func(t *testing.T) {
+							for _, profile := range []colorprofile.Profile{colorprofile.TrueColor, colorprofile.Ascii} {
+								t.Run(fmt.Sprintf("profile=%v", profile), func(t *testing.T) {
+									m := showingUpdateModel(t, updatePromptState{
+										latestVersion:  tc.tag,
+										latestName:     tc.release,
+										latestNotesURL: "https://example.com/releases/" + channel.tag,
+										security:       security,
+									})
+									m.width = 240 // keep the long version and dismissal label on one line
+									next, _ := m.Update(tea.ColorProfileMsg{Profile: profile})
+									m = next.(tuiModel)
+									out := stripANSI(m.View().Content)
+									body := tc.body
+									if body == "" {
+										body = "A newer release is available."
+										if security {
+											body = "A security update is available."
+										}
+									}
+									lines := strings.Split(out, "\n")
+									found := false
+									for i, line := range lines {
+										if !strings.Contains(line, "uzi v0.83.0") {
+											continue
+										}
+										found = true
+										if i+1 >= len(lines) {
+											t.Fatalf("missing body after version line\n%s", out)
+										}
+										if got := strings.Trim(lines[i+1], " │"); got != body {
+											t.Errorf("body = %q, want %q", got, body)
+										}
+										tag := channel.tag
+										if tc.name == "long_equal" {
+											tag = longTag
+										}
+										if got := strings.Count(line+"\n"+lines[i+1], tag); got != 1 {
+											t.Errorf("version/body pair contains tag %d times, want once\n%s\n%s", got, line, lines[i+1])
+										}
+									}
+									if !found {
+										t.Fatalf("missing version line\n%s", out)
+									}
+									for _, want := range []string{
+										"Don't remind me for " + strings.TrimSpace(strings.TrimPrefix(tc.tag, "\x01")),
+										"Release notes: https://example.com/releases/" + channel.tag,
+									} {
+										if !strings.Contains(out, want) {
+											t.Errorf("prompt missing %q\n%s", want, out)
+										}
+									}
+									// Also retain the brew action for each channel.
+									m.updatePrompt.owner = channel.owner
+									if got := stripANSI(m.View().Content); !strings.Contains(got, "brew upgrade "+channel.owner) {
+										t.Errorf("prompt missing brew action\n%s", got)
+									}
+								})
+							}
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestUpdatePromptRenderSecurityBand(t *testing.T) {
 	withVersion(t, "v0.83.0")
 	m := showingUpdateModel(t, updatePromptState{latestVersion: "v0.85.0", owner: "uzi-cli", security: true})
