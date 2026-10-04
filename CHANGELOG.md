@@ -32,6 +32,9 @@ through `[0.52.0]`.)
 - **Oversized Forgejo error responses fail without exposing body fragments ([#2231](https://github.com/vtmocanu/uzi/issues/2231)).**
   Non-success responses are capped at 4 KiB and an overflowing body is discarded before redaction, preventing a token split at the read boundary from leaking through SDK, raw GET or issue PATCH errors. HTTP error classification is preserved, and successful responses retain the 32 MiB transport cap.
 
+- **Explicit vault unlock queues already parked Codex runs promptly ([#1792](https://github.com/vtmocanu/uzi/issues/1792)).**
+  A successful explicit unlock best-effort queues the owner's vault-locked recovery parks regardless of retry time or count; a worker still starts them through the normal claim path. The scheduled retry remains the fallback for database failures or parks reported after the unlock update, and a promotion failure preserves the successful unlock response and Codex usage refresh. Login, startup and passphrase creation do not trigger early promotion.
+
 - **Trusted launch, admission and plan-gate refusals no longer park a run as a disk-full failure ([#1829](https://github.com/vtmocanu/uzi/issues/1829)).**
   These refusals keep their failure handling even when the data volume is full, including preserved trusted types, cause/interruption wrappers and complete legacy reasons prefixed by `<context>: <reason>` (a literal colon and space). Apostrophes in context are supported; double-quoted or multiline contexts, alternate separators, quoted reasons and producer-domain near-misses are not legacy refusal envelopes. Ordinary opaque failures are unchanged; a refusal whose origin has been completely erased can still coincide with fullness and be deferred.
 

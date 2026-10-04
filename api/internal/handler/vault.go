@@ -43,6 +43,11 @@ func (h *Handler) VaultUnlock(w http.ResponseWriter, r *http.Request) {
 	err := h.vault.UnlockExisting(r.Context(), user.ID, req.Password)
 	switch {
 	case err == nil:
+		if h.wsvc != nil {
+			if err := h.wsvc.PromoteVaultLockedRecoveryWaitRuns(r.Context(), user.ID); err != nil {
+				slog.Error("vault unlock: promote recovery waits", "user", user.ID, "error", err)
+			}
+		}
 		// A successful unlock lets the Codex poller read this user's linked accounts;
 		// poke so their account meters refresh within seconds (PRD #1209). Best-effort.
 		if h.codexUsagePoker != nil {

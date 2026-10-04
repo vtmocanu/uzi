@@ -1097,6 +1097,10 @@ func (f *autoStopSweepStore) PromoteLimitWaitRuns(context.Context, pgtype.Timest
 // Issue #1197's transient-recovery promotion pass. Empty for the same reason as
 // PromoteLimitWaitRuns above: this fixture's subject is the auto-stop streak, so no run
 // is recovery-parked and Sweep still runs end to end.
+func (f *autoStopSweepStore) PromoteVaultLockedRecoveryWaitRuns(context.Context, uuid.UUID) ([]store.PromoteVaultLockedRecoveryWaitRunsRow, error) {
+	return nil, nil
+}
+
 func (f *autoStopSweepStore) PromoteRecoveryWaitRuns(context.Context, pgtype.Timestamptz) ([]store.PromoteRecoveryWaitRunsRow, error) {
 	return nil, nil
 }

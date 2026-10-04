@@ -40,6 +40,7 @@ func uziLabels(extra ...string) []byte {
 // fakeStore embeds the Store interface so unimplemented methods panic if a test
 // path reaches them unexpectedly; the tests override only what they exercise.
 type fakeStore struct {
+	promoteVaultLocked func(context.Context, uuid.UUID) ([]store.PromoteVaultLockedRecoveryWaitRunsRow, error)
 	// reviseErr forces CreateRunReviseInputIfUnderCap to fail (PRD #1795: a 0-row race).
 	reviseErr error
 	Store
@@ -1214,6 +1215,13 @@ func (f *fakeStore) PromoteLimitWaitRuns(_ context.Context, now pgtype.Timestamp
 func (f *fakeStore) SetRunRecoveryWait(_ context.Context, arg store.SetRunRecoveryWaitParams) (int64, error) {
 	f.setRecoveryWait = &arg
 	return f.setRecoveryWaitRows, f.setRecoveryWaitErr
+}
+
+func (f *fakeStore) PromoteVaultLockedRecoveryWaitRuns(ctx context.Context, userID uuid.UUID) ([]store.PromoteVaultLockedRecoveryWaitRunsRow, error) {
+	if f.promoteVaultLocked != nil {
+		return f.promoteVaultLocked(ctx, userID)
+	}
+	return nil, nil
 }
 
 func (f *fakeStore) PromoteRecoveryWaitRuns(_ context.Context, now pgtype.Timestamptz) ([]store.PromoteRecoveryWaitRunsRow, error) {

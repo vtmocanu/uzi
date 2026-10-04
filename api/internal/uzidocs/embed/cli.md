@@ -2177,7 +2177,9 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
   from a transient interruption](run-recovery-wait.md). A Codex credential
   refresh or release that found the owner's vault locked also parks here
   (cause `vault_locked`); it takes the same capped backoff and no lifetime
-  cap, and resumes once its timer promotes it and the vault is unlocked — see
+  cap. The owner's explicit successful vault unlock best-effort queues an
+  already parked run promptly; the scheduled retry remains the fallback,
+  and a worker starts it through the normal claim path — see
   [Vault locked](run-recovery-wait.md#vault-locked). A Codex subscription
   run can also park here because its account is quarantined or needs a fresh
   login (cause `codex_account_unavailable`); unlike the transient park it has

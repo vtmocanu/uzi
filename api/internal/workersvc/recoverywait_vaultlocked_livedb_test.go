@@ -120,6 +120,122 @@ func TestRecoveryWaitVaultLockedParkPromoteClaimLiveDB(t *testing.T) {
 	}
 }
 
+// TestRecoveryWaitVaultUnlockEarlyPromoteReclaimLiveDB keeps the timer baseline above
+// unchanged and exercises explicit promotion, the benign relock race, and the new claim fence.
+func TestRecoveryWaitVaultUnlockEarlyPromoteReclaimLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, _, repoID := env.seedCodexInfra(t)
+	enableClaimAssembly(t, env, userID)
+	wk := seedSnapshotWorker(t, env, userID, "nonce-early-vault")
+	svc := snapshotSvc(env, testParams())
+	runID := seedOutageRun(t, env, userID, repoID, wk, "running", "issue", 3, 0)
+	cause := "vault_locked"
+	if _, applied, err := svc.SetState(env.ctx, wkrRow(t, env, wk), runID,
+		StateRequest{State: "recovery_wait", RecoveryCause: &cause, ClaimGeneration: i64Ptr(3)}); err != nil || !applied {
+		t.Fatalf("park: applied=%v err=%v", applied, err)
+	}
+	parked, err := env.q.GetRunByID(env.ctx, runID)
+	if err != nil || !parked.RecoveryRetryNotBefore.Valid || !parked.RecoveryRetryNotBefore.Time.After(time.Now()) {
+		t.Fatalf("park must have a future timer: row=%+v err=%v", parked, err)
+	}
+	vlt := vault.New(env.box, env.q)
+	svc.SetVault(vlt)
+	if err := vlt.Unlock(env.ctx, userID, codexVaultLockedTestPassword); err != nil {
+		t.Fatal(err)
+	}
+	bc, lc := &parkBroadcaster{}, &fakeLifecycle{}
+	svc.SetBroadcaster(bc)
+	svc.SetLifecycle(lc)
+	if err := svc.PromoteVaultLockedRecoveryWaitRuns(env.ctx, userID); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := env.q.GetRunByID(env.ctx, runID)
+	if err != nil || queued.Status != "queued" || queued.ClaimGeneration != parked.ClaimGeneration ||
+		queued.RecoveryWaitCount != parked.RecoveryWaitCount || queued.RecoveryRetryNotBefore != parked.RecoveryRetryNotBefore ||
+		queued.RecoveryWaitCause != parked.RecoveryWaitCause || queued.ClaimReleasedAt != parked.ClaimReleasedAt ||
+		queued.WorkerID != parked.WorkerID || queued.SessionID != parked.SessionID || queued.LastSeq != parked.LastSeq {
+		t.Fatalf("early promotion lost history/affinity: parked=%+v queued=%+v err=%v", parked, queued, err)
+	}
+	if len(bc.states) != 1 || !bc.sawState(runID, "queued") || len(lc.notes) != 1 || lc.notes[0].runID != runID {
+		t.Fatalf("early promotion publications: states=%v notes=%v", bc.states, lc.notes)
+	}
+	vlt.Lock(userID)
+	payload, err := svc.Claim(env.ctx, wkrRow(t, env, wk), nil)
+	if err != nil || payload != nil || statusOf(t, env, runID) != "queued" {
+		t.Fatalf("relock Claim: payload=%v err=%v status=%s", payload, err, statusOf(t, env, runID))
+	}
+	if err := vlt.UnlockExisting(env.ctx, userID, codexVaultLockedTestPassword); err != nil {
+		t.Fatal(err)
+	}
+	env.exec(`UPDATE runs SET updated_at = now() - interval '3 hours' WHERE id = $1`, runID)
+	payload, err = svc.Claim(env.ctx, wkrRow(t, env, wk), nil)
+	if err != nil || payload == nil || payload.RunID != runID.String() || payload.ClaimGeneration != 4 {
+		t.Fatalf("reclaim: payload=%+v err=%v, want generation 4", payload, err)
+	}
+	if _, applied, err := svc.SetState(env.ctx, wkrRow(t, env, wk), runID,
+		StateRequest{State: "running", ClaimGeneration: i64Ptr(4)}); err != nil || !applied {
+		t.Fatalf("start reclaimed generation: applied=%v err=%v", applied, err)
+	}
+	before, err := env.q.GetRunByID(env.ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, applied, err := svc.SetState(env.ctx, wkrRow(t, env, wk), runID,
+		StateRequest{State: "recovery_wait", RecoveryCause: &cause, ClaimGeneration: i64Ptr(3)}); applied || (err != nil && !errors.Is(err, ErrStaleClaim)) {
+		t.Fatalf("old report after reclaim: applied=%v err=%v", applied, err)
+	}
+	after, err := env.q.GetRunByID(env.ctx, runID)
+	if err != nil || after.Status != before.Status || after.ClaimGeneration != before.ClaimGeneration || after.RecoveryWaitCount != before.RecoveryWaitCount {
+		t.Fatalf("old report altered reclaimed run: before=%+v after=%+v err=%v", before, after, err)
+	}
+}
+
+// A worker can finish reporting its park after the explicit unlock's UPDATE has
+// passed. There is no background promotion; this late park still waits for the timer.
+func TestRecoveryWaitVaultUnlockDelayedParkUsesTimerLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, _, repoID := env.seedCodexInfra(t)
+	wk := seedSnapshotWorker(t, env, userID, "nonce-delayed-vault")
+	svc := snapshotSvc(env, testParams())
+	runID := seedOutageRun(t, env, userID, repoID, wk, "running", "issue", 5, 0)
+	vlt := vault.New(env.box, env.q)
+	if err := vlt.Unlock(env.ctx, userID, codexVaultLockedTestPassword); err != nil {
+		t.Fatal(err)
+	}
+	svc.SetVault(vlt)
+	bc := &parkBroadcaster{}
+	svc.SetBroadcaster(bc)
+	if err := svc.PromoteVaultLockedRecoveryWaitRuns(env.ctx, userID); err != nil || len(bc.states) != 0 {
+		t.Fatalf("unlock before park: err=%v states=%v", err, bc.states)
+	}
+	cause := "vault_locked"
+	if _, applied, err := svc.SetState(env.ctx, wkrRow(t, env, wk), runID,
+		StateRequest{State: "recovery_wait", RecoveryCause: &cause, ClaimGeneration: i64Ptr(5)}); err != nil || !applied {
+		t.Fatalf("delayed park: applied=%v err=%v", applied, err)
+	}
+	parked, err := env.q.GetRunByID(env.ctx, runID)
+	if err != nil || parked.Status != "recovery_wait" || !parked.RecoveryRetryNotBefore.Valid {
+		t.Fatalf("delayed park row=%+v err=%v", parked, err)
+	}
+	if _, err := env.q.PromoteRecoveryWaitRuns(env.ctx, pgconv.Time(parked.RecoveryRetryNotBefore.Time.Add(-time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	if got := statusOf(t, env, runID); got != "recovery_wait" {
+		t.Fatalf("late park promoted before deadline: %s", got)
+	}
+	rows, err := env.q.PromoteRecoveryWaitRuns(env.ctx, parked.RecoveryRetryNotBefore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, row := range rows {
+		found = found || row.ID == runID
+	}
+	if !found || statusOf(t, env, runID) != "queued" {
+		t.Fatal("late park did not promote at its timer deadline")
+	}
+}
+
 // TestRecoveryWaitUntypedCausesStayNullLiveDB pins PRD #1392 D9 alongside the new cause:
 // empty_turn and an absent cause park with recovery_wait_cause NULL, and an untyped park
 // REPLACES an earlier vault_locked cause rather than coalescing it.

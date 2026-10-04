@@ -189,16 +189,26 @@ credential, then makes a verified capture of the work done so far,
 publishing it credential-free when it can. It keeps custody of your source
 and does not open the merge request while the vault stays locked.
 
-Unlike the Codex-account hold above, this park **does** resume on a timer:
-it takes the same capped backoff as an empty-turn park
-(`RUN_RECOVERY_PARK_BASE` up to `RUN_RECOVERY_MAX_PARK`), with no lifetime
-cap, rather than waiting on an external signal. Unlocking the vault does
-not promote the run early — it still waits for that timer. Once the timer
-promotes it back to `queued`, a still-locked vault means claiming it idles;
-you'll see it queued with **your vault is locked, so this run can't start**
-until the vault is actually unlocked. After that, it is re-claimed and
-resumes where it left off — the resume costs at least one model turn before
-finalize opens the merge request.
+An explicit successful vault unlock (`POST /api/vault/unlock`) makes a
+synchronous, best-effort attempt to queue that owner's already parked
+`recovery_wait` runs with cause `vault_locked`, regardless of their retry
+time or count. Other owners and causes are untouched. This queues the work
+promptly; a worker still starts it through the normal claim path, so unlock
+does not promise an instant resume.
+
+The scheduled retry remains the fallback: the same capped backoff as an
+empty-turn park (`RUN_RECOVERY_PARK_BASE` up to `RUN_RECOVERY_MAX_PARK`),
+with no lifetime cap. A database failure leaves unlock successful (204) and
+preserves the Codex usage refresh poke; a park reported after the unlock's
+queue update also waits for the timer. Login, startup and passphrase
+creation do not trigger this early promotion.
+
+If the vault locks again between the unlocked-cache check and the queue
+update, the run can be queued while locked, just as on the timer path.
+Claiming it then idles; you'll see **your vault is locked, so this run can't
+start** until an unlocked claim succeeds. After that, it resumes where it
+left off — the resume costs at least one model turn before finalize opens
+the merge request.
 
 A vault lock while sealing a refreshed login also keeps the login protected
 for recovery. Updated workers survive a lost refresh reply: they reconcile
@@ -230,16 +240,16 @@ resumes.
 ### Where you'll see the vault park
 
 - The run page's recovery panel, reading **waiting for vault unlock** with
-  the next retry time. The web run list shows only a generic recovery wait
+  the scheduled retry time. The web run list shows only a generic recovery wait
   status.
 - `uzi run get <id>` — a `VAULT` row with the owner-neutral park sentence
-  and its next retry time.
+  and its scheduled retry fallback time.
 - `uzi run list` / `uzi admin runs` — the STATUS cell appends `(waiting for
   vault unlock)`, with no retry time.
 - `uzi tui` — this park stays in ON THE FLOOR and reads `~ vault wait`, like
   any other self-resolving recovery park; it also counts toward the board's
   vault-locked indicator alongside runs that are queued and blocked on the
-  same lock. Selecting the run shows the park and its next retry time on
+  same lock. Selecting the run shows the park and its scheduled retry fallback time on
   the row's second line and in the run detail, shortened to fit the
   terminal width.
 - The repo board's run badge carries no vault-specific tooltip; check the

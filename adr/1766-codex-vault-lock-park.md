@@ -32,11 +32,11 @@ its Codex processes to a stop without touching the credential (a **credential-fr
 makes a **verified capture** of the work done so far, publishing it credential-free when it can. It
 reports `recovery_wait` with cause `vault_locked`, **keeps custody** of the run's source, and does
 **not open the merge request** while the vault stays locked. The park is promoted back to `queued`
-on the ordinary recovery timer, not on an unlock signal; while the vault is still locked at that
-point, claiming it idles and the run shows queued with "your vault is locked, so this run can't
-start" until the vault is actually unlocked. After unlock it is re-claimed and resumes — the resume
-costs at least one model turn, then finalize may open the merge request after the existing
-completion checks.
+by a best-effort promotion on the owner's explicit successful vault unlock (issue #1792), with
+the ordinary recovery timer as a backstop. A queued run whose vault is still locked idles at claim
+and shows "your vault is locked, so this run can't start" until an unlocked claim succeeds.
+It is then re-claimed and resumes — the resume costs at least one model turn, then finalize may
+open the merge request after the existing completion checks.
 
 A vault lock while sealing the completed provider exchange retains the new login in a protected
 recovery slot and quarantines the account. Issue #1770 closes the former lost-response waiver:
@@ -155,7 +155,12 @@ proof. Noncredential recovery keeps its existing terminal blocked-proof cap. Can
 shutdown and claim loss take precedence and retain their existing exit and stale-claim cleanup
 semantics (`handleRecoveryExhausted`, `agent/src/runner.ts`).
 
-## D4: promotion is the ordinary recovery timer, not an unlock signal
+## D4: explicit unlock promotion with the ordinary recovery timer as backstop
+
+### Original decision (#1766; amended by #1792)
+
+The following timer-only decision records the original rationale; the #1792 amendment below
+supersedes its promotion trigger.
 
 Unlike the Codex-account hold (ADR-1590), which has no timer and resumes only when the account
 itself clears, a `vault_locked` park is not held on an unlock signal at all — an unlock event is
@@ -176,6 +181,27 @@ alternative is rejected anyway, for this cause specifically: the ordinary recove
 exists and already bounds the delay to at most one backoff interval, so an unlock-triggered promote
 of parked runs would only shave that bound — a UX-latency improvement, not something correctness
 needs. It stays a possible follow-up rather than part of this decision.
+
+### Amendment #1792: explicit unlock reduces queue latency
+
+A successful explicit `POST /api/vault/unlock` synchronously makes a best-effort attempt to
+promote this owner's already parked `recovery_wait` runs with cause `vault_locked` to `queued`,
+regardless of `recovery_retry_not_before` or `recovery_wait_count`. The owner, status and cause
+predicates in `PromoteVaultLockedRecoveryWaitRuns` (`api/internal/store/queries/runtime.sql`)
+leave other owners and causes untouched. Worker start still uses the normal claim path; this is
+an early queue promotion, not an instant worker start. Login, startup and passphrase creation
+do not gain this trigger.
+
+`VaultUnlock` (`api/internal/handler/vault.go`) calls the promotion before responding. A database
+failure is logged without changing the successful 204 response or skipping the Codex usage poke.
+The ordinary capped-backoff recovery timer remains the backstop, with no lifetime cap; a late
+worker park reported after the unlock UPDATE waits for that timer.
+
+The service (`api/internal/workersvc/vault_recovery.go`) checks the unlocked cache, then runs SQL
+without holding the vault mutex. A lock between the check and UPDATE can therefore queue a
+locked run, the same state the timer permits. `Claim` (`api/internal/workersvc/service.go`) idles
+until the owner unlocks again. This amendment accepts that race rather than holding the vault
+mutex over database I/O, and changes no credential, capture, custody or completion decision.
 
 ## Closing the former lost-reply waiver (issue #1770)
 
@@ -289,10 +315,11 @@ One related path is not covered by this decision:
 ## Consequences and residuals
 
 - An authorized run deferred by a vault lock retains its work and custody. It parks after verified
-  capture and can resume after unlock, recovery promotion and the ordinary retry/claim checks,
-  at the cost of at least one extra model turn on resume.
+  capture. An explicit successful owner unlock best-effort queues an already parked run promptly
+  (#1792), with the recovery timer as backstop; it resumes after recovery promotion and the
+  ordinary claim checks, at the cost of at least one extra model turn on resume.
 - The merge request waits for recovery promotion, successful resume and fresh completion
-  authority; unlock alone does not establish any of those checks.
+  authority; neither unlock nor the early queue promotion establishes any of those checks.
 - `evalCodexReleasePredicate`'s check order is now a correctness invariant for a second reason
   (D1): a future change to that function must preserve "quarantine check last" or re-verify the
   vault-locked recheck's tolerance from scratch.
