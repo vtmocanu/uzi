@@ -4876,7 +4876,7 @@ ORDER BY id
 LIMIT @page_cap::int;
 
 -- name: LockCodexAccountWaitRunForUpdate :one
--- PRD #1590 M3 (D3): prelock the selected parent before the run, then the caller locks
+-- PRD #1590 M3 (D3): prelock a checker's associated lead before the run, then the caller locks
 -- the alias and account (parent -> run -> alias -> account). Status and cause are re-checked here,
 -- so a run cancelled or promoted since the page was listed is pgx.ErrNoRows. SKIP LOCKED: the
 -- sweeper never waits on a run row another transaction holds (a cancel, say); that run is
@@ -4891,9 +4891,9 @@ WITH candidates AS MATERIALIZED (
     FROM candidates
     LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
         AND cc.checker_run_id = candidates.id
-    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
-        THEN cc.lead_run_id ELSE candidates.id END
+    LEFT JOIN runs parent ON parent.id = cc.lead_run_id
         AND parent.kind <> 'cross_check'
+    WHERE candidates.kind = 'cross_check'
 ), locked_parents AS MATERIALIZED (
     SELECT lead.* FROM runs lead
     WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
@@ -4907,6 +4907,9 @@ WITH candidates AS MATERIALIZED (
     SELECT DISTINCT mapping.run_id
     FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
     WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+    UNION ALL
+    SELECT candidates.id FROM candidates CROSS JOIN parent_lock_set locks
+    WHERE candidates.kind <> 'cross_check'
 )
 SELECT runs.* FROM runs
 WHERE runs.id = @id AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause = 'codex_account_unavailable'
@@ -4928,9 +4931,9 @@ WITH candidates AS MATERIALIZED (
     FROM candidates
     LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
         AND cc.checker_run_id = candidates.id
-    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
-        THEN cc.lead_run_id ELSE candidates.id END
+    LEFT JOIN runs parent ON parent.id = cc.lead_run_id
         AND parent.kind <> 'cross_check'
+    WHERE candidates.kind = 'cross_check'
 ), locked_parents AS MATERIALIZED (
     SELECT lead.* FROM runs lead
     WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
@@ -4959,6 +4962,9 @@ WITH candidates AS MATERIALIZED (
     SELECT DISTINCT mapping.run_id
     FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
     WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+    UNION ALL
+    SELECT candidates.id FROM candidates CROSS JOIN parent_lock_set locks
+    WHERE candidates.kind <> 'cross_check'
 )
 UPDATE runs SET
     status     = 'queued',
