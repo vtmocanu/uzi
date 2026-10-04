@@ -6878,6 +6878,92 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
 });
 
 describe("Codex completion interlock", () => {
+  for (const scenario of [
+    { name: "zero", ack: { scopeCeiling: 0, completedCount: 0 }, capped: 0 },
+    { name: "overshoot", ack: { scopeCeiling: 1, completedCount: 2 }, capped: 2 },
+    { name: "full total", ack: { scopeCeiling: 1, completedCount: 3 } },
+    { name: "above total", ack: { scopeCeiling: 1, completedCount: 4 } },
+    { name: "missing count", ack: { scopeCeiling: 0 } },
+    { name: "below ceiling", ack: { scopeCeiling: 2, completedCount: 1 } },
+    { name: "absent ceiling", ack: { completedCount: 2 } },
+    { name: "missing ACK", ack: undefined },
+    { name: "nonissue", ack: { scopeCeiling: 0, completedCount: 0 }, kind: "prompt" as const },
+    { name: "no frozen list", ack: { scopeCeiling: 0, completedCount: 0 }, frozen: [] },
+    { name: "absent frozen list", ack: { scopeCeiling: 0, completedCount: 0 }, noFrozen: true },
+  ]) {
+    it(`fresh boundary: ${scenario.name}`, async () => {
+      const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "signal_done", {}, th, tn, "boundary-done")).push(turnCompleted("completed", th, tn));
+      })]);
+      const c = makeCtx({
+        kind: scenario.kind ?? "issue", completionInterlock: true,
+        frozenMilestones: scenario.noFrozen ? undefined : scenario.frozen ?? [1, 2, 3].map((n) => ({ id: `m${n}`, title: `Milestone ${n}` })),
+        recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 1 }),
+        reportIteration: async () => scenario.ack,
+      });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(c.ctx), 5000, scenario.name);
+      assert.deepEqual(result.scopeCapped, scenario.capped === undefined ? undefined : { completedCount: scenario.capped, total: 3 });
+      assert.equal(rig.providerLaunches(), scenario.capped === undefined ? 1 : 0);
+      assert.equal(c.emitted.filter((m) => m.kind === "steer_ack").length, scenario.capped === undefined ? 0 : 1);
+    });
+  }
+
+  for (const mode of ["cap", "uncapped", "raised", "raised threshold", "missing ACK", "missing count", "budget lift", "cancel", "ACK cancel"] as const) {
+    it(`interlocked done at maxIterations=1: ${mode}`, async () => {
+      const rig = makeMultiEpochRig([
+        epochResponder("th-1", "tn-1", (t, th, tn) => {
+          t.push(toolCall(1, "signal_done", { milestones_completed: ["m2"] }, th, tn, "cap-done-1")).push(turnCompleted("completed", th, tn));
+        }),
+        resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+          t.push(toolCall(2, "signal_done", { milestones_completed: ["m3"] }, th, tn, "cap-done-2")).push(turnCompleted("completed", th, tn));
+        }),
+      ]);
+      const order: string[] = [];
+      const union = new Set(["m1"]);
+      let ackCancelled = false;
+      const holds: string[] = [];
+      let attempts = 0;
+      const { ctx } = makeCtx({
+        kind: "issue", completionInterlock: true, config: { max_iterations: mode === "raised threshold" ? 2 : 1 },
+        frozenMilestones: [1, 2, 3].map((n) => ({ id: `m${n}`, title: `Milestone ${n}` })),
+        cancelRequested: () => ackCancelled || (mode === "cancel" && attempts === 1),
+        checkpoint: async (opts) => { assert.equal(opts.sink, "done_checkpoint"); order.push("checkpoint"); },
+        recordCompletionAttempt: async ({ declared }) => {
+          order.push("attempt");
+          for (const id of declared) union.add(id);
+          attempts++;
+          return { unmet: ["m1", "m2", "m3"].filter((id) => !union.has(id)), attemptCount: attempts };
+        },
+        reportIteration: async (n) => {
+          order.push(`ack-${n}`);
+          if (n > 1 && mode === "ACK cancel") ackCancelled = true;
+          if (n > 1 && mode === "missing ACK") return undefined;
+          return { scopeCeiling: mode === "uncapped" || mode === "budget lift" ? undefined : (mode === "raised" || mode === "raised threshold") && n > 1 ? 3 : 2,
+            completedCount: n > 1 && mode === "missing count" ? undefined : union.size, completedIds: [...union],
+            ...(mode === "cap" && n > 1 ? { budgetExhausted: true, pauseRequested: true } : {}),
+            ...(mode === "budget lift" && n > 1 ? { maxIterations: 2 } : {}) };
+        },
+        enterCompletionHold: async (reason) => { holds.push(reason); return true; },
+        parkForPause: async () => { assert.fail("cap must precede pause"); },
+      });
+      const running = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, mode);
+      if (mode === "cancel" || mode === "ACK cancel") {
+        await assert.rejects(running, /cancelled/);
+        assert.deepEqual(order, mode === "cancel" ? ["ack-1", "checkpoint", "attempt"] : ["ack-1", "checkpoint", "attempt", "ack-2"]);
+      } else {
+        const result = await running;
+        assert.deepEqual(order.slice(0, 4), ["ack-1", "checkpoint", "attempt", "ack-2"]);
+        assert.deepEqual(result.scopeCapped, mode === "cap" ? { completedCount: 2, total: 3 } : undefined);
+        assert.equal(holds.length, ["uncapped", "raised", "missing ACK", "missing count"].includes(mode) ? 1 : 0);
+        if (holds.length) assert.match(holds[0]!, /iteration budget/);
+      }
+      assert.equal(rig.providerLaunches(), mode === "budget lift" || mode === "raised threshold" ? 2 : 1);
+      assert.equal(rig.client.releaseCalls.length, mode === "budget lift" || mode === "raised threshold" ? 2 : 1, "no extra epoch credential release");
+      assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+      assert.equal(rig.epochs[1]?.transport.turnStartCount ?? 0, mode === "budget lift" || mode === "raised threshold" ? 1 : 0);
+    });
+  }
+
   const doneEpoch = (n: number): Responder => resumedEpochResponder("th-1", `tn-${n}`, (t, th, tn) => {
     t.push(toolCall(n, "signal_done", { milestones_completed: ["m1"] }, th, tn, `done-${n}`))
       .push(turnCompleted("completed", th, tn));

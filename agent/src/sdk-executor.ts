@@ -24,7 +24,7 @@
 
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "./worker-spawn-mark.js";
-import { scopeCapAtDone, scopeSteerAckPayload } from "./scope-cap.js";
+import { scopeCapAtBoundary, scopeCapAtDone, scopeSteerAckPayload } from "./scope-cap.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type {
@@ -2509,6 +2509,19 @@ export class SdkExecutor implements Executor {
         // gets more turns; a single/zero-milestone run's ACK carries none, so this is
         // inert and REASON_MAX_ITERATIONS still trips at the default — the regression gate).
         const served = await ctx.reportIteration?.(iteration, latestProgress);
+        if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+        const boundaryCap = isIssueRun ? scopeCapAtBoundary({
+          served, frozen: frozenMilestones ?? ctx.frozenMilestones,
+        }) : undefined;
+        if (boundaryCap) {
+          scopeCapped = { completedCount: boundaryCap.completedCount, total: boundaryCap.total };
+          ctx.emit({
+            kind: "steer_ack",
+            agent: "worker",
+            payload: scopeSteerAckPayload(boundaryCap.ceiling, boundaryCap.completedCount),
+          });
+          break;
+        }
         if (served) {
           lastServedScope = { scopeCeiling: served.scopeCeiling, completedCount: served.completedCount, completedIds: served.completedIds };
           if (
@@ -2536,33 +2549,14 @@ export class SdkExecutor implements Executor {
             }
           }
         }
-        // PRD #634 M3: operator scope-ceiling honor gate. `served.scopeCeiling` (absent =
-        // unbounded) is the number of frozen milestones the operator permits; `served.completedCount`
-        // is the server's fresh completed count. When the count has reached the ceiling, start NO
-        // further milestone: the in-flight turn's work is already committed (the prior iteration's
-        // fallback/cooperative checkpoint), so finalize the committed slice. This fires EVERY
-        // iteration regardless of whether the lead cooperatively checkpointed — the whole point of
-        // putting it at the loop top, not the checkpoint. The advisory pullFollowUp drain is untouched.
-        if (
-          isIssueRun &&
-          served &&
-          typeof served.scopeCeiling === "number" &&
-          typeof served.completedCount === "number" &&
-          served.completedCount >= served.scopeCeiling
-        ) {
-          scopeCapped = {
-            completedCount: served.completedCount,
-            total: frozenMilestones?.length,
-          };
-          // PRD #634 M4: emit a structured steer_ack feed message (reusing the plan_feedback
-          // emit machinery) so the operator sees the scope directive was applied without
-          // parsing run state. The scopeCapped latch and the break are unchanged from M3.
-          ctx.emit({
-            kind: "steer_ack",
-            agent: "worker",
-            payload: scopeSteerAckPayload(served.scopeCeiling, served.completedCount),
-          });
-          break;
+        // Interlocked rework continues directly to this boundary. Check its existing attempt
+        // state after the fresh cap and any upward budget lift, before another provider turn.
+        if (isIssueRun && ctx.completionInterlock && completionAttempted && iteration > maxIterations) {
+          if (await routeCompletionHold(ctx, REASON_MAX_ITERATIONS, completionAttempted)) {
+            completionHeld = { reason: REASON_MAX_ITERATIONS };
+            break;
+          }
+          throw new Error(REASON_MAX_ITERATIONS);
         }
         // PRD #1190 M2: owner-requested pause boundary. SEPARATE from the scope block above and
         // deliberately NOT gated on isIssueRun — three of the four pausable kinds (task, prompt,

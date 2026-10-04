@@ -56,7 +56,7 @@ import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { scopeCapAtDone, scopeSteerAckPayload } from "../scope-cap.js";
+import { scopeCapAtBoundary, scopeCapAtDone, scopeSteerAckPayload } from "../scope-cap.js";
 import fs from "node:fs/promises";
 import { constants as FS } from "node:fs";
 import type { Readable, Writable } from "node:stream";
@@ -2484,9 +2484,8 @@ export class CodexExecutor implements Executor {
       // PRD #1798 M2 (D4, D13 parity with sdk-executor): the latched signal_done pr_summary,
       // stamped with the worktree HEAD on the done turn that declared it.
       let declaredPrSummary: PrSummaryClaim | undefined;
-      // Issue #1514: latched at the non-interlocked done exit when the operator's scope ceiling was
-      // reached with milestones remaining, so the run delivers non-closing (sdk-executor parity;
-      // Codex has no loop-top scope gate). Issue runs only.
+      // Latched at a fresh ACK boundary or the legacy done exit when milestones remain.
+      // Issue runs only.
       let scopeCapped: { completedCount: number; total?: number } | undefined;
       let lastServedScope: { scopeCeiling?: number; completedCount?: number; completedIds?: string[] } | undefined;
       // Issue #1514: every completed id seen this run; latestProgress is pruned across checkpoints.
@@ -2507,6 +2506,8 @@ export class CodexExecutor implements Executor {
       // will actually run, so a pause, wall park or completion hold decided at that boundary never
       // launches (and releases a credential for) a provider root it would immediately abandon.
       let epochNeedsRecreate = false;
+      // Written only by an exhausted interlocked done with unmet milestones.
+      let pendingIterationExhaustion = false;
       const loopResult = (): ExecutorResult => ({
         branch: ctx.branch,
         agentSelection,
@@ -2531,6 +2532,17 @@ export class CodexExecutor implements Executor {
         // Match sdk-executor's upward-only served iteration cap. A smaller or absent
         // budget never shortens the configured/default limit or an earlier lift.
         const served: IterationBudget | void = await ctx.reportIteration?.(iteration, latestProgress);
+        if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+        const boundaryCap = isIssueRun ? scopeCapAtBoundary({ served, frozen: milestones }) : undefined;
+        if (boundaryCap) {
+          scopeCapped = { completedCount: boundaryCap.completedCount, total: boundaryCap.total };
+          ctx.emit({
+            kind: "steer_ack",
+            agent: "worker",
+            payload: scopeSteerAckPayload(boundaryCap.ceiling, boundaryCap.completedCount),
+          });
+          break;
+        }
         if (served) {
           lastServedScope = { scopeCeiling: served.scopeCeiling, completedCount: served.completedCount, completedIds: served.completedIds };
           if (typeof served.maxIterations === "number" && served.maxIterations > maxIterations) {
@@ -2538,6 +2550,17 @@ export class CodexExecutor implements Executor {
           }
           // Issue #1600: lift the run-wide wall to the served total (including owner extensions).
           liftWall(wall, served.totalWallSeconds ?? served.wallSeconds);
+        }
+        if (pendingIterationExhaustion) {
+          pendingIterationExhaustion = false;
+          // The preceding turn exhausted the old limit; an upward ACK lift may permit rework.
+          if (iteration > maxIterations) {
+            if (await routeHold(REASON_MAX_ITERATIONS, completionAttempted)) {
+              completionHeld = { reason: REASON_MAX_ITERATIONS };
+              break;
+            }
+            throw new Error(REASON_MAX_ITERATIONS);
+          }
         }
         if (served?.budgetExhausted && interlockedIssue && completionAttempted &&
             await routeHold(REASON_COMPLETION_BUDGET_EXHAUSTED, completionAttempted)) {
@@ -2759,6 +2782,10 @@ export class CodexExecutor implements Executor {
             }
           }
           completionFollowUp = buildCompletionReworkFollowUp(unmet, milestones, guidance);
+          if (iteration >= maxIterations) pendingIterationExhaustion = true;
+          // Re-check the fresh ACK's cap before exhaustion or any new provider epoch.
+          epochNeedsRecreate = true;
+          continue;
         }
         if (iteration >= maxIterations) {
           if (await routeHold(REASON_MAX_ITERATIONS, completionAttempted)) {
@@ -2766,11 +2793,6 @@ export class CodexExecutor implements Executor {
             break;
           }
           throw new Error(REASON_MAX_ITERATIONS);
-        }
-        if (result.done) {
-          // Issue #1764: the rework turn's fresh epoch is minted at the next loop top.
-          epochNeedsRecreate = true;
-          continue;
         }
         // Issue #1674 (PRD #390 M3 parity): only a normal work turn reaches here. On a
         // milestone-bearing run whose tracker shows nothing in progress, re-ask on the next turn and,

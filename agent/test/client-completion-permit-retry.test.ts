@@ -21,10 +21,12 @@ type Answer = { status: number; body: unknown } | "drop";
 async function permitServer(
   answers: Answer[],
   onRequest?: () => void,
-): Promise<{ url: string; posts: () => number; close: () => Promise<void> }> {
+): Promise<{ url: string; posts: () => number; bodies: Record<string, unknown>[]; close: () => Promise<void> }> {
   let posts = 0;
+  const bodies: Record<string, unknown>[] = [];
   const server = http.createServer((req, res) => {
-    req.resume();
+    let raw = "";
+    req.on("data", (chunk) => { raw += String(chunk); });
     req.on("end", () => {
       if ((req.url ?? "").endsWith("/worker/register")) {
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -37,6 +39,7 @@ async function permitServer(
       }
       const answer = answers[Math.min(posts, answers.length - 1)]!;
       posts += 1;
+      bodies.push(JSON.parse(raw) as Record<string, unknown>);
       onRequest?.();
       if (answer === "drop") {
         req.socket.destroy();
@@ -52,6 +55,7 @@ async function permitServer(
   return {
     url: `http://127.0.0.1:${port}`,
     posts: () => posts,
+    bodies,
     close: () => new Promise<void>((r) => server.close(() => r())),
   };
 }
@@ -255,6 +259,30 @@ describe("requestCompletionPermit waits out an api outage (e2e phase 52 regressi
     try {
       await assert.rejects(c.requestCompletionPermit("run-1", ARGS, ac.signal));
       assert.ok(srv.posts() <= 2, `stopped promptly after the cancel (posts=${srv.posts()})`);
+    } finally {
+      await srv.close();
+    }
+  });
+});
+
+
+describe("capped completion permit transport", () => {
+  it("retains scope_capped through socket loss and generation fallback", async () => {
+    const srv = await permitServer([
+      "drop",
+      { status: 400, body: { error: "invalid request body" } },
+      GRANTED,
+    ]);
+    try {
+      const c = client(srv.url, []);
+      await c.register("cap", undefined, 1, undefined, ["credential_switch_v1"]);
+      const result = await c.requestCompletionPermit("run-1", { ...ARGS, claimGeneration: 3, scopeCapped: true });
+      assert.equal(result.granted, true);
+      assert.deepEqual(srv.bodies, [
+        { contract_revision: 2, branch: ARGS.branch, head: ARGS.head, claim_generation: 3, scope_capped: true },
+        { contract_revision: 2, branch: ARGS.branch, head: ARGS.head, claim_generation: 3, scope_capped: true },
+        { contract_revision: 2, branch: ARGS.branch, head: ARGS.head, scope_capped: true },
+      ]);
     } finally {
       await srv.close();
     }

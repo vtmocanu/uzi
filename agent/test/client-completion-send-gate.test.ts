@@ -523,3 +523,40 @@ describe("requestCompletionHold send-gate (PRD #1247 fix round)", () => {
     }
   });
 });
+
+
+describe("completion permit scope opt-in", () => {
+  for (const scopeCapped of [undefined, false, true]) {
+    it(`serializes scope_capped only for true (input ${scopeCapped})`, async () => {
+      const srv = await completionServer({ worker_id: "w1" }, () => ({ status: 200, body: { granted: true } }));
+      try {
+        const c = await bareClient(srv.url);
+        await c.requestCompletionPermit("run-1", { ...PERMIT_ARGS(), scopeCapped });
+        assert.deepEqual(srv.posts[0]!.body, {
+          contract_revision: 2, branch: "agent/issue-1", head: "head-sha",
+          ...(scopeCapped === true ? { scope_capped: true } : {}),
+        });
+      } finally {
+        await srv.close();
+      }
+    });
+  }
+
+  for (const fenced of [false, true]) {
+    it(`never downgrades when an older strict server rejects scope_capped (fenced ${fenced})`, async () => {
+      const srv = await completionServer({ worker_id: "w1" }, (_endpoint, body) =>
+        "scope_capped" in body ? STRICT_DECODE_400 : { status: 200, body: { granted: true } });
+      try {
+        const c = fenced ? await capabilityClient(srv.url) : await bareClient(srv.url);
+        await assert.rejects(
+          c.requestCompletionPermit("run-1", { ...PERMIT_ARGS(3), scopeCapped: true }),
+          (e: unknown) => e instanceof RequestError && e.status === 400,
+        );
+        assert.equal(srv.posts.length, fenced ? 2 : 1);
+        assert.ok(srv.posts.every((p) => p.body.scope_capped === true && p.status === 400));
+      } finally {
+        await srv.close();
+      }
+    });
+  }
+});

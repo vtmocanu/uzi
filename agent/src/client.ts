@@ -1942,7 +1942,7 @@ export class WorkerClient {
    *  cancel, or an exhausted budget throws as before (RequestError on HTTP). */
   async requestCompletionPermit(
     runId: string,
-    args: { contractRevision: number; branch: string; head: string; claimGeneration?: number },
+    args: { contractRevision: number; branch: string; head: string; claimGeneration?: number; scopeCapped?: boolean },
     signal?: AbortSignal,
   ): Promise<CompletionPermitResult> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/permit`;
@@ -1973,6 +1973,8 @@ export class WorkerClient {
           head: args.head,
         };
         if (includeField) body.claim_generation = args.claimGeneration;
+        // Never downgrade a capped permit to ordinary completion, even on a strict-decode retry.
+        if (args.scopeCapped === true) body.scope_capped = true;
         return this.postJSON(path, body, timeoutMs, signal);
       });
     let res: CompletionPermitResponse;

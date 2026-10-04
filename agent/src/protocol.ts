@@ -1712,6 +1712,8 @@ export interface CompletionAttemptResponse {
  *  alignment/push path landed. The server recomputes its OWNED structural predicates and
  *  never trusts a "milestones done" claim — there is none in the request. */
 export interface CompletionPermitRequest {
+  /** Explicit opt-in to an operator-capped partial completion; omitted unless true. */
+  scope_capped?: boolean;
   contract_revision: number;
   branch: string;
   head: string;
@@ -1726,7 +1728,7 @@ export interface CompletionPermitRequest {
  *  server's permit decision. `granted:true` carries `permit` (bound to run,
  *  contract_revision, branch, head); `granted:false` carries a `deny_reason` from the
  *  server taxonomy (stale_claim / not_interlocked / revision_drift / contract_not_frozen /
- *  missing_milestones / empty_branch / empty_head) and, for missing_milestones, the `unmet`
+ *  missing_milestones / scope_cap_not_reached / empty_branch / empty_head) and, for missing_milestones, the `unmet`
  *  id list. EVERY
  *  denial is NON-TERMINAL — the run keeps its status and the worker acts on the reason. */
 export interface CompletionPermitResponse {

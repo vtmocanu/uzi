@@ -4798,13 +4798,13 @@ export class RunRunner {
           if (!isCodePublishingKind(resolveRunKind(claim.kind))) return;
           // PRD #1392 M1/M2 (fact 9): stamp the release's evidence class. A full publication
           // (a pushed branch + / or MR) → "publication". A NO-code completion on this SAME
-          // branch (report_only / not_code / scope-capped-empty) carries no `branch` and is NOT a
+          // branch (report_only / not_code / scope-capped-empty) is NOT a
           // publication — its release class is genuinely ambiguous (neither publication nor the
           // fresh-forge no-output proof), so OMIT the evidence (the api stores NULL, which is
           // allowed) rather than mis-stamp it.
           const completedBody = body as StateRequest;
           const releaseEvidence =
-            typeof completedBody.branch === "string" && completedBody.branch !== ""
+            !completedBody.report_only && typeof completedBody.branch === "string" && completedBody.branch !== ""
               ? "publication"
               : undefined;
           await this.recovery.release(claim.run_id, claim.claim_generation, releaseEvidence);
@@ -4865,7 +4865,8 @@ export class RunRunner {
     // completion ACK, and the settle itself runs only AFTER the terminal outcome resolved (the
     // outbox journal retired / terminalResolved latched), off the terminal send path.
     const journalTerminalReport = async (body: Parameters<RunFlight["reportState"]>[0]) => {
-      await this.persistSettlementPushedHead(claim, flight, body);
+      // A report-only capped slice carries permit identity, but has no pushed settlement head.
+      if (!(body as StateRequest).report_only) await this.persistSettlementPushedHead(claim, flight, body);
       await this.journalAndSendTerminal(flight, TERMINAL_JOURNAL_PHASE, body, reportState);
       await this.settleAfterCompletion(claim, flight, body);
     };
@@ -4896,6 +4897,83 @@ export class RunRunner {
     };
     const runId = claim.run_id;
     const result = flight.result!;
+    const interlocked = claim.config?.completion_contract_version != null;
+    // Park the incomplete/unverifiable interlocked run, else report a typed failure. Shared by the
+    // permit-denied and PR-head-mismatch paths (D5's held-or-fail). enterCompletionHold reaps,
+    // captures a VERIFIED same-worker restore point and parks on a `paused` ACK (returns true), or
+    // parks nothing (returns false); on true we skip finalization exactly like the
+    // result.completionHeld branch above, and on false the run follows normal terminal cleanup
+    // (enterCompletionHold cleared its preserve flags) so we report a static, content-free failure.
+    // `holdReason` is a static hold-reason string, never raw model output.
+    const holdOrFailInterlocked = async (holdReason: string): Promise<void> => {
+      const held = await this.enterCompletionHold(flight, claim, holdReason, runLog);
+      if (held) {
+        // Issue #1742 retirement site (c): the api accepted the completion-hold park for this generation.
+        await this.retireFinalizeRecord(flight, "completion_hold_accepted");
+        executor.killAgentTree?.();
+        await closeBatcher().catch(() => undefined);
+        runLog.info("run entered the completion hold; skipping finalization", {
+          run_id: runId,
+          reason: holdReason,
+        });
+        return;
+      }
+      await closeBatcher();
+      // PRD #1391 Run B M3 (N1): journal write-ahead so the completion-interlock failure survives an
+      // outage as this exact outcome, not a generic agent_failure.
+      await journalTerminalReport({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
+      runLog.info("run failed: completion interlock could not park the incomplete run", {
+        run_id: runId,
+        reason: holdReason,
+      });
+    };
+
+    // Both capped-empty and MR completion use the same bounded client retry and hold paths.
+    const requireCompletionPermit = async (head: string | null, branch: string): Promise<boolean> => {
+      const contractRevision = flight.latestContractRevision ?? claim.config?.contract_revision;
+      if (!head || !branch || contractRevision === undefined) {
+        runLog.warn("completion interlock: head, branch or contract revision is unresolvable", { run_id: runId });
+        await holdOrFailInterlocked("completion identity unresolvable");
+        return false;
+      }
+      // 2. Request the permit bound to (run, contract_revision, branch, H). A denial is a normal 200
+      //    body (granted:false), never a throw. A transient transport failure (an api outage at
+      //    finalize) is retried inside the client until the api answers, bounded by its retry budget
+      //    and cancelled with the flight or the Codex finalize boundary. For Claude/stub runs
+      //    there is no boundary signal, so the flight signal is passed unchanged. Only a
+      //    permanent error, a cancel, or an exhausted budget throws to the generic catch,
+      //    which fails the run without falsely completing.
+      steps?.enter("completion_permit");
+      const permitSignal = boundarySignal
+        ? AbortSignal.any([flight.cancel.signal, boundarySignal])
+        : flight.cancel.signal;
+      const permit = await this.client.requestCompletionPermit(
+        runId,
+        {
+          contractRevision,
+          branch,
+          scopeCapped: !!result.scopeCapped,
+          head,
+          // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure
+          // stamps) so the server refuses to issue a permit for a released/superseded stale flight.
+          claimGeneration: flight.claimGeneration,
+        },
+        permitSignal,
+      );
+      // 3. NOT granted: do NOT create the MR, do NOT render Closes, do NOT report completed — hold.
+      if (!permit.granted) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: "completion permit denied; holding the incomplete run instead of opening a merge request",
+          },
+        });
+        await holdOrFailInterlocked("completion permit denied");
+        return false;
+      }
+      return true;
+    };
     // The same predicate gates the write-ahead record and entry into finalization.
     if (!isFinalizeBoundResult(result)) {
       // PRD #1190 M2: an owner-requested pause PARKED the run mid-loop (handlePausePark reported
@@ -5306,6 +5384,13 @@ export class RunRunner {
             landedCheckpoint ||
             (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
           if (!publishedCheckpoint) {
+            // Bind a zero slice to its committed base in the runner-owned clone, without pushing.
+            let cappedHead: string | undefined;
+            if (interlocked) {
+              const head = await this.git.branchTip(runnerClone.path, runnerClone.branch);
+              if (!await requireCompletionPermit(head, runnerClone.branch)) return;
+              cappedHead = head!;
+            }
             batcher.emit({
               kind: "status",
               agent: "worker",
@@ -5320,6 +5405,7 @@ export class RunRunner {
               status: "completed",
               report_only: true,
               scope_capped: true,
+              ...(interlocked ? { branch: runnerClone.branch, head: cappedHead } : {}),
               report_md:
                 result.summary ??
                 "Stopped by operator scope directive before any committed work; nothing to land.",
@@ -6572,7 +6658,6 @@ export class RunRunner {
     // the PRD #456 align push), so `H` below is the tip that ACTUALLY landed — never the pre-align
     // candidate. Interlocked runs are ISSUE runs that open MRs, so this sits on the openMr path only;
     // the no-MR task completion above is never interlocked and stays untouched.
-    const interlocked = claim.config?.completion_contract_version != null;
     // `Closes #N` renders at MR creation for a LEGACY run only (unchanged). For an INTERLOCKED run it
     // starts false and STAYS false at creation: Closes is NEVER rendered at creation for an interlocked
     // run; it is added ONLY after the PR head is verified to equal H (the verification block below), so
@@ -6593,36 +6678,6 @@ export class RunRunner {
     // legacy run, so JSON.stringify drops it and the legacy completed report is byte-for-byte the same
     // on the wire.
     let completionHead: string | undefined;
-    // Park the incomplete/unverifiable interlocked run, else report a typed failure. Shared by the
-    // permit-denied and PR-head-mismatch paths (D5's held-or-fail). enterCompletionHold reaps,
-    // captures a VERIFIED same-worker restore point and parks on a `paused` ACK (returns true), or
-    // parks nothing (returns false); on true we skip finalization exactly like the
-    // result.completionHeld branch above, and on false the run follows normal terminal cleanup
-    // (enterCompletionHold cleared its preserve flags) so we report a static, content-free failure.
-    // `holdReason` is a static hold-reason string, never raw model output.
-    const holdOrFailInterlocked = async (holdReason: string): Promise<void> => {
-      const held = await this.enterCompletionHold(flight, claim, holdReason, runLog);
-      if (held) {
-        // Issue #1742 retirement site (c): the api accepted the completion-hold park for this generation.
-        await this.retireFinalizeRecord(flight, "completion_hold_accepted");
-        executor.killAgentTree?.();
-        await closeBatcher().catch(() => undefined);
-        runLog.info("run entered the completion hold; skipping finalization", {
-          run_id: runId,
-          reason: holdReason,
-        });
-        return;
-      }
-      await closeBatcher();
-      // PRD #1391 Run B M3 (N1): journal write-ahead so the completion-interlock failure survives an
-      // outage as this exact outcome, not a generic agent_failure.
-      await journalTerminalReport({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
-      runLog.info("run failed: completion interlock could not park the incomplete run", {
-        run_id: runId,
-        reason: holdReason,
-      });
-    };
-
     // PRD #1225 (CodeRabbit !1254): fail CLOSED — a terminal failure with NO hold attempt. Used when a
     // would-be hold path could NOT strip `Closes #N` from the MR (the non-closing reconcile write
     // failed). `createMergeRequest` can ADOPT a pre-existing MR that already carries `Closes #N`, so a
@@ -6647,65 +6702,10 @@ export class RunRunner {
     };
 
     if (interlocked) {
-      // 1. Capture the EXACT landed head H. pushBranch pushes refs/uzi-runner/<branch>, and BOTH the
-      //    normal finalize push (fetchAgentBranch at the top of this method) and the align push
-      //    (fetchAndPush's re-fetch of the aligned tip) wrote that ref to the tip they pushed — so
-      //    trackingTip reads the landed tip after either path. The frozen contract revision is echoed
-      //    verbatim so the server can reject a revision drift. If either is unresolvable a permit
-      //    cannot be bound to (run, revision, branch, head), so route to the hold rather than report
-      //    completed. Issue #1626: the revision is the LATEST one a /state ACK carried
-      //    (flight.latestContractRevision) — a fresh run's contract freezes after its claim, so the
-      //    claim's value is absent there — falling back to the claim's (a resume re-delivers it).
+      // Read the exact landed tip after the finalize push or alignment; retain PR-head verification below.
       const head = await this.git.trackingTip(barePath, result.branch);
-      const contractRevision = flight.latestContractRevision ?? claim.config?.contract_revision;
-      if (head === null || contractRevision === undefined) {
-        runLog.warn(
-          "completion interlock: the landed head or contract revision is unresolvable; holding rather than completing",
-          { run_id: runId },
-        );
-        await holdOrFailInterlocked("completion identity unresolvable");
-        return;
-      }
-      // 2. Request the permit bound to (run, contract_revision, branch, H). A denial is a normal 200
-      //    body (granted:false), never a throw. A transient transport failure (an api outage at
-      //    finalize) is retried inside the client until the api answers, bounded by its retry budget
-      //    and cancelled with the flight or the Codex finalize boundary. For Claude/stub runs
-      //    there is no boundary signal, so the flight signal is passed unchanged. Only a
-      //    permanent error, a cancel, or an exhausted budget throws to the generic catch,
-      //    which fails the run without falsely completing.
-      steps?.enter("completion_permit");
-      const permitSignal = boundarySignal
-        ? AbortSignal.any([flight.cancel.signal, boundarySignal])
-        : flight.cancel.signal;
-      const permit = await this.client.requestCompletionPermit(
-        runId,
-        {
-          contractRevision,
-          branch: result.branch,
-          head,
-          // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure
-          // stamps) so the server refuses to issue a permit for a released/superseded stale flight.
-          claimGeneration: flight.claimGeneration,
-        },
-        permitSignal,
-      );
-      // 3. NOT granted: do NOT create the MR, do NOT render Closes, do NOT report completed — hold.
-      if (!permit.granted) {
-        batcher.emit({
-          kind: "status",
-          agent: "worker",
-          payload: {
-            text: "completion permit denied; holding the incomplete run instead of opening a merge request",
-          },
-        });
-        await holdOrFailInterlocked("completion permit denied");
-        return;
-      }
-      // 4. Granted: carry H on the completed report below. Closes is NEVER rendered at creation for an
-      //    interlocked run — it is added ONLY after the PR head is verified to equal H (the verification
-      //    block below re-asserts the canonical `Closes #N` body on a verified head), so a held,
-      //    unverified-head MR can never carry a closing line.
-      completionHead = head;
+      if (!await requireCompletionPermit(head, result.branch)) return;
+      completionHead = head!;
     }
 
     const targetBranch =
