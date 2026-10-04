@@ -252,6 +252,76 @@ func TestForgejoTruncatedResponseErrorClasses(t *testing.T) {
 	}
 }
 
+func TestForgejoOversizedErrorResponses(t *testing.T) {
+	token := strings.Join([]string{"deadbeef", "CANARY", strings.Repeat("d", 26)}, "")
+	for _, route := range []string{"sdk", "raw", "patch"} {
+		for _, tc := range []struct {
+			status int
+			class  ErrorClass
+		}{
+			{401, ErrorClassAuth}, {403, ErrorClassAuth},
+			{429, ErrorClassRateLimited}, {503, ErrorClassServerError},
+		} {
+			for _, oversized := range []bool{true, false} {
+				t.Run(fmt.Sprintf("%s/%d/oversized=%t", route, tc.status, oversized), func(t *testing.T) {
+					body := "CANARY echo " + token
+					if oversized {
+						// Split the token across the literal shipped error boundary.
+						body = strings.Repeat("x", 4096-20) + token + strings.Repeat("y", 4096)
+					}
+					path := "/repos/acme/widgets/issues"
+					if route == "raw" {
+						path += "/11/timeline"
+					}
+					if route == "patch" {
+						path += "/11"
+					}
+					m := newMockForgejo(t, map[string]http.HandlerFunc{
+						path: func(w http.ResponseWriter, _ *http.Request) {
+							w.Header().Set("Content-Type", "text/plain")
+							w.WriteHeader(tc.status)
+							_, _ = w.Write([]byte(body))
+						},
+					})
+					d := newForgejoDriver(t, m, token)
+					var err error
+					switch route {
+					case "sdk":
+						_, err = d.ListIssues(context.Background(), 7, ListIssuesOptions{})
+					case "raw":
+						_, err = d.ListIssueLabelEvents(context.Background(), 7, 11)
+					case "patch":
+						err = d.UpdateIssueDescription(context.Background(), 7, 11, "description")
+					}
+					assertClassifiedSafe(t, err, tc.class, token)
+					if errors.Unwrap(err) != nil {
+						t.Fatal("retained error chain")
+					}
+					if oversized {
+						want := "forgejo: read response: forgejo: response body exceeds size limit"
+						if route == "sdk" {
+							want = fmt.Sprintf("forgejo: list issues: body read on HTTP error %d: forgejo: response body exceeds size limit", tc.status)
+						}
+						if route == "patch" {
+							want = "forgejo: update issue description: forgejo: response body exceeds size limit"
+						}
+						if err.Error() != want || len(err.Error()) > 256 {
+							t.Fatalf("error = %q, want %q (at most 256 bytes)", err, want)
+						}
+						for _, fragment := range []string{token, token[:20], token[20:], "CANARY", "xxxxxxxx", "yyyyyyyy"} {
+							if strings.Contains(err.Error(), fragment) {
+								t.Fatalf("response fragment survived: %q", fragment)
+							}
+						}
+					} else if !strings.Contains(err.Error(), "CANARY echo "+redactPlaceholder) {
+						t.Fatalf("short error lost redaction control: %v", err)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestRawTypedErrorSevered(t *testing.T) {
 	token := strings.Join([]string{"glpat-", "CANARY", strings.Repeat("E", 14)}, "")
 	response := &http.Response{StatusCode: 503, Request: &http.Request{Header: http.Header{"Private-Token": {token}}}}

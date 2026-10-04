@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Oversized Forgejo error responses fail without exposing body fragments ([#2231](https://github.com/vtmocanu/uzi/issues/2231)).**
+  Non-success responses are capped at 4 KiB and an overflowing body is discarded before redaction, preventing a token split at the read boundary from leaking through SDK, raw GET or issue PATCH errors. HTTP error classification is preserved, and successful responses retain the 32 MiB transport cap.
+
 - **Trusted launch, admission and plan-gate refusals no longer park a run as a disk-full failure ([#1829](https://github.com/vtmocanu/uzi/issues/1829)).**
   These refusals keep their failure handling even when the data volume is full, including preserved trusted types, cause/interruption wrappers and complete legacy reasons prefixed by `<context>: <reason>` (a literal colon and space). Apostrophes in context are supported; double-quoted or multiline contexts, alternate separators, quoted reasons and producer-domain near-misses are not legacy refusal envelopes. Ordinary opaque failures are unchanged; a refusal whose origin has been completely erased can still coincide with fullness and be deferred.
 

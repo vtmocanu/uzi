@@ -236,12 +236,11 @@ func sameNameSet(a, b map[string]struct{}) bool {
 // gate — both D5/M4), and the job log endpoint (whose SDK method
 // GetRepoActionJobLogs buffers the whole body into memory before the driver sees
 // its size). It performs an authenticated GET against {baseURL}/api/v1{path} using
-// the driver's shared timeout client and reads the response body through an
-// io.LimitReader(resp.Body, limit) so the TRANSFER itself is byte-bounded: a
-// hostile forge streaming a multi-GB body therefore cannot OOM the api, as the read
-// stops at limit bytes. Every error is routed through the PAT redactor, including a
-// non-2xx body, so a hostile forge echoing the token in an error cannot leak it
-// (test #12).
+// the driver's shared timeout client. Successful reads stop at the caller's
+// limit. Non-2xx bodies are read to completion through cappedTransport's smaller
+// error cap; a read failure discards partial bytes before redaction so a token
+// split at a boundary cannot escape as a partial echo. Every error is routed
+// through the PAT redactor.
 func (f *forgejo) rawGetLimited(ctx context.Context, path string, limit int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.baseURL+"/api/v1"+path, nil)
 	if err != nil {
@@ -253,7 +252,11 @@ func (f *forgejo) rawGetLimited(ctx context.Context, path string, limit int64) (
 		return nil, f.wrapErr(fmt.Sprintf("request %s", path), err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, limit))
+	var reader io.Reader = resp.Body
+	if resp.StatusCode/100 == 2 {
+		reader = io.LimitReader(resp.Body, limit)
+	}
+	body, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, f.wrapErrStatus("read response", err, resp.StatusCode)
 	}
@@ -263,10 +266,8 @@ func (f *forgejo) rawGetLimited(ctx context.Context, path string, limit int64) (
 	return body, nil
 }
 
-// forgejoPatchErrBodyLimit caps how much of a non-2xx PATCH response patchIssue
-// reads: the body is only ever folded into a redacted error message, never
-// parsed, so a modest ceiling is enough and keeps a hostile forge's error body
-// byte-bounded (same reasoning as rawGetLimited's LimitReader).
+// forgejoPatchErrBodyLimit bounds the successful PATCH response read; its body
+// is discarded. Non-2xx reads use cappedTransport's error cap instead.
 const forgejoPatchErrBodyLimit = 1 << 20
 
 // patchIssue PATCHes a single issue with a caller-supplied struct, marshalling
@@ -279,9 +280,9 @@ const forgejoPatchErrBodyLimit = 1 << 20
 // concurrently by someone else — survives untouched (no read, no TOCTOU).
 //
 // Auth and redaction mirror rawGetLimited: the shared timeout client, the
-// "token " Authorization header, an io.LimitReader-bounded body read, and a
-// non-2xx error routed through f.wrapErr so a PAT echoed in the error body is
-// still redacted.
+// "token " Authorization header, a caller-limited successful read, and a full
+// transport-capped non-2xx read. Read failures discard partial bytes and retain
+// HTTP status classification through f.wrapErrStatus before redaction.
 func (f *forgejo) patchIssue(ctx context.Context, slug repoSlug, issueIID int64, op string, payload any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -300,7 +301,11 @@ func (f *forgejo) patchIssue(ctx context.Context, slug repoSlug, issueIID int64,
 		return f.wrapErr(op, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, forgejoPatchErrBodyLimit))
+	var reader io.Reader = resp.Body
+	if resp.StatusCode/100 == 2 {
+		reader = io.LimitReader(resp.Body, forgejoPatchErrBodyLimit)
+	}
+	respBody, err := io.ReadAll(reader)
 	if err != nil {
 		return f.wrapErrStatus(op, err, resp.StatusCode)
 	}
