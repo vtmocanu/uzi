@@ -276,7 +276,8 @@ const (
 	// pendingOutcomeFlagHeartbeats heartbeat intervals. It maps to the SAME healthStalled enum as
 	// reasonOutboxQueued, is a warning only, and never touches the lease or authorizes a reclaim,
 	// fail or discard. Same fixed-string contract as its siblings.
-	reasonOutcomeUndelivered = "the run's outcome is journaled on its worker but has not been delivered"
+	reasonOutcomeUndelivered    = "the run's outcome is journaled on its worker but has not been delivered"
+	reasonPlanCrossCheckWaiting = "waiting for plan cross-check"
 	// reasonLongToolCall (issue #2046) flags a running run whose oldest open lead tool call
 	// (delegation dispatches excluded) has been in flight longer than health_tool_call_seconds
 	// while the run itself has gone quiet. It maps to healthStalled, NOT healthSlow: slow
@@ -421,6 +422,11 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		if reason == reasonHandoffSetup {
 			nudge = false
 		}
+		// A live plan cross-check is expected waiting, not an owner-actionable warning.
+		// Preserve the existing notification stamp and cooldown for ordinary health episodes.
+		if reason == reasonPlanCrossCheckWaiting {
+			nudge = false
+		}
 		notifiedAt := pgtype.Timestamptz{}
 		if nudge {
 			notifiedAt = pgconv.Time(now)
@@ -505,8 +511,13 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 	}
 }
 
+// Optional reader keeps Store implementations without cross-check queries compatible.
+type livePlanCrossCheckReader interface {
+	HasLivePlanCrossCheck(context.Context, uuid.UUID) (bool, error)
+}
+
 // runningTarget computes the flag for a running run, priority persist-looping >
-// tool-looping > stalled > long tool call > near-timeout (Decision 3, extended by
+// tool-looping > live plan cross-check > stalled > long tool call > near-timeout (Decision 3, extended by
 // PRD #108 M4, #1170 D5 and issue #2046): looping is the strongest evidence of
 // pathology, and near-timeout is a budget-relative backstop that must not mask a
 // more specific signal.
@@ -551,6 +562,19 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 	// in-flight — a run repeating the same call is pathological even mid-call.
 	if stats.looping {
 		return healthLooping, reasonLooping
+	}
+
+	// The live query owns the current-generation, deadline and required-check predicate;
+	// the strict pending/settlement helper is deliberately not a health signal.
+	if runkind.PlanCrossCheckable(r.Kind) {
+		if reader, ok := s.q.(livePlanCrossCheckReader); ok {
+			live, err := reader.HasLivePlanCrossCheck(ctx, r.ID)
+			if err != nil {
+				slog.Error("health: read live plan cross-check", "run_id", r.ID, "error", err)
+			} else if live {
+				return healthWaitingWorker, reasonPlanCrossCheckWaiting
+			}
+		}
 	}
 
 	// stalled: silence past the threshold, suppressed while a LEAD tool call is in

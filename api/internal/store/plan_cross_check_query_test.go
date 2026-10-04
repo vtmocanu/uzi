@@ -70,6 +70,7 @@ func TestPlanCrossCheckPresenceHelpersLiveDB(t *testing.T) {
 		pending  bool
 	}{
 		{"live", "", true, true},
+		{"default off forced row", "UPDATE runs SET plan_cross_check_required = false WHERE id = $1", false, true},
 		{"expired", "UPDATE cross_checks SET deadline_at = now() - interval '1 second' WHERE lead_run_id = $1", false, true},
 		{"historical generation", "UPDATE cross_checks SET lead_claim_generation = 0 WHERE lead_run_id = $1", false, true},
 		{"settled", "UPDATE cross_checks SET verdict = 'approve', reason_class = 'approve', decided_at = now() WHERE lead_run_id = $1", false, false},

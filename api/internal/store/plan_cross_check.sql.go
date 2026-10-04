@@ -16,7 +16,7 @@ const hasLivePlanCrossCheck = `-- name: HasLivePlanCrossCheck :one
 SELECT EXISTS (
     SELECT 1 FROM cross_checks cc
     JOIN runs lead ON lead.id = cc.lead_run_id
-    WHERE lead.id = $1
+    WHERE lead.id = $1 AND lead.plan_cross_check_required
       AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
       AND cc.lead_claim_generation = lead.claim_generation
       AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
