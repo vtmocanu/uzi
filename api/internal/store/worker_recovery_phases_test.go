@@ -129,9 +129,10 @@ func TestFrozenRecoveryPhasesHealthyLiveDB(t *testing.T) {
 				t.Fatalf("healthy %s: rows=%v err=%v", phase, rows, err)
 			}
 			want := "queued"
-			if phase == "readopt" {
+			switch phase {
+			case "readopt":
 				want = "running"
-			} else if phase == "missing fail" || phase == "worker fail" || phase == "attested fail" {
+			case "missing fail", "worker fail", "attested fail":
 				want = "failed"
 			}
 			var status, verdict, leadStatus string
@@ -305,33 +306,37 @@ func TestRecoveryTerminalParentOwnershipLiveDB(t *testing.T) {
 				if err := run(); err != nil {
 					t.Fatal(err)
 				}
-				var child, verdict string
+				var child, verdict, leadStatus string
 				var bank int32
 				read := func() {
 					t.Helper()
-					if err := tx.QueryRow(ctx, `SELECT child.status,cc.verdict,lead.budget_paused_seconds
+					if err := tx.QueryRow(ctx, `SELECT child.status,cc.verdict,lead.status,lead.budget_paused_seconds
 						FROM cross_checks cc JOIN runs child ON child.id=cc.checker_run_id
 						JOIN runs lead ON lead.id=cc.lead_run_id WHERE cc.id=$1`, fx.crossCheckID).
-						Scan(&child, &verdict, &bank); err != nil {
+						Scan(&child, &verdict, &leadStatus, &bank); err != nil {
 						t.Fatal(err)
 					}
 				}
 				read()
 				wantChild, wantVerdict, wantBank := "failed", "pending", int32(7)
-				if state == "pending" {
+				wantLeadStatus := "failed"
+				switch state {
+				case "pending":
 					wantChild, wantVerdict, wantBank = "cancelled", "failed", 25
-				} else if state == "approve" || state == "failed" {
+				case "approve", "failed":
 					wantVerdict = state
+				case "parent fence", "frozen parent fence":
+					wantLeadStatus = "running"
 				}
-				if child != wantChild || verdict != wantVerdict || bank != wantBank {
-					t.Fatalf("child=%s verdict=%s bank=%d want=%s/%s/%d", child, verdict, bank, wantChild, wantVerdict, wantBank)
+				if child != wantChild || verdict != wantVerdict || leadStatus != wantLeadStatus || bank != wantBank {
+					t.Fatalf("child=%s verdict=%s lead=%s bank=%d want=%s/%s/%s/%d", child, verdict, leadStatus, bank, wantChild, wantVerdict, wantLeadStatus, wantBank)
 				}
 				if err := run(); err != nil {
 					t.Fatal(err)
 				}
 				read()
-				if child != wantChild || verdict != wantVerdict || bank != wantBank {
-					t.Fatalf("repeat child=%s verdict=%s bank=%d", child, verdict, bank)
+				if child != wantChild || verdict != wantVerdict || leadStatus != wantLeadStatus || bank != wantBank {
+					t.Fatalf("repeat child=%s verdict=%s lead=%s bank=%d", child, verdict, leadStatus, bank)
 				}
 				if err := tx.Rollback(ctx); err != nil {
 					t.Fatal(err)
@@ -341,6 +346,14 @@ func TestRecoveryTerminalParentOwnershipLiveDB(t *testing.T) {
 				if err := f.pool.QueryRow(ctx, "SELECT status,budget_paused_seconds FROM runs WHERE id=$1", fx.checkerID).
 					Scan(&original, &originalBank); err != nil || original != "running" || originalBank != 0 {
 					t.Fatalf("rollback child=%s bank=%d err=%v", original, originalBank, err)
+				}
+				wantOriginalLeadStatus := "running"
+				if state == "parked" {
+					wantOriginalLeadStatus = "awaiting_approval"
+				}
+				if err := f.pool.QueryRow(ctx, "SELECT status,budget_paused_seconds FROM runs WHERE id=$1", f.runID).
+					Scan(&original, &originalBank); err != nil || original != wantOriginalLeadStatus || originalBank != 7 {
+					t.Fatalf("rollback lead=%s bank=%d want=%s/7 err=%v", original, originalBank, wantOriginalLeadStatus, err)
 				}
 			})
 		}
