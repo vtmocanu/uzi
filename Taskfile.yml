@@ -2346,7 +2346,10 @@ tasks:
 
   # ----------------------------------------------------------- agent (npm) ----
   test:codex-refresh-lostreply-e2e:
-    desc: combined Codex lost refresh reply proof (real HTTP, Postgres and worker)
+    desc: Linux-only combined Codex lost refresh reply proof (real HTTP, Postgres and worker)
+    preconditions:
+      - sh: '[ "$(uname -s)" = Linux ]'
+        msg: 'test:codex-refresh-lostreply-e2e is Linux-only; requires the Linux-only session-copy fixture'
     cmds:
       - |
         command -v node >/dev/null || { echo "Node 24 or newer is required" >&2; exit 1; }
