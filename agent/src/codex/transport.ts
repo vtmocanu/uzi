@@ -29,6 +29,7 @@
 // becomes a bounded protocol failure, never an unbounded read buffer.
 
 import type { Readable, Writable } from "node:stream";
+import { StringDecoder } from "node:string_decoder";
 
 import type { HarnessError, HarnessErrorCategory } from "../harness.js";
 
@@ -183,9 +184,14 @@ export interface CodexTransportOptions {
   readonly maxOutboundBytes?: number;
   readonly maxInboundNotifications?: number;
   readonly maxInboundBytes?: number;
+  /** Cumulative lifetime ingress caps, used by the dedicated one-check connection. */
+  readonly maxProtocolBytes?: number;
+  readonly maxProtocolFrames?: number;
 }
 
 export interface CodexTransport {
+  /** Sticky read/write protocol failure, including one decoded after a queued terminal. */
+  readonly protocolFailure?: CodexTransportError;
   /**
    * Send a JSON-RPC request and resolve with its `result`, reject with a typed
    * {@link CodexTransportError} on a JSON-RPC error, `deadlineMs` timeout, `signal`
@@ -325,6 +331,11 @@ class CodexTransportImpl implements CodexTransport {
   private readonly maxOutboundBytes: number;
   private readonly maxInbound: number;
   private readonly maxInboundBytes: number;
+  private readonly maxProtocolBytes: number;
+  private readonly maxProtocolFrames: number;
+  private protocolBytes = 0;
+  private protocolFrames = 0;
+  private readonly decoder = new StringDecoder("utf8");
 
   private nextId = 1;
   private readonly pending = new Map<number, Pending>();
@@ -343,7 +354,7 @@ class CodexTransportImpl implements CodexTransport {
   private notesIterated = false;
   private serverRequestInterceptor?: (note: CodexNotification, frameBytes: number) => boolean;
 
-  private readonly onDataHandler = (chunk: string): void => this.onData(chunk);
+  private readonly onDataHandler = (chunk: string | Buffer): void => this.onData(chunk);
   private readonly onEndHandler = (): void => this.onEof();
   private readonly onInboundError = (): void => this.terminate(fail("transport", "codex transport read stream error"));
   private readonly onOutboundError = (): void => this.terminate(fail("transport", "codex transport write stream error"));
@@ -358,7 +369,10 @@ class CodexTransportImpl implements CodexTransport {
     this.maxInbound = opts.maxInboundNotifications ?? DEFAULT_MAX_INBOUND_NOTIFICATIONS;
     this.maxInboundBytes = opts.maxInboundBytes ?? DEFAULT_MAX_INBOUND_BYTES;
 
-    this.inbound.setEncoding("utf8");
+    this.maxProtocolBytes = opts.maxProtocolBytes ?? Infinity;
+    this.maxProtocolFrames = opts.maxProtocolFrames ?? Infinity;
+    // Count raw bytes before UTF-8 decoding or retaining streaming input.
+    if (opts.maxProtocolBytes === undefined && opts.maxProtocolFrames === undefined) this.inbound.setEncoding("utf8");
     this.inbound.on("data", this.onDataHandler);
     this.inbound.on("end", this.onEndHandler);
     this.inbound.on("close", this.onEndHandler);
@@ -458,6 +472,8 @@ class CodexTransportImpl implements CodexTransport {
     };
   }
 
+  get protocolFailure(): CodexTransportError | undefined { return this.terminalError; }
+
   notifications(): AsyncIterableIterator<CodexNotification> {
     if (this.notesIterated) throw fail("transport", "codex transport notifications() is single-consumer");
     this.notesIterated = true;
@@ -541,11 +557,24 @@ class CodexTransportImpl implements CodexTransport {
 
   // --- read side (bounded newline framing) ------------------------------------
 
-  private onData(chunk: string): void {
+  private onData(chunk: string | Buffer): void {
     if (this.closed) return;
-    this.readBuf += chunk;
+    const bytes = typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.byteLength;
+    if (bytes > this.maxProtocolBytes - this.protocolBytes) {
+      this.terminate(fail("protocol", "codex cumulative protocol budget exceeded"));
+      return;
+    }
+    this.protocolBytes += bytes;
+    this.readBuf += typeof chunk === "string" ? chunk : this.decoder.write(chunk);
     let nl = this.readBuf.indexOf("\n");
     while (nl !== -1) {
+      // Charge each framed line before JSON parsing, response correlation, or
+      // auth interception; draining the notification queue cannot reset this cap.
+      if (this.protocolFrames >= this.maxProtocolFrames) {
+        this.terminate(fail("protocol", "codex cumulative protocol budget exceeded"));
+        return;
+      }
+      this.protocolFrames += 1;
       const line = this.readBuf.slice(0, nl);
       this.readBuf = this.readBuf.slice(nl + 1);
       const byteLen = Buffer.byteLength(line, "utf8");

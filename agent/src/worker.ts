@@ -7,6 +7,7 @@ import type { ChatRunner } from "./chat-runner.js";
 import type { JudgeRunner } from "./judge-runner.js";
 import type { JobRunner } from "./job-runner.js";
 import type { ReviewRunner } from "./review-runner.js";
+import type { CrossCheckRunner } from "./cross-check-runner.js";
 import type { IsolatedRunner } from "./isolated-runner.js";
 import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
@@ -110,6 +111,7 @@ export class Worker {
     private readonly jobRunner: Pick<JobRunner, "execute"> = {
       execute: () => Promise.reject(new Error("no job runner wired")),
     },
+    private readonly crossCheckRunner?: Pick<CrossCheckRunner, "execute">,
   ) {}
 
   /** The run lane's in-flight executions (issue #1759: a field so {@link isIdle} can read it). */
@@ -920,7 +922,12 @@ export class Worker {
           // PRD #1976: a profile-bound JOB (`isolated_fetch` on a `job` claim) runs on the JobRunner's
           // lane mode, which applies the same isolated confinement and fails closed without a valid
           // grant or the fetcher config; every other `isolated_fetch` claim stays on the IsolatedRunner.
-          const exec = claim.isolated_fetch
+          const exec = claim.kind === "cross_check"
+            ? this.crossCheckRunner
+              ? this.crossCheckRunner.execute(claim, signal)
+              : this.client.reportState(claim.run_id, { status: "failed", claim_generation: claim.claim_generation,
+                  failure_reason: "No cross-check runner wired" }).then(() => undefined)
+            : claim.isolated_fetch
             ? claim.kind === "job"
               ? this.jobRunner.execute(claim)
               : this.executeIsolated(claim)

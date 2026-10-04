@@ -1017,3 +1017,39 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
   });
 });
+
+it("routes cross-check before review and ordinary runners in an ordinary slot and drains cancellation", async () => {
+ const controller = new AbortController();
+ const calls: string[] = [];
+ let claimCount = 0;
+ let started!: () => void;
+ const begin = new Promise<void>((resolve) => { started = resolve; });
+ const client = {
+  register: async () => ({}), heartbeat: async () => {},
+  claimChat: async () => null,
+  claimRun: async () => {
+   claimCount++;
+   return claimCount === 1 ? { run_id: "check", kind: "cross_check", review_target_run_id: "lead" } : null;
+  },
+ } as unknown as WorkerClient;
+ const runner = { ...noResumeRecoveries, execute: async () => { calls.push("ordinary"); } } as unknown as RunRunner;
+ const review = { execute: async () => { calls.push("review"); } } as unknown as ReviewRunner;
+ const { logger } = recordingLogger();
+ const worker = new Worker(fakeConfig(), client, runner, {} as ChatRunner, noJudge, review,
+  logger, okPreflight, undefined, undefined, undefined, undefined, undefined, undefined,
+  undefined, undefined, undefined, undefined, {
+   execute: async (_claim, signal) => {
+    calls.push("checker");
+    started();
+    await new Promise<void>((resolve) => signal!.addEventListener("abort", () => resolve(), { once: true }));
+    calls.push("drained");
+   },
+  });
+ const done = worker.run(controller.signal);
+ try {
+  await begin;
+  await tick(20);
+  assert.equal(claimCount, 1, "checker occupies the only ordinary slot");
+ } finally { controller.abort(); await done; }
+ assert.deepEqual(calls, ["checker", "drained"]);
+});

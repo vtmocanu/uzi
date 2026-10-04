@@ -2592,6 +2592,33 @@ tasks:
     cmds:
       - python3 -B e2e/codex-m0/supervisor-mechanism.test.py
 
+  test:cross-check-confinement:
+    desc: Required plan checker filesystem confinement and packaged provider/fileop proofs
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=vendor -buildvcs=false
+    cmds:
+      - |
+        set -eu
+        if [ "$(uname -s)" != Linux ]; then
+          echo "NOT RUN: cross-check confinement requires Linux" >&2
+          exit 2
+        fi
+        proof_dir="$(mktemp -d .uzi/scratch/cross-check-proof.XXXXXX)"
+        proof_dir="$(cd "$proof_dir" && pwd)"
+        trap 'rm -rf "$proof_dir"' EXIT
+        go -C agent/codex/supervisor build -o "$proof_dir/sandbox" ./cmdsandbox
+        go -C agent/codex/supervisor build -o "$proof_dir/supervisor" .
+        go -C agent/codex/supervisor build -o "$proof_dir/fileop" ./fileop
+        export UZI_CROSS_CHECK_SANDBOX="$proof_dir/sandbox"
+        export UZI_CROSS_CHECK_SUPERVISOR="$proof_dir/supervisor"
+        export UZI_CROSS_CHECK_FILEOP="$proof_dir/fileop"
+        export UZI_CROSS_CHECK_CONFINEMENT_REQUIRED=1
+        go -C agent/codex/supervisor test -count=1 ./cmdsandbox -run TestCrossCheck
+        node agent/test/cross-check-confinement-probe.mjs
+        cd agent
+        node --import tsx --test --test-concurrency=1 --test-timeout=120000 test/cross-check-confinement-packaged.probe.ts
+
   test:codex-supervisor:
     desc: Opt-in Linux-only gofmt vet and unit tests for the static Codex process supervisor module
     platforms: [linux]

@@ -1772,6 +1772,33 @@ export class GitCache {
     return path.join(this.runnerRoot, repoDir, key);
   }
 
+  /** A report-only checker owns a fresh clone and selects only the immutable candidate SHA. */
+  async runnerCloneAtCommit(barePath: string, baseCommit: string, runId: string): Promise<string> {
+    if (!/^[a-f0-9]{40}$/.test(baseCommit) || !/^[a-zA-Z0-9_-]+$/.test(runId)) {
+      throw new Error("invalid exact-commit checker identity");
+    }
+    return this.withLock(barePath, async () => {
+      const resolved = (await this.runGit(barePath, ["rev-parse", "--verify", `${baseCommit}^{commit}`])).trim();
+      if (resolved !== baseCommit) throw new Error("checker base commit unavailable");
+      const key = `cross-check-${runId}-${randomUUID()}`;
+      const clonePath = this.runnerClonePath(barePath, key);
+      await fs.mkdir(path.dirname(clonePath), { recursive: true });
+      try {
+        await this.runGitAsRunner(undefined, ["clone", "--shared", "--no-checkout", barePath, clonePath]);
+        await this.disableAutoMaintenance(clonePath, true);
+        await this.runGitAsRunner(clonePath, ["checkout", "--detach", baseCommit]);
+        await this.materializeRunnerClone(clonePath, [baseCommit]);
+        const head = (await this.runGitAsRunner(clonePath, ["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+        if (head !== baseCommit) throw new Error("checker checkout does not match candidate base");
+        return clonePath;
+      } catch (err) {
+        await this.removeRunnerClone(clonePath).catch((cleanup) =>
+          this.log.warn("checker clone cleanup failed", { error: gitErrorMessage(cleanup) }));
+        throw err;
+      }
+    });
+  }
+
   /**
    * Seed a RUNNER CLONE for an EXPLICIT branch — the PRD #6 ci_fix targets (a fresh
    * `ci-fix/pipeline-{id}` off the default branch, or an existing `agent/issue-{iid}`

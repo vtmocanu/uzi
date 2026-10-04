@@ -163,6 +163,9 @@ func setupFailure(stage string, err error) int {
 }
 
 func realMain(args []string) int {
+	if len(args) > 0 && args[0] == "--cross-check" {
+		return crossCheckMain(args[1:])
+	}
 	root, tmp, cwd, cache, mode, nullStdin, child, err := parseArgs(args)
 	if err != nil {
 		return setupFailure("invalid arguments", err)
@@ -474,8 +477,9 @@ type confineFunc func(root string, fds grantFds, abi int) error
 // grantFds are the adopted directories confine grants through their fds: the
 // private tmp, and the per-run cache (-1 when --cache is absent).
 type grantFds struct {
-	tmp   int
-	cache int
+	tmp      int
+	cache    int
+	readOnly bool // dedicated checker policy, never ordinary command mode
 }
 
 type noNewPrivsFunc func() error
@@ -583,7 +587,11 @@ var realRuleAdders = ruleAdders{path: addPathRule, fd: addFdRule}
 // lack. /opt/uzi-codex must stay off PATH (agent/test/templates-guardrails.test.ts).
 func addRules(ruleset int, root string, fds grantFds, handled uint64, add ruleAdders) error {
 	read := uint64(unix.LANDLOCK_ACCESS_FS_EXECUTE | unix.LANDLOCK_ACCESS_FS_READ_FILE | unix.LANDLOCK_ACCESS_FS_READ_DIR)
-	for _, path := range []string{"/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/nix", "/opt/uzi-toolchain", "/opt/uzi-codex"} {
+	systemPaths := []string{"/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/nix", "/opt/uzi-toolchain", "/opt/uzi-codex"}
+	if fds.readOnly {
+		systemPaths = []string{"/bin", "/sbin", "/usr", "/lib", "/lib64", "/nix", "/opt/uzi-toolchain", "/opt/uzi-codex", "/etc/ssl", "/etc/ca-certificates", "/etc/resolv.conf", "/etc/hosts", "/etc/localtime", "/etc/nsswitch.conf", "/etc/passwd", "/etc/group"}
+	}
+	for _, path := range systemPaths {
 		if err := add.path(ruleset, path, read&handled); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -592,7 +600,11 @@ func addRules(ruleset int, root string, fds grantFds, handled uint64, add ruleAd
 	if err := add.path(ruleset, "/dev", dev&handled); err != nil {
 		return err
 	}
-	if err := add.path(ruleset, root, handled); err != nil {
+	rootRights := handled
+	if fds.readOnly {
+		rootRights = uint64(unix.LANDLOCK_ACCESS_FS_READ_FILE|unix.LANDLOCK_ACCESS_FS_READ_DIR) & handled
+	}
+	if err := add.path(ruleset, root, rootRights); err != nil {
 		return err
 	}
 	if err := add.fd(ruleset, fds.tmp, handled); err != nil {
@@ -642,6 +654,13 @@ func addPathRule(ruleset int, path string, access uint64) error {
 		return &os.PathError{Op: "open", Path: path, Err: err}
 	}
 	defer unix.Close(fd)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		access &= uint64(unix.LANDLOCK_ACCESS_FS_EXECUTE | unix.LANDLOCK_ACCESS_FS_READ_FILE | unix.LANDLOCK_ACCESS_FS_WRITE_FILE | unix.LANDLOCK_ACCESS_FS_TRUNCATE)
+	}
 	return addFdRule(ruleset, fd, access)
 }
 

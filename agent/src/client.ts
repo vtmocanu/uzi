@@ -1028,7 +1028,19 @@ export class WorkerClient {
     const res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/claim`, body);
     if (res.status === 204) return null;
     if (res.status >= 400) throw await this.toError("POST", `${WORKER_API_PREFIX}/runs/claim`, res);
-    const claim = (await res.json()) as ClaimResponse;
+    const marker = res.headers.get("X-Uzi-Claim-Kind");
+    if (marker !== null && marker !== "cross_check") {
+      await res.body?.cancel();
+      throw new Error("unknown dedicated claim marker");
+    }
+    // Unmarked ordinary claims keep their existing decoder. This does not bound an
+    // arbitrary compromised unmarked response; the server envelope is a separate gate.
+    const claim = (marker === "cross_check"
+      ? JSON.parse(await readBoundedText(res, 2 * 1024 * 1024, true))
+      : await res.json()) as ClaimResponse;
+    if ((marker === "cross_check") !== (isRecord(claim) && claim.kind === "cross_check")) {
+      throw new Error("cross-check claim marker and kind disagree");
+    }
     // PRD #1798 D9: the pr_description is validated or dropped, never cast (decodePrState, the
     // same check as the bind / lookup / ack responses). The warning carries the run id only,
     // never the value (untrusted text). The isRecord guard keeps a `null` (or other non-object)

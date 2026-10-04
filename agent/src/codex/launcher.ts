@@ -133,6 +133,8 @@ export interface CodexLaunchSpec {
   /** Managed-auth resume only: copy the executor's deterministic, credential-free
    * sibling staging tree into the runner-owned sessions directory before spawn. */
   readonly seedSession?: boolean;
+  /** Dedicated required-Landlock checker policy; ordinary sandbox mode cannot relax it. */
+  readonly crossCheckReadOnly?: boolean;
 }
 
 /** The privileged step that creates the runner-owned trees + writes the config. The
@@ -211,6 +213,8 @@ export interface LauncherDeps {
   /** Static, path-free diagnostic for a best-effort tree-removal failure. */
   readonly reportRunnerTreeCleanupFailure?: () => void;
   readonly spawnSupervisor?: SpawnSupervisor;
+  /** Trusted test composition only: freshly built helpers. Never supplied by a launch spec. */
+  readonly helperBinsForTest?: { readonly supervisor: string; readonly crossCheckSandbox: string };
   /** issue #1783 (R0): reads a supervisor pid's start time when it is recorded as a worker-launched
    *  root (default procfs); a test with a fake supervisor pid injects it. */
   readonly rootStartTime?: StartTimeReader;
@@ -636,6 +640,9 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   }
 
   validateLaunchContract(spec);
+  if (spec.crossCheckReadOnly && (!spec.useAppServerAuth || spec.kind !== "provider")) {
+    throw new Error("cross-check confinement requires a managed-auth provider root");
+  }
   if (deps.appServerAuthOpenAIBaseUrlForTest !== undefined && !spec.useAppServerAuth) {
     throw new Error("Codex loopback test base URL requires app-server auth");
   }
@@ -706,10 +713,14 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   // 6. Spawn the supervisor AS the runner uid (compose the UNCHANGED runnerCommand),
   //    with 5-fd stdio (0/1/2 transport, 3 control, 4 evidence). The supervisor argv
   //    is trusted & launcher-fixed: never model-controlled.
-  const supervisorArgv = ["--expect-uid", String(uid), "--", spec.codexBin, ...spec.childArgv];
+  const childArgv = spec.crossCheckReadOnly
+    ? [deps.helperBinsForTest?.crossCheckSandbox ?? "/usr/local/bin/uzi-codex-command-sandbox", "--cross-check", "--root", spec.cwd,
+        "--state", spec.ownedDataRoot, "--cwd", spec.cwd, "--", spec.codexBin, ...spec.childArgv]
+    : [spec.codexBin, ...spec.childArgv];
+  const supervisorArgv = ["--expect-uid", String(uid), "--", ...childArgv];
   const wrapped = spec.kind === "command"
-    ? commandRootCommand(spec.supervisorBin, supervisorArgv)
-    : runnerCommand(spec.supervisorBin, supervisorArgv);
+    ? commandRootCommand(deps.helperBinsForTest?.supervisor ?? spec.supervisorBin, supervisorArgv)
+    : runnerCommand(deps.helperBinsForTest?.supervisor ?? spec.supervisorBin, supervisorArgv);
   // issue #1783 (R4): NO worker mark. The supervisor runs the Codex app-server, which executes
   // model-directed work, so anything it leaks must stay reapable and the nonce must stay out of
   // its env. A runner-uid (provider) root makes itself non-dumpable instead, so the reaper
@@ -783,8 +794,8 @@ export async function launchCodexEffectRoot(
     "--", spec.command, ...spec.args,
   ];
   const wrapped = spec.identity === "command"
-    ? commandRootCommand(spec.supervisorBin, supervisorArgv)
-    : workerBoundaryCommand(spec.supervisorBin, supervisorArgv);
+    ? commandRootCommand(deps.helperBinsForTest?.supervisor ?? spec.supervisorBin, supervisorArgv)
+    : workerBoundaryCommand(deps.helperBinsForTest?.supervisor ?? spec.supervisorBin, supervisorArgv);
   const child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
     cwd: spec.cwd,
     // issue #1783 (R4): NO worker mark. A command root runs model-directed shells, and neither
