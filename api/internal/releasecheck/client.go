@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"golang.org/x/mod/semver"
+
+	"github.com/vtmocanu/uzi/api/internal/httptransport"
 )
 
 // defaultBaseURL is the GitHub REST API base. The fetch endpoint is a compile-time
@@ -51,6 +53,9 @@ type githubRelease struct {
 	HTMLURL     string `json:"html_url"`
 }
 
+// releaseCheckHTTPTransport keeps an independent connection pool across release checks.
+var releaseCheckHTTPTransport = httptransport.New(http.DefaultTransport)
+
 // newHTTPClient builds the dedicated guarded client for the release check (PRD #836):
 // a hard Timeout and a redirect refusal (github.com/api.github.com never legitimately
 // 3xx-redirects this GET; returning ErrUseLastResponse hands the redirect response
@@ -60,7 +65,8 @@ type githubRelease struct {
 // io.LimitReader in fetchJSON.
 func newHTTPClient() *http.Client {
 	return &http.Client{
-		Timeout: releaseCheckTimeout,
+		Transport: releaseCheckHTTPTransport,
+		Timeout:   releaseCheckTimeout,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
