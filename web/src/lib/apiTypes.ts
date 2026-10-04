@@ -2702,6 +2702,10 @@ export interface Run {
   auto_approve: boolean;
   /** The run's snapshot of the owner's plan cross-check setting. */
   plan_cross_check_required: boolean;
+  /** Persisted forced-gate reason; optional for older server and mock responses. */
+  plan_cross_check_gate_reason?: string | null;
+  /** Owner detail only. Historical findings describe an earlier plan. */
+  plan_cross_check_summary?: PlanCrossCheckSummary;
   /** issue #857: what/how/who started the run (manual, autopilot, schedule,
    *  self_improve, ci_fix, mr_rework, chat, task, task_review, then_fix, judge,
    *  judge_rerun, resume, cross_check). A NOT NULL server column (DEFAULT 'manual'), so it is
@@ -3370,6 +3374,25 @@ export interface RunActivity {
   at: string;
   /** The frame's per-run seq — the deterministic tiebreak across interleaved subagents. */
   seq: number;
+}
+
+export interface PlanCrossCheckFinding {
+  file: string;
+  severity: string;
+  summary: string;
+  rationale: string;
+}
+
+export interface PlanCrossCheckSummary {
+  round: number;
+  verdict: string;
+  reason_class: string | null;
+  findings: { summary: string; items: PlanCrossCheckFinding[] } | null;
+  checker_run_id: string | null;
+  checker_model: string | null;
+  checker_effort: string | null;
+  usage: RunUsage | null;
+  historical: boolean;
 }
 
 // RunUsage is a run's server-rolled token/cost totals (PRD #40). The run VIEW
