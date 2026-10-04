@@ -2033,7 +2033,10 @@ UPDATE runs SET
             -- An approval racing a refused workflow does not erase its forced human gate.
             -- The service validates this declaration; it grants no implementation authority.
             THEN (SELECT CASE WHEN cc.verdict = 'approve'
-                         THEN COALESCE(sqlc.narg('plan_cross_check_gate_reason')::text,
+                         THEN COALESCE(
+                             CASE WHEN sqlc.narg('plan_cross_check_gate_reason')::text IN
+                                 ('interrupted', 'candidate_refused', 'checker_failed', 'planning_diff_refused')
+                                 THEN sqlc.narg('plan_cross_check_gate_reason')::text END,
                              CASE WHEN runs.plan_md IS NOT DISTINCT FROM @plan_md THEN runs.plan_cross_check_gate_reason END)
                          ELSE COALESCE(cc.reason_class, cc.verdict) END
                   FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan' AND cc.round = 1)

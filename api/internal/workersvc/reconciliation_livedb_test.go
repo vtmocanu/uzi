@@ -471,15 +471,16 @@ func TestReconciliationStateRefusalsAndOrdinaryLiveDB(t *testing.T) {
 			if result.Reconciliation != nil {
 				t.Fatalf("%s granted proof", tc)
 			}
-			if tc == "ordinary human" {
+			switch tc {
+			case "ordinary human":
 				if err != nil || !result.Applied || result.GateRevision != 1 {
 					t.Fatalf("ordinary report: applied=%v revision=%d err=%v", result.Applied, result.GateRevision, err)
 				}
-			} else if tc == "terminal" {
+			case "terminal":
 				if err != nil || result.Applied {
 					t.Fatalf("terminal no-op: applied=%v err=%v", result.Applied, err)
 				}
-			} else {
+			default:
 				if err == nil || result.Applied {
 					t.Fatalf("%s accepted: applied=%v err=%v", tc, result.Applied, err)
 				}

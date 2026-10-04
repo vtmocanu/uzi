@@ -28,6 +28,11 @@ func TestPlanCrossCheckGateReasonPersistedOutcomeLiveDB(t *testing.T) {
 		{"old generation approve", "approve", "", "interrupted", 1, 2, false},
 		{"current approve without refusal", "approve", "", "", 1, 1, false},
 		{"current approve with forced interruption", "approve", "interrupted", "interrupted", 1, 1, false},
+		{"current approve with stale revise declaration", "approve", "revise", "", 1, 1, false},
+		{"current approve with stale block declaration", "approve", "block", "", 1, 1, false},
+		{"current approve with bounded candidate refusal", "approve", "candidate_refused", "candidate_refused", 1, 1, false},
+		{"current approve with failed submit", "approve", "checker_failed", "checker_failed", 1, 1, false},
+		{"current approve with diff refusal", "approve", "planning_diff_refused", "planning_diff_refused", 1, 1, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := setupCodexLiveDB(t)
@@ -70,6 +75,14 @@ func TestPlanCrossCheckGateReasonPersistedOutcomeLiveDB(t *testing.T) {
 			if tc.declaration != "" {
 				req.PlanCrossCheckGateReason = &tc.declaration
 			}
+			switch tc.declaration {
+			case "candidate_refused":
+				req.PlanCrossCheckRefusal = "candidate_invalid"
+			case "checker_failed":
+				req.PlanCrossCheckRefusal = "submit_failed"
+			case "planning_diff_refused":
+				req.PlanCrossCheckDiffRefusal = "diff_too_large"
+			}
 			report := func(want string) {
 				t.Helper()
 				_, applied, err := svc.SetState(env.ctx, worker, leadID, req)
@@ -91,6 +104,7 @@ func TestPlanCrossCheckGateReasonPersistedOutcomeLiveDB(t *testing.T) {
 			// A retry of the same human presentation retains its server-derived reason,
 			// even when the worker omits the declaration.
 			req.PlanCrossCheckGateReason = nil
+			req.PlanCrossCheckRefusal, req.PlanCrossCheckDiffRefusal = "", ""
 			report(tc.want)
 			// A new human candidate clears the current reason, without deleting findings.
 			plan = "Review a revised human candidate"

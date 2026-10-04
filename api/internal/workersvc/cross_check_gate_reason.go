@@ -72,7 +72,7 @@ func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store,
 	_, err := reader.GetPlanCrossCheck(ctx, lead.ID)
 	if err == nil {
 		return nil
-	} // Stored outcome takes precedence over a declaration.
+	} // Recorded non-pass outcomes win; an approval may retain a workflow refusal.
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return err
 	}
