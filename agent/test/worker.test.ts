@@ -885,9 +885,10 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
         _name: string,
         _template: string,
         _maxRuns: number,
-        _capabilities?: string[],
+        capabilities?: string[],
         protocolCapabilities?: string[],
       ) => {
+        assert.ok(!capabilities?.includes("codex_refresh_recovery_v1"), "refresh recovery is not a scheduler capability");
         captured = protocolCapabilities;
         return {};
       },
@@ -924,7 +925,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "wall_park_v1", "input_receipts_v1", "input_inclusion_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1", "job_files_v1", CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY],
+      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "codex_refresh_recovery_v1", "wall_park_v1", "input_receipts_v1", "input_inclusion_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1", "job_files_v1", CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY],
       "an advertising result appends codex_harness_v1 then codex_custom_model_v1 (PRD #1551 D6) after the always-present protocol caps (v2 by PRD #1349 M1, credential_switch_v1 by PRD #1247 M5b, wall_park_v1 by PRD #1497 M2)",
     );
   });
@@ -945,7 +946,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "wall_park_v1", "input_receipts_v1", "input_inclusion_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1", "job_files_v1"],
+      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "codex_refresh_recovery_v1", "wall_park_v1", "input_receipts_v1", "input_inclusion_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1", "job_files_v1"],
       "a non-advertising result leaves the always-present protocol caps unchanged (Claude service intact)",
     );
     assert.ok(!caps?.includes(CODEX_HARNESS_CAPABILITY), "codex_harness_v1 is absent when not advertising");
@@ -958,12 +959,12 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     const caps = await advertisedCapabilities(fakeConfig());
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "wall_park_v1", "input_receipts_v1", "input_inclusion_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1", "job_files_v1"],
+      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "codex_refresh_recovery_v1", "wall_park_v1", "input_receipts_v1", "input_inclusion_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1", "job_files_v1"],
       "an absent availability result advertises only the always-present protocol caps",
     );
   });
 
-  it("always advertises completion_interlock_v1, recovery_archive_v1, recovery_archive_v2 and credential_switch_v1 regardless of Codex availability", async () => {
+  it("advertises codex_refresh_recovery_v1 without API protocol_features or Codex availability requirements", async () => {
     for (const advertise of [true, false]) {
       const caps = await advertisedCapabilities(
         fakeConfig({ codexHarness: { advertise, degraded: false, landlock: advertise ? "available" : "unavailable" } }),
@@ -972,6 +973,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
       assert.ok(caps?.includes("recovery_archive_v1"), "recovery_archive_v1 always present");
       assert.ok(caps?.includes("recovery_archive_v2"), "recovery_archive_v2 always present (PRD #1349 M1)");
       assert.ok(caps?.includes("credential_switch_v1"), "credential_switch_v1 always present (PRD #1247 M5b)");
+      assert.ok(caps?.includes("codex_refresh_recovery_v1"), "refresh recovery is advertised even when register returns no protocol_features");
       assert.ok(caps?.includes("wall_park_v1"), "wall_park_v1 always present (PRD #1497 M2)");
       assert.ok(caps?.includes("advice_claim_fence_v1"), "advice_claim_fence_v1 always present (issue #1423)");
     }

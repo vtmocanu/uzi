@@ -107,7 +107,8 @@ func (q *Queries) ApplyCodexRejectionQuarantine(ctx context.Context, arg ApplyCo
 const clearMismatchedCodexRecoveryAndMarkIntents = `-- name: ClearMismatchedCodexRecoveryAndMarkIntents :one
 WITH cleared AS (
     UPDATE codex_provider_account
-    SET recovery_sealed = NULL, recovery_generation = NULL, recovery_sealed_with = NULL, updated_at = now()
+    SET recovery_sealed = NULL, recovery_generation = NULL, recovery_sealed_with = NULL,
+        recovery_cause = NULL, updated_at = now()
     WHERE codex_provider_account.id = $1 AND codex_provider_account.user_id = $2
       AND codex_provider_account.coord_state = 'quarantined'
       AND codex_provider_account.recovery_generation = $3::bigint
@@ -159,9 +160,9 @@ type ClearMismatchedCodexRecoveryAndMarkIntentsRow struct {
 // account's generation independently ADVANCED past its from_generation is at a LOWER from_generation
 // and is excluded automatically (this path runs only with recovery_generation == generation).
 //
-// Owner-scoped. The (recovery_sealed, recovery_generation, recovery_sealed_with) triple is cleared
-// together so 00199's (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL) CHECK stays
-// satisfied. Postgres evaluates the data-modifying CTEs against ONE snapshot, communicating only
+// Owner-scoped. The recovery blob, generation, key discriminator and cause are cleared
+// together so the recovery-slot CHECKs in 00199 and 00293 stay satisfied.
+// Postgres evaluates the data-modifying CTEs against ONE snapshot, communicating only
 // via RETURNING, so `marked`'s (SELECT id FROM cleared) sees exactly `cleared`'s result within the
 // same statement. Returns (cleared, marked) counts: cleared == 0 means the account moved under the
 // caller and nothing — slot or intents — was touched.
@@ -182,6 +183,7 @@ SET generation           = generation + 1,
     coord_operation_id   = $3::uuid,
     recovery_sealed      = NULL,
     recovery_generation  = NULL,
+    recovery_cause       = NULL,
     -- 00199's CHECK requires (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL),
     -- so clearing the recovery blob MUST also clear its key discriminator or an account
     -- with a populated recovery slot would violate the CHECK (23514) on commit.
@@ -427,6 +429,8 @@ SELECT
     -- PRD #1590: the run's current claim generation, so the claim's release barriers can
     -- refuse a stale attempt from an earlier generation of the same worker's claim.
     r.claim_generation,
+    -- Explicit claim-release deferral fence for later service logic.
+    r.claim_released_at,
     -- CURRENT alias material revision (the run-frozen one is r.codex_material_revision).
     ccs.material_revision AS current_material_revision,
     -- CURRENT account counters + immutable identity tuple (NULL for an api_key alias).
@@ -450,23 +454,24 @@ WHERE r.id = $1
 `
 
 type GetRunCodexAuthContextRow struct {
-	CodexSecretID             pgtype.UUID `json:"codex_secret_id"`
-	CodexAuthMode             pgtype.Text `json:"codex_auth_mode"`
-	CodexAccountKey           pgtype.Text `json:"codex_account_key"`
-	CodexMaterialRevision     pgtype.Int8 `json:"codex_material_revision"`
-	CodexAccountRevision      pgtype.Int8 `json:"codex_account_revision"`
-	CodexClaimEpoch           int64       `json:"codex_claim_epoch"`
-	CodexCapHash              []byte      `json:"codex_cap_hash"`
-	WorkerID                  pgtype.UUID `json:"worker_id"`
-	Status                    string      `json:"status"`
-	ClaimGeneration           int64       `json:"claim_generation"`
-	CurrentMaterialRevision   int64       `json:"current_material_revision"`
-	CurrentGeneration         pgtype.Int8 `json:"current_generation"`
-	CurrentCredentialRevision pgtype.Int8 `json:"current_credential_revision"`
-	ProviderUserID            pgtype.Text `json:"provider_user_id"`
-	WorkspaceAccountID        pgtype.Text `json:"workspace_account_id"`
-	CurrentCoordState         pgtype.Text `json:"current_coord_state"`
-	BoundKind                 string      `json:"bound_kind"`
+	CodexSecretID             pgtype.UUID        `json:"codex_secret_id"`
+	CodexAuthMode             pgtype.Text        `json:"codex_auth_mode"`
+	CodexAccountKey           pgtype.Text        `json:"codex_account_key"`
+	CodexMaterialRevision     pgtype.Int8        `json:"codex_material_revision"`
+	CodexAccountRevision      pgtype.Int8        `json:"codex_account_revision"`
+	CodexClaimEpoch           int64              `json:"codex_claim_epoch"`
+	CodexCapHash              []byte             `json:"codex_cap_hash"`
+	WorkerID                  pgtype.UUID        `json:"worker_id"`
+	Status                    string             `json:"status"`
+	ClaimGeneration           int64              `json:"claim_generation"`
+	ClaimReleasedAt           pgtype.Timestamptz `json:"claim_released_at"`
+	CurrentMaterialRevision   int64              `json:"current_material_revision"`
+	CurrentGeneration         pgtype.Int8        `json:"current_generation"`
+	CurrentCredentialRevision pgtype.Int8        `json:"current_credential_revision"`
+	ProviderUserID            pgtype.Text        `json:"provider_user_id"`
+	WorkspaceAccountID        pgtype.Text        `json:"workspace_account_id"`
+	CurrentCoordState         pgtype.Text        `json:"current_coord_state"`
+	BoundKind                 string             `json:"bound_kind"`
 }
 
 // The authority-check read (PRD #1147 M2): the run's FROZEN Codex binding alongside the
@@ -507,6 +512,7 @@ func (q *Queries) GetRunCodexAuthContext(ctx context.Context, id uuid.UUID) (Get
 		&i.WorkerID,
 		&i.Status,
 		&i.ClaimGeneration,
+		&i.ClaimReleasedAt,
 		&i.CurrentMaterialRevision,
 		&i.CurrentGeneration,
 		&i.CurrentCredentialRevision,
@@ -516,6 +522,48 @@ func (q *Queries) GetRunCodexAuthContext(ctx context.Context, id uuid.UUID) (Get
 		&i.BoundKind,
 	)
 	return i, err
+}
+
+const hasCodexVaultLockRecoveryEvidence = `-- name: HasCodexVaultLockRecoveryEvidence :one
+SELECT EXISTS (
+    SELECT 1
+    FROM codex_provider_account a
+    JOIN codex_refresh_intent i
+      ON i.user_id = a.user_id AND i.provider_account_id = a.id
+    WHERE a.user_id = $1 AND a.id = $2
+      AND a.coord_state = 'quarantined'
+      AND a.coord_operation_id = $3::uuid
+      AND a.recovery_cause = 'vault_locked'
+      AND a.recovery_sealed IS NOT NULL
+      AND a.recovery_sealed_with IS NOT NULL
+      AND a.recovery_generation = $4::bigint
+      AND a.generation = $4::bigint
+      AND NOT a.reauth_required
+      AND i.operation_id = $3::uuid
+      AND i.from_generation = $4::bigint
+      AND i.state IN ('rotating', 'reconciled')
+) AS eligible
+`
+
+type HasCodexVaultLockRecoveryEvidenceParams struct {
+	UserID             uuid.UUID `json:"user_id"`
+	AccountID          uuid.UUID `json:"account_id"`
+	OperationID        uuid.UUID `json:"operation_id"`
+	ObservedGeneration int64     `json:"observed_generation"`
+}
+
+// Deferral evidence only: never opens material or authorizes a credential release.
+// Account and intent are read in one snapshot, fenced to this operation and generation.
+func (q *Queries) HasCodexVaultLockRecoveryEvidence(ctx context.Context, arg HasCodexVaultLockRecoveryEvidenceParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasCodexVaultLockRecoveryEvidence,
+		arg.UserID,
+		arg.AccountID,
+		arg.OperationID,
+		arg.ObservedGeneration,
+	)
+	var eligible bool
+	err := row.Scan(&eligible)
+	return eligible, err
 }
 
 const insertCodexReadmitRunMessage = `-- name: InsertCodexReadmitRunMessage :one
@@ -1055,6 +1103,7 @@ SET sealed_login         = $1,
     lease_deadline       = NULL,
     recovery_sealed      = NULL,
     recovery_generation  = NULL,
+    recovery_cause       = NULL,
     recovery_sealed_with = NULL,
     -- PRD #1209 M1: promoting recovery material installs a re-verified login and advances
     -- the generation, so any pending reauth flag is satisfied — clear it (and its
@@ -1275,6 +1324,7 @@ SET sealed_login         = $1,
     -- with a populated recovery slot (e.g. a quarantine re-login) would violate the
     -- CHECK (23514) on this install.
     recovery_sealed_with = NULL,
+    recovery_cause       = NULL,
     -- PRD #1209 M1: a verified re-login clears any pending reauth flag atomically with the
     -- generation advance. Unconditional so the 00239 coherence CHECK holds; a no-op on the
     -- quarantined arm when no reauth was pending.
@@ -1377,10 +1427,11 @@ UPDATE codex_provider_account
 SET recovery_sealed      = $1,
     recovery_generation  = $2::bigint,
     recovery_sealed_with = $3,
+    recovery_cause       = $4::text,
     coord_state          = 'quarantined',
     updated_at           = now()
-WHERE id = $4 AND user_id = $5
-    AND coord_operation_id = $6::uuid
+WHERE id = $5 AND user_id = $6
+    AND coord_operation_id = $7::uuid
     AND coord_state IN ('in_progress', 'quarantined')
     AND generation = $2::bigint
 `
@@ -1389,6 +1440,7 @@ type SetCodexRecoverySlotParams struct {
 	Sealed             []byte      `json:"sealed"`
 	Gen                int64       `json:"gen"`
 	RecoverySealedWith pgtype.Text `json:"recovery_sealed_with"`
+	RecoveryCause      pgtype.Text `json:"recovery_cause"`
 	ID                 uuid.UUID   `json:"id"`
 	UserID             uuid.UUID   `json:"user_id"`
 	Op                 uuid.UUID   `json:"op"`
@@ -1397,6 +1449,8 @@ type SetCodexRecoverySlotParams struct {
 // Protect a previously-good login into the recovery slot and quarantine the account (PRD
 // #1147 M2): the commit-or-persistence-failure path preserves the material needed to roll
 // back and parks the account for reconciliation. Owner-scoped.
+// The caller supplies recovery_cause explicitly (NULL or 'vault_locked'); it is persisted
+// atomically with the protected slot and quarantine, without inferring a cause.
 //
 // SECURITY HARDENING (PRD #1147 audit): operation-identity guard (coord_operation_id=@op)
 // across the in_progress/quarantined states. The identity guard is what prevents a
@@ -1419,6 +1473,7 @@ func (q *Queries) SetCodexRecoverySlot(ctx context.Context, arg SetCodexRecovery
 		arg.Sealed,
 		arg.Gen,
 		arg.RecoverySealedWith,
+		arg.RecoveryCause,
 		arg.ID,
 		arg.UserID,
 		arg.Op,

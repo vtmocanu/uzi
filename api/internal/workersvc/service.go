@@ -858,6 +858,9 @@ type Store interface {
 	// it has NO per-run cap, so promotion always fires and the run recovers repeatedly.
 	SetRunRecoveryWait(ctx context.Context, arg store.SetRunRecoveryWaitParams) (int64, error)
 	PromoteRecoveryWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteRecoveryWaitRunsRow, error)
+	// PromoteVaultLockedRecoveryWaitRuns is the owner-scoped early promotion after explicit
+	// vault unlock (#1792); it preserves the timer's reset set and backoff history.
+	PromoteVaultLockedRecoveryWaitRuns(ctx context.Context, userID uuid.UUID) ([]store.PromoteVaultLockedRecoveryWaitRunsRow, error)
 	// PromoteRecoveryWaitRunNow is the SINGLE-ROW early promote for `uzi run set-token`
 	// (PRD #1247 M4, D4): recovery_wait -> queued for ONE owner+run WITHOUT the
 	// recovery_retry_not_before guard, mirroring PromoteRecoveryWaitRuns' mutation set. A

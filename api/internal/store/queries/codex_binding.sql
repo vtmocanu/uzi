@@ -135,6 +135,8 @@ SELECT
     -- PRD #1590: the run's current claim generation, so the claim's release barriers can
     -- refuse a stale attempt from an earlier generation of the same worker's claim.
     r.claim_generation,
+    -- Explicit claim-release deferral fence for later service logic.
+    r.claim_released_at,
     -- CURRENT alias material revision (the run-frozen one is r.codex_material_revision).
     ccs.material_revision AS current_material_revision,
     -- CURRENT account counters + immutable identity tuple (NULL for an api_key alias).
@@ -405,6 +407,7 @@ SET generation           = generation + 1,
     coord_operation_id   = @op::uuid,
     recovery_sealed      = NULL,
     recovery_generation  = NULL,
+    recovery_cause       = NULL,
     -- 00199's CHECK requires (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL),
     -- so clearing the recovery blob MUST also clear its key discriminator or an account
     -- with a populated recovery slot would violate the CHECK (23514) on commit.
@@ -429,6 +432,8 @@ RETURNING generation, coord_state, committed_generation;
 -- Protect a previously-good login into the recovery slot and quarantine the account (PRD
 -- #1147 M2): the commit-or-persistence-failure path preserves the material needed to roll
 -- back and parks the account for reconciliation. Owner-scoped.
+-- The caller supplies recovery_cause explicitly (NULL or 'vault_locked'); it is persisted
+-- atomically with the protected slot and quarantine, without inferring a cause.
 --
 -- SECURITY HARDENING (PRD #1147 audit): operation-identity guard (coord_operation_id=@op)
 -- across the in_progress/quarantined states. The identity guard is what prevents a
@@ -450,6 +455,7 @@ UPDATE codex_provider_account
 SET recovery_sealed      = @sealed,
     recovery_generation  = @gen::bigint,
     recovery_sealed_with = @recovery_sealed_with,
+    recovery_cause       = sqlc.narg('recovery_cause')::text,
     coord_state          = 'quarantined',
     updated_at           = now()
 WHERE id = @id AND user_id = @user_id
@@ -500,6 +506,7 @@ SET sealed_login         = @sealed,
     lease_deadline       = NULL,
     recovery_sealed      = NULL,
     recovery_generation  = NULL,
+    recovery_cause       = NULL,
     recovery_sealed_with = NULL,
     -- PRD #1209 M1: promoting recovery material installs a re-verified login and advances
     -- the generation, so any pending reauth flag is satisfied — clear it (and its
@@ -559,6 +566,7 @@ SET sealed_login         = @sealed,
     -- with a populated recovery slot (e.g. a quarantine re-login) would violate the
     -- CHECK (23514) on this install.
     recovery_sealed_with = NULL,
+    recovery_cause       = NULL,
     -- PRD #1209 M1: a verified re-login clears any pending reauth flag atomically with the
     -- generation advance. Unconditional so the 00239 coherence CHECK holds; a no-op on the
     -- quarantined arm when no reauth was pending.
@@ -712,6 +720,28 @@ RETURNING *;
 SELECT * FROM codex_refresh_intent
 WHERE operation_id = @operation_id AND user_id = @user_id;
 
+-- name: HasCodexVaultLockRecoveryEvidence :one
+-- Deferral evidence only: never opens material or authorizes a credential release.
+-- Account and intent are read in one snapshot, fenced to this operation and generation.
+SELECT EXISTS (
+    SELECT 1
+    FROM codex_provider_account a
+    JOIN codex_refresh_intent i
+      ON i.user_id = a.user_id AND i.provider_account_id = a.id
+    WHERE a.user_id = @user_id AND a.id = @account_id
+      AND a.coord_state = 'quarantined'
+      AND a.coord_operation_id = @operation_id::uuid
+      AND a.recovery_cause = 'vault_locked'
+      AND a.recovery_sealed IS NOT NULL
+      AND a.recovery_sealed_with IS NOT NULL
+      AND a.recovery_generation = @observed_generation::bigint
+      AND a.generation = @observed_generation::bigint
+      AND NOT a.reauth_required
+      AND i.operation_id = @operation_id::uuid
+      AND i.from_generation = @observed_generation::bigint
+      AND i.state IN ('rotating', 'reconciled')
+) AS eligible;
+
 -- name: SetCodexRefreshIntentState :execrows
 -- Advance an intent's state (PRD #1147 M2) as the service drives the rotation state
 -- machine ('rotating' → 'committed'/'unrecoverable'/'reconciled'). Owner-scoped; 0 rows
@@ -821,15 +851,16 @@ WHERE (cpa.coord_state = 'in_progress' AND cpa.lease_deadline < @now::timestampt
 -- account's generation independently ADVANCED past its from_generation is at a LOWER from_generation
 -- and is excluded automatically (this path runs only with recovery_generation == generation).
 --
--- Owner-scoped. The (recovery_sealed, recovery_generation, recovery_sealed_with) triple is cleared
--- together so 00199's (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL) CHECK stays
--- satisfied. Postgres evaluates the data-modifying CTEs against ONE snapshot, communicating only
+-- Owner-scoped. The recovery blob, generation, key discriminator and cause are cleared
+-- together so the recovery-slot CHECKs in 00199 and 00293 stay satisfied.
+-- Postgres evaluates the data-modifying CTEs against ONE snapshot, communicating only
 -- via RETURNING, so `marked`'s (SELECT id FROM cleared) sees exactly `cleared`'s result within the
 -- same statement. Returns (cleared, marked) counts: cleared == 0 means the account moved under the
 -- caller and nothing — slot or intents — was touched.
 WITH cleared AS (
     UPDATE codex_provider_account
-    SET recovery_sealed = NULL, recovery_generation = NULL, recovery_sealed_with = NULL, updated_at = now()
+    SET recovery_sealed = NULL, recovery_generation = NULL, recovery_sealed_with = NULL,
+        recovery_cause = NULL, updated_at = now()
     WHERE codex_provider_account.id = @id AND codex_provider_account.user_id = @user_id
       AND codex_provider_account.coord_state = 'quarantined'
       AND codex_provider_account.recovery_generation = @from_generation::bigint

@@ -290,6 +290,7 @@ Tracked as GitLab issue vtmocanu/uzi#37; PRD at `prds/done/37-run-agent-selectio
 - Show whether repo agents were detected and which ones. [user 2026-07-10]
 - Default to the detected repo agents; if the user does not want them, they can choose their own templates instead. [user 2026-07-10]
 - Repo agents run with the tools and model their files declare (honored as they would be under Claude Code), still subject to uzi's guardrails. [user 2026-07-10; a review-round proposal to deny WebFetch/WebSearch and clamp the model to aliases was rejected by the user the same day — `Agent`/nested-spawn and the async-deferral tools stay denied]
+- Codex 0.159.3 permits native nonblocking async questions and read-only UTC on root start/resume and worker-created children; these grant no worker effect or workflow signal. The historical Claude async-deferral denial above remains. (AI-synced 2026-10-04) [AI-synced, #1566]
 - Either/or source with per-agent exclusions; no mixing the two sources in one run. [user 2026-07-10]
 - Autopilot runs apply the default automatically (repo agents if detected, else the user's templates) and record which roster they used, with no human interaction. [user 2026-07-10]
 - The Slack plan-approval gate offers the same source choice (two Approve buttons: repo agents / my templates); excluding individual agents is done in the web UI. [user 2026-07-10]
@@ -484,6 +485,7 @@ Tracked as GitLab issue vtmocanu/uzi#58 (closed); PRD at `prds/done/58-hosted-k8
 - Three sizes stay, and the picker displays what each size buys. [user 2026-07-17]
 - Deleting a hosted worker requires a confirmation (it destroys the worker's volumes); deleting an external worker stays one click. [user 2026-07-16]
 - Hosted k8s gains an opt-in uid-split worker profile for Codex (default off; while on, the kube-native worker namespace's PodSecurity admission drops from `restricted` to `baseline`, while the separate Docker-capable tier keeps its own `privileged` namespace); Landlock is optional via a mode knob (`required` fails closed, `best-effort` runs unconfined on a kernel without it, relying on the uid split alone). A worker without the split, or without usable Landlock under `required`, stops advertising Codex — those runs (including tool-less Codex advice) simply queue instead of being claimed and then failing. (AI-synced 2026-09-20)
+- Codex advice has zero worker callbacks; native async questions and read-only UTC remain permitted. Async question text currently appends to advice and may fail verdict validation; filtering is deferred. Other native effectful surfaces stay disabled, except the authority-free run code host. (AI-synced 2026-10-04) [AI-synced, #1566]
 - Landlock for Codex commands is off by default (a third mode, `off`, is the default everywhere: worker, controller, chart); `required` and `best-effort` remain opt-ins. User decision after repeated Landlock-caused run failures (#1769, #1863, #1598). (AI-synced 2026-09-28)
 - Restricted-tier hosted workers may reach `api.openai.com`, `chatgpt.com` and `auth.openai.com` on 443, fleet-wide for the tier (Claude-only workers included), per PRD #1106 D12. (AI-synced 2026-09-24)
 

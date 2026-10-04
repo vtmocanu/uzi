@@ -25,6 +25,7 @@ import (
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/go-git/go-git/v5/storage/memory"
 
+	"github.com/vtmocanu/uzi/api/internal/httptransport"
 	"github.com/vtmocanu/uzi/api/internal/packbudget"
 	"github.com/vtmocanu/uzi/api/internal/redirectguard"
 )
@@ -226,6 +227,20 @@ func fetchTip(ctx context.Context, opts CloneOptions, lim packbudget.Limits) (*o
 	return commit, resolved, nil
 }
 
+// agentSourceHTTPTransport shares the connection pool across operations; clients,
+// redirect guards and wire budgets remain per operation.
+var agentSourceHTTPTransport = httptransport.New(http.DefaultTransport)
+
+func agentSourceHTTPClient(budget *wireBudget, redirectAllowed func(string) bool) *http.Client {
+	return &http.Client{
+		Transport: &boundedRoundTripper{base: agentSourceHTTPTransport, budget: budget},
+		// go-git composes this CheckRedirect AFTER its own policy (which already only
+		// allows a redirect on the initial info/refs request); this adds the host
+		// re-check go-git omits — FINDING 2.
+		CheckRedirect: redirectGuard(redirectAllowed),
+	}
+}
+
 // transportForEndpoint builds the transport that drives ONE fetch. For an http(s)
 // endpoint (the only production shape — the allowlist is https-only) it returns a
 // transport backed by a per-operation *http.Client carrying the redirect allowlist
@@ -241,14 +256,7 @@ func transportForEndpoint(ep *transport.Endpoint, redirectAllowed func(string) b
 	switch ep.Protocol {
 	case "http", "https":
 		budget := &wireBudget{remaining: maxCloneWireBytes}
-		httpClient := &http.Client{
-			Transport: &boundedRoundTripper{base: http.DefaultTransport, budget: budget},
-			// go-git composes this CheckRedirect AFTER its own policy (which already only
-			// allows a redirect on the initial info/refs request); this adds the host
-			// re-check go-git omits — FINDING 2.
-			CheckRedirect: redirectGuard(redirectAllowed),
-		}
-		return githttp.NewClient(httpClient), budget, nil
+		return githttp.NewClient(agentSourceHTTPClient(budget, redirectAllowed)), budget, nil
 	default:
 		tr, err := client.NewClient(ep)
 		return tr, nil, err
@@ -291,7 +299,7 @@ type wireBudget struct {
 func (b *wireBudget) tripped() bool { return atomic.LoadInt32(&b.trip) == 1 }
 
 // boundedRoundTripper wraps every response body in a boundedBody so reads draw down the
-// shared wireBudget. It delegates the actual request to base (http.DefaultTransport).
+// shared wireBudget. It delegates the actual request to base (agentSourceHTTPTransport).
 type boundedRoundTripper struct {
 	base   http.RoundTripper
 	budget *wireBudget

@@ -1,11 +1,11 @@
 ---
 name: issue-triage
-description: "Triages one GitHub issue on this repo from backlog to a queued or parked decision. Preflight lists spent one-time issue schedules to delete and open issues from non-maintainers, which go first. Then hunts silently un-sweepable issues (a bug/Planned selector without uzi eligibility, or eligible without a selector), then the un-triaged backlog, then parked brainstorm/Later issues. Explains the issue, recommends a verdict, checks freshness (premise, anchors, referenced PR/PRD merged), and on confirmation applies labels plus a freshness comment. Use when triaging the backlog, finding issues the sweep never fires, or deciding what to send to uzi. Triggers include triage issue, triage the backlog, un-sweepable issues, next issue to implement, should we do this issue, queue an issue for uzi, clean up fired schedules."
+description: "Triages one GitHub issue on this repo from backlog to a queued or parked decision. Preflight lists spent one-time issue schedules to delete and open issues from non-maintainers, which go first. Then hunts silently un-sweepable issues (a bug/Planned selector without uzi eligibility, or eligible without a selector), then the un-triaged backlog, then parked brainstorm/Later issues. Explains the issue, recommends a verdict, checks freshness (premise, anchors, referenced PR/PRD merged), and on confirmation applies labels plus a freshness comment. A queue audit mode predicts which issues the next sweep fires and freshness-checks each. Use when triaging the backlog, finding issues the sweep never fires, or deciding what to send to uzi. Triggers include triage issue, triage the backlog, un-sweepable issues, next issue to implement, should we do this issue, queue an issue for uzi, clean up fired schedules, what goes to the sweep tonight."
 ---
 
 # Issue triage
 
-One issue per run. GitHub repo `vtmocanu/uzi`: use `gh` only.
+One issue per run, or a queue audit (below). GitHub repo `vtmocanu/uzi`: use `gh` only.
 
 Out of scope, read instead:
 - Sweep gating and this instance's schedules: `CLAUDE.local.md` → "uzi scheduled jobs", `docs/scheduling.md`, `docs/admin-settings.md#run-eligibility`. Live truth: `uzi schedule list`.
@@ -47,6 +47,24 @@ gh issue list --repo vtmocanu/uzi --state open --limit 400 --json number,title,a
 ```
 
 A successful empty result = maintainer-only backlog. If it looks wrong, compare it against the total number of open issues.
+
+## Queue audit (what fires next)
+
+When the user asks what the sweeps will run, skip Step 1 and audit the predicted picks instead.
+
+```sh
+set -o pipefail
+uzi schedule pause-status
+uzi schedule list --json | jq -r '.[] | select(.enabled and (.target=="sweep" or .target=="issue"))
+  | [(.catalog_slug // "custom"), .target, (.issue_iid // "-"), (.max_issues // "-"), (.next_fire_at // "-")] | @tsv'
+uzi schedule list --json | jq '.[] | select(.target=="sweep") | {slug: .catalog_slug, started: [.last_fire.started[]? | {issue_iid, run_id}], skips: .last_fire.skips}'
+```
+
+- Resolve each schedule's effective selector, catalog defaults included: a label selector requires all its configured labels; an assigned selector uses bot assignment. Apply eligibility separately. Do not infer runtime exclusions from triage park labels: the candidate query ignores them.
+- Follow `ListSweepCandidateIssues` and `fireSweep` (`api/internal/schedsvc/scheduler.go`): lowest issue number first, within a scan window of `max_issues + backfillHeadroom`, skipping active runs and open-MR refusals until the started-run cap is reached. Report the picks as predictions (cache freshness, state changes).
+- An enabled one-shot `target=issue` schedule fires its issue separately; another session may own it. Report it, do not re-triage or re-dispatch it.
+- A pick retried after last fire's run `failed`: read its `failure_reason`. An infra failure (claim/forge) leaves the issue sound.
+- Run Steps 2 to 4 on every predicted pick (independent picks fan out to read-only researchers), then Step 5 for any body fixes. Report a per-fire table: time, sweep, issues, one-line verdict each.
 
 ## Step 1: Pick
 
@@ -118,6 +136,9 @@ Do not trust issue line numbers.
 3. **Anchors**: re-grep named symbols; record current locations and omitted/extra sites.
 4. **Design forks**: pin a direction with reason; verify any ADR/PRD conflict against code, not the issue's framing.
 5. **Workflow scope**: a fix that must touch `.github/workflows/**` cannot go to a sweep (worker PAT lacks `workflow` scope; the whole push is rejected). → **Do locally**, or split into a local-only issue. See `.claude/rules/prds.md`.
+6. **Conditionals**: resolve every "also fix X if Y" in the body against code before queuing; an auto-approved run cannot ask.
+7. **Partly done**: rewrite the body (and title) to the open half; cite the PR that fixed the rest.
+8. **LiveDB-only tests**: default `gate:api` skips them, so a run can go green without executing the fix. Name `./e2e/run-store-it.sh` in the issue and require the test to run, not skip.
 
 ## Step 5: Propose, confirm, apply
 
@@ -135,5 +156,6 @@ EOF
 - Add `--add-label "reviewed"` when the buddy agreed with the verdict and Step 4 ran (root `CLAUDE.md` rule); otherwise leave it off.
 - Bot-assignment path: replace `--add-label "uzi"` with `--add-assignee BOT_LOGIN` (from `CLAUDE.local.md`; never invent it).
 - Comment carries Step 4 findings; mirror #525/#509.
+- Scope limits go in the body, not only a comment: a run may plan from the body alone. Split an open maintainer decision into its own `brainstorm` issue, link it, and drop it from the queued body.
 - A body note like "Needs re-review before dispatch" is stale once Step 4 is that re-review: remove it from the body (`gh issue edit NNN --body-file`) when queuing.
 - Remind the user: auto-approve runs past the plan gate; a human still merges. For plan review first, use **uzi-watcher** (Auto mode).

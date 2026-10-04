@@ -2,6 +2,7 @@ import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import { randomUUID } from "node:crypto";
+import { getEventListeners } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -35,8 +36,8 @@ import {
   type CodexExecutorDeps,
   type CodexCommittedGenerationCell,
 } from "../src/codex/codex-executor.js";
+import { WorkerClient, RequestError, CodexRequestFailure } from "../src/client.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
-import { RequestError } from "../src/client.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { WORKER_UID, RUNNER_UID } from "../src/runner-uid.js";
 import { gitEnv } from "../src/git.js";
@@ -56,7 +57,6 @@ import { CodexAdviceHarness } from "../src/codex/codex-advice-harness.js";
 import { makeRedactor, makeTextRedactor } from "../src/redact.js";
 import { MessageBatcher } from "../src/batcher.js";
 import { MAX_PROJECTED_BYTES } from "../src/codex/projection.js";
-import type { WorkerClient } from "../src/client.js";
 import type { OutgoingMessage } from "../src/protocol.js";
 import { CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
 import type { RunContext, EmittedMessage, Executor, WallParkOutcome, SecretRemediationDecision } from "../src/executor.js";
@@ -9175,10 +9175,10 @@ describe("CodexExecutor: vault_locked deferral (issue #1766)", () => {
     }
   });
 
-  it("buildRunLaneReconcile: a generic 500 (and a 409 with another reason) → blocked WITHOUT a deferral, exact legacy message", async () => {
+  it("buildRunLaneReconcile: generic 500 and API contended exhaust two attempts as refresh_unknown", async () => {
     for (const err of [
       new RequestError("POST", "/x", 500, JSON.stringify({ reason: "vault_locked" })),
-      new RequestError("POST", "/x", 409, JSON.stringify({ reason: "refresh_contended" })),
+      new RequestError("POST", "/x", 409, JSON.stringify({ error: "codex refresh is contended; retry" })),
     ]) {
       const client = {
         refreshCodex: async (): Promise<never> => { throw err; },
@@ -9187,7 +9187,8 @@ describe("CodexExecutor: vault_locked deferral (issue #1766)", () => {
       const out = await buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => {})(RECONCILE_REQ, RECONCILE_SIGNAL);
       assert.deepEqual(out, {
         kind: "blocked",
-        errors: [{ category: "authorization", message: "codex subscription boundary reconcile failed" }],
+        errors: [{ category: "authorization", message: "codex subscription boundary reconcile deferred: refresh outcome unknown" }],
+        deferral: "refresh_unknown",
       });
     }
   });
@@ -9196,7 +9197,7 @@ describe("CodexExecutor: vault_locked deferral (issue #1766)", () => {
     // Closure-level: drives buildRunLaneReconcile directly, not a whole run.
     const calls: { operation_id: string; observed_generation: number }[] = [];
     const script: (() => never | { access_token: string; generation: number })[] = [
-      () => { throw new Error("fetch failed"); },
+      () => { throw new CodexRequestFailure("transport"); },
       () => { throw vaultLocked409("refresh"); },
       () => ({ access_token: "tok-a", generation: 4 }),
       () => ({ access_token: "tok-b", generation: 5 }),
@@ -9210,9 +9211,8 @@ describe("CodexExecutor: vault_locked deferral (issue #1766)", () => {
     };
     const reconcile = buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => {});
     const first = await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL);
-    assert.equal(first.kind === "blocked" && first.deferral, undefined, "a transport error is a plain block");
-    const second = await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL);
-    assert.equal(second.kind === "blocked" && second.deferral, "vault_locked");
+    assert.equal(first.kind === "blocked" && first.deferral, "vault_locked", "lost reply reconciles immediately to the typed deferral");
+    assert.equal(calls.length, 2, "exactly two attempts in the first invocation");
     assert.equal((await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL)).kind, "ready");
     assert.equal(calls[0]!.operation_id, calls[1]!.operation_id);
     assert.equal(calls[1]!.operation_id, calls[2]!.operation_id, "the deferral retained the operation id");
@@ -9390,7 +9390,7 @@ describe("CodexExecutor: mid-turn vault_locked refresh deferral (issue #1789)", 
 
   it("C1: every other refresh failure is rethrown unchanged and never signals; the advice lane (no callback) keeps its behaviour", async () => {
     const failures: unknown[] = [
-      new RequestError("POST", "/x", 409, JSON.stringify({ reason: "refresh_contended" })),
+      new RequestError("POST", "/x", 409, JSON.stringify({ error: "codex refresh is contended; retry" })),
       new RequestError("POST", "/x", 409, JSON.stringify({ reason: "refresh_quarantined" })),
       new RequestError("POST", "/x", 500, JSON.stringify({ reason: "vault_locked" })),
       new Error("fetch failed"),
@@ -11231,5 +11231,198 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
       return true;
     });
     assert.equal(rig.transport.turnStartCount, 2, "no provider turn started for the retry");
+  });
+});
+
+describe("M2 subscription boundary reconciliation", () => {
+  const lost = () => new CodexRequestFailure("transport");
+  const http = (status: number, body: unknown = { error: "codex operation failed" }) =>
+    new RequestError("POST", "/private-coordinate", status, JSON.stringify(body));
+
+  it("freezes the complete tuple for two attempts and advances the shared cell monotonically", async () => {
+    const committed = { value: 3 };
+    const calls: unknown[] = [];
+    const tokens: string[] = [];
+    const client = {
+      refreshCodex: async (_id: string, req: unknown) => {
+        calls.push(req);
+        if (calls.length === 1) { committed.value = 9; throw lost(); }
+        return { access_token: "validated-token", generation: 4 };
+      },
+      releaseCodex: async () => { throw new Error("unused"); },
+    };
+    const out = await buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), (t) => tokens.push(t), committed)(RECONCILE_REQ, RECONCILE_SIGNAL);
+    assert.equal(out.kind, "ready");
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[0], calls[1]);
+    assert.equal((calls[1] as { observed_generation: number }).observed_generation, 3);
+    assert.equal(committed.value, 9);
+    assert.deepEqual(tokens, ["validated-token"]);
+  });
+
+  for (const [name, second] of [
+    ["lost body", lost()],
+    ["ambiguous-first then generic500-on-reconciliation", http(500)],
+    ["old API generic credential quarantine", http(409, { error: "codex credential is not available" })],
+    ["old API generic refresh unavailable", http(409, { error: "codex refresh is unavailable" })],
+    ["API pending contended", http(409, { error: "codex refresh is contended; retry" })],
+  ] as const) {
+    it(`${name}: exactly two attempts then refresh_unknown, no diagnostic canaries`, async () => {
+      let calls = 0;
+      const client = {
+        refreshCodex: async () => { throw ++calls === 1 ? lost() : second; },
+        releaseCodex: async () => { throw new Error("unused"); },
+      };
+      const out = await buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => assert.fail("no token"))(RECONCILE_REQ, RECONCILE_SIGNAL);
+      assert.equal(calls, 2);
+      assert.equal(out.kind === "blocked" && out.deferral, "refresh_unknown");
+      assert.doesNotMatch(JSON.stringify(out), /private-coordinate|codex operation failed/);
+    });
+  }
+
+  for (const refusal of [http(400), http(401), http(403), http(404),
+    http(409, { error: "codex credential is not available" }),
+    new CodexRequestFailure("local"), new CodexRequestFailure("response"), new Error("unclassified local failure")]) {
+    it(`definite ${refusal instanceof RequestError ? refusal.status : refusal.message}: no retry or deferral`, async () => {
+      let calls = 0;
+      const client = { refreshCodex: async () => { calls++; throw refusal; }, releaseCodex: async () => { throw refusal; } };
+      const out = await buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => assert.fail("no token"))(RECONCILE_REQ, RECONCILE_SIGNAL);
+      assert.equal(calls, 1);
+      assert.equal(out.kind === "blocked" && out.deferral, undefined);
+    });
+  }
+
+  for (const mode of ["deadline", "lifecycle", "claim_loss", "forbidden", "server_unknown", "response_invalid"] as const) {
+    it(`${mode} after ambiguity preserves precedence`, async () => {
+      const boundary = new AbortController();
+      const lifecycle = new AbortController();
+      let calls = 0;
+      const client = {
+        refreshCodex: async () => {
+          calls++;
+          if (calls === 1) {
+            if (mode === "deadline") boundary.abort();
+            if (mode === "lifecycle") lifecycle.abort();
+            throw lost();
+          }
+          throw mode === "claim_loss" ? http(404) : mode === "forbidden" ? http(403)
+            : mode === "server_unknown" ? http(409, { reason: "refresh_unknown" }) : new CodexRequestFailure("response");
+        },
+        releaseCodex: async () => { throw new Error("unused"); },
+      };
+      const out = await buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => assert.fail("no token"), { value: 3 }, undefined, lifecycle.signal)(RECONCILE_REQ, boundary.signal);
+      assert.equal(calls, mode === "deadline" || mode === "lifecycle" ? 1 : 2);
+      assert.equal(out.kind === "blocked" && out.deferral, mode === "deadline" ? "refresh_unknown" : undefined);
+    });
+  }
+});
+
+describe("M2 cancellation and elapsed deadline fences", () => {
+  it("an already confirmed vault lock needs no credential deadline, while lifecycle cancellation wins", async () => {
+    const boundary = new AbortController();
+    boundary.abort();
+    const lifecycle = new AbortController();
+    const client = { refreshCodex: async () => assert.fail("no refresh"), releaseCodex: async () => assert.fail("no release") };
+    const reconcile = buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => assert.fail("no token"), { value: 3 }, () => true, lifecycle.signal);
+    const expired = { ...RECONCILE_REQ, deadlineMs: 0 };
+    const held = await reconcile(expired, boundary.signal);
+    assert.equal(held.kind === "blocked" && held.deferral, "vault_locked");
+    lifecycle.abort();
+    const cancelled = await reconcile(expired, boundary.signal);
+    assert.equal(cancelled.kind === "blocked" && cancelled.deferral, undefined);
+  });
+  it("lifecycle cancellation with a valid reply grants no ready outcome or token", async () => {
+    const lifecycle = new AbortController();
+    const committed = { value: 3 };
+    const client = {
+      refreshCodex: async () => { lifecycle.abort(); return { access_token: "fixture-token", generation: 4 }; },
+      releaseCodex: async () => { throw new Error("unused"); },
+    };
+    const out = await buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => assert.fail("no token"), committed, undefined, lifecycle.signal)(RECONCILE_REQ, RECONCILE_SIGNAL);
+    assert.equal(out.kind === "blocked" && out.deferral, undefined);
+    assert.equal(committed.value, 3);
+  });
+  it("an elapsed deadline after an ambiguous send holds without a second send", async (t) => {
+    let now = 100;
+    t.mock.method(Date, "now", () => now);
+    let calls = 0;
+    const client = {
+      refreshCodex: async () => { calls++; now = 200; throw new CodexRequestFailure("transport"); },
+      releaseCodex: async () => { throw new Error("unused"); },
+    };
+    const out = await buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => assert.fail("no token"))({ ...RECONCILE_REQ, deadlineMs: 50 }, RECONCILE_SIGNAL);
+    assert.equal(calls, 1);
+    assert.equal(out.kind === "blocked" && out.deferral, "refresh_unknown");
+  });
+});
+
+describe("M2 actual WorkerClient boundary cancellation", () => {
+  for (const mode of ["timeout", "boundary", "lifecycle", "before_send"] as const) {
+    it(`${mode}: sent ambiguity parks only without lifecycle cancellation`, async (t) => {
+      const boundary = new AbortController();
+      const lifecycle = new AbortController();
+      const deadline = new AbortController();
+      t.mock.method(AbortSignal, "timeout", () => deadline.signal.aborted ? new AbortController().signal : deadline.signal);
+      let calls = 0;
+      t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
+        calls++;
+        if (mode === "timeout" && calls === 2) return new Response(JSON.stringify({
+          auth_mode: "subscription", access_token: "fixture-token", generation: 4, chatgpt_account_id: SUBSCRIPTION.chatgpt_account_id,
+          chatgpt_plan_type: null, outcome: "reconciled",
+        }));
+        const waiting = new Promise<Response>((_resolve, reject) => {
+          init.signal!.addEventListener("abort", () => reject(new Error("private-canary")), { once: true });
+        });
+        if (mode === "boundary") boundary.abort();
+        else if (mode === "lifecycle") lifecycle.abort();
+        else deadline.abort();
+        return waiting;
+      });
+      if (mode === "before_send") boundary.abort();
+      const client = new WorkerClient("http://fixture.invalid", "fixture-token", "test", noopLog);
+      const out = await buildRunLaneReconcile("run-1", client, bindingOf(SUBSCRIPTION), () => {}, { value: 3 }, undefined, lifecycle.signal)(RECONCILE_REQ, boundary.signal);
+      assert.equal(calls, mode === "before_send" ? 0 : mode === "timeout" ? 2 : 1);
+      assert.equal(out.kind, mode === "timeout" ? "ready" : "blocked");
+      assert.equal(out.kind === "blocked" ? out.deferral : undefined, mode === "boundary" ? "refresh_unknown" : undefined);
+      assert.doesNotMatch(JSON.stringify(out), /private-canary|fixture.invalid|fixture-token/);
+    });
+  }
+
+  it("real executor retains lifecycle forwarding through post-run finalize and removes it on disposal", async (t) => {
+    const controller = new AbortController();
+    const rig = makeRig();
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    await withTimeout(exec.run(makeCtx({ signal: controller.signal }).ctx), 3000, "deferred run");
+    assert.equal(getEventListeners(controller.signal, "abort").length, 1, "deferred safety owns the remaining lifecycle listener");
+    let calls = 0;
+    let sent!: () => void;
+    const started = new Promise<void>((resolve) => { sent = resolve; });
+    const realClient = new WorkerClient("http://fixture.invalid", "fixture-token", "test", noopLog);
+    t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
+      calls++;
+      if (calls === 1) throw new Error("private-canary");
+      const waiting = new Promise<Response>((_resolve, reject) => {
+        init.signal!.addEventListener("abort", () => reject(new Error("private-canary")), { once: true });
+      });
+      sent();
+      return waiting;
+    });
+    rig.client.refreshCodex = realClient.refreshCodex.bind(realClient) as unknown as typeof rig.client.refreshCodex;
+    let actions = 0;
+    const finalizing = exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 1000 }, async () => { actions++; });
+    await started;
+    controller.abort();
+    await assert.rejects(withTimeout(finalizing, 3000, "post-run lifecycle abort"), (err: unknown) => {
+      assert.ok(err instanceof CodexBoundaryError);
+      assert.equal(err.deferral, undefined);
+      assert.doesNotMatch(err.message, /private-canary|fixture.invalid/);
+      return true;
+    });
+    assert.equal(calls, 2);
+    assert.equal(actions, 0);
+    await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 200 });
+    assert.equal(getEventListeners(controller.signal, "abort").length, 0);
   });
 });

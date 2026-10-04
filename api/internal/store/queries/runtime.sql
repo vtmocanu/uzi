@@ -1861,8 +1861,8 @@ WHERE runs.id = @id AND worker_id = @worker_id
   -- recovery_wait is the SAME shape of park (issue #1197): a reordered pre-park `running`
   -- report must not un-park a transient-recovery hold, exactly as for limit_wait/pool_wait.
   -- The negative predicate above admits it, so it is excluded explicitly here — a
-  -- recovery-parked run resumes only via PromoteRecoveryWaitRuns, which lands it at 'queued'
-  -- before the worker reports.
+  -- recovery-parked run resumes through a server-side promoter (timer or owner action),
+  -- which lands it at 'queued' before the worker reports.
   AND status <> 'recovery_wait'
   -- paused (PRD #1190) needs the same explicit exclusion, for the same
   -- reason: a paused run's worker has EXITED (it freed its slot), so a reordered pre-park
@@ -1871,6 +1871,13 @@ WHERE runs.id = @id AND worker_id = @worker_id
   -- negative predicate above admits it; a resume lands it at 'queued' server-side before any
   -- worker reports, so this never blocks a legitimate resume.
   AND status <> 'paused'
+  -- queued is excluded for the same reason (issue #1792 review): every park->queued promoter
+  -- keeps worker_id as affinity and leaves claim_generation untouched, so a delayed running
+  -- report from the run's previous worker at the same generation would pass the service fence
+  -- and flip the promoted run back to running without a new claim. A promoted run is
+  -- re-claimed ('claimed') before its worker reports running, so a running report against a
+  -- queued row is always stale.
+  AND status <> 'queued'
   AND (status <> 'awaiting_approval' OR EXISTS (
         SELECT 1 FROM run_user_inputs
         WHERE run_user_inputs.run_id = @id
@@ -2719,6 +2726,24 @@ UPDATE runs SET
     updated_at = now()
 WHERE status = 'recovery_wait' AND recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND recovery_retry_not_before <= @now
+RETURNING id, user_id, status;
+
+-- name: PromoteVaultLockedRecoveryWaitRuns :many
+-- Explicit successful vault unlock resumes every matching owner park regardless of its
+-- deadline or retry count. Keep the timer reset list and preserve affinity and history.
+UPDATE runs SET
+    status     = 'queued',
+    status_since = now(),
+    started_at = NULL,
+    budget_paused_seconds = 0,
+    -- Revoke the per-claim Codex capability on park->queued, exactly as PromoteLimitWaitRuns:
+    -- a promoted run has no live owner until re-claimed, so clearing the hash and bumping the
+    -- epoch supersedes any capability minted for the prior claim.
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE user_id = @user_id AND status = 'recovery_wait'
+  AND recovery_wait_cause = 'vault_locked'
 RETURNING id, user_id, status;
 
 -- name: PromoteRecoveryWaitRunNow :execrows

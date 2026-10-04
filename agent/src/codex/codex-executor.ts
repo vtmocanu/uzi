@@ -62,7 +62,7 @@ import { constants as FS } from "node:fs";
 import type { Readable, Writable } from "node:stream";
 
 import type { Logger } from "../log.js";
-import { codexDeferralReason, isTransientStatus, type WorkerClient } from "../client.js";
+import { codexDeferralReason, codexRefreshFailure, isTransientStatus, type WorkerClient } from "../client.js";
 import { TransientRecoveryError } from "../sdk-executor.js";
 import { CodexTurnFailedError, formatCodexClassification, isCodexTransientClassification } from "./terminal-normalize.js";
 import type { DockerWiring } from "../docker-wiring.js";
@@ -867,9 +867,22 @@ export function buildRunLaneReconcile(
   registerToken: (token: string) => void,
   committed: CodexCommittedGenerationCell = { value: binding.authMode === "subscription" ? binding.generation : undefined },
   isVaultLocked?: () => boolean,
+  lifecycleSignal?: AbortSignal,
 ): ReconcileBeforeBoundary {
-  let reconcileOperationId: string | undefined;
-  return async (_request: BoundaryRequest, signal: AbortSignal): Promise<ReconcileOutcome> => {
+  let operation: { capability: string; operation_id: string; observed_generation: number } | undefined;
+  let operationUncertain = false;
+  return async (request: BoundaryRequest, boundarySignal: AbortSignal): Promise<ReconcileOutcome> => {
+    const deadlineAt = Date.now() + request.deadlineMs;
+    const signal = lifecycleSignal ? AbortSignal.any([boundarySignal, lifecycleSignal]) : boundarySignal;
+    const blocked = (deferral?: "vault_locked" | "refresh_unknown"): ReconcileOutcome => ({
+      kind: "blocked",
+      errors: [{ category: "authorization", message: deferral === "refresh_unknown"
+        ? "codex subscription boundary reconcile deferred: refresh outcome unknown"
+        : `codex ${binding.authMode} boundary reconcile failed` }],
+      ...(deferral ? { deferral } : {}),
+    });
+    // Lifecycle cancellation wins even after an ambiguous send; the runner routes steering.
+    if (lifecycleSignal?.aborted) return blocked();
     // Issue #1789: the run already learned (mid-turn) that the owner vault is locked: defer at once
     // with NO credential call, instead of re-asking the api for a refresh/release it will refuse.
     if (isVaultLocked?.()) {
@@ -878,6 +891,7 @@ export function buildRunLaneReconcile(
       ];
       return { kind: "blocked", errors, deferral: "vault_locked" };
     }
+    if (signal.aborted || Date.now() >= deadlineAt) return blocked(operationUncertain ? "refresh_unknown" : undefined);
     try {
       if (binding.authMode === "subscription") {
         if (committed.value === undefined) {
@@ -888,22 +902,50 @@ export function buildRunLaneReconcile(
           ];
           return { kind: "blocked", errors };
         }
-        // ONE operation id per LOGICAL refresh, RETAINED across retries until it SUCCEEDS.
-        if (reconcileOperationId === undefined) reconcileOperationId = randomUUID();
-        const res = await client.refreshCodex(
-          runId,
-          {
-            capability: binding.capability,
-            operation_id: reconcileOperationId,
-            observed_generation: committed.value,
-          },
-          { authMode: "subscription", chatgptAccountId: binding.chatgptAccountId },
-          signal,
-        );
-        registerToken(res.access_token);
-        committed.value = res.generation; // durable commit → advance the SHARED cell BEFORE the permit
-        reconcileOperationId = undefined; // logical refresh done; next boundary mints fresh
-        return { kind: "ready" };
+        // Freeze the entire tuple until validated success, including across boundary invocations.
+        operation ??= { capability: binding.capability, operation_id: randomUUID(), observed_generation: committed.value };
+        const frozenOperation = operation;
+        let uncertain = operationUncertain;
+        // At most two HTTP attempts, immediate reconciliation in this same flight. A refusal
+        // ends the loop; ambiguity/contended alone admits the second attempt.
+        for (let attempt = 0; attempt < 2; attempt++) {
+          if (lifecycleSignal?.aborted) return blocked();
+          if (signal.aborted || Date.now() >= deadlineAt) return blocked(uncertain ? "refresh_unknown" : undefined);
+          try {
+            const res = await client.refreshCodex(
+              runId, { ...frozenOperation },
+              { authMode: "subscription", chatgptAccountId: binding.chatgptAccountId }, signal,
+            );
+            // Cancellation can arrive with the response; it still precedes any new authority.
+            if (lifecycleSignal?.aborted) return blocked();
+            // WorkerClient validates identity, shape and generation before returning a token.
+            registerToken(res.access_token);
+            committed.value = Math.max(committed.value ?? frozenOperation.observed_generation, res.generation);
+            operation = undefined;
+            operationUncertain = false;
+            return { kind: "ready" };
+          } catch (err) {
+            if (lifecycleSignal?.aborted) return blocked();
+            if (codexDeferralReason(err) === "vault_locked") {
+              return { kind: "blocked", errors: [{ category: "authorization",
+                message: "codex subscription boundary reconcile deferred: vault locked" }], deferral: "vault_locked" };
+            }
+            const failure = codexRefreshFailure(err);
+            // The boundary deadline after a send cannot prove whether the provider spent the token.
+            if (failure === "cancelled" && boundarySignal.aborted) {
+              operationUncertain = true;
+              return blocked("refresh_unknown");
+            }
+            if (uncertain && (failure === "unavailable" || failure === "ambiguous" || failure === "contended")) {
+              return blocked("refresh_unknown");
+            }
+            if (failure !== "ambiguous" && failure !== "contended") return blocked();
+            uncertain = true;
+            operationUncertain = true;
+            if (attempt === 1 || signal.aborted) return blocked("refresh_unknown");
+          }
+        }
+        return blocked("refresh_unknown");
       }
       // api_key: ZERO refresh; a fresh release re-authorizes only (no subscription fallback).
       const res = await client.releaseCodex(
@@ -912,9 +954,11 @@ export function buildRunLaneReconcile(
         { authMode: "api_key" },
         signal,
       );
+      if (lifecycleSignal?.aborted) return blocked();
       registerToken(res.access_token);
       return { kind: "ready" };
     } catch (err) {
+      if (lifecycleSignal?.aborted) return blocked();
       // Fail CLOSED with a bounded, secret-free reason (authMode is safe to name). The op id and
       // observed generation are DELIBERATELY left intact so a retried boundary reuses them.
       // Issue #1766: a typed 409 vault_locked reply is still a block (the boundary poisons and
@@ -1001,7 +1045,7 @@ function buildAdviceAuthConfig(
  * Build a fresh, disposable Codex advice-launch root for ONE call (PRD #1429 M3). Adapts the
  * SAME `launchCodexRoot` primitive {@link defaultLaunchProviderRoot} uses for the run lane —
  * a "provider" root under app-server auth, so the credential flows over the login RPC and
- * NEVER the launcher env — but for the isolated, tool-less advice lane: NO registry, NO
+ * NEVER the launcher env — but for the isolated advice lane without worker callbacks: NO registry, NO
  * broker, NO command-effect surface, and its OWN disposable per-call owned-data-root/cwd
  * (never the run lane's `codex-data/<namespace>-epoch-N` tree or worktree). `authMode` is bound once at
  * FACTORY construction ({@link makeProductionCodexAdviceHarnessFactory}) because
@@ -1104,7 +1148,7 @@ export type CodexAdviceHarnessFactory = (params: CodexAdviceHarnessBuildParams) 
  * `runReadOnlyModelPass` (model-pass.ts) so a Codex judge/review claim gets a REAL advice
  * result instead of the deterministic missing-token fallback. Each call releases a FRESH
  * credential through a fresh {@link CodexAdviceCredentialBridge} (never the run lane's
- * registry/workspace/broker) and launches an isolated, tool-less provider root via
+ * registry/workspace/broker) and launches an isolated provider root without worker callbacks via
  * {@link makeProductionLaunchAdviceRoot}, disposed when the harness's own `run()` completes.
  */
 export function makeProductionCodexAdviceHarnessFactory(
@@ -1962,7 +2006,8 @@ export class CodexExecutor implements Executor {
     const pauseNow = new CodexPauseNowState(ctx.signal);
     ctx.onPauseNow?.(() => pauseNow.interrupt());
     // Issue #1764: the lifecycle signal for epoch startup. It forwards only a genuine (non-pause)
-    // abort of ctx.signal; the listener is removed in the finally below.
+    // abort of ctx.signal; deferred safety retains the listener until terminal disposal,
+    // otherwise the finally below removes it.
     const lifecycleAbort = new AbortController();
     const forwardLifecycleAbort = (): void => {
       if (!(ctx.signal?.reason instanceof PauseNowSignal)) lifecycleAbort.abort(ctx.signal?.reason);
@@ -2089,7 +2134,7 @@ export class CodexExecutor implements Executor {
         ((): Promise<RegisteredRoot> =>
           Promise.reject(new Error("codex boundary-action spawn seam is not wired (the runner drives spawnBoundaryProcess)")));
       const boundaryProcessSpawner = makeBoundaryProcessSpawner(launchEffectRoot, commandSandbox, this.log, runCache);
-      const reconcile = this.makeBoundaryReconcile(ctx.runId, registerToken, committedGeneration, () => pauseNow.vaultLock.latched);
+      const reconcile = this.makeBoundaryReconcile(ctx.runId, registerToken, committedGeneration, () => pauseNow.vaultLock.latched, lifecycleAbort.signal);
       // (C, F1) Terminal eviction of tokens released by the POST-RUN sink reconciles. The runner
       // calls safety.dispose after the last durability sink — by which point run()'s finally has
       // already evicted+cleared the DURING-run tokens — so the FINAL epoch's onDispose evicts only
@@ -2105,6 +2150,7 @@ export class CodexExecutor implements Executor {
       // post-run sink's command-identity boundary process. The settle is idempotent and never
       // throws, so a dispose can never change the run outcome.
       const onTerminalDispose = async (deadlineAt?: number): Promise<void> => {
+        ctx.signal?.removeEventListener("abort", forwardLifecycleAbort);
         evictTokens();
         await settleCommandCache(deadlineAt);
       };
@@ -2753,7 +2799,9 @@ export class CodexExecutor implements Executor {
 
       return loopResult();
     } finally {
-      ctx.signal?.removeEventListener("abort", forwardLifecycleAbort);
+      if (!this.deps.deferRegistryTeardown || epoch === undefined) {
+        ctx.signal?.removeEventListener("abort", forwardLifecycleAbort);
+      }
       // Terminal (m4 F1). Capture the FINAL epoch's credential-free session into the store so a
       // park/preserve resume can adopt it (the runner's runHome lifecycle — preserve on park,
       // remove on terminal — now OWNS store removal; the executor only ever persists, NEVER
@@ -3675,8 +3723,9 @@ export class CodexExecutor implements Executor {
     registerToken: (token: string) => void,
     committed: CodexCommittedGenerationCell,
     isVaultLocked: () => boolean,
+    lifecycleSignal: AbortSignal,
   ): ReconcileBeforeBoundary {
-    return buildRunLaneReconcile(runId, this.opts.client, this.opts.binding, registerToken, committed, isVaultLocked);
+    return buildRunLaneReconcile(runId, this.opts.client, this.opts.binding, registerToken, committed, isVaultLocked, lifecycleSignal);
   }
 
   // ─── the child-turn demux seam (part C) ───────────────────────────────────────
@@ -4311,7 +4360,7 @@ function stripGitConfigEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
  *     (hooksPath, gc/maintenance, code-exec keys) meant for the worker's own git.
  *   - Local subprocesses of a command (gitleaks, Taskfile gate steps) inherit this through
  *     the process env; commands inside separately launched Docker containers do NOT.
- *   - Codex advice roots need none: they are tool-less.
+ *   - Codex advice roots need none: they have no worker callbacks (#1566 native async/UTC exceptions).
  *   - It is not a worker-controlled boundary against the model: a command can still widen
  *     trust for its own single invocation with `git -c safe.directory=...`
  *     (GIT_CONFIG_PARAMETERS is read after GIT_CONFIG_COUNT).

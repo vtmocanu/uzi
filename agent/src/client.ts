@@ -131,6 +131,26 @@ export function codexDeferralReason(err: unknown): "vault_locked" | undefined {
   return (parsed as { reason?: unknown }).reason === "vault_locked" ? "vault_locked" : undefined;
 }
 
+/** Refresh retry decisions use only fixed classifications, never response text in diagnostics. */
+export function codexRefreshFailure(err: unknown): "ambiguous" | "contended" | "unavailable" | "cancelled" | "refused" {
+  if (err instanceof CodexRequestFailure) {
+    return err.kind === "parent_abort" ? "cancelled" : err.kind === "transport" || err.kind === "http_timeout" ? "ambiguous" : "refused";
+  }
+  if (!(err instanceof RequestError)) return "refused";
+  if (err.status === 500 || err.status === 502 || err.status === 504) return "ambiguous";
+  if (err.status !== 409) return "refused";
+  let body: unknown;
+  try { body = JSON.parse(err.body); } catch { return "refused"; }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return "refused";
+  const record = body as Record<string, unknown>;
+  if (Object.keys(record).length === 1 && record.error === "codex refresh is contended; retry") return "contended";
+  // The API returns these fixed unavailable errors without a reason field.
+  if (Object.keys(record).length === 1 && (
+    record.error === "codex credential is not available" || record.error === "codex refresh is unavailable"
+  )) return "unavailable";
+  return "refused";
+}
+
 // ── PRD #1798 D9: typed errors for the pr-description routes ─────────────────────────────────
 // Each HTTP error extends RequestError (status + truncated body stay readable, and isTransient
 // still treats the 429 as transient), so a caller can branch on the class without parsing the
@@ -578,8 +598,16 @@ const CODEX_REFRESH_OUTCOMES = new Set<CodexRefreshResponse["outcome"]>([
   "reconciled",
 ]);
 
+/** Secret-free classification: never retain the underlying HTTP error or coordinates. */
+export class CodexRequestFailure extends Error {
+  constructor(readonly kind: "transport" | "http_timeout" | "parent_abort" | "local" | "response") {
+    super(kind === "response" ? "invalid codex credential response" : `codex credential request failed: ${kind}`);
+    this.name = "CodexRequestFailure";
+  }
+}
+
 function codexResponseError(): Error {
-  return new Error("invalid codex credential response");
+  return new CodexRequestFailure("response");
 }
 
 function responseRecord(raw: unknown): Record<string, unknown> {
@@ -2380,11 +2408,13 @@ export class WorkerClient {
     signal?: AbortSignal,
   ): Promise<CodexRefreshResponse> {
     if (
+      typeof req.capability !== "string" || req.capability.length === 0 ||
+      typeof req.operation_id !== "string" || req.operation_id.length === 0 ||
       !validGeneration(req.observed_generation) ||
       req.observed_generation === Number.MAX_SAFE_INTEGER ||
-      expected.chatgptAccountId.length === 0
+      typeof expected.chatgptAccountId !== "string" || expected.chatgptAccountId.length === 0
     ) {
-      throw codexResponseError();
+      throw new CodexRequestFailure("local");
     }
     const raw = await this.postCodexJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/codex/refresh`,
@@ -2423,10 +2453,42 @@ export class WorkerClient {
   }
 
   private async postCodexJSON(path: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
-    const res = await this.fetchRaw("POST", path, body, this.codexHTTPTimeoutMs, signal);
-    if (res.status >= 400) throw await this.toError("POST", path, res);
-    const text = await res.text();
-    if (!text) throw codexResponseError();
+    let serialized: string | undefined;
+    try { serialized = JSON.stringify(body); } catch { throw new CodexRequestFailure("local"); }
+    const timeout = AbortSignal.timeout(this.codexHTTPTimeoutMs);
+    const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    const failure = (): CodexRequestFailure => new CodexRequestFailure(
+      signal?.aborted ? "parent_abort" : timeout.aborted ? "http_timeout" : "transport",
+    );
+    let res: Response;
+    try {
+      res = await fetch(this.baseUrl + path, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${this.token}`, "X-Client-Version": this.version, "Content-Type": "application/json" },
+        body: serialized,
+        signal: combined,
+      });
+    } catch {
+      throw failure();
+    }
+    if (res.status >= 400) {
+      let text: string;
+      try {
+        text = (await readBoundedText(res, ERROR_BODY_MAX_BYTES)).trim();
+      } catch {
+        // A received authorization refusal is definite even if its body is lost.
+        if ([400, 401, 403, 404].includes(res.status)) throw new RequestError("POST", path, res.status, "");
+        throw failure();
+      }
+      throw new RequestError("POST", path, res.status, text);
+    }
+    let text: string;
+    try {
+      text = await res.text();
+    } catch {
+      throw failure();
+    }
+    if (!text) throw new CodexRequestFailure("transport");
     try {
       return JSON.parse(text) as unknown;
     } catch {

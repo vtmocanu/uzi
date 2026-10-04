@@ -22,12 +22,26 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **Codex's documented execution boundary explicitly accepts async messages and UTC clock reads ([#1566](https://github.com/vtmocanu/uzi/issues/1566)).**
+  The ADR records the pinned 0.159.3 runtime's immediate async acceptance and successful read-only clock calls, with no worker effects, across root start, resume, child and advice characterization; async text can still contaminate advice, filtering remains deferred, and the underlying clock-provider path remains unverified. This is documentation of accepted exceptions, not a runtime suppression or security fix.
+
 ### Added
 
 - **See the estimated usage of an interrupted Claude session apart from the metered total ([#2014](https://github.com/vtmocanu/uzi/issues/2014)).**
   Usage after the last SDK result of a parked, stopped or crashed Claude run is recorded and shown as "Estimated, not metered" on the run page and as an EST. TAIL row in `uzi run get` (and `usage_estimated_tail` in its JSON), with price-table provenance, "cost unknown" when unpriced and a plain-words coverage note; it is never added to the metered total, usage aggregates or any budget.
 
 ### Fixed
+
+- **Per-run Docker teardown no longer leaks anonymous volumes ([#2236](https://github.com/vtmocanu/uzi/issues/2236)).**
+  When a run ends, each container bound under the run's clone is now removed together with its anonymous volumes, so they no longer pile up on a docker-tier worker's `dind-data` volume. Named volumes and containers not bound under the clone are left untouched.
+
+- **Oversized Forgejo error responses fail without exposing body fragments ([#2231](https://github.com/vtmocanu/uzi/issues/2231)).**
+  Non-success responses are capped at 4 KiB and an overflowing body is discarded before redaction, preventing a token split at the read boundary from leaking through SDK, raw GET or issue PATCH errors. HTTP error classification is preserved, and successful responses retain the 32 MiB transport cap.
+
+- **Explicit vault unlock queues already parked Codex runs promptly ([#1792](https://github.com/vtmocanu/uzi/issues/1792)).**
+  A successful explicit unlock best-effort queues the owner's vault-locked recovery parks regardless of retry time or count; a worker still starts them through the normal claim path. The scheduled retry remains the fallback for database failures or parks reported after the unlock update, and a promotion failure preserves the successful unlock response and Codex usage refresh. Login, startup and passphrase creation do not trigger early promotion.
 
 - **Trusted launch, admission and plan-gate refusals no longer park a run as a disk-full failure ([#1829](https://github.com/vtmocanu/uzi/issues/1829)).**
   These refusals keep their failure handling even when the data volume is full, including preserved trusted types, cause/interruption wrappers and complete legacy reasons prefixed by `<context>: <reason>` (a literal colon and space). Apostrophes in context are supported; double-quoted or multiline contexts, alternate separators, quoted reasons and producer-domain near-misses are not legacy refusal envelopes. Ordinary opaque failures are unchanged; a refusal whose origin has been completely erased can still coincide with fullness and be deferred.
@@ -37,6 +51,10 @@ through `[0.52.0]`.)
 - **Slack plan gates show the detected repo agent folder ([#2113](https://github.com/vtmocanu/uzi/issues/2113)).**
   The gate message and repo approval confirmation now name `.codex/agents/` for a detected Codex roster, with `.claude/agents/` as the fallback for older or unsupported folder metadata; template and no-roster approvals keep their existing behavior.
 
+- **Three more outbound clients use independent HTTP/2 health-ping pools ([#2211](https://github.com/vtmocanu/uzi/issues/2211)).**
+  Pushbroker, agent-source fetches and release checks each own a persistent connection pool built by the shared transport constructor, configured to send a health ping after 30 seconds without received frames and close the connection after a further 15 seconds without a ping response. Detection takes about 45 seconds after the last received frame, so individual requests may still time out; existing operation budgets, redirect policies and response limits remain in place.
+- **MR rework keeps handled review history across temporary opt-outs and token replacement ([#1811](https://github.com/vtmocanu/uzi/issues/1811)).**
+  Removing the owner's last Anthropic token or turning automatic rework off temporarily no longer resets consumed review comments or the attempt cap; history is retained while a qualifying source MR remains open.
 - **Worker UID ownership regressions run in required CI ([#2134](https://github.com/vtmocanu/uzi/issues/2134)).**
   The base worker image exercises privileged creation and ownership assertions, with a source-derived check that rejects missing or skipped tests.
 - **A job's output upload no longer retries past a deadline-capped wait.**
@@ -59,6 +77,8 @@ through `[0.52.0]`.)
   On a Claude run, a process carrying the run's HOME that the worker could not kill, or a reap that could not finish, now blocks every step that publishes or settles the run (finalize push, failure settlement, pause, completion hold, wall park, credential switch, recovery and checkpoint publishes) the same way an unproven clone does: the run keeps custody, keeps running (a failed pause) or fails with `worker_residue_blocked`. A re-claimed run reaps its HOME before its clone fetch, and a park or the periodic disk reclaim drops the run's rebuildable caches only once no such process is left.
 - **Worker upgrade waits no longer trigger premature capacity alarms (#2184).**
   Run health identifies currently suitable draining workers; admin capacity confirms each upgrade wait, preserves genuine five-minute alarms, and reports overdue upgrade waits after 24 hours of overlap.
+- **Codex runs keep their work when a refresh response is lost ([#1770](https://github.com/vtmocanu/uzi/issues/1770)).**
+  Updated workers reconcile the refresh once, then keep the work, session and custody while a vault lock or unknown outcome prevents safe recovery. Runs resume after unlock and recovery checks without spending the original refresh token again; no merge request opens before a successful resume. Deploy the API before the updated workers; older workers keep their first-request vault-lock reply but still need the worker update to survive a lost response.
 - **Worker disk-pressure protection now notices inode exhaustion ([#1829](https://github.com/vtmocanu/uzi/issues/1829)).**
   Admission and the periodic hard-stop layer use the higher of byte and inode utilization, so a data volume running out of inodes can trigger protection while byte usage stays low. Missing or invalid accounting, including missing or zero inode totals, falls back to the valid resource sample.
 

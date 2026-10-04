@@ -105,11 +105,10 @@ export type ReconcileOutcome =
   | {
       kind: "blocked";
       errors: readonly HarnessError[];
-      /** Issue #1766: set only when the credential authority deferred the reconcile because
-       *  the owner vault is locked. It is a FIELD on `blocked`, not a new kind, so the boundary
-       *  still fails closed (poison + throw) exactly as for any other block; the runner reads
-       *  it off the thrown {@link CodexBoundaryError} to park rather than fail. */
-      deferral?: "vault_locked";
+      /** A confirmed vault lock or unresolved subscription refresh outcome defers the
+       *  reconcile. This field never grants authority: the boundary still poisons and throws,
+       *  and the runner must prove credential-free capture before parking for recovery. */
+      deferral?: "vault_locked" | "refresh_unknown";
     };
 
 /** Issue #1766: the result of {@link CodexExecutionSafetyImpl.settleForCredentialFreeCapture}.
@@ -244,9 +243,9 @@ export class CodexBoundaryError extends Error {
    *  "preserve primary failure and cleanup evidence separately"). It is also set as
    *  the standard `cause`. Undefined when the action itself did not throw. */
   readonly actionError?: unknown;
-  /** Issue #1766: set when a `reconcile`-stage block carried a vault-locked deferral. The
-   *  registry is still poisoned; this only tells the runner the cause is recoverable. */
-  readonly deferral?: "vault_locked";
+  /** Set when a reconcile block carries a vault-lock or unresolved-refresh deferral.
+   *  The registry is still poisoned; the runner may preserve it for later recovery. */
+  readonly deferral?: "vault_locked" | "refresh_unknown";
   /** Issue #1864: the boundary and the checkpoint sink that requested it, when known. */
   readonly boundary?: SafeBoundary;
   readonly sink?: BoundarySink;
@@ -262,7 +261,7 @@ export class CodexBoundaryError extends Error {
     readonly stage: "reconcile" | "quiesce" | "reap" | "action",
     readonly errors: readonly HarnessError[],
     actionError?: unknown,
-    deferral?: "vault_locked",
+    deferral?: "vault_locked" | "refresh_unknown",
     context?: { boundary?: SafeBoundary; sink?: BoundarySink; step?: BoundaryStep },
   ) {
     super(

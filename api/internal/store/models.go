@@ -237,6 +237,7 @@ type CodexProviderAccount struct {
 	ReauthGeneration         pgtype.Int8        `json:"reauth_generation"`
 	ReauthCredentialRevision pgtype.Int8        `json:"reauth_credential_revision"`
 	ReauthReason             pgtype.Text        `json:"reauth_reason"`
+	RecoveryCause            pgtype.Text        `json:"recovery_cause"`
 }
 
 type CodexRefreshIntent struct {

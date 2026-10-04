@@ -129,6 +129,7 @@ function sleeper(cwd: string, env: NodeJS.ProcessEnv): ChildProcess {
 
 interface FakeDaemon {
   socket: string;
+  directoryFd?: number;
   containers: Map<string, { Id: string; Mounts: Array<{ Type: string; Source: string; Destination: string }> }>;
   /** When set, the NEXT create waits for this promise before it is committed. */
   hold: Promise<void> | undefined;
@@ -136,9 +137,9 @@ interface FakeDaemon {
 }
 
 async function startFakeDaemon(): Promise<FakeDaemon> {
-  const { socket, dispose } = shortUnixSocket();
+  const { socket, directoryFd, dispose } = shortUnixSocket();
   let seq = 0;
-  const daemon: FakeDaemon = { socket, containers: new Map(), hold: undefined, close: async () => {} };
+  const daemon: FakeDaemon = { socket, directoryFd, containers: new Map(), hold: undefined, close: async () => {} };
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://docker");
     const chunks: Buffer[] = [];
@@ -229,17 +230,20 @@ setInterval(() => {
 const CLI = `
 const { spawn } = require("node:child_process");
 const [tool, sock, src] = process.argv.slice(1);
-const c = spawn(process.execPath, ["-e", tool, sock, src], { detached: true, stdio: "ignore" });
+const c = spawn(process.execPath, ["-e", tool, sock, src], { detached: true,
+  stdio: sock.startsWith("/dev/fd/3/") ? ["ignore", "ignore", "ignore", 3] : "ignore" });
 process.stdout.write(String(c.pid) + "\\n");
 setInterval(() => {}, 1000);`;
 
 /** Start a stand-in CLI group whose tool keeps creating containers bound under `bindSrc`. */
-async function startAgent(a: RunAttempt, sock: string, bindSrc: string): Promise<{ cli: ChildProcess; toolPid: number }> {
+async function startAgent(a: RunAttempt, daemon: FakeDaemon, bindSrc: string): Promise<{ cli: ChildProcess; toolPid: number }> {
+  const sock = daemon.directoryFd === undefined ? daemon.socket :
+    daemon.socket.replace(`/dev/fd/${daemon.directoryFd}/`, "/dev/fd/3/");
   const cli = spawn(process.execPath, ["-e", CLI, TOOL, sock, bindSrc], {
     cwd: a.clonePath,
     env: markerEnv(a),
     detached: true,
-    stdio: ["ignore", "pipe", "ignore"],
+    stdio: daemon.directoryFd === undefined ? ["ignore", "pipe", "ignore"] : ["ignore", "pipe", "ignore", daemon.directoryFd],
   });
   spawned.push(cli);
   const toolPid = await new Promise<number>((resolve, reject) => {
@@ -277,9 +281,9 @@ describe("A-core: a setsid'd agent tool survives killAgentTree; quiesce + retire
       const sib = attemptFor("run-1769", clones["issue-1769"]!);
       registry.add(own);
       registry.add(sib);
-      const ownAgent = await startAgent(own, daemon.socket, path.join(own.clonePath, "data"));
+      const ownAgent = await startAgent(own, daemon, path.join(own.clonePath, "data"));
       ownRoots = [recordRoot(ownAgent.cli.pid)!];
-      const sibAgent = await startAgent(sib, daemon.socket, path.join(sib.clonePath, "data"));
+      const sibAgent = await startAgent(sib, daemon, path.join(sib.clonePath, "data"));
       assert.ok(await until(() => boundUnder(daemon, own.clonePath).length > 0 && boundUnder(daemon, sib.clonePath).length > 0));
 
       // BASE behaviour (the bug): killAgentTree alone kills the CLI group only. The detached tool

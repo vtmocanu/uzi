@@ -227,8 +227,8 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 									args[0], forgeParkLine(run))
 							} else if line := vaultParkLine(run); line != "" {
 								// Issue #1766: a Codex credential refresh or release found the
-								// run owner's vault locked. It resumes at its next retry once
-								// the vault is unlocked, not the instant of unlock; the wording
+								// run owner's vault locked. Explicit unlock queues it promptly;
+								// the timer remains the fallback and a worker claims it. The wording
 								// is owner-neutral (the follower may be an admin).
 								_, _ = fmt.Fprintf(env.Stderr,
 									"run %s %s; still following\n",

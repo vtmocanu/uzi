@@ -1,4 +1,5 @@
-// PRD #1156 (M3a) — the STOCK, native-DISABLED Codex app-server config builder.
+// PRD #1156 (M3a) — the stock Codex config with native effectful surfaces disabled.
+// #1566: async questions and read-only UTC remain reachable; the run code host routes callbacks.
 //
 // This reproduces the environment-replacement stock `config.toml` characterized by
 // the frozen M0 fixture (`e2e/codex-m0/harness.mjs:208-248`), MINUS the two
@@ -11,10 +12,10 @@
 //   * the fixture accepts arbitrary caller-shaped knobs (code_mode / unified_exec /
 //     multi_agent variables, `write_stdin_approval`). The generic M3a launcher builder
 //     accepts only a trusted provider + model + canonical project path and pins every
-//     native surface disabled. The production authentication builder below is narrower:
+//     configurable native effectful surface disabled. The production authentication builder below is narrower:
 //     it fixes the built-in OpenAI provider and accepts no endpoint/env-key injection.
 //
-// The ADR (`adr/1106-codex-harness.md:337-344`) requires the canonical project be
+// ADR-1106 requires the canonical project be
 // provisioned EXPLICITLY `untrusted` with `project_doc_max_bytes = 0`: pinned
 // 0.159.3 `thread_processor.rs` promotes trust when `trust_level.is_none()` (and, since 0.156, the
 // config is not projectless), so an
@@ -105,7 +106,7 @@ function nativeDisabledConfigLines(
     `multi_agent_v2 = false`,
     `enable_request_compression = false`,
     ``,
-    // Explicit untrusted state for the canonical project (ADR:337-344). A quoted
+    // Explicit untrusted state for the canonical project (ADR-1106). A quoted
     // key so any path is represented safely.
     `[projects.${toml(projectPath)}]`,
     `trust_level = "untrusted"`,
@@ -114,9 +115,9 @@ function nativeDisabledConfigLines(
 }
 
 /**
- * Build the `config.toml` TEXT for a stock, native-DISABLED Codex app-server.
+ * Build the `config.toml` TEXT with native effectful surfaces disabled (#1566 exceptions above).
  *
- * Every native surface is pinned to its stock disabled value: `project_doc_max_bytes
+ * Configurable native effectful surfaces are pinned off: `project_doc_max_bytes
  * = 0`, `web_search = "disabled"`, analytics/feedback/agents off, the whole
  * `[features]` family (apps / plugins / shell_snapshot* / code_mode* / remote_models
  * / unified_exec / hooks / multi_agent* / enable_request_compression) off, and

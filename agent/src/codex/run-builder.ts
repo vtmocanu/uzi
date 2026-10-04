@@ -11,7 +11,7 @@
 // {@link CodexDelegationRunner} needs, derive the broker's `allowedRoles` set from the
 // KNOWN roles, and surface the lead's broker grants + prompt + resolved model/effort as
 // one flat object the harness/broker are constructed from. Run and advice stay SEPARATE
-// entry points (advice is tool-less/isolated by construction — no roles, no grants).
+// entry points (advice is isolated without worker callbacks — no roles, no grants).
 //
 // PURE + DETERMINISTIC: no I/O, no clock, no randomness. Two calls on the same input
 // produce byte-identical structures (the renderer already sorts every map/set/diagnostic
@@ -51,8 +51,8 @@ export interface CodexRunPlan {
   readonly diagnostics: readonly CodexRenderDiagnostic[];
 }
 
-/** The advice construction inputs — the SEPARATELY-GATED, tool-less/isolated ceiling.
- *  Deliberately carries NO roles, NO grants and NO tool surface: model + effort +
+/** The advice construction inputs — the SEPARATELY-GATED, isolated ceiling (#1566 async/UTC exceptions).
+ *  Deliberately carries NO roles, NO grants and NO worker tool surface: model + effort +
  *  prompt + output only, mirroring {@link RenderedCodexAdvice}. */
 export interface CodexAdvicePlan {
   readonly label: AdviceRequest["label"];

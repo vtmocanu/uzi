@@ -50,6 +50,7 @@ import (
 	"github.com/go-git/go-git/v5/storage/memory"
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/httptransport"
 	"github.com/vtmocanu/uzi/api/internal/packbudget"
 	"github.com/vtmocanu/uzi/api/internal/redirectguard"
 )
@@ -1135,19 +1136,23 @@ func pushRefSpec(ref string) config.RefSpec {
 	return config.RefSpec(ref + ":" + ref)
 }
 
-// httpTransport is the go-git smart-HTTP transport every broker operation uses. Its
-// client follows a redirect only while it stays on the original request's scheme,
+// brokerHTTPClient owns the broker's independent connection pool, with HTTP/2
+// health pings. Its concrete transport supports go-git's endpoint TLS/proxy options.
+// The client follows a redirect only while it stays on the original request's scheme,
 // hostname and effective port (redirectguard.SameOrigin), composed after go-git's
 // own policy (redirects only on the initial discovery request). go-git alone admits
 // a same-host redirect that changes scheme or port, and net/http re-sends the
 // BasicAuth header to the same hostname, so without this the PAT could leave in
 // cleartext or reach another port before go-git's later endpoint check runs.
-var httpTransport = githttp.NewClient(&http.Client{
+var brokerHTTPClient = &http.Client{
 	// Explicit, not nil: go-git type-asserts *http.Transport when an endpoint carries
 	// TLS or proxy options.
-	Transport:     http.DefaultTransport,
+	Transport:     httptransport.New(http.DefaultTransport),
 	CheckRedirect: redirectguard.SameOrigin,
-})
+}
+
+// httpTransport is the go-git smart-HTTP transport every broker operation uses.
+var httpTransport = githttp.NewClient(brokerHTTPClient)
 
 // init installs httpTransport for http and https in go-git's process-global
 // protocol registry, ONCE, before any goroutine can read it (the registry is an

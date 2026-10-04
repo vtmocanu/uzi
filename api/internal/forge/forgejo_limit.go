@@ -6,13 +6,17 @@ import (
 	"net/http"
 )
 
-// forgejoMaxResponseBytes caps how many body bytes any single Forgejo response
+// forgejoMaxResponseBytes caps how many body bytes a successful Forgejo response
 // may deliver through the driver's client. The gitea SDK buffers bodies with
 // io.ReadAll (2xx and non-2xx alike), so without a cap an allowlisted hostile
 // forge could stream an unbounded body into api memory. It must stay above the
 // largest caller-side limit (maxTraceBytes+1 in rawGetLimited). A package var so
 // tests can lower it, like maxForgePages.
 var forgejoMaxResponseBytes int64 = 32 << 20
+
+// forgejoMaxErrorResponseBytes bounds error bodies before redaction. Overflow
+// discards partial content so a token split at the boundary cannot leak.
+const forgejoMaxErrorResponseBytes int64 = 4 << 10
 
 // errForgeResponseTooLarge is returned by a capped body reader once the cap is
 // exceeded. The read fails closed; a truncated body is never handed on as if it
@@ -29,7 +33,11 @@ func (t cappedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil || resp == nil || resp.Body == nil {
 		return resp, err
 	}
-	resp.Body = &cappedBody{rc: resp.Body, remaining: forgejoMaxResponseBytes}
+	limit := forgejoMaxResponseBytes
+	if resp.StatusCode/100 != 2 {
+		limit = min(limit, forgejoMaxErrorResponseBytes)
+	}
+	resp.Body = &cappedBody{rc: resp.Body, remaining: limit}
 	return resp, nil
 }
 
