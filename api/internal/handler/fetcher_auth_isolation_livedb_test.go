@@ -13,6 +13,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/auth"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/fetchctl"
+	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/hub"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -39,6 +40,7 @@ func TestFetcherCredentialIsolationLiveDB(t *testing.T) {
 	q := store.New(e.pool)
 	box := newHandlerTestBox(t)
 	h := &Handler{pool: e.pool, q: q, box: box, cfg: cfg, wsvc: workersvc.New(q, box, workersvc.Params{}), settings: e.caps, hub: hub.New()}
+	h.SetHostedSvc(hostedsvc.New(q, box, time.Now, time.Hour))
 	lim := mw.NewLimiter(100000, time.Minute, nil)
 	routers := map[string]http.Handler{
 		"plain": h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim, lim),
@@ -73,11 +75,11 @@ func TestFetcherCredentialIsolationLiveDB(t *testing.T) {
 
 	for name, r := range routers {
 		// Positive controls: each credential works on its own surface.
-		if code := do(r, http.MethodGet, "/api/controller/poll", ctrlTok, "", false); code == http.StatusUnauthorized || code == http.StatusNotFound {
-			t.Fatalf("%s: controller token on its own poll = %d; the control is broken", name, code)
+		if code := do(r, http.MethodGet, "/api/controller/poll", ctrlTok, "", false); code != http.StatusOK {
+			t.Fatalf("%s: controller token on its own poll = %d, want 200; the control is broken", name, code)
 		}
-		if code := do(r, http.MethodPost, "/api/worker/heartbeat", wkrTok, `{}`, false); code == http.StatusUnauthorized || code == http.StatusNotFound {
-			t.Fatalf("%s: worker token on its own heartbeat = %d; the control is broken", name, code)
+		if code := do(r, http.MethodPost, "/api/worker/heartbeat", wkrTok, `{}`, false); code != http.StatusOK {
+			t.Fatalf("%s: worker token on its own heartbeat = %d, want 200; the control is broken", name, code)
 		}
 
 		// The fetcher token on the controller and worker surfaces.
