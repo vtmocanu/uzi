@@ -7,7 +7,7 @@ import type { GitCache } from "./git.js";
 import type { Logger } from "./log.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { Outbox } from "./outbox.js";
-import { CodexCrossCheck } from "./codex/cross-check.js";
+import { CodexCrossCheck, CrossCheckMalformedError } from "./codex/cross-check.js";
 import { selectCodexBinding } from "./codex/select.js";
 import { ChatSteering } from "./steering.js";
 import { makeTerminalOutboxDeps, postTerminalState, isStaleClaimRefusal } from "./terminal-resolve.js";
@@ -63,7 +63,6 @@ export class CrossCheckRunner {
     let steering: ChatSteering | undefined;
     let seq = claim.last_seq ?? 0;
     let verdictDelivered = false;
-    let verdictAttempted = false;
     const custodyLost = async (): Promise<boolean> => {
       try {
         const ack = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation });
@@ -107,14 +106,15 @@ export class CrossCheckRunner {
       if (!parsed || !["approve", "revise", "block"].includes(parsed.verdict)
         || typeof parsed.summary !== "string" || !Array.isArray(parsed.items)
         || Object.keys(parsed).sort().join(",") !== "items,summary,verdict") throw new Error("invalid cross-check verdict");
-      const probe = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation });
+      reason = "model_error";
+      const probe = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation }, cancel.signal);
+      cancel.signal.throwIfAborted();
       if (probe?.staleClaim || steering.claimLost()) return;
       reason = "model_error";
       const decision = parsed.verdict === "approve" ? { verdict: "approve", reason_class: "approve" } as const
         : parsed.verdict === "revise" ? { verdict: "revise", reason_class: "revise" } as const
         : { verdict: "block", reason_class: "block" } as const;
-      verdictAttempted = true;
-      await this.client.reportCrossCheckVerdict(runId, generation, { ...parsed, ...decision });
+      await this.client.reportCrossCheckVerdict(runId, generation, { ...parsed, ...decision }, cancel.signal);
       verdictDelivered = true;
       await postTerminalState(this.terminalDeps, this.client, {
         runId, claimGeneration: generation, phase: "running", messagesThroughSeq: seq,
@@ -124,7 +124,7 @@ export class CrossCheckRunner {
       if (isStaleClaimRefusal(err) || steering?.claimLost()) return;
       if (checkerClaimRefused(err) && await custodyLost()) return;
       if (timedOut) reason = "model_timeout";
-      else if (!verdictAttempted && /verdict/.test(errMessage(err))) reason = "malformed";
+      else if (err instanceof CrossCheckMalformedError) reason = "malformed";
       else if (/confinement|cleanup unconfirmed/.test(errMessage(err))) reason = "confinement_failed";
       try {
         if (!verdictDelivered) await this.client.reportCrossCheckVerdict(runId, generation, {

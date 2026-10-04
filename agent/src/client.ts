@@ -1211,10 +1211,10 @@ export class WorkerClient {
     ({ verdict: "approve"; reason_class: "approve" } | { verdict: "revise"; reason_class: "revise" }
       | { verdict: "block"; reason_class: "block" } | { verdict: "failed";
           reason_class: "malformed" | "model_error" | "model_timeout" | "checker_unavailable" | "confinement_failed" })
-    & PlanCrossCheckFindings): Promise<void> {
+    & PlanCrossCheckFindings, signal?: AbortSignal): Promise<void> {
     await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-check-verdict`,
       { claim_generation: claimGeneration, ...result },
-      this.httpTimeoutMs, undefined, CROSS_CHECK_RESPONSE_MAX_BYTES);
+      this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
   }
 
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {

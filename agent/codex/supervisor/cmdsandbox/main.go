@@ -522,6 +522,9 @@ func applyNoNewPrivs() error {
 // through the fds adoptPrivateTmp and adoptCache verified, so a rename or
 // symlink swap of either path after adoption cannot redirect them.
 func confine(root string, fds grantFds, abi int) error {
+	if fds.readOnly && abi < 3 {
+		return errors.New("checker confinement requires Landlock ABI 3 for truncate denial")
+	}
 	handled := baseRights
 	if abi >= 2 {
 		handled |= unix.LANDLOCK_ACCESS_FS_REFER
@@ -589,7 +592,7 @@ func addRules(ruleset int, root string, fds grantFds, handled uint64, add ruleAd
 	read := uint64(unix.LANDLOCK_ACCESS_FS_EXECUTE | unix.LANDLOCK_ACCESS_FS_READ_FILE | unix.LANDLOCK_ACCESS_FS_READ_DIR)
 	systemPaths := []string{"/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/nix", "/opt/uzi-toolchain", "/opt/uzi-codex"}
 	if fds.readOnly {
-		systemPaths = []string{"/bin", "/sbin", "/usr", "/lib", "/lib64", "/nix", "/opt/uzi-toolchain", "/opt/uzi-codex", "/etc/ssl", "/etc/ca-certificates", "/etc/resolv.conf", "/etc/hosts", "/etc/localtime", "/etc/nsswitch.conf", "/etc/passwd", "/etc/group"}
+		systemPaths = []string{"/bin", "/sbin", "/usr", "/lib", "/lib64", "/nix", "/opt/uzi-toolchain", "/opt/uzi-codex", "/etc/ssl", "/etc/ca-certificates", "/etc/resolv.conf", "/etc/hosts", "/etc/localtime", "/etc/nsswitch.conf", "/etc/passwd", "/etc/group", "/etc/codex/requirements.toml"}
 	}
 	for _, path := range systemPaths {
 		if err := add.path(ruleset, path, read&handled); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -597,7 +600,17 @@ func addRules(ruleset int, root string, fds grantFds, handled uint64, add ruleAd
 		}
 	}
 	dev := read | unix.LANDLOCK_ACCESS_FS_WRITE_FILE
-	if err := add.path(ruleset, "/dev", dev&handled); err != nil {
+	if fds.readOnly {
+		for _, p := range []string{"/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"} {
+			rights := uint64(unix.LANDLOCK_ACCESS_FS_READ_FILE)
+			if p == "/dev/null" {
+				rights |= unix.LANDLOCK_ACCESS_FS_WRITE_FILE
+			}
+			if err := add.path(ruleset, p, rights&handled); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	} else if err := add.path(ruleset, "/dev", dev&handled); err != nil {
 		return err
 	}
 	rootRights := handled

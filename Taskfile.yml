@@ -2595,6 +2595,7 @@ tasks:
   test:cross-check-confinement:
     desc: Required plan checker filesystem confinement and packaged provider/fileop proofs
     env:
+      UZI_UID_SPLIT: "1"
       GOTOOLCHAIN: local
       GOFLAGS: -mod=vendor -buildvcs=false
     cmds:
@@ -2604,7 +2605,18 @@ tasks:
           echo "NOT RUN: cross-check confinement requires Linux" >&2
           exit 2
         fi
+        for prerequisite in go node; do
+          if ! command -v "$prerequisite" >/dev/null; then
+            echo "NOT RUN: missing $prerequisite for confinement proof" >&2
+            exit 2
+          fi
+        done
+        if ! (cd agent && node --import tsx -e ""); then
+          echo "NOT RUN: agent test dependencies unavailable" >&2
+          exit 2
+        fi
         proof_dir="$(mktemp -d .uzi/scratch/cross-check-proof.XXXXXX)"
+        chmod 755 "$proof_dir"
         proof_dir="$(cd "$proof_dir" && pwd)"
         trap 'rm -rf "$proof_dir"' EXIT
         go -C agent/codex/supervisor build -o "$proof_dir/sandbox" ./cmdsandbox

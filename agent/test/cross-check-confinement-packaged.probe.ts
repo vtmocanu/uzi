@@ -155,13 +155,12 @@ test("packaged Codex authenticates and creates a session with confined productio
     const resumed = await transport.request<{ thread: { id: string } }>("thread/resume", { threadId: result.thread.id, cwd: checkout }, { signal: AbortSignal.timeout(5000) });
     assert.equal(resumed.thread.id, result.thread.id);
     // Check auth/config/session custody using the real runner uid helper. No model turn or external call.
-    const custody = spawnSync("/bin/setpriv", [
-      "--reuid", "runner", "--regid", "runner", "--init-groups", "--inh-caps", "-all", "--ambient-caps", "-all",
-      "--no-new-privs", "--", process.execPath, "--eval",
+    const custodyCommand = runnerCommand(process.execPath, ["--eval",
       `const fs=require("node:fs"); const root=process.argv[1]; const st=p=>fs.statSync(root+p);
       console.log(JSON.stringify({root:st(""),config:st("/codex/config.toml"),auth:st("/codex/auth.json"),sessions:st("/codex/sessions")}));`,
       state,
-    ], { encoding: "utf8", timeout: 5000, env: { PATH: "/usr/bin:/bin", LANG: "C" } });
+    ]);
+    const custody = spawnSync(custodyCommand.command, custodyCommand.args, { encoding: "utf8", timeout: 5000, env: { PATH: "/usr/bin:/bin", LANG: "C" } });
     assert.equal(custody.status, 0, "NOT RUN: real runner custody inspection failed: " + custody.stderr);
     const observed = JSON.parse(custody.stdout) as Record<string, { uid: number; mode: number }>;
     for (const key of ["root", "config", "auth", "sessions"]) assert.equal(observed[key]!.uid, RUNNER_UID);

@@ -112,6 +112,14 @@ func TestCrossCheckArgsRejectWidening(t *testing.T) {
 	}
 }
 
+func TestCrossCheckTruncateRequiresABI3(t *testing.T) {
+	for _, abi := range []int{1, 2} {
+		if err := confine("/checkout", grantFds{readOnly: true}, abi); err == nil {
+			t.Fatalf("accepted ABI %d without truncate enforcement", abi)
+		}
+	}
+}
+
 func TestCrossCheckRulesNarrow(t *testing.T) {
 	paths := map[string]uint64{}
 	fds := map[int]uint64{}
@@ -127,12 +135,12 @@ func TestCrossCheckRulesNarrow(t *testing.T) {
 	if paths["/checkout"] != read || fds[9] != handled || len(fds) != 1 {
 		t.Fatal("incorrect checkout/private grants")
 	}
-	for _, p := range []string{"/", "/etc", "/tmp", "/data", "/checkout-sibling"} {
+	for _, p := range []string{"/", "/etc", "/dev", "/dev/shm", "/tmp", "/data", "/checkout-sibling"} {
 		if _, ok := paths[p]; ok {
 			t.Fatalf("broad grant: %s", p)
 		}
 	}
-	for _, p := range []string{"/usr", "/nix", "/opt/uzi-toolchain", "/opt/uzi-codex", "/etc/ssl"} {
+	for _, p := range []string{"/usr", "/nix", "/opt/uzi-toolchain", "/opt/uzi-codex", "/etc/ssl", "/etc/codex/requirements.toml"} {
 		rights, ok := paths[p]
 		if !ok || rights&unix.LANDLOCK_ACCESS_FS_WRITE_FILE != 0 {
 			t.Fatalf("system rights %s: %x", p, rights)

@@ -1,7 +1,7 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough, Writable } from "node:stream";
-import { CodexCrossCheck, type CrossCheckModelDeps } from "../src/codex/cross-check.js";
+import { CodexCrossCheck, CrossCheckMalformedError, type CrossCheckModelDeps } from "../src/codex/cross-check.js";
 import type { CodexRootHandle, CodexLaunchSpec, CodexEffectLaunchSpec } from "../src/codex/launcher.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import { WorkerClient, RequestError } from "../src/client.js";
@@ -196,7 +196,7 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
  }
 });
 
-for (const mode of ["stale-running", "stale-verdict", "malformed", "delivery", "timeout", "cancel", "lost-ack", "lost-terminal-ack"] as const) {
+for (const mode of ["stale-running", "stale-verdict", "malformed", "delivery", "timeout", "cancel", "lost-ack", "lost-terminal-ack", "cancel-probe", "timeout-probe", "finding-schema"] as const) {
  it("outer checker fails closed or abandons: " + mode, async () => {
   const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/checker-failure-"));
   const states: string[] = [];
@@ -209,6 +209,8 @@ for (const mode of ["stale-running", "stale-verdict", "malformed", "delivery", "
   const client = {
    reportState: async (_id: string, body: any) => {
     states.push(body.status);
+    if (states.length === 2 && mode === "cancel-probe") cancel.abort();
+    if (states.length === 2 && mode === "timeout-probe") await new Promise((resolve) => setTimeout(resolve, 2000));
     if (mode === "lost-terminal-ack" && body.status === "completed") throw new Error("terminal ACK lost");
     return mode === "stale-running" || (mode === "stale-verdict" && states.length >= 3) ? { staleClaim: true } : { applied: true };
    },
@@ -234,6 +236,7 @@ for (const mode of ["stale-running", "stale-verdict", "malformed", "delivery", "
     modelTimeoutMs: mode === "timeout" ? 5 : 1000,
     model: { run: async (_claim, _checkout, _home, signal) => {
      modelCalls++;
+     if (mode === "finding-schema") throw new CrossCheckMalformedError("cross-check invalid finding schema");
      if (mode === "cancel") cancel.abort();
      if (mode === "timeout" || mode === "cancel") {
       await new Promise<void>((resolve) => {
@@ -252,6 +255,10 @@ for (const mode of ["stale-running", "stale-verdict", "malformed", "delivery", "
     assert.equal(decisions.length, 0);
    } else {
     assert.equal(removals, 1);
+    if (mode === "cancel-probe" || mode === "timeout-probe") {
+     assert.ok(decisions.every((decision) => decision.verdict !== "approve"), "aborted custody probe cannot approve");
+     assert.ok(!states.includes("completed"));
+    }
     if (mode === "stale-verdict") {
      assert.deepEqual(states, ["running", "running", "running"]);
      assert.equal(decisions.length, 1);
@@ -262,8 +269,8 @@ for (const mode of ["stale-running", "stale-verdict", "malformed", "delivery", "
     } else {
      assert.equal(states.at(-1), "failed");
      assert.equal(decisions.at(-1).verdict, "failed");
-     assert.equal(decisions.at(-1).reason_class, mode === "timeout" ? "model_timeout"
-      : mode === "malformed" ? "malformed" : "model_error");
+     assert.equal(decisions.at(-1).reason_class, mode === "timeout" || mode === "timeout-probe" ? "model_timeout"
+      : mode === "malformed" || mode === "finding-schema" ? "malformed" : "model_error");
     }
    }
   } finally { await fs.rm(root, { recursive: true, force: true }); }

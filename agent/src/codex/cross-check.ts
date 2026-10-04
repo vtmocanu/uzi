@@ -15,6 +15,8 @@ import { CodexUsageAccountant } from "./token-accounting.js";
 import { launchCodexRoot, launchCodexEffectRoot, CODEX_BIN, SUPERVISOR_BIN, PROVIDER_CHILD_ARGV, type CodexRootHandle } from "./launcher.js";
 import { prepareCodexRunHome, buildAppServerRefreshBridge } from "./codex-executor.js";
 
+export class CrossCheckMalformedError extends Error {}
+
 const SANDBOX = "/usr/local/bin/uzi-codex-command-sandbox";
 const FILEOP = "/usr/local/bin/uzi-codex-fileop";
 const BRIEF = `You are the plan cross-checker. Use Read and Search to verify cited repository anchors.
@@ -103,6 +105,7 @@ export class CodexCrossCheck {
   let usageInit = false;
   let cleanupOK = true;
   let succeeded = false;
+  let completedText: string | undefined;
   const failedRoot = new AbortController();
   signal = AbortSignal.any([signal, failedRoot.signal]);
   const stopAdmission = (): void => {
@@ -209,29 +212,29 @@ export class CodexCrossCheck {
     } else if (note.method === "error") {
      throw new Error("cross-check model error");
     } else if (note.method === "item/agentMessage/delta") {
-     if (!bound) throw new Error("cross-check foreign assistant delta");
-     if (verdictText !== undefined) throw new Error("cross-check assistant delta after completion");
+     if (!bound) throw new CrossCheckMalformedError("cross-check foreign assistant delta");
+     if (verdictText !== undefined) throw new CrossCheckMalformedError("cross-check assistant delta after completion");
      if (typeof params?.itemId !== "string" || !params.itemId
       || (assistantItemId !== undefined && assistantItemId !== params.itemId)) {
-      throw new Error("cross-check requires one assistant item");
+      throw new CrossCheckMalformedError("cross-check requires one assistant item");
      }
      assistantItemId = params.itemId;
-     if (typeof params?.delta !== "string" || Buffer.byteLength(params.delta) > 64 * 1024 - textBytes) throw new Error("cross-check verdict text budget exceeded");
+     if (typeof params?.delta !== "string" || Buffer.byteLength(params.delta) > 64 * 1024 - textBytes) throw new CrossCheckMalformedError("cross-check verdict text budget exceeded");
      textBytes += Buffer.byteLength(params.delta);
      streamedText += params.delta;
     } else if (note.method === "item/completed") {
      const item = object(params?.item);
      if (item?.type === "agentMessage") {
-      if (!bound) throw new Error("cross-check foreign assistant completion");
+      if (!bound) throw new CrossCheckMalformedError("cross-check foreign assistant completion");
       if (typeof item.id !== "string" || !item.id
        || (assistantItemId !== undefined && assistantItemId !== item.id)) {
-       throw new Error("cross-check requires one assistant item");
+       throw new CrossCheckMalformedError("cross-check requires one assistant item");
       }
       assistantItemId = item.id;
       if (typeof item.text !== "string" || Buffer.byteLength(item.text) > 64 * 1024 || verdictText !== undefined) {
-       throw new Error("cross-check requires one bounded complete verdict");
+       throw new CrossCheckMalformedError("cross-check requires one bounded complete verdict");
       }
-      if (streamedText && streamedText !== item.text) throw new Error("cross-check streamed verdict disagrees with completion");
+      if (streamedText && streamedText !== item.text) throw new CrossCheckMalformedError("cross-check streamed verdict disagrees with completion");
       verdictText = item.text;
      }
     } else if (note.kind === "turn_completed") {
@@ -242,12 +245,13 @@ export class CodexCrossCheck {
      signal.throwIfAborted();
      if (transport.protocolFailure) throw transport.protocolFailure;
      succeeded = true;
-     return verdictText;
+     completedText = verdictText;
+     break;
     } else if (note.method === "turn/completed" || note.method === "item/tool/call") {
      throw new Error("cross-check malformed lifecycle frame");
     }
    }
-   throw new Error("cross-check ended without terminal turn");
+   if (!succeeded) throw new Error("cross-check ended without terminal turn");
   } finally {
    signal.removeEventListener("abort", stopAdmission);
    auth?.closeAdmissionAndCancel();
@@ -266,8 +270,10 @@ export class CodexCrossCheck {
    } finally {
     for (const secret of secrets) this.log.removeSecret(secret);
    }
-   if (!cleanupOK) throw new Error("cross-check cleanup unconfirmed");
   }
+  if (!cleanupOK) throw new Error("cross-check cleanup unconfirmed");
+  if (completedText === undefined) throw new Error("cross-check ended without terminal turn");
+  return completedText;
  }
 }
 
@@ -275,7 +281,7 @@ export class CodexCrossCheck {
 // absent here. The server repeats its validation before storing a verdict.
 function validateVerdict(text: string): void {
  let value: unknown;
- try { value = JSON.parse(text); } catch { throw new Error("cross-check invalid verdict JSON"); }
+ try { value = JSON.parse(text); } catch { throw new CrossCheckMalformedError("cross-check invalid verdict JSON"); }
  const verdict = object(value);
  const validKeys = (record: Record<string, unknown>, keys: string[]): boolean =>
   Object.keys(record).length === keys.length && keys.every((key) => Object.hasOwn(record, key));
@@ -283,7 +289,7 @@ function validateVerdict(text: string): void {
   || typeof verdict.verdict !== "string" || !["approve", "revise", "block"].includes(verdict.verdict)
   || typeof verdict.summary !== "string" || Buffer.byteLength(verdict.summary) > 4096
   || !Array.isArray(verdict.items) || verdict.items.length > 20) {
-  throw new Error("cross-check invalid verdict schema");
+  throw new CrossCheckMalformedError("cross-check invalid verdict schema");
  }
  let bytes = 0;
  for (const raw of verdict.items) {
@@ -291,11 +297,11 @@ function validateVerdict(text: string): void {
   if (!item || !validKeys(item, ["file", "severity", "summary", "rationale"])
    || typeof item.severity !== "string" || !["info", "warning", "error"].includes(item.severity)
    || !["file", "summary", "rationale"].every((key) => typeof item[key] === "string")) {
-   throw new Error("cross-check invalid finding schema");
+   throw new CrossCheckMalformedError("cross-check invalid finding schema");
   }
   const size = Buffer.byteLength(JSON.stringify(item));
   bytes += size;
-  if (size > 2048 || bytes > 32 * 1024) throw new Error("cross-check findings exceed cap");
+  if (size > 2048 || bytes > 32 * 1024) throw new CrossCheckMalformedError("cross-check findings exceed cap");
  }
 }
 

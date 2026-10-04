@@ -10,6 +10,8 @@ const fs = require("node:fs");
 const [checkout, state, sibling] = process.argv.slice(1);
 const attempt = (fn) => { try { fn(); return "allowed"; } catch (e) { return e.code; } };
 const result = {
+ devNullWrite: attempt(() => { const fd = fs.openSync("/dev/null", "w"); fs.writeSync(fd, "probe"); fs.closeSync(fd); }),
+ sharedDeviceRead: attempt(() => fs.readdirSync("/dev/shm")),
  checkoutRead: attempt(() => fs.readFileSync(checkout + "/read.txt")),
  checkoutWrite: attempt(() => fs.writeFileSync(checkout + "/write.txt", "probe")),
  systemRead: attempt(() => fs.readFileSync(process.execPath)),
@@ -33,13 +35,13 @@ console.log(JSON.stringify(result));
 `;
 
 export function assertIsolation(result) {
- for (const key of ["checkoutRead", "systemRead", "toolchainRead", "authRead", "authWrite", "configRead", "configWrite"]) {
+ for (const key of ["devNullWrite", "checkoutRead", "systemRead", "toolchainRead", "authRead", "authWrite", "configRead", "configWrite"]) {
   assert.equal(result[key], "allowed", key);
  }
  for (const dir of ["home", "codex", "codex/sessions", "xdg-config", "xdg-cache", "xdg-data", "xdg-state", "tmp"]) {
   for (const op of ["read", "write"]) assert.equal(result[dir + ":" + op], "allowed", dir + ":" + op);
  }
- for (const key of ["checkoutWrite", "systemWrite", "toolchainWrite", "siblingRead", "siblingWrite", "symlinkRead", "symlinkWrite"]) {
+ for (const key of ["sharedDeviceRead", "checkoutWrite", "systemWrite", "toolchainWrite", "siblingRead", "siblingWrite", "symlinkRead", "symlinkWrite"]) {
   assert.equal(result[key], "EACCES", key);
  }
 }
