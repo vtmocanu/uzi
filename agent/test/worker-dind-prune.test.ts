@@ -16,8 +16,9 @@ import { sleep } from "../src/util.js";
 import { nullLogger } from "./helpers.js";
 
 // issue #1759 M3: the claim-vs-prune race, driven through the REAL Worker claim loops.
-// The prune controller runs its real loop with short sleeps; the fake client counts
-// claims and can hold a claim in flight; the exec spy records, for every docker command,
+// Most cases run the prune controller's real loop with short sleeps; the held-heartbeat
+// case drives real ticks explicitly. The fake client counts claims and can hold a claim
+// in flight; the exec spy records, for every docker command,
 // whether the worker was idle at that moment. No prune argv may ever run while a run or
 // chat is active, and while the gate is held neither loop may call the claim endpoints.
 
