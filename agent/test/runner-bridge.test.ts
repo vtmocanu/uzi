@@ -655,15 +655,23 @@ describe("RunRunner — finalize ancestry bridge (PRD #1416 M3)", () => {
     const branch = "feature/rewritten-rebase";
     const P = publishBranch(branch);
     const { github } = fakeGitHub();
-    // An unknown precheck keeps conservative alignment reachable; the null diff forbids overlay.
-    // A known permitted target with a null diff instead bypasses alignment under issue #1869.
+    // Unknown precheck, then known nonempty fresh eligibility reaches alignment; null diff forbids overlay.
+    // Keep real workflow classifications before both strategy pushes.
     git.changedFiles = (async () => null) as typeof git.changedFiles;
     const realWorkflowFiles = git.branchWorkflowFiles.bind(git);
     let workflowChecks = 0;
     git.branchWorkflowFiles = (async (...args: Parameters<typeof git.branchWorkflowFiles>) => {
       workflowChecks++;
-      return workflowChecks === 1 ? null : realWorkflowFiles(...args);
+      if (workflowChecks === 1) return null;
+      if (workflowChecks === 2) return [".github/workflows/ci.yml"];
+      return realWorkflowFiles(...args);
     }) as typeof git.branchWorkflowFiles;
+    const strategies: string[] = [];
+    const realAlign = git.alignBranchWithDefault.bind(git);
+    git.alignBranchWithDefault = (async (...args: Parameters<typeof git.alignBranchWithDefault>) => {
+      strategies.push(args[4]);
+      return realAlign(...args);
+    }) as typeof git.alignBranchWithDefault;
     // Reject the FIRST push as GitHub's workflow-scope rejection, then let it through — so the merge
     // push is rejected and the rebase fallback (which rewrites P, fact 14) runs and is bridged.
     let pushCalls = 0;
@@ -683,7 +691,8 @@ describe("RunRunner — finalize ancestry bridge (PRD #1416 M3)", () => {
 
     assert.ok(statusesFor(claim.run_id).includes("completed"), "the run completed via the rebase fallback");
     assert.strictEqual(pushCalls, 2, "the first push was rejected and a second push landed");
-    assert.strictEqual(workflowChecks, 3, "unknown precheck followed by real checks before both pushes");
+    assert.deepStrictEqual(strategies, ["merge", "rebase"], "the merge rejection reached the real rebase fallback");
+    assert.strictEqual(workflowChecks, 4, "unknown precheck, nonempty fresh eligibility, then real checks before both pushes");
     assert.ok(originAncestor(P, branch), "P is an ancestor of the pushed (rebased+bridged) tip");
     assert.strictEqual(gitIn(fx.originPath, ["show", `${branch}:.github/workflows/ci.yml`]).trim(), CI_V2.trim());
   });
