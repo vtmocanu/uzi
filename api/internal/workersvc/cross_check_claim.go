@@ -46,6 +46,10 @@ func crossCheckClaimInput(cc store.CrossCheck) (*ClaimPlanCrossCheck, error) {
 }
 
 func (s *Service) assemblePlanCrossCheckInput(ctx context.Context, worker store.Worker, run store.Run, payload *ClaimPayload) error {
+	if validateCrossCheckContext(run.IssueTitle, run.IssueDescription) != nil ||
+		validateCrossCheckContext(payload.IssueTitle, payload.IssueDescription) != nil {
+		return ErrCrossCheckRefused
+	}
 	if s.txBeginner == nil || run.UserID != worker.UserID || run.Harness != string(HarnessCodex) || !run.ReportOnly ||
 		payload.Secrets.Codex == nil || payload.Secrets.AnthropicOAuthToken != "" {
 		return ErrCrossCheckRefused
@@ -64,6 +68,17 @@ func (s *Service) assemblePlanCrossCheckInput(ctx context.Context, worker store.
 	if err != nil {
 		return err
 	}
+	locked, err := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{
+		ID: run.ID, WorkerID: pgconv.UUID(worker.ID)})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrCrossCheckRefused
+	}
+	if err != nil {
+		return err
+	}
+	if validateCrossCheckContext(locked.IssueTitle, locked.IssueDescription) != nil {
+		return ErrCrossCheckRefused
+	}
 	cc, err := q.RecordPlanCrossCheckClaim(ctx, store.RecordPlanCrossCheckClaimParams{
 		ChildID: run.ID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: run.ClaimGeneration,
 		CheckerModel: pgconv.TextPtr(payload.Config.DefaultModel), CheckerEffort: pgconv.TextPtr(payload.Config.DefaultEffort)})
@@ -75,6 +90,11 @@ func (s *Service) assemblePlanCrossCheckInput(ctx context.Context, worker store.
 	}
 	input, err := crossCheckClaimInput(cc)
 	if err != nil {
+		return err
+	}
+	payload.CrossCheck = input
+	if _, err := MarshalCrossCheckClaim(payload); err != nil {
+		payload.CrossCheck = nil
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {

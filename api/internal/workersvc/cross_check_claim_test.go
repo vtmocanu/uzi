@@ -83,7 +83,9 @@ func TestPlanCrossCheckClaimInputLiveDB(t *testing.T) {
 				t.Fatalf("stale candidate accepted: %v", err)
 			}
 			env.exec(`UPDATE runs SET claim_generation=1,status='running' WHERE id=$1`, leadID)
-			env.exec(`UPDATE cross_checks SET verdict='pending',deadline_at=now()+interval '30 minutes' WHERE lead_run_id=$1`, leadID)
+			// Reset this synthetic refusal fixture after the synchronous lead-exit trigger.
+			env.exec(`UPDATE cross_checks SET verdict='pending',reason_class=NULL,decided_at=NULL,deadline_at=now()+interval '30 minutes' WHERE lead_run_id=$1`, leadID)
+			env.exec(`UPDATE runs SET status='claimed',claim_released_at=NULL WHERE id=$1`, f.runID)
 		})
 	}
 	t.Run("child generation", func(t *testing.T) {

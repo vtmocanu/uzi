@@ -981,7 +981,7 @@ func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		httpx.JSON(w, http.StatusOK, payload)
+		writeWorkerRunClaim(w, payload)
 	default:
 		httpx.Error(w, http.StatusBadRequest, "lane must be one of run, chat")
 	}

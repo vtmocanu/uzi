@@ -176,6 +176,11 @@ func resumePhaseFor(run store.Run, planApproved bool) string {
 // CLAIMING worker, not just the run, because since PRD #104 M3 the credential a
 // run spends can depend on which worker picked it up.
 func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimPayload, error) {
+	if run.Kind == runkind.CrossCheck {
+		if err := validateCrossCheckContext(run.IssueTitle, run.IssueDescription); err != nil {
+			return nil, err
+		}
+	}
 	// Judge lane (PRD #46 Decision 1): a judge run has no repo and no forge
 	// connection, so it MUST fork before GetRunClaimContext (which INNER-JOINs
 	// repos → forge_connections and would treat a repo-less judge run as vanished)
@@ -847,7 +852,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 
 	if run.Kind == runkind.CrossCheck {
 		if err := s.assemblePlanCrossCheckInput(ctx, wkr, run, payload); err != nil {
-			return nil, err
+			return nil, crossCheckAssemblyError(payload, err)
 		}
 	}
 
@@ -856,6 +861,12 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	if isolated {
 		if err := s.isolateClaim(ctx, run, payload); err != nil {
 			return nil, err
+		}
+	}
+
+	if run.Kind == runkind.CrossCheck {
+		if _, err := MarshalCrossCheckClaim(payload); err != nil {
+			return nil, crossCheckAssemblyError(payload, err)
 		}
 	}
 

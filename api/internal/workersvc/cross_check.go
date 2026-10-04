@@ -58,6 +58,20 @@ func (c PlanCrossCheckCandidate) Digest() ([]byte, error) {
 }
 
 func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64, candidate PlanCrossCheckCandidate) (store.CrossCheck, error) {
+	lead, err := s.runOwnedByWorker(ctx, leadID, worker)
+	if err != nil {
+		return store.CrossCheck{}, ErrCrossCheckRefused
+	}
+	if lead.UserID != worker.UserID || lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid {
+		return store.CrossCheck{}, ErrCrossCheckRefused
+	}
+	if lead.Harness != string(HarnessClaude) || !lead.PlanCrossCheckRequired || !lead.AutoApprove ||
+		(lead.Status != "claimed" && lead.Status != "running") {
+		return store.CrossCheck{}, ErrCrossCheckRefused
+	}
+	if err := validateCrossCheckContext(lead.IssueTitle, lead.IssueDescription); err != nil {
+		return store.CrossCheck{}, err
+	}
 	var normalizeErr error
 	candidate, normalizeErr = NormalizePlanCrossCheckCandidate(candidate)
 	if normalizeErr != nil {
@@ -83,17 +97,6 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 	if err != nil {
 		return store.CrossCheck{}, err
 	}
-	lead, err := s.runOwnedByWorker(ctx, leadID, worker)
-	if err != nil {
-		return store.CrossCheck{}, ErrCrossCheckRefused
-	}
-	if lead.UserID != worker.UserID || lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid {
-		return store.CrossCheck{}, ErrCrossCheckRefused
-	}
-	if lead.Harness != string(HarnessClaude) || !lead.PlanCrossCheckRequired || !lead.AutoApprove ||
-		(lead.Status != "claimed" && lead.Status != "running") {
-		return store.CrossCheck{}, ErrCrossCheckRefused
-	}
 	// Recover the immutable attempt before resolving checker credentials. A lost
 	// ACK does not authorize another round, even if the checker already decided.
 	if s.txBeginner == nil {
@@ -108,7 +111,8 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 	locked, err := retryQ.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: leadID, WorkerID: pgconv.UUID(worker.ID)})
 	if err != nil || locked.UserID != worker.UserID || locked.ClaimGeneration != generation || locked.ClaimReleasedAt.Valid ||
 		locked.Harness != string(HarnessClaude) || !locked.PlanCrossCheckRequired || !locked.AutoApprove ||
-		(locked.Status != "claimed" && locked.Status != "running") {
+		(locked.Status != "claimed" && locked.Status != "running") ||
+		validateCrossCheckContext(locked.IssueTitle, locked.IssueDescription) != nil {
 		return store.CrossCheck{}, ErrCrossCheckRefused
 	}
 	prior, err := retryQ.GetPlanCrossCheck(ctx, leadID)
@@ -159,7 +163,8 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 		}
 		if locked.UserID != worker.UserID || locked.ClaimGeneration != generation || locked.Harness != string(HarnessClaude) ||
 			!locked.PlanCrossCheckRequired || !locked.AutoApprove || locked.ClaimReleasedAt.Valid ||
-			(locked.Status != "claimed" && locked.Status != "running") {
+			(locked.Status != "claimed" && locked.Status != "running") ||
+			validateCrossCheckContext(locked.IssueTitle, locked.IssueDescription) != nil {
 			return store.Run{}, ErrCrossCheckRefused
 		}
 		prior, e := txq.GetPlanCrossCheck(ctx, leadID)
