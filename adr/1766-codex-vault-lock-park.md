@@ -220,7 +220,7 @@ lineage. An MR requires successful resume and fresh completion authority.
 
 ### Coordinated rollout and rollback
 
-Migration `00292_codex_refresh_recovery_cause.sql` adds a nullable, constrained account cause:
+Migration `00293_codex_refresh_recovery_cause.sql` adds a nullable, constrained account cause:
 `vault_locked` requires quarantine and populated recovery-slot metadata. Existing slots stay
 NULL without inference or backfill. PostgreSQL takes an AccessExclusive lock on
 `codex_provider_account` while validating these constraints; schedule a coordinated pause
@@ -239,7 +239,7 @@ For rollback, stop writers first, then clear only cause metadata:
 UPDATE codex_provider_account SET recovery_cause=NULL WHERE recovery_cause IS NOT NULL;
 ```
 
-Preserve the protected slot, live login, generations and intents. Optional goose Down for 00292
+Preserve the protected slot, live login, generations and intents. Optional goose Down for 00293
 drops only the cause column and its two constraints, matching the migration; it does not remove
 recovery material. Restart the rollback API only after this coordinated metadata step.
 

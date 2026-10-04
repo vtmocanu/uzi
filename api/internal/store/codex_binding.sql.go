@@ -161,7 +161,7 @@ type ClearMismatchedCodexRecoveryAndMarkIntentsRow struct {
 // and is excluded automatically (this path runs only with recovery_generation == generation).
 //
 // Owner-scoped. The recovery blob, generation, key discriminator and cause are cleared
-// together so the recovery-slot CHECKs in 00199 and 00292 stay satisfied.
+// together so the recovery-slot CHECKs in 00199 and 00293 stay satisfied.
 // Postgres evaluates the data-modifying CTEs against ONE snapshot, communicating only
 // via RETURNING, so `marked`'s (SELECT id FROM cleared) sees exactly `cleared`'s result within the
 // same statement. Returns (cleared, marked) counts: cleared == 0 means the account moved under the
