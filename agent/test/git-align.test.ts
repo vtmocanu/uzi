@@ -3,9 +3,10 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
-import { GitCache, isWorkflowScopeRejection } from "../src/git.js";
+import { GitCache, isWorkflowScopeRejection, type BoundaryProcessSpawner } from "../src/git.js";
 
 // PRD #456 M1 — the finalize base-align git helpers, exercised over REAL on-disk repos so a
 // genuine merge/rebase conflict is produced (not a stub). The fixture origin ships a real
@@ -96,7 +97,180 @@ describe("fetchDefaultTip", () => {
   });
 });
 
+describe("fetchWorkflowTargetTip", () => {
+  it("distinguishes absent and present while preserving mirrors, tags and FETCH_HEAD", async () => {
+    gitIn(fx.originPath, ["branch", "agent/published"]);
+    const bare = await git.ensureClone(fx.originPath);
+    const beforeRefs = gitIn(bare, ["for-each-ref", "refs/remotes", "refs/tags"]);
+    const fetchHead = path.join(bare, "FETCH_HEAD");
+    fs.writeFileSync(fetchHead, "fixture sentinel\n");
+    assert.deepStrictEqual(await git.fetchWorkflowTargetTip(bare, "agent/missing"), { kind: "absent" });
+    gitIn(fx.originPath, ["checkout", "agent/published"]);
+    advanceOriginMain(fx.originPath, { "target.txt": "new remote content\n" }, "remote target advances");
+    gitIn(fx.originPath, ["tag", "new-target-tag"]);
+    gitIn(fx.originPath, ["checkout", "main"]);
+    const sha = gitIn(fx.originPath, ["rev-parse", "agent/published"]);
+    assert.deepStrictEqual(await git.fetchWorkflowTargetTip(bare, "agent/published"), { kind: "present", sha });
+    assert.strictEqual(gitIn(bare, ["for-each-ref", "refs/remotes", "refs/tags"]), beforeRefs);
+    assert.strictEqual(fs.readFileSync(fetchHead, "utf8"), "fixture sentinel\n");
+    assert.strictEqual(gitIn(bare, ["for-each-ref", "refs/uzi-workflow-target"]), "");
+    assert.deepStrictEqual(await git.fetchWorkflowTargetTip(bare, "bad..branch"), { kind: "unavailable" });
+    gitIn(bare, ["config", "remote.origin.uploadpack", "false"]);
+    assert.deepStrictEqual(await git.fetchWorkflowTargetTip(bare, "agent/published"), { kind: "unavailable" });
+  });
+
+  for (const cancellation of ["hard", "soft"] as const) {
+    it(`cleans a real fetched ref before lock release after ${cancellation}-signal cancellation`, async () => {
+      gitIn(fx.originPath, ["branch", "agent/published"]);
+      const bare = await git.ensureClone(fx.originPath);
+      assert.strictEqual(gitIn(bare, ["config", "--get", "maintenance.auto"]), "false");
+      assert.strictEqual(gitIn(bare, ["config", "--get", "gc.auto"]), "0");
+      assert.ok(!fs.existsSync(path.join(bare, "reftable")), "worker bare uses files refs");
+      const hard = new AbortController();
+      const soft = new AbortController();
+      const seen: string[][] = [];
+      let tempRef = "";
+      let fetched = false;
+      let spawnsAfterAbort = 0;
+      let releaseObserved = false;
+      let cleanBeforeRelease = false;
+      const artifacts = () => [
+        path.join(bare, tempRef),
+        path.join(bare, `${tempRef}.lock`),
+        path.join(bare, "logs", tempRef),
+        path.join(bare, "logs", `${tempRef}.lock`),
+      ];
+      const spawner: BoundaryProcessSpawner = async (request) => {
+        if (hard.signal.aborted || soft.signal.aborted) {
+          spawnsAfterAbort++;
+          throw new Error("unexpected subprocess after abort");
+        }
+        seen.push([...request.argv]);
+        const output = execFileSync(request.argv[0]!, request.argv.slice(1), {
+          cwd: request.cwd, env: request.env, encoding: "utf8",
+        });
+        if (request.argv.includes("fetch")) {
+          tempRef = request.argv.at(-1)!.split(":")[1]!;
+          assert.match(tempRef, /^refs\/uzi-workflow-target\/[0-9a-f-]{36}$/);
+          assert.match(fs.readFileSync(path.join(bare, tempRef), "utf8"), /^[0-9a-f]{40}\n$/);
+          const packed = path.join(bare, "packed-refs");
+          assert.ok(!fs.existsSync(packed) || !fs.readFileSync(packed, "utf8").includes(tempRef));
+          // Model only this fresh UUID's residual files after the fetch child has settled.
+          for (const artifact of artifacts().slice(1)) {
+            fs.mkdirSync(path.dirname(artifact), { recursive: true });
+            fs.writeFileSync(artifact, "fixture residue\n");
+          }
+          fetched = true;
+          (cancellation === "hard" ? hard : soft).abort();
+        }
+        const stdin = new PassThrough();
+        const stdout = new PassThrough();
+        const stderr = new PassThrough();
+        stdout.end(output);
+        stderr.end();
+        return { stdin, stdout, stderr, completed: Promise.resolve({ code: 0 }) };
+      };
+      await assert.rejects(git.withBoundaryProcessSpawner(spawner, hard.signal,
+        () => git.fetchWorkflowTargetTip(bare, "agent/published"), {
+          softSignal: soft.signal,
+          beforeLockRelease: async (key) => {
+            releaseObserved = key === bare;
+            cleanBeforeRelease = fetched && artifacts().every((artifact) => !fs.existsSync(artifact));
+          },
+        }), (error: unknown) => error instanceof Error && error.name === "AbortError"
+          && (cancellation === "hard"
+            ? error.message.includes("boundary deadline exceeded")
+            : error.message.includes("soft deadline exceeded")));
+      assert.strictEqual(spawnsAfterAbort, 0, "no subprocess after abort");
+      assert.ok(fetched, "actual local fetch created a loose UUID ref before cancellation");
+      assert.ok(releaseObserved, "bare-lock release hook ran");
+      assert.ok(cleanBeforeRelease, "UUID ref, own locks and reflog removed before bare lock release");
+      assert.strictEqual(seen.at(-1)?.includes("fetch"), true, "fetch was the last subprocess");
+      assert.ok(artifacts().every((artifact) => !fs.existsSync(artifact)));
+    });
+  }
+
+  for (const mode of ["malformed", "fetch-failure", "resolve-failure", "abort"] as const) {
+    it(`cleans the dedicated ref and distinguishes ${mode}`, async () => {
+      const bare = await git.ensureClone(fx.originPath);
+      const seen: string[][] = [];
+      const sha = "a".repeat(40);
+      const abort = new Error("fixture cancellation");
+      abort.name = "AbortError";
+      const spawner: BoundaryProcessSpawner = async (request) => {
+        const args = request.argv;
+        seen.push([...args]);
+        let code = 0;
+        let output = "";
+        if (args.includes("ls-remote")) output = mode === "malformed"
+          ? `${sha}\trefs/heads/wrong\n` : `${sha}\trefs/heads/agent/published\n`;
+        if (args.includes("fetch")) {
+          if (mode === "abort") throw abort;
+          if (mode === "fetch-failure") code = 1;
+        }
+        if (args.includes("rev-parse")) output = mode === "resolve-failure" ? "not a SHA\n" : `${sha}\n`;
+        const stdin = new PassThrough();
+        const stdout = new PassThrough();
+        const stderr = new PassThrough();
+        stdout.end(output);
+        stderr.end();
+        return { stdin, stdout, stderr, completed: Promise.resolve({ code }) };
+      };
+      const read = () => git.withBoundaryProcessSpawner(spawner, new AbortController().signal,
+        () => git.fetchWorkflowTargetTip(bare, "agent/published"));
+      if (mode === "abort") await assert.rejects(read(), (error: unknown) => error instanceof Error && error.name === "AbortError");
+      else assert.deepStrictEqual(await read(), { kind: "unavailable" });
+      assert.ok(seen.some((args) => args.includes("update-ref") && args.includes("-d")), "cleanup attempted after failure");
+      for (const args of seen.filter((args) => args.includes("fetch"))) {
+        assert.ok(args.includes("--refmap=") && args.includes("--no-tags") && args.includes("--no-write-fetch-head"));
+      }
+      assert.strictEqual(gitIn(bare, ["for-each-ref", "refs/uzi-workflow-target"]), "");
+    });
+  }
+});
+
 describe("branchWorkflowFiles", () => {
+  it("duplicate maintainer and default workflow commits permit the published merged tip", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 1870, noProofReseed);
+    fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), "name: duplicate\n");
+    gitIn(rc.path, ["add", "."]);
+    gitIn(rc.path, [...IDENT, "commit", "-m", "maintainer workflow"]);
+    const maintainer = gitIn(rc.path, ["rev-parse", "HEAD"]);
+    advanceOriginMain(fx.originPath, { ".github/workflows/ci.yml": "name: duplicate\n" }, "independent default workflow");
+    const fresh = await git.fetchDefaultTip(bare, "main");
+    assert.notStrictEqual(maintainer, fresh);
+    gitIn(rc.path, ["fetch", fx.originPath, "main"]);
+    gitIn(rc.path, [...IDENT, "merge", "--no-ff", "-m", "merge default", fresh]);
+    const published = gitIn(rc.path, ["rev-parse", "HEAD"]);
+    gitIn(rc.path, ["push", fx.originPath, "HEAD:refs/heads/agent/issue-1870"]);
+    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-1870", "duplicate");
+    assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref, published), [], "published duplicate blob is permitted");
+  });
+
+  it("permits a per-path mixture, deletions, and flags renamed unknown paths", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 1871, noProofReseed);
+    const odd = ".github/workflows/café\nrelease.yml";
+    fs.writeFileSync(path.join(rc.path, odd), "name: target\n");
+    gitIn(rc.path, ["add", "."]);
+    gitIn(rc.path, [...IDENT, "commit", "-m", "target workflow"]);
+    const target = gitIn(rc.path, ["rev-parse", "HEAD"]);
+    advanceOriginMain(fx.originPath, { ".github/workflows/ci.yml": "name: default\n" }, "default changes");
+    const fresh = await git.fetchDefaultTip(bare, "main");
+    fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), "name: default\n");
+    gitIn(rc.path, ["add", "."]);
+    gitIn(rc.path, [...IDENT, "commit", "-m", "mix blobs"]);
+    let ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-1871", "mixed");
+    assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref, target), []);
+    gitIn(rc.path, ["rm", ".github/workflows/ci.yml"]);
+    gitIn(rc.path, ["mv", odd, ".github/workflows/renamed.yml"]);
+    gitIn(rc.path, [...IDENT, "commit", "-m", "rename and delete"]);
+    ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-1871", "renamed");
+    assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref, target), [".github/workflows/renamed.yml"]);
+    assert.strictEqual(await git.branchWorkflowFiles(bare, "f".repeat(40), ref), null);
+  });
+
   it("preserves unicode and newline workflow paths in both diff consumers", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const base = await git.fetchDefaultTip(bare, "main");
@@ -127,7 +301,7 @@ describe("branchWorkflowFiles", () => {
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, base, root), [workflow]);
   });
 
-  it("fails open when branch-only history exceeds 256 commits", async () => {
+  it("classifies tips beyond 256 commits", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const base = await git.fetchDefaultTip(bare, "main");
     const tree = gitIn(bare, ["rev-parse", `${base}^{tree}`]);
@@ -135,17 +309,17 @@ describe("branchWorkflowFiles", () => {
     for (let n = 0; n < 257; n++) {
       tip = gitIn(bare, [...IDENT, "commit-tree", tree, "-p", tip, "-m", `empty ${n}`]);
     }
-    assert.strictEqual(await git.branchWorkflowFiles(bare, base, tip), null);
+    assert.deepStrictEqual(await git.branchWorkflowFiles(bare, base, tip), []);
   });
 
-  it("fails open when one merge has more than 32 parents", async () => {
+  it("classifies tips with more than 32 parents", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const base = await git.fetchDefaultTip(bare, "main");
     const tree = gitIn(bare, ["rev-parse", `${base}^{tree}`]);
     const parents = Array.from({ length: 33 }, (_, n) =>
       gitIn(bare, [...IDENT, "commit-tree", tree, "-p", base, "-m", `parent ${n}`]));
     const merge = gitIn(bare, [...IDENT, "commit-tree", tree, ...parents.flatMap((p) => ["-p", p]), "-m", "wide merge"]);
-    assert.strictEqual(await git.branchWorkflowFiles(bare, base, merge), null);
+    assert.deepStrictEqual(await git.branchWorkflowFiles(bare, base, merge), []);
   });
 
   it("ignores a stale default mirror older than the branch base", async () => {
@@ -189,7 +363,7 @@ describe("branchWorkflowFiles", () => {
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), []);
   });
 
-  it("exempts a verified older align, but detects a later workflow edit against fresh main", async () => {
+  it("flags an unpublished older align, permits its remote blob, and flags a later edit", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const rc = await git.createOrAttachRunnerClone(bare, 1, noProofReseed);
     advanceOriginMain(fx.originPath, { ".github/workflows/ci.yml": "name: older\n" }, "older default");
@@ -200,12 +374,14 @@ describe("branchWorkflowFiles", () => {
     advanceOriginMain(fx.originPath, { ".github/workflows/ci.yml": "name: newest\n" }, "new default");
     const fresh = await git.fetchDefaultTip(bare, "main");
     let ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-1", "run-a");
-    assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), []);
+    assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), [".github/workflows/ci.yml"]);
+    const published = gitIn(rc.path, ["rev-parse", "HEAD"]);
+    assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref, published), []);
     fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), "name: agent edit\n");
     gitIn(rc.path, ["add", ".github/workflows/ci.yml"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "agent edits workflow"]);
     ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-1", "run-b");
-    assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), [".github/workflows/ci.yml"]);
+    assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref, published), [".github/workflows/ci.yml"]);
   });
 
   it("exempts a current single-parent workflow-only align", async () => {
@@ -220,7 +396,7 @@ describe("branchWorkflowFiles", () => {
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), []);
   });
 
-  it("fails open when a plausible align names a missing commit", async () => {
+  it("ignores a missing SHA in a commit subject", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const rc = await git.createOrAttachRunnerClone(bare, 106, noProofReseed);
     advanceOriginMain(fx.originPath, { ".github/workflows/ci.yml": "name: current\n" }, "default advances");
@@ -234,10 +410,10 @@ describe("branchWorkflowFiles", () => {
     gitIn(rc.path, ["add", ".github/workflows/ci.yml"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", `chore: align .github/workflows with ${missing}`]);
     const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-106", "run-missing");
-    assert.strictEqual(await git.branchWorkflowFiles(bare, fresh, ref), null);
+    assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), []);
   });
 
-  it("does not exempt a mixed align commit or a default already in its parent", async () => {
+  it("permits mixed edits matching default but flags later edits", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const rc = await git.createOrAttachRunnerClone(bare, 3, noProofReseed);
     advanceOriginMain(fx.originPath, { ".github/workflows/ci.yml": "name: aligned\n" }, "default advances");
@@ -247,9 +423,9 @@ describe("branchWorkflowFiles", () => {
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "-m", `chore: align .github/workflows with ${fresh}`]);
     let ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-3", "run-mixed");
-    assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), [".github/workflows/ci.yml"]);
+    assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), []);
 
-    // A parent that already contains the named default cannot justify a later align.
+    // A later workflow edit still differs from the allowed default blob, regardless of subject.
     gitIn(rc.path, ["fetch", fx.originPath, "main"]);
     gitIn(rc.path, ["reset", "--hard", fresh]);
     fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), "name: later edit\n");

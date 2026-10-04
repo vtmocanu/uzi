@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Permit already published GitHub workflow content ([#1869](https://github.com/vtmocanu/uzi/issues/1869)).**
+  Finalize compares workflow blobs per path against fresh default and target tips, and checks eligibility again before pushing when fresh tips are available. A workflow refusal preserves the original work for a human to land.
+
 - **Worker UID ownership regressions run in required CI ([#2134](https://github.com/vtmocanu/uzi/issues/2134)).**
   The base worker image exercises privileged creation and ownership assertions, with a source-derived check that rejects missing or skipped tests.
 - **A job's output upload no longer retries past a deadline-capped wait.**

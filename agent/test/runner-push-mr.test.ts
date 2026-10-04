@@ -672,15 +672,25 @@ describe("RunRunner — worker-performed push + MR", () => {
 // PRD #377 M1: a GitHub run whose branch touches .github/workflows/** cannot be pushed by
 // the bot's repo-only PAT (privcheck forbids the workflow scope by design). The worker
 // detects it at finalize, BEFORE the doomed push, and ends the run in a typed `failed`
-// outcome that preserves the agent's diff. Every fixture below is a SYNTHETIC in-memory
-// `changedFiles`/`workflowScopeDiff` stub — no real workflow file ever touches disk.
+// outcome that preserves the agent's diff. Workflow edits are real; patch stubs exercise redaction.
 describe("RunRunner — workflow-scope early fail (PRD #377 M1)", () => {
   /** Build a runner wired to the fake GitHub client, mirroring the github routing test. */
-  function githubRunner(github: GitHubClient): RunRunner {
+  function githubRunner(github: GitHubClient, workflow?: string): RunRunner {
     return new RunRunner(
       client,
       git,
-      () => ({ executor: new StubExecutor(nullLogger()) }),
+      () => ({ executor: workflow ? {
+        run: async (ctx) => {
+          const file = path.join(ctx.worktreePath, workflow);
+          fs.mkdirSync(path.dirname(file), { recursive: true });
+          fs.writeFileSync(file, "name: real branch workflow\n");
+          const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+          execFileSync("git", ["-C", ctx.worktreePath, "add", "--", workflow], { env });
+          execFileSync("git", ["-C", ctx.worktreePath, "-c", "user.name=t", "-c", "user.email=t@t",
+            "-c", "commit.gpgsign=false", "commit", "-m", "real workflow edit"], { env });
+          return { branch: ctx.branch };
+        },
+      } : new StubExecutor(nullLogger()) }),
       nullLogger(),
       20,
       undefined,
@@ -705,7 +715,7 @@ describe("RunRunner — workflow-scope early fail (PRD #377 M1)", () => {
     git.pushBranch = (async () => {
       pushed = true;
     }) as typeof git.pushBranch;
-    // Synthetic fixtures only — a workflow path in the changed set, and a diff string that
+    // A real workflow edit plus a synthetic patch that
     // carries the run's forge PAT so we can prove the CALLER's redactText was applied.
     const PAT = "fixture-forge-pat-000000";
     const SYNTH_DIFF =
@@ -718,7 +728,7 @@ describe("RunRunner — workflow-scope early fail (PRD #377 M1)", () => {
       SYNTH_DIFF) as typeof git.workflowScopeDiff;
 
     const claim = githubClaim(31);
-    await githubRunner(github).execute(claim);
+    await githubRunner(github, ".github/workflows/main-guard.yml").execute(claim);
 
     const statuses = api.states
       .filter((s) => s.runId === claim.run_id)
@@ -769,7 +779,7 @@ describe("RunRunner — workflow-scope early fail (PRD #377 M1)", () => {
     // NON-issue kind whose diff touches .github/workflows must fail identically. `prompt`
     // (a schedule-fired ad-hoc run) is the deterministic non-issue kind here: its finalize
     // path only composes an MR annotation, with no subprocess check-running to make the
-    // test timing-dependent. Synthetic in-memory fixtures only — no workflow file on disk.
+    // test timing-dependent. Real workflow edits on disk, with a synthetic patch for redaction.
     const { github, calls } = fakeGitHub();
     let pushed = false;
     git.pushBranch = (async () => {
@@ -786,7 +796,7 @@ describe("RunRunner — workflow-scope early fail (PRD #377 M1)", () => {
       SYNTH_DIFF) as typeof git.workflowScopeDiff;
 
     const claim = githubClaim(35, { kind: "prompt" });
-    await githubRunner(github).execute(claim);
+    await githubRunner(github, ".github/workflows/release.yml").execute(claim);
 
     const statuses = api.states
       .filter((s) => s.runId === claim.run_id)

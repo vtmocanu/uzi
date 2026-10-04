@@ -632,12 +632,12 @@ describe("RunRunner — finalize ancestry bridge (PRD #1416 M3)", () => {
     );
   });
 
-  it("(merge arm) overlay skipped (null diff) → merge-aligned+bridged tip has BOTH P and H as ancestors", async () => {
+  it("(published workflows) null diff bypasses alignment and the bridged tip has BOTH P and H as ancestors", async () => {
     commitToOriginMain({ ".github/workflows/ci.yml": CI_V1 }, "seed workflows");
     const branch = "feature/rewritten-merge";
     const P = publishBranch(branch);
     const { github } = fakeGitHub();
-    // A null diff (D6 fail-open) makes canOverlay false → the merge fallback aligns.
+    // A null diff cannot prove alignment safe; preserve the permitted published workflow.
     git.changedFiles = (async () => null) as typeof git.changedFiles;
     const obs: { H?: string } = {};
     const claim = githubTaskClaim(branch, { open_mr: false });
@@ -645,7 +645,9 @@ describe("RunRunner — finalize ancestry bridge (PRD #1416 M3)", () => {
 
     assert.ok(statusesFor(claim.run_id).includes("completed"), "the run completed");
     assert.ok(originAncestor(P, branch), "P is an ancestor of the pushed tip");
-    assert.ok(obs.H && originAncestor(obs.H, branch), "H is an ancestor of the pushed tip (merge preserved it)");
+    assert.ok(obs.H && originAncestor(obs.H, branch), "H is an ancestor of the pushed tip (bridge preserved it)");
+    assert.strictEqual(gitIn(fx.originPath, ["show", `${branch}:.github/workflows/ci.yml`]).trim(), CI_V1.trim(),
+      "the permitted published workflow is preserved when the diff is unavailable");
   });
 
   it("(rebase fallback) merge push rejected for workflow scope → rebase → bridged + pushed with P an ancestor", async () => {
@@ -653,8 +655,15 @@ describe("RunRunner — finalize ancestry bridge (PRD #1416 M3)", () => {
     const branch = "feature/rewritten-rebase";
     const P = publishBranch(branch);
     const { github } = fakeGitHub();
-    // null diff → overlay skipped → merge→rebase fallback chain.
+    // An unknown precheck keeps conservative alignment reachable; the null diff forbids overlay.
+    // A known permitted target with a null diff instead bypasses alignment under issue #1869.
     git.changedFiles = (async () => null) as typeof git.changedFiles;
+    const realWorkflowFiles = git.branchWorkflowFiles.bind(git);
+    let workflowChecks = 0;
+    git.branchWorkflowFiles = (async (...args: Parameters<typeof git.branchWorkflowFiles>) => {
+      workflowChecks++;
+      return workflowChecks === 1 ? null : realWorkflowFiles(...args);
+    }) as typeof git.branchWorkflowFiles;
     // Reject the FIRST push as GitHub's workflow-scope rejection, then let it through — so the merge
     // push is rejected and the rebase fallback (which rewrites P, fact 14) runs and is bridged.
     let pushCalls = 0;
@@ -673,8 +682,10 @@ describe("RunRunner — finalize ancestry bridge (PRD #1416 M3)", () => {
     await githubRunner(github, rewritingExecutor(obs, { ".github/workflows/ci.yml": CI_V2 })).execute(claim);
 
     assert.ok(statusesFor(claim.run_id).includes("completed"), "the run completed via the rebase fallback");
-    assert.ok(pushCalls >= 2, "the first push was rejected and a second push landed");
+    assert.strictEqual(pushCalls, 2, "the first push was rejected and a second push landed");
+    assert.strictEqual(workflowChecks, 3, "unknown precheck followed by real checks before both pushes");
     assert.ok(originAncestor(P, branch), "P is an ancestor of the pushed (rebased+bridged) tip");
+    assert.strictEqual(gitIn(fx.originPath, ["show", `${branch}:.github/workflows/ci.yml`]).trim(), CI_V2.trim());
   });
 
   it("(no rewrite) a clean fast-forward branch is NOT bridged and completes as today", async () => {

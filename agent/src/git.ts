@@ -4912,70 +4912,80 @@ export class GitCache {
     }
   }
 
-  /** Workflow paths touched by branch-only commits, excluding verified subtree align commits. */
+  /** Pushed workflow blobs must match the fresh default or the current remote target, per path. */
   async branchWorkflowFiles(
     barePath: string,
     freshDefaultTip: string,
     trackingRef: string,
+    targetTip?: string,
   ): Promise<string[] | null> {
     try {
-      if (!/^[0-9a-f]{40}$/.test(freshDefaultTip)) return null;
-      // Cap branch-only history at 256 commits; the extra commit detects truncation.
-      // Exceeding the cap returns null so the caller fails open rather than guessing.
-      const commits = (await this.runGit(barePath, [
-        "rev-list", "--max-count=257", trackingRef, `^${freshDefaultTip}`,
-      ])).trim().split("\n").filter(Boolean);
-      if (commits.length > 256) return null;
-      const paths = new Set<string>();
-      // A single octopus merge can have many parents even when the branch has few commits.
-      const maxParents = 32;
-      for (const commit of commits) {
-        const parts = (await this.runGit(barePath, ["rev-list", "--parents", "-n", "1", commit]))
-          .trim().split(" ");
-        const parents = parts.slice(1);
-        if (parents.length > maxParents) return null;
-        // A merge owns a workflow resolution only when its result differs from
-        // every parent. A clean merge merely carries one parent's workflow tree.
-        const comparisons = parents.length ? parents : ["--root"];
-        let touched: Set<string> | undefined;
-        for (const parent of comparisons) {
-          const args = parent === "--root"
-            ? ["diff-tree", "--root", "--no-commit-id", "--no-renames", "--name-only", "-z", "-r", commit]
-            : ["diff", "--no-renames", "--name-only", "-z", parent, commit];
-          const out = await this.runGit(barePath, args);
-          const changed = new Set(out.split("\0").filter((file) => file.startsWith(".github/workflows/")));
-          touched = touched === undefined ? changed : new Set([...touched].filter((file) => changed.has(file)));
+      if (!SHA40_RE.test(freshDefaultTip) || (targetTip !== undefined && !SHA40_RE.test(targetTip))) return null;
+      const blobs = async (tip: string): Promise<Map<string, string>> => {
+        const out = await this.runGit(barePath, ["ls-tree", "-r", "-z", tip, "--", ".github/workflows/"]);
+        const entries = new Map<string, string>();
+        for (const entry of out.split("\0")) {
+          if (!entry) continue;
+          const match = /^\d{6} blob ([0-9a-f]{40})\t([\s\S]+)$/.exec(entry);
+          if (!match) throw new Error("unexpected workflow tree entry");
+          entries.set(match[2]!, match[1]!);
         }
-        if (!touched || touched.size === 0) continue;
-        let align = false;
-        if (parents.length === 1) {
-          const subject = (await this.runGit(barePath, ["log", "-1", "--format=%s", commit])).trim();
-          const match = /^chore: align \.github\/workflows with ([0-9a-f]{40})$/.exec(subject);
-          const named = match?.[1];
-          const parent = parents[0];
-          if (named && parent) {
-            const changed = (await this.runGit(barePath, ["diff", "--no-renames", "--name-only", "-z", parent, commit]))
-              .split("\0").filter(Boolean);
-            const freshAncestry = await this.tryGitExit(barePath, ["merge-base", "--is-ancestor", named, freshDefaultTip]);
-            const parentAncestry = await this.tryGitExit(barePath, ["merge-base", "--is-ancestor", named, parent]);
-            if ((freshAncestry !== 0 && freshAncestry !== 1) ||
-                (parentAncestry !== 0 && parentAncestry !== 1)) return null;
-            const inFreshHistory = freshAncestry === 0;
-            const inParentHistory = parentAncestry === 0;
-            // ls-tree succeeds with empty output when the default deleted the entire
-            // workflow directory; a matching deletion is a valid align.
-            const commitTree = await this.runGit(barePath, ["ls-tree", commit, "--", ".github/workflows"]);
-            const namedTree = await this.runGit(barePath, ["ls-tree", named, "--", ".github/workflows"]);
-            const treesEqual = commitTree === namedTree;
-            align = changed.length > 0 && changed.every((file) => file.startsWith(".github/workflows/")) &&
-              inFreshHistory && !inParentHistory && treesEqual;
-          }
-        }
-        if (!align) for (const file of touched) paths.add(file);
-      }
-      return [...paths].sort();
-    } catch {
+        return entries;
+      };
+      const pushed = await blobs(trackingRef);
+      const defaults = await blobs(freshDefaultTip);
+      const target = targetTip === undefined ? new Map<string, string>() : await blobs(targetTip);
+      return [...pushed].filter(([file, oid]) => defaults.get(file) !== oid && target.get(file) !== oid)
+        .map(([file]) => file).sort();
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
       return null;
+    }
+  }
+
+  /** Read a fresh target without changing claim mirrors, tags or FETCH_HEAD. */
+  async fetchWorkflowTargetTip(
+    barePath: string, branch: string, pat?: string, repoUrl?: string, username?: string,
+  ): Promise<{ kind: "present"; sha: string } | { kind: "absent" } | { kind: "unavailable" }> {
+    const scope = repoUrl ? httpScopeForUrl(repoUrl) : undefined;
+    try {
+      return await this.withLock(barePath, async () => {
+        const tempRef = `refs/uzi-workflow-target/${randomUUID()}`;
+        try {
+          if (!(await this.isPlainBranchName(barePath, branch))) return { kind: "unavailable" } as const;
+          const remoteRef = `refs/heads/${branch}`;
+          const listed = await this.runGit(barePath, ["ls-remote", "origin", remoteRef], pat, scope, username);
+          if (listed === "") return { kind: "absent" } as const;
+          const match = /^([0-9a-f]{40})\t([^\n]+)\n?$/.exec(listed);
+          if (!match || match[2] !== remoteRef) return { kind: "unavailable" } as const;
+          await this.runGit(barePath, ["fetch", "--refmap=", "--no-tags", "--no-write-fetch-head",
+            "origin", `+${remoteRef}:${tempRef}`], pat, scope, username);
+          const sha = await this.resolveCommitStrict(barePath, tempRef);
+          return sha === match[1] ? { kind: "present", sha } as const : { kind: "unavailable" } as const;
+        } catch (cause) {
+          const abort = this.boundaryAbortError(cause);
+          if (abort) throw abort;
+          return { kind: "unavailable" } as const;
+        } finally {
+          await this.runGit(barePath, ["update-ref", "-d", tempRef]).catch(async (cause: unknown) => {
+            if (!(cause instanceof GitBoundaryAbortError || cause instanceof CheckpointSoftDeadlineError)) throw cause;
+            // execScoped has settled every child before reporting abort. The worker-owned
+            // files-ref bare has auto-maintenance disabled by gitEnv/disableAutoMaintenance,
+            // and withLock still excludes other bare mutations: this fresh UUID stays loose.
+            // Attempt exactly these four files, concurrently; no sibling is skipped on failure.
+            await Promise.allSettled([
+              tempRef, `${tempRef}.lock`, `logs/${tempRef}`, `logs/${tempRef}.lock`,
+            ].map((refFile) => fs.rm(path.join(barePath, refFile), { force: true })));
+            // A cleanup I/O failure must not turn cancellation into an unavailable snapshot.
+            throw cause;
+          });
+        }
+      });
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return { kind: "unavailable" };
     }
   }
 
@@ -5879,8 +5889,8 @@ export class GitCache {
    * three-dot — we want "do these two trees' workflow files differ right now", not "what did
    * the branch change since a merge base". `--name-only` correctly sidesteps the pinned
    * `diff.external` code-exec neutralizer (see GIT_CODE_EXEC_KEY_PINS / `changedFiles`), so no
-   * `--no-ext-diff` is needed. On ANY error this returns false (FAIL-OPEN to the normal push):
-   * a run must never be blocked on an inability to compute this.
+   * `--no-ext-diff` is needed. Ordinary errors return false (FAIL-OPEN to the normal push);
+   * boundary cancellation and deadlines propagate.
    */
   async workflowTreeDiffers(
     barePath: string,
@@ -5897,7 +5907,9 @@ export class GitCache {
         ".github/workflows/",
       ]);
       return out.trim() !== "";
-    } catch {
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
       return false;
     }
   }
