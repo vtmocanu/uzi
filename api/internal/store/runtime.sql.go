@@ -4419,22 +4419,13 @@ WITH candidates AS MATERIALIZED (
 ), parent_lock_set AS MATERIALIZED (
     -- Consume every selected parent lock before taking a checker lock.
     SELECT array_agg(id) AS ids FROM locked_parents
-), eligible_candidates AS MATERIALIZED (
-    SELECT DISTINCT mapping.run_id
-    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
-    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
-      -- The lead-exit trigger owns cancellation of a same-batch checker.
-      AND NOT EXISTS (
-          SELECT 1 FROM cross_checks cc
-          JOIN candidates exiting ON exiting.id = cc.lead_run_id
-          WHERE cc.checker_run_id = mapping.run_id
-            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
-            AND EXISTS (
-                SELECT 1 FROM locked_parents runs
-                WHERE runs.id = exiting.id
-                  AND runs.status IN ('claimed', 'running')
-                  AND runs.claim_released_at IS NULL
-                  AND (runs.worker_id = $2
+), locked_targets AS MATERIALIZED (
+    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM runs
+    JOIN parent_mapping mapping ON mapping.run_id = runs.id
+    CROSS JOIN parent_lock_set locks
+    WHERE runs.id IN (SELECT id FROM candidates)
+      AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      AND runs.worker_id = $2
   AND runs.claim_released_at IS NULL
   AND runs.status = 'running'
   AND runs.kind <> 'chat'
@@ -4444,9 +4435,45 @@ WITH candidates AS MATERIALIZED (
                   WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                     AND a.terminal_pending_until > now()
                     AND a.claim_generation = runs.claim_generation)
-  AND requeue_count >= $5
-  AND NOT ($5 > 0 AND finalize_resume_generation IS NULL))
-            )
+  AND runs.requeue_count >= $5
+  AND NOT ($5 > 0 AND runs.finalize_resume_generation IS NULL)
+
+    ORDER BY runs.id
+    FOR UPDATE OF runs
+), target_lock_set AS MATERIALIZED (
+    SELECT array_agg(id) AS ids FROM locked_targets
+), final_targets AS MATERIALIZED (
+    -- Recheck the refreshed locked rows, not initial candidate membership.
+    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM locked_targets runs CROSS JOIN target_lock_set locks
+    WHERE runs.id = ANY(locks.ids)
+      AND runs.worker_id = $2
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind <> 'chat'
+  AND runs.id = ANY($3::uuid[])
+  AND runs.claim_generation = ($4::bigint[])[array_position($3::uuid[], runs.id)]
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                    AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND runs.requeue_count >= $5
+  AND NOT ($5 > 0 AND runs.finalize_resume_generation IS NULL)
+
+), eligible_parent_exits AS MATERIALIZED (
+    -- Shared by parent writes and suppression; 00296 owns cancellation only
+    -- for an unreleased active lead with a pending plan round-one check.
+    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
+), eligible_candidates AS MATERIALIZED (
+    SELECT target.id AS run_id FROM final_targets target
+    WHERE (target.kind = 'cross_check'
+           OR target.id IN (SELECT id FROM eligible_parent_exits))
+      AND NOT EXISTS (
+          SELECT 1 FROM cross_checks cc
+          JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
+          WHERE cc.checker_run_id = target.id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND exiting.status IN ('claimed', 'running')
+            AND exiting.claim_released_at IS NULL
       )
 )
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
@@ -4727,22 +4754,13 @@ WITH candidates AS MATERIALIZED (
 ), parent_lock_set AS MATERIALIZED (
     -- Consume every selected parent lock before taking a checker lock.
     SELECT array_agg(id) AS ids FROM locked_parents
-), eligible_candidates AS MATERIALIZED (
-    SELECT DISTINCT mapping.run_id
-    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
-    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
-      -- The lead-exit trigger owns cancellation of a same-batch checker.
-      AND NOT EXISTS (
-          SELECT 1 FROM cross_checks cc
-          JOIN candidates exiting ON exiting.id = cc.lead_run_id
-          WHERE cc.checker_run_id = mapping.run_id
-            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
-            AND EXISTS (
-                SELECT 1 FROM locked_parents runs
-                WHERE runs.id = exiting.id
-                  AND runs.status IN ('claimed', 'running')
-                  AND runs.claim_released_at IS NULL
-                  AND (runs.worker_id = $2
+), locked_targets AS MATERIALIZED (
+    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM runs
+    JOIN parent_mapping mapping ON mapping.run_id = runs.id
+    CROSS JOIN parent_lock_set locks
+    WHERE runs.id IN (SELECT id FROM candidates)
+      AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      AND runs.worker_id = $2
   AND runs.kind <> 'chat'
   AND runs.status = 'running'
   AND runs.claim_released_at IS NULL
@@ -4766,8 +4784,57 @@ WITH candidates AS MATERIALIZED (
                     AND a.terminal_pending AND a.terminal_pending_until > now()
                     AND a.claim_generation = runs.claim_generation)
   AND NOT EXISTS (SELECT 1 FROM workers w
-                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now()))
-            )
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+
+    ORDER BY runs.id
+    FOR UPDATE OF runs
+), target_lock_set AS MATERIALIZED (
+    SELECT array_agg(id) AS ids FROM locked_targets
+), final_targets AS MATERIALIZED (
+    -- Recheck the refreshed locked rows, not initial candidate membership.
+    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM locked_targets runs CROSS JOIN target_lock_set locks
+    WHERE runs.id = ANY(locks.ids)
+      AND runs.worker_id = $2
+  AND runs.kind <> 'chat'
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL
+  AND runs.status_since < $3
+  AND runs.requeue_count >= $4
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < ($5::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, $6::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds
+                            + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                (LEAST($5::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = $2 AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+
+), eligible_parent_exits AS MATERIALIZED (
+    -- Shared by parent writes and suppression; 00296 owns cancellation only
+    -- for an unreleased active lead with a pending plan round-one check.
+    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
+), eligible_candidates AS MATERIALIZED (
+    SELECT target.id AS run_id FROM final_targets target
+    WHERE (target.kind = 'cross_check'
+           OR target.id IN (SELECT id FROM eligible_parent_exits))
+      AND NOT EXISTS (
+          SELECT 1 FROM cross_checks cc
+          JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
+          WHERE cc.checker_run_id = target.id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND exiting.status IN ('claimed', 'running')
+            AND exiting.claim_released_at IS NULL
       )
 )
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
@@ -4893,26 +4960,57 @@ WITH locked AS (
 ), parent_lock_set AS MATERIALIZED (
     -- Collect the actual locked IDs completely before any checker can be mutated.
     SELECT array_agg(id) AS ids FROM locked_parents
+), locked_targets AS MATERIALIZED (
+    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM runs
+    JOIN parent_mapping mapping ON mapping.run_id = runs.id
+    CROSS JOIN parent_lock_set locks
+    WHERE runs.id IN (SELECT id FROM candidates)
+      AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+      AND runs.requeue_count >= $2
+      AND runs.worker_id IN (SELECT id FROM locked)
+      AND (runs.kind = 'chat'
+           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                             AND a.terminal_pending_until > now()
+                             AND a.claim_generation = runs.claim_generation)
+               AND NOT EXISTS (SELECT 1 FROM workers w
+                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+
+    ORDER BY runs.id
+    FOR UPDATE OF runs
+), target_lock_set AS MATERIALIZED (
+    SELECT array_agg(id) AS ids FROM locked_targets
+), final_targets AS MATERIALIZED (
+    -- Recheck the refreshed locked rows, not initial candidate membership.
+    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM locked_targets runs CROSS JOIN target_lock_set locks
+    WHERE runs.id = ANY(locks.ids)
+      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+      AND runs.requeue_count >= $2
+      AND runs.worker_id IN (SELECT id FROM locked)
+      AND (runs.kind = 'chat'
+           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                             AND a.terminal_pending_until > now()
+                             AND a.claim_generation = runs.claim_generation)
+               AND NOT EXISTS (SELECT 1 FROM workers w
+                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+
+), eligible_parent_exits AS MATERIALIZED (
+    -- Shared by parent writes and suppression; 00296 owns cancellation only
+    -- for an unreleased active lead with a pending plan round-one check.
+    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
-    SELECT DISTINCT mapping.run_id
-    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
-    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
-      -- A same-batch lead exit owns its checker cancellation through the trigger.
+    SELECT target.id AS run_id FROM final_targets target
+    WHERE (target.kind = 'cross_check'
+           OR target.id IN (SELECT id FROM eligible_parent_exits))
       AND NOT EXISTS (
           SELECT 1 FROM cross_checks cc
-          JOIN candidates exiting ON exiting.id = cc.lead_run_id
-          JOIN locked_parents lead ON lead.id = exiting.id
-          WHERE cc.checker_run_id = mapping.run_id
-            AND lead.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-              AND lead.requeue_count >= $2
-              AND lead.worker_id IN (SELECT id FROM locked)
-              AND (lead.kind = 'chat'
-                     OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                                     WHERE a.run_id = lead.id AND a.worker_id = lead.worker_id AND a.terminal_pending
-                                       AND a.terminal_pending_until > now()
-                                       AND a.claim_generation = lead.claim_generation)
-                         AND NOT EXISTS (SELECT 1 FROM workers w
-                                         WHERE w.id = lead.worker_id AND w.pending_overflow_until > now())))
+          JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
+          WHERE cc.checker_run_id = target.id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND exiting.status IN ('claimed', 'running')
+            AND exiting.claim_released_at IS NULL
       )
 )
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
@@ -5028,26 +5126,57 @@ WITH candidates AS MATERIALIZED (
 ), parent_lock_set AS MATERIALIZED (
     -- Collect the actual locked IDs completely before any checker can be mutated.
     SELECT array_agg(id) AS ids FROM locked_parents
+), locked_targets AS MATERIALIZED (
+    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM runs
+    JOIN parent_mapping mapping ON mapping.run_id = runs.id
+    CROSS JOIN parent_lock_set locks
+    WHERE runs.id IN (SELECT id FROM candidates)
+      AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      AND runs.worker_id = $2
+      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+      AND runs.requeue_count >= $3
+      AND (runs.kind = 'chat'
+           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                             AND a.terminal_pending_until > now()
+                             AND a.claim_generation = runs.claim_generation)
+               AND NOT EXISTS (SELECT 1 FROM workers w
+                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+
+    ORDER BY runs.id
+    FOR UPDATE OF runs
+), target_lock_set AS MATERIALIZED (
+    SELECT array_agg(id) AS ids FROM locked_targets
+), final_targets AS MATERIALIZED (
+    -- Recheck the refreshed locked rows, not initial candidate membership.
+    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM locked_targets runs CROSS JOIN target_lock_set locks
+    WHERE runs.id = ANY(locks.ids)
+      AND runs.worker_id = $2
+      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+      AND runs.requeue_count >= $3
+      AND (runs.kind = 'chat'
+           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                             AND a.terminal_pending_until > now()
+                             AND a.claim_generation = runs.claim_generation)
+               AND NOT EXISTS (SELECT 1 FROM workers w
+                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+
+), eligible_parent_exits AS MATERIALIZED (
+    -- Shared by parent writes and suppression; 00296 owns cancellation only
+    -- for an unreleased active lead with a pending plan round-one check.
+    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
-    SELECT DISTINCT mapping.run_id
-    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
-    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
-      -- A same-batch lead exit owns its checker cancellation through the trigger.
+    SELECT target.id AS run_id FROM final_targets target
+    WHERE (target.kind = 'cross_check'
+           OR target.id IN (SELECT id FROM eligible_parent_exits))
       AND NOT EXISTS (
           SELECT 1 FROM cross_checks cc
-          JOIN candidates exiting ON exiting.id = cc.lead_run_id
-          JOIN locked_parents lead ON lead.id = exiting.id
-          WHERE cc.checker_run_id = mapping.run_id
-            AND lead.worker_id = $2
-              AND lead.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-              AND lead.requeue_count >= $3
-              AND (lead.kind = 'chat'
-                     OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                                     WHERE a.run_id = lead.id AND a.worker_id = lead.worker_id AND a.terminal_pending
-                                       AND a.terminal_pending_until > now()
-                                       AND a.claim_generation = lead.claim_generation)
-                         AND NOT EXISTS (SELECT 1 FROM workers w
-                                         WHERE w.id = lead.worker_id AND w.pending_overflow_until > now())))
+          JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
+          WHERE cc.checker_run_id = target.id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND exiting.status IN ('claimed', 'running')
+            AND exiting.claim_released_at IS NULL
       )
 )
 UPDATE runs SET plan_cross_check_gate_reason = NULL,

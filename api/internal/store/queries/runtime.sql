@@ -5541,26 +5541,57 @@ WITH locked AS (
 ), parent_lock_set AS MATERIALIZED (
     -- Collect the actual locked IDs completely before any checker can be mutated.
     SELECT array_agg(id) AS ids FROM locked_parents
+), locked_targets AS MATERIALIZED (
+    SELECT runs.* FROM runs
+    JOIN parent_mapping mapping ON mapping.run_id = runs.id
+    CROSS JOIN parent_lock_set locks
+    WHERE runs.id IN (SELECT id FROM candidates)
+      AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+      AND runs.requeue_count >= @max_requeues
+      AND runs.worker_id IN (SELECT id FROM locked)
+      AND (runs.kind = 'chat'
+           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                             AND a.terminal_pending_until > now()
+                             AND a.claim_generation = runs.claim_generation)
+               AND NOT EXISTS (SELECT 1 FROM workers w
+                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+
+    ORDER BY runs.id
+    FOR UPDATE OF runs
+), target_lock_set AS MATERIALIZED (
+    SELECT array_agg(id) AS ids FROM locked_targets
+), final_targets AS MATERIALIZED (
+    -- Recheck the refreshed locked rows, not initial candidate membership.
+    SELECT runs.* FROM locked_targets runs CROSS JOIN target_lock_set locks
+    WHERE runs.id = ANY(locks.ids)
+      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+      AND runs.requeue_count >= @max_requeues
+      AND runs.worker_id IN (SELECT id FROM locked)
+      AND (runs.kind = 'chat'
+           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                             AND a.terminal_pending_until > now()
+                             AND a.claim_generation = runs.claim_generation)
+               AND NOT EXISTS (SELECT 1 FROM workers w
+                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+
+), eligible_parent_exits AS MATERIALIZED (
+    -- Shared by parent writes and suppression; 00296 owns cancellation only
+    -- for an unreleased active lead with a pending plan round-one check.
+    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
-    SELECT DISTINCT mapping.run_id
-    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
-    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
-      -- A same-batch lead exit owns its checker cancellation through the trigger.
+    SELECT target.id AS run_id FROM final_targets target
+    WHERE (target.kind = 'cross_check'
+           OR target.id IN (SELECT id FROM eligible_parent_exits))
       AND NOT EXISTS (
           SELECT 1 FROM cross_checks cc
-          JOIN candidates exiting ON exiting.id = cc.lead_run_id
-          JOIN locked_parents lead ON lead.id = exiting.id
-          WHERE cc.checker_run_id = mapping.run_id
-            AND lead.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-              AND lead.requeue_count >= @max_requeues
-              AND lead.worker_id IN (SELECT id FROM locked)
-              AND (lead.kind = 'chat'
-                     OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                                     WHERE a.run_id = lead.id AND a.worker_id = lead.worker_id AND a.terminal_pending
-                                       AND a.terminal_pending_until > now()
-                                       AND a.claim_generation = lead.claim_generation)
-                         AND NOT EXISTS (SELECT 1 FROM workers w
-                                         WHERE w.id = lead.worker_id AND w.pending_overflow_until > now())))
+          JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
+          WHERE cc.checker_run_id = target.id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND exiting.status IN ('claimed', 'running')
+            AND exiting.claim_released_at IS NULL
       )
 )
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
@@ -5752,26 +5783,57 @@ WITH candidates AS MATERIALIZED (
 ), parent_lock_set AS MATERIALIZED (
     -- Collect the actual locked IDs completely before any checker can be mutated.
     SELECT array_agg(id) AS ids FROM locked_parents
+), locked_targets AS MATERIALIZED (
+    SELECT runs.* FROM runs
+    JOIN parent_mapping mapping ON mapping.run_id = runs.id
+    CROSS JOIN parent_lock_set locks
+    WHERE runs.id IN (SELECT id FROM candidates)
+      AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      AND runs.worker_id = @worker_id
+      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+      AND runs.requeue_count >= @max_requeues
+      AND (runs.kind = 'chat'
+           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                             AND a.terminal_pending_until > now()
+                             AND a.claim_generation = runs.claim_generation)
+               AND NOT EXISTS (SELECT 1 FROM workers w
+                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+
+    ORDER BY runs.id
+    FOR UPDATE OF runs
+), target_lock_set AS MATERIALIZED (
+    SELECT array_agg(id) AS ids FROM locked_targets
+), final_targets AS MATERIALIZED (
+    -- Recheck the refreshed locked rows, not initial candidate membership.
+    SELECT runs.* FROM locked_targets runs CROSS JOIN target_lock_set locks
+    WHERE runs.id = ANY(locks.ids)
+      AND runs.worker_id = @worker_id
+      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+      AND runs.requeue_count >= @max_requeues
+      AND (runs.kind = 'chat'
+           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                             AND a.terminal_pending_until > now()
+                             AND a.claim_generation = runs.claim_generation)
+               AND NOT EXISTS (SELECT 1 FROM workers w
+                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+
+), eligible_parent_exits AS MATERIALIZED (
+    -- Shared by parent writes and suppression; 00296 owns cancellation only
+    -- for an unreleased active lead with a pending plan round-one check.
+    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
-    SELECT DISTINCT mapping.run_id
-    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
-    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
-      -- A same-batch lead exit owns its checker cancellation through the trigger.
+    SELECT target.id AS run_id FROM final_targets target
+    WHERE (target.kind = 'cross_check'
+           OR target.id IN (SELECT id FROM eligible_parent_exits))
       AND NOT EXISTS (
           SELECT 1 FROM cross_checks cc
-          JOIN candidates exiting ON exiting.id = cc.lead_run_id
-          JOIN locked_parents lead ON lead.id = exiting.id
-          WHERE cc.checker_run_id = mapping.run_id
-            AND lead.worker_id = @worker_id
-              AND lead.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-              AND lead.requeue_count >= @max_requeues
-              AND (lead.kind = 'chat'
-                     OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                                     WHERE a.run_id = lead.id AND a.worker_id = lead.worker_id AND a.terminal_pending
-                                       AND a.terminal_pending_until > now()
-                                       AND a.claim_generation = lead.claim_generation)
-                         AND NOT EXISTS (SELECT 1 FROM workers w
-                                         WHERE w.id = lead.worker_id AND w.pending_overflow_until > now())))
+          JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
+          WHERE cc.checker_run_id = target.id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND exiting.status IN ('claimed', 'running')
+            AND exiting.claim_released_at IS NULL
       )
 )
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
@@ -5968,22 +6030,13 @@ WITH candidates AS MATERIALIZED (
 ), parent_lock_set AS MATERIALIZED (
     -- Consume every selected parent lock before taking a checker lock.
     SELECT array_agg(id) AS ids FROM locked_parents
-), eligible_candidates AS MATERIALIZED (
-    SELECT DISTINCT mapping.run_id
-    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
-    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
-      -- The lead-exit trigger owns cancellation of a same-batch checker.
-      AND NOT EXISTS (
-          SELECT 1 FROM cross_checks cc
-          JOIN candidates exiting ON exiting.id = cc.lead_run_id
-          WHERE cc.checker_run_id = mapping.run_id
-            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
-            AND EXISTS (
-                SELECT 1 FROM locked_parents runs
-                WHERE runs.id = exiting.id
-                  AND runs.status IN ('claimed', 'running')
-                  AND runs.claim_released_at IS NULL
-                  AND (runs.worker_id = @worker_id
+), locked_targets AS MATERIALIZED (
+    SELECT runs.* FROM runs
+    JOIN parent_mapping mapping ON mapping.run_id = runs.id
+    CROSS JOIN parent_lock_set locks
+    WHERE runs.id IN (SELECT id FROM candidates)
+      AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      AND runs.worker_id = @worker_id
   AND runs.claim_released_at IS NULL
   AND runs.status = 'running'
   AND runs.kind <> 'chat'
@@ -5993,9 +6046,45 @@ WITH candidates AS MATERIALIZED (
                   WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                     AND a.terminal_pending_until > now()
                     AND a.claim_generation = runs.claim_generation)
-  AND requeue_count >= @max_requeues
-  AND NOT (@max_requeues > 0 AND finalize_resume_generation IS NULL))
-            )
+  AND runs.requeue_count >= @max_requeues
+  AND NOT (@max_requeues > 0 AND runs.finalize_resume_generation IS NULL)
+
+    ORDER BY runs.id
+    FOR UPDATE OF runs
+), target_lock_set AS MATERIALIZED (
+    SELECT array_agg(id) AS ids FROM locked_targets
+), final_targets AS MATERIALIZED (
+    -- Recheck the refreshed locked rows, not initial candidate membership.
+    SELECT runs.* FROM locked_targets runs CROSS JOIN target_lock_set locks
+    WHERE runs.id = ANY(locks.ids)
+      AND runs.worker_id = @worker_id
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind <> 'chat'
+  AND runs.id = ANY(@run_ids::uuid[])
+  AND runs.claim_generation = (@claim_generations::bigint[])[array_position(@run_ids::uuid[], runs.id)]
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                    AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND runs.requeue_count >= @max_requeues
+  AND NOT (@max_requeues > 0 AND runs.finalize_resume_generation IS NULL)
+
+), eligible_parent_exits AS MATERIALIZED (
+    -- Shared by parent writes and suppression; 00296 owns cancellation only
+    -- for an unreleased active lead with a pending plan round-one check.
+    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
+), eligible_candidates AS MATERIALIZED (
+    SELECT target.id AS run_id FROM final_targets target
+    WHERE (target.kind = 'cross_check'
+           OR target.id IN (SELECT id FROM eligible_parent_exits))
+      AND NOT EXISTS (
+          SELECT 1 FROM cross_checks cc
+          JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
+          WHERE cc.checker_run_id = target.id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND exiting.status IN ('claimed', 'running')
+            AND exiting.claim_released_at IS NULL
       )
 )
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
@@ -6410,22 +6499,13 @@ WITH candidates AS MATERIALIZED (
 ), parent_lock_set AS MATERIALIZED (
     -- Consume every selected parent lock before taking a checker lock.
     SELECT array_agg(id) AS ids FROM locked_parents
-), eligible_candidates AS MATERIALIZED (
-    SELECT DISTINCT mapping.run_id
-    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
-    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
-      -- The lead-exit trigger owns cancellation of a same-batch checker.
-      AND NOT EXISTS (
-          SELECT 1 FROM cross_checks cc
-          JOIN candidates exiting ON exiting.id = cc.lead_run_id
-          WHERE cc.checker_run_id = mapping.run_id
-            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
-            AND EXISTS (
-                SELECT 1 FROM locked_parents runs
-                WHERE runs.id = exiting.id
-                  AND runs.status IN ('claimed', 'running')
-                  AND runs.claim_released_at IS NULL
-                  AND (runs.worker_id = @worker_id
+), locked_targets AS MATERIALIZED (
+    SELECT runs.* FROM runs
+    JOIN parent_mapping mapping ON mapping.run_id = runs.id
+    CROSS JOIN parent_lock_set locks
+    WHERE runs.id IN (SELECT id FROM candidates)
+      AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      AND runs.worker_id = @worker_id
   AND runs.kind <> 'chat'
   AND runs.status = 'running'
   AND runs.claim_released_at IS NULL
@@ -6449,8 +6529,57 @@ WITH candidates AS MATERIALIZED (
                     AND a.terminal_pending AND a.terminal_pending_until > now()
                     AND a.claim_generation = runs.claim_generation)
   AND NOT EXISTS (SELECT 1 FROM workers w
-                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now()))
-            )
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+
+    ORDER BY runs.id
+    FOR UPDATE OF runs
+), target_lock_set AS MATERIALIZED (
+    SELECT array_agg(id) AS ids FROM locked_targets
+), final_targets AS MATERIALIZED (
+    -- Recheck the refreshed locked rows, not initial candidate membership.
+    SELECT runs.* FROM locked_targets runs CROSS JOIN target_lock_set locks
+    WHERE runs.id = ANY(locks.ids)
+      AND runs.worker_id = @worker_id
+  AND runs.kind <> 'chat'
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL
+  AND runs.status_since < @missing_cutoff
+  AND runs.requeue_count >= @max_requeues
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < (sqlc.arg('now')::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds
+                            + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                (LEAST(sqlc.arg('now')::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = @worker_id AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+
+), eligible_parent_exits AS MATERIALIZED (
+    -- Shared by parent writes and suppression; 00296 owns cancellation only
+    -- for an unreleased active lead with a pending plan round-one check.
+    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
+), eligible_candidates AS MATERIALIZED (
+    SELECT target.id AS run_id FROM final_targets target
+    WHERE (target.kind = 'cross_check'
+           OR target.id IN (SELECT id FROM eligible_parent_exits))
+      AND NOT EXISTS (
+          SELECT 1 FROM cross_checks cc
+          JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
+          WHERE cc.checker_run_id = target.id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND exiting.status IN ('claimed', 'running')
+            AND exiting.claim_released_at IS NULL
       )
 )
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
