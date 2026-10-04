@@ -128,7 +128,7 @@ func (s *Service) mutateDindMaintenance(ctx context.Context, id uuid.UUID, op Di
 		}
 		return DindMaintenanceFromWorker(w), nil
 	}
-	refresh := ack == nil && op.Phase == "requested" && phase == "requested" &&
+	refresh := ack == nil && (op.Phase == "requested" || op.Phase == "ready") && phase == "requested" &&
 		w.MaintenanceRegisterNonce != w.SnapshotRegisterNonce.String &&
 		w.MaintenanceID.Valid && uuid.UUID(w.MaintenanceID.Bytes).String() == op.ID && w.MaintenanceNonce == op.Nonce &&
 		(op.RegisterNonce == w.SnapshotRegisterNonce.String || op.RegisterNonce == w.MaintenanceRegisterNonce)
@@ -146,12 +146,20 @@ func (s *Service) mutateDindMaintenance(ctx context.Context, id uuid.UUID, op Di
 		if ack != nil && (op.Phase != "cancelled" || op.Reason != "" && op.Reason != "below_threshold") {
 			return nil, ErrDindMaintenanceConflict
 		}
-		if op.Phase == "requested" && (!maintenancePending(w) || refresh) {
+		if op.Phase == "requested" && !maintenancePending(w) || refresh {
 			if !refresh && (op.ID != "" || op.Nonce != "") {
 				return nil, ErrDindMaintenanceConflict
 			}
 			if !s.dindActuable(w) || !s.dindFresh(w) || w.DindPressureStreak < 2 || op.DeploymentUID == "" || op.PVCUID == "" {
 				return nil, ErrDindMaintenanceConflict
+			}
+			// Refresh directly into the fence after legacy replacement, so a
+			// failed readiness check cannot erase the old binding that schedules it.
+			if op.Phase == "ready" {
+				if err := maintenanceIdle(ctx, q, w); err != nil {
+					return nil, err
+				}
+				w.MaintenanceFenced = true
 			}
 			if !refresh {
 				w.MaintenanceID = pgconv.UUID(uuid.New())
@@ -190,8 +198,20 @@ func (s *Service) mutateDindMaintenance(ctx context.Context, id uuid.UUID, op Di
 					return nil, ErrDindMaintenanceConflict
 				}
 			case "complete":
-				if phase != "recycling" {
+				// RegisterWorker stamps last_heartbeat_at at dind_register_floor.
+				// Require a later, fresh heartbeat from the replacement registration
+				// before releasing the fence; keep the operation bound to the old nonce.
+				now := s.now()
+				if phase != "recycling" || !w.MaintenanceFenced || !s.dindActuable(w) || w.Status != "online" ||
+					!w.SnapshotRegisterNonce.Valid || strings.TrimSpace(w.SnapshotRegisterNonce.String) == "" ||
+					w.SnapshotRegisterNonce.String == w.MaintenanceRegisterNonce ||
+					!w.DindRegisterFloor.Valid || !w.LastHeartbeatAt.Valid ||
+					!w.LastHeartbeatAt.Time.After(w.DindRegisterFloor.Time) ||
+					w.LastHeartbeatAt.Time.After(now) || now.Sub(w.LastHeartbeatAt.Time) > 45*time.Second {
 					return nil, ErrDindMaintenanceConflict
+				}
+				if err := maintenanceIdle(ctx, q, w); err != nil {
+					return nil, err
 				}
 				w.MaintenanceFenced = false
 				w.MaintenanceReadyAck = false

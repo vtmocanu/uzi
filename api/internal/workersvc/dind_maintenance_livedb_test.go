@@ -147,6 +147,122 @@ func (tx *dindLiveCommitTx) Commit(ctx context.Context) error {
 	}
 }
 
+func TestDindMaintenanceReplacementReadinessLiveDB(t *testing.T) {
+	env, w, svc, op := dindLiveFixture(t)
+	transition := func(phase string) DindMaintenance {
+		t.Helper()
+		op.Phase = phase
+		got, err := svc.TransitionDindMaintenance(env.ctx, w.ID, op)
+		if err != nil || got == nil {
+			t.Fatalf("transition to %s: got=%+v err=%v", phase, got, err)
+		}
+		return *got
+	}
+	read := func() store.Worker {
+		t.Helper()
+		current, err := env.q.GetWorkerByID(env.ctx, w.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return current
+	}
+	refuse := func(name, phase string) {
+		t.Helper()
+		before := read()
+		request := op
+		request.Phase = "complete"
+		if got, err := svc.TransitionDindMaintenance(env.ctx, w.ID, request); !errors.Is(err, ErrDindMaintenanceConflict) {
+			t.Fatalf("%s completed: got=%+v err=%v", name, got, err)
+		}
+		current := read()
+		if current.MaintenancePhase != phase || !current.MaintenanceFenced ||
+			current.MaintenanceRegisterNonce != w.MaintenanceRegisterNonce ||
+			!current.MaintenanceActivityFloor.Time.Equal(before.MaintenanceActivityFloor.Time) {
+			t.Fatalf("%s changed fenced operation: %+v", name, current)
+		}
+	}
+	op = transition("ready")
+	zero := 0
+	if _, err := svc.AckDindMaintenance(env.ctx, w.ID, DindMaintenanceReadyACK{
+		DindMaintenance: op, LocalClaims: &zero, LocalExecutions: &zero,
+		CustodyClear: true, CustodyCheckedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	op = transition("stopping")
+	refuse("stopping old registration", "stopping")
+	op = transition("recycling")
+	refuse("recycling old registration", "recycling")
+
+	replacement := uuid.NewString()
+	registered, err := env.q.RegisterWorker(env.ctx, store.RegisterWorkerParams{
+		ID: w.ID, ProtocolCapabilities: []string{capability.DindMaintenanceV1},
+		SnapshotRegisterNonce: pgconv.TextOrNull(replacement),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registered.MaintenancePhase != "recycling" || !registered.MaintenanceFenced ||
+		registered.MaintenanceRegisterNonce != op.RegisterNonce ||
+		!registered.LastHeartbeatAt.Time.Equal(registered.DindRegisterFloor.Time) {
+		t.Fatalf("registration lost fence/binding or stamped unequal heartbeat/floor: %+v", registered)
+	}
+	refuse("replacement registration without heartbeat", "recycling")
+	fresh, err := svc.Heartbeat(env.ctx, read(), nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fresh.LastHeartbeatAt.Time.After(fresh.DindRegisterFloor.Time) {
+		t.Fatal("heartbeat did not follow replacement registration")
+	}
+	env.exec("UPDATE workers SET last_heartbeat_at = NULL WHERE id = $1", w.ID)
+	refuse("missing replacement heartbeat", "recycling")
+	env.exec(`UPDATE workers SET dind_register_floor = now() - interval '2 minutes',
+		last_heartbeat_at = now() - interval '1 minute' WHERE id = $1`, w.ID)
+	refuse("stale replacement heartbeat", "recycling")
+	env.exec("UPDATE workers SET dind_register_floor = $2, last_heartbeat_at = $3, protocol_capabilities = '{}' WHERE id = $1",
+		w.ID, fresh.DindRegisterFloor, fresh.LastHeartbeatAt)
+	refuse("replacement without maintenance capability", "recycling")
+	env.exec("UPDATE workers SET protocol_capabilities = $2 WHERE id = $1", w.ID, fresh.ProtocolCapabilities)
+
+	// Terminal-only busy checking must include owned parked and queued lifecycles.
+	for _, status := range []string{"queued", "awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait", "pool_wait", "paused", "recovery_wait"} {
+		run := dindLiveRun(t, env, w, "issue", status, true)
+		refuse("owned "+status, "recycling")
+		env.exec("UPDATE runs SET status = 'completed' WHERE id = $1", run)
+	}
+	run := dindLiveRun(t, env, w, "issue", "completed", true)
+	hold := uuid.New()
+	env.exec(`INSERT INTO recovery_custody_holds
+		(id, user_id, repo_id, run_id, generation, state, original_worker_id,
+		 original_worker_identity, live_worker_id, live_run_id)
+		SELECT $1, user_id, repo_id, id, claim_generation, 'open', $2, 'maintenance-test', $2, id
+		FROM runs WHERE id = $3`, hold, w.ID, run)
+	refuse("terminal run with open live custody", "recycling")
+	env.exec(`UPDATE recovery_custody_holds SET state = 'discarded',
+		live_worker_id = NULL, live_run_id = NULL WHERE id = $1`, hold)
+
+	// The controller still sends the original operation binding after replacement.
+	op = transition("complete")
+	completed := read()
+	if op.RegisterNonce != w.MaintenanceRegisterNonce || op.Fenced || op.ReadyACK ||
+		completed.MaintenancePhase != "complete" || completed.MaintenanceFenced ||
+		completed.MaintenanceOwnsDrain || completed.DrainingSince.Valid ||
+		completed.SnapshotRegisterNonce.String != replacement {
+		t.Fatalf("completion did not release fence/drain with original binding: op=%+v worker=%+v", op, completed)
+	}
+	// A lost completion response can be retried even after readiness grows stale.
+	env.exec("UPDATE workers SET last_heartbeat_at = NULL, protocol_capabilities = '{}' WHERE id = $1", w.ID)
+	for range 2 {
+		retry := transition("complete")
+		current := read()
+		if retry != op || !current.MaintenanceActivityFloor.Time.Equal(completed.MaintenanceActivityFloor.Time) ||
+			!current.UpdatedAt.Time.Equal(completed.UpdatedAt.Time) {
+			t.Fatalf("completion retry changed binding/clocks: retry=%+v worker=%+v", retry, current)
+		}
+	}
+}
+
 func TestDindMaintenanceOwnershipBeforeFenceLiveDB(t *testing.T) {
 	for _, lane := range []string{"run", "chat", "continue"} {
 		t.Run(lane, func(t *testing.T) {
