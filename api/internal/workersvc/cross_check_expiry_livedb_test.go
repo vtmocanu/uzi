@@ -52,7 +52,7 @@ func TestPlanCrossCheckExpiryEventAndSequenceLiveDB(t *testing.T) {
 	}
 	lead := mustRun(t, env, leadID)
 	child := mustRun(t, env, childID)
-	if lead.LastSeq != seq || lead.BudgetPausedSeconds != 5+int32(credit) ||
+	if lead.LastSeq != seq || int64(lead.BudgetPausedSeconds) != 5+int64(credit) ||
 		child.Status != "cancelled" || !child.ClaimReleasedAt.Valid {
 		t.Fatalf("expiry settlement: seq=%d budget=%d child=%s released=%v", lead.LastSeq, lead.BudgetPausedSeconds, child.Status, child.ClaimReleasedAt.Valid)
 	}
