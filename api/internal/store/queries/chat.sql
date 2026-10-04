@@ -37,7 +37,7 @@ WITH affinity AS MATERIALIZED (
  SELECT * FROM workers WHERE workers.id = sqlc.narg('worker_id')::uuid FOR UPDATE
 )
 INSERT INTO runs (user_id, kind, issue_title, issue_description, title, resume_of_run_id, worker_id, trigger_source, harness)
-VALUES (@user_id, 'chat', @issue_title, '', @title, @resume_of_run_id, (SELECT affinity.id FROM affinity WHERE NOT maintenance_fenced), 'resume', 'claude')
+VALUES (@user_id, 'chat', @issue_title, '', @title, @resume_of_run_id, (SELECT affinity.id FROM affinity WHERE draining_since IS NULL AND NOT maintenance_fenced AND maintenance_phase NOT IN ('requested','ready','stopping','recycling')), 'resume', 'claude')
 RETURNING *;
 
 -- name: ListChatRunsForUser :many

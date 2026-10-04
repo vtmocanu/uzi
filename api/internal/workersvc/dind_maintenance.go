@@ -205,7 +205,7 @@ func (s *Service) mutateDindMaintenance(ctx context.Context, id uuid.UUID, op Di
 				if phase != "requested" && phase != "ready" {
 					return nil, ErrDindMaintenanceConflict
 				}
-				if !(ack == nil && op.Reason == "recycle_disabled") && !s.dindBelow(w) {
+				if (ack != nil || op.Reason != "recycle_disabled") && !s.dindBelow(w) {
 					return nil, ErrDindMaintenanceConflict
 				}
 				w.MaintenanceFenced = false

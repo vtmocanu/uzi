@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // wireContractFixture is the single golden file both sides of the controller
@@ -50,7 +52,7 @@ func samplePollResponse() PollResponse {
 			// either on either side reddens (PRD #837 M4), the same both-states rationale as
 			// Docker/Busy above.
 			DiskPressure:        true,
-			DiskPressureVolumes: []string{"dind"},
+			DiskPressureVolumes: []string{"nix", "dind"},
 			Ephemeral:           false,
 			// CustodyHeld true here, false on the second worker: both states of the new
 			// PRD #1296 M1 field ride one wire so a drop on either side reddens, the same
@@ -87,6 +89,16 @@ func samplePollResponse() PollResponse {
 			// No token to write: a pod already proved it holds one (its plaintext
 			// lives only in the cluster Secret now), or the buffer expired unread.
 			JoinToken: nil,
+		},
+		{
+			ID:       "33333333-3333-3333-3333-333333333333",
+			Template: "base", Size: "m", Generation: 1, Docker: true,
+			DiskPressureVolumes: []string{"dind"},
+			DindMaintenance: &workersvc.DindMaintenance{
+				ID: "44444444-4444-4444-4444-444444444444", Nonce: "maintenance-operation",
+				Phase: "requested", DeploymentUID: "deployment-uid", PVCUID: "pvc-uid",
+				RegisterNonce: "registration-nonce",
+			},
 		},
 	}}
 }
