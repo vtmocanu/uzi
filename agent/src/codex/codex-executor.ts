@@ -1045,7 +1045,7 @@ function buildAdviceAuthConfig(
  * Build a fresh, disposable Codex advice-launch root for ONE call (PRD #1429 M3). Adapts the
  * SAME `launchCodexRoot` primitive {@link defaultLaunchProviderRoot} uses for the run lane —
  * a "provider" root under app-server auth, so the credential flows over the login RPC and
- * NEVER the launcher env — but for the isolated, tool-less advice lane: NO registry, NO
+ * NEVER the launcher env — but for the isolated advice lane without worker callbacks: NO registry, NO
  * broker, NO command-effect surface, and its OWN disposable per-call owned-data-root/cwd
  * (never the run lane's `codex-data/<namespace>-epoch-N` tree or worktree). `authMode` is bound once at
  * FACTORY construction ({@link makeProductionCodexAdviceHarnessFactory}) because
@@ -1148,7 +1148,7 @@ export type CodexAdviceHarnessFactory = (params: CodexAdviceHarnessBuildParams) 
  * `runReadOnlyModelPass` (model-pass.ts) so a Codex judge/review claim gets a REAL advice
  * result instead of the deterministic missing-token fallback. Each call releases a FRESH
  * credential through a fresh {@link CodexAdviceCredentialBridge} (never the run lane's
- * registry/workspace/broker) and launches an isolated, tool-less provider root via
+ * registry/workspace/broker) and launches an isolated provider root without worker callbacks via
  * {@link makeProductionLaunchAdviceRoot}, disposed when the harness's own `run()` completes.
  */
 export function makeProductionCodexAdviceHarnessFactory(
@@ -4360,7 +4360,7 @@ function stripGitConfigEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
  *     (hooksPath, gc/maintenance, code-exec keys) meant for the worker's own git.
  *   - Local subprocesses of a command (gitleaks, Taskfile gate steps) inherit this through
  *     the process env; commands inside separately launched Docker containers do NOT.
- *   - Codex advice roots need none: they are tool-less.
+ *   - Codex advice roots need none: they have no worker callbacks (#1566 native async/UTC exceptions).
  *   - It is not a worker-controlled boundary against the model: a command can still widen
  *     trust for its own single invocation with `git -c safe.directory=...`
  *     (GIT_CONFIG_PARAMETERS is read after GIT_CONFIG_COUNT).

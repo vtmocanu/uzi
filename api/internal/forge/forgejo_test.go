@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1497,6 +1498,38 @@ func TestForgejoListIssuesMapsAssignees(t *testing.T) {
 	}
 	if len(issues[1].Assignees) != 0 {
 		t.Fatalf("unassigned issue must have no assignees, got %v", issues[1].Assignees)
+	}
+}
+
+func TestForgejoShippedSuccessCap(t *testing.T) {
+	if forgejoMaxResponseBytes != 32<<20 {
+		t.Fatalf("shipped cap = %d, want literal 32 MiB", forgejoMaxResponseBytes)
+	}
+	const validIssues = `[{"id":100,"number":11,"title":"t","state":"open","user":{"login":"alice"}}]`
+	for _, size := range []int{32 << 20, (32 << 20) + 1} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			body := validIssues + strings.Repeat(" ", size-len(validIssues))
+			if len(body) != size {
+				t.Fatalf("fixture length = %d, want %d", len(body), size)
+			}
+			m := newMockForgejo(t, map[string]http.HandlerFunc{
+				"/repos/acme/widgets/issues": func(w http.ResponseWriter, _ *http.Request) {
+					_, _ = w.Write([]byte(body))
+				},
+			})
+			d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+			issues, err := d.ListIssues(context.Background(), 7, ListIssuesOptions{})
+			if size == 32<<20 {
+				if err != nil || len(issues) != 1 || issues[0].IID != 11 {
+					t.Fatalf("exact-cap issue = %+v, error = %v", issues, err)
+				}
+			} else {
+				want := "forgejo: list issues: forgejo: response body exceeds size limit"
+				if err == nil || err.Error() != want || len(issues) != 0 || errors.Unwrap(err) != nil {
+					t.Fatalf("over-cap issues = %+v, error = %v, want %q", issues, err, want)
+				}
+			}
+		})
 	}
 }
 

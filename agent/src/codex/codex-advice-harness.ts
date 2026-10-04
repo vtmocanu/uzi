@@ -1,20 +1,21 @@
-// PRD #1171 (M3, milestone 3) — the Codex TOOL-LESS, isolated advice pass.
+// PRD #1171 (M3, milestone 3) — the Codex isolated advice pass with no worker callbacks.
+// #1566: native async questions and read-only UTC remain reachable in pinned 0.159.3.
 //
 // This is the `AdviceHarness` for `kind:"codex"`: it runs ONE isolated judge/review/
 // summary turn against an isolated Codex provider root and returns the accumulated
 // assistant text. It is the SEPARATELY-GATED advice ceiling by construction — mirror
 // `ClaudeAdviceHarness` (claude-advice-harness.ts) in SEMANTICS, not shape:
 //   - it has NO broker, NO callback/handler registry, NO run worktree, NO agents/tools
-//     and NO run working directory as a construction input, so the model has NO tool
+//     and NO run working directory as a construction input, so the model has NO worker tool
 //     surface (harness-contract.md §"Rate limits and advice" / §"Skills and policy
 //     inputs": "An advice constructor must not accept agents, MCP handlers, general
 //     tools or a run working directory");
 //   - the advice turn is built by `renderCodexAdvice` (render.ts) — model + effort +
 //     prompt + output ONLY — which ALSO enforces the ceiling at runtime (it throws if
 //     the request carries agents/tools/toolServers/cwd);
-//   - the isolated thread/turn is started with the native tool/agent/MCP surface
-//     disabled, the canonical project EXPLICITLY untrusted, `project_doc_max_bytes = 0`
-//     and NEVER a hook-trust bypass (mirrors config.ts, the native-disabled config).
+//   - the isolated thread/turn is started with native effectful tools/agents/MCP
+//     disabled (except #1566 async questions and read-only UTC), the canonical project EXPLICITLY untrusted, `project_doc_max_bytes = 0`
+//     and NEVER a hook-trust bypass (mirrors config.ts).
 //
 // FULLY UNIT-TESTABLE, NO REAL CODEX: every external effect is an INJECTED SEAM.
 //   - `launchRoot(spec)` launches an ISOLATED provider root with its OWN disposable
@@ -346,7 +347,7 @@ export class CodexAdviceHarness implements AdviceHarness {
   /** Start the isolated thread + turn and consume the notification stream, accumulating
    *  assistant text. On the terminal, invoke `policy.onTerminal` SYNCHRONOUSLY before the
    *  iterator is closed, then return. Server→client requests are REFUSED fail-closed (no
-   *  broker, no tool surface). An abort ends the stream without partial text; an
+   *  broker, no worker tool surface). An abort ends the stream without partial text; an
    *  unexpected EOF is a Codex protocol throw. */
   private async consume(
     transport: CodexTransport,
@@ -467,8 +468,8 @@ export class CodexAdviceHarness implements AdviceHarness {
     }
   }
 
-  /** The isolated advice thread config, pinned fail-closed ON THE WIRE: the native
-   *  tool/agent/MCP surface disabled (mirrors config.ts, the native-disabled config), the
+  /** The isolated advice thread config: native effectful tools/agents/MCP disabled
+   *  with #1566 async-question/UTC exceptions (mirrors config.ts), the
    *  canonical project EXPLICITLY untrusted, `project_doc_max_bytes = 0`, and NEVER a
    *  hook-trust bypass. The stock config.toml already pins these; re-asserting them here is
    *  defense-in-depth against a promoted trust. */
@@ -551,7 +552,7 @@ export class CodexAdviceHarness implements AdviceHarness {
     return id;
   }
 
-  /** Refuse a server→client request fail-closed — advice is tool-less. There is no broker
+  /** Refuse a server→client request fail-closed — advice has no worker callbacks. There is no broker
    *  to route to, so the reply is a JSON-RPC method error and NO effect ever runs. The
    *  reply may fail if the transport is already closed (an abort/timeout raced it); a
    *  reply that can no longer be delivered is dropped, NEVER thrown. */
@@ -564,7 +565,9 @@ export class CodexAdviceHarness implements AdviceHarness {
   }
 
   /** Extract assistant text off an `item/completed` agent-message note. Only text (never
-   *  reasoning) is accumulated into AdviceResult.text. Mirrors CodexHarness item decode;
+   *  reasoning) is accumulated into AdviceResult.text. There is no delivery filter: #1566
+   *  async question text contaminates advice and may fail structured-verdict validation.
+   *  Dropping delivery async is deferred. Mirrors CodexHarness item decode;
    *  the provisional item-type strings are the same current best guess and are verified in
    *  the packaged integration, not here. */
   private extractAdviceText(note: Extract<CodexNotification, { kind: "activity" }>): string {

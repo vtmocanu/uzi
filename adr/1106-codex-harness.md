@@ -320,9 +320,13 @@ inferred role-file restriction, or process-group kill substitutes for those proo
 ## Execution policy
 
 **Accepted architecture.** Use the stock app-server with `environments: []`,
-`agents.enabled = false` and `multi_agent_v2 = false`, with native tools and
-extensions disabled. Worker-owned dynamic callbacks provide the permitted run-tool boundary;
-worker-created child threads define synchronous delegation in the M3 adapter.
+`agents.enabled = false` and `multi_agent_v2 = false`, with effectful native
+execution and native extensions disabled. Authority-free code-host run plumbing
+and the accepted native exceptions `request_user_input_async` (catalog
+`send_user_message_async`) and `clock.curr_time` (catalog `clock`) remain available,
+with the measured boundaries below. Worker-owned dynamic callbacks provide the
+permitted run-tool boundary; worker-created child threads define synchronous
+delegation in the M3 adapter.
 This replaces the earlier loopback-MCP/native-role candidate. Native authority
 removal, representative role/phase callbacks and actual-host disposal now have
 separate fixture evidence above. M0 is complete at the design/feasibility level;
@@ -336,6 +340,71 @@ and apply each role's tool/skill allocation and plan/implement policy. A child
 callback must resolve only after its owned child turn finishes; root completion
 alone cannot establish that condition. Role TOML and healthy hook behavior are
 not substitutes for these checks.
+
+### Accepted native exceptions (#1566)
+
+**Current characterization (0.159.3).** Option 1 explicitly accepts the two
+native exceptions above. This documents the observed boundary; it does not add
+runtime suppression or a security enforcement fix. Effectful run operations
+remain behind worker-owned callbacks.
+
+- `request_user_input_async` emits an AgentMessage with delivery `"async"`,
+  questions and formatted text. Its direct tool output is JSON text
+  `{"accepted":true}`: acceptance is immediate, with no pause for a user response
+  and no worker effect. Uzi's root projects the message as ordinary text, without
+  a questions workflow. Advice appends that text to its result
+  ([accumulation](../agent/src/codex/codex-advice-harness.ts#L444),
+  [extraction](../agent/src/codex/codex-advice-harness.ts#L573)), so it can contaminate
+  prose or structured-verdict parsing. **Dropping async agent messages is a
+  DEFERRED follow-up; no filtering fix is included here.**
+- `clock.curr_time` is a human-authorized, read-only exception with no filesystem,
+  network or process effects. The verified installed runtime returns successful
+  UTC time without an observed `currentTime/read` request reaching uzi, then
+  continues without a worker effect. A direct namespace function call returns
+  `It is YYYY-MM-DD HH:MM:SS UTC.`; a code-mode nested
+  `tools.clock__curr_time({})` call returns
+  `{"current_time":"YYYY-MM-DD HH:MM:SS UTC"}`. Unknown server-request refusal
+  is unchanged: root returns `-32601` / `unsupported request`, and advice returns
+  `-32601` / `codex advice is tool-less`. The regression fails if a future
+  `currentTime/read` request reaches uzi.
+
+**Source/runtime discrepancy.** At pinned source commit
+`01fc69f4026735edfdf6789820549727a4867b11`,
+[`message_processor.rs:367`](https://github.com/openai/codex/blob/01fc69f4026735edfdf6789820549727a4867b11/codex-rs/app-server/src/message_processor.rs#L367)
+installs `app_server_time_provider`, and
+[`current_time.rs:110`](https://github.com/openai/codex/blob/01fc69f4026735edfdf6789820549727a4867b11/codex-rs/app-server/src/current_time.rs#L110)
+sends `CurrentTimeRead`, suggesting a client time read. The verified runtime
+instead returns time without an observed request reaching uzi. The underlying
+time-provider path and cause remain **UNVERIFIED**; the source reading does not
+establish that the current runtime refuses clock calls.
+
+The existing [native-exceptions regression](../e2e/codex-m4/native-exceptions.test.ts)
+passed 12 real-binary lifecycle/model runs: `gpt-6-astra`, `gpt-6-sol` and
+`gpt-6.1-sol`, each on root start, saved resume, worker-created child and advice.
+The binary was `/opt/uzi-codex/0.159.3/bin/codex`, reporting `codex-cli 0.159.3`.
+`probeCodexRuntime` checked the installed receipt against the lock-pinned amd64
+archive digest `3930f31ac5fca861ea3e444e2683f261190d96b63fba58e0a40a879174369cdf`
+and checked each member on disk; provisioning retains its version assertion.
+The fixture records namespace `tools` / `additional_tools` and nested inventories,
+checks both UTC output forms on run paths, and supplies no answer. A subsequent
+nested `uzi_bash` callback proves continuation and supplies the single worker
+effect on run paths; advice has zero worker effects. These are bounded
+characterization results, not proof of the unverified time-provider mechanism.
+
+**Preferred future policy (Option 2).** A positive allowlist is unavailable via
+app-server/TOML in 0.159.3. The internal
+[`ToolPolicy` API](https://github.com/openai/codex/blob/01fc69f4026735edfdf6789820549727a4867b11/codex-rs/ext/extension-api/src/tool_policy.rs)
+says “Supply through ExtensionDataInit before starting a thread.” and “Callers
+must supply it again when resuming a thread.” However,
+[`thread_processor.rs`](https://github.com/openai/codex/blob/01fc69f4026735edfdf6789820549727a4867b11/codex-rs/app-server/src/request_processors/thread_processor.rs)
+creates `let mut thread_extension_init = ExtensionDataInit::new()` without
+inserting `ToolPolicy`, and
+[`ThreadStartParams`](https://github.com/openai/codex/blob/01fc69f4026735edfdf6789820549727a4867b11/codex-rs/app-server-protocol/src/protocol/v2/thread.rs)
+exposes `config` and `dynamic_tools`, but no allowlist; the experimental binary
+schema was also examined during planning. The internal registry filters dynamic
+and core tools, so a future allowlist must include worker dynamic names plus the code-mode wrappers
+`exec` / `wait` and be reapplied on resume, rather than being a raw native-only list. This policy
+remains future work.
 
 ### Capability policy owners
 
