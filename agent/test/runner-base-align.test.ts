@@ -602,6 +602,100 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-154:.github/workflows/ci.yml"]), CI_V2.trim());
   });
 
+  it("an absent implementation-only branch with a null diff merges the fresh default after a permitted precheck", async () => {
+    seedWorkflowsOnOrigin();
+    const initialDefault = gitIn(fx.originPath, ["rev-parse", "main"]);
+    git.changedFiles = (async () => null) as typeof git.changedFiles;
+    const { github, calls } = fakeGitHub();
+    const strategies = spyAlign();
+    const alignedDefaults: string[] = [];
+    const align = git.alignBranchWithDefault.bind(git);
+    git.alignBranchWithDefault = (async (...args: Parameters<typeof git.alignBranchWithDefault>) => {
+      alignedDefaults.push(args[3]);
+      return align(...args);
+    }) as typeof git.alignBranchWithDefault;
+
+    const workflowSnapshots: { defaultTip: string; files: string[] | null }[] = [];
+    let initialWorkflowArgs: Parameters<typeof git.branchWorkflowFiles> | undefined;
+    const classify = git.branchWorkflowFiles.bind(git);
+    git.branchWorkflowFiles = (async (...args: Parameters<typeof git.branchWorkflowFiles>) => {
+      initialWorkflowArgs ??= args;
+      const files = await classify(...args);
+      workflowSnapshots.push({ defaultTip: args[1], files });
+      return files;
+    }) as typeof git.branchWorkflowFiles;
+    const targets: Awaited<ReturnType<typeof git.fetchWorkflowTargetTip>>[] = [];
+    const target = git.fetchWorkflowTargetTip.bind(git);
+    git.fetchWorkflowTargetTip = (async (...args: Parameters<typeof git.fetchWorkflowTargetTip>) => {
+      const result = await target(...args);
+      targets.push(result);
+      return result;
+    }) as typeof git.fetchWorkflowTargetTip;
+
+    const defaultTips: string[] = [];
+    let fetches = 0;
+    const fetch = git.fetchDefaultTip.bind(git);
+    git.fetchDefaultTip = (async (...args: Parameters<typeof git.fetchDefaultTip>) => {
+      fetches++;
+      if (fetches === 2) commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "advance after permitted precheck");
+      const sha = await fetch(...args);
+      defaultTips.push(sha);
+      if (fetches === 2) {
+        assert.ok(initialWorkflowArgs, "the real initial workflow comparison ran before main advanced");
+        const [barePath, , trackingRef, targetTip] = initialWorkflowArgs;
+        // Observe the same unaligned branch against the freshly fetched default.
+        // This probe delegates to the real classifier without changing the runner's decision.
+        await git.branchWorkflowFiles(barePath, sha, trackingRef, targetTip);
+      }
+      return sha;
+    }) as typeof git.fetchDefaultTip;
+
+    let pushCalls = 0;
+    const realPush = git.pushBranch.bind(git);
+    git.pushBranch = (async (...args: Parameters<typeof git.pushBranch>) => {
+      pushCalls++;
+      return realPush(...args);
+    }) as typeof git.pushBranch;
+    const pushArgs: string[][] = [];
+    const gitCommands = git as unknown as {
+      runGit: (cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string) => Promise<string>;
+    };
+    const runGit = gitCommands.runGit.bind(git);
+    gitCommands.runGit = async (...args: Parameters<typeof gitCommands.runGit>) => {
+      if (args[1][0] === "push") pushArgs.push([...args[1]]);
+      return runGit(...args);
+    };
+
+    const claim = githubClaim(1877);
+    await githubRunner(github, committingExecutor({ "impl.ts": "export const x = 1;\n" })).execute(claim);
+
+    const freshDefault = gitIn(fx.originPath, ["rev-parse", "main"]);
+    assert.notStrictEqual(freshDefault, initialDefault, "main really advanced between precheck and alignment");
+    assert.strictEqual(defaultTips[0], initialDefault);
+    assert.strictEqual(defaultTips[1], freshDefault);
+    assert.deepStrictEqual(targets[0], { kind: "absent" }, "the implementation branch was initially unpublished");
+    assert.deepStrictEqual(workflowSnapshots[0], { defaultTip: initialDefault, files: [] }, "the initial snapshot permitted publication");
+    assert.deepStrictEqual(workflowSnapshots[1], { defaultTip: freshDefault, files: [".github/workflows/ci.yml"] }, "the fresh snapshot requires alignment");
+    const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+    assert.deepStrictEqual(states.map((s) => s.status), ["running", "running", "completed"],
+      `the permitted precheck must allow later merge alignment, not workflow_scope_missing: ${JSON.stringify(states)}; strategies=${JSON.stringify(strategies)}`);
+    assert.deepStrictEqual(strategies, ["merge"], "a null diff uses the real merge fallback");
+    assert.deepStrictEqual(alignedDefaults, [freshDefault], "alignment uses the exact freshly fetched SHA");
+    assert.deepStrictEqual(defaultTips, [initialDefault, freshDefault, freshDefault]);
+    assert.strictEqual(pushCalls, 1, "exactly one real pushBranch call");
+    assert.strictEqual(pushArgs.length, 1, "exactly one real git push");
+    assert.ok(pushArgs[0]!.every((arg) => !arg.startsWith("--force") && arg !== "-f" && !arg.startsWith("+")),
+      "the observed push has no force flag or forced refspec");
+    const published = gitIn(fx.originPath, ["rev-parse", "agent/issue-1877"]);
+    assert.notStrictEqual(published, initialDefault, "the real push published a branch update");
+    assert.strictEqual(gitIn(fx.originPath, ["merge-base", "--is-ancestor", freshDefault, published]), "");
+    assert.strictEqual(gitIn(fx.originPath, ["show", `${published}:impl.ts`]), "export const x = 1;");
+    assert.strictEqual(gitIn(fx.originPath, ["show", `${published}:.github/workflows/ci.yml`]), CI_V2.trim());
+    assert.strictEqual(gitIn(fx.originPath, ["rev-parse", `${published}:.github/workflows`]),
+      gitIn(fx.originPath, ["rev-parse", `${freshDefault}:.github/workflows`]), "published workflows match fresh main");
+    assert.strictEqual(calls.length, 1, "the PR was opened once");
+  });
+
   it("second default-tip fetch failure falls through to the normal push", async () => {
     seedWorkflowsOnOrigin();
     const { github, calls } = fakeGitHub();
