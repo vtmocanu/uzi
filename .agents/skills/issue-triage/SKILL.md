@@ -60,7 +60,8 @@ uzi schedule list --json | jq -r '.[] | select(.enabled and (.target=="sweep" or
 uzi schedule list --json | jq '.[] | select(.target=="sweep") | {slug: .catalog_slug, started: [.last_fire.started[]? | {issue_iid, run_id}], skips: .last_fire.skips}'
 ```
 
-- Per sweep, list open selector + eligible issues (Step 1 tiers' complement). Predicted picks = the oldest `max_issues`, skipping any already mid-run or with an open `agent/issue-<n>` PR.
+- Resolve each schedule's effective selector, catalog defaults included: a label selector requires all its configured labels; an assigned selector uses bot assignment. Apply eligibility separately. Do not infer runtime exclusions from triage park labels: the candidate query ignores them.
+- Follow `ListSweepCandidateIssues` and `fireSweep` (`api/internal/schedsvc/scheduler.go`): lowest issue number first, within a scan window of `max_issues + backfillHeadroom`, skipping active runs and open-MR refusals until the started-run cap is reached. Report the picks as predictions (cache freshness, state changes).
 - An enabled one-shot `target=issue` schedule fires its issue separately; another session may own it. Report it, do not re-triage or re-dispatch it.
 - A pick retried after last fire's run `failed`: read its `failure_reason`. An infra failure (claim/forge) leaves the issue sound.
 - Run Steps 2 to 4 on every predicted pick (independent picks fan out to read-only researchers), then Step 5 for any body fixes. Report a per-fire table: time, sweep, issues, one-line verdict each.
