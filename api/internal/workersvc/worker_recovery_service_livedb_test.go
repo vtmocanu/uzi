@@ -129,20 +129,22 @@ func observeRecoveryParentWait(t *testing.T, ctx context.Context, env codexTestE
 	}
 }
 
+const recoveryCheckAssociationSQL = `INSERT INTO cross_checks(lead_run_id,stage,round,lead_claim_generation,plan_md,milestones,required_capabilities,required_tools,size_class,base_commit,planning_diff,candidate_digest,checker_run_id,checker_harness,created_at,deadline_at)
+ VALUES($1,'plan',1,1,'plan','[]','{}','{}','s',$2,'',$3,$4,'codex',now()-interval '60 seconds',now()+interval '20 minutes')`
+
 func seedRecoveryCheck(t *testing.T, env codexTestEnv, user, repo, worker, lead uuid.UUID) uuid.UUID {
 	t.Helper()
 	child := uuid.New()
 	env.exec(`INSERT INTO runs(id,user_id,repo_id,worker_id,kind,target_run_id,harness,report_only,budget_wall_seconds,status,claim_generation,issue_title,issue_description)
  VALUES($1,$2,$3,$4,'cross_check',$5,'codex',true,86400,'running',1,'checker','checker')`, child, user, repo, worker, lead)
 	env.exec(`UPDATE runs SET started_at=now()-interval '10 minutes',status_since=now()-interval '10 minutes' WHERE id=$1`, child)
-	env.exec(`INSERT INTO cross_checks(lead_run_id,stage,round,lead_claim_generation,plan_md,milestones,required_capabilities,required_tools,size_class,base_commit,planning_diff,candidate_digest,checker_run_id,checker_harness,created_at,deadline_at)
- VALUES($1,'plan',1,1,'plan','[]','{}','{}','s',$2,'',$3,$4,'codex',now()-interval '60 seconds',now()+interval '20 minutes')`, lead, strings.Repeat("a", 40), []byte("fixture digest"), child)
+	env.exec(recoveryCheckAssociationSQL, lead, strings.Repeat("a", 40), []byte("fixture digest"), child)
 	env.exec(`UPDATE runs SET budget_paused_seconds=5 WHERE id=$1`, lead)
 	return child
 }
 
 func TestWorkerRecoveryFreezeDriftLiveDB(t *testing.T) {
-	for _, drift := range []string{"unowned becomes owned", "server generation", "mapping new parent", "mapping held parent"} {
+	for _, drift := range []string{"unowned becomes owned", "server generation", "mapping new parent", "mapping held parent", "association appearance", "association disappearance"} {
 		t.Run(drift, func(t *testing.T) {
 			env := setupCodexLiveDB(t)
 			user, _, repo := env.seedCodexInfra(t)
@@ -164,6 +166,9 @@ func TestWorkerRecoveryFreezeDriftLiveDB(t *testing.T) {
 				owner = wb
 			}
 			child := seedRecoveryCheck(t, env, user, repo, owner, lead)
+			if drift == "association appearance" {
+				env.exec(`DELETE FROM cross_checks WHERE checker_run_id=$1`, child)
+			}
 			snap := &ActiveSnapshot{SnapshotEpoch: 1, RegisterNonce: "nonce", Active: []ActiveRunEntry{
 				entry(lead, 1, "running", true), entry(child, 1, "running", false),
 			}}
@@ -180,7 +185,7 @@ func TestWorkerRecoveryFreezeDriftLiveDB(t *testing.T) {
 				cancel()
 				t.Fatal(err)
 			}
-			defer blocker.Rollback(context.Background())
+			defer func() { _ = blocker.Rollback(context.Background()) }()
 			if _, err = blocker.Exec(ctx, `SELECT id FROM runs WHERE id=$1 FOR UPDATE`, lead); err != nil {
 				cancel()
 				t.Fatal(err)
@@ -200,6 +205,10 @@ func TestWorkerRecoveryFreezeDriftLiveDB(t *testing.T) {
 				_, err = blocker.Exec(ctx, `UPDATE runs SET worker_id=$2 WHERE id=$1`, child, wa)
 			case "server generation":
 				_, err = blocker.Exec(ctx, `UPDATE runs SET claim_generation=2 WHERE id=$1`, child)
+			case "association appearance":
+				_, err = blocker.Exec(ctx, recoveryCheckAssociationSQL, lead, strings.Repeat("a", 40), []byte("fixture digest"), child)
+			case "association disappearance":
+				_, err = blocker.Exec(ctx, `DELETE FROM cross_checks WHERE checker_run_id=$1`, child)
 			default:
 				// Change both authoritative association and target tuple while capture is
 				// waiting. The replacement may already belong to the captured parent set.
@@ -220,7 +229,7 @@ func TestWorkerRecoveryFreezeDriftLiveDB(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer outsideLock.Rollback(context.Background())
+				defer func() { _ = outsideLock.Rollback(context.Background()) }()
 				if _, err = outsideLock.Exec(ctx, `SELECT id FROM runs WHERE id=$1 FOR NO KEY UPDATE`, other); err != nil {
 					t.Fatal(err)
 				}
@@ -361,17 +370,19 @@ func TestWorkerRecoveryCrossedServicesLiveDB(t *testing.T) {
 					}
 					before := actual
 					// A further real tick cannot credit a decided check again.
-					sa.SnapshotEpoch = 2
-					sb.SnapshotEpoch = 2
 					if register {
 						_, _, err := a.Register(env.ctx, hbWorker(t, env, wa), "fixture", "", nil, nil, nil, nil)
 						if err != nil {
 							t.Fatal(err)
 						}
 					} else {
+						sa.SnapshotEpoch++
 						_, err := a.Heartbeat(env.ctx, hbWorker(t, env, wa), nil, nil, sa)
 						if err != nil {
 							t.Fatal(err)
+						}
+						if got := workerEpoch(t, env, wa); got != sa.SnapshotEpoch {
+							t.Fatalf("repeat heartbeat was not applied: epoch=%d want=%d", got, sa.SnapshotEpoch)
 						}
 					}
 					if got := int64(budgetPausedOf(t, env, lead)); got != before {

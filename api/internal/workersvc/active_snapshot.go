@@ -398,9 +398,9 @@ func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Quer
 			return false, err
 		}
 		if rows == 0 {
-			// The run is not owned by this worker — a worker can only describe its own runs, so
-			// the entry is DROPPED (never persisted, never leased) and logged, not an error.
-			slog.Warn("active snapshot entry dropped: run not owned by worker",
+			// UpsertFrozenWorkerActiveRun rejected ownership or frozen identity drift.
+			// The entry is not persisted or leased; log without further discovery.
+			slog.Warn("active snapshot entry dropped: ownership or frozen identity changed",
 				"worker_id", wkr.ID.String(), "run_id", e.runID.String())
 		}
 	}
