@@ -111,6 +111,7 @@ function baseArgs(arch: Arch, user: string): string[] {
  */
 export function buildMacosLinuxRunPlan(opts: MacosLinuxRunOptions): MacosLinuxRunPlan {
   const user = opts.user ?? DEFAULT_USER;
+  const [scratchUid, scratchGid] = user.split(":");
   // The per-invocation evidence file on the HOST. Its directory is bind-mounted as the container
   // .evidence dir; its basename is what the container writes under that mount, so the container's
   // append lands on the exact host file the native leg + run-completeness use. Defaults to the
@@ -151,7 +152,7 @@ export function buildMacosLinuxRunPlan(opts: MacosLinuxRunOptions): MacosLinuxRu
     // External network disabled during tests (D7 point 3).
     "--network=none",
     // Disposable, unprivileged scratch for #1566 observations and runner trees.
-    "--tmpfs", "/work/.uzi/scratch:uid=1000,gid=1000,mode=0700",
+    "--tmpfs", `/work/.uzi/scratch:uid=${scratchUid},gid=${scratchGid},mode=0700`,
     // Point the P suite's recordEvidence at the mounted host evidence file (this invocation's
     // unique basename under the .evidence mount) so the container's codex/P evidence lands on the
     // HOST in the exact per-invocation file the native U run wrote (run-completeness merges them).

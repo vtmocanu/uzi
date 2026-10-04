@@ -137,6 +137,13 @@ describe("buildMacosLinuxRunPlan argv invariants", () => {
       );
     }
   });
+  it("scratch ownership follows the configured execution uid and gid", () => {
+    const custom = buildMacosLinuxRunPlan({ ...OPTS, user: "2000:3000" });
+    assert.ok(custom.execute.includes("2000:3000"));
+    assert.ok(custom.execute.includes("/work/.uzi/scratch:uid=2000,gid=3000,mode=0700"));
+    assert.ok(!custom.execute.includes("/work/.uzi/scratch:uid=1000,gid=1000,mode=0700"));
+  });
+
   it("execute writes codex/P evidence to the host (env + read-write .evidence mount)", () => {
     assert.ok(
       plan.execute.includes("CODEX_M4_EVIDENCE=/work/e2e/codex-m4/.evidence/current.jsonl"),
