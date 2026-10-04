@@ -2366,28 +2366,46 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	if err != nil {
 		return store.Worker{}, "", err
 	}
-	// (c) Persist a register-carried snapshot BEFORE the orphan pass, so its leased rows protect
-	// #1391's pending outcomes from the D11-predicated fail/requeue that follows. #1390's worker
-	// never sends one; the path exists for #1391. An invalid register snapshot is ignored, never
-	// fatal (register must not wedge on soft input).
+	// Validate before any snapshot/FK write and capture the conservative union,
+	// including orphan phases even when there is no valid active snapshot.
+	entries, snapshotValid, err := s.validatedActiveSnapshot(store.Worker(row), snapshot, snapshotModeRegister)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	attested := validatedFinalizeResume{}
+	if finalizeOK {
+		attested = finalize
+	}
+	locks, err := captureWorkerRecoveryLocks(ctx, qtx, row.ID, entries, attested)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	frozen, parents, err := locks.parameters()
+	if err != nil {
+		return store.Worker{}, "", err
+	}
 	snapshotApplied := false
-	if snapshot != nil {
-		snapshotApplied, err = s.ReplaceWorkerActiveRuns(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister)
+	if snapshotValid {
+		snapshotApplied, err = s.applyWorkerActiveSnapshot(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister, entries, locks)
 		if err != nil {
 			return store.Worker{}, "", err
 		}
 	}
-	// (d0) Issue #1742: the attested finalize pass, after the snapshot apply (so the exact-generation
-	// lease predicate reads settled rows) and before the ordinary orphan pass.
-	if err := runAttested(qtx); err != nil {
-		return store.Worker{}, "", err
-	}
-	// (d) Orphan pass — fail-over-cap then requeue, both D11-lease/overflow-predicated (M1).
-	orphanFailed, err := qtx.FailWorkerRunsOverCap(ctx, failParams)
+	finalizeFailed, finalizeRequeued, finalizeAllowance, err = s.runFrozenAttested(ctx, qtx, row.ID, max,
+		store.FrozenFailWorkerRunsOverCapParams{FailureReason: failParams.FailureReason}, finalize, finalizeOK, locks)
 	if err != nil {
 		return store.Worker{}, "", err
 	}
-	requeued, err := qtx.RequeueWorkerRuns(ctx, requeueParams)
+	orphanFailed, err := qtx.FrozenFailWorkerRunsOverCap(ctx, store.FrozenFailWorkerRunsOverCapParams{
+		FailureReason: failParams.FailureReason, WorkerID: failParams.WorkerID, MaxRequeues: max,
+		FrozenTargets: frozen, LockedParentIds: parents,
+	})
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	requeued, err := qtx.FrozenRequeueWorkerRuns(ctx, store.FrozenRequeueWorkerRunsParams{
+		WorkerID: requeueParams.WorkerID, MaxRequeues: max, FrozenTargets: frozen, LockedParentIds: parents,
+	})
 	if err != nil {
 		return store.Worker{}, "", err
 	}
@@ -2509,11 +2527,11 @@ type RunDiskSample struct {
 // on the next empty report" contract).
 //
 // When a snapshot is carried it runs inside ONE transaction in the canonical order (PRD #1390
-// M2b): HeartbeatWorker (locks the worker row), then LockOwnedRunsByIDs (pre-locks the runs the
-// snapshot lists so a sibling's concurrent FOR UPDATE SKIP LOCKED claim skips them), then
-// ReplaceWorkerActiveRuns in heartbeat mode. ONLY when the snapshot was applied does it then
-// reconcile: ReadoptRunsFromSnapshot (restore a queued run the worker still lists), then
-// FailRunsMissingFromSnapshot then RequeueRunsMissingFromSnapshot (fail before requeue) for a
+// M2b): HeartbeatWorker locks the worker row, pure validation normalizes the snapshot, and
+// LockWorkerRecoveryParents locks the complete recovery parent set, including omitted leads,
+// before frozen snapshot locking or FK writes. ONLY when the snapshot was applied does it then
+// reconcile through FrozenReadoptRunsFromSnapshot (restore a listed queued run), then
+// FrozenFailRunsMissingFromSnapshot and FrozenRequeueRunsMissingFromSnapshot (fail first) for a
 // running run this worker owns but no longer lists, past the missing fence. Each reconciled
 // transition is published post-commit (never inside the tx), mirroring publishRegisterSweeps.
 // An invalid/stale/wrong-nonce snapshot is IGNORED (applied=false) — a warning, no error, rows
@@ -2572,42 +2590,44 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 	if err != nil {
 		return store.Worker{}, err
 	}
-	// (b) Pre-lock the runs the snapshot lists, in canonical id order, BEFORE the replace and the
-	// reconciliation writes — so a sibling's concurrent claim (FOR UPDATE SKIP LOCKED) skips them
-	// until this tx commits. Unparseable ids are skipped (they cannot name a real run); an id for a
-	// run this worker does not own is a no-op (the WHERE excludes it), never locked.
-	if ids := snapshotRunIDs(snapshot); len(ids) > 0 {
-		if _, err := qtx.LockOwnedRunsByIDs(ctx, store.LockOwnedRunsByIDsParams{
-			RunIds:   ids,
-			WorkerID: pgconv.UUID(updated.ID),
-		}); err != nil {
-			return store.Worker{}, err
-		}
-	}
-	// (c) heartbeat mode: an invalid snapshot returns (false, nil) — ignored, not fatal — so the
-	// heartbeat's liveness refresh still commits. Only a real DB error aborts the tx. CAPTURE
-	// applied: the reconciliation runs ONLY when the snapshot was actually applied (an invalid,
-	// stale-epoch or wrong-nonce snapshot must not drive readopt/requeue off rows it did not write).
-	applied, err := s.ReplaceWorkerActiveRuns(ctx, qtx, updated, snapshot, snapshotModeHeartbeat)
+	entries, valid, err := s.validatedActiveSnapshot(updated, snapshot, snapshotModeHeartbeat)
 	if err != nil {
 		return store.Worker{}, err
 	}
+	var locks workerRecoveryLockSet
+	applied := false
+	if valid {
+		// Include omitted owned leads before any snapshot child or FK write.
+		locks, err = captureWorkerRecoveryLocks(ctx, qtx, updated.ID, entries, validatedFinalizeResume{})
+		if err != nil {
+			return store.Worker{}, err
+		}
+		applied, err = s.applyWorkerActiveSnapshot(ctx, qtx, updated, snapshot, snapshotModeHeartbeat, entries, locks)
+		if err != nil {
+			return store.Worker{}, err
+		}
+	}
 	var (
-		readopted       []store.ReadoptRunsFromSnapshotRow
-		missingFailed   []store.FailRunsMissingFromSnapshotRow
-		missingRequeued []store.RequeueRunsMissingFromSnapshotRow
+		readopted       []store.FrozenReadoptRunsFromSnapshotRow
+		missingFailed   []store.FrozenFailRunsMissingFromSnapshotRow
+		missingRequeued []store.FrozenRequeueRunsMissingFromSnapshotRow
 	)
 	if applied {
+		frozen, parents, err := locks.parameters()
+		if err != nil {
+			return store.Worker{}, err
+		}
 		// (d) Reconcile, fail before requeue (over-cap fail-first ordering). The missing fence is the
 		// stale window plus one heartbeat interval (D4). max_requeues is RUN_MAX_REQUEUES.
 		now := s.now()
 		missingCutoff := pgconv.Time(now.Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval)))
 		maxRequeues := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
-		readopted, err = qtx.ReadoptRunsFromSnapshot(ctx, updated.ID)
+		readopted, err = qtx.FrozenReadoptRunsFromSnapshot(ctx, store.FrozenReadoptRunsFromSnapshotParams{WorkerID: updated.ID, FrozenTargets: frozen, LockedParentIds: parents})
 		if err != nil {
 			return store.Worker{}, err
 		}
-		missingFailed, err = qtx.FailRunsMissingFromSnapshot(ctx, store.FailRunsMissingFromSnapshotParams{
+		missingFailed, err = qtx.FrozenFailRunsMissingFromSnapshot(ctx, store.FrozenFailRunsMissingFromSnapshotParams{
+			FrozenTargets: frozen, LockedParentIds: parents,
 			FailureReason:        pgconv.TextOrNull("worker lost the execution; exceeded re-queue budget"),
 			WorkerID:             pgconv.UUID(updated.ID),
 			MissingCutoff:        missingCutoff,
@@ -2618,7 +2638,8 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		if err != nil {
 			return store.Worker{}, err
 		}
-		missingRequeued, err = qtx.RequeueRunsMissingFromSnapshot(ctx, store.RequeueRunsMissingFromSnapshotParams{
+		missingRequeued, err = qtx.FrozenRequeueRunsMissingFromSnapshot(ctx, store.FrozenRequeueRunsMissingFromSnapshotParams{
+			FrozenTargets: frozen, LockedParentIds: parents,
 			WorkerID:             pgconv.UUID(updated.ID),
 			MissingCutoff:        missingCutoff,
 			MaxRequeues:          maxRequeues,
@@ -2734,23 +2755,6 @@ func (s *Service) replaceRunDisk(ctx context.Context, wkr store.Worker, stats *W
 	if err := s.q.ReplaceWorkerRunDisk(ctx, arg); err != nil {
 		slog.Warn("heartbeat: store run disk sizes", "worker_id", wkr.ID.String(), "error", err)
 	}
-}
-
-// snapshotRunIDs parses the run ids an ActiveSnapshot lists into uuids for the canonical pre-lock
-// (PRD #1390 M2b). Unparseable ids are skipped (ReplaceWorkerActiveRuns rejects the whole snapshot
-// on a bad uuid anyway; the pre-lock only needs the parseable ones for its FOR UPDATE). Returns nil
-// for a nil/empty snapshot so the caller can skip the lock statement.
-func snapshotRunIDs(snap *ActiveSnapshot) []uuid.UUID {
-	if snap == nil || len(snap.Active) == 0 {
-		return nil
-	}
-	ids := make([]uuid.UUID, 0, len(snap.Active))
-	for _, e := range snap.Active {
-		if id, err := uuid.Parse(e.RunID); err == nil {
-			ids = append(ids, id)
-		}
-	}
-	return ids
 }
 
 // DiskPressureThreshold returns the configured UZI_DISK_PRESSURE_THRESHOLD (Params),
@@ -3063,21 +3067,18 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 	if err != nil {
 		return nil, err
 	}
-	// (b) Pre-lock the request snapshot's own runs in deterministic id order (skip when empty), so a
-	// sibling's concurrent FOR UPDATE SKIP LOCKED claim skips them until this tx commits its
-	// replacement. An id for a run this worker does not own is a no-op (the WHERE excludes it).
-	if ids := snapshotRunIDs(snapshot); len(ids) > 0 {
-		if _, err := qtx.LockOwnedRunsByIDs(ctx, store.LockOwnedRunsByIDsParams{
-			RunIds:   ids,
-			WorkerID: pgconv.UUID(wkr.ID),
-		}); err != nil {
-			return nil, err
-		}
+	entries, valid, err := s.validatedActiveSnapshot(locked, snapshot, snapshotModeClaim)
+	if err != nil {
+		return nil, err
 	}
-	// (c) Replace the snapshot in CLAIM mode: an invalid/stale-epoch/wrong-nonce snapshot returns
-	// ErrActiveSnapshotInvalid — ROLLBACK (via the defer) and return it so the handler fails the
-	// claim CLOSED (400, no claim, no side effect). A real DB error propagates the same way.
-	if _, err := s.ReplaceWorkerActiveRuns(ctx, qtx, locked, snapshot, snapshotModeClaim); err != nil {
+	if !valid {
+		return nil, ErrActiveSnapshotInvalid
+	}
+	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, validatedFinalizeResume{})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.applyWorkerActiveSnapshot(ctx, qtx, locked, snapshot, snapshotModeClaim, entries, locks); err != nil {
 		return nil, err
 	}
 	// (d) Claimant guard (snapshot-replace BEFORE overflow, blocker 2). The replace just set/cleared
