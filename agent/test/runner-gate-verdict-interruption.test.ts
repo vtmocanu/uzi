@@ -1623,7 +1623,7 @@ describe("shutdown at an observed plan gate", () => {
           assert.ok(s.statuses(resumed).includes("completed"), s.statuses(resumed).join(","));
         }
         assert.equal(s.rowsOf("cancel").length, 0, "neither claim required a cancel");
-      }));
+      }, {}, planApprovalTimeoutMs === 60_000 && failHeldGet ? "shutdown at an observed plan gate: 60000ms timeout, held GET fails, no session" : undefined));
   }
 });
 
