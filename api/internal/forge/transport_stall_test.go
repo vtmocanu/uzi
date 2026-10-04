@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/vtmocanu/uzi/api/internal/httptransport"
 )
 
 // Run each mode in a child process: installing the test CA on the shared
@@ -64,7 +66,7 @@ func TestForgeHTTP2StallInvestigation(t *testing.T) {
 	transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
 	recovery := os.Getenv("FORGE_STALL_CHILD") == "recovery"
 	if recovery {
-		transport = newForgeHTTPTransport(http.DefaultTransport)
+		transport = httptransport.New(http.DefaultTransport)
 		transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
 		// Scale only the durations in the child; production defaults have their
 		// own contract test. Exercise the real constructor and shared pool.
