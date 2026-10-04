@@ -4827,7 +4827,7 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     // N2: `paused` is a different status; this park never calls itself paused.
     expect(container.textContent).not.toMatch(/paused/i);
     expect(container.textContent).toContain(
-      `The run owner's vault was locked when this Codex run needed its credential. Using the vault unlock prompt queues this run promptly; work resumes when a worker picks it up. Scheduled retry fallback (${hhmm("2026-01-01T09:30:00Z")}).`,
+      `The run owner's vault was locked when this Codex run needed its credential. The run owner's explicit vault unlock queues this run promptly; work resumes when a worker picks it up. Scheduled retry fallback (${hhmm("2026-01-01T09:30:00Z")}).`,
     );
     // The banner is on screen while the viewer's vault is locked; the hint is conditional on
     // ownership, which the page cannot tell.
@@ -4847,7 +4847,7 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     const { container } = render(<RecoveryWaitPanel run={vaultPark()} />);
     expect(container.querySelector('[role="status"]')?.textContent).toContain("Waiting for vault unlock");
     expect(container.textContent).toContain(
-      `Using the vault unlock prompt queues this run promptly; work resumes when a worker picks it up. Scheduled retry fallback (${hhmm("2026-01-01T09:30:00Z")}).`,
+      `The run owner's explicit vault unlock queues this run promptly; work resumes when a worker picks it up. Scheduled retry fallback (${hhmm("2026-01-01T09:30:00Z")}).`,
     );
     expect(container.textContent).not.toMatch(/banner/i);
     expect(container.textContent).not.toMatch(/unlock your vault/i);
@@ -4872,7 +4872,7 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     const { container } = render(
       <RecoveryWaitPanel run={vaultPark({ recovery_retry_not_before: null })} />,
     );
-    expect(container.textContent).toContain("Using the vault unlock prompt queues this run promptly; work resumes when a worker picks it up. Scheduled retry fallback.");
+    expect(container.textContent).toContain("The run owner's explicit vault unlock queues this run promptly; work resumes when a worker picks it up. Scheduled retry fallback.");
     expect(container.textContent).not.toMatch(/retry fallback \(/);
   });
 
@@ -5252,7 +5252,7 @@ describe("RunView park announcement — recovery_wait (issue #1197, a11y)", () =
     });
     expect(region.getAttribute("aria-live")).toBe("polite");
     expect(region.textContent).toBe(
-      "This run is waiting for vault unlock. The run owner's vault was locked when this Codex run needed its credential. Using the vault unlock prompt queues this run promptly; work resumes when a worker picks it up. The scheduled retry remains the fallback.",
+      "This run is waiting for vault unlock. The run owner's vault was locked when this Codex run needed its credential. The run owner's explicit vault unlock queues this run promptly; work resumes when a worker picks it up. The scheduled retry remains the fallback.",
     );
     expect(region.textContent).not.toContain("transient interruption");
     expect(region.textContent).not.toMatch(/paused|unlock your vault/i);

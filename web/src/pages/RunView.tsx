@@ -1749,9 +1749,9 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
 
 /**
  * Issue #1766: the body of a `vault_locked` recovery park. The park comes from a Codex
- * credential refresh or release that found the run OWNER's vault locked, and the run resumes
- * at its next timer retry (`retryAt`, HH:MM, or null when the server sent no stamp) once that
- * vault is unlocked.
+ * credential refresh or release that found the run OWNER's vault locked. That owner's explicit
+ * unlock queues existing parks promptly; `retryAt` (HH:MM, or null without a stamp) names
+ * the timer fallback. A worker still picks up the queued run.
  *
  * The copy is owner-neutral ("the run owner's vault"), like codexHoldCopy's "the run's": an
  * admin may be reading another owner's run, and the Run DTO does not say who owns it. The
@@ -1767,7 +1767,7 @@ function VaultLockedParkBody({ retryAt }: { retryAt: string | null }) {
   return (
     <>
       <p className="mt-0.5 text-xs text-muted">
-        {`The run owner's vault was locked when this Codex run needed its credential. Using the vault unlock prompt queues this run promptly; work resumes when a worker picks it up. Scheduled retry fallback${retryAt ? ` (${retryAt})` : ""}.`}
+        {`The run owner's vault was locked when this Codex run needed its credential. The run owner's explicit vault unlock queues this run promptly; work resumes when a worker picks it up. Scheduled retry fallback${retryAt ? ` (${retryAt})` : ""}.`}
       </p>
       {!vaultUnlocked && (
         <p className="mt-1.5 text-xs text-muted">
@@ -2169,7 +2169,7 @@ export function RunView() {
           : parkKey === "recovery_wait"
             ? "This run paused to recover from a transient interruption and will resume automatically."
             : parkKey === "vault_locked"
-              ? "This run is waiting for vault unlock. The run owner's vault was locked when this Codex run needed its credential. Using the vault unlock prompt queues this run promptly; work resumes when a worker picks it up. The scheduled retry remains the fallback."
+              ? "This run is waiting for vault unlock. The run owner's vault was locked when this Codex run needed its credential. The run owner's explicit vault unlock queues this run promptly; work resumes when a worker picks it up. The scheduled retry remains the fallback."
             : parkKey === "data_volume_full"
               ? "This run is waiting for disk space. The worker's disk is full or nearly full; uzi frees space on the worker and the run resumes at its next retry."
             : parkKey.startsWith("codex:")
