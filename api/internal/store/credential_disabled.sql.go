@@ -367,37 +367,96 @@ func (q *Queries) ParkCredentialDisabledRun(ctx context.Context, arg ParkCredent
 }
 
 const promoteCredentialDisabledRun = `-- name: PromoteCredentialDisabledRun :one
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = $1 AND runs.user_id = $2
+  AND runs.status = 'paused' AND runs.hold_reason = 'credential_disabled'
+  AND runs.pause_requested_at IS NULL
+  AND runs.credential_override_mode IS NOT DISTINCT FROM $3::text
+  AND runs.credential_override_secret_id IS NOT DISTINCT FROM $4::uuid
+  AND runs.codex_secret_id IS NOT DISTINCT FROM $5::uuid
+  AND runs.worker_id IS NOT DISTINCT FROM $6::uuid
+  AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL OR
+       (COALESCE(runs.budget_wall_seconds, $7::int)
+          + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+       - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int)
+          - runs.budget_paused_seconds) > 0)
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET
     status = 'queued',
     status_since = now(),
-    budget_paused_seconds = budget_paused_seconds
-        + GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int),
+    budget_paused_seconds = runs.budget_paused_seconds
+        + GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int),
     hold_reason = NULL,
     -- Resume affinity is kept: the undelivered-claim park fences no incarnation. Only a row
     -- that carries a D19 released incarnation drops its worker, as ResumePausedRun does.
-    worker_id = CASE WHEN released_worker_id IS NOT NULL THEN NULL ELSE worker_id END,
+    worker_id = CASE WHEN runs.released_worker_id IS NOT NULL THEN NULL ELSE runs.worker_id END,
     codex_cap_hash = NULL,
-    codex_claim_epoch = codex_claim_epoch + 1,
+    codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE id = $1 AND user_id = $2
-  AND status = 'paused' AND hold_reason = 'credential_disabled'
-  AND pause_requested_at IS NULL
+WHERE runs.id = $1 AND runs.user_id = $2
+  AND runs.status = 'paused' AND runs.hold_reason = 'credential_disabled'
+  AND runs.pause_requested_at IS NULL
   -- The requirement the promoter evaluated must still be the run's requirement: a
   -- concurrent reassignment or rebind that is not serialized by the caller's locks
   -- makes this match 0 rows instead of promoting on a stale requirement.
-  AND credential_override_mode IS NOT DISTINCT FROM $3::text
-  AND credential_override_secret_id IS NOT DISTINCT FROM $4::uuid
-  AND codex_secret_id IS NOT DISTINCT FROM $5::uuid
-  AND worker_id IS NOT DISTINCT FROM $6::uuid
+  AND runs.credential_override_mode IS NOT DISTINCT FROM $3::text
+  AND runs.credential_override_secret_id IS NOT DISTINCT FROM $4::uuid
+  AND runs.codex_secret_id IS NOT DISTINCT FROM $5::uuid
+  AND runs.worker_id IS NOT DISTINCT FROM $6::uuid
   -- Untimed runs (chat, judge, interactive) have no wall (RequestWallParks' own exclusions),
   -- so the spent-budget guard applies only to a timed run.
-  AND (kind IN ('chat', 'judge') OR interactive OR started_at IS NULL OR
-       (COALESCE(budget_wall_seconds, $7::int)
-          + budget_extension_seconds + budget_finalize_seconds)
-       - (GREATEST(0, EXTRACT(EPOCH FROM (status_since - started_at))::int)
-          - budget_paused_seconds) > 0)
-RETURNING id, user_id, status
+  AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL OR
+       (COALESCE(runs.budget_wall_seconds, $7::int)
+          + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+       - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int)
+          - runs.budget_paused_seconds) > 0)
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ))
+RETURNING runs.id, runs.user_id, runs.status
 `
 
 type PromoteCredentialDisabledRunParams struct {
@@ -434,32 +493,87 @@ func (q *Queries) PromoteCredentialDisabledRun(ctx context.Context, arg PromoteC
 }
 
 const reassignCredentialDisabledRun = `-- name: ReassignCredentialDisabledRun :one
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = $3 AND runs.user_id = $4
+  AND runs.status = 'paused' AND runs.hold_reason = 'credential_disabled'
+  AND runs.pause_requested_at IS NULL
+  AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL OR
+       (COALESCE(runs.budget_wall_seconds, $5::int)
+          + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+       - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int)
+          - runs.budget_paused_seconds) > 0)
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET
     credential_override_mode = $1,
     credential_override_secret_id = $2,
     status = 'queued',
     status_since = now(),
-    budget_paused_seconds = budget_paused_seconds
-        + GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int),
+    budget_paused_seconds = runs.budget_paused_seconds
+        + GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int),
     hold_reason = NULL,
     -- Resume affinity is kept: the undelivered-claim park fences no incarnation. Only a row
     -- that carries a D19 released incarnation drops its worker, as ResumePausedRun does.
-    worker_id = CASE WHEN released_worker_id IS NOT NULL THEN NULL ELSE worker_id END,
+    worker_id = CASE WHEN runs.released_worker_id IS NOT NULL THEN NULL ELSE runs.worker_id END,
     codex_cap_hash = NULL,
-    codex_claim_epoch = codex_claim_epoch + 1,
+    codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE id = $3 AND user_id = $4
-  AND status = 'paused' AND hold_reason = 'credential_disabled'
-  AND pause_requested_at IS NULL
+WHERE runs.id = $3 AND runs.user_id = $4
+  AND runs.status = 'paused' AND runs.hold_reason = 'credential_disabled'
+  AND runs.pause_requested_at IS NULL
   -- Untimed runs (chat, judge, interactive) have no wall (RequestWallParks' own exclusions),
   -- so the spent-budget guard applies only to a timed run.
-  AND (kind IN ('chat', 'judge') OR interactive OR started_at IS NULL OR
-       (COALESCE(budget_wall_seconds, $5::int)
-          + budget_extension_seconds + budget_finalize_seconds)
-       - (GREATEST(0, EXTRACT(EPOCH FROM (status_since - started_at))::int)
-          - budget_paused_seconds) > 0)
-RETURNING id, user_id, status
+  AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL OR
+       (COALESCE(runs.budget_wall_seconds, $5::int)
+          + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+       - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int)
+          - runs.budget_paused_seconds) > 0)
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ))
+RETURNING runs.id, runs.user_id, runs.status
 `
 
 type ReassignCredentialDisabledRunParams struct {

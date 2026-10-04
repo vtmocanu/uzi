@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/capability"
@@ -93,9 +94,17 @@ func TestPlanCrossCheckReleasedWorkerPlacementLiveDB(t *testing.T) {
 				mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET plan_cross_check_required=true WHERE id=$1`, runID)
 			} else {
 				leadID := fx.queuedRun()
-				mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET status='running' WHERE id=$1`, leadID)
+				mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET status='running',harness='claude',
+     plan_cross_check_required=true,auto_approve=true,worker_id=$2,claim_generation=1,
+     claim_released_at=NULL WHERE id=$1`, leadID, workerID)
 				mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET kind='cross_check',issue_iid=NULL,target_run_id=$2,
-     harness='codex',report_only=true,budget_wall_seconds=1800 WHERE id=$1`, runID, leadID)
+     harness='codex',report_only=true,budget_wall_seconds=300,trigger_source='cross_check',
+     auto_approve=true,dispatched_at=now(),priority=2 WHERE id=$1`, runID, leadID)
+				mustExec(fx.ctx, t, fx.pool, `INSERT INTO cross_checks
+     (id,lead_run_id,checker_run_id,stage,round,lead_claim_generation,
+      plan_md,milestones,size_class,base_commit,candidate_digest,checker_harness,deadline_at)
+     VALUES ($1,$2,$3,'plan',1,1,'plan','[]'::jsonb,'s',repeat('a',40),
+      $4,'codex',now()+interval '5 minutes')`, uuid.New(), leadID, runID, []byte("test-digest"))
 			}
 			// All existing Codex protocol requirements pass. Only the new capability is absent.
 			releasedCaps := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}

@@ -811,6 +811,28 @@ WITH target AS (
       -- unaffected (dispatched_at is only ever set on a task run).
       AND (r.kind <> 'task' OR r.dispatched_at IS NOT NULL)
       AND r.status = 'queued'
+      -- Lock only this checker's parent, then its pending attempt, before the target
+      -- row and custody side effects. A changed verdict is rechecked on the locked cc.
+      AND (r.kind <> 'cross_check' OR EXISTS (
+          SELECT 1 FROM (
+              SELECT cc.* FROM cross_checks cc
+              JOIN (
+                  SELECT lead.* FROM runs lead
+                  WHERE lead.id = r.target_run_id AND lead.user_id = r.user_id
+                    AND lead.kind <> 'cross_check'
+                  ORDER BY lead.id
+                  FOR UPDATE OF lead SKIP LOCKED
+              ) lead ON lead.id = cc.lead_run_id
+              WHERE cc.checker_run_id = r.id AND cc.lead_run_id = r.target_run_id
+                AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+                AND cc.deadline_at > now()
+                AND lead.status IN ('claimed', 'running')
+                AND lead.claim_released_at IS NULL
+                AND lead.claim_generation = cc.lead_claim_generation
+              ORDER BY cc.lead_run_id
+              FOR UPDATE OF cc SKIP LOCKED
+          ) locked_checks
+      ))
       AND (r.worker_id IS NULL
            OR r.worker_id = @worker_id
            -- Hold the pin whenever the run's OWN worker ROW still exists AND it can
@@ -1310,7 +1332,7 @@ UPDATE runs SET
     updated_at = now(),
     -- PRD #1296 M1 (D2): the general claim-lane counter, incremented once per successful
     -- claim. Returned in the claim payload; the hold above binds the identical value.
-    claim_generation = claim_generation + 1,
+    claim_generation = runs.claim_generation + 1,
     -- PRD #1247 M5 (D3): CLOSE the released-claim fence window. A held-state credential
     -- switch requeues the run with claim_released_at set (ReleaseCredentialSwitch), which
     -- makes the generation fence reject every report from the OLD flight. Reclaiming the
@@ -1338,8 +1360,10 @@ UPDATE runs SET
     -- Exit contract (PRD #47 Decision 3): leaving 'queued' clears any health flag
     -- the detector raised (e.g. "no worker online"). health_notified_at is NOT reset.
     health = 'ok', health_reason = NULL, health_since = NULL
-WHERE id = (SELECT id FROM target)
-RETURNING *;
+WHERE runs.id = (SELECT id FROM target)
+  AND runs.status = 'queued'
+  AND runs.claim_generation = (SELECT claim_generation FROM target)
+RETURNING runs.*;
 
 -- name: GetCustodyAdmissionForRun :one
 -- Issue #1751 / ADR-1751: the per-run custody-admission facts the health resolver reads so
@@ -2523,6 +2547,46 @@ WHERE id = @id AND worker_id = @worker_id
 -- so the caller can publish each promotion through the broadcaster/notifier
 -- fan-out; a promotion to 'queued' moves the board card to In Progress exactly like
 -- a requeue.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.status = 'limit_wait' AND runs.retry_not_before <= @now
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET
     status     = 'queued',
     status_since = now(),
@@ -2534,11 +2598,19 @@ UPDATE runs SET
     -- A promoted run has no live owner until it is re-claimed, so any capability minted for
     -- the prior claim must not survive the requeue; clearing the hash and bumping the epoch
     -- supersedes it, mirroring the claimed→queued revocation sites.
-    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE status = 'limit_wait' AND retry_not_before <= @now
-RETURNING id, user_id, status;
+WHERE runs.status = 'limit_wait' AND runs.retry_not_before <= @now
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ))
+RETURNING runs.id, runs.user_id, runs.status;
 
 -- name: PromoteLimitWaitRunNow :execrows
 -- The SINGLE-ROW early promote of ONE owner's limit_wait run for `uzi run set-token`
@@ -2567,15 +2639,63 @@ RETURNING id, user_id, status;
 -- Owner- and status-scoped (user_id + status = 'limit_wait'): a run that moved out of
 -- limit_wait between the verb's read and this write is a 0-row no-op the service surfaces
 -- as a 409 (raced), and a foreign run can never be promoted.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'limit_wait'
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET
     status     = 'queued',
     status_since = now(),
     started_at = NULL,
     budget_paused_seconds = 0,
-    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE id = @id AND user_id = @user_id AND status = 'limit_wait';
+WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'limit_wait'
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ));
 
 -- name: ListLimitWaitReeval :many
 -- The duration-time auto-failover worklist (PRD #1247 M3, D8): every run STILL parked
@@ -2829,6 +2949,47 @@ FOR UPDATE;
 -- session_id, worker_id and recovery_retry_not_before are left in place as affinity/history
 -- exactly as PromoteLimitWaitRuns leaves limit_wait's. A stale recovery_retry_not_before
 -- cannot re-fire this statement because the status predicate has already moved.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.status = 'recovery_wait' AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
+  AND runs.recovery_retry_not_before <= @now
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET
     status     = 'queued',
     status_since = now(),
@@ -2837,12 +2998,20 @@ UPDATE runs SET
     -- Revoke the per-claim Codex capability on park->queued, exactly as PromoteLimitWaitRuns:
     -- a promoted run has no live owner until re-claimed, so clearing the hash and bumping the
     -- epoch supersedes any capability minted for the prior claim.
-    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE status = 'recovery_wait' AND recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
-  AND recovery_retry_not_before <= @now
-RETURNING id, user_id, status;
+WHERE runs.status = 'recovery_wait' AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
+  AND runs.recovery_retry_not_before <= @now
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ))
+RETURNING runs.id, runs.user_id, runs.status;
 
 -- name: PromoteRecoveryWaitRunNow :execrows
 -- The SINGLE-ROW early promote of ONE owner's recovery_wait run for `uzi run set-token`
@@ -2861,16 +3030,65 @@ RETURNING id, user_id, status;
 -- Owner- and status-scoped (user_id + status = 'recovery_wait'): a run that moved out of
 -- recovery_wait between the verb's read and this write is a 0-row no-op the service
 -- surfaces as a 409 (raced), and a foreign run can never be promoted.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET
     status     = 'queued',
     status_since = now(),
     started_at = NULL,
     budget_paused_seconds = 0,
-    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait'
-  AND recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable';
+WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ));
 
 -- name: SetRunPaused :execrows
 -- Park a run on the owner's explicit request (PRD #1190 M1). running -> paused,
@@ -3057,30 +3275,84 @@ RETURNING runs.*;
 --     has no expiry, so the worker may be a new safe incarnation by now). A worker-side park
 --     (claim_released_at IS NULL) KEEPS worker_id for the same-worker resume, as PRD #1190.
 -- All guards use IS DISTINCT FROM / OR so a NULL hold_reason (an owner pause) always resumes.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.user_id = @user_id
+  AND runs.status = 'paused'
+  AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
+  AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
+  AND (runs.hold_reason IS DISTINCT FROM 'budget_exhausted'
+       OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+          - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET
     status                = 'queued',
     status_since          = now(),
-    budget_paused_seconds = budget_paused_seconds
-        + GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int),
+    budget_paused_seconds = runs.budget_paused_seconds
+        + GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int),
     -- D19: drop worker affinity for a server-side park; keep it for a worker-side park.
-    worker_id = CASE WHEN claim_released_at IS NOT NULL THEN NULL ELSE worker_id END,
+    worker_id = CASE WHEN runs.claim_released_at IS NOT NULL THEN NULL ELSE runs.worker_id END,
     -- D7: a resumed budget_exhausted row leaves the wall hold behind.
-    hold_reason = CASE WHEN hold_reason = 'budget_exhausted' THEN NULL ELSE hold_reason END,
-    hold_captured_head = CASE WHEN hold_reason = 'budget_exhausted' THEN NULL ELSE hold_captured_head END,
-    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    hold_reason = CASE WHEN runs.hold_reason = 'budget_exhausted' THEN NULL ELSE runs.hold_reason END,
+    hold_captured_head = CASE WHEN runs.hold_reason = 'budget_exhausted' THEN NULL ELSE runs.hold_captured_head END,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at            = now()
-WHERE id = @id AND user_id = @user_id
-  AND status = 'paused'
-  AND hold_reason IS DISTINCT FROM 'credential_disabled'
+WHERE runs.id = @id AND runs.user_id = @user_id
+  AND runs.status = 'paused'
+  AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
   -- D6: refuse a completion hold unless the completion decision endpoint opts in.
-  AND (hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
+  AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
   -- D7: refuse a budget_exhausted park with no remaining budget (extend is the way back).
   -- Remaining = three-term total - (elapsed active run-time) = total - ((status_since - started_at) - budget_paused_seconds).
-  AND (hold_reason IS DISTINCT FROM 'budget_exhausted'
-       OR (COALESCE(budget_wall_seconds, @global_timeout_seconds::int) + budget_extension_seconds + budget_finalize_seconds)
-          - (GREATEST(0, EXTRACT(EPOCH FROM (status_since - started_at))::int) - budget_paused_seconds) > 0)
-RETURNING id, user_id, status;
+  AND (runs.hold_reason IS DISTINCT FROM 'budget_exhausted'
+       OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+          - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ))
+RETURNING runs.id, runs.user_id, runs.status;
 
 -- name: SetRunWallPark :one
 -- PRD #1497 M1 (D4/D14/D15): the worker's own capture-first wall park. A NEW worker-authored,
@@ -3206,19 +3478,70 @@ WHERE id = @id
 -- cap/epoch are revoked/bumped like every other park->queued transition; health is reset because
 -- 'queued' is on the detector's allowlist. Status_since is NOT NULL (migration 00163), so the
 -- banked interval is never NULL.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND runs.claim_generation = @generation
+  AND runs.claim_released_at IS NULL
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET
     status                = 'queued',
     status_since          = now(),
     claim_released_at     = now(),
-    budget_paused_seconds = budget_paused_seconds
-        + GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int),
-    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    budget_paused_seconds = runs.budget_paused_seconds
+        + GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int),
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at            = now()
-WHERE id = @id AND worker_id = @worker_id
-  AND claim_generation = @generation
-  AND claim_released_at IS NULL
-  AND status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup');
+WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND runs.claim_generation = @generation
+  AND runs.claim_released_at IS NULL
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ));
 
 -- name: StampHeldCredentialSwitch :execrows
 -- PRD #1247 M5 (D4, BLOCKING-1 rework): the held-state credential switch for the owner's
@@ -3736,8 +4059,34 @@ WHERE id = @id
 -- that will never come. cancelled restores the origin column → stamp. stop_kind is
 -- stamped 'cancelled' for uniformity (PRD #33 Decision 3), though isStoppedRun's
 -- status='cancelled' branch already treats this run as a deliberate stop.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.user_id = @user_id
+  AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
-    status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     -- PRD #503 M3: persist the operator's OPTIONAL cancel reason. @stop_reason binds a
     -- nullable pgtype.Text: an invalid/zero value stores NULL (no reason supplied).
     stop_reason = @stop_reason,
@@ -3750,8 +4099,9 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE id = @id AND user_id = @user_id
-  AND status NOT IN ('completed', 'failed', 'cancelled');
+WHERE runs.id = @id AND runs.user_id = @user_id
+  AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+  AND runs.id IN (SELECT run_id FROM eligible_candidates);
 
 -- name: RunHasPendingOutcomeLease :one
 -- PRD #1391 Run B M3d (D13): does this run currently have a terminal outcome journaled and
@@ -3791,8 +4141,41 @@ SELECT EXISTS (
 -- first, this matches 0 rows (status NOT IN protects it); if this wins, the replay's no-op 409
 -- returns `cancelled`, the journal retires and completion side effects never fire. Field-for-field
 -- identical to CancelRunServerSide's terminal cleanup; only the WHERE differs.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.user_id = @user_id
+  AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+  AND runs.kind <> 'chat'
+  AND (EXISTS (SELECT 1 FROM worker_active_runs a
+               WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                 AND a.terminal_pending_until > now()
+                 AND a.claim_generation = runs.claim_generation)
+       OR EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now()))
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
-    status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     stop_reason = @stop_reason,
     milestones_in_progress = NULL,
     milestones_agents = NULL,
@@ -3808,7 +4191,8 @@ WHERE runs.id = @id AND runs.user_id = @user_id
                  AND a.terminal_pending_until > now()
                  AND a.claim_generation = runs.claim_generation)
        OR EXISTS (SELECT 1 FROM workers w
-                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now()));
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now()))
+  AND runs.id IN (SELECT run_id FROM eligible_candidates);
 
 -- name: GetActiveMRReworkRunForMR :one
 -- Resolve the single non-terminal mr_rework run for a (repo, MR). Used by the
@@ -3847,12 +4231,39 @@ LIMIT 1;
 -- a worker, not a user, so CancelRunServerSide (user_id-scoped) is unusable from it.
 -- stop_kind is left untouched (already 'cancelled'). Terminal-run cleanup + guard mirror
 -- SetRunFailed exactly, so a report onto an already-terminal run is a 0-row no-op.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND runs.claim_released_at IS NULL
+  AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET
     plan_cross_check_gate_reason = NULL,
     status             = 'cancelled',
     status_since       = now(),
     fail_origin        = NULL,
-    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,
+    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END,
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
@@ -3863,9 +4274,10 @@ UPDATE runs SET
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
-WHERE id = @id AND worker_id = @worker_id
-  AND claim_released_at IS NULL
-  AND status NOT IN ('completed', 'failed', 'cancelled');
+WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND runs.claim_released_at IS NULL
+  AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+  AND runs.id IN (SELECT run_id FROM eligible_candidates);
 
 -- name: SupersedeRunByWorker :execrows
 -- Issue #1117: a LIVE mr_rework worker whose finalize push was rejected non-fast-forward
@@ -3877,6 +4289,34 @@ WHERE id = @id AND worker_id = @worker_id
 -- a static stop_reason in the same statement (branch_moved has no pre-stamp, unlike a
 -- CreateStopVerdictInput cancel). Terminal cleanup mirrors CancelRunByWorker. Its extra
 -- hold guard keeps a late failed report from cancelling a wall or completion hold.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND runs.claim_released_at IS NULL
+  AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET
     plan_cross_check_gate_reason = NULL,
     status             = 'cancelled',
@@ -3884,7 +4324,7 @@ UPDATE runs SET
     stop_reason        = 'The MR branch was advanced by a concurrent writer, so this rework was superseded and not applied. The branch and the concurrent commits are intact.',
     status_since       = now(),
     fail_origin        = NULL,
-    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,
+    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END,
     finished_at        = now(),
     milestones_in_progress = NULL,
     milestones_agents = NULL,
@@ -3892,10 +4332,11 @@ UPDATE runs SET
     credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
-WHERE id = @id AND worker_id = @worker_id
-  AND claim_released_at IS NULL
-  AND status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE));
+WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND runs.claim_released_at IS NULL
+  AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
+  AND runs.id IN (SELECT run_id FROM eligible_candidates);
 
 -- name: FailRunAutoStop :execrows
 -- Server-side auto-stop (PRD #108 M5) for a run whose message writes are in a
@@ -4014,11 +4455,39 @@ WHERE runs.id = @id
 -- stamped 'plan_rejected' in the same statement as the status/failure_reason write
 -- (PRD #33 Decision 3), so this failed run is recognised as a deliberate stop
 -- regardless of the failure_reason text.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.user_id = @user_id
+  AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+  AND (sqlc.narg('expected_gate_revision')::bigint IS NULL
+       OR (runs.status = 'awaiting_approval' AND runs.gate_revision = sqlc.narg('expected_gate_revision')::bigint))
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
     status = 'failed', status_since = now(), stop_kind = 'plan_rejected',
     -- PRD #69 M7a: trusted failure class, overlapping stop_kind deliberately (see 00126).
     fail_origin = 'plan_rejected',
-    failure_reason = @failure_reason, move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    failure_reason = @failure_reason, move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
     milestones_agents = NULL,
@@ -4028,12 +4497,13 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE id = @id AND user_id = @user_id
-  AND status NOT IN ('completed', 'failed', 'cancelled')
+WHERE runs.id = @id AND runs.user_id = @user_id
+  AND runs.status NOT IN ('completed', 'failed', 'cancelled')
   -- PRD #1795 M2 (D5): a reject sent against a revision the run no longer shows does not fail
   -- the run (0 rows; the caller re-reads and answers gate_revision_mismatch).
   AND (sqlc.narg('expected_gate_revision')::bigint IS NULL
-       OR (status = 'awaiting_approval' AND gate_revision = sqlc.narg('expected_gate_revision')::bigint));
+       OR (runs.status = 'awaiting_approval' AND runs.gate_revision = sqlc.narg('expected_gate_revision')::bigint))
+  AND runs.id IN (SELECT run_id FROM eligible_candidates);
 
 -- name: UpdateRunLastSeq :execrows
 -- Advance the message high-water mark (never regresses) AND bump last_activity_at
@@ -4064,6 +4534,74 @@ WHERE id = @id
 -- kept for affinity so the same disk reclaims it). RETURNING id, user_id, status
 -- so the sweeper can publish each transition through the broadcaster/notifier
 -- fan-out (PRD #25 M3: sweeper-driven transitions were previously silent).
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.status = 'claimed' AND runs.claimed_at < @cutoff
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      -- The lead-exit trigger owns cancellation of a same-batch checker.
+      AND NOT EXISTS (
+          SELECT 1 FROM cross_checks cc
+          JOIN candidates exiting ON exiting.id = cc.lead_run_id
+          WHERE cc.checker_run_id = mapping.run_id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND EXISTS (
+                SELECT 1 FROM locked_parents runs
+                WHERE runs.id = exiting.id
+                  AND runs.status IN ('claimed', 'running')
+                  AND runs.claim_released_at IS NULL
+                  AND (status = 'claimed' AND claimed_at < @cutoff
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now()))))
+            )
+      )
+)
 UPDATE runs SET status = 'queued', status_since = now(),
     -- Exit contract (PRD #47 Decision 3): reset on the way to a fresh 'queued'; the
     -- detector re-evaluates the queued signal from this transition's status_since.
@@ -4073,9 +4611,9 @@ UPDATE runs SET status = 'queued', status_since = now(),
     -- must revoke the per-claim capability here too, or a run swept back to queued
     -- would keep a live cap_hash replayable on its next claim. Clear the hash and
     -- bump the epoch; a harmless no-op for non-codex runs (cap_hash already NULL).
-    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
-WHERE status = 'claimed' AND claimed_at < @cutoff
+WHERE runs.status = 'claimed' AND runs.claimed_at < @cutoff
   -- PRD #1390 D11: a `claimed` run whose initial `running` report never landed while its worker
   -- journaled a terminal outcome and leased it (or whose owner is pending_overflow) must not be
   -- reset to `queued` — that would invite a re-claim that overtakes the pending replay. Chat is
@@ -4087,7 +4625,15 @@ WHERE status = 'claimed' AND claimed_at < @cutoff
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-RETURNING id, user_id, status;
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ))
+RETURNING runs.id, runs.user_id, runs.status;
 
 -- name: RequeueClaimedRunToQueued :execrows
 -- Vault lock race (PRD #32 M3): a run claimed while the owner's vault was
@@ -4100,6 +4646,46 @@ RETURNING id, user_id, status;
 -- (not :many like the sweeps): this runs on the claim path, not the sweeper, and
 -- deliberately does not broadcast the claimed→queued transition (matching the
 -- reviewed PRD #32 M3 behavior — it is a rare lock-race requeue, not a sweep).
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.status = 'claimed'
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET status = 'queued', status_since = now(),
     -- Exit contract (PRD #47 Decision 3): mirrors SweepClaimedNeverStarted — a
     -- 'claimed' run never carries a flag, so this is defensive, but it keeps every
@@ -4109,9 +4695,17 @@ UPDATE runs SET status = 'queued', status_since = now(),
     -- per-claim capability immediately — clear the hash and bump the epoch so a stale
     -- capability minted under this claim can never be replayed. A harmless no-op for a
     -- non-codex run, whose codex_cap_hash is already NULL.
-    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
-WHERE id = @id AND status = 'claimed';
+WHERE runs.id = @id AND runs.status = 'claimed'
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ));
 
 -- name: ParkRunCodexAccountUnavailable :one
 -- Called under the exact-claim row lock, after settling this generation's hold.
@@ -4166,10 +4760,49 @@ WITH page AS MATERIALIZED (
       AND runs.id > @after_id::uuid
     ORDER BY runs.id
     LIMIT @page_cap::int
+), candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id IN (SELECT page.id FROM page) AND runs.status = 'queued'
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead SKIP LOCKED
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc SKIP LOCKED
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
 ),
 locked AS (
     SELECT runs.id FROM runs
-    WHERE runs.id IN (SELECT page.id FROM page) AND runs.status = 'queued'
+    WHERE runs.id IN (SELECT run_id FROM eligible_candidates) AND runs.status = 'queued'
     ORDER BY runs.id
     FOR UPDATE SKIP LOCKED
 ),
@@ -4182,6 +4815,18 @@ parked AS (
         health = 'ok', health_reason = NULL, health_since = NULL,
         updated_at = now()
     WHERE r.id IN (SELECT locked.id FROM locked)
+      AND (r.kind <> 'cross_check' OR EXISTS (
+          SELECT 1 FROM locked_checks cc
+          JOIN locked_parents lead ON lead.id = cc.lead_run_id
+          CROSS JOIN checker_lock_set checks
+          WHERE cc.checker_run_id = r.id AND r.id = ANY(checks.ids)
+            AND cc.lead_run_id = r.target_run_id
+            AND lead.user_id = r.user_id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND cc.deadline_at > now()
+            AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
+            AND lead.claim_generation = cc.lead_claim_generation
+      ))
       AND r.status = 'queued'
       AND r.harness = 'codex'
       AND r.codex_auth_mode = 'subscription'
@@ -4231,16 +4876,42 @@ ORDER BY id
 LIMIT @page_cap::int;
 
 -- name: LockCodexAccountWaitRunForUpdate :one
--- PRD #1590 M3 (D3): the first lock of the per-run promotion transaction, taken BEFORE the
--- alias and then the account (run -> alias -> account). Status and cause are re-checked here,
+-- PRD #1590 M3 (D3): prelock the selected parent before the run, then the caller locks
+-- the alias and account (parent -> run -> alias -> account). Status and cause are re-checked here,
 -- so a run cancelled or promoted since the page was listed is pgx.ErrNoRows. SKIP LOCKED: the
 -- sweeper never waits on a run row another transaction holds (a cancel, say); that run is
 -- retried on a later tick. No writer in the re-login path touches the run row. NO KEY UPDATE,
 -- the level PromoteCodexAccountWaitRun's own UPDATE takes: it changes no column a foreign key
 -- can reference, so the lock need not block FOR KEY SHARE (a child row's FK check).
-SELECT * FROM runs
-WHERE id = @id AND status = 'recovery_wait' AND recovery_wait_cause = 'codex_account_unavailable'
-FOR NO KEY UPDATE SKIP LOCKED;
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause = 'codex_account_unavailable'
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead SKIP LOCKED
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
+SELECT runs.* FROM runs
+WHERE runs.id = @id AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause = 'codex_account_unavailable'
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+FOR NO KEY UPDATE OF runs SKIP LOCKED;
 
 -- name: PromoteCodexAccountWaitRun :execrows
 -- PRD #1590 M3 (D3): the account-driven promotion recovery_wait -> queued, run inside the
@@ -4249,15 +4920,63 @@ FOR NO KEY UPDATE SKIP LOCKED;
 -- for field (fresh RUN_TIMEOUT wall, banked pause cleared, capability revoked and epoch bumped,
 -- health reset); worker_id, session_id and recovery_wait_count stay as affinity and history,
 -- as there. Fenced on status and the cause, so it can promote only this hold.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause = 'codex_account_unavailable'
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET
     status     = 'queued',
     status_since = now(),
     started_at = NULL,
     budget_paused_seconds = 0,
-    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE id = @id AND status = 'recovery_wait' AND recovery_wait_cause = 'codex_account_unavailable';
+WHERE runs.id = @id AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause = 'codex_account_unavailable'
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ));
 
 -- name: FailClaimAssemblyExact :execrows
 -- Terminal claim assembly failure, fenced to the same locked claim (PRD #1590 D2). The
@@ -4294,17 +5013,67 @@ WHERE id = @id AND worker_id = @worker_id AND claim_generation = @claim_generati
 -- Both arms keep the POSITIVE source guard (status = 'claimed'), revoke the claim's Codex
 -- capability (PRD #1147 F7), reset health (the status itself is the signal; never write a
 -- sentence into health_reason) and keep worker_id for resume affinity.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.worker_id = @worker_id AND runs.claim_generation = @claim_generation
+  AND runs.status = 'claimed'
+  AND (NOT @pool_wait::boolean OR runs.kind NOT IN ('judge', 'job', 'cross_check'))
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET
     status = CASE WHEN @pool_wait::boolean THEN 'pool_wait' ELSE 'queued' END,
     status_since = now(),
-    started_at = CASE WHEN @pool_wait::boolean THEN NULL ELSE started_at END,
-    budget_paused_seconds = CASE WHEN @pool_wait::boolean THEN 0 ELSE budget_paused_seconds END,
+    started_at = CASE WHEN @pool_wait::boolean THEN NULL ELSE runs.started_at END,
+    budget_paused_seconds = CASE WHEN @pool_wait::boolean THEN 0 ELSE runs.budget_paused_seconds END,
     health = 'ok', health_reason = NULL, health_since = NULL,
-    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
-WHERE id = @id AND worker_id = @worker_id AND claim_generation = @claim_generation
-  AND status = 'claimed'
-  AND (NOT @pool_wait::boolean OR kind NOT IN ('judge', 'job', 'cross_check'));
+WHERE runs.id = @id AND runs.worker_id = @worker_id AND runs.claim_generation = @claim_generation
+  AND runs.status = 'claimed'
+  AND (NOT @pool_wait::boolean OR runs.kind NOT IN ('judge', 'job', 'cross_check'))
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ));
 
 -- name: ListPoolWaitRuns :many
 -- The reactive-resume worklist (PRD #754 M5): every run currently held in pool_wait,
@@ -4350,6 +5119,47 @@ ORDER BY status_since ASC;
 -- is a 0-row no-op, which is exactly what lets resume-now's handler tell "not held" (409)
 -- apart from "not yours / absent" (404) by re-reading the run after a 0-row result. The
 -- status predicate also makes a re-delivered or racing promote inert once the run has moved.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.user_id = @user_id
+  AND runs.status = 'pool_wait'
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET
     status       = 'queued',
     status_since = now(),
@@ -4361,11 +5171,19 @@ UPDATE runs SET
     -- pool_wait→queued. A promoted run has no live owner until it is re-claimed, so any
     -- capability minted for the prior claim must not survive the requeue; clearing the hash
     -- and bumping the epoch supersedes it, mirroring the claimed→queued revocation sites.
-    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at   = now()
-WHERE id = @id AND user_id = @user_id
-  AND status = 'pool_wait';
+WHERE runs.id = @id AND runs.user_id = @user_id
+  AND runs.status = 'pool_wait'
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ));
 
 -- name: SweepTaskNeverDispatched :many
 -- PRD #400 Decision 6 orphan reaper (issue #1367): a kind='task' (handoff) run is created
@@ -4694,12 +5512,62 @@ WITH locked AS (
     WHERE workers.last_heartbeat_at IS NULL OR workers.last_heartbeat_at < @fail_cutoff
     ORDER BY workers.id
     FOR UPDATE
+), candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+      AND runs.requeue_count >= @max_requeues
+      AND runs.worker_id IN (SELECT id FROM locked)
+      AND (runs.kind = 'chat'
+           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                             AND a.terminal_pending_until > now()
+                             AND a.claim_generation = runs.claim_generation)
+               AND NOT EXISTS (SELECT 1 FROM workers w
+                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Collect the actual locked IDs completely before any checker can be mutated.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      -- A same-batch lead exit owns its checker cancellation through the trigger.
+      AND NOT EXISTS (
+          SELECT 1 FROM cross_checks cc
+          JOIN candidates exiting ON exiting.id = cc.lead_run_id
+          JOIN locked_parents lead ON lead.id = exiting.id
+          WHERE cc.checker_run_id = mapping.run_id
+            AND lead.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+              AND lead.requeue_count >= @max_requeues
+              AND lead.worker_id IN (SELECT id FROM locked)
+              AND (lead.kind = 'chat'
+                     OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                                     WHERE a.run_id = lead.id AND a.worker_id = lead.worker_id AND a.terminal_pending
+                                       AND a.terminal_pending_until > now()
+                                       AND a.claim_generation = lead.claim_generation)
+                         AND NOT EXISTS (SELECT 1 FROM workers w
+                                         WHERE w.id = lead.worker_id AND w.pending_overflow_until > now())))
+      )
 )
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
     status = 'failed', status_since = now(), failure_reason = @failure_reason,
     -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
     fail_origin = 'worker_lost',
-    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
     milestones_agents = NULL,
@@ -4709,9 +5577,11 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND requeue_count >= @max_requeues
-  AND worker_id IN (SELECT id FROM locked)
+FROM eligible_candidates candidate
+WHERE runs.id = candidate.run_id
+  AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.requeue_count >= @max_requeues
+  AND runs.worker_id IN (SELECT id FROM locked)
   -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
   AND (runs.kind = 'chat'
        OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
@@ -4720,7 +5590,7 @@ WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'a
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-RETURNING id, user_id, status;
+RETURNING runs.id, runs.user_id, runs.status;
 
 -- name: RequeueRunsOfStaleWorkers :many
 -- A stale worker's non-terminal run within its re-queue budget → back to queued
@@ -4735,31 +5605,98 @@ WITH locked AS (
     WHERE workers.last_heartbeat_at IS NULL OR workers.last_heartbeat_at < @cutoff
     ORDER BY workers.id
     FOR UPDATE
+), candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+      AND runs.requeue_count < @max_requeues
+      AND runs.worker_id IN (SELECT id FROM locked)
+      AND (runs.kind = 'chat'
+           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                             AND a.terminal_pending_until > now()
+                             AND a.claim_generation = runs.claim_generation)
+               AND NOT EXISTS (SELECT 1 FROM workers w
+                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Collect the actual locked IDs completely before any checker can be mutated.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      -- A same-batch lead exit owns its checker cancellation through the trigger.
+      AND NOT EXISTS (
+          SELECT 1 FROM cross_checks cc
+          JOIN candidates exiting ON exiting.id = cc.lead_run_id
+          JOIN locked_parents lead ON lead.id = exiting.id
+          WHERE cc.checker_run_id = mapping.run_id
+            AND lead.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+              AND lead.requeue_count < @max_requeues
+              AND lead.worker_id IN (SELECT id FROM locked)
+              AND (lead.kind = 'chat'
+                     OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                                     WHERE a.run_id = lead.id AND a.worker_id = lead.worker_id AND a.terminal_pending
+                                       AND a.terminal_pending_until > now()
+                                       AND a.claim_generation = lead.claim_generation)
+                         AND NOT EXISTS (SELECT 1 FROM workers w
+                                         WHERE w.id = lead.worker_id AND w.pending_overflow_until > now())))
+      )
 )
-UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue_count + 1,
+UPDATE runs SET status = 'queued', status_since = now(), requeue_count = runs.requeue_count + 1,
     -- Exit contract (PRD #47 Decision 3): reset on the way back to 'queued'; the
     -- detector re-evaluates the queued signal from this transition's status_since.
     health = 'ok', health_reason = NULL, health_since = NULL,
     -- PRD #1390 M2b (D2): record the generation this stale-worker requeue charged, so the
     -- heartbeat re-adoption can refund the requeue only when the same generation is restored
     -- (a legitimate earlier loss is never refunded). The restore and every ClaimRun clear it.
-    stale_requeue_generation = claim_generation,
+    stale_requeue_generation = runs.claim_generation,
     -- Issue #783: bank park time before a worker-death requeue -> queued, since started_at
     -- survives the requeue and the later claimed->running resume would not see the park.
     -- awaiting_followup is intentionally excluded: interactive runs are exempt from
     -- SweepRunningTimeout entirely (interactive = false), so they have no wall deadline.
-    budget_paused_seconds = budget_paused_seconds
-        + CASE WHEN status IN ('awaiting_approval', 'awaiting_input')
-               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
+    budget_paused_seconds = runs.budget_paused_seconds
+        + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
                ELSE 0 END,
     -- Codex claim-capability revocation (PRD #1147 M2): a stale worker losing its runs
     -- revokes their per-claim capabilities immediately — clear the hash and bump the
     -- epoch. A harmless no-op for a non-codex run, whose codex_cap_hash is already NULL.
-    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
-WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND requeue_count < @max_requeues
-  AND worker_id IN (SELECT id FROM locked)
+FROM eligible_candidates candidate
+WHERE runs.id = candidate.run_id
+  AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.requeue_count < @max_requeues
+  AND runs.worker_id IN (SELECT id FROM locked)
   -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
   AND (runs.kind = 'chat'
        OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
@@ -4768,7 +5705,14 @@ WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'a
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-RETURNING id, user_id, status;
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ))
+RETURNING runs.id, runs.user_id, runs.status;
 
 -- Register-time orphan recovery (worker-scoped) ------------------------------
 
@@ -4779,11 +5723,62 @@ RETURNING id, user_id, status;
 -- it stamps move_pending_since. RETURNING id so the caller can funnel these
 -- committed-terminal (worker-lost) runs into the judge (PRD #46 Decision 2), exactly
 -- as the sweeper's FailRunsOfStaleWorkersOverCap does.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.worker_id = @worker_id
+      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+      AND runs.requeue_count >= @max_requeues
+      AND (runs.kind = 'chat'
+           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                             AND a.terminal_pending_until > now()
+                             AND a.claim_generation = runs.claim_generation)
+               AND NOT EXISTS (SELECT 1 FROM workers w
+                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Collect the actual locked IDs completely before any checker can be mutated.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      -- A same-batch lead exit owns its checker cancellation through the trigger.
+      AND NOT EXISTS (
+          SELECT 1 FROM cross_checks cc
+          JOIN candidates exiting ON exiting.id = cc.lead_run_id
+          JOIN locked_parents lead ON lead.id = exiting.id
+          WHERE cc.checker_run_id = mapping.run_id
+            AND lead.worker_id = @worker_id
+              AND lead.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+              AND lead.requeue_count >= @max_requeues
+              AND (lead.kind = 'chat'
+                     OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                                     WHERE a.run_id = lead.id AND a.worker_id = lead.worker_id AND a.terminal_pending
+                                       AND a.terminal_pending_until > now()
+                                       AND a.claim_generation = lead.claim_generation)
+                         AND NOT EXISTS (SELECT 1 FROM workers w
+                                         WHERE w.id = lead.worker_id AND w.pending_overflow_until > now())))
+      )
+)
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
     status = 'failed', status_since = now(), failure_reason = @failure_reason,
     -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
     fail_origin = 'worker_lost',
-    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
     milestones_agents = NULL,
@@ -4793,9 +5788,11 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE runs.worker_id = @worker_id
-  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND requeue_count >= @max_requeues
+FROM eligible_candidates candidate
+WHERE runs.id = candidate.run_id
+  AND runs.worker_id = @worker_id
+  AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.requeue_count >= @max_requeues
   -- PRD #1390 D11: register's orphan fail honours the terminal-pending lease + pending_overflow
   -- closure exactly as the stale-worker passes do (chat-exempt, D10) — a fresh worker process
   -- must not fail its own run whose outcome is journaled and about to be replayed (#1391).
@@ -4806,7 +5803,7 @@ WHERE runs.worker_id = @worker_id
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-RETURNING id;
+RETURNING runs.id;
 
 -- Attested finalize-resume passes (issue #1742) -----------------------------
 --
@@ -4830,12 +5827,88 @@ RETURNING id;
 -- stamps finalize_resume_generation = claim_generation. Never decrements requeue_count.
 -- RETURNING allowance_used tells the caller which case fired (the mark equals the generation the
 -- run held when re-queued; claim_generation is unchanged until the next ClaimRun).
-UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue_count + 1,
-    finalize_resume_generation = CASE WHEN requeue_count >= @max_requeues
-                                      THEN claim_generation
-                                      ELSE finalize_resume_generation END,
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.worker_id = @worker_id
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind <> 'chat'
+  AND runs.id = ANY(@run_ids::uuid[])
+  AND runs.claim_generation = (@claim_generations::bigint[])[array_position(@run_ids::uuid[], runs.id)]
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                    AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND (runs.requeue_count < @max_requeues
+       OR (runs.requeue_count >= @max_requeues AND @max_requeues > 0 AND runs.finalize_resume_generation IS NULL))
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      -- The lead-exit trigger owns cancellation of a same-batch checker.
+      AND NOT EXISTS (
+          SELECT 1 FROM cross_checks cc
+          JOIN candidates exiting ON exiting.id = cc.lead_run_id
+          WHERE cc.checker_run_id = mapping.run_id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND EXISTS (
+                SELECT 1 FROM locked_parents runs
+                WHERE runs.id = exiting.id
+                  AND runs.status IN ('claimed', 'running')
+                  AND runs.claim_released_at IS NULL
+                  AND (runs.worker_id = @worker_id
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind <> 'chat'
+  AND runs.id = ANY(@run_ids::uuid[])
+  AND runs.claim_generation = (@claim_generations::bigint[])[array_position(@run_ids::uuid[], runs.id)]
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                    AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND (requeue_count < @max_requeues
+       OR (requeue_count >= @max_requeues AND @max_requeues > 0 AND finalize_resume_generation IS NULL)))
+            )
+      )
+)
+UPDATE runs SET status = 'queued', status_since = now(), requeue_count = runs.requeue_count + 1,
+    finalize_resume_generation = CASE WHEN runs.requeue_count >= @max_requeues
+                                      THEN runs.claim_generation
+                                      ELSE runs.finalize_resume_generation END,
     health = 'ok', health_reason = NULL, health_since = NULL,
-    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
 WHERE runs.worker_id = @worker_id
   AND runs.claim_released_at IS NULL
@@ -4849,17 +5922,86 @@ WHERE runs.worker_id = @worker_id
                   WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                     AND a.terminal_pending_until > now()
                     AND a.claim_generation = runs.claim_generation)
-  AND (requeue_count < @max_requeues
-       OR (requeue_count >= @max_requeues AND @max_requeues > 0 AND finalize_resume_generation IS NULL))
-RETURNING id, (finalize_resume_generation IS NOT NULL AND finalize_resume_generation = claim_generation)::boolean AS allowance_used;
+  AND (runs.requeue_count < @max_requeues
+       OR (runs.requeue_count >= @max_requeues AND @max_requeues > 0 AND runs.finalize_resume_generation IS NULL))
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ))
+RETURNING runs.id, (runs.finalize_resume_generation IS NOT NULL AND runs.finalize_resume_generation = runs.claim_generation)::boolean AS allowance_used;
 
 -- name: FailAttestedFinalizeRunsOverCap :many
 -- An attested run that is over budget and not eligible for the one-shot allowance (allowance
 -- already used, or RUN_MAX_REQUEUES = 0) fails exactly as FailWorkerRunsOverCap fails it.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.worker_id = @worker_id
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind <> 'chat'
+  AND runs.id = ANY(@run_ids::uuid[])
+  AND runs.claim_generation = (@claim_generations::bigint[])[array_position(@run_ids::uuid[], runs.id)]
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                    AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND runs.requeue_count >= @max_requeues
+  AND NOT (@max_requeues > 0 AND runs.finalize_resume_generation IS NULL)
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      -- The lead-exit trigger owns cancellation of a same-batch checker.
+      AND NOT EXISTS (
+          SELECT 1 FROM cross_checks cc
+          JOIN candidates exiting ON exiting.id = cc.lead_run_id
+          WHERE cc.checker_run_id = mapping.run_id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND EXISTS (
+                SELECT 1 FROM locked_parents runs
+                WHERE runs.id = exiting.id
+                  AND runs.status IN ('claimed', 'running')
+                  AND runs.claim_released_at IS NULL
+                  AND (runs.worker_id = @worker_id
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind <> 'chat'
+  AND runs.id = ANY(@run_ids::uuid[])
+  AND runs.claim_generation = (@claim_generations::bigint[])[array_position(@run_ids::uuid[], runs.id)]
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                    AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND requeue_count >= @max_requeues
+  AND NOT (@max_requeues > 0 AND finalize_resume_generation IS NULL))
+            )
+      )
+)
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
     status = 'failed', status_since = now(), failure_reason = @failure_reason,
     fail_origin = 'worker_lost',
-    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     milestones_in_progress = NULL,
     milestones_agents = NULL,
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
@@ -4878,9 +6020,10 @@ WHERE runs.worker_id = @worker_id
                   WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                     AND a.terminal_pending_until > now()
                     AND a.claim_generation = runs.claim_generation)
-  AND requeue_count >= @max_requeues
-  AND NOT (@max_requeues > 0 AND finalize_resume_generation IS NULL)
-RETURNING id;
+  AND runs.requeue_count >= @max_requeues
+  AND NOT (@max_requeues > 0 AND runs.finalize_resume_generation IS NULL)
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+RETURNING runs.id;
 
 -- name: RequeueWorkerRuns :many
 -- Within budget → re-queued to this same worker (affinity), which then re-claims
@@ -4889,7 +6032,73 @@ RETURNING id;
 -- PRD #1390 M2a: RETURNING id so Register can publish each requeue transition post-commit
 -- (via publishSwept) exactly as the sweeper's RequeueRunsOfStaleWorkers twin already does —
 -- closing the gap where a register-time requeue reached no live channel.
-UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue_count + 1,
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.worker_id = @worker_id
+      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+      AND runs.requeue_count < @max_requeues
+      AND (runs.kind = 'chat'
+           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                             AND a.terminal_pending_until > now()
+                             AND a.claim_generation = runs.claim_generation)
+               AND NOT EXISTS (SELECT 1 FROM workers w
+                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Collect the actual locked IDs completely before any checker can be mutated.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      -- A same-batch lead exit owns its checker cancellation through the trigger.
+      AND NOT EXISTS (
+          SELECT 1 FROM cross_checks cc
+          JOIN candidates exiting ON exiting.id = cc.lead_run_id
+          JOIN locked_parents lead ON lead.id = exiting.id
+          WHERE cc.checker_run_id = mapping.run_id
+            AND lead.worker_id = @worker_id
+              AND lead.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+              AND lead.requeue_count < @max_requeues
+              AND (lead.kind = 'chat'
+                     OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                                     WHERE a.run_id = lead.id AND a.worker_id = lead.worker_id AND a.terminal_pending
+                                       AND a.terminal_pending_until > now()
+                                       AND a.claim_generation = lead.claim_generation)
+                         AND NOT EXISTS (SELECT 1 FROM workers w
+                                         WHERE w.id = lead.worker_id AND w.pending_overflow_until > now())))
+      )
+)
+UPDATE runs SET status = 'queued', status_since = now(), requeue_count = runs.requeue_count + 1,
     -- Exit contract (PRD #47 Decision 3): reset on the way back to 'queued'; the
     -- detector re-evaluates the queued signal from this transition's status_since.
     health = 'ok', health_reason = NULL, health_since = NULL,
@@ -4897,18 +6106,20 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue
     -- survives the requeue and the later claimed->running resume would not see the park.
     -- awaiting_followup is intentionally excluded: interactive runs are exempt from
     -- SweepRunningTimeout entirely (interactive = false), so they have no wall deadline.
-    budget_paused_seconds = budget_paused_seconds
-        + CASE WHEN status IN ('awaiting_approval', 'awaiting_input')
-               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
+    budget_paused_seconds = runs.budget_paused_seconds
+        + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
                ELSE 0 END,
     -- Codex claim-capability revocation (PRD #1147 M2): re-queuing a worker's runs
     -- revokes their per-claim capabilities immediately — clear the hash and bump the
     -- epoch. A harmless no-op for a non-codex run, whose codex_cap_hash is already NULL.
-    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
-WHERE runs.worker_id = @worker_id
-  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND requeue_count < @max_requeues
+FROM eligible_candidates candidate
+WHERE runs.id = candidate.run_id
+  AND runs.worker_id = @worker_id
+  AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.requeue_count < @max_requeues
   -- PRD #1390 D11: register's orphan requeue honours the terminal-pending lease + pending_overflow
   -- closure exactly as the stale-worker passes do (chat-exempt, D10) — a fresh worker process
   -- must not requeue its own run whose outcome is journaled and about to be replayed (#1391).
@@ -4919,7 +6130,14 @@ WHERE runs.worker_id = @worker_id
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-RETURNING id;
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ))
+RETURNING runs.id;
 
 -- Worker active-run snapshot (PRD #1390 M2a) --------------------------------
 
@@ -5019,7 +6237,36 @@ ORDER BY worker_id, run_id;
 -- PRD #1390 M2b (blocker 1, canonical lock order step b): lock the runs the heartbeat's snapshot
 -- lists, owned by this worker, in deterministic id order, BEFORE the snapshot replace and the
 -- reconciliation writes. Rows returned are ignored; the statement exists for its FOR UPDATE.
-SELECT id FROM runs WHERE id = ANY(@run_ids::uuid[]) AND worker_id = @worker_id ORDER BY id FOR UPDATE;
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = ANY(@run_ids::uuid[]) AND runs.worker_id = @worker_id
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.id FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Drain the ordered parent locks before taking any supplied own-run lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), owned_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids)
+)
+SELECT runs.id FROM runs
+JOIN owned_candidates candidate ON candidate.run_id = runs.id
+WHERE runs.id = ANY(@run_ids::uuid[]) AND runs.worker_id = @worker_id
+ORDER BY runs.id
+FOR UPDATE OF runs;
 
 -- name: ReadoptRunsFromSnapshot :many
 -- PRD #1390 M2b (D5, D2): restore a `queued` run-lane run the worker still lists as a LIVE entry
@@ -5032,6 +6279,51 @@ SELECT id FROM runs WHERE id = ANY(@run_ids::uuid[]) AND worker_id = @worker_id 
 -- (D2: the stale requeue charged THIS exact generation); a NULL/mismatched provenance never refunds.
 -- stale_requeue_generation is cleared after. claim_released_at IS NULL is #1247's fence (a run the
 -- credential switch released must not be revived). Held-state content columns are UNTOUCHED here.
+WITH candidates AS MATERIALIZED (
+    SELECT r.id, r.kind FROM runs r, worker_active_runs a
+    WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = false
+  AND r.worker_id = @worker_id
+  AND r.status = 'queued'
+  AND r.kind <> 'chat'
+  AND r.claim_generation = a.claim_generation
+  AND r.claim_released_at IS NULL
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs r SET
     status = a.phase,
     status_since = now(),
@@ -5051,6 +6343,19 @@ WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = fals
   AND r.kind <> 'chat'
   AND r.claim_generation = a.claim_generation
   AND r.claim_released_at IS NULL
+  AND r.id IN (SELECT run_id FROM eligible_candidates)
+  AND (r.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = r.id AND r.id = ANY(checks.ids)
+        AND cc.lead_run_id = r.target_run_id
+        AND lead.user_id = r.user_id
+        AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+        AND cc.deadline_at > now()
+        AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
+        AND lead.claim_generation = cc.lead_claim_generation
+  ))
 RETURNING r.id, r.user_id, r.status;
 
 -- name: FailRunsMissingFromSnapshot :many
@@ -5061,10 +6366,97 @@ RETURNING r.id, r.user_id, r.status;
 -- restore). Held states are never targeted (status = 'running' only). Chat is a target restriction
 -- (kind <> 'chat', D10) — these writers only ever touch run-lane runs. @missing_cutoff is the stale
 -- window plus one heartbeat interval (D4); @max_requeues is RUN_MAX_REQUEUES.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.worker_id = @worker_id
+  AND runs.kind <> 'chat'
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL
+  AND runs.status_since < @missing_cutoff
+  AND runs.requeue_count >= @max_requeues
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < (sqlc.arg('now')::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds
+                            + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                (LEAST(sqlc.arg('now')::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = @worker_id AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      -- The lead-exit trigger owns cancellation of a same-batch checker.
+      AND NOT EXISTS (
+          SELECT 1 FROM cross_checks cc
+          JOIN candidates exiting ON exiting.id = cc.lead_run_id
+          WHERE cc.checker_run_id = mapping.run_id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND EXISTS (
+                SELECT 1 FROM locked_parents runs
+                WHERE runs.id = exiting.id
+                  AND runs.status IN ('claimed', 'running')
+                  AND runs.claim_released_at IS NULL
+                  AND (runs.worker_id = @worker_id
+  AND runs.kind <> 'chat'
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL
+  AND runs.status_since < @missing_cutoff
+  AND runs.requeue_count >= @max_requeues
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < (sqlc.arg('now')::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds
+                            + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                (LEAST(sqlc.arg('now')::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = @worker_id AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now()))
+            )
+      )
+)
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
     status = 'failed', status_since = now(), failure_reason = @failure_reason,
     fail_origin = 'worker_lost',
-    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     milestones_in_progress = NULL,
     milestones_agents = NULL,
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
@@ -5096,7 +6488,8 @@ WHERE runs.worker_id = @worker_id
                     AND a.claim_generation = runs.claim_generation)
   AND NOT EXISTS (SELECT 1 FROM workers w                   -- D11 pending_overflow closure (worker-level, ESSENTIAL)
                   WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
-RETURNING id, user_id, status;
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+RETURNING runs.id, runs.user_id, runs.status;
 
 -- name: RequeueRunsMissingFromSnapshot :many
 -- PRD #1390 M2b (SC2, under cap): the requeue twin of FailRunsMissingFromSnapshot — a `running`
@@ -5105,13 +6498,115 @@ RETURNING id, user_id, status;
 -- park-time bank for approval/input — a no-op here since only status='running' is targeted, codex
 -- cap revocation, requeue_count++). It does NOT set stale_requeue_generation: a genuine loss is
 -- never refunded (D2). Chat is a target restriction (kind <> 'chat', D10).
-UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue_count + 1,
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.worker_id = @worker_id
+  AND runs.kind <> 'chat'
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL
+  AND runs.status_since < @missing_cutoff
+  AND runs.requeue_count < @max_requeues
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < (sqlc.arg('now')::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds
+                            + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                (LEAST(sqlc.arg('now')::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = @worker_id AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      -- The lead-exit trigger owns cancellation of a same-batch checker.
+      AND NOT EXISTS (
+          SELECT 1 FROM cross_checks cc
+          JOIN candidates exiting ON exiting.id = cc.lead_run_id
+          WHERE cc.checker_run_id = mapping.run_id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND EXISTS (
+                SELECT 1 FROM locked_parents runs
+                WHERE runs.id = exiting.id
+                  AND runs.status IN ('claimed', 'running')
+                  AND runs.claim_released_at IS NULL
+                  AND (runs.worker_id = @worker_id
+  AND runs.kind <> 'chat'
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL
+  AND runs.status_since < @missing_cutoff
+  AND runs.requeue_count < @max_requeues
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < (sqlc.arg('now')::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds
+                            + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                (LEAST(sqlc.arg('now')::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = @worker_id AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now()))
+            )
+      )
+)
+UPDATE runs SET status = 'queued', status_since = now(), requeue_count = runs.requeue_count + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
-    budget_paused_seconds = budget_paused_seconds
-        + CASE WHEN status IN ('awaiting_approval', 'awaiting_input')
-               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
+    budget_paused_seconds = runs.budget_paused_seconds
+        + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
                ELSE 0 END,
-    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
 WHERE runs.worker_id = @worker_id
   AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
@@ -5138,7 +6633,15 @@ WHERE runs.worker_id = @worker_id
                     AND a.claim_generation = runs.claim_generation)
   AND NOT EXISTS (SELECT 1 FROM workers w                   -- D11 pending_overflow closure (worker-level, ESSENTIAL)
                   WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
-RETURNING id, user_id, status;
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ))
+RETURNING runs.id, runs.user_id, runs.status;
 
 -- Messages -----------------------------------------------------------------
 
@@ -6397,7 +7900,49 @@ RETURNING COALESCE((SELECT budget_extension_seconds FROM extended), 0)::int AS b
 -- Stopped then re-parked). Refuses (0 rows) a row that is not a budget_exhausted paused hold, or over
 -- the cap. Returns the new total extension (CreateExtendInput's scalar shape); the handler re-reads
 -- the run for the deadline + resumed:true response.
-WITH extended AS (
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = sqlc.arg('id') AND runs.user_id = sqlc.arg('user_id')
+      AND runs.status = 'paused'
+      AND runs.hold_reason = 'budget_exhausted'
+      AND runs.budget_extension_seconds + sqlc.arg('secs')::int <= sqlc.arg('cap')::int
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+), extended AS (
     -- Outer refs qualified `runs.` because the sibling data-modifying CTEs (on run_user_inputs) put
     -- that table in the analyzer's shared name scope; a bare `id` would read ambiguous.
     UPDATE runs SET
@@ -6419,7 +7964,20 @@ WITH extended AS (
       AND runs.status = 'paused'
       AND runs.hold_reason = 'budget_exhausted'
       AND runs.budget_extension_seconds + sqlc.arg('secs')::int <= sqlc.arg('cap')::int
-    RETURNING budget_extension_seconds
+      AND runs.id IN (SELECT run_id FROM eligible_candidates)
+      AND (runs.kind <> 'cross_check' OR EXISTS (
+          SELECT 1 FROM locked_checks cc
+          JOIN locked_parents lead ON lead.id = cc.lead_run_id
+          CROSS JOIN checker_lock_set checks
+          WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+            AND cc.lead_run_id = runs.target_run_id
+            AND lead.user_id = runs.user_id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND cc.deadline_at > now()
+            AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
+            AND lead.claim_generation = cc.lead_claim_generation
+      ))
+    RETURNING runs.budget_extension_seconds
 ),
 consumed_wall AS (
     UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
@@ -6559,9 +8117,36 @@ LIMIT 1000;
 -- name: LockRunForInputReceipt :one
 -- egress_profile_id rides this lock (PRD #1906 M5, Decision D-D) so inputReceipt applies the
 -- same isolated-lane purpose check as runOwnedByWorker before it returns any input body.
-SELECT id, status, worker_id, claim_generation, claim_released_at, credential_switch_requested_at,
-       credential_switch_generation, egress_profile_id
-FROM runs WHERE id = @run_id FOR UPDATE;
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @run_id
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
+SELECT runs.id, runs.status, runs.worker_id, runs.claim_generation, runs.claim_released_at, runs.credential_switch_requested_at,
+       runs.credential_switch_generation, runs.egress_profile_id
+FROM runs WHERE runs.id = @run_id
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+FOR UPDATE OF runs;
 
 -- name: ListInputReceiptRows :many
 SELECT id, kind, body, created_at, consumed_at, consumed_claim_generation, consumed_worker_id, applied_at,
@@ -7870,7 +9455,34 @@ WHERE id = @id AND user_id = @user_id AND status = 'queued';
 -- reports (a retry after response loss) serialize — the second blocks until the first
 -- commits and then sees the terminal row. Worker-scoped like GetRunOwnedByWorker: a run the
 -- worker does not hold returns pgx.ErrNoRows.
-SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id FOR UPDATE;
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.worker_id = @worker_id
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
+SELECT runs.* FROM runs WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+FOR UPDATE OF runs;
 
 -- name: RecordCompletionAttempt :one
 -- PRD #1226 M2 (D4) + M3: record ONE gated completion attempt and return the run's new attempt
@@ -8066,7 +9678,34 @@ WHERE id = @id AND issued_by_worker_id = @issued_by_worker_id AND consumed_at IS
 -- LOCKED row (locked.user_id == caller) after the lock, so a foreign caller — including an
 -- admin_ro Bearer, which keeps IsAdmin — is hidden as ErrRunNotFound (never a write), preserving
 -- the read-only ceiling. An absent run returns pgx.ErrNoRows (-> ErrRunNotFound).
-SELECT * FROM runs WHERE id = @id FOR UPDATE;
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
+SELECT runs.* FROM runs WHERE runs.id = @id
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+FOR UPDATE OF runs;
 
 -- name: BumpContractRevision :one
 -- PRD #1227 M1: create contract revision N+1 for an owner decision (partial/accept). It writes
@@ -8180,6 +9819,8 @@ WHERE lead.id = @lead_run_id AND lead.user_id = @user_id
   AND lead.worker_id = @worker_id AND lead.claim_generation = @claim_generation
   AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
   AND lead.harness = 'claude' AND lead.plan_cross_check_required AND lead.auto_approve
+  AND COALESCE(octet_length(lead.issue_title), 0) <= 4096
+  AND COALESCE(octet_length(lead.issue_description), 0) <= 262144
 RETURNING *;
 
 -- name: InsertPlanCrossCheck :one
@@ -8256,8 +9897,8 @@ WITH expired AS (
 SELECT * FROM expired;
 
 -- name: SupersedeExitedPlanCrossChecks :many
--- Run after a lead exit while its lead row remains locked, and from a periodic
--- sweep. Lock leads before cross_checks to match submit, status and verdict paths.
+-- Periodic fallback for exits not settled by runs_settle_exited_plan_cross_check.
+-- Lock leads before cross_checks to match submit, status and verdict paths.
 -- SKIP LOCKED lets another lifecycle transaction settle its own lead; a later
 -- sweep retries it. One pending-to-failed transition owns the child cancellation
 -- and budget credit, so repeated sweeps have no effect.
