@@ -1,7 +1,12 @@
 import { describe, it } from "node:test";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import { PassThrough, Readable } from "node:stream";
 import { getEventListeners } from "node:events";
+import { createHash } from "node:crypto";
 import { GitCache, gitEnv } from "../src/git.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "../src/harness.js";
 import { TickSpawner } from "../src/tick-spawner.js";
@@ -32,7 +37,359 @@ function run(handle: BoundaryProcessHandle, signal = new AbortController().signa
     () => git.readBoundedPlanningOutput(process.cwd(), [process.execPath], 2000));
 }
 
-describe("Unit2 bounded runner stdout transport (not source capture)", () => {
+const exec = promisify(execFile);
+async function fixture(options: { seed?: (seed: string) => Promise<void>; shared?: boolean; meter?: boolean } = {}): Promise<{
+  cache: GitCache; clone: string; base: string; data: string;
+  git: (...args: string[]) => Promise<string>;
+  capture: (signal?: AbortSignal) => Promise<Buffer>;
+  dispose: () => Promise<void>;
+}> {
+  const scratch = path.resolve(import.meta.dirname, "../../.uzi/scratch");
+  await fs.mkdir(scratch, { recursive: true });
+  const data = await fs.mkdtemp(path.join(scratch, "planning-fixture-"));
+  const seed = path.join(data, "seed");
+  const clone = path.join(data, "runner", "repo", "issue-1");
+  await fs.mkdir(seed);
+  const run = async (cwd: string, ...args: string[]): Promise<string> =>
+    (await exec("git", ["-C", cwd, ...args], { env: gitEnv(), timeout: 5000 })).stdout;
+  await run(seed, "init", "--quiet", "--template=");
+  await fs.writeFile(path.join(seed, "tracked"), "base\n");
+  await fs.writeFile(path.join(seed, "deleted"), "delete me\n");
+  await fs.writeFile(path.join(seed, ".gitignore"), "ignored\nignored-dir/\n");
+  await options.seed?.(seed);
+  await run(seed, "add", ".");
+  await run(seed, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "base");
+  await fs.mkdir(path.dirname(clone), { recursive: true });
+  await run(seed, "clone", "--quiet", options.shared ? "--shared" : "--no-local", seed, clone);
+  const base = (await run(clone, "rev-parse", "HEAD")).trim();
+  const cache = new GitCache(data, nullLogger());
+  return {
+    data, clone, base, cache, git: (...args) => run(clone, ...args),
+    capture: async (signal = new AbortController().signal) => {
+      const owner = new TickSpawner({ signal, killGraceMs: 100 });
+      try {
+        return await cache.withBoundaryProcessSpawner((request) => {
+          if (!options.meter) return owner.spawn(request);
+          // Instrument only the trusted inline capture program, preserving its argv and body.
+          const argv = [...request.argv];
+          assert.equal(argv[1], "-e");
+          const metricPath = path.join(data, "read-metrics.json");
+          argv[2] = `
+const meterFs = require("node:fs");
+const meterCp = require("node:child_process");
+const readMetrics = { source: 0, diff: 0, diffSpawned: 0, diffClosed: 0 };
+const meterRead = meterFs.readSync;
+meterFs.readSync = function(...args) {
+  const bytes = meterRead.apply(this, args);
+  readMetrics.source += bytes;
+  return bytes;
+};
+const meterSpawn = meterCp.spawn;
+meterCp.spawn = function(...args) {
+  const p = meterSpawn.apply(this, args);
+  if (args[1].includes("diff") && args[1].includes("--no-index")) {
+    readMetrics.diffSpawned++;
+    p.once("close", () => { readMetrics.diffClosed++; });
+    const read = p.stdout.read;
+    p.stdout.read = function(...readArgs) {
+      const bytes = read.apply(this, readArgs);
+      if (Buffer.isBuffer(bytes)) readMetrics.diff += bytes.length;
+      return bytes;
+    };
+  }
+  return p;
+};
+process.on("exit", () => meterFs.writeFileSync(${JSON.stringify(metricPath)}, JSON.stringify(readMetrics)));
+` + argv[2];
+          return owner.spawn({ ...request, argv });
+        }, signal, () => cache.capturePlanningDiff(clone, base));
+      } finally {
+        await owner.settled();
+        assert.deepEqual(owner.survivors(), []);
+      }
+    },
+    dispose: () => fs.rm(data, { recursive: true, force: true }),
+  };
+}
+
+describe("Unit2 runner source capture", () => {
+  it("refuses non-UTF8 base metadata even after the source path is deleted", async () => {
+    const f = await fixture({ seed: async seed => {
+      const name = Buffer.concat([Buffer.from(seed + "/"), Buffer.from([0xff])]);
+      await fs.writeFile(name, "base text\n");
+    } });
+    try {
+      await fs.unlink(Buffer.concat([Buffer.from(f.clone + "/"), Buffer.from([0xff])]));
+      await f.git("add", "-u");
+      await assert.rejects(f.capture(), /non UTF8 path metadata/);
+    } finally { await f.dispose(); }
+  });
+  it("captures committed, staged, unstaged, deleted and nonignored untracked text against the immutable base", async () => {
+    const f = await fixture();
+    try {
+      await fs.writeFile(path.join(f.clone, "tracked"), "committed\n");
+      await f.git("add", "tracked");
+      await f.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "change");
+      await fs.writeFile(path.join(f.clone, "staged"), "staged\n");
+      await f.git("add", "staged");
+      await fs.writeFile(path.join(f.clone, "staged"), "unstaged\n");
+      await fs.unlink(path.join(f.clone, "deleted"));
+      await fs.writeFile(path.join(f.clone, "fresh"), "fresh text\n");
+      await fs.writeFile(path.join(f.clone, "ignored"), "ignored text\n");
+      await fs.mkdir(path.join(f.clone, "ignored-dir"));
+      await fs.symlink("/does-not-exist", path.join(f.clone, "ignored-dir", "escape"));
+      await fs.writeFile(path.join(f.clone, "binary"), Buffer.from([0, 1, 2, 3]));
+      const patch = (await f.capture()).toString();
+      assert.match(patch, /-base\n\+committed/);
+      assert.match(patch, /\+unstaged/);
+      assert.match(patch, /-delete me/);
+      assert.match(patch, /\+fresh text/);
+      assert.doesNotMatch(patch, /ignored text|binary|\+staged/);
+      assert.match(patch, /diff --git a\/tracked b\/tracked/);
+    } finally { await f.dispose(); }
+  });
+
+  it("reads changed bytes despite a forged matching index stat cache and valid checksum", async () => {
+    const f = await fixture();
+    try {
+      await fs.writeFile(path.join(f.clone, "tracked"), "evil\n");
+      await fs.chmod(path.join(f.clone, "tracked"), 0o644);
+      const st = await fs.stat(path.join(f.clone, "tracked"), { bigint: true });
+      const indexPath = path.join(f.clone, ".git/index");
+      const index = await fs.readFile(indexPath);
+      let offset = 12;
+      let forged = false;
+      for (let i = 0; i < index.readUInt32BE(8); i++) {
+        const end = index.indexOf(0, offset + 62);
+        const name = index.toString("utf8", offset + 62, end);
+        if (name === "tracked") {
+          const mask = 0xffffffffn;
+          const fields = [
+            st.ctimeNs / 1000000000n, st.ctimeNs % 1000000000n,
+            st.mtimeNs / 1000000000n, st.mtimeNs % 1000000000n,
+            st.dev, st.ino, st.mode, st.uid, st.gid, st.size,
+          ];
+          fields.forEach((value, j) => index.writeUInt32BE(Number(value & mask), offset + j * 4));
+          forged = true;
+        }
+        offset += Math.ceil((end + 1 - offset) / 8) * 8;
+      }
+      assert.equal(forged, true);
+      createHash("sha1").update(index.subarray(0, -20)).digest().copy(index, index.length - 20);
+      await fs.writeFile(indexPath, index);
+      const later = new Date(Number((st.mtimeNs > st.ctimeNs ? st.mtimeNs : st.ctimeNs) / 1000000n) + 2000);
+      await fs.utimes(indexPath, later, later);
+      assert.match((await f.capture()).toString(), /-base\n\+evil/);
+    } finally { await f.dispose(); }
+  });
+
+  it("captures text and .gitattributes itself when repository attributes disable diff", async () => {
+    const f = await fixture({ seed: async seed => {
+      await fs.writeFile(path.join(seed, ".gitattributes"), "* -diff\n");
+    } });
+    try {
+      await fs.writeFile(path.join(f.clone, "tracked"), "visible change\n");
+      await fs.writeFile(path.join(f.clone, ".gitattributes"), "* -diff\n# changed attributes\n");
+      const patch = (await f.capture()).toString();
+      assert.match(patch, /\+visible change/);
+      assert.match(patch, /\+# changed attributes/);
+    } finally { await f.dispose(); }
+  });
+
+  it("refuses more than 200 nonignored untracked paths before reading contents", async () => {
+    const f = await fixture();
+    try {
+      for (let i = 0; i < 201; i++) await fs.writeFile(path.join(f.clone, "extra-" + i), "x");
+      await assert.rejects(f.capture(), /process failed/);
+    } finally { await f.dispose(); }
+  });
+
+  it("bounds source bytes even when huge binary content would produce no patch", async () => {
+    const f = await fixture();
+    try {
+      await fs.writeFile(path.join(f.clone, "huge"), Buffer.alloc(4 * 1024 * 1024 + 1));
+      await assert.rejects(f.capture(), /process failed/);
+    } finally { await f.dispose(); }
+  });
+
+  it("refuses aggregate overflow from unchanged baseline text without producing a patch", async () => {
+    const f = await fixture({ meter: true, seed: async seed => {
+      const text = Buffer.alloc(4 * 1024 * 1024, 120);
+      for (let i = 0; i < 33; i++) await fs.writeFile(path.join(seed, "unchanged-" + i), text);
+    } });
+    try {
+      // Every file hashes to its base OID. Only actual source reads consume the budget.
+      await assert.rejects(f.capture(), /total source cap/);
+      const metrics = JSON.parse(await fs.readFile(path.join(f.data, "read-metrics.json"), "utf8"));
+      console.log("aggregate source actual reads:", metrics.source);
+      assert.equal(metrics.source, 128 * 1024 * 1024 + 1);
+      assert.equal(metrics.diff, 0);
+    } finally { await f.dispose(); }
+  });
+
+  it("refuses patch overflow without returning partial output", async () => {
+    const f = await fixture();
+    try {
+      await fs.writeFile(path.join(f.clone, "text"), "x\n".repeat(180000));
+      await assert.rejects(f.capture(), /process failed|exceeded/);
+    } finally { await f.dispose(); }
+  });
+
+  it("bounds actual inner diff reads across separate patches and reaps every diff child", async () => {
+    const f = await fixture({ meter: true });
+    try {
+      // Each patch is about 200 KiB; only their combined output exceeds the cap.
+      for (let i = 0; i < 3; i++)
+        await fs.writeFile(path.join(f.clone, "patch-" + i), ("x".repeat(199) + "\n").repeat(1000));
+      await assert.rejects(f.capture(), /Git pipe cap|patch cap/);
+      const metrics = JSON.parse(await fs.readFile(path.join(f.data, "read-metrics.json"), "utf8"));
+      console.log("aggregate inner diff actual reads:", metrics.diff);
+      assert.equal(metrics.diff, cap + 1);
+      assert.equal(metrics.diffSpawned, 3);
+      assert.equal(metrics.diffClosed, metrics.diffSpawned);
+    } finally { await f.dispose(); }
+  });
+
+  it("captures a baseline with 5461 tracked paths, an index over 512 KiB and 100 MiB of unchanged text", async () => {
+    const f = await fixture({ seed: async seed => {
+      const large = Buffer.alloc(2 * 1024 * 1024, 120);
+      await fs.mkdir(path.join(seed, "many"));
+      for (let i = 0; i < 50; i++) await fs.writeFile(path.join(seed, "large-" + i), large);
+      for (let i = 0; i < 5408; i++)
+        await fs.writeFile(path.join(seed, "many", "normal-repository-tracked-file-path-" + String(i).padStart(5, "0")), "unchanged\n");
+    } });
+    try {
+      assert.ok((await fs.stat(path.join(f.clone, ".git/index"))).size > cap);
+      assert.equal((await f.capture()).length, 0);
+      await fs.writeFile(path.join(f.clone, "tracked"), "normal repository change\n");
+      assert.match((await f.capture()).toString(), /\+normal repository change/);
+    } finally { await f.dispose(); }
+  });
+
+  it("captures a textual change in a 2 MiB tracked file", async () => {
+    const f = await fixture({ seed: async seed => {
+      await fs.writeFile(path.join(seed, "large"), "baseline\n" + "unchanged\n".repeat(240000));
+    } });
+    try {
+      await fs.writeFile(path.join(f.clone, "large"), "changed\n" + "unchanged\n".repeat(240000));
+      assert.match((await f.capture()).toString(), /-baseline\n\+changed/);
+    } finally { await f.dispose(); }
+  });
+
+  it("refuses a direct shared clone and captures after repack and removal of alternates", async () => {
+    const f = await fixture({ shared: true });
+    try {
+      const alternates = path.join(f.clone, ".git/objects/info/alternates");
+      assert.ok((await fs.readFile(alternates)).length > 0);
+      await assert.rejects(f.capture(), /object alternates unsupported/);
+      // This is the materialization GitCache's existing selfContained preparation performs.
+      await f.git("repack", "-a", "-d");
+      await fs.unlink(alternates);
+      await fs.rm(path.join(f.data, "seed"), { recursive: true });
+      assert.equal((await f.capture()).length, 0);
+      await fs.writeFile(path.join(f.clone, "tracked"), "dissociated change\n");
+      assert.match((await f.capture()).toString(), /-base\n\+dissociated change/);
+    } finally { await f.dispose(); }
+  });
+
+  it("ignores hostile local config includes even when config itself is a FIFO", async () => {
+    const f = await fixture();
+    try {
+      const fifo = path.join(f.data, "hostile-config");
+      await exec("mkfifo", [fifo], { env: gitEnv(), timeout: 5000 });
+      await f.git("config", "include.path", fifo);
+      await fs.writeFile(path.join(f.clone, "tracked"), "include-safe change\n");
+      assert.match((await f.capture()).toString(), /\+include-safe change/);
+      await fs.unlink(path.join(f.clone, ".git/config"));
+      await exec("mkfifo", [path.join(f.clone, ".git/config")], { env: gitEnv(), timeout: 5000 });
+      assert.match((await f.capture()).toString(), /\+include-safe change/);
+    } finally { await f.dispose(); }
+  });
+
+  it("refuses leaf and parent symlink escapes, nonregular ignores and an unavailable base", async () => {
+    const f = await fixture();
+    try {
+      await fs.writeFile(path.join(f.data, "outside"), "outside content\n");
+      await fs.symlink(path.join(f.data, "outside"), path.join(f.clone, "escape"));
+      await assert.rejects(f.capture(), /process failed/);
+      await fs.unlink(path.join(f.clone, "escape"));
+      await fs.mkdir(path.join(f.clone, "parent"));
+      await fs.writeFile(path.join(f.clone, "parent", "file"), "inside\n");
+      await f.git("add", "parent/file");
+      await fs.rm(path.join(f.clone, "parent"), { recursive: true });
+      await fs.symlink(f.data, path.join(f.clone, "parent"));
+      await assert.rejects(f.capture(), /process failed/);
+      await fs.unlink(path.join(f.clone, "parent"));
+      await fs.mkdir(path.join(f.clone, ".gitignore-bad"));
+      await fs.unlink(path.join(f.clone, ".gitignore"));
+      await fs.symlink(path.join(f.data, "outside"), path.join(f.clone, ".gitignore"));
+      await assert.rejects(f.capture(), /process failed/);
+      await fs.unlink(path.join(f.clone, ".gitignore"));
+      await fs.writeFile(path.join(f.clone, ".gitignore"), "");
+      const ac = new AbortController(), owner = new TickSpawner({ signal: ac.signal });
+      await assert.rejects(f.cache.withBoundaryProcessSpawner(owner.spawn, ac.signal,
+        () => f.cache.capturePlanningDiff(f.clone, "0".repeat(40))), /process failed/);
+      await owner.settled();
+      assert.deepEqual(owner.survivors(), []);
+    } finally { await f.dispose(); }
+  });
+
+  it("disables external diff, textconv and arbitrary clean filters", async () => {
+    const f = await fixture();
+    try {
+      const marker = path.join(f.data, "executed");
+      // Configured payload is inert test data, never executed by the test.
+      const plant = "touch " + marker;
+      await f.git("config", "diff.external", plant);
+      await f.git("config", "diff.hostile.textconv", plant);
+      await f.git("config", "filter.hostile.clean", plant);
+      await f.git("config", "filter.hostile.process", plant);
+      await f.git("config", "filter.hostile.required", "true");
+      await fs.writeFile(path.join(f.clone, ".gitattributes"), "* diff=hostile filter=hostile\n");
+      await fs.writeFile(path.join(f.clone, "tracked"), "plain changed\n");
+      const patch = (await f.capture()).toString();
+      assert.match(patch, /\+plain changed/);
+      await assert.rejects(fs.stat(marker), { code: "ENOENT" });
+    } finally { await f.dispose(); }
+  });
+
+  it("keeps safe leading dash, newline and unicode patch paths and raw secret bytes", async () => {
+    const f = await fixture();
+    try {
+      for (const name of ["-dash", "line\nbreak", "雪.txt"]) await fs.writeFile(path.join(f.clone, name), "safe\n");
+      const secret = "glpat-" + "abcdefghijklmnopqrst";
+      await fs.writeFile(path.join(f.clone, "raw"), secret + "\n");
+      const patch = await f.capture();
+      assert.ok(patch.includes(Buffer.from(secret)));
+      assert.match(patch.toString(), /b\/-dash/);
+      assert.match(patch.toString(), /line\\nbreak/);
+      // Verify Git itself accepts the emitted path quoting.
+      const patchPath = path.join(f.data, "capture.patch");
+      await fs.writeFile(patchPath, patch);
+      await f.git("apply", "--reverse", "--check", patchPath);
+    } finally { await f.dispose(); }
+  });
+
+  it("rejects lexical roots and aborts a real whole-root owner", async () => {
+    const f = await fixture();
+    try {
+      await assert.rejects(f.cache.capturePlanningDiff(f.data, f.base), /runnerRoot/);
+      await assert.rejects(f.cache.capturePlanningDiff(f.clone, "HEAD"), /40-hex/);
+      const ac = new AbortController(), owner = new TickSpawner({ signal: ac.signal, killGraceMs: 100 });
+      const pending = f.cache.withBoundaryProcessSpawner(async req => {
+        const handle = await owner.spawn(req);
+        ac.abort();
+        return handle;
+      }, ac.signal, () => f.cache.capturePlanningDiff(f.clone, f.base));
+      await assert.rejects(pending, /aborted/);
+      await owner.settled();
+      assert.deepEqual(owner.survivors(), []);
+      assert.equal(owner.cancelledAny(), true);
+    } finally { await f.dispose(); }
+  });
+});
+
+describe("Unit2 bounded runner stdout transport", () => {
   it("requires a trusted boundary owner and absolute argv/cwd", async () => {
     await assert.rejects(git.readBoundedPlanningOutput(process.cwd(), [process.execPath]), /trusted boundary/);
     let spawned = false;

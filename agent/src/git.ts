@@ -1894,12 +1894,12 @@ export class GitCache {
    * {@link freeCanonicalClonePath}: a scoped process proof first, then the runner-uid delete, and a
    * same-parent quarantine of whatever the delete could not remove. An attempt seed never uses it.
    *
-   * issue #1769 — `opts.selfContained` (the runner passes `executor.sandboxesCommands === true`,
-   * i.e. Codex, whose command sandbox is fixed at executor construction):
+   * `opts.selfContained` is required for sandboxed commands and planning cross-check
+   * capture, whose object reads must remain within the clone:
    * after every ref/checkpoint step, still under this bare's lock, the clone is dissociated
    * from the bare (materializeRunnerClone), because the Codex command sandbox does not grant
-   * the bare and git there cannot follow the alternate. Default false: the Claude path keeps
-   * the shared clone unchanged. It applies to BOTH seeds: the canonical one and
+   * the bare and planning capture refuses alternates. Default false: ordinary Claude
+   * runs keep the shared clone unchanged. It applies to BOTH seeds: the canonical one and
    * (issue #1783) the per-attempt one on a Docker-wired worker.
    */
   async runnerCloneForBranch(
@@ -3084,7 +3084,7 @@ export class GitCache {
         if ((err as { code?: unknown }).code === 5) return;
         throw err;
       });
-      // issue #1769 — a Codex (selfContained) clone is dissociated from the bare HERE, after
+      // A selfContained clone is dissociated from the bare HERE, after
       // every ref/checkpoint step and still inside this bare's withLock, so no bare maintenance
       // can interleave with the copy. A failure throws RunnerCloneMaterializationError, which
       // fails the run before the executor starts.
@@ -7124,9 +7124,24 @@ export class GitCache {
   }
 
   /**
-   * Unit2 transport primitive only: argv must come from a trusted caller, never
-   * clone configuration. No runner caller uses this yet; bytes are not approved
-   * source capture. Require a whole-root owner rather than a legacy spawn fallback.
+   * Capture raw planning bytes as the command identity. Refusals throw; these
+   * bytes still require scanPatchForSecrets before any planning consumer.
+   */
+  async capturePlanningDiff(clonePath: string, baseCommit: string): Promise<Buffer> {
+    const root = path.resolve(this.runnerRoot);
+    if (!path.isAbsolute(clonePath) || path.resolve(clonePath) !== clonePath
+        || !isWithinPath(clonePath, root) || path.dirname(path.dirname(clonePath)) !== root) {
+      throw new Error("planning clone must be <runnerRoot>/<repoDir>/<key>");
+    }
+    if (!/^[a-f0-9]{40}$/.test(baseCommit)) throw new Error("planning base must be immutable 40-hex");
+    return this.readBoundedPlanningOutput(clonePath,
+      [process.execPath, "-e", PLANNING_CAPTURE_HELPER, clonePath, baseCommit, GIT_BIN], 30_000);
+  }
+
+  /**
+   * Transport for the trusted planning reader: argv must never come from clone
+   * configuration. Captured bytes still require a trusted clean secret scan.
+   * Require a whole-root owner rather than a legacy spawn fallback.
    * @internal Transport for the planning reader; not a source-capture API.
    */
   async readBoundedPlanningOutput(
@@ -7162,8 +7177,8 @@ export class GitCache {
     handle.stdin?.end();
     const all = Promise.all([stdout.result, stderr.result, handle.completed] as const);
     try {
-      const [bytes, , terminal] = await Promise.race([all, aborted]);
-      if (terminal.code !== 0 || terminal.softTimedOut) throw new Error("bounded runner process failed");
+      const [bytes, diagnostic, terminal] = await Promise.race([all, aborted]);
+      if (terminal.code !== 0 || terminal.softTimedOut) throw new Error("bounded runner process failed: " + diagnostic.toString());
       return bytes;
     } catch (error) {
       stop.abort(error);
@@ -7443,6 +7458,326 @@ export class GitCache {
     return result;
   }
 }
+
+/**
+ * Trusted inline runner program, never loaded from the clone. Linux descriptor
+ * traversal is deliberately required. Unsupported indexes/objects fail closed.
+ * Metadata: 2 MiB per Git pipe/index, 20,000 tracked paths, 30,000 entries,
+ * 2,048 directories, depth 64. Patches: 512 KiB total and per diff pipe.
+ * Sources: 4 MiB per regular file/blob, 128 MiB total (including ignore/index
+ * inputs), plus one overflow sentinel byte; 200 nonignored untracked files.
+ * Patch pipes likewise consume at most 512 KiB total plus one sentinel byte.
+ * One error aborts the entire capture.
+ * Child commands have a 5s deadline; capture has a 30s whole-root deadline.
+ */
+const PLANNING_CAPTURE_HELPER = String.raw`
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawn } = require("node:child_process");
+const { createHash } = require("node:crypto");
+const [clone, base, git] = process.argv.slice(1);
+const C = fs.constants;
+const PATCH_LIMIT = 512 * 1024, METADATA_LIMIT = 2 * 1024 * 1024;
+const FILE_LIMIT = 4 * 1024 * 1024, TOTAL_LIMIT = 128 * 1024 * 1024;
+const PATH_LIMIT = 20000, ENTRY_LIMIT = 30000, DIR_LIMIT = 2048, DEPTH_LIMIT = 64;
+let total = 0, entries = 0, dirs = 0, temp, child;
+const fds = new Set();
+const deadline = Date.now() + 28000;
+function check() { if (Date.now() > deadline) throw Error("capture deadline"); }
+function close(fd) { fs.closeSync(fd); fds.delete(fd); }
+function fdpath(fd) { return "/proc/" + process.pid + "/fd/" + fd; }
+function directory(parent, name) {
+  check();
+  const fd = fs.openSync(fdpath(parent) + "/" + name, C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW);
+  fds.add(fd); return fd;
+}
+function absoluteDirectory(p) {
+  let fd = fs.openSync("/", C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW); fds.add(fd);
+  for (const part of p.split("/").filter(Boolean)) {
+    if (part === "." || part === "..") throw Error("unsafe root");
+    const next = directory(fd, part); close(fd); fd = next;
+  }
+  return fd;
+}
+function components(p) {
+  const parts = p.split("/");
+  if (!p || parts.length > DEPTH_LIMIT + 1 || parts.some(x => !x || x === "." || x === ".." || x.toLowerCase() === ".git")
+      || Buffer.from(p).toString() !== p) throw Error("unsafe path");
+  return parts;
+}
+function openFile(root, p) {
+  const parts = components(p); let parent = root, owned = false;
+  try {
+    for (const part of parts.slice(0, -1)) {
+      const next = directory(parent, part); if (owned) close(parent); parent = next; owned = true;
+    }
+    const fd = fs.openSync(fdpath(parent) + "/" + parts.at(-1), C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
+    fds.add(fd);
+    if (!fs.fstatSync(fd).isFile()) { close(fd); throw Error("nonregular source"); }
+    return fd;
+  } finally { if (owned) close(parent); }
+}
+function read(fd, cap) {
+  const before = fs.fstatSync(fd, { bigint: true });
+  if (before.size > BigInt(cap)) throw Error("source cap");
+  const chunks = []; let n = 0;
+  while (n <= cap) {
+    check();
+    const b = Buffer.alloc(Math.min(16384, cap + 1 - n, TOTAL_LIMIT + 1 - total));
+    const got = fs.readSync(fd, b, 0, b.length, null);
+    if (!got) break;
+    n += got; if (n > cap) throw Error("source cap");
+    total += got; if (total > TOTAL_LIMIT) throw Error("total source cap");
+    chunks.push(b.subarray(0, got));
+  }
+  const after = fs.fstatSync(fd, { bigint: true });
+  if (before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs)
+    throw Error("source changed during read");
+  return Buffer.concat(chunks, n);
+}
+function optional(root, p, cap) {
+  let fd;
+  try { fd = openFile(root, p); return read(fd, cap); }
+  catch (e) { if (e.code === "ENOENT") return null; throw e; }
+  finally { if (fd !== undefined) close(fd); }
+}
+function cleanup() {
+  if (temp) fs.rmSync(temp, { recursive: true, force: true });
+  for (const fd of fds) fs.closeSync(fd);
+  fds.clear();
+}
+process.on("SIGTERM", () => {
+  if (child) child.kill("SIGKILL");
+  try { cleanup(); } finally { process.exit(143); }
+});
+const env = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "uzi-no-transport",
+  GIT_ATTR_NOSYSTEM: "1", GIT_OPTIONAL_LOCKS: "0", GIT_EXTERNAL_DIFF: "",
+  GIT_CEILING_DIRECTORIES: "/", GIT_CONFIG_COUNT: "0" };
+function command(args, cap = METADATA_LIMIT, input, allowDiff = false, cwd = temp, extra = {}) {
+  check();
+  return new Promise((resolve, reject) => {
+    const p = spawn(git, ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+      "-c", "core.attributesFile=/dev/null", "-c", "core.excludesFile=/dev/null",
+      "-c", "core.quotePath=true", "-c", "diff.external=", ...args],
+      { cwd, env: { ...env, ...extra }, stdio: ["pipe", "pipe", "pipe"] });
+    child = p;
+    let error, bytes = 0, errBytes = 0; const chunks = [];
+    const fail = e => {
+      error ||= e; p.kill("SIGKILL");
+      // Overflow stops reads. Destroy both pipes so close/reap settles even
+      // when unread buffered output remains after the child has exited.
+      p.stdout.destroy(); p.stderr.destroy();
+    };
+    function collect(s, stderr) {
+      s.on("readable", () => {
+        try {
+          let n = stderr ? errBytes : bytes;
+          while (!error) {
+            const b = s.read(Math.min(16384, Math.max(1, s.readableLength), cap + 1 - n));
+            if (b === null) break;
+            n += b.length;
+            if (stderr) errBytes = n; else bytes = n;
+            if (n > cap) { fail(Error("Git pipe cap")); break; }
+            if (!stderr) chunks.push(b);
+          }
+        } catch (e) { fail(e); }
+      });
+      s.on("error", fail);
+    }
+    collect(p.stdout, false); collect(p.stderr, true);
+    const timer = setTimeout(() => fail(Error("Git deadline")), Math.min(5000, deadline - Date.now()));
+    p.on("error", fail);
+    p.on("close", code => {
+      clearTimeout(timer); child = undefined;
+      if (error) reject(error);
+      else if (code !== 0 && !(allowDiff && code === 1)) reject(Error("Git refused capture"));
+      else resolve(Buffer.concat(chunks, bytes));
+    });
+    p.stdin.on("error", fail); p.stdin.end(input);
+  });
+}
+function paths(bytes) {
+  if (bytes.length && bytes.at(-1) !== 0) throw Error("incomplete path metadata");
+  const text = bytes.toString("utf8");
+  if (!Buffer.from(text).equals(bytes)) throw Error("non UTF8 path metadata");
+  return bytes.length ? text.slice(0, -1).split("\0") : [];
+}
+function indexEntries(bytes) {
+  const result = new Set();
+  if (!bytes) return result;
+  if (bytes.length < 32 || bytes.toString("ascii", 0, 4) !== "DIRC"
+      || ![2, 3].includes(bytes.readUInt32BE(4))) throw Error("unsupported index");
+  const checksum = createHash("sha1").update(bytes.subarray(0, -20)).digest();
+  if (!checksum.equals(bytes.subarray(-20))) throw Error("index checksum");
+  const count = bytes.readUInt32BE(8);
+  if (count > PATH_LIMIT) throw Error("index path cap");
+  let offset = 12;
+  for (let i = 0; i < count; i++) {
+    const start = offset;
+    if (offset + 62 > bytes.length - 20) throw Error("short index");
+    const flags = bytes.readUInt16BE(offset + 60);
+    if (flags & 0x7000) throw Error("unsupported index flags/stage");
+    const end = bytes.indexOf(0, offset + 62);
+    if (end < 0 || end >= bytes.length - 20) throw Error("short index path");
+    const raw = bytes.subarray(offset + 62, end), name = raw.toString("utf8");
+    if (!Buffer.from(name).equals(raw)) throw Error("non UTF8 path");
+    components(name);
+    const mode = bytes.readUInt32BE(start + 24);
+    if (mode !== 0o100644 && mode !== 0o100755) throw Error("unsupported tracked mode");
+    if (result.has(name)) throw Error("duplicate index path");
+    result.add(name);
+    offset = start + Math.ceil((end + 1 - start) / 8) * 8;
+  }
+  // Optional extensions are skipped; required extensions (e.g. split index) refuse.
+  while (offset < bytes.length - 20) {
+    if (offset + 8 > bytes.length - 20 || bytes[offset] < 65 || bytes[offset] > 90)
+      throw Error("unsupported index extension");
+    offset += 8 + bytes.readUInt32BE(offset + 4);
+  }
+  if (offset !== bytes.length - 20) throw Error("short index extension");
+  return result;
+}
+(async () => {
+  const root = absoluteDirectory(clone);
+  const gd = directory(root, ".git"), objects = directory(gd, "objects");
+  const info = directory(objects, "info");
+  // Alternates could redirect base reads outside this clone. Missing objects refuse.
+  if (optional(info, "alternates", 65536) !== null) throw Error("object alternates unsupported");
+  temp = fs.mkdtempSync(path.join(process.env.TMPDIR || "/tmp", "uzi-planning-"));
+  fs.chmodSync(temp, 0o700);
+  await command(["init", "--quiet", "--template=", temp]);
+  // info/attributes has precedence over every captured .gitattributes, including itself.
+  fs.mkdirSync(path.join(temp, ".git/info"), { recursive: true });
+  fs.writeFileSync(path.join(temp, ".git/info/attributes"), "* diff -filter -text -ident -working-tree-encoding\n");
+  const attrNames = ["a/.gitattributes", "b/.gitattributes"];
+  const attributes = await command(["check-attr", "-z", "diff", "filter", "--", ...attrNames]);
+  const expectedAttributes = Buffer.from(attrNames.map(name => name + "\0diff\0set\0" + name + "\0filter\0unset\0").join(""));
+  if (!attributes.equals(expectedAttributes)) throw Error("neutral attributes unavailable");
+  const objectEnv = { GIT_OBJECT_DIRECTORY: fdpath(objects) };
+  const metadata = args => command(args, METADATA_LIMIT, undefined, false, temp, objectEnv);
+  const resolved = (await metadata(["rev-parse", "--verify", base + "^{commit}"])).toString().trim();
+  if (resolved !== base) throw Error("base unavailable");
+  const old = new Map();
+  for (const row of paths(await metadata(["ls-tree", "-rz", "--full-tree", base]))) {
+    const tab = row.indexOf("\t");
+    const head = row.slice(0, tab).split(" "), name = row.slice(tab + 1);
+    components(name);
+    if (tab < 0 || head[1] !== "blob" || !["100644", "100755"].includes(head[0]))
+      throw Error("unsupported base mode");
+    old.set(name, { mode: parseInt(head[0], 8), oid: head[2] });
+    if (old.size > PATH_LIMIT) throw Error("base path cap");
+  }
+  const ixfd = (() => { try { return openFile(gd, "index"); } catch (e) { if (e.code === "ENOENT") return null; throw e; } })();
+  let ix = null;
+  if (ixfd !== null) {
+    try { ix = read(ixfd, METADATA_LIMIT); } finally { close(ixfd); }
+  }
+  const indexed = indexEntries(ix);
+  const tracked = new Set([...old.keys(), ...indexed.keys()]);
+  if (tracked.size > PATH_LIMIT) throw Error("tracked path cap");
+  const trackedParents = new Set();
+  for (const name of tracked) {
+    let end = name.lastIndexOf("/");
+    while (end !== -1) {
+      trackedParents.add(name.slice(0, end));
+      end = name.lastIndexOf("/", end - 1);
+    }
+  }
+  const candidates = new Set(tracked), untracked = [];
+  const exclude = optional(gd, "info/exclude", 65536);
+  if (exclude) {
+    fs.mkdirSync(path.join(temp, ".git/info"), { recursive: true });
+    fs.writeFileSync(path.join(temp, ".git/info/exclude"), exclude);
+  }
+  async function walk(fd, prefix, depth) {
+    if (++dirs > DIR_LIMIT || depth > DEPTH_LIMIT) throw Error("directory cap");
+    const ignore = optional(fd, ".gitignore", 65536);
+    if (ignore) {
+      const dst = path.join(temp, prefix, ".gitignore");
+      fs.mkdirSync(path.dirname(dst), { recursive: true }); fs.writeFileSync(dst, ignore);
+    }
+    const directoryStream = fs.opendirSync(fdpath(fd), { encoding: "buffer" });
+    const names = [];
+    try {
+      let ent;
+      while ((ent = directoryStream.readSync())) {
+        check(); if (++entries > ENTRY_LIMIT) throw Error("metadata entry cap");
+        const raw = ent.name, name = raw.toString("utf8");
+        if (!Buffer.from(name).equals(raw)) throw Error("non UTF8 filename");
+        if (name.toLowerCase() === ".git") continue;
+        const rel = prefix + name; components(rel);
+        names.push({ name, rel, dir: ent.isDirectory() });
+      }
+    } finally { directoryStream.closeSync(); }
+    const queries = names.map(x => x.rel + (x.dir ? "/" : ""));
+    const queryBytes = Buffer.from(queries.join("\0") + (queries.length ? "\0" : ""));
+    if (queryBytes.length > METADATA_LIMIT) throw Error("ignore query cap");
+    const ignored = new Set(paths(await command(["check-ignore", "--no-index", "-z", "--stdin"],
+      METADATA_LIMIT, queryBytes, true)));
+    for (const item of names) {
+      check();
+      const needed = tracked.has(item.rel) || trackedParents.has(item.rel);
+      if (ignored.has(item.rel + (item.dir ? "/" : "")) && !needed) continue;
+      if (item.dir) {
+        const sub = directory(fd, item.name);
+        try { await walk(sub, item.rel + "/", depth + 1); } finally { close(sub); }
+      } else if (!tracked.has(item.rel)) {
+        untracked.push(item.rel);
+        if (untracked.length > 200) throw Error("untracked path cap");
+      }
+    }
+  }
+  await walk(root, "", 0);
+  for (const name of untracked) candidates.add(name);
+  let patchBytes = 0;
+  for (const name of candidates) {
+    check();
+    let fd, content = null, mode = 0o100644;
+    const previous = old.get(name);
+    try {
+      try { fd = openFile(root, name); } catch (e) { if (e.code !== "ENOENT") throw e; }
+      if (fd !== undefined) {
+        const st = fs.fstatSync(fd, { bigint: true });
+        mode = st.mode & 0o111n ? 0o100755 : 0o100644;
+        // The mutable index identifies paths only; current bytes must always be read.
+        content = read(fd, FILE_LIMIT);
+      }
+    } finally { if (fd !== undefined) close(fd); }
+    if (!previous && content === null) continue;
+    if (previous && content !== null && previous.mode === mode
+        && createHash("sha1").update("blob " + content.length + "\0").update(content).digest("hex") === previous.oid) continue;
+    let before = null;
+    if (previous) {
+      const sizeText = (await metadata(["cat-file", "-s", previous.oid])).toString().trim();
+      if (!/^\d+$/.test(sizeText) || Number(sizeText) > FILE_LIMIT || total + Number(sizeText) > TOTAL_LIMIT)
+        throw Error("base source cap");
+      before = await command(["cat-file", "blob", previous.oid], Number(sizeText), undefined, false, temp, objectEnv);
+      if (before.length !== Number(sizeText)) throw Error("base blob size mismatch");
+      total += before.length;
+    }
+    // Git's binary sample convention, before creating any diff inputs.
+    if ((before && before.subarray(0, 8000).includes(0)) || (content && content.subarray(0, 8000).includes(0))) continue;
+    for (const [side, bytes, fileMode] of [["a", before, previous?.mode], ["b", content, mode]]) {
+      if (bytes === null) continue;
+      const dst = path.join(temp, side, name);
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      fs.writeFileSync(dst, bytes, { mode: fileMode & 0o777 });
+    }
+    // Captured attributes are ordinary diff inputs; neutral info/attributes overrides them.
+    const patch = await command(["diff", "--no-index", "--no-ext-diff", "--no-textconv",
+      "--no-renames", "--src-prefix=", "--dst-prefix=", "--",
+      before === null ? "/dev/null" : "a/" + name, content === null ? "/dev/null" : "b/" + name],
+      PATCH_LIMIT - patchBytes, undefined, true);
+    patchBytes += patch.length;
+    if (patchBytes > PATCH_LIMIT) throw Error("patch cap");
+    if (!process.stdout.write(patch)) await new Promise(resolve => process.stdout.once("drain", resolve));
+    for (const side of ["a", "b"]) fs.rmSync(path.join(temp, side), { recursive: true, force: true });
+  }
+})().then(() => { cleanup(); }, (error) => {
+  try { cleanup(); } finally { process.stderr.write(String(error.stack)); process.exitCode = 1; }
+});
+`;
 
 function withDir(cwd: string | undefined, args: string[]): string[] {
   return cwd ? ["-C", cwd, ...args] : args;

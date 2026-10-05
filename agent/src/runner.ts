@@ -13907,11 +13907,11 @@ export class RunRunner {
     // cannot seed off a PRIOR (possibly plan-rejected) run's work. `?? undefined` maps the
     // wire's null (a never-published run) to the "do not adopt" sentinel the git layer reads.
     const expectedCheckpointTip = claim.checkpoint_tip ?? undefined;
-    // issue #1769: a Codex (sandboxed) run's command sandbox does not grant the worker bare,
-    // so its clone is dissociated from the bare at seed. Keyed on
-    // `executor.sandboxesCommands`, which the executor sets at construction: `executor.safety`
-    // is populated only inside run(), so it is still unset here. Claude/stub pass false.
-    const cloneOpts = { selfContained: executor.sandboxesCommands === true };
+    // Sandboxed commands cannot read the worker bare; required planning cross-check capture
+    // also refuses object alternates, including for Claude. Dissociate either clone at seed.
+    // `executor.sandboxesCommands` is set at construction; `executor.safety` is populated
+    // only inside run(), so it is still unset here. Ordinary Claude/stub clones pass false.
+    const cloneOpts = { selfContained: executor.sandboxesCommands === true || claim.plan_cross_check_required === true };
     // PRD #983 M4b: the per-kind branch derivations (ci_fix's default-branch vs run-branch
     // choice, self_improve/prompt's fresh-per-cycle run-id branch, task/mr_rework's
     // pre-seeded branch with its loud missing-branch guard) live in RUN_KIND_PROFILES. A
