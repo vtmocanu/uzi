@@ -222,6 +222,7 @@ var d7UntrustedFields = []string{
 	"upgradeDetail", "upgradeTarget", "blockingContainer", "blockingReason",
 	"outboxBlockedText", "tokenLabel", "hostedSize", "capabilityText",
 	"workerOwner", "pressureText", "attnShort", "attnDetail",
+	"runWorkerName",
 }
 
 // d7Writers are the calls that put a string on the screen. lipgloss's Render is one:

@@ -125,7 +125,9 @@ func (m tuiModel) workerKey(k string) (tea.Model, tea.Cmd) {
 		return m.leaveWorker()
 	}
 	if k == keyPageUp || k == keyPageDown {
-		m.workerDetail.scroll = max(0, m.workerDetail.scroll+motionDelta(k))
+		lines, _ := m.workerDetailLines(time.Now())
+		capacity := max(0, m.height-2)
+		m.workerDetail.scroll = min(max(0, len(lines)-capacity), max(0, m.workerDetail.scroll+motionDelta(k)))
 		return m, nil
 	}
 	if d := motionDelta(k); d != 0 {
@@ -133,15 +135,14 @@ func (m tuiModel) workerKey(k string) (tea.Model, tea.Cmd) {
 		m.workerDetail.cursor += d
 		m.workerDetail.selectedRunID = ""
 		m.reconcileReportedRun()
-		if r, ok := m.scopedWorker(m.workerDetail.workerID); ok {
-			line := 5 + len(workerAttention(r, time.Now())) + m.workerDetail.cursor
-			capacity := max(1, m.height-3)
-			if line < m.workerDetail.scroll {
-				m.workerDetail.scroll = line
-			}
-			if line >= m.workerDetail.scroll+capacity {
-				m.workerDetail.scroll = line - capacity + 1
-			}
+		lines, selected := m.workerDetailLines(time.Now())
+		capacity := max(1, m.height-2)
+		m.workerDetail.scroll = min(max(0, m.workerDetail.scroll), max(0, len(lines)-capacity))
+		if selected < m.workerDetail.scroll {
+			m.workerDetail.scroll = selected
+		}
+		if selected >= m.workerDetail.scroll+capacity {
+			m.workerDetail.scroll = selected - capacity + 1
 		}
 		return m, nil
 	}
@@ -219,32 +220,163 @@ func (m tuiModel) applyRunWorker(msg runWorkerMsg) (tea.Model, tea.Cmd) {
 	}
 	return m.openWorker(n.workerID)
 }
-func (m tuiModel) renderWorker() string {
+
+// workerDetailLines shares the selected row's actual position with scrolling. Each
+// reported run has a title, worker report and separately sourced cached board row.
+func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 	r, ok := m.scopedWorker(m.workerDetail.workerID)
 	if !ok {
-		return "worker not in your list\n esc back"
+		return []string{"worker not in your list"}, 0
 	}
-	t := workerTextOf(r)
-	lines := []string{m.pal.title.Render(m.renderer.Plain(t.workerName, max(1, m.width))), "", "Attention"}
-	for _, a := range workerAttention(r, time.Now()) {
-		lines = append(lines, m.renderer.Plain(a.attnDetail, max(1, m.width)))
+	w, t := r.w, workerTextOf(r)
+	width := max(1, m.width)
+	lines := []string{m.pal.title.Render(m.renderer.Plain(t.workerName, width)), "", "Attention"}
+	attention := workerAttention(r, now)
+	if len(attention) == 0 {
+		lines = append(lines, "none")
+	}
+	for _, a := range attention {
+		lines = append(lines, m.renderer.Plain(a.attnDetail, width))
 	}
 	lines = append(lines, "", "Reported runs")
-	for i, run := range r.w.ReportedRuns {
+	selected := 0
+	if len(w.ReportedRuns) == 0 {
+		lines = append(lines, "none reported")
+	}
+	for i, run := range w.ReportedRuns {
 		mark := "  "
 		if i == m.workerDetail.cursor {
-			mark = "› "
+			mark, selected = "› ", len(lines)
 		}
-		pending := ""
+		title, cached := m.renderer.Plain(run.RunID, width-2), "  cached board: ? (not cached)"
+		if m.board.runsAdmin == m.board.admin {
+			for _, boardRun := range m.board.runs {
+				if boardRun.ID != run.RunID {
+					continue
+				}
+				title = m.renderer.Plain(runTitle(boardRun.RunDTO), width-2)
+				status, stage := "unknown", "unknown"
+				switch boardRun.Status {
+				case "queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait", "pool_wait", "recovery_wait", "paused", "completed", "failed", "cancelled":
+					status = boardRun.Status
+					stage = m.pal.runStateToken(boardRun.RunDTO, boardRun.IsRevising).word
+				}
+				cached = "  cached board: status " + status + " · stage " + m.renderer.Plain(stage, 32)
+				break
+			}
+		}
+		phase := "unknown"
+		switch run.Phase {
+		case "running", "awaiting_approval", "awaiting_input", "awaiting_followup":
+			phase = run.Phase
+		}
+		lines = append(lines, mark+title, fmt.Sprintf("  worker phase: %s · generation %d", phase, run.ClaimGeneration), cached)
 		if run.TerminalPending {
-			pending = " · outcome pending"
+			lines = append(lines, "  outcome pending · "+workerAge(run.TerminalPendingSince, now))
 		}
-		lines = append(lines, fmt.Sprintf("%s%s · %s · generation %d%s", mark, m.renderer.Plain(run.RunID, 36), m.renderer.Plain(run.Phase, 24), run.ClaimGeneration, pending))
 	}
-	capacity := max(1, m.height-3)
-	m.workerDetail.scroll = min(m.workerDetail.scroll, max(0, len(lines)-capacity))
-	lines = lines[m.workerDetail.scroll:min(len(lines), m.workerDetail.scroll+capacity)]
-	lines = append(lines, m.workerDetail.notice, "enter run · esc back · pgup/pgdn scroll · r refresh · ? keys")
+	lines = append(lines, "", "Resources")
+	resourceStart := len(lines)
+	if w.Status != "online" {
+		lines = append(lines, "stale, last-known")
+	}
+	cpu := "?"
+	if w.StatsCPUPct != nil {
+		cpu = fmt.Sprintf("%.1f%%", *w.StatsCPUPct)
+	}
+	source := ""
+	if w.StatsSource != nil && *w.StatsSource == "process" {
+		source = " · worker process only"
+	}
+	lines = append(lines, "CPU "+cpu+source, "memory "+workerBytePair(w.StatsMemBytes, w.StatsMemLimitBytes)+source)
+	lines = append(lines,
+		"data bytes "+workerBytePair(w.StatsDiskDataBytes, w.StatsDiskDataTotalBytes),
+		"data inodes "+workerInodePair(w.StatsDiskDataInodes, w.StatsDiskDataTotalInodes)+" (display-only)",
+		"nix bytes "+workerBytePair(w.StatsDiskNixBytes, w.StatsDiskNixTotalBytes),
+		"nix inodes ? (display-only)",
+		"dind bytes "+workerBytePair(w.StatsDiskDindBytes, w.StatsDiskDindTotalBytes)+" (display-only)",
+		"dind inodes "+workerInodePair(w.StatsDiskDindInodes, w.StatsDiskDindTotalInodes)+" (display-only)",
+		"largest runs · cache is a subset of HOME (display-only)")
+	if len(w.RunDisk) == 0 {
+		lines = append(lines, "?")
+	}
+	for _, disk := range w.RunDisk {
+		bound := ""
+		if disk.Truncated {
+			bound = "≥"
+		}
+		lines = append(lines, m.renderer.Plain(disk.RunID, width),
+			"  HOME "+bound+humanBytes(disk.HomeBytes)+" · cache "+bound+humanBytes(disk.CacheBytes),
+			"  measured "+workerAge(&disk.SampledAt, now)+" ago")
+	}
+	if w.Status != "online" {
+		for i := resourceStart; i < len(lines); i++ {
+			lines[i] = m.pal.faint.Render("~ " + lines[i])
+		}
+	}
+	lines = append(lines, "", "Configuration",
+		"version "+m.renderer.Plain(t.workerVersion, width)+" · target "+m.renderer.Plain(t.upgradeTarget, width),
+		"capabilities "+m.renderer.Plain(t.capabilityText, width),
+		"template declared "+m.renderer.Plain(t.templateDeclared, width),
+		"template reported "+m.renderer.Plain(t.templateReported, width))
+	mode := "unknown"
+	switch w.AnthropicBindMode {
+	case "default", "auto":
+		mode = w.AnthropicBindMode
+	case "pinned":
+		mode = "pinned · " + m.renderer.Plain(t.tokenLabel, width)
+	}
+	kind := "unknown"
+	switch w.Kind {
+	case "external", "hosted":
+		kind = w.Kind
+	}
+	lines = append(lines, "token mode "+mode, "kind "+kind+" · size "+m.renderer.Plain(t.hostedSize, width))
+	if w.Ephemeral {
+		lease := "?"
+		if w.EphemeralLeaseExpiresAt != nil {
+			lease = "expired"
+			if w.EphemeralLeaseExpiresAt.After(now) {
+				lease = workerDuration(w.EphemeralLeaseExpiresAt.Sub(now)) + " left"
+			}
+		}
+		lines = append(lines, "ephemeral · lease "+lease)
+	}
+	if m.board.admin {
+		lines = append(lines, "owner "+m.renderer.Plain(t.workerOwner, width))
+	}
+	return lines, selected
+}
+
+func workerBytePair(used, total *int64) string {
+	value := func(n *int64) string {
+		if n == nil {
+			return "?"
+		}
+		return humanBytes(*n)
+	}
+	return value(used) + " / " + value(total)
+}
+func workerInodePair(used, total *int64) string {
+	value := func(n *int64) string {
+		if n == nil {
+			return "?"
+		}
+		return fmt.Sprintf("%d", *n)
+	}
+	return value(used) + " / " + value(total)
+}
+func (m tuiModel) renderWorker() string {
+	lines, _ := m.workerDetailLines(time.Now())
+	capacity := max(0, m.height-2)
+	scroll := min(max(0, m.workerDetail.scroll), max(0, len(lines)-capacity))
+	lines = lines[scroll:min(len(lines), scroll+capacity)]
+	if m.height >= 2 {
+		lines = append(lines, m.renderer.Plain(m.workerDetail.notice, max(1, m.width)))
+	}
+	if m.height >= 1 {
+		lines = append(lines, "j/k select · enter run · esc back · pgup/pgdn scroll · r refresh · ? keys")
+	}
 	for i, line := range lines {
 		lines[i] = clampVisual(line, max(1, m.width))
 	}
