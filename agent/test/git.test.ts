@@ -95,7 +95,7 @@ describe("permit-scoped git output collection", () => {
         stdin: null,
         stdout,
         stderr,
-        completed: Promise.resolve({ code: 0 }),
+        cancel: async () => {}, completed: Promise.resolve({ code: 0 }),
       }),
       signal,
       () => internals.execScoped("git", ["--version"], { env: {}, maxBuffer }),

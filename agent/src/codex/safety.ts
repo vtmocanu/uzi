@@ -48,7 +48,7 @@ export type SpawnRootSeam = (
   deadlineMs: number,
 ) => Promise<RegisteredRoot>;
 
-export interface SpawnedBoundaryProcess extends Omit<BoundaryProcessHandle, "completed"> {
+export interface SpawnedBoundaryProcess extends Omit<BoundaryProcessHandle, "completed" | "cancel"> {
   readonly root: RegisteredRoot;
   /** Wait only for the supervised primary child. The safety owner follows it
    * with the registry-owned whole-root reap before exposing completion. */
@@ -585,6 +585,14 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       await launched.root.dispose(remainingMs(this.currentDeadlineAt)).catch(() => undefined);
       throw new TrustedExecutionRefusal("boundary process failed registry admission");
     }
+    const cancellation = new AbortController();
+    let finished = false;
+    let resolveStop!: () => void;
+    const stopped = new Promise<void>((resolve) => { resolveStop = resolve; });
+    const onStop = (): void => resolveStop();
+    cancellation.signal.addEventListener("abort", onStop, { once: true });
+    permit.signal.addEventListener("abort", onStop, { once: true });
+    if (permit.signal.aborted) resolveStop();
     const completed = (async (): Promise<{ readonly code: number; readonly softTimedOut?: true }> => {
       let terminal: { readonly code: number } | undefined;
       let terminalError: unknown;
@@ -598,36 +606,62 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
         terminal = await this.waitChildOrAbort(
           launched,
           permit.signal,
+          cancellation.signal,
           Math.max(1, childDeadlineAt - Date.now()),
         );
       } catch (error) {
         terminalError = error;
       }
-      if (request.recoverableTimeout && terminalError instanceof SupervisedChildExitTimeoutError &&
-          !permit.signal.aborted && remainingMs(this.currentDeadlineAt) > 0) {
-        // The timeout only authorizes a skip after the supervisor has stopped its
-        // owned process group and the registry has verified a full-root reap.
-        // Keep this work inside the held permit and, for git, its bare lock.
+      const softTimeout = request.recoverableTimeout && terminalError instanceof SupervisedChildExitTimeoutError &&
+          !permit.signal.aborted && !cancellation.signal.aborted && remainingMs(this.currentDeadlineAt) > 0;
+      let disposalFailed = false;
+      let disposed = false;
+      const dispose = async (): Promise<void> => {
+        if (disposed) return;
+        disposed = true;
         try {
           await launched.root.dispose(remainingMs(this.currentDeadlineAt));
         } catch {
-          this.registry.poison({ category: "tool", message: "checkpoint child disposal failed" });
-          throw new TrustedExecutionRefusal("checkpoint child disposal failed");
+          disposalFailed = true;
+          this.registry.poison({ category: "tool", message: "boundary process disposal failed" });
         }
-        const reaped = await this.registry.reapRoot(launched.root, remainingMs(this.currentDeadlineAt));
-        if (!reaped.ok || permit.signal.aborted || remainingMs(this.currentDeadlineAt) <= 0) {
+      };
+      if (softTimeout || cancellation.signal.aborted || permit.signal.aborted) await dispose();
+      const reap = this.registry.reapRoot(launched.root, remainingMs(this.currentDeadlineAt));
+      // The completion owner alone disposes and reaps. A stop arriving during
+      // natural-exit reap still stops the owned root, without starting a second reap.
+      await Promise.race([reap, stopped]);
+      if (cancellation.signal.aborted || permit.signal.aborted) await dispose();
+      const reaped = await reap;
+      if (cancellation.signal.aborted || permit.signal.aborted) await dispose();
+      if (disposalFailed) throw new TrustedExecutionRefusal("boundary process disposal failed");
+      if (!reaped.ok) throw new TrustedExecutionRefusal("boundary process root did not reap cleanly");
+      if (softTimeout && !cancellation.signal.aborted) {
+        // The timeout only authorizes a skip after the supervisor has stopped its
+        // owned process group and the registry has verified a full-root reap.
+        // Keep this work inside the held permit and, for git, its bare lock.
+        if (permit.signal.aborted || remainingMs(this.currentDeadlineAt) <= 0) {
           throw new TrustedExecutionRefusal("checkpoint child root did not reap cleanly before boundary deadline");
         }
         launched.stdout?.destroy();
         launched.stderr?.destroy();
         return { code: -1, softTimedOut: true };
       }
-      const reaped = await this.registry.reapRoot(launched.root, remainingMs(this.currentDeadlineAt));
-      if (!reaped.ok) throw new TrustedExecutionRefusal("boundary process root did not reap cleanly");
+      if (permit.signal.aborted) throw new TrustedExecutionRefusal("boundary process deadline exceeded");
+      if (cancellation.signal.aborted) return { code: -1 };
       if (terminalError !== undefined) throw terminalError;
       if (!terminal) throw new TrustedExecutionRefusal("boundary process produced no terminal result");
       return terminal;
-    })();
+    })().finally(() => {
+      finished = true;
+      cancellation.signal.removeEventListener("abort", onStop);
+      permit.signal.removeEventListener("abort", onStop);
+    });
+    let cancelPromise: Promise<void> | undefined;
+    const cancel = (): Promise<void> => {
+      if (!finished) cancellation.abort();
+      return cancelPromise ??= completed.then(() => undefined);
+    };
     // Track synchronously before returning the streams. Even a caller that forgets
     // `completed` cannot release the permit while this process/root is live.
     this.pendingActions.push(completed);
@@ -636,21 +670,31 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       stdout: launched.stdout,
       stderr: launched.stderr,
       completed,
+      cancel,
     };
   }
 
   private waitChildOrAbort(
     launched: SpawnedBoundaryProcess,
     signal: AbortSignal,
+    cancellation: AbortSignal,
     deadlineMs: number,
   ): Promise<{ readonly code: number }> {
     if (signal.aborted) return Promise.reject(new TrustedExecutionRefusal("boundary process deadline exceeded"));
+    if (cancellation.aborted) return Promise.resolve({ code: -1 });
     return new Promise((resolve, reject) => {
-      const onAbort = (): void => reject(new TrustedExecutionRefusal("boundary process deadline exceeded"));
-      signal.addEventListener("abort", onAbort, { once: true });
-      launched.waitChild(deadlineMs).then(resolve, reject).finally(() => {
+      const cleanup = (): void => {
         signal.removeEventListener("abort", onAbort);
-      });
+        cancellation.removeEventListener("abort", onCancel);
+      };
+      const onAbort = (): void => { cleanup(); reject(new TrustedExecutionRefusal("boundary process deadline exceeded")); };
+      const onCancel = (): void => { cleanup(); resolve({ code: -1 }); };
+      signal.addEventListener("abort", onAbort, { once: true });
+      cancellation.addEventListener("abort", onCancel, { once: true });
+      launched.waitChild(deadlineMs).then(
+        (result) => { cleanup(); resolve(result); },
+        (error: unknown) => { cleanup(); reject(error); },
+      );
     });
   }
 

@@ -5260,7 +5260,7 @@ export class GitCache {
    * On the bound, the timeout and the abort, the stdout stream is abandoned (destroyed). What
    * that does to the child depends on the spawn path ({@link spawnGit}):
    * - Outside a boundary scope, abandoning the stream kills the child (SIGTERM) at once.
-   * - Inside a boundary scope (withBoundaryProcessSpawner) the handle exposes no kill: abandoning
+   * - Inside a boundary scope (withBoundaryProcessSpawner) this path does not call the handle's cancel(): abandoning
    *   the stream only unpipes and destroys its stdout, so a child that is still writing meets a
    *   closed pipe on its next write and an idle one keeps running. Its termination is then left to
    *   the `timeoutMs` forwarded to the spawner (BoundaryProcessRequest.timeoutMs, whose contract is

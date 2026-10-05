@@ -375,7 +375,10 @@ export class TickSpawner {
       held: undefined,
       reconciled: false,
     };
-    const completed = new Promise<{ code: number }>((resolve, reject) => {
+    let groupFailure: unknown;
+    let rejectPrimary!: (error: Error) => void;
+    const primary = new Promise<{ code: number }>((resolve, reject) => {
+      rejectPrimary = reject;
       // Settlement is the whole GROUP: wait (bounded) for any member that outlived the leader.
       // Started once, from whichever of 'error' / 'exit' comes first; a spawn failure has no group.
       let groupWaitStarted = false;
@@ -383,7 +386,11 @@ export class TickSpawner {
         if (groupWaitStarted) return;
         groupWaitStarted = true;
         const wait = child.pid === undefined ? Promise.resolve() : this.awaitGroupGone(tracked);
-        void wait.finally(() => {
+        void wait.catch((error: unknown) => {
+          groupFailure = error;
+          // Unknown cleanup is still a survivor: settlement must not unblock a sink.
+          tracked.survived = true;
+        }).finally(() => {
           this.live.delete(tracked);
           resolveGroup();
         });
@@ -392,6 +399,7 @@ export class TickSpawner {
         if (groupWaitStarted) return;
         groupWaitStarted = true;
         tracked.survived = true;
+        rejectPrimary(new Error("tick subprocess process group survived cleanup"));
         this.live.delete(tracked);
         resolveGroup();
       };
@@ -409,10 +417,25 @@ export class TickSpawner {
         startGroupWait();
       });
     });
+    const completed = (async (): Promise<{ code: number }> => {
+      let terminal: { code: number } | undefined;
+      let failure: unknown;
+      try { terminal = await primary; } catch (error) { failure = error; }
+      await groupGone;
+      if (tracked.survived) throw new Error("tick subprocess process group survived cleanup");
+      if (groupFailure !== undefined) throw groupFailure;
+      if (failure !== undefined) throw failure;
+      return tracked.signalled ? { code: terminal!.code || -1 } : terminal!;
+    })();
     completed.catch(() => undefined);
+    let cancelPromise: Promise<void> | undefined;
+    const cancel = (): Promise<void> => cancelPromise ??= (async () => {
+      if (this.live.has(tracked)) await this.terminate(tracked);
+      await completed;
+    })();
     if (child.pid === undefined) {
       // A spawn failure (ENOENT/EACCES): 'error' fires; nothing to track or kill.
-      return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed };
+      return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed, cancel };
     }
     this.live.add(tracked);
     this.all.push(tracked);
@@ -425,9 +448,12 @@ export class TickSpawner {
     }
     this.opts.hooks?.onSpawn?.(child.pid, request.argv);
     for (const s of signals) {
-      s.addEventListener("abort", () => void this.terminate(tracked), { once: true });
+      const onAbort = (): void => { void cancel().catch(() => undefined); };
+      s.addEventListener("abort", onAbort, { once: true });
+      void groupGone.then(() => s.removeEventListener("abort", onAbort));
+      if (s.aborted) onAbort();
     }
-    return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed };
+    return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed, cancel };
   }
 
   private async snapshotLocks(): Promise<Map<string, LockStat>> {
@@ -468,7 +494,7 @@ export class TickSpawner {
   }
 
   private async terminate(t: Tracked): Promise<void> {
-    if (t.isExited() || t.signalled) return;
+    if (!this.live.has(t) || t.signalled) return;
     t.signalled = true;
     this.signalGroup(t, "SIGTERM");
     let timer: ReturnType<typeof setTimeout> | undefined;

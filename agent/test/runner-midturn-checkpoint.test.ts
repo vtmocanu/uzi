@@ -1979,7 +1979,7 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
           child.once("error", reject);
           child.once("exit", (code, sig) => resolve({ code: code ?? (sig ? 128 : 1) }));
         });
-        return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed };
+        return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; }, completed };
       },
       dispose: async () => ({ kind: "disposed" }),
     };
@@ -2069,7 +2069,7 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
           child.once("error", reject);
           child.once("exit", (code, sig) => resolve({ code: code ?? (sig ? 128 : 1) }));
         });
-        return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed };
+        return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; }, completed };
       },
       dispose: async () => ({ kind: "disposed" }),
     };
@@ -2573,7 +2573,7 @@ function fakeCodex(): { safety: CodexExecutionSafety; inPermit: () => boolean; b
         child.once("error", reject);
         child.once("exit", (code, sig) => resolve({ code: code ?? (sig ? 128 : 1) }));
       });
-      return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed };
+      return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; }, completed };
     },
     dispose: async () => ({ kind: "disposed" }),
   };
