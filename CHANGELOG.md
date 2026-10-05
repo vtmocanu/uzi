@@ -32,8 +32,11 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Codex delegation requires an assignment ([#2285](https://github.com/vtmocanu/uzi/issues/2285)).**
+  Empty or blank subagent instructions are rejected before a child starts. Blank aliases fall through to later instructions, and valid task text is preserved.
+
 - **Incidental finding line ranges share a coordinate ([#2287](https://github.com/vtmocanu/uzi/issues/2287)).**
-  New reports strip trailing line ranges just like single line numbers, preserving symbol distinctions and each report’s evidence. Existing stored coordinates are unchanged.
+  New reports strip trailing line ranges just like single line numbers, preserving symbol distinctions and each report's evidence. Existing stored coordinates are unchanged.
 
 ## [0.85.2] - 2026-10-05
 

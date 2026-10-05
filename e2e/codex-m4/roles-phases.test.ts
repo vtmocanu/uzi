@@ -101,7 +101,7 @@ describe("codex U roles and phases (real render grants → real broker)", () => 
     assert.equal(okBash.ok, true, "a granted tool runs");
     assert.equal(h.spawn.calls.length, 1, "the granted Bash reached the command spawn seam");
 
-    const okDelegate = await h.broker.handleToolCall(rt(), "spawn_agent", { subagent_type: "coder" }, "root");
+    const okDelegate = await h.broker.handleToolCall(rt(), "spawn_agent", { subagent_type: "coder", prompt: "implement the assigned change" }, "root");
     assert.equal(okDelegate.ok, true, "a known-role delegation runs");
     assert.equal(delegatedRole, "coder", "the known role reached the delegate seam");
 

@@ -299,6 +299,9 @@ describe("CodexDelegationRunner: happy path + honest attribution", () => {
     { name: "all empty instruction fields fall back to description", args: { description: "label", prompt: "", task: "", input: "", message: "" }, expected: "label" },
     { name: "description-only delegation remains supported", args: { description: "label" }, expected: "label" },
     { name: "prompt-only delegation remains supported", args: { prompt: "prompt brief" }, expected: "prompt brief" },
+    { name: "blank prompt falls through to task", args: { prompt: "  ", task: "review X" }, expected: "review X" },
+    { name: "blank dedicated instructions fall through to description", args: { prompt: " ", task: "\t", input: "\n", message: " ", description: "fallback brief" }, expected: "fallback brief" },
+    { name: "nonblank assignment preserves surrounding whitespace", args: { prompt: "  review X\n" }, expected: "  review X\n" },
   ];
 
   for (const { name, args, expected } of taskInputs) {
