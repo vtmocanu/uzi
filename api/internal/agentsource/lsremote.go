@@ -102,13 +102,23 @@ func advertise(ctx context.Context, opts CloneOptions) (*advertisement, error) {
 	}
 	adv.session = session
 
-	ar, aerr := session.AdvertisedReferencesContext(cctx)
-	if aerr != nil {
+	if err := adv.readRefs(); err != nil {
 		adv.close()
-		return nil, adv.wrap("list refs", aerr)
+		return nil, err
 	}
-	adv.refs = ar
 	return adv, nil
+}
+
+func (a *advertisement) readRefs() error {
+	refs, err := a.session.AdvertisedReferencesContext(a.ctx)
+	if err != nil {
+		return a.wrap("list refs", err)
+	}
+	if a.budget != nil && a.budget.tripped() {
+		return a.wrap("list refs", errCloneWireBudget)
+	}
+	a.refs = refs
+	return nil
 }
 
 // ListRemoteRefs returns the source's advertised refs from a single ref-advertisement

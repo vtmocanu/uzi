@@ -49,6 +49,9 @@ through `[0.52.0]`.)
 - **Checkpoint scans exclude confirmed real history beneath overlays ([#1963](https://github.com/vtmocanu/uzi/issues/1963)).**
   Mid-turn and iteration checkpoint scans use confirmed published real tips as scan floors, so an earlier overlay publication does not block clean new work by rescanning already-public history. New unpublished secrets remain blocked, and local-only checkpoint bridges do not qualify as scan floors.
 
+- **Source ref advertisements enforce the clone wire budget ([#2266](https://github.com/vtmocanu/uzi/issues/2266)).**
+  Ref listing and source fetches reject over-budget advertisements even when the Git decoder succeeds, returning the existing wire-budget diagnostic before accepting refs or fetching a pack.
+
 - **Secret scans reuse the pinned worker scanner offline ([#2289](https://github.com/vtmocanu/uzi/issues/2289)).**
   The repository gate reuses installed gitleaks only when Go build metadata proves the exact module and version without replacements. Unknown or different builds use the pinned fetch, and every scan still must detect its canaries.
 
