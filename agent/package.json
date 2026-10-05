@@ -24,7 +24,7 @@
   "devDependencies": {
     "@types/node": "^24.13.3",
     "knip": "6.38.0",
-    "oxlint": "1.85.0",
+    "oxlint": "1.86.0",
     "typescript": "^7.0.0"
   },
   "overrides": {
