@@ -1,7 +1,7 @@
 # PRD #1349: Recovery custody hardening and operator control
 
-**Issue**: [#1349](https://github.com/vtmocanu/uzi/issues/1349) | **Priority**: High  
-**Status**: M0 browser mock approved; independently reviewed; ready for commit and Auto dispatch  
+**Issue**: [#1349](https://github.com/vtmocanu/uzi/issues/1349) | **Priority**: Normal  
+**Status**: M1-M7 merged (PR #1366, `f83c4c52`); M8 maintainer-owned hosted acceptance remains  
 **Evidence baseline**: `8e51f9ba` (2026-09-14); refresh file anchors on the implementation base  
 **Handoff**: User-selected Auto mode with MR rework enabled. The user approved the local HTML mock on 2026-09-14; implement its recorded decisions without another design gate.
 
