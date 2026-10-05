@@ -275,25 +275,31 @@ func (m tuiModel) splitFooterLine() string {
 // Build it once per render: time-dependent meter widths can change its height.
 func (m tuiModel) splitHeader(now time.Time) []string {
 	var lines []string
-	label := "floor"
-	if m.top() == viewWorkers {
-		label = "workers"
-	} else if m.board.admin {
-		label = "active runs"
+	floor := "floor"
+	if m.board.admin {
+		floor = "active runs"
 	}
-	if m.view == m.top() {
-		label = "[" + label + "]"
-	}
-	title := " " + m.pal.title.Render("▚▚ uzi") + m.pal.faint.Render(" · ") + m.pal.title.Render(label)
-	if m.top() == viewBoard {
-		lines = append(lines, m.workerTitleLines(title, m.workersSummary(m.width, true))...)
-	} else {
-		lines = append(lines, clampVisual(title, m.width))
-		if summary := m.workersSummary(min(80, m.width), false); summary != "" {
-			lines = append(lines, summary)
+	labels := []struct {
+		name string
+		tab  tuiView
+	}{{floor, viewBoard}, {"workers", viewWorkers}}
+	title := " " + m.pal.title.Render("▚▚ uzi")
+	for _, label := range labels {
+		title += m.pal.faint.Render(" · ")
+		if label.tab == m.top() {
+			name := label.name
+			if m.view == m.top() {
+				name = "[" + name + "]"
+			}
+			title += m.pal.title.Render(name)
+		} else {
+			title += m.pal.faint.Render(label.name)
 		}
 	}
-	lines = append(lines, m.boardMeterLayout(now).lines...)
+	lines = append(lines, m.workerTitleLines(title, m.workersSummary(m.width, m.top() == viewBoard))...)
+	if m.top() == viewBoard {
+		lines = append(lines, m.boardMeterLayout(now).lines...)
+	}
 	if vault := m.vaultIndicatorLine(); vault != "" {
 		lines = append(lines, vault)
 	}

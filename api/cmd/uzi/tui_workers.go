@@ -498,21 +498,20 @@ func workerSlots(w apitypes.WorkerDTO) string {
 	}
 	return itoa(w.ActiveRuns) + "/" + cap
 }
-func (m tuiModel) workersSummary(width int, floor bool) string {
+func (m tuiModel) workersSummary(width int, _ bool) string {
 	if m.workers.admin != m.board.admin || len(m.workers.rows) == 0 {
 		return ""
 	}
 	n, online, used, cap, unknown, attention, holding, draining, cordoned := len(m.workers.rows), 0, 0, 0, 0, 0, 0, 0, 0
 	now := time.Now()
 	for _, r := range m.workers.rows {
-		w := r.w
-		if w.Status == "online" {
+		if r.w.Status == "online" {
 			online++
-			used += w.ActiveRuns
-			if w.MaxConcurrentRuns == nil {
+			used += r.w.ActiveRuns
+			if r.w.MaxConcurrentRuns == nil {
 				unknown++
 			} else {
-				cap += *w.MaxConcurrentRuns
+				cap += *r.w.MaxConcurrentRuns
 			}
 		}
 		if workerSeverity(r, now) < 2 {
@@ -527,52 +526,48 @@ func (m tuiModel) workersSummary(width int, floor bool) string {
 			cordoned++
 		}
 	}
-	slots := fmt.Sprintf("%d/%d slots in use", used, cap)
-	attentionText := paintSeg(m.pal.amber, nil, false, fmt.Sprintf("%d need attention", attention))
-	if floor {
-		if width < 120 {
-			return fmt.Sprintf("workers %d/%d slots · %s", used, cap, attentionText)
-		}
-		return fmt.Sprintf("workers %s · %d/%d online · %s", slots, online, n, attentionText)
-	}
 	scope := "your workers"
 	if m.board.admin {
 		scope = "factory workers"
 	}
-	build := func(unk, admission, on bool) string {
-		seg := []string{scope, itoa(n)}
-		if on {
-			seg = append(seg, fmt.Sprintf("%d online", online))
+	build := func(showUnknown, showAdmission, showOnline, showCount bool) string {
+		parts := []string{paintSeg(nil, nil, true, scope)}
+		if showCount {
+			parts = append(parts, itoa(n))
 		}
-		occ := slots
-		if unk && unknown > 0 {
-			occ += fmt.Sprintf(" +%d ?cap", unknown)
+		if showOnline && online > 0 {
+			parts = append(parts, fmt.Sprintf("%d online", online))
 		}
-		seg = append(seg, occ)
-		if admission {
-			for _, c := range []struct {
-				n     int
-				label string
-			}{{holding, "holding"}, {draining, "draining"}, {cordoned, "cordoned"}} {
-				if c.n > 0 {
-					seg = append(seg, fmt.Sprintf("%d %s", c.n, c.label))
-				}
+		slots := paintSeg(m.pal.tungsten, nil, false, itoa(used)) + fmt.Sprintf("/%d slots in use", cap)
+		if showUnknown && unknown > 0 {
+			slots += m.pal.faint.Render(fmt.Sprintf(" +%d ?cap", unknown))
+		}
+		parts = append(parts, slots)
+		if showAdmission {
+			if holding > 0 {
+				parts = append(parts, paintSeg(m.pal.amber, nil, false, fmt.Sprintf("%d holding", holding)))
+			}
+			if draining > 0 {
+				parts = append(parts, paintSeg(m.pal.wait, nil, false, fmt.Sprintf("%d draining", draining)))
+			}
+			if cordoned > 0 {
+				parts = append(parts, paintSeg(m.pal.wait, nil, false, fmt.Sprintf("%d cordoned", cordoned)))
 			}
 		}
-		seg = append(seg, attentionText)
-		return strings.Join(seg, " · ")
+		if attention > 0 {
+			parts = append(parts, paintSeg(m.pal.amber, nil, false, fmt.Sprintf("%d need attention", attention)))
+		}
+		return strings.Join(parts, " · ")
 	}
-	if width < 120 {
-		return clampVisual(build(false, false, false), width)
-	}
-	for _, opts := range [][3]bool{{true, true, true}, {false, true, true}, {false, false, true}, {false, false, false}} {
-		s := build(opts[0], opts[1], opts[2])
-		if visualWidth(s) <= width {
-			return s
+	for _, options := range [][4]bool{{true, true, true, true}, {false, true, true, true}, {false, false, true, true}, {false, false, false, false}} {
+		text := build(options[0], options[1], options[2], options[3])
+		if visualWidth(text) <= width {
+			return text
 		}
 	}
-	return clampVisual(build(false, false, false), width)
+	return build(false, false, false, false)
 }
+
 func (m tuiModel) workerKind(r workerRow) string {
 	if r.w.Kind == "external" {
 		return "ext"
@@ -674,19 +669,21 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int) string {
 		cpu, mem, disk := "?", "?", "?"
 		var cpuC, diskC color.Color
 		if r.w.StatsCPUPct != nil {
-			cpu = fmt.Sprintf("%.0f%%", *r.w.StatsCPUPct)
+			cpu = fmt.Sprintf("%3.0f%%", *r.w.StatsCPUPct)
 			cpuC = m.workerUsageColor(*r.w.StatsCPUPct)
 		}
 		if r.w.StatsMemBytes != nil {
-			mem = humanBytes(*r.w.StatsMemBytes)
+			mem = fmt.Sprintf("%.1fG", float64(*r.w.StatsMemBytes)/(1<<30))
+			if r.w.StatsMemLimitBytes != nil && *r.w.StatsMemLimitBytes > 0 {
+				mem = fmt.Sprintf("%.1f/%.0fG", float64(*r.w.StatsMemBytes)/(1<<30), float64(*r.w.StatsMemLimitBytes)/(1<<30))
+			}
 		}
 		worst := -1.0
 		for _, d := range workerDisks(r.w) {
 			if d.pct > worst {
 				worst = d.pct
-				filled := min(4, max(0, int(d.pct*4/100)))
-				disk = padVisual(d.label, 8) + " " + strings.Repeat("█", filled) + strings.Repeat("░", 4-filled) + fmt.Sprintf(" %.0f%%", d.pct)
-				diskC = m.workerUsageColor(d.pct)
+				filled := min(4, max(0, int(d.pct*4/100+0.5)))
+				disk = paintSeg(nil, bg, false, padVisual(d.label, 8)+" ") + paintSeg(m.workerUsageColor(d.pct), bg, false, strings.Repeat("▮", filled)) + paintSeg(m.pal.faintC, bg, false, strings.Repeat("▯", 4-filled)) + paintSeg(m.workerUsageColor(d.pct), bg, false, fmt.Sprintf(" %.0f%%", d.pct))
 			}
 		}
 		var memC color.Color
@@ -740,15 +737,9 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 		return ""
 	}
 	width := m.width
-	if !full {
-		width = min(80, width)
-	}
 	var lines []string
 	if full {
-		lines = append(lines, clampVisual(" "+m.tabStrip(m.board.admin, viewWorkers, false), width))
-		if summary := m.workersSummary(width, false); summary != "" {
-			lines = append(lines, summary)
-		}
+		lines = append(lines, m.workerTitleLines(" "+m.tabStrip(m.board.admin, viewWorkers, false), m.workersSummary(width, false))...)
 	}
 	if m.board.adminDenied {
 		lines = append(lines, clampVisual("factory workers need an admin (uza_) token — showing your workers", width))
