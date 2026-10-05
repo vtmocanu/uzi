@@ -1,8 +1,8 @@
 # PRD #2278: Docker-capable ephemeral workers
 
-**Status**: In progress. Facts below were read at `main` `721f8dd3`.
+**Status**: Done (2026-10-05). Baseline facts below were read at `main` `721f8dd3`.
 
-This update is the documentation prerequisite for M1a, before feature code. The behaviour and tests below remain planned; acceptance is not yet evidenced.
+Implemented and validated on the issue branch. Acceptance evidence is recorded in the completion section below.
 
 **Design mock**: `prds/mockups/2278-ephemeral-docker-mock.html` (open in a browser; current vs proposal). The mock is the agreed visual reference for the Workers page. It is static, never shipped. Where the mock and this PRD disagree, this PRD wins.
 
@@ -135,12 +135,12 @@ Blocked by: none.
 The vertical slice: migration, api config + chart env, `HostedConfig.docker_enabled`, the `PUT /me/ephemeral-workers` `docker` field with tier enforcement, the provisioner rule (gap + saturation only; non-null `repo_id` in the admin allowlist; lane, job and repo-less runs including judges excluded; allowlist read errors discard returned values and mean empty membership), the user DTO, the web card per the agreed UX (sub-sections, one row, one paragraph, copy removals and fixes, persisted checkbox with pending/rollback/error, hidden without the tier), mock-mode fixtures, docs + `docs:sync`, `specs/human.md`.
 
 Acceptance:
-- [ ] Acceptance example 1 and 3 hold (live-DB/handler tests), evidenced by `./e2e/run-store-it.sh` output.
-- [ ] Both triggers restrict preference-driven Docker to explicitly allowlisted repositories, exclude jobs, lanes and repo-less judges, and discard allowlist values on error; capability-driven Docker and `fn_worker_can_claim` remain unchanged (tests).
-- [ ] The new `task render:*` chart target passes.
-- [ ] Preference off: provisioning is byte-identical to today (regression test).
-- [ ] The Workers page matches the mock's Proposal section; tests above pass.
-- [ ] `task gate:api`, `task gate:web`, `task gate:repo` green.
+- [x] Acceptance example 1 and 3 hold (live-DB/handler tests), evidenced by `./e2e/run-store-it.sh` output.
+- [x] Both triggers restrict preference-driven Docker to explicitly allowlisted repositories, exclude jobs, lanes and repo-less judges, and discard allowlist values on error; capability-driven Docker and `fn_worker_can_claim` remain unchanged (tests).
+- [x] The new `task render:*` chart target passes.
+- [x] Preference off: provisioning is byte-identical to today (regression test).
+- [x] The Workers page matches the mock's Proposal section; tests above pass.
+- [x] `task gate:api`, `task gate:web`, `task gate:repo` green.
 
 ### M2: A warm non-Docker ephemeral worker steps aside when the preference is on
 
@@ -149,11 +149,31 @@ Blocked by: M1.
 The additive non-STRICT `fn_ephemeral_docker_preference_applies` helper, preserving the old lease signature, the allowlist-scoped lease-arm condition, all seven lease call sites, D8 gap widening, and their tests. Empty membership on allowlist read error disables preference-only widening and plain-lease step-aside.
 
 Acceptance:
-- [ ] Acceptance example 2 holds, including the stranding regression (empty requirements, no persistent workers), evidenced by `./e2e/run-store-it.sh` output; preference off keeps today's warm reuse.
-- [ ] Unallowlisted runs and allowlist read errors (discarding returned values) retain plain-lease admission and do not become preference-only gap candidates; helper NULL inputs fail closed and the old lease signature remains callable.
-- [ ] The mutation check fails without the new conjunct.
-- [ ] `git grep -n fn_ephemeral_lease_admits` shows every call site either carries the condition or is documented as not needing it.
-- [ ] `task gate:api` green.
+- [x] Acceptance example 2 holds, including the stranding regression (empty requirements, no persistent workers), evidenced by `./e2e/run-store-it.sh` output; preference off keeps today's warm reuse.
+- [x] Unallowlisted runs and allowlist read errors (discarding returned values) retain plain-lease admission and do not become preference-only gap candidates; helper NULL inputs fail closed and the old lease signature remains callable.
+- [x] The mutation check fails without the new conjunct.
+- [x] `git grep -n fn_ephemeral_lease_admits` shows every call site either carries the condition or is documented as not needing it.
+- [x] `task gate:api` green.
+
+## Completion evidence (2026-10-05)
+
+The implementation at `3251f72c` passed `task gate:api`, `task gate:web`, `task gate:repo`, `./e2e/run-store-it.sh`, `task render:ephemeral-docker-check`, and `npm --prefix web run build`. The repository gate's first Semgrep instrument run exited 2; a direct scan then completed with zero findings, and the complete gate retry passed with its canary detected. No tracked scanner or workflow changes were made.
+
+The full store harness recorded 4,531 RUN entries, all 17 new `TestEphemeralDocker*LiveDB` test names as PASS, and zero FAIL or SKIP entries at every indentation level. It used the scratch-only TCP-readiness shim for the pre-existing PostgreSQL socket-readiness issue; the harness itself was unchanged. In particular:
+
+- `TestEphemeralDockerPreferencesLiveDB` exercises the partial session updates, retained choice, tier denial, no partial rejected write and session ownership; `TestEphemeralDockerPreferenceAppliesLiveDB` and `TestEphemeralDockerPreferenceGoSQLParityLiveDB` cover the shared helper, NULL/empty membership and the unchanged claim fence.
+- `TestEphemeralDockerProvisionPassLiveDB`, `TestEphemeralDockerExcludedCandidatesLiveDB` and `TestEphemeralDockerLatePlanApprovalLiveDB` cover both triggers, allowlist fallbacks, exclusions, unchanged capability-driven Docker and late Docker plan approval.
+- `TestEphemeralDockerWarmStepAsideLiveDB` executes the empty-requirement/no-persistent-worker regression: plain claim refused, gap returned, Docker worker provisioned and registered, same run claimed.
+- `TestEphemeralDockerWarmClaimBaselineLiveDB`, `TestEphemeralDockerNoWorkersGapBaselineLiveDB`, `TestEphemeralDockerAvailabilityLeaseAdmissionLiveDB` and `TestEphemeralDockerPlainAlternativesClaimLiveDB` prove inapplicable-preference fallback, empty-capability baseline, both availability projections, and persistent/bound admission.
+- `TestEphemeralDockerSaturationLeaseMirrorsLiveDB` isolates each saturation mirror; `TestEphemeralDockerFleetSpreadLeasePeerLiveDB` isolates the peer deferral; `TestEphemeralDockerPersistentSaturationDebounceLiveDB` observes provisioning before/after the delay; `TestEphemeralDockerEarlyCapEvictionLiveDB` observes the unexpired plain lease's replacement at cap=1 and a bounded second pass.
+
+The two health error contracts also passed focused unit tests: eligibility returns the existing allowlist error without a count; the released-worker fallback discards returned values and queries with non-nil empty membership. The real empty-list availability cases retain plain lease admission.
+
+The exhaustive tracked lease-call sweep found seven production calls in `queries/runtime.sql`: two in `ClaimRun`, two in `CountOnlineWorkersClaimableForRun`, one in `ListUnplaceableQueuedRunsForEphemeral`, and two in `ListSaturationQueuedRunsForEphemeral`. All seven carry the new condition inside their lease alternative, with seven generated copies. Direct calls in `ephemeral_lease_livedb_test.go` and `ephemeral_docker_preference_livedb_test.go` intentionally test the unchanged thirteen-argument helper itself; the migration's definition/drop signature and explanatory references are not placement callers.
+
+Mutation calibration used two fresh exports of committed `2d546df0` and real throwaway databases. The unmodified named warm-step-aside control passed. Removing only the claimant preference conjunct from the executed generated `claimRun` SQL preserved the peer condition and compiled successfully; the named test then failed with **"plain warm worker claims when it should refuse"**. Both exports were removed; the shared checkout was never mutated. The later credential-helper extraction retained this assertion and passed the focused and full harness runs.
+
+The Workers page was inspected in Chromium mock mode against the Proposal, including saved preference retention after reload. Web tests cover missing `docker_enabled` from an old API, visibility/layout, pending success/error rollback, off-state retention, mock persistence and confirmed-user reconciliation. The explicit chart target passed default, tier-on, tier-off, hosting-off and controller-off renders. It remains standalone, outside CI wiring. Docker controller pod shape is reused; no hosted Kubernetes runtime smoke was added.
 
 ## Decision Log
 
