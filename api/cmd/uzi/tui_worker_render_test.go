@@ -47,6 +47,7 @@ func TestWorkerRenderSectionsAndSources(t *testing.T) {
 			{RunID: "uncached", Phase: "future-phase", ClaimGeneration: 19},
 		}
 		w.Version, w.UpgradeTarget = sp("v1"), "v2"
+		w.UpgradeStatus = "outdated"
 		w.Capabilities = []string{"docker", "jvm"}
 		w.TemplateDeclared, w.TemplateReported = sp("declared"), sp("reported")
 		w.AnthropicBindMode, w.AnthropicSecretLabel = "pinned", sp("work-token")
@@ -54,37 +55,31 @@ func TestWorkerRenderSectionsAndSources(t *testing.T) {
 		lease := now.Add(time.Hour)
 		w.EphemeralLeaseExpiresAt = &lease
 		m.workers.rows[0].workerOwner = "owner@example.test"
-		m.board.runs = []apitypes.RunListItemDTO{{RunDTO: apitypes.RunDTO{ID: "cached", IssueTitle: "cached title", Status: "running", IsPlanning: true}}}
+		m.board.runs = []apitypes.RunListItemDTO{{RunDTO: apitypes.RunDTO{ID: "cached", IssueTitle: "cached title", IssueIID: i64(1), Harness: "claude", Status: "running", IsPlanning: true}}}
 		m.board.runsAdmin = m.board.admin
 		out := stripANSI(m.View().Content)
 		last := -1
-		for _, section := range []string{"Attention", "Reported runs", "Resources", "Configuration"} {
+		for _, section := range []string{"attention", "reported runs", "resources", "configuration"} {
 			at := strings.Index(out, section)
 			if at <= last {
 				t.Fatalf("section order: %s", out)
 			}
 			last = at
 		}
-		requireWorkerText(t, out, "cached title", "worker phase: awaiting_input · generation 17", "cached board: status running · stage planning",
-			"uncached", "worker phase: unknown · generation 19", "not cached", "outcome pending",
-			"CPU 12.5%", "worker process only", "memory 1.0 KiB / 2.0 KiB", "data bytes 4.0 KiB / 8.0 KiB",
-			"data inodes 3 / 7 (display-only)", "nix bytes ? / ?", "nix inodes ? (display-only)",
-			"dind bytes 1.0 KiB / 4.0 KiB (display-only)", "dind inodes 5 / 9 (display-only)",
-			"cache is a subset of HOME", "HOME ≥8.0 KiB · cache ≥2.0 KiB", "measured 2m ago",
-			"version v1 · target v2", "capabilities docker jvm", "template declared declared", "template reported reported",
-			"token mode pinned · work-token", "kind hosted", "ephemeral · lease", "owner owner@example.test")
+		requireWorkerText(t, out, "cached title", "worker phase awaiting_input · run stage planning · gen 17", "uncached", "worker phase unknown · run stage ? (not cached) · gen 19", "outcome pending",
+			"cpu", "12%", "process only", "memory", "1.0 KiB / 2.0 KiB", "50%", "25%", "inodes 43%", "nix", "?", "dind", "inodes 56%", "display only", "largest HOME", "disk-run  ≥8.0 KiB (sampled 2m ago)", "version", "v1", "target v2", "capabilities", "docker jvm", "template", "declared  ≠ reported reported", "token", "pinned · work-token", "kind", "hosted", "ephemeral · lease", "owner", "owner@example.test")
 		if strings.Contains(out, "10.0 KiB") || strings.Contains(out, "future-phase") {
 			t.Fatal("invented total or raw enum")
 		}
 		// A token label is not evidence of effective pinning (including ephemeral workers).
 		w.AnthropicBindMode = "auto"
 		out = stripANSI(m.renderWorker())
-		requireWorkerText(t, out, "token mode auto")
+		requireWorkerText(t, out, "token         auto")
 		if strings.Contains(out, "work-token") {
 			t.Fatal("inferred token binding")
 		}
 		w.AnthropicBindMode = "default"
-		requireWorkerText(t, stripANSI(m.renderWorker()), "token mode default")
+		requireWorkerText(t, stripANSI(m.renderWorker()), "token         default")
 	}
 }
 
@@ -114,7 +109,7 @@ func TestWorkerRenderHostileBoundsAndScrolling(t *testing.T) {
 			out := m.View().Content
 			assertNoRawControls(t, "worker", out)
 			requireWorkerText(t, stripANSI(out), "name", "reason", "detail", "outbox", "version", "target",
-				"declared", "reported", "cap", "size", "token", "owner", "disk", "~ stale, last-known", "~ CPU ?", "memory ? / ?")
+				"declared", "reported", "cap", "size", "token", "owner", "disk", "last-known, stale", "~ ?", "? / ?")
 			for _, height := range []int{1, 2, 3, 8, 20} {
 				m.height = height
 				for _, k := range []string{keyPageDown, keyPageDown, keyPageUp, "j", "j", "k"} {
@@ -130,7 +125,7 @@ func TestWorkerRenderHostileBoundsAndScrolling(t *testing.T) {
 						}
 					}
 					if height >= 3 && (k == "j" || k == "k") {
-						requireWorkerText(t, out, fmt.Sprintf("› reported-%02d", m.workerDetail.cursor))
+						requireWorkerText(t, out, fmt.Sprintf("▌ %d %s", m.workerDetail.cursor+1, clampVisual(m.renderer.Plain(fmt.Sprintf("reported-%02d", m.workerDetail.cursor), width), 8)))
 					}
 				}
 			}
@@ -144,7 +139,7 @@ func TestWorkerRenderHostileBoundsAndScrolling(t *testing.T) {
 				next, _ := m.workerKey(keyPageUp)
 				m = next.(tuiModel)
 			}
-			requireWorkerText(t, stripANSI(m.View().Content), "name", "Attention")
+			requireWorkerText(t, stripANSI(m.View().Content), "name", "attention")
 		}
 	}
 }

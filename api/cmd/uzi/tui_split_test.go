@@ -77,8 +77,8 @@ func TestSplitScrollUsesPaneCapacity(t *testing.T) {
 	}
 	top, _ := m.splitHeights()
 	frame := strings.Split(stripANSI(m.View().Content), "\n")
-	if !strings.Contains(strings.Join(frame[:1+top], "\n"), "item-29") || !strings.Contains(strings.Join(frame[:1+top], "\n"), "last-task") {
-		t.Fatalf("selected row and second line escaped top pane (scroll=%d):\n%s", m.board.scroll, strings.Join(frame[:1+top], "\n"))
+	if !strings.Contains(strings.Join(frame[:len(m.splitHeader(time.Now()))+top], "\n"), "item-29") || !strings.Contains(strings.Join(frame[:len(m.splitHeader(time.Now()))+top], "\n"), "last-task") {
+		t.Fatalf("selected row and second line escaped top pane (scroll=%d):\n%s", m.board.scroll, strings.Join(frame[:len(m.splitHeader(time.Now()))+top], "\n"))
 	}
 	if m.board.scroll == 0 {
 		t.Fatal("pane scroll did not move")

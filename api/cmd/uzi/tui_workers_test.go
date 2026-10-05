@@ -17,12 +17,12 @@ import (
 func TestWorkersDemoFleet(t *testing.T) {
 	f := newDemoClient()
 	m := workersScene(true, "workers-list-120")
-	want := "your workers · 9 · 8 online · 5/12 slots in use +1 ?cap · 1 holding · 1 draining · 6 need attention"
-	if got := m.workersSummary(120, false); got != want {
+	want := "workers · 9 · 8 online · 5/12 slots in use +1 ?cap · 1 holding · 1 draining · 6 need attention"
+	if got := stripANSI(m.workersSummary(120)); got != want {
 		t.Fatalf("summary %q", got)
 	}
-	if got := m.workersSummary(120, true); got != "workers 5/12 slots in use · 8/9 online · 6 need attention · 2 for detail" {
-		t.Fatal(got)
+	if title := m.workerFleetTitleLines("▚▚ uzi · floor"); !strings.Contains(stripANSI(title[0]), "need attention") {
+		t.Fatal("compact floor title omitted attention", title)
 	}
 	var names []string
 	for _, r := range m.workers.visible(time.Now()) {
@@ -75,21 +75,26 @@ func TestWorkersDemoFleet(t *testing.T) {
 func TestWorkersLegendHelpAndVersionBudget(t *testing.T) {
 	m := workersScene(true, "workers-factory")
 	r := m.workers.rows[0]
-	r.w.Version = sp(strings.Repeat("界", 8))
+	r.w.Version = sp(strings.Repeat("界", 30))
+	m.workers.rows = []workerRow{r}
 	r.w.UpgradeStatus = "upgrade_failed"
 	r.w.OutboxBlocked = sp("blocked")
+	m.workers.rows = []workerRow{r}
 	if line := m.workerRowLine(r, true, 120); !strings.Contains(stripANSI(line), "+") || visualWidth(line) > 120 {
 		t.Fatalf("attention suffix lost: %s", line)
 	}
 	line := stripANSI(m.workerRowLine(r, true, 120))
-	// Wide glyphs must fit the eight-column version cell before its marker.
-	versionCell := "界界界…✕"
+	// Wide glyphs must fit the capped eighteen-column version cell, including its marker.
+	versionCell := strings.Repeat("界", 8) + "…✕"
 	at := strings.Index(line, versionCell)
-	if at < 0 || visualWidth(line[:at]) != 83 || strings.Contains(line, "界界界界") {
+	if at < 0 || visualWidth(line[:at]) != 82 || strings.Contains(line, strings.Repeat("界", 9)) {
 		t.Fatalf("version cell moved or exceeded its visual budget: %q", line)
 	}
-	if !strings.Contains(stripANSI(m.renderWorkers()), "fixed visual cue") {
-		t.Fatal("missing disk legend")
+	if strings.Contains(stripANSI(m.renderWorkers()), "fixed visual cue") {
+		t.Fatal("disk legend should live only in help")
+	}
+	if !strings.Contains(strings.Join(helpLines(viewWorkers), "\n"), "fixed visual cue") {
+		t.Fatal("missing help disk legend")
 	}
 	help := strings.Join(helpLines(viewWorkers), "\n")
 	if !strings.Contains(help, "j / ↓") || !strings.Contains(help, "k / ↑") {
@@ -106,7 +111,7 @@ func TestWorkerBusyLeaseReadout(t *testing.T) {
 		ActiveRuns: 1, Ephemeral: true, EphemeralLeaseExpiresAt: &expires,
 	}}}
 	frame := stripANSI(m.View().Content)
-	if !strings.Contains(frame, "busy") || !strings.Contains(frame, "ephemeral lease held for follow-up") || strings.Contains(frame, "idle") {
+	if !strings.Contains(frame, "busy") || !strings.Contains(frame, "lease 9m left") || strings.Contains(frame, "idle") {
 		t.Fatalf("busy lease readout misstates occupancy: %s", frame)
 	}
 }
@@ -218,7 +223,7 @@ func TestWorkersScenesContentAndBounds(t *testing.T) {
 						}
 					}
 				}
-				if name == "split-workers-top" && !strings.Contains(frame, "2 [workers]") {
+				if name == "split-workers-top" && !strings.Contains(frame, "[workers]") {
 					t.Error("workers top focus missing")
 				}
 				lines := strings.Split(frame, "\n")
@@ -661,7 +666,7 @@ func TestWorkerSortSeverityNameAndIDTies(t *testing.T) {
 	if !reflect.DeepEqual(ids, []string{"danger", "warn", "info", "a", "b"}) {
 		t.Fatal(ids)
 	}
-	if !strings.Contains(m.workersSummary(120, false), "2 need attention") {
+	if !strings.Contains(m.workersSummary(120), "2 need attention") {
 		t.Fatal("info counted as attention")
 	}
 }
@@ -705,9 +710,9 @@ func TestWorkersSummaryDropsSegmentsInPriorityOrder(t *testing.T) {
 		used, cap int
 		want      string
 	}{
-		{"unknown cap first", 1, 2, "your workers · 2 · 2 online · 1/2 slots in use · 1 holding · 1 need attention"},
-		{"admission next", 12345, 12345, "your workers · 2 · 2 online · 12345/12345 slots in use · 1 need attention"},
-		{"online last", 1234567890, 1234567890, "your workers · 2 · 1234567890/1234567890 slots in use · 1 need attention"},
+		{"unknown cap first", 1, 2, "workers · 2 · 2 online · 1/2 slots in use · 1 holding · 1 need attention"},
+		{"admission next", 12345, 12345, "workers · 2 · 2 online · 12345/12345 slots in use · 1 need attention"},
+		{"online last", 1234567890, 1234567890, "workers · 1234567890/1234567890 slots in use · 1 need attention"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := workersScene(true, "workers-list-80")
@@ -715,11 +720,11 @@ func TestWorkersSummaryDropsSegmentsInPriorityOrder(t *testing.T) {
 				{w: apitypes.WorkerDTO{ID: "held", Status: "online", ActiveRuns: tc.used, MaxConcurrentRuns: &tc.cap, RetainingUnpublishedWork: true}},
 				{w: apitypes.WorkerDTO{ID: "unknown", Status: "online"}},
 			}
-			if wide := m.workersSummary(160, false); !strings.Contains(wide, "+1 ?cap") || !strings.Contains(wide, "1 holding") || !strings.Contains(wide, "2 online") {
+			if wide := m.workersSummary(160); !strings.Contains(wide, "+1 ?cap") || !strings.Contains(wide, "1 holding") || !strings.Contains(wide, "2 online") {
 				t.Fatalf("fixture lacks optional segments: %q", wide)
 			}
-			if got := m.workersSummary(80, false); got != tc.want || visualWidth(got) > 80 {
-				t.Fatalf("80-column summary = %q, want %q", got, tc.want)
+			if got := stripANSI(m.workersSummary(visualWidth(tc.want))); got != tc.want || visualWidth(got) > visualWidth(tc.want) {
+				t.Fatalf("narrowed summary = %q, want %q", got, tc.want)
 			}
 		})
 	}
@@ -984,8 +989,11 @@ func TestWorkersZeroSummaryAndMaximumAttentionBounds(t *testing.T) {
 		}
 	}
 	m.workers.rows = nil
-	if m.workersSummary(80, false) != "" || m.workersSummary(80, true) != "" {
+	if m.workersSummary(80) != "" {
 		t.Fatal("empty summary charged")
+	}
+	if title := m.workerFleetTitleLines("workers"); len(title) != 1 || title[0] != "workers" {
+		t.Fatal("empty fleet added chrome", title)
 	}
 	m.height = 34
 	for _, line := range strings.Split(m.renderHelp(), "\n") {

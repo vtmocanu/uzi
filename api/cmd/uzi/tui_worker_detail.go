@@ -3,11 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/charmbracelet/x/ansi"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
@@ -421,15 +421,6 @@ func workerBytePair(used, total *int64) string {
 			return "?"
 		}
 		return humanBytes(*n)
-	}
-	return value(used) + " / " + value(total)
-}
-func workerInodePair(used, total *int64) string {
-	value := func(n *int64) string {
-		if n == nil {
-			return "?"
-		}
-		return fmt.Sprintf("%d", *n)
 	}
 	return value(used) + " / " + value(total)
 }

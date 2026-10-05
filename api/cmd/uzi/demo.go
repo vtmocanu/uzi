@@ -219,10 +219,10 @@ func demoWorkers(now time.Time, runs []apitypes.RunListItemDTO) ([]apitypes.Work
 	for i, name := range names {
 		w := apitypes.WorkerDTO{
 			ID: "demo-worker-" + name, Name: name, Status: "online", Kind: "hosted",
-			HostedSize: str("M"), Docker: boolPtr(false), MaxConcurrentRuns: num(caps[i]),
+			HostedSize: str("m"), Docker: boolPtr(false), MaxConcurrentRuns: num(caps[i]),
 			ActiveRuns: active[i], Busy: active[i] > 0, Version: str("0.85.1"),
 			UpgradeStatus: "up_to_date", UpgradeTarget: "0.85.1",
-			LastHeartbeatAt: at(-time.Duration(i+2) * time.Second), CreatedAt: now.Add(-24 * time.Hour),
+			OnlineSince: at(-48 * time.Hour), LastHeartbeatAt: at(-time.Duration(i+2) * time.Second), CreatedAt: now.Add(-24 * time.Hour),
 			StatsCPUPct: fPtr(cpu[i]), StatsMemBytes: i64Ptr(int64(mem[i] * (1 << 30))),
 			StatsMemLimitBytes: i64Ptr(4 << 30), StatsSource: str("cgroup"),
 			StatsDiskDataBytes: i64Ptr(data[i]), StatsDiskDataTotalBytes: i64Ptr(100),
@@ -232,7 +232,7 @@ func demoWorkers(now time.Time, runs []apitypes.RunListItemDTO) ([]apitypes.Work
 		}
 		all[i] = w
 	}
-	all[0].HostedSize, all[1].HostedSize = str("L"), str("L")
+	all[0].HostedSize, all[1].HostedSize = str("l"), str("l")
 	all[0].StatsMemLimitBytes, all[1].StatsMemLimitBytes = i64Ptr(8<<30), i64Ptr(8<<30)
 	all[1].Docker, all[1].Capabilities, all[1].AnthropicBindMode = boolPtr(true), []string{"docker", "jvm"}, "auto"
 	all[1].StatsDiskDindInodes, all[1].StatsDiskDindTotalInodes = i64Ptr(97), i64Ptr(100)
@@ -243,7 +243,7 @@ func demoWorkers(now time.Time, runs []apitypes.RunListItemDTO) ([]apitypes.Work
 	all[4].DrainingSince, all[4].AnthropicBindMode = at(-time.Hour), "pinned"
 	all[4].AnthropicSecretID, all[4].AnthropicSecretLabel = str("sec-work"), str("work-key")
 	all[4].StatsDiskNixBytes, all[4].StatsDiskNixTotalBytes = i64Ptr(78), i64Ptr(100)
-	all[5].Status, all[5].HostedSize, all[5].UpgradeStatus = "offline", str("S"), "upgrade_failed"
+	all[5].Status, all[5].HostedSize, all[5].UpgradeStatus = "offline", str("s"), "upgrade_failed"
 	all[5].DrainingSince, all[5].LastHeartbeatAt, all[5].Version = at(-2*time.Hour), at(-2*time.Hour), str("0.85.0")
 	all[5].UpgradeBlockingContainer, all[5].UpgradeBlockingReason = str("seed-nix"), str("ImagePullBackOff")
 	all[5].UpgradeDetail = str("seed image could not be pulled")

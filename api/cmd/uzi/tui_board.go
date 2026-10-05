@@ -567,7 +567,7 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 		summary += m.pal.faint.Render(" · " + itoa(lo) + "–" + itoa(hi))
 	}
 	if fullScreen {
-		for _, line := range m.workerTitleLines(" "+brand, m.workersSummary(m.width, true)) {
+		for _, line := range m.workerFleetTitleLines(" " + brand) {
 			sb.WriteString(line + "\n")
 		}
 	} else {
@@ -977,7 +977,7 @@ func (m tuiModel) boardCapacityAt(height, meterLines int, fullScreen bool) int {
 	chrome := 1 // pane title, filter and summary
 	if fullScreen {
 		chrome += 2 // blank line and footer
-		chrome += len(m.workerTitleLines(" "+m.boardTitle(true), m.workersSummary(m.width, true))) - 1
+		chrome += len(m.workerFleetTitleLines(" "+m.boardTitle(true))) - 1
 		if m.board.adminDenied {
 			chrome++
 		}

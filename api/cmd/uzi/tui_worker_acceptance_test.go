@@ -38,7 +38,7 @@ func TestWorkerAcceptanceReportedRunPreflight(t *testing.T) {
 			f.RunByID["B"] = b
 			f.InputsByID = map[string][]apitypes.SteerInputDTO{"B": {{Kind: kindFollowUp, Body: sp("current input")}}}
 			if cached {
-				m.board.runs = []apitypes.RunListItemDTO{{RunDTO: apitypes.RunDTO{ID: "B", IssueTitle: "old cached title"}}}
+				m.board.runs = []apitypes.RunListItemDTO{{RunDTO: apitypes.RunDTO{ID: "B", IssueIID: i64(1), IssueTitle: "old cached title"}}}
 			}
 			m.blinkArmed = false
 			m = press(t, m, "W")

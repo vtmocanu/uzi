@@ -299,7 +299,7 @@ func (m tuiModel) splitHeaderSummary(now time.Time, summary string) []string {
 			title += m.pal.faint.Render(label.name)
 		}
 	}
-	lines = append(lines, m.workerTitleLines(title, m.workersSummary(m.width, m.top() == viewBoard))...)
+	lines = append(lines, m.workerFleetTitleLines(title)...)
 	if m.top() == viewBoard {
 		lines = append(lines, m.boardMeterSummaryLines(m.boardMeterLayout(now).lines, summary)...)
 	}

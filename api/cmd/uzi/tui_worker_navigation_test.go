@@ -275,7 +275,7 @@ func TestWorkerNavigationListFallbackAndConciseRenderer(t *testing.T) {
 	m.workers.selectedID = "worker-1"
 	m = press(t, m, keyEnter)
 	out := stripANSI(m.View().Content)
-	for _, want := range []string{"forge", "Attention", "Reported runs", "B", "generation 2", "enter run"} {
+	for _, want := range []string{"forge", "attention", "reported runs", "B", "gen 2", "enter/→ run"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("worker renderer omitted %q", want)
 		}

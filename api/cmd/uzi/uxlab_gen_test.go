@@ -319,21 +319,21 @@ func TestWorkerDetailScenesContentAndBounds(t *testing.T) {
 				}
 				out := stripANSI(m.View().Content)
 				last := -1
-				for _, section := range []string{"Attention", "Reported runs", "Resources", "Configuration"} {
+				for _, section := range []string{"attention", "reported runs", "resources", "configuration"} {
 					at := strings.Index(out, section)
 					if at <= last {
 						t.Fatalf("missing or reordered %s:\n%s", section, out)
 					}
 					last = at
 				}
-				requireWorkerText(t, out, "nix inodes ? (display-only)", "token mode", "template declared", "template reported", "enter run", "esc back")
+				requireWorkerText(t, out, "nix", "token", "template", "enter/→ run", "esc/← back")
 				switch name {
 				case "worker-upgrade-failed":
-					requireWorkerText(t, out, "forge-small", "upgrade failed", "seed-nix", "ImagePullBackOff", "stale, last-known", "CPU ?", "memory ? / ?", "version 0.85.0 · target 0.85.1")
+					requireWorkerText(t, out, "forge-small", "upgrade failed", "seed-nix", "ImagePullBackOff", "last-known, stale", "cpu", "~ ?", "memory", "? / ?", "0.85.0", "target 0.85.1")
 				case "worker-outcome-outbox":
-					requireWorkerText(t, out, "forge-docker", "outcome pending", "not yet delivered/acknowledged", "outbox", "14", "worker phase: running", "generation 1", "data bytes 41.0 GiB / 100.0 GiB", "dind bytes 20.0 GiB / 50.0 GiB", "HOME ≥8.0 GiB · cache ≥2.0 GiB", "measured 2m ago", "token mode auto")
+					requireWorkerText(t, out, "forge-docker", "outcome pending", "not yet delivered/acknowledged", "outbox", "14", "worker phase running", "gen 1", "data", "41%", "dind", "40%", "largest HOME", "≥8.0 GiB", "sampled 2m ago", "token         auto")
 				case "worker-holding":
-					requireWorkerText(t, out, "recovery", "unpublished work", "none reported", "data bytes 48.0 GiB / 100.0 GiB", "HOME ≥8.0 GiB · cache ≥2.0 GiB", "cache is a subset of HOME", "token mode default")
+					requireWorkerText(t, out, "recovery", "unpublished work", "none", "data", "48%", "largest HOME", "≥8.0 GiB", "sampled 2m ago", "token         default")
 				}
 				assertNoRawControls(t, name, out)
 				if len(strings.Split(out, "\n")) > m.height {

@@ -3,13 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/charmbracelet/x/ansi"
 	"image/color"
 	"slices"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
@@ -498,7 +498,7 @@ func workerSlots(w apitypes.WorkerDTO) string {
 	}
 	return itoa(w.ActiveRuns) + "/" + cap
 }
-func (m tuiModel) workersSummary(width int, _ bool) string {
+func (m tuiModel) workersSummary(width int) string {
 	if m.workers.admin != m.board.admin || len(m.workers.rows) == 0 {
 		return ""
 	}
@@ -637,12 +637,13 @@ func (m tuiModel) workerUsage(pct float64, cells int) string {
 	n := min(cells, max(0, int(pct*float64(cells)/100+0.5)))
 	return paintSeg(m.workerUsageColor(pct), nil, false, strings.Repeat("▮", n)) + paintSeg(m.pal.faintC, nil, false, strings.Repeat("▯", cells-n)) + paintSeg(m.workerUsageColor(pct), nil, false, fmt.Sprintf(" %.0f%%", pct))
 }
-func (m tuiModel) workerTitleLines(title, status string) []string {
+func (m tuiModel) workerFleetTitleLines(title string) []string {
+	status := m.workersSummary(m.width)
 	if status == "" {
 		return []string{clampVisual(title, m.width)}
 	}
 	// Fit the fleet's optional segments into the title's remaining space first.
-	compact := m.workersSummary(max(0, m.width-visualWidth(title)-2), false)
+	compact := m.workersSummary(max(0, m.width-visualWidth(title)-2))
 	if gap := m.width - visualWidth(title) - visualWidth(compact); gap >= 2 {
 		return []string{title + strings.Repeat(" ", gap) + compact}
 	}
@@ -728,7 +729,7 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int) string {
 			marker = "✕"
 			verC = m.pal.alarm
 		}
-		ver := m.renderer.Plain(t.workerVersion, max(0, versionWidth-visualWidth(marker))) + marker
+		ver := clampVisual(m.renderer.Plain(t.workerVersion, versionWidth), max(0, versionWidth-visualWidth(marker))) + marker
 		fields = append(fields, cell(cpu, 4, cpuC), cell(mem, 7, memC), cell(disk, 18, diskC), cell(ver, versionWidth, verC), cell(workerAge(r.w.LastHeartbeatAt, now), 3, m.pal.faintC))
 	}
 	items := workerAttention(r, now)
@@ -773,7 +774,7 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 	width := m.width
 	var lines []string
 	if full {
-		lines = append(lines, m.workerTitleLines(" "+m.tabStrip(m.board.admin, viewWorkers, false), m.workersSummary(width, false))...)
+		lines = append(lines, m.workerFleetTitleLines(" "+m.tabStrip(m.board.admin, viewWorkers, false))...)
 	}
 	if m.board.adminDenied {
 		lines = append(lines, clampVisual("factory workers need an admin (uza_) token — showing your workers", width))
