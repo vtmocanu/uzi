@@ -563,11 +563,104 @@ describe("CodexHarness: resumed usage evidence", () => {
       });
     }
 
+    for (const stopKind of ["abort", "stop"] as const) {
+      it(`${authMode}: ${stopKind} after thread resume prevents sending turn/start`, async () => {
+        const accountant = new CodexUsageAccountant();
+        const controller = new AbortController();
+        let stopTurn!: () => void;
+        const transport = new FakeTransport(method => {
+          if (method === "thread/resume") {
+            if (stopKind === "abort") controller.abort();
+            else stopTurn();
+          }
+          return defaultResponder(method);
+        });
+        const { harness } = makeHarness({ authMode, accountant, transport });
+        try {
+          const turn = harness.startTurn(makeRequest({
+            resumeSessionId: "resumed-1", signal: controller.signal,
+          }));
+          stopTurn = () => turn.requestStop("cancel");
+          assert.deepEqual(await collect(turn.events), []);
+          assert.equal(transport.requests.some(r => r.method === "turn/start"), false);
+          assert.equal(accountant.usageIncomplete, false);
+        } finally { await harness.close(); }
+      });
+    }
+
+    it(`${authMode}: real transport cancellation with an accepted turn/start reply pending cannot erase spend on retry`, async () => {
+      const accountant = new CodexUsageAccountant();
+      const controller = new AbortController();
+      const inbound = new PassThrough();
+      const outbound = new PassThrough();
+      const transport = createCodexTransport({ inbound, outbound });
+      let notices = 0;
+      const onTokenUsageIncomplete = async () => { notices++; throw new Error("diagnostic sink failed"); };
+      let receivedStart = false;
+      const write = (frame: unknown) => { inbound.write(JSON.stringify(frame) + "\n"); };
+      let buffered = "";
+      outbound.setEncoding("utf8");
+      outbound.on("data", (chunk: string) => {
+        buffered += chunk;
+        let end: number;
+        while ((end = buffered.indexOf("\n")) !== -1) {
+          const frame = rec(JSON.parse(buffered.slice(0, end)));
+          buffered = buffered.slice(end + 1);
+          if (typeof frame.method !== "string" || frame.id === undefined) continue;
+          if (frame.method === "turn/start") {
+            receivedStart = true;
+            // The peer persists A but withholds the RPC reply; cancellation rejects the pending request.
+            for (const note of [
+              turnStarted("resumed-1", "accepted-aborted"),
+              tokenUsage(next, response, "resumed-1", "accepted-aborted"),
+            ]) write({ method: note.method, params: note.params });
+            controller.abort();
+          } else write({ id: frame.id, result: defaultResponder(frame.method) });
+        }
+      });
+      const first = makeHarness({ authMode, accountant, onTokenUsageIncomplete,
+        launchRoot: async () => ({ root: fakeRoot, transport, supervisorPid: 4321 }) });
+      try {
+        await assert.rejects(withTimeout(collect(first.harness.startTurn(makeRequest({
+          resumeSessionId: "resumed-1", signal: controller.signal,
+        })).events), 5000, "pending start cancellation"), /request aborted/);
+        assert.equal(receivedStart, true);
+        assert.equal(accountant.usageIncomplete, true);
+        assert.equal(notices, 1, "cleanup delivers without another notification");
+      } finally {
+        await first.harness.close();
+        inbound.destroy();
+        outbound.destroy();
+      }
+
+      const retry = makeHarness({ authMode, accountant, onTokenUsageIncomplete });
+      // Retry restores H+A (600/180), then spends new B (400/120).
+      retry.transport.push(tokenUsage(next, response, "resumed-1", "accepted-aborted"))
+        .push(turnStarted("resumed-1"))
+        .push(tokenUsage(
+          { inputTokens: 1000, cachedInputTokens: 200, outputTokens: 300, reasoningOutputTokens: 100, totalTokens: 1300 },
+          { inputTokens: 400, cachedInputTokens: 80, outputTokens: 120, reasoningOutputTokens: 40, totalTokens: 520 },
+          "resumed-1"))
+        .push(turnCompleted("completed", { inputTokens: 9999 }, "resumed-1")).end();
+      try {
+        const result = terminal(await collect(retry.harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events));
+        assert.equal(result.outcome, "success");
+        assert.equal(result.usage?.wire?.modelUsage, undefined);
+        assert.equal(result.usage, undefined);
+        assert.deepEqual(result.metrics?.cost, { kind: authMode === "api_key" ? "unreported" : "subscription" });
+        assert.equal(accountant.aggregateByModel({ authMode, now: new Date("2026-10-05") }), undefined);
+        assert.equal(accountant.usageIncomplete, true);
+        assert.equal(notices, 1, "retry cannot redeliver a failed notice callback");
+      } finally { await retry.harness.close(); }
+    });
+
     for (const stagedReplay of [true, false]) {
       it(`${authMode}: abort before replay boundary keeps retry totals incomplete (${stagedReplay})`, async () => {
         const accountant = new CodexUsageAccountant();
         const controller = new AbortController();
-        const first = makeHarness({ authMode, accountant });
+        let notices = 0;
+        const onTokenUsageIncomplete = async () => { notices++; throw new Error("diagnostic sink failed"); };
+        const first = makeHarness({ authMode, accountant, onTokenUsageIncomplete });
         const running = collect(first.harness.startTurn(makeRequest({ resumeSessionId: "resumed-1", signal: controller.signal })).events);
         await tick();
         assert.ok(first.transport.requests.some(r => r.method === "turn/start"));
@@ -577,8 +670,9 @@ describe("CodexHarness: resumed usage evidence", () => {
         await running;
         assert.equal(accountant.hasBaseline("resumed-1"), false);
         assert.equal(accountant.usageIncomplete, true);
+        assert.equal(notices, 1, "cleanup delivers the notice in the cancelled epoch");
         await first.harness.close();
-        const retry = makeHarness({ authMode, accountant });
+        const retry = makeHarness({ authMode, accountant, onTokenUsageIncomplete });
         // The aborted turn persisted A: the retry restores H+A rather than the original H.
         retry.transport.push(tokenUsage(next, response, "resumed-1", "aborted-turn")).push(turnStarted("resumed-1"))
           .push(tokenUsage(next, response, "resumed-1"))
@@ -589,6 +683,7 @@ describe("CodexHarness: resumed usage evidence", () => {
         assert.deepEqual(result.metrics?.cost, { kind: authMode === "api_key" ? "unreported" : "subscription" });
         assert.equal(accountant.usageIncomplete, true);
         assert.equal(accountant.aggregateByModel(), undefined);
+        assert.equal(notices, 1, "retry shares the once-per-claim diagnostic latch");
         await retry.harness.close();
       });
     }
@@ -654,8 +749,7 @@ describe("CodexHarness: resumed usage evidence", () => {
           transport.push({ kind: "activity", method: "thread/tokenUsage/updated", params: { threadId: "resumed-1", tokenUsage: {} } });
         if (problem === "typed-malformed") {
           const note = replay();
-          note.usage.pricingEvidenceComplete = false;
-          transport.push(note);
+          transport.push({ ...note, usage: { ...note.usage, pricingEvidenceComplete: false } });
         }
         if (problem === "coerced") {
           const note = replay();

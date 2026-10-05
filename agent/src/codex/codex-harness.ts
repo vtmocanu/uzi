@@ -975,7 +975,7 @@ export class CodexHarness implements RunHarness {
     // A local watchdog/cancel (owner-aborted signal) ends the stream FIRST (rule 9).
     // requestStop()/close() also settle it via `stopTurn`, so a turn wedged in a pending
     // broker callback ends promptly and does not depend on a new notification arriving.
-    let startedResumedRoot: string | undefined;
+    let attemptedResumedRoot: string | undefined;
     let onAbort: (() => void) | undefined;
     let settleStop: (() => void) | undefined;
     const abortPromise = new Promise<"aborted">((resolve) => {
@@ -998,6 +998,10 @@ export class CodexHarness implements RunHarness {
       }
       // 1. Ensure the provider root + transport (launched once, reused after).
       await this.ensureRoot(request.signal);
+      if (request.signal.aborted || this.stopRequested) {
+        this.turnClosed = true;
+        return;
+      }
       const transport = this.transport;
       const notes = this.notes;
       if (!transport || !notes) {
@@ -1018,9 +1022,15 @@ export class CodexHarness implements RunHarness {
         this.accountant.registerThread(this.threadId, this.currentModel ?? this.provider.model, resumed);
       }
 
-      // 3. Start the turn with the rendered prompt / model / effort.
+      // 3. Stop before sending model work if cancellation arrived during thread setup.
+      if (request.signal.aborted || this.stopRequested) {
+        this.turnClosed = true;
+        return;
+      }
+      // The peer can accept and persist spend before the RPC reply arrives. Record the
+      // resumed attempt before awaiting startTurnRpc, including a rejected pending reply.
+      if (this.resumedRoot) attemptedResumedRoot = this.threadId;
       this.activeTurnId = await this.startTurnRpc(transport, this.threadId, rendered, request.signal);
-      if (this.resumedRoot) startedResumedRoot = this.threadId;
       if (request.signal.aborted || this.stopRequested) {
         // A stop during launch/thread/turn setup could not name a turn earlier. Now
         // that activeTurnId exists, issue the best-effort interrupt and end cleanly.
@@ -1097,10 +1107,7 @@ export class CodexHarness implements RunHarness {
         // attributed to root). The note still flows on to its normal handling below (a child's
         // routes to its sink; a root's maps to `activity`), so decode behavior is unchanged.
         this.recordUsageNote(step.value);
-        if (this.onTokenUsageIncomplete && this.accountant.takeIncompleteNotice()) {
-          // One attempt per shared claim. A rejected diagnostic is nonfatal, with no retry.
-          try { await this.onTokenUsageIncomplete(); } catch { /* execution continues */ }
-        }
+        await this.deliverIncompleteNotice();
         // CHILD-THREAD DEMUX (part C). A frame carrying a REGISTERED child thread id is a
         // delegated child's frame: route its CONTENT to the child controller's sink and
         // NEVER map/yield that content on the root loop. But routing must still count as
@@ -1174,9 +1181,9 @@ export class CodexHarness implements RunHarness {
         }
       }
     } finally {
-      // A started resumed turn may persist new work before the replay boundary is consumed.
+      // An attempted resumed turn may persist new work before its RPC reply or replay boundary.
       // A later epoch must not baseline that work away as history of this same claim.
-      if (startedResumedRoot !== undefined && !this.accountant.hasBaseline(startedResumedRoot))
+      if (attemptedResumedRoot !== undefined && !this.accountant.hasBaseline(attemptedResumedRoot))
         this.accountant.markIncomplete();
       if (onAbort) request.signal.removeEventListener("abort", onAbort);
       if (this.stopTurn === settleStop) this.stopTurn = undefined;
@@ -1189,7 +1196,14 @@ export class CodexHarness implements RunHarness {
         this.outbox = [];
         this.wakeOutbox = undefined;
       }
+      await this.deliverIncompleteNotice();
     }
+  }
+
+  private async deliverIncompleteNotice(): Promise<void> {
+    if (!this.onTokenUsageIncomplete || !this.accountant.takeIncompleteNotice()) return;
+    // One attempt per shared claim. A rejected diagnostic is nonfatal, with no retry.
+    try { await this.onTokenUsageIncomplete(); } catch { /* execution continues */ }
   }
 
   private async ensureRoot(signal?: AbortSignal): Promise<void> {

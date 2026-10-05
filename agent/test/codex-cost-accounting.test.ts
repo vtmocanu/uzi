@@ -120,8 +120,8 @@ describe("CodexUsageAccountant cost: a fully-observed api-key run is metered at 
   it("prices a resumed thread from its post-baseline responses only", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, ASTRA, true); // resumed
-    // First note replays the prior leg's snapshot (total 500/300, last 100/50) → baseline, no charge.
-    acct.record(ROOT, usage({ inputTokens: 500, outputTokens: 300, totalTokens: 800 }, { inputTokens: 100, outputTokens: 50, totalTokens: 150 }));
+    // Explicitly proved historical replay (total 500/300, last 100/50) establishes the baseline, no charge.
+    acct.record(ROOT, usage({ inputTokens: 500, outputTokens: 300, totalTokens: 800 }, { inputTokens: 100, outputTokens: 50, totalTokens: 150 }), true);
     // First genuinely-new post-resume response.
     acct.record(ROOT, usage({ inputTokens: 700, outputTokens: 400, totalTokens: 1100 }, { inputTokens: 200, outputTokens: 100, totalTokens: 300 }));
     const astra = get(acct.aggregateByModel(API_KEY_EARLY), ASTRA);

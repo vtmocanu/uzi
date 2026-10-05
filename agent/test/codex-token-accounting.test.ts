@@ -103,10 +103,10 @@ describe("CodexUsageAccountant: proved replay and incomplete claims", () => {
     acct.record(ROOT, first, true);
     acct.record(ROOT, usage({ inputTokens: 300, outputTokens: 90, totalTokens: 390 }, { inputTokens: 200, outputTokens: 60, totalTokens: 260 }));
     const pricing = { authMode: "api_key" as const, now: new Date("2026-10-05") };
-    assert.deepEqual(acct.aggregateByModel(pricing), acct.aggregateByModel(pricing));
-    assert.equal(acct.aggregateByModel(pricing)?.[MODEL_ROOT]?.inputTokens, 300);
-    assert.equal(acct.aggregateByModel(pricing)?.[MODEL_ROOT]?.costStatus, "metered");
-    assert.equal(acct.aggregateByModel(pricing)?.[MODEL_ROOT]?.costUSD, 0.0075);
+    assert.deepEqual(acct.aggregateByModel(pricing), {
+      [MODEL_ROOT]: { inputTokens: 300, outputTokens: 90, cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0, reasoningOutputTokens: 0, costStatus: "metered", costUSD: 0.0075 },
+    });
   });
 });
 
@@ -313,7 +313,7 @@ describe("CodexUsageAccountant: redelivery and empties", () => {
   it("a registered thread whose reconciled delta is entirely zero is omitted", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, MODEL_ROOT, true);
-    // Only an initial resume snapshot with last=0 — baseline = total, so charged is zero.
+    // Only a proved historical resume snapshot with last=0 — baseline = total, so charged is zero.
     acct.record(ROOT, usage({ inputTokens: 400, outputTokens: 250, totalTokens: 650 }, {}), true);
     assert.equal(acct.aggregateByModel(), undefined);
   });
