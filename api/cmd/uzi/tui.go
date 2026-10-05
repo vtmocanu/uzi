@@ -70,6 +70,7 @@ type tuiView int
 const (
 	viewBoard tuiView = iota
 	viewDetail
+	viewWorkers
 	// viewPulls is the forge `pulls` list screen (PRD #1255 M4a). viewCI is the forge
 	// `ci` list screen (PRD #1255 M4b). viewPR is the PR drill-in (PRD #1255 M5) — a peer of
 	// viewDetail, opened from the pulls list (enter/→) or the run view (m). viewCIRun is the
@@ -293,9 +294,11 @@ type tuiModel struct {
 	// splitLatch changes only on resize; bottomTab survives collapse and drill-ins.
 	splitLatch, splitOff, fromSplit bool
 	splitMode                       string
+	topTab                          tuiView
 	bottomTab                       tuiView
 	boardReplied                    bool
 	splitNote                       string
+	workers                         workersState
 	board                           boardState
 	detail                          detailState
 	// pulls is the forge `pulls` screen's state (PRD #1255 M4a). It carries its OWN
@@ -519,6 +522,10 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 		m.view = viewDetail
 		m.detail = newDetailState(startRun)
 	}
+	if m.workersVisible() {
+		m.workers.active = true
+		m.workers.reqSeq, m.workers.waitID = 1, 1
+	}
 	return m
 }
 
@@ -550,6 +557,9 @@ func (m tuiModel) initCmds() []tea.Cmd {
 		// nothing.
 		ciRunTickAfter(ciRunPollInterval, m.cirun.tickGen),
 		tea.RequestBackgroundColor}
+	if m.workers.active {
+		cmds = append(cmds, m.fetchWorkersCmd(m.board.admin, m.workers.waitID))
+	}
 	if m.skewCheck {
 		cmds = append(cmds, m.fetchBuildInfoCmd(), skewTickCmd())
 	}
@@ -889,6 +899,12 @@ func pollFallbackCmd() tea.Cmd {
 }
 
 func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.update(msg)
+	n := next.(tuiModel)
+	return n.reconcileWorkers(cmd)
+}
+
+func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -984,6 +1000,13 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(m.fetchBuildInfoCmd(), skewTickCmd())
 
+	case workersMsg:
+		return m.applyWorkers(msg)
+	case workersTickMsg:
+		if msg.gen != m.workers.tickGen || !m.workersVisible() || m.workers.waitID != 0 {
+			return m, nil
+		}
+		return m, (&m).startWorkersReq()
 	case boardRunsMsg:
 		// Drop a stale/out-of-order reply (PRD #1130 M1 D2): bubbletea runs each Cmd in its own
 		// goroutine and delivers in completion order, so an older board poll can resolve after a
@@ -993,7 +1016,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.board.waitID = 0
+		oldAdmin := m.board.admin
 		m.board.apply(msg)
+		var workersRefresh tea.Cmd
+		if oldAdmin != m.board.admin {
+			workersRefresh = tea.Batch((&m).startBoardReq(), (&m).startWorkersReq())
+		}
 		firstReply := !m.boardReplied
 		m.boardReplied = true
 		var activation tea.Cmd
@@ -1006,7 +1034,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// tickGen first so this new chain supersedes any tick a manual/admin refresh left
 		// pending — only one tick chain stays live.
 		m.board.tickGen++
-		return m, tea.Batch(tickAfter(boardTickInterval(m.board.errStreak), m.board.tickGen), m.maybeArmBlink(), activation)
+		return m, tea.Batch(tickAfter(boardTickInterval(m.board.errStreak), m.board.tickGen), m.maybeArmBlink(), activation, workersRefresh)
 
 	case reposMsg:
 		// The forge views' repo scope (PRD #1255 D2). A failure is recorded (the pulls scope
@@ -1532,6 +1560,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
+	next, cmd := m.handleKeyInner(k)
+	n := next.(tuiModel)
+	return n.reconcileWorkers(cmd)
+}
+
+func (m tuiModel) handleKeyInner(k string) (tea.Model, tea.Cmd) {
 	// q quits immediately (user preference). ctrl+c still routes through a confirm modal so a
 	// stray ctrl+c cannot drop a watched run; a second ctrl+c quits at once.
 	if k == keyCtrlC {
@@ -1590,50 +1624,28 @@ func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
 			m.splitNote = "terminal too small to split"
 			return m, nil
 		}
+		if v, ok := stripDestination(m.view, k); ok {
+			return m.gotoList(v)
+		}
 		if m.splitDrawn() {
 			switch k {
-			case keyTab, "shift+tab":
-				if k == keyTab {
-					switch m.view {
-					case viewBoard:
-						return m.gotoCI()
-					case viewCI:
-						return m.gotoPulls()
-					default:
-						m.setListView(viewBoard)
-						return m, nil
-					}
-				}
-				switch m.view {
-				case viewBoard:
-					return m.gotoPulls()
-				case viewPulls:
-					return m.gotoCI()
-				default:
-					m.setListView(viewBoard)
-					return m, nil
-				}
 			case "ctrl+w":
-				if m.view == viewBoard {
+				if m.view == viewBoard || m.view == viewWorkers {
 					return m.focusBottom()
 				}
-				m.setListView(viewBoard)
+				m.setListView(m.top())
 				return m, nil
-			case keyEsc, keyViewFloor:
-				if m.view != viewBoard {
-					m.setListView(viewBoard)
-					return m, nil
-				}
-			case keyViewPulls:
-				return m.gotoPulls()
-			case keyViewCI:
-				return m.gotoCI()
+			case keyEsc:
+				m.setListView(m.top())
+				return m, nil
 			}
 		}
 	}
 	switch m.view {
 	case viewBoard:
 		return m.boardKey(k)
+	case viewWorkers:
+		return m.workersKey(k)
 	case viewPulls:
 		return m.pullsKey(k)
 	case viewCI:
@@ -1648,7 +1660,8 @@ func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
 }
 
 func (m tuiModel) filtering() bool {
-	return (m.view == viewBoard && m.board.filtering) ||
+	return (m.view == viewWorkers && m.workers.filtering) ||
+		(m.view == viewBoard && m.board.filtering) ||
 		(m.view == viewPulls && m.pulls.filtering) ||
 		(m.view == viewCI && m.ci.filtering)
 }
@@ -1681,6 +1694,8 @@ func (m tuiModel) View() tea.View {
 		body = m.renderSplit()
 	case m.view == viewDetail:
 		body = m.renderDetail()
+	case m.view == viewWorkers:
+		body = m.renderWorkers()
 	case m.view == viewPulls:
 		body = m.renderPulls()
 	case m.view == viewCI:
@@ -1702,17 +1717,14 @@ func (m tuiModel) renderHelp() string {
 		var splitLines []string
 		for _, line := range lines {
 			if strings.HasPrefix(line, "tab ") {
-				splitLines = append(splitLines, "tab        cycle floor, ci, pulls")
-				if m.view == viewBoard {
-					splitLines = append(splitLines, "1 / 2 / 3  focus floor / pulls / ci")
-				}
-			} else if strings.HasPrefix(line, "1 / 2 / 3 ") {
-				splitLines = append(splitLines, "1 / 2 / 3  focus floor / pulls / ci")
+				splitLines = append(splitLines, "tab        cycle floor, workers, pulls, ci")
+			} else if strings.HasPrefix(line, "1 / 2 / 3 / 4 ") {
+				splitLines = append(splitLines, "1/2 top floor/workers · 3/4 bottom pulls/ci")
 			} else {
 				splitLines = append(splitLines, line)
 			}
 		}
-		lines = append(splitLines, "shift+tab  cycle floor, pulls, ci", "ctrl+w     switch pane focus", "s          collapse / restore split")
+		lines = append(splitLines, "shift+tab  cycle ci, pulls, workers, floor", "ctrl+w     switch pane focus", "s          collapse / restore split")
 	}
 	return m.pal.title.Render("keybindings") + "\n\n" +
 		strings.Join(lines, "\n") + "\n\n" +

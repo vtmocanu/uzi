@@ -221,10 +221,10 @@ func TestSplitReviewHelpHasOneAlignedNavigationEntry(t *testing.T) {
 		for i, line := range lines {
 			if strings.HasPrefix(line, "tab ") {
 				tabs++
-				if line != "tab        cycle floor, ci, pulls" {
+				if line != "tab        cycle floor, workers, pulls, ci" {
 					t.Errorf("wrong tab help: %q", line)
 				}
-				if view == viewBoard && (i+1 == len(lines) || lines[i+1] != "1 / 2 / 3  focus floor / pulls / ci") {
+				if view == viewBoard && (i+1 == len(lines) || lines[i+1] != "1/2 top floor/workers · 3/4 bottom pulls/ci") {
 					t.Error("board numbered navigation is not grouped after tab")
 				}
 			}
@@ -237,7 +237,7 @@ func TestSplitReviewHelpHasOneAlignedNavigationEntry(t *testing.T) {
 		if tabs != 1 {
 			t.Errorf("%v help has %d tab entries", view, tabs)
 		}
-		for _, want := range []string{"shift+tab  cycle floor, pulls, ci", "ctrl+w     switch pane focus", "s          collapse / restore split"} {
+		for _, want := range []string{"shift+tab  cycle ci, pulls, workers, floor", "ctrl+w     switch pane focus", "s          collapse / restore split"} {
 			if !strings.Contains(strings.Join(lines, "\n"), want) {
 				t.Errorf("%v help missing %q", view, want)
 			}

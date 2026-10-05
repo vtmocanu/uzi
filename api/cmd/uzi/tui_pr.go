@@ -282,7 +282,7 @@ func (m tuiModel) prKey(k string) (tea.Model, tea.Cmd) {
 		// loaded. Reset to the default for the next open.
 		target := m.prReturn
 		if m.fromSplit && !m.splitEligible() {
-			target = viewBoard
+			target = m.top()
 		}
 		if m.prReturn == viewDetail && target != viewDetail {
 			// The collapse skips the run view this PR was opened from, so leave it the way
@@ -291,7 +291,7 @@ func (m tuiModel) prKey(k string) (tea.Model, tea.Cmd) {
 			m.prReturn = viewPulls
 			return m.exitToBoard()
 		}
-		if target == viewBoard || target == viewCI || target == viewPulls {
+		if target == viewBoard || target == viewWorkers || target == viewCI || target == viewPulls {
 			m.setListView(target)
 			m.fromSplit = false
 		} else {

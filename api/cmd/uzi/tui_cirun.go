@@ -209,7 +209,7 @@ func (m tuiModel) ciRunKey(k string) (tea.Model, tea.Cmd) {
 		// persists on the model), so it is still loaded on return (D1). → opens a row, so ← is its
 		// symmetric back (issue #1335).
 		if m.fromSplit && !m.splitEligible() {
-			m.setListView(viewBoard)
+			m.setListView(m.top())
 		} else {
 			m.setListView(viewCI)
 		}

@@ -26,16 +26,20 @@ func TestSplitThresholdAndCycle(t *testing.T) {
 		t.Fatal("split did not enter at threshold")
 	}
 	m = press(t, m, keyTab)
-	if m.view != viewCI || m.bottom() != viewCI {
-		t.Fatalf("first tab: focus=%v bottom=%v", m.view, m.bottom())
+	if m.view != viewWorkers || m.top() != viewWorkers || m.bottom() != viewCI {
+		t.Fatalf("first tab: focus=%v top=%v bottom=%v", m.view, m.top(), m.bottom())
 	}
 	m = press(t, m, keyTab)
 	if m.view != viewPulls || m.bottom() != viewPulls {
 		t.Fatalf("second tab: focus=%v bottom=%v", m.view, m.bottom())
 	}
 	m = press(t, m, keyTab)
-	if m.view != viewBoard || m.bottom() != viewPulls {
+	if m.view != viewCI || m.bottom() != viewCI {
 		t.Fatalf("third tab: focus=%v bottom=%v", m.view, m.bottom())
+	}
+	m = press(t, m, keyTab)
+	if m.view != viewBoard || m.top() != viewBoard || m.bottom() != viewCI {
+		t.Fatalf("fourth tab: focus=%v top=%v bottom=%v", m.view, m.top(), m.bottom())
 	}
 	m = resizeSplit(m, 120, splitMinHeight)
 	if !m.splitDrawn() {
@@ -46,7 +50,7 @@ func TestSplitThresholdAndCycle(t *testing.T) {
 		t.Fatal("split did not collapse to floor")
 	}
 	m = resizeSplit(m, 120, splitMinHeight+2)
-	if !m.splitDrawn() || m.view != viewBoard || m.bottom() != viewPulls {
+	if !m.splitDrawn() || m.view != viewBoard || m.bottom() != viewCI {
 		t.Fatal("regrow did not retain floor focus and bottom tab")
 	}
 	m = press(t, m, "s")

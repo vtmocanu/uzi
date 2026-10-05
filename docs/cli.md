@@ -1388,14 +1388,39 @@ A newer release is available.
   and recommendations, with the same resolve/dismiss/undo triage described
   under [Reviewing and triaging from the CLI](#reviewing-and-triaging-from-the-cli).
 
+### Workers and the floor fleet summary
+
+Press `2` for the workers list. Rows put danger first, then warnings,
+information, and workers with no attention item; names break ties. Selection
+stays on the same worker when a refresh changes the order. `/` filters names
+case-insensitively, and the selected-row readout explains each attention item.
+At 80 columns the list shows name, state, kind, run occupancy, and attention;
+at 120 it adds resource readings, version, heartbeat age, and owner in factory
+scope. Offline resources are marked `~` as stale, last-known readings.
+
+The floor shows a fleet summary when you have workers: slots in use, online
+workers, and workers needing attention. Occupancy is not spare capacity:
+holding, draining, and cordoned workers may not take new work. A `?` cap means
+unknown advertised slots. Only danger and warning items count as needing
+attention; a lease or lone chat is information. Disk percentages are visual
+cues; DinD and inode readings are display-only.
+
+The floor summary and workers list share one request chain, polling every 5s
+while either is visible, including an unfocused top pane. Failures back off
+to at most 60s and keep the last snapshot. Polling pauses in detail screens
+and help; returning fetches immediately. `r` refreshes immediately.
+On the floor or workers list, `a` toggles their shared own/factory scope.
+Factory scope needs a `uza_` admin token and adds owners and server-reported
+disk pressure; a denied request returns both views to your own scope.
+
 ### The forge screens: `pulls` and `ci`
 
-A tab strip in the header — `▚▚ uzi · floor  pulls  ci` — sits beside the
-board (labelled `floor` on screen) and adds two more top-level screens, both
+The tab strip reads `1 floor · 2 workers · 3 pulls · 4 ci`.
+The two forge screens are both
 read straight through the API's stored forge connection PAT: no `gh`, no
 personal token, no leaving the terminal to see whether a PR went green.
-Without a split, `tab` cycles floor → pulls → ci → floor; `1`/`2`/`3`
-jump directly. Both forge lists scope to one repo at a time — `R` cycles
+In either layout, `tab` cycles floor → workers → pulls → ci → floor;
+`shift+tab` reverses the order and `1`–`4` jump directly. Both forge lists scope to one repo at a time — `R` cycles
 your enabled repos (hidden when only one is enabled), defaulting to the
 repo of your newest run — and `/` filters a list by title, branch, author,
 or workflow name.
@@ -1434,23 +1459,25 @@ view for that run's merge request, when it has one.
 
 With the default `auto` setting, a terminal at least 80 columns wide and
 tall enough shows the floor on top and the scoped repo's CI list below it.
+The top pane can show floor or workers; the bottom pane can show pulls or CI.
 The header and footer are shared; a separator names the bottom tab and
-repo. The bracketed label (`[floor]`, `[ci]`, or `[pulls]`) shows which
-pane has focus. Both visible lists keep refreshing. Press `tab` to cycle
-floor → CI → pulls → floor, or `shift+tab` to cycle backwards. `ctrl+w`
-switches focus between the floor and the currently selected bottom tab;
-`1` focuses the floor, `2` opens pulls below, and `3` opens CI below.
-`esc` from the bottom focuses the floor. `R` cycles the scoped repo when
+repo. The bracketed label (`[floor]`, `[workers]`, `[ci]`, or `[pulls]`)
+shows which pane has focus. Both visible lists keep refreshing. Press `tab`
+to cycle floor → workers → pulls → ci → floor, or `shift+tab` backwards.
+`ctrl+w` switches focus between the selected top and bottom tabs;
+`1`/`2` select floor/workers on top, and `3`/`4` select pulls/CI below.
+`esc` from the bottom focuses the selected top tab. `R` cycles the scoped repo when
 the bottom pane has focus. Run, PR, and CI run detail still open full-screen;
 `esc` returns to the originating pane with its tab and selection.
 
-Press `s` on a list to collapse the split to the full-screen floor for this
-session; press it again to restore the split when the terminal is large
-enough. A resize that makes the terminal too small also collapses to the
-floor. The bottom tab, cursor, filter, and repo are kept for the next
-split, while the floor takes focus after collapse. The split enters at
-42 rows (`minHeight + 2`) and leaves below 40 rows (`minHeight`), avoiding
-a layout flip on a one-row resize. The 40-row minimum is derived from the
+Press `s` on a list to collapse the split to its selected top tab (floor or
+workers) for this session; press it again to restore the split when the
+terminal is large enough. A resize that makes the terminal too small also
+collapses to that top tab. Both tabs, cursors, filters, and the scoped repo
+are kept for the next split, while the top tab takes focus after collapse.
+The split enters at 43 rows (`minHeight + 2`) and leaves below 41 rows
+(`minHeight`), avoiding a layout flip on a one-row resize. The 41-row minimum
+includes the fleet summary and is derived from the
 shared header, separator, footer, each pane's worst-case headings and
 spacers, and eight actual list rows per pane; the layout changes only on
 a resize. If the
@@ -1478,8 +1505,8 @@ j/k, ↑/↓     move within the focused pane (board: row · detail: between age
 g            detail: follow live — re-attach and jump to the newest output (live runs only)
 c            detail: fold / unfold the crew list; it also folds by itself when MILESTONES/SPEND/ACCOUNTS would not fit
 enter        open the selected run (board)
-/            filter the board
-a            toggle the factory-wide admin board (board only)
+/            filter the board or workers list
+a            toggle shared own/factory scope (board or workers; admin token required)
 h            hide finished runs — completed/failed/cancelled, keeps active + needs-you (board only; no-op on the admin board)
 r            refresh
 v            open/close the review overlay (detail)
@@ -1518,14 +1545,14 @@ plan gate gets, but `y`/`n` don't apply to it. Answer from another terminal
 with `uzi run answer <id>` (see [Commands](#commands)), from the web run
 view, or from Slack; the TUI picks the change up on its next refresh.
 
-The `pulls`, `ci`, and their two drill-ins (PR view, CI run view) share a
-second set of bindings:
+The list screens and forge drill-ins (PR view, CI run view) use these
+navigation bindings:
 
 ```
-tab          unsplit: floor → pulls → ci → floor; split: floor → ci → pulls → floor
-shift+tab    split: cycle backwards through floor, ci, pulls
-ctrl+w       split: switch focus between floor and the selected bottom tab
-1 / 2 / 3    focus floor / pulls / ci
+tab          floor → workers → pulls → ci → floor (both layouts)
+shift+tab    cycle backwards through the same list order
+ctrl+w       split: switch focus between the selected top and bottom tabs
+1 / 2 / 3 / 4  focus floor / workers / pulls / ci
 s            collapse or restore the split for this session (list screens)
 R            cycle the scoped repo (forge list focused; hidden with one enabled repo)
 enter / →    open the selected row (pulls → PR view · ci → CI run view)

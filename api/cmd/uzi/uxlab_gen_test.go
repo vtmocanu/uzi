@@ -69,7 +69,10 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		t.Skip("set UZI_UXLAB_GEN=1 to (re)generate the ux-lab frames")
 	}
 
-	outDir := filepath.Join("uxlab", "frames")
+	outDir := os.Getenv("UZI_UXLAB_OUT_DIR")
+	if outDir == "" {
+		outDir = filepath.Join("uxlab", "frames")
+	}
 	if err := os.MkdirAll(outDir, 0o755); err != nil { //nolint:gosec // G301: dev-tool frame output dir holds non-sensitive generated artifacts; 0755 keeps it browsable
 		t.Fatal(err)
 	}
@@ -122,6 +125,10 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"split-needs-you-unfocused":    func(d bool) string { return splitScene(d, now, "needs-you") },
 		"split-ci-empty":               func(d bool) string { return splitScene(d, now, "ci-empty") },
 		"split-filtering":              func(d bool) string { return splitScene(d, now, "filtering") },
+	}
+
+	for _, name := range workerSceneNames {
+		scenes[name] = func(dark bool) string { return workersScene(dark, name).View().Content }
 	}
 
 	names := make([]string, 0, len(scenes))
@@ -217,6 +224,44 @@ func splitScene(dark bool, now time.Time, scene string) string {
 		m = key(m, "u")
 	}
 	return m.View().Content
+}
+
+var workerSceneNames = []string{"workers-list-120", "workers-list-80", "workers-factory", "workers-cordoned", "split-workers-top", "floor-fleet"}
+
+// workersScene uses the shipped model and the interactive demo's client.
+func workersScene(dark bool, name string) tuiModel {
+	fake := newDemoClient()
+	m := uxModel(fake, "", dark)
+	width, height := 120, 34
+	if name == "workers-list-80" {
+		width = 80
+	}
+	if name == "split-workers-top" {
+		height = 60
+	}
+	m = step(m, tea.WindowSizeMsg{Width: width, Height: height})
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: fake.Runs})
+	if name != "floor-fleet" {
+		m = key(m, keyViewWorkers)
+	}
+	if name == "workers-factory" || name == "workers-cordoned" {
+		m = key(m, keyAdmin)
+	}
+	msg := m.fetchWorkersCmd(m.board.admin, m.workers.waitID)()
+	m = step(m, msg)
+	if name == "workers-cordoned" {
+		for i, r := range m.workers.visible(time.Now()) {
+			if r.w.Name == "b-runner" {
+				m.workers.cursor = i
+				m.workers.selectedID = r.w.ID
+			}
+		}
+	}
+	if name == "split-workers-top" {
+		m = step(m, reposMsg{repos: []apitypes.RepoDTO{oneRepo()}})
+		m = step(m, ciMsg{reqID: m.ci.waitID, runs: sampleCIRuns(time.Now())})
+	}
+	return m
 }
 
 // ---- board fixtures -------------------------------------------------------

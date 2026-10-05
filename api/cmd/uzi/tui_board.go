@@ -318,7 +318,7 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		// becomes the new waitID, so the next periodic tick does not stack a second poll on top
 		// of this one and any periodic reply still in flight is superseded (its stale reqID is
 		// dropped); this reply's own reqID clears the guard.
-		return m, tea.Batch((&m).startBoardReq(), m.fetchRateLimitsCmd(), m.fetchCodexRateLimitsCmd(), (&m).startSelfUsageReq(), m.fetchSettingsCmd(), m.fetchVaultCmd())
+		return m, tea.Batch((&m).startBoardReq(), m.fetchRateLimitsCmd(), m.fetchCodexRateLimitsCmd(), (&m).startSelfUsageReq(), m.fetchSettingsCmd(), m.fetchVaultCmd(), (&m).startWorkersReq())
 	case keyAdmin:
 		m.board.admin = !m.board.admin
 		m.board.adminDenied = false
@@ -327,7 +327,7 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		// Same as keyRefresh (D1): always fetch, minting a fresh id via startBoardReq so the next
 		// tick does not stack and any pre-toggle periodic reply is superseded. The subsequent
 		// boardRunsMsg for the new admin value carries the matching reqID and clears the guard.
-		return m, tea.Batch((&m).startBoardReq(), (&m).startSelfUsageReq())
+		return m, tea.Batch((&m).startBoardReq(), (&m).startSelfUsageReq(), (&m).startWorkersReq())
 	case keyHideDone:
 		// No-op on the admin board: AdminListRuns already returns non-terminal runs only, so
 		// hiding "finished" runs would change no rows — flipping the label there reads as a
@@ -357,18 +357,19 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		m.detailGen++
 		m.detail.gen = m.detailGen
 		return m, tea.Batch(m.loadRunCmd(sel.ID), m.loadTailCmd(sel.ID), m.openStreamCmd(sel.ID))
-	case keyTab, keyViewPulls:
-		// tab / 2 leave the floor for the forge `pulls` list (PRD #1255 D1). tab advances the
-		// cycle floor → pulls; 2 jumps to pulls directly.
+	case keyTab, keyViewWorkers:
+		m.setListView(viewWorkers)
+		return m, nil
+	case keyViewPulls:
 		return m.gotoPulls()
 	case keyViewCI:
-		// 3 jumps straight to the forge `ci` list (PRD #1255 M4b).
+		// 4 jumps straight to the forge `ci` list (PRD #1255 M4b).
 		return m.gotoCI()
 	}
 	return m, nil
 }
 
-// tabStrip builds the wordmark + the floor · pulls · ci tab strip shared by the board
+// tabStrip builds the wordmark + the floor · workers · pulls · ci tab strip shared by the board
 // and the forge views (PRD #1255 D1): the active screen's tab is tungsten-bold, the rest
 // faint. The marked tab and admin relabel are explicit so a split header can
 // mark the focused pane independently. The board's admin sub-mode relabels its own tab "active runs"
@@ -384,17 +385,23 @@ func (m tuiModel) tabStrip(admin bool, marked tuiView, repoSuffix bool) string {
 		label  string
 		active bool
 	}{
-		{floorLabel, marked == viewBoard},
-		{"pulls", marked == viewPulls},
-		{"ci", marked == viewCI},
+		{"1 " + floorLabel, marked == viewBoard},
+		{"2 workers", marked == viewWorkers},
+		{"3 pulls", marked == viewPulls},
+		{"4 ci", marked == viewCI},
 	}
 	out := m.pal.title.Render("▚▚ uzi") + m.pal.faint.Render(" · ")
 	for i, t := range tabs {
 		if i > 0 {
-			out += m.pal.faint.Render("  ")
+			out += m.pal.faint.Render(" · ")
 		}
 		if t.active {
-			out += m.pal.title.Render(t.label)
+			label := t.label
+			if m.splitDrawn() && (marked == viewBoard || marked == viewWorkers) {
+				key, name, _ := strings.Cut(label, " ")
+				label = key + " [" + name + "]"
+			}
+			out += m.pal.title.Render(label)
 		} else {
 			out += m.pal.faint.Render(t.label)
 		}
@@ -538,7 +545,7 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 		meters = m.boardMeterLayout(time.Now())
 	}
 
-	// The wordmark is now a tab strip (PRD #1255 D1): ▚▚ uzi · floor  pulls  ci, the active
+	// The wordmark is now a tab strip (PRD #1255 D1): ▚▚ uzi · 1 floor · 2 workers · 3 pulls · 4 ci, the active
 	// tab bold. tabStrip relabels the floor tab "active runs" on the admin board (AdminListRuns
 	// returns non-terminal runs only, so promising completed rows would be a claim the API
 	// cannot satisfy).
@@ -572,6 +579,11 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 		summary += m.pal.faint.Render(" · " + itoa(lo) + "–" + itoa(hi))
 	}
 	sb.WriteString(clampVisual(padVisual(" "+brand, m.width-visualWidth(summary)-1)+summary, m.width) + "\n")
+	if fullScreen {
+		if fleet := m.workersSummary(m.width, true); fleet != "" {
+			sb.WriteString(fleet + "\n")
+		}
+	}
 	// The viewer's own rate-limit meters, mirroring the web sidebar's selection (PRD #1209 M3 /
 	// 1519 M4). boardMeterLayout adaptively renders the Claude and Codex meters on ONE combined
 	// header line when they fit m.width, or on two lines (Claude, then Codex) when they do not.
@@ -976,6 +988,9 @@ func (m tuiModel) boardCapacityAt(height, meterLines int, fullScreen bool) int {
 	chrome := 1 // pane title, filter and summary
 	if fullScreen {
 		chrome += 2 // blank line and footer
+		if m.workersSummary(m.width, true) != "" {
+			chrome++
+		}
 		if m.board.adminDenied {
 			chrome++
 		}

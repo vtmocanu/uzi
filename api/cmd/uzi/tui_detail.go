@@ -455,9 +455,9 @@ func (m tuiModel) exitToBoard() (tea.Model, tea.Cmd) {
 	}
 	target := m.detailReturn
 	if m.fromSplit && !m.splitEligible() {
-		target = viewBoard
+		target = m.top()
 	}
-	if target == viewBoard || target == viewCI || target == viewPulls {
+	if target == viewBoard || target == viewWorkers || target == viewCI || target == viewPulls {
 		m.setListView(target)
 		m.fromSplit = false
 	} else {
