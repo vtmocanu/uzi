@@ -152,6 +152,7 @@ export async function journalAndResolveTerminal(
   // the SAME external behaviour for its direct callers (postTerminalState, the terminal-resolve tests):
   // install → (resolvePendingTerminal | sendUnjournaledTerminal), byte-for-byte as before.
   const installed = await installTerminalWriteAhead(deps, { runId, claimGeneration, phase, messagesThroughSeq, body });
+  if (!installed.journaled && "deferred" in installed) return;
   if (!installed.journaled) {
     await sendUnjournaledTerminal(deps, installed.canonical, messagesThroughSeq, send, signal);
     return;
@@ -170,17 +171,22 @@ export async function journalAndResolveTerminal(
  * phase gates its api outage on, and returns `{journaled:true}`. On `reserve_exhausted` (the
  * terminal-sized reserve could not admit the journal) it emits the same SC2 error line and returns
  * `{journaled:false, canonical}` so the caller sends the canonical body UNJOURNALED via
- * {@link sendUnjournaledTerminal} — never a silent drop.
+ * {@link sendUnjournaledTerminal} — never a silent drop. An unavailable selected winner returns
+ * `{journaled:false, deferred:true}` so callers preserve it without sending a competing outcome.
  */
 export async function installTerminalWriteAhead(
   deps: TerminalOutboxDeps,
   args: { runId: string; claimGeneration: number; phase: string; messagesThroughSeq: number; body: StateRequest },
-): Promise<{ journaled: true } | { journaled: false; canonical: Record<string, unknown> }> {
+): Promise<{ journaled: true } | { journaled: false; deferred: true } | { journaled: false; canonical: Record<string, unknown> }> {
   const { outbox, terminalMaxBytes, log } = deps;
   const { runId, claimGeneration, phase, messagesThroughSeq, body } = args;
   const canonical = canonicalizeTerminalBody(body as unknown as Record<string, unknown>, terminalMaxBytes);
   const result = await outbox.journalTerminal(runId, claimGeneration, phase, messagesThroughSeq, canonical);
   if (!result.journaled) {
+    if (result.reason === "winner_unavailable") {
+      log.info("outbox: selected terminal winner unavailable; deferring outcome", {});
+      return { journaled: false, deferred: true };
+    }
     // reserve_exhausted (SC2): the terminal-sized reserve could not admit the journal. The caller
     // sends the canonical body UNJOURNALED, keeping today's semantics — the send's own retries apply
     // and a throw propagates to the executor catch (which finds NO journal and takes today's fallback).

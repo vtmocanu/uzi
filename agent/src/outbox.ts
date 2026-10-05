@@ -157,10 +157,11 @@ export type TerminalBlockedReason = "completion_permit_mismatch" | "gap_unrecove
  *  caller (M3b's send path) never confuses "installed durably" with "sent unjournaled": on success
  *  the outcome is journalled (and `adopted` says whether THIS call installed it or adopted an
  *  earlier first-writer for the same generation, D4); on `reserve_exhausted` the terminal-sized
- *  reserve could not admit it, so the caller sends unjournaled + logs, never silently dropping. */
+ *  reserve could not admit it, so the caller sends unjournaled + logs, never silently dropping.
+ *  `winner_unavailable` retains the selected first writer and defers a competing outcome. */
 export type TerminalJournalResult =
   | { journaled: true; adopted: boolean }
-  | { journaled: false; reason: "reserve_exhausted" };
+  | { journaled: false; reason: "reserve_exhausted" | "winner_unavailable" };
 
 /** PRD #1391 M3 (Run B): one pending terminal journal listed by {@link Outbox.listPendingTerminals}
  *  and folded into the heartbeat outbox entry — the phase captured at journal time (`phase_at_journal`,
@@ -1230,7 +1231,10 @@ export class Outbox {
     messagesThroughSeq: number,
     canonicalBody: Record<string, unknown>,
   ): Promise<TerminalJournalResult> {
-    if (!this.writable()) return { journaled: false, reason: "reserve_exhausted" };
+    if (this.disabled) {
+      this.writable();
+      return { journaled: false, reason: "reserve_exhausted" };
+    }
     return this.withRunLock(runId, async () => {
       if (!this.validRunId(runId) || !Number.isSafeInteger(claimGeneration) || claimGeneration < 0) return { journaled: false, reason: "reserve_exhausted" };
       const dir = this.runDir(runId);
@@ -1242,13 +1246,27 @@ export class Outbox {
       }
       const winner = this.runs.get(runId)?.terminals.get(claimGeneration);
       if (winner) {
-        // This generation already has a durable authenticated winner, possibly a filename alias.
-        // A transient read must not install or send a competing outcome. Fresh MAC failure
-        // invalidates that winner; it cannot authorize adoption or a replacement write here.
+        // Re-authenticate the selected filename before claiming adoption.
         const observed = await this.inspectTerminal(runId, claimGeneration, winner.fileName);
-        if (observed.observation.kind === "mac_failure") return { journaled: false, reason: "reserve_exhausted" };
-        return { journaled: true, adopted: true };
+        switch (observed.observation.kind) {
+          case "authenticated":
+            return { journaled: true, adopted: true };
+          case "absent":
+            this.runs.get(runId)?.terminals.delete(claimGeneration);
+            break;
+          case "unreadable":
+          case "key_unavailable":
+            return { journaled: false, reason: "winner_unavailable" };
+          case "mac_failure":
+            return { journaled: false, reason: "reserve_exhausted" };
+          case "malformed":
+          case "oversized":
+          case "symlink":
+            this.runs.get(runId)?.terminals.delete(claimGeneration);
+            return { journaled: false, reason: "reserve_exhausted" };
+        }
       }
+      if (!this.writable()) return { journaled: false, reason: "reserve_exhausted" };
       const since = this.now();
       const record: TerminalJournalData = {
         version: 1,

@@ -29,6 +29,47 @@ async function fixture(terminalMaxBytes = 1024) {
   const file = path.join(root, run, "terminal-3.json");
   return { root, box, file, log };
 }
+test("unit 1: an absent selected winner is reinstalled, not adopted", async () => {
+  const { box, file } = await fixture();
+  await fs.unlink(file);
+  assert.deepEqual(await box.journalTerminal(run, 3, "implement", 9, { status: "completed" }), { journaled: true, adopted: false });
+  assert.equal((await box.readTerminalJournal(run, 3))?.messagesThroughSeq, 9);
+});
+
+test("unit 1: unreadable and key-unavailable selected winners defer without adoption", async () => {
+  const { box, file } = await fixture();
+  const original = await fs.readFile(file);
+  await fs.unlink(file);
+  await fs.mkdir(file);
+  assert.deepEqual(await box.journalTerminal(run, 3, "implement", 9, { status: "completed" }), { journaled: false, reason: "winner_unavailable" });
+  assert.equal(box.hasPendingTerminal(run, 3), true);
+  await fs.rmdir(file);
+  await fs.writeFile(file, original);
+  const keyed = box as unknown as { key: Buffer | undefined };
+  const key = keyed.key;
+  try {
+    keyed.key = undefined;
+    assert.deepEqual(await box.journalTerminal(run, 3, "implement", 9, { status: "completed" }), { journaled: false, reason: "winner_unavailable" });
+  } finally {
+    keyed.key = key;
+  }
+  assert.deepEqual(await fs.readFile(file), original);
+});
+
+for (const kind of ["malformed", "oversized", "symlink"] as const) {
+  test(`unit 1: selected ${kind} invalidates metadata and retains the invalid file`, async () => {
+    const { box, file, root } = await fixture();
+    await fs.unlink(file);
+    if (kind === "symlink") await fs.symlink(path.join(root, ".key"), file);
+    else await fs.writeFile(file, kind === "malformed" ? "{" : " ".repeat(1024 + OUTBOX_RANGE_RESERVE_BYTES + 1));
+    const before = await fs.lstat(file);
+    assert.deepEqual(await box.journalTerminal(run, 3, "implement", 9, { status: "completed" }), { journaled: false, reason: "reserve_exhausted" });
+    assert.equal(box.hasPendingTerminal(run, 3), false);
+    assert.equal((await fs.lstat(file)).ino, before.ino);
+    if (kind !== "symlink") assert.equal(await fs.readFile(file, "utf8"), kind === "malformed" ? "{" : " ".repeat(1024 + OUTBOX_RANGE_RESERVE_BYTES + 1));
+  });
+}
+
 async function reject(file: string) {
   const obj = JSON.parse(await fs.readFile(file, "utf8"));
   obj.body = { status: "failed", error: "changed private body" };
@@ -213,9 +254,10 @@ test("an authenticated alias wins before a competing canonical outcome is instal
   outboxes.push(again);
   await again.init();
   assert.deepEqual(again.listPendingTerminals(), []);
-  // Original-process metadata cannot manufacture a new outcome after a transient read.
+  // Original-process metadata preserves the selected winner without claiming adoption during a transient read.
   await fs.mkdir(file);
-  assert.deepEqual(await box.journalTerminal(run, 3, "implement", 0, { status: "completed" }), { journaled: true, adopted: true });
+  assert.deepEqual(await box.journalTerminal(run, 3, "implement", 0, { status: "completed" }), { journaled: false, reason: "winner_unavailable" });
+  assert.equal(box.hasPendingTerminal(run, 3), true);
   await fs.rmdir(file);
 });
 

@@ -8,6 +8,7 @@ import path from "node:path";
 import { Outbox, canonicalizeTerminalBody } from "../src/outbox.js";
 import {
   journalAndResolveTerminal,
+  installTerminalWriteAhead,
   resolvePendingTerminal,
   makeTerminalOutboxDeps,
   type TerminalOutboxDeps,
@@ -96,6 +97,81 @@ function depsFor(outbox: Outbox, client: FakeClient, over: Partial<{ gapFillMax:
   assert.ok(d, "deps built (outbox enabled)");
   return d;
 }
+
+it("unit 1: absent selected file reinstalls and the real helper sends and retires", async () => {
+  const { outbox, root } = await mkOutbox();
+  await outbox.journalTerminal("r1", 7, "running", 1, { status: "failed" });
+  await fs.unlink(path.join(root, "r1", "terminal-7.json"));
+  const client = new FakeClient();
+  client.features.add("terminal_fence");
+  const { send, bodies } = scriptedSend([{ applied: true, status: "completed" }]);
+  await journalAndResolveTerminal(depsFor(outbox, client), { runId: "r1", claimGeneration: 7, phase: "running", messagesThroughSeq: 42, body: { status: "completed" }, send });
+  assert.deepEqual(bodies, [{ status: "completed", messages_through_seq: 42 }]);
+  assert.equal(outbox.hasPendingTerminal("r1", 7), false);
+});
+
+for (const unavailable of ["unreadable", "key_unavailable"] as const) {
+  it(`unit 1: ${unavailable} selected winner defers then resolves only the original body and fence`, async () => {
+    const { outbox, root } = await mkOutbox();
+    const original = { status: "completed" as const, branch: "agent/original" };
+    await outbox.journalTerminal("r1", 7, "running", 42, original);
+    const file = path.join(root, "r1", "terminal-7.json");
+    const bytes = await fs.readFile(file);
+    const keyed = outbox as unknown as { key: Buffer | undefined };
+    const key = keyed.key;
+    const client = new FakeClient();
+    client.features.add("terminal_fence");
+    const { logger, lines } = recordingLogger();
+    const deps = { ...depsFor(outbox, client), log: logger };
+    const { send, bodies } = scriptedSend([{ applied: true, status: "completed" }]);
+    if (unavailable === "unreadable") { await fs.unlink(file); await fs.mkdir(file); }
+    else keyed.key = undefined;
+    try {
+      assert.deepEqual(await installTerminalWriteAhead(deps, { runId: "r1", claimGeneration: 7, phase: "running", messagesThroughSeq: 99, body: { status: "failed", failure_reason: "competing private body" } }), { journaled: false, deferred: true });
+      await journalAndResolveTerminal(deps, { runId: "r1", claimGeneration: 7, phase: "running", messagesThroughSeq: 99, body: { status: "failed" }, send });
+      assert.deepEqual(bodies, []);
+      assert.equal(outbox.hasPendingTerminal("r1", 7), true);
+      assert.equal(JSON.stringify(lines).includes("competing private body"), false);
+      assert.equal(JSON.stringify(lines).includes("terminal journaled write-ahead"), false);
+      assert.equal(JSON.stringify(lines).includes("reserve exhausted"), false);
+      assert.ok(lines.some((line: any) => line.msg === "outbox: selected terminal winner unavailable; deferring outcome"));
+    } finally {
+      keyed.key = key;
+      if (unavailable === "unreadable") { await fs.rmdir(file); await fs.writeFile(file, bytes); }
+    }
+    await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: 7, send });
+    await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: 7, send });
+    assert.deepEqual(bodies, [{ ...original, messages_through_seq: 42 }]);
+    assert.equal(outbox.hasPendingTerminal("r1", 7), false);
+  });
+}
+
+it("unit 1: malformed selected winner falls back to the caller body and retains invalid bytes", async () => {
+  const { outbox, root } = await mkOutbox();
+  await outbox.journalTerminal("r1", 7, "running", 1, { status: "completed", branch: "agent/original" });
+  const file = path.join(root, "r1", "terminal-7.json");
+  await fs.writeFile(file, "{");
+  const client = new FakeClient();
+  client.features.add("terminal_fence");
+  const { send, bodies } = scriptedSend([{ applied: true, status: "failed" }]);
+  await journalAndResolveTerminal(depsFor(outbox, client), { runId: "r1", claimGeneration: 7, phase: "running", messagesThroughSeq: 42, body: { status: "failed" }, send });
+  assert.deepEqual(bodies, [{ status: "failed", messages_through_seq: 42 }]);
+  assert.equal(outbox.hasPendingTerminal("r1", 7), false);
+  assert.equal(await fs.readFile(file, "utf8"), "{");
+});
+
+it("unit 1: no selected winner with unavailable key retains unjournaled fallback", async () => {
+  const { outbox } = await mkOutbox();
+  const deps = depsFor(outbox, new FakeClient());
+  const keyed = outbox as unknown as { key: Buffer | undefined };
+  const key = keyed.key;
+  const { send, bodies } = scriptedSend([{ applied: true, status: "failed" }]);
+  try {
+    keyed.key = undefined;
+    await journalAndResolveTerminal(deps, { runId: "r1", claimGeneration: 7, phase: "running", messagesThroughSeq: 42, body: { status: "failed" }, send });
+  } finally { keyed.key = key; }
+  assert.deepEqual(bodies, [{ status: "failed" }]);
+});
 
 const GEN = 7;
 const FENCE = 42;

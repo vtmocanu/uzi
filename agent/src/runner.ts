@@ -1584,11 +1584,13 @@ interface RunFlight {
   uncertainWallPark: boolean;
   /** PRD #1391 Run B M3 (N2/D5): true once ANY terminal outcome for this generation has been
    *  sent/resolved through {@link RunRunner.journalAndSendTerminal} — a run-lane completed/failed
-   *  site, the permanent-failure hook, or reportGenericFailure itself. A journaled outcome is FINAL,
-   *  so once this latches, reportGenericFailure never reports a SECOND `failed` — even after a 200
+   *  site, the permanent-failure hook, or reportGenericFailure itself — or a competing outcome has
+   *  been deferred for an unavailable selected winner. Deferral suppresses replacement without
+   *  claiming current durable adoption. The latch is set before the hook releases its resolve hold.
+   *  Once this latches, reportGenericFailure never reports a SECOND `failed` — even after a 200
    *  RETIRED the journal (which makes `hasPendingTerminal` read false), the exact fall-through this
    *  latch closes. Distinct from `hasPendingTerminal`: that reads the on-disk journal (kept), this
-   *  survives the journal's retirement. false until the first terminal resolve. */
+   *  survives the journal's retirement. false until the first terminal resolve or deferral. */
   terminalResolved: boolean;
   /** #1539: the outcome of the permanent-failure hook's pre-settle reap, or undefined when the
    *  hook never ran (every ordinary path). true iff the reap confirmed while the run was still
@@ -3783,10 +3785,12 @@ export class RunRunner {
     // Issue #1742 retirement site (a): G's terminal journal is installed, so the #1391 lease takes
     // over and the finalize-pending record is no longer needed (independent of the send below).
     if (installed.journaled) await this.retireFinalizeRecord(flight, "terminal_journal_installed");
-    // #1539: the durable install is now on disk. Run the hook (abort + reap for the permanent
-    // failure hook) BEFORE the resolve/send.
+    // #1539: run the hook (abort + reap for the permanent failure hook) after the install
+    // decision, including deferral, and BEFORE any resolve/send.
     await beforeResolve?.();
-    if (!installed.journaled) {
+    if (!installed.journaled && "deferred" in installed) {
+      // Preserve finalize and the selected winner; reach the latch before the hook releases its hold.
+    } else if (!installed.journaled) {
       // reserve_exhausted: send unjournaled. A throw here propagates (skipping the latch below), so the
       // executor catch finds NO journal and takes today's fallback — unchanged from journalAndResolveTerminal.
       await sendUnjournaledTerminal(deps, installed.canonical, fence, wrappedSend);
@@ -3800,7 +3804,7 @@ export class RunRunner {
         send: wrappedSend,
       });
     }
-    // PRD #1391 Run B M3 (N2/D5): latch that a terminal outcome for this generation has resolved, so
+    // PRD #1391 Run B M3 (N2/D5): latch terminal resolution or selected-winner deferral, so
     // a later reportGenericFailure never reports a SECOND `failed` — even after a 200 RETIRED the
     // journal (hasPendingTerminal then reads false). Skipped on a throw above (reserve_exhausted's
     // un-journaled send that failed), so that fallback still reports failed as today.
@@ -3971,23 +3975,22 @@ export class RunRunner {
     if (boundaryDiagnostic !== undefined) {
       runLog.error("codex boundary failed", { ...codexBoundaryFieldsOf(err), detail: redactText(boundaryDiagnostic) });
     }
-    // PRD #1391 Run B M3 (D5): if the permanent-failure hook tripped, AWAIT its settlement first — it
-    // journals `failed` durably and aborts the attempt (which routed us here), so the journal must be
-    // observed as installed before the hasPendingTerminal check below. Resolves immediately when the
+    // PRD #1391 Run B M3 (D5): if the permanent-failure hook tripped, AWAIT its settlement first —
+    // its install/deferral decision and latch must precede the suppression check below.
+    // The hook aborts the attempt, routing us here. Resolves immediately when the
     // breaker never tripped (every ordinary failure), so this is a no-op on the common path.
     await batcher.awaitPermanentFailureSettled();
-    // PRD #1391 Run B M3 (fact 2, D5, N2): a JOURNALED/RESOLVED outcome is FINAL. Do NOT fall through
-    // to a SECOND `failed` when EITHER a terminal outcome for this generation has already resolved
-    // (the `terminalResolved` latch — set even after a 200 RETIRED the journal, so hasPendingTerminal
-    // reads false) OR a write-ahead journal is still installed (the permanent-failure hook's durable
-    // `failed`, or a terminal site that journaled before throwing into this catch). The first durable
-    // winner stands (the no-replace install arbitrates, D4). Still close the batcher and settle
+    // PRD #1391 Run B M3 (fact 2, D5, N2): suppress a SECOND `failed` when a terminal outcome
+    // resolved or a competing outcome was deferred for an unavailable selected winner
+    // (the `terminalResolved` latch survives a 200 retiring the journal), or a pending terminal
+    // remains selected. Pending metadata alone does not claim current durable adoption.
+    // Still close the batcher and settle
     // recovery custody (clone cleanup is independent of the report).
     if (
       flight.terminalResolved ||
       (this.outbox && this.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration))
     ) {
-      runLog.info("run outcome already journaled write-ahead; not reporting a second failed", {
+      runLog.info("run outcome already selected; not reporting a second failed", {
         run_id: flight.runId,
         claim_generation: flight.claimGeneration,
       });
