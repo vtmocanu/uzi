@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ephemeral Docker mock</title>
+<style>
+  /* PRD #2278 design mock: Workers › Add a worker › Hosted workers, current vs proposal.
+     Static, throwaway, never shipped. Where it and prds/2278-ephemeral-docker-option.md
+     disagree, the PRD wins. Tokens mirror uzi's "dawn" light theme and "ember" dark. */
+  :root {
+    color-scheme: light;
+    --bg: 242 244 247; --surface: 255 255 255; --raised: 235 238 243;
+    --edge: 214 219 228; --fg: 21 26 34; --muted: 74 85 103;
+    --brand: 160 71 23; --brand-soft: 201 152 124; --on-brand: 255 255 255;
+    --note-bg: 238 241 255; --note-fg: 49 56 140;
+    --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: 8 10 15; --surface: 15 18 26; --raised: 23 27 38; --edge: 39 45 60;
+      --fg: 228 232 240; --muted: 148 158 176;
+      --brand: 251 146 60; --brand-soft: 120 80 50; --on-brand: 26 16 8;
+      --note-bg: 30 34 60; --note-fg: 190 196 255;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: 8 10 15; --surface: 15 18 26; --raised: 23 27 38; --edge: 39 45 60;
+    --fg: 228 232 240; --muted: 148 158 176;
+    --brand: 251 146 60; --brand-soft: 120 80 50; --on-brand: 26 16 8;
+    --note-bg: 30 34 60; --note-fg: 190 196 255;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: rgb(var(--bg)); color: rgb(var(--fg)); font-family: var(--font-sans); }
+  main { max-width: 1000px; margin: 0 auto; padding: 24px 16px 48px; display: grid; gap: 40px; }
+  h1 { font-size: 22px; margin: 0; }
+  .label { font-size: 12px; font-weight: 600; letter-spacing: .08em; color: rgb(var(--muted)); text-transform: uppercase; margin: 0 0 8px; }
+  .card { background: rgb(var(--surface)); border: 1px solid rgb(var(--edge)); border-radius: 14px; padding: 22px 20px; display: grid; gap: 16px; }
+  .sub { font-size: 14px; font-weight: 600; }
+  .row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; font-size: 14px; }
+  .row.center { align-items: center; gap: 28px; }
+  .field { display: grid; gap: 6px; }
+  select { font: inherit; padding: 8px 10px; border: 1px solid rgb(var(--edge)); border-radius: 8px; background: rgb(var(--raised)); color: inherit; }
+  .check { display: flex; align-items: center; gap: 8px; padding-bottom: 9px; }
+  .row.center .check { padding-bottom: 0; }
+  button.primary { background: rgb(var(--brand-soft)); color: rgb(var(--on-brand)); border: 0; border-radius: 8px; padding: 9px 16px; font: inherit; font-weight: 500; }
+  .quota { padding-bottom: 9px; font-size: 12px; color: rgb(var(--muted)); }
+  a { color: rgb(var(--brand)); }
+  p.help { margin: 0; font-size: 12px; line-height: 1.55; color: rgb(var(--muted)); }
+  .switch { display: flex; align-items: center; gap: 10px; }
+  .track { width: 36px; height: 20px; border-radius: 10px; background: rgb(var(--brand)); position: relative; display: inline-block; }
+  .track::after { content: ""; position: absolute; right: 3px; top: 3px; width: 14px; height: 14px; border-radius: 7px; background: #fff; }
+  hr { border: 0; border-top: 1px solid rgb(var(--edge)); margin: 0; }
+  .note { font-size: 12px; background: rgb(var(--note-bg)); color: rgb(var(--note-fg)); border-radius: 8px; padding: 10px 12px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<main>
+  <h1>PRD #2278: Docker-capable ephemeral workers</h1>
+
+  <section>
+    <p class="label">Current (main)</p>
+    <div class="card">
+      <p class="label">Hosted workers</p>
+      <div class="row">
+        <label class="field">Template <select><option>base</option></select></label>
+        <label class="field">Size <select><option>M — up to 2 CPU / 8Gi RAM / 10Gi disk</option></select></label>
+        <label class="check"><input type="checkbox"> Docker-capable</label>
+        <button class="primary" type="button">Provision</button>
+        <span class="quota">2 of 2 used — <a href="#">delete one to provision another</a></span>
+      </div>
+      <p class="help">A hosted worker runs in the cluster, not on your machine: there is no join token to copy and no container to start. It shows up under <strong>Your workers</strong> and comes online on its own, and you delete it there like any other worker. Tick <em>Docker-capable</em> to give its agent a rootless, isolated Docker daemon (for docker and docker compose); it costs extra CPU and storage and needs an instance that offers the docker tier.</p>
+      <div style="display:grid;gap:6px">
+        <label class="switch"><span class="track" aria-hidden="true"></span> Auto-provision on demand</label>
+        <p class="help">When on, uzi spins up a throwaway hosted worker on demand when one of your runs needs a capability no online worker has. After the run finishes, the worker may be kept warm, by default for up to 2 hours unless your admin turned that off, so a follow-up run on the same repository and branch can reuse it; then it is removed. While kept warm it still counts toward your ephemeral worker limit. This is <em>experimental</em>, and each new ephemeral worker pays a one-time ~2.6&nbsp;GiB tool-cache cold start.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="label">Proposal</p>
+    <div class="card">
+      <p class="label">Hosted workers</p>
+      <div style="display:grid;gap:10px">
+        <div class="sub">Persistent worker</div>
+        <div class="row">
+          <label class="field">Template <select><option>base</option></select></label>
+          <label class="field">Size <select><option>M — up to 2 CPU / 8Gi RAM / 10Gi disk</option></select></label>
+          <label class="check"><input type="checkbox"> Docker-capable</label>
+          <button class="primary" type="button">Provision</button>
+          <span class="quota">2 of 2 used — <a href="#">delete one to provision another</a></span>
+        </div>
+        <p class="help">Runs in the cluster, not on your machine: no join token, no container to start. It shows up under <strong>Your workers</strong> and you delete it there. <em>Docker-capable</em> gives it a Docker daemon for container builds and tests, at extra CPU and storage.</p>
+      </div>
+      <hr>
+      <div style="display:grid;gap:10px">
+        <div class="sub">Ephemeral workers</div>
+        <div class="row center">
+          <label class="switch"><span class="track" aria-hidden="true"></span> Auto-provision on demand</label>
+          <label class="check"><input type="checkbox" checked> Docker-capable</label>
+        </div>
+        <p class="help">uzi spins up a throwaway hosted worker when a run needs a capability no online worker has, or when every capable worker stays busy. It may be kept warm for up to 2 hours for a follow-up run on the same branch, and counts toward your ephemeral limit meanwhile. <em>Docker-capable</em> gives each one a Docker daemon for container builds and tests, at extra CPU and storage.</p>
+      </div>
+    </div>
+    <p class="note" style="margin-top:12px">Agreed UX: the two ephemeral controls share ONE row (no nested, indented checkbox); ONE short paragraph covers both; no "experimental" label and no cold-start size; no "rootless" promise in either section (rootless:false is a supported posture). Docker-capable is hidden when the instance offers no docker tier, saves on change, keeps its value while auto-provision is off.</p>
+  </section>
+</main>
+</body>
+</html>

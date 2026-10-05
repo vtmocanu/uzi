@@ -1,15 +1,12 @@
 package handler
 
 import (
-	"context"
 	"errors"
 	"log/slog"
 	"net/http"
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
-	"github.com/vtmocanu/uzi/api/internal/notifysvc"
-	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -82,7 +79,7 @@ func (h *Handler) WorkerCreateFinding(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	finding, notify, err := h.wsvc.CreateFinding(r.Context(), wkr, runID, workersvc.CreateFindingRequest{
+	finding, err := h.wsvc.CreateFinding(r.Context(), wkr, runID, workersvc.CreateFindingRequest{
 		Title:       req.Title,
 		Description: req.Description,
 		Location:    req.Location,
@@ -109,49 +106,5 @@ func (h *Handler) WorkerCreateFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The capture is the durable write; the notification is a best-effort side effect that
-	// must never fail the 200 (the finding is already stored). Fire the coalesced
-	// notification (D6: an event-log row that doubles as the per-run DM latch, plus the
-	// Slack DM) only when the coordinate ended up open/re-opened — a suppressed
-	// matching-hash re-report (notify==false) never notifies (the anti-nag guarantee,
-	// R2). Any error is logged and swallowed.
-	if notify {
-		h.notifyIncidentalFinding(r.Context(), finding)
-	}
-
 	httpx.JSON(w, http.StatusOK, map[string]any{"id": finding.ID.String()})
-}
-
-// notifyIncidentalFinding fires the coalesced incidental-finding notification for a
-// just-stored finding (PRD #333 M3, D6). Best-effort and nil-safe (mirrors
-// notifyReviewReady): no notifier wired ⇒ no-op; a repo lookup or delivery error is logged,
-// never surfaced (the capture already returned 200). The repo path is resolved from the
-// owner-scoped repo row and the run deep-link from the operator-set public base URL
-// (server-side, never LLM text); an unset base simply drops the link.
-func (h *Handler) notifyIncidentalFinding(ctx context.Context, finding store.IncidentalFinding) {
-	if h.notifier == nil {
-		return
-	}
-	repoPath := ""
-	if h.q != nil {
-		if repo, err := h.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: finding.RepoID, UserID: finding.UserID}); err == nil {
-			repoPath = repo.PathWithNamespace
-		}
-	}
-	base := ""
-	if h.settings != nil {
-		if b, err := h.settings.PublicBaseURL(ctx); err == nil {
-			base = b
-		}
-	}
-	if err := h.notifier.NotifyIncidentalFinding(ctx, notifysvc.IncidentalFindingNotifyInput{
-		UserID:    finding.UserID,
-		RunID:     finding.RunID,
-		RepoID:    finding.RepoID,
-		RepoPath:  repoPath,
-		FindingID: finding.ID,
-		Link:      runDeepLink(base, finding.RunID),
-	}); err != nil {
-		slog.Error("notify incidental finding", "error", err)
-	}
 }

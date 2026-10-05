@@ -83,13 +83,12 @@ metadata:
   requests.* key is counted but never enforced: a pod declaring nothing for it is
   admitted and contributes zero.
 
-  CPU and memory track the DEFAULT `m` size (issue #1341 raised m's request to 4Gi):
-  20 workers x 500m = 10 CPU and 20 x 4Gi = 80Gi requested. STORAGE tracks the WORST-CASE
-  `l` size instead — 20 x (25Gi data + 20Gi nix) = 900Gi of PVC — and is the binding
-  constraint, not CPU or memory. Raising m's memory request WITHOUT raising requests.memory
-  caps the admissible fleet below `deployments` (a QUOTA refusal no repo test catches, issue
-  #1341), so keep requests.memory = deployments x the m request. The cluster's real budget
-  is M6's rollout conversation.
+  CPU and memory track the DEFAULT size, now `l` (ADR-2240): 20 workers x 1 CPU
+  = 20 CPU and 20 x 8Gi = 160Gi requested. Keep requests aligned with deployments
+  x the default request, or admission caps the fleet below deployments (issue #1341).
+  ResourceQuotas are ceilings, not node-capacity reservations. STORAGE tracks `l`
+  too: 20 x (25Gi data + 20Gi nix) = 900Gi of PVC. Requests follow render.go. The rendered-fleet regression
+  checks CPU, memory and per-container LimitRange maxima.
 
   The data term is `l`'s 25Gi, not `m`'s 10Gi, and the nix term is 20Gi, not the 4Gi
   this comment carried until issue #224. Nothing scopes a size to a tier, so any of

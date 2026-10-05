@@ -26,6 +26,10 @@ export type ResponsesBody = { readonly model?: unknown; readonly input?: readonl
 export interface FakeProviderOptions {
   /** The exact bearer credential the app-server must present (assembled at runtime). */
   readonly credential: string;
+  /** Fixture-only request cap; default 4 MiB, opt-in bounded at 16 MiB. */
+  readonly maxRequestBytes?: number;
+  /** Optional deterministic nonzero usage for accounting characterization. */
+  readonly usage?: (responseIndex: number) => Record<string, unknown>;
   /** Produce the Responses output items for one request (mirrors M0's `respond`). */
   readonly respond: (body: ResponsesBody, provider: FakeProvider) => ResponseItem[] | Promise<ResponseItem[]>;
 }
@@ -44,7 +48,7 @@ export function bashArgCanary(): string {
 
 /** SSE framing for one Responses turn (created → output items → completed). The frozen `sse`
  *  helper is not exported by the M0 harness, so it is reproduced here (as m3a/m3b do). */
-function sse(id: string, items: ResponseItem[]): string {
+function sse(id: string, items: ResponseItem[], usage?: Record<string, unknown>): string {
   const frames = [
     { type: "response.created", response: { id } },
     ...items.map((item) => ({ type: "response.output_item.done", item })),
@@ -52,7 +56,7 @@ function sse(id: string, items: ResponseItem[]): string {
       type: "response.completed",
       response: {
         id,
-        usage: {
+        usage: usage ?? {
           input_tokens: 0, output_tokens: 0, total_tokens: 0,
           input_tokens_details: null, output_tokens_details: null,
         },
@@ -71,6 +75,8 @@ export class FakeProvider {
     private readonly server: Server,
     readonly port: number,
     private readonly credential: string,
+    private readonly maxRequestBytes: number,
+    private readonly usage: FakeProviderOptions["usage"],
     private readonly responder: (body: ResponsesBody, provider: FakeProvider) => ResponseItem[] | Promise<ResponseItem[]>,
   ) {}
 
@@ -81,6 +87,9 @@ export class FakeProvider {
   }
 
   static async start(options: FakeProviderOptions): Promise<FakeProvider> {
+    const maxRequestBytes = options.maxRequestBytes ?? MAX_BYTES;
+    if (!Number.isSafeInteger(maxRequestBytes) || maxRequestBytes < 1 || maxRequestBytes > 16 * 1024 * 1024)
+      throw new Error("m4 request cap must be an integer from 1 to 16 MiB");
     const server = createServer();
     const holder = { provider: undefined as FakeProvider | undefined };
     server.on("request", (request, response) => holder.provider?.handle(request, response));
@@ -94,7 +103,7 @@ export class FakeProvider {
     if (address === null || typeof address === "string" || address.address !== "127.0.0.1") {
       throw new Error("fake provider must bind 127.0.0.1");
     }
-    const provider = new FakeProvider(server, address.port, options.credential, options.respond);
+    const provider = new FakeProvider(server, address.port, options.credential, maxRequestBytes, options.usage, options.respond);
     holder.provider = provider;
     return provider;
   }
@@ -112,7 +121,7 @@ export class FakeProvider {
     request.setEncoding("utf8");
     request.on("data", (chunk: string) => {
       raw += chunk;
-      if (Buffer.byteLength(raw) > MAX_BYTES) request.destroy(new Error("m4 request too large"));
+      if (Buffer.byteLength(raw) > this.maxRequestBytes) request.destroy(new Error("m4 request too large"));
     });
     request.on("end", () => {
       void (async () => {
@@ -126,7 +135,7 @@ export class FakeProvider {
           this.requests.push(body);
           const items = await this.responder(body, this);
           if (response.destroyed) return;
-          const data = sse(`m4-response-${this.requests.length}`, items);
+          const data = sse(`m4-response-${this.requests.length}`, items, this.usage?.(this.requests.length));
           response.writeHead(200, { "content-type": "text/event-stream", "content-length": Buffer.byteLength(data) });
           response.end(data);
         } catch (error) {

@@ -11,6 +11,7 @@
 //      maintainer discharges every O clause with a record in the gitignored candidate manifest.
 
 import type { ClauseRow } from "./clause.js";
+import { LARGE_RESUME_TITLE } from "./large-resume-title.js";
 import { EXCEPTIONS_TITLE } from "./native-exceptions.js";
 import { CODEX_STARTUP_SMOKE_TITLE } from "./titles.js";
 import {
@@ -42,6 +43,17 @@ import {
 } from "./titles-c4.js";
 
 export const CODEX_CLAUSES: ClauseRow[] = [
+  {
+    id: "codex-p-bounded-large-cold-resume",
+    adapter: "codex",
+    layer: "P",
+    family: "Persisted context and usage replay",
+    seam: "pinned app-server with production config/auth/transport and token-accounting",
+    positiveControl: "normal persisted sub-4-MiB turns; separate full-history read measures serialized history above 4 MiB and fails the unchanged transport cap",
+    negativeOracle: "metadata-only cold resume stays below cap; next provider input contains all prior sentinels; historical replay charges zero and new usage charges only this claim",
+    intendedOutcome: "server context restoration and selected paginated replay accounting; no actual model memory or legacy recovery claim",
+    tests: [LARGE_RESUME_TITLE],
+  },
   {
     id: "codex-p-native-async-utc-exceptions",
     adapter: "codex",

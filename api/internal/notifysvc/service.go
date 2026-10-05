@@ -6,8 +6,7 @@
 //
 // Since PRD #1650 retired the in-app inbox, nothing reads the table back to a user:
 // it is a pruned, write-only event log (capped per user by DefaultUserCap, so not a
-// durable audit log) plus the per-run incidental-finding Slack DM latch
-// (NotifyIncidentalFinding). The user-facing delivery is the Slack DM.
+// durable audit log). The user-facing delivery is the Slack DM.
 //
 // One exception (issue #1675): a notification that opts into Notification.DurableSlack
 // (only the CI-autofix and MR-rework halt kinds) stores its Slack render on the row and
@@ -57,12 +56,6 @@ const SlackRetryAfter = 5 * time.Minute
 type Store interface {
 	InsertNotification(ctx context.Context, arg store.InsertNotificationParams) (store.Notification, error)
 	PruneNotificationsForUser(ctx context.Context, arg store.PruneNotificationsForUserParams) (int64, error)
-	// FindNotificationForRunKind / UpdateNotificationPayload are the PRD #333 D6
-	// per-run coalescing pair: find the run's finding notification, whatever its read
-	// state (a miss ⇒ this is the run's first finding, insert + one Slack DM), else
-	// bump its payload count WITHOUT re-firing Slack. See NotifyIncidentalFinding.
-	FindNotificationForRunKind(ctx context.Context, arg store.FindNotificationForRunKindParams) (store.Notification, error)
-	UpdateNotificationPayload(ctx context.Context, arg store.UpdateNotificationPayloadParams) (store.Notification, error)
 	// GetSecretEnablement backs the credential re-check a credential-specific alert
 	// runs before delivery (PRD #1732 D13, see NotifyEarlyReset).
 	GetSecretEnablement(ctx context.Context, arg store.GetSecretEnablementParams) (store.GetSecretEnablementRow, error)
@@ -270,11 +263,6 @@ func (s *Service) Notify(ctx context.Context, n Notification) (store.Notificatio
 	return row, nil
 }
 
-// KindIncidentalFinding is the notifications.kind for a coalesced incidental-finding
-// notification (PRD #333 D6). kind is a generic text column with no CHECK, so this needs
-// no migration; the value is the coalescing key alongside (user_id, run_id).
-const KindIncidentalFinding = "incidental_finding"
-
 // KindEarlyLimitReset is the notifications.kind for a LOUD alert that the Anthropic
 // 7-day rate limit reset EARLIER than its expected window (PRD #1020 M3). kind is a
 // generic text column with no CHECK, so this needs no migration.
@@ -284,108 +272,6 @@ const KindEarlyLimitReset = "early_limit_reset"
 // about is no longer the owner's enabled token at the revision the reading was written at
 // (PRD #1732 D13). Nothing was recorded or sent.
 var ErrCredentialNotCurrent = errors.New("credential no longer enabled at the alert's revision")
-
-// maxCoalescedFindingIDs caps the finding_ids the coalesced payload accumulates so a
-// noisy run cannot grow one row's jsonb without bound. The count keeps climbing past
-// the cap; only the id list stops appending. The per-run
-// capture cap (workersvc.MaxFindingsPerRun) is far below this, so in practice the cap is
-// defense-in-depth, not a limit users meet.
-const maxCoalescedFindingIDs = 50
-
-// IncidentalFindingPayload is the jsonb recorded for an incidental_finding
-// notification (PRD #333 D6). run_id/repo_id anchor it; repo_path is the human label;
-// count is the coalesced headline ("Run flagged M findings") and finding_ids the deep-link
-// set. All fields are server-built from the run/repo, never untrusted agent text (the
-// finding's title/location live on the backlog behind the deep link, already sanitised).
-type IncidentalFindingPayload struct {
-	RunID      uuid.UUID   `json:"run_id"`
-	RepoID     uuid.UUID   `json:"repo_id"`
-	RepoPath   string      `json:"repo_path"`
-	Count      int         `json:"count"`
-	FindingIDs []uuid.UUID `json:"finding_ids"`
-}
-
-// IncidentalFindingNotifyInput carries everything NotifyIncidentalFinding needs. Every
-// field is server-derived (the run/repo the api resolved, the server-built deep link) —
-// no untrusted agent text rides in here.
-type IncidentalFindingNotifyInput struct {
-	UserID    uuid.UUID
-	RunID     uuid.UUID
-	RepoID    uuid.UUID
-	RepoPath  string
-	FindingID uuid.UUID
-	Link      string
-}
-
-// NotifyIncidentalFinding is the PRD #333 D6 coalescing entry point: a finding with no
-// latch row for its (user, run) inserts one row and fires one Slack DM (via the existing
-// Notify persist-first + prune + Slack path); a later finding for the SAME run finds that
-// row, bumps its payload count and appends the finding id WITHOUT re-firing Slack. The
-// lookup ignores read state (PRD #1650 D4), so a row read before the inbox was retired
-// still latches.
-//
-// Coalescing is BEST-EFFORT, not exactly-once: the per-user prune (DefaultUserCap) can
-// evict a long run's latch row, and two concurrent first findings on one run can both
-// miss the lookup before either inserts. Either case sends the user a second DM. The
-// caller resolves whether to notify at all (a suppressed matching-hash re-report never
-// calls this, R2) and logs-and-swallows any error — the finding is already durably stored,
-// so a notification failure must never fail the capture.
-func (s *Service) NotifyIncidentalFinding(ctx context.Context, in IncidentalFindingNotifyInput) error {
-	existing, err := s.q.FindNotificationForRunKind(ctx, store.FindNotificationForRunKindParams{
-		UserID: in.UserID,
-		RunID:  in.RunID,
-		Kind:   KindIncidentalFinding,
-	})
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		// No latch row ⇒ treated as the run's FIRST finding: persist the row and fire one
-		// Slack DM. Notify owns persist-first + prune + best-effort Slack.
-		runID := in.RunID
-		_, nerr := s.Notify(ctx, Notification{
-			UserID: in.UserID,
-			Kind:   KindIncidentalFinding,
-			Payload: IncidentalFindingPayload{
-				RunID:      in.RunID,
-				RepoID:     in.RepoID,
-				RepoPath:   in.RepoPath,
-				Count:      1,
-				FindingIDs: []uuid.UUID{in.FindingID},
-			},
-			RunID: &runID,
-			Slack: &SlackRender{
-				Title: "🐛 Run flagged an incidental finding",
-				Body:  in.RepoPath,
-				Link:  in.Link,
-				Emoji: "🐛",
-			},
-		})
-		return nerr
-	case err != nil:
-		return err
-	default:
-		// A latch row exists ⇒ a SUBSEQUENT finding on the same run: bump the count and
-		// append the id, then rewrite the payload. NO Slack (D6: the DM fired on the first
-		// finding).
-		var payload IncidentalFindingPayload
-		if derr := json.Unmarshal(existing.Payload, &payload); derr != nil {
-			return derr
-		}
-		payload.Count++
-		if len(payload.FindingIDs) < maxCoalescedFindingIDs {
-			payload.FindingIDs = append(payload.FindingIDs, in.FindingID)
-		}
-		b, merr := json.Marshal(payload)
-		if merr != nil {
-			return merr
-		}
-		_, uerr := s.q.UpdateNotificationPayload(ctx, store.UpdateNotificationPayloadParams{
-			Payload: b,
-			ID:      existing.ID,
-			UserID:  in.UserID,
-		})
-		return uerr
-	}
-}
 
 // EarlyResetPayload is the jsonb recorded for an early_limit_reset notification
 // (PRD #1020 M3). title is the fixed headline; expected/observed

@@ -239,7 +239,8 @@ import (
 //   notifications.sql (8)  — every row a user's inbox rendered, all owner-scoped. Drift here was
 //     silent and permanently visible: a wrong unread badge is the bug a user reports and nobody
 //     can reproduce. (PRD #1650 M2 retired the inbox read path and deleted six of those queries;
-//     the file now holds the write seam, the prune and the finding-coalescing pair.)
+//     Issue #2271 M1 retired the finding-coalescing pair; the file now holds the write seam,
+//     prune and durable Slack delivery queries.)
 //   agent_memory.sql (6)   — user+repo scoped reads plus an eviction that DELETES, so a lost
 //     predicate either leaks another tenant's notes into a prompt or destroys the wrong rows.
 //
@@ -717,8 +718,8 @@ var queryInventory = []queryPin{
 	// ── notifications.sql — the pruned event log (PRD #1650 D4); durable halt rows are ──
 	// read back by the Slack redelivery sweep (issue #1675) ──
 	// The inbox read path (list, counts, admin all-view, mark-read) was deleted by PRD #1650
-	// M2 along with its six queries. What remains is the write seam and the per-user prune,
-	// pinned here, and the incidental-finding coalescing pair further down.
+	// M2 along with its six queries. The write seam and per-user prune remain pinned here;
+	// issue #2271 also retired the incidental-finding coalescing queries.
 	{"PruneNotificationsForUser", "notifications.sql", "TestNotificationsPruneLiveDB",
 		"direct call through the prune helper in notifications_integration_test.go, driven by " +
 			"several subtests. Discriminating: under-cap keeps everything, over-cap deletes exactly " +
@@ -985,21 +986,6 @@ var queryInventory = []queryPin{
 			"NULL, and it reappears in the to_file bucket / open_count) while a `filing` coordinate " +
 			"with a FRESH filing_since (within the cutoff) is NOT reset — the clamp that protects a " +
 			"slow-but-alive CreateIssue mid-flight (M5 review reaper)"},
-
-	// ── notifications.sql — the PRD #333 D6 coalescing plumbing (M1 lands the queries; M3 uses them) ──
-	{"FindNotificationForRunKind", "notifications.sql", "TestFindNotificationForRunKindIgnoresReadStateLiveDB",
-		"direct call, both directions (PRD #1650 D4, renamed from FindUnreadNotificationForRunKind " +
-			"and widened to ignore read_at): a (user, run, kind) row whose read_at was set by a raw " +
-			"UPDATE is still returned (the regression that would re-fire the incidental-finding DM), " +
-			"the newest of two matching rows wins, and another run, another kind or another user " +
-			"each get pgx.ErrNoRows. The coalesce-vs-fire decision on top of it is asserted in " +
-			"internal/notifysvc (TestNotifyIncidentalFindingCoalescesPerRun, a fake Store)"},
-	{"UpdateNotificationPayload", "notifications.sql", unpinnedPin,
-		"PRD #333 M3 drives this query from the same notifysvc.NotifyIncidentalFinding coalescing path, " +
-			"exercised by TestNotifyIncidentalFindingCoalescesPerRun in internal/notifysvc (outside " +
-			"inventoryPackages, a fake Store). That test asserts the row count stays 1 while the payload " +
-			"count bumps to 2 — the UPDATE ... WHERE id AND user_id RETURNING this query is. UNPINNED " +
-			"because no store/handler live-DB test executes it; the honest pin lives in notifysvc."},
 }
 
 var sqlQueryNameRe = regexp.MustCompile(`(?m)^-- name: (\w+) `)

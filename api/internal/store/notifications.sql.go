@@ -76,53 +76,6 @@ func (q *Queries) ClaimPendingSlackNotifications(ctx context.Context, arg ClaimP
 	return items, nil
 }
 
-const findNotificationForRunKind = `-- name: FindNotificationForRunKind :one
-
-SELECT id, user_id, kind, payload, run_id, review_id, read_at, created_at, slack_render, slack_attempts, slack_attempted_at, slack_delivered_at FROM notifications
-WHERE user_id = $1
-  AND run_id = $2::uuid
-  AND kind = $3
-ORDER BY created_at DESC, id DESC
-LIMIT 1
-`
-
-type FindNotificationForRunKindParams struct {
-	UserID uuid.UUID `json:"user_id"`
-	RunID  uuid.UUID `json:"run_id"`
-	Kind   string    `json:"kind"`
-}
-
-// ── PRD #333 Incidental Findings: the per-run finding coalescing plumbing (D6) ──
-// notifysvc.Notify is INSERT-only, so "N findings on one run → one Slack DM" needs the
-// lookup + payload bump below.
-// Find the coalescing latch row for a (user, run, kind): the newest notification of this
-// kind anchored to this run. notifysvc.NotifyIncidentalFinding calls this for each
-// finding: a hit means bump the existing row's payload count (below) with NO new Slack
-// DM; a miss (pgx.ErrNoRows) means this is the run's first finding, so insert and fire
-// one Slack DM. Scoped to the caller and their run. Read state is deliberately ignored
-// (PRD #1650 D4): nothing marks a row read any more, and a row read before the inbox was
-// retired must still latch. Best-effort, not exactly-once: the per-user prune can evict
-// the latch row during a long run, and two concurrent first findings can both miss.
-func (q *Queries) FindNotificationForRunKind(ctx context.Context, arg FindNotificationForRunKindParams) (Notification, error) {
-	row := q.db.QueryRow(ctx, findNotificationForRunKind, arg.UserID, arg.RunID, arg.Kind)
-	var i Notification
-	err := row.Scan(
-		&i.ID,
-		&i.UserID,
-		&i.Kind,
-		&i.Payload,
-		&i.RunID,
-		&i.ReviewID,
-		&i.ReadAt,
-		&i.CreatedAt,
-		&i.SlackRender,
-		&i.SlackAttempts,
-		&i.SlackAttemptedAt,
-		&i.SlackDeliveredAt,
-	)
-	return i, err
-}
-
 const insertNotification = `-- name: InsertNotification :one
 
 INSERT INTO notifications (user_id, kind, payload, run_id, review_id,
@@ -147,7 +100,7 @@ type InsertNotificationParams struct {
 // The table is generic (kind + payload jsonb) so any producer can record an event
 // without a schema change. Nothing reads it back to a user any more: it is a pruned,
 // write-only event log (not a durable audit log; PruneNotificationsForUser caps it per
-// user) plus the per-run incidental-finding Slack DM latch (FindNotificationForRunKind).
+// user).
 // The read_at column stays in the schema but nothing sets or reads it.
 // Exception (issue #1675): durable halt kinds carry a stored Slack render in slack_render
 // and are read back by the Slack redelivery sweep (ClaimPendingSlackNotifications), so
@@ -242,44 +195,4 @@ func (q *Queries) PruneNotificationsForUser(ctx context.Context, arg PruneNotifi
 		return 0, err
 	}
 	return result.RowsAffected(), nil
-}
-
-const updateNotificationPayload = `-- name: UpdateNotificationPayload :one
-UPDATE notifications
-SET payload = $1
-WHERE id = $2 AND user_id = $3
-RETURNING id, user_id, kind, payload, run_id, review_id, read_at, created_at, slack_render, slack_attempts, slack_attempted_at, slack_delivered_at
-`
-
-type UpdateNotificationPayloadParams struct {
-	Payload []byte    `json:"payload"`
-	ID      uuid.UUID `json:"id"`
-	UserID  uuid.UUID `json:"user_id"`
-}
-
-// Bump a coalesced notification's payload without re-firing Slack (D6). The caller
-// rewrites payload.count (and finding_ids) on the row FindNotificationForRunKind returned,
-// so the event log records "Run #N flagged M findings" while the Slack DM fired once, on
-// the first finding. RETURNING * so the caller can echo the updated row. The
-// (id, user_id) match is defense-in-depth: the caller always passes the row
-// FindNotificationForRunKind returned for this same user, so a foreign id can never be
-// updated even if a caller is ever wired to pass an untrusted id.
-func (q *Queries) UpdateNotificationPayload(ctx context.Context, arg UpdateNotificationPayloadParams) (Notification, error) {
-	row := q.db.QueryRow(ctx, updateNotificationPayload, arg.Payload, arg.ID, arg.UserID)
-	var i Notification
-	err := row.Scan(
-		&i.ID,
-		&i.UserID,
-		&i.Kind,
-		&i.Payload,
-		&i.RunID,
-		&i.ReviewID,
-		&i.ReadAt,
-		&i.CreatedAt,
-		&i.SlackRender,
-		&i.SlackAttempts,
-		&i.SlackAttemptedAt,
-		&i.SlackDeliveredAt,
-	)
-	return i, err
 }

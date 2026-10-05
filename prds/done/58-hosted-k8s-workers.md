@@ -1,5 +1,7 @@
 # PRD #58: Hosted k8s workers — self-service worker provisioning
 
+The original `m` default below is superseded by [ADR-2240](../../adr/2240-hosted-worker-default-size.md): new hosted workers default to `l`. The earlier decision log remains the implementation history.
+
 **GitLab Issue**: [#58](https://github.com/vtmocanu/uzi/issues/58)
 **Status**: DONE — **released in v0.3.0**, hosted workers live on dev-cluster (feature merge `6098104`, release `3da61c3`). M1–M7 all landed; GitLab issue #58 closed. Moved to `done/` 2026-07-25.
 

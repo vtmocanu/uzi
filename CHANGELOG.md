@@ -24,6 +24,21 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **New hosted workers default to the large preset ([#2240](https://github.com/vtmocanu/uzi/issues/2240)).**
+  Ephemeral provisioning defaults and falls back to L, and the persistent provision form preselects L. Existing workers keep their sizes; new workers reserve more CPU and memory capacity.
+
+### Added
+
+- **Workers join the TUI floor and split view ([#2275](https://github.com/vtmocanu/uzi/issues/2275)).**
+  The attention-ordered workers list and four-section worker detail share polling and own/factory scope with the floor fleet summary. Enter opens a worker or its reported run; uppercase `W` links a run to its worker, while Esc preserves the original return target and reopens runs with fresh metadata, transcript tail and stream. Wide floor rows show worker names. Tabs are now `1 floor · 2 workers · 3 pulls · 4 ci`; floor/workers occupy the split's top pane, with collapse retaining that tab and automatic restore at 43 rows (minimum 41).
+
+## [0.85.2] - 2026-10-05
+
+### Changed
+
+- **Findings stay in the backlog; admin health DMs cover instance danger ([#2271](https://github.com/vtmocanu/uzi/issues/2271)).**
+  Findings keep capture and triage without Slack DMs or new notification latch rows; admin notices select danger only for `db`, `controller.report`, `loops` and `fleet.roll`, while full health views, overall-episode timing and owner run-health DMs stay unchanged.
+
 - **Codex Read returns bounded text excerpts ([#296](https://github.com/vtmocanu/uzi/issues/296)).**
   Text reads support one-based line offsets and limits, default to 200 lines, and return at most 64 KiB with excerpt metadata; unranged binary reads preserve exact base64, while malformed or oversized helper responses fail with neutral denials.
 
@@ -35,13 +50,13 @@ through `[0.52.0]`.)
 
 ### Added
 
-- **Workers join the TUI floor and split view ([#2275](https://github.com/vtmocanu/uzi/issues/2275)).**
-  The attention-ordered workers list and four-section worker detail share polling and own/factory scope with the floor fleet summary. Enter opens a worker or its reported run; uppercase `W` links a run to its worker, while Esc preserves the original return target and reopens runs with fresh metadata, transcript tail and stream. Wide floor rows show worker names. Tabs are now `1 floor · 2 workers · 3 pulls · 4 ci`; floor/workers occupy the split's top pane, with collapse retaining that tab and automatic restore at 43 rows (minimum 41).
-
 - **See the estimated usage of an interrupted Claude session apart from the metered total ([#2014](https://github.com/vtmocanu/uzi/issues/2014)).**
   Usage after the last SDK result of a parked, stopped or crashed Claude run is recorded and shown as "Estimated, not metered" on the run page and as an EST. TAIL row in `uzi run get` (and `usage_estimated_tail` in its JSON), with price-table provenance, "cost unknown" when unpriced and a plain-words coverage note; it is never added to the metered total, usage aggregates or any budget.
 
 ### Fixed
+
+- **Codex resumes stay bounded and report incomplete usage explicitly ([#2267](https://github.com/vtmocanu/uzi/issues/2267)).**
+  Root resume excludes returned turns while preserving saved model context and the 4 MiB frame cap. If resumed usage lacks a known baseline, execution continues with a persisted notice and unavailable token totals. Released workers receive this protection after an agent release and worker roll.
 
 - **Automatic MR rework works for Codex-only owners ([#2084](https://github.com/vtmocanu/uzi/issues/2084)).**
   Codex source runs can enter automatic MR rework without an Anthropic token; creation still refuses an unusable inherited Codex harness without falling back to Claude. Claude source runs require an enabled Anthropic token.
@@ -102,7 +117,7 @@ through `[0.52.0]`.)
   Generic failure logs, feed events and stored reasons replace control and bidirectional formatting characters after secret redaction, while preserving the existing 512-character report limit.
 - **A run's forge token and caches stay protected when a leftover process survives the reap ([#1828](https://github.com/vtmocanu/uzi/issues/1828)).**
   On a Claude run, a process carrying the run's HOME that the worker could not kill, or a reap that could not finish, now blocks every step that publishes or settles the run (finalize push, failure settlement, pause, completion hold, wall park, credential switch, recovery and checkpoint publishes) the same way an unproven clone does: the run keeps custody, keeps running (a failed pause) or fails with `worker_residue_blocked`. A re-claimed run reaps its HOME before its clone fetch, and a park or the periodic disk reclaim drops the run's rebuildable caches only once no such process is left.
-- **Worker upgrade waits no longer trigger premature capacity alarms (#2184).**
+- **Worker upgrade waits no longer trigger premature capacity alarms ([#2184](https://github.com/vtmocanu/uzi/pull/2184)).**
   Run health identifies currently suitable draining workers; admin capacity confirms each upgrade wait, preserves genuine five-minute alarms, and reports overdue upgrade waits after 24 hours of overlap.
 - **Codex runs keep their work when a refresh response is lost ([#1770](https://github.com/vtmocanu/uzi/issues/1770)).**
   Updated workers reconcile the refresh once, then keep the work, session and custody while a vault lock or unknown outcome prevents safe recovery. Runs resume after unlock and recovery checks without spending the original refresh token again; no merge request opens before a successful resume. Deploy the API before the updated workers; older workers keep their first-request vault-lock reply but still need the worker update to survive a lost response.
@@ -4830,7 +4845,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.85.1...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.85.2...HEAD
+[0.85.2]: https://github.com/vtmocanu/uzi/compare/v0.85.1...v0.85.2
 [0.85.1]: https://github.com/vtmocanu/uzi/compare/v0.85.0...v0.85.1
 [0.85.0]: https://github.com/vtmocanu/uzi/compare/v0.84.0...v0.85.0
 [0.84.0]: https://github.com/vtmocanu/uzi/compare/v0.83.1...v0.84.0

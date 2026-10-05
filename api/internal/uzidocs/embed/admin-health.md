@@ -52,12 +52,26 @@ It surfaces five ways:
   `UPGRADE`, `BLOCKING`) on `uzi admin workers`, which previously showed no
   upgrade information at all for another user's worker.
 - **One notice per admin per Danger episode**, as a Slack DM for a linked
-  admin — because a tab nobody is looking at does not wake anyone. It fires
-  on the evaluation *after* the one that opened the
-  episode (a one-tick danger blip that recovers on the next tick opens and
-  closes an episode and notifies nobody), and it is gated by the same
-  "Enable run-health detection" (`health_enabled`) setting the run-health
-  detector uses — there is no separate notification toggle for this feature.
+  admin, selects only `danger` checks with the literal IDs `db`,
+  `controller.report`, `loops`, or `fleet.roll`. By maintainer decision,
+  `fleet.roll` is instance infrastructure even when the hosted workers belong
+  to a single owner. Owner checks, including `queue.waiting`, `fleet.capacity`,
+  and `queue.undispatched`, and future nonallowlisted IDs never trigger an admin
+  DM or appear in its check list.
+
+  The two-tick debounce still follows **overall danger**, not the notice
+  subset: the opening evaluation sends nothing. Owner-only danger can open
+  and hold an episode without consuming an admin notice claim; an allowlisted
+  instance danger arriving later sends on its **first tick** in that already
+  open episode. Once notified, a second instance failure does not send another
+  notice while owner danger holds the episode open. Overall recovery closes
+  the episode and rearms notices. A one-tick overall danger blip that recovers
+  on the next tick notifies nobody. Notices use the same "Enable run-health
+  detection" (`health_enabled`) setting as the run-health detector.
+
+  The Health tab, Overview card, CLI, Danger banner and snooze still use the
+  full check registry and overall status. Owner run-health DMs, including a
+  `waiting_worker` capability reason, keep their existing routing.
 
 A non-admin gets none of the above. Instead, Overview shows a single platform
 line — "Your hosted workers cannot start right now… This is a platform
@@ -98,7 +112,8 @@ or `na`.
 - The **overall status** is the worst of `danger`, then `warn`; `unknown`
   ranks as `warn` for that rollup, and `na` never contributes (an all-`na`,
   all-`ok` deployment — compose, with no hosted workers and no Slack — reads
-  overall `ok`). **Only `danger` raises the banner and sends a notice.**
+  overall `ok`). **Overall `danger` raises the banner; admin notices require
+  an allowlisted instance check at `danger`**, as described above.
 - A **worker roll in progress never alarms.** Only a pod actually stuck
   (`CrashLoopBackOff`, `ImagePullBackOff`, `ErrImagePull`,
   `CreateContainerConfigError`, `CreateContainerError`, `InvalidImageName`)

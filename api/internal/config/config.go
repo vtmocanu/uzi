@@ -720,7 +720,7 @@ type Config struct {
 	EphemeralMaxPerUser int
 
 	// EphemeralDefaultSize is the workersize preset every ephemeral worker is provisioned
-	// at (UZI_EPHEMERAL_DEFAULT_SIZE, default "m"). v1 provisions at a fixed default
+	// at (UZI_EPHEMERAL_DEFAULT_SIZE, default "l"). v1 provisions at a fixed default
 	// because a run's size_class is empty on the pre-claim trigger path (it is only
 	// written post-plan); size-aware provisioning is a Path-2 follow-on. Validated against
 	// the workersize vocabulary at load — an unknown preset the controller cannot resolve
@@ -1298,12 +1298,12 @@ func Load() (Config, error) {
 	// The default size must be a preset the controller can resolve — an unknown value
 	// would provision a worker that never renders and sits pending until its token
 	// expires (workersize's own doc). Reject a bad value at load rather than at use, and
-	// fall back to "m" with a boot warning so a typo cannot silently disable the feature.
-	cfg.EphemeralDefaultSize = strings.TrimSpace(getenv("UZI_EPHEMERAL_DEFAULT_SIZE", "m"))
+	// fall back to "l" with a boot warning so a typo cannot silently disable the feature.
+	cfg.EphemeralDefaultSize = strings.TrimSpace(getenv("UZI_EPHEMERAL_DEFAULT_SIZE", "l"))
 	if !workersize.Valid(cfg.EphemeralDefaultSize) {
-		slog.Warn("UZI_EPHEMERAL_DEFAULT_SIZE is not a known worker size preset; falling back to \"m\"",
+		slog.Warn("UZI_EPHEMERAL_DEFAULT_SIZE is not a known worker size preset; falling back to \"l\"",
 			"configured", cfg.EphemeralDefaultSize, "valid", workersize.Names)
-		cfg.EphemeralDefaultSize = "m"
+		cfg.EphemeralDefaultSize = "l"
 	}
 	// PRD #422: the concrete pinned hosted-worker image tag (deploy's workers.image.tag),
 	// used as the hosted-worker upgrade-badge target. Optional, unvalidated at load (empty

@@ -50,7 +50,7 @@ There is no CORS configuration to make, by design: nginx serves the SPA and prox
 
 ## Hosted k8s workers (PRD #58)
 
-k8s-only: nothing here applies to compose, and every variable below is set by the Helm chart, not hand-edited — this table exists for completeness and for anyone reading the chart's rendered env. See [Hosted workers](hosted-workers.md) for the user-facing feature, [Admin settings](admin-settings.md#hosted-worker-quota) for the per-user quota, and [deploy/README.md](../deploy/README.md#hosted-workers-prd-58) for the operator rollout runbook (turning it on, rotating the controller token, and the residuals that are only proven on a real cluster).
+k8s-only: nothing here applies to compose. Configure these variables through the Helm chart; optional variables left unset use the code defaults below. See [Hosted workers](hosted-workers.md) for the user-facing feature, [Admin settings](admin-settings.md#hosted-worker-quota) for the per-user quota, and [deploy/README.md](../deploy/README.md#hosted-workers-prd-58) for the operator rollout runbook (turning it on, rotating the controller token, and the residuals that are only proven on a real cluster).
 
 ### `api`
 
@@ -59,6 +59,7 @@ k8s-only: nothing here applies to compose, and every variable below is set by th
 | `WORKER_HOSTING_ENABLED` | `false` | The feature gate. `true` requires `WORKER_HOSTING_CONTROLLER_TOKEN_SHA256` to also be set, or the api refuses to boot — enabling hosting with no way to authenticate a controller would be a silent no-op, and this is a security control rather than a tuning knob, so a malformed value also refuses to start. |
 | `WORKER_HOSTING_CONTROLLER_TOKEN_SHA256` | — | The sha256 (hex) of the controller's bearer credential, generated once with `openssl rand -base64 32` and hashed. Setting this while `WORKER_HOSTING_ENABLED` is `false` also refuses to boot — a hash with nothing to gate it is a stray credential the api would silently ignore. |
 | `WORKER_HOSTING_PENDING_TOKEN_TTL` | `1h` | How long a hosted worker's join token may sit sealed in Postgres, undelivered, before the expiry sweep destroys it. Read regardless of `WORKER_HOSTING_ENABLED`, so a stack that provisioned workers and then turned hosting off doesn't strand ciphertext. `0` disables the sweep — an undelivered token then stays sealed under `UZI_SECRET_KEY` indefinitely; see [vault-threat-model.md](vault-threat-model.md#hosted-worker-join-tokens-prd-58). |
+| `UZI_EPHEMERAL_DEFAULT_SIZE` | `l` | Size preset for new ephemeral hosted workers (`s`, `m`, or `l`). Invalid values fall back to `l` with a boot warning. Set an override through `api.env` in the chart; the commented example is optional. Existing workers keep their stored size. The persistent provision form also preselects `l`, while its API requires an explicit size. |
 
 ### `controller`
 
