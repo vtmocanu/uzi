@@ -200,8 +200,10 @@ function failingClone(): () => number {
   return () => calls;
 }
 
+const LINUX_ONLY = process.platform !== "linux" ? "no /proc/self/fd on this host: descriptor-pinned removal requires Linux" : false;
+
 describe("RunRunner — data_volume_full park at clone/fetch (PRD #1809 M5, D6)", () => {
-  it("REGRESSION #1798: a resume whose first fetch hits ENOSPC on a full data volume parks recovery_wait/data_volume_full instead of failing", async () => {
+  it("REGRESSION #1798: a resume whose first fetch hits ENOSPC on a full data volume parks recovery_wait/data_volume_full instead of failing", { skip: LINUX_ONLY }, async () => {
     await withHome("uzi-diskpark-resume-", async (homeRoot) => {
       const client = new DiskParkClient([FEATURE, FENCE, ECHO, "recovery_park_cause"]);
       const { factory, runHome } = homeFactory(homeRoot, { resume: true });

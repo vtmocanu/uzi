@@ -94,7 +94,8 @@ import {
 import { classifyLimitEvidence, LimitReachedError } from "./limit.js";
 import { PauseNowSignal, CredentialSwitchSignal, PLAN_APPROVAL_TIMEOUT_REASON, type PlanVerdict } from "./steering.js";
 import { DiskParkSignal } from "./cache-cap.js";
-import { type RunProcessReap, type RunProcessScan, reapRunProcesses, scanRunProcesses } from "./run-procs.js";
+import { type RunProcessOps, type RunProcessReap, type RunProcessScan, defaultRunProcessOps } from "./run-procs.js";
+export type { RunProcessOps } from "./run-procs.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { buildForgeToolsServer, FORGE_SERVER_NAME } from "./forge-tools.js";
 import { buildFindingsToolsServer, FINDINGS_SERVER_NAME } from "./findings-tools.js";
@@ -479,18 +480,6 @@ function emitEnvironmentFactsStatus(ctx: RunContext, facts: EnvFacts): void {
   if (text) ctx.emit({ kind: "status", agent: "worker", payload: { text } });
 }
 
-/** PRD #1809 D4: the run-process attribution the executor uses (see run-procs.ts). */
-export interface RunProcessOps {
-  /** `spawnedPids`: the run's live CLI pids, which link an unreadable descendant to the run. */
-  scan: (home: string, worktree: string | undefined, spawnedPids: readonly number[]) => Promise<RunProcessScan>;
-  reap: (home: string, worktree: string | undefined, spawnedPids: readonly number[]) => Promise<RunProcessReap>;
-}
-
-const defaultRunProcesses: RunProcessOps = {
-  scan: (home, worktree, spawnedPids) => scanRunProcesses(home, worktree, spawnedPids),
-  reap: (home, worktree, spawnedPids) => reapRunProcesses(home, worktree, spawnedPids),
-};
-
 /**
  * PRD #1809 D4: throw the hard layer's COUNTED disk park when the worker-local `disk` stop is set
  * (steering's sticky pause mode). Called at every implement boundary and on every path that clears
@@ -825,7 +814,7 @@ export class SdkExecutor implements Executor {
     this.cliGroupPresent = opts.cliGroupPresent ?? processGroupPresent;
     this.rootStartTime = opts.rootStartTime;
     this.quietSettleMs = opts.quietSettleMs ?? QUIET_SETTLE_MS;
-    this.runProcesses = opts.runProcesses ?? defaultRunProcesses;
+    this.runProcesses = opts.runProcesses ?? defaultRunProcessOps();
     this.envProbeSpawner = opts.envProbeSpawner;
     this.secretPaths = opts.secretPaths ?? [];
     // Provisioning HOME + root are SHARED worker-lifetime paths (Decision 5): they

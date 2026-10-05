@@ -390,6 +390,16 @@ function firstStrField(args: unknown, keys: readonly string[]): string | undefin
   return undefined;
 }
 
+/** Pick the first nonblank assignment without changing its text. A dispatch
+ * description is a fallback label, used only when dedicated instructions are blank. */
+export function delegationTaskInput(args: unknown): string | undefined {
+  for (const key of ["prompt", "task", "input", "message", "description"]) {
+    const value = strField(args, key);
+    if (value !== undefined && value.trim().length > 0) return value;
+  }
+  return undefined;
+}
+
 /** A string field of `args` that MAY be the empty string (e.g. an Edit `new_string`
  *  that deletes text), distinct from {@link strField}'s non-empty contract. Returns
  *  undefined only when the key is absent or not a string. */
@@ -936,6 +946,9 @@ export class CodexCallbackBroker {
     if (role === undefined) return deny("bad_args", "delegation requires a target role");
     if (!this.allowedRoles.has(role)) {
       return deny("unknown_role", `role "${safeId(role)}" is not a known delegation target`);
+    }
+    if (delegationTaskInput(args) === undefined) {
+      return deny("bad_args", "delegation requires nonblank instructions in prompt, task, input, message, or description");
     }
     // Await the child SYNCHRONOUSLY: the parent callback resolves only after it settles.
     const child = await this.delegateSeam({ tool: canonical, role, args, parent: rt });

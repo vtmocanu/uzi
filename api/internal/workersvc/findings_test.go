@@ -64,6 +64,26 @@ func TestCanonicalizeLocationSymbolLineNumberStrip(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeLocationLineRanges(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"api/foo.go:439-462", "api/foo.go"},
+		{"api/foo.go:459", "api/foo.go"},
+		{"api/foo.go:12:5", "api/foo.go"},
+		{"api/foo.go:439-462#sweepLoop", "api/foo.go#sweeploop"},
+		{"api/foo.go#sweepLoop:439-462", "api/foo.go#sweeploop"},
+		{"api/foo.go:439-462#otherLoop:459", "api/foo.go#otherloop"},
+		{"api/foo.go:v2-final", "api/foo.go:v2-final"},
+		{"api/foo.go#sweepLoop:v2-final", "api/foo.go#sweeploop:v2-final"},
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			if got := canonicalizeLocation(c.in, MaxFindingLocationBytes); got != c.want {
+				t.Errorf("canonicalizeLocation(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
 func TestCanonicalizeLocationBoundsAndEmpty(t *testing.T) {
 	if got := canonicalizeLocation("   ###   ", MaxFindingLocationBytes); got != "" {
 		t.Errorf("an all-punctuation location must canonicalise to empty, got %q", got)

@@ -23,6 +23,7 @@ import { getEventListeners } from "node:events";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -32,7 +33,9 @@ import type { RunRunner, RunnerOptions } from "../src/runner.js";
 import { StubExecutor, type Executor } from "../src/executor.js";
 import type { AgentTemplate, ClaimResponse, StateRequest, UserInput } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
-import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith, simulateCommittedWork } from "./runner-harness.js";
+import { forceIncompleteHomeHelper } from "./forced-home-helper.js";
+import { scanRunProcesses, reapRunProcesses } from "../src/run-procs.js";
+import { TOKEN, api, baseUrl, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith, simulateCommittedWork } from "./runner-harness.js";
 
 installHarness();
 
@@ -57,6 +60,23 @@ const AGENTS: AgentTemplate[] = [
 const SELECTION = JSON.stringify({ source: "own", exclusions: ["reviewer"] });
 const SELECTION_STATUS = "implementing with your agent templates (coder)";
 const DEFAULT_SELECTION_STATUS = "implementing with your agent templates (reviewer, coder)";
+
+// Issue #1920: shutdown must not wait out a full input-GET timeout or backoff.
+// This generous bound guards that regression, rather than normal scheduling latency.
+const SHUTDOWN_PROMPTNESS_MS = 15_000;
+async function promptly(done: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      done,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("shutdown exceeded the #1920 promptness bound")), SHUTDOWN_PROMPTNESS_MS);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 const STATUS_RESUME_WITH_REVISION =
   "resuming at the plan gate with a revision the owner sent before the claim was released — revising the submitted plan instead of re-presenting it";
@@ -304,7 +324,9 @@ class Scenario {
     const { gitlab } = fakeGitlab();
     const runner = runnerWith(
       () => ({
-        executor: opts.executor?.() ?? new SdkExecutor(nullLogger(), this.home, { queryFn: this.model.queryFn() }),
+        executor: opts.executor?.() ?? new SdkExecutor(nullLogger(), this.home, {
+          queryFn: this.model.queryFn(),
+        }),
         homeDir: this.home,
       }),
       gitlab,
@@ -346,11 +368,11 @@ class Scenario {
     await Promise.race([flight.done, tick(10_000)]);
   }
 
-  /** Shut a flight down (the worker's graceful stop) and require a clean, bounded unwind. */
+  /** Require graceful shutdown to settle promptly, without a full input-GET timeout. */
   async shutdown(flight: Flight): Promise<void> {
     flight.runner.shutdown();
-    assert.ok(await until(() => flight.finished, 2_000), "shutdown ended the gate flight within two seconds");
-    await flight.done;
+    await promptly(flight.done);
+    assert.equal(flight.finished, true, "shutdown settled the gate flight");
     assert.equal(flight.error, undefined, "shutdown completed without an execution error");
     assert.equal(this.rowsOf("cancel").length, 0, "shutdown needed no cancel input");
   }
@@ -449,7 +471,7 @@ class Scenario {
   }
 }
 
-/** Only selected callback failures collect diagnostics, before Scenario.teardown changes the evidence. */
+/** Collect callback failures before Scenario.teardown changes the evidence; omit input and plan bodies. */
 function scenarioFailureDiagnostic(s: Scenario, label: string): string {
   const text = (value: string | undefined): string =>
     value === undefined ? "<absent>" : value.length > 400 ? value.slice(0, 400) + "...<truncated>" : value;
@@ -522,30 +544,129 @@ function scenarioFailureDiagnostic(s: Scenario, label: string): string {
     generationReports: bounded(generationReports, 12),
     arrivalWindowObservations: bounded(arrivalWindowObservations, 12),
     cancellationRows: s.rowsOf("cancel").length > 0 ? "present" : "<no cancellation row>",
+    // Keep the end of long timelines: the finalization immediately before failure matters most.
+    timeline: {
+      total: api.timeline.filter((entry) => entry.runId === s.runId).length,
+      items: api.timeline.map((entry, index) => ({ entry, index }))
+        .filter(({ entry }) => entry.runId === s.runId)
+        .map(({ entry, index }) => entry.type === "state"
+          ? { index, type: entry.type, status: entry.status, planPresent: entry.plan_md !== undefined }
+          : { index, ...entry }).slice(-200),
+    },
+    handlerExceptions: bounded(api.handlerExceptions.map((entry) => ({ ...entry, error: text(entry.error) })), 20),
+    recentFeed: s.texts().slice(-30).map(text),
+    modelTurns: bounded(s.model.turns.map(({ kind, resume }) => ({ kind, resumed: resume !== undefined })), 40),
   });
 }
 
 async function scenario(
   fn: (s: Scenario) => Promise<void>,
   overrides: Partial<ClaimResponse> = {},
-  diagnosticLabel?: string,
+  diagnosticLabel = "unlabelled scenario",
 ): Promise<void> {
   const s = new Scenario(overrides);
   try {
     await fn(s);
   } catch (error) {
-    if (diagnosticLabel !== undefined) {
-      try {
-        console.error(`#1604 scenario failure: ${scenarioFailureDiagnostic(s, diagnosticLabel)}`);
-      } catch {
-        // A diagnostic failure must not replace the callback's original error.
-      }
+    try {
+      console.error(`#1604 scenario failure: ${scenarioFailureDiagnostic(s, diagnosticLabel)}`);
+    } catch {
+      // A diagnostic failure must not replace the callback's original error.
     }
     throw error;
   } finally {
     await s.teardown();
   }
 }
+
+describe("#2230 scenario failure diagnostics", () => {
+  it("an unlabelled failure retains terminal reasons, receipt/state order and handler exceptions", async (t) => {
+    const output: string[] = [];
+    t.mock.method(console, "error", (line: string) => output.push(line));
+    const failure = new Error("intentional scenario assertion failure");
+    await assert.rejects(scenario(async (s) => {
+      const claim = s.claim();
+      client.protocolFeatures = ["claim_generation_fence"];
+      const [row] = s.send(s.input("revise_plan", "diagnostic input body must be omitted"));
+      await client.ackInputs(s.runId, [row!.id], claim.claim_generation!);
+      api.onState(s.runId, () => { throw new Error("intentional FakeApi handler failure"); });
+      const response = await fetch(`${baseUrl}/api/worker/runs/${s.runId}/state`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "running", claim_generation: claim.claim_generation }),
+      });
+      assert.equal(response.status, 500);
+      await response.text();
+      api.onState(s.runId, () => {});
+      await client.reportState(s.runId, { status: "failed", claim_generation: claim.claim_generation, failure_reason: "diagnostic terminal reason", fail_origin: "diagnostic_origin" });
+      throw failure;
+    }), (error: unknown) => error === failure);
+    assert.equal(output.length, 1, "every scenario failure emits one diagnostic before cleanup");
+    const diagnostic = JSON.parse(output[0]!.slice("#1604 scenario failure: ".length));
+    assert.equal(diagnostic.handlerExceptions.total, 1, "the HTTP 500 retained its handler exception");
+    const reports = diagnostic.generationReports.items[0];
+    assert.deepEqual(reports.statuses.items, ["running", "failed"]);
+    assert.deepEqual(reports.failedReports.items, [{ failure_reason: "diagnostic terminal reason", fail_origin: "diagnostic_origin" }]);
+    assert.deepEqual(diagnostic.timeline.items.map((entry: { type: string }) => entry.type), ["receipt_call", "receipt_reply", "state", "state"]);
+    assert.equal(diagnostic.handlerExceptions.items[0].method, "POST");
+    assert.match(diagnostic.handlerExceptions.items[0].path, /\/state$/);
+    assert.match(diagnostic.handlerExceptions.items[0].error, /intentional FakeApi handler failure/);
+    assert.ok(!output[0]!.includes("diagnostic input body must be omitted"));
+  });
+
+  it("a successful scenario emits no failure diagnostic", async (t) => {
+    const output: string[] = [];
+    t.mock.method(console, "error", (line: string) => output.push(line));
+    await scenario(async (s) => {
+      await client.reportState(s.runId, { status: "completed" });
+    });
+    assert.deepEqual(output, []);
+  });
+});
+
+describe("#2230 scripted model process isolation", () => {
+  it("a process-free gate scenario completes when an unrelated proc scan is incomplete", async (t) => {
+    const helper = forceIncompleteHomeHelper(t);
+    await scenario(async (s) => {
+      helper.enabled = true;
+      const control = new SdkExecutor(nullLogger(), s.home, {
+        queryFn: s.model.queryFn(),
+        runProcesses: { scan: scanRunProcesses, reap: reapRunProcesses },
+      });
+      assert.equal((await control.reapAttributedProcesses()).complete, false, "explicit real operations still fail closed");
+      assert.equal(helper.calls, 1, "the control used the actual HOME helper seam");
+      helper.enabled = false;
+      helper.calls = 0;
+      const block = s.model.block("implement");
+      const flight = await s.toFirstGate();
+      s.send(s.input("approve_plan"));
+      await block.entered;
+      helper.enabled = true;
+      block.release();
+      await s.finish(flight);
+      assert.ok(s.statuses(flight).includes("completed"), JSON.stringify(s.states(flight)));
+      assert.equal(helper.calls, 0, "the preloaded SDK default never scanned live host processes");
+    });
+  });
+});
+
+describe("#2230 binary checkpoint publication in FakeApi", () => {
+  it("a valid Git pack gets the missing-route response without a JSON handler exception", async () => {
+    const header = Buffer.alloc(12);
+    header.write("PACK");
+    header.writeUInt32BE(2, 4); // Git pack v2, zero objects, followed by its SHA-1 trailer.
+    const pack = Buffer.concat([header, createHash("sha1").update(header).digest()]);
+    const publishPath = "/api/worker/runs/binary-pack-fixture/publish";
+    const response = await fetch(baseUrl + publishPath, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/octet-stream" },
+      body: pack,
+    });
+    assert.equal(response.status, 404, "the fake does not claim it persisted a checkpoint");
+    assert.deepEqual(await response.json(), { error: "not found", path: publishPath });
+    assert.deepEqual(api.handlerExceptions, [], "binary routing did not throw a JSON decode error");
+  });
+});
 
 /** Assert a resumed claim revised the submitted plan with `feedback` instead of re-presenting it. */
 function assertRevisedOnResume(s: Scenario, flight: Flight, feedback: string, session: "kept" | "lost" | "none"): void {
@@ -1560,6 +1681,43 @@ describe("shutdown at an observed plan gate", () => {
     return execFileSync("git", ["-C", clone, "rev-parse", "HEAD"], { env: gitEnv, encoding: "utf8" }).trim();
   };
 
+  const readRetainedGateWork = (s: Scenario, flight: Flight, clone: string) => {
+    const gate = s.gates(flight)[0];
+    const failed = s.states(flight).find((state) => state.status === "failed");
+    // A terminal flight also satisfies the readiness wait. It may have failed before a clone
+    // existed, so require the gate before reading work and retain the primary failure reason.
+    assert.ok(gate, `the resumed claim reached no plan gate: ${failed?.failure_reason ?? s.statuses(flight).join(",")}`);
+    return { gate, content: fs.readFileSync(path.join(clone, "SHUTDOWN-WORK.txt"), "utf8") };
+  };
+
+  it("a reclaim refused before cloning reports its primary failure before reading retained work", {
+    skip: process.platform !== "linux" ? "the HOME-attributed pre-clone reap is Linux-only" : false,
+  }, (t) => scenario(async (s) => {
+    const helper = forceIncompleteHomeHelper(t);
+    const first = await s.toFirstGate();
+    const bare = git.barePathFor(fx.originPath);
+    const clone = git.runnerClonePath(bare, `issue-${s.base.issue_iid}`);
+    const committedTip = commitWork(clone);
+    await s.shutdown(first);
+    const trackedTip = await git.trackingTip(bare, `agent/issue-${s.base.issue_iid}`);
+    assert.ok(trackedTip, "the original work is captured before reclaim");
+    execFileSync("git", ["-C", bare, "merge-base", "--is-ancestor", committedTip, trackedTip], { env: gitEnv });
+
+    helper.enabled = true;
+    const resumed = s.start(s.resumeClaim("none"), { executor: () => new SdkExecutor(nullLogger(), s.home, {
+      queryFn: s.model.queryFn(), runProcesses: { scan: scanRunProcesses, reap: reapRunProcesses },
+    }) });
+    await s.finish(resumed);
+    assert.ok(helper.calls > 0, "the real HOME helper received the forced incomplete result");
+    assert.equal(s.gates(resumed).length, 0, "the failed reclaim presented no gate");
+    assert.equal(s.states(resumed).find((state) => state.status === "failed")?.fail_origin, "worker_residue_blocked");
+    assert.equal(fs.existsSync(clone), false, "the pre-clone refusal created no runner clone");
+    assert.throws(() => readRetainedGateWork(s, resumed, clone), (error: unknown) =>
+      error instanceof assert.AssertionError &&
+      /reached no plan gate: worker_residue_blocked:.*no clone was fetched/.test(error.message),
+    "the missing gate reports the primary refusal instead of a secondary ENOENT");
+  }));
+
   it("wakes an idle gate on shutdown without a verdict or cancel input", () =>
     scenario(async (s) => {
       const flight = s.start(s.claim(), { runner: { planApprovalTimeoutMs: 0 } });
@@ -1570,18 +1728,29 @@ describe("shutdown at an observed plan gate", () => {
     }));
 
   for (const [planApprovalTimeoutMs, session, failHeldGet] of [[0, "kept", true], [60_000, "none", true], [0, "kept", false]] as const) {
-    it(`finishes promptly without a cancel input when planApprovalTimeoutMs is ${planApprovalTimeoutMs} and the held GET ${failHeldGet ? "fails" : "succeeds"}`, () =>
+    it(`finishes promptly without a cancel input when planApprovalTimeoutMs is ${planApprovalTimeoutMs} and the held GET ${failHeldGet ? "fails" : "succeeds"}`, (t) =>
       scenario(async (s) => {
         api.gateRevisions = true;
         api.stampGateBindings = true;
         client.protocolFeatures = ["claim_generation_fence", "gate_revision_v1"];
         let holdFirstGate = true;
         let gateReads = 0;
+        let heldGet: ReturnType<typeof api.holdNextInputGet> | undefined;
+        t.after(() => heldGet?.release());
+        t.signal.addEventListener("abort", () => heldGet?.release(), { once: true });
+        let stopped!: () => void;
+        const pollingStopped = new Promise<void>((resolve) => { stopped = resolve; });
+        const originalStop = SteeringChannel.prototype.stop;
+        t.mock.method(SteeringChannel.prototype, "stop", function (this: SteeringChannel) {
+          const drain = originalStop.call(this); // Sets stopped before awaiting its in-flight GET.
+          stopped();
+          return drain;
+        });
         api.onState(s.runId, (body) => {
           if (body.status !== "awaiting_approval" || !holdFirstGate) return;
           holdFirstGate = false;
           gateReads = api.inputGets.get(s.runId) ?? 0;
-          api.delayInputGets(s.runId, 800, 1, gateReads);
+          heldGet = api.holdNextInputGet(s.runId, gateReads);
           if (failHeldGet) api.failInputGets(s.runId, 1, 503);
         });
         const flight = s.start(s.claim(), { runner: { planApprovalTimeoutMs } });
@@ -1599,14 +1768,22 @@ describe("shutdown at an observed plan gate", () => {
 
         // Hold a delivery read while the owner sends a bound approval. Shutdown must leave that
         // row pending for the next claim, rather than routing it on the first flight.
-        assert.ok(await until(() => (api.inputGets.get(s.runId) ?? 0) > gateReads), "the gate's input read is held");
+        assert.ok(heldGet, "the gate installed its input-read barrier");
+        await heldGet.entered;
+        assertHeldInputGet(s.runId);
         const [pending] = s.send(s.input("approve_plan"));
         const stored = api.inputRows(s.runId).find((row) => row.id === pending!.id)!;
         assert.equal(stored.gate_binding, "bound");
         assert.equal(stored.gate_revision, persisted.revision);
         flight.runner.shutdown();
-        assert.ok(await until(() => flight.finished, 2_000), "shutdown ended the gate flight within two seconds");
-        await flight.done;
+        await promptly(Promise.race([
+          pollingStopped,
+          flight.done.then(() => { throw new Error("flight ended without stopping input polling"); }),
+        ]).then(async () => {
+          heldGet!.release(); // The stopped poller cannot acknowledge this pending verdict.
+          await flight.done;
+        }));
+        assert.equal(flight.finished, true, "shutdown settled the gate flight");
         assert.equal(flight.error, undefined, "shutdown completed without an execution error");
         assert.equal(s.rowsOf("cancel").length, 0, "shutdown needed no cancel fallback");
         assert.ok(!s.statuses(flight).some((status) => status === "failed" || status === "cancelled"), s.statuses(flight).join(","));
@@ -1625,9 +1802,10 @@ describe("shutdown at an observed plan gate", () => {
         assert.equal(claim.plan_approved, false, "the resumed claim still needs approval");
         const resumed = s.start(claim);
         assert.ok(await until(() => s.gates(resumed).length > 0 || resumed.finished, 3_000), s.statuses(resumed).join(","));
-        assert.equal(fs.readFileSync(path.join(git.runnerClonePath(bare, `issue-${s.base.issue_iid}`), "SHUTDOWN-WORK.txt"), "utf8"),
+        const { gate: nextGate, content: retainedWork } = readRetainedGateWork(s, resumed,
+          git.runnerClonePath(bare, `issue-${s.base.issue_iid}`));
+        assert.equal(retainedWork,
           "committed before gate shutdown\n", "the resumed clone retains the committed work");
-        const nextGate = s.gates(resumed)[0]!;
         if (session === "kept") {
           await s.finish(resumed);
           assert.equal(nextGate.plan_md, PLAN_V1, "the submitted plan is re-presented");

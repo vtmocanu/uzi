@@ -27,10 +27,24 @@ through `[0.52.0]`.)
 - **New hosted workers default to the large preset ([#2240](https://github.com/vtmocanu/uzi/issues/2240)).**
   Ephemeral provisioning defaults and falls back to L, and the persistent provision form preselects L. Existing workers keep their sizes; new workers reserve more CPU and memory capacity.
 
+- **The agent gate distinguishes Linux-only contracts on macOS ([#1912](https://github.com/vtmocanu/uzi/issues/1912)).**
+  Linux process-proof and descriptor-pinned filesystem cases report named skips on other platforms; portable cases retain coverage. The scratch guard normalizes slash spelling, while timing checks use controlled clocks, CPU budgets, and readiness or completion events.
+
 ### Added
 
 - **`uzi tui` has a workers tab ([#2275](https://github.com/vtmocanu/uzi/issues/2275)).**
   A `workers` tab (key `2`; pulls and ci move to `3` and `4`) lists your workers, or the factory's with `a`, attention first: state, kind, slots, CPU, memory, worst disk, version, heartbeat and what needs a human; `enter` or `→` opens a worker's detail (attention, reported runs, resources, configuration) and its runs. Uppercase `W` in a run opens its worker, and `esc`/`←` returns to where you came from. The fleet status rides right-aligned on the title line, the split's top pane can show floor or workers, and the floor names each run's worker on wide terminals.
+
+### Fixed
+
+- **Secret scans reuse the pinned worker scanner offline ([#2289](https://github.com/vtmocanu/uzi/issues/2289)).**
+  The repository gate reuses installed gitleaks only when Go build metadata proves the exact module and version without replacements. Unknown or different builds use the pinned fetch, and every scan still must detect its canaries.
+
+- **Codex delegation requires an assignment ([#2285](https://github.com/vtmocanu/uzi/issues/2285)).**
+  Empty or blank subagent instructions are rejected before a child starts. Blank aliases fall through to later instructions, and valid task text is preserved.
+
+- **Incidental finding line ranges share a coordinate ([#2287](https://github.com/vtmocanu/uzi/issues/2287)).**
+  New reports strip trailing line ranges just like single line numbers, preserving symbol distinctions and each report's evidence. Existing stored coordinates are unchanged.
 
 ## [0.85.2] - 2026-10-05
 

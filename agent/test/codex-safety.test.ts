@@ -135,25 +135,32 @@ describe("CodexExecutionSafety.withBoundary: gate ordering", () => {
     assert.equal(actionCalls, 0, "the action never ran");
   });
 
-  it("propagates the same deadline AbortSignal into reconciliation", async () => {
+  it("propagates the same deadline AbortSignal into reconciliation", async (t) => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(13));
     let reconcileSignal: AbortSignal | undefined;
+    let entered!: () => void;
+    const reconciling = new Promise<void>((resolve) => { entered = resolve; });
     const safety = createCodexExecutionSafety(
       reg,
       spawnCounter().seam,
       async (_request, signal) => {
         reconcileSignal = signal;
+        entered();
         await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
         return { kind: "blocked", errors: [{ category: "timeout", message: "reconcile cancelled at boundary deadline" }] };
       },
     );
-    const started = Date.now();
-    await assert.rejects(
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const rejected = assert.rejects(
       safety.withBoundary({ boundary: "shutdown", deadlineMs: 25 }, async () => undefined),
       (error: unknown) => error instanceof CodexBoundaryError && error.stage === "reconcile",
     );
+    await reconciling;
+    t.mock.timers.tick(24);
+    assert.equal(reconcileSignal?.aborted, false, "the boundary still has one millisecond left");
+    t.mock.timers.tick(1);
+    await rejected;
     assert.equal(reconcileSignal?.aborted, true);
-    assert.ok(Date.now() - started < 100, "reconciliation used the boundary deadline, not its own full timeout");
   });
 
   it("a clean quiesce that settles after expiry still blocks permit mint and action", async () => {
@@ -686,10 +693,13 @@ describe("CodexExecutionSafety.spawnBoundaryProcess: permit-owned subprocesses",
     assert.equal(reaps, 1, "the registered boundary root reaped before permit release");
   });
 
-  it("deadline abort still awaits root reap and poisons instead of abandoning the action", async () => {
+  it("deadline abort still awaits root reap and poisons instead of abandoning the action", async (t) => {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(10));
     let reaped = false;
     let reapBudget = -1;
+    let entered!: () => void;
+    const registered = new Promise<void>((resolve) => { entered = resolve; });
     const safety = createCodexExecutionSafety(
       reg,
       spawnCounter().seam,
@@ -705,15 +715,19 @@ describe("CodexExecutionSafety.spawnBoundaryProcess: permit-owned subprocesses",
         waitChild: async () => new Promise<{ code: number }>(() => undefined),
       }),
     );
-    await assert.rejects(
+    const rejected = assert.rejects(
       safety.withBoundary({ boundary: "shutdown", deadlineMs: 20 }, async (permit) => {
         const process = await safety.spawnBoundaryProcess(permit, {
           argv: ["/bin/sleep", "forever"], cwd: "/tmp", env: {}, identity: "worker_pat",
         });
+        entered(); // spawnBoundaryProcess has registered the permit-owned root.
         await process.completed;
       }),
       CodexBoundaryError,
     );
+    await registered;
+    t.mock.timers.tick(20);
+    await rejected;
     assert.equal(reaped, true, "deadline cancellation reaped before withBoundary rejected");
     assert.ok(reapBudget <= 2, `action-root reap received only the remaining budget (${reapBudget}ms)`);
     assert.equal(reg.isPoisoned(), true, "a timed-out permit-held process poisons publication");

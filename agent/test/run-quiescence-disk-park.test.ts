@@ -194,9 +194,11 @@ async function runDiskPark(iid: number, state: ProcessQuiescenceState, reap?: ()
   return { claim, order, seen, pub, captures, releases, calls, spy, mrCalls, cachesAtProof };
 }
 
+const LINUX_REAP = process.platform !== "linux" ? "requires Linux attributed-reap ordering" : false;
+
 describe("issue #1783 x PRD #1826: a mid-run data_volume_full park whose clone is not provably quiescent", () => {
   for (const state of ["survivors", "unverified"] as const) {
-    it(`${state}: the attributed reap ran, yet nothing is captured or published and custody plus the clone are kept`, async () => {
+    it(`${state}: the attributed reap ran, yet nothing is captured or published and custody plus the clone are kept`, { skip: LINUX_REAP }, async () => {
       const iid = 1826 + (state === "survivors" ? 0 : 1);
       const { claim, order, seen, pub, captures, releases, calls, spy, mrCalls } = await runDiskPark(iid, state);
 

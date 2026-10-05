@@ -70,8 +70,10 @@ async function waitFor(cond: () => boolean, label: string, ms = 3000): Promise<v
   }
 }
 
+const LINUX_ONLY = process.platform !== "linux" ? "no /proc/self/fd on this host: fd-anchored Codex sessions require Linux" : false;
+
 describe("claimed Codex thread lookup", () => {
-  it("finds only the claimed rollout in the current generation", async () => {
+  it("finds only the claimed rollout in the current generation", { skip: LINUX_ONLY }, async () => {
     const root = mkdtempSync(join(tmpdir(), "uzi-codex-lookup-"));
     const source = join(root, "source");
     const store = join(root, "store");

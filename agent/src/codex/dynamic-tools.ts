@@ -70,7 +70,7 @@ function definition(name: string): Omit<CodexDynamicToolSpec, "type" | "name"> {
       };
     case "spawn_agent":
       return {
-        description: "Run one known subagent role synchronously and return its bounded result.",
+        description: "Run one known subagent role synchronously with nonblank instructions in prompt, task, input, message, or description, and return its bounded result.",
         inputSchema: {
           ...objectSchema({
           subagent_type: STRING,

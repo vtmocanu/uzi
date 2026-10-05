@@ -1,14 +1,18 @@
 # codex-m4 maintainer acceptance record
 
-Parent #1106 M4 acceptance requires **maintainer-only evidence the uzi worker cannot produce**:
+**Status: accepted.** PR #1309 merged as `ed7bb51d` on 2026-09-13 with green CI, closing #1287;
+parent #1106 recorded M4 complete and closed on 2026-09-26. Its PRD is archived at
+`prds/done/1287-codex-guardrail-conformance.md`. This file is the historical acceptance record; the
+procedure below applies again only when a future change needs fresh O-layer proof.
+
+Parent #1106 M4 acceptance required **maintainer-only evidence the uzi worker cannot produce**:
 a fresh packaged snapshot below the REAL Go supervisor on a Landlock-capable runtime, run on the
 actual merge-candidate images. That evidence is gated by `task check:codex-m4-receipts`, the
 lead's pre-merge gate, deliberately **not** folded into `gate:agent` / `test:codex-m4` so an
 owed packaged proof never reddens the worker's ordinary gate.
 
-For PR #1309, the packaged O proof and strict macOS Linux-container run are complete. Current-head
-GitHub CI after the recovered evidence-only commits remains the final acceptance item before parent
-M4 is marked complete.
+For PR #1309, the packaged O proof, the strict macOS Linux-container run and current-head GitHub CI
+were all complete before parent M4 was marked complete.
 
 ## Candidate evidence (2026-09-13)
 
@@ -82,9 +86,8 @@ run-receipts: 3 committed O clause(s) with no manifest record (undischarged):
 
 This is bookkeeping, not a gap left unnoticed: every committed O row is `inherited` or `owed`
 (D3/D8), and the ordinary worker gate accepts a well-formed `owed` record while this separate
-lead gate rejects it until a discharging manifest record exists. Do **not** mark parent M4
-complete, and do **not** move `prds/done/1287-codex-guardrail-conformance.md` to `prds/done/`, until
-every row below is resolved.
+lead gate rejects it until a discharging manifest record exists. Parent M4 was marked complete
+only after every row below was resolved, which PR #1309 did (see *Candidate evidence*).
 
 ## Stable O requirements
 
@@ -100,9 +103,11 @@ addition. Its committed row carries no digest — it needs only a matching `inhe
 
 ### 2. Owed rows: discharged by the fresh packaged proof
 
-Two rows have **no prior packaged evidence at all** — a direct harness spawn cannot prove the
+Two rows had **no packaged evidence before PR #1309**: a direct harness spawn cannot prove the
 absence of a descendant process or the completeness of supervisor reaping, only a real packaged
-snapshot below the real supervisor can:
+snapshot below the real supervisor can. PR #1309 discharged both original requirements with the
+packaged proof in *Candidate evidence*. A later runtime change on either path needs fresh,
+candidate-bound evidence of its own:
 
 - **`codex-o-descendant-code-mode-host-absence`** (Native execution bypass): on the RUN provider
   root a `codex-code-mode-host` descendant appears below the supervisor during a turn (a **separate
@@ -114,9 +119,9 @@ snapshot below the real supervisor can:
   code_mode_host=true launches a real code-mode host below the supervisor with a separate pgid and
   reaps it clean` and `production launcher advice posture: code_mode_host=false launches NO
   code-mode host below the supervisor and reaps only the app-server` cases — drives the REAL
-  `launchCodexRoot` + `config.ts` builder to prove both postures, but a fresh packaged snapshot
-  below the real Go supervisor on the merge-candidate images has never been packaged-proven and
-  must be **re-proven and pinned at a fresh `provenBaseCommit` at landing** (the #1533 run-lane M1
+  `launchCodexRoot` + `config.ts` builder to prove both postures, but the updated posture is not
+  established by the historical #1309 proof: a fresh packaged snapshot below the real Go supervisor
+  on the merge-candidate images must be **re-proven and pinned at a fresh `provenBaseCommit` at landing** (the #1533 run-lane M1
   change touches `agent/src/codex/config.ts`, a runtime path, so an older proof's fixed point
   cannot ride it).
 - **`codex-o-packaged-descendant-reaping`** (Delegation and cleanup): the real Go supervisor
@@ -124,7 +129,7 @@ snapshot below the real supervisor can:
   backgrounded/process-group-escapee descendant — BEFORE any checkpoint/finalize publication.
   The C4 U lifecycle cases (`codex-u-lifecycle-root-ordering` and friends) prove the
   registry/safety reap-ordering CONTRACT with injected fake roots; this row is the OS-level
-  backing proof under the real supervisor that no packaged snapshot has yet run.
+  backing proof under the real supervisor, discharged for PR #1309 by its packaged proof.
 
 Because these are committed `owed` clauses, the manifest must discharge each with a
 `receipt-present` record (never `inherited` — the gate rejects that as a disposition mismatch).
@@ -169,12 +174,14 @@ Because these are committed `owed` clauses, the manifest must discharge each wit
    extra, duplicate, undischarged, mismatched, or disposition-mismatched).`
 5. **No edit to `clauses-codex.ts` is needed.** The old "pin digests into `clauses-codex.ts`" step
    — the one that created the circular commit — is gone; that is the whole point of the redesign.
-6. For PR #1309, the strict macOS Linux-container run is complete. Current-head CI
-   `test-agent` confirmation after the recovered commits remains lead-owned.
-7. Only then tick parent #1106 M4 and move `prds/done/1287-codex-guardrail-conformance.md` to
-   `prds/done/`.
+6. Run the strict macOS Linux-container suite and confirm current-head CI `test-agent` is green
+   (both lead-owned; for PR #1309 both were done).
+7. Only then mark the milestone the proof serves complete. For #1287 that was parent #1106 M4,
+   and its PRD was archived to `prds/done/`.
 
 ## Also required before parent M4 acceptance
+
+Both were satisfied for PR #1309.
 
 - **The strict macOS Linux-container invocation** (D7 point 3): reproducibly callable as
   `task test:codex-m4:macos` (and `task gate:agent` / `task test:codex-m4` auto-route the
@@ -189,8 +196,9 @@ Because these are committed `owed` clauses, the manifest must discharge each wit
   and the hard-prerequisite gate (`macos-linux-runner.test.ts`). The actual macOS run passed for
   PR #1309 at recovered head `704eadad`; future candidates repeat it when the runner or P suite changes.
 - **Current-head CI `test-agent` confirmation.** The worker has no CI run URL for the exact
-  tested revision to cite honestly; the lead owns confirming CI is green on this revision (or
-  the revision that supersedes it) and recording the URL/counts.
+  tested revision to cite honestly; the lead owns confirming CI is green on the candidate revision
+  (or the revision that supersedes it) and recording the URL/counts. For PR #1309, CI was green on
+  its final PR head, which was squash-merged as `ed7bb51d`.
 
 ## Trust boundary
 

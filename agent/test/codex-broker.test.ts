@@ -526,6 +526,38 @@ describe("CodexCallbackBroker: root-only signals", () => {
 });
 
 describe("CodexCallbackBroker: delegation", () => {
+  for (const [name, args] of [
+    ["absent instructions", {}],
+    ["empty instructions", { prompt: "", task: "", input: "", message: "", description: "" }],
+    ["blank instructions", { prompt: " ", task: "\t", input: "\n", message: " \n ", description: "\t " }],
+    ["non-string instructions", { prompt: 123, task: null, input: [], message: {}, description: false }],
+  ] as const) {
+    it(`denies ${name} before starting a child`, async () => {
+      const h = makeBroker();
+      const r = await h.broker.handleToolCall(rt(), "spawn_agent", { subagent_type: "reviewer", ...args }, "root");
+      assertDenied(r, "bad_args");
+      assert.equal(h.delegate.calls.length, 0, "no child starts without an assignment");
+      assert.equal(h.registry.inFlightCallbackCount(), 0, "the denial settles its callback");
+    });
+  }
+
+  for (const field of ["prompt", "task", "input", "message", "description"]) {
+    it(`accepts a nonblank ${field} assignment`, async () => {
+      const h = makeBroker();
+      const r = await h.broker.handleToolCall(rt(), "spawn_agent", { subagent_type: "reviewer", [field]: " review X " }, "root");
+      assert.equal(r.ok, true);
+      assert.equal(h.delegate.calls.length, 1);
+      assert.equal((h.delegate.calls[0]!.args as Record<string, string>)[field], " review X ");
+    });
+  }
+
+  it("accepts a later assignment after a blank alias", async () => {
+    const h = makeBroker();
+    const r = await h.broker.handleToolCall(rt(), "spawn_agent", { subagent_type: "reviewer", prompt: "  ", task: "review X" }, "root");
+    assert.equal(r.ok, true);
+    assert.equal(h.delegate.calls.length, 1);
+  });
+
   it("awaits a root delegation to a known role exactly once", async () => {
     const h = makeBroker();
     const r = await h.broker.handleToolCall(rt(), "spawn_agent", { subagent_type: "reviewer", prompt: "look" }, "root");
@@ -560,7 +592,7 @@ describe("CodexCallbackBroker: delegation", () => {
     const r = await h.broker.handleToolCall(
       rt(),
       "spawn_agent",
-      { subagent_type: "reviewer" },
+      { subagent_type: "reviewer", prompt: "review X" },
       "root",
     );
     assertDenied(r, "child_failed");

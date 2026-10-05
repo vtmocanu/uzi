@@ -80,7 +80,8 @@
 # when absent, because they are brew/pip/system tools a contributor may simply not
 # have, and `gate:repo` runs FIRST inside `task gate` (PRD #103 Decision 2 -- a
 # gate people cannot run is a gate that stops being run). gitleaks is not in that
-# category: it arrives through `go install pkg@version`, the Go toolchain is mandatory
+# category: its installed module version is verified with Go metadata, or it is
+# fetched through `go install pkg@version`. The Go toolchain is mandatory
 # in this repo, and `gate:api` ALREADY fetches two pinned remote tools over the
 # network (golangci-lint's release archive, deadcode via `go run`). So the
 # population that cannot obtain gitleaks is the population that cannot run
@@ -195,12 +196,12 @@ if [ ! -f "$TEMPLATE" ]; then
   exit 2
 fi
 
-# `go`, not `gitleaks`: this check has no binary of its own by design (see the
-# no-skip paragraph in the header). A missing Go toolchain is an instrument
+# Go verifies an installed scanner's pinned module version or builds the pin when
+# no verified scanner is available. A missing Go toolchain is an instrument
 # failure here for the same reason it is one for lint:api.
 if ! command -v go >/dev/null 2>&1; then
   echo "scan-secrets: no go on PATH." >&2
-  echo "  This gate builds gitleaks with \`go install …@$VERSION\`, so it needs Go," >&2
+  echo "  This gate verifies Go build metadata or builds gitleaks @$VERSION, so it needs Go," >&2
   echo "  as gate:api already does. Install Go." >&2
   exit 2
 fi
@@ -387,27 +388,48 @@ done
 # decide whether the scan that follows was live.
 # SCAN_SECRETS_FETCH_ATTEMPTS / SCAN_SECRETS_FETCH_DELAY exist for the hermetic
 # test (scripts/scan-secrets.test.sh); they bound a download, not what is scanned.
-attempts="${SCAN_SECRETS_FETCH_ATTEMPTS:-3}"
-delay="${SCAN_SECRETS_FETCH_DELAY:-10}"
-attempt=1
-while :; do
-  if GOBIN="$BINDIR" go install "github.com/zricethezav/gitleaks/v8@$VERSION"; then
-    break
+# A worker already bakes this pin. Plain `go install` does not stamp the
+# `gitleaks version` string, so require its exact main-module identity instead.
+# Unknown metadata or any replacement falls back to the existing pinned fetch.
+GITLEAKS=""
+installed="$(command -v gitleaks 2>/dev/null || true)"
+if [ -n "$installed" ] && metadata="$(go version -m "$installed" 2>/dev/null)"; then
+  if printf '%s\n' "$metadata" | awk -v pinned="$VERSION" '
+    $1 == "mod" {
+      modules++
+      if ($2 == "github.com/zricethezav/gitleaks/v8" && $3 == pinned) matched = 1
+    }
+    $1 == "=>" { replaced = 1 }
+    END { exit !(modules == 1 && matched && !replaced) }
+  '; then
+    GITLEAKS="$installed"
+    echo "scan-secrets: using installed gitleaks $VERSION (Go module version verified)."
   fi
-  if [ "$attempt" -ge "$attempts" ]; then
-    echo "scan-secrets: fetching gitleaks $VERSION failed $attempts time(s)." >&2
-    echo "  INSTRUMENT failure, not a scan result: the module proxy was unreachable" >&2
-    echo "  or the pinned module did not build. Nothing was scanned." >&2
-    exit 2
-  fi
-  echo "scan-secrets: fetching gitleaks $VERSION failed (attempt $attempt/$attempts); retrying in $((attempt * delay))s." >&2
-  sleep "$((attempt * delay))"
-  attempt=$((attempt + 1))
-done
+fi
 
-GITLEAKS="$BINDIR/gitleaks"
+if [ -z "$GITLEAKS" ]; then
+  attempts="${SCAN_SECRETS_FETCH_ATTEMPTS:-3}"
+  delay="${SCAN_SECRETS_FETCH_DELAY:-10}"
+  attempt=1
+  while :; do
+    if GOBIN="$BINDIR" go install "github.com/zricethezav/gitleaks/v8@$VERSION"; then
+      break
+    fi
+    if [ "$attempt" -ge "$attempts" ]; then
+      echo "scan-secrets: fetching gitleaks $VERSION failed $attempts time(s)." >&2
+      echo "  INSTRUMENT failure, not a scan result: the module proxy was unreachable" >&2
+      echo "  or the pinned module did not build. Nothing was scanned." >&2
+      exit 2
+    fi
+    echo "scan-secrets: fetching gitleaks $VERSION failed (attempt $attempt/$attempts); retrying in $((attempt * delay))s." >&2
+    sleep "$((attempt * delay))"
+    attempt=$((attempt + 1))
+  done
+  GITLEAKS="$BINDIR/gitleaks"
+fi
+
 if [ ! -x "$GITLEAKS" ]; then
-  echo "scan-secrets: go install reported success but $GITLEAKS is missing." >&2
+  echo "scan-secrets: selected gitleaks is missing or not executable: $GITLEAKS." >&2
   exit 2
 fi
 

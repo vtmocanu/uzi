@@ -110,8 +110,10 @@ function deps(d: { home: string; provision: string }, over: Partial<DiskReclaimD
   };
 }
 
+const LINUX_ONLY = process.platform !== "linux" ? "no /proc/self/fd on this host: descriptor-pinned removal requires Linux" : false;
+
 describe("runDiskReclaimPass (PRD #1809 D7)", () => {
-  it("frees a process-ended park's caches and a terminal run's leftovers, keeping resume artifacts", { skip: SKIP_ROOT }, async () => {
+  it("frees a process-ended park's caches and a terminal run's leftovers, keeping resume artifacts", { skip: LINUX_ONLY || SKIP_ROOT }, async () => {
     const d = dataDir();
     const parked = seedRun(d);
     const terminal = seedRun(d);
@@ -134,7 +136,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     assert.equal(s.failed, 0);
   });
 
-  it("removes a terminal run's provision dir that has no HOME beside it", { skip: SKIP_ROOT }, async () => {
+  it("removes a terminal run's provision dir that has no HOME beside it", { skip: LINUX_ONLY || SKIP_ROOT }, async () => {
     const d = dataDir();
     const id = randomUUID();
     seedProvision(path.join(d.provision, id));
@@ -143,7 +145,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     assert.equal(s.provisionDirsRemoved, 1);
   });
 
-  it("drops caches for every process-ended park status (limit_wait, recovery_wait, paused)", { skip: SKIP_ROOT }, async () => {
+  it("drops caches for every process-ended park status (limit_wait, recovery_wait, paused)", { skip: LINUX_ONLY || SKIP_ROOT }, async () => {
     for (const st of ["limit_wait", "recovery_wait", "paused"]) {
       const d = dataDir();
       const run = seedRun(d);
@@ -229,7 +231,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     assert.equal(down.unexamined, 2);
   });
 
-  it("remembers a parked run whose caches are gone and skips it until it is seen executing again", { skip: SKIP_ROOT }, async () => {
+  it("remembers a parked run whose caches are gone and skips it until it is seen executing again", { skip: LINUX_ONLY || SKIP_ROOT }, async () => {
     const d = dataDir();
     const run = seedRun(d);
     const memo = new CachesDroppedMemo();
@@ -277,7 +279,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     assert.equal(memo.has(run.id), false, "a non-park status forgets the drop too");
   });
 
-  it("keeps a parked run's caches while a process is attributed to its HOME, without memoizing, and drops them once clear", { skip: SKIP_ROOT }, async () => {
+  it("keeps a parked run's caches while a process is attributed to its HOME, without memoizing, and drops them once clear", { skip: LINUX_ONLY || SKIP_ROOT }, async () => {
     const d = dataDir();
     const run = seedRun(d);
     const memo = new CachesDroppedMemo();
@@ -344,7 +346,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     for (const rel of CACHES) assert.equal(exists(path.join(run.home, rel)), false, `${rel} dropped`);
   });
 
-  it("does not run the process check for a terminal run", { skip: SKIP_ROOT }, async () => {
+  it("does not run the process check for a terminal run", { skip: LINUX_ONLY || SKIP_ROOT }, async () => {
     const d = dataDir();
     const terminal = seedRun(d);
     let asked = 0;
@@ -361,7 +363,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     assert.equal(exists(terminal.home), false);
   });
 
-  it("a run that resumes here, rebuilds its caches and parks again between two passes is dropped again", { skip: SKIP_ROOT }, async () => {
+  it("a run that resumes here, rebuilds its caches and parks again between two passes is dropped again", { skip: LINUX_ONLY || SKIP_ROOT }, async () => {
     const d = dataDir();
     const locks = new RunDiskLocks();
     const memo = new CachesDroppedMemo();
@@ -443,7 +445,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     assert.equal(full.dirEntriesRead, 600);
   });
 
-  it("a capped listing still examines what it read, and keeps the memo of runs it did not reach", { skip: SKIP_ROOT }, async () => {
+  it("a capped listing still examines what it read, and keeps the memo of runs it did not reach", { skip: LINUX_ONLY || SKIP_ROOT }, async () => {
     const d = dataDir();
     const run = seedRun(d);
     const memo = new CachesDroppedMemo();
@@ -491,7 +493,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     return { id, home };
   }
 
-  it("flood A: planted run-shaped dirs not owned by the worker take no lookup and no budget slot", async () => {
+  it("flood A: planted run-shaped dirs not owned by the worker take no lookup and no budget slot", { skip: LINUX_ONLY }, async () => {
     const d = dataDir();
     const workerUid = 4242;
     const foreign = new Set<string>();
@@ -579,7 +581,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     assert.equal(s.modelPassHomesRemoved, 0);
   });
 
-  it("flood B: a capped listing rotates, so real HOMEs behind a flood of names (within the read budget) are reached within ceil(N/cap)+1 passes", async () => {
+  it("flood B: a capped listing rotates, so real HOMEs behind a flood of names (within the read budget) are reached within ceil(N/cap)+1 passes", { skip: LINUX_ONLY }, async () => {
     const d = dataDir();
     // Real HOMEs on both sides of the flood in creation order, so some sit past the first
     // window whichever order this filesystem lists in.
@@ -659,7 +661,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     }
   });
 
-  it("the run budget resumes after the last examined run, so never-removed runs cannot starve terminal HOMEs", async () => {
+  it("the run budget resumes after the last examined run, so never-removed runs cannot starve terminal HOMEs", { skip: LINUX_ONLY }, async () => {
     const d = dataDir();
     const gone = Array.from({ length: 60 }, () => plainHome(d.home)); // HOMEs of runs the api no longer knows
     const terminal = Array.from({ length: 20 }, () => plainHome(d.home));
@@ -690,7 +692,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     assert.equal(first.terminalHomesRemoved + second.terminalHomesRemoved, 20);
   });
 
-  it("a capped window with more never-removed runs than the run budget still lets the listing move on to the HOMEs after it", async () => {
+  it("a capped window with more never-removed runs than the run budget still lets the listing move on to the HOMEs after it", { skip: LINUX_ONLY }, async () => {
     const d = dataDir();
     const workerUid = 4242;
     // 70 HOMEs, given their roles by the order this filesystem lists them in, so the first
@@ -733,7 +735,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     for (const p of junk) assert.equal(asked.has(path.basename(p)), false, "a planted dir takes no lookup");
   });
 
-  it("a window held for the run rotation keeps its end entry, so entries past it wait for their own window", async () => {
+  it("a window held for the run rotation keeps its end entry, so entries past it wait for their own window", { skip: LINUX_ONLY }, async () => {
     const d = dataDir();
     for (let i = 0; i < 30; i++) plainHome(d.home);
     const order = listingOrder(d.home);
@@ -768,7 +770,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     assert.equal(runCursors.has(d.home), false);
   });
 
-  it("a drop that found nothing is not counted as a drop and logs nothing of its own", { skip: SKIP_ROOT }, async () => {
+  it("a drop that found nothing is not counted as a drop and logs nothing of its own", { skip: LINUX_ONLY || SKIP_ROOT }, async () => {
     const d = dataDir();
     const id = randomUUID();
     fs.mkdirSync(path.join(d.home, id, ".claude"), { recursive: true });
@@ -824,7 +826,7 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
     assert.equal(exists(home), false);
   });
 
-  it("logs one summary line naming what it freed and what it skipped", { skip: SKIP_ROOT }, async () => {
+  it("logs one summary line naming what it freed and what it skipped", { skip: LINUX_ONLY || SKIP_ROOT }, async () => {
     const d = dataDir();
     seedRun(d);
     const { logger, lines } = recordingLogger();
@@ -853,7 +855,7 @@ describe("runDiskReclaimPass model-pass HOMEs (PRD #1809 D7)", () => {
     assert.equal(modelPassMinAgeMs([5 * 60_000, 5 * 60_000, 2 * 60 * 60_000]), 2 * 60 * 60_000 + 15 * 60_000);
   });
 
-  it("removes a stranded pass HOME older than the bound and keeps a recent one", async () => {
+  it("removes a stranded pass HOME older than the bound and keeps a recent one", { skip: LINUX_ONLY }, async () => {
     const d = dataDir();
     const old = seedPassHome(d.home, "uzi-summary-old1", OLD);
     const recent = seedPassHome(d.home, "uzi-judge-new1", Date.now());
