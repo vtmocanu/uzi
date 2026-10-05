@@ -27,7 +27,7 @@ describe("mockApi hosted workers (PRD #58 M5)", () => {
     // so the mock is the only place M5 can be seen at all.
     const api = await fresh();
     await api.login("vlad@uzi.local", "x");
-    expect(await api.hostedConfig()).toEqual({ enabled: true, quota: 5, ephemeral_enabled: true });
+    expect(await api.hostedConfig()).toEqual({ enabled: true, quota: 5, ephemeral_enabled: true, docker_enabled: true });
   });
 
   it("puts the at-quota journey three clicks away: four seeded hosted workers of five", async () => {
@@ -99,5 +99,44 @@ describe("mockApi hosted workers (PRD #58 M5)", () => {
     expect(res.worker.kind).toBe("external");
     expect(res.worker.hosted_size).toBeNull();
     expect(res.token).toMatch(/^uzi_wk_/);
+  });
+});
+
+
+describe("mockApi ephemeral preferences partial updates", () => {
+  it("preserves omitted fields, supports both/neither, and retains Docker with auto-provision off across login", async () => {
+    const api = await fresh();
+    await api.login("vlad@uzi.local", "x");
+    const prefs = (u: { ephemeral_workers_enabled: boolean; ephemeral_docker_enabled: boolean }) =>
+      [u.ephemeral_workers_enabled, u.ephemeral_docker_enabled];
+    expect(prefs((await api.setEphemeralWorkersEnabled({ enabled: true, docker: true })).user)).toEqual([true, true]);
+    expect(prefs((await api.setEphemeralWorkersEnabled(false)).user)).toEqual([false, true]);
+    expect(prefs((await api.setEphemeralWorkersEnabled({})).user)).toEqual([false, true]);
+    expect(prefs((await api.setEphemeralWorkersEnabled({ docker: false })).user)).toEqual([false, false]);
+    await api.setEphemeralWorkersEnabled({ docker: true });
+    expect(prefs((await api.me()).user)).toEqual([false, true]);
+    await api.logout();
+    expect(prefs((await api.login("vlad@uzi.local", "x")).user)).toEqual([false, true]);
+    // Another user's backing record must be unchanged.
+    await api.logout();
+    expect(prefs((await api.login("mira@uzi.local", "x")).user)).toEqual([false, false]);
+  });
+
+  it("refuses tierless Docker atomically, including backing user; disabling remains allowed", async () => {
+    const api = await fresh();
+    const { workersApi } = await import("./mockApi/workers");
+    await api.login("vlad@uzi.local", "x");
+    await api.setEphemeralWorkersEnabled({ docker: true });
+    const config = vi.spyOn(workersApi, "hostedConfig").mockResolvedValue({ enabled: true, quota: 5, ephemeral_enabled: true, docker_enabled: false });
+    try {
+      await expect(api.setEphemeralWorkersEnabled({ enabled: true, docker: true })).rejects.toMatchObject({ status: 409 });
+      expect((await api.me()).user).toMatchObject({ ephemeral_workers_enabled: false, ephemeral_docker_enabled: true });
+      await api.logout();
+      expect((await api.login("vlad@uzi.local", "x")).user).toMatchObject({ ephemeral_workers_enabled: false, ephemeral_docker_enabled: true });
+      expect((await api.setEphemeralWorkersEnabled({ docker: false })).user).toMatchObject({ ephemeral_workers_enabled: false, ephemeral_docker_enabled: false });
+      expect((await api.setEphemeralWorkersEnabled(true)).user).toMatchObject({ ephemeral_workers_enabled: true, ephemeral_docker_enabled: false });
+    } finally {
+      config.mockRestore();
+    }
   });
 });

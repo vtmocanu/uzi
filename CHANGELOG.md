@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Ephemeral Docker preference on the Workers page ([#2278](https://github.com/vtmocanu/uzi/issues/2278)).**
+  Persistent and ephemeral workers have separate sections. Instances offering the Docker tier show a saved Docker-capable checkbox beside auto-provision, usable even while auto-provision is off; writes share a pending lock and show local errors without changing confirmed preferences. Help text covers saturation, warm leases and the ephemeral cap, and qualifies Docker by the admin's repository allowlist. Warm-lease Docker routing remains a follow-up milestone.
+
 - **New hosted workers default to the large preset ([#2240](https://github.com/vtmocanu/uzi/issues/2240)).**
   Ephemeral provisioning defaults and falls back to L, and the persistent provision form preselects L. Existing workers keep their sizes; new workers reserve more CPU and memory capacity.
 

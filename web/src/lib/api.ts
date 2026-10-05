@@ -544,8 +544,9 @@ const realApi = {
     request<{ user: User }>("PUT", "/me/attribution", { enabled }),
   // Flip the current user's ephemeral-workers opt-in (PRD #649). Session identity
   // only — the body carries no user id. Returns the updated user.
-  setEphemeralWorkersEnabled: (enabled: boolean) =>
-    request<{ user: User }>("PUT", "/me/ephemeral-workers", { enabled }),
+  setEphemeralWorkersEnabled: (prefs: boolean | { enabled?: boolean; docker?: boolean }) =>
+    request<{ user: User }>("PUT", "/me/ephemeral-workers",
+      typeof prefs === "boolean" ? { enabled: prefs } : prefs),
   /**
    * PRD #35: flip the current user's DEFAULT for the usage-limit park. Returns the
    * updated user.

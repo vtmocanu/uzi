@@ -135,7 +135,7 @@ export const workersApi = {
   //
   // The second seeded worker is the failed roller, which the demo previously could not
   // show at all — so a browser pass could only ever validate the healthy path.
-  hostedConfig: async () => delay({ enabled: true, quota: 5, ephemeral_enabled: true }),
+  hostedConfig: async () => delay({ enabled: true, quota: 5, ephemeral_enabled: true, docker_enabled: true }),
   provisionHostedWorker: async (template: string, size: string, docker = false, name?: string) => {
     const w = {
       id: `w-hosted-${++workerCounter}`,

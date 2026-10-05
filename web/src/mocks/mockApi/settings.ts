@@ -26,6 +26,7 @@ import { state } from "../store";
 import { delay, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
+import { workersApi } from "./workers";
 
 // PRD #1551 D3: the two closed cross-vocabulary sets, mirroring the server's lane
 // validation (and web/src/components/ModelSelect.tsx's curated lists). A curated Codex
@@ -1019,13 +1020,20 @@ export const settingsApi = {
 
   // ── Ephemeral-workers opt-in (PRD #649) ──────────────────────────────────────
   // Own-user (session identity, never a body id, mirroring the server).
-  setEphemeralWorkersEnabled: async (enabled: boolean) => {
+  setEphemeralWorkersEnabled: async (prefs: boolean | { enabled?: boolean; docker?: boolean }) => {
     const u = requireSession();
-    u.ephemeral_workers_enabled = enabled;
-    // Persist on the backing users[] record too, not just the session copy, so the
-    // opt-in survives a mock logout/login (login() re-copies from users[]).
+    const patch = typeof prefs === "boolean" ? { enabled: prefs } : prefs;
+    // Validate the whole partial update before changing either session or backing user.
+    if (patch.docker === true && !(await workersApi.hostedConfig()).docker_enabled) {
+      throw new ApiError(409, "Docker-capable hosted workers are unavailable on this instance");
+    }
+    const next = {
+      ephemeral_workers_enabled: patch.enabled ?? u.ephemeral_workers_enabled,
+      ephemeral_docker_enabled: patch.docker ?? u.ephemeral_docker_enabled,
+    };
+    Object.assign(u, next);
     const stored = users.find((x) => x.id === u.id);
-    if (stored) stored.ephemeral_workers_enabled = enabled;
+    if (stored) Object.assign(stored, next);
     return delay({ user: { ...u } }, 200);
   },
   getMySettings: async () => delay(mySettingsResponse()),

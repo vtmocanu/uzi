@@ -2397,6 +2397,8 @@ export interface AdminWorker extends Worker {
  * only — hosted workers the user already holds stay listed and deletable.
  */
 export interface HostedConfig {
+  // Older APIs omit the tier flag; absence hides the ephemeral Docker option.
+  docker_enabled?: boolean;
   enabled: boolean;
   quota: number;
   // Whether the instance admin gate permits ephemeral auto-provisioning (PRD #649),

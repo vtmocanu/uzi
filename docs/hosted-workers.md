@@ -112,6 +112,10 @@ That's expected while it's cordoned — it isn't a bug, and it isn't stuck. It
 resumes claiming runs on its own once the roll finishes. There's no manual
 way to cordon a worker yourself; it's driven entirely by the cluster.
 
+The Workers page's **Ephemeral workers → Docker-capable** preference adds
+Docker when auto-provisioning for repositories your admin allows; see
+[the triggers, scope and warm-reuse policy](./scheduling.md#auto-provisioning-a-worker-for-an-unmet-capability).
+
 ## Ephemeral worker lease
 
 When an ephemeral worker finishes its run it is not removed at once. It stays

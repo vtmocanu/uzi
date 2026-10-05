@@ -617,7 +617,9 @@ online workers has, it stays `queued` — not failed — waiting for an eligible
 worker to claim it, surfaced with a "no eligible worker" health reason (see
 [Capability-aware scheduling](./capability-scheduling.md#match-what-a-worker-advertises)).
 It claims as soon as you start, or already have, a capable worker online.
-With this on, uzi instead spins up a throwaway worker just for that one run.
+With this on, uzi instead spins up a throwaway worker for that run. It also
+provisions when every capable worker stays busy (the saturation trigger),
+after the saturation debounce.
 
 **Turning it on** takes two switches, both off by default: an admin enables
 the feature instance-wide from **Admin → Instance**, then you opt in from
@@ -626,13 +628,36 @@ section — that per-user toggle only appears there once the admin switch is
 on. A per-user cap also bounds how many throwaway workers you can have
 running at once, so one busy stretch can't spin up an unbounded fleet.
 
-**What you'll see:** the run keeps showing its existing "no eligible worker"
-[health reason](./run-health.md) while the throwaway worker cold-starts.
-Once it's online it claims the run — and only that run — works it like any
-other worker, then disappears: the worker is dropped and its pod is gone on
-the next controller poll. While it exists, it's marked with an `ephemeral`
-badge in your fleet list on the Workers page, so you can tell it apart from
-a hosted worker you provisioned yourself.
+**Docker-capable ephemeral workers.** When the instance offers the Docker
+tier, the **Ephemeral workers** subsection also shows a **Docker-capable**
+checkbox beside **Auto-provision on demand**. It saves separately and keeps
+its value while auto-provision is off. For both capability-gap and saturation
+provisioning, the preference adds Docker only for ordinary runs with a
+repository explicitly in the admin's `docker_repo_allowlist`. It does not
+apply to jobs, isolated-lane runs or repo-less runs, including judges. If the
+allowlist read fails, any returned values are discarded and membership is
+treated as empty: no preference-driven Docker. A run's explicit Docker
+capability requirement and the independent worker-claim fence are unchanged.
+
+**What you'll see:** the run keeps its existing
+[health reason](./run-health.md) while the throwaway worker starts.
+Once online it claims the run and works it like any other worker. Afterwards
+it may stay warm for up to 2 hours (unless your admin disables the lease),
+so an eligible same-owner, same-repository, same-branch follow-up run can reuse
+it. It still counts toward your ephemeral cap while warm. At the cap, an idle,
+releasable lease may be evicted early to make room; the cap still bounds the
+fleet. When its lease ends, the worker and pod are removed. While it exists,
+it has an `ephemeral` badge in your fleet list. See
+[Ephemeral worker lease](./hosted-workers.md#ephemeral-worker-lease) for
+eligible run kinds and early removal rules.
+
+**Warm Docker reuse (M2 pending).** The approved follow-up makes a plain warm
+worker step aside when the Docker preference applies to the run's allowlisted
+repository, so it gets Docker-capable capacity instead. It will also make a
+capability-free run with no claimable online worker a capability-gap candidate
+under that same policy. Unallowlisted repositories and failed allowlist reads
+keep today's plain warm reuse; returned values alongside an error are discarded.
+This lease-admission change is not part of the settings UI milestone.
 
 **Caveats, honestly:**
 

@@ -67,6 +67,10 @@ an instance whose admin has turned the docker tier on. The cluster runs the
 daemon as a native sidecar in a dedicated, isolated namespace; there's
 nothing to configure yourself.
 
+For on-demand hosted workers, use **Ephemeral workers → Docker-capable** on
+the Workers page; it saves separately from auto-provision and adds Docker only
+for repositories your admin allows. See [auto-provisioning policy](./scheduling.md#auto-provisioning-a-worker-for-an-unmet-capability).
+
 ## dind-data metering and automatic pruning
 
 On a **hosted (k8s)** docker-capable worker, the daemon's images and build
