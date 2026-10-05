@@ -70,7 +70,7 @@ uzi schedule list --json | jq '.[] | select(.target=="sweep") | {slug: .catalog_
 
 ## Step 1: Pick
 
-Order: user-named issue → lowest-numbered `external` from 0B → lowest-numbered issue in the highest non-empty tier. When the user asks for newest first, take the highest number instead, at each step.
+Order: user-named issue → lowest-numbered `external` from 0B → `recurring` and not moving (no active run, no selector + `uzi`, no one-time schedule, not `In Progress`; reconsider its priority with the incident count in the reason) → lowest-numbered issue in the highest non-empty tier. When the user asks for newest first, take the highest number instead, at each step.
 
 A sweep fires an issue only with BOTH a selector (`Planned`, or `bug`) AND eligibility (`uzi` label OR assigned to the uzi-bot account). Missing either half = looks queued, never runs.
 

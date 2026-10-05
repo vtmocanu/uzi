@@ -36,10 +36,18 @@ GitHub label descriptions mirror the one-liners below; keep both in sync.
 - Recurrence evidence is a "hit again: run X / PR #N" comment; it warrants reconsidering priority, not raising it automatically.
 - Priority never authorizes a run, and readiness is separate: an urgent issue with an open design question needs investigation first.
 
+## Recurring
+
+`recurring`: the same verified root cause observed in at least two distinct incidents, evidence from before filing included.
+
+- A run and its PR are one incident; repeated reports or judge passes over that incident do not count again.
+- Whoever records the second incident's "hit again" comment adds the label (uzi-lander, judge-triage, issue-triage).
+- Closing ends its backlog presence; reopening keeps the history. A hit after a verified fix is a regression: say so in the comment, then reopen or file fresh.
+
 ## Labels with consumers: never rename or repurpose
 
 - `uzi`: run eligibility. `bug` and `Planned`: sweep selectors. `refactor`: refactor-sweep selector.
 - `In Progress`, `Human Review`: uzi board columns (`api/internal/board/board.go`).
 - `Later`, `brainstorm`: this skill's park tiers. `local`, `scheduled`, `acceptance`, `agent-found`, `nightly-e2e*`: workflow markers.
-- `reviewed`: root `AGENTS.md` rule. `unreviewed`: intake, awaiting first triage.
+- `reviewed`: root `AGENTS.md` rule. `recurring`: above. `unreviewed`: intake, awaiting first triage.
 - `effort::*` counts milestones, not elapsed time.

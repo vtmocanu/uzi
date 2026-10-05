@@ -406,7 +406,8 @@ changes it); trust it over a handover's claim.
      - **resolved by the merge**: `uzi findings resolve ID`.
      - **filed**: one issue per coherent fix, not per finding.
      - **already tracked**: an open issue covers it. Add one "hit again: run X / PR #N"
-       comment per issue per landing; `uzi findings resolve ID` (otherwise handled).
+       comment per issue per landing, and `recurring` at its second distinct incident
+       (taxonomy.md); `uzi findings resolve ID` (otherwise handled).
      - **dismissed**: `uzi findings dismiss ID --reason not-an-issue|wont-do`.
      - **needs you**: disagreement, insufficient evidence, or an unclear filing result stays
        in `to_file`. Never dismiss to empty the bucket.
