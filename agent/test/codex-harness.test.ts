@@ -491,6 +491,18 @@ describe("CodexHarness: resumed usage evidence", () => {
         authMode, accountant, onTokenUsageIncomplete: () => { notices++; },
         launchRoot: async () => ({ root: fakeRoot, transport, supervisorPid: 4321 }),
       });
+      const childNotes: CodexNotification[] = [];
+      harness.registerChildSink("child", { push: note => { childNotes.push(note); } });
+      const unrelatedUsage = ["foreign", "child"].flatMap(threadId => [
+        ...["", " \t "].map(turnId => {
+          const note = tokenUsage(historical, last, threadId, turnId);
+          return { method: note.method, params: note.params };
+        }),
+        ...[undefined, "", " \t "].map(turnId => ({
+          method: "thread/tokenUsage/updated",
+          params: { threadId, ...(turnId === undefined ? {} : { turnId }), tokenUsage: {} },
+        })),
+      ]);
       const write = (frame: unknown) => { inbound.write(JSON.stringify(frame) + "\n"); };
       let buffered = "";
       let delivery: Promise<void> | undefined;
@@ -508,9 +520,16 @@ describe("CodexHarness: resumed usage evidence", () => {
             // Foreign lifecycle and usage cannot establish the resumed root baseline.
             const sequence = [
               turnStarted("foreign"), tokenUsage(historical, last, "foreign", "historical"),
+              tokenUsage(historical, last, "child", "historical"),
+              tokenUsage(historical, last, " resumed-1 ", "historical"),
               turnStarted("resumed-1", "stale"), replay(), replay(),
+              ...unrelatedUsage,
               turnStarted("resumed-1"), tokenUsage(next, response, "resumed-1"),
+              ...unrelatedUsage,
               tokenUsage(next, response, "resumed-1"), replay(),
+              tokenUsage(historical, last, "foreign"), tokenUsage(historical, last, "child"),
+              tokenUsage(historical, last, " resumed-1 "),
+              tokenUsage(historical, last, "resumed-1", " tn-1 "),
               turnCompleted("completed", undefined, "resumed-1"),
             ];
             for (const note of sequence) {
@@ -526,6 +545,8 @@ describe("CodexHarness: resumed usage evidence", () => {
       try {
         const result = terminal(await withTimeout(collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events), 5000, "split replay"));
         await delivery;
+        assert.equal(childNotes.filter(note => note.kind === "token_usage_updated").length, 6);
+        assert.equal(childNotes.filter(note => note.kind === "activity").length, 6);
         assert.equal(result.outcome, "success");
         assert.equal(notices, 0);
         assert.deepEqual(accountant.aggregateByModel({ authMode, now: new Date("2026-10-05") })?.["gpt-6-astra"], {
@@ -540,6 +561,99 @@ describe("CodexHarness: resumed usage evidence", () => {
         inbound.destroy(); outbound.destroy();
       }
     });
+
+    for (const position of ["before", "after"] as const) {
+      for (const shape of ["typed", "activity"] as const) {
+        for (const field of ["threadId", "turnId"] as const) {
+          for (const identity of ["", " \t "] as const) {
+            it(`${authMode}: real transport rejects ${shape} ${field} ${identity === "" ? "empty" : "whitespace"} identity ${position} boundary`, async () => {
+              const inbound = new PassThrough();
+              const outbound = new PassThrough();
+              const transport = createCodexTransport({ inbound, outbound });
+              const accountant = new CodexUsageAccountant();
+              let notices = 0;
+              const onTokenUsageIncomplete = () => { notices++; };
+              const { harness } = makeHarness({
+                authMode, accountant, onTokenUsageIncomplete,
+                launchRoot: async () => ({ root: fakeRoot, transport, supervisorPid: 4321 }),
+              });
+              const finalTotal = { inputTokens: 1000, cachedInputTokens: 200, outputTokens: 300, reasoningOutputTokens: 100, totalTokens: 1300 };
+              const finalResponse = { inputTokens: 400, cachedInputTokens: 80, outputTokens: 120, reasoningOutputTokens: 40, totalTokens: 520 };
+              const malformed = {
+                ...rec(tokenUsage(next, response, "resumed-1").params),
+                [field]: identity,
+                ...(shape === "activity" ? { tokenUsage: {} } : {}),
+              };
+              let buffered = "";
+              let delivery: Promise<void> | undefined;
+              const write = (frame: unknown) => { inbound.write(JSON.stringify(frame) + "\n"); };
+              outbound.setEncoding("utf8");
+              outbound.on("data", (chunk: string) => {
+                buffered += chunk;
+                let end: number;
+                while ((end = buffered.indexOf("\n")) !== -1) {
+                  const frame = rec(JSON.parse(buffered.slice(0, end)));
+                  buffered = buffered.slice(end + 1);
+                  if (typeof frame.method !== "string" || frame.id === undefined) continue;
+                  write({ id: frame.id, result: defaultResponder(frame.method) });
+                  if (frame.method === "turn/start") delivery = (async () => {
+                    // Two replay pages arrive independently after the outbound start.
+                    // Delivery is finite and ordered; a write failure rejects the sequence.
+                    for (const note of [
+                      tokenUsage(last, last, "resumed-1", "older"), replay(),
+                    ]) {
+                      await tick();
+                      write({ method: note.method, params: note.params });
+                    }
+                    if (position === "before") write({ method: "thread/tokenUsage/updated", params: malformed });
+                    const boundary = turnStarted("resumed-1");
+                    write({ method: boundary.method, params: boundary.params });
+                    if (position === "after") write({ method: "thread/tokenUsage/updated", params: malformed });
+                    for (const note of [
+                      tokenUsage(finalTotal, finalResponse, "resumed-1"),
+                      turnCompleted("completed", { inputTokens: 9999 }, "resumed-1"),
+                    ]) {
+                      await tick();
+                      write({ method: note.method, params: note.params });
+                    }
+                  })();
+                }
+              });
+              try {
+                const result = terminal(await withTimeout(
+                  collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events),
+                  5000, "malformed usage identity",
+                ));
+                await delivery;
+                assert.equal(result.outcome, "success");
+                assert.equal(notices, 1);
+                assert.equal(accountant.usageIncomplete, true);
+                assert.equal(result.usage, undefined);
+                assert.equal(accountant.aggregateByModel(), undefined);
+                assert.deepEqual(result.metrics?.cost, { kind: authMode === "api_key" ? "unreported" : "subscription" });
+
+                const retry = makeHarness({ authMode, accountant, onTokenUsageIncomplete });
+                try {
+                  retry.transport.push(replay()).push(turnStarted("resumed-1"))
+                    .push(tokenUsage(finalTotal, finalResponse, "resumed-1"))
+                    .push(turnCompleted("completed", { inputTokens: 9999 }, "resumed-1")).end();
+                  const retried = terminal(await collect(retry.harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events));
+                  assert.equal(retried.outcome, "success");
+                  assert.equal(retried.usage, undefined);
+                  assert.equal(notices, 1);
+                } finally {
+                  await retry.harness.close();
+                }
+              } finally {
+                await delivery;
+                await harness.close();
+                inbound.destroy(); outbound.destroy();
+              }
+            });
+          }
+        }
+      }
+    }
 
     for (const hasReplay of [true, false]) {
       it(`${authMode}: metadata-only resume avoids an oversized history frame with ${hasReplay ? "replay" : "no replay"} and multiple new updates`, async () => {

@@ -1874,14 +1874,25 @@ export class CodexHarness implements RunHarness {
       }
     }
     if (note.method !== "thread/tokenUsage/updated") return;
-    if (this.resumedRoot && (root || noteThreadId(note) === undefined)) {
-      if (root && this.resumeBoundarySeen && note.kind === "token_usage_updated" &&
+    if (this.resumedRoot) {
+      const threadId = noteThreadId(note);
+      const turnId = note.kind === "token_usage_updated"
+        ? note.turnId : asString(asObject(note.params)?.turnId);
+      // Unknown thread identity or malformed root turn identity cannot establish root
+      // usage. Foreign/child turn IDs do not taint root; retain opaque nonblank IDs as-is.
+      if (threadId === undefined || threadId.trim() === "" ||
+          (root && (turnId === undefined || turnId.trim() === ""))) {
+        this.accountant.markIncomplete();
+        return;
+      }
+    }
+    if (this.resumedRoot && root) {
+      if (this.resumeBoundarySeen && note.kind === "token_usage_updated" &&
           note.turnId !== this.activeTurnId) return;
       if (note.kind !== "token_usage_updated" || !validResumedUsage(note)) {
         this.accountant.markIncomplete();
         return;
       }
-      if (!root) return;
       if (!this.resumeBoundarySeen) {
         if (note.turnId === this.activeTurnId) {
           this.accountant.markIncomplete();
