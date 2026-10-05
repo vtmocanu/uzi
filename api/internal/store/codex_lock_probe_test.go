@@ -229,6 +229,61 @@ func TestCodexLockContexts(t *testing.T) {
 	})
 }
 
+func TestCodexLockWriterJoin(t *testing.T) {
+	for _, mode := range []string{"pending", "completed", "consumed"} {
+		t.Run(mode, func(t *testing.T) {
+			ready := make(chan struct{})
+			proceed := make(chan struct{})
+			w := startCodexLockWriter(context.Background(), func(ctx context.Context) (int64, error) {
+				close(ready)
+				if mode == "pending" {
+					<-ctx.Done()
+					return 9, ctx.Err()
+				}
+				<-proceed
+				return 9, nil
+			})
+			actualComplete := w.complete
+			<-ready
+			if mode != "pending" {
+				close(proceed)
+				<-actualComplete
+			}
+			if mode == "consumed" {
+				<-w.result
+			}
+
+			notification := make(chan struct{})
+			w.complete = notification
+			stopReturned := make(chan struct{})
+			verdict := make(chan bool)
+			forwarded := make(chan struct{})
+			go func() {
+				defer close(forwarded)
+				<-actualComplete
+				// Only stop receives notification. Without its join, this send
+				// cannot rendezvous, regardless of when the writer finishes.
+				select {
+				case notification <- struct{}{}:
+					verdict <- true
+				case <-stopReturned:
+					verdict <- false
+				}
+			}()
+
+			w.stop()
+			close(stopReturned)
+			joined := <-verdict
+			<-forwarded
+			// Diagnostics join the real writer, never the notification transport.
+			<-actualComplete
+			if !joined {
+				t.Fatal("cleanup returned without joining completion")
+			}
+		})
+	}
+}
+
 func TestCodexLockWriterLifecycle(t *testing.T) {
 	for _, mode := range []string{"pending", "completed", "consumed", "error", "canceled", "final wait canceled", "probe expired", "probe error", "goexit"} {
 		t.Run(mode, func(t *testing.T) {
