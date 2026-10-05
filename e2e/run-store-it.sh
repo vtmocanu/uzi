@@ -12,8 +12,8 @@
 #     quota that lets four workers through here.
 #
 # Spins up a THROWAWAY Postgres, points UZI_TEST_DATABASE_URL at it, applies the
-# real goose migrations, seeds fixtures, and runs every *LiveDB test in the six
-# packages that carry one (store, handler, forgesvc, schedsvc, workersvc, recovery -- the
+# real goose migrations, seeds fixtures, and runs every *LiveDB test in the seven
+# packages that carry one (store, handler, forgesvc, schedsvc, workersvc, recovery, poller -- the
 # list on the `go test` line below, mirrored in .github/workflows/ci.yml).
 # Isolated: unique container + published loopback port, torn down on exit; never
 # touches the user's own stacks or DBs.
@@ -121,7 +121,7 @@ cd "$ROOT/api"
 # second one failed on the UNIQUE constraint). Derive token hashes from a fresh
 # uuid, the way handler/hosted_provision_livedb_test.go documents.
 #
-# PKGS is the ONE list; ci.yml's "LiveDB tests" step carries the same six, and the
+# PKGS is the ONE list; ci.yml's "LiveDB tests" step carries the same seven, and the
 # per-package check below is what makes a stale list visible: a listed package that
 # contributes zero *LiveDB tests prints `ok <pkg> 0.01s [no tests to run]`, which the
 # aggregate exit code and the aggregate PASS count both read as green.
@@ -132,6 +132,7 @@ PKGS=(
   ./internal/schedsvc/...
   ./internal/workersvc/...
   ./internal/recovery/...
+  ./internal/poller/...
 )
 # EXPLICIT XXXXXX template, NOT `mktemp -t <name>`: GNU coreutils rejects a `-t`
 # template with too few X's (it needs >=3 consecutive; this one had none) with "too
@@ -166,5 +167,21 @@ for p in "${PKGS[@]}"; do
   fi
 done
 rm -f "$LOG"
+
+# This opt-in leg shares the live throwaway DSN but is outside the LiveDB name
+# filter. Existing Go-only CI lanes neither require Node nor prove this composition.
+if [ -n "${UZI_CODEX_REFRESH_LOSTREPLY_E2E:-}" ]; then
+  E2E_LOG="$(mktemp "${TMPDIR:-/tmp}/codex-refresh-lostreply-log.XXXXXX")"
+  UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
+    -run '^TestCodexRefreshLostReplyE2E$' ./internal/handler/... 2>&1 | tee "$E2E_LOG"
+  # A named RUN and PASS are mandatory; inspect all indentation levels for skips.
+  if ! grep -q '^=== RUN   TestCodexRefreshLostReplyE2E$' "$E2E_LOG" ||
+    ! grep -q '^--- PASS: TestCodexRefreshLostReplyE2E ' "$E2E_LOG" ||
+    grep -q -- '--- SKIP:' "$E2E_LOG"; then
+    echo "combined Codex proof did not run and pass without skips: $E2E_LOG" >&2
+    exit 1
+  fi
+  rm -f "$E2E_LOG"
+fi
 
 printf '\n\033[32mStore integration tests passed.\033[0m\n'

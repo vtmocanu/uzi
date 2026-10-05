@@ -2,6 +2,7 @@ import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import { randomUUID } from "node:crypto";
+import { getEventListeners } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -35,8 +36,8 @@ import {
   type CodexExecutorDeps,
   type CodexCommittedGenerationCell,
 } from "../src/codex/codex-executor.js";
+import { WorkerClient, RequestError, CodexRequestFailure } from "../src/client.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
-import { RequestError } from "../src/client.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { WORKER_UID, RUNNER_UID } from "../src/runner-uid.js";
 import { gitEnv } from "../src/git.js";
@@ -56,7 +57,6 @@ import { CodexAdviceHarness } from "../src/codex/codex-advice-harness.js";
 import { makeRedactor, makeTextRedactor } from "../src/redact.js";
 import { MessageBatcher } from "../src/batcher.js";
 import { MAX_PROJECTED_BYTES } from "../src/codex/projection.js";
-import type { WorkerClient } from "../src/client.js";
 import type { OutgoingMessage } from "../src/protocol.js";
 import { CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
 import type { RunContext, EmittedMessage, Executor, WallParkOutcome, SecretRemediationDecision } from "../src/executor.js";
@@ -6886,6 +6886,92 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
 });
 
 describe("Codex completion interlock", () => {
+  for (const scenario of [
+    { name: "zero", ack: { scopeCeiling: 0, completedCount: 0 }, capped: 0 },
+    { name: "overshoot", ack: { scopeCeiling: 1, completedCount: 2 }, capped: 2 },
+    { name: "full total", ack: { scopeCeiling: 1, completedCount: 3 } },
+    { name: "above total", ack: { scopeCeiling: 1, completedCount: 4 } },
+    { name: "missing count", ack: { scopeCeiling: 0 } },
+    { name: "below ceiling", ack: { scopeCeiling: 2, completedCount: 1 } },
+    { name: "absent ceiling", ack: { completedCount: 2 } },
+    { name: "missing ACK", ack: undefined },
+    { name: "nonissue", ack: { scopeCeiling: 0, completedCount: 0 }, kind: "prompt" as const },
+    { name: "no frozen list", ack: { scopeCeiling: 0, completedCount: 0 }, frozen: [] },
+    { name: "absent frozen list", ack: { scopeCeiling: 0, completedCount: 0 }, noFrozen: true },
+  ]) {
+    it(`fresh boundary: ${scenario.name}`, async () => {
+      const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "signal_done", {}, th, tn, "boundary-done")).push(turnCompleted("completed", th, tn));
+      })]);
+      const c = makeCtx({
+        kind: scenario.kind ?? "issue", completionInterlock: true,
+        frozenMilestones: scenario.noFrozen ? undefined : scenario.frozen ?? [1, 2, 3].map((n) => ({ id: `m${n}`, title: `Milestone ${n}` })),
+        recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 1 }),
+        reportIteration: async () => scenario.ack,
+      });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(c.ctx), 5000, scenario.name);
+      assert.deepEqual(result.scopeCapped, scenario.capped === undefined ? undefined : { completedCount: scenario.capped, total: 3 });
+      assert.equal(rig.providerLaunches(), scenario.capped === undefined ? 1 : 0);
+      assert.equal(c.emitted.filter((m) => m.kind === "steer_ack").length, scenario.capped === undefined ? 0 : 1);
+    });
+  }
+
+  for (const mode of ["cap", "uncapped", "raised", "raised threshold", "missing ACK", "missing count", "budget lift", "cancel", "ACK cancel"] as const) {
+    it(`interlocked done at maxIterations=1: ${mode}`, async () => {
+      const rig = makeMultiEpochRig([
+        epochResponder("th-1", "tn-1", (t, th, tn) => {
+          t.push(toolCall(1, "signal_done", { milestones_completed: ["m2"] }, th, tn, "cap-done-1")).push(turnCompleted("completed", th, tn));
+        }),
+        resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+          t.push(toolCall(2, "signal_done", { milestones_completed: ["m3"] }, th, tn, "cap-done-2")).push(turnCompleted("completed", th, tn));
+        }),
+      ]);
+      const order: string[] = [];
+      const union = new Set(["m1"]);
+      let ackCancelled = false;
+      const holds: string[] = [];
+      let attempts = 0;
+      const { ctx } = makeCtx({
+        kind: "issue", completionInterlock: true, config: { max_iterations: mode === "raised threshold" ? 2 : 1 },
+        frozenMilestones: [1, 2, 3].map((n) => ({ id: `m${n}`, title: `Milestone ${n}` })),
+        cancelRequested: () => ackCancelled || (mode === "cancel" && attempts === 1),
+        checkpoint: async (opts) => { assert.equal(opts.sink, "done_checkpoint"); order.push("checkpoint"); },
+        recordCompletionAttempt: async ({ declared }) => {
+          order.push("attempt");
+          for (const id of declared) union.add(id);
+          attempts++;
+          return { unmet: ["m1", "m2", "m3"].filter((id) => !union.has(id)), attemptCount: attempts };
+        },
+        reportIteration: async (n) => {
+          order.push(`ack-${n}`);
+          if (n > 1 && mode === "ACK cancel") ackCancelled = true;
+          if (n > 1 && mode === "missing ACK") return undefined;
+          return { scopeCeiling: mode === "uncapped" || mode === "budget lift" ? undefined : (mode === "raised" || mode === "raised threshold") && n > 1 ? 3 : 2,
+            completedCount: n > 1 && mode === "missing count" ? undefined : union.size, completedIds: [...union],
+            ...(mode === "cap" && n > 1 ? { budgetExhausted: true, pauseRequested: true } : {}),
+            ...(mode === "budget lift" && n > 1 ? { maxIterations: 2 } : {}) };
+        },
+        enterCompletionHold: async (reason) => { holds.push(reason); return true; },
+        parkForPause: async () => { assert.fail("cap must precede pause"); },
+      });
+      const running = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, mode);
+      if (mode === "cancel" || mode === "ACK cancel") {
+        await assert.rejects(running, /cancelled/);
+        assert.deepEqual(order, mode === "cancel" ? ["ack-1", "checkpoint", "attempt"] : ["ack-1", "checkpoint", "attempt", "ack-2"]);
+      } else {
+        const result = await running;
+        assert.deepEqual(order.slice(0, 4), ["ack-1", "checkpoint", "attempt", "ack-2"]);
+        assert.deepEqual(result.scopeCapped, mode === "cap" ? { completedCount: 2, total: 3 } : undefined);
+        assert.equal(holds.length, ["uncapped", "raised", "missing ACK", "missing count"].includes(mode) ? 1 : 0);
+        if (holds.length) assert.match(holds[0]!, /iteration budget/);
+      }
+      assert.equal(rig.providerLaunches(), mode === "budget lift" || mode === "raised threshold" ? 2 : 1);
+      assert.equal(rig.client.releaseCalls.length, mode === "budget lift" || mode === "raised threshold" ? 2 : 1, "no extra epoch credential release");
+      assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+      assert.equal(rig.epochs[1]?.transport.turnStartCount ?? 0, mode === "budget lift" || mode === "raised threshold" ? 1 : 0);
+    });
+  }
+
   const doneEpoch = (n: number): Responder => resumedEpochResponder("th-1", `tn-${n}`, (t, th, tn) => {
     t.push(toolCall(n, "signal_done", { milestones_completed: ["m1"] }, th, tn, `done-${n}`))
       .push(turnCompleted("completed", th, tn));
@@ -9183,10 +9269,10 @@ describe("CodexExecutor: vault_locked deferral (issue #1766)", () => {
     }
   });
 
-  it("buildRunLaneReconcile: a generic 500 (and a 409 with another reason) → blocked WITHOUT a deferral, exact legacy message", async () => {
+  it("buildRunLaneReconcile: generic 500 and API contended exhaust two attempts as refresh_unknown", async () => {
     for (const err of [
       new RequestError("POST", "/x", 500, JSON.stringify({ reason: "vault_locked" })),
-      new RequestError("POST", "/x", 409, JSON.stringify({ reason: "refresh_contended" })),
+      new RequestError("POST", "/x", 409, JSON.stringify({ error: "codex refresh is contended; retry" })),
     ]) {
       const client = {
         refreshCodex: async (): Promise<never> => { throw err; },
@@ -9195,7 +9281,8 @@ describe("CodexExecutor: vault_locked deferral (issue #1766)", () => {
       const out = await buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => {})(RECONCILE_REQ, RECONCILE_SIGNAL);
       assert.deepEqual(out, {
         kind: "blocked",
-        errors: [{ category: "authorization", message: "codex subscription boundary reconcile failed" }],
+        errors: [{ category: "authorization", message: "codex subscription boundary reconcile deferred: refresh outcome unknown" }],
+        deferral: "refresh_unknown",
       });
     }
   });
@@ -9204,7 +9291,7 @@ describe("CodexExecutor: vault_locked deferral (issue #1766)", () => {
     // Closure-level: drives buildRunLaneReconcile directly, not a whole run.
     const calls: { operation_id: string; observed_generation: number }[] = [];
     const script: (() => never | { access_token: string; generation: number })[] = [
-      () => { throw new Error("fetch failed"); },
+      () => { throw new CodexRequestFailure("transport"); },
       () => { throw vaultLocked409("refresh"); },
       () => ({ access_token: "tok-a", generation: 4 }),
       () => ({ access_token: "tok-b", generation: 5 }),
@@ -9218,9 +9305,8 @@ describe("CodexExecutor: vault_locked deferral (issue #1766)", () => {
     };
     const reconcile = buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => {});
     const first = await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL);
-    assert.equal(first.kind === "blocked" && first.deferral, undefined, "a transport error is a plain block");
-    const second = await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL);
-    assert.equal(second.kind === "blocked" && second.deferral, "vault_locked");
+    assert.equal(first.kind === "blocked" && first.deferral, "vault_locked", "lost reply reconciles immediately to the typed deferral");
+    assert.equal(calls.length, 2, "exactly two attempts in the first invocation");
     assert.equal((await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL)).kind, "ready");
     assert.equal(calls[0]!.operation_id, calls[1]!.operation_id);
     assert.equal(calls[1]!.operation_id, calls[2]!.operation_id, "the deferral retained the operation id");
@@ -9398,7 +9484,7 @@ describe("CodexExecutor: mid-turn vault_locked refresh deferral (issue #1789)", 
 
   it("C1: every other refresh failure is rethrown unchanged and never signals; the advice lane (no callback) keeps its behaviour", async () => {
     const failures: unknown[] = [
-      new RequestError("POST", "/x", 409, JSON.stringify({ reason: "refresh_contended" })),
+      new RequestError("POST", "/x", 409, JSON.stringify({ error: "codex refresh is contended; retry" })),
       new RequestError("POST", "/x", 409, JSON.stringify({ reason: "refresh_quarantined" })),
       new RequestError("POST", "/x", 500, JSON.stringify({ reason: "vault_locked" })),
       new Error("fetch failed"),
@@ -10948,28 +11034,80 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     assert.equal(rig.transport.turnStartCount, 1, "no provider turn started after the cancel");
   });
 
-  it("(d2) a wall budget spent during the backoff takes the wall path, never TransientRecoveryError", async () => {
-    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
-    // The backoff (1s x attempt) is capped at the remaining wall and debited from it.
-    tinyBackoff(rig, { transientBackoffBaseMs: 1000, wallMs: 300, idleMs: 5000 });
-    await assert.rejects(
-      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "wall in backoff"),
-      (e: Error) => {
-        assert.ok(!(e instanceof TransientRecoveryError));
-        assert.match(e.message, /codex run wall-clock timeout/);
-        return true;
-      },
-    );
-    assert.equal(rig.transport.turnStartCount, 1, "no provider turn started with the budget spent");
-
-    const parkRig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
-    tinyBackoff(parkRig, { transientBackoffBaseMs: 1000, wallMs: 300, idleMs: 5000 });
-    let wallParks = 0;
-    const { ctx } = makeCtx({ parkForWall: async () => { wallParks++; return "parked"; } });
-    const result = await withTimeout(makeExecutor(parkRig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "wall park in backoff");
-    assert.deepStrictEqual(result.walled, { reason: "codex run wall-clock timeout" });
-    assert.equal(wallParks, 1);
-    assert.equal(parkRig.transport.turnStartCount, 1);
+  it("(d2) a wall budget spent during the backoff takes the wall path, never TransientRecoveryError", async (t) => {
+    for (const wired of [false, true]) {
+      await t.test(wired ? "parked wall" : "unwired wall rejection", async (t) => {
+        const realSetTimeout = globalThis.setTimeout;
+        const realClearTimeout = globalThis.clearTimeout;
+        const controller = new AbortController();
+        const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
+        tinyBackoff(rig, { transientBackoffBaseMs: 1000, wallMs: 300, idleMs: 5000 });
+        let wallParks = 0;
+        const { ctx, emitted } = makeCtx({
+          signal: controller.signal,
+          ...(wired ? { parkForWall: async () => { wallParks++; return "parked" as const; } } : {}),
+        });
+        let watchdogHandle: ReturnType<typeof setTimeout> | undefined;
+        let cleanupHandle: ReturnType<typeof setTimeout> | undefined;
+        let settled = false;
+        let running: Promise<
+          { result: Awaited<ReturnType<CodexExecutor["run"]>>; error?: never } |
+          { error: unknown; result?: never }
+        > | undefined;
+        const watchdog = new Promise<never>((_, reject) => {
+          watchdogHandle = realSetTimeout(() => reject(new Error("timed out setting up or completing wall in backoff")), 3000);
+        });
+        const bounded = <T,>(promise: Promise<T>): Promise<T> => Promise.race([promise, watchdog]);
+        try {
+          // Freeze startup so the first retry still has the entire 300 ms wall budget.
+          t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+          running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx).then(
+            (result) => { settled = true; return { result }; },
+            (error: unknown) => { settled = true; return { error }; },
+          );
+          // tick uses real setImmediate; waitFor's Date.now deadline would be frozen.
+          while (retryNotices(emitted).length === 0) await bounded(tick());
+          assert.equal(retryNotices(emitted).length, 1, "the first retry notice confirms backoff began");
+          await bounded(tick());
+          assert.equal(rig.transport.turnStartCount, 1);
+          t.mock.timers.tick(250);
+          await bounded(tick());
+          assert.equal(rig.transport.turnStartCount, 1);
+          assert.equal(settled, false, "50 ms of wall budget remains after the first slice");
+          t.mock.timers.tick(50);
+          await bounded(tick());
+          const outcome = await bounded(running);
+          if (wired) {
+            assert.ok(outcome.result);
+            assert.deepStrictEqual(outcome.result.walled, { reason: "codex run wall-clock timeout" });
+            assert.equal(wallParks, 1);
+          } else {
+            assert.ok(outcome.error instanceof Error);
+            assert.ok(!(outcome.error instanceof TransientRecoveryError));
+            assert.match(outcome.error.message, /codex run wall-clock timeout/);
+          }
+          assert.equal(rig.transport.turnStartCount, 1, "no provider turn started with the budget spent");
+        } finally {
+          if (watchdogHandle !== undefined) realClearTimeout(watchdogHandle);
+          try {
+            if (running !== undefined && !settled) {
+              // Abort only this run, queue any pending slice, then wake it before resetting mocks.
+              controller.abort();
+              const cleanupWatchdog = new Promise<never>((_, reject) => {
+                cleanupHandle = realSetTimeout(() => reject(new Error("timed out settling aborted wall test")), 3000);
+              });
+              await Promise.race([tick(), cleanupWatchdog]);
+              t.mock.timers.tick(250);
+              await Promise.race([running, cleanupWatchdog]);
+            }
+          } finally {
+            if (cleanupHandle !== undefined) realClearTimeout(cleanupHandle);
+            t.mock.timers.reset();
+            t.mock.restoreAll();
+          }
+        }
+      });
+    }
   });
 
   it("(d3) an early timer wake cannot finish a wall-capped backoff with budget left", async (t) => {
@@ -11187,5 +11325,198 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
       return true;
     });
     assert.equal(rig.transport.turnStartCount, 2, "no provider turn started for the retry");
+  });
+});
+
+describe("M2 subscription boundary reconciliation", () => {
+  const lost = () => new CodexRequestFailure("transport");
+  const http = (status: number, body: unknown = { error: "codex operation failed" }) =>
+    new RequestError("POST", "/private-coordinate", status, JSON.stringify(body));
+
+  it("freezes the complete tuple for two attempts and advances the shared cell monotonically", async () => {
+    const committed = { value: 3 };
+    const calls: unknown[] = [];
+    const tokens: string[] = [];
+    const client = {
+      refreshCodex: async (_id: string, req: unknown) => {
+        calls.push(req);
+        if (calls.length === 1) { committed.value = 9; throw lost(); }
+        return { access_token: "validated-token", generation: 4 };
+      },
+      releaseCodex: async () => { throw new Error("unused"); },
+    };
+    const out = await buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), (t) => tokens.push(t), committed)(RECONCILE_REQ, RECONCILE_SIGNAL);
+    assert.equal(out.kind, "ready");
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[0], calls[1]);
+    assert.equal((calls[1] as { observed_generation: number }).observed_generation, 3);
+    assert.equal(committed.value, 9);
+    assert.deepEqual(tokens, ["validated-token"]);
+  });
+
+  for (const [name, second] of [
+    ["lost body", lost()],
+    ["ambiguous-first then generic500-on-reconciliation", http(500)],
+    ["old API generic credential quarantine", http(409, { error: "codex credential is not available" })],
+    ["old API generic refresh unavailable", http(409, { error: "codex refresh is unavailable" })],
+    ["API pending contended", http(409, { error: "codex refresh is contended; retry" })],
+  ] as const) {
+    it(`${name}: exactly two attempts then refresh_unknown, no diagnostic canaries`, async () => {
+      let calls = 0;
+      const client = {
+        refreshCodex: async () => { throw ++calls === 1 ? lost() : second; },
+        releaseCodex: async () => { throw new Error("unused"); },
+      };
+      const out = await buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => assert.fail("no token"))(RECONCILE_REQ, RECONCILE_SIGNAL);
+      assert.equal(calls, 2);
+      assert.equal(out.kind === "blocked" && out.deferral, "refresh_unknown");
+      assert.doesNotMatch(JSON.stringify(out), /private-coordinate|codex operation failed/);
+    });
+  }
+
+  for (const refusal of [http(400), http(401), http(403), http(404),
+    http(409, { error: "codex credential is not available" }),
+    new CodexRequestFailure("local"), new CodexRequestFailure("response"), new Error("unclassified local failure")]) {
+    it(`definite ${refusal instanceof RequestError ? refusal.status : refusal.message}: no retry or deferral`, async () => {
+      let calls = 0;
+      const client = { refreshCodex: async () => { calls++; throw refusal; }, releaseCodex: async () => { throw refusal; } };
+      const out = await buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => assert.fail("no token"))(RECONCILE_REQ, RECONCILE_SIGNAL);
+      assert.equal(calls, 1);
+      assert.equal(out.kind === "blocked" && out.deferral, undefined);
+    });
+  }
+
+  for (const mode of ["deadline", "lifecycle", "claim_loss", "forbidden", "server_unknown", "response_invalid"] as const) {
+    it(`${mode} after ambiguity preserves precedence`, async () => {
+      const boundary = new AbortController();
+      const lifecycle = new AbortController();
+      let calls = 0;
+      const client = {
+        refreshCodex: async () => {
+          calls++;
+          if (calls === 1) {
+            if (mode === "deadline") boundary.abort();
+            if (mode === "lifecycle") lifecycle.abort();
+            throw lost();
+          }
+          throw mode === "claim_loss" ? http(404) : mode === "forbidden" ? http(403)
+            : mode === "server_unknown" ? http(409, { reason: "refresh_unknown" }) : new CodexRequestFailure("response");
+        },
+        releaseCodex: async () => { throw new Error("unused"); },
+      };
+      const out = await buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => assert.fail("no token"), { value: 3 }, undefined, lifecycle.signal)(RECONCILE_REQ, boundary.signal);
+      assert.equal(calls, mode === "deadline" || mode === "lifecycle" ? 1 : 2);
+      assert.equal(out.kind === "blocked" && out.deferral, mode === "deadline" ? "refresh_unknown" : undefined);
+    });
+  }
+});
+
+describe("M2 cancellation and elapsed deadline fences", () => {
+  it("an already confirmed vault lock needs no credential deadline, while lifecycle cancellation wins", async () => {
+    const boundary = new AbortController();
+    boundary.abort();
+    const lifecycle = new AbortController();
+    const client = { refreshCodex: async () => assert.fail("no refresh"), releaseCodex: async () => assert.fail("no release") };
+    const reconcile = buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => assert.fail("no token"), { value: 3 }, () => true, lifecycle.signal);
+    const expired = { ...RECONCILE_REQ, deadlineMs: 0 };
+    const held = await reconcile(expired, boundary.signal);
+    assert.equal(held.kind === "blocked" && held.deferral, "vault_locked");
+    lifecycle.abort();
+    const cancelled = await reconcile(expired, boundary.signal);
+    assert.equal(cancelled.kind === "blocked" && cancelled.deferral, undefined);
+  });
+  it("lifecycle cancellation with a valid reply grants no ready outcome or token", async () => {
+    const lifecycle = new AbortController();
+    const committed = { value: 3 };
+    const client = {
+      refreshCodex: async () => { lifecycle.abort(); return { access_token: "fixture-token", generation: 4 }; },
+      releaseCodex: async () => { throw new Error("unused"); },
+    };
+    const out = await buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => assert.fail("no token"), committed, undefined, lifecycle.signal)(RECONCILE_REQ, RECONCILE_SIGNAL);
+    assert.equal(out.kind === "blocked" && out.deferral, undefined);
+    assert.equal(committed.value, 3);
+  });
+  it("an elapsed deadline after an ambiguous send holds without a second send", async (t) => {
+    let now = 100;
+    t.mock.method(Date, "now", () => now);
+    let calls = 0;
+    const client = {
+      refreshCodex: async () => { calls++; now = 200; throw new CodexRequestFailure("transport"); },
+      releaseCodex: async () => { throw new Error("unused"); },
+    };
+    const out = await buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => assert.fail("no token"))({ ...RECONCILE_REQ, deadlineMs: 50 }, RECONCILE_SIGNAL);
+    assert.equal(calls, 1);
+    assert.equal(out.kind === "blocked" && out.deferral, "refresh_unknown");
+  });
+});
+
+describe("M2 actual WorkerClient boundary cancellation", () => {
+  for (const mode of ["timeout", "boundary", "lifecycle", "before_send"] as const) {
+    it(`${mode}: sent ambiguity parks only without lifecycle cancellation`, async (t) => {
+      const boundary = new AbortController();
+      const lifecycle = new AbortController();
+      const deadline = new AbortController();
+      t.mock.method(AbortSignal, "timeout", () => deadline.signal.aborted ? new AbortController().signal : deadline.signal);
+      let calls = 0;
+      t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
+        calls++;
+        if (mode === "timeout" && calls === 2) return new Response(JSON.stringify({
+          auth_mode: "subscription", access_token: "fixture-token", generation: 4, chatgpt_account_id: SUBSCRIPTION.chatgpt_account_id,
+          chatgpt_plan_type: null, outcome: "reconciled",
+        }));
+        const waiting = new Promise<Response>((_resolve, reject) => {
+          init.signal!.addEventListener("abort", () => reject(new Error("private-canary")), { once: true });
+        });
+        if (mode === "boundary") boundary.abort();
+        else if (mode === "lifecycle") lifecycle.abort();
+        else deadline.abort();
+        return waiting;
+      });
+      if (mode === "before_send") boundary.abort();
+      const client = new WorkerClient("http://fixture.invalid", "fixture-token", "test", noopLog);
+      const out = await buildRunLaneReconcile("run-1", client, bindingOf(SUBSCRIPTION), () => {}, { value: 3 }, undefined, lifecycle.signal)(RECONCILE_REQ, boundary.signal);
+      assert.equal(calls, mode === "before_send" ? 0 : mode === "timeout" ? 2 : 1);
+      assert.equal(out.kind, mode === "timeout" ? "ready" : "blocked");
+      assert.equal(out.kind === "blocked" ? out.deferral : undefined, mode === "boundary" ? "refresh_unknown" : undefined);
+      assert.doesNotMatch(JSON.stringify(out), /private-canary|fixture.invalid|fixture-token/);
+    });
+  }
+
+  it("real executor retains lifecycle forwarding through post-run finalize and removes it on disposal", async (t) => {
+    const controller = new AbortController();
+    const rig = makeRig();
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    await withTimeout(exec.run(makeCtx({ signal: controller.signal }).ctx), 3000, "deferred run");
+    assert.equal(getEventListeners(controller.signal, "abort").length, 1, "deferred safety owns the remaining lifecycle listener");
+    let calls = 0;
+    let sent!: () => void;
+    const started = new Promise<void>((resolve) => { sent = resolve; });
+    const realClient = new WorkerClient("http://fixture.invalid", "fixture-token", "test", noopLog);
+    t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
+      calls++;
+      if (calls === 1) throw new Error("private-canary");
+      const waiting = new Promise<Response>((_resolve, reject) => {
+        init.signal!.addEventListener("abort", () => reject(new Error("private-canary")), { once: true });
+      });
+      sent();
+      return waiting;
+    });
+    rig.client.refreshCodex = realClient.refreshCodex.bind(realClient) as unknown as typeof rig.client.refreshCodex;
+    let actions = 0;
+    const finalizing = exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 1000 }, async () => { actions++; });
+    await started;
+    controller.abort();
+    await assert.rejects(withTimeout(finalizing, 3000, "post-run lifecycle abort"), (err: unknown) => {
+      assert.ok(err instanceof CodexBoundaryError);
+      assert.equal(err.deferral, undefined);
+      assert.doesNotMatch(err.message, /private-canary|fixture.invalid/);
+      return true;
+    });
+    assert.equal(calls, 2);
+    assert.equal(actions, 0);
+    await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 200 });
+    assert.equal(getEventListeners(controller.signal, "abort").length, 0);
   });
 });

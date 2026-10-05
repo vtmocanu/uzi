@@ -133,7 +133,7 @@ Each Track U milestone ends green on its named gates, each run once to a log (`C
 - **PVC root directories.** After migration, leave each mounted volume's **root directory** matching what the kubelet's `OnRootMismatch` check expects (group 10001, setgid, group-rwx) without changing the ownership of the contents, so the kubelet skips its recursive walk of the nix store on every start.
 - The non-root branch is untouched: a non-root start still unsets the split variables and runs single-uid.
 - Tests: extend `agent/test/templates-guardrails.test.ts` and the entrypoint shell tests beside it for each of the four behaviours and for the unchanged compose path. Build token-shaped fixtures from parts (`.claude/rules/prds.md`).
-- Gate: `task gate:agent` plus `task lint:repo` (shellcheck).
+- Gate: `task gate:agent` plus `task lint:shell` (shellcheck).
 
 ### M3: optional Landlock and honest capability advertisement (Track U)
 

@@ -27,7 +27,7 @@ type mrReviewWatchStore interface {
 	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.MrReworkLedger, error)
 	UpsertMRReworkLedger(ctx context.Context, arg store.UpsertMRReworkLedgerParams) error
 	SetMRReworkHaltNotified(ctx context.Context, arg store.SetMRReworkHaltNotifiedParams) error
-	DeleteMRReworkLedgerNotIn(ctx context.Context, arg store.DeleteMRReworkLedgerNotInParams) (int64, error)
+	DeleteMRReworkLedgerNotIn(ctx context.Context, repoID uuid.UUID) (int64, error)
 }
 
 // MRReworkRunStarter creates an automatic mr_rework run through workersvc's shared
@@ -131,24 +131,18 @@ func (d *MRReviewWatch) detect(ctx context.Context, r store.ListEnabledReposWith
 		return
 	}
 
-	keep := make([]string, 0, len(cands))
 	for _, cand := range cands {
 		if ctx.Err() != nil {
 			return
 		}
-		keep = append(keep, cand.Ref.String)
 		d.detectOne(ctx, r, f, cand, capLimit)
 	}
 
-	// Reconcile eviction (stop-on-merge / stop-on-close cleanup): drop ledger rows for
-	// refs no longer in the opened-MR candidate set. A merged/closed MR left the
-	// candidate set (mr_state != 'opened'), so its ledger row evicts here and a reused
-	// agent/issue-N branch never inherits a stale count. Best-effort. An empty keep-set
-	// clears the repo's ledger, which is correct when the last watched MR terminated.
-	if _, err := d.q.DeleteMRReworkLedgerNotIn(ctx, store.DeleteMRReworkLedgerNotInParams{
-		RepoID:   r.ID,
-		KeepRefs: keep,
-	}); err != nil {
+	// Reconcile once per repo, best-effort: DeleteMRReworkLedgerNotIn retains rows
+	// while any qualifying opened source remains, independently of eligibility.
+	// A failure is logged and retried on the next tick; candidate processing above
+	// is unaffected.
+	if _, err := d.q.DeleteMRReworkLedgerNotIn(ctx, r.ID); err != nil {
 		slog.Warn("poller: mr-rework ledger eviction", "repo", r.PathWithNamespace, "error", err)
 	}
 }

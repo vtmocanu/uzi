@@ -1,6 +1,6 @@
 # PRD #238: GitHub support — the third forge driver
 
-**GitLab Issue**: [#238](https://github.com/vtmocanu/uzi/-/issues/238)
+**GitLab Issue**: [#238](https://github.com/vtmocanu/uzi/issues/238)
 **Status**: Complete (2026-08-08) — implemented across M1–M10 on branch `agent/issue-238` (driver, worker seam, privcheck arm, migration, vocabulary, e2e github lane, docs, and the go-live gate flip), with a read-only review + full quality gate green. One residual honestly recorded: the D6 `[verify-live]` rulesets-bot-scope spike (does `ListRulesForBranch` reflect the calling bot's own bypass ability) was **not executable** without GitHub credentials in the implementation environment, so `DefaultBranchProtection` was built **fail-safe to both outcomes** (never a fabricated `WriteRoleCan*=true` on a protected branch; `ProtectionUnverified=true` whenever protection can't be authoritatively read) — the one thing a future reviewer should pressure-test against a real repo (see ADR-0238). Designed against the seam PRD #65 (Forgejo) established and ADR-0065 records.
 **Priority**: High
 **Depends on**: no uzi PRD. PRD #65 already did the load-bearing generalization work (the worker forge seam `agent/src/forge.ts`, `runs.mr_web_url`, the connect-UI forge-type picker, the `pipelinestatus`/`pipelineBadge` two-vocabulary fold, the `forgeNoun` mapping site, `forge_type` reaching the web per card/run). This PRD is the third consumer of all of it; it should not need to re-open any of those seams, and where it does that is a finding, not a plan.

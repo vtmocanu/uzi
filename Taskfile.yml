@@ -2345,6 +2345,22 @@ tasks:
       - npm run test:browser
 
   # ----------------------------------------------------------- agent (npm) ----
+  test:codex-refresh-lostreply-e2e:
+    desc: combined Codex lost refresh reply proof (real HTTP, Postgres and worker)
+    cmds:
+      - |
+        command -v node >/dev/null || { echo "Node 24 or newer is required" >&2; exit 1; }
+        node -e 'if (Number(process.versions.node.split(".")[0]) < 24) process.exit(1)'
+        command -v npm >/dev/null || { echo "npm is required" >&2; exit 1; }
+      - |
+        if ! task deps-check:agent; then
+          (cd agent && npm ci --ignore-scripts)
+          task deps-check:agent
+        fi
+      - |
+        mkdir -p .uzi/scratch
+        UZI_CODEX_REFRESH_LOSTREPLY_E2E=1 TMPDIR="{{.ROOT_DIR}}/.uzi/scratch" ./e2e/run-store-it.sh
+
   deps-check:agent:
     desc: agent - is node_modules stale? (declared ranges AND resolved lockfile, offline)
     cmds:

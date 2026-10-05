@@ -1,6 +1,6 @@
 # PRD #85: Version-stamp the builtin roles and make library drift detectable
 
-**GitLab Issue**: [#85](https://github.com/vtmocanu/uzi/-/issues/85)
+**GitLab Issue**: [#85](https://github.com/vtmocanu/uzi/issues/85)
 **Status**: COMPLETE — the drift-check core (M1, M2, M4, M7) landed on branch `agent/issue-85`; M3 dropped, M5/M6 and Phase 2 were already done/superseded. See the banner below for the scope.
 **Priority**: Medium
 **Related**:

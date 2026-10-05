@@ -1,6 +1,6 @@
 # PRD #52: CI/CD — real pipeline, tag releases, ArgoCD deploy to dev-cluster
 
-**GitLab Issue**: [#52](https://github.com/vtmocanu/uzi/-/issues/52)
+**GitLab Issue**: [#52](https://github.com/vtmocanu/uzi/issues/52)
 **Status**: Complete (created 2026-07-13, completed 2026-07-16)
 **Priority**: High
 **Depends on**: nothing in-repo. Platform prerequisites (Harbor, ArgoCD, dev-cluster cluster services) are listed per milestone.

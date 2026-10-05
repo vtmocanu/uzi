@@ -1,6 +1,6 @@
 # PRD #337: Forge connect — base-URL ⇄ forge-type sync + token reveal toggle
 
-**Issue**: [#337](https://github.com/vtmocanu/uzi/-/issues/337)
+**Issue**: [#337](https://github.com/vtmocanu/uzi/issues/337)
 **Priority**: Medium (a UX papercut on the connect form; no correctness or security defect)
 **Status**: Done (shipped on branch agent/issue-337)
 **Anchor**: code references below are against `main` @ `dd95ecef`.

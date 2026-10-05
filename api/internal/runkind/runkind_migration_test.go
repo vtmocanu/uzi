@@ -102,7 +102,7 @@ func dbRunKinds(t *testing.T) []string {
 // TestCrossCheckRunShape pins the child identity to the lead and repo while allowing
 // the branch to start empty.
 func TestCrossCheckRunShape(t *testing.T) {
-	path := filepath.Join("..", "store", "migrations", "00294_cross_check_kind.sql")
+	path := filepath.Join("..", "store", "migrations", "00295_cross_check_kind.sql")
 	raw, err := os.ReadFile(path) //nolint:gosec // fixed migration path
 	if err != nil {
 		t.Fatal(err)

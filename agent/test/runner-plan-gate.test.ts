@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs, { writeFileSync } from "node:fs";
@@ -32,8 +32,163 @@ import {
 
 installHarness();
 
+function approvalWaiter(
+  stateApi: Pick<typeof api, "onState">,
+  runId: string,
+  signal: AbortSignal,
+  start: () => Promise<void>,
+): { approval: Promise<void>; execution: Promise<void> } {
+  let lastFailureReason: string | undefined;
+  const gate = new Promise<void>((resolve) => {
+    stateApi.onState(runId, (body) => {
+      if (body.failure_reason) lastFailureReason = body.failure_reason;
+      if (body.status === "awaiting_approval") resolve();
+    });
+  });
+  let onAbort = () => {};
+  const cancelled = new Promise<never>((_, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+  const execution = Promise.resolve().then(() => {
+    signal.throwIfAborted();
+    return start();
+  });
+  const ended = execution.then(() => {
+    throw new Error(
+      `execution completed before awaiting_approval${lastFailureReason ? `: ${lastFailureReason}` : ""}`,
+    );
+  });
+  const approval = Promise.race([gate, ended, cancelled]).finally(() => {
+    signal.removeEventListener("abort", onAbort);
+    stateApi.onState(runId, () => {});
+  });
+  // The clone hold may delay awaiting approval; observe rejection immediately.
+  void approval.catch(() => {});
+  return { approval, execution };
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((res) => { resolve = res; });
+  return { promise, resolve };
+}
+
+async function flushMicrotasks(): Promise<void> {
+  // Eight turns drain the waiter's race, finally, and observation handlers.
+  for (let turn = 0; turn < 8; turn++) await Promise.resolve();
+}
+
+function controlledStates() {
+  let hook = (_body: StateRequest) => {};
+  return {
+    onState(_runId: string, fn: (body: StateRequest) => void) { hook = fn; },
+    emit(body: StateRequest) { hook(body); },
+  };
+}
+
+describe("approval waiter", () => {
+  it("ignores running then resolves on approval", async (t) => {
+    const states = controlledStates();
+    const held = deferred();
+    const wait = approvalWaiter(states, "run", t.signal, () => {
+      states.emit({ status: "running" });
+      return held.promise;
+    });
+    let settled = false;
+    void wait.approval.then(() => { settled = true; }, () => { settled = true; });
+    await flushMicrotasks();
+    assert.equal(settled, false);
+    states.emit({ status: "awaiting_approval" });
+    await wait.approval;
+    held.resolve();
+    await wait.execution;
+    // The hook was replaced after settlement.
+    states.emit({ status: "failed", failure_reason: "late report" });
+  });
+
+  it("subscribes before the start callback emits approval", async (t) => {
+    const states = controlledStates();
+    const wait = approvalWaiter(states, "run", t.signal, async () => {
+      states.emit({ status: "awaiting_approval" });
+    });
+    await wait.approval;
+    await wait.execution;
+  });
+
+  it("preserves execution rejection", async (t) => {
+    const sentinel = new Error("execution sentinel");
+    const wait = approvalWaiter(controlledStates(), "run", t.signal, () => Promise.reject(sentinel));
+    await assert.rejects(wait.approval, (err) => err === sentinel);
+    await assert.rejects(wait.execution, (err) => err === sentinel);
+  });
+
+  it("rejects premature completion", async (t) => {
+    const wait = approvalWaiter(controlledStates(), "run", t.signal, async () => {});
+    await assert.rejects(wait.approval, /execution completed before awaiting_approval/);
+    await wait.execution;
+  });
+
+  it("includes the last recorded failure reason on premature completion", async (t) => {
+    const states = controlledStates();
+    const wait = approvalWaiter(states, "run", t.signal, async () => {
+      states.emit({ status: "failed", failure_reason: "first reason" });
+      states.emit({ status: "failed", failure_reason: "last reason" });
+      states.emit({ status: "running" });
+    });
+    await assert.rejects(wait.approval, /execution completed before awaiting_approval: last reason/);
+    await wait.execution;
+  });
+
+  it("aborts a pending wait", async () => {
+    const controller = new AbortController();
+    const held = deferred();
+    const wait = approvalWaiter(controlledStates(), "run", controller.signal, () => held.promise);
+    await flushMicrotasks();
+    const sentinel = new Error("abort sentinel");
+    controller.abort(sentinel);
+    await assert.rejects(wait.approval, (err) => err === sentinel);
+    held.resolve();
+    await wait.execution;
+  });
+
+  it("rejects a pre-aborted signal without starting execution", async () => {
+    const controller = new AbortController();
+    const sentinel = new Error("pre-abort sentinel");
+    controller.abort(sentinel);
+    let started = false;
+    const wait = approvalWaiter(controlledStates(), "run", controller.signal, async () => { started = true; });
+    await assert.rejects(wait.approval, (err) => err === sentinel);
+    await assert.rejects(wait.execution, (err) => err === sentinel);
+    assert.equal(started, false);
+  });
+
+  it("reaches approval after the former polling deadline with execution held", async (t) => {
+    const states = controlledStates();
+    const held = deferred();
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: Date.now() });
+    const wait = approvalWaiter(states, "run", t.signal, () => held.promise);
+    let settled = false;
+    void wait.approval.then(() => { settled = true; }, () => { settled = true; });
+    try {
+      await flushMicrotasks();
+      t.mock.timers.tick(3000);
+      await flushMicrotasks();
+      if (settled) await wait.approval;
+      assert.equal(settled, false, "approval remains pending while execution is held");
+      states.emit({ status: "awaiting_approval" });
+      await wait.approval;
+    } finally {
+      t.mock.timers.reset();
+      held.resolve();
+      await wait.execution;
+    }
+  });
+});
+
 describe("RunRunner — plan gate + steering end to end", () => {
-  it("keeps scratch in the exact retained runner clone across an approval wait", async () => {
+  async function retainedCloneApproval(t: TestContext, delayedSetup: boolean): Promise<void> {
     const { gitlab } = fakeGitlab();
     const claim = gitlabClaim(1719);
     const clone = worktreeDirFor(1719);
@@ -56,21 +211,59 @@ describe("RunRunner — plan gate + steering end to end", () => {
         return result;
       },
     };
-    const execution = runner(executor, gitlab, undefined, { planApprovalTimeoutMs: 3000 }).execute(claim);
-    const deadline = Date.now() + 2500;
-    while (!api.states.some((s) => s.runId === claim.run_id && s.body.status === "awaiting_approval")) {
-      assert.ok(Date.now() < deadline, "run reached approval wait");
-      await new Promise((resolve) => setTimeout(resolve, 5));
+    const retainedRunner = runner(executor, gitlab);
+    const entered = deferred();
+    const release = deferred();
+    const ensureClone = git.ensureClone.bind(git);
+    if (delayedSetup) {
+      git.ensureClone = async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return ensureClone(...args);
+      };
+      t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     }
-    assert.ok(cloneIdentity, "executor created scratch before approval");
-    assert.equal(fs.readFileSync(scratch, "utf8"), "private draft\n");
-    assert.deepEqual(
-      { dev: fs.statSync(clone).dev, ino: fs.statSync(clone).ino },
-      cloneIdentity,
-    );
-    api.setInputs(claim.run_id, [input("approve_plan")]);
-    await execution;
-    assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
+    const cancel = () => {
+      t.mock.timers.reset();
+      release.resolve();
+      retainedRunner.shutdown();
+    };
+    t.signal.addEventListener("abort", cancel, { once: true });
+    const { approval, execution } = approvalWaiter(api, claim.run_id, t.signal, () => retainedRunner.execute(claim));
+    try {
+      if (delayedSetup) {
+        await Promise.race([
+          entered.promise,
+          approval.then(() => { throw new Error("approval reached before clone setup"); }),
+        ]);
+        t.mock.timers.tick(3000);
+        t.mock.timers.reset();
+        release.resolve();
+      }
+      await approval;
+      assert.ok(cloneIdentity, "executor created scratch before approval");
+      assert.equal(fs.readFileSync(scratch, "utf8"), "private draft\n");
+      assert.deepEqual(
+        { dev: fs.statSync(clone).dev, ino: fs.statSync(clone).ino },
+        cloneIdentity,
+      );
+      api.setInputs(claim.run_id, [input("approve_plan")]);
+      await execution;
+      assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
+    } finally {
+      cancel();
+      git.ensureClone = ensureClone;
+      await Promise.allSettled([approval, execution]);
+      t.signal.removeEventListener("abort", cancel);
+    }
+  }
+
+  it("keeps scratch in the exact retained runner clone across an approval wait", async (t) => {
+    await retainedCloneApproval(t, false);
+  });
+
+  it("keeps scratch in the retained runner clone after delayed setup", async (t) => {
+    await retainedCloneApproval(t, true);
   });
 
   it("halts at awaiting_approval, resumes on approve, then completes with an MR", async () => {

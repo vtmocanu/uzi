@@ -29,13 +29,17 @@ import (
 // it to loopback.
 const otherHost = "forbidden.example.com"
 
-// trustLoopbackTLS makes the process-wide default transport trust the httptest
-// certificate and dial otherHost to loopback. go-git's HTTP clients all send
-// through the http.DefaultTransport OBJECT (captured when they are built), so the
-// fields are mutated in place and restored afterwards. Not parallel-safe.
+// trustLoopbackTLS makes the broker's connection pool trust the httptest
+// certificate and dial otherHost to loopback. Both registered and manual go-git
+// paths use this concrete transport. Hooks and idle connections are restored
+// after each fixture; callers must remain nonparallel.
 func trustLoopbackTLS(t *testing.T) {
 	t.Helper()
-	tr := http.DefaultTransport.(*http.Transport)
+	tr, ok := pushbroker.BrokerHTTPClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("broker transport = %T, want *http.Transport", pushbroker.BrokerHTTPClient.Transport)
+	}
+	tr.CloseIdleConnections()
 	probe := httptest.NewTLSServer(http.NotFoundHandler())
 	pool := probe.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
 	probe.Close()
@@ -52,8 +56,8 @@ func trustLoopbackTLS(t *testing.T) {
 	}
 	tr.CloseIdleConnections()
 	t.Cleanup(func() {
-		tr.TLSClientConfig, tr.DialContext = prevTLS, prevDial
 		tr.CloseIdleConnections()
+		tr.TLSClientConfig, tr.DialContext = prevTLS, prevDial
 	})
 }
 

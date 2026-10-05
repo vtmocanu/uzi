@@ -6,7 +6,8 @@ import { execFileSync } from "node:child_process";
 import { DataVolumeGuard, DataVolumeFullError } from "../src/disk-full.js";
 import { DiskGovernor, DiskParkSignal } from "../src/cache-cap.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
-import { PlanRejectedError, type ExecutorResult, type RunContext } from "../src/executor.js";
+import { PlanRejectedError, type CredentialFreeSettleOutcome, type ExecutorResult, type RunContext } from "../src/executor.js";
+import { CodexBoundaryError } from "../src/codex/safety.js";
 import type { BoundaryPermit, CodexExecutionSafety } from "../src/harness.js";
 import { type ExecutorFactory, type RunnerOptions } from "../src/runner.js";
 import type { QuiesceRunOutcome } from "../src/run-quiescence.js";
@@ -41,6 +42,7 @@ function fixture(opts: {
   reclaim?: () => Promise<void>; runner?: Partial<RunnerOptions>;
   result?: ExecutorResult; safety?: CodexExecutionSafety; observe?: (ctx: RunContext) => void;
   afterWork?: (ctx: RunContext) => Promise<void>;
+  settleForCredentialFreeCapture?: () => Promise<CredentialFreeSettleOutcome>;
 } = {}) {
   const claim = gitlabClaim(2201, { claim_generation: 4, ...(opts.kind ? { kind: opts.kind } : {}) });
   client.protocolFeatures = opts.features ? [...opts.features] :  ["recovery_cause_data_volume_full", "claim_generation_fence"];
@@ -53,7 +55,7 @@ function fixture(opts: {
   const error = Object.hasOwn(opts, "error") ? opts.error : new Error("opaque executor failure");
   const factory: ExecutorFactory = () => ({
     homeDir: home,
-    executor: { safety: opts.safety, run: async (ctx) => {
+    executor: { safety: opts.safety, settleForCredentialFreeCapture: opts.settleForCredentialFreeCapture, run: async (ctx) => {
       opts.observe?.(ctx);
       calls++;
       clone = ctx.worktreePath;
@@ -269,6 +271,86 @@ describe("terminal execution disk deferral", () => {
         assert.equal(api.states.find((s) => s.body.status === "failed")?.body.failure_reason, error.message);
       } finally { client.reportState = report; }
     });
+  }
+
+  for (const deferral of ["vault_locked", "refresh_unknown"] as const) {
+    for (const location of ["boundary", "post-WIP proof"] as const) {
+      it(`full-volume opaque rejection redispatches ${location} ${deferral} into credential-free recovery`, async () => {
+        let deferred = false;
+        let settles = 0;
+        let unverified = 0;
+        const boundaries: string[] = [];
+        const interruption = new CodexBoundaryError("reconcile", [], undefined, deferral);
+        const safety = supervisedSafety("empty");
+        const boundary = safety.withBoundary.bind(safety);
+        safety.withBoundary = async (request, action) => {
+          assert.equal(deferred, false, "no credentialed boundary after the deferral");
+          boundaries.push(request.boundary);
+          if (location === "boundary" && request.boundary === "shutdown") {
+            deferred = true;
+            throw interruption;
+          }
+          return boundary(request, action);
+        };
+        const f = fixture({ safety,
+          features: ["recovery_cause_data_volume_full", "claim_generation_fence", "recovery_cause_vault_locked"],
+          settleForCredentialFreeCapture: async () => {
+            assert.equal(deferred, true);
+            settles++;
+            return { kind: "observed_empty" };
+          },
+          runner: { quiesceRun: async (req) => {
+            if (!deferred && location === "post-WIP proof" && req.site === "recovery_capture:after_runner_git") {
+              deferred = true;
+              throw interruption;
+            }
+            return QUIESCENT;
+          } },
+        });
+        let custodySettles = 0;
+        const custody = f.runner as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+        for (const name of ["reapThenSettleRecoveryGeneration", "settleRecoveryGeneration"]) {
+          const original = custody[name]!.bind(f.runner);
+          custody[name] = async (...args) => { custodySettles++; return original(...args); };
+        }
+        const verify = git.verifyRunnerTrackingCovers.bind(git);
+        git.verifyRunnerTrackingCovers = async (...args) => {
+          if (deferred && unverified++ < 4) {
+            assert.equal(settles, 1, "credential-free settlement precedes recapture");
+            assert.equal(fs.existsSync(f.clone()), true);
+            assert.equal(fs.existsSync(path.join(f.home, "session")), true);
+            assert.equal(custodySettles, 0);
+            return false;
+          }
+          return verify(...args);
+        };
+        await f.runner.execute(f.claim);
+        assert.equal(deferred, true);
+        assert.equal(f.calls(), 1, "the executor was never replayed");
+        assert.equal(f.reclaims(), 1, "canonical redispatch never re-enters disk admission");
+        assert.equal(settles, 1);
+        assert.equal(unverified, 5, "credential deferrals outlive the three-attempt disk capture budget");
+        assert.deepEqual(boundaries, ["shutdown"]);
+        assert.equal(custodySettles, 0, "custody is retained");
+        assert.equal(parks().length, 1);
+        assert.equal(parks()[0]!.body.recovery_cause, deferral === "vault_locked" ? "vault_locked" : undefined);
+        assert.equal(parks()[0]!.body.claim_generation, 4);
+        assert.equal(api.states.some((state) => state.body.status === "failed" || state.body.status === "completed"), false);
+        assert.equal(f.forge.calls.length, 0);
+        assert.equal(api.completionPermitRequests.length, 0);
+        assert.equal(fs.existsSync(path.join(f.home, "session")), true);
+        const bare = git.barePathFor(fx.originPath);
+        assert.equal(readGit(bare, "show", "refs/uzi-runner/agent/issue-2201:COMMITTED.txt"), "committed sentinel");
+        assert.equal(readGit(bare, "show", "refs/uzi-runner/agent/issue-2201:DIRTY.txt"), "dirty sentinel");
+        const feed = api.messages(f.claim.run_id).filter((message) => message.kind === "status")
+          .map((message) => String((message.payload as { text?: unknown }).text));
+        assert.equal(feed.filter((text) => text === "Recovery checkpoint could not be verified. Keeping the local work and session and retrying before pausing.").length, 1);
+        assert.ok(feed.includes(deferral === "vault_locked"
+          ? "Paused: the run owner's vault is locked. The recovery checkpoint is saved only on this worker; this run resumes automatically at its next retry once the vault is unlocked."
+          : "Paused for credential recovery. The recovery checkpoint is saved only on this worker; this run can resume at its next retry."));
+        if (deferral === "refresh_unknown") assert.ok(feed.every((text) => !/vault/i.test(text)));
+      });
+    }
   }
 
   it("alternating safety blocks permits at most fifteen captures and five separate final proofs", async () => {

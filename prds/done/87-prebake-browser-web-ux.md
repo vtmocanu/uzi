@@ -1,6 +1,6 @@
 # PRD #87: Prebake a browser (+ `agent-browser`) into the worker toolchain so `web-ux` works in the worker runtime
 
-**GitLab Issue**: [#87](https://github.com/vtmocanu/uzi/-/issues/87)
+**GitLab Issue**: [#87](https://github.com/vtmocanu/uzi/issues/87)
 **Status**: **DONE** — closed 2026-07-25, shipped across v0.11.0–v0.11.6. Every DoD line is satisfied except one, and that one's cause is diagnosed and owned elsewhere (below). GitLab issue #87 already closed.
 
 > **The one unsatisfied DoD line, stated plainly rather than quietly ticked.** *"Issue #87 closed; the M0 crash cannot recur"* — **it recurred.** The M7 gate run's `web-ux` hit the exact M0 abort (`FATAL:sandbox/linux/suid/client/setuid_sandbox_host.cc:166`) on its first launch. §4's env contract does not reach the agent, because `npm run start` prepends `/app/node_modules/.bin` and shadows the shim on the non-root k8s path. That is a **real delivery gap in this PRD's own M4**, not a technicality.

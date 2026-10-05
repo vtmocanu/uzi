@@ -1,6 +1,6 @@
 # PRD #196 — Configurable board membership and run-eligible labels
 
-**Issue**: [#196](https://github.com/vtmocanu/uzi/-/issues/196) · **Label**: PRD · **Priority**: Medium
+**Issue**: [#196](https://github.com/vtmocanu/uzi/issues/196) · **Label**: PRD · **Priority**: Medium
 **Area**: `web/src/lib/boardCards.ts` + `web/src/pages/Board.tsx` + `web/src/pages/IssueView.tsx` (render filter and card affordances) · `api/internal/settings` (three new keys) · a new per-user board-preference table · `api/internal/workersvc/service.go` (the run-eligibility gate) · `web/src/pages/AdminSettings.tsx`.
 **Mockup**: [`prds/mockups/196-board-membership-labels-mock.html`](../mockups/196-board-membership-labels-mock.html) — seven sections, reviewed and approved 2026-08-02.
 **Line references** are against `a87fd521`.
@@ -213,7 +213,7 @@ repo do not want the same labels.
 There is **no issues board in the CLI**. `api/cmd/uzi/` has `tui_board.go` /
 `tui_lanes.go`, and that board is a **runs** board (`docs/cli.md:232`, *"Your own runs,
 refreshed on a poll"*). A search found zero `prd_label` / `PRDLabel` references anywhere
-under `api/cmd/uzi/` or `api/internal/uzicli/`. `uzi run start` goes through the same
+under `api/cmd/uzi/` or `api/internal/uzicli/`. `uzi run create` goes through the same
 endpoint as the web client (`uzicli/client.go:881`, `cmd/uzi/run.go:253`) and is
 therefore covered server-side. Recorded per CLAUDE.md's check-the-CLI rule.
 

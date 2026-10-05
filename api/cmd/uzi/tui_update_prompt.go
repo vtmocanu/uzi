@@ -327,14 +327,15 @@ func (m tuiModel) renderUpdatePrompt() string {
 			lipgloss.NewStyle().Foreground(pal.sage).Render(latest)
 	}
 
-	// Body line: the release name when present (UNTRUSTED, renderer.Plain), else a
+	// Body line: a nonempty release name that differs from the sanitized version,
+	// compared before the 80-rune cap (UNTRUSTED, renderer.Plain), else a
 	// variant-specific sentence.
 	bodyText := "A newer release is available."
 	if m.updatePrompt.security {
 		bodyText = "A security update is available."
 	}
-	if name := m.renderer.Plain(m.updatePrompt.latestName, updatePromptTextCap); name != "" {
-		bodyText = name
+	if name := cellText(m.updatePrompt.latestName); name != "" && name != latest {
+		bodyText = m.renderer.Plain(m.updatePrompt.latestName, updatePromptTextCap)
 	}
 	bodyLine := bodyText
 	if !ascii {

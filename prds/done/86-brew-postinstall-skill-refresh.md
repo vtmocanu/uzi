@@ -1,6 +1,6 @@
 # PRD #86: keep the uzi-cli Claude Code skill fresh via an opt-in SessionStart hook
 
-**GitLab Issue**: [#86](https://github.com/vtmocanu/uzi/-/issues/86)
+**GitLab Issue**: [#86](https://github.com/vtmocanu/uzi/issues/86)
 **Status**: Complete (implemented via MR !76, merged to `main` 2026-07-19 as `85b6895`; all 6 milestones landed; the M1/M6 empirical gate was validated 2026-07-19 — see Validation Results). Scope pivoted 2026-07-19 — see Change History.
 **Priority**: Medium
 **Created**: 2026-07-19

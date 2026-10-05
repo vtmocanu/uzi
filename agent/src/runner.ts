@@ -212,7 +212,7 @@ const QUEUED_DUPLICATE_END_LOG = "queued duplicate claim ended without executing
 
 /** PRD #1226 M4 (D6): bounded in-call attempts to capture a VERIFIED completion-hold restore
  *  point before giving up. Mirrors handleRecoveryExhausted's retain-and-retry, but bounded on every
- *  cause (the recovery loop bounds only blocked proofs, at RECOVERY_CAPTURE_BLOCKED_ATTEMPTS),
+ *  cause (the recovery loop caps blocked proofs only for noncredential causes),
  *  because this runs synchronously inside the executor's completion loop, not the server-parked
  *  recovery loop.
  *  A never-verified capture DOES NOT park: enterCompletionHold clears its preserve flags and returns
@@ -241,8 +241,10 @@ const CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS = 3;
  *  only when the block came from a process it could not attribute — a `survivors` proof instead
  *  reports just a count of the in-scope processes that outlived the reap. Any capture outcome that
  *  is NOT a blocked proof resets the count. The wall time before that failure is typically about
- *  30 s at the defaults (5 reap deadlines of 5 s plus 4 recoveryRetryMs backoffs), about 40 s on
- *  the vault-locked park, whose backoff doubles — this is not a strict ceiling: it runs faster when
+ *  30 s at the defaults (5 reap deadlines of 5 s plus 4 recoveryRetryMs backoffs), with no terminal cap for
+ *  vault_locked or refresh_unknown credential deferrals: those retain custody and retry with
+ *  capped exponential waits until a valid proof or an ownership/cancel/shutdown exit. For other
+ *  causes this is not a strict ceiling: it runs faster when
  *  a proof returns early (a `survivors` proof with nothing left to kill returns at once, so the
  *  bound can be reached in as little as ~4 s), and can run longer when the best-effort Docker
  *  teardown (budget 15 s on a Docker-wired worker) or the runner-uid helper (10 s timeout) runs out
@@ -398,14 +400,16 @@ class BoundaryStepTracker {
  *  answers a Codex refresh/release with a typed 409 `vault_locked`; the Codex side surfaces it as a
  *  boundary-reconcile block (`CodexBoundaryError`, finalize/checkpoint sinks) or as a failed epoch
  *  credential release or a mid-turn app-server refresh (`CodexCredentialDeferredError`, epoch
- *  recreation / issue #1789). Like
+ *  recreation / issue #1789). An ambiguous subscription refresh carries refresh_unknown through
+ *  the boundary error. Like
  *  {@link isCodexBoundaryError} it reads only the error's `name` and its `deferral` field (never
  *  `instanceof`, never the message text), so the runner never imports agent/src/codex/**. Returns
- *  "vault_locked" only for those two names carrying that exact deferral; undefined otherwise. */
-function codexDeferralOf(err: unknown): "vault_locked" | undefined {
+ *  "vault_locked" or "refresh_unknown" only for those two names carrying an exact deferral. */
+function codexDeferralOf(err: unknown): "vault_locked" | "refresh_unknown" | undefined {
   if (!(err instanceof Error)) return undefined;
   if (err.name !== "CodexBoundaryError" && err.name !== "CodexCredentialDeferredError") return undefined;
-  return (err as { deferral?: unknown }).deferral === "vault_locked" ? "vault_locked" : undefined;
+  const deferral = (err as { deferral?: unknown }).deferral;
+  return deferral === "vault_locked" || deferral === "refresh_unknown" ? deferral : undefined;
 }
 
 /** Issue #1766: the steering channel gave up on an operator input's applied receipt
@@ -481,7 +485,7 @@ interface ExecutionRejection {
 
 type RecoveryParkCause =
   | { kind: "transient" }
-  | { kind: "vault_locked" }
+  | { kind: "vault_locked" | "refresh_unknown" }
   | { kind: "data_volume_full"; preventive: boolean };
 
 /** What {@link RunRunner.captureRecoveryRestorePoint} reports. `residueBlocked` (issue #1783 M3)
@@ -494,30 +498,41 @@ interface RecoveryCaptureResult {
   residueDetail?: string;
 }
 
-/** Issue #1766: how many doublings a vault-lock park's retry wait may grow by before it is capped
+/** Issue #1766: how many doublings a credential recovery park's retry wait may grow by before it is capped
  *  (base recoveryRetryMs x 16). */
-const VAULT_PARK_BACKOFF_MAX_DOUBLINGS = 4;
+const CREDENTIAL_PARK_BACKOFF_MAX_DOUBLINGS = 4;
+
+const CREDENTIAL_PARK_FEED = {
+  unverified: "Recovery checkpoint could not be verified. Keeping the local work and session and retrying before pausing.",
+  settleIncomplete: "Waiting for this run's processes to stop before saving its work; keeping the local work and session and retrying.",
+  cancelReportFailed: "Could not record the cancellation yet; keeping the local work and session and retrying.",
+} as const;
 
 /** Issue #1766 (R6): the secret-free feed lines of a vault-lock deferral park. Owner-neutral: the
  *  feed is shown to any viewer of the run (an admin may view another owner's run), so a line names
  *  "the run owner's vault", never "your vault". */
 const VAULT_PARK_FEED = {
+  ...CREDENTIAL_PARK_FEED,
   published:
     "Paused: the run owner's vault is locked. The recovery checkpoint is published; this run resumes automatically at its next retry once the vault is unlocked.",
   local:
     "Paused: the run owner's vault is locked. The recovery checkpoint is saved only on this worker; this run resumes automatically at its next retry once the vault is unlocked.",
-  unverified:
-    "Recovery checkpoint could not be verified. Keeping the local work and session and retrying before pausing.",
-  settleIncomplete:
-    "Waiting for this run's processes to stop before saving its work; keeping the local work and session and retrying.",
   confirmUnknown:
     "The run owner's vault is locked. Could not confirm this run is still running; keeping the local work and session and retrying before pausing.",
   reportFailed:
     "The run owner's vault is locked. Could not record the pause yet; keeping the local work and session and retrying.",
-  cancelReportFailed:
-    "Could not record the cancellation yet; keeping the local work and session and retrying.",
   held:
     "The run owner's vault is locked and this run is not running, so it was not paused for recovery; its local work and session are kept on this worker.",
+} as const;
+
+/** An ambiguous refresh has no inferred vault cause; notices remain neutral and deduplicated. */
+const REFRESH_UNKNOWN_PARK_FEED = {
+  ...CREDENTIAL_PARK_FEED,
+  published: "Paused for credential recovery. The recovery checkpoint is published; this run can resume at its next retry.",
+  local: "Paused for credential recovery. The recovery checkpoint is saved only on this worker; this run can resume at its next retry.",
+  confirmUnknown: "Could not confirm this run is still running; keeping its local work and session and retrying before pausing.",
+  reportFailed: "Could not record the recovery pause yet; keeping the local work and session and retrying.",
+  held: "This run is not running, so it was not paused for recovery; its local work and session are kept on this worker.",
 } as const;
 
 /** issue #1597 M1: whether a CodexBoundaryError failed because its boundary DEADLINE elapsed (a
@@ -697,6 +712,14 @@ class HistoryRewrittenError extends Error {
       `history rewritten at or below the published tip ${publishedTip}; a fast-forward bridge could not be built or validated`,
     );
     this.name = "HistoryRewrittenError";
+  }
+}
+
+/** A local workflow refusal was already terminally reported; unwind without another push. */
+class WorkflowScopeBlockedSignal extends Error {
+  constructor() {
+    super("workflow scope blocked");
+    this.name = "WorkflowScopeBlockedSignal";
   }
 }
 
@@ -3228,16 +3251,16 @@ export class RunRunner {
           "e2e drop-execution seam: ending flight with no terminal report (run left running for the missing-run requeue)",
         );
         await batcher.close().catch(() => undefined);
-      } else if (codexDeferralOf(err) === "vault_locked") {
-        // Issue #1766: a Codex credential refresh/release was deferred because the owner vault is
-        // locked (finalize or checkpoint boundary reconcile, an epoch recreation's release, or a
-        // mid-turn app-server refresh, issue #1789). That
+      } else if (codexDeferralOf(err) !== undefined) {
+        // Codex credentials were deferred by a confirmed vault lock or an unknown boundary
+        // refresh outcome. Vault locks also arise during epoch release and mid-turn refresh.
+        // That
         // is recoverable, never a failed run: park it for recovery, credential-free. Placed AFTER the
         // claim-fence, stale-claim, running-ack-terminal and credential-switch arms, so a released or
         // superseded claim is never parked.
-        await this.handleVaultLockDeferral(err as Error, claim, flight, executor, runLog);
-        // Issue #1742 retirement site (c): the api accepted the vault_locked recovery park.
-        if (flight.parked) await this.retireFinalizeRecord(flight, "vault_lock_park_accepted");
+        await this.handleCredentialDeferral(err as Error, claim, flight, executor, runLog);
+        // Issue #1742 retirement site (c): the api accepted the credential recovery park.
+        if (flight.parked) await this.retireFinalizeRecord(flight, "credential_recovery_park_accepted");
       } else {
         await batcher.awaitPermanentFailureSettled();
         if (allowDiskDeferral && executionRejection.rejected && Object.is(executionRejection.value, err)
@@ -3276,7 +3299,7 @@ export class RunRunner {
       // provider root before any PAT git op. For Claude/stub this is a plain call (the legacy
       // reap already happened at the untouched security boundary). A CodexBoundaryError before
       // a committed publish still propagates to the failed-run report below, unless it carries a
-      // vault-locked deferral (issue #1766), which the catch chain parks instead. Once phasePublish
+      // credential deferral (vault_locked or refresh_unknown), which the catch chain parks instead. Once phasePublish
       // registers the committed terminal callback, however, the pushed branch/open MR is the
       // authoritative outcome and must be reported after the boundary releases.
       let postFinalizeTerminal: (() => Promise<void>) | undefined;
@@ -3658,7 +3681,7 @@ export class RunRunner {
    * recorded elsewhere. The retirement sites are: journalAndSendTerminal after the terminal journal
    * is installed; journalAndSendTerminal after an unjournaled terminal send resolved; the
    * executeClaim catch after the api accepted a limit, disk, recovery, pause or server-wall park;
-   * the accepted vault-lock park; and the accepted completion hold in phasePublish.
+   * the accepted credential recovery park; and the accepted completion hold in phasePublish.
    * The graceful-shutdown branch deliberately never calls this, so the record survives a SIGTERM.
    * Never throws.
    */
@@ -3906,7 +3929,7 @@ export class RunRunner {
     claim: ClaimResponse,
     flight: RunFlight,
     err: unknown,
-    /** Issue #1766: `keepCustody` (a vault-lock park's given-up input receipt) skips the
+    /** Issue #1766: `keepCustody` (a credential recovery park's given-up input receipt) skips the
      *  credentialed pre-report reap (its Codex reconcile would refresh against the locked vault)
      *  and every custody settle, so the exact-generation hold stays open for the reconciler. */
     opts: { keepCustody?: boolean } = {},
@@ -4783,13 +4806,13 @@ export class RunRunner {
           if (!isCodePublishingKind(resolveRunKind(claim.kind))) return;
           // PRD #1392 M1/M2 (fact 9): stamp the release's evidence class. A full publication
           // (a pushed branch + / or MR) → "publication". A NO-code completion on this SAME
-          // branch (report_only / not_code / scope-capped-empty) carries no `branch` and is NOT a
+          // branch (report_only / not_code / scope-capped-empty) is NOT a
           // publication — its release class is genuinely ambiguous (neither publication nor the
           // fresh-forge no-output proof), so OMIT the evidence (the api stores NULL, which is
           // allowed) rather than mis-stamp it.
           const completedBody = body as StateRequest;
           const releaseEvidence =
-            typeof completedBody.branch === "string" && completedBody.branch !== ""
+            !completedBody.report_only && typeof completedBody.branch === "string" && completedBody.branch !== ""
               ? "publication"
               : undefined;
           await this.recovery.release(claim.run_id, claim.claim_generation, releaseEvidence);
@@ -4850,7 +4873,8 @@ export class RunRunner {
     // completion ACK, and the settle itself runs only AFTER the terminal outcome resolved (the
     // outbox journal retired / terminalResolved latched), off the terminal send path.
     const journalTerminalReport = async (body: Parameters<RunFlight["reportState"]>[0]) => {
-      await this.persistSettlementPushedHead(claim, flight, body);
+      // A report-only capped slice carries permit identity, but has no pushed settlement head.
+      if (!(body as StateRequest).report_only) await this.persistSettlementPushedHead(claim, flight, body);
       await this.journalAndSendTerminal(flight, TERMINAL_JOURNAL_PHASE, body, reportState);
       await this.settleAfterCompletion(claim, flight, body);
     };
@@ -4881,6 +4905,83 @@ export class RunRunner {
     };
     const runId = claim.run_id;
     const result = flight.result!;
+    const interlocked = claim.config?.completion_contract_version != null;
+    // Park the incomplete/unverifiable interlocked run, else report a typed failure. Shared by the
+    // permit-denied and PR-head-mismatch paths (D5's held-or-fail). enterCompletionHold reaps,
+    // captures a VERIFIED same-worker restore point and parks on a `paused` ACK (returns true), or
+    // parks nothing (returns false); on true we skip finalization exactly like the
+    // result.completionHeld branch above, and on false the run follows normal terminal cleanup
+    // (enterCompletionHold cleared its preserve flags) so we report a static, content-free failure.
+    // `holdReason` is a static hold-reason string, never raw model output.
+    const holdOrFailInterlocked = async (holdReason: string): Promise<void> => {
+      const held = await this.enterCompletionHold(flight, claim, holdReason, runLog);
+      if (held) {
+        // Issue #1742 retirement site (c): the api accepted the completion-hold park for this generation.
+        await this.retireFinalizeRecord(flight, "completion_hold_accepted");
+        executor.killAgentTree?.();
+        await closeBatcher().catch(() => undefined);
+        runLog.info("run entered the completion hold; skipping finalization", {
+          run_id: runId,
+          reason: holdReason,
+        });
+        return;
+      }
+      await closeBatcher();
+      // PRD #1391 Run B M3 (N1): journal write-ahead so the completion-interlock failure survives an
+      // outage as this exact outcome, not a generic agent_failure.
+      await journalTerminalReport({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
+      runLog.info("run failed: completion interlock could not park the incomplete run", {
+        run_id: runId,
+        reason: holdReason,
+      });
+    };
+
+    // Both capped-empty and MR completion use the same bounded client retry and hold paths.
+    const requireCompletionPermit = async (head: string | null, branch: string): Promise<boolean> => {
+      const contractRevision = flight.latestContractRevision ?? claim.config?.contract_revision;
+      if (!head || !branch || contractRevision === undefined) {
+        runLog.warn("completion interlock: head, branch or contract revision is unresolvable", { run_id: runId });
+        await holdOrFailInterlocked("completion identity unresolvable");
+        return false;
+      }
+      // 2. Request the permit bound to (run, contract_revision, branch, H). A denial is a normal 200
+      //    body (granted:false), never a throw. A transient transport failure (an api outage at
+      //    finalize) is retried inside the client until the api answers, bounded by its retry budget
+      //    and cancelled with the flight or the Codex finalize boundary. For Claude/stub runs
+      //    there is no boundary signal, so the flight signal is passed unchanged. Only a
+      //    permanent error, a cancel, or an exhausted budget throws to the generic catch,
+      //    which fails the run without falsely completing.
+      steps?.enter("completion_permit");
+      const permitSignal = boundarySignal
+        ? AbortSignal.any([flight.cancel.signal, boundarySignal])
+        : flight.cancel.signal;
+      const permit = await this.client.requestCompletionPermit(
+        runId,
+        {
+          contractRevision,
+          branch,
+          scopeCapped: !!result.scopeCapped,
+          head,
+          // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure
+          // stamps) so the server refuses to issue a permit for a released/superseded stale flight.
+          claimGeneration: flight.claimGeneration,
+        },
+        permitSignal,
+      );
+      // 3. NOT granted: do NOT create the MR, do NOT render Closes, do NOT report completed — hold.
+      if (!permit.granted) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: "completion permit denied; holding the incomplete run instead of opening a merge request",
+          },
+        });
+        await holdOrFailInterlocked("completion permit denied");
+        return false;
+      }
+      return true;
+    };
     // The same predicate gates the write-ahead record and entry into finalization.
     if (!isFinalizeBoundResult(result)) {
       // PRD #1190 M2: an owner-requested pause PARKED the run mid-loop (handlePausePark reported
@@ -5291,6 +5392,13 @@ export class RunRunner {
             landedCheckpoint ||
             (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
           if (!publishedCheckpoint) {
+            // Bind a zero slice to its committed base in the runner-owned clone, without pushing.
+            let cappedHead: string | undefined;
+            if (interlocked) {
+              const head = await this.git.branchTip(runnerClone.path, runnerClone.branch);
+              if (!await requireCompletionPermit(head, runnerClone.branch)) return;
+              cappedHead = head!;
+            }
             batcher.emit({
               kind: "status",
               agent: "worker",
@@ -5305,6 +5413,7 @@ export class RunRunner {
               status: "completed",
               report_only: true,
               scope_capped: true,
+              ...(interlocked ? { branch: runnerClone.branch, head: cappedHead } : {}),
               report_md:
                 result.summary ??
                 "Stopped by operator scope directive before any committed work; nothing to land.",
@@ -5563,13 +5672,13 @@ export class RunRunner {
       }
     }
 
-    // PRD #377 M1: a GitHub run whose branch touches .github/workflows/** cannot be
-    // pushed by the bot's repo-only PAT (privcheck forbids the workflow scope by design).
+    // Issue #1869: a GitHub tip may carry workflow blobs from fresh default or target.
+    // Other workflow blobs cannot be pushed by the bot's repo-only PAT.
     // Detect it here, BEFORE the doomed push, and end the run in a typed `failed` outcome
     // that preserves the agent's diff for a human to land — instead of face-planting into
     // GitHub's opaque "without workflow scope" rejection and discarding the committed work.
     // Serves every forge-pushing kind (the failed path is not issue-gated).
-    // The precheck uses branch-only commits; the overlay keeps its separate conservative
+    // The precheck compares tip blobs per path; the overlay keeps its separate conservative
     // changedFiles guard below.
     // Every preserved_patch is stored and rendered on the run page, and redactText knows only the
     // run's OWN secrets, so a foreign credential in the diff would persist verbatim. Attach a patch
@@ -5589,64 +5698,70 @@ export class RunRunner {
       });
       return undefined;
     };
-    let changedForWf: string[] | null = null;
-    let freshDefaultTip: string | undefined;
+    const workflowBarePath = barePath;
+    const originalWorkflowTip = await this.git.trackingTip(workflowBarePath, result.branch);
+    const rethrowWorkflowAbort = (error: unknown) => {
+      if (boundarySignal?.aborted || error instanceof CheckpointSoftDeadlineError ||
+          (error instanceof Error && (error.name === "GitBoundaryAbortError" || error.name === "AbortError"))) throw error;
+    };
+    let workflowUnavailable = false;
+    let workflowPermitted = false;
+    let workflowOverlayForbidden = false;
+    let workflowBranchChanges: string[] | null = null;
+    let workflowReported = false;
+    const failWorkflowScope = async (paths: string[]) => {
+      if (workflowReported) return;
+      await this.git.scratchPublicationPreflight(workflowBarePath, result.branch);
+      workflowReported = true;
+      const patch = await scanGatedPatch(
+        originalWorkflowTip ? await this.git.workflowScopeDiff(workflowBarePath, originalWorkflowTip) : null,
+        "workflow_scope_missing",
+      );
+      batcher.emit({ kind: "status", agent: "worker", payload: {
+        text: patch !== undefined
+          ? "branch changes .github/workflows, which the bot token cannot push; preserving the diff for a human to land"
+          : "branch changes .github/workflows, which the bot token cannot push; the diff is withheld",
+      } });
+      await closeBatcher();
+      await journalTerminalReport({ status: "failed", fail_origin: "workflow_scope_missing",
+        failure_reason: composeWorkflowScopeReason(paths, patch !== undefined).slice(0, MAX_FAILURE_REASON_LEN),
+        preserved_patch: patch });
+    };
+    const freshWorkflowFiles = async (
+      tip: string, latchUnavailable = false, fetchedDefault?: string,
+    ): Promise<string[] | null> => {
+      let freshDefault = fetchedDefault;
+      if (freshDefault === undefined) {
+        const defaultBranch = claim.repo.default_branch?.trim() ||
+          (await this.git.defaultBranchName(workflowBarePath)) || "main";
+        freshDefault = await this.git.fetchDefaultTip(workflowBarePath, defaultBranch,
+          claim.secrets.forge_pat, claim.repo.clone_url, claim.secrets.forge_username);
+      }
+      const target = await this.git.fetchWorkflowTargetTip(workflowBarePath, result.branch,
+        claim.secrets.forge_pat, claim.repo.clone_url, claim.secrets.forge_username);
+      if (target.kind === "unavailable") {
+        if (latchUnavailable) workflowUnavailable = true;
+        return null;
+      }
+      return this.git.branchWorkflowFiles(workflowBarePath, freshDefault, tip,
+        target.kind === "present" ? target.sha : undefined);
+    };
     if (claim.repo.forge_type === "github") {
-      // Capture the narrowed bare path in a const the SAME way the push block does
-      // (barePath is an outer `let string | undefined` and TS drops the narrowing here).
-      const wfBarePath = barePath;
-      // Fetch before the precheck so commit classification sees the current default tip.
+      let hits: string[] | null = null;
       try {
         steps?.enter("default_fetch");
-        const defaultBranch = claim.repo.default_branch?.trim() ||
-          (await this.git.defaultBranchName(wfBarePath)) || "main";
-        freshDefaultTip = await this.git.fetchDefaultTip(
-          wfBarePath, defaultBranch, claim.secrets.forge_pat,
-          claim.repo.clone_url, claim.secrets.forge_username,
-        );
-        changedForWf = await this.git.branchWorkflowFiles(wfBarePath, freshDefaultTip, trackingRef);
-      } catch (e) {
-        runLog.warn("workflow precheck: could not fetch default tip; pushing normally", {
-          run_id: runId, error: errMessage(e),
-        });
+        hits = await freshWorkflowFiles(trackingRef);
+        workflowPermitted = hits !== null && hits.length === 0;
+        if (hits !== null) {
+          workflowBranchChanges = await this.git.changedFiles(workflowBarePath, trackingRef);
+          workflowOverlayForbidden = hits.length > 0 && workflowBranchChanges === null;
+        }
+      } catch (error) {
+        rethrowWorkflowAbort(error);
+        runLog.warn("workflow precheck unavailable; deferring to fresh alignment eligibility", { run_id: runId, error: errMessage(error) });
       }
-      // D6: a null diff (diff-computation failure) fails OPEN to the normal push — do not
-      // fail a possibly-legitimate non-workflow run on an inability to compute the diff.
-      const wfHits = changedForWf === null
-        ? null
-        : changedForWf.filter((file) => file.startsWith(".github/workflows/"));
-      if (wfHits && wfHits.length > 0) {
-        // Preserve the agent's diff so a human can land it without re-deriving it from the
-        // transcript, behind scanGatedPatch (redacted, then secret-scanned as stored); a null diff
-        // (best-effort failure) or a withheld one just omits the patch — the typed failure still lands.
-        const patch = await scanGatedPatch(
-          await this.git.workflowScopeDiff(wfBarePath, trackingRef),
-          "workflow_scope_missing",
-        );
-        // Compose an actionable, capped failure_reason that names the offending path(s)
-        // (truncating the path LIST if needed, never the doc link) and points at
-        // docs/github-bot-setup.md; it promises the diff only when one is attached.
-        const reason = composeWorkflowScopeReason(wfHits, patch !== undefined);
-        batcher.emit({
-          kind: "status",
-          agent: "worker",
-          payload: {
-            text: patch !== undefined
-              ? "branch changes .github/workflows, which the bot token cannot push; failing early and preserving the diff for a human to land"
-              : "branch changes .github/workflows, which the bot token cannot push; failing early (the diff is withheld: it could not be preserved or did not scan clean)",
-          },
-        });
-        runLog.info(
-          "run failed: branch touches .github/workflows which the bot PAT cannot push; preserving diff",
-          { run_id: runId, paths: wfHits },
-        );
-        await closeBatcher();
-        await journalTerminalReport({
-          status: "failed",
-          failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
-          fail_origin: "workflow_scope_missing",
-          preserved_patch: patch,
-        });
+      if (hits && hits.length > 0 && workflowBranchChanges?.some((file) => file.startsWith(".github/workflows/"))) {
+        await failWorkflowScope(hits);
         return;
       }
     }
@@ -5730,6 +5845,19 @@ export class RunRunner {
     const pushToOrigin = () =>
       withForgeRetry(
         async () => {
+          if (claim.repo.forge_type === "github" && !workflowUnavailable) {
+            let hits: string[] | null = null;
+            try {
+              hits = await freshWorkflowFiles(trackingRef);
+            } catch (error) {
+              rethrowWorkflowAbort(error);
+              runLog.warn("final workflow check unavailable; pushing normally", { run_id: runId, error: errMessage(error) });
+            }
+            if (hits && hits.length > 0) {
+              await failWorkflowScope(hits);
+              throw new WorkflowScopeBlockedSignal();
+            }
+          }
           await this.git.pushBranch(
             finalizeBarePath,
             result.branch,
@@ -5741,7 +5869,7 @@ export class RunRunner {
         {
           log: runLog,
           signal: boundarySignal,
-          classify: (error) => error instanceof ScratchPublicationError ? "permanent" : classifyForgeError(error),
+          classify: (error) => (error instanceof ScratchPublicationError || error instanceof WorkflowScopeBlockedSignal) ? "permanent" : classifyForgeError(error),
         },
       );
 
@@ -6022,6 +6150,9 @@ export class RunRunner {
             claim.repo.clone_url, claim.secrets.forge_username,
           );
         } catch (e) {
+          rethrowWorkflowAbort(e);
+          if (e instanceof WorkflowScopeBlockedSignal) throw e;
+          workflowUnavailable = true;
           runLog.warn("finalize base-align: could not refresh default tip; pushing without aligning", {
             run_id: runId, error: errMessage(e),
           });
@@ -6034,12 +6165,36 @@ export class RunRunner {
             defaultTip,
           );
         } catch (e) {
+          rethrowWorkflowAbort(e);
+          if (e instanceof WorkflowScopeBlockedSignal) throw e;
+          workflowUnavailable = true;
           runLog.warn(
             "finalize base-align: could not compute the align target; pushing without aligning",
             { run_id: runId, error: errMessage(e) },
           );
         }
-        if (defaultTip && differs) {
+        if (defaultTip && differs && !workflowUnavailable) {
+          try {
+            const hits = await freshWorkflowFiles(trackingRef, true, defaultTip);
+            if (hits === null) {
+              workflowUnavailable = true;
+            } else {
+              workflowPermitted = hits.length === 0;
+              workflowBranchChanges = await this.git.changedFiles(alignBarePath, trackingRef);
+              workflowOverlayForbidden = hits.length > 0 && workflowBranchChanges === null;
+            }
+          } catch (e) {
+            rethrowWorkflowAbort(e);
+            if (e instanceof WorkflowScopeBlockedSignal) throw e;
+            workflowUnavailable = true;
+            runLog.warn("finalize base-align: workflow eligibility unavailable; pushing without aligning", {
+              run_id: runId, error: errMessage(e),
+            });
+          }
+        }
+        const bypassAlignment = workflowPermitted && (workflowBranchChanges === null ||
+          workflowBranchChanges.some((file) => file.startsWith(".github/workflows/")));
+        if (defaultTip && differs && !workflowUnavailable && !bypassAlignment) {
           // The pre-align committed agent tip — the base every align strategy starts from, so
           // a rebase FALLBACK after a clean merge replays the ORIGINAL commits, not the merge.
           const originalAgentTip = await this.git.branchTip(
@@ -6125,6 +6280,8 @@ export class RunRunner {
                   strategy,
                 );
               } catch (e) {
+                rethrowWorkflowAbort(e);
+                if (e instanceof WorkflowScopeBlockedSignal) throw e;
                 runLog.warn(
                   "finalize base-align: unexpected error during align; preserving diff and failing typed",
                   { run_id: runId, strategy, error: errMessage(e) },
@@ -6193,6 +6350,8 @@ export class RunRunner {
                 await fetchAndPush();
                 return false;
               } catch (e) {
+                rethrowWorkflowAbort(e);
+                if (e instanceof WorkflowScopeBlockedSignal) throw e;
                 if (e instanceof ScratchPublicationError || e instanceof RunResidueBlockedError) throw e;
                 if (await reportMovedBranchIfVerified(e)) return true;
                 // PRD #974 M2: an aligned push rejected by GitHub Push Protection (GH013) is a
@@ -6232,7 +6391,7 @@ export class RunRunner {
             // allowed ONLY when the diff succeeded AND the branch provably modified NO workflow
             // file. Any other case (null diff, or a real workflow edit) falls straight into the
             // EXISTING merge → rebase → preserve chain, unchanged.
-            // Keep the overlay's tree-diff guard independent of the commit-based precheck.
+            // Keep the overlay's changed-file guard independent of tip blob eligibility.
             const alignChanged = await this.git.changedFiles(alignBarePath, trackingRef);
             const alignWfHits = alignChanged === null
               ? null
@@ -6262,6 +6421,8 @@ export class RunRunner {
                 [runnerClone.baseCommit, runnerClone.defaultBranchCommit ?? ""],
               );
             } catch (e) {
+              rethrowWorkflowAbort(e);
+              if (e instanceof WorkflowScopeBlockedSignal) throw e;
               runLog.warn(
                 "finalize base-align: could not import the default tip into the runner clone; preserving diff and failing typed",
                 { run_id: runId, error: errMessage(e) },
@@ -6279,7 +6440,7 @@ export class RunRunner {
             // WRONG for the overlay — an overlay error must fall back to merge/rebase, not
             // preserve-and-fail. So the overlay gets its own try/catch here.
             let overlayHandled = false;
-            if (canOverlay) {
+            if (canOverlay && !workflowOverlayForbidden) {
               let overlayAligned = false;
               try {
                 const res = await this.git.alignBranchWithDefault(
@@ -6291,6 +6452,8 @@ export class RunRunner {
                 );
                 overlayAligned = res === "aligned"; // the overlay never returns "conflict"
               } catch (e) {
+                rethrowWorkflowAbort(e);
+                if (e instanceof WorkflowScopeBlockedSignal) throw e;
                 // (b) the overlay git op threw (a GENUINE unexpected git error) → fall back to
                 // merge/rebase, NOT preserve-and-fail. Distinct message from (c) below.
                 runLog.warn(
@@ -6303,6 +6466,8 @@ export class RunRunner {
                   await fetchAndPush(); // sets alignPushed = true on success
                   overlayHandled = true;
                 } catch (e) {
+                  rethrowWorkflowAbort(e);
+                  if (e instanceof WorkflowScopeBlockedSignal) throw e;
                   if (e instanceof RunResidueBlockedError) throw e;
                   // PRD #974 M2: an overlay push rejected by GitHub Push Protection (GH013) is a
                   // secret gitleaks missed — typed push_secret_blocked fail (NO preserved diff:
@@ -6336,6 +6501,8 @@ export class RunRunner {
                 try {
                   await fetchAndPush();
                 } catch (e) {
+                  rethrowWorkflowAbort(e);
+                  if (e instanceof WorkflowScopeBlockedSignal) throw e;
                   if (e instanceof RunResidueBlockedError) throw e;
                   // PRD #974 M2: a merge push rejected by GitHub Push Protection (GH013) is a secret
                   // gitleaks missed — typed push_secret_blocked fail (NO preserved diff: it may
@@ -6402,6 +6569,8 @@ export class RunRunner {
         }
       }
     } catch (e) {
+      rethrowWorkflowAbort(e);
+      if (e instanceof WorkflowScopeBlockedSignal) return;
       if (e instanceof ScratchPublicationError) throw e;
       // PRD #1416 M4 (SC3): a bridge that could not be built/validated at a finalize push site was
       // thrown as HistoryRewrittenError; type it history_rewritten — never the generic catch
@@ -6478,6 +6647,8 @@ export class RunRunner {
       try {
         await pushToOrigin();
       } catch (e) {
+        rethrowWorkflowAbort(e);
+        if (e instanceof WorkflowScopeBlockedSignal) return;
         if (e instanceof ScratchPublicationError) throw e;
         // PRD #974 M2 backstop: a GitHub Push Protection (GH013) rejection here means a secret
         // the pre-push gitleaks scan missed — route it to the typed push_secret_blocked fail
@@ -6492,6 +6663,10 @@ export class RunRunner {
         // advanced the MR branch under the run; route that distinct case to the branch_moved
         // disposition instead of letting it rethrow into the generic agent_failure catch.
         if (await reportMovedBranchIfVerified(e)) return;
+        if (isWorkflowScopeRejection(e)) {
+          await failWorkflowScope([".github/workflows/"]);
+          return;
+        }
         throw e;
       }
     }
@@ -6557,7 +6732,6 @@ export class RunRunner {
     // the PRD #456 align push), so `H` below is the tip that ACTUALLY landed — never the pre-align
     // candidate. Interlocked runs are ISSUE runs that open MRs, so this sits on the openMr path only;
     // the no-MR task completion above is never interlocked and stays untouched.
-    const interlocked = claim.config?.completion_contract_version != null;
     // `Closes #N` renders at MR creation for a LEGACY run only (unchanged). For an INTERLOCKED run it
     // starts false and STAYS false at creation: Closes is NEVER rendered at creation for an interlocked
     // run; it is added ONLY after the PR head is verified to equal H (the verification block below), so
@@ -6578,36 +6752,6 @@ export class RunRunner {
     // legacy run, so JSON.stringify drops it and the legacy completed report is byte-for-byte the same
     // on the wire.
     let completionHead: string | undefined;
-    // Park the incomplete/unverifiable interlocked run, else report a typed failure. Shared by the
-    // permit-denied and PR-head-mismatch paths (D5's held-or-fail). enterCompletionHold reaps,
-    // captures a VERIFIED same-worker restore point and parks on a `paused` ACK (returns true), or
-    // parks nothing (returns false); on true we skip finalization exactly like the
-    // result.completionHeld branch above, and on false the run follows normal terminal cleanup
-    // (enterCompletionHold cleared its preserve flags) so we report a static, content-free failure.
-    // `holdReason` is a static hold-reason string, never raw model output.
-    const holdOrFailInterlocked = async (holdReason: string): Promise<void> => {
-      const held = await this.enterCompletionHold(flight, claim, holdReason, runLog);
-      if (held) {
-        // Issue #1742 retirement site (c): the api accepted the completion-hold park for this generation.
-        await this.retireFinalizeRecord(flight, "completion_hold_accepted");
-        executor.killAgentTree?.();
-        await closeBatcher().catch(() => undefined);
-        runLog.info("run entered the completion hold; skipping finalization", {
-          run_id: runId,
-          reason: holdReason,
-        });
-        return;
-      }
-      await closeBatcher();
-      // PRD #1391 Run B M3 (N1): journal write-ahead so the completion-interlock failure survives an
-      // outage as this exact outcome, not a generic agent_failure.
-      await journalTerminalReport({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
-      runLog.info("run failed: completion interlock could not park the incomplete run", {
-        run_id: runId,
-        reason: holdReason,
-      });
-    };
-
     // PRD #1225 (CodeRabbit !1254): fail CLOSED — a terminal failure with NO hold attempt. Used when a
     // would-be hold path could NOT strip `Closes #N` from the MR (the non-closing reconcile write
     // failed). `createMergeRequest` can ADOPT a pre-existing MR that already carries `Closes #N`, so a
@@ -6632,65 +6776,10 @@ export class RunRunner {
     };
 
     if (interlocked) {
-      // 1. Capture the EXACT landed head H. pushBranch pushes refs/uzi-runner/<branch>, and BOTH the
-      //    normal finalize push (fetchAgentBranch at the top of this method) and the align push
-      //    (fetchAndPush's re-fetch of the aligned tip) wrote that ref to the tip they pushed — so
-      //    trackingTip reads the landed tip after either path. The frozen contract revision is echoed
-      //    verbatim so the server can reject a revision drift. If either is unresolvable a permit
-      //    cannot be bound to (run, revision, branch, head), so route to the hold rather than report
-      //    completed. Issue #1626: the revision is the LATEST one a /state ACK carried
-      //    (flight.latestContractRevision) — a fresh run's contract freezes after its claim, so the
-      //    claim's value is absent there — falling back to the claim's (a resume re-delivers it).
+      // Read the exact landed tip after the finalize push or alignment; retain PR-head verification below.
       const head = await this.git.trackingTip(barePath, result.branch);
-      const contractRevision = flight.latestContractRevision ?? claim.config?.contract_revision;
-      if (head === null || contractRevision === undefined) {
-        runLog.warn(
-          "completion interlock: the landed head or contract revision is unresolvable; holding rather than completing",
-          { run_id: runId },
-        );
-        await holdOrFailInterlocked("completion identity unresolvable");
-        return;
-      }
-      // 2. Request the permit bound to (run, contract_revision, branch, H). A denial is a normal 200
-      //    body (granted:false), never a throw. A transient transport failure (an api outage at
-      //    finalize) is retried inside the client until the api answers, bounded by its retry budget
-      //    and cancelled with the flight or the Codex finalize boundary. For Claude/stub runs
-      //    there is no boundary signal, so the flight signal is passed unchanged. Only a
-      //    permanent error, a cancel, or an exhausted budget throws to the generic catch,
-      //    which fails the run without falsely completing.
-      steps?.enter("completion_permit");
-      const permitSignal = boundarySignal
-        ? AbortSignal.any([flight.cancel.signal, boundarySignal])
-        : flight.cancel.signal;
-      const permit = await this.client.requestCompletionPermit(
-        runId,
-        {
-          contractRevision,
-          branch: result.branch,
-          head,
-          // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure
-          // stamps) so the server refuses to issue a permit for a released/superseded stale flight.
-          claimGeneration: flight.claimGeneration,
-        },
-        permitSignal,
-      );
-      // 3. NOT granted: do NOT create the MR, do NOT render Closes, do NOT report completed — hold.
-      if (!permit.granted) {
-        batcher.emit({
-          kind: "status",
-          agent: "worker",
-          payload: {
-            text: "completion permit denied; holding the incomplete run instead of opening a merge request",
-          },
-        });
-        await holdOrFailInterlocked("completion permit denied");
-        return;
-      }
-      // 4. Granted: carry H on the completed report below. Closes is NEVER rendered at creation for an
-      //    interlocked run — it is added ONLY after the PR head is verified to equal H (the verification
-      //    block below re-asserts the canonical `Closes #N` body on a verified head), so a held,
-      //    unverified-head MR can never carry a closing line.
-      completionHead = head;
+      if (!await requireCompletionPermit(head, result.branch)) return;
+      completionHead = head!;
     }
 
     const targetBranch =
@@ -8777,13 +8866,13 @@ export class RunRunner {
         // (the executor then recreates the reaped provider epoch — see startProviderEpoch). A blocked
         // reconcile (e.g. a transient refresh failure) surfaces a CodexBoundaryError that propagates and
         // fails the run — the intended fail-closed behavior for a credentialed durability boundary —
-        // EXCEPT a vault-locked deferral (issue #1766): that error still propagates, but executeClaim's
+        // EXCEPT a credential deferral (vault_locked or refresh_unknown): that error still propagates, but executeClaim's
         // catch chain parks the run for recovery credential-free instead of failing it.
         // issue #1783 (auditor M2): the flight rides along, so the milestone proves the clone
         // quiescent first. On survivors/unverified THIS checkpoint's publish (and its overlay PAT
         // fetch) is skipped and the run continues; the clone is not flagged for preservation (its
         // terminal retire runs its own gate). The catch below swallows ONLY that
-        // RunResidueBlockedError; every other error, the #1766 vault-locked deferral included,
+        // RunResidueBlockedError; every other error, the #1766 credential deferrals included,
         // still propagates.
         let residueBlocked = false;
         let checkpointFailed = false;
@@ -11965,20 +12054,22 @@ export class RunRunner {
   }
 
   /**
-   * Issue #1766: park a run whose Codex credential refresh/release was deferred by a locked owner
-   * vault. A separate helper (one catch clause in executeClaim) so the vault park stays textually
+   * Issue #1766: park a run whose Codex credential refresh/release was deferred by a confirmed vault
+   * lock or an unknown refresh outcome. A separate helper (one catch clause in executeClaim) so the credential park stays textually
    * apart from the finalize site. Delegates to {@link handleRecoveryExhausted} with the
-   * `vault_locked` cause: confirm the run is `running` at this claim's generation, settle the
+   * exact deferral cause: confirm the run is `running` at this claim's generation, settle the
    * executor credential-free, capture the restore point credential-free, then report the park.
    */
-  private async handleVaultLockDeferral(
+  private async handleCredentialDeferral(
     err: Error,
     claim: ClaimResponse,
     flight: RunFlight,
     executor: Executor,
     runLog: Logger,
   ): Promise<void> {
-    runLog.warn("codex credential deferred: the owner vault is locked; parking the run for recovery", {
+    const deferral = codexDeferralOf(err);
+    if (deferral === undefined) throw err;
+    runLog.warn("codex credential deferred; retaining work for recovery", {
       run_id: flight.runId,
     });
     flight.parked = await this.handleRecoveryExhausted(
@@ -11989,19 +12080,19 @@ export class RunRunner {
       flight.batcher,
       flight.reportState,
       runLog,
-      { kind: "vault_locked" },
+      { kind: deferral },
     );
   }
 
   /**
-   * Issue #1766 (R4): before a vault-lock park, positively confirm this flight still owns a
+   * Issue #1766 (R4): before a credential recovery park, positively confirm this flight still owns a
    * `running` row. `ctx.reportIteration` swallows its errors, so nothing earlier proves the
    * awaiting_approval -> running transition landed (a post-approval epoch recreation defers before
    * the first iteration report). Sends a fenced `running` report through the flight choke point
    * (which stamps claim_generation); a statusless ack or a transport failure falls back to the
    * ownership probe, which confirms only on `running` AT this claim's generation.
    */
-  private async confirmRunningForVaultPark(
+  private async confirmRunningForCredentialPark(
     flight: RunFlight,
     reportState: (body: StateRequest) => Promise<StateAck>,
     runLog: Logger,
@@ -12016,7 +12107,7 @@ export class RunRunner {
       if (e instanceof StaleClaimError) return { kind: "stop" };
       if (e instanceof ServerWallParkedError) return { kind: "wall_parked" };
       if (isInputReceiptError(e)) return { kind: "receipt_failed", error: e };
-      runLog.warn("vault-lock park: could not confirm the running state; probing ownership", {
+      runLog.warn("credential recovery park: could not confirm the running state; probing ownership", {
         run_id: flight.runId,
         error: errMessage(e),
       });
@@ -12049,7 +12140,7 @@ export class RunRunner {
    *  its live registry (never reconciling or minting a permit); a legacy executor was already
    *  reaped by the handler's `killAgentTree`; a `safety`-bearing executor without the method fails
    *  closed. Never throws. */
-  private async settleForVaultCapture(executor: Executor): Promise<CredentialFreeSettleOutcome> {
+  private async settleForCredentialCapture(executor: Executor): Promise<CredentialFreeSettleOutcome> {
     if (executor.settleForCredentialFreeCapture) {
       try {
         return await executor.settleForCredentialFreeCapture(this.codexBoundaryDeadlineMs);
@@ -12069,7 +12160,7 @@ export class RunRunner {
    * after current HEAD is verified in the worker-owned tracking ref. A failed
    * park report is retried too: live worker heartbeats preclude stale requeue.
    *
-   * issue #1783 M3: the capture retry is BOUNDED for one cause. A capture skipped because its
+   * issue #1783 M3: the capture retry is BOUNDED for noncredential causes, including transient and disk parks. A capture skipped because its
    * quiescence proof blocked does not clear by waiting, so after
    * RECOVERY_CAPTURE_BLOCKED_ATTEMPTS consecutive blocked proofs the run fails with fail_origin
    * `worker_residue_blocked` (the clone and session kept). Other unverified captures (a failed WIP
@@ -12083,9 +12174,9 @@ export class RunRunner {
    * recovery_wait status, including an idempotent 409 after a lost success ACK.
    *
    * Issue #1766: `cause` selects the park. `transient` (the default) is the path above, unchanged.
-   * `vault_locked` (a Codex credential deferral) differs in these ways:
+   * `vault_locked` and `refresh_unknown` credential deferrals differ in these ways:
    *   - it first confirms the run is `running` at this claim's generation
-   *     ({@link confirmRunningForVaultPark}); a stale claim or another generation stops silently, a
+   *     ({@link confirmRunningForCredentialPark}); a stale claim or another generation stops silently, a
    *     server wall park retains everything, and a 404 keeps the clone and session unless a
    *     verified capture exists. An `unknown` confirm (a probe with no claim_generation, a live
    *     non-running probe status, or a persistent probe failure) retries at the capped backoff
@@ -12108,10 +12199,10 @@ export class RunRunner {
    *   - it settles the executor credential-free before capture, and retries (no park) until the
    *     settle is observed empty;
    *   - the capture publishes with no overlay and no boundary (credentialFree);
-   *   - the park is typed `recovery_cause: "vault_locked"` when the api advertises
-   *     `recovery_cause_vault_locked`, else untyped;
-   *   - it never runs the credentialed reap-then-settle (which would refresh against the locked
-   *     vault and could release custody), so the custody hold is kept;
+   *   - only a confirmed vault lock is typed `recovery_cause: "vault_locked"` when the api advertises
+   *     `recovery_cause_vault_locked`; refresh_unknown is always untyped and uses neutral notices;
+   *   - it never runs the credentialed reap-then-settle (which would retry the deferred credential
+   *     operation and could release custody), so the custody hold is kept;
    *   - a cancel captures, then reports `run cancelled` without the credentialed pre-report reap;
    *   - each retry (the running confirmation, the ownership probe, the settle, the capture, the
    *     park report and the cancel report) posts a deduplicated feed line and backs off from
@@ -12128,7 +12219,10 @@ export class RunRunner {
     cause: RecoveryParkCause = { kind: "transient" },
     opts: { terminalDisk?: boolean } = {},
   ): Promise<boolean> {
-    const vault = cause.kind === "vault_locked";
+    // Both credential deferrals use the same credential-free proof/custody posture.
+    // Unknown outcomes never imply a locked vault or send an API recovery cause.
+    let credentialDeferred = cause.kind === "vault_locked" || cause.kind === "refresh_unknown";
+    let feed = cause.kind === "vault_locked" ? VAULT_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
     // PRD #1809 D4: the mid-run disk park (the cache cap's preventive park, or the hard pressure
     // stop's counted one). The transient park's steps, with the typed cause on the park report and
     // the custody hold KEPT (no post-park settle): a clone exists, and the api keeps custody for a
@@ -12159,14 +12253,15 @@ export class RunRunner {
     let blockedCaptures = 0;
     let unverifiedCaptures = 0;
     let degraded = false;
+    let credentialRedispatch = false;
     // #1539: the outcome of the cancel branch's pre-report reap, run ONCE while the run is
     // still actively-claimed. undefined = not yet attempted; true = reaped (settle after the
     // terminal report); false = a blocked/failed reap (RETAIN the hold, still report the cancel).
     let cancelReap: boolean | undefined;
     const terminal = TERMINAL_RUN_STATUSES;
-    // Issue #1766: vault-lock park progress. A transient park starts with both latched.
-    let confirmedRunning = !vault;
-    let settled = !vault;
+    // Issue #1766: credential-deferral park progress. A transient park starts with both latched.
+    let confirmedRunning = !credentialDeferred;
+    let settled = !credentialDeferred;
     let retries = 0;
     const shown = new Set<string>();
     const note = async (text: string): Promise<void> => {
@@ -12176,11 +12271,11 @@ export class RunRunner {
       await batcher.flush().catch(() => undefined);
     };
     const retryWait = async (cancelStopsWait = true): Promise<void> => {
-      if (!vault) return this.waitRecoveryRetry(flight, cancelStopsWait);
-      const doublings = Math.min(retries++, VAULT_PARK_BACKOFF_MAX_DOUBLINGS);
+      if (!credentialDeferred) return this.waitRecoveryRetry(flight, cancelStopsWait);
+      const doublings = Math.min(retries++, CREDENTIAL_PARK_BACKOFF_MAX_DOUBLINGS);
       await this.waitRecoveryRetry(flight, cancelStopsWait, this.recoveryRetryMs * 2 ** doublings);
     };
-    // Issue #1766: the vault-lock EXIT capture. The vault exits on a terminal or held outcome (a
+    // Issue #1766: the credential-deferral EXIT capture. The credential park exits on a terminal or held outcome (a
     // cancel, a terminal ack or ownership read, a given-up input receipt, a live non-running status)
     // run it first, because executeClaim's finally DISCARDS the clone once preserveRecoveryClone is
     // false: commits since the last fetch-back and uncommitted edits exist only there. The stop arms
@@ -12189,12 +12284,12 @@ export class RunRunner {
     // has its own clone. Credential-free: settle the executor (never reconciling),
     // then WIP commit, fetch-back and verify, then a best-effort join-token publish (skipped for a
     // run already known terminal). True only for a VERIFIED capture; never throws.
-    const captureForVaultExit = async (publish: boolean): Promise<boolean> => {
+    const captureForCredentialExit = async (publish: boolean): Promise<boolean> => {
       if (capture) return true;
       if (!settled) {
-        const settlement = await this.settleForVaultCapture(executor);
+        const settlement = await this.settleForCredentialCapture(executor);
         if (settlement.kind !== "observed_empty") {
-          runLog.warn("vault-lock park: the execution did not settle before exit; keeping the clone and session", {
+          runLog.warn("credential recovery park: the execution did not settle before exit; keeping the clone and session", {
             run_id: flight.runId,
             errors: settlement.errors.map((e) => e.category),
           });
@@ -12206,6 +12301,7 @@ export class RunRunner {
         const attempt = await this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
           credentialFree: true,
           publish,
+          terminalDisk: opts.terminalDisk,
         });
         if (attempt.verified) {
           capture = attempt;
@@ -12215,7 +12311,7 @@ export class RunRunner {
           return true;
         }
       } catch (captureError) {
-        runLog.warn("vault-lock park: exit capture failed; keeping the clone and session", {
+        runLog.warn("credential recovery park: exit capture failed; keeping the clone and session", {
           run_id: flight.runId,
           error: errMessage(captureError),
         });
@@ -12229,12 +12325,12 @@ export class RunRunner {
     };
     // A live non-running status (paused, awaiting_approval, ...): never park over it and never fail
     // it. Capture, say so on the feed, and keep the clone and session for whoever resumes it.
-    const vaultHeld = async (): Promise<false> => {
-      await captureForVaultExit(true);
-      runLog.info("vault-lock park: the run is not running and cannot resume here; retaining work, not parking", {
+    const credentialHeld = async (): Promise<false> => {
+      await captureForCredentialExit(true);
+      runLog.info("credential recovery park: the run is not running and cannot resume here; retaining work, not parking", {
         run_id: flight.runId,
       });
-      await note(VAULT_PARK_FEED.held);
+      await note(feed.held);
       flight.preserveRecoveryClone = true;
       flight.preserveSession = true;
       return false;
@@ -12244,19 +12340,19 @@ export class RunRunner {
         if (opts.terminalDisk) this.terminalDiskInterruption(flight);
         if (flight.active?.shuttingDown) return false;
         if (!confirmedRunning && !flight.steering.isCancelled()) {
-          const confirm = await this.confirmRunningForVaultPark(flight, reportState, runLog);
+          const confirm = await this.confirmRunningForCredentialPark(flight, reportState, runLog);
           switch (confirm.kind) {
             case "confirmed":
               confirmedRunning = true;
               retries = 0;
               break;
             case "unknown":
-              await note(VAULT_PARK_FEED.confirmUnknown);
+              await note(feed.confirmUnknown);
               await retryWait();
               continue;
             case "stop":
               // #1247: the run moved on under this worker. Stop silently: no report, normal teardown.
-              runLog.info("vault-lock park: the claim moved on under this worker; stopping silently", {
+              runLog.info("credential recovery park: the claim moved on under this worker; stopping silently", {
                 run_id: flight.runId,
               });
               flight.preserveRecoveryClone = false;
@@ -12265,16 +12361,16 @@ export class RunRunner {
             case "gone":
               // A 404: this worker no longer owns the run. Keep the clone and session unless a
               // verified capture exists, exactly as the loop's 404 does.
-              runLog.info("vault-lock park: the run is not found for this worker; keeping the clone and session", {
+              runLog.info("credential recovery park: the run is not found for this worker; keeping the clone and session", {
                 run_id: flight.runId,
               });
               keepUnlessCaptured(capture !== undefined);
               return false;
             case "terminal":
-              keepUnlessCaptured(await captureForVaultExit(false));
+              keepUnlessCaptured(await captureForCredentialExit(false));
               return false;
             case "held":
-              return await vaultHeld();
+              return await credentialHeld();
             case "wall_parked":
               // The ServerWallParkedError arm's posture: retain everything, report nothing.
               runLog.info(
@@ -12284,8 +12380,8 @@ export class RunRunner {
               return true;
             case "receipt_failed":
               // The run fails, so capture first. keepCustody: no credentialed pre-report reap (it
-              // would refresh against the locked vault) and no custody settle; the hold stays open.
-              keepUnlessCaptured(await captureForVaultExit(true));
+              // would retry the deferred credential operation) and no custody settle; the hold stays open.
+              keepUnlessCaptured(await captureForCredentialExit(true));
               await this.reportGenericFailure(claim, flight, confirm.error, { keepCustody: true });
               return false;
           }
@@ -12297,7 +12393,7 @@ export class RunRunner {
         try {
           const own = await this.client.getRunOwnership(flight.runId);
           status = own.status;
-          if ((vault || opts.terminalDisk) && own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration) {
+          if ((credentialDeferred || opts.terminalDisk) && own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration) {
             flight.preserveRecoveryClone = false;
             flight.preserveSession = false;
             return false;
@@ -12308,21 +12404,21 @@ export class RunRunner {
           }
         } catch (probeError) {
           if (probeError instanceof RequestError && probeError.status === 404) {
-            if (vault) keepUnlessCaptured(capture !== undefined);
-            if (opts.terminalDisk) { flight.preserveRecoveryClone = false; flight.preserveSession = false; }
+            if (credentialDeferred) keepUnlessCaptured(capture !== undefined);
+            if (opts.terminalDisk && !credentialDeferred) { flight.preserveRecoveryClone = false; flight.preserveSession = false; }
             return false;
           }
-          if (vault) await note(VAULT_PARK_FEED.confirmUnknown);
+          if (credentialDeferred) await note(feed.confirmUnknown);
           await retryWait();
           continue;
         }
         if (status !== "running") {
-          if (vault && status !== "recovery_wait") {
+          if (credentialDeferred && status !== "recovery_wait") {
             if (terminal.has(status)) {
-              keepUnlessCaptured(await captureForVaultExit(false));
+              keepUnlessCaptured(await captureForCredentialExit(false));
               return false;
             }
-            return await vaultHeld();
+            return await credentialHeld();
           }
           if (terminal.has(status)) {
             flight.preserveRecoveryClone = false;
@@ -12348,23 +12444,23 @@ export class RunRunner {
           // top of this handler reaps Claude/stub but is a NO-OP for Codex, so this reap is what
           // closes Codex admission. The credentialed settle runs AFTER the terminal report below (on
           // the ack, or on a later terminal ownership read via the early return above).
-          // Issue #1766: a vault-lock park skips this credentialed reap (it would refresh against
-          // the locked vault); cancelReap stays false, so the hold is retained for the reconciler.
+          // Issue #1766: a credential-deferral park skips this credentialed reap (it would refresh against
+          // the deferred credential operation); cancelReap stays false, so the hold is retained for the reconciler.
           if (cancelReap === undefined)
-            cancelReap = vault
+            cancelReap = credentialDeferred
               ? false
               : await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
           // Issue #1766: capture BEFORE the cancel report, credential-free. Mirrors the transient
           // settle's guarantee (committed work is archived, or the clone kept when it is the only
           // source) without a credentialed call: an unverified capture keeps the clone and session.
-          const cancelCaptured = vault ? await captureForVaultExit(true) : false;
+          const cancelCaptured = credentialDeferred ? await captureForCredentialExit(true) : false;
           try {
             // Consuming cancel only stamps stop_kind. This existing terminal
             // report is what makes Service route it to CancelRunByWorker.
             const ack = await reportState({ status: "failed", failure_reason: "run cancelled" });
             if (ack.status && terminal.has(ack.status)) {
-              flight.preserveRecoveryClone = vault && !cancelCaptured;
-              flight.preserveSession = vault && !cancelCaptured;
+              flight.preserveRecoveryClone = credentialDeferred && !cancelCaptured;
+              flight.preserveSession = credentialDeferred && !cancelCaptured;
               // PRD #1349 M2 (D4.5) / #1539: the provider was reaped above while actively-claimed;
               // now the terminal report has landed, so run the non-status-gated custody settle. A
               // verified-empty run RELEASES its exact hold, committed work CAPTURES it, and a
@@ -12376,7 +12472,7 @@ export class RunRunner {
             if (ack.status && ack.status !== "running") {
               // Issue #1766: a live non-running cancel ack (paused, awaiting_approval, ...) is the
               // held posture: say so on the feed and keep the clone and session.
-              if (vault) return await vaultHeld();
+              if (credentialDeferred) return await credentialHeld();
               return false;
             }
           } catch (cancelError) {
@@ -12384,7 +12480,7 @@ export class RunRunner {
               error: errMessage(cancelError),
             });
           }
-          if (vault) await note(VAULT_PARK_FEED.cancelReportFailed);
+          if (credentialDeferred) await note(feed.cancelReportFailed);
           // Do not busy-loop on the sticky cancel or its spent abort signal.
           // Shutdown can still stop the retry with clone and session retained.
           await retryWait(false);
@@ -12393,13 +12489,13 @@ export class RunRunner {
         if (!settled) {
           // Issue #1766 (R2): nothing of the run may still write to the clone while it is captured.
           // An incomplete settle retains everything and retries; it never parks and never fails.
-          const settlement = await this.settleForVaultCapture(executor);
+          const settlement = await this.settleForCredentialCapture(executor);
           if (settlement.kind !== "observed_empty") {
-            runLog.warn("vault-lock park: the execution did not settle; retaining work and retrying", {
+            runLog.warn("credential recovery park: the execution did not settle; retaining work and retrying", {
               run_id: flight.runId,
               errors: settlement.errors.map((e) => e.category),
             });
-            await note(VAULT_PARK_FEED.settleIncomplete);
+            await note(feed.settleIncomplete);
             await retryWait();
             continue;
           }
@@ -12410,13 +12506,13 @@ export class RunRunner {
           let blockedDetail: string | undefined;
           try {
             const attempt = await this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
-              credentialFree: vault,
+              credentialFree: credentialDeferred,
               terminalDisk: opts.terminalDisk,
             });
             if (attempt.residueBlocked) blockedDetail = attempt.residueDetail ?? "not quiescent";
             if (attempt.verified) {
               capture = attempt;
-              flight.preserveRecoveryClone = false;
+              flight.preserveRecoveryClone = credentialDeferred;
               flight.predecessorCaptureVerified = flight.predecessorCapture;
               retries = 0;
             }
@@ -12424,6 +12520,14 @@ export class RunRunner {
             if (opts.terminalDisk) {
               this.terminalDiskInterruption(flight);
               if (canonicalRecoveryInterruption(captureError)) throw captureError;
+            }
+            const deferral = codexDeferralOf(captureError);
+            if (deferral !== undefined) {
+              cause = { kind: deferral };
+              credentialDeferred = true;
+              feed = deferral === "vault_locked" ? VAULT_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
+              confirmedRunning = false;
+              settled = false;
             }
             runLog.warn("recovery capture failed; retaining work for retry", {
               error: errMessage(captureError),
@@ -12438,15 +12542,15 @@ export class RunRunner {
           // precedence over the blocked bound below: the loop's top routes a shutdown to the
           // retained posture and a cancel to the cancel report, never to worker_residue_blocked.
           if (flight.active?.shuttingDown || flight.steering.isCancelled()) continue;
-          if (blockedDetail !== undefined && blockedCaptures >= RECOVERY_CAPTURE_BLOCKED_ATTEMPTS) {
+          if (!credentialDeferred && blockedDetail !== undefined && blockedCaptures >= RECOVERY_CAPTURE_BLOCKED_ATTEMPTS) {
             // issue #1783 M3: the proof keeps blocking, and nothing else is guaranteed to end this
             // loop. Stop retrying: keep the clone and session for inspection (a surviving process
             // may still be writing there) and fail the run worker_residue_blocked; its reason names
             // the blocking pid and comm when the block was an unattributed process, or just a count
             // of survivors when it was not. Reported here, not thrown: an error escaping this
             // handler would leave executeClaim's catch arm without reaching reportGenericFailure.
-            // A RunResidueBlockedError runs no credentialed pre-report reap; a vault-lock park
-            // additionally keeps the custody hold (keepCustody), as its given-up receipt does.
+            // Only other recovery causes reach this terminal cap; credential deferrals keep
+            // retrying with capped waits and retain custody until a capture proof passes.
             flight.preserveRecoveryClone = true;
             flight.preserveSession = true;
             runLog.warn("recovery capture: the clone stayed not provably quiescent; failing the run and keeping the clone", {
@@ -12454,10 +12558,10 @@ export class RunRunner {
               attempts: blockedCaptures,
               detail: sanitizeForLog(blockedDetail),
             });
-            await this.reportGenericFailure(claim, flight, new RunResidueBlockedError(blockedDetail), { keepCustody: vault || opts.terminalDisk });
+            await this.reportGenericFailure(claim, flight, new RunResidueBlockedError(blockedDetail), { keepCustody: credentialDeferred || opts.terminalDisk });
             return false;
           }
-          if (opts.terminalDisk && !capture && unverifiedCaptures >= COMPLETION_HOLD_CAPTURE_ATTEMPTS) {
+          if (!credentialDeferred && opts.terminalDisk && !capture && unverifiedCaptures >= COMPLETION_HOLD_CAPTURE_ATTEMPTS) {
             // Captures never restart after this disposition, including lost/statusless park ACKs.
             // Up to four blocked calls can precede each of three nonblocked failures (15 total).
             // Final proof is separately bounded to five calls and performs no capture/git mutation.
@@ -12482,8 +12586,8 @@ export class RunRunner {
             await note("Disk recovery capture could not be verified. Keeping the original clone, journal and session on this worker; recovery requires this worker and cannot transfer to another worker until capture succeeds.");
           }
           if (!capture) {
-            if (vault) {
-              await note(VAULT_PARK_FEED.unverified);
+            if (credentialDeferred) {
+              await note(feed.unverified);
             } else if (!notified) {
               batcher.emit({
                 kind: "status",
@@ -12532,7 +12636,7 @@ export class RunRunner {
         }
         try {
           const parkBody: StateRequest = {
-            ...(vault && this.client.protocolFeatures.includes("recovery_cause_vault_locked")
+            ...(cause.kind === "vault_locked" && this.client.protocolFeatures.includes("recovery_cause_vault_locked")
               ? { status: "recovery_wait", recovery_cause: "vault_locked" }
               : disk
                 ? this.diskParkBody(claim, disk.preventive)
@@ -12569,10 +12673,14 @@ export class RunRunner {
             return true;
           }
           if (ack.status === "recovery_wait") {
-            if (vault) {
+            if (credentialDeferred) {
+              // Verified fetch-back plus the park ACK ends the retained-clone hold. The
+              // tracking ref and session remain recovery sources; normal retirement still
+              // requires its independent quiescence proof before removing the clone.
+              flight.preserveRecoveryClone = false;
               // Issue #1766: NO reapThenSettleRecoveryGeneration — its credentialed reap would
-              // refresh against the locked vault and could release custody. The hold is kept.
-              runLog.info("run parked for recovery: the owner vault is locked", {
+              // retry the deferred credential operation and could release custody. The hold is kept.
+              runLog.info("run parked for credential recovery", {
                 run_id: flight.runId,
                 published: capture.published,
                 typed: parkBody.recovery_cause !== undefined,
@@ -12580,7 +12688,7 @@ export class RunRunner {
               batcher.emit({
                 kind: "status",
                 agent: "worker",
-                payload: { text: capture.published ? VAULT_PARK_FEED.published : VAULT_PARK_FEED.local },
+                payload: { text: capture.published ? feed.published : feed.local },
               });
               return true;
             }
@@ -12615,7 +12723,7 @@ export class RunRunner {
             // Issue #1766: a live non-running park ack (paused, awaiting_approval, ...) is the held
             // posture: the feed says so, and the clone and session are kept (the in-loop capture
             // above had already released the clone) for whoever resumes the run.
-            if (vault) return await vaultHeld();
+            if (credentialDeferred) return await credentialHeld();
             return false;
           }
           // A statusless ACK (including HTTP204) proves neither a park nor a
@@ -12623,13 +12731,13 @@ export class RunRunner {
           // ownership: returning while it is still running would strand the row
           // because this healthy worker's heartbeats prevent stale-worker requeue.
         } catch (reportError) {
-          if ((vault || opts.terminalDisk) && reportError instanceof StaleClaimError) {
+          if ((credentialDeferred || opts.terminalDisk) && reportError instanceof StaleClaimError) {
             // #1247: the run moved on under this worker. Stop silently, normal teardown.
             flight.preserveRecoveryClone = false;
             flight.preserveSession = false;
             return false;
           }
-          if ((vault || opts.terminalDisk) && reportError instanceof ServerWallParkedError) {
+          if ((credentialDeferred || opts.terminalDisk) && reportError instanceof ServerWallParkedError) {
             flight.preserveRecoveryClone = true;
             return true;
           }
@@ -12644,11 +12752,15 @@ export class RunRunner {
           });
         }
         // Issue #1766: a thrown park report and a statusless ACK both retry; both are visible.
-        if (vault) await note(VAULT_PARK_FEED.reportFailed);
+        if (credentialDeferred) await note(feed.reportFailed);
         await retryWait();
       }
+    } catch (error) {
+      // dispatchFailure reuses this batcher to report the credential recovery notices.
+      credentialRedispatch = opts.terminalDisk === true && codexDeferralOf(error) !== undefined;
+      throw error;
     } finally {
-      await batcher.close().catch(() => undefined);
+      if (!credentialRedispatch) await batcher.close().catch(() => undefined);
     }
   }
 
@@ -12974,10 +13086,12 @@ export class RunRunner {
     // fetch-back and the credentialed overlay + publish). On survivors/unverified NOTHING runs:
     // the result is unverified and `residueBlocked`, which each caller treats as its
     // capture-failure branch, BOUNDED (issue #1783 M3): recovery-exhausted retains the clone +
-    // session and retries up to RECOVERY_CAPTURE_BLOCKED_ATTEMPTS consecutive blocked proofs, then
+    // session; noncredential recovery retries up to RECOVERY_CAPTURE_BLOCKED_ATTEMPTS blocked proofs, then
     // fails the run worker_residue_blocked; the credential switch retries up to
     // CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS, then gives up with custody kept. The callers set
-    // preserveRecoveryClone up front.
+    // Credential deferrals instead retain custody and retry with capped waits until a verified
+    // proof or a cancellation/shutdown/ownership exit; no skipped proof grants sink authority.
+    // The callers set preserveRecoveryClone up front.
     if (opts.terminalDisk) {
       this.terminalDiskInterruption(flight);
       if (!await this.terminalDiskQuiescence(flight)) {
@@ -13065,8 +13179,8 @@ export class RunRunner {
     // fail the capture. (Codex never reaches the TRANSIENT recovery — its executor throws no
     // TransientRecoveryError — so this is defensive wiring.)
     //
-    // Issue #1766: the vault-lock park captures `credentialFree`. Everything above is unchanged, but
-    // the publish opens NO Codex boundary (its reconcile would refresh against the locked vault) and
+    // Issue #1766: the credential recovery park captures `credentialFree`. Everything above is unchanged, but
+    // the publish opens NO Codex boundary (its reconcile would retry the deferred credential operation) and
     // builds NO overlay (the overlay's default-fetch is PAT-bearing): it is the pause-park sink's
     // credential-free join-token publish. The caller settled the execution before this capture.
     // `publish: false` (a run already known terminal) keeps the verified local capture and skips
@@ -13087,7 +13201,7 @@ export class RunRunner {
         },
       );
     } catch (err) {
-      if (!isCodexBoundaryError(err)) throw err;
+      if (!isCodexBoundaryError(err) || (site === "recovery_capture" && codexDeferralOf(err) !== undefined)) throw err;
       runLog.warn("recovery checkpoint boundary blocked; restore point saved locally but not published", {
         error: errMessage(err),
         ...codexBoundaryDiagnosticField(err, flight.redactText),

@@ -1,6 +1,6 @@
 # PRD #16: Agent Skills (builtin / global / user / repo) + first CICD skill
 
-**GitLab Issue**: [vtmocanu/uzi#16](https://github.com/vtmocanu/uzi/-/issues/16)
+**GitLab Issue**: [vtmocanu/uzi#16](https://github.com/vtmocanu/uzi/issues/16)
 **Status**: Complete (2026-07-05, MR !22 merged; all milestones M1–M7 done, final audit clean)
 **Priority**: High
 **Created**: 2026-07-05

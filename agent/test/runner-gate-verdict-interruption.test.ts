@@ -449,10 +449,99 @@ class Scenario {
   }
 }
 
-async function scenario(fn: (s: Scenario) => Promise<void>, overrides: Partial<ClaimResponse> = {}): Promise<void> {
+/** Only selected callback failures collect diagnostics, before Scenario.teardown changes the evidence. */
+function scenarioFailureDiagnostic(s: Scenario, label: string): string {
+  const text = (value: string | undefined): string =>
+    value === undefined ? "<absent>" : value.length > 400 ? value.slice(0, 400) + "...<truncated>" : value;
+  const bounded = <T,>(values: T[], limit: number): { total: number; items: T[]; omitted: number } => ({
+    total: values.length,
+    items: values.slice(0, limit),
+    omitted: Math.max(0, values.length - limit),
+  });
+  const summarizeReports = (states: StateRequest[]) => {
+    const failed = states.filter((state) => state.status === "failed");
+    const gateReports = states.filter((state) => state.status === "awaiting_approval");
+    return {
+      statuses: bounded(states.map((state) => text(state.status)), 40),
+      gateObservations: gateReports.length === 0 ? "<no gate report>" : bounded(gateReports.map((state) => ({
+        planPresent: Boolean(state.plan_md),
+        matchesPlanV1: state.plan_md === PLAN_V1,
+        matchesRevisedPlan1: state.plan_md === revisedPlan(1),
+      })), 8),
+      failedReports: failed.length === 0 ? "<no failed report>" : bounded(failed.map((state) => ({
+        failure_reason: text(state.failure_reason),
+        fail_origin: text(state.fail_origin),
+      })), 8),
+    };
+  };
+  const stampedReports = new Map<number, StateRequest[]>();
+  for (const state of api.states) {
+    if (state.runId !== s.runId || state.body.claim_generation === undefined) continue;
+    const generation = state.body.claim_generation;
+    const reports = stampedReports.get(generation);
+    if (reports === undefined) stampedReports.set(generation, [state.body]);
+    else reports.push(state.body);
+  }
+  const generationReports = Array.from(stampedReports, ([generation, reports]) => ({
+    generation,
+    ...summarizeReports(reports),
+  }));
+  const arrivalWindowObservations = s.flights.map((flight, flightIndex) => {
+    const stateFrom = flight.stateFrom;
+    const stateTo = s.flights[flightIndex + 1]?.stateFrom ?? api.states.length;
+    const reports = api.states
+      .slice(stateFrom, stateTo)
+      .filter((state) => state.runId === s.runId && state.body.claim_generation === undefined)
+      .map((state) => state.body);
+    return {
+      label: "arrival-window observations",
+      flightIndex,
+      stateFrom,
+      stateTo,
+      ...summarizeReports(reports),
+    };
+  });
+  const flights = s.flights.map((flight) => {
+    const hasError = Object.hasOwn(flight, "error");
+    const error = flight.error;
+    const errorDescription = error instanceof Error
+      ? `${text(error.name)}: ${text(error.message)}`
+      : error === null || (typeof error !== "object" && typeof error !== "function")
+        ? String(error)
+        : `<${typeof error} rejection; body omitted>`;
+    return {
+      generation: flight.claim.claim_generation,
+      finished: flight.finished,
+      execution: hasError ? { rejected: true, error: text(errorDescription) } : "<no rejected execution>",
+    };
+  });
+  return JSON.stringify({
+    label: text(label),
+    resumedFlight: s.flights.length > 1 ? "present" : "<no resumed flight>",
+    flights: bounded(flights, 12),
+    generationReports: bounded(generationReports, 12),
+    arrivalWindowObservations: bounded(arrivalWindowObservations, 12),
+    cancellationRows: s.rowsOf("cancel").length > 0 ? "present" : "<no cancellation row>",
+  });
+}
+
+async function scenario(
+  fn: (s: Scenario) => Promise<void>,
+  overrides: Partial<ClaimResponse> = {},
+  diagnosticLabel?: string,
+): Promise<void> {
   const s = new Scenario(overrides);
   try {
     await fn(s);
+  } catch (error) {
+    if (diagnosticLabel !== undefined) {
+      try {
+        console.error(`#1604 scenario failure: ${scenarioFailureDiagnostic(s, diagnosticLabel)}`);
+      } catch {
+        // A diagnostic failure must not replace the callback's original error.
+      }
+    }
+    throw error;
   } finally {
     await s.teardown();
   }
@@ -565,7 +654,7 @@ describe("#1604 — (a) a verdict still unACKed when a switch releases the claim
       assertRevisedOnResume(s, flight, FEEDBACK, "kept");
       assert.ok(s.appliedAt(row.id, flight.timelineFrom) > gateAt, "applied only after the revised plan was persisted");
       assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
-    }));
+    }, {}, "(a) unACKed revise: reclaim revises the submitted plan"));
 
   it("approve: the reclaim offers the submitted plan and the replayed approve (and its selection) applies", () =>
     scenario(async (s) => {
@@ -863,7 +952,7 @@ describe("#1604 — boundaries of the revise receipt", () => {
       // turn AFTER the current one, and this scripted lead signals done on its first implement
       // turn, so on the base code too it never reaches a prompt (independent of #1604).
       assert.ok(s.statuses(first).includes("completed"), s.statuses(first).join(","));
-    }));
+    }, {}, "mixed revise / follow_up / answer batch"));
 
   it("repeated GETs of the deferred revise neither re-ACK nor re-route it, while newer inputs still flow", () =>
     scenario(async (s) => {
@@ -932,7 +1021,7 @@ describe("#1604 — boundaries of the revise receipt", () => {
       assert.ok(s.texts(first).includes(STALE_REJECT_NOTICE), s.texts(first).join(" | "));
       assert.ok(api.isApplied(s.runId, rej!.id), "the stale reject is applied");
       assert.ok(s.statuses(first).includes("completed"), s.statuses(first).join(","));
-    }));
+    }, {}, "stale reject during revision"));
 
   it("a reject superseded in the buffer by a newer same-epoch verdict is applied with a notice", () =>
     scenario(async (s) => {
@@ -1279,7 +1368,7 @@ describe("#1604 review — a replayed verdict never applies to a plan no human s
         await s.finish(flight);
         assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
         assert.equal(s.model.count("revise", flight.turnFrom), 0, "no second revision");
-      }));
+      }, {}, kind === "reject_plan" ? "Path B (reject_plan)" : undefined));
   }
 
   it("a replayed revise older than the persisted revised plan is stale: no second revision", () =>
@@ -1563,7 +1652,7 @@ describe("shutdown at an observed plan gate", () => {
           assert.ok(s.statuses(resumed).includes("completed"), s.statuses(resumed).join(","));
         }
         assert.equal(s.rowsOf("cancel").length, 0, "neither claim required a cancel");
-      }));
+      }, {}, planApprovalTimeoutMs === 60_000 && failHeldGet ? "shutdown at an observed plan gate: 60000ms timeout, held GET fails, no session" : undefined));
   }
 });
 
@@ -1604,7 +1693,7 @@ describe("#1604 round 3 — a disposed approve is never applied, so no later cla
         assert.ok(!api.inputReceiptCalls.some((c) => c.kind === "applied" && c.ids.includes(row.id)), "the stale approve is never sent to /inputs/applied");
         if (route === "404") assert.equal(api.isApplied(s.runId, row.id), false, "the stale approve never is applied");
         assert.equal(s.model.count("implement"), 1);
-      }));
+      }, {}, `round 3 B1 Path B: second interruption gates B again; route=${route}`));
 
     it(`Path A, then a second interruption at the fresh plan's gate: the reclaim is not approved and gates again${label}`, () =>
       scenario(async (s) => {

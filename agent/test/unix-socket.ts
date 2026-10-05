@@ -11,6 +11,8 @@ import path from "node:path";
 // Fixtures take a short socket path from shortUnixSocket and bind through listenUnix, which fails
 // fast and names the path.
 const UNIX_SOCKET_PATH_MAX_BYTES = 103;
+// FD numbers recycle; each fallback endpoint needs its own HTTP connection-pool key.
+let socketSequence = 0;
 
 function assertSocketPathFits(socket: string): void {
   const bytes = Buffer.byteLength(socket);
@@ -19,18 +21,37 @@ function assertSocketPathFits(socket: string): void {
   }
 }
 
-/** A socket path in its own fresh short directory under `base`; `dispose` removes that directory. */
-export function shortUnixSocket(base = os.tmpdir()): { socket: string; dispose: () => void } {
-  const dir = fs.mkdtempSync(path.join(base, "us-"));
-  const dispose = (): void => fs.rmSync(dir, { recursive: true, force: true });
-  const socket = path.join(dir, "d.sock");
+/** Owns a fresh directory and optional FD; close the server before disposal. Borrow the FD
+ *  only while this fixture lives, explicitly mapping it into any child that uses the alias. */
+export function shortUnixSocket(base = os.tmpdir()): { socket: string; directoryFd?: number; dispose: () => void } {
+  const dir = fs.mkdtempSync(path.join(path.resolve(base), "us-"));
+  let directoryFd: number | undefined;
+  let disposed = false;
+  const dispose = (): void => {
+    if (disposed) return;
+    disposed = true;
+    try {
+      if (directoryFd !== undefined) fs.closeSync(directoryFd);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  let socket = path.join(dir, "d.sock");
   try {
+    if (process.platform === "linux" && Buffer.byteLength(socket) > UNIX_SOCKET_PATH_MAX_BYTES &&
+        Buffer.byteLength(path.relative(process.cwd(), socket)) <= UNIX_SOCKET_PATH_MAX_BYTES) {
+      directoryFd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+      socket = `/dev/fd/${directoryFd}/d-${++socketSequence}.sock`;
+      if (fs.realpathSync(path.dirname(socket)) !== fs.realpathSync(dir)) {
+        throw new Error("unix socket directory FD does not resolve to its owned directory");
+      }
+    }
     assertSocketPathFits(socket);
   } catch (err) {
     dispose();
     throw err;
   }
-  return { socket, dispose };
+  return { socket, directoryFd, dispose };
 }
 
 /** Bind `server` to a unix socket; rejects on a listen error or an over-long path instead of hanging. */

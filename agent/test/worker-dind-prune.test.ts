@@ -16,8 +16,9 @@ import { sleep } from "../src/util.js";
 import { nullLogger } from "./helpers.js";
 
 // issue #1759 M3: the claim-vs-prune race, driven through the REAL Worker claim loops.
-// The prune controller runs its real loop with short sleeps; the fake client counts
-// claims and can hold a claim in flight; the exec spy records, for every docker command,
+// Most cases run the prune controller's real loop with short sleeps; the held-heartbeat
+// case drives real ticks explicitly. The fake client counts claims and can hold a claim
+// in flight; the exec spy records, for every docker command,
 // whether the worker was idle at that moment. No prune argv may ever run while a run or
 // chat is active, and while the gate is held neither loop may call the claim endpoints.
 
@@ -48,6 +49,7 @@ function deferred<T = void>(): { promise: Promise<T>; resolve: (v: T) => void } 
 
 interface Harness {
   worker: Worker;
+  ctl: DindPruneController;
   gate: DindPruneGate;
   pressure: { on: boolean };
   execs: Array<{ argv: string[]; idle: boolean }>;
@@ -108,7 +110,7 @@ function build(client: Partial<WorkerClient>, runner: RunRunner, chatRunner: Cha
     undefined,
     ctl,
   );
-  return { worker, gate, pressure, execs };
+  return { worker, ctl, gate, pressure, execs };
 }
 
 const idleRunner = { resumePendingRecoveries: async () => {}, execute: async () => {} } as unknown as RunRunner;
@@ -247,7 +249,9 @@ describe("Worker × DinD prune claim gate (issue #1759)", () => {
     }
   });
 
-  it("a heartbeat held open across a whole claimed run is stamped at SEND time and never authorizes the prune", async () => {
+  it("a heartbeat held open across a whole claimed run is stamped at SEND time and never authorizes the prune", async (t) => {
+    let now = 1000;
+    t.mock.method(Date, "now", () => now);
     // The straddle: a heartbeat sent BEFORE the claim (the api then reports no hold)
     // returns only AFTER a fast run has ended. Stamped at receipt, that stale `false`
     // would look newer than the run end and authorize the prune; stamped at send it
@@ -275,14 +279,13 @@ describe("Worker × DinD prune claim gate (issue #1759)", () => {
             heldSent.resolve();
             return heldResponse.promise; // held open across the whole run
           }
-          await tick(1);
           if (hb.down) throw new Error("api unreachable");
           return false;
         },
         claimRun: async (): Promise<ClaimResponse | null> => {
           if (runClaims++ > 0) return null;
           await heldSent.promise; // the claim happens only once the held heartbeat is out
-          await tick(2);
+          now = 1001;
           at.claimMs = Date.now();
           return { run_id: "run-1" } as unknown as ClaimResponse;
         },
@@ -290,23 +293,35 @@ describe("Worker × DinD prune claim gate (issue #1759)", () => {
       runner,
       idleChat,
     );
+    t.mock.method(h.ctl, "loop", async () => {});
+    let custodyRecords = 0;
+    const recordCustody = h.ctl.recordCustody;
+    t.mock.method(h.ctl, "recordCustody", function (this: DindPruneController, ...args: Parameters<DindPruneController["recordCustody"]>) {
+      recordCustody.apply(this, args);
+      custodyRecords++;
+    });
     const controller = new AbortController();
     const done = h.worker.run(controller.signal);
     try {
       await until(() => runStarted, "the run is active");
       assert.ok(hb.heldSentAtMs < at.claimMs, "the held heartbeat was sent before the claim");
       assert.strictEqual(hb.calls, 1, "no other heartbeat is sent while one is in flight");
+      now = 1002;
       runGate.resolve();
       await until(() => h.worker.isIdle(), "the run ended");
+      now = 1003;
+      heldResponse.resolve(false); // the pre-claim heartbeat finally returns: custody clear
+      await until(() => custodyRecords === 1, "the held heartbeat's flag was recorded");
       // Pressure only after the run end, so only the worker's run-end hook orders the flag.
       h.pressure.on = true;
-      for (let i = 0; i < 10; i++) await tick();
-      heldResponse.resolve(false); // the pre-claim heartbeat finally returns: custody clear
-      await until(() => hb.calls >= 2, "the held heartbeat's flag was recorded");
-      for (let i = 0; i < 80; i++) await tick();
+      await h.ctl.tick(controller.signal);
+      assert.strictEqual(await h.ctl.tick(controller.signal), "custody");
       assert.strictEqual(h.execs.length, 0, "no docker command on a flag from a heartbeat sent before the run");
+      now = 1004;
       hb.down = false; // a LATER heartbeat, sent after the run end, reports custody clear
-      await until(() => h.execs.some((e) => isPrune(e.argv)), "a heartbeat sent after the run end authorizes it");
+      await until(() => custodyRecords >= 2, "a later heartbeat's flag was recorded");
+      await h.ctl.tick(controller.signal);
+      assert.ok(h.execs.some((e) => isPrune(e.argv)), "a heartbeat sent after the run end authorizes it");
     } finally {
       heldResponse.resolve(false);
       runGate.resolve();

@@ -237,8 +237,11 @@ A few worth knowing:
 - **`run approve` picks the subagent roster explicitly.** By default a run
   uses its own default roster; `--agent-source own|repo` overrides it
   (`own` = your template roster, `repo` = the agents the worker detected in
-  the clone's `.claude/agents/`), and `--exclude-agents a,b` drops individual
-  subagents from that source. `--exclude-agents` requires `--agent-source`.
+  the clone's `.claude/agents/` or `.codex/agents/`), and `--exclude-agents a,b`
+  drops individual subagents from that source. `--exclude-agents` requires
+  `--agent-source`. Detection reads one folder, never merges rosters, and prefers
+  the run harness's native folder; a present preferred folder is final even if
+  empty or invalid. See [Repo agents](repo-agents.md#which-folder-is-read).
   `run create --plan-file` takes the same two flags, for the seeded run's
   roster.
 - **`run revise <id> -m "<feedback>"`** steers a plan at the approval gate
@@ -2174,7 +2177,9 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
   from a transient interruption](run-recovery-wait.md). A Codex credential
   refresh or release that found the owner's vault locked also parks here
   (cause `vault_locked`); it takes the same capped backoff and no lifetime
-  cap, and resumes once its timer promotes it and the vault is unlocked — see
+  cap. The owner's explicit successful vault unlock best-effort queues an
+  already parked run promptly; the scheduled retry remains the fallback,
+  and a worker starts it through the normal claim path — see
   [Vault locked](run-recovery-wait.md#vault-locked). A Codex subscription
   run can also park here because its account is quarantined or needs a fresh
   login (cause `codex_account_unavailable`); unlike the transient park it has

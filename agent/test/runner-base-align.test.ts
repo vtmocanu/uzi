@@ -9,7 +9,7 @@ import { nullLogger } from "./helpers.js";
 import { type Executor, type RunContext, type ExecutorResult } from "../src/executor.js";
 import { RunRunner, composeBaseAlignConflictReason, type RunnerOptions } from "../src/runner.js";
 import { Outbox } from "../src/outbox.js";
-import { RunnerCloneImportError, isNonFastForwardRejection } from "../src/git.js";
+import { CheckpointSoftDeadlineError, RunnerCloneImportError, isNonFastForwardRejection } from "../src/git.js";
 import { GitHubClient } from "../src/forge.js";
 import {
   api,
@@ -154,32 +154,377 @@ function spyFetchDefaultTip(): { count: () => number } {
 }
 
 describe("RunRunner — finalize base-align (PRD #456)", () => {
+  it("duplicate merged workflows advancing after claim use a real subtree overlay and nonforced push", async () => {
+    seedWorkflowsOnOrigin();
+    gitIn(fx.originPath, ["checkout", "-b", "agent/issue-1869"]);
+    commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "maintainer workflow");
+    const maintainer = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+    gitIn(fx.originPath, ["checkout", "main"]);
+    commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "independent default workflow");
+    const independent = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+    assert.notStrictEqual(independent, maintainer);
+    gitIn(fx.originPath, ["checkout", "agent/issue-1869"]);
+    gitIn(fx.originPath, [...IDENT, "merge", "--no-ff", "-m", "merge duplicate default", "main"]);
+    const published = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+    gitIn(fx.originPath, ["checkout", "main"]);
+    const { github, calls } = fakeGitHub();
+    const strategies = spyAlign();
+    const claim = githubClaim(1869);
+    await githubRunner(github, committingExecutor({ "impl.ts": "task content\n" },
+      { ".github/workflows/ci.yml": "name: after claim\n" })).execute(claim);
+    assert.strictEqual(api.states.filter((s) => s.runId === claim.run_id).at(-1)?.body.status, "completed", "duplicate published workflow must pass precheck");
+    assert.deepStrictEqual(strategies, ["workflow-subtree"], "use the actual workflow subtree overlay");
+    assert.strictEqual(calls.length, 1);
+    const tip = gitIn(fx.originPath, ["rev-parse", "agent/issue-1869"]);
+    assert.notStrictEqual(tip, published, "origin really advanced");
+    assert.strictEqual(gitIn(fx.originPath, ["merge-base", "--is-ancestor", published, tip]), "");
+    assert.strictEqual(gitIn(fx.originPath, ["show", `${tip}:impl.ts`]), "task content");
+    assert.strictEqual(gitIn(fx.originPath, ["rev-parse", `${tip}:.github/workflows`]), gitIn(fx.originPath, ["rev-parse", "main:.github/workflows"]));
+  });
+
+  it("newly edited published workflow content is refused and preserves original work", async () => {
+    publishPriorAlign(1872, true);
+    const { github, calls } = fakeGitHub();
+    const claim = githubClaim(1872);
+    await githubRunner(github, committingExecutor({
+      ".github/workflows/ci.yml": "name: unpublished edit\n", "impl.ts": "task content\n",
+    })).execute(claim);
+    const failed = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed");
+    assert.strictEqual(failed.length, 1);
+    assert.strictEqual(failed[0]?.body.fail_origin, "workflow_scope_missing");
+    assert.match(failed[0]?.body.preserved_patch ?? "", /unpublished edit/);
+    assert.match(failed[0]?.body.preserved_patch ?? "", /task content/);
+    assert.strictEqual(calls.length, 0);
+    assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-1872:.github/workflows/ci.yml"]), CI_V2.trim());
+  });
+
+  it("a final mismatch after overlay reports once with the original patch and no fallback", async () => {
+    seedWorkflowsOnOrigin();
+    const { github, calls } = fakeGitHub();
+    const strategies = spyAlign();
+    const align = git.alignBranchWithDefault.bind(git);
+    git.alignBranchWithDefault = (async (...args: Parameters<typeof git.alignBranchWithDefault>) => {
+      const res = await align(...args);
+      commitToOriginMain({ ".github/workflows/ci.yml": "name: later default\n" }, "default advances after overlay");
+      return res;
+    }) as typeof git.alignBranchWithDefault;
+    let pushes = 0;
+    git.pushBranch = (async () => { pushes++; }) as typeof git.pushBranch;
+    const claim = githubClaim(1873);
+    await githubRunner(github, committingExecutor({ "impl.ts": "original task\n" },
+      { ".github/workflows/ci.yml": CI_V2 })).execute(claim);
+    const failed = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed");
+    assert.strictEqual(failed.length, 1);
+    assert.strictEqual(failed[0]?.body.fail_origin, "workflow_scope_missing");
+    assert.match(failed[0]?.body.preserved_patch ?? "", /original task/);
+    assert.doesNotMatch(failed[0]?.body.preserved_patch ?? "", /diff --git a\/\.github\/workflows/);
+    assert.deepStrictEqual(strategies, ["workflow-subtree"]);
+    assert.strictEqual(pushes, 0);
+    assert.strictEqual(calls.length, 0);
+  });
+
+  for (const [index, failure] of ["unavailable", "ordinary error"].entries()) {
+    it(`recovers from first precheck target lookup ${failure} with fresh alignment and final reads`, async () => {
+      seedWorkflowsOnOrigin();
+      const initialDefault = gitIn(fx.originPath, ["rev-parse", "main"]);
+      const { github, calls } = fakeGitHub();
+      const strategies = spyAlign();
+      const alignedDefaults: string[] = [];
+      const align = git.alignBranchWithDefault.bind(git);
+      git.alignBranchWithDefault = (async (...args: Parameters<typeof git.alignBranchWithDefault>) => {
+        alignedDefaults.push(args[3]);
+        return align(...args);
+      }) as typeof git.alignBranchWithDefault;
+
+      const defaultTips: string[] = [];
+      const fetch = git.fetchDefaultTip.bind(git);
+      git.fetchDefaultTip = (async (...args: Parameters<typeof git.fetchDefaultTip>) => {
+        if (defaultTips.length === 1) {
+          commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "advance after unavailable precheck");
+        }
+        const sha = await fetch(...args);
+        defaultTips.push(sha);
+        return sha;
+      }) as typeof git.fetchDefaultTip;
+      let targetReads = 0;
+      const target = git.fetchWorkflowTargetTip.bind(git);
+      git.fetchWorkflowTargetTip = (async (...args: Parameters<typeof git.fetchWorkflowTargetTip>) => {
+        if (++targetReads === 1) {
+          if (failure === "ordinary error") throw new Error("precheck target lookup failed");
+          return { kind: "unavailable" };
+        }
+        return target(...args);
+      }) as typeof git.fetchWorkflowTargetTip;
+      const snapshots: { defaultTip: string; files: string[] | null }[] = [];
+      const classify = git.branchWorkflowFiles.bind(git);
+      git.branchWorkflowFiles = (async (...args: Parameters<typeof git.branchWorkflowFiles>) => {
+        const files = await classify(...args);
+        snapshots.push({ defaultTip: args[1], files });
+        return files;
+      }) as typeof git.branchWorkflowFiles;
+
+      let pushes = 0;
+      const push = git.pushBranch.bind(git);
+      git.pushBranch = (async (...args: Parameters<typeof git.pushBranch>) => {
+        pushes++;
+        return push(...args);
+      }) as typeof git.pushBranch;
+      const pushArgs: string[][] = [];
+      const commands = git as unknown as {
+        runGit: (cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string) => Promise<string>;
+      };
+      const runGit = commands.runGit.bind(git);
+      commands.runGit = async (...args: Parameters<typeof commands.runGit>) => {
+        if (args[1][0] === "push") pushArgs.push([...args[1]]);
+        return runGit(...args);
+      };
+
+      let implementationSha = "";
+      const executor = committingExecutor({ "impl.ts": "recovered implementation\n" });
+      const claim = githubClaim(1876 + index);
+      await githubRunner(github, {
+        run: async (ctx: RunContext) => {
+          const result = await executor.run(ctx);
+          implementationSha = gitIn(ctx.worktreePath, ["rev-parse", "HEAD"]);
+          return result;
+        },
+      }).execute(claim);
+
+      const freshDefault = gitIn(fx.originPath, ["rev-parse", "main"]);
+      assert.notStrictEqual(freshDefault, initialDefault, "main advanced after the failed precheck");
+      assert.strictEqual(targetReads, 3, "precheck failure must not skip fresh eligibility or the final read");
+      assert.deepStrictEqual(defaultTips, [initialDefault, freshDefault, freshDefault]);
+      assert.deepStrictEqual(snapshots, [
+        { defaultTip: freshDefault, files: [".github/workflows/ci.yml"] },
+        { defaultTip: freshDefault, files: [] },
+      ], "real fresh eligibility uses the fetched align SHA and final classification sees aligned workflows");
+      assert.deepStrictEqual(alignedDefaults, [defaultTips[1]], "align uses the exact eligibility snapshot");
+      assert.deepStrictEqual(strategies, ["workflow-subtree"], "real workflow-subtree alignment ran");
+      const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+      assert.deepStrictEqual(states.map((s) => s.status), ["running", "running", "completed"]);
+      assert.ok(states.every((s) => s.fail_origin !== "workflow_scope_missing"));
+      assert.strictEqual(pushes, 1, "one real pushBranch call");
+      assert.strictEqual(pushArgs.length, 1, "one real git push");
+      assert.ok(pushArgs[0]!.every((arg) => !arg.startsWith("--force") && arg !== "-f" && !arg.startsWith("+")),
+        "no force flags or forced refspec");
+      const published = gitIn(fx.originPath, ["rev-parse", `agent/issue-${1876 + index}`]);
+      assert.ok(implementationSha, "captured executor commit before alignment");
+      assert.strictEqual(gitIn(fx.originPath, ["merge-base", "--is-ancestor", implementationSha, published]), "");
+      assert.strictEqual(gitIn(fx.originPath, ["show", `${published}:impl.ts`]), "recovered implementation");
+      assert.strictEqual(gitIn(fx.originPath, ["rev-parse", `${published}:.github/workflows`]),
+        gitIn(fx.originPath, ["rev-parse", `${freshDefault}:.github/workflows`]), "published workflows match fresh main");
+      assert.strictEqual(calls.length, 1);
+    });
+  }
+
+  for (const [index, failure] of [
+    "unavailable target", "null classifier", "thrown target", "thrown classifier",
+  ].entries()) {
+    it(`fresh alignment ${failure} latches normal nonforced publication after a permitted precheck`, async () => {
+      seedWorkflowsOnOrigin();
+      const initialDefault = gitIn(fx.originPath, ["rev-parse", "main"]);
+      const { github, calls } = fakeGitHub();
+      const strategies = spyAlign();
+      // Main advances only after the real precheck has permitted the original workflow.
+      const fetch = git.fetchDefaultTip.bind(git);
+      let fetches = 0;
+      git.fetchDefaultTip = (async (...args: Parameters<typeof git.fetchDefaultTip>) => {
+        if (++fetches === 2) commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "advance before unavailable eligibility");
+        return fetch(...args);
+      }) as typeof git.fetchDefaultTip;
+      const target = git.fetchWorkflowTargetTip.bind(git);
+      let targetReads = 0;
+      git.fetchWorkflowTargetTip = (async (...args: Parameters<typeof git.fetchWorkflowTargetTip>) => {
+        if (++targetReads === 2) {
+          if (failure === "unavailable target") return { kind: "unavailable" };
+          if (failure === "thrown target") throw new Error("target lookup failed");
+        }
+        return target(...args);
+      }) as typeof git.fetchWorkflowTargetTip;
+      const classify = git.branchWorkflowFiles.bind(git);
+      const snapshots: { defaultTip: string; hits: string[] | null }[] = [];
+      let classifierReads = 0;
+      git.branchWorkflowFiles = (async (...args: Parameters<typeof git.branchWorkflowFiles>) => {
+        if (++classifierReads === 2) {
+          if (failure === "null classifier") return null;
+          if (failure === "thrown classifier") throw new Error("classification failed");
+        }
+        const hits = await classify(...args);
+        snapshots.push({ defaultTip: args[1], hits });
+        return hits;
+      }) as typeof git.branchWorkflowFiles;
+      git.changedFiles = (async () => null) as typeof git.changedFiles;
+      let pushes = 0;
+      const push = git.pushBranch.bind(git);
+      git.pushBranch = (async (...args: Parameters<typeof git.pushBranch>) => {
+        pushes++;
+        return push(...args);
+      }) as typeof git.pushBranch;
+      const pushArgs: string[][] = [];
+      const commands = git as unknown as {
+        runGit: (cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string) => Promise<string>;
+      };
+      const runGit = commands.runGit.bind(git);
+      commands.runGit = async (...args: Parameters<typeof commands.runGit>) => {
+        if (args[1][0] === "push") pushArgs.push([...args[1]]);
+        return runGit(...args);
+      };
+      const claim = githubClaim(1900 + index);
+      await githubRunner(github, committingExecutor({ "impl.ts": "preserved implementation\n" })).execute(claim);
+
+      assert.deepStrictEqual(snapshots[0], { defaultTip: initialDefault, hits: [] }, "real precheck permitted publication");
+      assert.notStrictEqual(gitIn(fx.originPath, ["rev-parse", "main"]), initialDefault, "workflow trees genuinely diverged");
+      assert.deepStrictEqual(api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status),
+        ["running", "running", "completed"]);
+      assert.deepStrictEqual(strategies, [], "unknown fresh eligibility skips every align strategy");
+      assert.strictEqual(fetches, 2, "fresh SHA reused; unavailable latch skips final local veto");
+      assert.strictEqual(targetReads, 2, "target refreshed once at alignment, never at final push");
+      assert.strictEqual(classifierReads, failure.includes("target") ? 1 : 2);
+      assert.strictEqual(pushes, 1);
+      assert.strictEqual(pushArgs.length, 1, "one real git push");
+      assert.ok(pushArgs[0]!.every((arg) => !arg.startsWith("--force") && arg !== "-f" && !arg.startsWith("+")));
+      const published = gitIn(fx.originPath, ["rev-parse", `agent/issue-${1900 + index}`]);
+      assert.strictEqual(gitIn(fx.originPath, ["merge-base", "--is-ancestor", initialDefault, published]), "");
+      assert.strictEqual(gitIn(fx.originPath, ["show", `${published}:impl.ts`]), "preserved implementation");
+      assert.strictEqual(gitIn(fx.originPath, ["show", `${published}:.github/workflows/ci.yml`]), CI_V1.trim(),
+        "normal push retains the original workflow rather than aligning");
+      assert.strictEqual(calls.length, 1);
+    });
+  }
+
+  for (const [siteIndex, site] of ["target", "classifier"].entries()) {
+    for (const [errorIndex, kind] of ["abort", "deadline"].entries()) {
+      it(`fresh alignment ${site} ${kind} prohibits publication`, async () => {
+        seedWorkflowsOnOrigin();
+        const { github, calls } = fakeGitHub();
+        const strategies = spyAlign();
+        const fetch = git.fetchDefaultTip.bind(git);
+        let fetches = 0;
+        git.fetchDefaultTip = (async (...args: Parameters<typeof git.fetchDefaultTip>) => {
+          if (++fetches === 2) commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "advance before boundary stop");
+          return fetch(...args);
+        }) as typeof git.fetchDefaultTip;
+        const stop = () => {
+          if (kind === "deadline") throw new CheckpointSoftDeadlineError();
+          const error = new Error("fixture boundary cancelled");
+          error.name = "AbortError";
+          throw error;
+        };
+        const target = git.fetchWorkflowTargetTip.bind(git);
+        let targetReads = 0;
+        git.fetchWorkflowTargetTip = (async (...args: Parameters<typeof git.fetchWorkflowTargetTip>) => {
+          if (++targetReads === 2 && site === "target") stop();
+          return target(...args);
+        }) as typeof git.fetchWorkflowTargetTip;
+        const classify = git.branchWorkflowFiles.bind(git);
+        let classifierReads = 0;
+        git.branchWorkflowFiles = (async (...args: Parameters<typeof git.branchWorkflowFiles>) => {
+          if (++classifierReads === 2 && site === "classifier") stop();
+          return classify(...args);
+        }) as typeof git.branchWorkflowFiles;
+        let pushes = 0;
+        git.pushBranch = (async () => { pushes++; }) as typeof git.pushBranch;
+        const claim = githubClaim(1910 + siteIndex * 2 + errorIndex);
+        await githubRunner(github, committingExecutor({ "impl.ts": "boundary task\n" })).execute(claim);
+        assert.strictEqual(fetches, 2);
+        assert.strictEqual(targetReads, 2, "abort occurs after successful precheck at the fresh seam");
+        assert.strictEqual(classifierReads, site === "target" ? 1 : 2);
+        assert.deepStrictEqual(strategies, []);
+        assert.strictEqual(pushes, 0);
+        assert.strictEqual(calls.length, 0);
+      });
+    }
+  }
+
+  it("plain remote workflow rejection preserves work with a typed outcome", async () => {
+    seedWorkflowsOnOrigin();
+    const { github, calls } = fakeGitHub();
+    let pushes = 0;
+    git.pushBranch = (async () => {
+      pushes++;
+      throw new Error("refusing to update workflow without workflow scope");
+    }) as typeof git.pushBranch;
+    const claim = githubClaim(1874);
+    await githubRunner(github, committingExecutor({ "impl.ts": "remote rejection task\n" })).execute(claim);
+    const failed = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed");
+    assert.strictEqual(failed.length, 1);
+    assert.strictEqual(failed[0]?.body.fail_origin, "workflow_scope_missing");
+    assert.match(failed[0]?.body.preserved_patch ?? "", /remote rejection task/);
+    assert.strictEqual(pushes, 1);
+    assert.strictEqual(calls.length, 0);
+  });
+
+  it("a retry refreshes refs after the first push attempt changes the default", async (t) => {
+    seedWorkflowsOnOrigin();
+    const { github, calls } = fakeGitHub();
+    let pushes = 0;
+    let skipBackoff = false;
+    const realTimeout = globalThis.setTimeout;
+    t.mock.method(globalThis, "setTimeout", ((...args: Parameters<typeof setTimeout>) => {
+      if (skipBackoff && args[1] === 1_000) {
+        skipBackoff = false;
+        queueMicrotask(() => (args[0] as (...params: unknown[]) => void)(...args.slice(2)));
+        return { ref() { return this; }, unref() { return this; } } as ReturnType<typeof setTimeout>;
+      }
+      return realTimeout(...args);
+    }) as typeof setTimeout);
+    git.pushBranch = (async () => {
+      pushes++;
+      commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "default changes during first attempt");
+      skipBackoff = true;
+      throw new Error("connection reset");
+    }) as typeof git.pushBranch;
+    const claim = githubClaim(1875);
+    await githubRunner(github, committingExecutor({ "impl.ts": "retry task\n" })).execute(claim);
+    const failed = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed");
+    assert.strictEqual(failed.length, 1);
+    assert.strictEqual(failed[0]?.body.fail_origin, "workflow_scope_missing");
+    assert.match(failed[0]?.body.preserved_patch ?? "", /retry task/);
+    assert.strictEqual(pushes, 1, "the second attempt checks fresh refs before pushing");
+    assert.strictEqual(calls.length, 0);
+  });
+
+  for (const site of ["precheck", "align", "final"] as const) {
+    it(`boundary abort at ${site} prohibits publication`, async () => {
+      seedWorkflowsOnOrigin();
+      const { github, calls } = fakeGitHub();
+      const fetch = git.fetchDefaultTip.bind(git);
+      let fetches = 0;
+      let pushes = 0;
+      const failAt = site === "precheck" ? 1 : site === "align" ? 2 : 3;
+      git.fetchDefaultTip = (async (...args: Parameters<typeof git.fetchDefaultTip>) => {
+        if (++fetches === failAt) {
+          const error = new Error("fixture boundary cancelled");
+          error.name = "AbortError";
+          throw error;
+        }
+        return fetch(...args);
+      }) as typeof git.fetchDefaultTip;
+      git.pushBranch = (async () => { pushes++; }) as typeof git.pushBranch;
+      const claim = githubClaim(1880 + failAt);
+      await githubRunner(github, committingExecutor({ "impl.ts": "abort task\n" })).execute(claim);
+      assert.strictEqual(pushes, 0);
+      assert.strictEqual(calls.length, 0);
+    });
+  }
+
   for (const [iid, advanceAgain] of [[165, true], [166, false]] as const) {
-    it(`prior published align ${advanceAgain ? "behind D2 is not falsely workflow_scope_missing but may hit base-align conflict" : "at current D1 survives rework and opens a PR"}`, async () => {
+    it(`prior published align ${advanceAgain ? "behind D2 bypasses unsafe alignment" : "at current D1 survives rework and opens a PR"}`, async () => {
       publishPriorAlign(iid, advanceAgain);
       const { github, calls } = fakeGitHub();
       const strategies = spyAlign();
       const claim = githubClaim(iid);
       await githubRunner(github, committingExecutor({ "impl.ts": "export const result = 1;\n" })).execute(claim);
       const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
-      if (advanceAgain) {
-        // The conservative overlay guard still refuses the old align path. The
-        // fallback can conflict at D2, but the precheck must not misclassify it.
-        assert.deepStrictEqual(states.map((s) => s.status), ["running", "running", "failed"]);
-        assert.strictEqual(states.at(-1)?.fail_origin, "finalize_base_align_conflict");
-        assert.deepStrictEqual(strategies, ["merge", "rebase"]);
-        assert.strictEqual(calls.length, 0);
-      } else {
-        assert.deepStrictEqual(states.map((s) => s.status), ["running", "running", "completed"]);
-        assert.strictEqual(calls.length, 1);
-        assert.strictEqual(gitIn(fx.originPath, ["show", `agent/issue-${iid}:impl.ts`]), "export const result = 1;");
-        assert.strictEqual(gitIn(fx.originPath, ["show", `agent/issue-${iid}:.github/workflows/ci.yml`]), CI_V2.trim());
-        assert.deepStrictEqual(strategies, []);
-      }
+      assert.deepStrictEqual(states.map((s) => s.status), ["running", "running", "completed"]);
+      assert.strictEqual(calls.length, 1);
+      assert.strictEqual(gitIn(fx.originPath, ["show", `agent/issue-${iid}:impl.ts`]), "export const result = 1;");
+      assert.strictEqual(gitIn(fx.originPath, ["show", `agent/issue-${iid}:.github/workflows/ci.yml`]), CI_V2.trim());
+      assert.deepStrictEqual(strategies, []);
     });
   }
 
-  it("workflow resolution in a published merge fails typed and preserves the patch", async () => {
+  it("workflow resolution in a published merge is permitted for implementation-only rework", async () => {
     seedWorkflowsOnOrigin();
     const base = gitIn(fx.originPath, ["rev-parse", "main"]);
     gitIn(fx.originPath, ["checkout", "-b", "agent/issue-157"]);
@@ -211,13 +556,10 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
       return result;
     }) as typeof git.branchWorkflowFiles;
     await githubRunner(github, committingExecutor({ "impl.ts": "export const x = 1;\n" })).execute(claim);
-    assert.deepStrictEqual(checked, [[".github/workflows/ci.yml"]]);
-    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
-    assert.strictEqual(failed?.fail_origin, "workflow_scope_missing");
-    assert.match(failed?.preserved_patch ?? "", /\.github\/workflows\/ci\.yml/);
-    assert.match(failed?.preserved_patch ?? "", /branch\.txt/);
-    assert.match(failed?.preserved_patch ?? "", /impl\.ts/);
-    assert.strictEqual(calls.length, 0);
+    assert.ok(checked.length >= 2);
+    assert.ok(checked.every((paths) => paths?.length === 0));
+    assert.strictEqual(api.states.filter((s) => s.runId === claim.run_id).at(-1)?.body.status, "completed");
+    assert.strictEqual(calls.length, 1);
   });
 
   it("published clean merge followed by MR rework completes without a workflow-scope failure", async () => {
@@ -242,7 +584,7 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
       return result;
     }) as typeof git.branchWorkflowFiles;
     await githubRunner(github, committingExecutor({ "impl.ts": "export const reworked = true;\n" })).execute(claim);
-    assert.deepStrictEqual(checked, [[]]);
+    assert.deepStrictEqual(checked, [[], []]);
     const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
     assert.deepStrictEqual(states.map((s) => s.status), ["running", "running", "completed"]);
     assert.strictEqual(calls.length, 1);
@@ -403,7 +745,7 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
   });
 
   // (d) already aligned: the branch's workflow tree already matches the fresh default.
-  it("(d) already aligned → no align work, single push, two fetchDefaultTip calls", async () => {
+  it("(d) already aligned → no align work, single push, three fetchDefaultTip calls", async () => {
     seedWorkflowsOnOrigin();
     const { github, calls } = fakeGitHub();
     const strategies = spyAlign();
@@ -423,7 +765,7 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
     assert.deepStrictEqual(statuses, ["running", "running", "completed"]);
     assert.deepStrictEqual(strategies, [], "no align was performed");
-    assert.strictEqual(fetchSpy.count(), 2, "precheck and alignment each fetch the default tip");
+    assert.strictEqual(fetchSpy.count(), 3, "precheck, alignment and final push each fetch the default tip");
     assert.strictEqual(pushCalls, 1, "exactly one push");
     assert.strictEqual(calls.length, 1, "the PR was opened once");
     assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-53:impl.ts"]), "export const x = 1;");
@@ -444,10 +786,104 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     await githubRunner(github, committingExecutor({ "impl.ts": "export const x = 1;\n" })).execute(claim);
     assert.deepStrictEqual(api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status),
       ["running", "running", "completed"]);
-    assert.strictEqual(fetches, 2);
+    assert.strictEqual(fetches, 3);
     assert.deepStrictEqual(strategies, ["workflow-subtree"]);
     assert.strictEqual(calls.length, 1);
     assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-154:.github/workflows/ci.yml"]), CI_V2.trim());
+  });
+
+  it("an absent implementation-only branch with a null diff merges the fresh default after a permitted precheck", async () => {
+    seedWorkflowsOnOrigin();
+    const initialDefault = gitIn(fx.originPath, ["rev-parse", "main"]);
+    git.changedFiles = (async () => null) as typeof git.changedFiles;
+    const { github, calls } = fakeGitHub();
+    const strategies = spyAlign();
+    const alignedDefaults: string[] = [];
+    const align = git.alignBranchWithDefault.bind(git);
+    git.alignBranchWithDefault = (async (...args: Parameters<typeof git.alignBranchWithDefault>) => {
+      alignedDefaults.push(args[3]);
+      return align(...args);
+    }) as typeof git.alignBranchWithDefault;
+
+    const workflowSnapshots: { defaultTip: string; files: string[] | null }[] = [];
+    let initialWorkflowArgs: Parameters<typeof git.branchWorkflowFiles> | undefined;
+    const classify = git.branchWorkflowFiles.bind(git);
+    git.branchWorkflowFiles = (async (...args: Parameters<typeof git.branchWorkflowFiles>) => {
+      initialWorkflowArgs ??= args;
+      const files = await classify(...args);
+      workflowSnapshots.push({ defaultTip: args[1], files });
+      return files;
+    }) as typeof git.branchWorkflowFiles;
+    const targets: Awaited<ReturnType<typeof git.fetchWorkflowTargetTip>>[] = [];
+    const target = git.fetchWorkflowTargetTip.bind(git);
+    git.fetchWorkflowTargetTip = (async (...args: Parameters<typeof git.fetchWorkflowTargetTip>) => {
+      const result = await target(...args);
+      targets.push(result);
+      return result;
+    }) as typeof git.fetchWorkflowTargetTip;
+
+    const defaultTips: string[] = [];
+    let fetches = 0;
+    const fetch = git.fetchDefaultTip.bind(git);
+    git.fetchDefaultTip = (async (...args: Parameters<typeof git.fetchDefaultTip>) => {
+      fetches++;
+      if (fetches === 2) commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "advance after permitted precheck");
+      const sha = await fetch(...args);
+      defaultTips.push(sha);
+      if (fetches === 2) {
+        assert.ok(initialWorkflowArgs, "the real initial workflow comparison ran before main advanced");
+        const [barePath, , trackingRef, targetTip] = initialWorkflowArgs;
+        // Observe the same unaligned branch against the freshly fetched default.
+        // This probe delegates to the real classifier without changing the runner's decision.
+        await git.branchWorkflowFiles(barePath, sha, trackingRef, targetTip);
+      }
+      return sha;
+    }) as typeof git.fetchDefaultTip;
+
+    let pushCalls = 0;
+    const realPush = git.pushBranch.bind(git);
+    git.pushBranch = (async (...args: Parameters<typeof git.pushBranch>) => {
+      pushCalls++;
+      return realPush(...args);
+    }) as typeof git.pushBranch;
+    const pushArgs: string[][] = [];
+    const gitCommands = git as unknown as {
+      runGit: (cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string) => Promise<string>;
+    };
+    const runGit = gitCommands.runGit.bind(git);
+    gitCommands.runGit = async (...args: Parameters<typeof gitCommands.runGit>) => {
+      if (args[1][0] === "push") pushArgs.push([...args[1]]);
+      return runGit(...args);
+    };
+
+    const claim = githubClaim(1877);
+    await githubRunner(github, committingExecutor({ "impl.ts": "export const x = 1;\n" })).execute(claim);
+
+    const freshDefault = gitIn(fx.originPath, ["rev-parse", "main"]);
+    assert.notStrictEqual(freshDefault, initialDefault, "main really advanced between precheck and alignment");
+    assert.strictEqual(defaultTips[0], initialDefault);
+    assert.strictEqual(defaultTips[1], freshDefault);
+    assert.deepStrictEqual(targets[0], { kind: "absent" }, "the implementation branch was initially unpublished");
+    assert.deepStrictEqual(workflowSnapshots[0], { defaultTip: initialDefault, files: [] }, "the initial snapshot permitted publication");
+    assert.deepStrictEqual(workflowSnapshots[1], { defaultTip: freshDefault, files: [".github/workflows/ci.yml"] }, "the fresh snapshot requires alignment");
+    const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+    assert.deepStrictEqual(states.map((s) => s.status), ["running", "running", "completed"],
+      `the permitted precheck must allow later merge alignment, not workflow_scope_missing: ${JSON.stringify(states)}; strategies=${JSON.stringify(strategies)}`);
+    assert.deepStrictEqual(strategies, ["merge"], "a null diff uses the real merge fallback");
+    assert.deepStrictEqual(alignedDefaults, [freshDefault], "alignment uses the exact freshly fetched SHA");
+    assert.deepStrictEqual(defaultTips, [initialDefault, freshDefault, freshDefault]);
+    assert.strictEqual(pushCalls, 1, "exactly one real pushBranch call");
+    assert.strictEqual(pushArgs.length, 1, "exactly one real git push");
+    assert.ok(pushArgs[0]!.every((arg) => !arg.startsWith("--force") && arg !== "-f" && !arg.startsWith("+")),
+      "the observed push has no force flag or forced refspec");
+    const published = gitIn(fx.originPath, ["rev-parse", "agent/issue-1877"]);
+    assert.notStrictEqual(published, initialDefault, "the real push published a branch update");
+    assert.strictEqual(gitIn(fx.originPath, ["merge-base", "--is-ancestor", freshDefault, published]), "");
+    assert.strictEqual(gitIn(fx.originPath, ["show", `${published}:impl.ts`]), "export const x = 1;");
+    assert.strictEqual(gitIn(fx.originPath, ["show", `${published}:.github/workflows/ci.yml`]), CI_V2.trim());
+    assert.strictEqual(gitIn(fx.originPath, ["rev-parse", `${published}:.github/workflows`]),
+      gitIn(fx.originPath, ["rev-parse", `${freshDefault}:.github/workflows`]), "published workflows match fresh main");
+    assert.strictEqual(calls.length, 1, "the PR was opened once");
   });
 
   it("second default-tip fetch failure falls through to the normal push", async () => {
@@ -721,8 +1157,9 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     git.pushBranch = (async () => {
       pushed = true;
     }) as typeof git.pushBranch;
-    // A failed precheck and overlay diff must both fail open without clobbering work.
-    git.branchWorkflowFiles = (async () => null) as typeof git.branchWorkflowFiles;
+    // Unknown precheck eligibility stays open; known fresh eligibility reaches the real fallback.
+    let workflowReads = 0;
+    git.branchWorkflowFiles = (async () => ++workflowReads === 1 ? null : [".github/workflows/ci.yml"]) as typeof git.branchWorkflowFiles;
     git.changedFiles = (async () => null) as typeof git.changedFiles;
     // The branch edits the SAME workflow file main diverges, forcing the whole-tree conflict.
     const exec = committingExecutor(
@@ -750,8 +1187,9 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     seedWorkflowsOnOrigin({ [workflow]: "name: original\n" });
     const { github, calls } = fakeGitHub();
     const strategies = spyAlign();
-    // Let the run reach base-align while retaining the real changedFiles overlay check.
-    git.branchWorkflowFiles = (async () => null) as typeof git.branchWorkflowFiles;
+    // Unknown precheck, then known fresh eligibility; retain the real newline overlay guard.
+    let workflowReads = 0;
+    git.branchWorkflowFiles = (async () => ++workflowReads === 1 ? null : [workflow]) as typeof git.branchWorkflowFiles;
     const realChanged = git.changedFiles.bind(git);
     let sawNewline = false;
     git.changedFiles = (async (...args: Parameters<typeof git.changedFiles>) => {
@@ -932,9 +1370,9 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.strictEqual(calls.length, 0, "no PR opened");
   });
 
-  // The commit-based precheck does not use changedFiles. The zero-diff guard and the
+  // The tip-blob precheck also uses changedFiles to distinguish branch edits from staleness. The zero-diff guard and the
   // overlay's independent clobber guard each call it once.
-  it("(m) overlay checks the branch tree independently of the commit precheck", async () => {
+  it("(m) overlay checks the branch tree independently of tip-blob eligibility", async () => {
     seedWorkflowsOnOrigin();
     const { github, calls } = fakeGitHub();
     let changedCalls = 0;
@@ -961,8 +1399,8 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.strictEqual(calls.length, 1, "the overlaid branch was pushed and a PR opened");
     assert.strictEqual(
       changedCalls,
-      2,
-      "changedFiles: zero-diff guard plus independent overlay clobber guard",
+      4,
+      "changedFiles: zero-diff guard, workflow precheck, fresh alignment eligibility and independent overlay clobber guard",
     );
   });
 
@@ -976,7 +1414,9 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
       changedCalls++;
       return null;
     }) as typeof git.changedFiles;
-    git.branchWorkflowFiles = (async () => null) as typeof git.branchWorkflowFiles;
+    // Precheck null does not latch; fresh nonempty eligibility plus null diff must use fallback.
+    let workflowReads = 0;
+    git.branchWorkflowFiles = (async () => ++workflowReads === 1 ? null : [".github/workflows/ci.yml"]) as typeof git.branchWorkflowFiles;
     git.pushBranch = (async () => {}) as typeof git.pushBranch;
     // The branch edits the SAME workflow file main diverges → the fallback merge/rebase
     // conflicts (as in (i)), proving the run reached the fallback after the recompute.
@@ -993,8 +1433,8 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.deepStrictEqual(strategies, ["merge", "rebase"], "the run reached the fallback merge→rebase");
     assert.strictEqual(
       changedCalls,
-      2,
-      "zero-diff guard plus overlay clobber guard",
+      3,
+      "zero-diff guard, fresh alignment eligibility and independent overlay guard; null precheck skips its diff",
     );
   });
 });

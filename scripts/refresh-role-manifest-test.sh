@@ -11,6 +11,19 @@ fail=0
 tmp_root="$(mktemp -d)"
 trap 'rm -rf "$tmp_root"' EXIT
 
+# A unified-only `diff` first on PATH, like BusyBox on Alpine workers: a call without
+# -u/-U fails, so a normal-format dependency in the script reddens this test on a
+# GNU-diff host (CI) too, not only where BusyBox happens to be first.
+real_diff="$(command -v diff)"
+mkdir "$tmp_root/bin"
+cat > "$tmp_root/bin/diff" <<SH
+#!/usr/bin/env bash
+for a in "\$@"; do case "\$a" in -u|-U*|--unified*) exec "$real_diff" "\$@" ;; esac; done
+echo "diff: unified output only (BusyBox stand-in)" >&2; exit 2
+SH
+chmod +x "$tmp_root/bin/diff"
+export PATH="$tmp_root/bin:$PATH"
+
 ok() { pass=$((pass + 1)); echo "ok   $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL $1${2:+: $2}"; }
 
@@ -161,6 +174,17 @@ printf 'coder         1 -> 2     tail 5B    LEGACY    body -1/+1 vs library\n' >
 printf 'body line\n## For this repository\nnew generic line\n## For this repo\ntail\n' > "$stub/new/coder.md"
 if run_case old; then
   if grep -q 'generic after heading' "$ghout"; then ok "$case_name"; else bad "$case_name" "$(cat "$ghout")"; fi
+fi
+
+# 7d. a dropped body line that itself starts with '--' is still listed (the unified-diff
+# extraction skips only the ---/+++ header, so BusyBox and GNU diff report it alike).
+case_name="dropped line starting with -- is listed"; new_case dashline
+printf -- 'body line\n-- dashed old line\n## For this repo\ntail\n' > "$repo/.claude/agents/coder.md"
+(cd "$repo" && git add -A && git -c user.email=t@t -c user.name=t commit -qm dl)
+printf 'coder         1 -> 2     tail 5B    LEGACY    body -1/+0 vs library\n' > "$stub/check.txt"; echo 1 > "$stub/check.rc"
+printf 'body line\n## For this repo\ntail\n' > "$stub/new/coder.md"
+if run_case old; then
+  if grep -qF '< -- dashed old line' "$ghout"; then ok "$case_name"; else bad "$case_name" "$(cat "$ghout")"; fi
 fi
 
 # 8. allowlisted tester model is silent; another MODIFIED is reported.

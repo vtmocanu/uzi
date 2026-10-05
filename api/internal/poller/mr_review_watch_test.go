@@ -1,7 +1,12 @@
 package poller
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -41,7 +46,7 @@ type mrwStore struct {
 
 	upserts   []store.UpsertMRReworkLedgerParams
 	haltSets  []store.SetMRReworkHaltNotifiedParams
-	evicts    []store.DeleteMRReworkLedgerNotInParams
+	evicts    []uuid.UUID
 	upsertErr error
 	haltErr   error
 
@@ -105,8 +110,8 @@ func (s *mrwStore) SetMRReworkHaltNotified(_ context.Context, arg store.SetMRRew
 	return nil
 }
 
-func (s *mrwStore) DeleteMRReworkLedgerNotIn(_ context.Context, arg store.DeleteMRReworkLedgerNotInParams) (int64, error) {
-	s.evicts = append(s.evicts, arg)
+func (s *mrwStore) DeleteMRReworkLedgerNotIn(_ context.Context, repoID uuid.UUID) (int64, error) {
+	s.evicts = append(s.evicts, repoID)
 	return 0, nil
 }
 
@@ -562,6 +567,62 @@ func TestMRReworkBranchInUseSwallows(t *testing.T) {
 	}
 }
 
+// This test stays serial because it captures the process-wide slog default.
+func TestMRReworkNoCredentialForHarnessSkipsWithoutErrorDetail(t *testing.T) {
+	const detail = "arbitrary fixture resolver detail"
+	ledger := store.MrReworkLedger{
+		RepoID: mrwRepoID, Ref: mrwRef, AttemptCount: 1, HighWater: 100,
+	}
+	st := &mrwStore{
+		candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
+		ledgers:    map[string]store.MrReworkLedger{mrwRef: ledger},
+	}
+	runs := &mrwRuns{err: fmt.Errorf("%s: %w", detail, workersvc.ErrNoCredentialForHarness)}
+	notifier := &mrwNotifier{}
+	f := landedForge(mrwComment(140, landed(), mrwHeadSHA))
+
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+
+	if len(runs.calls) != 1 {
+		t.Fatalf("expected one create attempt, got %+v", runs.calls)
+	}
+	call := runs.calls[0]
+	if call.userID != mrwUserID || call.repoID != mrwRepoID || call.sourceRunID != mrwSourceRunID ||
+		call.ref != mrwRef || call.mrIID != mrwMrIID {
+		t.Fatalf("create attempt targeted wrong source: %+v", call)
+	}
+	if !reflect.DeepEqual(st.ledgers, map[string]store.MrReworkLedger{mrwRef: ledger}) ||
+		len(st.upserts) != 0 || len(st.haltSets) != 0 {
+		t.Fatalf("credential refusal changed ledger: ledgers=%+v upserts=%+v halts=%+v", st.ledgers, st.upserts, st.haltSets)
+	}
+	if len(notifier.calls) != 0 || len(f.notes) != 0 {
+		t.Fatalf("credential refusal must not notify/comment: notifications=%+v notes=%+v", notifier.calls, f.notes)
+	}
+	var record map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &record); err != nil {
+		t.Fatalf("expected one JSON skip log: %v; logs=%q", err, logs.String())
+	}
+	want := map[string]any{
+		"level":      "WARN",
+		"msg":        "poller: mr-rework skipped: source-run harness has no usable credential",
+		"repo":       mrwRepoRow().PathWithNamespace,
+		"ref":        mrwRef,
+		"source_run": mrwSourceRunID.String(),
+	}
+	delete(record, "time")
+	if !reflect.DeepEqual(record, want) {
+		t.Fatalf("skip log = %+v, want static fields %+v", record, want)
+	}
+	if strings.Contains(logs.String(), detail) || strings.Contains(logs.String(), runs.err.Error()) {
+		t.Fatalf("skip log contains resolver error detail: %q", logs.String())
+	}
+}
+
 func TestMRReworkActiveExistsSwallows(t *testing.T) {
 	// A concurrent rework on this MR → ErrActiveMRReworkExists, swallowed like ErrBranchInUse.
 	st := &mrwStore{candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")}}
@@ -601,11 +662,9 @@ func TestMRReworkAdminGateErrorFailsClosed(t *testing.T) {
 	}
 }
 
-func TestMRReworkStopEvictsStaleLedger(t *testing.T) {
-	// Stop-on-merge / stop-on-close cleanup: when a watched MR leaves the opened-only
-	// candidate set (merged/closed via PRD #24's SyncMRStates, which ran FIRST this
-	// tick), it produces no candidate, so the reconcile eviction clears its ledger row
-	// with an empty keep-set — and nothing is acted on (no double-fire).
+func TestMRReworkEmptyCandidatesReconcilesRepo(t *testing.T) {
+	// Wiring only: even an empty candidate list reconciles the correct repo.
+	// Real structural eviction and eligibility retention are covered by live-DB tests.
 	st := &mrwStore{
 		candidates: nil, // the merged/closed MR is excluded by the candidate query
 		ledgers:    map[string]store.MrReworkLedger{mrwRef: {Ref: mrwRef, AttemptCount: 3, HighWater: 200}},
@@ -618,8 +677,8 @@ func TestMRReworkStopEvictsStaleLedger(t *testing.T) {
 	if len(runs.calls) != 0 {
 		t.Fatalf("a merged/closed MR must not be acted on, got %d runs", len(runs.calls))
 	}
-	if len(st.evicts) != 1 || len(st.evicts[0].KeepRefs) != 0 {
-		t.Fatalf("expected one eviction with an empty keep-set, got %+v", st.evicts)
+	if len(st.evicts) != 1 || st.evicts[0] != mrwRepoID {
+		t.Fatalf("expected one reconciliation for the repo, got %+v", st.evicts)
 	}
 }
 

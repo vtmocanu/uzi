@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -6,7 +6,6 @@ import type { ExecutorResult, RunContext } from "../src/executor.js";
 import type { ExecutorFactory } from "../src/runner.js";
 import { DiskParkSignal } from "../src/cache-cap.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
-import { CodexCredentialDeferredError } from "../src/codex/codex-executor.js";
 import type { QuiesceRunOutcome, QuiesceRunRequest } from "../src/run-quiescence.js";
 import type { StateRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
@@ -18,7 +17,8 @@ import { api, client, fakeGitlab, git, gitlabClaim, homeDir, installHarness, run
 // runner-uid process never clears by waiting, so the claim was held forever and a test driving it
 // never ended (CI ran for hours). Now RECOVERY_CAPTURE_BLOCKED_ATTEMPTS (5) consecutive blocked
 // proofs fail the run with fail_origin worker_residue_blocked, naming the pid and comm, with the
-// clone and session kept.
+// clone and session kept. Credential deferrals (vault_locked and refresh_unknown) are the scoped
+// exception: blocked proofs retain custody and retry with capped waits, without park authority.
 //
 // Safety valve: on UNFIXED code the loop would never end, so the quiescer flips the run's ownership
 // to `paused` after SAFETY_VALVE capture proofs, which ends the unfixed loop non-parked; the test
@@ -83,6 +83,30 @@ function spyCustody(runner: object): string[] {
     };
   }
   return calls;
+}
+
+/** Observe requested waits while executing the real abortable wait implementation. */
+function spyRequestedWaits(runner: object): number[] {
+  const waits: number[] = [];
+  const r = runner as { waitRecoveryRetry: (flight: unknown, cancelStopsWait: boolean, ms: number) => Promise<void> };
+  const original = r.waitRecoveryRetry.bind(runner);
+  r.waitRecoveryRetry = async (flight, cancelStopsWait, ms) => {
+    waits.push(ms);
+    await original(flight, cancelStopsWait, ms);
+  };
+  return waits;
+}
+
+/** Observe public publication seams without changing their behavior. */
+function assertNoPublication(t: TestContext): () => void {
+  const publish = t.mock.method(client, "publishCheckpoint");
+  const push = t.mock.method(git, "pushBranch");
+  return () => {
+    assert.equal(publish.mock.callCount(), 0, "no checkpoint publication while proof is blocked");
+    assert.equal(push.mock.callCount(), 0, "no branch push while proof is blocked");
+    assert.equal(api.completionPermitRequests.length, 0, "no completion permit request");
+    assert.equal(api.completionHoldRequests.length, 0, "no completion hold request");
+  };
 }
 
 const CASES: Array<{ name: string; iid: number; signal: () => Error; features?: string[] }> = [
@@ -241,68 +265,132 @@ describe("issue #1783 M3: a recovery capture whose proof keeps blocking is bound
     assert.notEqual(failed[0]!.fail_origin, "worker_residue_blocked");
   });
 
-  it("vault_locked park: fails worker_residue_blocked after the cap, custody kept (no credentialed reap or settle), clone and session kept", TIMEOUT, async () => {
-    client.protocolFeatures = ["recovery_cause_vault_locked"];
-    const { gitlab, calls: mrCalls } = fakeGitlab();
-    const claim = gitlabClaim(1783_06, { claim_generation: 3 });
-    const q = blockedQuiescer(claim.run_id);
-    const seen = { clone: "", home: "" };
-    const runner = runnerWith(factory(() => new CodexCredentialDeferredError(), seen), gitlab, undefined, nullLogger(), {
-      checkpointIntervalMs: 0,
-      recoveryRetryMs: 1,
-      quiesceRun: q.quiesceRun,
+  for (const deferral of ["vault_locked", "refresh_unknown"] as const) {
+    it(`${deferral}: blocked proofs past the old cap retain custody until a valid proof parks`, TIMEOUT, async (t) => {
+      const noPublication = assertNoPublication(t);
+      client.protocolFeatures = ["recovery_cause_vault_locked"];
+      const { gitlab, calls: mrCalls } = fakeGitlab();
+      const claim = gitlabClaim(deferral === "vault_locked" ? 1783_06 : 1783_07, { claim_generation: 3 });
+      const q = blockedQuiescer(claim.run_id);
+      const seen = { clone: "", home: "" };
+      let custodyCalls: string[] = [];
+      let proofs = 0;
+      const quiesceRun = async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
+        if (req.site === "recovery_capture") proofs++;
+        if (proofs <= CAP + 2) {
+          noPublication();
+          assert.ok(!statesOf(claim.run_id).some((s) => ["failed", "completed", "recovery_wait"].includes(s.status)));
+          assert.equal(mrCalls.length, 0);
+          assert.deepEqual(custodyCalls, [], "custody held while proof is blocked");
+          assert.ok(fs.existsSync(path.join(seen.clone, "ONLY_COPY.txt")), "source held while blocked");
+          assert.ok(fs.existsSync(path.join(seen.home, "session")), "session held while blocked");
+          return q.quiesceRun(req);
+        }
+        return {
+          process: { state: "quiescent", processes: [], killed: [], detail: "" },
+          docker: { state: "not_wired", removed: [], detail: "" },
+        };
+      };
+      const error = new Error("credential deferred");
+      error.name = "CodexBoundaryError";
+      Object.assign(error, { deferral });
+      const runner = runnerWith(factory(() => error, seen), gitlab, undefined, nullLogger(), {
+        checkpointIntervalMs: 0, recoveryRetryMs: 1, quiesceRun,
+      });
+      custodyCalls = spyCustody(runner);
+      const waits = spyRequestedWaits(runner);
+      await runner.execute(claim);
+      assert.deepEqual(waits, [1, 2, 4, 8, 16, 16, 16], "actual requested waits cap at 16x");
+      assert.equal(q.captureProofs(), CAP + 2);
+      const states = statesOf(claim.run_id);
+      assert.ok(!states.some((s) => s.status === "failed" || s.status === "completed"));
+      const parks = states.filter((s) => s.status === "recovery_wait");
+      assert.equal(parks.length, 1);
+      assert.equal(parks[0]!.recovery_cause, deferral === "vault_locked" ? "vault_locked" : undefined);
+      assert.deepEqual(custodyCalls, [], "no credentialed custody sink");
+      assert.equal(mrCalls.length, 0);
+      const feed = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
+      const notice = "Recovery checkpoint could not be verified. Keeping the local work and session and retrying before pausing.";
+      assert.equal(feed.filter((t) => t === notice).length, 1, "blocked wait is visible and deduplicated");
+      if (deferral === "refresh_unknown") assert.ok(feed.every((t) => !/vault/i.test(t)));
     });
-    const custodyCalls = spyCustody(runner);
-    await runner.execute(claim);
+  }
+  for (const deferral of ["vault_locked", "refresh_unknown"] as const) {
+    for (const exit of ["cancel", "shutdown", "released", "superseded"] as const) {
+      it(`${deferral}: ${exit} after seven blocked proofs wins without recovery/completion authority`, TIMEOUT, async (t) => {
+        const noPublication = assertNoPublication(t);
+        const { gitlab, calls: mrCalls } = fakeGitlab();
+        const claim = gitlabClaim(1783_100 + (deferral === "vault_locked" ? 0 : 10) + ["cancel", "shutdown", "released", "superseded"].indexOf(exit), { claim_generation: 3 });
+        const q = blockedQuiescer(claim.run_id);
+        const seen = { clone: "", home: "" };
+        let ctxRef: RunContext | undefined;
+        const error = Object.assign(new Error("credential deferred"), { name: "CodexBoundaryError", deferral });
+        const inner = factory(() => error, seen);
+        const withContext: ExecutorFactory = (runId, ...rest) => {
+          const made = inner(runId, ...rest);
+          const run = made.executor.run.bind(made.executor);
+          made.executor.run = async (ctx) => { ctxRef = ctx; return run(ctx); };
+          return made;
+        };
+        let custodyCalls: string[] = [];
+        const runner = runnerWith(withContext, gitlab, undefined, nullLogger(), {
+          checkpointIntervalMs: 0, recoveryRetryMs: 1,
+          quiesceRun: async (req) => {
+            if (req.site === "recovery_capture") {
+              noPublication();
+              assert.ok(!statesOf(claim.run_id).some((s) => ["failed", "completed", "recovery_wait"].includes(s.status)));
+              assert.deepEqual(custodyCalls, []);
+              assert.equal(mrCalls.length, 0);
+              assert.ok(fs.existsSync(path.join(seen.clone, "ONLY_COPY.txt")));
+              assert.ok(fs.existsSync(path.join(seen.home, "session")));
+            }
+            return q.quiesceRun(req);
+          },
+        });
+        custodyCalls = spyCustody(runner);
+        const r = runner as unknown as { waitRecoveryRetry: (flight: unknown, cancelStopsWait: boolean, ms: number) => Promise<void> };
+        const wait = r.waitRecoveryRetry.bind(runner);
+        const waits: number[] = [];
+        r.waitRecoveryRetry = async (flight, cancelStopsWait, ms) => {
+          waits.push(ms);
+          if (waits.length !== 7) return wait(flight, cancelStopsWait, ms);
+          assert.equal(q.captureProofs(), 7, "seven blocked proofs before exit steering");
+          if (exit === "released") api.setOwnershipNotOwned(claim.run_id);
+          if (exit === "superseded") api.setOwnershipStatus(claim.run_id, "running", 4);
+          if (exit === "cancel" || exit === "shutdown") {
+            // Begin a real long wait before aborting it: completion must not await its deadline.
+            const pending = wait(flight, cancelStopsWait, 60_000);
+            if (exit === "shutdown") runner.shutdown();
+            else {
+              api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+              const until = Date.now() + 10_000;
+              while (!ctxRef?.signal?.aborted && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 5));
+              assert.ok(ctxRef?.signal?.aborted, "sticky owner cancellation reached the active wait");
+            }
+            await pending;
+          } else await wait(flight, cancelStopsWait, ms);
+        };
+        await runner.execute(claim);
+        assert.deepEqual(waits, [1, 2, 4, 8, 16, 16, 16]);
+        assert.equal(q.captureProofs(), exit === "cancel" ? 8 : 7, "cancellation makes one final capture attempt; other exits stop after seven");
+        noPublication();
+        const states = statesOf(claim.run_id);
+        assert.ok(!states.some((s) => s.status === "completed" || s.status === "recovery_wait" || s.fail_origin === "worker_residue_blocked"));
+        const failed = states.filter((s) => s.status === "failed");
+        assert.equal(failed.length, exit === "cancel" ? 1 : 0);
+        if (exit === "cancel") assert.equal(failed[0]!.failure_reason, "run cancelled");
+        assert.deepEqual(custodyCalls, []);
+        assert.equal(mrCalls.length, 0);
+        if (exit !== "superseded") {
+          assert.ok(fs.existsSync(path.join(seen.clone, "ONLY_COPY.txt")), "unverified source retained");
+          assert.ok(fs.existsSync(path.join(seen.home, "session")), "unverified session retained");
+        } else assert.ok(fs.existsSync(path.join(seen.clone, "ONLY_COPY.txt")), "stale claim has no authority; blocked terminal-retire proof still retains the source");
+        if (deferral === "refresh_unknown") {
+          assert.ok(api.messages(claim.run_id).every((m) => !/vault/i.test(String(m.payload.text))));
+          assert.ok(states.every((s) => s.recovery_cause === undefined));
+        }
+      });
+    }
+  }
 
-    assert.ok(q.captureProofs() < SAFETY_VALVE, `the safety valve fired (${q.captureProofs()} proofs)`);
-    assert.equal(q.captureProofs(), CAP, "exactly the cap of blocked capture proofs ran");
-    const states = statesOf(claim.run_id);
-    const failed = states.filter((s) => s.status === "failed");
-    assert.equal(failed.length, 1, `one failure report: ${states.map((s) => s.status).join(",")}`);
-    assert.equal(failed[0]!.fail_origin, "worker_residue_blocked");
-    assert.ok(String(failed[0]!.failure_reason).includes(`pid ${PID} "${COMM}"`), String(failed[0]!.failure_reason));
-    assert.ok(!states.some((s) => s.status === "recovery_wait"), "never parked over an uncaptured clone");
-    assert.deepEqual(custodyCalls, [], "custody kept: no credentialed pre-report reap and no custody settle");
-    assert.equal(mrCalls.length, 0);
-    assert.ok(fs.existsSync(path.join(seen.clone, ".git")), "the clone is kept");
-    assert.ok(fs.existsSync(path.join(seen.clone, "ONLY_COPY.txt")), "the uncommitted work is kept");
-    assert.ok(fs.existsSync(path.join(seen.home, "session")), "the session is kept");
-  });
-
-  it("vault_locked park: the bound's report keeps custody even when a terminal outcome already resolved", TIMEOUT, async () => {
-    // On the ordinary path a RunResidueBlockedError already skips reportGenericFailure's reap and
-    // settle, so `keepCustody` matters only where the outcome was already journaled or resolved
-    // (the permanent-failure hook's write-ahead `failed`): that arm runs a credentialed
-    // reap-then-settle unless custody is kept. Seam: mark the flight's terminal as resolved as the
-    // bound calls reportGenericFailure, and require that no custody call follows.
-    client.protocolFeatures = ["recovery_cause_vault_locked"];
-    const { gitlab } = fakeGitlab();
-    const claim = gitlabClaim(1783_07, { claim_generation: 3 });
-    const q = blockedQuiescer(claim.run_id);
-    const seen = { clone: "", home: "" };
-    const runner = runnerWith(factory(() => new CodexCredentialDeferredError(), seen), gitlab, undefined, nullLogger(), {
-      checkpointIntervalMs: 0,
-      recoveryRetryMs: 1,
-      quiesceRun: q.quiesceRun,
-    });
-    const r = runner as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
-    const report = r.reportGenericFailure!.bind(runner);
-    let bounded = 0;
-    r.reportGenericFailure = async (...args: unknown[]) => {
-      if (args[2] instanceof Error && args[2].name === "RunResidueBlockedError") {
-        bounded += 1;
-        (args[1] as { terminalResolved?: boolean }).terminalResolved = true;
-      }
-      return report(...args);
-    };
-    const custodyCalls = spyCustody(runner);
-    await runner.execute(claim);
-
-    assert.equal(q.captureProofs(), CAP, "exactly the cap of blocked capture proofs ran");
-    assert.equal(bounded, 1, "the bound reported the residue-blocked failure once");
-    assert.deepEqual(custodyCalls, [], "custody kept: no credentialed reap or settle after the resolved terminal");
-    assert.ok(fs.existsSync(path.join(seen.clone, "ONLY_COPY.txt")), "the uncommitted work is kept");
-    assert.ok(fs.existsSync(path.join(seen.home, "session")), "the session is kept");
-  });
 });

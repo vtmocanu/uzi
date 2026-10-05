@@ -1,6 +1,6 @@
 # PRD #98: Judge menu — a dedicated cross-run recommendation workbench
 
-**GitLab Issue**: [#98](https://github.com/vtmocanu/uzi/-/issues/98)
+**GitLab Issue**: [#98](https://github.com/vtmocanu/uzi/issues/98)
 **Status (2026-07-25)**: **MR OPEN — [!111](https://github.com/vtmocanu/uzi/-/merge_requests/111)**, `feature/prd-98-t3` → `main` at `407d6b72`, 75 commits, 48 files, +12,096/−679. All six wave-2 branches and `origin/main` merged in; opened 0 behind.
 **CI: pipeline [20031](https://github.com/vtmocanu/uzi/-/pipelines/20031) SUCCESS, all 15 jobs** — including `test:api-store-it`, the live-Postgres job that actually executes the admin CLI-token endpoint's no-credential-leak test. *(A claim that CI could not run it was recorded here and refuted by a fact-check on 2026-07-25; the true narrowing is only that the job sits outside `.gate_needs`/`.publish_needs`.)*
 **e2e at the merged tip: 197 PASS / 1 FAIL.** **Both judge phases GREEN** — `B6'` (the close→Done edge driven by the POLLER, the chain nothing in this repo had ever executed) and `B4'` (row cap, truncation remedy executed, fixtures removed by cascade). **The single failure is in PRD #104's phase, not this PRD's**: *"claim for 'unbound' returned HTTP 204, not 200 — the queue was idle, the run existed but was not claimable by this worker."*
@@ -1424,7 +1424,7 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       the only reason it is
       visible at all.
 
-- [x] **MOVED OUT OF THIS PRD — now [issue #135](https://github.com/vtmocanu/uzi/-/issues/135) (2026-07-25).**
+- [x] **MOVED OUT OF THIS PRD — now [issue #135](https://github.com/vtmocanu/uzi/issues/135) (2026-07-25).**
       The mechanism is built and the first 12 files are covered; what remains is an open-ended
       hygiene programme, one file at a time, and **a PRD that cannot close until it finishes is a
       PRD that never closes.** #135 carries the full procedure, the remaining-file list, the three

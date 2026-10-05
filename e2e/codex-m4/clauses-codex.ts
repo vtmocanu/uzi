@@ -11,6 +11,7 @@
 //      maintainer discharges every O clause with a record in the gitignored candidate manifest.
 
 import type { ClauseRow } from "./clause.js";
+import { EXCEPTIONS_TITLE } from "./native-exceptions.js";
 import { CODEX_STARTUP_SMOKE_TITLE } from "./titles.js";
 import {
   CODEX_P_NATIVE_ABSENT_TITLE,
@@ -41,6 +42,17 @@ import {
 } from "./titles-c4.js";
 
 export const CODEX_CLAUSES: ClauseRow[] = [
+  {
+    id: "codex-p-native-async-utc-exceptions",
+    adapter: "codex",
+    layer: "P",
+    family: "Native execution bypass",
+    seam: "harness-p: production launcher/config/auth/transport/broker; pinned async handler and clock",
+    positiveControl: "lock-bound receipt/member verification + codex --version; live provider traffic and later real code-mode uzi_bash callback",
+    negativeOracle: "no currentTime/read to uzi, no filesystem effect, only the control worker command; advice zero callbacks; no answer supplied",
+    intendedOutcome: "async accepted JSON text and delivery/questions; exact successful UTC formats; root start/resume, worker-created child and advice start on all three supported metadata models",
+    tests: [EXCEPTIONS_TITLE],
+  },
   {
     // C1 REAL, EXECUTED P row — the startup/allowed-callback smoke (startup-smoke.test.ts).
     id: "codex-p-startup-allowed-callback",
@@ -163,16 +175,16 @@ export const CODEX_CLAUSES: ClauseRow[] = [
       + "effect through the REAL broker on the real protocol",
     negativeOracle:
       "BOTH halves are checked (PRD 'Native execution bypass'): (schema) the real app-server "
-      + "advertises NO native tool identity to the model on any observed provider request — the "
-      + "native-disabled template forwards no `tools` array, so an empty native-tool advertisement "
-      + "is the absence PASS; (dispatch) forced native shell/exec_command/unified_exec/write_stdin/"
+      + "does not advertise the representative effectful native deny identities; #1566 separately "
+      + "inspects namespace and nested inventories and characterizes native async/UTC exceptions; "
+      + "(dispatch) forced native shell/exec_command/unified_exec/write_stdin/"
       + "local_shell function-calls and a native freeform apply_patch custom-tool-call produce NO "
       + "worker callback, NO command spawn, NO fileop and NO marker file (absolute marker paths "
       + "asserted absent after the turn)",
     intendedOutcome:
       "no alternate native execution authority or retained writable terminal exists on the "
-      + "production path: the model is never offered a native schema AND no native dispatch is "
-      + "executable; only the dynamic worker exec runs",
+      + "production path for the representative effectful deny probes; the authority-free code host "
+      + "and #1566 async-question/read-only UTC exceptions remain reachable",
     tests: [CODEX_P_NATIVE_ABSENT_TITLE],
   },
   {
@@ -365,7 +377,7 @@ export const CODEX_CLAUSES: ClauseRow[] = [
       "the fixed config template pins project_doc_max_bytes=0 + trust_level untrusted and every native "
       + "feature off EXCEPT the run-lane code_mode_host — the authority-free callback-routing host, off "
       + "on the default/advice lane and enabled (codeModeHost:true → code_mode_host=true) on the run lane "
-      + "with every OTHER native feature and trust still off; it rejects any unknown (smuggled repo/hook) "
+      + "with other configurable effectful features and trust off; #1566 async/UTC remain reachable. It rejects any unknown (smuggled repo/hook) "
       + "key, and references no AGENTS.md/.codex; thread/start (start) AND thread/resume (resume) "
       + "RE-assert the untrusted config and turn/start reasserts environments:[]; no repo trust surface "
       + "rides any construction request",

@@ -2,6 +2,7 @@ package pushbroker
 
 import (
 	"context"
+	"net/http"
 
 	"github.com/go-git/go-git/v5/plumbing"
 )
@@ -12,6 +13,12 @@ import (
 // CreateRefWithPack is CreateRef with the pack under the test's control, so a test
 // can prove the empty pack is what makes a real receive-pack accept the create.
 var CreateRefWithPack = createRefWithPack
+
+// BrokerHTTPClient exposes the actual broker client for serial TLS/pool fixtures.
+var BrokerHTTPClient *http.Client = brokerHTTPClient
+
+// TransportFor exposes manual session selection for HTTP wiring tests.
+var TransportFor = transportFor
 
 // EmptyPack is the zero-object pack CreateRef sends.
 var EmptyPack = emptyPack

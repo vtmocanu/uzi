@@ -1,6 +1,6 @@
 # PRD #95: Run activity pane v2 — crew roster, collapse-by-default logs, opt-in follow, and steer-queue delivery
 
-**GitLab Issue**: [#95](https://github.com/vtmocanu/uzi/-/issues/95)
+**GitLab Issue**: [#95](https://github.com/vtmocanu/uzi/issues/95)
 **Status**: Complete (2026-07-20; merged via MR [!82](https://github.com/vtmocanu/uzi/-/merge_requests/82))
 **Priority**: Medium
 **Mockup**: [`prds/mockups/95-activity-pane-v2-mock.html`](../mockups/95-activity-pane-v2-mock.html) (live/interactive: crew strip + collapse-by-default accordion + opt-in Follow toggle + steer queue with Queued→Delivered)

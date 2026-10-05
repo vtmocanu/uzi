@@ -15,6 +15,23 @@ interface ScopeCap {
 }
 
 /**
+ * Decide from this boundary's ACK only. Local declarations and earlier ACKs are
+ * deliberately excluded: the completion attempt must reach the server first.
+ */
+export function scopeCapAtBoundary(args: {
+  served: { scopeCeiling?: number; completedCount?: number } | undefined | void;
+  frozen: readonly { id: string }[] | undefined | null;
+}): ScopeCap | undefined {
+  const { served, frozen } = args;
+  if (!served || typeof served.scopeCeiling !== "number" ||
+      typeof served.completedCount !== "number" || !frozen?.length) return undefined;
+  if (served.completedCount >= served.scopeCeiling && served.completedCount < frozen.length) {
+    return { completedCount: served.completedCount, total: frozen.length, ceiling: served.scopeCeiling };
+  }
+  return undefined;
+}
+
+/**
  * Returns the cap to latch at a done exit, or undefined when the run is not scope-capped.
  * Capped iff a numeric ceiling was served, the frozen list is known and non-empty, and the
  * completed count (the larger of the server's count and the frozen ids in the union of the

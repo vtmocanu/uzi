@@ -895,7 +895,7 @@ export interface Executor {
   readonly resumesAtGate?: boolean;
   /**
    * Issue #1766: settle the executor's live execution registry for a CREDENTIAL-FREE capture
-   * after a vault-locked credential deferral: refuse new launches, reap every root and drain
+   * after a vault-locked or unknown-refresh credential deferral: refuse new launches, reap every root and drain
    * launches and callbacks under one deadline, without reconciling a credential or minting a
    * permit. `observed_empty` means nothing of the run can still write to the clone. Optional:
    * only a Codex-selected executor supplies it (the runner fails closed when a `safety`-bearing

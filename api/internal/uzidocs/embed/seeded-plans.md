@@ -55,21 +55,24 @@ HEAD)` in your own clone.
 ## 3. Pick the roster (optional)
 
 By default a seeded run uses the same roster any other run would: the
-repo's own agents if the clone ships a [`.claude/agents/`
-directory](./repo-agents.md), otherwise your own [agent
-templates](./agent-templates.md). Pass `--agent-source own|repo` to pick
-explicitly, and `--exclude-agents a,b` to drop specific ones from that
-source.
+repo's own agents if the worker detects a roster in `.claude/agents/` or
+`.codex/agents/`, otherwise your own [agent templates](./agent-templates.md).
+Detection reads one folder, never merges rosters, and prefers the run harness's
+native folder. A present preferred folder is final even if empty or invalid;
+see [Repo agents](./repo-agents.md#which-folder-is-read). Pass
+`--agent-source own|repo` to pick explicitly, and `--exclude-agents a,b` to drop
+specific ones from that source.
 
 Unlike the plan-approval gate, none of this is checked against the clone's
 actual roster at create time — the clone doesn't exist yet, so there's
-nothing to check against. Confirm the roster from the filesystem before
-naming it (`ls .claude/agents/` in your own clone for `--agent-source
-repo`), not from memory: `--agent-source repo` against a clone that turns
-out to have no `.claude/agents/` **falls back to your own agent templates**
-and records the fallback in the run feed, rather than running with zero
-subagents. An `--exclude-agents` name that doesn't match anything in the
-chosen source is still silently a no-op rather than an error.
+nothing to check against. Inspect the applicable folder's files in your own
+clone (`.claude/agents/*.md` or `.codex/agents/*.toml`) before naming agents for
+`--agent-source repo`. Mere directory existence does not establish a valid
+roster: `--agent-source repo` against a clone with no detected roster
+**falls back to your own agent templates** and records the fallback in the
+run feed, rather than running with zero subagents. An `--exclude-agents` name
+that doesn't match anything in the chosen source is still silently a no-op
+rather than an error.
 
 ## 4. Create the run
 

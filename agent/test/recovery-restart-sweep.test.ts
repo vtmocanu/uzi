@@ -217,6 +217,7 @@ describe("RecoveryCoordinator.resumePending — pinned records after restart (is
     assert.equal(client.uploadCalls.length, 1);
     assert.ok(client.uploadCalls[0]!.bytes > 0);
     assert.equal((await only(restarted, "r1")).state, "uploaded");
+    assert.equal((await only(restarted, "r1")).recoveryPinBareDir, BARE_DIR);
   });
 
   it("holds a finalization-pinned head already on the default branch: no bundle, no reserve", async () => {

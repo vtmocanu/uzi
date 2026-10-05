@@ -1,4 +1,5 @@
 import { after, describe, it } from "node:test";
+import { createServer } from "node:http";
 import { AsyncResource } from "node:async_hooks";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
@@ -35,7 +36,7 @@ import { SupervisedChildExitTimeoutError } from "../src/codex/launcher.js";
 import { resolveBoundaryExecutable } from "../src/git.js";
 import { GitLabClient } from "../src/forge.js";
 import type { SummaryRunner } from "../src/summary-runner.js";
-import { RequestError } from "../src/client.js";
+import { WorkerClient, CodexRequestFailure, RequestError } from "../src/client.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 import { FakeRecoveryClient, FakeRecoveryGit, makeRecoveryCoordinator } from "./codex-reap-fixture.js";
 import {
@@ -239,6 +240,7 @@ const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 function codexRig(
   opts: {
     authMode?: "subscription" | "api_key";
+    credentialClient?: Pick<WorkerClient, "releaseCodex" | "refreshCodex">;
     blockReconcile?: boolean;
     /** Forwarded to createCodexExecutionSafety (issue #1513): event-gates a boundary deadline. */
     armDeadline?: ArmBoundaryDeadline;
@@ -249,6 +251,7 @@ function codexRig(
     /** Issue #1766: while this answers true, refreshCodex/releaseCodex throw the api's real typed
      *  409 `vault_locked` RequestError (a locked owner vault after authorization). */
     vaultLocked?: () => boolean;
+    refreshUnknown?: boolean;
     /** Issue #1784: while this answers true, refreshCodex/releaseCodex throw the api's 409 "codex
      *  credential is not available" (the server refuses a reconcile for a `paused` run). */
     refuseReconcile?: () => boolean;
@@ -275,6 +278,7 @@ function codexRig(
       _req: { capability: string; operation_id: string; observed_generation: number },
     ) => {
       refreshCalls += 1;
+      if (opts.refreshUnknown) throw new CodexRequestFailure("transport");
       if (opts.refuseReconcile?.()) throw notAvailableError("refresh");
       if (opts.vaultLocked?.()) throw vaultLockedError("refresh");
       if (opts.blockReconcile) throw new Error("refresh contended");
@@ -286,7 +290,7 @@ function codexRig(
   const processArgv: (readonly string[])[] = [];
   const reconcile: ReconcileBeforeBoundary = buildRunLaneReconcile(
     "run-codex-sink",
-    fakeClient as never,
+    opts.credentialClient ?? fakeClient as never,
     binding,
     (t) => registeredTokens.push(t),
   );
@@ -1500,8 +1504,8 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
     assert.equal(rig.refreshCalls() + rig.releaseCalls(), 0, "no credential call from the park");
   });
 
-  it("(d) a stale_claim ack on the confirming running report stops silently: no park, no failure", async () => {
-    const { gitlab } = fakeGitlab();
+  it("(d) a stale_claim ack stops silently and retains the clone when independent retirement proof blocks", async () => {
+    const { gitlab, calls: mrCalls } = fakeGitlab();
     client.protocolFeatures = [VAULT_FEATURE];
     const rig = codexRig({ vaultLocked: () => true });
     let deferred = false;
@@ -1515,10 +1519,21 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
       runStatus: "running",
       disposition: "stale_claim",
     });
-    await runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 }).execute(claim);
+    const runner = runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), {
+      recoveryRetryMs: 5,
+      quiesceRun: async () => ({
+        process: { state: "unverified", processes: [], killed: [], detail: "independent retirement proof blocked" },
+        docker: { state: "not_wired", removed: [], detail: "" },
+      }),
+    });
+    const custody = spyCustodySettle(runner);
+    await runner.execute(claim);
     assert.equal(parkReports(claim.run_id).length, 0, "a superseded claim is never parked");
-    assert.ok(!statuses(claim.run_id).includes("failed"), "no failure report");
-    assert.equal(fs.existsSync(worktreeDirFor(1770)), false, "normal teardown (the new claim owns the run)");
+    assert.ok(!statuses(claim.run_id).some((status) => status === "failed" || status === "completed"), "no terminal report");
+    assert.equal(api.completionPermitRequests.length, 0, "no completion authority");
+    assert.equal(mrCalls.length, 0, "no MR");
+    assert.equal(custody(), 0, "custody held");
+    assert.equal(fs.readFileSync(path.join(worktreeDirFor(1770), "STALE.txt"), "utf8"), "work\n", "blocked independent retirement proof retains the source");
   });
 
   it("(d) an ownership probe showing ANOTHER generation stops silently: no park, no failure", async () => {
@@ -2511,9 +2526,9 @@ describe("RunRunner #1766 — the park loop's exits after running is confirmed",
       recoveryRetryMs: 5,
       recovery: coord,
     });
-    const r = runner as unknown as { confirmRunningForVaultPark: (f: { terminalResolved?: boolean }, ...rest: unknown[]) => Promise<unknown> };
-    const confirm = r.confirmRunningForVaultPark.bind(runner);
-    r.confirmRunningForVaultPark = async (flight, ...rest) => {
+    const r = runner as unknown as { confirmRunningForCredentialPark: (f: { terminalResolved?: boolean }, ...rest: unknown[]) => Promise<unknown> };
+    const confirm = r.confirmRunningForCredentialPark.bind(runner);
+    r.confirmRunningForCredentialPark = async (flight, ...rest) => {
       flight.terminalResolved = true;
       return confirm(flight, ...rest);
     };
@@ -3452,5 +3467,206 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
       "a premature source-close hint is not misreported as a generic publish failure");
     assert.ok(statuses(claim.run_id).includes("completed"));
     assert.ok(!statuses(claim.run_id).includes("failed"));
+  });
+});
+
+
+// M2 acceptance through HTTP -> WorkerClient -> buildRunLaneReconcile -> safety -> runner.
+// Each server handles at most two credential requests; the first destroys the reply after
+// recording the request, the second returns a fixed API classification. No provider exchange.
+describe("RunRunner M2 — lost refresh replies reconcile before credential recovery", () => {
+  for (const sink of ["finalize", "checkpoint"] as const) {
+    for (const reply of ["vault_locked", "unavailable", "contended", "legacy_typed_first"] as const) {
+      it(`${sink}: ${reply} HTTP reconciliation parks with exact cause and no further credential authority`, async () => {
+        const requests: Array<Record<string, unknown>> = [];
+        const server = createServer(async (req, res) => {
+          let body = "";
+          for await (const chunk of req) body += String(chunk);
+          requests.push(JSON.parse(body));
+          assert.match(req.url ?? "", /\/codex\/refresh$/);
+          if (requests.length === 1 && reply !== "legacy_typed_first") {
+            req.socket.destroy();
+            return;
+          }
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(reply === "vault_locked" || reply === "legacy_typed_first"
+            ? { reason: "vault_locked", error: "fixture raw diagnostic must stay private" }
+            : { error: reply === "contended" ? "codex refresh is contended; retry" : "codex credential is not available" }));
+        });
+        await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+        const address = server.address();
+        assert.ok(address && typeof address !== "string");
+        const credentialClient = new WorkerClient(`http://127.0.0.1:${address.port}`, "fixture-join", "test", nullLogger());
+        const pubs = spyPublishLands();
+        try {
+          client.protocolFeatures = [VAULT_FEATURE];
+          const { gitlab, calls: mrCalls } = fakeGitlab();
+          const rig = codexRig({ credentialClient });
+          const { logger, lines } = recordingLogger();
+          const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+            commitInTree(ctx.worktreePath, "COMMITTED.txt", "committed, not yet fetched back\n");
+            fs.writeFileSync(path.join(ctx.worktreePath, "DIRTY.txt"), "uncommitted edit\n");
+            if (sink === "checkpoint") await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+            return { branch: ctx.branch };
+          }, rig.settle);
+          const iid = 177000 + ["finalize", "checkpoint"].indexOf(sink) * 10 + ["vault_locked", "unavailable", "contended", "legacy_typed_first"].indexOf(reply);
+          const claim = gitlabClaim(iid, { claim_generation: 3 });
+          const runner = runnerWith(() => ({ executor: exec }), gitlab, undefined, logger, { recoveryRetryMs: 1 });
+          const custody = spyCustodySettle(runner);
+          await runner.execute(claim);
+          assert.equal(requests.length, reply === "legacy_typed_first" ? 1 : 2, "only the bounded reconciliation credential requests");
+          if (requests.length === 2) assert.deepEqual(requests[1], requests[0], "same operation id, capability and observed generation after a lost reply");
+          const parks = parkReports(claim.run_id);
+          assert.equal(parks.length, 1);
+          assert.equal(parks[0]!.recovery_cause, reply === "vault_locked" || reply === "legacy_typed_first" ? "vault_locked" : undefined);
+          assertCaptured(iid);
+          assert.deepEqual(rig.boundaries, [sink], "no new boundary after reconciliation deferred");
+          assert.equal(rig.processSpawns(), 0, "no permit-held process action");
+          assert.equal(api.completionPermitRequests.length, 0, "no completion authority requested");
+          assert.equal(mrCalls.length, 0);
+          assert.equal(custody(), 0);
+          assert.ok(!statuses(claim.run_id).some((status) => status === "failed" || status === "completed"));
+          const visible = JSON.stringify({ lines, states: api.states, feed: api.messages(claim.run_id) });
+          assert.ok(!visible.includes("fixture raw diagnostic"));
+          assert.ok(!visible.includes(String(requests[0]!.operation_id)), "operation metadata stays private");
+          if (reply === "unavailable" || reply === "contended") assert.ok(feedTexts(claim.run_id).every((text) => !/vault/i.test(text)));
+        } finally {
+          pubs();
+          await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+        }
+      });
+    }
+  }
+});
+
+
+describe("RunRunner M2 — unknown refresh sink retries and local recovery", () => {
+  it("refresh_unknown: fetch-back and park report failures visibly retry with source/session/custody retained", async () => {
+    client.protocolFeatures = [VAULT_FEATURE];
+    const { gitlab, calls: mrCalls } = fakeGitlab();
+    const rig = codexRig({ refreshUnknown: true });
+    const w = workThenDefer(rig);
+    const claim = gitlabClaim(177020, { claim_generation: 3 });
+    let captureFailures = 0;
+    let reportAttempts = 0;
+    const { logger, lines } = recordingLogger();
+    const { coord } = enabledRecovery();
+    const runner = runnerWith(() => ({ executor: w.exec }), gitlab, undefined, logger, { recovery: coord, recoveryRetryMs: 1 });
+    const custody = spyCustodySettle(runner);
+    const retained = () => {
+      assert.equal(fs.readFileSync(path.join(worktreeDirFor(177020), "DIRTY.txt"), "utf8"), "uncommitted edit\n");
+      assert.equal(sessionKept(lines), false, "the active session has not been torn down");
+      assert.equal(custody(), 0);
+      assert.equal(mrCalls.length, 0);
+      assert.equal(api.completionPermitRequests.length, 0);
+      assert.ok(!statuses(claim.run_id).includes("completed"));
+    };
+    const fetch = git.fetchAgentBranch.bind(git);
+    git.fetchAgentBranch = async (...args) => {
+      if (w.deferred() && captureFailures++ === 0) {
+        retained();
+        throw new Error("injected capture failure");
+      }
+      return fetch(...args);
+    };
+    const report = client.reportState.bind(client);
+    client.reportState = async (runId, body, signal) => {
+      if (body.status === "recovery_wait") {
+        retained();
+        if (++reportAttempts === 1) throw new Error("injected park report failure");
+      }
+      return report(runId, body, signal);
+    };
+    const restore = spyPublishLands();
+    try {
+      await runner.execute(claim);
+      assert.equal(reportAttempts, 2);
+      assert.equal(parkReports(claim.run_id).length, 1);
+      assert.equal(parkReports(claim.run_id)[0]!.recovery_cause, undefined);
+      assertCaptured(177020);
+      const feed = feedTexts(claim.run_id);
+      assert.equal(feed.filter((text) => text === VAULT_UNVERIFIED).length, 1);
+      assert.equal(feed.filter((text) => text === "Could not record the recovery pause yet; keeping the local work and session and retrying.").length, 1);
+      assert.ok(feed.every((text) => !/vault/i.test(text)));
+      assert.equal(rig.refreshCalls(), 2, "bounded initial reconciliation only, no reexchange while retrying sinks");
+      assert.equal(rig.releaseCalls(), 0);
+      assert.equal(custody(), 0);
+      assert.deepEqual(rig.boundaries, ["finalize"]);
+    } finally { restore(); }
+  });
+
+  it("refresh_unknown: publication failure parks verified local-only work; same-worker resume retries publication and completes", async () => {
+    client.protocolFeatures = [VAULT_FEATURE];
+    const { gitlab, calls: mrCalls } = fakeGitlab();
+    const rig = codexRig({ refreshUnknown: true });
+    const w = workThenDefer(rig);
+    const claim = gitlabClaim(177021, { claim_generation: 3 });
+    let pubs = 0;
+    const publish = client.publishCheckpoint.bind(client);
+    client.publishCheckpoint = async (_runId, _tip, pack) => {
+      pubs++;
+      await drain(pack);
+      throw new Error("injected checkpoint publication outage");
+    };
+    const runner = runnerWith(() => ({ executor: w.exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 });
+    const custody = spyCustodySettle(runner);
+    await runner.execute(claim);
+    assert.equal(pubs, 1);
+    assertCaptured(177021);
+    assert.equal(parkReports(claim.run_id).length, 1, "publication remains best effort after verified fetch-back");
+    assert.equal(parkReports(claim.run_id)[0]!.recovery_cause, undefined);
+    assert.ok(feedTexts(claim.run_id).includes("Paused for credential recovery. The recovery checkpoint is saved only on this worker; this run can resume at its next retry."));
+    assert.ok(!feedTexts(claim.run_id).some((text) => text.includes("checkpoint is published")));
+    assert.equal(mrCalls.length, 0);
+    assert.equal(custody(), 0);
+    assert.equal(api.completionPermitRequests.length, 0);
+    assert.equal(rig.refreshCalls(), 2);
+    client.publishCheckpoint = publish;
+    const publication = countPublishes(() => true);
+    try {
+      const ready = codexRig();
+      let checkpointRetried = false;
+      const exec = new FakeCodexExecutor(ready.safety, async (ctx) => {
+        assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "DIRTY.txt"), "utf8"), "uncommitted edit\n", "local-only recovery source restored");
+        await ctx.checkpoint!({ reap: true });
+        // The overlay-less Codex checkpoint defers its scan outside the permit.
+        await ctx.checkpoint!({ reap: false });
+        checkpointRetried = true;
+        return { branch: ctx.branch };
+      }, ready.settle);
+      await runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute({ ...claim, claim_generation: 4 });
+      assert.ok(checkpointRetried, `resume retries checkpoint publication through a ready boundary: ${JSON.stringify(api.states)}`);
+      assert.equal(publication.count(), 1, "the direct resume retries checkpoint publication exactly once");
+      assert.equal(parkReports(claim.run_id).length, 1, "no predecessor recapture flight");
+      assert.deepEqual(ready.boundaries, ["checkpoint", "finalize"], "publication and MR cross ready boundaries");
+      assert.ok(ready.refreshCalls() >= 1, "the resumed finalize reconciled ready");
+      assert.equal(mrCalls.length, 1, "the resumed claim created the MR");
+      assert.ok(statuses(claim.run_id).includes("completed"));
+      assert.ok(!statuses(claim.run_id).includes("failed"));
+    } finally { publication.restore(); }
+  });
+});
+
+describe("M2 existing completion hold deferral control", () => {
+  it("unknown refresh during a verified hold capture stays nonterminal", async () => {
+    api.setCompletionHoldResponse("paused");
+    const { gitlab, calls } = fakeGitlab();
+    const rig = codexRig({ refreshUnknown: true });
+    let entered = false;
+    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "HOLD.txt", "committed work before an existing completion hold\n");
+      fs.writeFileSync(path.join(ctx.worktreePath, "DIRTY.txt"), "dirty work\n");
+      entered = await ctx.enterCompletionHold!("existing pending owner decision");
+      return entered ? { branch: ctx.branch, completionHeld: { reason: "existing pending owner decision" } } : { branch: ctx.branch };
+    }, rig.settle);
+    const claim = gitlabClaim(177090, { claim_generation: 3 });
+    await runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute(claim);
+    assert.ok(!statuses(claim.run_id).includes("failed"), "an unknown refresh must not fail this hold");
+    assert.equal(rig.refreshCalls(), 2, "verified local-only hold ends the flight without more credential requests");
+    assert.equal(entered, true, "existing completion hold is preserved after verified local capture");
+    assert.equal(api.completionHoldRequests.length, 1);
+    assert.ok(trackingTip(177090), "verified tracking snapshot survives the local-only hold");
+    assert.equal(calls.length, 0);
+    assert.equal(api.completionPermitRequests.length, 0);
   });
 });

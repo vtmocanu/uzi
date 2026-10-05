@@ -1,6 +1,6 @@
 # PRD #111: Auto-select the Anthropic token per run by rate-limit headroom, and record which token each run used
 
-**GitLab Issue**: [#111](https://github.com/vtmocanu/uzi/-/issues/111)
+**GitLab Issue**: [#111](https://github.com/vtmocanu/uzi/issues/111)
 **Status**: **DONE — merged 2026-07-27 (MR !139); the one deferred success criterion (dev-cluster
 k8s validation) was VALIDATED 2026-08-22 and issue #168 closed** (created 2026-07-22; implemented
 2026-07-27 on `feature/prd-111-auto-select-token`). That criterion (the dev-cluster hosted-worker
@@ -9,12 +9,12 @@ real dev-02 usage rather than a one-off spend. A read-only DB check confirmed al
 227/229 `auto` runs claimed on `kind=hosted` workers, 31 concurrent auto-run pairs landed on
 different tokens (in-flight bias), headroom 15–100% recorded against a live poller gauge (no
 seeding), and the `pool_stale` (7×) and `best_of_pool` (15×) fallbacks fired for real. Evidence in
-the [#168 close comment](https://github.com/vtmocanu/uzi/issues/168#issuecomment-5381295684); see
+the [#168 close comment](https://github.com/vtmocanu/uzi/issues/168#issuecomment-5440531113); see
 "Status at PR time" at the foot of this file for why the compose e2e did not substitute for it.
 Other follow-ups from this PRD: **#169** (user-authored names in admin terminals), **#170**
 (`check-styles`), **#171** (the live-DB harness's Postgres wait).
 **Priority**: Medium
-**Related**: [#104](https://github.com/vtmocanu/uzi/-/issues/104) (named tokens — this builds directly on its per-token rate-limit gauge and its single credential-resolution seam), [#53](https://github.com/vtmocanu/uzi/-/issues/53) (rate limits — the gauge this PRD reads to choose), [#40](https://github.com/vtmocanu/uzi/-/issues/40) (token usage reporting — the per-run token record this PRD adds is the attribution join #40 could not make)
+**Related**: [#104](https://github.com/vtmocanu/uzi/issues/104) (named tokens — this builds directly on its per-token rate-limit gauge and its single credential-resolution seam), [#53](https://github.com/vtmocanu/uzi/issues/53) (rate limits — the gauge this PRD reads to choose), [#40](https://github.com/vtmocanu/uzi/issues/40) (token usage reporting — the per-run token record this PRD adds is the attribution join #40 could not make)
 
 Seven milestones. M1 (record token per run) and M2 (opt-in pool) are
 file-disjoint and land in parallel; M3 (worker `auto` mode) needs M2; M4 (the

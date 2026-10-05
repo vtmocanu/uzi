@@ -52,6 +52,7 @@ export const STRICT_P_SUITE: readonly string[] = [
   "startup-smoke.test.ts",
   "policy-real.test.ts",
   "native-bypass.test.ts",
+  "native-exceptions.test.ts",
 ];
 
 /** Where the disposable codex volume is provisioned and, read-only, mounted for EXECUTE. It
@@ -110,6 +111,7 @@ function baseArgs(arch: Arch, user: string): string[] {
  */
 export function buildMacosLinuxRunPlan(opts: MacosLinuxRunOptions): MacosLinuxRunPlan {
   const user = opts.user ?? DEFAULT_USER;
+  const [scratchUid, scratchGid] = user.split(":");
   // The per-invocation evidence file on the HOST. Its directory is bind-mounted as the container
   // .evidence dir; its basename is what the container writes under that mount, so the container's
   // append lands on the exact host file the native leg + run-completeness use. Defaults to the
@@ -149,6 +151,8 @@ export function buildMacosLinuxRunPlan(opts: MacosLinuxRunOptions): MacosLinuxRu
     ...baseArgs(opts.arch, user),
     // External network disabled during tests (D7 point 3).
     "--network=none",
+    // Disposable, unprivileged scratch for #1566 observations and runner trees.
+    "--tmpfs", `/work/.uzi/scratch:uid=${scratchUid},gid=${scratchGid},mode=0700`,
     // Point the P suite's recordEvidence at the mounted host evidence file (this invocation's
     // unique basename under the .evidence mount) so the container's codex/P evidence lands on the
     // HOST in the exact per-invocation file the native U run wrote (run-completeness merges them).
@@ -168,7 +172,7 @@ export function buildMacosLinuxRunPlan(opts: MacosLinuxRunOptions): MacosLinuxRu
     "-v", `${opts.codexVolume}:${CODEX_PREFIX_MOUNT}:ro`,
     "-w", "/work/agent",
     MACOS_LINUX_RUNNER_REF,
-    // The strict, serial, bounded P subset of test:codex-m4: all three P files, writing evidence
+    // The strict, serial, bounded P subset of test:codex-m4, writing evidence
     // to the host via the read-write .evidence mount above.
     "node", "--import", "tsx", "--test", "--test-concurrency=1", "--test-timeout=120000",
     ...STRICT_P_SUITE.map((f) => `../e2e/codex-m4/${f}`),

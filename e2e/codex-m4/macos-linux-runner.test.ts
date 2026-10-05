@@ -128,14 +128,22 @@ describe("buildMacosLinuxRunPlan argv invariants", () => {
     assert.ok(!plan.execute.some((a) => a.includes(":/home/")), "execute mounts no HOME");
   });
 
-  it("execute runs the complete strict P suite (all three P files)", () => {
-    for (const f of ["startup-smoke.test.ts", "policy-real.test.ts", "native-bypass.test.ts"]) {
+  it("execute includes the native-exception characterization in the strict P suite", () => {
+    assert.ok(plan.execute.includes("/work/.uzi/scratch:uid=1000,gid=1000,mode=0700"));
+    for (const f of ["startup-smoke.test.ts", "policy-real.test.ts", "native-bypass.test.ts", "native-exceptions.test.ts"]) {
       assert.ok(
         plan.execute.includes(`../e2e/codex-m4/${f}`),
         `execute runs ${f}`,
       );
     }
   });
+  it("scratch ownership follows the configured execution uid and gid", () => {
+    const custom = buildMacosLinuxRunPlan({ ...OPTS, user: "2000:3000" });
+    assert.ok(custom.execute.includes("2000:3000"));
+    assert.ok(custom.execute.includes("/work/.uzi/scratch:uid=2000,gid=3000,mode=0700"));
+    assert.ok(!custom.execute.includes("/work/.uzi/scratch:uid=1000,gid=1000,mode=0700"));
+  });
+
   it("execute writes codex/P evidence to the host (env + read-write .evidence mount)", () => {
     assert.ok(
       plan.execute.includes("CODEX_M4_EVIDENCE=/work/e2e/codex-m4/.evidence/current.jsonl"),

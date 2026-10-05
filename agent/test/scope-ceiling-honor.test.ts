@@ -190,6 +190,87 @@ afterEach(() => {
 });
 
 describe("PRD #634 M6 — worker scope-ceiling honor gate", () => {
+  for (const scenario of [
+    { name: "zero", ack: { scopeCeiling: 0, completedCount: 0 }, capped: 0 },
+    { name: "overshoot", ack: { scopeCeiling: 2, completedCount: 3 }, capped: 3 },
+    { name: "full total", ack: { scopeCeiling: 2, completedCount: 6 } },
+    { name: "above total", ack: { scopeCeiling: 2, completedCount: 7 } },
+    { name: "missing count", ack: { scopeCeiling: 0 } },
+    { name: "below ceiling", ack: { scopeCeiling: 3, completedCount: 2 } },
+    { name: "absent ceiling", ack: { completedCount: 3 } },
+    { name: "missing ACK", ack: undefined },
+    { name: "nonissue", ack: { scopeCeiling: 0, completedCount: 0 }, kind: "prompt" as const },
+    { name: "no frozen list", ack: { scopeCeiling: 0, completedCount: 0 }, frozen: [] },
+    { name: "absent frozen list", ack: { scopeCeiling: 0, completedCount: 0 }, noFrozen: true },
+  ]) {
+    it(`fresh boundary: ${scenario.name}`, async () => {
+      const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+      const probe = makeCtx({
+        planApproved: true, approvedPlan: "# Approved", sessionId: "sess-1",
+        frozenMilestones: scenario.noFrozen ? undefined : scenario.frozen ?? SIX_MILESTONES,
+        kind: scenario.kind ?? "issue", completionInterlock: true,
+        recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 1 }),
+        reportIteration: async () => scenario.ack,
+      });
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.deepEqual(result.scopeCapped, scenario.capped === undefined ? undefined : {
+        completedCount: scenario.capped, total: 6,
+      });
+      assert.equal(turns.length, scenario.capped === undefined ? 1 : 0);
+      assert.equal(probe.emits.filter((m) => m.kind === "steer_ack").length, scenario.capped === undefined ? 0 : 1);
+    });
+  }
+
+  for (const mode of ["cap", "uncapped", "raised", "raised threshold", "missing ACK", "missing count", "budget lift", "cancel", "ACK cancel"] as const) {
+    it(`interlocked done at maxIterations=1: ${mode}`, async () => {
+      const { queryFn, turns } = fakeTurns([
+        [signalDoneDeclaring(["m2"]), resultSuccess()],
+        [signalDoneDeclaring(["m3", "m4", "m5", "m6"]), resultSuccess()],
+      ]);
+      const order: string[] = [];
+      const union = new Set(["m1"]);
+      let ackCancelled = false;
+      const holds: string[] = [];
+      let attempts = 0;
+      const probe = makeCtx({
+        planApproved: true, approvedPlan: "# Approved", sessionId: "sess-1",
+        frozenMilestones: SIX_MILESTONES, kind: "issue", completionInterlock: true,
+        config: { max_iterations: mode === "raised threshold" ? 2 : 1 },
+        cancelRequested: () => ackCancelled || (mode === "cancel" && attempts === 1),
+        checkpoint: async () => { order.push("checkpoint"); },
+        recordCompletionAttempt: async ({ declared }) => {
+          order.push("attempt");
+          for (const id of declared) union.add(id);
+          attempts++;
+          return { unmet: SIX_MILESTONES.filter((m) => !union.has(m.id)).map((m) => m.id), attemptCount: attempts };
+        },
+        reportIteration: async (n) => {
+          order.push(`ack-${n}`);
+          if (n > 1 && mode === "ACK cancel") ackCancelled = true;
+          if (n > 1 && mode === "missing ACK") return undefined;
+          return { scopeCeiling: mode === "uncapped" || mode === "budget lift" ? undefined : (mode === "raised" || mode === "raised threshold") && n > 1 ? 3 : 2,
+            completedCount: n > 1 && mode === "missing count" ? undefined : union.size, completedIds: [...union],
+            ...(mode === "cap" && n > 1 ? { budgetExhausted: true, pauseRequested: true } : {}),
+            ...(mode === "budget lift" && n > 1 ? { maxIterations: 2 } : {}) };
+        },
+        enterCompletionHold: async (reason) => { holds.push(reason); return true; },
+        parkForPause: async () => { assert.fail("cap must precede pause"); },
+      });
+      const running = new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      if (mode === "cancel" || mode === "ACK cancel") {
+        await assert.rejects(running, /cancelled/);
+        assert.deepEqual(order, mode === "cancel" ? ["ack-1", "checkpoint", "attempt"] : ["ack-1", "checkpoint", "attempt", "ack-2"]);
+      } else {
+        const result = await running;
+        assert.deepEqual(order.slice(0, 4), ["ack-1", "checkpoint", "attempt", "ack-2"]);
+        assert.deepEqual(result.scopeCapped, mode === "cap" ? { completedCount: 2, total: 6 } : undefined);
+        assert.equal(holds.length, ["uncapped", "raised", "missing ACK", "missing count"].includes(mode) ? 1 : 0);
+        if (holds.length) assert.match(holds[0]!, /iteration budget/);
+      }
+      assert.equal(turns.length, mode === "budget lift" || mode === "raised threshold" ? 2 : 1);
+    });
+  }
+
   // Test 1 (finding-2's fragile case). The gate MUST finalize at the ceiling even when the
   // lead never cooperatively checkpointed on the honoring turn — that is the whole point of
   // placing it at the loop top rather than in the checkpoint tool. The turns never call the

@@ -509,24 +509,30 @@ func (q *Queries) CreateManualMRReworkRunAndAdvance(ctx context.Context, arg Cre
 }
 
 const deleteMRReworkLedgerNotIn = `-- name: DeleteMRReworkLedgerNotIn :execrows
-DELETE FROM mr_rework_ledger
-WHERE repo_id = $1::uuid AND ref <> ALL($2::text[])
+DELETE FROM mr_rework_ledger AS ledger
+WHERE ledger.repo_id = $1::uuid
+  AND NOT EXISTS (
+      SELECT 1
+      FROM runs r
+      JOIN repos rp ON rp.id = r.repo_id
+      WHERE r.repo_id = ledger.repo_id
+        AND r.branch = ledger.ref
+        AND r.kind IN ('issue', 'prompt', 'self_improve')
+        AND r.status = 'completed'
+        AND r.branch IS NOT NULL AND r.branch <> ''
+        AND r.branch <> rp.default_branch
+        AND r.mr_iid IS NOT NULL
+        AND r.mr_state = 'opened'
+  )
 `
 
-type DeleteMRReworkLedgerNotInParams struct {
-	RepoID   uuid.UUID `json:"repo_id"`
-	KeepRefs []string  `json:"keep_refs"`
-}
-
-// Reconcile eviction: drop ledger rows for refs no longer in the opened-MR candidate
-// set (a merged/closed MR, or a run branch that aged out), mirroring
-// DeleteCIAutofixAttemptsNotIn with the same keep-set semantics. This is ALSO the
-// stop-on-merge / stop-on-close cleanup: an mr_state that leaves 'opened' drops the
-// ref from the candidate set, so its ledger row evicts here and a reused agent branch
-// (agent/issue-N, uzi/prompt-…, uzi/self-improve/…) never inherits a stale count. An
-// empty keep-set clears the repo's ledger.
-func (q *Queries) DeleteMRReworkLedgerNotIn(ctx context.Context, arg DeleteMRReworkLedgerNotInParams) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteMRReworkLedgerNotIn, arg.RepoID, arg.KeepRefs)
+// Reconcile structural lifetime, independently of temporary detection eligibility.
+// Retain the ledger while ANY qualifying completed source run in the same repo/ref
+// has an opened MR, even if a newer source is terminal. Token removal, opt-out and
+// pipeline state must not reset the consumed high-water, attempt budget or halt latch.
+// Evict only when no such source remains (closed/merged or missing source).
+func (q *Queries) DeleteMRReworkLedgerNotIn(ctx context.Context, repoID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteMRReworkLedgerNotIn, repoID)
 	if err != nil {
 		return 0, err
 	}
@@ -566,7 +572,7 @@ const listMRReworkCandidates = `-- name: ListMRReworkCandidates :many
 
 WITH per_branch AS (
     SELECT DISTINCT ON (r.branch)
-           r.branch, r.mr_iid, r.user_id, r.id AS source_run_id, r.mr_rework_enabled
+           r.branch, r.mr_iid, r.user_id, r.id AS source_run_id, r.mr_rework_enabled, r.harness
     FROM runs r
     WHERE r.repo_id = $1::uuid
       AND r.kind IN ('issue', 'prompt', 'self_improve')
@@ -593,9 +599,13 @@ LEFT JOIN pipeline_statuses ps
     ON ps.repo_id = $1::uuid AND ps.ref = per_branch.branch
 WHERE per_branch.branch <> rp.default_branch
   AND COALESCE(per_branch.mr_rework_enabled, u.mr_rework_enabled) IS NOT FALSE
-  AND EXISTS (
-      SELECT 1 FROM user_secrets s
-      WHERE s.user_id = per_branch.user_id AND s.kind = 'anthropic_token'
+  AND (
+      per_branch.harness = 'codex'
+      OR EXISTS (
+          SELECT 1 FROM user_secrets s
+          WHERE s.user_id = per_branch.user_id AND s.kind = 'anthropic_token'
+            AND s.disabled_at IS NULL
+      )
   )
 `
 
@@ -638,12 +648,14 @@ type ListMRReworkCandidatesRow struct {
 //     default (users.mr_rework_enabled, nullable, default-ON per 00165): a non-NULL run
 //     column wins, and a NULL run column falls through to the owner default. Either
 //     layer explicitly false excludes the branch; NULL/absent at both = ON. The run
-//     column read is the newest issue run's per the DISTINCT ON below. The owner must
-//     ALSO have an Anthropic token on file. The token gate mirrors ListCIAutofixCandidateRefs: an mr_rework
-//     run executes on the OWNER's Anthropic token, so a token-less owner would only
-//     spawn a doomed run that burns the per-MR cap and posts a halt comment. It is an
-//     EXISTS over user_secrets (kind='anthropic_token'), not a users column. The admin
-//     global kill-switch is read separately by the detector (settings.MrReworkEnabled).
+//     column read is the newest source run's per the DISTINCT ON below. A rework
+//     inherits that source run's harness (PRD #1429 D4): Claude sources require an
+//     enabled owner Anthropic token (disabled_at IS NULL, matching the manual door).
+//     Codex sources are admitted without an Anthropic token; createRunResolved
+//     transactionally checks Codex usability and refuses an unusable inherited
+//     harness with ErrNoCredentialForHarness, without falling back or spending a
+//     rework attempt. The admin global kill-switch is read separately by the
+//     detector (settings.MrReworkEnabled).
 //
 // The default-branch exclusion is defensive (an agent MR branch is never the default
 // branch by construction). bot_forge_user_id powers the snapshot's bot self-filter.

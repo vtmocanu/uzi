@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { nullLogger } from "./helpers.js";
-import { parseOwnedBlocks } from "../src/pr-description.js";
+import { COMPLETION_START, COMPLETION_END, REGION_START, REGION_END, parseOwnedBlocks } from "../src/pr-description.js";
 import { FakePrDescApi } from "./fake-pr-desc-api.js";
 import { StubExecutor } from "../src/executor.js";
 import type { StateRequest } from "../src/protocol.js";
@@ -361,4 +361,54 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     assert.strictEqual(done!.head, undefined, "a legacy completed report carries NO head (byte-for-byte legacy)");
     assert.strictEqual(done!.mr_iid, 42);
   });
+});
+
+
+function cappedExecutor(): StubExecutor {
+  const executor = new StubExecutor(nullLogger());
+  const run = executor.run.bind(executor);
+  executor.run = async (ctx) => ({ ...await run(ctx), scopeCapped: { completedCount: 1, total: 3 } });
+  return executor;
+}
+
+describe("interlocked capped MR delivery", () => {
+  for (const adopted of [false, true]) {
+    it(`opts into a capped permit and preserves a non-closing partial MR (adopted ${adopted})`, async () => {
+      const claim = interlockedClaim(1320);
+      const forge = fakeGitlab({ head: H, ...(adopted ? { existing: ["Human notes", REGION_START, "Old size", REGION_END, COMPLETION_START, "Closes #1320", COMPLETION_END].join("\n\n") } : {}) });
+      api.setCompletionPermitResponse(true);
+      git.trackingTip = async () => H;
+      await runner(cappedExecutor(), forge.gitlab).execute(claim);
+      assert.equal(api.completionPermitRequests.length, 1);
+      assert.equal(api.completionPermitRequests[0]!.body.scope_capped, true);
+      const created = mrPostBody(forge.calls);
+      assert.match(String(created.title), /^\[partial\] /);
+      assert.doesNotMatch(String(created.description), /Closes #/);
+      assert.doesNotMatch(forge.pr.description, /Closes #1320/);
+      assert.match(forge.pr.description, /Implements part of #1320/);
+      if (adopted) {
+        assert.match(forge.pr.description, /Human notes/);
+        assert.ok(forge.calls.some((c) => c.method === "PUT"), "the adopted closing line was stripped");
+      }
+      assert.ok(forge.reads.length > 0, "head verification still runs");
+      assert.equal(completedBody(claim.run_id)?.head, H);
+      assert.equal(completedBody(claim.run_id)?.scope_capped, true);
+      assert.equal(api.completionHoldRequests.length, 0);
+    });
+  }
+
+  for (const denied of [false, true]) {
+    it(`holds a capped MR delivery on ${denied ? "permit denial" : "head mismatch"}`, async () => {
+      const claim = interlockedClaim(1321);
+      const forge = fakeGitlab({ head: OTHER });
+      api.setCompletionPermitResponse(!denied, { denyReason: "scope_cap_not_reached" });
+      git.trackingTip = async () => H;
+      await runnerWith(() => ({ executor: cappedExecutor() }), forge.gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
+      assert.equal(api.completionPermitRequests[0]!.body.scope_capped, true);
+      assert.equal(completedBody(claim.run_id), undefined);
+      assert.equal(api.completionHoldRequests.length, 1);
+      if (denied) assert.equal(forge.all.length, 0);
+      else assert.doesNotMatch(forge.pr.description, /Closes #/);
+    });
+  }
 });

@@ -828,6 +828,26 @@ describe("CodexHarness: kind + thread configuration", () => {
 });
 
 describe("CodexHarness: frame → neutral event decode", () => {
+  it("#1566 projects async agent text as ordinary text, without a questions signal", async () => {
+    let brokerCalls = 0;
+    const { harness, transport } = makeHarness({ broker: stubBroker(async () => {
+      brokerCalls += 1;
+      return { ok: true, output: {} };
+    }) });
+    transport.push(threadStarted()).push({
+      kind: "activity", method: "item/completed",
+      params: { threadId: "th-1", item: { type: "agentMessage", text: "Choose validation",
+        delivery: "async", questions: [{ title: "Which validation?", options: ["Focused", "Defer"] }] } },
+    }).push(agentMessage("finished")).push(turnCompleted("completed")).end();
+    const events = await collect(harness.startTurn(makeRequest()).events);
+    const frames = events.filter(e => e.kind === "frame");
+    assert.deepEqual(frames.map(e => e.items), [[{ kind: "text", text: "Choose validation" }], [{ kind: "text", text: "finished" }]]);
+    assert.equal(JSON.stringify(events).includes('"questions"'), false);
+    assert.equal(brokerCalls, 0);
+    assert.deepEqual(transport.responses, []);
+    assert.equal(events.at(-1)?.kind, "turn_finished");
+  });
+
   it("decodes the full turn: initialized(model) → activity → frame(items/usage/model) → turn_finished", async () => {
     const { harness, transport } = makeHarness();
     transport
@@ -1253,7 +1273,8 @@ describe("CodexHarness: server→client tool-call routing", () => {
     assert.equal(rec(rec(transport.responses[0]!.response).result).success, false);
   });
 
-  it("refuses a non-tool server request and never calls the broker", async () => {
+  for (const method of ["account/login/refresh", "currentTime/read"]) {
+  it(`refuses ${method} and never calls the broker`, async () => {
     let brokerCalls = 0;
     const broker = stubBroker(async () => {
       brokerCalls += 1;
@@ -1262,7 +1283,7 @@ describe("CodexHarness: server→client tool-call routing", () => {
     const { harness, transport } = makeHarness({ broker });
     transport
       .push(threadStarted())
-      .push(serverRequest(17, "account/login/refresh"))
+      .push(serverRequest(17, method))
       .push(turnCompleted("completed"))
       .end();
 
@@ -1276,6 +1297,7 @@ describe("CodexHarness: server→client tool-call routing", () => {
       response: { error: { code: -32601, message: "unsupported request" } },
     });
   });
+  }
 });
 
 describe("CodexHarness: tool-call is bound fail-closed to the active (thread, turn)", () => {

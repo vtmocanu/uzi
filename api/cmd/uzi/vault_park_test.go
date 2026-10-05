@@ -118,7 +118,7 @@ func TestRunLogsFollowVaultLockedNotice(t *testing.T) {
 		t.Fatal("run logs --follow hung on a vault_locked park")
 	}
 	stderr := errBuf.String()
-	want := "run r1 waiting for vault unlock: the run owner's vault was locked when this Codex run needed its credential; once the vault is unlocked it resumes at its next retry (" +
+	want := "run r1 waiting for vault unlock: the run owner's vault was locked when this Codex run needed its credential; explicit unlock queues promptly; scheduled retry fallback (" +
 		parked.RecoveryRetryNotBefore.Local().Format("15:04") + "); still following\n"
 	if n := strings.Count(stderr, want); n != 1 {
 		t.Errorf("vault_locked notice appeared %d times, want exactly 1:\n%s", n, stderr)
@@ -138,13 +138,13 @@ func TestRunLogsFollowVaultLockedNotice(t *testing.T) {
 // retry as local HH:MM, is dropped without a stamp, and any other run gets "".
 func TestVaultParkLine(t *testing.T) {
 	r := vaultParkRun("r1")
-	want := "waiting for vault unlock: the run owner's vault was locked when this Codex run needed its credential; once the vault is unlocked it resumes at its next retry (" +
+	want := "waiting for vault unlock: the run owner's vault was locked when this Codex run needed its credential; explicit unlock queues promptly; scheduled retry fallback (" +
 		r.RecoveryRetryNotBefore.Local().Format("15:04") + ")"
 	if got := vaultParkLine(r); got != want {
 		t.Errorf("vaultParkLine = %q, want %q", got, want)
 	}
 	r.RecoveryRetryNotBefore = nil
-	if got := vaultParkLine(r); !strings.HasSuffix(got, "it resumes at its next retry") {
+	if got := vaultParkLine(r); !strings.HasSuffix(got, "scheduled retry fallback") {
 		t.Errorf("vaultParkLine(no stamp) = %q, want the retry clause without a time", got)
 	}
 	if got := vaultParkLine(apitypes.RunDTO{Status: statusRecoveryWait}); got != "" {
@@ -343,16 +343,16 @@ func assertVaultRetryShown(t *testing.T, surface string, width int, r apitypes.R
 }
 
 // TestFitVaultParkLine pins the shedding order: the full sentence when it fits, then the
-// explanation shed to "... once unlocked it resumes at its next retry (HH:MM)", then the floor
-// "waiting for vault unlock · retry HH:MM"; never over width while the floor fits, the floor
+// explanation shed to the prompt-queue and scheduled-fallback clauses, then the floor
+// "waiting for vault unlock · retry fallback HH:MM"; never over width while the floor fits, the floor
 // is never cut, and a run without a stamp or without the cause behaves. Reddening mutations:
 // return vaultParkLine unshed (over width), or drop the HH:MM from the floor.
 func TestFitVaultParkLine(t *testing.T) {
 	r := vaultParkRun("r1")
 	hhmm := r.RecoveryRetryNotBefore.Local().Format("15:04")
 	full := vaultParkLine(r)
-	short := "waiting for vault unlock: once unlocked it resumes at its next retry (" + hhmm + ")"
-	floor := "waiting for vault unlock · retry " + hhmm
+	short := "waiting for vault unlock: unlock queues promptly; scheduled retry fallback (" + hhmm + ")"
+	floor := "waiting for vault unlock · retry fallback " + hhmm
 	for _, tc := range []struct {
 		width int
 		want  string

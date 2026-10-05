@@ -858,6 +858,9 @@ type Store interface {
 	// it has NO per-run cap, so promotion always fires and the run recovers repeatedly.
 	SetRunRecoveryWait(ctx context.Context, arg store.SetRunRecoveryWaitParams) (int64, error)
 	PromoteRecoveryWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteRecoveryWaitRunsRow, error)
+	// PromoteVaultLockedRecoveryWaitRuns is the owner-scoped early promotion after explicit
+	// vault unlock (#1792); it preserves the timer's reset set and backoff history.
+	PromoteVaultLockedRecoveryWaitRuns(ctx context.Context, userID uuid.UUID) ([]store.PromoteVaultLockedRecoveryWaitRunsRow, error)
 	// PromoteRecoveryWaitRunNow is the SINGLE-ROW early promote for `uzi run set-token`
 	// (PRD #1247 M4, D4): recovery_wait -> queued for ONE owner+run WITHOUT the
 	// recovery_retry_not_before guard, mirroring PromoteRecoveryWaitRuns' mutation set. A
@@ -4449,11 +4452,15 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// (the scope_ceiling directive did not drive this finalize). A scope_reduced completion
 		// then falls to the else-if and settles 'declined' ONLY if the run ALSO carried a
 		// scope_ceiling directive; a run with deferrals but no scope_ceiling settles nothing.
-		if scopeStopKind.Valid && scopeStopKind.String == "scope_capped" {
-			settleScopeDisposition = "applied"
-		} else if owned.ScopeCeiling.Valid {
-			settleScopeDisposition = "declined"
+		if !owned.CompletionContractVersion.Valid {
+			if scopeStopKind.Valid && scopeStopKind.String == "scope_capped" {
+				settleScopeDisposition = "applied"
+			} else if owned.ScopeCeiling.Valid {
+				settleScopeDisposition = "declined"
+			}
 		}
+		// Interlocked completion derives its stamp from the locked row; leave audit
+		// settlement to the committed reread below, including directives racing owned.
 		completedParams := store.SetRunCompletedParams{
 			Branch: stripNULParam(req.Branch), MrIid: pgconv.Int8Ptr(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
 			FixVerdict:          clampWireFixVerdict(req.FixVerdict),
