@@ -669,6 +669,8 @@ type Config struct {
 	// Required when hosting is enabled, refused when it is not (see loadWorkerHosting).
 	WorkerHostingEnabled  bool
 	ControllerTokenSHA256 []byte
+	// WorkerDockerEnabled reports effective Docker tier availability; requires hosting.
+	WorkerDockerEnabled bool
 	// FetcherTokenSHA256 is the sha256 of uzi-fetcher's service credential (PRD #1906 M3),
 	// decoded from the hex UZI_FETCHER_TOKEN_SHA256: the hash of the token in the fetcher's
 	// UZI_FETCHER_TOKEN_FILE, surrounding whitespace trimmed (the fetcher trims it too).
@@ -1633,6 +1635,11 @@ func loadWorkerHosting(cfg *Config) error {
 	if err != nil {
 		return err
 	}
+	docker, err := parseBool("WORKER_DOCKER_ENABLED", false)
+	if err != nil {
+		return err
+	}
+	cfg.WorkerDockerEnabled = enabled && docker
 	raw := strings.TrimSpace(os.Getenv("WORKER_HOSTING_CONTROLLER_TOKEN_SHA256"))
 	if !enabled {
 		if raw != "" {

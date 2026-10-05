@@ -668,6 +668,7 @@ func toDTO(u store.User) apitypes.UserDTO {
 		CIAutofixEnabled:        boolPtrValue(u.CiAutofixEnabled),
 		AttributionEnabled:      u.AttributionEnabled,
 		EphemeralWorkersEnabled: u.EphemeralWorkersEnabled,
+		EphemeralDockerEnabled:  u.EphemeralDockerEnabled,
 		CreatedAt:               u.CreatedAt.Time,
 		// The judge binding's id; the LABEL is filled in only by the routes that
 		// resolved it (PUT /api/me/judge), since a bare users row carries no join to

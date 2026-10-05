@@ -101,7 +101,7 @@
           <label class="switch"><span class="track" aria-hidden="true"></span> Auto-provision on demand</label>
           <label class="check"><input type="checkbox" checked> Docker-capable</label>
         </div>
-        <p class="help">uzi spins up a throwaway hosted worker when a run needs a capability no online worker has, or when every capable worker stays busy. It may be kept warm for up to 2 hours for a follow-up run on the same branch, and counts toward your ephemeral limit meanwhile. <em>Docker-capable</em> gives each one a Docker daemon for container builds and tests, at extra CPU and storage.</p>
+        <p class="help">uzi spins up a throwaway hosted worker when a run needs a capability no online worker has, or when every capable worker stays busy. It may be kept warm for up to 2 hours for a follow-up run on the same branch, and counts toward your ephemeral limit meanwhile. Docker-capable includes Docker for repositories your admin allows, at extra CPU and storage.</p>
       </div>
     </div>
     <p class="note" style="margin-top:12px">Agreed UX: the two ephemeral controls share ONE row (no nested, indented checkbox); ONE short paragraph covers both; no "experimental" label and no cold-start size; no "rootless" promise in either section (rootless:false is a supported posture). Docker-capable is hidden when the instance offers no docker tier, saves on change, keeps its value while auto-provision is off.</p>

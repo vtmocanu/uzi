@@ -11,6 +11,7 @@
   "ci_autofix_enabled": true,
   "attribution_enabled": true,
   "ephemeral_workers_enabled": true,
+  "ephemeral_docker_enabled": true,
   "judge_anthropic_secret_id": "x",
   "judge_anthropic_secret_label": "x",
   "judge_anthropic_bind_mode": "x",

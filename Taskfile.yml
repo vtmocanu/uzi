@@ -1307,6 +1307,11 @@ tasks:
       # script header.
       - ./scripts/assert-drain-knobs-render.sh
 
+  render:ephemeral-docker-check:
+    desc: assert effective Docker tier availability reaches the api Deployment
+    cmds:
+      - ./scripts/assert-ephemeral-docker-render.sh
+
   render:ephemeral-lease-check:
     desc: assert the api Deployment renders UZI_EPHEMERAL_LEASE (default 2h, null -> 2h, 0 survives, override) (PRD 2006)
     cmds:

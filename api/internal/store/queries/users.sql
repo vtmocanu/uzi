@@ -364,3 +364,10 @@ RETURNING *;
 -- seed-admin demotion exemption is enforced in the caller, not here.
 UPDATE users SET is_admin = @is_admin WHERE id = @id
 RETURNING *;
+
+-- name: SetUserEphemeralWorkerPreferences :one
+-- Partial session-owned preferences; omitted values preserve the current row atomically.
+UPDATE users SET ephemeral_workers_enabled = COALESCE(sqlc.narg(enabled)::boolean, ephemeral_workers_enabled),
+    ephemeral_docker_enabled = COALESCE(sqlc.narg(docker)::boolean, ephemeral_docker_enabled)
+WHERE id = @id
+RETURNING *;

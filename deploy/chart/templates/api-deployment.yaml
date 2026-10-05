@@ -105,6 +105,8 @@ spec:
             {{- $ephemeralLease := .Values.workers.ephemeralLease }}
             - name: UZI_EPHEMERAL_LEASE
               value: {{ if kindIs "invalid" $ephemeralLease }}"2h"{{ else }}{{ toString $ephemeralLease | quote }}{{ end }}
+            - name: WORKER_DOCKER_ENABLED
+              value: {{ ternary "true" "false" (and (not (empty (include "uzi.apiHostingEnabled" .))) .Values.workers.docker.enabled) | quote }}
             {{- if include "uzi.apiHostingEnabled" . }}
             # The controller's bearer credential, as a HASH (PRD #58 Decision 2). The
             # api only ever compares sha256(presented) against this, so the hash is not

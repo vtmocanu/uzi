@@ -1301,6 +1301,7 @@ type User struct {
 	DefaultClaudeModel      pgtype.Text        `json:"default_claude_model"`
 	DefaultCodexModel       pgtype.Text        `json:"default_codex_model"`
 	DefaultCodexEffort      pgtype.Text        `json:"default_codex_effort"`
+	EphemeralDockerEnabled  bool               `json:"ephemeral_docker_enabled"`
 }
 
 type UserSecret struct {

@@ -45,6 +45,8 @@ type UserDTO struct {
 	// toggles their own from the Workers page. Both this and the admin instance
 	// kill-switch must be on before the provisioner acts.
 	EphemeralWorkersEnabled bool `json:"ephemeral_workers_enabled"`
+	// EphemeralDockerEnabled persists independently of auto-provisioning and tier availability.
+	EphemeralDockerEnabled bool `json:"ephemeral_docker_enabled"`
 	// Which Anthropic credential this user's RETROSPECTIVES spend (PRD #104 M4, D1),
 	// independent of what their runs spend. Both null ⇒ unbound ⇒ their default
 	// token, which is every user's state until they choose otherwise. The label
