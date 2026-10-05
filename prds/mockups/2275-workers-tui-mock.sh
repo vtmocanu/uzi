@@ -215,7 +215,7 @@ title() { local t lbl out="${TUNG}${B}▚▚ uzi${R}${F} · ${R}" set="floor wor
   else printf '%s\n%s\n' "$out" "$(fleet_fit $width)"; fi; }
 
 # floor: account meters, the run summary right-aligned on the last meter line
-meters() { local m="  ${F}claude${R} $(bar 62 4) 62% ${F}5h${R}  ${F}codex${R} $(bar 18 4) 18% ${F}5h${R}"
+meters() { local m; m="  ${F}claude${R} $(bar 62 4) 62% ${F}5h${R}  ${F}codex${R} $(bar 18 4) 18% ${F}5h${R}"
   rjust "$m" "${F}\$1733+ 7d · 200 runs · 1–5${R}"; }
 
 list_header() {
