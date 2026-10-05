@@ -435,7 +435,7 @@ changes it); trust it over a handover's claim.
      occurrences) or it is a verified urgent/high item; judge confidence alone is not
      severity. Leave the rest for **judge-triage**. Route by where the fix lives, verified,
      not by category. Uzi code or config gets the same outcomes and gates as findings, with
-     judge verbs: file through the run's judge Recommendations panel (edits the title and
+     judge verbs: file from the run view's Judge panel or the Judge backlog (edits the title and
      body, records the link, moves the rec to filed) or `uzi review file RUN REC`, which
      posts the unedited server text; already tracked or fixed → `uzi review resolve RUN
      REC`; false or declined → `uzi review dismiss RUN REC --reason not-an-issue|wont-do`;
