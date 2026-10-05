@@ -26,6 +26,9 @@ func TestPlanCrossCheckPersistentProvisioningMirrorsLiveDB(t *testing.T) {
 			t.Run(kind+"/"+tc.name, func(t *testing.T) {
 				fx := newFleetFixture(t)
 				optInEphemeral(fx)
+				t.Cleanup(func() {
+					mustExec(fx.ctx, t, fx.pool, `UPDATE users SET ephemeral_workers_enabled=false WHERE id=$1`, fx.userID)
+				})
 				workerID := fx.worker("persistent", capOf(1), false)
 				mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET protocol_capabilities=$2 WHERE id=$1`, workerID, tc.protocols)
 				runID := queuedRunWithCaps(fx, []string{})
