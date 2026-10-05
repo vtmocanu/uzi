@@ -32,6 +32,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Secret scans reuse the pinned worker scanner offline ([#2289](https://github.com/vtmocanu/uzi/issues/2289)).**
+  The repository gate reuses installed gitleaks only when Go build metadata proves the exact module and version without replacements. Unknown or different builds use the pinned fetch, and every scan still must detect its canaries.
+
 - **Codex delegation requires an assignment ([#2285](https://github.com/vtmocanu/uzi/issues/2285)).**
   Empty or blank subagent instructions are rejected before a child starts. Blank aliases fall through to later instructions, and valid task text is preserved.
 
