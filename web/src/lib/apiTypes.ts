@@ -32,6 +32,7 @@ export interface User {
   // capability (PRD #529/#649). Default false; toggled from the Workers page. No
   // dedicated AuthContext field — it rides `user` like `judge_enabled`.
   ephemeral_workers_enabled: boolean;
+  ephemeral_docker_enabled: boolean;
   /** PRD #35: this user's DEFAULT for the usage-limit park — every run they create
    *  inherits it, including the three kinds with no start affordance at all
    *  (autopilot, ci_fix, self_improve), which is why the default exists rather than

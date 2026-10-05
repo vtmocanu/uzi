@@ -35,7 +35,7 @@ func (h *Handler) SetEphemeralWorkersEnabled(w http.ResponseWriter, r *http.Requ
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.Docker != nil && *req.Docker && !(h.cfg.WorkerHostingEnabled && h.cfg.WorkerDockerEnabled) {
+	if req.Docker != nil && *req.Docker && (!h.cfg.WorkerHostingEnabled || !h.cfg.WorkerDockerEnabled) {
 		httpx.Error(w, http.StatusConflict, "Docker-capable workers are unavailable on this instance")
 		return
 	}

@@ -16,6 +16,7 @@ export const mockAdmin: User = {
   ci_autofix_enabled: false,
   attribution_enabled: true,
   ephemeral_workers_enabled: false,
+  ephemeral_docker_enabled: false,
   wait_on_limit: true,
   notify_early_limit_reset: true,
   judge_anthropic_secret_id: null,
@@ -38,6 +39,7 @@ export const mockUsers: User[] = [
     ci_autofix_enabled: false,
     attribution_enabled: true,
     ephemeral_workers_enabled: false,
+    ephemeral_docker_enabled: false,
     // PRD #35: the demo's one opted-IN user, and it is the autopilot user on purpose.
     // An autopilot run has no start affordance at all, so this default is the ONLY
     // way its opt-in can ever be expressed — pairing the two is what makes the
@@ -61,6 +63,7 @@ export const mockUsers: User[] = [
     ci_autofix_enabled: false,
     attribution_enabled: true,
     ephemeral_workers_enabled: false,
+    ephemeral_docker_enabled: false,
     wait_on_limit: false,
     notify_early_limit_reset: false,
     judge_anthropic_secret_id: null,
@@ -80,6 +83,7 @@ export const mockUsers: User[] = [
     ci_autofix_enabled: false,
     attribution_enabled: true,
     ephemeral_workers_enabled: false,
+    ephemeral_docker_enabled: false,
     wait_on_limit: false,
     notify_early_limit_reset: false,
     judge_anthropic_secret_id: null,
@@ -101,6 +105,7 @@ export const mockUsers: User[] = [
     ci_autofix_enabled: false,
     attribution_enabled: true,
     ephemeral_workers_enabled: false,
+    ephemeral_docker_enabled: false,
     wait_on_limit: false,
     notify_early_limit_reset: false,
     judge_anthropic_secret_id: null,
@@ -120,6 +125,7 @@ export const mockUsers: User[] = [
     ci_autofix_enabled: false,
     attribution_enabled: true,
     ephemeral_workers_enabled: false,
+    ephemeral_docker_enabled: false,
     wait_on_limit: false,
     notify_early_limit_reset: false,
     judge_anthropic_secret_id: null,
