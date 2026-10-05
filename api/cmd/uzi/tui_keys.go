@@ -97,10 +97,10 @@ func helpLines(v tuiView) []string {
 			"m          open the PR view for this run's merge request (when it has one)",
 		}, common...)
 	case viewWorker:
-		return []string{"j / ↓      select reported run", "k / ↑      select reported run", "pgup/pgdn  scroll worker detail", "enter      open reported run", "esc        back to origin", "r          refresh workers", "?          this help", "q          quit"}
+		return []string{"j / ↓      select reported run", "k / ↑      select reported run", "pgup/pgdn  scroll worker detail", "enter / →  open reported run", "esc / ←    back to origin", "r          refresh workers", "?          this help", "q          quit"}
 	case viewWorkers:
 		return append(append([]string{
-			"enter      open selected worker",
+			"enter / →  open selected worker",
 			"a          toggle your workers / factory workers (admin token)",
 			"tab / shift+tab  floor · workers · pulls · ci",
 			"1 / 2 / 3 / 4  floor / workers / pulls / ci",

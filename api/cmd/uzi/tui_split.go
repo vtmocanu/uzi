@@ -234,7 +234,7 @@ func (m tuiModel) splitFooterLine() string {
 		hints = []string{"enter/→ open", "tab pane", "/ filter", "a factory", "h fold done", "r refresh", "? keys", "q quit"}
 	}
 	if m.view == viewWorkers {
-		hints = []string{"j/k move", "ctrl+w focus", "1-4 tabs", "/ filter", "a factory", "r refresh", "? keys", "q quit"}
+		hints = []string{"enter/→ open", "j/k move", "ctrl+w focus", "/ filter", "a factory", "r refresh", "? keys", "q quit"}
 	}
 	if m.view == viewCI {
 		hints = []string{"enter/→ open", "tab pane", "R repo", "/ filter", "r refresh", "? keys", "q quit"}
@@ -275,13 +275,23 @@ func (m tuiModel) splitFooterLine() string {
 // Build it once per render: time-dependent meter widths can change its height.
 func (m tuiModel) splitHeader(now time.Time) []string {
 	var lines []string
-	lines = append(lines, clampVisual(" "+m.tabStrip(m.board.admin, m.view, false), m.width))
-	summaryWidth := m.width
+	label := "floor"
 	if m.top() == viewWorkers {
-		summaryWidth = min(80, summaryWidth)
+		label = "workers"
+	} else if m.board.admin {
+		label = "active runs"
 	}
-	if fleet := m.workersSummary(summaryWidth, m.top() == viewBoard); fleet != "" {
-		lines = append(lines, fleet)
+	if m.view == m.top() {
+		label = "[" + label + "]"
+	}
+	title := " " + m.pal.title.Render("▚▚ uzi") + m.pal.faint.Render(" · ") + m.pal.title.Render(label)
+	if m.top() == viewBoard {
+		lines = append(lines, m.workerTitleLines(title, m.workersSummary(m.width, true))...)
+	} else {
+		lines = append(lines, clampVisual(title, m.width))
+		if summary := m.workersSummary(min(80, m.width), false); summary != "" {
+			lines = append(lines, summary)
+		}
 	}
 	lines = append(lines, m.boardMeterLayout(now).lines...)
 	if vault := m.vaultIndicatorLine(); vault != "" {

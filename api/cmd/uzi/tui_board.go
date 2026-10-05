@@ -385,22 +385,18 @@ func (m tuiModel) tabStrip(admin bool, marked tuiView, repoSuffix bool) string {
 		label  string
 		active bool
 	}{
-		{"1 " + floorLabel, marked == viewBoard},
-		{"2 workers", marked == viewWorkers},
-		{"3 pulls", marked == viewPulls},
-		{"4 ci", marked == viewCI},
+		{floorLabel, marked == viewBoard},
+		{"workers", marked == viewWorkers},
+		{"pulls", marked == viewPulls},
+		{"ci", marked == viewCI},
 	}
 	out := m.pal.title.Render("▚▚ uzi") + m.pal.faint.Render(" · ")
 	for i, t := range tabs {
 		if i > 0 {
-			out += m.pal.faint.Render(" · ")
+			out += m.pal.faint.Render("  ")
 		}
 		if t.active {
 			label := t.label
-			if m.splitDrawn() && (marked == viewBoard || marked == viewWorkers) {
-				key, name, _ := strings.Cut(label, " ")
-				label = key + " [" + name + "]"
-			}
 			out += m.pal.title.Render(label)
 		} else {
 			out += m.pal.faint.Render(t.label)
@@ -545,23 +541,11 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 		meters = m.boardMeterLayout(time.Now())
 	}
 
-	// The wordmark is now a tab strip (PRD #1255 D1): ▚▚ uzi · 1 floor · 2 workers · 3 pulls · 4 ci, the active
+	// The wordmark is now a tab strip (PRD #1255 D1): ▚▚ uzi · floor  workers  pulls  ci, the active
 	// tab bold. tabStrip relabels the floor tab "active runs" on the admin board (AdminListRuns
 	// returns non-terminal runs only, so promising completed rows would be a claim the API
 	// cannot satisfy).
-	brand := ""
-	if fullScreen {
-		brand = m.tabStrip(m.board.admin, m.view, false)
-	}
-	if m.board.hideDone && !m.board.admin {
-		brand += m.pal.faint.Render("   active only")
-	}
-	if m.board.filter != "" || m.board.filtering {
-		brand += m.pal.faint.Render("   /" + cellText(m.board.filter))
-		if m.board.filtering {
-			brand += m.pal.title.Render("▌")
-		}
-	}
+	brand := m.boardTitle(fullScreen)
 
 	// The display list injects non-selectable eyebrow + spacer lines around the run rows; the
 	// cursor still indexes RUN rows only (via visible()), so selection/enter/clamp are unchanged.
@@ -578,11 +562,12 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 		lo, hi := windowRunSpan(items, start, end)
 		summary += m.pal.faint.Render(" · " + itoa(lo) + "–" + itoa(hi))
 	}
-	sb.WriteString(clampVisual(padVisual(" "+brand, m.width-visualWidth(summary)-1)+summary, m.width) + "\n")
 	if fullScreen {
-		if fleet := m.workersSummary(m.width, true); fleet != "" {
-			sb.WriteString(fleet + "\n")
+		for _, line := range m.workerTitleLines(" "+brand, m.workersSummary(m.width, true)) {
+			sb.WriteString(line + "\n")
 		}
+	} else {
+		sb.WriteString(clampVisual(padVisual(" "+brand, m.width-visualWidth(summary)-1)+summary, m.width) + "\n")
 	}
 	// The viewer's own rate-limit meters, mirroring the web sidebar's selection (PRD #1209 M3 /
 	// 1519 M4). boardMeterLayout adaptively renders the Claude and Codex meters on ONE combined
@@ -602,7 +587,7 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 		if vault := m.vaultIndicatorLine(); vault != "" {
 			sb.WriteString(vault + "\n")
 		}
-		sb.WriteString("\n")
+		sb.WriteString(padVisual("", max(0, m.width-visualWidth(summary))) + clampVisual(summary, m.width) + "\n")
 	}
 
 	if fullScreen && m.board.adminDenied {
@@ -988,9 +973,7 @@ func (m tuiModel) boardCapacityAt(height, meterLines int, fullScreen bool) int {
 	chrome := 1 // pane title, filter and summary
 	if fullScreen {
 		chrome += 2 // blank line and footer
-		if m.workersSummary(m.width, true) != "" {
-			chrome++
-		}
+		chrome += len(m.workerTitleLines(" "+m.boardTitle(true), m.workersSummary(m.width, true))) - 1
 		if m.board.adminDenied {
 			chrome++
 		}
@@ -1120,4 +1103,22 @@ func (m tuiModel) boardSummary() string {
 	}
 	segs = append(segs, m.pal.faint.Render(itoa(len(m.board.runs))+" runs"))
 	return strings.Join(segs, m.pal.faint.Render(" · "))
+}
+
+// boardTitle is shared by rendering and capacity so filter chrome cannot hide a row.
+func (m tuiModel) boardTitle(full bool) string {
+	brand := ""
+	if full {
+		brand = m.tabStrip(m.board.admin, m.view, false)
+	}
+	if m.board.hideDone && !m.board.admin {
+		brand += m.pal.faint.Render("   active only")
+	}
+	if m.board.filter != "" || m.board.filtering {
+		brand += m.pal.faint.Render("   /" + cellText(m.board.filter))
+		if m.board.filtering {
+			brand += m.pal.title.Render("▌")
+		}
+	}
+	return brand
 }

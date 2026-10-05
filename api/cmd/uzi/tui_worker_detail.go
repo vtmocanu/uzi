@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/charmbracelet/x/ansi"
 	"strings"
 	"time"
 
@@ -149,7 +150,7 @@ func (m tuiModel) workerKey(k string) (tea.Model, tea.Cmd) {
 	if k == keyRefresh {
 		return m, (&m).startWorkersReq()
 	}
-	if k != keyEnter || m.workerDetail.selectedRunID == "" {
+	if (k != keyEnter && k != keyRight) || m.workerDetail.selectedRunID == "" {
 		return m, nil
 	}
 	m.workerNav.req++
@@ -230,108 +231,156 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 	}
 	w, t := r.w, workerTextOf(r)
 	width := max(1, m.width)
-	lines := []string{m.pal.title.Render(m.renderer.Plain(t.workerName, width)), "", "Attention"}
+	plain := func(s string) string { return m.renderer.Plain(s, width) }
+	scope := "your workers"
+	if m.board.admin {
+		scope = "factory workers"
+	}
+	state := workerState(r)
+	lines := []string{m.tabStrip(m.board.admin, viewWorkers, false),
+		m.pal.faint.Render(scope+" › ") + m.pal.title.Render(plain(t.workerName)) + "  " + paintSeg(m.workerStateColor(state), nil, false, workerStateGlyph(state)+" "+state) + "  " + m.pal.faint.Render(m.workerKind(r))}
+	heartbeat := "last heartbeat " + workerAge(w.LastHeartbeatAt, now) + " ago"
+	if w.Status == "online" {
+		heartbeat = "up " + workerUptime(w.OnlineSince, now) + " · heartbeat " + workerAge(w.LastHeartbeatAt, now) + " ago"
+	}
+	lines = append(lines, "  "+m.pal.faint.Render(heartbeat), "", m.pal.title.Render("attention"))
 	attention := workerAttention(r, now)
 	if len(attention) == 0 {
-		lines = append(lines, "none")
+		lines = append(lines, "  "+m.pal.faint.Render("no reported warnings"))
 	}
-	for _, a := range attention {
-		lines = append(lines, m.renderer.Plain(a.attnDetail, width))
+	for _, item := range attention {
+		lines = append(lines, "  "+paintSeg(m.workerAttentionColor(item), nil, false, plain(item.attnDetail)))
 	}
-	lines = append(lines, "", "Reported runs")
+	lines = append(lines, "", m.pal.title.Render("reported runs")+m.pal.faint.Render("  api active_runs ")+itoa(w.ActiveRuns)+m.pal.faint.Render(" / cap ")+strings.Split(workerSlots(w), "/")[1]+m.pal.faint.Render(" (run lane)"))
 	selected := 0
 	if len(w.ReportedRuns) == 0 {
-		lines = append(lines, "none reported")
+		lines = append(lines, "  "+m.pal.faint.Render("none"))
 	}
 	for i, run := range w.ReportedRuns {
-		mark := "  "
-		if i == m.workerDetail.cursor {
-			mark, selected = "› ", len(lines)
-		}
-		title, cached := m.renderer.Plain(run.RunID, width-2), "  cached board: ? (not cached)"
+		id, title, engine, stage := plain(run.RunID[:min(8, len(run.RunID))]), "", "?", "? (not cached)"
 		if m.board.runsAdmin == m.board.admin {
-			for _, boardRun := range m.board.runs {
-				if boardRun.ID != run.RunID {
-					continue
+			for _, br := range m.board.runs {
+				if br.ID == run.RunID {
+					if br.IssueIID != nil {
+						id = fmt.Sprintf("#%d", *br.IssueIID)
+						title = plain(runTitle(br.RunDTO))
+					}
+					engine = plain(br.Harness)
+					stage = plain(m.pal.runStateToken(br.RunDTO, br.IsRevising).word)
+					break
 				}
-				title = m.renderer.Plain(runTitle(boardRun.RunDTO), width-2)
-				status, stage := "unknown", "unknown"
-				switch boardRun.Status {
-				case "queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait", "pool_wait", "recovery_wait", "paused", "completed", "failed", "cancelled":
-					status = boardRun.Status
-					stage = m.pal.runStateToken(boardRun.RunDTO, boardRun.IsRevising).word
-				}
-				cached = "  cached board: status " + status + " · stage " + m.renderer.Plain(stage, 32)
-				break
 			}
 		}
+		mark := "  "
+		if i == m.workerDetail.cursor {
+			mark = m.pal.sel.Render("▌ ")
+			selected = len(lines)
+		}
+		lines = append(lines, mark+m.pal.faint.Render(itoa(i+1)+" ")+m.pal.sel.Render(id)+" "+title+"  "+m.pal.faint.Render(engine))
 		phase := "unknown"
 		switch run.Phase {
 		case "running", "awaiting_approval", "awaiting_input", "awaiting_followup":
 			phase = run.Phase
 		}
-		lines = append(lines, mark+title, fmt.Sprintf("  worker phase: %s · generation %d", phase, run.ClaimGeneration), cached)
+		line := "      " + m.pal.faint.Render("worker phase ") + phase + m.pal.faint.Render(" · run stage ") + stage + m.pal.faint.Render(fmt.Sprintf(" · gen %d", run.ClaimGeneration))
 		if run.TerminalPending {
-			lines = append(lines, "  outcome pending · "+workerAge(run.TerminalPendingSince, now))
+			line += " · " + paintSeg(m.pal.stall, nil, false, "◷ outcome pending "+workerAge(run.TerminalPendingSince, now))
 		}
+		lines = append(lines, line)
 	}
-	lines = append(lines, "", "Resources")
-	resourceStart := len(lines)
-	if w.Status != "online" {
-		lines = append(lines, "stale, last-known")
+	if len(w.ReportedRuns) > 0 {
+		lines = append(lines, "  "+m.pal.faint.Render("↵/→ open run (esc returns here)"))
+	}
+	lines = append(lines, "", m.pal.title.Render("resources"))
+	stale := w.Status != "online"
+	if stale {
+		lines[len(lines)-1] += m.pal.faint.Render("  last-known, stale")
+	}
+	kv := func(key, value string) { lines = append(lines, "  "+m.pal.faint.Render(padVisual(key, 13))+" "+value) }
+	resource := func(value string) string {
+		if stale {
+			return m.pal.faint.Render("~ " + ansi.Strip(value))
+		}
+		return value
 	}
 	cpu := "?"
 	if w.StatsCPUPct != nil {
-		cpu = fmt.Sprintf("%.1f%%", *w.StatsCPUPct)
+		cpu = paintSeg(m.workerUsageColor(*w.StatsCPUPct), nil, false, fmt.Sprintf("%.0f%%", *w.StatsCPUPct))
 	}
 	source := ""
 	if w.StatsSource != nil && *w.StatsSource == "process" {
-		source = " · worker process only"
+		source = m.pal.faint.Render("  process only")
 	}
-	lines = append(lines, "CPU "+cpu+source, "memory "+workerBytePair(w.StatsMemBytes, w.StatsMemLimitBytes)+source)
-	lines = append(lines,
-		"data bytes "+workerBytePair(w.StatsDiskDataBytes, w.StatsDiskDataTotalBytes),
-		"data inodes "+workerInodePair(w.StatsDiskDataInodes, w.StatsDiskDataTotalInodes)+" (display-only)",
-		"nix bytes "+workerBytePair(w.StatsDiskNixBytes, w.StatsDiskNixTotalBytes),
-		"nix inodes ? (display-only)",
-		"dind bytes "+workerBytePair(w.StatsDiskDindBytes, w.StatsDiskDindTotalBytes)+" (display-only)",
-		"dind inodes "+workerInodePair(w.StatsDiskDindInodes, w.StatsDiskDindTotalInodes)+" (display-only)",
-		"largest runs · cache is a subset of HOME (display-only)")
-	if len(w.RunDisk) == 0 {
-		lines = append(lines, "?")
+	kv("cpu", resource(cpu+source))
+	kv("memory", resource(workerBytePair(w.StatsMemBytes, w.StatsMemLimitBytes)+source))
+	disk := func(key string, used, total, inodes, inodeTotal *int64, display bool) {
+		value := "?"
+		if used != nil && total != nil && *total > 0 {
+			value = m.workerUsage(100*float64(*used)/float64(*total), 12)
+		}
+		if inodes != nil && inodeTotal != nil && *inodeTotal > 0 {
+			value += m.pal.faint.Render(fmt.Sprintf("  inodes %.0f%%", 100*float64(*inodes)/float64(*inodeTotal)))
+		}
+		if display {
+			value += m.pal.faint.Render("  display only")
+		}
+		kv(key, resource(value))
 	}
-	for _, disk := range w.RunDisk {
+	disk("data", w.StatsDiskDataBytes, w.StatsDiskDataTotalBytes, w.StatsDiskDataInodes, w.StatsDiskDataTotalInodes, false)
+	if w.Kind == "hosted" || w.StatsDiskNixBytes != nil {
+		disk("nix", w.StatsDiskNixBytes, w.StatsDiskNixTotalBytes, nil, nil, false)
+	}
+	if (w.Docker != nil && *w.Docker) || w.StatsDiskDindBytes != nil {
+		disk("dind", w.StatsDiskDindBytes, w.StatsDiskDindTotalBytes, w.StatsDiskDindInodes, w.StatsDiskDindTotalInodes, true)
+	}
+	if len(w.RunDisk) > 0 {
+		d := w.RunDisk[0]
+		id := plain(d.RunID[:min(8, len(d.RunID))])
+		if m.board.runsAdmin == m.board.admin {
+			for _, br := range m.board.runs {
+				if br.ID == d.RunID && br.IssueIID != nil {
+					id = fmt.Sprintf("#%d", *br.IssueIID)
+					break
+				}
+			}
+		}
 		bound := ""
-		if disk.Truncated {
+		if d.Truncated {
 			bound = "≥"
 		}
-		lines = append(lines, m.renderer.Plain(disk.RunID, width),
-			"  HOME "+bound+humanBytes(disk.HomeBytes)+" · cache "+bound+humanBytes(disk.CacheBytes),
-			"  measured "+workerAge(&disk.SampledAt, now)+" ago")
+		kv("largest HOME", resource(m.pal.sel.Render(id)+"  "+bound+humanBytes(d.HomeBytes)+m.pal.faint.Render(" (sampled "+workerAge(&d.SampledAt, now)+" ago)")))
 	}
-	if w.Status != "online" {
-		for i := resourceStart; i < len(lines); i++ {
-			lines[i] = m.pal.faint.Render("~ " + lines[i])
-		}
+	lines = append(lines, "", m.pal.title.Render("configuration"))
+	ver := plain(t.workerVersion)
+	if w.UpgradeStatus == "outdated" {
+		ver += "  " + paintSeg(m.pal.stall, nil, false, "↑ outdated · target "+plain(t.upgradeTarget))
 	}
-	lines = append(lines, "", "Configuration",
-		"version "+m.renderer.Plain(t.workerVersion, width)+" · target "+m.renderer.Plain(t.upgradeTarget, width),
-		"capabilities "+m.renderer.Plain(t.capabilityText, width),
-		"template declared "+m.renderer.Plain(t.templateDeclared, width),
-		"template reported "+m.renderer.Plain(t.templateReported, width))
+	if w.UpgradeStatus == "upgrade_failed" {
+		ver += "  " + paintSeg(m.pal.alarm, nil, false, "✕ upgrade failed") + paintSeg(m.pal.stall, nil, false, " · target "+plain(t.upgradeTarget))
+	}
+	kv("version", ver)
+	kv("capabilities", plain(t.capabilityText))
+	template := plain(t.templateDeclared)
+	if w.TemplateDeclared != nil && w.TemplateReported != nil && *w.TemplateDeclared != *w.TemplateReported {
+		template += "  " + paintSeg(m.pal.stall, nil, false, "≠ reported "+plain(t.templateReported))
+	}
+	kv("template", template)
 	mode := "unknown"
 	switch w.AnthropicBindMode {
 	case "default", "auto":
 		mode = w.AnthropicBindMode
 	case "pinned":
-		mode = "pinned · " + m.renderer.Plain(t.tokenLabel, width)
+		mode = "pinned · " + plain(t.tokenLabel)
 	}
+	kv("token", mode)
 	kind := "unknown"
 	switch w.Kind {
 	case "external", "hosted":
 		kind = w.Kind
 	}
-	lines = append(lines, "token mode "+mode, "kind "+kind+" · size "+m.renderer.Plain(t.hostedSize, width))
+	if w.Kind == "hosted" {
+		kind += " · size " + plain(t.hostedSize)
+	}
 	if w.Ephemeral {
 		lease := "?"
 		if w.EphemeralLeaseExpiresAt != nil {
@@ -340,12 +389,26 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 				lease = workerDuration(w.EphemeralLeaseExpiresAt.Sub(now)) + " left"
 			}
 		}
-		lines = append(lines, "ephemeral · lease "+lease)
+		kind += " · ephemeral · lease " + lease
 	}
+	kv("kind", kind)
 	if m.board.admin {
-		lines = append(lines, "owner "+m.renderer.Plain(t.workerOwner, width))
+		kv("owner", plain(t.workerOwner))
 	}
 	return lines, selected
+}
+func workerUptime(at *time.Time, now time.Time) string {
+	if at == nil {
+		return "?"
+	}
+	d := max(time.Duration(0), now.Sub(*at))
+	if d >= 24*time.Hour {
+		return fmt.Sprintf("%dd%dh", int(d.Hours())/24, int(d.Hours())%24)
+	}
+	if d >= time.Hour {
+		return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+	return workerDuration(d)
 }
 
 func workerBytePair(used, total *int64) string {
@@ -375,7 +438,7 @@ func (m tuiModel) renderWorker() string {
 		lines = append(lines, m.renderer.Plain(m.workerDetail.notice, max(1, m.width)))
 	}
 	if m.height >= 1 {
-		lines = append(lines, "j/k select · enter run · esc back · pgup/pgdn scroll · r refresh · ? keys")
+		lines = append(lines, "j/k select · enter/→ run · esc/← back · pgup/pgdn scroll · r refresh · ? keys")
 	}
 	for i, line := range lines {
 		lines[i] = clampVisual(line, max(1, m.width))

@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/charmbracelet/x/ansi"
+	"image/color"
 	"slices"
 	"strings"
 	"time"
@@ -466,7 +468,7 @@ func (m tuiModel) workersKey(k string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	switch k {
-	case keyEnter:
+	case keyEnter, keyRight:
 		if len(rows) > 0 {
 			return m.openWorker(rows[m.workers.cursor].w.ID)
 		}
@@ -526,12 +528,12 @@ func (m tuiModel) workersSummary(width int, floor bool) string {
 		}
 	}
 	slots := fmt.Sprintf("%d/%d slots in use", used, cap)
+	attentionText := paintSeg(m.pal.amber, nil, false, fmt.Sprintf("%d need attention", attention))
 	if floor {
-		summary := fmt.Sprintf("workers %s · %d/%d online · %d need attention · 2 for detail", slots, online, n, attention)
-		if visualWidth(summary) > width {
-			summary = fmt.Sprintf("workers %s · %d need attention · 2 for detail", slots, attention)
+		if width < 120 {
+			return fmt.Sprintf("workers %d/%d slots · %s", used, cap, attentionText)
 		}
-		return clampVisual(summary, width)
+		return fmt.Sprintf("workers %s · %d/%d online · %s", slots, online, n, attentionText)
 	}
 	scope := "your workers"
 	if m.board.admin {
@@ -557,8 +559,11 @@ func (m tuiModel) workersSummary(width int, floor bool) string {
 				}
 			}
 		}
-		seg = append(seg, fmt.Sprintf("%d need attention", attention))
+		seg = append(seg, attentionText)
 		return strings.Join(seg, " · ")
+	}
+	if width < 120 {
+		return clampVisual(build(false, false, false), width)
 	}
 	for _, opts := range [][3]bool{{true, true, true}, {false, true, true}, {false, false, true}, {false, false, false}} {
 		s := build(opts[0], opts[1], opts[2])
@@ -595,63 +600,128 @@ func (m tuiModel) workerKind(r workerRow) string {
 	}
 	return kind
 }
+func (m tuiModel) workerStateColor(state string) color.Color {
+	switch state {
+	case "busy":
+		return m.pal.sage
+	case "holding":
+		return m.pal.amber
+	case "offline":
+		return m.pal.stall
+	case "draining", "cordoned":
+		return m.pal.wait
+	default:
+		return m.pal.faintC
+	}
+}
+func (m tuiModel) workerAttentionColor(a attnItem) color.Color {
+	if a.severity == 0 {
+		return m.pal.alarm
+	}
+	if a.severity == 2 {
+		return m.pal.faintC
+	}
+	if strings.HasPrefix(a.attnShort, "⚑") {
+		return m.pal.amber
+	}
+	if strings.HasPrefix(a.attnShort, "◐") || strings.HasPrefix(a.attnShort, "◌") {
+		return m.pal.wait
+	}
+	return m.pal.stall
+}
+func (m tuiModel) workerUsageColor(pct float64) color.Color {
+	if pct >= 90 {
+		return m.pal.alarm
+	}
+	if pct >= 75 {
+		return m.pal.stall
+	}
+	return nil
+}
+func (m tuiModel) workerUsage(pct float64, cells int) string {
+	n := min(cells, max(0, int(pct*float64(cells)/100)))
+	return paintSeg(m.workerUsageColor(pct), nil, false, strings.Repeat("█", n)+strings.Repeat("░", cells-n)+fmt.Sprintf(" %.0f%%", pct))
+}
+func (m tuiModel) workerTitleLines(title, status string) []string {
+	if status == "" {
+		return []string{clampVisual(title, m.width)}
+	}
+	if gap := m.width - visualWidth(title) - visualWidth(status); gap >= 2 {
+		return []string{title + strings.Repeat(" ", gap) + status}
+	}
+	return []string{clampVisual(title, m.width), clampVisual(status, m.width)}
+}
 func (m tuiModel) workerRowLine(r workerRow, selected bool, width int) string {
-	t := workerTextOf(r)
-	now := time.Now()
+	t, now := workerTextOf(r), time.Now()
+	var bg color.Color
+	if selected {
+		bg = m.pal.selBg
+	}
+	cell := func(text string, n int, fg color.Color) string {
+		return paintSeg(fg, bg, false, padVisual(clampVisual(text, n), n))
+	}
 	pre := " "
 	if selected {
 		pre = "▌"
 	}
-	state := workerState(r)
-	fields := []string{pre, padVisual(clampVisual(m.renderer.Plain(t.workerName, 13), 13), 13)}
+	fields := []string{paintSeg(m.pal.tungsten, bg, true, pre), cell(m.renderer.Plain(t.workerName, 13), 13, nil)}
 	if width >= 120 && m.board.admin {
-		fields = append(fields, padVisual(clampVisual(m.renderer.Plain(t.workerOwner, 10), 10), 10))
+		fields = append(fields, cell(m.renderer.Plain(t.workerOwner, 7), 7, m.pal.faintC))
 	}
-	fields = append(fields, padVisual(workerStateGlyph(state)+" "+state, 10), padVisual(m.workerKind(r), 9), padVisual(workerSlots(r.w), 5))
+	state := workerState(r)
+	fields = append(fields, cell(workerStateGlyph(state)+" "+state, 10, m.workerStateColor(state)), cell(m.workerKind(r), 9, m.pal.faintC), cell(workerSlots(r.w), 4, nil))
 	if width >= 120 {
 		cpu, mem, disk := "?", "?", "?"
+		var cpuC, diskC color.Color
 		if r.w.StatsCPUPct != nil {
 			cpu = fmt.Sprintf("%.0f%%", *r.w.StatsCPUPct)
+			cpuC = m.workerUsageColor(*r.w.StatsCPUPct)
 		}
 		if r.w.StatsMemBytes != nil {
-			mem = fmt.Sprintf("%.1fG", float64(*r.w.StatsMemBytes)/(1<<30))
+			mem = humanBytes(*r.w.StatsMemBytes)
 		}
 		worst := -1.0
 		for _, d := range workerDisks(r.w) {
 			if d.pct > worst {
 				worst = d.pct
-				disk = fmt.Sprintf("%s %.0f%%", d.label, d.pct)
+				filled := min(4, max(0, int(d.pct*4/100)))
+				disk = padVisual(d.label, 8) + " " + strings.Repeat("█", filled) + strings.Repeat("░", 4-filled) + fmt.Sprintf(" %.0f%%", d.pct)
+				diskC = m.workerUsageColor(d.pct)
 			}
 		}
+		var memC color.Color
 		if state == "offline" {
 			cpu = "~" + cpu
 			mem = "~" + mem
-			disk = "~" + disk
-			cpu = m.pal.faint.Render(cpu)
-			mem = m.pal.faint.Render(mem)
-			disk = m.pal.faint.Render(disk)
+			disk = "~" + ansi.Strip(disk)
+			cpuC = m.pal.faintC
+			memC = m.pal.faintC
+			diskC = m.pal.faintC
 		}
-		ver := clampVisual(m.renderer.Plain(t.workerVersion, 8), 8)
+		ver, verC := m.renderer.Plain(t.workerVersion, 7), color.Color(nil)
 		switch r.w.UpgradeStatus {
 		case "outdated":
 			ver += "↑"
+			verC = m.pal.stall
 		case "upgrade_failed":
 			ver += "✕"
+			verC = m.pal.alarm
 		}
-		fields = append(fields, padVisual(cpu, 5), padVisual(mem, 6), padVisual(disk, 15), padVisual(ver, 9), padVisual(workerAge(r.w.LastHeartbeatAt, now), 4))
+		fields = append(fields, cell(cpu, 4, cpuC), cell(mem, 7, memC), cell(disk, 18, diskC), cell(ver, 8, verC), cell(workerAge(r.w.LastHeartbeatAt, now), 3, m.pal.faintC))
 	}
 	items := workerAttention(r, now)
-	att := "—"
+	att := paintSeg(m.pal.faintC, bg, false, "·")
 	if len(items) > 0 {
 		suffix := ""
 		if len(items) > 1 {
 			suffix = fmt.Sprintf(" +%d", len(items)-1)
 		}
 		budget := max(0, width-visualWidth(strings.Join(fields, " "))-1-visualWidth(suffix))
-		att = clampVisual(m.renderer.Plain(items[0].attnShort, budget), budget) + suffix
+		att = paintSeg(m.workerAttentionColor(items[0]), bg, false, m.renderer.Plain(items[0].attnShort, budget)) + paintSeg(m.pal.faintC, bg, false, suffix)
 	}
 	fields = append(fields, att)
-	return clampVisual(strings.Join(fields, " "), width)
+	line := clampVisual(strings.Join(fields, paintSeg(nil, bg, false, " ")), width)
+	return line + paintSeg(nil, bg, false, strings.Repeat(" ", max(0, width-visualWidth(line))))
 }
 func (m tuiModel) workerReadout(r workerRow, width int) []string {
 	t := workerTextOf(r)
@@ -660,7 +730,7 @@ func (m tuiModel) workerReadout(r workerRow, width int) []string {
 		lines = append(lines, clampVisual("owner "+m.renderer.Plain(t.workerOwner, width-6), width))
 	}
 	for _, item := range workerAttention(r, time.Now()) {
-		lines = append(lines, clampVisual(m.renderer.Plain(item.attnDetail, width), width))
+		lines = append(lines, clampVisual(paintSeg(m.workerAttentionColor(item), nil, false, m.renderer.Plain(item.attnDetail, width)), width))
 	}
 	return lines
 }
@@ -689,15 +759,17 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 	if m.workers.filter != "" || m.workers.filtering {
 		lines = append(lines, clampVisual("/"+cellText(m.workers.filter), width))
 	}
-	header := "  NAME          STATE      KIND      RUNS  ATTENTION"
-	if width >= 120 {
-		header = "  NAME          STATE      KIND      RUNS  CPU   MEM    DISK (worst)    VERSION   HB   ATTENTION"
-		if m.board.admin {
-			header = "  NAME          OWNER      STATE      KIND      RUNS  CPU   MEM    DISK (worst)    VERSION   HB   ATTENTION"
-		}
+	cols := []string{padVisual("NAME", 13)}
+	if width >= 120 && m.board.admin {
+		cols = append(cols, padVisual("OWNER", 7))
 	}
-	lines = append(lines, clampVisual(header, width))
-	lines = append(lines, clampVisual("disk ≥90%: fixed visual cue; dind/inodes display-only", width))
+	cols = append(cols, padVisual("STATE", 10), padVisual("KIND", 9), padVisual("RUNS", 4))
+	if width >= 120 {
+		cols = append(cols, padVisual("CPU", 4), padVisual("MEM", 7), padVisual("DISK (worst)", 18), padVisual("VERSION", 8), padVisual("HB", 3))
+	}
+	cols = append(cols, "ATTENTION")
+	header := "  " + strings.Join(cols, " ")
+	lines = append(lines, m.pal.faint.Render(clampVisual(header, width)))
 	rows := m.workers.visible(time.Now())
 	if m.workers.admin != m.board.admin {
 		rows = nil
@@ -707,7 +779,7 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 	if len(rows) > 0 {
 		readout = m.workerReadout(rows[cursor], width)
 	}
-	footer := "enter worker · j/k move · / filter · a scope · r refresh · ? keys · q quit"
+	footer := "enter/→ worker · j/k move · / filter · a scope · r refresh · ? keys · q quit"
 	reserve := 0
 	if full {
 		reserve = 1
