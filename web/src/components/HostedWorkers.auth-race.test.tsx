@@ -39,6 +39,16 @@ function AuthControls() {
     <button onClick={() => void refresh()}>probe</button>
     <button onClick={() => void logout()}>logout</button>
     <button onClick={() => void login("bob@example.com", "password")}>login</button>
+    <button onClick={async () => {
+      await login("bob@example.com", "password");
+      void refresh();
+      auth.updateUser(savedUser);
+    }}>batched login probe old save</button>
+    <button onClick={async () => {
+      await logout();
+      void refresh();
+      auth.updateUser(savedUser);
+    }}>batched logout probe old save</button>
   </>;
 }
 
@@ -61,6 +71,81 @@ async function mount() {
   expect(screen.getByTestId("identity").textContent).toBe("u1");
   return { responses, fetch, finishSave };
 }
+
+it.each(["login", "logout"] as const)(
+  "rejected old identity save after %s must not invalidate the new session probe",
+  async (action) => {
+    const { responses, fetch, finishSave } = await mount();
+    fireEvent.click(checkbox());
+    fireEvent.click(screen.getByText(action));
+    await act(async () => {
+      responses[1](new Response(action === "logout" ? "{}" : JSON.stringify({
+        ...session, user: { ...user, id: "u2", email: "bob@example.com" },
+      })));
+    });
+    fireEvent.click(screen.getByText("probe"));
+    expect(fetch).toHaveBeenCalledTimes(3);
+    const metadata = screen.getByTestId("auth-metadata").textContent;
+    await act(async () => { finishSave({ user: savedUser }); });
+    expect(screen.getByTestId("identity").textContent).toBe(action === "logout" ? "none" : "u2");
+    expect(screen.getByTestId("auth-metadata").textContent).toBe(metadata);
+    await act(async () => {
+      responses[2](new Response('{"error":"unauthorized"}', { status: 401 }));
+    });
+    expect(screen.getByTestId("identity").textContent).toBe("none");
+    expect(JSON.parse(screen.getByTestId("auth-metadata").textContent!).serverUnreachable).toBe(false);
+  },
+);
+
+it.each(["login", "logout"] as const)(
+  "a rejected save cannot invalidate a probe batched with %s",
+  async (action) => {
+    const { responses, fetch } = await mount();
+    fireEvent.click(screen.getByText(`batched ${action} probe old save`));
+    await act(async () => {
+      responses[1](new Response(action === "logout" ? "{}" : JSON.stringify({
+        ...session, user: { ...user, id: "u2", email: "bob@example.com" },
+      })));
+    });
+    expect(fetch).toHaveBeenCalledTimes(3);
+    await act(async () => {
+      responses[2](new Response(JSON.stringify({
+        ...session, user: { ...user, id: "u2", email: "bob@example.com" },
+        uzi_label: "current-probe",
+      })));
+    });
+    expect(screen.getByTestId("identity").textContent).toBe("u2");
+    expect(JSON.parse(screen.getByTestId("auth-metadata").textContent!).uziLabel).toBe("current-probe");
+    expect(checkbox().checked).toBe(false);
+  },
+);
+
+it.each([200, 503])(
+  "a rejected old identity save preserves the new session probe's %s result",
+  async (status) => {
+    const { responses, finishSave } = await mount();
+    fireEvent.click(checkbox());
+    fireEvent.click(screen.getByText("login"));
+    await act(async () => {
+      responses[1](new Response(JSON.stringify({
+        ...session, user: { ...user, id: "u2", email: "bob@example.com" },
+      })));
+    });
+    fireEvent.click(screen.getByText("probe"));
+    await act(async () => { finishSave({ user: savedUser }); });
+    await act(async () => {
+      responses[2](new Response(JSON.stringify(status === 200 ? {
+        ...session, user: { ...user, id: "u2", email: "bob@example.com" },
+        uzi_label: "current-probe",
+      } : { error: "unavailable" }), { status }));
+    });
+    expect(screen.getByTestId("identity").textContent).toBe("u2");
+    const metadata = JSON.parse(screen.getByTestId("auth-metadata").textContent!);
+    expect(metadata.serverUnreachable).toBe(status === 503);
+    expect(metadata.uziLabel).toBe(status === 200 ? "current-probe" : "ready");
+    expect(checkbox().checked).toBe(false);
+  },
+);
 
 afterEach(() => {
   cleanup();

@@ -120,6 +120,9 @@ const AuthContext = createContext<AuthState | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
+  // Track identity synchronously with every user write, including batched updates.
+  // A late settings save must be rejected before it invalidates a current probe.
+  const currentUserID = useRef<User["id"] | null>(null);
   const [loading, setLoading] = useState(true);
   const [uziLabel, setUziLabel] = useState(DEFAULT_UZI_LABEL);
   const [autopilotLabel, setAutopilotLabel] = useState(DEFAULT_AUTOPILOT_LABEL);
@@ -147,6 +150,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // the deprecated single-theme trio so the app still paints. applyAppearance
   // stamps data-theme/data-font and arms the live system-mode listener.
   const applySession = useCallback((session: SessionResponse) => {
+    currentUserID.current = session.user?.id ?? null;
     setUser(session.user);
     setServerUnreachable(false);
     setLoading(false);
@@ -177,10 +181,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const updateUser = useCallback((savedUser: User) => {
-    // Invalidate older probes before queuing the authoritative user update. Only
-    // the current identity may be reconciled: a late save cannot undo logout or
-    // replace a different user's session. Session metadata stays untouched.
+    // Only the current identity may invalidate older probes or be reconciled:
+    // a late save cannot undo logout or replace a different user's session.
+    // Session metadata stays untouched.
+    if (currentUserID.current !== savedUser.id) return;
     sessionGen.current += 1;
+    currentUserID.current = savedUser.id;
     setUser((current) => (current?.id === savedUser.id ? savedUser : current));
   }, []);
 
@@ -195,6 +201,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       } catch (err) {
         if (gen !== sessionGen.current) return;
         if (err instanceof ApiError && err.status === 401) {
+          currentUserID.current = null;
           setUser(null);
           setServerUnreachable(false);
         } else {
@@ -221,6 +228,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // Another request's 401: the session is gone. Invalidate any pending probe
       // so its later result cannot restore the user.
       sessionGen.current += 1;
+      currentUserID.current = null;
       setUser(null);
       setServerUnreachable(false);
       setLoading(false);
@@ -299,6 +307,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       await api.logout();
     } finally {
       sessionGen.current += 1;
+      currentUserID.current = null;
       setUser(null);
       setServerUnreachable(false);
       setLoading(false);
