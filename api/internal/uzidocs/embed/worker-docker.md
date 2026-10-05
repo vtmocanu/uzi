@@ -88,13 +88,59 @@ the attempt rather than risking one. Look for `dind-prune-completed`,
 `dind-prune-failed`, `dind-prune-insufficient`, or `dind-prune-deferred` in
 the worker's logs to see what it did.
 
-**What this never touches**: docker volumes, running or stopped containers,
-and the `/nix`/`/data` disk-pressure recycle (which only ever deletes and
-re-provisions those two, never `dind-data`; see
-[ADR-837](../adr/0837-worker-disk-lifecycle.md)). If the cache is still over
-the threshold after a prune (`dind-prune-insufficient`), there is currently
-no automatic recycle of `dind-data` — the gauge stays elevated and the only
-way to reclaim the volume is the manual fallback below.
+**Cache prune leaves containers and volumes in place.** It is tried first when
+eligible, but a skip, failure, timeout, or deferral because containers are
+running does not prevent the separate **DinD maintenance** path below.
+
+### DinD scratch and pressure recycle
+
+**Upgrade warning: automated DinD cleanup defaults on, including existing
+installs.** The daemon's containers, named and anonymous volumes, networks,
+images, and build cache are scratch, not durable storage. Sustained pressure
+can delete the entire `dind-data` PVC, including **named volumes**, and
+replacing the Deployment also loses the shared **run-workdir emptyDir**
+(`/data/runner`). Keep deliverables in git, published checkpoints, or captured
+work. There is no preservation inventory or migration. An admin can opt out
+before stop with `UZI_WORKER_DISK_RECYCLE_ENABLED=false`; an operation that
+has already started stopping completes safely even if disabled.
+
+For a persistent hosted Docker worker with the maintenance capability,
+bytes **or** inodes at the configured disk-pressure watermark across at
+least two distinct fresh meter epochs request a drain. Samples must be from
+the current registration and no older than 45s; a freshness gap resets the
+streak. Idle time and maximum age do not trigger cleanup.
+
+The pending drain refuses new run and chat claims but lets the worker's own
+parked runs resume and finish. Any run status other than `completed`,
+`failed`, or `cancelled` blocks cleanup: parked, paused, approval, input,
+and follow-up waits all count. DinD cleanup has no user nudge, timer, forced
+park, drain deadline, or force-roll override.
+
+Once the server atomically proves no nonterminal claims and fences all
+claims, the worker must also prove zero local activity and fresh
+post-activity custody clearance for the matching maintenance identity.
+Within that gate it may make one read-only Docker **server** API version
+check; at API 1.42 or newer it runs exactly `docker volume prune -f`.
+This removes unreferenced anonymous volumes, keeping named volumes and
+volumes referenced by any container, including stopped containers. A newer
+fresh sample below the watermark reopens admission without recycling.
+Skipped, failed, or insufficient pruning proceeds to recycle; leaked
+running containers do not block this gate once runs are terminal and
+custody is clear.
+
+Recycle foreground-deletes the Deployment by UID, observes it and its old
+pods gone (including Terminating pods), then deletes only `dind-data` by
+UID. It preserves `/nix`, `/data`, the worker UUID, and the join Secret.
+Admission stays fenced through PVC removal, replacement binding, pod
+readiness, and a fresh replacement registration heartbeat. Failed binding
+stays fenced, with no rollback. Cooldown uses the DinD PVC's own creation
+time. See [ADR-1759](../adr/1759-dind-data-metering-and-prune.md) for the
+maintenance boundaries and observation limits.
+
+Older workers remain report-only for DinD maintenance. Ephemeral hosted
+Docker workers report the meter and admin pending state but disable
+prune/recycle and use terminal teardown. Plain workers never enter DinD
+maintenance; compose keeps its manual cleanup path.
 
 **Manual fallback.** Delete the worker and reprovision it (the
 [Workers page](./hosted-workers.md), or `uzi worker rm <worker-id>` +

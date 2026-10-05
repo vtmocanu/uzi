@@ -200,7 +200,8 @@ Two things now self-heal without you deleting and re-provisioning by hand:
 
 - **A tools cache smaller than the current size** (provisioned before a size
   bump, like the one above) gets reconciled to the current size automatically:
-  only the `/nix` cache is recycled, and the `/data` workspace is preserved.
+  only the `/nix` cache PVC is recycled, and the `/data` PVC is preserved.
+  On Docker workers, Deployment replacement still loses run-workdir emptyDir.
 - **A volume that fills up** (at or above 90% used, sustained across a couple
   of heartbeats) gets recycled: the worker is drained first if it's busy —
   same cordon behavior as above — then **both** its volumes are deleted and
@@ -208,11 +209,40 @@ Two things now self-heal without you deleting and re-provisioning by hand:
   the `/data` workspace is permanently lost. A worker recycled this way shows
   the same draining/cordoned pills while it happens.
 
-Both are cluster-driven, like cordoning; there's no button for either. An
-admin can turn the self-heal off entirely via chart config if it's ever not
-wanted.
+A **persistent Docker-capable worker** also has a separate DinD-only
+pressure recycle. It preserves the `/nix` and `/data` PVCs, worker UUID,
+and join Secret, but **loses all DinD state, including named Docker volumes,
+and the shared run-workdir emptyDir** when the Deployment is replaced.
+Deliverables belong in git, published checkpoints, or captured work.
+**This destructive behavior defaults on for existing installs on upgrade.**
 
-This full-volume recycle is the **last resort**. Before a volume gets anywhere
+DinD maintenance waits for every run to finish (`completed`, `failed`, or
+`cancelled`); parked, paused, approval, input, and follow-up waits block
+cleanup. A pending drain refuses new run/chat work while letting this
+worker's own parked runs resume to finish. It then fences claims and
+requires fresh custody clearance and zero local activity before gated
+anonymous-volume pruning or stop. No timer, forced park, or force-roll
+override bypasses this DinD gate. The legacy `/nix`+ `/data` recycle and
+ordinary rolls retain their current drain-deadline/force override behavior.
+
+If legacy and DinD pressure coincide, the legacy recycle goes first; the
+pending DinD intent resumes on a later tick before another legacy recycle.
+The legacy cooldown does not delay DinD cleanup, whose cooldown reads its
+own PVC's creation time. Older workers are report-only; ephemeral Docker
+workers report metering/admin pending state but use terminal teardown
+instead of prune/recycle. See
+[Docker inside a worker](./worker-docker.md#dind-scratch-and-pressure-recycle).
+
+These are cluster-driven; there is no self-heal button. An admin can set
+`UZI_WORKER_DISK_RECYCLE_ENABLED=false` to opt out before DinD stop;
+an operation already stopping finishes safely. Upgrade the chart's Docker
+controller Role with the controller: replacement readiness requires
+`apps/replicasets` `list` in the Docker namespace only, with no Secret
+read permission. An observation limit or list failure leaves maintenance
+pending/fenced rather than granting cleanup; see
+[ADR-1759](../adr/1759-dind-data-metering-and-prune.md#d9--fresh-bounded-observation-and-replacement-readiness).
+
+The legacy nix/data full-volume recycle is the **last resort**. Before that data volume gets anywhere
 near it, a run's own build caches are bounded and reclaimed on their own —
 see [Worker disk safety](./worker-setup.md#worker-disk-safety-prd-1809) for
 the cache drop, in-run cache cap, periodic reclaim, admission stop, and the

@@ -989,6 +989,13 @@ tasks:
     cmds:
       - ./scripts/create-gitlab-bot.test.sh
 
+  test:dind-volume-prune:
+    desc: disposable DinD proof that anonymous prune keeps named and container-referenced volumes
+    cmds:
+      # Separate from component gates: starts one owned throwaway DinD daemon.
+      # All prune commands use its inner Unix socket; no host daemon prune.
+      - bash ./e2e/dind-recycle/run.sh
+
   test:e2e-reclaim:
     desc: behavioral test of the e2e leaked-project reclaim safety contract (fake docker, hermetic)
     cmds:

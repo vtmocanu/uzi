@@ -350,27 +350,45 @@ func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health 
 	return c
 }
 
-// checkFleetDisk warns when any worker (of any kind) with a fresh heartbeat has a debounced
-// disk-pressure streak of at least diskPressureStreakWarn consecutive polls. There is no
-// danger, unknown or na band for it (it reads live workers, no controller signal).
+// checkFleetDisk preserves the legacy disk-pressure count, adds fresh sustained DinD
+// pressure, and displays pending cleanup even when an operation has outlasted telemetry.
+// There is no danger, unknown or na band.
 func (s *Service) checkFleetDisk(now time.Time, workers []store.ListAllWorkersRow) apitypes.HealthCheckDTO {
 	c := s.base("fleet.disk")
-	var affected int
-	for _, w := range workers {
-		fresh := w.Worker.LastHeartbeatAt.Valid && now.Sub(w.Worker.LastHeartbeatAt.Time) <= s.heartbeatStale()
-		if fresh && w.Worker.StatsDiskPressureStreak >= diskPressureStreakWarn {
+	var affected, pending int
+	for _, row := range workers {
+		w := row.Worker
+		// Keep the legacy heartbeat/streak count unchanged, including its clock semantics.
+		fresh := w.LastHeartbeatAt.Valid && now.Sub(w.LastHeartbeatAt.Time) <= s.heartbeatStale()
+		dind := fresh && !w.LastHeartbeatAt.Time.After(now) && w.DindPressureStreak >= 2 &&
+			w.DindMeterAt.Valid && !w.DindMeterAt.Time.After(now) && now.Sub(w.DindMeterAt.Time) <= 45*time.Second
+		if (fresh && w.StatsDiskPressureStreak >= diskPressureStreakWarn) || dind {
 			affected++
 		}
+		cleanup := dind
+		if w.MaintenanceID.Valid {
+			switch w.MaintenancePhase {
+			case "requested", "ready", "stopping", "recycling":
+				cleanup = true
+			}
+		}
+		if cleanup {
+			pending++
+		}
 	}
-	if affected == 0 {
-		c.Severity = sevOK
-		c.Summary = "No worker is under sustained disk pressure."
-		return c
+	c.Severity = sevOK
+	c.Summary = "No worker is under sustained disk pressure."
+	if affected > 0 {
+		c.Severity = sevWarn
+		c.Summary = fmt.Sprintf("%d worker(s) are under sustained disk pressure.", affected)
+		c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Workers", Value: fmt.Sprintf("%d", affected)}}
+		c.Action = strPtr("Free disk on the affected worker(s) or increase the worker volume size.")
 	}
-	c.Severity = sevWarn
-	c.Summary = fmt.Sprintf("%d worker(s) are under sustained disk pressure.", affected)
-	c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Workers", Value: fmt.Sprintf("%d", affected)}}
-	c.Action = strPtr("Free disk on the affected worker(s) or increase the worker volume size.")
+	if pending > 0 {
+		c.Severity = sevWarn
+		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Cleanup pending", Value: fmt.Sprintf("%d worker(s)", pending)})
+		c.Action = strPtr("DinD cleanup pending can be report-only or waiting safely for active work and retained unpublished work to clear. An active operation can outlast fresh telemetry. Inspect uzi admin workers; wait for safe cleanup, or increase volume capacity.")
+	}
 	return c
 }
 

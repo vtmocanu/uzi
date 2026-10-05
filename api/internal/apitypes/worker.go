@@ -1,6 +1,9 @@
 package apitypes
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // WorkerDTO is the browser/CLI view of a worker.
 type WorkerDTO struct {
@@ -228,6 +231,19 @@ type WorkerDTO struct {
 type AdminWorkerDTO struct {
 	WorkerDTO
 	OwnerEmail string `json:"owner_email"`
+	// DiskPressureVolumes lists sustained fresh pressure in nix/data/dind order.
+	DiskPressureVolumes []string `json:"disk_pressure_volumes"`
+	// CleanupPending includes report-only DinD pressure and active maintenance safe waits.
+	CleanupPending bool `json:"cleanup_pending"`
+}
+
+// MarshalJSON keeps the admin-only pressure list an array even for a zero DTO.
+func (w AdminWorkerDTO) MarshalJSON() ([]byte, error) {
+	type wire AdminWorkerDTO
+	if w.DiskPressureVolumes == nil {
+		w.DiskPressureVolumes = []string{}
+	}
+	return json.Marshal(wire(w))
 }
 
 // WorkerRunDiskTop is how many of a worker's largest runs WorkerDTO.RunDisk carries.

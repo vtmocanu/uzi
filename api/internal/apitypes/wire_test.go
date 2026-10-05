@@ -924,7 +924,7 @@ func TestWorkerDTOTags(t *testing.T) {
 }
 
 func TestAdminWorkerDTOTags(t *testing.T) {
-	want := append(append([]string{}, workerDTOKeys...), "owner_email")
+	want := append(append([]string{}, workerDTOKeys...), "owner_email", "disk_pressure_volumes", "cleanup_pending")
 	assertTags(t, "AdminWorkerDTO", AdminWorkerDTO{}, want...)
 }
 

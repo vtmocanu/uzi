@@ -530,7 +530,7 @@ Tracked as GitLab issue vtmocanu/uzi#83; PRD at `prds/done/83-docker-capable-wor
 - Trust model: trust the USER who owns the worker, not the repo code the agent runs (prompt-injectable). Security compromises allowed to cut complexity; agent-facing defenses stay load-bearing. [user]
 - k8s is the first-class test/runtime environment (not the deferred track). [user]
 - k8s docker posture: a dedicated privileged-tier namespace running the rootless-DinD sidecar. [user, Q-B owner decision]
-- dind-data is metered and cache-pruned automatically under an exclusion gate; never volumes; never feeds the /nix+/data recycle. (AI-synced 2026-09-27)
+- DinD state (containers, named/anonymous volumes, networks, images, build cache) is scratch; deliverables use git/checkpoints/capture. Persistent hosted Docker workers use distinct fresh byte-or-inode pressure epochs and a terminal-only, atomic claim fence plus zero local activity/fresh matching custody clearance for optional anonymous-volume prune and DinD-only PVC recycle; parked/paused/approval/input/follow-up waits block cleanup while own parked resumes may finish during pending drain. Recycle preserves nix/data, UUID and join Secret but loses DinD state and run-workdir emptyDir; default-on upgrades require an explicit warning and pre-stop opt-out, no forced park/deadline override, no rollback. Legacy disk_pressure remains nix/data-only; ordinary legacy overrides and compose manual cleanup are unchanged. Supersedes the cache-only/never-volumes decision of 2026-09-27 per maintainer decision 2026-10-04; see ADR-1759 for the strict gate, freshness, lifecycle, capability and observation boundaries. (AI-synced 2026-10-05)
 
 ## Feature #95 — Run activity pane v2: crew roster, opt-in follow, steer-queue delivery
 

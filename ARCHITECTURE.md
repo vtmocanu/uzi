@@ -1857,9 +1857,10 @@ open (a CLI drain verb, live-cluster validation) are in
 
 ### Worker disk: observed on the heartbeat, self-healed by the controller (PRD #837)
 
-A worker now samples `/nix` and `/data` filesystem usage on the existing
-heartbeat and reports it display-only, alongside CPU/memory (PRD #49); no
-scheduling query reads it. The controller gained two new drift arms that both
+A worker samples `/nix` and `/data` filesystem usage on the existing
+heartbeat alongside CPU/memory (PRD #49). Gauges display the usage; derived
+pressure also drives lifecycle maintenance and worker-local disk admission/reclaim.
+The legacy controller has two drift arms that both
 resolve to the same delete-and-remint mechanism (a pod roll re-attaches the
 same PVC, so it cannot reclaim disk): one reconciles a worker whose `/nix` PVC
 is smaller than the current `preset.nixSize` constant, the other recycles
@@ -1870,6 +1871,20 @@ rationale — the await-gone gate that keeps a re-mint from racing a
 still-Terminating PVC, the default-ON decision over reviewer dissent, and the
 thrash-cooldown-as-capacity-signal — is in
 [adr/0837-worker-disk-lifecycle.md](adr/0837-worker-disk-lifecycle.md).
+
+Issue #1760 adds a separate DinD-only arm for sustained fresh byte or inode
+pressure. All non-terminal worker-owned runs, including parks and approval waits,
+block it. Requested maintenance drains new run/chat claims while owned runs may
+resume; only an atomic terminal-only claim fence, drained local activity and fresh
+custody clearance permit gated anonymous-volume prune and stop authorization.
+The controller observes the old Deployment and pods gone before deleting only
+`dind-data`, then publishes replacement readiness before reopening claims.
+DinD is scratch, including named volumes; replacing the Deployment also loses
+run-workdir. DinD never uses ForceRoll or the drain deadline. Simultaneous pressure
+runs legacy first, DinD on a later tick; standalone legacy overrides are unchanged.
+Admins see cleanup pending; ephemeral and unsupported workers report pressure only.
+See [ADR-1759](adr/1759-dind-data-metering-and-prune.md) for the safe gate,
+Docker-only ReplicaSet-list permission, bounded observations and upgrade policy.
 
 ### Admin in-app health (PRD #1484)
 
