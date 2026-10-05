@@ -3874,69 +3874,6 @@ func (q *Queries) ExtendAndResumeWallPark(ctx context.Context, arg ExtendAndResu
 	return budget_extension_seconds, err
 }
 
-const failAttestedFinalizeRunsOverCap = `-- name: FailAttestedFinalizeRunsOverCap :many
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE $1 END,
-    fail_origin = 'worker_lost',
-    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
-    milestones_in_progress = NULL,
-    milestones_agents = NULL,
-    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
-    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
-    health = 'ok', health_reason = NULL, health_since = NULL,
-    updated_at = now()
-WHERE runs.worker_id = $2
-  AND runs.claim_released_at IS NULL
-  AND runs.status = 'running'
-  AND runs.kind <> 'chat'
-  -- Positional pairing of the two parallel arrays (run ids are unique: Register validates the
-  -- list). array_position is NULL for an unlisted run, so the equality is then never true.
-  AND runs.id = ANY($3::uuid[])
-  AND runs.claim_generation = ($4::bigint[])[array_position($3::uuid[], runs.id)]
-  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
-                    AND a.terminal_pending_until > now()
-                    AND a.claim_generation = runs.claim_generation)
-  AND requeue_count >= $5
-  AND NOT ($5 > 0 AND finalize_resume_generation IS NULL)
-RETURNING id
-`
-
-type FailAttestedFinalizeRunsOverCapParams struct {
-	FailureReason    pgtype.Text `json:"failure_reason"`
-	WorkerID         pgtype.UUID `json:"worker_id"`
-	RunIds           []uuid.UUID `json:"run_ids"`
-	ClaimGenerations []int64     `json:"claim_generations"`
-	MaxRequeues      int32       `json:"max_requeues"`
-}
-
-// An attested run that is over budget and not eligible for the one-shot allowance (allowance
-// already used, or RUN_MAX_REQUEUES = 0) fails exactly as FailWorkerRunsOverCap fails it.
-func (q *Queries) FailAttestedFinalizeRunsOverCap(ctx context.Context, arg FailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, failAttestedFinalizeRunsOverCap,
-		arg.FailureReason,
-		arg.WorkerID,
-		arg.RunIds,
-		arg.ClaimGenerations,
-		arg.MaxRequeues,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []uuid.UUID{}
-	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		items = append(items, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const failClaimAssemblyExact = `-- name: FailClaimAssemblyExact :execrows
 UPDATE runs SET
     status = 'failed', status_since = now(), failure_reason = $1,
@@ -4102,239 +4039,6 @@ func (q *Queries) FailRunAutoStop(ctx context.Context, arg FailRunAutoStopParams
 		return 0, err
 	}
 	return result.RowsAffected(), nil
-}
-
-const failRunsMissingFromSnapshot = `-- name: FailRunsMissingFromSnapshot :many
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE $1 END,
-    fail_origin = 'worker_lost',
-    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
-    milestones_in_progress = NULL,
-    milestones_agents = NULL,
-    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
-    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
-    health = 'ok', health_reason = NULL, health_since = NULL,
-    updated_at = now()
-WHERE runs.worker_id = $2
-  AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
-  AND runs.status = 'running'
-  AND runs.claim_released_at IS NULL                        -- #1247 fence
-  AND runs.status_since < $3                   -- fence: stale window + one heartbeat interval, D4
-  AND runs.requeue_count >= $4
-  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job') AND runs.interactive = false
-    AND runs.completion_attempts = 0
-    AND runs.started_at < ($5::timestamptz
-      - make_interval(secs => COALESCE(runs.budget_wall_seconds, $6::int)
-                            + runs.budget_paused_seconds + runs.budget_extension_seconds
-                            + runs.budget_finalize_seconds)))
-  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
-                  WHERE a.worker_id = $2 AND a.run_id = runs.id
-                    AND a.claim_generation = runs.claim_generation)
-  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- D11 terminal-pending lease (worker-scoped, defense-in-depth)
-                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
-                    AND a.terminal_pending AND a.terminal_pending_until > now()
-                    AND a.claim_generation = runs.claim_generation)
-  AND NOT EXISTS (SELECT 1 FROM workers w                   -- D11 pending_overflow closure (worker-level, ESSENTIAL)
-                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
-RETURNING id, user_id, status
-`
-
-type FailRunsMissingFromSnapshotParams struct {
-	FailureReason        pgtype.Text        `json:"failure_reason"`
-	WorkerID             pgtype.UUID        `json:"worker_id"`
-	MissingCutoff        pgtype.Timestamptz `json:"missing_cutoff"`
-	MaxRequeues          int32              `json:"max_requeues"`
-	Now                  pgtype.Timestamptz `json:"now"`
-	GlobalTimeoutSeconds int32              `json:"global_timeout_seconds"`
-}
-
-type FailRunsMissingFromSnapshotRow struct {
-	ID     uuid.UUID `json:"id"`
-	UserID uuid.UUID `json:"user_id"`
-	Status string    `json:"status"`
-}
-
-// PRD #1390 M2b (SC2, over cap): a run-lane `running` run this worker OWNS but no longer lists (its
-// execution is lost) — past the fence, and out of re-queue budget — is FAILED (fail-first with the
-// requeue twin below). Its SET list mirrors FailRunsOfStaleWorkersOverCap (fail_origin='worker_lost',
-// the pause/switch/milestone clears, health reset, move_pending_since for the reconcile origin
-// restore). Held states are never targeted (status = 'running' only). Chat is a target restriction
-// (kind <> 'chat', D10) — these writers only ever touch run-lane runs. @missing_cutoff is the stale
-// window plus one heartbeat interval (D4); @max_requeues is RUN_MAX_REQUEUES.
-func (q *Queries) FailRunsMissingFromSnapshot(ctx context.Context, arg FailRunsMissingFromSnapshotParams) ([]FailRunsMissingFromSnapshotRow, error) {
-	rows, err := q.db.Query(ctx, failRunsMissingFromSnapshot,
-		arg.FailureReason,
-		arg.WorkerID,
-		arg.MissingCutoff,
-		arg.MaxRequeues,
-		arg.Now,
-		arg.GlobalTimeoutSeconds,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []FailRunsMissingFromSnapshotRow{}
-	for rows.Next() {
-		var i FailRunsMissingFromSnapshotRow
-		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const failRunsOfStaleWorkersOverCap = `-- name: FailRunsOfStaleWorkersOverCap :many
-WITH locked AS (
-    SELECT workers.id FROM workers
-    WHERE workers.last_heartbeat_at IS NULL OR workers.last_heartbeat_at < $3
-    ORDER BY workers.id
-    FOR UPDATE
-)
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE $1 END,
-    -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
-    fail_origin = 'worker_lost',
-    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
-    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
-    milestones_in_progress = NULL,
-    milestones_agents = NULL,
-    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
-    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
-    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
-    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
-    health = 'ok', health_reason = NULL, health_since = NULL,
-    updated_at = now()
-WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND requeue_count >= $2
-  AND worker_id IN (SELECT id FROM locked)
-  -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
-  AND (runs.kind = 'chat'
-       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
-                         AND a.terminal_pending_until > now()
-                         AND a.claim_generation = runs.claim_generation)
-           AND NOT EXISTS (SELECT 1 FROM workers w
-                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-RETURNING id, user_id, status
-`
-
-type FailRunsOfStaleWorkersOverCapParams struct {
-	FailureReason pgtype.Text        `json:"failure_reason"`
-	MaxRequeues   int32              `json:"max_requeues"`
-	FailCutoff    pgtype.Timestamptz `json:"fail_cutoff"`
-}
-
-type FailRunsOfStaleWorkersOverCapRow struct {
-	ID     uuid.UUID `json:"id"`
-	UserID uuid.UUID `json:"user_id"`
-	Status string    `json:"status"`
-}
-
-// A stale worker's non-terminal run that has already used its re-queue budget →
-// failed instead of re-queued. Stamps move_pending_since (reconcile restores the
-// origin column; the sweep itself never touches the forge — worker-loss recovery
-// must not wait on a down forge).
-//
-// PRD #1390 M1 (D9): the FAIL path requires TWO consecutive stale windows —
-// @fail_cutoff = now() - 2*WORKER_HEARTBEAT_STALE (the Go caller computes it) — so a run
-// that was requeued once and then hits a partition just over one window is not terminated
-// before a heartbeat can re-adopt it; terminal cannot be undone. The stale workers are
-// locked FIRST in a `locked` CTE that takes each worker row FOR UPDATE ordered by id (the
-// canonical lock order), so this statement serialises with HeartbeatWorker and re-checks
-// staleness after a concurrent heartbeat commits — the race where a heartbeat lands between
-// the staleness read and the terminal write is closed.
-//
-// PRD #1390 M1 (D11): a run under an unexpired terminal-pending lease for its CURRENT
-// generation is NOT failed (an outcome is journaled on the worker, #1391), and neither is
-// any run owned by a worker flagged pending_overflow (the worker-level closure for outcomes
-// it could not list). Chat is exempt from the lease/overflow PROTECTION (D10) — it is still
-// failed as before — so the guard is `kind = 'chat' OR NOT EXISTS(...)`, never a top-level
-// kind <> 'chat'. The lease/overflow expiries (one clock) are the dead-worker backstop.
-func (q *Queries) FailRunsOfStaleWorkersOverCap(ctx context.Context, arg FailRunsOfStaleWorkersOverCapParams) ([]FailRunsOfStaleWorkersOverCapRow, error) {
-	rows, err := q.db.Query(ctx, failRunsOfStaleWorkersOverCap, arg.FailureReason, arg.MaxRequeues, arg.FailCutoff)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []FailRunsOfStaleWorkersOverCapRow{}
-	for rows.Next() {
-		var i FailRunsOfStaleWorkersOverCapRow
-		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const failWorkerRunsOverCap = `-- name: FailWorkerRunsOverCap :many
-
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE $1 END,
-    -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
-    fail_origin = 'worker_lost',
-    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
-    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
-    milestones_in_progress = NULL,
-    milestones_agents = NULL,
-    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
-    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
-    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
-    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
-    health = 'ok', health_reason = NULL, health_since = NULL,
-    updated_at = now()
-WHERE runs.worker_id = $2
-  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND requeue_count >= $3
-  -- PRD #1390 D11: register's orphan fail honours the terminal-pending lease + pending_overflow
-  -- closure exactly as the stale-worker passes do (chat-exempt, D10) — a fresh worker process
-  -- must not fail its own run whose outcome is journaled and about to be replayed (#1391).
-  AND (runs.kind = 'chat'
-       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
-                         AND a.terminal_pending_until > now()
-                         AND a.claim_generation = runs.claim_generation)
-           AND NOT EXISTS (SELECT 1 FROM workers w
-                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-RETURNING id
-`
-
-type FailWorkerRunsOverCapParams struct {
-	FailureReason pgtype.Text `json:"failure_reason"`
-	WorkerID      pgtype.UUID `json:"worker_id"`
-	MaxRequeues   int32       `json:"max_requeues"`
-}
-
-// Register-time orphan recovery (worker-scoped) ------------------------------
-// On register a worker declares a fresh start, so any run it still holds is
-// orphaned (its execution is gone). Over its re-queue budget → failed. failed →
-// origin restore, applied by the reconcile loop (register does no forge I/O), so
-// it stamps move_pending_since. RETURNING id so the caller can funnel these
-// committed-terminal (worker-lost) runs into the judge (PRD #46 Decision 2), exactly
-// as the sweeper's FailRunsOfStaleWorkersOverCap does.
-func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, failWorkerRunsOverCap, arg.FailureReason, arg.WorkerID, arg.MaxRequeues)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []uuid.UUID{}
-	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		items = append(items, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
 }
 
 const getActiveMRReworkRunForMR = `-- name: GetActiveMRReworkRunForMR :one
@@ -10287,6 +9991,217 @@ func (q *Queries) LockCodexAccountWaitRunForUpdate(ctx context.Context, id uuid.
 		&i.FirstStartedAt,
 	)
 	return i, err
+}
+
+const lockFailAttestedFinalizeRunsOverCap = `-- name: LockFailAttestedFinalizeRunsOverCap :many
+SELECT runs.id FROM runs
+WHERE runs.worker_id = $1
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind <> 'chat'
+  -- Positional pairing of the two parallel arrays (run ids are unique: Register validates the
+  -- list). array_position is NULL for an unlisted run, so the equality is then never true.
+  AND runs.id = ANY($2::uuid[])
+  AND runs.claim_generation = ($3::bigint[])[array_position($2::uuid[], runs.id)]
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                    AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND runs.requeue_count >= $4
+  AND NOT ($4 > 0 AND runs.finalize_resume_generation IS NULL)
+ORDER BY runs.id
+FOR UPDATE OF runs
+`
+
+type LockFailAttestedFinalizeRunsOverCapParams struct {
+	WorkerID         pgtype.UUID `json:"worker_id"`
+	RunIds           []uuid.UUID `json:"run_ids"`
+	ClaimGenerations []int64     `json:"claim_generations"`
+	MaxRequeues      int32       `json:"max_requeues"`
+}
+
+// Acquire run locks before the failure writer takes its hold-annotation snapshot.
+func (q *Queries) LockFailAttestedFinalizeRunsOverCap(ctx context.Context, arg LockFailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockFailAttestedFinalizeRunsOverCap,
+		arg.WorkerID,
+		arg.RunIds,
+		arg.ClaimGenerations,
+		arg.MaxRequeues,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockFailRunsMissingFromSnapshot = `-- name: LockFailRunsMissingFromSnapshot :many
+SELECT runs.id FROM runs
+WHERE runs.worker_id = $1
+  AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL                        -- #1247 fence
+  AND runs.status_since < $2                   -- fence: stale window + one heartbeat interval, D4
+  AND runs.requeue_count >= $3
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < ($4::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, $5::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds)))
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
+                  WHERE a.worker_id = $1 AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- D11 terminal-pending lease (worker-scoped, defense-in-depth)
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w                   -- D11 pending_overflow closure (worker-level, ESSENTIAL)
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+ORDER BY runs.id
+FOR UPDATE OF runs
+`
+
+type LockFailRunsMissingFromSnapshotParams struct {
+	WorkerID             pgtype.UUID        `json:"worker_id"`
+	MissingCutoff        pgtype.Timestamptz `json:"missing_cutoff"`
+	MaxRequeues          int32              `json:"max_requeues"`
+	Now                  pgtype.Timestamptz `json:"now"`
+	GlobalTimeoutSeconds int32              `json:"global_timeout_seconds"`
+}
+
+// Acquire run locks before the failure writer takes its hold-annotation snapshot.
+func (q *Queries) LockFailRunsMissingFromSnapshot(ctx context.Context, arg LockFailRunsMissingFromSnapshotParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockFailRunsMissingFromSnapshot,
+		arg.WorkerID,
+		arg.MissingCutoff,
+		arg.MaxRequeues,
+		arg.Now,
+		arg.GlobalTimeoutSeconds,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockFailRunsOfStaleWorkersOverCap = `-- name: LockFailRunsOfStaleWorkersOverCap :many
+WITH locked AS (
+    SELECT workers.id FROM workers
+    WHERE workers.last_heartbeat_at IS NULL OR workers.last_heartbeat_at < $2
+    ORDER BY workers.id
+    FOR UPDATE
+)
+SELECT runs.id FROM runs
+WHERE runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.requeue_count >= $1
+  AND runs.worker_id IN (SELECT id FROM locked)
+  -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+ORDER BY runs.id
+FOR UPDATE OF runs
+`
+
+type LockFailRunsOfStaleWorkersOverCapParams struct {
+	MaxRequeues int32              `json:"max_requeues"`
+	FailCutoff  pgtype.Timestamptz `json:"fail_cutoff"`
+}
+
+// Acquire run locks before the failure writer takes its hold-annotation snapshot.
+func (q *Queries) LockFailRunsOfStaleWorkersOverCap(ctx context.Context, arg LockFailRunsOfStaleWorkersOverCapParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockFailRunsOfStaleWorkersOverCap, arg.MaxRequeues, arg.FailCutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockFailWorkerRunsOverCap = `-- name: LockFailWorkerRunsOverCap :many
+
+SELECT runs.id FROM runs
+WHERE runs.worker_id = $1
+  AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.requeue_count >= $2
+  -- PRD #1390 D11: register's orphan fail honours the terminal-pending lease + pending_overflow
+  -- closure exactly as the stale-worker passes do (chat-exempt, D10) — a fresh worker process
+  -- must not fail its own run whose outcome is journaled and about to be replayed (#1391).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+ORDER BY runs.id
+FOR UPDATE OF runs
+`
+
+type LockFailWorkerRunsOverCapParams struct {
+	WorkerID    pgtype.UUID `json:"worker_id"`
+	MaxRequeues int32       `json:"max_requeues"`
+}
+
+// Register-time orphan recovery (worker-scoped) ------------------------------
+// Acquire run locks before the failure writer takes its hold-annotation snapshot.
+func (q *Queries) LockFailWorkerRunsOverCap(ctx context.Context, arg LockFailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockFailWorkerRunsOverCap, arg.WorkerID, arg.MaxRequeues)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const lockOpenCustodyHoldsForRunWorkerGeneration = `-- name: LockOpenCustodyHoldsForRunWorkerGeneration :many
@@ -17161,4 +17076,316 @@ func (q *Queries) UpsertWorkerActiveRun(ctx context.Context, arg UpsertWorkerAct
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const failAttestedFinalizeRunsOverCapLocked = `-- name: failAttestedFinalizeRunsOverCapLocked :many
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE $1 END,
+    fail_origin = 'worker_lost',
+    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.worker_id = $2
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind <> 'chat'
+  -- Positional pairing of the two parallel arrays (run ids are unique: Register validates the
+  -- list). array_position is NULL for an unlisted run, so the equality is then never true.
+  AND runs.id = ANY($3::uuid[])
+  AND runs.claim_generation = ($4::bigint[])[array_position($3::uuid[], runs.id)]
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                    AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND requeue_count >= $5
+  AND NOT ($5 > 0 AND finalize_resume_generation IS NULL)
+  AND runs.id = ANY($6::uuid[])
+RETURNING id
+`
+
+type failAttestedFinalizeRunsOverCapLockedParams struct {
+	FailureReason    pgtype.Text `json:"failure_reason"`
+	WorkerID         pgtype.UUID `json:"worker_id"`
+	RunIds           []uuid.UUID `json:"run_ids"`
+	ClaimGenerations []int64     `json:"claim_generations"`
+	MaxRequeues      int32       `json:"max_requeues"`
+	LockedRunIds     []uuid.UUID `json:"locked_run_ids"`
+}
+
+// An attested run that is over budget and not eligible for the one-shot allowance (allowance
+// already used, or RUN_MAX_REQUEUES = 0) fails exactly as FailWorkerRunsOverCap fails it.
+func (q *Queries) failAttestedFinalizeRunsOverCapLocked(ctx context.Context, arg failAttestedFinalizeRunsOverCapLockedParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, failAttestedFinalizeRunsOverCapLocked,
+		arg.FailureReason,
+		arg.WorkerID,
+		arg.RunIds,
+		arg.ClaimGenerations,
+		arg.MaxRequeues,
+		arg.LockedRunIds,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const failRunsMissingFromSnapshotLocked = `-- name: failRunsMissingFromSnapshotLocked :many
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE $1 END,
+    fail_origin = 'worker_lost',
+    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.worker_id = $2
+  AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL                        -- #1247 fence
+  AND runs.status_since < $3                   -- fence: stale window + one heartbeat interval, D4
+  AND runs.requeue_count >= $4
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < ($5::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, $6::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds)))
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
+                  WHERE a.worker_id = $2 AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- D11 terminal-pending lease (worker-scoped, defense-in-depth)
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w                   -- D11 pending_overflow closure (worker-level, ESSENTIAL)
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+  AND runs.id = ANY($7::uuid[])
+RETURNING id, user_id, status
+`
+
+type failRunsMissingFromSnapshotLockedParams struct {
+	FailureReason        pgtype.Text        `json:"failure_reason"`
+	WorkerID             pgtype.UUID        `json:"worker_id"`
+	MissingCutoff        pgtype.Timestamptz `json:"missing_cutoff"`
+	MaxRequeues          int32              `json:"max_requeues"`
+	Now                  pgtype.Timestamptz `json:"now"`
+	GlobalTimeoutSeconds int32              `json:"global_timeout_seconds"`
+	LockedRunIds         []uuid.UUID        `json:"locked_run_ids"`
+}
+
+type failRunsMissingFromSnapshotLockedRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
+// PRD #1390 M2b (SC2, over cap): a run-lane `running` run this worker OWNS but no longer lists (its
+// execution is lost) — past the fence, and out of re-queue budget — is FAILED (fail-first with the
+// requeue twin below). Its SET list mirrors FailRunsOfStaleWorkersOverCap (fail_origin='worker_lost',
+// the pause/switch/milestone clears, health reset, move_pending_since for the reconcile origin
+// restore). Held states are never targeted (status = 'running' only). Chat is a target restriction
+// (kind <> 'chat', D10) — these writers only ever touch run-lane runs. @missing_cutoff is the stale
+// window plus one heartbeat interval (D4); @max_requeues is RUN_MAX_REQUEUES.
+func (q *Queries) failRunsMissingFromSnapshotLocked(ctx context.Context, arg failRunsMissingFromSnapshotLockedParams) ([]failRunsMissingFromSnapshotLockedRow, error) {
+	rows, err := q.db.Query(ctx, failRunsMissingFromSnapshotLocked,
+		arg.FailureReason,
+		arg.WorkerID,
+		arg.MissingCutoff,
+		arg.MaxRequeues,
+		arg.Now,
+		arg.GlobalTimeoutSeconds,
+		arg.LockedRunIds,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []failRunsMissingFromSnapshotLockedRow{}
+	for rows.Next() {
+		var i failRunsMissingFromSnapshotLockedRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const failRunsOfStaleWorkersOverCapLocked = `-- name: failRunsOfStaleWorkersOverCapLocked :many
+WITH locked AS (
+    SELECT workers.id FROM workers
+    WHERE workers.last_heartbeat_at IS NULL OR workers.last_heartbeat_at < $4
+)
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE $1 END,
+    -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
+    fail_origin = 'worker_lost',
+    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND requeue_count >= $2
+  AND worker_id IN (SELECT id FROM locked)
+  -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+  AND runs.id = ANY($3::uuid[])
+RETURNING id, user_id, status
+`
+
+type failRunsOfStaleWorkersOverCapLockedParams struct {
+	FailureReason pgtype.Text        `json:"failure_reason"`
+	MaxRequeues   int32              `json:"max_requeues"`
+	LockedRunIds  []uuid.UUID        `json:"locked_run_ids"`
+	FailCutoff    pgtype.Timestamptz `json:"fail_cutoff"`
+}
+
+type failRunsOfStaleWorkersOverCapLockedRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
+// A stale worker's non-terminal run that has already used its re-queue budget →
+// failed instead of re-queued. Stamps move_pending_since (reconcile restores the
+// origin column; the sweep itself never touches the forge — worker-loss recovery
+// must not wait on a down forge).
+//
+// PRD #1390 M1 (D9): the FAIL path requires TWO consecutive stale windows —
+// @fail_cutoff = now() - 2*WORKER_HEARTBEAT_STALE (the Go caller computes it) — so a run
+// that was requeued once and then hits a partition just over one window is not terminated
+// before a heartbeat can re-adopt it; terminal cannot be undone. The stale workers are
+// locked FIRST by LockFailRunsOfStaleWorkersOverCap, ordered by id (the canonical
+// lock order), before run locks. This writer rechecks with a fresh snapshot after
+// staleness after a concurrent heartbeat commits — the race where a heartbeat lands between
+// the staleness read and the terminal write is closed.
+//
+// PRD #1390 M1 (D11): a run under an unexpired terminal-pending lease for its CURRENT
+// generation is NOT failed (an outcome is journaled on the worker, #1391), and neither is
+// any run owned by a worker flagged pending_overflow (the worker-level closure for outcomes
+// it could not list). Chat is exempt from the lease/overflow PROTECTION (D10) — it is still
+// failed as before — so the guard is `kind = 'chat' OR NOT EXISTS(...)`, never a top-level
+// kind <> 'chat'. The lease/overflow expiries (one clock) are the dead-worker backstop.
+func (q *Queries) failRunsOfStaleWorkersOverCapLocked(ctx context.Context, arg failRunsOfStaleWorkersOverCapLockedParams) ([]failRunsOfStaleWorkersOverCapLockedRow, error) {
+	rows, err := q.db.Query(ctx, failRunsOfStaleWorkersOverCapLocked,
+		arg.FailureReason,
+		arg.MaxRequeues,
+		arg.LockedRunIds,
+		arg.FailCutoff,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []failRunsOfStaleWorkersOverCapLockedRow{}
+	for rows.Next() {
+		var i failRunsOfStaleWorkersOverCapLockedRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const failWorkerRunsOverCapLocked = `-- name: failWorkerRunsOverCapLocked :many
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE $1 END,
+    -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
+    fail_origin = 'worker_lost',
+    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.worker_id = $2
+  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND requeue_count >= $3
+  -- PRD #1390 D11: register's orphan fail honours the terminal-pending lease + pending_overflow
+  -- closure exactly as the stale-worker passes do (chat-exempt, D10) — a fresh worker process
+  -- must not fail its own run whose outcome is journaled and about to be replayed (#1391).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+  AND runs.id = ANY($4::uuid[])
+RETURNING id
+`
+
+type failWorkerRunsOverCapLockedParams struct {
+	FailureReason pgtype.Text `json:"failure_reason"`
+	WorkerID      pgtype.UUID `json:"worker_id"`
+	MaxRequeues   int32       `json:"max_requeues"`
+	LockedRunIds  []uuid.UUID `json:"locked_run_ids"`
+}
+
+// On register a worker declares a fresh start, so any run it still holds is
+// orphaned (its execution is gone). Over its re-queue budget → failed. failed →
+// origin restore, applied by the reconcile loop (register does no forge I/O), so
+// it stamps move_pending_since. RETURNING id so the caller can funnel these
+// committed-terminal (worker-lost) runs into the judge (PRD #46 Decision 2), exactly
+// as the sweeper's FailRunsOfStaleWorkersOverCap does.
+func (q *Queries) failWorkerRunsOverCapLocked(ctx context.Context, arg failWorkerRunsOverCapLockedParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, failWorkerRunsOverCapLocked,
+		arg.FailureReason,
+		arg.WorkerID,
+		arg.MaxRequeues,
+		arg.LockedRunIds,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

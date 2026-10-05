@@ -4591,7 +4591,30 @@ WHERE status = 'running'
 -- since-consumed ACK. Owner scoping is enforced by the caller (GetRun read) before this runs.
 UPDATE runs SET completion_budget_exhausted_at = NULL, updated_at = now() WHERE id = @id;
 
--- name: FailRunsOfStaleWorkersOverCap :many
+-- name: LockFailRunsOfStaleWorkersOverCap :many
+-- Acquire run locks before the failure writer takes its hold-annotation snapshot.
+WITH locked AS (
+    SELECT workers.id FROM workers
+    WHERE workers.last_heartbeat_at IS NULL OR workers.last_heartbeat_at < @fail_cutoff
+    ORDER BY workers.id
+    FOR UPDATE
+)
+SELECT runs.id FROM runs
+WHERE runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.requeue_count >= @max_requeues
+  AND runs.worker_id IN (SELECT id FROM locked)
+  -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+ORDER BY runs.id
+FOR UPDATE OF runs;
+
+-- name: failRunsOfStaleWorkersOverCapLocked :many
 -- A stale worker's non-terminal run that has already used its re-queue budget →
 -- failed instead of re-queued. Stamps move_pending_since (reconcile restores the
 -- origin column; the sweep itself never touches the forge — worker-loss recovery
@@ -4601,8 +4624,8 @@ UPDATE runs SET completion_budget_exhausted_at = NULL, updated_at = now() WHERE 
 -- @fail_cutoff = now() - 2*WORKER_HEARTBEAT_STALE (the Go caller computes it) — so a run
 -- that was requeued once and then hits a partition just over one window is not terminated
 -- before a heartbeat can re-adopt it; terminal cannot be undone. The stale workers are
--- locked FIRST in a `locked` CTE that takes each worker row FOR UPDATE ordered by id (the
--- canonical lock order), so this statement serialises with HeartbeatWorker and re-checks
+-- locked FIRST by LockFailRunsOfStaleWorkersOverCap, ordered by id (the canonical
+-- lock order), before run locks. This writer rechecks with a fresh snapshot after
 -- staleness after a concurrent heartbeat commits — the race where a heartbeat lands between
 -- the staleness read and the terminal write is closed.
 --
@@ -4615,8 +4638,6 @@ UPDATE runs SET completion_budget_exhausted_at = NULL, updated_at = now() WHERE 
 WITH locked AS (
     SELECT workers.id FROM workers
     WHERE workers.last_heartbeat_at IS NULL OR workers.last_heartbeat_at < @fail_cutoff
-    ORDER BY workers.id
-    FOR UPDATE
 )
 UPDATE runs SET status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE @failure_reason END,
     -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
@@ -4642,6 +4663,7 @@ WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'a
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+  AND runs.id = ANY(@locked_run_ids::uuid[])
 RETURNING id, user_id, status;
 
 -- name: RequeueRunsOfStaleWorkers :many
@@ -4694,7 +4716,26 @@ RETURNING id, user_id, status;
 
 -- Register-time orphan recovery (worker-scoped) ------------------------------
 
--- name: FailWorkerRunsOverCap :many
+-- name: LockFailWorkerRunsOverCap :many
+-- Acquire run locks before the failure writer takes its hold-annotation snapshot.
+SELECT runs.id FROM runs
+WHERE runs.worker_id = @worker_id
+  AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.requeue_count >= @max_requeues
+  -- PRD #1390 D11: register's orphan fail honours the terminal-pending lease + pending_overflow
+  -- closure exactly as the stale-worker passes do (chat-exempt, D10) — a fresh worker process
+  -- must not fail its own run whose outcome is journaled and about to be replayed (#1391).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+ORDER BY runs.id
+FOR UPDATE OF runs;
+
+-- name: failWorkerRunsOverCapLocked :many
 -- On register a worker declares a fresh start, so any run it still holds is
 -- orphaned (its execution is gone). Over its re-queue budget → failed. failed →
 -- origin restore, applied by the reconcile loop (register does no forge I/O), so
@@ -4727,6 +4768,7 @@ WHERE runs.worker_id = @worker_id
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+  AND runs.id = ANY(@locked_run_ids::uuid[])
 RETURNING id;
 
 -- Attested finalize-resume passes (issue #1742) -----------------------------
@@ -4774,7 +4816,27 @@ WHERE runs.worker_id = @worker_id
        OR (requeue_count >= @max_requeues AND @max_requeues > 0 AND finalize_resume_generation IS NULL))
 RETURNING id, (finalize_resume_generation IS NOT NULL AND finalize_resume_generation = claim_generation)::boolean AS allowance_used;
 
--- name: FailAttestedFinalizeRunsOverCap :many
+-- name: LockFailAttestedFinalizeRunsOverCap :many
+-- Acquire run locks before the failure writer takes its hold-annotation snapshot.
+SELECT runs.id FROM runs
+WHERE runs.worker_id = @worker_id
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind <> 'chat'
+  -- Positional pairing of the two parallel arrays (run ids are unique: Register validates the
+  -- list). array_position is NULL for an unlisted run, so the equality is then never true.
+  AND runs.id = ANY(@run_ids::uuid[])
+  AND runs.claim_generation = (@claim_generations::bigint[])[array_position(@run_ids::uuid[], runs.id)]
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                    AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND runs.requeue_count >= @max_requeues
+  AND NOT (@max_requeues > 0 AND runs.finalize_resume_generation IS NULL)
+ORDER BY runs.id
+FOR UPDATE OF runs;
+
+-- name: failAttestedFinalizeRunsOverCapLocked :many
 -- An attested run that is over budget and not eligible for the one-shot allowance (allowance
 -- already used, or RUN_MAX_REQUEUES = 0) fails exactly as FailWorkerRunsOverCap fails it.
 UPDATE runs SET status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE @failure_reason END,
@@ -4800,6 +4862,7 @@ WHERE runs.worker_id = @worker_id
                     AND a.claim_generation = runs.claim_generation)
   AND requeue_count >= @max_requeues
   AND NOT (@max_requeues > 0 AND finalize_resume_generation IS NULL)
+  AND runs.id = ANY(@locked_run_ids::uuid[])
 RETURNING id;
 
 -- name: RequeueWorkerRuns :many
@@ -4973,7 +5036,34 @@ WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = fals
   AND r.claim_released_at IS NULL
 RETURNING r.id, r.user_id, r.status;
 
--- name: FailRunsMissingFromSnapshot :many
+-- name: LockFailRunsMissingFromSnapshot :many
+-- Acquire run locks before the failure writer takes its hold-annotation snapshot.
+SELECT runs.id FROM runs
+WHERE runs.worker_id = @worker_id
+  AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL                        -- #1247 fence
+  AND runs.status_since < @missing_cutoff                   -- fence: stale window + one heartbeat interval, D4
+  AND runs.requeue_count >= @max_requeues
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < (sqlc.arg('now')::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds)))
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
+                  WHERE a.worker_id = @worker_id AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- D11 terminal-pending lease (worker-scoped, defense-in-depth)
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w                   -- D11 pending_overflow closure (worker-level, ESSENTIAL)
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+ORDER BY runs.id
+FOR UPDATE OF runs;
+
+-- name: failRunsMissingFromSnapshotLocked :many
 -- PRD #1390 M2b (SC2, over cap): a run-lane `running` run this worker OWNS but no longer lists (its
 -- execution is lost) — past the fence, and out of re-queue budget — is FAILED (fail-first with the
 -- requeue twin below). Its SET list mirrors FailRunsOfStaleWorkersOverCap (fail_origin='worker_lost',
@@ -5011,6 +5101,7 @@ WHERE runs.worker_id = @worker_id
                     AND a.claim_generation = runs.claim_generation)
   AND NOT EXISTS (SELECT 1 FROM workers w                   -- D11 pending_overflow closure (worker-level, ESSENTIAL)
                   WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+  AND runs.id = ANY(@locked_run_ids::uuid[])
 RETURNING id, user_id, status;
 
 -- name: RequeueRunsMissingFromSnapshot :many
