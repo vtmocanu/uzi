@@ -250,18 +250,22 @@ func (m tuiModel) openLinkedRun(runID *string, from tuiView) (tea.Model, tea.Cmd
 	// Close the prior run's live stream before reassigning m.detail: reached via detail→m (PR
 	// view)→u, m.detail still holds the run we drilled into (its stream live), so overwriting it
 	// without a Close would orphan that SSE connection for the session. Mirrors exitToBoard.
-	if m.detail.stream != nil {
-		m.detail.stream.Close()
-	}
+	m.beginRunSession(*runID, from)
+	return m, tea.Batch(m.loadRunCmd(*runID), m.loadTailCmd(*runID), m.openStreamCmd(*runID))
+}
+
+// beginRunSession is shared by linked runs and worker preflight entry. The caller
+// supplies either a normal loadRunCmd or its already fetched detailRunMsg DTO.
+func (m *tuiModel) beginRunSession(runID string, from tuiView) {
+	m.clearRunSession()
 	if m.splitDrawn() {
 		m.fromSplit = true
 	}
 	m.view = viewDetail
-	m.detail = newDetailState(*runID)
+	m.detail = newDetailState(runID)
 	m.detailGen++
 	m.detail.gen = m.detailGen
 	m.detailReturn = from
-	return m, tea.Batch(m.loadRunCmd(*runID), m.loadTailCmd(*runID), m.openStreamCmd(*runID))
 }
 
 // ---- keys -----------------------------------------------------------------

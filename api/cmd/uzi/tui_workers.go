@@ -76,12 +76,26 @@ func (m tuiModel) workersVisible() bool {
 	if m.showHelp || m.quitting || m.updatePrompt.showing {
 		return false
 	}
-	return m.view == viewBoard || m.view == viewWorkers || m.splitDrawn()
+	return m.view == viewBoard || m.view == viewWorkers || m.view == viewWorker || m.splitDrawn()
 }
 
 // Every update and key path reconciles visibility. Departure invalidates pending
 // ticks; entry supersedes any request left outstanding while hidden.
 func (m tuiModel) reconcileWorkers(cmd tea.Cmd) (tea.Model, tea.Cmd) {
+	if m.workerNav.runID != "" && (m.view != viewDetail || m.detail.runID != m.workerNav.runID || m.detail.gen != m.workerNav.gen || m.board.admin != m.workerNav.admin) {
+		m.workerNav.req++
+		m.workerNav.runID = ""
+	}
+	if m.view == viewWorker && m.workerDetail.admin != m.board.admin {
+		next, exit := m.leaveWorker()
+		n := next.(tuiModel)
+		if n.view == viewDetail {
+			n.detail.steer.notice = "worker not in your list"
+		} else {
+			n.splitNote = "worker not in your list"
+		}
+		return n.reconcileWorkers(tea.Batch(cmd, exit))
+	}
 	active := m.workersVisible()
 	if active != m.workers.active {
 		m.workers.active = active
@@ -93,14 +107,18 @@ func (m tuiModel) reconcileWorkers(cmd tea.Cmd) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 func (m *tuiModel) startWorkersReq() tea.Cmd {
-	if m.workers.admin != m.board.admin {
+	return m.startWorkersReqMode(false)
+}
+func (m *tuiModel) startWorkersReqMode(finite bool) tea.Cmd {
+	scopeChanged := m.workers.admin != m.board.admin
+	if scopeChanged {
 		m.workers.rows, m.workers.loaded = nil, false
 		m.workers.admin = m.board.admin
 		m.workers.cursor, m.workers.scroll, m.workers.errStreak = 0, 0, 0
 		m.workers.selectedID = ""
 		m.workers.err = nil
 	}
-	if !m.workersVisible() {
+	if !finite && !scopeChanged && !m.workersVisible() {
 		m.workers.waitID = 0
 		m.workers.tickGen++
 		return nil
@@ -140,6 +158,8 @@ func (m tuiModel) applyWorkers(msg workersMsg) (tea.Model, tea.Cmd) {
 	if msg.err != nil {
 		if msg.admin && uzicli.ExitCodeFor(msg.err) == uzicli.ExitAuth {
 			m.board.admin, m.board.adminDenied = false, true
+			m.workerNav.req++
+			m.workerNav.runID = ""
 			return m, tea.Batch((&m).startWorkersReq(), (&m).startBoardReq())
 		}
 		m.workers.err = msg.err
@@ -162,6 +182,20 @@ func (m tuiModel) applyWorkers(msg workersMsg) (tea.Model, tea.Cmd) {
 		}
 		m.workers.clamp(len(v))
 		m.workers.rememberSelection(v)
+	}
+	if msg.err == nil && m.view == viewWorker {
+		if _, ok := m.scopedWorker(m.workerDetail.workerID); !ok {
+			m.workerDetail.notice = "worker not in your list"
+			next, cmd := m.leaveWorker()
+			m = next.(tuiModel)
+			if m.view == viewDetail {
+				m.detail.steer.notice = "worker not in your list"
+			} else {
+				m.splitNote = "worker not in your list"
+			}
+			return m, cmd
+		}
+		m.reconcileReportedRun()
 	}
 	if !m.workersVisible() {
 		return m, nil
@@ -430,6 +464,11 @@ func (m tuiModel) workersKey(k string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	switch k {
+	case keyEnter:
+		if len(rows) > 0 {
+			return m.openWorker(rows[m.workers.cursor].w.ID)
+		}
+		return m, nil
 	case keyHome:
 		m.workers.cursor = 0
 	case keyEnd:
@@ -666,7 +705,7 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 	if len(rows) > 0 {
 		readout = m.workerReadout(rows[cursor], width)
 	}
-	footer := "j/k move · / filter · a scope · r refresh · 1-4 tabs · ? keys · q quit"
+	footer := "enter worker · j/k move · / filter · a scope · r refresh · ? keys · q quit"
 	reserve := 0
 	if full {
 		reserve = 1

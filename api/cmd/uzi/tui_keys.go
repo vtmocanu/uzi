@@ -40,10 +40,11 @@ const (
 	// Forge actions (PRD #1255 M5, D1/D12), bound on BOTH the pulls list row and the PR drill-in:
 	// u opens the PR's linked uzi run in the run view, w reworks that run, f queues a CI-fix run
 	// for the PR's head branch. keyPRView (m) is the run view → PR view cross-link.
-	keyRunLink = "u"
-	keyRework  = "w"
-	keyFixCI   = "f"
-	keyPRView  = "m"
+	keyRunLink    = "u"
+	keyRework     = "w"
+	keyFixCI      = "f"
+	keyPRView     = "m"
+	keyWorkerView = "W"
 )
 
 // keyString normalizes a v2 key press to the string form the switches below compare
@@ -92,10 +93,14 @@ func helpLines(v tuiView) []string {
 			"↑ / ↓      move within the focused pane (agents · scroll)",
 			"g          follow live: re-attach and jump to newest (live runs)",
 			"c          fold / unfold crew (auto-folds when blocks below do not fit)",
+			"W          open this run's worker",
 			"m          open the PR view for this run's merge request (when it has one)",
 		}, common...)
+	case viewWorker:
+		return []string{"j / ↓      select reported run", "k / ↑      select reported run", "pgup/pgdn  scroll worker detail", "enter      open reported run", "esc        back to origin", "r          refresh workers", "?          this help", "q          quit"}
 	case viewWorkers:
 		return append(append([]string{
+			"enter      open selected worker",
 			"a          toggle your workers / factory workers (admin token)",
 			"tab / shift+tab  floor · workers · pulls · ci",
 			"1 / 2 / 3 / 4  floor / workers / pulls / ci",

@@ -450,8 +450,22 @@ func (d *detailState) selectedLane() (agentLane, bool) {
 // stream, drops the detail state, and refetches the board. Shared by esc and by ← at the left pane
 // boundary so the two cannot drift. The name is kept for continuity; it now honours detailReturn.
 func (m tuiModel) exitToBoard() (tea.Model, tea.Cmd) {
-	if m.detail.stream != nil {
-		m.detail.stream.Close()
+	m.clearRunSession()
+	if m.detailReturn == viewWorker {
+		m.view = viewWorker
+		m.detailReturn = viewBoard
+		if _, ok := m.scopedWorker(m.workerDetail.workerID); !ok || m.workerDetail.admin != m.board.admin {
+			next, cmd := m.leaveWorker()
+			n := next.(tuiModel)
+			if n.view == viewDetail {
+				n.detail.steer.notice = "worker not in your list"
+			} else {
+				n.splitNote = "worker not in your list"
+			}
+			return n, cmd
+		}
+		m.reconcileReportedRun()
+		return m, nil
 	}
 	target := m.detailReturn
 	if m.fromSplit && !m.splitEligible() {
@@ -492,6 +506,8 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	switch k {
+	case keyWorkerView:
+		return m.runWorkerKey()
 	case keyEsc:
 		return m.exitToBoard()
 	case keyPRView:
@@ -929,7 +945,7 @@ func (m tuiModel) transportLine() string {
 // interactive modes draw their own hints, so this is only emitted when idle.
 func (m tuiModel) detailFooter() string {
 	owner := m.detail.steer.access == steerAllowed
-	parts := []string{m.keyHint("←→", "pane"), m.keyHint("↑↓", "move")}
+	parts := []string{m.keyHint("←→", "pane"), m.keyHint("↑↓", "move"), m.keyHint("W", "worker")}
 	if len(m.detail.lanes) > 0 {
 		parts = append(parts, m.keyHint("c", "crew"))
 	}

@@ -71,6 +71,7 @@ const (
 	viewBoard tuiView = iota
 	viewDetail
 	viewWorkers
+	viewWorker
 	// viewPulls is the forge `pulls` list screen (PRD #1255 M4a). viewCI is the forge
 	// `ci` list screen (PRD #1255 M4b). viewPR is the PR drill-in (PRD #1255 M5) — a peer of
 	// viewDetail, opened from the pulls list (enter/→) or the run view (m). viewCIRun is the
@@ -257,7 +258,10 @@ type streamEventsMsg struct {
 
 // pollFallbackMsg drives the D8 degradation: when the socket is unreachable the detail
 // view falls back to the same 2s REST poll `uzi run logs --follow` uses.
-type pollFallbackMsg struct{}
+type pollFallbackMsg struct {
+	runID string
+	gen   uint64
+}
 
 // detailMetaMsg carries a fresh run DTO for the drilled-in run, so the detail view's
 // non-streamed fields (milestones, health, kind, title, duration) stay current while the
@@ -298,6 +302,10 @@ type tuiModel struct {
 	bottomTab                       tuiView
 	boardReplied                    bool
 	splitNote                       string
+	workerDetail                    workerDetailState
+	workerOrigin                    workerOrigin
+	workerNav                       workerNavigation
+	workerGen                       uint64
 	workers                         workersState
 	board                           boardState
 	detail                          detailState
@@ -894,8 +902,8 @@ func readStreamCmd(runID string, gen uint64, s *uzicli.RunStream) tea.Cmd {
 // var so a test can shrink it and drain the re-armed tick without blocking on the real 2s.
 var pollFallbackInterval = 2 * time.Second
 
-func pollFallbackCmd() tea.Cmd {
-	return tea.Tick(pollFallbackInterval, func(time.Time) tea.Msg { return pollFallbackMsg{} })
+func pollFallbackCmd(runID string, gen uint64) tea.Cmd {
+	return tea.Tick(pollFallbackInterval, func(time.Time) tea.Msg { return pollFallbackMsg{runID: runID, gen: gen} })
 }
 
 func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -1000,6 +1008,10 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(m.fetchBuildInfoCmd(), skewTickCmd())
 
+	case workerRunMsg:
+		return m.applyWorkerRun(msg)
+	case runWorkerMsg:
+		return m.applyRunWorker(msg)
 	case workersMsg:
 		return m.applyWorkers(msg)
 	case workersTickMsg:
@@ -1492,7 +1504,7 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// the same 2s REST poll `uzi run logs --follow` uses and say so on screen.
 			m.detail.streamErr = msg.err
 			m.detail.polling = true
-			return m, pollFallbackCmd()
+			return m, pollFallbackCmd(m.detail.runID, m.detail.gen)
 		}
 		m.detail.stream = msg.stream
 		m.detail.streamErr = nil
@@ -1530,15 +1542,15 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.detail.stream = nil
 			m.detail.streamErr = msg.err
 			m.detail.polling = true
-			return m, pollFallbackCmd()
+			return m, pollFallbackCmd(m.detail.runID, m.detail.gen)
 		}
 		return m, readStreamCmd(msg.runID, msg.gen, m.detail.stream)
 
 	case pollFallbackMsg:
-		if m.view != viewDetail || !m.detail.polling {
+		if msg.runID != m.detail.runID || msg.gen != m.detail.gen || m.view != viewDetail || !m.detail.polling {
 			return m, nil
 		}
-		cmds := []tea.Cmd{pollFallbackCmd()} // always re-arm the 2s tick while polling
+		cmds := []tea.Cmd{pollFallbackCmd(m.detail.runID, m.detail.gen)} // always re-arm the 2s tick while polling
 		if m.detail.metaWaitID == 0 {
 			cmds = append(cmds, (&m).startDetailMetaReq()) // one meta refresh, guarded (#1135)
 		}
@@ -1644,6 +1656,8 @@ func (m tuiModel) handleKeyInner(k string) (tea.Model, tea.Cmd) {
 	switch m.view {
 	case viewBoard:
 		return m.boardKey(k)
+	case viewWorker:
+		return m.workerKey(k)
 	case viewWorkers:
 		return m.workersKey(k)
 	case viewPulls:
@@ -1694,6 +1708,8 @@ func (m tuiModel) View() tea.View {
 		body = m.renderSplit()
 	case m.view == viewDetail:
 		body = m.renderDetail()
+	case m.view == viewWorker:
+		body = m.renderWorker()
 	case m.view == viewWorkers:
 		body = m.renderWorkers()
 	case m.view == viewPulls:

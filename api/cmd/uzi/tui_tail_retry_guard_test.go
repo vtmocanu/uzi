@@ -52,10 +52,10 @@ func TestTUIDetailTailRetryIsGuardedInFlight(t *testing.T) {
 
 	// Two fallback ticks, no reply in between: exactly one Tail request.
 	from := len(fake.RunLogsPageCalls)
-	next, cmd := m.Update(pollFallbackMsg{})
+	next, cmd := m.Update(pollFallbackMsg{runID: m.detail.runID, gen: m.detail.gen})
 	m = next.(tuiModel)
 	drainCmd(cmd)
-	next, cmd = m.Update(pollFallbackMsg{})
+	next, cmd = m.Update(pollFallbackMsg{runID: m.detail.runID, gen: m.detail.gen})
 	m = next.(tuiModel)
 	drainCmd(cmd)
 	if got := len(tailQueries(fake, from)); got != 1 {
@@ -82,7 +82,7 @@ func TestTUIDetailTailRetryIsGuardedInFlight(t *testing.T) {
 		t.Fatalf("a pageTail error reply did not release tailInFlight")
 	}
 	from = len(fake.RunLogsPageCalls)
-	_, cmd = m.Update(pollFallbackMsg{})
+	_, cmd = m.Update(pollFallbackMsg{runID: m.detail.runID, gen: m.detail.gen})
 	drainCmd(cmd)
 	if got := len(tailQueries(fake, from)); got != 1 {
 		t.Fatalf("after the failed retry's reply the next tick issued %d Tail requests, want exactly 1", got)

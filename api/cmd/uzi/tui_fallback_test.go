@@ -70,11 +70,11 @@ func TestTUIDetailPollFallbackIncrementalAndGuarded(t *testing.T) {
 	callsBefore := len(fake.RunLogsPageCalls)
 
 	// First tick: one catch-up (After:3) + one meta GetRun.
-	next, cmd := m.Update(pollFallbackMsg{})
+	next, cmd := m.Update(pollFallbackMsg{runID: m.detail.runID, gen: m.detail.gen})
 	m = next.(tuiModel)
 	drainCmd(cmd)
 	// Second tick with NO reply delivered: the guards hold, so nothing new is issued.
-	next, cmd = m.Update(pollFallbackMsg{})
+	next, cmd = m.Update(pollFallbackMsg{runID: m.detail.runID, gen: m.detail.gen})
 	m = next.(tuiModel)
 	drainCmd(cmd)
 
@@ -334,7 +334,7 @@ func TestTUIDetailTailRetryAfterFailedInitialTail(t *testing.T) {
 	next, _ = m.Update(detailPageMsg{runID: runID, kind: pageTail, err: errFake("tail boom again")})
 	m = next.(tuiModel)
 	before = len(fake.RunLogsPageCalls)
-	next, cmd = m.Update(pollFallbackMsg{})
+	next, cmd = m.Update(pollFallbackMsg{runID: m.detail.runID, gen: m.detail.gen})
 	m = next.(tuiModel)
 	drainCmd(cmd)
 	sawTail = false
