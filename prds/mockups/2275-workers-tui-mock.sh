@@ -10,18 +10,36 @@
 # Keys
 #   1 floor  2 workers  3 pulls  4 ci     j/k or ↑/↓ move   enter/→ drill-in   esc/← back
 #   a  scope: your workers <-> factory workers   w  width 80 <-> 120
-#   z  floor fleet summary line on/off           s  split view on/off (shipped key)
+#   z  fleet status (title line) on/off          s  split view on/off (shipped key)
 #   tab  next view   ctrl+w  pane focus          ?  legend   q quit
-#   w and z exist only in this mock, for comparing layouts (w is the shipped rework key).
+#   t  theme dark <-> light (repaints the terminal background; restored on quit)
+#   t, w and z exist only in this mock, for comparing layouts (w is the shipped rework key).
 #   Where this mock and the PRD disagree, the PRD wins.
 
 export LC_ALL=${LC_ALL:-en_US.UTF-8}   # ${#s} must count characters, not bytes
 E=$'\033'
 R="${E}[0m"; B="${E}[1m"; F="${E}[2m"
-TUNG="${E}[38;5;214m"
-GRN="${E}[38;5;114m"; AMB="${E}[38;5;221m"; RED="${E}[38;5;203m"
-CYN="${E}[38;5;117m"; GRY="${E}[38;5;245m"; MAG="${E}[38;5;176m"
-SEL="${E}[48;5;237m"
+# Colours = the shipped ANDON palette (api/cmd/uzi/tui_render.go newPalette), light and dark
+# hex values in truecolor. `t` flips the theme and repaints the terminal background (OSC 11)
+# so the light values are judged on a light ground; the original colours return on exit.
+# Roles, kept consistent with floor / pulls / ci:
+#   TUNG tungsten  wordmark, active tab, cursor ▌        SAGE sage   busy (= a running run)
+#   AMB  amber     needs a human: ⚑ holding, the count   STALL stall ▲ warn items, offline
+#   RED  alarm     ✕ danger items, disk/cpu >= 90%       WAIT  wait  draining / cordoned (self-resolving holds)
+#   GRY  faint     idle, ids, ages, info items, chrome   healthy readings stay default ink (quiet board)
+rgb() { printf '%s[%s;2;%d;%d;%dm' "$E" "$1" $((16#${2:1:2})) $((16#${2:3:2})) $((16#${2:5:2})); }
+set_theme() { # $1 = dark|light ; value pairs are (light dark) exactly as in newPalette
+  local d=1; [ "$1" = light ] && d=0
+  pick() { if [ $d = 1 ]; then rgb 38 "$2"; else rgb 38 "$1"; fi; }
+  TUNG=$(pick '#7c5200' '#c9a061'); AMB=$(pick '#b45309' '#ffb454'); RED=$(pick '#b91c1c' '#f87171')
+  STALL=$(pick '#c2410c' '#fb923c'); SAGE=$(pick '#2f7d4f' '#6fbf8f'); WAIT=$(pick '#0369a1' '#38bdf8')
+  GRY=$(pick '#6c6c6c' '#8a8a8a')
+  if [ $d = 1 ]; then SEL=$(rgb 48 '#33302a'); else SEL=$(rgb 48 '#f3ead8'); fi
+  CYN=$GRY   # issue ids are faint, as on the floor
+  [ -z "${MOCK_RENDER:-}" ] && { if [ $d = 1 ]; then printf '%s]11;#0e1016%s\\%s]10;#d8d8d8%s\\' "$E" "$E" "$E" "$E"
+    else printf '%s]11;#fbfaf7%s\\%s]10;#1f1f1f%s\\' "$E" "$E" "$E" "$E"; fi; }
+  return 0; }
+theme=${MOCK_THEME:-dark}; set_theme "$theme"
 
 # ---- fixture (parallel arrays, one index per worker) ---------------------------------
 # DTO facts stay SEPARATE (online, draining_since, upgrade, busy, custody); the primary
@@ -80,7 +98,7 @@ pad() { local s="$1" w="$2" n=${#1}
 
 hr() { printf "${GRY}%s${R}\n" "$(printf '%*s' "$width" '' | tr ' ' '─')"; }
 
-pctcol() { local p=$1; if [ "$p" -lt 0 ]; then printf '%s' "$GRY"; elif [ "$p" -ge 90 ]; then printf '%s' "$RED"; elif [ "$p" -ge 75 ]; then printf '%s' "$AMB"; else printf '%s' "$GRN"; fi; }
+pctcol() { local p=$1; if [ "$p" -lt 0 ]; then printf '%s' "$GRY"; elif [ "$p" -ge 90 ]; then printf '%s' "$RED"; elif [ "$p" -ge 75 ]; then printf '%s' "$STALL"; else printf '%s' "$R"; fi; }
 
 bar() { local p=$1 w=$2 i fill col
   if [ "$p" -lt 0 ]; then printf "${GRY}%s${R}" "$(printf '%*s' "$w" '' | tr ' ' '·')"; return; fi
@@ -96,26 +114,26 @@ state() { local i=$1
   else echo idle; fi; }
 
 statecell() { local s=$1 w=$2 g c
-  case $s in idle) g='●' c=$GRN;; busy) g='◉' c=$TUNG;; draining) g='◐' c=$AMB;; cordoned) g='◌' c=$AMB;; holding) g='⚑' c=$MAG;; offline) g='○' c=$GRY;; esac
+  case $s in idle) g='●' c=$GRY;; busy) g='◉' c=$SAGE;; draining) g='◐' c=$WAIT;; cordoned) g='◌' c=$WAIT;; holding) g='⚑' c=$AMB;; offline) g='○' c=$STALL;; esac
   printf '%s%s %s%s' "$c" "$g" "$(pad "$s" $((w-2)))" "$R"; }
 
 # attention items, worst first: items joined by '^', each "colour~glyph text".
-# Severity: RED = danger (✕), AMB/MAG = warn (state glyph, else ▲), GRY = info (·).
+# Severity: alarm = danger (✕); amber ⚑ / stall ▲ / wait ◐◌ = warn; faint = info (·).
 # Only danger + warn count toward "need attention".
 attention() { local i=$1 out="" r age IFS
   [ "${UPG[$i]}" = failed ] && out+="$RED~✕ upgrade failed^"
   [ -n "${OUTBOXBLK[$i]}" ] && out+="$RED~✕ outbox blocked^"
   [ $admin = 1 ] && [ -n "${PRESS[$i]}" ] && out+="$RED~✕ pressure: ${PRESS[$i]}^"
   case "${DISKL[$i]}" in data|nix) [ "${DISKP[$i]}" -ge 90 ] && out+="$RED~✕ ${DISKL[$i]} ${DISKP[$i]}%^";; esac
-  [ "${CUST[$i]}" = 1 ] && out+="$MAG~⚑ unpublished work^"
+  [ "${CUST[$i]}" = 1 ] && out+="$AMB~⚑ unpublished work^"
   if [ -n "${RUNS[$i]}" ]; then IFS=';'; for r in ${RUNS[$i]}; do
-    IFS='|' read -r _ _ age _ <<<"$r"; [ -n "$age" ] && out+="$AMB~◷ outcome pending $age^"; IFS=';'; done; unset IFS; fi
-  [ "${OUTBOX[$i]}" -gt 0 ] && out+="$AMB~⇡ outbox ${OUTBOX[$i]} queued^"
-  [ "${ONLINE[$i]}" = 0 ] && out+="$AMB~○ offline ${HB[$i]}^"
-  if [ "${DRAIN[$i]}" = 1 ]; then if [ "${ACT[$i]}" -gt 0 ]; then out+="$AMB~◐ draining, ${ACT[$i]} run left^"; else out+="$AMB~◌ cordoned^"; fi; fi
-  [ "${UPG[$i]}" = outdated ] && out+="$AMB~↑ outdated ${VER[$i]}^"
-  [ "${TPLD[$i]}" != "${TPLR[$i]}" ] && out+="$AMB~▲ template drift^"
-  case "${DISKL[$i]}" in *ino*|dind*) [ "${DISKP[$i]}" -ge 90 ] && out+="$AMB~▲ ${DISKL[$i]} ${DISKP[$i]}% (display only)^";; esac
+    IFS='|' read -r _ _ age _ <<<"$r"; [ -n "$age" ] && out+="$STALL~◷ outcome pending $age^"; IFS=';'; done; unset IFS; fi
+  [ "${OUTBOX[$i]}" -gt 0 ] && out+="$STALL~⇡ outbox ${OUTBOX[$i]} queued^"
+  [ "${ONLINE[$i]}" = 0 ] && out+="$STALL~○ offline ${HB[$i]}^"
+  if [ "${DRAIN[$i]}" = 1 ]; then if [ "${ACT[$i]}" -gt 0 ]; then out+="$WAIT~◐ draining, ${ACT[$i]} run left^"; else out+="$WAIT~◌ cordoned^"; fi; fi
+  [ "${UPG[$i]}" = outdated ] && out+="$STALL~↑ outdated ${VER[$i]}^"
+  [ "${TPLD[$i]}" != "${TPLR[$i]}" ] && out+="$STALL~▲ template drift^"
+  case "${DISKL[$i]}" in *ino*|dind*) [ "${DISKP[$i]}" -ge 90 ] && out+="$STALL~▲ ${DISKL[$i]} ${DISKP[$i]}% (display only)^";; esac
   case "${EPH[$i]}" in *lease*) out+="$GRY~· lease 8m left^";; esac
   [ "${BUSY[$i]}" = 1 ] && [ "${ACT[$i]}" = 0 ] && out+="$GRY~· chat active^"
   printf '%s' "$out"; }
@@ -125,10 +143,10 @@ attcell() { local a first rest n=0 x IFS
   first=${a%%^*}; rest=${a#*^}; IFS='^'; for x in $rest; do n=$((n+1)); done; unset IFS
   printf '%s%s%s' "${first%%~*}" "${first#*~}" "$R"; [ $n -gt 0 ] && printf "${F} +%d${R}" $n; }
 
-needs_attention() { local a; a=$(attention "$1"); case "$a" in *"$RED"*|*"$MAG"*|*"$AMB"*) return 0;; esac; return 1; }
+needs_attention() { local a; a=$(attention "$1"); case "$a" in *"$RED"*|*"$AMB"*|*"$STALL"*|*"$WAIT"*) return 0;; esac; return 1; }
 
 sevrank() { local a; a=$(attention "$1")
-  case "$a" in *"$RED"*) echo 0;; *"$MAG"*|*"$AMB"*) echo 1;; *"$GRY"*) echo 2;; *) echo 3;; esac; }
+  case "$a" in *"$RED"*) echo 0;; *"$AMB"*|*"$STALL"*|*"$WAIT"*) echo 1;; *"$GRY"*) echo 2;; *) echo 3;; esac; }
 
 # rows sorted worst severity first, then name (the real view keeps the cursor by worker ID)
 visible_rows() { local i line; ROWS=()
@@ -140,15 +158,24 @@ visible_rows() { local i line; ROWS=()
 
 scope_label() { [ $admin = 1 ] && echo "factory workers" || echo "your workers"; }
 
-# tab strip: the focused screen is bold; in split the unfocused pane's tab is underlined
-tabs() { local t lbl out="${TUNG}${B}▚▚ uzi${R}${F} · ${R}" mark=$view other=""
+vislen() { local s; s=$(printf '%s' "$1" | sed $'s/\033\\[[0-9;]*m//g'); echo ${#s}; }
+
+# tab strip: the focused screen is bold; in split the unfocused pane's tab is underlined.
+# $1 (optional) = a status segment drawn RIGHT-ALIGNED on this same first line; when the
+# line cannot hold both with a 2-column gap, the segment falls back to its own line below.
+tabs() { local t lbl out="${TUNG}${B}▚▚ uzi${R}${F} · ${R}" mark=$view other="" right="${1:-}" gap
   if [ $split = 1 ]; then if [ $focus = top ]; then mark=$top other=$bottom; else mark=$bottom other=$top; fi; fi
   for t in floor workers pulls ci; do
     lbl=$t; [ $t = floor ] && [ $admin = 1 ] && lbl="active runs"
     if [ "$t" = "$mark" ]; then out+="${TUNG}${B}${lbl}${R}  "
     elif [ "$t" = "$other" ]; then out+="${E}[4m${lbl}${R}  "
     else out+="${F}${lbl}${R}  "; fi
-  done; printf '%s\n' "$out"; }
+  done
+  out="${out%  }"
+  [ -z "$right" ] && { printf '%s\n' "$out"; return; }
+  gap=$(( width - $(vislen "$out") - $(vislen "$right") ))
+  if [ $gap -ge 2 ]; then printf '%s%*s%s\n' "$out" $gap "" "$right"
+  else printf '%s\n%s\n' "$out" "$right"; fi; }
 
 # Occupancy, not admission capacity: in-use / advertised run-lane slots over ONLINE workers,
 # with holds, drains and cordons counted separately (they advertise slots they will not fill).
@@ -167,11 +194,11 @@ summary() { visible_rows; fleet_counts
     printf "${B}%s${R} · %d · ${TUNG}%d${R}/%d slots in use" "$(scope_label)" $FN $FU $FC
     [ $FATT -gt 0 ] && printf " · ${AMB}%d need attention${R}" $FATT; printf '\n'; return
   fi
-  printf "${B}%s${R} · %d · ${GRN}%d online${R} · ${TUNG}%d${R}/%d slots in use" "$(scope_label)" $FN $FON $FU $FC
+  printf "${B}%s${R} · %d · %d online · ${TUNG}%d${R}/%d slots in use" "$(scope_label)" $FN $FON $FU $FC
   [ $FUNK -gt 0 ] && printf "${F} +%d ?cap${R}" $FUNK
-  [ $FHOLD -gt 0 ] && printf " · ${MAG}%d holding${R}" $FHOLD
-  [ $FDRAIN -gt 0 ] && printf " · ${AMB}%d draining${R}" $FDRAIN
-  [ $FCORD -gt 0 ] && printf " · ${AMB}%d cordoned${R}" $FCORD
+  [ $FHOLD -gt 0 ] && printf " · ${AMB}%d holding${R}" $FHOLD
+  [ $FDRAIN -gt 0 ] && printf " · ${WAIT}%d draining${R}" $FDRAIN
+  [ $FCORD -gt 0 ] && printf " · ${WAIT}%d cordoned${R}" $FCORD
   [ $FATT -gt 0 ] && printf " · ${AMB}%d need attention${R}" $FATT; printf '\n'; }
 
 list_header() {
@@ -192,7 +219,7 @@ list_row() { local k=$1 i=$2 active=$3 pre=" " line s
       else disk="$(pad "${DISKL[$i]}" 8) $(bar "${DISKP[$i]}" 4) $(pctcol "${DISKP[$i]}")$(pad "${DISKP[$i]}%" 4)${R}"; fi
     # version marker: ↑ outdated, ✕ upgrade failed (glyph + colour)
     local vm=" "; case "${UPG[$i]}" in outdated) vm="↑";; failed) vm="✕";; esac
-    local ver; ver=$(pad "${VER[$i]}$vm" 8); [ "${UPG[$i]}" != ok ] && ver="${AMB}${ver}${R}"
+    local ver; ver=$(pad "${VER[$i]}$vm" 8); case "${UPG[$i]}" in outdated) ver="${STALL}${ver}${R}";; failed) ver="${RED}${ver}${R}";; esac
     line="$pre $(pad "${NAME[$i]}" 13) $( [ $admin = 1 ] && pad "${OWNER[$i]}" 7 && printf ' ')$(statecell "$s" 10) $(pad "${KIND[$i]}" 9) $runs ${d}$cpu $(pad "${MEMU[$i]}" 7) ${disk}${R} ${ver} ${F}$(pad "${HB[$i]}" 3)${R} $(attcell "$i")"
   else
     line="$pre $(pad "${NAME[$i]}" 13) $(statecell "$s" 10) $(pad "${KIND[$i]}" 9) $runs $(attcell "$i")"
@@ -227,7 +254,7 @@ legend_box() {
   printf "${F}disk${R}  worst labelled reading (ino = inodes). Colour is a visual cue,\n"
   printf "${F}      not the server's disk-pressure threshold; dind + inodes never gate.${R}\n"
   printf "${F}~   ${R}  stale (last-known) sample, also dimmed\n"
-  printf "${F}sev ${R}  ${RED}✕${R} danger  ${AMB}▲${R}/state glyph warn  ${GRY}·${R} info; only danger + warn count as \"need attention\"\n"
+  printf "${F}sev ${R}  ${RED}✕${R} danger  ${STALL}▲${R}/${AMB}⚑${R}/${WAIT}◐${R} warn  ${GRY}·${R} info; only danger + warn count as \"need attention\"\n"
   printf "${F}ver ${R}  ↑ outdated  ✕ upgrade failed\n"; }
 
 kv() { printf "  ${F}%-13s${R} %s\n" "$1" "$2"; }
@@ -291,30 +318,36 @@ floor_row() { # pre glyph issue title stage worker
   local wk=""; [ $width -ge 120 ] && wk="${F}$6${R}"
   printf "%s %s ${CYN}%s${R} %s %s %s\n" "$1" "$2" "$3" "$(pad "$4" 26)" "$(pad "$5" 12)" "$wk"; }
 floor_rows() { local act=$1 pre=" "; [ "$act" = 1 ] && pre="${TUNG}▌${R}"
-  floor_row "$pre" "${TUNG}◉${R}" "#101" "Add export button" "implementing" "forge-large"
-  floor_row " " "${TUNG}◉${R}" "#102" "Retry flaky upload" "reviewing" "forge-large"
-  floor_row " " "${TUNG}◉${R}" "#103" "Retry flaky upload fix" "implementing" "forge-docker"
+  floor_row "$pre" "${SAGE}◉${R}" "#101" "Add export button" "implementing" "forge-large"
+  floor_row " " "${SAGE}◉${R}" "#102" "Retry flaky upload" "reviewing" "forge-large"
+  floor_row " " "${SAGE}◉${R}" "#103" "Retry flaky upload fix" "implementing" "forge-docker"
   floor_row " " "${AMB}◆${R}" "#105" "Test hardening" "plan gate" "forge-m-2"
   floor_row " " "${GRY}○${R}" "#106" "Docker build cache" "queued" "no worker yet"; }
 
+# Fleet status, right-aligned on the title line (no line of its own). At 80 columns it keeps
+# only slots in use + the attention count.
 fleet_strip() { visible_rows; fleet_counts
-  printf "${F}workers${R} ${TUNG}%d${R}/%d slots in use · %d/%d online" $FU $FC $FON $FN
-  [ $FATT -gt 0 ] && printf " · ${AMB}%d need attention${R}" $FATT; printf "${F} · 2 for detail${R}\n"; }
+  if [ $width -lt 120 ]; then printf "${F}workers${R} ${TUNG}%d${R}/%d slots" $FU $FC
+  else printf "${F}workers${R} ${TUNG}%d${R}/%d slots in use · %d/%d online" $FU $FC $FON $FN; fi
+  [ $FATT -gt 0 ] && printf " · ${AMB}%d need attention${R}" $FATT; }
 
-draw_floor() { tabs; [ $strip = 1 ] && fleet_strip; hr; floor_rows 1; hr
-  footer "1-4 tabs · z summary line ($( [ $strip = 1 ] && echo on || echo off)) · s split · q quit" "1-4 tabs · z summary · s split · q quit"; }
+fleet_right() { [ $strip = 1 ] && fleet_strip; }
+
+draw_floor() { tabs "$(fleet_right)"; hr; floor_rows 1; hr
+  footer "1-4 tabs · z fleet status ($( [ $strip = 1 ] && echo on || echo off)) · s split · q quit" "1-4 tabs · z fleet · s split · q quit"; }
 
 draw_split() { visible_rows; [ $sel -ge ${#ROWS[@]} ] && sel=$((${#ROWS[@]}-1))
   local tf=0 bf=0; [ $focus = top ] && tf=1 || bf=1
-  tabs
-  # top pane: floor | workers  (the fleet strip rides with the floor, the summary with workers)
-  if [ $top = floor ]; then [ $strip = 1 ] && fleet_strip; hr; floor_rows $tf
+  # the fleet status rides right-aligned on the title line while the floor is the top pane
+  if [ $top = floor ]; then tabs "$(fleet_right)"; else tabs; fi
+  # top pane: floor | workers  (the summary rides with workers)
+  if [ $top = floor ]; then hr; floor_rows $tf
   else local ow=$width; width=80; summary; width=$ow; hr; ow=$width; width=80; workers_body $tf; width=$ow; fi
   printf "${GRY}%s${R}\n" "$(printf '%*s' "$width" '' | tr ' ' '━')"
   # bottom pane: pulls | ci
   case $bottom in
-    ci) printf "${F}ci${R}\n%s ${GRN}✓${R} main     ci.yml  0a1b2c3d  4m\n  ${RED}✕${R} pr-107  ci.yml  4e5f6a7b  12m\n" "$( [ $bf = 1 ] && printf "${TUNG}▌${R}" || printf ' ')";;
-    pulls) printf "${F}pulls${R}\n%s ${CYN}#107${R} Label taxonomy   ${GRN}approved${R}\n  ${CYN}#108${R} dind disk         ${AMB}review${R}\n" "$( [ $bf = 1 ] && printf "${TUNG}▌${R}" || printf ' ')";;
+    ci) printf "${F}ci${R}\n%s ${SAGE}✓${R} main     ci.yml  0a1b2c3d  4m\n  ${RED}✕${R} pr-107  ci.yml  4e5f6a7b  12m\n" "$( [ $bf = 1 ] && printf "${TUNG}▌${R}" || printf ' ')";;
+    pulls) printf "${F}pulls${R}\n%s ${CYN}#107${R} Label taxonomy   ${SAGE}approved${R}\n  ${CYN}#108${R} dind disk         ${AMB}review${R}\n" "$( [ $bf = 1 ] && printf "${TUNG}▌${R}" || printf ' ')";;
   esac
   hr
   if [ $top = workers ] && [ $focus = top ]; then
@@ -341,7 +374,7 @@ can_drill() { [ $split = 0 ] && [ "$view" = workers ] && return 0
   [ $split = 1 ] && [ $top = workers ] && [ $focus = top ] && return 0; return 1; }
 
 if [ -z "${MOCK_RENDER:-}" ]; then
-  cleanup() { printf '%s[?25h%s[?1049l' "$E" "$E"; }
+  cleanup() { printf '%s[?25h%s[?1049l%s]110%s\\%s]111%s\\' "$E" "$E" "$E" "$E" "$E" "$E"; }
   trap cleanup EXIT
   printf '%s[?1049h%s[?25l' "$E" "$E"
 fi
@@ -371,5 +404,6 @@ while :; do
     $'\x17') [ $split = 1 ] && [ $drill = 0 ] && { [ $focus = top ] && focus=bottom || focus=top; };;
     $'\t') [ $drill = 0 ] && next_view;;
     \?) legend=$((1-legend));;
+    t) if [ $theme = dark ]; then theme=light; else theme=dark; fi; set_theme "$theme";;
   esac
 done
