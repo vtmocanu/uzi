@@ -2392,6 +2392,8 @@ export class CodexExecutor implements Executor {
         }
         if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason);
         if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
+        if (verdict.approval === "cross_check")
+          throw new TrustedExecutionRefusal("codex cannot consume checked plan approval");
         pauseNow.vaultLock.gateOpen = false;
         gatedPlan = planMd;
         approvedMilestones = planResult.milestones;

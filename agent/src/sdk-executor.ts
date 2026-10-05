@@ -722,6 +722,8 @@ interface DriveState {
   resumeId: string | undefined;
   // --- Products of phasePlanGate (P5), consumed by phaseRunLoop (P6-P8) ---
   approvedPlan?: string;
+  /** Checked canonical instructions replace the local plan carried by the planning session. */
+  checkedPlan?: boolean;
   approvedSelection?: AgentSelectionParse;
   preApproved?: boolean;
   /** Issue #2083: the decisions memo block was already placed in this execution's plan or
@@ -2178,6 +2180,31 @@ export class SdkExecutor implements Executor {
           throw new TrustedExecutionRefusal(
             `unexpected plan verdict: ${(verdict as { kind: string }).kind}`,
           );
+        if (verdict.approval === "cross_check") {
+          const canonical = verdict.canonical;
+          // Validate the entire bundle before adopting either value. The digest is an opaque
+          // server SHA-256 identity, not a locally recomputed proof of approval.
+          if (
+            !canonical || typeof canonical !== "object" ||
+            typeof canonical.plan !== "string" || !canonical.plan.trim() ||
+            !Array.isArray(canonical.milestones) ||
+            !Array.from(canonical.milestones).every((m) =>
+              m !== null && typeof m === "object" &&
+              typeof m.id === "string" && m.id.trim().length > 0 &&
+              typeof m.title === "string" && m.title.trim().length > 0
+            ) ||
+            typeof canonical.candidate_digest !== "string" ||
+            canonical.candidate_digest.length !== 64 ||
+            !/^[0-9a-f]{64}$/.test(canonical.candidate_digest) ||
+            !Number.isSafeInteger(canonical.claimGeneration) || canonical.claimGeneration <= 0 ||
+            !Number.isSafeInteger(ctx.claimGeneration) || (ctx.claimGeneration ?? 0) <= 0 ||
+            canonical.claimGeneration !== ctx.claimGeneration
+          ) throw new TrustedExecutionRefusal("invalid checked plan approval bundle");
+          // Preserve server values verbatim, including nested keys and explicit [].
+          approvedPlan = canonical.plan;
+          candidateMilestones = canonical.milestones;
+          drive.checkedPlan = true;
+        }
         approvedSelection = verdict.selection;
         // PRD #122 M6: freeze the APPROVED milestone breakdown for the implement loop.
         // `candidateMilestones` is block-scoped and REPLACED across revision rounds
@@ -2357,6 +2384,12 @@ export class SdkExecutor implements Executor {
       // undefined. buildImplementPrompt embeds it first-turn-only, as authoritative
       // instructions (D5), never untrusted-fenced. The gate is embedSeededPlan (extracted
       // so its defense-in-depth `seeded` term is testable — see that function's doc).
+      // Repeat the checked server contract on every implement attempt: an interrupted
+      // first attempt may not have delivered it to the model or updated the old session.
+      // Serialize the entire approved list, including nested values and explicit [].
+      const checkedImplementationContext = drive.checkedPlan
+        ? `The following server contract is explicitly approved for implementation and supersedes the local plan in this session. Follow its prose and full milestone contract.\n\n${approvedPlan}\n\n<approved_milestone_contract>\n${JSON.stringify(frozenMilestones)}\n</approved_milestone_contract>\n\n`
+        : "";
       const seededPlanBody = embedSeededPlan({
         preApproved,
         seeded: ctx.seeded === true,
@@ -2691,7 +2724,7 @@ export class SdkExecutor implements Executor {
           implementConfig,
           "implement",
           resumeId,
-          buildImplementPrompt({
+          checkedImplementationContext + buildImplementPrompt({
             branch: ctx.branch,
             subagentNames: selectedNames,
             // PRD #266 M1: the implement roster's OWN capability map (selectedCanWrite),
@@ -2719,9 +2752,7 @@ export class SdkExecutor implements Executor {
             // supplied the plan, not that it was "approved". First turn only (gated
             // inside buildImplementPrompt); false/absent for every non-seeded run.
             seeded: ctx.seeded,
-            // PRD #209 (M2 validation): the seeded plan body, embedded first-turn-only.
-            // Undefined for every path except the session-less seeded cold start (see
-            // seededPlanBody above), so resume/gated implement prompts are unchanged.
+            // Ordinary seeded/resume plan embedding remains first-turn-only.
             seededPlan: seededPlanBody,
             followUp: followUp ?? ownerRides?.body,
             // #157: the join above populated these, so the first implement turn can be told

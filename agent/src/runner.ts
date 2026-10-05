@@ -8990,6 +8990,7 @@ export class RunRunner {
     }
     const ctx: RunContext = {
       runId,
+      claimGeneration: claim.claim_generation,
       kind: resolveRunKind(claim.kind),
       issueIid: claim.issue_iid,
       issueTitle: claim.issue_title,

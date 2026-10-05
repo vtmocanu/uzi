@@ -3930,6 +3930,31 @@ describe("CodexExecutor: per-turn phase-correct broker (plan write ban)", () => 
 // are fail-old/pass-fixed: without the signals frame planResult.plan is undefined and run()
 // throws "produced no plan" before the gate, so a resolving success test can only pass wired.
 describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
+  it("refuses checked plan approval before provider epoch recreation or implementation", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "local plan" }, th, tn, "c-plan")).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    let iterations = 0;
+    const { ctx } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      claimGeneration: 7,
+      reportIteration: async () => { iterations++; return undefined; },
+      gatePlan: async () => ({
+        kind: "approve", approval: "cross_check", selection: { status: "absent" },
+        canonical: { plan: "canonical", milestones: [], candidate_digest: "a".repeat(64), claimGeneration: 7 },
+      }),
+    });
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "checked approval refusal"),
+      /codex cannot consume checked plan approval/,
+    );
+    assert.equal(iterations, 0);
+    assert.equal(rig.epochs.length, 1);
+    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+  });
   it("(m2-1) a folded submit_plan gates, approval recreates a fresh provider epoch, and a root signal_done on the NEW root resolves { branch }", async () => {
     // m4 change: plan approval now RECREATES the provider epoch (new-root resume), so the plan
     // turn and the implement turn run on DISTINCT provider roots/transports. Each epoch is scripted
