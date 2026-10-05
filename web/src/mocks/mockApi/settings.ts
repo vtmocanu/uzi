@@ -165,10 +165,31 @@ const SEED_APP_SETTINGS: AppSettings = {
   brand_plaque: "false",
 };
 
+interface EphemeralPreferences {
+  ephemeral_workers_enabled: boolean;
+  ephemeral_docker_enabled: boolean;
+}
+
 interface PersistedSettings {
   v: 1;
   userSettings: UserSettings;
   appSettings: AppSettings;
+  // Optional for old blobs; keyed by user ID without persisting user/auth records.
+  ephemeralPreferences?: Record<string, EphemeralPreferences>;
+}
+
+// Ignore malformed pairs atomically and copy only the two preferences.
+function loadEphemeralPreferences(value: unknown): Record<string, EphemeralPreferences> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).flatMap(([id, prefs]) => {
+    if (typeof prefs !== "object" || prefs === null || Array.isArray(prefs)) return [];
+    const p = prefs as Record<string, unknown>;
+    if (typeof p.ephemeral_workers_enabled !== "boolean" || typeof p.ephemeral_docker_enabled !== "boolean") return [];
+    return [[id, {
+      ephemeral_workers_enabled: p.ephemeral_workers_enabled,
+      ephemeral_docker_enabled: p.ephemeral_docker_enabled,
+    }]];
+  }));
 }
 
 // isPersistedSettings validates the version AND the shape (key presence + value
@@ -270,7 +291,7 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
   return okUser && okApp;
 }
 
-function loadSettings(): { userSettings: UserSettings; appSettings: AppSettings } {
+function loadSettings(): { userSettings: UserSettings; appSettings: AppSettings; ephemeralPreferences: Record<string, EphemeralPreferences> } {
   try {
     const raw = localStorage.getItem(MOCK_SETTINGS_KEY);
     if (raw) {
@@ -300,20 +321,20 @@ function loadSettings(): { userSettings: UserSettings; appSettings: AppSettings 
             userSettings.default_claude_model = userSettings.default_model;
           }
         }
-        return { userSettings, appSettings };
+        return { userSettings, appSettings, ephemeralPreferences: loadEphemeralPreferences(parsed.ephemeralPreferences) };
       }
     }
   } catch {
     // Storage unavailable (private mode) or a corrupt/legacy blob: re-seed.
   }
-  return { userSettings: { ...SEED_USER_SETTINGS }, appSettings: { ...SEED_APP_SETTINGS } };
+  return { userSettings: { ...SEED_USER_SETTINGS }, appSettings: { ...SEED_APP_SETTINGS }, ephemeralPreferences: {} };
 }
 
-// persistSettings write-throughs the current settings maps. Called from the
-// putMySettings / updateSettings mock handlers after they mutate.
+// persistSettings write-throughs the settings maps and per-user ephemeral preferences
+// after putMySettings, updateSettings or setEphemeralWorkersEnabled mutate them.
 function persistSettings(): void {
   try {
-    const blob: PersistedSettings = { v: 1, userSettings, appSettings };
+    const blob: PersistedSettings = { v: 1, userSettings, appSettings, ephemeralPreferences };
     localStorage.setItem(MOCK_SETTINGS_KEY, JSON.stringify(blob));
   } catch {
     // Storage unavailable: the demo still works in-memory for this session.
@@ -321,6 +342,16 @@ function persistSettings(): void {
 }
 
 const loadedSettings = loadSettings();
+const ephemeralPreferences = loadedSettings.ephemeralPreferences;
+// Restore both the seeded session and login's backing roster on module/browser reload.
+// Iterate the finite seeded roster; a missing or malformed pair retains seed defaults.
+for (const user of users) {
+  const prefs = Object.prototype.hasOwnProperty.call(ephemeralPreferences, user.id) ? ephemeralPreferences[user.id] : undefined;
+  if (prefs) Object.assign(user, prefs);
+}
+if (state.session && Object.prototype.hasOwnProperty.call(ephemeralPreferences, state.session.id)) {
+  Object.assign(state.session, ephemeralPreferences[state.session.id]);
+}
 
 // ── Upstream release check (PRD #836) ────────────────────────────────────────
 // Persisted remote facts from the last release poll, consistent with mockBuildInfo
@@ -1034,6 +1065,8 @@ export const settingsApi = {
     Object.assign(u, next);
     const stored = users.find((x) => x.id === u.id);
     if (stored) Object.assign(stored, next);
+    ephemeralPreferences[u.id] = next;
+    persistSettings();
     return delay({ user: { ...u } }, 200);
   },
   getMySettings: async () => delay(mySettingsResponse()),
