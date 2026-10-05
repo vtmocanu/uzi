@@ -291,17 +291,23 @@ describe("HostedWorkers provisioning", () => {
     expect(screen.queryByRole("status")).toBeNull();
   });
 
-  it("defaults to compose parity — the base template at M", async () => {
-    // M, not S: it is what the repo's own sizing formula computes as the floor for a
-    // working worker (1 run slot + 1 unturnoffable chat session, + headroom = 4 GiB),
-    // and it matches both compose's AGENT_MEM_LIMIT default and the k8s block in
-    // docs/worker-setup.md. It is the preset a user hands themselves by not choosing,
-    // so it must be the known-good one rather than the cheapest.
+  it("preselects the large hosted size when provisioning without a size change", async () => {
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
     mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
     renderCard(0);
+    expect((await screen.findByLabelText("Hosted worker size") as HTMLSelectElement).value).toBe("l");
     fireEvent.click(await provisionButton());
-    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("base", "m", false));
+    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("base", "l", false));
+  });
+
+  it("resets a chosen size to large after successful provisioning", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
+    mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
+    renderCard(0);
+    fireEvent.change(await screen.findByLabelText("Hosted worker size"), { target: { value: "s" } });
+    fireEvent.click(await provisionButton());
+    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("base", "s", false));
+    await waitFor(() => expect((screen.getByLabelText("Hosted worker size") as HTMLSelectElement).value).toBe("l"));
   });
 
   it("shows the 409 quota refusal verbatim (the server's words, not ours)", async () => {

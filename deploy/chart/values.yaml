@@ -257,7 +257,7 @@ api:
     # opt-in. These env knobs only TUNE an already-enabled feature; leave them
     # unset to use config.go's defaults. Uncomment to override.
     # UZI_EPHEMERAL_MAX_PER_USER: "2"          # per-user concurrent-ephemeral cap
-    # UZI_EPHEMERAL_DEFAULT_SIZE: m            # provision size preset: s|m|l
+    # UZI_EPHEMERAL_DEFAULT_SIZE: l            # provision size preset: s|m|l
     # UZI_EPHEMERAL_PROVISION_DEADLINE: 10m    # GC deadline for never-booted / idle-stolen workers
     # UZI_EPHEMERAL_SATURATION_DELAY: 90s     # debounce before bursting on a saturated (all capable workers full) fleet
     # Job files and product skill sets (PRD #1909). Unset => config.go's defaults

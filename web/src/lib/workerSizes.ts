@@ -56,50 +56,13 @@ export const WORKER_SIZE_SPECS: Record<WorkerSize, WorkerSizeSpec> = {
 };
 
 /**
- * The size a fresh provision form starts on: M, for parity with the worker every user
- * already runs by hand.
- *
- * M is NOT "the middle one" — it is what this repo's own sizing formula computes as the
- * FLOOR for a working worker. docker-compose.yml budgets ~1.5 GiB per slot, and the
- * default config is 1 run slot + 1 chat session = 2 slots = 3 GiB, plus ~1 GiB headroom
- * = 4 GiB. That is exactly compose's own AGENT_MEM_LIMIT=4g / AGENT_CPUS=2, and exactly
- * the k8s block docs/worker-setup.md already publishes. Two independent artifacts
- * already agree on it, which makes M the only preset that is known-good rather than
- * guessed.
- *
- * The chat slot cannot be switched off, which is what puts the floor at 4 GiB rather
- * than at one slot: WORKER_CHAT_SESSIONS=0 silently falls back to 1 (positiveInt,
- * agent/src/config.ts), so every worker budgets a run AND a chat.
- *
- * S stays offered, but is not what we hand someone who never opens the field — and the
- * reason CHANGED after this was written, so the argument is worth reading rather than
- * inheriting. This comment used to say "whether S can run a real session is still
- * UNMEASURED — no benchmark has spawned an SDK subprocess". That is no longer true: a
- * live capstone measured a complete real SDK run peaking at 676 MiB (cgroup
- * memory.peak), so S's 2Gi fits the AGENT roughly three times over and S is not the
- * OOM risk it looked like. Corrected 2026-07-17 (M6); see PRD #58's M6 bullet.
- *
- * M survives that correction for a DIFFERENT reason than it was chosen for: what 676
- * MiB bounds is the agent, not the USER'S BUILD, which nothing has measured (the e2e
- * repo is a single-commit fake and compiles nothing — a JVM test suite or a large `go
- * build` is what dwarfs the agent). So the default still rests on the asymmetry: an
- * over-sized default wastes a LIMIT, and limits reserve nothing (only requests do; an
- * idle worker measures ~130 MiB and ~0 CPU whichever preset it is), whereas an
- * under-sized one OOMs the shared cgroup, killing the container and requeueing every
- * in-flight run — which FAILS them past RUN_MAX_REQUEUES, with no pod-phase status in
- * v1 to explain why. M is also compose parity and the formula's floor. Do not
- * re-litigate S on the strength of the 676 MiB number: it bounds the agent, not the
- * build.
- *
- * Still open, and NOT closed by showing the numbers: nothing gives a user a reason to
- * pick S over L, since the quota counts WORKERS and every size costs exactly one. The
- * quantities fix the INFORMED half (a user could not previously see what a size buys);
- * the INCENTIVE half is untouched and was deliberately deferred — the user declined
- * both structural levers (a resource-weighted quota; offering one size only) twice.
- * The argument lives in PRD #58's M6 bullet and is deliberately not restated here; two
- * prose copies of it would drift.
+ * New hosted workers start at L (#2240), matching the ephemeral provisioning default.
+ * Its 4-CPU limit gives build and test commands more concurrency headroom. Compared
+ * with M, its CPU/memory requests double (1 CPU / 8Gi versus 500m / 4Gi), reserving
+ * more node capacity even while idle. S and M remain explicit choices; existing
+ * workers keep the size stored at creation. Rationale: ADR-2240.
  */
-export const DEFAULT_WORKER_SIZE: WorkerSize = "m";
+export const DEFAULT_WORKER_SIZE: WorkerSize = "l";
 
 /**
  * Display spelling of a size name. Upper-case is for READING only — the wire value
@@ -112,7 +75,7 @@ function sizeLabel(size: string): string {
 
 /**
  * One preset's quantities, as a single readable clause for the picker:
- * `up to 2 CPU / 4Gi RAM / 10Gi disk`.
+ * `up to 2 CPU / 8Gi RAM / 10Gi disk`.
  *
  * "up to" qualifies all three honestly: CPU and memory are cgroup ceilings a
  * Burstable pod bursts into, and the disk is a volume of that size — in every case
@@ -131,7 +94,7 @@ export function sizeSummary(size: string): string {
 }
 
 /**
- * The picker's option text: `M — up to 2 CPU / 4Gi RAM / 10Gi disk`.
+ * The picker's option text includes the uppercase size and its resource summary.
  *
  * A <select> option can hold only text, and this is deliberately where the numbers
  * go: the whole point is that the quantities are visible AT the moment of choosing,

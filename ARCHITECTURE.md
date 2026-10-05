@@ -1685,6 +1685,10 @@ docker tier's own privileged-namespace ruling (Q-B) and Decision 3's
 separate-mount-namespace invariant are recorded in
 `prds/done/83-docker-capable-worker.md`.
 
+New persistent and ephemeral workers default to the large preset. The decision,
+capacity cost, and preservation of existing stored sizes are recorded in
+[ADR-2240](adr/2240-hosted-worker-default-size.md).
+
 **Codex on a hosted worker needs a third identity, and that is opt-in.** The
 restricted-tier namespace above starts every worker single-uid, which is one
 identity short of what the Codex harness's fail-closed launcher requires (a
