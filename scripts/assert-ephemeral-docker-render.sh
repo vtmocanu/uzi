@@ -1,5 +1,5 @@
 #!/bin/sh
-# Offline, nonvacuous Docker tier env assertions. Scratch stays in the worktree.
+# Offline, nonvacuous Docker tier env assertions. Scratch lives in the system temp dir.
 set -eu
 
 # Resolve the chart dir: explicit arg, else relative to this script (../deploy/chart).
@@ -11,8 +11,7 @@ CHART_DIR="${1:-$SCRIPT_DIR/../deploy/chart}"
 command -v helm >/dev/null 2>&1 || { echo "BROKEN: helm not on PATH" >&2; exit 2; }
 [ -f "$CHART_DIR/Chart.yaml" ] || { echo "BROKEN: no Chart.yaml under $CHART_DIR" >&2; exit 2; }
 
-ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
-WORK=$(mktemp -d "$ROOT/.uzi/scratch/docker-render.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/docker-render.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT INT TERM
 
 # Build an offline, dependency-free copy of the chart.
