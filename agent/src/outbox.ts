@@ -27,13 +27,13 @@
 // durability there. It protects against OUTAGES (and, on the split-UID runtime,
 // against the runner), not against the model. This is documented, not hidden.
 
-import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import fs from "node:fs/promises";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, type Dir } from "node:fs";
 import path from "node:path";
 
 import type { Logger } from "./log.js";
-import type { OutgoingMessage } from "./protocol.js";
+import type { TerminalRejectionCustodyResponse, OutgoingMessage } from "./protocol.js";
 import type { DiskFullVerdict } from "./disk-full.js";
 
 /** The worker-local HMAC secret is exactly this many random bytes. */
@@ -280,6 +280,22 @@ export type RawWriteSeam = (
   ctx: { path: string; kind: RecordFileKind | "manifest" | "terminal" | "finalize" },
 ) => Promise<void>;
 
+/** Content-free physical evidence. Unknown files never enter the pending inventory. */
+export interface TerminalAuthenticationObservation {
+  runId: string;
+  /** Exact physical directory name; report runId is normalized separately. */
+  physicalRunId?: string;
+  generation?: number;
+  fileName: string;
+  kind: "authenticated" | "mac_failure" | "absent" | "malformed" | "symlink" | "unreadable" | "key_unavailable" | "oversized";
+  fingerprint?: { dev: string; ino: string; sha256: string };
+}
+
+export interface TerminalObservationPage {
+  observations: TerminalAuthenticationObservation[];
+  passComplete: boolean;
+}
+
 export interface OutboxOptions {
   /** The outbox root, `<dataDir>/outbox`. */
   root: string;
@@ -298,6 +314,8 @@ export interface OutboxOptions {
    * {@link deriveTerminalReserveBytes}.
    */
   reserveBytes?: number;
+  /** Bound terminal reads before JSON; defaults to the config's 1.25 MiB cap. */
+  terminalMaxBytes?: number;
   now?: () => number;
   /** Optional raw-write seam to simulate `ENOSPC` (tests). */
   rawWrite?: RawWriteSeam;
@@ -386,6 +404,10 @@ export class Outbox {
   /** The configured `.reserve` byte size (Run B's terminal-sized reserve, or the
    *  Run A default when no `reserveBytes` was supplied). */
   private readonly reserveBytes: number;
+  private readonly terminalReadMaxBytes: number;
+  private terminalScanRoot?: Dir;
+  private terminalScanRun?: { id: string; dir: Dir };
+  private terminalScanTail: Promise<unknown> = Promise.resolve();
   private readonly now: () => number;
   private readonly rawWrite: RawWriteSeam;
   private readonly classifyWriteFailure: OutboxOptions["classifyWriteFailure"];
@@ -404,7 +426,10 @@ export class Outbox {
   private disabled = false;
 
   constructor(opts: OutboxOptions) {
-    this.root = opts.root;
+    this.root = path.resolve(opts.root);
+    const terminalMax = opts.terminalMaxBytes ?? Math.round(1.25 * 1024 * 1024);
+    if (!Number.isSafeInteger(terminalMax) || terminalMax <= 0 || terminalMax > Number.MAX_SAFE_INTEGER - OUTBOX_RANGE_RESERVE_BYTES - 1) throw new Error("invalid terminal cap");
+    this.terminalReadMaxBytes = terminalMax + OUTBOX_RANGE_RESERVE_BYTES;
     this.log = opts.log;
     this.runMaxBytes = opts.runMaxBytes;
     this.maxBytes = opts.maxBytes;
@@ -618,14 +643,14 @@ export class Outbox {
     for (const name of names) {
       const gen = parseTerminalFileName(name);
       if (gen === undefined) continue;
-      const parsed = await this.readAuthed(path.join(dir, name), MAC_DOMAIN_TERMINAL);
+      const parsed = await this.readTerminalAuthed(runId, gen, name);
       if (!parsed) {
         result.rejected++;
         continue; // absent/symlink/unparseable/MAC-bad (readAuthed logged)
       }
       const meta = coerceTerminal(parsed, runId, gen);
       if (!meta) {
-        this.log.warn("outbox: malformed or misfiled terminal journal; skipping", { run_id: runId, file: name });
+        this.log.warn("outbox: malformed or misfiled terminal journal; skipping", { ...(terminalRunUUID(runId) ? { run_id: runId.toLowerCase() } : {}), claim_generation: gen, fact: "malformed" });
         result.rejected++;
         continue;
       }
@@ -1059,6 +1084,7 @@ export class Outbox {
     if (rs.terminals.size !== 0) return false; // a terminal journal was installed after the decision
     if (rs.finalizes.size !== 0) return false; // a finalize record was installed after the decision
     if (now - rs.manifest.updatedAt <= this.retentionMs) return false; // no longer past retention
+    if (await this.hasPhysicalTerminalProtection(runId)) return false;
     await this.removeRun(runId);
     return true;
   }
@@ -1068,6 +1094,7 @@ export class Outbox {
     // separator/NUL) would escape the root, so refuse it here — the last line of
     // defense before `fs.rm(..., { recursive: true })` (H1).
     if (!this.validRunId(runId)) return;
+    if (await this.hasPhysicalTerminalProtection(runId)) return;
     await fs.rm(this.runDir(runId), { recursive: true, force: true }).catch(() => undefined);
     this.runs.delete(runId);
   }
@@ -1204,7 +1231,7 @@ export class Outbox {
   ): Promise<TerminalJournalResult> {
     if (!this.writable()) return { journaled: false, reason: "reserve_exhausted" };
     return this.withRunLock(runId, async () => {
-      if (!this.validRunId(runId)) return { journaled: false, reason: "reserve_exhausted" };
+      if (!this.validRunId(runId) || !Number.isSafeInteger(claimGeneration) || claimGeneration < 0) return { journaled: false, reason: "reserve_exhausted" };
       const dir = this.runDir(runId);
       if (await this.isSymlink(dir)) {
         this.log.warn("outbox: run dir is a symlink; refusing terminal journal (skipped, not followed)", {
@@ -1258,6 +1285,12 @@ export class Outbox {
         }
         throw err;
       }
+      if (adopted) {
+        const existing = await this.readTerminalAuthed(runId, claimGeneration);
+        const meta = existing && coerceTerminal(existing, runId, claimGeneration);
+        if (!meta) return { journaled: false, reason: "reserve_exhausted" };
+        this.ensureInMemoryRun(runId, meta.since).terminals.set(claimGeneration, meta);
+      }
       // Track it in memory. On an adopt (a first-writer already installed this generation) keep
       // the winner's metadata if we already loaded it; otherwise record ours (same generation).
       const rs = this.ensureInMemoryRun(runId, since);
@@ -1304,6 +1337,7 @@ export class Outbox {
     if (this.disabled) return;
     await this.withRunLock(runId, async () => {
       if (!this.validRunId(runId)) return;
+      if (!await this.readTerminalAuthed(runId, claimGeneration)) return;
       await fs
         .rm(path.join(this.runDir(runId), terminalFileName(claimGeneration)), { force: true })
         .catch(() => undefined);
@@ -1323,6 +1357,7 @@ export class Outbox {
       if (!this.validRunId(runId)) return;
       const rs = this.runs.get(runId);
       if (!rs || !rs.terminals.has(claimGeneration)) return;
+      if (!await this.readTerminalAuthed(runId, claimGeneration)) return;
       await fs
         .rm(path.join(this.runDir(runId), terminalFileName(claimGeneration)), { force: true })
         .catch(() => undefined);
@@ -1348,7 +1383,7 @@ export class Outbox {
       const meta = rs?.terminals.get(claimGeneration);
       if (!rs || !meta) return;
       const dst = path.join(this.runDir(runId), terminalFileName(claimGeneration));
-      const parsed = await this.readAuthed(dst, MAC_DOMAIN_TERMINAL);
+      const parsed = await this.readTerminalAuthed(runId, claimGeneration);
       if (parsed) {
         const next = { ...parsed, blocked: true, blocked_reason: reason };
         // Re-seal + rewrite atomically (rename-based): the exclusive first-writer guarantee is only
@@ -1384,10 +1419,7 @@ export class Outbox {
     if (this.disabled) return undefined;
     return this.withRunLock(runId, async () => {
       if (!this.validRunId(runId)) return undefined;
-      const parsed = await this.readAuthed(
-        path.join(this.runDir(runId), terminalFileName(claimGeneration)),
-        MAC_DOMAIN_TERMINAL,
-      );
+      const parsed = await this.readTerminalAuthed(runId, claimGeneration);
       if (!parsed) return undefined;
       return coerceTerminalRecord(parsed, runId, claimGeneration) ?? undefined;
     });
@@ -1606,16 +1638,8 @@ export class Outbox {
    *  recursive delete must never be handed an escaping component (H1). Rejection
    *  logs a warning; the caller fails closed (no write, no delete). */
   private validRunId(runId: string): boolean {
-    if (
-      runId === "" ||
-      runId === "." ||
-      runId === ".." ||
-      runId.includes("/") ||
-      runId.includes("\\") ||
-      runId.includes("\0") ||
-      path.basename(runId) !== runId
-    ) {
-      this.log.warn("outbox: refusing non-bare runId (path escape guard)", { run_id: runId });
+    if (runId === "" || runId === "." || runId === ".." || runId.includes("/") || runId.includes("\\") || runId.includes("\0") || path.basename(runId) !== runId) {
+      this.log.warn("outbox: refusing non-bare runId (path escape guard)", { fact: "invalid_run_id" });
       return false;
     }
     return true;
@@ -1785,6 +1809,202 @@ export class Outbox {
   private computeMac(domain: string, body: unknown): string {
     if (!this.key) throw new Error("outbox: MAC key unavailable");
     return createHmac("sha256", this.key).update(domain).update(canonicalJson(body)).digest("hex");
+  }
+
+  /** Observe one alias using a bounded no-follow regular-file read. */
+  async observeTerminalAuthentication(runId: string, generation: number, fileName = terminalFileName(generation)): Promise<TerminalAuthenticationObservation> {
+    if (!terminalRunUUID(runId)) return { runId, generation, fileName, kind: "malformed" };
+    return (await this.inspectTerminal(runId, generation, fileName)).observation;
+  }
+
+  private async readTerminalAuthed(runId: string, generation: number, fileName = terminalFileName(generation)): Promise<Record<string, unknown> | null> {
+    const result = await this.inspectTerminal(runId, generation, fileName);
+    if (!result.record) this.runs.get(runId)?.terminals.delete(generation);
+    return result.record ?? null;
+  }
+
+  private async terminalDirectorySafe(runId: string): Promise<boolean> {
+    if (!this.validRunId(runId)) return false;
+    const root = await fs.lstat(this.root);
+    const dir = await fs.lstat(this.runDir(runId));
+    return root.isDirectory() && !root.isSymbolicLink() && dir.isDirectory() && !dir.isSymbolicLink() &&
+      await fs.realpath(this.runDir(runId)) === path.join(await fs.realpath(this.root), runId);
+  }
+
+  private async inspectTerminal(runId: string, generation: number | undefined, fileName: string): Promise<{ observation: TerminalAuthenticationObservation; record?: Record<string, unknown> }> {
+    const observation: TerminalAuthenticationObservation = { runId: terminalRunUUID(runId) ? runId.toLowerCase() : runId, physicalRunId: runId, generation, fileName, kind: "malformed" };
+    const result = { observation } as { observation: TerminalAuthenticationObservation; record?: Record<string, unknown> };
+    if (!this.validRunId(runId) || generation === undefined || !Number.isSafeInteger(generation) || generation < 0 || parseTerminalFileName(fileName) !== generation) return result;
+    let fh: Awaited<ReturnType<typeof fs.open>> | undefined;
+    try {
+      if (!await this.terminalDirectorySafe(runId)) { observation.kind = "symlink"; return result; }
+      const filePath = path.join(this.runDir(runId), fileName);
+      const before = await fs.lstat(filePath, { bigint: true });
+      if (before.isSymbolicLink()) { observation.kind = "symlink"; return result; }
+      if (!before.isFile()) { observation.kind = "unreadable"; return result; }
+      fh = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+      const stat = await fh.stat({ bigint: true });
+      if (!stat.isFile() || stat.ino !== before.ino || stat.dev !== before.dev) { observation.kind = "unreadable"; return result; }
+      const raw = Buffer.alloc(this.terminalReadMaxBytes + 1);
+      let length = 0;
+      // At most cap+1 bytes and cap+1 nonempty read attempts; EOF ends sooner.
+      while (length < raw.length) {
+        const { bytesRead } = await fh.read(raw, length, raw.length - length, null);
+        if (!bytesRead) break;
+        length += bytesRead;
+      }
+      if (length > this.terminalReadMaxBytes) { observation.kind = "oversized"; return result; }
+      const after = await fs.lstat(filePath, { bigint: true });
+      const final = await fh.stat({ bigint: true });
+      if (after.ino !== stat.ino || after.dev !== stat.dev || final.size !== stat.size || final.mtimeNs !== stat.mtimeNs || final.ctimeNs !== stat.ctimeNs || !await this.terminalDirectorySafe(runId)) { observation.kind = "unreadable"; return result; }
+      observation.fingerprint = { dev: String(stat.dev), ino: String(stat.ino), sha256: createHash("sha256").update(raw.subarray(0, length)).digest("hex") };
+      if (!this.key) { observation.kind = "key_unavailable"; return result; }
+      let parsed: unknown;
+      try { parsed = JSON.parse(raw.subarray(0, length).toString("utf8")); } catch { return result; }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return result;
+      const obj = { ...parsed as Record<string, unknown> };
+      const mac = obj.mac;
+      if (typeof mac !== "string" || !/^[0-9a-f]{64}$/i.test(mac)) return result;
+      delete obj.mac;
+      if (!macEqual(mac, this.computeMac(MAC_DOMAIN_TERMINAL, obj))) {
+        observation.kind = "mac_failure";
+        if (terminalRunUUID(runId)) this.log.warn("outbox: terminal authentication rejected", { run_id: runId.toLowerCase(), claim_generation: generation, fact: "mac_failure" });
+        return result;
+      }
+      if (!coerceTerminalRecord(obj, runId, generation)) return result;
+      observation.kind = "authenticated";
+      result.record = obj;
+      return result;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      observation.kind = code === "ENOENT" ? "absent" : code === "ELOOP" ? "symlink" : "unreadable";
+      return result;
+    } finally {
+      if (fh) await fh.close();
+    }
+  }
+
+  /** Physical terminals protect the entire run subtree, including unknown/unsafe aliases.
+   * A directory read failure conservatively protects it, independent of authenticated counts. */
+  async hasPhysicalTerminalProtection(runId: string): Promise<boolean> {
+    if (!this.validRunId(runId)) return true;
+    let dir: Dir | undefined;
+    try {
+      if (!await this.terminalDirectorySafe(runId)) return true;
+      dir = await fs.opendir(this.runDir(runId));
+      for await (const entry of dir) {
+        if (entry.name.startsWith(TERMINAL_FILE_PREFIX)) return true;
+      }
+      dir = undefined; // for-await closes the directory, including early return.
+      return false;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code !== "ENOENT";
+    } finally {
+      if (dir) await dir.close().catch(() => undefined);
+    }
+  }
+
+  /** One persistent cursor, serialized across callers. Each page visits at most 256 physical
+   * entries (directories included) and returns at most 256 observations. The cursor advances
+   * before transport, so failed requests cannot starve newer files. EOF starts a fresh pass. */
+  scanTerminalObservationsPage(): Promise<TerminalObservationPage> {
+    const next = this.terminalScanTail.then(() => this.scanTerminalPage());
+    this.terminalScanTail = next.catch(() => undefined);
+    return next;
+  }
+
+  async closeTerminalObservationScan(): Promise<void> {
+    await this.terminalScanTail;
+    if (this.terminalScanRun) await this.terminalScanRun.dir.close().catch(() => undefined);
+    if (this.terminalScanRoot) await this.terminalScanRoot.close().catch(() => undefined);
+    this.terminalScanRun = undefined;
+    this.terminalScanRoot = undefined;
+  }
+
+  private async scanTerminalPage(): Promise<TerminalObservationPage> {
+    const page: TerminalObservationPage = { observations: [], passComplete: false };
+    try {
+      if (!this.terminalScanRoot) {
+        if (!(await fs.lstat(this.root)).isDirectory()) throw new Error("unsafe root");
+        this.terminalScanRoot = await fs.opendir(this.root);
+      }
+      for (let visited = 0; visited < 256; visited++) {
+        if (this.terminalScanRun) {
+          const entry = await this.terminalScanRun.dir.read();
+          if (!entry) {
+            await this.terminalScanRun.dir.close();
+            this.terminalScanRun = undefined;
+            continue;
+          }
+          if (entry.name.startsWith(TERMINAL_FILE_PREFIX)) {
+            const result = await this.inspectTerminal(this.terminalScanRun.id, parseTerminalFileName(entry.name), entry.name);
+            page.observations.push(result.observation);
+          }
+        } else {
+          const entry = await this.terminalScanRoot.read();
+          if (!entry) {
+            await this.terminalScanRoot.close();
+            this.terminalScanRoot = undefined;
+            page.passComplete = true;
+            break;
+          }
+          if (entry.isDirectory() && terminalRunUUID(entry.name)) {
+            try {
+              if (await this.terminalDirectorySafe(entry.name)) this.terminalScanRun = { id: entry.name, dir: await fs.opendir(this.runDir(entry.name)) };
+            } catch { /* One inaccessible run does not block sibling runs this pass. */ }
+          }
+        }
+      }
+      return page;
+    } catch (err) {
+      if (this.terminalScanRun) await this.terminalScanRun.dir.close().catch(() => undefined);
+      if (this.terminalScanRoot) await this.terminalScanRoot.close().catch(() => undefined);
+      this.terminalScanRun = undefined;
+      this.terminalScanRoot = undefined;
+      throw err;
+    }
+  }
+
+  /** Exact aliases only; the coordinator supplies fresh custody authority INSIDE the run lock.
+   * Diagnostic POST acknowledgments are not accepted. Unknown observations are never deleted.
+   * The worker's run lock serializes worker mutations; the existing single-UID residual applies. */
+  async cleanupRejectedTerminalFiles(
+    runId: string,
+    generation: number,
+    workerId: string,
+    observations: readonly TerminalAuthenticationObservation[],
+    freshCustody: () => Promise<TerminalRejectionCustodyResponse | undefined>,
+  ): Promise<number> {
+    if (!terminalRunUUID(runId) || !terminalRunUUID(workerId) || !Number.isSafeInteger(generation) || generation < 0 || observations.length === 0 || observations.length > 256) return 0;
+    runId = runId.toLowerCase();
+    workerId = workerId.toLowerCase();
+    const physicalRunId = observations[0]!.physicalRunId ?? runId;
+    if (!terminalRunUUID(physicalRunId) || physicalRunId.toLowerCase() !== runId || observations.some(o => (o.physicalRunId ?? runId) !== physicalRunId)) return 0;
+    return this.withRunLock(physicalRunId, async () => {
+      const same = (a: TerminalAuthenticationObservation, b: TerminalAuthenticationObservation) =>
+        a.kind === "mac_failure" && b.kind === "mac_failure" && a.runId === runId && a.generation === generation &&
+        a.fileName === b.fileName && a.fingerprint !== undefined && b.fingerprint !== undefined &&
+        a.fingerprint.dev === b.fingerprint.dev && a.fingerprint.ino === b.fingerprint.ino && a.fingerprint.sha256 === b.fingerprint.sha256;
+      const names = new Set<string>();
+      for (const observed of observations) {
+        if (names.has(observed.fileName) || !same(observed, await this.observeTerminalAuthentication(physicalRunId, generation, observed.fileName))) return 0;
+        names.add(observed.fileName);
+      }
+      const custody = await freshCustody();
+      if (!custody || custody.run_id !== runId || custody.worker_id !== workerId || custody.generation !== generation ||
+          custody.outcome !== "settled" || !custody.complete || !custody.exact_complete || !custody.sibling_complete ||
+          !Number.isSafeInteger(custody.exact_count) || custody.exact_count < 1 || custody.exact_count > 256 ||
+          custody.exact_holds.length !== custody.exact_count || custody.exact_holds.some(h => !terminalRunUUID(h.id) || (h.state !== "released" && h.state !== "discarded")) ||
+          new Set(custody.exact_holds.map(h => h.id)).size !== custody.exact_count || custody.sibling_count !== 0 || custody.sibling_holds.length !== 0) return 0;
+      let removed = 0;
+      for (const observed of observations) {
+        if (!same(observed, await this.observeTerminalAuthentication(physicalRunId, generation, observed.fileName))) return removed;
+        await fs.unlink(path.join(this.runDir(physicalRunId), observed.fileName));
+        await this.fsyncDir(this.runDir(physicalRunId), true);
+        removed++;
+      }
+      return removed;
+    });
   }
 
   /** Read + authenticate a record file. Returns the parsed body (minus `mac`) when
@@ -2110,6 +2330,10 @@ function gapTombstone(seq: number, reason: string): OutgoingMessage {
 
 // ── terminal-journal helpers (Run B / M3) ─────────────────────────────────────────
 
+function terminalRunUUID(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
 /** The `terminal-<generation>.json` filename for a claim generation (D4). */
 function terminalFileName(claimGeneration: number): string {
   return `${TERMINAL_FILE_PREFIX}${claimGeneration}${TERMINAL_FILE_SUFFIX}`;
@@ -2124,7 +2348,7 @@ function parseTerminalFileName(name: string): number | undefined {
   const mid = name.slice(TERMINAL_FILE_PREFIX.length, name.length - TERMINAL_FILE_SUFFIX.length);
   if (!/^\d+$/.test(mid)) return undefined; // no sign, no separators, no leading `+`
   const gen = Number(mid);
-  return Number.isInteger(gen) && gen >= 0 ? gen : undefined;
+  return Number.isSafeInteger(gen) && gen >= 0 ? gen : undefined;
 }
 
 /** The `finalize-<generation>.json` filename for a claim generation (issue #1742). */

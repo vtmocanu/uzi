@@ -3076,3 +3076,27 @@ export interface PrDescriptionAckResponse {
   pr: PrDescriptionState;
   recovered_version_id: string | null;
 }
+
+/** #1974: diagnostics only; a disposition never authorizes local cleanup. */
+export interface TerminalRejection {
+  run_id: string;
+  claim_generation: number;
+  reason: "mac_failure";
+}
+export interface TerminalRejectionsRequest { rejections: TerminalRejection[] }
+export interface TerminalRejectionsResponse {
+  dispositions: (TerminalRejection & { disposition: "recorded" | "skipped" })[];
+}
+export interface TerminalRejectionCustodyResponse {
+  run_id: string;
+  worker_id: string;
+  generation: number;
+  exact_holds: { id: string; state: "open" | "released" | "discarded" }[];
+  sibling_holds: { id: string; generation: number }[];
+  exact_count: number;
+  sibling_count: number;
+  exact_complete: boolean;
+  sibling_complete: boolean;
+  complete: boolean;
+  outcome: "retained" | "settled" | "unknown";
+}
