@@ -1895,11 +1895,11 @@ Docker-only ReplicaSet-list permission, bounded observations and upgrade policy.
 
 ### Admin in-app health (PRD #1484)
 
-An admin-only, read-only Health tab, Overview card, app-wide Danger banner (with a
-per-admin 1h snooze) and `uzi admin health` roll up the full closed registry
-of checks over worker rolls/capacity, the queue, the
-controller's own liveness, background loops, the database, integrations, and
-housekeeping. It **never reads the Kubernetes API** — `api` stays credential-free,
+An admin-only, read-only Health tab, Overview card and `uzi admin health`
+show the full closed registry of checks over worker rolls/capacity, the queue,
+the controller's own liveness, background loops, the database, integrations,
+and housekeeping. The app-wide Danger banner (with a per-admin 1h snooze)
+follows instance blockers. In-app health **never reads the Kubernetes API** — `api` stays credential-free,
 exactly as the worker controller section above requires — so every
 Kubernetes-derived fact (a worker pod stuck rolling) still arrives only over the
 existing controller report; pod-level health of the `api`/`web`/database/controller
