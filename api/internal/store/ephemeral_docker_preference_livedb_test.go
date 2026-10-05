@@ -67,7 +67,7 @@ func TestEphemeralDockerPreferenceAppliesLiveDB(t *testing.T) {
 		t.Fatalf("strict=%v volatility=%s", strict, volatility)
 	}
 	// The previous lease signature still admits the same ordinary follow-up.
-	if err := fx.pool.QueryRow(fx.ctx, `SELECT fn_ephemeral_lease_admits(now(),$1::uuid,'branch',false,interval '1 hour',now(),$1::uuid,'issue','branch',NULL,1,NULL,NULL)`, fx.repoID).Scan(&got); err != nil || !got {
+	if err := fx.pool.QueryRow(fx.ctx, `SELECT fn_ephemeral_lease_admits(now(),$1::uuid,'agent/issue-1',false,interval '1 hour',now(),$1::uuid,'issue','agent/issue-1',NULL,1,NULL,NULL)`, fx.repoID).Scan(&got); err != nil || !got {
 		t.Fatalf("old lease=%v err=%v", got, err)
 	}
 	for _, tc := range []struct {
