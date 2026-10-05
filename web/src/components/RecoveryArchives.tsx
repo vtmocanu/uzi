@@ -61,7 +61,7 @@ function RecoveryArchivesContent({ run }: { run: Run }) {
         if (live) setHolds(listing.holds.filter((hold) => hold.run_id === run.id));
       })
       .catch(() => {
-        if (live) setHolds([]);
+        // Keep the last-good holds on a transient failure; run.id remounts this state.
       });
     return () => {
       live = false;
@@ -74,8 +74,11 @@ function RecoveryArchivesContent({ run }: { run: Run }) {
     .map((hold) => ({ hold, view: custodyHoldView(hold) }))
     .filter(({ view }) => view.terminalRejection !== null);
   const kind = summary ? recoverySectionKind(summary, run.status) : null;
-  const sourceOnly = diagnostics.some(
-    ({ hold }) => hold.attention === "source_only" && !hold.has_available_capture,
+  // An open rejected hold alone is no evidence that an archive is being produced.
+  // Explicit capture metadata can still describe independently authorized preparation.
+  const unverifiedSource = diagnostics.some(
+    ({ hold }) => hold.state === "open" && !hold.has_available_capture &&
+      hold.capture_state !== "preparing" && hold.capture_state !== "uploading",
   );
   if (!kind && diagnostics.length === 0) return null;
 
@@ -126,7 +129,7 @@ function RecoveryArchivesContent({ run }: { run: Run }) {
         </p>
       )}
 
-      {kind === "preparing" && !sourceOnly && (
+      {kind === "preparing" && !unverifiedSource && (
         <div className="rounded-lg border border-info/40 bg-info/10 px-3 py-2 text-sm text-info">
           Preparing the recovery archive. The committed history is being captured and
           stored, and a download appears here once it is ready.

@@ -183,7 +183,7 @@ func TestTerminalRejectionAcceptanceLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	binary := filepath.Join(scratch, "uzi")
-	build := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-o", binary, "./cmd/uzi")
+	build := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-o", binary, "./cmd/uzi") //nolint:gosec // G204: fixed command and build args; test-owned fixture output path, no shell
 	build.Dir = "../.."
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("CLI build: %v %s", err, output)
@@ -191,7 +191,7 @@ func TestTerminalRejectionAcceptanceLiveDB(t *testing.T) {
 	server := httptest.NewServer(e.router)
 	defer server.Close()
 	cli := func(args ...string) ([]byte, error) {
-		cmd := exec.CommandContext(ctx, binary, args...)
+		cmd := exec.CommandContext(ctx, binary, args...) //nolint:gosec // G204: generated test-owned binary; fixed test args and fixture IDs/paths, no shell
 		// Replace inherited credentials/config; the token never enters argv.
 		for _, entry := range os.Environ() {
 			if !strings.HasPrefix(entry, "UZI_") && !strings.HasPrefix(entry, "XDG_CONFIG_HOME=") {
