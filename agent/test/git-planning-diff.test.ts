@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { PassThrough, Readable } from "node:stream";
 import { getEventListeners } from "node:events";
 import { createHash } from "node:crypto";
+import { crc32, deflateSync } from "node:zlib";
 import { GitCache, gitEnv } from "../src/git.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "../src/harness.js";
 import { TickSpawner } from "../src/tick-spawner.js";
@@ -87,6 +88,14 @@ meterFs.readSync = function(...args) {
 const meterSpawn = meterCp.spawn;
 meterCp.spawn = function(...args) {
   const p = meterSpawn.apply(this, args);
+  if (args[1].includes("cat-file") && ["commit", "tree", "blob"].some(type => args[1].includes(type))) {
+    const read = p.stdout.read;
+    p.stdout.read = function(...readArgs) {
+      const bytes = read.apply(this, readArgs);
+      if (Buffer.isBuffer(bytes)) readMetrics.source += bytes.length;
+      return bytes;
+    };
+  }
   if (args[1].includes("diff") && args[1].includes("--no-index")) {
     readMetrics.diffSpawned++;
     p.once("close", () => { readMetrics.diffClosed++; });
@@ -113,6 +122,118 @@ process.on("exit", () => meterFs.writeFileSync(${JSON.stringify(metricPath)}, JS
 }
 
 describe("Unit2 runner source capture", () => {
+  for (const kind of ["outside loose symlink", "outside loose directory symlink", "forged blob", "forged commit", "forged tree", "packed pack symlink", "packed idx symlink", "packed directory symlink"]) {
+    it("refuses object integrity attack: " + kind, async () => {
+      const f = await fixture();
+      let forged: { type: string; oid: string } | undefined;
+      try {
+        if (!kind.startsWith("packed")) {
+          // Force a loose-only baseline so Git cannot prefer an authentic packed duplicate.
+          await fs.rm(path.join(f.clone, ".git/objects"), { recursive: true });
+          await fs.cp(path.join(f.data, "seed/.git/objects"), path.join(f.clone, ".git/objects"), { recursive: true });
+        }
+        await fs.unlink(path.join(f.clone, "tracked"));
+        assert.match((await f.capture()).toString(), /-base/);
+        if (kind.startsWith("packed")) {
+          await f.git("repack", "-a", "-d");
+          assert.match((await f.capture()).toString(), /-base/);
+          const packDir = path.join(f.clone, ".git/objects/pack");
+          const suffix = kind.includes("idx") ? ".idx" : ".pack";
+          const name = (await fs.readdir(packDir)).find(name => name.endsWith(suffix))!;
+          const object = path.join(packDir, name), outside = path.join(f.data, "outside-pack");
+          if (kind === "packed directory symlink") {
+            await fs.cp(packDir, outside, { recursive: true });
+            await fs.rm(packDir, { recursive: true });
+            await fs.symlink(outside, packDir);
+          } else {
+            await fs.copyFile(object, outside);
+            await fs.unlink(object);
+            await fs.symlink(outside, object);
+          }
+        } else {
+          const type = kind.includes("commit") ? "commit" : kind.includes("tree") ? "tree" : "blob";
+          const oid = (await f.git("rev-parse", type === "commit" ? "HEAD" : type === "tree" ? "HEAD^{tree}" : "HEAD:tracked")).trim();
+          if (kind.startsWith("forged")) forged = { type, oid };
+          let body: Buffer;
+          if (type === "commit") body = Buffer.from((await f.git("cat-file", "commit", oid)) + "forged message\n");
+          else if (type === "tree") {
+            // An otherwise valid tree under the original OID points tracked at a different authentic blob.
+            const other = (await f.git("rev-parse", "HEAD:deleted")).trim();
+            body = Buffer.concat([Buffer.from("100644 tracked\0"), Buffer.from(other, "hex")]);
+          } else body = Buffer.from(kind.startsWith("outside") ? "base\n" : "evil\n"); // Same size; symlink controls use authentic bytes.
+          assert.equal(createHash("sha1").update(type + " " + body.length + "\0").update(body).digest("hex") === oid,
+            kind.startsWith("outside"));
+          const bytes = deflateSync(Buffer.concat([Buffer.from(type + " " + body.length + "\0"), body]));
+          const object = path.join(f.clone, ".git/objects", oid.slice(0, 2), oid.slice(2));
+          await fs.mkdir(path.dirname(object), { recursive: true });
+          await fs.rm(object, { force: true });
+          if (kind === "outside loose directory symlink") {
+            // Redirect an authentic fanout directory, not just the final object file.
+            await fs.writeFile(object, bytes);
+            const outside = path.join(f.data, "outside-fanout");
+            await fs.cp(path.dirname(object), outside, { recursive: true });
+            await fs.rm(path.dirname(object), { recursive: true });
+            await fs.symlink(outside, path.dirname(object));
+          } else if (kind === "outside loose symlink") {
+            const outside = path.join(f.data, "outside-object");
+            await fs.writeFile(outside, bytes);
+            await fs.symlink(outside, object);
+          } else if (type === "blob") await fs.writeFile(object, bytes);
+          else {
+            // A valid pack/idx checksum does not authenticate the idx's object identity.
+            // Keep other baseline objects loose; substitute this commit/tree through a forged idx.
+            const header = Buffer.alloc(12);
+            header.write("PACK"); header.writeUInt32BE(2, 4); header.writeUInt32BE(1, 8);
+            let size = body.length;
+            const encoding = [(type === "commit" ? 1 : 2) * 16 + (size & 15)];
+            size >>>= 4;
+            while (size) {
+              encoding[encoding.length - 1]! |= 128;
+              encoding.push(size & 127); size >>>= 7;
+            }
+            const entry = Buffer.concat([Buffer.from(encoding), deflateSync(body)]);
+            const payload = Buffer.concat([header, entry]), packHash = createHash("sha1").update(payload).digest();
+            const pack = Buffer.concat([payload, packHash]);
+            const idx = Buffer.alloc(8 + 256 * 4 + 20 + 4 + 4 + 20);
+            idx.writeUInt32BE(0xff744f63, 0); idx.writeUInt32BE(2, 4);
+            for (let i = parseInt(oid.slice(0, 2), 16); i < 256; i++) idx.writeUInt32BE(1, 8 + i * 4);
+            Buffer.from(oid, "hex").copy(idx, 1032);
+            idx.writeUInt32BE(crc32(entry), 1052); idx.writeUInt32BE(12, 1056);
+            packHash.copy(idx, 1060);
+            const packDir = path.join(f.clone, ".git/objects/pack");
+            await fs.mkdir(packDir, { recursive: true });
+            const stem = path.join(packDir, "pack-" + packHash.toString("hex"));
+            await fs.writeFile(stem + ".pack", pack);
+            await fs.writeFile(stem + ".idx", Buffer.concat([idx, createHash("sha1").update(idx).digest()]));
+          }
+        }
+        if (forged) {
+          // Prove Git serves the forged body; rejection must come from capture authentication.
+          const { type, oid } = forged;
+          const served = (await exec("git", ["-C", f.clone, "cat-file", type, oid],
+            { env: gitEnv(), timeout: 5000, encoding: "buffer" })).stdout;
+          assert.notEqual(createHash("sha1").update(type + " " + served.length + "\0").update(served).digest("hex"), oid);
+        }
+        await assert.rejects(f.capture(), kind.startsWith("forged") ? /base object integrity mismatch/ : /ELOOP|ENOTDIR/);
+      } finally { await f.dispose(); }
+    });
+  }
+
+  it("captures legitimate loose and repacked objects", async () => {
+    const f = await fixture();
+    try {
+      await fs.rm(path.join(f.clone, ".git/objects"), { recursive: true });
+      await fs.cp(path.join(f.data, "seed/.git/objects"), path.join(f.clone, ".git/objects"), { recursive: true });
+      // Materialize a loose blob and commit through Git's public object-writing interface.
+      await fs.writeFile(path.join(f.clone, "tracked"), "loose change\n");
+      await f.git("add", "tracked");
+      await f.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "loose");
+      assert.match((await f.capture()).toString(), /-base\n\+loose change/);
+      await f.git("repack", "-a", "-d");
+      assert.match((await f.capture()).toString(), /-base\n\+loose change/);
+    } finally { await f.dispose(); }
+  });
+
   it("refuses non-UTF8 base metadata even after the source path is deleted", async () => {
     const f = await fixture({ seed: async seed => {
       const name = Buffer.concat([Buffer.from(seed + "/"), Buffer.from([0xff])]);
@@ -218,7 +339,7 @@ describe("Unit2 runner source capture", () => {
       for (let i = 0; i < 33; i++) await fs.writeFile(path.join(seed, "unchanged-" + i), text);
     } });
     try {
-      // Every file hashes to its base OID. Only actual source reads consume the budget.
+      // Every file hashes to its verified base OID; snapshot and raw object pipes also consume the budget.
       await assert.rejects(f.capture(), /total source cap/);
       const metrics = JSON.parse(await fs.readFile(path.join(f.data, "read-metrics.json"), "utf8"));
       console.log("aggregate source actual reads:", metrics.source);

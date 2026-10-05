@@ -7464,8 +7464,11 @@ export class GitCache {
  * traversal is deliberately required. Unsupported indexes/objects fail closed.
  * Metadata: 2 MiB per Git pipe/index, 20,000 tracked paths, 30,000 entries,
  * 2,048 directories, depth 64. Patches: 512 KiB total and per diff pipe.
- * Sources: 4 MiB per regular file/blob, 128 MiB total (including ignore/index
- * inputs), plus one overflow sentinel byte; 200 nonignored untracked files.
+ * Sources: 4 MiB per worktree file/blob, 128 MiB total including ignore/index,
+ * object-store snapshot and authenticated commit/tree/blob pipe reads, plus one
+ * overflow sentinel byte; 200 nonignored untracked files. Object files (including
+ * packs) may use the remaining aggregate budget, without the 4 MiB file cap.
+ * Copying the entire bounded object store can conservatively refuse large histories.
  * Patch pipes likewise consume at most 512 KiB total plus one sentinel byte.
  * One error aborts the entire capture.
  * Child commands have a 5s deadline; capture has a 30s whole-root deadline.
@@ -7501,7 +7504,7 @@ function absoluteDirectory(p) {
 }
 function components(p) {
   const parts = p.split("/");
-  if (!p || parts.length > DEPTH_LIMIT + 1 || parts.some(x => !x || x === "." || x === ".." || x.toLowerCase() === ".git")
+  if (!p || p.includes("\0") || parts.length > DEPTH_LIMIT + 1 || parts.some(x => !x || x === "." || x === ".." || x.toLowerCase() === ".git")
       || Buffer.from(p).toString() !== p) throw Error("unsafe path");
   return parts;
 }
@@ -7554,7 +7557,7 @@ const env = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev
   GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "uzi-no-transport",
   GIT_ATTR_NOSYSTEM: "1", GIT_OPTIONAL_LOCKS: "0", GIT_EXTERNAL_DIFF: "",
   GIT_CEILING_DIRECTORIES: "/", GIT_CONFIG_COUNT: "0" };
-function command(args, cap = METADATA_LIMIT, input, allowDiff = false, cwd = temp, extra = {}) {
+function command(args, cap = METADATA_LIMIT, input, allowDiff = false, cwd = temp, extra = {}, source = false) {
   check();
   return new Promise((resolve, reject) => {
     const p = spawn(git, ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
@@ -7574,9 +7577,14 @@ function command(args, cap = METADATA_LIMIT, input, allowDiff = false, cwd = tem
         try {
           let n = stderr ? errBytes : bytes;
           while (!error) {
-            const b = s.read(Math.min(16384, Math.max(1, s.readableLength), cap + 1 - n));
+            const b = s.read(Math.min(16384, Math.max(1, s.readableLength), cap + 1 - n,
+              source && !stderr ? TOTAL_LIMIT + 1 - total : Infinity));
             if (b === null) break;
             n += b.length;
+            if (source && !stderr) {
+              total += b.length;
+              if (total > TOTAL_LIMIT) { fail(Error("total source cap")); break; }
+            }
             if (stderr) errBytes = n; else bytes = n;
             if (n > cap) { fail(Error("Git pipe cap")); break; }
             if (!stderr) chunks.push(b);
@@ -7654,20 +7662,92 @@ function indexEntries(bytes) {
   const attributes = await command(["check-attr", "-z", "diff", "filter", "--", ...attrNames]);
   const expectedAttributes = Buffer.from(attrNames.map(name => name + "\0diff\0set\0" + name + "\0filter\0unset\0").join(""));
   if (!attributes.equals(expectedAttributes)) throw Error("neutral attributes unavailable");
-  const objectEnv = { GIT_OBJECT_DIRECTORY: fdpath(objects) };
-  const metadata = args => command(args, METADATA_LIMIT, undefined, false, temp, objectEnv);
-  const resolved = (await metadata(["rev-parse", "--verify", base + "^{commit}"])).toString().trim();
-  if (resolved !== base) throw Error("base unavailable");
-  const old = new Map();
-  for (const row of paths(await metadata(["ls-tree", "-rz", "--full-tree", base]))) {
-    const tab = row.indexOf("\t");
-    const head = row.slice(0, tab).split(" "), name = row.slice(tab + 1);
-    components(name);
-    if (tab < 0 || head[1] !== "blob" || !["100644", "100755"].includes(head[0]))
-      throw Error("unsupported base mode");
-    old.set(name, { mode: parseInt(head[0], 8), oid: head[2] });
-    if (old.size > PATH_LIMIT) throw Error("base path cap");
+  // A directory descriptor pins traversal only: Git can follow links inside it.
+  // Git receives only runner-owned copies, never paths into the mutable clone.
+  const objectStore = path.join(temp, "object-store");
+  fs.mkdirSync(objectStore);
+  function snapshot(fd, dst, depth) {
+    if (++dirs > DIR_LIMIT || depth > DEPTH_LIMIT) throw Error("directory cap");
+    const stream = fs.opendirSync(fdpath(fd), { encoding: "buffer" });
+    try {
+      let ent;
+      while ((ent = stream.readSync())) {
+        check(); if (++entries > ENTRY_LIMIT) throw Error("metadata entry cap");
+        const raw = ent.name, name = raw.toString("utf8");
+        if (!Buffer.from(name).equals(raw)) throw Error("non UTF8 object filename");
+        if (components(name).length !== 1) throw Error("unsafe object filename");
+        const target = path.join(dst, name);
+        if (ent.isDirectory()) {
+          const sub = directory(fd, name);
+          try {
+            fs.mkdirSync(target);
+            snapshot(sub, target, depth + 1);
+          } finally { close(sub); }
+        } else {
+          const src = openFile(fd, name);
+          try { fs.writeFileSync(target, read(src, TOTAL_LIMIT - total), { flag: "wx", mode: 0o600 }); }
+          finally { close(src); }
+        }
+      }
+    } finally { stream.closeSync(); }
   }
+  snapshot(objects, objectStore, 0);
+  // Check the owned snapshot as well: alternates could have appeared during copying.
+  for (const name of ["alternates", "http-alternates"]) {
+    if (fs.existsSync(path.join(objectStore, "info", name))) throw Error("object alternates unsupported");
+  }
+  const objectEnv = { GIT_OBJECT_DIRECTORY: objectStore };
+  async function object(type, oid, cap) {
+    if (!/^[0-9a-f]{40}$/.test(oid)) throw Error("invalid object identity");
+    const description = (await command(["cat-file", "--batch-check=%(objecttype) %(objectsize)"],
+      METADATA_LIMIT, oid + "\n", false, temp, objectEnv)).toString();
+    const match = /^(commit|tree|blob) (0|[1-9][0-9]*)\n$/.exec(description);
+    if (!match || match[1] !== type) throw Error("base object type mismatch");
+    const size = Number(match[2]);
+    if (!Number.isSafeInteger(size) || size > cap || total + size > TOTAL_LIMIT)
+      throw Error("base source cap");
+    const bytes = await command(["cat-file", type, oid], size, undefined, false, temp, objectEnv, true);
+    if (bytes.length !== size || createHash("sha1").update(type + " " + bytes.length + "\0")
+        .update(bytes).digest("hex") !== oid) throw Error("base object integrity mismatch");
+    return bytes;
+  }
+  const commit = await object("commit", base, METADATA_LIMIT);
+  const treeHeader = /^tree ([0-9a-f]{40})\n/.exec(commit.subarray(0, 46).toString("ascii"));
+  if (!treeHeader || !commit.subarray(0, 46).equals(Buffer.from(treeHeader[0]))) throw Error("invalid base commit tree");
+  const old = new Map();
+  let treeBytes = 0;
+  async function tree(oid, prefix, depth) {
+    if (++dirs > DIR_LIMIT || depth > DEPTH_LIMIT) throw Error("directory cap");
+    const bytes = await object("tree", oid, METADATA_LIMIT - treeBytes);
+    treeBytes += bytes.length;
+    let at = 0, prior = null;
+    const names = new Set();
+    while (at < bytes.length) {
+      check(); if (++entries > ENTRY_LIMIT) throw Error("metadata entry cap");
+      const space = bytes.indexOf(32, at), end = bytes.indexOf(0, at);
+      if (space < at || end <= space || end + 21 > bytes.length) throw Error("invalid base tree");
+      const mode = bytes.toString("ascii", at, space);
+      if (!["40000", "100644", "100755"].includes(mode)
+          || !bytes.subarray(at, space).equals(Buffer.from(mode))) throw Error("unsupported base mode");
+      const raw = bytes.subarray(space + 1, end), name = raw.toString("utf8");
+      if (!Buffer.from(name).equals(raw)) throw Error("non UTF8 path metadata");
+      if (components(name).length !== 1 || names.has(name)) throw Error("invalid base tree name");
+      names.add(name);
+      const key = Buffer.concat([raw, Buffer.from(mode === "40000" ? "/" : "\0")]);
+      if (prior && Buffer.compare(prior, key) >= 0) throw Error("noncanonical base tree");
+      prior = key;
+      const childOid = bytes.subarray(end + 1, end + 21).toString("hex");
+      at = end + 21;
+      const rel = prefix + name; components(rel);
+      if (mode === "40000") await tree(childOid, rel + "/", depth + 1);
+      else {
+        old.set(rel, { mode: parseInt(mode, 8), oid: childOid });
+        if (old.size > PATH_LIMIT) throw Error("base path cap");
+      }
+    }
+  }
+  await tree(treeHeader[1], "", 0);
+
   const ixfd = (() => { try { return openFile(gd, "index"); } catch (e) { if (e.code === "ENOENT") return null; throw e; } })();
   let ix = null;
   if (ixfd !== null) {
@@ -7749,12 +7829,7 @@ function indexEntries(bytes) {
         && createHash("sha1").update("blob " + content.length + "\0").update(content).digest("hex") === previous.oid) continue;
     let before = null;
     if (previous) {
-      const sizeText = (await metadata(["cat-file", "-s", previous.oid])).toString().trim();
-      if (!/^\d+$/.test(sizeText) || Number(sizeText) > FILE_LIMIT || total + Number(sizeText) > TOTAL_LIMIT)
-        throw Error("base source cap");
-      before = await command(["cat-file", "blob", previous.oid], Number(sizeText), undefined, false, temp, objectEnv);
-      if (before.length !== Number(sizeText)) throw Error("base blob size mismatch");
-      total += before.length;
+      before = await object("blob", previous.oid, FILE_LIMIT);
     }
     // Git's binary sample convention, before creating any diff inputs.
     if ((before && before.subarray(0, 8000).includes(0)) || (content && content.subarray(0, 8000).includes(0))) continue;
