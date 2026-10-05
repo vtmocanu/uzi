@@ -331,7 +331,7 @@ func TestEphemeralDockerFinalPlacementLiveDB(t *testing.T) {
 
 // This seam uses real claim transactions, provisioning and registration on the same run.
 func TestEphemeralDockerWarmStepAsideLiveDB(t *testing.T) {
-	fx := newEphemeralFixture(t, true)
+	fx := newDockerPlacementFixture(t)
 	warm := fx.leasedWorker(time.Minute)
 	cliMustExec(t, fx.pool, "UPDATE workers SET docker_enabled=false WHERE id=$1", warm.id)
 	run := fx.followUp(warm)
@@ -343,18 +343,7 @@ func TestEphemeralDockerWarmStepAsideLiveDB(t *testing.T) {
 	svc.SetDockerAllowlist(probe)
 	svc.SetEffectiveDockerTier(true)
 	svc.SetBackground(func(func()) {})
-	// Seal real claim credentials only for this seam; other fixtures do not assemble claims.
-	for _, kind := range []string{"forge", "anthropic"} {
-		sealed, err := fx.box.Seal([]byte("test-credential-" + kind))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if kind == "forge" {
-			cliMustExec(t, fx.pool, "UPDATE forge_connections SET token_ciphertext=$2 WHERE user_id=$1", fx.userID, sealed)
-		} else {
-			cliMustExec(t, fx.pool, "INSERT INTO user_secrets(id,user_id,kind,label,is_default,ciphertext,sealed_with) VALUES($1,$2,'anthropic_token','seam',true,$3,'master')", uuid.New(), fx.userID, sealed)
-		}
-	}
+	fx.sealDockerClaimCredentials()
 	cliMustExec(t, fx.pool, "UPDATE users SET ephemeral_docker_enabled=false WHERE id=$1", fx.userID)
 	plain, err := fx.q.GetWorkerByID(fx.ctx, warm.id)
 	if err != nil {

@@ -651,13 +651,14 @@ it has an `ephemeral` badge in your fleet list. See
 [Ephemeral worker lease](./hosted-workers.md#ephemeral-worker-lease) for
 eligible run kinds and early removal rules.
 
-**Warm Docker reuse (M2 pending).** The approved follow-up makes a plain warm
-worker step aside when the Docker preference applies to the run's allowlisted
-repository, so it gets Docker-capable capacity instead. It will also make a
-capability-free run with no claimable online worker a capability-gap candidate
-under that same policy. Unallowlisted repositories and failed allowlist reads
-keep today's plain warm reuse; returned values alongside an error are discarded.
-This lease-admission change is not part of the settings UI milestone.
+**Warm Docker reuse.** A plain warm worker steps aside when the Docker preference
+applies to the run's allowlisted repository, so it gets Docker-capable capacity
+instead. A capability-free run with no claimable online worker becomes an
+immediate capability-gap candidate under that same policy. A busy eligible
+persistent worker still keeps the run on the saturation debounce. Unallowlisted
+repositories, an empty allowlist and failed allowlist reads keep plain warm
+reuse; returned values alongside an error are discarded. Persistent placement
+and already-bound runs are unchanged.
 
 **Caveats, honestly:**
 
