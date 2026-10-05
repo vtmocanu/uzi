@@ -857,9 +857,9 @@ func (m tuiModel) boardShowMile() bool {
 	min := boardMileMinWidth
 	// The extra columns before TITLE (the admin owner cell, and the credential cell when
 	// shown) push the mile threshold up by exactly their width, so a narrow board drops the
-	// micro-bar instead of squeezing the title (issue #379). mile is false in both terms so
-	// it cancels; only the owner + credential deltas survive.
-	min += boardRowPrefixWidth(m.board.admin, false, m.boardShowCred(), m.boardShowCost()) - boardRowPrefixWidth(false, false, false, false)
+	// micro-bar instead of squeezing the title (issue #379). The milestone-free
+	// prefix leaves only the owner + credential + cost deltas.
+	min += boardRowPrefixWidth(m.board.admin, m.boardShowCred(), m.boardShowCost()) - boardRowPrefixWidth(false, false, false)
 	return m.width >= min
 }
 
@@ -875,7 +875,7 @@ func (m tuiModel) boardShowCost() bool {
 	min := boardCostMinWidth
 	// The extra columns before TITLE (the credential cell when shown) push the threshold up by
 	// exactly their width; cost is false in both terms so it cancels, only the cred delta survives.
-	min += boardRowPrefixWidth(false, false, m.boardShowCred(), false) - boardRowPrefixWidth(false, false, false, false)
+	min += boardRowPrefixWidth(false, m.boardShowCred(), false) - boardRowPrefixWidth(false, false, false)
 	return m.width >= min
 }
 
