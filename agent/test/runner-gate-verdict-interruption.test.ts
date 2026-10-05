@@ -23,8 +23,6 @@ import { getEventListeners } from "node:events";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
-import childProcess from "node:child_process";
-import { syncBuiltinESMExports } from "node:module";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -35,6 +33,8 @@ import type { RunRunner, RunnerOptions } from "../src/runner.js";
 import { StubExecutor, type Executor } from "../src/executor.js";
 import type { AgentTemplate, ClaimResponse, StateRequest, UserInput } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
+import { forceIncompleteHomeHelper } from "./forced-home-helper.js";
+import { scanRunProcesses, reapRunProcesses } from "../src/run-procs.js";
 import { TOKEN, api, baseUrl, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith, simulateCommittedWork } from "./runner-harness.js";
 
 installHarness();
@@ -326,13 +326,6 @@ class Scenario {
       () => ({
         executor: opts.executor?.() ?? new SdkExecutor(nullLogger(), this.home, {
           queryFn: this.model.queryFn(),
-          // Model is an in-process generator; the fixture has no JS lockfile and the env probe
-          // is hermetic. There are no agent processes to reap. A real host /proc scan here
-          // can be incomplete because of unrelated processes and fail a receipt scenario.
-          runProcesses: {
-            scan: async () => ({ pids: [], complete: true }),
-            reap: async () => ({ killed: [], left: [], complete: true }),
-          },
         }),
         homeDir: this.home,
       }),
@@ -633,40 +626,27 @@ describe("#2230 scenario failure diagnostics", () => {
 
 describe("#2230 scripted model process isolation", () => {
   it("a process-free gate scenario completes when an unrelated proc scan is incomplete", async (t) => {
-    let forceIncomplete = false;
-    let injected = 0;
-    const spawn = childProcess.spawn;
-    const spy = t.mock.method(childProcess, "spawn", (command: string, args: readonly string[], options: childProcess.SpawnOptions) => {
-      if (forceIncomplete && command === process.execPath && args[0] === "-e" && args[1]?.includes('const want = Buffer.from("HOME=" + home);')) {
-        injected++;
-        return spawn(command, ["-e", 'process.stdout.write("H\\t" + JSON.stringify({scanned:1,truncated:false,unresolved:1,procMount:"ok"}) + "\\n")'], options);
-      }
-      return spawn(command, args, options);
-    });
-    syncBuiltinESMExports();
-    try {
-      await scenario(async (s) => {
-        forceIncomplete = true;
-        const control = new SdkExecutor(nullLogger(), s.home, { queryFn: s.model.queryFn() });
-        const reap = await control.reapAttributedProcesses();
-        assert.equal(reap.complete, false, "the forced live-proc result is incomplete");
-        assert.equal(injected, 1, "the control used the actual HOME helper seam");
-        forceIncomplete = false;
-        injected = 0;
-        const block = s.model.block("implement");
-        const flight = await s.toFirstGate();
-        s.send(s.input("approve_plan"));
-        await block.entered;
-        forceIncomplete = true;
-        block.release();
-        await s.finish(flight);
-        assert.ok(s.statuses(flight).includes("completed"), JSON.stringify(s.states(flight)));
-        assert.equal(injected, 0, "the process-free scenario never scanned live host processes");
+    const helper = forceIncompleteHomeHelper(t);
+    await scenario(async (s) => {
+      helper.enabled = true;
+      const control = new SdkExecutor(nullLogger(), s.home, {
+        queryFn: s.model.queryFn(),
+        runProcesses: { scan: scanRunProcesses, reap: reapRunProcesses },
       });
-    } finally {
-      spy.mock.restore();
-      syncBuiltinESMExports();
-    }
+      assert.equal((await control.reapAttributedProcesses()).complete, false, "explicit real operations still fail closed");
+      assert.equal(helper.calls, 1, "the control used the actual HOME helper seam");
+      helper.enabled = false;
+      helper.calls = 0;
+      const block = s.model.block("implement");
+      const flight = await s.toFirstGate();
+      s.send(s.input("approve_plan"));
+      await block.entered;
+      helper.enabled = true;
+      block.release();
+      await s.finish(flight);
+      assert.ok(s.statuses(flight).includes("completed"), JSON.stringify(s.states(flight)));
+      assert.equal(helper.calls, 0, "the preloaded SDK default never scanned live host processes");
+    });
   });
 });
 

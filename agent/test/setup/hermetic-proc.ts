@@ -9,13 +9,16 @@
 // single-file run without the preload is hermetic as well. ES modules evaluate once per process
 // (the preload's `./test/setup/hermetic-proc.ts` and a test's `./setup/hermetic-proc.js` resolve to
 // the same module), so the default is installed once, at load, before any test body can install
-// its own view. It also installs a process-free default environment probe (issue #1866, below).
+// its own view. It also installs process-free SDK HOME-attribution operations (#2230) and a
+// process-free default environment probe (issue #1866). Real HOME-helper subjects call the direct
+// run-procs functions or explicitly supply SdkExecutorOptions.runProcesses; those stay real.
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { setQuiescenceViewForTests, type QuiescenceView } from "../../src/run-quiescence.js";
 import { setDefaultEnvProbeSpawnerForTests, type EnvProbeSpawner } from "../../src/env-probe.js";
+import { setDefaultRunProcessOpsForTests, type RunProcessOps } from "../../src/run-procs.js";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-hermetic-proc-"));
 process.on("exit", () => fs.rmSync(root, { recursive: true, force: true }));
@@ -46,3 +49,16 @@ export function restoreHermeticEnvProbe(): void {
 }
 
 restoreHermeticEnvProbe();
+
+/** Scripted SDK queries start no agent processes. Explicit per-executor operations still win. */
+const HERMETIC_RUN_PROCESS_OPS: RunProcessOps = {
+  scan: async () => ({ pids: [], complete: true }),
+  reap: async () => ({ killed: [], left: [], complete: true }),
+};
+
+/** Restore the shared test default without changing the direct HOME scan/reap functions. */
+export function restoreHermeticRunProcessOps(): void {
+  setDefaultRunProcessOpsForTests(HERMETIC_RUN_PROCESS_OPS);
+}
+
+restoreHermeticRunProcessOps();

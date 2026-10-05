@@ -341,6 +341,27 @@ export interface RunProcessReap {
   complete: boolean;
 }
 
+/** The SDK executor's process attribution operations. Explicit executor options take precedence. */
+export interface RunProcessOps {
+  /** Live CLI pids link an unreadable descendant to this run. */
+  scan: (home: string, worktree: string | undefined, spawnedPids: readonly number[]) => Promise<RunProcessScan>;
+  reap: (home: string, worktree: string | undefined, spawnedPids: readonly number[]) => Promise<RunProcessReap>;
+}
+
+const REAL_RUN_PROCESS_OPS: RunProcessOps = { scan: scanRunProcesses, reap: reapRunProcesses };
+let testDefaultRunProcessOps: RunProcessOps | undefined;
+
+/** TEST ONLY: shared preload wiring for scripted executors. No environment/config selects this
+ *  override; undefined restores the production default. Direct scan/reap helpers are unchanged. */
+export function setDefaultRunProcessOpsForTests(ops: RunProcessOps | undefined): void {
+  testDefaultRunProcessOps = ops;
+}
+
+/** Real HOME attribution unless the test preload installed its process-free operations. */
+export function defaultRunProcessOps(): RunProcessOps {
+  return testDefaultRunProcessOps ?? REAL_RUN_PROCESS_OPS;
+}
+
 /** The `/proc` of this host; a constant so no caller spells the path. */
 const PROC_ROOT = "/proc";
 

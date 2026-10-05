@@ -8,6 +8,7 @@ import { LiveAttemptRegistry, newRunAttempt, procfsTable, quiesceRunAttempt, rea
 import { RUN_ATTEMPT_ENV, RUN_CLONE_KEY_ENV, workerSpawnNonce } from "../src/worker-spawn-mark.js";
 // Safe to import here: real-procfs.ts imports only node:fs and node:path and installs no view.
 import { realProcfsSkip } from "./real-procfs.js";
+import { defaultRunProcessOps, setDefaultRunProcessOpsForTests, scanRunProcesses, reapRunProcesses as reapHomeProcesses } from "../src/run-procs.js";
 
 // issue #1783 — the package.json `test` script preloads test/setup/hermetic-proc.ts into EVERY
 // test file's process (node --test forwards the parent's --import flags to each child). This file
@@ -89,5 +90,20 @@ describe("hermetic default quiescence view (preloaded)", { skip: SKIP }, () => {
     assert.equal(viaHelper.state, "quiescent", viaHelper.detail);
     assert.deepEqual(viaHelper.killed, []);
     assert.equal(alive(straggler.pid), true, "no real process was signalled");
+  });
+});
+
+describe("#2230 SDK process operations preload", () => {
+  it("is process-free by default, and clearing test wiring restores the real production operations", async () => {
+    const preloaded = defaultRunProcessOps();
+    assert.deepEqual(await preloaded.scan(tmp, undefined, []), { pids: [], complete: true });
+    assert.deepEqual(await preloaded.reap(tmp, undefined, []), { killed: [], left: [], complete: true });
+    setDefaultRunProcessOpsForTests(undefined);
+    try {
+      assert.equal(defaultRunProcessOps().scan, scanRunProcesses);
+      assert.equal(defaultRunProcessOps().reap, reapHomeProcesses);
+    } finally {
+      setDefaultRunProcessOpsForTests(preloaded);
+    }
   });
 });
