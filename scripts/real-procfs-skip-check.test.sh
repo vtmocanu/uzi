@@ -70,6 +70,13 @@ chmod +x "$FAKE"
 failures=0
 OUT="$TMP/out"
 
+# Control parallelism in this test's node processes without a production env seam.
+# The probe still enumerates the real throwaway directory and gets real EACCES.
+PARALLELISM_PRELOAD="$TMP/parallelism.cjs"
+cat > "$PARALLELISM_PRELOAD" <<'EOF'
+require("node:os").availableParallelism = () => Number(process.env.TEST_AVAILABLE_PARALLELISM);
+EOF
+
 # run_case NAME EXPECTED_RC PROBE_DIR CI_VALUE COMMAND...
 # CI_VALUE "-" runs with CI unset (`env -u CI`); anything else exports CI=<value>.
 # UZI_AGENT_TEST_CONCURRENCY is always unset, so a caller's value cannot leak into a case;
@@ -79,9 +86,9 @@ run_case() {
   shift 4
   got=0
   if [ "$ci" = "-" ]; then
-    env -u CI -u UZI_AGENT_TEST_CONCURRENCY UZI_REAL_PROCFS_PROBE_DIR="$probe" "$@" > "$OUT" 2>&1 || got=$?
+    env -u CI -u UZI_AGENT_TEST_CONCURRENCY NODE_OPTIONS="--require=\"$PARALLELISM_PRELOAD\"" TEST_AVAILABLE_PARALLELISM=4 UZI_REAL_PROCFS_PROBE_DIR="$probe" "$@" > "$OUT" 2>&1 || got=$?
   else
-    env -u UZI_AGENT_TEST_CONCURRENCY CI="$ci" UZI_REAL_PROCFS_PROBE_DIR="$probe" "$@" > "$OUT" 2>&1 || got=$?
+    env -u UZI_AGENT_TEST_CONCURRENCY NODE_OPTIONS="--require=\"$PARALLELISM_PRELOAD\"" TEST_AVAILABLE_PARALLELISM=4 CI="$ci" UZI_REAL_PROCFS_PROBE_DIR="$probe" "$@" > "$OUT" 2>&1 || got=$?
   fi
   if [ "$got" -eq "$want" ]; then
     echo "PASS: $name (exit $got)"
@@ -186,6 +193,52 @@ else
     env UZI_AGENT_TEST_CONCURRENCY=x2 "$CHECK" "$FAKE" concurrency "$SEEN" && {
     expect_seen "denied + preset 'x2': the command sees 1" "1"
     expect_output "denied + preset 'x2': the replacement is warned" "UZI_AGENT_TEST_CONCURRENCY='x2' is not a positive integer"
+  }
+fi
+
+# Issue #2240: caller > denied-procfs cap > two-CPU floor > Node default.
+for parallelism in 1 2 4; do
+  case "$parallelism" in
+    1) seen='<unset>'; effective=1; source=node-default ;;
+    2) seen=2; effective=2; source=floor ;;
+    4) seen='<unset>'; effective=3; source=node-default ;;
+  esac
+  run_case "parallelism $parallelism without caller" 0 "$ENUMERABLE" - \
+    env TEST_AVAILABLE_PARALLELISM="$parallelism" "$CHECK" "$FAKE" concurrency "$SEEN" && {
+    expect_seen "parallelism $parallelism selection" "$seen"
+    expect_output "parallelism $parallelism diagnostics" "availableParallelism=$parallelism"
+    expect_output "parallelism $parallelism effective/source" "--test-concurrency=$effective source=$source"
+    expect_output "runtime node version" "agent-tests: node="
+    expect_output "runtime libuv version" "libuv="
+    expect_output "quota readable or explicitly unavailable" "cpu.max="
+    expect_output "unit stage duration" "agent-stage: unit duration_seconds="
+  }
+done
+for caller in 1 3 x2 ''; do
+  run_case "two CPUs keep caller '$caller'" 0 "$ENUMERABLE" - \
+    env TEST_AVAILABLE_PARALLELISM=2 UZI_AGENT_TEST_CONCURRENCY="$caller" "$CHECK" "$FAKE" concurrency "$SEEN" &&
+    expect_seen "two CPUs caller '$caller' preserved" "$caller"
+done
+run_case "caller override diagnosed" 0 "$ENUMERABLE" - \
+  env TEST_AVAILABLE_PARALLELISM=2 UZI_AGENT_TEST_CONCURRENCY=3 "$CHECK" "$FAKE" concurrency "$SEEN" &&
+  expect_output "caller effective/source" "--test-concurrency=3 source=caller-override"
+run_case "failure still timed" 7 "$ENUMERABLE" - "$CHECK" "$FAKE" fail 7 &&
+  expect_output "failed unit stage retains its exit" "exit=7"
+if [ "$(id -u)" -ne 0 ]; then
+  run_case "denied cap beats two-CPU floor" 0 "$DENIED" - \
+    env TEST_AVAILABLE_PARALLELISM=2 "$CHECK" "$FAKE" concurrency "$SEEN" && {
+    expect_seen "denied cap stays serial" "1"
+    expect_output "denied cap effective/source" "--test-concurrency=1 source=procfs-denied-cap"
+  }
+  run_case "caller beats denied cap and floor" 0 "$DENIED" - \
+    env TEST_AVAILABLE_PARALLELISM=2 UZI_AGENT_TEST_CONCURRENCY=3 "$CHECK" "$FAKE" concurrency "$SEEN" && {
+    expect_seen "caller beats both selections" "3"
+    expect_output "denied caller effective/source" "--test-concurrency=3 source=caller-override"
+  }
+  run_case "invalid caller still replaced on denied procfs" 0 "$DENIED" - \
+    env TEST_AVAILABLE_PARALLELISM=2 UZI_AGENT_TEST_CONCURRENCY=x2 "$CHECK" "$FAKE" concurrency "$SEEN" && {
+    expect_seen "invalid denied caller sees cap" "1"
+    expect_output "invalid denied caller source" "--test-concurrency=1 source=procfs-denied-cap"
   }
 fi
 

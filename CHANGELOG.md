@@ -33,6 +33,9 @@ through `[0.52.0]`.)
 - **The agent gate distinguishes Linux-only contracts on macOS ([#1912](https://github.com/vtmocanu/uzi/issues/1912)).**
   Linux process-proof and descriptor-pinned filesystem cases report named skips on other platforms; portable cases retain coverage. The scratch guard normalizes slash spelling, while timing checks use controlled clocks, CPU budgets, and readiness or completion events.
 
+- **Agent gates report quota and concurrency diagnostics ([#2240](https://github.com/vtmocanu/uzi/issues/2240)).**
+  Gates print Node/libuv versions, detected parallelism, readable CPU quota, selected test-file concurrency and unit/M4 durations. A two-CPU default runs two unit files at a time; caller overrides and the procfs-denied serial cap keep precedence, and one-CPU workers keep Node's default.
+
 ### Added
 
 - **`uzi tui` has a workers tab ([#2275](https://github.com/vtmocanu/uzi/issues/2275)).**
