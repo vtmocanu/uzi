@@ -1,6 +1,6 @@
 # PRD #58: Hosted k8s workers — self-service worker provisioning
 
-**GitLab Issue**: [#58](https://github.com/vtmocanu/uzi/-/issues/58)
+**GitLab Issue**: [#58](https://github.com/vtmocanu/uzi/issues/58)
 **Status**: DONE — **released in v0.3.0**, hosted workers live on dev-cluster (feature merge `6098104`, release `3da61c3`). M1–M7 all landed; GitLab issue #58 closed. Moved to `done/` 2026-07-25.
 
 > **The two "open residuals" that held this file in `prds/` for a week were both misfiled, and the audit that moved it is worth recording because the status line itself was the misleading artifact.**

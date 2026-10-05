@@ -1,6 +1,6 @@
 # PRD #7: In-app Docs Section — Terse Howtos with Screenshots
 
-**GitLab Issue**: [vtmocanu/uzi#7](https://github.com/vtmocanu/uzi/-/issues/7)
+**GitLab Issue**: [vtmocanu/uzi#7](https://github.com/vtmocanu/uzi/issues/7)
 **Status**: Complete (2026-07-04). M1-M5 done; 4-agent review wave passed, all findings fixed; specs synced; merged to main via MR !9. GitLab-side screenshot real, uzi-UI shots stay placeholders by decision until the UI stabilizes.
 **Priority**: Medium
 **Created**: 2026-07-04

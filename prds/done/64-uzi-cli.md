@@ -1,6 +1,6 @@
 # PRD #64: uzi CLI — terminal control of the factory for humans and agents
 
-**GitLab Issue**: [#64](https://github.com/vtmocanu/uzi/-/issues/64)
+**GitLab Issue**: [#64](https://github.com/vtmocanu/uzi/issues/64)
 **Status**: Complete (implemented 2026-07-17, merged to main 2026-07-18 via MR !67; all 11 milestones landed, reviewed, and live-validated)
 **Priority**: Medium
 **Created**: 2026-07-17

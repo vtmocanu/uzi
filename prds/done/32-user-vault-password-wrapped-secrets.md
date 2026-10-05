@@ -1,6 +1,6 @@
 # PRD #32: Per-User Vault — Password-Wrapped Secrets
 
-**GitLab Issue**: [vtmocanu/uzi#32](https://github.com/vtmocanu/uzi/-/issues/32)
+**GitLab Issue**: [vtmocanu/uzi#32](https://github.com/vtmocanu/uzi/issues/32)
 **Status**: Complete (2026-07-10, merged via [MR !35](https://github.com/vtmocanu/uzi/-/merge_requests/35))
 **Priority**: High
 **Created**: 2026-07-10

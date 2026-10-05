@@ -1,6 +1,6 @@
 # PRD #3: Agent Definitions, Templates & Anthropic Token Storage
 
-**GitLab Issue**: [vtmocanu/uzi#3](https://github.com/vtmocanu/uzi/-/issues/3)
+**GitLab Issue**: [vtmocanu/uzi#3](https://github.com/vtmocanu/uzi/issues/3)
 **Status**: Complete (2026-07-03, all milestones done, reviewed + audited + E2E-tested)
 **Priority**: High
 **Created**: 2026-07-03

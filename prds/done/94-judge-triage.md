@@ -1,6 +1,6 @@
 # PRD #94: Triage judge recommendations — resolve, dismiss, and count
 
-**GitLab Issue**: [#94](https://github.com/vtmocanu/uzi/-/issues/94)
+**GitLab Issue**: [#94](https://github.com/vtmocanu/uzi/issues/94)
 **Status**: Complete (2026-07-20; merged via MR [!81](https://github.com/vtmocanu/uzi/-/merge_requests/81))
 **Priority**: Medium
 **Mockup**: [`prds/mockups/94-judge-triage-mock.html`](../mockups/94-judge-triage-mock.html) (global strip + per-review triage bar + row states + CLI)

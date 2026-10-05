@@ -1,10 +1,10 @@
 # PRD #72: PRD lifecycle inside the run — progress updates, move-to-done, and the issue link that follows
 
-**GitLab Issue**: [#72](https://github.com/vtmocanu/uzi/-/issues/72)
+**GitLab Issue**: [#72](https://github.com/vtmocanu/uzi/issues/72)
 **Status**: Complete (2026-07-26). All six milestones landed, reviewed, audited and scenario-validated, and the "Manual, and required" acceptance run in the Validation section has now been performed — see the Decision Log entry for 2026-07-26.
 
 **Priority**: Medium
-**Related**: [#96](https://github.com/vtmocanu/uzi/-/issues/96) (mid-run restart discards un-pushed commits — the durability bug this PRD deliberately does NOT try to fix), [#110](https://github.com/vtmocanu/uzi/-/issues/110) (checkpoint agent work — closed will-not-implement; the reason "update the PRD and push mid-run" is not on the table), [#122](https://github.com/vtmocanu/uzi/-/issues/122) (milestone-structured runs — the DB-side progress record this PRD's file-side record must not contradict), [#16](https://github.com/vtmocanu/uzi/-/issues/16) (skills), [#37](https://github.com/vtmocanu/uzi/-/issues/37) (repo-sourced agents — whose skill gap M1 closes and whose trust model Decision 6 must argue against), [#46](https://github.com/vtmocanu/uzi/-/issues/46) (self-improvement runs — excluded by Decision 13), [#24](https://github.com/vtmocanu/uzi/-/issues/24) (MR-state watcher, whose candidate prefilter M5 must not reuse)
+**Related**: [#96](https://github.com/vtmocanu/uzi/issues/96) (mid-run restart discards un-pushed commits — the durability bug this PRD deliberately does NOT try to fix), [#110](https://github.com/vtmocanu/uzi/issues/110) (checkpoint agent work — closed will-not-implement; the reason "update the PRD and push mid-run" is not on the table), [#122](https://github.com/vtmocanu/uzi/issues/122) (milestone-structured runs — the DB-side progress record this PRD's file-side record must not contradict), [#16](https://github.com/vtmocanu/uzi/issues/16) (skills), [#37](https://github.com/vtmocanu/uzi/issues/37) (repo-sourced agents — whose skill gap M1 closes and whose trust model Decision 6 must argue against), [#46](https://github.com/vtmocanu/uzi/issues/46) (self-improvement runs — excluded by Decision 13), [#24](https://github.com/vtmocanu/uzi/issues/24) (MR-state watcher, whose candidate prefilter M5 must not reuse)
 
 **What the acceptance run established, and what it did not.** A real `issue` run
 (`c13cff61`, one iteration, on a throwaway PRD created for the purpose) ticked the

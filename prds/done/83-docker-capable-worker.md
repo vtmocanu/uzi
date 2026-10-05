@@ -1,6 +1,6 @@
 # PRD #83: Docker-capable worker (rootless DinD) — testing containerized projects without host-root
 
-**GitLab Issue**: [#83](https://github.com/vtmocanu/uzi/-/issues/83)
+**GitLab Issue**: [#83](https://github.com/vtmocanu/uzi/issues/83)
 **Status**: Implemented 2026-07-19 (feature branch `feature/prd-83-docker-capable-worker`, MR pending review; LIVE dev-cluster rollout is a separate owner-gated step). Created 2026-07-18; revised 2026-07-18 after a 3-agent design review; landed 2026-07-19 — see Decision Log.
 **Priority**: Medium
 **Depends on**: PRD #4 (worker runtime — the `agent` service, register/claim protocol); PRD #18 (worker templates + the nix/devbox tool tiers + the declared-vs-reported drift badge this PRD reuses); PRD #51 (worker/runner uid split — the containment this design must not weaken); **PRD #58 (hosted k8s workers — SHIPPED, released v0.3.0, hosted workers live on dev-cluster). The k8s track of this PRD extends #58's in-production controller and is a first-class deliverable, not a deferred follow-up (see Decision 8 and the k8s-first testing convention in CLAUDE.md).**

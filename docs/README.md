@@ -22,7 +22,7 @@ This file itself is exempt from the frontmatter contract below and from
    ---
    title: GitLab bot setup
    order: 20
-   audience: user        # user | operator | design | contributor
+   audience: user
    ---
    ```
 
@@ -31,9 +31,7 @@ This file itself is exempt from the frontmatter contract below and from
      `audience: user` and `audience: operator` pages (each is a separate
      order namespace); it decides the page's position in that audience's
      in-app index. `design`/`contributor` pages may omit it.
-   - A missing or malformed frontmatter fence doesn't fail the build: the
-     page silently falls back to `audience: design` (repo-only). That's a
-     safety net for a half-written page, not something to rely on.
+   - A missing or malformed frontmatter fence fails validation.
 3. Write the content (house style below), run the validator, and link the
    page from wherever a reader would land on it (another doc, `README.md`,
    or `ARCHITECTURE.md`).
@@ -67,11 +65,8 @@ One per major step, in `docs/img/`, named `<page>-<step>.png` (e.g.
 ```
 
 Each image must stay under 300 KB (`check-docs.mjs` fails the build past
-that; images ship to every visitor, not just docs readers). It's fine to
-reference an image before it exists: placeholders land first, real
-captures replace them later in one dedicated commit, and a missing file
-only breaks the build once the reference itself is broken (a typo'd
-path), not while the file is merely a placeholder.
+that; images ship to every visitor, not just docs readers). Referenced image files must exist;
+placeholders can be replaced with real captures later.
 
 ## Links
 

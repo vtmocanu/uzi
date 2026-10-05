@@ -1,6 +1,6 @@
 # PRD #316: UX tweaks — sidebar collapse toggle, schedules caret, runs search/grouping/paging
 
-**GitLab Issue**: [#316](https://github.com/vtmocanu/uzi/-/issues/316)
+**GitLab Issue**: [#316](https://github.com/vtmocanu/uzi/issues/316)
 **Status**: DONE — merged to `main` (merge commit `d0375a0b`, 2026-08-14) and released as `v0.37.0`. M1–M8 complete: reviewed (reviewer + auditor + web-ux, no blockers; 5 non-blocking fixes applied), specs synced (`specs/ai.md` §490/§504/§531 + `specs/human.md`), merged, deployed via ArgoCD to dev-cluster.
 **Priority**: Medium
 **Branch / worktree**: `feature/ux-tweaks` @ `302ca7c1` (base `main` @ `cf312c33`, 0.36.0), 6 commits, +1176/-235 across 11 files. Worktree `/home/user/repos/myorg/uzi-ux-tweaks`.
