@@ -1016,7 +1016,7 @@ for the third PVC's create-gate; and the A8.8 ownership check on a real cluster.
 materializer test that `desired < observed` issues **no** patch — the case that would otherwise
 produce a rejected update every tick.
 
-**A8.13 — issue #225 FILED** (`https://github.com/vtmocanu/uzi/-/issues/225`) for A7.3's
+**A8.13 — issue #225 FILED** (`https://github.com/vtmocanu/uzi/issues/225`) for A7.3's
 imagefs/image-accumulation defect, per the user's decision to file rather than fix.
 
 ### A9 — 2026-08-04, USER DECISIONS. **THE DESIGN IS NOW FROZEN. The coder builds exactly this.**
