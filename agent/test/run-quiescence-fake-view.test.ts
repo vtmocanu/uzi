@@ -88,6 +88,8 @@ function assertUnreadableBlocks(r: ProcessQuiescence | undefined): void {
 
 // ─── the fake root itself ──────────────────────────────────────────────────────────────────
 
+const LINUX_ONLY = process.platform !== "linux" ? "requires a real Linux /proc root" : false;
+
 describe("fake proc root: the reaper's reads", () => {
   it("parses the planted stat (ppid, group, session, field-22 start time) like a real one", async () => {
     plantFakeProc(root, 50, { uid: ME, ppid: 7, pgid: 8, sid: 9, startTime: 123456, env: {}, cwd: "/tmp" });
@@ -223,7 +225,7 @@ describe("a malformed view is refused by the setter and by the helper", () => {
     }
   });
 
-  it("the real proc root reached through a symlink is refused too", () => {
+  it("the real proc root reached through a symlink is refused too", { skip: LINUX_ONLY }, () => {
     const link = path.join(root, "proc-link");
     fs.symlinkSync(PROC, link);
     assert.throws(() => setQuiescenceViewForTests({ procRoot: link }), /invalid quiescence test view/);

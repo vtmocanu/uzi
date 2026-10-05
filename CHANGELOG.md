@@ -27,6 +27,9 @@ through `[0.52.0]`.)
 - **New hosted workers default to the large preset ([#2240](https://github.com/vtmocanu/uzi/issues/2240)).**
   Ephemeral provisioning defaults and falls back to L, and the persistent provision form preselects L. Existing workers keep their sizes; new workers reserve more CPU and memory capacity.
 
+- **The agent gate distinguishes Linux-only contracts on macOS ([#1912](https://github.com/vtmocanu/uzi/issues/1912)).**
+  Linux process-proof and descriptor-pinned filesystem cases report named skips on other platforms; portable cases retain coverage. The scratch guard normalizes slash spelling, while timing checks use controlled clocks, CPU budgets, and readiness or completion events.
+
 ## [0.85.2] - 2026-10-05
 
 ### Changed

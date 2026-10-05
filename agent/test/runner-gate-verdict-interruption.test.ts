@@ -346,11 +346,11 @@ class Scenario {
     await Promise.race([flight.done, tick(10_000)]);
   }
 
-  /** Shut a flight down (the worker's graceful stop) and require a clean, bounded unwind. */
+  /** Wait for graceful shutdown's settlement; the test timeout bounds a stuck flight. */
   async shutdown(flight: Flight): Promise<void> {
     flight.runner.shutdown();
-    assert.ok(await until(() => flight.finished, 2_000), "shutdown ended the gate flight within two seconds");
     await flight.done;
+    assert.equal(flight.finished, true, "shutdown settled the gate flight");
     assert.equal(flight.error, undefined, "shutdown completed without an execution error");
     assert.equal(this.rowsOf("cancel").length, 0, "shutdown needed no cancel input");
   }
@@ -1570,18 +1570,29 @@ describe("shutdown at an observed plan gate", () => {
     }));
 
   for (const [planApprovalTimeoutMs, session, failHeldGet] of [[0, "kept", true], [60_000, "none", true], [0, "kept", false]] as const) {
-    it(`finishes promptly without a cancel input when planApprovalTimeoutMs is ${planApprovalTimeoutMs} and the held GET ${failHeldGet ? "fails" : "succeeds"}`, () =>
+    it(`unwinds without a cancel input when planApprovalTimeoutMs is ${planApprovalTimeoutMs} and the held GET ${failHeldGet ? "fails" : "succeeds"}`, (t) =>
       scenario(async (s) => {
         api.gateRevisions = true;
         api.stampGateBindings = true;
         client.protocolFeatures = ["claim_generation_fence", "gate_revision_v1"];
         let holdFirstGate = true;
         let gateReads = 0;
+        let heldGet: ReturnType<typeof api.holdNextInputGet> | undefined;
+        t.after(() => heldGet?.release());
+        t.signal.addEventListener("abort", () => heldGet?.release(), { once: true });
+        let stopped!: () => void;
+        const pollingStopped = new Promise<void>((resolve) => { stopped = resolve; });
+        const originalStop = SteeringChannel.prototype.stop;
+        t.mock.method(SteeringChannel.prototype, "stop", function (this: SteeringChannel) {
+          const drain = originalStop.call(this); // Sets stopped before awaiting its in-flight GET.
+          stopped();
+          return drain;
+        });
         api.onState(s.runId, (body) => {
           if (body.status !== "awaiting_approval" || !holdFirstGate) return;
           holdFirstGate = false;
           gateReads = api.inputGets.get(s.runId) ?? 0;
-          api.delayInputGets(s.runId, 800, 1, gateReads);
+          heldGet = api.holdNextInputGet(s.runId, gateReads);
           if (failHeldGet) api.failInputGets(s.runId, 1, 503);
         });
         const flight = s.start(s.claim(), { runner: { planApprovalTimeoutMs } });
@@ -1599,14 +1610,21 @@ describe("shutdown at an observed plan gate", () => {
 
         // Hold a delivery read while the owner sends a bound approval. Shutdown must leave that
         // row pending for the next claim, rather than routing it on the first flight.
-        assert.ok(await until(() => (api.inputGets.get(s.runId) ?? 0) > gateReads), "the gate's input read is held");
+        assert.ok(heldGet, "the gate installed its input-read barrier");
+        await heldGet.entered;
+        assertHeldInputGet(s.runId);
         const [pending] = s.send(s.input("approve_plan"));
         const stored = api.inputRows(s.runId).find((row) => row.id === pending!.id)!;
         assert.equal(stored.gate_binding, "bound");
         assert.equal(stored.gate_revision, persisted.revision);
         flight.runner.shutdown();
-        assert.ok(await until(() => flight.finished, 2_000), "shutdown ended the gate flight within two seconds");
+        await Promise.race([
+          pollingStopped,
+          flight.done.then(() => { throw new Error("flight ended without stopping input polling"); }),
+        ]);
+        heldGet.release(); // The stopped poller cannot acknowledge this pending verdict.
         await flight.done;
+        assert.equal(flight.finished, true, "shutdown settled the gate flight");
         assert.equal(flight.error, undefined, "shutdown completed without an execution error");
         assert.equal(s.rowsOf("cancel").length, 0, "shutdown needed no cancel fallback");
         assert.ok(!s.statuses(flight).some((status) => status === "failed" || status === "cancelled"), s.statuses(flight).join(","));

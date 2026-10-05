@@ -122,6 +122,10 @@ function supervisedSafety(mode: "empty" | "absent" | "incomplete"): CodexExecuti
   };
 }
 
+// These capture cases require the runner's Linux process-proof branch, even when
+// the proof itself is injected. Portable rejection-only cases remain unguarded.
+const LINUX_CAPTURE = process.platform !== "linux" ? "requires Linux terminal-capture process proof" : false;
+
 describe("terminal execution disk deferral", () => {
   it("setup failure on a full volume keeps the original failure path", async () => {
     const f = fixture();
@@ -218,7 +222,7 @@ describe("terminal execution disk deferral", () => {
 
   for (const site of ["reclaim", "capture", "coincident"] as const) {
     for (const control of ["cancel", "pause", "shutdown"] as const) {
-      it(`${control} during ${site} wins over full occupancy`, async () => {
+      it(`${control} during ${site} wins over full occupancy`, { skip: site === "capture" && LINUX_CAPTURE }, async () => {
         let signal: AbortSignal;
         let fired = false;
         const interrupt = async () => {
@@ -252,7 +256,7 @@ describe("terminal execution disk deferral", () => {
   }
 
   for (const location of ["source", "proof", "post-WIP proof", "report"] as const) {
-    it(`typed plan rejection raised during ${location} uses canonical failure`, async () => {
+    it(`typed plan rejection raised during ${location} uses canonical failure`, { skip: location !== "proof" && LINUX_CAPTURE }, async () => {
       const error = new PlanRejectedError("capture policy rejected");
       const f = fixture({ runner: { quiesceRun: async (req) => {
         if ((location === "proof" && req.site === "terminal_disk:after_runner_git")
@@ -353,7 +357,7 @@ describe("terminal execution disk deferral", () => {
     }
   }
 
-  it("alternating safety blocks permits at most fifteen captures and five separate final proofs", async () => {
+  it("alternating safety blocks permits at most fifteen captures and five separate final proofs", { skip: LINUX_CAPTURE }, async () => {
     let captures = 0;
     let finals = 0;
     let markers = 0;
@@ -374,7 +378,7 @@ describe("terminal execution disk deferral", () => {
   });
 
   for (const verified of [false, true]) {
-    it(`lost and statusless ACKs keep the original capture budget, verified=${verified}`, async () => {
+    it(`lost and statusless ACKs keep the original capture budget, verified=${verified}`, { skip: LINUX_CAPTURE }, async () => {
       let markers = 0;
       const marker = git.commitWipMarker.bind(git);
       git.commitWipMarker = async (...args) => { markers++; return verified ? marker(...args) : false; };
@@ -412,7 +416,7 @@ describe("terminal execution disk deferral", () => {
     ["undefined rejection", FULL, undefined],
     ["NaN rejection", FULL, NaN],
   ] as const) {
-    it(name, async () => {
+    it(name, { skip: LINUX_CAPTURE }, async () => {
       const f = fixture({ sample, error });
       await f.runner.execute(f.claim);
       assert.equal(f.calls(), 1);
@@ -429,7 +433,7 @@ describe("terminal execution disk deferral", () => {
       assert.equal(readGit(bare, "show", "refs/uzi-runner/agent/issue-2201:DIRTY.txt"), "dirty sentinel");
     });
   }
-  it("fresh generations exhaust the counted disk cap without replay or a second failure", async () => {
+  it("fresh generations exhaust the counted disk cap without replay or a second failure", { skip: LINUX_CAPTURE }, async () => {
     const options = { generation: 4 };
     const f = fixture(options);
     const report = client.reportState.bind(client);
@@ -475,7 +479,7 @@ describe("terminal execution disk deferral", () => {
     } finally { client.reportState = report; }
   });
 
-  it("reclaim relief does not restart execution or withdraw the counted park", async () => {
+  it("reclaim relief does not restart execution or withdraw the counted park", { skip: LINUX_CAPTURE }, async () => {
     const f = fixture({ reclaim: async () => f.setRoomy() });
     await f.runner.execute(f.claim);
     assert.equal(f.calls(), 1);
@@ -549,7 +553,7 @@ describe("terminal execution disk deferral", () => {
     });
   }
   for (const [name, error] of opaqueBoundaryCases) {
-    it(`opaque boundary defers: ${name}`, async () => {
+    it(`opaque boundary defers: ${name}`, { skip: LINUX_CAPTURE }, async () => {
       const f = fixture({ error: error() });
       await f.runner.execute(f.claim);
       assert.equal(f.reclaims(), 1);
@@ -562,7 +566,7 @@ describe("terminal execution disk deferral", () => {
 
   for (const entry of trustedCaptureCases) {
     for (const site of ["source", "fetch"] as const) {
-      it(`trusted capture ${site}: ${entry.reason} [${entry.representation}]`, async () => {
+      it(`trusted capture ${site}: ${entry.reason} [${entry.representation}]`, { skip: LINUX_CAPTURE }, async () => {
         let captures = 0;
         const reject = async () => { captures++; throw entry.error(); };
         if (site === "source") git.commitWipMarker = reject;
@@ -626,7 +630,7 @@ describe("terminal execution disk deferral", () => {
     { message: "command cwd escapes the worktree sandbox" },
     new Error("wrapped", { cause: "denied by guardrail: other trusted policy" }),
   ]) {
-    it(`propagates protected capture failure: ${String(error)}`, async () => {
+    it(`propagates protected capture failure: ${String(error)}`, { skip: LINUX_CAPTURE }, async () => {
       let markers = 0;
       git.commitWipMarker = async () => { markers++; throw error; };
       const f = fixture();
@@ -639,7 +643,7 @@ describe("terminal execution disk deferral", () => {
   }
 
   for (const failure of ["wip", "fetch"] as const) {
-    it(`bounds persistent real-Git ${failure} failure and retains both sentinels plus session/journal`, async () => {
+    it(`bounds persistent real-Git ${failure} failure and retains both sentinels plus session/journal`, { skip: LINUX_CAPTURE }, async () => {
       const marker = git.commitWipMarker.bind(git);
       const fetch = git.fetchAgentBranch.bind(git);
       let attempts = 0;
