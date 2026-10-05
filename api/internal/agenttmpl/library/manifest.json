@@ -1,18 +1,18 @@
 {
   "upstream_repo": "github.com/vtmocanu/skills",
-  "upstream_sha": "309c3b62f9151fb2cd455185ffc590178b315f6e",
+  "upstream_sha": "83c8cb30c386afbe943f45254418fbbfa6b74606",
   "path": "skills/agent-kit/agent-team/roles.yaml",
-  "synced": "2026-10-02",
+  "synced": "2026-10-05",
   "roles": {
     "architect": 12,
-    "auditor": 14,
+    "auditor": 15,
     "coder": 18,
     "documenter": 7,
-    "fact-checker": 11,
+    "fact-checker": 12,
     "researcher": 5,
-    "reviewer": 19,
+    "reviewer": 20,
     "spec-keeper": 7,
-    "tester": 17,
+    "tester": 18,
     "ux-designer": 7,
     "web-ux": 11
   }
