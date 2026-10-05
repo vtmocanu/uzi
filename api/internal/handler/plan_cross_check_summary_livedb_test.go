@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
@@ -124,6 +125,52 @@ VALUES($1,$2,'plan',1,1,'private candidate','[{"id":"m1","title":"one"}]',ARRAY[
 }
 
 func TestPlanCrossCheckSummaryQueryLiveDB(t *testing.T) {
+	t.Run("humanRevisionWithUnchangedCandidate", func(t *testing.T) {
+		h, _, pool, owner, lead, _ := summaryLiveFixture(t)
+		cliMustExec(t, pool, `UPDATE runs SET status='awaiting_approval',gate_revision=1,plan_md='private candidate',milestones_candidate='[{"id":"m1","title":"one"}]',milestones_frozen='[{"id":"m1","title":"one"}]',required_capabilities=ARRAY['a','b'],required_tools=ARRAY['git','go'],size_class='s' WHERE id=$1`, lead)
+		read := func() *apitypes.PlanCrossCheckSummaryDTO {
+			t.Helper()
+			got, err := h.wsvc.PlanCrossCheckSummary(t.Context(), owner, lead)
+			if err != nil || got == nil {
+				t.Fatalf("actual query: %+v %v", got, err)
+			}
+			return got
+		}
+		snapshot := func() (string, int32, int64) {
+			t.Helper()
+			var candidate string
+			var revisions int32
+			var gateRevision int64
+			err := pool.QueryRow(t.Context(), `SELECT jsonb_build_array(plan_md,milestones_candidate,milestones_frozen,required_capabilities,required_tools,size_class,claim_generation)::text,revise_count,gate_revision FROM runs WHERE id=$1`, lead).Scan(&candidate, &revisions, &gateRevision)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return candidate, revisions, gateRevision
+		}
+		before, revisionsBefore, gateRevision := snapshot()
+		if revisionsBefore != 0 || read().Historical {
+			t.Fatal("current gate without a human revision must not be historical")
+		}
+		input, err := store.New(pool).CreateRunReviseInputIfUnderCap(t.Context(), store.CreateRunReviseInputIfUnderCapParams{
+			RunID:                lead,
+			Body:                 pgtype.Text{String: "Reconsider this plan", Valid: true},
+			MaxRevisions:         1,
+			ExpectedGateRevision: pgtype.Int8{Int64: gateRevision, Valid: true},
+		})
+		if err != nil {
+			t.Fatalf("enqueue human revision: %v", err)
+		}
+		if input.RunID != lead || input.Kind != "revise_plan" || !input.GateRevision.Valid || input.GateRevision.Int64 != gateRevision {
+			t.Fatalf("revision must target the current gate: %+v", input)
+		}
+		after, revisionsAfter, gateRevisionAfter := snapshot()
+		if after != before || revisionsAfter != revisionsBefore+1 || gateRevisionAfter != gateRevision {
+			t.Fatalf("revision changed candidate or gate: before=%s after=%s revisions=%d->%d gate=%d->%d", before, after, revisionsBefore, revisionsAfter, gateRevision, gateRevisionAfter)
+		}
+		if !read().Historical {
+			t.Fatal("earlier checker findings must be historical after a human revision with unchanged candidate and claim generation")
+		}
+	})
 	h, _, pool, owner, lead, child := summaryLiveFixture(t)
 	read := func() *apitypes.PlanCrossCheckSummaryDTO {
 		t.Helper()

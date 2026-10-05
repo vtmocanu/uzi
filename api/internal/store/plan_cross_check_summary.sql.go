@@ -22,7 +22,10 @@ SELECT cc.round, cc.verdict, cc.reason_class,
     COALESCE(usage.cache_creation_tokens, 0)::bigint AS cache_creation_tokens,
     COALESCE(usage.output_tokens, 0)::bigint AS output_tokens,
     usage.cost_usd, usage.cost_status,
-    (CASE WHEN lead.plan_md IS NULL THEN
+    -- Once a human requests revision, this one-round check is earlier-plan
+    -- evidence even when the revised presentation retains identical plan fields.
+    (CASE WHEN lead.revise_count > 0 THEN true
+     WHEN lead.plan_md IS NULL THEN
         cc.lead_claim_generation <> lead.claim_generation OR lead.gate_revision > 0
      ELSE NOT COALESCE(
         cc.lead_claim_generation = lead.claim_generation
