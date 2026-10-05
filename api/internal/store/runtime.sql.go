@@ -9275,7 +9275,7 @@ func (q *Queries) ListRunsPendingUsageRefold(ctx context.Context, arg ListRunsPe
 }
 
 const listSaturationQueuedRunsForEphemeral = `-- name: ListSaturationQueuedRunsForEphemeral :many
-SELECT r.id, r.user_id, r.required_capabilities
+SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_docker_enabled
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
@@ -9410,9 +9410,12 @@ type ListSaturationQueuedRunsForEphemeralParams struct {
 }
 
 type ListSaturationQueuedRunsForEphemeralRow struct {
-	ID                   uuid.UUID `json:"id"`
-	UserID               uuid.UUID `json:"user_id"`
-	RequiredCapabilities []string  `json:"required_capabilities"`
+	ID                     uuid.UUID   `json:"id"`
+	UserID                 uuid.UUID   `json:"user_id"`
+	RequiredCapabilities   []string    `json:"required_capabilities"`
+	RepoID                 pgtype.UUID `json:"repo_id"`
+	Kind                   string      `json:"kind"`
+	EphemeralDockerEnabled bool        `json:"ephemeral_docker_enabled"`
 }
 
 // The SATURATION sibling of ListUnplaceableQueuedRunsForEphemeral (issue #747 M1).
@@ -9498,7 +9501,14 @@ func (q *Queries) ListSaturationQueuedRunsForEphemeral(ctx context.Context, arg 
 	items := []ListSaturationQueuedRunsForEphemeralRow{}
 	for rows.Next() {
 		var i ListSaturationQueuedRunsForEphemeralRow
-		if err := rows.Scan(&i.ID, &i.UserID, &i.RequiredCapabilities); err != nil {
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.RequiredCapabilities,
+			&i.RepoID,
+			&i.Kind,
+			&i.EphemeralDockerEnabled,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -9510,7 +9520,7 @@ func (q *Queries) ListSaturationQueuedRunsForEphemeral(ctx context.Context, arg 
 }
 
 const listUnplaceableQueuedRunsForEphemeral = `-- name: ListUnplaceableQueuedRunsForEphemeral :many
-SELECT r.id, r.user_id, r.required_capabilities
+SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_docker_enabled
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
@@ -9615,9 +9625,12 @@ type ListUnplaceableQueuedRunsForEphemeralParams struct {
 }
 
 type ListUnplaceableQueuedRunsForEphemeralRow struct {
-	ID                   uuid.UUID `json:"id"`
-	UserID               uuid.UUID `json:"user_id"`
-	RequiredCapabilities []string  `json:"required_capabilities"`
+	ID                     uuid.UUID   `json:"id"`
+	UserID                 uuid.UUID   `json:"user_id"`
+	RequiredCapabilities   []string    `json:"required_capabilities"`
+	RepoID                 pgtype.UUID `json:"repo_id"`
+	Kind                   string      `json:"kind"`
+	EphemeralDockerEnabled bool        `json:"ephemeral_docker_enabled"`
 }
 
 // The trigger query for the ephemeral auto-provisioner (PRD #529 M2). It returns the
@@ -9685,7 +9698,14 @@ func (q *Queries) ListUnplaceableQueuedRunsForEphemeral(ctx context.Context, arg
 	items := []ListUnplaceableQueuedRunsForEphemeralRow{}
 	for rows.Next() {
 		var i ListUnplaceableQueuedRunsForEphemeralRow
-		if err := rows.Scan(&i.ID, &i.UserID, &i.RequiredCapabilities); err != nil {
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.RequiredCapabilities,
+			&i.RepoID,
+			&i.Kind,
+			&i.EphemeralDockerEnabled,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

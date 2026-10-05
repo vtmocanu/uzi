@@ -7290,7 +7290,7 @@ WHERE w.user_id = @user_id
 --
 -- ORDER BY r.created_at ASC so the oldest waiting run is provisioned first; LIMIT
 -- @max_rows bounds the work per tick.
-SELECT r.id, r.user_id, r.required_capabilities
+SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_docker_enabled
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
@@ -7447,7 +7447,7 @@ LIMIT @max_rows;
 -- sibling orders by created_at, but THIS path's clock is status_since (the same column the
 -- debounce gates on), so we order by it for consistency. LIMIT @max_rows bounds the work
 -- per tick.
-SELECT r.id, r.user_id, r.required_capabilities
+SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_docker_enabled
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'

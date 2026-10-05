@@ -758,6 +758,7 @@ func run() error {
 	ephemeralProv := hostedsvc.NewEphemeralProvisioner(pool, q, box, settingsCache, hostedsvc.EphemeralConfig{
 		// Issue #1965: lane workers are provisioned only where the chart enabled the lane.
 		IsolatedLaneEnabled: cfg.IsolatedLaneEnabled(),
+		DockerEnabled:       cfg.WorkerDockerEnabled,
 		MaxPerUser:          cfg.EphemeralMaxPerUser,
 		DefaultSize:         cfg.EphemeralDefaultSize,
 		ProvisionDeadline:   cfg.EphemeralProvisionDeadline,
