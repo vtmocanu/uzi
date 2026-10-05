@@ -100,7 +100,10 @@ describe("DinD maintenance heartbeat integration", () => {
     assert.equal(ACK.register_nonce, NONCE);
   });
 
-  it("omits unsafe, stale, future and inconsistent meter samples without throwing", async () => {
+  it("omits unsafe, stale, future and inconsistent meter samples without throwing", async (t) => {
+    // Freeze Date on a whole second so the 44 s and 46 s samples sit at exact
+    // ages around the 45 s bound, whatever the wall clock or the loop costs.
+    t.mock.timers.enable({ apis: ["Date"], now: 1_790_000_000_000 });
     await client.register("w");
     const s = sample();
     const invalid = [
