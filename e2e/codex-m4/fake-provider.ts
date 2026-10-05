@@ -26,6 +26,8 @@ export type ResponsesBody = { readonly model?: unknown; readonly input?: readonl
 export interface FakeProviderOptions {
   /** The exact bearer credential the app-server must present (assembled at runtime). */
   readonly credential: string;
+  /** Fixture-only request cap; default 4 MiB, opt-in bounded at 16 MiB. */
+  readonly maxRequestBytes?: number;
   /** Optional deterministic nonzero usage for accounting characterization. */
   readonly usage?: (responseIndex: number) => Record<string, unknown>;
   /** Produce the Responses output items for one request (mirrors M0's `respond`). */
@@ -73,6 +75,7 @@ export class FakeProvider {
     private readonly server: Server,
     readonly port: number,
     private readonly credential: string,
+    private readonly maxRequestBytes: number,
     private readonly usage: FakeProviderOptions["usage"],
     private readonly responder: (body: ResponsesBody, provider: FakeProvider) => ResponseItem[] | Promise<ResponseItem[]>,
   ) {}
@@ -84,6 +87,9 @@ export class FakeProvider {
   }
 
   static async start(options: FakeProviderOptions): Promise<FakeProvider> {
+    const maxRequestBytes = options.maxRequestBytes ?? MAX_BYTES;
+    if (!Number.isSafeInteger(maxRequestBytes) || maxRequestBytes < 1 || maxRequestBytes > 16 * 1024 * 1024)
+      throw new Error("m4 request cap must be an integer from 1 to 16 MiB");
     const server = createServer();
     const holder = { provider: undefined as FakeProvider | undefined };
     server.on("request", (request, response) => holder.provider?.handle(request, response));
@@ -97,7 +103,7 @@ export class FakeProvider {
     if (address === null || typeof address === "string" || address.address !== "127.0.0.1") {
       throw new Error("fake provider must bind 127.0.0.1");
     }
-    const provider = new FakeProvider(server, address.port, options.credential, options.usage, options.respond);
+    const provider = new FakeProvider(server, address.port, options.credential, maxRequestBytes, options.usage, options.respond);
     holder.provider = provider;
     return provider;
   }
@@ -115,7 +121,7 @@ export class FakeProvider {
     request.setEncoding("utf8");
     request.on("data", (chunk: string) => {
       raw += chunk;
-      if (Buffer.byteLength(raw) > MAX_BYTES) request.destroy(new Error("m4 request too large"));
+      if (Buffer.byteLength(raw) > this.maxRequestBytes) request.destroy(new Error("m4 request too large"));
     });
     request.on("end", () => {
       void (async () => {

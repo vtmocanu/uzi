@@ -54,6 +54,7 @@ export const STRICT_P_SUITE: readonly string[] = [
   "native-bypass.test.ts",
   "native-exceptions.test.ts",
   "token-resume.test.ts",
+  "large-resume.test.ts",
 ];
 
 /** Where the disposable codex volume is provisioned and, read-only, mounted for EXECUTE. It

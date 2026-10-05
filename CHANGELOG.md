@@ -37,6 +37,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Codex resumes stay bounded and report incomplete usage explicitly ([#2267](https://github.com/vtmocanu/uzi/issues/2267)).**
+  Root resume excludes returned turns while preserving saved model context and the 4 MiB frame cap. If resumed usage lacks a known baseline, execution continues with a persisted notice and unavailable token totals. Released workers receive this protection after an agent release and worker roll.
+
 - **Automatic MR rework works for Codex-only owners ([#2084](https://github.com/vtmocanu/uzi/issues/2084)).**
   Codex source runs can enter automatic MR rework without an Anthropic token; creation still refuses an unusable inherited Codex harness without falling back to Claude. Claude source runs require an enabled Anthropic token.
 
