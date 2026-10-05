@@ -196,6 +196,80 @@ test("absent physical directories allow ordinary cleanup while UUID case aliases
   assert.equal(await box.hasPhysicalTerminalProtection(run), false);
 });
 
+test("an authenticated alias wins before a competing canonical outcome is installed", async () => {
+  const { root, file, box, log } = await fixture();
+  const alias = path.join(root, run, "terminal-0003.json");
+  await fs.rename(file, alias);
+  const restarted = new Outbox({ root, log: log.logger, runMaxBytes: 1e6, maxBytes: 1e7, retentionMs: 1 });
+  outboxes.push(restarted);
+  await restarted.init();
+  assert.deepEqual(await restarted.journalTerminal(run, 3, "implement", 0, { status: "completed" }), { journaled: true, adopted: true });
+  assert.equal((await restarted.readTerminalJournal(run, 3))!.body.status, "failed");
+  await assert.rejects(fs.stat(file), { code: "ENOENT" });
+  await restarted.retireTerminal(run, 3);
+  await assert.rejects(fs.stat(alias), { code: "ENOENT" });
+  const again = new Outbox({ root, log: log.logger, runMaxBytes: 1e6, maxBytes: 1e7, retentionMs: 1 });
+  outboxes.push(again);
+  await again.init();
+  assert.deepEqual(again.listPendingTerminals(), []);
+  // Original-process metadata cannot manufacture a new outcome after a transient read.
+  await fs.mkdir(file);
+  assert.deepEqual(await box.journalTerminal(run, 3, "implement", 0, { status: "completed" }), { journaled: true, adopted: true });
+  await fs.rmdir(file);
+});
+
+test("accepted boundary journals stay readable across every blocked-state update and restart", async () => {
+  const { root, box, log } = await fixture(1024);
+  const cap = 1024 + OUTBOX_RANGE_RESERVE_BYTES;
+  const reasons = ["gap_unrecoverable", "reserve_exhausted", "completion_permit_mismatch"] as const;
+  // Search the admission boundary with distinct generations: an installed winner is immutable.
+  let low = cap - 1024;
+  let high = cap;
+  let generation = 10;
+  let accepted = 0;
+  while (low <= high) {
+    const length = Math.floor((low + high) / 2);
+    const gen = generation++;
+    const result = await box.journalTerminal(run, gen, "implement", 0, { status: "failed", failure_reason: "x".repeat(length) });
+    if (!result.journaled) { high = length - 1; continue; }
+    accepted++;
+    for (const reason of reasons) {
+      await box.markTerminalBlocked(run, gen, reason);
+      assert.ok((await fs.stat(path.join(root, run, `terminal-${gen}.json`))).size <= cap);
+      assert.equal((await box.observeTerminalAuthentication(run, gen)).kind, "authenticated");
+      assert.ok(await box.readTerminalJournal(run, gen));
+    }
+    low = length + 1;
+  }
+  assert.ok(accepted > 0);
+  const restarted = new Outbox({ root, log: log.logger, runMaxBytes: 1e6, maxBytes: 1e7, retentionMs: 1, terminalMaxBytes: 1024 });
+  outboxes.push(restarted);
+  await restarted.init();
+  assert.equal(restarted.listPendingTerminals().length, accepted + 1);
+});
+
+test("blocking a historical cap-sized journal preserves its authenticated outcome without an oversized rewrite", async () => {
+  const { root, box, file, log } = await fixture(1024);
+  const record = JSON.parse(await fs.readFile(file, "utf8"));
+  delete record.mac;
+  record.body = { status: "failed", failure_reason: "" };
+  const legacy = box as unknown as { seal(domain: string, body: unknown): string };
+  const cap = 1024 + OUTBOX_RANGE_RESERVE_BYTES;
+  record.body.failure_reason = "x".repeat(cap - Buffer.byteLength(legacy.seal("uzi.outbox.terminal.v1", record)));
+  const serialized = legacy.seal("uzi.outbox.terminal.v1", record);
+  assert.equal(Buffer.byteLength(serialized), cap);
+  await fs.writeFile(file, serialized);
+  assert.equal((await box.observeTerminalAuthentication(run, 3)).kind, "authenticated");
+  await box.markTerminalBlocked(run, 3, "completion_permit_mismatch");
+  assert.equal(await fs.readFile(file, "utf8"), serialized);
+  assert.equal((await box.readTerminalJournal(run, 3))!.body.status, "failed");
+  const restarted = new Outbox({ root, log: log.logger, runMaxBytes: 1e6, maxBytes: 1e7, retentionMs: 1, terminalMaxBytes: 1024 });
+  outboxes.push(restarted);
+  await restarted.init();
+  assert.equal(restarted.listPendingTerminals().length, 1);
+  assert.ok(await restarted.readTerminalJournal(run, 3));
+});
+
 test("symlinked run containment prevents observation and recursive deletion", async () => {
   const { box, root } = await fixture();
   const original = path.join(root, run);

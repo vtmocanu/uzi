@@ -1240,6 +1240,15 @@ export class Outbox {
         });
         return { journaled: false, reason: "reserve_exhausted" };
       }
+      const winner = this.runs.get(runId)?.terminals.get(claimGeneration);
+      if (winner) {
+        // This generation already has a durable authenticated winner, possibly a filename alias.
+        // A transient read must not install or send a competing outcome. Fresh MAC failure
+        // invalidates that winner; it cannot authorize adoption or a replacement write here.
+        const observed = await this.inspectTerminal(runId, claimGeneration, winner.fileName);
+        if (observed.observation.kind === "mac_failure") return { journaled: false, reason: "reserve_exhausted" };
+        return { journaled: true, adopted: true };
+      }
       const since = this.now();
       const record: TerminalJournalData = {
         version: 1,
@@ -1253,7 +1262,10 @@ export class Outbox {
         blocked: false,
       };
       const serialized = this.seal(MAC_DOMAIN_TERMINAL, record);
-      if (Buffer.byteLength(serialized) > this.terminalReadMaxBytes) return { journaled: false, reason: "reserve_exhausted" };
+      // Reserve the largest closed-vocabulary blocked-state update, so every accepted
+      // new journal remains readable after any legitimate blocked-state rewrite.
+      const blocked = this.seal(MAC_DOMAIN_TERMINAL, { ...record, blocked: true, blocked_reason: "completion_permit_mismatch" });
+      if (Math.max(Buffer.byteLength(serialized), Buffer.byteLength(blocked)) > this.terminalReadMaxBytes) return { journaled: false, reason: "reserve_exhausted" };
       const dst = path.join(dir, terminalFileName(claimGeneration));
       let adopted: boolean;
       try {
@@ -1393,9 +1405,12 @@ export class Outbox {
         // for the INITIAL install; updating blocked-state is the owner's own follow-up write. The
         // rewrite needs temporary-file space too, so it must release the reserve on ENOSPC just like
         // the initial terminal install; otherwise a full volume can strand an unblocked journal.
-        await this.withReserveOnEnospc(() =>
-          this.writeFileAtomic(dst, this.seal(MAC_DOMAIN_TERMINAL, next), "terminal"),
-        );
+        const serialized = this.seal(MAC_DOMAIN_TERMINAL, next);
+        // Historical journals may have consumed the new writer\'s blocked-state reserve.
+        // Keep their readable outcome intact and mark memory only rather than destroy replay.
+        if (Buffer.byteLength(serialized) <= this.terminalReadMaxBytes) {
+          await this.withReserveOnEnospc(() => this.writeFileAtomic(dst, serialized, "terminal"));
+        }
       } else {
         this.log.warn("outbox: terminal journal unreadable while marking blocked; updating in-memory only", {
           run_id: runId,
