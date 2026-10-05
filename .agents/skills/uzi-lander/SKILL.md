@@ -411,6 +411,9 @@ changes it); trust it over a handover's claim.
      - **dismissed**: `uzi findings dismiss ID --reason not-an-issue|wont-do`.
      - **needs you**: disagreement, insufficient evidence, or an unclear filing result stays
        in `to_file`. Never dismiss to empty the bucket.
+   - A security vulnerability is never a public issue, whatever the redaction: route it per
+     `.github/SECURITY.md` (private draft advisory, references/advisory.md) and list it under
+     needs you.
    - Filing: the buddy's `APPROVE` covers membership, the exact posted title and body, and
      redaction (public repo). Publish findings through the Findings page's grouped-file
      dialog, which edits the server text before filing; `uzi findings file ID ID...` posts
@@ -419,8 +422,9 @@ changes it); trust it over a handover's claim.
      `priority::*` per `.agents/skills/issue-triage/references/taxonomy.md` (omit when
      unsure) and `reviewed`. A set over the grouped-filing limit (50) is "needs you"; never
      split or truncate it silently. Name each issue in the trail.
-   - Already-tracked issue not moving (no active run, no selector + `uzi`, no one-time
-     schedule, not `In Progress`): after issue-triage's Step 4 freshness and eligibility
+   - Already-tracked issue not moving (no active run, not sweep-fireable per issue-triage's
+     Step 1 selector plus `uzi` or bot assignment, no enabled one-time schedule still to
+     fire, not `In Progress`): after issue-triage's Step 4 freshness and eligibility
      checks, offer the user run now (**uzi-watcher**), tonight (a one-time schedule, only
      where one can fire tonight), raise priority, or leave. A `brainstorm` issue gets
      "decide the design" instead. Dispatch is the user's choice. A moving issue gets a
@@ -430,9 +434,12 @@ changes it); trust it over a handover's claim.
      verified root cause recurs across distinct runs (count them in `uzi review backlog`
      occurrences) or it is a verified urgent/high item; judge confidence alone is not
      severity. Leave the rest for **judge-triage**. Route by where the fix lives, verified,
-     not by category: uzi code or config takes the findings path above and is recorded with
-     `uzi review file RUN REC` (server-templated: the buddy approves that text, else file
-     by hand); agent text may be upstream roles, `agent/src/prompt.ts`, builtin `lead.md`
+     not by category. Uzi code or config gets the same outcomes and gates as findings, with
+     judge verbs: file through the run's judge Recommendations panel (edits the title and
+     body, records the link, moves the rec to filed) or `uzi review file RUN REC`, which
+     posts the unedited server text; already tracked or fixed → `uzi review resolve RUN
+     REC`; false or declined → `uzi review dismiss RUN REC --reason not-an-issue|wont-do`;
+     undecided stays `todo`. Agent text may be upstream roles, `agent/src/prompt.ts`, builtin `lead.md`
      or a repo-local tail, so report it as "needs you: judge-triage agent session"; a
      worker tool or egress change is "needs you".
    - Report one table: filed (link, priority), already tracked (link), resolved by the

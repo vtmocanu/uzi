@@ -70,7 +70,7 @@ uzi schedule list --json | jq '.[] | select(.target=="sweep") | {slug: .catalog_
 
 ## Step 1: Pick
 
-Order: user-named issue → lowest-numbered `external` from 0B → `recurring` and not moving (no active run, no selector + `uzi`, no one-time schedule, not `In Progress`; reconsider its priority with the incident count in the reason) → lowest-numbered issue in the highest non-empty tier. When the user asks for newest first, take the highest number instead, at each step.
+Order: user-named issue → lowest-numbered `external` from 0B → `recurring` and not moving (no active run, not fireable per the selector plus eligibility rule below, bot assignment included, no enabled one-time schedule still to fire, not `In Progress`; reconsider its priority with the incident count in the reason) → lowest-numbered issue in the highest non-empty tier. When the user asks for newest first, take the highest number instead, at each step.
 
 A sweep fires an issue only with BOTH a selector (`Planned`, or `bug`) AND eligibility (`uzi` label OR assigned to the uzi-bot account). Missing either half = looks queued, never runs.
 
@@ -116,7 +116,7 @@ gh issue list --repo vtmocanu/uzi --state open --limit 400 --json number,title,l
       | "#\(.number)\tmissing:\($miss | join("+"))\t[\($n | join(","))]\t\(.title[0:64])"'
 ```
 
-Run Steps 2 and 3 on each; a label-only fix needs no Step 4 unless the verdict also changes. Batch several into one proposal.
+Run Steps 2 and 3 on each and batch several into one proposal. A categorization-only change (area or priority, no selector, eligibility or verdict change) skips Step 4; any change that can make the issue fire is a dispatch gap and runs Steps 2 to 4.
 
 Confirm the pick with the user. Gap issues still run Steps 2 to 4: the gap names the missing label, not whether adding it is right.
 
@@ -162,7 +162,8 @@ Do not trust issue line numbers.
 Labels and comments are public writes: propose first, apply on OK.
 
 ```sh
-gh issue edit NNN --repo vtmocanu/uzi --add-label "SELECTOR" --add-label "uzi" --add-label "area::AREA" --add-label "priority::PRIO"
+gh issue edit NNN --repo vtmocanu/uzi --add-label "SELECTOR" --add-label "uzi" --add-label "area::AREA" --add-label "priority::PRIO" \
+  --remove-label "area::OLD" --remove-label "priority::OLD"   # only the superseded ones it carries
 gh issue comment NNN --repo vtmocanu/uzi --body "$(cat <<'EOF'
 Queued for the nightly SELECTOR sweep (SELECTOR + uzi added; spec-in-body).
 Priority PRIO because X happens under Y; workaround Z.

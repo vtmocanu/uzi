@@ -2,6 +2,7 @@
 
 Every open issue carries one `area::*` and one `priority::*` label when the evidence supports them.
 Leave either off when unsure: a missing area or priority means categorization is incomplete, never "low".
+Assigning a new area or priority removes the superseded one; other labels stay.
 GitHub label descriptions mirror the one-liners below; keep both in sync.
 
 ## Area: the maintainer's decision domain (one primary)
