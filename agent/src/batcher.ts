@@ -811,9 +811,9 @@ export class MessageBatcher {
     if (signal?.aborted) onAbort();
     else signal?.addEventListener("abort", onAbort, { once: true });
     this.inFlightAbort = abort;
-    // PRD #1391 M2: SPILLED flushes go to the outbox (local, fast — the boundary signal
-    // is irrelevant); network flushes stay abort-aware as before.
-    this.inFlight = this.spilled ? this.doSpillFlush() : this.doFlush(abort.signal);
+    // Both targets share owned cancellation: an outbox write can queue behind
+    // an independent drainer. Active writes still await their real settlement.
+    this.inFlight = this.spilled ? this.doSpillFlush(abort.signal) : this.doFlush(abort.signal);
     try {
       await this.inFlight;
     } finally {
@@ -1122,7 +1122,7 @@ export class MessageBatcher {
         // back off and keep the sustained-failure breaker clock running. Resetting the
         // accounting here — as the old code did — re-posted with no backoff and wiped
         // failingSince, reopening the PRD #108 retry storm through the bisect door.
-        await this.noteTransientFailure(batch.length, lastSeq, err);
+        await this.noteTransientFailure(batch.length, lastSeq, err, signal);
         return true;
       }
       // Real progress: a sub-batch was persisted, or the poison was isolated and
@@ -1136,7 +1136,7 @@ export class MessageBatcher {
     // whole buffer no longer rides on one request, so this re-buffer can no longer
     // grow a body across the server's cap — the next attempt re-splits.
     this.buffer = batch.concat(this.buffer);
-    await this.noteTransientFailure(batch.length, lastSeq, err);
+    await this.noteTransientFailure(batch.length, lastSeq, err, signal);
     return true;
   }
 
@@ -1144,7 +1144,7 @@ export class MessageBatcher {
    *  sustained-failure spill/trip. The caller has already re-buffered the batch. After
    *  `transientTripMs` of unbroken transient failure the batcher SPILLS to the outbox
    *  (PRD #1391 M2) instead of tripping; with no outbox it falls back to today's trip. */
-  private async noteTransientFailure(count: number, lastSeq: number, err: unknown): Promise<void> {
+  private async noteTransientFailure(count: number, lastSeq: number, err: unknown, signal?: AbortSignal): Promise<void> {
     this.consecutiveFailures += 1;
     const now = Date.now();
     this.failingSince ??= now;
@@ -1162,7 +1162,7 @@ export class MessageBatcher {
       // as "no durable store" and TRIP (surfacing the failure), exactly as today with
       // no outbox at all.
       if (this.outbox && !this.outbox.isDisabled()) {
-        await this.enterSpill(lastSeq);
+        await this.enterSpill(lastSeq, signal);
       } else {
         this.trip(
           `the api has been unreachable or failing for ${Math.round((now - this.failingSince) / 1000)}s`,
@@ -1180,7 +1180,7 @@ export class MessageBatcher {
    * restart. If marking fails the store is unusable, so fall back to today's trip
    * rather than silently losing the tail.
    */
-  private async enterSpill(lastSeq: number): Promise<void> {
+  private async enterSpill(lastSeq: number, signal?: AbortSignal): Promise<void> {
     if (this.spilled || this.tripped) return;
     // No durable store — absent, or failed closed at init (a disabled store's writes
     // are silent no-ops). Trip rather than pretend to spill into the void.
@@ -1189,8 +1189,9 @@ export class MessageBatcher {
       return;
     }
     try {
-      await this.outbox.markSpillUnclean(this.runId);
+      await this.outbox.markSpillUnclean(this.runId, signal);
     } catch (err) {
+      if (signal?.aborted) return; // Cancelled acquisition leaves the assigned tail buffered.
       this.log.error("outbox: could not mark spill unclean; tripping instead of spilling", {
         run_id: this.runId,
         error: errMessage(err),
@@ -1215,7 +1216,7 @@ export class MessageBatcher {
    * tail is durable at that instant). One `appendSegment` is the durability point — no
    * per-frame sync.
    */
-  private async doSpillFlush(): Promise<void> {
+  private async doSpillFlush(signal?: AbortSignal): Promise<void> {
     try {
       const outbox = this.outbox;
       if (!outbox) return; // defensive: only ever reached while spilled, which requires an outbox
@@ -1226,7 +1227,7 @@ export class MessageBatcher {
       // that restart reads as clean — a silent tail loss. Back off and retry instead.
       if (this.buffer.length > 0 || this.pendingRangeFirst !== undefined) {
         try {
-          await outbox.markSpillUnclean(this.runId);
+          await outbox.markSpillUnclean(this.runId, signal);
         } catch (err) {
           if (this.spilled) {
             this.consecutiveFailures += 1;
@@ -1245,7 +1246,7 @@ export class MessageBatcher {
         const last = this.pendingRangeLast;
         try {
           await outbox.appendRangeRecord(this.runId, this.generation, first, last,
-            (identity) => { this.reservation?.outboxPending.add(identity); });
+            (identity) => { this.reservation?.outboxPending.add(identity); }, signal);
           this.pendingRangeFirst = undefined;
           this.pendingRangeLast = undefined;
         } catch (err) {
@@ -1278,6 +1279,7 @@ export class MessageBatcher {
             this.generation,
             batch.map((b) => b.msg),
             (identity) => { this.reservation?.outboxPending.add(identity); },
+            signal,
           );
         } catch (err) {
           this.buffer = batch.concat(this.buffer);
@@ -1299,7 +1301,7 @@ export class MessageBatcher {
       if (this.buffer.length === 0 && this.pendingRangeFirst === undefined) {
         this.consecutiveFailures = 0;
         this.failingSince = undefined;
-        await outbox.clearSpillUnclean(this.runId).catch(() => undefined);
+        await outbox.clearSpillUnclean(this.runId, signal).catch(() => undefined);
       }
     } finally {
       this.flushing = false;
@@ -1314,7 +1316,7 @@ export class MessageBatcher {
    *  the possible loss. */
   private async finalSpillOnClose(signal?: AbortSignal): Promise<void> {
     const outbox = this.outbox;
-    if (!outbox || (this.buffer.length === 0 && this.pendingRangeFirst === undefined)) return;
+    if (!outbox) return;
     try {
       // Re-mark unclean BEFORE any close-time write, mirroring doSpillFlush's own
       // defensive re-mark at its top. A prior clean periodic doSpillFlush may have

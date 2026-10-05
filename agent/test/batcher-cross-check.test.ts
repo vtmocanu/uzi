@@ -370,6 +370,271 @@ it("close awaits the real failure of a running owned delivery and preserves its 
   });
 });
 
+async function within100ms<T>(work: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([work, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("owned queued spill exceeded 100ms")), 100);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
+for (const stage of ["marker", "range", "segment", "clear", "transition"] as const) {
+  for (const stop of ["prepare", "close"] as const) {
+    it(`queued ${stage} spill acquisition cancels on ${stop} without overtaking or late writes`, async () => {
+      await withOutbox(async (o) => {
+        const sent: OutgoingMessage[][] = [];
+        const b = new MessageBatcher({ async postUsage() {},
+          async postMessages(_id: string, msgs: OutgoingMessage[]) {
+            sent.push(structuredClone(msgs));
+            throw new Error("offline");
+          },
+        } as unknown as WorkerClient, runId, 0, 60_000, nullLogger(), undefined, undefined,
+        { generation: 3, outbox: o, transientTripMs: 0, spillBufferBytes: 256 });
+        b.emit(event("durable seed"));
+        await b.flush();
+        await b.flush();
+        assert.equal(b.isSpilled(), true);
+        if (stage === "transition") b.rearm();
+        b.emit(event("assigned tail"));
+        if (stage === "range") b.emit(event("dropped".repeat(100)));
+        const tail = b.currentSeq();
+        let entered!: () => void;
+        const started = new Promise<void>((resolve) => { entered = resolve; });
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        let ownerSettled = false;
+        let owner: ReturnType<Outbox["drainRun"]> | undefined;
+        let queued!: () => void;
+        const queueReady = new Promise<void>((resolve) => { queued = resolve; });
+        let armed = true;
+        const acquire = async (work: () => Promise<void>) => {
+          if (armed) {
+            armed = false;
+            owner = o.drainRun(runId, async () => {
+              entered();
+              await held;
+              throw new Error("independent ACK unknown");
+            }).then((result) => { ownerSettled = true; return result; });
+            await started;
+            const pending = work();
+            queued();
+            await pending;
+          } else await work();
+        };
+        if (stage === "marker" || stage === "transition") {
+          const original = o.markSpillUnclean.bind(o);
+          o.markSpillUnclean = (...args) => acquire(() => original(...args));
+        } else if (stage === "range") {
+          const original = o.appendRangeRecord.bind(o);
+          o.appendRangeRecord = (...args) => acquire(() => original(...args));
+        } else if (stage === "segment") {
+          const original = o.appendSegment.bind(o);
+          o.appendSegment = (...args) => acquire(() => original(...args));
+        } else {
+          const original = o.clearSpillUnclean.bind(o);
+          o.clearSpillUnclean = (...args) => acquire(() => original(...args));
+        }
+        const flushing = b.flush();
+        await queueReady;
+        const identities = o.pendingDeliveryIdentities(runId);
+        const count = stage === "segment" ? 1 : b.bufferedCount();
+        const posts = sent.length;
+        let preparing: Promise<{ prepared: boolean; tail: number }> | undefined;
+        let later: ReturnType<Outbox["drainRun"]> | undefined;
+        let laterSent = false;
+        try {
+          if (stop === "prepare") {
+            const r = b.reserveCandidateTransport();
+            preparing = r.prepare(10);
+            assert.equal((await within100ms(preparing)).prepared, false);
+            assert.equal(r.release(proof(tail + 1)), false);
+          }
+          await within100ms(b.close(AbortSignal.abort()));
+          await within100ms(flushing);
+          assert.equal(ownerSettled, false);
+          assert.equal(sent.length, posts);
+          assert.equal(b.bufferedCount(), count);
+          assert.equal(b.currentSeq(), tail);
+          assert.equal(b.isTripped(), false, "cancellation is not a persistence failure");
+          assert.deepEqual(o.pendingDeliveryIdentities(runId), identities);
+          later = o.drainRun(runId, async (msgs) => {
+            laterSent = true;
+            assert.ok(msgs.every((m) => m.seq <= (stage === "clear" ? 2 : 1)),
+              "cancelled range/segment must not reach the later drainer");
+          });
+          await new Promise<void>((resolve) => { setImmediate(resolve); });
+          assert.equal(laterSent, false);
+        } finally {
+          release();
+          if (owner) assert.equal((await owner).retired, false);
+          await flushing;
+          if (preparing) await preparing;
+          await b.close(AbortSignal.abort());
+          if (later) await later;
+        }
+        assert.deepEqual(o.pendingDeliveryIdentities(runId), [],
+          "cancelled callback must not append after the independent owner releases");
+      });
+    });
+  }
+}
+
+for (const stage of ["marker", "range", "segment", "clear", "transition"] as const) {
+  it(`active ${stage} spill write awaits real settlement after close cancellation`, async () => {
+    let armed = false;
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let resume!: () => void;
+    const resumed = new Promise<void>((resolve) => { resume = resolve; });
+    let target: "manifest" | "range" | "segment" = "manifest";
+    await withOutbox(async (o) => {
+      const b = new MessageBatcher({ async postUsage() {},
+        async postMessages() { throw new Error("offline"); },
+      } as unknown as WorkerClient, runId, 0, 60_000, nullLogger(), undefined, undefined,
+      { generation: 3, outbox: o, transientTripMs: 0, spillBufferBytes: 256 });
+      b.emit(event("seed"));
+      await b.flush();
+      await b.flush();
+      if (stage === "transition") b.rearm();
+      b.emit(event("assigned"));
+      if (stage === "range") b.emit(event("pressure".repeat(100)));
+      if (stage === "marker" || stage === "transition") {
+        const original = o.markSpillUnclean.bind(o);
+        o.markSpillUnclean = (...args) => { armed = true; return original(...args); };
+      } else if (stage === "range") {
+        target = "range";
+        const original = o.appendRangeRecord.bind(o);
+        o.appendRangeRecord = (...args) => { armed = true; return original(...args); };
+      } else if (stage === "segment") {
+        target = "segment";
+        const original = o.appendSegment.bind(o);
+        o.appendSegment = (...args) => { armed = true; return original(...args); };
+      } else {
+        const original = o.clearSpillUnclean.bind(o);
+        o.clearSpillUnclean = (...args) => { armed = true; return original(...args); };
+      }
+      const flushing = b.flush();
+      await started;
+      let closed = false;
+      const closing = b.close(AbortSignal.abort()).then(() => { closed = true; });
+      try {
+        await new Promise<void>((resolve) => { setImmediate(resolve); });
+        assert.equal(closed, false, "active write must settle before close returns");
+      } finally {
+        resume();
+        await flushing;
+        await closing;
+      }
+      assert.equal(b.isTripped(), false);
+      await b.close(); // normal cleanup persists the retained assigned tail, if any
+      const delivered: OutgoingMessage[] = [];
+      const identities = o.pendingDeliveryIdentities(runId);
+      const receipts: symbol[] = [];
+      assert.equal((await o.drainRun(runId, async (msgs) => { delivered.push(...msgs); },
+        (identity) => { receipts.push(identity); })).retired, true);
+      assert.equal(receipts.length, identities.length);
+      assert.deepEqual(new Set(receipts), new Set(identities));
+      assert.deepEqual(delivered.slice(0, 2).map((m) => [m.seq, m.payload]),
+        [[1, { text: "seed" }], [2, { text: "assigned" }]]);
+      if (stage === "range") {
+        assert.equal(delivered[2]?.seq, 3);
+        assert.equal(delivered[2]?.payload["event"], "message_dropped");
+      } else assert.equal(delivered.length, 2);
+    }, async (write, ctx) => {
+      if (armed && ctx.kind === target) {
+        armed = false;
+        entered();
+        await resumed;
+      }
+      await write();
+    });
+  });
+}
+
+it("normal empty-tail close retries a failed periodic spill-marker clear", async () => {
+  let failManifest = false;
+  await withOutbox(async (o, root) => {
+    const b = new MessageBatcher({ async postUsage() {},
+      async postMessages() { throw new Error("offline"); },
+    } as unknown as WorkerClient, runId, 0, 60_000, nullLogger(), undefined, undefined,
+    { generation: 3, outbox: o, transientTripMs: 0 });
+    b.emit(event("persisted tail"));
+    await b.flush();
+    const clear = o.clearSpillUnclean.bind(o);
+    let failOnce = true;
+    o.clearSpillUnclean = async (...args) => {
+      failManifest = failOnce;
+      failOnce = false;
+      try { await clear(...args); } finally { failManifest = false; }
+    };
+    const restart = async () => {
+      const fresh = new Outbox({ root, log: nullLogger(), runMaxBytes: 64 * 1024 * 1024,
+        maxBytes: 512 * 1024 * 1024, retentionMs: 86400_000 });
+      await fresh.init();
+      return fresh;
+    };
+    try {
+      await b.flush();
+      assert.equal(b.bufferedCount(), 0);
+      assert.equal((await restart()).uncleanRuns().includes(runId), true);
+      await b.close();
+      const fresh = await restart();
+      assert.equal(fresh.uncleanRuns().includes(runId), false);
+      const delivered: OutgoingMessage[] = [];
+      await fresh.drainRun(runId, async (msgs) => { delivered.push(...msgs); });
+      assert.deepEqual(delivered.map((m) => [m.seq, m.payload]), [[1, { text: "persisted tail" }]]);
+    } finally { await b.close(AbortSignal.abort()); }
+  }, async (write, ctx) => {
+    if (failManifest && ctx.kind === "manifest") throw new Error("transient storage failure");
+    await write();
+  });
+});
+
+it("cancelled empty-tail close leaves the marker and skips its queued cleanup callback", async () => {
+  let failManifest = false;
+  await withOutbox(async (o, root) => {
+    const b = new MessageBatcher({ async postUsage() {},
+      async postMessages() { throw new Error("offline"); },
+    } as unknown as WorkerClient, runId, 0, 60_000, nullLogger(), undefined, undefined,
+    { generation: 3, outbox: o, transientTripMs: 0 });
+    b.emit(event("durable"));
+    await b.flush();
+    const clear = o.clearSpillUnclean.bind(o);
+    o.clearSpillUnclean = async (...args) => {
+      failManifest = true;
+      try { await clear(...args); } finally { failManifest = false; }
+    };
+    await b.flush();
+    o.clearSpillUnclean = clear;
+    assert.equal(b.bufferedCount(), 0);
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const owner = o.drainRun(runId, async () => {
+      entered();
+      await held;
+      throw new Error("independent ACK unknown");
+    });
+    await started;
+    try { await within100ms(b.close(AbortSignal.timeout(10))); }
+    finally { release(); await owner; }
+    const fresh = new Outbox({ root, log: nullLogger(), runMaxBytes: 64 * 1024 * 1024,
+      maxBytes: 512 * 1024 * 1024, retentionMs: 86400_000 });
+    await fresh.init();
+    assert.equal(fresh.uncleanRuns().includes(runId), true);
+    await b.close();
+    const clean = new Outbox({ root, log: nullLogger(), runMaxBytes: 64 * 1024 * 1024,
+      maxBytes: 512 * 1024 * 1024, retentionMs: 86400_000 });
+    await clean.init();
+    assert.equal(clean.uncleanRuns().includes(runId), false);
+  }, async (write, ctx) => {
+    if (failManifest && ctx.kind === "manifest") throw new Error("transient storage failure");
+    await write();
+  });
+});
+
 it("invalid preparation deadlines fail before changing ownership", async () => {
   const { b } = fixture();
   const r = b.reserveCandidateTransport();
