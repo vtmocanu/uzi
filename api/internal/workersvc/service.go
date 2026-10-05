@@ -433,6 +433,7 @@ const (
 // Store is the narrow set of generated queries workersvc uses. *store.Queries
 // satisfies it; tests embed it and override only the methods they exercise.
 type Store interface {
+	TerminalRejectionCustodySnapshot(context.Context, store.TerminalRejectionCustodySnapshotParams) (store.TerminalRejectionCustodySnapshotRow, error)
 	// Workers.
 	CreateWorker(ctx context.Context, arg store.CreateWorkerParams) (store.Worker, error)
 	GetWorkerByID(ctx context.Context, id uuid.UUID) (store.Worker, error)

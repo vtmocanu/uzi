@@ -734,6 +734,7 @@ type RecoveryCustodyHold struct {
 	ReleaseSuccessorGeneration pgtype.Int8        `json:"release_successor_generation"`
 	ReleaseBranch              pgtype.Text        `json:"release_branch"`
 	ReleaseTarget              pgtype.Text        `json:"release_target"`
+	TerminalRecordRejection    pgtype.Text        `json:"terminal_record_rejection"`
 }
 
 type Repo struct {

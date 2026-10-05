@@ -147,15 +147,16 @@ func isDecisionAttention(attention string) bool {
 // original_worker_identity (raw provenance) — and stamps the server-derived Attention.
 func custodyHoldToDTO(row store.ListCustodyHoldsForOwnerRow) apitypes.RecoveryCustodyHoldDTO {
 	out := apitypes.RecoveryCustodyHoldDTO{
-		ID:                  row.ID.String(),
-		RunID:               row.RunID.String(),
-		Generation:          row.Generation,
-		State:               row.State,
-		Attention:           deriveHoldAttention(row),
-		WorkerID:            row.OriginalWorkerID.String(),
-		WorkerName:          row.WorkerName,
-		HasAvailableCapture: row.HasAvailableCapture,
-		CaptureState:        row.CaptureState,
+		TerminalRecordRejection: row.TerminalRecordRejection.String,
+		ID:                      row.ID.String(),
+		RunID:                   row.RunID.String(),
+		Generation:              row.Generation,
+		State:                   row.State,
+		Attention:               deriveHoldAttention(row),
+		WorkerID:                row.OriginalWorkerID.String(),
+		WorkerName:              row.WorkerName,
+		HasAvailableCapture:     row.HasAvailableCapture,
+		CaptureState:            row.CaptureState,
 	}
 	if row.CreatedAt.Valid {
 		out.CreatedAt = row.CreatedAt.Time

@@ -4669,6 +4669,7 @@ export interface RecoveryArchiveSummary {
 // checkpoint lives on origin: the branch checkpoint ref, or refs/uzi-recovery/<run id> once
 // superseded; all three are absent when the run has no live retention record.
 export interface RecoveryCustodyHold {
+  terminal_record_rejection?: string;
   id: string;
   run_id: string;
   generation: number;

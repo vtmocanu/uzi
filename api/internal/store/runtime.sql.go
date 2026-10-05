@@ -3875,7 +3875,7 @@ func (q *Queries) ExtendAndResumeWallPark(ctx context.Context, arg ExtendAndResu
 }
 
 const failAttestedFinalizeRunsOverCap = `-- name: FailAttestedFinalizeRunsOverCap :many
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = $1,
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE $1 END,
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     milestones_in_progress = NULL,
@@ -4105,7 +4105,7 @@ func (q *Queries) FailRunAutoStop(ctx context.Context, arg FailRunAutoStopParams
 }
 
 const failRunsMissingFromSnapshot = `-- name: FailRunsMissingFromSnapshot :many
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = $1,
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE $1 END,
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     milestones_in_progress = NULL,
@@ -4194,7 +4194,7 @@ WITH locked AS (
     ORDER BY workers.id
     FOR UPDATE
 )
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = $1,
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE $1 END,
     -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
@@ -4275,7 +4275,7 @@ func (q *Queries) FailRunsOfStaleWorkersOverCap(ctx context.Context, arg FailRun
 
 const failWorkerRunsOverCap = `-- name: FailWorkerRunsOverCap :many
 
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = $1,
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE $1 END,
     -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),

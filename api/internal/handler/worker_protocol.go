@@ -424,6 +424,7 @@ func protocolFeatures(activeSnapshotEnabled bool) []string {
 		// the roster. Advertised UNCONDITIONALLY: an older api's strict decoder 400s the
 		// unknown field, so a worker sends it only after seeing this token.
 		{"repo_agent_folder"},
+		{"terminal_rejection_report"}, // Issue #1974 M1; independent of active snapshots.
 	}
 	if activeSnapshotEnabled {
 		groups = append(groups, []string{"active_run_snapshot"}) // PRD #1390 M2a

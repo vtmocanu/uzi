@@ -1346,6 +1346,8 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// with the ready transition in one transaction; a retry starts from zero under the
 		// same capture id. The two static paths (reserve/release) are registered before the
 		// {captureID} wildcard so chi routes them by their static segment.
+		r.Post("/terminal-rejections", h.WorkerTerminalRejections)
+		r.Get("/runs/{id}/terminal-rejection-custody", h.WorkerTerminalRejectionCustody)
 		r.Post("/runs/{id}/archives/reserve", h.WorkerRecoveryReserve)
 		r.Post("/runs/{id}/archives/release", h.WorkerRecoveryRelease)
 		r.Post("/runs/{id}/archives/{captureID}/upload", h.WorkerRecoveryUpload)

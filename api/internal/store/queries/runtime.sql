@@ -4618,7 +4618,7 @@ WITH locked AS (
     ORDER BY workers.id
     FOR UPDATE
 )
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE @failure_reason END,
     -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
@@ -4701,7 +4701,7 @@ RETURNING id, user_id, status;
 -- it stamps move_pending_since. RETURNING id so the caller can funnel these
 -- committed-terminal (worker-lost) runs into the judge (PRD #46 Decision 2), exactly
 -- as the sweeper's FailRunsOfStaleWorkersOverCap does.
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE @failure_reason END,
     -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
@@ -4777,7 +4777,7 @@ RETURNING id, (finalize_resume_generation IS NOT NULL AND finalize_resume_genera
 -- name: FailAttestedFinalizeRunsOverCap :many
 -- An attested run that is over budget and not eligible for the one-shot allowance (allowance
 -- already used, or RUN_MAX_REQUEUES = 0) fails exactly as FailWorkerRunsOverCap fails it.
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE @failure_reason END,
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     milestones_in_progress = NULL,
@@ -4981,7 +4981,7 @@ RETURNING r.id, r.user_id, r.status;
 -- restore). Held states are never targeted (status = 'running' only). Chat is a target restriction
 -- (kind <> 'chat', D10) — these writers only ever touch run-lane runs. @missing_cutoff is the stale
 -- window plus one heartbeat interval (D4); @max_requeues is RUN_MAX_REQUEUES.
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE @failure_reason END,
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     milestones_in_progress = NULL,
