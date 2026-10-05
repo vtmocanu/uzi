@@ -1678,7 +1678,8 @@ type SettingsReader interface {
 // Kept its own interface (interface segregation, like SettingsReader/Settings) so a
 // test exercises only what it uses. Optional (nil-safe): a nil reader means the
 // allowlist is UNAVAILABLE, which the claim gate treats as fail-closed for a docker
-// worker — it then claims no repo-bearing run. A non-docker worker never consults it.
+// worker — it then claims no repo-bearing run. Every claimant reads it for peer
+// eligibility and preference-driven warm-lease admission.
 type DockerAllowlistReader interface {
 	DockerRepoAllowlist(ctx context.Context) ([]uuid.UUID, error)
 }
@@ -1796,9 +1797,10 @@ type Service struct {
 	// dockerAllowlist reads the docker-worker repo allowlist the claim gate enforces
 	// (PRD #89 M-allow). Optional (nil-safe); set via SetDockerAllowlist with the same
 	// settings cache the HTTP handlers hold. Nil ⇒ a docker worker is fail-closed (it
-	// claims no repo-bearing run); a non-docker worker never consults it, so tests and
-	// deployments without a settings cache are unaffected.
-	dockerAllowlist DockerAllowlistReader
+	// claims no repo-bearing run). An empty list disables preference-driven warm-lease
+	// admission fencing for a plain worker.
+	dockerAllowlist     DockerAllowlistReader
+	effectiveDockerTier bool
 	// capabilitySettings reads the capability-aware scheduling kill-switch the claim
 	// gate threads into ClaimRun (PRD #84 Decision 13). Optional (nil-safe); set via
 	// SetCapabilitySettings with the same settings cache the HTTP handlers hold. Nil ⇒
@@ -2033,9 +2035,12 @@ func (s *Service) SetHealthSettings(cfg Settings) { s.healthSettings = cfg }
 // SetDockerAllowlist wires the docker-worker repo-allowlist reader the claim gate
 // enforces (PRD #89 M-allow). Call once at startup, before serving, with the same
 // settings cache the HTTP handlers hold. Nil (the default in tests) makes a docker
-// worker fail-closed — it claims no repo-bearing run — while leaving non-docker
-// workers wholly unaffected.
+// worker fail-closed — it claims no repo-bearing run. The same snapshot supplies
+// peer eligibility and preference-driven warm-lease admission.
 func (s *Service) SetDockerAllowlist(r DockerAllowlistReader) { s.dockerAllowlist = r }
+
+// SetEffectiveDockerTier sets deployment Docker availability once at startup.
+func (s *Service) SetEffectiveDockerTier(enabled bool) { s.effectiveDockerTier = enabled }
 
 // SetCapabilitySettings wires the capability-aware scheduling kill-switch reader the
 // claim gate threads into ClaimRun (PRD #84 Decision 13). Call once at startup, before
@@ -2975,6 +2980,7 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 		UserID:              wkr.UserID,
 		AffinityCutoff:      pgconv.Time(s.now().Add(-s.p.WorkerAffinityCeiling)),
 		IsDockerWorker:      isDocker,
+		WorkerDockerEnabled: s.effectiveDockerTier,
 		DockerRepoAllowlist: allowlist,
 		WorkerCaps:          wkr.Capabilities,
 		CapabilityAware:     capabilityAware,

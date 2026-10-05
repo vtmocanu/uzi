@@ -947,7 +947,7 @@ WITH claimant AS MATERIALIZED (
       -- clause above. The caller rebinds the worker to the claimed run in the same transaction.
       AND (NOT $14::boolean
            OR r.id = $15::uuid
-           OR (fn_ephemeral_lease_admits(
+           OR ((fn_ephemeral_lease_admits(
                    $16::timestamptz,
                    $17::uuid,
                    $18::text,
@@ -955,6 +955,7 @@ WITH claimant AS MATERIALIZED (
                    $19::interval,
                    $20::timestamptz,
                    r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies((SELECT owner.ephemeral_docker_enabled FROM users owner WHERE owner.id = r.user_id), $21::boolean, r.repo_id, r.kind, r.egress_profile_id, $7::uuid[]) OR COALESCE($6::boolean, false)))
                AND NOT EXISTS (
                    SELECT 1 FROM workers bw
                    WHERE bw.ephemeral AND bw.ephemeral_run_id = r.id)
@@ -978,7 +979,7 @@ WITH claimant AS MATERIALIZED (
       -- claim (a minimum-loaded worker never defers, guaranteeing claimability).
       AND (
           r.worker_id = $1
-          OR r.updated_at < $21
+          OR r.updated_at < $22
           OR NOT EXISTS (
               SELECT 1
               FROM workers p
@@ -1006,10 +1007,11 @@ WITH claimant AS MATERIALIZED (
                 -- PRD #2006: ...or a LEASED ephemeral peer that may claim r through its lease
                 -- (the claimant clause's lease arm), advisory like this whole mirror, so now().
                 AND (NOT p.ephemeral OR p.ephemeral_run_id = r.id
-                     OR fn_ephemeral_lease_admits(
+                     OR (fn_ephemeral_lease_admits(
                             p.lease_since, p.lease_repo_id, p.lease_branch, p.draining_since IS NOT NULL,
                             $19::interval, now(),
-                            r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id))
+                            r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies((SELECT owner.ephemeral_docker_enabled FROM users owner WHERE owner.id = r.user_id), $21::boolean, r.repo_id, r.kind, r.egress_profile_id, $7::uuid[]) OR COALESCE(p.docker_enabled, false))))
                 AND p.max_concurrent_runs IS NOT NULL
                 AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), $7::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, $9::boolean)
                 -- PRD #1226 M1 (D2): MIRROR the non-bypassable completion-protocol clause for
@@ -1122,7 +1124,7 @@ WITH claimant AS MATERIALIZED (
             -- PRD #1497 M1 (D16): a RELEASED flight's fresh snapshot must NOT block the reclaim of a
             -- server-parked run — the release is exactly the signal the old flight is over.
             AND r.claim_released_at IS NULL
-            AND (a.reported_at >= $22
+            AND (a.reported_at >= $23
                  OR (a.terminal_pending AND a.terminal_pending_until > now())))
       -- (2) Request-array exclusion (fact 7): the claimant's OWN request snapshot excludes its
       -- listed runs at the CURRENT generation, so the exclusion holds BEFORE the first heartbeat
@@ -1132,8 +1134,8 @@ WITH claimant AS MATERIALIZED (
       -- Empty arrays (no request snapshot, or the no-snapshot path) match nothing → no exclusion.
       AND NOT EXISTS (
           SELECT 1
-          FROM unnest($23::uuid[]) WITH ORDINALITY AS req_id(id, ord)
-          JOIN unnest($24::bigint[]) WITH ORDINALITY AS req_gen(gen, ord)
+          FROM unnest($24::uuid[]) WITH ORDINALITY AS req_id(id, ord)
+          JOIN unnest($25::bigint[]) WITH ORDINALITY AS req_gen(gen, ord)
                ON req_gen.ord = req_id.ord
           WHERE req_id.id = r.id AND req_gen.gen = r.claim_generation)
       -- (3) Overflow closure (D11): never claim a run whose OWNER is under an unexpired
@@ -1164,7 +1166,7 @@ WITH claimant AS MATERIALIZED (
     -- fail-open: a demoted run created before it reads as stale, so
     -- fn_run_priority returns normal and background work never starves.
     ORDER BY COALESCE(r.worker_id = $1, false) DESC,
-             fn_run_priority(r.kind, r.priority, r.created_at < $25) DESC,
+             fn_run_priority(r.kind, r.priority, r.created_at < $26) DESC,
              r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -1184,9 +1186,9 @@ hold AS (
          original_worker_id, original_worker_identity, live_worker_id, live_run_id,
          created_at, updated_at)
     SELECT gen_random_uuid(), t.user_id, t.repo_id, t.id, t.claim_generation + 1, 'open',
-           $1, $26::text, $1, t.id, now(), now()
+           $1, $27::text, $1, t.id, now(), now()
     FROM target t
-    WHERE $27::boolean
+    WHERE $28::boolean
       AND t.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
       -- PRD #1906 M5: a profile-bound run publishes no code (no repo, no forge credential, no
       -- push), so it never opens a custody hold, whatever the claiming worker advertises.
@@ -1254,6 +1256,7 @@ type ClaimRunParams struct {
 	LeaseBranch           pgtype.Text        `json:"lease_branch"`
 	EphemeralLease        pgtype.Interval    `json:"ephemeral_lease"`
 	LeaseAt               pgtype.Timestamptz `json:"lease_at"`
+	WorkerDockerEnabled   bool               `json:"worker_docker_enabled"`
 	SpreadCutoff          pgtype.Timestamptz `json:"spread_cutoff"`
 	SnapshotFreshCutoff   pgtype.Timestamptz `json:"snapshot_fresh_cutoff"`
 	RequestActiveIds      []uuid.UUID        `json:"request_active_ids"`
@@ -1320,6 +1323,7 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		arg.LeaseBranch,
 		arg.EphemeralLease,
 		arg.LeaseAt,
+		arg.WorkerDockerEnabled,
 		arg.SpreadCutoff,
 		arg.SnapshotFreshCutoff,
 		arg.RequestActiveIds,
@@ -1894,15 +1898,17 @@ WITH candidates AS (
 SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','ready','stopping','recycling') THEN COALESCE(w.draining_since, w.maintenance_activity_floor) ELSE w.draining_since END AS draining_since,
        (w.status = 'online') AS online,
        (w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs) AS free_slot,
-       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR fn_ephemeral_lease_admits(
-              w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
-              $1::interval, now(),
-              run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)) AS advisory_binding,
-       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (
-           fn_ephemeral_lease_admits(
+       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (fn_ephemeral_lease_admits(
               w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
               $1::interval, now(),
               run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, $2::boolean, run.repo_id, run.kind, run.egress_profile_id, $3::uuid[]) OR COALESCE(w.docker_enabled, false)))) AS advisory_binding,
+       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (
+           (fn_ephemeral_lease_admits(
+              w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+              $1::interval, now(),
+              run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, $2::boolean, run.repo_id, run.kind, run.egress_profile_id, $3::uuid[]) OR COALESCE(w.docker_enabled, false)))
            AND NOT EXISTS (SELECT 1 FROM workers bw WHERE bw.ephemeral AND bw.ephemeral_run_id = run.id)
            AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds ch WHERE ch.live_worker_id = w.id AND ch.state = 'open')
        )) AS strict_binding,
@@ -1911,9 +1917,10 @@ SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','re
        (run.worker_id IS NULL OR run.worker_id = w.id
         OR NOT EXISTS (SELECT 1 FROM workers ow WHERE ow.id = run.worker_id
                        AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced OR
-                            (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= $2)))
-        OR run.updated_at < $3) AS affinity
+                            (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= $4)))
+        OR run.updated_at < $5) AS affinity
 FROM runs run
+JOIN users owner ON owner.id = run.user_id
 JOIN workers w ON w.user_id = run.user_id
 CROSS JOIN LATERAL (
     SELECT count(*) AS active FROM runs pr
@@ -1921,17 +1928,17 @@ CROSS JOIN LATERAL (
       AND pr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
       AND pr.kind <> 'chat'
 ) wa
-WHERE run.id = $4
+WHERE run.id = $6
   AND w.last_heartbeat_at IS NOT NULL
-  AND w.last_heartbeat_at >= $2
+  AND w.last_heartbeat_at >= $4
   AND fn_worker_can_claim(
         COALESCE(w.docker_enabled, false),
-        $5::uuid[],
+        $3::uuid[],
         run.repo_id,
         run.kind,
         COALESCE(w.capabilities, '{}')::text[],
         run.required_capabilities,
-        $6::boolean)
+        $7::boolean)
   AND (run.completion_contract_version IS NULL
        OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
@@ -1949,9 +1956,9 @@ WHERE run.id = $4
           AND run.kind NOT IN ('judge', 'chat')
           AND run.review_target_run_id IS NULL
           AND COALESCE(
-              NOT ((CASE WHEN run.model = ANY($7::text[]) THEN run.model
+              NOT ((CASE WHEN run.model = ANY($8::text[]) THEN run.model
                          ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id) END)
-                   = ANY($7::text[])),
+                   = ANY($8::text[])),
               false)
       )
       OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
@@ -1982,10 +1989,11 @@ FROM candidates
 
 type CountOnlineWorkersClaimableForRunParams struct {
 	EphemeralLease      pgtype.Interval    `json:"ephemeral_lease"`
+	WorkerDockerEnabled bool               `json:"worker_docker_enabled"`
+	DockerRepoAllowlist []uuid.UUID        `json:"docker_repo_allowlist"`
 	HeartbeatCutoff     pgtype.Timestamptz `json:"heartbeat_cutoff"`
 	AffinityCutoff      pgtype.Timestamptz `json:"affinity_cutoff"`
 	RunID               uuid.UUID          `json:"run_id"`
-	DockerRepoAllowlist []uuid.UUID        `json:"docker_repo_allowlist"`
 	CapabilityAware     bool               `json:"capability_aware"`
 	CodexCuratedModels  []string           `json:"codex_curated_models"`
 }
@@ -2024,10 +2032,11 @@ type CountOnlineWorkersClaimableForRunRow struct {
 func (q *Queries) CountOnlineWorkersClaimableForRun(ctx context.Context, arg CountOnlineWorkersClaimableForRunParams) (CountOnlineWorkersClaimableForRunRow, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersClaimableForRun,
 		arg.EphemeralLease,
+		arg.WorkerDockerEnabled,
+		arg.DockerRepoAllowlist,
 		arg.HeartbeatCutoff,
 		arg.AffinityCutoff,
 		arg.RunID,
-		arg.DockerRepoAllowlist,
 		arg.CapabilityAware,
 		arg.CodexCuratedModels,
 	)
@@ -9295,10 +9304,11 @@ WHERE r.status = 'queued'
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
-             OR (fn_ephemeral_lease_admits(
+             OR ((fn_ephemeral_lease_admits(
                     w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
                     $2::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[]) OR COALESCE(w.docker_enabled, false)))
                  -- ...and only when the leased worker also meets the non-bypassable protocol clauses
                  -- ClaimRun enforces, written as in CountOnlineWorkersClaimableForRun (a leased worker
                  -- that cannot claim r must not read as a placement). The lane half is
@@ -9317,9 +9327,9 @@ WHERE r.status = 'queued'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
-                             NOT ((CASE WHEN r.model = ANY($3::text[]) THEN r.model
+                             NOT ((CASE WHEN r.model = ANY($5::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
-                                  = ANY($3::text[])),
+                                  = ANY($5::text[])),
                              false)
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
@@ -9340,10 +9350,11 @@ WHERE r.status = 'queued'
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
-             OR (fn_ephemeral_lease_admits(
+             OR ((fn_ephemeral_lease_admits(
                     w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
                     $2::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[]) OR COALESCE(w.docker_enabled, false)))
                  -- ...and only when the leased worker also meets the non-bypassable protocol clauses
                  -- ClaimRun enforces, written as in CountOnlineWorkersClaimableForRun (a leased worker
                  -- that cannot claim r must not read as a placement). The lane half is
@@ -9362,9 +9373,9 @@ WHERE r.status = 'queued'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
-                             NOT ((CASE WHEN r.model = ANY($3::text[]) THEN r.model
+                             NOT ((CASE WHEN r.model = ANY($5::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
-                                  = ANY($3::text[])),
+                                  = ANY($5::text[])),
                              false)
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
@@ -9396,17 +9407,19 @@ WHERE r.status = 'queued'
                                     AND lr.status NOT IN ('completed', 'failed', 'cancelled'))
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
-      ) < $4::int
+      ) < $6::int
 ORDER BY r.status_since ASC
-LIMIT $5
+LIMIT $7
 `
 
 type ListSaturationQueuedRunsForEphemeralParams struct {
-	SaturationDelay    pgtype.Interval `json:"saturation_delay"`
-	EphemeralLease     pgtype.Interval `json:"ephemeral_lease"`
-	CodexCuratedModels []string        `json:"codex_curated_models"`
-	MaxPerUser         int32           `json:"max_per_user"`
-	MaxRows            int32           `json:"max_rows"`
+	SaturationDelay     pgtype.Interval `json:"saturation_delay"`
+	EphemeralLease      pgtype.Interval `json:"ephemeral_lease"`
+	WorkerDockerEnabled bool            `json:"worker_docker_enabled"`
+	DockerRepoAllowlist []uuid.UUID     `json:"docker_repo_allowlist"`
+	CodexCuratedModels  []string        `json:"codex_curated_models"`
+	MaxPerUser          int32           `json:"max_per_user"`
+	MaxRows             int32           `json:"max_rows"`
 }
 
 type ListSaturationQueuedRunsForEphemeralRow struct {
@@ -9490,6 +9503,8 @@ func (q *Queries) ListSaturationQueuedRunsForEphemeral(ctx context.Context, arg 
 	rows, err := q.db.Query(ctx, listSaturationQueuedRunsForEphemeral,
 		arg.SaturationDelay,
 		arg.EphemeralLease,
+		arg.WorkerDockerEnabled,
+		arg.DockerRepoAllowlist,
 		arg.CodexCuratedModels,
 		arg.MaxPerUser,
 		arg.MaxRows,
@@ -9530,14 +9545,14 @@ WHERE r.status = 'queued'
   -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
   -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
   AND r.egress_profile_id IS NULL
-  -- PRD #1908 (D-A): the two conjuncts below are the ORIGINAL non-job predicate, kept
-  -- byte-for-byte. They are wrapped in an OR so a repo-less 'job' (whose required_capabilities is
+  -- PRD #1908 (D-A): the non-job placement predicate stays separate from jobs.
+  -- The OR lets a repo-less 'job' (whose required_capabilities is
   -- always '{}', so the first conjunct is false for it) is decided by the job arm instead. AND
   -- binds tighter than OR, so ` + "`" + `TRUE AND a AND b OR c` + "`" + ` reads (a AND b) OR c; TRUE only gives the
   -- original leading AND something to attach to.
   AND (
       TRUE
-  AND cardinality(r.required_capabilities) > 0
+  AND (cardinality(r.required_capabilities) > 0 OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $1::boolean, r.repo_id, r.kind, r.egress_profile_id, $2::uuid[]))
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
@@ -9547,10 +9562,11 @@ WHERE r.status = 'queued'
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
-             OR (fn_ephemeral_lease_admits(
+             OR ((fn_ephemeral_lease_admits(
                     w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
-                    $1::interval, now(),
+                    $3::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $1::boolean, r.repo_id, r.kind, r.egress_profile_id, $2::uuid[]) OR COALESCE(w.docker_enabled, false)))
                  -- ...and only when the leased worker also meets the non-bypassable protocol clauses
                  -- ClaimRun enforces, written as in CountOnlineWorkersClaimableForRun (a leased worker
                  -- that cannot claim r must not read as a placement). The lane half is
@@ -9569,9 +9585,9 @@ WHERE r.status = 'queued'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
-                             NOT ((CASE WHEN r.model = ANY($2::text[]) THEN r.model
+                             NOT ((CASE WHEN r.model = ANY($4::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
-                                  = ANY($2::text[])),
+                                  = ANY($4::text[])),
                              false)
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
@@ -9612,16 +9628,18 @@ WHERE r.status = 'queued'
                                     AND lr.status NOT IN ('completed', 'failed', 'cancelled'))
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
-      ) < $3::int
+      ) < $5::int
 ORDER BY r.created_at ASC
-LIMIT $4
+LIMIT $6
 `
 
 type ListUnplaceableQueuedRunsForEphemeralParams struct {
-	EphemeralLease     pgtype.Interval `json:"ephemeral_lease"`
-	CodexCuratedModels []string        `json:"codex_curated_models"`
-	MaxPerUser         int32           `json:"max_per_user"`
-	MaxRows            int32           `json:"max_rows"`
+	WorkerDockerEnabled bool            `json:"worker_docker_enabled"`
+	DockerRepoAllowlist []uuid.UUID     `json:"docker_repo_allowlist"`
+	EphemeralLease      pgtype.Interval `json:"ephemeral_lease"`
+	CodexCuratedModels  []string        `json:"codex_curated_models"`
+	MaxPerUser          int32           `json:"max_per_user"`
+	MaxRows             int32           `json:"max_rows"`
 }
 
 type ListUnplaceableQueuedRunsForEphemeralRow struct {
@@ -9648,10 +9666,8 @@ type ListUnplaceableQueuedRunsForEphemeralRow struct {
 //     nothing has claimed yet, excluding the chat lane (which never carries capability
 //     requirements and is served by ClaimChatRun).
 //
-//   - cardinality(r.required_capabilities) > 0 — for every kind EXCEPT 'job', a run with no
-//     capability requirement is never "unplaceable for a capability", so it is not our
-//     concern (mirrors health.go's len(RequiredCapabilities) > 0 guard on the display
-//     reason). A kind='job' run always has required_capabilities = '{}' yet CAN be
+//   - Non-job runs need a capability requirement or an effective Docker preference.
+//     A kind='job' run always has required_capabilities = '{}' yet CAN be
 //     unplaceable: it needs an online, non-docker worker advertising 'job_runner_v1'. That
 //     kind is decided by the job arm of the OR below (PRD #1908 D-A), not by this conjunct.
 //
@@ -9686,6 +9702,8 @@ type ListUnplaceableQueuedRunsForEphemeralRow struct {
 // @max_rows bounds the work per tick.
 func (q *Queries) ListUnplaceableQueuedRunsForEphemeral(ctx context.Context, arg ListUnplaceableQueuedRunsForEphemeralParams) ([]ListUnplaceableQueuedRunsForEphemeralRow, error) {
 	rows, err := q.db.Query(ctx, listUnplaceableQueuedRunsForEphemeral,
+		arg.WorkerDockerEnabled,
+		arg.DockerRepoAllowlist,
 		arg.EphemeralLease,
 		arg.CodexCuratedModels,
 		arg.MaxPerUser,

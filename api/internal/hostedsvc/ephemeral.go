@@ -150,6 +150,10 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		allowlist = []uuid.UUID{}
 	}
 
+	if allowlist == nil {
+		allowlist = []uuid.UUID{}
+	}
+
 	// @max_per_user is the cross-user FAIRNESS filter (see the query comment): it excludes
 	// runs whose owner is already at/over the per-user ephemeral cap so one at-cap user with
 	// a large backlog cannot monopolize every batch. It is an unlocked snapshot, so it is
@@ -168,7 +172,9 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		MaxPerUser:     int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
 		EphemeralLease: workersvc.LeaseInterval(p.cfg.Lease),
 		// PRD #2006: the lease arm mirrors ClaimRun's custom-Codex-model gate.
-		CodexCuratedModels: workersvc.CodexCuratedModels(),
+		CodexCuratedModels:  workersvc.CodexCuratedModels(),
+		WorkerDockerEnabled: p.cfg.DockerEnabled,
+		DockerRepoAllowlist: allowlist,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("hostedsvc: list unplaceable queued runs: %w", err)
@@ -179,7 +185,9 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		MaxPerUser:      int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
 		EphemeralLease:  workersvc.LeaseInterval(p.cfg.Lease),
 		// PRD #2006: the lease arm mirrors ClaimRun's custom-Codex-model gate.
-		CodexCuratedModels: workersvc.CodexCuratedModels(),
+		CodexCuratedModels:  workersvc.CodexCuratedModels(),
+		WorkerDockerEnabled: p.cfg.DockerEnabled,
+		DockerRepoAllowlist: allowlist,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("hostedsvc: list saturation queued runs: %w", err)

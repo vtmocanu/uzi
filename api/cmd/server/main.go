@@ -562,6 +562,7 @@ func run() error {
 	// (claims no repo-bearing run) for any repo not on the list. Non-docker workers are
 	// unaffected.
 	wsvc.SetDockerAllowlist(settingsCache)
+	wsvc.SetEffectiveDockerTier(cfg.WorkerDockerEnabled)
 
 	// Capability-aware scheduling kill-switch (PRD #84 Decision 13): the claim gate reads
 	// it from the same settings cache, so an admin flip takes effect within the cache TTL.

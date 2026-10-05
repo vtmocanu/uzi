@@ -1133,7 +1133,7 @@ WITH claimant AS MATERIALIZED (
       -- clause above. The caller rebinds the worker to the claimed run in the same transaction.
       AND (NOT @is_ephemeral::boolean
            OR r.id = sqlc.narg('ephemeral_run_id')::uuid
-           OR (fn_ephemeral_lease_admits(
+           OR ((fn_ephemeral_lease_admits(
                    sqlc.narg('lease_since')::timestamptz,
                    sqlc.narg('lease_repo_id')::uuid,
                    sqlc.narg('lease_branch')::text,
@@ -1141,6 +1141,7 @@ WITH claimant AS MATERIALIZED (
                    @ephemeral_lease::interval,
                    @lease_at::timestamptz,
                    r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies((SELECT owner.ephemeral_docker_enabled FROM users owner WHERE owner.id = r.user_id), @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(@is_docker_worker::boolean, false)))
                AND NOT EXISTS (
                    SELECT 1 FROM workers bw
                    WHERE bw.ephemeral AND bw.ephemeral_run_id = r.id)
@@ -1192,10 +1193,11 @@ WITH claimant AS MATERIALIZED (
                 -- PRD #2006: ...or a LEASED ephemeral peer that may claim r through its lease
                 -- (the claimant clause's lease arm), advisory like this whole mirror, so now().
                 AND (NOT p.ephemeral OR p.ephemeral_run_id = r.id
-                     OR fn_ephemeral_lease_admits(
+                     OR (fn_ephemeral_lease_admits(
                             p.lease_since, p.lease_repo_id, p.lease_branch, p.draining_since IS NOT NULL,
                             @ephemeral_lease::interval, now(),
-                            r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id))
+                            r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies((SELECT owner.ephemeral_docker_enabled FROM users owner WHERE owner.id = r.user_id), @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(p.docker_enabled, false))))
                 AND p.max_concurrent_runs IS NOT NULL
                 AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), @docker_repo_allowlist::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, @capability_aware::boolean)
                 -- PRD #1226 M1 (D2): MIRROR the non-bypassable completion-protocol clause for
@@ -6924,15 +6926,17 @@ WITH candidates AS (
 SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','ready','stopping','recycling') THEN COALESCE(w.draining_since, w.maintenance_activity_floor) ELSE w.draining_since END AS draining_since,
        (w.status = 'online') AS online,
        (w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs) AS free_slot,
-       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR fn_ephemeral_lease_admits(
-              w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
-              @ephemeral_lease::interval, now(),
-              run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)) AS advisory_binding,
-       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (
-           fn_ephemeral_lease_admits(
+       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (fn_ephemeral_lease_admits(
               w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
               @ephemeral_lease::interval, now(),
               run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, @worker_docker_enabled::boolean, run.repo_id, run.kind, run.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(w.docker_enabled, false)))) AS advisory_binding,
+       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (
+           (fn_ephemeral_lease_admits(
+              w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+              @ephemeral_lease::interval, now(),
+              run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, @worker_docker_enabled::boolean, run.repo_id, run.kind, run.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(w.docker_enabled, false)))
            AND NOT EXISTS (SELECT 1 FROM workers bw WHERE bw.ephemeral AND bw.ephemeral_run_id = run.id)
            AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds ch WHERE ch.live_worker_id = w.id AND ch.state = 'open')
        )) AS strict_binding,
@@ -6944,6 +6948,7 @@ SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','re
                             (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= @heartbeat_cutoff)))
         OR run.updated_at < @affinity_cutoff) AS affinity
 FROM runs run
+JOIN users owner ON owner.id = run.user_id
 JOIN workers w ON w.user_id = run.user_id
 CROSS JOIN LATERAL (
     SELECT count(*) AS active FROM runs pr
@@ -7257,10 +7262,8 @@ WHERE w.user_id = @user_id
 --   * r.status = 'queued' AND r.kind <> 'chat' — the pre-claim trigger (Path 1): a run
 --     nothing has claimed yet, excluding the chat lane (which never carries capability
 --     requirements and is served by ClaimChatRun).
---   * cardinality(r.required_capabilities) > 0 — for every kind EXCEPT 'job', a run with no
---     capability requirement is never "unplaceable for a capability", so it is not our
---     concern (mirrors health.go's len(RequiredCapabilities) > 0 guard on the display
---     reason). A kind='job' run always has required_capabilities = '{}' yet CAN be
+--   * Non-job runs need a capability requirement or an effective Docker preference.
+--     A kind='job' run always has required_capabilities = '{}' yet CAN be
 --     unplaceable: it needs an online, non-docker worker advertising 'job_runner_v1'. That
 --     kind is decided by the job arm of the OR below (PRD #1908 D-A), not by this conjunct.
 --   * NOT EXISTS (an online, non-draining, NON-ephemeral worker of the user whose
@@ -7300,14 +7303,14 @@ WHERE r.status = 'queued'
   -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
   -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
   AND r.egress_profile_id IS NULL
-  -- PRD #1908 (D-A): the two conjuncts below are the ORIGINAL non-job predicate, kept
-  -- byte-for-byte. They are wrapped in an OR so a repo-less 'job' (whose required_capabilities is
+  -- PRD #1908 (D-A): the non-job placement predicate stays separate from jobs.
+  -- The OR lets a repo-less 'job' (whose required_capabilities is
   -- always '{}', so the first conjunct is false for it) is decided by the job arm instead. AND
   -- binds tighter than OR, so `TRUE AND a AND b OR c` reads (a AND b) OR c; TRUE only gives the
   -- original leading AND something to attach to.
   AND (
       TRUE
-  AND cardinality(r.required_capabilities) > 0
+  AND (cardinality(r.required_capabilities) > 0 OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]))
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
@@ -7317,10 +7320,11 @@ WHERE r.status = 'queued'
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
-             OR (fn_ephemeral_lease_admits(
+             OR ((fn_ephemeral_lease_admits(
                     w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
                     @ephemeral_lease::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(w.docker_enabled, false)))
                  -- ...and only when the leased worker also meets the non-bypassable protocol clauses
                  -- ClaimRun enforces, written as in CountOnlineWorkersClaimableForRun (a leased worker
                  -- that cannot claim r must not read as a placement). The lane half is
@@ -7467,10 +7471,11 @@ WHERE r.status = 'queued'
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
-             OR (fn_ephemeral_lease_admits(
+             OR ((fn_ephemeral_lease_admits(
                     w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
                     @ephemeral_lease::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(w.docker_enabled, false)))
                  -- ...and only when the leased worker also meets the non-bypassable protocol clauses
                  -- ClaimRun enforces, written as in CountOnlineWorkersClaimableForRun (a leased worker
                  -- that cannot claim r must not read as a placement). The lane half is
@@ -7512,10 +7517,11 @@ WHERE r.status = 'queued'
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
-             OR (fn_ephemeral_lease_admits(
+             OR ((fn_ephemeral_lease_admits(
                     w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
                     @ephemeral_lease::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(w.docker_enabled, false)))
                  -- ...and only when the leased worker also meets the non-bypassable protocol clauses
                  -- ClaimRun enforces, written as in CountOnlineWorkersClaimableForRun (a leased worker
                  -- that cannot claim r must not read as a placement). The lane half is

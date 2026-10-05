@@ -271,37 +271,146 @@ func TestEphemeralDockerExcludedCandidatesLiveDB(t *testing.T) {
 	})
 }
 
-func TestEphemeralDockerM1bPlacementUnchangedLiveDB(t *testing.T) {
-	t.Run("no preference-only gap widening", func(t *testing.T) {
+func TestEphemeralDockerFinalPlacementLiveDB(t *testing.T) {
+	t.Run("preference-only gap", func(t *testing.T) {
 		fx := newEphemeralFixture(t, true)
-		fx.queuedRun([]string{})
+		run := fx.queuedRun([]string{})
 		p, _ := fx.dockerProvisioner(true, true, true, 2, false)
 		if _, err := p.ProvisionPass(fx.ctx); err != nil {
 			t.Fatal(err)
 		}
-		if rows := fx.ephemeralRows(); len(rows) != 0 {
-			t.Fatalf("capability-free gap widened before M2: %+v", rows)
+		rows := fx.ephemeralRows()
+		if len(rows) != 1 || rows[0].runID != run || !rows[0].docker {
+			t.Fatalf("preference gap workers=%+v", rows)
 		}
 	})
-	t.Run("plain warm lease still places follow-up", func(t *testing.T) {
-		fx := newEphemeralFixture(t, true)
-		warm := fx.leasedWorker(time.Minute)
-		cliMustExec(t, fx.pool, "UPDATE workers SET docker_enabled=false WHERE id=$1", warm.id)
-		fx.followUp(warm)
-		cliMustExec(t, fx.pool, "UPDATE users SET ephemeral_docker_enabled=true WHERE id=$1", fx.userID)
-		sc := settings.New(&settingsStore{rows: []store.AppSetting{
-			{Key: settings.KeyEphemeralWorkersEnabled, Value: "true"},
-			{Key: settings.KeyDockerRepoAllowlist, Value: fx.repoID.String()},
-		}}, time.Minute)
-		p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, sc, hostedsvc.EphemeralConfig{
-			DockerEnabled: true, MaxPerUser: 2, DefaultSize: "m", Lease: 2 * time.Hour,
+	for _, tc := range []struct {
+		name                     string
+		pref, tier, member, fail bool
+	}{
+		{"effective", true, true, true, false},
+		{"preference off", false, true, true, false},
+		{"tier off", true, false, true, false},
+		{"empty list", true, true, false, false},
+		{"values with error", true, true, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newEphemeralFixture(t, true)
+			warm := fx.leasedWorker(time.Minute)
+			cliMustExec(t, fx.pool, "UPDATE workers SET docker_enabled=false WHERE id=$1", warm.id)
+			run := fx.followUp(warm)
+			p, probe := fx.dockerProvisioner(tc.pref, tc.tier, tc.member, 2, tc.fail)
+			// Use the same settings snapshot with a live lease.
+			p = hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{DockerEnabled: tc.tier, MaxPerUser: 2, DefaultSize: "m", Lease: 2 * time.Hour})
+			if _, err := p.ProvisionPass(fx.ctx); err != nil {
+				t.Fatal(err)
+			}
+			rows := fx.ephemeralRows()
+			if tc.name == "effective" {
+				if len(rows) != 2 {
+					t.Fatalf("warm step-aside workers=%+v", rows)
+				}
+				found := false
+				for _, row := range rows {
+					if row.runID == run && row.docker {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("missing Docker follow-up worker: %+v", rows)
+				}
+			} else if len(rows) != 1 || rows[0].id != warm.id || rows[0].docker {
+				t.Fatalf("ineffective preference changed reuse: %+v", rows)
+			}
+			if probe.reads != 1 {
+				t.Fatalf("allowlist reads=%d", probe.reads)
+			}
 		})
-		if _, err := p.ProvisionPass(fx.ctx); err != nil {
+	}
+}
+
+// This seam uses real claim transactions, provisioning and registration on the same run.
+func TestEphemeralDockerWarmStepAsideLiveDB(t *testing.T) {
+	fx := newEphemeralFixture(t, true)
+	warm := fx.leasedWorker(time.Minute)
+	cliMustExec(t, fx.pool, "UPDATE workers SET docker_enabled=false WHERE id=$1", warm.id)
+	run := fx.followUp(warm)
+	p, probe := fx.dockerProvisioner(true, true, true, 2, false)
+	p = hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{DockerEnabled: true, MaxPerUser: 2, DefaultSize: "m", Lease: 2 * time.Hour})
+	svc := workersvc.New(fx.q, fx.box, workersvc.Params{WorkerHeartbeatStale: time.Minute, WorkerAffinityCeiling: time.Minute})
+	svc.SetTxBeginner(fx.pool)
+	svc.SetEphemeralLease(2 * time.Hour)
+	svc.SetDockerAllowlist(probe)
+	svc.SetEffectiveDockerTier(true)
+	svc.SetBackground(func(func()) {})
+	// Seal real claim credentials only for this seam; other fixtures do not assemble claims.
+	for _, kind := range []string{"forge", "anthropic"} {
+		sealed, err := fx.box.Seal([]byte("test-credential-" + kind))
+		if err != nil {
 			t.Fatal(err)
 		}
-		rows := fx.ephemeralRows()
-		if len(rows) != 1 || rows[0].id != warm.id || rows[0].docker {
-			t.Fatalf("warm placement changed before M2: %+v", rows)
+		if kind == "forge" {
+			cliMustExec(t, fx.pool, "UPDATE forge_connections SET token_ciphertext=$2 WHERE user_id=$1", fx.userID, sealed)
+		} else {
+			cliMustExec(t, fx.pool, "INSERT INTO user_secrets(id,user_id,kind,label,is_default,ciphertext,sealed_with) VALUES($1,$2,'anthropic_token','seam',true,$3,'master')", uuid.New(), fx.userID, sealed)
 		}
-	})
+	}
+	cliMustExec(t, fx.pool, "UPDATE users SET ephemeral_docker_enabled=false WHERE id=$1", fx.userID)
+	plain, err := fx.q.GetWorkerByID(fx.ctx, warm.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The owner preference changes after the worker was loaded. ClaimRun must read it fresh.
+	cliMustExec(t, fx.pool, "UPDATE users SET ephemeral_docker_enabled=true WHERE id=$1", fx.userID)
+	payload, err := svc.Claim(fx.ctx, plain, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload != nil {
+		t.Fatal("plain warm worker claims when it should refuse")
+	}
+	gaps, err := fx.q.ListUnplaceableQueuedRunsForEphemeral(fx.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{MaxRows: 10, MaxPerUser: 2, EphemeralLease: workersvc.LeaseInterval(2 * time.Hour), WorkerDockerEnabled: true, DockerRepoAllowlist: []uuid.UUID{fx.repoID}, CodexCuratedModels: workersvc.CodexCuratedModels()})
+	if err != nil || len(gaps) != 1 || gaps[0].ID != run {
+		t.Fatalf("gap=%+v err=%v, want same follow-up", gaps, err)
+	}
+	created, err := p.ProvisionPass(fx.ctx)
+	if err != nil || created != 1 {
+		t.Fatalf("ProvisionPass=(%d,%v)", created, err)
+	}
+	var dockerID uuid.UUID
+	for _, row := range fx.ephemeralRows() {
+		if row.runID == run && row.docker {
+			dockerID = row.id
+		}
+	}
+	if dockerID == uuid.Nil {
+		t.Fatal("missing newly created Docker worker")
+	}
+	docker, err := fx.q.GetWorkerByID(fx.ctx, dockerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	max := 1
+	docker, _, err = svc.Register(fx.ctx, docker, "test", "base", &max, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if docker.Status != "online" {
+		t.Fatalf("registered status=%q, want online", docker.Status)
+	}
+	if !slices.Contains(capability.EffectiveWorkerCaps(docker.Capabilities, docker.DockerEnabled.Valid && docker.DockerEnabled.Bool), "docker") {
+		t.Fatal("registered worker lacks effective Docker capability")
+	}
+	payload, err = svc.Claim(fx.ctx, docker, nil)
+	if err != nil || payload == nil {
+		t.Fatalf("Docker claim payload present=%v err=%v", payload != nil, err)
+	}
+	if payload.RunID != run.String() {
+		t.Fatalf("claimed=%s want=%s", payload.RunID, run)
+	}
+	var owner uuid.UUID
+	err = fx.pool.QueryRow(fx.ctx, "SELECT worker_id FROM runs WHERE id=$1", run).Scan(&owner)
+	if err != nil || owner != dockerID {
+		t.Fatalf("created worker does not own same run: %s err=%v", owner, err)
+	}
 }

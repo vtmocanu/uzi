@@ -37,7 +37,7 @@ func (s *Service) WorkerEligibilityForHealth(ctx context.Context, now time.Time,
 }
 
 func (s *Service) workerEligibilityForHealth(ctx context.Context, now time.Time, runID uuid.UUID, capAware bool) (store.CountOnlineWorkersClaimableForRunRow, error) {
-	var allowlist []uuid.UUID
+	allowlist := []uuid.UUID{}
 	if s.dockerAllowlist != nil {
 		var err error
 		allowlist, err = s.dockerAllowlist.DockerRepoAllowlist(ctx)
@@ -45,11 +45,15 @@ func (s *Service) workerEligibilityForHealth(ctx context.Context, now time.Time,
 			return store.CountOnlineWorkersClaimableForRunRow{}, err
 		}
 	}
+	if allowlist == nil {
+		allowlist = []uuid.UUID{}
+	}
 	return s.q.CountOnlineWorkersClaimableForRun(ctx, store.CountOnlineWorkersClaimableForRunParams{
 		RunID:               runID,
 		HeartbeatCutoff:     pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
 		AffinityCutoff:      pgconv.Time(now.Add(-s.p.WorkerAffinityCeiling)),
 		DockerRepoAllowlist: allowlist,
+		WorkerDockerEnabled: s.effectiveDockerTier,
 		CapabilityAware:     capAware,
 		CodexCuratedModels:  codexCuratedModelsSlice(),
 		EphemeralLease:      LeaseInterval(s.ephemeralLease),
@@ -1133,12 +1137,14 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// to the generic reasons below. The per-run counts sit behind the queued-threshold guard in
 	// healthTargetFor, so they run for ~0 runs/tick.
 	if r.ReleasedWorkerID.Valid {
-		var allowlist []uuid.UUID
+		allowlist := []uuid.UUID{}
 		if s.dockerAllowlist != nil {
 			if al, aerr := s.dockerAllowlist.DockerRepoAllowlist(ctx); aerr != nil {
 				slog.Error("health: docker allowlist for released-worker reason", "error", aerr)
 			} else {
-				allowlist = al
+				if al != nil {
+					allowlist = al
+				}
 			}
 		}
 		if claimable, cerr := s.q.CountOnlineWorkersClaimableForRun(ctx, store.CountOnlineWorkersClaimableForRunParams{
@@ -1147,6 +1153,7 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			AffinityCutoff:      pgconv.Time(now.Add(-s.p.WorkerAffinityCeiling)),
 			HeartbeatCutoff:     pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
 			DockerRepoAllowlist: allowlist,
+			WorkerDockerEnabled: s.effectiveDockerTier,
 			CapabilityAware:     capAware,
 			EphemeralLease:      LeaseInterval(s.ephemeralLease),
 		}); cerr != nil {
