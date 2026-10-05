@@ -1,6 +1,6 @@
 // Issue #1598 M4: the worker entrypoint prepares the Codex command-cache root
 // (/var/cache/uzi-codex-cmd) on the ROOT-started (uid-split) path: refuse a symlink, create it
-// when missing, reclaim -> chmod 0700 -> hand over to runner-cmd (10003:10003), never recursive
+// when missing, reclaim -> chmod 00700 (exact mode 0700) -> hand over to runner-cmd (10003:10003), never recursive
 // and never deleting contents. The non-root (#58) start must not touch it.
 //
 // Same seam as entrypoint-migration.test.ts: RUN the real `agent/templates/entrypoint.sh` with
@@ -128,10 +128,10 @@ describe("issue #1598: entrypoint prepares the Codex command-cache root", () => 
         [
           `mkdir -p ${h.cache}`,
           `chown -h 0:0 ${h.cache}`,
-          `chmod 0700 ${h.cache}`,
+          `chmod 00700 ${h.cache}`,
           `chown -h 10003:10003 ${h.cache}`,
         ],
-        "exactly mkdir -> reclaim -> chmod 0700 -> hand over to 10003, nothing else on the cache root",
+        "exactly mkdir -> reclaim -> chmod 00700 (exact mode 0700) -> hand over to 10003, nothing else on the cache root",
       );
       if (process.getuid?.() === 0) {
         assert.equal(st.uid, 10003, "owner uid must be runner-cmd (10003)");

@@ -38,7 +38,7 @@ through `[0.52.0]`.)
   Codex source runs can enter automatic MR rework without an Anthropic token; creation still refuses an unusable inherited Codex harness without falling back to Claude. Claude source runs require an enabled Anthropic token.
 
 - **Codex credential success responses are capped at 64 KiB ([#2232](https://github.com/vtmocanu/uzi/issues/2232)).**
-  Release and refresh reject oversized bodies as invalid responses without exposing body fragments. Cache permission and non-repository Git fixtures work under setgid parents and checkout-local temporary directories; the combined lost-reply test refuses non-Linux hosts before setup.
+  Release and refresh reject oversized bodies as invalid responses without exposing body fragments. The Codex command-cache root is exactly 0700 under GNU and BusyBox chmod even with setgid parents. Non-repository Git fixtures work under setgid parents and checkout-local temporary directories; the combined lost-reply test refuses non-Linux hosts before setup.
 
 - **The TUI update prompt avoids repeating the release tag as its body ([#1978](https://github.com/vtmocanu/uzi/issues/1978)).**
   When the sanitized release name equals the version, stable and RC prompts show the normal or security fallback sentence. Distinct release names retain their capped rendering, and the dismissal label still includes the version.
