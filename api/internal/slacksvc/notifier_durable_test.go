@@ -93,12 +93,7 @@ func (m *sqlMirror) InsertNotification(_ context.Context, a store.InsertNotifica
 func (m *sqlMirror) PruneNotificationsForUser(context.Context, store.PruneNotificationsForUserParams) (int64, error) {
 	return 0, nil
 }
-func (m *sqlMirror) FindNotificationForRunKind(context.Context, store.FindNotificationForRunKindParams) (store.Notification, error) {
-	return store.Notification{}, pgx.ErrNoRows
-}
-func (m *sqlMirror) UpdateNotificationPayload(context.Context, store.UpdateNotificationPayloadParams) (store.Notification, error) {
-	return store.Notification{}, nil
-}
+
 func (m *sqlMirror) GetSecretEnablement(context.Context, store.GetSecretEnablementParams) (store.GetSecretEnablementRow, error) {
 	return store.GetSecretEnablementRow{}, pgx.ErrNoRows
 }

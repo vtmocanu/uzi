@@ -651,7 +651,7 @@ func run() error {
 	// rows. It persists the row first, then delivers best-effort through slackNotifier
 	// (reusing its per-user opt-in gating + drain goroutine via a separate queue). The
 	// in-app inbox read path is retired (PRD #1650 D1), so the table is a pruned,
-	// write-only event log plus the incidental-finding DM latch; the Slack DM is what
+	// event log with durable halt delivery; the Slack DM is what
 	// the user sees. Every producer below (handler, poller detectors, scheduler,
 	// reconcilers, usage engine) calls notifier.Notify or one of its helpers.
 	notifier := notifysvc.New(q, slackNotifier, notifysvc.DefaultUserCap, slog.Default())
