@@ -274,8 +274,7 @@ interface TransportReservation {
   abort: AbortController;
   held: { msg: Omit<OutgoingMessage, "seq">; bytes: number }[];
   bytes: number;
-  outboxPending: number;
-  written: number;
+  outboxPending: Set<symbol>;
   preparing?: Promise<{ prepared: boolean; tail: number }>;
   /** Exact failed request prefix, even if later assigned frames follow it. */
   replay?: Buffered[];
@@ -292,7 +291,6 @@ export interface CandidateTransportReservation {
 
 export class MessageBatcher {
   private reservation: TransportReservation | undefined;
-  private durableWritten = 0;
   private buffer: Buffered[] = [];
   /** Consecutive FAILED flushes; drives the backoff delay and resets on any 2xx. */
   private consecutiveFailures = 0;
@@ -517,7 +515,7 @@ export class MessageBatcher {
       throw new Error("candidate transport cannot be reserved");
     const r: TransportReservation = {
       tail: this.seq, state: "held", abort: new AbortController(), held: [], bytes: 0,
-      outboxPending: this.outbox?.depthFor(this.runId)?.pendingMessages ?? 0, written: this.durableWritten,
+      outboxPending: new Set(this.outbox?.pendingDeliveryIdentities(this.runId)),
     };
     this.reservation = r;
     if (this.timer) clearTimeout(this.timer);
@@ -582,23 +580,19 @@ export class MessageBatcher {
       if (!await this.usage.drainConfirmed(Math.min(deadlineMs, 3000), expiry))
         throw new Error("usage not ACK-proven");
       if (this.outbox) {
-        const expected = Math.max(r.outboxPending + this.durableWritten - r.written,
-          this.outbox.depthFor(this.runId)?.pendingMessages ?? 0);
-        let acknowledged = 0;
         const result = await this.outbox.drainRun(this.runId, async (msgs, generation) => {
           if (expiry.aborted || generation !== this.generation ||
             msgs.some((m) => m.seq > r.tail)) throw new Error("unproven durable generation/tail");
           await this.client.postMessages(this.runId, msgs, generation, expiry);
-          acknowledged += msgs.length;
-        });
-        const remaining = this.outbox.depthFor(this.runId)?.pendingMessages ?? 0;
-        if (acknowledged < expected - remaining || result.staleRetired !== 0) {
-          r.abort.abort(); // Unobservable retirement cannot be recovered by a retry.
+        }, (identity) => { r.outboxPending.delete(identity); });
+        const remaining = new Set(this.outbox.pendingDeliveryIdentities(this.runId));
+        if ([...r.outboxPending].some((identity) => !remaining.has(identity)) ||
+          result.staleRetired !== 0) {
+          r.abort.abort(); // External disappearance supplies no delivery receipt.
           throw new Error("outbox retirement not ACK-proven");
         }
-        r.outboxPending = remaining;
-        r.written = this.durableWritten;
-        if (!result.retired || this.outbox.isDisabled() || this.outbox.hasUndrainedMessages(this.runId))
+        if (!result.retired || r.outboxPending.size !== 0 || this.outbox.isDisabled() ||
+          this.outbox.hasUndrainedMessages(this.runId))
           throw new Error("outbox not ACK-proven");
       }
       // Existing ranges retain their assigned sequence and bounded tombstone replay.
@@ -1250,8 +1244,8 @@ export class MessageBatcher {
         const first = this.pendingRangeFirst;
         const last = this.pendingRangeLast;
         try {
-          await outbox.appendRangeRecord(this.runId, this.generation, first, last);
-          this.durableWritten += last - first + 1;
+          await outbox.appendRangeRecord(this.runId, this.generation, first, last,
+            (identity) => { this.reservation?.outboxPending.add(identity); });
           this.pendingRangeFirst = undefined;
           this.pendingRangeLast = undefined;
         } catch (err) {
@@ -1283,8 +1277,8 @@ export class MessageBatcher {
             this.runId,
             this.generation,
             batch.map((b) => b.msg),
+            (identity) => { this.reservation?.outboxPending.add(identity); },
           );
-          this.durableWritten += batch.length;
         } catch (err) {
           this.buffer = batch.concat(this.buffer);
           // Advance the failure clock so nextDelayMs() backs off on a persistent
@@ -1340,7 +1334,8 @@ export class MessageBatcher {
         await outbox.markSpillUnclean(this.runId);
       }
       if (this.pendingRangeFirst !== undefined && this.pendingRangeLast !== undefined) {
-        await outbox.appendRangeRecord(this.runId, this.generation, this.pendingRangeFirst, this.pendingRangeLast);
+        await outbox.appendRangeRecord(this.runId, this.generation, this.pendingRangeFirst, this.pendingRangeLast,
+          (identity) => { this.reservation?.outboxPending.add(identity); });
         this.pendingRangeFirst = undefined;
         this.pendingRangeLast = undefined;
       }
@@ -1352,6 +1347,7 @@ export class MessageBatcher {
             this.runId,
             this.generation,
             batch.map((b) => b.msg),
+            (identity) => { this.reservation?.outboxPending.add(identity); },
           );
         } catch (err) {
           this.buffer = batch.concat(this.buffer);

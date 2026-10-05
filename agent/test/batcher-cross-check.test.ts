@@ -2,7 +2,7 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { MessageBatcher } from "../src/batcher.js";
+import { MessageBatcher, replaySegment } from "../src/batcher.js";
 import { Outbox, StaleClaimError, type RawWriteSeam } from "../src/outbox.js";
 import { RequestError, type PlanCrossCheckResponse, type WorkerClient } from "../src/client.js";
 import type { OutgoingMessage } from "../src/protocol.js";
@@ -143,11 +143,11 @@ it("sanitizes/redacts held events immediately and refuses bounded overflow", asy
   await b.close();
 });
 
-async function withOutbox(body: (o: Outbox) => Promise<void>, rawWrite?: RawWriteSeam) {
+async function withOutbox(body: (o: Outbox) => Promise<void>, rawWrite?: RawWriteSeam, runMaxBytes = 64 * 1024 * 1024) {
   const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/reservation-outbox-"));
   try {
     const o = new Outbox({ root: path.join(root, "outbox"), log: nullLogger(),
-      runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 86400_000, rawWrite });
+      runMaxBytes, maxBytes: 512 * 1024 * 1024, retentionMs: 86400_000, rawWrite });
     await o.init();
     await body(o);
   } finally { await fs.rm(root, { recursive: true, force: true }); }
@@ -451,6 +451,148 @@ it("timer-started poison refusal preserves the original batch instead of bisecti
   assert.equal(sent[1]?.length, 2);
   r.cancel();
   await b.close();
+});
+
+it("partial range ACKs cannot mask another record's external retirement", async () => {
+  await withOutbox(async (o) => {
+    await o.appendSegment(runId, 3, [{ seq: 1, kind: "status", payload: { text: "original" } }]);
+    await o.appendRangeRecord(runId, 3, 2, 502);
+    let failLast = true;
+    const owned: number[] = [];
+    const b = new MessageBatcher({
+      async postUsage() {},
+      async postMessages(_id: string, msgs: OutgoingMessage[]) {
+        if (failLast && msgs[0]?.seq === 502) throw new Error("last ACK unknown");
+        owned.push(...msgs.map((m) => m.seq));
+      },
+    } as unknown as WorkerClient, runId, 502, 60_000, nullLogger(), undefined, undefined,
+    { generation: 3, outbox: o });
+    const r = b.reserveCandidateTransport();
+    let replaced = false;
+    const external = {
+      async postMessages(_id: string, msgs: OutgoingMessage[]) {
+        if (msgs[0]?.seq !== 1) throw new Error("external drain stopped");
+        if (msgs[0]?.payload["text"] === "original")
+          throw new RequestError("POST", "/messages", 400, "refused");
+        replaced = true;
+      },
+    } as unknown as WorkerClient;
+    await o.drainRun(runId, (msgs, gen) => replaySegment(external, runId, msgs, gen, nullLogger()));
+    assert.equal(replaced, true);
+    assert.equal((await r.prepare()).prepared, false);
+    failLast = false;
+    assert.equal((await r.prepare()).prepared, false,
+      "must not certify externally retired seq 1 without its ACK evidence");
+    assert.equal(owned.includes(1), false);
+    assert.equal(r.release(proof(503)), false);
+    await b.close();
+  });
+});
+
+it("complete gapped and overlapping records have distinct ACK obligations", async () => {
+  for (const gapped of [true, false]) await withOutbox(async (o) => {
+    if (gapped) {
+      await o.appendSegment(runId, 3, [
+        { seq: 1, kind: "status", payload: { text: "one" } },
+        { seq: 3, kind: "status", payload: { text: "three" } },
+      ]);
+      await o.appendRangeRecord(runId, 3, 2, 2);
+    } else {
+      await o.appendRangeRecord(runId, 3, 1, 3);
+      await o.appendRangeRecord(runId, 3, 2, 4);
+    }
+    const b = new MessageBatcher({ async postUsage() {}, async postMessages() {} } as unknown as WorkerClient,
+      runId, gapped ? 3 : 4, 60_000, nullLogger(), undefined, undefined, { generation: 3, outbox: o });
+    const r = b.reserveCandidateTransport();
+    assert.equal((await r.prepare()).prepared, true, "each complete record must count once");
+    assert.equal(o.hasUndrainedMessages(runId), false);
+    r.cancel();
+    await b.close();
+  });
+});
+
+it("record identities survive quota replacement and do not reuse retired names", async () => {
+  await withOutbox(async (o) => {
+    let appended: symbol | undefined;
+    await o.appendSegment(runId, 3, [
+      { seq: 1, kind: "status", payload: { text: "x".repeat(500) } },
+    ], (identity) => { appended = identity; });
+    assert.equal(o.pendingDeliveryIdentities(runId)[0], appended);
+    await o.appendSegment(runId, 3, [
+      { seq: 2, kind: "status", payload: { text: "y".repeat(500) } },
+    ]);
+    const afterQuota = o.pendingDeliveryIdentities(runId);
+    assert.equal(afterQuota.length, 2);
+    assert.equal(afterQuota[0], appended, "quota replacement must retain its logical obligation");
+    const received: symbol[] = [];
+    const delivered: OutgoingMessage[] = [];
+    assert.equal((await o.drainRun(runId, async (msgs) => {
+      delivered.push(...msgs);
+    }, (identity) => { received.push(identity); })).retired, true);
+    assert.deepEqual(received, afterQuota);
+    assert.equal(delivered[0]?.payload["event"], "message_dropped",
+      "the real quota replacement must have executed");
+    assert.deepEqual(o.pendingDeliveryIdentities(runId), []);
+    await o.appendSegment(runId, 3, [{ seq: 1, kind: "status", payload: {} }]);
+    assert.notEqual(o.pendingDeliveryIdentities(runId)[0], appended,
+      "a later append needs a fresh identity even when its filename/version can be reused");
+  }, undefined, 1024);
+});
+
+it("an externally retired late spill cannot disappear before append commit observation", async () => {
+  let block = false;
+  let started!: () => void;
+  const installing = new Promise<void>((resolve) => { started = resolve; });
+  let resume!: () => void;
+  const resumed = new Promise<void>((resolve) => { resume = resolve; });
+  await withOutbox(async (o) => {
+    const b = new MessageBatcher({
+      async postUsage() {}, async postMessages() { throw new Error("offline"); },
+    } as unknown as WorkerClient, runId, 0, 60_000, nullLogger(), undefined, undefined,
+    { generation: 3, outbox: o, transientTripMs: 0 });
+    b.emit(event("earlier spill"));
+    await b.flush();
+    await b.flush();
+    await o.drainRun(runId, async () => {});
+    assert.equal(o.pendingDeliveryIdentities(runId).length, 0);
+    block = true;
+    b.emit(event("late committed spill"));
+    const flushing = b.flush();
+    await installing;
+    const r = b.reserveCandidateTransport();
+    const external = o.drainRun(runId, async () => {});
+    const preparing = r.prepare();
+    resume();
+    await flushing;
+    assert.equal((await external).retired, true);
+    assert.equal((await preparing).prepared, false,
+      "late append retirement needs the reservation's own receipt");
+    assert.equal(r.release(proof(3)), false);
+    await b.close();
+  }, async (write, ctx) => {
+    if (block && ctx.kind === "segment") {
+      block = false;
+      started();
+      await resumed;
+    }
+    await write();
+  });
+});
+
+it("healthy senders cannot certify wrong-generation or beyond-tail durable records", async () => {
+  for (const [generation, seq] of [[2, 1], [3, 2]]) await withOutbox(async (o) => {
+    await o.appendSegment(runId, generation!, [{ seq: seq!, kind: "status", payload: {} }]);
+    let sends = 0;
+    const b = new MessageBatcher({
+      async postUsage() {}, async postMessages() { sends++; },
+    } as unknown as WorkerClient, runId, 1, 60_000, nullLogger(), undefined, undefined,
+    { generation: 3, outbox: o });
+    const r = b.reserveCandidateTransport();
+    assert.equal((await r.prepare()).prepared, false, "unproven durable replay cannot prepare");
+    assert.equal(sends, 0);
+    assert.equal(o.hasUndrainedMessages(runId), true);
+    await b.close();
+  });
 });
 
 it("an already-owned bisection probe retries that exact prefix before the remaining assigned frames", async () => {

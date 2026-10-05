@@ -391,6 +391,8 @@ export class Outbox {
   private readonly classifyWriteFailure: OutboxOptions["classifyWriteFailure"];
 
   private readonly runs = new Map<string, RunState>();
+  /** Process-local receipt identities; never persisted or reused for later appends. */
+  private readonly deliveryIdentities = new WeakMap<ManifestRecordRef, symbol>();
   private readonly uncleanAtInit: string[] = [];
   /** Per-run promise-chain mutex tails: every mutating op on one run awaits and
    *  extends its run's tail, so a run's ops run strictly one-at-a-time (different
@@ -671,7 +673,8 @@ export class Outbox {
    * (evicting the oldest segment to a range record when the run or worker quota
    * binds), then writes the segment and installs the next manifest generation.
    */
-  async appendSegment(runId: string, generation: number, msgs: OutgoingMessage[]): Promise<void> {
+  async appendSegment(runId: string, generation: number, msgs: OutgoingMessage[],
+    onCommitted?: (identity: symbol) => void): Promise<void> {
     if (!this.writable()) return;
     if (msgs.length === 0) return;
     const first = msgs[0];
@@ -701,6 +704,8 @@ export class Outbox {
       const ref: ManifestRecordRef = { kind: "segment", firstSeq: first.seq, lastSeq: last.seq, fileVersion, file };
       await this.installManifest(rs, [...rs.manifest.records, ref]);
       rs.recordBytes.set(file, bytes);
+      // Trusted synchronous observer: commit evidence is emitted while the run lock is held.
+      onCommitted?.(this.deliveryIdentity(ref));
     });
   }
 
@@ -710,7 +715,8 @@ export class Outbox {
    * the record, then replenishes it. Replay expands the record into one tombstone
    * per seq so the stream stays contiguous.
    */
-  async appendRangeRecord(runId: string, generation: number, firstSeq: number, lastSeq: number): Promise<void> {
+  async appendRangeRecord(runId: string, generation: number, firstSeq: number, lastSeq: number,
+    onCommitted?: (identity: symbol) => void): Promise<void> {
     if (!this.writable()) return;
     await this.withRunLock(runId, async () => {
       const rs = await this.ensureRunState(runId);
@@ -733,6 +739,7 @@ export class Outbox {
         const ref: ManifestRecordRef = { kind: "range", firstSeq, lastSeq, fileVersion, file };
         await this.installManifest(rs, [...rs.manifest.records, ref]);
         rs.recordBytes.set(file, bytes);
+        onCommitted?.(this.deliveryIdentity(ref));
       });
     });
   }
@@ -774,6 +781,7 @@ export class Outbox {
   async drainRun(
     runId: string,
     send: (msgs: OutgoingMessage[], generation: number) => Promise<void>,
+    onAcknowledged?: (identity: symbol) => void,
   ): Promise<{ retired: boolean; staleRetired: number }> {
     if (this.disabled) return { retired: false, staleRetired: 0 };
     return this.withRunLock(runId, async () => {
@@ -791,6 +799,9 @@ export class Outbox {
           // bump never rebinds an old attempt's frames. Streamed in bounded chunks so a
           // wide range never allocates one huge array or posts one oversized request.
           await this.replayRecord(rs, rec, send);
+          // Only this drain gets evidence, and only after every chunk was ACKed.
+          // Observer callbacks are trusted, synchronous and must not throw.
+          onAcknowledged?.(this.deliveryIdentity(rec));
         } catch (err) {
           if (err instanceof StaleClaimError) {
             this.log.warn("outbox: record refused as stale claim; retiring locally (frames lost, not rebound)", {
@@ -944,6 +955,8 @@ export class Outbox {
       fileVersion,
       file,
     };
+    // Quota replacement changes storage shape, not the logical delivery obligation.
+    this.deliveryIdentities.set(ref, this.deliveryIdentity(segRec));
     const nextRecords = rs.manifest.records.map((r) => (r.file === segRec.file ? ref : r));
     await this.installManifest(rs, nextRecords);
     rs.recordBytes.delete(segRec.file);
@@ -1095,6 +1108,23 @@ export class Outbox {
     const rs = this.runs.get(runId);
     if (!rs) return false;
     return rs.manifest.records.some((r) => r.lastSeq > rs.manifest.cursor);
+  }
+
+  private deliveryIdentity(rec: ManifestRecordRef): symbol {
+    let identity = this.deliveryIdentities.get(rec);
+    if (identity === undefined) {
+      identity = Symbol();
+      this.deliveryIdentities.set(rec, identity);
+    }
+    return identity;
+  }
+
+  /** Capture every unretired logical record synchronously, including records
+   * currently excluded by the replay cursor. Only a complete owned replay can
+   * supply its receipt. Identities live only in this Outbox instance.
+   */
+  pendingDeliveryIdentities(runId: string): readonly symbol[] {
+    return this.runs.get(runId)?.manifest.records.map((rec) => this.deliveryIdentity(rec)) ?? [];
   }
 
   /** The outbox depth for one run, or undefined if the run is not tracked. */
