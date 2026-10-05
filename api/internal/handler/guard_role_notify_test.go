@@ -106,10 +106,6 @@ func (s *countingNotifStore) PruneNotificationsForUser(context.Context, store.Pr
 	return 0, nil
 }
 
-// The PRD #333 coalescing pair, unused by the guard-role path but required to satisfy the
-// widened notifysvc.Store interface. Find reports "no coalescible row" so any accidental
-// caller takes the insert branch rather than a phantom hit.
-
 // TestGuardRoleExcludedEmitDecision pins the producer notifyGuardRoleExcluded (PRD #319
 // M3): a guard-role exclusion emits exactly one Notify with the new kind, and a nil
 // notifier is a no-op. The empty-skip decision is covered end-to-end through the real
