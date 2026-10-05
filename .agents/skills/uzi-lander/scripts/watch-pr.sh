@@ -280,7 +280,7 @@ while [ "$i" -lt "$MAX" ]; do
   # posted: N" tally. A tally-less COMMENTED/CHANGES_REQUESTED review on the head is NOT a
   # verdict: CodeRabbit puts grouped / outside-diff findings in that review BODY, which the
   # inline count below never sees, so it is counted as an UNCONFIRMED finding instead when
-  # the head has no verdict (pr-findings.sh classifies it the same way). Next to a verdict,
+  # the head has no verdict (cr_reviewed=0: no APPROVED or tallied review on it). Next to a verdict,
   # that body is gated by the every-author ack (unacked) only; see the live computation.
   # Two gotchas handled here: `gh api --jq`
   # does NOT accept jq's --arg (so the head SHA is passed to standalone jq), and `gh api
@@ -550,8 +550,9 @@ while [ "$i" -lt "$MAX" ]; do
     greptile)   cr_counts=0 ;;
   esac
   live=0
-  # cr_unconfirmed gates only while CodeRabbit has NO verdict on the head (cr_reviewed=0),
-  # as in pr-findings.sh. Once a verdict exists, an extra tally-less COMMENTED review body is
+  # cr_unconfirmed gates only while CodeRabbit has NO verdict on the head (cr_reviewed=0:
+  # no same-head APPROVED, tallied or walkthrough-covered review, whatever the review order).
+  # Once a verdict exists, an extra tally-less COMMENTED review body is
   # gated by the every-author unacked count below (it blocks until acknowledged), so counting
   # it here too would hold watch-pr at findings forever after the ack. The poll and RESULT
   # lines still print the raw cr_unconfirmed count.
