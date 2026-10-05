@@ -12,7 +12,7 @@ map is the root `CLAUDE.md`.
 
 - The TUI is bubbletea v2 + lipgloss v2 (`api/cmd/uzi/tui_*.go`); the shared palette and render primitives are `tui_render.go`.
 - You cannot look at a terminal, so review the TUI through rendered images, not by reading code.
-- `cd api/cmd/uzi/uxlab && devbox run build` drives the SHIPPED `tuiModel` offline (env-gated `uxlab_gen_test.go`, no server, no PTY) to ANSI frames, then freezes them to PNG (light + dark, ~19 scenes) under `uxlab/png/` (gitignored). Read `png/<scene>-dark.png` / `png/<scene>-light.png`; `devbox run gen` / `devbox run render` are the two halves.
+- `cd api/cmd/uzi/uxlab && devbox run build` drives the SHIPPED `tuiModel` offline (env-gated `uxlab_gen_test.go`, no server, no PTY) to ANSI frames, then freezes them to PNG (a light + dark pair per scene) under `uxlab/png/` (gitignored). Read `png/<scene>-dark.png` / `png/<scene>-light.png`; `devbox run gen` / `devbox run render` are the two halves.
 - After a code change run the full `build` and confirm the PNG mtimes are newer than the frames. A timed-out render leaves stale PNGs beside current frames, and a stale screenshot lies silently.
 - Interactive drive-test with no server: `cd api && go run ./cmd/uzi tui --demo`, a hidden flag running the real model over seeded fixtures and a fake stream.
 - The demo, the screenshots and the shipped views all run the same `tuiModel`, so changing a view moves both. Do not reintroduce a parallel mock model.
