@@ -185,11 +185,24 @@ export function incidentDoc(): HealthDoc {
   );
 }
 
+// Fixed demo identities in waitEvidence's server format; stored reason is the
+// reasonNoEligibleWorker text truncated to healthsvc's 96-byte evidence bound.
+export const ownerOnlyWaitingRunId = "22930000-0000-0000-0000-000000000003";
+export const ownerOnlyWaitingOwnerId = "22930000-0000-0000-0000-000000000004";
+const ownerOnlyWaitingEvidence = [
+  { label: "Waiting run", value: `run ${ownerOnlyWaitingRunId}; owner ${ownerOnlyWaitingOwnerId}; waited 36m; stored reason no online worker can run this — it needs a capability none of your workers has; provision a ca` },
+  { label: "Waiting run", value: "run 22930000-0000-0000-0000-000000000005; owner 22930000-0000-0000-0000-000000000006; waited 34m; stored reason no online worker can run this — it needs a capability none of your workers has; provision a ca" },
+];
+
 // Owner-local capacity and queue danger remains visible without an instance episode.
 export function ownerOnlyDoc(): HealthDoc {
   const checks = incidentDoc().checks.map((c) => c.id === "fleet.roll"
     ? { ...c, severity: "ok", summary: OK_SUMMARY[c.id], evidence: [], action: null, command: null, since: null }
-    : c);
+    : c.id === "fleet.capacity"
+      ? { ...c, evidence: [...ownerOnlyWaitingEvidence, { label: "Owners affected", value: "2" }] }
+      : c.id === "queue.waiting"
+        ? { ...c, summary: "A run has been waiting for a worker for 36m.", since: minsAgo(36), evidence: [...ownerOnlyWaitingEvidence] }
+        : c);
   return doc(checks);
 }
 

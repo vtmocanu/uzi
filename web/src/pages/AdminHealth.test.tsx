@@ -19,6 +19,8 @@ import { likelyCause } from "../components/WorkerUpgradeBadge";
 import { api, type AdminWorker, type HealthDoc } from "../lib/api";
 import {
   ownerOnlyDoc,
+  ownerOnlyWaitingOwnerId,
+  ownerOnlyWaitingRunId,
   degradedDoc,
   healthySilentDoc,
   incidentDoc,
@@ -120,6 +122,11 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
     expect(band("3 checks need attention; no instance-wide blocker detected").getAttribute("role")).toBe("alert");
     const capacity = attentionItem(container, "fleet.capacity")!;
     expect(within(capacity).getByText("2")).toBeTruthy();
+    for (const id of ["fleet.capacity", "queue.waiting"]) {
+      const item = attentionItem(container, id)!;
+      expect(within(item).getAllByText("Waiting run")).toHaveLength(2);
+      expect(within(item).getByText(`run ${ownerOnlyWaitingRunId}; owner ${ownerOnlyWaitingOwnerId}; waited 36m; stored reason no online worker can run this — it needs a capability none of your workers has; provision a ca`)).toBeTruthy();
+    }
     expect(within(capacity).getByText(/Recover or provision a worker/)).toBeTruthy();
     expect(attentionIds(container)).toEqual(["fleet.capacity", "queue.waiting", "forge.ciwatch"]);
   });

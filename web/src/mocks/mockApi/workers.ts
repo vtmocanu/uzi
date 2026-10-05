@@ -1,6 +1,7 @@
 import type { BindMode } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { healthyFleetWorkers, incidentFleetWorkers, mockAdminWorkers, mockWorkers } from "../data";
+import { minsAgo } from "../data/time";
 import { delay, mockScenario } from "./shared";
 // secrets ↔ workers is the one accepted import cycle (PRD #991 D4): setWorkerBindMode
 // resolves a token label against the secrets roster, and secrets' deleteAnthropicTokenById
@@ -203,8 +204,8 @@ export const workersApi = {
   //   health-incident            → the stuck hosted fleet, so the Blocking/Upgrade columns
   //                                 (the ones the admin list lacked before this PRD) are
   //                                 populated across two owners, matching the danger doc;
-  //   health-silent / -degraded  → a HEALTHY fleet, so "all normal" / "warnings only, nothing
-  //                                 is blocked" is not undercut by a stuck upgrade in the table;
+  //   health-confirmed-drain     → two owner-A workers finishing current runs before upgrading;
+  //   health-silent / -degraded / -owner-only → a healthy roll without failed workers;
   //   otherwise                  → the default mixed fleet (unchanged), which the Workers page
   //                                 demo relies on to show the full range of worker states.
   adminListWorkers: async () => {
@@ -212,9 +213,13 @@ export const workersApi = {
     const rows =
       scn === "health-incident"
         ? incidentFleetWorkers()
-        : scn === "health-silent" || scn === "health-degraded"
-          ? healthyFleetWorkers()
-          : mockAdminWorkers;
+        : scn === "health-confirmed-drain"
+          ? healthyFleetWorkers().map((w) => w.owner_email === "user.a@uzi.local"
+            ? { ...w, draining_since: minsAgo(40), upgrade_status: "upgrading" as const, busy: true, active_runs: 1 }
+            : w)
+          : scn === "health-silent" || scn === "health-degraded" || scn === "health-owner-only"
+            ? healthyFleetWorkers()
+            : mockAdminWorkers;
     return delay({ workers: rows.map((w) => ({ ...w })) });
   },
 };

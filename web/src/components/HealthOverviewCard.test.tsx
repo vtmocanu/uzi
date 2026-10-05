@@ -13,7 +13,7 @@ import { MemoryRouter } from "react-router-dom";
 
 import { HealthOverviewCard } from "./HealthOverviewCard";
 import { api } from "../lib/api";
-import { healthySilentDoc, incidentDoc, ownerOnlyDoc } from "../mocks/data/health";
+import { healthySilentDoc, incidentDoc, ownerOnlyDoc, ownerOnlyWaitingOwnerId, ownerOnlyWaitingRunId } from "../mocks/data/health";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -42,6 +42,19 @@ describe("HealthOverviewCard", () => {
     const card = await screen.findByRole("alert", { name: "System health" });
     expect(within(card).getByText("System health: 3 checks need attention; no instance-wide blocker detected")).toBeTruthy();
     expect(within(card).getByText(doc.checks.find((c) => c.id === "fleet.capacity")!.summary)).toBeTruthy();
+    const items = within(card).getAllByRole("listitem");
+    expect(items).toHaveLength(3);
+    for (const item of items.slice(0, 2)) {
+      expect(within(item).getByText("Waiting run:")).toBeTruthy();
+      expect(within(item).getByText((_, el) =>
+        el?.tagName === "SPAN" && el.textContent === `Waiting run: run ${ownerOnlyWaitingRunId}; owner ${ownerOnlyWaitingOwnerId}; waited 36m; stored reason no online worker can run this — it needs a capability none of your workers has; provision a ca`,
+      )).toBeTruthy();
+      expect(within(item).getByText("Danger")).toBeTruthy();
+      expect(within(item).queryByText("Owners affected:")).toBeNull();
+      expect(item.textContent).not.toContain("22930000-0000-0000-0000-000000000005");
+    }
+    expect(within(card).queryByRole("banner")).toBeNull();
+    expect(within(card).getByRole("link", { name: "Open health" })).toBeTruthy();
   });
 
   it("collapses to one quiet line when every check passes", async () => {
