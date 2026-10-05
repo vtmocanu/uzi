@@ -47,6 +47,9 @@ the agent workload, not an arbitrary user's build or test suite.
   with unchanged resources. Operators must account for that capacity cost.
 - Limits increase from 2 CPU / 8Gi to 4 CPU / 12Gi. Two run slots still share
   the same worker quota; this decision does not scale CPU with slot count.
+- New persistent workers also request a 25Gi data volume instead of the medium
+  preset's 10Gi. Ephemeral data volumes retain their independent 20Gi default;
+  the shared tools-cache volume retains its separate sizing.
 - A larger preset does not cure leaks or memory pressure: [#2127](https://github.com/vtmocanu/uzi/issues/2127)
   records an OOM kill at the large preset's 12Gi limit.
 - Existing workers retain their persisted sizes. Self-run compose workers
