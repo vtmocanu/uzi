@@ -534,7 +534,7 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 
 	// ONE per-frame meter snapshot with ONE now (PRD 1519 M4): boardMeterLayout decides
 	// combined-vs-split once and returns the rendered header meter line(s). The SAME snapshot
-	// feeds both the draw below and the row reservation (boardCapacityWith), so the reserved
+	// feeds both the combined summary line and its row reservation, so the reserved
 	// chrome can never disagree with what is drawn.
 	var meters boardMeterLayout
 	if fullScreen {
@@ -551,11 +551,15 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 	// cursor still indexes RUN rows only (via visible()), so selection/enter/clamp are unchanged.
 	// The window keeps the selected run row on screen so the wordmark and footer never scroll off.
 	items := m.buildBoardItems(rows)
-	capacity := m.boardCapacityAt(height, len(meters.lines), fullScreen)
+	meterRows := len(meters.lines)
+	if fullScreen {
+		meterRows = len(m.boardMeterSummaryLines(meters.lines, m.boardSummary()))
+	}
+	capacity := m.boardCapacityAt(height, meterRows, fullScreen)
 	selItem := selectedBoardItem(items, m.board.cursor)
 	start, end := boardWindow(selItem, m.board.scroll, len(items), capacity)
 
-	// Summary glyph cluster + position readout, pinned top-right. Over the WHOLE board (not the
+	// Summary glyph cluster + position readout, right-aligned with account meters. Over the WHOLE board (not the
 	// filtered view) so it stays a stable factory read while you filter.
 	summary := m.boardSummary()
 	if len(rows) > 0 {
@@ -567,15 +571,15 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 			sb.WriteString(line + "\n")
 		}
 	} else {
-		sb.WriteString(clampVisual(padVisual(" "+brand, m.width-visualWidth(summary)-1)+summary, m.width) + "\n")
+		sb.WriteString(clampVisual(" "+brand, m.width) + "\n")
 	}
 	// The viewer's own rate-limit meters, mirroring the web sidebar's selection (PRD #1209 M3 /
 	// 1519 M4). boardMeterLayout adaptively renders the Claude and Codex meters on ONE combined
 	// header line when they fit m.width, or on two lines (Claude, then Codex) when they do not.
-	// len(meters.lines) is 0, 1, or 2, and boardCapacityWith reserved exactly that many rows from
-	// the SAME snapshot, so this loop can never overdraw the run list.
+	// The summary joins the last account line or gets a separate row; capacity reserves
+	// that combined layout from the same meter snapshot.
 	if fullScreen {
-		for _, line := range meters.lines {
+		for _, line := range m.boardMeterSummaryLines(meters.lines, summary) {
 			sb.WriteString(line + "\n")
 		}
 	}
@@ -587,7 +591,7 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 		if vault := m.vaultIndicatorLine(); vault != "" {
 			sb.WriteString(vault + "\n")
 		}
-		sb.WriteString(padVisual("", max(0, m.width-visualWidth(summary))) + clampVisual(summary, m.width) + "\n")
+		sb.WriteString("\n")
 	}
 
 	if fullScreen && m.board.adminDenied {
@@ -955,14 +959,14 @@ func (m tuiModel) boardMeterLayout(now time.Time) boardMeterLayout {
 // boardCapacity is how many display lines fit between the wordmark block and the footer at the
 // current terminal height. It is the zero-arg form for callers that do not already hold a meter
 // snapshot (syncedScroll, tests): it derives the meter row count from a fresh boardMeterLayout.
-// renderBoard MUST use boardCapacityWith with its own per-frame snapshot instead, so the reserved
-// meter rows match exactly what it draws.
+// Rendering counts the combined meter/summary layout from its own snapshot so the reserved
+// rows match what it draws.
 func (m tuiModel) boardCapacity() int {
-	return m.boardCapacityWith(len(m.boardMeterLayout(time.Now()).lines))
+	return m.boardCapacityWith(len(m.boardMeterSummaryLines(m.boardMeterLayout(time.Now()).lines, m.boardSummary())))
 }
 
 // boardCapacityWith is boardCapacity given the number of header meter rows the caller is drawing
-// (0, 1, or 2 from boardMeterLayout). It counts the same chrome renderBoard draws: the wordmark
+// (including any run-summary fallback). It counts the same chrome renderBoard draws: the wordmark
 // line, the blank below it, the footer (3), the meter rows, plus the optional adminDenied, error,
 // vault-hint, and selected-row second lines. At least one content line is always shown.
 func (m tuiModel) boardCapacityWith(meterLines int) int {
@@ -1121,4 +1125,36 @@ func (m tuiModel) boardTitle(full bool) string {
 		}
 	}
 	return brand
+}
+
+// Reserve the widest possible page range so gaining a row cannot make the
+// summary wrap and change the capacity that produced that range.
+func (m tuiModel) boardSummaryReserve() string {
+	summary := m.boardSummary()
+	if n := len(m.board.visible()); n > 0 {
+		summary += m.pal.faint.Render(" · " + itoa(n) + "–" + itoa(n))
+	}
+	return summary
+}
+func (m tuiModel) boardMeterSummaryLines(meters []string, summary string) []string {
+	lines := append([]string(nil), meters...)
+	if len(lines) > 0 {
+		last := len(lines) - 1
+		if m.width-visualWidth(lines[last])-visualWidth(m.boardSummaryReserve()) >= 2 {
+			lines[last] = padVisual(lines[last], m.width-visualWidth(summary)) + summary
+			return lines
+		}
+	}
+	return append(lines, padVisual("", max(0, m.width-visualWidth(summary)))+clampVisual(summary, m.width))
+}
+func (m tuiModel) boardWindowSummary(capacity int) string {
+	rows := m.board.visible()
+	summary := m.boardSummary()
+	if len(rows) > 0 {
+		items := m.buildBoardItems(rows)
+		start, end := boardWindow(selectedBoardItem(items, m.board.cursor), m.board.scroll, len(items), capacity)
+		lo, hi := windowRunSpan(items, start, end)
+		summary += m.pal.faint.Render(" · " + itoa(lo) + "–" + itoa(hi))
+	}
+	return summary
 }

@@ -274,6 +274,9 @@ func (m tuiModel) splitFooterLine() string {
 // splitHeader is the sole source of shared header lines and their row count.
 // Build it once per render: time-dependent meter widths can change its height.
 func (m tuiModel) splitHeader(now time.Time) []string {
+	return m.splitHeaderSummary(now, m.boardSummary())
+}
+func (m tuiModel) splitHeaderSummary(now time.Time, summary string) []string {
 	var lines []string
 	floor := "floor"
 	if m.board.admin {
@@ -298,7 +301,7 @@ func (m tuiModel) splitHeader(now time.Time) []string {
 	}
 	lines = append(lines, m.workerTitleLines(title, m.workersSummary(m.width, m.top() == viewBoard))...)
 	if m.top() == viewBoard {
-		lines = append(lines, m.boardMeterLayout(now).lines...)
+		lines = append(lines, m.boardMeterSummaryLines(m.boardMeterLayout(now).lines, summary)...)
 	}
 	if vault := m.vaultIndicatorLine(); vault != "" {
 		lines = append(lines, vault)
@@ -315,8 +318,12 @@ func (m tuiModel) splitHeader(now time.Time) []string {
 }
 
 func (m tuiModel) renderSplit() string {
-	lines := m.splitHeader(time.Now())
+	now := time.Now()
+	lines := m.splitHeader(now)
 	top, bottom := m.splitHeightsWithHeader(len(lines))
+	if m.top() == viewBoard {
+		lines = m.splitHeaderSummary(now, m.boardWindowSummary(m.boardCapacityAt(top, 0, false)))
+	}
 	if m.top() == viewWorkers {
 		lines = append(lines, splitPane(m.renderWorkersBody(top, false), top))
 	} else {
