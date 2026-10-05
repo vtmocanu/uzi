@@ -674,7 +674,7 @@ export class Outbox {
    * binds), then writes the segment and installs the next manifest generation.
    */
   async appendSegment(runId: string, generation: number, msgs: OutgoingMessage[],
-    onCommitted?: (identity: symbol) => void): Promise<void> {
+    onCommitted?: (identity: symbol) => void, signal?: AbortSignal): Promise<void> {
     if (!this.writable()) return;
     if (msgs.length === 0) return;
     const first = msgs[0];
@@ -706,7 +706,7 @@ export class Outbox {
       rs.recordBytes.set(file, bytes);
       // Trusted synchronous observer: commit evidence is emitted while the run lock is held.
       onCommitted?.(this.deliveryIdentity(ref));
-    });
+    }, signal);
   }
 
   /**
@@ -716,7 +716,7 @@ export class Outbox {
    * per seq so the stream stays contiguous.
    */
   async appendRangeRecord(runId: string, generation: number, firstSeq: number, lastSeq: number,
-    onCommitted?: (identity: symbol) => void): Promise<void> {
+    onCommitted?: (identity: symbol) => void, signal?: AbortSignal): Promise<void> {
     if (!this.writable()) return;
     await this.withRunLock(runId, async () => {
       const rs = await this.ensureRunState(runId);
@@ -741,29 +741,29 @@ export class Outbox {
         rs.recordBytes.set(file, bytes);
         onCommitted?.(this.deliveryIdentity(ref));
       });
-    });
+    }, signal);
   }
 
   /** Set the spill-unclean flag when a spill begins (creates the run's manifest if
    *  none exists yet). Surfaced at the next restart via {@link uncleanRuns}. */
-  async markSpillUnclean(runId: string): Promise<void> {
+  async markSpillUnclean(runId: string, signal?: AbortSignal): Promise<void> {
     if (!this.writable()) return;
     await this.withRunLock(runId, async () => {
       const rs = await this.ensureRunState(runId);
       if (!rs) return;
       if (rs.manifest.spilledUnclean && rs.manifest.generation > 0) return;
       await this.installManifest(rs, rs.manifest.records, { spilledUnclean: true });
-    });
+    }, signal);
   }
 
   /** Clear the spill-unclean flag on a clean flush/close. */
-  async clearSpillUnclean(runId: string): Promise<void> {
+  async clearSpillUnclean(runId: string, signal?: AbortSignal): Promise<void> {
     if (!this.writable()) return;
     await this.withRunLock(runId, async () => {
       const rs = this.runs.get(runId);
       if (!rs || !rs.manifest.spilledUnclean) return;
       await this.installManifest(rs, rs.manifest.records, { spilledUnclean: false });
-    });
+    }, signal);
   }
 
   // ── drain / replay ────────────────────────────────────────────────────────────
@@ -776,12 +776,14 @@ export class Outbox {
    * hole. A `send` that throws {@link StaleClaimError} retires the record locally
    * and counts it in `staleRetired`; any OTHER throw stops the drain and leaves
    * the rest pending. Returns whether the run is now fully retired and the run's
-   * cumulative stale-retired seq count.
+   * cumulative stale-retired seq count. The optional signal cancels queued lock
+   * acquisition only; an acquired drain awaits send and retirement truthfully.
    */
   async drainRun(
     runId: string,
     send: (msgs: OutgoingMessage[], generation: number) => Promise<void>,
     onAcknowledged?: (identity: symbol) => void,
+    signal?: AbortSignal,
   ): Promise<{ retired: boolean; staleRetired: number }> {
     if (this.disabled) return { retired: false, staleRetired: 0 };
     return this.withRunLock(runId, async () => {
@@ -818,7 +820,7 @@ export class Outbox {
         await this.retireRecord(rs, rec, false);
       }
       return { retired: rs.manifest.records.length === 0, staleRetired: rs.manifest.staleRetired };
-    });
+    }, signal);
   }
 
   /** Replay one record as bounded, sequence-ordered chunks over `send` (each ≤
@@ -1657,9 +1659,18 @@ export class Outbox {
    *  manifest generation and lose one). Different runs never share a tail, so they
    *  stay concurrent. The stored tail never rejects, so one op's failure does not
    *  wedge the run's chain (H2). */
-  private withRunLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+  private withRunLock<T>(runId: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (signal?.aborted) return Promise.reject(signal.reason);
     const prev = this.runLocks.get(runId) ?? Promise.resolve();
-    const result = prev.then(() => fn());
+    let started = false;
+    let abortQueued: (() => void) | undefined;
+    const result = prev.then(() => {
+      if (abortQueued) signal?.removeEventListener("abort", abortQueued);
+      // A cancelled waiter keeps its place in the chain but never runs fn.
+      if (signal?.aborted) throw signal.reason;
+      started = true;
+      return fn();
+    });
     const tail = result.then(
       () => undefined,
       () => undefined,
@@ -1669,7 +1680,17 @@ export class Outbox {
     void tail.then(() => {
       if (this.runLocks.get(runId) === tail) this.runLocks.delete(runId);
     });
-    return result;
+    if (!signal) return result;
+    // Reject only queued acquisition. Once fn owns the lock, its real result
+    // settles the caller; cancellation cannot claim an unfinished write or ACK.
+    return new Promise<T>((resolve, reject) => {
+      abortQueued = () => {
+        if (abortQueued) signal.removeEventListener("abort", abortQueued);
+        if (!started) reject(signal.reason);
+      };
+      signal.addEventListener("abort", abortQueued, { once: true });
+      void result.then(resolve, reject);
+    });
   }
 
   /** Non-blocking acquire of a run's per-run lock, for a CROSS-RUN mutation (a

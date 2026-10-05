@@ -2,6 +2,7 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import { MessageBatcher, replaySegment } from "../src/batcher.js";
 import { Outbox, StaleClaimError, type RawWriteSeam } from "../src/outbox.js";
 import { RequestError, type PlanCrossCheckResponse, type WorkerClient } from "../src/client.js";
@@ -143,13 +144,13 @@ it("sanitizes/redacts held events immediately and refuses bounded overflow", asy
   await b.close();
 });
 
-async function withOutbox(body: (o: Outbox) => Promise<void>, rawWrite?: RawWriteSeam, runMaxBytes = 64 * 1024 * 1024) {
-  const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/reservation-outbox-"));
+async function withOutbox(body: (o: Outbox, root: string) => Promise<void>, rawWrite?: RawWriteSeam, runMaxBytes = 64 * 1024 * 1024) {
+  const root = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "reservation-outbox-"));
   try {
     const o = new Outbox({ root: path.join(root, "outbox"), log: nullLogger(),
       runMaxBytes, maxBytes: 512 * 1024 * 1024, retentionMs: 86400_000, rawWrite });
     await o.init();
-    await body(o);
+    await body(o, path.join(root, "outbox"));
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 }
 it("real durable segment and range replay retain generation and sequence, with concurrent rearm", async () => {
@@ -197,6 +198,175 @@ it("external retirement without this reservation's ACK proof fails closed", asyn
     assert.equal((await r.prepare()).prepared, false);
     assert.equal(r.release(proof()), false);
     await b.close();
+  });
+});
+
+for (const stop of ["deadline", "cancel", "close", "close-with-tail"] as const) {
+  it(`queued preparation and ${stop} settle without releasing an independent drainer's lock`, async () => {
+    await withOutbox(async (o) => {
+      const original = { seq: 1, kind: "status" as const, payload: { text: "independent" } };
+      await o.appendSegment(runId, 3, [original]);
+      const identities = o.pendingDeliveryIdentities(runId);
+      let entered!: () => void;
+      const started = new Promise<void>((resolve) => { entered = resolve; });
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let ownerSettled = false;
+      const owner = o.drainRun(runId, async () => {
+        entered();
+        await held;
+        throw new Error("independent ACK unknown");
+      }).then((result) => { ownerSettled = true; return result; });
+      await started;
+      const sent: OutgoingMessage[][] = [];
+      const b = new MessageBatcher({ async postUsage() {}, async postMessages(_id: string, msgs: OutgoingMessage[]) {
+        sent.push(msgs);
+      } } as unknown as WorkerClient, runId, 1, 60_000, nullLogger(), undefined, undefined,
+      { generation: 3, outbox: o });
+      if (stop === "close-with-tail") b.emit(event("assigned tail"));
+      const r = b.reserveCandidateTransport();
+      b.emit(event("unassigned"));
+      const preparing = r.prepare(stop === "deadline" ? 10 : 3000);
+      // Let preparation reach the outbox queue before cancelling its owner.
+      await new Promise<void>((resolve) => { setImmediate(resolve); });
+      let watchdog: ReturnType<typeof setTimeout> | undefined;
+      const bounded = async <T>(work: Promise<T>): Promise<T> => {
+        try {
+          return await Promise.race([work, new Promise<never>((_, reject) => {
+            watchdog = setTimeout(() => reject(new Error("queued operation exceeded 100ms")), 100);
+          })]);
+        } finally { clearTimeout(watchdog); }
+      };
+      let later: Promise<{ retired: boolean; staleRetired: number }> | undefined;
+      let laterSent = false;
+      try {
+        if (stop === "cancel") r.cancel();
+        if (stop.startsWith("close")) await bounded(b.close(AbortSignal.timeout(10)));
+        assert.equal((await bounded(preparing)).prepared, false);
+        if (!stop.startsWith("close")) await bounded(b.close(AbortSignal.abort()));
+        assert.equal(ownerSettled, false);
+        assert.equal(sent.length, 0);
+        assert.deepEqual(o.pendingDeliveryIdentities(runId), identities);
+        assert.equal(b.bufferedCount(), stop === "close-with-tail" ? 1 : 0);
+        assert.equal(b.currentSeq(), stop === "close-with-tail" ? 2 : 1);
+        assert.equal(r.release(proof()), false);
+        later = o.drainRun(runId, async (msgs) => {
+          laterSent = true;
+          assert.deepEqual(msgs, [original]);
+        });
+        await new Promise<void>((resolve) => { setImmediate(resolve); });
+        assert.equal(laterSent, false, "cancelled acquisition must not let a later drain overtake the live owner");
+      } finally {
+        release();
+        assert.equal((await owner).retired, false);
+        await preparing;
+        await b.close(AbortSignal.abort());
+        if (later) assert.equal((await later).retired, true);
+      }
+      assert.equal(laterSent, true);
+      assert.equal(sent.length, 0, "cancelled queued callback must never run after the owner releases");
+      assert.equal(o.hasUndrainedMessages(runId), false);
+    });
+  });
+}
+
+it("cancelled queued outbox writes neither commit nor clear the unclean marker later", async () => {
+  let writes = 0;
+  await withOutbox(async (o, root) => {
+    const original = { seq: 1, kind: "status" as const, payload: {} };
+    await o.appendSegment(runId, 3, [original]);
+    await o.markSpillUnclean(runId);
+    const baselineWrites = writes;
+    const identities = o.pendingDeliveryIdentities(runId);
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const owner = o.drainRun(runId, async () => {
+      entered();
+      await held;
+      throw new Error("owner retains record");
+    });
+    await started;
+    const controller = new AbortController();
+    let committed = 0;
+    const writesQueued = [
+      o.appendSegment(runId, 3, [{ ...original, seq: 2 }], () => { committed++; }, controller.signal),
+      o.appendRangeRecord(runId, 3, 3, 4, () => { committed++; }, controller.signal),
+      o.markSpillUnclean(runId, controller.signal),
+      o.clearSpillUnclean(runId, controller.signal),
+    ];
+    const settled = Promise.allSettled(writesQueued);
+    controller.abort();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const results = await Promise.race([settled, new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("queued writes exceeded 100ms")), 100);
+      })]);
+      assert.equal(results.every((result) => result.status === "rejected" &&
+        result.reason === controller.signal.reason), true);
+      assert.equal(writes, baselineWrites);
+      assert.equal(committed, 0);
+    } finally {
+      clearTimeout(timeout);
+      release();
+      await owner;
+      await settled;
+    }
+    // This drain is behind all cancelled slots, so inspect their final effects.
+    const delivered: OutgoingMessage[] = [];
+    const barrier = await o.drainRun(runId, async (msgs) => {
+      delivered.push(...msgs);
+      throw new Error("keep original");
+    });
+    assert.equal(barrier.retired, false);
+    assert.deepEqual(delivered, [original]);
+    assert.equal(writes, baselineWrites);
+    assert.equal(committed, 0);
+    assert.deepEqual(o.pendingDeliveryIdentities(runId), identities);
+    const restarted = new Outbox({ root, log: nullLogger(), runMaxBytes: 64 * 1024 * 1024,
+      maxBytes: 512 * 1024 * 1024, retentionMs: 86400_000 });
+    await restarted.init();
+    assert.equal(restarted.uncleanRuns().includes(runId), true);
+  }, async (write) => { writes++; await write(); });
+});
+
+it("close awaits the real failure of a running owned delivery and preserves its durable record", async () => {
+  await withOutbox(async (o) => {
+    const original = { seq: 1, kind: "status" as const, payload: { text: "ACK unknown" } };
+    await o.appendSegment(runId, 3, [original]);
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let requestSignal: AbortSignal | undefined;
+    const b = new MessageBatcher({ async postUsage() {}, async postMessages(
+      _id: string, _msgs: OutgoingMessage[], _generation: number, signal?: AbortSignal,
+    ) {
+      requestSignal = signal;
+      entered();
+      await held;
+      throw new Error("delivery failed after cancellation");
+    } } as unknown as WorkerClient, runId, 1, 60_000, nullLogger(), undefined, undefined,
+    { generation: 3, outbox: o });
+    const r = b.reserveCandidateTransport();
+    let preparedSettled = false;
+    const preparing = r.prepare().then((result) => { preparedSettled = true; return result; });
+    await started;
+    let closed = false;
+    const closing = b.close(AbortSignal.abort()).then(() => { closed = true; });
+    try {
+      await new Promise<void>((resolve) => { setImmediate(resolve); });
+      assert.equal(requestSignal?.aborted, true);
+      assert.equal(preparedSettled, false);
+      assert.equal(closed, false);
+      assert.equal(o.hasUndrainedMessages(runId), true);
+    } finally { release(); await closing; }
+    assert.equal((await preparing).prepared, false);
+    assert.equal(r.release(proof()), false);
+    assert.equal((await o.drainRun(runId, async (msgs) => {
+      assert.deepEqual(msgs, [original]);
+    })).retired, true);
   });
 });
 
@@ -285,7 +455,7 @@ it("previous stale retirement is not ACK proof even with an empty durable queue"
 });
 
 it("a real disabled outbox cannot certify an empty queue", async () => {
-  const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/reservation-disabled-"));
+  const root = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "reservation-disabled-"));
   try {
     const blocked = path.join(root, "file");
     await fs.writeFile(blocked, "not a directory");

@@ -584,7 +584,7 @@ export class MessageBatcher {
           if (expiry.aborted || generation !== this.generation ||
             msgs.some((m) => m.seq > r.tail)) throw new Error("unproven durable generation/tail");
           await this.client.postMessages(this.runId, msgs, generation, expiry);
-        }, (identity) => { r.outboxPending.delete(identity); });
+        }, (identity) => { r.outboxPending.delete(identity); }, expiry);
         const remaining = new Set(this.outbox.pendingDeliveryIdentities(this.runId));
         if ([...r.outboxPending].some((identity) => !remaining.has(identity)) ||
           result.staleRetired !== 0) {
@@ -1312,9 +1312,9 @@ export class MessageBatcher {
    *  to the outbox (durable, replayed later by the drainer) and clear the unclean flag
    *  once the tail is on disk. A write failure leaves the flag set so restart admits
    *  the possible loss. */
-  private async finalSpillOnClose(): Promise<void> {
+  private async finalSpillOnClose(signal?: AbortSignal): Promise<void> {
     const outbox = this.outbox;
-    if (!outbox) return;
+    if (!outbox || (this.buffer.length === 0 && this.pendingRangeFirst === undefined)) return;
     try {
       // Re-mark unclean BEFORE any close-time write, mirroring doSpillFlush's own
       // defensive re-mark at its top. A prior clean periodic doSpillFlush may have
@@ -1331,11 +1331,11 @@ export class MessageBatcher {
       // cleared the flag), an unwritable manifest can record nothing durably and the
       // loss is admitted by the "may be lost" log alone.
       if (this.buffer.length > 0 || this.pendingRangeFirst !== undefined) {
-        await outbox.markSpillUnclean(this.runId);
+        await outbox.markSpillUnclean(this.runId, signal);
       }
       if (this.pendingRangeFirst !== undefined && this.pendingRangeLast !== undefined) {
         await outbox.appendRangeRecord(this.runId, this.generation, this.pendingRangeFirst, this.pendingRangeLast,
-          (identity) => { this.reservation?.outboxPending.add(identity); });
+          (identity) => { this.reservation?.outboxPending.add(identity); }, signal);
         this.pendingRangeFirst = undefined;
         this.pendingRangeLast = undefined;
       }
@@ -1348,13 +1348,14 @@ export class MessageBatcher {
             this.generation,
             batch.map((b) => b.msg),
             (identity) => { this.reservation?.outboxPending.add(identity); },
+            signal,
           );
         } catch (err) {
           this.buffer = batch.concat(this.buffer);
           throw err;
         }
       }
-      await outbox.clearSpillUnclean(this.runId);
+      await outbox.clearSpillUnclean(this.runId, signal);
     } catch (err) {
       this.log.warn("message batcher: spilling the tail to the outbox on close failed; it may be lost", {
         run_id: this.runId,
@@ -1380,7 +1381,7 @@ export class MessageBatcher {
       this.usage.release();
       // These messages already own their original sequence numbers. Preserve
       // them for identical replay; the held events must never enter this writer.
-      if (this.outbox && !this.outbox.isDisabled()) await this.finalSpillOnClose();
+      if (this.outbox && !this.outbox.isDisabled()) await this.finalSpillOnClose(signal);
       else if (this.buffer.length || this.pendingRangeFirst !== undefined)
         this.warnUndeliveredAtClose("candidate transport ended without a durable store");
       this.log.warn("closed with candidate transport reservation held", {
@@ -1416,7 +1417,7 @@ export class MessageBatcher {
     // clear the unclean flag once the tail is durable. Never a network drain here (the
     // api is unreachable, which is why we spilled).
     if (this.spilled) {
-      await this.finalSpillOnClose();
+      await this.finalSpillOnClose(signal);
       return;
     }
     // A tripped breaker skips the drain entirely. The 3 attempts plus 600ms of
