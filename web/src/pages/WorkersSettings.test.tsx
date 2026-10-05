@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { WorkersSettings } from "./WorkersSettings";
 import { api, type SecretMeta, type Worker } from "../lib/api";
+import { incidentFleetWorkers } from "../mocks/data/health";
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
@@ -160,6 +161,21 @@ function openAddTab() {
 function openWorkersTab() {
   fireEvent.click(screen.getByRole("tab", { name: /^Your workers/ }));
 }
+
+describe("WorkersSettings — cleanup state stays admin-only", () => {
+  it("does not render cleanup warnings even if a response includes admin fields", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [{
+      ...incidentFleetWorkers()[0], name: "owner-disk-worker", kind: "external",
+      stats_cpu_pct: 10, stats_mem_bytes: 1024, stats_mem_limit_bytes: 2048, stats_source: "cgroup",
+      stats_disk_dind_bytes: 1024, stats_disk_dind_total_bytes: 2048,
+      stats_disk_dind_inodes: 100, stats_disk_dind_total_inodes: 100,
+    }] });
+    renderPage();
+    await screen.findByText("owner-disk-worker");
+    expect(screen.getByText(/inodes 100%/)).toBeTruthy();
+    expect(screen.queryByText("cleanup pending")).toBeNull();
+  });
+});
 
 describe("WorkersSettings — always-visible worker-setup guide link (PRD #57 M2)", () => {
   it("renders the worker-setup guide link in the page header", async () => {

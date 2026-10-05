@@ -242,6 +242,18 @@ export function WorkerStatGauges({ worker }: { worker: Worker }) {
   );
 }
 
+/** Disk-only compact readout, independent of the CPU/memory sample. */
+export function WorkerDiskLine({ worker }: { worker: Worker }) {
+  const disk = diskVolumes(worker).sort((a, b) => b.pct - a.pct)[0];
+  if (!disk) return null;
+  return (
+    <span className={cx("tabular-nums text-xs text-faint", worker.status !== "online" && "opacity-50")}>
+      disk {formatBytesPair(disk.used, disk.total)}
+      {disk.inodePct != null && ` (inodes ${Math.round(disk.inodePct)}%)`}
+    </span>
+  );
+}
+
 /**
  * A compact one-liner "cpu 34% · mem 2.1/4 GiB" for denser lists. Same display-only
  * rules as the gauges: nothing until a sample exists, dimmed when offline, and the

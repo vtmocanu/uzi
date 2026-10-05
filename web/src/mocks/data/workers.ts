@@ -380,10 +380,10 @@ export const mockWorkers: Worker[] = [
 ];
 
 export const mockAdminWorkers: AdminWorker[] = [
-  { ...mockWorkers[0], owner_email: mockAdmin.email },
-  { ...mockWorkers[1], owner_email: mockAdmin.email },
-  { ...mockWorkers[2], owner_email: mockAdmin.email },
-  { ...mockWorkers[3], owner_email: mockAdmin.email },
+  { ...mockWorkers[0], owner_email: mockAdmin.email, disk_pressure_volumes: [], cleanup_pending: false },
+  { ...mockWorkers[1], owner_email: mockAdmin.email, disk_pressure_volumes: [], cleanup_pending: false },
+  { ...mockWorkers[2], owner_email: mockAdmin.email, disk_pressure_volumes: [], cleanup_pending: false },
+  { ...mockWorkers[3], owner_email: mockAdmin.email, disk_pressure_volumes: [], cleanup_pending: false },
   {
     // A cap-2 worker running both slots → "2/2 runs" badge demo (PRD #42), and a
     // near-limit cgroup sample → danger-tone CPU + memory bars (≥95%).
@@ -425,5 +425,7 @@ export const mockAdminWorkers: AdminWorker[] = [
     anthropic_bind_mode: "default",
     draining_since: null,
     owner_email: "mira@uzi.local",
+    disk_pressure_volumes: [],
+    cleanup_pending: false,
   },
 ];

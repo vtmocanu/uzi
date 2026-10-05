@@ -403,7 +403,30 @@ async function fleetRow(name: string): Promise<HTMLElement> {
 }
 
 describe("AdminHealth — Fleet card (M5)", () => {
-  it("own card with a sentence-case header and the seven columns, no Kind or Since", async () => {
+  it.each([
+    { name: "DinD-only sample", pending: true, sample: true, ephemeral: false },
+    { name: "operation without a sample", pending: true, sample: false, ephemeral: false },
+    { name: "ephemeral pressure report", pending: true, sample: true, ephemeral: true },
+    { name: "clear worker", pending: false, sample: true, ephemeral: false },
+    { name: "clear worker without a sample", pending: false, sample: false, ephemeral: false },
+  ])("disk cleanup: $name", async ({ pending, sample, ephemeral }) => {
+    await renderHealth(healthySilentDoc(), [fleetWorker({
+      name: "disk-worker", ephemeral, cleanup_pending: pending,
+      disk_pressure_volumes: pending && sample ? ["dind"] : [],
+      stats_disk_dind_bytes: sample ? 1024 : null,
+      stats_disk_dind_total_bytes: sample ? 2048 : null,
+      stats_disk_dind_inodes: sample ? 100 : null,
+      stats_disk_dind_total_inodes: sample ? 100 : null,
+    })]);
+    const row = await fleetRow("disk-worker");
+    const badge = within(row).queryByText("cleanup pending");
+    expect(Boolean(badge)).toBe(pending);
+    if (pending) expect(badge?.getAttribute("title")).toBe("Docker disk cleanup is pending. Existing runs may finish before cleanup; some workers report pressure only.");
+    expect(Boolean(within(row).queryByText(/disk 1\/2 KiB \(inodes 100%\)/))).toBe(sample);
+    expect(within(row).queryByText(/cpu .*mem/)).toBeNull();
+  });
+
+  it("own card with a sentence-case header and the eight columns, no Kind or Since", async () => {
     await renderHealth(healthySilentDoc(), [fleetWorker({ id: "w-1", name: "base.l-aaaa" })]);
     const card = fleetCard();
     expect(within(card).getByRole("heading", { name: "Fleet, all users" })).toBeTruthy();
@@ -412,7 +435,7 @@ describe("AdminHealth — Fleet card (M5)", () => {
     const headers = within(card)
       .getAllByRole("columnheader")
       .map((th) => th.textContent);
-    expect(headers).toEqual(["Owner", "Worker", "Status", "Version", "Upgrade", "Blocking", "Last seen"]);
+    expect(headers).toEqual(["Owner", "Worker", "Status", "Disk", "Version", "Upgrade", "Blocking", "Last seen"]);
     expect(within(card).queryByRole("columnheader", { name: "Kind" })).toBeNull();
     expect(within(card).queryByRole("columnheader", { name: "Since" })).toBeNull();
   });
@@ -485,6 +508,7 @@ describe("AdminHealth — Fleet card (M5)", () => {
     expect(table.getAttribute("aria-busy")).toBe("true");
     const body = table.querySelector("tbody")!;
     expect(body.querySelectorAll("tr").length).toBe(3);
+    expect(body.querySelectorAll("td").length).toBe(24);
     expect(body.textContent).toBe("");
     // The retired visible copy (with its ellipsis) is gone; a visually hidden caption without
     // the ellipsis is what a screen reader announces instead. Exact-string matches, so the
@@ -503,7 +527,7 @@ describe("AdminHealth — Fleet card (M5)", () => {
 
   it("empty fleet keeps its text", async () => {
     await renderHealth(healthySilentDoc(), []);
-    expect(await within(fleetCard()).findByText("No workers across any user.")).toBeTruthy();
+    expect((await within(fleetCard()).findByText("No workers across any user.")).getAttribute("colspan")).toBe("8");
     expect(within(fleetCard()).getByRole("table").getAttribute("aria-busy")).toBe("false");
   });
 

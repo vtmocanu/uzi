@@ -2384,6 +2384,8 @@ export type BindMode = "default" | "pinned" | "auto";
 
 export interface AdminWorker extends Worker {
   owner_email: string;
+  disk_pressure_volumes: string[];
+  cleanup_pending: boolean;
 }
 
 /**

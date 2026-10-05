@@ -30,6 +30,7 @@ import { SEV, SeverityBadge, SeverityShape, sevOf, type Sev } from "../component
 import { ChevronRightIcon } from "../components/icons";
 import { likelyCause, upgradePresentation } from "../components/WorkerUpgradeBadge";
 import { Badge, Button, Card, SectionTitle, Skeleton, cx } from "../components/ui";
+import { AdminWorkerResources } from "../components/AdminWorkerResources";
 import { api, type AdminWorker, type HealthCheck, type HealthDoc } from "../lib/api";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail } from "../lib/demoMask";
@@ -486,7 +487,7 @@ function CheckLine({ check }: { check: HealthCheck }) {
 // GET /api/admin/workers, which carries roll health, and shares the Workers page's upgrade
 // words (upgradePresentation) and blocking cause (likelyCause), so the two pages cannot drift.
 // Its own best-effort poll keeps the last-good rows on a failed fetch.
-const FLEET_COLUMNS = ["Owner", "Worker", "Status", "Version", "Upgrade", "Blocking", "Last seen"];
+const FLEET_COLUMNS = ["Owner", "Worker", "Status", "Disk", "Version", "Upgrade", "Blocking", "Last seen"];
 const SKELETON_ROWS = 3;
 
 function FleetCard() {
@@ -575,6 +576,9 @@ function FleetRow({ worker: w, demo }: { worker: AdminWorker; demo: boolean }) {
         <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
           {w.status}
         </Badge>
+      </td>
+      <td className="px-4 py-3">
+        <AdminWorkerResources worker={w} diskOnly />
       </td>
       <td className="px-4 py-3 font-mono">{w.version ?? "—"}</td>
       <td className="px-4 py-3">

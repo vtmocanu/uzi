@@ -5,6 +5,7 @@ import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { RunRow, RunsHistory, RunsLayout, RunsList, sortPast } from "./RunsList";
 import { api, type RunListItem, type SecretMeta, type CostStatus } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
+import { healthyFleetWorkers } from "../mocks/data/health";
 
 // Keep the real module (isTerminalRun etc.) and mock only the network + auth so the
 // list renders offline. A non-admin viewer skips the admin fetches.
@@ -194,6 +195,7 @@ describe("RunsList — the admin fleet list carries no format characters (#124)"
       workers: [
         {
           id: "w1", name: "prod\u202Ebox\u200B", status: "online", owner_email: "someone@else.test",
+          disk_pressure_volumes: [], cleanup_pending: false,
           kind: "external", hosted_size: null, busy: false, active_runs: 0, max_concurrent_runs: null,
           template_declared: null, template_reported: null, version: null, last_heartbeat_at: null,
           created_at: "2026-01-01T00:00:00Z",
@@ -223,6 +225,7 @@ describe("RunsList — the admin fleet list surfaces the cordon badge (PRD #496)
     kind: "hosted", hosted_size: null, busy: false, active_runs: 0, max_concurrent_runs: null,
     template_declared: null, template_reported: null, version: null, last_heartbeat_at: null,
     created_at: "2026-01-01T00:00:00Z", draining_since: null,
+    disk_pressure_volumes: [], cleanup_pending: false,
     ...over,
   });
 
@@ -299,6 +302,47 @@ describe("RunsList — the admin fleet list surfaces the cordon badge (PRD #496)
     renderRuns();
     await waitFor(() => expect(screen.getByText("someone@else.test")).toBeTruthy());
     expect(screen.queryByText(/pending outcome/)).toBeNull();
+  });
+});
+
+describe("RunsList — admin Docker disk cleanup", () => {
+  it.each([
+    { name: "DinD-only sample", pending: true, sample: true, ephemeral: false },
+    { name: "operation without a sample", pending: true, sample: false, ephemeral: false },
+    { name: "ephemeral pressure report", pending: true, sample: true, ephemeral: true },
+    { name: "clear worker", pending: false, sample: true, ephemeral: false },
+    { name: "clear worker without a sample", pending: false, sample: false, ephemeral: false },
+  ])("$name", async ({ pending, sample, ephemeral }) => {
+    vi.mocked(useAuth).mockReturnValue({ user: { is_admin: true }, vaultUnlocked: true } as unknown as ReturnType<typeof useAuth>);
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({ workers: [{
+      ...healthyFleetWorkers()[0], owner_email: "disk@uzi.test", ephemeral,
+      cleanup_pending: pending, disk_pressure_volumes: pending && sample ? ["dind"] : [],
+      stats_disk_dind_bytes: sample ? 1024 : null,
+      stats_disk_dind_total_bytes: sample ? 2048 : null,
+      stats_disk_dind_inodes: sample ? 100 : null,
+      stats_disk_dind_total_inodes: sample ? 100 : null,
+    }] });
+    renderRuns();
+    await screen.findByText("disk@uzi.test");
+    const badge = screen.queryByText("cleanup pending");
+    expect(Boolean(badge)).toBe(pending);
+    if (pending) expect(badge?.getAttribute("title")).toBe("Docker disk cleanup is pending. Existing runs may finish before cleanup; some workers report pressure only.");
+    expect(Boolean(screen.queryByText(/disk 1\/2 KiB \(inodes 100%\)/))).toBe(sample);
+    expect(screen.queryByText(/cpu .*mem/)).toBeNull();
+  });
+
+  it("keeps the cleanup warning out of the owner's runs page", async () => {
+    vi.mocked(useAuth).mockReturnValue({ user: { is_admin: false }, vaultUnlocked: true } as unknown as ReturnType<typeof useAuth>);
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({ workers: [{
+      ...healthyFleetWorkers()[0], cleanup_pending: true, disk_pressure_volumes: ["dind"],
+    }] });
+    renderRuns();
+    await screen.findByText("No runs yet");
+    expect(mockApi.adminListWorkers).not.toHaveBeenCalled();
+    expect(screen.queryByText("cleanup pending")).toBeNull();
   });
 });
 

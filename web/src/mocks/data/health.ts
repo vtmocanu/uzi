@@ -273,6 +273,8 @@ function stuckHosted(over: Partial<AdminWorker>): AdminWorker {
     anthropic_bind_mode: "default",
     draining_since: null,
     owner_email: "user.a@uzi.local",
+    disk_pressure_volumes: ["dind"],
+    cleanup_pending: true,
     ...over,
   };
 }
@@ -333,6 +335,8 @@ function healthyHosted(over: Partial<AdminWorker>): AdminWorker {
     anthropic_bind_mode: "default",
     draining_since: null,
     owner_email: "user.a@uzi.local",
+    disk_pressure_volumes: [],
+    cleanup_pending: false,
     ...over,
   };
 }

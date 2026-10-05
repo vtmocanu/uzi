@@ -494,8 +494,10 @@ void _buildInfoFull;
 }
 
 // ── AdminWorker (M2) ────────────────────────────────────────────────────────
-// AdminWorker extends Worker + owner_email; the embedded WorkerDTO fields marshal inline,
-// so full.json carries the Worker keys AND owner_email. Same capabilities exemption, the same
+// AdminWorker extends Worker with owner and disk cleanup state; WorkerDTO fields marshal inline,
+// so full.json carries Worker keys, owner_email, disk_pressure_volumes and cleanup_pending.
+// Pressure volumes are always an array, including zero.json: no ZeroOf exemption.
+// Same capabilities exemption, the same
 // reported_runs exemption (PRD #1390 M2c, inherited from Worker), and the same inherited
 // worker.docker null, now reconciled in M4 (docker?: boolean | null) — no directive.
 {
@@ -1344,6 +1346,17 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // nil-slice null in zero.json.
   { stem: "product_skills", nullable: true },
 ];
+
+describe("admin worker cleanup contract", () => {
+  it("keeps required cleanup state admin-only and pressure volumes non-null at zero", () => {
+    expect(adminWorkerZero.disk_pressure_volumes).toEqual([]);
+    expect(adminWorkerZero.cleanup_pending).toBe(false);
+    expect(adminWorkerFull.disk_pressure_volumes).toEqual(["x"]);
+    expect(adminWorkerFull.cleanup_pending).toBe(true);
+    expect(workerFull).not.toHaveProperty("disk_pressure_volumes");
+    expect(workerFull).not.toHaveProperty("cleanup_pending");
+  });
+});
 
 describe("api-contract fixtures are present and discriminating", () => {
   for (const { stem, nullable } of dtos) {
