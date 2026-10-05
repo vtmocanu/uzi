@@ -156,7 +156,7 @@ Acceptance examples (counts are from the `demo.go` seed this PRD adds, which mir
 - **Severity glyphs** are shown on every item, so severity survives without colour: `✕` danger, a state-specific glyph (`⚑`, `◷`, `⇡`, `◐`, `◌`, `↑`) or else `▲` warn, `·` info. `!` is not used: the floor already uses it for `awaiting`. "N need attention" counts workers with at least one danger or warn item (D11).
 - **Ordering.** Rows sort by worst severity (danger, warn, info, none), then name. The cursor is tracked by worker `ID`, so a poll that reorders rows keeps the selection, and `esc` from detail restores by ID. A worker that disappeared from the list selects the row at its old index.
 - **Occupancy.** Run slots render as `ActiveRuns/MaxConcurrentRuns`, with `?` for a null cap, never `0`. The summary reports occupancy ("N/M slots in use" over online workers, plus an unknown-cap count), never schedulable capacity. Holding, draining and cordoned counts are listed separately (D8).
-- **Phase and stage.** `ReportedRuns[i].Phase` (closed enum `running | awaiting_approval | awaiting_input | awaiting_followup`) is the worker's phase. The run's own status and stage come from the board cache and are labelled separately, falling back to the run id when the run is not cached (D9).
+- **Phase and stage.** `ReportedRuns[i].Phase` (closed enum `running | awaiting_approval | awaiting_input | awaiting_followup`) is the worker's phase. The run's stage comes from the board cache, shown as `run stage`, and the run id stands in when the run is not cached (D9).
 
 ### Rendering (`tui_workers.go`)
 

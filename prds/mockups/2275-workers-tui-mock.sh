@@ -244,7 +244,9 @@ list_row() { local k=$1 i=$2 active=$3 pre=" " line s
     local d="" t=" "; [ "${STALE[$i]}" = 1 ] && { d=$F; t="~"; }
     local cpu; if [ "${CPU[$i]}" = "?" ]; then cpu="    ?"; else cpu=$(printf '%s%3d%%' "$t" "${CPU[$i]}"); fi
     local disk; if [ "${DISKP[$i]}" -lt 0 ]; then disk="$(pad '?' 19)"
-      else disk="$(pad "${t# }${DISKL[$i]}" 8) $(bar "${DISKP[$i]}" 4) $(pctcol "${DISKP[$i]}")$(pad "${DISKP[$i]}%" 5)${R}"; fi
+      # 19 cells: [~]label(8) bar(4) pct; the stale ~ takes a cell from the percentage pad,
+      # never from the label
+      else local lead="${t# }"; disk="$(pad "${lead}${DISKL[$i]}" $((8 + ${#lead}))) $(bar "${DISKP[$i]}" 4) $(pctcol "${DISKP[$i]}")$(pad "${DISKP[$i]}%" $((5 - ${#lead})))${R}"; fi
     # version marker: ↑ outdated, ✕ upgrade failed (glyph + colour)
     local vm=" "; case "${UPG[$i]}" in outdated) vm="↑";; failed) vm="✕";; esac
     local ver; ver=$(pad "${VER[$i]}$vm" $VW); case "${UPG[$i]}" in outdated) ver="${STALL}${ver}${R}";; failed) ver="${RED}${ver}${R}";; esac
