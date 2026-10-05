@@ -197,3 +197,34 @@ test("real HTTP whitespace stream exceeds byte cap without a content-length", as
     await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
   }
 });
+
+test("custody enums reject array coercion in full and incomplete inventories", async () => {
+  const c = client();
+  c.protocolFeatures = ["terminal_rejection_report"];
+  for (const incomplete of [false, true]) {
+    const body = incomplete
+      ? { ...custody(), exact_count: 257, exact_complete: false, complete: false, outcome: "unknown",
+          exact_holds: Array.from({ length: 256 }, (_, i) => ({ id: `${i.toString(16).padStart(8, "0")}-1111-4111-8111-111111111111`, state: "released" })) }
+      : custody();
+    for (const malformed of [
+      { ...body, outcome: [body.outcome] },
+      { ...body, exact_holds: body.exact_holds.map((h, i) => i === 0 ? { ...h, state: [h.state] } : h) },
+    ]) {
+      fakeResponse(malformed);
+      await assert.rejects(c.getTerminalRejectionCustody(run, 3, worker), /invalid terminal rejection response/);
+    }
+  }
+});
+
+test("streamed responses ignore zero-byte chunks before a valid response", async () => {
+  const c = client();
+  c.protocolFeatures = ["terminal_rejection_report"];
+  globalThis.fetch = async () => new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (let i = 0; i < 1000; i++) controller.enqueue(new Uint8Array(0));
+      controller.enqueue(new TextEncoder().encode(JSON.stringify(disposition)));
+      controller.close();
+    },
+  }));
+  assert.deepEqual(await c.reportTerminalRejections(request), disposition);
+});

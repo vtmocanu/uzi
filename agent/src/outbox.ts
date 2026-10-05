@@ -211,6 +211,7 @@ interface TerminalJournalData {
 /** In-memory metadata for one pending terminal journal (the file's durable fields minus the body,
  *  which the store never needs to re-read for depth/list/retire). */
 interface TerminalMeta {
+  fileName: string;
   claimGeneration: number;
   phaseAtJournal: string;
   since: number;
@@ -648,7 +649,7 @@ export class Outbox {
         result.rejected++;
         continue; // absent/symlink/unparseable/MAC-bad (readAuthed logged)
       }
-      const meta = coerceTerminal(parsed, runId, gen);
+      const meta = coerceTerminal(parsed, runId, gen, name);
       if (!meta) {
         this.log.warn("outbox: malformed or misfiled terminal journal; skipping", { ...(terminalRunUUID(runId) ? { run_id: runId.toLowerCase() } : {}), claim_generation: gen, fact: "malformed" });
         result.rejected++;
@@ -1252,6 +1253,7 @@ export class Outbox {
         blocked: false,
       };
       const serialized = this.seal(MAC_DOMAIN_TERMINAL, record);
+      if (Buffer.byteLength(serialized) > this.terminalReadMaxBytes) return { journaled: false, reason: "reserve_exhausted" };
       const dst = path.join(dir, terminalFileName(claimGeneration));
       let adopted: boolean;
       try {
@@ -1287,7 +1289,7 @@ export class Outbox {
       }
       if (adopted) {
         const existing = await this.readTerminalAuthed(runId, claimGeneration);
-        const meta = existing && coerceTerminal(existing, runId, claimGeneration);
+        const meta = existing && coerceTerminal(existing, runId, claimGeneration, this.runs.get(runId)?.terminals.get(claimGeneration)?.fileName);
         if (!meta) return { journaled: false, reason: "reserve_exhausted" };
         this.ensureInMemoryRun(runId, meta.since).terminals.set(claimGeneration, meta);
       }
@@ -1296,6 +1298,7 @@ export class Outbox {
       const rs = this.ensureInMemoryRun(runId, since);
       if (!rs.terminals.has(claimGeneration)) {
         rs.terminals.set(claimGeneration, {
+          fileName: terminalFileName(claimGeneration),
           claimGeneration,
           phaseAtJournal,
           since,
@@ -1339,7 +1342,7 @@ export class Outbox {
       if (!this.validRunId(runId)) return;
       if (!await this.readTerminalAuthed(runId, claimGeneration)) return;
       await fs
-        .rm(path.join(this.runDir(runId), terminalFileName(claimGeneration)), { force: true })
+        .rm(path.join(this.runDir(runId), this.runs.get(runId)?.terminals.get(claimGeneration)?.fileName ?? terminalFileName(claimGeneration)), { force: true })
         .catch(() => undefined);
       this.runs.get(runId)?.terminals.delete(claimGeneration);
     });
@@ -1359,7 +1362,7 @@ export class Outbox {
       if (!rs || !rs.terminals.has(claimGeneration)) return;
       if (!await this.readTerminalAuthed(runId, claimGeneration)) return;
       await fs
-        .rm(path.join(this.runDir(runId), terminalFileName(claimGeneration)), { force: true })
+        .rm(path.join(this.runDir(runId), rs.terminals.get(claimGeneration)!.fileName), { force: true })
         .catch(() => undefined);
       rs.terminals.delete(claimGeneration);
       // Reuse the message path's staleRetired mechanism (D11): a durable, monotone per-run count.
@@ -1382,7 +1385,7 @@ export class Outbox {
       const rs = this.runs.get(runId);
       const meta = rs?.terminals.get(claimGeneration);
       if (!rs || !meta) return;
-      const dst = path.join(this.runDir(runId), terminalFileName(claimGeneration));
+      const dst = path.join(this.runDir(runId), meta.fileName);
       const parsed = await this.readTerminalAuthed(runId, claimGeneration);
       if (parsed) {
         const next = { ...parsed, blocked: true, blocked_reason: reason };
@@ -1817,9 +1820,8 @@ export class Outbox {
     return (await this.inspectTerminal(runId, generation, fileName)).observation;
   }
 
-  private async readTerminalAuthed(runId: string, generation: number, fileName = terminalFileName(generation)): Promise<Record<string, unknown> | null> {
+  private async readTerminalAuthed(runId: string, generation: number, fileName = this.runs.get(runId)?.terminals.get(generation)?.fileName ?? terminalFileName(generation)): Promise<Record<string, unknown> | null> {
     const result = await this.inspectTerminal(runId, generation, fileName);
-    if (!result.record) this.runs.get(runId)?.terminals.delete(generation);
     return result.record ?? null;
   }
 
@@ -1868,6 +1870,8 @@ export class Outbox {
       delete obj.mac;
       if (!macEqual(mac, this.computeMac(MAC_DOMAIN_TERMINAL, obj))) {
         observation.kind = "mac_failure";
+        // Only the selected authenticated filename loses trust; sibling aliases and unknown reads preserve retry eligibility.
+        if (this.runs.get(runId)?.terminals.get(generation)?.fileName === fileName) this.runs.get(runId)?.terminals.delete(generation);
         if (terminalRunUUID(runId)) this.log.warn("outbox: terminal authentication rejected", { run_id: runId.toLowerCase(), claim_generation: generation, fact: "mac_failure" });
         return result;
       }
@@ -1888,19 +1892,47 @@ export class Outbox {
    * A directory read failure conservatively protects it, independent of authenticated counts. */
   async hasPhysicalTerminalProtection(runId: string): Promise<boolean> {
     if (!this.validRunId(runId)) return true;
-    let dir: Dir | undefined;
-    try {
-      if (!await this.terminalDirectorySafe(runId)) return true;
-      dir = await fs.opendir(this.runDir(runId));
-      for await (const entry of dir) {
-        if (entry.name.startsWith(TERMINAL_FILE_PREFIX)) return true;
+    let inspected = 0;
+    // One shared budget bounds both the source directory and UUID case-alias discovery.
+    // Any failure or exhausted budget protects the source and stops this check.
+    const protects = async (physicalRunId: string): Promise<boolean> => {
+      try {
+        if (!await this.terminalDirectorySafe(physicalRunId)) return true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw err;
       }
-      dir = undefined; // for-await closes the directory, including early return.
-      return false;
+      const dir = await fs.opendir(this.runDir(physicalRunId));
+      try {
+        while (inspected < 256) {
+          const entry = await dir.read();
+          if (!entry) return false;
+          inspected++;
+          if (entry.name.startsWith(TERMINAL_FILE_PREFIX)) return true;
+        }
+        return true;
+      } finally {
+        await dir.close();
+      }
+    };
+    try {
+      if (await protects(runId)) return true;
+      if (!terminalRunUUID(runId)) return false;
+      const root = await fs.opendir(this.root);
+      try {
+        while (inspected < 256) {
+          const entry = await root.read();
+          if (!entry) return false;
+          inspected++;
+          if (entry.name !== runId && terminalRunUUID(entry.name) && entry.name.toLowerCase() === runId.toLowerCase() &&
+              await protects(entry.name)) return true;
+        }
+        return true;
+      } finally {
+        await root.close();
+      }
     } catch (err) {
       return (err as NodeJS.ErrnoException).code !== "ENOENT";
-    } finally {
-      if (dir) await dir.close().catch(() => undefined);
     }
   }
 
@@ -2386,7 +2418,7 @@ const TERMINAL_BLOCKED_REASONS: ReadonlySet<string> = new Set<TerminalBlockedRea
  *  already gated integrity in readAuthed). Binds the embedded `run_id` to the directory and the
  *  embedded `claim_generation` to the filename, so a copied/misfiled journal is skipped. Returns
  *  null on any mismatch. */
-function coerceTerminal(obj: Record<string, unknown>, runId: string, fileGen: number): TerminalMeta | null {
+function coerceTerminal(obj: Record<string, unknown>, runId: string, fileGen: number, fileName = terminalFileName(fileGen)): TerminalMeta | null {
   if (obj.version !== 1) return null;
   if (obj.run_id !== runId) return null;
   if (typeof obj.claim_generation !== "number" || obj.claim_generation !== fileGen) return null;
@@ -2398,6 +2430,7 @@ function coerceTerminal(obj: Record<string, unknown>, runId: string, fileGen: nu
     blockedReason = obj.blocked_reason as TerminalBlockedReason;
   }
   return {
+    fileName,
     claimGeneration: obj.claim_generation,
     phaseAtJournal: obj.phase_at_journal,
     since: obj.since,

@@ -185,6 +185,17 @@ test("generic bare run names retain message and journal contracts without becomi
   assert.ok(await fs.stat(path.join(root, "fixture-run", "terminal-3.json")));
 });
 
+test("absent physical directories allow ordinary cleanup while UUID case aliases remain protected", async () => {
+  const { box, root } = await fixture();
+  const absent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  assert.equal(await box.hasPhysicalTerminalProtection(absent), false);
+  await fs.mkdir(path.join(root, absent.toUpperCase()));
+  await fs.copyFile(path.join(root, run, "terminal-3.json"), path.join(root, absent.toUpperCase(), "terminal-3.json"));
+  assert.equal(await box.hasPhysicalTerminalProtection(absent), true);
+  await fs.rm(root, { recursive: true, force: true });
+  assert.equal(await box.hasPhysicalTerminalProtection(run), false);
+});
+
 test("symlinked run containment prevents observation and recursive deletion", async () => {
   const { box, root } = await fixture();
   const original = path.join(root, run);
@@ -196,4 +207,92 @@ test("symlinked run containment prevents observation and recursive deletion", as
   await box.retireRun(run);
   assert.ok(await fs.lstat(original));
   assert.ok(await fs.stat(path.join(moved, "terminal-3.json")));
+});
+
+test("accepted serialized journals are readable and oversized writes never claim durability", async () => {
+  const { box, root } = await fixture(1024);
+  const accepted = { status: "failed", error: "x".repeat(60 * 1024) };
+  assert.equal((await box.journalTerminal(run, 4, "implement", 0, accepted)).journaled, true);
+  assert.deepEqual((await box.readTerminalJournal(run, 4))!.body, accepted);
+  assert.deepEqual(await box.journalTerminal(run, 5, "implement", 0, { status: "failed", error: "x".repeat(1024 + OUTBOX_RANGE_RESERVE_BYTES) }),
+    { journaled: false, reason: "reserve_exhausted" });
+  assert.equal(box.hasPendingTerminal(run, 5), false);
+  await assert.rejects(fs.stat(path.join(root, run, "terminal-5.json")), { code: "ENOENT" });
+});
+
+test("temporary directory replacement preserves pending retry eligibility until file restoration", async () => {
+  const { box, file } = await fixture();
+  const saved = `${file}.saved`;
+  await fs.rename(file, saved);
+  await fs.mkdir(file);
+  assert.equal(await box.readTerminalJournal(run, 3), undefined);
+  assert.equal(box.hasPendingTerminal(run, 3), true);
+  await fs.rmdir(file);
+  await fs.rename(saved, file);
+  assert.equal((await box.readTerminalJournal(run, 3))!.body.error, "private body");
+  await box.retireTerminal(run, 3);
+  assert.equal(box.hasPendingTerminal(run, 3), false);
+});
+
+test("startup selects valid leading-zero alias; bad canonical observations preserve it and ACK removes only winner", async () => {
+  const { box, file, root, log } = await fixture();
+  const alias = path.join(root, run, "terminal-0003.json");
+  await fs.copyFile(file, alias);
+  await reject(file);
+  const restarted = new Outbox({ root, log: log.logger, runMaxBytes: 1e6, maxBytes: 1e7, retentionMs: 1 });
+  outboxes.push(restarted);
+  await restarted.init();
+  assert.equal(restarted.hasPendingTerminal(run, 3), true);
+  assert.equal((await restarted.observeTerminalAuthentication(run, 3)).kind, "mac_failure");
+  await restarted.scanTerminalObservationsPage();
+  assert.equal(restarted.hasPendingTerminal(run, 3), true);
+  assert.equal((await restarted.readTerminalJournal(run, 3))!.body.error, "private body");
+  await restarted.markTerminalBlocked(run, 3, "gap_unrecoverable");
+  assert.equal((await restarted.readTerminalJournal(run, 3))!.blocked, true);
+  await restarted.retireTerminal(run, 3);
+  await assert.rejects(fs.stat(alias), { code: "ENOENT" });
+  assert.ok(await fs.stat(file));
+  // The original selected canonical winner must lose trust when scan confirms its rejection.
+  await box.scanTerminalObservationsPage();
+  assert.equal(box.hasPendingTerminal(run, 3), false);
+});
+
+test("physical protection fails closed after 256 junk entries and preserves UUID case aliases", async () => {
+  const { box, file, root } = await fixture();
+  await fs.unlink(file);
+  for (let n = 0; n < 257; n++) await fs.writeFile(path.join(root, run, `junk-${n}`), "");
+  assert.equal(await box.hasPhysicalTerminalProtection(run), true);
+  await box.retireRun(run);
+  assert.ok(await fs.stat(path.join(root, run, "junk-256")));
+  const lower = "abcdefab-1111-4111-8111-111111111111";
+  const mixed = "ABCDefab-1111-4111-8111-111111111111";
+  await box.journalTerminal(lower, 3, "implement", 0, { status: "failed" });
+  await fs.unlink(path.join(root, lower, "terminal-3.json"));
+  await box.journalTerminal(mixed, 3, "implement", 0, { status: "failed" });
+  assert.equal(await box.hasPhysicalTerminalProtection(lower), true);
+  await box.retireRun(lower);
+  assert.ok(await fs.stat(path.join(root, mixed, "terminal-3.json")));
+});
+
+test("rejected cleanup directory fsync failure propagates without claiming durable completion", async () => {
+  const { box, file, root } = await fixture();
+  await reject(file);
+  const alias = path.join(root, run, "terminal-003.json");
+  await fs.copyFile(file, alias);
+  const observations = [await box.observeTerminalAuthentication(run, 3), await box.observeTerminalAuthentication(run, 3, "terminal-003.json")];
+  const seam = box as unknown as { fsyncDir(dir: string, strict?: boolean): Promise<void> };
+  const original = seam.fsyncDir;
+  let calls = 0;
+  seam.fsyncDir = async (_dir, strict) => { calls++; assert.equal(strict, true); throw new Error("injected directory fsync failure"); };
+  try {
+    await assert.rejects(box.cleanupRejectedTerminalFiles(run, 3, worker, observations, async () => settled()), /injected directory fsync failure/);
+    assert.equal(calls, 1);
+    assert.ok(await fs.stat(alias));
+    assert.equal(await box.cleanupRejectedTerminalFiles(run, 3, worker, observations, async () => settled()), 0);
+    assert.equal(await box.cleanupRejectedTerminalFiles(run, 3, worker, [observations[1]!], async () => ({ ...settled(), complete: false })), 0);
+    assert.equal(calls, 1);
+    assert.ok(await fs.stat(alias));
+  } finally {
+    seam.fsyncDir = original;
+  }
 });

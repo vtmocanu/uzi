@@ -2615,7 +2615,7 @@ export class WorkerClient {
         !Array.isArray(obj.exact_holds) || !Array.isArray(obj.sibling_holds) ||
         !terminalGeneration(obj.exact_count) || !terminalGeneration(obj.sibling_count) ||
         typeof obj.exact_complete !== "boolean" || typeof obj.sibling_complete !== "boolean" || typeof obj.complete !== "boolean" ||
-        !["retained", "settled", "unknown"].includes(String(obj.outcome))) throw terminalResponseError();
+        (typeof obj.outcome !== "string" || !["retained", "settled", "unknown"].includes(obj.outcome))) throw terminalResponseError();
     const exactCount = obj.exact_count as number;
     const siblingCount = obj.sibling_count as number;
     if (obj.exact_holds.length !== Math.min(exactCount, 256) || obj.sibling_holds.length !== Math.min(siblingCount, 256) ||
@@ -2626,7 +2626,7 @@ export class WorkerClient {
     let closed = true;
     for (const value of obj.exact_holds) {
       const hold = terminalObject(value);
-      if (!terminalUUID(hold.id) || ids.has(hold.id.toLowerCase()) || !["open", "released", "discarded"].includes(String(hold.state))) throw terminalResponseError();
+      if (!terminalUUID(hold.id) || ids.has(hold.id.toLowerCase()) || (typeof hold.state !== "string" || !["open", "released", "discarded"].includes(hold.state))) throw terminalResponseError();
       ids.add(hold.id.toLowerCase());
       open ||= hold.state === "open";
       closed &&= hold.state === "released" || hold.state === "discarded";
@@ -3028,6 +3028,7 @@ async function readTerminalRejectionBody(res: Response, signal: AbortSignal): Pr
       const { done, value } = await reader.read();
       signal.throwIfAborted();
       if (done) break;
+      if (!value.byteLength) continue;
       if (value.byteLength > TERMINAL_REJECTION_RESPONSE_MAX_BYTES - total) throw terminalResponseError();
       total += value.byteLength;
       parts.push(value);
