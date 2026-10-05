@@ -57,10 +57,9 @@ export const MAX_TOOL_NAME_BYTES = 256;
 // Output cap. A shell effect's stdout/stderr is bounded (as plain TEXT) before it
 // reaches the model so a large effect cannot balloon a callback result. HYGIENE bound,
 // not a redaction guarantee — the screener already denies a secret READ, so an ALLOWED
-// effect's output is the model's own legitimate result. A file READ has NO broker-level
-// cap: the fileop helper already bounds it to its own maxRead (1 MB) and returns valid
-// base64, which dispatchFileRead forwards verbatim (re-capping encoded base64 in the
-// broker would corrupt it — see dispatchFileRead).
+// effect's output is the model's own legitimate result. File reads retain the helper's
+// 1 MiB body bound; text excerpts also have a 64 KiB UTF-8 bound to fit nested JSON
+// replies. Binary base64 is forwarded intact, never sliced (see dispatchFileRead).
 const MAX_SHELL_OUTPUT_BYTES = 64 * 1024;
 // A tool/role/skill name echoed into a diagnostic is bounded so a long name cannot
 // bloat a denial message; the name already passed the byte cap, this is belt-and-braces.
@@ -800,26 +799,79 @@ export class CodexCallbackBroker {
     const candidate = firstStrField(args, ["path", "file_path"]);
     if (candidate === undefined) return deny("bad_args", "a file read requires a string 'path'");
 
+    const fields = asObject(args)!;
+    const explicitRange = Object.hasOwn(fields, "offset") || Object.hasOwn(fields, "limit");
+    const offset = Object.hasOwn(fields, "offset") ? fields.offset : 1;
+    const limit = Object.hasOwn(fields, "limit") ? fields.limit : 200;
+    if (
+      typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 1 ||
+      typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > 2000
+    ) {
+      return deny("bad_args", "a file read requires a positive safe integer offset and a limit from 1 to 2000");
+    }
+
     const screened = this.screenAndRelativize(candidate);
     if ("ok" in screened) return screened;
 
     const res = await this.fileop.op({ op: "read", path: screened.rel });
     if (!res.ok) return this.mapFileopError(res);
-    // FORWARD the helper's base64 body VERBATIM and PROPAGATE its `truncated` flag.
-    // Decision (forward-verbatim, no broker-level re-cap): the fileop helper already
-    // bounds a read to its own maxRead (1 MB) and returns VALID base64, so a second
-    // broker cap buys nothing. Running boundedString on the ENCODED text would cut it
-    // at a raw-byte boundary that is not a 4-char base64 quantum, producing
-    // non-decodable garbage and silently dropping the helper's truncation signal — the
-    // exact corruption this replaces. A smaller broker cap, were one ever needed, would
-    // have to DECODE -> slice the raw bytes -> RE-ENCODE (never truncate the text); it
-    // is not needed here, so the helper's bound stands.
+    const maxReadBytes = 1024 * 1024;
+    const malformed = (): CallbackResult => this.mapFileopError({ ok: false, code: "E_MALFORMED" });
+    const oversized = (): CallbackResult => this.mapFileopError({ ok: false, code: "E_OVERSIZE" });
+    // Validate in this order: encoded bounds precede decoding; decoded bounds precede metadata.
+    if (typeof res.data !== "string") return malformed();
+    if (res.data.length > 4 * Math.ceil(maxReadBytes / 3)) return oversized();
+    if (res.data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(res.data)) return malformed();
+    const bytes = Buffer.from(res.data, "base64");
+    if (bytes.toString("base64") !== res.data) return malformed();
+    if (bytes.length > maxReadBytes) return oversized();
+    if (
+      typeof res.size !== "number" || !Number.isSafeInteger(res.size) || res.size < 0 ||
+      res.size > maxReadBytes || (res.truncated === true ? res.size < bytes.length : res.size !== bytes.length)
+    ) {
+      return malformed();
+    }
+
+    const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+    let text: string | undefined;
+    try {
+      text = decoder.decode(bytes);
+    } catch {
+      // Invalid UTF-8 is binary, just like a NUL-containing valid UTF-8 body.
+    }
+    if (text === undefined || text.includes("\u0000")) {
+      if (explicitRange) return deny("bad_args", "line ranges require a text file");
+      return { ok: true, output: { size: res.size, contentBase64: res.data, truncated: res.truncated === true } };
+    }
+
+    // LF ends a logical line, including its delimiter. Scan at most the validated 1 MiB
+    // body; there is no phantom line after a final LF. A range never changes the helper read.
+    const lineEnds: number[] = [];
+    for (let i = 0; i < bytes.length; i++) {
+      if (bytes[i] === 10) lineEnds.push(i + 1);
+    }
+    if (bytes.length > 0 && lineEnds.at(-1) !== bytes.length) lineEnds.push(bytes.length);
+    const first = offset - 1;
+    const start = first < lineEnds.length ? (first === 0 ? 0 : lineEnds[first - 1]!) : bytes.length;
+    const selectedEnd = first < lineEnds.length ? lineEnds[Math.min(first + limit, lineEnds.length) - 1]! : start;
+    let end = Math.min(selectedEnd, start + 64 * 1024);
+    // Retreat at most three UTF-8 continuation bytes to preserve a complete code point.
+    while (end > start && end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end--;
+    let linesReturned = 0;
+    let partialLastLine = false;
+    for (let i = first; i < lineEnds.length && (i === 0 ? 0 : lineEnds[i - 1]!) < end; i++) {
+      linesReturned++;
+      partialLastLine = end < lineEnds[i]!;
+    }
     return {
       ok: true,
       output: {
         size: res.size,
-        contentBase64: typeof res.data === "string" ? res.data : undefined,
-        truncated: res.truncated === true,
+        content: decoder.decode(bytes.subarray(start, end)),
+        offset,
+        linesReturned,
+        partialLastLine,
+        truncated: res.truncated === true || end < bytes.length,
       },
     };
   }

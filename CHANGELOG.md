@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Codex Read returns bounded text excerpts ([#296](https://github.com/vtmocanu/uzi/issues/296)).**
+  Text reads support one-based line offsets and limits, default to 200 lines, and return at most 64 KiB with excerpt metadata; unranged binary reads preserve exact base64, while malformed or oversized helper responses fail with neutral denials.
+
 - **Codex's documented execution boundary explicitly accepts async messages and UTC clock reads ([#1566](https://github.com/vtmocanu/uzi/issues/1566)).**
   The ADR records the pinned 0.159.3 runtime's immediate async acceptance and successful read-only clock calls, with no worker effects, across root start, resume, child and advice characterization; async text can still contaminate advice, filtering remains deferred, and the underlying clock-provider path remains unverified. This is documentation of accepted exceptions, not a runtime suppression or security fix.
 

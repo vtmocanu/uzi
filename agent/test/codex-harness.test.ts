@@ -1,4 +1,6 @@
 import { describe, it } from "node:test";
+import { PassThrough } from "node:stream";
+import { createCodexTransport } from "../src/codex/transport.js";
 import assert from "node:assert/strict";
 
 import {
@@ -1166,6 +1168,86 @@ describe("CodexHarness: notifications are bound to the active (thread, turn)", (
       ["initialized", "activity", "turn_finished"],
     );
   });
+});
+
+describe("CodexHarness: bounded Read transport serialization (#296)", () => {
+  for (const { name, raw, args, expected, offset, lines, partial, truncated } of [
+    { name: "middle excerpt", raw: "a\nb\nc\n", args: { file_path: "src/x.ts", offset: 2, limit: 1 }, expected: "b\n", offset: 2, lines: 1, partial: false, truncated: true },
+    { name: "near 1 MiB U+0001", raw: "\u0001".repeat(1024 * 1024 - 2), args: { path: "src/x.ts" }, expected: "\u0001".repeat(64 * 1024), offset: 1, lines: 1, partial: true, truncated: true },
+    { name: "near 1 MiB quotes and backslashes", raw: '"\\'.repeat((1024 * 1024 - 2) / 2), args: { path: "src/x.ts" }, expected: '"\\'.repeat(32 * 1024), offset: 1, lines: 1, partial: true, truncated: true },
+  ]) {
+    it("delivers and settles " + name + " through emitted transport frames", async () => {
+      const inbound = new PassThrough();
+      const outbound = new PassThrough();
+      const transport = createCodexTransport({ inbound, outbound });
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+      const request = makeRequest();
+      let calls = 0;
+      const broker = new CodexCallbackBroker({
+        registry,
+        spawnCommand: async () => ({ code: 0, stdout: "", stderr: "" }),
+        fileop: { op: async () => { calls++; return { ok: true, size: Buffer.byteLength(raw), data: Buffer.from(raw).toString("base64") }; } },
+        worktreePath: WORKSPACE,
+        grants: renderCodexRun(request).leadGrants,
+        delegate: async () => ({ ok: false, code: "x", message: "no" }),
+        allowedRoles: new Set<string>(),
+      });
+      const replies: { frame: Record<string, unknown>; bytes: number }[] = [];
+      const write = (frame: unknown): void => { inbound.write(JSON.stringify(frame) + "\n"); };
+      let buffered = "";
+      outbound.setEncoding("utf8");
+      outbound.on("data", (chunk: string) => {
+        buffered += chunk;
+        let nl = buffered.indexOf("\n");
+        while (nl !== -1) {
+          const line = buffered.slice(0, nl);
+          buffered = buffered.slice(nl + 1);
+          const frame = rec(JSON.parse(line));
+          if (typeof frame.method === "string" && frame.id !== undefined) {
+            write({ id: frame.id, result: defaultResponder(frame.method) });
+            if (frame.method === "turn/start") {
+              write({ method: "thread/started", params: { thread: { id: "th-1" } } });
+              write({ id: 296, method: "item/tool/call", params: { threadId: "th-1", turnId: "tn-1", callId: "read-296", tool: "uzi_read", arguments: args } });
+            }
+          } else if (frame.id === 296) {
+            replies.push({ frame, bytes: Buffer.byteLength(line) + 1 });
+            // Complete only once the real response has arrived at the peer.
+            write({ method: "turn/completed", params: { threadId: "th-1", turn: { id: "tn-1", status: "completed" } } });
+          }
+          nl = buffered.indexOf("\n");
+        }
+      });
+      const { harness } = makeHarness({
+        registry, broker,
+        launchRoot: async () => ({ root: fakeRoot, transport, supervisorPid: 4321 }),
+      });
+      try {
+        const events = await withTimeout(collect(harness.startTurn(request).events), 5000, "Read response delivery");
+        assert.ok(events.some(e => e.kind === "turn_finished"));
+        assert.equal(replies.length, 1);
+        assert.ok(replies[0]!.bytes < 4 * 1024 * 1024);
+        const reply = rec(replies[0]!.frame.result);
+        assert.equal(reply.success, true);
+        const items = reply.contentItems as { type: string; text: string }[];
+        assert.equal(items.length, 1);
+        assert.equal(items[0]!.type, "inputText");
+        assert.deepEqual(JSON.parse(items[0]!.text), {
+          size: Buffer.byteLength(raw), content: expected, offset, linesReturned: lines, partialLastLine: partial, truncated,
+        });
+        assert.equal(calls, 1);
+        assert.equal(registry.inFlightCallbackCount(), 0);
+        assert.equal(registry.isPoisoned(), false);
+        const replay = await broker.handleToolCall({ threadId: "th-1", turnId: "tn-1", callId: "read-296" }, "uzi_read", args, "root");
+        assert.equal(replay.ok, true);
+        if (replay.ok) assert.deepEqual(replay.output, { replay: true });
+        assert.equal(calls, 1);
+      } finally {
+        transport.close();
+        inbound.destroy();
+        outbound.destroy();
+      }
+    });
+  }
 });
 
 describe("CodexHarness: server→client tool-call routing", () => {

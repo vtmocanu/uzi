@@ -49,9 +49,14 @@ function definition(name: string): Omit<CodexDynamicToolSpec, "type" | "name"> {
       };
     case "Read":
       return {
-        description: "Read one file inside the current worktree through the worker-owned no-symlink file boundary.",
+        description: "Read text lines through the worker-owned no-symlink boundary inside the current worktree (offset defaults to 1, limit to 200; at most 64 KiB). Unranged binary reads return exact base64. Files over 1 MiB are denied.",
         inputSchema: {
-          ...objectSchema({ path: STRING, file_path: STRING }, [], false),
+          ...objectSchema({
+            path: STRING,
+            file_path: STRING,
+            offset: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER, default: 1 },
+            limit: { type: "integer", minimum: 1, maximum: 2000, default: 200 },
+          }, [], false),
           anyOf: [{ required: ["path"] }, { required: ["file_path"] }],
         },
       };

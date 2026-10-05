@@ -51,7 +51,7 @@ class FileopSpy {
   private readonly responses: readonly FileopResponse[];
   private responseIndex = 0;
 
-  constructor(response: FileopResponse | FileopResponse[] = { ok: true, size: 3 }) {
+  constructor(response: FileopResponse | FileopResponse[] = { ok: true, size: 3, data: Buffer.from("abc").toString("base64") }) {
     this.responses = Array.isArray(response) ? response : [response];
   }
   op = async (request: FileopRequest): Promise<FileopResponse> => {
@@ -256,7 +256,10 @@ describe("CodexCallbackBroker: file effects through the fileop client", () => {
     if (r.ok) {
       assert.deepEqual(r.output, {
         size: 5,
-        contentBase64: Buffer.from("hello").toString("base64"),
+        content: "hello",
+        offset: 1,
+        linesReturned: 1,
+        partialLastLine: false,
         truncated: false,
       });
     }
@@ -720,7 +723,7 @@ describe("CodexCallbackBroker: file read forwards the helper's base64 verbatim +
     // cap. The old code ran boundedString on the ENCODED text, cutting it at a raw-byte
     // boundary and appending a marker -> non-decodable garbage. Forwarding verbatim
     // must round-trip exactly.
-    const raw = Buffer.alloc(200 * 1024, 0x41);
+    const raw = Buffer.alloc(200 * 1024, 0xff);
     const b64 = raw.toString("base64");
     const fileop = new FileopSpy({ ok: true, size: raw.length, data: b64, truncated: false });
     const h = makeBroker({ fileop });
@@ -738,7 +741,7 @@ describe("CodexCallbackBroker: file read forwards the helper's base64 verbatim +
   });
 
   it("propagates truncated=true from the helper while still round-tripping", async () => {
-    const raw = Buffer.alloc(200 * 1024, 0x42);
+    const raw = Buffer.alloc(200 * 1024, 0x00);
     const b64 = raw.toString("base64");
     const fileop = new FileopSpy({ ok: true, size: raw.length, data: b64, truncated: true });
     const h = makeBroker({ fileop });
@@ -751,6 +754,123 @@ describe("CodexCallbackBroker: file read forwards the helper's base64 verbatim +
       assert.ok(Buffer.from(out.contentBase64!, "base64").equals(raw), "base64 must round-trip");
       assert.equal(out.truncated, true);
     }
+  });
+});
+
+describe("CodexCallbackBroker: bounded text Read (#296)", () => {
+  async function read(raw: string | Buffer, args: Record<string, unknown> = {}, truncated = false, size?: number) {
+    const bytes = typeof raw === "string" ? Buffer.from(raw) : raw;
+    const fileop = new FileopSpy({ ok: true, size: size ?? bytes.length, data: bytes.toString("base64"), truncated });
+    const h = makeBroker({ fileop });
+    const result = await h.broker.handleToolCall(rt(), "uzi_read", { path: "text.txt", ...args }, "root");
+    assert.equal(h.registry.inFlightCallbackCount(), 0);
+    assert.equal(h.registry.isPoisoned(), false);
+    return { result, fileop };
+  }
+
+  function output(result: CallbackResult): Record<string, unknown> {
+    assert.equal(result.ok, true);
+    if (!result.ok) assert.fail(result.message);
+    return result.output as Record<string, unknown>;
+  }
+
+  it("defaults to 200 lines and supports middle ranges, aliases and past EOF", async () => {
+    const text = "line\n".repeat(201);
+    assert.deepEqual(output((await read(text)).result), {
+      size: 1005, content: "line\n".repeat(200), offset: 1, linesReturned: 200,
+      partialLastLine: false, truncated: true,
+    });
+    const fileop = new FileopSpy({ ok: true, size: 6, data: Buffer.from("a\nb\nc\n").toString("base64") });
+    const h = makeBroker({ fileop });
+    const result = await h.broker.handleToolCall(rt(), "Read", { file_path: "src/x.ts", offset: 2, limit: 1 }, "root");
+    assert.deepEqual(output(result), { size: 6, content: "b\n", offset: 2, linesReturned: 1, partialLastLine: false, truncated: true });
+    assert.deepEqual(fileop.calls, [{ op: "read", path: "src/x.ts" }]);
+    assert.deepEqual(output((await read("a\n", { offset: Number.MAX_SAFE_INTEGER })).result), {
+      size: 2, content: "", offset: Number.MAX_SAFE_INTEGER, linesReturned: 0, partialLastLine: false, truncated: false,
+    });
+  });
+
+  for (const [text, lines] of [["", 0], ["\n\n", 2], ["a\n", 1], ["a\nb", 2], ["\r\n\r\nx\r\n", 3], ["\ufeffé😀\n尾", 2]] as const) {
+    it("preserves blank lines, delimiters and UTF-8: " + JSON.stringify(text), async () => {
+      assert.deepEqual(output((await read(text)).result), {
+        size: Buffer.byteLength(text), content: text, offset: 1, linesReturned: lines,
+        partialLastLine: false, truncated: false,
+      });
+    });
+  }
+
+  it("rejects invalid explicit ranges before calling the helper", async () => {
+    for (const args of [
+      ...[null, "1", 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, Infinity, NaN, undefined].map(offset => ({ offset })),
+      ...[null, "1", 0, -1, 1.5, 2001, Number.MAX_SAFE_INTEGER + 1, Infinity, NaN, undefined].map(limit => ({ limit })),
+    ]) {
+      const h = makeBroker();
+      assertDenied(await h.broker.handleToolCall(rt(), "Read", { path: "text.txt", ...args }, "root"), "bad_args");
+      assert.equal(h.fileop.calls.length, 0);
+      assert.equal(h.registry.inFlightCallbackCount(), 0);
+    }
+    assert.equal(output((await read("x", { limit: 2000 })).result).content, "x");
+  });
+
+  const cap = 64 * 1024;
+  for (const { name, text, content, lines, partial, truncated, args } of [
+    { name: "inside multibyte", text: "a".repeat(cap - 1) + "😀tail", content: "a".repeat(cap - 1), lines: 1, partial: true, truncated: true },
+    { name: "between CR and LF", text: "a".repeat(cap - 1) + "\r\ntail", content: "a".repeat(cap - 1) + "\r", lines: 1, partial: true, truncated: true },
+    { name: "after delimiter", text: "a".repeat(cap - 1) + "\ntail", content: "a".repeat(cap - 1) + "\n", lines: 1, partial: false, truncated: true },
+    { name: "exact unterminated EOF", text: "a".repeat(cap), content: "a".repeat(cap), lines: 1, partial: false, truncated: false },
+    { name: "exact delimited EOF", text: "a".repeat(cap - 1) + "\n", content: "a".repeat(cap - 1) + "\n", lines: 1, partial: false, truncated: false },
+    { name: "line limit at delimited EOF", text: "a\nb\n", content: "a\nb\n", lines: 2, partial: false, truncated: false, args: { limit: 2 } },
+    { name: "line limit at unterminated EOF", text: "a\nb", content: "a\nb", lines: 2, partial: false, truncated: false, args: { limit: 2 } },
+    { name: "partial second source line", text: "a\n" + "b".repeat(cap), content: "a\n" + "b".repeat(cap - 2), lines: 2, partial: true, truncated: true },
+  ]) {
+    it("caps text at complete codepoints: " + name, async () => {
+      assert.deepEqual(output((await read(text, args)).result), {
+        size: Buffer.byteLength(text), content, offset: 1, linesReturned: lines,
+        partialLastLine: partial, truncated,
+      });
+    });
+  }
+
+  it("preserves defensive helper truncation for text and exact binary bytes", async () => {
+    assert.equal(output((await read("text", {}, true, 8)).result).truncated, true);
+    for (const bytes of [Buffer.alloc(200 * 1024, 0xff), Buffer.alloc(200 * 1024, 0), Buffer.from([0xc0, 0xaf])]) {
+      assert.deepEqual(output((await read(bytes, {}, true, bytes.length + 1)).result), {
+        size: bytes.length + 1, contentBase64: bytes.toString("base64"), truncated: true,
+      });
+      for (const args of [{ offset: 1 }, { limit: 200 }]) {
+        const r = await read(bytes, args);
+        assertDenied(r.result, "bad_args");
+        assert.equal(r.fileop.calls.length, 1);
+      }
+    }
+  });
+
+  it("validates helper success with ordered, neutral malformed/oversize denials", async () => {
+    const max = 1024 * 1024;
+    const maxEncoded = 4 * Math.ceil(max / 3);
+    const valid = Buffer.from("hi").toString("base64");
+    const cases: { response: unknown; code: string }[] = [
+      ...[undefined, null, 7, {}].map(data => ({ response: { ok: true, data, size: max + 1 }, code: "E_MALFORMED" })),
+      ...["a", "aGk", "aGk==", "aGk=\n", "aGk_", "aGl=", "Zh==", "===="].map(data => ({ response: { ok: true, data, size: 2 }, code: "E_MALFORMED" })),
+      { response: { ok: true, data: "!".repeat(maxEncoded + 1), size: -1 }, code: "E_OVERSIZE" },
+      { response: { ok: true, data: "!".repeat(maxEncoded), size: -1 }, code: "E_MALFORMED" },
+      // max+1 and max+2 bytes still fit the encoded-length bound.
+      ...[max + 1, max + 2].map(n => ({ response: { ok: true, data: Buffer.alloc(n).toString("base64"), size: -1 }, code: "E_OVERSIZE" })),
+      ...[undefined, null, "2", -1, 1.5, Number.MAX_SAFE_INTEGER + 1, Infinity, NaN, max + 1, 1, 3].map(size => ({
+        response: { ok: true, data: valid, size }, code: "E_MALFORMED",
+      })),
+      { response: { ok: true, data: valid, size: 1, truncated: true }, code: "E_MALFORMED" },
+      { response: { ok: true, data: valid, size: 3, truncated: "true" }, code: "E_MALFORMED" },
+    ];
+    for (const { response, code } of cases) {
+      const h = makeBroker({ fileop: new FileopSpy(response as FileopResponse) });
+      const result = await h.broker.handleToolCall(rt(), "Read", { path: "text.txt" }, "root");
+      assertDenied(result, "fileop_denied");
+      assert.equal(result.message, "file operation denied (" + code + ")");
+      assert.equal(h.registry.inFlightCallbackCount(), 0);
+    }
+    assert.equal(output((await read(Buffer.alloc(max, 1))).result).size, max);
+    assert.deepEqual(output((await read("")).result).content, "");
   });
 });
 

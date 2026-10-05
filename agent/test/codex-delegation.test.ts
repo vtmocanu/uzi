@@ -1,4 +1,6 @@
 import { describe, it } from "node:test";
+import { PassThrough } from "node:stream";
+import { createCodexTransport } from "../src/codex/transport.js";
 import assert from "node:assert/strict";
 
 import {
@@ -97,7 +99,7 @@ class SpawnSpy {
 
 class FileopSpy {
   calls: FileopRequest[] = [];
-  constructor(private readonly response: FileopResponse = { ok: true, size: 3, data: Buffer.from("hi").toString("base64") }) {}
+  constructor(private readonly response: FileopResponse = { ok: true, size: 2, data: Buffer.from("hi").toString("base64") }) {}
   op = async (request: FileopRequest): Promise<FileopResponse> => {
     this.calls.push(request);
     return this.response;
@@ -119,10 +121,11 @@ function makeRunner(opts: {
   childTurnDeadlineMs?: number;
   startImpl?: (spec: StartChildTurnSpec) => Promise<ChildThreadController>;
   spawnImpl?: (argv: readonly string[], o: SpawnCommandOptions) => Promise<SpawnCommandResult>;
+  fileop?: FileopSpy;
 } = {}): Built {
   const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
   const spawn = new SpawnSpy();
-  const fileop = new FileopSpy();
+  const fileop = opts.fileop ?? new FileopSpy();
   const startSpecs: StartChildTurnSpec[] = [];
   const roles = opts.roles ?? new Map<string, DelegationRole>([["coder", role()]]);
   const runner = new CodexDelegationRunner({
@@ -197,6 +200,73 @@ function withNotes(controller: FakeController, notes: CodexNotification[]): Fake
   (controller as unknown as { notes: CodexNotification[] }).notes = notes;
   return controller;
 }
+
+describe("CodexDelegationRunner: bounded Read transport serialization (#296)", () => {
+  for (const { name, raw, args, expected, offset, lines, partial, truncated } of [
+    { name: "middle excerpt", raw: "a\nb\nc\n", args: { file_path: "src/x.ts", offset: 2, limit: 1 }, expected: "b\n", offset: 2, lines: 1, partial: false, truncated: true },
+    { name: "near 1 MiB U+0001", raw: "\u0001".repeat(1024 * 1024 - 2), args: { path: "src/x.ts" }, expected: "\u0001".repeat(64 * 1024), offset: 1, lines: 1, partial: true, truncated: true },
+    { name: "near 1 MiB quotes and backslashes", raw: '"\\'.repeat((1024 * 1024 - 2) / 2), args: { path: "src/x.ts" }, expected: '"\\'.repeat(32 * 1024), offset: 1, lines: 1, partial: true, truncated: true },
+  ]) {
+    it("delivers and settles " + name + " through emitted child transport frames", async () => {
+      const inbound = new PassThrough();
+      const outbound = new PassThrough();
+      const transport = createCodexTransport({ inbound, outbound });
+      const replies: { frame: Record<string, unknown>; bytes: number }[] = [];
+      const write = (frame: unknown): void => { inbound.write(JSON.stringify(frame) + "\n"); };
+      let buffered = "";
+      outbound.setEncoding("utf8");
+      outbound.on("data", (chunk: string) => {
+        buffered += chunk;
+        let nl = buffered.indexOf("\n");
+        while (nl !== -1) {
+          const line = buffered.slice(0, nl);
+          buffered = buffered.slice(nl + 1);
+          const frame = JSON.parse(line) as Record<string, unknown>;
+          replies.push({ frame, bytes: Buffer.byteLength(line) + 1 });
+          // The child cannot finish until its actual Read reply reaches the peer.
+          write({ method: "turn/completed", params: { threadId: "ct-296", turn: { id: "cu-296", status: "completed" } } });
+          nl = buffered.indexOf("\n");
+        }
+      });
+      const controller: ChildThreadController = {
+        threadId: "ct-296", turnId: "cu-296",
+        notifications: () => transport.notifications(),
+        respond: (id, reply) => transport.respond(id, reply),
+        interrupt: async () => {},
+        close: async () => { transport.close(); },
+      };
+      const fileop = new FileopSpy({ ok: true, size: Buffer.byteLength(raw), data: Buffer.from(raw).toString("base64") });
+      const b = makeRunner({
+        fileop, childTurnDeadlineMs: 5000,
+        startImpl: async () => {
+          write({ id: 296, method: "item/tool/call", params: { threadId: controller.threadId, turnId: controller.turnId, callId: "read-296", tool: "uzi_read", arguments: args } });
+          return controller;
+        },
+      });
+      try {
+        const result = await b.runner.run(delegReq());
+        assert.equal(result.ok, true);
+        assert.equal(replies.length, 1);
+        assert.equal(replies[0]!.frame.id, 296);
+        assert.ok(replies[0]!.bytes < 4 * 1024 * 1024);
+        const reply = replies[0]!.frame.result as { success: boolean; contentItems: { type: string; text: string }[] };
+        assert.equal(reply.success, true);
+        assert.equal(reply.contentItems.length, 1);
+        assert.equal(reply.contentItems[0]!.type, "inputText");
+        assert.deepEqual(JSON.parse(reply.contentItems[0]!.text), {
+          size: Buffer.byteLength(raw), content: expected, offset, linesReturned: lines, partialLastLine: partial, truncated,
+        });
+        assert.equal(fileop.calls.length, 1);
+        assert.equal(b.registry.inFlightCallbackCount(), 0);
+        assert.equal(b.registry.isPoisoned(), false);
+      } finally {
+        transport.close();
+        inbound.destroy();
+        outbound.destroy();
+      }
+    });
+  }
+});
 
 describe("CodexDelegationRunner: admission", () => {
   it("denies an unknown role WITHOUT starting a child", async () => {

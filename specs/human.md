@@ -22,6 +22,10 @@ terse and tag each AI edit `(AI-synced YYYY-MM-DD)`.
 - Prefer the better implementation; beat them where possible. Best-practice bar.
 - Some scope may be deferred to later.
 
+## Codex bounded Read (#296)
+
+- Text Read accepts path/file_path and optional one-based positive safe integer offset (default 1), limit 1–2000 (default 200); excerpts preserve UTF-8/BOM and LF/CRLF, cap at 64 KiB, and report size/content/offset/linesReturned/partialLastLine/truncated without duplicate base64 or a cursor. Strict helper validation retains the 1 MiB file ceiling and neutral errors. Invalid UTF-8 or NUL returns exact base64 only without explicit ranges; ranged binary is refused. Root and child replies must fit the existing 4 MiB transport cap. Full contract: [ADR 0296](../adr/0296-codex-bounded-text-reads.md). (AI-synced 2026-10-05)
+
 ## MVP / infrastructure
 
 - Initial MVP is a local laptop demo via docker-compose.
