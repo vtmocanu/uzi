@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { execFileSync, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import type { ExecutorResult, RunContext } from "../src/executor.js";
 import {
@@ -207,6 +207,44 @@ function alive(pid: number): boolean {
     return false;
   }
 }
+
+it("issue #2104: an unreaped zombie is dead even while signal-0 succeeds", { skip: realTableSkip("held zombie") }, async () => {
+  const pidFile = path.join(orphanPidDir, "held-zombie.pid");
+  // First let the shell exec a parent that never waits for its child. Only then kill
+  // the child, so the shell cannot reap it before exec and erase the regression seam.
+  const parent = spawn("/bin/sh", ["-c", 'sleep 30 & echo $! > "$1"; exec sleep 30', "held-zombie", pidFile], { stdio: "ignore" });
+  let spawnError: Error | undefined;
+  parent.once("error", (err) => { spawnError = err; });
+  const closed = new Promise<void>((resolve) => parent.once("close", () => resolve()));
+  let pid: number | undefined;
+  async function until(check: () => boolean, message: string): Promise<void> {
+    const deadline = Date.now() + 5000;
+    while (!check()) {
+      if (spawnError) throw spawnError;
+      assert.ok(Date.now() < deadline, message);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  try {
+    await until(() => {
+      if (!fs.existsSync(pidFile) || !parent.pid) return false;
+      const candidate = Number(fs.readFileSync(pidFile, "utf8").trim());
+      if (!Number.isInteger(candidate) || candidate <= 0) return false;
+      pid = candidate;
+      return /^Name:\s*sleep$/m.test(fs.readFileSync(`/proc/${parent.pid}/status`, "utf8"));
+    }, "the holding parent execs sleep and publishes its child PID");
+    assert.equal(alive(parent.pid!), true, "the holding parent is still live");
+    process.kill(pid!, "SIGKILL");
+    await until(() => /^State:\s*Z/m.test(fs.readFileSync(`/proc/${pid}/status`, "utf8")), "the killed child remains an unreaped zombie");
+    assert.doesNotThrow(() => process.kill(pid!, 0), "signal-0 still finds the zombie PID");
+    assert.equal(alive(pid!), false, "the zombie cannot execute work");
+  } finally {
+    if (pid !== undefined) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
+    if (parent.pid) { try { process.kill(parent.pid, "SIGKILL"); } catch { /* already gone */ } }
+    await closed;
+    fs.rmSync(pidFile, { force: true });
+  }
+});
 
 // ─── the typed failure ─────────────────────────────────────────────────────────────────────
 
