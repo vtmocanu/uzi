@@ -248,9 +248,9 @@ func normalizeForHash(s string) string {
 	return strings.Join(strings.Fields(strings.ToLower(s)), " ")
 }
 
-// findingLineNumRe matches a trailing line reference (`:12`, `:12:5`) the coordinate
+// findingLineNumRe matches a trailing line reference (`:12`, `:12:5`, `:12-15`) the coordinate
 // must exclude — line numbers drift and would defeat dedup (D3).
-var findingLineNumRe = regexp.MustCompile(`(:[0-9]+)+$`)
+var findingLineNumRe = regexp.MustCompile(`(:[0-9]+(-[0-9]+)?)+$`)
 
 // canonicalizeLocation folds an agent-supplied `location` to the D3 fixed coordinate so
 // the same file#symbol phrased with cosmetic drift collapses to ONE coordinate. Modelled
@@ -310,7 +310,7 @@ func canonicalizeLocationPath(p string) string {
 		p = p[2:]
 	}
 	p = strings.TrimLeft(p, "/")
-	// Exclude trailing line numbers (D3): file.go:123 → file.go.
+	// Exclude trailing line numbers and ranges (D3): file.go:123-125 → file.go.
 	p = findingLineNumRe.ReplaceAllString(p, "")
 	return p
 }
@@ -326,7 +326,7 @@ func canonicalizeLocationSymbol(sym string) string {
 	// token already drops `:line` in canonicalizeLocationPath, but a symbol like
 	// `bar:42` was left intact, so `foo.go#bar:42` and `foo.go#bar` produced two
 	// coordinates for one bug (line numbers drift and would defeat dedup, D3). Apply the
-	// same strip here so `bar:42`/`bar:42:5` fold to `bar`.
+	// same strip here so `bar:42`/`bar:42:5`/`bar:42-45` fold to `bar`.
 	sym = findingLineNumRe.ReplaceAllString(sym, "")
 	// A purely numeric "symbol" is a line reference, not a symbol name — drop it.
 	if sym == "" || isAllDigits(sym) {
