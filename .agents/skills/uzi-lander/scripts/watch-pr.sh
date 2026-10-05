@@ -281,7 +281,8 @@ while [ "$i" -lt "$MAX" ]; do
   # verdict: CodeRabbit puts grouped / outside-diff findings in that review BODY, which the
   # inline count below never sees, so it is counted as an UNCONFIRMED finding instead when
   # the head has no verdict (pr-findings.sh classifies it the same way). Next to a verdict,
-  # that body is gated by the every-author ack (unacked) only; see the live computation. Two gotchas handled here: `gh api --jq`
+  # that body is gated by the every-author ack (unacked) only; see the live computation.
+  # Two gotchas handled here: `gh api --jq`
   # does NOT accept jq's --arg (so the head SHA is passed to standalone jq), and `gh api
   # --paginate` emits one array PER PAGE (so pages are slurped with `-s`/`.[][]`).
   cr_reviewed=0; cr_unconfirmed=0
