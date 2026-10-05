@@ -16,12 +16,12 @@
 
 ## Outcome
 
-`uzi tui` gains a `workers` view, second in the tab strip: `1 floor · 2 workers · 3 pulls · 4 ci`.
+`uzi tui` gains a `workers` view, second in the tab strip: `floor  workers  pulls  ci` (keys `1`-`4`; the digits appear only in the `?` help, D14).
 
 - **List.** Sorted so the workers needing attention come first, it answers "why can't this worker take work?" before it shows resource figures.
 - **Drill-in.** Explains one worker.
 - **Split view.** Workers is a top-pane view alongside the floor; pulls and ci stay in the bottom pane.
-- **Floor.** Shows a one-line fleet summary, and each run's worker on wide terminals.
+- **Floor.** The fleet status rides right-aligned on the title line (D15), and each run's worker shows on wide terminals.
 
 Acceptance examples (counts are from the `demo.go` seed this PRD adds, which mirrors the mock's fixtures):
 
@@ -102,12 +102,12 @@ Acceptance examples (counts are from the `demo.go` seed this PRD adds, which mir
   - the `[floor]` bracket in `splitHeader` (`tui_split.go:269`) brackets the top pane's tab;
   - `splitFooterLine` (`tui_split.go:222-230`) gets workers hints;
   - `splitSeparatorAt`'s focus test (`tui_split.go:151`) treats either top view as top-focused.
-- **Pane height.** The workers top pane uses the floor's height allocation and the 80-column layout regardless of terminal width.
+- **Pane height.** The workers top pane uses the floor's height allocation and the same width-driven layout as full screen: the wide table at ≥120 columns (D17).
 - **Drill-in from the top pane.** `enter` on a top-pane worker opens `viewWorker` full-screen through the existing `fromSplit` path (`tui_board.go:352`). `esc` restores the split with `topTab = viewWorkers`, the same selected worker ID and the top pane focused.
 
 ### Fleet summary line and height accounting (`tui_board.go`, `tui_split.go`)
 
-- **Placement.** The summary renders as one row directly under the tab strip on the floor (full-screen, and in split when `topTab = viewBoard`). The workers view renders its own fuller summary in the same slot.
+- **Placement.** Superseded by D15: the fleet status is right-aligned on the title line on the floor and the workers views, full screen and split, narrowed to the space left after the tabs; it takes its own row only when even its shortest form does not fit (full-screen 80 columns). The workers view has no separate summary line.
 - **Height.** It is charged to the chrome:
   - `splitSharedChrome` gains one row, so `splitMinHeight` grows by 1 (D4);
   - the full-screen board chrome in `boardCapacityAt` (`tui_board.go:975-987`) also gains one row.
@@ -295,9 +295,10 @@ Contents:
 - [x] M2: four-section detail, single-origin cross-links and fresh run sessions, floor/rail worker names.
 - [x] Automated navigation, polling, untrusted text, resource and dimension acceptance tests.
 - [x] Nine feature ANSI scenes generated in dark and light themes; content and bounds asserted.
-- [ ] D12: render uxlab PNGs.
-- [ ] D12: `tui-ux` screenshot review against the mock.
-- [ ] D12: drive `uzi tui --demo` manually.
+- [x] D12: render uxlab PNGs.
+- [x] D12: `tui-ux` screenshot review against the mock.
+- [x] D12: drive `uzi tui --demo` manually (maintainer, live and demo, 2026-10-05).
+- [x] Maintainer review round: D14-D21 applied, mock updated to match.
 
 The factory-only demo worker is cordoned to cover all six primary states; the nine own workers and their acceptance totals remain unchanged. Nix inode readings display `?` because the existing DTO carries no nix inode fields.
 
@@ -326,3 +327,16 @@ The implementation run does not do this step (D12).
 - **D11, three attention severities, and only danger and warn count as "need attention".** An ephemeral lease or a lone chat is information, not a problem. Counting them would make a healthy fleet read as needing attention.
 - **D12, PNG rendering and the `tui-ux` visual review are a maintainer pre-merge step.** uxlab's PNG half needs devbox `charm-freeze` (`api/cmd/uzi/uxlab/devbox.json`), which an egress-restricted uzi worker cannot be relied on to fetch. The run still generates the scenes under `go test` and asserts on the frames.
 - **D13, collapse goes to the top pane's view.** With the floor on top, this is today's behaviour exactly. Rejected: collapsing to whichever pane has focus, which would change shipped behaviour for ci and pulls.
+- **D1 amended by D14** (strip text only; the key numbering stands).
+
+Maintainer review of the implementation (user decisions 2026-10-05, prototyped, rendered and reviewed by `tui-ux`; the mock was updated to match):
+
+- **D14, no digits in the strip or footers.** The strip reads `floor  workers  pulls  ci`, as before this PRD; `1`-`4` still select the tabs and are listed in the `?` help only. Rejected: D1's `1 floor · 2 workers …` labels, which the maintainer found noisy.
+- **D15, the fleet status lives on the title line, right-aligned,** on the floor and workers views in both layouts, with the fuller content (`workers · 9 · 8 online · 5/12 slots in use +1 ?cap · 1 holding · 1 draining · 6 need attention`, `factory workers` in factory scope). It narrows against the width left after the tabs and takes its own row only as a last resort. The floor's run summary (`$… 7d · N runs · a–b`) moves to the account-meter line, right-aligned. Rejected: a separate fleet row (costs a row on every screen) and the stats inside the `workers` tab label (blurs the tab boundaries).
+- **D16, split titles per pane.** The split's title line shows only the top pane's tabs, `floor · [workers]`, mirroring the bottom divider's `pulls · ci`; the selected tab is bracketed. With workers on top, the floor's account meters and run summary are hidden.
+- **D17, the wide table in split.** The workers top pane follows the terminal width like full screen, replacing "80-column layout regardless of width". VERSION is sized to the longest visible version (cap 18), so `0.85.1+gba846d7` is not cut.
+- **D18, colour on the shared ANDON tokens.** busy sage (a running run), idle faint, holding/⚑ amber, warn items, offline, outdated, ◷, ⇡, drift and 75-89% stall, danger items and ≥90% alarm, draining/cordoned wait, healthy readings default ink. Every signal keeps its glyph or word for NO_COLOR.
+- **D19, the detail follows the mock.** One header line `worker › <name>  <state>  <kind>  up … · heartbeat …` (the uptime part drops when unknown and wraps below when narrow), lowercase tungsten section headings, an aligned key column, `▮▯` usage bars, coloured attention items, runs as `#iid title engine` with the worker phase, run stage and generation.
+- **D20, navigation and spacing like the other tabs.** `→` opens (list → detail, detail → run) and `←` goes back. Blank lines, not rules, separate the header and the `selected …` readout from the table. An empty attention cell reads `—`; the owner column reads `you` for the viewer's own workers.
+- **D21, the floor's worker cell never shows `?`.** `worker_name` is null for a run not yet claimed and for a finished run whose ephemeral worker was deleted (`runs.worker_id` is `ON DELETE SET NULL`). The cell reads `no worker yet` and `—` respectively. Rejected for this PRD: snapshotting the worker name on the run, which needs a migration.
+- **Bug found in review:** the hosted size arrives lowercase (`l`), so KIND showed `host·?` for every live hosted worker while the uppercase demo seed hid it. The size is matched case-insensitively and the demo seed is lowercase.

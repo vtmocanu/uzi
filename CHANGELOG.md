@@ -35,6 +35,9 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **`uzi tui` has a workers tab ([#2275](https://github.com/vtmocanu/uzi/issues/2275)).**
+  A `workers` tab (key `2`; pulls and ci move to `3` and `4`) lists your workers, or the factory's with `a`, attention first: state, kind, slots, CPU, memory, worst disk, version, heartbeat and what needs a human; `enter` or `→` opens a worker's detail (attention, reported runs, resources, configuration) and its runs. The fleet status rides right-aligned on the title line, the split's top pane can show workers, and the floor names each run's worker on wide terminals.
+
 - **Workers join the TUI floor and split view ([#2275](https://github.com/vtmocanu/uzi/issues/2275)).**
   The attention-ordered workers list and four-section worker detail share polling and own/factory scope with the floor fleet summary. Enter opens a worker or its reported run; uppercase `W` links a run to its worker, while Esc preserves the original return target and reopens runs with fresh metadata, transcript tail and stream. Wide floor rows show worker names. Tabs are now `1 floor · 2 workers · 3 pulls · 4 ci`; floor/workers occupy the split's top pane, with collapse retaining that tab and automatic restore at 43 rows (minimum 41).
 
