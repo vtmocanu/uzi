@@ -173,7 +173,7 @@ func TestTerminalRejectionAcceptanceLiveDB(t *testing.T) {
 		t.Fatalf("archives = %d %s", rec.Code, rec.Body.String())
 	}
 
-	scratch, err := os.MkdirTemp("../../../.uzi/scratch", "terminal-acceptance.")
+	scratch, err := os.MkdirTemp("", "terminal-acceptance.")
 	if err != nil {
 		t.Fatal(err)
 	}
