@@ -565,6 +565,34 @@ describe("codex transport: respond (server→client reply lane)", () => {
 });
 
 describe("codex transport: bounded framing", () => {
+  it("rejects a thread/resume response above the default 4 MiB frame cap", async () => {
+    const { inbound, outbound, transport } = makePair();
+    const frames = collectFrames(outbound);
+    const notes = transport.notifications();
+    const pending = transport.request("thread/resume", { threadId: "resumed-1" });
+    try {
+      const sent = await waitFor(() => frames()[0], "resume request");
+      const line = JSON.stringify({
+        id: sent.id,
+        result: { thread: { id: "resumed-1", turns: [{ items: [{ text: "z".repeat(4 * 1024 * 1024) }] }] } },
+      });
+      assert.ok(Buffer.byteLength(line, "utf8") > 4 * 1024 * 1024);
+      inbound.write(line + "\n");
+      await assert.rejects(pending, (err: unknown) => {
+        assert.ok(err instanceof CodexTransportError);
+        assert.equal(err.failure.category, "protocol");
+        assert.match(err.message, /exceeds size cap/);
+        return true;
+      });
+      await assert.rejects(notes.next(), (err: unknown) =>
+        err instanceof CodexTransportError && err.failure.category === "protocol" && /exceeds size cap/.test(err.message));
+    } finally {
+      await transport.close();
+      inbound.destroy();
+      outbound.destroy();
+    }
+  });
+
   it("turns an over-cap frame into a protocol failure and rejects the in-flight request", async () => {
     const { inbound, transport } = makePair({ maxFrameBytes: 64 });
     const notes = transport.notifications();

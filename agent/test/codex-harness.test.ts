@@ -541,6 +541,101 @@ describe("CodexHarness: resumed usage evidence", () => {
       }
     });
 
+    for (const hasReplay of [true, false]) {
+      it(`${authMode}: metadata-only resume avoids an oversized history frame with ${hasReplay ? "replay" : "no replay"} and multiple new updates`, async () => {
+        const inbound = new PassThrough();
+        const outbound = new PassThrough();
+        const transport = createCodexTransport({ inbound, outbound });
+        const accountant = new CodexUsageAccountant();
+        let notices = 0;
+        const { harness } = makeHarness({
+          authMode, accountant, onTokenUsageIncomplete: () => { notices++; },
+          launchRoot: async () => ({ root: fakeRoot, transport, supervisorPid: 4321 }),
+        });
+        const finalTotal = { inputTokens: 1000, cachedInputTokens: 200, outputTokens: 300, reasoningOutputTokens: 100, totalTokens: 1300 };
+        const finalResponse = { inputTokens: 400, cachedInputTokens: 80, outputTokens: 120, reasoningOutputTokens: 40, totalTokens: 520 };
+        let buffered = "";
+        let resumeParams: Record<string, unknown> | undefined;
+        let historyBytes = 0;
+        let responseBytes = 0;
+        let delivery: Promise<void> | undefined;
+        const write = (frame: unknown) => { inbound.write(JSON.stringify(frame) + "\n"); };
+        outbound.setEncoding("utf8");
+        outbound.on("data", (chunk: string) => {
+          buffered += chunk;
+          let end: number;
+          while ((end = buffered.indexOf("\n")) !== -1) {
+            const frame = rec(JSON.parse(buffered.slice(0, end)));
+            buffered = buffered.slice(end + 1);
+            if (typeof frame.method !== "string" || frame.id === undefined) continue;
+            if (frame.method === "thread/resume") {
+              resumeParams = rec(frame.params);
+              const history = JSON.stringify({
+                id: frame.id,
+                result: { thread: { id: "resumed-1", turns: [{ items: [{ text: "z".repeat(4 * 1024 * 1024) }] }] } },
+              });
+              historyBytes = Buffer.byteLength(history, "utf8");
+              const metadata = JSON.stringify({ id: frame.id, result: { thread: { id: "resumed-1" } } });
+              const responseLine = resumeParams.excludeTurns === true ? metadata : history;
+              responseBytes = Buffer.byteLength(responseLine, "utf8");
+              inbound.write(responseLine + "\n");
+            } else {
+              write({ id: frame.id, result: defaultResponder(frame.method) });
+            }
+            if (frame.method === "turn/start") delivery = (async () => {
+              await tick();
+              const sequence = [
+                ...(hasReplay ? [replay(), replay()] : []),
+                turnStarted("resumed-1"),
+                tokenUsage(next, response, "resumed-1"),
+                tokenUsage(next, response, "resumed-1"),
+                tokenUsage(finalTotal, finalResponse, "resumed-1"),
+                turnCompleted("completed", { inputTokens: 9999 }, "resumed-1"),
+              ];
+              // Finite, ordered delivery: a write failure rejects the sequence.
+              for (const note of sequence) {
+                write({ method: note.method, params: note.params });
+                await tick();
+              }
+            })();
+          }
+        });
+        try {
+          // Await the real transport first: omitting excludeTurns must fail on
+          // oversized framing before any assertion about the outbound flag.
+          const result = terminal(await withTimeout(
+            collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events),
+            5000, "metadata-only resume",
+          ));
+          await delivery;
+          assert.equal(result.outcome, "success");
+          assert.ok(historyBytes > 4 * 1024 * 1024);
+          assert.ok(responseBytes < 4 * 1024 * 1024);
+          assert.equal(resumeParams?.threadId, "resumed-1");
+          assert.equal(resumeParams?.excludeTurns, true);
+          assert.equal(accountant.usageIncomplete, !hasReplay);
+          assert.equal(notices, hasReplay ? 0 : 1);
+          if (hasReplay) {
+            assert.deepEqual(accountant.aggregateByModel({ authMode, now: new Date("2026-10-05") })?.["gpt-6-astra"], {
+              inputTokens: 560, cacheReadInputTokens: 140, cacheCreationInputTokens: 0,
+              outputTokens: 210, reasoningOutputTokens: 70,
+              costStatus: authMode === "api_key" ? "metered" : "subscription",
+              ...(authMode === "api_key" ? { costUSD: 0.01624 } : {}),
+            });
+          } else {
+            assert.equal(result.usage, undefined);
+            assert.equal(accountant.aggregateByModel(), undefined);
+            assert.deepEqual(result.metrics?.cost, { kind: authMode === "api_key" ? "unreported" : "subscription" });
+          }
+        } finally {
+          await delivery;
+          await harness.close();
+          inbound.destroy();
+          outbound.destroy();
+        }
+      });
+    }
+
     for (const abortAt of ["prelaunch", "preturn"] as const) {
       it(`${authMode}: ${abortAt} abort does not taint an unstarted resumed turn`, async () => {
         const accountant = new CodexUsageAccountant();

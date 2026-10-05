@@ -1308,6 +1308,7 @@ export class CodexHarness implements RunHarness {
         "thread/resume",
         {
           threadId: resumeId,
+          excludeTurns: true,
           model: this.currentModel,
           modelProvider: this.provider.name,
           cwd: this.workspace,
