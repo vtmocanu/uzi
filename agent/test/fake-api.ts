@@ -39,6 +39,8 @@ interface RecordedRegister {
  */
 export class FakeApi {
   private readonly server: http.Server;
+  /** Issue #2230: retain handler exceptions behind HTTP 500 for failure-only diagnostics. */
+  readonly handlerExceptions: Array<{ method: string; path: string; error: string }> = [];
 
   // --- control -------------------------------------------------------------
   private readonly claimQueue: ClaimResponse[] = [];
@@ -353,6 +355,11 @@ export class FakeApi {
   constructor(private readonly token: string) {
     this.server = http.createServer((req, res) => {
       this.handle(req, res).catch((err) => {
+        this.handlerExceptions.push({
+          method: req.method ?? "<absent>",
+          path: (req.url ?? "/").split("?", 1)[0]!,
+          error: err instanceof Error ? err.stack ?? err.message : String(err),
+        });
         res.writeHead(500);
         res.end(String(err));
       });
