@@ -923,7 +923,7 @@ func TestWorkersReplySchedulesBackoffDelay(t *testing.T) {
 			if workersTickInterval(m.workers.errStreak) != tc.delay {
 				t.Fatalf("backoff ratio changed: streak=%d delay=%v", m.workers.errStreak, workersTickInterval(m.workers.errStreak))
 			}
-			if !ok || tick.gen != m.workers.tickGen || elapsed < tc.delay-workersPollInterval/2 || elapsed > tc.delay+5*time.Second {
+			if !ok || tick.gen != m.workers.tickGen || elapsed < tc.delay-workersPollInterval/2 || elapsed > tc.delay+time.Second {
 				t.Fatalf("reply scheduled %T after %v, want workers tick after %v (gen %d)", msg, elapsed, tc.delay, m.workers.tickGen)
 			}
 			next, fetch := m.Update(tick)
