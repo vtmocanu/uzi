@@ -118,7 +118,7 @@ gh issue list --repo vtmocanu/uzi --state open --limit 400 --json number,title,l
 
 Run Steps 2 and 3 on each and batch several into one proposal. A categorization-only change (area or priority, no selector, eligibility or verdict change) skips Step 4; any change that can make the issue fire is a dispatch gap and runs Steps 2 to 4.
 
-Confirm the pick with the user. Gap issues still run Steps 2 to 4: the gap names the missing label, not whether adding it is right.
+Confirm the pick with the user. Dispatch-gap issues still run Steps 2 to 4: the gap names the missing label, not whether adding it is right.
 
 ## Step 2: Explain
 
