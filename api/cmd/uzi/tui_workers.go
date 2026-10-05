@@ -526,7 +526,7 @@ func (m tuiModel) workersSummary(width int, _ bool) string {
 			cordoned++
 		}
 	}
-	scope := "your workers"
+	scope := "workers"
 	if m.board.admin {
 		scope = "factory workers"
 	}
@@ -581,7 +581,7 @@ func (m tuiModel) workerKind(r workerRow) string {
 		kind = "eph"
 	}
 	size := "?"
-	switch t.hostedSize {
+	switch strings.ToUpper(t.hostedSize) {
 	case "S":
 		size = "S"
 	case "M":
@@ -646,6 +646,27 @@ func (m tuiModel) workerTitleLines(title, status string) []string {
 	}
 	return []string{clampVisual(title, m.width), clampVisual(status, m.width)}
 }
+
+// Keep one shared version width for the header and every filtered row.
+func (m tuiModel) workerVersionWidth(width int) int {
+	wanted := 8
+	if m.workers.admin == m.board.admin {
+		for _, row := range m.workers.visible(time.Now()) {
+			marker := 0
+			if row.w.UpgradeStatus == "outdated" || row.w.UpgradeStatus == "upgrade_failed" {
+				marker = 1
+			}
+			wanted = max(wanted, visualWidth(m.renderer.Plain(workerTextOf(row).workerVersion, 18))+marker)
+		}
+	}
+	// Other columns and separators consume 80 cells (88 in factory scope).
+	// Leave at least a glyph and a compact attention-count suffix visible.
+	fixed := 80
+	if m.board.admin {
+		fixed += 8
+	}
+	return max(1, min(wanted, 18, max(1, width-fixed-4)))
+}
 func (m tuiModel) workerRowLine(r workerRow, selected bool, width int) string {
 	t, now := workerTextOf(r), time.Now()
 	var bg color.Color
@@ -695,16 +716,18 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int) string {
 			memC = m.pal.faintC
 			diskC = m.pal.faintC
 		}
-		ver, verC := m.renderer.Plain(t.workerVersion, 7), color.Color(nil)
+		versionWidth := m.workerVersionWidth(width)
+		marker, verC := "", color.Color(nil)
 		switch r.w.UpgradeStatus {
 		case "outdated":
-			ver += "↑"
+			marker = "↑"
 			verC = m.pal.stall
 		case "upgrade_failed":
-			ver += "✕"
+			marker = "✕"
 			verC = m.pal.alarm
 		}
-		fields = append(fields, cell(cpu, 4, cpuC), cell(mem, 7, memC), cell(disk, 18, diskC), cell(ver, 8, verC), cell(workerAge(r.w.LastHeartbeatAt, now), 3, m.pal.faintC))
+		ver := m.renderer.Plain(t.workerVersion, max(0, versionWidth-visualWidth(marker))) + marker
+		fields = append(fields, cell(cpu, 4, cpuC), cell(mem, 7, memC), cell(disk, 18, diskC), cell(ver, versionWidth, verC), cell(workerAge(r.w.LastHeartbeatAt, now), 3, m.pal.faintC))
 	}
 	items := workerAttention(r, now)
 	att := paintSeg(m.pal.faintC, bg, false, "·")
@@ -722,15 +745,24 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int) string {
 }
 func (m tuiModel) workerReadout(r workerRow, width int) []string {
 	t := workerTextOf(r)
-	lines := []string{clampVisual("selected "+m.renderer.Plain(t.workerName, width-9), width)}
+	selected := m.pal.faint.Render("selected ") + m.pal.title.Render(m.renderer.Plain(t.workerName, max(0, width-9)))
 	if m.board.admin {
-		lines = append(lines, clampVisual("owner "+m.renderer.Plain(t.workerOwner, width-6), width))
+		selected += m.pal.faint.Render(" · owner ") + m.renderer.Plain(t.workerOwner, width)
 	}
-	for _, item := range workerAttention(r, time.Now()) {
-		lines = append(lines, clampVisual(paintSeg(m.workerAttentionColor(item), nil, false, m.renderer.Plain(item.attnDetail, width)), width))
+	items := workerAttention(r, time.Now())
+	if width >= 120 {
+		for _, item := range items {
+			selected += m.pal.faint.Render(" · ") + paintSeg(m.workerAttentionColor(item), nil, false, m.renderer.Plain(item.attnShort, width))
+		}
+		return []string{clampVisual(selected, width)}
+	}
+	lines := []string{clampVisual(selected, width)}
+	for _, item := range items {
+		lines = append(lines, clampVisual("  "+paintSeg(m.workerAttentionColor(item), nil, false, m.renderer.Plain(item.attnShort, max(0, width-2))), width))
 	}
 	return lines
 }
+
 func (m tuiModel) renderWorkers() string { return m.renderWorkersBody(m.height, true) }
 func (m tuiModel) renderWorkersBody(height int, full bool) string {
 	if height <= 0 {
@@ -756,11 +788,12 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 	}
 	cols = append(cols, padVisual("STATE", 10), padVisual("KIND", 9), padVisual("RUNS", 4))
 	if width >= 120 {
-		cols = append(cols, padVisual("CPU", 4), padVisual("MEM", 7), padVisual("DISK (worst)", 18), padVisual("VERSION", 8), padVisual("HB", 3))
+		cols = append(cols, padVisual("CPU", 4), padVisual("MEM", 7), padVisual("DISK (worst)", 18), padVisual("VERSION", m.workerVersionWidth(width)), padVisual("HB", 3))
 	}
 	cols = append(cols, "ATTENTION")
 	header := "  " + strings.Join(cols, " ")
-	lines = append(lines, m.pal.faint.Render(clampVisual(header, width)))
+	rule := m.pal.faint.Render(strings.Repeat("─", width))
+	lines = append(lines, rule, m.pal.faint.Render(clampVisual(header, width)))
 	rows := m.workers.visible(time.Now())
 	if m.workers.admin != m.board.admin {
 		rows = nil
@@ -777,8 +810,8 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 	}
 	// Bound the readout before allocating list rows, retaining the selected row
 	// and footer even at tiny heights. Each failure is independent of other rows.
-	readout = readout[:min(len(readout), max(0, height-len(lines)-reserve-1))]
-	capacity := max(0, height-len(lines)-len(readout)-reserve)
+	readout = readout[:min(len(readout), max(0, height-len(lines)-reserve-2))]
+	capacity := max(0, height-len(lines)-len(readout)-reserve-1)
 	start := min(m.workers.scroll, max(0, len(rows)-capacity))
 	if cursor < start {
 		start = cursor
@@ -796,6 +829,7 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 		}
 		lines = append(lines, empty)
 	}
+	lines = append(lines, rule)
 	lines = append(lines, readout...)
 	if full {
 		for len(lines) < height-1 {
