@@ -67,7 +67,7 @@ func (m tuiModel) openWorker(id string) (tea.Model, tea.Cmd) {
 	if _, ok := m.scopedWorker(id); !ok {
 		return m, nil
 	}
-	if m.view == viewDetail && m.detailReturn != viewWorker {
+	if m.view == viewDetail && m.workerOrigin.runID == "" && m.workerOrigin.workerID == "" {
 		m.workerOrigin = workerOrigin{runID: m.detail.runID, detailReturn: m.detailReturn,
 			topTab: m.topTab, bottomTab: m.bottomTab, focus: m.view, fromSplit: m.fromSplit, splitOff: m.splitOff, splitMode: m.splitMode}
 	} else if m.view == viewWorkers {

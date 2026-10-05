@@ -511,12 +511,11 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 	case keyEsc:
 		return m.exitToBoard()
 	case keyPRView:
-		// m: open the PR drill-in for this run's merge request (PRD #1255 M5 D1), the run → PR
-		// cross-link. No-op (hidden from the legend) when the run has no MR/repo. m.detail is NOT
-		// clobbered — it persists on the model — so the PR view's esc (prReturn = viewDetail) returns
-		// to the still-loaded run view.
+		// Retain only the run ID and return target; every departing run closes its session.
 		if m.detail.run.MrIID != nil && m.detail.run.RepoID != nil && *m.detail.run.RepoID != "" {
 			m.pr = newPRState(*m.detail.run.RepoID, *m.detail.run.MrIID)
+			m.prReturnRunID, m.prReturnRunTarget = m.detail.runID, m.detailReturn
+			m.clearRunSession()
 			m.view = viewPR
 			m.prReturn = viewDetail
 			m.forgeNotice = ""

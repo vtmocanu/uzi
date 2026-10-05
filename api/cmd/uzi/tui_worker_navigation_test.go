@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -482,5 +483,224 @@ func TestWorkerNavigationNoRetainedSessionReferences(t *testing.T) {
 				t.Fatalf("retained run session: %s", field.Name)
 			}
 		}
+	}
+}
+
+func TestWorkerNavigationAuxiliarySessionGuards(t *testing.T) {
+	m, f := workerNavFixture(t)
+	m.detail.steer.access = steerAllowed
+	f.InputsByID = map[string][]apitypes.SteerInputDTO{"A": {{Kind: kindFollowUp, Body: sp("fresh input")}}}
+	f.Reviews = map[string]*apitypes.ReviewDTO{"A": reviewFixture()}
+	cmds := []tea.Cmd{
+		m.fetchInputsCmd("A"), m.submitSteerCmd(kindCancel, "", nil),
+		m.loadReviewCmd("A"), m.setDispositionCmd("aaaaaaaa", "done", ""),
+		m.deleteDispositionCmd("aaaaaaaa"),
+		// Resolution errors are also stamped.
+		m.setDispositionCmd("missing", "done", ""), m.deleteDispositionCmd("missing"),
+	}
+	old := make([]tea.Msg, len(cmds))
+	for i, cmd := range cmds {
+		old[i] = cmd()
+	}
+	m = press(t, m, "W")
+	next, cmd := m.handleKey(keyEsc)
+	m = workerNavFinite(t, next.(tuiModel), cmd)
+	m.detail.review.loading = true
+	m.detail.steer.access, m.detail.steer.queue = steerUnknown, nil
+	before := m.detail
+	for _, msg := range old {
+		next, cmd = m.Update(msg)
+		m = next.(tuiModel)
+		if cmd != nil || !reflect.DeepEqual(before, m.detail) {
+			t.Fatalf("old auxiliary reply %T changed fresh same-ID session", msg)
+		}
+	}
+	current := []tea.Msg{
+		m.fetchInputsCmd("A")(), m.submitSteerCmd(kindCancel, "", nil)(),
+		m.loadReviewCmd("A")(), m.setDispositionCmd("aaaaaaaa", "done", "")(), m.deleteDispositionCmd("aaaaaaaa")(),
+	}
+	for _, msg := range current {
+		next, cmd = m.Update(msg)
+		m = next.(tuiModel)
+		switch msg.(type) {
+		case runInputsMsg:
+			if m.detail.steer.access != steerAllowed || len(m.detail.steer.queue) != 1 || (m.detail.steer.queue[0].Body == nil || *m.detail.steer.queue[0].Body != "fresh input") {
+				t.Fatal("current input probe ignored")
+			}
+		case steerResultMsg:
+			if cmd == nil {
+				t.Fatal("current steer reply did not fetch inputs")
+			}
+			if reply := cmd().(runInputsMsg); reply.gen != m.detail.gen {
+				t.Fatal("input follow-up lost generation")
+			}
+		case reviewLoadedMsg:
+			if m.detail.review.loading || m.detail.review.review == nil {
+				t.Fatal("current review ignored")
+			}
+		case dispositionDoneMsg:
+			if cmd == nil || !m.detail.review.loading || m.detail.review.notice != "triage recorded" {
+				t.Fatal("current disposition ignored")
+			}
+			if reply := cmd().(reviewLoadedMsg); reply.gen != m.detail.gen {
+				t.Fatal("review follow-up lost generation")
+			}
+		}
+	}
+	for _, cmd := range []tea.Cmd{m.setDispositionCmd("missing", "done", ""), m.deleteDispositionCmd("missing")} {
+		msg := cmd().(dispositionDoneMsg)
+		if msg.gen != m.detail.gen || msg.err == nil {
+			t.Fatal("current disposition resolution error lost generation")
+		}
+	}
+}
+
+func TestWorkerNavigationPRFreshReturnAndRoot(t *testing.T) {
+	for _, viaLink := range []bool{false, true} {
+		t.Run(fmt.Sprint(viaLink), func(t *testing.T) {
+			m, f := workerNavFixture(t)
+			m.detailReturn = viewPulls
+			b := f.RunByID["B"]
+			b.RepoID, b.MrIID = sp("repo"), ip(12)
+			if viaLink {
+				b.WorkerID = sp("worker-2")
+				m.workers.rows = append(m.workers.rows, workerRow{w: apitypes.WorkerDTO{ID: "worker-2", Status: "online", ReportedRuns: []apitypes.WorkerReportedRunDTO{{RunID: "B"}}}})
+			}
+			f.RunByID["B"] = b
+			m = press(t, m, "W")
+			next, cmd := m.handleKey(keyEnter)
+			m = next.(tuiModel)
+			next, cmd = m.Update(cmd())
+			m = workerNavFinite(t, next.(tuiModel), cmd)
+			gen := m.detail.gen
+			aux := []tea.Msg{m.fetchInputsCmd("B")(), m.submitSteerCmd(kindCancel, "", nil)(), m.loadReviewCmd("B")(), m.setDispositionCmd("missing", "done", "")()}
+			own := streamOf(t, m.openStreamCmd("B"))
+			next, _ = m.Update(own)
+			m = next.(tuiModel)
+			m = press(t, m, keyPRView)
+			requireStreamClosed(t, own.stream, "run departing for PR")
+			if !reflect.DeepEqual(m.detail, detailState{}) || m.prReturnRunID != "B" || m.prReturnRunTarget != viewWorker {
+				t.Fatal("PR retained loaded run state or lost scalar return")
+			}
+			m.fromSplit, m.splitLatch = true, false
+			if viaLink {
+				m.pr.detail.RunID = sp("B")
+				next, cmd = m.handleKey(keyRunLink)
+				m = next.(tuiModel)
+			} else {
+				next, cmd = m.handleKey(keyEsc)
+				m = next.(tuiModel)
+				if m.detailReturn != viewWorker || m.detail.runLoaded || m.prReturnRunID != "" {
+					t.Fatal("PR Esc lost fresh worker return")
+				}
+			}
+			reopen := cmd
+			if reopen == nil {
+				t.Fatal("fresh PR return did not fetch run/tail/stream")
+			}
+			if m.view != viewDetail || m.detail.runID != "B" || m.detail.gen == gen {
+				t.Fatal("PR return did not open fresh B")
+			}
+			before := m.detail
+			for _, msg := range aux {
+				next, cmd = m.Update(msg)
+				m = next.(tuiModel)
+				if cmd != nil || !reflect.DeepEqual(before, m.detail) {
+					t.Fatalf("PR return accepted stale auxiliary %T", msg)
+				}
+			}
+			next, cmd = m.Update(detailRunMsg{runID: "B", gen: gen, run: b})
+			m = next.(tuiModel)
+			if cmd != nil || m.detail.runLoaded {
+				t.Fatal("old B DTO applied")
+			}
+			stale := uzicli.NewRunStream(context.Background(), nil)
+			next, cmd = m.Update(streamReadyMsg{runID: "B", gen: gen, stream: stale})
+			m = next.(tuiModel)
+			requireStreamClosed(t, stale, "old B socket")
+			m = workerNavFinite(t, m, reopen)
+			if !m.detail.runLoaded || m.detail.stream == nil || m.detail.tailInFlight || f.gets != 2 || f.inputs != 2 {
+				t.Fatal("PR return did not execute fresh run/tail/stream/input lifecycle")
+			}
+			if viaLink {
+				m = press(t, m, "W")
+				if m.workerDetail.workerID != "worker-2" || m.detail.runID != "" {
+					t.Fatal("new worker link retained old identity or loaded run")
+				}
+				next, cmd = m.handleKey(keyEnter)
+				m = next.(tuiModel)
+				next, _ = m.Update(cmd())
+				m = next.(tuiModel)
+				m = press(t, m, keyEsc)
+			} else {
+				m = press(t, m, keyEsc)
+			}
+			if m.view != viewWorker || m.workerOrigin.runID != "A" || m.workerOrigin.detailReturn != viewPulls {
+				t.Fatal("PR link replaced root A")
+			}
+			m = press(t, m, keyEsc)
+			if m.detail.runID != "A" || m.detailReturn != viewPulls {
+				t.Fatal("worker Esc lost original A target")
+			}
+			m = press(t, m, keyEsc)
+			if m.workerOrigin != (workerOrigin{}) {
+				t.Fatal("list return retained origin")
+			}
+			m.beginRunSession("C", viewBoard)
+			c := apitypes.RunDTO{ID: "C", Status: "running", WorkerID: sp("worker-1")}
+			m = applyDetail(m, c, nil)
+			m = press(t, m, "W")
+			if m.workerOrigin.runID != "C" || m.workerOrigin.detailReturn != viewBoard {
+				t.Fatal("fresh C inherited stale root")
+			}
+		})
+	}
+}
+
+func TestWorkerNavigationMissingWorkerRearmsVisiblePollOnly(t *testing.T) {
+	for _, list := range []bool{false, true} {
+		t.Run(fmt.Sprint(list), func(t *testing.T) {
+			m, f := workerNavFixture(t)
+			if list {
+				m.view, m.topTab = viewWorkers, viewWorkers
+			}
+			m = press(t, m, "W")
+			if list {
+				m.view = viewWorkers
+				m = press(t, m, keyEnter)
+			}
+			m.workers.active, m.workers.waitID = true, 91
+			next, cmd := m.Update(workersMsg{reqID: 91})
+			m = next.(tuiModel)
+			if !list {
+				for _, msg := range drainCmd(cmd) {
+					if _, ok := msg.(workersTickMsg); ok {
+						t.Fatal("hidden run origin rearmed workers")
+					}
+				}
+				return
+			}
+			msgs := drainCmd(cmd)
+			if len(msgs) != 1 {
+				t.Fatalf("visible disappearance commands: %v", msgs)
+			}
+			tick, ok := msgs[0].(workersTickMsg)
+			if !ok {
+				t.Fatalf("missing visible worker tick: %T", msgs[0])
+			}
+			next, cmd = m.Update(tick)
+			m = next.(tuiModel)
+			if cmd == nil {
+				t.Fatal("tick discarded next poll")
+			}
+			reply := cmd().(workersMsg)
+			if f.lists != 1 || reply.reqID != m.workers.waitID {
+				t.Fatal("tick did not request exactly one next poll")
+			}
+			_, duplicate := m.Update(tick)
+			if duplicate != nil {
+				t.Fatal("tick duplicated pending poll")
+			}
+		})
 	}
 }

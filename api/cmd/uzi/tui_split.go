@@ -25,6 +25,7 @@ func (m tuiModel) listView() bool {
 	return m.view == viewBoard || m.view == viewWorkers || m.view == viewCI || m.view == viewPulls
 }
 func (m *tuiModel) setListView(v tuiView) {
+	m.workerOrigin = workerOrigin{}
 	m.view = v
 	if v == viewBoard || v == viewWorkers {
 		m.topTab = v

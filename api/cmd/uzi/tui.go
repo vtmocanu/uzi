@@ -327,10 +327,12 @@ type tuiModel struct {
 	// (D1): the PR view returns to prReturn (the pulls list, or the run view on detail→m→PR), and
 	// the run view returns to detailReturn (the board by default, or pulls / PR on a u ↳ run jump).
 	// prReturn defaults to viewPulls; detailReturn to viewBoard (the zero value), so the existing
-	// board↔detail behaviour is unchanged. The state returned to is never clobbered — m.pulls /
-	// m.detail persist on the model — so it is still loaded when esc lands back on it.
-	prReturn     tuiView
-	detailReturn tuiView
+	// board↔detail behaviour is unchanged. PR run returns retain only an ID and target;
+	// the run is reopened in a fresh session on return.
+	prReturn          tuiView
+	prReturnRunID     string
+	prReturnRunTarget tuiView
+	detailReturn      tuiView
 	// forgeNotice is the transient one-line confirmation / server-reason a w (rework) / f (fix ci)
 	// action leaves, drawn in the PR view's and the pulls screen's header-note area (D1/D12). It is
 	// set by prActionMsg, overwritten by the next action, and cleared when a PR view is opened fresh
@@ -1442,7 +1444,7 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.maybeArmBlink()
 
 	case runInputsMsg:
-		if msg.runID != m.detail.runID {
+		if msg.runID != m.detail.runID || msg.gen != m.detail.gen {
 			return m, nil
 		}
 		m.detail.steer.access = steerAccessFor(m.detail.run, msg.err)
@@ -1452,7 +1454,7 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case steerResultMsg:
-		if msg.runID != m.detail.runID {
+		if msg.runID != m.detail.runID || msg.gen != m.detail.gen {
 			return m, nil
 		}
 		m.applySteerResult(msg)
@@ -1467,7 +1469,7 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.fetchInputsCmd(m.detail.runID)
 
 	case reviewLoadedMsg:
-		if msg.runID != m.detail.runID {
+		if msg.runID != m.detail.runID || msg.gen != m.detail.gen {
 			return m, nil
 		}
 		m.detail.review.loading = false
@@ -1479,7 +1481,7 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case dispositionDoneMsg:
-		if msg.runID != m.detail.runID {
+		if msg.runID != m.detail.runID || msg.gen != m.detail.gen {
 			return m, nil
 		}
 		if msg.err != nil {

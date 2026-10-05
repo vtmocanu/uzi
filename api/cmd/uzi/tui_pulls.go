@@ -414,6 +414,7 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 		m.fromSplit = m.splitDrawn()
 		m.view = viewPR
 		m.prReturn = viewPulls
+		m.prReturnRunID, m.prReturnRunTarget = "", viewBoard
 		m.forgeNotice = ""
 		return m, (&m).startPRReq()
 	case keyRunLink:

@@ -657,7 +657,7 @@ func TestTUIPRProvenanceRoundTrips(t *testing.T) {
 	}
 }
 
-// detail → m → PR → esc → detail → esc → board, and the run view is not clobbered.
+// detail → m → PR → esc freshly reopens detail → esc → board.
 func TestTUIDetailMToPRRoundTrip(t *testing.T) {
 	runID := "abcd1234-1111-2222-3333-444444444444"
 	run := apitypes.RunDTO{ID: runID, Status: "running", RepoID: sp("r1"), MrIID: ip(1254), IssueTitle: "a run"}
@@ -688,8 +688,8 @@ func TestTUIDetailMToPRRoundTrip(t *testing.T) {
 	if m.view != viewDetail {
 		t.Fatalf("PR esc did not return to the run view (view=%v)", m.view)
 	}
-	if m.detail.run.ID != runID {
-		t.Fatalf("the run view was clobbered by the PR round trip (runID=%q)", m.detail.run.ID)
+	if m.detail.runID != runID || m.detail.runLoaded || m.detailReturn != viewBoard || m.prReturnRunID != "" {
+		t.Fatal("PR return did not freshly reopen the run with its original target")
 	}
 	m = press(t, m, keyEsc)
 	if m.view != viewBoard {

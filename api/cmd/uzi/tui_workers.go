@@ -183,6 +183,7 @@ func (m tuiModel) applyWorkers(msg workersMsg) (tea.Model, tea.Cmd) {
 		m.workers.clamp(len(v))
 		m.workers.rememberSelection(v)
 	}
+	var departure tea.Cmd
 	if msg.err == nil && m.view == viewWorker {
 		if _, ok := m.scopedWorker(m.workerDetail.workerID); !ok {
 			m.workerDetail.notice = "worker not in your list"
@@ -193,15 +194,16 @@ func (m tuiModel) applyWorkers(msg workersMsg) (tea.Model, tea.Cmd) {
 			} else {
 				m.splitNote = "worker not in your list"
 			}
-			return m, cmd
+			departure = cmd
+		} else {
+			m.reconcileReportedRun()
 		}
-		m.reconcileReportedRun()
 	}
 	if !m.workersVisible() {
-		return m, nil
+		return m, departure
 	}
 	m.workers.tickGen++
-	return m, workersTickAfter(workersTickInterval(m.workers.errStreak), m.workers.tickGen)
+	return m, tea.Batch(departure, workersTickAfter(workersTickInterval(m.workers.errStreak), m.workers.tickGen))
 }
 func workerState(r workerRow) string {
 	w := r.w

@@ -289,6 +289,7 @@ func (m tuiModel) steerKey(k string) (tuiModel, tea.Cmd, bool) {
 }
 
 type steerResultMsg struct {
+	gen   uint64
 	runID string
 	kind  string
 	res   apitypes.RunInputResponse
@@ -299,6 +300,7 @@ type steerResultMsg struct {
 }
 
 type runInputsMsg struct {
+	gen    uint64
 	runID  string
 	inputs []apitypes.SteerInputDTO
 	err    error
@@ -317,19 +319,19 @@ func gateRevisionOf(run apitypes.RunDTO) *int64 {
 // submitSteerCmd posts one steering input. expectedGateRevision is the revision captured when
 // the verdict started (`y` pressed, or the reject confirmation opened); nil for other kinds.
 func (m tuiModel) submitSteerCmd(kind, body string, expectedGateRevision *int64) tea.Cmd {
-	c, ctx, runID := m.client, m.ctx, m.detail.runID
+	c, ctx, runID, gen := m.client, m.ctx, m.detail.runID, m.detail.gen
 	return func() tea.Msg {
 		res, err := c.SubmitRunInput(ctx, runID, kind, body, nil, false, expectedGateRevision)
-		return steerResultMsg{runID: runID, kind: kind, res: res, err: err, expected: expectedGateRevision}
+		return steerResultMsg{runID: runID, gen: gen, kind: kind, res: res, err: err, expected: expectedGateRevision}
 	}
 }
 
 // fetchInputsCmd doubles as the ownership probe — see steerAccessFor.
 func (m tuiModel) fetchInputsCmd(runID string) tea.Cmd {
-	c, ctx := m.client, m.ctx
+	c, ctx, gen := m.client, m.ctx, m.detail.gen
 	return func() tea.Msg {
 		in, err := c.RunInputs(ctx, runID)
-		return runInputsMsg{runID: runID, inputs: in, err: err}
+		return runInputsMsg{runID: runID, gen: gen, inputs: in, err: err}
 	}
 }
 
