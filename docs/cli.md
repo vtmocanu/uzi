@@ -772,8 +772,12 @@ A few worth knowing:
   controller report, background loops, the database, integrations, housekeeping), with an
   overall verdict and a per-severity tally. By default it prints only the checks needing
   attention (everything that is not `ok` and not `na`) as
-  `SEVERITY CHECK SINCE SUMMARY`, then the verdict and the tally. `--all` lists every
-  check. `--json` emits the endpoint's document unchanged. **Its exit code is a probe
+  `SEVERITY CHECK SINCE SUMMARY`, then overall status,
+  `blocking: true/false (instance-wide)` and the tally. The server's blocking flag
+  means an instance-scoped check is danger; owner-only danger remains visible and still exits 8.
+  `--all` lists every check. `--json` emits the endpoint's document unchanged.
+  See [admin health](admin-health.md#severity) for scope and banner/episode routing.
+  **Its exit code is a probe
   contract:** 0 unless the overall status is `danger`, then **8**; `--strict` also exits
   8 on `warn` or `unknown`. Exit 8 is a **success-path** exit — the HTTP call returned
   200 carrying an unhealthy verdict — so the full report prints first, and a transport or

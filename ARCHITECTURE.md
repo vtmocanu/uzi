@@ -1908,18 +1908,33 @@ pods themselves stays out of scope, owned by cluster monitoring. See
 [ADR-1484](adr/1484-in-app-health-boundary.md) for the checks, the boundary
 rationale, and the deferred items (version skew, per-connection sync freshness).
 
-Admin danger-episode notices (#2271) select only checks at `danger` with the
-literal IDs `db`, `controller.report`, `loops`, and `fleet.roll`. The maintainer
-classifies `fleet.roll` as instance infrastructure even for a single owner's
-workers. Owner checks (`queue.waiting`, `fleet.capacity`, `queue.undispatched`)
-and future nonallowlisted IDs cannot trigger an admin DM or enter its check
-list. Episode opening, closing, the two-tick debounce, banner and snooze still
-follow overall status. Owner-only danger opens or holds an episode without
-claiming an admin notice; later instance danger sends on its first tick in that
-open episode. Once notified, another instance failure cannot renotify while
-owner danger holds it open; overall recovery rearms. Owner run-health DMs,
-including `waiting_worker` capability reasons, retain their existing routing.
-See [docs/admin-health.md](docs/admin-health.md) for the notice contract.
+The health registry supplies each check's `scope` (#2293): `db`,
+`controller.report`, `loops` and `fleet.roll` are `instance`; the rest are
+`owner`. `fleet.roll` remains instance infrastructure even for a single owner.
+The server emits `blocking` on every document, true exactly when an instance
+check is danger. Overall status, counts, attention pips, history and CLI exit
+status still cover the full registry. Episodes, admin Slack notices, banner
+and snooze follow `blocking`, superseding #2271's overall-episode timing:
+the opening tick sends nothing; the next still-blocking tick claims a notice
+per admin with instance-danger checks. Clearing instance danger closes and
+rearms even if owner danger remains. Owner-only danger opens no episode,
+sends no admin DM and raises no banner; owner run-health routing is unchanged.
+
+The web derives blocker count/cause from server scope with no client ID map.
+A present `blocking` is authoritative; an absent field conservatively uses
+legacy status/danger count/first danger, including the snooze expiry timer.
+This accepted follow-up replaces the originally deferred mixed-version fallback.
+Api-before-web upgrades and web-before-api rollbacks are preferred to avoid
+legacy owner false positives, not required to prevent suppressed banners.
+
+Capacity and queue share one evaluation-local, run-memoized confirmation
+coordinator (capacity first, 200 calls, 2s per call, lazy shared 4s budget).
+The full `waiting_worker` population excludes confirmed upgrade drains from
+`queue.waiting`, even overdue ones; `fleet.capacity` retains D18's 24h
+later-wait/drain overlap, independent of controller deadlines. Failed or invalid
+confirmation leaves a genuine wait. See
+[docs/admin-health.md](docs/admin-health.md) for predicates, evidence bounds,
+thresholds and the notice contract.
 
 Issue-sync failure streaks have shipped as `forge.sync`
 ([#2203](https://github.com/vtmocanu/uzi/issues/2203)), separate from deferred

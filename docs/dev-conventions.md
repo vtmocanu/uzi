@@ -630,13 +630,19 @@ scenarios are mutually exclusive by construction. Known values:
   run title. Requires a signed-in admin user for the switch to render; the
   owner-scoped `Mine` view is unchanged (it never reads the synthetic owners).
   (PRD #1184.)
-- `health-degraded`, `health-incident`, `health-silent` — the PRD #1484
+- `health-degraded`, `health-incident`, `health-owner-only`,
+  `health-confirmed-drain`, `health-silent` — the PRD #1484 / #2293
   Admin → Health tab (`/admin/health?mock=<name>`).
-  `health-degraded` serves a warn-level document (two warnings, nothing
-  blocked); `health-incident` serves a danger document AND makes the workers
-  mock return a stuck hosted fleet, so the cross-user fleet table shows the
-  blocking container and reason across owners; `health-silent` (the default too)
-  serves an all-passing document. Requires a signed-in admin. (PRD #1484.)
+  `health-degraded` serves two warnings with neutral attention copy.
+  `health-incident` mixes owner danger with one instance blocker (`fleet.roll`):
+  the banner says one blocking check while Health retains all attention items.
+  Its workers mock returns a stuck hosted fleet, with blocking container and
+  reason across owners. `health-owner-only` shows owner capacity/queue danger
+  and bounded waiting-run evidence without an episode, banner or snooze.
+  `health-confirmed-drain` shows a 40-minute orderly upgrade wait: queue excludes
+  it and capacity stays `ok` below 24h, without an episode.
+  `health-silent` (the default too) serves an all-passing document.
+  Requires a signed-in admin.
 
 ### What keeps the mock build current
 

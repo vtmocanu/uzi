@@ -42,9 +42,9 @@ It surfaces five ways:
   health: all N checks passing"); otherwise it shows the verdict and the top
   three attention items, with one Open health link to the Health tab. It
   makes no request at all for a non-admin.
-- **An app-wide Danger banner**, admins only, shown only while the overall
-  status is `danger`. It carries the verdict, the top danger check's own
-  summary, an Open health link, and **Snooze 1 h** — per admin, per danger
+- **An app-wide Danger banner**, admins only, shown while `blocking` is
+  `true`. It carries the instance-blocker verdict, the first instance danger
+  check's own summary, an Open health link, and **Snooze 1 h** — per admin, per danger
   episode. The snooze button appears only while an episode is open; a new
   episode (a fresh incident, not a continuation of the same one) shows the
   banner again even if the prior one was snoozed.
@@ -52,26 +52,24 @@ It surfaces five ways:
   `UPGRADE`, `BLOCKING`) on `uzi admin workers`, which previously showed no
   upgrade information at all for another user's worker.
 - **One notice per admin per Danger episode**, as a Slack DM for a linked
-  admin, selects only `danger` checks with the literal IDs `db`,
-  `controller.report`, `loops`, or `fleet.roll`. By maintainer decision,
-  `fleet.roll` is instance infrastructure even when the hosted workers belong
-  to a single owner. Owner checks, including `queue.waiting`, `fleet.capacity`,
-  and `queue.undispatched`, and future nonallowlisted IDs never trigger an admin
-  DM or appear in its check list.
+  admin, selects checks with server-supplied `scope: instance` and severity
+  `danger`. The current instance checks are `db`, `controller.report`, `loops`
+  and `fleet.roll`; the rest are `owner`. `fleet.roll` remains instance
+  infrastructure even when the hosted workers belong to a single owner.
 
-  The two-tick debounce still follows **overall danger**, not the notice
-  subset: the opening evaluation sends nothing. Owner-only danger can open
-  and hold an episode without consuming an admin notice claim; an allowlisted
-  instance danger arriving later sends on its **first tick** in that already
-  open episode. Once notified, a second instance failure does not send another
-  notice while owner danger holds the episode open. Overall recovery closes
-  the episode and rearms notices. A one-tick overall danger blip that recovers
-  on the next tick notifies nobody. Notices use the same "Enable run-health
-  detection" (`health_enabled`) setting as the run-health detector.
+  Episodes follow `blocking`: the opening evaluation sends nothing, and the
+  next still-blocking evaluation claims one notice per admin. Another instance
+  failure in the same episode does not send a fresh notice. When `blocking`
+  becomes `false`, the evaluator closes the episode and rearms notices, even
+  if owner danger remains. Owner-only danger neither opens nor holds an
+  episode, sends an admin DM, nor raises the banner. A one-tick instance danger
+  blip notifies nobody. Notices use the same "Enable run-health detection"
+  (`health_enabled`) setting as the run-health detector.
 
-  The Health tab, Overview card, CLI, Danger banner and snooze still use the
-  full check registry and overall status. Owner run-health DMs, including a
-  `waiting_worker` capability reason, keep their existing routing.
+  Health, Overview, counts, attention pips, history and CLI status retain the
+  full registry. Owner run-health DMs, including a `waiting_worker` capability
+  reason, keep their existing routing. This replaces #2271's overall-episode
+  timing ([#2293](https://github.com/vtmocanu/uzi/issues/2293)).
 
 A non-admin gets none of the above. Instead, Overview shows a single platform
 line — "Your hosted workers cannot start right now… This is a platform
@@ -112,18 +110,37 @@ or `na`.
 - The **overall status** is the worst of `danger`, then `warn`; `unknown`
   ranks as `warn` for that rollup, and `na` never contributes (an all-`na`,
   all-`ok` deployment — compose, with no hosted workers and no Slack — reads
-  overall `ok`). **Overall `danger` raises the banner; admin notices require
-  an allowlisted instance check at `danger`**, as described above.
-- A **worker roll in progress never alarms.** Only a pod actually stuck
-  (`CrashLoopBackOff`, `ImagePullBackOff`, `ErrImagePull`,
-  `CreateContainerConfigError`, `CreateContainerError`, `InvalidImageName`)
-  does.
+  overall `ok`). Each check carries `scope: instance` or `scope: owner`.
+  The server emits `blocking` on every document, `true` exactly when an
+  instance check is `danger`. Episodes, admin notices, banner and snooze
+  follow this separate field, not overall status.
+- Owner-only danger reads **"N checks need attention; no instance-wide blocker
+  detected"** ("1 check needs attention" for one). Warn/unknown use neutral
+  attention copy. With instance danger, the blocking headline count and cause
+  use instance-danger checks; owner evidence remains in the attention list.
+- **`fleet.roll` does not alarm for an orderly roll in progress.** It reports
+  stuck pods (`CrashLoopBackOff`, `ImagePullBackOff`, `ErrImagePull`,
+  `CreateContainerConfigError`, `CreateContainerError`, `InvalidImageName`).
+  `fleet.capacity` separately reports overdue confirmed upgrade waits at
+  24 hours, as described [below](#workers).
 
 Every `summary`, `action`, and `command` string the endpoint returns is
 composed server-side from a fixed template per check id, plus numbers, closed
 enums, and identifiers an admin may already see (owner names, worker names,
 repo paths). No free text from Kubernetes, a forge, a run, or a worker is ever
 interpolated as-is.
+
+## Mixed-version web and api
+
+The web honors a present `blocking: true` or `blocking: false` exactly, using
+server scope for the blocker count and cause; it has no client-side ID map.
+If `blocking` is absent on an older api response, it conservatively uses the
+legacy `status`, `counts.danger` and first danger check, including the snooze
+expiry timer. This accepted fallback supersedes the originally deferred
+mixed-version fallback in #2293. It can show a legacy owner-only banner.
+Upgrade the api before the web, and roll back the web before the api, to avoid
+those false positives; that order is preferred, not required to prevent a
+suppressed banner.
 
 ## The checks
 
@@ -136,7 +153,7 @@ except `forge.sync`, whose windows follow the effective forge poll interval.
 | Check | What it means | `warn` | `danger` | `unknown` / `na` |
 |---|---|---|---|---|
 | `fleet.roll` | Whether hosted worker pods are rolling cleanly to their target image tag, from the controller's per-pod roll signal | some hosted workers are stuck | every hosted worker is stuck | `unknown` when the newest roll signal is older than the controller-signal freshness window *and* `controller.report` is not `ok` (a genuinely silent controller, not just an idle fleet); `na` when no hosted workers are configured |
-| `fleet.capacity` | Owners waiting without a fresh non-draining worker; stored upgrade reasons are confirmed against current composed eligibility | — | genuine wait at least 5 minutes, or confirmed upgrade-wait overlap at least 24 hours | `unknown` when the run-health detector is off or its state could not be read |
+| `fleet.capacity` | Owners waiting without a fresh non-draining worker; stored upgrade reasons are confirmed against current composed eligibility | — | genuine wait at least 5 minutes, or confirmed upgrade-wait overlap at least 24 hours | `unknown` when the run-health detector is off/unreadable, the query fails, or a genuine wait has unavailable age unless a valid wait establishes danger |
 | `fleet.disk` | Whether any worker is under sustained disk pressure | any worker with a fresh heartbeat has a disk-pressure streak of 2+ consecutive polls | — | — |
 | `fleet.rundisk` | Whether one run is close to filling its worker's data volume (PRD #1809 M6, D8) | a fresh worker's largest reported run HOME is 40%+ of the data volume's total bytes, or the volume has less than 5% of its inodes free | — | `unknown` when the largest-run-size lookup itself fails |
 
@@ -160,8 +177,27 @@ union, so an owner in both groups is counted once.
 
 | Check | What it means | `warn` | `danger` | `unknown` / `na` |
 |---|---|---|---|---|
-| `queue.waiting` | How long the oldest run has been waiting for a worker | oldest wait is 10+ minutes | oldest wait is 30+ minutes | `unknown` when the run-health detector is off, or its state could not be read |
+| `queue.waiting` | Oldest genuine wait across the full `waiting_worker` population, excluding confirmed upgrade drains | oldest genuine wait is 10+ minutes | oldest genuine wait is 30+ minutes | `unknown` when the run-health detector is off/unreadable, the query fails, or a genuine wait has unavailable age unless a valid wait establishes danger |
 | `queue.undispatched` | A queued task run that never got dispatched (the [#1367](https://github.com/vtmocanu/uzi/issues/1367) failure class) | — | any `kind = 'task'`, `status = 'queued'` run with no dispatch for 10+ minutes | — |
+
+The queue evaluates the full waiting population, including owners with usable
+workers. Exclusion requires the exact stored `workersvc.ReasonWorkersUpgrading`
+value ("your workers are finishing their current runs before an upgrade; this
+run starts after"), valid non-null, finite, nonzero, nonfuture `health_since`
+and latest suitable drain timestamp,
+and current eligibility with `DrainingEligible > 0`, `NonDrainingEligible == 0`
+and `SuitableOwnDraining == 0`. An unconfirmed wait stays on the genuine path.
+Confirmed drains remain excluded from `queue.waiting` even when overdue;
+`fleet.capacity` owns the 24-hour overlap rule above.
+
+Capacity runs first with a shared per-evaluation confirmation coordinator,
+memoized by run (including failed reads). It permits at most 200 distinct
+confirmation calls, two seconds per call and a shared four-second budget,
+started lazily on the first call. Errors, elapsed deadlines, exhausted caps or
+budgets and invalid timestamps fail closed to genuine-wait treatment. Callbacks
+must honor their context. Queue and capacity evidence show at most five run
+rows with sanitized run/owner IDs, wait and stored reason, plus an omitted-row
+count; severity still uses the full population.
 
 ### Control
 
@@ -308,6 +344,11 @@ uzi admin health --all        # every check, including ok/na
 uzi admin health --json       # the endpoint's document, unchanged
 uzi admin health --strict     # also exit nonzero on warn/unknown, not just danger
 ```
+
+Text output includes `blocking: true (instance-wide)` or
+`blocking: false (instance-wide)` alongside the overall status and tally.
+Owner-only danger still exits `8`; `blocking` does not change `--strict`,
+transport/auth handling or malformed-document handling.
 
 The exit code is the probe contract:
 

@@ -41,6 +41,9 @@ through `[0.52.0]`.)
 - **Incidental finding line ranges share a coordinate ([#2287](https://github.com/vtmocanu/uzi/issues/2287)).**
   New reports strip trailing line ranges just like single line numbers, preserving symbol distinctions and each report's evidence. Existing stored coordinates are unchanged.
 
+- **Owner health problems stay visible without raising an instance outage banner ([#2293](https://github.com/vtmocanu/uzi/issues/2293)).**
+  Banners, episodes and admin Slack notices now follow instance blockers; owner problems remain visible in Health and still exit CLI code 8. Confirmed worker-upgrade drains no longer age into queue alarms, while capacity retains its 24-hour overlap limit. Health reports add scoped blocking and bounded run evidence; older API responses keep the conservative legacy banner.
+
 ## [0.85.2] - 2026-10-05
 
 ### Changed
