@@ -14,8 +14,9 @@ const result = {
  sharedDeviceRead: attempt(() => fs.readdirSync("/dev/shm")),
  checkoutRead: attempt(() => fs.readFileSync(checkout + "/read.txt")),
  checkoutWrite: attempt(() => fs.writeFileSync(checkout + "/write.txt", "probe")),
- systemRead: attempt(() => fs.readFileSync(process.execPath)),
- systemWrite: attempt(() => { const fd = fs.openSync(process.execPath, "r+"); fs.closeSync(fd); }),
+ // /etc/passwd is a non-executing file in the cross-check system read grants.
+ systemRead: attempt(() => fs.readFileSync("/etc/passwd")),
+ systemWrite: attempt(() => { const fd = fs.openSync("/etc/passwd", "r+"); fs.closeSync(fd); }),
  toolchainRead: attempt(() => fs.readFileSync("/opt/uzi-toolchain/bin/go")),
  toolchainWrite: attempt(() => { const fd = fs.openSync("/opt/uzi-toolchain/bin/go", "r+"); fs.closeSync(fd); }),
  siblingRead: attempt(() => fs.readFileSync(sibling + "/secret.txt")),
@@ -81,6 +82,7 @@ function directProof() {
   const control = run(["--root", checkout, "--tmp", controlTmp, "--cwd", checkout, "--mode", "off"]);
   assert.equal(control.status, 0, control.stderr);
   const unconfined = JSON.parse(control.stdout);
+  assert.equal(unconfined.systemWrite, "allowed", "systemWrite control must allow the same r+ open without confinement");
   assert.equal(unconfined.checkoutWrite, "allowed");
   assert.equal(unconfined.siblingRead, "allowed");
   assert.equal(unconfined.siblingWrite, "allowed");

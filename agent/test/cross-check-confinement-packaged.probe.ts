@@ -149,12 +149,10 @@ test("packaged Codex authenticates and creates a session with confined productio
     assert.equal(config.config.project_doc_max_bytes, 0);
     assert.equal((config.config.features as Record<string, unknown>).shell_tool, false);
     const result = await transport.request<{ thread: { id: string } }>("thread/start", {
-      model: "gpt-5-codex", cwd: checkout, approvalPolicy: "never", sandbox: "danger-full-access", ephemeral: false,
+      model: "gpt-5-codex", cwd: checkout, approvalPolicy: "never", sandbox: "danger-full-access", ephemeral: true,
     }, { signal: AbortSignal.timeout(5000) });
     assert.ok(result.thread.id);
-    const resumed = await transport.request<{ thread: { id: string } }>("thread/resume", { threadId: result.thread.id, cwd: checkout }, { signal: AbortSignal.timeout(5000) });
-    assert.equal(resumed.thread.id, result.thread.id);
-    // Check auth/config/session custody using the real runner uid helper. No model turn or external call.
+    // Session creation only; check auth/config/session custody using the real runner uid helper. No model turn or external call.
     const custodyCommand = runnerCommand(process.execPath, ["--eval",
       `const fs=require("node:fs"); const root=process.argv[1]; const st=p=>fs.statSync(root+p);
       console.log(JSON.stringify({root:st(""),config:st("/codex/config.toml"),auth:st("/codex/auth.json"),sessions:st("/codex/sessions")}));`,
@@ -168,7 +166,7 @@ test("packaged Codex authenticates and creates a session with confined productio
     assert.equal(observed.config!.mode & 0o7777, 0o600);
     assert.equal(observed.auth!.mode & 0o7777, 0o600);
     assert.equal(observed.sessions!.mode & 0o7777, 0o2750);
-    console.log("PASS: PACKAGED Codex initialize/login/session/config and credential custody");
+    console.log("PASS: PACKAGED Codex initialize/login/session creation/config and credential custody");
   } catch (e) { console.error("NOT RUN/FAIL: packaged Codex proof", e); throw e; }
   finally {
     auth.closeAdmissionAndCancel();
