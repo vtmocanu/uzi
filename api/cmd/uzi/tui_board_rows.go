@@ -314,7 +314,12 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 		markerAllow = mc.fullW + 2
 	}
 	// The outer list field shadows RunDTO.WorkerName; project it explicitly.
-	text := struct{ runWorkerName string }{runWorkerName: workerString(r.WorkerName)}
+	text := struct{ runWorkerName string }{runWorkerName: "no worker yet"}
+	if r.WorkerName != nil {
+		text.runWorkerName = *r.WorkerName
+	} else if terminalRunStatuses[r.Status] {
+		text.runWorkerName = "—"
+	}
 	workerWidth := 0
 	if m.width >= 120 {
 		workerWidth = 18 // two spaces and a fixed 16-column worker cell
