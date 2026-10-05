@@ -100,6 +100,8 @@ interface AuthState {
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
+  // Apply an authoritative current-user DTO returned by a successful settings save.
+  updateUser: (savedUser: User) => void;
   // serverUnreachable is true when the session probe failed for a reason other than
   // 401 (a 503 from a transient DB outage, or a network error), so the SPA does not
   // know whether the visitor is signed in. Route guards show a retry panel instead
@@ -131,9 +133,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [effectiveJudgeModel, setEffectiveJudgeModel] = useState("");
   const [serverUnreachable, setServerUnreachable] = useState(false);
   // At most one session probe is in flight: a refresh while one is pending joins it,
-  // so probe results can never settle out of order. sessionGen is bumped only by an
-  // explicit login, register or logout, or by another request's 401; a probe that
-  // started before one of those drops its result, so it cannot undo the newer state.
+  // so probe results can never settle out of order. sessionGen is bumped by an
+  // explicit login, register, logout, settings update or another request's 401;
+  // a probe started before one of those drops its result rather than undoing it.
   const probeInFlight = useRef<Promise<void> | null>(null);
   const sessionGen = useRef(0);
 
@@ -172,6 +174,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // value while an absent field (older server) reads as the safe not-enforced state.
     setJudgeEnforcedByAdmin(session.judge_enforced_by_admin ?? false);
     setEffectiveJudgeModel(session.effective_judge_model ?? "");
+  }, []);
+
+  const updateUser = useCallback((savedUser: User) => {
+    // Invalidate older probes before queuing the authoritative user update. Only
+    // the current identity may be reconciled: a late save cannot undo logout or
+    // replace a different user's session. Session metadata stays untouched.
+    sessionGen.current += 1;
+    setUser((current) => (current?.id === savedUser.id ? savedUser : current));
   }, []);
 
   const refresh = useCallback(() => {
@@ -311,6 +321,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       login,
       logout,
       refresh,
+      updateUser,
       serverUnreachable,
       retry: refresh,
     }),
@@ -329,6 +340,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       login,
       logout,
       refresh,
+      updateUser,
       serverUnreachable,
     ],
   );

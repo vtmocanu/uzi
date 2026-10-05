@@ -47,7 +47,7 @@ export function HostedWorkers({
    *  `{ manual: false }` when hosting is disabled, quota is 0, or the config read rejects. */
   onAvailability?: (a: { manual: boolean }) => void;
 }) {
-  const { user, refresh } = useAuth();
+  const { user, updateUser } = useAuth();
   const [config, setConfig] = useState<HostedConfig | null>(null);
   const [template, setTemplate] = useState<string>(DEFAULT_WORKER_TEMPLATE);
   const [size, setSize] = useState<string>(DEFAULT_WORKER_SIZE);
@@ -56,7 +56,7 @@ export function HostedWorkers({
   const [docker, setDocker] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  // Both ephemeral preference controls stay disabled through the write and refresh.
+  // Both ephemeral preference controls stay disabled until the saved user is applied.
   const [ephemeralBusy, setEphemeralBusy] = useState(false);
   // The ephemeral toggle carries its OWN error slot, rendered beside the toggle at the
   // bottom of the card, so a failed write is visible where the user acted — not in the
@@ -131,14 +131,14 @@ export function HostedWorkers({
 
   // Both preferences share a pending lock. Keep rendering confirmed auth values;
   // a rejected write therefore restores the control without a speculative value.
-  // Refresh the session after saving, as with the other per-user settings.
+  // Apply the saved user directly so an older session probe cannot undo the write.
   const toggleEphemeral = async (prefs: boolean | { docker: boolean }) => {
     if (ephemeralBusy) return;
     setEphemeralError("");
     setEphemeralBusy(true);
     try {
-      await api.setEphemeralWorkersEnabled(prefs);
-      await refresh();
+      const { user: savedUser } = await api.setEphemeralWorkersEnabled(prefs);
+      updateUser(savedUser);
     } catch (err) {
       setEphemeralError(errorMessage(err, "Failed to update ephemeral workers"));
     } finally {
