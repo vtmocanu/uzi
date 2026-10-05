@@ -299,9 +299,9 @@ func TestEphemeralDockerFinalPlacementLiveDB(t *testing.T) {
 			warm := fx.leasedWorker(time.Minute)
 			cliMustExec(t, fx.pool, "UPDATE workers SET docker_enabled=false WHERE id=$1", warm.id)
 			run := fx.followUp(warm)
-			p, probe := fx.dockerProvisioner(tc.pref, tc.tier, tc.member, 2, tc.fail)
+			_, probe := fx.dockerProvisioner(tc.pref, tc.tier, tc.member, 2, tc.fail)
 			// Use the same settings snapshot with a live lease.
-			p = hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{DockerEnabled: tc.tier, MaxPerUser: 2, DefaultSize: "m", Lease: 2 * time.Hour})
+			p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{DockerEnabled: tc.tier, MaxPerUser: 2, DefaultSize: "m", Lease: 2 * time.Hour})
 			if _, err := p.ProvisionPass(fx.ctx); err != nil {
 				t.Fatal(err)
 			}
@@ -335,8 +335,8 @@ func TestEphemeralDockerWarmStepAsideLiveDB(t *testing.T) {
 	warm := fx.leasedWorker(time.Minute)
 	cliMustExec(t, fx.pool, "UPDATE workers SET docker_enabled=false WHERE id=$1", warm.id)
 	run := fx.followUp(warm)
-	p, probe := fx.dockerProvisioner(true, true, true, 2, false)
-	p = hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{DockerEnabled: true, MaxPerUser: 2, DefaultSize: "m", Lease: 2 * time.Hour})
+	_, probe := fx.dockerProvisioner(true, true, true, 2, false)
+	p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{DockerEnabled: true, MaxPerUser: 2, DefaultSize: "m", Lease: 2 * time.Hour})
 	svc := workersvc.New(fx.q, fx.box, workersvc.Params{WorkerHeartbeatStale: time.Minute, WorkerAffinityCeiling: time.Minute})
 	svc.SetTxBeginner(fx.pool)
 	svc.SetEphemeralLease(2 * time.Hour)
