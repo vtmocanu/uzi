@@ -8002,7 +8002,7 @@ WHERE run_id = @run_id AND consumed_at IS NULL AND contract_revision < @new_revi
 -- usable workers" is what makes waiting_worker a CAPACITY failure rather than one of its
 -- other causes (vault locked, custody limit, all workers busy) — those surface through
 -- queue.waiting by age instead.
-SELECT r.user_id, r.id AS run_id, r.health_since,
+SELECT r.user_id, r.id AS run_id, r.health_since, r.health_reason,
        (COALESCE(r.health_reason = @roll_reason::text, false))::boolean AS has_roll_reason
 FROM runs r
 WHERE r.health = 'waiting_worker'
@@ -8012,17 +8012,15 @@ WHERE r.health = 'waiting_worker'
         AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
         AND w.last_heartbeat_at IS NOT NULL
         AND w.last_heartbeat_at >= @heartbeat_cutoff
-  );
+  )
+ORDER BY CASE WHEN isfinite(r.health_since) THEN 0 ELSE 1 END, r.health_since, r.id;
 
--- name: OldestWaitingWorkerRun :one
--- health queue.waiting: the oldest health_since across every run in
--- health='waiting_worker', or NULL when none is waiting. healthsvc applies warn >= 10 min
--- and danger >= 30 min. This is the sole reader of the age; the writer (detectRunHealth)
--- is gated by health_enabled, so when that setting is off the check reports unknown, not
--- ok, rather than reading this NULL as "nothing waiting".
-SELECT min(health_since)::timestamptz AS oldest_health_since
+-- name: ListWaitingWorkerRuns :many
+-- Full waiting population, including owners with usable capacity and unknown ages.
+SELECT id AS run_id, user_id, health_reason, health_since
 FROM runs
-WHERE health = 'waiting_worker';
+WHERE health = 'waiting_worker'
+ORDER BY CASE WHEN isfinite(health_since) THEN 0 ELSE 1 END, health_since, id;
 
 -- name: OldestUndispatchedTaskRun :one
 -- health queue.undispatched: the oldest created_at across every task run stuck queued

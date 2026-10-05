@@ -55,7 +55,7 @@ func TestEvaluateBlocking(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := &fakeStore{controller: pgtype.Timestamptz{Time: fixedNow, Valid: true}}
 			if tc.owner {
-				fs.waiting = pgtype.Timestamptz{Time: fixedNow.Add(-time.Hour), Valid: true}
+				fs.waitingRows = []store.ListWaitingWorkerRunsRow{{HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-time.Hour), Valid: true}}}
 			}
 			if tc.roll {
 				fs.workers = []store.ListAllWorkersRow{hostedRow("worker", "stuck", time.Second, "ImagePullBackOff", "worker", "0.84.0")}

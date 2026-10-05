@@ -8004,7 +8004,7 @@ func (q *Queries) ListLimitWaitReeval(ctx context.Context, now pgtype.Timestampt
 
 const listOwnersWaitingNoCapacity = `-- name: ListOwnersWaitingNoCapacity :many
 
-SELECT r.user_id, r.id AS run_id, r.health_since,
+SELECT r.user_id, r.id AS run_id, r.health_since, r.health_reason,
        (COALESCE(r.health_reason = $1::text, false))::boolean AS has_roll_reason
 FROM runs r
 WHERE r.health = 'waiting_worker'
@@ -8015,6 +8015,7 @@ WHERE r.health = 'waiting_worker'
         AND w.last_heartbeat_at IS NOT NULL
         AND w.last_heartbeat_at >= $2
   )
+ORDER BY CASE WHEN isfinite(r.health_since) THEN 0 ELSE 1 END, r.health_since, r.id
 `
 
 type ListOwnersWaitingNoCapacityParams struct {
@@ -8026,6 +8027,7 @@ type ListOwnersWaitingNoCapacityRow struct {
 	UserID        uuid.UUID          `json:"user_id"`
 	RunID         uuid.UUID          `json:"run_id"`
 	HealthSince   pgtype.Timestamptz `json:"health_since"`
+	HealthReason  pgtype.Text        `json:"health_reason"`
 	HasRollReason bool               `json:"has_roll_reason"`
 }
 
@@ -8058,6 +8060,7 @@ func (q *Queries) ListOwnersWaitingNoCapacity(ctx context.Context, arg ListOwner
 			&i.UserID,
 			&i.RunID,
 			&i.HealthSince,
+			&i.HealthReason,
 			&i.HasRollReason,
 		); err != nil {
 			return nil, err
@@ -9696,6 +9699,46 @@ func (q *Queries) ListUnplaceableQueuedRunsForEphemeral(ctx context.Context, arg
 	return items, nil
 }
 
+const listWaitingWorkerRuns = `-- name: ListWaitingWorkerRuns :many
+SELECT id AS run_id, user_id, health_reason, health_since
+FROM runs
+WHERE health = 'waiting_worker'
+ORDER BY CASE WHEN isfinite(health_since) THEN 0 ELSE 1 END, health_since, id
+`
+
+type ListWaitingWorkerRunsRow struct {
+	RunID        uuid.UUID          `json:"run_id"`
+	UserID       uuid.UUID          `json:"user_id"`
+	HealthReason pgtype.Text        `json:"health_reason"`
+	HealthSince  pgtype.Timestamptz `json:"health_since"`
+}
+
+// Full waiting population, including owners with usable capacity and unknown ages.
+func (q *Queries) ListWaitingWorkerRuns(ctx context.Context) ([]ListWaitingWorkerRunsRow, error) {
+	rows, err := q.db.Query(ctx, listWaitingWorkerRuns)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListWaitingWorkerRunsRow{}
+	for rows.Next() {
+		var i ListWaitingWorkerRunsRow
+		if err := rows.Scan(
+			&i.RunID,
+			&i.UserID,
+			&i.HealthReason,
+			&i.HealthSince,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listWorkerPendingSince = `-- name: ListWorkerPendingSince :many
 SELECT run_id, claim_generation, terminal_pending_since
 FROM worker_active_runs
@@ -10645,24 +10688,6 @@ func (q *Queries) OldestUndispatchedTaskRun(ctx context.Context) (pgtype.Timesta
 	var oldest_created_at pgtype.Timestamptz
 	err := row.Scan(&oldest_created_at)
 	return oldest_created_at, err
-}
-
-const oldestWaitingWorkerRun = `-- name: OldestWaitingWorkerRun :one
-SELECT min(health_since)::timestamptz AS oldest_health_since
-FROM runs
-WHERE health = 'waiting_worker'
-`
-
-// health queue.waiting: the oldest health_since across every run in
-// health='waiting_worker', or NULL when none is waiting. healthsvc applies warn >= 10 min
-// and danger >= 30 min. This is the sole reader of the age; the writer (detectRunHealth)
-// is gated by health_enabled, so when that setting is off the check reports unknown, not
-// ok, rather than reading this NULL as "nothing waiting".
-func (q *Queries) OldestWaitingWorkerRun(ctx context.Context) (pgtype.Timestamptz, error) {
-	row := q.db.QueryRow(ctx, oldestWaitingWorkerRun)
-	var oldest_health_since pgtype.Timestamptz
-	err := row.Scan(&oldest_health_since)
-	return oldest_health_since, err
 }
 
 const parkQueuedCodexAccountUnavailablePage = `-- name: ParkQueuedCodexAccountUnavailablePage :one

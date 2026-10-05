@@ -15,7 +15,7 @@ const (
 	// fleetCapacityRollDanger is the wait/drain overlap ceiling, independent of controller deadlines.
 	fleetCapacityRollDanger = 24 * time.Hour
 	// fleetCapacityMaxRollConfirmations caps the per-run eligibility callbacks one
-	// fleet.capacity evaluation makes; rows past it stay unconfirmed (genuine treatment).
+	// health evaluation shares across fleet.capacity and queue.waiting; rows past it stay unconfirmed (genuine treatment).
 	fleetCapacityMaxRollConfirmations = 200
 	// fleetCapacityConfirmTimeout bounds each eligibility callback so a slow database
 	// cannot hold the health request; a timed-out row stays unconfirmed.

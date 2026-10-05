@@ -145,6 +145,19 @@ func TestAdminHealthEpisodeAndSnoozePerCallerLiveDB(t *testing.T) {
 	} else if d.SnoozedUntil != nil {
 		t.Fatalf("admin2 snoozed_until = %v, want null (admin1's snooze must not leak to admin2)", *d.SnoozedUntil)
 	}
+	cliMustExec(t, pool, "UPDATE health_episodes SET closed_at=now() WHERE id=$1", episode)
+	next := healthOpenEpisode(t, pool)
+	for _, token := range []string{uza1, uza2} {
+		d := get(token)
+		if d.EpisodeID == nil || *d.EpisodeID != next.String() || d.SnoozedUntil != nil {
+			t.Fatalf("new episode document=%+v, want %s and null snooze", d, next)
+		}
+	}
+	var persisted int
+	if err := pool.QueryRow(context.Background(), "SELECT count(*) FROM health_banner_snoozes WHERE episode_id=$1 AND user_id=$2", episode, admin1).Scan(&persisted); err != nil || persisted != 1 {
+		t.Fatalf("old persisted snooze count=%d err=%v", persisted, err)
+	}
+
 }
 
 // TestControllerStatusAdvancesSingletonEndToEndLiveDB is the folded-in singleton test (the
