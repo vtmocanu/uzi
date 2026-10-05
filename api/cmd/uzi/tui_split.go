@@ -231,10 +231,10 @@ func (m tuiModel) withSplitNote(footer string) string {
 func (m tuiModel) splitFooterLine() string {
 	var hints []string
 	if m.view == viewBoard {
-		hints = []string{"enter/→ open", "tab pane", "/ filter", "a factory", "h fold done", "r refresh", "? keys", "q quit"}
+		hints = []string{"enter/→ open", "tab pane", "/ filter", "a scope", "h fold done", "r refresh", "? keys", "q quit"}
 	}
 	if m.view == viewWorkers {
-		hints = []string{"enter/→ open", "j/k move", "ctrl+w focus", "/ filter", "a factory", "r refresh", "? keys", "q quit"}
+		hints = []string{"enter/→ open", "j/k move", "ctrl+w focus", "/ filter", "a scope", "r refresh", "? keys", "q quit"}
 	}
 	if m.view == viewCI {
 		hints = []string{"enter/→ open", "tab pane", "R repo", "/ filter", "r refresh", "? keys", "q quit"}
@@ -252,7 +252,7 @@ func (m tuiModel) splitFooterLine() string {
 			return padVisual(line, m.width)
 		}
 		removed := false
-		for _, key := range []string{"r refresh", "h fold done", "a factory", "/ filter"} {
+		for _, key := range []string{"r refresh", "h fold done", "a scope", "/ filter"} {
 			for i, h := range hints {
 				if h == key {
 					hints = append(hints[:i], hints[i+1:]...)

@@ -634,15 +634,17 @@ func (m tuiModel) workerUsageColor(pct float64) color.Color {
 	return nil
 }
 func (m tuiModel) workerUsage(pct float64, cells int) string {
-	n := min(cells, max(0, int(pct*float64(cells)/100)))
-	return paintSeg(m.workerUsageColor(pct), nil, false, strings.Repeat("█", n)+strings.Repeat("░", cells-n)+fmt.Sprintf(" %.0f%%", pct))
+	n := min(cells, max(0, int(pct*float64(cells)/100+0.5)))
+	return paintSeg(m.workerUsageColor(pct), nil, false, strings.Repeat("▮", n)) + paintSeg(m.pal.faintC, nil, false, strings.Repeat("▯", cells-n)) + paintSeg(m.workerUsageColor(pct), nil, false, fmt.Sprintf(" %.0f%%", pct))
 }
 func (m tuiModel) workerTitleLines(title, status string) []string {
 	if status == "" {
 		return []string{clampVisual(title, m.width)}
 	}
-	if gap := m.width - visualWidth(title) - visualWidth(status); gap >= 2 {
-		return []string{title + strings.Repeat(" ", gap) + status}
+	// Fit the fleet's optional segments into the title's remaining space first.
+	compact := m.workersSummary(max(0, m.width-visualWidth(title)-2), false)
+	if gap := m.width - visualWidth(title) - visualWidth(compact); gap >= 2 {
+		return []string{title + strings.Repeat(" ", gap) + compact}
 	}
 	return []string{clampVisual(title, m.width), clampVisual(status, m.width)}
 }
@@ -674,7 +676,7 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int) string {
 		bg = m.pal.selBg
 	}
 	cell := func(text string, n int, fg color.Color) string {
-		return paintSeg(fg, bg, false, padVisual(clampVisual(text, n), n))
+		return padSeg(paintSeg(fg, bg, false, clampVisual(text, n)), n, bg)
 	}
 	pre := " "
 	if selected {
@@ -682,7 +684,7 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int) string {
 	}
 	fields := []string{paintSeg(m.pal.tungsten, bg, true, pre), cell(m.renderer.Plain(t.workerName, 13), 13, nil)}
 	if width >= 120 && m.board.admin {
-		fields = append(fields, cell(m.renderer.Plain(t.workerOwner, 7), 7, m.pal.faintC))
+		fields = append(fields, cell(m.workerOwnerCell(r), 7, m.pal.faintC))
 	}
 	state := workerState(r)
 	fields = append(fields, cell(workerStateGlyph(state)+" "+state, 10, m.workerStateColor(state)), cell(m.workerKind(r), 9, m.pal.faintC), cell(workerSlots(r.w), 4, nil))
@@ -730,7 +732,7 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int) string {
 		fields = append(fields, cell(cpu, 4, cpuC), cell(mem, 7, memC), cell(disk, 18, diskC), cell(ver, versionWidth, verC), cell(workerAge(r.w.LastHeartbeatAt, now), 3, m.pal.faintC))
 	}
 	items := workerAttention(r, now)
-	att := paintSeg(m.pal.faintC, bg, false, "·")
+	att := paintSeg(m.pal.faintC, bg, false, "—")
 	if len(items) > 0 {
 		suffix := ""
 		if len(items) > 1 {
@@ -839,4 +841,13 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 	}
 	lines = lines[:min(len(lines), height)]
 	return strings.Join(lines, "\n")
+}
+
+func (m tuiModel) workerOwnerCell(r workerRow) string {
+	if m.selfEmail != "" && r.workerOwner == m.selfEmail {
+		return "you"
+	}
+	owner := m.renderer.Plain(r.workerOwner, 200)
+	local, _, _ := strings.Cut(owner, "@")
+	return clampVisual(local, 7)
 }

@@ -231,17 +231,19 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 	}
 	w, t := r.w, workerTextOf(r)
 	width := max(1, m.width)
-	plain := func(s string) string { return m.renderer.Plain(s, width) }
 	scope := "your workers"
 	if m.board.admin {
 		scope = "factory workers"
 	}
 	state := workerState(r)
 	lines := []string{m.tabStrip(m.board.admin, viewWorkers, false),
-		m.pal.faint.Render(scope+" › ") + m.pal.title.Render(plain(t.workerName)) + "  " + paintSeg(m.workerStateColor(state), nil, false, workerStateGlyph(state)+" "+state) + "  " + m.pal.faint.Render(m.workerKind(r))}
+		m.pal.faint.Render(scope+" › ") + m.pal.title.Render(m.renderer.Plain(t.workerName, width)) + "  " + paintSeg(m.workerStateColor(state), nil, false, workerStateGlyph(state)+" "+state) + "  " + m.pal.faint.Render(m.workerKind(r))}
 	heartbeat := "last heartbeat " + workerAge(w.LastHeartbeatAt, now) + " ago"
 	if w.Status == "online" {
-		heartbeat = "up " + workerUptime(w.OnlineSince, now) + " · heartbeat " + workerAge(w.LastHeartbeatAt, now) + " ago"
+		heartbeat = "heartbeat " + workerAge(w.LastHeartbeatAt, now) + " ago"
+		if w.OnlineSince != nil {
+			heartbeat = "up " + workerUptime(w.OnlineSince, now) + " · " + heartbeat
+		}
 	}
 	lines = append(lines, "  "+m.pal.faint.Render(heartbeat), "", m.pal.title.Render("attention"))
 	attention := workerAttention(r, now)
@@ -249,7 +251,7 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 		lines = append(lines, "  "+m.pal.faint.Render("no reported warnings"))
 	}
 	for _, item := range attention {
-		lines = append(lines, "  "+paintSeg(m.workerAttentionColor(item), nil, false, plain(item.attnDetail)))
+		lines = append(lines, "  "+paintSeg(m.workerAttentionColor(item), nil, false, m.renderer.Plain(item.attnDetail, width)))
 	}
 	lines = append(lines, "", m.pal.title.Render("reported runs")+m.pal.faint.Render("  api active_runs ")+itoa(w.ActiveRuns)+m.pal.faint.Render(" / cap ")+strings.Split(workerSlots(w), "/")[1]+m.pal.faint.Render(" (run lane)"))
 	selected := 0
@@ -257,16 +259,16 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 		lines = append(lines, "  "+m.pal.faint.Render("none"))
 	}
 	for i, run := range w.ReportedRuns {
-		id, title, engine, stage := plain(run.RunID[:min(8, len(run.RunID))]), "", "?", "? (not cached)"
+		id, title, engine, stage := clampVisual(m.renderer.Plain(run.RunID, width), 8), "", "?", "? (not cached)"
 		if m.board.runsAdmin == m.board.admin {
 			for _, br := range m.board.runs {
 				if br.ID == run.RunID {
 					if br.IssueIID != nil {
 						id = fmt.Sprintf("#%d", *br.IssueIID)
-						title = plain(runTitle(br.RunDTO))
+						title = m.renderer.Plain(runTitle(br.RunDTO), width)
 					}
-					engine = plain(br.Harness)
-					stage = plain(m.pal.runStateToken(br.RunDTO, br.IsRevising).word)
+					engine = m.renderer.Plain(br.Harness, width)
+					stage = m.renderer.Plain(m.pal.runStateToken(br.RunDTO, br.IsRevising).word, width)
 					break
 				}
 			}
@@ -319,7 +321,8 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 			value = m.workerUsage(100*float64(*used)/float64(*total), 12)
 		}
 		if inodes != nil && inodeTotal != nil && *inodeTotal > 0 {
-			value += m.pal.faint.Render(fmt.Sprintf("  inodes %.0f%%", 100*float64(*inodes)/float64(*inodeTotal)))
+			pct := 100 * float64(*inodes) / float64(*inodeTotal)
+			value += m.pal.faint.Render("  inodes ") + paintSeg(m.workerUsageColor(pct), nil, false, fmt.Sprintf("%.0f%%", pct))
 		}
 		if display {
 			value += m.pal.faint.Render("  display only")
@@ -335,7 +338,7 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 	}
 	if len(w.RunDisk) > 0 {
 		d := w.RunDisk[0]
-		id := plain(d.RunID[:min(8, len(d.RunID))])
+		id := clampVisual(m.renderer.Plain(d.RunID, width), 8)
 		if m.board.runsAdmin == m.board.admin {
 			for _, br := range m.board.runs {
 				if br.ID == d.RunID && br.IssueIID != nil {
@@ -351,18 +354,18 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 		kv("largest HOME", resource(m.pal.sel.Render(id)+"  "+bound+humanBytes(d.HomeBytes)+m.pal.faint.Render(" (sampled "+workerAge(&d.SampledAt, now)+" ago)")))
 	}
 	lines = append(lines, "", m.pal.title.Render("configuration"))
-	ver := plain(t.workerVersion)
+	ver := m.renderer.Plain(t.workerVersion, width)
 	if w.UpgradeStatus == "outdated" {
-		ver += "  " + paintSeg(m.pal.stall, nil, false, "↑ outdated · target "+plain(t.upgradeTarget))
+		ver += "  " + paintSeg(m.pal.stall, nil, false, "↑ outdated · target "+m.renderer.Plain(t.upgradeTarget, width))
 	}
 	if w.UpgradeStatus == "upgrade_failed" {
-		ver += "  " + paintSeg(m.pal.alarm, nil, false, "✕ upgrade failed") + paintSeg(m.pal.stall, nil, false, " · target "+plain(t.upgradeTarget))
+		ver += "  " + paintSeg(m.pal.alarm, nil, false, "✕ upgrade failed") + paintSeg(m.pal.stall, nil, false, " · target "+m.renderer.Plain(t.upgradeTarget, width))
 	}
 	kv("version", ver)
-	kv("capabilities", plain(t.capabilityText))
-	template := plain(t.templateDeclared)
+	kv("capabilities", m.renderer.Plain(t.capabilityText, width))
+	template := m.renderer.Plain(t.templateDeclared, width)
 	if w.TemplateDeclared != nil && w.TemplateReported != nil && *w.TemplateDeclared != *w.TemplateReported {
-		template += "  " + paintSeg(m.pal.stall, nil, false, "≠ reported "+plain(t.templateReported))
+		template += "  " + paintSeg(m.pal.stall, nil, false, "≠ reported "+m.renderer.Plain(t.templateReported, width))
 	}
 	kv("template", template)
 	mode := "unknown"
@@ -370,7 +373,7 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 	case "default", "auto":
 		mode = w.AnthropicBindMode
 	case "pinned":
-		mode = "pinned · " + plain(t.tokenLabel)
+		mode = "pinned · " + m.renderer.Plain(t.tokenLabel, width)
 	}
 	kv("token", mode)
 	kind := "unknown"
@@ -379,7 +382,7 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 		kind = w.Kind
 	}
 	if w.Kind == "hosted" {
-		kind += " · size " + plain(t.hostedSize)
+		kind += " · size " + m.renderer.Plain(t.hostedSize, width)
 	}
 	if w.Ephemeral {
 		lease := "?"
@@ -393,7 +396,7 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 	}
 	kv("kind", kind)
 	if m.board.admin {
-		kv("owner", plain(t.workerOwner))
+		kv("owner", m.renderer.Plain(t.workerOwner, width))
 	}
 	return lines, selected
 }
