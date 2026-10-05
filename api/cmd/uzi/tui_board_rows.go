@@ -401,7 +401,7 @@ func (m tuiModel) boardCostSeg(r apitypes.RunListItemDTO, bg color.Color) string
 
 // boardRowPrefixWidth measures the fixed prefix without the milestone micro-bar
 // for column visibility thresholds. cursor(1)+strip(1)+glyph(1)+space(1)+id, then two-space gaps around
-// the status-word and AGE cells, the micro-bar cell when shown, the credential cell when
+// the status-word and AGE cells, the credential cell when
 // shown, the cost cell when shown, plus the admin owner cell.
 func boardRowPrefixWidth(admin, cred, cost bool) int {
 	w := 4 + boardIDWidth + 2 + boardStatusWordWidth + 2 + boardAgeWidth + 2

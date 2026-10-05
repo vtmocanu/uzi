@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -127,7 +128,7 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"split-filtering":              func(d bool) string { return splitScene(d, now, "filtering") },
 	}
 
-	for _, name := range workerSceneNames {
+	for _, name := range append(append([]string{}, workerSceneNames...), workerDetailSceneNames...) {
 		scenes[name] = func(dark bool) string { return workersScene(dark, name).View().Content }
 	}
 
@@ -228,11 +229,47 @@ func splitScene(dark bool, now time.Time, scene string) string {
 
 var workerSceneNames = []string{"workers-list-120", "workers-list-80", "workers-factory", "workers-cordoned", "split-workers-top", "floor-fleet"}
 
+var workerDetailSceneNames = []string{"worker-upgrade-failed", "worker-outcome-outbox", "worker-holding"}
+
 // workersScene uses the shipped model and the interactive demo's client.
 func workersScene(dark bool, name string) tuiModel {
 	fake := newDemoClient()
+	target := map[string]string{"worker-upgrade-failed": "forge-small", "worker-outcome-outbox": "forge-docker", "worker-holding": "recovery"}[name]
+	if target != "" {
+		// Scene-local samples keep the demo fleet's state and attention counts intact.
+		for i := range fake.Workers {
+			w := &fake.Workers[i]
+			if w.Name != target {
+				continue
+			}
+			if w.StatsDiskDataBytes != nil {
+				w.StatsDiskDataBytes = i64(*w.StatsDiskDataBytes << 30)
+				w.StatsDiskDataTotalBytes = i64(100 << 30)
+			}
+			if target == "forge-docker" {
+				w.StatsDiskDindBytes, w.StatsDiskDindTotalBytes = i64(20<<30), i64(50<<30)
+			}
+			if target != "forge-small" {
+				runID := fake.Runs[0].ID
+				if len(w.ReportedRuns) > 0 {
+					runID = w.ReportedRuns[0].RunID
+				} else {
+					for _, run := range fake.Runs {
+						if run.Status == "failed" {
+							runID = run.ID
+							break
+						}
+					}
+				}
+				w.RunDisk = []apitypes.WorkerRunDiskDTO{{RunID: runID, HomeBytes: 8 << 30, CacheBytes: 2 << 30, Truncated: true, SampledAt: time.Now().Add(-2 * time.Minute)}}
+			}
+		}
+	}
 	m := uxModel(fake, "", dark)
 	width, height := 120, 34
+	if target != "" {
+		height = 52
+	}
 	if name == "workers-list-80" {
 		width = 80
 	}
@@ -257,11 +294,59 @@ func workersScene(dark bool, name string) tuiModel {
 			}
 		}
 	}
+	if target != "" {
+		for i, r := range m.workers.visible(time.Now()) {
+			if r.w.Name == target {
+				m.workers.cursor, m.workers.selectedID = i, r.w.ID
+			}
+		}
+		m = key(m, keyEnter)
+	}
 	if name == "split-workers-top" {
 		m = step(m, reposMsg{repos: []apitypes.RepoDTO{oneRepo()}})
 		m = step(m, ciMsg{reqID: m.ci.waitID, runs: sampleCIRuns(time.Now())})
 	}
 	return m
+}
+
+func TestWorkerDetailScenesContentAndBounds(t *testing.T) {
+	for _, name := range workerDetailSceneNames {
+		for _, dark := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/dark=%t", name, dark), func(t *testing.T) {
+				m := workersScene(dark, name)
+				if m.view != viewWorker || m.workerDetail.workerID == "" {
+					t.Fatal("scene did not enter the production worker detail")
+				}
+				out := stripANSI(m.View().Content)
+				last := -1
+				for _, section := range []string{"Attention", "Reported runs", "Resources", "Configuration"} {
+					at := strings.Index(out, section)
+					if at <= last {
+						t.Fatalf("missing or reordered %s:\n%s", section, out)
+					}
+					last = at
+				}
+				requireWorkerText(t, out, "nix inodes ? (display-only)", "token mode", "template declared", "template reported", "enter run", "esc back")
+				switch name {
+				case "worker-upgrade-failed":
+					requireWorkerText(t, out, "forge-small", "upgrade failed", "seed-nix", "ImagePullBackOff", "stale, last-known", "CPU ?", "memory ? / ?", "version 0.85.0 · target 0.85.1")
+				case "worker-outcome-outbox":
+					requireWorkerText(t, out, "forge-docker", "outcome pending", "not yet delivered/acknowledged", "outbox", "14", "worker phase: running", "generation 1", "data bytes 41.0 GiB / 100.0 GiB", "dind bytes 20.0 GiB / 50.0 GiB", "HOME ≥8.0 GiB · cache ≥2.0 GiB", "measured 2m ago", "token mode auto")
+				case "worker-holding":
+					requireWorkerText(t, out, "recovery", "unpublished work", "none reported", "data bytes 48.0 GiB / 100.0 GiB", "HOME ≥8.0 GiB · cache ≥2.0 GiB", "cache is a subset of HOME", "token mode default")
+				}
+				assertNoRawControls(t, name, out)
+				if len(strings.Split(out, "\n")) > m.height {
+					t.Fatal("scene exceeds physical height")
+				}
+				for _, line := range strings.Split(out, "\n") {
+					if visualWidth(line) > m.width {
+						t.Fatalf("scene exceeds width: %q", line)
+					}
+				}
+			})
+		}
+	}
 }
 
 // ---- board fixtures -------------------------------------------------------

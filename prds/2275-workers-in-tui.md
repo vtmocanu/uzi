@@ -1,6 +1,6 @@
 # PRD #2275: Workers in the TUI
 
-**Status**: In progress. M1 workers list, shared polling, split top pane, floor summary, demo scenes and documentation are implemented. M2 and the D12 maintainer pre-merge steps remain pending. Resolved facts below were read at `main` `10d18291`. Reviewed by an architect, a tui-ux reviewer and a Codex peer before landing.
+**Status**: Implemented with automated acceptance coverage. M1 and M2 are implemented; ANSI scenes are generated and asserted in both themes. D12 PNG rendering, `tui-ux` screenshot review and manual `--demo` acceptance remain pending before merge. Resolved facts below were read at `main` `10d18291`. Reviewed by an architect, a tui-ux reviewer and a Codex peer before landing.
 
 **Design mock**: `prds/mockups/2275-workers-tui-mock.sh` (run `bash prds/mockups/2275-workers-tui-mock.sh` in a terminal; its header lists the keys). The mock is the agreed visual and navigation reference. It is a throwaway bash script with static fixture data. It is not shipped code and never a parallel model for the TUI (`.claude/rules/tui.md`). Where the mock and this PRD disagree, this PRD wins. The mock's `w` (width 80/120) and `z` (summary on/off) keys exist only for comparing layouts; they are not product keys (`w` is the shipped `keyRework`).
 
@@ -170,7 +170,7 @@ Acceptance examples (counts are from the `demo.go` seed this PRD adds, which mir
 - **Detail sections, in order:**
   - **Attention.**
   - **Reported runs:** worker phase, outcome pending, run stage and generation.
-    - `enter` opens the run by id through the existing run-detail entry, which fetches the run itself, so the run need not be cached.
+    - `enter` preflights the run by id with `GetRun`, so the run need not be cached. The successful DTO enters through the normal guarded detail handler, including input-fetch and blink side effects, then tail and stream loading start without a second initial `GetRun`.
     - A 404 shows `run not visible` in the footer and stays put.
   - **Resources:**
     - cpu; memory, labelled `process only` when `StatsSource == "process"`;
@@ -198,7 +198,9 @@ Acceptance examples (counts are from the `demo.go` seed this PRD adds, which mir
 ### Floor additions (`tui_board_rows.go`, `tui_detail.go`)
 
 - **Worker cell.** At ≥120 columns each floor run row ends with `runWorkerName`; at 80 the cell is dropped.
-- **Run detail rail** shows the worker name. `W` (shift+w, unbound everywhere at `10d18291`) opens that worker's `viewWorker`; `esc` returns to the run.
+- **Run detail rail** shows the worker name. `W` (shift+w, unbound everywhere at `10d18291`) opens that worker's `viewWorker`; `esc` reopens the originating run in a fresh session with its original return target.
+  - One worker-origin context retains list selection, scroll and pane state, or the originating run ID and return target. Further cross-links update that context instead of accumulating history. A reported run returns to the current worker without overwriting its origin.
+  - Every departing run closes its stream, invalidates its session and discards loaded detail, transcript buffers, guards and fallback handles. Returning uses the normal newest-first entry and background history backfill; no loaded session is suspended or restored. PR round-trips from a run likewise retain only a run ID and return target.
   - If `WorkerID` is nil (queued, unclaimed or wall-parked), `W` shows `no worker yet` and stays put.
   - If the worker is not in the current list (for example the admin board while the shared list is own-scope, or a worker removed since), `W` refetches once. If the worker is still absent it shows `worker not in your list` and stays put.
 
@@ -286,6 +288,18 @@ Contents:
 
 - Blocked by: M1.
 - Acceptance: example 1 (detail half), example 2 (drill-in), and example 3. The test-plan items for M2 pass.
+
+## Implementation progress
+
+- [x] M1: list, shared polling and scope, split top pane, fleet summary, demo and docs.
+- [x] M2: four-section detail, single-origin cross-links and fresh run sessions, floor/rail worker names.
+- [x] Automated navigation, polling, untrusted text, resource and dimension acceptance tests.
+- [x] Nine feature ANSI scenes generated in dark and light themes; content and bounds asserted.
+- [ ] D12: render uxlab PNGs.
+- [ ] D12: `tui-ux` screenshot review against the mock.
+- [ ] D12: drive `uzi tui --demo` manually.
+
+The factory-only demo worker is cordoned to cover all six primary states; the nine own workers and their acceptance totals remain unchanged. Nix inode readings display `?` because the existing DTO carries no nix inode fields.
 
 ## Acceptance (live, maintainer)
 

@@ -1405,10 +1405,40 @@ unknown advertised slots. Only danger and warning items count as needing
 attention; a lease or lone chat is information. Disk percentages are visual
 cues; DinD and inode readings are display-only.
 
-The floor summary and workers list share one request chain, polling every 5s
-while either is visible, including an unfocused top pane. Failures back off
-to at most 60s and keep the last snapshot. Polling pauses in detail screens
-and help; returning fetches immediately. `r` refreshes immediately.
+Press `enter` on a worker to open its full-screen detail, with four sections:
+Attention, Reported runs, Resources, and Configuration. Attention explains
+upgrade failures, unpublished-work holds, outbox queues and pending outcomes.
+Reported runs show the worker's phase and claim generation separately from the
+run status and stage in the board cache. `enter` opens the selected reported
+run even when it is not cached; an invisible run shows `run not visible`.
+
+Resources show `?` for missing readings or a null limit; offline readings are
+stale, last-known values. Process samples cover only the worker process.
+DinD and all inode readings are display-only; nix inodes are unavailable and
+show `?`. Largest-run HOME sizes show `≥` when truncated (a lower bound),
+with the sample age; cache is a subset of HOME, not an additional size.
+Configuration shows version and upgrade target, capabilities, templates,
+token mode and ephemeral lease. Reported runs do not establish an ephemeral
+worker's binding.
+
+In run detail, uppercase `W` opens the run's worker; lowercase `w` keeps its
+existing rework action. A run without a worker shows `no worker yet`.
+`esc` from a reported run returns to its worker, and `esc` from the worker
+returns to the original list or run. Cross-links retain one original return
+target, including its originating pane, rather than a navigation history.
+Returning to a run starts a fresh session: it fetches the current run and
+newest transcript tail, opens a new stream, then fills older history in the
+background. It does not restore loaded transcript state. The reported-run
+preflight fetch supplies the initial run DTO without a second initial fetch.
+Opening a PR from a run and returning also starts a fresh run session.
+
+At 120 columns floor rows include the worker name; at 80 it is omitted.
+
+The floor summary, workers list and worker detail share one request chain,
+polling every 5s while any is visible, including an unfocused top pane.
+Failures back off to at most 60s and keep the last snapshot. Polling pauses
+in run, PR and CI run detail and help; returning fetches immediately.
+`r` refreshes immediately.
 On the floor or workers list, `a` toggles their shared own/factory scope.
 Factory scope needs a `uza_` admin token and adds owners and server-reported
 disk pressure; a denied request returns both views to your own scope.
@@ -1467,8 +1497,9 @@ to cycle floor → workers → pulls → ci → floor, or `shift+tab` backwards.
 `ctrl+w` switches focus between the selected top and bottom tabs;
 `1`/`2` select floor/workers on top, and `3`/`4` select pulls/CI below.
 `esc` from the bottom focuses the selected top tab. `R` cycles the scoped repo when
-the bottom pane has focus. Run, PR, and CI run detail still open full-screen;
-`esc` returns to the originating pane with its tab and selection.
+the bottom pane has focus. Run, worker, PR, and CI run detail open full-screen;
+`enter` on a top-pane worker opens its detail, and `esc` returns to the
+originating pane with its tab, selected worker and focus.
 
 Press `s` on a list to collapse the split to its selected top tab (floor or
 workers) for this session; press it again to restore the split when the
@@ -1504,7 +1535,8 @@ The `off` setting also disables `s`. `uzi tui --demo` and
 j/k, ↑/↓     move within the focused pane (board: row · detail: between agents on the rail, or scroll the transcript)
 g            detail: follow live — re-attach and jump to the newest output (live runs only)
 c            detail: fold / unfold the crew list; it also folds by itself when MILESTONES/SPEND/ACCOUNTS would not fit
-enter        open the selected run (board)
+enter        open the selected run (board), worker (workers), or reported run (worker detail)
+W            open the run's worker (run detail; lowercase w still reworks)
 /            filter the board or workers list
 a            toggle shared own/factory scope (board or workers; admin token required)
 h            hide finished runs — completed/failed/cancelled, keeps active + needs-you (board only; no-op on the admin board)
