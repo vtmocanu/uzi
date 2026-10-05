@@ -1925,47 +1925,52 @@ export class Outbox {
    * A directory read failure conservatively protects it, independent of authenticated counts. */
   async hasPhysicalTerminalProtection(runId: string): Promise<boolean> {
     if (!this.validRunId(runId)) return true;
-    let inspected = 0;
-    // One shared budget bounds both the source directory and UUID case-alias discovery.
-    // Any failure or exhausted budget protects the source and stops this check.
+    // Only initial path checks may establish ordinary absence. Once scanning starts,
+    // all errors protect the run, including a directory read reporting ENOENT.
+    try {
+      const root = await fs.lstat(this.root);
+      if (!root.isDirectory() || root.isSymbolicLink()) return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code !== "ENOENT";
+    }
+    let runExists = true;
+    try {
+      await fs.lstat(this.runDir(runId));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") return true;
+      runExists = false;
+    }
     const protects = async (physicalRunId: string): Promise<boolean> => {
-      try {
-        if (!await this.terminalDirectorySafe(physicalRunId)) return true;
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
-        throw err;
-      }
+      if (!await this.terminalDirectorySafe(physicalRunId)) return true;
       const dir = await fs.opendir(this.runDir(physicalRunId));
       try {
-        while (inspected < 256) {
+        // Stream to EOF or the first protecting entry, without retries or an entry cap.
+        while (true) {
           const entry = await dir.read();
           if (!entry) return false;
-          inspected++;
           if (entry.name.startsWith(TERMINAL_FILE_PREFIX)) return true;
         }
-        return true;
       } finally {
         await dir.close();
       }
     };
     try {
-      if (await protects(runId)) return true;
+      if (runExists && await protects(runId)) return true;
       if (!terminalRunUUID(runId)) return false;
       const root = await fs.opendir(this.root);
       try {
-        while (inspected < 256) {
+        // Case-alias discovery also ends at EOF or the first protecting alias.
+        while (true) {
           const entry = await root.read();
           if (!entry) return false;
-          inspected++;
           if (entry.name !== runId && terminalRunUUID(entry.name) && entry.name.toLowerCase() === runId.toLowerCase() &&
               await protects(entry.name)) return true;
         }
-        return true;
       } finally {
         await root.close();
       }
-    } catch (err) {
-      return (err as NodeJS.ErrnoException).code !== "ENOENT";
+    } catch {
+      return true;
     }
   }
 

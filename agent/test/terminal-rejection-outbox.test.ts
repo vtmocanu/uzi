@@ -6,7 +6,7 @@ import { Outbox, OUTBOX_RANGE_RESERVE_BYTES } from "../src/outbox.js";
 import type { TerminalRejectionCustodyResponse } from "../src/protocol.js";
 import { recordingLogger } from "./helpers.js";
 import os from "node:os";
-import { realpathSync } from "node:fs";
+import { realpathSync, type Dirent } from "node:fs";
 
 const scratch = realpathSync(os.tmpdir());
 const run = "11111111-1111-4111-8111-111111111111";
@@ -374,13 +374,78 @@ test("startup selects valid leading-zero alias; bad canonical observations prese
   assert.equal(box.hasPendingTerminal(run, 3), false);
 });
 
-test("physical protection fails closed after 256 junk entries and preserves UUID case aliases", async () => {
+// Reorder real entries from finite local fixtures, preserving real open/close handles.
+// Only reads made by the protection scan are recorded, not the ordering pre-read.
+async function withProtectionReads(
+  options: { last?: { directory: string; name: string }; failure?: { directory: string; code: string } },
+  check: (visited: Map<string, string[]>) => Promise<void>,
+) {
+  const original = fs.opendir;
+  const visited = new Map<string, string[]>();
+  let opened = 0;
+  let closed = 0;
+  fs.opendir = async (...args: Parameters<typeof fs.opendir>) => {
+    const dir = await original(...args);
+    opened++;
+    const directory = String(args[0]);
+    const read = dir.read.bind(dir);
+    const close = dir.close.bind(dir);
+    const entries: Dirent[] = [];
+    try {
+      // Each fixture has finitely many entries; one read per entry plus EOF, no retries.
+      for (let entry = await read(); entry; entry = await read()) entries.push(entry);
+      if (options.last?.directory === directory) {
+        const target = entries.find(entry => entry.name === options.last?.name);
+        assert.ok(target, "ordered target must exist in the real directory");
+        entries.splice(entries.indexOf(target), 1);
+        entries.push(target);
+      }
+    } catch (err) {
+      await close();
+      closed++;
+      throw err;
+    }
+    const names: string[] = [];
+    visited.set(directory, names);
+    let index = 0;
+    dir.read = (async () => {
+      if (options.failure?.directory === directory) {
+        throw Object.assign(new Error("injected protection directory read failure"), { code: options.failure.code });
+      }
+      const entry = entries[index++];
+      if (!entry) return null;
+      names.push(entry.name);
+      return entry;
+    }) as typeof dir.read;
+    dir.close = (async () => {
+      await close();
+      closed++;
+    }) as typeof dir.close;
+    return dir;
+  };
+  try {
+    await check(visited);
+  } finally {
+    fs.opendir = original;
+    assert.equal(closed, opened, "every protection directory handle must close");
+  }
+}
+
+function ordinaryUUID(n: number): string {
+  return `${n.toString(16).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`;
+}
+
+test("physical protection exhausts 257 junk entries and retirement removes the run", async () => {
   const { box, file, root } = await fixture();
   await fs.unlink(file);
   for (let n = 0; n < 257; n++) await fs.writeFile(path.join(root, run, `junk-${n}`), "");
-  assert.equal(await box.hasPhysicalTerminalProtection(run), true);
+  assert.equal(await box.hasPhysicalTerminalProtection(run), false);
   await box.retireRun(run);
-  assert.ok(await fs.stat(path.join(root, run, "junk-256")));
+  await assert.rejects(fs.stat(path.join(root, run)), { code: "ENOENT" });
+});
+
+test("physical protection preserves UUID case aliases", async () => {
+  const { box, root } = await fixture();
   const lower = "abcdefab-1111-4111-8111-111111111111";
   const mixed = "ABCDefab-1111-4111-8111-111111111111";
   await box.journalTerminal(lower, 3, "implement", 0, { status: "failed" });
@@ -390,6 +455,118 @@ test("physical protection fails closed after 256 junk entries and preserves UUID
   await box.retireRun(lower);
   assert.ok(await fs.stat(path.join(root, mixed, "terminal-3.json")));
 });
+
+test("physical protection retirement removes all 257 ordinary UUID subdirectories without terminals", async () => {
+  const { box, file, root } = await fixture();
+  await fs.unlink(file);
+  const directories = Array.from({ length: 257 }, (_, n) => path.join(root, run, ordinaryUUID(n)));
+  for (const directory of directories) await fs.mkdir(directory);
+  assert.equal((await fs.readdir(path.join(root, run))).length, 257);
+  // Exercise retirement itself first: old code must fail regardless of enumeration order.
+  await box.retireRun(run);
+  for (const directory of directories) await assert.rejects(fs.stat(directory), { code: "ENOENT" });
+  await assert.rejects(fs.stat(path.join(root, run)), { code: "ENOENT" });
+  assert.equal(await box.hasPhysicalTerminalProtection(run), false);
+});
+
+test("physical protection retirement removes all 257 ordinary UUID run directories at the root", async () => {
+  const { box, file, root } = await fixture();
+  await fs.unlink(file);
+  const runIds = [run, ...Array.from({ length: 256 }, (_, n) => ordinaryUUID(n))];
+  for (const id of runIds.slice(1)) await fs.mkdir(path.join(root, id));
+  assert.equal((await fs.readdir(root, { withFileTypes: true })).filter(entry => entry.isDirectory()).length, 257);
+  for (const id of runIds) await box.retireRun(id);
+  for (const id of runIds) await assert.rejects(fs.stat(path.join(root, id)), { code: "ENOENT" });
+  assert.equal(await box.hasPhysicalTerminalProtection(run), false);
+});
+
+test("physical protection visits a terminal beyond 256 junk entries and closes handles", async () => {
+  const { box, file, root } = await fixture();
+  const directory = path.join(root, run);
+  for (let n = 0; n < 257; n++) await fs.writeFile(path.join(directory, `junk-${n}`), "");
+  await withProtectionReads({ last: { directory, name: path.basename(file) } }, async visited => {
+    assert.equal(await box.hasPhysicalTerminalProtection(run), true);
+    const names = visited.get(directory);
+    assert.ok(names, "the run directory must be read");
+    assert.equal(names.indexOf(path.basename(file)), 257, "the protecting terminal must actually be visited beyond the old budget");
+    await box.retireRun(run);
+    assert.ok(await fs.stat(file));
+  });
+});
+
+test("physical protection visits a matching UUID case alias beyond 256 unrelated root entries", async () => {
+  const { box, file, root } = await fixture();
+  await fs.unlink(file);
+  const lower = "abcdefab-1111-4111-8111-111111111111";
+  const mixed = "ABCDefab-1111-4111-8111-111111111111";
+  await fs.mkdir(path.join(root, lower));
+  await box.journalTerminal(mixed, 3, "implement", 0, { status: "failed" });
+  for (let n = 0; n < 257; n++) await fs.mkdir(path.join(root, ordinaryUUID(n)));
+  await withProtectionReads({ last: { directory: root, name: mixed } }, async visited => {
+    assert.equal(await box.hasPhysicalTerminalProtection(lower), true);
+    const names = visited.get(root);
+    assert.ok(names, "the root directory must be read");
+    assert.ok(names.indexOf(mixed) > 256, "the matching case alias must actually be visited beyond the old budget");
+    const aliasNames = visited.get(path.join(root, mixed));
+    assert.ok(aliasNames, "the matching case alias directory must be read");
+    assert.ok(aliasNames.includes("terminal-3.json"), "the case alias terminal must actually be visited");
+    await box.retireRun(lower);
+    assert.ok(await fs.stat(path.join(root, lower)));
+    assert.ok(await fs.stat(path.join(root, mixed, "terminal-3.json")));
+  });
+});
+
+for (const kind of ["symlink", "file"] as const) {
+  test(`physical protection retains an unsafe ${kind} root even when the run is absent`, async () => {
+    const { box, root } = await fixture();
+    const moved = `${root}-saved`;
+    await fs.rename(root, moved);
+    roots.push(moved);
+    if (kind === "symlink") await fs.symlink(moved, root);
+    else await fs.writeFile(root, "");
+    assert.equal(await box.hasPhysicalTerminalProtection(worker), true);
+    await box.retireRun(worker);
+    assert.ok(await fs.lstat(root));
+  });
+}
+
+for (const kind of ["symlink", "file"] as const) {
+  test(`physical protection retains an unsafe matching UUID ${kind} directory`, async () => {
+    const { box, file, root } = await fixture();
+    await fs.unlink(file);
+    const lower = "abcdefab-1111-4111-8111-111111111111";
+    const mixed = "ABCDefab-1111-4111-8111-111111111111";
+    await fs.mkdir(path.join(root, lower));
+    const alias = path.join(root, mixed);
+    if (kind === "symlink") await fs.symlink(path.join(root, run), alias);
+    else await fs.writeFile(alias, "");
+    await withProtectionReads({ last: { directory: root, name: mixed } }, async visited => {
+      assert.equal(await box.hasPhysicalTerminalProtection(lower), true);
+      const names = visited.get(root);
+      assert.ok(names, "the root directory must be read");
+      assert.ok(names.includes(mixed), "the unsafe matching alias must actually be visited");
+      await box.retireRun(lower);
+      assert.ok(await fs.stat(path.join(root, lower)));
+      assert.ok(await fs.lstat(alias));
+    });
+  });
+}
+
+for (const location of ["run", "root"] as const) {
+  for (const code of ["EIO", "ENOENT"] as const) {
+    test(`physical protection retains the run on ${location} read failure ${code} and closes handles`, async () => {
+      const { box, file, root } = await fixture();
+      await fs.unlink(file);
+      const directory = location === "run" ? path.join(root, run) : root;
+      await withProtectionReads({ failure: { directory, code } }, async visited => {
+        assert.equal(await box.hasPhysicalTerminalProtection(run), true);
+        assert.ok(visited.has(directory), "the failing directory must have been opened");
+        await box.retireRun(run);
+        assert.ok(await fs.stat(path.join(root, run)));
+      });
+    });
+  }
+}
 
 test("busy outbox writes do not queue custody disposal or permit late cleanup", async () => {
   const { box, file } = await fixture();
