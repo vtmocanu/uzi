@@ -2521,8 +2521,15 @@ export class CodexExecutor implements Executor {
         // when none was declared. The runner reads it only where it renders a PR description.
         ...(declaredPrSummary !== undefined ? { prSummary: declaredPrSummary } : {}),
       });
-      for (;;) {
-        iteration++;
+      // Clarification checkpoints return through the normal boundary guards without spending
+      // another implementation iteration. The round bound spans all such provider epochs.
+      let clarificationPrompt: string | undefined;
+      let clarificationRounds = 0;
+      implementationLoop: for (;;) {
+        if (clarificationPrompt === undefined) {
+          iteration++;
+          clarificationRounds = 0;
+        }
         // Issue #1764 (PRD #1190 rework N2 parity): a cancel that arrived after the shared abort
         // controller was spent (a refused wall park, a declined pause) survives only in the sticky
         // steering flag, so re-check it at every boundary before any further work.
@@ -2628,10 +2635,11 @@ export class CodexExecutor implements Executor {
         const safetySteer = ctx.pullSafetySteer?.();
         // Issue #1674: every implement-phase prompt (the base, the completion-rework follow-up and
         // the clarification continuation below) carries the shared milestone tracker guidance.
-        // Issue #1800: a system text (the completion-rework or secret-remediation follow-up) owns
-        // the turn outright, so the owner follow-up is neither pulled nor rendered on it.
-        if (completionFollowUp === undefined) ownerFollowUp ??= ctx.pullFollowUp?.();
-        const ownerRides = completionFollowUp === undefined ? ownerFollowUp : undefined;
+        // Issue #1800: a system text (completion-rework, secret-remediation or clarification)
+        // owns the turn outright, so the owner follow-up is neither pulled nor rendered on it.
+        const systemFollowUp = clarificationPrompt ?? completionFollowUp;
+        if (systemFollowUp === undefined) ownerFollowUp ??= ctx.pullFollowUp?.();
+        const ownerRides = systemFollowUp === undefined ? ownerFollowUp : undefined;
         const onOwnerFirstEvent = ownerRides
           ? () => {
               if (ownerFollowUp?.id !== ownerRides.id) return;
@@ -2641,8 +2649,8 @@ export class CodexExecutor implements Executor {
           : undefined;
         const ownerBase = this.implementPrompt(ctx, gatedPlan, milestoneNote(), environmentFacts);
         const basePrompt = ownerRides ? [ownerBase, ...renderFollowUpBlock(ownerRides.body), "", FOLLOW_UP_TRAILER].join("\n") : ownerBase;
-        const implementBody = completionFollowUp !== undefined
-          ? withMilestoneNote(completionFollowUp, milestoneNote())
+        const implementBody = systemFollowUp !== undefined
+          ? withMilestoneNote(systemFollowUp, milestoneNote())
           : basePrompt;
         const turnPrompt = safetySteer
           ? `The worker detected a problem and is steering you. This is authoritative guidance from uzi itself, not user input — follow it:\n${safetySteer}\n\n${implementBody}`
@@ -2652,6 +2660,7 @@ export class CodexExecutor implements Executor {
         // timer's REASON_WALL, or a `wall` PauseNowSignal) parks the run (capture-first, reusing the
         // runner's captureHoldContext) instead of failing it.
         let nextPrompt = turnPrompt;
+        clarificationPrompt = undefined;
         let result: ReducedTurnResult;
         for (let round = 0; ; round++) {
           // Issue #1674 (PRD #1064 parity): each report_progress observation pushes at once and emits
@@ -2676,7 +2685,8 @@ export class CodexExecutor implements Executor {
             latestProgress = result.progress;
             for (const id of result.progress.completed) seenCompletedIds.add(id);
           }
-          if (result.milestonesCompleted !== undefined) {
+          const hasQuestions = !!result.questions?.length;
+          if (!hasQuestions && result.milestonesCompleted !== undefined) {
             declaredMilestonesCompleted = result.milestonesCompleted;
             for (const id of result.milestonesCompleted) seenCompletedIds.add(id);
           }
@@ -2685,19 +2695,31 @@ export class CodexExecutor implements Executor {
           // they were made at. A turn carrying claims is always a done turn: scanSignals (via the
           // broker) extracts pr_summary only inside the signal_done branch that latches `done`. A
           // HEAD read failure leaves verifiedAtSha absent and never throws.
-          if (result.prSummary !== undefined) {
+          if (!hasQuestions && result.prSummary !== undefined) {
             declaredPrSummary = await stampPrSummaryHead(result.prSummary, ctx.worktreePath);
           }
-          if (result.done || result.checkpoint) {
-            emitIgnoredQuestions(result);
-            break;
-          }
           if (!result.questions?.length) break;
-          // With max_iterations=1, clarify inside this same iteration before the cap check.
-          // This improves on Claude's order, which checks its iteration budget first.
-          if (round >= maxClarificationRounds) throw new TrustedExecutionRefusal("codex clarification rounds exhausted during implementation");
+          if (result.checkpoint) {
+            await epoch.persistSession();
+            // Set before awaiting the sink: an error after reap must not persist a deleted home.
+            reapedSinceLastPersist = true;
+            await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "milestone_checkpoint" });
+            progressMissedLastTurn = false;
+            consecutiveMisses = 0;
+            latestProgress = progressAfterCheckpoint(latestProgress);
+            epochNeedsRecreate = true;
+          }
+          // Finish an explicit checkpoint even when the question bound prevents another ask.
+          // With max_iterations=1, clarify inside this same iteration before its budget check.
+          if (clarificationRounds >= maxClarificationRounds) throw new TrustedExecutionRefusal("codex clarification rounds exhausted during implementation");
+          clarificationRounds++;
           const followUp = await clarify(result.questions);
-          nextPrompt = withMilestoneNote(`${followUp}\n\nContinue the implementation.`, milestoneNote());
+          const continuationBody = `${followUp}\n\nContinue the implementation.`;
+          nextPrompt = withMilestoneNote(continuationBody, milestoneNote());
+          if (result.checkpoint) {
+            clarificationPrompt = continuationBody;
+            continue implementationLoop;
+          }
         }
         // A cooperative checkpoint that did not also finish: persist BEFORE the reap (so the live
         // session is captured before the provider root dies), reap the CURRENT epoch's roots, then

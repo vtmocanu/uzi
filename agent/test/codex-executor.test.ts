@@ -5920,23 +5920,233 @@ describe("CodexExecutor clarification turns (#1584)", () => {
     });
   }
 
-  for (const signals of [["done", "ask"], ["checkpoint", "ask"], ["done", "checkpoint", "ask"]] as const) {
-    it(`ignores a question alongside ${signals.join("+")}`, async () => {
-      const checkpointFirst = signals[0] === "checkpoint";
-      const rig = checkpointFirst
-        ? makeMultiEpochRig([scripted([["checkpoint", "ask"]]), scripted([["done"]])])
-        : makeRig({ responder: scripted([signals as unknown as Array<"ask" | "done" | "checkpoint">]) });
+  for (const signals of [
+    ["done", "ask"], ["ask", "done"], ["checkpoint", "ask"], ["ask", "checkpoint"],
+    ["done", "checkpoint", "ask"], ["done", "ask", "checkpoint"],
+    ["checkpoint", "done", "ask"], ["checkpoint", "ask", "done"],
+    ["ask", "done", "checkpoint"], ["ask", "checkpoint", "done"],
+  ] as const) {
+    it(`#2284 prioritizes clarification alongside ${signals.join("+")}`, async () => {
+      const reaps = signals.includes("checkpoint" as never);
+      const steps = signals as unknown as Array<"ask" | "done" | "checkpoint">;
+      const rig = makeMultiEpochRig(reaps
+        ? [scripted([steps]), scripted([["done"]])]
+        : [scripted([steps, ["done"]])]);
       let asks = 0;
-      const checkpoints: boolean[] = [];
+      const checkpoints: string[] = [];
       const { ctx, emitted } = makeCtx({
-        askUser: async () => { asks++; return { kind: "answer", answers: ["bad"] }; },
-        checkpoint: async ({ reap }) => { checkpoints.push(reap); },
+        askUser: async () => { asks++; return { kind: "answer", answers: ["server"] }; },
+        checkpoint: async ({ sink }) => { checkpoints.push(sink!); },
         config: { max_iterations: 1 },
       });
-      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "ignored question");
-      assert.equal(asks, 0);
-      assert.equal(notices(emitted).filter((s) => s.includes("question was ignored")).length, 1);
-      assert.deepEqual(checkpoints, checkpointFirst ? [true] : []);
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "combined question");
+      assert.equal(asks, 1);
+      assert.equal(notices(emitted).filter((s) => s.includes("question was ignored")).length, 0);
+      assert.deepEqual(checkpoints, reaps ? ["milestone_checkpoint"] : []);
+      const prompts = promptTexts(rig.epochs[reaps ? 1 : 0]!.transport);
+      assert.match(prompts[reaps ? 0 : 1]!, /A: server/);
+      assert.equal(rig.providerLaunches(), reaps ? 2 : 1);
+    });
+  }
+
+  for (const checkpoint of [false, true]) {
+    for (const interlocked of [false, true]) {
+      it(`#2284 holds done+ask pending; checkpoint=${checkpoint}, interlocked=${interlocked}`, async () => {
+        const rig = makeMultiEpochRig(checkpoint
+          ? [scripted([["done", "checkpoint", "ask"]]), scripted([["done"]])]
+          : [scripted([["done", "ask"], ["done"]])]);
+        let answer!: (v: { kind: "answer"; answers: string[] }) => void;
+        let asked = false;
+        let settled = false;
+        let attempts = 0;
+        let remediation = 0;
+        let exec!: CodexExecutor;
+        const sinks: string[] = [];
+        const iterations: number[] = [];
+        const { ctx } = makeCtx({
+          kind: "issue", completionInterlock: interlocked, config: { max_iterations: 1 },
+          askUser: async () => {
+            assert.equal(rig.sessionOps.persist, checkpoint ? 1 : 0);
+            assert.equal(rig.epochs[0]!.reaped() > 0, checkpoint);
+            asked = true;
+            return new Promise((resolve) => { answer = resolve; });
+          },
+          checkpoint: async (opts) => {
+            sinks.push(opts.sink!);
+            await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+          },
+          secretRemediationGate: async () => { remediation++; return { action: "proceed" } as never; },
+          recordCompletionAttempt: async () => { attempts++; return { unmet: [], attemptCount: attempts }; },
+          reportIteration: async (i) => { iterations.push(i); },
+        });
+        exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+        const running = exec.run(ctx).finally(() => { settled = true; });
+        await waitFor(() => asked || settled, "question or premature exit");
+        // Always release the instrument before asserting, including on a broken implementation.
+        const observed = {
+          asked, settled, launches: rig.providerLaunches(), turns: rig.epochs[0]!.transport.turnStartCount,
+          attempts, remediation, sinks: [...sinks],
+        };
+        answer?.({ kind: "answer", answers: ["retained-answer"] });
+        await withTimeout(running, 5000, "pending answer continuation");
+        assert.deepEqual(observed, { asked: true, settled: false, launches: 1, turns: 1,
+          attempts: 0, remediation: 0, sinks: checkpoint ? ["milestone_checkpoint"] : [] });
+        assert.equal(attempts, interlocked ? 1 : 0);
+        assert.equal(remediation, 1);
+        assert.deepEqual(iterations, checkpoint ? [1, 1] : [1]);
+        assert.deepEqual(sinks, [...(checkpoint ? ["milestone_checkpoint"] : []), ...(interlocked ? ["done_checkpoint"] : [])]);
+        const transport = rig.epochs[checkpoint ? 1 : 0]!.transport;
+        assert.match(promptTexts(transport)[checkpoint ? 0 : 1]!, /A: retained-answer/);
+        if (checkpoint) assert.ok(transport.requests.some((r) => r.method === "thread/resume"));
+      });
+    }
+  }
+
+  for (const failure of ["cancel", "timeout", "error", "checkpoint error"] as const) {
+    it(`#2284 guards a reaped home on ${failure}`, async () => {
+      const rig = makeMultiEpochRig([scripted([["done", "checkpoint", "ask"]])]);
+      let exec!: CodexExecutor;
+      let asks = 0;
+      const { ctx } = makeCtx({
+        checkpoint: async () => {
+          await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+          if (failure === "checkpoint error") throw new Error("checkpoint failed after reap");
+        },
+        askUser: async () => {
+          asks++;
+          if (failure === "cancel") return { kind: "cancel" };
+          throw new Error(failure === "timeout" ? "question timeout" : "question error");
+        },
+      });
+      exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      await assert.rejects(withTimeout(exec.run(ctx), 5000, failure),
+        failure === "cancel" ? /run cancelled/ : failure === "checkpoint error" ? /checkpoint failed/ : /question/);
+      assert.equal(rig.sessionOps.persist, 1, "finally must not persist the deleted provider home");
+      assert.equal(rig.providerLaunches(), 1);
+      assert.equal(asks, failure === "checkpoint error" ? 0 : 1);
+      assert.ok(rig.epochs[0]!.reaped() > 0);
+    });
+  }
+
+  for (const mode of ["unwired", "auto", "capped"] as const) {
+    it(`#2284 preserves combined-question fallback: ${mode}`, async () => {
+      const rig = makeMultiEpochRig([scripted(mode === "capped" ? [["ask"], ["done", "checkpoint", "ask"]] : [["done", "checkpoint", "ask"]]), scripted([["done"]])]);
+      let asks = 0;
+      const { ctx } = makeCtx({
+        config: { max_iterations: 1, question_max: 1 },
+        autoApprove: mode === "auto",
+        askUser: mode === "unwired" ? undefined : async () => { asks++; return { kind: "answer", answers: ["SENTINEL"] }; },
+      });
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, mode);
+      assert.equal(asks, mode === "unwired" ? 0 : 1);
+      const prompt = promptTexts(rig.epochs[1]!.transport)[0]!;
+      assert.match(prompt, /Proceed on your best judgment/);
+      assert.doesNotMatch(prompt, /SENTINEL/);
+    });
+  }
+
+  it("#2284 bounds clarification rounds across checkpoint epochs", async () => {
+    const rig = makeMultiEpochRig(Array.from({ length: 4 }, () => scripted([["done", "checkpoint", "ask"]])));
+    let asks = 0;
+    let exec!: CodexExecutor;
+    const checkpoints: string[] = [];
+    const { ctx } = makeCtx({
+      config: { max_iterations: 1, question_max: 1 },
+      checkpoint: async ({ sink }) => {
+        checkpoints.push(sink!);
+        assert.equal(rig.sessionOps.persist, checkpoints.length, "persist precedes each checkpoint");
+        await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+      },
+      askUser: async () => { asks++; return { kind: "answer", answers: ["yes"] }; },
+    });
+    exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    await assert.rejects(withTimeout(exec.run(ctx), 5000, "bounded epochs"),
+      /clarification rounds exhausted during implementation/);
+    assert.equal(asks, 1);
+    assert.equal(rig.providerLaunches(), 3);
+    assert.deepEqual(checkpoints, Array(3).fill("milestone_checkpoint"), "the exhausted turn checkpoints too");
+    assert.equal(rig.sessionOps.persist, 3, "finally never persists a reaped home");
+    assert.ok(rig.epochs.slice(0, 3).every((epoch) => epoch.reaped() > 0));
+    assert.deepEqual(rig.epochs.map((epoch) => epoch.transport.turnStartCount), [1, 1, 1, 0]);
+  });
+
+  for (const prior of [false, true]) {
+    it(`#2284 ignores stale done claims and preserves independent progress; prior=${prior}`, async () => {
+      const responder: Responder = (c) => {
+        if (c.method === "thread/start") return { thread: { id: "th-1" } };
+        if (c.method !== "turn/start") return {};
+        const tn = `tn-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) c.transport.push(threadStarted());
+        const isPrior = prior && c.turnStartCount === 1;
+        const questionTurn = c.turnStartCount === (prior ? 2 : 1);
+        if (questionTurn) {
+          c.transport.push(toolCall(50, "report_progress", { completed: ["m1"], in_progress: ["m3"] }, "th-1", tn, "progress"));
+          c.transport.push(ask(51, "th-1", tn));
+        }
+        c.transport.push(toolCall(60 + c.turnStartCount, "signal_done",
+          isPrior ? { milestones_completed: ["m1"], pr_summary: PR_SUMMARY_INPUT }
+            : questionTurn ? { milestones_completed: ["m2"], pr_summary: { ...PR_SUMMARY_INPUT, summary: "STALE-CLAIM" } } : {},
+          "th-1", tn, `done-${c.turnStartCount}`)).push(turnCompleted("completed", "th-1", tn));
+        return { turn: { id: tn } };
+      };
+      const rig = makeRig({ responder });
+      let gates = 0;
+      const { ctx } = makeCtx({
+        kind: "issue", config: { max_iterations: 3 },
+        askUser: async () => ({ kind: "answer", answers: ["yes"] }),
+        secretRemediationGate: async () => ++gates === 1 && prior
+          ? { action: "remediate", followUp: "fix secrets" } : { action: "proceed" } as never,
+        reportIteration: async () => ({ scopeCeiling: 2, completedCount: 0 }),
+        frozenMilestones: ["m1", "m2", "m3"].map((id) => ({ id, title: id })),
+      });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "stale done");
+      assert.deepEqual(result.milestonesCompleted, prior ? ["m1"] : undefined);
+      assert.deepEqual(result.prSummary, prior ? PR_SUMMARY_EXPECTED : undefined);
+      assert.equal(result.scopeCapped, undefined, "stale m2 must not join the completed ID set");
+      assert.match(promptTexts(rig.transport).at(-1)!, /m3/);
+      assert.equal(gates, prior ? 2 : 1, "question-bearing done never enters remediation");
+    });
+  }
+
+  for (const interlocked of [false, true]) {
+    it(`#2284 requires fresh done after an intermediate non-done turn; interlocked=${interlocked}`, async () => {
+      const rig = makeMultiEpochRig([scripted([["done", "checkpoint", "ask"]]), scripted([[], ["done"]])]);
+      let attempts = 0;
+      const { ctx } = makeCtx({
+        kind: "issue", completionInterlock: interlocked, config: { max_iterations: 2 },
+        askUser: async () => ({ kind: "answer", answers: ["server"] }),
+        recordCompletionAttempt: async () => { attempts++; return { unmet: [], attemptCount: attempts }; },
+      });
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "intermediate turn");
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 2);
+      assert.equal(attempts, interlocked ? 1 : 0);
+    });
+  }
+
+  for (const boundary of ["cancel", "cap", "pause", "wall"] as const) {
+    it(`#2284 honors ${boundary} after answering before minting an epoch`, async () => {
+      const rig = makeMultiEpochRig([scripted([["done", "checkpoint", "ask"]])]);
+      let answered = false;
+      const { ctx } = makeCtx({
+        kind: "issue", config: { max_iterations: 1 },
+        frozenMilestones: [{ id: "m1", title: "one" }, { id: "m2", title: "two" }],
+        askUser: async () => { answered = true; return { kind: "answer", answers: ["yes"] }; },
+        cancelRequested: () => answered && boundary === "cancel",
+        reportIteration: async () => answered
+          ? boundary === "cap" ? { scopeCeiling: 1, completedCount: 1 }
+            : { pauseRequested: boundary === "pause" || boundary === "wall" } : undefined,
+        pauseModeRequested: () => answered && boundary === "wall" ? "wall" : null,
+        parkForPause: async () => true,
+        parkForWall: async () => "parked",
+      });
+      const running = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, boundary);
+      if (boundary === "cancel") await assert.rejects(running, /run cancelled/);
+      else {
+        const result = await running;
+        assert.ok(boundary === "cap" ? result.scopeCapped : boundary === "pause" ? result.pausedAt : result.walled);
+      }
+      assert.equal(rig.providerLaunches(), 1);
+      assert.equal(rig.sessionOps.persist, 1);
     });
   }
 
@@ -10549,6 +10759,52 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     assert.ok(next!.includes(A), "the next ordinary turn does");
     assert.deepEqual(seams.pulls, [undefined, A], "no pull while the rework text owned the turn");
     assert.deepEqual(seams.included, [1]);
+  });
+
+  it("#2284 checkpoint clarification retains safety steering and queues owner guidance for the next ordinary turn", async () => {
+    const queue: string[] = [];
+    const seams = followUpSeams(queue);
+    let safetySteer: string | undefined;
+    const steer = "SAFETY-STEER-RETAINED";
+    const rig = makeMultiEpochRig([
+      script("th-1", [(th, tn) => [
+        toolCall(11, "checkpoint", {}, th, tn, "c-checkpoint"),
+        toolCall(12, "ask_user", { questions: [{ question: "Which target?", header: "Target" }] }, th, tn, "c-ask"),
+      ]]),
+      script("th-1", [spoke, (th, tn) => [done(31, th, tn)]], (n) => {
+        if (n === 1) {
+          assert.deepEqual(seams.pulls, [undefined], "answer continuation never pulls owner guidance");
+          assert.deepEqual(queue, [A]);
+          assert.deepEqual(seams.included, [], "omitted guidance is never acknowledged");
+        } else {
+          assert.deepEqual(seams.included, [], "answer turn did not acknowledge owner guidance");
+        }
+      }),
+    ]);
+    const iterations: number[] = [];
+    const { ctx } = makeCtx({
+      config: { max_iterations: 2 },
+      checkpoint: async () => {},
+      askUser: async () => {
+        queue.push(A);
+        safetySteer = steer;
+        return { kind: "answer", answers: ["retained-answer"] };
+      },
+      pullSafetySteer: () => { const pending = safetySteer; safetySteer = undefined; return pending; },
+      pullFollowUp: seams.pullFollowUp,
+      followUpIncluded: seams.followUpIncluded,
+      reportIteration: async (i) => { iterations.push(i); },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#2284 owner clarification run");
+    const [answer, ordinary] = turnTexts(rig.epochs[1]!.transport);
+    assert.match(answer!, /A: retained-answer/);
+    assert.ok(answer!.includes(steer) && answer!.indexOf(steer) < answer!.indexOf("A: retained-answer"));
+    assert.ok(!answer!.includes(A));
+    assert.ok(ordinary!.includes(A), "queued guidance reaches the later ordinary turn");
+    assert.deepEqual(seams.pulls, [undefined, A]);
+    assert.deepEqual(seams.included, [1]);
+    assert.deepEqual(queue, []);
+    assert.deepEqual(iterations, [1, 1, 2], "answer continuation preserves its iteration");
   });
 
   it("(f) a non-issue run kind (task) delivers the follow-up too", async () => {

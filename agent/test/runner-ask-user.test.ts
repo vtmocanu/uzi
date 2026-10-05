@@ -1,4 +1,9 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
+import { PassThrough } from "node:stream";
+import { spawn } from "node:child_process";
+import { CodexExecutor, type CodexExecutorDeps } from "../src/codex/codex-executor.js";
+import { selectCodexBinding } from "../src/codex/select.js";
+import type { CodexTransport, CodexNotification } from "../src/codex/transport.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -207,6 +212,205 @@ function askingExecutor(count: number, log: AskLog): Executor {
     },
   };
 }
+
+// The actual executor/harness folds these callbacks; the runner owns the park and all sinks.
+class ClarificationTransport implements CodexTransport {
+  turns = 0;
+  prompts: string[] = [];
+  responses: unknown[] = [];
+  resumed = false;
+  private queue: CodexNotification[] = [];
+  private waiter?: (value: IteratorResult<CodexNotification>) => void;
+  constructor(private readonly startTurn: (transport: ClarificationTransport) => void) {}
+  push(value: CodexNotification): void {
+    if (this.waiter) { const resolve = this.waiter; this.waiter = undefined; resolve({ value, done: false }); }
+    else this.queue.push(value);
+  }
+  request<T>(method: string, params?: unknown): Promise<T> {
+    const p = params as { type?: string; input?: { text?: string }[] };
+    let result: unknown = {};
+    if (method === "initialize") result = { userAgent: "codex/0.153.2", codexHome: "/owned/codex", platformFamily: "unix", platformOs: "linux" };
+    if (method === "account/login/start") result = { type: p.type };
+    if (method === "thread/resume") this.resumed = true;
+    if (method === "thread/start" || method === "thread/resume") result = { thread: { id: "th-clarify" } };
+    if (method === "turn/start") {
+      this.turns++;
+      this.prompts.push(p.input?.[0]?.text ?? "");
+      this.startTurn(this);
+      result = { turn: { id: "tn-clarify" } };
+    }
+    return Promise.resolve(result as T);
+  }
+  installServerRequestInterceptor(): () => void { return () => {}; }
+  notify(): void {}
+  respond(id: string | number, response: unknown): void { this.responses.push({ id, response }); }
+  notifications(): AsyncIterableIterator<CodexNotification> {
+    return {
+      next: () => this.queue.length ? Promise.resolve({ value: this.queue.shift()!, done: false })
+        : new Promise((resolve) => { this.waiter = resolve; }),
+      [Symbol.asyncIterator]() { return this; },
+    };
+  }
+  close(): Promise<void> {
+    this.waiter?.({ value: undefined, done: true });
+    this.waiter = undefined;
+    return Promise.resolve();
+  }
+}
+function clarificationTool(id: number, tool: string, args = {}): CodexNotification {
+  return { kind: "activity", method: "item/tool/call", requestId: id,
+    params: { threadId: "th-clarify", turnId: "tn-clarify", callId: `clarify-${id}`, tool, arguments: args } };
+}
+function clarificationTerminal(): CodexNotification {
+  return { kind: "turn_completed", method: "turn/completed", threadId: "th-clarify", turnId: "tn-clarify",
+    status: "completed", params: { threadId: "th-clarify", turn: { id: "tn-clarify", status: "completed" } } };
+}
+
+describe("Codex RunRunner clarification completion (#2284)", () => {
+  it("checkpoints before awaiting_input and withholds MR finalize until fresh done", async () => {
+    const claim = claimFor(2284, { kind: "issue", plan_approved: true,
+      plan_md: "approved", plan_source: "seeded", config: { max_iterations: 1 },
+      secrets: { forge_pat: "fixture-forge-pat-000000", codex: { auth_mode: "subscription", access_token: "claim-key", capability: "cap", generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: null } } });
+    const logs: unknown[] = [];
+    const log = nullLogger();
+    log.warn = (message, fields) => { logs.push({ message, fields }); };
+    log.info = (message, fields) => { logs.push({ message, fields }); };
+    log.child = () => log;
+    let worktree = "";
+    let launches = 0;
+    let reaps = 0;
+    let publishes = 0;
+    let mrCalls = 0;
+    let settled = false;
+    let checkpointAtAsk = 0;
+    let reapsAtAsk = 0;
+    const first = new ClarificationTransport((t) => {
+      commitMarker(worktree, "checkpoint before clarification");
+      t.push({ kind: "thread_started", method: "thread/started", threadId: "th-clarify",
+        params: { thread: { id: "th-clarify" } } });
+      t.push(clarificationTool(1, "signal_done"));
+      t.push(clarificationTool(2, "checkpoint"));
+      t.push(clarificationTool(3, "ask_user", { questions: [{ question: "Which target?", header: "Target" }] }));
+      t.push(clarificationTerminal());
+    });
+    const fresh = new ClarificationTransport(() => {});
+    const selection = selectCodexBinding({ codex: { auth_mode: "subscription", access_token: "claim-key", capability: "cap", generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: null } });
+    assert.equal(selection.kind, "codex");
+    if (selection.kind !== "codex") throw new Error("missing Codex binding");
+    const deps: CodexExecutorDeps = {
+      deferRegistryTeardown: true, idleMs: 5000, wallMs: 10000, boundaryDeadlineMs: 5000,
+      launchProviderRoot: async () => ({
+        transport: ++launches === 1 ? first : fresh, supervisorPid: 1234,
+        root: { kind: "provider", reap: async () => { reaps++; return { ok: true }; }, dispose: async () => {} },
+      }),
+      rootStartTime: () => 1,
+      spawnCommand: async () => ({ code: 0, stdout: JSON.stringify({ uzi_envprobe: 1, proc: "ok", home: "ok", tmp: "ok" }), stderr: "" }),
+      wireFileop: () => ({ client: { op: async () => ({ ok: true }) }, dispose: async () => {} }),
+      launchEffectRoot: async (spec) => {
+        // Fileop is inert; boundary Git children run against the fixture through the real facade.
+        const fileop = spec.command.includes("fileop");
+        const split = spec.command.endsWith("uzi-codex-command-sandbox") ? spec.args.indexOf("--") : -1;
+        const command = split >= 0 ? spec.args[split + 1]! : spec.command;
+        const args = split >= 0 ? spec.args.slice(split + 2) : spec.args;
+        const child = fileop ? undefined : spawn(command, args, { cwd: spec.cwd, env: spec.env, stdio: ["pipe", "pipe", "pipe"] });
+        const terminal = child ? new Promise<{ code: number }>((resolve, reject) => {
+          child.once("error", reject);
+          child.once("exit", (code) => resolve({ code: code ?? 1 }));
+        }) : Promise.resolve({ code: 0 });
+        return {
+          started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
+            nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+          supervisorPid: 200,
+          transport: { stdin: child?.stdin ?? new PassThrough(), stdout: child?.stdout ?? new PassThrough(), stderr: child?.stderr ?? new PassThrough() },
+          snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+          waitChild: async () => ({ event: "child_exit", ...(await terminal) }),
+          dispose: async () => {
+            if (child && child.exitCode === null) child.kill("SIGKILL");
+            await terminal;
+            return { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } };
+          },
+          failed: undefined, whenFailed: new Promise<Error>(() => {}),
+        };
+      },
+      sessionStore: { adopt: async () => ({ files: 0 }), inspect: async () => "absent",
+        remove: async () => {}, persist: async () => ({ files: 0, bytes: 0 }) },
+    };
+    const executor = new CodexExecutor(log, path.join(fx.dataDir, "codex"),
+      { binding: selection.binding, client, commandSandbox: "off",
+        provider: { name: "openai", baseUrl: "http://127.0.0.1:9/v1", envKey: "OPENAI_API_KEY", model: "gpt-6-astra" } }, deps);
+    const release = client.releaseCodex.bind(client);
+    let generation = 3;
+    client.releaseCodex = async () => ({ auth_mode: "subscription", access_token: "fixture-codex-access", generation, chatgpt_account_id: "verified-account", chatgpt_plan_type: null });
+    const refresh = client.refreshCodex.bind(client);
+    client.refreshCodex = async () => ({ auth_mode: "subscription", access_token: "fixture-codex-access", generation: ++generation, chatgpt_account_id: "verified-account", chatgpt_plan_type: null, outcome: "advanced" });
+    const publish = client.publishCheckpoint.bind(client);
+    client.publishCheckpoint = async (_run, _tip, pack) => {
+      for await (const chunk of pack) void chunk;
+      publishes++;
+      return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-2284" } };
+    };
+    let questionId = "";
+    api.onState(claim.run_id, (body) => {
+      if (body.status === "awaiting_input") {
+        questionId = body.open_question_id ?? "";
+        checkpointAtAsk = publishes;
+        reapsAtAsk = reaps;
+      }
+    });
+    const runner = new RunRunner(client, git, () => ({ executor: {
+      get safety() { return executor.safety; },
+      run: async (ctx) => { worktree = ctx.worktreePath; return executor.run(ctx); },
+    } }), log, 20, undefined, {
+      pollMs: 5, questionTimeoutMs: 3000, planApprovalTimeoutMs: 0,
+      gitlab: new GitLabClient({ fetchFn: async (_url, init) => {
+        if (init?.method === "POST") mrCalls++;
+        return { status: 201, text: async () => JSON.stringify({ iid: 42, web_url: "https://gitlab.example.test/org/repo/-/merge_requests/42" }) };
+      } }),
+    });
+    const running = runner.execute(claim).finally(() => { settled = true; });
+    const wait = async (condition: () => boolean): Promise<void> => {
+      const deadline = Date.now() + 5000;
+      while (!condition() && !settled) {
+        if (Date.now() >= deadline) throw new Error("clarification observation deadline");
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    };
+    try {
+      await wait(() => !!questionId);
+      const parked = { questionId, checkpointAtAsk, reapsAtAsk, launches, turns: first.turns, settled, mrCalls };
+      api.setInputs(claim.run_id, [answerInput(questionId, "server")]);
+      await wait(() => fresh.turns === 1);
+      const answered = { launches, resumed: fresh.resumed, prompt: fresh.prompts[0], mrCalls, settled, publishes };
+      fresh.push(clarificationTool(4, "signal_done"));
+      fresh.push(clarificationTerminal());
+      await running;
+      assert.ok(parked.questionId, JSON.stringify(api.states));
+      // Overlay-less Codex checkpoints fetch back locally and defer the remote scan/publish
+      // outside the permit. A deferred checkpoint does not grant MR finalization.
+      assert.equal(parked.checkpointAtAsk, 0);
+      assert.ok(logs.some((entry) => (entry as { message: string }).message.includes("scan_deferred")));
+      assert.equal(answered.publishes, 0, "remote publication remains deferred while clarification resumes");
+      assert.ok(parked.reapsAtAsk > 0, "real boundary reaped before asking");
+      assert.deepEqual({ launches: parked.launches, turns: parked.turns, settled: parked.settled, mrCalls: parked.mrCalls },
+        { launches: 1, turns: 1, settled: false, mrCalls: 0 });
+      assert.equal(answered.launches, 2);
+      assert.equal(answered.resumed, true);
+      assert.match(answered.prompt!, /A: server/);
+      assert.equal(answered.mrCalls, 0);
+      assert.equal(answered.settled, false);
+      assert.equal(mrCalls, 1, JSON.stringify({ states: api.states, messages: api.messages(claim.run_id), logs }));
+      assert.equal(statuses(claim.run_id).at(-1), "completed", failureReason(claim.run_id));
+      assert.deepEqual(questionMessageIds(claim.run_id), [questionId]);
+    } finally {
+      fresh.push(clarificationTool(5, "signal_done"));
+      fresh.push(clarificationTerminal());
+      await running;
+      client.publishCheckpoint = publish;
+      client.releaseCodex = release;
+      client.refreshCodex = refresh;
+    }
+  });
+});
 
 describe("PRD #88 M6 — RunRunner.askUser", () => {
   /**

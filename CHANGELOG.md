@@ -55,6 +55,9 @@ through `[0.52.0]`.)
 - **Source ref advertisements enforce the clone wire budget ([#2266](https://github.com/vtmocanu/uzi/issues/2266)).**
   Ref listing and source fetches reject over-budget advertisements even when the Git decoder succeeds, returning the existing wire-budget diagnostic before accepting refs or fetching a pack.
 
+- **Codex answers clarification before accepting completion ([#2284](https://github.com/vtmocanu/uzi/issues/2284)).**
+  Implementation questions require a fresh completion signal after the answer. For a simultaneous milestone checkpoint, session persistence and reaping finish before asking; publication follows the runner's existing best-effort or deferred behavior. The saved session resumes with the answer in the same iteration; premature completion claims are ignored.
+
 - **Secret scans reuse the pinned worker scanner offline ([#2289](https://github.com/vtmocanu/uzi/issues/2289)).**
   The repository gate reuses installed gitleaks only when Go build metadata proves the exact module and version without replacements. Unknown or different builds use the pinned fetch, and every scan still must detect its canaries.
 
