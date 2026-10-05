@@ -46,7 +46,8 @@ the agent workload, not an arbitrary user's build or test suite.
   to 8Gi. Requests reserve node capacity, so fewer new workers fit on a node
   with unchanged resources. Operators must account for that capacity cost.
 - Shipped namespace request quotas cover the advertised deployment count at
-  the new default, including Docker sidecars and modest headroom. Quotas are
+  the new default, including Docker sidecars. Only the Docker tier has
+  headroom; the plain and isolated tiers fit their fleet exactly. Quotas are
   ceilings, not reservations. Operators with their own quota overrides must
   raise them too, or admission caps their fleet below `deployments`.
 - Limits increase from 2 CPU / 8Gi to 4 CPU / 12Gi. Two run slots still share

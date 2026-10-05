@@ -22,15 +22,17 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **New hosted workers default to the large preset ([#2240](https://github.com/vtmocanu/uzi/issues/2240)).**
+  Ephemeral provisioning defaults and falls back to L, and the persistent provision form preselects L. Existing workers keep their sizes; new workers reserve more CPU and memory capacity.
+
 ## [0.85.2] - 2026-10-05
 
 ### Changed
 
 - **Findings stay in the backlog; admin health DMs cover instance danger ([#2271](https://github.com/vtmocanu/uzi/issues/2271)).**
   Findings keep capture and triage without Slack DMs or new notification latch rows; admin notices select danger only for `db`, `controller.report`, `loops` and `fleet.roll`, while full health views, overall-episode timing and owner run-health DMs stay unchanged.
-
-- **New hosted workers default to the large preset ([#2240](https://github.com/vtmocanu/uzi/issues/2240)).**
-  Ephemeral provisioning defaults and falls back to L, and the persistent provision form preselects L. Existing workers keep their sizes; new workers reserve more CPU and memory capacity.
 
 - **Codex Read returns bounded text excerpts ([#296](https://github.com/vtmocanu/uzi/issues/296)).**
   Text reads support one-based line offsets and limits, default to 200 lines, and return at most 64 KiB with excerpt metadata; unranged binary reads preserve exact base64, while malformed or oversized helper responses fail with neutral denials.
