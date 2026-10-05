@@ -310,7 +310,7 @@ func workerAttention(r workerRow, now time.Time) []attnItem {
 	}
 	if w.Ephemeral && w.EphemeralLeaseExpiresAt != nil && w.EphemeralLeaseExpiresAt.After(now) {
 		text := "· lease " + workerDuration(w.EphemeralLeaseExpiresAt.Sub(now)) + " left"
-		add(2, text, text+" · idle, held for follow-up")
+		add(2, text, text+" · ephemeral lease held for follow-up")
 	}
 	if w.Busy && w.ActiveRuns == 0 {
 		add(2, "· chat active", "· chat active (run lane occupancy is zero)")

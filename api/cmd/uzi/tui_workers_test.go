@@ -81,12 +81,33 @@ func TestWorkersLegendHelpAndVersionBudget(t *testing.T) {
 	if line := m.workerRowLine(r, true, 120); !strings.Contains(stripANSI(line), "+") || visualWidth(line) > 120 {
 		t.Fatalf("attention suffix lost: %s", line)
 	}
+	line := stripANSI(m.workerRowLine(r, true, 120))
+	// Wide glyphs must fit the eight-column version cell before its marker.
+	versionCell := "界界界…✕"
+	at := strings.Index(line, versionCell)
+	if at < 0 || visualWidth(line[:at]) != 83 || strings.Contains(line, "界界界界") {
+		t.Fatalf("version cell moved or exceeded its visual budget: %q", line)
+	}
 	if !strings.Contains(stripANSI(m.renderWorkers()), "fixed visual cue") {
 		t.Fatal("missing disk legend")
 	}
 	help := strings.Join(helpLines(viewWorkers), "\n")
 	if !strings.Contains(help, "j / ↓") || !strings.Contains(help, "k / ↑") {
 		t.Fatal("movement help omitted")
+	}
+}
+
+func TestWorkerBusyLeaseReadout(t *testing.T) {
+	now := time.Now()
+	expires := now.Add(10 * time.Minute)
+	m := workersScene(true, "workers-list-80")
+	m.workers.rows = []workerRow{{w: apitypes.WorkerDTO{
+		ID: "busy-lease", Name: "busy-lease", Status: "online", Busy: true,
+		ActiveRuns: 1, Ephemeral: true, EphemeralLeaseExpiresAt: &expires,
+	}}}
+	frame := stripANSI(m.View().Content)
+	if !strings.Contains(frame, "busy") || !strings.Contains(frame, "ephemeral lease held for follow-up") || strings.Contains(frame, "idle") {
+		t.Fatalf("busy lease readout misstates occupancy: %s", frame)
 	}
 }
 
@@ -675,6 +696,266 @@ func TestWorkersHostileReadoutAndASCII(t *testing.T) {
 		if width >= 120 && (!strings.Contains(frame, "~?") || !strings.Contains(frame, "✕")) {
 			t.Fatal("stale/version markers missing")
 		}
+	}
+}
+
+func TestWorkersSummaryDropsSegmentsInPriorityOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		used, cap int
+		want      string
+	}{
+		{"unknown cap first", 1, 2, "your workers · 2 · 2 online · 1/2 slots in use · 1 holding · 1 need attention"},
+		{"admission next", 12345, 12345, "your workers · 2 · 2 online · 12345/12345 slots in use · 1 need attention"},
+		{"online last", 1234567890, 1234567890, "your workers · 2 · 1234567890/1234567890 slots in use · 1 need attention"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := workersScene(true, "workers-list-80")
+			m.workers.rows = []workerRow{
+				{w: apitypes.WorkerDTO{ID: "held", Status: "online", ActiveRuns: tc.used, MaxConcurrentRuns: &tc.cap, RetainingUnpublishedWork: true}},
+				{w: apitypes.WorkerDTO{ID: "unknown", Status: "online"}},
+			}
+			if wide := m.workersSummary(160, false); !strings.Contains(wide, "+1 ?cap") || !strings.Contains(wide, "1 holding") || !strings.Contains(wide, "2 online") {
+				t.Fatalf("fixture lacks optional segments: %q", wide)
+			}
+			if got := m.workersSummary(80, false); got != tc.want || visualWidth(got) > 80 {
+				t.Fatalf("80-column summary = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWorkersHelpEveryListLayout(t *testing.T) {
+	for _, split := range []bool{false, true} {
+		for _, key := range []string{"1", "2", "3", "4"} {
+			t.Run(map[bool]string{false: "full", true: "split"}[split]+"/"+key, func(t *testing.T) {
+				m := workersScene(true, "workers-list-80")
+				m.splitMode = "off"
+				if split {
+					m.splitMode = "auto"
+					m = resizeSplit(m, 80, splitMinHeight+2)
+				}
+				m = press(t, m, key)
+				m = press(t, m, "?")
+				if !m.showHelp {
+					t.Fatal("help key did not open overlay")
+				}
+				frame := stripANSI(m.View().Content)
+				wants := []string{"j / ↓", "k / ↑", "/          filter", "r          refresh", "?          this help", "any key returns"}
+				if split {
+					wants = append(wants, "tab        cycle floor, workers, pulls, ci", "1/2 top floor/workers · 3/4 bottom pulls/ci",
+						"shift+tab  cycle ci, pulls, workers, floor", "ctrl+w     switch pane focus", "s          collapse / restore split")
+				} else {
+					wants = append(wants, "tab / shift+tab  floor · workers · pulls · ci", "1 / 2 / 3 / 4  floor / workers / pulls / ci")
+					if strings.Contains(frame, "ctrl+w") || strings.Contains(frame, "collapse / restore split") {
+						t.Fatal("full-screen help advertises split keys")
+					}
+				}
+				switch key {
+				case "1":
+					wants = append(wants, "h          hide finished runs")
+				case "2":
+					wants = append(wants, "a          toggle your workers / factory workers", "occupancy / advertised slots", "chat excluded")
+				case "3":
+					wants = append(wants, "open the selected PR", "u          open the PR's linked uzi run")
+				case "4":
+					wants = append(wants, "open the selected run's jobs")
+				}
+				for _, want := range wants {
+					if !strings.Contains(frame, want) {
+						t.Errorf("help lacks %q: %s", want, frame)
+					}
+				}
+				for _, line := range strings.Split(frame, "\n") {
+					if visualWidth(line) > 80 {
+						t.Errorf("help line exceeds 80 columns: %q", line)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestWorkersDrillReturnPollingAndTopTab(t *testing.T) {
+	for _, origin := range []struct {
+		name, key    string
+		list, detail tuiView
+	}{
+		{"run", "1", viewBoard, viewDetail},
+		{"pr", "3", viewPulls, viewPR},
+		{"ci", "4", viewCI, viewCIRun},
+	} {
+		for _, collapse := range []bool{false, true} {
+			t.Run(origin.name+map[bool]string{false: "/split", true: "/resize"}[collapse], func(t *testing.T) {
+				c := &workersProbeClient{Client: &uzicli.FakeClient{}}
+				m := tuiTestModel(t, c, "")
+				m = resizeSplit(m, 120, splitMinHeight+2)
+				m.repos, m.reposLoaded, m.repoChosen = []apitypes.RepoDTO{oneRepo()}, true, true
+				m.board.runs = []apitypes.RunListItemDTO{
+					{RunDTO: apitypes.RunDTO{ID: "first", Kind: "issue", Status: "running"}},
+					{RunDTO: apitypes.RunDTO{ID: "second", Kind: "issue", Status: "running"}},
+				}
+				m.pulls.pulls = samplePulls(time.Now())
+				m.ci.runs = sampleCIRuns(time.Now())
+				m = press(t, m, "2")
+				m = step(m, m.fetchWorkersCmd(false, m.workers.waitID)())
+				m = press(t, m, origin.key)
+				// The run originates on the floor; bottom drill-ins retain workers on top.
+				top := viewWorkers
+				if origin.list == viewBoard {
+					top = viewBoard
+				}
+				m = press(t, m, "j")
+				id, gen := m.workers.reqSeq, m.workers.tickGen
+				m = press(t, m, "enter")
+				if m.view != origin.detail || !m.fromSplit || m.workers.active || m.workers.tickGen <= gen || m.top() != top {
+					t.Fatalf("drill-in did not suspend workers or retain top: view=%v active=%v top=%v", m.view, m.workers.active, m.top())
+				}
+				next, cmd := m.Update(workersTickMsg{gen: gen})
+				m = next.(tuiModel)
+				if cmd != nil || m.workers.reqSeq != id {
+					t.Fatal("pre-drill tick fetched while hidden")
+				}
+				next, cmd = m.Update(workersTickMsg{gen: m.workers.tickGen})
+				m = next.(tuiModel)
+				if cmd != nil || m.workers.reqSeq != id {
+					t.Fatal("hidden current tick fetched")
+				}
+				if collapse {
+					m = resizeSplit(m, 120, splitMinHeight-1)
+					if m.workers.active || m.top() != top {
+						t.Fatal("resize in detail restarted polling or lost top")
+					}
+				}
+				next, cmd = m.handleKey("esc")
+				m = next.(tuiModel)
+				want := origin.list
+				if collapse {
+					want = top
+				}
+				if m.view != want || m.top() != top || m.fromSplit || !m.workers.active || m.workers.waitID <= id || cmd == nil {
+					t.Fatalf("return did not restore view and fresh request: view=%v top=%v active=%v wait=%d", m.view, m.top(), m.workers.active, m.workers.waitID)
+				}
+				if origin.list == viewPulls && (m.bottom() != viewPulls || m.pulls.cursor != 1) {
+					t.Fatal("PR return lost bottom tab or selection")
+				}
+				if origin.list == viewCI && (m.bottom() != viewCI || m.ci.cursor != 1) {
+					t.Fatal("CI return lost bottom tab or selection")
+				}
+				if origin.list == viewBoard && m.board.cursor != 1 {
+					t.Fatal("run return lost floor selection")
+				}
+				// Execute only the finite return command batch (board refresh and workers
+				// fetch); no tick or stream command is fed back into this queue.
+				pending := []tea.Cmd{cmd}
+				var reply *workersMsg
+				before := c.own
+				for attempts := 0; len(pending) > 0 && attempts < 8; attempts++ {
+					current := pending[0]
+					pending = pending[1:]
+					if current == nil {
+						continue
+					}
+					switch msg := current().(type) {
+					case tea.BatchMsg:
+						pending = append(pending, msg...)
+					case workersMsg:
+						if reply != nil {
+							t.Fatal("return scheduled duplicate worker fetches")
+						}
+						reply = &msg
+					}
+				}
+				if len(pending) != 0 || reply == nil || reply.reqID != m.workers.waitID || c.own != before+1 {
+					t.Fatal("return command did not immediately fetch workers exactly once")
+				}
+				m = step(m, *reply)
+				next, cmd = m.Update(workersTickMsg{gen: gen})
+				m = next.(tuiModel)
+				if cmd != nil || m.workers.waitID != 0 {
+					t.Fatal("pre-drill tick survived return")
+				}
+				if collapse {
+					m = resizeSplit(m, 120, splitMinHeight+2)
+					if !m.splitDrawn() || m.view != top || m.top() != top || (origin.list != viewBoard && m.bottom() != origin.list) {
+						t.Fatal("regrow lost restored panes or top focus")
+					}
+				} else if !m.splitDrawn() {
+					t.Fatal("return failed to draw split")
+				}
+			})
+		}
+	}
+}
+
+func TestWorkersReplySchedulesBackoffDelay(t *testing.T) {
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	for _, tc := range []struct {
+		name   string
+		err    error
+		delay  time.Duration
+		streak int
+	}{
+		{"first failure", errors.New("unavailable"), 10 * time.Second, 1},
+		{"second failure", errors.New("unavailable"), 20 * time.Second, 2},
+		{"recovery", nil, 5 * time.Second, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m = press(t, m, "r")
+			start := time.Now()
+			next, cmd := m.Update(workersMsg{reqID: m.workers.waitID, err: tc.err})
+			m = next.(tuiModel)
+			if cmd == nil || m.workers.waitID != 0 || m.workers.errStreak != tc.streak {
+				t.Fatal("reply failed to schedule the next poll")
+			}
+			// Run the actual reply command, not the interval helper. Its timer is
+			// bounded by the specified delay; failure here does not skip siblings.
+			msg := cmd()
+			elapsed := time.Since(start)
+			tick, ok := msg.(workersTickMsg)
+			if !ok || tick.gen != m.workers.tickGen || elapsed < tc.delay-100*time.Millisecond || elapsed > tc.delay+5*time.Second {
+				t.Fatalf("reply scheduled %T after %v, want workers tick after %v (gen %d)", msg, elapsed, tc.delay, m.workers.tickGen)
+			}
+			next, fetch := m.Update(tick)
+			m = next.(tuiModel)
+			if fetch == nil || m.workers.waitID == 0 {
+				t.Fatal("reply-scheduled tick did not request workers")
+			}
+		})
+	}
+}
+
+func TestWorkersFilteredSelectionAcrossPolls(t *testing.T) {
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	m.splitMode = "off"
+	m = press(t, m, "2")
+	rows := []workerRow{
+		{w: apitypes.WorkerDTO{ID: "a", Name: "forge-alpha", Status: "online"}},
+		{w: apitypes.WorkerDTO{ID: "b", Name: "forge-beta", Status: "online"}},
+		{w: apitypes.WorkerDTO{ID: "excluded", Name: "laptop", Status: "offline"}},
+	}
+	m = step(m, workersMsg{reqID: m.workers.waitID, rows: rows})
+	m = press(t, m, "/")
+	for _, key := range []string{"F", "O", "R", "G", "E", "enter", "j"} {
+		m = press(t, m, key)
+	}
+	if m.workers.selectedID != "b" || m.workers.cursor != 1 {
+		t.Fatal("filter did not select beta")
+	}
+	rows[1].w.OutboxBlocked = sp("blocked")
+	m = press(t, m, "r")
+	m = step(m, workersMsg{reqID: m.workers.waitID, rows: rows})
+	if m.workers.filter != "FORGE" || m.workers.selectedID != "b" || m.workers.cursor != 0 {
+		t.Fatal("filtered reorder lost selection")
+	}
+	if frame := stripANSI(m.View().Content); !strings.Contains(frame, "selected forge-beta") || strings.Contains(frame, "laptop") {
+		t.Fatalf("filtered selection rendered incorrectly: %s", frame)
+	}
+	rows = []workerRow{rows[0], rows[2]}
+	m = press(t, m, "r")
+	m = step(m, workersMsg{reqID: m.workers.waitID, rows: rows})
+	if m.workers.filter != "FORGE" || m.workers.selectedID != "a" || m.workers.cursor != 0 {
+		t.Fatal("disappearance did not select remaining filtered row")
 	}
 }
 
