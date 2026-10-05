@@ -8,8 +8,10 @@ import { Outbox } from "../src/outbox.js";
 import type { RecoveryReleaseResponse } from "../src/protocol.js";
 import { FakeRecoveryClient, FakeRecoveryGit } from "./codex-reap-fixture.js";
 import { nullLogger } from "./helpers.js";
+import os from "node:os";
+import { realpathSync } from "node:fs";
 
-const scratch = path.resolve(import.meta.dirname, "../../.uzi/scratch");
+const scratch = realpathSync(os.tmpdir());
 const run = "11111111-1111-4111-8111-111111111111";
 const hold = "22222222-2222-4222-8222-222222222222";
 test("exact release hints follow metadata locks; bad terminals and unknown sibling files remain", async () => {

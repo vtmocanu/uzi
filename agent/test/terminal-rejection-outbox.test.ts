@@ -2,12 +2,13 @@ import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { Outbox, OUTBOX_RANGE_RESERVE_BYTES } from "../src/outbox.js";
 import type { TerminalRejectionCustodyResponse } from "../src/protocol.js";
 import { recordingLogger } from "./helpers.js";
+import os from "node:os";
+import { realpathSync } from "node:fs";
 
-const scratch = fileURLToPath(new URL("../../.uzi/scratch/", import.meta.url));
+const scratch = realpathSync(os.tmpdir());
 const run = "11111111-1111-4111-8111-111111111111";
 const worker = "22222222-2222-4222-8222-222222222222";
 const hold = "33333333-3333-4333-8333-333333333333";

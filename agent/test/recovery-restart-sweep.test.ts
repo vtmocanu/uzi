@@ -142,7 +142,7 @@ function guardedWrite(coord: RecoveryCoordinator, record: RecoveryRecord, next: 
 
 const FIN = { bareDir: BARE_DIR, defaultBranch: "main", finalizationPin: true } as const;
 const TRUST_RUN = "11111111-1111-4111-8111-111111111111";
-const OUTBOX_SCRATCH = path.resolve(import.meta.dirname, "../../.uzi/scratch");
+const OUTBOX_SCRATCH = fs.realpathSync(os.tmpdir());
 
 async function rejectedTerminal(root: string): Promise<{ outbox: Outbox; file: string; physical: string }> {
   const reopenOutbox = async (): Promise<Outbox> => {

@@ -16,12 +16,14 @@ import type { StatsCollector } from "../src/stats.js";
 import type { Logger } from "../src/log.js";
 import { nullLogger } from "./helpers.js";
 import { sleep } from "../src/util.js";
+import os from "node:os";
+import { realpathSync } from "node:fs";
 
 const run = "11111111-1111-4111-8111-111111111111";
 const workerId = "22222222-2222-4222-8222-222222222222";
 const hold = "33333333-3333-4333-8333-333333333333";
 const feature = "terminal_rejection_report";
-const scratch = path.resolve(import.meta.dirname, "../../.uzi/scratch");
+const scratch = realpathSync(os.tmpdir());
 const fixture = new URL("../../fixtures/terminal-rejection/mac-failure.json", import.meta.url);
 const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; });
@@ -83,7 +85,7 @@ function makeWorker(r: Awaited<ReturnType<typeof rig>>, client: WorkerClient, lo
   } as unknown as RunRunner, { execute: async () => {} } as unknown as ChatRunner,
   {} as JudgeRunner, {} as ReviewRunner, log, () => ({ ok: true, missing: [] }),
   r.outbox, new Map(), r.registry, undefined, undefined, undefined, undefined,
-  () => ({ collect: () => undefined }) as unknown as StatsCollector, undefined, undefined, coordinator);
+  () => ({ collect: () => undefined }) as unknown as StatsCollector, undefined, undefined, undefined, coordinator);
 }
 
 function client(log = nullLogger()) {

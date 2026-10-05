@@ -8,8 +8,10 @@ import { Outbox } from "../src/outbox.js";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { mintAttemptId } from "../src/run-quiescence.js";
 import { nullLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
+import os from "node:os";
+import { realpathSync } from "node:fs";
 
-const scratch = path.resolve(import.meta.dirname, "../../.uzi/scratch");
+const scratch = realpathSync(os.tmpdir());
 const run = "11111111-1111-4111-8111-111111111111";
 test("bad MAC retains attempts above the limit, every ledger state, and terminal clone; control deletes", async () => {
   const root = fs.mkdtempSync(path.join(scratch, "terminal-retention-"));

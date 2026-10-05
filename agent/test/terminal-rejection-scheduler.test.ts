@@ -9,13 +9,15 @@ import { RunDiskLocks } from "../src/run-disk-locks.js";
 import type { TerminalRejectionCustodyResponse } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 import { sleep } from "../src/util.js";
+import os from "node:os";
+import { realpathSync } from "node:fs";
 
 const run = "abcdefab-1111-4111-8111-111111111111";
 const worker = "22222222-2222-4222-8222-222222222222";
 const hold = "33333333-3333-4333-8333-333333333333";
 const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; });
-const scratch = path.resolve(import.meta.dirname, "../../.uzi/scratch");
+const scratch = realpathSync(os.tmpdir());
 function badRecord() { return JSON.stringify({ mac: "0".repeat(64), body: { error: "never-send-this-content" } }); }
 function custody(generation: number): TerminalRejectionCustodyResponse {
   return { run_id: run, worker_id: worker, generation, exact_holds: [{ id: hold, state: "released" }],

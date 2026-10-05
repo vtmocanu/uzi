@@ -17,13 +17,15 @@ import type { StatsCollector } from "../src/stats.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 import { sleep } from "../src/util.js";
+import os from "node:os";
+import { realpathSync } from "node:fs";
 
 const run = "11111111-1111-4111-8111-111111111111";
 const workerId = "22222222-2222-4222-8222-222222222222";
 const hold = "33333333-3333-4333-8333-333333333333";
 const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; });
-const scratch = path.resolve(import.meta.dirname, "../../.uzi/scratch");
+const scratch = realpathSync(os.tmpdir());
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => { resolve = done; });
@@ -63,7 +65,7 @@ function makeWorker(r: Awaited<ReturnType<typeof rig>>, client: WorkerClient,
   {} as JudgeRunner, {} as ReviewRunner, nullLogger(), () => ({ ok: true, missing: [] }),
   r.outbox, new Map(), r.registry, undefined, undefined, undefined, undefined,
   () => ({ collect: () => undefined }) as unknown as StatsCollector,
-  undefined, undefined, coordinator);
+  undefined, undefined, undefined, coordinator);
 }
 function settled() {
   return { run_id: run, worker_id: workerId, generation: 3, exact_holds: [{ id: hold, state: "released" }],
