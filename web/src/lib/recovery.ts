@@ -18,6 +18,8 @@ import { isTerminalRun } from "./runStatus";
 import { stripUnsafeChars } from "./safeText";
 import type { BadgeTone } from "../components/ui";
 
+export const TERMINAL_MAC_FAILURE_COPY = "terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody";
+
 // RecoverySectionKind is the top-level shape the section renders, derived from the
 // aggregate summary so the section is truthful with ZERO captures. `null` means render
 // nothing at all — an ordinary run with no recovery relevance.
@@ -313,7 +315,7 @@ export function custodyHoldView(hold: RecoveryCustodyHold): CustodyHoldView {
     ...attentionView(hold),
     checkpoint: custodyCheckpointView(hold),
     terminalRejection: hold.terminal_record_rejection === "mac_failure"
-      ? "terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody"
+      ? TERMINAL_MAC_FAILURE_COPY
       : null,
   };
 }

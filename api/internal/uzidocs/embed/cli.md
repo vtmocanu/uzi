@@ -978,6 +978,14 @@ uzi run recovery <run-id> [--json]
   hold. A hold with no retained checkpoint ref omits the line (and the `--json` fields are
   absent).
 
+- A hold with `terminal_record_rejection: "mac_failure"` also shows the fixed diagnostic:
+  “terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody”.
+  JSON preserves that field and adds the fixed text as `terminal_rejection`, alongside the
+  exact hold and generation. The diagnostic supplies no completion or replay authority and
+  does not change attention or export availability. Export still requires an independently
+  verified available capture. See [terminal record authentication failures](run-recovery.md#when-a-terminal-record-fails-authentication-after-restart)
+  for negotiated reporting, retained source, and positive custody cleanup after settlement.
+
 When a capture-less hold is genuinely not worth keeping, discard that one exact held
 source:
 

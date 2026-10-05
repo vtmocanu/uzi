@@ -22,10 +22,6 @@ vi.mock("../lib/api", async (importOriginal) => {
       listWorkers: vi.fn().mockResolvedValue({ workers: [] }),
       getMySettings: vi.fn().mockResolvedValue({ settings: { mr_rework_enabled: null } }),
       setRunMrRework: vi.fn().mockResolvedValue({ run: null }),
-      getRecoveryHolds: vi.fn<typeof actual.api.getRecoveryHolds>().mockResolvedValue({
-        aggregate: { open_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 },
-        holds: [],
-      }),
       getRunArchives: vi.fn().mockResolvedValue({
         supported: false,
         legacy: true,

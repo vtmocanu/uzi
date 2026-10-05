@@ -2,9 +2,9 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { RecoveryArchivesPanel } from "./RecoveryArchives";
-import { api, type RecoveryArchive, type RecoveryArchiveSummary, type RecoveryCustodyHold, type RecoveryCustodyHolds, type Run } from "../lib/api";
+import { api, type RecoveryArchive, type RecoveryArchiveSummary, type Run } from "../lib/api";
 
-// The panel fetches its owner-scoped summary and holds. Mock those reads and deletion;
+// The panel fetches only its owner-scoped summary. Spy on holds to forbid a new read;
 // keep runArchiveDownloadUrl and the recovery display helpers real, since the whole
 // point of these pins is the real render path (D6/D7).
 vi.mock("../lib/api", async (importActual) => {
@@ -17,7 +17,7 @@ vi.mock("../lib/api", async (importActual) => {
 const mockApi = vi.mocked(api);
 
 beforeEach(() => {
-  mockApi.getRecoveryHolds.mockReset().mockResolvedValue(listing([]));
+  mockApi.getRecoveryHolds.mockReset();
 });
 
 afterEach(() => {
@@ -25,7 +25,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-// The panel reads only run.id and run.status; a minimal cast matches the repo convention
+// A minimal run fixture matches the repo convention
 // (SteerQueueCard.test.tsx) rather than spelling out the whole Run.
 function aRun(over: Partial<Run> = {}): Run {
   return { id: "r1", status: "failed", ...over } as Run;
@@ -74,173 +74,100 @@ async function renderPanel(run: Run, s: RecoveryArchiveSummary) {
   return utils;
 }
 
-function hold(over: Partial<RecoveryCustodyHold> = {}): RecoveryCustodyHold {
-  return {
-    id: "hold-gen7",
-    run_id: "r1",
-    generation: 7,
-    state: "open",
-    attention: "source_only",
-    worker_id: "w1",
-    has_available_capture: false,
-    created_at: "2026-09-14T00:00:00Z",
-    updated_at: "2026-09-14T00:00:00Z",
-    terminal_record_rejection: "mac_failure",
-    ...over,
-  };
-}
-
-function listing(holds: RecoveryCustodyHold[]): RecoveryCustodyHolds {
-  return {
-    aggregate: { open_holds: holds.length, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 },
-    holds,
-  };
-}
-
 const DIAGNOSTIC = "terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody";
 const SECRET_WARNING = /Treat every archive as if it contains secrets/;
 
-describe("RecoveryArchivesPanel custody diagnostic", () => {
-  it("shows the exact rejected hold and generation with authoritative source-only copy instead of preparing", async () => {
-    mockApi.getRecoveryHolds.mockResolvedValue(listing([hold()]));
-    await renderPanel(aRun(), summary({ has_open_hold: true }));
-    const row = screen.getByText(DIAGNOSTIC).closest("li")!;
-    expect(within(row).getByText("hold hold-gen7")).toBeTruthy();
-    expect(within(row).getByText("gen 7")).toBeTruthy();
-    expect(within(row).getByText("Decision required")).toBeTruthy();
-    expect(within(row).getByText(/No server archive exists/)).toBeTruthy();
+describe("RecoveryArchivesPanel fixed failed-run copy", () => {
+  it("uses only the exact failed-run reason and suppresses inferred zero-row preparation", async () => {
+    await renderPanel(aRun({ failure_reason: DIAGNOSTIC }), summary({ has_open_hold: true }));
+    expect(screen.getByText(DIAGNOSTIC).textContent).toBe(DIAGNOSTIC);
+    expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
     expect(screen.queryByText(/Preparing the recovery archive/)).toBeNull();
-    expect(screen.queryByRole("link", { name: "Export archive" })).toBeNull();
-    expect(screen.queryByText(/uzi run export/)).toBeNull();
-  });
-
-  it("preserves the last good source-only diagnostic when a same-run status refresh fails", async () => {
-    mockApi.getRecoveryHolds.mockResolvedValueOnce(listing([hold()]));
-    const { rerender } = await renderPanel(
-      aRun({ status: "running", landing_state: "needs_landing" }),
-      summary(),
-    );
-    expect(screen.getByText(DIAGNOSTIC)).toBeTruthy();
-
-    mockApi.getRunArchives.mockResolvedValue(summary({ has_open_hold: true }));
-    mockApi.getRecoveryHolds.mockRejectedValueOnce(new Error("temporarily unavailable"));
-    await act(async () => {
-      rerender(<RecoveryArchivesPanel run={aRun({ status: "failed", landing_state: "needs_landing" })} />);
-    });
-    expect(mockApi.getRunArchives).toHaveBeenCalledTimes(2);
-    expect(mockApi.getRecoveryHolds).toHaveBeenCalledTimes(2);
-    const row = screen.getByText(DIAGNOSTIC).closest("li")!;
-    expect(within(row).getByText("hold hold-gen7")).toBeTruthy();
-    expect(within(row).getByText("gen 7")).toBeTruthy();
-    expect(within(row).getByText("Decision required")).toBeTruthy();
-    expect(within(row).getByText(/No server archive exists/)).toBeTruthy();
+    expect(screen.queryByText(/No server archive exists|Decision required|gen 7|hold h1/)).toBeNull();
     expect(screen.queryByRole("link", { name: "Export archive" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Export archive" })).toBeNull();
     expect(screen.queryByText(/uzi run export/)).toBeNull();
-    expect(screen.queryByText(/Preparing the recovery archive/)).toBeNull();
   });
 
-  it("does not infer an archive from a known active MAC rejection after a failed refresh", async () => {
-    mockApi.getRecoveryHolds.mockResolvedValueOnce(listing([hold({ attention: "active" })]));
-    const { rerender } = await renderPanel(aRun({ status: "running" }), summary());
-    expect(screen.getByText(DIAGNOSTIC)).toBeTruthy();
-    mockApi.getRunArchives.mockResolvedValue(summary({ has_open_hold: true }));
-    mockApi.getRecoveryHolds.mockRejectedValueOnce(new Error("temporarily unavailable"));
-    await act(async () => {
-      rerender(<RecoveryArchivesPanel run={aRun({ status: "failed" })} />);
-    });
-    expect(screen.getByText(DIAGNOSTIC)).toBeTruthy();
-    expect(screen.getByText("Active protection")).toBeTruthy();
-    expect(screen.queryByText(/Preparing the recovery archive/)).toBeNull();
-    expect(screen.queryByText(/No server archive exists/)).toBeNull();
-    expect(screen.queryByRole("link", { name: "Export archive" })).toBeNull();
-  });
-
-  it("keeps preparation authorized by independent capture metadata", async () => {
-    mockApi.getRecoveryHolds.mockResolvedValue(listing([
-      hold({ attention: "capturing", capture_state: "preparing" }),
-    ]));
-    await renderPanel(aRun(), summary({ has_open_hold: true }));
-    expect(screen.getByText(DIAGNOSTIC)).toBeTruthy();
+  it.each([
+    "mac_failure",
+    "unknown MAC failure",
+    DIAGNOSTIC + " ",
+    " " + DIAGNOSTIC,
+    DIAGNOSTIC.toUpperCase(),
+  ])("does not interpret an unknown or approximate reason: %s", async (failure_reason) => {
+    await renderPanel(aRun({ failure_reason }), summary({ has_open_hold: true }));
     expect(screen.getByText(/Preparing the recovery archive/)).toBeTruthy();
-    expect(screen.queryByRole("link", { name: "Export archive" })).toBeNull();
+    expect(screen.queryByText(DIAGNOSTIC)).toBeNull();
+    expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
   });
 
-  it("keeps available capture export independent of rejection and attention", async () => {
-    mockApi.getRecoveryHolds.mockResolvedValue(listing([
-      hold({ attention: "active", has_available_capture: true }),
-    ]));
-    await renderPanel(
-      aRun({ landing_state: "needs_landing" }),
-      summary({ archives: [archive()] }),
-    );
+  it("does not show rejection copy for a non-failed run", async () => {
+    await renderPanel(aRun({ status: "completed", failure_reason: DIAGNOSTIC }),
+      summary({ has_open_hold: true }));
+    expect(screen.getByText(/Preparing the recovery archive/)).toBeTruthy();
+    expect(screen.queryByText(DIAGNOSTIC)).toBeNull();
+    expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
+  });
+
+  it("keeps actual available capture export and the CLI hint", async () => {
+    await renderPanel(aRun({ failure_reason: DIAGNOSTIC, landing_state: "needs_landing" }),
+      summary({ archives: [archive()] }));
     expect(screen.getByText(DIAGNOSTIC)).toBeTruthy();
-    expect(screen.getByText("Active protection")).toBeTruthy();
-    expect(screen.queryByText(/No server archive exists/)).toBeNull();
     expect(screen.getByRole("link", { name: "Export archive" }).getAttribute("href"))
       .toBe("/api/runs/r1/archives/cap1/download");
     expect(screen.getByText("uzi run export r1 --output <path> --capture cap1")).toBeTruthy();
+    expect(screen.getByText(SECRET_WARNING)).toBeTruthy();
+    expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
   });
 
-  it("does not turn an unavailable capture into an export from the flag", async () => {
-    mockApi.getRecoveryHolds.mockResolvedValue(listing([hold({ attention: "needs_action" })]));
-    await renderPanel(
-      aRun({ landing_state: "needs_landing" }),
-      summary({ archives: [archive({ state: "needs_action" })] }),
-    );
+  it.each([
+    ["preparing", "Preparing"],
+    ["uploading", "Uploading"],
+    ["needs_action", "Needs action"],
+  ] as const)("preserves an actual %s capture without enabling export", async (state, label) => {
+    await renderPanel(aRun({ failure_reason: DIAGNOSTIC, landing_state: "needs_landing" }),
+      summary({ has_open_hold: true, archives: [archive({ state })] }));
     expect(screen.getByText(DIAGNOSTIC)).toBeTruthy();
-    expect(screen.getByText("Needs attention")).toBeTruthy();
+    expect(screen.getByText(label)).toBeTruthy();
     expect(screen.queryByRole("link", { name: "Export archive" })).toBeNull();
     expect((screen.getByRole("button", { name: "Export archive" }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.queryByText(/uzi run export/)).toBeNull();
+    expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
   });
 
-  it("ignores unknown flags and holds belonging to any other exact run ID", async () => {
-    mockApi.getRecoveryHolds.mockResolvedValue(listing([
-      hold({ run_id: "r10" }),
-      hold({ id: "hold-unknown", terminal_record_rejection: "untrusted <script>" }),
-    ]));
-    await renderPanel(aRun(), summary({ has_open_hold: true }));
-    expect(screen.getByText(/Preparing the recovery archive/)).toBeTruthy();
-    expect(screen.queryByText(DIAGNOSTIC)).toBeNull();
-    expect(document.body.textContent).not.toContain("untrusted");
-    expect(screen.queryByText(/hold-gen7|hold-unknown/)).toBeNull();
-  });
-
-  it("renders successful owner hold diagnostics without inventing availability when the summary fails", async () => {
-    mockApi.getRunArchives.mockRejectedValueOnce(new Error("unavailable"));
-    mockApi.getRecoveryHolds.mockResolvedValue(listing([hold()]));
-    render(<RecoveryArchivesPanel run={aRun()} />);
-    expect(await screen.findByText(DIAGNOSTIC)).toBeTruthy();
-    expect(screen.getByText(/No server archive exists/)).toBeTruthy();
-    expect(screen.queryByRole("link", { name: "Export archive" })).toBeNull();
-    expect(screen.queryByText(/Preparing the recovery archive/)).toBeNull();
-  });
-
-  it("hides recovery when a foreign-run summary fails and the caller has only unrelated holds", async () => {
+  it("hides the panel when the owner summary fails even with the fixed reason", async () => {
     mockApi.getRunArchives.mockRejectedValueOnce(new Error("404"));
-    mockApi.getRecoveryHolds.mockResolvedValue(listing([hold({ run_id: "other" })]));
-    const { container } = render(<RecoveryArchivesPanel run={aRun()} />);
+    const { container } = render(<RecoveryArchivesPanel run={aRun({ failure_reason: DIAGNOSTIC })} />);
     await act(async () => { await Promise.resolve(); });
+    expect(mockApi.getRunArchives).toHaveBeenCalledWith("r1");
     expect(container.innerHTML).toBe("");
+    expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
   });
 
-  it("keeps summary rendering when the hold request fails, without showing a diagnostic", async () => {
-    mockApi.getRecoveryHolds.mockRejectedValueOnce(new Error("unavailable"));
-    await renderPanel(aRun(), summary({ has_open_hold: true }));
-    expect(screen.getByText(/Preparing the recovery archive/)).toBeTruthy();
-    expect(screen.queryByText(DIAGNOSTIC)).toBeNull();
-  });
-
-  it("clears old run diagnostics immediately and ignores a late response from that run", async () => {
-    let resolveOld!: (value: RecoveryCustodyHolds) => void;
-    mockApi.getRecoveryHolds.mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }));
-    const { rerender, container } = await renderPanel(aRun(), summary({ has_open_hold: true }));
-    mockApi.getRunArchives.mockResolvedValue(summary());
+  it("clears a loaded summary immediately when changing runs", async () => {
+    const { rerender, container } = await renderPanel(aRun({ failure_reason: DIAGNOSTIC }),
+      summary({ archives: [archive()] }));
+    expect(screen.getByRole("link", { name: "Export archive" })).toBeTruthy();
+    let resolveNext!: (value: RecoveryArchiveSummary) => void;
+    mockApi.getRunArchives.mockImplementationOnce(() => new Promise((resolve) => { resolveNext = resolve; }));
     rerender(<RecoveryArchivesPanel run={aRun({ id: "r2", status: "completed" })} />);
-    await act(async () => { resolveOld(listing([hold()])); });
     expect(container.innerHTML).toBe("");
-    expect(screen.queryByText(DIAGNOSTIC)).toBeNull();
+    await act(async () => { resolveNext(summary()); });
+    expect(container.innerHTML).toBe("");
+    expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
+  });
+
+  it("ignores a late summary from the previous run after the new owner's summary fails", async () => {
+    let resolveOld!: (value: RecoveryArchiveSummary) => void;
+    mockApi.getRunArchives.mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }));
+    const { rerender, container } = render(<RecoveryArchivesPanel run={aRun({ failure_reason: DIAGNOSTIC })} />);
+    mockApi.getRunArchives.mockRejectedValueOnce(new Error("404"));
+    rerender(<RecoveryArchivesPanel run={aRun({ id: "r2", failure_reason: DIAGNOSTIC })} />);
+    await act(async () => { resolveOld(summary({ archives: [archive()] })); });
+    expect(mockApi.getRunArchives).toHaveBeenCalledWith("r2");
+    expect(container.innerHTML).toBe("");
+    expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
   });
 });
 

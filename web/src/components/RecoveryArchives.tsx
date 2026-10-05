@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { api, runArchiveDownloadUrl, type RecoveryArchiveSummary, type RecoveryCustodyHold, type Run } from "../lib/api";
+import { api, runArchiveDownloadUrl, type RecoveryArchiveSummary, type Run } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useNow } from "../lib/useNow";
 import { formatCountdown } from "../lib/limitWait";
 import {
   captureView,
-  custodyHoldView,
+  TERMINAL_MAC_FAILURE_COPY,
   formatArchiveSize,
   recoverySectionKind,
   shortSha,
@@ -22,16 +22,14 @@ import { ShieldIcon, TrashIcon } from "./icons";
 // captures: it distinguishes legacy/unsupported, an open-hold-still-preparing, and each
 // capture lifecycle state (available / needs-action / expired / discarded / preparing).
 //
-// Archive availability comes only from the strict-owner summary. Custody diagnostics
-// come independently from the caller-owned hold listing, filtered to this exact run.
+// Archive availability and panel visibility come only from the strict-owner summary.
 export function RecoveryArchivesPanel({ run }: { run: Run }) {
-  // Changing runs must clear both owner-scoped responses before the next fetch settles.
+  // Changing runs clears the owner-scoped summary before the next fetch settles.
   return <RecoveryArchivesContent key={run.id} run={run} />;
 }
 
 function RecoveryArchivesContent({ run }: { run: Run }) {
   const [summary, setSummary] = useState<RecoveryArchiveSummary | null>(null);
-  const [holds, setHolds] = useState<RecoveryCustodyHold[]>([]);
 
   // Re-fetch the owner-scoped summary. Used on mount/status-change AND after a Delete
   // archive so the list reflects the deletion (the server drops the capture / flips it to
@@ -55,14 +53,6 @@ function RecoveryArchivesContent({ run }: { run: Run }) {
       .catch(() => {
         if (live) setSummary(null);
       });
-    api
-      .getRecoveryHolds()
-      .then((listing) => {
-        if (live) setHolds(listing.holds.filter((hold) => hold.run_id === run.id));
-      })
-      .catch(() => {
-        // Keep the last-good holds on a transient failure; run.id remounts this state.
-      });
     return () => {
       live = false;
     };
@@ -70,17 +60,12 @@ function RecoveryArchivesContent({ run }: { run: Run }) {
     // is captured at the finalization boundary, so a run that just failed grows one.
   }, [run.id, run.status]);
 
-  const diagnostics = holds
-    .map((hold) => ({ hold, view: custodyHoldView(hold) }))
-    .filter(({ view }) => view.terminalRejection !== null);
   const kind = summary ? recoverySectionKind(summary, run.status) : null;
-  // An open rejected hold alone is no evidence that an archive is being produced.
-  // Explicit capture metadata can still describe independently authorized preparation.
-  const unverifiedSource = diagnostics.some(
-    ({ hold }) => hold.state === "open" && !hold.has_available_capture &&
-      hold.capture_state !== "preparing" && hold.capture_state !== "uploading",
-  );
-  if (!kind && diagnostics.length === 0) return null;
+  if (!kind) return null;
+  // The existing failed-run reason supplies cosmetic copy only, never custody metadata.
+  const terminalRejection = run.status === "failed" &&
+    run.failure_reason === TERMINAL_MAC_FAILURE_COPY;
+  const inferredPreparation = terminalRejection && summary?.archives.length === 0;
 
   return (
     // id anchor so the Workers custody surface can deep-link straight to a run's archives.
@@ -90,23 +75,7 @@ function RecoveryArchivesContent({ run }: { run: Run }) {
         <SectionTitle>Recovery archives</SectionTitle>
       </div>
 
-      {diagnostics.length > 0 && (
-        <ul className="space-y-3">
-          {diagnostics.map(({ hold, view }) => (
-            <li key={hold.id} className="rounded-lg border border-edge bg-raised/40 p-3">
-              <div className="flex flex-wrap items-center gap-2">
-                <Badge tone={view.tone}>{view.stateLabel}</Badge>
-                <span className="font-mono text-xs text-muted">hold {stripUnsafeChars(hold.id)}</span>
-                <Badge tone="neutral">gen {hold.generation}</Badge>
-              </div>
-              <p className="mt-2 text-sm text-muted">{view.terminalRejection}</p>
-              {hold.attention === "source_only" && !hold.has_available_capture && (
-                <p className="mt-2 text-sm text-muted">{view.summary}</p>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
+      {terminalRejection && <p className="text-sm text-muted">{TERMINAL_MAC_FAILURE_COPY}</p>}
 
       {/* What this is — and, just as importantly, what it is NOT (D7). */}
       <p className="text-sm text-muted">
@@ -129,7 +98,7 @@ function RecoveryArchivesContent({ run }: { run: Run }) {
         </p>
       )}
 
-      {kind === "preparing" && !unverifiedSource && (
+      {kind === "preparing" && !inferredPreparation && (
         <div className="rounded-lg border border-info/40 bg-info/10 px-3 py-2 text-sm text-info">
           Preparing the recovery archive. The committed history is being captured and
           stored, and a download appears here once it is ready.
