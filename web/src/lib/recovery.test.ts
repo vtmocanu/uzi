@@ -262,6 +262,24 @@ describe("custodyAlertView — self-hide + escalation (D6/D8)", () => {
   });
 });
 
+describe("custodyHoldView — terminal rejection", () => {
+  it.each(["source_only", "archive_ready", "active"])("keeps %s classification and actions independent", (attention) => {
+    const original = hold({ attention, generation: 7, has_available_capture: attention === "archive_ready" });
+    const before = custodyHoldView(original);
+    const after = custodyHoldView({ ...original, terminal_record_rejection: "mac_failure" });
+    expect(after).toEqual({
+      ...before,
+      terminalRejection: "terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody",
+    });
+    expect(after.actions).toEqual(attention === "source_only" ? ["discard"] : attention === "archive_ready" ? ["export"] : []);
+    expect(original.generation).toBe(7);
+  });
+
+  it.each([undefined, "", "untrusted <script>", "MAC_FAILURE"])("ignores unknown rejection %s", (terminal_record_rejection) => {
+    expect(custodyHoldView(hold({ terminal_record_rejection })).terminalRejection).toBeNull();
+  });
+});
+
 describe("custodyHoldView — attention → presentation + actions (D6/D8/D9)", () => {
   it("active protection needs no decision and offers no action", () => {
     const v = custodyHoldView(hold({ attention: "active" }));

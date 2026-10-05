@@ -43,6 +43,8 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			"`source_only` and `needs_action` holds the retained source may be the only copy, so " +
 			"discarding one can destroy the work. `active` is healthy protection " +
 			"of a still-running run and needs nothing.\n\n" +
+			"A terminal_record_rejection of mac_failure is shown separately: " + terminalMACFailureCopy +
+			". JSON also includes this fixed diagnostic as terminal_rejection; disposition and archive availability remain independent.\n\n" +
 			"Without a run id, --json emits the entire owner-wide aggregate and holds DTO, " +
 			"including settled holds. With a run id, --json emits each of the run's hold DTOs " +
 			"plus a `captures` array listing that hold's " +
@@ -105,7 +107,15 @@ func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyH
 		if dto.Holds == nil {
 			dto.Holds = []apitypes.RecoveryCustodyHoldDTO{}
 		}
-		return p.JSON(dto)
+		rows := make([]recoveryOwnerHoldJSON, 0, len(dto.Holds))
+		for _, h := range dto.Holds {
+			rows = append(rows, recoveryOwnerHoldJSON{RecoveryCustodyHoldDTO: h, TerminalRejection: terminalRejectionCopy(h)})
+		}
+		return p.JSON(struct {
+			// Embed the response to preserve aggregate keys while enriching hold rows.
+			apitypes.RecoveryCustodyHoldsDTO
+			Holds []recoveryOwnerHoldJSON `json:"holds"`
+		}{RecoveryCustodyHoldsDTO: dto, Holds: rows})
 	}
 	open := make([]apitypes.RecoveryCustodyHoldDTO, 0, len(dto.Holds))
 	for _, h := range dto.Holds {
@@ -148,6 +158,11 @@ func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyH
 	} else if !gf.quiet {
 		p.Printf("no open custody holds\n")
 	}
+	for _, h := range open {
+		if copy := terminalRejectionCopy(h); copy != "" {
+			p.Printf("run %s hold %s gen %d: %s\n", cellText(h.RunID), cellText(h.ID), h.Generation, copy)
+		}
+	}
 	a := dto.Aggregate
 	p.Printf("open_holds: %d  custody_hold_limit: %d  decision_needed: %d  blocked_runs: %d\n",
 		a.OpenHolds, a.CustodyHoldLimit, a.DecisionNeeded, a.BlockedRuns)
@@ -165,6 +180,20 @@ func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyH
 		printRecoveryHint(p, exportable, decisionNeeded, "<run-id>")
 	}
 	return nil
+}
+
+const terminalMACFailureCopy = "terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody"
+
+func terminalRejectionCopy(h apitypes.RecoveryCustodyHoldDTO) string {
+	if h.TerminalRecordRejection == "mac_failure" {
+		return terminalMACFailureCopy
+	}
+	return ""
+}
+
+type recoveryOwnerHoldJSON struct {
+	apitypes.RecoveryCustodyHoldDTO
+	TerminalRejection string `json:"terminal_rejection,omitempty"`
 }
 
 // sourceOnlyLine explains a source_only hold: no archive exists, so `uzi run export` cannot
@@ -208,7 +237,7 @@ type recoveryHoldCapture struct {
 // recoveryHoldJSON is one hold in `run recovery --json`: the hold DTO's keys, flat and
 // unchanged, plus the captures reserved under it.
 type recoveryHoldJSON struct {
-	apitypes.RecoveryCustodyHoldDTO
+	recoveryOwnerHoldJSON
 	Captures []recoveryHoldCapture `json:"captures"`
 }
 
@@ -228,7 +257,7 @@ func holdsWithCaptures(holds []apitypes.RecoveryCustodyHoldDTO, archives []apity
 				ID: a.ID, State: a.State, SourceSha: a.SourceSha, ByteSize: a.ByteSize, CreatedAt: a.CreatedAt,
 			})
 		}
-		out = append(out, recoveryHoldJSON{RecoveryCustodyHoldDTO: h, Captures: caps})
+		out = append(out, recoveryHoldJSON{recoveryOwnerHoldJSON: recoveryOwnerHoldJSON{RecoveryCustodyHoldDTO: h, TerminalRejection: terminalRejectionCopy(h)}, Captures: caps})
 	}
 	return out
 }
@@ -294,6 +323,9 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 		return err
 	}
 	for _, h := range holds {
+		if copy := terminalRejectionCopy(h); copy != "" {
+			p.Printf("run %s hold %s gen %d: %s\n", cellText(h.RunID), cellText(h.ID), h.Generation, copy)
+		}
 		if line := checkpointLine(h); line != "" {
 			p.Printf("%s\n", line)
 		}

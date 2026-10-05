@@ -242,6 +242,8 @@ export interface CustodyHoldView {
   stateLabel: string;
   // One plain-language line describing what this hold is and what will happen.
   summary: string;
+  // Fixed diagnostic, separate from attention and action classification.
+  terminalRejection: string | null;
   // archive_ready holds self-resolve through the reconciler (D8/D9): the row reads
   // "releasing automatically" and is NOT presented as a decision.
   autoReleasing: boolean;
@@ -307,10 +309,16 @@ function custodyCheckpointView(hold: RecoveryCustodyHold): CustodyCheckpointView
 // and `has_available_capture`. An UNKNOWN attention is treated as needing a decision
 // (fail toward the owner seeing it), never silently hidden or auto-actioned.
 export function custodyHoldView(hold: RecoveryCustodyHold): CustodyHoldView {
-  return { ...attentionView(hold), checkpoint: custodyCheckpointView(hold) };
+  return {
+    ...attentionView(hold),
+    checkpoint: custodyCheckpointView(hold),
+    terminalRejection: hold.terminal_record_rejection === "mac_failure"
+      ? "terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody"
+      : null,
+  };
 }
 
-function attentionView(hold: RecoveryCustodyHold): Omit<CustodyHoldView, "checkpoint"> {
+function attentionView(hold: RecoveryCustodyHold): Omit<CustodyHoldView, "checkpoint" | "terminalRejection"> {
   const hasArchive = hold.has_available_capture;
   switch (hold.attention) {
     case "active":

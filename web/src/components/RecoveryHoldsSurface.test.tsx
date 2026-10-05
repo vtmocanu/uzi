@@ -73,6 +73,23 @@ async function renderSurface(resp: RecoveryCustodyHolds) {
 }
 
 describe("RecoveryHoldsSurface", () => {
+  it("shows fixed rejection separately on the exact source-only generation without export", async () => {
+    await renderSurface(listing([
+      hold({ id: "hold-gen7", run_id: "run-one", generation: 7, attention: "source_only", terminal_record_rejection: "mac_failure" }),
+      hold({ id: "hold-gen8", run_id: "run-one", generation: 8, attention: "source_only", terminal_record_rejection: "untrusted <script>" }),
+    ]));
+    const diagnostic = screen.getByText("terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody");
+    const row = diagnostic.closest("li")!;
+    expect(within(row).getByText("gen 7")).toBeTruthy();
+    expect(within(row).getByText("Decision required")).toBeTruthy();
+    expect(within(row).getByText(/No server archive exists/)).toBeTruthy();
+    expect(within(row).getByRole("link", { name: /View run/ }).getAttribute("href")).toBe("/runs/run-one");
+    expect(within(row).queryByRole("link", { name: /Export archive/ })).toBeNull();
+    expect(screen.getByText("gen 8")).toBeTruthy();
+    expect(document.body.textContent).not.toContain("untrusted <script>");
+    expect(mockApi.discardHold).not.toHaveBeenCalled();
+  });
+
   it("self-hides when there are no holds", async () => {
     const { container } = await renderSurface(listing([]));
     expect(container.innerHTML).toBe("");

@@ -52,6 +52,9 @@ through `[0.52.0]`.)
 - **Owner health problems stay visible without raising an instance outage banner ([#2293](https://github.com/vtmocanu/uzi/issues/2293)).**
   Banners, episodes and admin Slack notices now follow instance blockers; owner problems remain visible in Health and still exit CLI code 8. Confirmed worker-upgrade drains no longer age into queue alarms, while capacity retains its 24-hour overlap limit. Health reports add scoped blocking and bounded run evidence; older API responses keep the conservative legacy banner.
 
+- **Recovery distinguishes a rejected terminal record from verified work ([#1974](https://github.com/vtmocanu/uzi/issues/1974)).**
+  After restart, a MAC-rejected terminal record is identified in run recovery and retains source custody without authorizing completion, replay, or extra retries. Export still requires an independently verified archive. Negotiated reconciliation can remove the rejected file after exact-generation custody and sibling holds settle; unsupported servers leave local bytes retained.
+
 ## [0.85.2] - 2026-10-05
 
 ### Changed

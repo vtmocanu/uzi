@@ -218,6 +218,7 @@ function HoldRow({
             )}
           </div>
           <p className="text-sm text-muted">{view.summary}</p>
+          {view.terminalRejection && <p className="text-sm text-muted">{view.terminalRejection}</p>}
           <p className="flex flex-wrap items-center gap-x-2 text-xs text-faint">
             <span className="font-mono">run {runShort}</span>
             <span className="font-mono">hold {holdShort}</span>

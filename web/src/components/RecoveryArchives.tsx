@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { api, runArchiveDownloadUrl, type RecoveryArchiveSummary, type Run } from "../lib/api";
+import { api, runArchiveDownloadUrl, type RecoveryArchiveSummary, type RecoveryCustodyHold, type Run } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useNow } from "../lib/useNow";
 import { formatCountdown } from "../lib/limitWait";
 import {
   captureView,
+  custodyHoldView,
   formatArchiveSize,
   recoverySectionKind,
   shortSha,
@@ -21,12 +22,16 @@ import { ShieldIcon, TrashIcon } from "./icons";
 // captures: it distinguishes legacy/unsupported, an open-hold-still-preparing, and each
 // capture lifecycle state (available / needs-action / expired / discarded / preparing).
 //
-// It fetches its own summary. The endpoint is strict-owner (a non-owner, incl. an admin
-// viewing a foreign run, gets 404), so any fetch failure is treated as "no recovery
-// data" and the section renders nothing — the section never leaks the existence of an
-// archive to a viewer the server would refuse.
+// Archive availability comes only from the strict-owner summary. Custody diagnostics
+// come independently from the caller-owned hold listing, filtered to this exact run.
 export function RecoveryArchivesPanel({ run }: { run: Run }) {
+  // Changing runs must clear both owner-scoped responses before the next fetch settles.
+  return <RecoveryArchivesContent key={run.id} run={run} />;
+}
+
+function RecoveryArchivesContent({ run }: { run: Run }) {
   const [summary, setSummary] = useState<RecoveryArchiveSummary | null>(null);
+  const [holds, setHolds] = useState<RecoveryCustodyHold[]>([]);
 
   // Re-fetch the owner-scoped summary. Used on mount/status-change AND after a Delete
   // archive so the list reflects the deletion (the server drops the capture / flips it to
@@ -50,6 +55,14 @@ export function RecoveryArchivesPanel({ run }: { run: Run }) {
       .catch(() => {
         if (live) setSummary(null);
       });
+    api
+      .getRecoveryHolds()
+      .then((listing) => {
+        if (live) setHolds(listing.holds.filter((hold) => hold.run_id === run.id));
+      })
+      .catch(() => {
+        if (live) setHolds([]);
+      });
     return () => {
       live = false;
     };
@@ -57,9 +70,14 @@ export function RecoveryArchivesPanel({ run }: { run: Run }) {
     // is captured at the finalization boundary, so a run that just failed grows one.
   }, [run.id, run.status]);
 
-  if (!summary) return null;
-  const kind = recoverySectionKind(summary, run.status);
-  if (!kind) return null;
+  const diagnostics = holds
+    .map((hold) => ({ hold, view: custodyHoldView(hold) }))
+    .filter(({ view }) => view.terminalRejection !== null);
+  const kind = summary ? recoverySectionKind(summary, run.status) : null;
+  const sourceOnly = diagnostics.some(
+    ({ hold }) => hold.attention === "source_only" && !hold.has_available_capture,
+  );
+  if (!kind && diagnostics.length === 0) return null;
 
   return (
     // id anchor so the Workers custody surface can deep-link straight to a run's archives.
@@ -68,6 +86,24 @@ export function RecoveryArchivesPanel({ run }: { run: Run }) {
         <ShieldIcon className="h-4 w-4 text-muted" aria-hidden="true" />
         <SectionTitle>Recovery archives</SectionTitle>
       </div>
+
+      {diagnostics.length > 0 && (
+        <ul className="space-y-3">
+          {diagnostics.map(({ hold, view }) => (
+            <li key={hold.id} className="rounded-lg border border-edge bg-raised/40 p-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge tone={view.tone}>{view.stateLabel}</Badge>
+                <span className="font-mono text-xs text-muted">hold {stripUnsafeChars(hold.id)}</span>
+                <Badge tone="neutral">gen {hold.generation}</Badge>
+              </div>
+              <p className="mt-2 text-sm text-muted">{view.terminalRejection}</p>
+              {hold.attention === "source_only" && !hold.has_available_capture && (
+                <p className="mt-2 text-sm text-muted">{view.summary}</p>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
 
       {/* What this is — and, just as importantly, what it is NOT (D7). */}
       <p className="text-sm text-muted">
@@ -90,14 +126,14 @@ export function RecoveryArchivesPanel({ run }: { run: Run }) {
         </p>
       )}
 
-      {kind === "preparing" && (
+      {kind === "preparing" && !sourceOnly && (
         <div className="rounded-lg border border-info/40 bg-info/10 px-3 py-2 text-sm text-info">
           Preparing the recovery archive. The committed history is being captured and
           stored, and a download appears here once it is ready.
         </div>
       )}
 
-      {kind === "captures" && (
+      {kind === "captures" && summary && (
         <>
           {/* The secret warning sits directly above every download control, so it is on
               every download surface (D7). */}

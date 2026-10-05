@@ -684,6 +684,26 @@ uzi version
   `landing_state` is `needs_landing` carries human-landable work: recover it with
   `uzi run export` when an archive is available, or from the preserved diff
   (`uzi run get <run-id> --field preserved_patch`) when it isn't.
+  A `terminal_record_rejection` of `mac_failure` is a separate diagnostic:
+  "terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody".
+  The rejected record is unauthenticated, distinct from a trusted unsent outcome;
+  it authorizes no outcome replay, completion, terminal lease renewal, or extra
+  finalize-resume allowance. Ordinary requeue policy still applies; a policy failure
+  keeps `worker_lost` as its origin, with this rejection prose.
+  The originating worker's exact-generation open hold remains in custody. For a terminal
+  run without an available independently verified capture, it reports `source_only`:
+  "no recovery archive; custody of worker `<name>`'s local source is retained (export unavailable; it may be the only copy)".
+  Export requires an available independent capture; a verified pin must first be archived.
+  Hold discard changes database custody; it does not repair the worker journal.
+  Periodic reconciliation permits cleanup only after a fresh positive, complete custody GET
+  proves a nonempty exact-generation set is all released/discarded, with no open sibling
+  generations under immutable owner/originating-worker/run provenance, plus local quiescence
+  under admission and run locks. Only unchanged exact bad-MAC terminal files are removed;
+  a POST acknowledgment, missing hold, error, or timer supplies no deletion authority.
+  This requires `terminal_rejection_report` in registration's `protocol_features`:
+  without support there is no diagnostic POST/custody GET, local bytes stay retained,
+  and the unsupported log is bounded to once per episode. Strict-decode rollback clears
+  the shared feature set.
 - **Salvage copy of a failed run** (off by default; an operator enables it per forge with
   `UZI_SALVAGE_FORGES`). `uzi run get <run-id>` on a failed run with a salvage record prints a
   `SALVAGE` block: the state with a one-line explanation, `SALVAGE_REF`, `SALVAGE_TIP`,
