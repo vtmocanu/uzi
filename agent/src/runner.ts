@@ -3732,10 +3732,10 @@ export class RunRunner {
     phase: string,
     body: Parameters<RunFlight["reportState"]>[0],
     send: SendTerminalState,
-    // #1539: an optional hook that runs AFTER the durable install and BEFORE the resolve/send (on
-    // the no-outbox branch too, before the direct `send`). The permanent-failure hook uses it to abort
-    // the attempt and reap the provider WHILE the run is still actively-claimed — the journal is on
-    // disk first (D5), the reap runs before the terminal is sent, and the reconcile is authorized
+    // #1539: an optional hook that runs AFTER the install/deferral decision and BEFORE any resolve/send
+    // (on the no-outbox branch too, before the direct `send`). The permanent-failure hook uses it to abort
+    // the attempt and reap the provider WHILE the run is still actively-claimed — a fresh journal is
+    // installed first (D5), an unavailable selected winner is preserved, and the reconcile is authorized
     // because the abort has not yet reported terminal. Every other caller passes nothing, so their
     // behaviour is identical.
     beforeResolve?: () => Promise<void>,
@@ -3816,10 +3816,11 @@ export class RunRunner {
    * batcher's onPermanentFailureReport closure so its ORDERING is unit-testable against the REAL
    * shipping code (runner-terminal-journal.test.ts) rather than a synthetic hand-rolled handler.
    *
-   * The order is: (1) DURABLE first-writer-wins install of the `failed` journal, then (2) ABORT the
-   * attempt, then (3) REAP this generation's provider WHILE the run is still actively-claimed, then
-   * (4) resolve/send the terminal. Steps 2+3 run in the `beforeResolve` hook, between the install and
-   * the send, so a completion racing the trip can never reverse the first durable winner (the
+   * The order is: (1) first-writer-wins install of the `failed` journal, or deferral to preserve an
+   * unavailable selected winner, then (2) ABORT the attempt, then (3) REAP this generation's provider
+   * WHILE the run is still actively-claimed, then (4) resolve/send unless deferred. Steps 2+3 run in
+   * the `beforeResolve` hook after the install/deferral decision and before any send, so a completion
+   * racing the trip can never reverse the selected first winner (the
    * no-replace install in journalTerminal arbitrates, D4) AND the Codex per-sink credential reconcile
    * inside the reap's withBoundary is authorized (the abort has not yet reported terminal, so the run
    * is still in codexActivelyClaimedStatuses — reaping AFTER the terminal report would be refused 409
@@ -3854,9 +3855,9 @@ export class RunRunner {
         },
         (b, sig) => flight.reportState(b, sig),
         async () => {
-          // (2) Abort the attempt ONLY AFTER the durable journal is installed (D5/D4), so execute()
-          // falls into its catch (→ reportGenericFailure, which awaits this handler's settlement,
-          // finds the durable journal / the terminalResolved latch, and does NOT report a second
+          // (2) Abort after the install/deferral decision preserves the selected outcome (D5/D4), so
+          // execute() falls into its catch (→ reportGenericFailure, which awaits this handler's settlement,
+          // finds the pending winner / the terminalResolved latch, and does NOT report a second
           // `failed`). (3) Then reap this generation's provider while the run is still actively-claimed
           // and record the outcome + the reaped safety epoch, for reportGenericFailure to settle on.
           if (!flight.cancel.signal.aborted) flight.cancel.abort();
@@ -3997,7 +3998,7 @@ export class RunRunner {
       await batcher.close().catch(() => undefined);
       if (opts.keepCustody) return;
       // #1539: when the permanent-failure hook handled this terminal it ALREADY reaped the
-      // provider between the install and the send (while still actively-claimed), so there is no
+      // provider after the install/deferral decision and before any send (while still actively-claimed), so there is no
       // second reap here — settle custody ONCE, gated by the stale-epoch guard. Any OTHER writer that
       // reaches this arm (the finalize sites at :2600/:2611) already settles via driveRecoveryTerminal
       // under the finalize boundary, so its reapThenSettle here is a redundant backstop kept unchanged.
@@ -7550,19 +7551,19 @@ export class RunRunner {
       result: undefined,
     };
 
-    // PRD #1391 Run B M3 (D5) / #1539: a PERMANENT message failure now journals `failed` WRITE-AHEAD
-    // (durable), then ABORTS the attempt, then REAPS this generation's provider while the run is still
-    // actively-claimed, then resolves/sends the terminal — replacing today's fire-and-forget `failed`
+    // PRD #1391 Run B M3 (D5) / #1539: a PERMANENT message failure installs `failed` WRITE-AHEAD
+    // or defers for an unavailable selected winner, then ABORTS the attempt, then REAPS this generation's
+    // provider while the run is still actively-claimed, then resolves/sends unless deferred — replacing the fire-and-forget `failed`
     // report that left the executor running (the split-brain in miniature, fact 1). The handler is
     // ASYNC and trip() captures its promise into batcher.permanentFailureSettled, which
-    // reportGenericFailure AWAITS before it checks the journal — so the abort's terminal `failed` is
-    // observable ONLY AFTER the outcome is durable, and a completion that races the trip can never
-    // reverse the first durable winner (the no-replace install in journalTerminal arbitrates, D4). The
-    // reap runs between the install and the send (in beforeResolve), so the Codex reconcile is
+    // reportGenericFailure AWAITS before it checks the selected outcome/latch — so a completion
+    // racing the trip can never reverse the selected first winner (the no-replace install in
+    // journalTerminal arbitrates, D4). The reap runs after the install/deferral decision and before
+    // any send (in beforeResolve), so the Codex reconcile is
     // authorized (still actively-claimed) rather than refused 409 after a terminal report — the #1539
     // fix. Chat keeps today's non-journal behaviour (chat-runner.ts). When no outbox is wired this
     // degrades to today's direct `failed` report + abort + reap.
-    // The hook body lives in handlePermanentFailure (a named method) so its install-BEFORE-abort,
+    // The hook body lives in handlePermanentFailure (a named method) so its install/decision-BEFORE-abort,
     // abort-BEFORE-reap, reap-BEFORE-send ordering is unit-testable against the REAL code — a mutation
     // to any of those orderings reddens a test.
     batcher.onPermanentFailureReport(({ reason }) => this.handlePermanentFailure(claim, flight, reason));

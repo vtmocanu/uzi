@@ -146,6 +146,7 @@ it("unit 1: deferred hook preserves finalize and latches across held-skip ACK re
     batcher: { currentSeq: () => 5, close: async () => undefined, awaitPermanentFailureSettled: async () => undefined, emit: () => events.push("emit") },
   });
   flight.reportState = async (body: unknown) => {
+    assert.equal(flight.terminalResolved, true, "deferral must latch before the post-release send");
     events.push("send");
     bodies.push(structuredClone(body as StateRequest));
     return { applied: true, status: "completed" };
@@ -170,8 +171,10 @@ it("unit 1: deferred hook preserves finalize and latches across held-skip ACK re
   assert.deepEqual(await fsp.readFile(finalize), finalizeBytes);
   assert.deepEqual(events, ["abort", "reap", "send"], "only post-release resolution sends");
   assert.equal(bodies.length, 1);
-  assert.equal(bodies[0].status, "completed");
-  assert.equal(bodies[0].branch, "agent/original");
+  const delivered = bodies[0];
+  assert.ok(delivered);
+  assert.equal(delivered.status, "completed");
+  assert.equal(delivered.branch, "agent/original");
   assert.equal(outbox.hasPendingTerminal(runId, gen), false, "post-release ACK retired original");
   assert.equal(outbox.isTerminalResolveHeld(runId, gen), false);
   assert.equal(flight.permanentFailureReap, true);

@@ -149,8 +149,8 @@ export async function journalAndResolveTerminal(
   // {@link installTerminalWriteAhead} / {@link sendUnjournaledTerminal} + {@link resolvePendingTerminal},
   // so a caller that must interleave work BETWEEN the durable install and the resolve (the
   // permanent-failure hook's abort-then-reap, RunRunner.journalAndSendTerminal) can. This helper keeps
-  // the SAME external behaviour for its direct callers (postTerminalState, the terminal-resolve tests):
-  // install → (resolvePendingTerminal | sendUnjournaledTerminal), byte-for-byte as before.
+  // the write-ahead flow for its direct callers (postTerminalState, the terminal-resolve tests):
+  // install → resolvePendingTerminal, fallback → sendUnjournaledTerminal, or deferral without a send.
   const installed = await installTerminalWriteAhead(deps, { runId, claimGeneration, phase, messagesThroughSeq, body });
   if (!installed.journaled && "deferred" in installed) return;
   if (!installed.journaled) {
