@@ -615,7 +615,7 @@ func TestWorkerNavigationPRFreshReturnAndRoot(t *testing.T) {
 				t.Fatal("old B DTO applied")
 			}
 			stale := uzicli.NewRunStream(context.Background(), nil)
-			next, cmd = m.Update(streamReadyMsg{runID: "B", gen: gen, stream: stale})
+			next, _ = m.Update(streamReadyMsg{runID: "B", gen: gen, stream: stale})
 			m = next.(tuiModel)
 			requireStreamClosed(t, stale, "old B socket")
 			m = workerNavFinite(t, m, reopen)

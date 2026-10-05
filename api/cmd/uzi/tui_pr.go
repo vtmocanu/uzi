@@ -283,7 +283,7 @@ func (m tuiModel) prKey(k string) (tea.Model, tea.Cmd) {
 		m.prReturn = viewPulls
 		m.prReturnRunID, m.prReturnRunTarget = "", viewBoard
 		// A worker return takes precedence over split collapse, just as run Esc does.
-		if m.fromSplit && !m.splitEligible() && !(target == viewDetail && runTarget == viewWorker) {
+		if m.fromSplit && !m.splitEligible() && (target != viewDetail || runTarget != viewWorker) {
 			target = m.top()
 		}
 		if target == viewDetail && runID != "" {
