@@ -1,6 +1,6 @@
 # PRD #2275: Workers in the TUI
 
-**Status**: Implemented with automated acceptance coverage. M1 and M2 are implemented; ANSI scenes are generated and asserted in both themes. D12 PNG rendering, `tui-ux` screenshot review and manual `--demo` acceptance remain pending before merge. Resolved facts below were read at `main` `10d18291`. Reviewed by an architect, a tui-ux reviewer and a Codex peer before landing.
+**Status**: Implemented with automated acceptance coverage. M1 and M2 are implemented; ANSI scenes are generated and asserted in both themes. D12 PNG rendering, the `tui-ux` screenshot review and the maintainer's `--demo` and live drive are done; the maintainer's review round is recorded as D14-D21. Resolved facts below were read at `main` `10d18291`. Reviewed by an architect, a tui-ux reviewer and a Codex peer before landing.
 
 **Design mock**: `prds/mockups/2275-workers-tui-mock.sh` (run `bash prds/mockups/2275-workers-tui-mock.sh` in a terminal; its header lists the keys). The mock is the agreed visual and navigation reference. It is a throwaway bash script with static fixture data. It is not shipped code and never a parallel model for the TUI (`.claude/rules/tui.md`). Where the mock and this PRD disagree, this PRD wins. The mock's `w` (width 80/120) and `z` (summary on/off) keys exist only for comparing layouts; they are not product keys (`w` is the shipped `keyRework`).
 
@@ -108,11 +108,9 @@ Acceptance examples (counts are from the `demo.go` seed this PRD adds, which mir
 ### Fleet summary line and height accounting (`tui_board.go`, `tui_split.go`)
 
 - **Placement.** Superseded by D15: the fleet status is right-aligned on the title line on the floor and the workers views, full screen and split, narrowed to the space left after the tabs; it takes its own row only when even its shortest form does not fit (full-screen 80 columns). The workers view has no separate summary line.
-- **Height.** It is charged to the chrome:
-  - `splitSharedChrome` gains one row, so `splitMinHeight` grows by 1 (D4);
-  - the full-screen board chrome in `boardCapacityAt` (`tui_board.go:975-987`) also gains one row.
-- **Shown only when the viewer has at least one worker.** With zero workers, the row is not drawn and not charged.
-- **At 80 columns** the summary never wraps: it drops segments in priority order (unknown-cap note, then holding/draining/cordoned counts, then the online count) until it fits. It always keeps slots in use and the attention count.
+- **Height.** Charged only when drawn: the fleet status's fallback row (when even its shortest form does not fit beside the tabs) and the run summary's fallback row (when it does not fit beside the account meters). `splitSharedChrome` counts the worst case of the shared header, so the split thresholds stay at 41/43 rows; tiny full-screen viewports crop the body and keep the footer.
+- **Shown only when the viewer has at least one worker.** With zero workers, the fleet status is not drawn.
+- **Narrowing.** The status never wraps: it drops, in order, the unknown-cap note, then the holding/draining/cordoned counts, then the worker count and the online count. It always keeps the scope, slots in use and the attention count.
 
 ### Workers fetch and polling (new `tui_workers.go`)
 
@@ -169,13 +167,13 @@ Acceptance examples (counts are from the `demo.go` seed this PRD adds, which mir
 - **Selected-row readout** under the list: every attention item, plus the owner in factory scope. One item per line at 80 columns.
 - **Detail sections, in order:**
   - **Attention.**
-  - **Reported runs:** worker phase, outcome pending, run stage and generation.
+  - **Reported runs:** `#iid title engine`, then the worker phase, outcome pending, run stage and generation; `j`/`k` select a reported run.
     - `enter` preflights the run by id with `GetRun`, so the run need not be cached. The successful DTO enters through the normal guarded detail handler, including input-fetch and blink side effects, then tail and stream loading start without a second initial `GetRun`.
     - A 404 shows `run not visible` in the footer and stays put.
   - **Resources:**
     - cpu; memory, labelled `process only` when `StatsSource == "process"`;
     - data, nix and dind disks with inodes, where dind and inodes are labelled display-only;
-    - largest runs from `RunDisk`, with `≥` when `Truncated` and the `SampledAt` age;
+    - the largest run's HOME from `RunDisk` (one line), with `≥` when `Truncated` and the `SampledAt` age;
     - a `stale, last-known` label when offline.
   - **Configuration:** version and `UpgradeTarget`; capabilities; template declared and reported; token mode (`default`, `auto`, or the pinned label); `ephemeral` with the lease remaining; owner in factory scope.
 - **Untrusted text (D7 guard).** The bare wire names `Name`, `Version` and friends collide with existing draws (`tui_d7_guard_test.go:179-213`). So, following `ciRowText` / `ciTextOf` (`tui_ci.go`):
@@ -300,7 +298,7 @@ Contents:
 - [x] D12: drive `uzi tui --demo` manually (maintainer, live and demo, 2026-10-05).
 - [x] Maintainer review round: D14-D21 applied, mock updated to match.
 
-The factory-only demo worker is cordoned to cover all six primary states; the nine own workers and their acceptance totals remain unchanged. Nix inode readings display `?` because the existing DTO carries no nix inode fields.
+The factory-only demo worker is cordoned to cover all six primary states; the nine own workers and their acceptance totals remain unchanged. Nix shows no inode reading because the existing DTO carries no nix inode fields.
 
 ## Acceptance (live, maintainer)
 
@@ -333,7 +331,7 @@ Maintainer review of the implementation (user decisions 2026-10-05, prototyped, 
 
 - **D14, no digits in the strip or footers.** The strip reads `floor  workers  pulls  ci`, as before this PRD; `1`-`4` still select the tabs and are listed in the `?` help only. Rejected: D1's `1 floor · 2 workers …` labels, which the maintainer found noisy.
 - **D15, the fleet status lives on the title line, right-aligned,** on the floor and workers views in both layouts, with the fuller content (`workers · 9 · 8 online · 5/12 slots in use +1 ?cap · 1 holding · 1 draining · 6 need attention`, `factory workers` in factory scope). It narrows against the width left after the tabs and takes its own row only as a last resort. The floor's run summary (`$… 7d · N runs · a–b`) moves to the account-meter line, right-aligned. Rejected: a separate fleet row (costs a row on every screen) and the stats inside the `workers` tab label (blurs the tab boundaries).
-- **D16, split titles per pane.** The split's title line shows only the top pane's tabs, `floor · [workers]`, mirroring the bottom divider's `pulls · ci`; the selected tab is bracketed. With workers on top, the floor's account meters and run summary are hidden.
+- **D16, split titles per pane.** The split's title line shows only the top pane's tabs, `floor · workers`, mirroring the bottom divider's `pulls · ci`; the focused pane's selected tab is bracketed (`[workers]`), the other pane's selected tab is plain. Worker detail opened from the split is full screen and shows the full four-tab strip. With workers on top, the floor's account meters and run summary are hidden.
 - **D17, the wide table in split.** The workers top pane follows the terminal width like full screen, replacing "80-column layout regardless of width". VERSION is sized to the longest visible version (cap 18), so `0.85.1+gba846d7` is not cut.
 - **D18, colour on the shared ANDON tokens.** busy sage (a running run), idle faint, holding/⚑ amber, warn items, offline, outdated, ◷, ⇡, drift and 75-89% stall, danger items and ≥90% alarm, draining/cordoned wait, healthy readings default ink. Every signal keeps its glyph or word for NO_COLOR.
 - **D19, the detail follows the mock.** One header line `worker › <name>  <state>  <kind>  up … · heartbeat …` (the uptime part drops when unknown and wraps below when narrow), lowercase tungsten section headings, an aligned key column, `▮▯` usage bars, coloured attention items, runs as `#iid title engine` with the worker phase, run stage and generation.

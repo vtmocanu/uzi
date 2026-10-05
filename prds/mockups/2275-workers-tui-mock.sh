@@ -93,7 +93,7 @@ RUNS=(
   ""
 )
 
-sel=0; view=workers; drill=0; admin=0; width=120; legend=0; strip=1
+sel=0; rsel=0; view=workers; drill=0; admin=0; width=120; legend=0; strip=1
 split=0; top=floor; bottom=ci; focus=top
 
 pad() { local s="$1" w="$2" n=${#1}
@@ -176,11 +176,12 @@ fleet_counts() { local i s
       if [ "${CAP[$i]}" = "?" ]; then FUNK=$((FUNK+1)); else FC=$((FC+CAP[i])); fi; fi
     needs_attention "$i" && FATT=$((FATT+1)); done; }
 
-# Fleet status in one of four forms, widest first; level 0 = full, 3 = minimal.
+# Fleet status in one of four forms, widest first: 0 full, 1 without the ?cap note,
+# 2 without the holding/draining/cordoned counts, 3 scope + slots + attention only.
 fleet_form() { local lvl=$1
   printf "${B}%s${R}" "$(scope_label)"
   [ $lvl -le 2 ] && printf " · %d" $FN
-  [ $lvl -le 1 ] && printf " · %d online" $FON
+  [ $lvl -le 2 ] && printf " · %d online" $FON
   printf " · ${TUNG}%d${R}/%d slots in use" $FU $FC
   [ $lvl -eq 0 ] && [ $FUNK -gt 0 ] && printf "${F} +%d ?cap${R}" $FUNK
   if [ $lvl -le 1 ]; then
@@ -198,17 +199,20 @@ fleet_fit() { local avail=$1 lvl s; visible_rows; fleet_counts
 # Title line. Left: wordmark + tabs (split: only the top pane's tabs, the selected one
 # bracketed, mirroring the bottom divider's `pulls · ci`). Right: the fleet status, narrowed
 # against the space LEFT after the tabs; its own line only when even the minimal form won't fit.
-title() { local t lbl out="${TUNG}${B}▚▚ uzi${R}${F} · ${R}" set="floor workers pulls ci" sep="  " cur=$view avail fs
-  if [ $split = 1 ]; then set="floor workers"; sep="${F} · ${R}"; cur=$top; fi
+title() { local t lbl out="${TUNG}${B}▚▚ uzi${R}${F} · ${R}" set="floor workers pulls ci" sep="  " cur=$view avail fs sp=$split
+  [ "${1:-}" = detail ] && { sp=0; cur=workers; }
+  if [ $sp = 1 ]; then set="floor workers"; sep="${F} · ${R}"; cur=$top; fi
   for t in $set; do
     lbl=$t; [ $t = floor ] && [ $admin = 1 ] && lbl="active runs"
     if [ "$t" = "$cur" ]; then
-      if [ $split = 1 ]; then lbl="[$lbl]"; fi
-      if [ $split = 0 ] || [ $focus = top ]; then out+="${TUNG}${B}${lbl}${R}${sep}"; else out+="${lbl}${sep}"; fi
+      if [ $sp = 0 ]; then out+="${TUNG}${B}${lbl}${R}${sep}"
+      elif [ $focus = top ]; then out+="${TUNG}${B}[${lbl}]${R}${sep}"   # bracket only in the focused pane
+      else out+="${lbl}${sep}"; fi
     else out+="${F}${lbl}${R}${sep}"; fi
   done
   out="${out%"$sep"}"
-  [ $strip = 1 ] || { printf '%s\n' "$out"; return; }
+  # worker detail draws the full strip without the fleet status
+  { [ $strip = 1 ] && [ "${1:-}" != detail ]; } || { printf '%s\n' "$out"; return; }
   avail=$(( width - $(vislen "$out") - 2 ))
   fs=$(fleet_fit $avail)
   if [ "$(vislen "$fs")" -le $avail ]; then rjust "$out" "$fs"
@@ -220,14 +224,15 @@ meters() { local m; m="  ${F}claude${R} $(bar 62 4) 62% ${F}5h${R}  ${F}codex${R
 
 list_header() {
   if [ $width -ge 120 ]; then
-    printf "${F}  %s %s%s %s %s %s %s %s %s %s %s ATTENTION${R}\n" "$(pad NAME 13)" "$( [ $admin = 1 ] && pad OWNER 7 && printf ' ')" "$(pad STATE 10)" "$(pad KIND 9)" "$(pad RUNS 4)" "$(pad CPU 4)" "$(pad MEM 7)" "$(pad 'DISK (worst)' 18)" "$(pad VERSION $VW)" "$(pad HB 3)"
+    printf "${F}  %s %s%s %s %s %s %s %s %s %s %s ATTENTION${R}\n" "$(pad NAME 13)" "$( [ $admin = 1 ] && pad OWNER 7 && printf ' ')" "$(pad STATE 10)" "$(pad KIND 9)" "$(pad RUNS 4)" "$(pad CPU 5)" "$(pad MEM $MW)" "$(pad 'DISK (worst)' 19)" "$(pad VERSION $VW)" "$(pad HB 3)"
   else
     printf "${F}  %s %s %s %s ATTENTION${R}\n" "$(pad NAME 13)" "$(pad STATE 10)" "$(pad KIND 9)" "$(pad RUNS 4)"
   fi; }
 
 # VERSION is as wide as the longest visible version + marker, capped at 18 (never truncated
 # while the row has room)
-version_width() { local i v; VW=8
+version_width() { local i v m; VW=8; MW=9   # MEM is at least 9 wide (~12.0/16G)
+  for i in "${ROWS[@]}"; do m=${#MEMU[$i]}; [ "${STALE[$i]}" = 1 ] && m=$((m+1)); [ $m -gt $MW ] && MW=$m; done
   for i in "${ROWS[@]}"; do v=$(( ${#VER[$i]} + 1 )); [ $v -gt $VW ] && VW=$v; done
   [ $VW -gt 18 ] && VW=18; return 0; }
 
@@ -237,13 +242,13 @@ list_row() { local k=$1 i=$2 active=$3 pre=" " line s
   if [ $width -ge 120 ]; then
     # stale (offline, last-known) readings: dimmed AND prefixed "~", so it survives NO_COLOR
     local d="" t=" "; [ "${STALE[$i]}" = 1 ] && { d=$F; t="~"; }
-    local cpu; if [ "${CPU[$i]}" = "?" ]; then cpu="   ?"; else cpu=$(printf '%s%2d%%' "$t" "${CPU[$i]}"); fi
-    local disk; if [ "${DISKP[$i]}" -lt 0 ]; then disk="$(pad '?' 18)"
-      else disk="$(pad "${DISKL[$i]}" 8) $(bar "${DISKP[$i]}" 4) $(pctcol "${DISKP[$i]}")$(pad "${DISKP[$i]}%" 4)${R}"; fi
+    local cpu; if [ "${CPU[$i]}" = "?" ]; then cpu="    ?"; else cpu=$(printf '%s%3d%%' "$t" "${CPU[$i]}"); fi
+    local disk; if [ "${DISKP[$i]}" -lt 0 ]; then disk="$(pad '?' 19)"
+      else disk="$(pad "${t# }${DISKL[$i]}" 8) $(bar "${DISKP[$i]}" 4) $(pctcol "${DISKP[$i]}")$(pad "${DISKP[$i]}%" 5)${R}"; fi
     # version marker: ↑ outdated, ✕ upgrade failed (glyph + colour)
     local vm=" "; case "${UPG[$i]}" in outdated) vm="↑";; failed) vm="✕";; esac
     local ver; ver=$(pad "${VER[$i]}$vm" $VW); case "${UPG[$i]}" in outdated) ver="${STALL}${ver}${R}";; failed) ver="${RED}${ver}${R}";; esac
-    line="$pre $(pad "${NAME[$i]}" 13) $( [ $admin = 1 ] && pad "${OWNER[$i]}" 7 && printf ' ')$(statecell "$s" 10) $(pad "${KIND[$i]}" 9) $runs ${d}$cpu $(pad "${MEMU[$i]}" 7) ${disk}${R} ${ver} ${F}$(pad "${HB[$i]}" 3)${R} $(attcell "$i")"
+    line="$pre $(pad "${NAME[$i]}" 13) $( [ $admin = 1 ] && pad "${OWNER[$i]}" 7 && printf ' ')$(statecell "$s" 10) $(pad "${KIND[$i]}" 9) $runs ${d}$cpu $(pad "${t# }${MEMU[$i]}" $MW) ${disk}${R} ${ver} ${F}$(pad "${HB[$i]}" 3)${R} $(attcell "$i")"
   else
     line="$pre $(pad "${NAME[$i]}" 13) $(statecell "$s" 10) $(pad "${KIND[$i]}" 9) $runs $(attcell "$i")"
   fi
@@ -285,7 +290,7 @@ legend_box() {
 kv() { printf "  ${F}%-13s${R} %s\n" "$1" "$2"; }
 
 draw_detail() { visible_rows; local i=${ROWS[$sel]} s a x IFS hd up
-  s=$(state "$i"); title
+  s=$(state "$i"); title detail
   # one header line: breadcrumb, state, kind; uptime/heartbeat right after it when it fits
   hd="${F}worker ›${R} ${B}${NAME[$i]}${R}  $(statecell "$s" $(( ${#s} + 2 )))  ${F}${KIND[$i]}${R}"
   if [ "${ONLINE[$i]}" = 1 ]; then up="up ${UPT[$i]} · heartbeat ${HB[$i]} ago"; else up="last heartbeat ${HB[$i]} ago"; fi
@@ -309,10 +314,13 @@ draw_detail() { visible_rows; local i=${ROWS[$sel]} s a x IFS hd up
       *) printf "  %s%s${R}\n" "${x%%~*}" "${x#*~}";;
     esac; done; unset IFS; fi
   printf "\n${TUNG}reported runs${R}  ${F}api active_runs${R} %s${F} / cap${R} %s ${F}(run lane)${R}\n" "${ACT[$i]}" "${CAP[$i]}"
-  if [ -n "${RUNS[$i]}" ]; then local r n=0 rid ph age iss ttl stg eng gen; IFS=';'; for r in ${RUNS[$i]}; do
+  if [ -n "${RUNS[$i]}" ]; then local r n=0 rid ph age iss ttl stg eng gen nr
+    nr=$(printf '%s' "${RUNS[$i]}" | tr ';' '\n' | grep -c .); [ $rsel -ge "$nr" ] && rsel=$((nr-1))
+    IFS=';'; for r in ${RUNS[$i]}; do
       IFS='|' read -r rid ph age iss ttl stg eng gen <<<"$r"; n=$((n+1))
       [ -z "$iss" ] && { iss="run"; ttl="$rid"; }
-      printf "  ${F}%d${R} ${CYN}%-5s${R} %s ${F}%s${R}\n" $n "$iss" "$(pad "$ttl" 26)" "$eng"
+      local cur=" "; [ $((n-1)) = $rsel ] && cur="${TUNG}›${R}"
+      printf "%s ${F}%d${R} ${CYN}%-5s${R} %s ${F}%s${R}\n" "$cur" $n "$iss" "$(pad "$ttl" 26)" "$eng"
       printf "      ${F}worker phase${R} %s" "$ph"; [ -n "$age" ] && printf " · ${STALL}outcome pending %s${R}" "$age"
       printf "  ${F}· run stage${R} %s ${F}· gen %s${R}\n" "$stg" "$gen"
       IFS=';'; done; unset IFS
@@ -337,8 +345,9 @@ draw_detail() { visible_rows; local i=${ROWS[$sel]} s a x IFS hd up
   [ $admin = 1 ] && [ -n "${PRESS[$i]}" ] && kv "disk pressure" "${RED}${PRESS[$i]}${R} ${F}(sustained, server-reported)${R}"
   [ $admin = 1 ] && kv "owner" "${OWNER[$i]}"
   printf '\n'
-  if [ $split = 1 ]; then footer "esc/← back to split (selection kept) · j/k next worker · q quit" "esc/← back to split · j/k · q quit"
-  else footer "esc/← back · ↵/→ open run · j/k next worker · q quit" "esc/← back · ↵/→ run · j/k · q quit"; fi; }
+  if [ $split = 1 ]; then footer "esc/← back to split (selection kept) · j/k select run · ? keys · q quit" "esc/← back to split · j/k run · ? · q quit"
+  else footer "esc/← back · j/k select run · ↵/→ open run · ? keys · q quit" "esc/← back · j/k run · ↵/→ open · ? · q quit"; fi
+  [ $legend = 1 ] && legend_box; }
 
 # floor rows: the worker cell is drawn only at >=120 columns (dropped at 80). A run with no
 # worker yet reads `no worker yet`; a finished run whose (ephemeral) worker is gone reads `—`.
@@ -354,7 +363,8 @@ floor_rows() { local act=$1 pre=" "; [ "$act" = 1 ] && pre="${TUNG}▌${R}"
   floor_row " " "${GRY}✓${R}" "#099" "Seed fixture refresh" "completed" "—"; }
 
 draw_floor() { title; meters; printf '\n'; floor_rows 1; printf '\n'
-  footer "tab next · z fleet status ($( [ $strip = 1 ] && echo on || echo off)) · s split · ? keys · q quit" "tab · z fleet · s split · ? · q quit"; }
+  footer "tab next · z fleet status ($( [ $strip = 1 ] && echo on || echo off)) · s split · ? keys · q quit" "tab · z fleet · s split · ? · q quit"
+  [ $legend = 1 ] && legend_box; }
 
 draw_split() { visible_rows; [ $sel -ge ${#ROWS[@]} ] && sel=$((${#ROWS[@]}-1))
   local tf=0 bf=0; [ $focus = top ] && tf=1 || bf=1
@@ -362,13 +372,13 @@ draw_split() { visible_rows; [ $sel -ge ${#ROWS[@]} ] && sel=$((${#ROWS[@]}-1))
   # top pane: floor keeps its meters + run summary; workers hides both and uses the same
   # table as full screen (wide at >= 120 columns)
   if [ $top = floor ]; then meters; printf '\n'; floor_rows $tf
-  else workers_body $tf; fi
+  else workers_body $tf; readout; fi
   printf "${GRY}%s${R}\n" "$(printf '%*s' "$width" '' | tr ' ' '━')"
   # bottom pane: pulls | ci, the shown one bracketed (bold when focused)
   if [ $bottom = pulls ]; then
-    printf " %s${F} · ci${R}\n" "$( [ $bf = 1 ] && printf "${TUNG}${B}[pulls]${R}" || printf '[pulls]')"
+    printf " %s${F} · ci${R}\n" "$( [ $bf = 1 ] && printf "${TUNG}${B}[pulls]${R}" || printf 'pulls')"
   else
-    printf " ${F}pulls · ${R}%s\n" "$( [ $bf = 1 ] && printf "${TUNG}${B}[ci]${R}" || printf '[ci]')"
+    printf " ${F}pulls · ${R}%s\n" "$( [ $bf = 1 ] && printf "${TUNG}${B}[ci]${R}" || printf 'ci')"
   fi
   case $bottom in
     ci) printf "%s ${SAGE}✓${R} main     ci.yml  0a1b2c3d  4m\n  ${RED}✕${R} pr-107  ci.yml  4e5f6a7b  12m\n" "$( [ $bf = 1 ] && printf "${TUNG}▌${R}" || printf ' ')";;
@@ -386,7 +396,7 @@ draw() { printf '%s[H%s[2J' "$E" "$E"
   case "$view" in
     workers) draw_list;;
     floor) draw_floor;;
-    *) title; printf "\n  ${F}(%s view unchanged; 2 for workers, s for split)${R}\n" "$view";;
+    *) title; printf "\n  ${F}(the %s view is unchanged and not drawn in this mock)${R}\n" "$view";;
   esac; }
 
 next_view() { # tab: floor -> workers -> pulls -> ci -> floor; in split the owning pane takes it
@@ -415,9 +425,9 @@ while :; do
        if [ $split = 1 ]; then
          case $key in 1) top=floor; focus=top;; 2) top=workers; focus=top;; 3) bottom=pulls; focus=bottom;; 4) bottom=ci; focus=bottom;; esac
        else case $key in 1) view=floor;; 2) view=workers;; 3) view=pulls;; 4) view=ci;; esac; fi;;
-    j|"${E}[B") [ $sel -lt $((n-1)) ] && sel=$((sel+1));;
-    k|"${E}[A") [ $sel -gt 0 ] && sel=$((sel-1));;
-    ""|$'\r'|l|"${E}[C") can_drill && drill=1;;
+    j|"${E}[B") if [ $drill = 1 ]; then rsel=$((rsel+1)); elif [ $sel -lt $((n-1)) ]; then sel=$((sel+1)); fi;;
+    k|"${E}[A") if [ $drill = 1 ]; then [ $rsel -gt 0 ] && rsel=$((rsel-1)); elif [ $sel -gt 0 ]; then sel=$((sel-1)); fi;;
+    ""|$'\r'|l|"${E}[C") can_drill && { drill=1; rsel=0; };;
     "$E"|h|"${E}[D") drill=0;;
     a) admin=$((1-admin)); sel=0;;
     w) if [ $width = 120 ]; then width=80; else width=120; fi;;
