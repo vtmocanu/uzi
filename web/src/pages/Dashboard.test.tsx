@@ -191,6 +191,7 @@ beforeEach(() => {
     login: vi.fn(),
     logout: vi.fn(),
     refresh: vi.fn(),
+    updateUser: vi.fn(),
     serverUnreachable: false,
     retry: vi.fn(),
   });
