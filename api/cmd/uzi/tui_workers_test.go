@@ -72,6 +72,24 @@ func TestWorkersDemoFleet(t *testing.T) {
 	}
 }
 
+func TestWorkersLegendHelpAndVersionBudget(t *testing.T) {
+	m := workersScene(true, "workers-factory")
+	r := m.workers.rows[0]
+	r.w.Version = sp(strings.Repeat("界", 8))
+	r.w.UpgradeStatus = "upgrade_failed"
+	r.w.OutboxBlocked = sp("blocked")
+	if line := m.workerRowLine(r, true, 120); !strings.Contains(stripANSI(line), "+") || visualWidth(line) > 120 {
+		t.Fatalf("attention suffix lost: %s", line)
+	}
+	if !strings.Contains(stripANSI(m.renderWorkers()), "fixed visual cue") {
+		t.Fatal("missing disk legend")
+	}
+	help := strings.Join(helpLines(viewWorkers), "\n")
+	if !strings.Contains(help, "j / ↓") || !strings.Contains(help, "k / ↑") {
+		t.Fatal("movement help omitted")
+	}
+}
+
 func TestWorkerStatePrecedence(t *testing.T) {
 	now := time.Now()
 	for _, tc := range []struct {

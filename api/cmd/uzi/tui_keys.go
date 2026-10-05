@@ -95,7 +95,7 @@ func helpLines(v tuiView) []string {
 			"m          open the PR view for this run's merge request (when it has one)",
 		}, common...)
 	case viewWorkers:
-		return append([]string{
+		return append(append([]string{
 			"a          toggle your workers / factory workers (admin token)",
 			"tab / shift+tab  floor · workers · pulls · ci",
 			"1 / 2 / 3 / 4  floor / workers / pulls / ci",
@@ -104,7 +104,7 @@ func helpLines(v tuiView) []string {
 			"~          stale, last-known resources (also dimmed)",
 			"✕ danger · ▲/state glyph warn · · info; danger/warn need attention",
 			"↑ version outdated · ✕ upgrade failed",
-		}, common[3:]...)
+		}, common[:2]...), common[3:]...)
 	case viewPulls:
 		return append([]string{
 			"enter / →  open the selected PR (checks · reviews · merge)",

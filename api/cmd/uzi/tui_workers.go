@@ -590,7 +590,7 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int) string {
 			mem = m.pal.faint.Render(mem)
 			disk = m.pal.faint.Render(disk)
 		}
-		ver := m.renderer.Plain(t.workerVersion, 8)
+		ver := clampVisual(m.renderer.Plain(t.workerVersion, 8), 8)
 		switch r.w.UpgradeStatus {
 		case "outdated":
 			ver += "↑"
@@ -656,6 +656,7 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 		}
 	}
 	lines = append(lines, clampVisual(header, width))
+	lines = append(lines, clampVisual("disk ≥90%: fixed visual cue; dind/inodes display-only", width))
 	rows := m.workers.visible(time.Now())
 	if m.workers.admin != m.board.admin {
 		rows = nil
