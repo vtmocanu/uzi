@@ -35,8 +35,8 @@ particular token afterwards from **Settings → Workers** if you want one.
 [Worker templates](./worker-setup.md#worker-templates) for a self-run worker:
 `base` (Node + git, most repos) or `jvm` (`base` plus a JDK).
 
-**Size** picks how much CPU, memory, and disk the worker gets: **S**, **M**
-(the default), or **L**, each step roughly doubling the last. The provision
+**Size** picks how much CPU, memory, and disk the worker gets: **S**, **M**,
+or **L** (the default), with larger presets providing more capacity. The provision
 form shows the exact numbers next to each option when you pick — they live
 there, not here, so they can't say something different from what you'll
 actually get. Every size also gets the same 20Gi tools cache (`/nix`),
@@ -49,8 +49,14 @@ lease](#ephemeral-worker-lease)), is the exception on `/data`: its `/data` is
 its own setting, 20Gi by default and set by the operator, whatever size the
 worker runs at. Its CPU and memory still follow its size.
 
-**M** is the default because it matches what a self-run worker gets out of
-the box. **Every size costs you the same, 1 of your quota below** — there's
+New persistent and ephemeral hosted workers default to **L** for more build
+and test headroom. Compared with **M**, **L** doubles the CPU and memory
+requests (1 CPU / 8Gi instead of 500m / 4Gi), reserving more node capacity.
+Existing workers keep their stored size. Operators can change the ephemeral
+default through `UZI_EPHEMERAL_DEFAULT_SIZE`; users can choose another size
+when provisioning a persistent worker.
+
+**Every size costs you the same, 1 of your quota below**; there's
 no personal cost to picking bigger. Size for your actual workload anyway,
 not to save quota: **L** for large projects (a big JVM test suite, a large
 `go build`), **S** for light repos. A hosted worker's CPU, memory and disk

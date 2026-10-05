@@ -58,7 +58,7 @@ func TestCreateFindingScrubsCredentialStraddlingCap(t *testing.T) {
 	desc, descKeep := straddlingSecret(MaxIssueDescriptionBytes)
 	label, labelKeep := straddlingSecret(MaxFindingLabelBytes)
 
-	_, _, err := svc.CreateFinding(context.Background(), wkr, run.ID, CreateFindingRequest{
+	_, err := svc.CreateFinding(context.Background(), wkr, run.ID, CreateFindingRequest{
 		Title:       title,
 		Description: desc,
 		Location:    "api/internal/x.go#Fn",
@@ -127,7 +127,7 @@ func TestCreateFindingInvalidUTF8DoesNotCutCredential(t *testing.T) {
 	wkr := store.Worker{ID: uuid.New(), UserID: run.UserID}
 
 	token := "gh" + "p_" + strings.Repeat(straddleTokenChunk, 9)
-	_, _, err := svc.CreateFinding(context.Background(), wkr, run.ID, CreateFindingRequest{
+	_, err := svc.CreateFinding(context.Background(), wkr, run.ID, CreateFindingRequest{
 		Title:       strings.Repeat("\xff", 15) + token,
 		Description: "d",
 		Location:    "api/internal/x.go#Fn",

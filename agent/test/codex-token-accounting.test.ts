@@ -59,6 +59,57 @@ function assertEntry(
   assert.ok(actual !== undefined && !("costUSD" in actual), "no costUSD in a C4a entry");
 }
 
+describe("CodexUsageAccountant: proved replay and incomplete claims", () => {
+  it("never guesses total-last without replay, and later replay cannot clear incomplete", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_ROOT, true);
+    acct.record(ROOT, usage({ inputTokens: 600, totalTokens: 600 }, { inputTokens: 300, totalTokens: 300 }));
+    assert.equal(acct.usageIncomplete, true);
+    assert.equal(acct.aggregateByModel({ authMode: "subscription", now: new Date("2026-10-05") }), undefined);
+    assert.equal(acct.takeIncompleteNotice(), true);
+    acct.registerThread(ROOT, MODEL_ROOT, false);
+    acct.registerThread("later-child", MODEL_CHILD, false);
+    acct.record(ROOT, usage({ inputTokens: 300, totalTokens: 300 }, { inputTokens: 200, totalTokens: 200 }), true);
+    assert.equal(acct.usageIncomplete, true);
+    assert.equal(acct.aggregateByModel(), undefined);
+    assert.equal(acct.takeIncompleteNotice(), false);
+  });
+
+  it("ready baseline survives no-replay recreation with model, max and priced responses intact", () => {
+    const acct = new CodexUsageAccountant();
+    assert.equal(acct.hasBaseline(ROOT), false);
+    acct.registerThread(ROOT, MODEL_ROOT, true);
+    acct.record(ROOT, usage({ inputTokens: 300, outputTokens: 90, totalTokens: 390 }, { inputTokens: 200, outputTokens: 60, totalTokens: 260 }), true);
+    assert.equal(acct.hasBaseline(ROOT), true);
+    acct.record(ROOT, usage({ inputTokens: 600, outputTokens: 180, totalTokens: 780 }, { inputTokens: 300, outputTokens: 90, totalTokens: 390 }));
+    acct.registerThread(ROOT, MODEL_CHILD, true);
+    // Recreation has no historical replay; duplicate/stale notes must preserve both max and responses.
+    acct.record(ROOT, usage({ inputTokens: 600, outputTokens: 180, totalTokens: 780 }, { inputTokens: 300, outputTokens: 90, totalTokens: 390 }));
+    acct.record(ROOT, usage({ inputTokens: 300, outputTokens: 90, totalTokens: 390 }, { inputTokens: 200, outputTokens: 60, totalTokens: 260 }));
+    acct.record(ROOT, usage({ inputTokens: 1000, outputTokens: 300, totalTokens: 1300 }, { inputTokens: 400, outputTokens: 120, totalTokens: 520 }));
+    assert.equal(acct.usageIncomplete, false);
+    assert.deepEqual(acct.aggregateByModel({ authMode: "api_key", now: new Date("2026-10-05") }), {
+      [MODEL_ROOT]: { inputTokens: 700, outputTokens: 210, cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0, reasoningOutputTokens: 0, costStatus: "metered", costUSD: 0.0175 },
+    });
+  });
+
+  it("same accountant retains original baseline and does not price replay last on recreation", () => {
+    const acct = new CodexUsageAccountant();
+    const first = usage({ inputTokens: 100, outputTokens: 30, totalTokens: 130 }, { inputTokens: 100, outputTokens: 30, totalTokens: 130 });
+    acct.registerThread(ROOT, MODEL_ROOT, false);
+    acct.record(ROOT, first);
+    acct.registerThread(ROOT, MODEL_ROOT, true);
+    acct.record(ROOT, first, true);
+    acct.record(ROOT, usage({ inputTokens: 300, outputTokens: 90, totalTokens: 390 }, { inputTokens: 200, outputTokens: 60, totalTokens: 260 }));
+    const pricing = { authMode: "api_key" as const, now: new Date("2026-10-05") };
+    assert.deepEqual(acct.aggregateByModel(pricing), {
+      [MODEL_ROOT]: { inputTokens: 300, outputTokens: 90, cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0, reasoningOutputTokens: 0, costStatus: "metered", costUSD: 0.0075 },
+    });
+  });
+});
+
 describe("CodexUsageAccountant: a fresh thread charges its whole cumulative", () => {
   it("maps the six wire buckets, deriving uncached input and keeping reasoning as a subset", () => {
     const acct = new CodexUsageAccountant();
@@ -154,12 +205,12 @@ describe("CodexUsageAccountant: resumed threads baseline at the full restored cu
   it("baselines at the FULL restored `total` so the prior leg's final response is NOT double-counted (real resume shape: initial replay carries a non-zero `last`)", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, MODEL_ROOT, true); // resumed
-    // REAL resume behavior (pinned app-server token_usage_replay.rs): the FIRST note on resume is
-    // the replayed snapshot of the restored TokenUsageInfo — total = the prior cumulative AND
+    // Proved historical replay, matching the characterized paginated cold-resume fixture:
+    // the restored snapshot has total = the prior cumulative AND
     // `last` = the prior leg's FINAL response (NON-ZERO, a subset already in `total`). The baseline
     // must be the full `total` ({in:500, out:300}); a `total - last` baseline ({in:400, out:250})
     // would sit below the prior cumulative and re-charge the prior leg's last response.
-    acct.record(ROOT, usage({ inputTokens: 500, outputTokens: 300, totalTokens: 800 }, { inputTokens: 100, outputTokens: 50, totalTokens: 150 }));
+    acct.record(ROOT, usage({ inputTokens: 500, outputTokens: 300, totalTokens: 800 }, { inputTokens: 100, outputTokens: 50, totalTokens: 150 }), true);
     // The first genuinely-new response after resume adds {in:200, out:100}.
     acct.record(ROOT, usage({ inputTokens: 700, outputTokens: 400, totalTokens: 1100 }, { inputTokens: 200, outputTokens: 100, totalTokens: 300 }));
     const agg = acct.aggregateByModel();
@@ -172,10 +223,10 @@ describe("CodexUsageAccountant: resumed threads baseline at the full restored cu
   it("a stale resume replay after the baseline cannot increase usage", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, MODEL_ROOT, true);
-    acct.record(ROOT, usage({ inputTokens: 500, outputTokens: 300, totalTokens: 800 }, { inputTokens: 100, outputTokens: 50, totalTokens: 150 }));
+    acct.record(ROOT, usage({ inputTokens: 500, outputTokens: 300, totalTokens: 800 }, { inputTokens: 100, outputTokens: 50, totalTokens: 150 }), true);
     acct.record(ROOT, usage({ inputTokens: 700, outputTokens: 400, totalTokens: 1100 }, { inputTokens: 200, outputTokens: 100, totalTokens: 300 }));
     // A resume replay redelivers an EARLIER cumulative snapshot — must not increase usage.
-    acct.record(ROOT, usage({ inputTokens: 500, outputTokens: 300, totalTokens: 800 }, { inputTokens: 100, outputTokens: 50, totalTokens: 150 }));
+    acct.record(ROOT, usage({ inputTokens: 500, outputTokens: 300, totalTokens: 800 }, { inputTokens: 100, outputTokens: 50, totalTokens: 150 }), true);
     const agg = acct.aggregateByModel();
     assert.ok(agg);
     assertEntry(agg[MODEL_ROOT], { input: 200, output: 100, cacheRead: 0, cacheCreation: 0, reasoning: 0 });
@@ -184,9 +235,8 @@ describe("CodexUsageAccountant: resumed threads baseline at the full restored cu
   it("baselines at `total` irrespective of `last` (a hypothetical last=0 snapshot charges the same)", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, MODEL_ROOT, true);
-    // The resume baseline is the full `total` regardless of `last`, so a last=0 first note (were
-    // one ever emitted) baselines at total = {in:400, out:250} — the same rule as the non-zero case.
-    acct.record(ROOT, usage({ inputTokens: 400, outputTokens: 250, totalTokens: 650 }, {}));
+    // Explicitly proved replay with last=0 baselines at full total = {in:400, out:250}.
+    acct.record(ROOT, usage({ inputTokens: 400, outputTokens: 250, totalTokens: 650 }, {}), true);
     // First new response after resume.
     acct.record(ROOT, usage({ inputTokens: 500, outputTokens: 300, totalTokens: 800 }, { inputTokens: 100, outputTokens: 50, totalTokens: 150 }));
     const agg = acct.aggregateByModel();
@@ -263,8 +313,8 @@ describe("CodexUsageAccountant: redelivery and empties", () => {
   it("a registered thread whose reconciled delta is entirely zero is omitted", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, MODEL_ROOT, true);
-    // Only an initial resume snapshot with last=0 — baseline = total, so charged is zero.
-    acct.record(ROOT, usage({ inputTokens: 400, outputTokens: 250, totalTokens: 650 }, {}));
+    // Only a proved historical resume snapshot with last=0 — baseline = total, so charged is zero.
+    acct.record(ROOT, usage({ inputTokens: 400, outputTokens: 250, totalTokens: 650 }, {}), true);
     assert.equal(acct.aggregateByModel(), undefined);
   });
 

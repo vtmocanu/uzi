@@ -2,7 +2,9 @@ package healthsvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/slacksvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -343,6 +346,267 @@ func TestEpisodeNotice_SlackMarkupInSummaryIsInert(t *testing.T) {
 	// clickable phishing link reaches the admin's DM.
 	if strings.Contains(rendered, "<https://evil.example") {
 		t.Errorf("SlackMrkdwn render kept a RAW <url|text> link (live phishing markup); want it neutralized. got %q", rendered)
+	}
+}
+
+// M2 read counters distinguish skipping the notice from a gate hiding it.
+type m2EpisodeStore struct {
+	*fakeEpisodeStore
+	adminReads int
+}
+
+func (s *m2EpisodeStore) ListAdmins(ctx context.Context) ([]uuid.UUID, error) {
+	s.adminReads++
+	return s.fakeEpisodeStore.ListAdmins(ctx)
+}
+
+type m2Settings struct {
+	enabledReads, baseReads int
+}
+
+func (s *m2Settings) HealthEnabled(context.Context) (bool, error) {
+	s.enabledReads++
+	return true, nil
+}
+func (s *m2Settings) PublicBaseURL(context.Context) (string, error) {
+	s.baseReads++
+	return "https://uzi.example.com", nil
+}
+
+func TestEpisodeNoticeM2Allowed(t *testing.T) {
+	for _, id := range []string{"db", "controller.report", "loops", "fleet.roll"} {
+		t.Run(id, func(t *testing.T) {
+			a, b := uuid.New(), uuid.New()
+			st := &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: uuid.New(), admins: []uuid.UUID{a, b}}
+			nf := &fakeEpisodeNotifier{}
+			ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{dangerCheckDTO(id, id, "danger")}}}
+			r := newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true})
+			r.Reconcile(context.Background())
+			if len(st.claims) != 0 || len(nf.sent) != 0 {
+				t.Fatal("opener notified")
+			}
+			r.Reconcile(context.Background())
+			r.Reconcile(context.Background())
+			if countDeliveredTo(nf, a) != 1 || countDeliveredTo(nf, b) != 1 || len(nf.sent) != 2 {
+				t.Fatalf("notices = %+v, want once per admin", nf.sent)
+			}
+			for _, n := range nf.sent {
+				if got := n.Payload.(map[string]any)["checks"]; !reflect.DeepEqual(got, []dangerCheck{{ID: id, Title: id, Summary: "danger"}}) {
+					t.Fatalf("checks = %+v", got)
+				}
+			}
+		})
+	}
+}
+
+func TestEpisodeNoticeM2ExcludedAndSeverities(t *testing.T) {
+	for _, id := range []string{"queue.waiting", "fleet.capacity", "queue.undispatched", "fleet.disk", "fleet.rundisk", "future.check"} {
+		for _, severity := range []string{sevWarn, sevUnknown, sevOK} {
+			t.Run(id+"/"+severity, func(t *testing.T) {
+				st := &m2EpisodeStore{fakeEpisodeStore: &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: uuid.New(), admins: []uuid.UUID{uuid.New()}}}
+				se, nf := &m2Settings{}, &fakeEpisodeNotifier{}
+				checks := []apitypes.HealthCheckDTO{dangerCheckDTO(id, "owner danger", "excluded")}
+				for _, allowed := range []string{"db", "controller.report", "loops", "fleet.roll"} {
+					c := dangerCheckDTO(allowed, allowed, "not danger")
+					c.Severity = severity
+					checks = append(checks, c)
+				}
+				ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: checks}}
+				r := NewEpisodeReconciler(ev, st, nf, se, nil)
+				for range 3 {
+					r.Reconcile(context.Background())
+				}
+				if st.opened != 1 || len(st.closed) != 0 {
+					t.Fatal("overall danger lifecycle changed")
+				}
+				if se.enabledReads != 0 || se.baseReads != 0 || st.adminReads != 0 || len(st.claims) != 0 || len(nf.sent) != 0 {
+					t.Fatalf("reads enabled/base/admin=%d/%d/%d claims=%d notices=%d", se.enabledReads, se.baseReads, st.adminReads, len(st.claims), len(nf.sent))
+				}
+			})
+		}
+	}
+}
+
+func TestEpisodeNoticeM2MixedPayload(t *testing.T) {
+	for _, severity := range []string{sevWarn, sevUnknown, sevOK} {
+		t.Run(severity, func(t *testing.T) {
+			st := &fakeEpisodeStore{open: store.GetOpenHealthEpisodeRow{ID: uuid.New()}, admins: []uuid.UUID{uuid.New()}}
+			nf := &fakeEpisodeNotifier{}
+			checks := []apitypes.HealthCheckDTO{
+				dangerCheckDTO("queue.waiting", "owner waiting", "owner-only waiting"),
+				dangerCheckDTO("fleet.roll", "roll title", "roll summary"),
+				{ID: "db", Title: "db nondanger", Summary: "db-only nondanger", Severity: severity},
+				dangerCheckDTO("fleet.disk", "owner disk", "owner-only disk"),
+				dangerCheckDTO("loops", "loops title", "loops summary"),
+				dangerCheckDTO("controller.report", "controller title", "controller summary"),
+			}
+			ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: checks}}
+			newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true}).Reconcile(context.Background())
+			if len(nf.sent) != 1 {
+				t.Fatalf("notices=%d", len(nf.sent))
+			}
+			n := nf.sent[0]
+			want := []dangerCheck{{"fleet.roll", "roll title", "roll summary"}, {"loops", "loops title", "loops summary"}, {"controller.report", "controller title", "controller summary"}}
+			p := n.Payload.(map[string]any)
+			if !reflect.DeepEqual(p["checks"], want) {
+				t.Fatalf("checks=%+v want %+v", p["checks"], want)
+			}
+			body := p["body"].(string)
+			if body != n.Slack.Body {
+				t.Fatal("payload and Slack body differ")
+			}
+			last := -1
+			for _, c := range want {
+				pos := strings.Index(body, c.Title+": "+c.Summary)
+				if pos <= last {
+					t.Fatalf("body order/content=%q", body)
+				}
+				last = pos
+			}
+			for _, absent := range []string{"owner waiting", "owner disk", "db nondanger", "owner-only", "db-only"} {
+				if strings.Contains(body, absent) {
+					t.Fatalf("excluded text in body: %q", body)
+				}
+			}
+			if !reflect.DeepEqual(n.Slack.Facts, []string{"*3* danger checks"}) {
+				t.Fatalf("facts=%v", n.Slack.Facts)
+			}
+		})
+	}
+}
+
+func TestEpisodeNoticeM2OwnerThenInstanceSameEpisode(t *testing.T) {
+	a := uuid.New()
+	ep := uuid.New()
+	st := &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: ep, admins: []uuid.UUID{a}}
+	nf := &fakeEpisodeNotifier{}
+	ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{dangerCheckDTO("queue.waiting", "owner", "waiting")}}}
+	r := newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true})
+	ctx := context.Background()
+	r.Reconcile(ctx)
+	r.Reconcile(ctx)
+	if st.open.ID != ep || len(st.claims) != 0 || len(nf.sent) != 0 {
+		t.Fatal("owner ticks consumed notice or changed episode")
+	}
+	ev.doc.Checks = []apitypes.HealthCheckDTO{dangerCheckDTO("queue.waiting", "owner", "waiting"), dangerCheckDTO("db", "db", "unavailable")}
+	r.Reconcile(ctx)
+	if st.open.ID != ep || st.opened != 1 || countDeliveredTo(nf, a) != 1 {
+		t.Fatal("first instance danger did not notify immediately in same episode")
+	}
+	// Owner danger holds this same episode open through owner-only and later instance ticks.
+	for _, id := range []string{"", "controller.report", "", "loops"} {
+		ev.doc.Checks = []apitypes.HealthCheckDTO{dangerCheckDTO("queue.waiting", "owner", "waiting")}
+		if id != "" {
+			ev.doc.Checks = append(ev.doc.Checks, dangerCheckDTO(id, id, "danger"))
+		}
+		r.Reconcile(ctx)
+		if st.open.ID != ep || st.opened != 1 || len(st.closed) != 0 || len(nf.sent) != 1 {
+			t.Fatalf("owner plus %q changed episode or re-notified", id)
+		}
+	}
+	ev.doc = Doc{Status: sevOK}
+	r.Reconcile(ctx)
+	if !reflect.DeepEqual(st.closed, []uuid.UUID{ep}) {
+		t.Fatalf("closed=%v", st.closed)
+	}
+	st.openReturn = uuid.New()
+	ev.doc = Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{dangerCheckDTO("fleet.roll", "roll", "stuck")}}
+	r.Reconcile(ctx)
+	if len(nf.sent) != 1 {
+		t.Fatal("new opener notified")
+	}
+	r.Reconcile(ctx)
+	if st.opened != 2 || countDeliveredTo(nf, a) != 2 || st.open.ID == ep {
+		t.Fatal("new episode did not rearm")
+	}
+}
+
+// These spies prove persistence and PublishNotification calls, not queue drain or link resolution.
+type m2NotificationStore struct {
+	notifysvc.Store
+	rows   []store.InsertNotificationParams
+	pruned []uuid.UUID
+}
+
+func (s *m2NotificationStore) InsertNotification(_ context.Context, p store.InsertNotificationParams) (store.Notification, error) {
+	s.rows = append(s.rows, p)
+	return store.Notification{ID: uuid.New(), UserID: p.UserID, Kind: p.Kind, Payload: p.Payload}, nil
+}
+func (s *m2NotificationStore) PruneNotificationsForUser(_ context.Context, p store.PruneNotificationsForUserParams) (int64, error) {
+	s.pruned = append(s.pruned, p.UserID)
+	return 0, nil
+}
+
+type m2Slacker struct {
+	t       *testing.T
+	store   *m2NotificationStore
+	users   []uuid.UUID
+	renders []notifysvc.SlackRender
+}
+
+func (s *m2Slacker) PublishNotification(uid uuid.UUID, r notifysvc.SlackRender) {
+	if len(s.store.rows) != len(s.users)+1 || s.store.rows[len(s.users)].UserID != uid {
+		s.t.Fatal("publish before matching persistence")
+	}
+	s.users = append(s.users, uid)
+	s.renders = append(s.renders, r)
+}
+func TestEpisodeNoticeM2RealNotifyAddressing(t *testing.T) {
+	a, b := uuid.New(), uuid.New()
+	for _, membership := range []struct {
+		name   string
+		admins []uuid.UUID
+	}{{"none", nil}, {"A", []uuid.UUID{a}}, {"B", []uuid.UUID{b}}, {"both", []uuid.UUID{a, b}}} {
+		for _, id := range []string{"db", "controller.report", "loops", "fleet.roll", "queue.waiting", "fleet.capacity"} {
+			// Owner labels are informational: these health checks aggregate owners and carry no owner UUID.
+			owners := []string{""}
+			ownerOnly := id == "queue.waiting" || id == "fleet.capacity"
+			if ownerOnly {
+				owners = []string{"A", "B"}
+			}
+			for _, owner := range owners {
+				t.Run(membership.name+"/"+id+"/owner"+owner, func(t *testing.T) {
+					ns := &m2NotificationStore{}
+					sl := &m2Slacker{t: t, store: ns}
+					st := &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: uuid.New(), admins: membership.admins}
+					ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{dangerCheckDTO(id, id, "danger")}}}
+					r := NewEpisodeReconciler(ev, st, notifysvc.New(ns, sl, 0, nil), &fakeEpisodeSettings{enabled: true}, nil)
+					r.Reconcile(context.Background())
+					if len(ns.rows) != 0 || len(sl.users) != 0 || len(ns.pruned) != 0 {
+						t.Fatal("opener persisted/published/pruned")
+					}
+					r.Reconcile(context.Background())
+					r.Reconcile(context.Background())
+					want := membership.admins
+					if ownerOnly {
+						want = nil
+					}
+					if len(ns.rows) != len(want) || !reflect.DeepEqual(sl.users, want) || !reflect.DeepEqual(ns.pruned, want) {
+						t.Fatalf("rows=%v publish=%v prune=%v want admins=%v", ns.rows, sl.users, ns.pruned, want)
+					}
+					for i, uid := range want {
+						row := ns.rows[i]
+						if row.UserID != uid || row.Kind != KindHealthEpisode || row.RunID.Valid || row.ReviewID.Valid {
+							t.Fatalf("row=%+v", row)
+						}
+						var payload struct {
+							Checks    []dangerCheck `json:"checks"`
+							Body      string        `json:"body"`
+							EpisodeID string        `json:"episode_id"`
+						}
+						if err := json.Unmarshal(row.Payload, &payload); err != nil {
+							t.Fatal(err)
+						}
+						if !reflect.DeepEqual(payload.Checks, []dangerCheck{{id, id, "danger"}}) || payload.Body != sl.renders[i].Body || payload.EpisodeID != st.open.ID.String() {
+							t.Fatalf("payload=%+v", payload)
+						}
+						if sl.renders[i].DeliveryID != uuid.Nil {
+							t.Fatal("unexpected durable delivery")
+						}
+					}
+				})
+			}
+		}
 	}
 }
 

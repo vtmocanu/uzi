@@ -3,7 +3,6 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,12 +30,15 @@ type workerFindingsStore struct {
 	inserted *store.InsertFindingParams
 	disp     *store.UpsertOpenDispositionParams
 
-	// Disposition outcome knobs (default zero = a fresh `open` insert → notify). Set
+	// Disposition outcome knobs (default zero = a fresh open insert). Set
 	// upsertErr=pgx.ErrNoRows with reopenRows=0/updateRows=0 to model the SUPPRESSED
-	// matching-hash re-report on a resolved coordinate (notify=false).
-	upsertErr  error
-	reopenRows int64
-	updateRows int64
+	// matching-hash re-report on a resolved coordinate.
+	upsertErr     error
+	reopenRows    int64
+	updateRows    int64
+	reopenCalls   int
+	refreshCalls  int
+	evidenceCount int
 }
 
 func (s *workerFindingsStore) GetRunByIDForUser(_ context.Context, arg store.GetRunByIDForUserParams) (store.Run, error) {
@@ -50,6 +52,7 @@ func (s *workerFindingsStore) CountFindingsForRun(context.Context, uuid.UUID) (i
 }
 func (s *workerFindingsStore) InsertFinding(_ context.Context, arg store.InsertFindingParams) (store.IncidentalFinding, error) {
 	s.inserted = &arg
+	s.evidenceCount++
 	return store.IncidentalFinding{
 		ID: uuid.New(), RunID: arg.RunID, UserID: arg.UserID, RepoID: arg.RepoID,
 		Location: arg.Location, Title: arg.Title, DescriptionMd: arg.DescriptionMd,
@@ -64,9 +67,11 @@ func (s *workerFindingsStore) UpsertOpenDisposition(_ context.Context, arg store
 	return store.FindingDisposition{}, nil // a fresh open row was inserted
 }
 func (s *workerFindingsStore) ReopenDispositionOnHashMismatch(context.Context, store.ReopenDispositionOnHashMismatchParams) (int64, error) {
+	s.reopenCalls++
 	return s.reopenRows, nil
 }
 func (s *workerFindingsStore) UpdateDispositionLastTitle(context.Context, store.UpdateDispositionLastTitleParams) (int64, error) {
+	s.refreshCalls++
 	return s.updateRows, nil
 }
 
@@ -189,96 +194,82 @@ func manyLabels(n int) string {
 	return string(b)
 }
 
-// notifyingSpyStore is a notifysvc.Store that records the InsertNotification calls the M3
-// coalescing path makes, so the handler test can assert WorkerCreateFinding fires the
-// notification when the finding opened/re-opened a coordinate and stays silent when it was
-// suppressed. FindNotificationForRunKind always reports "no coalescible row" so the
-// first (and only) finding takes the insert-and-DM branch. insertErr lets a test prove the
-// notification failing does not fail the 200.
+// notifyingSpyStore records notification inserts so capture tests can prove silence.
 type notifyingSpyStore struct {
-	inserts   int
-	insertErr error
+	inserts int
 }
 
 func (s *notifyingSpyStore) InsertNotification(_ context.Context, arg store.InsertNotificationParams) (store.Notification, error) {
 	s.inserts++
-	if s.insertErr != nil {
-		return store.Notification{}, s.insertErr
-	}
 	return store.Notification{ID: uuid.New(), UserID: arg.UserID, Kind: arg.Kind, Payload: arg.Payload}, nil
 }
 func (s *notifyingSpyStore) PruneNotificationsForUser(context.Context, store.PruneNotificationsForUserParams) (int64, error) {
 	return 0, nil
 }
-func (s *notifyingSpyStore) FindNotificationForRunKind(context.Context, store.FindNotificationForRunKindParams) (store.Notification, error) {
-	return store.Notification{}, pgx.ErrNoRows
-}
-func (s *notifyingSpyStore) UpdateNotificationPayload(_ context.Context, arg store.UpdateNotificationPayloadParams) (store.Notification, error) {
-	return store.Notification{ID: arg.ID, UserID: arg.UserID, Payload: arg.Payload}, nil
-}
 
-func newNotifyingWorkerHandler(st workersvc.Store, ns *notifyingSpyStore) *Handler {
+func newNotifyingWorkerHandler(st workersvc.Store, ns *notifyingSpyStore, slack *findingSlackerSpy) *Handler {
 	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{})}
-	h.SetNotifier(notifysvc.New(ns, nil, 0, nil))
+	h.SetNotifier(notifysvc.New(ns, slack, 0, nil))
 	return h
 }
 
-func TestWorkerCreateFindingFiresNotificationWhenOpened(t *testing.T) {
-	uid, repoID := uuid.New(), uuid.New()
-	run := findingRun(uid, repoID)
-	st := &workerFindingsStore{userID: uid, run: run} // fresh open insert → notify
-	ns := &notifyingSpyStore{}
-	h := newNotifyingWorkerHandler(st, ns)
-	wkr := store.Worker{ID: uuid.New(), UserID: uid}
+type findingSlackerSpy struct{ publishes int }
 
-	body := `{"title":"Leaked ticker","description":"sweepLoop never Stops it","location":"a/b.go#f"}`
-	rec := httptest.NewRecorder()
-	h.WorkerCreateFinding(rec, workerChatReq(http.MethodPost, "/api/worker/runs/x/findings", wkr, run.ID, body))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("create finding = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
-	if ns.inserts != 1 {
-		t.Errorf("a newly-opened coordinate must fire exactly one notification, got %d", ns.inserts)
-	}
-}
+func (s *findingSlackerSpy) PublishNotification(uuid.UUID, notifysvc.SlackRender) { s.publishes++ }
 
-func TestWorkerCreateFindingSuppressedDoesNotNotify(t *testing.T) {
-	uid, repoID := uuid.New(), uuid.New()
-	run := findingRun(uid, repoID)
-	// Suppressed: the coordinate already exists (upsert conflict), the re-open matches 0
-	// rows (identical hash) and the open-only refresh matches 0 (resolved) → notify=false.
-	st := &workerFindingsStore{userID: uid, run: run, upsertErr: pgx.ErrNoRows, reopenRows: 0, updateRows: 0}
-	ns := &notifyingSpyStore{}
-	h := newNotifyingWorkerHandler(st, ns)
-	wkr := store.Worker{ID: uuid.New(), UserID: uid}
-
-	body := `{"title":"Leaked ticker","description":"sweepLoop never Stops it","location":"a/b.go#f"}`
-	rec := httptest.NewRecorder()
-	h.WorkerCreateFinding(rec, workerChatReq(http.MethodPost, "/api/worker/runs/x/findings", wkr, run.ID, body))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("suppressed capture must still return 200 (the evidence is stored); got %d, body=%s", rec.Code, rec.Body.String())
-	}
-	if ns.inserts != 0 {
-		t.Errorf("a suppressed matching-hash re-report must NOT notify (anti-nag, R2), got %d inserts", ns.inserts)
-	}
-}
-
-func TestWorkerCreateFindingNotificationFailureDoesNotFail200(t *testing.T) {
-	uid, repoID := uuid.New(), uuid.New()
-	run := findingRun(uid, repoID)
-	st := &workerFindingsStore{userID: uid, run: run}
-	ns := &notifyingSpyStore{insertErr: errors.New("notifications store down")}
-	h := newNotifyingWorkerHandler(st, ns)
-	wkr := store.Worker{ID: uuid.New(), UserID: uid}
-
-	body := `{"title":"Leaked ticker","description":"sweepLoop never Stops it","location":"a/b.go#f"}`
-	rec := httptest.NewRecorder()
-	h.WorkerCreateFinding(rec, workerChatReq(http.MethodPost, "/api/worker/runs/x/findings", wkr, run.ID, body))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("a notification failure must not fail the capture; got %d, body=%s", rec.Code, rec.Body.String())
-	}
-	if st.inserted == nil {
-		t.Error("the finding must still be durably stored even when the notification fails")
+func TestWorkerCreateFindingCaptureSilent(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		conflict        bool
+		reopen, refresh int64
+		reports         int
+	}{
+		{"fresh", false, 0, 0, 1},
+		{"open", true, 0, 1, 1},
+		{"repeated_same_run", false, 0, 1, 2},
+		{"reopened", true, 1, 0, 1},
+		{"suppressed", true, 0, 0, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			uid, repoID := uuid.New(), uuid.New()
+			run := findingRun(uid, repoID)
+			st := &workerFindingsStore{userID: uid, run: run, reopenRows: tc.reopen, updateRows: tc.refresh}
+			if tc.conflict {
+				st.upsertErr = pgx.ErrNoRows
+			}
+			ns, slack := &notifyingSpyStore{}, &findingSlackerSpy{}
+			h := newNotifyingWorkerHandler(st, ns, slack)
+			for i := 0; i < tc.reports; i++ {
+				reportFinding(t, h, uid, run.ID, "Leaked ticker", "sweepLoop never Stops it", "./a/B.go#F")
+				if st.inserted == nil || st.inserted.Location != "a/b.go#f" || st.inserted.Title != "Leaked ticker" || st.inserted.DescriptionMd != "sweepLoop never Stops it" || st.inserted.RunID != run.ID || st.inserted.UserID != uid || st.inserted.RepoID != repoID {
+					t.Fatalf("capture lost evidence: %+v", st.inserted)
+				}
+				if st.disp == nil || st.disp.Location != "a/b.go#f" || len(st.disp.ContentHash) != 64 {
+					t.Fatalf("capture lost disposition: %+v", st.disp)
+				}
+				st.upsertErr = pgx.ErrNoRows
+			}
+			wantConflict := tc.reports
+			if !tc.conflict {
+				wantConflict--
+			}
+			if st.evidenceCount != tc.reports || st.reopenCalls != wantConflict {
+				t.Errorf("evidence=%d reopen=%d, want %d/%d", st.evidenceCount, st.reopenCalls, tc.reports, wantConflict)
+			}
+			wantRefresh := wantConflict
+			if tc.reopen == 1 {
+				wantRefresh = 0
+			}
+			if st.refreshCalls != wantRefresh {
+				t.Errorf("refresh=%d want %d", st.refreshCalls, wantRefresh)
+			}
+			if ns.inserts != 0 {
+				t.Errorf("capture inserted %d notifications, want zero", ns.inserts)
+			}
+			if slack.publishes != 0 {
+				t.Errorf("capture published %d Slack notifications, want zero", slack.publishes)
+			}
+		})
 	}
 }
 

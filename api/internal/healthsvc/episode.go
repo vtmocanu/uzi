@@ -162,6 +162,11 @@ func (r *EpisodeReconciler) Reconcile(ctx context.Context) {
 // Best-effort throughout: one admin's claim/notify/release error is logged and never aborts
 // the rest.
 func (r *EpisodeReconciler) notifyAdmins(ctx context.Context, episodeID uuid.UUID, doc Doc) {
+	danger := dangerChecks(doc)
+	if len(danger) == 0 {
+		return
+	}
+
 	enabled, err := r.settings.HealthEnabled(ctx)
 	if err != nil {
 		r.logger.Error("health episode: read health_enabled", "error", err)
@@ -183,7 +188,6 @@ func (r *EpisodeReconciler) notifyAdmins(ctx context.Context, episodeID uuid.UUI
 	// The notice body is composed ONCE from the danger checks at this moment (their
 	// already-sanitized, server-authored titles/summaries from Evaluate — D7, no raw
 	// untrusted text). Only the per-admin UserID differs.
-	danger := dangerChecks(doc)
 	base, _ := r.settings.PublicBaseURL(ctx) // empty on error ⇒ the notice simply omits the deep link
 
 	for _, uid := range admins {
@@ -244,13 +248,18 @@ type dangerCheck struct {
 	Summary string `json:"summary"`
 }
 
-// dangerChecks pulls the danger checks out of the evaluated document, in the registry's
-// stable order. Every field is server-authored and already sanitized by Evaluate, so the
-// notice interpolates nothing raw.
+// dangerChecks selects instance danger checks for notices in Doc.Checks order.
+// The positive allowlist excludes owner checks and future IDs; it does not change
+// the overall status used by Reconcile to open and close episodes. Every field is
+// server-authored and already sanitized by Evaluate.
 func dangerChecks(doc Doc) []dangerCheck {
 	var out []dangerCheck
 	for _, c := range doc.Checks {
-		if c.Severity == sevDanger {
+		if c.Severity != sevDanger {
+			continue
+		}
+		switch c.ID {
+		case "db", "controller.report", "loops", "fleet.roll":
 			out = append(out, dangerCheck{ID: c.ID, Title: c.Title, Summary: c.Summary})
 		}
 	}
@@ -315,7 +324,7 @@ func healthEpisodeCheckLines(danger []dangerCheck) string {
 // notice BODY instead, where the notifier's SlackMrkdwn render neutralizes it. The count is a
 // server-computed int, so its `*bold*` chip is intended and injection-free — Facts must be CLOSED
 // per notifysvc's contract, matching custody_episode's counts-only Facts. len(danger) >= 1 in
-// practice: the reconciler reaches here only when the overall status is danger.
+// practice: notifyAdmins returns before building a notice if dangerChecks is empty.
 func healthEpisodeFacts(danger []dangerCheck) []string {
 	noun := "checks"
 	if len(danger) == 1 {

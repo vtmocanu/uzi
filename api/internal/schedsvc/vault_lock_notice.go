@@ -28,7 +28,7 @@ import (
 
 // KindVaultLocked is the notifications.kind for the vault-lock notice (PRD #890 M2).
 // kind is a generic text column with no CHECK, so this needs no migration — it is a
-// free-text discriminator, defined here for symmetry with notifysvc.KindIncidentalFinding.
+// free-text discriminator for the vault-lock notice.
 const KindVaultLocked = "vault_locked"
 
 // VaultLockReconciler sends the one-per-episode vault-lock Slack notice. It holds the

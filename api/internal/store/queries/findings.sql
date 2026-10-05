@@ -1,7 +1,6 @@
--- Incidental-findings queries (PRD #333). The FULL query set lands in M1 so no later
--- milestone regenerates the sqlc foundation (Parallelization plan, R10): the capture path
--- (M2), the notification coalescing (M3), the backlog read (M4) and the filing/dismissal
--- forge-write (M5) all draw from here. Two tables: `findings` is per-run evidence,
+-- Incidental-findings queries (PRD #333). Capture, backlog reads and filing/dismissal
+-- share this query set. Findings capture sends no notification (issue #2271).
+-- Two tables: `findings` is per-run evidence,
 -- `finding_dispositions` is the coordinate-keyed (user_id, repo_id, location) lifecycle.
 -- See 00129_incidental_findings.sql for the table rationale and decision references.
 --

@@ -2,7 +2,7 @@
 -- The table is generic (kind + payload jsonb) so any producer can record an event
 -- without a schema change. Nothing reads it back to a user any more: it is a pruned,
 -- write-only event log (not a durable audit log; PruneNotificationsForUser caps it per
--- user) plus the per-run incidental-finding Slack DM latch (FindNotificationForRunKind).
+-- user).
 -- The read_at column stays in the schema but nothing sets or reads it.
 -- Exception (issue #1675): durable halt kinds carry a stored Slack render in slack_render
 -- and are read back by the Slack redelivery sweep (ClaimPendingSlackNotifications), so
@@ -53,39 +53,6 @@ WHERE n.user_id = @user_id
           LIMIT @keep
       ) AS keep_row
   );
-
--- ── PRD #333 Incidental Findings: the per-run finding coalescing plumbing (D6) ──
--- notifysvc.Notify is INSERT-only, so "N findings on one run → one Slack DM" needs the
--- lookup + payload bump below.
-
--- name: FindNotificationForRunKind :one
--- Find the coalescing latch row for a (user, run, kind): the newest notification of this
--- kind anchored to this run. notifysvc.NotifyIncidentalFinding calls this for each
--- finding: a hit means bump the existing row's payload count (below) with NO new Slack
--- DM; a miss (pgx.ErrNoRows) means this is the run's first finding, so insert and fire
--- one Slack DM. Scoped to the caller and their run. Read state is deliberately ignored
--- (PRD #1650 D4): nothing marks a row read any more, and a row read before the inbox was
--- retired must still latch. Best-effort, not exactly-once: the per-user prune can evict
--- the latch row during a long run, and two concurrent first findings can both miss.
-SELECT * FROM notifications
-WHERE user_id = @user_id
-  AND run_id = @run_id::uuid
-  AND kind = @kind
-ORDER BY created_at DESC, id DESC
-LIMIT 1;
-
--- name: UpdateNotificationPayload :one
--- Bump a coalesced notification's payload without re-firing Slack (D6). The caller
--- rewrites payload.count (and finding_ids) on the row FindNotificationForRunKind returned,
--- so the event log records "Run #N flagged M findings" while the Slack DM fired once, on
--- the first finding. RETURNING * so the caller can echo the updated row. The
--- (id, user_id) match is defense-in-depth: the caller always passes the row
--- FindNotificationForRunKind returned for this same user, so a foreign id can never be
--- updated even if a caller is ever wired to pass an untrusted id.
-UPDATE notifications
-SET payload = @payload
-WHERE id = @id AND user_id = @user_id
-RETURNING *;
 
 -- ── Issue #1675: durable Slack delivery for halt DMs ──
 

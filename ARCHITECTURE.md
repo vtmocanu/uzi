@@ -1009,8 +1009,9 @@ chain in the diagram above, with no intervening `running`.
   glyph; every other failed run, plan rejections and an escalated or no-live-worker auto-stop
   included, posts a ❌ Failed message with its reason. The DM is not gated on `stop_kind`.
   The `notifications` table itself is not gone (PRD #1650): it stays as a
-  pruned (200 rows/user), write-only event log and the incidental-finding
-  Slack de-dup latch (`notifysvc.Notify`). One exception (#1675): the two halt
+  pruned (200 rows/user), write-only event log (`notifysvc.Notify`). Incidental
+  findings no longer send Slack DMs or create new latch rows (#2271); existing
+  rows remain subject to pruning. One exception (#1675): the two halt
   DMs ("CI auto-fix stopped", "MR rework stopped") store their DM render in
   `notifications.slack_render` and are delivered at-least-once. The Slack drain
   marks a row delivered on a successful post, or terminally when the owner has
@@ -1327,7 +1328,9 @@ tool can never be mistaken for (or promoted into) a turn-ending signal. Full
 design rationale is in the PRD (`prds/done/333-incidental-findings.md`, especially
 its Decision Log); the durable seams are in
 [adr/0333-incidental-findings.md](adr/0333-incidental-findings.md); user-facing
-usage is [docs/findings.md](docs/findings.md).
+usage is [docs/findings.md](docs/findings.md). Capture, storage, listing,
+backlog, filing and dispositions are unchanged by #2271; findings appear in
+stream cards and the backlog without Slack DMs or new notification latch rows.
 
 - **Capture is worker→api, never worker→forge.** The tool posts to a
   `RequireWorker` endpoint the same way a chat proposal does; the worker holds
@@ -1682,6 +1685,10 @@ docker tier's own privileged-namespace ruling (Q-B) and Decision 3's
 separate-mount-namespace invariant are recorded in
 `prds/done/83-docker-capable-worker.md`.
 
+New persistent and ephemeral workers default to the large preset. The decision,
+capacity cost, and preservation of existing stored sizes are recorded in
+[ADR-2240](adr/2240-hosted-worker-default-size.md).
+
 **Codex on a hosted worker needs a third identity, and that is opt-in.** The
 restricted-tier namespace above starts every worker single-uid, which is one
 identity short of what the Codex harness's fail-closed launcher requires (a
@@ -1889,8 +1896,8 @@ Docker-only ReplicaSet-list permission, bounded observations and upgrade policy.
 ### Admin in-app health (PRD #1484)
 
 An admin-only, read-only Health tab, Overview card, app-wide Danger banner (with a
-per-admin 1h snooze), `uzi admin health`, and a per-admin danger-episode notice roll
-up a closed registry of checks over worker rolls/capacity, the queue, the
+per-admin 1h snooze) and `uzi admin health` roll up the full closed registry
+of checks over worker rolls/capacity, the queue, the
 controller's own liveness, background loops, the database, integrations, and
 housekeeping. It **never reads the Kubernetes API** — `api` stays credential-free,
 exactly as the worker controller section above requires — so every
@@ -1900,6 +1907,19 @@ pods themselves stays out of scope, owned by cluster monitoring. See
 [PRD #1484](prds/1484-admin-health-tab.md) and
 [ADR-1484](adr/1484-in-app-health-boundary.md) for the checks, the boundary
 rationale, and the deferred items (version skew, per-connection sync freshness).
+
+Admin danger-episode notices (#2271) select only checks at `danger` with the
+literal IDs `db`, `controller.report`, `loops`, and `fleet.roll`. The maintainer
+classifies `fleet.roll` as instance infrastructure even for a single owner's
+workers. Owner checks (`queue.waiting`, `fleet.capacity`, `queue.undispatched`)
+and future nonallowlisted IDs cannot trigger an admin DM or enter its check
+list. Episode opening, closing, the two-tick debounce, banner and snooze still
+follow overall status. Owner-only danger opens or holds an episode without
+claiming an admin notice; later instance danger sends on its first tick in that
+open episode. Once notified, another instance failure cannot renotify while
+owner danger holds it open; overall recovery rearms. Owner run-health DMs,
+including `waiting_worker` capability reasons, retain their existing routing.
+See [docs/admin-health.md](docs/admin-health.md) for the notice contract.
 
 Issue-sync failure streaks have shipped as `forge.sync`
 ([#2203](https://github.com/vtmocanu/uzi/issues/2203)), separate from deferred

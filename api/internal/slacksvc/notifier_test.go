@@ -872,6 +872,88 @@ func TestNotifierHealthDropsOptedOutMidRun(t *testing.T) {
 	}
 }
 
+// UUID-sensitive delivery prevents the shared fake's constant target from masking owner leaks.
+type m2OwnerStore struct {
+	*fakeNotifStore
+	targets   map[uuid.UUID]string
+	requested []uuid.UUID
+}
+
+func (s *m2OwnerStore) GetSlackDeliveryForUser(_ context.Context, uid uuid.UUID) (pgtype.Text, error) {
+	s.requested = append(s.requested, uid)
+	target, ok := s.targets[uid]
+	if !ok {
+		return pgtype.Text{}, pgx.ErrNoRows
+	}
+	return txt(target), nil
+}
+
+type m2OwnerPoster struct {
+	*fakePoster
+	recipients []string
+	channels   map[string]string
+}
+
+func (p *m2OwnerPoster) OpenDM(_ context.Context, recipient string) (string, error) {
+	p.recipients = append(p.recipients, recipient)
+	ch, ok := p.channels[recipient]
+	if !ok {
+		return "", errors.New("unexpected Slack recipient")
+	}
+	return ch, nil
+}
+func TestNotifierHealthM2WaitingWorkerOwnerRouting(t *testing.T) {
+	testNotifierHealthM2OwnerRouting(t, "no online worker can run this — it needs a capability none of your workers has; provision a capable worker")
+}
+
+func TestNotifierHealthM2NoWorkerOwnerRouting(t *testing.T) {
+	testNotifierHealthM2OwnerRouting(t, "no worker is online to pick up this run")
+}
+
+// This matrix complements TestEpisodeNoticeM2RealNotifyAddressing's health ListAdmins test.
+// handleHealth has no admin dependency: both owners have Slack targets for every admin membership.
+func testNotifierHealthM2OwnerRouting(t *testing.T, reason string) {
+	t.Helper()
+	a, b := uuid.New(), uuid.New()
+	for _, membership := range []string{"none", "A", "B", "both"} {
+		for _, owner := range []struct {
+			name               string
+			id                 uuid.UUID
+			recipient, channel string
+		}{{"A", a, "UA", "DA"}, {"B", b, "UB", "DB"}} {
+			t.Run(membership+"/owner"+owner.name, func(t *testing.T) {
+				targets := map[uuid.UUID]string{a: "UA", b: "UB"}
+				rc := healthRun("queued", "waiting_worker")
+				rc.UserID = owner.id
+				fs := &m2OwnerStore{fakeNotifStore: &fakeNotifStore{rc: rc, msgErr: pgx.ErrNoRows}, targets: targets}
+				fp := &m2OwnerPoster{fakePoster: &fakePoster{}, channels: map[string]string{"UA": "DA", "UB": "DB"}}
+				n := NewNotifier(fs, fp, fixedBase, nil)
+				n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: "waiting_worker", reason: reason, nudge: true})
+				if len(fs.requested) != 1 || fs.requested[0] != owner.id {
+					t.Fatalf("lookup UUIDs=%v want [%s]", fs.requested, owner.id)
+				}
+				if len(fp.recipients) != 1 || fp.recipients[0] != owner.recipient {
+					t.Fatalf("OpenDM recipients=%v", fp.recipients)
+				}
+				if len(fp.blocks) != 2 {
+					t.Fatalf("posts=%+v want root and nudge", fp.blocks)
+				}
+				for _, post := range fp.blocks {
+					if post.channel != owner.channel {
+						t.Fatalf("posted to %s want %s", post.channel, owner.channel)
+					}
+				}
+				if fp.blocks[0].thread != "" || fp.blocks[1].thread == "" || !strings.Contains(fp.blocks[1].sectionText, reason) {
+					t.Fatalf("rendered nudge=%+v", fp.blocks[1])
+				}
+				if len(fs.upserted) != 1 || fs.upserted[0].ChannelID != owner.channel {
+					t.Fatalf("anchor=%+v", fs.upserted)
+				}
+			})
+		}
+	}
+}
+
 func TestNotifierHealthCreatesRootWhenAbsent(t *testing.T) {
 	rc := healthRun("queued", "waiting_worker")
 	fs := &fakeNotifStore{rc: rc, delivery: txt("U1"), msgErr: pgx.ErrNoRows}
