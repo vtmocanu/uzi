@@ -650,6 +650,36 @@ func (m tuiModel) workerFleetTitleLines(title string) []string {
 	return []string{clampVisual(title, m.width), clampVisual(status, m.width)}
 }
 
+const (
+	workerCPUWidth       = 5  // includes the stale prefix in ~100%
+	workerDiskWidth      = 19 // stale prefix, eight-cell label, four-cell bar, 100%
+	workerMemoryMinWidth = 9  // includes ~12.0/16G
+)
+
+func workerMemoryText(w apitypes.WorkerDTO) string {
+	if w.StatsMemBytes == nil {
+		return "?"
+	}
+	used := float64(*w.StatsMemBytes) / (1 << 30)
+	if w.StatsMemLimitBytes != nil && *w.StatsMemLimitBytes > 0 {
+		return fmt.Sprintf("%.1f/%.0fG", used, float64(*w.StatsMemLimitBytes)/(1<<30))
+	}
+	return fmt.Sprintf("%.1fG", used)
+}
+func (m tuiModel) workerMemoryWidth() int {
+	width := workerMemoryMinWidth
+	if m.workers.admin == m.board.admin {
+		for _, r := range m.workers.visible(time.Now()) {
+			text := workerMemoryText(r.w)
+			if workerState(r) == "offline" {
+				text = "~" + text
+			}
+			width = max(width, visualWidth(text))
+		}
+	}
+	return width
+}
+
 // Keep one shared version width for the header and every filtered row.
 func (m tuiModel) workerVersionWidth(width int) int {
 	wanted := 8
@@ -662,9 +692,10 @@ func (m tuiModel) workerVersionWidth(width int) int {
 			wanted = max(wanted, visualWidth(m.renderer.Plain(workerTextOf(row).workerVersion, 18))+marker)
 		}
 	}
-	// Other columns and separators consume 80 cells (88 in factory scope).
+	// Cursor, name, state, kind, runs, resource cells, heartbeat, ten separators,
+	// and one attention glyph; factory scope adds owner plus its separator.
 	// Leave at least a glyph and a compact attention-count suffix visible.
-	fixed := 80
+	fixed := 1 + 13 + 10 + 9 + 4 + workerCPUWidth + m.workerMemoryWidth() + workerDiskWidth + 3 + 11
 	if m.board.admin {
 		fixed += 8
 	}
@@ -690,18 +721,13 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int) string {
 	state := workerState(r)
 	fields = append(fields, cell(workerStateGlyph(state)+" "+state, 10, m.workerStateColor(state)), cell(m.workerKind(r), 9, m.pal.faintC), cell(workerSlots(r.w), 4, nil))
 	if width >= 120 {
-		cpu, mem, disk := "?", "?", "?"
+		cpu, disk := "?", "?"
 		var cpuC, diskC color.Color
 		if r.w.StatsCPUPct != nil {
 			cpu = fmt.Sprintf("%3.0f%%", *r.w.StatsCPUPct)
 			cpuC = m.workerUsageColor(*r.w.StatsCPUPct)
 		}
-		if r.w.StatsMemBytes != nil {
-			mem = fmt.Sprintf("%.1fG", float64(*r.w.StatsMemBytes)/(1<<30))
-			if r.w.StatsMemLimitBytes != nil && *r.w.StatsMemLimitBytes > 0 {
-				mem = fmt.Sprintf("%.1f/%.0fG", float64(*r.w.StatsMemBytes)/(1<<30), float64(*r.w.StatsMemLimitBytes)/(1<<30))
-			}
-		}
+		mem := workerMemoryText(r.w)
 		worst := -1.0
 		for _, d := range workerDisks(r.w) {
 			if d.pct > worst {
@@ -712,7 +738,7 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int) string {
 		}
 		var memC color.Color
 		if state == "offline" {
-			cpu = "~" + cpu
+			cpu = "~" + strings.TrimSpace(cpu)
 			mem = "~" + mem
 			disk = "~" + ansi.Strip(disk)
 			cpuC = m.pal.faintC
@@ -730,7 +756,7 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int) string {
 			verC = m.pal.alarm
 		}
 		ver := clampVisual(m.renderer.Plain(t.workerVersion, versionWidth), max(0, versionWidth-visualWidth(marker))) + marker
-		fields = append(fields, cell(cpu, 4, cpuC), cell(mem, 7, memC), cell(disk, 18, diskC), cell(ver, versionWidth, verC), cell(workerAge(r.w.LastHeartbeatAt, now), 3, m.pal.faintC))
+		fields = append(fields, cell(cpu, workerCPUWidth, cpuC), cell(mem, m.workerMemoryWidth(), memC), cell(disk, workerDiskWidth, diskC), cell(ver, versionWidth, verC), cell(workerAge(r.w.LastHeartbeatAt, now), 3, m.pal.faintC))
 	}
 	items := workerAttention(r, now)
 	att := paintSeg(m.pal.faintC, bg, false, "—")
@@ -791,7 +817,7 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 	}
 	cols = append(cols, padVisual("STATE", 10), padVisual("KIND", 9), padVisual("RUNS", 4))
 	if width >= 120 {
-		cols = append(cols, padVisual("CPU", 4), padVisual("MEM", 7), padVisual("DISK (worst)", 18), padVisual("VERSION", m.workerVersionWidth(width)), padVisual("HB", 3))
+		cols = append(cols, padVisual("CPU", workerCPUWidth), padVisual("MEM", m.workerMemoryWidth()), padVisual("DISK (worst)", workerDiskWidth), padVisual("VERSION", m.workerVersionWidth(width)), padVisual("HB", 3))
 	}
 	cols = append(cols, "ATTENTION")
 	header := "  " + strings.Join(cols, " ")

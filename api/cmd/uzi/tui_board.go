@@ -632,7 +632,19 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 	if fullScreen {
 		sb.WriteString(clampVisual(m.boardFooterLine(), m.width))
 	}
-	return sb.String()
+	frame := sb.String()
+	if fullScreen {
+		if height <= 0 {
+			return ""
+		}
+		lines := strings.Split(frame, "\n")
+		if len(lines) > height {
+			// Headers can exceed the viewport at tiny heights. Keep the footer,
+			// while cropping the already capacity-budgeted body to its available rows.
+			return strings.Join(append(lines[:height-1], lines[len(lines)-1]), "\n")
+		}
+	}
+	return frame
 }
 
 // boardItem is one line of the board's display list: a band eyebrow, a run row, or a blank
@@ -893,9 +905,9 @@ func (m tuiModel) boardShowRunCred(r apitypes.RunListItemDTO) bool {
 // boardMeterLayout is the ONE per-frame snapshot of the header rate-limit meter line(s) (PRD 1519
 // M4). It decides — ONCE per frame, with ONE now — whether the Claude and Codex meters share a
 // single combined line or fall back to two, and returns the rendered line string(s). len(lines) is
-// the physical row count the meters occupy (0, 1, or 2). renderBoard draws lines and boardCapacityWith
-// reserves exactly len(lines) rows from the SAME snapshot, so the reserved chrome can never disagree
-// with what is drawn: a countdown/reset-in text can change visual width at a reset boundary between two
+// the physical row count the meters occupy (0, 1, or 2). Rendering and capacity combine this
+// SAME snapshot with the run summary, reserving any summary fallback row as well, so the
+// reserved chrome agrees with what is drawn: a countdown/reset-in text can change visual width at a reset boundary between two
 // now values and flip the combined-vs-split decision, so deriving the layout twice (two nows) is banned.
 type boardMeterLayout struct{ lines []string }
 
@@ -968,7 +980,7 @@ func (m tuiModel) boardCapacity() int {
 // boardCapacityWith is boardCapacity given the number of header meter rows the caller is drawing
 // (including any run-summary fallback). It counts the same chrome renderBoard draws: the wordmark
 // line, the blank below it, the footer (3), the meter rows, plus the optional adminDenied, error,
-// vault-hint, and selected-row second lines. At least one content line is always shown.
+// vault-hint, and selected-row second lines. Tiny full-screen viewports crop the body to keep the footer.
 func (m tuiModel) boardCapacityWith(meterLines int) int {
 	return m.boardCapacityAt(m.height, meterLines, true)
 }

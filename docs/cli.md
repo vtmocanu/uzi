@@ -1419,7 +1419,8 @@ are visual cues; DinD and inode readings are display-only.
 Press `enter` or `→` on a worker to open its full-screen detail. Below the tab
 strip, `worker ›` introduces its name, state, and kind; faint uptime and
 heartbeat share that line when they fit, otherwise appear below. Unknown
-uptime is omitted; offline workers show the last heartbeat age.
+uptime and heartbeat values are omitted; offline workers with a heartbeat
+show its age.
 The lowercase sections are `attention`, `reported runs`, `resources`, and
 `configuration`. Attention explains upgrade failures, unpublished-work holds,
 outbox queues, and pending outcomes. Reported runs show issue/title and engine
@@ -1434,7 +1435,8 @@ ink, 75–89% uses warning colour, and 90% or more uses alarm colour. Offline
 readings remain faint. DinD and inode readings are display-only. The largest
 reported HOME appears on one line with its sample age and `≥` for a truncated
 measurement (a lower bound). Configuration shows version and upgrade target,
-capabilities, declared template and any reported drift, effective token mode,
+capabilities (`none` when empty), declared template and any reported drift,
+effective token mode,
 kind, and ephemeral lease. Reported runs do not establish an ephemeral
 worker's binding.
 

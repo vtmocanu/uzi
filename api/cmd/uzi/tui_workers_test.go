@@ -76,7 +76,6 @@ func TestWorkersLegendHelpAndVersionBudget(t *testing.T) {
 	m := workersScene(true, "workers-factory")
 	r := m.workers.rows[0]
 	r.w.Version = sp(strings.Repeat("界", 30))
-	m.workers.rows = []workerRow{r}
 	r.w.UpgradeStatus = "upgrade_failed"
 	r.w.OutboxBlocked = sp("blocked")
 	m.workers.rows = []workerRow{r}
@@ -87,7 +86,7 @@ func TestWorkersLegendHelpAndVersionBudget(t *testing.T) {
 	// Wide glyphs must fit the capped eighteen-column version cell, including its marker.
 	versionCell := strings.Repeat("界", 8) + "…✕"
 	at := strings.Index(line, versionCell)
-	if at < 0 || visualWidth(line[:at]) != 82 || strings.Contains(line, strings.Repeat("界", 9)) {
+	if at < 0 || visualWidth(line[:at]) != 86 || strings.Contains(line, strings.Repeat("界", 9)) {
 		t.Fatalf("version cell moved or exceeded its visual budget: %q", line)
 	}
 	if strings.Contains(stripANSI(m.renderWorkers()), "fixed visual cue") {

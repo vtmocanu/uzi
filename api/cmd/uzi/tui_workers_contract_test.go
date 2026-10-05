@@ -76,32 +76,37 @@ func TestWorkersApprovedMissingFloorWorker(t *testing.T) {
 }
 
 func TestWorkersApprovedRunIDCells(t *testing.T) {
-	m := workerRenderModel(true)
-	id := "界😀界😀界😀\x1b[31mBAD\x07"
-	w := &m.workers.rows[0].w
-	w.ReportedRuns = []apitypes.WorkerReportedRunDTO{{RunID: id, Phase: "running"}}
-	w.RunDisk = []apitypes.WorkerRunDiskDTO{{RunID: id, SampledAt: time.Now()}}
-	lines, _ := m.workerDetailLines(time.Now())
-	out := strings.Join(lines, "\n")
-	assertNoRawControls(t, "reported/run-disk IDs", out)
-	clean := stripANSI(out)
-	if !utf8.ValidString(clean) || strings.ContainsRune(clean, '\uFFFD') {
-		t.Fatalf("split rune: %q", clean)
-	}
-	expected := clampVisual(m.renderer.Plain(id, m.width), 8)
-	runLine, diskLine := "", ""
-	for _, line := range strings.Split(clean, "\n") {
-		if strings.Contains(line, "▌ ") {
-			runLine = line
-		}
-		if strings.Contains(line, "largest HOME") {
-			diskLine = line
-		}
-	}
-	for _, line := range []string{runLine, diskLine} {
-		if !strings.Contains(line, expected) || strings.Contains(line, "BAD") {
-			t.Errorf("ID must sanitise then truncate to 8 cells: %q want %q", line, expected)
-		}
+	for _, tc := range []struct{ name, id, want string }{
+		{"multibyte", "界😀界😀界😀BAD", "界😀界…"},
+		{"escape before cut", "\x1b[31mBAD界😀界😀", "[31mBAD…"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := workerRenderModel(true)
+			w := &m.workers.rows[0].w
+			w.ReportedRuns = []apitypes.WorkerReportedRunDTO{{RunID: tc.id, Phase: "running"}}
+			w.RunDisk = []apitypes.WorkerRunDiskDTO{{RunID: tc.id, SampledAt: time.Now()}}
+			lines, _ := m.workerDetailLines(time.Now())
+			out := strings.Join(lines, "\n")
+			assertNoRawControls(t, "reported/run-disk IDs", out)
+			clean := stripANSI(out)
+			if !utf8.ValidString(clean) || strings.ContainsRune(clean, '\uFFFD') {
+				t.Fatalf("split rune: %q", clean)
+			}
+			runLine, diskLine := "", ""
+			for _, line := range strings.Split(clean, "\n") {
+				if strings.Contains(line, "▌ ") {
+					runLine = line
+				}
+				if strings.Contains(line, "largest HOME") {
+					diskLine = line
+				}
+			}
+			for _, line := range []string{runLine, diskLine} {
+				if !strings.Contains(line, tc.want) {
+					t.Errorf("sanitise before cell truncation: %q want %q", line, tc.want)
+				}
+			}
+		})
 	}
 }
 
@@ -264,5 +269,75 @@ func TestWorkersApprovedDetailHeader(t *testing.T) {
 	lines, _ = m.workerDetailLines(now)
 	if !strings.Contains(stripANSI(lines[1]), "last heartbeat 3s ago") {
 		t.Fatal("offline heartbeat wording")
+	}
+}
+
+func TestWorkersStaleResourceCells(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		cpu    float64
+		used   int64
+		memory string
+	}{
+		{"online", 12, 12 << 30, "12.0/16G"},
+		{"offline", 12, 12 << 30, "~12.0/16G"},
+		{"offline", 100, 79 * (1 << 30) / 10, "~7.9/16G"},
+		{"offline", 100, 100 << 30, "~100.0/16G"},
+	} {
+		t.Run(fmt.Sprintf("%s/cpu=%.0f/memory=%s", tc.status, tc.cpu, tc.memory), func(t *testing.T) {
+			m := workersScene(true, "workers-list-120")
+			r := workerRow{w: apitypes.WorkerDTO{ID: "sample", Name: "sample", Status: tc.status, Kind: "hosted", Version: sp("0.85.1"), StatsCPUPct: &tc.cpu, StatsMemBytes: &tc.used, StatsMemLimitBytes: i64(16 << 30), StatsDiskDataBytes: i64(100), StatsDiskDataTotalBytes: i64(100)}}
+			m.workers.rows = []workerRow{r}
+			row := stripANSI(m.workerRowLine(r, true, 120))
+			cpu := fmt.Sprintf("%.0f%%", tc.cpu)
+			disk := "data     ▮▮▮▮ 100%"
+			if tc.status == "offline" {
+				cpu = "~" + cpu
+				disk = "~" + disk
+			}
+			for _, want := range []string{cpu, tc.memory, disk} {
+				if !strings.Contains(row, want) {
+					t.Errorf("lost resource reading %q: %s", want, row)
+				}
+			}
+			if visualWidth(row) > 120 {
+				t.Fatalf("resource row exceeds viewport: %s", row)
+			}
+		})
+	}
+}
+
+func TestFloorTinyMeterSummaryHeight(t *testing.T) {
+	for width := 40; width <= 58; width++ {
+		t.Run(itoa(width), func(t *testing.T) {
+			m := workersScene(true, "floor-fleet")
+			m.splitMode = "off"
+			m.width, m.height = width, 6
+			m.rateLimits = []apitypes.TokenRateLimitDTO{{Label: "account", IsDefault: true, Limits: apitypes.RateLimitDTO{Status: "ok"}}}
+			frame := stripANSI(m.View().Content)
+			lines := strings.Split(frame, "\n")
+			if len(lines) > m.height {
+				t.Fatalf("floor at width %d overflows height %d with %d lines: %s", width, m.height, len(lines), frame)
+			}
+			if !strings.Contains(lines[len(lines)-1], "enter/→") {
+				t.Fatalf("footer lost: %s", frame)
+			}
+		})
+	}
+}
+
+func TestWorkerUnknownHeaderAndEmptyCapabilities(t *testing.T) {
+	m := workerRenderModel(true)
+	w := &m.workers.rows[0].w
+	w.LastHeartbeatAt = nil
+	w.OnlineSince = nil
+	w.Capabilities = nil
+	lines, _ := m.workerDetailLines(time.Now())
+	out := stripANSI(strings.Join(lines, "\n"))
+	if strings.Contains(stripANSI(lines[1]), "heartbeat") || strings.Contains(stripANSI(lines[1]), "up ?") {
+		t.Fatalf("unknown header timestamp displayed: %s", lines[1])
+	}
+	if !strings.Contains(out, "capabilities  none") {
+		t.Fatalf("empty capabilities unclear: %s", out)
 	}
 }

@@ -227,13 +227,25 @@ func splitScene(dark bool, now time.Time, scene string) string {
 	return m.View().Content
 }
 
-var workerSceneNames = []string{"workers-list-120", "workers-list-80", "workers-factory", "workers-cordoned", "split-workers-top", "floor-fleet"}
+var workerSceneNames = []string{"workers-list-120", "workers-list-80", "workers-factory", "workers-cordoned", "split-workers-top", "floor-fleet", "workers-stale-stats"}
 
 var workerDetailSceneNames = []string{"worker-upgrade-failed", "worker-outcome-outbox", "worker-holding"}
 
 // workersScene uses the shipped model and the interactive demo's client.
 func workersScene(dark bool, name string) tuiModel {
 	fake := newDemoClient()
+	if name == "workers-stale-stats" {
+		for i := range fake.Workers {
+			w := &fake.Workers[i]
+			if w.Name == "forge-small" {
+				w.StatsCPUPct = fPtr(100)
+				w.StatsMemBytes = i64(12 << 30)
+				w.StatsMemLimitBytes = i64(16 << 30)
+				w.StatsDiskDataBytes = i64(100)
+				w.StatsDiskDataTotalBytes = i64(100)
+			}
+		}
+	}
 	target := map[string]string{"worker-upgrade-failed": "forge-small", "worker-outcome-outbox": "forge-docker", "worker-holding": "recovery"}[name]
 	if target != "" {
 		// Scene-local samples keep the demo fleet's state and attention counts intact.

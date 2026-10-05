@@ -10,7 +10,7 @@ import (
 // The bounds include all three band headings and two inter-band spacers even
 // when the current list has fewer bands.
 const (
-	splitSharedChrome = 1 + 2 + 1 + 1 + 1 + 1 // fleet, wordmark, meters, vault, admin, error
+	splitSharedChrome = 1 + 1 + 2 + 1 + 1 + 1 + 1 // wordmark, fleet fallback, meters, summary fallback, vault, admin, error
 	splitBandHeadings = 3
 	splitBandSpacers  = splitBandHeadings - 1
 	splitFloorChrome  = 1 + 1 + splitBandHeadings + splitBandSpacers
@@ -18,7 +18,7 @@ const (
 	splitSeparator    = 1
 	splitFooter       = 1
 	splitRows         = 8
-	splitMinHeight    = splitSharedChrome + splitSeparator + splitFooter + 2*(splitForgeChrome+splitRows)
+	splitMinHeight    = splitSharedChrome + splitSeparator + splitFooter + splitFloorChrome + splitForgeChrome + 2*splitRows
 )
 
 func (m tuiModel) listView() bool {

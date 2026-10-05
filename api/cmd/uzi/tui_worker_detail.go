@@ -234,14 +234,21 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 	state := workerState(r)
 	header := m.pal.faint.Render("worker › ") + m.pal.title.Render(m.renderer.Plain(t.workerName, width)) + "  " + paintSeg(m.workerStateColor(state), nil, false, workerStateGlyph(state)+" "+state) + "  " + m.pal.faint.Render(m.workerKind(r))
 	lines := []string{m.tabStrip(m.board.admin, viewWorkers, false)}
-	heartbeat := "last heartbeat " + workerAge(w.LastHeartbeatAt, now) + " ago"
+	var timing []string
 	if w.Status == "online" {
-		heartbeat = "heartbeat " + workerAge(w.LastHeartbeatAt, now) + " ago"
 		if w.OnlineSince != nil {
-			heartbeat = "up " + workerUptime(w.OnlineSince, now) + " · " + heartbeat
+			timing = append(timing, "up "+workerUptime(w.OnlineSince, now))
 		}
+		if w.LastHeartbeatAt != nil {
+			timing = append(timing, "heartbeat "+workerAge(w.LastHeartbeatAt, now)+" ago")
+		}
+	} else if w.LastHeartbeatAt != nil {
+		timing = append(timing, "last heartbeat "+workerAge(w.LastHeartbeatAt, now)+" ago")
 	}
-	if visualWidth(header)+2+visualWidth(heartbeat) <= width {
+	heartbeat := strings.Join(timing, " · ")
+	if heartbeat == "" {
+		lines = append(lines, header)
+	} else if visualWidth(header)+2+visualWidth(heartbeat) <= width {
 		lines = append(lines, header+m.pal.faint.Render("  "+heartbeat))
 	} else {
 		lines = append(lines, header, "  "+m.pal.faint.Render(heartbeat))
@@ -363,7 +370,11 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 		ver += "  " + paintSeg(m.pal.alarm, nil, false, "✕ upgrade failed") + paintSeg(m.pal.stall, nil, false, " · target "+m.renderer.Plain(t.upgradeTarget, width))
 	}
 	kv("version", ver)
-	kv("capabilities", m.renderer.Plain(t.capabilityText, width))
+	capabilities := m.renderer.Plain(t.capabilityText, width)
+	if capabilities == "" {
+		capabilities = "none"
+	}
+	kv("capabilities", capabilities)
 	template := m.renderer.Plain(t.templateDeclared, width)
 	if w.TemplateDeclared != nil && w.TemplateReported != nil && *w.TemplateDeclared != *w.TemplateReported {
 		template += "  " + paintSeg(m.pal.stall, nil, false, "≠ reported "+m.renderer.Plain(t.templateReported, width))
