@@ -19,6 +19,7 @@ import {
   type CallbackResult,
   type CallbackRuntimeId,
 } from "../src/codex/broker.js";
+import { CodexUsageAccountant } from "../src/codex/token-accounting.js";
 import { renderCodexRun } from "../src/codex/render.js";
 import { CodexTurnFailedError } from "../src/codex/terminal-normalize.js";
 import { evidencesModelProcessing, type HarnessEvent, type HarnessItem, type HarnessTerminal, type RunTurnRequest } from "../src/harness.js";
@@ -287,14 +288,14 @@ function tokenUsage(
   last: Partial<CodexUsageBreakdown>,
   threadId = "th-1",
   turnId = "tn-1",
-): CodexNotification {
+): Extract<CodexNotification, { kind: "token_usage_updated" }> {
   return {
     kind: "token_usage_updated",
     method: "thread/tokenUsage/updated",
     threadId,
     turnId,
     usage: { total: bd(total), last: bd(last) },
-    params: { threadId, turnId },
+    params: { threadId, turnId, tokenUsage: { total: bd(total), last: bd(last) } },
   };
 }
 
@@ -363,6 +364,8 @@ function makeHarness(
     appServerAuth?: CodexAppServerAuthSession;
     credentialValue?: string;
     authMode?: CodexAppServerAuthMode;
+    accountant?: CodexUsageAccountant;
+    onTokenUsageIncomplete?: () => void | Promise<void>;
     scrubProjected?: (s: string) => string;
     idNonce?: string;
     log?: Logger;
@@ -384,6 +387,8 @@ function makeHarness(
     appServerAuth: opts.appServerAuth,
     credentialValue: opts.credentialValue,
     authMode: opts.authMode,
+    accountant: opts.accountant,
+    onTokenUsageIncomplete: opts.onTokenUsageIncomplete,
     scrubProjected: opts.scrubProjected,
     idNonce: opts.idNonce,
   });
@@ -435,6 +440,254 @@ function wedgeBroker(): { broker: CodexCallbackBroker; entered: Promise<void>; r
   });
   return { broker, entered, release };
 }
+
+// U1 resumed-claim accounting through completed turns, both credential modes.
+describe("CodexHarness: resumed usage evidence", () => {
+  const historical = { inputTokens: 300, cachedInputTokens: 60, outputTokens: 90, reasoningOutputTokens: 30, totalTokens: 390 };
+  const last = { inputTokens: 200, cachedInputTokens: 40, outputTokens: 60, reasoningOutputTokens: 20, totalTokens: 260 };
+  const next = { inputTokens: 600, cachedInputTokens: 120, outputTokens: 180, reasoningOutputTokens: 60, totalTokens: 780 };
+  const response = { inputTokens: 300, cachedInputTokens: 60, outputTokens: 90, reasoningOutputTokens: 30, totalTokens: 390 };
+  const replay = () => tokenUsage(historical, last, "resumed-1", "historical");
+  const terminal = (events: HarnessEvent[]) => {
+    const event = events.find(e => e.kind === "turn_finished");
+    assert.ok(event?.kind === "turn_finished");
+    return event.terminal;
+  };
+  for (const authMode of ["api_key", "subscription"] as const) {
+    it(`${authMode}: delayed replay after outbound turn/start is historical; child/stale boundaries cannot close replay`, async () => {
+      const accountant = new CodexUsageAccountant();
+      let notices = 0;
+      const { harness, transport } = makeHarness({ authMode, accountant, onTokenUsageIncomplete: () => { notices++; } });
+      const running = collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events);
+      await tick();
+      assert.ok(transport.requests.some(r => r.method === "turn/start"));
+      transport.push(turnStarted("child", "tn-1")).push(turnStarted("resumed-1", "stale"));
+      await tick(); // separate inbound delivery after the outbound RPC
+      transport.push(replay()).push(replay());
+      await tick();
+      transport.push(turnStarted("resumed-1", "tn-1"))
+        .push(tokenUsage(next, response, "resumed-1"))
+        .push(replay()) // stale historical usage after boundary is ignored
+        .push(turnCompleted("completed", { inputTokens: 9999 }, "resumed-1")).end();
+      const result = terminal(await running);
+      assert.equal(result.outcome, "success");
+      assert.equal(notices, 0);
+      assert.deepEqual(accountant.aggregateByModel({ authMode, now: new Date("2026-10-05") })?.["gpt-6-astra"], {
+        inputTokens: 240, cacheReadInputTokens: 60, cacheCreationInputTokens: 0,
+        outputTokens: 90, reasoningOutputTokens: 30,
+        costStatus: authMode === "api_key" ? "metered" : "subscription",
+        ...(authMode === "api_key" ? { costUSD: 0.00696 } : {}),
+      });
+      await harness.close();
+    });
+
+    it(`${authMode}: real transport accepts delayed replay in split chunks after outbound start`, async () => {
+      const inbound = new PassThrough();
+      const outbound = new PassThrough();
+      const transport = createCodexTransport({ inbound, outbound });
+      const accountant = new CodexUsageAccountant();
+      let notices = 0;
+      const { harness } = makeHarness({
+        authMode, accountant, onTokenUsageIncomplete: () => { notices++; },
+        launchRoot: async () => ({ root: fakeRoot, transport, supervisorPid: 4321 }),
+      });
+      const write = (frame: unknown) => { inbound.write(JSON.stringify(frame) + "\n"); };
+      let buffered = "";
+      let delivery: Promise<void> | undefined;
+      outbound.setEncoding("utf8");
+      outbound.on("data", (chunk: string) => {
+        buffered += chunk;
+        let end: number;
+        while ((end = buffered.indexOf("\n")) !== -1) {
+          const frame = rec(JSON.parse(buffered.slice(0, end)));
+          buffered = buffered.slice(end + 1);
+          if (typeof frame.method !== "string" || frame.id === undefined) continue;
+          write({ id: frame.id, result: defaultResponder(frame.method) });
+          if (frame.method === "turn/start") delivery = (async () => {
+            await tick();
+            // Foreign lifecycle and usage cannot establish the resumed root baseline.
+            const sequence = [
+              turnStarted("foreign"), tokenUsage(historical, last, "foreign", "historical"),
+              turnStarted("resumed-1", "stale"), replay(), replay(),
+              turnStarted("resumed-1"), tokenUsage(next, response, "resumed-1"),
+              tokenUsage(next, response, "resumed-1"), replay(),
+              turnCompleted("completed", undefined, "resumed-1"),
+            ];
+            for (const note of sequence) {
+              const line = JSON.stringify({ method: note.method, params: note.params }) + "\n";
+              const split = Math.floor(line.length / 2);
+              inbound.write(line.slice(0, split));
+              await tick();
+              inbound.write(line.slice(split));
+            }
+          })();
+        }
+      });
+      try {
+        const result = terminal(await withTimeout(collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events), 5000, "split replay"));
+        await delivery;
+        assert.equal(result.outcome, "success");
+        assert.equal(notices, 0);
+        assert.deepEqual(accountant.aggregateByModel({ authMode, now: new Date("2026-10-05") })?.["gpt-6-astra"], {
+          inputTokens: 240, cacheReadInputTokens: 60, cacheCreationInputTokens: 0,
+          outputTokens: 90, reasoningOutputTokens: 30,
+          costStatus: authMode === "api_key" ? "metered" : "subscription",
+          ...(authMode === "api_key" ? { costUSD: 0.00696 } : {}),
+        });
+      } finally {
+        await delivery;
+        await harness.close();
+        inbound.destroy(); outbound.destroy();
+      }
+    });
+
+    for (const abortAt of ["prelaunch", "preturn"] as const) {
+      it(`${authMode}: ${abortAt} abort does not taint an unstarted resumed turn`, async () => {
+        const accountant = new CodexUsageAccountant();
+        const controller = new AbortController();
+        const transport = new FakeTransport(method => {
+          if (method === "thread/resume") {
+            controller.abort();
+            throw new Error("aborted before turn");
+          }
+          return defaultResponder(method);
+        });
+        const { harness } = makeHarness({ authMode, accountant, transport });
+        if (abortAt === "prelaunch") controller.abort();
+        const running = collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1", signal: controller.signal })).events);
+        if (abortAt === "preturn") await assert.rejects(running, /aborted before turn/);
+        else assert.deepEqual(await running, []);
+        assert.equal(transport.requests.some(r => r.method === "turn/start"), false);
+        assert.equal(accountant.usageIncomplete, false);
+        await harness.close();
+      });
+    }
+
+    for (const stagedReplay of [true, false]) {
+      it(`${authMode}: abort before replay boundary keeps retry totals incomplete (${stagedReplay})`, async () => {
+        const accountant = new CodexUsageAccountant();
+        const controller = new AbortController();
+        const first = makeHarness({ authMode, accountant });
+        const running = collect(first.harness.startTurn(makeRequest({ resumeSessionId: "resumed-1", signal: controller.signal })).events);
+        await tick();
+        assert.ok(first.transport.requests.some(r => r.method === "turn/start"));
+        if (stagedReplay) first.transport.push(replay());
+        await tick();
+        controller.abort();
+        await running;
+        assert.equal(accountant.hasBaseline("resumed-1"), false);
+        assert.equal(accountant.usageIncomplete, true);
+        await first.harness.close();
+        const retry = makeHarness({ authMode, accountant });
+        // The aborted turn persisted A: the retry restores H+A rather than the original H.
+        retry.transport.push(tokenUsage(next, response, "resumed-1", "aborted-turn")).push(turnStarted("resumed-1"))
+          .push(tokenUsage(next, response, "resumed-1"))
+          .push(turnCompleted("completed", undefined, "resumed-1")).end();
+        const result = terminal(await collect(retry.harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events));
+        assert.equal(result.outcome, "success");
+        assert.equal(result.usage, undefined);
+        assert.deepEqual(result.metrics?.cost, { kind: authMode === "api_key" ? "unreported" : "subscription" });
+        assert.equal(accountant.usageIncomplete, true);
+        assert.equal(accountant.aggregateByModel(), undefined);
+        await retry.harness.close();
+      });
+    }
+
+    for (const firstEpochUsage of [true, false]) {
+      it(`${authMode}: no-replay recreation recovers all fresh-root tokens from zero (${firstEpochUsage})`, async () => {
+        const accountant = new CodexUsageAccountant();
+        let notices = 0;
+        const onTokenUsageIncomplete = async () => { notices++; throw new Error("diagnostic rejected"); };
+        const first = makeHarness({
+          authMode, accountant, onTokenUsageIncomplete,
+          transport: new FakeTransport((method) => method === "thread/start" ? { thread: { id: "resumed-1" } } : defaultResponder(method)),
+        });
+        first.transport.push(turnStarted("resumed-1"));
+        if (firstEpochUsage) first.transport.push(tokenUsage(historical, historical, "resumed-1"));
+        first.transport.push(turnCompleted("completed", undefined, "resumed-1")).end();
+        assert.equal(terminal(await collect(first.harness.startTurn(makeRequest()).events)).outcome, "success");
+        const before = accountant.aggregateByModel({ authMode, now: new Date("2026-10-05") });
+        assert.equal(accountant.hasBaseline("resumed-1"), true);
+        await first.harness.close();
+
+        const second = makeHarness({ authMode, accountant, onTokenUsageIncomplete });
+        second.transport.push(turnStarted("resumed-1"))
+          .push(tokenUsage(next, response, "resumed-1"))
+          .push(tokenUsage(next, response, "resumed-1"))
+          .push(tokenUsage({ ...next, inputTokens: 1000, cachedInputTokens: 200, outputTokens: 300, reasoningOutputTokens: 100, totalTokens: 1300 },
+            { inputTokens: 400, cachedInputTokens: 80, outputTokens: 120, reasoningOutputTokens: 40, totalTokens: 520 }, "resumed-1"))
+          .push(turnCompleted("completed", { inputTokens: 9999 }, "resumed-1")).end();
+        const result = terminal(await collect(second.harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events));
+        assert.equal(result.outcome, "success");
+        if (firstEpochUsage) {
+          const entry = accountant.aggregateByModel({ authMode, now: new Date("2026-10-05") })?.["gpt-6-astra"];
+          assert.deepEqual(entry, {
+            inputTokens: 800, cacheReadInputTokens: 200, cacheCreationInputTokens: 0,
+            outputTokens: 300, reasoningOutputTokens: 100,
+            costStatus: authMode === "api_key" ? "metered" : "subscription",
+            ...(authMode === "api_key" ? { costUSD: 0.0232 } : {}),
+          });
+          assert.ok(before?.["gpt-6-astra"]);
+          assert.equal(notices, 0);
+        } else {
+          assert.deepEqual(accountant.aggregateByModel({ authMode, now: new Date("2026-10-05") })?.["gpt-6-astra"], {
+            inputTokens: 800, cacheReadInputTokens: 200, cacheCreationInputTokens: 0,
+            outputTokens: 300, reasoningOutputTokens: 100,
+            costStatus: authMode === "api_key" ? "unreported" : "subscription",
+          });
+          assert.ok(result.usage);
+          assert.deepEqual(result.metrics?.cost, { kind: authMode === "api_key" ? "unreported" : "subscription" });
+          assert.equal(accountant.usageIncomplete, false);
+          assert.equal(notices, 0);
+        }
+        await second.harness.close();
+      });
+    }
+
+    for (const problem of ["absent", "malformed", "typed-malformed", "coerced", "child-only"] as const) {
+      it(`${authMode}: ${problem} replay completes with sticky incomplete totals and one nonfatal notice`, async () => {
+        const accountant = new CodexUsageAccountant();
+        let notices = 0;
+        const onTokenUsageIncomplete = () => { notices++; throw new Error("diagnostic sink failed"); };
+        const { harness, transport } = makeHarness({ authMode, accountant, onTokenUsageIncomplete });
+        if (problem === "malformed")
+          transport.push({ kind: "activity", method: "thread/tokenUsage/updated", params: { threadId: "resumed-1", tokenUsage: {} } });
+        if (problem === "typed-malformed") {
+          const note = replay();
+          note.usage.pricingEvidenceComplete = false;
+          transport.push(note);
+        }
+        if (problem === "coerced") {
+          const note = replay();
+          const raw = rec(rec(note.params).tokenUsage);
+          rec(raw.total).reasoningOutputTokens = "30";
+          transport.push(note);
+        }
+        if (problem === "child-only")
+          transport.push(tokenUsage(historical, last, "child", "historical"));
+        transport.push(turnStarted("resumed-1"))
+          .push(tokenUsage(next, response, "resumed-1"))
+          .push(tokenUsage(next, response, "resumed-1"))
+          .push(turnCompleted("completed", { inputTokens: 9999 }, "resumed-1")).end();
+        const result = terminal(await collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events));
+        assert.equal(result.outcome, "success");
+        assert.equal(result.usage, undefined);
+        assert.deepEqual(result.metrics?.cost, { kind: authMode === "api_key" ? "unreported" : "subscription" });
+        assert.equal(notices, 1);
+        assert.equal(accountant.aggregateByModel(), undefined);
+        await harness.close();
+
+        const retry = makeHarness({ authMode, accountant, onTokenUsageIncomplete });
+        retry.transport.push(replay()).push(turnStarted("resumed-1"))
+          .push(tokenUsage(next, response, "resumed-1"))
+          .push(turnCompleted("completed", undefined, "resumed-1")).end();
+        assert.equal(terminal(await collect(retry.harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events)).usage, undefined);
+        assert.equal(notices, 1);
+        await retry.harness.close();
+      });
+    }
+  }
+});
 
 // --- tests --------------------------------------------------------------------------
 

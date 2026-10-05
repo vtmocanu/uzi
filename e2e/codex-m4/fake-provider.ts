@@ -26,6 +26,8 @@ export type ResponsesBody = { readonly model?: unknown; readonly input?: readonl
 export interface FakeProviderOptions {
   /** The exact bearer credential the app-server must present (assembled at runtime). */
   readonly credential: string;
+  /** Optional deterministic nonzero usage for accounting characterization. */
+  readonly usage?: (responseIndex: number) => Record<string, unknown>;
   /** Produce the Responses output items for one request (mirrors M0's `respond`). */
   readonly respond: (body: ResponsesBody, provider: FakeProvider) => ResponseItem[] | Promise<ResponseItem[]>;
 }
@@ -44,7 +46,7 @@ export function bashArgCanary(): string {
 
 /** SSE framing for one Responses turn (created → output items → completed). The frozen `sse`
  *  helper is not exported by the M0 harness, so it is reproduced here (as m3a/m3b do). */
-function sse(id: string, items: ResponseItem[]): string {
+function sse(id: string, items: ResponseItem[], usage?: Record<string, unknown>): string {
   const frames = [
     { type: "response.created", response: { id } },
     ...items.map((item) => ({ type: "response.output_item.done", item })),
@@ -52,7 +54,7 @@ function sse(id: string, items: ResponseItem[]): string {
       type: "response.completed",
       response: {
         id,
-        usage: {
+        usage: usage ?? {
           input_tokens: 0, output_tokens: 0, total_tokens: 0,
           input_tokens_details: null, output_tokens_details: null,
         },
@@ -71,6 +73,7 @@ export class FakeProvider {
     private readonly server: Server,
     readonly port: number,
     private readonly credential: string,
+    private readonly usage: FakeProviderOptions["usage"],
     private readonly responder: (body: ResponsesBody, provider: FakeProvider) => ResponseItem[] | Promise<ResponseItem[]>,
   ) {}
 
@@ -94,7 +97,7 @@ export class FakeProvider {
     if (address === null || typeof address === "string" || address.address !== "127.0.0.1") {
       throw new Error("fake provider must bind 127.0.0.1");
     }
-    const provider = new FakeProvider(server, address.port, options.credential, options.respond);
+    const provider = new FakeProvider(server, address.port, options.credential, options.usage, options.respond);
     holder.provider = provider;
     return provider;
   }
@@ -126,7 +129,7 @@ export class FakeProvider {
           this.requests.push(body);
           const items = await this.responder(body, this);
           if (response.destroyed) return;
-          const data = sse(`m4-response-${this.requests.length}`, items);
+          const data = sse(`m4-response-${this.requests.length}`, items, this.usage?.(this.requests.length));
           response.writeHead(200, { "content-type": "text/event-stream", "content-length": Buffer.byteLength(data) });
           response.end(data);
         } catch (error) {

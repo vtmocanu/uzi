@@ -2724,6 +2724,39 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
   });
 });
 
+describe("CodexExecutor: incomplete resumed claim notice", () => {
+  for (const credential of [API_KEY, SUBSCRIPTION]) {
+    it(`${credential.auth_mode}: persists fixed worker notice once across epochs while execution completes`, async () => {
+      const rig = makeMultiEpochRig([
+        resumedEpochResponder("th-1", "tn-1", (t, th, tn) => {
+          t.push({ kind: "turn_started", method: "turn/started", threadId: th, turnId: tn, params: { threadId: th, turn: { id: tn } } })
+            .push(tokenUsageUpdated(th, tn, { inputTokens: 150, totalTokens: 150 }))
+            .push(toolCall(1, "checkpoint", {}, th, tn, "c-ckpt"))
+            .push(turnCompleted("completed", th, tn));
+        }),
+        resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+          t.push(tokenUsageUpdated(th, "historical", { inputTokens: 150, totalTokens: 150 }))
+            .push({ kind: "turn_started", method: "turn/started", threadId: th, turnId: tn, params: { threadId: th, turn: { id: tn } } })
+            .push(tokenUsageUpdated(th, tn, { inputTokens: 200, totalTokens: 200 }, { inputTokens: 50, totalTokens: 50 }))
+            .push(toolCall(2, "signal_done", {}, th, tn, "c-done"))
+            .push(turnCompleted("completed", th, tn));
+        }),
+      ]);
+      const { ctx, emitted } = makeCtx({ sessionId: "th-1", checkpoint: async () => undefined });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(credential)).run(ctx), 5000, "incomplete claim completes");
+      assert.equal(result.branch, "agent/issue-42");
+      assert.equal(rig.providerLaunches(), 2);
+      assert.deepEqual(emitted.filter(m => m.payload.event === "codex_token_usage_incomplete"), [{
+        kind: "status", agent: "worker", payload: {
+          event: "codex_token_usage_incomplete",
+          text: "Token usage for this resumed claim is unavailable; recorded run totals are incomplete. Execution continues.",
+        },
+      }]);
+      assert.equal(lastResultModelUsage(emitted), undefined);
+    });
+  }
+});
+
 describe("CodexExecutor: one claim-leg accountant survives provider-epoch recreation (CodeRabbit 4004800880)", () => {
   it("reports cumulative-since-claim-start across a checkpoint recreation, not just the resumed epoch's own delta", async () => {
     // The seam under test is the shared EpochSharedContext.accountant threaded into every epoch's
@@ -2749,7 +2782,8 @@ describe("CodexExecutor: one claim-leg accountant survives provider-epoch recrea
       resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
         // Resume replay: the restored cumulative (total=100); `last` is the prior leg's final
         // response (a subset already counted upstream). Then a genuinely-newer note (total=150).
-        t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }, { inputTokens: 100, totalTokens: 100 }))
+        t.push(tokenUsageUpdated(th, "historical", { inputTokens: 100, totalTokens: 100 }, { inputTokens: 100, totalTokens: 100 }))
+          .push({ kind: "turn_started", method: "turn/started", threadId: th, turnId: tn, params: { threadId: th, turn: { id: tn } } })
           .push(tokenUsageUpdated(th, tn, { inputTokens: 150, totalTokens: 150 }, { inputTokens: 50, totalTokens: 50 }))
           .push(toolCall(2, "signal_done", {}, th, tn, "c-done"))
           .push(turnCompleted("completed", th, tn));
@@ -2806,7 +2840,8 @@ describe("CodexExecutor: one claim-leg accountant survives provider-epoch recrea
 
     const resumedRig = makeMultiEpochRig([
       resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
-        t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }, { inputTokens: 100, totalTokens: 100 }))
+        t.push(tokenUsageUpdated(th, "historical", { inputTokens: 100, totalTokens: 100 }, { inputTokens: 100, totalTokens: 100 }))
+          .push({ kind: "turn_started", method: "turn/started", threadId: th, turnId: tn, params: { threadId: th, turn: { id: tn } } })
           .push(tokenUsageUpdated(th, tn, { inputTokens: 150, totalTokens: 150 }, { inputTokens: 50, totalTokens: 50 }))
           .push(toolCall(2, "signal_done", {}, th, tn, "c-done-2"))
           .push(turnCompleted("completed", th, tn));
@@ -2842,7 +2877,8 @@ describe("CodexExecutor: one claim-leg accountant survives provider-epoch recrea
       resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
         // A resumed claim replays the restored cumulative first (a no-op baseline), then a
         // genuinely-newer note charges the delta — so a per-model usage entry exists to key on.
-        t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }, { inputTokens: 100, totalTokens: 100 }))
+        t.push(tokenUsageUpdated(th, "historical", { inputTokens: 100, totalTokens: 100 }, { inputTokens: 100, totalTokens: 100 }))
+          .push({ kind: "turn_started", method: "turn/started", threadId: th, turnId: tn, params: { threadId: th, turn: { id: tn } } })
           .push(tokenUsageUpdated(th, tn, { inputTokens: 150, totalTokens: 150 }, { inputTokens: 50, totalTokens: 50 }))
           .push(toolCall(1, "signal_done", {}, th, tn, "c-done"))
           .push(turnCompleted("completed", th, tn));

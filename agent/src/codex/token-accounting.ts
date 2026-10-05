@@ -12,15 +12,13 @@
 //     Token totals are derived from `total` (dedup/recovery-safe), NEVER by summing `last`.
 //   - Each thread has a STARTING SNAPSHOT (baseline). A FRESH thread (thread/start) starts at
 //     zero, so its whole cumulative is this leg's work and a MISSED intermediate update is
-//     recovered by the later cumulative. A RESUMED thread (thread/resume) baselines at the FULL
-//     restored cumulative (`total`) observed on its FIRST note — NOT `total - last`. The pinned
-//     app-server replays an initial `thread/tokenUsage/updated` on resume whose `last` is the
-//     PRIOR leg's final response (non-zero, a subset already in `total`; verified at commit
-//     657a993… — token_usage_replay.rs + protocol.rs append_last_usage), so a `total - last`
-//     baseline would fall below the prior cumulative and DOUBLE-COUNT that final response on the
-//     next note. Baselining at the full `total` charges only genuinely-new post-resume deltas and
-//     can never inflate (D5). Only post-baseline deltas are charged, so a resumed leg never
-//     re-reports the prior leg's usage.
+//     recovered by the later cumulative. A RESUMED thread needs proved replay: root usage with
+//     a historical turn id BEFORE the matching inbound turn/started boundary. Pinned 0.159.3
+//     cold resume with excludeTurns:true was characterized in token-resume.test.ts: restored
+//     total and historical last precede that boundary even when consumption starts after the
+//     outbound turn/start. Baseline the FULL replay total; never price replay last. A shared
+//     accountant retains its original baseline across epochs. Without a retained baseline or
+//     proved replay, usage is INCOMPLETE for the claim; no total-minus-last recovery is assumed.
 //   - A DUPLICATE, STALE or OUT-OF-ORDER note cannot increase usage: a note is adopted only
 //     when its cumulative MAGNITUDE strictly exceeds the running max, and it then replaces the
 //     whole breakdown (so a stale note cannot inflate a single bucket).
@@ -172,10 +170,10 @@ function responsesReconcileDelta(responseSum: Cumulative, delta: Cumulative): bo
 interface ThreadAccount {
   /** The IMMUTABLE configured model for this thread (root or child). */
   readonly model: string;
-  /** True when the thread was resumed (thread/resume): it baselines at the pre-resume
-   *  cumulative rather than zero, so prior-leg usage is not re-charged. */
+  /** True when first registered by thread/resume: requires proved replay to establish its
+   *  pre-claim cumulative. Repeat registrations retain the original claim state. */
   readonly resumed: boolean;
-  /** The starting snapshot; established at the first observed note (undefined until then). */
+  /** The starting snapshot; first fresh usage or proved historical replay establishes it. */
   baseline?: Cumulative;
   /** The running per-bucket max of `total`; undefined until the first note. */
   maxTotal?: Cumulative;
@@ -184,8 +182,7 @@ interface ThreadAccount {
   /** The observed per-response `last` breakdowns of THIS leg, one per ADOPTED note — the pricing
    *  basis (C4b, D5). A note is recorded here on exactly the same gate that advances {@link
    *  maxTotal}, so a duplicate/stale/out-of-order note is neither charged nor priced twice. A
-   *  RESUMED thread's FIRST note is the prior leg's replayed snapshot (its `last` is a prior
-   *  response already counted), so it establishes the baseline WITHOUT being recorded here. */
+   *  Proved replay is never recorded here: its last belongs to historical work. */
   readonly responses: CodexUsageBreakdown[];
   /** PRD #1332 m3 (CodeRabbit 4004800884): FALSE once any CONSUMED (adopted) note carried an
    *  absent or malformed pricing-required bucket (`transport.ts` pricingEvidenceComplete). It
@@ -204,6 +201,25 @@ interface ThreadAccount {
  */
 export class CodexUsageAccountant {
   private readonly threads = new Map<string, ThreadAccount>();
+  private incomplete = false;
+  private incompleteNoticeTaken = false;
+
+  /** Sticky across all provider epochs of this claim; execution remains independent. */
+  markIncomplete(): void { this.incomplete = true; }
+  get usageIncomplete(): boolean { return this.incomplete; }
+
+  /** The shared accountant owns the claim-wide diagnostic latch, including failed callbacks. */
+  takeIncompleteNotice(): boolean {
+    if (!this.incomplete || this.incompleteNoticeTaken) return false;
+    this.incompleteNoticeTaken = true;
+    return true;
+  }
+
+  /** Whether this claim has already established this thread's cumulative starting snapshot. */
+  hasBaseline(threadId: string): boolean {
+    const acct = this.threads.get(threadId);
+    return acct !== undefined && (!acct.resumed || acct.baseline !== undefined);
+  }
 
   /** Register the IMMUTABLE `threadId -> model` mapping. The FIRST registration wins: a repeat
    *  call for a known thread is ignored, so a stray/duplicate registration cannot rebind a
@@ -216,38 +232,30 @@ export class CodexUsageAccountant {
 
   /**
    * Reconcile one `thread/tokenUsage/updated` notification. An UNKNOWN thread is dropped (never
-   * attributed to the root). The first note establishes the baseline (zero for a fresh thread,
-   * the full restored cumulative `total` for a resumed one — see the module header on why NOT
-   * `total - last`); later notes advance the cumulative max ONLY when strictly newer, so
-   * duplicates/stale/out-of-order notes cannot increase usage.
+   * attributed to the root). Only explicitly proved replay may baseline a resumed thread.
+   * Later notes advance the cumulative max only when strictly newer. Missing replay never
+   * licenses component subtraction of last from total.
    */
-  record(threadId: string, usage: CodexThreadTokenUsage): void {
+  record(threadId: string, usage: CodexThreadTokenUsage, replay = false): void {
     const acct = this.threads.get(threadId);
     if (acct === undefined) return; // unknown / unregistered thread — never attributed
+    if (acct.resumed && acct.baseline === undefined && !replay) {
+      this.markIncomplete();
+      return;
+    }
     const total = toCumulative(usage.total);
     // PRD #1332 m3 (CodeRabbit 4004800884): a note carrying a present-but-malformed pricing-required
     // bucket taints THIS thread's pricing evidence. Applied ONLY when the note is adopted (below),
     // so a duplicate/stale/out-of-order note — which is neither charged nor priced — cannot taint.
     const evidenceIncomplete = usage.pricingEvidenceComplete === false;
     if (acct.maxTotal === undefined) {
-      // A RESUMED thread baselines at the FULL restored cumulative (`total`) of its first
-      // observed note — NOT `total - last`. VERIFIED against the pinned app-server (commit
-      // 657a993…): on resume `thread_lifecycle.rs` replays an initial `thread/tokenUsage/updated`
-      // carrying the restored `TokenUsageInfo` (`token_usage_replay.rs`
-      // send_thread_token_usage_update_to_connection), whose `last` is the PRIOR leg's final
-      // response (non-zero — `protocol.rs` append_last_usage sets `last_token_usage = last`), a
-      // subset already counted in `total`. So a `total - last` baseline falls BELOW the prior
-      // cumulative and DOUBLE-COUNTS that final response on the next note. Baselining at the full
-      // `total` charges only genuinely-new post-resume deltas and can never inflate (D5). A fresh
-      // thread starts at zero (its whole cumulative is this leg's work).
+      // The harness proves replay using the inbound root turn boundary, not note ordinal.
+      // Fresh threads start at zero; resumed threads use the full proved replay total.
       acct.baseline = acct.resumed ? toCumulative(usage.total) : zeroCumulative();
       acct.maxTotal = total;
       acct.maxMagnitude = magnitude(usage.total);
-      // Record the first note's `last` as a priced response ONLY for a FRESH thread (its whole
-      // cumulative is this leg's work). A RESUMED thread's first note replays the prior leg's
-      // final response into `last`; it is already counted upstream and sits below the baseline, so
-      // recording it would over-count cost and break reconciliation — it is deliberately skipped.
-      if (!acct.resumed) acct.responses.push(usage.last);
+      // Historical replay last is never a response of this claim.
+      if (!replay) acct.responses.push(usage.last);
       if (evidenceIncomplete) acct.pricingEvidenceComplete = false;
       return;
     }
@@ -258,7 +266,7 @@ export class CodexUsageAccountant {
       // A genuinely newer note: `last` is this note's single most-recent response — record it as a
       // priced response. Mirrors the magnitude gate so a duplicate/stale/out-of-order note (which
       // does NOT advance the max) is never priced twice.
-      acct.responses.push(usage.last);
+      if (!replay) acct.responses.push(usage.last);
       if (evidenceIncomplete) acct.pricingEvidenceComplete = false;
     }
     // else: a duplicate, stale resume replay or out-of-order note — cannot increase usage or cost.
@@ -286,6 +294,7 @@ export class CodexUsageAccountant {
    *                                    tokens RETAINED and no `costUSD`.
    */
   aggregateByModel(pricing?: CodexPricingContext): Record<string, CodexModelUsageEntry> | undefined {
+    if (this.incomplete) return undefined;
     interface ModelAgg {
       tokens: Cumulative;
       /** True until a thread on this model fails to reconcile or has an unpriceable response.
