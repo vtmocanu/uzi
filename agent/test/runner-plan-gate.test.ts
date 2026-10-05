@@ -7,6 +7,7 @@ import { type SDKMessage, type SpawnOptions } from "@anthropic-ai/claude-agent-s
 import { spawnDetached } from "../src/sdk-spawn.js";
 import { nullLogger } from "./helpers.js";
 import { forceIncompleteHomeHelper } from "./forced-home-helper.js";
+import { scanRunProcesses, reapRunProcesses } from "../src/run-procs.js";
 import { StubExecutor, PlanRejectedError, STUB_FAIL_SENTINEL, STUB_ASK_SENTINEL, type Executor } from "../src/executor.js";
 import { AUTOPILOT_SENTINEL_ANSWER } from "../src/runner.js";
 import { CI_CONFIG_MARKER } from "../src/prompt.js";
@@ -1301,6 +1302,15 @@ describe("RunRunner — plan_changed_files on the plan gate (PRD #212)", () => {
 describe("#2230 shared SDK process default at a plan gate", () => {
   it("a second scripted runner suite completes despite an incomplete live HOME helper", async (t) => {
     const helper = forceIncompleteHomeHelper(t);
+    helper.enabled = true;
+    const control = new SdkExecutor(nullLogger(), homeDir, {
+      queryFn: planThenDoneQuery(),
+      runProcesses: { scan: scanRunProcesses, reap: reapRunProcesses },
+    });
+    assert.equal((await control.reapAttributedProcesses()).complete, false, "explicit real operations still fail closed");
+    assert.equal(helper.calls, 1, "this suite's forced-helper matcher is active");
+    helper.enabled = false;
+    helper.calls = 0;
     simulateCommittedWork();
     const { gitlab } = fakeGitlab();
     const claim = gitlabClaim(2230);
