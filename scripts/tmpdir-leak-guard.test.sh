@@ -164,6 +164,9 @@ normalized_outer="$(printf '%s' "$OUTER" | tr -s '/')"
 check "trailing slash: rc=0" rc_is 0
 check "trailing slash: normalized scratch spelling" test "${seen_tmpdir#"$normalized_outer"/}" != "$seen_tmpdir"
 check "trailing slash: normalized ledger spelling" test "${seen_ledger#"$normalized_outer"/}" != "$seen_ledger"
+no_double_slash() { case "$1" in *//*) return 1 ;; *) return 0 ;; esac; }
+check "trailing slash: scratch has no double slash" no_double_slash "$seen_tmpdir"
+check "trailing slash: ledger has no double slash" no_double_slash "$seen_ledger"
 check "trailing slash: scratch and ledger removed" outer_empty
 
 # Prove the root-only spelling without creating anything at the filesystem root.

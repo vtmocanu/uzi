@@ -58,6 +58,23 @@ const SELECTION = JSON.stringify({ source: "own", exclusions: ["reviewer"] });
 const SELECTION_STATUS = "implementing with your agent templates (coder)";
 const DEFAULT_SELECTION_STATUS = "implementing with your agent templates (reviewer, coder)";
 
+// Issue #1920: shutdown must not wait out a full input-GET timeout or backoff.
+// This generous bound guards that regression, rather than normal scheduling latency.
+const SHUTDOWN_PROMPTNESS_MS = 15_000;
+async function promptly(done: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      done,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("shutdown exceeded the #1920 promptness bound")), SHUTDOWN_PROMPTNESS_MS);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const STATUS_RESUME_WITH_REVISION =
   "resuming at the plan gate with a revision the owner sent before the claim was released — revising the submitted plan instead of re-presenting it";
 const STATUS_WAITING_DELIVERY =
@@ -346,10 +363,10 @@ class Scenario {
     await Promise.race([flight.done, tick(10_000)]);
   }
 
-  /** Wait for graceful shutdown's settlement; the test timeout bounds a stuck flight. */
+  /** Require graceful shutdown to settle promptly, without a full input-GET timeout. */
   async shutdown(flight: Flight): Promise<void> {
     flight.runner.shutdown();
-    await flight.done;
+    await promptly(flight.done);
     assert.equal(flight.finished, true, "shutdown settled the gate flight");
     assert.equal(flight.error, undefined, "shutdown completed without an execution error");
     assert.equal(this.rowsOf("cancel").length, 0, "shutdown needed no cancel input");
@@ -1570,7 +1587,7 @@ describe("shutdown at an observed plan gate", () => {
     }));
 
   for (const [planApprovalTimeoutMs, session, failHeldGet] of [[0, "kept", true], [60_000, "none", true], [0, "kept", false]] as const) {
-    it(`unwinds without a cancel input when planApprovalTimeoutMs is ${planApprovalTimeoutMs} and the held GET ${failHeldGet ? "fails" : "succeeds"}`, (t) =>
+    it(`finishes promptly without a cancel input when planApprovalTimeoutMs is ${planApprovalTimeoutMs} and the held GET ${failHeldGet ? "fails" : "succeeds"}`, (t) =>
       scenario(async (s) => {
         api.gateRevisions = true;
         api.stampGateBindings = true;
@@ -1618,12 +1635,13 @@ describe("shutdown at an observed plan gate", () => {
         assert.equal(stored.gate_binding, "bound");
         assert.equal(stored.gate_revision, persisted.revision);
         flight.runner.shutdown();
-        await Promise.race([
+        await promptly(Promise.race([
           pollingStopped,
           flight.done.then(() => { throw new Error("flight ended without stopping input polling"); }),
-        ]);
-        heldGet.release(); // The stopped poller cannot acknowledge this pending verdict.
-        await flight.done;
+        ]).then(async () => {
+          heldGet!.release(); // The stopped poller cannot acknowledge this pending verdict.
+          await flight.done;
+        }));
         assert.equal(flight.finished, true, "shutdown settled the gate flight");
         assert.equal(flight.error, undefined, "shutdown completed without an execution error");
         assert.equal(s.rowsOf("cancel").length, 0, "shutdown needed no cancel fallback");

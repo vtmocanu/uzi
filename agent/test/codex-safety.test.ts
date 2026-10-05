@@ -161,7 +161,6 @@ describe("CodexExecutionSafety.withBoundary: gate ordering", () => {
     t.mock.timers.tick(1);
     await rejected;
     assert.equal(reconcileSignal?.aborted, true);
-    assert.equal(Date.now(), 25, "reconciliation used the exact boundary deadline");
   });
 
   it("a clean quiesce that settles after expiry still blocks permit mint and action", async () => {

@@ -43,9 +43,15 @@ if [ "$#" -eq 0 ]; then
 fi
 
 # Normalize slash spelling without resolving symlinks (notably /var on macOS).
-# The appended slash preserves any trailing newline in the path through substitution;
-# removing it also makes the template join below root-safe when TMPDIR is /.
-temp_base="$(printf '%s/' "${TMPDIR:-/tmp}" | tr -s '/')"
+# Parameter expansion cannot silently fail into an empty base as an external pipeline
+# could. The added slash makes the join root-safe; only an all-slash input becomes empty.
+temp_base="${TMPDIR:-/tmp}/"
+while :; do
+  case "$temp_base" in
+    *//*) temp_base="${temp_base%%//*}/${temp_base#*//}" ;;
+    *) break ;;
+  esac
+done
 temp_base="${temp_base%/}"
 # Portable template form (check:mktemp-portability): a full path with 6 X's, no -t.
 scratch="$(mktemp -d "$temp_base/uzi-tmpdir-guard.XXXXXX")" || {
