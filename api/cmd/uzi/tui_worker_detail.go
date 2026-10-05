@@ -231,13 +231,9 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 	}
 	w, t := r.w, workerTextOf(r)
 	width := max(1, m.width)
-	scope := "your workers"
-	if m.board.admin {
-		scope = "factory workers"
-	}
 	state := workerState(r)
-	lines := []string{m.tabStrip(m.board.admin, viewWorkers, false),
-		m.pal.faint.Render(scope+" › ") + m.pal.title.Render(m.renderer.Plain(t.workerName, width)) + "  " + paintSeg(m.workerStateColor(state), nil, false, workerStateGlyph(state)+" "+state) + "  " + m.pal.faint.Render(m.workerKind(r))}
+	header := m.pal.faint.Render("worker › ") + m.pal.title.Render(m.renderer.Plain(t.workerName, width)) + "  " + paintSeg(m.workerStateColor(state), nil, false, workerStateGlyph(state)+" "+state) + "  " + m.pal.faint.Render(m.workerKind(r))
+	lines := []string{m.tabStrip(m.board.admin, viewWorkers, false)}
 	heartbeat := "last heartbeat " + workerAge(w.LastHeartbeatAt, now) + " ago"
 	if w.Status == "online" {
 		heartbeat = "heartbeat " + workerAge(w.LastHeartbeatAt, now) + " ago"
@@ -245,7 +241,12 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 			heartbeat = "up " + workerUptime(w.OnlineSince, now) + " · " + heartbeat
 		}
 	}
-	lines = append(lines, "  "+m.pal.faint.Render(heartbeat), "", m.pal.title.Render("attention"))
+	if visualWidth(header)+2+visualWidth(heartbeat) <= width {
+		lines = append(lines, header+m.pal.faint.Render("  "+heartbeat))
+	} else {
+		lines = append(lines, header, "  "+m.pal.faint.Render(heartbeat))
+	}
+	lines = append(lines, "", m.pal.title.Render("attention"))
 	attention := workerAttention(r, now)
 	if len(attention) == 0 {
 		lines = append(lines, "  "+m.pal.faint.Render("no reported warnings"))
