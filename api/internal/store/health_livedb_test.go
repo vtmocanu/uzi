@@ -531,7 +531,7 @@ func TestHealthWaitingRowsLiveDB(t *testing.T) {
 		if !fixture {
 			continue
 		}
-		if r.UserID != fx.userID || r.HealthSince != expected || r.HealthReason.Valid {
+		if r.UserID != fx.userID || r.HealthSince.Valid != expected.Valid || r.HealthSince.InfinityModifier != expected.InfinityModifier || !r.HealthSince.Time.Equal(expected.Time) || r.HealthReason.Valid {
 			t.Fatalf("waiting projection=%+v expected=%+v", r, expected)
 		}
 		seen[r.RunID] = true
@@ -556,7 +556,7 @@ func TestHealthWaitingRowsLiveDB(t *testing.T) {
 	seen = map[uuid.UUID]bool{}
 	for _, r := range capacity {
 		if expected, fixture := want[r.RunID]; fixture {
-			if r.HealthSince != expected || r.HealthReason.Valid || r.HasRollReason {
+			if r.HealthSince.Valid != expected.Valid || r.HealthSince.InfinityModifier != expected.InfinityModifier || !r.HealthSince.Time.Equal(expected.Time) || r.HealthReason.Valid || r.HasRollReason {
 				t.Fatalf("capacity projection=%+v expected=%+v", r, expected)
 			}
 			seen[r.RunID] = true
