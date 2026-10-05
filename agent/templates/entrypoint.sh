@@ -531,7 +531,8 @@ for tmpdir in "$WORKER_TMPDIR" "$RUNNER_TMPDIR"; do
     "$CHOWN" -h 0:0 "$tmpdir"
     if [ -d "$tmpdir" ] && [ ! -L "$tmpdir" ]; then
       "$FIND" "$tmpdir" -xdev -type d -exec "$CHOWN" 0:0 '{}' +
-      "$FIND" "$tmpdir" -xdev -type d -exec "$CHMOD" 0700 '{}' +
+      # GNU chmod preserves directory setgid with 0700; 00700 clears special bits.
+      "$FIND" "$tmpdir" -xdev -type d -exec "$CHMOD" 00700 '{}' +
     fi
   fi
 done
@@ -542,10 +543,10 @@ done
 # even when a prior boot left the dir worker/runner-owned -- the SAME restart-safe reclaim the
 # token block and the legacy-migration roots use. No `if`-wrapper (unlike the token's EROFS
 # read-only Secret mount): these tmpdirs are ALWAYS a writable mount, never read-only.
-"$CHOWN" 0:0 "$WORKER_TMPDIR"; "$CHMOD" 0700 "$WORKER_TMPDIR"; "$CHOWN" "$WORKER_OWNER" "$WORKER_TMPDIR"
+"$CHOWN" 0:0 "$WORKER_TMPDIR"; "$CHMOD" 00700 "$WORKER_TMPDIR"; "$CHOWN" "$WORKER_OWNER" "$WORKER_TMPDIR"
 # runner:runner 0700 -- owner-only, so even the worker (a `runner`-GROUP member) cannot reach
 # it (0700 grants the group nothing); true per-uid isolation.
-"$CHOWN" 0:0 "$RUNNER_TMPDIR"; "$CHMOD" 0700 "$RUNNER_TMPDIR"; "$CHOWN" runner:runner "$RUNNER_TMPDIR"
+"$CHOWN" 0:0 "$RUNNER_TMPDIR"; "$CHMOD" 00700 "$RUNNER_TMPDIR"; "$CHOWN" runner:runner "$RUNNER_TMPDIR"
 
 # --- (a4) issue #1598: the Codex command-cache root, runner-cmd 0700 ---------------
 # The supervisor's uid-10003 cache holder creates ONE random per-run dir under this root
