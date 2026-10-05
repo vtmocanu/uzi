@@ -213,9 +213,20 @@ func TestWaitingM2LateSuccessAndSharedBudget(t *testing.T) {
 			if c.Severity != sevDanger {
 				t.Fatalf("late success=%+v", c)
 			}
+			late := map[uuid.UUID]bool{second: false, third: false}
 			for _, e := range c.Evidence {
 				if strings.Contains(e.Value, first.String()) {
 					t.Fatal("timely memo was discarded after expiry")
+				}
+				for id := range late {
+					if strings.Contains(e.Value, id.String()) {
+						late[id] = true
+					}
+				}
+			}
+			for id, present := range late {
+				if !present {
+					t.Fatalf("late successful callback wrongly exempted run %s from queue evidence", id)
 				}
 			}
 		}
@@ -228,7 +239,7 @@ func TestWaitingM2DetectorSkipsQueries(t *testing.T) {
 		s := newSvc(f, &fakeSettings{})
 		s.checkFleetCapacity(context.Background(), fixedNow, state)
 		s.checkQueueWaiting(context.Background(), fixedNow, state)
-		if f.capacityQueries != 0 || f.waitingQueries != 0 {
+		if f.capacityQueries.Load() != 0 || f.waitingQueries.Load() != 0 {
 			t.Fatal("disabled detector queried waiting population")
 		}
 	}

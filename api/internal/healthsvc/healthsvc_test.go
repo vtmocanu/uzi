@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode"
@@ -34,8 +35,8 @@ type fakeStore struct {
 	workersErr      error
 	capacityRows    []store.ListOwnersWaitingNoCapacityRow
 	capacityErr     error
-	capacityQueries int
-	waitingQueries  int
+	capacityQueries atomic.Int32
+	waitingQueries  atomic.Int32
 	waitingRows     []store.ListWaitingWorkerRunsRow
 	waitingErr      error
 	undispatched    pgtype.Timestamptz
@@ -62,11 +63,11 @@ func (f *fakeStore) ListAllWorkers(context.Context) ([]store.ListAllWorkersRow, 
 	return f.workers, f.workersErr
 }
 func (f *fakeStore) ListOwnersWaitingNoCapacity(context.Context, store.ListOwnersWaitingNoCapacityParams) ([]store.ListOwnersWaitingNoCapacityRow, error) {
-	f.capacityQueries++
+	f.capacityQueries.Add(1)
 	return f.capacityRows, f.capacityErr
 }
 func (f *fakeStore) ListWaitingWorkerRuns(context.Context) ([]store.ListWaitingWorkerRunsRow, error) {
-	f.waitingQueries++
+	f.waitingQueries.Add(1)
 	return f.waitingRows, f.waitingErr
 }
 func (f *fakeStore) OldestUndispatchedTaskRun(context.Context) (pgtype.Timestamptz, error) {
