@@ -109,7 +109,7 @@ export function healthySilentDoc(): HealthDoc {
   return doc(build({}));
 }
 
-// health-degraded: two warnings, nothing blocked. Work still flows.
+// health-degraded: two checks need attention.
 export function degradedDoc(): HealthDoc {
   return doc(
     build({
@@ -136,7 +136,7 @@ export function degradedDoc(): HealthDoc {
 }
 
 // health-incident: the motivating incident — the fleet is pinned to a worker image that was
-// never published, so three checks share one cause and uzi cannot run work. A danger episode
+// never published: one instance blocker and two owner danger checks share a cause. A danger episode
 // is open, so episode_id is non-null (the banner/snooze machinery reads it in M5).
 export function incidentDoc(): HealthDoc {
   return doc(
@@ -183,6 +183,30 @@ export function incidentDoc(): HealthDoc {
     }),
     { episode_id: "b1f0c2ep" },
   );
+}
+
+// Owner-local capacity and queue danger remains visible without an instance episode.
+export function ownerOnlyDoc(): HealthDoc {
+  const checks = incidentDoc().checks.map((c) => c.id === "fleet.roll"
+    ? { ...c, severity: "ok", summary: OK_SUMMARY[c.id], evidence: [], action: null, command: null, since: null }
+    : c);
+  return doc(checks);
+}
+
+// A confirmed ReasonWorkersUpgrading wait overlaps an orderly drain for 40 minutes.
+// queue.waiting excludes this confirmed wait; fleet.capacity stays ok below 24 hours.
+// Ordinary draining is not a fresh PhaseStuck signal, so fleet.roll remains ok.
+export function confirmedDrainDoc(): HealthDoc {
+  return doc(build({
+    "fleet.capacity": {
+      summary: "1 owner(s) are waiting while workers finish their current runs before an upgrade.",
+      evidence: [{ label: "Waiting run", value: "run 22930000-0000-0000-0000-000000000001; owner 22930000-0000-0000-0000-000000000002; waited 40m; stored reason your workers are finishing their current runs before an upgrade; this run starts after" }],
+    },
+    "queue.waiting": {
+      summary: "Runs are waiting while workers finish their current runs before an upgrade.",
+      evidence: [],
+    },
+  }));
 }
 
 // ── Extra states for the component tests (not named scenarios) ──────────────────
@@ -294,7 +318,7 @@ export function incidentFleetWorkers(): AdminWorker[] {
 
 // The healthy hosted fleet the silent (all-ok) and degraded (warn) scenarios show: every
 // worker online and up to date across three owners, so the cross-user table AGREES with the
-// "all normal" / "warnings only, nothing is blocked" verdict rather than showing a stuck
+// all-normal or attention verdict rather than showing a stuck
 // upgrade the verdict says nothing about. In production both endpoints read one DB and so
 // always agree; this only keeps the DEMO scenarios coherent. No upgrade_failed row here.
 function healthyHosted(over: Partial<AdminWorker>): AdminWorker {

@@ -63,7 +63,7 @@ export function HealthOverviewCard() {
     );
   }
 
-  const verdict = healthVerdict(doc.status, doc.counts);
+  const verdict = healthVerdict(doc);
   const top = attention.slice(0, 3);
 
   return (

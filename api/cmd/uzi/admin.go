@@ -492,6 +492,7 @@ func runAdminHealth(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Comman
 		p.Println("all checks passing")
 	}
 	p.Printf("status: %s\n", strings.ToUpper(doc.Status))
+	p.Printf("blocking: %t (instance-wide)\n", doc.Blocking)
 	p.Printf("checks: %d ok, %d warn, %d danger, %d unknown, %d na\n",
 		doc.Counts.OK, doc.Counts.Warn, doc.Counts.Danger, doc.Counts.Unknown, doc.Counts.NA)
 	return healthVerdictError(doc.Status, strict)

@@ -9,7 +9,7 @@ import { MemoryRouter } from "react-router-dom";
 
 import { AdminShell } from "./AdminShell";
 import { api, type HealthDoc } from "../lib/api";
-import { healthySilentDoc, incidentDoc, unknownDoc } from "../mocks/data/health";
+import { healthySilentDoc, incidentDoc, unknownDoc, ownerOnlyDoc } from "../mocks/data/health";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -41,6 +41,12 @@ describe("AdminShell health tab pip", () => {
     expect(within(pip).getByText("4")).toBeTruthy();
     // The pip sits inside the Health tab link.
     expect(screen.getByRole("link", { name: /Health/ }).contains(pip)).toBe(true);
+  });
+
+  it("retains owner danger in the attention pip", async () => {
+    await renderShell(ownerOnlyDoc());
+    const pip = await screen.findByLabelText("3 health checks need attention: 2 danger, 1 warning");
+    expect(within(pip).getByText("3")).toBeTruthy();
   });
 
   it("names unknown as unknown rather than folding it into warning", async () => {

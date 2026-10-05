@@ -126,7 +126,7 @@ func TestAdminHealthExitEightWhenDangerAfterPrinting(t *testing.T) {
 	}
 	// The full report reached stdout despite the nonzero exit: the danger check and its
 	// summary, the warn check, and the verdict line.
-	for _, want := range []string{"fleet.roll", "4 of 4 workers stuck rolling", "queue.waiting", "status: DANGER"} {
+	for _, want := range []string{"fleet.roll", "4 of 4 workers stuck rolling", "queue.waiting", "status: DANGER", "blocking: true (instance-wide)"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("danger report did not print %q before the exit-8 return:\n%s", want, out)
 		}
@@ -254,6 +254,12 @@ func TestAdminHealthJSONEmitsTheDocAndExits(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &got); err != nil {
 		t.Fatalf("--json output is not a HealthDocDTO: %v\n%s", err, out)
 	}
+	if len(got.Checks) != 2 {
+		t.Fatalf("--json lost checks: %+v", got)
+	}
+	if !got.Blocking || got.Checks[0].Scope != "instance" {
+		t.Errorf("--json lost scope/blocking: %+v", got)
+	}
 	if got.Status != "danger" || len(got.Checks) != 2 {
 		t.Errorf("--json lost the document: status=%q checks=%d", got.Status, len(got.Checks))
 	}
@@ -290,5 +296,29 @@ func TestAdminHealthIsRegistered(t *testing.T) {
 		if health.Flags().Lookup(f) == nil {
 			t.Errorf("`admin health` missing --%s flag", f)
 		}
+	}
+}
+
+func TestAdminHealthOwnerDangerRemainsExitEightWithoutInstanceBlocking(t *testing.T) {
+	check := queueWarnCheck()
+	check.Severity = "danger"
+	doc := healthDoc("danger", check)
+	fc := &uzicli.FakeClient{AdminHealthDoc: doc}
+	out, _, code := runCLI(t, fakeEnv(fc), "admin", "health")
+	if code != uzicli.ExitHealthDanger {
+		t.Fatalf("owner danger exit = %d, want 8", code)
+	}
+	for _, want := range []string{"blocking: false (instance-wide)", "status: DANGER", "1 danger", "queue.waiting"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("owner report missing %q: %s", want, out)
+		}
+	}
+	out, _, code = runCLI(t, fakeEnv(fc), "admin", "health", "--json")
+	var got apitypes.HealthDocDTO
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatal(err)
+	}
+	if code != uzicli.ExitHealthDanger || got.Blocking || len(got.Checks) != 1 || got.Checks[0].Scope != "owner" {
+		t.Fatalf("owner JSON scope/blocking/exit changed: exit=%d doc=%+v", code, got)
 	}
 }

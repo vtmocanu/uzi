@@ -1,15 +1,18 @@
 import type { HealthDoc } from "../../lib/api";
-import { degradedDoc, healthySilentDoc, incidentDoc } from "../data";
+import { ApiError } from "../../lib/apiError";
+import { confirmedDrainDoc, degradedDoc, healthySilentDoc, incidentDoc, ownerOnlyDoc } from "../data";
 import { delay, mockScenario, requireAdmin } from "./shared";
 
 // Admin health (PRD #1484). GET /api/admin/health backs the Health tab and (M5) the
 // Overview card + danger banner. Admin-only (RequireAdminRO), so the mock gates on admin
 // exactly as the real route does. The scenario picks which fixture to serve:
 //
-//   ?mock=health-degraded  → two warnings, nothing blocked (warn)
+//   ?mock=health-degraded  → two checks need attention (warn)
 //   ?mock=health-incident  → the fleet is pinned to an unpublished image (danger); the
 //                            workers mock returns the stuck fleet so the table populates,
 //                            AND a non-admin viewer sees the platform line on Overview
+//   ?mock=health-owner-only → owner danger without an instance blocker or episode
+//   ?mock=health-confirmed-drain → orderly upgrade wait, all checks ok and no episode
 //   ?mock=health-silent    → every check passing (healthy/all-ok)
 //   (default)              → healthy, same as health-silent
 //
@@ -20,7 +23,7 @@ import { delay, mockScenario, requireAdmin } from "./shared";
 // real endpoint does (the api stores the per-(episode, caller) snooze and the next poll
 // reads it back). Module-level so it survives across the poll cadence, reset on a scenario
 // switch is not modelled (a demo reload clears it).
-let snoozedUntil: string | null = null;
+let snoozed: { episode: string; until: string } | null = null;
 
 export const healthApi = {
   getAdminHealth: async (): Promise<HealthDoc> => {
@@ -28,11 +31,15 @@ export const healthApi = {
     switch (mockScenario()) {
       case "health-degraded":
         return delay(degradedDoc());
+      case "health-owner-only":
+        return delay(ownerOnlyDoc());
+      case "health-confirmed-drain":
+        return delay(confirmedDrainDoc());
       case "health-incident": {
         const d = incidentDoc();
         // Reflect a prior snooze so the banner stays hidden until the snooze expires or a
         // new episode opens — the same round-trip the real endpoint gives the banner.
-        if (snoozedUntil) d.snoozed_until = snoozedUntil;
+        if (snoozed?.episode === d.episode_id) d.snoozed_until = snoozed.until;
         return delay(d);
       }
       case "health-silent":
@@ -47,8 +54,11 @@ export const healthApi = {
   snoozeAdminHealth: async (): Promise<{ episode_id: string; snoozed_until: string }> => {
     requireAdmin();
     const until = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-    snoozedUntil = until;
-    const episodeId = incidentDoc().episode_id ?? "b1f0c2ep";
+    if (mockScenario() !== "health-incident") {
+      throw new ApiError(409, "no open health episode to snooze");
+    }
+    const episodeId = incidentDoc().episode_id!;
+    snoozed = { episode: episodeId, until };
     return delay({ episode_id: episodeId, snoozed_until: until });
   },
 };

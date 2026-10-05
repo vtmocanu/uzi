@@ -164,18 +164,9 @@ function HealthContent({ doc, nowMs }: { doc: HealthDoc; nowMs: number }) {
 
 function AttentionCard({ doc, attention, nowMs }: { doc: HealthDoc; attention: HealthCheck[]; nowMs: number }) {
   const danger = doc.status === "danger";
-  const { title } = healthVerdict(doc.status, doc.counts);
-  // The title and the band's tone come from doc.status / doc.counts (healthVerdict); the
-  // severity badges and the sub line are counted from the attention list itself, so those two
-  // always match the items below. The sub line is page-local on purpose: healthVerdict.sub is
-  // the Overview card's.
+  const { title, sub } = healthVerdict(doc);
+  // The tone follows overall severity; badges and items retain owner-scoped evidence.
   const count = (s: Sev) => attention.filter((c) => sevOf(c.severity) === s).length;
-  const more = attention.length - count("danger");
-  const sub = danger
-    ? more > 0
-      ? `Plus ${more} more that need attention without blocking work. Worst first, each with what to do.`
-      : "Worst first, each with what to do."
-    : "Work is still flowing. Worst first, each with what to do.";
 
   return (
     // Card always carries border-edge and cx does not merge classes; in the compiled CSS

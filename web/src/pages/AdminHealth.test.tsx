@@ -18,6 +18,7 @@ import { AdminHealth } from "./AdminHealth";
 import { likelyCause } from "../components/WorkerUpgradeBadge";
 import { api, type AdminWorker, type HealthDoc } from "../lib/api";
 import {
+  ownerOnlyDoc,
   degradedDoc,
   healthySilentDoc,
   incidentDoc,
@@ -106,7 +107,7 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
     expect(screen.getByText("refreshes every 10 s")).toBeTruthy();
     // No attention band (no alert/status region, no verdict heading) and no attention items.
     expect(container.querySelector('[role="alert"], [role="status"]')).toBeNull();
-    expect(screen.queryByRole("heading", { name: /blocking|warning/ })).toBeNull();
+    expect(screen.queryByRole("heading", { name: /blocking|attention/ })).toBeNull();
     expect(attentionIds(container)).toEqual([]);
     // Every check's shape carries its word; all 15 read OK, none Warn/Danger.
     expect(screen.getAllByText("OK").length).toBe(15);
@@ -114,13 +115,22 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
     expect(screen.queryByLabelText(/health checks? needs? attention/)).toBeNull();
   });
 
+  it("keeps owner danger evidence and action visible without claiming an instance block", async () => {
+    const { container } = await renderHealth(ownerOnlyDoc());
+    expect(band("3 checks need attention; no instance-wide blocker detected").getAttribute("role")).toBe("alert");
+    const capacity = attentionItem(container, "fleet.capacity")!;
+    expect(within(capacity).getByText("2")).toBeTruthy();
+    expect(within(capacity).getByText(/Recover or provision a worker/)).toBeTruthy();
+    expect(attentionIds(container)).toEqual(["fleet.capacity", "queue.waiting", "forge.ciwatch"]);
+  });
+
   it("warn (degraded): a warn status band and both warn items expanded with their action", async () => {
     const { container } = await renderHealth(degradedDoc());
-    // Count-aware warn headline, derived from counts (2 warn, 0 unknown → "2 warnings").
-    const b = band("2 warnings, nothing is blocked");
+    // Every non-ok/non-na check contributes to the neutral attention headline.
+    const b = band("2 checks need attention");
     expect(b.getAttribute("role")).toBe("status");
     expect(screen.queryByRole("alert")).toBeNull();
-    expect(within(b).getByText("Work is still flowing. Worst first, each with what to do.")).toBeTruthy();
+    expect(within(b).getByText("Review the flagged checks below for evidence and what to do.")).toBeTruthy();
     expect(within(b).getByText("2 Warn")).toBeTruthy();
     // Both warn items are fully expanded (no <details>, nothing to click): the action is there.
     expect(container.querySelector("details")).toBeNull();
@@ -139,12 +149,12 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
 
   it("danger (incident): alert band, derived sub line, worst first, Fleet link only on fleet.* items", async () => {
     const { container } = await renderHealth(incidentDoc(), incidentFleetWorkers());
-    // Count-aware danger headline (3 danger; the 1 warn is not blocking and is excluded).
-    const b = band("uzi cannot run work: 3 blocking checks");
+    // Only one of the three danger checks has instance scope.
+    const b = band("uzi cannot run work: 1 blocking check");
     expect(b.getAttribute("role")).toBe("alert");
-    // K = 4 attention − 3 danger = 1.
+    // The shared sub line makes no workflow claim for owner attention.
     expect(
-      within(b).getByText("Plus 1 more that need attention without blocking work. Worst first, each with what to do."),
+      within(b).getByText("Work is blocked until these clear. Start with the flagged checks below."),
     ).toBeTruthy();
     expect(within(b).getByText("3 Danger")).toBeTruthy();
     expect(within(b).getByText("1 Warn")).toBeTruthy();
@@ -176,12 +186,12 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
     expect((await screen.findAllByText("worker: ImagePullBackOff")).length).toBe(4);
   });
 
-  it("orders danger before unknown before warn and counts K over every non-danger item", async () => {
+  it("orders danger before unknown before warn while retaining severity totals", async () => {
     // slack.socket (after the warn forge.ciwatch in registry order) turned unknown.
     const { container } = await renderHealth(withSeverity(incidentDoc(), { "slack.socket": "unknown" }));
     expect(attentionIds(container)).toEqual(["fleet.roll", "fleet.capacity", "queue.waiting", "slack.socket", "forge.ciwatch"]);
-    const b = band("uzi cannot run work: 3 blocking checks");
-    expect(within(b).getByText(/^Plus 2 more that need attention/)).toBeTruthy();
+    const b = band("uzi cannot run work: 1 blocking check");
+    expect(within(b).getByText("Work is blocked until these clear. Start with the flagged checks below.")).toBeTruthy();
     expect(within(b).getAllByText(/^\d+ (Danger|Unknown|Warn)$/).map((el) => el.textContent)).toEqual([
       "3 Danger",
       "1 Unknown",
@@ -189,19 +199,18 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
     ]);
   });
 
-  it("danger with nothing else: the sub line drops the 'Plus K more' clause", async () => {
+  it("danger without warnings retains the shared blocker guidance", async () => {
     await renderHealth(withSeverity(incidentDoc(), { "forge.ciwatch": "ok" }));
-    const b = band("uzi cannot run work: 3 blocking checks");
-    expect(within(b).getByText("Worst first, each with what to do.")).toBeTruthy();
+    const b = band("uzi cannot run work: 1 blocking check");
+    expect(within(b).getByText("Work is blocked until these clear. Start with the flagged checks below.")).toBeTruthy();
     expect(within(b).queryByText(/Plus/)).toBeNull();
   });
 
   it("unknown: Unknown items render expanded in a warn band (a stale signal is never green)", async () => {
     const { container } = await renderHealth(unknownDoc());
     // Overall ranks unknown as warn: the verdict is the warn one, not danger. The headline
-    // folds unknowns into the warn count (4 unknown, 0 warn → "4 warnings"); the pip names
-    // them separately.
-    const b = band("4 warnings, nothing is blocked");
+    // counts all four attention checks; the pip names their unknown severity separately.
+    const b = band("4 checks need attention");
     expect(b.getAttribute("role")).toBe("status");
     expect(within(b).getByText("4 Unknown")).toBeTruthy();
     expect(attentionIds(container).sort()).toEqual(["controller.report", "fleet.capacity", "fleet.roll", "queue.waiting"]);
@@ -272,7 +281,7 @@ describe("AdminHealth — All checks inventory (M4)", () => {
     await act(async () => {
       document.dispatchEvent(new Event("visibilitychange"));
     });
-    expect(await screen.findByRole("heading", { name: "2 warnings, nothing is blocked" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "2 checks need attention" })).toBeTruthy();
     expect(groupButton("Control plane").getAttribute("aria-expanded")).toBe("true");
     expect(screen.getByText("Database reachable (2ms); schema at head.")).toBeTruthy();
     expect(groupButton("Queue").getAttribute("aria-expanded")).toBe("false");
