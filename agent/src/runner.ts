@@ -7522,9 +7522,9 @@ export class RunRunner {
       parked: false,
       holdOrWallParkConfirmed: false,
       uncertainWallPark: false,
-      // PRD #1391 Run B M3 (N2/D5): no terminal outcome resolved yet. Set by journalAndSendTerminal
-      // the moment any completed/failed for this generation is sent/resolved (write-ahead or not),
-      // so reportGenericFailure never falls through to a SECOND `failed` once one is final.
+      // PRD #1391 Run B M3 (N2/D5): no terminal outcome selected yet. Set by journalAndSendTerminal
+      // when an outcome is resolved or a competing outcome is deferred for an unavailable selected
+      // winner, so reportGenericFailure never falls through to a SECOND `failed` after either decision.
       terminalResolved: false,
       // #1539: set by the permanent-failure hook (undefined until then) — the pre-settle reap
       // outcome and the safety epoch it reaped, for reportGenericFailure's one-time custody settle.

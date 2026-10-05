@@ -147,7 +147,7 @@ export async function journalAndResolveTerminal(
   const { runId, claimGeneration, phase, messagesThroughSeq, body, send, signal } = args;
   // #1539: the write-ahead install and the send/resolve are now the two exported primitives
   // {@link installTerminalWriteAhead} / {@link sendUnjournaledTerminal} + {@link resolvePendingTerminal},
-  // so a caller that must interleave work BETWEEN the durable install and the resolve (the
+  // so a caller that must interleave work BETWEEN the install/deferral decision and any resolve (the
   // permanent-failure hook's abort-then-reap, RunRunner.journalAndSendTerminal) can. This helper keeps
   // the write-ahead flow for its direct callers (postTerminalState, the terminal-resolve tests):
   // install → resolvePendingTerminal, fallback → sendUnjournaledTerminal, or deferral without a send.
@@ -161,9 +161,9 @@ export async function journalAndResolveTerminal(
 }
 
 /**
- * #1539: the DURABLE-INSTALL half of the write-ahead terminal path, split out so a caller can run
- * work BETWEEN the install and the resolve (the permanent-failure hook aborts + reaps the provider
- * after the `failed` journal is on disk but before it is sent). Canonicalises the body ONCE (D-A1/D2:
+ * #1539: the INSTALL-DECISION half of the write-ahead terminal path, split out so a caller can run
+ * work BETWEEN the install/deferral decision and any resolve (the permanent-failure hook aborts +
+ * reaps the provider after this decision and before any send). Canonicalises the body ONCE (D-A1/D2:
  * the SAME bytes are journalled and sent, so the first send and any replay are byte-identical) and
  * journals it write-ahead.
  *
