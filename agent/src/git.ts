@@ -7480,6 +7480,8 @@ const { spawn } = require("node:child_process");
 const { createHash } = require("node:crypto");
 const [clone, base, git] = process.argv.slice(1);
 const C = fs.constants;
+// Linux O_PATH is not exported by every Node build; this helper already uses Linux proc-fd paths.
+const O_PATH = 0x200000;
 const PATCH_LIMIT = 512 * 1024, METADATA_LIMIT = 2 * 1024 * 1024;
 const FILE_LIMIT = 4 * 1024 * 1024, TOTAL_LIMIT = 128 * 1024 * 1024;
 const PATH_LIMIT = 20000, ENTRY_LIMIT = 30000, DIR_LIMIT = 2048, DEPTH_LIMIT = 64;
@@ -7494,13 +7496,21 @@ function directory(parent, name) {
   const fd = fs.openSync(fdpath(parent) + "/" + name, C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW);
   fds.add(fd); return fd;
 }
+function pathOnly(p) {
+  check();
+  const fd = fs.openSync(p, O_PATH | C.O_NOFOLLOW);
+  fds.add(fd); return fd;
+}
 function absoluteDirectory(p) {
-  let fd = fs.openSync("/", C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW); fds.add(fd);
+  let fd = pathOnly("/");
   for (const part of p.split("/").filter(Boolean)) {
     if (part === "." || part === "..") throw Error("unsafe root");
-    const next = directory(fd, part); close(fd); fd = next;
+    const next = pathOnly(fdpath(fd) + "/" + part);
+    if (!fs.fstatSync(next).isDirectory()) throw Error("non-directory root");
+    close(fd); fd = next;
   }
-  return fd;
+  // Ancestors need lookup authority only. Acquire read authority at the pinned checkout.
+  const root = directory(fd, "."); close(fd); return root;
 }
 function components(p) {
   const parts = p.split("/");
@@ -7508,15 +7518,28 @@ function components(p) {
       || Buffer.from(p).toString() !== p) throw Error("unsafe path");
   return parts;
 }
-function openFile(root, p) {
+function openFile(root, p, replacementAbsent = false) {
   const parts = components(p); let parent = root, owned = false;
   try {
     for (const part of parts.slice(0, -1)) {
-      const next = directory(parent, part); if (owned) close(parent); parent = next; owned = true;
+      const next = pathOnly(fdpath(parent) + "/" + part);
+      const st = fs.fstatSync(next);
+      if (!st.isDirectory()) {
+        close(next);
+        // Only a pinned regular file proves a former descendant is absent.
+        if (replacementAbsent && st.isFile()) return undefined;
+        throw Error("non-directory source ancestor");
+      }
+      if (owned) close(parent); parent = next; owned = true;
     }
     const fd = fs.openSync(fdpath(parent) + "/" + parts.at(-1), C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
     fds.add(fd);
-    if (!fs.fstatSync(fd).isFile()) { close(fd); throw Error("nonregular source"); }
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) {
+      close(fd);
+      if (replacementAbsent && st.isDirectory()) return undefined;
+      throw Error("nonregular source");
+    }
     return fd;
   } finally { if (owned) close(parent); }
 }
@@ -7816,7 +7839,7 @@ function indexEntries(bytes) {
     let fd, content = null, mode = 0o100644;
     const previous = old.get(name);
     try {
-      try { fd = openFile(root, name); } catch (e) { if (e.code !== "ENOENT") throw e; }
+      try { fd = openFile(root, name, true); } catch (e) { if (e.code !== "ENOENT") throw e; }
       if (fd !== undefined) {
         const st = fs.fstatSync(fd, { bigint: true });
         mode = st.mode & 0o111n ? 0o100755 : 0o100644;

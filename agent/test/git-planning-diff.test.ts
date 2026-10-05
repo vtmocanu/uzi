@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import fs from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import assert from "node:assert/strict";
@@ -13,6 +14,8 @@ import type { BoundaryProcessHandle, BoundaryProcessRequest } from "../src/harne
 import { TickSpawner } from "../src/tick-spawner.js";
 import { runnerPath, runnerTmpdir } from "../src/runner-uid.js";
 import { nullLogger } from "./helpers.js";
+import { commandSandboxArgv } from "../src/codex/codex-executor.js";
+import { probeLandlockAvailability } from "../src/codex/codex-capability.js";
 
 const cap = 512 * 1024;
 const git = new GitCache(process.cwd(), nullLogger());
@@ -39,15 +42,14 @@ function run(handle: BoundaryProcessHandle, signal = new AbortController().signa
 }
 
 const exec = promisify(execFile);
-async function fixture(options: { seed?: (seed: string) => Promise<void>; shared?: boolean; meter?: boolean } = {}): Promise<{
+async function fixture(options: { seed?: (seed: string) => Promise<void>; shared?: boolean; meter?: boolean; sandbox?: boolean } = {}): Promise<{
   cache: GitCache; clone: string; base: string; data: string;
   git: (...args: string[]) => Promise<string>;
   capture: (signal?: AbortSignal) => Promise<Buffer>;
   dispose: () => Promise<void>;
 }> {
-  const scratch = path.resolve(import.meta.dirname, "../../.uzi/scratch");
-  await fs.mkdir(scratch, { recursive: true });
-  const data = await fs.mkdtemp(path.join(scratch, "planning-fixture-"));
+  const tempRoot = await fs.realpath(os.tmpdir());
+  const data = await fs.mkdtemp(path.join(tempRoot, "planning-fixture-"));
   const seed = path.join(data, "seed");
   const clone = path.join(data, "runner", "repo", "issue-1");
   await fs.mkdir(seed);
@@ -68,8 +70,30 @@ async function fixture(options: { seed?: (seed: string) => Promise<void>; shared
     data, clone, base, cache, git: (...args) => run(clone, ...args),
     capture: async (signal = new AbortController().signal) => {
       const owner = new TickSpawner({ signal, killGraceMs: 100 });
+      const privateTmp = options.sandbox
+        ? await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "planning-command-")) : undefined;
       try {
         return await cache.withBoundaryProcessSpawner((request) => {
+          if (privateTmp) {
+            const argv = [...request.argv];
+            assert.equal(argv[1], "-e");
+            // Prove enforced read confinement in the same process that captures the checkout.
+            argv[2] = `
+const denyFs = require("node:fs");
+for (const denied of ["/", ${JSON.stringify(path.join(data, "seed", "tracked"))}]) {
+  let deniedError;
+  try { const fd = denyFs.openSync(denied, denyFs.constants.O_RDONLY); denyFs.closeSync(fd); }
+  catch (error) { deniedError = error; }
+  if (deniedError?.code !== "EACCES") throw Error("required sandbox did not deny " + denied);
+}
+` + argv[2];
+            return owner.spawn({
+              ...request,
+              argv: ["/usr/local/bin/uzi-codex-command-sandbox",
+                ...commandSandboxArgv(clone, clone, argv[0]!, argv.slice(1), privateTmp, "required")],
+              env: { ...request.env, HOME: privateTmp, TMPDIR: privateTmp },
+            });
+          }
           if (!options.meter) return owner.spawn(request);
           // Instrument only the trusted inline capture program, preserving its argv and body.
           const argv = [...request.argv];
@@ -115,6 +139,7 @@ process.on("exit", () => meterFs.writeFileSync(${JSON.stringify(metricPath)}, JS
       } finally {
         await owner.settled();
         assert.deepEqual(owner.survivors(), []);
+        if (privateTmp) await fs.rm(privateTmp, { recursive: true, force: true });
       }
     },
     dispose: () => fs.rm(data, { recursive: true, force: true }),
@@ -122,6 +147,78 @@ process.on("exit", () => meterFs.writeFileSync(${JSON.stringify(metricPath)}, JS
 }
 
 describe("Unit2 runner source capture", () => {
+  it("captures under the enforced required command sandbox", async (t) => {
+    if (process.platform !== "linux") { t.skip("Linux command sandbox required"); return; }
+    try { await fs.access("/usr/local/bin/uzi-codex-command-sandbox", fs.constants.X_OK); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      t.skip("fixed command sandbox binary absent"); return;
+    }
+    const probe = probeLandlockAvailability();
+    if (probe === "unavailable") { t.skip("kernel Landlock unavailable"); return; }
+    assert.equal(probe, "available");
+    const f = await fixture({ sandbox: true });
+    try {
+      await fs.writeFile(path.join(f.clone, "tracked"), "sandbox change\n");
+      assert.match((await f.capture()).toString(), /-base\n\+sandbox change/);
+    } finally { await f.dispose(); }
+  });
+
+  for (const direction of ["file to directory", "directory to file"]) {
+    for (const staged of [false, true]) {
+      it(`captures ${direction} replacement (${staged ? "staged" : "unstaged"})`, async () => {
+        const fileFirst = direction === "file to directory";
+        const f = await fixture({ seed: async seed => {
+          if (!fileFirst) await fs.mkdir(path.join(seed, "a"));
+          await fs.writeFile(path.join(seed, fileFirst ? "a" : "a/b"), "old replacement\n");
+        } });
+        try {
+          await fs.rm(path.join(f.clone, "a"), { recursive: true });
+          if (fileFirst) await fs.mkdir(path.join(f.clone, "a"));
+          await fs.writeFile(path.join(f.clone, fileFirst ? "a/b" : "a"), "new replacement\n");
+          if (staged) await f.git("add", "-A");
+          const patch = await f.capture();
+          const text = patch.toString();
+          assert.match(text, /deleted file mode 100644/);
+          assert.match(text, /new file mode 100644/);
+          assert.match(text, /-old replacement/);
+          assert.match(text, /\+new replacement/);
+          // Applying the public patch must reproduce the new path shape and bytes.
+          const target = path.join(f.data, "apply");
+          await exec("git", ["clone", "--quiet", "--no-local", path.join(f.data, "seed"), target],
+            { env: gitEnv(), timeout: 5000 });
+          const patchPath = path.join(f.data, "replacement.patch");
+          await fs.writeFile(patchPath, patch);
+          await exec("git", ["-C", target, "apply", patchPath], { env: gitEnv(), timeout: 5000 });
+          assert.equal(await fs.readFile(path.join(target, fileFirst ? "a/b" : "a"), "utf8"), "new replacement\n");
+          if (!fileFirst) await assert.rejects(fs.stat(path.join(target, "a/b")), { code: "ENOTDIR" });
+        } finally { await f.dispose(); }
+      });
+    }
+  }
+
+  for (const kind of ["symlink to file", "symlink to directory", "dangling symlink", "fifo"]) {
+    for (const nested of [false, true]) {
+      it(`refuses ${kind} replacing a tracked ${nested ? "ancestor" : "leaf"}`, async () => {
+        const f = await fixture({ seed: async seed => {
+          if (nested) await fs.mkdir(path.join(seed, "a"));
+          await fs.writeFile(path.join(seed, nested ? "a/b" : "a"), "old replacement\n");
+        } });
+        try {
+          await fs.rm(path.join(f.clone, "a"), { recursive: true });
+          const outside = path.join(f.data, "outside");
+          if (kind === "symlink to directory") {
+            await fs.mkdir(outside);
+            await fs.writeFile(path.join(outside, "b"), "outside\n");
+          } else if (kind === "symlink to file") await fs.writeFile(outside, "outside\n");
+          if (kind === "fifo") await exec("mkfifo", [path.join(f.clone, "a")], { timeout: 5000 });
+          else await fs.symlink(outside, path.join(f.clone, "a"));
+          await assert.rejects(f.capture(), /process failed/);
+        } finally { await f.dispose(); }
+      });
+    }
+  }
+
   for (const kind of ["outside loose symlink", "outside loose directory symlink", "forged blob", "forged commit", "forged tree", "packed pack symlink", "packed idx symlink", "packed directory symlink"]) {
     it("refuses object integrity attack: " + kind, async () => {
       const f = await fixture();
