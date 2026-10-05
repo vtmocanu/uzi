@@ -792,8 +792,7 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 	}
 	cols = append(cols, "ATTENTION")
 	header := "  " + strings.Join(cols, " ")
-	rule := m.pal.faint.Render(strings.Repeat("─", width))
-	lines = append(lines, rule, m.pal.faint.Render(clampVisual(header, width)))
+	lines = append(lines, "", m.pal.faint.Render(clampVisual(header, width)))
 	rows := m.workers.visible(time.Now())
 	if m.workers.admin != m.board.admin {
 		rows = nil
@@ -829,7 +828,7 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 		}
 		lines = append(lines, empty)
 	}
-	lines = append(lines, rule)
+	lines = append(lines, "")
 	lines = append(lines, readout...)
 	if full {
 		for len(lines) < height-1 {
