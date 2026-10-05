@@ -1,11 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { healthApi } from "./health";
-import { workersApi } from "./workers";
-import { ownerOnlyWaitingOwnerId, ownerOnlyWaitingRunId } from "../data/health";
-import { mockScenario } from "./shared";
+import { healthApi } from "./mockApi/health";
+import { workersApi } from "./mockApi/workers";
+import { ownerOnlyWaitingOwnerId, ownerOnlyWaitingRunId } from "./data/health";
+import { mockScenario } from "./mockApi/shared";
 
-vi.mock("./shared", () => ({
+vi.mock("./mockApi/shared", () => ({
   delay: <T>(value: T) => Promise.resolve(value),
   mockScenario: vi.fn(),
   requireAdmin: vi.fn(),
