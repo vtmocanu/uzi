@@ -1681,6 +1681,43 @@ describe("shutdown at an observed plan gate", () => {
     return execFileSync("git", ["-C", clone, "rev-parse", "HEAD"], { env: gitEnv, encoding: "utf8" }).trim();
   };
 
+  const readRetainedGateWork = (s: Scenario, flight: Flight, clone: string) => {
+    const gate = s.gates(flight)[0];
+    const failed = s.states(flight).find((state) => state.status === "failed");
+    // A terminal flight also satisfies the readiness wait. It may have failed before a clone
+    // existed, so require the gate before reading work and retain the primary failure reason.
+    assert.ok(gate, `the resumed claim reached no plan gate: ${failed?.failure_reason ?? s.statuses(flight).join(",")}`);
+    return { gate, content: fs.readFileSync(path.join(clone, "SHUTDOWN-WORK.txt"), "utf8") };
+  };
+
+  it("a reclaim refused before cloning reports its primary failure before reading retained work", {
+    skip: process.platform !== "linux" ? "the HOME-attributed pre-clone reap is Linux-only" : false,
+  }, (t) => scenario(async (s) => {
+    const helper = forceIncompleteHomeHelper(t);
+    const first = await s.toFirstGate();
+    const bare = git.barePathFor(fx.originPath);
+    const clone = git.runnerClonePath(bare, `issue-${s.base.issue_iid}`);
+    const committedTip = commitWork(clone);
+    await s.shutdown(first);
+    const trackedTip = await git.trackingTip(bare, `agent/issue-${s.base.issue_iid}`);
+    assert.ok(trackedTip, "the original work is captured before reclaim");
+    execFileSync("git", ["-C", bare, "merge-base", "--is-ancestor", committedTip, trackedTip], { env: gitEnv });
+
+    helper.enabled = true;
+    const resumed = s.start(s.resumeClaim("none"), { executor: () => new SdkExecutor(nullLogger(), s.home, {
+      queryFn: s.model.queryFn(), runProcesses: { scan: scanRunProcesses, reap: reapRunProcesses },
+    }) });
+    await s.finish(resumed);
+    assert.ok(helper.calls > 0, "the real HOME helper received the forced incomplete result");
+    assert.equal(s.gates(resumed).length, 0, "the failed reclaim presented no gate");
+    assert.equal(s.states(resumed).find((state) => state.status === "failed")?.fail_origin, "worker_residue_blocked");
+    assert.equal(fs.existsSync(clone), false, "the pre-clone refusal created no runner clone");
+    assert.throws(() => readRetainedGateWork(s, resumed, clone), (error: unknown) =>
+      error instanceof assert.AssertionError &&
+      /reached no plan gate: worker_residue_blocked:.*no clone was fetched/.test(error.message),
+    "the missing gate reports the primary refusal instead of a secondary ENOENT");
+  }));
+
   it("wakes an idle gate on shutdown without a verdict or cancel input", () =>
     scenario(async (s) => {
       const flight = s.start(s.claim(), { runner: { planApprovalTimeoutMs: 0 } });
@@ -1765,9 +1802,10 @@ describe("shutdown at an observed plan gate", () => {
         assert.equal(claim.plan_approved, false, "the resumed claim still needs approval");
         const resumed = s.start(claim);
         assert.ok(await until(() => s.gates(resumed).length > 0 || resumed.finished, 3_000), s.statuses(resumed).join(","));
-        assert.equal(fs.readFileSync(path.join(git.runnerClonePath(bare, `issue-${s.base.issue_iid}`), "SHUTDOWN-WORK.txt"), "utf8"),
+        const { gate: nextGate, content: retainedWork } = readRetainedGateWork(s, resumed,
+          git.runnerClonePath(bare, `issue-${s.base.issue_iid}`));
+        assert.equal(retainedWork,
           "committed before gate shutdown\n", "the resumed clone retains the committed work");
-        const nextGate = s.gates(resumed)[0]!;
         if (session === "kept") {
           await s.finish(resumed);
           assert.equal(nextGate.plan_md, PLAN_V1, "the submitted plan is re-presented");
