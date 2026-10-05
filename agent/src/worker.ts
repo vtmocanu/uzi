@@ -1,5 +1,6 @@
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
+import { TerminalRejectionCoordinator } from "./terminal-rejections.js";
 import { replaySegment } from "./batcher.js";
 import type { Outbox, PendingFinalize } from "./outbox.js";
 import type { RunRunner } from "./runner.js";
@@ -112,7 +113,18 @@ export class Worker {
       execute: () => Promise.reject(new Error("no job runner wired")),
     },
     private readonly dindMaintenance?: DindMaintenanceController,
-  ) {}
+    private readonly terminalRejections?: TerminalRejectionCoordinator,
+  ) {
+    // Existing constructor callers with a real outbox/client also reconcile after restart.
+    if (!this.terminalRejections && outbox && typeof client.reportTerminalRejections === "function" &&
+        typeof client.getTerminalRejectionCustody === "function" && typeof client.hasFeature === "function") {
+      this.terminalRejections = new TerminalRejectionCoordinator(outbox, client, log, undefined,
+        (runId) => this.admittedRunIds.has(runId) || (activeRuns?.has(runId) ?? false) ||
+          (typeof runner.isExecuting === "function" && runner.isExecuting(runId)));
+    }
+  }
+
+  private readonly admittedRunIds = new Map<string, number>();
 
   /** The run lane's in-flight executions (issue #1759: a field so {@link isIdle} can read it). */
   private readonly runActive = new Set<Promise<void>>();
@@ -159,8 +171,20 @@ export class Worker {
     // A runner stub without the method (older test doubles) simply has nothing to snapshot.
     const bootRecoveries =
       typeof this.runner.snapshotBootRecoveries === "function" ? await this.runner.snapshotBootRecoveries() : [];
-    await this.registerWithRetry(signal);
-    if (signal.aborted) return;
+    let heartbeat = Promise.resolve();
+    let rejections = Promise.resolve();
+    let registered = false;
+    await this.registerWithRetry(signal, (workerId) => {
+      if (registered) return;
+      registered = true;
+      // Start before finalize retirement or any other post-registration await.
+      heartbeat = this.heartbeatLoop(signal);
+      rejections = this.terminalRejections?.loop(workerId, signal) ?? Promise.resolve();
+    });
+    if (signal.aborted) {
+      await Promise.all([heartbeat, rejections]);
+      return;
+    }
     // PRD #1296 M3 (D3/D5) — after registering (so the worker is authenticated), re-drive
     // any durable-recovery capture the previous life left journaled: re-upload the exact
     // journaled bundle bytes with NO forge PAT. Fire-and-forget and fully swallowed — a
@@ -195,7 +219,6 @@ export class Worker {
     // exists. The claim loops themselves additionally stay closed while the pending set exceeds the
     // cap (`pending_overflow`, checked each iteration in claimLoop), and message drain stays in the
     // background above. The heartbeat promise is created once and awaited alongside the claim loops.
-    const heartbeat = this.heartbeatLoop(signal);
     await this.resolveBootTerminals(signal);
     // issue #1582 M2: ONLY after the boot pending-terminal gate, start the ancestry-settlement loop
     // alongside the claim loops (it never gates them): an immediate sweep of every due
@@ -208,7 +231,7 @@ export class Worker {
     const dindMaintenance = this.dindMaintenance?.loop(signal) ?? Promise.resolve();
     // PRD #1809 D7: the periodic disk reclaim, only when enabled. Its loop never throws.
     const diskReclaim = this.diskPressure ? this.diskPressure.loop(signal) : Promise.resolve();
-    await Promise.all([heartbeat, settlement, dindPrune, dindMaintenance, diskReclaim, this.claimLoop(signal), this.chatClaimLoop(signal)]);
+    await Promise.all([heartbeat, rejections, settlement, dindPrune, dindMaintenance, diskReclaim, this.claimLoop(signal), this.chatClaimLoop(signal)]);
   }
 
   /** issue #1582 M2: sweep the settlement journal now, then every `settlementSweepMs` until the
@@ -426,7 +449,7 @@ export class Worker {
     return typeof runner.isExecuting === "function" ? runner.isExecuting(runId) : false;
   }
 
-  private async registerWithRetry(signal: AbortSignal): Promise<void> {
+  private async registerWithRetry(signal: AbortSignal, onRegistered: (workerId: string | undefined) => void = () => {}): Promise<void> {
     // PRD #1391 Run B M4 (D7/SC3): if this worker holds any pending terminal journal, carry an
     // initial snapshot with an EMPTY pending subset + `pending_overflow: true` ON the register
     // request, so those outcomes are LEASED before the api's register-time orphan pass can re-claim
@@ -579,6 +602,7 @@ export class Worker {
         });
         this.dindPrune?.setWorkerId(res.worker_id);
         this.dindMaintenance?.register(res.register_nonce, this.client.hasFeature("dind_maintenance_v1"));
+        onRegistered(res.worker_id);
         // Issue #1742: the api accepted this register, so retire the offered finalize records
         // (`sentFinalizes`, what the snapshot carried) and any lower-generation records of the same
         // offered runs. A failed register never reaches here. A
@@ -890,11 +914,14 @@ export class Worker {
         continue;
       }
       let claimed = false;
+      let releaseAdmission: (() => void) | undefined;
       try {
+        releaseAdmission = await this.terminalRejections?.acquireAdmission(signal);
+        if (signal.aborted) continue;
         // PRD #1390 M2a: carry the active-run snapshot on the claim (built from the SAME
         // monotonic epoch counter the heartbeat draws from) so the api's pre-claim dedupe
         // sees this worker's live runs even before the first post-outage heartbeat lands.
-        const claim = await this.client.claimRun(this.buildActiveSnapshot());
+        const claim = await this.client.claimRun(this.buildActiveSnapshot(), signal, this.config.httpTimeoutMs);
         if (claim && this.activeRuns?.has(claim.run_id)) {
           // PRD #1390 M3 (blocker 7) — belt-and-braces duplicate-claim assertion. The
           // server-side pre-claim dedupe (M3 api) is the real guard; this is the loud last
@@ -926,7 +953,17 @@ export class Worker {
           // PRD #1976: a profile-bound JOB (`isolated_fetch` on a `job` claim) runs on the JobRunner's
           // lane mode, which applies the same isolated confinement and fails closed without a valid
           // grant or the fetcher config; every other `isolated_fetch` claim stays on the IsolatedRunner.
-          const exec = claim.isolated_fetch
+          const admittedId = claim.run_id.toLowerCase();
+          this.admittedRunIds.set(admittedId, (this.admittedRunIds.get(admittedId) ?? 0) + 1);
+          const releaseAdmitted = () => {
+            const count = this.admittedRunIds.get(admittedId)!;
+            if (count === 1) this.admittedRunIds.delete(admittedId);
+            else this.admittedRunIds.set(admittedId, count - 1);
+          };
+          const releaseProtection = this.terminalRejections?.protectExecution(claim.run_id);
+          let exec: Promise<void>;
+          try {
+            exec = claim.isolated_fetch
             ? claim.kind === "job"
               ? this.jobRunner.execute(claim)
               : this.executeIsolated(claim)
@@ -936,6 +973,11 @@ export class Worker {
               ? this.judgeRunner.execute(claim)
               : claim.kind === "job" ? this.jobRunner.execute(claim)
               : this.runner.execute(claim);
+          } catch (err) {
+            releaseAdmitted();
+            releaseProtection?.();
+            throw err;
+          }
           const run = exec.catch((err) =>
             this.log.warn("claim/execute cycle failed", { error: errMessage(err) }),
           );
@@ -943,6 +985,8 @@ export class Worker {
           // issue #1759: the ending is activity the DinD prune's custody check orders against.
           void run.finally(() => {
             active.delete(run);
+            releaseAdmitted();
+            releaseProtection?.();
             this.dindPrune?.noteActivityEnded();
             this.dindMaintenance?.noteActivityEnded();
           });
@@ -950,6 +994,7 @@ export class Worker {
       } catch (err) {
         this.log.warn("claim/execute cycle failed", { error: errMessage(err) });
       } finally {
+        releaseAdmission?.();
         gate?.exitClaim();
       }
       // A claim yielded a run: immediately loop to fill the next free slot (up to

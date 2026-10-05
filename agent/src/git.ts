@@ -507,6 +507,8 @@ export interface CheckpointRange {
 
 /** issue #1597 M2: optional GitCache construction knobs. */
 export interface GitCacheOptions {
+  /** Physical terminal custody, rooted at the configured outbox by the caller. */
+  terminalRecordProtection?: (runId: string) => Promise<boolean>;
   /** The gitleaks executable. Default `"gitleaks"` (PATH outside a boundary scope, the image's
    *  absolute `/usr/local/bin/gitleaks` inside one via resolveBoundaryExecutable). A test injects an
    *  absolute path to a shim. */
@@ -1311,6 +1313,7 @@ export class GitCache {
   private readonly scratchProvisioner: ((clonePath: string) => Promise<void>) | undefined;
   /** See {@link GitCacheOptions.retentionDelete}; undefined in production. */
   private readonly retentionDeleteSeam: GitCacheOptions["retentionDelete"];
+  private readonly terminalRecordProtection: GitCacheOptions["terminalRecordProtection"];
   /** See {@link GitCacheOptions.canonicalFree}; undefined in production. */
   private readonly canonicalFreeSeam: GitCacheOptions["canonicalFree"];
   /** issue #1783 (N1): the targets (resolved) of every runner-uid delete that settled as a
@@ -1337,6 +1340,7 @@ export class GitCache {
     this.canonicalFreeSeam = opts.canonicalFree;
     this.reposRoot = path.join(dataDir, "repos");
     this.runnerRoot = path.join(dataDir, "runner");
+    this.terminalRecordProtection = opts.terminalRecordProtection;
     this.runnerHoldingRoot = path.join(dataDir, "runner-quarantine");
     this.recoveryRoot = path.join(dataDir, "recovery");
     this.recoverySettlementRoot = path.join(dataDir, "recovery-settlement");
@@ -3787,7 +3791,8 @@ export class GitCache {
       const kept: string[] = [];
       for (const e of last.values()) {
         const gone = path.isAbsolute(e.clonePath) && !(await this.pathPresent(e.clonePath));
-        const droppable = gone && !namedByJournal(e.clonePath) && (e.state !== "reclaimed" || !(await this.custodyHeld(e.runId)));
+        const droppable = gone && !namedByJournal(e.clonePath) && !(await this.hasPhysicalTerminalProtection(e.runId)) &&
+          (e.state !== "reclaimed" || !(await this.custodyHeld(e.runId)));
         if (!droppable) kept.push(attemptLedgerValue(e));
       }
       if (kept.length === raw.length && kept.every((v, i) => v === raw[i])) return;
@@ -3882,12 +3887,22 @@ export class GitCache {
     return out;
   }
 
+  /** Callback errors retain custody; no identity is inferred from terminal body fields. */
+  async hasPhysicalTerminalProtection(runId: string): Promise<boolean> {
+    try {
+      return await this.terminalRecordProtection?.(runId) ?? false;
+    } catch {
+      return true;
+    }
+  }
+
   /** issue #1783 M2: true when a custody or capture record under the recovery stores belongs to
    *  `runId` (a durable-recovery journal/bundle under `recovery/<runId>`, or an ancestry
    *  settlement record under `recovery-settlement/<runId>`). Neither record names a clone path,
    *  so any record of the run holds every retained attempt of that run. An unreadable store
    *  counts as held (fail closed). */
   private async custodyHeld(runId: string): Promise<boolean> {
+    if (await this.hasPhysicalTerminalProtection(runId)) return true;
     for (const root of [this.recoveryRoot, this.recoverySettlementRoot]) {
       try {
         if ((await fs.readdir(path.join(root, runId))).length > 0) return true;
@@ -4653,7 +4668,10 @@ export class GitCache {
 
   /** Remove the run's runner clone (a standalone clone, not a linked worktree — no
    *  bare interaction). The warm bare and the fetched refs/objects are kept. */
-  async removeRunnerClone(clonePath: string): Promise<void> {
+  async removeRunnerClone(clonePath: string, ownerRunId?: string): Promise<void> {
+    if (ownerRunId !== undefined && await this.hasPhysicalTerminalProtection(ownerRunId)) {
+      throw new Error("terminal record custody retains runner clone");
+    }
     await fs.rm(clonePath, { recursive: true, force: true });
   }
 
@@ -4709,6 +4727,9 @@ export class GitCache {
       const resolvedRoot = path.resolve(this.runnerRoot);
       if (!resolvedClone.startsWith(resolvedRoot + path.sep)) {
         throw new CapturePathMismatchError(clonePath, this.runnerRoot, branch, ownerRunId);
+      }
+      if (opts.discard && await this.hasPhysicalTerminalProtection(ownerRunId)) {
+        throw new Error("terminal record custody retains runner clone");
       }
       // 3. Worker-only 0700 holding destination: a SIBLING of runnerRoot under the same
       //    dataDir PATH — but NOT necessarily the same device: on a docker-lane worker
@@ -4844,7 +4865,8 @@ export class GitCache {
     //    the canonical is already free and the journal already cleared, so a partial
     //    scratch rm is harmless residue.
     const { holding, scratch } = result;
-    if (holding && opts.discard) {
+    const protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId);
+    if (holding && opts.discard && !protectedNow) {
       await fs.rm(holding, { recursive: true, force: true }).catch((e) =>
         this.log.warn("retireRunnerClone: holding dispose failed", {
           path: holding,
@@ -4852,7 +4874,7 @@ export class GitCache {
         }),
       );
     }
-    if (scratch) {
+    if (scratch && !protectedNow) {
       await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
     }
     return result.disposition;

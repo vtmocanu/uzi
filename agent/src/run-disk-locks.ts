@@ -22,9 +22,11 @@ export class RunDiskLocks {
 
   /**
    * Wait for every earlier holder of `runId` to release, then hold it. Returns the release
-   * function; calling it more than once is harmless. Never rejects.
+   * function; calling it more than once is harmless. An aborted waiter rejects without
+   * admitting any late action; subsequent waiters retain their FIFO order.
    */
-  async acquire(runId: string): Promise<() => void> {
+  async acquire(runId: string, signal?: AbortSignal): Promise<() => void> {
+    signal?.throwIfAborted();
     const previous = this.tails.get(runId) ?? Promise.resolve();
     let release!: () => void;
     const held = new Promise<void>((resolve) => {
@@ -34,7 +36,29 @@ export class RunDiskLocks {
     // one is still waiting for the first.
     const tail = previous.then(() => held);
     this.tails.set(runId, tail);
-    await previous;
+    // Cancellation removes this waiter's action, but preserves FIFO ordering for siblings.
+    // Its placeholder releases immediately; no late lock holder can run after abort.
+    if (signal) {
+      let onAbort!: () => void;
+      const cancelled = new Promise<never>((_resolve, reject) => {
+        onAbort = () => reject(signal.reason);
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+      try {
+        await Promise.race([previous, cancelled]);
+        signal.throwIfAborted();
+      } catch (err) {
+        release();
+        void tail.finally(() => {
+          if (this.tails.get(runId) === tail) this.tails.delete(runId);
+        });
+        throw err;
+      } finally {
+        signal.removeEventListener("abort", onAbort);
+      }
+    } else {
+      await previous;
+    }
     let released = false;
     return () => {
       if (released) return;

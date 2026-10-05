@@ -348,6 +348,43 @@ test("physical protection fails closed after 256 junk entries and preserves UUID
   assert.ok(await fs.stat(path.join(root, mixed, "terminal-3.json")));
 });
 
+test("busy outbox writes do not queue custody disposal or permit late cleanup", async () => {
+  const { box, file } = await fixture();
+  await reject(file);
+  const observed = await box.observeTerminalAuthentication(run, 3);
+  let unlock!: () => void;
+  let entered!: () => void;
+  const held = new Promise<void>((resolve) => { unlock = resolve; });
+  const ready = new Promise<void>((resolve) => { entered = resolve; });
+  const lock = box as unknown as { withRunLock<T>(id: string, fn: () => Promise<T>): Promise<T> };
+  const writer = lock.withRunLock(run, async () => { entered(); await held; });
+  await ready;
+  let reads = 0;
+  let allowed = true;
+  const cleanup = box.cleanupRejectedTerminalFiles(run, 3, worker, [observed], async () => {
+    reads++;
+    return settled();
+  }, () => allowed);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("disposal queued behind busy outbox")), 200);
+    });
+    assert.equal(await Promise.race([cleanup, deadline]), 0);
+    assert.equal(reads, 0);
+    assert.ok(await fs.stat(file));
+  } finally {
+    clearTimeout(timer);
+    allowed = false;
+    unlock();
+    await writer;
+    await cleanup;
+  }
+  assert.equal(reads, 0);
+  assert.ok(await fs.stat(file));
+  assert.equal(await box.cleanupRejectedTerminalFiles(run, 3, worker, [observed], async () => settled()), 1);
+});
+
 test("rejected cleanup directory fsync failure propagates without claiming durable completion", async () => {
   const { box, file, root } = await fixture();
   await reject(file);

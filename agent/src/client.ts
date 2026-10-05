@@ -1097,15 +1097,21 @@ export class WorkerClient {
    *  api's pre-claim dedupe sees the runs this worker is already executing BEFORE the first
    *  post-outage heartbeat lands. If not negotiated the claim posts an empty body `{}`, which
    *  an old api ignores (harmless — the run-lane claim was bodyless before this). */
-  async claimRun(activeSnapshot?: ActiveSnapshot): Promise<ClaimResponse | null> {
+  async claimRun(activeSnapshot?: ActiveSnapshot, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<ClaimResponse | null> {
+    // The same deadline reaches fetch AND its body. Await the real request rather than a race:
+    // admission must remain held until a late transport has definitively stopped.
+    const deadline = AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]);
+    deadline.throwIfAborted();
     const body: ClaimRequest = {};
     if (this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined) {
       body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
     }
-    const res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/claim`, body);
+    const res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/claim`, body, timeoutMs, deadline);
+    deadline.throwIfAborted();
     if (res.status === 204) return null;
     if (res.status >= 400) throw await this.toError("POST", `${WORKER_API_PREFIX}/runs/claim`, res);
     const claim = (await res.json()) as ClaimResponse;
+    deadline.throwIfAborted();
     // PRD #1798 D9: the pr_description is validated or dropped, never cast (decodePrState, the
     // same check as the bind / lookup / ack responses). The warning carries the run id only,
     // never the value (untrusted text). The isRecord guard keeps a `null` (or other non-object)

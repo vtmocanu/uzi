@@ -2021,23 +2021,32 @@ export class Outbox {
     workerId: string,
     observations: readonly TerminalAuthenticationObservation[],
     freshCustody: () => Promise<TerminalRejectionCustodyResponse | undefined>,
+    canDelete: () => boolean = () => true,
   ): Promise<number> {
     if (!terminalRunUUID(runId) || !terminalRunUUID(workerId) || !Number.isSafeInteger(generation) || generation < 0 || observations.length === 0 || observations.length > 256) return 0;
     runId = runId.toLowerCase();
     workerId = workerId.toLowerCase();
     const physicalRunId = observations[0]!.physicalRunId ?? runId;
     if (!terminalRunUUID(physicalRunId) || physicalRunId.toLowerCase() !== runId || observations.some(o => (o.physicalRunId ?? runId) !== physicalRunId)) return 0;
-    return this.withRunLock(physicalRunId, async () => {
+    // Do not hold admission while queued behind an unrelated outbox write. Busy runs
+    // remain protected and are revisited from the physical scan on its next pass.
+    const release = this.tryRunLock(physicalRunId);
+    if (!release) return 0;
+    try {
+      if (!canDelete()) return 0;
       const same = (a: TerminalAuthenticationObservation, b: TerminalAuthenticationObservation) =>
         a.kind === "mac_failure" && b.kind === "mac_failure" && a.runId === runId && a.generation === generation &&
         a.fileName === b.fileName && a.fingerprint !== undefined && b.fingerprint !== undefined &&
         a.fingerprint.dev === b.fingerprint.dev && a.fingerprint.ino === b.fingerprint.ino && a.fingerprint.sha256 === b.fingerprint.sha256;
       const names = new Set<string>();
       for (const observed of observations) {
+        if (!canDelete()) return 0;
         if (names.has(observed.fileName) || !same(observed, await this.observeTerminalAuthentication(physicalRunId, generation, observed.fileName))) return 0;
         names.add(observed.fileName);
       }
+      if (!canDelete()) return 0;
       const custody = await freshCustody();
+      if (!canDelete()) return 0;
       if (!custody || custody.run_id !== runId || custody.worker_id !== workerId || custody.generation !== generation ||
           custody.outcome !== "settled" || !custody.complete || !custody.exact_complete || !custody.sibling_complete ||
           !Number.isSafeInteger(custody.exact_count) || custody.exact_count < 1 || custody.exact_count > 256 ||
@@ -2046,12 +2055,15 @@ export class Outbox {
       let removed = 0;
       for (const observed of observations) {
         if (!same(observed, await this.observeTerminalAuthentication(physicalRunId, generation, observed.fileName))) return removed;
+        if (!canDelete()) return removed;
         await fs.unlink(path.join(this.runDir(physicalRunId), observed.fileName));
         await this.fsyncDir(this.runDir(physicalRunId), true);
         removed++;
       }
       return removed;
-    });
+    } finally {
+      release();
+    }
   }
 
   /** Read + authenticate a record file. Returns the parsed body (minus `mac`) when

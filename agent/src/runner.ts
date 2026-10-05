@@ -1836,6 +1836,7 @@ export interface CheckpointTestHooks {
 
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
 export interface RunnerOptions {
+  queueTerminalRejectionReconciliation?: (runId: string, generation: number) => void;
   /** How often the steering channel polls /inputs (default 3s). */
   pollMs?: number;
   /** issue #1783: the resolved Docker endpoint (DockerWiring.dockerHost) the run-quiescence
@@ -2177,6 +2178,8 @@ export class RunRunner {
         git: this.git,
         log: this.log,
         recoveryRoot: this.git.recoveryRoot,
+        terminalRecordProtection: (runId) => this.git.hasPhysicalTerminalProtection(runId),
+        onAuthoritativeGenerationReleased: opts.queueTerminalRejectionReconciliation,
         workerToken: this.joinToken,
         now: opts.now,
       });
@@ -2199,6 +2202,7 @@ export class RunRunner {
         deleteSettlementRefs: (bare, runId, holdId) => gitCache.deleteSettlementRefs(bare, runId, holdId),
         deleteRecoveryPin: (bare, runId, gen) => gitCache.deleteRecoveryPin(bare, runId, gen),
         forgetGeneration: (runId, gen) => recovery.forgetGeneration(runId, gen),
+        onAuthoritativeGenerationReleased: opts.queueTerminalRejectionReconciliation,
       },
       // issue #1751 M2: the live leg's local checks + `published` pin, in the trusted bare.
       liveGit: {
@@ -3547,7 +3551,7 @@ export class RunRunner {
           } else {
             // No bare/branch to key the journal on (a run that never journaled): fall
             // back to the bare recursive remove.
-            await this.git.removeRunnerClone(flight.worktreePath);
+            await this.git.removeRunnerClone(flight.worktreePath, runId);
           }
         } catch (e) {
           runLog.warn("runner clone cleanup failed", { error: errMessage(e) });

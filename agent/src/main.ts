@@ -30,6 +30,7 @@ import { CachesDroppedMemo, DiskPressureController, modelPassMinAgeMs, runDiskRe
 import { RunDiskSampler } from "./run-disk.js";
 import { DataVolumeGuard } from "./disk-full.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
+import { TerminalRejectionCoordinator } from "./terminal-rejections.js";
 import { DiskGovernor } from "./cache-cap.js";
 import { sampleVolume } from "./stats.js";
 import { errMessage } from "./util.js";
@@ -409,7 +410,9 @@ async function main(): Promise<void> {
   const client = new WorkerClient(config.apiUrl, config.workerToken, config.version, log, {
     httpTimeoutMs: config.httpTimeoutMs,
   });
-  const git = new GitCache(config.dataDir, log);
+  const git = new GitCache(config.dataDir, log, undefined, {
+    terminalRecordProtection: (runId) => outbox.hasPhysicalTerminalProtection(runId),
+  });
 
   // PRD #1809 D6: the data-volume guard. It classifies a failed write as data-volume disk-full
   // (the bare clone/fetch, the fetch-back, the outbox reserve), preflights the volume at claim and
@@ -439,6 +442,7 @@ async function main(): Promise<void> {
     runMaxBytes: config.outboxRunMaxBytes,
     maxBytes: config.outboxMaxBytes,
     retentionMs: config.outboxRetentionMs,
+    terminalMaxBytes: config.outboxTerminalMaxBytes,
     // PRD #1391 M3 (Run B, D2): size the physical `.reserve` for the terminal journals, derived from
     // ONE source — the per-record cap times how many hard-max journals must survive a full volume,
     // plus a per-record overhead. init() grows a deployed Run A worker's 64 KiB reserve up to this.
@@ -524,6 +528,8 @@ async function main(): Promise<void> {
 
   // PRD #1809 D7: the per-run lock the runner and the disk reclaim share (run-disk-locks.ts).
   const diskLocks = new RunDiskLocks();
+  const terminalRejections = new TerminalRejectionCoordinator(outbox, client, log, diskLocks,
+    (runId) => activeRuns.has(runId) || runner.isExecuting(runId));
   // The reclaim's memo of runs whose caches it found gone; the runner forgets a run there
   // each time it starts executing it (disk-reclaim.ts CachesDroppedMemo).
   const cachesDropped = new CachesDroppedMemo();
@@ -571,6 +577,7 @@ async function main(): Promise<void> {
     // Codex advice path takes no queryFn, so a stub queryFn could not neutralize it).
     skipDeliverySummary: config.executor === "stub",
     diskLocks,
+    queueTerminalRejectionReconciliation: (runId, generation) => terminalRejections.queueReconciliation(runId, generation),
     cachesDropped,
     dataVolume,
     diskGovernor,
@@ -808,6 +815,7 @@ async function main(): Promise<void> {
     isolatedRunner,
     jobRunner,
     dindMaintenance,
+    terminalRejections,
   );
 
   // Signal handlers FIRST, before anything that can take real time. Until these

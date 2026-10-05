@@ -140,6 +140,7 @@ export interface SettlementTerminalAck {
 
 /** The local cleanup a `released` settle performs — GitCache + RecoveryCoordinator satisfy it. */
 export interface SettlementCleanup {
+  onAuthoritativeGenerationReleased?: (runId: string, generation: number) => void;
   deleteSettlementRefs(barePath: string, runId: string, holdId: string): Promise<void>;
   deleteRecoveryPin(barePath: string, runId: string, generation: number): Promise<void>;
   forgetGeneration(runId: string, generation: number): Promise<void>;
@@ -410,6 +411,8 @@ export class PredecessorSettler {
   private readonly log: Logger;
   /** Per-(runId, holdId) queued lock: the tail of that hold's promise chain (deleted when idle). */
   private readonly holdLocks = new Map<string, Promise<void>>();
+  /** At most one hint per active hold; discarded from memory at lock release. */
+  private readonly pendingReleaseHints = new Map<string, number>();
 
   constructor(opts: PredecessorSettlerOptions) {
     this.journal = opts.journal;
@@ -438,8 +441,17 @@ export class PredecessorSettler {
     try {
       return await fn();
     } finally {
+      const generation = this.pendingReleaseHints.get(key);
+      this.pendingReleaseHints.delete(key);
       release();
       if (this.holdLocks.get(key) === tail) this.holdLocks.delete(key);
+      if (generation !== undefined) {
+        try {
+          this.cleanup.onAuthoritativeGenerationReleased?.(runId, generation);
+        } catch {
+          this.log.warn("recovery settlement: reconciliation hint failed", { run_id: runId });
+        }
+      }
     }
   }
 
@@ -696,6 +708,7 @@ export class PredecessorSettler {
     await this.cleanup.deleteRecoveryPin(rec.barePath, rec.runId, sent.predecessorGeneration);
     await this.cleanup.forgetGeneration(rec.runId, sent.predecessorGeneration);
     await this.journal.remove(rec.runId, rec.holdId);
+    this.pendingReleaseHints.set(`${rec.runId}/${rec.holdId}`, sent.predecessorGeneration);
     this.log.info("recovery settlement: predecessor hold released by server-proven ancestry", {
       run_id: rec.runId,
       hold_id: rec.holdId,
