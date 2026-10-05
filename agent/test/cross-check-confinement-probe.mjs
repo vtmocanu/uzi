@@ -15,7 +15,7 @@ const result = {
  checkoutRead: attempt(() => fs.readFileSync(checkout + "/read.txt")),
  checkoutWrite: attempt(() => fs.writeFileSync(checkout + "/write.txt", "probe")),
  // /etc/passwd is a non-executing file in the cross-check system read grants.
- systemRead: attempt(() => fs.readFileSync("/etc/passwd")),
+ systemRead: attempt(() => fs.readFileSync(process.execPath)),
  systemWrite: attempt(() => { const fd = fs.openSync("/etc/passwd", "r+"); fs.closeSync(fd); }),
  toolchainRead: attempt(() => fs.readFileSync("/opt/uzi-toolchain/bin/go")),
  toolchainWrite: attempt(() => { const fd = fs.openSync("/opt/uzi-toolchain/bin/go", "r+"); fs.closeSync(fd); }),
