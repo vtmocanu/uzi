@@ -46,6 +46,9 @@ through `[0.52.0]`.)
 - **Codex advice ignores async question text ([#2239](https://github.com/vtmocanu/uzi/issues/2239)).**
   Items whose delivery is exactly `"async"` no longer contaminate advice prose or structured verdicts. Other delivery values preserve text unchanged and in order; advice surfaces and answers no questions, while the native capability stays available.
 
+- **Checkpoint scans exclude confirmed real history beneath overlays ([#1963](https://github.com/vtmocanu/uzi/issues/1963)).**
+  Mid-turn and iteration checkpoint scans use confirmed published real tips as scan floors, so an earlier overlay publication does not block clean new work by rescanning already-public history. New unpublished secrets remain blocked, and local-only checkpoint bridges do not qualify as scan floors.
+
 - **Secret scans reuse the pinned worker scanner offline ([#2289](https://github.com/vtmocanu/uzi/issues/2289)).**
   The repository gate reuses installed gitleaks only when Go build metadata proves the exact module and version without replacements. Unknown or different builds use the pinned fetch, and every scan still must detect its canaries.
 

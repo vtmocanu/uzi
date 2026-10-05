@@ -23,6 +23,7 @@ import {
   client,
   deferred,
   fakeGitlab,
+  fakeGitHub,
   fx,
   gitlabClaim,
   installHarness,
@@ -2277,6 +2278,124 @@ async function eachScanner(
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 }
+
+describe("issue #1963 confirmed real checkpoint scan floors", () => {
+  for (const boundary of ["tick", "iteration"] as const) {
+    it(`keeps already-public real history below an overlay out of the ${boundary} scan`, async (t) => {
+      await eachScanner(t, async (bin, label) => {
+        const iid = 1963_000 + (boundary === "tick" ? 0 : 10) + (label === "shim" ? 1 : 2);
+        const workflow = ".github/workflows/ci.yml";
+        commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# base ${iid}\n`);
+        const g = mkGit(fx.dataDir, bin);
+        const ranges: Parameters<GitCache["secretScanCheckpointRange"]>[1][] = [];
+        const scan = g.secretScanCheckpointRange.bind(g);
+        g.secretScanCheckpointRange = async (bare, range, opts) => {
+          ranges.push(range);
+          return scan(bare, range, opts);
+        };
+        const ctl = control();
+        const claim = gitlabClaim(iid);
+        claim.repo = { ...claim.repo!, url: "https://github.com/org/repo", forge_type: "github" };
+        const { github } = fakeGitHub();
+        const checkpointRef = `refs/uzi-checkpoints/agent/issue-${iid}`;
+        const pub = stubPublish(async (_n, tip, pack) => {
+          const bytes = await drain(pack);
+          gitIn(fx.originPath, ["index-pack", "--stdin", "--fix-thin"], bytes);
+          gitIn(fx.originPath, ["update-ref", checkpointRef, tip]);
+          return { ok: true, body: { published: true, ref: checkpointRef } };
+        });
+        // Fixed, high-entropy runtime fixture; neither source fragment is a full provider token.
+        const secret = "gh" + "p_" + "aB3dE7fG9hJ2kL5mN8pQ1rS4tU6vW0xY2zA7";
+        const progress = { completed: ["m1"], in_progress: [] };
+        try {
+          await mkRunner(g, turn(async (ctx) => {
+            const oldSecret = commitIn(ctx.worktreePath, "old.env", `TOKEN=${secret}\n`);
+            const realTip = commitIn(ctx.worktreePath, "old.env", "TOKEN=\n");
+            commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# advanced ${iid}\n`);
+            await ctx.checkpoint!({ reap: true, progress });
+            assert.equal(pub.count(), 1, `${label}: milestone publish confirmed`);
+            const overlay = pub.tips[0]!;
+            assert.notEqual(overlay, realTip, "the real GitHub workflow path packed an overlay O");
+            assert.equal(
+              gitIn(fx.originPath, ["rev-list", "--parents", "-n", "1", overlay]).split(" ").at(-1),
+              realTip,
+              "O's last parent is the real tip R",
+            );
+            assert.equal(gitIn(fx.originPath, ["rev-parse", checkpointRef]), overlay);
+            assert.equal(ranges.length, 0, "overlay milestone publication is unscanned");
+            const newTip = commitIn(ctx.worktreePath, "new.txt", "clean new work\n");
+            ctl.advance(INTERVAL_MS + 1);
+            if (boundary === "tick") {
+              assert.equal(await ctl.fire(), "published", `${label}: clean N after confirmed overlay must publish`);
+            } else {
+              await ctx.checkpoint!({ reap: false, progress });
+            }
+            assert.equal(pub.count(), 2, `${label}: clean N after confirmed overlay must publish`);
+            const range = ranges[0]!;
+            assert.equal(range.tipSha, newTip);
+            assert.ok(range.scanFloorShas?.includes(realTip), "confirmed R is admitted as a scan floor");
+            assert.equal(range.scanFloorShas?.includes(overlay), false, "O is not an ancestor of N");
+            const scanned = gitIn(ctx.worktreePath, [
+              "rev-list", range.tipSha, ...(range.excludeSha ? [`^${range.excludeSha}`] : []),
+              ...(range.scanFloorShas ?? []).map((sha) => `^${sha}`),
+            ]).split("\n");
+            assert.deepEqual(scanned, [newTip], "only N is scanned; the old secret commit is excluded");
+            assert.equal(scanned.includes(oldSecret), false);
+
+            commitIn(ctx.worktreePath, "unpublished.env", `TOKEN=${secret}\n`);
+            ctl.advance(INTERVAL_MS + 1);
+            assert.equal(await ctl.fire(), "secret_found", "new unpublished secret is still scanned");
+            assert.equal(pub.count(), 2, "a new secret adds no publication");
+          }), ctl, { github }).execute(claim);
+          if (turnErrors.length > 0) throw turnErrors[0];
+          assertPushSecretBlocked(claim.run_id, label);
+          assert.equal(pub.count(), 2, label);
+        } finally {
+          pub.restore();
+        }
+      });
+    });
+  }
+
+  it("still scans a secret behind a local-only checkpointFloor bridge", async (t) => {
+    await eachScanner(t, async (bin, label) => {
+      const iid = label === "shim" ? 1963_021 : 1963_022;
+      const branch = `agent/issue-${iid}`;
+      const base = gitIn(fx.originPath, ["rev-parse", "main"]);
+      gitIn(fx.originPath, ["checkout", "-q", "-b", branch]);
+      commitIn(fx.originPath, "published.txt", "published branch work\n");
+      gitIn(fx.originPath, ["checkout", "-q", "main"]);
+      const g = mkGit(fx.dataDir, bin);
+      const ctl = control();
+      const pub = stubPublish(async (_n, _tip, pack) => {
+        await drain(pack);
+        return LANDED;
+      });
+      const claim = gitlabClaim(iid);
+      const secret = "gh" + "p_" + "aB3dE7fG9hJ2kL5mN8pQ1rS4tU6vW0xY2zA7";
+      try {
+        await mkRunner(g, turn(async (ctx) => {
+          gitIn(ctx.worktreePath, ["reset", "-q", "--hard", base]);
+          const secretTip = commitIn(ctx.worktreePath, "local.env", `TOKEN=${secret}\n`);
+          await ctx.checkpoint!({ reap: false, progress: { completed: [], in_progress: [] } });
+          assert.equal(pub.count(), 0, "closed gate leaves the bridge local only");
+          const bare = g.barePathFor(fx.originPath);
+          const bridge = await g.trackingTip(bare, branch);
+          assert.ok(bridge);
+          assert.notEqual(bridge, secretTip, "checkpoint created a bridge B");
+          assert.equal(await g.ancestry(bare, secretTip, bridge), "ancestor");
+          ctl.advance(INTERVAL_MS + 1);
+          assert.equal(await ctl.fire(), "secret_found", "local-only B must never become a scan floor");
+          assert.equal(pub.count(), 0, "the unpublished secret is withheld");
+        }), ctl).execute(claim);
+        assertPushSecretBlocked(claim.run_id, label);
+        assert.equal(pub.count(), 0, label);
+      } finally {
+        pub.restore();
+      }
+    });
+  });
+});
 
 describe("mid-turn checkpoint round 3 (issue #1597 M2)", () => {
   it("(r3 5) commits gitleaks does not count (pure mv, --allow-empty, chmod, binary-only, empty file, whole-file delete) do not wedge the scan", async (t) => {

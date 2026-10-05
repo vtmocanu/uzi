@@ -10533,9 +10533,11 @@ export class RunRunner {
       return { kind: "blocked", outcome: "secret_scan_untrusted" };
     };
     try {
-      // Scan floors: the default branch and the last CONFIRMED checkpoint tip (already public).
+      // Scan floors: the default branch, the last confirmed checkpoint ref tip, and confirmed
+      // published real tips beneath overlays (already public). Local-only checkpointFloor is excluded.
       const range = await this.git.resolveCheckpointRange(barePath, branch, {
         confirmedTip: flight.lastCheckpointRefTip,
+        extraFloors: flight.publishedRealTips,
       });
       if (!range) {
         if ((await this.git.trackingTip(barePath, branch)) === null) return { kind: "none" };
