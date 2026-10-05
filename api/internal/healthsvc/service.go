@@ -263,7 +263,16 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		s.checkReleaseCheck(ctx, now),
 	}
 
+	blocking := false
+	for _, c := range checks {
+		if c.Scope == "instance" && c.Severity == sevDanger {
+			blocking = true
+			break
+		}
+	}
+
 	return Doc{
+		Blocking:  blocking,
 		Status:    overallStatus(checks),
 		CheckedAt: now.UTC().Format(time.RFC3339),
 		Counts:    tally(checks),

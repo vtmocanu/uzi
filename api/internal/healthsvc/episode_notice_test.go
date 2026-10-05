@@ -38,11 +38,15 @@ type mutEvaluator struct {
 func (m *mutEvaluator) Evaluate(context.Context) (Doc, error) { return m.doc, m.err }
 
 func dangerCheckDTO(id, title, summary string) apitypes.HealthCheckDTO {
-	return apitypes.HealthCheckDTO{ID: id, Group: groupWorkers, Title: title, Severity: sevDanger, Summary: summary}
+	c := (&Service{}).base(id)
+	c.Title, c.Severity, c.Summary = title, sevDanger, summary
+	return c
 }
 
 func warnCheckDTO(id, title, summary string) apitypes.HealthCheckDTO {
-	return apitypes.HealthCheckDTO{ID: id, Group: groupQueue, Title: title, Severity: sevWarn, Summary: summary}
+	c := dangerCheckDTO(id, title, summary)
+	c.Severity = sevWarn
+	return c
 }
 
 func newNoticeReconciler(ev *mutEvaluator, st *fakeEpisodeStore, nf *fakeEpisodeNotifier, se *fakeEpisodeSettings) *EpisodeReconciler {
@@ -58,7 +62,7 @@ func TestEpisodeNotice_OpenerTickNoNotice(t *testing.T) {
 	ep := uuid.New()
 	st := &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: ep, admins: []uuid.UUID{a1}}
 	nf := &fakeEpisodeNotifier{}
-	ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{dangerCheckDTO("fleet.roll", "Worker image roll", "4 of 4 workers stuck")}}}
+	ev := &mutEvaluator{doc: noticeDoc(sevDanger, []apitypes.HealthCheckDTO{dangerCheckDTO("fleet.roll", "Worker image roll", "4 of 4 workers stuck")})}
 
 	newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true}).Reconcile(context.Background())
 
@@ -80,7 +84,7 @@ func TestEpisodeNotice_ExactlyOncePerAdmin(t *testing.T) {
 	ep := uuid.New()
 	st := &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: ep, admins: []uuid.UUID{a1, a2}}
 	nf := &fakeEpisodeNotifier{}
-	ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{dangerCheckDTO("fleet.roll", "Worker image roll", "4 of 4 workers stuck")}}}
+	ev := &mutEvaluator{doc: noticeDoc(sevDanger, []apitypes.HealthCheckDTO{dangerCheckDTO("fleet.roll", "Worker image roll", "4 of 4 workers stuck")})}
 	r := newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true})
 
 	r.Reconcile(context.Background()) // tick 1: opens, no notice
@@ -114,7 +118,7 @@ func TestEpisodeNotice_FreshNoticeAfterReArm(t *testing.T) {
 	ep1, ep2 := uuid.New(), uuid.New()
 	st := &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: ep1, admins: []uuid.UUID{a1}}
 	nf := &fakeEpisodeNotifier{}
-	ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{dangerCheckDTO("db", "Database", "ping fails")}}}
+	ev := &mutEvaluator{doc: noticeDoc(sevDanger, []apitypes.HealthCheckDTO{dangerCheckDTO("db", "Database", "ping fails")})}
 	r := newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true})
 
 	r.Reconcile(context.Background()) // opens ep1
@@ -132,7 +136,7 @@ func TestEpisodeNotice_FreshNoticeAfterReArm(t *testing.T) {
 
 	// A new danger opens ep2 (distinct id) and notifies afresh.
 	st.openReturn = ep2
-	ev.doc = Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{dangerCheckDTO("db", "Database", "ping fails")}}
+	ev.doc = noticeDoc(sevDanger, []apitypes.HealthCheckDTO{dangerCheckDTO("db", "Database", "ping fails")})
 	r.Reconcile(context.Background()) // opens ep2, no notice (opener)
 	if len(nf.sent) != 1 {
 		t.Fatalf("after ep2 opener tick: notices = %d, want still 1 (opener sends none)", len(nf.sent))
@@ -153,7 +157,7 @@ func TestEpisodeNotice_NoNoticeForWarnOrUnknown(t *testing.T) {
 			a1 := uuid.New()
 			st := &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: uuid.New(), admins: []uuid.UUID{a1}}
 			nf := &fakeEpisodeNotifier{}
-			ev := &mutEvaluator{doc: Doc{Status: status, Checks: []apitypes.HealthCheckDTO{warnCheckDTO("queue.waiting", "Runs waiting", "oldest 12m")}}}
+			ev := &mutEvaluator{doc: noticeDoc(status, []apitypes.HealthCheckDTO{warnCheckDTO("queue.waiting", "Runs waiting", "oldest 12m")})}
 			r := newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true})
 
 			r.Reconcile(context.Background())
@@ -176,7 +180,7 @@ func TestEpisodeNotice_GateOffSuppressesNotice(t *testing.T) {
 		ep := uuid.New()
 		st := &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: ep, admins: []uuid.UUID{a1}}
 		nf := &fakeEpisodeNotifier{}
-		ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{dangerCheckDTO("db", "Database", "ping fails")}}}
+		ev := &mutEvaluator{doc: noticeDoc(sevDanger, []apitypes.HealthCheckDTO{dangerCheckDTO("db", "Database", "ping fails")})}
 		r := newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: false})
 
 		r.Reconcile(context.Background()) // opens
@@ -197,7 +201,7 @@ func TestEpisodeNotice_GateOffSuppressesNotice(t *testing.T) {
 		ep := uuid.New()
 		st := &fakeEpisodeStore{open: store.GetOpenHealthEpisodeRow{ID: ep}, admins: []uuid.UUID{a1}}
 		nf := &fakeEpisodeNotifier{}
-		ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{dangerCheckDTO("db", "Database", "ping fails")}}}
+		ev := &mutEvaluator{doc: noticeDoc(sevDanger, []apitypes.HealthCheckDTO{dangerCheckDTO("db", "Database", "ping fails")})}
 		r := newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true, enabledErr: errBoom})
 
 		r.Reconcile(context.Background()) // episode already open, gate read fails ⇒ no notice
@@ -214,11 +218,11 @@ func TestEpisodeNotice_ServerAuthoredBody(t *testing.T) {
 	ep := uuid.New()
 	st := &fakeEpisodeStore{open: store.GetOpenHealthEpisodeRow{ID: ep}, admins: []uuid.UUID{a1}}
 	nf := &fakeEpisodeNotifier{}
-	ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{
+	ev := &mutEvaluator{doc: noticeDoc(sevDanger, []apitypes.HealthCheckDTO{
 		dangerCheckDTO("fleet.roll", "Worker image roll", "4 of 4 workers stuck rolling"),
 		warnCheckDTO("queue.waiting", "Runs waiting for a worker", "oldest waiting 12m"),
 		dangerCheckDTO("controller.report", "Controller reporting", "not reported for 6m"),
-	}}}
+	})}
 	r := newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true, baseURL: "https://uzi.example.com/"})
 
 	r.Reconcile(context.Background()) // episode already open ⇒ fan out
@@ -308,9 +312,9 @@ func TestEpisodeNotice_SlackMarkupInSummaryIsInert(t *testing.T) {
 	// A worker an owner named with Slack markup flows into the check summary (PRD D7): a live-link
 	// attempt, bold, and a backtick code chip.
 	const evil = "worker <https://evil.example|click> *urgent* `code`"
-	ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{
+	ev := &mutEvaluator{doc: noticeDoc(sevDanger, []apitypes.HealthCheckDTO{
 		dangerCheckDTO("fleet.roll", "Worker image roll", evil+" stuck"),
-	}}}
+	})}
 	r := newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true})
 
 	r.Reconcile(context.Background()) // episode already open ⇒ fan out
@@ -379,7 +383,7 @@ func TestEpisodeNoticeM2Allowed(t *testing.T) {
 			a, b := uuid.New(), uuid.New()
 			st := &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: uuid.New(), admins: []uuid.UUID{a, b}}
 			nf := &fakeEpisodeNotifier{}
-			ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{dangerCheckDTO(id, id, "danger")}}}
+			ev := &mutEvaluator{doc: noticeDoc(sevDanger, []apitypes.HealthCheckDTO{dangerCheckDTO(id, id, "danger")})}
 			r := newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true})
 			r.Reconcile(context.Background())
 			if len(st.claims) != 0 || len(nf.sent) != 0 {
@@ -400,7 +404,7 @@ func TestEpisodeNoticeM2Allowed(t *testing.T) {
 }
 
 func TestEpisodeNoticeM2ExcludedAndSeverities(t *testing.T) {
-	for _, id := range []string{"queue.waiting", "fleet.capacity", "queue.undispatched", "fleet.disk", "fleet.rundisk", "future.check"} {
+	for _, id := range []string{"queue.waiting", "fleet.capacity", "queue.undispatched", "fleet.disk", "fleet.rundisk", "forge.sync", "forge.ciwatch", "slack.socket", "schedules.paused", "board.drift", "custody.holds", "release.check", "future.check"} {
 		for _, severity := range []string{sevWarn, sevUnknown, sevOK} {
 			t.Run(id+"/"+severity, func(t *testing.T) {
 				st := &m2EpisodeStore{fakeEpisodeStore: &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: uuid.New(), admins: []uuid.UUID{uuid.New()}}}
@@ -411,13 +415,13 @@ func TestEpisodeNoticeM2ExcludedAndSeverities(t *testing.T) {
 					c.Severity = severity
 					checks = append(checks, c)
 				}
-				ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: checks}}
+				ev := &mutEvaluator{doc: noticeDoc(sevDanger, checks)}
 				r := NewEpisodeReconciler(ev, st, nf, se, nil)
 				for range 3 {
 					r.Reconcile(context.Background())
 				}
-				if st.opened != 1 || len(st.closed) != 0 {
-					t.Fatal("overall danger lifecycle changed")
+				if st.opened != 0 || len(st.closed) != 0 {
+					t.Fatal("owner danger opened an episode")
 				}
 				if se.enabledReads != 0 || se.baseReads != 0 || st.adminReads != 0 || len(st.claims) != 0 || len(nf.sent) != 0 {
 					t.Fatalf("reads enabled/base/admin=%d/%d/%d claims=%d notices=%d", se.enabledReads, se.baseReads, st.adminReads, len(st.claims), len(nf.sent))
@@ -435,12 +439,12 @@ func TestEpisodeNoticeM2MixedPayload(t *testing.T) {
 			checks := []apitypes.HealthCheckDTO{
 				dangerCheckDTO("queue.waiting", "owner waiting", "owner-only waiting"),
 				dangerCheckDTO("fleet.roll", "roll title", "roll summary"),
-				{ID: "db", Title: "db nondanger", Summary: "db-only nondanger", Severity: severity},
+				{ID: "db", Scope: "instance", Title: "db nondanger", Summary: "db-only nondanger", Severity: severity},
 				dangerCheckDTO("fleet.disk", "owner disk", "owner-only disk"),
 				dangerCheckDTO("loops", "loops title", "loops summary"),
 				dangerCheckDTO("controller.report", "controller title", "controller summary"),
 			}
-			ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: checks}}
+			ev := &mutEvaluator{doc: noticeDoc(sevDanger, checks)}
 			newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true}).Reconcile(context.Background())
 			if len(nf.sent) != 1 {
 				t.Fatalf("notices=%d", len(nf.sent))
@@ -475,49 +479,38 @@ func TestEpisodeNoticeM2MixedPayload(t *testing.T) {
 	}
 }
 
-func TestEpisodeNoticeM2OwnerThenInstanceSameEpisode(t *testing.T) {
-	a := uuid.New()
-	ep := uuid.New()
-	st := &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: ep, admins: []uuid.UUID{a}}
+func TestEpisodeNoticeInstanceOwnerRearm(t *testing.T) {
+	admin, first, second := uuid.New(), uuid.New(), uuid.New()
+	st := &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: first, admins: []uuid.UUID{admin}}
 	nf := &fakeEpisodeNotifier{}
-	ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{dangerCheckDTO("queue.waiting", "owner", "waiting")}}}
+	ev := &mutEvaluator{doc: noticeDoc(sevDanger, []apitypes.HealthCheckDTO{dangerCheckDTO("db", "db", "unavailable")})}
 	r := newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true})
 	ctx := context.Background()
 	r.Reconcile(ctx)
-	r.Reconcile(ctx)
-	if st.open.ID != ep || len(st.claims) != 0 || len(nf.sent) != 0 {
-		t.Fatal("owner ticks consumed notice or changed episode")
-	}
-	ev.doc.Checks = []apitypes.HealthCheckDTO{dangerCheckDTO("queue.waiting", "owner", "waiting"), dangerCheckDTO("db", "db", "unavailable")}
-	r.Reconcile(ctx)
-	if st.open.ID != ep || st.opened != 1 || countDeliveredTo(nf, a) != 1 {
-		t.Fatal("first instance danger did not notify immediately in same episode")
-	}
-	// Owner danger holds this same episode open through owner-only and later instance ticks.
-	for _, id := range []string{"", "controller.report", "", "loops"} {
-		ev.doc.Checks = []apitypes.HealthCheckDTO{dangerCheckDTO("queue.waiting", "owner", "waiting")}
-		if id != "" {
-			ev.doc.Checks = append(ev.doc.Checks, dangerCheckDTO(id, id, "danger"))
-		}
-		r.Reconcile(ctx)
-		if st.open.ID != ep || st.opened != 1 || len(st.closed) != 0 || len(nf.sent) != 1 {
-			t.Fatalf("owner plus %q changed episode or re-notified", id)
-		}
-	}
-	ev.doc = Doc{Status: sevOK}
-	r.Reconcile(ctx)
-	if !reflect.DeepEqual(st.closed, []uuid.UUID{ep}) {
-		t.Fatalf("closed=%v", st.closed)
-	}
-	st.openReturn = uuid.New()
-	ev.doc = Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{dangerCheckDTO("fleet.roll", "roll", "stuck")}}
-	r.Reconcile(ctx)
-	if len(nf.sent) != 1 {
-		t.Fatal("new opener notified")
+	if st.open.ID != first || len(st.claims) != 0 || len(nf.sent) != 0 {
+		t.Fatal("first opener claimed or notified")
 	}
 	r.Reconcile(ctx)
-	if st.opened != 2 || countDeliveredTo(nf, a) != 2 || st.open.ID == ep {
-		t.Fatal("new episode did not rearm")
+	if len(st.claims) != 1 || countDeliveredTo(nf, admin) != 1 {
+		t.Fatal("first episode did not notify")
+	}
+	snooze := fixedNow.Add(time.Hour).Format(time.RFC3339)
+	ev.doc = noticeDoc(sevDanger, []apitypes.HealthCheckDTO{dangerCheckDTO("queue.waiting", "owner", "waiting")})
+	ev.doc.EpisodeID, ev.doc.SnoozedUntil = strPtr(first.String()), &snooze
+	r.Reconcile(ctx)
+	r.Reconcile(ctx)
+	if !reflect.DeepEqual(st.closed, []uuid.UUID{first}) || st.open.ID != uuid.Nil || st.opened != 1 || len(st.claims) != 1 || len(nf.sent) != 1 {
+		t.Fatal("owner-only danger did not close without claiming/notifying")
+	}
+	st.openReturn = second
+	ev.doc = noticeDoc(sevDanger, []apitypes.HealthCheckDTO{dangerCheckDTO("fleet.roll", "roll", "stuck")})
+	r.Reconcile(ctx)
+	if st.open.ID != second || st.opened != 2 || len(st.claims) != 1 || len(nf.sent) != 1 {
+		t.Fatal("fresh instance opener inherited notice state")
+	}
+	r.Reconcile(ctx)
+	if len(st.claims) != 2 || st.claims[1].EpisodeID != second || countDeliveredTo(nf, admin) != 2 || nf.sent[1].Payload.(map[string]any)["episode_id"] != second.String() {
+		t.Fatal("fresh episode did not notify on second tick")
 	}
 }
 
@@ -569,7 +562,7 @@ func TestEpisodeNoticeM2RealNotifyAddressing(t *testing.T) {
 					ns := &m2NotificationStore{}
 					sl := &m2Slacker{t: t, store: ns}
 					st := &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: uuid.New(), admins: membership.admins}
-					ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{dangerCheckDTO(id, id, "danger")}}}
+					ev := &mutEvaluator{doc: noticeDoc(sevDanger, []apitypes.HealthCheckDTO{dangerCheckDTO(id, id, "danger")})}
 					r := NewEpisodeReconciler(ev, st, notifysvc.New(ns, sl, 0, nil), &fakeEpisodeSettings{enabled: true}, nil)
 					r.Reconcile(context.Background())
 					if len(ns.rows) != 0 || len(sl.users) != 0 || len(ns.pruned) != 0 {
@@ -629,7 +622,7 @@ func TestEpisodeNotice_FailedNotifyIsRetried(t *testing.T) {
 	ep := uuid.New()
 	st := &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: ep, admins: []uuid.UUID{a1, a2}}
 	nf := &fakeEpisodeNotifier{}
-	ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{dangerCheckDTO("fleet.roll", "Worker image roll", "4 of 4 workers stuck")}}}
+	ev := &mutEvaluator{doc: noticeDoc(sevDanger, []apitypes.HealthCheckDTO{dangerCheckDTO("fleet.roll", "Worker image roll", "4 of 4 workers stuck")})}
 	r := newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true})
 	ctx := context.Background()
 
@@ -687,7 +680,7 @@ func TestEpisodeNotice_FailedReleaseIsTolerated(t *testing.T) {
 	ep := uuid.New()
 	st := &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: ep, admins: []uuid.UUID{a1, a2}, releaseErr: errBoom}
 	nf := &fakeEpisodeNotifier{}
-	ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{dangerCheckDTO("fleet.roll", "Worker image roll", "4 of 4 workers stuck")}}}
+	ev := &mutEvaluator{doc: noticeDoc(sevDanger, []apitypes.HealthCheckDTO{dangerCheckDTO("fleet.roll", "Worker image roll", "4 of 4 workers stuck")})}
 	r := newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true})
 	ctx := context.Background()
 
@@ -709,4 +702,15 @@ func TestEpisodeNotice_FailedReleaseIsTolerated(t *testing.T) {
 	if len(st.releases) != 1 {
 		t.Fatalf("releases = %d, want 1 (no further release attempts)", len(st.releases))
 	}
+}
+
+// noticeDoc supplies internally consistent test documents without changing evaluator behavior.
+func noticeDoc(status string, checks []apitypes.HealthCheckDTO) Doc {
+	d := Doc{Status: status, Counts: tally(checks), Checks: checks}
+	for _, c := range checks {
+		if c.Scope == "instance" && c.Severity == sevDanger {
+			d.Blocking = true
+		}
+	}
+	return d
 }

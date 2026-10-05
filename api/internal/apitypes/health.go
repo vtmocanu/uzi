@@ -17,6 +17,8 @@ type HealthDocDTO struct {
 	// ok | warn | danger | unknown. "na" is never an overall status (an all-na, all-ok
 	// instance is "ok").
 	Status string `json:"status"`
+	// Blocking reports whether any instance-scoped check is danger.
+	Blocking bool `json:"blocking"`
 	// CheckedAt is the evaluation time (RFC3339, UTC). The web card renders "Checked N s
 	// ago" from it.
 	CheckedAt string `json:"checked_at"`
@@ -47,8 +49,10 @@ type HealthCountsDTO struct {
 type HealthCheckDTO struct {
 	// ID and Group are closed enums (e.g. "fleet.roll" / "workers"). Severity is one of
 	// ok | warn | danger | unknown | na.
-	ID       string `json:"id"`
-	Group    string `json:"group"`
+	ID    string `json:"id"`
+	Group string `json:"group"`
+	// Scope is instance | owner, supplied by the server registry.
+	Scope    string `json:"scope"`
 	Title    string `json:"title"`
 	Severity string `json:"severity"`
 	// Summary is the one-line server-authored verdict for this check.

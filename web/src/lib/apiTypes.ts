@@ -1442,6 +1442,8 @@ export interface ReleaseCheckStatus {
 // byte-for-byte (snake_case JSON keys). Admin-only by route — it carries owner and
 // worker names — so it must never migrate onto an unauthenticated response.
 export interface HealthDoc {
+  // True when an instance-scoped check is danger.
+  blocking: boolean;
   // Overall verdict: the worst check, "danger" then "warn", with unknown ranking as
   // warn. "ok" | "warn" | "danger" | "unknown".
   status: string;
@@ -1470,6 +1472,8 @@ export interface HealthCounts {
 // HealthCheck is one check's verdict plus its server-authored evidence and what-to-do
 // line. Mirrors `apitypes.HealthCheckDTO`. id/group/severity are closed-enum strings.
 export interface HealthCheck {
+  // Server registry scope: instance | owner.
+  scope: string;
   id: string;
   group: string;
   title: string;

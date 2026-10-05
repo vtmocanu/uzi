@@ -20,7 +20,11 @@ const healthSinceTS = "2026-09-20T02:14:00Z"
 // with what it renders.
 func healthDoc(status string, checks ...apitypes.HealthCheckDTO) apitypes.HealthDocDTO {
 	var counts apitypes.HealthCountsDTO
+	blocking := false
 	for _, ck := range checks {
+		if ck.Scope == "instance" && ck.Severity == "danger" {
+			blocking = true
+		}
 		switch ck.Severity {
 		case "ok":
 			counts.OK++
@@ -36,6 +40,7 @@ func healthDoc(status string, checks ...apitypes.HealthCheckDTO) apitypes.Health
 	}
 	return apitypes.HealthDocDTO{
 		Status:    status,
+		Blocking:  blocking,
 		CheckedAt: "2026-09-20T02:52:10Z",
 		Counts:    counts,
 		Checks:    checks,
@@ -45,7 +50,7 @@ func healthDoc(status string, checks ...apitypes.HealthCheckDTO) apitypes.Health
 func rollDangerCheck() apitypes.HealthCheckDTO {
 	since := healthSinceTS
 	return apitypes.HealthCheckDTO{
-		ID: "fleet.roll", Group: "workers", Title: "Worker image roll", Severity: "danger",
+		ID: "fleet.roll", Scope: "instance", Group: "workers", Title: "Worker image roll", Severity: "danger",
 		Summary: "4 of 4 workers stuck rolling to 0.84.0-rc.2: ImagePullBackOff", Since: &since,
 	}
 }
@@ -53,21 +58,21 @@ func rollDangerCheck() apitypes.HealthCheckDTO {
 func queueWarnCheck() apitypes.HealthCheckDTO {
 	since := healthSinceTS
 	return apitypes.HealthCheckDTO{
-		ID: "queue.waiting", Group: "queue", Title: "Queued runs waiting", Severity: "warn",
+		ID: "queue.waiting", Scope: "owner", Group: "queue", Title: "Queued runs waiting", Severity: "warn",
 		Summary: "oldest waiting_worker run has waited 12m", Since: &since,
 	}
 }
 
 func dbOKCheck() apitypes.HealthCheckDTO {
 	return apitypes.HealthCheckDTO{
-		ID: "db", Group: "control", Title: "Database", Severity: "ok",
+		ID: "db", Scope: "instance", Group: "control", Title: "Database", Severity: "ok",
 		Summary: "ping 4ms, pool 3/20 acquired",
 	}
 }
 
 func slackNACheck() apitypes.HealthCheckDTO {
 	return apitypes.HealthCheckDTO{
-		ID: "slack.socket", Group: "integrations", Title: "Slack socket", Severity: "na",
+		ID: "slack.socket", Scope: "owner", Group: "integrations", Title: "Slack socket", Severity: "na",
 		Summary: "Slack is not configured on this deployment",
 	}
 }
@@ -217,7 +222,7 @@ func TestAdminHealthTransportFailuresKeepTheirCodes(t *testing.T) {
 func TestAdminHealthBoundsHostileCell(t *testing.T) {
 	hostile := strings.Repeat("A", 1<<20) // 1 MiB
 	check := apitypes.HealthCheckDTO{
-		ID: "fleet.roll", Group: "workers", Title: "Worker image roll", Severity: "danger",
+		ID: "fleet.roll", Scope: "instance", Group: "workers", Title: "Worker image roll", Severity: "danger",
 		Summary: hostile,
 	}
 	fc := &uzicli.FakeClient{AdminHealthDoc: healthDoc("danger", check)}

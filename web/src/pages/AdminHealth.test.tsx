@@ -82,7 +82,7 @@ function retally(doc: HealthDoc): HealthDoc {
   const counts = { ok: 0, warn: 0, danger: 0, unknown: 0, na: 0 };
   for (const c of doc.checks) counts[c.severity as keyof typeof counts]++;
   const status = counts.danger > 0 ? "danger" : counts.warn + counts.unknown > 0 ? "warn" : "ok";
-  return { ...doc, counts, status };
+  return { ...doc, counts, status, blocking: doc.checks.some((c) => c.scope === "instance" && c.severity === "danger") };
 }
 
 function withSeverity(doc: HealthDoc, over: Record<string, string>): HealthDoc {

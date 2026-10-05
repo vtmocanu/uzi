@@ -11,22 +11,22 @@ import { minsAgo } from "./time";
 
 // The fixed per-id metadata, in the server's emit order (Evaluate). group/title/doc mirror
 // checkMeta in api/internal/healthsvc/checks.go.
-const CHECK_META: { id: string; group: string; title: string; doc: string | null }[] = [
-  { id: "fleet.roll", group: "workers", title: "Worker image roll", doc: "worker-upgrades" },
-  { id: "fleet.capacity", group: "workers", title: "Worker capacity", doc: "hosted-workers" },
-  { id: "fleet.disk", group: "workers", title: "Worker disk", doc: "hosted-workers" },
-  { id: "fleet.rundisk", group: "workers", title: "Run disk size", doc: "hosted-workers" },
-  { id: "queue.waiting", group: "queue", title: "Runs waiting for a worker", doc: null },
-  { id: "queue.undispatched", group: "queue", title: "Undispatched task runs", doc: null },
-  { id: "controller.report", group: "control", title: "Controller reporting", doc: "hosted-workers" },
-  { id: "db", group: "control", title: "Database", doc: null },
-  { id: "loops", group: "control", title: "Background loops", doc: null },
-  { id: "forge.ciwatch", group: "integrations", title: "CI watch capacity", doc: null },
-  { id: "slack.socket", group: "integrations", title: "Slack socket", doc: null },
-  { id: "schedules.paused", group: "housekeeping", title: "Paused schedules", doc: null },
-  { id: "board.drift", group: "housekeeping", title: "Board drift", doc: null },
-  { id: "custody.holds", group: "housekeeping", title: "Recovery custody holds", doc: null },
-  { id: "release.check", group: "housekeeping", title: "Upstream release", doc: null },
+const CHECK_META: { id: string; scope: string; group: string; title: string; doc: string | null }[] = [
+  { id: "fleet.roll", scope: "instance", group: "workers", title: "Worker image roll", doc: "worker-upgrades" },
+  { id: "fleet.capacity", scope: "owner", group: "workers", title: "Worker capacity", doc: "hosted-workers" },
+  { id: "fleet.disk", scope: "owner", group: "workers", title: "Worker disk", doc: "hosted-workers" },
+  { id: "fleet.rundisk", scope: "owner", group: "workers", title: "Run disk size", doc: "hosted-workers" },
+  { id: "queue.waiting", scope: "owner", group: "queue", title: "Runs waiting for a worker", doc: null },
+  { id: "queue.undispatched", scope: "owner", group: "queue", title: "Undispatched task runs", doc: null },
+  { id: "controller.report", scope: "instance", group: "control", title: "Controller reporting", doc: "hosted-workers" },
+  { id: "db", scope: "instance", group: "control", title: "Database", doc: null },
+  { id: "loops", scope: "instance", group: "control", title: "Background loops", doc: null },
+  { id: "forge.ciwatch", scope: "owner", group: "integrations", title: "CI watch capacity", doc: null },
+  { id: "slack.socket", scope: "owner", group: "integrations", title: "Slack socket", doc: null },
+  { id: "schedules.paused", scope: "owner", group: "housekeeping", title: "Paused schedules", doc: null },
+  { id: "board.drift", scope: "owner", group: "housekeeping", title: "Board drift", doc: null },
+  { id: "custody.holds", scope: "owner", group: "housekeeping", title: "Recovery custody holds", doc: null },
+  { id: "release.check", scope: "owner", group: "housekeeping", title: "Upstream release", doc: null },
 ];
 
 // The all-ok summary per id, so the healthy path reads like the server's green templates.
@@ -54,6 +54,7 @@ type CheckOverride = Partial<Pick<HealthCheck, "severity" | "summary" | "since" 
 function build(overrides: Record<string, CheckOverride>): HealthCheck[] {
   return CHECK_META.map((m) => ({
     id: m.id,
+    scope: m.scope,
     group: m.group,
     title: m.title,
     severity: "ok",
@@ -91,6 +92,7 @@ function doc(checks: HealthCheck[], over: Partial<HealthDoc> = {}): HealthDoc {
   const counts = tally(checks);
   return {
     status: overall(counts),
+    blocking: checks.some((c) => c.scope === "instance" && c.severity === "danger"),
     checked_at: new Date().toISOString(),
     counts,
     snoozed_until: null,

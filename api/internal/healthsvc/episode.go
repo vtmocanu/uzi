@@ -97,14 +97,14 @@ func NewEpisodeReconciler(eval healthEvaluator, st episodeStore, notifier episod
 }
 
 // Reconcile runs one evaluation and moves the episode lifecycle by exactly one step:
-//   - overall danger AND no episode open  -> open one and RETURN (the opener sends NO
+//   - blocking AND no episode open  -> open one and RETURN (the opener sends NO
 //     notice; a 23505 unique violation means another replica opened first, which is
 //     already-open, not an error). This is the first half of the two-evaluation debounce.
-//   - overall danger AND an episode ALREADY open (opened by a PRIOR tick) -> the debounce is
+//   - blocking AND an episode ALREADY open (opened by a PRIOR tick) -> the debounce is
 //     satisfied: fan the one-per-admin notice out (gated on HealthEnabled).
-//   - overall not-danger AND an episode open -> close it (the re-arm; no recovery notice, D11).
+//   - not blocking AND an episode open -> close it (the re-arm; no recovery notice, D11).
 //
-// warn/unknown never notify — only danger opens an episode and fires the fan-out. Everything
+// Only instance danger opens an episode and fires the fan-out. Everything
 // else is a no-op. Best-effort: every error is logged, never returned.
 func (r *EpisodeReconciler) Reconcile(ctx context.Context) {
 	doc, err := r.eval.Evaluate(ctx)
@@ -112,7 +112,7 @@ func (r *EpisodeReconciler) Reconcile(ctx context.Context) {
 		r.logger.Error("health episode: evaluate", "error", err)
 		return
 	}
-	danger := doc.Status == sevDanger
+	blocking := doc.Blocking
 
 	open, err := r.store.GetOpenHealthEpisode(ctx)
 	hasOpen := true
@@ -126,7 +126,7 @@ func (r *EpisodeReconciler) Reconcile(ctx context.Context) {
 	}
 
 	switch {
-	case danger && !hasOpen:
+	case blocking && !hasOpen:
 		if _, err := r.store.OpenHealthEpisode(ctx, pgconv.Time(r.now())); err != nil {
 			if isUniqueViolation(err) {
 				// The partial unique index rejected a second concurrent open: another
@@ -138,11 +138,11 @@ func (r *EpisodeReconciler) Reconcile(ctx context.Context) {
 		}
 		// The OPENER tick sends NO notice: the debounce fires the fan-out on the NEXT
 		// still-danger tick, which finds the episode already open (the case below).
-	case danger && hasOpen:
+	case blocking && hasOpen:
 		// The episode was opened by a PRIOR tick, so the two-evaluation debounce is
 		// satisfied: notify every admin exactly once for THIS episode.
 		r.notifyAdmins(ctx, open.ID, doc)
-	case !danger && hasOpen:
+	case !blocking && hasOpen:
 		if err := r.store.CloseHealthEpisode(ctx, store.CloseHealthEpisodeParams{
 			ID:       open.ID,
 			ClosedAt: pgconv.Time(r.now()),
@@ -249,19 +249,15 @@ type dangerCheck struct {
 }
 
 // dangerChecks selects instance danger checks for notices in Doc.Checks order.
-// The positive allowlist excludes owner checks and future IDs; it does not change
-// the overall status used by Reconcile to open and close episodes. Every field is
-// server-authored and already sanitized by Evaluate.
+// Scope comes from checkMeta through Evaluate; owner, empty and invalid scopes are
+// excluded. Every field is server-authored and already sanitized by Evaluate.
 func dangerChecks(doc Doc) []dangerCheck {
 	var out []dangerCheck
 	for _, c := range doc.Checks {
-		if c.Severity != sevDanger {
+		if c.Scope != "instance" || c.Severity != sevDanger {
 			continue
 		}
-		switch c.ID {
-		case "db", "controller.report", "loops", "fleet.roll":
-			out = append(out, dangerCheck{ID: c.ID, Title: c.Title, Summary: c.Summary})
-		}
+		out = append(out, dangerCheck{ID: c.ID, Title: c.Title, Summary: c.Summary})
 	}
 	return out
 }

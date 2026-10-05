@@ -28,30 +28,31 @@ import (
 // an admin surface.
 const maxEvidenceBytes = 96
 
-// checkMeta is the fixed per-id metadata: the group, the human title, and the docs slug
+// checkMeta is the fixed per-id metadata: the scope, group, human title, and docs slug
 // (empty ⇒ no doc link in M1). The registry order in Evaluate is the stable order; this
 // map only supplies the constant fields so each check builder sets just severity + text.
 var checkMeta = map[string]struct {
+	scope string
 	group string
 	title string
 	doc   string
 }{
-	"fleet.roll":         {groupWorkers, "Worker image roll", "worker-upgrades"},
-	"fleet.capacity":     {groupWorkers, "Worker capacity", "hosted-workers"},
-	"fleet.disk":         {groupWorkers, "Worker disk", "hosted-workers"},
-	"fleet.rundisk":      {groupWorkers, "Run disk size", "hosted-workers"},
-	"queue.waiting":      {groupQueue, "Runs waiting for a worker", ""},
-	"queue.undispatched": {groupQueue, "Undispatched task runs", ""},
-	"controller.report":  {groupControl, "Controller reporting", "hosted-workers"},
-	"db":                 {groupControl, "Database", ""},
-	"loops":              {groupControl, "Background loops", ""},
-	"forge.sync":         {groupIntegrations, "Forge issue sync", ""},
-	"forge.ciwatch":      {groupIntegrations, "CI watch capacity", ""},
-	"slack.socket":       {groupIntegrations, "Slack socket", ""},
-	"schedules.paused":   {groupHousekeeping, "Paused schedules", ""},
-	"board.drift":        {groupHousekeeping, "Board drift", ""},
-	"custody.holds":      {groupHousekeeping, "Recovery custody holds", ""},
-	"release.check":      {groupHousekeeping, "Upstream release", ""},
+	"fleet.roll":         {"instance", groupWorkers, "Worker image roll", "worker-upgrades"},
+	"fleet.capacity":     {"owner", groupWorkers, "Worker capacity", "hosted-workers"},
+	"fleet.disk":         {"owner", groupWorkers, "Worker disk", "hosted-workers"},
+	"fleet.rundisk":      {"owner", groupWorkers, "Run disk size", "hosted-workers"},
+	"queue.waiting":      {"owner", groupQueue, "Runs waiting for a worker", ""},
+	"queue.undispatched": {"owner", groupQueue, "Undispatched task runs", ""},
+	"controller.report":  {"instance", groupControl, "Controller reporting", "hosted-workers"},
+	"db":                 {"instance", groupControl, "Database", ""},
+	"loops":              {"instance", groupControl, "Background loops", ""},
+	"forge.sync":         {"owner", groupIntegrations, "Forge issue sync", ""},
+	"forge.ciwatch":      {"owner", groupIntegrations, "CI watch capacity", ""},
+	"slack.socket":       {"owner", groupIntegrations, "Slack socket", ""},
+	"schedules.paused":   {"owner", groupHousekeeping, "Paused schedules", ""},
+	"board.drift":        {"owner", groupHousekeeping, "Board drift", ""},
+	"custody.holds":      {"owner", groupHousekeeping, "Recovery custody holds", ""},
+	"release.check":      {"owner", groupHousekeeping, "Upstream release", ""},
 }
 
 // base returns a check DTO pre-filled with the id's fixed metadata and a non-nil (empty)
@@ -61,6 +62,7 @@ func (s *Service) base(id string) apitypes.HealthCheckDTO {
 	c := apitypes.HealthCheckDTO{
 		ID:       id,
 		Group:    m.group,
+		Scope:    m.scope,
 		Title:    m.title,
 		Evidence: []apitypes.HealthEvidenceDTO{},
 	}
