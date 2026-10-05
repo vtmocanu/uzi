@@ -947,12 +947,18 @@ Tracked as GitHub issue vtmocanu/uzi#1995; ADR at `adr/1296-durable-run-recovery
 
 Tracked as GitHub issue vtmocanu/uzi#1484; PRD at `prds/1484-admin-health-tab.md`.
 
-- An admin gets a read-only, closed registry of checks over what uzi knows about itself (worker rolls, queue and capacity, controller liveness, background loops, the database, integrations, housekeeping), surfaced as an Admin → Health tab, an Overview card, an app-wide Danger banner, `uzi admin health`, and one notice per admin per danger episode. [AI-synced 2026-09-20, #1484]
+- An admin gets a read-only, closed registry of checks over what uzi knows about itself (worker rolls, queue and capacity, controller liveness, background loops, the database, integrations, housekeeping), surfaced as an Admin → Health tab, an Overview card, an app-wide Danger banner and `uzi admin health` over all checks, plus one notice per admin per danger episode restricted to instance danger checks. [AI-synced 2026-10-05, #2271]
 - Health is the **last** admin tab, not the first; the sidebar pip and the Overview card are the entry points. [AI-synced 2026-10-03, #1484]
   - Admin tab order: Users, Rate limits, Tool allowlist, Blocked repos, Instance, Branding, Site lists, Products, Health. Site lists and Products follow Branding, with Health still last. (AI-synced 2026-10-03)
 - The Danger banner carries a "Snooze 1 h", per admin, per open episode; a new episode shows the banner again. [AI-synced 2026-09-20, #1484]
 - A non-admin gets a platform line on Overview instead of the admin card, derived only from their own runs and workers, so they can tell a platform problem from a problem with their own run. [AI-synced 2026-09-20, #1484]
 - In-app health never reads the Kubernetes API; the api holds no kube credential, and no action (restart, retry, rollback, cordon) is offered — diagnosis only. [AI-synced 2026-09-20, #1484]
+
+## Issue #2271 — Findings stay in the backlog; admin notices cover instance danger
+
+- Findings remain captured, stored, listed and available in stream cards and the backlog for filing and dispositions; they send no Slack DMs and create no new notification latch rows. [AI-synced 2026-10-05, #2271]
+- Admin notices select only `danger` checks with literal IDs `db`, `controller.report`, `loops`, `fleet.roll`; the maintainer classifies `fleet.roll` as instance infrastructure even for a single owner's workers. Owner checks (`queue.waiting`, `fleet.capacity`, `queue.undispatched`) and future nonallowlisted IDs never trigger admin DMs or enter their check list. Owner run-health DMs, including `waiting_worker` capability reasons, retain their existing routing. [AI-synced 2026-10-05, #2271]
+- The full Health tab, CLI, Danger banner and snooze still follow all checks and overall status. Accepted timing: the existing overall-danger two-tick debounce lets owner-only danger open/hold an episode without consuming an admin claim, so later instance danger sends on its first tick in that episode; once notified, a second instance failure cannot renotify while owner danger holds it open. Overall recovery closes the episode and rearms. [AI-synced 2026-10-05, #2271]
 
 ## Feature #1594 — Codex provider-rejection surfaces as re-login required
 
@@ -1002,7 +1008,7 @@ Tracked as GitHub issue vtmocanu/uzi#1624.
 
 Tracked as GitHub issue vtmocanu/uzi#1650; PRD at `prds/done/1650-retire-notifications-inbox.md`.
 
-- The web Notifications inbox (tab, bell, unread badge) is retired; actionable signals reach users by Slack DM (when linked) plus the page that owns the thing. [user 2026-09-25, #1650] (AI-synced 2026-09-25)
+- The web Notifications inbox (tab, bell, unread badge) is retired; actionable signals use the page that owns the thing and, where their routing provides it, Slack DM (when linked). Findings use stream cards and the backlog without DMs (#2271). [user 2026-09-25, #1650] (AI-synced 2026-10-05, #2271)
 - "Settings → Notifications" (Slack linking) is not the inbox and stays. [user 2026-09-25, #1650] (AI-synced 2026-09-25)
 - CI auto-fix / MR rework halt DMs are delivered at-least-once: retried until posted or the owner has no Slack link (capped at about 24h); the forge halt comment stays once-only. A rare duplicate DM is accepted. (AI-synced 2026-10-01, #1675)
 

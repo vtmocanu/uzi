@@ -22,11 +22,11 @@ uzi.**
   **Dismiss ▾**. It's non-blocking by design — a different accent from the
   amber gate cards (plan approval, a clarifying question) that actually park
   the run.
-- **A Slack DM** if you've linked your account (see [Slack](./slack.md)) —
-  even if you weren't watching. A run that flags several findings sends
-  **one** DM, best-effort, not one ping per finding.
+- **The Findings backlog**, available later even if you weren't watching
+  the run. Capture, storage, listing, filing and dispositions are unchanged.
 
-Either surface lands you on the same place: the **Findings** backlog.
+Findings do not send Slack DMs. The stream card links to the same
+**Findings** backlog.
 
 ## The Findings backlog
 
@@ -86,10 +86,9 @@ one shared reason; **Undo** in the toast that follows reverses exactly the
 ones that action settled.
 
 A dismissed finding **stays dismissed**: if a later run trips over the exact
-same bug again, it does **not** re-notify you and does **not** reappear in To
-triage. Only a **materially different** finding at that same spot re-opens
-it — so dismissing something is a real "stop nagging me about this," not a
-snooze.
+same bug again, it does **not** reappear in To triage. Only a **materially
+different** finding at that same spot re-opens it — so dismissing something is
+a real "stop nagging me about this," not a snooze.
 
 An old finding card can lag the backlog (it's a historical record of the
 moment it was posted, not a live view) — clicking **File** on a card for a
@@ -157,7 +156,7 @@ one does not touch the others.
 A finding's title, description, and location are written by the agent, from
 whatever it was reading when it noticed the bug — treat them as data, not as
 something to trust. uzi renders them as inert text everywhere they show up
-(the stream card, the backlog, the Slack DM), and the issue it files runs
+(the stream card and the backlog), and the issue it files runs
 each field through the same sanitizers uzi's other forge writes use before
 anything reaches the forge.
 
