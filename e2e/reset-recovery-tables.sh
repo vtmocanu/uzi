@@ -3,7 +3,7 @@
 # THROWAWAY test database. HARNESS ISOLATION ONLY.
 #
 # WHY THIS EXISTS. The store-it suite (e2e/run-store-it.sh) runs every *LiveDB test in
-# six packages against ONE shared throwaway Postgres (`-p 1`), and — as run-store-it.sh
+# seven packages against ONE shared throwaway Postgres (`-p 1`), and — as run-store-it.sh
 # itself documents for `workers` — nothing truncates a table between package binaries, so
 # rows one package's test seeds outlive it. The recovery tables (recovery_custody_holds,
 # recovery_captures, recovery_capture_chunks, custody_episode_notices) are seeded by the

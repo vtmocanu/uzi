@@ -107,10 +107,10 @@ a plain `go test ./...` when `UZI_TEST_DATABASE_URL` is unset. The full PRD #24 
 is `./e2e/run-e2e.sh` **and** `./e2e/run-store-it.sh`.
 
 The script has since grown past that one query: it sweeps **every `*LiveDB` test in
-the six packages that carry one**, `store`, `handler`, `forgesvc`, `schedsvc`,
-`workersvc` and `recovery`, serially (`-p 1`, one shared database). CI's `test-api-store-it` job runs
+the seven packages that carry one**, `store`, `handler`, `forgesvc`, `schedsvc`,
+`workersvc`, `recovery` and `poller`, serially (`-p 1`, one shared database). CI's `test-api-store-it` job runs
 the same list. A `*LiveDB` test in a package neither list names runs nowhere and still
-prints `ok`, so a new live-DB test in a seventh package must add that package to both
+prints `ok`, so a new live-DB test in an eighth package must add that package to both
 the script and `.github/workflows/ci.yml` in the same commit.
 
 ## Phase registry (what it asserts)
