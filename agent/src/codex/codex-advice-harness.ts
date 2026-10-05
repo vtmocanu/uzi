@@ -565,15 +565,16 @@ export class CodexAdviceHarness implements AdviceHarness {
   }
 
   /** Extract assistant text off an `item/completed` agent-message note. Only text (never
-   *  reasoning) is accumulated into AdviceResult.text. There is no delivery filter: #1566
-   *  async question text contaminates advice and may fail structured-verdict validation.
-   *  Dropping delivery async is deferred. Mirrors CodexHarness item decode;
+   *  reasoning) is accumulated into AdviceResult.text. #2239 ignores items whose delivery
+   *  is exactly "async": native questions remain available, but advice neither surfaces nor
+   *  answers them. Mirrors CodexHarness item decode;
    *  the provisional item-type strings are the same current best guess and are verified in
    *  the packaged integration, not here. */
   private extractAdviceText(note: Extract<CodexNotification, { kind: "activity" }>): string {
     if (note.method !== "item/completed") return "";
     const item = asObject(asObject(note.params)?.item);
     if (!item) return "";
+    if (item.delivery === "async") return "";
     const type = asString(item.type);
     if (type === "agentMessage" || type === "assistantMessage" || type === "agent_message") {
       return extractText(item).join("");

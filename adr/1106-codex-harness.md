@@ -352,11 +352,10 @@ remain behind worker-owned callbacks.
   questions and formatted text. Its direct tool output is JSON text
   `{"accepted":true}`: acceptance is immediate, with no pause for a user response
   and no worker effect. Uzi's root projects the message as ordinary text, without
-  a questions workflow. Advice appends that text to its result
-  ([accumulation](../agent/src/codex/codex-advice-harness.ts#L444),
-  [extraction](../agent/src/codex/codex-advice-harness.ts#L573)), so it can contaminate
-  prose or structured-verdict parsing. **Dropping async agent messages is a
-  DEFERRED follow-up; no filtering fix is included here.**
+  a questions workflow. Advice ignores text from items whose delivery is exactly
+  `"async"` before extraction into its result; no questions are surfaced or
+  answered. The native capability stays available. This resolves the earlier
+  advice-filtering deferral under #2239. (AI-synced 2026-10-05)
 - `clock.curr_time` is a human-authorized, read-only exception with no filesystem,
   network or process effects. The verified installed runtime returns successful
   UTC time without an observed `currentTime/read` request reaching uzi, then

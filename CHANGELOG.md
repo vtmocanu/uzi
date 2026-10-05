@@ -40,6 +40,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Codex advice ignores async question text ([#2239](https://github.com/vtmocanu/uzi/issues/2239)).**
+  Items whose delivery is exactly `"async"` no longer contaminate advice prose or structured verdicts. Other delivery values preserve text unchanged and in order; advice surfaces and answers no questions, while the native capability stays available.
+
 - **Secret scans reuse the pinned worker scanner offline ([#2289](https://github.com/vtmocanu/uzi/issues/2289)).**
   The repository gate reuses installed gitleaks only when Go build metadata proves the exact module and version without replacements. Unknown or different builds use the pinned fetch, and every scan still must detect its canaries.
 
@@ -66,7 +69,7 @@ through `[0.52.0]`.)
   Text reads support one-based line offsets and limits, default to 200 lines, and return at most 64 KiB with excerpt metadata; unranged binary reads preserve exact base64, while malformed or oversized helper responses fail with neutral denials.
 
 - **Codex's documented execution boundary explicitly accepts async messages and UTC clock reads ([#1566](https://github.com/vtmocanu/uzi/issues/1566)).**
-  The ADR records the pinned 0.159.3 runtime's immediate async acceptance and successful read-only clock calls, with no worker effects, across root start, resume, child and advice characterization; async text can still contaminate advice, filtering remains deferred, and the underlying clock-provider path remains unverified. This is documentation of accepted exceptions, not a runtime suppression or security fix.
+  The ADR records the pinned 0.159.3 runtime's immediate async acceptance and successful read-only clock calls, with no worker effects, across root start, resume, child and advice characterization; at release, async text could still contaminate advice and filtering was deferred (resolved subsequently by [#2239](https://github.com/vtmocanu/uzi/issues/2239)), while the underlying clock-provider path remains unverified. This is documentation of accepted exceptions, not a runtime suppression or security fix.
 
 - **Hosted Docker workers can reclaim a full DinD disk automatically, including named volumes ([#1760](https://github.com/vtmocanu/uzi/issues/1760)).**
   Upgrade warning: this destructive behavior defaults on for existing installs. DinD containers, named and anonymous volumes, networks, images and build cache are scratch; replacing the Deployment also loses the shared run-workdir emptyDir. Sustained fresh byte or inode pressure requests a drain that lets the worker's own parked runs finish, then a terminal-only claim fence and fresh custody/local-idle proof guard optional anonymous-volume pruning and DinD-only PVC replacement. The nix/data PVCs, worker UUID and join Secret survive; admission stays fenced until replacement binding, pod readiness and a fresh replacement registration heartbeat, with no rollback on failed binding. Set `UZI_WORKER_DISK_RECYCLE_ENABLED=false` before stop to opt out; started stop/rebuild finishes safely if disabled. Old workers remain report-only, ephemeral workers use terminal teardown, and compose stays manual. Real-cluster validation is a maintainer post-release task and has not run; the focused throwaway DinD check's scope is Docker prune semantics only, not the production gate, and no result is claimed here. See [Docker inside a worker](docs/worker-docker.md#dind-scratch-and-pressure-recycle).
