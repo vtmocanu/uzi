@@ -770,7 +770,6 @@ describe("CodexCallbackBroker: bounded text Read (#296)", () => {
 
   function output(result: CallbackResult): Record<string, unknown> {
     assert.equal(result.ok, true);
-    if (!result.ok) assert.fail(result.message);
     return result.output as Record<string, unknown>;
   }
 
