@@ -6,10 +6,10 @@
 // the process: a quiescing run, a shutdown or a preempting sink waits for EVERY tick child to have
 // exited before it touches the clone or the bare. Each child is spawned in its OWN process group
 // (`detached: true`); on the tick signal the group gets SIGTERM, then SIGKILL after a grace, and a
-// child's `completed` resolves only once the leader has exited. `settled()` resolves once every
-// child's WHOLE process group is gone, not just its leader: a grandchild (a git subprocess) that
-// outlives its leader is SIGKILLed after the grace, and a group still alive past a bounded deadline
-// is logged and listed by `survivors()` rather than silently counted as settled.
+// child's `completed` resolves only once its WHOLE process group is gone, and rejects if group
+// cleanup cannot be confirmed. A grandchild (a git subprocess) that outlives its leader is
+// SIGKILLed after the grace. `settled()` finishes after bounded cleanup attempts for every child;
+// groups still alive or unconfirmed are logged and listed by `survivors()`.
 //
 // Lock custody. git removes its own `*.lock` files on SIGTERM, but a child that survives SIGTERM
 // and is SIGKILLed leaves them behind, and a leftover lock in the worker bare would fail every

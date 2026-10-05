@@ -23,6 +23,8 @@ import {
   type RunnerTreeRequest,
   type SupervisorProcess,
 } from "../src/codex/launcher.js";
+import { registeredRoot } from "../src/codex/codex-executor.js";
+import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { makeTextRedactor } from "../src/redact.js";
 import { SESSION_SEED_ENTRYPOINT } from "../src/codex/session-seed-cli.js";
@@ -59,6 +61,7 @@ interface FakeOpts {
   capBoundingSet?: "0x0" | "0xc0" | "0xff";
   autoStarted?: boolean;
   disposeState?: "drained" | "unconfirmed";
+  singleDisposeResponse?: boolean;
   disposeAuthority?: string;
   exitCode?: number;
   disposeNearBudget?: boolean;
@@ -78,6 +81,7 @@ class FakeSupervisor extends EventEmitter {
   readonly evidence = new PassThrough();
   readonly stdio: PassThrough[];
   private readonly disposeState: "drained" | "unconfirmed";
+  private readonly singleDisposeResponse: boolean;
   private readonly disposeAuthority: string;
   private readonly exitCode: number;
   private readonly disposeNearBudget: boolean;
@@ -89,6 +93,7 @@ class FakeSupervisor extends EventEmitter {
     super();
     this.stdio = [this.stdin, this.stdout, this.stderr, this.control, this.evidence];
     this.disposeState = opts.disposeState ?? "drained";
+    this.singleDisposeResponse = opts.singleDisposeResponse ?? false;
     this.disposeAuthority = opts.disposeAuthority ?? "ECHILD+__WALL";
     this.exitCode = opts.exitCode ?? 0;
     this.disposeNearBudget = opts.disposeNearBudget ?? false;
@@ -116,6 +121,7 @@ class FakeSupervisor extends EventEmitter {
       this.writeEvidence({ event: "snapshot", id: cmd.id, processes: [{ pid: this.pid + 1, ppid: this.pid, pgid: this.pid, comm: "codex" }] });
     } else if (cmd.op === "dispose") {
       this.disposeTimeouts.push(cmd.timeoutMs ?? 0);
+      if (this.singleDisposeResponse && this.disposeTimeouts.length > 1) return;
       if (this.disposeState === "drained") {
         const emit = (): void => {
           this.writeEvidence({
@@ -706,6 +712,56 @@ describe("launchCodexRoot: happy-path lifecycle over the fake supervisor", () =>
     assert.equal((await handle.dispose(1500)).clean, true, "dispose stays idempotent");
     assert.equal(treeRemoveCalls.length, 1, "a clean tree removal runs once");
     assert.equal(handle.failed, undefined);
+  });
+
+  it("coalesces concurrent registered root reap and disposal without poisoning", async () => {
+    const fake = newFake({ singleDisposeResponse: true, exitDelayMs: 50 });
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const root = registeredRoot(handle, "boundary_action");
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const reservation = registry.reserveLaunch(root.kind);
+    assert.equal(reservation.kind, "reserved");
+    if (reservation.kind !== "reserved") return;
+    registry.registerRoot(reservation.reservation, root);
+    const reap = registry.reapRoot(root, 1000);
+    const disposal = root.dispose(1000);
+    const results = await Promise.allSettled([reap, disposal]);
+    assert.equal(fake.disposeTimeouts.length, 1, "one supervisor disposal request");
+    assert.deepEqual(results, [
+      { status: "fulfilled", value: { ok: true } },
+      { status: "fulfilled", value: undefined },
+    ]);
+    assert.equal(registry.isPoisoned(), false);
+    assert.equal(handle.failed, undefined);
+    assert.equal((await handle.dispose(500)).clean, true);
+    assert.equal(fake.disposeTimeouts.length, 1, "repeated clean disposal stays idempotent");
+    assert.equal(treeRemoveCalls.length, 1);
+  });
+
+  it("bounds a shorter concurrent disposal caller without a second request", async () => {
+    const fake = newFake({ singleDisposeResponse: true, exitDelayMs: 150 });
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const first = handle.dispose(2000);
+    const start = Date.now();
+    const second = await handle.dispose(20);
+    assert.equal(second.clean, false, "short caller cannot inherit the first caller's budget");
+    assert.ok(Date.now() - start < 100, "short caller returns before the supervisor exits");
+    assert.equal((await first).clean, true);
+    assert.equal(fake.disposeTimeouts.length, 1);
+    assert.equal(handle.failed, undefined);
+    assert.equal((await handle.dispose(500)).clean, true);
+  });
+
+  it("retries after a shared unconfirmed disposal without removing the owned tree", async () => {
+    const fake = newFake({ disposeState: "unconfirmed" });
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const outcomes = await Promise.all([handle.dispose(500), handle.dispose(500)]);
+    assert.equal(fake.disposeTimeouts.length, 1);
+    assert.equal(outcomes[0]?.clean, false);
+    assert.deepEqual(outcomes[1], outcomes[0]);
+    assert.equal((await handle.dispose(500)).clean, false);
+    assert.equal(fake.disposeTimeouts.length, 2, "an unclean operation is not cached");
+    assert.equal(treeRemoveCalls.length, 0);
   });
 
   it("reserves caller budget for exit confirmation after a near-deadline drain", async () => {

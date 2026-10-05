@@ -867,6 +867,7 @@ async function createHandle(
   let exited = false;
   let exitInfo: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   let disposeInFlight = false;
+  let disposalOperation: Promise<DisposeOutcome> | undefined;
   let cleanDisposed = false;
   let lastDrained: DisposeEvidence | undefined;
   let abnormalTmpCleanup: TmpCleanupEvidence | undefined;
@@ -1030,7 +1031,25 @@ async function createHandle(
   /** Every unclean outcome carries the tmpCleanup an abnormal event reported, however
    *  the disposal came to be unclean (the abnormal may land before or during it). */
   async function dispose(timeoutMs?: number): Promise<DisposeOutcome> {
-    const outcome = await disposeOnce(timeoutMs);
+    let outcome: DisposeOutcome;
+    if (disposalOperation) {
+      // Join the owned drain without extending this caller's budget or cancelling
+      // the first caller's operation when this caller's deadline expires.
+      try {
+        outcome = await withDeadline(disposalOperation, timeoutMs ?? 2000, "dispose");
+      } catch (error) {
+        outcome = { clean: false, reason: error instanceof Error ? error.message : String(error) };
+      }
+    } else {
+      const operation = disposeOnce(timeoutMs);
+      disposalOperation = operation;
+      try {
+        outcome = await operation;
+      } finally {
+        // Unconfirmed disposal may be retried; only cleanDisposed caches success.
+        disposalOperation = undefined;
+      }
+    }
     if (outcome.clean || !abnormalTmpCleanup) return outcome;
     return { ...outcome, tmpCleanup: abnormalTmpCleanup };
   }

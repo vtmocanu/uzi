@@ -10,7 +10,7 @@ import { WORKER_SPAWN_ENV, workerSpawnEnv, workerSpawnNonce } from "../src/worke
 import { realProcfsSkip } from "./real-procfs.js";
 
 // issue #1597 M2 — the mid-turn checkpoint tick's spawner: own process group per child, SIGTERM
-// then SIGKILL after a grace, `completed` only after exit, settled(), and PROVEN-ownership lock
+// then SIGKILL after a grace, `completed` after whole-group cleanup, settled(), and PROVEN-ownership lock
 // custody (pre-spawn snapshot + /proc fd evidence + dev/ino re-check). Real child processes.
 
 const NODE = process.execPath;
@@ -212,7 +212,7 @@ ${exitAfterMs === undefined ? "setInterval(() => {}, 1000);" : `setTimeout(() =>
     const h = await sp.spawn(req([NODE, leaderWithStubbornGrandchild()]));
     const grandchild = await grandchildOf(h);
     ac.abort();
-    await h.completed; // the leader dies on SIGTERM at once; its group gets the SIGKILL next
+    await h.completed; // includes the SIGKILL cleanup of the group after its leader exits
     await sp.settled();
     assert.equal(alive(grandchild), false, "settled() did not resolve while the grandchild lived");
     assert.deepEqual(sp.survivors(), []);
@@ -229,7 +229,7 @@ ${exitAfterMs === undefined ? "setInterval(() => {}, 1000);" : `setTimeout(() =>
     assert.equal(sp.cancelledAny(), false);
   });
 
-  it("escalates to SIGKILL after the grace for a SIGTERM-ignoring child; completed only after exit", async () => {
+  it("escalates to SIGKILL after the grace for a SIGTERM-ignoring child; completion includes group cleanup", async () => {
     const ac = new AbortController();
     const sp = new TickSpawner({ signal: ac.signal, killGraceMs: 200 });
     const h = await sp.spawn(req([NODE, stubborn()]));
