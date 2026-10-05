@@ -920,9 +920,13 @@ export class FakeApi {
       return send(res, 401, { error: "unauthorized" });
     }
     const url = new URL(req.url ?? "/", "http://fake");
-    const body = await readBody(req);
-    const json: Record<string, unknown> = body ? JSON.parse(body) : {};
     const p = url.pathname;
+    const body = await readBody(req);
+    // The checkpoint broker streams a Git pack, not JSON. This fake has no publisher:
+    // preserve the ordinary missing-route answer instead of throwing on the PACK header.
+    if (req.method === "POST" && /^\/api\/worker\/runs\/[^/]+\/publish$/.test(p))
+      return send(res, 404, { error: "not found", path: p });
+    const json: Record<string, unknown> = body ? JSON.parse(body) : {};
 
     if (req.method === "POST" && p === "/api/worker/register") {
       const rec: RecordedRegister = {

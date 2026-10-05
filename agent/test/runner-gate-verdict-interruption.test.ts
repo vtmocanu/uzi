@@ -23,6 +23,9 @@ import { getEventListeners } from "node:events";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -321,7 +324,16 @@ class Scenario {
     const { gitlab } = fakeGitlab();
     const runner = runnerWith(
       () => ({
-        executor: opts.executor?.() ?? new SdkExecutor(nullLogger(), this.home, { queryFn: this.model.queryFn() }),
+        executor: opts.executor?.() ?? new SdkExecutor(nullLogger(), this.home, {
+          queryFn: this.model.queryFn(),
+          // Model is an in-process generator; the fixture has no JS lockfile and the env probe
+          // is hermetic. There are no agent processes to reap. A real host /proc scan here
+          // can be incomplete because of unrelated processes and fail a receipt scenario.
+          runProcesses: {
+            scan: async () => ({ pids: [], complete: true }),
+            reap: async () => ({ killed: [], left: [], complete: true }),
+          },
+        }),
         homeDir: this.home,
       }),
       gitlab,
@@ -616,6 +628,63 @@ describe("#2230 scenario failure diagnostics", () => {
       await client.reportState(s.runId, { status: "completed" });
     });
     assert.deepEqual(output, []);
+  });
+});
+
+describe("#2230 scripted model process isolation", () => {
+  it("a process-free gate scenario completes when an unrelated proc scan is incomplete", async (t) => {
+    let forceIncomplete = false;
+    let injected = 0;
+    const spawn = childProcess.spawn;
+    const spy = t.mock.method(childProcess, "spawn", (command: string, args: readonly string[], options: childProcess.SpawnOptions) => {
+      if (forceIncomplete && command === process.execPath && args[0] === "-e" && args[1]?.includes('const want = Buffer.from("HOME=" + home);')) {
+        injected++;
+        return spawn(command, ["-e", 'process.stdout.write("H\\t" + JSON.stringify({scanned:1,truncated:false,unresolved:1,procMount:"ok"}) + "\\n")'], options);
+      }
+      return spawn(command, args, options);
+    });
+    syncBuiltinESMExports();
+    try {
+      await scenario(async (s) => {
+        forceIncomplete = true;
+        const control = new SdkExecutor(nullLogger(), s.home, { queryFn: s.model.queryFn() });
+        const reap = await control.reapAttributedProcesses();
+        assert.equal(reap.complete, false, "the forced live-proc result is incomplete");
+        assert.equal(injected, 1, "the control used the actual HOME helper seam");
+        forceIncomplete = false;
+        injected = 0;
+        const block = s.model.block("implement");
+        const flight = await s.toFirstGate();
+        s.send(s.input("approve_plan"));
+        await block.entered;
+        forceIncomplete = true;
+        block.release();
+        await s.finish(flight);
+        assert.ok(s.statuses(flight).includes("completed"), JSON.stringify(s.states(flight)));
+        assert.equal(injected, 0, "the process-free scenario never scanned live host processes");
+      });
+    } finally {
+      spy.mock.restore();
+      syncBuiltinESMExports();
+    }
+  });
+});
+
+describe("#2230 binary checkpoint publication in FakeApi", () => {
+  it("a valid Git pack gets the missing-route response without a JSON handler exception", async () => {
+    const header = Buffer.alloc(12);
+    header.write("PACK");
+    header.writeUInt32BE(2, 4); // Git pack v2, zero objects, followed by its SHA-1 trailer.
+    const pack = Buffer.concat([header, createHash("sha1").update(header).digest()]);
+    const publishPath = "/api/worker/runs/binary-pack-fixture/publish";
+    const response = await fetch(baseUrl + publishPath, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/octet-stream" },
+      body: pack,
+    });
+    assert.equal(response.status, 404, "the fake does not claim it persisted a checkpoint");
+    assert.deepEqual(await response.json(), { error: "not found", path: publishPath });
+    assert.deepEqual(api.handlerExceptions, [], "binary routing did not throw a JSON decode error");
   });
 });
 
