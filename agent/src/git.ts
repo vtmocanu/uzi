@@ -7124,6 +7124,67 @@ export class GitCache {
   }
 
   /**
+   * Unit2 transport primitive only: argv must come from a trusted caller, never
+   * clone configuration. No runner caller uses this yet; bytes are not approved
+   * source capture. Require a whole-root owner rather than a legacy spawn fallback.
+   * @internal Transport for the planning reader; not a source-capture API.
+   */
+  async readBoundedPlanningOutput(
+    cwd: string,
+    argv: readonly string[],
+    timeoutMs = GIT_TIMEOUT_MS,
+  ): Promise<Buffer> {
+    const boundary = this.boundaryProcesses.getStore();
+    if (!boundary) throw new Error("bounded runner stdout requires a trusted boundary spawner");
+    if (!path.isAbsolute(cwd) || !argv[0] || !path.isAbsolute(argv[0])) {
+      throw new Error("bounded runner stdout requires trusted absolute executable and clone cwd");
+    }
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("invalid stdout deadline");
+    if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
+    const env = unmarkedSpawnEnv({ ...gitEnv(), PATH: runnerPath() });
+    const tmp = runnerTmpdir();
+    if (tmp) env.TMPDIR = tmp;
+    const handle = await boundary.spawn({ argv, cwd, env, identity: "command", timeoutMs });
+    // Attach both paused collectors before any further await. An async spawner
+    // may hand us pipes after child_process flushStdio: refuse any prior read.
+    const stop = new AbortController();
+    const stdout = collectBoundedRunnerPipe(handle.stdout, stop.signal);
+    const stderr = collectBoundedRunnerPipe(handle.stderr, stop.signal);
+    const onAbort = (): void => stop.abort(new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE));
+    boundary.signal.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(() => stop.abort(new Error("bounded runner stdout timed out")), timeoutMs);
+    let rejectAbort!: (error: unknown) => void;
+    const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
+    const onStop = (): void => rejectAbort(stop.signal.reason);
+    stop.signal.addEventListener("abort", onStop, { once: true });
+    if (boundary.signal.aborted) onAbort();
+    handle.stdin?.on("error", () => undefined);
+    handle.stdin?.end();
+    const all = Promise.all([stdout.result, stderr.result, handle.completed] as const);
+    try {
+      const [bytes, , terminal] = await Promise.race([all, aborted]);
+      if (terminal.code !== 0 || terminal.softTimedOut) throw new Error("bounded runner process failed");
+      return bytes;
+    } catch (error) {
+      stop.abort(error);
+      // One cancellation attempt; the trusted owner bounds termination/reap.
+      // A refused cleanup overrides the output error, and no bytes escape.
+      const cleanup = await Promise.allSettled([handle.cancel(), handle.completed]);
+      await Promise.allSettled([stdout.result, stderr.result]);
+      if (cleanup.some((result) => result.status === "rejected")) {
+        throw new Error("bounded runner stdout cleanup failed", { cause: error });
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      boundary.signal.removeEventListener("abort", onAbort);
+      stop.signal.removeEventListener("abort", onStop);
+      stdout.dispose();
+      stderr.dispose();
+    }
+  }
+
+  /**
    * Run a git op as the RUNNER uid (PRD #51 M4) — the runner-clone seed + checkout,
    * which must be runner-owned. NEVER carries a PAT (a local, non-credentialed op), and
    * runs on gitEnv's config pins (safe.directory / hooksPath / M0 code-exec-key pins)
@@ -7394,6 +7455,78 @@ function commandCwd(args: readonly string[]): string {
     throw new Error("permit-held runner git requires an absolute -C worktree");
   }
   return cwd;
+}
+
+/**
+ * Paused byte-mode consumption: read at most 512 KiB plus one overflow sentinel
+ * per pipe. No flowing collector or truncation of an already-read large chunk.
+ */
+function collectBoundedRunnerPipe(stream: Readable | null, signal: AbortSignal): {
+  result: Promise<Buffer>;
+  dispose: () => void;
+} {
+  const cap = 512 * 1024;
+  let dispose = (): void => {};
+  const result = new Promise<Buffer>((resolve, reject) => {
+    if (!stream) { reject(new Error("bounded runner process has no output pipe")); return; }
+    let bytes = 0;
+    let settled = false;
+    const chunks: Buffer[] = [];
+    const fail = (error: unknown): void => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    const drain = (): void => {
+      if (settled) return;
+      try {
+        while (!settled) {
+          const size = Math.min(16 * 1024, Math.max(1, stream.readableLength), cap + 1 - bytes);
+          const chunk: unknown = stream.read(size);
+          if (chunk === null) break;
+          if (!Buffer.isBuffer(chunk) || chunk.length > size) {
+            throw new Error("bounded runner output is not a byte pipe");
+          }
+          bytes += chunk.length;
+          if (bytes > cap) throw new Error("bounded runner stdout exceeded 512 KiB");
+          chunks.push(chunk);
+        }
+      } catch (error) { fail(error); }
+    };
+    const end = (): void => {
+      if (settled) return;
+      drain();
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks, bytes));
+    };
+    const close = (): void => {
+      if (!stream.readableEnded) fail(new Error("bounded runner output closed before end"));
+      else end();
+    };
+    const abort = (): void => fail(signal.reason);
+    stream.pause();
+    stream.on("readable", drain);
+    stream.on("end", end);
+    stream.on("close", close);
+    // Keep the error listener until whole-root cleanup, even after overflow.
+    stream.on("error", fail);
+    signal.addEventListener("abort", abort, { once: true });
+    dispose = (): void => {
+      stream.removeListener("readable", drain);
+      stream.removeListener("end", end);
+      stream.removeListener("close", close);
+      stream.removeListener("error", fail);
+      signal.removeEventListener("abort", abort);
+    };
+    if (stream.readableDidRead || stream.errored || stream.readableObjectMode || stream.readableEncoding) {
+      fail(new Error("bounded runner output was consumed or is not a fresh byte pipe"));
+    } else if (stream.readableEnded) end();
+    else if (stream.destroyed) close();
+    else drain();
+    if (signal.aborted) abort();
+  });
+  return { result, dispose: () => dispose() };
 }
 
 export function resolveBoundaryExecutable(command: string): string {
