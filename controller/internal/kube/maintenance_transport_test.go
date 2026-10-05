@@ -36,7 +36,11 @@ func TestMaintenanceTransportActualClient(t *testing.T) {
 				if tc.compressed {
 					w.Header().Set("Content-Encoding", "gzip")
 					zw := gzip.NewWriter(w)
-					defer zw.Close()
+					defer func() {
+						if err := zw.Close(); err != nil {
+							t.Errorf("close gzip response: %v", err)
+						}
+					}()
 					out = zw
 				} else {
 					w.(http.Flusher).Flush()
