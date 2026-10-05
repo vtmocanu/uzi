@@ -79,10 +79,10 @@ func TestWorkersLegendHelpAndVersionBudget(t *testing.T) {
 	r.w.UpgradeStatus = "upgrade_failed"
 	r.w.OutboxBlocked = sp("blocked")
 	m.workers.rows = []workerRow{r}
-	if line := m.workerRowLine(r, true, 120); !strings.Contains(stripANSI(line), "+") || visualWidth(line) > 120 {
+	if line := m.workerRowLine(r, true, 120, m.workerTableWidths(m.workers.rows, 120), time.Now()); !strings.Contains(stripANSI(line), "+") || visualWidth(line) > 120 {
 		t.Fatalf("attention suffix lost: %s", line)
 	}
-	line := stripANSI(m.workerRowLine(r, true, 120))
+	line := stripANSI(m.workerRowLine(r, true, 120, m.workerTableWidths(m.workers.rows, 120), time.Now()))
 	// Wide glyphs must fit the capped eighteen-column version cell, including its marker.
 	versionCell := strings.Repeat("界", 8) + "…✕"
 	at := strings.Index(line, versionCell)
@@ -893,6 +893,9 @@ func TestWorkersDrillReturnPollingAndTopTab(t *testing.T) {
 }
 
 func TestWorkersReplySchedulesBackoffDelay(t *testing.T) {
+	original := workersPollInterval
+	workersPollInterval = 5 * time.Millisecond
+	t.Cleanup(func() { workersPollInterval = original })
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 	for _, tc := range []struct {
 		name   string
@@ -900,9 +903,9 @@ func TestWorkersReplySchedulesBackoffDelay(t *testing.T) {
 		delay  time.Duration
 		streak int
 	}{
-		{"first failure", errors.New("unavailable"), 10 * time.Second, 1},
-		{"second failure", errors.New("unavailable"), 20 * time.Second, 2},
-		{"recovery", nil, 5 * time.Second, 0},
+		{"first failure", errors.New("unavailable"), 2 * workersPollInterval, 1},
+		{"second failure", errors.New("unavailable"), 4 * workersPollInterval, 2},
+		{"recovery", nil, workersPollInterval, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m = press(t, m, "r")
@@ -917,7 +920,10 @@ func TestWorkersReplySchedulesBackoffDelay(t *testing.T) {
 			msg := cmd()
 			elapsed := time.Since(start)
 			tick, ok := msg.(workersTickMsg)
-			if !ok || tick.gen != m.workers.tickGen || elapsed < tc.delay-100*time.Millisecond || elapsed > tc.delay+5*time.Second {
+			if workersTickInterval(m.workers.errStreak) != tc.delay {
+				t.Fatalf("backoff ratio changed: streak=%d delay=%v", m.workers.errStreak, workersTickInterval(m.workers.errStreak))
+			}
+			if !ok || tick.gen != m.workers.tickGen || elapsed < tc.delay-workersPollInterval/2 || elapsed > tc.delay+5*time.Second {
 				t.Fatalf("reply scheduled %T after %v, want workers tick after %v (gen %d)", msg, elapsed, tc.delay, m.workers.tickGen)
 			}
 			next, fetch := m.Update(tick)

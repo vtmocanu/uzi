@@ -165,13 +165,13 @@ func TestWorkersApprovedVersionWidth(t *testing.T) {
 	r.w.Version = sp("0.85.1+gba846d7")
 	r.w.UpgradeStatus = "outdated"
 	m.workers.rows = []workerRow{r}
-	row := stripANSI(m.workerRowLine(r, true, m.width))
+	row := stripANSI(m.workerRowLine(r, true, m.width, m.workerTableWidths(m.workers.rows, m.width), time.Now()))
 	if !strings.Contains(row, "0.85.1+gba846d7↑") {
 		t.Fatalf("version truncated with spare width: %s", row)
 	}
 	r.w.Version = sp(strings.Repeat("v", 30))
 	m.workers.rows = []workerRow{r}
-	row = stripANSI(m.workerRowLine(r, true, m.width))
+	row = stripANSI(m.workerRowLine(r, true, m.width, m.workerTableWidths(m.workers.rows, m.width), time.Now()))
 	if !strings.Contains(row, strings.Repeat("v", 16)+"…↑") || strings.Contains(row, strings.Repeat("v", 18)) {
 		t.Fatalf("version must cap at 18 cells including marker: %s", row)
 	}
@@ -288,7 +288,7 @@ func TestWorkersStaleResourceCells(t *testing.T) {
 			m := workersScene(true, "workers-list-120")
 			r := workerRow{w: apitypes.WorkerDTO{ID: "sample", Name: "sample", Status: tc.status, Kind: "hosted", Version: sp("0.85.1"), StatsCPUPct: &tc.cpu, StatsMemBytes: &tc.used, StatsMemLimitBytes: i64(16 << 30), StatsDiskDataBytes: i64(100), StatsDiskDataTotalBytes: i64(100)}}
 			m.workers.rows = []workerRow{r}
-			row := stripANSI(m.workerRowLine(r, true, 120))
+			row := stripANSI(m.workerRowLine(r, true, 120, m.workerTableWidths(m.workers.rows, 120), time.Now()))
 			cpu := fmt.Sprintf("%.0f%%", tc.cpu)
 			disk := "data     ▮▮▮▮ 100%"
 			if tc.status == "offline" {
