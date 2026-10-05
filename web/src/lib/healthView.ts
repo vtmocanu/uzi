@@ -23,7 +23,7 @@ export function attentionChecks(doc: HealthDoc): HealthCheck[] {
 
 // Present blocking is authoritative. An older server omitting it retains the conservative
 // status/tally/first-danger presentation, including the banner's snooze expiry timer.
-export function healthVerdict(doc: HealthDoc): { title: string; sub: string; blocking: boolean; cause: HealthCheck | undefined } {
+export function healthVerdict(doc: HealthDoc | Omit<HealthDoc, "blocking">): { title: string; sub: string; blocking: boolean; cause: HealthCheck | undefined } {
   const legacy = !("blocking" in doc);
   const dangers = doc.checks.filter((c) => c.severity === "danger" && (legacy || c.scope === "instance"));
   const blocking = legacy ? doc.status === "danger" : doc.blocking;

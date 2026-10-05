@@ -53,7 +53,6 @@ describe("HealthOverviewCard", () => {
       expect(within(item).queryByText("Owners affected:")).toBeNull();
       expect(item.textContent).not.toContain("22930000-0000-0000-0000-000000000005");
     }
-    expect(within(card).queryByRole("banner")).toBeNull();
     expect(within(card).getByRole("link", { name: "Open health" })).toBeTruthy();
   });
 

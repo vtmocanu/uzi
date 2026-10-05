@@ -56,7 +56,7 @@ describe("HealthDangerBanner", () => {
     repoll();
     await waitFor(() => expect(banner()).not.toBeNull());
     expect(screen.getByText("uzi cannot run work: 1 blocking check")).toBeTruthy();
-    expect(screen.getByText(mixed.checks.at(-1)!.summary)).toBeTruthy();
+    expect(screen.getByText(mixed.checks[mixed.checks.length - 1].summary)).toBeTruthy();
     expect(screen.queryByText(mixed.checks[0].summary)).toBeNull();
   });
 
