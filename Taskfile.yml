@@ -353,6 +353,9 @@ tasks:
       # hermetic (~1s, fake go + gofmt on PATH): fmt-check:api and fmt-check:controller run
       # the module toolchain's gofmt, not a stale PATH gofmt, and still fail closed.
       - task: test:fmt-check-toolchain
+      # Offline fake-go contract: govulncheck install and child package loading use
+      # the module-selected toolchain, preserving host/target settings and failures.
+      - task: test:govulncheck-toolchain
       - task: test:brew-tap-guard
       # cheapest-first: this whole-file duplicate check is sub-second, so it runs
       # before `scan:secrets`, which is deliberately last because it dominates.
@@ -1066,6 +1069,11 @@ tasks:
     desc: hermetic test that fmt-check:api and fmt-check:controller use the module toolchain's gofmt (go env GOROOT), not PATH's, and fail closed (fake go + gofmt)
     cmds:
       - ./scripts/fmt-check-toolchain.test.sh
+
+  test:govulncheck-toolchain:
+    desc: hermetic govulncheck module toolchain, host-native install, analysis environment and exit contract (fake go)
+    cmds:
+      - ./scripts/govulncheck-toolchain.test.sh
 
   test:uzi-lander:
     desc: hermetic tests of uzi-lander review routing, quota timing, CI discovery, required-check completeness, stale-base push guards, base-move tolerance, CHANGELOG union and release fold, the post-rebase CHANGELOG placement guard, and orphan run-PR claims

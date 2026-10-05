@@ -207,10 +207,21 @@ TMP="$(mktemp -d)"
 # shellcheck disable=SC2064  # expand TMP now: the trap must survive its unset.
 trap "rm -rf '$TMP'" EXIT INT TERM
 
+# Resolve inside the module before installing: a versioned go install ignores
+# its go.mod, and govulncheck's child go for package loading also needs this
+# selected toolchain. Keep both overrides inline so installation stays host-native.
+src=0
+selected_go_version="$( (cd "$MODULE_DIR" && go env GOVERSION) 2>"$TMP/selection.err")" || src=$?
+if [ "$src" -ne 0 ] || [ -z "$selected_go_version" ]; then
+  cat "$TMP/selection.err" >&2
+  echo "govulncheck-gate: could not resolve GOVERSION over $MODULE_DIR (exit $src; empty version is invalid)." >&2
+  exit 2
+fi
+
 # THROWAWAY GOBIN. `go install pkg@version` ignores the current module's go.mod
 # by construction (Go 1.16+), so this writes nothing to either module.
 irc=0
-GOBIN="$TMP/bin" go install "$TOOL" >"$TMP/install.out" 2>&1 || irc=$?
+GOTOOLCHAIN="$selected_go_version" GOBIN="$TMP/bin" go install "$TOOL" >"$TMP/install.out" 2>&1 || irc=$?
 if [ "$irc" -ne 0 ] || [ ! -x "$TMP/bin/govulncheck" ]; then
   cat "$TMP/install.out" >&2
   # Two arms, two messages. The `-x` arm is reachable at irc=0 -- a pkg@version
@@ -245,7 +256,7 @@ fi
 # enough to act on. It is a DISPLAY flag: it cannot change the verdict, and the
 # rc 0/3/* mapping below is untouched by it.
 rc=0
-(cd "$MODULE_DIR" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+(cd "$MODULE_DIR" && GOTOOLCHAIN="$selected_go_version" CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
   "$TMP/bin/govulncheck" -test=false -show verbose ./...) \
   >"$TMP/out" 2>"$TMP/err" || rc=$?
 
