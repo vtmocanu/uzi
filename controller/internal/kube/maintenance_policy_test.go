@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -20,6 +21,15 @@ func stampMaintenancePodOwner(p *corev1.Pod, deployment string) {
 	controller := true
 	p.Labels["pod-template-hash"] = "hash"
 	p.OwnerReferences = []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: deployment + "-hash", UID: "replicaset", Controller: &controller}}
+}
+
+func maintenanceReplicaSet(p *corev1.Pod, d *appsv1.Deployment) *appsv1.ReplicaSet {
+	controller := true
+	owner := p.OwnerReferences[0]
+	return &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
+		Name: owner.Name, UID: owner.UID, Namespace: p.Namespace,
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: d.Name, UID: d.UID, Controller: &controller}},
+	}}
 }
 
 func TestDinDCancelOnlyBeforeStopping(t *testing.T) {
@@ -148,6 +158,9 @@ func TestDinDSimultaneousLegacyFirstThenRefreshAndDinDPriority(t *testing.T) {
 	}
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "replacement", Namespace: cfg.DockerNamespace, UID: "replacement-pod", Labels: replacement.Spec.Template.Labels, Annotations: replacement.Spec.Template.Annotations}, Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}
 	stampMaintenancePodOwner(pod, replacement.Name)
+	if _, err = client.AppsV1().ReplicaSets(cfg.DockerNamespace).Create(ctx, maintenanceReplicaSet(pod, replacement), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = client.CoreV1().Pods(cfg.DockerNamespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}

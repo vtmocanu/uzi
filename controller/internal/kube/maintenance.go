@@ -68,13 +68,6 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 		}
 		return false, nil
 	}
-	{
-		var err error
-		o, err = m.maintenanceObservation(ctx, w.ID, ns, o)
-		if err != nil {
-			return true, err
-		}
-	}
 	next := *op
 	// Absent pressure can mean a fresh low sample OR unknown telemetry. Let the
 	// API distinguish them under its worker lock; only confirmed cancellation
@@ -100,6 +93,13 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 		next.Reason = "recycle_disabled"
 		transition(next)
 		return true, nil
+	}
+	{
+		var err error
+		o, err = m.maintenanceObservation(ctx, w.ID, ns, o, op)
+		if err != nil {
+			return true, err
+		}
 	}
 	switch op.Phase {
 	case "requested":

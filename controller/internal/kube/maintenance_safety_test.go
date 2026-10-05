@@ -3,6 +3,7 @@ package kube
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -19,7 +20,7 @@ import (
 
 // Exercise all safety decisions through Reconcile rather than observation helpers.
 func TestDinDAuthoritativeSafety(t *testing.T) {
-	for _, mode := range []string{"foreign-deployment", "foreign-pvc", "incomplete-pods", "stale-ready", "foreign-ready", "wrong-owner", "replacement-pvc", "missing-objects"} {
+	for _, mode := range []string{"foreign-deployment", "foreign-pvc", "incomplete-pods", "stale-ready", "foreign-ready", "wrong-owner", "replacement-pvc", "missing-objects", "dangling-replicaset", "old-replicaset", "wrong-replicaset-uid", "terminating-replicaset", "replicaset-list-denied"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			cfg := dockerTestConfig()
@@ -57,7 +58,22 @@ func TestDinDAuthoritativeSafety(t *testing.T) {
 			case "wrong-owner":
 				pod.OwnerReferences[0].Name = "other-hash"
 			}
-			objs := []runtime.Object{dep, pvc, pod}
+			rs := maintenanceReplicaSet(pod, dep)
+			switch mode {
+			case "wrong-owner":
+				rs.Name = dep.Name + "-hash"
+			case "old-replicaset":
+				rs.OwnerReferences[0].UID = "old-deployment"
+			case "wrong-replicaset-uid":
+				rs.UID = "other-replicaset"
+			case "terminating-replicaset":
+				at := metav1.Now()
+				rs.DeletionTimestamp = &at
+			}
+			objs := []runtime.Object{dep, pvc, pod, rs}
+			if mode == "dangling-replicaset" {
+				objs = []runtime.Object{dep, pvc, pod}
+			}
 			if mode == "missing-objects" {
 				objs = nil
 				op.Phase = "stopping"
@@ -76,6 +92,11 @@ func TestDinDAuthoritativeSafety(t *testing.T) {
 				if _, err = client.CoreV1().Pods(cfg.DockerNamespace).Update(ctx, pod, metav1.UpdateOptions{}); err != nil {
 					t.Fatal(err)
 				}
+			}
+			if mode == "replicaset-list-denied" {
+				client.PrependReactor("list", "replicasets", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, errors.New("denied")
+				})
 			}
 			if mode == "incomplete-pods" {
 				client.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
@@ -213,7 +234,7 @@ func TestDinDActualClientReadiness404RetainsFence(t *testing.T) {
 		_ = json.NewEncoder(rw).Encode(w.DindMaintenance)
 	}))
 	defer server.Close()
-	m, _ := newMat(t, dep, pvc, pod)
+	m, _ := newMat(t, dep, pvc, pod, maintenanceReplicaSet(pod, dep))
 	m.cfg = cfg
 	m.cordoner = apiclient.New(server.URL, "token", time.Second, nil, nil)
 	obs, err := m.Observe(ctx)

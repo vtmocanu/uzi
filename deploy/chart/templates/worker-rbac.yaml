@@ -185,6 +185,10 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["create", "list", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    # Replacement readiness resolves controller UIDs; no Secret contents are read.
+    verbs: ["list"]
   - apiGroups: [""]
     resources: ["secrets"]
     # ================= DO NOT ADD `get` OR `list` HERE. EVER. =================
