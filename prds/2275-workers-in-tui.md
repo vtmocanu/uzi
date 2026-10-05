@@ -32,17 +32,17 @@ Acceptance examples (counts are from the `demo.go` seed this PRD adds, which mir
      - info rows (lease, chat);
      - then workers with no attention item.
    - Within a row, items are listed worst first.
-   - **Summary line.** Reads `your workers · 9 · 8 online · 5/12 slots in use +1 ?cap · 1 holding · 1 draining · 6 need attention`; the count includes only workers with a danger or warn item (D11).
+   - **Fleet status.** Right-aligned on the title line (D15), narrowed to fit: `workers · 9 · 8 online · 5/12 slots in use +1 ?cap · 1 holding · 1 draining · 6 need attention` in full; the count includes only workers with a danger or warn item (D11).
    - **Detail.** `enter` on `forge-small` opens its detail. Attention comes first (blocking container `seed-nix`, reason `ImagePullBackOff`, target vs running version), then reported runs, resources (`stale, last-known` label, `?` for absent readings), then configuration. `esc` returns to the list with `forge-small` still selected, even after a poll reorders rows.
 2. A 60×120 terminal (above `splitMinHeight`) with the split drawn.
-   - **Workers on top.** Press `2`. The top pane shows the workers list in its 80-column layout with focus, and the bottom pane keeps CI.
+   - **Workers on top.** Press `2`. The top pane shows the workers list with focus, in the wide layout at ≥120 columns (D17), and the bottom pane keeps CI.
    - **Pane keys.** `ctrl+w` moves focus to CI and back. `4`/`3` switch the bottom pane between ci and pulls, and `1` returns the top pane to the floor.
    - **`tab` order.** `tab` cycles floor → workers → pulls → ci, each view landing in its own pane.
    - **Drill-in and back.** `enter` on a focused worker opens its detail full-screen; `esc` returns to the split with workers on top, the same worker selected and the top pane focused.
    - **Collapse.** `s` collapses to the top pane's view (workers), and `s` again restores both panes.
 3. **Floor, 120 columns, demo seed.**
    - Each run row ends with its worker name.
-   - The fleet summary line under the tab strip reads `workers 5/12 slots in use · 8/9 online · 6 need attention · 2 for detail`.
+   - The title line carries the fleet status right-aligned (D15), and the account-meter line carries the run summary right-aligned.
    - From the floor, open the run on `forge-large` and press `W`: that worker's detail opens, and `esc` returns to the run.
    - In worker detail, `enter` on a reported run opens that run, and `esc` returns to the worker.
    - **Unclaimed run.** On a queued run (no worker), `W` shows `no worker yet` in the footer and stays put.
@@ -266,7 +266,7 @@ Contents:
 - `workerRow`, state, attention, sort, and cursor by ID;
 - the list at both widths, in own and factory scope;
 - `topTab` and the split semantics, including collapse to `topTab` and every return-to-top site;
-- the fleet summary line and its height accounting;
+- the title-line fleet status, the meter-line run summary and their height accounting;
 - the stale `tui_keys.go` comment;
 - D7 projections and guard entries for list text;
 - the demo seed, the list, split and floor uxlab scenes, and `docs/cli.md` with `task docs:sync`.

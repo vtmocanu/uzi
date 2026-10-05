@@ -36,10 +36,7 @@ through `[0.52.0]`.)
 ### Added
 
 - **`uzi tui` has a workers tab ([#2275](https://github.com/vtmocanu/uzi/issues/2275)).**
-  A `workers` tab (key `2`; pulls and ci move to `3` and `4`) lists your workers, or the factory's with `a`, attention first: state, kind, slots, CPU, memory, worst disk, version, heartbeat and what needs a human; `enter` or `→` opens a worker's detail (attention, reported runs, resources, configuration) and its runs. The fleet status rides right-aligned on the title line, the split's top pane can show workers, and the floor names each run's worker on wide terminals.
-
-- **Workers join the TUI floor and split view ([#2275](https://github.com/vtmocanu/uzi/issues/2275)).**
-  The attention-ordered workers list and four-section worker detail share polling and own/factory scope with the floor fleet summary. Enter opens a worker or its reported run; uppercase `W` links a run to its worker, while Esc preserves the original return target and reopens runs with fresh metadata, transcript tail and stream. Wide floor rows show worker names. Tabs are now `1 floor · 2 workers · 3 pulls · 4 ci`; floor/workers occupy the split's top pane, with collapse retaining that tab and automatic restore at 43 rows (minimum 41).
+  A `workers` tab (key `2`; pulls and ci move to `3` and `4`) lists your workers, or the factory's with `a`, attention first: state, kind, slots, CPU, memory, worst disk, version, heartbeat and what needs a human; `enter` or `→` opens a worker's detail (attention, reported runs, resources, configuration) and its runs. Uppercase `W` in a run opens its worker, and `esc`/`←` returns to where you came from. The fleet status rides right-aligned on the title line, the split's top pane can show floor or workers, and the floor names each run's worker on wide terminals.
 
 - **See the estimated usage of an interrupted Claude session apart from the metered total ([#2014](https://github.com/vtmocanu/uzi/issues/2014)).**
   Usage after the last SDK result of a parked, stopped or crashed Claude run is recorded and shown as "Estimated, not metered" on the run page and as an EST. TAIL row in `uzi run get` (and `usage_estimated_tail` in its JSON), with price-table provenance, "cost unknown" when unpriced and a plain-words coverage note; it is never added to the metered total, usage aggregates or any budget.
