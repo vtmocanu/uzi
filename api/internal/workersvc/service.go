@@ -5736,7 +5736,7 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	// live-routed push must be SENT within livePublishPrePushBudget of that routing. The clock
 	// starts BEFORE the read, so a slow read can only shorten the budget, never start it after the
 	// run's terminal commit.
-	routedAt := time.Now()
+	routedAt := s.now()
 
 	// 1. Server-derived authorization: the run must be owned by THIS worker.
 	// ErrRunNotOwned bubbles to the handler → 404. This is the only thing the worker

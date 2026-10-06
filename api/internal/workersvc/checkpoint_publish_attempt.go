@@ -185,7 +185,7 @@ func (p *checkpointPush) pushOnce(ctx context.Context) error {
 		return errPushRefused
 	}
 	if p.live {
-		if elapsed := time.Since(p.routedAt); elapsed > s.livePublishPrePushBudget {
+		if elapsed := s.now().Sub(p.routedAt); elapsed > s.livePublishPrePushBudget {
 			s.clearPublishAttempt(ctx, id)
 			slog.Warn("checkpoint: live-routed publish exceeded its pre-push budget; push not sent",
 				"run", p.runID, "branch", p.branch, "elapsed", elapsed, "budget", s.livePublishPrePushBudget)
