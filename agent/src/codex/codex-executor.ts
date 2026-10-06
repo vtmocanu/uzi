@@ -1891,6 +1891,63 @@ export class CodexExecutor implements Executor {
     }
   }
 
+  /**
+   * Approval alone joins successful provisioning without aborting it. Poll sticky steering every
+   * 25ms until actual settlement; an interruption aborts but still joins the actual install.
+   * The install's elapsed wait (including abort settlement) spends wall; human approval does not.
+   */
+  private async awaitApprovalDepsInstall(ctx: RunContext, pauseNow: CodexPauseNowState, wall: RunWall): Promise<void> {
+    const state = this.depsInstall;
+    const startedAt = Date.now();
+    const interrupted = (): string | undefined => {
+      if (ctx.cancelRequested?.()) return REASON_CANCEL;
+      const pending = this.pendingInterruption(ctx, pauseNow, wall);
+      if (pending) return pending;
+      const mode = ctx.pauseModeRequested?.();
+      if (mode === "wall" || (mode === "now" && !pauseNow.sharedAbortHandled)) return REASON_PAUSE;
+      if (pauseNow.vaultLock.latched) return REASON_VAULT_LOCKED;
+      if (Date.now() - startedAt >= wall.remainingMs) return REASON_WALL;
+      return undefined;
+    };
+    let timer: ReturnType<typeof setInterval> | undefined;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let wake!: () => void;
+    const stop = new Promise<void>((resolve) => { wake = resolve; });
+    const check = (): void => { if (interrupted()) wake(); };
+    const trip = (): void => { check(); };
+    try {
+      ctx.signal?.addEventListener("abort", check);
+      pauseNow.activeTurnTrip = trip;
+      pauseNow.vaultLock.activeTurnTrip = trip;
+      timer = setInterval(check, 25);
+      deadline = setTimeout(check, Math.max(0, wall.remainingMs));
+      check();
+      await Promise.race([state?.promise ?? Promise.resolve(), stop]);
+      if (interrupted()) state?.abort.abort();
+      // Never substitute an abort notification or deadline for actual settlement.
+      await state?.promise;
+    } finally {
+      if (timer !== undefined) clearInterval(timer);
+      if (deadline !== undefined) clearTimeout(deadline);
+      ctx.signal?.removeEventListener("abort", check);
+      if (pauseNow.activeTurnTrip === trip) pauseNow.activeTurnTrip = undefined;
+      if (pauseNow.vaultLock.activeTurnTrip === trip) pauseNow.vaultLock.activeTurnTrip = undefined;
+      wall.remainingMs -= Math.max(0, Date.now() - startedAt);
+    }
+    // Steering can change during the join. Cancel wins over every pause or vault deferral.
+    if (ctx.cancelRequested?.() || this.pendingInterruption(ctx, pauseNow, wall) === REASON_CANCEL) throw new Error(REASON_CANCEL);
+    const pending = this.pendingInterruption(ctx, pauseNow, wall);
+    const mode = ctx.pauseModeRequested?.();
+    if ((pending === REASON_PAUSE || (mode === "now" && !pauseNow.sharedAbortHandled)) && mode != null && mode !== "wall") {
+      throw new PauseNowSignal();
+    }
+    if (pauseNow.vaultLock.latched) throw new CodexCredentialDeferredError();
+    // A wall mode observed without a signal/callback still needs one consumable generation.
+    if (mode === "wall" && pending !== REASON_PAUSE) pauseNow.interrupt();
+    // A spent wall/pending wall pause proceeds through approval persistence and the first running
+    // report. pendingInterruption then drops implementation into driveTurnWithWallPark.
+  }
+
   private readonly log: Logger;
   private readonly homeRoot: string;
   private readonly provisionHomeDir: string;
@@ -2478,6 +2535,7 @@ export class CodexExecutor implements Executor {
         // epoch. Implement now runs on a fresh credential/root — the plan root's credential was
         // released for the duration of the (possibly long) approval.
         if (planResult.sessionId) lastSessionId = planResult.sessionId;
+        await this.awaitApprovalDepsInstall(ctx, pauseNow, wall);
         await epoch.persistSession();
         const old = epoch;
         // Issue #1766 (B1): this recreation runs BEFORE the first reportIteration, i.e. before

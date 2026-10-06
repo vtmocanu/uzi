@@ -275,6 +275,10 @@ class FakeTransport implements CodexTransport {
     };
   }
 
+  deliverServerRequest(note: CodexNotification): void {
+    assert.ok(this.interceptor?.(note, Buffer.byteLength(JSON.stringify(note))), "live transport interceptor accepts the server request");
+  }
+
   respond(
     requestId: number | string,
     response: { readonly result: unknown } | { readonly error: { readonly code: number; readonly message: string } },
@@ -12431,10 +12435,11 @@ describe("Codex dependency provisioning M2", () => {
     }
   });
 
-  it("planning overlaps pending install; gate reaping awaits actual settlement; first implement gets mixed facts once", async () => {
+  it("approval joins pending install without abort; first implement gets mixed facts once", async () => {
     const planSeen = barrier<void>();
     const finish = barrier<Result>();
-    const abortSeen = barrier<void>();
+    const approvalSeen = barrier<void>();
+    let aborts = 0;
     let calls = 0;
     const plan: Responder = (c) => {
       if (c.method === "thread/start") return { thread: { id: "th-1" } };
@@ -12458,18 +12463,24 @@ describe("Codex dependency provisioning M2", () => {
     const rig = makeMultiEpochRig([plan, impl]);
     rig.deps = { ...rig.deps, installDeps: (_cwd, _env, opts) => {
       calls++;
-      opts?.signal?.addEventListener("abort", () => abortSeen.resolve(), { once: true });
+      opts?.signal?.addEventListener("abort", () => { aborts++; }, { once: true });
       return finish.promise;
     } };
     const { ctx, emitted } = makeCtx({ planApproved: false, approvedPlan: undefined,
-      gatePlan: async () => ({ kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } }) as never,
+      gatePlan: async () => {
+        approvalSeen.resolve();
+        return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
+      },
       config: { max_iterations: 3 },
     });
     const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
     try {
       await withTimeout(planSeen.promise, 3000, "plan overlap");
       assert.match(texts(rig.epochs[0]!.transport)[0]!, /Dependencies: the worker is installing/);
-      await withTimeout(abortSeen.promise, 3000, "gate persist abort");
+      await withTimeout(approvalSeen.promise, 3000, "approval while install pending");
+      await tick();
+      assert.equal(aborts, 0, "approval must not abort the pending installer");
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 0, "no implementation before actual settlement");
       assert.equal(rig.sessionOps.persist, 0);
       assert.equal(rig.providerLaunches(), 1);
       assert.equal(rig.epochs[0]!.reaped(), 0);
@@ -12490,6 +12501,118 @@ describe("Codex dependency provisioning M2", () => {
     assert.ok(emitted.some((m) => JSON.stringify(m).includes("agent: cancelled")));
     assert.ok(emitted.some((m) => JSON.stringify(m).includes("discovery hit its directory bound")));
   });
+
+  for (const mode of ["signal cancel", "sticky cancel", "owner pause", "sticky owner pause", "wall pause", "sticky wall pause", "deadline", "settlement expiry", "served lift", "refused wall", "cancel during join", "withdrawn pause", "vault lock", "vault cancel during join", "vault owner during join", "stale pause", "human gate", "real deadline"] as const) {
+    it(`approval install wait: ${mode} joins before durability and routes the interruption`, async (t) => {
+      const approval = barrier<void>();
+      const finish = barrier<Result>();
+      const aborted = barrier<void>();
+      const controller = new AbortController();
+      let pause: "now" | "wall" | null = null;
+      let cancelled = false;
+      let interrupt: (() => void) | undefined;
+      let returned = false;
+      let now = Date.now();
+      if (mode !== "real deadline") t.mock.method(Date, "now", () => now);
+      const order: string[] = [];
+      const plan = epochResponder("th-1", "tn-1", (transport) => {
+        transport.push(toolCall(1, "submit_plan", { plan_md: "approval wait" }, "th-1", "tn-1", "plan")).push(turnCompleted());
+      });
+      const rig = makeMultiEpochRig([plan, doneResponder, doneResponder]);
+      rig.deps = { ...rig.deps, wallMs: mode === "real deadline" ? 120 : 1000, installDeps: (_cwd, _env, opts) => {
+        opts?.signal?.addEventListener("abort", () => aborted.resolve(), { once: true });
+        return finish.promise;
+      } };
+      const { ctx } = makeCtx({
+        planApproved: false, approvedPlan: undefined, signal: controller.signal,
+        cancelRequested: () => cancelled, pauseModeRequested: () => pause,
+        onPauseNow: (cb) => { interrupt = cb; },
+        gatePlan: async () => {
+          if (mode === "human gate") now += 5000;
+          if (mode === "stale pause") controller.abort(new PauseNowSignal());
+          approval.resolve(); return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never; },
+        reportIteration: async () => {
+          order.push("running");
+          return mode === "served lift" ? { totalWallSeconds: 10 } : undefined;
+        },
+        parkForWall: async () => {
+          order.push("wall");
+          if (mode === "refused wall") { pause = null; return "refused"; }
+          return "parked";
+        },
+        takeWallParkRefresh: () => ({ totalSeconds: 10, usedSeconds: 0 }),
+        clearWallMode: () => { pause = null; },
+      });
+      const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx).then(
+        (value) => { returned = true; return value; },
+        (error: unknown) => { returned = true; return error; },
+      );
+      try {
+        await withTimeout(approval.promise, 3000, "approval reached");
+        await tick();
+        if (mode === "stale pause" || mode === "human gate") finish.resolve(empty);
+        else if (mode === "real deadline") { /* the actual wall timer expires */ }
+        else if (mode.startsWith("vault")) {
+          rig.client.refreshCodex = async () => { throw vaultLocked409("refresh"); };
+          rig.epochs[0]!.transport.deliverServerRequest({
+            kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 91,
+            params: { reason: "unauthorized", previousAccountId: null },
+          });
+        } else if (mode === "signal cancel") controller.abort();
+        else if (mode === "sticky cancel") cancelled = true;
+        else if (["deadline", "settlement expiry", "served lift"].includes(mode)) now += 1001;
+        else {
+          pause = mode.includes("wall") ? "wall" : "now";
+          if (!mode.startsWith("sticky")) {
+            controller.abort(new PauseNowSignal());
+            interrupt?.();
+          }
+        }
+        if (["settlement expiry", "stale pause", "human gate"].includes(mode)) finish.resolve(empty);
+        else {
+          await withTimeout(aborted.promise, 3000, "approval install aborted");
+          await tick();
+          assert.equal(returned, false);
+          assert.equal(rig.sessionOps.persist, 0, "no persistence before actual join");
+          assert.equal(rig.providerLaunches(), 1, "no recreation before actual join");
+          assert.equal(rig.epochs[0]!.reaped(), 0, "no reaping before actual join");
+          assert.equal(rig.effectDisposes(), 0, "no cleanup before actual join");
+          assert.deepEqual(order, [], "no report or park before actual join");
+          if (mode === "cancel during join" || mode === "vault cancel during join") cancelled = true;
+          if (mode === "vault owner during join") {
+            pause = "now";
+            controller.abort(new PauseNowSignal());
+            interrupt?.();
+          }
+          if (mode === "withdrawn pause") pause = null;
+          finish.resolve(empty);
+        }
+        const result = await withTimeout(run, 5000, "approval interruption result");
+        if (mode.includes("cancel")) {
+          assert.ok(result instanceof Error);
+          assert.equal(result.message, "run cancelled");
+          assert.equal(rig.providerLaunches(), 1);
+        } else if (mode === "owner pause" || mode === "sticky owner pause" || mode === "vault owner during join") {
+          assert.ok(result instanceof PauseNowSignal);
+          assert.equal(rig.providerLaunches(), 1);
+        } else if (mode === "vault lock") {
+          assert.ok(result instanceof CodexCredentialDeferredError);
+          assert.equal(rig.providerLaunches(), 1);
+        } else {
+          assert.ok(!(result instanceof Error), String(result));
+          const walled = !["served lift", "refused wall", "withdrawn pause", "stale pause", "human gate"].includes(mode);
+          assert.deepEqual(order, walled || mode === "refused wall" ? ["running", "wall"] : ["running"]);
+          const impl = rig.epochs.slice(1).flatMap((epoch) => texts(epoch.transport));
+          assert.equal(impl.length, walled ? 0 : 1);
+          if (impl.length) assert.match(impl[0]!, /<approved_plan>\napproval wait/);
+        }
+        assert.equal(getEventListeners(controller.signal, "abort").length, 0, "run listeners cleaned");
+      } finally {
+        finish.resolve(empty);
+        await withTimeout(run, 5000, "approval fixture cleanup");
+      }
+    });
+  }
 
   for (const failure of ["throw", "reject"] as const) it(`${failure} is best effort and does not prevent implementation`, async () => {
     const warnings: string[] = [];
