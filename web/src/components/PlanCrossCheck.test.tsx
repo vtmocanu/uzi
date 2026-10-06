@@ -71,6 +71,11 @@ describe("M1 plan cross-check outcomes at real sinks", () => {
     expect(r.getByText("Earlier-plan evidence: Passed")).toBeTruthy();
     expect(r.getByText("Plan cross-check of earlier-plan candidate: Passed")).toBeTruthy();
     cleanup();
+    // The checker run was deleted: the summary lost its id, the event kept it.
+    const orphaned = render(<MemoryRouter><PlanCrossCheckEvent payload={{ verdict: "approve", reason_class: "approve", checker_run_id: child }}
+      detail={summary({ historical: true, checker_run_id: null })} /></MemoryRouter>);
+    expect(orphaned.getByText("Plan cross-check of earlier-plan candidate: Passed")).toBeTruthy();
+    cleanup();
     const absent = render(<PlanCrossCheck run={run({ plan_cross_check_gate_reason: "checker_unavailable" })} />);
     expect(absent.getByText("Current gate: Checker unavailable")).toBeTruthy();
     expect(absent.getByText("Outcome unavailable")).toBeTruthy();

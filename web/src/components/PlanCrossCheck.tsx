@@ -40,7 +40,9 @@ function childId(value: unknown): value is string {
 
 export function planCheckEventText(payload: unknown, detail?: PlanCrossCheckSummary): string {
   const p = record(payload);
-  const earlier = detail?.historical === true && childId(p.checker_run_id) && p.checker_run_id === detail.checker_run_id;
+  // A run has one plan checker, so a historical summary makes every plan event earlier-plan
+  // evidence, even when the deleted checker's id no longer appears in the summary.
+  const earlier = detail?.historical === true;
   return `Plan cross-check of ${earlier ? "earlier-plan" : "checked"} candidate: ${planCheckOutcome(p.verdict, p.reason_class)}`;
 }
 
