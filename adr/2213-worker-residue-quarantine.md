@@ -115,11 +115,17 @@ deletes a pin or changes the journal or the hold:
 
 H and the sha256 are appended to the run's `failure_reason`. They live in the api's
 run row, which a same-uid survivor cannot reach, and detect a later tampering with
-the local file. The outcome never changes the typed failure. The run whose check detected the process
-fails with a plain `RunResidueBlockedError` (before the clone fetch: "could not be
-proven gone by the worker-wide check before the clone fetch"; at a later proof: "the
-run's clone could not be proven quiescent"), names the process rather than the
-quarantine and gets no archive. Where the capture
+the local file. The outcome never changes the typed failure. When the detecting check is the pre-clone check or
+the finalize proof, that run fails with a plain `RunResidueBlockedError` (before the
+clone fetch: "could not be proven gone by the worker-wide check before the clone
+fetch"; at the finalize proof: "the run's clone could not be proven quiescent"),
+names the process rather than the quarantine and gets no archive. Detection is a
+side effect of every process-scanning quiesce, so elsewhere it does not by itself
+fail the run: a milestone checkpoint swallows the block and the run continues until
+the latch refuses its next turn or credentialed git command (failing "this worker is
+quarantined", with the archive); a limit or wall park, completion hold or shutdown
+leaves the park standing, so the run can resume elsewhere; and at the terminal
+retire the run has already reported. Where the capture
 cannot complete (no committed work in the bare, verification failure, over the size
 cap, deadline) nothing is appended.
 
@@ -169,11 +175,15 @@ credentialed git child and no new provider turn starts once the latch is held.
   `preserveRecoveryClone` (latched when it fails, or a latch caught before its settle)
   skips the `terminal_retire` quiesce, as residue-blocked runs did before.
 - **Ungated Codex credential paths.** Only the epoch-start `releaseCodex` call is
-  gated. The advice harness's initial `bridge.release` and the api_key refresh are
-  not, so while latched a provider token can still be fetched into worker memory,
-  though no new turn starts (launch and login are gated).
+  gated. Not gated: the run-lane per-sink boundary reconcile (subscription
+  `refreshCodex`, api_key `releaseCodex`), the app-server refresh bridge
+  (`bridge.refresh` to `refreshCodex`) and the advice harness's initial
+  `bridge.release`. While latched these can still fetch a provider token into worker
+  memory or deliver one to an app-server already running, though no new turn starts
+  (launch and login are gated).
 - **Visibility gap.** After an api restart a latched worker shows as not quarantined
   until its next heartbeat.
 - **Stale badge.** A quarantined badge can show on a worker whose heartbeat went
-  stale while `fleet.quarantine` (fresh heartbeats only) reports none, for up to the
-  tracker's 10-minute TTL.
+  stale while `fleet.quarantine` (fresh heartbeats only) reports none, for roughly
+  the tracker's 10-minute TTL plus up to one sweep interval after the last heartbeat
+  (the prune runs per sweep).

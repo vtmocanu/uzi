@@ -319,18 +319,22 @@ worker.
 
 A provider turn that was already running when the worker quarantined is **not**
 killed: it runs to its boundary (the end of that turn, plan step or iteration),
-where the run stops. Heartbeats, outbox draining and the terminal-report and
-outbox journals keep running, so the worker stays visible and its runs can be
+where the run stops. Heartbeats, terminal reports, the outbox drain and their
+journal sweeps keep running, so the worker stays visible and its runs can be
 reported. The live recovery re-drive and the predecessor settlement sweep are
 skipped while quarantined.
 
 **What happens to active runs.** Each one fails with `fail_origin =
 worker_residue_blocked` (see [Run activity](run-activity.md)). The reason differs
-by run. The run whose check detected the process fails with a plain residue-blocked
-reason that names the process, not the quarantine: before the clone fetch it reads
-"could not be proven gone by the worker-wide check before the clone fetch (...); no
-clone was fetched", and at a later proof "the run's clone could not be proven
-quiescent (...)". A run refused afterwards by the latch fails with "this worker is
+by run. When the detecting check is the pre-clone check or the finalize proof, that
+run fails with a plain residue-blocked reason that names the process, not the
+quarantine: before the clone fetch it reads "could not be proven gone by the
+worker-wide check before the clone fetch (...); no clone was fetched", and at the
+finalize proof "the run's clone could not be proven quiescent (...)". A detection at
+a milestone checkpoint, a limit or wall park, a completion hold, shutdown or the
+terminal retire does not by itself fail that run: a checkpoint carries on until the
+latch refuses its next turn or credentialed git command, and a park stands and can
+resume elsewhere. A run refused afterwards by the latch fails with "this worker is
 quarantined (...)". The failed run's clone, its generation
 hold, its recovery pins and its journal are kept. Nothing is uploaded and no
 custody is released while the worker is quarantined, so the run's held work is
@@ -352,7 +356,7 @@ under the data directory (`/data` in the container, `UZI_DATA_DIR`):
 ```
 
 The bundle is anchored in the bare by the ref `refs/uzi-archive/<runId>/g<generation>`.
-The run that detected the process gets no archive. When the capture succeeds,
+A run that fails on its own detection (above) gets no archive. When the capture succeeds,
 the run's failure reason ends with `Committed work
 archived on the worker: head <H>, bundle sha256 <S>.` Without that sentence there
 is no verified archive (no committed work in the bare, a failed verification, a
