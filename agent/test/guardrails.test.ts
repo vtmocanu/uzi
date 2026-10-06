@@ -19,6 +19,18 @@ import { OPERATOR_CONSTRAINTS_MAX_CHARS } from "../src/prompt.js";
 import { nullLogger } from "./helpers.js";
 import type { HookInput, HookJSONOutput } from "@anthropic-ai/claude-agent-sdk";
 
+describe("Codex instruction metadata commands (#2264 M1)", () => {
+  it("allows index inspection and validated oid metadata as screened strings", () => {
+    for (const command of [
+      "git ls-files -s -- CLAUDE.md",
+      "git cat-file -p 0123456789abcdef0123456789abcdef01234567",
+      "git cat-file -p " + "abcdef01".repeat(8),
+    ]) {
+      assert.equal(screenBashCommand(command).denied, false, command);
+    }
+  });
+});
+
 // The milestone's acceptance: scripted hostile prompts attempting a protected
 // push, force-push, and repo-settings mutation MUST be denied at the hook layer
 // — asserted directly, with NO live Anthropic session.

@@ -48,6 +48,7 @@ import { forgeToolNames } from "../forge-tools.js";
 import { SKILL_NAME_RE } from "../skills-plugin.js";
 import {
   CODEX_LONG_COMMAND_APPEND,
+  CODEX_REPO_INSTRUCTIONS_APPEND,
   FINDINGS_NUDGE_APPEND,
   SECRET_FIXTURE_HYGIENE_APPEND,
   SUBAGENT_SAFETY_APPEND,
@@ -365,7 +366,7 @@ function resolveRoleModel(
  *  the run's operator constraints (follow-ups) are attached per dispatch by the Claude Agent
  *  guard (guardrails.ts buildAgentGuardHook) and do NOT reach Codex subagents yet (#1660). */
 function renderSubagentPrompt(agent: HarnessAgent): string {
-  return `${agent.prompt}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${CODEX_LONG_COMMAND_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`;
+  return `${agent.prompt}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${CODEX_LONG_COMMAND_APPEND}\n\n${CODEX_REPO_INSTRUCTIONS_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`;
 }
 
 /** The character ceiling on a sanitized diagnostic `name`, mirroring broker.ts's

@@ -3,6 +3,7 @@ import { admitPolicyTurn, type PolicyRefusalPayload } from "../src/provider-poli
 import { PassThrough } from "node:stream";
 import { createCodexTransport } from "../src/codex/transport.js";
 import assert from "node:assert/strict";
+import { buildCodexRunPlan } from "../src/codex/run-builder.js";
 
 import {
   CodexDelegationRunner,
@@ -148,6 +149,36 @@ function makeRunner(opts: {
   });
   return { runner, registry, spawn, fileop, startSpecs };
 }
+
+describe("Codex instruction guidance delivery (#2264 M1)", () => {
+  for (const phase of ["plan", "implement"] as const) {
+    for (const name of ["coder", "custom-reader"]) {
+      it(`delivers a real built ${name} prompt in ${phase} without widening Read-only grants`, async () => {
+        const plan = buildCodexRunPlan({
+          phase, prompt: "task", systemPrompt: "lead", signal: new AbortController().signal,
+          leadSkills: [], agents: { [name]: {
+            description: "reader", prompt: "Follow CLAUDE.md rules.",
+            tools: { kind: "allow", names: ["Read"] }, deniedTools: [], skills: [], toolServers: [],
+          } },
+        });
+        const controller = new FakeController({ notes: [] });
+        withNotes(controller, [turnCompletedNote(controller, "completed")]);
+        const b = makeRunner({ roles: new Map(plan.roles), controller });
+        const result = await b.runner.run(delegReq({ role: name }));
+        assert.equal(result.ok, true);
+        assert.equal(b.startSpecs.length, 1);
+        const spec = b.startSpecs[0]!;
+        assert.equal(spec.systemPrompt, plan.roles.get(name)!.systemPrompt);
+        assert.match(spec.systemPrompt, /Read AGENTS\.md first/);
+        assert.match(spec.systemPrompt, /Without Bash, skip inaccessible instructions; never request broader permissions/);
+        assert.equal(spec.grants.allowedTools.has("Read"), true);
+        assert.equal(spec.grants.allowedTools.has("Bash"), false);
+        assert.deepEqual(spec.grants, plan.roles.get(name)!.grants);
+        assert.equal(b.spawn.calls.length, 0);
+      });
+    }
+  }
+});
 
 function delegReq(overrides: Partial<ChildDelegationRequest> = {}): ChildDelegationRequest {
   return {

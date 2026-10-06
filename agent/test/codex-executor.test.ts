@@ -2089,6 +2089,9 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     assert.equal(childTools.some((tool) => tool.name === "signal_done"), false, "root signals are not advertised to a child");
     assert.equal(childTools.some((tool) => tool.name === "spawn_agent"), false, "nested delegation is not advertised to a child");
     assert.match(String(childParams.developerInstructions), /^coder body\n\n/, "the rendered child prompt uses the real protocol field");
+    assert.match(String(childParams.developerInstructions), /Read AGENTS\.md first/, "repository guidance reaches the actual child wire");
+    assert.match(String(childParams.developerInstructions), /git ls-files -s -- CLAUDE\.md/);
+    assert.match(String(childParams.developerInstructions), /git cat-file -p/);
     assert.equal(childParams.instructions, undefined);
 
     // The child's Bash effect ran as the command identity (through the demux + child broker).
