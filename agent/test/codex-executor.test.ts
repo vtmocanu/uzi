@@ -79,6 +79,7 @@ import type { Logger } from "../src/log.js";
 import type { DockerWiring } from "../src/docker-wiring.js";
 import type { AgentTemplate, MilestoneProgress } from "../src/protocol.js";
 import type { BoundaryRequest } from "../src/harness.js";
+import type { CodexExecutionSafetyImpl } from "../src/codex/safety.js";
 import type {
   CacheCleanupResult,
   CodexEffectLaunchSpec,
@@ -496,6 +497,7 @@ function makeRig(opts: { responder?: Responder; token?: string } = {}): Rig {
   let effectDisposes = 0;
   let providerLaunches = 0;
   const deps: CodexExecutorDeps = {
+    installDeps: async () => ({ results: [], truncated: false }),
     launchProviderRoot: async (spec, authMode): Promise<CodexLaunchRootResult> => {
       providerLaunches += 1;
       // Issue #1782: a recreated epoch (launch #2+) needs its own single-consumer transport.
@@ -613,7 +615,8 @@ function makeExecutor(
     log,
     "/data/agent-home/run-1",
     { binding, client: rig.client as never, provider: providerConfig, dockerWiring },
-    seam ? { ...rig.deps, spawnCommand: answerEnvProbe(seam, rig.probeCalls) } : rig.deps,
+    { installDeps: async () => ({ results: [], truncated: false }), ...rig.deps,
+      ...(seam ? { spawnCommand: answerEnvProbe(seam, rig.probeCalls) } : {}) },
   );
 }
 
@@ -652,6 +655,7 @@ function makeMultiEpochRig(responders: Responder[], opts: { token?: string } = {
   const launchRoots: string[] = [];
   let effectDisposes = 0;
   const deps: CodexExecutorDeps = {
+    installDeps: async () => ({ results: [], truncated: false }),
     launchProviderRoot: async (spec, authMode): Promise<CodexLaunchRootResult> => {
       launchRoots.push(spec.ownedDataRoot);
       const epoch = epochs[providerLaunches];
@@ -1935,6 +1939,7 @@ describe("CodexExecutor: root tool projection (issue #1583)", () => {
     const claimSecret = "glpat-" + "abcdefghij" + "0123456789";
     const rig = makeRig();
     const deps: CodexExecutorDeps = {
+    installDeps: async () => ({ results: [], truncated: false }),
       ...rig.deps,
       spawnCommand: async () => ({ code: 0, stdout: `pat=${claimSecret} tok=${FRESH_TOKEN}`, stderr: "" }),
     };
@@ -1981,6 +1986,7 @@ describe("CodexExecutor: root tool projection (issue #1583)", () => {
     const stdout = "x".repeat(MAX_PROJECTED_BYTES - 70) + claimSecret + "y".repeat(500);
     const rig = makeRig();
     const deps: CodexExecutorDeps = {
+    installDeps: async () => ({ results: [], truncated: false }),
       ...rig.deps,
       spawnCommand: async () => ({ code: 0, stdout, stderr: "" }),
     };
@@ -5666,6 +5672,7 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
         const sentinel = new Error("SENTINEL: provisioning short-circuit after devbox materialized its HOME");
         let provisionHomeSeen: string | undefined;
         const deps: CodexExecutorDeps = {
+    installDeps: async () => ({ results: [], truncated: false }),
           // Do NOT inject launchProviderRoot: the REAL initialization ordering (fs.mkdir +
           // prepareCodexRunHome) must run. The stub simulates devbox materializing its SUPPLIED
           // HOME (the SHARED root post-fix), then short-circuits before the real supervisor is needed.
@@ -12378,5 +12385,384 @@ describe("M2 actual WorkerClient boundary cancellation", () => {
     assert.equal(actions, 0);
     await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 200 });
     assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  });
+});
+
+// M2 dependency provisioning exercises the public run/capture/boundary seams.
+describe("Codex dependency provisioning M2", () => {
+  type Install = typeof import("../src/js-deps.js").installJsDeps;
+  type Result = Awaited<ReturnType<Install>>;
+  const empty: Result = { results: [], truncated: false };
+  function barrier<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((done) => { resolve = done; });
+    return { promise, resolve };
+  }
+  const doneResponder = epochResponder("th-1", "tn-1", (t) => {
+    t.push(signalDone()).push(turnCompleted());
+  });
+  const texts = (transport: FakeTransport) => transport.requests.filter((r) => r.method === "turn/start")
+    .map((r) => (r.params as { input: { text: string }[] }).input[0]!.text);
+
+  it("Codex invokes dependency installer", async () => {
+    const rig = makeRig({ responder: doneResponder });
+    const invoked = barrier<void>();
+    const finish = barrier<Result>();
+    // A variable with an extra property is structurally assignable even at the baseline
+    // interface, so the baseline fails the behaviour assertion rather than compilation.
+    const fixture: CodexExecutorDeps & { installDeps: Install } = {
+      ...rig.deps,
+      installDeps: () => { invoked.resolve(); return finish.promise; },
+    };
+    rig.deps = fixture;
+    const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const called = await Promise.race([
+        invoked.promise.then(() => true),
+        new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), 150); }),
+      ]);
+      assert.ok(called, "Codex invokes dependency installer");
+      assert.equal(rig.transport.turnStartCount, 0, "implementation waits for installation");
+    } finally {
+      if (timer) clearTimeout(timer);
+      finish.resolve(empty);
+      await withTimeout(run, 5000, "installer assertion cleanup");
+    }
+  });
+
+  it("planning overlaps pending install; gate reaping awaits actual settlement; first implement gets mixed facts once", async () => {
+    const planSeen = barrier<void>();
+    const finish = barrier<Result>();
+    const abortSeen = barrier<void>();
+    let calls = 0;
+    const plan: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        planSeen.resolve();
+        c.transport.push(threadStarted()).push(toolCall(1, "submit_plan", { plan_md: "approved M2" }, "th-1", "tn-1", "plan"))
+          .push(turnCompleted());
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    };
+    const impl: Responder = (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 2) c.transport.push(signalDone());
+        c.transport.push(turnCompleted());
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    };
+    const rig = makeMultiEpochRig([plan, impl]);
+    rig.deps = { ...rig.deps, installDeps: (_cwd, _env, opts) => {
+      calls++;
+      opts?.signal?.addEventListener("abort", () => abortSeen.resolve(), { once: true });
+      return finish.promise;
+    } };
+    const { ctx, emitted } = makeCtx({ planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } }) as never,
+      config: { max_iterations: 3 },
+    });
+    const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    try {
+      await withTimeout(planSeen.promise, 3000, "plan overlap");
+      assert.match(texts(rig.epochs[0]!.transport)[0]!, /Dependencies: the worker is installing/);
+      await withTimeout(abortSeen.promise, 3000, "gate persist abort");
+      assert.equal(rig.sessionOps.persist, 0);
+      assert.equal(rig.providerLaunches(), 1);
+      assert.equal(rig.epochs[0]!.reaped(), 0);
+    } finally {
+      finish.resolve({ results: [
+        { dir: "web", manager: "npm", ok: true, detail: "installed" },
+        { dir: "agent", manager: "npm", ok: false, detail: "cancelled" },
+      ], truncated: true });
+      await withTimeout(run, 5000, "plan join cleanup");
+    }
+    assert.equal(calls, 1, "epoch recreation shares the install");
+    const prompts = texts(rig.epochs[1]!.transport);
+    assert.match(prompts[0]!, /installed:\n1\. web/);
+    assert.match(prompts[0]!, /failed:\n2\. agent/);
+    assert.match(prompts[0]!, /NOT the complete set/);
+    assert.match(prompts[0]!, /<approved_plan>\napproved M2/);
+    assert.doesNotMatch(prompts[1]!, /deps_dirs_/);
+    assert.ok(emitted.some((m) => JSON.stringify(m).includes("agent: cancelled")));
+    assert.ok(emitted.some((m) => JSON.stringify(m).includes("discovery hit its directory bound")));
+  });
+
+  for (const failure of ["throw", "reject"] as const) it(`${failure} is best effort and does not prevent implementation`, async () => {
+    const warnings: string[] = [];
+    const rig = makeRig({ responder: doneResponder });
+    rig.deps = { ...rig.deps, installDeps: () => {
+      if (failure === "throw") throw new Error("fixture failure");
+      return Promise.reject(new Error("fixture failure"));
+    } };
+    const { ctx, emitted } = makeCtx();
+    await makeExecutor(rig, bindingOf(SUBSCRIPTION), { ...noopLog, warn: (message) => { warnings.push(message); } }).run(ctx);
+    assert.equal(rig.transport.turnStartCount, 1);
+    assert.deepEqual(warnings, ["JS dependency provisioning failed"]);
+    assert.ok(emitted.some((m) => JSON.stringify(m).includes("no JS dependencies to install")));
+  });
+
+  for (const deferred of [false, true]) it(`setup failure retains install until actual settlement (deferred=${deferred})`, async () => {
+    const started = barrier<void>();
+    const aborted = barrier<void>();
+    const finish = barrier<Result>();
+    const rig = makeRig();
+    rig.deps = { ...rig.deps, deferRegistryTeardown: deferred,
+      installDeps: (_cwd, _env, opts) => {
+        started.resolve();
+        opts?.signal?.addEventListener("abort", () => aborted.resolve(), { once: true });
+        return finish.promise;
+      },
+      wireFileop: () => { throw new Error("setup after install"); },
+    };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    let returned = false;
+    const run = exec.run(makeCtx().ctx).then(() => { returned = true; }, (error: unknown) => { returned = true; return error; });
+    try {
+      await withTimeout(started.promise, 3000, "setup installer start");
+      await withTimeout(aborted.promise, 3000, "setup installer abort");
+      await tick();
+      assert.equal(returned, false);
+      assert.equal(rig.effectDisposes(), 0, "partial epoch teardown waits");
+      assert.equal((await exec.settleForCredentialFreeCapture(10)).kind, "incomplete");
+    } finally {
+      finish.resolve(empty);
+      assert.match(String(await withTimeout(run, 5000, "setup cleanup")), /setup after install/);
+    }
+  });
+
+  for (const mode of ["deadline", "cancel"] as const) it(`capture with no safety blocks on ${mode} and retains pending ownership`, async () => {
+    const started = barrier<void>();
+    const finish = barrier<Result>();
+    const credentialGate = barrier<void>();
+    const controller = new AbortController();
+    const rig = makeRig({ responder: doneResponder });
+    rig.client.releaseCodex = async () => { await credentialGate.promise; throw new Error("release fixture"); };
+    let signal: AbortSignal | undefined;
+    rig.deps = { ...rig.deps, installDeps: (_cwd, _env, opts) => {
+      signal = opts?.signal; started.resolve(); return finish.promise;
+    } };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    let returned = false;
+    const run = exec.run(makeCtx({ signal: controller.signal }).ctx).catch(() => undefined).finally(() => { returned = true; });
+    try {
+      await withTimeout(started.promise, 3000, "capture installer start");
+      const capture = exec.settleForCredentialFreeCapture(mode === "deadline" ? 15 : 1000);
+      if (mode === "cancel") controller.abort(new Error("cancel fixture"));
+      assert.equal((await capture).kind, "incomplete", "never claims observed_empty while install is live");
+      assert.equal(signal?.aborted, true);
+      credentialGate.resolve();
+      await tick();
+      assert.equal(returned, false, "terminal still owns expired wait's install promise");
+      assert.equal(rig.sessionOps.persist, 0);
+    } finally {
+      credentialGate.resolve(); finish.resolve(empty);
+      await withTimeout(run, 5000, "capture cleanup");
+    }
+  });
+
+  it("genuine cancellation is prompt, preaborted signals propagate, and sequential reuse starts fresh", async () => {
+    const rig = makeRig({ responder: doneResponder });
+    const controller = new AbortController();
+    const finish = barrier<Result>();
+    const started = barrier<void>();
+    const observed: AbortSignal[] = [];
+    let calls = 0;
+    rig.deps = { ...rig.deps, installDeps: (_cwd, _env, opts) => {
+      observed.push(opts!.signal!); calls++; started.resolve();
+      return calls === 1 ? finish.promise : Promise.resolve(empty);
+    } };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const run = exec.run(makeCtx({ signal: controller.signal }).ctx).catch(() => undefined);
+    try {
+      await withTimeout(started.promise, 3000, "cancel install start");
+      controller.abort(new Error("cancel fixture"));
+      assert.equal(observed[0]!.aborted, true);
+    } finally { finish.resolve(empty); await withTimeout(run, 5000, "cancel cleanup"); }
+    await exec.run(makeCtx().ctx);
+    assert.equal(calls, 2);
+    assert.notEqual(observed[0], observed[1]);
+    const preaborted = new AbortController(); preaborted.abort(new Error("already cancelled"));
+    await exec.run(makeCtx({ signal: preaborted.signal }).ctx).catch(() => undefined);
+    assert.equal(calls, 3);
+    assert.equal(observed[2]!.aborted, true);
+  });
+
+  for (const mode of ["deadline", "cancel", "settle"] as const) it(`credential boundary ${mode} waits for installer before reconcile and sink`, async () => {
+    const finish = barrier<Result>();
+    const planSeen = barrier<void>();
+    const aborted = barrier<void>();
+    const controller = new AbortController();
+    const rig = makeRig({ responder: (c) => {
+      if (c.method === "turn/start") planSeen.resolve();
+      return defaultResponder(c);
+    } });
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true, installDeps: (_cwd, _env, opts) => {
+      opts?.signal?.addEventListener("abort", () => aborted.resolve(), { once: true });
+      return finish.promise;
+    } };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const run = exec.run(makeCtx({ signal: controller.signal, planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "cancel" }) as never,
+    }).ctx).catch(() => undefined);
+    let sinks = 0;
+    try {
+      await withTimeout(planSeen.promise, 3000, "boundary plan overlap");
+      const boundary = exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: mode === "deadline" ? 25 : 1000 }, async () => { sinks++; });
+      const outcome = boundary.then(() => true, () => false);
+      await withTimeout(aborted.promise, 3000, "boundary abort observed");
+      assert.equal(rig.client.refreshCalls.length, 0, "abort acknowledgement is not settlement");
+      assert.equal(sinks, 0);
+      if (mode === "cancel") controller.abort(new Error("cancel fixture"));
+      if (mode === "settle") finish.resolve(empty);
+      assert.equal(await withTimeout(outcome, 3000, "boundary outcome"), mode === "settle");
+      assert.equal(sinks, mode === "settle" ? 1 : 0);
+      assert.equal(rig.client.refreshCalls.length, mode === "settle" ? 1 : 0);
+      assert.equal(rig.client.releaseCalls.length, 1, "subscription reconcile refreshes without another release");
+    } finally {
+      controller.abort(new Error("cleanup")); finish.resolve(empty);
+      await withTimeout(run, 5000, "boundary run cleanup");
+      await exec.safety?.dispose({ boundary: "finalize", deadlineMs: 200 });
+    }
+  });
+
+  it("capture gives its safety only the remaining absolute budget", async () => {
+    const finish = barrier<Result>();
+    const planSeen = barrier<void>();
+    const aborted = barrier<void>();
+    const controller = new AbortController();
+    const rig = makeRig({ responder: (c) => {
+      if (c.method === "turn/start") planSeen.resolve();
+      return defaultResponder(c);
+    } });
+    rig.deps = { ...rig.deps, installDeps: (_cwd, _env, opts) => {
+      opts?.signal?.addEventListener("abort", () => aborted.resolve(), { once: true });
+      return finish.promise;
+    } };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const run = exec.run(makeCtx({ signal: controller.signal, planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "cancel" }) as never,
+    }).ctx).catch(() => undefined);
+    let passed = 0;
+    try {
+      await withTimeout(planSeen.promise, 3000, "capture plan");
+      const facade = exec.safety as CodexExecutionSafetyImpl;
+      const original = facade.settleForCredentialFreeCapture.bind(facade);
+      facade.settleForCredentialFreeCapture = async (ms) => { passed = ms; return { kind: "observed_empty" }; };
+      const capture = exec.settleForCredentialFreeCapture(500);
+      await aborted.promise;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      finish.resolve(empty);
+      assert.equal((await capture).kind, "observed_empty");
+      assert.ok(passed > 0 && passed <= 475, `remaining capture budget: ${passed}`);
+      facade.settleForCredentialFreeCapture = original;
+    } finally {
+      controller.abort(new Error("cleanup")); finish.resolve(empty);
+      await withTimeout(run, 5000, "budget cleanup");
+    }
+  });
+
+  it("provisioning failure starts no install; a rejected plan still joins before persist and cleanup", async () => {
+    const rig = makeRig();
+    let calls = 0;
+    rig.deps = { ...rig.deps, installDeps: async () => { calls++; return empty; },
+      provisionRunTools: async () => { throw new Error("tools fixture"); },
+    };
+    await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), /tools fixture/);
+    assert.equal(calls, 0);
+    assert.equal(rig.providerLaunches(), 0);
+
+    const finish = barrier<Result>();
+    const aborted = barrier<void>();
+    const planRig = makeRig({ responder: epochResponder("th-1", "tn-1", (t) => {
+      t.push(toolCall(1, "submit_plan", { plan_md: "reject fixture" }, "th-1", "tn-1", "plan")).push(turnCompleted());
+    }) });
+    planRig.deps = { ...planRig.deps, installDeps: (_cwd, _env, opts) => {
+      opts?.signal?.addEventListener("abort", () => aborted.resolve(), { once: true });
+      return finish.promise;
+    } };
+    let returned = false;
+    const run = makeExecutor(planRig, bindingOf(SUBSCRIPTION)).run(makeCtx({ planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "reject", reason: "rejected fixture" }) as never,
+    }).ctx).catch((error: unknown) => { returned = true; return error; });
+    try {
+      await withTimeout(aborted.promise, 3000, "rejected plan abort");
+      await tick();
+      assert.equal(returned, false);
+      assert.equal(planRig.sessionOps.persist, 0);
+      assert.equal(planRig.reaped(), 0);
+    } finally {
+      finish.resolve(empty);
+      assert.match(String(await withTimeout(run, 5000, "reject cleanup")), /rejected fixture/);
+    }
+  });
+
+  it("refused pause continuation preserves cancelled install facts and never restarts installation", async () => {
+    const finish = barrier<Result>();
+    const started = barrier<void>();
+    const aborted = barrier<void>();
+    const controller = new AbortController();
+    controller.abort(new PauseNowSignal());
+    const rig = makeRig({ responder: doneResponder });
+    let calls = 0;
+    let parks = 0;
+    rig.deps = { ...rig.deps, installDeps: (_cwd, _env, opts) => {
+      calls++; started.resolve();
+      opts?.signal?.addEventListener("abort", () => aborted.resolve(), { once: true });
+      return finish.promise;
+    } };
+    let mode: "wall" | null = "wall";
+    const { ctx, emitted } = makeCtx({ signal: controller.signal, pauseModeRequested: () => mode,
+      clearWallMode: () => { mode = null; },
+      parkForWall: async () => { parks++; return "refused"; },
+    });
+    const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    try {
+      await withTimeout(started.promise, 3000, "pause install start");
+      await withTimeout(aborted.promise, 3000, "pause boundary abort");
+      assert.equal(parks, 0, "park sink waits for settlement");
+      assert.equal(rig.sessionOps.persist, 0);
+    } finally {
+      finish.resolve({ results: [{ dir: "web", manager: "npm", ok: false, detail: "cancelled" }], truncated: false });
+      await withTimeout(run, 5000, "pause cleanup");
+    }
+    assert.equal(calls, 1);
+    assert.equal(parks, 1);
+    assert.match(texts(rig.transport)[0]!, /failed:\n1\. web/);
+    assert.ok(emitted.some((m) => JSON.stringify(m).includes("web: cancelled")));
+  });
+
+  it("installer gets the full scrubbed allowlist, per-run HOME, PATH/TMPDIR fallbacks and TLS/locale precedence", async () => {
+    const keys = ["PATH", "UZI_RUNNER_PATH", "TMPDIR", "UZI_RUNNER_TMPDIR", "NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "LOCALE_ARCHIVE",
+      "GITLAB_TOKEN", "GITHUB_TOKEN", "UZI_WORKER_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NODE_OPTIONS", "M2_ARBITRARY"];
+    const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    try {
+      Object.assign(process.env, { PATH: "/source/bin", UZI_RUNNER_PATH: "/runner/bin", TMPDIR: "/source/tmp", UZI_RUNNER_TMPDIR: "/runner/tmp",
+        NIX_SSL_CERT_FILE: "/source/nix.pem", SSL_CERT_FILE: "/source/ssl.pem", LOCALE_ARCHIVE: "/source/locale",
+        GITLAB_TOKEN: "fixture-pat", GITHUB_TOKEN: "fixture-pat", UZI_WORKER_TOKEN: "fixture-join", OPENAI_API_KEY: "fixture-provider",
+        ANTHROPIC_API_KEY: "fixture-provider", NODE_OPTIONS: "fixture-options", M2_ARBITRARY: "fixture-arbitrary" });
+      for (const fallback of [false, true]) {
+        if (fallback) { delete process.env.UZI_RUNNER_PATH; delete process.env.UZI_RUNNER_TMPDIR; }
+        const rig = makeRig({ responder: doneResponder });
+        const seen: NodeJS.ProcessEnv[] = [];
+        rig.deps = { ...rig.deps, provisionRunTools: async () => ({ toolEnv: fallback ? {} as Record<string, string> : {
+          PATH: "/provision/bin", NIX_SSL_CERT_FILE: "/provision/nix.pem", LOCALE_ARCHIVE: "/provision/locale",
+          HOME: "/wrong/home", TMPDIR: "/wrong/tmp", NODE_OPTIONS: "wrong-options", GITLAB_TOKEN: "wrong-pat", M2_ARBITRARY: "wrong",
+        } }), installDeps: async (cwd, env) => {
+          assert.equal(cwd, WORKSPACE); seen.push(env); return empty;
+        } };
+        await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx);
+        assert.deepEqual(seen, [{
+          PATH: fallback ? "/source/bin" : "/provision/bin", HOME: "/data/agent-home/run-1", GIT_TERMINAL_PROMPT: "0",
+          TMPDIR: fallback ? "/source/tmp" : "/runner/tmp", NIX_SSL_CERT_FILE: fallback ? "/source/nix.pem" : "/provision/nix.pem",
+          SSL_CERT_FILE: "/source/ssl.pem", LOCALE_ARCHIVE: fallback ? "/source/locale" : "/provision/locale",
+        }]);
+      }
+    } finally {
+      for (const key of keys) { const value = saved[key]; if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+    }
   });
 });

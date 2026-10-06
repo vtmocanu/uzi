@@ -32,6 +32,9 @@ through `[0.52.0]`.)
 - **Higher default resource requests for the api and the CNPG database.**
   The chart now requests 100m CPU / 320Mi for the api (was 50m / 128Mi) and 512Mi per CNPG instance (was 256Mi), matching what a live install actually uses, which reduces their eviction risk under node memory pressure. Limits are unchanged; override `api.resources` or `postgres.cluster.resources` to size differently.
 
+- **Codex runs provision JavaScript dependencies before implementation.**
+  Dependency installation overlaps planning, reports installed and failed projects before the first implementation turn, and settles before capture, credential reconciliation and teardown across provider epochs.
+
 ### Fixed
 
 - **Codex provider safety-policy refusals have a distinct failure origin ([#2321](https://github.com/vtmocanu/uzi/issues/2321)).**

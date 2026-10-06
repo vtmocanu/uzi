@@ -85,6 +85,8 @@ import { FORGE_SERVER_NAME, makeForgeToolHandlers, type ForgeToolHandlers } from
 import { provisionRunTools, removeProvisionDir } from "../provision-run.js";
 import { rmTeardownTree } from "../rmtree.js";
 import { asText } from "../tool-evidence.js";
+import { installJsDeps, type JsDepsInstall } from "../js-deps.js";
+import { startDepsInstall, reportDepsInstall } from "../js-deps-provision.js";
 import {
   evidencesModelProcessing,
   type BoundaryRequest,
@@ -99,7 +101,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
+import { depsProvisionPlanNote, depsProvisionImplementNote, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -1534,6 +1536,7 @@ function firstSkillName(args: unknown): string | undefined {
 
 // ─── Injectable seams (production defaults; tests inject fakes) ──────────────────
 export interface CodexExecutorDeps {
+  readonly installDeps?: typeof installJsDeps;
   /** Adapts the real M3a launcher for a PROVIDER root; a test injects a fake returning a
    *  scripted in-memory transport (NO real Codex). Receives the harness's launch spec AND the
    *  immutable app-server auth mode; the credential NO LONGER rides into the launcher env — it
@@ -1694,6 +1697,7 @@ interface EpochSharedContext {
   readonly spawnBoundaryRoot: SpawnRootSeam;
   readonly boundaryProcessSpawner: SpawnBoundaryProcessSeam;
   readonly reconcile: ReconcileBeforeBoundary;
+  readonly settleDepsInstall: () => Promise<void>;
   /** The FINAL epoch's safety.dispose hook: evicts the post-run sink tokens, then settles
    *  the run's command cache (issue #1598) within the dispose's absolute deadline
    *  (`deadlineAt`, epoch ms) when one is known. Never throws. */
@@ -1821,6 +1825,10 @@ export class CodexExecutor implements Executor {
    * `incomplete` rather than trusting an unobserved drain.
    */
   async settleForCredentialFreeCapture(deadlineMs: number): Promise<CredentialFreeCaptureSettlement> {
+    const deadlineAt = Date.now() + Math.max(0, deadlineMs);
+    if (!await this.settleDepsInstall(deadlineAt, this.depsInstall?.cancellation)) {
+      return { kind: "incomplete", errors: [{ category: "protocol", message: "codex dependency install did not settle before capture" }] };
+    }
     const safety = this.safety;
     if (safety === undefined) {
       const outstanding = this.unverifiedEpochRegistries.size;
@@ -1833,7 +1841,7 @@ export class CodexExecutor implements Executor {
         }],
       };
     }
-    if (safety instanceof CodexExecutionSafetyImpl) return safety.settleForCredentialFreeCapture(deadlineMs);
+    if (safety instanceof CodexExecutionSafetyImpl) return safety.settleForCredentialFreeCapture(Math.max(0, deadlineAt - Date.now()));
     return {
       kind: "incomplete",
       errors: [{ category: "protocol", message: "codex capture settle: unsupported safety facade" }],
@@ -1845,6 +1853,43 @@ export class CodexExecutor implements Executor {
    *  it is then reachable through `this.safety` (set once, never unset), so this set is consulted
    *  only while `this.safety` is undefined. */
   private readonly unverifiedEpochRegistries = new Set<ExecutionRegistry>();
+
+  /** Owned across epochs, replaced on sequential reuse; expiry never drops the handle. */
+  private depsInstall?: {
+    abort: AbortController;
+    cancellation: AbortSignal;
+    promise?: Promise<JsDepsInstall>;
+    result?: JsDepsInstall;
+    reported: boolean;
+    noted: boolean;
+  };
+
+  /** Abort before a durability boundary. Terminal callers await without a deadline.
+   * Each bounded wait has one deadline and removes its own timer/listener on every exit.
+   * Expiry/cancellation blocks this boundary, leaving the run to actually join at terminal.
+   */
+  private async settleDepsInstall(deadlineAt?: number, signal?: AbortSignal, state = this.depsInstall): Promise<boolean> {
+    state?.abort.abort();
+    if (!state?.promise) return true;
+    if (deadlineAt === undefined) {
+      await state.promise;
+      return true;
+    }
+    if (signal?.aborted || Date.now() >= deadlineAt) return false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    try {
+      return await new Promise<boolean>((resolve) => {
+        onAbort = () => resolve(false);
+        signal?.addEventListener("abort", onAbort, { once: true });
+        timer = setTimeout(() => resolve(false), Math.max(0, deadlineAt - Date.now()));
+        state.promise!.then(() => resolve(!signal?.aborted && Date.now() < deadlineAt));
+      });
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
+    }
+  }
 
   private readonly log: Logger;
   private readonly homeRoot: string;
@@ -1907,6 +1952,8 @@ export class CodexExecutor implements Executor {
   }
 
   async run(ctx: RunContext): Promise<ExecutorResult> {
+    this.depsInstall = undefined;
+    this.safety = undefined;
     // Everything that needs the worktree is built at the TOP of run() (the executor is
     // constructed before the claim's worktree exists).
     const binding = this.opts.binding;
@@ -1994,6 +2041,7 @@ export class CodexExecutor implements Executor {
     // recreates it at the implement loop top (epochNeedsRecreate). The fresh epoch's newer session
     // state is captured by its own persists; until then the store keeps the pre-sink generation.
     const beforeReapingSink = async (): Promise<void> => {
+      await settleInstall();
       if (reapedSinceLastPersist || !epoch) return;
       await epoch.persistSession();
       reapedSinceLastPersist = true;
@@ -2017,6 +2065,18 @@ export class CodexExecutor implements Executor {
     };
     if (ctx.signal?.aborted) forwardLifecycleAbort();
     else ctx.signal?.addEventListener("abort", forwardLifecycleAbort, { once: true });
+    const installAbort = new AbortController();
+    const installState: NonNullable<CodexExecutor["depsInstall"]> = {
+      abort: installAbort, cancellation: lifecycleAbort.signal,
+      reported: false, noted: false,
+    };
+    this.depsInstall = installState;
+    const settleInstall = async (): Promise<void> => { await this.settleDepsInstall(undefined, undefined, installState); };
+    const forwardInstallAbort = (): void => {
+      if (!(ctx.signal?.reason instanceof PauseNowSignal)) installAbort.abort(ctx.signal?.reason);
+    };
+    if (ctx.signal?.aborted) forwardInstallAbort();
+    else ctx.signal?.addEventListener("abort", forwardInstallAbort);
     let epochIndex = 0;
     const epochNamespace = randomUUID();
     let provisionDir: string | undefined;
@@ -2075,6 +2135,8 @@ export class CodexExecutor implements Executor {
         log: this.log,
       });
       provisionDir = provisioned.provisionDir; // removed in the terminal finally (best-effort)
+      installState.promise = startDepsInstall(ctx, this.log, this.homeRoot, provisioned.toolEnv, installAbort.signal, this.deps.installDeps ?? installJsDeps)
+        .then((result) => { installState.result = result; return result; });
 
       // The SCRUBBED command-identity env — NOTHING from process.env (cross-root credential
       // boundary). The FIXED toolchain+system PATH comes first; the run's allowlisted provisioned
@@ -2137,7 +2199,15 @@ export class CodexExecutor implements Executor {
         ((): Promise<RegisteredRoot> =>
           Promise.reject(new Error("codex boundary-action spawn seam is not wired (the runner drives spawnBoundaryProcess)")));
       const boundaryProcessSpawner = makeBoundaryProcessSpawner(launchEffectRoot, commandSandbox, this.log, runCache);
-      const reconcile = this.makeBoundaryReconcile(ctx.runId, registerToken, committedGeneration, () => pauseNow.vaultLock.latched, lifecycleAbort.signal);
+      const credentialReconcile = this.makeBoundaryReconcile(ctx.runId, registerToken, committedGeneration, () => pauseNow.vaultLock.latched, lifecycleAbort.signal);
+      const reconcile: ReconcileBeforeBoundary = async (request, signal) => {
+        const deadlineAt = Date.now() + Math.max(0, request.deadlineMs);
+        const cancellation = AbortSignal.any([signal, lifecycleAbort.signal]);
+        if (!await this.settleDepsInstall(deadlineAt, cancellation, installState)) {
+          return { kind: "blocked", errors: [{ category: "protocol", message: "codex dependency install did not settle before reconcile" }] };
+        }
+        return credentialReconcile({ ...request, deadlineMs: Math.max(0, deadlineAt - Date.now()) }, signal);
+      };
       // (C, F1) Terminal eviction of tokens released by the POST-RUN sink reconciles. The runner
       // calls safety.dispose after the last durability sink — by which point run()'s finally has
       // already evicted+cleared the DURING-run tokens — so the FINAL epoch's onDispose evicts only
@@ -2166,6 +2236,7 @@ export class CodexExecutor implements Executor {
         provider,
         binding,
         vaultLock: pauseNow.vaultLock,
+        settleDepsInstall: settleInstall,
         worktreePath,
         storeDir,
         homeRoot: this.homeRoot,
@@ -2650,7 +2721,18 @@ export class CodexExecutor implements Executor {
               ctx.followUpIncluded?.(ownerRides.id);
             }
           : undefined;
-        const ownerBase = this.implementPrompt(ctx, gatedPlan, milestoneNote(), environmentFacts);
+        let depsNote = "";
+        if (systemFollowUp === undefined && !installState.noted) {
+          const result = await installState.promise!;
+          if (!installState.reported) {
+            reportDepsInstall(ctx, this.log, result);
+            installState.reported = true;
+          }
+          depsNote = depsProvisionImplementNote(result.results, result.truncated);
+          installState.noted = true;
+        }
+        const ownerPrompt = this.implementPrompt(ctx, gatedPlan, milestoneNote(), environmentFacts);
+        const ownerBase = depsNote ? `${ownerPrompt}\n\n${depsNote}` : ownerPrompt;
         const basePrompt = ownerRides ? [ownerBase, ...renderFollowUpBlock(ownerRides.body), "", FOLLOW_UP_TRAILER].join("\n") : ownerBase;
         const implementBody = systemFollowUp !== undefined
           ? withMilestoneNote(systemFollowUp, milestoneNote())
@@ -2846,6 +2928,8 @@ export class CodexExecutor implements Executor {
 
       return loopResult();
     } finally {
+      await settleInstall();
+      ctx.signal?.removeEventListener("abort", forwardInstallAbort);
       if (!this.deps.deferRegistryTeardown || epoch === undefined) {
         ctx.signal?.removeEventListener("abort", forwardLifecycleAbort);
       }
@@ -2921,7 +3005,7 @@ export class CodexExecutor implements Executor {
       provider, binding, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
       commandEnv, commandSandbox, screenPolicy, toolHandlers, registerToken, committedGeneration, launchEffectRoot,
       spawnBoundaryRoot, boundaryProcessSpawner, reconcile, onTerminalDispose, accountant, scrubProjected,
-      commandCache, lifecycleSignal, selection, vaultLock,
+      commandCache, lifecycleSignal, selection, vaultLock, settleDepsInstall,
     } = shared;
 
     // Per-epoch trust-boundary REVALIDATION: re-verify the run HOME + codex-data parent's
@@ -2998,7 +3082,22 @@ export class CodexExecutor implements Executor {
       // `--cache` (and commandEffectSpec strips the cache variables from its env).
       const fileopRoot = await launchRegisteredEffectRoot(
         registry,
-        launchEffectRoot,
+        async (spec, deadlineMs) => {
+          const handle = await launchEffectRoot(spec, deadlineMs);
+          return {
+            get started() { return handle.started; },
+            get supervisorPid() { return handle.supervisorPid; },
+            get transport() { return handle.transport; },
+            get failed() { return handle.failed; },
+            get whenFailed() { return handle.whenFailed; },
+            snapshot: (timeoutMs) => handle.snapshot(timeoutMs),
+            waitChild: (timeoutMs) => handle.waitChild(timeoutMs),
+            dispose: async (timeoutMs) => {
+              await settleDepsInstall();
+              return handle.dispose(timeoutMs);
+            },
+          };
+        },
         commandEffectSpec(worktreePath, worktreePath, FILEOP_BIN, ["--root", worktreePath], commandEnv, commandSandbox),
         boundaryDeadlineMs,
         "command",
@@ -3010,6 +3109,7 @@ export class CodexExecutor implements Executor {
           stdout: fileopRoot.handle.transport.stdout,
         });
       } catch (error) {
+        await settleDepsInstall();
         await registry.reapRoot(fileopRoot.root, boundaryDeadlineMs);
         throw error;
       }
@@ -3168,6 +3268,7 @@ export class CodexExecutor implements Executor {
         // provider has launched and adopted the session, so an unpopulated home never replaces the
         // generation persisted before the park.
         persistSession: async (): Promise<void> => {
+          await settleDepsInstall();
           if (opts.persistAfterLaunchOnly && !launched) return;
           await this.sessionStore.persist(codexHome, storeDir).catch(() => undefined);
         },
@@ -3175,6 +3276,7 @@ export class CodexExecutor implements Executor {
         // disposeTools the registry (WITHOUT the onDispose token-eviction hook — a live token must
         // survive into the next epoch), then close the harness/transport and dispose the fileop.
         dispose: async (): Promise<void> => {
+          await settleDepsInstall();
           await this.tearDownEpoch(registry, epochHarness, epochFileop, boundaryDeadlineMs, true);
         },
       };
@@ -3183,6 +3285,7 @@ export class CodexExecutor implements Executor {
       // points at the PREVIOUS live epoch): best-effort tear down whatever this build produced.
       // Issue #1766: only a VERIFIED clean teardown clears the registry from the outstanding set,
       // so a failed or rejected one leaves a later capture settle answering `incomplete`.
+      await settleDepsInstall();
       const clean = await this.tearDownEpoch(registry, harness, fileopHandle, boundaryDeadlineMs, true).catch(() => false);
       if (clean) this.unverifiedEpochRegistries.delete(registry);
       throw error;
@@ -3974,7 +4077,7 @@ export class CodexExecutor implements Executor {
   private planPrompt(ctx: RunContext, facts?: EnvFacts): string {
     const head = ctx.issueIid != null ? `Issue #${ctx.issueIid}: ${ctx.issueTitle}` : ctx.issueTitle;
     const block = buildEnvironmentFactsBlock(facts);
-    const body = `${head}\n\n${ctx.issueDescription}\n\nProduce a plan for this work and submit it for approval.${block ? `\n\n${block}` : ""}`;
+    const body = `${head}\n\n${ctx.issueDescription}\n\nProduce a plan for this work and submit it for approval.\n\n${depsProvisionPlanNote()}${block ? `\n\n${block}` : ""}`;
     // PRD #1416 M1: these Codex builders bypass the shared buildPlanPrompt/buildImplementPrompt,
     // so prepend the published-floor paragraph here. Empty ⇒ unchanged (a fresh branch).
     // #1416 (MR-rework): thread autoApprove so an autopilot Codex run gets the autopilot-safe
