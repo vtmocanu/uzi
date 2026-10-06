@@ -5080,6 +5080,48 @@ export class GitCache {
   }
 
   /**
+   * Owner-cancel inspection only. All observations run as the runner uid without optional
+   * locks. Refuse executable conversion surfaces and hidden index entries before status.
+   * Gitlinks are conservatively unverified; ignored files retain ordinary status semantics.
+   */
+  async credentialFreeCancelCleanHead(cwd: string): Promise<string | null> {
+    const pins = [
+      "--no-optional-locks",
+      "-c", "core.fsmonitor=false",
+      "-c", "core.untrackedCache=false",
+      "-c", "core.ignoreStat=false",
+      "-c", "core.checkStat=default",
+      "-c", "core.trustctime=true",
+      "-c", "core.fileMode=true",
+      "-c", "core.ignoreCase=false",
+    ];
+    const read = (args: string[]) => this.runGitAsRunner(cwd, [...pins, ...args]);
+    try {
+      // config/index/ref reads cannot invoke a clean/process filter. Reading all effective
+      // config also sees included config files; any read failure refuses the proof.
+      const config = await read(["config", "--null", "--list"]);
+      for (const entry of config.split("\0")) {
+        const split = entry.indexOf("\n");
+        const key = (split < 0 ? entry : entry.slice(0, split)).toLowerCase();
+        if (/^filter\..*\.(clean|process)$/.test(key) ||
+            key === "core.worktree" || key === "core.sparsecheckout" ||
+            key === "extensions.worktreeconfig") return null;
+      }
+      const flags = await read(["ls-files", "-v", "-z"]);
+      if (flags.split("\0").some(entry => entry && (entry[0] === "S" || /^[a-z]/.test(entry)))) return null;
+      const index = await read(["ls-files", "--stage", "-z"]);
+      if (index.split("\0").some(entry => entry.startsWith("160000 "))) return null;
+      const before = (await read(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+      if (!/^[0-9a-f]{40}$/.test(before)) return null;
+      const status = await read(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"]);
+      const after = (await read(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+      return status.length === 0 && before === after ? after : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Issue #281 / CodeRabbit #655: the porcelain read for the no-progress detector's
    * worktree fingerprint. Identical git invocation and runner-uid rationale as
    * planChangedFiles, but returns `null` on a failed read instead of `[]`, so an

@@ -71,6 +71,7 @@ import type { OutgoingMessage } from "../src/protocol.js";
 import { createCodexTransport, CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
 import type { RunContext, EmittedMessage, Executor, WallParkOutcome, SecretRemediationDecision } from "../src/executor.js";
 import { PauseNowSignal } from "../src/steering.js";
+import { makeRecoveryCoordinator, FakeRecoveryClient, FakeRecoveryGit, commitInTree } from "./codex-reap-fixture.js";
 import { scanSignals } from "../src/signals.js";
 import { detectRepoAgents } from "../src/repoagents.js";
 import { CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND } from "../src/prompt.js";
@@ -81,7 +82,7 @@ import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary
 import type { Logger } from "../src/log.js";
 import type { DockerWiring } from "../src/docker-wiring.js";
 import type { AgentTemplate, MilestoneProgress } from "../src/protocol.js";
-import type { BoundaryRequest } from "../src/harness.js";
+import type { BoundaryRequest, BoundaryPermit } from "../src/harness.js";
 import type { CodexExecutionSafetyImpl } from "../src/codex/safety.js";
 import type {
   CacheCleanupResult,
@@ -1120,6 +1121,242 @@ describe("decoded Codex usage limits reach RunRunner #2360", () => {
       }
     });
   }
+});
+
+describe("m1 credential-free owner cancel", () => {
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>(r => { resolve = r; });
+    return { promise, resolve };
+  }
+  const quietResponder: Responder = c => {
+    if (c.method === "thread/start") return { thread: { id: "th-1" } };
+    if (c.method === "turn/start") return { turn: { id: "tn-1" } };
+    return {};
+  };
+  for (const pending of [false, true]) it(`aborted installer cancel cleanup pending=${pending}`, async () => {
+    const rig = makeRig({ responder: quietResponder });
+    const installed = deferred<{ results: []; truncated: false }>();
+    const started = deferred<void>();
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true, installDeps: async () => {
+      started.resolve(); return installed.promise;
+    } };
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const controller = new AbortController();
+    const run = executor.run(makeCtx({ signal: controller.signal }).ctx).catch(() => undefined);
+    try {
+      await withTimeout(started.promise, 3000, "installer start");
+      await waitFor(() => executor.safety !== undefined, "live provider registry");
+      controller.abort(new Error("owner cancel"));
+      if (!pending) installed.resolve({ results: [], truncated: false });
+      const result = await executor.settleForCredentialFreeCapture(100, "cancel");
+      assert.equal(result.kind, pending ? "incomplete" : "observed_empty");
+      assert.equal(rig.client.refreshCalls.length, 0);
+      assert.equal(rig.client.releaseCalls.length, 1, "only startup release");
+    } finally {
+      controller.abort(new Error("fixture cleanup"));
+      installed.resolve({ results: [], truncated: false });
+      await withTimeout(run, 5000, "installer teardown");
+      await executor.safety?.dispose({ boundary: "terminal", deadlineMs: 200 });
+    }
+  });
+
+  for (const state of ["callback", "launch", "disposed", "unsupported"] as const)
+    it(`cancel cleanup refuses ${state} without reconcile`, async () => {
+      const rig = makeRig();
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+      let reconcile = 0;
+      executor.safety = createCodexExecutionSafety(registry, async () => {
+        reconcile++; throw new Error("credential reconcile forbidden");
+      });
+      if (state === "callback") assert.equal(registry.reserveCallback({
+        threadId: "thread", turnId: "turn", callId: "pending", fingerprint: "pending",
+      }).kind, "admitted");
+      if (state === "launch") assert.equal(registry.reserveLaunch("command").kind, "reserved");
+      if (state === "disposed") await registry.disposeTools();
+      if (state === "unsupported") executor.safety = { kind: "codex" } as never;
+      assert.equal((await executor.settleForCredentialFreeCapture(20, "cancel")).kind, "incomplete");
+      assert.equal(reconcile, 0);
+      await registry.disposeTools();
+    });
+
+  const cases = [
+    ...["clean", "dirty", "untracked", "committed", "hidden", "assume", "skip", "filter"].map(work => ({ work })),
+    ...["wrong", "missing", "retained", "error"].map(release => ({ work: "clean", release })),
+    ...["survivors", "unverified", "new-writer"].map(process => ({ work: "clean", process })),
+    { work: "clean", docker: "docker_error" },
+    { work: "clean", trust: "missing" },
+    { work: "clean", trust: "recovered" },
+    { work: "clean", inspect: "unreadable" },
+    { work: "clean", inspect: "head" },
+    { work: "clean", drain: "root" },
+    { work: "dirty", terminal: "statusless" },
+    { work: "dirty", terminal: "lost" },
+    ...["immediate", "statusless", "lost"].flatMap(terminal =>
+      ["clean", "dirty"].map(work => ({ work, route: "recovery", terminal }))),
+    { work: "dirty", route: "deferred", terminal: "statusless" },
+    { work: "clean", route: "deferred", terminal: "immediate" },
+  ] as Array<{ work: string; release?: string; process?: string; docker?: string; trust?: string;
+    inspect?: string; drain?: string; terminal?: string; route?: string }>;
+  for (const scenario of cases.filter(scenario => HAS_PROCFS || !scenario.process))
+    it(`actual runner owner cancel ${JSON.stringify(scenario)}`, async () => {
+      const { work } = scenario;
+      const shouldRelease = work === "clean" && !scenario.release && !scenario.process &&
+        !scenario.trust && !scenario.inspect && !scenario.drain;
+      const api = new FakeApi("cancel-worker");
+      const url = await api.listen();
+      const fx = makeFixture();
+      const recoveryClient = new FakeRecoveryClient();
+      const recoveryGit = new FakeRecoveryGit();
+      const recovery = makeRecoveryCoordinator(recoveryClient, recoveryGit);
+      const rig = makeRig({ responder: quietResponder });
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const client = new WorkerClient(url, "cancel-worker", "test", noopLog, { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+      client.protocolFeatures = ["recovery_release_exact_echo"];
+      const releases: unknown[][] = [];
+      const openHolds = new Set([7, 8]);
+      client.releaseRecoveryCustody = async (...args) => {
+        releases.push(args);
+        if (scenario.release === "error") throw new Error("lost release ACK");
+        if (scenario.release === "missing") return {} as never;
+        if (!scenario.release) openHolds.delete(Number(args[1]));
+        return { run_id: args[0], generation: scenario.release === "wrong" ? 8 : args[1],
+          released: true, holds_released: 1, retained: scenario.release === "retained" };
+      };
+      const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
+      let clone = "";
+      let lifecycle: AbortSignal | undefined;
+      let boundaryCalls = 0;
+      let bare = "";
+      const ensureClone = git.ensureClone.bind(git);
+      git.ensureClone = async (...args) => { bare = await ensureClone(...args); return bare; };
+      const observations: string[] = [];
+      const { logger: cancelLog, lines: cancelLogs } = recordingLogger();
+      const claim = makeClaim({
+        claim_generation: 7,
+        repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath, default_branch: "main" },
+        secrets: { forge_pat: "pat", codex: SUBSCRIPTION } as never,
+        agents: [{ name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] }],
+        plan_approved: true, plan_source: "seeded", plan_md: "approved plan",
+      });
+      const runner = new RunRunner(client, git, () => ({
+        executor: {
+          run: async ctx => {
+            clone = ctx.worktreePath; lifecycle = ctx.signal;
+            if (scenario.route) {
+              // Let the actual executor see the sticky cancel/lifecycle abort, then route its
+              // unwind through the recovery loop without substituting the live safety facade.
+              try { return await executor.run(ctx); } catch {
+                if (scenario.route === "deferred") throw new CodexCredentialDeferredError();
+                throw new TransientRecoveryError();
+              }
+            }
+            return executor.run(ctx);
+          },
+          get safety() { return executor.safety; },
+          sandboxesCommands: true,
+          settleForCredentialFreeCapture: (ms, purpose) => executor.settleForCredentialFreeCapture(ms, purpose),
+        },
+      }), cancelLog, 20, undefined, {
+        recovery: recovery.coord, pollMs: 5, recoveryRetryMs: 5,
+        quiesceRun: async req => {
+          observations.push(req.site);
+          if (req.site.startsWith("owner_cancel")) assert.equal(req.processes, HAS_PROCFS);
+          const state = req.site.startsWith("owner_cancel") && scenario.process === "survivors" ? "survivors" :
+            req.site.startsWith("owner_cancel") && scenario.process === "unverified" ? "unverified" : "quiescent";
+          return { process: HAS_PROCFS ? { state, processes: [], killed: req.site === "owner_cancel_after_inspection" && scenario.process === "new-writer" ? [101] : [] } : undefined,
+            docker: { state: scenario.docker === "docker_error" ? "docker_error" : "docker_unconfirmed", removed: [], detail: "late-create race" } };
+        },
+      });
+      if (scenario.trust === "missing") git.originBranchTip = async () => null;
+      if (scenario.trust === "recovered") {
+        const seed = git.runnerCloneForBranch.bind(git);
+        git.runnerCloneForBranch = async (...args) => {
+          const result = await seed(...args);
+          const head = commitInTree(result.path, "RECOVERED.txt", "prior unpublished work");
+          await git.fetchAgentBranch(args[0], result.path, result.branch, claim.run_id);
+          return { ...result, baseCommit: head };
+        };
+      }
+      if (scenario.inspect === "unreadable") git.credentialFreeCancelCleanHead = async () => null;
+      if (scenario.drain === "root") rig.root.reap = async () => ({ ok: false, error: { category: "tool", message: "root survives" } });
+      const sendState = client.reportState.bind(client);
+      client.reportState = async (...args) => {
+        const ack = await sendState(...args);
+        if (args[1].status === "failed") {
+          if (scenario.terminal === "lost") throw new Error("terminal landed but ACK lost");
+          if (scenario.terminal === "statusless") return { ...ack, status: undefined };
+        }
+        return ack;
+      };
+      api.setOwnershipStatus(claim.run_id, "running", 7);
+      api.onState(claim.run_id, body => {
+        if (body.status === "failed") {
+          api.setOwnershipStatus(claim.run_id, "cancelled", 7);
+          api.overrideStateStatus(claim.run_id, "cancelled");
+        }
+      });
+      const execution = runner.execute(claim);
+      const gitInClone = (...args: string[]) => {
+        const result = spawnSync("git", ["-C", clone, ...args], { env: gitEnv(), encoding: "utf8" });
+        assert.equal(result.status, 0, result.stderr);
+      };
+      try {
+        await waitFor(() => rig.transport.turnStartCount > 0, "runner provider");
+        const safety = executor.safety!;
+        const boundary = safety.withBoundary.bind(safety);
+        safety.withBoundary = async <T>(request: BoundaryRequest, action: (permit: BoundaryPermit) => Promise<T>) => { boundaryCalls++; return boundary(request, action); };
+        const startHead = await git.worktreeHead(clone);
+        assert.ok(startHead);
+        await recovery.coord.pin({ runId: claim.run_id, sourceSha: startHead, kind: "issue", branch: "agent/issue-1", generation: 8 });
+        assert.equal(await git.anchorRecoveryHead(bare, claim.run_id, 8, startHead), true);
+        if (scenario.inspect === "head") await fs.rename(path.join(clone, ".git", "HEAD"), path.join(clone, ".git", "HEAD-unreadable"));
+        if (work === "dirty") await fs.appendFile(path.join(clone, "README.md"), "changed");
+        if (work === "untracked" || work === "hidden") await fs.writeFile(path.join(clone, "NEW.txt"), "unpublished");
+        if (work === "hidden") gitInClone("config", "status.showUntrackedFiles", "no");
+        if (work === "committed") {
+          await fs.writeFile(path.join(clone, "NEW.txt"), "unpublished");
+          gitInClone("add", "NEW.txt"); gitInClone("commit", "-m", "unpublished");
+        }
+        if (work === "assume" || work === "skip") {
+          gitInClone("update-index", work === "assume" ? "--assume-unchanged" : "--skip-worktree", "README.md");
+          await fs.appendFile(path.join(clone, "README.md"), "hidden change");
+        }
+        if (work === "filter") {
+          gitInClone("config", "filter.delayed.clean", "touch FILTER-RAN");
+          await fs.writeFile(path.join(clone, ".gitattributes"), "README.md filter=delayed\n");
+        }
+        api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+        await withTimeout(execution, 10000, "runner owner cancel");
+        assert.equal(lifecycle?.aborted, true, "real steering forwards genuine lifecycle abort");
+        assert.equal(rig.client.refreshCalls.length, 0, "cleanup never refreshes");
+        assert.equal(rig.client.releaseCalls.length, 1, "cleanup never releases Codex credentials");
+        assert.equal(recoveryGit.fetchCalls, 0, "no PAT fetch");
+        assert.equal(recoveryClient.reserveCalls.length, 0, "no archive");
+        assert.equal(releases.length, shouldRelease || scenario.release ? 1 : 0);
+        assert.equal(boundaryCalls, 0, "no credentialed cleanup boundary");
+        assert.equal(openHolds.has(7), !shouldRelease, "proven-empty cancellation leaves no open own hold");
+        assert.equal(openHolds.has(8), true, "sibling hold untouched");
+        const records = await recovery.coord.inspect(claim.run_id);
+        assert.ok(records.some(record => record.generation === 8), "sibling journal untouched");
+        assert.equal(records.some(record => record.generation === 7), !shouldRelease, "own journal follows exact release proof");
+        assert.equal(await git.revParse(bare, `refs/uzi-recovery-pin/${claim.run_id}/8^{commit}`), startHead, "sibling pin untouched");
+        assert.ok(observations.includes("owner_cancel"));
+        assert.ok(cancelLogs.some(line => rec(line).msg === "owner cancel Docker teardown"), "every Docker state logged");
+        if (shouldRelease) assert.ok(observations.includes("owner_cancel_after_inspection"));
+        if (shouldRelease) assert.deepEqual(releases[0], [claim.run_id, 7]);
+        else assert.equal((await fs.stat(clone)).isDirectory(), true, "source retained");
+        assert.equal(await fs.access(path.join(clone, "FILTER-RAN")).then(() => true, () => false), false);
+      } finally {
+        await runner.shutdown();
+        await execution;
+        await api.close();
+        fx.cleanup();
+        await fs.rm(recovery.root, { recursive: true, force: true });
+      }
+    });
 });
 
 describe("approved actual CodexExecutor policy flow (#2321)", () => {

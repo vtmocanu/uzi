@@ -1834,8 +1834,37 @@ export class CodexExecutor implements Executor {
    * clean. A registry still being built, or one whose half-built teardown failed, answers
    * `incomplete` rather than trusting an unobserved drain.
    */
-  async settleForCredentialFreeCapture(deadlineMs: number): Promise<CredentialFreeCaptureSettlement> {
+  async settleForCredentialFreeCapture(deadlineMs: number, purpose: "capture" | "cancel" = "capture"): Promise<CredentialFreeCaptureSettlement> {
     const deadlineAt = Date.now() + Math.max(0, deadlineMs);
+    if (purpose === "cancel") {
+      // Owner cancellation spends one deadline independently of the spent lifecycle signal.
+      // Close admission and drain before joining the installer, then observe the drain again:
+      // setup/installer completion may have registered work during the join.
+      this.depsInstall?.abort.abort();
+      const safety = this.safety;
+      if (safety !== undefined && !(safety instanceof CodexExecutionSafetyImpl)) {
+        return { kind: "incomplete", errors: [{ category: "protocol", message: "codex cancel settle: unsupported safety facade" }] };
+      }
+      const first = safety instanceof CodexExecutionSafetyImpl
+        ? await safety.settleForCredentialFreeCapture(Math.max(0, deadlineAt - Date.now()))
+        : undefined;
+      const joined = await this.settleDepsInstall(deadlineAt);
+      if (!joined) {
+        return { kind: "incomplete", errors: [{ category: "timeout", message: "codex dependency install did not settle before cancel" }] };
+      }
+      if (first?.kind === "incomplete") return first;
+      if (Date.now() >= deadlineAt) {
+        return { kind: "incomplete", errors: [{ category: "timeout", message: "codex cancel settle expired" }] };
+      }
+      const current = this.safety;
+      if (current instanceof CodexExecutionSafetyImpl) {
+        return current.settleForCredentialFreeCapture(Math.max(0, deadlineAt - Date.now()));
+      }
+      if (current !== undefined || this.unverifiedEpochRegistries.size > 0) {
+        return { kind: "incomplete", errors: [{ category: "protocol", message: "codex cancel settle: outstanding epoch registry without verified drain" }] };
+      }
+      return { kind: "observed_empty" };
+    }
     if (!await this.settleDepsInstall(deadlineAt, this.depsInstall?.cancellation)) {
       return { kind: "incomplete", errors: [{ category: "protocol", message: "codex dependency install did not settle before capture" }] };
     }

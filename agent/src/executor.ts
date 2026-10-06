@@ -906,11 +906,12 @@ export interface Executor {
    * Issue #1766: settle the executor's live execution registry for a CREDENTIAL-FREE capture
    * after a vault-locked or unknown-refresh credential deferral: refuse new launches, reap every root and drain
    * launches and callbacks under one deadline, without reconciling a credential or minting a
-   * permit. `observed_empty` means nothing of the run can still write to the clone. Optional:
+   * permit. Explicit purpose `cancel` settles independently of an aborted lifecycle; the default
+   * capture keeps its signal semantics. `observed_empty` means nothing of the run can still write to the clone. Optional:
    * only a Codex-selected executor supplies it (the runner fails closed when a `safety`-bearing
    * executor lacks it, and treats a legacy executor's `killAgentTree` reap as settled).
    */
-  settleForCredentialFreeCapture?(deadlineMs: number): Promise<CredentialFreeSettleOutcome>;
+  settleForCredentialFreeCapture?(deadlineMs: number, purpose?: "capture" | "cancel"): Promise<CredentialFreeSettleOutcome>;
 }
 
 /** Issue #1766: the result of {@link Executor.settleForCredentialFreeCapture}. */

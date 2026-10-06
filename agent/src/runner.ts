@@ -1738,6 +1738,9 @@ interface RunFlight {
    *  work. Named in every prompt of a run with a published floor; later milestones read it for
    *  the ancestry check and the finalize bridge. */
   publishedTip?: string;
+  /** Private, immutable per flight: a published origin tip matching the seeded private HEAD.
+   * Never reconstructed from recovery/checkpoint state or persisted across worker restarts. */
+  trustedPublishedStart?: string;
   /** PRD #1416 M1: floor C, initialised to P (`publishedTip`). Advanced to each confirmed
    *  checkpoint tip by later milestones (M2/M3); M1 only seeds it. */
   checkpointFloor?: string;
@@ -4012,6 +4015,8 @@ export class RunRunner {
     // The hook aborts the attempt, routing us here. Resolves immediately when the
     // breaker never tripped (every ordinary failure), so this is a no-op on the common path.
     await batcher.awaitPermanentFailureSettled();
+    const ownerCancel = this.isCredentialFreeOwnerCancel(claim, flight);
+    if (ownerCancel) await this.disposeCredentialFreeOwnerCancel(claim, flight);
     // PRD #1391 Run B M3 (fact 2, D5, N2): suppress a SECOND `failed` when a terminal outcome
     // resolved or a competing outcome was deferred for an unavailable selected winner
     // (the `terminalResolved` latch survives a 200 retiring the journal), or a pending terminal
@@ -4027,7 +4032,7 @@ export class RunRunner {
         claim_generation: flight.claimGeneration,
       });
       await batcher.close().catch(() => undefined);
-      if (opts.keepCustody) return;
+      if (opts.keepCustody || ownerCancel) return;
       // #1539: when the permanent-failure hook handled this terminal it ALREADY reaped the
       // provider after the install/deferral decision and before any send (while still actively-claimed), so there is no
       // second reap here — settle custody ONCE, gated by the stale-epoch guard. Any OTHER writer that
@@ -4043,9 +4048,9 @@ export class RunRunner {
     this.emitWorkerDiagnostic(flight, "error", reason);
     await batcher.close().catch(() => undefined);
     // PRD #1349 M2 (D4.5) / #1531: REAP THIS generation's provider FIRST, BEFORE the `failed`
-    // report. A steering-cancel and an early agent failure both land here (a cancel aborts the
-    // controller with the same error, then reports failed), and neither reaches the finalization
-    // pin — so without a disposition the hold leaks. A Codex run's pre-settle reap runs the
+    // report for non-cancel failures. Codex owner cancellation was disposed credential-free
+    // above: its aborted lifecycle cannot authorize this reconcile. Early failures that did not
+    // reach finalization still need disposition. A Codex run's pre-settle reap runs the
     // per-sink credential reconcile (refreshCodex/releaseCodex) INSIDE withBoundary, which the api
     // authorizes ONLY while the run is actively-claimed (codexActivelyClaimedStatuses); once the
     // status is terminal the reconcile is refused (409), which would block the reap and leak the
@@ -4059,7 +4064,7 @@ export class RunRunner {
     // process survived the reap, so no PAT-bearing git may start while it lives. issue #1766: a
     // custody-keeping park (opts.keepCustody) keeps the provider hold for the recovery settle.
     const reaped =
-      opts.keepCustody || err instanceof RunResidueBlockedError
+      ownerCancel || opts.keepCustody || err instanceof RunResidueBlockedError
         ? false
         : flight.permanentFailureReap !== undefined
           ? this.permanentFailureReapValid(flight)
@@ -8068,6 +8073,16 @@ export class RunRunner {
     // milestones advance it to each confirmed checkpoint tip.
     flight.publishedTip = (await this.git.originBranchTip(barePath, flight.branch!)) ?? undefined;
     flight.checkpointFloor = flight.publishedTip;
+    if (this.recovery.enabled && claim.secrets.codex && isCodePublishingKind(resolveRunKind(claim.kind)) && !flight.predecessorCapture) {
+      const privateHead = await this.git.worktreeHead(flight.worktreePath!);
+      const configuredDefaultTip = claim.repo.default_branch?.trim()
+        ? await this.git.originBranchTip(barePath, claim.repo.default_branch.trim())
+        : undefined;
+      if (privateHead && /^[0-9a-f]{40}$/.test(privateHead) &&
+          (privateHead === flight.publishedTip || privateHead === configuredDefaultTip)) {
+        flight.trustedPublishedStart = privateHead;
+      }
+    }
 
     // Journal ownership before any model can write. The worker-owned bare config
     // survives failed captures, process restarts, and runner-owned clone tampering.
@@ -10055,7 +10070,7 @@ export class RunRunner {
   private async quiesceRun(
     flight: RunFlight,
     executor: Executor,
-    opts: { mode: QuiesceMode; site: string; targetPaths?: string[]; processOnly?: boolean; clonePath?: string; propagateControl?: boolean },
+    opts: { mode: QuiesceMode; site: string; targetPaths?: string[]; processOnly?: boolean; clonePath?: string; propagateControl?: boolean; forceProcessScan?: boolean },
   ): Promise<{ outcome: QuiesceRunOutcome; blocked: boolean }> {
     return flight.sinkGate.run(async () => {
       executor.killAgentTree?.();
@@ -10119,7 +10134,7 @@ export class RunRunner {
           targetPaths,
           // A Codex run's supervisor proves its OWN attempt's process drain; a seed/capture sweep
           // over OTHER attempts' paths has no supervisor behind it, so it always scans (issue #1783 M2).
-          processes: (!executor.safety || mode !== "own") && process.platform === "linux",
+          processes: (opts.forceProcessScan || !executor.safety || mode !== "own") && process.platform === "linux",
           // A re-proof after a runner-clone git (processOnly) repeats only the process half: the
           // Docker teardown already ran at the sink's first proof, and never blocks anyway.
           dockerHost: opts.processOnly ? undefined : this.dockerHost,
@@ -12079,6 +12094,66 @@ export class RunRunner {
     return head;
   }
 
+  private isCredentialFreeOwnerCancel(claim: ClaimResponse, flight: RunFlight): boolean {
+    return this.recovery.enabled && !!flight.worktreePath && !!flight.barePath &&
+      isCodePublishingKind(resolveRunKind(claim.kind)) && !!claim.secrets.codex &&
+      flight.steering.isCancelled();
+  }
+
+  /** A cancel disposition is independent of terminal reporting. Failure retains every source;
+   * no caller retries it through a credentialed boundary or treats a terminal ACK as proof. */
+  private async disposeCredentialFreeOwnerCancel(
+    claim: ClaimResponse,
+    flight: RunFlight,
+  ): Promise<"released" | "retained"> {
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    const gen = claim.claim_generation;
+    const fenced = () => flight.steering.claimFence() !== undefined;
+    if (!Number.isSafeInteger(gen) || gen === undefined || gen <= 0 ||
+        gen !== flight.claimGeneration || fenced() ||
+        !this.client.protocolFeatures.includes("recovery_release_exact_echo")) return "retained";
+    try {
+      const executor = flight.executor;
+      const settlement = executor.settleForCredentialFreeCapture
+        ? await executor.settleForCredentialFreeCapture(this.codexBoundaryDeadlineMs, "cancel")
+        : { kind: "incomplete" as const };
+      const initial = await this.quiesceRun(flight, executor, {
+        mode: "own", site: "owner_cancel", forceProcessScan: true,
+      });
+      // ADR1783: every Docker state is observed and logged before restore inspection;
+      // neither an unconfirmed teardown nor a Docker error blocks a process/Git proof.
+      flight.runLog.info("owner cancel Docker teardown", { ...initial.outcome.docker });
+      if (settlement.kind !== "observed_empty" || initial.blocked ||
+          (process.platform === "linux" && initial.outcome.process?.state !== "quiescent")) return "retained";
+      const trusted = flight.trustedPublishedStart;
+      if (!trusted || !/^[0-9a-f]{40}$/.test(trusted)) return "retained";
+      const head = await this.git.credentialFreeCancelCleanHead(flight.worktreePath!);
+      const present = await this.git.revParse(flight.barePath!, `${trusted}^{commit}`);
+      // Finish every Git observation before the final process proof. A newly killed writer
+      // invalidates the observations even if the scan then reports quiescent.
+      const final = await this.quiesceRun(flight, executor, {
+        mode: "own", site: "owner_cancel_after_inspection", processOnly: true, forceProcessScan: true,
+      });
+      if (head !== trusted || present !== trusted || final.blocked ||
+          (process.platform === "linux" && final.outcome.process?.state !== "quiescent") ||
+          (final.outcome.process?.killed.length ?? 0) > 0 || fenced()) return "retained";
+      // ADR1783 accepts Docker's late-create race. No code-capable Git runs between this
+      // final process proof and release; historical published start is not fresh forge evidence.
+      const ack = await this.client.releaseRecoveryCustody(flight.runId, gen);
+      if (fenced() || ack.run_id !== flight.runId || ack.generation !== gen ||
+          ack.released !== true || ack.holds_released !== 1 || ack.retained === true) return "retained";
+      await this.recovery.forgetGeneration(flight.runId, gen);
+      await this.git.deleteRecoveryPin(flight.barePath!, flight.runId, gen);
+      flight.preserveRecoveryClone = false;
+      flight.preserveSession = false;
+      return "released";
+    } catch (error) {
+      flight.runLog.warn("owner cancel disposition incomplete; retaining source and journal", { error: errMessage(error) });
+      return "retained";
+    }
+  }
+
   /**
    * PRD #1349 M2 (D4) — settle THIS run's exact-generation custody hold at a park / early
    * terminal exit that never reached the finalization pin. Pins the verified restore-point
@@ -12448,6 +12523,7 @@ export class RunRunner {
     // still actively-claimed. undefined = not yet attempted; true = reaped (settle after the
     // terminal report); false = a blocked/failed reap (RETAIN the hold, still report the cancel).
     let cancelReap: boolean | undefined;
+    let cancelDisposition: "released" | "retained" | undefined;
     const terminal = TERMINAL_RUN_STATUSES;
     // Issue #1766: credential-deferral park progress. A transient park starts with both latched.
     let confirmedRunning = !credentialDeferred;
@@ -12583,7 +12659,9 @@ export class RunRunner {
         try {
           const own = await this.client.getRunOwnership(flight.runId);
           status = own.status;
-          if ((credentialDeferred || opts.terminalDisk) && own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration) {
+          if ((credentialDeferred || opts.terminalDisk || this.isCredentialFreeOwnerCancel(claim, flight)) &&
+              own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration) {
+            // An authoritative successor claim keeps the existing stale-claim cleanup convention.
             flight.preserveRecoveryClone = false;
             flight.preserveSession = false;
             return false;
@@ -12602,7 +12680,12 @@ export class RunRunner {
           await retryWait();
           continue;
         }
+        if (cancelDisposition === undefined && this.isCredentialFreeOwnerCancel(claim, flight)) {
+          cancelDisposition = await this.disposeCredentialFreeOwnerCancel(claim, flight);
+        }
         if (status !== "running") {
+          // A terminal ACK/ownership read is reporting evidence only, never a clone proof.
+          if (cancelDisposition !== undefined) return status === "recovery_wait";
           if (credentialDeferred && status !== "recovery_wait") {
             if (terminal.has(status)) {
               keepUnlessCaptured(await captureForCredentialExit(false));
@@ -12636,21 +12719,27 @@ export class RunRunner {
           // the ack, or on a later terminal ownership read via the early return above).
           // Issue #1766: a credential-deferral park skips this credentialed reap (it would refresh against
           // the deferred credential operation); cancelReap stays false, so the hold is retained for the reconciler.
-          if (cancelReap === undefined)
+          const ownerCancel = this.isCredentialFreeOwnerCancel(claim, flight);
+          if (ownerCancel && cancelDisposition === undefined) {
+            cancelDisposition = await this.disposeCredentialFreeOwnerCancel(claim, flight);
+          }
+          if (!ownerCancel && cancelReap === undefined)
             cancelReap = credentialDeferred
               ? false
               : await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
           // Issue #1766: capture BEFORE the cancel report, credential-free. Mirrors the transient
           // settle's guarantee (committed work is archived, or the clone kept when it is the only
           // source) without a credentialed call: an unverified capture keeps the clone and session.
-          const cancelCaptured = credentialDeferred ? await captureForCredentialExit(true) : false;
+          const cancelCaptured = !ownerCancel && credentialDeferred ? await captureForCredentialExit(true) : false;
           try {
             // Consuming cancel only stamps stop_kind. This existing terminal
             // report is what makes Service route it to CancelRunByWorker.
             const ack = await reportState({ status: "failed", failure_reason: "run cancelled" });
             if (ack.status && terminal.has(ack.status)) {
-              flight.preserveRecoveryClone = credentialDeferred && !cancelCaptured;
-              flight.preserveSession = credentialDeferred && !cancelCaptured;
+              if (!ownerCancel) {
+                flight.preserveRecoveryClone = credentialDeferred && !cancelCaptured;
+                flight.preserveSession = credentialDeferred && !cancelCaptured;
+              }
               // PRD #1349 M2 (D4.5) / #1539: the provider was reaped above while actively-claimed;
               // now the terminal report has landed, so run the non-status-gated custody settle. A
               // verified-empty run RELEASES its exact hold, committed work CAPTURES it, and a
@@ -12662,7 +12751,7 @@ export class RunRunner {
             if (ack.status && ack.status !== "running") {
               // Issue #1766: a live non-running cancel ack (paused, awaiting_approval, ...) is the
               // held posture: say so on the feed and keep the clone and session.
-              if (credentialDeferred) return await credentialHeld();
+              if (credentialDeferred && !ownerCancel) return await credentialHeld();
               return false;
             }
           } catch (cancelError) {
