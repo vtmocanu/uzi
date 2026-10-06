@@ -124,8 +124,8 @@ type RecoveryCaptureStatusResponse struct {
 }
 
 // RecoveryReleaseResponse is the release ACK for a run's custody (D3): Released is true
-// when the call transitioned any open hold to released, and HoldsReleased is how many open
-// holds it settled (0 on an idempotent repeat once none remain open).
+// when custody is confirmed released. Legacy repeats can return zero HoldsReleased;
+// an exact guarded FINAL retry confirms its stored identity with HoldsReleased=1.
 type RecoveryReleaseResponse struct {
 	RunID         string `json:"run_id"`
 	Released      bool   `json:"released"`
@@ -137,9 +137,9 @@ type RecoveryReleaseResponse struct {
 	Retained bool   `json:"retained,omitempty"`
 	Reason   string `json:"reason,omitempty"`
 	// Generation is the released generation the server ECHOES back on the v2 exact release path
-	// (PRD #1392 M1), set only when a hold was actually released (n>0) so the worker can confirm
-	// the server settled the exact generation it asked to release. Omitempty and a pointer, so a
-	// v1/idempotent-no-op release marshals nothing.
+	// (PRD #1392 M1), including an exact guarded FINAL retry, so the worker can confirm
+	// the server settled the generation it asked to release. Omitempty and a pointer;
+	// a legacy v1/idempotent-no-op release can marshal nothing.
 	Generation *int64 `json:"generation,omitempty"`
 }
 

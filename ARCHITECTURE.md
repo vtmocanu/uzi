@@ -1066,6 +1066,26 @@ chain in the diagram above, with no intervening `running`.
   [PRD #1349](prds/1349-recovery-custody-hardening.md) and
   [adr/1296-durable-run-recovery.md](adr/1296-durable-run-recovery.md) (with
   its 2026-09-14 PRD #1349 amendment).
+  [Issue #1924](https://github.com/vtmocanu/uzi/issues/1924) adds generation-latched `inventory_guarded` custody for
+  `recovery_inventory_v1` workers. The worker records divergent unpublished
+  heads at `refs/uzi-owed/<run-id>/<sha>` with producer context; only containment
+  in broker/claim-confirmed remote history clears publication candidates.
+  Local pins are not checkpoint durability. At a verified source/process
+  boundary it freezes the roots and proves ancestry in a recovery-only
+  aggregate with the current source tree; neither task nor checkpoint refs
+  advance to that aggregate. The API binds final release to the exact
+  available capture/source/`coverage_digest` identity or an evidenced empty
+  inventory, rather than trusting completion or an earlier ready capture.
+  The digest is identity, not server-side Git ancestry proof. The final
+  receipt is owner-readable across hold states; closed holds confer no new
+  reserve/upload authority, and deleted workers fail worker authentication.
+  Selected final bytes are protected while the local worker row exists;
+  physical worker deletion renews the configured normal ready window.
+  Earlier non-final/legacy TTL, quotas and explicit discard remain unchanged.
+  Dirty/unverified source, unproven quiescence, pending final ACK or feature
+  loss after guard latching retains custody with bounded retry. Credential-free
+  boot cannot auto-capture dirty source. Unguarded APIs can retain local pins
+  but do not provide complete terminal/reclamation protection.
   Since PRD #1909, recovery archives and job files count against one shared
   stored-file budget (`UZI_STORED_FILES_BUDGET_BYTES`): recovery admission takes
   the same advisory locks as job-file admission and, when the budget is short,

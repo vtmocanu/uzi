@@ -27,8 +27,11 @@ for (const mode of ["boot", "live"] as const) for (const source of ["dirty-unver
     return {capture_id:id, state:"available", manifest_bound:true};
   };
   client.getRecoveryCaptureStatus = async () => ({capture_id:id, state:manifest ? "available" : "preparing", manifest_bound:!!manifest, checksum:manifest?.checksum, byte_size:manifest?.byte_size, expires_at:"2099-01-01T00:00:00Z"});
-  client.releaseRecoveryCustody = async () => {
+  client.releaseRecoveryCustody = async (_run, _generation, _evidence, disposition) => {
     if (source === "foreground-wip") {
+      assert.ok(disposition?.kind === "archive");
+      assert.equal(cmd(git.barePathFor(fx.originPath), ["show", disposition.source_sha + ":tester-source.txt"]),
+        "unpublished dirty source", "the covering archive includes foreground WIP contents");
       assert.ok(queued, "claim queued during physical proof");
       await new Promise<void>(resolve => setImmediate(resolve));
       assert.equal(executions, 1, "queued executor cannot write during FINAL");

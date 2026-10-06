@@ -961,8 +961,10 @@ uzi run recovery <run-id> [--json]
 ```
 
 - The per-run view shows each hold's exact id, claim generation, and its attention state — active
-  protection, a capture in flight, an archive ready (which releases automatically), or a
-  capture-less source that needs a decision — plus the latest capture state. A `source_only`
+  protection, a capture in flight, or a ready archive. Legacy holds can release
+  automatically on archive readiness; guarded holds await final inventory acknowledgment.
+  The status also distinguishes a capture-less source that needs a decision and shows
+  the latest capture state. A `source_only`
   hold prints `hold <hold-id>: no recovery archive; custody of worker <name>'s local source is
   retained (export unavailable; it may be the only copy)`, and the same export and discard
   hints as above follow. `--json` prints

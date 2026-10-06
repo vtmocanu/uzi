@@ -47,7 +47,7 @@ through `[0.52.0]`.)
 ### Fixed
 
 - **Recovery custody retains complete candidate inventories ([#1924](https://github.com/vtmocanu/uzi/issues/1924)).**
-  Inventory-capable workers keep generation custody open until a final covering archive or verified empty inventory is acknowledged. Selected archives survive worker reclamation for the configured recovery retention window, with an owner-readable receipt.
+  Workers retain divergent unpublished heads under worker-local refs, distinguish them from durable remote checkpoints in the feed, and freeze a recovery-only aggregate whose ancestry preserves the original heads with one current source tree. Inventory-guarded generations keep custody open despite completion or an earlier available archive until the exact final covering archive or verified empty inventory is acknowledged; an owner-readable receipt identifies the selected capture and coverage digest. The selected archive is protected while its local worker exists, and physical worker deletion renews the configured normal ready-retention window (7 days by default); earlier non-final and legacy captures keep their existing TTL. Dirty or unverified source and pending final acknowledgments retain custody with bounded retries. Older APIs report unguarded generations without promising complete terminal or reclamation protection; local pins alone are not durable recovery.
 
 - **Codex advice ignores async question text ([#2239](https://github.com/vtmocanu/uzi/issues/2239)).**
   Items whose delivery is exactly `"async"` no longer contaminate advice prose or structured verdicts. Other delivery values preserve text unchanged and in order; advice surfaces and answers no questions, while the native capability stays available.
