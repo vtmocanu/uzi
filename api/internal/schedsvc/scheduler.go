@@ -783,10 +783,22 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 				for i := range res.Started {
 					res.Started[i].SelectorLabel = selectorLabel
 				}
-				if selectorLabel != e.resolveUziLabel(ctx) {
-					cached, removeErr := e.store.GetIssueByIID(ctx, store.GetIssueByIIDParams{RepoID: repo.ID, ForgeIssueIid: iid})
+				uziLabel := settings.DefaultUziLabel
+				var removeErr error
+				if e.settings != nil {
+					var live string
+					live, removeErr = e.settings.UziLabel(ctx)
+					if strings.TrimSpace(live) != "" {
+						uziLabel = live
+					}
+				}
+				if removeErr != nil || selectorLabel != uziLabel {
 					if removeErr == nil {
-						_, removeErr = e.forge.SetIssueLabel(ctx, f, repo.ForgeProjectID, cached, selectorLabel, "", false)
+						var cached store.Issue
+						cached, removeErr = e.store.GetIssueByIID(ctx, store.GetIssueByIIDParams{RepoID: repo.ID, ForgeIssueIid: iid})
+						if removeErr == nil {
+							_, removeErr = e.forge.SetIssueLabel(ctx, f, repo.ForgeProjectID, cached, selectorLabel, "", false)
+						}
 					}
 					for i := range res.Started {
 						res.Started[i].LabelRemoved = removeErr == nil

@@ -224,15 +224,7 @@ func (h *Handler) AddScheduleRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	selector := schedtmpl.SelectorLabel
-	cloneLabels := cur.Labels
-	if cur.Origin == "default" {
-		if job, ok := schedtmpl.BySlug(cur.CatalogSlug.String); ok {
-			selector = job.SelectorKind
-			cloneLabels = marshalLabels(job.Labels)
-		}
-	}
-	if status, msg := h.validateScheduleRemoval(r.Context(), apitypes.ScheduleRequest{Target: cur.Target, Timing: cur.Timing, Labels: scheduleLabelsToSlice(cloneLabels), RemoveLabelOnDispatch: &cur.RemoveLabelOnDispatch}, selector); status != 0 {
+	if status, msg := h.validateScheduleRemoval(r.Context(), apitypes.ScheduleRequest{Target: cur.Target, Timing: cur.Timing, Labels: scheduleLabelsToSlice(cur.Labels), RemoveLabelOnDispatch: &cur.RemoveLabelOnDispatch}, schedtmpl.SelectorLabel); status != 0 {
 		httpx.Error(w, status, msg)
 		return
 	}

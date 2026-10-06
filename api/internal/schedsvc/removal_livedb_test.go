@@ -80,8 +80,18 @@ func (s removalCache) RemoveCachedIssueLabel(ctx context.Context, p store.Remove
 
 type removalRuns struct {
 	fakeRuns
-	pool      *pgxpool.Pool
-	createErr error
+	pool        *pgxpool.Pool
+	createErr   error
+	afterCreate func()
+}
+
+type removalSettings struct {
+	fakeSettings
+	err error
+}
+
+func (s *removalSettings) UziLabel(context.Context) (string, error) {
+	return s.uziLabel, s.err
 }
 
 func (r *removalRuns) CreateScheduledAutopilotRun(ctx context.Context, user, repo uuid.UUID, iid int64, desc string, _ *bool, _ *bool, _ *string, _ bool, _ *workersvc.CredentialOverride, _ *workersvc.Harness) (store.Run, error) {
@@ -90,11 +100,14 @@ func (r *removalRuns) CreateScheduledAutopilotRun(ctx context.Context, user, rep
 	}
 	var id uuid.UUID
 	err := r.pool.QueryRow(ctx, `INSERT INTO runs (user_id,repo_id,issue_iid,kind,status,issue_title,issue_description) VALUES ($1,$2,$3,'issue','queued','candidate',$4) RETURNING id`, user, repo, iid, desc).Scan(&id)
+	if err == nil && r.afterCreate != nil {
+		r.afterCreate()
+	}
 	return store.Run{ID: id}, err
 }
 
 func TestSweepRemovalLiveDB(t *testing.T) {
-	for _, name := range []string{"success", "off", "create failure", "create skip", "forge failure", "cache failure", "lookup failure", "live uzi changed", "foreign owner", "concurrent cache update", "normalized selector"} {
+	for _, name := range []string{"success", "off", "create failure", "create skip", "forge failure", "cache failure", "lookup failure", "live uzi changed", "foreign owner", "concurrent cache update", "normalized selector", "absent cache", "absent cache forge failure", "settings read failure", "nil settings", "blank settings"} {
 		t.Run(name, func(t *testing.T) {
 			ctx, pool, q, _ := openScheduleFireLiveDB(t)
 			user, repo := scheduleFireUser(ctx, t, pool)
@@ -109,7 +122,7 @@ func TestSweepRemovalLiveDB(t *testing.T) {
 			cache := removalCache{Queries: q}
 			runs := &removalRuns{pool: pool}
 			f := &removalForge{labels: []string{"on-deck", "uzi"}}
-			settings := &fakeSettings{uziLabel: "uzi"}
+			settings := &removalSettings{fakeSettings: fakeSettings{uziLabel: "uzi"}}
 			switch name {
 			case "normalized selector":
 				sc.Labels = []byte(`["  on-deck  ","","  "]`)
@@ -129,6 +142,19 @@ func TestSweepRemovalLiveDB(t *testing.T) {
 				settings.uziLabel = "on-deck"
 			case "foreign owner":
 				sc.UserID = uuid.New()
+			case "absent cache", "absent cache forge failure":
+				if name == "absent cache forge failure" {
+					f.writeErr = errors.New("forge failed")
+				}
+				runs.afterCreate = func() {
+					capacityExec(t, ctx, pool, `UPDATE issues SET labels='["uzi"]' WHERE repo_id=$1 AND forge_issue_iid=1`, repo)
+				}
+			case "settings read failure":
+				runs.afterCreate = func() {
+					settings.err = errors.New("settings read failed")
+				}
+			case "blank settings":
+				settings.uziLabel = "   "
 			}
 			f.beforeWrite = func() {
 				var n int
@@ -136,7 +162,8 @@ func TestSweepRemovalLiveDB(t *testing.T) {
 					t.Fatalf("forge write before run: n=%d err=%v", n, err)
 				}
 				cached, err := q.GetIssueByIID(ctx, store.GetIssueByIIDParams{RepoID: repo, ForgeIssueIid: 1})
-				if err != nil || !slices.Contains(scheduleRemovalLabels(t, cached.Labels), "on-deck") {
+				wantCachedSelector := name != "absent cache" && name != "absent cache forge failure"
+				if err != nil || slices.Contains(scheduleRemovalLabels(t, cached.Labels), "on-deck") != wantCachedSelector {
 					t.Fatalf("cache removed before forge: %+v %v", cached, err)
 				}
 				if name == "concurrent cache update" {
@@ -146,6 +173,9 @@ func TestSweepRemovalLiveDB(t *testing.T) {
 			}
 			builder := removalBuilder{Service: forgesvc.New(cache, nil, time.Second, nil), f: f}
 			e := New(st, runs, builder, settings, nil, nil, time.Minute, nil)
+			if name == "nil settings" {
+				e.settings = nil
+			}
 			out, err := e.RunNow(ctx, sc)
 			if name == "foreign owner" {
 				if !errors.Is(err, workersvc.ErrRepoNotFound) || f.writes != 0 {
@@ -164,14 +194,14 @@ func TestSweepRemovalLiveDB(t *testing.T) {
 				t.Fatalf("out=%+v", out)
 			}
 			wantWrites := 1
-			if wantStarts == 0 || name == "off" || name == "live uzi changed" || name == "lookup failure" {
+			if wantStarts == 0 || name == "off" || name == "live uzi changed" || name == "lookup failure" || name == "settings read failure" {
 				wantWrites = 0
 			}
 			if f.writes != wantWrites {
 				t.Fatalf("writes=%d want=%d", f.writes, wantWrites)
 			}
-			failure := name == "forge failure" || name == "cache failure" || name == "lookup failure"
-			removed := name == "success" || name == "concurrent cache update" || name == "normalized selector"
+			failure := name == "forge failure" || name == "absent cache forge failure" || name == "cache failure" || name == "lookup failure" || name == "settings read failure"
+			removed := name == "success" || name == "concurrent cache update" || name == "normalized selector" || name == "absent cache" || name == "nil settings" || name == "blank settings"
 			if wantStarts == 1 {
 				started := out.Started[0]
 				selector := "on-deck"
@@ -199,7 +229,7 @@ func TestSweepRemovalLiveDB(t *testing.T) {
 				t.Fatal(err)
 			}
 			wantLabels := []string{"on-deck", "uzi"}
-			if removed {
+			if removed || name == "absent cache forge failure" {
 				wantLabels = []string{"uzi"}
 			}
 			if name == "concurrent cache update" {
@@ -211,7 +241,7 @@ func TestSweepRemovalLiveDB(t *testing.T) {
 			if !slices.Equal(scheduleRemovalLabels(t, cached.Labels), wantLabels) {
 				t.Fatalf("cached labels=%s", cached.Labels)
 			}
-			if name == "forge failure" && !slices.Contains(f.labels, "on-deck") {
+			if (name == "forge failure" || name == "absent cache forge failure" || name == "settings read failure") && !slices.Contains(f.labels, "on-deck") {
 				t.Fatal("failed forge changed labels")
 			}
 			if removed || name == "cache failure" {

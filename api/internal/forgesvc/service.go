@@ -571,11 +571,10 @@ func (s *Service) AutoMove(ctx context.Context, f forge.Forge, forgeProjectID in
 // label to enforce single-column membership) it touches only the one label and
 // preserves everything else, so it must never be used for column moves.
 //
-// Idempotent by a cached-labels diff: when the desired state already holds (apply
-// and the label is already present, or remove and already absent) it is a local
-// no-op success with NO forge call. Otherwise, on apply it first EnsureLabels the
-// label (auto-creating it on the project the first time, pinned to color), then
-// issues one UpdateIssueLabels with a single-element add or remove set.
+// Applying an already-cached label is a local no-op with no forge call. Otherwise,
+// apply first ensures the label exists on the project, pinned to color. Removal
+// always sends the forge delta: cached absence does not prove forge absence.
+// Both paths issue one UpdateIssueLabels with a single-element add or remove set.
 //
 // color is the label color to pin when apply auto-creates the label, and is
 // ignored on remove. It is a PARAMETER so the one caller (Promote) supplies the
@@ -590,9 +589,8 @@ func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProject
 		current = []string{}
 	}
 
-	// Diff-first: if the cache already reflects the desired state, skip the forge
-	// entirely and return the row unchanged (idempotent apply/remove).
-	if slices.Contains(current, label) == apply {
+	// Applying a cached label preserves the existing idempotent apply behavior.
+	if apply && slices.Contains(current, label) {
 		return issue, nil
 	}
 
