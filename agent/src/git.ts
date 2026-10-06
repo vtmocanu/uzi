@@ -1606,10 +1606,10 @@ export class GitCache {
    * resolved to a pinned commit before pushing, keeping the runner's branch out
    * of the bare's heads namespace (B2 invariant 2).
    */
-  async pushBranch(barePath: string, branch: string, pat: string, repoUrl: string, username?: string): Promise<void> {
+  async pushBranch(barePath: string, branch: string, pat: string, repoUrl: string, username?: string, sourceSha?: string): Promise<void> {
     const scope = httpScopeForUrl(repoUrl);
     await this.withLock(barePath, async () => {
-      const tip = await this.resolveCommitStrict(barePath, runnerTrackingRef(branch));
+      const tip = sourceSha ?? await this.resolveCommitStrict(barePath, runnerTrackingRef(branch));
       const candidate = await this.scratchPublicationPreflight(barePath, branch, tip);
       await this.refreshScratchPublicationFloor(barePath, branch, candidate, pat, scope, username);
       // A literal OID keeps the candidate fixed even if the tracking ref moves.
@@ -4118,12 +4118,15 @@ export class GitCache {
     overlay?: CheckpointOverlayContext,
     pinned?: CheckpointRange,
     onStep?: (step: BoundaryStep) => void,
+    /** Exact committed ownership snapshot supplied by the runner; never a source ref name. */
+    sourceSha?: string,
   ): Promise<{ tipOid: string; pack: Readable; exited: Promise<number> } | null> {
     // A pinned range uses literal commit OIDs for the pack floor and candidate.
     // If an overlay is requested, its wrapper becomes the wanted OID while the
     // excluded floor remains pinned.
     if (pinned) {
-      if (!SHA40_RE.test(pinned.tipSha) || !SHA40_RE.test(pinned.excludeSha)) {
+      if (!SHA40_RE.test(pinned.tipSha) || !SHA40_RE.test(pinned.excludeSha) ||
+          (sourceSha !== undefined && sourceSha !== pinned.tipSha)) {
         throw new ScratchPublicationError("pinned checkpoint range must be two 40-hex commit SHAs", undefined, {
           kind: "checkpoint_range", step: "checkpoint_floor", detail: "pinned range is not two 40-hex commit SHAs",
         });
@@ -4145,7 +4148,7 @@ export class GitCache {
       );
       return { tipOid: wanted, pack: stdout, exited };
     }
-    const realTip = await this.trackingTip(barePath, branch);
+    const realTip = sourceSha ?? await this.trackingTip(barePath, branch);
     if (!realTip) return null;
     onStep?.("scratch_preflight");
     await this.scratchPublicationPreflight(barePath, branch, realTip);

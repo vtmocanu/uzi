@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -252,6 +253,11 @@ describe("real-git adoption → settle (issue #1582 M2)", () => {
     // so the reseed takes the owner-anchored checkpoint leg rather than the tracking leg.
     gitOut(bare(), "push", "-q", fx.originPath, `${gen1Head}:refs/uzi-checkpoints/${branch}`);
     gitOut(bare(), "update-ref", "-d", `refs/uzi-runner/${branch}`);
+    // Retire the transient ownership metadata after the existing checkpoint/archive guarantee.
+    // Permanent governance and the owed candidate pin remain intact for gen2's admission.
+    gitOut(bare(), "config", "--local", "--unset-all", `uzi-trackowner.${branch}.owner`);
+    const receipt = createHash("sha256").update(branch).digest("hex");
+    fs.unlinkSync(path.join(bare(), "uzi-owed", `receipt-${receipt}.json`));
     s.recoveryClient.holds = [{ hold_id: HOLD_G1, generation: 1, has_available_capture: true }];
     const gen2Claim = {
       ...gen1Claim,

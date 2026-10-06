@@ -1,3 +1,4 @@
+import { establishTrackingOwnership } from "./publication-fixture.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -691,7 +692,7 @@ describe("RunRunner — settlement promotion on every terminal path (issue #1582
     ["pin-throws", "a pushed pin that throws"],
     ["tip-null", "an unreadable tracking tip"],
   ] as const) {
-    it(`${label} marks the record terminal/pushed_head_unrecorded (logged), never sent`, async () => {
+    it(mode === "tip-null" ? "an unreadable tracking tip after push still settles the exact successful source" : `${label} marks the record terminal/pushed_head_unrecorded (logged), never sent`, async () => {
       const r = rig("tracking");
       try {
         const src = originCommit(`prior-unrec-${mode}`, "PRIOR.txt");
@@ -709,7 +710,15 @@ describe("RunRunner — settlement promotion on every terminal path (issue #1582
           }
           return pin(...args);
         };
-        if (mode === "tip-null") git.trackingTip = async () => null;
+        let successfulSource = "";
+        if (mode === "tip-null") {
+          const push = git.pushBranch.bind(git);
+          git.pushBranch = async (...args) => {
+            await push(...args);
+            successfulSource = args[5]!;
+            git.trackingTip = async () => null;
+          };
+        }
         const { logger, lines } = recordingLogger();
         await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), fakeGitlab().gitlab, undefined, logger, {
           recovery: r.coord,
@@ -717,12 +726,20 @@ describe("RunRunner — settlement promotion on every terminal path (issue #1582
           settleClient: r.settleClient,
         }).execute(claim);
         assert.ok(hasStatus(claim.run_id, "completed"));
+        if (mode === "tip-null") {
+          assert.match(successfulSource, /^[0-9a-f]{40}$/);
+          assert.deepEqual(await r.settlement.listRun(claim.run_id), []);
+          assert.equal(r.settleClient.calls.length, 1);
+          assert.equal(r.settleClient.calls[0]!.req.pushed_sha, successfulSource);
+          assert.equal(pushedPins, 1);
+          return;
+        }
         const [rec] = await r.settlement.listRun(claim.run_id);
         assert.equal(rec!.state, "terminal");
         assert.equal(rec!.lastReason, PUSHED_HEAD_UNRECORDED, "the real cause, not successor_not_published");
         assert.equal(rec!.pushedSha, undefined);
         assert.equal(r.settleClient.calls.length, 0, "never sent");
-        assert.equal(pushedPins, mode === "tip-null" ? 0 : 1, "no pushed pin without a head");
+        assert.equal(pushedPins, 1);
         assert.ok(
           lines.some((l) => (l as { reason?: string; hold_id?: string }).reason === PUSHED_HEAD_UNRECORDED
             && (l as { hold_id?: string }).hold_id === HOLD_A),
@@ -869,12 +886,21 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
     } as Record<string, unknown> & { cancel: AbortController };
   }
 
+  async function preparePublication(r: LiveRig, flight: Record<string, unknown>): Promise<void> {
+    execFileSync("git", ["-C", fx.originPath, "update-ref", "refs/heads/agent/issue-1751", r.published]);
+    flight.owedContext = Promise.resolve(await establishTrackingOwnership(
+      git, r.bare, fx.originPath, "agent/issue-1751", String(flight.runId),
+      Number(flight.claimGeneration), flight.runKind as "issue",
+    ));
+  }
+
   /** Publish once through the private best-effort seam with the pack and the broker stubbed. */
   async function publish(
     r: LiveRig,
     flight: Record<string, unknown>,
     result: unknown | Error,
   ): Promise<boolean> {
+    if (!flight.owedContext) await preparePublication(r, flight);
     const origPack = git.checkpointPack.bind(git);
     const origPub = client.publishCheckpoint.bind(client);
     (git as unknown as { checkpointPack: unknown }).checkpointPack = async () => ({
@@ -952,6 +978,8 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
       await r.settlement.put(adoptedRecord(r, HOLD_A));
       assert.ok(await git.pinSettlementRefs(r.bare, RUN_ID, HOLD_A, { source: r.src, adopted: r.adopted }));
       r.settleClient.liveAnswer = (h) => released(RUN_ID, h);
+      const flight = liveFlight();
+      await preparePublication(r, flight);
       const ended = new AbortController();
       ended.abort(new Error("permit ended"));
       let scopedSpawns = 0;
@@ -959,11 +987,14 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
         scopedSpawns += 1;
         throw new Error("boundary spawner used after its permit ended");
       };
-      assert.equal(
-        await git.withBoundaryProcessSpawner(deadSpawner, ended.signal, () => publish(r, liveFlight(), PUBLISHED_OK)),
-        true,
-      );
-      assert.equal(r.observed.length, 1, "the confirmed publish fired the live trigger");
+      // Exercise the post-confirmation trigger: source binding and packing require a live
+      // boundary, while triggerLiveSettle must detach from one that has already ended.
+      await git.withBoundaryProcessSpawner(deadSpawner, ended.signal, async () => {
+        (r.runner as unknown as {
+          triggerLiveSettle: (f: unknown, publishedSha: string, target: "checkpoint") => void;
+        }).triggerLiveSettle(flight, r.published, "checkpoint");
+      });
+      assert.equal(r.observed.length, 1, "the confirmed publication fired the live trigger");
       await Promise.all(r.observed);
       await Promise.all(r.settled);
       assert.equal(scopedSpawns, 0, "no git child went through the ended permit's spawner");
@@ -1020,8 +1051,8 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
   function finalizePushed(r: LiveRig, flight: Record<string, unknown>): void {
     gitOut(r.bare, "update-ref", `refs/uzi-runner/${TASK_BRANCH}`, r.published);
     (r.runner as unknown as {
-      triggerBranchLiveSettle: (f: unknown, bare: string, branch: string) => void;
-    }).triggerBranchLiveSettle(flight, r.bare, TASK_BRANCH);
+      triggerBranchLiveSettle: (f: unknown, pushedSha: string) => void;
+    }).triggerBranchLiveSettle(flight, r.published);
   }
 
   /** Wait (bounded) for `want` fire-and-forget triggers, then for their observe + send to finish. */

@@ -95,6 +95,58 @@ beforeEach(async () => {
 afterEach(() => fx.cleanup());
 
 describe("issue1924 M2 owed candidates", () => {
+  for (const pinned of [false, true]) {
+    it(`packs the proved literal after a foreign shared-branch promotion (pinned=${pinned})`, async () => {
+      const h = root("owned H", [base]); updated(await fetch());
+      const proof = await cache.committedTrackingOwnership(bare, BRANCH, RUN, h, 1);
+      assert.ok(proof.kind === "owned");
+      const f = root("foreign F", [h]);
+      updated(await cache.fetchAgentBranch(bare, clone, BRANCH, "foreign-run", {
+        context: { ...positiveContext(), runId: "foreign-run", generation: 2 },
+      }));
+      assert.equal(tip(), f);
+      gitIn(bare, ["update-ref", `refs/remotes/origin/${BRANCH}`, base]);
+      const packed = await cache.checkpointPack(bare, BRANCH, undefined,
+        pinned ? { tipSha: proof.sha, excludeSha: base } : undefined, undefined, proof.sha);
+      assert.ok(packed);
+      assert.equal(packed.tipOid, h);
+      const chunks: Buffer[] = [];
+      for await (const chunk of packed.pack) chunks.push(Buffer.from(chunk));
+      assert.equal(await packed.exited, 0);
+      const destination = path.join(fx.dataDir, "pack-proof.git");
+      execFileSync("git", ["init", "-q", "--bare", destination], { env: ENV });
+      execFileSync("git", ["-C", destination, "index-pack", "--stdin"],
+        { env: ENV, input: Buffer.concat(chunks) });
+      const commits = gitIn(destination, ["cat-file", "--batch-all-objects",
+        "--batch-check=%(objectname) %(objecttype)"]).split("\n")
+        .filter(line => line.endsWith(" commit")).map(line => line.split(" ")[0]);
+      assert.deepEqual(commits, [h]);
+      assert.deepEqual(await pins(), [h], "foreign promotion retains H without attributing F");
+    });
+  }
+
+  it("pushes the proved literal after another run promotes the shared branch", async () => {
+    const h = root("owned push", [base]); updated(await fetch());
+    const proof = await cache.committedTrackingOwnership(bare, BRANCH, RUN, h, 1);
+    assert.ok(proof.kind === "owned");
+    const f = root("foreign push", [h]);
+    updated(await cache.fetchAgentBranch(bare, clone, BRANCH, "foreign-run", {
+      context: { ...positiveContext(), runId: "foreign-run", generation: 2 },
+    }));
+    await cache.pushBranch(bare, BRANCH, "fixture-pat", fx.originPath, undefined, proof.sha);
+    assert.equal(gitIn(fx.originPath, ["rev-parse", BRANCH]), h);
+    assert.equal(tip(), f);
+    assert.deepEqual(await pins(), [h]);
+  });
+
+  it("rejects a nonliteral or nonexistent exact publication source", async () => {
+    root("source validation", [base]); updated(await fetch());
+    for (const invalid of [`refs/uzi-runner/${BRANCH}`, "f".repeat(40)]) {
+      await assert.rejects(cache.checkpointPack(bare, BRANCH, undefined, undefined, undefined, invalid));
+      await assert.rejects(cache.pushBranch(bare, BRANCH, "fixture-pat", fx.originPath, undefined, invalid));
+    }
+  });
+
   it("legacy calls and invalid trusted identities fail before any mutation", async () => {
     const before = gitIn(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]);
     await assert.rejects(Reflect.apply(cache.fetchAgentBranch, cache, [bare, clone, BRANCH, RUN]), /trusted claim context/);

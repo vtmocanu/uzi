@@ -1741,6 +1741,8 @@ interface RunFlight {
    *  this list can be a local-only bridge (set by bridgeBareTrackingRefIfDivergent even when the
    *  publish is later held) and must never hide content from a scan. */
   publishedRealTips?: string[];
+  /** Exact candidate of the successful finalize push, retained for completion bookkeeping. */
+  successfulPushedSha?: string;
   /** PRD #1416 M2: the set of fetched tips already steered on for a divergence, so the mid-run
    *  detection emits AT MOST ONE status + steer per distinct tip. A repeated checkpoint tick that
    *  re-fetches the SAME diverged tip emits nothing; a FURTHER rewrite (a new tip) is a new key
@@ -5867,11 +5869,11 @@ export class RunRunner {
     const pushToOrigin = () =>
       withForgeRetry(
         async () => {
-          await this.requireTrackingOwned(flight, finalizeBarePath, result.branch);
+          const sourceSha = await this.requireTrackingOwned(flight, finalizeBarePath, result.branch);
           if (claim.repo.forge_type === "github" && !workflowUnavailable) {
             let hits: string[] | null = null;
             try {
-              hits = await freshWorkflowFiles(trackingRef);
+              hits = await freshWorkflowFiles(sourceSha);
             } catch (error) {
               if (error instanceof PreservationRefusedError) throw error;
               rethrowWorkflowAbort(error);
@@ -5888,7 +5890,9 @@ export class RunRunner {
             claim.secrets.forge_pat,
             claim.repo.clone_url,
             claim.secrets.forge_username,
+            sourceSha,
           );
+          flight.successfulPushedSha = sourceSha;
         },
         {
           log: runLog,
@@ -6700,7 +6704,7 @@ export class RunRunner {
     // never throws (a git error → false), so this can never fail a finalize whose push already landed.
     let bridged = false;
     if (flight.publishedTip) {
-      const pushedTip = await this.git.trackingTip(finalizeBarePath, result.branch);
+      const pushedTip = flight.successfulPushedSha;
       if (pushedTip) {
         bridged = await this.git.rangeContainsBridge(
           finalizeBarePath,
@@ -6711,7 +6715,7 @@ export class RunRunner {
     }
     // issue #1751 M2: the finalize push landed, so the pushed tracking tip is a confirmed publication
     // on runs.branch (task runs only; see triggerBranchLiveSettle).
-    this.triggerBranchLiveSettle(flight, finalizeBarePath, result.branch);
+    this.triggerBranchLiveSettle(flight, flight.successfulPushedSha);
     if (bridged) {
       // Worded GENERICALLY: the branch may have been bridged by THIS worker OR by the agent (the M2
       // steer's `git merge -s ours <P>`), so it never says "the worker bridged it".
@@ -6798,7 +6802,7 @@ export class RunRunner {
 
     if (interlocked) {
       // Read the exact landed tip after the finalize push or alignment; retain PR-head verification below.
-      const head = await this.git.trackingTip(barePath, result.branch);
+      const head = flight.successfulPushedSha ?? null;
       if (!await requireCompletionPermit(head, result.branch)) return;
       completionHead = head!;
     }
@@ -6874,14 +6878,8 @@ export class RunRunner {
         label: "PR description",
         classify: classifyForgeError,
       });
-    // The landed head the description describes (D2: after the push, align and bridge, so the branch
-    // is final). A read failure leaves it empty: the size line then reads unavailable.
-    let landedHead = "";
-    try {
-      landedHead = (await this.git.trackingTip(barePath, result.branch)) ?? "";
-    } catch (err) {
-      runLog.warn("PR description: the landed head is unreadable", { run_id: runId, error: errMessage(err) });
-    }
+    // The description describes the exact successfully pushed candidate.
+    const landedHead = flight.successfulPushedSha ?? "";
     const publisher = new PrDescriptionPublisher({
       forge,
       api: this.client,
@@ -8606,16 +8604,15 @@ export class RunRunner {
           bodyOutcome = "no_new_work";
           return;
         }
-        await this.requireTrackingOwned(flight, barePath, runnerClone.branch);
+        const fetchedTip = await this.requireTrackingOwned(flight, barePath, runnerClone.branch);
 
         // PRD #1416 M2: on the tip that was just fetched into the bare, detect a history
         // rewrite at/below the published floor P (and floor C) and steer the agent to restore
-        // it — never blocks a git command (D2). Read the tip FRESH from the bare tracking ref
-        // (refs/uzi-runner/<branch>) since fetchBackBestEffort returns nothing and the
-        // top-of-checkpoint trackTip predates this fetch; never the runner clone (that crosses
+        // it — never blocks a git command (D2). Use the exact committed ownership snapshot
+        // after fetchBackBestEffort; the top-of-checkpoint trackTip predates this fetch.
+        // Never read the runner clone here (that crosses
         // the worker-uid/runner-uid ownership seam branchTip exists to avoid). MID-RUN
         // checkpoint tick only — the finalize/park/capture fetch-backs are M3's territory.
-        const fetchedTip = await this.git.trackingTip(barePath, runnerClone.branch);
         await this.maybeSteerOnDivergence(barePath, flight, fetchedTip, batcher, steering, runLog);
 
         // PRD #1416 M3 (C1): AFTER the steer (which must see the agent's rewritten H) and BEFORE
@@ -8653,13 +8650,13 @@ export class RunRunner {
         // the last CLEAN trusted gate scan, so a commit landing after that scan cannot slip out
         // unscanned through the GitHub overlay (which is otherwise unscanned). lastPublish,
         // lastPublishedTip, checkpointFloor and pendingPublish are left as they are.
-        await this.requireTrackingOwned(flight, barePath, runnerClone.branch);
+        const postBridgeTip = await this.requireTrackingOwned(flight, barePath, runnerClone.branch);
         const remediation = flight.secretRemediation;
         // A commit only the mid-turn scan flagged (flaggedCommits, no `known`) holds too while it is
         // still an ancestor of the tip about to be published (unknown ancestry counts as reachable, an
         // unreadable tip fails closed), or once the list overflowed: the GitHub reap:true overlay
         // publish is unscanned, so ancestry is the only guard there. The tip judged is the POST-bridge
-        // tracking tip (re-read below, not fetchedTip): the bridge can move the ref to a commit that
+        // owned snapshot postBridgeTip, rather than fetchedTip: the bridge can produce a commit that
         // wraps a local-only floor containing the flagged commit. Read only when remediation state
         // exists, so a clean run pays nothing extra.
         const timeGateOpen =
@@ -8669,7 +8666,7 @@ export class RunRunner {
         let holdTip: string | null = fetchedTip;
         // Only a publish that would otherwise happen is held here (a closed time gate keeps its own outcome).
         if (hasNewWork && (opts.reap || timeGateOpen || flight.pendingPublish) && remediation !== undefined) {
-          holdTip = await this.git.trackingTip(barePath, runnerClone.branch);
+          holdTip = postBridgeTip;
           if (remediation.overflow === true) {
             flaggedHold = true;
           } else if ((remediation.flaggedCommits?.length ?? 0) > 0) {
@@ -10114,7 +10111,7 @@ export class RunRunner {
     return new PreservationRefusedError();
   }
 
-  private async trackingOwned(flight: RunFlight, barePath: string, branch: string, expectedSha?: string): Promise<boolean> {
+  private async checkedTrackingSnapshot(flight: RunFlight, barePath: string, branch: string, expectedSha?: string): Promise<string | null> {
     const { context } = await this.owedOptions(flight, barePath, branch);
     const owned = await this.git.committedTrackingOwnership(
       barePath, branch, flight.runId, expectedSha, context.generation ?? undefined,
@@ -10123,13 +10120,17 @@ export class RunRunner {
       owned.context.runId === context.runId && owned.context.branch === context.branch &&
       owned.context.barePath === context.barePath && owned.context.kind === context.kind &&
       owned.context.defaultIdentity.ref === context.defaultIdentity.ref &&
-      owned.context.defaultIdentity.sha === context.defaultIdentity.sha;
+      owned.context.defaultIdentity.sha === context.defaultIdentity.sha ? owned.sha : null;
   }
 
-  private async requireTrackingOwned(flight: RunFlight, barePath: string, branch: string, expectedSha?: string): Promise<void> {
-    if (!await this.trackingOwned(flight, barePath, branch, expectedSha)) {
-      throw this.preservationRefused(flight, "ownership_unknown");
-    }
+  private async trackingOwned(flight: RunFlight, barePath: string, branch: string, expectedSha?: string): Promise<boolean> {
+    return await this.checkedTrackingSnapshot(flight, barePath, branch, expectedSha) !== null;
+  }
+
+  private async requireTrackingOwned(flight: RunFlight, barePath: string, branch: string, expectedSha?: string): Promise<string> {
+    const sha = await this.checkedTrackingSnapshot(flight, barePath, branch, expectedSha);
+    if (sha === null) throw this.preservationRefused(flight, "ownership_unknown");
+    return sha;
   }
 
   private async fetchTracking(flight: RunFlight, barePath: string, worktreePath: string, branch: string): Promise<Extract<TrackingUpdateResult, { kind: "updated" }>> {
@@ -10267,9 +10268,8 @@ export class RunRunner {
    * PRD #1416 M3 — at a PUBLICATION BOUNDARY (finalize push, park, release, capture), non-
    * destructively repair a divergent bare tracking tip H by wrapping it in a synthesised bridge
    * commit B so a rewritten branch FAST-FORWARDS from its published floor P (and checkpoint floor
-   * C) WITHOUT a force-push (D4). Reads H from the WORKER BARE tracking ref (worker-uid, via
-   * {@link Git.trackingTip}) — NEVER the runner clone (that crosses the ownership seam branchTip
-   * avoids). Advances the tracking ref to B and C to B on success, so everything a caller then
+   * C) WITHOUT a force-push (D4). Takes H from checkedTrackingSnapshot in the worker bare.
+   * Advances the tracking ref to B and C to B on success, so everything a caller then
    * captures / releases / aligns / pushes off the tracking ref carries B.
    *
    * Outcomes (never thrown for control flow — a git failure inside maps to "failed"/"unknown"):
@@ -10285,15 +10285,14 @@ export class RunRunner {
     flight: RunFlight,
     runLog: Logger,
   ): Promise<BridgeOutcome> {
-    if (!await this.trackingOwned(flight, barePath, branch)) {
+    const H = await this.checkedTrackingSnapshot(flight, barePath, branch);
+    if (H === null) {
       this.preservationRefused(flight, "ownership_unknown");
       return { kind: "preservation_refused" };
     }
     const publishedTip = flight.publishedTip;
     if (!publishedTip) return { kind: "clean" }; // no published floor (fact 17) — nothing to bridge
-    // Read H from the WORKER-owned bare tracking ref; null ⇒ nothing published yet on this seam.
-    const H = await this.git.trackingTip(barePath, branch);
-    if (!H) return { kind: "clean" };
+    // Build over the exact owned snapshot, even if another run advances the shared ref.
     // Ancestry of P and of C (when C is set and differs from P) against H, tri-state.
     const floors = [publishedTip];
     if (flight.checkpointFloor && flight.checkpointFloor !== publishedTip) {
@@ -11326,12 +11325,8 @@ export class RunRunner {
     // the first landed ACK.
     let packedTip: string | undefined;
     try {
-      await this.requireTrackingOwned(flight, barePath, branch, pinned?.tipSha);
-      // issue #1597 M2: `pinned` is passed only by the scanned (overlay-less) publish; every other
-      // caller keeps the unpinned 3-argument call shape.
-      const packed = pinned
-        ? await this.git.checkpointPack(barePath, branch, overlay, pinned, onStep)
-        : await this.git.checkpointPack(barePath, branch, overlay, undefined, onStep);
+      const sourceSha = await this.requireTrackingOwned(flight, barePath, branch, pinned?.tipSha);
+      const packed = await this.git.checkpointPack(barePath, branch, overlay, pinned, onStep, sourceSha);
       // tracking tip unresolved (no tracking ref, or it could not be read) — nothing to pack; not a
       // publish failure, stay silent
       if (!packed) return { published: false, reason: "no_local_tip" };
@@ -11779,19 +11774,12 @@ export class RunRunner {
   /**
    * issue #1751 M2 — after a landed finalize push, a TASK run's pushed tracking tip is a confirmed
    * publication on its creation-time runs.branch: fire the `branch` live settle for it. Every other
-   * kind returns before any git read (see {@link triggerLiveSettle} for why). The tip read is local
-   * and runs inside the fire-and-forget, never on the finalize path.
+   * kind returns immediately (see {@link triggerLiveSettle} for why). Uses the exact successful
+   * push candidate rather than the mutable shared tracking ref.
    */
-  private triggerBranchLiveSettle(flight: RunFlight, barePath: string, branch: string): void {
-    if (flight.runKind !== "task" || !this.settlement.enabled) return;
-    this.detached(() => {
-      void this.git
-        .trackingTip(barePath, branch)
-        .then((tip) => {
-          if (tip) this.triggerLiveSettle(flight, tip, "branch");
-        })
-        .catch(() => undefined);
-    });
+  private triggerBranchLiveSettle(flight: RunFlight, pushedSha: string | undefined): void {
+    if (flight.runKind !== "task" || !this.settlement.enabled || !pushedSha) return;
+    this.triggerLiveSettle(flight, pushedSha, "branch");
   }
 
   /**
@@ -11854,21 +11842,14 @@ export class RunRunner {
         });
         await this.settler.markTerminal(rec, PUSHED_HEAD_UNRECORDED);
       };
-      // The interlocked completion carries the exact permitted head; otherwise read the landed tip
-      // off the tracking ref the finalize push wrote.
-      let pushed: string | null = null;
-      let tipError: string | undefined;
+      // The interlocked completion carries the permitted head; other completions use the successful push.
+      let pushed: string | null = flight.successfulPushedSha ?? null;
       if (typeof b.head === "string" && /^[0-9a-f]{40}$/.test(b.head)) {
         pushed = b.head;
-      } else if (barePath) {
-        pushed = await this.git.trackingTip(barePath, b.branch).catch((err: unknown) => {
-          tipError = errMessage(err);
-          return null;
-        });
       }
       if (!barePath || !pushed) {
-        const why = !barePath ? "no runner bare" : "tracking tip unreadable";
-        for (const rec of adopted) await unrecorded(rec, why, tipError);
+        const why = !barePath ? "no runner bare" : "successful push head unavailable";
+        for (const rec of adopted) await unrecorded(rec, why);
         return;
       }
       for (const rec of adopted) {
@@ -13001,7 +12982,7 @@ export class RunRunner {
     // before any commit, or a resume with no new work — it is DELIBERATELY skipped: an unconditional
     // fetch-back would create a spurious base tracking ref, and the broker would then publish a
     // base-only checkpoint (published:true) and PARK an empty pause, violating Decision 8. Skipping
-    // it leaves the ref exactly as the reseed did (absent on a fresh run → checkpointPack null →
+    // it leaves the ref exactly as the reseed did (absent on a fresh run → no owned checkpoint →
     // pause_failed; the recovered tracking tip on a resume → re-published as before), i.e. today's
     // behaviour. This is NOT the rejected base-tip SHORTCUT (which would SKIP the publish and CLAIM
     // durability, unsafe on the seededFrom:"tracking" leg): the publish below always runs; only the
@@ -13032,8 +13013,7 @@ export class RunRunner {
         .branchTip(runnerClone.path, branch)
         .catch(() => null);
       let fetched: FetchBackOutcome = { kind: "updated" }; // ownership is checked even without a fetch
-      if (preTip !== null && (preTip !== runnerClone.baseCommit ||
-          !await this.trackingOwned(flight, barePath, branch, preTip))) {
+      if (preTip !== null && preTip !== runnerClone.baseCommit) {
         fetched = await this.fetchBackBestEffort(
           barePath,
           runnerClone.path,

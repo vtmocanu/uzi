@@ -1,3 +1,4 @@
+import { followSuccessfulPush } from "./publication-fixture.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -15,13 +16,19 @@ import {
 } from "../src/pr-description.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import { FakePrDescApi } from "./fake-pr-desc-api.js";
-import { api, fakeGitlab, fx, git, gitlabClaim, installHarness, runner, runnerWith, type FakeForgeOpts } from "./runner-harness.js";
+import { api, fakeGitlab as rawFakeGitlab, fx, git, gitlabClaim, installHarness, runner, runnerWith, type FakeForgeOpts } from "./runner-harness.js";
 
 installHarness();
 
 // PRD #1798 M6 (M6b): the description publisher and the completion interlock, end to end through the
 // REAL RunRunner.execute() (StubExecutor commits real work, phasePublish pushes it), against a fake
 // forge whose single PR keeps its description across reads and writes.
+
+function fakeGitlab(opts: Parameters<typeof rawFakeGitlab>[0] = {}) {
+  const forge = rawFakeGitlab(opts);
+  followSuccessfulPush(git, forge.pr, opts.head === undefined || opts.head === H);
+  return forge;
+}
 
 const H = "1111111111111111111111111111111111111111";
 const OTHER = "2222222222222222222222222222222222222222";
@@ -49,7 +56,7 @@ describe("RunRunner — completion interlock over a preserved body (PRD #1798 M6
     const { gitlab, pr } = fakeGitlab({ head: OTHER, existing: adoptedBody(1820, "Closes #1820 when merged, please.") });
     const claim = interlockedClaim(1820);
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
       recoveryRetryMs: 1,
@@ -66,7 +73,7 @@ describe("RunRunner — completion interlock over a preserved body (PRD #1798 M6
     const { gitlab } = fakeGitlab({ head: OTHER, putStatus: 403, existing: adoptedBody(1821, "Fixes #1821") });
     const claim = interlockedClaim(1821);
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
       recoveryRetryMs: 1,
@@ -82,7 +89,7 @@ describe("RunRunner — completion interlock over a preserved body (PRD #1798 M6
     const { gitlab, pr } = fakeGitlab({ head: OTHER, existing });
     const claim = interlockedClaim(1822);
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
       recoveryRetryMs: 1,
@@ -98,7 +105,7 @@ describe("RunRunner — completion interlock over a preserved body (PRD #1798 M6
     const { gitlab, pr } = fakeGitlab({ head: H, existing: adoptedBody(1823, "Resolves #1823") });
     const claim = interlockedClaim(1823, { deferred: [{ milestone_id: "m2", title: "Second", reason: "later" }] });
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
@@ -112,7 +119,7 @@ describe("RunRunner — completion interlock over a preserved body (PRD #1798 M6
     const { gitlab, pr } = fakeGitlab({ head: H, existing: broken });
     const claim = interlockedClaim(1824);
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
@@ -133,7 +140,7 @@ describe("RunRunner — completion interlock over a preserved body (PRD #1798 M6
     });
     const claim = interlockedClaim(1826);
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
@@ -148,7 +155,7 @@ describe("RunRunner — completion interlock over a preserved body (PRD #1798 M6
     const { gitlab } = fakeGitlab({ head: H, putStatus: 403, existing: "Legacy body with no markers." });
     const claim = interlockedClaim(1825);
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
       recoveryRetryMs: 1,
@@ -169,12 +176,7 @@ describe("RunRunner — the description publisher (PRD #1798 M6)", () => {
     const { gitlab, pr } = fakeGitlab();
     const claim = gitlabClaim(1830);
     // The fake answers the landed head, so read 1 matches the staged snapshot.
-    const tip = git.trackingTip.bind(git);
-    git.trackingTip = (async (bare: string, branch: string) => {
-      const h = await tip(bare, branch);
-      if (h) pr.head = h;
-      return h;
-    }) as typeof git.trackingTip;
+
 
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
@@ -215,7 +217,7 @@ describe("RunRunner — refresh runs (PRD #1798 D17)", () => {
   it("mr_rework leaves a legacy PR without uzi markers untouched", async () => {
     const legacy = "A human-written PR body.\n\nCloses #42";
     const { gitlab, calls, pr } = fakeGitlab({ head: H, existing: legacy });
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
     await runner(new StubExecutor(nullLogger()), gitlab).execute(mrReworkClaim());
     assert.ok(!calls.some((c) => c.method === "PUT"), "no body write");
     assert.equal(pr.description, legacy);
@@ -225,13 +227,13 @@ describe("RunRunner — refresh runs (PRD #1798 D17)", () => {
     const completion = [COMPLETION_START, "Related to #42.", "", "Closes #42", "", "---", "Opened by uzi.", COMPLETION_END].join("\n");
     const existing = `Intro.\n\n${SIZE_REGION}\n\n${completion}\n\nBot text.`;
     const { gitlab, pr } = fakeGitlab({ head: H, existing });
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
     await runner(new StubExecutor(nullLogger()), gitlab).execute(mrReworkClaim());
     const parsed = parseOwnedBlocks(pr.description);
     assert.ok(parsed.kind === "ok");
     assert.equal(parsed.kind === "ok" && parsed.completion, completion, "the completion block is untouched");
     assert.notEqual(parsed.kind === "ok" && parsed.region, SIZE_REGION, "the region was refreshed");
-    assert.match(parsed.kind === "ok" ? (parsed.region ?? "") : "", /Describes `1111111` against `main`\./);
+    assert.ok(parsed.kind === "ok" && parsed.region?.includes(`Describes \`${pr.head.slice(0, 7)}\` against \`main\`.`));
     assert.ok(pr.description.startsWith("Intro.\n\n") && pr.description.endsWith("\n\nBot text."));
   });
 });
@@ -240,12 +242,7 @@ describe("RunRunner — the verified-head Closes add is bound to what was writte
   /** The fake PR answers the REAL landed head, so the publisher stages, binds and acks a version and
    *  the completion block carries a described SHA: the production configuration. */
   function followLandedHead(pr: { head: string }): void {
-    const tip = git.trackingTip.bind(git);
-    git.trackingTip = (async (bare: string, branch: string) => {
-      const h = await tip(bare, branch);
-      if (h && pr.head !== OTHER) pr.head = h;
-      return h;
-    }) as typeof git.trackingTip;
+    followSuccessfulPush(git, pr);
   }
 
   it("PROBE-A: the head moves when `Closes #1901` is written → Closes is stripped and the run holds", async () => {
@@ -301,17 +298,7 @@ describe("RunRunner — the verified-head Closes add is bound to what was writte
 /** The fake PR follows the REAL landed head (the publisher then stages real snapshots). Returns the
  *  landed head once the run read it. */
 function followHead(pr: { head: string }): () => string {
-  let landed = "";
-  const tip = git.trackingTip.bind(git);
-  git.trackingTip = (async (bare: string, branch: string) => {
-    const h = await tip(bare, branch);
-    if (h) {
-      landed = h;
-      pr.head = h;
-    }
-    return h;
-  }) as typeof git.trackingTip;
-  return () => landed;
+  return followSuccessfulPush(git, pr);
 }
 
 /** A StubExecutor run stopped by an operator scope directive after committing work (PRD #634). */
@@ -464,7 +451,7 @@ describe("RunRunner — an interlocked non-closing delivery on a verified head (
       };
       const claim = makeClaim_(n);
       api.setCompletionPermitResponse(true);
-      git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
       await runnerWith(() => ({ executor: makeExecutor() }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
 
@@ -482,7 +469,7 @@ describe("RunRunner — an interlocked non-closing delivery on a verified head (
       const { gitlab, pr } = fakeGitlab({ head: H, putStatus: 403, existing: adoptedBody(n, "Notes from the maintainer.") });
       const claim = makeClaim_(n);
       api.setCompletionPermitResponse(true);
-      git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
       await runnerWith(() => ({ executor: makeExecutor() }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
 
@@ -533,7 +520,7 @@ describe("RunRunner — over-cap forge answers are permanent and treated as unre
     });
     const claim = interlockedClaim(1921);
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
       recoveryRetryMs: 1,

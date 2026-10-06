@@ -905,16 +905,20 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
     let scanned: { tipSha: string; excludeSha: string } | undefined;
     let c2 = "";
     const ctl = control({
-      afterCheckpointScan: async ({ range }) => {
-        scanned = { ...range };
-        // Widen: move the exclude floor BACK below O1 (O1 was never scanned) …
+      afterCheckpointScan: async ({ range }) => { scanned = { ...range }; },
+    });
+    const pack = g.checkpointPack.bind(g);
+    g.checkpointPack = async (...args) => {
+      const range = args[3];
+      if (range) {
+        assert.equal(args[5], range.tipSha, "the publisher proved the scanned source before packing");
         gitIn(bare(), ["update-ref", `refs/remotes/origin/${branch}`, main]);
-        // … and advance the tracking ref to a NEW unscanned commit.
         const tree = gitIn(bare(), ["rev-parse", `${range.tipSha}^{tree}`]);
         c2 = gitIn(bare(), [...IDENT, "commit-tree", tree, "-p", range.tipSha, "-m", "unscanned C2"]);
         gitIn(bare(), ["update-ref", `refs/uzi-runner/${branch}`, c2]);
-      },
-    });
+      }
+      return pack(...args);
+    };
     let packBytes: Buffer | undefined;
     const pub = stubPublish(async (_n, _tip, pack) => {
       packBytes = await drain(pack);
