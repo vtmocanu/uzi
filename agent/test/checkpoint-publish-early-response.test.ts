@@ -6,6 +6,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { MessageBatcher } from "../src/batcher.js";
 import { WorkerClient } from "../src/client.js";
 import { GitCache } from "../src/git.js";
 import { RunRunner } from "../src/runner.js";
@@ -14,7 +15,7 @@ import { nullLogger, testGitCacheOptions } from "./helpers.js";
 
 // The production API drains the request before reporting published:true. These subprocesses
 // also cover an early peer response, where the HTTP result alone cannot confirm git's work.
-type Mode = "early" | "abort" | "success";
+type Mode = "early" | "abort" | "success" | "success-refused";
 
 async function child(mode: Mode): Promise<void> {
   const fx = makeFixture();
@@ -28,10 +29,10 @@ async function child(mode: Mode): Promise<void> {
   execFileSync("git", ["-C", bare, "fetch", "--no-tags", fx.originPath,
     `refs/heads/main:refs/uzi-runner/${branch}`], { env });
 
-  const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "ckpt-git-shim-"));
+  const shimDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "ckpt-git-shim-"));
   const release = path.join(shimDir, "release");
   const shim = path.join(shimDir, "git");
-  fs.writeFileSync(shim, `#!/bin/sh\nfor arg in "$@"; do\n  if [ "$arg" = pack-objects ] && [ '${mode}' != success ]; then\n    printf PACK\n    while [ ! -f '${release}' ] && [ -d '${shimDir}' ]; do sleep 0.01; done\n    echo 'intentional pack failure' >&2\n    exit 47\n  fi\ndone\nexec /usr/bin/git "$@"\n`, { mode: 0o755 });
+  fs.writeFileSync(shim, `#!/bin/sh\nfor arg in "$@"; do\n  if [ "$arg" = pack-objects ] && [ '${mode}' != success ] && [ '${mode}' != success-refused ]; then\n    printf PACK\n    while [ ! -f '${release}' ] && [ -d '${shimDir}' ]; do sleep 0.01; done\n    echo 'intentional pack failure' >&2\n    exit 47\n  fi\ndone\nexec /usr/bin/git "$@"\n`, { mode: 0o755 });
   const oldPath = process.env.PATH;
   process.env.PATH = `${shimDir}:${oldPath}`;
 
@@ -70,13 +71,19 @@ async function child(mode: Mode): Promise<void> {
     packedTip = packed?.tipOid;
     return packed;
   }) as typeof git.checkpointPack;
+  const warnings: { message: string; reason: unknown }[] = [];
+  const log = { ...nullLogger(), warn: (message: string, fields?: Record<string, unknown>) => {
+    warnings.push({ message, reason: fields?.reason });
+  } };
+  const batcher = new MessageBatcher(client, "run-1725", 0, 60_000, log, undefined, undefined, { generation: 1 });
+  if (mode === "success-refused") batcher.reserveCandidateTransport().cancel();
   const flight = {
     runId: "run-1725",
     lastCheckpointRefTip: "OLD_CONFIRMED",
     lastAttemptedCheckpointRefTip: undefined as string | undefined,
-    reportedPublishOutcomes: new Set<string>(),
-    runLog: nullLogger(),
-    batcher: { emit() {} },
+    reportedPublishOutcomes: new Set<string>(mode === "success-refused" ? ["error"] : []),
+    runLog: log,
+    batcher,
   };
   try {
     const outcome = await (runner as unknown as {
@@ -86,8 +93,10 @@ async function child(mode: Mode): Promise<void> {
     fs.writeFileSync(release, "go");
     const exit = await producerExit;
     process.stdout.write(JSON.stringify({ outcome, confirmed: flight.lastCheckpointRefTip,
-      attempted: flight.lastAttemptedCheckpointRefTip, packedTip, exit }) + "\n");
+      attempted: flight.lastAttemptedCheckpointRefTip, packedTip, exit, warnings,
+      seq: batcher.currentSeq(), outcomes: [...flight.reportedPublishOutcomes] }) + "\n");
   } finally {
+    await batcher.close();
     process.env.PATH = oldPath;
     server.closeAllConnections();
     server.close();
@@ -99,11 +108,11 @@ async function child(mode: Mode): Promise<void> {
 if (process.env.UZI_1725_CHILD === "1") {
   await child(process.env.UZI_1725_MODE as Mode);
 } else {
-  for (const mode of ["early", "abort", "success"] as const) it(`${mode} checkpoint publication settles the producer`, () => {
+  for (const mode of ["early", "abort", "success", "success-refused"] as const) it(`${mode} checkpoint publication settles the producer`, () => {
     const script = fileURLToPath(import.meta.url);
     // The child's own TMPDIR, owned and removed here (issue #2020): a timeout kill skips the
     // child's `finally`, which would otherwise leak its fixture and git shim dir.
-    const childTmp = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1725-"));
+    const childTmp = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "uzi-1725-"));
     let result: SpawnSyncReturns<string>;
     try {
       result = spawnSync(process.execPath, ["--import", "tsx", script], {
@@ -121,11 +130,17 @@ if (process.env.UZI_1725_CHILD === "1") {
     const observed = JSON.parse(result.stdout.trim());
     assert.match(observed.packedTip, /^[0-9a-f]{40}$/);
     assert.equal(typeof observed.exit, "number");
-    if (mode === "success") {
+    if (mode === "success" || mode === "success-refused") {
       assert.equal(observed.exit, 0);
       assert.deepEqual(observed.outcome, { published: true });
       assert.equal(observed.confirmed, observed.packedTip);
       assert.equal(observed.attempted, undefined);
+      if (mode === "success-refused") {
+        assert.equal(observed.seq, 0, "refused recovery diagnostic assigns no sequence");
+        assert.deepEqual(observed.outcomes, []);
+        assert.ok(observed.warnings.some((w: { message: string; reason: string }) =>
+          w.message === "worker diagnostic refused by failed candidate reservation" && w.reason === "cancelled"));
+      }
     } else {
       assert.notEqual(observed.exit, 0, JSON.stringify(observed));
       assert.equal(observed.confirmed, "OLD_CONFIRMED", JSON.stringify(observed));

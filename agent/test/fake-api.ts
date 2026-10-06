@@ -234,6 +234,9 @@ export class FakeApi {
   /** Focused lead-side cross-check transport seam; absent keeps existing fake routes unchanged. */
   crossCheckHandler?: (request: { runId: string; method: string; body: Record<string, unknown> }) =>
     Promise<{ status: number; body: unknown; drop?: boolean }> | { status: number; body: unknown; drop?: boolean };
+  /** Hold a pending status response until the owning client's HTTP request aborts. */
+  holdCrossCheckStatusUntilAbort?: (runId: string) => boolean;
+  abortedHeldCrossCheckStatuses = 0;
   readonly crossCheckRequests: { runId: string; method: string; body: Record<string, unknown> }[] = [];
   readonly crossCheckReplies: { runId: string; method: string; status: number; acceptedCandidate: boolean; dropped: boolean }[] = [];
   usageHandler?: () => { status: number; body: unknown };
@@ -1196,6 +1199,11 @@ export class FakeApi {
       };
       if (request.method === "POST" && this.checkedFencedRuns.has(request.runId))
         return reply(409, { reason: "cross_check_refused" });
+      if (request.method === "GET" && this.holdCrossCheckStatusUntilAbort?.(request.runId)) {
+        await new Promise<void>((resolve) => res.once("close", resolve));
+        this.abortedHeldCrossCheckStatuses++;
+        return;
+      }
       const answer = await this.crossCheckHandler(request);
       // A request held across the applied forced gate is fenced under that same row lock.
       if (request.method === "POST" && this.checkedFencedRuns.has(request.runId))

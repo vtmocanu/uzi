@@ -4,6 +4,13 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { Outbox } from "../src/outbox.js";
+import { Worker } from "../src/worker.js";
+import type { Logger } from "../src/log.js";
+import { skillsPluginDir } from "../src/skills-plugin.js";
+import type { Config } from "../src/config.js";
+import type { ChatRunner } from "../src/chat-runner.js";
+import type { JudgeRunner } from "../src/judge-runner.js";
+import type { ReviewRunner } from "../src/review-runner.js";
 import { RecoveryCoordinator, type RecoveryArchiveClient } from "../src/recovery.js";
 import type { OutgoingMessage } from "../src/protocol.js";
 import { createHash } from "node:crypto";
@@ -15,7 +22,7 @@ import type { PlanCrossCheckCandidate, PlanCrossCheckStateRequest } from "../src
 import type { PlanVerdict } from "../src/steering.js";
 import { nullLogger } from "./helpers.js";
 import { api, client, git, homeDir, installHarness, runner, runnerWith, fakeGitlab,
-  planWithMilestonesThenDoneQuery } from "./runner-harness.js";
+  assistant, resultOk, planWithMilestonesThenDoneQuery } from "./runner-harness.js";
 import { freshClaim, gates, holdGateAck, newApi, row, send, routed, statuses, until } from "./gate-revision-harness.js";
 
 installHarness();
@@ -28,6 +35,14 @@ const PLAN = "# PLAN\n- local proposal";
 const NORMALIZED = "# PLAN\n- server normalized proposal";
 const digest = "a".repeat(64);
 const child = "11111111-1111-4111-8111-111111111111";
+function diagnosticLogger() {
+  const warnings: { message: string; fields?: Record<string, unknown> }[] = [];
+  const log: Logger = { ...nullLogger(),
+    warn: (message, fields) => { warnings.push({ message, fields }); },
+    child: () => log,
+  };
+  return { log, warnings };
+}
 const timing = { preparationMs: 100, backoffMs: [1, 2] as const, requestMs: 100, pollMs: 5 };
 
 function claim() { return freshClaim(1, { kind: "issue", auto_approve: true, plan_cross_check_required: true }); }
@@ -261,6 +276,353 @@ describe("U2 real runner checked gate", () => {
       api.holdMessagesUntilAbort = undefined;
       MessageBatcher.prototype.reserveCandidateTransport = reserve;
       client.postMessages = post;
+    }
+  });
+
+  it("pending checker expires at its fixed local deadline despite transient status failures", async () => {
+    const c = claim();
+    let stored!: ReturnType<typeof answer>;
+    api.crossCheckHandler = ({ runId, method, body }) => {
+      if (method === "GET") return { status: 503, body: { error: "temporary status failure" } };
+      stored = answer(runId, body, "pending", "", { deadline_at: new Date(Date.now() + 500).toISOString() });
+      return { status: 200, body: stored };
+    };
+    let rejection = 0;
+    api.onState(c.run_id, (b) => {
+      if (b.status === "awaiting_approval") {
+        assert.ok(Date.now() >= Date.parse(stored.deadline_at), "fallback uses locally stored deadline");
+        rejection = send(c.run_id, row("reject_plan", "reject expired checker"))[0]!.id;
+      }
+    });
+    const { exec, verdicts } = checkedExec();
+    const done = start(exec, c);
+    try {
+      await done;
+      assert.deepEqual(verdicts.map((v) => v.kind), ["reject"]);
+      assert.ok(api.isApplied(c.run_id, rejection));
+      assert.equal(api.crossCheckRequests.filter((r) => r.method === "POST").length, 1);
+      assert.ok(api.crossCheckRequests.filter((r) => r.method === "GET").length > 1);
+      assert.ok(api.crossCheckReplies.filter((r) => r.method === "GET").every((r) => r.status === 503));
+      assert.equal(stored.verdict, "pending", "server never supplied a timed_out verdict");
+      assert.equal((gates(c.run_id)[0] as PlanCrossCheckStateRequest).plan_cross_check_gate_reason, "timed_out");
+      assert.equal(gates(c.run_id).length, 1);
+      assert.equal(api.crossCheckReplies.filter((r) => r.acceptedCandidate).length, 1);
+      terminal(c.run_id, "reject expired checker");
+    } finally { done.shutdown(); await done; }
+  });
+
+  for (const control of ["cancel", "shutdown"] as const) {
+    it(`owner ${control} aborts a held pending checker status socket before runner settlement`, async () => {
+      const c = claim();
+      let stored!: ReturnType<typeof answer>;
+      api.crossCheckHandler = ({ runId, body, method }) => {
+        assert.equal(method, "POST", "held GET must not fabricate a status answer");
+        stored = answer(runId, body, "pending", "");
+        return { status: 200, body: stored };
+      };
+      let entered = false;
+      let settled = false;
+      const status = client.planCrossCheckStatus;
+      client.planCrossCheckStatus = async (...args) => {
+        try { return await status.apply(client, args); } finally { settled = true; }
+      };
+      api.holdCrossCheckStatusUntilAbort = (id) => {
+        if (id !== c.run_id) return false;
+        entered = true;
+        return true;
+      };
+      const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "checked-held-stop-"));
+      const { log, warnings } = diagnosticLogger();
+      const recovery = new RecoveryCoordinator({ client: {
+        reserveRecoveryCapture: async () => { throw new Error("held stop must not capture"); },
+        getRecoveryCaptureStatus: async () => { throw new Error("held stop must not query capture"); },
+        uploadRecoveryBundle: async () => { throw new Error("held stop must not upload"); },
+        listRecoveryHolds: async (id) => ({ run_id: id, holds: [] }),
+        releaseRecoveryCustody: async (id) => ({ run_id: id, released: true, holds_released: 1 }),
+      } as RecoveryArchiveClient, git, log, recoveryRoot: path.join(root, "recovery"),
+      workerToken: "held-stop-fixture" });
+      const pin = recovery.pin.bind(recovery);
+      let pins = 0;
+      recovery.pin = async (input) => { pins++; return pin(input); };
+      let clone = "";
+      const session = path.join(root, "session");
+      const { exec, verdicts } = checkedExec(async (ctx) => {
+        clone = ctx.worktreePath;
+        fs.mkdirSync(session);
+        fs.writeFileSync(path.join(session, "transcript"), "resume");
+        fs.mkdirSync(skillsPluginDir(clone), { recursive: true });
+        fs.writeFileSync(path.join(skillsPluginDir(clone), "marker"), "resume");
+      });
+      const close = MessageBatcher.prototype.close;
+      let closes = 0;
+      MessageBatcher.prototype.close = async function () { closes++; return close.call(this); };
+      const forge = fakeGitlab();
+      const run = runnerWith(() => ({ executor: exec, homeDir: session }), forge.gitlab, undefined, log, {
+        recovery, planCrossCheckTiming: { ...timing, requestMs: 1000 }, planApprovalTimeoutMs: 4000,
+      });
+      let executionError: unknown;
+      const done = run.execute(c).catch((error: unknown) => { executionError = error; });
+      try {
+        assert.ok(await until(() => entered));
+        assert.equal(settled, false);
+        if (control === "cancel") {
+          const id = send(c.run_id, row("cancel"))[0]!.id;
+          await routed(c.run_id, id);
+        } else run.shutdown();
+        await done;
+        assert.ok(settled, "owned client request settles before runner returns");
+        assert.ok(await until(() => api.abortedHeldCrossCheckStatuses === 1), "server observes socket cancellation");
+        assert.equal(api.crossCheckRequests.length, 2, "one candidate and one held status request");
+        assert.deepEqual(api.crossCheckRequests.map((r) => r.method), ["POST", "GET"]);
+        assert.equal(verdicts.length, 0);
+        assert.equal(gates(c.run_id).length, 0);
+        assert.equal(api.crossCheckReplies.length, 1, "no manufactured status reply");
+        assert.equal(executionError, undefined, "lifecycle settlement must not throw from a cancelled reservation");
+        assert.equal(closes, 1, "existing lifecycle closes the batcher exactly once");
+        const refusals = warnings.filter((w) => w.message === "worker diagnostic refused by failed candidate reservation");
+        assert.ok(refusals.length > 0, "operator sees diagnostic refusal");
+        assert.ok(refusals.every((w) => w.fields?.reason === "cancelled"));
+        if (control === "cancel") {
+          assert.equal(statuses(c.run_id).filter((s) => s === "failed").length, 1, "cancel keeps the generic terminal");
+          assert.ok(!fs.existsSync(session), "cancel cleans up session");
+        } else {
+          assert.ok(!statuses(c.run_id).includes("failed"), "shutdown leaves the run for the sweeper");
+          assert.ok(pins >= 2, "shutdown reaches the existing durable generation pin after the initial pin");
+          assert.equal(fs.readFileSync(path.join(session, "transcript"), "utf8"), "resume");
+          assert.equal(fs.readFileSync(path.join(skillsPluginDir(clone), "marker"), "utf8"), "resume");
+        }
+        assert.ok(!fs.existsSync(clone), "normal close removes the runner clone");
+        assert.ok(!statuses(c.run_id).includes("recovery_wait"));
+        assert.ok(!statuses(c.run_id).includes("completed"));
+        assert.ok(!api.states.some((s) => s.runId === c.run_id && s.body.status === "running" && s.body.plan_md));
+      } finally {
+        run.shutdown();
+        try { await done; } finally {
+          api.holdCrossCheckStatusUntilAbort = undefined;
+          client.planCrossCheckStatus = status;
+          MessageBatcher.prototype.close = close;
+          fs.rmSync(root, { recursive: true, force: true });
+        }
+      }
+    });
+  }
+
+  it("healthy worker error diagnostic remains deliverable through ordinary terminal reporting", async () => {
+    const c = claim();
+    await start({ run: async () => { throw new Error("ordinary diagnostic"); } }, c);
+    terminal(c.run_id, "ordinary diagnostic");
+    assert.ok(api.messages(c.run_id).some((m) => m.kind === "error" && m.agent === "worker" &&
+      (m.payload as { text?: string }).text === "ordinary diagnostic"));
+  });
+
+  for (const crossCheckFailure of [false, true]) {
+    it(`unrelated diagnostic emit exception propagates with identical refusal text (checked failure: ${crossCheckFailure})`, async () => {
+      const c = claim();
+      if (crossCheckFailure) api.usageHandler = () => ({ status: 400, body: { error: "usage refused" } });
+      const { exec } = checkedExec(async (ctx) => {
+        const leg = ctx.usage!.startLeg();
+        leg.observeAssistant({ message: { id: "unrelated-usage", model: "claude", usage: { input_tokens: 1 } } });
+        leg.close();
+      });
+      const emit = MessageBatcher.prototype.emit;
+      const unrelated = new Error("candidate transport reservation refused an event");
+      MessageBatcher.prototype.emit = function (message) {
+        if (message.kind === "error" && message.agent === "worker") throw unrelated;
+        return emit.call(this, message);
+      };
+      try {
+        await assert.rejects(start(crossCheckFailure ? exec : {
+          run: async () => { throw new Error("ordinary failure"); },
+        }, c), (error: unknown) => error === unrelated);
+        assert.ok(!statuses(c.run_id).includes("failed"), "unrelated exception is not silently consumed");
+      } finally { MessageBatcher.prototype.emit = emit; }
+    });
+  }
+
+  it("reservation acquisition failure terminates after one call without candidate or human publication", async () => {
+    const c = claim();
+    const reserve = MessageBatcher.prototype.reserveCandidateTransport;
+    let attempts = 0;
+    MessageBatcher.prototype.reserveCandidateTransport = function () {
+      attempts++;
+      throw new Error("fixture reservation acquisition failure");
+    };
+    const { exec, verdicts } = checkedExec();
+    try {
+      await start(exec, c);
+      assert.equal(attempts, 1, "no second reservation handle");
+      assert.equal(verdicts.length, 0);
+      assert.equal(api.crossCheckRequests.length, 0);
+      assert.equal(gates(c.run_id).length, 0);
+      terminal(c.run_id, "transport reservation unavailable");
+    } finally { MessageBatcher.prototype.reserveCandidateTransport = reserve; }
+  });
+
+  it("real disabled outbox is a permanent runner preparation failure before any candidate", async () => {
+    const c = claim();
+    const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "checked-disabled-"));
+    const blocked = path.join(root, "file");
+    fs.writeFileSync(blocked, "not a directory");
+    const outbox = new Outbox({ root: path.join(blocked, "outbox"), log: nullLogger(),
+      runMaxBytes: 1024, maxBytes: 4096, retentionMs: 86_400_000 });
+    await outbox.init();
+    assert.ok(outbox.isDisabled());
+    const { exec, verdicts } = checkedExec();
+    const forge = fakeGitlab();
+    const run = runner(exec, forge.gitlab, undefined, { outbox, planCrossCheckTiming: timing });
+    try {
+      await run.execute(c);
+      terminal(c.run_id, "transport permanently failed (outbox_unavailable)");
+      assert.equal(api.crossCheckRequests.length, 0);
+      assert.equal(gates(c.run_id).length, 0);
+      assert.equal(verdicts.length, 0);
+    } finally { run.shutdown(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("runner cannot borrow an ACK when a current-generation external outbox drain retires its tracked identity", async () => {
+    const c = claim();
+    c.last_seq = 1;
+    const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "checked-external-retire-"));
+    const outbox = new Outbox({ root: path.join(root, "outbox"), log: nullLogger(),
+      runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 86_400_000 });
+    await outbox.init();
+    await outbox.appendSegment(c.run_id, 1, [{ seq: 1, kind: "status", payload: { text: "externally delivered original" } }]);
+    const reserve = MessageBatcher.prototype.reserveCandidateTransport;
+    let reserves = 0;
+    let externalDrain: Promise<{ retired: boolean; staleRetired: number }> | undefined;
+    MessageBatcher.prototype.reserveCandidateTransport = function () {
+      reserves++;
+      const reservation = reserve.call(this);
+      // The real drainer queues first on the real outbox lock. It delivers at the same
+      // generation but outside the reservation's delivery callback.
+      externalDrain = outbox.drainRun(c.run_id, async (messages, generation) => {
+        assert.equal(generation, c.claim_generation);
+        await client.postMessages(c.run_id, messages, generation);
+      });
+      return reservation;
+    };
+    const { exec, verdicts } = checkedExec();
+    const forge = fakeGitlab();
+    const run = runner(exec, forge.gitlab, undefined, { outbox, planCrossCheckTiming: { ...timing, preparationMs: 1000 } });
+    try {
+      await run.execute(c);
+      assert.ok(externalDrain);
+      assert.deepEqual(await externalDrain, { retired: true, staleRetired: 0 });
+      assert.equal(reserves, 1);
+      assert.ok(!outbox.hasUndrainedMessages(c.run_id), "external delivery legitimately retired the actual record");
+      assert.equal(api.messages(c.run_id).filter((m) => (m.payload as { text?: string }).text === "externally delivered original").length, 1);
+      terminal(c.run_id, "preparation receipts irrecoverably lost");
+      assert.equal(api.crossCheckRequests.length, 0);
+      assert.equal(gates(c.run_id).length, 0);
+      assert.equal(verdicts.length, 0);
+    } finally {
+      run.shutdown();
+      try { await externalDrain; } finally {
+        MessageBatcher.prototype.reserveCandidateTransport = reserve;
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("actual held producers overflow the bounded reservation before candidate preparation", async () => {
+    const c = claim();
+    const reserve = MessageBatcher.prototype.reserveCandidateTransport;
+    let reserves = 0;
+    let produced = 0;
+    let refused = 0;
+    MessageBatcher.prototype.reserveCandidateTransport = function () {
+      reserves++;
+      const reservation = reserve.call(this);
+      // At most 64 events, each below the individual wire cap; stop on the first refusal.
+      const text = "held producer payload ".repeat(4000);
+      for (let i = 0; i < 64; i++) {
+        try { this.emit({ kind: "status", payload: { text, producer: i } }); produced++; }
+        catch { refused++; break; }
+      }
+      return reservation;
+    };
+    const { exec, verdicts } = checkedExec();
+    const { log, warnings } = diagnosticLogger();
+    const forge = fakeGitlab();
+    const run = runnerWith(() => ({ executor: exec }), forge.gitlab, undefined, log,
+      { planCrossCheckTiming: timing, planApprovalTimeoutMs: 4000 });
+    try {
+      await run.execute(c);
+      assert.equal(reserves, 1);
+      assert.ok(produced > 0 && produced < 64, "real buffer limit reached");
+      assert.equal(refused, 1);
+      assert.ok(warnings.some((w) => w.message === "worker diagnostic refused by failed candidate reservation" &&
+        w.fields?.reason === "overflow"), "operator sees the bounded overflow reason");
+      terminal(c.run_id, "transport permanently failed (overflow)");
+      assert.equal(api.crossCheckRequests.length, 0);
+      assert.equal(gates(c.run_id).length, 0);
+      assert.equal(verdicts.length, 0);
+    } finally { MessageBatcher.prototype.reserveCandidateTransport = reserve; }
+  });
+
+  it("public Worker heartbeats advance while its real checked runner holds the human state ACK", async () => {
+    const c = claim();
+    api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "revise", "revise") });
+    const held = holdGateAck(c.run_id, PLAN);
+    let rejectId = 0;
+    api.onState(c.run_id, (b) => {
+      if (b.status === "awaiting_approval") rejectId = send(c.run_id, row("reject_plan", "finish heartbeat proof"))[0]!.id;
+    });
+    const { exec, verdicts } = checkedExec();
+    const forge = fakeGitlab();
+    const run = runner(exec, forge.gitlab, undefined, { planCrossCheckTiming: timing, planApprovalTimeoutMs: 4000 });
+    const register = client.register;
+    const heartbeat = client.heartbeat;
+    const claimRun = client.claimRun;
+    const claimChat = client.claimChat;
+    let claimed = false;
+    let heartbeats = 0;
+    client.register = async () => ({});
+    client.heartbeat = async (...args) => {
+      const response = await heartbeat.apply(client, args);
+      heartbeats++;
+      return response;
+    };
+    client.claimRun = async () => {
+      if (claimed) return null;
+      claimed = true;
+      return c;
+    };
+    client.claimChat = async () => null;
+    const controller = new AbortController();
+    const config = { workerName: "checked-heartbeat", workerTemplate: "base",
+      pollIntervalMs: 5, heartbeatIntervalMs: 10, chatPollMs: 5, chatSessions: 1,
+      maxConcurrentRuns: 1, dockerWiring: {}, dataDir: homeDir } as Config;
+    const worker = new Worker(config, client, run,
+      { execute: async () => {} } as unknown as ChatRunner,
+      { execute: async () => {} } as unknown as JudgeRunner,
+      { execute: async () => {} } as unknown as ReviewRunner,
+      nullLogger(), () => ({ ok: true, missing: [] }));
+    const done = worker.run(controller.signal);
+    try {
+      assert.ok(await until(() => rejectId > 0));
+      await routed(c.run_id, rejectId);
+      const before = heartbeats;
+      assert.ok(await until(() => heartbeats >= before + 3, 2000),
+        "three successful public heartbeat ticks during the real held checked-state ACK");
+      assert.equal(verdicts.length, 0);
+      assert.ok(!api.isApplied(c.run_id, rejectId));
+      assert.equal(gates(c.run_id).length, 1);
+      assert.equal(api.crossCheckRequests.length, 1);
+      held.release();
+      assert.ok(await until(() => statuses(c.run_id).includes("failed")));
+      assert.ok(api.isApplied(c.run_id, rejectId));
+      terminal(c.run_id, "finish heartbeat proof");
+    } finally {
+      held.release();
+      run.shutdown();
+      controller.abort();
+      try { await done; } finally {
+        client.register = register;
+        client.heartbeat = heartbeat;
+        client.claimRun = claimRun;
+        client.claimChat = claimChat;
+      }
     }
   });
 
@@ -697,6 +1059,222 @@ describe("U2 real runner checked gate", () => {
         release();
         await done;
       }
+    });
+  }
+
+  for (const droppedRound of [0, 1]) {
+    for (const final of ["approve_plan", "reject_plan"] as const) {
+      it(`SDK dropped ${droppedRound === 0 ? "initial" : "revised"} ACK routes next revise before retry ACK then current ${final}`, async () => {
+        const c = claim();
+        const plans = [PLAN, "# PLAN SDK revision B", "# PLAN SDK revision C"].slice(0, droppedRound + 2);
+        const milestones = [
+          [{ id: "original", title: "original milestone must disappear" }],
+          droppedRound === 0 ? [] : [{ id: "middle", title: "middle milestone must disappear" }],
+          [],
+        ];
+        api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "revise", "revise") });
+        const matches = (b: { status: string; plan_md?: string }) =>
+          b.status === "awaiting_approval" && b.plan_md === plans[droppedRound];
+        api.afterPersistState(c.run_id, matches, "drop");
+        let releaseRetry!: () => void;
+        const retryAck = new Promise<void>((resolve) => { releaseRetry = resolve; });
+        let releaseFinal!: () => void;
+        const finalAck = new Promise<void>((resolve) => { releaseFinal = resolve; });
+        const report = client.reportPlanCrossCheckGateState;
+        const requests: PlanCrossCheckStateRequest[] = [];
+        const snapshots: string[] = [];
+        client.reportPlanCrossCheckGateState = async (id, fields, signal) => {
+          if (id === c.run_id && fields.status === "awaiting_approval") {
+            requests.push(fields);
+            snapshots.push(JSON.stringify(fields));
+          }
+          return report.call(client, id, fields, signal);
+        };
+        let attempts = 0;
+        let context!: RunContext;
+        const reviseIds: number[] = [];
+        let finalId = 0;
+        api.onState(c.run_id, (b) => {
+          if (b.status !== "awaiting_approval") return;
+          if (matches(b)) {
+            if (++attempts === 1) context.emit({ kind: "status", payload: { text: "SDK held delivery" } });
+            if (attempts === 2) {
+              api.afterPersistState(c.run_id, matches, retryAck);
+              reviseIds.push(send(c.run_id, row("revise_plan", "change the current SDK plan"))[0]!.id);
+            }
+          } else if (b.plan_md === plans.at(-1)) {
+            api.afterPersistState(c.run_id, (next) => next.status === "awaiting_approval" && next.plan_md === plans.at(-1), finalAck);
+            finalId = send(c.run_id, row(final, "current SDK decision"))[0]!.id;
+          } else {
+            reviseIds.push(send(c.run_id, row("revise_plan", "first SDK revision"))[0]!.id);
+          }
+        });
+        const prompts: string[] = [];
+        const resumedSessions: Array<string | undefined> = [];
+        let turns = 0;
+        const queryFn: SdkQueryFn = (params) => {
+          const turn = turns++;
+          resumedSessions.push(params.options.resume);
+          assert.ok(turn <= plans.length, "bounded scripted SDK turns");
+          if (turn === plans.length) {
+            assert.equal(final, "approve_plan", "reject must never implement");
+            assert.ok(api.isApplied(c.run_id, finalId), "implementation needs current approval receipt");
+          }
+          return (async function* () {
+            let prompt = "";
+            for await (const frame of params.prompt) prompt += JSON.stringify(frame);
+            prompts[turn] = prompt;
+            yield assistant(turn < plans.length ? [{
+              type: "tool_use", id: `sdk-plan-${turn}`, name: "mcp__uzi__submit_plan",
+              input: { plan_md: plans[turn], milestones: milestones[turn] },
+            }] : [{ type: "tool_use", id: "sdk-done", name: "mcp__uzi__signal_done", input: {} }]);
+            yield resultOk();
+          })();
+        };
+        let rejected: unknown;
+        const sdk = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+        const exec: Executor = { run: async (ctx) => {
+          context = ctx;
+          try { return await sdk.run(ctx); } catch (error) { rejected = error; throw error; }
+        } };
+        const forge = fakeGitlab();
+        const run = runner(exec, forge.gitlab, undefined, {
+          planCrossCheckTiming: { ...timing, requestMs: 1000 }, planApprovalTimeoutMs: 8000,
+        });
+        const done = run.execute(c);
+        try {
+          assert.ok(await until(() => reviseIds.length === droppedRound + 1), JSON.stringify({ states: api.states, turns, rejected: String(rejected) }));
+          const pendingRevise = reviseIds.at(-1)!;
+          await routed(c.run_id, pendingRevise);
+          assert.equal(attempts, 2);
+          assert.equal(turns, droppedRound + 1, "held retry cannot start another SDK revision or implementation");
+          assert.ok(!api.isApplied(c.run_id, pendingRevise));
+          if (droppedRound === 1)
+            assert.ok(!api.isApplied(c.run_id, reviseIds[0]!), "first revise waits for revised applied ACK");
+          const retryIndex = droppedRound;
+          assert.deepEqual(gates(c.run_id)[retryIndex + 1], gates(c.run_id)[retryIndex], "transport retry keeps full request identity");
+          assert.equal(JSON.stringify(gates(c.run_id)[retryIndex + 1]), snapshots[retryIndex], "identical full JSON, id, generation and session");
+          assert.equal(requests[retryIndex]!.claim_generation, c.claim_generation);
+          assert.equal(requests[retryIndex]!.session_id, "sess-e2e");
+          if (droppedRound === 0)
+            assert.ok(!api.messages(c.run_id).some((m) => (m.payload as { text?: string }).text === "SDK held delivery"));
+          releaseRetry();
+          assert.ok(await until(() => finalId > 0));
+          await routed(c.run_id, finalId);
+          assert.equal(turns, plans.length, "final ACK still blocks implementation");
+          assert.ok(!api.isApplied(c.run_id, pendingRevise), "last revise waits for final presentation ACK");
+          assert.ok(!api.isApplied(c.run_id, finalId));
+          if (droppedRound === 1) assert.ok(api.isApplied(c.run_id, reviseIds[0]!));
+          releaseFinal();
+          await done;
+          assert.equal(turns, plans.length + (final === "approve_plan" ? 1 : 0));
+          assert.deepEqual(gates(c.run_id).map((g) => g.plan_md),
+            [...plans.slice(0, droppedRound + 1), plans[droppedRound], ...plans.slice(droppedRound + 1)]);
+          assert.deepEqual(requests.map((g) => JSON.stringify(g)), snapshots, "original strict request objects remain unchanged");
+          assert.equal(new Set(requests.map((g) => g.presentation_id)).size, plans.length,
+            "only normal human revisions allocate fresh presentation ids");
+          for (const id of [...reviseIds, finalId]) assert.ok(api.isApplied(c.run_id, id), `receipt ${id} settled`);
+          assert.equal(api.crossCheckRequests.length, 1);
+          const candidate = api.crossCheckRequests[0]!.body;
+          assert.equal(candidate.plan_md, PLAN, "historical checker candidate remains original");
+          assert.deepEqual(candidate.milestones, milestones[0]);
+          assert.equal(api.crossCheckReplies.filter((r) => r.acceptedCandidate).length, 1);
+          assert.equal(api.messages(c.run_id).filter((m) => (m.payload as { text?: string }).text === "SDK held delivery").length, 1);
+          assert.ok(!statuses(c.run_id).includes("recovery_wait"));
+          assert.deepEqual(gates(c.run_id).at(-1)!.milestones, []);
+          if (final === "approve_plan") {
+            assert.ok(statuses(c.run_id).includes("completed"));
+            assert.equal(resumedSessions.at(-1), "sess-e2e", "implementation resumes the session that submitted the current plan");
+            assert.ok(prompts.at(-1)!.includes("Your plan was approved"));
+            assert.ok(!prompts.at(-1)!.includes("original milestone must disappear"));
+            assert.ok(!prompts.at(-1)!.includes("middle milestone must disappear"));
+          } else {
+            assert.ok(rejected instanceof PlanRejectedError);
+            terminal(c.run_id, "current SDK decision");
+          }
+        } finally {
+          releaseRetry();
+          releaseFinal();
+          run.shutdown();
+          try { await done; } finally { client.reportPlanCrossCheckGateState = report; }
+        }
+      });
+    }
+  }
+
+  for (const switchBeforeRevision of [false, true]) {
+    it(`checked SDK retains absolute human deadline through held revision planning${switchBeforeRevision ? " and switch give-up" : ""}`, async () => {
+      const c = claim();
+      api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "revise", "revise") });
+      const budgetMs = 1000;
+      let firstPublishedAt = 0;
+      let revisedPublishedAt = 0;
+      let revisionEntered = false;
+      let releaseRevision!: () => void;
+      const revisionHold = new Promise<void>((resolve) => { releaseRevision = resolve; });
+      let reviseId = 0;
+      let switches = 0;
+      let turns = 0;
+      const revised = "# PLAN after original approval deadline";
+      api.onState(c.run_id, (b) => {
+        if (b.status === "awaiting_approval" && b.plan_md === PLAN && !firstPublishedAt) {
+          firstPublishedAt = Date.now();
+          if (switchBeforeRevision) api.requestCredentialSwitch(c.run_id, 1);
+          else reviseId = send(c.run_id, row("revise_plan", "slow revision"))[0]!.id;
+        }
+        if (b.status === "credential_switch_failed")
+          reviseId = send(c.run_id, row("revise_plan", "slow revision after give-up"))[0]!.id;
+        if (b.status === "awaiting_approval" && b.plan_md === revised) revisedPublishedAt = Date.now();
+      });
+      const queryFn: SdkQueryFn = (params) => {
+        const turn = turns++;
+        assert.ok(turn < 2, "expired approval cannot start implementation");
+        return (async function* () {
+          for await (const _frame of params.prompt) { /* Drain each SDK prompt once. */ }
+          if (turn === 1) { revisionEntered = true; await revisionHold; }
+          yield assistant([{ type: "tool_use", id: `deadline-plan-${turn}`, name: "mcp__uzi__submit_plan",
+            input: { plan_md: turn === 0 ? PLAN : revised, milestones: [] } }]);
+          yield resultOk();
+        })();
+      };
+      const sdk = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+      const exec: Executor = { run: async (ctx) => {
+        if (switchBeforeRevision) {
+          git.worktreeStatus = async () => ["M src/impl.ts"];
+          git.commitWipMarker = async () => false;
+          const attempt = ctx.attemptCredentialSwitch!;
+          ctx.attemptCredentialSwitch = async () => {
+            assert.equal(++switches, 1, "one real give-up");
+            const result = await attempt();
+            assert.equal(result, "gave_up");
+            return result;
+          };
+        }
+        return sdk.run(ctx);
+      } };
+      const forge = fakeGitlab();
+      const run = runner(exec, forge.gitlab, undefined, { planCrossCheckTiming: timing,
+        planApprovalTimeoutMs: budgetMs, recoveryRetryMs: 1 });
+      const done = run.execute(c);
+      try {
+        assert.ok(await until(() => revisionEntered));
+        await routed(c.run_id, reviseId);
+        assert.ok(!api.isApplied(c.run_id, reviseId), "revision receipt waits for new presentation");
+        // The original gate anchors this wait; no per-poll or per-revision deadline mutation.
+        await new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, firstPublishedAt + budgetMs + 100 - Date.now())));
+        assert.equal(gates(c.run_id).length, 1);
+        releaseRevision();
+        assert.ok(await until(() => revisedPublishedAt > 0));
+        assert.ok(await until(() => statuses(c.run_id).includes("failed"), 700),
+          "revised human waiter must expire immediately, not grant another 1000ms");
+        await done;
+        terminal(c.run_id, "plan approval timed out");
+        assert.equal(turns, 2);
+        assert.equal(switches, switchBeforeRevision ? 1 : 0);
+        assert.equal(gates(c.run_id).length, 2, "only normal revision publishes a fresh gate");
+        assert.equal(api.crossCheckRequests.length, 1);
+        assert.ok(api.isApplied(c.run_id, reviseId));
+      } finally { releaseRevision(); run.shutdown(); await done; }
     });
   }
 

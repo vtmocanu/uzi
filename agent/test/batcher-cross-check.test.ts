@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { MessageBatcher, replaySegment } from "../src/batcher.js";
+import { CandidateReservationRefusedError, MessageBatcher, replaySegment } from "../src/batcher.js";
 import { Outbox, StaleClaimError, type RawWriteSeam } from "../src/outbox.js";
 import { RequestError, type PlanCrossCheckResponse, type WorkerClient } from "../src/client.js";
 import type { OutgoingMessage } from "../src/protocol.js";
@@ -1156,6 +1156,30 @@ it("irreversible usage loss is detected at preparation without retrying its miss
   assert.equal(b.currentSeq(), 1);
   assert.equal(b.bufferedCount(), 1);
   await b.close();
+});
+
+it("already-failed reservations refuse with a typed bounded reason without advancing sequence", async () => {
+  for (const reason of ["cancelled", "overflow"] as const) {
+    const { b, sent } = fixture(undefined, undefined, 180);
+    b.emit(event("assigned"));
+    const r = b.reserveCandidateTransport();
+    if (reason === "cancelled") r.cancel();
+    else assert.throws(() => b.emit(event("x".repeat(200))), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.ok(!(error instanceof CandidateReservationRefusedError), "first overflow must propagate as an ordinary error");
+      return true;
+    });
+    assert.throws(() => b.emit(event("diagnostic")), (error: unknown) => {
+      assert.ok(error instanceof CandidateReservationRefusedError);
+      assert.equal(error.reason, reason);
+      return true;
+    });
+    assert.equal(b.currentSeq(), 1);
+    assert.equal(b.bufferedCount(), 1);
+    assert.equal((await r.prepare()).reason, reason);
+    await b.close();
+    assert.equal(sent.length, 0);
+  }
 });
 
 it("overflow and cancellation are permanent and cannot resurrect through rearm or preparation", async () => {

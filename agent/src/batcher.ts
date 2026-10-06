@@ -292,6 +292,14 @@ export interface CandidateTransportPreparation {
   reason?: "retryable" | "usage_unconfirmed" | "cancelled" | "overflow" | "outbox_unavailable" | "ownership_unknown";
   permanent?: boolean;
 }
+/** An event refused by a reservation that had already permanently failed. */
+export class CandidateReservationRefusedError extends Error {
+  constructor(readonly reason: CandidateTransportPreparation["reason"]) {
+    super("candidate transport reservation refused an event");
+    this.name = "CandidateReservationRefusedError";
+  }
+}
+
 export interface CandidateTransportReservation {
   prepare(deadlineMs?: number, signal?: AbortSignal): Promise<CandidateTransportPreparation>;
   /** Latch synchronously before the first submit POST, including an ambiguous failure. */
@@ -469,8 +477,9 @@ export class MessageBatcher {
       const r = this.reservation;
       // Reserve space for the eventual signed32-bit sequence without assigning it.
       const bytes = item.bytes + 10;
-      if (r.state === "failed" || r.bytes + bytes > this.spillBufferBytes) {
-        if (r.state !== "failed") r.failureReason = "overflow";
+      if (r.state === "failed") throw new CandidateReservationRefusedError(r.failureReason);
+      if (r.bytes + bytes > this.spillBufferBytes) {
+        r.failureReason = "overflow";
         r.state = "failed";
         r.abort.abort();
         throw new Error("candidate transport reservation refused an event");

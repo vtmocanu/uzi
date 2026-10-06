@@ -100,7 +100,7 @@ import {
   type RepoAgentFolder,
   type RepoAgentHarness,
 } from "./repoagents.js";
-import { MessageBatcher } from "./batcher.js";
+import { CandidateReservationRefusedError, MessageBatcher } from "./batcher.js";
 import type { Outbox } from "./outbox.js";
 import {
   installTerminalWriteAhead,
@@ -3061,29 +3061,26 @@ export class RunRunner {
                   : raced;
           runLog.info("shutdown checkpoint outcome", { run_id: runId, outcome });
           // issue #1030 M4: surface the outcome on the feed the same way the park path does — a
-          // direct batcher.emit, NOT deduped (it fires once per shutdown; only the generic
-          // publish-failure lines go through the reportPublishOutcome dedupe). This lands
-          // because it is emitted BEFORE the single batcher.close() below — the shutdown
+          // worker diagnostic, NOT deduped (it fires once per shutdown; only the generic
+          // publish-failure lines go through the reportPublishOutcome dedupe). Delivery is
+          // attempted BEFORE the single batcher.close() below — the shutdown
           // branch closes the batcher exactly once, further down, never here.
-          batcher.emit({
-            kind: "status",
-            agent: "worker",
-            payload: {
-              // issue #1597 M1: the class only — no error message, remote text or credential. The
-              // tail names the likely restart point. A checkpoint this run (or its claim) knows
-              // landed is only adopted by a resume while it is still adoptable (runnerCloneForBranch
-              // sets it aside when e.g. origin/<branch> exists and it does not descend it), so that
-              // case is hedged; with no known checkpoint the default branch is named, as before.
-              text:
-                outcome === "published"
-                  ? "shutdown checkpoint published to origin"
-                  : `shutdown checkpoint NOT published (reason: ${outcome}) — a resume on another worker will restart from ${
-                      flight.lastCheckpointRefTip
-                        ? "the last published checkpoint if it is still adoptable, else the branch or default branch"
-                        : "the default branch"
-                    }`,
-            },
-          });
+          this.emitWorkerDiagnostic(
+            flight,
+            "status",
+            // issue #1597 M1: the class only — no error message, remote text or credential. The
+            // tail names the likely restart point. A checkpoint this run (or its claim) knows
+            // landed is only adopted by a resume while it is still adoptable (runnerCloneForBranch
+            // sets it aside when e.g. origin/<branch> exists and it does not descend it), so that
+            // case is hedged; with no known checkpoint the default branch is named, as before.
+            outcome === "published"
+              ? "shutdown checkpoint published to origin"
+              : `shutdown checkpoint NOT published (reason: ${outcome}) — a resume on another worker will restart from ${
+                  flight.lastCheckpointRefTip
+                    ? "the last published checkpoint if it is still adoptable, else the branch or default branch"
+                    : "the default branch"
+                }`,
+          );
           // PRD #1349 M2 (D4.6): record this generation's restore point in the durable journal
           // so an interrupted run's exact hold can be dispositioned later. A shutdown is bounded
           // by the k8s termination grace (the durability publish above is already raced against
@@ -4034,13 +4031,7 @@ export class RunRunner {
       await this.reapThenSettleRecoveryGeneration(claim, flight, runLog, "terminal");
       return;
     }
-    if (err instanceof PlanCrossCheckFailure) {
-      // One best-effort escalation; a failed reservation must not block terminal reporting.
-      try { batcher.emit({ kind: "error", agent: "worker", payload: { text: reason } }); }
-      catch { /* Continue through the existing terminal report and custody settlement. */ }
-    } else {
-      batcher.emit({ kind: "error", agent: "worker", payload: { text: reason } });
-    }
+    this.emitWorkerDiagnostic(flight, "error", reason);
     await batcher.close().catch(() => undefined);
     // PRD #1349 M2 (D4.5) / #1531: REAP THIS generation's provider FIRST, BEFORE the `failed`
     // report. A steering-cancel and an early agent failure both land here (a cancel aborts the
@@ -11411,11 +11402,7 @@ export class RunRunner {
         if (flight.reportedPublishOutcomes.size > 0) {
           flight.reportedPublishOutcomes.clear();
           flight.runLog.info("checkpoint publishing recovered", { run_id: flight.runId });
-          flight.batcher.emit({
-            kind: "status",
-            agent: "worker",
-            payload: { text: "checkpoint publishing recovered — published to origin" },
-          });
+          this.emitWorkerDiagnostic(flight, "status", "checkpoint publishing recovered — published to origin");
         }
         return { published: true };
       }
@@ -11493,7 +11480,21 @@ export class RunRunner {
     flight.runLog.warn(text, { run_id: flight.runId, ...logFields });
     if (flight.reportedPublishOutcomes.has(key)) return;
     flight.reportedPublishOutcomes.add(key);
-    flight.batcher.emit({ kind: "status", agent: "worker", payload: { text } });
+    this.emitWorkerDiagnostic(flight, "status", text);
+  }
+
+  /** Diagnostic refusal cannot prevent the caller's existing lifecycle settlement. */
+  private emitWorkerDiagnostic(flight: RunFlight, kind: "status" | "error", text: string): void {
+    try {
+      flight.batcher.emit({ kind, agent: "worker", payload: { text } });
+    } catch (error) {
+      if (!(error instanceof CandidateReservationRefusedError)) throw error;
+      flight.runLog.warn("worker diagnostic refused by failed candidate reservation", {
+        run_id: flight.runId,
+        kind,
+        reason: error.reason,
+      });
+    }
   }
 
   /**
