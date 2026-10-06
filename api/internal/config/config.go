@@ -1047,6 +1047,11 @@ func Load() (Config, error) {
 
 	cfg.RunTimeout = parseDuration("RUN_TIMEOUT", 2*time.Hour)
 	cfg.PlanCrossCheckTimeout = 30 * time.Minute
+	if cfg.RunTimeout > 0 && cfg.PlanCrossCheckTimeout >= cfg.RunTimeout {
+		// An install with a short RUN_TIMEOUT and no explicit checker timeout must
+		// still boot after upgrade; an explicit value is validated strictly below.
+		cfg.PlanCrossCheckTimeout = cfg.RunTimeout / 2
+	}
 	if raw, present := os.LookupEnv("PLAN_CROSS_CHECK_TIMEOUT"); present {
 		value, err := time.ParseDuration(raw)
 		if err != nil {

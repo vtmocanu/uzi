@@ -124,14 +124,14 @@ Acceptance examples:
 | Concurrent cross-checks per lead and stage | 1 | partial unique index |
 | Candidate plan_md / milestones | 256 KiB / 64 items; over cap parks, never retries | submit route (`DecodeJSONStrict`) |
 | Planning diff | 512 KiB read, 200 untracked files, no binaries, gitleaks-clean | lead capture; submit route re-checks size |
-| Wait for a verdict | `PLAN_CROSS_CHECK_TIMEOUT`, default 30 min, max 2 h, stored as `deadline_at` | submit, verdict route, lead poll |
+| Wait for a verdict | `PLAN_CROSS_CHECK_TIMEOUT`, default 30 min (half of `RUN_TIMEOUT` when that is 30 min or less), max 2 h, stored as `deadline_at` | submit, verdict route, lead poll |
 | Lead poll rate | every 15 s | lead |
 | Cross-checker model turn | `CROSS_CHECK_MODEL_TIMEOUT`, default 15 min (the text-only `REVIEW_MODEL_TIMEOUT_MS` is 5 min; a tool-using check needs more) | `CrossCheckRunner` |
 | Cross-checker tool calls | 200 per check | broker grant |
 | Findings | 20 items, 2 KiB each, 32 KiB total, summary 4 KiB | verdict route |
 | Worker slots | normal run-lane caps, no exception (PRD #2169 adds a dedicated lane) | existing claim path |
 
-Boot validation refuses malformed or out-of-range knobs, and `PLAN_CROSS_CHECK_TIMEOUT` must be below `RUN_TIMEOUT`.
+Boot validation refuses malformed or out-of-range knobs, and `PLAN_CROSS_CHECK_TIMEOUT` must be below `RUN_TIMEOUT`; an unset value derives a valid default so a short-`RUN_TIMEOUT` install still boots.
 
 ## Testing decisions
 
