@@ -61,6 +61,16 @@ describe("draft capture status card", () => {
     }
   });
 
+  it("strips entity-encoded bidi from the draft Markdown heading and link title", () => {
+    const r = render(<RunEventRow msg={capture({
+      plan_md: '# Report &#x202e;denied&#x202c;\n\n[details](https://example.com "review &#8238;denied&#8236;")',
+    })} live={false} />);
+    const card = r.getByTestId("draft-plan-capture");
+    expect(r.getByRole("heading", { name: "Report denied" })).toBeTruthy();
+    expect(card.querySelector("a")?.getAttribute("title")).toBe("review denied");
+    expect(card.textContent).not.toMatch(/[\p{Cf}]/u);
+  });
+
   it("does not treat a subagent capture as the lead's draft", () => {
     const r = render(<RunEventRow msg={{ ...capture(), agent: "coder", agent_instance: "child" }} live={false} />);
     expect(r.queryByTestId("draft-plan-capture")).toBeNull();

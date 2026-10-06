@@ -18,9 +18,11 @@ import { MarkdownCore } from "./MarkdownCore";
 // zero-width family) via stripUnsafeChars before handing content to MarkdownCore,
 // so EVERY untrusted <Markdown> sink — current and future, notably plan_md at the
 // plan-approval gate — is covered by construction rather than by each call site
-// remembering to wrap. The strip runs BEFORE the markdown parse (deliberately: it
+// remembering to wrap. The first strip runs BEFORE the markdown parse (deliberately: it
 // also covers fenced code, where a Trojan-Source payload would sit) and never
-// removes a character that carries markdown meaning. stripUnsafeChars is
+// removes a character that carries markdown meaning. The postparse policy below
+// also scrubs decoded entities in HAST text and every string property before
+// rendering, including array entries such as className. stripUnsafeChars is
 // idempotent, so call sites that keep their own stripUnsafeChars wrap (e.g. the
 // non-Markdown escaped-JSX sinks that share a value with a Markdown one) stay
 // correct — the second pass is a no-op. This lives in Markdown.tsx and NOT in
@@ -56,15 +58,46 @@ function shellLang(className: unknown): string | undefined {
   return undefined;
 }
 
-// A minimal structural view of the hast node react-markdown hands each override
-// (avoids importing @types/hast just to read one className off the `pre`'s child
-// `code`). Only the fields we touch are declared.
+// A minimal structural view of parsed HAST and the nodes handed to overrides.
+// Only the fields used by the untrusted policy and shell-fence detection are declared.
 type HastNode = {
   type?: string;
   tagName?: string;
-  properties?: { className?: unknown };
+  value?: string;
+  properties?: Record<string, unknown>;
   children?: HastNode[];
 };
+
+// Scrub after entity decoding, before React receives text or element properties.
+// The stack visits each node once (no retries); work is bounded by tree size and
+// string lengths, without recursive calls depending on attacker-controlled depth.
+function rehypeStripUnsafeChars() {
+  return (tree: HastNode) => {
+    const pending = [tree];
+    while (pending.length > 0) {
+      const node = pending.pop()!;
+      if (node.type === "text" && typeof node.value === "string") {
+        node.value = stripUnsafeChars(node.value);
+      }
+      if (node.properties) {
+        for (const [key, value] of Object.entries(node.properties)) {
+          if (typeof value === "string") {
+            node.properties[key] = stripUnsafeChars(value);
+          } else if (Array.isArray(value)) {
+            node.properties[key] = value.map((entry) =>
+              typeof entry === "string" ? stripUnsafeChars(entry) : entry,
+            );
+          }
+        }
+      }
+      if (node.children) {
+        for (const child of node.children) pending.push(child);
+      }
+    }
+  };
+}
+
+const rehypePlugins = [rehypeStripUnsafeChars];
 
 // preShellLang answers "is this <pre> wrapping a shell fence?" so the wrapper can
 // be unwrapped (the CommandBlock the `code` override returns is a block-level
@@ -163,6 +196,7 @@ export const Markdown = memo(function Markdown({ content }: { content: string })
       content={stripUnsafeChars(content)}
       className="docs-prose"
       components={components}
+      rehypePlugins={rehypePlugins}
     />
   );
 });

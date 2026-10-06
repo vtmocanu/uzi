@@ -1,4 +1,4 @@
-import Markdown, { type Components } from "react-markdown";
+import Markdown, { type Components, type Options } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 // Policy-free markdown core shared by every renderer in the app. It fixes the
@@ -24,17 +24,19 @@ export function MarkdownCore({
   content,
   className,
   components,
+  rehypePlugins,
 }: {
   content: string;
   className?: string;
   components?: Components;
+  rehypePlugins?: Options["rehypePlugins"];
 }) {
   // Caller overrides win over the base (so a caller could replace the table
   // wrapper too), but callers only supply `a`/`img` in practice.
   const merged = components ? { ...baseComponents, ...components } : baseComponents;
   return (
     <div className={className}>
-      <Markdown remarkPlugins={[remarkGfm]} components={merged}>
+      <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={rehypePlugins} components={merged}>
         {content}
       </Markdown>
     </div>
