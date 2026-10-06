@@ -926,7 +926,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
 
   // Issue #134 (the production half of #127). Any git that writes into a repo spawns a
   // DETACHED `git maintenance run --auto --detach` that outlives the awaited process and keeps
-  // writing inside `.git`. removeRunnerClone() (runner.ts:454) `fs.rm`s the clone moments after
+  // writing inside `.git`. removeRunnerClone() removes the clone through pinned teardown moments after
   // the agent's last commit and our push, and `force: true` suppresses ENOENT, not ENOTEMPTY.
   // Pinning the CONFIG rather than trying to observe a race: the config is deterministic, the
   // race is not — and #127 spent two agents' effort failing to reproduce the race on demand.

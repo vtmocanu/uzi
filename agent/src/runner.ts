@@ -3558,7 +3558,7 @@ export class RunRunner {
             ownAttemptRetired = flight.runnerClone?.attemptId !== undefined;
           } else {
             // No bare/branch to key the journal on (a run that never journaled): fall
-            // back to the bare recursive remove.
+            // back to pinned runner-owned removal.
             await this.git.removeRunnerClone(flight.worktreePath, runId);
           }
         } catch (e) {

@@ -13,6 +13,7 @@ import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest, BoundaryStep } from "./harness.js";
 import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
+import { rmRunnerTeardownTree } from "./rmtree.js";
 import { withForgeRetry } from "./forge-retry.js";
 import {
   ATTEMPT_ID_RE,
@@ -4672,7 +4673,7 @@ export class GitCache {
     if (ownerRunId !== undefined && await this.hasPhysicalTerminalProtection(ownerRunId)) {
       throw new Error("terminal record custody retains runner clone");
     }
-    await fs.rm(clonePath, { recursive: true, force: true });
+    await rmRunnerTeardownTree(clonePath, { allowCloneName: true });
   }
 
   /**
