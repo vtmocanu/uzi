@@ -96,6 +96,7 @@ const CODEX_DYNAMIC_WIRE_NAMES: ReadonlyMap<string, string> = new Map([
   ["Bash", "uzi_bash"],
   ["apply_patch", "uzi_apply_patch"],
   ["Read", "uzi_read"],
+  ["Search", "uzi_search"],
   ["Skill", "uzi_skill"],
   ["mcp__forge__get_issue", "uzi_forge_get_issue"],
   ["mcp__forge__list_issues", "uzi_forge_list_issues"],
@@ -181,7 +182,7 @@ const FILEOP_FAILURE_CODES: ReadonlySet<string> = new Set([
 
 /** The capability the broker binds a callback to, decided from the tool NAME +
  *  grants — never from the arguments. */
-type Capability = "shell" | "file_write" | "file_read" | "signal" | "delegate" | "mcp" | "unknown";
+type Capability = "shell" | "file_write" | "file_read" | "file_search" | "signal" | "delegate" | "mcp" | "unknown";
 
 /** Canonical callback name shared by the renderer and the enforcing broker. */
 export function canonicalizeCodexToolName(name: string): string {
@@ -201,6 +202,7 @@ function capabilityOf(canonical: string): Capability {
   if (canonical === "Bash") return "shell";
   if (canonical === "apply_patch") return "file_write";
   if (canonical === "Read") return "file_read";
+  if (canonical === "Search") return "file_search";
   if (CODEX_SIGNAL_TOOLS.has(canonical)) return "signal";
   if (CODEX_DELEGATE_TOOLS.has(canonical)) return "delegate";
   if (canonical === "Skill" || canonical.startsWith("mcp__")) return "mcp";
@@ -675,6 +677,8 @@ export class CodexCallbackBroker {
         return this.dispatchFileWrite(args);
       case "file_read":
         return this.dispatchFileRead(args);
+      case "file_search":
+        return this.dispatchFileSearch(args);
       case "signal":
         return this.dispatchSignal(canonical, args, origin);
       case "delegate":
@@ -900,6 +904,78 @@ export class CodexCallbackBroker {
         truncated: res.truncated === true || end < bytes.length,
       },
     };
+  }
+
+  /** Search only through fileop list/stat/read. Every traversal and returned byte has
+   * a fixed ceiling; one failed file blocks the search rather than hiding an incomplete result. */
+  private async dispatchFileSearch(args: unknown): Promise<CallbackResult> {
+    const query = strField(args, "query");
+    if (!query || Buffer.byteLength(query) > 256) return deny("bad_args", "Search requires a query of at most 256 bytes");
+    const candidate = firstStrField(args, ["path", "file_path"]) ?? ".";
+    const screened = candidate === "." ? { rel: "." } : this.screenAndRelativize(candidate);
+    if ("ok" in screened) return screened;
+    const pending = [screened.rel];
+    const matches: { path: string; line: number; text: string }[] = [];
+    let directories = 0;
+    let entries = 0;
+    let bytes = 0;
+    let operations = 0;
+    const deadline = Date.now() + 10_000;
+    const searchOp = async (request: FileopRequest): Promise<FileopResponse> => {
+      if (++operations > 64 || Date.now() >= deadline) return { ok: false, code: "E_TIMEOUT" };
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          this.fileop.op(request),
+          new Promise<FileopResponse>((resolve) => {
+            timer = setTimeout(() => resolve({ ok: false, code: "E_TIMEOUT" }), Math.max(1, deadline - Date.now()));
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+    while (pending.length > 0) {
+      const dir = pending.shift()!;
+      if (++directories > 32) return deny("search_limit", "Search directory limit reached");
+      const listing = await searchOp({ op: "list", path: dir });
+      if (!listing.ok) return this.mapFileopError(listing);
+      if (listing.truncated || !listing.entries) return deny("search_limit", "Search listing incomplete");
+      entries += listing.entries.length;
+      if (entries > 256) return deny("search_limit", "Search entry limit reached");
+      for (const entry of listing.entries) {
+        if (entry.name === ".git" || !entry.name || entry.name === "." || entry.name === ".." || entry.name.includes("/")) continue;
+        const rel = dir === "." ? entry.name : path.posix.join(dir, entry.name);
+        const screenedEntry = this.screenAndRelativize(rel);
+        if ("ok" in screenedEntry) continue;
+        if (entry.type === "dir") {
+          pending.push(rel);
+          continue;
+        }
+        if (entry.type !== "file") continue;
+        const stat = await searchOp({ op: "stat", path: rel });
+        if (!stat.ok) return this.mapFileopError(stat);
+        if (typeof stat.size !== "number" || !Number.isSafeInteger(stat.size) || stat.size < 0) return deny("fileop_denied", "Search file size unavailable");
+        if (stat.size > 64 * 1024) return deny("search_limit", "Search file size limit reached");
+        if (bytes + stat.size > 256 * 1024) return deny("search_limit", "Search byte limit reached");
+        const read = await searchOp({ op: "read", path: rel });
+        if (!read.ok) return this.mapFileopError(read);
+        if (read.truncated) return deny("search_limit", "Search file read incomplete");
+        if (typeof read.data !== "string") return deny("fileop_denied", "Search file body unavailable");
+        const body = Buffer.from(read.data, "base64");
+        if (body.length > 64 * 1024) return deny("search_limit", "Search file size limit reached");
+        bytes += body.length;
+        if (bytes > 256 * 1024) return deny("search_limit", "Search byte limit reached");
+        for (const [index, line] of body.toString("utf8").split("\n").entries()) {
+          const matchAt = line.indexOf(query);
+          if (matchAt < 0) continue;
+          if (matches.length === 20) return { ok: true, output: { matches, truncated: true, bytes } };
+          const excerptStart = Math.max(0, matchAt - Math.floor((256 - query.length) / 2));
+          matches.push({ path: rel, line: index + 1, text: line.slice(excerptStart, excerptStart + 256) });
+        }
+      }
+    }
+    return { ok: true, output: { matches, truncated: false, bytes } };
   }
 
   /** Map a fileop response to a bounded neutral denial. Only the closed helper/client

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { PlanCrossCheckSummary } from "./apiTypes";
 import { readFileSync } from "node:fs";
 import type {
   Run,
@@ -459,7 +460,7 @@ void _buildInfoFull;
   const _scheduleInputZero: ZeroOf<
     Omit<
       ScheduleInput,
-      "labels" | "auto_approve" | "wait_on_limit" | "enabled" | "override_subagent_model" | "sibling_group_id"
+      "labels" | "auto_approve" | "wait_on_limit" | "enabled" | "override_subagent_model" | "sibling_group_id" | "capacity_limit" | "capacity_room_needed"
     >
   > = scheduleInputZero;
   const _scheduleInputFull: Widen<ScheduleInput> = scheduleInputFull;
@@ -1388,6 +1389,23 @@ describe("api-contract fixtures are present and discriminating", () => {
       expect(hasNull(full), `${stem}.full.json has a null -- the populator left a field zero`).toBe(false);
     });
   }
+});
+
+// TestPlanCrossCheckSummaryNullableItems records this accepted server wire case.
+// Explicit typing makes a narrower array-only declaration fail typecheck.
+it("plan-check findings permit a null item array", () => {
+  const summary: PlanCrossCheckSummary = {
+    round: 1,
+    verdict: "approve",
+    reason_class: "approve",
+    findings: { summary: "ok", items: null },
+    checker_run_id: null,
+    checker_model: null,
+    checker_effort: null,
+    usage: null,
+    historical: false,
+  };
+  expect(summary.findings?.items).toBeNull();
 });
 
 

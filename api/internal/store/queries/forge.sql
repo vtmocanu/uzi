@@ -34,7 +34,35 @@ WHERE id = $1 AND user_id = $2
 RETURNING *;
 
 -- name: DeleteForgeConnectionForUser :execrows
-DELETE FROM forge_connections WHERE id = $1 AND user_id = $2;
+WITH deletion_scope AS MATERIALIZED (
+    SELECT id FROM forge_connections WHERE id = $1 AND user_id = $2
+), candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs WHERE runs.repo_id IN (SELECT repos.id FROM repos WHERE repos.connection_id IN (SELECT id FROM deletion_scope))
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume the selected parent IDs before allowing the cascading deletion.
+    SELECT array_agg(id) AS ids FROM locked_parents
+)
+
+DELETE FROM forge_connections WHERE forge_connections.id = $1 AND forge_connections.user_id = $2
+  AND NOT EXISTS (
+      SELECT 1 FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+      WHERE mapping.parent_id IS NOT NULL
+        AND NOT COALESCE(mapping.parent_id = ANY(locks.ids), false)
+  );
 
 -- name: ListAllForgeConnections :many
 -- Every connection across all users, for the privilege-check sweep (single-API,
@@ -176,10 +204,40 @@ RETURNING *;
 -- is the atomic race guard (D6): a concurrent enable between the handler's fetch
 -- and this delete must not let a tracked repo through. Cascades derived data
 -- (runs, cached issues, board columns, ...) via existing FKs.
+WITH deletion_scope AS MATERIALIZED (
+    SELECT repos.id FROM repos WHERE repos.id = $1
+      AND repos.connection_id IN (SELECT id FROM forge_connections WHERE user_id = $2)
+      AND repos.enabled = false
+), candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs WHERE runs.repo_id IN (SELECT id FROM deletion_scope)
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume the selected parent IDs before allowing the cascading deletion.
+    SELECT array_agg(id) AS ids FROM locked_parents
+)
+
 DELETE FROM repos
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $2)
-  AND repos.enabled = false;
+  AND repos.enabled = false
+  AND NOT EXISTS (
+      SELECT 1 FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+      WHERE mapping.parent_id IS NOT NULL
+        AND NOT COALESCE(mapping.parent_id = ANY(locks.ids), false)
+  );
 
 -- name: CountActiveRunsForRepo :one
 -- Non-terminal run count for a repo (PRD #357 D7). "Disabled" is not "quiescent":

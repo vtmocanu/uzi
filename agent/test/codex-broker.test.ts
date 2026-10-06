@@ -332,6 +332,18 @@ describe("CodexCallbackBroker: file effects through the fileop client", () => {
     assert.equal(h.fileop.calls.length, 0);
   });
 
+  it("a granted child Read of CLAUDE returns only neutral E_SYMLINK denial", async () => {
+    const fileop = new FileopSpy({ ok: false, code: "E_SYMLINK",
+      data: Buffer.from("PRIVATE_RULES_SENTINEL").toString("base64") });
+    const h = makeBroker({ fileop, grants: grants({ isRoot: false, allowedTools: new Set(["Read"]) }) });
+    const r = await h.broker.handleToolCall(rt(), "Read", { path: "CLAUDE.md" }, "child");
+    assert.deepEqual(r, { ok: false, code: "fileop_denied", message: "file operation denied (E_SYMLINK)" });
+    assert.equal(fileop.calls.length, 1);
+    assert.equal(fileop.calls[0]!.path, "CLAUDE.md");
+    assert.equal(h.spawn.calls.length, 0);
+    assert.doesNotMatch(JSON.stringify(r), /AGENTS|PRIVATE_RULES_SENTINEL|data/);
+  });
+
   it("maps a fileop error code to a neutral denial", async () => {
     const fileop = new FileopSpy({ ok: false, code: "E_ESCAPE" });
     const h = makeBroker({ fileop });

@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
-import { commandRootCommand, runnerCommand, uidSplitActive } from "./runner-uid.js";
+import { RUNNER_UID, commandRootCommand, runnerCommand, uidSplitActive } from "./runner-uid.js";
 import { workerSpawnEnv } from "./worker-spawn-mark.js";
 
 const execFileAsync = promisify(execFile);
@@ -842,7 +842,13 @@ const SELF_FD = "/proc/self/fd/";
 /** One path component: no separator, not `.`/`..`, not dash-leading (it becomes a bare
  *  `node -e` argument). Run ids and `mkdtemp` names (`uzi-judge-XXXXXX`) all fit. */
 const TREE_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
-const SKILLS_PLUGIN_TREE_NAME_RE = /^\.uzi-skills-(?![.-])[^\p{Cc}/\\]+$/u;
+const TEARDOWN_COMPONENT_RE = /^(?![.-])[^\p{Cc}/\\]+$/u;
+function isTeardownComponent(name: string): boolean {
+  return TEARDOWN_COMPONENT_RE.test(name);
+}
+function isSkillsPluginTreeName(name: string): boolean {
+  return name.startsWith(".uzi-skills-") && isTeardownComponent(name.slice(".uzi-skills-".length));
+}
 
 /** The worker itself as a helper's uid: the command unchanged. */
 const asWorker: CommandWrapper = (command, args) => ({ command, args: [...args] });
@@ -866,7 +872,19 @@ export async function rmTeardownTree(target: string, testDeps: TeardownTestDeps 
   const name = path.basename(target);
   await (testDeps.removeTreePinned ?? rmTreePinned)(path.dirname(target), name, {
     deadline: (testDeps.now ?? Date.now)() + 120_000,
-    ...(SKILLS_PLUGIN_TREE_NAME_RE.test(name) ? { allowSkillsPluginName: true } : {}),
+    ...(isSkillsPluginTreeName(name) ? { allowSkillsPluginName: true } : {}),
+  });
+}
+
+/** Runner-owned disposal only: fixed runner owner under the split, current uid otherwise.
+ * Does not open private roots to the group. Inaccessible mixed-private content refuses.
+ * Clone names opt into the same component predicate as skills suffixes; advice UUIDs do not.
+ */
+export async function rmRunnerTeardownTree(target: string, opts: { allowCloneName?: boolean } = {}): Promise<void> {
+  if (!path.isAbsolute(target)) throw new Error(`rmRunnerTeardownTree: refusing non-absolute path ${target}`);
+  await removePinnedTree(path.dirname(target), path.basename(target), { deadline: Date.now() + 120_000 }, {
+    runnerOwned: true,
+    allowCloneName: opts.allowCloneName === true,
   });
 }
 
@@ -928,9 +946,20 @@ export async function rmTreePinned(
   name: string,
   opts: PinnedTreeRemovalOptions = {},
 ): Promise<"removed" | "absent"> {
+  return removePinnedTree(parent, name, opts);
+}
+
+/** Owner policy is private: callers cannot select an arbitrary production uid. */
+async function removePinnedTree(
+  parent: string,
+  name: string,
+  opts: PinnedTreeRemovalOptions,
+  policy: { runnerOwned?: boolean; allowCloneName?: boolean } = {},
+): Promise<"removed" | "absent"> {
   if (!path.isAbsolute(parent)) throw new Error(`rmTreePinned: refusing non-absolute parent ${parent}`);
-  const skillsPluginName = opts.allowSkillsPluginName === true && SKILLS_PLUGIN_TREE_NAME_RE.test(name);
-  if (!TREE_NAME_RE.test(name) && !skillsPluginName) {
+  const cloneName = policy.allowCloneName === true && isTeardownComponent(name);
+  const skillsPluginName = opts.allowSkillsPluginName === true && isSkillsPluginTreeName(name);
+  if (!TREE_NAME_RE.test(name) && !skillsPluginName && !cloneName) {
     throw new Error(`rmTreePinned: refusing ${JSON.stringify(name)}, not one path component`);
   }
   if (process.platform !== "linux") throw new Error("rmTreePinned: refusing, no descriptor-pinned walk here");
@@ -958,14 +987,16 @@ export async function rmTreePinned(
     }
     try {
       const st = await fs.stat(SELF_FD + leafPin.fd);
-      const uid = opts.getuid ? opts.getuid() : process.getuid?.();
-      if (uid !== undefined && st.uid !== uid) {
-        throw Object.assign(new Error(`rmTreePinned: ${target} is not owned by this worker (uid ${st.uid})`), {
+      const uid = policy.runnerOwned
+        ? (split ? RUNNER_UID : process.getuid?.())
+        : (opts.getuid ? opts.getuid() : process.getuid?.());
+      if ((policy.runnerOwned && uid === undefined) || (uid !== undefined && st.uid !== uid)) {
+        throw Object.assign(new Error(`rmTreePinned: ${target} is not owned by ${policy.runnerOwned ? "the runner" : "this worker"} (uid ${st.uid})`), {
           code: "EPERM",
         });
       }
       // chmod follows the magic link to the pinned inode, never a path.
-      if (split) await fs.chmod(SELF_FD + leafPin.fd, (st.mode & 0o7777) | 0o770);
+      if (split && !policy.runnerOwned) await fs.chmod(SELF_FD + leafPin.fd, (st.mode & 0o7777) | 0o770);
       const expect = await identityOf(leafPin.fd);
       const wrappers =
         opts.wrappers ?? (split ? [runnerCommand, commandRootCommand, runnerCommand, asWorker] : [asWorker]);

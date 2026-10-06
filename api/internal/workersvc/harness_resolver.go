@@ -288,6 +288,24 @@ func explicitHarnessRefusal(ctx context.Context, q harnessResolverStore, userID 
 	return errNoCredentialForHarness
 }
 
+// BothHarnessesUsable applies the same credential rules as run creation when a user
+// enables plan cross-check. In particular, Codex requires a usable default credential.
+func (s *Service) BothHarnessesUsable(ctx context.Context, userID uuid.UUID) (bool, error) {
+	q, ok := s.harnessStore()
+	if !ok {
+		return false, errHarnessStoreUnavailable
+	}
+	claude, err := q.UserHasEnabledAnthropicToken(ctx, userID)
+	if err != nil {
+		return false, fmt.Errorf("harness resolve: anthropic token check: %w", err)
+	}
+	if !claude {
+		return false, nil
+	}
+	_, codex, err := s.resolveUsableCodexCredential(ctx, userID, q)
+	return codex, err
+}
+
 // ResolveSettingsHarness resolves the harness the settings surface projects the legacy
 // default_model lane from (PRD #1551 M1 / D3): it runs the same D11 resolver production run
 // creation uses, with no explicit selection, so a usable stored default_harness is honoured.

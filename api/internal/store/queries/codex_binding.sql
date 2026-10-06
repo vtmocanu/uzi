@@ -291,18 +291,48 @@ SELECT ins.seq FROM ins;
 -- the claim-capability revoke (already NULL on a hold; kept so every Codex exit revokes). It
 -- touches no custody hold: like every failed run, the run retains custody for capture or
 -- discard (ListReleasableCustodyHolds never qualifies a failed run without a ready capture).
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause = 'codex_account_unavailable'
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = cc.lead_run_id
+        AND parent.kind <> 'cross_check'
+    WHERE candidates.kind = 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+    UNION ALL
+    SELECT candidates.id FROM candidates CROSS JOIN parent_lock_set locks
+    WHERE candidates.kind <> 'cross_check'
+)
 UPDATE runs SET
+    plan_cross_check_gate_reason = NULL,
     status = 'failed', status_since = now(), failure_reason = @failure_reason,
     fail_origin = @fail_origin,
-    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,
+    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END,
     finished_at = now(),
     milestones_in_progress = NULL, milestones_agents = NULL,
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     credential_switch_requested_at = NULL, credential_switch_generation = NULL,
     health = 'ok', health_reason = NULL, health_since = NULL,
-    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
-WHERE id = @id AND status = 'recovery_wait' AND recovery_wait_cause = 'codex_account_unavailable';
+WHERE runs.id = @id AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause = 'codex_account_unavailable'
+  AND runs.id IN (SELECT run_id FROM eligible_candidates);
 
 -- name: SetRunCodexClaimCapability :one
 -- Mint (or rotate) the per-claim Codex capability (PRD #1147 M2): store the new hash and

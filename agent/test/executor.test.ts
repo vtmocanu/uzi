@@ -280,6 +280,26 @@ describe("StubExecutor — PRD #1391 M5 outbox-outage sentinel", () => {
 });
 
 describe("StubExecutor — PRD #41 plan gate revision loop", () => {
+  it("refuses checked plan approval because the stub cannot implement canonical prose", async () => {
+    const wt = makeWorktree();
+    let iterations = 0;
+    const { ctx, emitted } = makeCtx({
+      worktreePath: wt.path,
+      claimGeneration: 7,
+      reportIteration: () => { iterations++; },
+      gatePlan: async () => ({
+        kind: "approve", approval: "cross_check", selection: { status: "absent" },
+        canonical: { plan: "canonical", milestones: [], candidate_digest: "a".repeat(64), claimGeneration: 7 },
+      }),
+    });
+    try {
+      await assert.rejects(new StubExecutor(nullLogger(), { planGate: true }).run(ctx), /stub cannot consume checked plan approval/);
+      assert.equal(iterations, 0);
+      assert.ok(!emitted.some((m) => String(m.payload.text).includes("implementing")));
+    } finally {
+      wt.cleanup();
+    }
+  });
   const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
   const revise = (feedback: string): PlanVerdict => ({ kind: "revise", feedback });
 

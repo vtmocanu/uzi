@@ -228,6 +228,10 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   actually shipped (e.g. `3 of 7 milestones`). This is **surface-only** —
   Slack shows the outcome after the fact, but you can't set a scope ceiling
   or stop a run from Slack itself; use the CLI or web run view.
+- For a [Plan cross-check](./cross-check.md) park, the plan-gate card
+  includes `Plan cross-check: <reason>` (for this release, checker
+  unavailable). It does not send checker findings to Slack. Open the run in
+  uzi for the plan decision.
 - Otherwise only status, repository path, issue number and title, MR link,
   and failure reason ever appear in a message — diff content never leaves
   uzi. **The plan body is the one exception**, deliberately (see the

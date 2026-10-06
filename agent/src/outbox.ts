@@ -415,6 +415,8 @@ export class Outbox {
   private readonly classifyWriteFailure: OutboxOptions["classifyWriteFailure"];
 
   private readonly runs = new Map<string, RunState>();
+  /** Process-local receipt identities; never persisted or reused for later appends. */
+  private readonly deliveryIdentities = new WeakMap<ManifestRecordRef, symbol>();
   private readonly uncleanAtInit: string[] = [];
   /** Per-run promise-chain mutex tails: every mutating op on one run awaits and
    *  extends its run's tail, so a run's ops run strictly one-at-a-time (different
@@ -698,7 +700,8 @@ export class Outbox {
    * (evicting the oldest segment to a range record when the run or worker quota
    * binds), then writes the segment and installs the next manifest generation.
    */
-  async appendSegment(runId: string, generation: number, msgs: OutgoingMessage[]): Promise<void> {
+  async appendSegment(runId: string, generation: number, msgs: OutgoingMessage[],
+    onCommitted?: (identity: symbol) => void, signal?: AbortSignal): Promise<void> {
     if (!this.writable()) return;
     if (msgs.length === 0) return;
     const first = msgs[0];
@@ -728,7 +731,9 @@ export class Outbox {
       const ref: ManifestRecordRef = { kind: "segment", firstSeq: first.seq, lastSeq: last.seq, fileVersion, file };
       await this.installManifest(rs, [...rs.manifest.records, ref]);
       rs.recordBytes.set(file, bytes);
-    });
+      // Trusted synchronous observer: commit evidence is emitted while the run lock is held.
+      onCommitted?.(this.deliveryIdentity(ref));
+    }, signal);
   }
 
   /**
@@ -737,7 +742,8 @@ export class Outbox {
    * the record, then replenishes it. Replay expands the record into one tombstone
    * per seq so the stream stays contiguous.
    */
-  async appendRangeRecord(runId: string, generation: number, firstSeq: number, lastSeq: number): Promise<void> {
+  async appendRangeRecord(runId: string, generation: number, firstSeq: number, lastSeq: number,
+    onCommitted?: (identity: symbol) => void, signal?: AbortSignal): Promise<void> {
     if (!this.writable()) return;
     await this.withRunLock(runId, async () => {
       const rs = await this.ensureRunState(runId);
@@ -760,30 +766,31 @@ export class Outbox {
         const ref: ManifestRecordRef = { kind: "range", firstSeq, lastSeq, fileVersion, file };
         await this.installManifest(rs, [...rs.manifest.records, ref]);
         rs.recordBytes.set(file, bytes);
+        onCommitted?.(this.deliveryIdentity(ref));
       });
-    });
+    }, signal);
   }
 
   /** Set the spill-unclean flag when a spill begins (creates the run's manifest if
    *  none exists yet). Surfaced at the next restart via {@link uncleanRuns}. */
-  async markSpillUnclean(runId: string): Promise<void> {
+  async markSpillUnclean(runId: string, signal?: AbortSignal): Promise<void> {
     if (!this.writable()) return;
     await this.withRunLock(runId, async () => {
       const rs = await this.ensureRunState(runId);
       if (!rs) return;
       if (rs.manifest.spilledUnclean && rs.manifest.generation > 0) return;
       await this.installManifest(rs, rs.manifest.records, { spilledUnclean: true });
-    });
+    }, signal);
   }
 
   /** Clear the spill-unclean flag on a clean flush/close. */
-  async clearSpillUnclean(runId: string): Promise<void> {
+  async clearSpillUnclean(runId: string, signal?: AbortSignal): Promise<void> {
     if (!this.writable()) return;
     await this.withRunLock(runId, async () => {
       const rs = this.runs.get(runId);
       if (!rs || !rs.manifest.spilledUnclean) return;
       await this.installManifest(rs, rs.manifest.records, { spilledUnclean: false });
-    });
+    }, signal);
   }
 
   // ── drain / replay ────────────────────────────────────────────────────────────
@@ -796,11 +803,14 @@ export class Outbox {
    * hole. A `send` that throws {@link StaleClaimError} retires the record locally
    * and counts it in `staleRetired`; any OTHER throw stops the drain and leaves
    * the rest pending. Returns whether the run is now fully retired and the run's
-   * cumulative stale-retired seq count.
+   * cumulative stale-retired seq count. The optional signal cancels queued lock
+   * acquisition only; an acquired drain awaits send and retirement truthfully.
    */
   async drainRun(
     runId: string,
     send: (msgs: OutgoingMessage[], generation: number) => Promise<void>,
+    onAcknowledged?: (identity: symbol) => void,
+    signal?: AbortSignal,
   ): Promise<{ retired: boolean; staleRetired: number }> {
     if (this.disabled) return { retired: false, staleRetired: 0 };
     return this.withRunLock(runId, async () => {
@@ -818,6 +828,9 @@ export class Outbox {
           // bump never rebinds an old attempt's frames. Streamed in bounded chunks so a
           // wide range never allocates one huge array or posts one oversized request.
           await this.replayRecord(rs, rec, send);
+          // Only this drain gets evidence, and only after every chunk was ACKed.
+          // Observer callbacks are trusted, synchronous and must not throw.
+          onAcknowledged?.(this.deliveryIdentity(rec));
         } catch (err) {
           if (err instanceof StaleClaimError) {
             this.log.warn("outbox: record refused as stale claim; retiring locally (frames lost, not rebound)", {
@@ -834,7 +847,7 @@ export class Outbox {
         await this.retireRecord(rs, rec, false);
       }
       return { retired: rs.manifest.records.length === 0, staleRetired: rs.manifest.staleRetired };
-    });
+    }, signal);
   }
 
   /** Replay one record as bounded, sequence-ordered chunks over `send` (each ≤
@@ -971,6 +984,8 @@ export class Outbox {
       fileVersion,
       file,
     };
+    // Quota replacement changes storage shape, not the logical delivery obligation.
+    this.deliveryIdentities.set(ref, this.deliveryIdentity(segRec));
     const nextRecords = rs.manifest.records.map((r) => (r.file === segRec.file ? ref : r));
     await this.installManifest(rs, nextRecords);
     rs.recordBytes.delete(segRec.file);
@@ -1124,6 +1139,23 @@ export class Outbox {
     const rs = this.runs.get(runId);
     if (!rs) return false;
     return rs.manifest.records.some((r) => r.lastSeq > rs.manifest.cursor);
+  }
+
+  private deliveryIdentity(rec: ManifestRecordRef): symbol {
+    let identity = this.deliveryIdentities.get(rec);
+    if (identity === undefined) {
+      identity = Symbol();
+      this.deliveryIdentities.set(rec, identity);
+    }
+    return identity;
+  }
+
+  /** Capture every unretired logical record synchronously, including records
+   * currently excluded by the replay cursor. Only a complete owned replay can
+   * supply its receipt. Identities live only in this Outbox instance.
+   */
+  pendingDeliveryIdentities(runId: string): readonly symbol[] {
+    return this.runs.get(runId)?.manifest.records.map((rec) => this.deliveryIdentity(rec)) ?? [];
   }
 
   /** The outbox depth for one run, or undefined if the run is not tracked. */
@@ -1687,9 +1719,18 @@ export class Outbox {
    *  manifest generation and lose one). Different runs never share a tail, so they
    *  stay concurrent. The stored tail never rejects, so one op's failure does not
    *  wedge the run's chain (H2). */
-  private withRunLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+  private withRunLock<T>(runId: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (signal?.aborted) return Promise.reject(signal.reason);
     const prev = this.runLocks.get(runId) ?? Promise.resolve();
-    const result = prev.then(() => fn());
+    let started = false;
+    let abortQueued: (() => void) | undefined;
+    const result = prev.then(() => {
+      if (abortQueued) signal?.removeEventListener("abort", abortQueued);
+      // A cancelled waiter keeps its place in the chain but never runs fn.
+      if (signal?.aborted) throw signal.reason;
+      started = true;
+      return fn();
+    });
     const tail = result.then(
       () => undefined,
       () => undefined,
@@ -1699,7 +1740,17 @@ export class Outbox {
     void tail.then(() => {
       if (this.runLocks.get(runId) === tail) this.runLocks.delete(runId);
     });
-    return result;
+    if (!signal) return result;
+    // Reject only queued acquisition. Once fn owns the lock, its real result
+    // settles the caller; cancellation cannot claim an unfinished write or ACK.
+    return new Promise<T>((resolve, reject) => {
+      abortQueued = () => {
+        if (abortQueued) signal.removeEventListener("abort", abortQueued);
+        if (!started) reject(signal.reason);
+      };
+      signal.addEventListener("abort", abortQueued, { once: true });
+      void result.then(resolve, reject);
+    });
   }
 
   /** Non-blocking acquire of a run's per-run lock, for a CROSS-RUN mutation (a

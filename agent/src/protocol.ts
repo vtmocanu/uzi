@@ -276,7 +276,7 @@ export interface AnswerBody {
  *
  *  RUN_KINDS is mirrored from the DB `runs_kind_check` constraint (in DB CHECK
  *  order); agent/test/run-kind-db-parity.test.ts keeps the two in sync. */
-export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task", "mr_rework", "job"] as const;
+export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task", "mr_rework", "job", "cross_check"] as const;
 export type RunKind = (typeof RUN_KINDS)[number];
 
 /** How a run's plan_md was produced (PRD #209 D4). "agent": the worker's own Phase-1
@@ -1149,7 +1149,24 @@ export interface ClaimJob {
  * `plan_md` used to be in that ignored list and no longer is — PRD #35's resume
  * path consumes it, so it is declared below.
  */
+/** Server-stored, bounded plan candidate for one live read-only child claim. */
+export interface ClaimPlanCrossCheck {
+  stage: "plan";
+  lead_run_id: string;
+  round: number;
+  candidate_digest: string;
+  deadline_at: string;
+  plan_md: string;
+  milestones: Milestone[];
+  required_capabilities: string[];
+  required_tools: string[];
+  size_class: string;
+  base_commit: string;
+  planning_diff: string;
+}
+
 export interface ClaimResponse {
+  cross_check?: ClaimPlanCrossCheck;
   run_id: string;
   /** Run kind (PRD #6). "issue": work issue_iid's card. "ci_fix": diagnose + fix
    *  the failed `pipeline`. Absent on older servers ⇒ treat as "issue". */
@@ -1219,6 +1236,10 @@ export interface ClaimResponse {
    *  fact. Re-delivered on every resume/requeue of the same run (the server reads
    *  it from the row), so an unattended resume never hangs at the gate. */
   auto_approve?: boolean;
+  /** PRD #2149 M1: this autopilot plan requires an opposite-family cross-check before
+   *  implementation. The M1 worker parks it for human review while the checker is unavailable.
+   *  Omitted by older servers and on runs without the requirement. */
+  plan_cross_check_required?: boolean;
   /** PRD #400 M2: gates whether a TASK run opens a merge request. Meaningful only for
    *  kind="task": a task ALWAYS pushes its branch back (the deliverable is commits the
    *  user pulls), but opens an MR only when this is true (`uzi handoff --mr`). Every
@@ -2231,6 +2252,8 @@ export type PublishResult =
   | { ok: false; httpStatus: number };
 
 export interface StateRequest {
+  /** Required for an opted-in autopilot plan write; server-computed at submission. */
+  candidate_digest?: string;
   status: RunState;
   /** PRD #1392 M2 (#1247 generation fence): the exact claim generation THIS report is made
    *  against, so the api's park transaction settles only the hold that generation opened. Sent on
@@ -2498,6 +2521,17 @@ export interface StateRequest {
   messages_through_seq?: number;
 }
 
+/** Atomic server snapshot. Candidate authority still requires the exact applied running ACK. */
+export interface PlanCrossCheckReconciliation {
+  leadLastSeq: number;
+  claimGeneration: number;
+  planCrossCheckSettled: boolean;
+  gateRevision: number;
+  gatePresentationId?: string;
+  gatePayloadDigest?: string;
+  currentPlanSHA256: string;
+}
+
 /**
  * What the server answered a state report with (PRD #35's park acknowledgement
  * contract). Both the 200 and the 409 path return `{"run": <RunDTO>}`, so the run's
@@ -2520,6 +2554,7 @@ export interface StateRequest {
  * construction. An enumeration would go stale; this cannot.
  */
 export interface StateAck {
+  reconciliation?: PlanCrossCheckReconciliation;
   /** Whether the server applied the transition. Diagnostics and logging only —
    *  see the warning above before branching on it. */
   applied: boolean;

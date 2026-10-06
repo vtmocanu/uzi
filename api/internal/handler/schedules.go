@@ -115,6 +115,8 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 		MrReworkEnabled:            optBoolToPgtype(m.MrReworkEnabled),
 		Enabled:                    *m.Enabled,
 		MaxIssues:                  maxIssuesColumn(m),
+		CapacityLimit:              capacityColumn(m.CapacityLimit),
+		CapacityRoomNeeded:         capacityColumn(m.CapacityRoomNeeded),
 		Guidance:                   guidanceColumn(m),
 		Model:                      modelColumn(m),
 		OutputMode:                 outputModeColumn(m),
@@ -273,6 +275,8 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 			WaitOnLimit:                *m.WaitOnLimit,
 			MrReworkEnabled:            optBoolToPgtype(m.MrReworkEnabled),
 			MaxIssues:                  maxIssuesColumn(m),
+			CapacityLimit:              capacityColumn(m.CapacityLimit),
+			CapacityRoomNeeded:         capacityColumn(m.CapacityRoomNeeded),
 			Guidance:                   guidanceColumn(m),
 			Model:                      modelColumn(m),
 			OutputMode:                 outputModeColumn(m),
@@ -439,7 +443,12 @@ func runNowResponse(out schedsvc.FireOutcome) apitypes.RunNowResponse {
 			Reason:   string(s.Reason),
 		})
 	}
+	var capacity *apitypes.CapacityCheck
+	if c := out.Capacity; c != nil {
+		capacity = &apitypes.CapacityCheck{InFlight: c.InFlight, Limit: c.Limit, RoomNeeded: c.RoomNeeded, Room: c.Room, Blocked: c.Blocked}
+	}
 	return apitypes.RunNowResponse{
+		Capacity:          capacity,
 		Created:           len(started),
 		RunIDs:            runIDs,
 		Matched:           out.Matched,

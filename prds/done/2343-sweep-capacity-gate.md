@@ -1,6 +1,14 @@
 # PRD #2343: "When to send issues" capacity gate for label sweeps
 
-**Status**: Draft
+**Status**: Done — M1 and M2 implemented and verified
+
+## Implementation progress
+
+- [x] Capacity storage, scheduler admission, API/PATCH/default/reset/copy behavior, and optional fire outcomes.
+- [x] CLI flags and capacity rendering, synchronized client contracts, and scheduling documentation.
+- [x] Focused capacity tests executed against throwaway PostgreSQL; four mutation probes detected the intended defects and the restored control passed.
+- [x] Web controls, capacity summaries, mock behavior, and visual parity evidence (M2).
+
 **Issue**: [#2343](https://github.com/vtmocanu/uzi/issues/2343) (part of umbrella #2342; followed by #2344)
 **Priority**: Medium
 **Design mock**: `prds/mockups/2342-capacity-gated-sweeps-mock.html` (shared with #2344; open it in a browser). This PRD implements the gate parts of frames 1 and 2; the removal toggle, label-removal last-fire states, the minutes cadence and frame 3 belong to #2344. The preview strip in frame 1 is a mock-only aid.
@@ -79,7 +87,7 @@ Acceptance examples:
 
 - **Live-DB tests are mandatory evidence.** `task gate:api` skips live-DB tests without a database, so each Go milestone also runs `./e2e/run-store-it.sh` (or `go test` with `UZI_TEST_DATABASE_URL` pointing at a throwaway Postgres named outside the `uzi-` namespace) and the PR shows the named tests ran, not skipped.
 - **Scheduler gate** (live-DB, beside `credential_disabled_fire_livedb_test.go`): seed runs across two repos, every origin, kinds (issue, chat, judge, job), and statuses (queued, running, awaiting_approval, limit_wait, paused, completed). Cases: blocked (a counting fake forge asserts zero `ListIssues`/`GetIssue` calls and no run created; `matched 0`; schedule advanced); partial batch `min(N, room)`; over-limit WIP clamps room to 0; chat and judge excluded, job counted; terminal excluded; Run now blocked; a gated multi-label sweep accepted and gated normally; `config_not_supported` for a gated row resolving to `assigned` (no run created).
-- **Mutations to watch fail** (per `.claude/rules/go.md`): drop the gate; use `N` instead of `min(N, room)`; drop the kind exclusion (via a separate query); remove the pre-list placement.
+- **Mutations to watch fail** (per `.claude/rules/go.md`): drop the gate; use `N` instead of `min(N, room)`; drop the kind exclusion (by mutating the generated SQL constant); remove the pre-list placement.
 - **Handler**: table tests pinning 400 for each refusal in example 5; PATCH omission preserves, both-clear clears, half-clear refuses; default-row edit flips `customized`; reset clears; clone copies; `runNowResponse` carries `capacity`.
 - **CLI**: `schedule_render_test.go` and `schedule_test.go` for flags, `WHEN TO SEND`, the blocked run-now line and the renamed help text.
 - **Web**: vitest for `ScheduleModal` (sentence inputs, shared N, hidden for assigned/once, request body, cadence-aware helper) and `LastRun` "Waiting for room".
@@ -93,7 +101,7 @@ Acceptance examples:
 Migration, reuse of the in-flight count, the `fireSweep` gate, `config_not_supported`, `capacity` in `FireOutcome`/`last_fire`/run-now, DTO/PATCH/validation including default rows, reset and clone, CLI flags, render and help rename, docs section plus `docs:sync`.
 
 - Blocked by: none
-- Acceptance: examples 1-5 pass in tests; an ungated schedule behaves byte-for-byte as before (existing schedsvc and handler tests unchanged and green); live-DB evidence in the PR.
+- Acceptance: examples 1-5 pass in tests; ungated admission remains unchanged (existing ungated schedsvc and handler assertions retained and green); live-DB evidence in the PR.
 
 ### M2: "When to send issues" in the web UI, and the field rename
 

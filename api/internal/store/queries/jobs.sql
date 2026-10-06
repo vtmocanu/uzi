@@ -183,6 +183,7 @@ VALUES (@run_id, @ordinal, @severity, @message_md, sqlc.narg('url'), sqlc.narg('
 -- The live-status guard matches SetRunCompleted's job arm: only a claimed or running job (never
 -- queued, paused or terminal) with an unreleased claim.
 UPDATE runs SET
+    plan_cross_check_gate_reason = NULL,
     status             = 'failed',
     status_since       = now(),
     failure_reason     = @failure_reason,
@@ -285,7 +286,8 @@ SELECT w.id AS worker_id, r.id AS run_id, r.user_id AS user_id,
 -- only the stale ephemeral row). Server-derived failure: fail_origin is one of the two
 -- server-only values (@fail_origin is checked by runs_fail_origin_check), stamped in the same
 -- statement, and the transition is returned so the caller can fan it out.
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), failure_reason = @failure_reason,
     fail_origin = @fail_origin::text,
     finished_at = now(),
     milestones_in_progress = NULL,
@@ -307,7 +309,8 @@ RETURNING id, user_id, status;
 -- runner that died or wedged. The deadline is the same shape the wall passes use
 -- (budget_wall_seconds, else the global timeout, plus banked pause and any extension/finalize
 -- term, all zero for a job in practice) measured from started_at, else claimed_at.
-UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), failure_reason = @failure_reason,
     fail_origin = 'run_timeout',
     finished_at = now(),
     milestones_in_progress = NULL,

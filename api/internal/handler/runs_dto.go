@@ -229,6 +229,8 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		AutoApprove:               r.AutoApprove,
 		AutoApproveBlockedReasons: nonNilStrings(r.AutoApproveBlockedReasons),
 		IssueInputReason:          textPtrValue(r.IssueInputReason.Valid, r.IssueInputReason.String),
+		PlanCrossCheckRequired:    r.PlanCrossCheckRequired,
+		PlanCrossCheckGateReason:  textPtrValue(r.PlanCrossCheckGateReason.Valid, r.PlanCrossCheckGateReason.String),
 		TriggerSource:             r.TriggerSource,
 		Branch:                    textPtrValue(r.Branch.Valid, r.Branch.String),
 		BaseBranch:                textPtrValue(r.BaseBranch.Valid, r.BaseBranch.String),

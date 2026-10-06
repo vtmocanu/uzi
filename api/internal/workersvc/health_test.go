@@ -27,8 +27,13 @@ type healthFakeStore struct {
 	eligibilityCalls []store.CountOnlineWorkersClaimableForRunParams
 
 	Store
-	active []store.ListActiveRunsForHealthRow
-	window map[uuid.UUID][]store.ListRunToolWindowRow
+	liveCrossCheck      map[uuid.UUID]bool
+	liveCrossCheckErr   error
+	liveCrossCheckCalls []uuid.UUID
+	active              []store.ListActiveRunsForHealthRow
+	crossCheckRun       store.Run
+	crossCheckWorkers   []store.ListWorkersByUserRow
+	window              map[uuid.UUID][]store.ListRunToolWindowRow
 	// messages is an optional per-run run_messages log (seq ascending or not; the
 	// fake orders it). When a run has one, BOTH tool-window reads derive from it with
 	// the real queries' filter + ORDER BY seq DESC + LIMIT semantics, so a test can
@@ -122,6 +127,18 @@ type healthFakeStore struct {
 	// custodyLimitCalls records every lookup's custody_hold_limit (issue #1751: the per-run
 	// exemption bound is the same limit ClaimRun is passed).
 	custodyLimitCalls []int32
+}
+
+func (f *healthFakeStore) HasLivePlanCrossCheck(_ context.Context, id uuid.UUID) (bool, error) {
+	f.liveCrossCheckCalls = append(f.liveCrossCheckCalls, id)
+	return f.liveCrossCheck[id], f.liveCrossCheckErr
+}
+
+func (f *healthFakeStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
+	return f.crossCheckRun, nil
+}
+func (f *healthFakeStore) ListWorkersByUser(context.Context, uuid.UUID) ([]store.ListWorkersByUserRow, error) {
+	return f.crossCheckWorkers, nil
 }
 
 func (f *healthFakeStore) ListActiveRunsForHealth(context.Context, []string) ([]store.ListActiveRunsForHealthRow, error) {

@@ -1011,7 +1011,7 @@ func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		httpx.JSON(w, http.StatusOK, payload)
+		writeWorkerRunClaim(w, payload)
 	default:
 		httpx.Error(w, http.StatusBadRequest, "lane must be one of run, chat")
 	}
@@ -1233,7 +1233,8 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	run, applied, gateRevision, err := h.wsvc.SetStateReport(r.Context(), wkr, runID, req)
+	result, err := h.wsvc.SetStateReportWithReconciliation(r.Context(), wkr, runID, req)
+	run, applied, gateRevision := result.Run, result.Applied, result.GateRevision
 	if err != nil {
 		// PRD #1795 M1: a refused awaiting_approval report (historical presentation id, changed
 		// payload under the current id, stale adoption) published nothing. 409 with the same
@@ -1345,6 +1346,13 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// returned inside the report's transaction and threaded back from SetStateReport, never
 		// re-read after commit. The worker confirms THIS revision for bound-verdict matching.
 		ack["gate_revision"] = gateRevision
+	}
+	if result.Reconciliation != nil {
+		httpx.JSON(w, http.StatusOK, workerReconciledStateAck{
+			Run: ack["run"], CredentialSwitch: ack["credential_switch"], Disposition: ack["disposition"],
+			leadReconciliationResponse: reconciliationResponse(0, result.Reconciliation),
+		})
+		return
 	}
 	httpx.JSON(w, http.StatusOK, ack)
 }

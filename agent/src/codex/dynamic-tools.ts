@@ -61,6 +61,11 @@ function definition(name: string): Omit<CodexDynamicToolSpec, "type" | "name"> {
           anyOf: [{ required: ["path"] }, { required: ["file_path"] }],
         },
       };
+    case "Search":
+      return {
+        description: "Search checkout text with fixed directory, entry, byte, and result limits.",
+        inputSchema: objectSchema({ query: STRING, path: STRING }, ["query"], false),
+      };
     case "Skill":
       return {
         description: "Load one skill already granted to this role.",

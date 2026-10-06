@@ -194,6 +194,77 @@ const stateStatuses = (runId: string): string[] =>
 const messageKinds = (runId: string): string[] => api.messages(runId).map((m) => m.kind);
 
 describe("RunRunner — capture-first wall park (PRD #1497 M2)", () => {
+  for (const mode of ["confirmed", "uncertain running", "uncertain park"] as const) {
+    it(`approval wall handoff: ${mode} reports running before park and retains nonterminal work`, async (t) => {
+      const { gitlab, calls: mrCalls } = fakeGitlab();
+      const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-r1-wall-gate-"));
+      const { restore } = spyPublish();
+      const claim = gitlabClaim(1590);
+      const order: string[] = [];
+      const outcomes: (WallParkOutcome | undefined)[] = [];
+      let approved = false;
+      api.onState(claim.run_id, (body) => {
+        if (body.status === "awaiting_approval") {
+          order.push("awaiting_approval");
+          api.setInputs(claim.run_id, [{ id: 1, kind: "approve_plan" }]);
+        }
+      });
+      const reportState = client.reportState.bind(client);
+      t.mock.method(client, "reportState", async (...args: Parameters<typeof client.reportState>) => {
+        if (approved && args[1].status === "running") order.push("running");
+        return reportState(...args);
+      });
+      const reportWallPark = client.reportWallPark.bind(client);
+      t.mock.method(client, "reportWallPark", async (...args: Parameters<typeof client.reportWallPark>) => {
+        order.push("wall");
+        return reportWallPark(...args);
+      });
+      const factory: ExecutorFactory = (runId) => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: {
+          run: async (ctx): Promise<ExecutorResult> => {
+            fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+            commitInTree(ctx.worktreePath, "WORK.txt", "approved work retained at wall\n");
+            const verdict = await ctx.gatePlan!("approved implementation");
+            assert.equal(verdict.kind, "approve");
+            approved = true;
+            if (mode === "uncertain running") {
+              api.failStateNext(100);
+              api.setWallParkResponse("awaiting_approval", 409);
+            } else if (mode === "uncertain park") api.setWallParkResponse("paused", 404);
+            // Exercise the production runner's awaiting_approval -> running report closure and
+            // capture-first wall park, in the executor's post-approval order.
+            await ctx.reportIteration?.(1);
+            const outcome = await ctx.parkForWall?.({ completedCount: 0 });
+            outcomes.push(outcome);
+            assert.ok(outcome === "parked" || outcome === "undeliverable");
+            return { branch: ctx.branch, walled: { reason: "run exceeded its wall-clock timeout" } };
+          },
+        },
+      });
+      try {
+        await runnerWithGit(factory, gitlab).execute(claim);
+        const gateAt = order.indexOf("awaiting_approval");
+        const runningAt = order.indexOf("running", gateAt + 1);
+        const wallAt = order.indexOf("wall");
+        assert.ok(gateAt >= 0 && runningAt > gateAt && wallAt > runningAt, JSON.stringify(order));
+        assert.deepEqual(outcomes, [mode === "confirmed" ? "parked" : "undeliverable"]);
+        const statuses = stateStatuses(claim.run_id);
+        assert.ok(!statuses.includes("failed") && !statuses.includes("completed"), JSON.stringify(statuses));
+        assert.equal(mrCalls.length, 0);
+        assert.ok(fs.existsSync(path.join(homeRoot, claim.run_id)), "HOME retained");
+        assert.ok(fs.existsSync(worktreeDirFor(1590)), "clone retained");
+        if (mode === "confirmed") {
+          const gate = statuses.indexOf("awaiting_approval");
+          assert.equal(statuses[gate + 1], "running", "positive running transition follows approval");
+        }
+      } finally {
+        restore();
+        fs.rmSync(homeRoot, { recursive: true, force: true });
+      }
+    });
+  }
+
   it("parks (reports wall_park with a captured head) without pause_failed, and does not finalize", async () => {
     const { gitlab, calls: mrCalls } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1497-ok-"));

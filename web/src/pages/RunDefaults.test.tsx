@@ -31,6 +31,7 @@ vi.mock("../lib/api", async (importActual) => {
       // never open a delete confirmation.
       listWorkers: vi.fn().mockResolvedValue({ workers: [] }),
       setAutopilotEnabled: vi.fn(),
+      setPlanCrossCheckEnabled: vi.fn(),
       setWaitOnLimit: vi.fn(),
       setNotifyEarlyReset: vi.fn(),
       setJudgeEnabled: vi.fn(),
@@ -188,6 +189,43 @@ describe("Run defaults — autopilot opt-in (PRD #19 M3, Decision 7)", () => {
 
     expect(await screen.findByText("internal error")).toBeTruthy();
     expect(toggle().disabled).toBe(false);
+  });
+});
+
+describe("Run defaults — plan cross-check consent", () => {
+  const crossCheckToggle = () =>
+    screen.getByLabelText("Plan cross-check · Required before implementation") as HTMLInputElement;
+
+  it("shows the stage and helper with the saved state", () => {
+    mockAuth({ ...baseUser, plan_cross_check_enabled: true });
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    expect(screen.getByText("Cross-check")).toBeTruthy();
+    expect(screen.getByText(/A second opinion from the other model family/)).toBeTruthy();
+    expect(crossCheckToggle().checked).toBe(true);
+  });
+
+  it("sends plan consent and shows the API warning after refreshing", async () => {
+    mockApi.setPlanCrossCheckEnabled.mockResolvedValue({
+      user: { ...baseUser, plan_cross_check_enabled: true },
+      warning: "No online worker can run Codex plan cross-checks",
+    });
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    fireEvent.click(crossCheckToggle());
+    await waitFor(() => expect(mockApi.setPlanCrossCheckEnabled).toHaveBeenCalledWith(true));
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("No online worker can run Codex plan cross-checks")).toBeTruthy();
+  });
+
+  it("keeps the saved value and allows retry after refusal", async () => {
+    mockApi.setPlanCrossCheckEnabled.mockRejectedValue(
+      new ApiError(409, "both Claude and Codex credentials must be usable"),
+    );
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    fireEvent.click(crossCheckToggle());
+    expect(await screen.findByText("both Claude and Codex credentials must be usable")).toBeTruthy();
+    expect(crossCheckToggle().checked).toBe(false);
+    expect(crossCheckToggle().disabled).toBe(false);
+    expect(refresh).not.toHaveBeenCalled();
   });
 });
 

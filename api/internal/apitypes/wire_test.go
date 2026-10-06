@@ -46,7 +46,7 @@ func assertTags(t *testing.T, name string, v any, want ...string) {
 func TestUserDTOTags(t *testing.T) {
 	assertTags(t, "UserDTO", UserDTO{},
 		"id", "email", "display_name", "is_admin", "is_active",
-		"autopilot_enabled", "judge_enabled", "ci_autofix_enabled",
+		"autopilot_enabled", "plan_cross_check_enabled", "judge_enabled", "ci_autofix_enabled",
 		// issue #916: the per-user AI-attribution opt-out. Default true (current
 		// behavior); when false the worker suppresses the Co-Authored-By trailer.
 		"attribution_enabled",
@@ -90,7 +90,7 @@ var runDTOKeys = []string{
 	"is_planning",
 	// PRD #122 M1: the FROZEN milestone list, always on the wire (nil ⇒ null ⇒ a run
 	// with no milestones, which is every pre-feature run).
-	"auto_approve",
+	"auto_approve", "plan_cross_check_required", "plan_cross_check_gate_reason",
 	// issue #857: the run's trigger provenance (what/how/who started it), NOT NULL
 	// (DEFAULT 'manual') so always on the wire.
 	"trigger_source",

@@ -114,6 +114,42 @@ func (o OptionalHarness) MarshalJSON() ([]byte, error) {
 // zero value and dropped from the marshaled body.
 func (o OptionalHarness) IsZero() bool { return !o.Present }
 
+// OptionalInteger distinguishes an omitted capacity setting from null and an integer.
+type OptionalInteger struct {
+	Present bool
+	Value   *int
+}
+
+// UnmarshalJSON records that the key was present (even for an explicit null) and, for a
+// non-null value, decodes the integer.
+func (o *OptionalInteger) UnmarshalJSON(b []byte) error {
+	o.Present = true
+	if string(b) == "null" {
+		o.Value = nil
+		return nil
+	}
+	var v int
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	o.Value = &v
+	return nil
+}
+
+// MarshalJSON emits the inner value (or JSON null when Present with no value). A
+// Present=false wrapper is never reached because IsZero + the `omitzero` tag omit the
+// whole key; it still marshals to null defensively if a caller forces it.
+func (o OptionalInteger) MarshalJSON() ([]byte, error) {
+	if o.Value == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal(*o.Value)
+}
+
+// IsZero drives the `omitzero` tag: an omitted (Present=false) wrapper is treated as the
+// zero value and dropped from the marshaled body.
+func (o OptionalInteger) IsZero() bool { return !o.Present }
+
 // ScheduleRequest is the create/patch input for a run schedule (PRD #241 M4).
 //
 // On CREATE, omitted pointer fields take their documented defaults (auto_approve=true
@@ -141,7 +177,9 @@ func (o OptionalHarness) IsZero() bool { return !o.Present }
 // inherit the owner default (NULL in the DB). Validated later via agenttmpl.ValidateModel;
 // it carries the same "present, even to clear" replace-semantics on PATCH (see mergeSchedule).
 type ScheduleRequest struct {
-	Target string `json:"target"`
+	CapacityLimit      OptionalInteger `json:"capacity_limit,omitzero"`
+	CapacityRoomNeeded OptionalInteger `json:"capacity_room_needed,omitzero"`
+	Target             string          `json:"target"`
 	// RepoID repoints a schedule to another repo on PATCH (Feature A, PRD #344). It is
 	// honored ONLY on PATCH: CreateSchedule takes the repo from the URL and ignores a
 	// body repo_id, so a create caller has no reason to send it. Empty = keep the current
@@ -216,21 +254,23 @@ type ScheduleRequest struct {
 // best-effort display value and may be "" when the repo can no longer be resolved
 // (disconnected or no longer owned).
 type ScheduleDTO struct {
-	ID          string     `json:"id"`
-	RepoID      string     `json:"repo_id"`
-	RepoPath    string     `json:"repo_path"`
-	Target      string     `json:"target"`
-	IssueIID    *int64     `json:"issue_iid"`
-	Labels      []string   `json:"labels"`
-	Prompt      string     `json:"prompt"`
-	Timing      string     `json:"timing"`
-	CronExpr    string     `json:"cron_expr"`
-	RunAt       *time.Time `json:"run_at"`
-	Timezone    string     `json:"timezone"`
-	NextFireAt  *time.Time `json:"next_fire_at"`
-	LastFiredAt *time.Time `json:"last_fired_at"`
-	AutoApprove bool       `json:"auto_approve"`
-	WaitOnLimit bool       `json:"wait_on_limit"`
+	CapacityLimit      *int       `json:"capacity_limit"`
+	CapacityRoomNeeded *int       `json:"capacity_room_needed"`
+	ID                 string     `json:"id"`
+	RepoID             string     `json:"repo_id"`
+	RepoPath           string     `json:"repo_path"`
+	Target             string     `json:"target"`
+	IssueIID           *int64     `json:"issue_iid"`
+	Labels             []string   `json:"labels"`
+	Prompt             string     `json:"prompt"`
+	Timing             string     `json:"timing"`
+	CronExpr           string     `json:"cron_expr"`
+	RunAt              *time.Time `json:"run_at"`
+	Timezone           string     `json:"timezone"`
+	NextFireAt         *time.Time `json:"next_fire_at"`
+	LastFiredAt        *time.Time `json:"last_fired_at"`
+	AutoApprove        bool       `json:"auto_approve"`
+	WaitOnLimit        bool       `json:"wait_on_limit"`
 	// MrReworkEnabled is the per-schedule MR-rework override (PRD #841 M2): nil means
 	// inherit the owner default (NULL in the DB, the schedule default per D5), a value is
 	// an explicit override a scheduled run stamps onto itself. It is *bool (tri-state),
@@ -336,14 +376,24 @@ type LastFireSkip struct {
 	WebURL string `json:"web_url"`
 }
 
+// CapacityCheck is the owner-wide admission snapshot for a gated sweep.
+type CapacityCheck struct {
+	InFlight   int64 `json:"in_flight"`
+	Limit      int   `json:"limit"`
+	RoomNeeded int   `json:"room_needed"`
+	Room       int   `json:"room"`
+	Blocked    bool  `json:"blocked"`
+}
+
 // LastFire is the top-level persisted summary of a schedule's last fire (PRD #308 M3).
 // FiredAt is the advance instant; Matched == len(Started) + len(Skips) balances (Decision
 // 4). Tags mirror schedsvc's lastFireRecord exactly so the raw jsonb column unmarshals
 // straight into this struct.
 type LastFire struct {
-	FiredAt time.Time `json:"fired_at"`
-	Matched int       `json:"matched"`
-	Capped  bool      `json:"capped"`
+	Capacity *CapacityCheck `json:"capacity,omitempty"`
+	FiredAt  time.Time      `json:"fired_at"`
+	Matched  int            `json:"matched"`
+	Capped   bool           `json:"capped"`
 	// IneligibleMatched (issue #1543, label sweeps only) is the number of open issues that
 	// match the sweep's selector but are not eligible (neither carrying the configured uzi
 	// label nor assigned to the bot), over the whole selector backlog. Absent/nil (a
@@ -484,10 +534,11 @@ type SchedulePreviewResponse struct {
 // fields carry the full per-candidate outcome so a caller can render it without a second
 // fetch. Started/Skips are non-nil empty slices, matching the persisted convention.
 type RunNowResponse struct {
-	Created int      `json:"created"`
-	RunIDs  []string `json:"run_ids"`
-	Matched int      `json:"matched"`
-	Capped  bool     `json:"capped"`
+	Capacity *CapacityCheck `json:"capacity,omitempty"`
+	Created  int            `json:"created"`
+	RunIDs   []string       `json:"run_ids"`
+	Matched  int            `json:"matched"`
+	Capped   bool           `json:"capped"`
 	// IneligibleMatched (issue #1543, label sweeps only) is the number of open issues that
 	// match the sweep's selector but are not eligible (neither carrying the configured uzi
 	// label nor assigned to the bot), over the whole selector backlog. Absent/nil (a

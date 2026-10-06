@@ -55,6 +55,25 @@ export function RunDefaults() {
     }
   };
 
+  const [crossCheckBusy, setCrossCheckBusy] = useState(false);
+  const [crossCheckError, setCrossCheckError] = useState("");
+  const [crossCheckWarning, setCrossCheckWarning] = useState("");
+
+  const togglePlanCrossCheck = async (plan: boolean) => {
+    setCrossCheckError("");
+    setCrossCheckWarning("");
+    setCrossCheckBusy(true);
+    try {
+      const response = await api.setPlanCrossCheckEnabled(plan);
+      await refresh();
+      setCrossCheckWarning(response.warning ?? "");
+    } catch (err) {
+      setCrossCheckError(errorMessage(err, "Failed to update plan cross-check"));
+    } finally {
+      setCrossCheckBusy(false);
+    }
+  };
+
   const [waitLimitBusy, setWaitLimitBusy] = useState(false);
   const [waitLimitError, setWaitLimitError] = useState("");
 
@@ -522,6 +541,29 @@ export function RunDefaults() {
             onChange={(e) => toggleAutopilot(e.target.checked)}
           />
           <span className="text-fg">Enable autopilot for my account</span>
+        </label>
+      </Card>
+
+      <Card className="space-y-4">
+        <div>
+          <SectionTitle>Cross-check</SectionTitle>
+          <p id="plan-cross-check-help" className="mt-2 text-sm text-muted">
+            A second opinion from the other model family. For new auto-approved runs,
+            the plan must pass before implementation.
+          </p>
+        </div>
+        {crossCheckError && <Alert message={crossCheckError} />}
+        {crossCheckWarning && <Alert tone="warning" message={crossCheckWarning} />}
+        <label className="flex items-center gap-3 text-sm">
+          <input
+            type="checkbox"
+            className="h-4 w-4 accent-brand"
+            aria-describedby="plan-cross-check-help"
+            checked={user?.plan_cross_check_enabled ?? false}
+            disabled={crossCheckBusy}
+            onChange={(e) => togglePlanCrossCheck(e.target.checked)}
+          />
+          <span className="text-fg">Plan cross-check · Required before implementation</span>
         </label>
       </Card>
 

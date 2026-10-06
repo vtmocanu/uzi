@@ -82,6 +82,7 @@ function demoIssueRun(over: Partial<Run> & Pick<Run, "id" | "status" | "health">
     auto_approve: false,
     auto_approve_blocked_reasons: [],
     issue_input_reason: null,
+    plan_cross_check_required: false,
     worker_id: "w-laptop",
     branch: "agent/issue-24",
     model: null,

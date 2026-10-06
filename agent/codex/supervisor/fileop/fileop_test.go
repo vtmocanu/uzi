@@ -322,6 +322,39 @@ func TestSymlinkComponentOutsideBlocked(t *testing.T) {
 	wantErr(t, s.handle(request{ID: 3, Op: opRead, Path: "pwlink"}), codeSymlink)
 }
 
+func TestInstructionSymlinkToAgents(t *testing.T) {
+	s, root := newTestServer(t)
+	const target = "AGENTS.md"
+	const sentinel = "AGENTS_RULES_SENTINEL"
+	wantOK(t, s.handle(request{ID: 1, Op: opWrite, Path: target, Data: b64(sentinel)}))
+	if err := os.Symlink(target, filepath.Join(root, "CLAUDE.md")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	r := s.handle(request{ID: 2, Op: opRead, Path: target})
+	wantOK(t, r)
+	if got := string(respData(t, r)); got != sentinel {
+		t.Fatalf("target content = %q, want %q", got, sentinel)
+	}
+	wantErr(t, s.handle(request{ID: 3, Op: opRead, Path: "CLAUDE.md"}), codeSymlink)
+}
+
+func TestInstructionSymlinkToNestedRules(t *testing.T) {
+	s, root := newTestServer(t)
+	const target = "docs/agent-rules.md"
+	const sentinel = "NESTED_RULES_SENTINEL"
+	wantOK(t, s.handle(request{ID: 1, Op: opMkdir, Path: "docs"}))
+	wantOK(t, s.handle(request{ID: 2, Op: opWrite, Path: target, Data: b64(sentinel)}))
+	if err := os.Symlink(target, filepath.Join(root, "CLAUDE.md")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	r := s.handle(request{ID: 3, Op: opRead, Path: target})
+	wantOK(t, r)
+	if got := string(respData(t, r)); got != sentinel {
+		t.Fatalf("target content = %q, want %q", got, sentinel)
+	}
+	wantErr(t, s.handle(request{ID: 4, Op: opRead, Path: "CLAUDE.md"}), codeSymlink)
+}
+
 func TestSymlinkInsideAlsoBlocked(t *testing.T) {
 	s, root := newTestServer(t)
 	// NO_SYMLINKS is intentional: even a symlink whose target is INSIDE the root is

@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import type { CommandWrapper } from "../src/rmtree.js";
 
 /**
  * PRD #1809 M3 (audit fix): the racer a same-uid agent process can run against a deletion
@@ -51,9 +52,12 @@ export async function seedRacedTree(root: string, victim: string): Promise<void>
 }
 
 /** Start the racer on `root` (stop file under `scratch`); resolves once it is running. */
-export async function startSwapRacer(root: string, victim: string, scratch: string): Promise<{ stop: () => Promise<number> }> {
+export async function startSwapRacer(root: string, victim: string, scratch: string, wrap?: CommandWrapper): Promise<{ stop: () => Promise<number> }> {
   const stopFile = path.join(scratch, "racer.stop");
-  const racer = spawn(process.execPath, ["-e", RACER, root, victim, stopFile, String(RACED_DIRS), String(RACED_FILES)], {
+  const args = ["-e", RACER, root, victim, stopFile, String(RACED_DIRS), String(RACED_FILES)];
+  const command = wrap ? wrap(process.execPath, args) : { command: process.execPath, args };
+  const racer = spawn(command.command, command.args, {
+    env: { PATH: "/usr/bin:/bin" },
     stdio: ["ignore", "pipe", "inherit"],
   });
   let out = "";

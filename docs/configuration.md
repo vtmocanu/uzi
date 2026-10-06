@@ -225,6 +225,10 @@ See [oidc.md](oidc.md#group-based-roles-and-access-prd-55) for the full semantic
 
 Matching is exact and case-sensitive after trimming whitespace from the config value — no glob/regex/path normalization. There is no `UZI_OIDC_*` variable for multiple providers or SAML — out of scope for this iteration (see the PRD).
 
+## Cross-check settings
+
+**Plan cross-check** is a per-user opt-in under **Settings → Run defaults → Cross-check**, not a deployment environment variable. Enabling it requires usable credentials for both Claude and Codex. The requirement is copied onto each new eligible auto-approved run, so toggling the setting does not change a run already created. In this release the checker is unavailable: required runs park at the human plan gate. See [Cross-check](./cross-check.md) for the covered runs and the later checker and code stages.
+
 ## Agent runtime (PRD #4)
 
 See [ARCHITECTURE.md](../ARCHITECTURE.md#agent-runtime-workers-runs-live-view) for how these are used (run lifecycle, sweeper, claim affinity) and [worker-setup.md](worker-setup.md) for the operator procedure. `UZI_SEED_ANTHROPIC_TOKEN` (dev convenience: boot-seeds an existing Anthropic token for the seed admin) is documented above, in the Forge integration seed table, alongside the other startup seeds.

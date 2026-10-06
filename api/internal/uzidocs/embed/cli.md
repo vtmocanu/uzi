@@ -2178,7 +2178,7 @@ A run's trigger provenance — what/how/who started it — is readable this way:
 (DEFAULT `manual`, so always set; historical rows carry a best-effort
 backfilled value), one of: `manual`, `autopilot`, `schedule`, `self_improve`,
 `ci_fix`, `mr_rework`, `chat`, `task`, `task_review`, `then_fix`, `judge`,
-`judge_rerun`, `resume`. The human `run get` view prints it as a `TRIGGER` row,
+`judge_rerun`, `resume`, `cross_check`. The human `run get` view prints it as a `TRIGGER` row,
 and `uzi admin runs` shows it as a `TRIGGER` column.
 
 A run's plan-gate revision is readable the same way:

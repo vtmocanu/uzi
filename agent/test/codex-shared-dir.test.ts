@@ -16,7 +16,7 @@
 // gated on running as WORKER_UID with WORKER+RUNNER group membership (true in the uzi worker
 // gate and the real image; skipped elsewhere).
 
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -28,6 +28,8 @@ import {
   makeProductionLaunchAdviceRoot,
   CODEX_PRODUCTION_PROVIDER,
 } from "../src/codex/codex-executor.js";
+import { GitCache } from "../src/git.js";
+import { runnerTeardownFixture, uidScript, createRunnerTree, seedRunnerRacedTree, assertGone, writePrivateRunnerFile } from "./runner-teardown-fixtures.js";
 import { rmTeardownTree } from "../src/rmtree.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { createJobWorkspace, openJobWorkspace } from "../src/job-workspace.js";
@@ -388,6 +390,94 @@ const GROUP_B_SKIP =
     : "requires running as WORKER_UID with WORKER_UID + RUNNER_UID group membership";
 
 describe("Issue #1492: production paths repair worker-inherited dirs to RUNNER_UID", { skip: GROUP_B_SKIP }, () => {
+describe("runner clone teardown (#2324)", () => {
+  it("removeRunnerClone preserves every outside file during runner-uid swaps", async () => runnerTeardownFixture(async (root, victim) => {
+    const target = path.join(root, "ci-fix-a+b-ș");
+    createRunnerTree(target, "2770");
+    seedRunnerRacedTree(target, victim);
+    const racer = await startSwapRacer(target, victim, root, runnerCommand);
+    let swaps = 0;
+    try { await new GitCache(root, nullLogger()).removeRunnerClone(target).catch(() => undefined); }
+    finally { swaps = await racer.stop(); }
+    await assertVictim(victim, swaps);
+  }));
+
+  it("removeRunnerClone removes ordinary private and shared mixed-uid content", async () => runnerTeardownFixture(async (root) => {
+    const target = path.join(root, "ordinary");
+    createRunnerTree(target, "2770");
+    writePrivateRunnerFile(target);
+    uidScript(commandRootCommand, "const fs=require('node:fs');fs.mkdirSync(process.argv[1]+'/command',{mode:0o700});fs.writeFileSync(process.argv[1]+'/command/file','remove')", target);
+    assert.equal((await fs.lstat(target)).uid, RUNNER_UID);
+    await new GitCache(root, nullLogger()).removeRunnerClone(target);
+    await assertGone(target);
+  }));
+
+  it("removeRunnerClone refuses and retains inaccessible mixed-private content", async () => runnerTeardownFixture(async (root, victim) => {
+    const target = path.join(root, "private-ancestor");
+    createRunnerTree(target, "2770");
+    uidScript(commandRootCommand, "const fs=require('node:fs');fs.mkdirSync(process.argv[1]+'/command',{mode:0o700});fs.chmodSync(process.argv[1]+'/command',0o700);fs.writeFileSync(process.argv[1]+'/command/keep','keep')", target);
+    uidScript(runnerCommand, "require('node:fs').chmodSync(process.argv[1],0o700)", target);
+    await fs.writeFile(path.join(victim, "outside"), "untouched");
+    await assert.rejects(new GitCache(root, nullLogger()).removeRunnerClone(target), /not removed/);
+    assert.equal((await fs.lstat(target)).mode & 0o7777, 0o700);
+    uidScript(runnerCommand, "const fs=require('node:fs');if((fs.lstatSync(process.argv[1]+'/command').mode&0o7777)!==0o700)process.exit(1);fs.chmodSync(process.argv[1],0o2770)", target);
+    uidScript(commandRootCommand, "if(require('node:fs').readFileSync(process.argv[1]+'/command/keep','utf8')!=='keep')process.exit(1)", target);
+    assert.equal(await fs.readFile(path.join(victim, "outside"), "utf8"), "untouched");
+  }));
+
+  it("removeRunnerClone rejects worker roots, symlinks and terminal custody", async () => runnerTeardownFixture(async (root, victim) => {
+    const git = new GitCache(root, nullLogger());
+    const workerTree = path.join(root, "worker-owned");
+    await fs.mkdir(workerTree);
+    await fs.writeFile(path.join(workerTree, "keep"), "keep");
+    await assert.rejects(git.removeRunnerClone(workerTree), /not owned/);
+    assert.equal(await fs.readFile(path.join(workerTree, "keep"), "utf8"), "keep");
+    const link = path.join(root, "link");
+    await fs.symlink(victim, link);
+    await assert.rejects(git.removeRunnerClone(link), /symlink or non-directory/);
+    const target = path.join(root, "protected");
+    createRunnerTree(target);
+    const guard = mock.method(git as unknown as { hasPhysicalTerminalProtection: () => Promise<boolean> }, "hasPhysicalTerminalProtection", async () => true);
+    try { await assert.rejects(git.removeRunnerClone(target, "run-2324"), /terminal record custody/); }
+    finally { guard.mock.restore(); }
+    assert.equal((await fs.lstat(target)).uid, RUNNER_UID);
+  }));
+
+  it("runner cleanup refuses a root identity replaced after the worker pin", async () => runnerTeardownFixture(async (root) => {
+    const { rmRunnerTeardownTree } = await import("../src/rmtree.js");
+    const target = path.join(root, "original");
+    createRunnerTree(target);
+    writePrivateRunnerFile(target);
+    const originalStat = fs.stat.bind(fs);
+    const identity = await fs.stat(target);
+    let swapped = false;
+    const statMock = mock.method(fs, "stat", async (...args: Parameters<typeof fs.stat>) => {
+      const result = await originalStat(...args);
+      if (!swapped && String(result.ino) === String(identity.ino) && String(result.dev) === String(identity.dev) && args[1]?.bigint) {
+        swapped = true;
+        uidScript(runnerCommand, "const fs=require('node:fs');fs.renameSync(process.argv[1],process.argv[1]+'.moved');fs.mkdirSync(process.argv[1]);fs.writeFileSync(process.argv[1]+'/planted','keep')", target);
+      }
+      return result;
+    });
+    try { await assert.rejects(rmRunnerTeardownTree(target), /not removed/); }
+    finally { statMock.mock.restore(); }
+    assert.ok(swapped);
+    uidScript(runnerCommand, "const fs=require('node:fs');if(fs.readFileSync(process.argv[1]+'/planted','utf8')!=='keep'||fs.readFileSync(process.argv[1]+'.moved/private/keep','utf8')!=='keep')process.exit(1)", target);
+  }));
+
+  it("removeRunnerClone single-uid removes a current-worker tree", async () => runnerTeardownFixture(async (root) => {
+    const foreign = path.join(root, "foreign-single-uid");
+    createRunnerTree(foreign);
+    delete process.env.UZI_UID_SPLIT;
+    await assert.rejects(new GitCache(root, nullLogger()).removeRunnerClone(foreign), /not owned/);
+    const target = path.join(root, "single-uid");
+    await fs.mkdir(target);
+    await fs.writeFile(path.join(target, "file"), "remove");
+    await new GitCache(root, nullLogger()).removeRunnerClone(target);
+    await assertGone(target);
+  }));
+});
+
   it("run-home: prepareCodexRunHome repairs the per-run home and codex-data to gid RUNNER_UID", async () => {
     const base = await freshTmp();
     try {

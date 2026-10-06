@@ -14,6 +14,50 @@ func gateSummary(blocks []slack.Block) ([]string, string) {
 	return blockSummary(blocks)
 }
 
+func TestGateBlocksCrossCheckReason(t *testing.T) {
+	for _, reason := range []string{"revise", "model timeout", "checker unavailable", "codex lead unsupported"} {
+		_, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, "", reason))
+		if !strings.Contains(section, "Plan cross-check: "+reason) {
+			t.Fatalf("gate card omitted reason %q: %q", reason, section)
+		}
+		if strings.Contains(section, "findings") {
+			t.Fatalf("gate card included findings: %q", section)
+		}
+	}
+	_, ordinary := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, ""))
+	if strings.Contains(ordinary, "Plan cross-check:") {
+		t.Fatalf("ordinary gate gained cross-check reason: %q", ordinary)
+	}
+}
+
+func TestGateBlocksCrossCheckReasonScrubsBeforeBound(t *testing.T) {
+	token := "glpat-" + strings.Repeat("a", 20)
+	reason := strings.Repeat("x", 189) + " " + token[:12] + "\u202e" + token[12:]
+	_, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, "", reason))
+	if strings.Contains(section, "glpat-") {
+		t.Fatalf("bound leaked token prefix: %q", section)
+	}
+}
+
+func TestGateBlocksCrossCheckReasonSanitizedAndBounded(t *testing.T) {
+	_, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, "",
+		"future_reason\u202e\x1b\n<!channel>"))
+	if !strings.Contains(section, "Plan cross-check: future reason&lt;!channel&gt;") ||
+		strings.ContainsAny(section, "\x1b\u202e") || strings.Contains(section, "<!channel>") {
+		t.Fatalf("unsafe reason: %q", section)
+	}
+	_, bounded := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, "",
+		strings.Repeat("x", 10000)))
+	if !strings.Contains(bounded, "Plan cross-check: stored reason exceeds display limit") ||
+		strings.Contains(bounded, strings.Repeat("x", 200)) {
+		t.Fatalf("unbounded reason: %q", bounded)
+	}
+	_, cleared := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, "", "\u202e\n"))
+	if strings.Contains(cleared, "Plan cross-check:") {
+		t.Fatalf("empty sanitized reason rendered: %q", cleared)
+	}
+}
+
 // No detected roster (nil or []) renders the single legacy Approve button (source
 // own), byte-identical to the pre-M7 shape.
 func TestGateBlocksNoRosterSingleApprove(t *testing.T) {

@@ -21,6 +21,7 @@ vi.mock("../lib/api", async (importOriginal) => {
   return {
     ...actual,
     api: {
+      listScheduleCatalog: vi.fn().mockResolvedValue({ entries: [], enablements: [] }),
       listRepos: vi.fn().mockResolvedValue({ repos: [] }),
       previewSchedule: vi.fn(),
       createSchedule: vi.fn(),
@@ -52,8 +53,9 @@ function renderModal() {
   );
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.mocked(useAuth).mockReturnValue({ uziLabel: "uzi" } as unknown as ReturnType<typeof useAuth>);
+  mockApi.listScheduleCatalog.mockResolvedValue(await realMockApi.listScheduleCatalog());
   mockApi.previewSchedule.mockResolvedValue({ fires: [] });
   mockApi.listRepos.mockResolvedValue({ repos: [] });
   mockApi.checkRepoLabels.mockResolvedValue({ missing: [] });
@@ -228,6 +230,8 @@ function schedFixture(over: Partial<Schedule> = {}): Schedule {
     last_fire: null,
     auto_approve: true,
     wait_on_limit: true,
+    capacity_limit: null,
+    capacity_room_needed: null,
     max_issues: 10,
     guidance: null,
     baked_guidance: null,
@@ -1021,6 +1025,7 @@ describe("owner guidance overlay on a sweep default (issue #675)", () => {
     fireEvent.change(screen.getByPlaceholderText("always add a failing test first"), {
       target: { value: "keep the change tiny and reversible" },
     });
+    await waitFor(() => expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
 
     await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
@@ -1043,6 +1048,7 @@ describe("owner guidance overlay on a sweep default (issue #675)", () => {
     fireEvent.change(screen.getByPlaceholderText("always add a failing test first"), {
       target: { value: "" },
     });
+    await waitFor(() => expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
 
     await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
@@ -1513,5 +1519,104 @@ describe("the per-schedule harness picker (PRD #1429 M4a)", () => {
     const modelSelect = screen.getByLabelText("Model (optional)") as HTMLSelectElement;
     expect(within(modelSelect).getByRole("option", { name: "gpt-6-astra" })).toBeTruthy();
     expect(within(modelSelect).queryByRole("option", { name: "opus" })).toBeNull();
+  });
+});
+
+describe("capacity-gated recurring label sweeps", () => {
+  function edit(over: Partial<Schedule> = {}) {
+    return render(<MemoryRouter><ScheduleModal editing={schedFixture(over)}
+      onClose={vi.fn()} onSaved={vi.fn()} /></MemoryRouter>);
+  }
+  const toggle = () => screen.getByRole("switch", { name: "Limit by unfinished runs" });
+  const batch = () => screen.getByRole("spinbutton", { name: "Issues to send at a time" });
+  const save = () => fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  it("shares N across standalone/inline controls and sends the pair, nullable N, and both-null clear", async () => {
+    edit();
+    fireEvent.change(batch(), { target: { value: "7" } });
+    fireEvent.click(toggle());
+    expect((batch() as HTMLInputElement).value).toBe("7");
+    expect(screen.getByRole("group", { name: "When to send issues" }).textContent).toContain("Only send when I have room");
+    fireEvent.change(screen.getByLabelText("Unfinished-run limit"), { target: { value: "6" } });
+    fireEvent.change(screen.getByLabelText("Room needed to send"), { target: { value: "3" } });
+    fireEvent.change(batch(), { target: { value: "" } });
+    save();
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalledWith("sch-1",
+      expect.objectContaining({ capacity_limit: 6, capacity_room_needed: 3, max_issues: null })));
+    fireEvent.click(toggle());
+    expect((batch() as HTMLInputElement).value).toBe("");
+    save();
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenLastCalledWith("sch-1",
+      expect.objectContaining({ capacity_limit: null, capacity_room_needed: null, max_issues: null })));
+  });
+  it("seeds edits and clears on unsupported target/timing without resurrecting the gate", () => {
+    edit({ capacity_limit: 8, capacity_room_needed: 3, max_issues: 2 });
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+    expect((screen.getByLabelText("Unfinished-run limit") as HTMLInputElement).value).toBe("8");
+    fireEvent.click(screen.getByRole("radio", { name: /Once/ }));
+    expect(screen.queryByRole("switch", { name: "Limit by unfinished runs" })).toBeNull();
+    fireEvent.click(screen.getByRole("radio", { name: /Recurring/ }));
+    expect(toggle().getAttribute("aria-checked")).toBe("false");
+    fireEvent.click(toggle());
+    fireEvent.click(screen.getByRole("radio", { name: /Prompt/ }));
+    expect(screen.queryByRole("switch", { name: "Limit by unfinished runs" })).toBeNull();
+    fireEvent.click(screen.getByRole("radio", { name: /Label sweep/ }));
+    expect(toggle().getAttribute("aria-checked")).toBe("false");
+    save();
+    expect(mockApi.updateSchedule).toHaveBeenCalledWith("sch-1",
+      expect.objectContaining({ capacity_limit: null, capacity_room_needed: null }));
+  });
+  it.each([[0, 1], [51, 1], [4, 5], [4, 0], [4.5, 2], [4, 1.5]])("blocks invalid C=%s K=%s", (c, k) => {
+    edit({ capacity_limit: 4, capacity_room_needed: 2 });
+    fireEvent.change(screen.getByLabelText("Unfinished-run limit"), { target: { value: String(c) } });
+    fireEvent.change(screen.getByLabelText("Room needed to send"), { target: { value: String(k) } });
+    expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+  it("uses the existing 10000 batch bound, independently of capacity", () => {
+    edit({ capacity_limit: 4, capacity_room_needed: 2 });
+    fireEvent.change(batch(), { target: { value: "10000" } });
+    expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.change(batch(), { target: { value: "10001" } });
+    expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+  it.each(["label", "assigned"])("resolves default selector %s from catalog rather than labels", async (selector_kind) => {
+    const catalog = await realMockApi.listScheduleCatalog();
+    const entry = catalog.entries.find((e) => e.slug === "bug-triage")!;
+    mockApi.listScheduleCatalog.mockResolvedValueOnce({ entries: [{ ...entry, selector_kind }], enablements: [] });
+    edit({ origin: "default", catalog_slug: entry.slug, labels: [] });
+    await waitFor(() => expect(mockApi.listScheduleCatalog).toHaveBeenCalled());
+    if (selector_kind === "label") {
+      await waitFor(() => expect(toggle()).toBeTruthy());
+      fireEvent.click(toggle());
+      save();
+      await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalledWith("sch-1",
+        expect.objectContaining({ capacity_limit: 4, capacity_room_needed: 2 })));
+      expect(mockApi.updateSchedule.mock.calls[0][1].target).toBeUndefined();
+    } else {
+      await waitFor(() => expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(false));
+      expect(screen.queryByRole("switch", { name: "Limit by unfinished runs" })).toBeNull();
+      expect(batch()).toBeTruthy();
+    }
+  });
+  it.each([{ labels: [] }, { labels: ["bug", "Planned"] }])("allows custom labels %j and fans the pair out to every repo", async ({ labels }) => {
+    mockApi.listRepos.mockResolvedValue({ repos: [
+      { id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" },
+      { id: "repo-atlas", path_with_namespace: "vtmocanu/atlas" },
+    ] } as Awaited<ReturnType<typeof api.listRepos>>);
+    renderModal();
+    await waitFor(() => expect(screen.getByRole("checkbox", { name: /vtmocanu\/atlas/ })).toBeTruthy());
+    fireEvent.click(screen.getByRole("checkbox", { name: /vtmocanu\/atlas/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /Label sweep/ }));
+    for (const label of labels) {
+      const field = screen.getByPlaceholderText(/add label/i);
+      fireEvent.change(field, { target: { value: label } });
+      fireEvent.keyDown(field, { key: "Enter" });
+    }
+    fireEvent.click(toggle());
+    fireEvent.click(screen.getByRole("button", { name: /Create schedule/ }));
+    await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalledTimes(2));
+    for (const [, input] of mockApi.createSchedule.mock.calls) {
+      expect(input).toMatchObject({ labels, capacity_limit: 4, capacity_room_needed: 2, max_issues: 10 });
+      expect(input.sibling_group_id).toBeTruthy();
+    }
   });
 });

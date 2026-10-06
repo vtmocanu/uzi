@@ -169,6 +169,7 @@ function run(over: Partial<Run>): Run {
     auto_approve: false,
     auto_approve_blocked_reasons: [],
     issue_input_reason: null,
+    plan_cross_check_required: false,
     worker_id: "w1",
     branch: null,
     model: null,

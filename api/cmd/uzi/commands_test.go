@@ -143,12 +143,12 @@ func TestWhoamiJSON(t *testing.T) {
 }
 
 func TestWhoamiTable(t *testing.T) {
-	fc := &uzicli.FakeClient{User: apitypes.UserDTO{ID: "u1", Email: "a@example.com", IsAdmin: true}}
+	fc := &uzicli.FakeClient{User: apitypes.UserDTO{ID: "u1", Email: "a@example.com", IsAdmin: true, PlanCrossCheckEnabled: true}}
 	out, _, code := runCLI(t, fakeEnv(fc), "whoami")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
-	if !strings.Contains(out, "EMAIL") || !strings.Contains(out, "a@example.com") {
+	if !strings.Contains(out, "EMAIL") || !strings.Contains(out, "a@example.com") || !strings.Contains(out, "PLAN CROSS-CHECK") || !strings.Contains(out, "true") {
 		t.Errorf("unexpected table:\n%s", out)
 	}
 }

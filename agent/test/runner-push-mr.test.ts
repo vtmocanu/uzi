@@ -87,8 +87,8 @@ describe("RunRunner — worker-performed push + MR", () => {
     const { gitlab, calls } = fakeGitlab();
     const claim = gitlabClaim(7);
     simulateCommittedWork(); // a real diff, so #279's empty-diff guard does not suppress the MR
-    // An executor that delivers work but reports web's JS deps did not install, so
-    // web's gates (vitest/knip) could not have run — the honest annotation posture.
+    // An executor that delivers work but reports web's dependency provisioning as
+    // unverified; the MR must require actual gate evidence even if existing deps are usable.
     const exec: Executor = {
       run: async (ctx) => ({
         branch: ctx.branch,

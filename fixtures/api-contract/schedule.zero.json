@@ -1,4 +1,6 @@
 {
+  "capacity_limit": null,
+  "capacity_room_needed": null,
   "id": "",
   "repo_id": "",
   "repo_path": "",

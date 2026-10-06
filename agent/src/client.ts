@@ -1,4 +1,5 @@
 import { Readable } from "node:stream";
+import { readPlanCrossCheckReconciliation } from "./cross-check-reconciliation.js";
 import type { DindMeterSample } from "./dind-meter.js";
 import type { Logger } from "./log.js";
 import type { UsageWireRequest } from "./usage-recorder.js";
@@ -27,7 +28,7 @@ import {
   type PublishResponse,
   type PublishResult,
   type ChatClaimResponse,
-  type ClaimResponse,
+  type ClaimResponse as ProtocolClaimResponse,
   type CreateProposalRequest,
   type JobResultRequest,
   type CompletionAttemptRequest,
@@ -45,6 +46,7 @@ import {
   type RegisterRequest,
   type RegisterResponse,
   type StateAck,
+  type PlanCrossCheckReconciliation,
   type StateRequest,
   type UserInput,
   type InputsResponse,
@@ -52,8 +54,8 @@ import {
   type RunOrphanClassificationResponse,
   type MessageGapsResponse,
   type WorkerProposal,
-  type WorkerRunDetail,
-  type WorkerRunListItem,
+  type WorkerRunDetail as ProtocolWorkerRunDetail,
+  type WorkerRunListItem as ProtocolWorkerRunListItem,
   type WorkerRunMessage,
   type JudgeTraceResponse,
   type ReviewRequest,
@@ -86,6 +88,139 @@ import {
   type RecoverySettleRequest,
   type RecoverySettleResponse,
 } from "./protocol.js";
+
+export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model_error" | "model_timeout"
+  | "checker_unavailable" | "confinement_failed" | "timed_out" | "superseded"
+  | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted" | "candidate_refused" | "checker_failed";
+export type ClaimResponse = ProtocolClaimResponse & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
+export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
+export type WorkerRunListItem = ProtocolWorkerRunListItem & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
+export type PlanCrossCheckDiffRefusal = "base_unavailable" | "diff_failed" | "diff_too_large"
+  | "too_many_untracked" | "secret_detected" | "scan_failed";
+export interface PlanCrossCheckCandidate {
+  plan_md: string;
+  milestones: unknown[];
+  required_capabilities: string[];
+  required_tools: string[];
+  size_class: "s" | "m" | "l";
+  base_commit: string;
+  planning_diff: string;
+}
+export interface PlanCrossCheckFindings {
+  summary: string;
+  items: { file: string; severity: "info" | "warning" | "error"; summary: string; rationale: string }[];
+}
+export type PlanCrossCheckResponse = ({ reconciliation?: PlanCrossCheckReconciliation } & (
+  | { result: "parked"; verdict: string; reason_class: string; lead_last_seq: number; reconciliation: PlanCrossCheckReconciliation }
+  | { result: "no_row"; reason_class: "no_candidate"; lead_last_seq: number }
+  | { result: "candidate"; round: number; checker_run_id: string | null; candidate_digest: string;
+      candidate_generation: number; candidate: PlanCrossCheckCandidate;
+      verdict: "pending" | "approve" | "revise" | "block" | "failed";
+      reason_class: "" | "approve" | PlanCrossCheckGateReason;
+      findings: PlanCrossCheckFindings | null; deadline_at: string; lead_last_seq: number }));
+const CROSS_CHECK_FAILURE_REASONS = new Set([
+  "malformed", "model_error", "model_timeout", "checker_unavailable", "confinement_failed",
+  "timed_out", "superseded", "interrupted",
+]);
+const CROSS_CHECK_GATE_REASONS = new Set([...CROSS_CHECK_FAILURE_REASONS,
+  "revise", "block", "codex_lead_unsupported", "planning_diff_refused", "candidate_refused", "checker_failed"]);
+function crossCheckRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function crossCheckText(value: unknown, bytes: number): value is string {
+  return typeof value === "string" && Buffer.byteLength(value, "utf8") <= bytes;
+}
+function crossCheckDeadline(value: unknown): boolean {
+  if (typeof value !== "string" || value.length > 64 ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(value) ||
+      !Number.isFinite(Date.parse(value))) return false;
+  const year = Number(value.slice(0, 4)), month = Number(value.slice(5, 7)), day = Number(value.slice(8, 10));
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return year > 0 && month >= 1 && month <= 12 && day >= 1 && day <= days[month - 1]!;
+}
+function crossCheckPair(verdict: unknown, reason: unknown): boolean {
+  return verdict === "pending" ? reason === "" :
+    verdict === "failed" ? typeof reason === "string" && CROSS_CHECK_FAILURE_REASONS.has(reason) :
+      ["approve", "revise", "block"].includes(verdict as string) && reason === verdict;
+}
+function decodePlanCrossCheckResponse(value: unknown, generation: number): PlanCrossCheckResponse {
+  const invalid = (): never => { throw new Error("invalid " +
+    (crossCheckRecord(value) && value.result === "parked" ? "parked " : "") + "cross-check response"); };
+  if (!crossCheckRecord(value)) return invalid();
+  const wire = value;
+  if (!Number.isInteger(wire.lead_last_seq) || (wire.lead_last_seq as number) < 0 ||
+      (wire.lead_last_seq as number) > 0x7fffffff) return invalid();
+  const proof = readPlanCrossCheckReconciliation(wire);
+  const reconciliation = proof?.claimGeneration === generation ? proof : undefined;
+  const decoded = { ...wire };
+  delete decoded.reconciliation;
+  if (reconciliation) decoded.reconciliation = reconciliation;
+  if (wire.result === "no_row") {
+    if (wire.reason_class !== "no_candidate" || wire.candidate !== undefined) return invalid();
+    return decoded as PlanCrossCheckResponse;
+  }
+  if (wire.result === "parked") {
+    const verdict = wire.verdict === undefined ? "" : wire.verdict;
+    const reason = wire.reason_class === undefined ? "" : wire.reason_class;
+    if (!reconciliation || reconciliation.gateRevision < 1 ||
+        ["candidate", "candidate_digest", "candidate_generation", "checker_run_id", "findings", "round", "deadline_at"]
+          .some((key) => key in wire) ||
+        !(crossCheckPair(verdict, reason) ||
+          (verdict === "" && (reason === "" || CROSS_CHECK_GATE_REASONS.has(reason as string))))) return invalid();
+    return { result: "parked", verdict: verdict as string, reason_class: reason as string,
+      lead_last_seq: reconciliation.leadLastSeq, reconciliation };
+  }
+  if (wire.result !== "candidate" || wire.round !== 1 ||
+      !Number.isSafeInteger(wire.candidate_generation) || (wire.candidate_generation as number) <= 0 ||
+      (wire.checker_run_id !== null && (typeof wire.checker_run_id !== "string" ||
+        !/^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$/.test(wire.checker_run_id))) ||
+      typeof wire.candidate_digest !== "string" || !/^[a-fA-F0-9]{64}$/.test(wire.candidate_digest) ||
+      !crossCheckDeadline(wire.deadline_at) || !crossCheckPair(wire.verdict, wire.reason_class))
+    return invalid();
+  const c = wire.candidate;
+  if (!crossCheckRecord(c) || !crossCheckText(c.plan_md, 256 * 1024) ||
+      !crossCheckText(c.planning_diff, 512 * 1024) ||
+      typeof c.base_commit !== "string" || !/^[a-fA-F0-9]{40}$/.test(c.base_commit) ||
+      !["s", "m", "l"].includes(c.size_class as string) ||
+      !Array.isArray(c.milestones) || c.milestones.length > 64 ||
+      Buffer.byteLength(JSON.stringify(c.milestones), "utf8") > 256 * 1024) return invalid();
+  // Canonical stored nil capability/tool slices serialize as null, unlike milestones.
+  const list = (v: unknown): string[] | undefined =>
+    v === null ? [] : Array.isArray(v) && v.length <= 64 && v.every((s) => crossCheckText(s, 256)) ? v : undefined;
+  const caps = list(c.required_capabilities), tools = list(c.required_tools);
+  if (!caps || !tools) return invalid();
+  // The normalizer preserves extra milestone prose, bounded to depth 32 and total bytes.
+  const prose = (v: unknown, depth: number): boolean => depth <= 32 &&
+    (typeof v === "string" ? crossCheckText(v, 256 * 1024) :
+      Array.isArray(v) ? v.every((x) => prose(x, depth + 1)) :
+        crossCheckRecord(v) ? Object.entries(v).every(([k, x]) => crossCheckText(k, 128) && prose(x, depth + 1)) : true);
+  if (!prose(c.milestones, 0) || !c.milestones.every((m) => crossCheckRecord(m) &&
+      (m.id === undefined || m.id === null || crossCheckText(m.id, 64)) &&
+      (m.title === undefined || m.title === null || crossCheckText(m.title, 256 * 1024)))) return invalid();
+  const f = wire.findings;
+  if (f !== null) {
+    if (!crossCheckRecord(f) || !crossCheckText(f.summary, 4096) ||
+        !(f.items === null || Array.isArray(f.items)) ||
+        (Array.isArray(f.items) && (f.items.length > 20 || !f.items.every((item) =>
+          crossCheckRecord(item) && crossCheckText(item.file, 512) &&
+          ["info", "warning", "error"].includes(item.severity as string) &&
+          crossCheckText(item.summary, 1024) && crossCheckText(item.rationale, 2048) &&
+          Buffer.byteLength(item.file + item.severity + item.summary + item.rationale, "utf8") <= 2048 &&
+          Object.keys(item).every((key) => ["file", "severity", "summary", "rationale"].includes(key))))) ||
+        Object.keys(f).some((key) => !["summary", "items"].includes(key)) ||
+        Buffer.byteLength(JSON.stringify(f), "utf8") > 32 * 1024) return invalid();
+    decoded.findings = { ...f, items: f.items ?? [] };
+  }
+  decoded.candidate = { ...c, required_capabilities: caps, required_tools: tools };
+  return decoded as PlanCrossCheckResponse;
+}
+
+export type PlanCrossCheckStateRequest = StateRequest & {
+  plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null;
+  plan_cross_check_diff_refusal?: PlanCrossCheckDiffRefusal;
+  plan_cross_check_refusal?: "candidate_too_large" | "candidate_invalid" | "envelope_too_large" | "submit_failed";
+};
 
 /** A job input file download hit its per-file timeout (WorkerClient#downloadJobFile), before or
  *  after the response headers. Distinct from a torn stream so the job reports a timeout. */
@@ -1110,7 +1245,19 @@ export class WorkerClient {
     deadline.throwIfAborted();
     if (res.status === 204) return null;
     if (res.status >= 400) throw await this.toError("POST", `${WORKER_API_PREFIX}/runs/claim`, res);
-    const claim = (await res.json()) as ClaimResponse;
+    const marker = res.headers.get("X-Uzi-Claim-Kind");
+    if (marker !== null && marker !== "cross_check") {
+      await res.body?.cancel();
+      throw new Error("unknown dedicated claim marker");
+    }
+    // Unmarked ordinary claims keep their existing decoder. This does not bound an
+    // arbitrary compromised unmarked response; the server envelope is a separate gate.
+    const claim = (marker === "cross_check"
+      ? JSON.parse(await readBoundedText(res, 2 * 1024 * 1024, true))
+      : await res.json()) as ClaimResponse;
+    if ((marker === "cross_check") !== (isRecord(claim) && claim.kind === "cross_check")) {
+      throw new Error("cross-check claim marker and kind disagree");
+    }
     deadline.throwIfAborted();
     // PRD #1798 D9: the pr_description is validated or dropped, never cast (decodePrState, the
     // same check as the bind / lookup / ack responses). The warning carries the run id only,
@@ -1267,7 +1414,36 @@ export class WorkerClient {
    * so parsing a 409's status back out of the error text would work in tests and
    * fail on real runs.
    */
-  async reportState(runId: string, body: StateRequest, signal?: AbortSignal): Promise<StateAck> {
+  async submitPlanCrossCheck(runId: string, claimGeneration: number, candidate: PlanCrossCheckCandidate, signal?: AbortSignal): Promise<PlanCrossCheckResponse> {
+    return decodePlanCrossCheckResponse(await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
+      { stage: "plan", claim_generation: claimGeneration, ...candidate },
+      this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES), claimGeneration);
+  }
+
+  async planCrossCheckStatus(runId: string, claimGeneration: number, round = 1, signal?: AbortSignal): Promise<PlanCrossCheckResponse> {
+    return decodePlanCrossCheckResponse(await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks/plan/${round}?claim_generation=${claimGeneration}`,
+      undefined, CROSS_CHECK_RESPONSE_MAX_BYTES, signal), claimGeneration);
+  }
+
+  async reportCrossCheckVerdict(runId: string, claimGeneration: number, result:
+    ({ verdict: "approve"; reason_class: "approve" } | { verdict: "revise"; reason_class: "revise" }
+      | { verdict: "block"; reason_class: "block" } | { verdict: "failed";
+          reason_class: "malformed" | "model_error" | "model_timeout" | "checker_unavailable" | "confinement_failed" })
+    & PlanCrossCheckFindings, signal?: AbortSignal): Promise<void> {
+    await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-check-verdict`,
+      { claim_generation: claimGeneration, ...result },
+      this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+  }
+
+  /** Checked plan writes never downgrade their immutable generation or gate identity. */
+  async reportPlanCrossCheckGateState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
+    if (!Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
+        !this.serverFeatures.has("gate_revision_v1"))
+      throw new Error("checked plan state requires generation and gate_revision_v1");
+    return this.reportStateOnce(runId, `${WORKER_API_PREFIX}/runs/${runId}/state`, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+  }
+
+  async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
     // PRD #1247 fix round (E): /state carries claim_generation on EVERY mutating report (M5b's
     // reportState closure stamps it), but /state DisallowUnknownFields-decodes, so a rolled-back api
@@ -1299,7 +1475,7 @@ export class WorkerClient {
    *  handling, 200/409 single-body ACK parse, already-terminal handling and logging. Split out of
    *  reportState (PRD #1247 fix round E) so the claim_generation send-gate + strict-decode
    *  strip-and-retry can drive it through withGenerationFallback, exactly as postMessages. */
-  private async reportStateOnce(runId: string, path: string, body: StateRequest, signal?: AbortSignal): Promise<StateAck> {
+  private async reportStateOnce(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal, maxAckBytes?: number): Promise<StateAck> {
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted();
       try {
@@ -1312,7 +1488,7 @@ export class WorkerClient {
           // the ACK so a FRESH run — frozen mid-run at plan-approval, after its claim was
           // already issued — learns its scaled cap here (a resume gets it on the claim
           // config instead). Absent/non-numeric ⇒ left undefined = "no budget update".
-          const fields = await readRunAck(res);
+          const fields = await readRunAck(res, maxAckBytes);
           const ack: StateAck = {
             applied: res.status === 200,
             status: fields.status,
@@ -1370,6 +1546,9 @@ export class WorkerClient {
           // PRD #1795 M1 (decision 5): the revision an awaiting_approval report was answered with,
           // read like contractRevision off the same single-use body (top-level, beside `run`).
           if (fields.gateRevision !== undefined) ack.gateRevision = fields.gateRevision;
+          if (ack.applied && fields.reconciliation !== undefined &&
+              fields.reconciliation.claimGeneration === body.claim_generation)
+            ack.reconciliation = fields.reconciliation;
           if (!ack.applied) {
             this.log.info("state report not applied server-side", {
               run_id: runId,
@@ -2535,11 +2714,12 @@ export class WorkerClient {
     body: unknown,
     timeoutMs = this.httpTimeoutMs,
     callerSignal?: AbortSignal,
+    maxResponseBytes?: number,
   ): Promise<unknown> {
     const res = await this.fetchRaw("POST", path, body, timeoutMs, callerSignal);
     if (res.status >= 400) throw await this.toError("POST", path, res);
     if (res.status === 204) return undefined;
-    const text = await res.text();
+    const text = maxResponseBytes === undefined ? await res.text() : await readBoundedText(res, maxResponseBytes, true);
     return text ? JSON.parse(text) : undefined;
   }
 
@@ -2664,10 +2844,10 @@ export class WorkerClient {
     }
   }
 
-  private async getJSON(path: string, timeoutMs?: number): Promise<unknown> {
-    const res = await this.fetchRaw("GET", path, undefined, timeoutMs);
+  private async getJSON(path: string, timeoutMs?: number, maxResponseBytes?: number, signal?: AbortSignal): Promise<unknown> {
+    const res = await this.fetchRaw("GET", path, undefined, timeoutMs, signal);
     if (res.status >= 400) throw await this.toError("GET", path, res);
-    const text = await res.text();
+    const text = maxResponseBytes === undefined ? await res.text() : await readBoundedText(res, maxResponseBytes, true);
     return text ? JSON.parse(text) : undefined;
   }
 
@@ -2718,6 +2898,13 @@ function retryAfterMsOf(h: string | null): number | undefined {
   return Math.min(Number(h.trim()), 3600) * 1000;
 }
 
+/** Cross-check response budget, including Go JSON escaping (up to 6 bytes per input byte).
+ * NormalizePlanCrossCheckCandidate caps plan/diff at 256/512 KiB, milestones JSON at 256 KiB,
+ * and 64 capability plus 64 tool names at 256 bytes each (32 KiB). NormalizeCrossCheckFindings caps
+ * serialized findings at 32 KiB. Thus 6 * (256 + 512 + 32) + 256 + 32 = 5088 KiB;
+ * reserving another 64 KiB for keys/metadata stays below 6 MiB. Count actual streamed bytes,
+ * never Content-Length; the cross-check methods and strict gate ACK opt in. */
+const CROSS_CHECK_RESPONSE_MAX_BYTES = 6 * 1024 * 1024;
 /** Maximum success body size for the Codex release and refresh envelopes. */
 const CODEX_SUCCESS_BODY_MAX_BYTES = 64 * 1024;
 
@@ -2746,21 +2933,34 @@ async function readCodexSuccessText(res: Response): Promise<string> {
   }
 }
 
+/** Actual response byte overflow is permanent; transport read failures remain retryable. */
+class ResponseBodyOverflowError extends Error {
+  constructor(maxBytes: number) {
+    super(`response body exceeds ${maxBytes} bytes`);
+    this.name = "ResponseBodyOverflowError";
+  }
+}
+
 /** Most bytes of an error response body toError reads. */
 const ERROR_BODY_MAX_BYTES = 4096;
 
 /** Read at most `maxBytes` of `res`'s body as UTF-8 text, then cancel the stream so a hostile or
  *  unending body neither fills memory nor holds the connection. A body that ends sooner is read
- *  whole, so a small body yields exactly what Response#text() would. A read failure rejects. */
-async function readBoundedText(res: Response, maxBytes: number): Promise<string> {
+ *  whole, so a small body yields exactly what Response#text() would. A read failure rejects.
+ *  With rejectOverflow, read through EOF (including at the exact cap) and reject any chunk
+ *  exceeding the remaining byte budget before retaining or decoding it. */
+async function readBoundedText(res: Response, maxBytes: number, rejectOverflow = false): Promise<string> {
   if (!res.body) return "";
   const reader = res.body.getReader();
   const parts: Uint8Array[] = [];
   let total = 0;
   try {
-    while (total < maxBytes) {
+    while (total < maxBytes || rejectOverflow) {
       const { done, value } = await reader.read();
       if (done) break;
+      if (rejectOverflow && value.byteLength > maxBytes - total) {
+        throw new ResponseBodyOverflowError(maxBytes);
+      }
       parts.push(value.length > maxBytes - total ? value.subarray(0, maxBytes - total) : value);
       total += parts[parts.length - 1]!.length;
     }
@@ -2777,7 +2977,11 @@ async function readBoundedText(res: Response, maxBytes: number): Promise<string>
  * ONCE — a Response body is single-use — so status and both budget numbers must come out
  * of one parse.
  *
- * TOTAL by construction: every failure — an unreadable stream, malformed JSON, a
+ * With maxAckBytes, readBoundedText rejects actual byte overflow or stream failure outside
+ * the compatibility catch, so a strict gate report cannot manufacture a successful ACK.
+ * JSON decoding and per-field absence semantics remain unchanged.
+ *
+ * Without maxAckBytes, TOTAL by construction: every failure — an unreadable stream, malformed JSON, a
  * body with no run, a non-string status, a non-numeric budget, an older server that sent
  * nothing — yields the field absent rather than throwing. That is not defensiveness for
  * its own sake: the status caller's rule is a POSITIVE test for one literal, so a missing
@@ -2786,7 +2990,7 @@ async function readBoundedText(res: Response, maxBytes: number): Promise<string>
  * report that appears to have failed, and would be retried against a server that already
  * applied it.
  */
-export async function readRunAck(res: Response): Promise<{
+export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   status?: string;
   holdReason?: string | null;
   budgetMaxIterations?: number;
@@ -2805,9 +3009,11 @@ export async function readRunAck(res: Response): Promise<{
   staleClaim?: boolean;
   credentialSwitchReleased?: boolean;
   gateRevision?: number;
+  reconciliation?: PlanCrossCheckReconciliation;
 }> {
+  const boundedText = maxAckBytes === undefined ? undefined : await readBoundedText(res, maxAckBytes, true);
   try {
-    const text = await res.text();
+    const text = boundedText ?? await res.text();
     if (!text) return {};
     const parsed = JSON.parse(text) as {
       // PRD #1392 M2 (D10): `reason` is TOP-LEVEL on the {run, reason?} ack body, NOT under run.
@@ -2857,6 +3063,7 @@ export async function readRunAck(res: Response): Promise<{
       staleClaim?: boolean;
       credentialSwitchReleased?: boolean;
       gateRevision?: number;
+      reconciliation?: PlanCrossCheckReconciliation;
     } = {};
     if (typeof run?.status === "string") out.status = run.status;
     // PRD #1497 M2: the RunDTO's hold_reason rides the SAME body as `status`. A string only — a
@@ -2940,6 +3147,10 @@ export async function readRunAck(res: Response): Promise<{
     // leaves it undefined, which the gate reads as "no revision confirmed" (bound verdicts wait).
     const gateRev = parsed?.gate_revision;
     if (typeof gateRev === "number" && Number.isSafeInteger(gateRev) && gateRev >= 1) out.gateRevision = gateRev;
+    const reconciliation = readPlanCrossCheckReconciliation(parsed);
+    if (res.status === 200 && reconciliation !== undefined &&
+        (out.status !== "awaiting_approval" || reconciliation.gateRevision > 0))
+      out.reconciliation = reconciliation;
     return out;
   } catch {
     return {};
@@ -2969,7 +3180,7 @@ export function isTransientStatus(status: number): boolean {
  *  2xx pr-description response, {@link PrDescriptionMalformedResponse}). */
 export function isTransient(err: unknown): boolean {
   // A malformed 2xx pr-description body: the api answered, so retrying could re-apply a write.
-  if (err instanceof PrDescriptionMalformedResponse) return false;
+  if (err instanceof PrDescriptionMalformedResponse || err instanceof ResponseBodyOverflowError) return false;
   if (err instanceof RequestError) {
     return isTransientStatus(err.status);
   }

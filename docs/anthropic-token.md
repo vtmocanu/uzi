@@ -16,17 +16,38 @@ save it — not in the UI, not in an API response, not in a log.
 
 ## Which credential to use
 
-Prefer the first.
+Either works; pick the one that matches how you pay for Claude.
 
 | Credential | How you get it | Best for |
 |---|---|---|
-| **OAuth token** (recommended) | `claude setup-token` (needs the Claude Code CLI and a Claude Pro/Max subscription login) | Anyone already on Claude Code; billed against your subscription. |
+| **OAuth token** | `claude setup-token` (needs the Claude Code CLI and a Claude Pro/Max subscription login) | Anyone already on Claude Code; billed against your subscription. |
 | **Console API key** | [console.anthropic.com](https://console.anthropic.com) → **API keys** → **Create key** | Anyone on usage-based API billing without a subscription. |
 
 Both paste into the same field; uzi doesn't check for a particular prefix,
 so either kind is accepted. Storing one of each is the common reason to hold
 more than one token: subscription for the work, console key for the
 retrospectives.
+
+### Whose credentials
+
+uzi is self-hosted: it runs the official Claude Agent SDK (the Claude Code
+binary) on your own infrastructure, with a credential you minted yourself.
+uzi technically supports both kinds; which one your use is authorized for is
+set by Anthropic's terms, not by uzi.
+
+- **Use only your own credentials.** Never store someone else's token or
+  share yours; Anthropic's terms forbid sharing account credentials.
+- **Subscription (OAuth) tokens.** The
+  [Agent SDK overview](https://code.claude.com/docs/en/agent-sdk/overview)
+  says Anthropic does not allow third-party developers to offer claude.ai
+  login or rate limits for their products, including agents built on the
+  Agent SDK, unless previously approved. uzi has no such approval; the
+  docs do not say whether a self-hosted tool running your own token counts,
+  so decide for your own use. Subscription use falls under the
+  [Consumer Terms](https://www.anthropic.com/legal/consumer-terms).
+- **Console API keys** fall under Anthropic's
+  [Commercial Terms](https://www.anthropic.com/legal/commercial-terms), the
+  authentication the Agent SDK documentation directs third-party products to.
 
 ## 1. Mint a credential
 

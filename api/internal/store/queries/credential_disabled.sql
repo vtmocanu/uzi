@@ -62,37 +62,96 @@ LIMIT @page_size::int;
 -- Promotion banks only the parked interval. The active time already spent before
 -- parking must still fit the frozen budget; the hold interval is excluded.
 -- name: PromoteCredentialDisabledRun :one
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.user_id = @user_id
+  AND runs.status = 'paused' AND runs.hold_reason = 'credential_disabled'
+  AND runs.pause_requested_at IS NULL
+  AND runs.credential_override_mode IS NOT DISTINCT FROM sqlc.narg('expected_override_mode')::text
+  AND runs.credential_override_secret_id IS NOT DISTINCT FROM sqlc.narg('expected_override_secret_id')::uuid
+  AND runs.codex_secret_id IS NOT DISTINCT FROM sqlc.narg('expected_codex_secret_id')::uuid
+  AND runs.worker_id IS NOT DISTINCT FROM sqlc.narg('expected_worker_id')::uuid
+  AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL OR
+       (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int)
+          + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+       - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int)
+          - runs.budget_paused_seconds) > 0)
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET
     status = 'queued',
     status_since = now(),
-    budget_paused_seconds = budget_paused_seconds
-        + GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int),
+    budget_paused_seconds = runs.budget_paused_seconds
+        + GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int),
     hold_reason = NULL,
     -- Resume affinity is kept: the undelivered-claim park fences no incarnation. Only a row
     -- that carries a D19 released incarnation drops its worker, as ResumePausedRun does.
-    worker_id = CASE WHEN released_worker_id IS NOT NULL THEN NULL ELSE worker_id END,
+    worker_id = CASE WHEN runs.released_worker_id IS NOT NULL THEN NULL ELSE runs.worker_id END,
     codex_cap_hash = NULL,
-    codex_claim_epoch = codex_claim_epoch + 1,
+    codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE id = @id AND user_id = @user_id
-  AND status = 'paused' AND hold_reason = 'credential_disabled'
-  AND pause_requested_at IS NULL
+WHERE runs.id = @id AND runs.user_id = @user_id
+  AND runs.status = 'paused' AND runs.hold_reason = 'credential_disabled'
+  AND runs.pause_requested_at IS NULL
   -- The requirement the promoter evaluated must still be the run's requirement: a
   -- concurrent reassignment or rebind that is not serialized by the caller's locks
   -- makes this match 0 rows instead of promoting on a stale requirement.
-  AND credential_override_mode IS NOT DISTINCT FROM sqlc.narg('expected_override_mode')::text
-  AND credential_override_secret_id IS NOT DISTINCT FROM sqlc.narg('expected_override_secret_id')::uuid
-  AND codex_secret_id IS NOT DISTINCT FROM sqlc.narg('expected_codex_secret_id')::uuid
-  AND worker_id IS NOT DISTINCT FROM sqlc.narg('expected_worker_id')::uuid
+  AND runs.credential_override_mode IS NOT DISTINCT FROM sqlc.narg('expected_override_mode')::text
+  AND runs.credential_override_secret_id IS NOT DISTINCT FROM sqlc.narg('expected_override_secret_id')::uuid
+  AND runs.codex_secret_id IS NOT DISTINCT FROM sqlc.narg('expected_codex_secret_id')::uuid
+  AND runs.worker_id IS NOT DISTINCT FROM sqlc.narg('expected_worker_id')::uuid
   -- Untimed runs (chat, judge, interactive) have no wall (RequestWallParks' own exclusions),
   -- so the spent-budget guard applies only to a timed run.
-  AND (kind IN ('chat', 'judge') OR interactive OR started_at IS NULL OR
-       (COALESCE(budget_wall_seconds, @global_timeout_seconds::int)
-          + budget_extension_seconds + budget_finalize_seconds)
-       - (GREATEST(0, EXTRACT(EPOCH FROM (status_since - started_at))::int)
-          - budget_paused_seconds) > 0)
-RETURNING id, user_id, status;
+  AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL OR
+       (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int)
+          + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+       - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int)
+          - runs.budget_paused_seconds) > 0)
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ))
+RETURNING runs.id, runs.user_id, runs.status;
 
 -- An owner reassignment of an existing credential hold that can go straight back to the queue
 -- (no pending pause, budget left): the override and the promotion in one statement. The caller
@@ -101,32 +160,87 @@ RETURNING id, user_id, status;
 -- pause or budget_exhausted, as the promoter does. The whole reassignment is one transaction,
 -- so a refusal leaves no override behind.
 -- name: ReassignCredentialDisabledRun :one
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.user_id = @user_id
+  AND runs.status = 'paused' AND runs.hold_reason = 'credential_disabled'
+  AND runs.pause_requested_at IS NULL
+  AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL OR
+       (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int)
+          + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+       - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int)
+          - runs.budget_paused_seconds) > 0)
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
 UPDATE runs SET
     credential_override_mode = @mode,
     credential_override_secret_id = @secret_id,
     status = 'queued',
     status_since = now(),
-    budget_paused_seconds = budget_paused_seconds
-        + GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int),
+    budget_paused_seconds = runs.budget_paused_seconds
+        + GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int),
     hold_reason = NULL,
     -- Resume affinity is kept: the undelivered-claim park fences no incarnation. Only a row
     -- that carries a D19 released incarnation drops its worker, as ResumePausedRun does.
-    worker_id = CASE WHEN released_worker_id IS NOT NULL THEN NULL ELSE worker_id END,
+    worker_id = CASE WHEN runs.released_worker_id IS NOT NULL THEN NULL ELSE runs.worker_id END,
     codex_cap_hash = NULL,
-    codex_claim_epoch = codex_claim_epoch + 1,
+    codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE id = @id AND user_id = @user_id
-  AND status = 'paused' AND hold_reason = 'credential_disabled'
-  AND pause_requested_at IS NULL
+WHERE runs.id = @id AND runs.user_id = @user_id
+  AND runs.status = 'paused' AND runs.hold_reason = 'credential_disabled'
+  AND runs.pause_requested_at IS NULL
   -- Untimed runs (chat, judge, interactive) have no wall (RequestWallParks' own exclusions),
   -- so the spent-budget guard applies only to a timed run.
-  AND (kind IN ('chat', 'judge') OR interactive OR started_at IS NULL OR
-       (COALESCE(budget_wall_seconds, @global_timeout_seconds::int)
-          + budget_extension_seconds + budget_finalize_seconds)
-       - (GREATEST(0, EXTRACT(EPOCH FROM (status_since - started_at))::int)
-          - budget_paused_seconds) > 0)
-RETURNING id, user_id, status;
+  AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL OR
+       (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int)
+          + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+       - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int)
+          - runs.budget_paused_seconds) > 0)
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ))
+RETURNING runs.id, runs.user_id, runs.status;
 
 -- The claim finisher's in-transaction enablement re-check of the credential the payload
 -- resolved, taken under the exact-claim run lock and after the Codex alias/account locks.

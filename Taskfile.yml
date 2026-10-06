@@ -285,6 +285,7 @@ tasks:
     cmds:
       - task: lint:shell
       - task: lint:yaml
+      - task: check:skill-triage-render
       - task: lint:formula
       # Workflow linting (actionlint + zizmor). Grouped with the other lint:* checks;
       # like them it fail-open SKIPs when its tools are absent on a laptop and is
@@ -1261,6 +1262,16 @@ tasks:
       # No .github/workflows edit: the lint-repo job runs `task gate:repo`, which lists this.
       # See the script header.
       - ./scripts/check-api-v1-compat.sh "{{.OASDIFF_VERSION}}" scripts/api-v1-compat-canary api/openapi/v1.yaml
+
+  check:skill-triage-render:
+    # The sanitizer runs inside jq, so the offline hostile-field suite is required
+    # under bash in CI. Also execute the documented snippets under zsh when present
+    # to catch quoting/word-splitting differences; print a bash-only note if absent.
+    # Local zsh verification is required when editing these workstation snippets.
+    # No forge reads: the regression mocks gh and exercises SKILL.md's real pipelines.
+    desc: reject terminal-control and bidi bytes in issue-triage renderers
+    cmds:
+      - python3 -B .agents/skills/issue-triage/scripts/test-rendering.py
 
   check:skill-size:
     desc: no repo skill's SKILL.md exceeds the 65536-byte runtime cap (over-cap skills are dropped silently at run time), with a canary proving the detector fired
@@ -2629,6 +2640,46 @@ tasks:
     desc: Opt-in Linux supervisor mechanism characterization
     cmds:
       - python3 -B e2e/codex-m0/supervisor-mechanism.test.py
+
+  test:cross-check-confinement:
+    desc: Required plan checker filesystem confinement and packaged provider/fileop proofs
+    env:
+      UZI_UID_SPLIT: "1"
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=vendor -buildvcs=false
+    cmds:
+      - |
+        set -eu
+        if [ "$(uname -s)" != Linux ]; then
+          echo "NOT RUN: cross-check confinement requires Linux" >&2
+          exit 2
+        fi
+        for prerequisite in go node; do
+          if ! command -v "$prerequisite" >/dev/null; then
+            echo "NOT RUN: missing $prerequisite for confinement proof" >&2
+            exit 2
+          fi
+        done
+        if ! (cd agent && node --import tsx -e ""); then
+          echo "NOT RUN: agent test dependencies unavailable" >&2
+          exit 2
+        fi
+        mkdir -p .uzi/scratch
+        proof_dir="$(mktemp -d .uzi/scratch/cross-check-proof.XXXXXX)"
+        chmod 755 "$proof_dir"
+        proof_dir="$(cd "$proof_dir" && pwd)"
+        trap 'rm -rf "$proof_dir"' EXIT
+        go -C agent/codex/supervisor build -o "$proof_dir/sandbox" ./cmdsandbox
+        go -C agent/codex/supervisor build -o "$proof_dir/supervisor" .
+        go -C agent/codex/supervisor build -o "$proof_dir/fileop" ./fileop
+        export UZI_CROSS_CHECK_SANDBOX="$proof_dir/sandbox"
+        export UZI_CROSS_CHECK_SUPERVISOR="$proof_dir/supervisor"
+        export UZI_CROSS_CHECK_FILEOP="$proof_dir/fileop"
+        export UZI_CROSS_CHECK_CONFINEMENT_REQUIRED=1
+        go -C agent/codex/supervisor test -count=1 ./cmdsandbox -run TestCrossCheck
+        node agent/test/cross-check-confinement-probe.mjs
+        cd agent
+        node --import tsx --test --test-concurrency=1 --test-timeout=120000 test/cross-check-confinement-packaged.probe.ts
 
   test:codex-supervisor:
     desc: Opt-in Linux-only gofmt vet and unit tests for the static Codex process supervisor module

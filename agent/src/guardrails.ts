@@ -27,7 +27,10 @@
 // `Read /proc/<worker_pid>/environ` (which leaks the worker's join token), by an
 // absolute path into `/etc`, or by a `..` escape out of the worktree. The path
 // guard denies /proc, anything resolving outside the run worktree, and anything
-// under `.git/`.
+// under `.git/`. One narrow exception (#2332): the Claude SDK spills oversized tool
+// output to `<HOME>/.claude/projects/<P>/<session_id>/tool-results/<file>`, and the
+// agent's own READ of that one direct-child regular file is allowed, keyed on the
+// SDK-supplied session_id/transcript_path of the hook input (see sdkSpillRoots).
 //
 // Residual (accepted, documented at merge):
 //  - Shell-expansion indirection a static screener cannot see through
@@ -335,19 +338,24 @@ const EXPORT_BUILTINS = new Set(["export", "declare", "typeset", "local"]);
 // Built from WRITE_PATH_TOOLS (defined above, exported) plus the read-only ones,
 // so THIS set and the plan-turn subtraction in agents.ts cannot drift.
 //
-// THAT IS TWO OF THREE COPIES, AND THE THIRD IS THE ONE THAT GATES THIS ONE.
+// THE HOOK'S `matcher` GATES THIS SET.
 // The hook's `matcher` decides whether the guard is invoked at all; the
 // `PATH_TOOLS.has(...)` test below is a SECOND filter that only ever sees names
-// the matcher already admitted. Two hand-written matcher literals spell the list
+// the matcher already admitted. Three hand-written matcher literals spell the list
 // out and derive from nothing:
 //
-//   agent/src/sdk-executor.ts    matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep"
-//   agent/src/chat-executor.ts   matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep"
+//   agent/src/sdk-executor.ts       matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep"
+//   agent/src/chat-executor.ts      matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep"
+//   agent/src/isolated-executor.ts  matcher: the same literal
+//
+// (agent/src/job-runner.ts re-spells "Read", "Glob" and "Grep" and derives only its
+// write-tool half from WRITE_PATH_TOOLS:
+// matcher: ["Read", "Glob", "Grep", ...WRITE_PATH_TOOLS].join("|").)
 //
 // So adding a fifth write tool to WRITE_PATH_TOOLS grows this set and grows the
 // plan-turn subtraction, and THE PATH JAIL STILL DOES NOT REACH THE NEW TOOL,
-// because neither matcher mentions it. The three lists agree today; nothing
-// enforces that. Update all three, or derive the matchers from this constant.
+// because none of the three literal matchers mentions it. The lists agree today; nothing enforces that.
+// Update every literal site, or derive those matchers from this constant.
 const PATH_TOOLS = new Set<string>(["Read", "Glob", "Grep", ...WRITE_PATH_TOOLS]);
 // git global options that consume the following token as their value.
 const GIT_VALUE_OPTS = new Set(["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"]);
@@ -1442,16 +1450,23 @@ export function extractToolPaths(toolInput: unknown): string[] {
  * push, sdk-executor.killAgentTree) remains a second layer against a `setsid`-escaped
  * survivor. The cross-container k8s form (shareProcessNamespace:false / userns / gVisor)
  * is mapped in docs/proc-hardening.md.
+ *
+ * `readOnlyRoot` (#2332) is the optional SDK spill directory a READ may touch, as
+ * a `{ lexical, real }` pair: `lexical` is applied to the lexical pass and `real`
+ * (the HOME realpath'd, the tail kept lexical) to the realpath pass, so a symlinked
+ * HOME ancestor works while a symlink inside the spill dir still resolves outside
+ * `real` and is denied. The caller only passes it for the Read tool.
  */
 export function screenToolPath(
   candidate: string,
   worktreeRoot: string,
   cwd: string,
   secretPaths: readonly string[] = [],
+  readOnlyRoot?: { lexical: string; real: string },
 ): BashScreenResult {
   const root = path.resolve(worktreeRoot);
   const lexical = path.resolve(cwd || root, candidate);
-  const lexicalResult = classifyResolvedPath(candidate, lexical, root, secretPaths);
+  const lexicalResult = classifyResolvedPath(candidate, lexical, root, secretPaths, readOnlyRoot?.lexical);
   if (lexicalResult.denied) return lexicalResult;
   // Resolve symlinks on the existing prefix and re-check, so a symlink that
   // lexically stays in-worktree but points at /proc or outside is caught. Both
@@ -1461,7 +1476,7 @@ export function screenToolPath(
   // data volume) — a fail-closed asymmetry, not a security hole, but fragile.
   const real = realpathExisting(lexical);
   if (real === lexical) return ALLOW;
-  return classifyResolvedPath(candidate, real, realpathExisting(root), secretPaths);
+  return classifyResolvedPath(candidate, real, realpathExisting(root), secretPaths, readOnlyRoot?.real);
 }
 
 /**
@@ -1474,20 +1489,68 @@ export function screenToolPath(
  * token lives OUTSIDE the worktree, so the outside-root deny below is already the
  * load-bearing block; the secret check is additive defense-in-depth. The /proc deny
  * stays first and unchanged — it is the load-bearing non-Bash egress block.
+ *
+ * Order: /proc and secret denies run first, then the containment check. The #2332
+ * spill allowance lives ONLY inside the outside-worktree branch: a path outside the
+ * root is allowed iff `readOnlyRoot` is set, the path is a direct child of it, and
+ * it is a regular file (lstat, so a symlink is refused). The `.git` deny runs after
+ * the containment check and applies to in-worktree paths; a spill path is outside
+ * the worktree, so the allowance can never reach `.git` under the worktree.
+ * Checks are check-time only: the CLI opens the file later, so a parallel Bash swap
+ * can race exactly as it can for the existing worktree jail. The Read runs as the
+ * runner uid, so it reaches nothing Bash cannot already read.
  */
 function classifyResolvedPath(
   candidate: string,
   resolved: string,
   root: string,
   secretPaths: readonly string[] = [],
+  readOnlyRoot?: string,
 ): BashScreenResult {
   if (candidate.includes("/proc/") || resolved === "/proc" || resolved.startsWith("/proc/")) return deny(REASON_PROC);
   if (hitsSecret(resolved, secretPaths)) return deny(REASON_SECRET_FILE);
   const inRoot = resolved === root || resolved.startsWith(root + path.sep);
-  if (!inRoot) return deny(REASON_OUTSIDE_WORKTREE);
+  if (!inRoot) {
+    if (readOnlyRoot && path.dirname(resolved) === readOnlyRoot && isRegularFile(resolved)) return ALLOW;
+    return deny(REASON_OUTSIDE_WORKTREE);
+  }
   const gitDir = path.join(root, ".git");
   if (resolved === gitDir || resolved.startsWith(gitDir + path.sep)) return deny(REASON_DOTGIT);
   return ALLOW;
+}
+
+function isRegularFile(p: string): boolean {
+  try {
+    return fs.lstatSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Derive the SDK's tool-result spill directory for this hook call from TRUSTED hook
+ * data (#2332): the SDK-supplied `session_id` and `transcript_path`, which must agree
+ * with the run's own SDK HOME (`<HOME>/.claude/projects/<P>/<session_id>.jsonl`).
+ * Returns the directory both lexically and with only the HOME realpath'd (the tail
+ * stays lexical, so an agent-made symlink at `.../<session_id>/tool-results` cannot
+ * move the root), or undefined on any mismatch (no allowance).
+ */
+export function sdkSpillRoots(
+  sdkHomeDir: string,
+  sessionId: unknown,
+  transcriptPath: unknown,
+): { lexical: string; real: string } | undefined {
+  if (typeof sessionId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) return undefined;
+  if (typeof transcriptPath !== "string" || !transcriptPath) return undefined;
+  const projects = path.resolve(sdkHomeDir, ".claude", "projects");
+  const t = path.resolve(transcriptPath);
+  if (path.dirname(path.dirname(t)) !== projects) return undefined;
+  if (path.basename(t) !== `${sessionId}.jsonl`) return undefined;
+  const slug = path.basename(path.dirname(t));
+  return {
+    lexical: path.join(projects, slug, sessionId, "tool-results"),
+    real: path.join(realpathExisting(sdkHomeDir), ".claude", "projects", slug, sessionId, "tool-results"),
+  };
 }
 
 /**
@@ -1564,17 +1627,27 @@ function deepestExisting(p: string): { path: string; tail: string[] } | undefine
  * Decision 6/S2) it is the same outside-root deny that carries the load, with this
  * as defense-in-depth — a compromised chat must never Read the join token and
  * escalate to the worker protocol whose *run* claims carry the PAT.
+ *
+ * `opts.sdkHomeDir` (#2332, the SDK run's per-run HOME; omitted by the chat,
+ * isolated and job-runner callers, which keep today's behaviour) enables a
+ * Read-only allowance for the SDK's own tool-result spill file; see sdkSpillRoots
+ * and classifyResolvedPath. Every other tool keeps the plain worktree jail.
  */
 export function buildPathGuardHook(
   worktreeRoot: string,
   log: Logger,
   extraSecretPaths: readonly string[] = [],
+  opts: { sdkHomeDir?: string } = {},
 ): (input: HookInput) => Promise<HookJSONOutput> {
   return async (input: HookInput): Promise<HookJSONOutput> => {
     if (input.hook_event_name !== "PreToolUse" || !PATH_TOOLS.has(input.tool_name)) return {};
     const cwd = typeof input.cwd === "string" && input.cwd ? input.cwd : worktreeRoot;
+    const readOnlyRoot =
+      input.tool_name === "Read" && opts.sdkHomeDir
+        ? sdkSpillRoots(opts.sdkHomeDir, input.session_id, input.transcript_path)
+        : undefined;
     for (const candidate of extractToolPaths(input.tool_input)) {
-      const screen = screenToolPath(candidate, worktreeRoot, cwd, extraSecretPaths);
+      const screen = screenToolPath(candidate, worktreeRoot, cwd, extraSecretPaths, readOnlyRoot);
       if (screen.denied) {
         log.warn("guardrail denied a file-tool path", { tool: input.tool_name, reason: screen.reason });
         return {

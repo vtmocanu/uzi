@@ -33,6 +33,7 @@ import { buildRepoInstructionsContext, type PriorWork } from "./prompt.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { readRepoInstructions } from "./repo-instructions.js";
 import { LimitReachedError } from "./limit.js";
+import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { provisionRunTools, removeProvisionDir } from "./provision-run.js";
 import type { provisionTools } from "./provision.js";
 import { AGENT_GIT_IDENTITY, gitEnv, runnerGitSpawnEnv } from "./git.js";
@@ -115,6 +116,8 @@ export type SecretRemediationDecision =
  */
 export interface RunContext {
   runId: string;
+  /** Current server claim fence; required to consume a checked plan approval. */
+  claimGeneration?: number;
   /** Run kind (PRD #6). "issue" (default when absent) works issueIid's card;
    *  "ci_fix" diagnoses + fixes `pipeline`. */
   kind?: RunKind;
@@ -378,6 +381,8 @@ export interface RunContext {
    * a fenced claim ends quietly. Absent on the stub/test executors ⇒ today's behaviour.
    */
   takeResumedGateEvent?(signal?: AbortSignal): Promise<PlanVerdict | undefined>;
+  /** An associated cross-check human gate continues its established wait after switch give-up. */
+  continueExistingPlanGate?(otherwise: () => Promise<PlanVerdict>): Promise<PlanVerdict>;
   /**
    * PRD #88 M1 clarification park. Called by the executor after a turn that made an
    * ask_user call: the runner emits the `question` run-message, posts /state
@@ -734,12 +739,14 @@ export interface ExecutorResult {
    *  when no mid-run progress was reported. Absent when the lead declared nothing, which
    *  is the common case. StubExecutor never sets it. */
   milestonesCompleted?: string[];
-  /** Issue #293 M2 (gate honesty): component dirs whose JS dependencies did NOT
-   *  install this run, so the gates that need them (e.g. `vitest`, `knip`) could not
-   *  have run. Rendered as an "unverified gates" annotation on the issue-run MR body
+  /** Issue #293 M2 (gate honesty): component dirs with failed or unconfirmed JS
+   *  dependency provisioning this run; this does not prove dependencies are absent
+   *  or whether gates (e.g. `vitest`, `knip`) ran or passed. Rendered as an "unverified
+   *  gates" annotation on the issue-run MR body asking for actual gate evidence
    *  (ANNOTATE posture — never blocks). Dir names are already charset/length-clamped
-   *  via safeDirLabel. ISSUE RUNS ONLY and OMITTED (never `[]`/undefined) when every
-   *  dir installed, which is the common case. StubExecutor never sets it. */
+   *  via safeDirLabel. ISSUE RUNS ONLY and OMITTED (never `[]`/undefined) when no
+   *  qualifying failure remains after excluding deliberate no-lockfile skips
+   *  (!r.ok && r.detail !== DETAIL_NO_LOCKFILE). StubExecutor never sets it. */
   gatesUnverified?: string[];
   /** Issue #293 M2 (review F1): true when dependency DISCOVERY was truncated at its scan
    *  cap, so components past the cap were never examined and cannot appear in
@@ -1504,6 +1511,9 @@ export class StubExecutor implements Executor {
         if (verdict.kind === "reject")
           throw new PlanRejectedError(verdict.reason);
         if (verdict.kind === "cancel") throw new Error("run cancelled");
+        // Stub implementation is fixed behaviour and does not implement the approved plan text.
+        if (verdict.approval === "cross_check")
+          throw new TrustedExecutionRefusal("stub cannot consume checked plan approval");
       }
       if (notCode) {
         ctx.emit({

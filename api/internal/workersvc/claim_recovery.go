@@ -450,7 +450,7 @@ func claimAssemblyOrigin(err error) string {
 		return "credential_unavailable"
 	case errors.Is(err, errToolPackagesRejected):
 		return "provisioning_failed"
-	case errors.Is(err, errGuardrailBlockedClaim):
+	case errors.Is(err, errGuardrailBlockedClaim), errors.Is(err, ErrCrossCheckRefused):
 		return "guardrail_blocked"
 	default:
 		return ""

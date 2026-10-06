@@ -1751,3 +1751,11 @@ missing feature — the field reads `null` while the server holds a real value, 
 nothing else tells you. Report the skew to the human rather than reasoning about
 the `null`. The check compares this binary's version against the server's, is
 cached for an hour per server, and never changes an exit code or touches stdout.
+
+Recurring label sweeps support `--capacity-limit <n> --room-needed <k>` together
+(1 <= k <= n <= 50). `schedule edit --clear-capacity` turns the gate off and
+cannot be combined with the pair. Unrelated edits preserve it. `--max-issues`
+sets issues to send at a time; capacity limits the batch to available room.
+The owner-wide advisory count excludes chat and judge and includes queued,
+waiting, parked and job runs across repos. A blocked Run now prints Waiting for
+room and starts nothing; detail shows WHEN TO SEND and the last capacity check.

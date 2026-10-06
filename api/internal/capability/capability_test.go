@@ -145,6 +145,15 @@ func TestFilterProtocol_DedupesStableOrderAndEmpty(t *testing.T) {
 // vocabulary and the scheduler vocabulary do not overlap: no Vocabulary() member survives
 // FilterProtocol, and CompletionInterlockV1 is not a Filter (scheduler) member. This is
 // what keeps a protocol string out of the web capability picker.
+func TestFilterProtocol_KeepsCrossCheckV1(t *testing.T) {
+	if got := FilterProtocol([]string{CrossCheckV1}); !reflect.DeepEqual(got, []string{CrossCheckV1}) {
+		t.Fatalf("FilterProtocol(cross-check) = %v, want [%s]", got, CrossCheckV1)
+	}
+	if got := Filter([]string{CrossCheckV1}); len(got) != 0 {
+		t.Fatalf("cross-check protocol leaked into scheduler capabilities: %v", got)
+	}
+}
+
 func TestFilterProtocol_SeparateFromSchedulerVocabulary(t *testing.T) {
 	if got := FilterProtocol(Vocabulary()); len(got) != 0 {
 		t.Errorf("FilterProtocol(scheduler vocabulary) = %v, want empty (vocabularies must not overlap)", got)
