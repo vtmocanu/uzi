@@ -97,7 +97,7 @@ for (const sibling of ["none", "unreadable", "uncovered"] as const) {
       return { run_id: runId, generation, released: true, holds_released: 1 };
     };
     git.enumerateOwedCandidates = async () => [];
-    git.readInventoryCloneHeads = async () => ({ kind: "verified", heads: [], foreignOwners: [] });
+    git.readInventoryCloneHeads = async () => ({ kind: "verified", heads: [], clones: [], foreignOwners: [] });
     const record = await internals.recovery.freezeInventory({
       context: { runId, generation, kind: "issue", branch: "task", barePath: git.barePathFor(fx.originPath),
         defaultIdentity: { ref: "refs/remotes/origin/main", sha } },

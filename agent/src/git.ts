@@ -3841,7 +3841,7 @@ export class GitCache {
    * no retries, and any failed sibling read refuses the whole verification.
    * Runner config is never consulted, and every traversed component rejects symlinks. */
   async readInventoryCloneHeads(barePath: string, runId: string): Promise<
-    { kind: "verified"; heads: string[]; foreignOwners: string[] } | { kind: "unknown" }
+    { kind: "verified"; heads: string[]; clones: Array<{ clonePath: string; branch: string; runId: string }>; foreignOwners: string[] } | { kind: "unknown" }
   > {
     try {
       if (typeof runId !== "string" || !OWED_RUN_ID.test(runId) ||
@@ -3856,7 +3856,7 @@ export class GitCache {
           const match = /^uzi-recovery\.(.+)\.clone$/.exec(item.slice(0, nl));
           if (!match) continue;
           const journal = await this.readRecoveryCapture(barePath, match[1]!, entries);
-          if (!journal) continue;
+          if (!journal) throw new Error("unreadable recovery attribution");
           if (journal.runId !== runId) { foreignOwners.add(journal.runId); continue; }
           paths.set(journal.clonePath, { branch: match[1]!, runId });
         }
@@ -3869,6 +3869,7 @@ export class GitCache {
           paths.set(entry.clonePath, { branch: entry.branch, runId });
         }
         const heads = new Set<string>();
+        const clones: Array<{ clonePath: string; branch: string; runId: string }> = [];
         for (const [clone, owner] of paths) {
           const parsed = parseAttemptPath(clone, path.resolve(this.runnerRoot));
           const key = parsed?.key ?? path.basename(clone);
@@ -3921,8 +3922,9 @@ export class GitCache {
           }
           if (!SHA40_RE.test(head)) throw new Error("unreadable retained HEAD");
           heads.add(head);
+          clones.push({ clonePath: clone, ...owner });
         }
-        return { kind: "verified", heads: [...heads], foreignOwners: [...foreignOwners] };
+        return { kind: "verified", heads: [...heads], clones, foreignOwners: [...foreignOwners] };
       });
     } catch {
       return { kind: "unknown" };

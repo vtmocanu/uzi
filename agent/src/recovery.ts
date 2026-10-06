@@ -241,6 +241,10 @@ export interface CaptureInput {
 }
 
 export interface RecoveryCoordinatorOptions {
+  withInventorySourceBoundary?: (
+    context: { runId: string; generation: number; barePath: string },
+    action: (prove: () => Promise<boolean>) => Promise<void>,
+  ) => Promise<"passed" | "retained">;
   isExecuting?: (runId: string) => boolean;
   terminalRecordProtection?: (runId: string) => Promise<boolean>;
   onAuthoritativeGenerationReleased?: (runId: string, generation: number) => void;
@@ -298,6 +302,7 @@ const LIVE_RETRY_REASONS: ReadonlySet<string> = new Set([
   "restart_upload_failed",
   "upload_transient",
   "credential_rejected",
+  "inventory_source_not_quiescent",
 ]);
 
 /** Which entry point is uploading: picks the transient retry reason and the failure log. */
@@ -564,6 +569,7 @@ const recoveryJournalLocks = new RunDiskLocks();
  * upload can safely happen after (or across a restart from) the terminal report.
  */
 export class RecoveryCoordinator {
+  private readonly withInventorySourceBoundary: RecoveryCoordinatorOptions["withInventorySourceBoundary"];
   private readonly isExecuting: (runId: string) => boolean;
   private bootOwed: Awaited<ReturnType<NonNullable<RecoveryBundleProducer["discoverOwedCandidates"]>>> = [];
   private readonly terminalRecordProtection: RecoveryCoordinatorOptions["terminalRecordProtection"];
@@ -590,6 +596,7 @@ export class RecoveryCoordinator {
   private readonly lastAttemptAt = new Map<string, number>();
 
   constructor(opts: RecoveryCoordinatorOptions) {
+    this.withInventorySourceBoundary = opts.withInventorySourceBoundary;
     this.isExecuting = opts.isExecuting ?? (() => false);
     this.terminalRecordProtection = opts.terminalRecordProtection;
     this.onAuthoritativeGenerationReleased = opts.onAuthoritativeGenerationReleased;
@@ -795,7 +802,38 @@ export class RecoveryCoordinator {
   }
 
   /** Persist the exact request before RPC. Lost ACKs replay this identity, never a new archive. */
-  private async finalizeInventory(snapshot: RecoveryRecord): Promise<void> {
+  private async inventorySourceBoundary(
+    context: { runId: string; generation: number; barePath: string },
+    action: (prove: () => Promise<boolean>) => Promise<void>,
+  ): Promise<"passed" | "retained"> {
+    if (this.withInventorySourceBoundary) return this.withInventorySourceBoundary(context, action);
+    // Only positive discovery of zero physical sources permits a callback-free producer.
+    const prove = async () => {
+      const inventory = await this.git.readInventoryCloneHeads?.(context.barePath, context.runId);
+      return inventory?.kind === "verified" && Array.isArray(inventory.clones) && inventory.clones.length === 0;
+    };
+    if (!await prove()) return "retained";
+    await action(prove);
+    return "passed";
+  }
+
+  private async finalizeInventory(snapshot: RecoveryRecord): Promise<RecoveryOutcome | void> {
+    if (!snapshot.coverageContext || typeof snapshot.generation !== "number") return;
+    let outcome: RecoveryOutcome | void = undefined;
+    let sourceVerified = true;
+    const result = await this.inventorySourceBoundary({ ...snapshot.coverageContext, generation: snapshot.generation }, async prove => {
+      outcome = await this.finalizeInventoryWithinBoundary(snapshot, async () => {
+        sourceVerified = await prove();
+        return sourceVerified;
+      });
+    });
+    if (result === "retained" || !sourceVerified) {
+      await this.writeExistingRecord(snapshot, cur => ({ ...cur, state: "needs_action", reason: "inventory_source_not_quiescent" }));
+    }
+    return outcome;
+  }
+
+  private async finalizeInventoryWithinBoundary(snapshot: RecoveryRecord, prove: () => Promise<boolean>): Promise<RecoveryOutcome | void> {
     let record = await this.requireRecord(snapshot);
     if (!record.inventoryGuarded || record.finalAcknowledged || record.reason === "inventory_quiescence_breach" || !record.coverageDigest ||
         !(await this.inactiveInventory(record))) return;
@@ -865,6 +903,7 @@ export class RecoveryCoordinator {
     // Publication proof was checked at minting; replay grants no reserve/upload authority.
     try {
       if (!this.client.hasFeature?.("recovery_inventory_v1") || !(await this.inactiveInventory(record))) return;
+      if (!await prove() || !await this.inactiveInventory(record)) return;
       const ack = await this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition);
       if (ack.run_id !== record.runId || ack.generation !== record.generation || ack.released !== true ||
           ack.holds_released !== 1 || ack.retained) return;
@@ -872,15 +911,20 @@ export class RecoveryCoordinator {
       this.onAuthoritativeGenerationReleased?.(record.runId, record.generation!);
     } catch (err) {
       this.log.warn("recovery: final inventory ACK pending; exact request retained", { run_id: record.runId, generation: record.generation, error: errText(err) });
+      const cls = await classifyUploadFailure(err, record);
+      if (cls.kind === "credential") this.credentialBlockedAt = this.now();
+      // FINAL failure does not change the available archive or its immutable request.
+      return { state: record.state, captureId: record.captureId,
+        reason: cls.kind === "transient" ? "upload_transient" : cls.reason };
     }
   }
 
-  private async resumeInventory(record: RecoveryRecord, signal?: AbortSignal): Promise<void> {
+  private async resumeInventory(record: RecoveryRecord, signal?: AbortSignal): Promise<RecoveryOutcome | void> {
     if (this.isExecuting(record.runId) || !isLiveCandidate(record) || !record.coverageDigest || record.finalAcknowledged || !(await this.inactiveInventory(record))) return;
-    if (record.finalRequest || record.state === "uploaded") { await this.finalizeInventory(record); return; }
+    if (record.finalRequest || record.state === "uploaded") return this.finalizeInventory(record);
     const barePath = record.bareDir && await this.git.resolveRecoveryBareDir?.(record.bareDir);
     if (!barePath) return;
-    await this.captureCycle({ record, barePath, defaultBranch: record.defaultBranch ?? "main", signal });
+    return this.captureCycle({ record, barePath, defaultBranch: record.defaultBranch ?? "main", signal });
   }
 
   /** Credential-free discovery precedes the journal snapshot; authentication is required
@@ -927,11 +971,17 @@ export class RecoveryCoordinator {
         if (!currentSha) continue; // No adopted source or positive tracking proof is not an empty snapshot.
         // freezeInventory alone compares the complete source/tree/context fingerprint.
         // Equal pin lists cannot justify reusing an archive of an earlier disposition source.
-        const record = await this.freezeInventory({
-          context: ctx as PositiveOwedCandidateContext, currentSha, originalSourceSha,
-          defaultBranch: ctx.defaultIdentity!.ref.replace(/^refs\/remotes\/origin\//, ""),
+        const boundary = await this.inventorySourceBoundary({ ...ctx, generation: ctx.generation }, async prove => {
+          if (!await this.inactiveInventory(probe) || !await prove()) return;
+          const record = await this.freezeInventory({
+            context: ctx as PositiveOwedCandidateContext, currentSha, originalSourceSha,
+            defaultBranch: ctx.defaultIdentity!.ref.replace(/^refs\/remotes\/origin\//, ""),
+          });
+          if (record) records.push(record);
         });
-        if (record) records.push(record);
+        if (boundary === "retained" && original) {
+          await this.writeExistingRecord(original, cur => ({ ...cur, state: "needs_action", reason: "inventory_source_not_quiescent" }));
+        }
       } catch (err) {
         this.log.warn("recovery: boot inventory retained; reconstruction failed", { run_id: ctx.runId, generation: ctx.generation, error: errText(err) });
       }
@@ -987,12 +1037,16 @@ export class RecoveryCoordinator {
         return { state: "needs_action", captureId: record.captureId, reason: "inventory_hold_closed" };
       }
       if (record.inventoryGuarded && record.finalRequest) {
-        await this.finalizeInventory(record);
+        const finalOutcome = await this.finalizeInventory(record);
+        if (finalOutcome) return finalOutcome;
         const current = await this.requireRecord(record);
         return { state: current.finalAcknowledged ? "uploaded" : current.state, captureId: record.captureId };
       }
       if (record.state === "uploaded") {
-        if (record.inventoryGuarded) await this.finalizeInventory(record);
+        if (record.inventoryGuarded) {
+          const finalOutcome = await this.finalizeInventory(record);
+          if (finalOutcome) return finalOutcome;
+        }
         return { state: "uploaded", captureId: record.captureId };
       }
       if (record.state === "needs_action" && record.reason && PERMANENT_UPLOAD_REASONS.has(record.reason)) {
@@ -1019,7 +1073,10 @@ export class RecoveryCoordinator {
         record = produced.record;
       }
       const outcome = await this.uploadJournaledBundle(record, input.signal, "capture");
-      if (record.inventoryGuarded && outcome.state === "uploaded") await this.finalizeInventory(await this.requireRecord(record));
+      if (record.inventoryGuarded && outcome.state === "uploaded") {
+        const finalOutcome = await this.finalizeInventory(await this.requireRecord(record));
+        if (finalOutcome) return finalOutcome;
+      }
       return outcome;
     } catch (err) {
       if (err instanceof RecordGoneError) return removed(err);
@@ -1489,8 +1546,7 @@ export class RecoveryCoordinator {
     // Re-read the current, authenticated state of exactly this snapshotted record.
     const record = await this.readRecord(this.recordPath(snap));
     if (!record) return;
-    if (record.inventoryGuarded) { await this.resumeInventory(record, signal); return; }
-    if (record.state === "uploaded") return;
+
     const done = (outcome: string, reason?: string): void => {
       this.log.info("recovery restart sweep", {
         run_id: record.runId,
@@ -1500,6 +1556,8 @@ export class RecoveryCoordinator {
       });
     };
     try {
+      if (record.inventoryGuarded) { await this.resumeInventory(record, signal); return; }
+      if (record.state === "uploaded") return;
       if (record.state === "needs_action" && record.reason && PERMANENT_UPLOAD_REASONS.has(record.reason)) {
         // A disposition the api or the local bytes made final: never retried (issue #1995).
         done("needs_action", record.reason);
@@ -1744,14 +1802,13 @@ export class RecoveryCoordinator {
     if (!isLiveCandidate(record) || opts.isExecuting(record.runId)) return "ok";
     this.lastAttemptAt.set(record.captureId, this.now());
     try {
-      if (record.inventoryGuarded) {
-        await this.resumeInventory(record, opts.signal);
-        return "ok";
-      }
-      const out = await this.uploadJournaledBundle(record, opts.signal, "live");
+      const out = record.inventoryGuarded
+        ? await this.resumeInventory(record, opts.signal)
+        : await this.uploadJournaledBundle(record, opts.signal, "live");
+      if (!out) return "ok";
       log(out.state, out.reason);
-      if (out.state === "needs_action" && out.reason === "upload_transient") return "transient";
-      if (out.state === "needs_action" && out.reason === "credential_rejected") return "credential";
+      if (out.reason === "credential_rejected") return "credential";
+      if (out.reason && LIVE_RETRY_REASONS.has(out.reason)) return "transient";
       return "ok";
     } catch (err) {
       if (err instanceof RecordGoneError) {

@@ -106,6 +106,8 @@ async function fixture() {
     status: "failed", ownGeneration: 7, ownGuarded: true, feature: true, open: true, expires: "2099-01-01T00:00:00Z",
     ownershipError: undefined as Error | undefined,
     loseAck: false, wrongAck: false, failProduce: false, now: 1000,
+    reserveError: undefined as Error | undefined,
+    finalError: undefined as Error | undefined,
     oversized: false, cloneHeads: [] as string[], cloneReadable: true,
     produceWait: undefined as Promise<void> | undefined, produced: 0,
     onProduce: undefined as (() => void) | undefined,
@@ -120,11 +122,12 @@ async function fixture() {
       if (state.ownershipError) throw state.ownershipError;
       return { status: state.status, claim_generation: state.ownGeneration, inventory_guarded: state.ownGuarded };
     },
-    listRecoveryHolds: async () => ({ run_id: context.runId, holds: state.open ? [{
+    listRecoveryHolds: async (runId = context.runId) => ({ run_id: runId, holds: state.open ? [{
       hold_id: "hold-7", generation: 7, inventory_guarded: true, has_available_capture: false,
     }] : [] }),
     reserveRecoveryCapture: async (_run: string, request: { idempotency_key: string }) => {
       reserves++;
+      if (state.reserveError) throw state.reserveError;
       let capture = captures.get(request.idempotency_key);
       if (!capture) {
         capture = { id: "server-" + (captures.size + 1) };
@@ -149,13 +152,14 @@ async function fixture() {
     },
     releaseRecoveryCustody: async (...args: unknown[]) => {
       finals.push(args);
+      if (state.finalError) throw state.finalError;
       if (state.loseAck) { state.open = false; throw new Error("ACK lost"); }
-      return { run_id: state.wrongAck ? "other-run" : context.runId, generation: 7, released: true, holds_released: 1 };
+      return { run_id: state.wrongAck ? "other-run" : args[0], generation: 7, released: true, holds_released: 1 };
     },
   };
   const git = {
     readInventoryCloneHeads: async () => state.cloneReadable
-      ? ({ kind: "verified", heads: state.cloneHeads, foreignOwners: [] }) : ({ kind: "unknown" }),
+      ? ({ kind: "verified", heads: state.cloneHeads, clones: [], foreignOwners: [] }) : ({ kind: "unknown" }),
     ancestry: async (_bare: string, head: string) => head === H ? "ancestor" : "unknown",
     enumerateOwedCandidates: async () => structuredClone(state.candidates),
     discoverOwedCandidates: async () => [{ context, candidates: structuredClone(state.candidates) }],
@@ -191,8 +195,78 @@ async function fixture() {
   const capture = (record: RecoveryRecord) => coordinator.captureAndUpload({
     record, barePath: context.barePath, defaultBranch: "main",
   });
-  return { root, context, state, aggregates, finals, coordinator, make, freeze, capture,
+  return { root, context, state, aggregates, finals, coordinator, make, freeze, capture, git,
     reserves: () => reserves, close: () => fs.rm(root, { recursive: true, force: true }) };
+}
+
+it("guarded boot failure does not block a sibling run", async () => {
+  const f = await fixture();
+  try {
+    f.state.candidates = [];
+    f.state.status = "completed";
+    const first = await f.coordinator.freezeInventory({
+      context: f.context, currentSha: H, defaultBranch: "main", settledEvidence: "publication",
+    });
+    const second = await f.coordinator.freezeInventory({
+      context: { ...f.context, runId: "run-2" }, currentSha: H, defaultBranch: "main", settledEvidence: "publication",
+    });
+    assert.ok(first && second);
+    const visited: string[] = [];
+    f.git.enumerateOwedCandidates = async (_bare?: string, run?: string) => {
+      visited.push(run!);
+      if (run === "run-1") throw new Error("unreadable owed inventory");
+      return [];
+    };
+    await assert.doesNotReject(f.coordinator.resumePending(undefined, [first, second]));
+    assert.deepEqual(visited, ["run-1", "run-2"]);
+    assert.equal(f.finals.length, 1);
+    assert.equal((await f.coordinator.inspect("run-2"))[0]!.finalAcknowledged, true);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, undefined);
+  } finally { await f.close(); }
+});
+
+for (const phase of ["capture", "FINAL"] as const) {
+  for (const credential of [false, true]) {
+    it(`guarded ${phase} ${credential ? "credential rejection" : "transient failure"} spaces live retries`, async () => {
+      const f = await fixture();
+      try {
+        const record = await f.freeze();
+        assert.ok(record);
+        const error = credential
+          ? new RequestError("POST", "/api/worker/recovery", 401, "unauthorized")
+          : new Error("network unavailable");
+        if (phase === "capture") f.state.reserveError = error;
+        else f.state.finalError = error;
+        const outcome = await f.capture(record);
+        assert.equal(outcome.reason, credential ? "credential_rejected" : phase === "capture" ? "capture_error" : "upload_transient");
+        const before = (await f.coordinator.inspect("run-1"))[0]!;
+        await f.coordinator.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now + 1 });
+        const pending = (await f.coordinator.inspect("run-1"))[0]!;
+        assert.equal(pending.finalAcknowledged, undefined);
+        if (phase === "FINAL") {
+          assert.equal(pending.state, "uploaded");
+          assert.deepEqual(pending.finalRequest, before.finalRequest);
+        }
+        const attempts = phase === "capture" ? f.reserves() : f.finals.length;
+        f.state.now += 30_000;
+        await f.coordinator.resumeLive({ isExecuting: () => false, authenticatedAtMs: credential ? 1000 : f.state.now });
+        assert.equal(phase === "capture" ? f.reserves() : f.finals.length, attempts);
+        f.state.now += 30_000;
+        f.state.reserveError = undefined;
+        f.state.finalError = undefined;
+        await f.coordinator.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+        const after = (await f.coordinator.inspect("run-1"))[0]!;
+        assert.equal(after.finalAcknowledged, true);
+        if (phase === "FINAL") {
+          assert.equal(before.state, "uploaded");
+          assert.equal(after.state, "uploaded");
+          assert.deepEqual(after.finalRequest, before.finalRequest);
+          assert.ok(f.finals.every(request => canonicalJson(request) === canonicalJson(f.finals[0])));
+          assert.equal(f.reserves(), 1);
+        }
+      } finally { await f.close(); }
+    });
+  }
 }
 
 it("final inventory ACK covers an earlier available aggregate without treating it as an adopted head", async () => {
@@ -893,4 +967,19 @@ it("a guarded journal never uses the legacy release RPC after feature loss", asy
     assert.deepEqual(calls, []);
     assert.equal((await coordinator.inspect("run-1")).length, 1);
   } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+
+it("physical clones fail closed without runner boundary even when heads are covered", async () => {
+  const f = await fixture();
+  try {
+    f.git.readInventoryCloneHeads = async () => ({ kind: "verified", heads: [H],
+      clones: [{ clonePath: "/retained/task", branch: "task", runId: "run-1" }], foreignOwners: [] }) as never;
+    const record = await f.freeze();
+    assert.ok(record);
+    await f.capture(record);
+    assert.equal(f.finals.length, 0);
+    assert.equal(f.state.open, true);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]?.state, "needs_action");
+  } finally { await f.close(); }
 });

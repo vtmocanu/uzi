@@ -2147,6 +2147,7 @@ export class RunRunner {
   private readonly activeRuns = new Map<string, ActiveRun>();
   /** Whole-execution ownership, including factory setup, batcher close and every
    * finally cleanup. A promoted claim can arrive before an old park ACK returns. */
+  private readonly inventoryReservations = new Set<string>();
   private readonly executionTails = new Map<string, Promise<void>>();
   /** PRD #218 M1: set by `shutdown()`. Read when a run registers so a run that starts
    *  DURING the shutdown drain (a late claim) is aborted immediately rather than running
@@ -2203,7 +2204,8 @@ export class RunRunner {
         log: this.log,
         recoveryRoot: this.git.recoveryRoot,
         terminalRecordProtection: (runId) => this.git.hasPhysicalTerminalProtection(runId),
-        isExecuting: (runId) => this.isExecuting(runId),
+        isExecuting: (runId) => this.isExecuting(runId) && !this.inventoryReservations.has(runId),
+        withInventorySourceBoundary: (context, action) => this.withInventorySourceBoundary(context, action),
         onAuthoritativeGenerationReleased: opts.queueTerminalRejectionReconciliation,
         workerToken: this.joinToken,
         now: opts.now,
@@ -2382,6 +2384,59 @@ export class RunRunner {
    */
   isExecuting(runId: string): boolean {
     return this.executionTails.has(runId);
+  }
+
+  private async withInventorySourceBoundary(
+    context: { runId: string; generation: number; barePath: string },
+    action: (prove: () => Promise<boolean>) => Promise<void>,
+  ): Promise<"passed" | "retained"> {
+    const { runId, barePath } = context;
+    // Never wait on an executing lane: terminal-journal drain can call recovery itself.
+    if (this.executionTails.has(runId)) return "retained";
+    let release!: () => void;
+    const tail = new Promise<void>(resolve => { release = resolve; });
+    this.executionTails.set(runId, tail);
+    this.inventoryReservations.add(runId);
+    try {
+      let sourceIdentity: string | undefined;
+      const prove = async (): Promise<boolean> => {
+        const inventory = await this.git.readInventoryCloneHeads(barePath, runId);
+        if (inventory.kind !== "verified") return false;
+        const identity = JSON.stringify({ heads: inventory.heads, clones: inventory.clones });
+        if (sourceIdentity !== undefined && sourceIdentity !== identity) return false;
+        sourceIdentity = identity;
+        // Each owned physical source is checked once per proof; a failed sibling blocks FINAL.
+        for (const clone of inventory.clones) {
+          const request = {
+            mode: "capture" as const, attempt: undefined,
+            cloneKey: cloneKeyOf(clone.clonePath).cloneKey, targetPaths: [clone.clonePath],
+            processes: process.platform === "linux", dockerHost: this.dockerHost,
+            registry: this.liveAttempts,
+            otherClaimInFlight: [...this.executionTails.keys()].some(id => id !== runId),
+            site: "inventory_source",
+          };
+          if (process.platform !== "linux" || this.liveAttempts.isLivePath(clone.clonePath)) return false;
+          const before = await this.quiesceImpl(request);
+          if (before.process?.state !== "quiescent") return false;
+          const status = await this.git.worktreeStatus(clone.clonePath);
+          const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "inventory_source:after_runner_git" });
+          if (status === null || status.length !== 0 || after.process?.state !== "quiescent") return false;
+        }
+        const afterGit = await this.git.readInventoryCloneHeads(barePath, runId);
+        return afterGit.kind === "verified" &&
+          JSON.stringify({ heads: afterGit.heads, clones: afterGit.clones }) === sourceIdentity;
+      };
+      if (!await prove()) return "retained";
+      await action(prove);
+      return "passed";
+    } catch (err) {
+      this.log.warn("recovery: physical source retained", { run_id: runId, error: errMessage(err) });
+      return "retained";
+    } finally {
+      this.inventoryReservations.delete(runId);
+      if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
+      release();
+    }
   }
 
   async execute(claim: ClaimResponse): Promise<void> {
