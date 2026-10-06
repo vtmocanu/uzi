@@ -342,10 +342,11 @@ describe("Codex RunRunner clarification completion (#2284)", () => {
         wireFileop: () => ({ client: { op: async () => ({ ok: true }) }, dispose: async () => {} }),
         launchEffectRoot: async (spec) => {
           // Fileop is inert; boundary Git children run against the fixture through the real facade.
-          const fileop = spec.command.includes("fileop");
+          // Classify on the unwrapped command: the sandbox wrapper names fileop only after `--`.
           const split = spec.command.endsWith("uzi-codex-command-sandbox") ? spec.args.indexOf("--") : -1;
           const command = split >= 0 ? spec.args[split + 1]! : spec.command;
           const args = split >= 0 ? spec.args.slice(split + 2) : spec.args;
+          const fileop = command.includes("fileop");
           const child = fileop ? undefined : spawn(command, args, { cwd: spec.cwd, env: spec.env, stdio: ["pipe", "pipe", "pipe"] });
           const terminal = child ? new Promise<{ code: number }>((resolve, reject) => {
             child.once("error", reject);
