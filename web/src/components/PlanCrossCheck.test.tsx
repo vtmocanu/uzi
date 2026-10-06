@@ -91,7 +91,8 @@ describe("M1 plan cross-check outcomes at real sinks", () => {
       sink === "panel" ? <PlanPanel run={run({ plan_cross_check_summary: s })} busy={false} canSteer={false} onApprove={vi.fn()} onReject={vi.fn()} /> :
       <PlanCrossCheck run={run({ plan_cross_check_summary: s })} />}</MemoryRouter>);
     const region = r.getByRole("region", { name: sink === "event" ? "Plan cross-check event" : "Plan cross-check" });
-    expect(region.textContent).not.toMatch(/[\p{Cf}\u0007]/u);
+    expect(region.textContent).not.toMatch(/\p{Cf}/u);
+    expect(region.textContent).not.toContain(String.fromCharCode(7));
     expect(region.querySelector("script, img, [onerror]")).toBeNull();
     expect(within(region).getByText("bad").getAttribute("href")).toBeNull();
     expect(within(region).getByText("good").getAttribute("title")).toBe("review denied");
