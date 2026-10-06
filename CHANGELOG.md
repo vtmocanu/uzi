@@ -25,7 +25,7 @@ through `[0.52.0]`.)
 ### Added
 
 - **Plan cross-check opt-in establishes a required gate for auto-approved plans ([#2149](https://github.com/vtmocanu/uzi/issues/2149)).**
-  Settings → Run defaults offers a per-user Plan cross-check switch when Claude and Codex are usable. An opted-in auto-approved Claude run sends its plan to a Codex checker before implementing: a pass approves the exact checked plan, and any other outcome (changes requested, blocked, timed out, checker unavailable, submit failure) parks the run at the human plan gate with the reason. Run-page rendering of cross-check results follows in a later change.
+  Settings → Run defaults offers a per-user Plan cross-check switch when Claude and Codex are usable. An opted-in auto-approved Claude run sends its plan to a Codex checker before implementing: a pass approves the exact checked plan, and any other outcome (changes requested, blocked, timed out, checker unavailable, submit failure) parks the run at the human plan gate with the reason. If its delivery receipts or the human-gate acknowledgement are irrecoverably lost, the run fails with a named reason instead of approving or retrying indefinitely. Run-page rendering of cross-check results follows in a later change.
 
 - **Capacity gates for scheduled sweeps**
   Recurring label sweeps can wait for room in the owner’s unfinished work and send batches within the available room, with API and CLI controls and recorded capacity outcomes.

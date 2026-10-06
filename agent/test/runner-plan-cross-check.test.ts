@@ -83,7 +83,8 @@ function terminal(runId: string, condition: string) {
   assert.ok(!states.some((s) => s.status === "completed" || s.status === "recovery_wait"), "no completion/recovery");
 }
 
-describe("U2 real runner checked gate", () => {
+// These runner paths reach native planning capture (Linux /proc); Linux CI runs this block.
+describe("U2 real runner checked gate", { skip: process.platform !== "linux" && "Linux /proc capture required" }, () => {
   for (const action of ["approve_plan", "revise_plan", "reject_plan"] as const) {
     it(`retryable preparation publishes once before replay and restores human ${action}`, async () => {
       const c = claim();
@@ -1546,7 +1547,7 @@ describe("U2 real runner checked gate", () => {
 });
 
 for (const committed of [false, true])
-it(`checked canonical storage resumes after real switch give-up with ${committed ? "committed held ACK" : "write not committed"}`, { timeout: 10_000 }, async () => {
+it(`checked canonical storage resumes after real switch give-up with ${committed ? "committed held ACK" : "write not committed"}`, { timeout: 10_000, skip: process.platform !== "linux" && "Linux /proc capture required" }, async () => {
   const c = claim();
   api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "approve", "approve", {
     candidate: { ...body, plan_md: NORMALIZED, milestones: [], required_capabilities: [], required_tools: [], size_class: "s" },
@@ -1685,7 +1686,7 @@ it(`checked canonical storage resumes after real switch give-up with ${committed
 });
 
 for (const [checked, revised] of [[true, false], [false, false], [true, true]] as const)
-it(`${checked ? "checked" : "ordinary"} confirmed human wait survives one real switch give-up${revised ? " then human revision" : ""}`, async () => {
+it(`${checked ? "checked" : "ordinary"} confirmed human wait survives one real switch give-up${revised ? " then human revision" : ""}`, { skip: checked && process.platform !== "linux" && "Linux /proc capture required" }, async () => {
   const c = claim();
   if (!checked) { c.auto_approve = false; c.plan_cross_check_required = false; }
   api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "revise", "revise") });

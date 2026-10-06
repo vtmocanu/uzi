@@ -146,7 +146,8 @@ process.on("exit", () => meterFs.writeFileSync(${JSON.stringify(metricPath)}, JS
   };
 }
 
-describe("Unit2 runner source capture", () => {
+// Native capture walks Linux /proc/<pid>/fd paths (src/git.ts); Linux CI runs this block.
+describe("Unit2 runner source capture", { skip: process.platform !== "linux" && "Linux /proc capture required" }, () => {
   it("captures under the enforced required command sandbox", async (t) => {
     if (process.platform !== "linux") { t.skip("Linux command sandbox required"); return; }
     try { await fs.access("/usr/local/bin/uzi-codex-command-sandbox", fs.constants.X_OK); }
