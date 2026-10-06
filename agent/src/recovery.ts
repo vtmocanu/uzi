@@ -20,12 +20,12 @@
 
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import fs from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import { constants, createReadStream } from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
 
 import { RUN_KINDS } from "./protocol.js";
-import { RequestError } from "./client.js";
+import { RequestError, isRunOwnershipLost } from "./client.js";
 import type { Logger } from "./log.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import type {
@@ -623,7 +623,8 @@ export class RecoveryCoordinator {
    */
   async pin(input: PinInput): Promise<RecoveryRecord | undefined> {
     if (!this.enabled) return undefined;
-    return runCaptureCycle(this.cycleKey({ ...input, captureId: "" }), "wait", () => this.pinCycle(input));
+    if (!(await this.guardedGeneration(input))) return this.pinCycle(input);
+    return runCaptureCycle(await this.cycleKey({ ...input, captureId: "" }), "wait", () => this.pinCycle(input));
   }
 
   private async pinCycle(input: PinInput): Promise<RecoveryRecord | undefined> {
@@ -702,12 +703,18 @@ export class RecoveryCoordinator {
   }): Promise<RecoveryRecord | undefined> {
     if (!this.enabled) return undefined;
     const { context } = input;
-    return runCaptureCycle(this.cycleKey({ runId: context.runId, generation: context.generation, captureId: "" }), "wait", async () => {
+    return runCaptureCycle(await this.cycleKey({ runId: context.runId, generation: context.generation, captureId: "", inventoryGuarded: true }), "wait", async () => {
       if (!this.git.enumerateOwedCandidates || !this.git.buildRecoveryCoverage) throw new Error("inventory Git support unavailable");
       const candidates = await this.git.enumerateOwedCandidates(context.barePath, context.runId);
       const probe = { runId: context.runId, generation: context.generation } as RecoveryRecord;
       if (!input.locallyQuiescent && !(await this.inactiveInventory(probe))) return undefined;
       if (!(await this.openInventoryHold(probe))) return undefined;
+      if (input.settledEvidence === "publication") {
+        try {
+          const own = await this.client.getRunOwnership!(context.runId);
+          if (own.status !== "completed" || own.claim_generation !== context.generation || own.inventory_guarded !== true) return undefined;
+        } catch { return undefined; }
+      }
       if (!validInventoryContext(context, context.runId) ||
           candidates.some(c => !/^[0-9a-f]{40}$/.test(c.sha) || !c.contexts.length ||
             c.contexts.some(producer => !validInventoryContext(producer, context.runId, context.barePath)))) {
@@ -761,19 +768,26 @@ export class RecoveryCoordinator {
   }
 
   private async inactiveInventory(record: RecoveryRecord): Promise<boolean> {
+    const generation = record.generation;
     if (this.isExecuting(record.runId) || !this.client.hasFeature?.("recovery_inventory_v1") ||
-        !this.client.getRunOwnership || !record.generation) return false;
-    const own = await this.client.getRunOwnership(record.runId);
-    if (!Number.isSafeInteger(own.claim_generation) || own.claim_generation! < record.generation) return false;
+        !this.client.getRunOwnership || typeof generation !== "number" || !Number.isSafeInteger(generation) || generation <= 0) return false;
+    let own;
+    try { own = await this.client.getRunOwnership(record.runId); }
+    catch (err) {
+      if (!isRunOwnershipLost(err, record.runId)) return false;
+      // A MAC-authenticated immutable FINAL may only replay; new work needs the exact open hold.
+      return !!(record.inventoryGuarded && record.finalRequest) || await this.openInventoryHold(record);
+    }
+    if (!Number.isSafeInteger(own.claim_generation) || own.claim_generation! < generation) return false;
     // A later claim ends this exact generation, even while the successor is active or unguarded.
     // The MAC-covered original guard and exact hold checks remain the custody authority.
-    return own.claim_generation! > record.generation ||
+    return own.claim_generation! > generation ||
       (own.inventory_guarded === true &&
        ["completed", "failed", "cancelled", "paused", "recovery_wait", "limit_wait"].includes(own.status));
   }
 
   private async openInventoryHold(record: Pick<RecoveryRecord, "runId" | "generation">): Promise<boolean> {
-    if (!this.client.hasFeature?.("recovery_inventory_v1") || !record.generation) return false;
+    if (!this.client.hasFeature?.("recovery_inventory_v1") || !Number.isSafeInteger(record.generation) || record.generation! <= 0) return false;
     const response = await this.client.listRecoveryHolds(record.runId);
     return response.run_id === record.runId && Array.isArray(response.holds) &&
       response.holds.filter(h => h.generation === record.generation && h.inventory_guarded === true &&
@@ -792,16 +806,8 @@ export class RecoveryCoordinator {
     // Authenticate every physical source record: listRecords deliberately skips unreadable
     // files for inspection, which cannot prove that FINAL covers the run's sources.
     if (!this.git.readInventoryCloneHeads || !this.git.ancestry) return;
-    const sources: RecoveryRecord[] = [];
-    try {
-      const names = await fs.readdir(this.runDir(record.runId));
-      for (const name of names) {
-        if (!name.endsWith(".json")) continue;
-        const result = await this.readRecordResult(path.join(this.runDir(record.runId), name));
-        if (result.kind !== "ok" || result.record.runId !== record.runId) return;
-        sources.push(result.record);
-      }
-    } catch { return; }
+    let sources: RecoveryRecord[];
+    try { sources = await this.checkedRecords(record.runId); } catch { return; }
     const clones = await this.git.readInventoryCloneHeads(record.coverageContext.barePath, record.runId);
     if (clones.kind !== "verified") return;
     const laterContext = (c: OwedCandidate["contexts"][number]): boolean =>
@@ -855,14 +861,8 @@ export class RecoveryCoordinator {
       }));
     }
     const request = record.finalRequest!;
-    if (request.disposition.kind === "settled") {
-      // The journaled identity was frozen under the exact open guarded hold.
-      // Its ACK may have been lost after release; replaying it grants no reserve/upload authority.
-      if (request.evidence === "publication") {
-        const own = await this.client.getRunOwnership!(record.runId);
-        if (own.status !== "completed" || own.claim_generation !== record.generation || own.inventory_guarded !== true) return;
-      }
-    }
+    // The journaled identity was frozen under the exact open guarded hold.
+    // Publication proof was checked at minting; replay grants no reserve/upload authority.
     try {
       if (!this.client.hasFeature?.("recovery_inventory_v1") || !(await this.inactiveInventory(record))) return;
       const ack = await this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition);
@@ -955,7 +955,7 @@ export class RecoveryCoordinator {
    */
   async captureAndUpload(input: CaptureInput): Promise<RecoveryOutcome> {
     if (!this.enabled) return { state: "pinned", captureId: input.record.captureId };
-    return runCaptureCycle(this.cycleKey(input.record), "wait", () => this.captureCycle(input));
+    return runCaptureCycle(await this.cycleKey(input.record), "wait", () => this.captureCycle(input));
   }
 
   /** The capture cycle; the caller holds the record's capture-cycle lock. */
@@ -1480,7 +1480,7 @@ export class RecoveryCoordinator {
       if (signal?.aborted) return;
       // The whole record step runs under the per-capture cycle lock (issue #1995), so a foreground
       // capture or a live pass on the same record cannot interleave with it.
-      await runCaptureCycle(this.cycleKey(snap), "wait", () => this.pendingStep(snap, signal));
+      await runCaptureCycle(await this.cycleKey(snap), "wait", () => this.pendingStep(snap, signal));
     }
   }
 
@@ -1698,7 +1698,7 @@ export class RecoveryCoordinator {
         .slice(0, this.liveMaxPerPass);
       for (const snap of candidates) {
         if (opts.signal?.aborted) break;
-        const res = await runCaptureCycle(this.cycleKey(snap), "skip", () => this.liveStep(snap, opts));
+        const res = await runCaptureCycle(await this.cycleKey(snap), "skip", () => this.liveStep(snap, opts));
         if (!res.ran) {
           // Cycle busy (a foreground capture or sweep step owns it): rotate it behind its peers so it
           // does not hold a per-pass slot forever.
@@ -1784,7 +1784,11 @@ export class RecoveryCoordinator {
    */
   async forgetGeneration(runId: string, generation: number): Promise<void> {
     if (!this.enabled) return;
-    await runCaptureCycle(this.cycleKey({ runId, captureId: "", generation }), "wait", async () => {
+    if (!(await this.guardedGeneration({ runId, generation }))) {
+      await this.removeGenerationRecords(runId, generation, "rmdir_if_empty");
+      return;
+    }
+    await runCaptureCycle(await this.cycleKey({ runId, captureId: "", generation }), "wait", async () => {
       if ((await this.listRecords(runId)).some(r => r.generation === generation && r.inventoryGuarded && !r.finalAcknowledged)) return;
       await this.removeGenerationRecords(runId, generation, "rmdir_if_empty");
     });
@@ -1795,6 +1799,68 @@ export class RecoveryCoordinator {
   async inspect(runId: string): Promise<RecoveryRecord[]> {
     if (!this.enabled) return [];
     return this.listRecords(runId);
+  }
+
+  /** Cleanup authority requires a complete authenticated physical journal, unlike inspect. */
+  async inventoryCleanupState(runId: string, generation: number): Promise<"legacy" | "pending" | "acknowledged"> {
+    const records = await this.checkedRecords(runId);
+    const relevant = records.filter(r => r.generation === generation);
+    const guarded = relevant.filter(r => r.inventoryGuarded === true);
+    if (guarded.length === 0) return "legacy";
+    const ack = guarded.find(r => r.finalAcknowledged === true && r.finalRequest && r.coverageDigest);
+    if (!ack || ack.reason === "inventory_quiescence_breach" || ack.reason === "inventory_snapshot_changed") return "pending";
+    // FINAL authenticated its frozen metadata. Later source records still require coverage;
+    // no ACK can short-circuit an unreadable sibling or an unattributed source.
+    for (const source of records) {
+      if (source.generation !== undefined && source.generation > generation) continue;
+      if (source.captureId === ack.captureId) continue;
+      if (source.finalRequest && !source.finalAcknowledged) return "pending";
+      // Earlier recovery-only aggregates are not adopted original heads. Check their
+      // original roots and current source, without requiring synthetic commits as parents.
+      if (source.coverageDigest && (!source.originalSourceSha || !source.inventoryCurrentSha)) return "pending";
+      const heads = source.coverageDigest
+        ? [...new Set([source.originalSourceSha!, source.inventoryCurrentSha!, ...(source.originalRoots ?? []).map(r => r.sha)])]
+        : [source.sourceSha];
+      for (const head of heads) {
+        if (head === ack.sourceSha) continue;
+        const bare = ack.bareDir && await this.git.resolveRecoveryBareDir?.(ack.bareDir);
+        if (!bare || bare !== ack.coverageContext?.barePath || !this.git.ancestry ||
+            await this.git.ancestry(bare, head, ack.sourceSha) !== "ancestor") return "pending";
+      }
+    }
+    return "acknowledged";
+  }
+
+  /** One bounded pass over physical JSON files; any failed read blocks authority.
+   * Paths must resolve inside this coordinator's root, with no symlink file reads. */
+  private async checkedRecords(runId: string): Promise<RecoveryRecord[]> {
+    if (!/^[a-zA-Z0-9_-]+$/.test(runId)) throw new Error("unsafe recovery run id");
+    const root = path.resolve(this.recoveryRoot);
+    const dir = this.runDir(runId);
+    let names: string[];
+    for (const directory of [root, dir]) {
+      let stat;
+      try { stat = await fs.lstat(directory); }
+      catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw err;
+      }
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe recovery directory");
+    }
+    if (await fs.realpath(root) !== root || await fs.realpath(dir) !== path.resolve(dir)) {
+      throw new Error("symlink recovery directory");
+    }
+    // Disappearance after a positive directory check is unknown, not empty proof.
+    names = await fs.readdir(dir);
+    const records: RecoveryRecord[] = [];
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue;
+      const result = await this.readRecordResult(path.join(dir, name), true);
+      if (result.kind !== "ok" || result.record.runId !== runId ||
+          name !== result.record.captureId + ".json") throw new Error("unverified recovery journal");
+      records.push(result.record);
+    }
+    return records;
   }
 
   // ── journal IO + authentication ─────────────────────────────────────────────────
@@ -1817,9 +1883,16 @@ export class RecoveryCoordinator {
     return path.join(this.runDir(record.runId), `${record.captureId}.${randomUUID()}.bundle.tmp`);
   }
 
-  /** The per-capture cycle lock key. */
-  private cycleKey(record: Pick<RecoveryRecord, "runId" | "captureId" | "generation">): string {
-    return path.resolve(this.runDir(record.runId), `generation-${record.generation ?? "legacy"}`);
+  /** Guarded generations serialize original evidence; legacy captures retain pin invalidation. */
+  private async cycleKey(record: Pick<RecoveryRecord, "runId" | "captureId" | "generation" | "inventoryGuarded">): Promise<string> {
+    return (await this.guardedGeneration(record))
+      ? path.resolve(this.runDir(record.runId), `generation-${record.generation ?? "legacy"}`)
+      : this.recordPath(record);
+  }
+
+  private async guardedGeneration(record: Pick<RecoveryRecord, "runId" | "generation" | "inventoryGuarded">): Promise<boolean> {
+    return record.inventoryGuarded === true || (await this.listRecords(record.runId))
+      .some(r => r.generation === record.generation && r.inventoryGuarded === true);
   }
 
   private withJournalLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
@@ -1852,11 +1925,20 @@ export class RecoveryCoordinator {
    */
   private async readRecordResult(
     filePath: string,
+    noFollow = false,
   ): Promise<{ kind: "ok"; record: RecoveryRecord } | { kind: "absent" } | { kind: "unreadable" }> {
     if (!this.key) return { kind: "unreadable" };
     let raw: string;
     try {
-      raw = await fs.readFile(filePath, "utf8");
+      if (noFollow) {
+        const file = await fs.open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        try {
+          if (!(await file.stat()).isFile()) return { kind: "unreadable" };
+          raw = await file.readFile("utf8");
+        } finally { await file.close(); }
+      } else {
+        raw = await fs.readFile(filePath, "utf8");
+      }
     } catch (err) {
       return (err as NodeJS.ErrnoException)?.code === "ENOENT" ? { kind: "absent" } : { kind: "unreadable" };
     }

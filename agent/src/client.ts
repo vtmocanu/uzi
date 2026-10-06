@@ -119,6 +119,18 @@ export class RequestError extends Error {
   }
 }
 
+/** Exact current-worker ownership loss; generic route/auth/transport failures are unknown. */
+export function isRunOwnershipLost(err: unknown, runId: string): boolean {
+  if (!(err instanceof RequestError) || err.method !== "GET" || err.status !== 404 ||
+      err.path !== `${WORKER_API_PREFIX}/runs/${runId}/ownership` || err.body.length > 1024) return false;
+  try {
+    const body: unknown = JSON.parse(err.body);
+    return typeof body === "object" && body !== null && !Array.isArray(body) &&
+      Object.keys(body).length === 1 &&
+      (body as { error?: unknown }).error === "run not found for this worker";
+  } catch { return false; }
+}
+
 /** Issue #1766: the typed Codex credential deferral a locked owner vault produces. A Codex
  *  refresh/release that passed authorization but hit a locked vault answers HTTP 409 with
  *  `{"reason":"vault_locked"}` in the body. Returns "vault_locked" ONLY for that exact shape
@@ -794,6 +806,11 @@ function validDindSample(sample: DindMeterSample | null | undefined): sample is 
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
   private readonly inventoryGuardedClaims = new Set<string>();
+
+  /** Exact positive server claim evidence survives capability refreshes. */
+  knowsInventoryGuardedClaim(runId: string, generation: number): boolean {
+    return this.inventoryGuardedClaims.has(`${runId}:${generation}`);
+  }
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly terminalRetrySchedule: number[];
   private readonly permitRetryBudgetMs: number;

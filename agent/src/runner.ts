@@ -5,7 +5,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import { basename as pathBasename, join, resolve as resolvePath } from "node:path";
 import type { WorkerClient } from "./client.js";
-import { RequestError } from "./client.js";
+import { RequestError, isRunOwnershipLost } from "./client.js";
 import type { GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
@@ -3542,17 +3542,15 @@ export class RunRunner {
       // `abandoned`, NO filesystem operation on its path — and never retired or reused. Its
       // capture already ran behind the predecessor-scoped capture-mode proof.
       let ownAttemptRetired = false;
+      // This credential-free retention reads only the trusted bare, including when the clone
+      // must stay in place after a blocked proof. Inventory freeze uses the retire proof below.
       if (flight.barePath && flight.branch && !terminalDisposeUnproven && typeof this.git.retainCurrentOwedCandidate === "function") {
-        const q = await this.quiesceRun(flight, executor, { mode: "own", site: "terminal_retire" });
-        if (!q.blocked) {
-          try {
-            const retained = await this.git.retainCurrentOwedCandidate(flight.barePath, await this.owedOptions(flight, flight.barePath, flight.branch));
-            if (retained.kind === "not_updated" && claim.inventory_guarded === true) flight.preserveRecoveryClone = true;
-            if (claim.inventory_guarded === true && !flight.active?.shuttingDown) await this.settleGuardedInventory(claim, flight);
-          } catch (err) {
-            if (claim.inventory_guarded === true) flight.preserveRecoveryClone = true;
-            runLog.warn("recovery: retirement inventory unknown", { error: errMessage(err), guarded: claim.inventory_guarded === true });
-          }
+        try {
+          const retained = await this.git.retainCurrentOwedCandidate(flight.barePath, await this.owedOptions(flight, flight.barePath, flight.branch));
+          if (retained.kind === "not_updated" && claim.inventory_guarded === true) flight.preserveRecoveryClone = true;
+        } catch (err) {
+          if (claim.inventory_guarded === true) flight.preserveRecoveryClone = true;
+          runLog.warn("recovery: retirement inventory unknown", { error: errMessage(err), guarded: claim.inventory_guarded === true });
         }
       }
       if (flight.predecessorCapture && flight.worktreePath && !flight.preserveRecoveryClone) {
@@ -3581,6 +3579,8 @@ export class RunRunner {
             clone: flight.worktreePath,
             state: q.outcome.process?.state,
           });
+        } else if (claim.inventory_guarded === true && !flight.active?.shuttingDown) {
+          await this.settleGuardedInventory(claim, flight, undefined, undefined, undefined, true);
         }
       }
       if (flight.worktreePath && !flight.predecessorCapture && !flight.preserveRecoveryClone && !retireBlocked) {
@@ -3762,9 +3762,10 @@ export class RunRunner {
    *  write-ahead terminal send path falls back to today's un-journaled `reportState`. */
   async recoveryInventoryPending(runId: string, generation: number): Promise<boolean> {
     try {
-      const records = (await this.recovery.inspect(runId)).filter(r => r.generation === generation);
-      if (records.some(r => r.inventoryGuarded && r.coverageDigest && r.finalAcknowledged)) return false;
-      if (records.some(r => r.inventoryGuarded)) return true;
+      const state = await this.recovery.inventoryCleanupState(runId, generation);
+      if (state === "acknowledged") return false;
+      if (state !== "legacy") return true;
+      if (this.client.knowsInventoryGuardedClaim?.(runId, generation) === true) return true;
       if (this.client.hasFeature("recovery_inventory_v1")) {
         return (await this.client.listRecoveryHolds(runId)).holds.some(h => h.generation === generation && h.inventory_guarded === true);
       }
@@ -3772,7 +3773,12 @@ export class RunRunner {
     } catch { return true; } // Unknown inventory never permits cleanup.
   }
 
+  // terminal-resolve keys its single-flight by outbox identity; all replay paths share this proxy.
+  private readonly protectedTerminalOutboxes = new WeakMap<TerminalOutboxDeps["outbox"], TerminalOutboxDeps["outbox"]>();
+
   protectRecoveryTerminalDeps(deps: TerminalOutboxDeps): TerminalOutboxDeps {
+    const existing = this.protectedTerminalOutboxes.get(deps.outbox);
+    if (existing) return { ...deps, outbox: existing };
     const outbox = new Proxy(deps.outbox, {
       get: (target, property) => {
         if (property === "retireTerminal") return async (runId: string, generation: number) => {
@@ -3782,6 +3788,7 @@ export class RunRunner {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
+    this.protectedTerminalOutboxes.set(deps.outbox, outbox);
     return { ...deps, outbox };
   }
 
@@ -10240,13 +10247,21 @@ export class RunRunner {
       const retained = await this.git.retainCurrentOwedCandidate(barePath, options);
       if (retained.kind === "updated") this.announceOwedHeads(flight, retained.retainedShas);
       else flight.preserveRecoveryClone = true;
-      const own = await this.client.getRunOwnership(claim.run_id);
-      if (!locallyQuiescent && (own.claim_generation === undefined ||
+      let own;
+      // A reaped accepted park/terminal can freeze without a current-owner probe.
+      // Publication still requires positive exact-generation completed evidence.
+      if (!locallyQuiescent || completedBody) {
+        try { own = await this.client.getRunOwnership(claim.run_id); }
+        catch (err) {
+          if (!isRunOwnershipLost(err, claim.run_id)) throw err;
+        }
+      }
+      if (!locallyQuiescent && own && (own.claim_generation === undefined ||
           !(own.claim_generation > claim.claim_generation ||
             (own.claim_generation === claim.claim_generation && own.inventory_guarded === true &&
              ["completed", "failed", "cancelled", "paused", "recovery_wait", "limit_wait"].includes(own.status))))) return;
       // Publication can classify an authoritative empty inventory, never clear owed pins.
-      const publication = completedBody && own.status === "completed" &&
+      const publication = completedBody && own?.status === "completed" &&
         own.claim_generation === claim.claim_generation && flight.successfulPushedSha &&
         !completedBody.report_only && !!completedBody.branch;
       const candidates = await this.git.enumerateOwedCandidates(barePath, claim.run_id);

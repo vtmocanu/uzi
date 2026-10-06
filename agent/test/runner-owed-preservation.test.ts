@@ -323,6 +323,7 @@ for (const sink of ["limit-park", "scanned-checkpoint"] as const) {
       return realPack(...args);
     };
     client.publishCheckpoint = async (_run, tip, pack) => {
+      assert.ok((await git.enumerateOwedCandidates(bare, claim.run_id)).some(c => c.sha === h), "H stays pinned before broker confirmation");
       published = tip;
       for await (const chunk of pack) chunks.push(Buffer.from(chunk));
       return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/proof" } };
@@ -347,8 +348,11 @@ for (const sink of ["limit-park", "scanned-checkpoint"] as const) {
     assert.ok(f, "foreign promotion reached the real pack boundary");
     assert.equal(published, h);
     assert.notEqual(published, f);
-    assert.ok((await git.enumerateOwedCandidates(bare, claim.run_id)).some(c => c.sha === h));
+    assert.ok((await git.enumerateOwedCandidates(bare, claim.run_id)).every(c => c.sha !== h), "exact confirmed containment clears H");
     assert.ok((await git.enumerateOwedCandidates(bare, claim.run_id)).every(c => c.sha !== f));
+    const foreign = (await git.enumerateOwedCandidates(bare, "foreign-run")).find(c => c.sha === f);
+    assert.ok(foreign, "foreign H2 stays pinned under its original owner");
+    assert.ok(foreign.contexts.every(c => c.runId === "foreign-run" && c.generation === 8));
     if (sink === "scanned-checkpoint") {
       assert.equal(continued, true);
       assert.deepEqual(bookkeeping, { publishedTip: h, lastPublishedTip: h, checkpointFloor: h });

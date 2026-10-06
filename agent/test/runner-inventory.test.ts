@@ -1,4 +1,5 @@
 import { it } from "node:test";
+import { RequestError } from "../src/client.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -174,6 +175,28 @@ it("failed terminal transfer journals clone-only HEAD and does not settle an old
   const bare = git.barePathFor(fx.originPath);
   assert.equal((await git.enumerateOwedCandidates(bare, claim.run_id)).some(c => c.sha === head), false);
   assert.throws(() => command(bare, ["cat-file", "-t", head]));
+});
+
+it("issue1924 locally quiescent terminal captures original roots after foreign ownership404", async () => {
+  const claim = gitlabClaim(1961, { claim_generation: 28, inventory_guarded: true });
+  const { gitlab } = fakeGitlab();
+  guardedApi(claim, () => "failed");
+  let head = "", productions = 0;
+  const produce = git.produceRecoveryBundle.bind(git);
+  git.produceRecoveryBundle = async (...args) => { productions++; return produce(...args); };
+  const r = runner({ run: async ctx => {
+    head = commit(ctx.worktreePath, "foreign-reclaim.txt");
+    client.getRunOwnership = async () => {
+      throw new RequestError("GET", "/api/worker/runs/" + claim.run_id + "/ownership", 404,
+        JSON.stringify({ error: "run not found " + "for this worker" }));
+    };
+    throw new Error("terminal failure after reclaim");
+  } }, gitlab, "journal-key");
+  await r.execute(claim);
+  assert.ok(productions > 0);
+  const records = await r.snapshotBootRecoveries();
+  assert.ok(records.some(record => record.coverageDigest &&
+    record.originalRoots?.some(root => root.sha === head)));
 });
 
 function guardedApi(claim: ReturnType<typeof gitlabClaim>, status: () => string) {

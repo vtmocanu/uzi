@@ -1,4 +1,5 @@
 import { it } from "node:test";
+import { RequestError } from "../src/client.js";
 import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -12,6 +13,87 @@ import { nullLogger, testGitCacheOptions } from "./helpers.js";
 const H = "a".repeat(40);
 const H2 = "b".repeat(40);
 
+function ownershipLost() {
+  return new RequestError("GET", "/api/worker/runs/" + "run-1/ownership", 404,
+    JSON.stringify({ error: "run not found " + "for this worker" }));
+}
+
+it("issue1924 crossworker ownership404 archives all original roots under open hold", async () => {
+  const f = await fixture();
+  try {
+    f.state.ownershipError = ownershipLost();
+    const record = await f.freeze(H2);
+    assert.ok(record);
+    assert.deepEqual(record.originalRoots?.map(r => r.sha), [H]);
+    assert.ok(f.aggregates.some(roots => roots.includes(H) && roots.includes(H2)));
+    await f.capture(record);
+    assert.equal(f.finals.length, 1);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]?.finalAcknowledged, true);
+  } finally { await f.close(); }
+});
+
+for (const settled of [false, true]) {
+  it(`issue1924 lost FINAL ACK foreign ownership404 closed hold exact replay settled=${settled}`, async () => {
+    const f = await fixture();
+    try {
+      if (settled) { f.state.candidates = []; f.state.status = "completed"; }
+      const record = settled ? await f.coordinator.freezeInventory({
+        context: f.context, currentSha: H, defaultBranch: "main", settledEvidence: "publication",
+      }) : await f.freeze();
+      assert.ok(record);
+      f.state.loseAck = true;
+      await f.capture(record);
+      assert.equal(f.finals.length, 1);
+      const identity = (await f.coordinator.inspect("run-1"))[0]!.finalRequest;
+      const reserves = f.reserves(), produced = f.state.produced;
+      f.state.ownershipError = ownershipLost();
+      f.state.loseAck = false;
+      assert.equal(f.state.open, false);
+      await f.make().resumePending(undefined, [record]);
+      assert.equal(f.finals.length, 2);
+      assert.deepEqual(f.finals[1], f.finals[0]);
+      assert.deepEqual((await f.coordinator.inspect("run-1"))[0]!.finalRequest, identity);
+      assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, true);
+      assert.equal(f.reserves(), reserves);
+      assert.equal(f.state.produced, produced);
+    } finally { await f.close(); }
+  });
+}
+
+it("issue1924 ownership loss never mints publication or reopens closed hold", async () => {
+  const f = await fixture();
+  try {
+    f.state.candidates = [];
+    f.state.ownershipError = ownershipLost();
+    assert.equal(await f.coordinator.freezeInventory({
+      context: f.context, currentSha: H, defaultBranch: "main",
+      settledEvidence: "publication", locallyQuiescent: true,
+    }), undefined);
+    f.state.open = false;
+    assert.equal(await f.freeze(), undefined);
+    assert.equal(f.reserves(), 0);
+    assert.equal(f.finals.length, 0);
+  } finally { await f.close(); }
+});
+
+it("issue1924 invalid ownership route body network and HTTP failures never FINAL", async () => {
+  for (const error of [
+    new RequestError("GET", "/api/worker/runs/run-1/unknown", 404, ownershipLost().body),
+    new RequestError("GET", ownershipLost().path, 404, '{"error":"unknown route"}'),
+    new RequestError("GET", ownershipLost().path, 401, ownershipLost().body),
+    new RequestError("GET", ownershipLost().path, 500, ownershipLost().body),
+    new Error("network unavailable"),
+  ]) {
+    const f = await fixture();
+    try {
+      f.state.ownershipError = error;
+      await f.freeze().catch(() => undefined);
+      assert.equal(f.reserves(), 0);
+      assert.equal(f.finals.length, 0);
+    } finally { await f.close(); }
+  }
+});
+
 async function fixture() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "inventory-"));
   const context: PositiveOwedCandidateContext = {
@@ -22,6 +104,7 @@ async function fixture() {
   const state = {
     candidates: [{ sha: H, pinRef: "refs/owed/a", contexts: [structuredClone(context)] }] as OwedCandidate[],
     status: "failed", ownGeneration: 7, ownGuarded: true, feature: true, open: true, expires: "2099-01-01T00:00:00Z",
+    ownershipError: undefined as Error | undefined,
     loseAck: false, wrongAck: false, failProduce: false, now: 1000,
     oversized: false, cloneHeads: [] as string[], cloneReadable: true,
     produceWait: undefined as Promise<void> | undefined, produced: 0,
@@ -30,22 +113,39 @@ async function fixture() {
   const aggregates: string[][] = [];
   const finals: unknown[][] = [];
   let reserves = 0;
-  let manifest: { checksum: string; byte_size: number } | undefined;
+  const captures = new Map<string, { id: string; manifest?: { checksum: string; byte_size: number } }>();
   const client = {
     hasFeature: () => state.feature,
-    getRunOwnership: async () => ({ status: state.status, claim_generation: state.ownGeneration, inventory_guarded: state.ownGuarded }),
+    getRunOwnership: async () => {
+      if (state.ownershipError) throw state.ownershipError;
+      return { status: state.status, claim_generation: state.ownGeneration, inventory_guarded: state.ownGuarded };
+    },
     listRecoveryHolds: async () => ({ run_id: context.runId, holds: state.open ? [{
       hold_id: "hold-7", generation: 7, inventory_guarded: true, has_available_capture: false,
     }] : [] }),
-    reserveRecoveryCapture: async () => { reserves++; return { capture_id: "server-1", state: "preparing" }; },
-    getRecoveryCaptureStatus: async () => ({
-      capture_id: "server-1", state: manifest ? "available" : "preparing", manifest_bound: !!manifest,
-      checksum: manifest?.checksum, byte_size: manifest?.byte_size, expires_at: state.expires,
-    }),
-    uploadRecoveryBundle: async (_run: string, _id: string, m: typeof manifest, stream: AsyncIterable<unknown>) => {
+    reserveRecoveryCapture: async (_run: string, request: { idempotency_key: string }) => {
+      reserves++;
+      let capture = captures.get(request.idempotency_key);
+      if (!capture) {
+        capture = { id: "server-" + (captures.size + 1) };
+        captures.set(request.idempotency_key, capture);
+      }
+      return { capture_id: capture.id, state: "preparing" };
+    },
+    getRecoveryCaptureStatus: async (_run: string, id: string) => {
+      const capture = [...captures.values()].find(c => c.id === id);
+      assert.ok(capture);
+      return {
+        capture_id: id, state: capture.manifest ? "available" : "preparing", manifest_bound: !!capture.manifest,
+        checksum: capture.manifest?.checksum, byte_size: capture.manifest?.byte_size, expires_at: state.expires,
+      };
+    },
+    uploadRecoveryBundle: async (_run: string, id: string, m: { checksum: string; byte_size: number }, stream: AsyncIterable<unknown>) => {
       for await (const chunk of stream) assert.ok(chunk);
-      manifest = m;
-      return { capture_id: "server-1", state: "available", manifest_bound: true };
+      const capture = [...captures.values()].find(c => c.id === id);
+      assert.ok(capture);
+      capture.manifest = m;
+      return { capture_id: id, state: "available", manifest_bound: true };
     },
     releaseRecoveryCustody: async (...args: unknown[]) => {
       finals.push(args);
@@ -94,6 +194,30 @@ async function fixture() {
   return { root, context, state, aggregates, finals, coordinator, make, freeze, capture,
     reserves: () => reserves, close: () => fs.rm(root, { recursive: true, force: true }) };
 }
+
+it("final inventory ACK covers an earlier available aggregate without treating it as an adopted head", async () => {
+  const f = await fixture();
+  try {
+    f.state.status = "running";
+    const earlier = await f.coordinator.freezeInventory({
+      context: f.context, currentSha: H, defaultBranch: "main", locallyQuiescent: true,
+    });
+    assert.ok(earlier);
+    await f.capture(earlier);
+    assert.equal(f.finals.length, 0, "an active generation cannot finalize its earlier archive");
+    f.state.candidates.push({ sha: H2, pinRef: "refs/owed/b", contexts: [structuredClone(f.context)] });
+    f.state.status = "failed";
+    const covering = await f.freeze(H2);
+    assert.ok(covering);
+    assert.notEqual(covering.captureId, earlier.captureId);
+    await f.capture(covering);
+    const records = await f.coordinator.inspect(f.context.runId);
+    const final = records.find(r => r.captureId === covering.captureId)!;
+    assert.equal(final.finalAcknowledged, true);
+    assert.notEqual(final.serverCaptureId, records.find(r => r.captureId === earlier.captureId)?.serverCaptureId);
+    assert.equal(await f.coordinator.inventoryCleanupState(f.context.runId, f.context.generation), "acknowledged");
+  } finally { await f.close(); }
+});
 
 it("exact disposition source absent from owed refs is included without invented production", async () => {
   const f = await fixture();
