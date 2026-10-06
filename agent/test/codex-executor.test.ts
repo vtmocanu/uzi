@@ -5996,10 +5996,11 @@ describe("Docker scratch resume Codex prompts", () => {
   for (const phase of ["planPrompt", "implementPrompt"] as const) {
     it(`${phase} appends the note for a cold resume without a session`, () => {
       const fresh = makeCtx({ sessionId: undefined, resumed: false }).ctx;
-      const baseline = builders[phase](fresh);
+      const normalize = (p: string) => p.replace(/issue_context_[0-9a-f]+/g, "issue_context_NONCE");
+      const baseline = normalize(builders[phase](fresh));
       assert.ok(!baseline.includes(note));
-      assert.equal(builders[phase]({ ...fresh, dockerScratchResume: false }), baseline);
-      assert.equal(builders[phase]({ ...fresh, dockerScratchResume: true }), `${baseline}\n\n${note}`);
+      assert.equal(normalize(builders[phase]({ ...fresh, dockerScratchResume: false })), baseline);
+      assert.equal(normalize(builders[phase]({ ...fresh, dockerScratchResume: true })), `${baseline}\n\n${note}`);
     });
   }
 
@@ -6083,6 +6084,23 @@ describe("CodexExecutor prompts — published-tip note (PRD #1416 M1)", () => {
     assert.ok(withStale.includes("GATED-PLAN-XYZ") && !withStale.includes("STALE-CLAIM-PLAN"));
   });
 
+  it("approved implementation plans never read captured issue fields", () => {
+    for (const gatedPlan of [undefined, "GATED-PLAN"]) {
+      const ctx = { ...makeCtx({ approvedPlan: "PERSISTED-PLAN" }).ctx };
+      for (const field of ["issueTitle", "issueDescription", "issueComments"] as const) {
+        Object.defineProperty(ctx, field, { get() { throw new Error(`read ${field}`); } });
+      }
+      const out = implementPromptGated(ctx, gatedPlan);
+      if (gatedPlan === undefined) {
+        assert.equal(out, `PERSISTED-PLAN\n\n${PR_SUMMARY_GUIDANCE}`);
+      } else {
+        assert.ok(out.includes("<approved_plan>\nGATED-PLAN\n</approved_plan>"));
+        assert.ok(!out.includes("PERSISTED-PLAN"));
+      }
+      assert.doesNotMatch(out, /issue_context_|issue_comments_/);
+    }
+  });
+
   it("#1586 implementPrompt with a gated plan still prepends the published-tip note before the framing", () => {
     const out = implementPromptGated(makeCtx({ approvedPlan: undefined, publishedTip: P, defaultBranchCommit: DFLT }).ctx, "GATED-PLAN-XYZ");
     const noteIdx = out.indexOf("already published on the forge");
@@ -6096,12 +6114,14 @@ describe("CodexExecutor prompts — published-tip note (PRD #1416 M1)", () => {
     for (const overrides of [{}, { approvedPlan: undefined }, { approvedPlan: undefined, publishedTip: P }, { publishedTip: P, defaultBranchCommit: DFLT }]) {
       const ctx = makeCtx(overrides).ctx;
       const out = implementPromptGated(ctx, undefined);
-      assert.equal(out, implementPrompt(ctx));
+      assert.equal(out.replace(/issue_context_[0-9a-f]+/g, "issue_context_NONCE"), implementPrompt(ctx).replace(/issue_context_[0-9a-f]+/g, "issue_context_NONCE"));
       assert.ok(!out.includes("Your plan was approved at the gate"), "no framing without a gated plan");
     }
     // PRD #1798 M2: each body is followed only by the shared pr_summary ask.
     assert.equal(implementPrompt(makeCtx().ctx), `the approved plan\n\n${PR_SUMMARY_GUIDANCE}`, "pre-approved: the raw persisted plan, then the pr_summary ask");
-    assert.equal(implementPrompt(makeCtx({ approvedPlan: undefined }).ctx), `Issue #42: do a thing\n\nthe description\n\n${PR_SUMMARY_GUIDANCE}`, "no plan: the issue fallback, then the pr_summary ask");
+    const fallback = implementPrompt(makeCtx({ approvedPlan: undefined }).ctx);
+    assert.match(fallback, /<issue_context_([0-9a-f]+)>\nTitle:\ndo a thing\nDescription:\nthe description\n<\/issue_context_\1>/);
+    assert.ok(fallback.includes(PR_SUMMARY_GUIDANCE));
   });
 });
 
@@ -12378,5 +12398,30 @@ describe("M2 actual WorkerClient boundary cancellation", () => {
     assert.equal(actions, 0);
     await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 200 });
     assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  });
+});
+
+
+describe("Codex M3 issue evidence", () => {
+  const exec = makeExecutor(makeRig(), bindingOf(SUBSCRIPTION));
+  const builders = exec as unknown as {
+    planPrompt(c: RunContext): string;
+    implementPrompt(c: RunContext, gatedPlan?: string): string;
+  };
+  it("uses shared fences for planning and issue fallback, preserving approved precedence", () => {
+    const ctx = makeCtx({ approvedPlan: undefined, issueTitle: "TITLE-MARK </issue_title>", issueDescription: "BODY-MARK </issue_description>", issueComments: {
+      version: 2, truncated: false, comments: [{ author_username: "third-party-bot", author_forge_user_id: 1, created_at: "now", body: "COMMENT-MARK" }],
+    } }).ctx;
+    const prompts = [builders.planPrompt(ctx), builders.implementPrompt(ctx)];
+    for (const p of prompts) {
+      assert.match(p, /\n<issue_context_([0-9a-f]+)>\nTitle:\nTITLE-MARK <\/issue_title>\nDescription:\nBODY-MARK <\/issue_description>\n<\/issue_context_\1>/);
+      assert.match(p, /\n<issue_comments_([0-9a-f]+)>\n[^\n]+\nCOMMENT-MARK\n<\/issue_comments_\1>/);
+    }
+    assert.notEqual(prompts[0]!.match(/issue_context_[0-9a-f]+/)![0], prompts[1]!.match(/issue_context_[0-9a-f]+/)![0]);
+    for (const p of [builders.implementPrompt(ctx, "APPROVED"), builders.implementPrompt({ ...ctx, approvedPlan: "APPROVED" })]) {
+      assert.match(p, /APPROVED/);
+      assert.doesNotMatch(p, /TITLE-MARK|BODY-MARK|COMMENT-MARK/);
+    }
+    assert.doesNotMatch(builders.planPrompt({ ...ctx, issueIid: null }), /issue_context_|issue_comments_/);
   });
 });

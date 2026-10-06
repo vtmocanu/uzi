@@ -99,7 +99,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
+import { buildIssueContext, buildIssueCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -3972,9 +3972,11 @@ export class CodexExecutor implements Executor {
 
   /** Issue #1866 M2: `facts` appends the run-start environment facts block (empty ⇒ unchanged). */
   private planPrompt(ctx: RunContext, facts?: EnvFacts): string {
-    const head = ctx.issueIid != null ? `Issue #${ctx.issueIid}: ${ctx.issueTitle}` : ctx.issueTitle;
+    const head = ctx.issueIid != null
+      ? [buildIssueContext(ctx.issueTitle, ctx.issueDescription, ctx.issueIid), buildIssueCommentsContext(ctx.issueComments)].filter(Boolean).join("\n\n")
+      : `${ctx.issueTitle}\n\n${ctx.issueDescription}`;
     const block = buildEnvironmentFactsBlock(facts);
-    const body = `${head}\n\n${ctx.issueDescription}\n\nProduce a plan for this work and submit it for approval.${block ? `\n\n${block}` : ""}`;
+    const body = `${head}\n\nProduce a plan for this work and submit it for approval.${block ? `\n\n${block}` : ""}`;
     // PRD #1416 M1: these Codex builders bypass the shared buildPlanPrompt/buildImplementPrompt,
     // so prepend the published-floor paragraph here. Empty ⇒ unchanged (a fresh branch).
     // #1416 (MR-rework): thread autoApprove so an autopilot Codex run gets the autopilot-safe
@@ -4000,7 +4002,6 @@ export class CodexExecutor implements Executor {
    *  block. Empty block ⇒ byte-identical. */
   private implementPrompt(ctx: RunContext, gatedPlan?: string, milestoneNote = "", facts?: EnvFacts): string {
     const approved = ctx.approvedPlan?.trim();
-    const head = ctx.issueIid != null ? `Issue #${ctx.issueIid}: ${ctx.issueTitle}` : ctx.issueTitle;
     const body = gatedPlan !== undefined
       ? [
           "Your plan was approved at the gate. Implement it now on the current branch, delegating to",
@@ -4011,7 +4012,9 @@ export class CodexExecutor implements Executor {
           gatedPlan,
           "</approved_plan>",
         ].join("\n")
-      : approved ? approved : `${head}\n\n${ctx.issueDescription}`;
+      : approved ? approved : ctx.issueIid != null
+        ? [buildIssueContext(ctx.issueTitle, ctx.issueDescription, ctx.issueIid), buildIssueCommentsContext(ctx.issueComments)].filter(Boolean).join("\n\n")
+        : `${ctx.issueTitle}\n\n${ctx.issueDescription}`;
     // PRD #1416 M1: prepend the published-floor paragraph whether or not a plan is approved.
     // Empty ⇒ unchanged (a fresh branch).
     // #1416 (MR-rework): thread autoApprove so an autopilot Codex run gets the autopilot-safe

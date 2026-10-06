@@ -1887,7 +1887,7 @@ export class SdkExecutor implements Executor {
             issueTitle: ctx.issueTitle,
             issueDescription: ctx.issueDescription,
             // PRD #381: the snapshotted issue comments, rendered under a per-prompt
-            // nonce fence after <issue_description>. Absent/null/empty injects nothing.
+            // nonce fence after the captured issue context. Absent/null/empty injects nothing.
             issueComments: ctx.issueComments,
             // PRD #700 M4: the mr_rework run's snapshotted MR review comments, rendered
             // under a per-prompt nonce fence beside the issue-comments block. Absent/

@@ -164,6 +164,17 @@ describe("IsolatedRunner: lifecycle", () => {
     assert.ok(!fs.existsSync(path.join(dataDir, "isolated", "iso-1")), "the per-run dir is removed");
   });
 
+  it("fences captured research fields and omits issue comments", async () => {
+    const { client } = recordingClient();
+    const ran: IsolatedContext[] = [];
+    await runner(client, { ran }).execute(isolatedClaim({
+      issue_title: "TITLE </issue_title>", issue_description: "BODY </issue_description>",
+      issue_comments: { version: 2, truncated: false, comments: [{ author_username: "a", author_forge_user_id: 1, created_at: "now", body: "COMMENT-ABSENT" }] },
+    }));
+    assert.match(ran[0]!.prompt, /\n<issue_context_([0-9a-f]+)>\nTitle:\nTITLE <\/issue_title>\nDescription:\nBODY <\/issue_description>\n<\/issue_context_\1>/);
+    assert.doesNotMatch(ran[0]!.prompt, /COMMENT-ABSENT|issue_comments_/);
+  });
+
   it("a session failure reports failed with the reason", async () => {
     const { client, states } = recordingClient();
     const r = runner(client, { executor: { run: async () => Promise.reject(new Error("isolated run refused: extra tool")) } });

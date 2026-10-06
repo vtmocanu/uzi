@@ -2,6 +2,7 @@
 // callback boundary. The app-server receives only the immutable grant's model-visible
 // subset. Native environments are disabled separately on every fresh thread.
 
+import { GET_ISSUE_HELP } from "../forge-tool-help.js";
 import { CODEX_DELEGATE_TOOLS, codexDynamicToolWireName, type RunGrants } from "./broker.js";
 
 export interface CodexDynamicToolSpec {
@@ -165,6 +166,10 @@ function definition(name: string): Omit<CodexDynamicToolSpec, "type" | "name"> {
         inputSchema: objectSchema({}, [], false),
       };
     case "mcp__forge__get_issue":
+      return {
+        description: GET_ISSUE_HELP,
+        inputSchema: objectSchema({ iid: { type: "integer", minimum: 1 } }, ["iid"], false),
+      };
     case "mcp__forge__get_merge_request":
     case "mcp__forge__list_issue_label_events":
       return {

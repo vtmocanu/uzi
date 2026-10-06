@@ -1004,20 +1004,25 @@ export interface IterationBudget {
   budgetExhausted?: boolean;
 }
 
-/** One human comment on the worked issue, snapshotted at run creation (PRD #381).
- *  Bodies are UNTRUSTED, attacker-influenceable free text. */
+/** One server-assessed issue comment, snapshotted at run creation.
+ *  Eligible bodies and withheld placeholders remain UNTRUSTED data. */
 export interface IssueCommentSnapshot {
   author_username: string;
   author_forge_user_id: number;
   /** RFC3339. */
   created_at: string;
   body: string;
+  reason?: "author_not_eligible" | "permission_unknown";
 }
 
-/** The bounded, bot/system-filtered snapshot of the issue's human comments carried
- *  on the claim (PRD #381). Absent for a comment-less issue, a non-issue kind, and a
- *  connection with an unknown bot id (D9). `truncated` is set when the thread was clipped. */
+/** Version 2 carries server-filtered comments: only uzi's own bot is excluded by
+ *  identity; other authors are assessed by the API. Empty/unknown threads may be
+ *  present. Missing/unsupported versions render unknown-permission placeholders.
+ *  `truncated` marks clipping after assessment of the complete fetched thread. */
 export interface IssueCommentsSnapshot {
+  version?: number;
+  withheld?: boolean;
+  unknown?: boolean;
   comments: IssueCommentSnapshot[];
   truncated: boolean;
 }
@@ -1889,6 +1894,7 @@ export interface IssueCommentDTO {
   author: string;
   created_at: string;
   body: string;
+  reason?: "author_not_eligible" | "permission_unknown";
 }
 
 /** One issue's detail (GET /worker/runs/:id/forge/issues/:iid). `description` may be
@@ -1906,6 +1912,13 @@ export interface IssueDTO {
   description_truncated: boolean;
   comments: IssueCommentDTO[];
   comments_truncated: boolean;
+  content_reason?: "author_not_eligible" | "permission_unknown";
+  comments_withheld?: boolean;
+  comments_unknown?: boolean;
+  snapshot_comparison?: "changed" | "unchanged" | "unavailable";
+  snapshot_note?: string;
+  content_changed?: boolean;
+  metadata_unavailable?: boolean;
 }
 
 /** A lightweight issue row in a list (no description). */

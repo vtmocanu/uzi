@@ -5957,6 +5957,9 @@ describe("SdkExecutor decisions memo (issue #2083)", () => {
     ]);
     const probe = makeCtx({
       ...reworkBase,
+      issueTitle: "CAPTURED-TITLE-MARK",
+      issueDescription: "CAPTURED-BODY-MARK",
+      issueComments: { truncated: false, comments: [{ author_username: "legacy", author_forge_user_id: 1, created_at: "now", body: "LEGACY-BODY-MARK" }] },
       planApproved: false,
       resumePhase: "awaiting_approval",
       takeResumedGateEvent: async () => ({ kind: "revise", feedback: "split it" }),
@@ -5964,6 +5967,10 @@ describe("SdkExecutor decisions memo (issue #2083)", () => {
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
     assert.match(turns[0]!.promptText!, memoBlock, "the revise prompt re-sends the planning prompt");
     assert.ok(!turns[1]!.promptText!.includes(MEMO), "the implement prompt does not repeat it");
+    assert.doesNotMatch(turns[0]!.promptText!, /LEGACY-BODY-MARK/);
+    assert.match(turns[0]!.promptText!, /permission_unknown/);
+    assert.match(turns[0]!.promptText!, /<issue_context_([0-9a-f]+)>\nTitle:\nCAPTURED-TITLE-MARK\nDescription:\nCAPTURED-BODY-MARK\n<\/issue_context_\1>/);
+    assert.doesNotMatch(turns[1]!.promptText!, /CAPTURED-TITLE-MARK|CAPTURED-BODY-MARK|LEGACY-BODY-MARK/);
     assert.strictEqual(injectedLines(probe.emits).length, 1);
   });
 
