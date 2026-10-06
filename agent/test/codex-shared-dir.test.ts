@@ -28,6 +28,8 @@ import {
   makeProductionLaunchAdviceRoot,
   CODEX_PRODUCTION_PROVIDER,
 } from "../src/codex/codex-executor.js";
+import { rmTeardownTree } from "../src/rmtree.js";
+import { skillsPluginDir } from "../src/skills-plugin.js";
 import { createJobWorkspace, openJobWorkspace } from "../src/job-workspace.js";
 import { spawnSync } from "node:child_process";
 import type { LaunchAdviceRootSeam } from "../src/codex/codex-advice-harness.js";
@@ -669,5 +671,19 @@ describe("Issue #1492: production paths repair worker-inherited dirs to RUNNER_U
       const clean = runnerCommand(process.execPath, ["-e", "const fs=require('node:fs');if(fs.existsSync(process.argv[1])){fs.chmodSync(process.argv[1],0o700);fs.rmSync(process.argv[1],{recursive:true,force:true})}", foreign]);
       spawnSync(clean.command, clean.args, { env: { PATH: "/usr/bin:/bin" }, timeout: 10_000 });
     }
+  }));
+
+  it("ordinary skills teardown removes a worker-owned runner-group tree", async () => fixture(async (root) => {
+    await fs.chown(root, -1, RUNNER_UID);
+    await fs.chmod(root, 0o3775);
+    const target = skillsPluginDir(path.join(root, "task-2324"));
+    await fs.mkdir(target);
+    await fs.chmod(target, 0o2770);
+    await fs.writeFile(path.join(target, "skill"), "remove");
+    const st = await fs.stat(target);
+    assert.equal(st.uid, WORKER_UID);
+    assert.equal(st.gid, RUNNER_UID);
+    await rmTeardownTree(target);
+    await assert.rejects(fs.stat(target), { code: "ENOENT" });
   }));
 });

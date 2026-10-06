@@ -5812,6 +5812,46 @@ describe("production session-seed cleanup (#2324)", () => {
     } finally { openMock.mock.restore(); }
   });
 
+  it("ordinary production staging is worker-owned and removed before returning", async (t) => {
+    const root = await fs.mkdtemp("/tmp/cdr-seed-normal-");
+    await fs.chown(root, -1, RUNNER_UID);
+    await fs.chmod(root, 0o3775);
+    t.after(async () => {
+      const { restoreTreeWritability } = await import("../src/rmtree.js");
+      await restoreTreeWritability(root);
+      await fs.rm(root, { recursive: true, force: true });
+    });
+    const home = path.join(root, "home");
+    const work = path.join(root, "work");
+    await fs.mkdir(work);
+    await fs.chown(work, -1, RUNNER_UID);
+    await fs.chmod(work, 0o2770);
+    const rig = makeRig();
+    const sentinel = new Error("stop after ordinary staging");
+    let staged: string | undefined;
+    let observed: { uid: number; gid: number; groupWrite: number; parentUid: number; sticky: number } | undefined;
+    const executor = new CodexExecutor(noopLog, home, {
+      binding: bindingOf(API_KEY), client: rig.client as never, provider, provisionHomeDir: root,
+    }, {
+      ...rig.deps, provisionRunTools: async () => ({ toolEnv: {} }),
+      spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls),
+      launchProviderRoot: async () => { throw sentinel; },
+      sessionStore: { ...rig.deps.sessionStore!, adopt: async (_store, dest) => {
+        staged = dest;
+        const st = await fs.stat(dest);
+        const parent = await fs.stat(path.dirname(dest));
+        await fs.writeFile(path.join(dest, "ordinary"), "remove");
+        observed = { uid: st.uid, gid: st.gid, groupWrite: st.mode & 0o020, parentUid: parent.uid, sticky: parent.mode & 0o1000 };
+        return { files: 0 };
+      } },
+    });
+    Object.defineProperty(executor, "providerLaunchInjected", { value: () => false });
+    await assert.rejects(executor.run(makeCtx({ worktreePath: work }).ctx), (error) => error === sentinel);
+    assert.deepEqual(observed, { uid: WORKER_UID, gid: RUNNER_UID, groupWrite: 0, parentUid: WORKER_UID, sticky: 0o1000 }, "observe outside the best-effort adopt catch");
+    assert.ok(staged);
+    await assert.rejects(fs.stat(staged), { code: "ENOENT" });
+  });
+
   it("the production staging finally preserves outside files during swaps", async (t) => {
     const root = await fs.mkdtemp(path.join("/tmp", "cdr-seed-race-"));
     t.after(async () => {
