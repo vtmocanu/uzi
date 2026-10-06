@@ -34,7 +34,7 @@ through `[0.52.0]`.)
 
 ### Fixed
 
-- **Runner-owned clone and advice disposal resists directory swaps (#2324).**
+- **Runner-owned clone and executor advice cleanup uses pinned removal (#2324).**
   Cleanup pins directory identities and requires their expected owner without opening private directories to other identities. Refusals retain the remainder and warn; advice cwd cleanup still runs.
 
 - **Codex provider safety-policy refusals have a distinct failure origin ([#2321](https://github.com/vtmocanu/uzi/issues/2321)).**

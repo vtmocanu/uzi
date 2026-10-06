@@ -1802,7 +1802,9 @@ describe("issue #909 — the owner-stamp reader falls back to the pre-#887 flatt
     gitIn(first.path, [...IDENT, "commit", "-m", "unpushed work"]);
     const workSha = gitIn(first.path, ["rev-parse", "HEAD"]);
     await git.fetchAgentBranch(bare, first.path, branch, runId);
-    await git.removeRunnerClone(first.path);
+    // Simulate a missing checkout in this isolated recovery fixture. Production
+    // teardown is covered by the worker-uid tests and deliberately refuses off Linux.
+    fs.rmSync(first.path, { recursive: true, force: true });
 
     // Simulate a PRE-#887 persistent bare: no #887 subsection stamp, only the old FLATTENED
     // 2-part key (no `.owner`). Drop the new-key stamp fetchAgentBranch just wrote and plant
