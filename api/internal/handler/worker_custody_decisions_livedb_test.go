@@ -52,14 +52,20 @@ func TestWorkerCustodyDecisionMatrixLiveDB(t *testing.T) {
 			mustExecT(e.ctx, t, e.pool, `UPDATE recovery_custody_holds SET state=$2 WHERE id=$1`, e.holdID, tc.state)
 			for i, state := range tc.captures {
 				// Equal timestamps exercise the deterministic id DESC tie-break as well as EXISTS.
-				id := uuid.MustParse("00000000-0000-0000-0000-000000000001")
-				id[15] += byte(i)
-				// Each subtest owns its hold; capture UUIDs must also be unique across the matrix.
-				id[0] = byte(len(tc.name))
-				copy(id[1:15], e.holdID[1:15])
+				// Each subtest owns its hold; retain its random prefix for unique capture UUIDs.
+				id := e.holdID
+				if i == 0 {
+					id[15] = 1
+				} else {
+					id[15] = 2
+				}
 				created := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 				if tc.name == "created time beats id" {
-					id[15] = byte(2 - i)
+					if i == 0 {
+						id[15] = 2
+					} else {
+						id[15] = 1
+					}
 					created = created.Add(time.Duration(i) * time.Hour)
 				}
 				mustExecT(e.ctx, t, e.pool, `INSERT INTO recovery_captures (id,hold_id,run_id,user_id,original_worker_identity,source_sha,idempotency_key,state,created_at)
