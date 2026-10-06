@@ -42,7 +42,7 @@ export async function runnerTeardownFixture(body: (root: string, victim: string)
 
 export function seedRunnerRacedTree(target: string, victim: string): void {
   uidScript(runnerCommand, `const fs=require('node:fs');const [root,victim,dirs,files]=process.argv.slice(1);
-    for(let i=0;i<Number(dirs);i++){const d=root+'/d'+i+'/x';fs.mkdirSync(d,{recursive:true});for(let j=0;j<Number(files);j++)fs.writeFileSync(d+'/f'+j,'')}
+    for(let i=0;i<Number(dirs);i++){const d=root+'/d'+i+'/x';fs.mkdirSync(d,{recursive:true});fs.chmodSync(root+'/d'+i,0o2770);fs.chmodSync(d,0o2770);for(let j=0;j<Number(files);j++)fs.writeFileSync(d+'/f'+j,'')}
     for(let j=0;j<Number(files);j++)fs.writeFileSync(victim+'/f'+j,'keep\\n');`, target, victim, String(RACED_DIRS), String(RACED_FILES));
 }
 

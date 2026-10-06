@@ -34,6 +34,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Runner-owned clone and advice disposal resists directory swaps (#2324).**
+  Cleanup pins directory identities and requires their expected owner without opening private directories to other identities. Refusals retain the remainder and warn; advice cwd cleanup still runs.
+
 - **Codex provider safety-policy refusals have a distinct failure origin ([#2321](https://github.com/vtmocanu/uzi/issues/2321)).**
   Runs refused for `cyberPolicy` or `misalignmentPolicyViolation` now report `provider_policy_refusal` with a fixed, content-free reason. Run logs retain bounded root/child provenance with role, phase and opaque correlation IDs; the lead may continue after a child refusal. Refusals remain terminal execution failures, included in failure totals and eligible for retrospective judging.
 

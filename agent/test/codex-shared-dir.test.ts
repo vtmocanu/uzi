@@ -466,7 +466,10 @@ describe("runner clone teardown (#2324)", () => {
   }));
 
   it("removeRunnerClone single-uid removes a current-worker tree", async () => runnerTeardownFixture(async (root) => {
+    const foreign = path.join(root, "foreign-single-uid");
+    createRunnerTree(foreign);
     delete process.env.UZI_UID_SPLIT;
+    await assert.rejects(new GitCache(root, nullLogger()).removeRunnerClone(foreign), /not owned/);
     const target = path.join(root, "single-uid");
     await fs.mkdir(target);
     await fs.writeFile(path.join(target, "file"), "remove");

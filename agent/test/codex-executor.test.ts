@@ -5663,9 +5663,23 @@ describe("production advice data teardown (#2324)", () => {
       uidScript(runnerCommand, "require('node:fs').chmodSync(process.argv[1],0o2770)", owned);
       seedRunnerRacedTree(owned, victim);
       const racer = await startSwapRacer(owned, victim, root, runnerCommand);
+      // Isolate this executor disposal site: the launcher has its own earlier tree
+      // cleanup. Make only that synchronous preflight see the root as absent; the
+      // executor's actual fs.rm / pinned fs-promises walk still sees the raced tree.
+      const { default: syncFs } = await import("node:fs");
+      const { syncBuiltinESMExports } = await import("node:module");
+      const originalLstat = syncFs.lstatSync.bind(syncFs);
+      const preflight = mock.method(syncFs, "lstatSync", ((...args: Parameters<typeof syncFs.lstatSync>) =>
+        args[0] === owned ? undefined : originalLstat(...args)) as typeof syncFs.lstatSync);
+      syncBuiltinESMExports();
       let swaps = 0;
       try { await handle.dispose(); }
-      finally { swaps = await racer.stop(); await handle.dispose().catch(() => undefined); }
+      finally {
+        swaps = await racer.stop();
+        preflight.mock.restore();
+        syncBuiltinESMExports();
+        await handle.dispose().catch(() => undefined);
+      }
       await assertOutsideFiles(victim, swaps);
     });
   });
@@ -5726,6 +5740,44 @@ describe("production advice data teardown (#2324)", () => {
         await assertGone(handle.cwd);
         assert.ok(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed"));
       } finally { await handle.dispose().catch(() => undefined); }
+    });
+  });
+
+  it("advice data identity refusal retains both roots and still cleans cwd", async () => {
+    const { runnerTeardownFixture, uidScript, assertGone } = await import("./runner-teardown-fixtures.js");
+    await runnerTeardownFixture(async (root) => {
+      const { logger, lines } = recordingLogger();
+      const handle = await makeProductionLaunchAdviceRoot(root, "api_key", logger)({
+        kind: "advice", label: "review", provider: CODEX_PRODUCTION_PROVIDER, model: "gpt-6.1-sol",
+      });
+      const owned = path.join(root, "codex-advice-data", path.basename(handle.cwd));
+      const { default: syncFs } = await import("node:fs");
+      const { syncBuiltinESMExports } = await import("node:module");
+      const originalLstat = syncFs.lstatSync.bind(syncFs);
+      const preflight = mock.method(syncFs, "lstatSync", ((...args: Parameters<typeof syncFs.lstatSync>) =>
+        args[0] === owned ? undefined : originalLstat(...args)) as typeof syncFs.lstatSync);
+      syncBuiltinESMExports();
+      const identity = await fs.stat(owned);
+      const originalStat = fs.stat.bind(fs);
+      let swapped = false;
+      const pin = mock.method(fs, "stat", async (...args: Parameters<typeof fs.stat>) => {
+        const result = await originalStat(...args);
+        if (!swapped && String(result.ino) === String(identity.ino) && String(result.dev) === String(identity.dev) && args[1]?.bigint) {
+          swapped = true;
+          uidScript(runnerCommand, "const fs=require('node:fs');fs.renameSync(process.argv[1],process.argv[1]+'.retained');fs.mkdirSync(process.argv[1]);fs.writeFileSync(process.argv[1]+'/planted','keep')", owned);
+        }
+        return result;
+      });
+      try {
+        await handle.dispose();
+        assert.ok(swapped);
+        uidScript(runnerCommand, "const fs=require('node:fs');if(fs.readFileSync(process.argv[1]+'/planted','utf8')!=='keep'||!fs.existsSync(process.argv[1]+'.retained/codex/config.toml'))process.exit(1)", owned);
+        await assertGone(handle.cwd);
+        assert.ok(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed"));
+      } finally {
+        pin.mock.restore(); preflight.mock.restore(); syncBuiltinESMExports();
+        await handle.dispose().catch(() => undefined);
+      }
     });
   });
 
