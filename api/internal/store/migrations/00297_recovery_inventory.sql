@@ -109,12 +109,17 @@ CREATE TRIGGER recovery_inventory_capture_guard BEFORE UPDATE ON recovery_captur
 FOR EACH ROW EXECUTE FUNCTION recovery_inventory_capture_guard();
 
 -- The worker DELETE owns the worker lock before taking selected capture locks.
--- Renew from a fresh clock after every capture lock, even if deletion was delayed past TTL.
+-- Lock every selected capture before renewing any deadline, so a later lock wait
+-- cannot consume an earlier capture's post-deletion retention interval.
 -- Visit each selected capture once; any failure rolls back the whole worker deletion.
 -- +goose StatementBegin
 CREATE FUNCTION recovery_inventory_worker_delete() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE c recovery_captures;
 BEGIN
+    PERFORM 1 FROM recovery_captures
+        WHERE local_replica_worker_id = OLD.id
+          AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.final_capture_id = recovery_captures.id)
+        ORDER BY id FOR UPDATE;
     FOR c IN SELECT * FROM recovery_captures
         WHERE local_replica_worker_id = OLD.id
           AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.final_capture_id = recovery_captures.id)

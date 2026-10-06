@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -229,6 +230,213 @@ func TestRecoveryInventoryExpiryHandoffLiveDB(t *testing.T) {
 		t.Fatalf("normal expiry state: %+v %v", expired, err)
 	}
 
+}
+
+// TestRecoveryInventoryWorkerDeleteLockAllLiveDB crosses the PL/pgSQL cursor's
+// first ten-row fetch: no capture may spend its renewed TTL waiting for a later lock.
+func TestRecoveryInventoryWorkerDeleteLockAllLiveDB(t *testing.T) {
+	e := newInventoryEnv(t)
+	ctx, cancel := context.WithTimeout(e.ctx, 30*time.Second)
+	defer cancel()
+	e.ctx = ctx
+	const captures = 12
+	bodies := make(map[uuid.UUID][]byte, captures)
+	e.exec("UPDATE runs SET claim_generation=13,status='completed' WHERE id=$1", e.run)
+	for gen := int64(1); gen <= captures; gen++ {
+		e.gen = gen
+		if gen > 1 {
+			e.hold = uuid.New()
+			e.exec(`INSERT INTO recovery_custody_holds
+				(id,user_id,run_id,generation,original_worker_id,original_worker_identity,
+				 live_worker_id,live_run_id,inventory_guarded,state)
+				VALUES($1,$2,$3,$4,$5,$6,$5,$3,true,'open')`,
+				e.hold, e.w.UserID, e.run, gen, e.w.ID, e.w.Name)
+		}
+		// Upload retains its hour-long expiry; only final Release stores the short TTL.
+		e.svc.limits.ReadyRetention = time.Hour
+		id := e.reserve(fmt.Sprintf("final-generation-%d", gen))
+		bodies[id] = e.upload(id)
+		e.svc.limits.ReadyRetention = time.Second
+		e.release(e.request(id))
+		var bound bool
+		err := e.pool.QueryRow(ctx, `SELECT
+			h.state='released' AND h.generation=$2 AND h.final_disposition='archive'
+			AND h.final_capture_id=c.id AND h.final_source_sha=c.source_sha
+			AND h.final_coverage_digest=c.coverage_digest
+			AND h.original_worker_id=$3 AND c.original_worker_id=$3
+			AND c.local_replica_worker_id=$3 AND c.ready_retention_seconds=1
+			AND c.state='available' AND c.manifest_bound
+			FROM recovery_captures c JOIN recovery_custody_holds h ON h.id=c.hold_id
+			WHERE c.id=$1`, id, gen, e.w.ID).Scan(&bound)
+		if err != nil || !bound {
+			t.Fatalf("generation %d final binding: %v, %v", gen, bound, err)
+		}
+	}
+	// Remove the upload's longer deadline so GREATEST cannot conceal the renewal bug.
+	e.exec("UPDATE recovery_captures SET expires_at=clock_timestamp()-interval '1 second' WHERE run_id=$1 AND user_id=$2", e.run, e.w.UserID)
+	rows, err := e.pool.Query(ctx, `SELECT id FROM recovery_captures
+		WHERE local_replica_worker_id=$1
+		AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.final_capture_id=recovery_captures.id)
+		ORDER BY id`, e.w.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || len(ids) != captures {
+		t.Fatalf("selected captures: %d, %v", len(ids), err)
+	}
+
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	blocker, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cleanupCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		_ = blocker.Close(cleanupCtx)
+	}()
+	tx, err := blocker.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cleanupCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		_ = tx.Rollback(cleanupCtx)
+	}()
+	var locked uuid.UUID
+	if err := tx.QueryRow(ctx, "SELECT id FROM recovery_captures WHERE id=$1 FOR UPDATE", ids[10]).Scan(&locked); err != nil {
+		t.Fatal(err)
+	}
+	deleter, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This connection belongs only to the DELETE goroutine until it has returned.
+	defer func() {
+		cleanupCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		_ = deleter.Close(cleanupCtx)
+	}()
+	deleteCtx, stopDelete := context.WithTimeout(ctx, 15*time.Second)
+	result := make(chan error, 1)
+	deletePID, blockerPID := deleter.PgConn().PID(), blocker.PgConn().PID()
+	go func() {
+		tag, err := deleter.Exec(deleteCtx, "DELETE FROM workers WHERE id=$1", e.w.ID)
+		if err == nil && tag.RowsAffected() != 1 {
+			err = fmt.Errorf("worker DELETE affected %d rows", tag.RowsAffected())
+		}
+		result <- err
+	}()
+	// Always cancel, unlock and join before closing the goroutine's connection,
+	// including assertion/timeout exits. Both network operations have bounded contexts.
+	deleteJoined := false
+	defer func() {
+		stopDelete()
+		cleanupCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		_ = tx.Rollback(cleanupCtx)
+		if !deleteJoined {
+			select {
+			case <-result:
+			case <-cleanupCtx.Done():
+				t.Error("worker DELETE goroutine did not return during cleanup")
+			}
+		}
+	}()
+	waitCtx, stopWait := context.WithTimeout(ctx, 5*time.Second)
+	defer stopWait()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var blocked bool
+		// Inspect only our DELETE's blockers and compare with our own blocker PID.
+		if err := e.pool.QueryRow(waitCtx, "SELECT $2::int=ANY(pg_blocking_pids($1::int))", deletePID, blockerPID).Scan(&blocked); err != nil {
+			t.Fatalf("prove owned lock wait: %v", err)
+		}
+		if blocked {
+			break
+		}
+		select {
+		case err := <-result:
+			deleteJoined = true
+			t.Fatalf("worker DELETE returned before owned lock wait: %v", err)
+		case <-waitCtx.Done():
+			t.Fatalf("worker DELETE never blocked on capture %s: %v", locked, waitCtx.Err())
+		case <-ticker.C:
+		}
+	}
+	t.Logf("owned DELETE pid=%d blocked by pid=%d on sorted capture 11/12 (%s)", deletePID, blockerPID, locked)
+	timer := time.NewTimer(1200 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	var unblockClock time.Time
+	if err := blocker.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&unblockClock); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		deleteJoined = true
+		if err != nil {
+			t.Fatalf("worker DELETE: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+
+	var count, markers, belowFloor, expired int
+	var minExpiry time.Time
+	err = e.pool.QueryRow(ctx, `SELECT count(*), min(expires_at),
+		count(*) FILTER (WHERE local_replica_worker_id IS NOT NULL),
+		count(*) FILTER (WHERE expires_at < $3::timestamptz + make_interval(secs => ready_retention_seconds)),
+		count(*) FILTER (WHERE expires_at < $3::timestamptz)
+		FROM recovery_captures WHERE run_id=$1 AND user_id=$2`, e.run, e.w.UserID, unblockClock).
+		Scan(&count, &minExpiry, &markers, &belowFloor, &expired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("handoff: captures=%d min_expiry=%s unblock_clock=%s stored_TTL=1s below_floor=%d expired_at_unblock=%d markers=%d",
+		count, minExpiry.Format(time.RFC3339Nano), unblockClock.Format(time.RFC3339Nano), belowFloor, expired, markers)
+	if count != captures || markers != 0 {
+		t.Errorf("handoff selected captures=%d, markers=%d; want %d, 0", count, markers, captures)
+	}
+	if belowFloor != 0 || minExpiry.Before(unblockClock.Add(time.Second)) {
+		t.Errorf("worker DELETE renewed %d/%d captures below unblock clock + stored TTL: min=%s floor=%s (%d already expired at unblock)",
+			belowFloor, captures, minExpiry.Format(time.RFC3339Nano), unblockClock.Add(time.Second).Format(time.RFC3339Nano), expired)
+	}
+	// Use the observed handoff clock as the real expiry query's cutoff: later
+	// network latency must not consume the fixed trigger's legitimate one-second TTL.
+	n, err := e.q.ExpireReadyCaptures(ctx, pgtype.Timestamptz{Time: unblockClock, Valid: true})
+	if err != nil || n != 0 {
+		t.Errorf("ExpireReadyCaptures at handoff deleted %d captures; want 0: %v", n, err)
+	}
+	for _, id := range ids {
+		rr := httptest.NewRecorder()
+		if err := e.svc.Download(ctx, rr, e.w.UserID, e.run, id); err != nil || !bytes.Equal(rr.Body.Bytes(), bodies[id]) {
+			t.Errorf("download final root %s: bytes=%q, want=%q, error=%v", id, rr.Body.Bytes(), bodies[id], err)
+		}
+		chunks, err := e.q.ListCaptureChunks(ctx, id)
+		if err != nil || len(chunks) != 1 || len(chunks[0].Sealed) == 0 {
+			t.Errorf("final root %s chunks: %+v, %v", id, chunks, err)
+		}
+	}
 }
 
 func TestRecoveryInventoryBoundsLiveDB(t *testing.T) {
