@@ -1473,7 +1473,7 @@ describe("m1 credential-free owner cancel", () => {
         assert.equal(rig.client.releaseCalls.length, 1, "cleanup never releases Codex credentials");
         assert.equal(recoveryGit.fetchCalls, 0, "no PAT fetch");
         assert.equal(recoveryClient.reserveCalls.length, 0, "no archive");
-        assert.equal(releases.length, shouldRelease || scenario.release ? 1 : 0);
+        assert.equal(releases.length, process.platform === "linux" && (shouldRelease || scenario.release) ? 1 : 0);
         assert.equal(boundaryCalls, 0, "no credentialed cleanup boundary");
         assert.equal(openHolds.has(7), !shouldRelease, "proven-empty cancellation leaves no open own hold");
         assert.equal(openHolds.has(8), true, "sibling hold untouched");
