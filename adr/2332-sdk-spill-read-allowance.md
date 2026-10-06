@@ -61,5 +61,6 @@ hits the `.git` deny.
   already read; under the worker/runner uid split OS permissions remain the boundary.
 - Nested spill subdirectories (for example PDF page extraction `pdf-<id>/`) are
   not readable. This is a limit, not a hole.
-- A HOME or transcript path that is not NFC-normalized, or a `CLAUDE_CONFIG_DIR`
-  override, fails closed (no allowance).
+- Transcript paths outside the expected `<HOME>/.claude/projects/<P>/<session_id>.jsonl`
+  layout fail closed. A `CLAUDE_CONFIG_DIR` override that changes that layout
+  receives no allowance. No Unicode normalization policy is enforced.
