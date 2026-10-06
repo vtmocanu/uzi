@@ -3937,9 +3937,9 @@ export class RunRunner {
     // its recovery journal exactly like a finalize-gate residue block: the terminal retire must not
     // discard a tree the ordinary recovery settle cannot capture while a survivor may read credentials.
     if (err instanceof ResidueQuarantinedError) flight.preserveRecoveryClone = true;
-    // issue #2213: on a quarantined worker NO failing run reaps or settles custody (the settle starts
-    // runner-clone git, uploads and releases): a failure with some other cause keeps its clone and
-    // custody exactly like a quarantine failure, until the worker restarts.
+    // issue #2213: a failing run that sees the latch here skips the reap and every settle and keeps
+    // its clone and custody until the worker restarts. This is a snapshot: a latch that lands later
+    // is caught by the re-check before each settle below and by settleRecoveryGeneration itself.
     const quarantined = residueQuarantine() !== undefined;
     if (quarantined) flight.preserveRecoveryClone = true;
     const rawReason =
@@ -4001,7 +4001,11 @@ export class RunRunner {
         claim_generation: flight.claimGeneration,
       });
       await batcher.close().catch(() => undefined);
-      if (opts.keepCustody || quarantined) return;
+      // issue #2213: re-read the latch (the batcher close above awaited), so a late latch skips the reap.
+      if (opts.keepCustody || quarantined || residueQuarantine() !== undefined) {
+        if (residueQuarantine() !== undefined) flight.preserveRecoveryClone = true;
+        return;
+      }
       // #1539: when the permanent-failure hook handled this terminal it ALREADY reaped the
       // provider after the install/deferral decision and before any send (while still actively-claimed), so there is no
       // second reap here — settle custody ONCE, gated by the stale-epoch guard. Any OTHER writer that
@@ -4080,7 +4084,10 @@ export class RunRunner {
     // skipped on a reap that did not confirm (guard miss or a blocked/failed reap keeps the hold),
     // and (issue #1783) on a clone the pre-settle reap could not prove quiescent: that reap then
     // returns false, so custody stays open and the clone is kept.
-    if (reaped) await this.settleRecoveryGeneration(claim, flight, runLog);
+    // issue #2213: re-read the latch immediately before the settle (the reap, the archive and the
+    // report above awaited); settleRecoveryGeneration refuses on its own as well.
+    if (reaped && residueQuarantine() === undefined) await this.settleRecoveryGeneration(claim, flight, runLog);
+    else if (reaped) flight.preserveRecoveryClone = true;
   }
 
   /**
@@ -12018,6 +12025,13 @@ export class RunRunner {
     if (!isCodePublishingKind(resolveRunKind(claim.kind))) return;
     const barePath = flight.barePath;
     if (!barePath) return;
+    // issue #2213: a latched worker transfers, pins, uploads and deletes nothing here; the clone,
+    // journal are kept for the restart. Every settle caller reaches this check, whatever
+    // it tested earlier, so a latch that landed during an await cannot reach the retire.
+    if (residueQuarantine() !== undefined) {
+      flight.preserveRecoveryClone = true;
+      return;
+    }
     try {
       // issue #1507 — the pin ref anchoring the transferred head is keyed on this run's exact claim
       // generation; a v1 claim without one falls back to 0. This value need NOT match the journal
@@ -12606,6 +12620,7 @@ export class RunRunner {
         }
         if (!capture) {
           let blockedDetail: string | undefined;
+          let quarantinedCapture: ResidueQuarantinedError | undefined;
           try {
             const attempt = await this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
               credentialFree: credentialDeferred,
@@ -12631,16 +12646,7 @@ export class RunRunner {
               confirmedRunning = false;
               settled = false;
             }
-            if (captureError instanceof ResidueQuarantinedError) {
-              // issue #2213: the worker latched mid-capture. Retrying would loop forever (every
-              // credentialed step is refused until a restart) and the clone is the only copy:
-              // keep it and fail the run worker_residue_blocked. Reported here, not thrown, for the
-              // reason the blocked-capture cap below documents.
-              flight.preserveRecoveryClone = true;
-              flight.preserveSession = true;
-              await this.reportGenericFailure(claim, flight, captureError, { keepCustody: credentialDeferred || opts.terminalDisk });
-              return false;
-            }
+            if (captureError instanceof ResidueQuarantinedError) quarantinedCapture = captureError;
             runLog.warn("recovery capture failed; retaining work for retry", {
               error: errMessage(captureError),
             });
@@ -12654,6 +12660,18 @@ export class RunRunner {
           // precedence over the blocked bound below: the loop's top routes a shutdown to the
           // retained posture and a cancel to the cancel report, never to worker_residue_blocked.
           if (flight.active?.shuttingDown || flight.steering.isCancelled()) continue;
+          if (quarantinedCapture !== undefined) {
+            // issue #2213: the worker latched mid-capture. Retrying would loop forever (every
+            // credentialed step is refused until a restart) and the clone is the only copy:
+            // keep it and fail the run worker_residue_blocked. Reported here, not thrown, for the
+            // reason the blocked-capture cap below documents. Placed after the cancel/shutdown
+            // precedence check above, so a cancel is reported as cancelled and a shutdown keeps
+            // the retained posture.
+            flight.preserveRecoveryClone = true;
+            flight.preserveSession = true;
+            await this.reportGenericFailure(claim, flight, quarantinedCapture, { keepCustody: credentialDeferred || opts.terminalDisk });
+            return false;
+          }
           if (!credentialDeferred && blockedDetail !== undefined && blockedCaptures >= RECOVERY_CAPTURE_BLOCKED_ATTEMPTS) {
             // issue #1783 M3: the proof keeps blocking, and nothing else is guaranteed to end this
             // loop. Stop retrying: keep the clone and session for inspection (a surviving process

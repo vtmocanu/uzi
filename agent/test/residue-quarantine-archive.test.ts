@@ -21,6 +21,7 @@ import type { RunRunner } from "../src/runner.js";
 import type { ExecutorFactory } from "../src/runner.js";
 import type { ExecutorResult, RunContext } from "../src/executor.js";
 import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
+import { RecoveryCoordinator, type RecoveryArchiveClient } from "../src/recovery.js";
 import { api, client, fakeGitlab, fx, git as harnessGit, gitlabClaim, homeDir, installHarness, runnerWith, worktreeDirFor } from "./runner-harness.js";
 
 // issue #2213 — the additive, credential-free archival capture of a quarantined run's committed work.
@@ -599,6 +600,103 @@ describe("a run that fails quarantined archives its committed work and releases 
     assert.ok(counts.reaps >= 1, "the ordinary failure path reaps for the settle");
   });
 
+  /** The harness leaves recovery disabled (no worker token); these tests need the real coordinator so a missing gate reaches the client. */
+  function realRecovery(): RecoveryCoordinator {
+    return new RecoveryCoordinator({
+      client: client as unknown as RecoveryArchiveClient,
+      git: harnessGit,
+      log: nullLogger(),
+      recoveryRoot: harnessGit.recoveryRoot,
+      workerToken: "issue-2213-worker-token-0123456789",
+    });
+  }
+
+  /** An executor that commits work, lets a checkpoint fetch it into the bare, plants a pin and fails (NOT latched). */
+  function failingUnlatched(iid: number, snap: { before?: ReturnType<typeof retained> }): ExecutorFactory {
+    return (runId) => ({
+      homeDir: path.join(homeDir, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          fs.writeFileSync(path.join(ctx.worktreePath, "WORK.txt"), "committed work\n");
+          execFileSync("git", ["-C", ctx.worktreePath, "add", "WORK.txt"], { env: GIT_ENV, stdio: "pipe" });
+          execFileSync("git", ["-C", ctx.worktreePath, ...IDENT, "commit", "-m", "work"], { env: GIT_ENV, stdio: "pipe" });
+          await harnessGit.fetchAgentBranch(harnessGit.barePathFor(fx.originPath), ctx.worktreePath, ctx.branch, runId);
+          const bare = harnessGit.barePathFor(fx.originPath);
+          git(bare, ["update-ref", `refs/uzi-recovery-pin/${runId}/3`, git(bare, ["rev-parse", `refs/uzi-runner/${ctx.branch}`])]);
+          snap.before = retained(iid, runId);
+          throw new Error("the agent failed for an unrelated reason");
+        },
+      },
+    });
+  }
+
+  it("a latch that lands inside the failure path's reap (after the entry snapshot) still settles nothing and retires nothing", TIMEOUT, async () => {
+    const iid = 22201;
+    const afterLatch = { on: false };
+    const spy = installSpies(afterLatch);
+    const snap: { before?: ReturnType<typeof retained> } = {};
+    const claim = gitlabClaim(iid, { claim_generation: 3 });
+    const runner = runnerWith(failingUnlatched(iid, snap), fakeGitlab().gitlab, undefined, undefined, { checkpointIntervalMs: 0, recoveryRetryMs: 1, recovery: realRecovery() });
+    (runner as unknown as Record<string, unknown>).reapRecoveryProviderForSettle = async () => {
+      latchResidueQuarantine({ cause: `runner-uid pid 4242 "ssh-agent" could not be attributed (env/cwd unreadable)`, runId: claim.run_id, site: "reap" }, nullLogger());
+      afterLatch.on = true;
+      return true;
+    };
+    await runner.execute(claim);
+    assert.ok(lastFailed(claim.run_id), "the run failed");
+    assert.deepEqual(spy.clientCalls, [], "no reserve, upload or release client call");
+    assert.deepEqual(spy.deletedPins, [], "no recovery pin was deleted");
+    assert.deepEqual(retained(iid, claim.run_id), snap.before, "pins, the journal and the recovery files are exactly as they were");
+    assert.ok(journalOf(iid), "the journal still points at the kept clone");
+    assert.equal(fs.existsSync(path.join(worktreeDirFor(iid), "WORK.txt")), true, "the clone is kept");
+    const bare = harnessGit.barePathFor(fx.originPath);
+    assert.equal(git(bare, ["show", `refs/uzi-runner/agent/issue-${iid}:WORK.txt`]).trim(), "committed work", "the commit is still recoverable");
+  });
+
+  it("control: the same failure whose reap does not latch settles (the capture reaches the client)", TIMEOUT, async () => {
+    const iid = 22202;
+    const afterLatch = { on: false };
+    const spy = installSpies(afterLatch);
+    const snap: { before?: ReturnType<typeof retained> } = {};
+    const claim = gitlabClaim(iid, { claim_generation: 3 });
+    const runner = runnerWith(failingUnlatched(iid, snap), fakeGitlab().gitlab, undefined, undefined, { checkpointIntervalMs: 0, recoveryRetryMs: 1, recovery: realRecovery() });
+    (runner as unknown as Record<string, unknown>).reapRecoveryProviderForSettle = async () => true;
+    await runner.execute(claim);
+    assert.ok(spy.clientCalls.length > 0, "unlatched, the settle ran and reached the recovery client");
+  });
+
+  it("a latch landing during a finalization failure's terminal drive uploads and releases nothing and keeps its journal record", TIMEOUT, async () => {
+    const iid = 22203;
+    const afterLatch = { on: false };
+    const spy = installSpies(afterLatch);
+    // The credentialed forge-tip fetch is refused while latched; hand the bundle producer a tip so a
+    // missing gate would reach the client reserve.
+    (harnessGit as unknown as Record<string, unknown>).fetchDefaultTip = async () =>
+      git(harnessGit.barePathFor(fx.originPath), ["rev-parse", "--verify", "refs/remotes/origin/main"]).trim();
+    // An undeclared empty-diff finish fails the finalization through the terminal drive (the head
+    // is already on the forge tip, so an ungated drive would RELEASE its hold); the latch lands in
+    // the fetch-back that precedes the finalization pin.
+    const realFetchBack = harnessGit.fetchAgentBranch.bind(harnessGit);
+    harnessGit.fetchAgentBranch = (async (...a: Parameters<typeof realFetchBack>) => {
+      const ref = await realFetchBack(...a);
+      latchResidueQuarantine({ cause: `runner-uid pid 4242 "ssh-agent" could not be attributed (env/cwd unreadable)`, site: "terminal_drive" }, nullLogger());
+      afterLatch.on = true;
+      return ref;
+    }) as typeof harnessGit.fetchAgentBranch;
+    const factory: ExecutorFactory = (runId) => ({
+      homeDir: path.join(homeDir, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => ({ branch: ctx.branch, summary: "done" }) as unknown as ExecutorResult,
+      },
+    });
+    const claim = gitlabClaim(iid, { claim_generation: 3 });
+    await runnerWith(factory, fakeGitlab().gitlab, undefined, undefined, { checkpointIntervalMs: 0, recoveryRetryMs: 1, recovery: realRecovery() }).execute(claim);
+    assert.match(String(lastFailed(claim.run_id)?.failure_reason), /no changes were committed/, "the finalization failed through the terminal drive");
+    assert.deepEqual(spy.clientCalls, [], "no reserve, upload or release client call");
+    assert.deepEqual(spy.deletedPins, [], "no recovery pin was deleted");
+    assert.ok(fs.readdirSync(path.join(harnessGit.recoveryRoot, claim.run_id)).some((f) => f.endsWith(".json")), "the journal record is kept");
+  });
+
   it("a latch during the recovery-exhausted capture fails the run worker_residue_blocked instead of retrying forever", TIMEOUT, async () => {
     const iid = 22198;
     const afterLatch = { on: false };
@@ -630,6 +728,52 @@ describe("a run that fails quarantined archives its committed work and releases 
     assert.deepEqual(counts, { reaps: 0, settles: 0 });
     assert.equal(fs.existsSync(path.join(worktreeDirFor(iid), "WORK.txt")), true, "the clone is kept");
   });
+
+  for (const c of [
+    { name: "shutdown", iid: 22204, act: (r: RunRunner) => r.shutdown() },
+    {
+      name: "cancel",
+      iid: 22205,
+      act: (r: RunRunner, runId: string) => {
+        const flightActive = (r as unknown as { activeRuns: Map<string, { steering: unknown }> }).activeRuns.get(runId);
+        (flightActive!.steering as { cancelled: boolean }).cancelled = true;
+      },
+    },
+  ]) {
+    it(`a ${c.name} that arrives with the capture's latch refusal takes precedence over the worker_residue_blocked failure`, TIMEOUT, async () => {
+      const afterLatch = { on: false };
+      installSpies(afterLatch);
+      const claim = gitlabClaim(c.iid);
+      let runner: RunRunner | undefined;
+      let calls = 0;
+      harnessGit.commitWipMarker = async () => {
+        calls++;
+        latchResidueQuarantine({ cause: "pid 4242", site: "recovery_capture" }, nullLogger());
+        afterLatch.on = true;
+        c.act(runner!, claim.run_id);
+        throw new ResidueQuarantinedError("git", "pid 4242");
+      };
+      const factory: ExecutorFactory = (runId) => ({
+        homeDir: path.join(homeDir, runId),
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            fs.writeFileSync(path.join(ctx.worktreePath, "WORK.txt"), "uncommitted work\n");
+            throw new TransientRecoveryError();
+          },
+        },
+      });
+      runner = runnerWith(factory, fakeGitlab().gitlab, undefined, undefined, { checkpointIntervalMs: 0, recoveryRetryMs: 1 });
+      await runner.execute(claim);
+      assert.ok(calls >= 1, "the capture ran");
+      const failed = lastFailed(claim.run_id);
+      assert.notEqual(failed?.fail_origin, "worker_residue_blocked", String(failed?.failure_reason));
+      if (c.name === "shutdown") {
+        assert.equal(fs.existsSync(path.join(worktreeDirFor(c.iid), "WORK.txt")), true, "the retained posture keeps the clone");
+      } else {
+        assert.match(String(failed?.failure_reason), /cancel/i, "the cancel is what is reported");
+      }
+    });
+  }
 
   it("an archival crash never masks the typed failure, and still releases, deletes and retires nothing", TIMEOUT, async () => {
     const iid = 22192;

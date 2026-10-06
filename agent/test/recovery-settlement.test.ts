@@ -373,6 +373,28 @@ describe("PredecessorSettler outcome rules (issue #1582 M2)", () => {
     assert.deepEqual(client.calls.map((c) => c.holdId), [HOLD], "control: unlatched, the same sweep settles it");
   });
 
+  it("issue #2213: a latch that lands during the first send stops the sweep: the second due record is not sent and keeps its refs and journal", async () => {
+    await j.put(record());
+    await j.put(record({ holdId: HOLD2, predecessorGeneration: 3, successorGeneration: 4 }));
+    // The first send latches the worker and gets a retryable answer, so the sweep moves on.
+    const send = client.settleRecoveryHold.bind(client);
+    client.settleRecoveryHold = async (runId, holdId, req) => {
+      latchResidueQuarantine({ cause: "c", site: "t" }, nullLogger());
+      return send(runId, holdId, req);
+    };
+    client.answers = [retained("ancestry_unknown")];
+    await settler.sweep();
+    assert.equal(client.calls.length, 1, "only the first record was sent");
+    assert.deepEqual(cleanup.calls, [], "no pin or ref cleanup");
+    assert.deepEqual(
+      (await j.listRun(RUN)).map((r) => r.holdId).sort(),
+      [HOLD, HOLD2].sort(),
+      "both records stay journaled",
+    );
+    assert.equal(await settler.settleOne((await j.listRun(RUN)).find((r) => r.holdId === HOLD2)!), "skipped");
+    assert.equal(client.calls.length, 1, "a direct settleOne on the latched worker sends nothing either");
+  });
+
   for (const status of [401, 403]) {
     it(`a ${status} (a rotated join token is transient for the worker) → retry, not terminal`, async () => {
       await j.put(record());
