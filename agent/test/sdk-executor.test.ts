@@ -1745,11 +1745,13 @@ describe("SdkExecutor guardrail options", () => {
       [signalDone(), resultSuccess()],
     ]);
     const probe = makeCtx({ agents: [lead, coder, reviewer] });
-    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
-
     const spillDir = path.join(homeDir, ".claude", "projects", "proj", "sid1", "tool-results");
+    const secretInSpill = path.join(spillDir, "secret.txt");
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, secretPaths: [secretInSpill] }).run(probe.ctx);
+
     fs.mkdirSync(spillDir, { recursive: true });
     fs.writeFileSync(path.join(spillDir, "f.txt"), "spilled");
+    fs.writeFileSync(secretInSpill, "tok");
     fs.writeFileSync(path.join(homeDir, ".claude", "settings.json"), "{}");
 
     const pathHook = turns[0]!.options.hooks!.PreToolUse![1]!.hooks[0]!;
@@ -1772,6 +1774,11 @@ describe("SdkExecutor guardrail options", () => {
       (denied as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision,
       "deny",
     );
+    const secret = (await read(secretInSpill)) as {
+      hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string };
+    };
+    assert.strictEqual(secret.hookSpecificOutput?.permissionDecision, "deny");
+    assert.match(secret.hookSpecificOutput?.permissionDecisionReason ?? "", /worker credential file/);
   });
 
   it("wires the signal MCP server, the subagent guard, and the file/bash hooks", async () => {

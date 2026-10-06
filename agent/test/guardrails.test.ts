@@ -1460,8 +1460,19 @@ describe("path guard — SDK spill read allowance (#2332)", () => {
     }
   });
 
-  it("denies another run's HOME spill file", async () => {
-    assert.strictEqual(decision(await mk()(readSpill(path.join(spill(otherHome, "sidA"), "z.txt")))), "deny");
+  it("denies another run's HOME spill file, even with a fully self-consistent other-run input", async () => {
+    const z = path.join(spill(otherHome, "sidA"), "z.txt");
+    const otherInput = readSpill(z, "sidA", transcript(otherHome, "sidA"));
+    assert.strictEqual(decision(await mk([], home)(otherInput)), "deny");
+    // Non-vacuity: the same input is allowed by a hook bound to that other HOME.
+    assert.deepStrictEqual(await mk([], otherHome)(otherInput), {});
+  });
+
+  it("denies a symlink inside tool-results pointing at a sibling regular file (only lstat catches it)", async () => {
+    const dir = spill(home, "sidA");
+    fs.symlinkSync(path.join(dir, "x.txt"), path.join(dir, "alias.txt"));
+    assert.deepStrictEqual(await mk()(readSpill(path.join(dir, "x.txt"))), {}, "target itself is allowed");
+    assert.strictEqual(decision(await mk()(readSpill(path.join(dir, "alias.txt")))), "deny");
   });
 
   it("denies a file symlink in the spill dir pointing at settings.json or /etc/hostname", async () => {

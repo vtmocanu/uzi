@@ -341,18 +341,20 @@ const EXPORT_BUILTINS = new Set(["export", "declare", "typeset", "local"]);
 // THE HOOK'S `matcher` GATES THIS SET.
 // The hook's `matcher` decides whether the guard is invoked at all; the
 // `PATH_TOOLS.has(...)` test below is a SECOND filter that only ever sees names
-// the matcher already admitted. Four hand-written matcher literals spell the list
+// the matcher already admitted. Three hand-written matcher literals spell the list
 // out and derive from nothing:
 //
 //   agent/src/sdk-executor.ts       matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep"
 //   agent/src/chat-executor.ts      matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep"
 //   agent/src/isolated-executor.ts  matcher: the same literal
-//   agent/src/job-runner.ts         matcher: the same literal
+//
+// (agent/src/job-runner.ts already derives its matcher from this constant:
+// ["Read", "Glob", "Grep", ...WRITE_PATH_TOOLS].join("|").)
 //
 // So adding a fifth write tool to WRITE_PATH_TOOLS grows this set and grows the
 // plan-turn subtraction, and THE PATH JAIL STILL DOES NOT REACH THE NEW TOOL,
 // because no matcher mentions it. The lists agree today; nothing enforces that.
-// Update every one, or derive the matchers from this constant.
+// Update every literal site, or derive those matchers from this constant.
 const PATH_TOOLS = new Set<string>(["Read", "Glob", "Grep", ...WRITE_PATH_TOOLS]);
 // git global options that consume the following token as their value.
 const GIT_VALUE_OPTS = new Set(["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"]);
@@ -1544,7 +1546,6 @@ export function sdkSpillRoots(
   if (path.dirname(path.dirname(t)) !== projects) return undefined;
   if (path.basename(t) !== `${sessionId}.jsonl`) return undefined;
   const slug = path.basename(path.dirname(t));
-  if (!slug || slug === "." || slug === "..") return undefined;
   return {
     lexical: path.join(projects, slug, sessionId, "tool-results"),
     real: path.join(realpathExisting(sdkHomeDir), ".claude", "projects", slug, sessionId, "tool-results"),
