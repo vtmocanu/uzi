@@ -115,17 +115,17 @@ deletes a pin or changes the journal or the hold:
 
 H and the sha256 are appended to the run's `failure_reason`. They live in the api's
 run row, which a same-uid survivor cannot reach, and detect a later tampering with
-the local file. The outcome never changes the typed failure. When the detecting check is the pre-clone check or
-the finalize proof, that run fails with a plain `RunResidueBlockedError` (before the
-clone fetch: "could not be proven gone by the worker-wide check before the clone
-fetch"; at the finalize proof: "the run's clone could not be proven quiescent"),
-names the process rather than the quarantine and gets no archive. Detection is a
-side effect of every process-scanning quiesce, so elsewhere it does not by itself
-fail the run: a milestone checkpoint swallows the block and the run continues until
-the latch refuses its next turn or credentialed git command (failing "this worker is
-quarantined", with the archive); a limit or wall park, completion hold or shutdown
-leaves the park standing, so the run can resume elsewhere; and at the terminal
-retire the run has already reported. Where the capture
+the local file. The outcome never changes the typed failure. The archive runs only for a
+`ResidueQuarantinedError`, i.e. a run stopped because the latch refused its turn,
+credentialed git or claim. A run stopped by one of its own blocking quiescence
+checks (pre-clone check, finalize proof, canonical reseed, orphan reclaim, predecessor capture, or a
+recovery capture after its bounded retries) fails with a plain `RunResidueBlockedError`
+naming the process and gets no archive; detection is a side effect of every
+process-scanning check, so which of the two a run hits depends on what stops it, not
+on which run detected the process. Checks that do not stop the run when they block
+(milestone checkpoint, pause, limit or wall park, completion hold, shutdown requeue,
+terminal retire) leave it running or its park/requeue standing until a later step
+hits one of the two cases. Where the capture
 cannot complete (no committed work in the bare, verification failure, over the size
 cap, deadline) nothing is appended.
 

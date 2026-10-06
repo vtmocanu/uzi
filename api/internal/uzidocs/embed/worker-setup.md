@@ -325,17 +325,18 @@ reported. The live recovery re-drive and the predecessor settlement sweep are
 skipped while quarantined.
 
 **What happens to active runs.** Each one fails with `fail_origin =
-worker_residue_blocked` (see [Run activity](run-activity.md)). The reason differs
-by run. When the detecting check is the pre-clone check or the finalize proof, that
-run fails with a plain residue-blocked reason that names the process, not the
-quarantine: before the clone fetch it reads "could not be proven gone by the
-worker-wide check before the clone fetch (...); no clone was fetched", and at the
-finalize proof "the run's clone could not be proven quiescent (...)". A detection at
-a milestone checkpoint, a limit or wall park, a completion hold, shutdown or the
-terminal retire does not by itself fail that run: a checkpoint carries on until the
-latch refuses its next turn or credentialed git command, and a park stands and can
-resume elsewhere. A run refused afterwards by the latch fails with "this worker is
-quarantined (...)". The failed run's clone, its generation
+worker_residue_blocked` (see [Run activity](run-activity.md)). The reason depends on
+what stops the run, not on which run detected the process. A run stopped by one of
+its own quiescence checks that blocks on the process (the pre-clone check, the
+finalize proof, a canonical reseed, orphan reclaim or predecessor capture, or a recovery capture after its
+bounded retries) fails with a plain residue-blocked reason that names the process,
+for example "could not be proven gone by the worker-wide check before the clone
+fetch (...); no clone was fetched" or "the run's clone could not be proven quiescent
+(...)". A run stopped because the latch refused its next turn, credentialed git
+command or claim fails with "this worker is quarantined (...)". Some checks do not
+stop the run when they block (a milestone checkpoint, a pause, a limit or wall park,
+a completion hold, a shutdown requeue, the terminal retire): the run continues, or
+its park or requeue stands, until a later step hits one of the two cases above. The failed run's clone, its generation
 hold, its recovery pins and its journal are kept. Nothing is uploaded and no
 custody is released while the worker is quarantined, so the run's held work is
 still there for the [usual recovery](run-recovery.md). Two releases are exempt,
@@ -356,7 +357,7 @@ under the data directory (`/data` in the container, `UZI_DATA_DIR`):
 ```
 
 The bundle is anchored in the bare by the ref `refs/uzi-archive/<runId>/g<generation>`.
-A run that fails on its own detection (above) gets no archive. When the capture succeeds,
+A run that fails with the plain residue-blocked reason gets no archive. When the capture succeeds,
 the run's failure reason ends with `Committed work
 archived on the worker: head <H>, bundle sha256 <S>.` Without that sentence there
 is no verified archive (no committed work in the bare, a failed verification, a
