@@ -151,11 +151,9 @@ UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
 # self-skips and `go test` still prints ok. (2) Per package: each listed package must
 # have produced an `ok <pkg> <N>s` line with NO `[no tests to run]` suffix, so a package
 # whose LiveDB tests were renamed, moved, or never existed cannot hide behind the others.
-ran=$(grep -c '^--- PASS' "$LOG" || true)
-skipped=$(grep -c '^--- SKIP' "$LOG" || true)
-echo "LiveDB: $ran passed, $skipped skipped"
-if [ "$ran" -eq 0 ] || [ "$skipped" -gt 0 ]; then
-  printf '\n\033[1;31m==> FAIL: the live-DB tests did not actually run against Postgres (ran=%s skipped=%s).\033[0m\n' "$ran" "$skipped" >&2
+# The aggregate check (ran > 0, no skip at ANY indentation) is shared with ci.yml.
+if ! "$ROOT/scripts/livedb-skip-guard.sh" "$LOG"; then
+  printf '\n\033[1;31m==> FAIL: the live-DB tests did not actually run against Postgres.\033[0m\n' >&2
   exit 1
 fi
 for p in "${PKGS[@]}"; do

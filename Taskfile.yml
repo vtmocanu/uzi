@@ -406,6 +406,7 @@ tasks:
       # without one. Its hermetic suite runs first so a gutted check cannot read green.
       - task: test:changelog-entry
       - task: check:changelog-entry
+      - task: test:livedb-skip-guard
       # CI and the baked worker share one SAST engine (#2093): CI installs the
       # worker lock's semgrep, and this fails if CI grows a pin of its own.
       - task: test:semgrep-parity
@@ -957,6 +958,11 @@ tasks:
     desc: hermetic exit-code contract for check:changelog-entry (throwaway git repos, no network), tally-guarded
     cmds:
       - ./scripts/check-changelog-entry.test.sh
+
+  test:livedb-skip-guard:
+    desc: hermetic exit-code contract for the shared LiveDB zero-skip guard (synthetic go test logs, nested skips), tally-guarded
+    cmds:
+      - ./scripts/livedb-skip-guard.test.sh
 
   test:semgrep-parity:
     desc: hermetic CI and worker semgrep parity fixtures, including fail-closed inputs
