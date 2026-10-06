@@ -3,6 +3,7 @@ package forge
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	gh "github.com/google/go-github/v92/github"
 )
@@ -35,7 +36,7 @@ func (g *github) RepositoryAuthorEligibility(ctx context.Context, projectID, aut
 			if resp == nil || !completeAuthorResponse(resp.Response) || users == nil {
 				return nil, 0, ErrAuthorUnknown
 			}
-			if err := validateAuthorNextPage(resp.Header.Get("Link"), page, resp.NextPage); err != nil {
+			if err := validateAuthorNextPage(strings.Join(resp.Header.Values("Link"), ","), page, resp.NextPage); err != nil {
 				return nil, 0, err
 			}
 			return users, resp.NextPage, nil

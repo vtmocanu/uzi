@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 
 	gitea "code.gitea.io/sdk/gitea"
 )
@@ -59,7 +60,7 @@ func (f *forgejo) RepositoryAuthorEligibility(ctx context.Context, projectID, au
 			if resp == nil || !completeAuthorResponse(resp.Response) || users == nil {
 				return nil, 0, ErrAuthorUnknown
 			}
-			if err := validateAuthorNextPage(resp.Header.Get("Link"), page, resp.NextPage); err != nil {
+			if err := validateAuthorNextPage(strings.Join(resp.Header.Values("Link"), ","), page, resp.NextPage); err != nil {
 				return nil, 0, err
 			}
 			return users, resp.NextPage, nil
@@ -151,7 +152,7 @@ func (f *forgejo) authorPersonalRepository(ctx context.Context, owner, repo stri
 		return false, f.wrapErr("author ownership", fmt.Errorf("status %d: %w", resp.StatusCode, ErrAuthorUnknown))
 	}
 	// v16 returns the whole repository team list. Reject an incomplete variant.
-	if err := validateAuthorNextPage(resp.Header.Get("Link"), 1, 0); err != nil {
+	if err := validateAuthorNextPage(strings.Join(resp.Header.Values("Link"), ","), 1, 0); err != nil {
 		return false, err
 	}
 	var teams []*gitea.Team

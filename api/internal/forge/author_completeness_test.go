@@ -16,7 +16,7 @@ func TestAuthorIncompleteHTTPReads(t *testing.T) {
 			reads = append(reads, "permission", "ownership")
 		}
 		for _, read := range reads {
-			for _, variant := range []string{"206", "200-content-range"} {
+			for _, variant := range []string{"206", "200-content-range", "206-content-range"} {
 				t.Run(provider+"/"+read+"/"+variant, func(t *testing.T) {
 					handlers := map[string]http.HandlerFunc{}
 					target := ""
@@ -53,8 +53,10 @@ func TestAuthorIncompleteHTTPReads(t *testing.T) {
 					original := handlers[target]
 					handlers[target] = func(w http.ResponseWriter, r *http.Request) {
 						w.Header().Set("Content-Type", "application/json")
-						w.Header().Set("Content-Range", "items 0-0/2")
-						if variant == "206" {
+						if variant != "206" {
+							w.Header().Set("Content-Range", "items 0-0/2")
+						}
+						if variant != "200-content-range" {
 							w.WriteHeader(http.StatusPartialContent)
 						}
 						original(w, r)
@@ -113,9 +115,10 @@ func TestAuthorCollaboratorPaginationMetadata(t *testing.T) {
 						w.Header().Set("Link", tc.link)
 						authorJSON(body)(w, r)
 					} else {
-						if tc.name == "terminal-second-first-prev-last" {
+						switch tc.name {
+						case "terminal-second-first-prev-last":
 							w.Header().Set("Link", `<http://example.test/?page=1>; rel="first", <http://example.test/?page=1>; rel="prev", <http://example.test/?page=2>; rel="last"`)
-						} else if tc.name == "second-page-last-backward" {
+						case "second-page-last-backward":
 							w.Header().Set("Link", `<http://example.test/?page=1>; rel="last"`)
 						}
 						authorJSON("[]")(w, r)
