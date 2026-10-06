@@ -5626,9 +5626,9 @@ describe("SdkExecutor run-start environment probe (issue #1866 M2)", () => {
     assert.equal(installs, 0, "no JS-deps install was started (a phaseSetup throw would leak it)");
   });
 
-  it("an unconfirmed probe cleanup removes the run's provisioning dir before failing the run", async () => {
+  it("an unconfirmed probe attempts provisioning-dir cleanup before failing the run", async () => {
     // A throw from phaseSetup never reaches run()'s finally, so the probe's catch is the only
-    // place the per-run provisioning dir (created by a successful tool provision) is removed.
+    // place the per-run provisioning dir gets a cleanup attempt (or a platform refusal).
     const runId = "66666666-6666-6666-6666-666666666666";
     const provisionRoot = path.join(homeDir, "provision-root");
     const provisionRunDir = path.join(provisionRoot, runId);
@@ -5656,7 +5656,8 @@ describe("SdkExecutor run-start environment probe (issue #1866 M2)", () => {
     );
     assert.equal(provisioned, provisionRunDir, "the tool provision ran against the per-run dir");
     assert.equal(existedAtProbe, true, "the dir existed when the probe ran");
-    assert.equal(fs.existsSync(provisionRunDir), false, "the per-run provisioning dir was removed");
+    assert.equal(fs.existsSync(provisionRunDir), process.platform !== "linux",
+      "Linux removes the provisioning dir; unsupported platforms retain it");
     assert.equal(turns.length, 0, "no turn ran");
   });
 

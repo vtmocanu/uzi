@@ -12,6 +12,7 @@ import type {
   StateRequest,
 } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
+import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 import {
   TOKEN,
   api,
@@ -122,6 +123,7 @@ function makeRunner(client: WorkerClient, factory: ExecutorFactory): RunRunner {
   // No join token ⇒ the RecoveryCoordinator is disabled, matching a pre-clone park's "nothing to
   // capture" (fact 4). recoveryRetryMs is tiny so the probe-reconcile loop never stalls a test.
   return new RunRunner(client, git, factory, nullLogger(), 20, undefined, {
+    teardownTestDeps: portableTeardownTestDeps,
     pollMs: 5,
     planApprovalTimeoutMs: 0,
     questionTimeoutMs: 600,

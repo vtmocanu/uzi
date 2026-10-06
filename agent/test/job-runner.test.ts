@@ -34,6 +34,11 @@ const roots: string[] = [];
 afterEach(async () => {
   while (roots.length) await fsp.rm(roots.pop()!, { recursive: true, force: true });
 });
+async function assertTerminalWorkspace(root: string): Promise<void> {
+  if (process.platform === "linux") await assert.rejects(() => fsp.stat(root), { code: "ENOENT" });
+  else assert.ok((await fsp.stat(root)).isDirectory(), "unsupported platforms retain the workspace");
+}
+
 async function tmpJobsRoot(): Promise<string> {
   const d = await fsp.mkdtemp(path.join(os.tmpdir(), "uzi-jobrun-"));
   roots.push(d);
@@ -402,7 +407,7 @@ describe("job files in the prompt (PRD #1909 M3)", () => {
 });
 
 describe("JobRunner (PRD #1908 M4)", () => {
-  it("runs a job to completion: workspace + inputs, running first, result POST before completed, generation stamped, workspace removed", async () => {
+  it("runs a job to completion: workspace + inputs, running first, result POST before completed, generation stamped, platform-aware workspace cleanup", async () => {
     const jobsRoot = await tmpJobsRoot();
     const { client, calls } = fakeClient();
     const registry = new ActiveRunRegistry();
@@ -435,7 +440,7 @@ describe("JobRunner (PRD #1908 M4)", () => {
     assert.deepStrictEqual(calls.results[0]!.body, { claim_generation: GEN, ...GOOD_RESULT });
     assert.ok(calls.messages.length > 0 && calls.messages.every((m) => m.generation === GEN), "messages flow through the batcher stamped with the generation");
     assert.ok(calls.messages.flatMap((m) => m.messages).some((m) => m.kind === "text"), "the assistant text was streamed");
-    await assert.rejects(() => fsp.stat(wsSeenDuringRun), { code: "ENOENT" }, "the workspace is removed at terminal");
+    await assertTerminalWorkspace(wsSeenDuringRun);
     assert.deepStrictEqual(seen.options!.tools, ["Read", "Write", "Glob", "Grep", "mcp__job__submit_job_result"]);
     assert.deepStrictEqual(seen.options!.settingSources, []);
     // the credential rides the SDK env only
@@ -497,7 +502,8 @@ describe("JobRunner (PRD #1908 M4)", () => {
       const last = calls.states.at(-1)!.body;
       assert.strictEqual(last.status, "failed");
       assert.match(last.failure_reason!, /job input refused/);
-      assert.deepStrictEqual(await fsp.readdir(jobsRoot), [], `${name}: no workspace left behind`);
+      assert.deepStrictEqual(await fsp.readdir(jobsRoot), process.platform === "linux" ? [] : [claim.run_id],
+        `${name}: cleanup follows the platform refusal policy`);
     }
   });
 
@@ -525,7 +531,7 @@ describe("JobRunner (PRD #1908 M4)", () => {
     assert.deepStrictEqual(calls.acks, [[41]]);
     assert.deepStrictEqual(calls.applied, [[41]]);
     assert.strictEqual(calls.results.length, 0);
-    await assert.rejects(() => fsp.stat(path.dirname(cwd)), { code: "ENOENT" });
+    await assertTerminalWorkspace(path.dirname(cwd));
   });
 
   it("aborts at budget_wall_seconds and reports failed (never limit_wait or a park)", async () => {
@@ -707,18 +713,20 @@ describe("JobRunner input files (PRD #1909 M3)", () => {
     assert.strictEqual(calls.states.at(-1)!.body.status, "completed");
   });
 
-  it("fails the job, naming the cause, when a file fails its integrity check; no session starts and no workspace is left", async () => {
+  it("fails the job, naming the cause, when a file fails its integrity check; no session starts and cleanup respects the platform policy", async () => {
     const jobsRoot = await tmpJobsRoot();
     const tampered = Buffer.from(body);
     tampered[2] = tampered[2]! ^ 0xff;
     const { client, calls } = fakeClient({ downloadJobFile: send(tampered) });
     let ran = false;
-    await newRunner(client, jobsRoot, scripted(async function* () { ran = true; yield RESULT_OK; })).execute(jobClaim({}, { files: [fileEntry()] }));
+    const claim = jobClaim({}, { files: [fileEntry()] });
+    await newRunner(client, jobsRoot, scripted(async function* () { ran = true; yield RESULT_OK; })).execute(claim);
     assert.strictEqual(ran, false);
     const last = calls.states.at(-1)!.body;
     assert.strictEqual(last.status, "failed");
     assert.strictEqual(last.failure_reason, 'job input file "Q3 report.pdf" failed its integrity check');
-    assert.deepStrictEqual(await fsp.readdir(jobsRoot), []);
+    assert.deepStrictEqual(await fsp.readdir(jobsRoot), process.platform === "linux" ? [] : [claim.run_id],
+      "cleanup follows the platform refusal policy");
   });
 
   it("fails the job with 'could not download' on a transport failure, with a sanitised and bounded display name", async () => {
