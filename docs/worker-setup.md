@@ -324,19 +324,22 @@ journal sweeps keep running, so the worker stays visible and its runs can be
 reported. The live recovery re-drive and the predecessor settlement sweep are
 skipped while quarantined.
 
-**What happens to active runs.** Each one fails with `fail_origin =
-worker_residue_blocked` (see [Run activity](run-activity.md)). The reason depends on
+**What happens to active runs.** A run that is stopped on this worker fails with
+`fail_origin = worker_residue_blocked` (see [Run activity](run-activity.md)). The reason depends on
 what stops the run, not on which run detected the process. A run stopped by one of
 its own quiescence checks that blocks on the process (the pre-clone check, the
 finalize proof, a canonical reseed, orphan reclaim or predecessor capture, or a recovery capture after its
-bounded retries) fails with a plain residue-blocked reason that names the process,
+bounded retries) fails with a plain residue-blocked reason that usually names the
+process (an orphan reclaim or a terminal-disk recovery capture reports a fixed text instead),
 for example "could not be proven gone by the worker-wide check before the clone
 fetch (...); no clone was fetched" or "the run's clone could not be proven quiescent
 (...)". A run stopped because the latch refused its next turn, credentialed git
 command or claim fails with "this worker is quarantined (...)". Some checks do not
 stop the run when they block (a milestone checkpoint, a pause, a limit or wall park,
-a completion hold, a shutdown requeue, the terminal retire): the run continues, or
-its park or requeue stands, until a later step hits one of the two cases above. The failed run's clone, its generation
+a completion hold, a shutdown requeue, the terminal retire). A run that continues
+fails at a later step in one of the two ways above; a park or requeue stands and the
+run resumes on another worker, or here after the restart; at the terminal retire the
+run has already reported. The failed run's clone, its generation
 hold, its recovery pins and its journal are kept. Nothing is uploaded and no
 custody is released while the worker is quarantined, so the run's held work is
 still there for the [usual recovery](run-recovery.md). Two releases are exempt,

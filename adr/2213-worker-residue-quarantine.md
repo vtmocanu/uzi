@@ -119,13 +119,17 @@ the local file. The outcome never changes the typed failure. The archive runs on
 `ResidueQuarantinedError`, i.e. a run stopped because the latch refused its turn,
 credentialed git or claim. A run stopped by one of its own blocking quiescence
 checks (pre-clone check, finalize proof, canonical reseed, orphan reclaim, predecessor capture, or a
-recovery capture after its bounded retries) fails with a plain `RunResidueBlockedError`
-naming the process and gets no archive; detection is a side effect of every
+recovery capture after its bounded retries) fails with a plain residue-blocked error
+(`RunResidueBlockedError`, or `CloneResidueBlockedError` for the canonical reseed),
+usually naming the process (orphan reclaim and the terminal-disk recovery capture
+report a fixed text), and gets no archive; detection is a side effect of every
 process-scanning check, so which of the two a run hits depends on what stops it, not
 on which run detected the process. Checks that do not stop the run when they block
-(milestone checkpoint, pause, limit or wall park, completion hold, shutdown requeue,
-terminal retire) leave it running or its park/requeue standing until a later step
-hits one of the two cases. Where the capture
+include, for example, the milestone checkpoint, pause, limit or wall park, completion
+hold, shutdown requeue, credential-switch capture, attempt retention, the pre-settle
+reap and the terminal retire: a run that continues fails at a later step in one of
+the two ways; a park or requeue stands and the run resumes on another worker, or here
+after the restart; at the terminal retire the run has already reported. Where the capture
 cannot complete (no committed work in the bare, verification failure, over the size
 cap, deadline) nothing is appended.
 
