@@ -866,6 +866,8 @@ describe("uzi runtime facts reach every subagent through the append (PRD #1849)"
     "does not permit\na detached checkout",
     "Git commands run inside an\nexport can find the parent checkout; never run Git there.",
     "cannot run in the export",
+    // Issue #2332: the spill-file allowance is worker-owned, not in any upstream body.
+    "On Claude, Read may open the spill file the SDK names for this run's own oversized output.",
   ];
   const shippedBody = (role: string): string => {
     const raw = readFileSync(join(import.meta.dirname, "..", "..", "api", "internal", "agenttmpl", "builtins", `${role}.md`), "utf8");

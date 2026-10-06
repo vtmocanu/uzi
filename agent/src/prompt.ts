@@ -47,6 +47,7 @@ const RUN_SCRATCH_GUIDANCE = [
   "a detached checkout or any other nested worktree: review from an export instead.",
   "File tools deny paths outside the worktree; shell screening differs,",
   "so keep shell artifacts here too. An outside-path denial points back to this dir.",
+  "On Claude, Read may open the spill file the SDK names for this run's own oversized output.",
   "Scratch is available to this run only while the identical runner clone is retained",
   "through a park/resume. Fresh reseed and cross-worker recovery start empty. Retirement",
   "removes the canonical clone; worker-only quarantine or failed best-effort disposal may",

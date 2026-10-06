@@ -348,12 +348,13 @@ const EXPORT_BUILTINS = new Set(["export", "declare", "typeset", "local"]);
 //   agent/src/chat-executor.ts      matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep"
 //   agent/src/isolated-executor.ts  matcher: the same literal
 //
-// (agent/src/job-runner.ts already derives its matcher from this constant:
-// ["Read", "Glob", "Grep", ...WRITE_PATH_TOOLS].join("|").)
+// (agent/src/job-runner.ts re-spells "Read", "Glob" and "Grep" and derives only its
+// write-tool half from WRITE_PATH_TOOLS:
+// matcher: ["Read", "Glob", "Grep", ...WRITE_PATH_TOOLS].join("|").)
 //
 // So adding a fifth write tool to WRITE_PATH_TOOLS grows this set and grows the
 // plan-turn subtraction, and THE PATH JAIL STILL DOES NOT REACH THE NEW TOOL,
-// because no matcher mentions it. The lists agree today; nothing enforces that.
+// because none of the three literal matchers mentions it. The lists agree today; nothing enforces that.
 // Update every literal site, or derive those matchers from this constant.
 const PATH_TOOLS = new Set<string>(["Read", "Glob", "Grep", ...WRITE_PATH_TOOLS]);
 // git global options that consume the following token as their value.
