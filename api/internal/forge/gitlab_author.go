@@ -13,11 +13,11 @@ func (g *gitLab) RepositoryAuthorEligibility(ctx context.Context, projectID, aut
 	if projectID <= 0 || authorID <= 0 {
 		return AuthorUnknown, ErrAuthorUnknown
 	}
-	u, _, err := g.client.Users.GetUser(authorID, nil, gitlab.WithContext(ctx))
+	u, userResp, err := g.client.Users.GetUser(authorID, nil, gitlab.WithContext(ctx))
 	if err != nil {
 		return AuthorUnknown, g.wrapErr("resolve repository author", err)
 	}
-	if u == nil || u.ID != authorID || u.Username == "" || u.State == "" {
+	if userResp == nil || !completeAuthorResponse(userResp.Response) || u == nil || u.ID != authorID || u.Username == "" || u.State == "" {
 		return AuthorUnknown, ErrAuthorUnknown
 	}
 	// Same effective members/all route as GetInheritedProjectMember. The SDK
@@ -40,20 +40,20 @@ func (g *gitLab) RepositoryAuthorEligibility(ctx context.Context, projectID, aut
 	if err != nil {
 		// The stable identity was independently resolved above; members/all's 404
 		// means absence of effective membership for that extant user.
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
+		if resp != nil && resp.Response != nil && resp.StatusCode == http.StatusNotFound && len(resp.Header.Values("Content-Range")) == 0 {
 			// Exclude a concealed or deleted project before treating this as absence.
-			repo, _, readErr := g.client.Projects.GetProject(projectID, nil, gitlab.WithContext(ctx))
+			repo, repoResp, readErr := g.client.Projects.GetProject(projectID, nil, gitlab.WithContext(ctx))
 			if readErr != nil {
 				return AuthorUnknown, g.wrapErr("author repository", readErr)
 			}
-			if repo == nil || repo.ID != projectID {
+			if repoResp == nil || !completeAuthorResponse(repoResp.Response) || repo == nil || repo.ID != projectID {
 				return AuthorUnknown, ErrAuthorUnknown
 			}
 			return AuthorNotEligible, nil
 		}
 		return AuthorUnknown, g.wrapErr("repository author membership", err)
 	}
-	if m.ID != authorID || m.Username != u.Username || m.State == "" || m.AccessLevel == nil {
+	if resp == nil || !completeAuthorResponse(resp.Response) || m.ID != authorID || m.Username != u.Username || m.State == "" || m.AccessLevel == nil {
 		return AuthorUnknown, ErrAuthorUnknown
 	}
 	switch *m.AccessLevel {

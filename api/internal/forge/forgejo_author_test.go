@@ -2,8 +2,10 @@ package forge
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -52,7 +54,8 @@ func TestForgejoAuthorEvidence(t *testing.T) {
 					if r.URL.Query().Get("uid") != fmt.Sprint(tc.id) {
 						t.Error("lookup not stable ID")
 					}
-					_, _ = fmt.Fprintf(w, `{"data":[%s],"ok":true}`, tc.user)
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{"data": []json.RawMessage{json.RawMessage(tc.user)}, "ok": true})
 				},
 				"/repos/acme/widgets/teams": func(w http.ResponseWriter, _ *http.Request) {
 					w.WriteHeader(tc.teamsStatus)
@@ -93,8 +96,13 @@ func TestForgejoAuthorPaginationAndFreshMetadata(t *testing.T) {
 			_, _ = w.Write([]byte(`{"id":7,"name":"widgets","full_name":"acme/widgets","owner":{"id":1,"login":"acme"}}`))
 		},
 		"/users/search": func(w http.ResponseWriter, r *http.Request) {
-			id := r.URL.Query().Get("uid")
-			_, _ = fmt.Fprintf(w, `{"data":[{"id":%s,"login":"user%s"}],"ok":true}`, id, id)
+			id, err := strconv.ParseInt(r.URL.Query().Get("uid"), 10, 64)
+			if err != nil || id <= 0 {
+				http.Error(w, "invalid user ID", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": id, "login": fmt.Sprintf("user%d", id)}}, "ok": true})
 		},
 		"/repos/acme/widgets/teams": func(w http.ResponseWriter, _ *http.Request) {
 			teams++

@@ -19,19 +19,19 @@ func (f *forgejo) RepositoryAuthorEligibility(ctx context.Context, projectID, au
 	if err != nil {
 		return AuthorUnknown, err
 	}
-	u, _, err := c.GetUserByID(authorID)
+	u, userResp, err := c.GetUserByID(authorID)
 	if err != nil {
 		return AuthorUnknown, f.wrapErr("resolve repository author", err)
 	}
-	if u == nil || u.ID != authorID || u.UserName == "" {
+	if userResp == nil || !completeAuthorResponse(userResp.Response) || u == nil || u.ID != authorID || u.UserName == "" {
 		return AuthorUnknown, ErrAuthorUnknown
 	}
 	r, err := assessmentEvidence(ctx, evidenceKey{f, projectID, "repository"}, func() (*gitea.Repository, error) {
-		repo, _, err := c.GetRepoByID(projectID)
+		repo, repoResp, err := c.GetRepoByID(projectID)
 		if err != nil {
 			return nil, f.wrapErr("author repository", err)
 		}
-		if repo == nil || repo.ID != projectID || repo.Owner == nil || repo.Owner.ID <= 0 ||
+		if repoResp == nil || !completeAuthorResponse(repoResp.Response) || repo == nil || repo.ID != projectID || repo.Owner == nil || repo.Owner.ID <= 0 ||
 			repo.Owner.UserName == "" || repo.Name == "" || repo.FullName != repo.Owner.UserName+"/"+repo.Name {
 			return nil, ErrAuthorUnknown
 		}
@@ -56,7 +56,7 @@ func (f *forgejo) RepositoryAuthorEligibility(ctx context.Context, projectID, au
 			if err != nil {
 				return nil, 0, err
 			}
-			if resp == nil || users == nil {
+			if resp == nil || !completeAuthorResponse(resp.Response) || users == nil {
 				return nil, 0, ErrAuthorUnknown
 			}
 			if err := validateAuthorNextPage(resp.Header.Get("Link"), page, resp.NextPage); err != nil {
@@ -92,11 +92,11 @@ func (f *forgejo) RepositoryAuthorEligibility(ctx context.Context, projectID, au
 	if ownershipErr == nil && personal && r.Owner.ID != authorID && directErr == nil {
 		return AuthorNotEligible, nil
 	}
-	p, _, err := c.CollaboratorPermission(r.Owner.UserName, r.Name, u.UserName)
+	p, permissionResp, err := c.CollaboratorPermission(r.Owner.UserName, r.Name, u.UserName)
 	if err != nil {
 		return AuthorUnknown, f.wrapErr("repository author permission", err)
 	}
-	if p == nil || p.User == nil || p.User.ID != authorID || p.User.UserName != u.UserName {
+	if permissionResp == nil || !completeAuthorResponse(permissionResp.Response) || p == nil || p.User == nil || p.User.ID != authorID || p.User.UserName != u.UserName {
 		return AuthorUnknown, ErrAuthorUnknown
 	}
 	switch p.Permission {
@@ -127,7 +127,13 @@ func (f *forgejo) authorPersonalRepository(ctx context.Context, owner, repo stri
 	if err != nil {
 		return false, f.wrapErr("author ownership", err)
 	}
+	if resp == nil || resp.Body == nil {
+		return false, ErrAuthorUnknown
+	}
 	defer func() { _ = resp.Body.Close() }()
+	if len(resp.Header.Values("Content-Range")) != 0 {
+		return false, ErrAuthorUnknown
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return false, f.wrapErr("author ownership", err)
@@ -141,7 +147,7 @@ func (f *forgejo) authorPersonalRepository(ctx context.Context, owner, repo stri
 		}
 		return false, ErrAuthorUnknown
 	}
-	if resp.StatusCode != http.StatusOK {
+	if !completeAuthorResponse(resp) {
 		return false, f.wrapErr("author ownership", fmt.Errorf("status %d: %w", resp.StatusCode, ErrAuthorUnknown))
 	}
 	// v16 returns the whole repository team list. Reject an incomplete variant.

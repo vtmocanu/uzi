@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -89,8 +90,13 @@ func TestGitHubAuthorPaginationCacheIsOperationScoped(t *testing.T) {
 	incomplete := false
 	m := newMockGitHub(t, map[string]http.HandlerFunc{
 		"/user/": func(w http.ResponseWriter, r *http.Request) {
-			id := strings.TrimPrefix(r.URL.Path, "/api/v3/user/")
-			_, _ = fmt.Fprintf(w, `{"id":%s,"login":"user%s"}`, id, id)
+			id, err := strconv.ParseInt(strings.TrimPrefix(r.URL.Path, "/api/v3/user/"), 10, 64)
+			if err != nil || id <= 0 {
+				http.Error(w, "invalid user ID", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "login": fmt.Sprintf("user%d", id)})
 		},
 		"/repos/acme/widgets/collaborators": func(w http.ResponseWriter, r *http.Request) {
 			pages++

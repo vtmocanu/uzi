@@ -11,19 +11,19 @@ func (g *github) RepositoryAuthorEligibility(ctx context.Context, projectID, aut
 	if projectID <= 0 || authorID <= 0 {
 		return AuthorUnknown, ErrAuthorUnknown
 	}
-	u, _, err := g.client.Users.GetByID(ctx, authorID)
+	u, userResp, err := g.client.Users.GetByID(ctx, authorID)
 	if err != nil {
 		return AuthorUnknown, g.wrapErr("resolve repository author", err)
 	}
-	if u == nil || u.GetID() != authorID || u.GetLogin() == "" {
+	if userResp == nil || !completeAuthorResponse(userResp.Response) || u == nil || u.GetID() != authorID || u.GetLogin() == "" {
 		return AuthorUnknown, ErrAuthorUnknown
 	}
 	members, err := assessmentEvidence(ctx, evidenceKey{g, projectID, "collaborators"}, func() (map[int64]*gh.User, error) {
-		r, _, err := g.client.Repositories.GetByID(ctx, projectID)
+		r, repoResp, err := g.client.Repositories.GetByID(ctx, projectID)
 		if err != nil {
 			return nil, g.wrapErr("author repository", err)
 		}
-		if r == nil || r.GetID() != projectID || r.GetOwner().GetLogin() == "" || r.GetName() == "" {
+		if repoResp == nil || !completeAuthorResponse(repoResp.Response) || r == nil || r.GetID() != projectID || r.GetOwner().GetLogin() == "" || r.GetName() == "" {
 			return nil, ErrAuthorUnknown
 		}
 		all, err := paginate(func(e error) error { return g.wrapErr("author collaborators", e) }, func(page int) ([]*gh.User, int, error) {
@@ -32,7 +32,7 @@ func (g *github) RepositoryAuthorEligibility(ctx context.Context, projectID, aut
 			if err != nil {
 				return nil, 0, err
 			}
-			if resp == nil || users == nil {
+			if resp == nil || !completeAuthorResponse(resp.Response) || users == nil {
 				return nil, 0, ErrAuthorUnknown
 			}
 			if err := validateAuthorNextPage(resp.Header.Get("Link"), page, resp.NextPage); err != nil {

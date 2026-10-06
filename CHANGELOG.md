@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **Repository author eligibility assessment ([#2345](https://github.com/vtmocanu/uzi/issues/2345)).**
+  The API can distinguish authors who meet the forge's repository input threshold from non-members and unknown permissions, including Forgejo owners and team access where the existing bot token can establish it; assessment work is limited to 30 seconds and 200 distinct authors.
+
 - **Advisory draft plans in run activity ([#2323](https://github.com/vtmocanu/uzi/issues/2323)).**
   The latest valid explicit draft capture appears as Markdown in both activity views, labelled draft, unapproved, possibly incomplete, with a truncation notice when needed; earlier captures remain stored and submitted-plan approval stays separate.
 
