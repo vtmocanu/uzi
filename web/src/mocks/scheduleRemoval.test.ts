@@ -1,12 +1,14 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it } from "vitest";
 import { mockApi } from "./mockApi";
+import { state } from "./store";
 import { appSettings } from "./mockApi/settings";
 import type { ScheduleInput } from "../lib/api";
 
 const base: ScheduleInput = { target: "sweep", timing: "recurring", cron_expr: "0 2 * * *", labels: ["on-deck"] };
 const originalLabel = appSettings.uzi_label;
-afterEach(() => { appSettings.uzi_label = originalLabel; });
+const originalRuns = new Map(state.runs);
+afterEach(() => { appSettings.uzi_label = originalLabel; state.runs = new Map(originalRuns); });
 
 describe("mock selector removal contract", () => {
   it("defaults false, preserves omitted PATCH and clears explicit false", async () => {
@@ -46,7 +48,7 @@ describe("mock selector removal contract", () => {
     await expect(mockApi.createSchedule("repo-uzi", { ...base, remove_label_on_dispatch: true })).rejects.toMatchObject({ status: 400 });
     expect(await mockApi.createSchedule("repo-uzi", { ...base, labels: ["uzi"], remove_label_on_dispatch: true })).toMatchObject({ remove_label_on_dispatch: true });
   });
-  it("uses catalog effective selectors and false enable/reset baselines until M2", async () => {
+  it("uses catalog effective selectors and older entries’ false enable/reset baselines", async () => {
     const row = await mockApi.enableCatalogSchedule("repo-payments", "bug-triage");
     expect(row.remove_label_on_dispatch).toBe(false);
     for (const enabled of [false, true]) {
@@ -86,5 +88,46 @@ describe("mock selector removal contract", () => {
     const row = await mockApi.createSchedule("repo-uzi", base);
     expect((await mockApi.runScheduleNow(row.id)).started?.[0]).not.toHaveProperty("selector_label");
     expect((await mockApi.getSchedule(row.id)).last_fire).toBeNull();
+  });
+});
+
+
+describe("On-deck catalog baseline", () => {
+  const baseline = { remove_label_on_dispatch: true, capacity_limit: 4,
+    capacity_room_needed: 2, max_issues: 1, cron_expr: "*/10 * * * *", customized: false };
+  it("enables, edits, restores exactly, resets, clones and copies the stored values", async () => {
+    const row = await mockApi.enableCatalogSchedule("repo-ledger", "ondeck-sweep");
+    expect(row).toMatchObject(baseline);
+    expect(row.labels).toEqual(["on-deck"]);
+    expect(await mockApi.updateSchedule(row.id, { capacity_limit: 5 })).toMatchObject({
+      capacity_limit: 5, capacity_room_needed: 2, customized: true });
+    expect(await mockApi.updateSchedule(row.id, { capacity_limit: 4 })).toMatchObject(baseline);
+    expect(await mockApi.updateSchedule(row.id, { remove_label_on_dispatch: false })).toMatchObject({ customized: true });
+    expect(await mockApi.updateSchedule(row.id, { remove_label_on_dispatch: true })).toMatchObject(baseline);
+    await mockApi.updateSchedule(row.id, { capacity_limit: null, capacity_room_needed: null, remove_label_on_dispatch: false });
+    await mockApi.updateSchedule(row.id, { enabled: false });
+    const reset = await mockApi.resetSchedule(row.id);
+    expect(reset).toMatchObject({ ...baseline, enabled: false });
+    const clone = await mockApi.cloneSchedule(row.id);
+    expect(clone).toMatchObject({ ...baseline, origin: "user", catalog_slug: null, labels: ["on-deck"] });
+    expect(await mockApi.addScheduleRepo(clone.id, "repo-atlas")).toMatchObject({
+      ...baseline, origin: "user", labels: ["on-deck"] });
+    expect((await mockApi.runScheduleNow(row.id)).capacity?.blocked).toBe(true);
+    state.runs.clear();
+    expect((await mockApi.runScheduleNow(row.id)).started?.[0]).toMatchObject({
+      selector_label: "on-deck", label_removed: true, label_remove_failed: false });
+  });
+  it("checks the live uzi label on fresh enable/reset but returns existing rows first", async () => {
+    const row = await mockApi.enableCatalogSchedule("repo-payments", "ondeck-sweep");
+    appSettings.uzi_label = "on-deck";
+    expect(await mockApi.enableCatalogSchedule("repo-payments", "ondeck-sweep", "Europe/Berlin")).toMatchObject({ id: row.id });
+    await expect(mockApi.enableCatalogSchedule("repo-uzi", "ondeck-sweep")).rejects.toMatchObject({ status: 400 });
+    await expect(mockApi.resetSchedule(row.id)).rejects.toMatchObject({ status: 400 });
+    expect(await mockApi.getSchedule(row.id)).toMatchObject(baseline);
+    expect(await mockApi.updateSchedule(row.id, { enabled: false })).toMatchObject({ ...baseline, enabled: false });
+    expect(await mockApi.updateSchedule(row.id, { enabled: true })).toMatchObject({ ...baseline, enabled: true });
+    state.runs.clear();
+    expect((await mockApi.runScheduleNow(row.id)).started?.[0]).toMatchObject({
+      selector_label: "on-deck", label_removed: false, label_remove_failed: false });
   });
 });

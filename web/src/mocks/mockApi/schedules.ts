@@ -430,6 +430,7 @@ const userSchedules: Omit<
 // Non-prompt entries have no output channel ("").
 const scheduleCatalog: CatalogEntry[] = [
   {
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     slug: "test-improvement",
     name: "Weekly test improvement",
     description: "Weekly pass that finds one under-tested area and strengthens its tests.",
@@ -439,6 +440,7 @@ const scheduleCatalog: CatalogEntry[] = [
     labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
   },
   {
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     slug: "docs-hygiene",
     name: "Docs hygiene",
     description: "Weekly sweep for mechanical documentation defects — dead links, stale references, drift.",
@@ -448,6 +450,7 @@ const scheduleCatalog: CatalogEntry[] = [
     labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
   },
   {
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     slug: "bug-hunt",
     name: "Bug hunt — deep audit",
     description: "Deep audit of one subsystem for correctness bugs, confirmed by a reviewer and an auditor.",
@@ -457,6 +460,7 @@ const scheduleCatalog: CatalogEntry[] = [
     labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
   },
   {
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     slug: "feature-bingo",
     name: "Feature bingo",
     description: "Weekly brainstorm that proposes one concrete new feature or improvement.",
@@ -466,6 +470,7 @@ const scheduleCatalog: CatalogEntry[] = [
     labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
   },
   {
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     slug: "refactor-scout",
     name: "Refactor scout",
     description: "Biweekly scout that surveys the repo for one high-value structural refactor and files a proposal issue.",
@@ -475,6 +480,7 @@ const scheduleCatalog: CatalogEntry[] = [
     labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
   },
   {
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     slug: "bug-triage",
     name: "Bug triage sweep",
     description: "Daily sweep over open issues labelled \"bug\", starting a run for the oldest few.",
@@ -484,6 +490,7 @@ const scheduleCatalog: CatalogEntry[] = [
       "Triage the sweep's bug issue. Reproduce or confirm the reported problem, find its root cause, and fix it if the fix is small and well-contained; otherwise document the diagnosis and the minimal reproduction so a maintainer can act. Keep changes scoped to the bug at hand and back any fix with a test that would have caught it.",
   },
   {
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     slug: "planned-sweep",
     name: "Planned-work sweep",
     description: "Daily sweep over open issues labelled \"Planned\", starting a run for the oldest few.",
@@ -494,6 +501,7 @@ const scheduleCatalog: CatalogEntry[] = [
   },
   {
     selector_kind: "assigned",
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     slug: "assigned-sweep",
     name: "Assigned-work sweep",
     description: "Daily sweep over open issues assigned to the uzi bot account, starting a run for the oldest few.",
@@ -506,11 +514,22 @@ const scheduleCatalog: CatalogEntry[] = [
     // A self_improve entry (PRD #590) carries neither a prompt nor labels/guidance: the
     // orchestration lead resolves its own tracking issue at fire time. So it edits like a
     // prompt default (cadence/model only) but has no baked text to show.
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     slug: "self-improve",
     name: "Self-improvement",
     description: "Autonomous self-improvement — audit uzi's own codebase and open one improvement MR per cycle.",
     target: "self_improve", cron: "0 4 */2 * *", timezone: "UTC", model: "", output_mode: "",
     prompt: "", labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
+  },
+  {
+    slug: "ondeck-sweep", name: "On-deck sweep",
+    description: "Drain a triaged on-deck backlog a little at a time when there is room, then remove the label.",
+    target: "sweep", selector_kind: "label", labels: ["on-deck"],
+    cron: "*/10 * * * *", timezone: "UTC", max_issues: 1,
+    capacity_limit: 4, capacity_room_needed: 2, remove_label_on_dispatch: true,
+    model: "", output_mode: "", prompt: "",
+    guidance: "Work the next on-deck issue. Keep the change focused and verify it before opening a merge request.",
+    auto_approve: true, wait_on_limit: true,
   },
 ];
 
@@ -548,9 +567,9 @@ function materializeDefault(
     // is inherit until an override sets it, so seed the explicit null sentinel here rather
     // than leaving the field undefined (which would diverge from the server response shape).
     mr_rework_enabled: null,
-    remove_label_on_dispatch: false,
-    capacity_limit: null,
-    capacity_room_needed: null,
+    remove_label_on_dispatch: entry.remove_label_on_dispatch,
+    capacity_limit: entry.capacity_limit,
+    capacity_room_needed: entry.capacity_room_needed,
     max_issues: entry.target === "sweep" ? entry.max_issues : null,
     // Owner OVERLAY (issue #675): null by default; a seed sets it via `...over`.
     guidance: null,
@@ -635,7 +654,7 @@ let schedules: Schedule[] = [
   ...seededDefaults,
 ];
 
-// Capacity demos use custom rows; shipped catalog defaults remain ungated.
+// Capacity demos use custom rows alongside the On-deck catalog default.
 const capacityDemo = schedules.find((s) => s.target === "sweep" && s.origin === "user")!;
 schedules.push(
   { ...capacityDemo, id: "sch-capacity-blocked", capacity_limit: 4, capacity_room_needed: 2,
@@ -891,7 +910,8 @@ export const schedulesApi = {
       const entry = catalogBySlug(m.catalog_slug);
       if (entry) {
         m.customized =
-          m.remove_label_on_dispatch || m.capacity_limit != null || m.capacity_room_needed != null ||
+          m.remove_label_on_dispatch !== entry.remove_label_on_dispatch ||
+          m.capacity_limit !== entry.capacity_limit || m.capacity_room_needed !== entry.capacity_room_needed ||
           m.cron_expr !== entry.cron ||
           m.timezone !== entry.timezone ||
           (m.model ?? "") !== entry.model ||
@@ -1017,6 +1037,8 @@ export const schedulesApi = {
     );
     if (existing) return delay(scheduleDTO(existing));
     const s = materializeDefault(entry, repoId, nextScheduleId());
+    applyCapacity(s, {});
+    applyRemoval(s, {});
     // On the fresh-materialize path only, an optional detected browser timezone (issue
     // #660) overrides the catalog zone; an empty/absent tz keeps the catalog zone. Mirror
     // the production handler: trim, and reject an invalid IANA name (Intl throws a
@@ -1050,6 +1072,8 @@ export const schedulesApi = {
       last_fire: cur.last_fire,
       created_at: cur.created_at,
     });
+    applyCapacity(restored, {});
+    applyRemoval(restored, {});
     schedules = schedules.map((x) => (x.id === id ? restored : x));
     return delay(scheduleDTO(restored));
   },

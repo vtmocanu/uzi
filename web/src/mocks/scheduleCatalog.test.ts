@@ -20,10 +20,10 @@ describe("mock default-jobs catalog (PRD #589)", () => {
     ]);
   });
 
-  it("lists the 9 catalog entries and seeds a visible Layout-A demo state", async () => {
+  it("lists the 10 catalog entries and seeds a visible Layout-A demo state", async () => {
     const { entries, enablements } = await mockApi.listScheduleCatalog();
     expect(entries.map((e) => e.slug).sort()).toEqual(
-      ["assigned-sweep", "bug-hunt", "bug-triage", "docs-hygiene", "feature-bingo", "planned-sweep", "refactor-scout", "self-improve", "test-improvement"].sort(),
+      ["ondeck-sweep", "assigned-sweep", "bug-hunt", "bug-triage", "docs-hygiene", "feature-bingo", "planned-sweep", "refactor-scout", "self-improve", "test-improvement"].sort(),
     );
     // The assigned sweep selects by assignee, not by label, so its catalog labels stay null.
     expect(entries.find((e) => e.slug === "assigned-sweep")?.labels).toBeNull();

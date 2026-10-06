@@ -65,6 +65,7 @@ import {
   parseHHMM,
   presetFromCron,
   PRESET_OPTIONS,
+  MINUTE_INTERVALS,
   type CronPreset,
   type PresetState,
 } from "../lib/schedulePresets";
@@ -477,7 +478,9 @@ export function ScheduleModal({
       setPresetState((s) => ({ ...s, preset }));
       return;
     }
-    applyPreset({ ...presetState, preset });
+    const everyN = preset === "everyNMinutes" && !MINUTE_INTERVALS.includes(presetState.everyN)
+      ? 10 : preset === "everyNHours" && presetState.everyN > 23 ? 6 : presetState.everyN;
+    applyPreset({ ...presetState, preset, everyN });
   };
   const onTimeChange = (v: string) => {
     const t = parseHHMM(v);
@@ -486,7 +489,8 @@ export function ScheduleModal({
   };
   const onEveryNChange = (v: string) => {
     const n = Number(v);
-    if (!Number.isFinite(n) || n < 1 || n > 23) return;
+    if (!Number.isInteger(n) || (presetState.preset === "everyNMinutes"
+      ? !MINUTE_INTERVALS.includes(n) : n < 1 || n > 23)) return;
     applyPreset({ ...presetState, everyN: n });
   };
   const onRawCronChange = (v: string) => {
@@ -1137,7 +1141,12 @@ export function ScheduleModal({
                     </option>
                   ))}
                 </Select>
-                {presetState.preset === "everyNHours" ? (
+                {presetState.preset === "everyNMinutes" ? (
+                  <Select aria-label="Every N minutes" value={presetState.everyN}
+                    onChange={(e) => onEveryNChange(e.target.value)}>
+                    {MINUTE_INTERVALS.map((n) => <option key={n} value={n}>{n}</option>)}
+                  </Select>
+                ) : presetState.preset === "everyNHours" ? (
                   <Input
                     type="number"
                     min={1}

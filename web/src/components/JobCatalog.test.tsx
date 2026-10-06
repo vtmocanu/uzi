@@ -47,6 +47,7 @@ function entry(over: Partial<CatalogEntry> = {}): CatalogEntry {
     labels: ["bug"],
     guidance: "",
     max_issues: 3,
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     auto_approve: true,
     wait_on_limit: true,
     ...over,
@@ -320,4 +321,17 @@ describe("EnableJobDialog — focus and dismissal (ExtendTimePopover pattern)", 
     expect(document.activeElement).toBe(dialog);
     expect(card("bug-triage").contains(dialog)).toBe(true);
   });
+});
+
+it("shows the On-deck catalog baseline", () => {
+  renderCatalog({ catalog: { entries: [entry({
+    slug: "ondeck-sweep", name: "On-deck sweep", cron: "*/10 * * * *",
+    labels: ["on-deck"], max_issues: 1, capacity_limit: 4,
+    capacity_room_needed: 2, remove_label_on_dispatch: true,
+  })], enablements: [] } });
+  const deck = within(card("ondeck-sweep"));
+  for (const text of ["label on-deck", "max 1 at a time", "limit 4 · room 2", "removes label"]) {
+    expect(deck.getByText(text)).toBeTruthy();
+  }
+  expect(deck.getByText(/catalog default/).parentElement!.textContent).toBe("Every 10 minutes · UTC · catalog default");
 });

@@ -1702,3 +1702,35 @@ describe("selector label removal", () => {
     await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalledWith("repo-uzi", expect.objectContaining({ remove_label_on_dispatch: true })));
   });
 });
+
+describe("M2 minute cadence controls", () => {
+  it("uses the fixed minute choices, normalizes hours 23 and can return to hours from minutes 30", async () => {
+    renderModal();
+    const preset = await screen.findByLabelText("Cadence");
+    fireEvent.change(preset, { target: { value: "everyNHours" } });
+    fireEvent.change(screen.getByLabelText("Every N hours"), { target: { value: "23" } });
+    fireEvent.change(preset, { target: { value: "everyNMinutes" } });
+    const minutes = screen.getByLabelText("Every N minutes") as HTMLSelectElement;
+    expect(Array.from(minutes.options, (o) => Number(o.value))).toEqual([1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30]);
+    expect(minutes.value).toBe("10");
+    expect((screen.getByLabelText("Cron expression") as HTMLInputElement).value).toBe("*/10 * * * *");
+    for (const n of [1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30]) {
+      fireEvent.change(minutes, { target: { value: String(n) } });
+      expect((screen.getByLabelText("Cron expression") as HTMLInputElement).value).toBe(`*/${n} * * * *`);
+    }
+    fireEvent.change(preset, { target: { value: "everyNHours" } });
+    expect((screen.getByLabelText("Every N hours") as HTMLInputElement).value).toBe("6");
+    fireEvent.change(screen.getByLabelText("Cron expression"), { target: { value: "*/40 * * * *" } });
+    expect((preset as HTMLSelectElement).value).toBe("custom");
+  });
+  it.each([["*/10 * * * *", "everyNMinutes"], ["*/40 * * * *", "custom"]])("reopens %s as %s", async (cron, preset) => {
+    const row = await realMockApi.enableCatalogSchedule("repo-uzi", "ondeck-sweep");
+    render(<MemoryRouter><ScheduleModal editing={{ ...row, cron_expr: cron }} onClose={vi.fn()} onSaved={vi.fn()} /></MemoryRouter>);
+    expect((await screen.findByLabelText("Cadence") as HTMLSelectElement).value).toBe(preset);
+    if (preset === "everyNMinutes") {
+      expect((screen.getByLabelText("Every N minutes") as HTMLSelectElement).value).toBe("10");
+    } else {
+      expect(screen.queryByLabelText("Every N minutes")).toBeNull();
+    }
+  });
+});

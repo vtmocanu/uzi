@@ -2042,6 +2042,9 @@ export interface SchedulePauseDTO {
 // prompt is empty and the body maps to guidance. auto_approve/wait_on_limit are the
 // fixed run flags every default is seeded with, not per-entry.
 export interface CatalogEntry {
+  remove_label_on_dispatch: boolean;
+  capacity_limit: number | null;
+  capacity_room_needed: number | null;
   slug: string;
   name: string;
   description: string;

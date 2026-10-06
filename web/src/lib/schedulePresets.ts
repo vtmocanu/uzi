@@ -5,10 +5,11 @@
 // translation layer on top: selecting a preset builds a cron string; editing the
 // raw cron field that no longer matches any preset flips the dropdown to "Custom".
 //
-// The four preset cron shapes match M2's canonical forms EXACTLY:
+// The preset cron shapes match M2's canonical forms EXACTLY:
 //   weekdays  = `M H * * 1-5`
 //   daily     = `M H * * *`
 //   weekly    = `M H * * 1`   (Monday)
+//   minutes   = `*/N * * * *` (fixed divisors of 60)
 //   everyN    = `0 */N * * *`
 // so cronFromPreset(presetFromCron(c)) === c for every c a preset can produce.
 
@@ -16,12 +17,13 @@ export type CronPreset =
   | "weekdays"
   | "daily"
   | "weekly"
+  | "everyNMinutes"
   | "everyNHours"
   | "custom";
 
 // PresetState is the modal's cadence sub-state: the chosen preset plus the two
 // parameters presets read — a wall-clock time (for the day-based presets) and an
-// interval N (for the every-N-hours preset). A custom preset ignores both and
+// interval N (for the every-N-hours or minutes preset). A custom preset ignores both and
 // edits the raw cron directly.
 export interface PresetState {
   preset: CronPreset;
@@ -29,7 +31,7 @@ export interface PresetState {
   hour: number;
   // 0..59
   minute: number;
-  // 1..23 (the step in `0 */N * * *`)
+  // 1..23 for hours; MINUTE_INTERVALS for minutes
   everyN: number;
 }
 
@@ -42,11 +44,14 @@ export const DEFAULT_PRESET_STATE: PresetState = {
   everyN: 6,
 };
 
+export const MINUTE_INTERVALS: readonly number[] = [1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30];
+
 // The dropdown options, in the mock's order. `custom` is last.
 export const PRESET_OPTIONS: { value: CronPreset; label: string }[] = [
   { value: "weekdays", label: "Weekdays" },
   { value: "daily", label: "Every day" },
   { value: "weekly", label: "Every week (Monday)" },
+  { value: "everyNMinutes", label: "Every N minutes" },
   { value: "everyNHours", label: "Every N hours" },
   { value: "custom", label: "Custom (cron)…" },
 ];
@@ -84,6 +89,8 @@ export function cronFromPreset(state: PresetState): string {
       return `${minute} ${hour} * * *`;
     case "weekly":
       return `${minute} ${hour} * * 1`;
+    case "everyNMinutes":
+      return MINUTE_INTERVALS.includes(everyN) ? `*/${everyN} * * * *` : "";
     case "everyNHours":
       return `0 */${everyN} * * *`;
     case "custom":
@@ -93,7 +100,7 @@ export function cronFromPreset(state: PresetState): string {
 
 const INT_RE = /^\d{1,2}$/;
 
-// presetFromCron is the inverse: it recognises exactly the four canonical shapes
+// presetFromCron is the inverse: it recognises exactly the canonical shapes
 // cronFromPreset produces and returns the matching PresetState; anything else
 // (extra fields, ranges, lists, unhandled steps) resolves to `custom`, which is
 // what flips the dropdown when a user hand-edits the raw cron. The returned
@@ -108,6 +115,14 @@ export function presetFromCron(
   if (fields.length !== 5) return custom;
   const [min, hr, dom, mon, dow] = fields;
   if (dom !== "*" || mon !== "*") return custom;
+
+  const minuteStep = /^\*\/(\d{1,2})$/.exec(min);
+  if (minuteStep && hr === "*" && dow === "*") {
+    const everyN = Number(minuteStep[1]);
+    return MINUTE_INTERVALS.includes(everyN)
+      ? { preset: "everyNMinutes", hour: 0, minute: 0, everyN }
+      : custom;
+  }
 
   // Every-N-hours: `0 */N * * *`.
   const stepMatch = /^\*\/(\d{1,2})$/.exec(hr);
@@ -150,6 +165,8 @@ export function humanizeCron(cron: string): string {
       return `Every day at ${at}`;
     case "weekly":
       return `Every Monday at ${at}`;
+    case "everyNMinutes":
+      return st.everyN === 1 ? "Every minute" : `Every ${st.everyN} minutes`;
     case "everyNHours":
       return st.everyN === 1 ? "Every hour" : `Every ${st.everyN} hours`;
     case "custom":
