@@ -473,6 +473,22 @@ describe("renderCompletionBlock (D10, D12, D14)", () => {
 });
 
 describe("mrCompletionBlock over the renderer: every PR-producing kind renders", () => {
+  it("requires gate evidence after unconfirmed provisioning and preserves truncation without dirs", () => {
+    const claim = makeClaim({ kind: "issue", issue_iid: 7 });
+    const failed = mrCompletionBlock(claim, "b", undefined, undefined, undefined, ["."]);
+    assert.match(failed, /provisioning failed or is unconfirmed in: `\.`/);
+    assert.match(failed, /Existing dependencies may still be usable/);
+    assert.match(failed, /Require actual gate evidence/);
+    assert.doesNotMatch(failed, /could not run on this change|node_modules.*absent/);
+    const truncated = mrCompletionBlock(claim, "b", undefined, undefined, undefined, [], true);
+    assert.match(truncated, /Quality gates unverified/);
+    assert.match(truncated, /Dependency discovery stopped at its scan cap/);
+    assert.doesNotMatch(truncated, /provisioning failed/);
+    assert.doesNotMatch(mrCompletionBlock(claim, "b"), /Quality gates unverified/);
+    assert.doesNotMatch(mrCompletionBlock(makeClaim({ kind: "self_improve" }), "b",
+      undefined, undefined, undefined, ["."], true), /Quality gates unverified/);
+  });
+
   const kinds: Array<[RunKind, Partial<ClaimResponse>, RegExp]> = [
     ["issue", { issue_iid: 7 }, /Related to #7\.\n\nCloses #7/],
     [

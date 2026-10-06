@@ -8,7 +8,7 @@ import { clampToDirCharset, errMessage } from "./util.js";
 /**
  * Start eagerly so provisioning overlaps planning. Attach the rejection handler
  * immediately, before the caller can leave the promise floating until its join.
- * Synchronous injected throws use the same best-effort warning and empty result.
+ * Synchronous injected throws use the same best-effort warning and safe failure result.
  *
  * buildCheckEnv supplies a scrubbed replacement env and the run's provisioned PATH.
  * HOME is per-run: sharing the runner-writable npm cache would let one run seed
@@ -34,7 +34,10 @@ export function startDepsInstall(
       run_id: ctx.runId,
       error: errMessage(err),
     });
-    return { results: [], truncated: false };
+    return {
+      results: [{ dir: ".", manager: "none", ok: false, detail: "dependency installer failed" }],
+      truncated: false,
+    };
   };
   try {
     return installDeps(
@@ -53,7 +56,7 @@ export function reportDepsInstall(
   log: Logger,
   { results, truncated }: JsDepsInstall,
 ): JsDepsInstall {
-  if (results.length === 0) {
+  if (results.length === 0 && !truncated) {
     ctx.emit({
       kind: "status",
       agent: "worker",

@@ -3455,9 +3455,8 @@ export class SdkExecutor implements Executor {
         }
       }
 
-      // js_deps rides the completion log so a finished run's record says whether its
-      // gates were runnable — the same question M4 will have to answer from a durable
-      // source. It is also what keeps depsResults READ rather than merely assigned.
+      // js_deps records dependency provisioning outcomes in the completion log;
+      // it does not establish whether quality gates ran or passed.
       this.log.info("SDK run completed", {
         run_id: ctx.runId,
         branch: ctx.branch,
