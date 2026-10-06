@@ -51,7 +51,7 @@ INSERT INTO run_schedules (
     @user_id, @repo_id, @target, @catalog_slug, 'default', false,
     NULL, NULL, NULL, NULL,
     'recurring', @cron_expr, @timezone, @next_fire_at,
-    @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), true, sqlc.narg('max_issues'), sqlc.narg('model'), sqlc.narg('output_mode'), false, NULL, NULL
+    @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), true, sqlc.narg('max_issues'), sqlc.narg('model'), sqlc.narg('output_mode'), @remove_label_on_dispatch, sqlc.narg('capacity_limit'), sqlc.narg('capacity_room_needed')
 )
 ON CONFLICT (user_id, repo_id, catalog_slug) WHERE origin = 'default' DO NOTHING
 RETURNING *;
@@ -95,10 +95,10 @@ SET cron_expr     = @cron_expr,
     max_issues    = sqlc.narg('max_issues'),
     guidance      = NULL,
     output_mode   = sqlc.narg('output_mode'),
-    remove_label_on_dispatch = false,
+    remove_label_on_dispatch = @remove_label_on_dispatch,
     override_subagent_model = false,
-    capacity_limit = NULL,
-    capacity_room_needed = NULL,
+    capacity_limit = sqlc.narg('capacity_limit'),
+    capacity_room_needed = sqlc.narg('capacity_room_needed'),
     harness       = NULL,
     credential_override_mode = NULL,
     credential_override_secret_id = NULL,

@@ -298,26 +298,29 @@ INSERT INTO run_schedules (
     $1, $2, $3, $4, 'default', false,
     NULL, NULL, NULL, NULL,
     'recurring', $5, $6, $7,
-    $8, $9, $10, true, $11, $12, $13, false, NULL, NULL
+    $8, $9, $10, true, $11, $12, $13, $14, $15, $16
 )
 ON CONFLICT (user_id, repo_id, catalog_slug) WHERE origin = 'default' DO NOTHING
 RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed, remove_label_on_dispatch
 `
 
 type CreateDefaultScheduleParams struct {
-	UserID          uuid.UUID          `json:"user_id"`
-	RepoID          uuid.UUID          `json:"repo_id"`
-	Target          string             `json:"target"`
-	CatalogSlug     pgtype.Text        `json:"catalog_slug"`
-	CronExpr        pgtype.Text        `json:"cron_expr"`
-	Timezone        string             `json:"timezone"`
-	NextFireAt      pgtype.Timestamptz `json:"next_fire_at"`
-	AutoApprove     bool               `json:"auto_approve"`
-	WaitOnLimit     bool               `json:"wait_on_limit"`
-	MrReworkEnabled pgtype.Bool        `json:"mr_rework_enabled"`
-	MaxIssues       pgtype.Int4        `json:"max_issues"`
-	Model           pgtype.Text        `json:"model"`
-	OutputMode      pgtype.Text        `json:"output_mode"`
+	UserID                uuid.UUID          `json:"user_id"`
+	RepoID                uuid.UUID          `json:"repo_id"`
+	Target                string             `json:"target"`
+	CatalogSlug           pgtype.Text        `json:"catalog_slug"`
+	CronExpr              pgtype.Text        `json:"cron_expr"`
+	Timezone              string             `json:"timezone"`
+	NextFireAt            pgtype.Timestamptz `json:"next_fire_at"`
+	AutoApprove           bool               `json:"auto_approve"`
+	WaitOnLimit           bool               `json:"wait_on_limit"`
+	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
+	MaxIssues             pgtype.Int4        `json:"max_issues"`
+	Model                 pgtype.Text        `json:"model"`
+	OutputMode            pgtype.Text        `json:"output_mode"`
+	RemoveLabelOnDispatch bool               `json:"remove_label_on_dispatch"`
+	CapacityLimit         pgtype.Int4        `json:"capacity_limit"`
+	CapacityRoomNeeded    pgtype.Int4        `json:"capacity_room_needed"`
 }
 
 // Enable a builtin default scheduled job (PRD #589 M2) on a repo for an owner. A
@@ -347,6 +350,9 @@ func (q *Queries) CreateDefaultSchedule(ctx context.Context, arg CreateDefaultSc
 		arg.MaxIssues,
 		arg.Model,
 		arg.OutputMode,
+		arg.RemoveLabelOnDispatch,
+		arg.CapacityLimit,
+		arg.CapacityRoomNeeded,
 	)
 	var i RunSchedule
 	err := row.Scan(
@@ -1150,33 +1156,36 @@ SET cron_expr     = $1,
     max_issues    = $7,
     guidance      = NULL,
     output_mode   = $8,
-    remove_label_on_dispatch = false,
+    remove_label_on_dispatch = $9,
     override_subagent_model = false,
-    capacity_limit = NULL,
-    capacity_room_needed = NULL,
+    capacity_limit = $10,
+    capacity_room_needed = $11,
     harness       = NULL,
     credential_override_mode = NULL,
     credential_override_secret_id = NULL,
-    next_fire_at  = $9,
+    next_fire_at  = $12,
     customized    = false,
     status        = 'active',
     updated_at    = now()
-WHERE id = $10 AND user_id = $11 AND origin = 'default'
+WHERE id = $13 AND user_id = $14 AND origin = 'default'
 RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed, remove_label_on_dispatch
 `
 
 type ResetDefaultScheduleParams struct {
-	CronExpr        pgtype.Text        `json:"cron_expr"`
-	Timezone        string             `json:"timezone"`
-	Model           pgtype.Text        `json:"model"`
-	AutoApprove     bool               `json:"auto_approve"`
-	WaitOnLimit     bool               `json:"wait_on_limit"`
-	MrReworkEnabled pgtype.Bool        `json:"mr_rework_enabled"`
-	MaxIssues       pgtype.Int4        `json:"max_issues"`
-	OutputMode      pgtype.Text        `json:"output_mode"`
-	NextFireAt      pgtype.Timestamptz `json:"next_fire_at"`
-	ID              uuid.UUID          `json:"id"`
-	UserID          uuid.UUID          `json:"user_id"`
+	CronExpr              pgtype.Text        `json:"cron_expr"`
+	Timezone              string             `json:"timezone"`
+	Model                 pgtype.Text        `json:"model"`
+	AutoApprove           bool               `json:"auto_approve"`
+	WaitOnLimit           bool               `json:"wait_on_limit"`
+	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
+	MaxIssues             pgtype.Int4        `json:"max_issues"`
+	OutputMode            pgtype.Text        `json:"output_mode"`
+	RemoveLabelOnDispatch bool               `json:"remove_label_on_dispatch"`
+	CapacityLimit         pgtype.Int4        `json:"capacity_limit"`
+	CapacityRoomNeeded    pgtype.Int4        `json:"capacity_room_needed"`
+	NextFireAt            pgtype.Timestamptz `json:"next_fire_at"`
+	ID                    uuid.UUID          `json:"id"`
+	UserID                uuid.UUID          `json:"user_id"`
 }
 
 // Restore a default-origin schedule's editable fields to the catalog defaults and clear
@@ -1209,6 +1218,9 @@ func (q *Queries) ResetDefaultSchedule(ctx context.Context, arg ResetDefaultSche
 		arg.MrReworkEnabled,
 		arg.MaxIssues,
 		arg.OutputMode,
+		arg.RemoveLabelOnDispatch,
+		arg.CapacityLimit,
+		arg.CapacityRoomNeeded,
 		arg.NextFireAt,
 		arg.ID,
 		arg.UserID,

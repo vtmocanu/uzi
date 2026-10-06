@@ -414,13 +414,16 @@ type LastFire struct {
 // seeded with (schedtmpl.AutoApprove / WaitOnLimit), not per-entry. For a prompt entry
 // Guidance/Labels/MaxIssues are empty; for a sweep entry Prompt is empty.
 type CatalogEntryDTO struct {
-	Slug        string `json:"slug"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Target      string `json:"target"`
-	Cron        string `json:"cron"`
-	Timezone    string `json:"timezone"`
-	Model       string `json:"model"`
+	RemoveLabelOnDispatch bool   `json:"remove_label_on_dispatch"`
+	CapacityLimit         *int   `json:"capacity_limit"`
+	CapacityRoomNeeded    *int   `json:"capacity_room_needed"`
+	Slug                  string `json:"slug"`
+	Name                  string `json:"name"`
+	Description           string `json:"description"`
+	Target                string `json:"target"`
+	Cron                  string `json:"cron"`
+	Timezone              string `json:"timezone"`
+	Model                 string `json:"model"`
 	// OutputMode is a prompt entry's resolved output mode (PRD #929 M1): "mr" (the
 	// default) or "issues", resolved from the catalog `output:` frontmatter via
 	// DefaultJob.OutputMode so a prompt entry is never "". Empty for a non-prompt entry

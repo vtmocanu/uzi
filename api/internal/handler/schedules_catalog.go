@@ -88,6 +88,10 @@ func (h *Handler) EnableCatalogSchedule(w http.ResponseWriter, r *http.Request) 
 		httpx.RespondDecodeError(w, derr, "invalid request body")
 		return
 	}
+	if status, msg := h.validateScheduleRemoval(r.Context(), apitypes.ScheduleRequest{Target: job.Target, Timing: "recurring", Labels: job.Labels, RemoveLabelOnDispatch: &job.RemoveLabelOnDispatch}, job.SelectorKind); status != 0 {
+		httpx.Error(w, status, msg)
+		return
+	}
 	tz := catalogTimezone(job)
 	if override := strings.TrimSpace(req.Timezone); override != "" {
 		// Reject the "Local" sentinel: time.LoadLocation("Local") succeeds and resolves to
@@ -111,18 +115,21 @@ func (h *Handler) EnableCatalogSchedule(w http.ResponseWriter, r *http.Request) 
 	}
 	slugText := pgtype.Text{String: slug, Valid: true}
 	s, err := h.q.CreateDefaultSchedule(r.Context(), store.CreateDefaultScheduleParams{
-		UserID:      user.ID,
-		RepoID:      repo.ID,
-		Target:      job.Target,
-		CatalogSlug: slugText,
-		CronExpr:    pgtype.Text{String: job.Cron, Valid: true},
-		Timezone:    tz,
-		NextFireAt:  pgtype.Timestamptz{Time: next, Valid: true},
-		AutoApprove: schedtmpl.AutoApprove,
-		WaitOnLimit: schedtmpl.WaitOnLimit,
-		MaxIssues:   catalogMaxIssues(job),
-		Model:       catalogModel(job),
-		OutputMode:  catalogOutputMode(job),
+		UserID:                user.ID,
+		RepoID:                repo.ID,
+		Target:                job.Target,
+		CatalogSlug:           slugText,
+		CronExpr:              pgtype.Text{String: job.Cron, Valid: true},
+		Timezone:              tz,
+		NextFireAt:            pgtype.Timestamptz{Time: next, Valid: true},
+		AutoApprove:           schedtmpl.AutoApprove,
+		WaitOnLimit:           schedtmpl.WaitOnLimit,
+		MaxIssues:             catalogMaxIssues(job),
+		RemoveLabelOnDispatch: job.RemoveLabelOnDispatch,
+		CapacityLimit:         catalogCapacity(job.CapacityLimit),
+		CapacityRoomNeeded:    catalogCapacity(job.CapacityRoomNeeded),
+		Model:                 catalogModel(job),
+		OutputMode:            catalogOutputMode(job),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -171,6 +178,10 @@ func (h *Handler) ResetSchedule(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnprocessableEntity, "this schedule's catalog entry no longer exists")
 		return
 	}
+	if status, msg := h.validateScheduleRemoval(r.Context(), apitypes.ScheduleRequest{Target: job.Target, Timing: "recurring", Labels: job.Labels, RemoveLabelOnDispatch: &job.RemoveLabelOnDispatch}, job.SelectorKind); status != 0 {
+		httpx.Error(w, status, msg)
+		return
+	}
 	tz := catalogTimezone(job)
 	next, err := schedsvc.NextFire(job.Cron, tz, h.clock())
 	if err != nil {
@@ -179,16 +190,19 @@ func (h *Handler) ResetSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s, err := h.q.ResetDefaultSchedule(r.Context(), store.ResetDefaultScheduleParams{
-		CronExpr:    pgtype.Text{String: job.Cron, Valid: true},
-		Timezone:    tz,
-		Model:       catalogModel(job),
-		AutoApprove: schedtmpl.AutoApprove,
-		WaitOnLimit: schedtmpl.WaitOnLimit,
-		MaxIssues:   catalogMaxIssues(job),
-		OutputMode:  catalogOutputMode(job),
-		NextFireAt:  pgtype.Timestamptz{Time: next, Valid: true},
-		ID:          id,
-		UserID:      user.ID,
+		CronExpr:              pgtype.Text{String: job.Cron, Valid: true},
+		Timezone:              tz,
+		Model:                 catalogModel(job),
+		AutoApprove:           schedtmpl.AutoApprove,
+		WaitOnLimit:           schedtmpl.WaitOnLimit,
+		MaxIssues:             catalogMaxIssues(job),
+		RemoveLabelOnDispatch: job.RemoveLabelOnDispatch,
+		CapacityLimit:         catalogCapacity(job.CapacityLimit),
+		CapacityRoomNeeded:    catalogCapacity(job.CapacityRoomNeeded),
+		OutputMode:            catalogOutputMode(job),
+		NextFireAt:            pgtype.Timestamptz{Time: next, Valid: true},
+		ID:                    id,
+		UserID:                user.ID,
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -446,7 +460,7 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 	// harness (PRD #1429 M4a) is likewise a run option, not a catalog field: its catalog
 	// baseline is no pin (NULL), so any stored pin diverges = customized. A cleared pin does
 	// not, so an exact-restore un-customizes. Mirrors credential_override's precedent above.
-	customized = customized || harness.Valid || capacityLimit.Valid || capacityRoomNeeded.Valid
+	customized = customized || harness.Valid
 
 	final, err := h.q.UpdateRunSchedule(r.Context(), store.UpdateRunScheduleParams{
 		Target:                     cur.Target,
@@ -489,26 +503,43 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 // and wait_on_limit are the fixed schedtmpl run flags, not per-entry.
 func catalogEntryDTO(j schedtmpl.DefaultJob) apitypes.CatalogEntryDTO {
 	return apitypes.CatalogEntryDTO{
-		Slug:         j.Slug,
-		Name:         j.Name,
-		Description:  j.Description,
-		Target:       j.Target,
-		Cron:         j.Cron,
-		Timezone:     catalogTimezone(j),
-		Model:        j.Model,
-		OutputMode:   catalogEntryOutputMode(j),
-		Prompt:       j.Prompt,
-		SelectorKind: j.SelectorKind,
-		Labels:       j.Labels,
-		Guidance:     j.Guidance,
-		MaxIssues:    j.MaxIssues,
-		AutoApprove:  schedtmpl.AutoApprove,
-		WaitOnLimit:  schedtmpl.WaitOnLimit,
+		Slug:                  j.Slug,
+		Name:                  j.Name,
+		Description:           j.Description,
+		Target:                j.Target,
+		Cron:                  j.Cron,
+		Timezone:              catalogTimezone(j),
+		Model:                 j.Model,
+		OutputMode:            catalogEntryOutputMode(j),
+		Prompt:                j.Prompt,
+		SelectorKind:          j.SelectorKind,
+		Labels:                j.Labels,
+		Guidance:              j.Guidance,
+		MaxIssues:             j.MaxIssues,
+		RemoveLabelOnDispatch: j.RemoveLabelOnDispatch,
+		CapacityLimit:         catalogCapacityDTO(j.CapacityLimit),
+		CapacityRoomNeeded:    catalogCapacityDTO(j.CapacityRoomNeeded),
+		AutoApprove:           schedtmpl.AutoApprove,
+		WaitOnLimit:           schedtmpl.WaitOnLimit,
 	}
 }
 
-// catalogTimezone returns a job's timezone, defaulting a blank to the catalog default so a
-// stored/enabled row never carries an empty timezone.
+// catalogCapacityDTO maps an absent catalog capacity to JSON null.
+func catalogCapacityDTO(n int) *int {
+	if n == 0 {
+		return nil
+	}
+	return &n
+}
+
+func catalogCapacity(n int) pgtype.Int4 {
+	if n >= 1 && n <= 50 {
+		return pgtype.Int4{Int32: int32(n), Valid: true}
+	}
+	return pgtype.Int4{}
+}
+
+// catalogTimezone returns the catalog default when the job leaves its zone blank.
 func catalogTimezone(j schedtmpl.DefaultJob) string {
 	if strings.TrimSpace(j.Timezone) == "" {
 		return schedtmpl.DefaultTimezone
@@ -563,12 +594,12 @@ func catalogEntryOutputMode(j schedtmpl.DefaultJob) string {
 // model and a NULL row model both mean "inherit", so they compare equal; a 0 catalog
 // max_issues and a NULL row max_issues both mean "unlimited".
 func defaultEditableDiverges(job schedtmpl.DefaultJob, cron, tz string, model pgtype.Text, autoApprove, waitOnLimit bool, mrRework pgtype.Bool, maxIssues pgtype.Int4, outputMode pgtype.Text, removeLabelOnDispatch bool, capacity ...pgtype.Int4) bool {
-	// M1 catalog baseline is false until removal defaults land in M2.
-	if removeLabelOnDispatch {
+	if removeLabelOnDispatch != job.RemoveLabelOnDispatch {
 		return true
 	}
-	for _, c := range capacity {
-		if c.Valid {
+	baseline := []pgtype.Int4{catalogCapacity(job.CapacityLimit), catalogCapacity(job.CapacityRoomNeeded)}
+	for i, c := range capacity {
+		if i >= len(baseline) || c != baseline[i] {
 			return true
 		}
 	}

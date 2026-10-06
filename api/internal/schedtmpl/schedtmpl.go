@@ -118,6 +118,10 @@ type DefaultJob struct {
 	// MaxIssues caps how many issues one sweep fire may start (sweep only); 0
 	// means unset.
 	MaxIssues int
+	// Capacity is absent when both values are zero; otherwise 1 <= room <= limit <= 50.
+	CapacityLimit         int
+	CapacityRoomNeeded    int
+	RemoveLabelOnDispatch bool
 }
 
 //go:embed catalog/*.md
@@ -242,6 +246,7 @@ func parse(raw []byte) (DefaultJob, error) {
 
 	j := DefaultJob{Timezone: DefaultTimezone}
 	selectorSet := false
+	capacityLimitSet, capacityRoomSet, removalSet := false, false, false
 	for _, line := range strings.Split(frontmatter, "\n") {
 		key, val, ok := strings.Cut(line, ": ")
 		if !ok {
@@ -276,6 +281,21 @@ func parse(raw []byte) (DefaultJob, error) {
 					j.Labels = append(j.Labels, l)
 				}
 			}
+		case "capacity_limit", "capacity_room_needed":
+			n, err := strconv.Atoi(val)
+			if err != nil || n < 1 || n > 50 || strconv.Itoa(n) != val {
+				return DefaultJob{}, fmt.Errorf("invalid %s %q: want integer 1..50", key, val)
+			}
+			if key == "capacity_limit" {
+				j.CapacityLimit, capacityLimitSet = n, true
+			} else {
+				j.CapacityRoomNeeded, capacityRoomSet = n, true
+			}
+		case "remove_label_on_dispatch":
+			if val != "true" && val != "false" {
+				return DefaultJob{}, fmt.Errorf("invalid remove_label_on_dispatch %q: want boolean", val)
+			}
+			j.RemoveLabelOnDispatch, removalSet = val == "true", true
 		case "max_issues":
 			n, err := strconv.Atoi(val)
 			if err != nil {
@@ -363,6 +383,15 @@ func parse(raw []byte) (DefaultJob, error) {
 		// a body prompt nor labels, so nothing off the body is stored.
 	default:
 		return DefaultJob{}, fmt.Errorf("catalog %q has unknown target %q", j.Slug, j.Target)
+	}
+	if capacityLimitSet != capacityRoomSet || j.CapacityRoomNeeded > j.CapacityLimit {
+		return DefaultJob{}, fmt.Errorf("catalog %q requires 1 <= capacity_room_needed <= capacity_limit <= 50", j.Slug)
+	}
+	if (capacityLimitSet || removalSet) && (j.Target != "sweep" || j.SelectorKind != SelectorLabel) {
+		return DefaultJob{}, fmt.Errorf("catalog %q capacity/removal requires a label-selected sweep", j.Slug)
+	}
+	if j.RemoveLabelOnDispatch && len(j.Labels) != 1 {
+		return DefaultJob{}, fmt.Errorf("catalog %q removal requires exactly one label", j.Slug)
 	}
 	return j, nil
 }
