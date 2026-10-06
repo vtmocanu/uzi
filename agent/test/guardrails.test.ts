@@ -1395,3 +1395,171 @@ describe("buildAgentGuardHook operator constraints (issue #1660)", () => {
     assert.ok(prompt.includes("c\td\ne"), "tab and newline kept");
   });
 });
+
+describe("path guard — SDK spill read allowance (#2332)", () => {
+  let tmp: string;
+  let home: string;
+  let wt: string;
+  let otherHome: string;
+  const P = "-proj-slug";
+  const spill = (h: string, sid: string): string => path.join(h, ".claude", "projects", P, sid, "tool-results");
+  const transcript = (h: string, sid: string): string => path.join(h, ".claude", "projects", P, `${sid}.jsonl`);
+
+  beforeEach(() => {
+    tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "uzi-spill-")));
+    home = path.join(tmp, "home");
+    otherHome = path.join(tmp, "other");
+    wt = path.join(tmp, "wt");
+    fs.mkdirSync(path.join(wt, ".git"), { recursive: true });
+    fs.writeFileSync(path.join(wt, ".git", "config"), "x");
+    for (const [h, sid, f] of [
+      [home, "sidA", "x.txt"],
+      [home, "sidB", "y.txt"],
+      [otherHome, "sidA", "z.txt"],
+    ] as const) {
+      fs.mkdirSync(spill(h, sid), { recursive: true });
+      fs.writeFileSync(path.join(spill(h, sid), f), "data");
+    }
+    fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}");
+    fs.writeFileSync(path.join(home, ".claude", ".credentials.json"), "{}");
+  });
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  function input(tool: string, toolInput: Record<string, unknown>, sid = "sidA", tp?: string, h = home): HookInput {
+    return {
+      session_id: sid,
+      transcript_path: tp ?? transcript(h, sid),
+      cwd: wt,
+      hook_event_name: "PreToolUse",
+      tool_name: tool,
+      tool_input: toolInput,
+      tool_use_id: "tu",
+    } as HookInput;
+  }
+  const decision = (o: HookJSONOutput): string | undefined =>
+    (o as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision;
+  const reason = (o: HookJSONOutput): string | undefined =>
+    (o as { hookSpecificOutput?: { permissionDecisionReason?: string } }).hookSpecificOutput?.permissionDecisionReason;
+  const mk = (extra: readonly string[] = [], h: string | null = home) =>
+    buildPathGuardHook(wt, nullLogger(), extra, h === null ? {} : { sdkHomeDir: h });
+  const readSpill = (file: string, sid = "sidA", tp?: string) => input("Read", { file_path: file }, sid, tp);
+
+  it("allows Read of the run's own session spill file", async () => {
+    assert.deepStrictEqual(await mk()(readSpill(path.join(spill(home, "sidA"), "x.txt"))), {});
+  });
+
+  it("denies another session's spill file in the same run", async () => {
+    assert.strictEqual(decision(await mk()(readSpill(path.join(spill(home, "sidB"), "y.txt")))), "deny");
+  });
+
+  it("denies sibling files in HOME/.claude", async () => {
+    for (const f of ["settings.json", ".credentials.json"]) {
+      assert.strictEqual(decision(await mk()(readSpill(path.join(home, ".claude", f)))), "deny", f);
+    }
+  });
+
+  it("denies another run's HOME spill file", async () => {
+    assert.strictEqual(decision(await mk()(readSpill(path.join(spill(otherHome, "sidA"), "z.txt")))), "deny");
+  });
+
+  it("denies a file symlink in the spill dir pointing at settings.json or /etc/hostname", async () => {
+    const dir = spill(home, "sidA");
+    fs.symlinkSync(path.join(home, ".claude", "settings.json"), path.join(dir, "l1"));
+    fs.symlinkSync("/etc/hostname", path.join(dir, "l2"));
+    for (const l of ["l1", "l2"]) {
+      assert.strictEqual(decision(await mk()(readSpill(path.join(dir, l)))), "deny", l);
+    }
+  });
+
+  it("denies when the tool-results dir itself is a symlink to an outside dir", async () => {
+    const outside = path.join(tmp, "outside");
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, "f.txt"), "secret");
+    const sessionDir = path.join(home, ".claude", "projects", P, "sidC");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.symlinkSync(outside, path.join(sessionDir, "tool-results"));
+    assert.strictEqual(decision(await mk()(readSpill(path.join(sessionDir, "tool-results", "f.txt"), "sidC"))), "deny");
+  });
+
+  it("denies a .. escape out of the spill dir", async () => {
+    const f = `${spill(home, "sidA")}/../../../../settings.json`; // string concat: path.join would normalize the ..
+    assert.strictEqual(decision(await mk()(readSpill(f))), "deny");
+  });
+
+  it("denies nested files and the tool-results dir itself", async () => {
+    const dir = spill(home, "sidA");
+    fs.mkdirSync(path.join(dir, "sub"));
+    fs.writeFileSync(path.join(dir, "sub", "f.txt"), "n");
+    assert.strictEqual(decision(await mk()(readSpill(path.join(dir, "sub", "f.txt")))), "deny");
+    assert.strictEqual(decision(await mk()(readSpill(dir))), "deny");
+  });
+
+  it("allows only Read: Write/Edit/MultiEdit/NotebookEdit/Grep/Glob of the spill path stay denied", async () => {
+    const dir = spill(home, "sidA");
+    const f = path.join(dir, "x.txt");
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["Write", { file_path: f }],
+      ["Edit", { file_path: f }],
+      ["MultiEdit", { file_path: f }],
+      ["NotebookEdit", { notebook_path: f }],
+      ["Grep", { pattern: "d", path: f }],
+      ["Glob", { pattern: "*", path: dir }],
+    ];
+    for (const [tool, ti] of cases) {
+      assert.strictEqual(decision(await mk()(input(tool, ti))), "deny", tool);
+    }
+  });
+
+  it("keeps the procfs, secret-file and .git denies", async () => {
+    const procEnviron = ["", "proc", "1", "environ"].join("/");
+    assert.strictEqual(decision(await mk()(readSpill(procEnviron))), "deny");
+    const secret = path.join(spill(home, "sidA"), "x.txt");
+    const out = await mk([secret])(readSpill(secret));
+    assert.strictEqual(decision(out), "deny");
+    assert.match(reason(out) ?? "", /credential file/);
+    assert.strictEqual(decision(await mk()(readSpill(path.join(wt, ".git", "config")))), "deny");
+  });
+
+  it("denies a bad session_id or a transcript_path that does not match the run's HOME", async () => {
+    const x = path.join(spill(home, "sidA"), "x.txt");
+    assert.strictEqual(decision(await mk()(readSpill(x, "..", transcript(home, "sidA")))), "deny", "..");
+    assert.strictEqual(decision(await mk()(readSpill(x, "a/b", transcript(home, "sidA")))), "deny", "a/b");
+    assert.strictEqual(decision(await mk()(readSpill(x, "served:x", ""))), "deny", "served:x, empty transcript");
+    // session_id ".." with a self-consistent transcript name would otherwise point the root at projects/tool-results.
+    fs.mkdirSync(path.join(home, ".claude", "projects", "tool-results"), { recursive: true });
+    const trap = path.join(home, ".claude", "projects", "tool-results", "f.txt");
+    fs.writeFileSync(trap, "t");
+    assert.strictEqual(
+      decision(await mk()(readSpill(trap, "..", path.join(home, ".claude", "projects", P, "...jsonl")))),
+      "deny",
+      ".. with matching transcript basename",
+    );
+    assert.strictEqual(decision(await mk()(readSpill(x, "sidA", transcript(otherHome, "sidA")))), "deny", "other home");
+    assert.strictEqual(
+      decision(await mk()(readSpill(x, "sidA", path.join(home, ".claude", "projects", P, "other.jsonl")))),
+      "deny",
+      "basename mismatch",
+    );
+  });
+
+  it("allows when the SDK HOME is reached through a symlinked ancestor", async () => {
+    const link = path.join(tmp, "homelink");
+    fs.symlinkSync(home, link);
+    const f = path.join(spill(link, "sidA"), "x.txt");
+    const out = await mk([], link)(input("Read", { file_path: f }, "sidA", transcript(link, "sidA")));
+    assert.deepStrictEqual(out, {});
+  });
+
+  it("denies when no sdkHomeDir is passed (chat / isolated / job-runner form)", async () => {
+    assert.strictEqual(decision(await mk([], null)(readSpill(path.join(spill(home, "sidA"), "x.txt")))), "deny");
+  });
+
+  it("screenToolPath applies the read-only root only when given", () => {
+    const x = path.join(spill(home, "sidA"), "x.txt");
+    const roots = { lexical: spill(home, "sidA"), real: spill(home, "sidA") };
+    assert.strictEqual(screenToolPath(x, wt, wt, [], roots).denied, false);
+    assert.strictEqual(screenToolPath(x, wt, wt, [], undefined).denied, true);
+  });
+});

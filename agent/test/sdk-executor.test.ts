@@ -1739,6 +1739,41 @@ describe("SdkExecutor per-frame usage attach (PRD #40 Decision 11)", () => {
 });
 
 describe("SdkExecutor guardrail options", () => {
+  it("path hook allows a Read of the run's own SDK spill file but not other files in its HOME (#2332)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    const spillDir = path.join(homeDir, ".claude", "projects", "proj", "sid1", "tool-results");
+    fs.mkdirSync(spillDir, { recursive: true });
+    fs.writeFileSync(path.join(spillDir, "f.txt"), "spilled");
+    fs.writeFileSync(path.join(homeDir, ".claude", "settings.json"), "{}");
+
+    const pathHook = turns[0]!.options.hooks!.PreToolUse![1]!.hooks[0]!;
+    const read = (file: string) =>
+      pathHook(
+        {
+          hook_event_name: "PreToolUse",
+          tool_name: "Read",
+          tool_input: { file_path: file },
+          session_id: "sid1",
+          transcript_path: path.join(homeDir, ".claude", "projects", "proj", "sid1.jsonl"),
+          cwd: homeDir,
+        } as unknown as HookInput,
+        "tu",
+        { signal: new AbortController().signal },
+      );
+    assert.deepStrictEqual(await read(path.join(spillDir, "f.txt")), {});
+    const denied = await read(path.join(homeDir, ".claude", "settings.json"));
+    assert.strictEqual(
+      (denied as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision,
+      "deny",
+    );
+  });
+
   it("wires the signal MCP server, the subagent guard, and the file/bash hooks", async () => {
     const { queryFn, turns } = fakeTurns([
       [submitPlan("plan"), resultSuccess()],
