@@ -28,7 +28,7 @@
 #
 # 🔴 IT DELEGATES TO `npm run knip`, NEVER knip DIRECTLY. package.json's `knip`
 # script is a bare `knip` on purpose: every flag lives in the component's
-# knip.jsonc (staging of the exports/types family at `warn`, etc.), so invoking
+# knip.jsonc (rule severities, ignores, entry points), so invoking
 # knip directly here would drop those flags silently. And NEVER `npx knip`: npx
 # FETCHES FROM THE NETWORK when the dep is missing, which a gate may not do -- so
 # presence is resolved by looking for the local binary that `npm run knip` would
@@ -36,8 +36,9 @@
 #
 # EXIT CODES (the convention lint-formula.sh / deadcode-gate.sh set):
 #     2 = the instrument is broken / required-but-absent   0 = clean OR loud skip
-# and whatever `npm run knip` itself exits when knip IS present (knip gates unused
-# files/deps at zero; the warn tier prints and does not set the code).
+# and whatever `npm run knip` itself exits when knip IS present (every rule the
+# component's knip.jsonc sets to `error` gates at zero; a `warn` rule would print
+# without setting the code).
 set -eu
 
 DIR="${1:-}"
