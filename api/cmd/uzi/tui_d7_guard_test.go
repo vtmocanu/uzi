@@ -220,7 +220,7 @@ var d7UntrustedFields = []string{
 	// Worker projections and attention text (tui_workers.go).
 	"workerName", "workerVersion", "templateDeclared", "templateReported",
 	"upgradeDetail", "upgradeTarget", "blockingContainer", "blockingReason",
-	"outboxBlockedText", "tokenLabel", "hostedSize", "capabilityText",
+	"outboxBlockedText", "quarantineText", "tokenLabel", "hostedSize", "capabilityText",
 	"workerOwner", "pressureText", "attnShort", "attnDetail",
 	"runWorkerName",
 }

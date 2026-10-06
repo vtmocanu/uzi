@@ -417,6 +417,31 @@ func (h *Handler) overlayOutbox(dto *apitypes.WorkerDTO, workerID uuid.UUID) {
 	dto.OutboxBlocked = blocked
 }
 
+// overlayResidueQuarantine folds a worker's in-process residue-quarantine latch (issue
+// #2213) onto its DTO. Left NIL (both fields marshal null) when the worker reported no
+// latch. The cause is re-sanitized at parse time (parseWorkerResidueQuarantine); it is
+// still untrusted text for every renderer. A nil wsvc is a no-op.
+func (h *Handler) overlayResidueQuarantine(dto *apitypes.WorkerDTO, workerID uuid.UUID) {
+	if h.wsvc == nil {
+		return
+	}
+	q, ok := h.wsvc.ResidueQuarantineFor(workerID)
+	if !ok {
+		return
+	}
+	at, cause := q.LatchedAt, q.Cause
+	dto.ResidueQuarantinedAt = &at
+	dto.ResidueQuarantineCause = &cause
+}
+
+// overlayWorkerReports applies every in-process, heartbeat-reported overlay (outbox
+// depth, residue quarantine) to a worker DTO. Each response site that shows a worker
+// calls this one helper so the two stay in lockstep.
+func (h *Handler) overlayWorkerReports(dto *apitypes.WorkerDTO, workerID uuid.UUID) {
+	h.overlayOutbox(dto, workerID)
+	h.overlayResidueQuarantine(dto, workerID)
+}
+
 // reportedRunsByWorker reads each listed worker's reported active runs (PRD #1390 M2c) from
 // the worker_active_runs snapshot table in ONE batched round-trip, grouped by worker id. The
 // batch is what keeps the two list endpoints off an N+1: ListWorkers and AdminListWorkers pass
@@ -629,7 +654,7 @@ func (h *Handler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 			dto.CustodyDecisionsNeeded = &count
 		}
 		h.overlayEphemeralLease(&dto, row.LeaseSince, row.DrainingSince)
-		h.overlayOutbox(&dto, row.ID)
+		h.overlayWorkerReports(&dto, row.ID)
 		h.overlayReportedRuns(&dto, reported, row.ID)
 		overlayRunDisk(&dto, runDisk, row.ID)
 		out = append(out, dto)
@@ -660,7 +685,7 @@ func (h *Handler) AdminListWorkers(w http.ResponseWriter, r *http.Request) {
 			dto.CustodyDecisionsNeeded = &count
 		}
 		h.overlayEphemeralLease(&dto.WorkerDTO, row.Worker.LeaseSince, row.Worker.DrainingSince)
-		h.overlayOutbox(&dto.WorkerDTO, row.Worker.ID)
+		h.overlayWorkerReports(&dto.WorkerDTO, row.Worker.ID)
 		h.overlayReportedRuns(&dto.WorkerDTO, reported, row.Worker.ID)
 		overlayRunDisk(&dto.WorkerDTO, runDisk, row.Worker.ID)
 		out = append(out, dto)
@@ -836,7 +861,7 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 	// and without the overlay its outbox_* fields would read null on this response.
 	dto := workerDTOFromWorker(wkr, 0, false, token.label, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
 	h.overlayEphemeralLease(&dto, wkr.LeaseSince, wkr.DrainingSince)
-	h.overlayOutbox(&dto, wkr.ID)
+	h.overlayWorkerReports(&dto, wkr.ID)
 	// Reuse the batched query with a one-element id set (PRD #1390 M2c): this worker may hold a
 	// live snapshot, so without the overlay its reported_runs would read [] on this response.
 	reported := h.reportedRunsByWorker(r.Context(), []uuid.UUID{wkr.ID})

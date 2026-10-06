@@ -7,7 +7,7 @@ import (
 
 // TestRegisterAdvertisesProtocolFeatures pins the register response's protocol_features to
 // EXACTLY the union of the tokens the landed PRDs ship — #1392 M1's recovery pair, #1391 Run
-// A's heartbeat_outbox, #1247's claim_generation_fence (this api implements the fence, so it
+// A's heartbeat_outbox, issue #2213's worker_residue_quarantine, #1247's claim_generation_fence (this api implements the fence, so it
 // advertises server support), #1391 Run B M3c's terminal_fence (the api now fences a terminal
 // transition on messages_through_seq contiguity), issue #1766 M2's recovery_cause_vault_locked
 // (unconditional), #1795 M1's gate_revision_v1 (unconditional), PRD #1809 M5's
@@ -20,7 +20,7 @@ import (
 // wire-contract change a worker negotiates on.
 func TestRegisterAdvertisesProtocolFeatures(t *testing.T) {
 	got := protocolFeatures(true)
-	want := []string{"dind_maintenance_v1", "recovery_park_cause", "recovery_release_exact_echo", "heartbeat_outbox", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "gate_revision_v1", "recovery_cause_data_volume_full", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report", "active_run_snapshot"}
+	want := []string{"dind_maintenance_v1", "recovery_park_cause", "recovery_release_exact_echo", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "gate_revision_v1", "recovery_cause_data_volume_full", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report", "active_run_snapshot"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("protocolFeatures(true) = %v, want exactly %v", got, want)
 	}
@@ -36,7 +36,7 @@ func TestRegisterAdvertisesProtocolFeatures(t *testing.T) {
 // worker never sends the snapshot) while every other landed token stays exactly as it was.
 func TestProtocolFeaturesOmitsSnapshotWhenDisabled(t *testing.T) {
 	got := protocolFeatures(false)
-	want := []string{"dind_maintenance_v1", "recovery_park_cause", "recovery_release_exact_echo", "heartbeat_outbox", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "gate_revision_v1", "recovery_cause_data_volume_full", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report"}
+	want := []string{"dind_maintenance_v1", "recovery_park_cause", "recovery_release_exact_echo", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "gate_revision_v1", "recovery_cause_data_volume_full", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("protocolFeatures(false) = %v, want exactly %v", got, want)
 	}

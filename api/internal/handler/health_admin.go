@@ -38,11 +38,14 @@ func (h *Handler) healthService() *healthsvc.Service {
 	h.healthSvcOnce.Do(func() {
 		if h.healthSvc == nil {
 			var eligibility func(context.Context, time.Time, uuid.UUID) (store.CountOnlineWorkersClaimableForRunRow, error)
+			var quarantine func(uuid.UUID) (workersvc.ResidueQuarantine, bool)
 			if h.wsvc != nil {
 				eligibility = h.wsvc.WorkerEligibilityForHealth
+				quarantine = h.wsvc.ResidueQuarantineFor
 			}
 			h.healthSvc = healthsvc.New(healthsvc.Config{
 				WorkerEligibilityForHealth: eligibility,
+				ResidueQuarantine:          quarantine,
 				Store:                      h.q,
 				Pool:                       h.pool,
 				Settings:                   h.settings,
