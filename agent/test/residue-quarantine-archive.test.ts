@@ -653,6 +653,94 @@ describe("a run that fails quarantined archives its committed work and releases 
     assert.equal(git(bare, ["show", `refs/uzi-runner/agent/issue-${iid}:WORK.txt`]).trim(), "committed work", "the commit is still recoverable");
   });
 
+  const LATCH = (runId: string, site: string) =>
+    latchResidueQuarantine({ cause: `runner-uid pid 4242 "ssh-agent" could not be attributed (env/cwd unreadable)`, runId, site } as never, nullLogger());
+
+  it("a latch landing inside the settle's transfer (after its entry check) still keeps the clone and the journal", TIMEOUT, async () => {
+    const iid = 22205;
+    const afterLatch = { on: false };
+    const spy = installSpies(afterLatch);
+    const snap: { before?: ReturnType<typeof retained> } = {};
+    const claim = gitlabClaim(iid, { claim_generation: 3 });
+    const runner = runnerWith(failingUnlatched(iid, snap), fakeGitlab().gitlab, undefined, undefined, { checkpointIntervalMs: 0, recoveryRetryMs: 1, recovery: realRecovery() });
+    const priv = runner as unknown as Record<string, (...a: unknown[]) => Promise<unknown>> & { transferRestorePointToTrustedBare: (...a: unknown[]) => Promise<unknown> };
+    priv.reapRecoveryProviderForSettle = async () => true;
+    const realTransfer = priv.transferRestorePointToTrustedBare.bind(runner);
+    priv.transferRestorePointToTrustedBare = async (...a: unknown[]) => {
+      const sha = await realTransfer(...a);
+      LATCH(claim.run_id, "reap");
+      afterLatch.on = true;
+      return sha;
+    };
+    await runner.execute(claim);
+    assert.ok(lastFailed(claim.run_id), "the run failed");
+    assert.deepEqual(spy.clientCalls, [], "no reserve, upload or release client call");
+    assert.ok(journalOf(iid), "the journal still points at the kept clone");
+    assert.equal(fs.existsSync(path.join(worktreeDirFor(iid), "WORK.txt")), true, "the clone is kept");
+  });
+
+  it("a reap that latches and returns false keeps the clone, its uncommitted WIP and the journal", TIMEOUT, async () => {
+    const iid = 22206;
+    const afterLatch = { on: false };
+    installSpies(afterLatch);
+    const snap: { before?: ReturnType<typeof retained> } = {};
+    const claim = gitlabClaim(iid, { claim_generation: 3 });
+    const inner = failingUnlatched(iid, snap);
+    const factory: ExecutorFactory = (runId, ...rest) => {
+      const f = inner(runId, ...rest);
+      const run = f.executor.run.bind(f.executor);
+      f.executor.run = async (ctx: RunContext) => {
+        fs.writeFileSync(path.join(ctx.worktreePath, "WIP.txt"), "uncommitted\n");
+        return run(ctx);
+      };
+      return f;
+    };
+    const runner = runnerWith(factory, fakeGitlab().gitlab, undefined, undefined, { checkpointIntervalMs: 0, recoveryRetryMs: 1, recovery: realRecovery() });
+    (runner as unknown as Record<string, unknown>).reapRecoveryProviderForSettle = async () => {
+      LATCH(claim.run_id, "reap");
+      return false;
+    };
+    await runner.execute(claim);
+    assert.ok(lastFailed(claim.run_id), "the run failed");
+    assert.equal(fs.readFileSync(path.join(worktreeDirFor(iid), "WIP.txt"), "utf8"), "uncommitted\n", "the uncommitted WIP is kept");
+    assert.equal(fs.existsSync(path.join(worktreeDirFor(iid), "WORK.txt")), true, "the clone is kept");
+    assert.ok(journalOf(iid), "the journal is kept");
+  });
+
+  it("a completed run's publication release still goes out while latched; every other release stays gated", TIMEOUT, async () => {
+    const iid = 22207;
+    const releases: unknown[][] = [];
+    (client as unknown as Record<string, unknown>).releaseRecoveryCustody = async (...a: unknown[]) => {
+      releases.push(a);
+      return { run_id: "x", released: true, holds_released: 1, generation: a[1] };
+    };
+    const claim = gitlabClaim(iid, { claim_generation: 3 });
+    const factory: ExecutorFactory = (runId) => ({
+      homeDir: path.join(homeDir, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          fs.writeFileSync(path.join(ctx.worktreePath, "WORK.txt"), "committed work\n");
+          execFileSync("git", ["-C", ctx.worktreePath, "add", "WORK.txt"], { env: GIT_ENV, stdio: "pipe" });
+          execFileSync("git", ["-C", ctx.worktreePath, ...IDENT, "commit", "-m", "work"], { env: GIT_ENV, stdio: "pipe" });
+          return { branch: ctx.branch, summary: "done" } as unknown as ExecutorResult;
+        },
+      },
+    });
+    // The latch lands as the completed report arrives (the publication already happened).
+    api.onState(claim.run_id, (body) => {
+      if (body.status === "completed") LATCH(claim.run_id, "terminal_drive");
+    });
+    const recovery = realRecovery();
+    await runnerWith(factory, fakeGitlab().gitlab, undefined, undefined, { checkpointIntervalMs: 0, recoveryRetryMs: 1, recovery }).execute(claim);
+    assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"), "the run completed");
+    assert.notEqual(residueQuarantine(), undefined, "the worker is latched");
+    assert.equal(releases.length, 1, "the completed publication release went out exactly once");
+    // Every other caller stays gated.
+    await recovery.release(claim.run_id, 3, "forge_no_output");
+    await recovery.release(claim.run_id, 3);
+    assert.equal(releases.length, 1, "no other release reached the client while latched");
+  });
+
   it("control: the same failure whose reap does not latch settles (the capture reaches the client)", TIMEOUT, async () => {
     const iid = 22202;
     const afterLatch = { on: false };
@@ -695,6 +783,8 @@ describe("a run that fails quarantined archives its committed work and releases 
     assert.deepEqual(spy.clientCalls, [], "no reserve, upload or release client call");
     assert.deepEqual(spy.deletedPins, [], "no recovery pin was deleted");
     assert.ok(fs.readdirSync(path.join(harnessGit.recoveryRoot, claim.run_id)).some((f) => f.endsWith(".json")), "the journal record is kept");
+    assert.ok(fs.existsSync(worktreeDirFor(iid)), "the finalization-failure arm's clone is kept");
+    assert.ok(journalOf(iid), "the clone's ownership journal is kept");
   });
 
   it("a latch during the recovery-exhausted capture fails the run worker_residue_blocked instead of retrying forever", TIMEOUT, async () => {

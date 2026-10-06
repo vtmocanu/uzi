@@ -1054,11 +1054,22 @@ export class RecoveryCoordinator {
    * (they would otherwise leak worker disk forever). The v1 fallback (generation omitted, at most
    * one record) removes the whole run dir. Both recursive sweeps are suppressed when physical
    * terminal protection is present or its callback fails; only an empty-dir rmdir is attempted.
+   *
+   * issue #2213: a latched worker releases no custody (the hold, record and pin stay), with ONE
+   * exception: `opts.completedPublication`, passed only by the runner's completed-run arm
+   * (driveRecoveryTerminal). A completed run's publication already happened before the report (its
+   * push cannot have run while latched), and the release is an in-process api call, not a
+   * credentialed child; refusing it would leave the server hold open forever and turn into a false
+   * early_pin_only_after_restart needs_action after the restart. Every other caller stays gated.
    */
-  async release(runId: string, generation?: number, releaseEvidence?: string): Promise<void> {
+  async release(
+    runId: string,
+    generation?: number,
+    releaseEvidence?: string,
+    opts: { completedPublication?: boolean } = {},
+  ): Promise<void> {
     if (!this.enabled) return;
-    // issue #2213: a latched worker releases no custody; the hold, record and pin stay.
-    if (residueQuarantine() !== undefined) return;
+    if (residueQuarantine() !== undefined && opts.completedPublication !== true) return;
     try {
       const res = await this.client.releaseRecoveryCustody(runId, generation, releaseEvidence);
       this.log.info("recovery: released custody after verified no-unpublished-output", {

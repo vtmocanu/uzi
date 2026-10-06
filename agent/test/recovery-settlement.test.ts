@@ -882,6 +882,26 @@ describe("PredecessorSettler live leg (issue #1751 M2)", () => {
     assert.deepEqual(lg.calls, [`unpin:${RUN}/${HOLD}`]);
   });
 
+  it("issue #2213: a latch landing during the live leg's write-ahead put sends nothing and cleans nothing", async () => {
+    await j.put(adoptedRecord({ live: liveLeg() }));
+    const put = j.put.bind(j);
+    let puts = 0;
+    j.put = async (rec) => {
+      const ok = await put(rec);
+      puts += 1;
+      latchResidueQuarantine({ cause: "c", site: "t" }, nullLogger());
+      return ok;
+    };
+    await settler.settleLive(RUN);
+    assert.equal(puts, 1, "the write-ahead put ran (the latch landed after the entry check)");
+    assert.deepEqual(client.liveCalls, [], "settleRecoveryHoldLive was not called");
+    assert.deepEqual(cleanup.calls, [], "nothing was cleaned up");
+    assert.equal((await one())!.live!.sent, true, "the write-ahead record stays journaled");
+    resetResidueQuarantineForTests();
+    await settler.settleLive(RUN);
+    assert.equal(client.liveCalls.length, 1, "control: unlatched, the same leg is sent");
+  });
+
   it("a released answer naming a DIFFERENT hold never cleans up (backs off)", async () => {
     await j.put(adoptedRecord({ live: liveLeg() }));
     client.liveAnswers = [{ run_id: RUN, hold_id: HOLD2, outcome: "released" }];

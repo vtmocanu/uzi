@@ -3492,6 +3492,12 @@ export class RunRunner {
       // journal — retiring a tree a live process still writes would hand the next attempt a
       // half-removed clone. The Docker half never blocks the retire; it is logged.
       let retireBlocked = false;
+      // issue #2213: the root guard for the worker residue quarantine. Whatever path reached this
+      // finally (a settle that latched mid-await, a reap that returned false, a cancel or shutdown
+      // arm that cleared preserveRecoveryClone), a latched worker keeps the clone and its journal:
+      // the recovery settle could not capture them. Read synchronously here and again after the
+      // quiesce await below, right before the retire decision.
+      if (residueQuarantine() !== undefined) flight.preserveRecoveryClone = true;
       // issue #1783 M2: a CAPTURED predecessor attempt (the C′ flight on a Docker-wired worker) is
       // released IN PLACE — journal cleared (only now that its capture is verified), ledger
       // `abandoned`, NO filesystem operation on its path — and never retired or reused. Its
@@ -3525,6 +3531,7 @@ export class RunRunner {
           });
         }
       }
+      if (residueQuarantine() !== undefined) flight.preserveRecoveryClone = true;
       if (flight.worktreePath && !flight.predecessorCapture && !flight.preserveRecoveryClone && !retireBlocked) {
         try {
           if (flight.barePath && flight.branch) {
@@ -3939,7 +3946,8 @@ export class RunRunner {
     if (err instanceof ResidueQuarantinedError) flight.preserveRecoveryClone = true;
     // issue #2213: a failing run that sees the latch here skips the reap and every settle and keeps
     // its clone and custody until the worker restarts. This is a snapshot: a latch that lands later
-    // is caught by the re-check before each settle below and by settleRecoveryGeneration itself.
+    // is caught by the re-check before each settle below, by settleRecoveryGeneration's entry check,
+    // and, for the clone and journal, by the terminal retire's own latch read in executeClaim's finally.
     const quarantined = residueQuarantine() !== undefined;
     if (quarantined) flight.preserveRecoveryClone = true;
     const rawReason =
@@ -4175,6 +4183,8 @@ export class RunRunner {
   ): Promise<boolean> {
     let rel;
     try {
+      // issue #2213: deliberately NOT gated on the residue quarantine: a pre-clone park has no source
+      // to lose, and holding this custody open would strand the worker custody-held forever.
       rel = await this.client.releaseRecoveryCustody(flight.runId, gen);
     } catch (relErr) {
       runLog.warn(`${copy.log}: exact release call failed; taking the failed path (no park)`, {
@@ -4848,7 +4858,10 @@ export class RunRunner {
             !completedBody.report_only && typeof completedBody.branch === "string" && completedBody.branch !== ""
               ? "publication"
               : undefined;
-          await this.recovery.release(claim.run_id, claim.claim_generation, releaseEvidence);
+          // issue #2213: the completed-run publication release is the one release a latched worker still sends.
+          await this.recovery.release(claim.run_id, claim.claim_generation, releaseEvidence, {
+            completedPublication: true,
+          });
         } else if (status === "failed" || status === "cancelled") {
           const capBarePath = flight.barePath;
           if (!capBarePath) return;
@@ -12025,9 +12038,10 @@ export class RunRunner {
     if (!isCodePublishingKind(resolveRunKind(claim.kind))) return;
     const barePath = flight.barePath;
     if (!barePath) return;
-    // issue #2213: a latched worker transfers, pins, uploads and deletes nothing here; the clone,
-    // journal are kept for the restart. Every settle caller reaches this check, whatever
-    // it tested earlier, so a latch that landed during an await cannot reach the retire.
+    // issue #2213: a latched worker transfers, pins, uploads and deletes nothing here; the clone
+    // and journal are kept for the restart. This is an ENTRY check only: a latch that lands during
+    // a later await in this method is caught by the terminal clone retire's own residueQuarantine()
+    // read in executeClaim's finally, not here.
     if (residueQuarantine() !== undefined) {
       flight.preserveRecoveryClone = true;
       return;
