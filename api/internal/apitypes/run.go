@@ -186,8 +186,10 @@ type RunDTO struct {
 	// run is in its pre-approval PLANNING turn (status running, iteration_count 0, no
 	// persisted plan yet; chat/judge excluded). Derived, not stored — no new column or
 	// status value. A pre-feature api pod omits it; absent reads as not-planning.
-	IsPlanning  bool `json:"is_planning"`
-	AutoApprove bool `json:"auto_approve"`
+	IsPlanning                bool     `json:"is_planning"`
+	AutoApprove               bool     `json:"auto_approve"`
+	AutoApproveBlockedReasons []string `json:"auto_approve_blocked_reasons"`
+	IssueInputReason          *string  `json:"issue_input_reason"`
 	// TriggerSource records what/how/who started the run (issue #857): one of
 	// manual, autopilot, schedule, self_improve, ci_fix, mr_rework, chat, task,
 	// task_review, then_fix, judge, judge_rerun, resume. Always set (NOT NULL column,

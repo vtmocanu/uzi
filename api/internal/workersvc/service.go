@@ -35,6 +35,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/planpolicy"
@@ -5619,6 +5620,11 @@ type ForgeConn struct {
 	// unmarshal it into a ReviewCommentsSnapshot and reject any reply/resolve id not
 	// present in it (the Decision-11 server-side scope check).
 	ReviewComments []byte
+	IssueIID       *int64
+	SavedTitle     string
+	SavedBody      string
+	RawDigest      *string
+	InputReason    string
 }
 
 // ForgeConnForRun authorizes a worker's forge read against a run it holds and returns
@@ -5649,6 +5655,20 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 	// PRD #700 M4: carry the run's source mr_iid and raw review-comments snapshot from
 	// the SAME owned run read, so the mr_rework write-back endpoints can enforce the
 	// Decision-11 scope check without a second (unscoped) run read.
+	var issueIID *int64
+	if run.Kind == runkind.Issue && run.IssueIid.Valid {
+		v := run.IssueIid.Int64
+		issueIID = &v
+	}
+	var digest *string
+	if run.IssueRawDigest.Valid {
+		v := run.IssueRawDigest.String
+		digest = &v
+	}
+	body := run.IssueDescription
+	if run.IssueSavedBody.Valid {
+		body = run.IssueSavedBody.String
+	}
 	var mrIID *int64
 	if run.MrIid.Valid {
 		v := run.MrIid.Int64
@@ -5662,6 +5682,7 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 		BotForgeUserID:  row.BotForgeUserID,
 		MRIID:           mrIID,
 		ReviewComments:  run.ReviewComments,
+		IssueIID:        issueIID, SavedTitle: run.IssueTitle, SavedBody: body, RawDigest: digest, InputReason: run.IssueInputReason.String,
 	}, nil
 }
 
@@ -6410,13 +6431,15 @@ func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoI
 	// false force (issue #856): a scheduled autopilot run never bypasses the open-MR dedup.
 	// credOverride: the schedule's stored override; explicit: the schedule's pinned harness
 	// (nil ⇒ implicit D11 at fire time), PRD #1429 M2.
-	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false /*force*/, nil /*seed*/, credOverride, explicit, nil /*rawOverride*/)
+	return s.createRun(context.WithValue(ctx, scheduleApprovalKey{}, true), userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false /*force*/, nil /*seed*/, credOverride, explicit, nil /*rawOverride*/)
 }
 
 // SeededPlan carries a create-time externally-authored plan and its optional agent
 // selection (PRD #209). A run created with a SeededPlan skips the Phase-1 planning
 // turn and the approval gate: the worker implements PlanMD directly. Nil for an
 // ordinary run planned from the issue alone.
+type scheduleApprovalKey struct{}
+
 type SeededPlan struct {
 	// PlanMD is the externally-authored plan. Untrusted input (D5): capped and
 	// secret-scrubbed before storage, and an empty/whitespace plan is rejected (D8).
@@ -6626,20 +6649,55 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	if fixing > 0 {
 		return store.Run{}, ErrBranchInUse
 	}
-	// PRD #381: snapshot the issue's human comments alongside the description. One
-	// extra forge round-trip, centralized here so every issue-backed origin (manual,
-	// autopilot, scheduled) captures it (D6) without rippling the Create*Run seam.
-	// Best-effort: a forge glitch, a nil forge builder (tests), or an unknown bot id
-	// (D9) all degrade to a NULL snapshot rather than failing run creation.
+	// Capture issue fields and assessed comments once for every issue-backed origin.
+	// A nil builder supports manual test fixtures; unattended schedules remain blocked.
 	var issueCommentsJSON []byte
-	if s.forges != nil {
-		if snap := s.fetchIssueCommentsSnapshot(ctx, row, issueIID); snap != nil {
-			if b, err := json.Marshal(snap); err != nil {
-				slog.Error("workersvc: marshal issue comments snapshot", "issue_iid", issueIID, "error", err)
-			} else {
-				issueCommentsJSON = b
+	capture := issueinput.FromContext(ctx, row.ForgeProjectID, issueIID)
+	handedOff := capture != nil
+	if capture == nil && s.forges != nil {
+		f, ferr := s.forges.ForgeForConnection(row.ForgeType, row.BaseUrl, row.TokenCiphertext)
+		if ferr != nil {
+			return store.Run{}, ErrForgeBuild
+		}
+		capture, err = issueinput.Fetch(ctx, f, row.ForgeProjectID, issueIID, row.BotForgeUserID)
+		if err != nil {
+			return store.Run{}, ErrForgeIssueRead
+		}
+	}
+	savedBody, rawDigest, inputReason := pgtype.Text{}, pgtype.Text{}, pgtype.Text{}
+	blockedReasons := []string{}
+	title := issue.Title
+	if capture != nil {
+		title = capture.Issue.Title
+		savedBody = pgconv.Text(capture.Issue.Description)
+		rawDigest = pgconv.Text(capture.Digest)
+		inputReason = pgconv.TextOrNull(capture.Reason)
+		// Only scheduler guidance composed from this capture may supplement it.
+		if _, scheduled := ctx.Value(scheduleApprovalKey{}).(bool); !handedOff || (!scheduled && triggerSource != "schedule") {
+			description = capture.Issue.Description
+		}
+		issueCommentsJSON, err = json.Marshal(capture.Thread)
+		if err != nil {
+			return store.Run{}, err
+		}
+		if requested, _ := ctx.Value(scheduleApprovalKey{}).(bool); requested && autoApprove {
+			blockedReasons = capture.Reasons()
+			if len(blockedReasons) != 0 {
+				autoApprove = false
 			}
 		}
+	}
+	if capture == nil {
+		if requested, _ := ctx.Value(scheduleApprovalKey{}).(bool); requested && autoApprove {
+			autoApprove = false
+			blockedReasons = []string{issueinput.Unknown}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return store.Run{}, err
+	}
+	if len(description) > MaxIssueDescriptionBytes {
+		return store.Run{}, ErrDescriptionTooLarge
 	}
 	// PRD #1226 M1 (D1), #1626: stamp the run as INTERLOCKED before its first claim when the
 	// completion-interlock switch is on (default ON; an explicit "false" row is the
@@ -6720,13 +6778,17 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			completionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
 		}
 		return q.CreateRun(ctx, store.CreateRunParams{
-			UserID:           userID,
-			RepoID:           repoID,
-			IssueIid:         pgtype.Int8{Int64: issueIID, Valid: true},
-			IssueTitle:       issue.Title,
-			IssueDescription: description,
-			OriginColumn:     originColumn,
-			AutoApprove:      autoApprove,
+			UserID:                    userID,
+			RepoID:                    repoID,
+			IssueIid:                  pgtype.Int8{Int64: issueIID, Valid: true},
+			IssueTitle:                title,
+			IssueDescription:          description,
+			IssueSavedBody:            savedBody,
+			IssueRawDigest:            rawDigest,
+			IssueInputReason:          inputReason,
+			AutoApproveBlockedReasons: blockedReasons,
+			OriginColumn:              originColumn,
+			AutoApprove:               autoApprove,
 			// PRD #35 Decision 7. Stamped at creation from the owner's default (or the
 			// caller's explicit choice), never read from users at park time: a run must
 			// keep the behaviour it was created with, so flipping the default later cannot
@@ -6796,24 +6858,6 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	s.notify(run.ID, "queued")
 	logRunCreated(run)
 	return run, nil
-}
-
-// fetchIssueCommentsSnapshot builds a forge driver from the run's repo connection,
-// reads the issue's comments, and returns the filtered/capped snapshot (PRD #381).
-// Returns nil (→ NULL) on any error or when the D1/D9 filter leaves nothing — a
-// comment snapshot is best-effort run CONTEXT, never a reason to fail creation.
-func (s *Service) fetchIssueCommentsSnapshot(ctx context.Context, row store.GetRepoForUserRow, issueIID int64) *IssueCommentsSnapshot {
-	f, err := s.forges.ForgeForConnection(row.ForgeType, row.BaseUrl, row.TokenCiphertext)
-	if err != nil {
-		slog.Error("workersvc: build forge for issue comments", "issue_iid", issueIID, "error", err)
-		return nil
-	}
-	comments, err := f.ListIssueComments(ctx, row.ForgeProjectID, issueIID)
-	if err != nil {
-		slog.Error("workersvc: list issue comments", "issue_iid", issueIID, "error", err) // err is PAT-redacted by the driver
-		return nil
-	}
-	return buildIssueCommentsSnapshot(comments, row.BotForgeUserID)
 }
 
 // uziLabel resolves the configured run-eligibility label (PRD #764 M1), falling back

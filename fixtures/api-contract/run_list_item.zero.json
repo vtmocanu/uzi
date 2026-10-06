@@ -15,6 +15,8 @@
   "iteration_count": 0,
   "is_planning": false,
   "auto_approve": false,
+  "auto_approve_blocked_reasons": null,
+  "issue_input_reason": null,
   "trigger_source": "",
   "milestones": null,
   "milestones_candidate": null,

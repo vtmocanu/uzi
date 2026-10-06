@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -208,7 +209,7 @@ func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID,
 	if err != nil {
 		return store.Run{}, fmt.Errorf("%w: %v", ErrForgeBuild, err)
 	}
-	issue, err := f.GetIssue(ctx, repo.ForgeProjectID, issueIID)
+	capture, err := issueinput.Fetch(ctx, f, repo.ForgeProjectID, issueIID, repo.BotForgeUserID)
 	if err != nil {
 		// err is already PAT-redacted by the driver.
 		return store.Run{}, fmt.Errorf("%w: %v", ErrForgeIssueRead, err)
@@ -220,7 +221,7 @@ func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID,
 	// credential override (D5). Both are threaded straight into CreateRun, which resolves D11 and
 	// validates the override INSIDE the create transaction against the resolved harness — the old
 	// pre-transaction effective-harness guess is gone. The web board / chat start card pass nil/nil.
-	return s.CreateRun(ctx, userID, repo.ID, issueIID, issue.Description, waitOnLimit, mrReworkEnabled, force, seed, explicit, rawOverride)
+	return s.CreateRun(issueinput.WithCapture(ctx, capture), userID, repo.ID, issueIID, capture.Issue.Description, waitOnLimit, mrReworkEnabled, force, seed, explicit, rawOverride)
 }
 
 // StartRunForUserByPath is StartRunForUser keyed by the human repo PATH the chat

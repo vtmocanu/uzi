@@ -277,6 +277,7 @@ var runDTOKeys = []string{
 	// permanently refused the terminal report ({reason} object or null). Non-omitempty,
 	// overlaid on the single-run detail read only.
 	"outcome_pending",
+	"auto_approve_blocked_reasons", "issue_input_reason",
 }
 
 func TestRunDTOTags(t *testing.T) {

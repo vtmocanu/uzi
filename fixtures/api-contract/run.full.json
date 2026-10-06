@@ -15,6 +15,10 @@
   "iteration_count": 1,
   "is_planning": true,
   "auto_approve": true,
+  "auto_approve_blocked_reasons": [
+    "x"
+  ],
+  "issue_input_reason": "x",
   "trigger_source": "x",
   "milestones": [
     {

@@ -106,6 +106,9 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		// and still carries the raw enum (machine-facing, D1).
 		{"HEALTH", displayHealth(r.Health)},
 	}
+	if len(r.AutoApproveBlockedReasons) > 0 {
+		rows = append(rows, []string{"AUTO_APPROVE_BLOCKED", strings.Join(r.AutoApproveBlockedReasons, ", ")})
+	}
 	// DEADLINE (PRD #1170): the run's wall-clock stop time and countdown, emitted only when
 	// the server set a deadline (a running issue run) — right after HEALTH, and emit-only-
 	// when-set like HEALTH_REASON below, so a chat/judge/non-running run prints no new row.

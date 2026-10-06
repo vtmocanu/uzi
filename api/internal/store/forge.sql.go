@@ -358,6 +358,7 @@ SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_
        -- PRD #1497 M1: budget_finalize_seconds is the third RunDeadline term; hold_reason lets the
        -- board badge render a wall park ('budget_exhausted') as needing the owner.
        r.budget_finalize_seconds, r.hold_reason,
+       r.auto_approve_blocked_reasons,
        r.created_at, r.updated_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER () AS run_count
@@ -375,35 +376,36 @@ type GetLatestRunForIssueParams struct {
 }
 
 type GetLatestRunForIssueRow struct {
-	ID                     uuid.UUID          `json:"id"`
-	UserID                 uuid.UUID          `json:"user_id"`
-	Status                 string             `json:"status"`
-	MrIid                  pgtype.Int8        `json:"mr_iid"`
-	MrWebUrl               pgtype.Text        `json:"mr_web_url"`
-	MrState                pgtype.Text        `json:"mr_state"`
-	FailureReason          pgtype.Text        `json:"failure_reason"`
-	StopKind               pgtype.Text        `json:"stop_kind"`
-	StopReason             pgtype.Text        `json:"stop_reason"`
-	Kind                   string             `json:"kind"`
-	IterationCount         int32              `json:"iteration_count"`
-	HasPlanMd              pgtype.Bool        `json:"has_plan_md"`
-	Health                 string             `json:"health"`
-	HealthReason           pgtype.Text        `json:"health_reason"`
-	HealthSince            pgtype.Timestamptz `json:"health_since"`
-	StartedAt              pgtype.Timestamptz `json:"started_at"`
-	FirstStartedAt         pgtype.Timestamptz `json:"first_started_at"`
-	FinishedAt             pgtype.Timestamptz `json:"finished_at"`
-	BudgetWallSeconds      pgtype.Int4        `json:"budget_wall_seconds"`
-	BudgetPausedSeconds    int32              `json:"budget_paused_seconds"`
-	Interactive            bool               `json:"interactive"`
-	BudgetExtensionSeconds int32              `json:"budget_extension_seconds"`
-	BudgetFinalizeSeconds  int32              `json:"budget_finalize_seconds"`
-	HoldReason             pgtype.Text        `json:"hold_reason"`
-	CreatedAt              pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
-	OwnerName              pgtype.Text        `json:"owner_name"`
-	WorkerName             pgtype.Text        `json:"worker_name"`
-	RunCount               int64              `json:"run_count"`
+	ID                        uuid.UUID          `json:"id"`
+	UserID                    uuid.UUID          `json:"user_id"`
+	Status                    string             `json:"status"`
+	MrIid                     pgtype.Int8        `json:"mr_iid"`
+	MrWebUrl                  pgtype.Text        `json:"mr_web_url"`
+	MrState                   pgtype.Text        `json:"mr_state"`
+	FailureReason             pgtype.Text        `json:"failure_reason"`
+	StopKind                  pgtype.Text        `json:"stop_kind"`
+	StopReason                pgtype.Text        `json:"stop_reason"`
+	Kind                      string             `json:"kind"`
+	IterationCount            int32              `json:"iteration_count"`
+	HasPlanMd                 pgtype.Bool        `json:"has_plan_md"`
+	Health                    string             `json:"health"`
+	HealthReason              pgtype.Text        `json:"health_reason"`
+	HealthSince               pgtype.Timestamptz `json:"health_since"`
+	StartedAt                 pgtype.Timestamptz `json:"started_at"`
+	FirstStartedAt            pgtype.Timestamptz `json:"first_started_at"`
+	FinishedAt                pgtype.Timestamptz `json:"finished_at"`
+	BudgetWallSeconds         pgtype.Int4        `json:"budget_wall_seconds"`
+	BudgetPausedSeconds       int32              `json:"budget_paused_seconds"`
+	Interactive               bool               `json:"interactive"`
+	BudgetExtensionSeconds    int32              `json:"budget_extension_seconds"`
+	BudgetFinalizeSeconds     int32              `json:"budget_finalize_seconds"`
+	HoldReason                pgtype.Text        `json:"hold_reason"`
+	AutoApproveBlockedReasons []string           `json:"auto_approve_blocked_reasons"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
+	OwnerName                 pgtype.Text        `json:"owner_name"`
+	WorkerName                pgtype.Text        `json:"worker_name"`
+	RunCount                  int64              `json:"run_count"`
 }
 
 // One issue's newest run with the same display fields as the board lateral join,
@@ -441,6 +443,7 @@ func (q *Queries) GetLatestRunForIssue(ctx context.Context, arg GetLatestRunForI
 		&i.BudgetExtensionSeconds,
 		&i.BudgetFinalizeSeconds,
 		&i.HoldReason,
+		&i.AutoApproveBlockedReasons,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.OwnerName,
@@ -1006,6 +1009,7 @@ SELECT DISTINCT ON (r.issue_iid)
        -- PRD #1497 M1: budget_finalize_seconds is the third RunDeadline term; hold_reason lets the
        -- board badge render a wall park ('budget_exhausted') as needing the owner.
        r.budget_finalize_seconds, r.hold_reason,
+       r.auto_approve_blocked_reasons,
        r.created_at, r.updated_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER (PARTITION BY r.issue_iid) AS run_count
@@ -1017,36 +1021,37 @@ ORDER BY r.issue_iid, r.created_at DESC
 `
 
 type ListLatestRunsForRepoRow struct {
-	IssueIid               pgtype.Int8        `json:"issue_iid"`
-	ID                     uuid.UUID          `json:"id"`
-	UserID                 uuid.UUID          `json:"user_id"`
-	Status                 string             `json:"status"`
-	MrIid                  pgtype.Int8        `json:"mr_iid"`
-	MrWebUrl               pgtype.Text        `json:"mr_web_url"`
-	MrState                pgtype.Text        `json:"mr_state"`
-	FailureReason          pgtype.Text        `json:"failure_reason"`
-	StopKind               pgtype.Text        `json:"stop_kind"`
-	StopReason             pgtype.Text        `json:"stop_reason"`
-	Kind                   string             `json:"kind"`
-	IterationCount         int32              `json:"iteration_count"`
-	HasPlanMd              pgtype.Bool        `json:"has_plan_md"`
-	Health                 string             `json:"health"`
-	HealthReason           pgtype.Text        `json:"health_reason"`
-	HealthSince            pgtype.Timestamptz `json:"health_since"`
-	StartedAt              pgtype.Timestamptz `json:"started_at"`
-	FirstStartedAt         pgtype.Timestamptz `json:"first_started_at"`
-	FinishedAt             pgtype.Timestamptz `json:"finished_at"`
-	BudgetWallSeconds      pgtype.Int4        `json:"budget_wall_seconds"`
-	BudgetPausedSeconds    int32              `json:"budget_paused_seconds"`
-	Interactive            bool               `json:"interactive"`
-	BudgetExtensionSeconds int32              `json:"budget_extension_seconds"`
-	BudgetFinalizeSeconds  int32              `json:"budget_finalize_seconds"`
-	HoldReason             pgtype.Text        `json:"hold_reason"`
-	CreatedAt              pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
-	OwnerName              pgtype.Text        `json:"owner_name"`
-	WorkerName             pgtype.Text        `json:"worker_name"`
-	RunCount               int64              `json:"run_count"`
+	IssueIid                  pgtype.Int8        `json:"issue_iid"`
+	ID                        uuid.UUID          `json:"id"`
+	UserID                    uuid.UUID          `json:"user_id"`
+	Status                    string             `json:"status"`
+	MrIid                     pgtype.Int8        `json:"mr_iid"`
+	MrWebUrl                  pgtype.Text        `json:"mr_web_url"`
+	MrState                   pgtype.Text        `json:"mr_state"`
+	FailureReason             pgtype.Text        `json:"failure_reason"`
+	StopKind                  pgtype.Text        `json:"stop_kind"`
+	StopReason                pgtype.Text        `json:"stop_reason"`
+	Kind                      string             `json:"kind"`
+	IterationCount            int32              `json:"iteration_count"`
+	HasPlanMd                 pgtype.Bool        `json:"has_plan_md"`
+	Health                    string             `json:"health"`
+	HealthReason              pgtype.Text        `json:"health_reason"`
+	HealthSince               pgtype.Timestamptz `json:"health_since"`
+	StartedAt                 pgtype.Timestamptz `json:"started_at"`
+	FirstStartedAt            pgtype.Timestamptz `json:"first_started_at"`
+	FinishedAt                pgtype.Timestamptz `json:"finished_at"`
+	BudgetWallSeconds         pgtype.Int4        `json:"budget_wall_seconds"`
+	BudgetPausedSeconds       int32              `json:"budget_paused_seconds"`
+	Interactive               bool               `json:"interactive"`
+	BudgetExtensionSeconds    int32              `json:"budget_extension_seconds"`
+	BudgetFinalizeSeconds     int32              `json:"budget_finalize_seconds"`
+	HoldReason                pgtype.Text        `json:"hold_reason"`
+	AutoApproveBlockedReasons []string           `json:"auto_approve_blocked_reasons"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
+	OwnerName                 pgtype.Text        `json:"owner_name"`
+	WorkerName                pgtype.Text        `json:"worker_name"`
+	RunCount                  int64              `json:"run_count"`
 }
 
 // The board payload's run half (PRD #12 M2): the newest run per issue for a repo,
@@ -1101,6 +1106,7 @@ func (q *Queries) ListLatestRunsForRepo(ctx context.Context, repoID uuid.UUID) (
 			&i.BudgetExtensionSeconds,
 			&i.BudgetFinalizeSeconds,
 			&i.HoldReason,
+			&i.AutoApproveBlockedReasons,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.OwnerName,

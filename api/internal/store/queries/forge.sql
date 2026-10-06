@@ -518,6 +518,7 @@ SELECT DISTINCT ON (r.issue_iid)
        -- PRD #1497 M1: budget_finalize_seconds is the third RunDeadline term; hold_reason lets the
        -- board badge render a wall park ('budget_exhausted') as needing the owner.
        r.budget_finalize_seconds, r.hold_reason,
+       r.auto_approve_blocked_reasons,
        r.created_at, r.updated_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER (PARTITION BY r.issue_iid) AS run_count
@@ -550,6 +551,7 @@ SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_
        -- PRD #1497 M1: budget_finalize_seconds is the third RunDeadline term; hold_reason lets the
        -- board badge render a wall park ('budget_exhausted') as needing the owner.
        r.budget_finalize_seconds, r.hold_reason,
+       r.auto_approve_blocked_reasons,
        r.created_at, r.updated_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER () AS run_count

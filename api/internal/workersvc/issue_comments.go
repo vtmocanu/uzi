@@ -25,6 +25,7 @@ type IssueCommentSnapshot struct {
 	AuthorForgeUserID int64     `json:"author_forge_user_id"`
 	CreatedAt         time.Time `json:"created_at"`
 	Body              string    `json:"body"`
+	Reason            string    `json:"reason,omitempty"`
 }
 
 // IssueCommentsSnapshot is the structured JSONB stored in runs.issue_comments and
@@ -32,6 +33,9 @@ type IssueCommentSnapshot struct {
 // bounds: older comments dropped by the count or byte cap, or a single over-cap
 // newest body trimmed in place — i.e. the agent is not seeing the whole thread.
 type IssueCommentsSnapshot struct {
+	Version   int                    `json:"version,omitempty"`
+	Withheld  bool                   `json:"withheld,omitempty"`
+	Unknown   bool                   `json:"unknown,omitempty"`
 	Comments  []IssueCommentSnapshot `json:"comments"`
 	Truncated bool                   `json:"truncated"`
 }

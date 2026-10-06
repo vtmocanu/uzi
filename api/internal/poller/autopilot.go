@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -204,14 +205,14 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 	// cached-PRD-issue, PRD-link and one-active-run gates all enforced there), only
 	// with auto_approve set. The description is the fresh forge copy, snapshotted onto
 	// the run exactly as the manual start path snapshots the description it is given.
-	issue, err := f.GetIssue(ctx, r.ForgeProjectID, iid)
+	capture, err := issueinput.Fetch(ctx, f, r.ForgeProjectID, iid, cc.BotForgeUserID)
 	if err != nil {
 		// Transient forge error: leave the event unrecorded so the next tick retries.
 		slog.Warn("poller: autopilot fetch issue", "repo", r.PathWithNamespace, "issue", iid, "error", err)
 		return
 	}
 
-	_, err = a.runs.CreateAutopilotRun(ctx, cc.UserID, r.ID, iid, issue.Description)
+	_, err = a.runs.CreateAutopilotRun(issueinput.WithCapture(ctx, capture), cc.UserID, r.ID, iid, capture.Issue.Description)
 	switch {
 	case err == nil:
 		// Create-then-record: a crash before recording leaves the created run active,

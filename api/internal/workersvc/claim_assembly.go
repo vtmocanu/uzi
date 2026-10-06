@@ -17,6 +17,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
@@ -460,6 +461,38 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		if err := json.Unmarshal(run.IssueComments, &snap); err != nil {
 			slog.Error("workersvc: decode run issue comments", "run_id", run.ID, "error", err)
 		} else {
+			// Legacy snapshots have no permission classification. Never refetch or
+			// unlock their bodies during claim/resume.
+			if snap.Version != issueinput.SnapshotVersion {
+				snap.Unknown = true
+				for i := range snap.Comments {
+					snap.Comments[i].Body = issueinput.Placeholder
+					snap.Comments[i].Reason = issueinput.Unknown
+				}
+			}
+			if len(snap.Comments) > maxIssueCommentsCount {
+				snap.Comments = snap.Comments[len(snap.Comments)-maxIssueCommentsCount:]
+				snap.Truncated = true
+			}
+			total := 0
+			start := len(snap.Comments)
+			for i := len(snap.Comments) - 1; i >= 0; i-- {
+				if total+len(snap.Comments[i].Body) > maxIssueCommentsBytes {
+					if start == len(snap.Comments) {
+						snap.Comments[i].Body = truncateCommentBody(snap.Comments[i].Body)
+						start = i
+					}
+					snap.Truncated = true
+					break
+				}
+				total += len(snap.Comments[i].Body)
+				start = i
+			}
+			snap.Comments = snap.Comments[start:]
+			for i := range snap.Comments {
+				snap.Comments[i].AuthorUsername = issueinput.AuthorName(snap.Comments[i].AuthorUsername)
+			}
+			snap.Version = issueinput.SnapshotVersion
 			issueComments = &snap
 		}
 	}

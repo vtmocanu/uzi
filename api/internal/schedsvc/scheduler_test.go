@@ -508,7 +508,18 @@ type fakeForge struct {
 
 func (f *fakeForge) GetIssue(_ context.Context, _ int64, iid int64) (forge.Issue, error) {
 	f.getIID = append(f.getIID, iid)
-	return f.issue, f.err
+	issue := f.issue
+	issue.IID = iid
+	if issue.AuthorForgeUserID == 0 {
+		issue.AuthorForgeUserID = 2
+	}
+	return issue, f.err
+}
+func (f *fakeForge) ListIssueComments(context.Context, int64, int64) ([]forge.IssueComment, error) {
+	return nil, nil
+}
+func (f *fakeForge) RepositoryAuthorEligibility(context.Context, int64, int64) (forge.AuthorEligibility, error) {
+	return forge.AuthorEligible, nil
 }
 func (f *fakeForge) ListIssues(_ context.Context, _ int64, _ forge.ListIssuesOptions) ([]forge.Issue, error) {
 	f.listCount++
