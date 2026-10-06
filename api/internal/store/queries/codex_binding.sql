@@ -346,14 +346,13 @@ WHERE runs.id = @id AND runs.status = 'recovery_wait' AND runs.recovery_wait_cau
 -- PRD #1147 F7 (defense-in-depth) extends the same revoke to the park/promote paths that
 -- likewise leave a run without a live owner: RequeueClaimAssemblyExact (claimed→pool_wait hold),
 -- PromotePoolWaitRun (pool_wait→queued), and PromoteLimitWaitRuns (limit_wait→queued).
--- SetRunLimitWait is INTENTIONALLY EXCLUDED: limit_wait is an actively-claimed status that
--- keeps its live capability by design (persist-before-park), so revoking there would strip
--- a run that still legitimately holds its claim.
+-- SetRunLimitWait also revokes atomically at park: boundary reconciliation has already
+-- persisted recovery material, and the parked flight must no longer spend credentials.
 --
 -- STATUS GUARD (PRD #1147): the mint is additionally gated on the run being in one of the
 -- actively-claimed statuses ('claimed','running','awaiting_approval','awaiting_input',
--- 'awaiting_followup','limit_wait'), the exact set of codexActivelyClaimedStatuses in
--- codexauthz.go. It EXCLUDES the non-executing states (queued/pool_wait and the terminals):
+-- 'awaiting_followup'). The authorization status map in codexauthz.go additionally
+-- admits revoked parks; their hash and epoch deny credential operations. It EXCLUDES the non-executing states (queued/pool_wait and the terminals):
 -- a run requeued out from under the worker (RequeueClaimedRunToQueued / SweepClaimedNeverStarted
 -- in runtime.sql clear the cap + bump the epoch but RETAIN worker_id) would otherwise still
 -- match on worker_id and let the departed worker re-mint a fresh capability. Closing this
@@ -375,7 +374,7 @@ WHERE id = @id AND worker_id = @worker_id
   AND claim_generation = @claim_generation
   AND status IN (
       'claimed', 'running', 'awaiting_approval',
-      'awaiting_input', 'awaiting_followup', 'limit_wait'
+      'awaiting_input', 'awaiting_followup'
   )
 RETURNING codex_claim_epoch;
 

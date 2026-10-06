@@ -2511,7 +2511,7 @@ UPDATE runs SET
 WHERE id = @id AND plan_md = @expected_plan_md;
 
 -- name: SetRunLimitWait :execrows
--- Park a run until the owner's exhausted Anthropic usage window reopens (PRD #35
+-- Park a run until the owner's exhausted provider usage window reopens (PRD #35
 -- M2). running → limit_wait, non-terminal: the run keeps its issue, its session,
 -- its worker affinity and its message history, and the sweeper promotes it back to
 -- queued once retry_not_before passes.
@@ -2580,6 +2580,9 @@ UPDATE runs SET
     rate_limit_type      = sqlc.narg('rate_limit_type'),
     retry_not_before     = @retry_not_before,
     limit_wait_count     = limit_wait_count + 1,
+    -- Boundary reconcile precedes park; revoke this Codex flight atomically.
+    codex_cap_hash       = CASE WHEN harness = 'codex' THEN NULL ELSE codex_cap_hash END,
+    codex_claim_epoch    = CASE WHEN harness = 'codex' THEN codex_claim_epoch + 1 ELSE codex_claim_epoch END,
     limit_dead_secret_id = sqlc.narg('limit_dead_secret_id'),
     session_id           = COALESCE(sqlc.narg('session_id'), session_id),
     health = 'ok', health_reason = NULL, health_since = NULL,

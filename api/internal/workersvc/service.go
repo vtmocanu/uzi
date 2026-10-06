@@ -4558,7 +4558,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// cancel/cap-fail, failForgeUnsettleable returns no row at all, and `owned` is
 			// unlocked. A normal park re-reads as recovery_wait and leaves the row pending.
 			if s.txBeginner == nil {
-				rows, err = s.failForgeUnsettleable(ctx, wkr, runID, req, sessionID)
+				rows, err = s.failForgeUnsettleable(ctx, wkr, runID, owned.Harness, req, sessionID)
 				break
 			}
 			var frun store.Run
@@ -4656,7 +4656,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// for a generation-less one, where the single statement is what keeps the two
 			// writes together. rows counts transitioned runs, exactly as SetRunFailed's did.
 			rows, err = q.SetRunFailedPlanRejected(ctx, store.SetRunFailedPlanRejectedParams{
-				FailureReason:  limitAwareFailureReason(req),
+				FailureReason:  limitAwareFailureReason(owned.Harness, req),
 				FailOrigin:     pgconv.TextOrNull("plan_rejected"),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
@@ -4705,7 +4705,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				// compromised worker cannot smuggle a non-enum rate_limit_type past the
 				// server" would then be false on exactly the path a human reads. When the
 				// fields are absent this is nil and every other failure path is untouched.
-				FailureReason:  limitAwareFailureReason(req),
+				FailureReason:  limitAwareFailureReason(owned.Harness, req),
 				FailOrigin:     pgconv.TextOrNull(failOrigin),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
