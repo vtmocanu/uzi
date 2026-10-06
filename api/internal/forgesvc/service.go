@@ -614,9 +614,12 @@ func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProject
 		return s.q.RemoveCachedIssueLabel(ctx, store.RemoveCachedIssueLabelParams{RepoID: issue.RepoID, ForgeIssueIid: issue.ForgeIssueIid, Label: label})
 	}
 
-	// Incremental cache update on success only: add/remove the one label on the
-	// current set (order preserved, every other label kept), never an overwrite
-	// computed from a possibly-stale snapshot.
+	// Apply path, on forge success only: the cache labels are rewritten from the
+	// caller's snapshot (`current`) plus this label via UpsertIssueLabels. Unlike the
+	// remove path above (RemoveCachedIssueLabel, which filters the current row
+	// atomically), this IS an overwrite computed from a possibly-stale snapshot: a
+	// concurrent label change between the caller's read and this write can be lost
+	// until the next sync re-reads the forge.
 	next := append(append([]string{}, current...), label)
 	labelsJSON, err := json.Marshal(next)
 	if err != nil {
