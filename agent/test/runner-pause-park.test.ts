@@ -223,6 +223,7 @@ describe("RunRunner — owner-requested pause park (PRD #1190 M2)", () => {
     const branch = "agent/issue-1935";
     const bare = await git.ensureClone(fx.originPath);
     const seed = await git.runnerCloneForBranch(bare, branch, "issue-1935", noProofReseed, claim.run_id);
+    assert.ok(seed.defaultBranchCommit);
     commitInTree(seed.path, "WORK.txt", "generation 1 work\n");
     const h = execFileSync("git", ["-C", seed.path, "rev-parse", "HEAD"], { env: GIT_ENV }).toString().trim();
     const result = await git.fetchAgentBranch(bare, seed.path, branch, claim.run_id, {
