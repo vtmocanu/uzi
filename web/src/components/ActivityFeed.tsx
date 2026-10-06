@@ -2,6 +2,7 @@ import { planCheckEventText } from "./PlanCrossCheck";
 import type { PlanCrossCheckSummary } from "../lib/apiTypes";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Run, RunMessage } from "../lib/api";
+import { usageLimitPhrase } from "../lib/limitWait";
 import { formatTokens } from "../lib/formatTokens";
 import { prefs } from "../lib/prefs";
 import { stripUnsafeChars } from "../lib/safeText";
@@ -877,9 +878,9 @@ export function ActivityFeed({
                   // the region fires once, at the park, and the run view's countdown
                   // is the surface that stays true as the clock moves.
                   meaningful.kind === "limit_wait"
-                  ? "Run paused on an Anthropic usage limit"
+                  ? `Run paused on ${usageLimitPhrase(run.harness)}`
                   : meaningful.kind === "limit_hit"
-                    ? "Run hit an Anthropic usage limit"
+                    ? `Run hit ${usageLimitPhrase(run.harness)}`
                     : // Fixed phrase, matching the limit_* treatment: the steer_ack
                       // payload is worker-authored, and this is read aloud out of
                       // context, so it interpolates nothing from the payload.
@@ -892,7 +893,7 @@ export function ActivityFeed({
     seen.terminal = terminal;
 
     if (next !== null) setAnnouncement(truncate(next, ANNOUNCE_MAX));
-  }, [messages, activeAgent, terminal, run.plan_cross_check_summary]);
+  }, [messages, activeAgent, terminal, run.plan_cross_check_summary, run.harness]);
 
   const anchored = new Set<string>();
 
@@ -1081,6 +1082,7 @@ export function ActivityFeed({
           {byAgent
             ? lanes.map((l) => (
                 <AgentBlock
+                  harness={run.harness}
                   key={l.key}
                   anchorId={`agent-anchor-${l.key}`}
                   bodyId={`agent-body-${l.messages[0]?.seq ?? 0}`}
@@ -1125,6 +1127,7 @@ export function ActivityFeed({
                 if (firstBlock) anchored.add(g.agent);
                 return (
                   <AgentBlock
+                    harness={run.harness}
                     key={`${g.agent}-${firstSeq}`}
                     anchorId={
                       firstBlock ? `agent-anchor-${g.agent}` : undefined
@@ -1160,6 +1163,7 @@ export function ActivityFeed({
 }
 
 function AgentBlock({
+  harness,
   agent,
   label,
   messages,
@@ -1182,6 +1186,7 @@ function AgentBlock({
   onFindingMutation,
 }: {
   planCheckDetail?: PlanCrossCheckSummary;
+  harness?: string;
   agent: string;
   // The lane's task label, ALREADY clamped by laneLabelText: model-authored text
   // rendered plain, never through <Markdown> (Decision 7). Empty ⇒ no `· task` suffix.
@@ -1245,7 +1250,7 @@ function AgentBlock({
       const useId = (m.payload as { tool_use_id?: string } | null)?.tool_use_id;
       if (useId && visibleToolUseIds.has(useId)) continue;
       if (rail.length === 0) railSeq = m.seq;
-      rail.push(<RunEventRow key={m.seq} msg={m} live={live} />);
+      rail.push(<RunEventRow harness={harness} key={m.seq} msg={m} live={live} />);
       continue;
     }
     if (m.kind === "tool_use" || m.kind === "thinking") {
@@ -1257,13 +1262,14 @@ function AgentBlock({
           : undefined;
       if (rail.length === 0) railSeq = m.seq;
       rail.push(
-        <RunEventRow key={m.seq} msg={m} result={result} live={live} />,
+        <RunEventRow harness={harness} key={m.seq} msg={m} result={result} live={live} />,
       );
       continue;
     }
     flushRail();
     rows.push(
       <RunEventRow
+        harness={harness}
         key={m.seq}
         msg={m}
         live={live}

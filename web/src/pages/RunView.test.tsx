@@ -4334,7 +4334,7 @@ describe("LimitWaitPanel (PRD #35)", () => {
     );
     expect(container.querySelector("input[type=checkbox]")).not.toBeNull();
     expect(container.textContent).toContain(
-      "Wait out future Anthropic usage limits",
+      "Wait out future usage limits",
     );
     // No park has happened, so nothing may claim one has.
     expect(container.textContent).not.toContain("Paused");
@@ -6837,5 +6837,23 @@ describe("M1 plan cross-check detail refresh", () => {
     await act(async () => { await r.router.navigate("/runs/r1"); });
     await r.update([message(4)]);
     expect(r.refreshRun).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("usage-limit provider regression #2360", () => {
+  it.each([
+    ["codex", "Paused on a Codex usage limit"],
+    ["claude", "Paused on an Anthropic usage limit"],
+    [undefined, "Paused on a usage limit"],
+    ["unrecognized-provider", "Paused on a usage limit"],
+  ])("names only closed parked context %s", (harness, heading) => {
+    render(<LimitWaitPanel run={run({ status: "limit_wait", harness: harness as Run["harness"], wait_on_limit: true })} busy={false} onToggle={vi.fn()} onStop={vi.fn()} />);
+    expect(screen.getByRole("status").textContent).toContain(heading);
+    expect(screen.getByLabelText("Wait out future usage limits on this run")).toBeTruthy();
+    expect(screen.queryByText(/unrecognized-provider/)).toBeNull();
+  });
+  it.each([true, false])("keeps the shared setting neutral for read-only state %s", (wait_on_limit) => {
+    render(<LimitWaitPanel run={run({ status: "running", harness: "codex", wait_on_limit })} canSteer={false} busy={false} onToggle={vi.fn()} onStop={vi.fn()} />);
+    expect(screen.getByText(`${wait_on_limit ? "Waiting" : "Not waiting"} out future usage limits on this run — only its owner can change this.`)).toBeTruthy();
   });
 });

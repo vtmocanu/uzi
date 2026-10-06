@@ -181,13 +181,13 @@ const TERMINAL: RunStatus[] = ["completed", "failed", "cancelled"];
 // consistent with status, so a test states only status + health.
 function renderFeed(
   messages: RunMessage[],
-  opts: { status?: RunStatus; health?: RunHealth; connected?: boolean } = {},
+  opts: { status?: RunStatus; health?: RunHealth; connected?: boolean; harness?: Run["harness"] } = {},
 ) {
-  const { status = "running", health = "ok", connected = true } = opts;
+  const { status = "running", health = "ok", connected = true, harness = "claude" } = opts;
   return render(
     <ActivityFeed
       messages={messages}
-      run={runFixture({ status, health })}
+      run={runFixture({ status, health, harness })}
       runningLive={status === "running"}
       connected={connected}
       terminal={TERMINAL.includes(status)}
@@ -1515,4 +1515,22 @@ it("M1 historical cross-check announces earlier candidate evidence independently
       checker_run_id: checker, checker_model: null, checker_effort: null, usage: null, historical: true },
   })} messages={[message]} connected runningLive={false} terminal={false} /></MemoryRouter>);
   expect(r.container.querySelector('[aria-live="polite"]')?.textContent).toBe("Plan cross-check of earlier-plan candidate: Passed");
+});
+
+describe("usage-limit provider regression #2360", () => {
+  it.each(["agent", "timeline"])("threads run context through %s rows and announcements", (view) => {
+    window.localStorage.setItem("uzi.activity.view", JSON.stringify(view));
+    const { container } = renderFeed([m(1, "limit_wait", { harness: "claude", rate_limit_type: "seven_day" }, "worker")], { status: "limit_wait", harness: "codex" });
+    expect(document.querySelector('[aria-live="polite"]')?.textContent).toBe("Run paused on a Codex usage limit");
+    expect(container.textContent).toContain("Codex usage limit reached — paused until it resets");
+    expect(container.textContent).toContain("7-day window");
+    expect(container.textContent).not.toContain("Anthropic usage limit");
+  });
+  it("uses neutral copy for unknown full-run context", () => {
+    const { container } = renderFeed([m(1, "limit_hit", { provider: "payload-provider" }, "worker")], { harness: "unrecognized-provider" as Run["harness"] });
+    expect(document.querySelector('[aria-live="polite"]')?.textContent).toBe("Run hit a usage limit");
+    expect(container.textContent).toContain("Usage limit reached — the run failed here");
+    expect(container.textContent).not.toContain("unrecognized-provider");
+    expect(container.textContent).not.toContain("payload-provider");
+  });
 });

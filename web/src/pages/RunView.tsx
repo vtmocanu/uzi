@@ -24,7 +24,7 @@ import {
 import { useAuth } from "../auth/AuthContext";
 import { mergeRequestUrl } from "../lib/forgeUrls";
 import { errorMessage } from "../lib/apiError";
-import { canToggleWaitOnLimit, formatCountdown, runWindowLabel } from "../lib/limitWait";
+import { canToggleWaitOnLimit, formatCountdown, runWindowLabel, usageLimitPhrase } from "../lib/limitWait";
 import {
   budgetRightLabel,
   extendBudgetView,
@@ -940,14 +940,14 @@ export function LimitWaitPanel({
         onChange={(e) => onToggle(e.target.checked)}
       />
       <span className={parked ? "text-fg" : "text-muted"}>
-        Wait out future Anthropic usage limits on this run
+        Wait out future usage limits on this run
       </span>
     </label>
   ) : (
     <span className={cx("text-xs", parked ? "text-fg" : "text-muted")}>
       {run.wait_on_limit
-        ? "Waiting out future Anthropic usage limits on this run — only its owner can change this."
-        : "Not waiting out future Anthropic usage limits on this run — only its owner can change this."}
+        ? "Waiting out future usage limits on this run — only its owner can change this."
+        : "Not waiting out future usage limits on this run — only its owner can change this."}
     </span>
   );
 
@@ -1018,7 +1018,7 @@ export function LimitWaitPanel({
               which is the kind that stops the next person from checking.) */}
           <p role="status" className="text-sm font-semibold text-warn">
             <span aria-hidden="true">⏸ </span>
-            Paused on an Anthropic usage limit
+            {`Paused on ${usageLimitPhrase(run.harness)}`}
           </p>
           <p className="mt-0.5 text-xs text-muted">
             {countdown ? (
@@ -2636,8 +2636,8 @@ export function RunView() {
 
       {/* Issue #754: the pool-empty hold + Resume-now. Ordered ABOVE the usage-limit
           strip deliberately (web-ux should-fix): on a pool_wait run the strip below
-          renders its NON-parked "Wait out future Anthropic usage limits" toggle, and
-          two Anthropic controls stacked let a user read that usage-limit checkbox as
+          renders its NON-parked "Wait out future usage limits" toggle, and
+          two recovery controls stacked let a user read that usage-limit checkbox as
           the way to un-wait the pool hold, which it is not. Putting the pool panel
           first makes the hold read as one self-contained unit (its own Resume-now is
           the action), with the unrelated future-limit toggle clearly beneath it. This
@@ -2648,8 +2648,8 @@ export function RunView() {
 
       {/* Issue #1197: the transient-recovery hold. Ordered here beside PoolWaitPanel and
           above the usage-limit strip for the SAME reason (web-ux): on a recovery_wait run
-          the strip below renders its NON-parked "Wait out future Anthropic usage limits"
-          toggle, and two Anthropic-adjacent controls stacked let a user misread that
+          the strip below renders its NON-parked "Wait out future usage limits"
+          toggle, and two recovery controls stacked let a user misread that
           usage-limit checkbox as the way to un-wait the recovery hold, which it is not.
           RecoveryWaitPanel self-hides on every status but recovery_wait, so it does not
           disturb the limit_wait/pool_wait layouts. It carries no control of its own — the

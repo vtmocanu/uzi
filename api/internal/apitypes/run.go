@@ -669,12 +669,12 @@ type RunDTO struct {
 	// pre-feature run and every run on an old worker omit it); filled on the single-run detail
 	// read (GetRun) only.
 	UsageEstimatedTail *UsageTailDTO `json:"usage_estimated_tail,omitempty"`
-	// Anthropic usage-limit park (PRD #35). A run that exhausts the owner's
-	// subscription window is parked at status "limit_wait" rather than failed, and
-	// resumes once the window reopens.
+	// Provider usage-limit park (PRDs #35/#2360). With waiting enabled and budget
+	// available, a recognized Claude or Codex subscription usage window parks at
+	// "limit_wait" and resumes after the reset or bounded fallback.
 	//
-	// WaitOnLimit is the run's opt-in, resolved at creation from the owner's default
-	// or an explicit override. It is on the DTO rather than inferred from the status
+	// WaitOnLimit is the run's waiting preference (default on), resolved at creation
+	// from the owner's default or an explicit override. It is on the DTO rather than inferred from the status
 	// because it is meaningful BEFORE any park — it is what a "will retry on limit"
 	// affordance renders, and what a per-run toggle reads back.
 	WaitOnLimit bool `json:"wait_on_limit"`

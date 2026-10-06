@@ -143,7 +143,7 @@ export type MessageKind =
   /** PRD #88: the answer that resolved a question (payload `{ question_id, answers }`),
    *  echoed to the feed so the round-trip is auditable, mirroring plan_feedback. */
   | "answer"
-  /** PRD #35 Decision 10: the run is being PARKED until the owner's Anthropic usage
+  /** PRD #35 Decision 10: the run is being PARKED until the provider's usage
    *  window reopens. Payload `{ rate_limit_type?: string, resets_at?: string }` —
    *  both OMITTED rather than null when unknown, so "unknown" has one shape.
    *
@@ -2417,18 +2417,19 @@ export interface StateRequest {
    *  which diverges from it once M2 lands (a re-claim can recover the tree via checkpoint
    *  while the session still breaks). */
   seeded_from_default?: boolean;
-  /** limit_wait (PRD #35): the epoch at which the exhausted Anthropic usage window
-   *  reopens, taken from the SDK's `SDKRateLimitInfo.resetsAt`. That field is a bare
-   *  `number` in the typings with no unit declared, so the WORKER normalizes it
-   *  (< 10^12 ⇒ seconds ⇒ ×1000) before sending and the server re-validates rather
-   *  than trusting the normalization. Absent when the frames carried no usable
-   *  reset — the server then falls back to its exponential park schedule. */
+  /** limit_wait (PRDs #35/#2360): epoch milliseconds when the exhausted provider
+   *  usage window reopens. Claude normalizes SDKRateLimitInfo.resetsAt
+   *  (< 10^12 ⇒ seconds ⇒ ×1000); Codex converts structured per-turn account
+   *  snapshot seconds to milliseconds and selects the latest selected-window reset.
+   *  The server re-validates the value. Absent when no usable reset remains —
+   *  the server then falls back to its exponential park schedule. */
   limit_resets_at?: number;
-  /** limit_wait (PRD #35): the SDK's `rateLimitType` verbatim, e.g. "five_hour".
-   *  Sent unvalidated ON PURPOSE — the server allowlists it against the SDK union
-   *  and coerces anything else to "unknown" before it reaches the DB, the DTO, the
-   *  feed or Slack. Doing the allowlisting here as well would put the authoritative
-   *  copy of the vocabulary on the untrusted side. */
+  /** limit_wait (PRDs #35/#2360): provider window type, e.g. "five_hour" —
+   *  Claude's SDK rateLimitType or Codex's mapped window duration.
+   *  Sent unvalidated ON PURPOSE — the server allowlists the shared vocabulary
+   *  and coerces anything else to "unknown" before it reaches the DB, DTO or Slack.
+   *  Run-message payloads follow a separate worker-authored path; their readers use
+   *  closed lookups. The server owns validation of these state-report fields. */
   rate_limit_type?: string;
   /** failed (PRD #69 M7a): the worker's structured guess at WHY this run is failing,
    *  mapped from the known reason CONSTANT at the report site — e.g.

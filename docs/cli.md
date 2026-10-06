@@ -2287,8 +2287,9 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
   does **not** auto-resume on its own — wind it down explicitly with `run
   stop`, or let its worker-side idle timeout finalize it — see [Interactive
   mode](./handoff.md#interactive-mode);
-- `limit_wait` — parked while an Anthropic usage limit resets, promoted back to
-  `queued` once past its `retry_not_before`;
+- `limit_wait` — parked on a Claude or Codex subscription usage window, promoted
+  back to `queued` once past its `retry_not_before` (reset plus jitter, or bounded
+  fallback when no usable reset is known); see [Paused on a usage limit](run-limit-wait.md);
 - `pool_wait` — an `auto` worker held because its Anthropic token pool is
   genuinely empty, resumed once a token is pooled — see [Letting uzi pick the
   token](anthropic-token.md#letting-uzi-pick-the-token-auto-selection);

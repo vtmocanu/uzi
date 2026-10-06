@@ -688,7 +688,7 @@ is a linear state machine:
 queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiting_approval ⟲ (revise, PRD #41) → running → completed
                                                                                                                    → failed
    ↳ (worker dies) → re-queued, up to RUN_MAX_REQUEUES → failed
-   ↳ (Anthropic usage limit, opt-in) → limit_wait → queued, up to RUN_LIMIT_MAX_WAITS → failed
+   ↳ (provider usage window, waiting enabled by default) → limit_wait → queued, up to RUN_LIMIT_MAX_WAITS → failed
    ↳ (auto lane, token pool empty) → pool_wait → queued, once a token is pooled (or resume-now)
    ↳ (resumed turn came back empty) → recovery_wait → queued, on a capped backoff, no lifetime cap
    ↳ (interactive task, clean signal_done) → awaiting_followup, no auto-resume — wound down by run stop or idle timeout
@@ -716,20 +716,30 @@ reported between the answer and the planning turn's next move, and if that
 move is a plan, the run goes straight to `awaiting_approval` — the literal
 chain in the diagram above, with no intervening `running`.
 
-- **running → limit_wait** (PRD #35, opt-in per run or per user) — a run that
-  exhausts the owner's Anthropic usage limit **parks** instead of failing: the
+- **running → limit_wait** (PRDs #35/#2360, waiting on by default with per-user
+  and per-run overrides) — a recognized Claude or Codex subscription usage-window
+  failure **parks** instead of failing, within the wait and per-park budgets: the
   worker's slot is released while its skills plugin dir and per-run SDK home
   stay on disk so a same-worker resume can continue the session. The clone is
   normally removed and reseeded from the captured tracking/checkpoint refs
   (verified 2026-09-08 during issue #1197 review). A sweeper
   promotes it back to `queued` once `retry_not_before` passes (server-timed and
-  server-clamped, never worker-trusted: the earliest moment this user could spend
-  anything across the whole credential pool), and the resume skips the plan gate
-  when the plan was already approved. Two independent guards keep the on-disk
+  server-clamped). For Claude, the server cross-checks the Anthropic gauge and can
+  lower the delay for an auto-bound run when another pooled token is spendable;
+  Codex has no Anthropic gauge or pool input and keeps the frozen Codex account.
+  The updated API atomically revokes the capability at accepted park and refuses
+  late minting in `limit_wait`. An already-started refresh may commit account
+  rotation, but its post-exchange authorization cannot return tokens to that flight.
+  Codex uses accepted structured per-turn account-window evidence, with the latest
+  selected reset or bounded fallback, not provider prose, account reads or polling.
+  If that account is unavailable after promotion, Claim refuses it and Sweep holds
+  it at `recovery_wait` / `codex_account_unavailable`. Recovered approved work
+  resumes without another plan gate. Two independent guards keep the on-disk
   state alive (the runner's teardown carve-out and `home-reclaim`'s
   terminal-status check); losing either loses the transcript. See
   [adr/0035-run-limit-retry.md](adr/0035-run-limit-retry.md) and
-  `prds/done/35-run-limit-retry.md`.
+  `prds/done/35-run-limit-retry.md` and
+  [PRD #2360](prds/2360-codex-usage-limit-park.md).
   **Only committed history survives a park by itself**; PRD #759 additionally
   captures uncommitted mid-milestone work as a throwaway `wip(park):` commit that
   the checkpoint broker ([PRD #628](prds/done/628-cross-worker-resume-durability.md))
@@ -739,6 +749,13 @@ chain in the diagram above, with no intervening `running`.
   without re-gating; a total loss re-gates a human-approved run, preserving
   [PRD #209](prds/done/209-seeded-plan-runs.md)'s loss-detection property. See
   [adr/0759-protect-run-work-usage-limit-park.md](adr/0759-protect-run-work-usage-limit-park.md).
+  A failed park sink makes no latest-work checkpoint claim; failed capture retains
+  the source clone for recovery, so durability is conditional on successful capture
+  and publish. Codex resumes a resolvable thread on non-Docker workers; Docker
+  attempt paths keep the existing fresh-thread lineage break with recovered work.
+  `RUN_LIMIT_MAX_PARK` bounds each park (8 days by default), during which the issue
+  lock and a run-bound hosted worker/PVC can remain held. Missing resets use the
+  bounded fallback and can exhaust `RUN_LIMIT_MAX_WAITS` before a weekly reset.
 
 - **claimed → pool_wait** (PRD #754): an `auto`-lane worker's whole opted-in
   token pool is genuinely empty, so the run **holds** rather than reach for

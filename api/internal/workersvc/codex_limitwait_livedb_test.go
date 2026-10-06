@@ -338,6 +338,7 @@ func TestCodexLimitParkRefreshDiscardsTokenLiveDB(t *testing.T) {
 	env.exec("UPDATE runs SET status='running', wait_on_limit=true WHERE id=$1", f.runID)
 	wire := env.mintCap(t, f.runID, f.workerID)
 	gen := mustRun(t, env, f.runID).ClaimGeneration
+	revision := env.mustAccount(t, f.userID, f.accountID).CredentialRevision
 	fake.onRefresh = func() { parkCodexFlight(t, env, f.svc, f.wkr, f.runID, gen) }
 	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, wire, uuid.New(), 0)
 	if !errors.Is(err, ErrCodexCapabilityEpoch) || res.AccessToken != "" || res.Outcome != CodexRefreshContended {
@@ -347,5 +348,8 @@ func TestCodexLimitParkRefreshDiscardsTokenLiveDB(t *testing.T) {
 	blob := env.accountBlob(t, f.userID, f.accountID)
 	if fake.calls != 1 || acct.Generation != 1 || blob.AccessToken != access || blob.RefreshToken != refresh {
 		t.Fatal("park discarded durable account rotation")
+	}
+	if acct.CredentialRevision != revision {
+		t.Fatal("park or refresh changed the account credential revision")
 	}
 }

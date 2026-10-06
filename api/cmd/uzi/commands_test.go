@@ -1623,9 +1623,9 @@ func TestRunLogsFollowRidesOutALimitWaitPark(t *testing.T) {
 	}
 
 	stderr := errBuf.String()
-	// PRD #1190 D13: the park notice now reads "waiting: Anthropic usage limit …" (reworded
+	// PRD #1190 D13: the park notice now reads "waiting: usage limit …" (reworded
 	// from "paused:"), so the one-shot edge notice is counted by that distinctive prefix.
-	if n := strings.Count(stderr, "waiting: Anthropic usage limit"); n != 1 {
+	if n := strings.Count(stderr, "waiting: usage limit"); n != 1 {
 		t.Errorf("park notice appeared %d times, want exactly 1 — it must fire on the EDGE into the park, not on every poll of a park that lasts hours:\n%s", n, stderr)
 	}
 	if !strings.Contains(stderr, "five_hour") || !strings.Contains(stderr, "resumes in") {

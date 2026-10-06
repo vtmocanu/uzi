@@ -2199,7 +2199,13 @@ func limitWaitLine(r apitypes.RunDTO, now time.Time) string {
 	// PRD #1190 D13: the leading word is "waiting:", NOT "paused:". Once an owner pause
 	// exists, "paused:" on the rate-limit line would read as a user pause; "waiting:" says
 	// plainly that the run is held on a usage limit, not parked by its owner.
-	line := "waiting: Anthropic usage limit"
+	line := "waiting: usage limit"
+	switch r.Harness {
+	case "claude":
+		line = "waiting: Anthropic usage limit"
+	case "codex":
+		line = "waiting: Codex usage limit"
+	}
 	if t := cellText(strOr(r.RateLimitType, "")); t != "" {
 		line += " (" + t + ")"
 	}

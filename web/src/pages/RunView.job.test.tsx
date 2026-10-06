@@ -75,7 +75,7 @@ async function renderPage(run: Run) {
   return utils;
 }
 
-const WAIT_LABEL = "Wait out future Anthropic usage limits on this run";
+const WAIT_LABEL = "Wait out future usage limits on this run";
 const REWORK_LABEL = /Auto-rework this MR.s review comments/;
 const breadcrumb = (container: HTMLElement) => container.querySelector("nav")!;
 

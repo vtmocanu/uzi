@@ -573,14 +573,12 @@ export function RunDefaults() {
           default is the ONLY way the opt-in can ever be expressed. */}
       <Card className="space-y-4">
         <div>
-          <SectionTitle>Anthropic usage limits</SectionTitle>
+          <SectionTitle>Usage limits</SectionTitle>
           <p className="mt-2 text-sm text-muted">
-            When a run exhausts your Anthropic usage window it normally{" "}
-            <strong className="text-fg">fails</strong> and its work is lost. With this on, a run{" "}
-            <strong className="text-fg">pauses</strong> instead and resumes by itself when the window
-            reopens — it keeps its branch, its history and its place, and picks up where it left off. Runs
-            you did not start by hand (autopilot, CI fixes, self-improvement) have no other way to opt in,
-            so this setting is what covers them. Off by default.
+            Claude runs and Codex subscription runs can{" "}
+            <strong className="text-fg">pause</strong> on a usage-window limit and resume by themselves
+            when the window reopens. Recovered work and an approved plan carry forward. Runs you did
+            not start by hand (autopilot, CI fixes, self-improvement) inherit this setting too. On by default.
           </p>
           <p className="mt-2 text-sm text-muted">
             This is the default for <strong className="text-fg">new</strong> runs. It does not change runs
@@ -588,9 +586,9 @@ export function RunDefaults() {
             which you can flip on the run's page.
           </p>
           <p className="mt-2 text-sm text-faint">
-            A paused run holds onto its checkout and its cached dependencies while it waits, so several at
-            once cost real disk on the worker. There is a cap on how many times one run will wait before it
-            gives up and fails.
+            A parked run keeps its issue lock and retains session and recovery data on the worker.
+            Several parked runs cost real disk. Limits on the number of waits and the length of each
+            wait bound how long a run can keep waiting.
           </p>
         </div>
 

@@ -3041,7 +3041,7 @@ export interface Run {
    *  (the tail of an interrupted Claude session). Omitted when the run has none. Always shown
    *  APART from `usage` and never added to it. */
   usage_estimated_tail?: UsageTail | null;
-  /** PRD #35: this run's usage-limit opt-in — on a sustained Anthropic usage limit
+  /** PRD #35: this run's usage-limit opt-in — on a sustained usage limit
    *  the run parks at status "limit_wait" and resumes when the window reopens,
    *  instead of failing. Present on every run from creation, so it is what a "will
    *  retry on limit" affordance renders BEFORE any park has happened. */

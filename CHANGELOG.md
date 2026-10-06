@@ -38,6 +38,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Codex subscription runs can wait out a usage window and resume automatically ([#2360](https://github.com/vtmocanu/uzi/issues/2360)).**
+  The existing default-on usage-limit preference now covers recognized Codex window failures using structured evidence from the failed turn, with the latest exhausted-window reset or bounded fallback; Settings and per-run controls use shared Usage limits wording. Resume keeps the same Codex account and restores captured work, with approval reused when recovered; Docker workers retain the existing fresh-thread lineage break. Missing or unaccepted evidence and non-window limits fail as typed `rate_limited` without a reset promise; `rateLimitExceeded` and `sessionBudgetExceeded` are unchanged (#2361 tracks the former). Capture and publish can fail, so latest-work durability is conditional; each park can hold an issue lock and a run-bound hosted worker/PVC for up to the default 8 days, while fallback retries can exhaust the wait budget before a weekly reset.
+
 - **Higher default resource requests for the api and the CNPG database.**
   The chart now requests 100m CPU / 320Mi for the api (was 50m / 128Mi) and 512Mi per CNPG instance (was 256Mi), matching what a live install actually uses, which reduces their eviction risk under node memory pressure. Limits are unchanged; override `api.resources` or `postgres.cluster.resources` to size differently.
 

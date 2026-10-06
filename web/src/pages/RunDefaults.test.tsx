@@ -1365,3 +1365,12 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
     expect(document.activeElement).toBe(codexSel);
   });
 });
+
+it("usage-limit provider regression #2360: shared default has neutral copy", () => {
+  mockAuth(baseUser);
+  render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+  expect(screen.getByText("Usage limits")).toBeTruthy();
+  expect(screen.getByText(/Claude runs and Codex subscription runs can/).textContent).toContain("On by default.");
+  // The saved opt-out stays off even though newly-created users default on.
+  expect((screen.getByLabelText("Pause my new runs on a usage limit instead of failing them") as HTMLInputElement).checked).toBe(false);
+});

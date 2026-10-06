@@ -348,7 +348,7 @@ uzi version
   task — `uzi handoff --interactive` — parked after a clean `signal_done`,
   awaiting your next `run follow-up`; it does not auto-resume — wind it down
   with `run stop`, or let its worker-side idle timeout finalize it),
-  `limit_wait` (parked while an Anthropic usage limit resets; the sweep
+  `limit_wait` (parked on a Claude or Codex subscription usage window; the sweep
   promotes it back to `queued` once past its `retry_not_before`),
   `pool_wait` (an `auto` run held because its token pool is empty — add a token
   to the pool and it resumes), `recovery_wait` (parked after an empty model turn, or
@@ -446,11 +446,15 @@ uzi version
 - `uzi run create --repo <repo-id> --issue <issue-iid>` — queue a run on a repo's
   PRD issue. Get the repo id from `uzi repo list`.
   `--wait-on-limit` is THREE-WAY, not a plain switch: omit it and the run inherits
-  your Settings default; pass `--wait-on-limit` to make this run park until your
-  Anthropic usage window reopens instead of failing; pass `--wait-on-limit=false`
+  your Settings → Usage limits default (on); pass `--wait-on-limit` to make this
+  run park on a recognized Claude or Codex subscription usage window instead of
+  failing; pass `--wait-on-limit=false`
   (with the `=`, since a bare bool flag consumes no following word) to force it off
-  for this run only. A parked run holds its issue and its worker's disk until it
-  resumes, so it is opt-in rather than the default.
+  for this run only. A park holds its issue lock and worker disk, and can hold a
+  run-bound hosted worker and PVC for up to `RUN_LIMIT_MAX_PARK` per park (8 days
+  by default). Codex keeps its frozen account; there is no Anthropic token switching.
+  Missing usable resets use the bounded fallback and can exhaust the wait budget
+  before a weekly window reopens.
 
   `--mr-rework` is the same THREE-WAY shape for the MR review-rework watcher (PRD
   #841): omit it and the run inherits your account default; pass `--mr-rework` to
