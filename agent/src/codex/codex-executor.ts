@@ -1114,14 +1114,21 @@ export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: Codex
       transport,
       cwd,
       dispose: async () => {
+        let cleanDisposal = false;
         try {
-          await handle.dispose();
+          const outcome = await handle.dispose();
+          cleanDisposal = outcome?.clean === true;
         } finally {
-          // Best-effort cleanup of the per-call trees; a failed rm never fails the advice call
-          // (mirrors model-pass.ts's ephemeral-HOME cleanup posture for the Claude lane).
-          await rmRunnerTeardownTree(ownedDataRoot).catch((error) =>
-            log.warn("Codex advice data cleanup failed", { error: errMessage(error) }),
-          );
+          // The launcher's normal removal and this fallback share the same forensic
+          // retention rule: only positively confirmed clean disposal permits deletion.
+          // False, unknown or thrown outcomes may leave a supervised writer alive.
+          if (cleanDisposal) {
+            await rmRunnerTeardownTree(ownedDataRoot).catch((error) =>
+              log.warn("Codex advice data cleanup failed", { error: errMessage(error) }),
+            );
+          } else {
+            log.warn("Codex advice data retained: disposal was not confirmed clean");
+          }
           await rmTeardownTree(cwd).catch((error) =>
             log.warn("Codex advice cwd cleanup failed", { error: errMessage(error) }),
           );

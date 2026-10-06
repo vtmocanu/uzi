@@ -5684,6 +5684,65 @@ describe("production advice data teardown (#2324)", () => {
     });
   });
 
+  it("unclean advice disposal retains runner data after the supervisor is killed", async () => {
+    const { runnerTeardownFixture, uidScript, assertGone } = await import("./runner-teardown-fixtures.js");
+    const { default: cp } = await import("node:child_process");
+    const { syncBuiltinESMExports } = await import("node:module");
+    await runnerTeardownFixture(async (root) => {
+      const { logger, lines } = recordingLogger();
+      const originalSpawn = cp.spawn.bind(cp);
+      let supervisor: import("node:child_process").ChildProcess | undefined;
+      let providerPid: number | undefined;
+      const observe = mock.method(cp, "spawn", ((command: string, args: string[], options: import("node:child_process").SpawnOptions) => {
+        const child = originalSpawn(command, args, options);
+        if (args.some((arg) => arg.endsWith("/uzi-codex-supervisor"))) {
+          supervisor = child;
+          let pending = "";
+          (child.stdio[4] as import("node:stream").Readable).on("data", (chunk) => {
+            pending += String(chunk);
+            let end: number;
+            while ((end = pending.indexOf("\n")) >= 0) {
+              const event = JSON.parse(pending.slice(0, end));
+              pending = pending.slice(end + 1);
+              if (event.event === "started") providerPid = event.childPid;
+            }
+          });
+        }
+        return child;
+      }) as typeof cp.spawn);
+      syncBuiltinESMExports();
+      let handle: Awaited<ReturnType<LaunchAdviceRootSeam>> | undefined;
+      try {
+        handle = await makeProductionLaunchAdviceRoot(root, "api_key", logger)({
+          kind: "advice", label: "review", provider: CODEX_PRODUCTION_PROVIDER, model: "gpt-6.1-sol",
+        });
+        const owned = path.join(root, "codex-advice-data", path.basename(handle.cwd));
+        assert.ok(supervisor?.pid && providerPid, "observe the exact supervisor and primary child this fixture launched");
+        uidScript(runnerCommand, "require('node:fs').writeFileSync(process.argv[1]+'/forensic','retain')", owned);
+        const exited = new Promise<void>((resolve) => supervisor!.once("exit", () => resolve()));
+        uidScript(runnerCommand, "process.kill(Number(process.argv[1]),'SIGKILL')", String(supervisor.pid));
+        await withTimeout(exited, 5000, "killed advice supervisor");
+        assert.equal(supervisor.signalCode, "SIGKILL");
+        await handle.dispose();
+        assert.equal((await fs.lstat(owned)).uid, RUNNER_UID);
+        uidScript(runnerCommand, "if(require('node:fs').readFileSync(process.argv[1]+'/forensic','utf8')!=='retain')process.exit(1)", owned);
+        await assertGone(handle.cwd);
+        assert.ok(lines.some((line) => rec(line).msg === "Codex advice data retained: disposal was not confirmed clean"));
+      } finally {
+        observe.mock.restore(); syncBuiltinESMExports();
+        // Only this fixture's evidence-identified child is signalled. Settle its
+        // stdout pipe before fixture tree disposal, even after a failed assertion.
+        if (providerPid && supervisor) {
+          const stdout = supervisor.stdout;
+          const closed = stdout?.destroyed ? Promise.resolve() : new Promise<void>((resolve) => stdout?.once("close", () => resolve()));
+          uidScript(runnerCommand, "try{process.kill(Number(process.argv[1]),'SIGKILL')}catch(e){if(e.code!=='ESRCH')throw e}", String(providerPid));
+          if (stdout) await withTimeout(closed, 5000, "killed advice provider pipe");
+        }
+        await handle?.dispose().catch(() => undefined);
+      }
+    });
+  });
+
   it("ordinary advice ownedDataRoot removes private runner-only content without leaking", async () => {
     const { runnerTeardownFixture, writePrivateRunnerFile, assertGone } = await import("./runner-teardown-fixtures.js");
     await runnerTeardownFixture(async (root) => {
@@ -5692,6 +5751,13 @@ describe("production advice data teardown (#2324)", () => {
         kind: "advice", label: "review", provider: CODEX_PRODUCTION_PROVIDER, model: "gpt-6.1-sol",
       });
       const owned = path.join(root, "codex-advice-data", path.basename(handle.cwd));
+      // Exercise the executor fallback, rather than the launcher's earlier rm.
+      const { default: syncFs } = await import("node:fs");
+      const { syncBuiltinESMExports } = await import("node:module");
+      const originalLstat = syncFs.lstatSync.bind(syncFs);
+      const preflight = mock.method(syncFs, "lstatSync", ((...args: Parameters<typeof syncFs.lstatSync>) =>
+        args[0] === owned ? undefined : originalLstat(...args)) as typeof syncFs.lstatSync);
+      syncBuiltinESMExports();
       try {
         assert.equal((await fs.lstat(owned)).uid, RUNNER_UID);
         writePrivateRunnerFile(owned);
@@ -5699,7 +5765,10 @@ describe("production advice data teardown (#2324)", () => {
         await assertGone(owned);
         await assertGone(handle.cwd);
         assert.equal(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed"), false);
-      } finally { await handle.dispose().catch(() => undefined); }
+      } finally {
+        preflight.mock.restore(); syncBuiltinESMExports();
+        await handle.dispose().catch(() => undefined);
+      }
     });
   });
 
