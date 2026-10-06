@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { PlanRejectedError, type Executor, type RunContext } from "../src/executor.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import { MessageBatcher } from "../src/batcher.js";
+import { UsageRecorder } from "../src/usage-recorder.js";
 import type { PlanCrossCheckCandidate, PlanCrossCheckStateRequest } from "../src/client.js";
 import type { PlanVerdict } from "../src/steering.js";
 import { nullLogger } from "./helpers.js";
@@ -162,19 +163,104 @@ describe("U2 real runner checked gate", () => {
     });
   }
 
-  for (const [condition, override] of [
-    ["invalid or stale candidate identity", { candidate_generation: 2 }],
-    ["terminal settlement receipts unavailable", { claim_generation: 2 }],
-    ["invalid or stale candidate identity", { candidate_digest: "b".repeat(64), candidate_generation: 3 }],
-  ]) {
-    it(`rejects ${JSON.stringify(override)} before approval`, async () => {
-      const c = claim();
-      api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "approve", "approve", override) });
-      await start(checkedExec().exec, c);
-      terminal(c.run_id, condition as string);
-      assert.equal(gates(c.run_id).length, 0);
+  for (const [reason, override, verdict, checkerReason] of [
+    ["interrupted", { candidate_generation: 2 }, "approve", "approve"],
+    ["checker_failed", { claim_generation: 2 }, "approve", "approve"],
+    ["interrupted", { candidate_digest: "b".repeat(64), candidate_generation: 3 }, "approve", "approve"],
+    // cross_check.go returns the historical candidate generation with current claim proof.
+    ["interrupted", { candidate_generation: 1, claim_generation: 2 }, "failed", "interrupted"],
+    ["checker_failed", { candidate_digest: "b".repeat(64) }, "pending", ""],
+    ["checker_failed", { candidate_digest: "invalid" }, "pending", ""],
+    ["checker_failed", { candidate_digest: "invalid" }, "invalid_submit", ""],
+    ["checker_failed", { plan_cross_check_settled: false }, "approve", "approve"],
+  ] as const) {
+    it(`forces human rejection for ${verdict} ${JSON.stringify(override)} with intact preparation`, async () => {
+      const c = verdict === "failed" ? freshClaim(2, { auto_approve: true, plan_cross_check_required: true }) : claim();
+      let context!: RunContext;
+      let submitted!: Record<string, unknown>;
+      let pending!: ReturnType<typeof answer>;
+      api.crossCheckHandler = ({ runId, body, method }) => {
+        if (method === "POST") {
+          submitted = body;
+          assert.equal(api.usageRequests.length, 1, "usage preparation ACK precedes submit");
+          assert.ok(api.messages(runId).some((m) => (m.payload as { text?: string }).text === "prepared feed"),
+            "message preparation ACK precedes submit");
+          context.emit({ kind: "status", payload: { text: "reserved feed" } });
+          pending = answer(runId, body, verdict === "invalid_submit" ? "approve" : verdict,
+            verdict === "invalid_submit" ? "approve" : checkerReason, verdict === "pending" ? {} : override);
+          return { status: 200, body: pending };
+        }
+        return { status: 200, body: answer(runId, submitted, "approve", "approve",
+          { ...override, deadline_at: pending.deadline_at }) };
+      };
+      const held = holdGateAck(c.run_id, PLAN);
+      let rejectId = 0;
+      api.onState(c.run_id, (b) => {
+        if (b.status === "awaiting_approval") rejectId = send(c.run_id, row("reject_plan", "decline"))[0]!.id;
+      });
+      const { exec, verdicts } = checkedExec(async (ctx) => {
+        context = ctx;
+        ctx.emit({ kind: "status", payload: { text: "prepared feed" } });
+        const leg = ctx.usage!.startLeg();
+        leg.observeAssistant({ message: { id: "prepared-usage", model: "claude", usage: { input_tokens: 3 } } });
+        leg.close();
+      });
+      let applied = false;
+      const report = client.reportPlanCrossCheckGateState.bind(client);
+      client.reportPlanCrossCheckGateState = async (runId, fields, signal) => {
+        const ack = await report(runId, fields, signal);
+        if (fields.status === "awaiting_approval") {
+          assert.equal(fields.claim_generation, c.claim_generation);
+          assert.ok(ack.applied && !ack.staleClaim);
+          assert.equal(ack.reconciliation?.claimGeneration, c.claim_generation);
+          assert.equal(ack.reconciliation?.planCrossCheckSettled, true);
+          applied = true;
+        }
+        return ack;
+      };
+      const done = start(exec, c);
+      try {
+        assert.ok(await until(() => rejectId > 0));
+        await routed(c.run_id, rejectId);
+        assert.equal(applied, false, "held forced gate ACK cannot release transport");
+        assert.equal(verdicts.length, 0, "human verdict waits for applied ACK");
+        assert.ok(!api.messages(c.run_id).some((m) => (m.payload as { text?: string }).text === "reserved feed"));
+        held.release();
+        await done;
+        assert.equal(applied, true);
+        const gate = gates(c.run_id)[0] as PlanCrossCheckStateRequest;
+        assert.equal(gate.plan_cross_check_gate_reason, reason);
+        assert.equal(gate.plan_cross_check_refusal, reason === "checker_failed" ? "submit_failed" : undefined);
+        assert.deepEqual(verdicts.map((v) => v.kind), ["reject"]);
+        assert.equal(api.crossCheckRequests.filter((r) => r.method === "POST").length, 1);
+        assert.ok(api.messages(c.run_id).some((m) => (m.payload as { text?: string }).text === "reserved feed"),
+          "applied same-generation forced gate ACK releases normal feed");
+        assert.ok(!api.states.some((s) => s.runId === c.run_id && s.body.status === "running" && s.body.plan_md),
+          "no canonical unchecked approval");
+        assert.ok(!statuses(c.run_id).includes("completed") && !statuses(c.run_id).includes("recovery_wait"));
+      } finally {
+        held.release();
+        await done;
+        client.reportPlanCrossCheckGateState = report;
+      }
     });
   }
+
+  it("inactive preparation remains terminal before an identity fallback", async () => {
+    const c = claim();
+    let context!: RunContext;
+    api.crossCheckHandler = ({ runId, body }) => {
+      assert.ok(context.usage instanceof UsageRecorder);
+      context.usage.release();
+      return { status: 200, body: answer(runId, body, "approve", "approve", { candidate_generation: 2 }) };
+    };
+    const { exec, verdicts } = checkedExec(async (ctx) => { context = ctx; });
+    await start(exec, c);
+    terminal(c.run_id, "preparation receipts irrecoverably lost");
+    assert.deepEqual(verdicts, []);
+    assert.equal(gates(c.run_id).length, 0);
+    assert.equal(api.crossCheckRequests.length, 1);
+  });
 
   it("a real usage 400 irrecoverably loses preparation receipts and terminates before submit", async () => {
     const c = claim();
