@@ -79,7 +79,7 @@ export class FakeApi {
   /** GET response send attempts; a held GET has one more entry than send attempt. */
   readonly inputGetSendAttempts = new Map<string, number>();
   /** Issue #1604: /state reports this run drops (connection destroyed, nothing recorded). */
-  private readonly droppedStates = new Map<string, (body: StateRequest) => boolean>();
+  private readonly droppedStates = new Map<string, { matches: (body: StateRequest) => boolean; beforeDrop?: Promise<void> }>();
   /** Issue #1604: the created_at of each recorded `plan` run_message, with its plan_md, per run. */
   private readonly planFramesByRun = new Map<string, Array<{ at: string; plan_md: unknown }>>();
   /** Issue #1604: runs.stop_kind as CreateStopVerdictInput stamps it (last write wins): a
@@ -624,11 +624,13 @@ export class FakeApi {
 
   /** Issue #1604: drop every /state report for this run matching `matches` (the connection is
    *  destroyed before anything is recorded), modelling a worker that dies before the report lands.
-   *  Returns a function that stops dropping. */
-  dropStatesWhen(runId: string, matches: (body: StateRequest) => boolean): () => void {
-    this.droppedStates.set(runId, matches);
+   *  An optional hold delays destruction of matching requests without committing them.
+   *  Returns a function that stops dropping future requests; already matched requests still drop. */
+  dropStatesWhen(runId: string, matches: (body: StateRequest) => boolean, beforeDrop?: Promise<void>): () => void {
+    const drop = { matches, beforeDrop };
+    this.droppedStates.set(runId, drop);
     return () => {
-      if (this.droppedStates.get(runId) === matches) this.droppedStates.delete(runId);
+      if (this.droppedStates.get(runId) === drop) this.droppedStates.delete(runId);
     };
   }
 
@@ -1490,7 +1492,9 @@ export class FakeApi {
       return;
     }
     const body = json as unknown as StateRequest;
-    if (this.droppedStates.get(runId)?.(body)) {
+    const drop = this.droppedStates.get(runId);
+    if (drop?.matches(body)) {
+      if (drop.beforeDrop !== undefined) await drop.beforeDrop;
       res.destroy();
       return;
     }

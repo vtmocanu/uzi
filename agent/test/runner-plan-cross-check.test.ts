@@ -649,6 +649,16 @@ it(`checked canonical storage resumes after real switch give-up with ${committed
   let attempts = 0;
   let applied = false;
   let retried = false;
+  let switchDelivered = false;
+  let initialAbortedAfterControl = false;
+  const getInputs = client.getInputs.bind(client);
+  client.getInputs = async (runId) => {
+    const result = await getInputs(runId);
+    if (runId === c.run_id && result.credentialSwitch?.generation === 1) switchDelivered = true;
+    return result;
+  };
+  let releaseBeforeDrop!: () => void;
+  const beforeDrop = new Promise<void>((resolve) => { releaseBeforeDrop = resolve; });
   let releaseAck!: () => void;
   const heldAck = new Promise<void>((resolve) => { releaseAck = resolve; });
   let releaseInitialAck!: () => void;
@@ -658,7 +668,13 @@ it(`checked canonical storage resumes after real switch give-up with ${committed
   const snapshots: string[] = [];
   const report = client.reportPlanCrossCheckGateState.bind(client);
   client.reportPlanCrossCheckGateState = async (runId, body, signal) => {
-    if (canonical(body)) { requests.push(body); snapshots.push(JSON.stringify(body)); }
+    if (canonical(body)) {
+      requests.push(body);
+      snapshots.push(JSON.stringify(body));
+      if (requests.length === 1) signal?.addEventListener("abort", () => {
+        initialAbortedAfterControl = switchDelivered;
+      }, { once: true });
+    }
     const ack = await report(runId, body, signal);
     if (canonical(body)) {
       assert.ok(ack.applied && ack.status === "running" && !ack.staleClaim);
@@ -673,7 +689,7 @@ it(`checked canonical storage resumes after real switch give-up with ${committed
       api.requestCredentialSwitch(c.run_id, 1);
     }
     return !committed || requested;
-  });
+  }, committed ? undefined : beforeDrop);
   if (committed) api.afterPersistState(c.run_id, (b) => {
     if (!canonical(b)) return false;
     requested = true;
@@ -683,6 +699,9 @@ it(`checked canonical storage resumes after real switch give-up with ${committed
   api.onState(c.run_id, (b) => {
     if (b.status === "credential_switch_failed") {
       gaveUp = true;
+      assert.ok(switchDelivered, "real inputs control delivered before give-up");
+      assert.ok(initialAbortedAfterControl, "owned HTTP request aborted after inputs control");
+      releaseBeforeDrop();
       releaseInitialAck();
       assert.equal(applied, false);
       assert.equal(api.states.filter((s) => s.runId === c.run_id && canonical(s.body)).length, committed ? 1 : 0);
@@ -736,6 +755,8 @@ it(`checked canonical storage resumes after real switch give-up with ${committed
     releaseAck();
     await done;
     assert.equal(attempts, 1);
+    assert.equal(api.states.filter((s) => s.runId === c.run_id && canonical(s.body)).length, committed ? 2 : 1,
+      "the held initial request cannot commit after dropping is restored");
     assert.equal(api.crossCheckRequests.length, 1);
     assert.equal(gates(c.run_id).length, 0, "no human publication");
     assert.ok(!statuses(c.run_id).includes("recovery_wait"));
@@ -744,11 +765,15 @@ it(`checked canonical storage resumes after real switch give-up with ${committed
     assert.ok(!prompts.slice(1).some((p) => p.includes("local milestone")));
     assert.equal(api.messages(c.run_id).filter((m) => m.kind === "plan").length, 1, "no second initial plan emission");
   } finally {
+    releaseBeforeDrop();
     releaseInitialAck();
     releaseAck();
+    restore();
     run.shutdown();
-    await done;
-    client.reportPlanCrossCheckGateState = report;
+    try { await done; } finally {
+      client.getInputs = getInputs;
+      client.reportPlanCrossCheckGateState = report;
+    }
   }
 });
 
