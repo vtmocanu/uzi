@@ -857,8 +857,9 @@ export interface TeardownTestDeps {
  * Remove a worker-owned teardown tree while sibling runs may still be writing.
  * One shared 120 s deadline bounds worker waiting across the ordered pinned passes.
  * Helper entry/time budgets are cooperative: under the uid split the worker cannot
- * kill a foreign-uid helper blocked in a syscall. Refusals propagate to the caller's
- * warning catch; there is no path-based fallback, including on non-Linux hosts.
+ * kill a foreign-uid helper blocked in a syscall. Refusals propagate: required setup
+ * aborts, while best-effort disposal warns and retains. There is no path-based
+ * fallback, including on non-Linux hosts.
  */
 export async function rmTeardownTree(target: string, testDeps: TeardownTestDeps = {}): Promise<void> {
   if (!path.isAbsolute(target)) throw new Error(`rmTeardownTree: refusing non-absolute path ${target}`);

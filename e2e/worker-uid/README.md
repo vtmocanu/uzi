@@ -1,6 +1,6 @@
 # Worker UID test lane
 
-`task test:agent:worker-uid` builds the base worker image and runs the eight ownership
+`task test:agent:worker-uid` builds the base worker image and runs the ownership and cleanup
 leaves from four test files through its root entrypoint, which drops to the worker UID with runner
 group membership and the production ambient capabilities. It runs offline, with
 disposable data and Nix mounts, and removes only its own named container.

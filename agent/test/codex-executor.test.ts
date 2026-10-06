@@ -5645,9 +5645,9 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
       ? false
       : "requires running as WORKER_UID with WORKER_UID + RUNNER_UID group membership";
 
+  describe("real worker-UID initialization and session cleanup", { skip: INIT_SKIP }, () => {
   it(
     "run() initializes the FRESH per-run HOME to worker:runner 3770 BEFORE provisioning materializes it",
-    { skip: INIT_SKIP },
     async () => {
       // Single-uid (#58) non-root k8s: no UZI_UID_SPLIT, so run()'s worktree-posture assert is inert.
       const savedSplit = process.env.UZI_UID_SPLIT;
@@ -5704,6 +5704,111 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
       }
     },
   );
+describe("production session-seed cleanup (#2324)", () => {
+  it("refuses a planted seed root before adoption and retains it", async (t) => {
+    const root = await fs.mkdtemp(path.join("/tmp", "cdr-seed-refusal-"));
+    t.after(async () => {
+      const { restoreTreeWritability } = await import("../src/rmtree.js");
+      await restoreTreeWritability(root);
+      await fs.rm(root, { recursive: true, force: true });
+    });
+    await fs.chown(root, -1, RUNNER_UID);
+    await fs.chmod(root, 0o3775);
+    const home = path.join(root, "home");
+    const work = path.join(root, "work");
+    const victim = path.join(root, "outside");
+    await fs.mkdir(work);
+    await fs.chown(work, -1, RUNNER_UID);
+    await fs.chmod(work, 0o2770);
+    await fs.mkdir(victim);
+    await fs.writeFile(path.join(victim, "keep"), "outside");
+    const rig = makeRig();
+    let adopted = 0;
+    let planted: string | undefined;
+    const join = path.join;
+    const joinMock = t.mock.method(path, "join", (...parts: string[]) => {
+      const joined = join(...parts);
+      if (parts[0] === home && parts[1] === "codex-data" && (parts[2] ?? "").endsWith("-epoch-0") && planted === undefined) {
+        planted = `${joined}.session-seed`;
+        symlinkSync(victim, planted, "dir");
+      }
+      return joined;
+    });
+    const executor = new CodexExecutor(noopLog, home, {
+      binding: bindingOf(API_KEY), client: rig.client as never, provider, provisionHomeDir: root,
+    }, {
+      ...rig.deps,
+      provisionRunTools: async () => ({ toolEnv: {} }),
+      spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls),
+      launchProviderRoot: async () => { throw new Error("must not launch after a cleanup refusal"); },
+      sessionStore: { ...rig.deps.sessionStore!, adopt: async () => { adopted++; return { files: 0 }; } },
+    });
+    Object.defineProperty(executor, "providerLaunchInjected", { value: () => false });
+    try {
+      await assert.rejects(executor.run(makeCtx({ worktreePath: work }).ctx), /Codex session seed cleanup refused/);
+      assert.equal(adopted, 0, "refused content is never adopted");
+      assert.ok(planted, "the actual production staging name was planted");
+      assert.ok((await fs.lstat(planted)).isSymbolicLink(), "refused root remains for inspection");
+      assert.equal(await fs.readFile(join(victim, "keep"), "utf8"), "outside");
+    } finally { joinMock.mock.restore(); }
+  });
+
+  it("the production staging finally preserves outside files during swaps", async (t) => {
+    const root = await fs.mkdtemp(path.join("/tmp", "cdr-seed-race-"));
+    t.after(async () => {
+      const { restoreTreeWritability } = await import("../src/rmtree.js");
+      await restoreTreeWritability(root);
+      await fs.rm(root, { recursive: true, force: true });
+    });
+    await fs.chown(root, -1, RUNNER_UID);
+    await fs.chmod(root, 0o3775);
+    const home = path.join(root, "home");
+    const work = path.join(root, "work");
+    const victim = path.join(root, "outside");
+    await fs.mkdir(work);
+    await fs.chown(work, -1, RUNNER_UID);
+    await fs.chmod(work, 0o2770);
+    await fs.mkdir(victim);
+    const { seedRacedTree, startSwapRacer, RACED_FILES } = await import("./swap-racer.js");
+    const rig = makeRig();
+    const launchSentinel = new Error("stop after production session staging");
+    let racer: Awaited<ReturnType<typeof startSwapRacer>> | undefined;
+    let swaps = 0;
+    let adopted = 0;
+    const deps: CodexExecutorDeps = {
+      ...rig.deps,
+      launchProviderRoot: async () => { throw launchSentinel; },
+      provisionRunTools: async () => ({ toolEnv: {} }),
+      spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls),
+      sessionStore: {
+        ...rig.deps.sessionStore!,
+        adopt: async (_store, dest) => {
+          adopted += 1;
+          await seedRacedTree(dest, victim);
+          racer = await startSwapRacer(dest, victim, root);
+          return { files: 0 };
+        },
+      },
+    };
+    const executor = new CodexExecutor(noopLog, home, { binding: bindingOf(API_KEY), client: rig.client as never, provider, provisionHomeDir: root }, deps);
+    // Exercise actual production preparation/staging, then stop at the injected
+    // provider launcher before any model-bearing request.
+    Object.defineProperty(executor, "providerLaunchInjected", { value: () => false });
+    try {
+      await assert.rejects(executor.run(makeCtx({ worktreePath: work }).ctx), (error) => error === launchSentinel);
+      assert.ok(adopted > 0, "the production staging path ran");
+    } finally {
+      if (racer) swaps = await racer.stop();
+    }
+    assert.ok(swaps > 0, "positive intermediate swaps");
+    const names = (await fs.readdir(victim)).sort();
+    console.log(JSON.stringify({ site: "session-seed", swaps, outsideRemaining: names.length, outsideLost: RACED_FILES - names.length }));
+    assert.deepEqual(names, Array.from({ length: RACED_FILES }, (_, i) => `f${i}`).sort());
+    for (const name of names) assert.equal(await fs.readFile(path.join(victim, name), "utf8"), "keep\n");
+  });
+});
+
+  });
 });
 
 // ================================================================================
@@ -12174,108 +12279,5 @@ describe("M2 actual WorkerClient boundary cancellation", () => {
     assert.equal(actions, 0);
     await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 200 });
     assert.equal(getEventListeners(controller.signal, "abort").length, 0);
-  });
-});
-
-describe("production session-seed cleanup (#2324)", {
-  skip: process.platform !== "linux" || process.getuid?.() !== WORKER_UID || !process.getgroups?.().includes(RUNNER_UID)
-    ? "requires worker uid and runner-group membership" : false,
-}, () => {
-  it("refuses a planted seed root before adoption and retains it", async (t) => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cdr-seed-refusal-"));
-    t.after(async () => {
-      const { restoreTreeWritability } = await import("../src/rmtree.js");
-      await restoreTreeWritability(root);
-      await fs.rm(root, { recursive: true, force: true });
-    });
-    const home = path.join(root, "home");
-    const work = path.join(root, "work");
-    const victim = path.join(root, "outside");
-    await fs.mkdir(work);
-    await fs.chown(work, -1, RUNNER_UID);
-    await fs.chmod(work, 0o2770);
-    await fs.mkdir(victim);
-    await fs.writeFile(path.join(victim, "keep"), "outside");
-    const rig = makeRig();
-    let adopted = 0;
-    let planted: string | undefined;
-    const join = path.join;
-    const joinMock = t.mock.method(path, "join", (...parts: string[]) => {
-      const joined = join(...parts);
-      if (parts[0] === home && parts[1] === "codex-data" && (parts[2] ?? "").endsWith("-epoch-0") && planted === undefined) {
-        planted = `${joined}.session-seed`;
-        symlinkSync(victim, planted, "dir");
-      }
-      return joined;
-    });
-    const executor = new CodexExecutor(noopLog, home, {
-      binding: bindingOf(API_KEY), client: rig.client as never, provider, provisionHomeDir: root,
-    }, {
-      ...rig.deps,
-      provisionRunTools: async () => ({ toolEnv: {} }),
-      spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls),
-      launchProviderRoot: async () => { throw new Error("must not launch after a cleanup refusal"); },
-      sessionStore: { ...rig.deps.sessionStore!, adopt: async () => { adopted++; return { files: 0 }; } },
-    });
-    Object.defineProperty(executor, "providerLaunchInjected", { value: () => false });
-    try {
-      await assert.rejects(executor.run(makeCtx({ worktreePath: work }).ctx), /Codex session seed cleanup refused/);
-      assert.equal(adopted, 0, "refused content is never adopted");
-      assert.ok(planted, "the actual production staging name was planted");
-      assert.ok((await fs.lstat(planted)).isSymbolicLink(), "refused root remains for inspection");
-      assert.equal(await fs.readFile(join(victim, "keep"), "utf8"), "outside");
-    } finally { joinMock.mock.restore(); }
-  });
-
-  it("the production staging finally preserves outside files during swaps", async (t) => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cdr-seed-race-"));
-    t.after(async () => {
-      const { restoreTreeWritability } = await import("../src/rmtree.js");
-      await restoreTreeWritability(root);
-      await fs.rm(root, { recursive: true, force: true });
-    });
-    const home = path.join(root, "home");
-    const work = path.join(root, "work");
-    const victim = path.join(root, "outside");
-    await fs.mkdir(work);
-    await fs.chown(work, -1, RUNNER_UID);
-    await fs.chmod(work, 0o2770);
-    await fs.mkdir(victim);
-    const { seedRacedTree, startSwapRacer, RACED_FILES } = await import("./swap-racer.js");
-    const rig = makeRig();
-    const launchSentinel = new Error("stop after production session staging");
-    let racer: Awaited<ReturnType<typeof startSwapRacer>> | undefined;
-    let swaps = 0;
-    let adopted = 0;
-    const deps: CodexExecutorDeps = {
-      ...rig.deps,
-      launchProviderRoot: async () => { throw launchSentinel; },
-      provisionRunTools: async () => ({ toolEnv: {} }),
-      spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls),
-      sessionStore: {
-        ...rig.deps.sessionStore!,
-        adopt: async (_store, dest) => {
-          adopted += 1;
-          await seedRacedTree(dest, victim);
-          racer = await startSwapRacer(dest, victim, root);
-          return { files: 0 };
-        },
-      },
-    };
-    const executor = new CodexExecutor(noopLog, home, { binding: bindingOf(API_KEY), client: rig.client as never, provider, provisionHomeDir: root }, deps);
-    // Exercise actual production preparation/staging, then stop at the injected
-    // provider launcher before any model-bearing request.
-    Object.defineProperty(executor, "providerLaunchInjected", { value: () => false });
-    try {
-      await assert.rejects(executor.run(makeCtx({ worktreePath: work }).ctx), (error) => error === launchSentinel);
-      assert.ok(adopted > 0, "the production staging path ran");
-    } finally {
-      if (racer) swaps = await racer.stop();
-    }
-    assert.ok(swaps > 0, "positive intermediate swaps");
-    const names = (await fs.readdir(victim)).sort();
-    console.log(JSON.stringify({ site: "session-seed", swaps, outsideRemaining: names.length, outsideLost: RACED_FILES - names.length }));
-    assert.deepEqual(names, Array.from({ length: RACED_FILES }, (_, i) => `f${i}`).sort());
-    for (const name of names) assert.equal(await fs.readFile(path.join(victim, name), "utf8"), "keep\n");
   });
 });

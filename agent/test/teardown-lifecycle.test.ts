@@ -19,6 +19,10 @@ const surfaces = ["terminal HOME", "provision", "model pass", "job workspace"] a
 type Surface = typeof surfaces[number];
 type Seed = (target: string) => Promise<void>;
 
+function cleanupWarning(surface: Surface, line: unknown): boolean {
+  return JSON.stringify(line).includes(surface === "terminal HOME" ? "run HOME cleanup failed" : "cleanup failed");
+}
+
 async function exists(target: string): Promise<boolean> {
   return fs.lstat(target).then(() => true, () => false);
 }
@@ -118,7 +122,7 @@ for (const surface of surfaces) {
           if (readOnly) await fs.chmod(sub, 0o555);
         });
         assert.equal(await exists(out.target), !linux);
-        if (!linux) assert.ok(out.lines.some((l) => JSON.stringify(l).includes("cleanup failed")));
+        if (!linux) assert.ok(out.lines.some((l) => cleanupWarning(surface, l)));
         assert.equal(await fs.readFile(path.join(victim, "precious"), "utf8"), "keep\n");
       }));
     }
@@ -131,7 +135,7 @@ for (const surface of surfaces) {
           else await fs.writeFile(target, "keep root");
         });
         assert.equal(await exists(out.target), true);
-        assert.ok(out.lines.some((l) => JSON.stringify(l).includes("cleanup failed")));
+        assert.ok(out.lines.some((l) => cleanupWarning(surface, l)));
         assert.equal(await fs.readFile(path.join(victim, "precious"), "utf8"), "keep\n");
       }));
     }
@@ -143,6 +147,7 @@ for (const surface of surfaces) {
           await fs.writeFile(path.join(target, "keep"), "retained");
         }, {
           removeTreePinned: async (p, n, opts) => {
+            if (surface === "terminal HOME" && (p !== parent || n.startsWith(".uzi-skills-"))) return rmTreePinned(p, n, opts);
             ran = true;
             if (surface === "model pass") assert.equal(isLiveModelPassHome(path.join(p, n)), true);
             return rmTreePinned(p, n, {
@@ -154,7 +159,7 @@ for (const surface of surfaces) {
         });
         assert.equal(ran, true);
         assert.equal(await fs.readFile(path.join(out.target, "keep"), "utf8"), "retained");
-        const warning = out.lines.find((l) => JSON.stringify(l).includes("cleanup failed"));
+        const warning = out.lines.find((l) => cleanupWarning(surface, l));
         assert.ok(warning);
         if (linux) assert.match(JSON.stringify(warning), refusal === "owner" ? /not owned/ : refusal === "budget" ? /budget/ : /deadline passed/);
       }));
@@ -167,6 +172,7 @@ for (const surface of surfaces) {
       }, {
         now: () => 1234,
         removeTreePinned: async (p, n, opts) => {
+          if (surface === "terminal HOME" && (p !== parent || n.startsWith(".uzi-skills-"))) return rmTreePinned(p, n, opts);
           ran = true;
           assert.equal(p, parent);
           assert.equal(path.basename(n), n);
@@ -197,7 +203,7 @@ for (const surface of surfaces) {
       const names = (await fs.readdir(victim)).sort();
       assert.deepEqual(names, Array.from({ length: RACED_FILES }, (_, i) => "f" + i).sort());
       for (const name of names) assert.equal(await fs.readFile(path.join(victim, name), "utf8"), "keep\n");
-      assert.ok(!(await exists(out!.target)) || out!.lines.some((l) => JSON.stringify(l).includes("cleanup failed")));
+      assert.ok(!(await exists(out!.target)) || out!.lines.some((l) => cleanupWarning(surface, l)));
     }));
   });
 }

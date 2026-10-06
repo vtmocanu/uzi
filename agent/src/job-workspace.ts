@@ -164,7 +164,8 @@ async function assertRealJobsRoot(jobsRoot: string): Promise<void> {
 }
 
 /** Create `<jobsRoot>/<runId>` (0700 single-uid; under the uid split the setgid codex-session modes: root 2750, home 2770, work 2750 then 2770, inputs 2750, outputs 2770, files 0640) with its home/work/inputs/outputs subtree. A leftover tree for the
- *  same run id (a requeue on this worker after a hard kill) is removed first. */
+ *  same run id (a requeue on this worker after a hard kill) is removed only after an
+ *  exclusive mkdir reports EEXIST. Refusal aborts; retained content is never reused. */
 export async function createJobWorkspace(
   jobsRoot: string,
   runId: string,
