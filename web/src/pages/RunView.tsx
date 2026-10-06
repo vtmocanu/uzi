@@ -1836,6 +1836,41 @@ function outcomePendingReasonLabel(reason: string): string {
   }
 }
 
+// These fields describe creation-time assessment, never current authorization.
+function IssueInputHistory({ run }: { run: Run }) {
+  const blocked = [...new Set(run.auto_approve_blocked_reasons ?? [])];
+  const issueReason = run.issue_input_reason;
+  if (blocked.length === 0 && !issueReason) return null;
+  const blockedCopy = (reason: string) => {
+    switch (reason) {
+      case "author_not_eligible":
+        return "Required repo access was missing for some issue input.";
+      case "permission_unknown":
+        return "Repo access couldn't be checked for some issue input.";
+      default:
+        return "Some issue input could not be verified for automatic approval.";
+    }
+  };
+  const issueCopy = issueReason === "author_not_eligible"
+    ? "At run creation, the issue author's repo access was below the required threshold."
+    : issueReason === "permission_unknown"
+      ? "At run creation, the issue author's repo access couldn't be checked."
+      : "At run creation, the issue author's repo access could not be verified.";
+  return (
+    <section aria-label="Issue input at run creation" className="rounded-lg border border-info/40 bg-info/10 p-4 text-sm">
+      {blocked.length > 0 && (
+        <>
+          <p className="font-medium">Scheduled automatic approval was disabled.</p>
+          <ul className="mt-2 list-disc pl-5">
+            {[...new Set(blocked.map(blockedCopy))].map((copy) => <li key={copy}>{copy}</li>)}
+          </ul>
+        </>
+      )}
+      {issueReason && <p className={blocked.length > 0 ? "mt-2" : undefined}>{issueCopy}</p>}
+    </section>
+  );
+}
+
 export function RunView() {
   const { id = "" } = useParams();
   const currentRunIdRef = useRef(id);
@@ -2548,6 +2583,8 @@ export function RunView() {
       <div className="sr-only" role="status" aria-live="polite">
         {resumeAnnounce || parkAnnounce}
       </div>
+
+      <IssueInputHistory run={run} />
 
       {error && <Alert message={error} />}
       {actionErr && <Alert message={actionErr} />}

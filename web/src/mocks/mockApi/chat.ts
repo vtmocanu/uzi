@@ -65,6 +65,8 @@ export const chatApi = {
       requeue_count: 0,
       iteration_count: 0,
       auto_approve: false,
+      auto_approve_blocked_reasons: [],
+      issue_input_reason: null,
       worker_id: "w-laptop",
       branch: null,
       model: null,

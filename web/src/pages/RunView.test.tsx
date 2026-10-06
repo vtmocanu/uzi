@@ -167,6 +167,8 @@ function run(over: Partial<Run>): Run {
     requeue_count: 0,
     iteration_count: 0,
     auto_approve: false,
+    auto_approve_blocked_reasons: [],
+    issue_input_reason: null,
     worker_id: "w1",
     branch: null,
     model: null,
@@ -219,6 +221,134 @@ function run(over: Partial<Run>): Run {
     ...over,
   };
 }
+
+describe("RunView issue-input creation history", () => {
+  const extra = mockApi as unknown as Record<string, unknown>;
+  const disabledCopy = "Scheduled automatic approval was disabled.";
+  const missingCopy = "Required repo access was missing for some issue input.";
+  const unknownCopy = "Repo access couldn't be checked for some issue input.";
+
+  beforeEach(() => {
+    extra.listWorkers = vi.fn().mockResolvedValue({ workers: [] });
+    extra.listSecrets = vi.fn().mockResolvedValue({ secrets: [] });
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+  });
+  afterEach(() => {
+    delete extra.listWorkers;
+    delete extra.listSecrets;
+  });
+
+  function stream(over: Partial<Run>, submit = vi.fn().mockResolvedValue(undefined), canSteer = true) {
+    mockUseRunStream.mockReturnValue({
+      run: run({ trigger_source: "schedule", gate_revision: 2, ...over }),
+      messages: [],
+      connected: true,
+      error: "",
+      submit,
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer,
+    } as unknown as ReturnType<typeof useRunStream>);
+    return submit;
+  }
+  function page() {
+    return <MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>;
+  }
+
+  it.each([
+    ["author_not_eligible", missingCopy],
+    ["permission_unknown", unknownCopy],
+  ])("explains %s with fixed copy", (reason, copy) => {
+    stream({ auto_approve_blocked_reasons: [reason] });
+    render(page());
+    expect(screen.getByText(disabledCopy)).toBeTruthy();
+    expect(screen.getByText(copy)).toBeTruthy();
+    expect(screen.queryByText(reason)).toBeNull();
+  });
+
+  it("shows both recorded reasons", () => {
+    stream({ auto_approve_blocked_reasons: ["author_not_eligible", "permission_unknown"] });
+    render(page());
+    expect(screen.getByText(missingCopy)).toBeTruthy();
+    expect(screen.getByText(unknownCopy)).toBeTruthy();
+  });
+
+  it.each([
+    ["empty", [], null],
+    ["omitted", undefined, undefined],
+  ] as const)("adds no notice for %s fields", (_name, reasons, issueReason) => {
+    stream({ auto_approve_blocked_reasons: reasons ? [...reasons] : undefined, issue_input_reason: issueReason });
+    render(page());
+    expect(screen.queryByText(disabledCopy)).toBeNull();
+    expect(screen.queryByRole("region", { name: "Issue input at run creation" })).toBeNull();
+    expect(screen.getByRole("button", { name: /Approve plan/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Request changes" })).toBeTruthy();
+  });
+
+  it.each([
+    ["author_not_eligible", "At run creation, the issue author's repo access was below the required threshold."],
+    ["permission_unknown", "At run creation, the issue author's repo access couldn't be checked."],
+  ])("uses the dedicated issue-input reason %s without an auto-approval block", (reason, copy) => {
+    stream({ trigger_source: "manual", issue_input_reason: reason });
+    render(page());
+    expect(screen.getByText(copy)).toBeTruthy();
+    expect(screen.queryByText(disabledCopy)).toBeNull();
+  });
+
+  it("keeps the creation history from queued through the gate and after approval", () => {
+    const history = {
+      auto_approve_blocked_reasons: ["author_not_eligible", "permission_unknown"],
+      issue_input_reason: "permission_unknown",
+    };
+    stream({ ...history, status: "queued", plan_md: null });
+    const view = render(page());
+    expect(screen.getByText(disabledCopy)).toBeTruthy();
+    for (const status of ["awaiting_approval", "running", "completed"] as const) {
+      stream({ ...history, status });
+      view.rerender(page());
+      expect(screen.getByText(disabledCopy)).toBeTruthy();
+      expect(screen.getByText(missingCopy)).toBeTruthy();
+      expect(screen.getByText(unknownCopy)).toBeTruthy();
+      expect(screen.getByText("At run creation, the issue author's repo access couldn't be checked.")).toBeTruthy();
+    }
+  });
+
+  it("renders future reasons generically without exposing raw codes", () => {
+    stream({ auto_approve_blocked_reasons: ["future-private-code"], issue_input_reason: "future-input-code" });
+    const view = render(page());
+    expect(screen.getByText(disabledCopy)).toBeTruthy();
+    expect(screen.getByText("Some issue input could not be verified for automatic approval.")).toBeTruthy();
+    expect(screen.getByText("At run creation, the issue author's repo access could not be verified.")).toBeTruthy();
+    expect(view.container.innerHTML).not.toContain("future-private-code");
+    expect(view.container.innerHTML).not.toContain("future-input-code");
+  });
+
+  it("preserves manual approval with recorded reasons", async () => {
+    const submit = stream({ auto_approve_blocked_reasons: ["author_not_eligible", "permission_unknown"] });
+    render(page());
+    await act(async () => fireEvent.click(await screen.findByRole("button", { name: /Approve plan/ })));
+    await waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
+    expect(submit.mock.calls[0][0]).toBe("approve_plan");
+    expect(submit.mock.calls[0][5]).toBe(2);
+  });
+
+  it("preserves manual revision with recorded reasons", async () => {
+    const submit = stream({ auto_approve_blocked_reasons: ["permission_unknown"], issue_input_reason: "permission_unknown" });
+    render(page());
+    fireEvent.click(await screen.findByRole("button", { name: "Request changes" }));
+    fireEvent.change(screen.getByPlaceholderText(/sent to the planning session/), { target: { value: "Split the work" } });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: /Send & revise/ })));
+    await waitFor(() => expect(submit).toHaveBeenCalledWith("revise_plan", "Split the work", undefined, undefined, undefined, 2));
+  });
+
+  it("keeps approval controls unavailable to a viewer who cannot steer", () => {
+    stream({ auto_approve_blocked_reasons: ["permission_unknown"] }, undefined, false);
+    render(page());
+    expect(screen.getByText(disabledCopy)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Approve plan/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Request changes" })).toBeNull();
+  });
+});
 
 describe("PlanPanel agent picker (PRD #37 M4)", () => {
   it("State A: repo detected → approve button labels the repo-agent default", async () => {
