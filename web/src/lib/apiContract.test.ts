@@ -1380,3 +1380,13 @@ describe("api-contract fixtures are present and discriminating", () => {
     });
   }
 });
+
+
+describe("worker custody decision contract", () => {
+  it("records populated counts while zero DTOs omit the optional field", () => {
+    expect(workerFull.custody_decisions_needed).toBe(1);
+    expect(adminWorkerFull.custody_decisions_needed).toBe(1);
+    expect(workerZero).not.toHaveProperty("custody_decisions_needed");
+    expect(adminWorkerZero).not.toHaveProperty("custody_decisions_needed");
+  });
+});

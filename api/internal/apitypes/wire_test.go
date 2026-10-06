@@ -874,9 +874,8 @@ var workerDTOKeys = []string{
 	// each entry a {run_id, phase, claim_generation}. ALWAYS a JSON array, never null — the
 	// list/patch overlay reads it from the DB and the builders seed it to []. Display-only.
 	"reported_runs",
-	// PRD #1296 M4 (D4): true when the worker holds an OPEN durable-recovery custody hold —
-	// it retained committed work a run could not publish. Distinct from busy (a held worker
-	// consumes no run/LLM slot) but still counts against the per-owner hosted quota.
+	// True for ANY open custody hold, healthy live runs included. Independent of busy
+	// and owner decisions; protects deletion, cleanup and hosted-quota safety guards.
 	"retaining_unpublished_work",
 	"template_declared", "template_reported", "version",
 	// PRD #113: derived upgrade health, computed at read time from `version` against

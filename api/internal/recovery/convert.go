@@ -107,13 +107,28 @@ const (
 // run has ended and now needs an owner decision (source_only).
 var custodyRunTerminalStatuses = map[string]bool{"completed": true, "failed": true, "cancelled": true}
 
+type holdAttentionInput struct {
+	State               string
+	HasAvailableCapture bool
+	CaptureState        string
+	RunStatus           string
+}
+
+func ownerHoldAttentionInput(row store.ListCustodyHoldsForOwnerRow) holdAttentionInput {
+	return holdAttentionInput{State: row.State, HasAvailableCapture: row.HasAvailableCapture, CaptureState: row.CaptureState, RunStatus: row.RunStatus}
+}
+
+func batchHoldAttentionInput(row store.ListOpenCustodyHoldsForWorkersRow) holdAttentionInput {
+	return holdAttentionInput{State: row.State, HasAvailableCapture: row.HasAvailableCapture, CaptureState: row.CaptureState, RunStatus: row.RunStatus}
+}
+
 // deriveHoldAttention computes a hold's server-derived Attention from its state, capture
 // summary and run status (PRD #1349 M5, D6/D8). Precedence for an OPEN hold: a ready archive
 // (archive_ready, self-releasing) → a capture in flight (capturing) → a stalled/failed capture
 // (needs_action) → a still-live run (active protection) → otherwise a capture-less hold whose
 // run has ended, or whose run is gone/unknown, needs an owner decision (source_only). A
 // non-open hold reports its terminal disposition directly.
-func deriveHoldAttention(row store.ListCustodyHoldsForOwnerRow) string {
+func deriveHoldAttention(row holdAttentionInput) string {
 	switch row.State {
 	case "discarded":
 		return attentionDiscarded
@@ -152,7 +167,7 @@ func custodyHoldToDTO(row store.ListCustodyHoldsForOwnerRow) apitypes.RecoveryCu
 		RunID:                   row.RunID.String(),
 		Generation:              row.Generation,
 		State:                   row.State,
-		Attention:               deriveHoldAttention(row),
+		Attention:               deriveHoldAttention(ownerHoldAttentionInput(row)),
 		WorkerID:                row.OriginalWorkerID.String(),
 		WorkerName:              row.WorkerName,
 		HasAvailableCapture:     row.HasAvailableCapture,

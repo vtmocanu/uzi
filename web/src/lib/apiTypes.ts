@@ -2232,11 +2232,12 @@ export interface Worker {
   // literals compile while the wire contract stays a never-null array (pinned by the api-contract
   // parity check against the recorded fixtures).
   reported_runs?: WorkerReportedRun[];
-  // retaining_unpublished_work (PRD #1296 M4): true when the worker holds an OPEN
-  // durable-recovery custody hold (unpublished committed work not yet archived), so
-  // teardown is deferred. Distinct from busy/active_runs — it consumes no run slot.
+  // True for ANY open custody hold, healthy live runs included. Protects local source
+  // through deletion, cleanup and hosted-quota safety guards; independent of owner decisions.
   // Optional in TS (mocks/older payloads may omit it); the api always sends it.
   retaining_unpublished_work?: boolean;
+  // List-only owner decision count; explicit zero on success, absent on a failed read.
+  custody_decisions_needed?: number;
   // disk_pressure_threshold (PRD #1809 D5): the api's UZI_DISK_PRESSURE_THRESHOLD, set only
   // on the worker's own heartbeat response (the worker derives its reclaim/admission and hard-stop
   // thresholds from it); absent from every list/admin response.

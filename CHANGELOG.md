@@ -35,6 +35,9 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **Worker lists report custody decisions needed.**
+  Owner and admin worker lists include an explicit count of recovery holds requiring an owner decision, omitting the count if its read fails while preserving all custody safety guards.
+
 - **`uzi tui` has a workers tab ([#2275](https://github.com/vtmocanu/uzi/issues/2275)).**
   A `workers` tab (key `2`; pulls and ci move to `3` and `4`) lists your workers, or the factory's with `a`, attention first: state, kind, slots, CPU, memory, worst disk, version, heartbeat and what needs a human; `enter` or `→` opens a worker's detail (attention, reported runs, resources, configuration) and its runs. Uppercase `W` in a run opens its worker, and `esc`/`←` returns to where you came from. The fleet status rides right-aligned on the title line, the split's top pane can show floor or workers, and the floor names each run's worker on wide terminals.
 

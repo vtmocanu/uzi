@@ -63,14 +63,13 @@ type WorkerDTO struct {
 	// array, never null — the list/patch handlers overlay it from the DB and the DTO builders
 	// seed it to [] — so a worker the snapshot table has no row for encodes as [], not null.
 	ReportedRuns []WorkerReportedRunDTO `json:"reported_runs"`
-	// RetainingUnpublishedWork marks a worker holding an OPEN durable-recovery custody
-	// hold (PRD #1296 M4, D4): it committed work a run could not publish and is keeping
-	// the last local source until the archive is captured or the owner discards it.
-	// Distinct from Busy — such a worker consumes no active run or LLM slot, but it is
-	// NOT free fleet capacity and still counts against the per-owner hosted quota, so the
-	// owner surface flags it as "retaining unpublished work" rather than idle. Always
-	// false once custody is released or discarded.
+	// RetainingUnpublishedWork is true for ANY open custody hold, including healthy live
+	// runs. It protects local source through deletion, cleanup and hosted-quota safety guards.
+	// It is independent of owner decisions and false once all holds are released or discarded.
 	RetainingUnpublishedWork bool `json:"retaining_unpublished_work"`
+	// CustodyDecisionsNeeded counts holds requiring an owner decision on list endpoints.
+	// A successful read sends zero or a positive count; read failures and other producers omit it.
+	CustodyDecisionsNeeded *int `json:"custody_decisions_needed,omitempty"`
 	// DiskPressureThreshold is the api's configured UZI_DISK_PRESSURE_THRESHOLD, the
 	// used/total fraction in (0,1] at/above which a volume counts as under disk pressure
 	// (PRD #1809 D5): the worker derives its soft reclaim/admission and hard stop

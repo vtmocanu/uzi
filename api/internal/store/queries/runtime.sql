@@ -98,9 +98,9 @@ SELECT w.*,
              AND r.kind <> 'chat'
        ) AS active_runs,
        -- retaining_unpublished_work (PRD #1296 M4, D4): does this worker hold any OPEN
-       -- custody hold? A held worker consumes NO active run/LLM slot (so it is not counted
-       -- in busy/active_runs above), but it is NOT free capacity — it still counts against
-       -- the per-owner hosted quota, and the owner surface distinguishes it. A top-level
+       -- custody hold? Healthy live runs included: custody is independent of busy/active_runs
+       -- and owner decisions. It protects source through deletion, cleanup and per-owner
+       -- hosted-quota safety guards. A top-level
        -- EXISTS types as a plain Go bool here, exactly like the busy column above.
        EXISTS (
            SELECT 1 FROM recovery_custody_holds h

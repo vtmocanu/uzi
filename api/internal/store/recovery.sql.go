@@ -910,6 +910,57 @@ func (q *Queries) ListCustodyHoldsForWorkerRun(ctx context.Context, arg ListCust
 	return items, nil
 }
 
+const listOpenCustodyHoldsForWorkers = `-- name: ListOpenCustodyHoldsForWorkers :many
+SELECT w.id AS worker_id, h.state,
+    (EXISTS (SELECT 1 FROM recovery_captures c
+        WHERE c.hold_id = h.id AND c.state = 'available'))::boolean AS has_available_capture,
+    COALESCE((SELECT c.state FROM recovery_captures c
+        WHERE c.hold_id = h.id
+        ORDER BY c.created_at DESC, c.id DESC
+        LIMIT 1), '')::text AS capture_state,
+    COALESCE(r.status, '')::text AS run_status
+FROM workers w
+JOIN recovery_custody_holds h ON h.live_worker_id = w.id AND h.user_id = w.user_id
+LEFT JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
+WHERE w.id = ANY($1::uuid[]) AND h.state = 'open'
+`
+
+type ListOpenCustodyHoldsForWorkersRow struct {
+	WorkerID            uuid.UUID `json:"worker_id"`
+	State               string    `json:"state"`
+	HasAvailableCapture bool      `json:"has_available_capture"`
+	CaptureState        string    `json:"capture_state"`
+	RunStatus           string    `json:"run_status"`
+}
+
+// Display-only attention inputs for the authorized workers returned by a list endpoint.
+// Live custody determines which worker holds the source; original custody is provenance.
+func (q *Queries) ListOpenCustodyHoldsForWorkers(ctx context.Context, workerIds []uuid.UUID) ([]ListOpenCustodyHoldsForWorkersRow, error) {
+	rows, err := q.db.Query(ctx, listOpenCustodyHoldsForWorkers, workerIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListOpenCustodyHoldsForWorkersRow{}
+	for rows.Next() {
+		var i ListOpenCustodyHoldsForWorkersRow
+		if err := rows.Scan(
+			&i.WorkerID,
+			&i.State,
+			&i.HasAvailableCapture,
+			&i.CaptureState,
+			&i.RunStatus,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listOwnersOverCustodyLimit = `-- name: ListOwnersOverCustodyLimit :many
 
 SELECT h.user_id
