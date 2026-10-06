@@ -293,8 +293,8 @@ every tunable in this section and its default.
 A worker can **quarantine** itself ([#2213](https://github.com/vtmocanu/uzi/issues/2213);
 design record [ADR-2213](../adr/2213-worker-residue-quarantine.md)). It is a fail-closed
 stop for one situation: a process running as the worker's own runner uid, whose
-environment and working directory cannot be read and that nothing ties to a live
-run, was found on the worker. On a single-uid worker such a process may read the
+environment or working directory cannot be read (either one) and that nothing ties
+to a live run, was found on the worker. On a single-uid worker such a process may read the
 environment of every child the worker starts afterwards, which holds the forge
 token (a git child) or a provider credential (a Claude or Codex turn), and
 nothing on that worker can kill or contain it.
@@ -302,8 +302,9 @@ nothing on that worker can kill or contain it.
 **What triggers it.** Only a single-uid Linux worker quarantines, and only for
 that one finding (the process-quiescence verdict reason `unreadable_unattributed`).
 A worker-wide, credential-free scan runs on every claim before the clone fetch
-(both harnesses, and the review lane before its fetch) and inside every
-quiescence proof. Under the [uid split](proc-hardening.md) a worker never
+(both harnesses, and the review lane before its fetch) and inside the quiescence
+proofs that scan processes. A Codex run's own-mode proof does not scan processes,
+so it neither scans nor latches. Under the [uid split](proc-hardening.md) a worker never
 quarantines: the existing solitary-kill path and the uid boundary already contain
 the process. Every other unproven state (a kill that could not be confirmed, a
 HOME reap that left a process, an unreadable status file, a helper failure) keeps
@@ -318,12 +319,19 @@ worker.
 
 A provider turn that was already running when the worker quarantined is **not**
 killed: it runs to its boundary (the end of that turn, plan step or iteration),
-where the run stops. Heartbeats, outbox draining, terminal reports and journal
-sweeps keep running, so the worker stays visible and its runs can be reported.
+where the run stops. Heartbeats, outbox draining and the terminal-report and
+outbox journals keep running, so the worker stays visible and its runs can be
+reported. The live recovery re-drive and the predecessor settlement sweep are
+skipped while quarantined.
 
 **What happens to active runs.** Each one fails with `fail_origin =
-worker_residue_blocked` (see [Run activity](run-activity.md)), and the failure
-reason says the worker is quarantined. The failed run's clone, its generation
+worker_residue_blocked` (see [Run activity](run-activity.md)). The reason differs
+by run. The run whose check detected the process fails with a plain residue-blocked
+reason that names the process, not the quarantine: before the clone fetch it reads
+"could not be proven gone by the worker-wide check before the clone fetch (...); no
+clone was fetched", and at a later proof "the run's clone could not be proven
+quiescent (...)". A run refused afterwards by the latch fails with "this worker is
+quarantined (...)". The failed run's clone, its generation
 hold, its recovery pins and its journal are kept. Nothing is uploaded and no
 custody is released while the worker is quarantined, so the run's held work is
 still there for the [usual recovery](run-recovery.md). Two releases are exempt,
@@ -333,8 +341,9 @@ clone existed (a pre-clone park). The terminal clone retire also keeps the clone
 while the worker is quarantined; a completed run's clone is therefore kept until
 you clean it up by hand, because no sweep removes it.
 
-**The local archive.** For a failed run with committed work already in the
-worker's bare repository, the worker also writes a verified, credential-free copy
+**The local archive.** For a run refused by the latch (the "this worker is
+quarantined" reason) with committed work already in the worker's bare repository,
+the worker also writes a verified, credential-free copy
 under the data directory (`/data` in the container, `UZI_DATA_DIR`):
 
 ```
@@ -343,21 +352,26 @@ under the data directory (`/data` in the container, `UZI_DATA_DIR`):
 ```
 
 The bundle is anchored in the bare by the ref `refs/uzi-archive/<runId>/g<generation>`.
-When the capture succeeds, the run's failure reason ends with `Committed work
+The run that detected the process gets no archive. When the capture succeeds,
+the run's failure reason ends with `Committed work
 archived on the worker: head <H>, bundle sha256 <S>.` Without that sentence there
 is no verified archive (no committed work in the bare, a failed verification, a
 bundle over the recovery size cap, or the 120-second capture deadline). Only the
 commits already in the bare are covered; commits and uncommitted edits newer than
 the last checkpoint exist only in the kept clone. Check an archive on the worker
-against the head in the failure reason:
+against the head in the failure reason. `git bundle verify` needs a repository
+and the worker image's working directory (`/app`) is not one, so verify inside a
+throwaway bare repository:
 
 ```
-git bundle verify <dataDir>/recovery-archive/<runId>/g<generation>.bundle
 git bundle list-heads <dataDir>/recovery-archive/<runId>/g<generation>.bundle
 sha256sum <dataDir>/recovery-archive/<runId>/g<generation>.bundle
+git init --bare /tmp/verify.git
+git --git-dir=/tmp/verify.git bundle verify <dataDir>/recovery-archive/<runId>/g<generation>.bundle
 ```
 
-`list-heads` must name exactly `<H>`, and the `sha256sum` must equal `<S>`. Those
+`list-heads` (which works anywhere) must name exactly `<H>`, the `sha256sum` must
+equal `<S>`, and `bundle verify` must report the bundle is okay. Those
 two values live in the api's run row, which a process on the worker cannot reach,
 so a mismatch means the file was altered after it was written. Nothing is
 uploaded off the worker: it is a local copy, not a recovery capture, and it is not
@@ -379,12 +393,15 @@ its own; adding one would break this release rule.
   text; the cause comes from the worker and is untrusted).
 - `uzi admin workers --json` carries `residue_quarantined_at` and
   `residue_quarantine_cause` on each worker.
-- The web worker list shows the quarantine for the worker.
+- The web Workers settings page and the admin worker lists show a `quarantined`
+  badge on the worker; its tooltip carries the latch age and the reported cause
+  (untrusted text).
 - **Admin → Health** raises the `fleet.quarantine` warning, see
   [Admin health](admin-health.md#the-checks).
 
-The api learns of it from the worker's heartbeat only (the worker advertises the
-`worker_residue_quarantine` feature), so an api restart shows the worker as not
+The api learns of it from the worker's heartbeat only (the api advertises the
+`worker_residue_quarantine` feature and the worker sends the member only when it
+did), so an api restart shows the worker as not
 quarantined until its next heartbeat. Any run can cause a quarantine by leaving
 such a process behind, so on a shared worker a restart is the cost of that.
 Credentials a process could read before it was detected are not revoked.

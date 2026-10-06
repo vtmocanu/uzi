@@ -41,7 +41,9 @@ forge-credentialed git child and no new provider turn, and claims nothing.
 
 A worker-wide, credential-free scan (a process-table read with nothing in scope and
 nothing signalled) runs on every claim before the clone fetch, for both harnesses
-and before the review runner's fetch, and inside every quiescence proof.
+and before the review runner's fetch, and inside the quiescence proofs that scan
+processes. A Codex run's own-mode proof does not (`quiesceRun` sets `processes:
+(!executor.safety || mode !== "own")`), so it neither scans nor latches.
 
 The latch cause is narrowed to the verdict reason `unreadable_unattributed`, and
 only that reason (an approver decision). A `kill_unconfirmed`, a HOME reap that left
@@ -60,7 +62,7 @@ with nothing awaited between the check and the start:
   refuse a child whose environment carries the forge Authorization header;
 - providers: every Claude `queryFn` call site, `defaultQueryFn` and the detached
   spawn belt, `launchCodexRoot`, the Codex transport's login, thread and turn
-  requests, and `releaseCodex`;
+  requests, and the epoch-start `releaseCodex` call;
 - claims: the run and chat claim loops claim nothing while latched.
 
 ### Fail typed, do not park
@@ -93,7 +95,7 @@ the quarantine exists to keep. So the ordinary path stays skipped.
 
 ### The additive archival capture
 
-A failed quarantined run instead gets a local, credential-free copy of the committed
+A run refused by the latch (`ResidueQuarantinedError`) instead gets a local, credential-free copy of the committed
 work already in the worker bare. It reads only the bare, runs only worker-uid git,
 never touches the runner clone, makes no reserve, upload or release call, and never
 deletes a pin or changes the journal or the hold:
@@ -113,7 +115,11 @@ deletes a pin or changes the journal or the hold:
 
 H and the sha256 are appended to the run's `failure_reason`. They live in the api's
 run row, which a same-uid survivor cannot reach, and detect a later tampering with
-the local file. The outcome never changes the typed failure. Where the capture
+the local file. The outcome never changes the typed failure. The run whose check detected the process
+fails with a plain `RunResidueBlockedError` (before the clone fetch: "could not be
+proven gone by the worker-wide check before the clone fetch"; at a later proof: "the
+run's clone could not be proven quiescent"), names the process rather than the
+quarantine and gets no archive. Where the capture
 cannot complete (no committed work in the bare, verification failure, over the size
 cap, deadline) nothing is appended.
 
@@ -134,7 +140,7 @@ The heartbeat carries `residue_quarantine` while latched, gated by the
 The api keeps it in an in-memory tracker (cleared by a heartbeat without the member)
 and overlays it as `residue_quarantined_at` and `residue_quarantine_cause` on worker
 DTOs, a `(quarantined)` suffix in `uzi worker list` and `uzi admin workers`, the TUI
-worker view, the web worker list, and the admin Health warning `fleet.quarantine`.
+worker view, the web `quarantined` badge (Workers settings page and admin worker lists, cause in its tooltip), and the admin Health warning `fleet.quarantine`.
 Operator steps are in [Quarantined worker](../docs/worker-setup.md#quarantined-worker).
 
 ## Consequences and residuals
@@ -159,7 +165,15 @@ credentialed git child and no new provider turn starts once the latch is held.
   shared worker, bounded by a restart and attributed in Health.
 - **Completed-run clone.** Kept forever while latched and after, until cleaned by
   hand.
-- **Skipped terminal quiesce.** A run that is already latched when it fails skips its
-  terminal quiesce, as a residue-blocked run did before.
+- **Skipped terminal quiesce.** Any run whose failure path already set
+  `preserveRecoveryClone` (latched when it fails, or a latch caught before its settle)
+  skips the `terminal_retire` quiesce, as residue-blocked runs did before.
+- **Ungated Codex credential paths.** Only the epoch-start `releaseCodex` call is
+  gated. The advice harness's initial `bridge.release` and the api_key refresh are
+  not, so while latched a provider token can still be fetched into worker memory,
+  though no new turn starts (launch and login are gated).
 - **Visibility gap.** After an api restart a latched worker shows as not quarantined
   until its next heartbeat.
+- **Stale badge.** A quarantined badge can show on a worker whose heartbeat went
+  stale while `fleet.quarantine` (fresh heartbeats only) reports none, for up to the
+  tracker's 10-minute TTL.
