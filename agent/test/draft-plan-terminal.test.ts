@@ -5,8 +5,9 @@ import path from "node:path";
 import { Outbox } from "../src/outbox.js";
 import { nullLogger } from "./helpers.js";
 import { RunTurnReducerImpl } from "../src/harness-reducer.js";
+import { RunRunner } from "../src/runner.js";
 import type { Executor } from "../src/executor.js";
-import { api, fakeGitlab, gitlabClaim, installHarness, runner } from "./runner-harness.js";
+import { api, client, git, fakeGitlab, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 import { commitInTree, fixture } from "./codex-reap-fixture.js";
 import { capture, claudeScript, request } from "./draft-plan-script.js";
 
@@ -61,7 +62,16 @@ for (const [name, status, live] of [
           throw original;
         },
       };
-      await runner(executor, fakeGitlab().gitlab, undefined, { recovery: coord, outbox, outboxTerminalMaxBytes: 1 << 20, gapFillMax: 100 }).execute(claim);
+      const gitlab = fakeGitlab().gitlab;
+      const options = { recovery: coord, outbox, outboxTerminalMaxBytes: 1 << 20, gapFillMax: 100 };
+      // Defer timer delivery beyond this test\'s deadline: only ordinary close can
+      // initiate this case\'s first post, after generic failure\'s suppression check.
+      const run = closePermanent
+        ? new RunRunner(client, git, () => ({ executor }), nullLogger(), 1_000_000_000, undefined, {
+          pollMs: 5, planApprovalTimeoutMs: 0, questionTimeoutMs: 600, prDescriptionHeadLagMs: 0, gitlab, ...options,
+        })
+        : runner(executor, gitlab, undefined, options);
+      await run.execute(claim);
       const failed = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed");
       assert.equal(failed.length, closePermanent ? 2 : 1);
       if (status === 503) assert.equal(failed[0]?.body.failure_reason, original.message);

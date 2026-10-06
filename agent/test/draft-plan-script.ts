@@ -36,7 +36,7 @@ export function capture(plan_md: unknown, markers = {}): unknown {
 }
 
 /** Finite script: each notification is consumed once; an injected throw ends the iterator. */
-export function codexScript(notes: CodexNotification[], failure?: Error) {
+export function codexScript(notes: CodexNotification[], failure?: Error, scrubProjected?: (s: string) => string) {
   let harness: CodexHarness;
   const replies: unknown[] = [];
   const replied = new Set<string | number>();
@@ -87,7 +87,7 @@ export function codexScript(notes: CodexNotification[], failure?: Error) {
   harness = new CodexHarness({
     registry, broker, workspace: "/tmp/draft-test", homeDir: "/tmp/draft-codex",
     provider: { name: "openai", baseUrl: "http://127.0.0.1:9/v1", envKey: "OPENAI_API_KEY", model: "test" },
-    log: nullLogger(), sessionInspect: async () => "unknown",
+    log: nullLogger(), sessionInspect: async () => "unknown", scrubProjected,
     launchRoot: async () => ({ transport, supervisorPid: 4321,
       root: { kind: "provider", reap: async () => { reaps++; return { ok: true }; }, dispose: async () => {} } }),
   });

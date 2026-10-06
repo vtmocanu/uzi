@@ -14,6 +14,8 @@ import { capture, claudeScript, codexScript, request, toolNote } from "./draft-p
 
 const ack = "Draft capture requested; this is not plan submission or approval.";
 const tool = "save_draft_plan";
+const completed = { kind: "turn_completed" as const, method: "turn/completed", threadId: "th-1", turnId: "tn-1", status: "completed",
+  params: { threadId: "th-1", turn: { id: "tn-1", status: "completed" } } };
 
 test("Claude registration requires nonblank Markdown and enforces decoded maxLength before trim", async () => {
   const server = buildSignalMcpServer() as unknown as { instance: { _registeredTools: Record<string, {
@@ -174,6 +176,95 @@ test("sanitize whole input, redact whole secrets spanning the cutoff, then trunc
   assert.equal(out.plan_md, head + "***REDAC");
   assert.equal(out.truncated, true);
   assert.equal(JSON.stringify(out).includes("glpat-"), false);
+});
+
+test("Codex accepted drafts use live runtime redaction before batcher truncation", async () => {
+  const first = "glpat-" + "abcdefghijklmnopqrst";
+  const refreshed = "glpat-" + "zyxwvutsrqponmlkjihg";
+  const claimSecret = "claim-only-secret";
+  const released = new Set([first]);
+  const head = "x".repeat(32_760);
+  const split = refreshed.slice(0, 10) + "\u0000" + refreshed.slice(10);
+  const script = codexScript([
+    toolNote(tool, { plan_md: first + " " + claimSecret }, "short"),
+    toolNote(tool, { plan_md: head + split + "tail".repeat(100) }, "long"), completed,
+  ], undefined, (s) => makeTextRedactor([claimSecret])(makeTextRedactor([...released])(s)));
+  const sent: OutgoingMessage[] = [];
+  const client = { async postMessages(_run: string, messages: OutgoingMessage[]) { sent.push(...messages); } } as unknown as WorkerClient;
+  const batcher = new MessageBatcher(client, "live-draft", 0, 60_000, nullLogger(),
+    makeRedactor([claimSecret]), makeTextRedactor([claimSecret]));
+  const reducer = new RunTurnReducerImpl({ request() {}, get: async () => undefined });
+  reducer.beginTurn();
+  const immediate = [];
+  try {
+    for await (const event of script.harness.startTurn(request).events) {
+      for (const message of (await reducer.accept(event)).messages) {
+        if (message.payload.event !== "draft_plan_capture") continue;
+        immediate.push(message);
+        batcher.emit(message);
+        if (immediate.length === 1) released.add(refreshed);
+      }
+    }
+  } finally {
+    await batcher.close();
+  }
+  assert.deepEqual(immediate.map((m) => m.payload.plan_md), [
+    "***REDACTED*** ***REDACTED***",
+    head + "***REDACTED***" + "tail".repeat(100),
+  ]);
+  assert.deepEqual(immediate.map((m) => m.payload.truncated), [false, false]);
+  assert.deepEqual(sent.map((m) => m.payload.plan_md), [
+    "***REDACTED*** ***REDACTED***", head + "***REDAC",
+  ]);
+  assert.deepEqual(sent.map((m) => m.payload.truncated), [false, true]);
+  assert.deepEqual(sent.map((m) => m.seq), [1, 2]);
+  for (const message of sent) {
+    assert.ok(Buffer.byteLength(JSON.stringify(message), "utf8") <= MAX_MESSAGE_BYTES);
+    assert.ok(Buffer.byteLength(String(message.payload.plan_md), "utf8") <= 32_768);
+  }
+  assert.equal(JSON.stringify([immediate, sent]).includes("glpat-"), false);
+});
+
+test("both adapters append captures immediately and persist no malformed or child signal payload", async () => {
+  for (const adapter of ["claude", "codex"] as const) {
+    const forbidden = "raw-rejected-draft";
+    const childNote = { ...toolNote(tool, { plan_md: forbidden }, "child"),
+      params: { threadId: "foreign-child", turnId: "tn-1", callId: "child", tool, arguments: { plan_md: forbidden }, namespace: null } };
+    const script = adapter === "claude" ? { harness: claudeScript([
+      capture("# first"), capture({ raw: forbidden }),
+      capture(forbidden, { parent_tool_use_id: "child", subagent_type: "tester" }),
+      capture("# second"), capture("# third"),
+    ]) } : codexScript([
+      toolNote(tool, { plan_md: "# first" }, "first"),
+      toolNote(tool, { plan_md: { raw: forbidden } }, "malformed"),
+      childNote,
+      toolNote(tool, { plan_md: "# second" }, "second"),
+      toolNote(tool, { plan_md: "# third" }, "third"), completed,
+    ]);
+    const sent: OutgoingMessage[] = [];
+    const client = { async postMessages(_run: string, messages: OutgoingMessage[]) { sent.push(...messages); } } as unknown as WorkerClient;
+    const batcher = new MessageBatcher(client, "append-draft", 0, 60_000, nullLogger(), makeRedactor([]), makeTextRedactor([]));
+    const reducer = new RunTurnReducerImpl({ request() {}, get: async () => undefined });
+    reducer.beginTurn();
+    const immediate = [];
+    try {
+      for await (const event of script.harness.startTurn(request).events) {
+        const messages = (await reducer.accept(event)).messages;
+        immediate.push(...messages.filter((m) => m.payload.event === "draft_plan_capture"));
+        for (const message of messages) batcher.emit(message);
+        assert.deepEqual(immediate.map((m) => m.payload.plan_md),
+          ["# first", "# second", "# third"].slice(0, immediate.length));
+      }
+    } finally {
+      await batcher.close();
+    }
+    assert.deepEqual(immediate.map((m) => m.payload.plan_md), ["# first", "# second", "# third"]);
+    const captures = sent.filter((m) => m.payload.event === "draft_plan_capture");
+    assert.deepEqual(captures.map((m) => m.payload.plan_md), ["# first", "# second", "# third"]);
+    assert.ok(captures[0]!.seq < captures[1]!.seq && captures[1]!.seq < captures[2]!.seq);
+    assert.equal(JSON.stringify([immediate, sent]).includes(forbidden), false);
+    assert.equal(sent.some((m) => m.kind === "tool_use" || m.kind === "tool_result"), false);
+  }
 });
 
 test("UTF8 exact boundary, Unicode, NUL, lone surrogates and escaped JSON stay bounded", async () => {
