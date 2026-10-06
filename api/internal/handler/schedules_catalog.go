@@ -88,10 +88,6 @@ func (h *Handler) EnableCatalogSchedule(w http.ResponseWriter, r *http.Request) 
 		httpx.RespondDecodeError(w, derr, "invalid request body")
 		return
 	}
-	if status, msg := h.validateScheduleRemoval(r.Context(), apitypes.ScheduleRequest{Target: job.Target, Timing: "recurring", Labels: job.Labels, RemoveLabelOnDispatch: &job.RemoveLabelOnDispatch}, job.SelectorKind); status != 0 {
-		httpx.Error(w, status, msg)
-		return
-	}
 	tz := catalogTimezone(job)
 	if override := strings.TrimSpace(req.Timezone); override != "" {
 		// Reject the "Local" sentinel: time.LoadLocation("Local") succeeds and resolves to
@@ -107,13 +103,31 @@ func (h *Handler) EnableCatalogSchedule(w http.ResponseWriter, r *http.Request) 
 		}
 		tz = override
 	}
+	// Repeat enable returns the stored row before validating a new catalog
+	// configuration against settings that may have changed since its creation.
+	slugText := pgtype.Text{String: slug, Valid: true}
+	existing, err := h.q.GetDefaultScheduleForRepoSlug(r.Context(), store.GetDefaultScheduleForRepoSlugParams{
+		UserID: user.ID, RepoID: repo.ID, CatalogSlug: slugText,
+	})
+	if err == nil {
+		httpx.JSON(w, http.StatusOK, h.scheduleDTOWithLabel(r.Context(), existing, repo.PathWithNamespace))
+		return
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		slog.Error("enable default schedule: fetch existing", "slug", slug, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if status, msg := h.validateScheduleRemoval(r.Context(), apitypes.ScheduleRequest{Target: job.Target, Timing: "recurring", Labels: job.Labels, RemoveLabelOnDispatch: &job.RemoveLabelOnDispatch}, job.SelectorKind); status != 0 {
+		httpx.Error(w, status, msg)
+		return
+	}
 	next, err := schedsvc.NextFire(job.Cron, tz, h.clock())
 	if err != nil {
 		slog.Error("enable default schedule: next fire", "slug", slug, "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "could not compute the next fire time")
 		return
 	}
-	slugText := pgtype.Text{String: slug, Valid: true}
 	s, err := h.q.CreateDefaultSchedule(r.Context(), store.CreateDefaultScheduleParams{
 		UserID:                user.ID,
 		RepoID:                repo.ID,

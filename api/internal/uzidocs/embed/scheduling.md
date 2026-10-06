@@ -104,7 +104,8 @@ existed stays unbounded until you set one.
 ### Remove the selector label on dispatch
 
 A recurring **single-label sweep** can opt in to
-`remove_label_on_dispatch` (off by default, including on existing schedules).
+`remove_label_on_dispatch` (off by default for custom schedules and unchanged
+on existing schedules; the `ondeck-sweep` catalog default enables it).
 Once an issue's run is **created**, uzi removes the selector label on the
 forge, then applies an **atomic label delta** to the current cached issue
 row. That cache write preserves unrelated labels and non-label fields,
@@ -207,11 +208,20 @@ idea-file and MR delivery.
 
 - **Web**: the **Schedules** page lists your schedules, and a "Schedule…"
   entry point on an issue opens the create modal pre-pinned to it. The modal
-  offers cadence presets (weekdays, every day, every N hours) plus an
+  offers cadence presets (weekdays, every day, every week, every N hours,
+  every N minutes) plus an
   advanced raw-cron field, and a live "next fires" preview. Pause, resume,
   and run-now are per-schedule row actions on the list.
 - **CLI**: `uzi schedule create | edit | list | get | pause | resume | run-now |
   delete` — see [the CLI reference](./cli.md#commands) for the full flag list.
+
+### Every N minutes
+
+The **Every N minutes** preset accepts **1, 2, 3, 4, 5, 6, 10, 12, 15, 20,
+30** and produces `*/N * * * *`. Those values divide 60, giving evenly spaced
+fires across the hour boundary. These cron expressions reopen as the same
+minutes preset. Other minute steps stay **Custom (cron)**: `*/40 * * * *`,
+for example, fires at minutes 0 and 40, alternating 40- and 20-minute gaps.
 
 ### Configuring dispatch label removal
 
@@ -228,8 +238,9 @@ and create/PATCH requests. Omission on create means false; omission on PATCH
 preserves the stored value, and explicit false disables it. Enabling an
 unsupported configuration returns HTTP 400. This is also an owner-editable
 field on a default-origin schedule whose effective catalog selector meets
-the same single-label constraints. Clone and Add repo copy it; Reset turns
-it off. The catalog-owned selector itself stays read-only.
+the same single-label constraints. Clone and Add repo copy it; Reset restores
+the catalog's removal value (`true` for `ondeck-sweep`, `false` for older
+catalog entries). The catalog-owned selector itself stays read-only.
 
 ### Which harness a schedule runs on
 
@@ -488,18 +499,19 @@ reads `last_fire: null`.
 
 ## Default jobs
 
-uzi ships a small **catalog of built-in default jobs** — nine generic,
+uzi ships a small **catalog of built-in default jobs** — ten generic,
 repo-agnostic schedules covering the standing automations most projects want
 from day one: a weekly test-improvement pass, a weekly docs-hygiene sweep, a
 deep bug-hunt audit, a feature-brainstorm prompt, a biweekly propose-only
 refactoring scout that surveys for one structural refactor and files a
 proposal issue by default (never implementing it, `refactor-scout`), daily
 sweeps over the `bug` and `Planned` labels and over issues **assigned to the uzi-bot
-account** (`assigned-sweep`), and self-improvement — an autonomous audit of
+account** (`assigned-sweep`), an On-deck backlog drain every 10 minutes
+(`ondeck-sweep`), and self-improvement — an autonomous audit of
 the enabled repo's own codebase that picks one top improvement. Each has a
 baked cron cadence and, for the five prompt
-jobs, a baked prompt; two of the three sweeps instead carry a baked label
-selector, and the third (`assigned-sweep`) carries the non-label "assigned"
+jobs, a baked prompt; three of the four sweeps instead carry a baked label
+selector, and the fourth (`assigned-sweep`) carries the non-label "assigned"
 selector kind instead (see [Targets](#targets) above); self-improvement
 carries neither, since its directive is baked into the worker rather than
 the catalog — its entry is cadence and model only (see
@@ -512,14 +524,16 @@ the catalog — its entry is cadence and model only (see
   from the shipped catalog every time the job fires, not copied onto your
   schedule, so a prompt improvement uzi ships later reaches every repo that
   already enabled the job, automatically, with nothing to re-enable. Cadence,
-  model, and the run options (auto-approve, wait-on-limit, max issues, and
+  model, and the run options (auto-approve, wait-on-limit, max issues,
+  capacity limit and room needed, selector-label removal, and
   whether the model is also applied to agents — the "apply model also to
   agents" toggle, `override_subagent_model`) are yours to edit like any
   schedule — as is owner **guidance** on a prompt-target or sweep-target
   default (on a sweep default it is an overlay composed onto the read-only
   baked catalog guidance); a **Reset** action (shown only on a customized row)
   restores cron, timezone, model,
-  auto-approve, wait-on-limit, max issues and output mode to the catalog
+  auto-approve, wait-on-limit, max issues, capacity limit and room needed,
+  selector-label removal and output mode to the catalog
   values in one step, sets `override_subagent_model` back to its catalog
   baseline of `false`, and clears MR rework, owner guidance, the harness pin
   and the credential override back to inherit. It also re-activates a parked
@@ -550,7 +564,7 @@ the catalog — its entry is cadence and model only (see
   highest-confidence bug. An MR-mode run that commits nothing opens no branch
   or empty MR either (issue #341), so a quiet week produces no off-hours MR
   noise, and each job can report when it has nothing worth landing.
-- **Sweep-label guardrail.** Enabling one of the two label-selector sweep
+- **Sweep-label guardrail.** Enabling one of the three label-selector sweep
   defaults (or creating or editing a label-selector sweep schedule) checks
   whether its selector label actually exists on the target repo, and offers
   to create it if not — see [the sweep-label guardrail
@@ -575,6 +589,49 @@ the catalog — its entry is cadence and model only (see
   several repos at once); `uzi schedule reset <id>` and `uzi schedule clone
   <id>` work as described above — see [the CLI
   reference](./cli.md#commands) for the full flag list.
+
+### On-deck sweep
+
+**On-deck sweep** (`ondeck-sweep`) drains a triaged backlog selected by the
+`on-deck` label. Its catalog baseline is:
+
+| Setting | Value |
+|---|---|
+| Selector label | `on-deck` |
+| Cron | `*/10 * * * *` (every 10 minutes) |
+| Timezone | `UTC` |
+| `max_issues` (N) | `1` |
+| `capacity_limit` (C) | `4` |
+| `capacity_room_needed` (K) | `2` |
+| `remove_label_on_dispatch` | `true` |
+
+Enable it with `uzi schedule catalog enable ondeck-sweep --repo <id>`, or
+from its **Job catalog** card. The `on-deck` label selects work; issues still
+need the configured `uzi` label or bot assignment to pass
+[run eligibility](./admin-settings.md#run-eligibility). A missing `on-deck`
+label triggers the advisory [sweep-label guardrail](#sweep-label-guardrail),
+with an option to create it; it does not block enabling the schedule.
+
+Each fire waits for at least two slots in the owner's unfinished work under
+the limit of four, then starts at most one eligible issue, oldest first (see
+[When to send issues](#when-to-send-issues)). After run creation it consumes
+`on-deck` on the forge and in the cache, with the
+[best-effort removal guarantees](#remove-the-selector-label-on-dispatch)
+above. A failed run whose label was removed stays out of the backlog until
+the owner re-adds `on-deck`; a removal failure keeps the started run and is
+reported for manual cleanup.
+
+Enable and Reset **persist** the catalog capacity pair and removal flag on
+the schedule, just as they persist `max_issues`. Older catalog entries have
+no gate (`capacity_limit` and `capacity_room_needed` are null) and removal
+is false. Existing schedules keep their stored settings. Editable gate and
+removal values are not overlaid from the catalog at fire time.
+
+Changing C (for example, `uzi schedule edit <id> --capacity-limit 5 --room-needed 2`)
+marks the default **customized**. An API PATCH of C alone keeps the stored K. Restoring the exact
+catalog values clears that divergence; the customized marker clears when
+no editable field diverges. `uzi schedule reset <id>` restores the current
+catalog baseline, including C=4, K=2 and removal on for On-deck sweep.
 
 ### Self-improvement
 
@@ -774,5 +831,8 @@ Use `uzi schedule create --sweep --capacity-limit 4 --room-needed 2` with the us
 repo and recurring timing flags. Edit accepts the same paired flags, or
 `--clear-capacity` to turn the gate off. Unrelated edits preserve it. API PATCH
 may change one integer using the stored other value; clearing requires both
-`capacity_limit` and `capacity_room_needed` explicitly set to null. Resetting a
-default turns its gate off; clone and Add repo copy it.
+`capacity_limit` and `capacity_room_needed` explicitly set to null. Enabling or
+resetting a default persists its catalog gate: C=4 and K=2 for `ondeck-sweep`,
+both null for older catalog entries. Owner edits use the stored values, without
+a runtime catalog overlay; restoring the exact baseline clears gate divergence
+(see [On-deck sweep](#on-deck-sweep)). Clone and Add repo copy the gate.

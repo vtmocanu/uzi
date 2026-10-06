@@ -25,7 +25,7 @@ through `[0.52.0]`.)
 ### Added
 
 - **Recurring single-label sweeps can consume their selector label after dispatch ([#2344](https://github.com/vtmocanu/uzi/issues/2344)).**
-  Single-label recurring sweeps can remove their selector after a run starts, with API, CLI and web controls. Fire history reports removal success or failure using the original label; failures keep the started run, and owners re-add a successfully removed label to retry failed work.
+  Single-label recurring sweeps can remove their selector after a run starts, with API, CLI and web controls. Fire history reports removal success or failure using the original label; failures keep the started run, and owners re-add a successfully removed label to retry failed work. The new On-deck sweep (`ondeck-sweep`) provides a triaged `on-deck` backlog drain every 10 minutes (`*/10 * * * *`, UTC), starting at most one issue when at least two slots remain under an unfinished-work limit of four, with best-effort selector removal after creation and an advisory missing-label check. Enable and Reset persist catalog capacity and removal values; owner edits mark divergence, exact restoration or Reset clears it, and editable gate/removal settings are not overlaid at fire time. Older catalog entries retain null gates and removal off; existing schedules keep their settings. The Every N minutes preset accepts 1, 2, 3, 4, 5, 6, 10, 12, 15, 20 and 30 as `*/N * * * *`; uneven steps such as `*/40` stay custom cron.
 
 - **Capacity gates for scheduled sweeps**
   Recurring label sweeps can wait for room in the owner’s unfinished work and send batches within the available room, with API and CLI controls and recorded capacity outcomes.

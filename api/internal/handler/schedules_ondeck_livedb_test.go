@@ -151,6 +151,10 @@ func TestOndeckCatalogEnableRunDrainLiveDB(t *testing.T) {
 	if w.Code != 400 {
 		t.Fatalf("live label reset=%d %s", w.Code, w.Body.String())
 	}
+	repeated, repeatCode := f.enableCatalog(t, f.owner.ID, f.repoID, "ondeck-sweep")
+	if repeatCode != http.StatusOK || repeated.ID != d.ID || repeated.RemoveLabelOnDispatch || repeated.CapacityLimit == nil || *repeated.CapacityLimit != 1 || repeated.Enabled {
+		t.Fatalf("repeat enable must preserve existing edited paused row: status=%d dto=%+v", repeatCode, repeated)
+	}
 	other := f.insertRepo(ctx, t, f.owner, 7980, "g/on-deck-other")
 	if _, code := f.enableCatalog(t, f.owner.ID, other, "ondeck-sweep"); code != 400 {
 		t.Fatalf("live label enable=%d", code)
