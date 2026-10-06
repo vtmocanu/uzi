@@ -110,6 +110,8 @@ describe("mock capacity contract", () => {
     await mockApi.updateSchedule(row.id, { capacity_limit: 7 });
     const pass = await mockApi.runScheduleNow(row.id);
     expect(pass).toMatchObject({ created: 3, capacity: { in_flight: 4, room: 3, blocked: false } });
+    await mockApi.updateSchedule(row.id, { max_issues: 10 });
+    expect((await mockApi.runScheduleNow(row.id)).created).toBe(3);
     await mockApi.updateSchedule(row.id, { max_issues: 1 });
     expect((await mockApi.runScheduleNow(row.id)).created).toBe(1);
     expect(await mockApi.getSchedule(row.id)).toMatchObject({ last_fire: null, last_fired_at: null });

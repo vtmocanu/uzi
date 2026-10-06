@@ -947,7 +947,7 @@ describe("Schedules — default rows on the unified list (PRD #1645 D4)", () => 
     expect(within(row).queryByText("inherit model")).toBeNull();
     // Sealed labels and the max-issues cap are chips from the row too.
     expect(within(row).getByText("label bug")).toBeTruthy();
-    expect(within(row).getByText("max 3")).toBeTruthy();
+    expect(within(row).getByText("3 at a time")).toBeTruthy();
     // Provenance: lock marker, kind pill, customized badge.
     expect(within(row).getByLabelText("Baked prompt, read-only")).toBeTruthy();
     expect(within(row).getByText("sweep")).toBeTruthy();
