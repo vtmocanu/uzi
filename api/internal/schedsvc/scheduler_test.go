@@ -1430,8 +1430,8 @@ func TestSkipReasonForErr(t *testing.T) {
 	// issue #856 added open_mr_exists; PRD #1093 M1 added schedules_paused; PRD #1429 M2 added
 	// codex_override_conflict; a PRD #1429 review fix added no_usable_credential; PRD #1732 added
 	// credential_disabled).
-	if len(AllSkipReasons) != 11 {
-		t.Fatalf("AllSkipReasons has %d reasons, want 11", len(AllSkipReasons))
+	if len(AllSkipReasons) != 12 {
+		t.Fatalf("AllSkipReasons has %d reasons, want 12", len(AllSkipReasons))
 	}
 }
 

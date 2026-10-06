@@ -11,7 +11,8 @@ import (
 // consistent (PRD #308 M3; PRD #590 M1 added vault_locked; PRD #764 retired the link-less skip;
 // issue #856 added open_mr_exists; PRD #1093 M1 added schedules_paused; PRD #1429 M2 added
 // codex_override_conflict; a PRD #1429 review fix added no_usable_credential; PRD #1732 added
-// credential_disabled): the closed set has exactly the eleven expected members with no duplicates, every benign seam sentinel maps into that
+// credential_disabled; PRD #2343 added config_not_supported): the closed set has the expected
+// members with no duplicates, every benign seam sentinel maps into that
 // set, an unrelated error maps to no reason, and the reasons the seam does not map (fetch_failed
 // is recorded at the sweep site, already_running also at the prompt site, vault_locked at the
 // self_improve site) are still enumerated. The cross-language guard that the TS reason union has
@@ -19,6 +20,7 @@ import (
 // that guard has a trustworthy source to compare against.
 func TestSkipReasonEnumIsHonest(t *testing.T) {
 	want := map[SkipReason]bool{
+		SkipConfigNotSupported:      true,
 		SkipNotEligible:             true,
 		SkipAlreadyRunning:          true,
 		SkipDescriptionTooLarge:     true,

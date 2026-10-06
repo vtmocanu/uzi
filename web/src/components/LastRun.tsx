@@ -19,6 +19,7 @@ import { useAuth } from "../auth/AuthContext";
 // benign, self-resolving ones (already running, body too large) read neutral.
 // Exhaustive so a new union member is a tsc error, not a default.
 const SKIP_REASON_TONES: Record<ScheduleSkipReason, BadgeTone> = {
+  config_not_supported: "warning",
   not_eligible: "warning",
   already_running: "neutral",
   description_too_large: "neutral",

@@ -17,8 +17,25 @@ import (
 // The wrapper observes the public store seams while executing the real queries.
 type capacityLiveStore struct {
 	*store.Queries
+	scheduleID            uuid.UUID
 	counts, lists, probes int
 	scan                  pgtype.Int4
+}
+
+// Other packages leave due schedules in the shared test database. Execute the real
+// claim query, then give this scheduler only the fixture it owns.
+func (s *capacityLiveStore) ClaimDueSchedules(ctx context.Context) ([]store.RunSchedule, error) {
+	rows, err := s.Queries.ClaimDueSchedules(ctx)
+	if err != nil {
+		return nil, err
+	}
+	owned := make([]store.RunSchedule, 0, 1)
+	for _, row := range rows {
+		if row.ID == s.scheduleID {
+			owned = append(owned, row)
+		}
+	}
+	return owned, nil
 }
 
 func (s *capacityLiveStore) CountInProgressRunsForUser(ctx context.Context, id uuid.UUID) (int64, error) {
@@ -81,8 +98,11 @@ func seedCapacityWork(t *testing.T, ctx context.Context, pool *pgxpool.Pool, use
 	capacityExec(t, ctx, pool, `INSERT INTO runs (id,user_id,repo_id,issue_iid,kind,status,issue_title,issue_description) VALUES ($1,$2,$3,999,'issue','completed','done','d')`, terminal, user, repo)
 	capacityExec(t, ctx, pool, `INSERT INTO runs (user_id,kind,status,issue_title,issue_description) VALUES ($1,'chat','running','chat','d')`, user)
 	capacityExec(t, ctx, pool, `INSERT INTO runs (user_id,kind,status,target_run_id,issue_title,issue_description) VALUES ($1,'judge','running',$2,'judge','d')`, user, terminal)
-	otherUser, _ := scheduleFireUser(ctx, t, pool)
-	capacityExec(t, ctx, pool, `INSERT INTO runs (user_id,repo_id,issue_iid,kind,status,issue_title,issue_description) VALUES ($1,$2,888,'issue','running','foreign','d')`, otherUser, repo)
+	otherUser, otherRepo := scheduleFireUser(ctx, t, pool)
+	capacityExec(t, ctx, pool, `INSERT INTO runs (user_id,repo_id,issue_iid,kind,status,issue_title,issue_description) VALUES ($1,$2,888,'issue','running','foreign','d')`, otherUser, otherRepo)
+	// A second owner's due sweep must not contaminate the observed starts/counters.
+	capacityLiveSchedule(t, ctx, pool, store.New(pool), otherUser, otherRepo, 4, 2, pgtype.Int4{Int32: 1, Valid: true})
+	capacityExec(t, ctx, pool, `INSERT INTO issues (repo_id,forge_issue_iid,title,state,labels,web_url,forge_updated_at,synced_at) VALUES ($1,1,'foreign candidate','opened','["uzi","bug"]','https://forge.e2e/foreign',now(),now())`, otherRepo)
 	for i := 1; i <= 5; i++ {
 		capacityExec(t, ctx, pool, `INSERT INTO issues (repo_id,forge_issue_iid,title,state,labels,web_url,forge_updated_at,synced_at) VALUES ($1,$2,'candidate','opened','["uzi","bug"]','https://forge.e2e/issue',now(),now())`, repo, i)
 	}
@@ -116,7 +136,7 @@ func TestCapacitySchedulerLiveDB(t *testing.T) {
 				user, repo := scheduleFireUser(ctx, t, pool)
 				seedCapacityWork(t, ctx, pool, user, repo, tc.wip)
 				sc := capacityLiveSchedule(t, ctx, pool, q, user, repo, tc.c, tc.k, tc.n)
-				st := &capacityLiveStore{Queries: q}
+				st := &capacityLiveStore{Queries: q, scheduleID: sc.ID}
 				runs := &fakeRuns{}
 				fb := &fakeBuilder{f: &fakeForge{issue: forge.Issue{Title: "candidate", Labels: []string{"uzi", "bug"}}}}
 				sched := New(st, runs, fb, &fakeSettings{uziLabel: "uzi"}, nil, nil, time.Minute, nil)
@@ -187,7 +207,7 @@ func TestCapacityAssignedCatalogDriftLiveDB(t *testing.T) {
 	user, repo := scheduleFireUser(ctx, t, pool)
 	sc := capacityLiveSchedule(t, ctx, pool, q, user, repo, 4, 2, pgtype.Int4{})
 	capacityExec(t, ctx, pool, `UPDATE run_schedules SET origin='default',catalog_slug='assigned-sweep',labels=NULL WHERE id=$1`, sc.ID)
-	st := &capacityLiveStore{Queries: q}
+	st := &capacityLiveStore{Queries: q, scheduleID: sc.ID}
 	runs := &fakeRuns{}
 	fb := &fakeBuilder{f: &fakeForge{}}
 	sched := New(st, runs, fb, nil, nil, nil, time.Minute, nil)
