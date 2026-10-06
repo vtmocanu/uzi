@@ -1,3 +1,4 @@
+import os from "node:os";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough, Writable } from "node:stream";
@@ -89,7 +90,7 @@ function rig(options: {
   ops.push(op.op);
   if (op.op === "stat" && options.holdStat) return;
   emit({ id: op.id, ok: op.op === "stat" || (op.op === "read" && op.path === "anchor.ts"),
-   data: Buffer.from("export const anchor = true;").toString("base64"), size: 27 });
+   data: Buffer.from("export const anchor = true;").toString("base64"), size: Buffer.byteLength("export const anchor = true;") });
  });
  const deps: CrossCheckModelDeps = {
   prepareHome: async () => {},
@@ -134,7 +135,7 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
   verdict: "approve", summary: "Anchors checked",
   items: [{ file: "anchor.ts", severity: "invalid", summary: "Finding", rationale: "Read anchor" }],
  });
- const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/cross-check-test-"));
+ const root = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "cross-check-test-"));
  const outbox = new Outbox({ root: path.join(root, "outbox"), log: nullLogger(),
   runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 86400000 });
  await outbox.init();
@@ -145,7 +146,12 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
    threadId: "thread", turnId: "turn", callId: "read", tool: "Read", arguments: { path: "anchor.ts" } } }),
   onToolReply: (frame, emit) => {
    assert.equal(frame.result.success, true);
-   assert.match(frame.result.contentItems[0].text, /contentBase64/);
+   const excerpt = /^<(repository_excerpt_[a-f0-9]{32})>\n([\s\S]*)\n<\/\1>$/.exec(frame.result.contentItems[0].text);
+   assert.ok(excerpt, "Read output remains inside its untrusted repository fence");
+   assert.deepEqual(JSON.parse(excerpt[2]!), {
+    size: Buffer.byteLength("export const anchor = true;"), content: "export const anchor = true;", offset: 1,
+    linesReturned: 1, partialLastLine: false, truncated: false,
+   });
    r.terminal(emit, assistantText);
   },
  });
@@ -218,7 +224,7 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
 
 for (const mode of ["stale-running", "stale-verdict", "malformed", "delivery", "timeout", "cancel", "lost-ack", "lost-terminal-ack", "cancel-probe", "timeout-probe", "finding-schema"] as const) {
  it("outer checker fails closed or abandons: " + mode, async () => {
-  const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/checker-failure-"));
+  const root = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "checker-failure-"));
   const states: string[] = [];
   const decisions: any[] = [];
   let modelCalls = 0;
@@ -298,7 +304,7 @@ for (const mode of ["stale-running", "stale-verdict", "malformed", "delivery", "
 }
 
 it("exact-commit clone stays on immutable base after default and tracking refs advance", async () => {
- const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/exact-check-"));
+ const root = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "exact-check-"));
  const exec = promisify(execFile);
  const origin = path.join(root, "origin");
  const git = async (...args: string[]) => (await exec("git", ["-C", origin, ...args],

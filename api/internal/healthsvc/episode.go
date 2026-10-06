@@ -97,14 +97,14 @@ func NewEpisodeReconciler(eval healthEvaluator, st episodeStore, notifier episod
 }
 
 // Reconcile runs one evaluation and moves the episode lifecycle by exactly one step:
-//   - overall danger AND no episode open  -> open one and RETURN (the opener sends NO
+//   - blocking AND no episode open  -> open one and RETURN (the opener sends NO
 //     notice; a 23505 unique violation means another replica opened first, which is
 //     already-open, not an error). This is the first half of the two-evaluation debounce.
-//   - overall danger AND an episode ALREADY open (opened by a PRIOR tick) -> the debounce is
+//   - blocking AND an episode ALREADY open (opened by a PRIOR tick) -> the debounce is
 //     satisfied: fan the one-per-admin notice out (gated on HealthEnabled).
-//   - overall not-danger AND an episode open -> close it (the re-arm; no recovery notice, D11).
+//   - not blocking AND an episode open -> close it (the re-arm; no recovery notice, D11).
 //
-// warn/unknown never notify — only danger opens an episode and fires the fan-out. Everything
+// Only instance danger opens an episode and fires the fan-out. Everything
 // else is a no-op. Best-effort: every error is logged, never returned.
 func (r *EpisodeReconciler) Reconcile(ctx context.Context) {
 	doc, err := r.eval.Evaluate(ctx)
@@ -112,7 +112,7 @@ func (r *EpisodeReconciler) Reconcile(ctx context.Context) {
 		r.logger.Error("health episode: evaluate", "error", err)
 		return
 	}
-	danger := doc.Status == sevDanger
+	blocking := doc.Blocking
 
 	open, err := r.store.GetOpenHealthEpisode(ctx)
 	hasOpen := true
@@ -126,7 +126,7 @@ func (r *EpisodeReconciler) Reconcile(ctx context.Context) {
 	}
 
 	switch {
-	case danger && !hasOpen:
+	case blocking && !hasOpen:
 		if _, err := r.store.OpenHealthEpisode(ctx, pgconv.Time(r.now())); err != nil {
 			if isUniqueViolation(err) {
 				// The partial unique index rejected a second concurrent open: another
@@ -138,11 +138,11 @@ func (r *EpisodeReconciler) Reconcile(ctx context.Context) {
 		}
 		// The OPENER tick sends NO notice: the debounce fires the fan-out on the NEXT
 		// still-danger tick, which finds the episode already open (the case below).
-	case danger && hasOpen:
+	case blocking && hasOpen:
 		// The episode was opened by a PRIOR tick, so the two-evaluation debounce is
 		// satisfied: notify every admin exactly once for THIS episode.
 		r.notifyAdmins(ctx, open.ID, doc)
-	case !danger && hasOpen:
+	case !blocking && hasOpen:
 		if err := r.store.CloseHealthEpisode(ctx, store.CloseHealthEpisodeParams{
 			ID:       open.ID,
 			ClosedAt: pgconv.Time(r.now()),
@@ -162,6 +162,11 @@ func (r *EpisodeReconciler) Reconcile(ctx context.Context) {
 // Best-effort throughout: one admin's claim/notify/release error is logged and never aborts
 // the rest.
 func (r *EpisodeReconciler) notifyAdmins(ctx context.Context, episodeID uuid.UUID, doc Doc) {
+	danger := dangerChecks(doc)
+	if len(danger) == 0 {
+		return
+	}
+
 	enabled, err := r.settings.HealthEnabled(ctx)
 	if err != nil {
 		r.logger.Error("health episode: read health_enabled", "error", err)
@@ -183,7 +188,6 @@ func (r *EpisodeReconciler) notifyAdmins(ctx context.Context, episodeID uuid.UUI
 	// The notice body is composed ONCE from the danger checks at this moment (their
 	// already-sanitized, server-authored titles/summaries from Evaluate — D7, no raw
 	// untrusted text). Only the per-admin UserID differs.
-	danger := dangerChecks(doc)
 	base, _ := r.settings.PublicBaseURL(ctx) // empty on error ⇒ the notice simply omits the deep link
 
 	for _, uid := range admins {
@@ -244,15 +248,16 @@ type dangerCheck struct {
 	Summary string `json:"summary"`
 }
 
-// dangerChecks pulls the danger checks out of the evaluated document, in the registry's
-// stable order. Every field is server-authored and already sanitized by Evaluate, so the
-// notice interpolates nothing raw.
+// dangerChecks selects instance danger checks for notices in Doc.Checks order.
+// Scope comes from checkMeta through Evaluate; owner, empty and invalid scopes are
+// excluded. Every field is server-authored and already sanitized by Evaluate.
 func dangerChecks(doc Doc) []dangerCheck {
 	var out []dangerCheck
 	for _, c := range doc.Checks {
-		if c.Severity == sevDanger {
-			out = append(out, dangerCheck{ID: c.ID, Title: c.Title, Summary: c.Summary})
+		if c.Scope != "instance" || c.Severity != sevDanger {
+			continue
 		}
+		out = append(out, dangerCheck{ID: c.ID, Title: c.Title, Summary: c.Summary})
 	}
 	return out
 }
@@ -315,7 +320,7 @@ func healthEpisodeCheckLines(danger []dangerCheck) string {
 // notice BODY instead, where the notifier's SlackMrkdwn render neutralizes it. The count is a
 // server-computed int, so its `*bold*` chip is intended and injection-free — Facts must be CLOSED
 // per notifysvc's contract, matching custody_episode's counts-only Facts. len(danger) >= 1 in
-// practice: the reconciler reaches here only when the overall status is danger.
+// practice: notifyAdmins returns before building a notice if dangerChecks is empty.
 func healthEpisodeFacts(danger []dangerCheck) []string {
 	noun := "checks"
 	if len(danger) == 1 {

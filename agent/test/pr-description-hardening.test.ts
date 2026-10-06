@@ -546,9 +546,12 @@ describe("scans stay linear on adversarial input (M1)", () => {
   const best = (f: () => unknown) => {
     let min = Infinity;
     for (let i = 0; i < 3; i++) {
-      const t = performance.now();
+      // Only synchronous scan work is measured. cpuUsage is process-wide, so GC
+      // and helper threads count too: this remains a ceiling, not a microbenchmark.
+      const t = process.cpuUsage();
       f();
-      min = Math.min(min, performance.now() - t);
+      const spent = process.cpuUsage(t);
+      min = Math.min(min, (spent.user + spent.system) / 1000);
       if (min > CEILING_MS) break;
     }
     return min;
@@ -571,7 +574,7 @@ describe("scans stay linear on adversarial input (M1)", () => {
     assert.ok(again.ok, `${first.label}; retried: ${again.label}`);
   };
 
-  it("closingDirectiveFor: 8x the input takes under 32x the time, for each shape", () => {
+  it("closingDirectiveFor: 8x the input takes under 32x the CPU time, for each shape", () => {
     const units = [
       "fixes:https://",
       "fix-",
@@ -644,7 +647,7 @@ describe("scans stay linear on adversarial input (M1)", () => {
     for (const shape of shapes) assertLinear(shape, (s) => closingDirectiveFor(s, 7, "o/r"));
   });
 
-  it("closingDirectiveFor: 1 MiB of keyword-dense path segments scans in well under 2 s", () => {
+  it("closingDirectiveFor: 1 MiB of keyword-dense path segments uses under 2 CPU seconds", () => {
     const MIB = 1024 * 1024;
     for (const body of [
       `*&amp; ${fillTo(`${DENSE_SEGMENT}/`, MIB)}`.slice(0, MIB),

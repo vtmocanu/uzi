@@ -669,6 +669,7 @@ func toDTO(u store.User) apitypes.UserDTO {
 		CIAutofixEnabled:        boolPtrValue(u.CiAutofixEnabled),
 		AttributionEnabled:      u.AttributionEnabled,
 		EphemeralWorkersEnabled: u.EphemeralWorkersEnabled,
+		EphemeralDockerEnabled:  u.EphemeralDockerEnabled,
 		CreatedAt:               u.CreatedAt.Time,
 		// The judge binding's id; the LABEL is filled in only by the routes that
 		// resolved it (PUT /api/me/judge), since a bare users row carries no join to
@@ -1349,6 +1350,8 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// with the ready transition in one transaction; a retry starts from zero under the
 		// same capture id. The two static paths (reserve/release) are registered before the
 		// {captureID} wildcard so chi routes them by their static segment.
+		r.Post("/terminal-rejections", h.WorkerTerminalRejections)
+		r.Get("/runs/{id}/terminal-rejection-custody", h.WorkerTerminalRejectionCustody)
 		r.Post("/runs/{id}/archives/reserve", h.WorkerRecoveryReserve)
 		r.Post("/runs/{id}/archives/release", h.WorkerRecoveryRelease)
 		r.Post("/runs/{id}/archives/{captureID}/upload", h.WorkerRecoveryUpload)
@@ -1395,6 +1398,7 @@ func (h *Handler) mountControllerRoutes(r chi.Router) {
 		// Cordon control-write (PRD #422 M4). Marks a hosted worker draining so it
 		// drains before rolling; distinct from the display-only status report.
 		r.Post("/workers/{workerID}/drain", h.ControllerCordonWorker)
+		r.Post("/workers/{workerID}/dind-maintenance", h.ControllerDindMaintenance)
 		// Uncordon control-write (issue #458). Clears draining_since when drift was
 		// reverted so the worker resumes claiming; same path, different method.
 		r.Delete("/workers/{workerID}/drain", h.ControllerUncordonWorker)

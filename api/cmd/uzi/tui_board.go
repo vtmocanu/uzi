@@ -318,7 +318,7 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		// becomes the new waitID, so the next periodic tick does not stack a second poll on top
 		// of this one and any periodic reply still in flight is superseded (its stale reqID is
 		// dropped); this reply's own reqID clears the guard.
-		return m, tea.Batch((&m).startBoardReq(), m.fetchRateLimitsCmd(), m.fetchCodexRateLimitsCmd(), (&m).startSelfUsageReq(), m.fetchSettingsCmd(), m.fetchVaultCmd())
+		return m, tea.Batch((&m).startBoardReq(), m.fetchRateLimitsCmd(), m.fetchCodexRateLimitsCmd(), (&m).startSelfUsageReq(), m.fetchSettingsCmd(), m.fetchVaultCmd(), (&m).startWorkersReq())
 	case keyAdmin:
 		m.board.admin = !m.board.admin
 		m.board.adminDenied = false
@@ -327,7 +327,7 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		// Same as keyRefresh (D1): always fetch, minting a fresh id via startBoardReq so the next
 		// tick does not stack and any pre-toggle periodic reply is superseded. The subsequent
 		// boardRunsMsg for the new admin value carries the matching reqID and clears the guard.
-		return m, tea.Batch((&m).startBoardReq(), (&m).startSelfUsageReq())
+		return m, tea.Batch((&m).startBoardReq(), (&m).startSelfUsageReq(), (&m).startWorkersReq())
 	case keyHideDone:
 		// No-op on the admin board: AdminListRuns already returns non-terminal runs only, so
 		// hiding "finished" runs would change no rows — flipping the label there reads as a
@@ -357,18 +357,19 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		m.detailGen++
 		m.detail.gen = m.detailGen
 		return m, tea.Batch(m.loadRunCmd(sel.ID), m.loadTailCmd(sel.ID), m.openStreamCmd(sel.ID))
-	case keyTab, keyViewPulls:
-		// tab / 2 leave the floor for the forge `pulls` list (PRD #1255 D1). tab advances the
-		// cycle floor → pulls; 2 jumps to pulls directly.
+	case keyTab, keyViewWorkers:
+		m.setListView(viewWorkers)
+		return m, nil
+	case keyViewPulls:
 		return m.gotoPulls()
 	case keyViewCI:
-		// 3 jumps straight to the forge `ci` list (PRD #1255 M4b).
+		// 4 jumps straight to the forge `ci` list (PRD #1255 M4b).
 		return m.gotoCI()
 	}
 	return m, nil
 }
 
-// tabStrip builds the wordmark + the floor · pulls · ci tab strip shared by the board
+// tabStrip builds the wordmark + the floor · workers · pulls · ci tab strip shared by the board
 // and the forge views (PRD #1255 D1): the active screen's tab is tungsten-bold, the rest
 // faint. The marked tab and admin relabel are explicit so a split header can
 // mark the focused pane independently. The board's admin sub-mode relabels its own tab "active runs"
@@ -385,6 +386,7 @@ func (m tuiModel) tabStrip(admin bool, marked tuiView, repoSuffix bool) string {
 		active bool
 	}{
 		{floorLabel, marked == viewBoard},
+		{"workers", marked == viewWorkers},
 		{"pulls", marked == viewPulls},
 		{"ci", marked == viewCI},
 	}
@@ -394,7 +396,8 @@ func (m tuiModel) tabStrip(admin bool, marked tuiView, repoSuffix bool) string {
 			out += m.pal.faint.Render("  ")
 		}
 		if t.active {
-			out += m.pal.title.Render(t.label)
+			label := t.label
+			out += m.pal.title.Render(label)
 		} else {
 			out += m.pal.faint.Render(t.label)
 		}
@@ -531,54 +534,52 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 
 	// ONE per-frame meter snapshot with ONE now (PRD 1519 M4): boardMeterLayout decides
 	// combined-vs-split once and returns the rendered header meter line(s). The SAME snapshot
-	// feeds both the draw below and the row reservation (boardCapacityWith), so the reserved
+	// feeds both the combined summary line and its row reservation, so the reserved
 	// chrome can never disagree with what is drawn.
 	var meters boardMeterLayout
 	if fullScreen {
 		meters = m.boardMeterLayout(time.Now())
 	}
 
-	// The wordmark is now a tab strip (PRD #1255 D1): ▚▚ uzi · floor  pulls  ci, the active
+	// The wordmark is now a tab strip (PRD #1255 D1): ▚▚ uzi · floor  workers  pulls  ci, the active
 	// tab bold. tabStrip relabels the floor tab "active runs" on the admin board (AdminListRuns
 	// returns non-terminal runs only, so promising completed rows would be a claim the API
 	// cannot satisfy).
-	brand := ""
-	if fullScreen {
-		brand = m.tabStrip(m.board.admin, m.view, false)
-	}
-	if m.board.hideDone && !m.board.admin {
-		brand += m.pal.faint.Render("   active only")
-	}
-	if m.board.filter != "" || m.board.filtering {
-		brand += m.pal.faint.Render("   /" + cellText(m.board.filter))
-		if m.board.filtering {
-			brand += m.pal.title.Render("▌")
-		}
-	}
+	brand := m.boardTitle(fullScreen)
 
 	// The display list injects non-selectable eyebrow + spacer lines around the run rows; the
 	// cursor still indexes RUN rows only (via visible()), so selection/enter/clamp are unchanged.
 	// The window keeps the selected run row on screen so the wordmark and footer never scroll off.
 	items := m.buildBoardItems(rows)
-	capacity := m.boardCapacityAt(height, len(meters.lines), fullScreen)
+	meterRows := len(meters.lines)
+	if fullScreen {
+		meterRows = len(m.boardMeterSummaryLines(meters.lines, m.boardSummary()))
+	}
+	capacity := m.boardCapacityAt(height, meterRows, fullScreen)
 	selItem := selectedBoardItem(items, m.board.cursor)
 	start, end := boardWindow(selItem, m.board.scroll, len(items), capacity)
 
-	// Summary glyph cluster + position readout, pinned top-right. Over the WHOLE board (not the
+	// Summary glyph cluster + position readout, right-aligned with account meters. Over the WHOLE board (not the
 	// filtered view) so it stays a stable factory read while you filter.
 	summary := m.boardSummary()
 	if len(rows) > 0 {
 		lo, hi := windowRunSpan(items, start, end)
 		summary += m.pal.faint.Render(" · " + itoa(lo) + "–" + itoa(hi))
 	}
-	sb.WriteString(clampVisual(padVisual(" "+brand, m.width-visualWidth(summary)-1)+summary, m.width) + "\n")
+	if fullScreen {
+		for _, line := range m.workerFleetTitleLines(" " + brand) {
+			sb.WriteString(line + "\n")
+		}
+	} else {
+		sb.WriteString(clampVisual(" "+brand, m.width) + "\n")
+	}
 	// The viewer's own rate-limit meters, mirroring the web sidebar's selection (PRD #1209 M3 /
 	// 1519 M4). boardMeterLayout adaptively renders the Claude and Codex meters on ONE combined
 	// header line when they fit m.width, or on two lines (Claude, then Codex) when they do not.
-	// len(meters.lines) is 0, 1, or 2, and boardCapacityWith reserved exactly that many rows from
-	// the SAME snapshot, so this loop can never overdraw the run list.
+	// The summary joins the last account line or gets a separate row; capacity reserves
+	// that combined layout from the same meter snapshot.
 	if fullScreen {
-		for _, line := range meters.lines {
+		for _, line := range m.boardMeterSummaryLines(meters.lines, summary) {
 			sb.WriteString(line + "\n")
 		}
 	}
@@ -631,7 +632,19 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 	if fullScreen {
 		sb.WriteString(clampVisual(m.boardFooterLine(), m.width))
 	}
-	return sb.String()
+	frame := sb.String()
+	if fullScreen {
+		if height <= 0 {
+			return ""
+		}
+		lines := strings.Split(frame, "\n")
+		if len(lines) > height {
+			// Headers can exceed the viewport at tiny heights. Keep the footer,
+			// while cropping the already capacity-budgeted body to its available rows.
+			return strings.Join(append(lines[:height-1], lines[len(lines)-1]), "\n")
+		}
+	}
+	return frame
 }
 
 // boardItem is one line of the board's display list: a band eyebrow, a run row, or a blank
@@ -845,9 +858,9 @@ func (m tuiModel) boardShowMile() bool {
 	min := boardMileMinWidth
 	// The extra columns before TITLE (the admin owner cell, and the credential cell when
 	// shown) push the mile threshold up by exactly their width, so a narrow board drops the
-	// micro-bar instead of squeezing the title (issue #379). mile is false in both terms so
-	// it cancels; only the owner + credential deltas survive.
-	min += boardRowPrefixWidth(m.board.admin, false, m.boardShowCred(), m.boardShowCost()) - boardRowPrefixWidth(false, false, false, false)
+	// micro-bar instead of squeezing the title (issue #379). The milestone-free
+	// prefix leaves only the owner + credential + cost deltas.
+	min += boardRowPrefixWidth(m.board.admin, m.boardShowCred(), m.boardShowCost()) - boardRowPrefixWidth(false, false, false)
 	return m.width >= min
 }
 
@@ -863,7 +876,7 @@ func (m tuiModel) boardShowCost() bool {
 	min := boardCostMinWidth
 	// The extra columns before TITLE (the credential cell when shown) push the threshold up by
 	// exactly their width; cost is false in both terms so it cancels, only the cred delta survives.
-	min += boardRowPrefixWidth(false, false, m.boardShowCred(), false) - boardRowPrefixWidth(false, false, false, false)
+	min += boardRowPrefixWidth(false, m.boardShowCred(), false) - boardRowPrefixWidth(false, false, false)
 	return m.width >= min
 }
 
@@ -892,9 +905,9 @@ func (m tuiModel) boardShowRunCred(r apitypes.RunListItemDTO) bool {
 // boardMeterLayout is the ONE per-frame snapshot of the header rate-limit meter line(s) (PRD 1519
 // M4). It decides — ONCE per frame, with ONE now — whether the Claude and Codex meters share a
 // single combined line or fall back to two, and returns the rendered line string(s). len(lines) is
-// the physical row count the meters occupy (0, 1, or 2). renderBoard draws lines and boardCapacityWith
-// reserves exactly len(lines) rows from the SAME snapshot, so the reserved chrome can never disagree
-// with what is drawn: a countdown/reset-in text can change visual width at a reset boundary between two
+// the physical row count the meters occupy (0, 1, or 2). Rendering and capacity combine this
+// SAME snapshot with the run summary, reserving any summary fallback row as well, so the
+// reserved chrome agrees with what is drawn: a countdown/reset-in text can change visual width at a reset boundary between two
 // now values and flip the combined-vs-split decision, so deriving the layout twice (two nows) is banned.
 type boardMeterLayout struct{ lines []string }
 
@@ -958,16 +971,16 @@ func (m tuiModel) boardMeterLayout(now time.Time) boardMeterLayout {
 // boardCapacity is how many display lines fit between the wordmark block and the footer at the
 // current terminal height. It is the zero-arg form for callers that do not already hold a meter
 // snapshot (syncedScroll, tests): it derives the meter row count from a fresh boardMeterLayout.
-// renderBoard MUST use boardCapacityWith with its own per-frame snapshot instead, so the reserved
-// meter rows match exactly what it draws.
+// Rendering counts the combined meter/summary layout from its own snapshot so the reserved
+// rows match what it draws.
 func (m tuiModel) boardCapacity() int {
-	return m.boardCapacityWith(len(m.boardMeterLayout(time.Now()).lines))
+	return m.boardCapacityWith(len(m.boardMeterSummaryLines(m.boardMeterLayout(time.Now()).lines, m.boardSummary())))
 }
 
 // boardCapacityWith is boardCapacity given the number of header meter rows the caller is drawing
-// (0, 1, or 2 from boardMeterLayout). It counts the same chrome renderBoard draws: the wordmark
+// (including any run-summary fallback). It counts the same chrome renderBoard draws: the wordmark
 // line, the blank below it, the footer (3), the meter rows, plus the optional adminDenied, error,
-// vault-hint, and selected-row second lines. At least one content line is always shown.
+// vault-hint, and selected-row second lines. Tiny full-screen viewports crop the body to keep the footer.
 func (m tuiModel) boardCapacityWith(meterLines int) int {
 	return m.boardCapacityAt(m.height, meterLines, true)
 }
@@ -976,6 +989,7 @@ func (m tuiModel) boardCapacityAt(height, meterLines int, fullScreen bool) int {
 	chrome := 1 // pane title, filter and summary
 	if fullScreen {
 		chrome += 2 // blank line and footer
+		chrome += len(m.workerFleetTitleLines(" "+m.boardTitle(true))) - 1
 		if m.board.adminDenied {
 			chrome++
 		}
@@ -1105,4 +1119,54 @@ func (m tuiModel) boardSummary() string {
 	}
 	segs = append(segs, m.pal.faint.Render(itoa(len(m.board.runs))+" runs"))
 	return strings.Join(segs, m.pal.faint.Render(" · "))
+}
+
+// boardTitle is shared by rendering and capacity so filter chrome cannot hide a row.
+func (m tuiModel) boardTitle(full bool) string {
+	brand := ""
+	if full {
+		brand = m.tabStrip(m.board.admin, m.view, false)
+	}
+	if m.board.hideDone && !m.board.admin {
+		brand += m.pal.faint.Render("   active only")
+	}
+	if m.board.filter != "" || m.board.filtering {
+		brand += m.pal.faint.Render("   /" + cellText(m.board.filter))
+		if m.board.filtering {
+			brand += m.pal.title.Render("▌")
+		}
+	}
+	return brand
+}
+
+// Reserve the widest possible page range so gaining a row cannot make the
+// summary wrap and change the capacity that produced that range.
+func (m tuiModel) boardSummaryReserve() string {
+	summary := m.boardSummary()
+	if n := len(m.board.visible()); n > 0 {
+		summary += m.pal.faint.Render(" · " + itoa(n) + "–" + itoa(n))
+	}
+	return summary
+}
+func (m tuiModel) boardMeterSummaryLines(meters []string, summary string) []string {
+	lines := append([]string(nil), meters...)
+	if len(lines) > 0 {
+		last := len(lines) - 1
+		if m.width-visualWidth(lines[last])-visualWidth(m.boardSummaryReserve()) >= 2 {
+			lines[last] = padVisual(lines[last], m.width-visualWidth(summary)) + summary
+			return lines
+		}
+	}
+	return append(lines, padVisual("", max(0, m.width-visualWidth(summary)))+clampVisual(summary, m.width))
+}
+func (m tuiModel) boardWindowSummary(capacity int) string {
+	rows := m.board.visible()
+	summary := m.boardSummary()
+	if len(rows) > 0 {
+		items := m.buildBoardItems(rows)
+		start, end := boardWindow(selectedBoardItem(items, m.board.cursor), m.board.scroll, len(items), capacity)
+		lo, hi := windowRunSpan(items, start, end)
+		summary += m.pal.faint.Render(" · " + itoa(lo) + "–" + itoa(hi))
+	}
+	return summary
 }

@@ -247,21 +247,23 @@ func (m tuiModel) openLinkedRun(runID *string, from tuiView) (tea.Model, tea.Cmd
 	if runID == nil || *runID == "" {
 		return m, nil
 	}
-	// Close the prior run's live stream before reassigning m.detail: reached via detail→m (PR
-	// view)→u, m.detail still holds the run we drilled into (its stream live), so overwriting it
-	// without a Close would orphan that SSE connection for the session. Mirrors exitToBoard.
-	if m.detail.stream != nil {
-		m.detail.stream.Close()
-	}
+	// beginRunSession closes any departing run before opening the fresh session.
+	m.beginRunSession(*runID, from)
+	return m, tea.Batch(m.loadRunCmd(*runID), m.loadTailCmd(*runID), m.openStreamCmd(*runID))
+}
+
+// beginRunSession is shared by linked runs and worker preflight entry. The caller
+// supplies either a normal loadRunCmd or its already fetched detailRunMsg DTO.
+func (m *tuiModel) beginRunSession(runID string, from tuiView) {
+	m.clearRunSession()
 	if m.splitDrawn() {
 		m.fromSplit = true
 	}
 	m.view = viewDetail
-	m.detail = newDetailState(*runID)
+	m.detail = newDetailState(runID)
 	m.detailGen++
 	m.detail.gen = m.detailGen
 	m.detailReturn = from
-	return m, tea.Batch(m.loadRunCmd(*runID), m.loadTailCmd(*runID), m.openStreamCmd(*runID))
 }
 
 // ---- keys -----------------------------------------------------------------
@@ -276,28 +278,23 @@ func (m tuiModel) prKey(k string) (tea.Model, tea.Cmd) {
 	}
 	switch k {
 	case keyEsc, keyLeft:
-		// ←/esc both return to where the drill-in was opened from (D1): the pulls list, or the run view
-		// on the detail→m→PR path. → opens a row, so ← is its symmetric back (issue #1335). The state
-		// returned to persists on the model (m.pulls / m.detail are never clobbered), so it is still
-		// loaded. Reset to the default for the next open.
 		target := m.prReturn
-		if m.fromSplit && !m.splitEligible() {
-			target = viewBoard
+		runID, runTarget := m.prReturnRunID, m.prReturnRunTarget
+		m.prReturn = viewPulls
+		m.prReturnRunID, m.prReturnRunTarget = "", viewBoard
+		// A worker return takes precedence over split collapse, just as run Esc does.
+		if m.fromSplit && !m.splitEligible() && (target != viewDetail || runTarget != viewWorker) {
+			target = m.top()
 		}
-		if m.prReturn == viewDetail && target != viewDetail {
-			// The collapse skips the run view this PR was opened from, so leave it the way
-			// exitToBoard does: close its stream and drop the session, so a late stream reply
-			// no longer matches and is closed on arrival.
-			m.prReturn = viewPulls
-			return m.exitToBoard()
+		if target == viewDetail && runID != "" {
+			return m.openLinkedRun(&runID, runTarget)
 		}
-		if target == viewBoard || target == viewCI || target == viewPulls {
+		if target == viewBoard || target == viewWorkers || target == viewCI || target == viewPulls {
 			m.setListView(target)
 			m.fromSplit = false
 		} else {
 			m.view = target
 		}
-		m.prReturn = viewPulls
 		return m, nil
 	case keyRefresh:
 		// A keypress is intent: never gated on the in-flight guard, mirroring the list screens' r.

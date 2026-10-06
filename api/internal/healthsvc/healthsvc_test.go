@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode"
@@ -28,28 +29,30 @@ import (
 // ---- fakes -----------------------------------------------------------------
 
 type fakeStore struct {
-	enabledIDs    []uuid.UUID
-	enabledErr    error
-	workers       []store.ListAllWorkersRow
-	workersErr    error
-	capacityRows  []store.ListOwnersWaitingNoCapacityRow
-	capacityErr   error
-	waiting       pgtype.Timestamptz
-	waitingErr    error
-	undispatched  pgtype.Timestamptz
-	undispatchErr error
-	pausedCount   int64
-	pausedErr     error
-	gaveUp        []store.ListGaveUpColumnMovesRow
-	gaveUpErr     error
-	custodyOwners []uuid.UUID
-	custodyErr    error
-	controller    pgtype.Timestamptz
-	controllerErr error
-	ciwatch       []store.CountEligibleCIWatchRefsPerRepoRow
-	ciwatchErr    error
-	runDisk       []store.WorkerRunDisk
-	runDiskErr    error
+	enabledIDs      []uuid.UUID
+	enabledErr      error
+	workers         []store.ListAllWorkersRow
+	workersErr      error
+	capacityRows    []store.ListOwnersWaitingNoCapacityRow
+	capacityErr     error
+	capacityQueries atomic.Int32
+	waitingQueries  atomic.Int32
+	waitingRows     []store.ListWaitingWorkerRunsRow
+	waitingErr      error
+	undispatched    pgtype.Timestamptz
+	undispatchErr   error
+	pausedCount     int64
+	pausedErr       error
+	gaveUp          []store.ListGaveUpColumnMovesRow
+	gaveUpErr       error
+	custodyOwners   []uuid.UUID
+	custodyErr      error
+	controller      pgtype.Timestamptz
+	controllerErr   error
+	ciwatch         []store.CountEligibleCIWatchRefsPerRepoRow
+	ciwatchErr      error
+	runDisk         []store.WorkerRunDisk
+	runDiskErr      error
 }
 
 func (f *fakeStore) ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error) {
@@ -60,10 +63,12 @@ func (f *fakeStore) ListAllWorkers(context.Context) ([]store.ListAllWorkersRow, 
 	return f.workers, f.workersErr
 }
 func (f *fakeStore) ListOwnersWaitingNoCapacity(context.Context, store.ListOwnersWaitingNoCapacityParams) ([]store.ListOwnersWaitingNoCapacityRow, error) {
+	f.capacityQueries.Add(1)
 	return f.capacityRows, f.capacityErr
 }
-func (f *fakeStore) OldestWaitingWorkerRun(context.Context) (pgtype.Timestamptz, error) {
-	return f.waiting, f.waitingErr
+func (f *fakeStore) ListWaitingWorkerRuns(context.Context) ([]store.ListWaitingWorkerRunsRow, error) {
+	f.waitingQueries.Add(1)
+	return f.waitingRows, f.waitingErr
 }
 func (f *fakeStore) OldestUndispatchedTaskRun(context.Context) (pgtype.Timestamptz, error) {
 	return f.undispatched, f.undispatchErr
@@ -400,7 +405,11 @@ func TestQueueWaiting(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			svc := newSvc(&fakeStore{waiting: tc.oldest}, &fakeSettings{})
+			var rows []store.ListWaitingWorkerRunsRow
+			if tc.oldest.Valid {
+				rows = []store.ListWaitingWorkerRunsRow{{RunID: uuid.New(), UserID: uuid.New(), HealthSince: tc.oldest}}
+			}
+			svc := newSvc(&fakeStore{waitingRows: rows}, &fakeSettings{})
 			c := svc.checkQueueWaiting(context.Background(), fixedNow, tc.health)
 			if c.Severity != tc.wantSev {
 				t.Fatalf("severity = %q, want %q (summary %q)", c.Severity, tc.wantSev, c.Summary)
@@ -905,7 +914,7 @@ func assertClean(t *testing.T, where, s string) {
 
 func TestFleetCapacityRollConfirmation(t *testing.T) {
 	owner := uuid.New()
-	row := store.ListOwnersWaitingNoCapacityRow{UserID: owner, RunID: uuid.New(), HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-48 * time.Hour), Valid: true}, HasRollReason: true}
+	row := store.ListOwnersWaitingNoCapacityRow{UserID: owner, RunID: uuid.New(), HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-48 * time.Hour), Valid: true}, HasRollReason: true, HealthReason: pgtype.Text{String: workersvc.ReasonWorkersUpgrading, Valid: true}}
 	eligible := store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 2, LatestSuitableDrainingSince: pgtype.Timestamptz{Time: fixedNow.Add(-time.Hour), Valid: true}}
 	for _, tc := range []struct {
 		name        string
@@ -942,6 +951,7 @@ func TestFleetCapacityRollConfirmation(t *testing.T) {
 		}, want: sevDanger, since: row.HealthSince.Time},
 		{name: "different stored reason", change: func(r *store.ListOwnersWaitingNoCapacityRow, _ *store.CountOnlineWorkersClaimableForRunRow) {
 			r.HasRollReason = false
+			r.HealthReason = pgtype.Text{}
 		}, want: sevDanger, since: row.HealthSince.Time},
 		{name: "failed callback", err: errors.New("eligibility failed"), want: sevDanger, since: row.HealthSince.Time},
 		{name: "nil callback", nilCallback: true, want: sevDanger, since: row.HealthSince.Time},
@@ -956,9 +966,10 @@ func TestFleetCapacityRollConfirmation(t *testing.T) {
 		}, want: sevDanger, since: row.HealthSince.Time},
 		{name: "null health since", change: func(r *store.ListOwnersWaitingNoCapacityRow, _ *store.CountOnlineWorkersClaimableForRunRow) {
 			r.HealthSince.Valid = false
-		}, want: sevOK},
+		}, want: sevUnknown},
 		{name: "genuine exact five minutes", change: func(r *store.ListOwnersWaitingNoCapacityRow, _ *store.CountOnlineWorkersClaimableForRunRow) {
 			r.HasRollReason = false
+			r.HealthReason = pgtype.Text{}
 			r.HealthSince.Time = fixedNow.Add(-5 * time.Minute)
 		}, want: sevDanger, since: fixedNow.Add(-5 * time.Minute)},
 	} {
@@ -1002,7 +1013,7 @@ func TestFleetCapacityRollConfirmationBounded(t *testing.T) {
 	eligible := store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 1, LatestSuitableDrainingSince: pgtype.Timestamptz{Time: fixedNow.Add(-time.Hour), Valid: true}}
 	rows := make([]store.ListOwnersWaitingNoCapacityRow, fleetCapacityMaxRollConfirmations+1)
 	for i := range rows {
-		rows[i] = store.ListOwnersWaitingNoCapacityRow{UserID: uuid.New(), RunID: uuid.New(), HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-time.Hour), Valid: true}, HasRollReason: true}
+		rows[i] = store.ListOwnersWaitingNoCapacityRow{UserID: uuid.New(), RunID: uuid.New(), HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-time.Hour), Valid: true}, HasRollReason: true, HealthReason: pgtype.Text{String: workersvc.ReasonWorkersUpgrading, Valid: true}}
 	}
 	svc := newSvc(&fakeStore{capacityRows: rows}, &fakeSettings{})
 	calls := 0
@@ -1030,7 +1041,7 @@ func TestFleetCapacityRollConfirmationBounded(t *testing.T) {
 func TestFleetCapacityRollConfirmationBudget(t *testing.T) {
 	rows := make([]store.ListOwnersWaitingNoCapacityRow, 10)
 	for i := range rows {
-		rows[i] = store.ListOwnersWaitingNoCapacityRow{UserID: uuid.New(), RunID: uuid.New(), HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-time.Hour), Valid: true}, HasRollReason: true}
+		rows[i] = store.ListOwnersWaitingNoCapacityRow{UserID: uuid.New(), RunID: uuid.New(), HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-time.Hour), Valid: true}, HasRollReason: true, HealthReason: pgtype.Text{String: workersvc.ReasonWorkersUpgrading, Valid: true}}
 	}
 	svc := newSvc(&fakeStore{capacityRows: rows}, &fakeSettings{})
 	calls := 0
@@ -1088,7 +1099,7 @@ func TestFleetCapacityYoungGenuineAndRoll(t *testing.T) {
 			roll := uuid.New()
 			rows := []store.ListOwnersWaitingNoCapacityRow{
 				{UserID: owner, RunID: uuid.New(), HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-5*time.Minute + time.Second), Valid: true}},
-				{UserID: other, RunID: roll, HasRollReason: true, HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-48 * time.Hour), Valid: true}},
+				{UserID: other, RunID: roll, HasRollReason: true, HealthReason: pgtype.Text{String: workersvc.ReasonWorkersUpgrading, Valid: true}, HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-48 * time.Hour), Valid: true}},
 			}
 			svc := newSvc(&fakeStore{capacityRows: rows}, &fakeSettings{})
 			svc.cfg.WorkerEligibilityForHealth = func(context.Context, time.Time, uuid.UUID) (store.CountOnlineWorkersClaimableForRunRow, error) {
@@ -1106,7 +1117,7 @@ func TestFleetCapacityYoungGenuineAndRoll(t *testing.T) {
 }
 
 func TestFleetCapacityOverdueOnlyAction(t *testing.T) {
-	svc := newSvc(&fakeStore{capacityRows: []store.ListOwnersWaitingNoCapacityRow{{UserID: uuid.New(), RunID: uuid.New(), HasRollReason: true, HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-48 * time.Hour), Valid: true}}}}, &fakeSettings{})
+	svc := newSvc(&fakeStore{capacityRows: []store.ListOwnersWaitingNoCapacityRow{{UserID: uuid.New(), RunID: uuid.New(), HasRollReason: true, HealthReason: pgtype.Text{String: workersvc.ReasonWorkersUpgrading, Valid: true}, HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-48 * time.Hour), Valid: true}}}}, &fakeSettings{})
 	svc.cfg.WorkerEligibilityForHealth = func(context.Context, time.Time, uuid.UUID) (store.CountOnlineWorkersClaimableForRunRow, error) {
 		return store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 1, LatestSuitableDrainingSince: pgtype.Timestamptz{Time: fixedNow.Add(-24 * time.Hour), Valid: true}}, nil
 	}
@@ -1123,8 +1134,8 @@ func TestFleetCapacityMixedOwnersAndAges(t *testing.T) {
 	a, b := uuid.New(), uuid.New()
 	genuine, overdue := uuid.New(), uuid.New()
 	rows := []store.ListOwnersWaitingNoCapacityRow{
-		{UserID: a, RunID: genuine, HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-7 * time.Minute), Valid: true}, HasRollReason: true},
-		{UserID: a, RunID: overdue, HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-72 * time.Hour), Valid: true}, HasRollReason: true},
+		{UserID: a, RunID: genuine, HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-7 * time.Minute), Valid: true}, HasRollReason: true, HealthReason: pgtype.Text{String: workersvc.ReasonWorkersUpgrading, Valid: true}},
+		{UserID: a, RunID: overdue, HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-72 * time.Hour), Valid: true}, HasRollReason: true, HealthReason: pgtype.Text{String: workersvc.ReasonWorkersUpgrading, Valid: true}},
 		{UserID: b, RunID: uuid.New(), HealthSince: pgtype.Timestamptz{Time: fixedNow.Add(-10 * time.Minute), Valid: true}},
 	}
 	svc := newSvc(&fakeStore{capacityRows: rows}, &fakeSettings{})

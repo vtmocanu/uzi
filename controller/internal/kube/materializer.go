@@ -188,6 +188,7 @@ func (m *Materializer) flagStrandedPVCs(workers []reconcile.ObservedWorker) {
 		targets := []target{
 			{nixPVCName(w.ID), w.NixPVCPhase, w.NixPVCCreatedAt},
 			{dataPVCName(w.ID), w.DataPVCPhase, w.DataPVCCreatedAt},
+			{dindDataPVCName(w.ID), w.DinDPVCPhase, w.DinDPVCCreatedAt},
 		}
 		var flagged bool
 		for _, t := range targets {
@@ -260,6 +261,8 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		}
 		o := get(id)
 		o.HasDeployment = true
+		o.DeploymentUID = string(d.UID)
+		o.DeploymentTerminating = d.DeletionTimestamp != nil
 		if img := workerImage(d); img != "" {
 			targetImages[id] = img
 		}
@@ -326,6 +329,13 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 			// to have. A plain worker never has an object by this name, so the arm is
 			// simply never taken for one.
 			o.HasDinDDataPVC = true
+			o.DinDPVCUID = string(p.UID)
+			if !terminating {
+				o.DinDPVCLive = true
+				o.DinDPVCPhase = string(p.Status.Phase)
+				t := p.CreationTimestamp.Time
+				o.DinDPVCCreatedAt = &t
+			}
 		}
 	}
 
@@ -336,32 +346,12 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 	// Unselected, for the same reason as the two lists above: a label selector would
 	// make the unmanaged-pod check below structurally blind to exactly what it looks
 	// for. Pods inherit the pod template's labels, so IsOurs works on them unchanged.
-	// A POD-LIST FAILURE IS LOGGED AND SWALLOWED. It must never abort the cycle, and
-	// this is the one asymmetry in this function that is worth reading carefully.
-	//
-	// The Deployment and PVC lists above return their errors, and that is CORRECT for
-	// them: they drive decisions, so reconciling against a view we just admitted we
-	// could not read is how a healthy worker gets clobbered. Nothing of the sort is
-	// true here. `.Roll` is written below and consumed in exactly ONE place — the
-	// display-only status report in reconcile.Tick. No create, patch, teardown or
-	// token-delivery decision reads it.
-	//
-	// So returning an error here would stop provisioning, teardown, patching and token
-	// delivery for the entire hosted fleet on account of a read whose only consumer is
-	// a badge. MEASURED, and this is not hypothetical: the controller ServiceAccount
-	// deployed on dev-cluster today answers `no` to `list pods` in both worker
-	// namespaces (with `list deployments` = yes as the positive control), and nothing
-	// in the chart orders worker-rbac.yaml ahead of controller-deployment.yaml — no
-	// sync-wave on either. So the first tick after this image becomes ready 403s. With
-	// the swallow, that is a few ticks of absent roll-health rows, which the api already
-	// reads as "no signal"; without it, the fleet wedges and the symptom points nowhere
-	// near roll health.
-	//
-	// The principle is the same one the report step in Tick states from the other side:
-	// an observability feature must never be able to take down the thing it observes.
+	// Pod-list failure preserves legacy provisioning and reporting behaviour.
+	// PodsKnown stays false. Fenced DinD maintenance rechecks pods through
+	// maintenanceObservation and waits on any read failure.
 	pods, err := m.client.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		m.log.Warn("listing pods for roll health failed; continuing without roll health for this namespace (reconciliation is unaffected)",
+		m.log.Warn("listing pods failed; legacy reconciliation continues and DinD maintenance requires a successful recheck",
 			"namespace", ns, "error", err)
 		return nil
 	}
@@ -374,6 +364,20 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 			continue
 		}
 		byWorker[id] = append(byWorker[id], *p)
+		o := get(id)
+		o.WorkerPodCount++
+		if p.DeletionTimestamp == nil && p.UID != "" && p.Annotations[AnnotationSpecHash] == o.SpecHash {
+			for _, c := range p.Status.Conditions {
+				if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+					o.ReadyPodUID = string(p.UID)
+				}
+			}
+		}
+	}
+	for _, o := range byID {
+		if o.Namespace == ns {
+			o.PodsKnown = true
+		}
 	}
 	// Derive for every worker we have a DEPLOYMENT for, not merely for every worker we
 	// found pods for. The difference is the Recreate gap: between the old pod being
@@ -585,10 +589,12 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 }
 
 // recycleVolumes selects which of a worker's PVCs a recycle tears down: {Nix} for the
-// M3 size-drift arm, {Nix, Data} for the M4 disk-pressure arm. dind is never recycled.
+// size-drift arm, {Nix, Data} for legacy disk pressure. DinD is handled by its
+// separately fenced lifecycle; legacy deletion refuses selectors containing it.
 type recycleVolumes struct {
 	Nix  bool
 	Data bool
+	DinD bool
 }
 
 // recycleWorkerVolumes tears a worker's Deployment and the selected PVC(s) down so the
@@ -608,6 +614,11 @@ type recycleVolumes struct {
 //   - Phase 2 deletes each selected, LIVE PVC. A nil NixPVCSize means the nix PVC is
 //     already Terminating or absent, so it is skipped rather than re-deleted.
 func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, vols recycleVolumes) error {
+	// DinD destruction requires its fenced lifecycle; this legacy helper fails
+	// closed even for combined selectors and force/deadline overrides.
+	if vols.DinD {
+		return nil
+	}
 	// Phase 0: drain-if-busy. Identical guard to reconcileWorker's roll path — a busy
 	// worker is cordoned + deferred rather than having its volumes torn out from under a
 	// live run, unless an override (force-roll, or the elapsed drain deadline) says roll.
@@ -703,6 +714,10 @@ func (m *Materializer) withinRecycleCooldown(obs reconcile.ObservedWorker) bool 
 
 // reconcileWorker converges one desired worker.
 func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker) error {
+	return m.reconcileWorkerWithLegacy(ctx, w, obs, true)
+}
+
+func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, legacy bool) error {
 	// Placement is the render gate, and nothing below runs without it. A docker worker
 	// needs the privileged docker namespace and an isolated worker the lane namespace
 	// (PRD #1906 M5), and this controller is not always configured for either (the kind
@@ -757,13 +772,19 @@ func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWo
 		}
 	}
 
+	if legacy {
+		if handled, err := m.reconcileDinD(ctx, w, obs, ns, spec); handled || err != nil {
+			return err
+		}
+	}
+
 	// M3: /nix size-drift recycle. Teardown + reprovision in place, NOT expansion. Trigger
 	// STRICTLY less-than only (a PVC cannot shrink; >= must never recycle). NixPVCSize==nil
 	// (absent or Terminating nix PVC) never triggers — a mid-recycle tick falls through to the
 	// create-gate and the Deployment guard below. Keeps the Secret, the worker row/uuid, /data.
 	// M4: gated on the recycle toggle, and Ephemeral (run-bound) workers are excluded — their
 	// volumes are torn down when the run ends anyway, so recycling them is pointless churn.
-	if m.recycle.Enabled && !w.Ephemeral &&
+	if legacy && m.recycle.Enabled && !w.Ephemeral &&
 		obs.HasNixPVC && obs.NixPVCSize != nil && obs.NixPVCSize.Cmp(spec.NixSize) < 0 {
 		return m.recycleWorkerVolumes(ctx, w, obs, ns, recycleVolumes{Nix: true})
 	}
@@ -776,7 +797,7 @@ func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWo
 	// discard it. It falls through to normal reconcile (like the cooldown case) with a fixed
 	// deferral token, rather than recycling. recycleWorkerVolumes itself also refuses to drop
 	// a held /data volume, so this arm is doubly guarded.
-	if m.recycle.Enabled && w.DiskPressure && !w.Ephemeral {
+	if legacy && m.recycle.Enabled && w.DiskPressure && !w.Ephemeral {
 		switch {
 		case w.CustodyHeld:
 			m.log.Info(fmt.Sprintf("disk-recycle-skipped-custody worker=%s", w.ID))
@@ -844,7 +865,8 @@ func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWo
 		// affected; it fires only for a present-but-Terminating /data volume.
 		nixLiveAtSize := obs.NixPVCSize != nil && obs.NixPVCSize.Cmp(spec.NixSize) >= 0
 		dataBlocking := obs.HasDataPVC && !obs.DataPVCLive // present but Terminating
-		if (obs.HasNixPVC && !nixLiveAtSize) || dataBlocking {
+		dindBlocking := w.Docker && obs.HasDinDDataPVC && !obs.DinDPVCLive
+		if (obs.HasNixPVC && !nixLiveAtSize) || dataBlocking || dindBlocking {
 			return nil
 		}
 		_, err := m.client.AppsV1().Deployments(ns).Create(ctx, dep, metav1.CreateOptions{})

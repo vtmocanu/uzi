@@ -16,7 +16,7 @@ import { MemoryRouter } from "react-router-dom";
 
 import { HealthDangerBanner } from "./HealthDangerBanner";
 import { api, type HealthDoc } from "../lib/api";
-import { healthySilentDoc, incidentDoc } from "../mocks/data/health";
+import { confirmedDrainDoc, healthySilentDoc, incidentDoc, ownerOnlyDoc } from "../mocks/data/health";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -45,6 +45,60 @@ function repoll() {
 }
 
 describe("HealthDangerBanner", () => {
+  it("keeps owner-only danger out of the instance alert, then shows an instance blocker", async () => {
+    mockApi.getAdminHealth.mockResolvedValue(ownerOnlyDoc());
+    renderBanner();
+    await act(async () => { await Promise.resolve(); });
+    expect(banner()).toBeNull();
+    const mixed = incidentDoc();
+    mixed.checks = [...mixed.checks.slice(1), mixed.checks[0]];
+    mockApi.getAdminHealth.mockResolvedValue(mixed);
+    repoll();
+    await waitFor(() => expect(banner()).not.toBeNull());
+    expect(screen.getByText("uzi cannot run work: 1 blocking check")).toBeTruthy();
+    expect(screen.getByText(mixed.checks[mixed.checks.length - 1].summary)).toBeTruthy();
+    expect(screen.queryByText(mixed.checks[0].summary)).toBeNull();
+  });
+
+  it("keeps confirmed-drain out of the instance alert", async () => {
+    mockApi.getAdminHealth.mockResolvedValue(confirmedDrainDoc());
+    renderBanner();
+    await act(async () => { await Promise.resolve(); });
+    expect(mockApi.getAdminHealth).toHaveBeenCalledTimes(1);
+    expect(banner()).toBeNull();
+    expect(screen.queryByRole("button", { name: "Snooze 1 h" })).toBeNull();
+  });
+
+  it("honors explicit false on an owner danger with an old episode", async () => {
+    mockApi.getAdminHealth.mockResolvedValue({ ...ownerOnlyDoc(), episode_id: "old" });
+    renderBanner();
+    await act(async () => { await Promise.resolve(); });
+    expect(banner()).toBeNull();
+    expect(screen.queryByRole("button", { name: "Snooze 1 h" })).toBeNull();
+  });
+
+  it("renders the legacy owner danger and expires its server snooze without a new document", async () => {
+    vi.useFakeTimers();
+    try {
+      const base = Date.parse("2026-09-20T00:00:00Z");
+      vi.setSystemTime(base);
+      const { blocking: _blocking, ...old } = ownerOnlyDoc();
+      const checks = old.checks.map(({ scope: _scope, ...check }) => check);
+      const legacy = { ...old, checks, episode_id: "legacy", snoozed_until: new Date(base + 3600_000).toISOString() } as HealthDoc;
+      mockApi.getAdminHealth.mockResolvedValue(legacy);
+      renderBanner();
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(banner()).toBeNull();
+      await act(async () => { await vi.advanceTimersByTimeAsync(3600_000); });
+      expect(banner()).not.toBeNull();
+      expect(screen.getByText("uzi cannot run work: 2 blocking checks")).toBeTruthy();
+      expect(screen.getByText(legacy.checks.find((c) => c.severity === "danger")!.summary)).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Snooze 1 h" })).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not render when the status is not danger", async () => {
     mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc());
     renderBanner();
@@ -57,8 +111,8 @@ describe("HealthDangerBanner", () => {
     mockApi.getAdminHealth.mockResolvedValue(incidentDoc());
     renderBanner();
     await waitFor(() => expect(banner()).not.toBeNull());
-    // Verdict line derived from counts.danger (3 danger checks in the incident fixture).
-    expect(screen.getByText("uzi cannot run work: 3 blocking checks")).toBeTruthy();
+    // Only the instance-scoped danger contributes to the blocking headline.
+    expect(screen.getByText("uzi cannot run work: 1 blocking check")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Snooze 1 h" })).toBeTruthy();
     // PRD #1648 D6: the danger mark is the decorative SVG shape, not a font glyph.
     const el = banner();

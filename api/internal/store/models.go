@@ -760,6 +760,7 @@ type RecoveryCustodyHold struct {
 	ReleaseSuccessorGeneration pgtype.Int8        `json:"release_successor_generation"`
 	ReleaseBranch              pgtype.Text        `json:"release_branch"`
 	ReleaseTarget              pgtype.Text        `json:"release_target"`
+	TerminalRecordRejection    pgtype.Text        `json:"terminal_record_rejection"`
 }
 
 type Repo struct {
@@ -1329,6 +1330,7 @@ type User struct {
 	DefaultClaudeModel      pgtype.Text        `json:"default_claude_model"`
 	DefaultCodexModel       pgtype.Text        `json:"default_codex_model"`
 	DefaultCodexEffort      pgtype.Text        `json:"default_codex_effort"`
+	EphemeralDockerEnabled  bool               `json:"ephemeral_docker_enabled"`
 	PlanCrossCheckEnabled   bool               `json:"plan_cross_check_enabled"`
 }
 
@@ -1406,6 +1408,25 @@ type Worker struct {
 	LeaseSince               pgtype.Timestamptz `json:"lease_since"`
 	LeaseRepoID              pgtype.UUID        `json:"lease_repo_id"`
 	LeaseBranch              pgtype.Text        `json:"lease_branch"`
+	DindRegisterFloor        pgtype.Timestamptz `json:"dind_register_floor"`
+	DindMeterEpoch           int64              `json:"dind_meter_epoch"`
+	DindMeterAt              pgtype.Timestamptz `json:"dind_meter_at"`
+	DindPressureStreak       int32              `json:"dind_pressure_streak"`
+	DindMeterOver            bool               `json:"dind_meter_over"`
+	DindBelowThreshold       bool               `json:"dind_below_threshold"`
+	MaintenanceOwnsDrain     bool               `json:"maintenance_owns_drain"`
+	NixPressure              bool               `json:"nix_pressure"`
+	DataPressure             bool               `json:"data_pressure"`
+	MaintenanceID            pgtype.UUID        `json:"maintenance_id"`
+	MaintenanceNonce         string             `json:"maintenance_nonce"`
+	MaintenancePhase         string             `json:"maintenance_phase"`
+	MaintenanceDeploymentUid string             `json:"maintenance_deployment_uid"`
+	MaintenancePvcUid        string             `json:"maintenance_pvc_uid"`
+	MaintenanceRegisterNonce string             `json:"maintenance_register_nonce"`
+	MaintenanceFenced        bool               `json:"maintenance_fenced"`
+	MaintenanceReadyAck      bool               `json:"maintenance_ready_ack"`
+	MaintenanceAckAt         pgtype.Timestamptz `json:"maintenance_ack_at"`
+	MaintenanceActivityFloor pgtype.Timestamptz `json:"maintenance_activity_floor"`
 }
 
 type WorkerActiveRun struct {

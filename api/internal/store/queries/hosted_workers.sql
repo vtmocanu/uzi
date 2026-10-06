@@ -60,6 +60,14 @@ SELECT w.id,
        COALESCE(w.stats_disk_pressure_streak >= @disk_pressure_min_streak::int
         AND w.last_heartbeat_at IS NOT NULL
         AND w.last_heartbeat_at >= @heartbeat_cutoff, false)::boolean AS disk_pressure,
+       ARRAY_REMOVE(ARRAY[
+         CASE WHEN w.stats_disk_pressure_streak >= 2 AND w.nix_pressure AND w.last_heartbeat_at >= @heartbeat_cutoff THEN 'nix'::text END,
+         CASE WHEN w.stats_disk_pressure_streak >= 2 AND w.data_pressure AND w.last_heartbeat_at >= @heartbeat_cutoff THEN 'data'::text END,
+         CASE WHEN w.dind_pressure_streak >= 2 AND w.dind_meter_at >= now() - interval '45 seconds' THEN 'dind'::text END
+       ], NULL)::text[] AS disk_pressure_volumes,
+       w.maintenance_id, w.maintenance_nonce, w.maintenance_phase,
+       w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce,
+       w.maintenance_fenced, w.maintenance_ready_ack,
        w.ephemeral,
        -- isolated_lane (PRD #1906 M5): the server-set lane marker, mapped to DesiredWorker.Isolated
        -- so the controller renders the worker into the isolated lane's namespace.
@@ -596,7 +604,7 @@ WHERE token_ciphertext IS NOT NULL
 -- leased-idle worker is idle, so it rolls or is released at once, never held for its lease). The
 -- UPDATE takes the row lock, so it serializes against a claim that is rebinding the same worker.
 UPDATE workers
-   SET draining_since = COALESCE(draining_since, now()), updated_at = now(),
+   SET draining_since = COALESCE(draining_since, now()), maintenance_owns_drain = false, updated_at = now(),
        lease_since = NULL, lease_repo_id = NULL, lease_branch = NULL
  WHERE id = @id AND kind = 'hosted';
 
@@ -609,5 +617,8 @@ UPDATE workers
 -- unambiguously "no such hosted worker" (clean 404), not "already clear". kind='hosted'
 -- mirrors CordonHostedWorker: never touch an external worker.
 UPDATE workers
-   SET draining_since = NULL, updated_at = now()
+   -- Releasing the legacy cordon hands a pending drain to maintenance for cleanup.
+   SET draining_since = CASE WHEN maintenance_phase IN ('requested','ready','stopping','recycling') THEN draining_since ELSE NULL END,
+       maintenance_owns_drain = maintenance_phase IN ('requested','ready','stopping','recycling'),
+       updated_at = now()
  WHERE id = @id AND kind = 'hosted';

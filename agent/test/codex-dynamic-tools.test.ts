@@ -55,6 +55,18 @@ describe("buildCodexDynamicTools: worker-owned app-server callback surface", () 
     assert.equal(checkpoint?.inputSchema.additionalProperties, false);
   });
 
+  it("advertises optional bounded Read ranges and both path aliases", () => {
+    const spec = buildCodexDynamicTools(grants(["Read"])).find(s => s.name === "uzi_read")!;
+    assert.deepEqual(spec.inputSchema.properties, {
+      path: { type: "string" }, file_path: { type: "string" },
+      offset: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER, default: 1 },
+      limit: { type: "integer", minimum: 1, maximum: 2000, default: 200 },
+    });
+    assert.deepEqual(spec.inputSchema.anyOf, [{ required: ["path"] }, { required: ["file_path"] }]);
+    assert.equal(spec.inputSchema.required, undefined);
+    assert.equal(spec.inputSchema.additionalProperties, false);
+  });
+
   it("is byte-stable and never mutates the immutable grant", () => {
     const input = grants(["Read", "Skill", "Bash"]);
     const before = [...input.allowedTools];

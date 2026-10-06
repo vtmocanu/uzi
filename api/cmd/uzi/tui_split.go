@@ -10,7 +10,7 @@ import (
 // The bounds include all three band headings and two inter-band spacers even
 // when the current list has fewer bands.
 const (
-	splitSharedChrome = 1 + 2 + 1 + 1 + 1 // wordmark, meters, vault, admin, error
+	splitSharedChrome = 1 + 1 + 2 + 1 + 1 + 1 + 1 // wordmark, fleet fallback, meters, summary fallback, vault, admin, error
 	splitBandHeadings = 3
 	splitBandSpacers  = splitBandHeadings - 1
 	splitFloorChrome  = 1 + 1 + splitBandHeadings + splitBandSpacers
@@ -18,17 +18,27 @@ const (
 	splitSeparator    = 1
 	splitFooter       = 1
 	splitRows         = 8
-	splitMinHeight    = splitSharedChrome + splitSeparator + splitFooter + 2*(splitForgeChrome+splitRows)
+	splitMinHeight    = splitSharedChrome + splitSeparator + splitFooter + splitFloorChrome + splitForgeChrome + 2*splitRows
 )
 
 func (m tuiModel) listView() bool {
-	return m.view == viewBoard || m.view == viewCI || m.view == viewPulls
+	return m.view == viewBoard || m.view == viewWorkers || m.view == viewCI || m.view == viewPulls
 }
 func (m *tuiModel) setListView(v tuiView) {
+	m.workerOrigin = workerOrigin{}
 	m.view = v
+	if v == viewBoard || v == viewWorkers {
+		m.topTab = v
+	}
 	if v == viewCI || v == viewPulls {
 		m.bottomTab = v
 	}
+}
+func (m tuiModel) top() tuiView {
+	if m.topTab == viewWorkers {
+		return viewWorkers
+	}
+	return viewBoard
 }
 func (m tuiModel) bottom() tuiView {
 	if m.bottomTab == viewPulls {
@@ -58,7 +68,7 @@ func (m *tuiModel) collapseSplit() {
 	if m.view == viewPulls {
 		m.pulls.filtering = false
 	}
-	m.setListView(viewBoard)
+	m.setListView(m.top())
 }
 func (m tuiModel) focusBottom() (tea.Model, tea.Cmd) {
 	if m.bottom() == viewPulls {
@@ -221,7 +231,10 @@ func (m tuiModel) withSplitNote(footer string) string {
 func (m tuiModel) splitFooterLine() string {
 	var hints []string
 	if m.view == viewBoard {
-		hints = []string{"enter/→ open", "tab pane", "/ filter", "a factory", "h fold done", "r refresh", "? keys", "q quit"}
+		hints = []string{"enter/→ open", "tab pane", "/ filter", "a scope", "h fold done", "r refresh", "? keys", "q quit"}
+	}
+	if m.view == viewWorkers {
+		hints = []string{"enter/→ open", "j/k move", "ctrl+w focus", "/ filter", "a scope", "r refresh", "? keys", "q quit"}
 	}
 	if m.view == viewCI {
 		hints = []string{"enter/→ open", "tab pane", "R repo", "/ filter", "r refresh", "? keys", "q quit"}
@@ -239,7 +252,7 @@ func (m tuiModel) splitFooterLine() string {
 			return padVisual(line, m.width)
 		}
 		removed := false
-		for _, key := range []string{"r refresh", "h fold done", "a factory", "/ filter"} {
+		for _, key := range []string{"r refresh", "h fold done", "a scope", "/ filter"} {
 			for i, h := range hints {
 				if h == key {
 					hints = append(hints[:i], hints[i+1:]...)
@@ -261,16 +274,35 @@ func (m tuiModel) splitFooterLine() string {
 // splitHeader is the sole source of shared header lines and their row count.
 // Build it once per render: time-dependent meter widths can change its height.
 func (m tuiModel) splitHeader(now time.Time) []string {
+	return m.splitHeaderSummary(now, m.boardSummary())
+}
+func (m tuiModel) splitHeaderSummary(now time.Time, summary string) []string {
 	var lines []string
 	floor := "floor"
 	if m.board.admin {
 		floor = "active runs"
 	}
-	if m.view == viewBoard {
-		floor = "[" + floor + "]"
+	labels := []struct {
+		name string
+		tab  tuiView
+	}{{floor, viewBoard}, {"workers", viewWorkers}}
+	title := " " + m.pal.title.Render("▚▚ uzi")
+	for _, label := range labels {
+		title += m.pal.faint.Render(" · ")
+		if label.tab == m.top() {
+			name := label.name
+			if m.view == m.top() {
+				name = "[" + name + "]"
+			}
+			title += m.pal.title.Render(name)
+		} else {
+			title += m.pal.faint.Render(label.name)
+		}
 	}
-	lines = append(lines, clampVisual(" "+m.pal.title.Render("▚▚ uzi")+" · "+m.pal.title.Render(floor), m.width))
-	lines = append(lines, m.boardMeterLayout(now).lines...)
+	lines = append(lines, m.workerFleetTitleLines(title)...)
+	if m.top() == viewBoard {
+		lines = append(lines, m.boardMeterSummaryLines(m.boardMeterLayout(now).lines, summary)...)
+	}
 	if vault := m.vaultIndicatorLine(); vault != "" {
 		lines = append(lines, vault)
 	}
@@ -286,9 +318,17 @@ func (m tuiModel) splitHeader(now time.Time) []string {
 }
 
 func (m tuiModel) renderSplit() string {
-	lines := m.splitHeader(time.Now())
+	now := time.Now()
+	lines := m.splitHeader(now)
 	top, bottom := m.splitHeightsWithHeader(len(lines))
-	lines = append(lines, splitPane(m.renderBoardBody(top, false), top))
+	if m.top() == viewBoard {
+		lines = m.splitHeaderSummary(now, m.boardWindowSummary(m.boardCapacityAt(top, 0, false)))
+	}
+	if m.top() == viewWorkers {
+		lines = append(lines, splitPane(m.renderWorkersBody(top, false), top))
+	} else {
+		lines = append(lines, splitPane(m.renderBoardBody(top, false), top))
+	}
 	lines = append(lines, m.splitSeparatorAt(bottom))
 	if m.bottom() == viewPulls {
 		lines = append(lines, splitPane(m.renderPullsBody(bottom, false), bottom))

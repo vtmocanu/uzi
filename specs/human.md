@@ -22,6 +22,10 @@ terse and tag each AI edit `(AI-synced YYYY-MM-DD)`.
 - Prefer the better implementation; beat them where possible. Best-practice bar.
 - Some scope may be deferred to later.
 
+## Codex bounded Read (#296)
+
+- Text Read accepts path/file_path and optional one-based positive safe integer offset (default 1), limit 1–2000 (default 200); excerpts preserve UTF-8/BOM and LF/CRLF, cap at 64 KiB, and report size/content/offset/linesReturned/partialLastLine/truncated without duplicate base64 or a cursor. Strict helper validation retains the 1 MiB file ceiling and neutral errors. Invalid UTF-8 or NUL returns exact base64 only without explicit ranges; ranged binary is refused. Root and child replies must fit the existing 4 MiB transport cap. Full contract: [ADR 0296](../adr/0296-codex-bounded-text-reads.md). (AI-synced 2026-10-05)
+
 ## MVP / infrastructure
 
 - Initial MVP is a local laptop demo via docker-compose.
@@ -481,7 +485,7 @@ Tracked as GitLab issue vtmocanu/uzi#58 (closed); PRD at `prds/done/58-hosted-k8
   - `l`'s RAM limit is now **12Gi** (request was 4Gi; now 8Gi, #1341), raised to stop runtime OOMKills from multi-agent runs (parallel subagent waves plus the web-ux browser). [user, #131]
   - Per-size RAM raised: `s` 2–4Gi, `m` 4–8Gi, `l` 8–12Gi — each request lifted above that size's measured per-run peak (all still Burstable). Stops kubelet node-memory-pressure eviction of workers that sat over their request, incl. mid-run. [user, #1341]
   - Hosted worker pods now carry a default `priorityClassName` (a modest cluster-scoped PriorityClass, value 1000, `globalDefault: false`), so under node memory pressure other lower-priority pods are evicted before ours. `preemptionPolicy: PreemptLowerPriority` (owner's choice): a worker that cannot be scheduled for lack of room also preempts lower-priority pods to get placed. Operators can set `Never` to drop that scheduling-time preemption. [user, #1341]
-- Default size is `m`, not `s`. [user 2026-07-16]
+- Default size is `l` for new hosted workers, persistent picker and ephemeral provisioning alike; explicit choices and existing workers keep their sizes. Was `m` [user 2026-07-16]. [user 2026-10-05, #2240] (AI-synced 2026-10-05)
 - Three sizes stay, and the picker displays what each size buys. [user 2026-07-17]
 - Deleting a hosted worker requires a confirmation (it destroys the worker's volumes); deleting an external worker stays one click. [user 2026-07-16]
 - Hosted k8s gains an opt-in uid-split worker profile for Codex (default off; while on, the kube-native worker namespace's PodSecurity admission drops from `restricted` to `baseline`, while the separate Docker-capable tier keeps its own `privileged` namespace); Landlock is optional via a mode knob (`required` fails closed, `best-effort` runs unconfined on a kernel without it, relying on the uid split alone). A worker without the split, or without usable Landlock under `required`, stops advertising Codex — those runs (including tool-less Codex advice) simply queue instead of being claimed and then failing. (AI-synced 2026-09-20)
@@ -526,7 +530,7 @@ Tracked as GitLab issue vtmocanu/uzi#83; PRD at `prds/done/83-docker-capable-wor
 - Trust model: trust the USER who owns the worker, not the repo code the agent runs (prompt-injectable). Security compromises allowed to cut complexity; agent-facing defenses stay load-bearing. [user]
 - k8s is the first-class test/runtime environment (not the deferred track). [user]
 - k8s docker posture: a dedicated privileged-tier namespace running the rootless-DinD sidecar. [user, Q-B owner decision]
-- dind-data is metered and cache-pruned automatically under an exclusion gate; never volumes; never feeds the /nix+/data recycle. (AI-synced 2026-09-27)
+- DinD state (containers, named/anonymous volumes, networks, images, build cache) is scratch; deliverables use git/checkpoints/capture. Persistent hosted Docker workers use distinct fresh byte-or-inode pressure epochs and a terminal-only, atomic claim fence plus zero local activity/fresh matching custody clearance for optional anonymous-volume prune and DinD-only PVC recycle; parked/paused/approval/input/follow-up waits block cleanup while own parked resumes may finish during pending drain. Recycle preserves nix/data, UUID and join Secret but loses DinD state and run-workdir emptyDir; default-on upgrades require an explicit warning and pre-stop opt-out, no forced park/deadline override, no rollback. Legacy disk_pressure remains nix/data-only; ordinary legacy overrides and compose manual cleanup are unchanged. Supersedes the cache-only/never-volumes decision of 2026-09-27 per maintainer decision 2026-10-04; see ADR-1759 for the strict gate, freshness, lifecycle, capability and observation boundaries. (AI-synced 2026-10-05)
 
 ## Feature #95 — Run activity pane v2: crew roster, opt-in follow, steer-queue delivery
 
@@ -943,12 +947,20 @@ Tracked as GitHub issue vtmocanu/uzi#1995; ADR at `adr/1296-durable-run-recovery
 
 Tracked as GitHub issue vtmocanu/uzi#1484; PRD at `prds/1484-admin-health-tab.md`.
 
-- An admin gets a read-only, closed registry of checks over what uzi knows about itself (worker rolls, queue and capacity, controller liveness, background loops, the database, integrations, housekeeping), surfaced as an Admin → Health tab, an Overview card, an app-wide Danger banner, `uzi admin health`, and one notice per admin per danger episode. [AI-synced 2026-09-20, #1484]
+- An admin gets a read-only, closed registry of checks over what uzi knows about itself (worker rolls, queue and capacity, controller liveness, background loops, the database, integrations, housekeeping). Health, Overview, overall status/counts, attention pips, history and `uzi admin health` retain all checks; the app-wide Danger banner, snooze, episodes and admin notices follow the server's separate `blocking` field for instance danger. Owner-only danger remains visible and exits CLI code 8 without an episode, admin DM or banner. [AI-synced 2026-10-05, #2293]
 - Health is the **last** admin tab, not the first; the sidebar pip and the Overview card are the entry points. [AI-synced 2026-10-03, #1484]
   - Admin tab order: Users, Rate limits, Tool allowlist, Blocked repos, Instance, Branding, Site lists, Products, Health. Site lists and Products follow Branding, with Health still last. (AI-synced 2026-10-03)
 - The Danger banner carries a "Snooze 1 h", per admin, per open episode; a new episode shows the banner again. [AI-synced 2026-09-20, #1484]
 - A non-admin gets a platform line on Overview instead of the admin card, derived only from their own runs and workers, so they can tell a platform problem from a problem with their own run. [AI-synced 2026-09-20, #1484]
 - In-app health never reads the Kubernetes API; the api holds no kube credential, and no action (restart, retry, rollback, cordon) is offered — diagnosis only. [AI-synced 2026-09-20, #1484]
+
+## Issue #2271 — Findings stay in the backlog; admin notices cover instance danger
+
+- Findings remain captured, stored, listed and available in stream cards and the backlog for filing and dispositions; they send no Slack DMs and create no new notification latch rows. [AI-synced 2026-10-05, #2271]
+- #2293 supersedes #2271's literal-ID selection: the server registry gives each check `scope: instance` or `scope: owner`; `db`, `controller.report`, `loops`, `fleet.roll` are instance (including a single owner's fleet), the rest owner. Every document emits `blocking`, true exactly when any instance check is danger; admin notices select instance-danger checks by scope. Owner run-health DMs retain their existing routing. [AI-synced 2026-10-05, #2293]
+- #2293 explicitly supersedes #2271's accepted owner-bridged episode timing: `blocking` opens/holds episodes; the opening tick sends no notice, the next still-blocking tick claims one per admin. Clearing instance danger closes and rearms even while owner danger remains; owner-only danger cannot open/hold an episode. [AI-synced 2026-10-05, #2293]
+- The accepted #2293 follow-up replaces the originally deferred mixed-version fallback: web honors present `blocking` true/false exactly with scoped count/cause and no client ID map; absent `blocking` conservatively uses legacy status/danger count/first danger, including snooze expiry. Api-before-web upgrade / web-before-api rollback is preferred to avoid legacy owner false positives, not required to prevent suppressed banners. Owner-only danger reads "N checks need attention; no instance-wide blocker detected" (singular for one); warn/unknown copy makes no work-flow claim. CLI adds `blocking: true/false (instance-wide)` without changing overall exit 8, strict, transport or malformed handling. [AI-synced 2026-10-05, #2293]
+- `queue.waiting` evaluates the full waiting population, excluding only waits with the exact stored `workersvc.ReasonWorkersUpgrading` value confirmed with finite, nonzero, nonfuture wait/drain times and eligibility `DrainingEligible > 0`, `NonDrainingEligible == 0`, `SuitableOwnDraining == 0`. Capacity-first shared confirmation memoizes by run, caps at 200 calls, 2s per call and a lazy shared 4s budget; failures/elapsed deadlines/exhaustion/invalid inputs leave genuine waits. Genuine waits warn at 10m, danger at 30m; unknown age yields unknown unless a valid wait establishes danger. Confirmed drains stay excluded even overdue; capacity retains D18's >=24h later-wait/drain overlap, independent of controller deadlines. Evidence caps at five sanitized run/owner/wait/reason rows plus omissions; severity uses the full population. [AI-synced 2026-10-05, #2293]
 
 ## Feature #1594 — Codex provider-rejection surfaces as re-login required
 
@@ -998,7 +1010,7 @@ Tracked as GitHub issue vtmocanu/uzi#1624.
 
 Tracked as GitHub issue vtmocanu/uzi#1650; PRD at `prds/done/1650-retire-notifications-inbox.md`.
 
-- The web Notifications inbox (tab, bell, unread badge) is retired; actionable signals reach users by Slack DM (when linked) plus the page that owns the thing. [user 2026-09-25, #1650] (AI-synced 2026-09-25)
+- The web Notifications inbox (tab, bell, unread badge) is retired; actionable signals use the page that owns the thing and, where their routing provides it, Slack DM (when linked). Findings use stream cards and the backlog without DMs (#2271). [user 2026-09-25, #1650] (AI-synced 2026-10-05, #2271)
 - "Settings → Notifications" (Slack linking) is not the inbox and stays. [user 2026-09-25, #1650] (AI-synced 2026-09-25)
 - CI auto-fix / MR rework halt DMs are delivered at-least-once: retried until posted or the owner has no Slack link (capped at about 24h); the forge halt comment stays once-only. A rare duplicate DM is accepted. (AI-synced 2026-10-01, #1675)
 
@@ -1138,6 +1150,10 @@ Tracked as GitHub issue vtmocanu/uzi#2012.
 ## Proposal agent output modes
 
 - Feature-bingo and refactor-scout default to issues (supersedes PRD #929 D5); global fallback stays mr; stored mr/issues modes remain authoritative, NULL inherits the catalog default, and reset adopts that default; no migration. (AI-synced 2026-10-02)
+
+## Feature #2278 — Docker-capable ephemeral workers
+
+- Add a per-user persisted **Docker-capable** checkbox beside **Auto-provision on demand**, on one row with one shared paragraph; hide it without the instance Docker tier (including an old API omitting the flag), keep it usable and retain its value while auto-provision is off, save `{docker}` separately from `{enabled}`, disable competing writes while pending, update auth on success, and restore the confirmed value with a local error on rejection (including an old API's unknown-field error). The preference adds Docker on capability-gap and saturation provisioning only for ordinary runs whose non-null repository is explicitly in the admin's `docker_repo_allowlist`; jobs, isolated-lane and repo-less runs including judges are excluded. Failed allowlist reads discard returned values and mean empty membership; capability-driven Docker and the independent claim fence remain unchanged. Plain warm leases step aside and the capability-free gap widens under the same policy, preserving plain reuse when inapplicable and existing cap/early-eviction rules. Use exactly “Docker-capable includes Docker for repositories your admin allows, at extra CPU and storage.” only when the checkbox is visible; remove experimental/cold-start-size framing and rootless promises from the shipped worker sections while retaining the accurate rootless-by-default Docker documentation. [user 2026-10-05, #2278] (AI-synced 2026-10-05)
 
 ## Deferred (user, "later stuff")
 

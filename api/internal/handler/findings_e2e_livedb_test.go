@@ -18,32 +18,16 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// PRD #333 M8 — the two end-to-end scenarios, wiring the REAL handlers/services together
-// against a live DB with a STUBBED forge (an offline worker has no forge egress). Neither
-// scenario re-tests one endpoint: each drives a report ⇒ … chain across the milestone seams
-// (M2 capture → M3 coalesced notification → M5 filing/dismiss → M4 backlog read) so a
-// regression in the SEAM between two milestones — not just inside one — reddens here.
-//
-// The forge is the same httptest GitLab the M5 suite uses (newFindingForgeStub), the fake
-// the real GitLab driver talks to, so "an issue was filed" means the fake recorded a
-// CreateIssue with the marker label and the disposition stamped `filed` — never a network
-// call. Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres
-// (./e2e/run-store-it.sh provides one and sweeps this package for the LiveDB suffix).
-
-// findingsE2E stands up a Handler wired for the WHOLE flow: the real workersvc (capture +
-// backlog read), the real forgesvc pointed at the httptest forge (filing), and a real
-// notifysvc backed by the live notifications table so the coalescing/suppression path (M3)
-// is exercised end-to-end, not mocked. It reuses fileFindingLiveDB's harness (pool, q, box,
-// forge stub, settings with the DEFAULT agent-found marker) and adds the notifier the M5
-// file-only handler does not need.
-func findingsE2E(t *testing.T) (*Handler, *pgxpool.Pool, *store.Queries, *secretbox.Box, *findingForgeStub) {
+// findingsE2E wires real capture, backlog and filing services against a live DB
+// and a stubbed forge. Real notifysvc plus a Slacker spy prove that capture records
+// evidence and maintains dispositions without inserting notifications or sending DMs.
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
+func findingsE2E(t *testing.T) (*Handler, *pgxpool.Pool, *store.Queries, *secretbox.Box, *findingForgeStub, *findingSlackerSpy) {
 	t.Helper()
 	h, pool, q, box, fs := fileFindingLiveDB(t)
-	// The live notifications table is the M3 coalescing/suppression seam. Nil Slacker →
-	// inbox-only (an offline worker has no Slack egress either); the inbox row is the
-	// durable half this scenario counts.
-	h.SetNotifier(notifysvc.New(q, nil, 0, nil))
-	return h, pool, q, box, fs
+	slack := &findingSlackerSpy{}
+	h.SetNotifier(notifysvc.New(q, slack, 0, nil))
+	return h, pool, q, box, fs, slack
 }
 
 // findingsE2EFixture is one owner with a connected repo and a RUNNING (non-terminal) run the
@@ -88,9 +72,8 @@ func seedRunningRun(ctx context.Context, t *testing.T, pool *pgxpool.Pool, owner
 }
 
 // reportFinding drives WorkerCreateFinding as a worker on ownerID's run, returning the created
-// finding id (the real endpoint's {"id":...} body). It is the M2 capture seam invoked through
-// the HTTP handler, not the service directly, so the RequireWorker/derive-from-run/notify wiring
-// is on the path.
+// finding id (the real endpoint's {"id":...} body). The real handler exercises
+// worker ownership and run-derived capture.
 func reportFinding(t *testing.T, h *Handler, ownerID, runID uuid.UUID, title, description, location string) uuid.UUID {
 	t.Helper()
 	wkr := store.Worker{ID: uuid.New(), UserID: ownerID}
@@ -126,15 +109,13 @@ func findingRowCount(ctx context.Context, t *testing.T, pool *pgxpool.Pool, user
 	return n
 }
 
-// incidentalNotificationCount is the number of inbox notification ROWS of kind
-// incidental_finding for a user. Coalescing keeps one row per run, so this is the anti-nag
-// assertion's instrument: it must NOT climb when a dismissed coordinate is re-reported.
+// incidentalNotificationCount detects any row of the retired incidental_finding kind.
 func incidentalNotificationCount(ctx context.Context, t *testing.T, pool *pgxpool.Pool, userID uuid.UUID) int {
 	t.Helper()
 	var n int
 	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM notifications WHERE user_id = $1 AND kind = $2`,
-		userID, notifysvc.KindIncidentalFinding).Scan(&n); err != nil {
+		`SELECT count(*) FROM notifications WHERE user_id = $1 AND kind = 'incidental_finding'`,
+		userID).Scan(&n); err != nil {
 		t.Fatalf("count notifications: %v", err)
 	}
 	return n
@@ -171,20 +152,10 @@ func backlogHas(dto apitypes.IncidentalFindingBacklogDTO, location string) (apit
 	return apitypes.IncidentalFindingDTO{}, false
 }
 
-// ── Scenario (a): the happy path — report → notify → file → the fake Forge recorded the
-// CreateIssue → the backlog shows the coordinate `filed` with the issue link ──────────────
-//
-// Assertions:
-//  1. after the worker POST, a `findings` evidence row + an `open` disposition exist at the
-//     canonicalised coordinate;
-//  2. exactly one inbox notification (kind incidental_finding) was created, payload count=1
-//     (M3 coalescing — the run's first finding);
-//  3. filing via POST /api/findings/{id}/issue records exactly one fake-Forge CreateIssue
-//     whose labels include the server marker, and stamps the disposition `filed` with
-//     filed_issue_iid + filed_issue_url;
-//  4. GET /api/findings?bucket=filed shows the coordinate as `filed` carrying the issue link.
+// TestFindingsE2EHappyPathLiveDB covers silent capture, evidence in the backlog,
+// human-gated filing through the forge, and the filed disposition with its issue link.
 func TestFindingsE2EHappyPathLiveDB(t *testing.T) {
-	h, pool, _, box, fs := findingsE2E(t)
+	h, pool, _, box, fs, slack := findingsE2E(t)
 	ctx := context.Background()
 	f := seedFindingsE2E(ctx, t, pool, box, fs.server.URL)
 	runID := seedRunningRun(ctx, t, pool, f.owner.ID, f.repoID, 101)
@@ -202,18 +173,14 @@ func TestFindingsE2EHappyPathLiveDB(t *testing.T) {
 		t.Fatalf("after capture: disposition = (%s, iid %v), want (open, nil)", status, iid)
 	}
 
-	// (2) exactly one incidental_finding notification, payload count=1.
-	if got := incidentalNotificationCount(ctx, t, pool, f.owner.ID); got != 1 {
-		t.Fatalf("incidental_finding notifications = %d, want exactly 1 (M3 coalescing)", got)
+	if got := incidentalNotificationCount(ctx, t, pool, f.owner.ID); got != 0 {
+		t.Fatalf("capture notifications = %d, want zero", got)
 	}
-	var payloadCount int
-	if err := pool.QueryRow(ctx,
-		`SELECT (payload->>'count')::int FROM notifications WHERE user_id = $1 AND kind = $2`,
-		f.owner.ID, notifysvc.KindIncidentalFinding).Scan(&payloadCount); err != nil {
-		t.Fatalf("read notification payload count: %v", err)
+	if slack.publishes != 0 {
+		t.Fatalf("Slack publishes = %d, want zero", slack.publishes)
 	}
-	if payloadCount != 1 {
-		t.Fatalf("notification payload count = %d, want 1", payloadCount)
+	if _, ok := backlogHas(listBacklog(t, h, f.owner, "to_file"), canonical); !ok {
+		t.Fatal("captured evidence missing from backlog")
 	}
 
 	// (3) file it — the fake Forge records exactly one CreateIssue with the marker label, and
@@ -245,6 +212,9 @@ func TestFindingsE2EHappyPathLiveDB(t *testing.T) {
 	}
 
 	// (4) the filed bucket shows the coordinate as filed with the issue link.
+	if slack.publishes != 0 {
+		t.Fatalf("Slack publishes = %d, want zero", slack.publishes)
+	}
 	dto := listBacklog(t, h, f.owner, "filed")
 	row, ok := backlogHas(dto, canonical)
 	if !ok {
@@ -265,22 +235,10 @@ func TestFindingsE2EHappyPathLiveDB(t *testing.T) {
 	}
 }
 
-// ── Scenario (b): the anti-nag guarantee (R2) — report → dismiss → a LATER run re-reports the
-// SAME coordinate → the report is recorded but does NOT re-nag and does NOT re-enter to_file;
-// then a materially-DIFFERENT report on that coordinate DOES re-open and notify ───────────────
-//
-// Assertions across the two re-reports:
-//
-//	dismiss:        the coordinate is `dismissed`, one notification exists (run1's first finding).
-//	identical re-report from a later run:
-//	  (1) a NEW evidence row exists (2 total at the coordinate — the report IS recorded);
-//	  (2) NO new notification fired (count stays 1 — the coalescing/suppression path, R2);
-//	  (3) the coordinate does NOT reappear in to_file and stays `dismissed`.
-//	materially-different re-report on the same coordinate:
-//	  (4) it re-opens (reappears in to_file, status `open`);
-//	  (5) a notification fires (count climbs to 2).
+// TestFindingsE2EAntiNagLiveDB covers dismissed matching-hash suppression and
+// changed-hash reopening. Every report stores evidence and produces no notification.
 func TestFindingsE2EAntiNagLiveDB(t *testing.T) {
-	h, pool, _, box, fs := findingsE2E(t)
+	h, pool, _, box, fs, slack := findingsE2E(t)
 	ctx := context.Background()
 	f := seedFindingsE2E(ctx, t, pool, box, fs.server.URL)
 
@@ -289,11 +247,11 @@ func TestFindingsE2EAntiNagLiveDB(t *testing.T) {
 	const sameTitle = "retry can never succeed"
 	const sameDesc = "the backoff resets so the retry loop spins forever"
 
-	// (0) run1 reports the finding → one notification, one open coordinate.
+	// (0) run1 reports the finding, silently opening the coordinate.
 	run1 := seedRunningRun(ctx, t, pool, f.owner.ID, f.repoID, 201)
 	findingID := reportFinding(t, h, f.owner.ID, run1, sameTitle, sameDesc, location)
-	if got := incidentalNotificationCount(ctx, t, pool, f.owner.ID); got != 1 {
-		t.Fatalf("after run1's finding: notifications = %d, want 1", got)
+	if got := incidentalNotificationCount(ctx, t, pool, f.owner.ID); got != 0 {
+		t.Fatalf("after run1's finding: notifications = %d, want zero", got)
 	}
 
 	// The user dismisses it (wont_do).
@@ -305,9 +263,12 @@ func TestFindingsE2EAntiNagLiveDB(t *testing.T) {
 	if status, _ := dispositionStatus(ctx, t, pool, f.owner.ID, f.repoID, canonical); status != "dismissed" {
 		t.Fatalf("after dismiss: status = %s, want dismissed", status)
 	}
+	if slack.publishes != 0 {
+		t.Fatalf("Slack publishes = %d, want zero", slack.publishes)
+	}
 	notifsBeforeRereport := incidentalNotificationCount(ctx, t, pool, f.owner.ID)
-	if notifsBeforeRereport != 1 {
-		t.Fatalf("dismiss must not create a notification; count = %d, want 1", notifsBeforeRereport)
+	if notifsBeforeRereport != 0 {
+		t.Fatalf("dismiss must not create a notification; count = %d, want zero", notifsBeforeRereport)
 	}
 
 	// (b.1-3) a LATER run re-reports the SAME coordinate with the SAME content (identical
@@ -319,7 +280,10 @@ func TestFindingsE2EAntiNagLiveDB(t *testing.T) {
 		t.Fatalf("(1) the re-report must record a new evidence row: rows = %d, want 2", got)
 	}
 	if got := incidentalNotificationCount(ctx, t, pool, f.owner.ID); got != notifsBeforeRereport {
-		t.Fatalf("(2) a suppressed matching-hash re-report must NOT notify (R2): count = %d, want %d", got, notifsBeforeRereport)
+		t.Fatalf("suppressed capture notifications = %d, want %d", got, notifsBeforeRereport)
+	}
+	if slack.publishes != 0 {
+		t.Fatalf("Slack publishes = %d, want zero", slack.publishes)
 	}
 	if status, _ := dispositionStatus(ctx, t, pool, f.owner.ID, f.repoID, canonical); status != "dismissed" {
 		t.Fatalf("(3) the coordinate must stay dismissed, got %s", status)
@@ -329,11 +293,17 @@ func TestFindingsE2EAntiNagLiveDB(t *testing.T) {
 	}
 
 	// (b.4-5) a materially-DIFFERENT report on the SAME coordinate (different title/description →
-	// different content_hash) → it re-opens and notifies.
+	// different content_hash) silently re-opens it.
 	run3 := seedRunningRun(ctx, t, pool, f.owner.ID, f.repoID, 203)
 	reportFinding(t, h, f.owner.ID, run3,
 		"unbounded goroutine leak in retryLoop", "each retry spawns a goroutine that never exits, leaking one per attempt", location)
 
+	if slack.publishes != 0 {
+		t.Fatalf("Slack publishes = %d, want zero", slack.publishes)
+	}
+	if got := findingRowCount(ctx, t, pool, f.owner.ID, f.repoID, canonical); got != 3 {
+		t.Fatalf("reopened evidence rows = %d, want 3", got)
+	}
 	dto := listBacklog(t, h, f.owner, "to_file")
 	row, ok := backlogHas(dto, canonical)
 	if !ok {
@@ -342,7 +312,7 @@ func TestFindingsE2EAntiNagLiveDB(t *testing.T) {
 	if row.Status != "open" {
 		t.Fatalf("(4) re-opened coordinate status = %q, want open", row.Status)
 	}
-	if got := incidentalNotificationCount(ctx, t, pool, f.owner.ID); got != notifsBeforeRereport+1 {
-		t.Fatalf("(5) a materially-different re-open must notify: count = %d, want %d", got, notifsBeforeRereport+1)
+	if got := incidentalNotificationCount(ctx, t, pool, f.owner.ID); got != 0 {
+		t.Fatalf("reopened capture notifications = %d, want zero", got)
 	}
 }

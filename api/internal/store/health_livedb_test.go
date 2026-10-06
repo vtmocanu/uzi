@@ -202,16 +202,21 @@ func TestHealthChecksLiveDB(t *testing.T) {
 		t.Errorf("noCap oldest_health_since = %v, want %v (the min across its two waits)", ts.Time, oldWait)
 	}
 
-	// -------------------------------------------------------------------------
-	// OldestWaitingWorkerRun: the global min health_since across admission waits.
-	// (The noCap owner's 9-minute wait above is the oldest seeded so far.)
-	// -------------------------------------------------------------------------
-	oldest, err := q.OldestWaitingWorkerRun(ctx)
+	waiting, err := q.ListWaitingWorkerRuns(ctx)
 	if err != nil {
-		t.Fatalf("OldestWaitingWorkerRun: %v", err)
+		t.Fatal(err)
 	}
-	if !oldest.Valid || oldest.Time.After(oldWait) {
-		t.Errorf("OldestWaitingWorkerRun = %v, want <= %v", oldest.Time, oldWait)
+	seen := map[uuid.UUID]int{}
+	for _, r := range waiting {
+		seen[r.UserID]++
+	}
+	for _, owner := range []uuid.UUID{noCapUser, hasCapUser, drainUser, staleUser} {
+		if seen[owner] == 0 {
+			t.Fatalf("global waiting population missing owner %s", owner)
+		}
+	}
+	if seen[noCapUser] != 2 {
+		t.Fatalf("waiting population lost run: %+v", waiting)
 	}
 
 	// -------------------------------------------------------------------------
@@ -350,8 +355,22 @@ func (s rollHealthStore) ListOwnersWaitingNoCapacity(ctx context.Context, p stor
 	return out, nil
 }
 
+func (s rollHealthStore) ListWaitingWorkerRuns(ctx context.Context) ([]store.ListWaitingWorkerRunsRow, error) {
+	rows, err := s.Queries.ListWaitingWorkerRuns(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := []store.ListWaitingWorkerRunsRow{}
+	for _, r := range rows {
+		if r.UserID == s.owner {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
 func TestHealthRollCapacityEvaluationLiveDB(t *testing.T) {
-	for _, name := range []string{"older health latest suitable", "incompatible later ignored", "24h equality", "just below 24h", "own veto one peer", "own veto several peers", "stale suitable fresh incompatible", "null reason", "mixed reason rows", "null timestamp row"} {
+	for _, name := range []string{"older health latest suitable", "incompatible later ignored", "24h equality", "just below 24h", "own veto one peer", "own veto several peers", "stale suitable fresh incompatible", "null reason", "mixed reason rows", "null timestamp row", "observed 40m"} {
 		t.Run(name, func(t *testing.T) {
 			fx := newFleetFixture(t)
 			now := time.Now().UTC().Truncate(time.Second)
@@ -370,6 +389,9 @@ func TestHealthRollCapacityEvaluationLiveDB(t *testing.T) {
 			switch name {
 			case "24h equality":
 				latest = now.Add(-24 * time.Hour)
+			case "observed 40m":
+				latest = now.Add(-40 * time.Minute)
+				mustExec(fx.ctx, t, fx.pool, "UPDATE runs SET health_since=$2 WHERE id=$1", run, latest)
 			case "just below 24h":
 				latest = now.Add(-24*time.Hour + time.Second)
 			}
@@ -401,6 +423,8 @@ func TestHealthRollCapacityEvaluationLiveDB(t *testing.T) {
 				if name == "mixed reason rows" {
 					since = now.Add(-7 * time.Minute)
 					want = "danger"
+				} else {
+					want = "unknown"
 				}
 				mustExec(fx.ctx, t, fx.pool, "UPDATE runs SET health='waiting_worker',health_reason=NULL,health_since=$2 WHERE id=$1", other, since)
 				rows, err := (rollHealthStore{Queries: fx.q, owner: fx.userID}).ListOwnersWaitingNoCapacity(fx.ctx, store.ListOwnersWaitingNoCapacityParams{HeartbeatCutoff: ts(now.Add(-45 * time.Second)), RollReason: workersvc.ReasonWorkersUpgrading})
@@ -430,6 +454,18 @@ func TestHealthRollCapacityEvaluationLiveDB(t *testing.T) {
 			}
 			found := false
 			for _, c := range doc.Checks {
+				if c.ID == "queue.waiting" {
+					queueWant := "ok"
+					if name == "own veto one peer" || name == "own veto several peers" || name == "stale suitable fresh incompatible" || name == "null reason" {
+						queueWant = "danger"
+					}
+					if name == "null timestamp row" {
+						queueWant = "unknown"
+					}
+					if c.Severity != queueWant {
+						t.Fatalf("queue=%+v want=%s", c, queueWant)
+					}
+				}
 				if c.ID != "fleet.capacity" {
 					continue
 				}
@@ -440,7 +476,7 @@ func TestHealthRollCapacityEvaluationLiveDB(t *testing.T) {
 				if want == "ok" && c.Since != nil {
 					t.Errorf("ordinary roll since=%v", c.Since)
 				}
-				if name == "null timestamp row" && c.Summary != "Owners waiting for a worker are within the transient window." {
+				if name == "null timestamp row" && c.Summary != "Waiting run age is unavailable." {
 					t.Errorf("NULL row must prevent roll-only owner summary: %q", c.Summary)
 				}
 				if want == "danger" {
@@ -460,6 +496,100 @@ func TestHealthRollCapacityEvaluationLiveDB(t *testing.T) {
 				t.Fatal("capacity missing")
 			}
 		})
+	}
+}
+
+// TestHealthWaitingRowsLiveDB proves that nullable and infinite ages survive both
+// SQL projections, and that queue selection does not inherit the capacity filter.
+func TestHealthWaitingRowsLiveDB(t *testing.T) {
+	fx := newFleetFixture(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	timestamps := []pgtype.Timestamptz{
+		{Time: now.Add(-40 * time.Minute), Valid: true},
+		{Time: now.Add(-40 * time.Minute), Valid: true},
+		{},
+		{Valid: true, InfinityModifier: pgtype.Infinity},
+		{Valid: true, InfinityModifier: pgtype.NegativeInfinity},
+		{Valid: true, Time: time.Time{}},
+		{Valid: true, Time: now.Add(time.Hour)},
+	}
+	want := map[uuid.UUID]pgtype.Timestamptz{}
+	for _, since := range timestamps {
+		id := fx.queuedRun()
+		mustExec(fx.ctx, t, fx.pool, "UPDATE runs SET health='waiting_worker',health_since=$2,health_reason=NULL WHERE id=$1", id, since)
+		want[id] = since
+	}
+	rows, err := fx.q.ListWaitingWorkerRuns(fx.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[uuid.UUID]bool{}
+	var prior *store.ListWaitingWorkerRunsRow
+	for i := range rows {
+		r := rows[i]
+		expected, fixture := want[r.RunID]
+		if !fixture {
+			continue
+		}
+		if r.UserID != fx.userID || r.HealthSince.Valid != expected.Valid || r.HealthSince.InfinityModifier != expected.InfinityModifier || !r.HealthSince.Time.Equal(expected.Time) || r.HealthReason.Valid {
+			t.Fatalf("waiting projection=%+v expected=%+v", r, expected)
+		}
+		seen[r.RunID] = true
+		if prior != nil && prior.HealthSince.Valid && prior.HealthSince.InfinityModifier == pgtype.Finite &&
+			r.HealthSince.Valid && r.HealthSince.InfinityModifier == pgtype.Finite {
+			if r.HealthSince.Time.Before(prior.HealthSince.Time) ||
+				(r.HealthSince.Time.Equal(prior.HealthSince.Time) && r.RunID.String() < prior.RunID.String()) {
+				t.Fatalf("unstable finite ordering: %+v then %+v", prior, r)
+			}
+		}
+		prior = &rows[i]
+	}
+	if len(seen) != len(want) {
+		t.Fatalf("waiting selection retained %d of %d fixture rows", len(seen), len(want))
+	}
+	capacity, err := fx.q.ListOwnersWaitingNoCapacity(fx.ctx, store.ListOwnersWaitingNoCapacityParams{
+		HeartbeatCutoff: ts(now.Add(-45 * time.Second)), RollReason: workersvc.ReasonWorkersUpgrading,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen = map[uuid.UUID]bool{}
+	for _, r := range capacity {
+		if expected, fixture := want[r.RunID]; fixture {
+			if r.HealthSince.Valid != expected.Valid || r.HealthSince.InfinityModifier != expected.InfinityModifier || !r.HealthSince.Time.Equal(expected.Time) || r.HealthReason.Valid || r.HasRollReason {
+				t.Fatalf("capacity projection=%+v expected=%+v", r, expected)
+			}
+			seen[r.RunID] = true
+		}
+	}
+	if len(seen) != len(want) {
+		t.Fatalf("capacity selection retained %d of %d fixture rows", len(seen), len(want))
+	}
+	fresh := newFleetFixture(t)
+	fresh.worker("fresh", nil, false)
+	id := fresh.queuedRun()
+	mustExec(fresh.ctx, t, fresh.pool, "UPDATE runs SET health='waiting_worker',health_since=$2 WHERE id=$1", id, ts(now.Add(-40*time.Minute)))
+	rows, err = fx.q.ListWaitingWorkerRuns(fx.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range rows {
+		found = found || r.RunID == id
+	}
+	if !found {
+		t.Fatal("queue omitted waiting run whose owner has a fresh worker")
+	}
+	capacity, err = fx.q.ListOwnersWaitingNoCapacity(fx.ctx, store.ListOwnersWaitingNoCapacityParams{
+		HeartbeatCutoff: ts(now.Add(-45 * time.Second)), RollReason: workersvc.ReasonWorkersUpgrading,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range capacity {
+		if r.RunID == id {
+			t.Fatal("capacity population unexpectedly included fresh-worker owner")
+		}
 	}
 }
 

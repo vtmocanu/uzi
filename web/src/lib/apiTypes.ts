@@ -34,6 +34,7 @@ export interface User {
   // capability (PRD #529/#649). Default false; toggled from the Workers page. No
   // dedicated AuthContext field — it rides `user` like `judge_enabled`.
   ephemeral_workers_enabled: boolean;
+  ephemeral_docker_enabled: boolean;
   /** PRD #35: this user's DEFAULT for the usage-limit park — every run they create
    *  inherits it, including the three kinds with no start affordance at all
    *  (autopilot, ci_fix, self_improve), which is why the default exists rather than
@@ -1444,6 +1445,8 @@ export interface ReleaseCheckStatus {
 // byte-for-byte (snake_case JSON keys). Admin-only by route — it carries owner and
 // worker names — so it must never migrate onto an unauthenticated response.
 export interface HealthDoc {
+  // True when an instance-scoped check is danger.
+  blocking: boolean;
   // Overall verdict: the worst check, "danger" then "warn", with unknown ranking as
   // warn. "ok" | "warn" | "danger" | "unknown".
   status: string;
@@ -1472,6 +1475,8 @@ export interface HealthCounts {
 // HealthCheck is one check's verdict plus its server-authored evidence and what-to-do
 // line. Mirrors `apitypes.HealthCheckDTO`. id/group/severity are closed-enum strings.
 export interface HealthCheck {
+  // Server registry scope: instance | owner.
+  scope: string;
   id: string;
   group: string;
   title: string;
@@ -2386,6 +2391,8 @@ export type BindMode = "default" | "pinned" | "auto";
 
 export interface AdminWorker extends Worker {
   owner_email: string;
+  disk_pressure_volumes: string[];
+  cleanup_pending: boolean;
 }
 
 /**
@@ -2396,6 +2403,8 @@ export interface AdminWorker extends Worker {
  * only — hosted workers the user already holds stay listed and deletable.
  */
 export interface HostedConfig {
+  // Older APIs omit the tier flag; absence hides the ephemeral Docker option.
+  docker_enabled?: boolean;
   enabled: boolean;
   quota: number;
   // Whether the instance admin gate permits ephemeral auto-provisioning (PRD #649),
@@ -4688,6 +4697,7 @@ export interface RecoveryArchiveSummary {
 // checkpoint lives on origin: the branch checkpoint ref, or refs/uzi-recovery/<run id> once
 // superseded; all three are absent when the run has no live retention record.
 export interface RecoveryCustodyHold {
+  terminal_record_rejection?: string;
   id: string;
   run_id: string;
   generation: number;

@@ -33,6 +33,7 @@ func (m tuiModel) renderLaneRail() string {
 		}
 	}
 	sb.WriteString(title + "\n")
+	sb.WriteString(m.railWorkerLine())
 
 	if len(d.lanes) == 0 {
 		sb.WriteString(m.pal.faint.Render("(no activity yet)"))
@@ -83,6 +84,15 @@ func (m tuiModel) renderLaneRail() string {
 		appendRailBlock(&sb, cl)
 	}
 	return sb.String()
+}
+
+// railWorkerLine is also counted by railAutoFolded before protected blocks.
+func (m tuiModel) railWorkerLine() string {
+	if m.detail.run.WorkerName == nil {
+		return ""
+	}
+	text := struct{ runWorkerName string }{runWorkerName: *m.detail.run.WorkerName}
+	return m.pal.faint.Render("worker "+m.renderer.Plain(text.runWorkerName, 19)) + "\n"
 }
 
 // appendRailBlock appends a protected rail block beneath the content already built, separated by
@@ -150,13 +160,13 @@ func (m tuiModel) effectiveRailFolded(now time.Time) bool {
 
 // railAutoFolded reports whether the EXPANDED rail's roster plus every PRESENT protected block
 // would overrun transcriptViewport(), so the rail must fold by itself (PRD #1257 D1/D2). The
-// protected set is: the whole MILESTONES list (no budget of its own — clamped by joinColumns), the
+// protected set includes the worker-name row when present, the whole MILESTONES list (no budget of its own — clamped by joinColumns), the
 // 3-line SPEND block, the run's OWN ACCOUNTS entry (three Claude rows or one Codex
 // snapshot row under a 1-row header), and — PRD #1209 M3 — the CODEX block's floor (its 1-row header + the first shown Codex
 // account, the analog of the Claude own-account floor; railCodexFloorRows). Sibling Claude/Codex
 // accounts stay best-effort and drop bottom-up as today, so only the first of each is counted (D2).
 // A run with no lanes has nothing to fold; a run with an empty required set (no milestone list, no
-// usage, no own account, no shown Codex account) never folds either — its roster just clips at the
+// usage, no own account, no shown Codex account, no worker name) never folds either — its roster just clips at the
 // bottom exactly as today (D2/D5).
 //
 // The decision REPLAYS renderLaneRail's expanded builder (expandedRoster + the same appendRailBlock
@@ -188,12 +198,13 @@ func (m tuiModel) railAutoFolded(now time.Time) bool {
 		accountFloorRows++ // ACCOUNTS header
 	}
 	codexRows, hasCodex := m.railCodexFloorRows()
-	if block == "" && !spend && accountFloorRows == 0 && !hasCodex {
+	if block == "" && !spend && accountFloorRows == 0 && !hasCodex && m.railWorkerLine() == "" {
 		return false // empty required set: nothing below the roster to protect (D2/D5)
 	}
 	vp := m.transcriptViewport()
 	var sb strings.Builder
 	sb.WriteString("crew\n") // stand-in title row: only its trailing "\n" counts toward the budget
+	sb.WriteString(m.railWorkerLine())
 	sb.WriteString(m.expandedRoster(now))
 	appendRailBlock(&sb, block)
 	if spend {

@@ -39,6 +39,8 @@ installHarness();
 // (verified against the shipped CLI: exit 1, "No conversation found with session ID",
 // duration_api_ms 0), passing that id through did not start a fresh run — it killed the
 // run on its first turn with `error_during_execution`.
+const LINUX_ONLY = process.platform !== "linux" ? "no /proc/self/fd on this host: fd-anchored Codex sessions require Linux" : false;
+
 describe("RunRunner — resume preflight (issue #105)", () => {
   const SID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
@@ -72,7 +74,7 @@ describe("RunRunner — resume preflight (issue #105)", () => {
     fs.writeFileSync(path.join(dir, `${sessionId}.jsonl`), "{}\n");
   }
 
-  it("Codex resumes only when the claimed thread is persisted on this worker", async () => {
+  it("Codex resumes only when the claimed thread is persisted on this worker", { skip: LINUX_ONLY }, async () => {
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-codex-resume-"));
     const codexHome = path.join(homeRoot, "source");
     const codex = {
@@ -352,7 +354,7 @@ describe("RunRunner — resume preflight (issue #105)", () => {
   });
 });
 
-it("a resumed Codex runner turn adopts the claimed persisted thread", async () => {
+it("a resumed Codex runner turn adopts the claimed persisted thread", { skip: LINUX_ONLY }, async () => {
   const sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
   const turnId = "resumed-turn";
   const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-codex-runner-resume-"));

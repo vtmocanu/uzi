@@ -450,14 +450,28 @@ func (d *detailState) selectedLane() (agentLane, bool) {
 // stream, drops the detail state, and refetches the board. Shared by esc and by ← at the left pane
 // boundary so the two cannot drift. The name is kept for continuity; it now honours detailReturn.
 func (m tuiModel) exitToBoard() (tea.Model, tea.Cmd) {
-	if m.detail.stream != nil {
-		m.detail.stream.Close()
+	m.clearRunSession()
+	if m.detailReturn == viewWorker {
+		m.view = viewWorker
+		m.detailReturn = viewBoard
+		if _, ok := m.scopedWorker(m.workerDetail.workerID); !ok || m.workerDetail.admin != m.board.admin {
+			next, cmd := m.leaveWorker()
+			n := next.(tuiModel)
+			if n.view == viewDetail {
+				n.detail.steer.notice = "worker not in your list"
+			} else {
+				n.splitNote = "worker not in your list"
+			}
+			return n, cmd
+		}
+		m.reconcileReportedRun()
+		return m, nil
 	}
 	target := m.detailReturn
 	if m.fromSplit && !m.splitEligible() {
-		target = viewBoard
+		target = m.top()
 	}
-	if target == viewBoard || target == viewCI || target == viewPulls {
+	if target == viewBoard || target == viewWorkers || target == viewCI || target == viewPulls {
 		m.setListView(target)
 		m.fromSplit = false
 	} else {
@@ -492,15 +506,16 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	switch k {
+	case keyWorkerView:
+		return m.runWorkerKey()
 	case keyEsc:
 		return m.exitToBoard()
 	case keyPRView:
-		// m: open the PR drill-in for this run's merge request (PRD #1255 M5 D1), the run → PR
-		// cross-link. No-op (hidden from the legend) when the run has no MR/repo. m.detail is NOT
-		// clobbered — it persists on the model — so the PR view's esc (prReturn = viewDetail) returns
-		// to the still-loaded run view.
+		// Retain only the run ID and return target; every departing run closes its session.
 		if m.detail.run.MrIID != nil && m.detail.run.RepoID != nil && *m.detail.run.RepoID != "" {
 			m.pr = newPRState(*m.detail.run.RepoID, *m.detail.run.MrIID)
+			m.prReturnRunID, m.prReturnRunTarget = m.detail.runID, m.detailReturn
+			m.clearRunSession()
 			m.view = viewPR
 			m.prReturn = viewDetail
 			m.forgeNotice = ""
@@ -929,7 +944,7 @@ func (m tuiModel) transportLine() string {
 // interactive modes draw their own hints, so this is only emitted when idle.
 func (m tuiModel) detailFooter() string {
 	owner := m.detail.steer.access == steerAllowed
-	parts := []string{m.keyHint("←→", "pane"), m.keyHint("↑↓", "move")}
+	parts := []string{m.keyHint("←→", "pane"), m.keyHint("↑↓", "move"), m.keyHint("W", "worker")}
 	if len(m.detail.lanes) > 0 {
 		parts = append(parts, m.keyHint("c", "crew"))
 	}

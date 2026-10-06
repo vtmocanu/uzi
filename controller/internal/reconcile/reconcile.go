@@ -76,6 +76,16 @@ type ObservedWorker struct {
 	HasDataPVC     bool
 	HasNixPVC      bool
 	HasDinDDataPVC bool
+	// Incarnation and pod-list evidence are used only by fenced DinD maintenance.
+	DeploymentUID         string
+	DeploymentTerminating bool
+	DinDPVCUID            string
+	DinDPVCLive           bool
+	DinDPVCPhase          string
+	DinDPVCCreatedAt      *time.Time
+	PodsKnown             bool
+	WorkerPodCount        int
+	ReadyPodUID           string
 	// NixPVCSize is the observed /nix PVC's requested storage (spec.resources.requests[storage]),
 	// recorded ONLY from a LIVE (deletionTimestamp == nil) nix PVC. nil means "no live nix PVC
 	// observed" — the PVC is absent OR Terminating. M3's size-drift arm compares it against the
@@ -116,8 +126,8 @@ type ObservedWorker struct {
 	// single-namespace (pre-#83) observation carried implicitly.
 	Namespace string
 	// Roll is this worker's upgrade health, derived from its POD (PRD #113 M3).
-	// Display-only: nothing in Reconcile reads it, and it exists purely to be
-	// reported to the api for the Workers UI. Zero value means "no pod information",
+	// DinD completion requires settled health and publishes it before asking the
+	// server to release the fence. Zero value means "no pod information",
 	// which RollHealth.Phase renders as the rolling gap.
 	Roll RollHealth
 }

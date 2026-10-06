@@ -1088,6 +1088,220 @@ describe("codexDeferralReason", () => {
 });
 
 
+describe("Codex success body byte cap (#2232 M1)", () => {
+  const limit = 65_536;
+  const expected = { authMode: "subscription", chatgptAccountId: "verified-account", minimumGeneration: 3 } as const;
+  const req = { capability: "fixture-cap", operation_id: "fixture-operation", observed_generation: 3 };
+  const encoder = new TextEncoder();
+
+  for (const route of ["release", "refresh"] as const) {
+    const envelope = {
+      auth_mode: "subscription",
+      access_token: "secret-canary-€😀",
+      generation: 4,
+      chatgpt_account_id: "verified-account",
+      chatgpt_plan_type: null,
+      ...(route === "refresh" ? { outcome: "advanced" } : {}),
+    };
+    const json = JSON.stringify(envelope);
+    const prefix = encoder.encode(json + " ".repeat(limit - encoder.encode(json).byteLength));
+    const request = (client = newClient(), signal?: AbortSignal) => route === "release"
+      ? client.releaseCodex("subscription-run", req, expected, signal)
+      : client.refreshCodex("subscription-run", req, expected, signal);
+    const check = (kind: CodexRequestFailure["kind"]) => (err: unknown) => {
+      assert.ok(err instanceof CodexRequestFailure);
+      assert.equal(err.kind, kind);
+      assert.equal(codexRefreshFailure(err), kind === "response" ? "refused" : kind === "parent_abort" ? "cancelled" : "ambiguous");
+      assert.doesNotMatch(err.message + err.stack, /secret-canary|fixture-cap|fixture-operation|cleanup-canary/);
+      assert.equal(err.cause, undefined);
+      return true;
+    };
+
+    // Zero highWaterMark makes each pull a reader request, with no speculative prefetch.
+    function controlled(chunks: Uint8Array[], cleanup?: "reject" | "throw", readFault = false) {
+      const stats = { reads: 0, cancels: 0, releases: 0 };
+      let index = 0;
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (index < chunks.length) controller.enqueue(chunks[index++]!);
+          else if (readFault) controller.error(new Error("secret-canary"));
+          else controller.close();
+        },
+      }, { highWaterMark: 0 });
+      const getReader = stream.getReader.bind(stream);
+      Object.defineProperty(stream, "getReader", { value: () => {
+        const reader = getReader();
+        const read = reader.read.bind(reader);
+        const cancel = reader.cancel.bind(reader);
+        const release = reader.releaseLock.bind(reader);
+        reader.read = () => { stats.reads++; return read(); };
+        reader.cancel = () => {
+          stats.cancels++;
+          if (cleanup === "throw") throw new Error("cleanup-canary");
+          const result = cancel();
+          return cleanup === "reject" ? result.then(() => { throw new Error("cleanup-canary"); }) : result;
+        };
+        reader.releaseLock = () => {
+          stats.releases++;
+          release();
+          if (cleanup) throw new Error("cleanup-canary");
+        };
+        return reader;
+      } });
+      return { stream, stats };
+    }
+
+    for (const singleChunk of [true, false]) {
+      for (const contentLength of [undefined, "1", "999999"]) {
+        it(`${route} accepts exactly 65536 bytes through EOF (${singleChunk ? "single chunk" : "split UTF-8"}, Content-Length ${contentLength})`, async () => {
+          const original = globalThis.fetch;
+          // Split both multibyte codepoints across chunks; the byte cap includes whitespace.
+          const euro = prefix.indexOf(0xe2);
+          const emoji = prefix.indexOf(0xf0);
+          const chunks = singleChunk ? [prefix] : [prefix.subarray(0, euro + 1), prefix.subarray(euro + 1, emoji + 2), prefix.subarray(emoji + 2)];
+          const { stream, stats } = controlled(chunks);
+          try {
+            globalThis.fetch = async () => new Response(stream, {
+              headers: contentLength === undefined ? {} : { "Content-Length": contentLength },
+            });
+            assert.deepStrictEqual(await request(), envelope);
+            assert.equal(stats.reads, chunks.length + 1, "must read EOF at the exact limit");
+            assert.equal(stats.releases, 1);
+            assert.equal(stream.locked, false);
+          } finally {
+            globalThis.fetch = original;
+          }
+        });
+      }
+    }
+
+    it(`${route} refuses a complete valid 65537-byte body`, async () => {
+      const original = globalThis.fetch;
+      const oversized = encoder.encode(json + " ".repeat(limit + 1 - encoder.encode(json).byteLength));
+      assert.equal(oversized.byteLength, limit + 1);
+      assert.deepStrictEqual(JSON.parse(new TextDecoder().decode(oversized)), envelope);
+      const { stream, stats } = controlled([oversized]);
+      try {
+        globalThis.fetch = async () => new Response(stream);
+        await assert.rejects(request(), check("response"));
+        assert.deepStrictEqual(stats, { reads: 1, cancels: 1, releases: 1 });
+        assert.equal(stream.locked, false);
+      } finally {
+        globalThis.fetch = original;
+      }
+    });
+
+    for (const split of [false, true]) {
+      for (const cleanup of [undefined, "reject", "throw"] as const) {
+        it(`${route} refuses 65537 bytes (${split ? "valid prefix then byte" : "single chunk"}, cleanup ${cleanup})`, async () => {
+          const original = globalThis.fetch;
+          const oversized = encoder.encode(json + " ".repeat(limit + 1 - encoder.encode(json).byteLength));
+          const chunks = split ? [prefix, encoder.encode(" "), encoder.encode("secret-canary-later")] : [oversized, encoder.encode("secret-canary-later")];
+          const { stream, stats } = controlled(chunks, cleanup);
+          try {
+            globalThis.fetch = async () => new Response(stream, { headers: { "Content-Length": "1" } });
+            await assert.rejects(request(), check("response"));
+            assert.equal(stats.reads, split ? 2 : 1, "no request after the overflowing chunk");
+            assert.equal(stats.cancels, 1);
+            assert.equal(stats.releases, 1);
+            assert.equal(stream.locked, false);
+          } finally {
+            globalThis.fetch = original;
+          }
+        });
+      }
+    }
+
+    it(`${route} counts UTF-8 bytes rather than decoded characters`, async () => {
+      const original = globalThis.fetch;
+      const text = JSON.stringify({ ...envelope, access_token: "secret-canary-" + "€".repeat(22_000) });
+      assert.ok(text.length < limit);
+      const bytes = encoder.encode(text);
+      assert.ok(bytes.byteLength > limit);
+      const { stream, stats } = controlled([bytes.subarray(0, 100), bytes.subarray(100), encoder.encode("later")]);
+      try {
+        globalThis.fetch = async () => new Response(stream);
+        await assert.rejects(request(), check("response"));
+        assert.deepStrictEqual(stats, { reads: 2, cancels: 1, releases: 1 });
+      } finally {
+        globalThis.fetch = original;
+      }
+    });
+
+    it(`${route} preserves transport on a partial-body read fault despite cleanup rejection`, async () => {
+      const original = globalThis.fetch;
+      const { stream, stats } = controlled([encoder.encode('{"access_token":"secret-canary')], "reject", true);
+      try {
+        globalThis.fetch = async () => new Response(stream);
+        await assert.rejects(request(), check("transport"));
+        assert.deepStrictEqual(stats, { reads: 2, cancels: 1, releases: 1 });
+        assert.equal(stream.locked, false);
+      } finally {
+        globalThis.fetch = original;
+      }
+    });
+
+    for (const body of [null, "", "secret-canary-malformed"]) {
+      it(`${route} keeps ${body === null ? "missing" : body === "" ? "empty" : "malformed"} body classification`, async () => {
+        const original = globalThis.fetch;
+        try {
+          globalThis.fetch = async () => new Response(body);
+          await assert.rejects(request(), check(body ? "response" : "transport"));
+        } finally {
+          globalThis.fetch = original;
+        }
+      });
+    }
+
+    for (const cancellation of ["deadline", "parent", "both"] as const) {
+      it(`${route} classifies ${cancellation} during a stalled partial success body`, async () => {
+        const original = globalThis.fetch;
+        const parent = new AbortController();
+        let reads = 0;
+        let stalled!: () => void;
+        const reading = new Promise<void>((resolve) => { stalled = resolve; });
+        let passedSignal: AbortSignal | undefined;
+        let stream: ReadableStream<Uint8Array> | undefined;
+        const client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), {
+          codexHTTPTimeoutMs: cancellation === "parent" ? 1_000 : 40,
+        });
+        try {
+          globalThis.fetch = async (_input, init) => {
+            const signal = init?.signal;
+            assert.ok(signal);
+            passedSignal = signal;
+            stream = new ReadableStream<Uint8Array>({
+              start(controller) {
+                signal.addEventListener("abort", () => {
+                  if (cancellation === "both") parent.abort(new Error("secret-canary"));
+                  controller.error(new Error("secret-canary"));
+                }, { once: true });
+              },
+              pull(controller) {
+                reads++;
+                if (reads === 1) controller.enqueue(encoder.encode('{"access_token":"secret-canary'));
+                else stalled();
+              },
+            }, { highWaterMark: 0 });
+            return new Response(stream);
+          };
+          const result = request(client, parent.signal);
+          const rejection = assert.rejects(result, check(cancellation === "deadline" ? "http_timeout" : "parent_abort"));
+          await reading;
+          assert.equal(passedSignal?.aborted, false, "headers and partial body arrive before cancellation");
+          if (cancellation === "parent") parent.abort(new Error("secret-canary"));
+          await rejection;
+          assert.equal(passedSignal?.aborted, true);
+          assert.equal(reads, 2);
+          assert.equal(stream?.locked, false);
+        } finally {
+          globalThis.fetch = original;
+        }
+      });
+    }
+  }
+});
+
 describe("M2 secret-free WorkerClient refresh failure classification", () => {
   it("distinguishes local and received malformed replies from transport and lost body", async () => {
     const original = globalThis.fetch;

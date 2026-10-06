@@ -1,6 +1,6 @@
 // Issue #1598 M4: the worker entrypoint prepares the Codex command-cache root
 // (/var/cache/uzi-codex-cmd) on the ROOT-started (uid-split) path: refuse a symlink, create it
-// when missing, reclaim -> chmod 0700 -> hand over to runner-cmd (10003:10003), never recursive
+// when missing, reclaim -> chmod 00700 (exact mode 0700) -> hand over to runner-cmd (10003:10003), never recursive
 // and never deleting contents. The non-root (#58) start must not touch it.
 //
 // Same seam as entrypoint-migration.test.ts: RUN the real `agent/templates/entrypoint.sh` with
@@ -41,8 +41,13 @@ function recordingStub(real: string, name: string): string {
   return `#!/bin/sh\nprintf "${name} %s\\n" "$*" >> "$OPLOG"\n${real} "$@" 2>/dev/null || true\nexit 0\n`;
 }
 
-function makeHarness(uid: string): Harness {
+function makeHarness(uid: string, { setgidParent = false } = {}): Harness {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-entrypoint-codex-cache-"));
+  const rootMode = fs.statSync(root).mode & 0o7777;
+  fs.chmodSync(root, setgidParent ? rootMode | 0o2000 : rootMode & ~0o2000);
+  if (process.platform === "linux") {
+    assert.equal(Boolean(fs.statSync(root).mode & 0o2000), setgidParent, "temporary parent setgid mode must match the fixture");
+  }
   const stubDir = path.join(root, "stubs");
   const opLog = path.join(root, "ops.log");
   const cache = path.join(root, "var-cache", "uzi-codex-cmd");
@@ -123,10 +128,10 @@ describe("issue #1598: entrypoint prepares the Codex command-cache root", () => 
         [
           `mkdir -p ${h.cache}`,
           `chown -h 0:0 ${h.cache}`,
-          `chmod 0700 ${h.cache}`,
+          `chmod 00700 ${h.cache}`,
           `chown -h 10003:10003 ${h.cache}`,
         ],
-        "exactly mkdir -> reclaim -> chmod 0700 -> hand over to 10003, nothing else on the cache root",
+        "exactly mkdir -> reclaim -> chmod 00700 (exact mode 0700) -> hand over to 10003, nothing else on the cache root",
       );
       if (process.getuid?.() === 0) {
         assert.equal(st.uid, 10003, "owner uid must be runner-cmd (10003)");
@@ -137,47 +142,61 @@ describe("issue #1598: entrypoint prepares the Codex command-cache root", () => 
     }
   });
 
-  it("root start: an existing root keeps its per-run dirs (not recursive, nothing deleted)", () => {
-    const h = makeHarness("0");
-    try {
-      const perRun = path.join(h.cache, "run-abc123");
-      fs.mkdirSync(perRun, { recursive: true, mode: 0o755 });
-      fs.writeFileSync(path.join(perRun, "go.sum"), "cached");
-      const r = run(h);
-      assert.equal(r.status, 0, `entrypoint must succeed (stderr: ${r.stderr})`);
-      assert.equal(fs.readFileSync(path.join(perRun, "go.sum"), "utf8"), "cached", "per-run content must survive");
-      assert.equal(fs.statSync(perRun).mode & 0o7777, 0o755, "a per-run dir's mode must be untouched");
-      const onCache = opsOn(r.ops, h.cache);
-      assert.equal(onCache.filter((op) => op.includes(perRun)).length, 0, "no op may name a per-run dir");
-      assert.equal(onCache.filter((op) => / -R /.test(op) || op.startsWith("rm ")).length, 0, "no recursive or rm op");
-      assert.equal(fs.statSync(h.cache).mode & 0o7777, 0o700, "the root is still re-asserted 0700");
-    } finally {
-      fs.rmSync(h.root, { recursive: true, force: true });
-    }
-  });
-
-  for (const shape of ["a link to a directory", "a dangling link"] as const) {
-    it(`root start: ${shape} at the cache path is refused and nothing is chowned through it`, () => {
-      const h = makeHarness("0");
+  for (const setgidParent of [false, true]) {
+    const parentLabel = setgidParent ? "setgid parent" : "ordinary parent";
+    it(`root start (${parentLabel}): an existing root keeps its per-run dirs (not recursive, nothing deleted)`, () => {
+      const h = makeHarness("0", { setgidParent });
       try {
-        const victim = path.join(h.root, "victim");
-        fs.mkdirSync(path.dirname(h.cache), { recursive: true });
-        if (shape === "a link to a directory") fs.mkdirSync(victim, { mode: 0o755 });
-        fs.symlinkSync(victim, h.cache);
-        const r = run(h);
-        assert.notEqual(r.status, 0, "a symlinked cache root must fail closed");
-        assert.match(r.stderr, /refusing to start: .*uzi-codex-cmd is a symlink/, "must log the refusal");
-        assert.deepEqual(opsOn(r.ops, h.cache), [], "no mkdir/chown/chmod may touch the symlinked path");
-        assert.deepEqual(opsOn(r.ops, victim), [], "nothing may reach the link target");
-        assert.ok(fs.lstatSync(h.cache).isSymbolicLink(), "the link itself is left in place");
-        assert.equal(r.stdout.includes("UZI_UID_SPLIT=1"), false, "the drop must never be reached");
-        if (shape === "a link to a directory") {
-          assert.equal(fs.statSync(victim).mode & 0o7777, 0o755, "the link target's mode is untouched");
+        const perRun = path.join(h.cache, "run-abc123");
+        fs.mkdirSync(perRun, { recursive: true, mode: 0o755 });
+        const initialMode = fs.statSync(perRun).mode & 0o7777;
+        if (process.platform === "linux" && setgidParent) {
+          assert.ok(initialMode & 0o2000, "the protected per-run directory must inherit setgid");
         }
+        fs.writeFileSync(path.join(perRun, "go.sum"), "cached");
+        const r = run(h);
+        assert.equal(r.status, 0, `entrypoint must succeed (stderr: ${r.stderr})`);
+        assert.equal(fs.readFileSync(path.join(perRun, "go.sum"), "utf8"), "cached", "per-run content must survive");
+        assert.equal(fs.statSync(perRun).mode & 0o7777, initialMode, "a per-run dir's mode must be untouched");
+        const onCache = opsOn(r.ops, h.cache);
+        assert.equal(onCache.filter((op) => op.includes(perRun)).length, 0, "no op may name a per-run dir");
+        assert.equal(onCache.filter((op) => / -R /.test(op) || op.startsWith("rm ")).length, 0, "no recursive or rm op");
+        assert.equal(fs.statSync(h.cache).mode & 0o7777, 0o700, "the root is still re-asserted 0700");
       } finally {
         fs.rmSync(h.root, { recursive: true, force: true });
       }
     });
+
+    for (const shape of ["a link to a directory", "a dangling link"] as const) {
+      it(`root start (${parentLabel}): ${shape} at the cache path is refused and nothing is chowned through it`, () => {
+        const h = makeHarness("0", { setgidParent });
+        try {
+          const victim = path.join(h.root, "victim");
+          fs.mkdirSync(path.dirname(h.cache), { recursive: true });
+          let initialMode: number | undefined;
+          if (shape === "a link to a directory") {
+            fs.mkdirSync(victim, { mode: 0o755 });
+            initialMode = fs.statSync(victim).mode & 0o7777;
+            if (process.platform === "linux" && setgidParent) {
+              assert.ok(initialMode & 0o2000, "the protected link target must inherit setgid");
+            }
+          }
+          fs.symlinkSync(victim, h.cache);
+          const r = run(h);
+          assert.notEqual(r.status, 0, "a symlinked cache root must fail closed");
+          assert.match(r.stderr, /refusing to start: .*uzi-codex-cmd is a symlink/, "must log the refusal");
+          assert.deepEqual(opsOn(r.ops, h.cache), [], "no mkdir/chown/chmod may touch the symlinked path");
+          assert.deepEqual(opsOn(r.ops, victim), [], "nothing may reach the link target");
+          assert.ok(fs.lstatSync(h.cache).isSymbolicLink(), "the link itself is left in place");
+          assert.equal(r.stdout.includes("UZI_UID_SPLIT=1"), false, "the drop must never be reached");
+          if (shape === "a link to a directory") {
+            assert.equal(fs.statSync(victim).mode & 0o7777, initialMode, "the link target's mode is untouched");
+          }
+        } finally {
+          fs.rmSync(h.root, { recursive: true, force: true });
+        }
+      });
+    }
   }
 
   it("non-root (#58) start: the cache root is never touched", () => {

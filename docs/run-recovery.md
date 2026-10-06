@@ -297,6 +297,47 @@ touches a ready archive or any other hold. See
 [the CLI reference](cli.md#recovering-unpublished-work-uzi-run-export) for the
 `uzi run export` flag and exit-code contract.
 
+### When a terminal record fails authentication after restart
+
+Recovery shows the fixed diagnostic:
+
+> terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody
+
+A MAC-rejected terminal record supplies no trustworthy outcome: it cannot
+authorize outcome replay, completion, a terminal lease renewal, or an extra
+finalize-resume allowance. Ordinary requeue policy still applies; if that
+policy fails the run, its failure origin stays `worker_lost`, with the
+rejection prose above. This is an unauthenticated record, distinct from a
+trusted unsent outcome protected against a second execution.
+
+The open hold for that originating worker and exact claim generation G
+stays in custody. For a terminal run without an available independently
+verified recovery capture, it reports `source_only`:
+
+> no recovery archive; custody of worker `<name>`'s local source is retained (export unavailable; it may be the only copy)
+
+A rejected record cannot supply a source head or make an archive exportable.
+Export is offered when an independently verified capture is available; an
+independently verified pin must first produce an available archive.
+
+The worker negotiates `terminal_rejection_report` through registration's
+`protocol_features`. Without support it sends neither the diagnostic POST
+nor the custody GET, retains local bytes, and logs the unsupported state
+once per unsupported episode. A strict-decode rollback clears the shared
+feature set, disabling these requests until support is negotiated again.
+
+Hold discard changes database custody; it does not repair the worker journal.
+The worker periodically checks custody with a fresh GET scoped to immutable
+owner, originating worker, run, and generation provenance. Cleanup requires
+a complete, nonempty exact-generation hold set, all released or discarded,
+and no open sibling-generation holds on that worker. It also requires local
+quiescence under admission and run locks: no admitted or active execution.
+Together these checks permit deletion of only the exact observed bad-MAC
+terminal files, rechecked for unchanged device, inode, hash, and MAC failure.
+A diagnostic POST acknowledgment, missing hold, error, or elapsed timer
+does not authorize deletion. This cleanup does not repair other journals
+or delete source clones.
+
 ### When retained work blocks a new run on the same branch
 
 A new run can be refused because the worker's recovery journal still names a

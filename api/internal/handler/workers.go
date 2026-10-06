@@ -363,6 +363,39 @@ func workerDTOFromAdminRow(row store.ListAllWorkersRow, cpVersion, pinnedWorkerV
 	return dto
 }
 
+// adminWorkerDTOFromRow adds display evidence without changing owner DTOs or actuation.
+func adminWorkerDTOFromRow(row store.ListAllWorkersRow, cpVersion, pinnedWorkerVersion string, now, apiStartedAt time.Time, heartbeatStale time.Duration) apitypes.AdminWorkerDTO {
+	dto := apitypes.AdminWorkerDTO{
+		WorkerDTO:           workerDTOFromAdminRow(row, cpVersion, pinnedWorkerVersion, now, apiStartedAt),
+		OwnerEmail:          row.OwnerEmail,
+		DiskPressureVolumes: []string{},
+	}
+	if heartbeatStale <= 0 {
+		heartbeatStale = 45 * time.Second
+	}
+	w := row.Worker
+	fresh := w.LastHeartbeatAt.Valid && !w.LastHeartbeatAt.Time.After(now) && now.Sub(w.LastHeartbeatAt.Time) <= heartbeatStale
+	if fresh && w.StatsDiskPressureStreak >= 2 {
+		if w.NixPressure {
+			dto.DiskPressureVolumes = append(dto.DiskPressureVolumes, "nix")
+		}
+		if w.DataPressure {
+			dto.DiskPressureVolumes = append(dto.DiskPressureVolumes, "data")
+		}
+	}
+	if fresh && w.DindPressureStreak >= 2 && w.DindMeterAt.Valid && !w.DindMeterAt.Time.After(now) && now.Sub(w.DindMeterAt.Time) <= 45*time.Second {
+		dto.DiskPressureVolumes = append(dto.DiskPressureVolumes, "dind")
+		dto.CleanupPending = true
+	}
+	if w.MaintenanceID.Valid {
+		switch w.MaintenancePhase {
+		case "requested", "ready", "stopping", "recycling":
+			dto.CleanupPending = true
+		}
+	}
+	return dto
+}
+
 // overlayOutbox folds a worker's in-process outbox depth (PRD #1391 M5) onto its
 // DTO. The depth lives in workersvc's restart-losing tracker, not in a store.Worker
 // row, so workerDTOFromWorker/workerDTOFromRow (which read only the row) cannot carry
@@ -617,15 +650,12 @@ func (h *Handler) AdminListWorkers(w http.ResponseWriter, r *http.Request) {
 	reported := h.reportedRunsByWorker(r.Context(), ids)
 	runDisk := h.runDiskByWorker(r.Context(), ids)
 	for _, row := range rows {
-		dto := workerDTOFromAdminRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
-		h.overlayEphemeralLease(&dto, row.Worker.LeaseSince, row.Worker.DrainingSince)
-		h.overlayOutbox(&dto, row.Worker.ID)
-		h.overlayReportedRuns(&dto, reported, row.Worker.ID)
-		overlayRunDisk(&dto, runDisk, row.Worker.ID)
-		out = append(out, apitypes.AdminWorkerDTO{
-			WorkerDTO:  dto,
-			OwnerEmail: row.OwnerEmail,
-		})
+		dto := adminWorkerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt, h.cfg.WorkerHeartbeatStale)
+		h.overlayEphemeralLease(&dto.WorkerDTO, row.Worker.LeaseSince, row.Worker.DrainingSince)
+		h.overlayOutbox(&dto.WorkerDTO, row.Worker.ID)
+		h.overlayReportedRuns(&dto.WorkerDTO, reported, row.Worker.ID)
+		overlayRunDisk(&dto.WorkerDTO, runDisk, row.Worker.ID)
+		out = append(out, dto)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"workers": out})
 }

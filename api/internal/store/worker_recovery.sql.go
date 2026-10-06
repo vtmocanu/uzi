@@ -165,7 +165,7 @@ WITH candidates AS MATERIALIZED (
       )
   )
 ), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00297 owns cancellation only
+    -- Shared by parent writes and suppression; 00300 owns cancellation only
     -- for an unreleased active lead with a pending plan round-one check.
     SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
@@ -468,7 +468,7 @@ WITH candidates AS MATERIALIZED (
       )
   )
 ), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00297 owns cancellation only
+    -- Shared by parent writes and suppression; 00300 owns cancellation only
     -- for an unreleased active lead with a pending plan round-one check.
     SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
@@ -750,7 +750,7 @@ WITH candidates AS MATERIALIZED (
       )
   )
 ), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00297 owns cancellation only
+    -- Shared by parent writes and suppression; 00300 owns cancellation only
     -- for an unreleased active lead with a pending plan round-one check.
     SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (

@@ -33,8 +33,11 @@ RETURNING *;
 -- still holds the SDK session). issue_description is empty — a Continue seeds no new
 -- prompt; the worker resumes the prior session and parks awaiting the next message.
 -- harness (PRD #1332 M5A / D2): SQL literal 'claude', not a param — a Claude production origin.
+WITH affinity AS MATERIALIZED (
+ SELECT * FROM workers WHERE workers.id = sqlc.narg('worker_id')::uuid FOR UPDATE
+)
 INSERT INTO runs (user_id, kind, issue_title, issue_description, title, resume_of_run_id, worker_id, trigger_source, harness)
-VALUES (@user_id, 'chat', @issue_title, '', @title, @resume_of_run_id, @worker_id, 'resume', 'claude')
+VALUES (@user_id, 'chat', @issue_title, '', @title, @resume_of_run_id, (SELECT affinity.id FROM affinity WHERE draining_since IS NULL AND NOT maintenance_fenced AND maintenance_phase NOT IN ('requested','ready','stopping','recycling')), 'resume', 'claude')
 RETURNING *;
 
 -- name: ListChatRunsForUser :many
@@ -73,6 +76,9 @@ LIMIT 1;
 -- CHAT run for the worker's user. Identical affinity/lock semantics to ClaimRun but
 -- scoped to kind='chat', so the chat lane never claims an issue/ci_fix run and the
 -- run lane (ClaimRun, which now excludes chat) never claims a chat.
+WITH claimant AS MATERIALIZED (
+ SELECT * FROM workers WHERE workers.id = @worker_id FOR UPDATE
+)
 UPDATE runs SET
     status     = 'claimed',
     status_since = now(),
@@ -82,6 +88,9 @@ UPDATE runs SET
 WHERE id = (
     SELECT r.id FROM runs r
     WHERE r.user_id = @user_id
+      AND EXISTS (SELECT 1 FROM claimant c WHERE NOT c.maintenance_fenced
+        AND (c.draining_since IS NULL AND c.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+             OR r.worker_id = c.id))
       AND r.kind = 'chat'
       AND r.status = 'queued'
       -- PRD #529 Decision 4: an ephemeral worker is run-bound and its bound run is

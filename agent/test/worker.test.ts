@@ -1039,7 +1039,7 @@ it("routes cross-check before review and ordinary runners in an ordinary slot an
  const { logger } = recordingLogger();
  const worker = new Worker(fakeConfig(), client, runner, {} as ChatRunner, noJudge, review,
   logger, okPreflight, undefined, undefined, undefined, undefined, undefined, undefined,
-  undefined, undefined, undefined, undefined, {
+  undefined, undefined, undefined, undefined, undefined, undefined, {
    execute: async (_claim, signal) => {
     calls.push("checker");
     started();

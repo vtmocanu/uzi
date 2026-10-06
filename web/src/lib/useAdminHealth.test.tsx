@@ -6,14 +6,14 @@
 // gate is proven where it actually lives. Asserted on the mocked api CALL LOG (vi.fn), the
 // same "no request" seam AppShell/CustodyBoardAlert tests use.
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 
 import { api } from "./api";
 import { useAuth } from "../auth/AuthContext";
 import { HealthStatusProvider } from "./useAdminHealth";
 import { HealthDangerBanner } from "../components/HealthDangerBanner";
-import { healthySilentDoc } from "../mocks/data/health";
+import { healthySilentDoc, ownerOnlyDoc, incidentDoc } from "../mocks/data/health";
 
 // Replace only `api` (keep ApiError, MOCK_MODE, types real), and stub useAuth so the
 // provider's isAdmin read is driven per test.
@@ -52,6 +52,23 @@ describe("HealthStatusProvider — the isAdmin fetch gate", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(mockApi.getAdminHealth).not.toHaveBeenCalled();
+  });
+
+  it("shares scoped owner danger with the banner without an instance alert", async () => {
+    vi.mocked(useAuth).mockReturnValue({ user: { is_admin: true } } as never);
+    mockApi.getAdminHealth.mockResolvedValue(ownerOnlyDoc());
+    renderProvider();
+    await act(async () => { await Promise.resolve(); });
+    expect(mockApi.getAdminHealth).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("alert", { name: "Instance health" })).toBeNull();
+  });
+
+  it("shows a confirmed instance blocker through the shared provider", async () => {
+    vi.mocked(useAuth).mockReturnValue({ user: { is_admin: true } } as never);
+    mockApi.getAdminHealth.mockResolvedValue(incidentDoc());
+    renderProvider();
+    expect(await screen.findByRole("alert", { name: "Instance health" })).toBeTruthy();
+    expect(mockApi.getAdminHealth).toHaveBeenCalledTimes(1);
   });
 
   it("DOES request /api/admin/health for an admin session (positive control)", async () => {

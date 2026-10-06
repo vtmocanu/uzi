@@ -563,6 +563,7 @@ func run() error {
 	// (claims no repo-bearing run) for any repo not on the list. Non-docker workers are
 	// unaffected.
 	wsvc.SetDockerAllowlist(settingsCache)
+	wsvc.SetEffectiveDockerTier(cfg.WorkerDockerEnabled)
 
 	// Capability-aware scheduling kill-switch (PRD #84 Decision 13): the claim gate reads
 	// it from the same settings cache, so an admin flip takes effect within the cache TTL.
@@ -652,7 +653,7 @@ func run() error {
 	// rows. It persists the row first, then delivers best-effort through slackNotifier
 	// (reusing its per-user opt-in gating + drain goroutine via a separate queue). The
 	// in-app inbox read path is retired (PRD #1650 D1), so the table is a pruned,
-	// write-only event log plus the incidental-finding DM latch; the Slack DM is what
+	// event log with durable halt delivery; the Slack DM is what
 	// the user sees. Every producer below (handler, poller detectors, scheduler,
 	// reconcilers, usage engine) calls notifier.Notify or one of its helpers.
 	notifier := notifysvc.New(q, slackNotifier, notifysvc.DefaultUserCap, slog.Default())
@@ -759,6 +760,7 @@ func run() error {
 	ephemeralProv := hostedsvc.NewEphemeralProvisioner(pool, q, box, settingsCache, hostedsvc.EphemeralConfig{
 		// Issue #1965: lane workers are provisioned only where the chart enabled the lane.
 		IsolatedLaneEnabled: cfg.IsolatedLaneEnabled(),
+		DockerEnabled:       cfg.WorkerDockerEnabled,
 		MaxPerUser:          cfg.EphemeralMaxPerUser,
 		DefaultSize:         cfg.EphemeralDefaultSize,
 		ProvisionDeadline:   cfg.EphemeralProvisionDeadline,

@@ -20,7 +20,11 @@ const healthSinceTS = "2026-09-20T02:14:00Z"
 // with what it renders.
 func healthDoc(status string, checks ...apitypes.HealthCheckDTO) apitypes.HealthDocDTO {
 	var counts apitypes.HealthCountsDTO
+	blocking := false
 	for _, ck := range checks {
+		if ck.Scope == "instance" && ck.Severity == "danger" {
+			blocking = true
+		}
 		switch ck.Severity {
 		case "ok":
 			counts.OK++
@@ -36,6 +40,7 @@ func healthDoc(status string, checks ...apitypes.HealthCheckDTO) apitypes.Health
 	}
 	return apitypes.HealthDocDTO{
 		Status:    status,
+		Blocking:  blocking,
 		CheckedAt: "2026-09-20T02:52:10Z",
 		Counts:    counts,
 		Checks:    checks,
@@ -45,7 +50,7 @@ func healthDoc(status string, checks ...apitypes.HealthCheckDTO) apitypes.Health
 func rollDangerCheck() apitypes.HealthCheckDTO {
 	since := healthSinceTS
 	return apitypes.HealthCheckDTO{
-		ID: "fleet.roll", Group: "workers", Title: "Worker image roll", Severity: "danger",
+		ID: "fleet.roll", Scope: "instance", Group: "workers", Title: "Worker image roll", Severity: "danger",
 		Summary: "4 of 4 workers stuck rolling to 0.84.0-rc.2: ImagePullBackOff", Since: &since,
 	}
 }
@@ -53,21 +58,21 @@ func rollDangerCheck() apitypes.HealthCheckDTO {
 func queueWarnCheck() apitypes.HealthCheckDTO {
 	since := healthSinceTS
 	return apitypes.HealthCheckDTO{
-		ID: "queue.waiting", Group: "queue", Title: "Queued runs waiting", Severity: "warn",
+		ID: "queue.waiting", Scope: "owner", Group: "queue", Title: "Queued runs waiting", Severity: "warn",
 		Summary: "oldest waiting_worker run has waited 12m", Since: &since,
 	}
 }
 
 func dbOKCheck() apitypes.HealthCheckDTO {
 	return apitypes.HealthCheckDTO{
-		ID: "db", Group: "control", Title: "Database", Severity: "ok",
+		ID: "db", Scope: "instance", Group: "control", Title: "Database", Severity: "ok",
 		Summary: "ping 4ms, pool 3/20 acquired",
 	}
 }
 
 func slackNACheck() apitypes.HealthCheckDTO {
 	return apitypes.HealthCheckDTO{
-		ID: "slack.socket", Group: "integrations", Title: "Slack socket", Severity: "na",
+		ID: "slack.socket", Scope: "owner", Group: "integrations", Title: "Slack socket", Severity: "na",
 		Summary: "Slack is not configured on this deployment",
 	}
 }
@@ -121,7 +126,7 @@ func TestAdminHealthExitEightWhenDangerAfterPrinting(t *testing.T) {
 	}
 	// The full report reached stdout despite the nonzero exit: the danger check and its
 	// summary, the warn check, and the verdict line.
-	for _, want := range []string{"fleet.roll", "4 of 4 workers stuck rolling", "queue.waiting", "status: DANGER"} {
+	for _, want := range []string{"fleet.roll", "4 of 4 workers stuck rolling", "queue.waiting", "status: DANGER", "blocking: true (instance-wide)"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("danger report did not print %q before the exit-8 return:\n%s", want, out)
 		}
@@ -217,7 +222,7 @@ func TestAdminHealthTransportFailuresKeepTheirCodes(t *testing.T) {
 func TestAdminHealthBoundsHostileCell(t *testing.T) {
 	hostile := strings.Repeat("A", 1<<20) // 1 MiB
 	check := apitypes.HealthCheckDTO{
-		ID: "fleet.roll", Group: "workers", Title: "Worker image roll", Severity: "danger",
+		ID: "fleet.roll", Scope: "instance", Group: "workers", Title: "Worker image roll", Severity: "danger",
 		Summary: hostile,
 	}
 	fc := &uzicli.FakeClient{AdminHealthDoc: healthDoc("danger", check)}
@@ -248,6 +253,12 @@ func TestAdminHealthJSONEmitsTheDocAndExits(t *testing.T) {
 	var got apitypes.HealthDocDTO
 	if err := json.Unmarshal([]byte(out), &got); err != nil {
 		t.Fatalf("--json output is not a HealthDocDTO: %v\n%s", err, out)
+	}
+	if len(got.Checks) != 2 {
+		t.Fatalf("--json lost checks: %+v", got)
+	}
+	if !got.Blocking || got.Checks[0].Scope != "instance" {
+		t.Errorf("--json lost scope/blocking: %+v", got)
 	}
 	if got.Status != "danger" || len(got.Checks) != 2 {
 		t.Errorf("--json lost the document: status=%q checks=%d", got.Status, len(got.Checks))
@@ -285,5 +296,29 @@ func TestAdminHealthIsRegistered(t *testing.T) {
 		if health.Flags().Lookup(f) == nil {
 			t.Errorf("`admin health` missing --%s flag", f)
 		}
+	}
+}
+
+func TestAdminHealthOwnerDangerRemainsExitEightWithoutInstanceBlocking(t *testing.T) {
+	check := queueWarnCheck()
+	check.Severity = "danger"
+	doc := healthDoc("danger", check)
+	fc := &uzicli.FakeClient{AdminHealthDoc: doc}
+	out, _, code := runCLI(t, fakeEnv(fc), "admin", "health")
+	if code != uzicli.ExitHealthDanger {
+		t.Fatalf("owner danger exit = %d, want 8", code)
+	}
+	for _, want := range []string{"blocking: false (instance-wide)", "status: DANGER", "1 danger", "queue.waiting"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("owner report missing %q: %s", want, out)
+		}
+	}
+	out, _, code = runCLI(t, fakeEnv(fc), "admin", "health", "--json")
+	var got apitypes.HealthDocDTO
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatal(err)
+	}
+	if code != uzicli.ExitHealthDanger || got.Blocking || len(got.Checks) != 1 || got.Checks[0].Scope != "owner" {
+		t.Fatalf("owner JSON scope/blocking/exit changed: exit=%d doc=%+v", code, got)
 	}
 }

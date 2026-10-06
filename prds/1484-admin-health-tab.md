@@ -121,6 +121,12 @@ Nothing here needs a file under `.github/workflows/`.
 - **A roll in progress must not alert.** Only a blocked pod does.
 - Every non-`ok` check carries `since`, where the source has one.
 
+**#2293 supersession (2026-10-05).** Overall status still rolls up the full
+registry, but banner, snooze, episodes and admin notices follow server-emitted
+`blocking`, true exactly when an instance-scoped check is danger. The registry
+marks `db`, `controller.report`, `loops`, `fleet.roll` as instance and the rest
+owner. The original severity/banner rule above is retained as design history.
+
 ### Checks in v1
 
 Thresholds are constants in v1, named in one place, not settings.
@@ -142,6 +148,19 @@ Thresholds are constants in v1, named in one place, not settings.
 | `custody.holds` | housekeeping | any owner at the custody admission limit | none | none |
 | `release.check` | housekeeping | the release check reports `far_behind` | none | `na` when the release check is disabled |
 
+**#2293 queue supersession (2026-10-05).** The `queue.waiting` rungs above
+apply to genuine waits across the full `waiting_worker` population, including
+owners with usable capacity. Exclude only exact stored upgrade-reason
+values (`workersvc.ReasonWorkersUpgrading`) confirmed with finite, nonzero,
+nonfuture wait/drain timestamps and
+`DrainingEligible > 0`, `NonDrainingEligible == 0`, `SuitableOwnDraining == 0`.
+Confirmed drains remain excluded even overdue; D18's 24h capacity overlap rule
+is unchanged. Capacity-first shared per-evaluation confirmation memoizes by run,
+with 200 calls, 2s per call and a lazy shared 4s budget. Errors, elapsed deadlines,
+exhaustion and invalid input leave genuine waits. Unknown genuine age yields
+unknown unless a valid wait establishes danger. Evidence retains up to five
+sanitized run/owner/wait/reason rows plus omissions; severity uses all rows.
+
 "Hosted workers are configured" means `HOSTED_WORKER_VERSION` is non-empty or at least one `kind = 'hosted'` worker exists. The plan confirms that predicate against `api/internal/config/config.go` and says so.
 
 `fleet.capacity` is deliberately narrow. `waiting_worker` covers many causes (vault locked, custody limit, all workers busy, no eligible worker), so the conjunction with "zero usable workers" is what makes it a capacity failure. A capability-gap run (online workers, none eligible) is not a capacity failure and surfaces through `queue.waiting` by age instead.
@@ -162,11 +181,26 @@ Layout, top to bottom: verdict with per-severity tally; the needs-attention list
 - **Banner**, mounted in `AppShell` beside `UpdateEscalationBanner`: admins only, `danger` only, `role="alert"`, the verdict line, the cause line, an Open health link, and **Snooze 1 h**. A snooze is per admin and applies to the current Danger episode only; a new episode shows the banner again. The banner follows `status`, so it appears at once; the Snooze button renders only while `episode_id` is non-null (an episode opens within one evaluation, see Danger notice).
 - **Non-admin line**: shown when the viewer has at least one queued run, owns at least one hosted worker, and every hosted worker they own reads `upgrade_failed`. It is derived entirely from the `listRuns` and `listWorkers` responses Overview already polls. No new endpoint, nothing about any other user. Copy: "Your hosted workers cannot start right now: the worker image cannot be pulled. This is a platform problem, not your run. Queued runs start on their own once it is fixed." The cause clause follows the viewer's own `upgrade_blocking_*` fields through the existing `likelyCause` lookup in `WorkerUpgradeBadge.tsx`, which already yields the image-pull cause for `ImagePullBackOff` and `ErrImagePull`; it is never free text. Admins get the card instead of this line.
 
+**#2293 banner supersession (2026-10-05).** The banner rule above now follows
+`blocking`; blocker count/cause use server-scoped instance danger. Owner-only
+danger stays in Health/Overview with "N checks need attention; no instance-wide
+blocker detected" (singular for one), without a banner or episode. Warn/unknown
+use neutral attention copy. Web honors present true/false exactly with no ID
+map. The accepted follow-up replaces the originally deferred mixed-version
+fallback: absent `blocking` conservatively uses legacy status/danger count/first
+danger, including the snooze expiry timer. Api-before-web upgrades and
+web-before-api rollbacks are preferred to avoid legacy owner false positives,
+not required to prevent suppressed banners.
+
 ### CLI
 
 - `uzi admin health` prints the non-`ok`, non-`na` checks (`SEVERITY CHECK SINCE SUMMARY`), the verdict and a tally. `--all` lists every check. `--json` emits the endpoint's document unchanged.
 - Exit status: `0` unless the overall status is `danger`, then **`8`**, a new code in the CLI exit-code contract ("a health check reports danger"). `--strict` also exits 8 on `warn` or `unknown`. The contract lives in code, not only in docs: codes 0 to 7 are constants in `api/internal/uzicli/output.go` and `ExitCodeFor(err)` maps errors to them. Exit 8 is a **success-path** exit (HTTP 200 carrying `status: danger`), so the command prints its full output, then returns a sentinel error that `ExitCodeFor` maps to a new `ExitHealthDanger = 8`, with a test. Transport and auth failures keep their existing codes, so a probe can tell "unhealthy" from "could not ask".
 - `uzi admin workers` gains `VERSION`, `UPGRADE` and `BLOCKING`, reusing `upgradeCell` from `api/cmd/uzi/worker.go`. Every server string goes through the bounded, package-local `cellText`, never the unbounded `CellText` (`.claude/rules/go.md`).
+
+**#2293 CLI addition (2026-10-05).** Text output adds
+`blocking: true/false (instance-wide)`; owner-only danger still exits 8.
+Strict, transport/auth and malformed-document handling are unchanged.
 
 ### Danger notice and episodes
 
@@ -182,6 +216,13 @@ A standalone evaluator, wired from `main.go` beside the custody episode reconcil
 1. Overall status is `danger` and no episode is open: open one.
 2. Overall status is `danger` on the evaluation **after** the one that opened the episode (the two-evaluation debounce): claim and send one notice to each admin through `notifysvc.Notify`, listing the danger checks at that moment.
 3. Overall status is not `danger` and an episode is open: close it. That is the re-arm.
+
+**#2293 episode supersession (2026-10-05).** The numbered overall-status rules
+above, and #2271's accepted owner-bridged timing, are superseded: `blocking`
+opens/holds an episode; the opening tick sends nothing and the next
+still-blocking tick claims one notice per admin, listing instance-danger checks
+by server scope. Clearing instance danger closes/rearms even while owner danger
+remains. Owner-only danger opens/holds no episode and sends no admin notice.
 
 It reuses the existing health-notification enablement gate; no new enable flag. `warn` and `unknown` never notify. There is no recovery notice in v1. The chart runs a single api replica, so the two-replica race is defensive, consistent with the custody precedent.
 
@@ -219,7 +260,16 @@ It reuses the existing health-notification enablement gate; no new enable flag. 
 - `GET /api/health` and `GET /api/version` do not change. `TestVersionEndpointCarriesNothingPrivate` must stay green untouched.
 - New DTOs follow the three-file rule: the Go struct, `fixtures/api-contract/<dto>.{zero,full}.json` **recorded from the failing contract test's output, never hand-authored**, and `web/src/lib/apiTypes.ts`.
 
+**#2293 contract addition (2026-10-05).** The original example above is
+historical: current documents also emit `blocking` (boolean, including false),
+and each check emits `scope` (`instance` or `owner`). See
+[admin health](../docs/admin-health.md#severity) for the current contract.
+
 ## Milestones
+
+**#2293 supersession.** The completed milestones below record the original
+landing and remain checked. M5's overall-danger banner acceptance is replaced
+by the scoped `blocking` rule above; this annotation does not reopen milestones.
 
 Per-milestone gate lines: M1, M2, M3, M6 `task gate:api`; M4, M5 `task gate:web`; M7 `task check-docs:web`; and `task gate:repo` once before finalize. Run each gate once, to a log, then read the log. Any milestone that edits `docs/*.md` also runs `task docs:sync` and commits the mirror.
 
@@ -253,6 +303,10 @@ A single uzi run executes these in order. M3, M4 and M6 share no files except th
 4. A worker mid-roll raises nothing.
 5. A non-admin never triggers a request to an admin route, and sees the platform line only for their own blocked fleet.
 6. `api/go.mod` still has no kube client, and `git diff --name-only <base>..HEAD` lists nothing under `deploy/chart/` or `.github/workflows/`.
+
+**#2293 acceptance boundary.** Criterion 1's stuck `fleet.roll` remains an
+instance incident. Owner capacity/queue danger alone still appears in Health,
+Overview and CLI (exit 8), but raises no banner, episode or admin notice.
 
 ## Risks
 

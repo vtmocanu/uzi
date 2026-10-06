@@ -25,11 +25,13 @@ import { JobRunner } from "./job-runner.js";
 import { stubJobQueryFn } from "./job-runner-stub.js";
 import { Worker } from "./worker.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
+import { DindMaintenanceController } from "./dind-maintenance.js";
 import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js";
 import { CachesDroppedMemo, DiskPressureController, modelPassMinAgeMs, runDiskReclaimPass } from "./disk-reclaim.js";
 import { RunDiskSampler } from "./run-disk.js";
 import { DataVolumeGuard } from "./disk-full.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
+import { TerminalRejectionCoordinator } from "./terminal-rejections.js";
 import { DiskGovernor } from "./cache-cap.js";
 import { sampleVolume } from "./stats.js";
 import { errMessage } from "./util.js";
@@ -409,7 +411,9 @@ async function main(): Promise<void> {
   const client = new WorkerClient(config.apiUrl, config.workerToken, config.version, log, {
     httpTimeoutMs: config.httpTimeoutMs,
   });
-  const git = new GitCache(config.dataDir, log);
+  const git = new GitCache(config.dataDir, log, undefined, {
+    terminalRecordProtection: (runId) => outbox.hasPhysicalTerminalProtection(runId),
+  });
 
   // PRD #1809 D6: the data-volume guard. It classifies a failed write as data-volume disk-full
   // (the bare clone/fetch, the fetch-back, the outbox reserve), preflights the volume at claim and
@@ -439,6 +443,7 @@ async function main(): Promise<void> {
     runMaxBytes: config.outboxRunMaxBytes,
     maxBytes: config.outboxMaxBytes,
     retentionMs: config.outboxRetentionMs,
+    terminalMaxBytes: config.outboxTerminalMaxBytes,
     // PRD #1391 M3 (Run B, D2): size the physical `.reserve` for the terminal journals, derived from
     // ONE source — the per-record cap times how many hard-max journals must survive a full volume,
     // plus a per-record overhead. init() grows a deployed Run A worker's 64 KiB reserve up to this.
@@ -524,6 +529,8 @@ async function main(): Promise<void> {
 
   // PRD #1809 D7: the per-run lock the runner and the disk reclaim share (run-disk-locks.ts).
   const diskLocks = new RunDiskLocks();
+  const terminalRejections = new TerminalRejectionCoordinator(outbox, client, log, diskLocks,
+    (runId) => activeRuns.has(runId) || runner.isExecuting(runId));
   // The reclaim's memo of runs whose caches it found gone; the runner forgets a run there
   // each time it starts executing it (disk-reclaim.ts CachesDroppedMemo).
   const cachesDropped = new CachesDroppedMemo();
@@ -571,6 +578,7 @@ async function main(): Promise<void> {
     // Codex advice path takes no queryFn, so a stub queryFn could not neutralize it).
     skipDeliverySummary: config.executor === "stub",
     diskLocks,
+    queueTerminalRejectionReconciliation: (runId, generation) => terminalRejections.queueReconciliation(runId, generation),
     cachesDropped,
     dataVolume,
     diskGovernor,
@@ -709,16 +717,27 @@ async function main(): Promise<void> {
   // report, so it takes the same outbox + re-arm registry the runners spill into. The
   // `undefined` preserves the default boot toolchain preflight (only tests inject one).
   // issue #1759 M3: the DinD prune, built only on a docker worker with
-  // UZI_DIND_PRUNE_ENABLED=true (undefined otherwise, so no loop and no claim gate). Its idle
+  // UZI_DIND_PRUNE_ENABLED=true. Server maintenance shares its gate even when cache prune is off. Its idle
   // probe reads the worker's own active sets, hence the late-bound `worker` reference: the
-  // probe is only ever called from the prune loop, which the worker itself starts.
+  // probe is called from the controller loops, which the worker itself starts.
   let worker: Worker | undefined;
+  const dindGate = new DindPruneGate();
   const dindPrune = createDindPrune(config, {
-    gate: new DindPruneGate(),
+    gate: dindGate,
     isIdle: () => worker?.isIdle() ?? false,
     log,
   });
   if (dindPrune) log.info("dind prune enabled", { docker_host_wired: true });
+  const dindMaintenance = config.dockerWiring.dockerHost !== undefined
+    ? new DindMaintenanceController({
+        gate: dindGate,
+        dockerHost: config.dockerWiring.dockerHost,
+        heartbeatIntervalMs: config.heartbeatIntervalMs,
+        isIdle: () => worker?.isIdle() ?? false,
+        log,
+        threshold: () => client.diskPressureThreshold,
+      })
+    : undefined;
   // A run's api status for both HOME reclaims. A 404 is the API ANSWERING not-found (the
   // run's row is gone, which is exactly what the oldest stranded HOMEs look like): return
   // undefined so a sweep SKIPS without counting it toward the outage bail; every other error
@@ -802,6 +821,8 @@ async function main(): Promise<void> {
     undefined,
     isolatedRunner,
     jobRunner,
+    dindMaintenance,
+    terminalRejections,
     crossCheckRunner,
   );
 

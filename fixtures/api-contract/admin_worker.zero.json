@@ -47,5 +47,7 @@
   "outbox_pending_terminal": null,
   "outbox_stale_retired": null,
   "outbox_blocked": null,
-  "owner_email": ""
+  "owner_email": "",
+  "disk_pressure_volumes": [],
+  "cleanup_pending": false
 }

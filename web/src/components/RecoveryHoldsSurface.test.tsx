@@ -73,6 +73,54 @@ async function renderSurface(resp: RecoveryCustodyHolds) {
 }
 
 describe("RecoveryHoldsSurface", () => {
+  it("shows fixed rejection separately on the exact source-only generation without export", async () => {
+    await renderSurface(listing([
+      hold({ id: "hold-gen7", run_id: "run-one", generation: 7, attention: "source_only", terminal_record_rejection: "mac_failure" }),
+      hold({ id: "hold-gen8", run_id: "run-one", generation: 8, attention: "source_only", terminal_record_rejection: "untrusted <script>" }),
+    ]));
+    const diagnostic = screen.getByText("terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody");
+    const row = diagnostic.closest("li")!;
+    expect(within(row).getByText("gen 7")).toBeTruthy();
+    expect(within(row).getByText("Decision required")).toBeTruthy();
+    expect(within(row).getByText(/No server archive exists/)).toBeTruthy();
+    expect(within(row).getByRole("link", { name: /View run/ }).getAttribute("href")).toBe("/runs/run-one");
+    expect(within(row).queryByRole("link", { name: /Export archive/ })).toBeNull();
+    expect(screen.getByText("gen 8")).toBeTruthy();
+    expect(document.body.textContent).not.toContain("untrusted <script>");
+    expect(mockApi.discardHold).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["active", "Active protection", false],
+    ["capturing", "Capturing", false],
+    ["archive_ready", "Archive ready", true],
+  ] as const)("surfaces the exact flagged %s hold without changing classification or actions", async (attention, label, exportable) => {
+    await renderSurface(listing([
+      hold({ id: "flagged7", run_id: "run-one", generation: 7, attention,
+        has_available_capture: exportable, terminal_record_rejection: "mac_failure" }),
+      hold({ id: "unknown8", run_id: "run-one", generation: 8, attention,
+        terminal_record_rejection: "unknown MAC failure" }),
+    ]));
+    const row = screen.getByText("terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody").closest("li")!;
+    expect(within(row).getByText("hold flagged7")).toBeTruthy();
+    expect(within(row).getByText("gen 7")).toBeTruthy();
+    expect(within(row).getByText(label)).toBeTruthy();
+    expect(within(row).getByRole("link", { name: /View run/ }).getAttribute("href")).toBe("/runs/run-one");
+    const exportLink = within(row).queryByRole("link", { name: /Export archive/ });
+    if (exportable) {
+      expect(exportLink?.getAttribute("href")).toBe("/runs/run-one#recovery-archives");
+      expect(within(row).getByText(/Releasing automatically — no action needed/)).toBeTruthy();
+    } else {
+      expect(exportLink).toBeNull();
+    }
+    expect(within(row).queryByRole("button", { name: /Discard held work/ })).toBeNull();
+    expect(screen.queryByText("gen 8")).toBeNull();
+    expect(document.body.textContent).not.toContain("unknown MAC failure");
+    expect(screen.getByText("2 / 8")).toBeTruthy();
+    expect(screen.queryByText(/need a decision|to resolve/)).toBeNull();
+    expect(mockApi.discardHold).not.toHaveBeenCalled();
+  });
+
   it("self-hides when there are no holds", async () => {
     const { container } = await renderSurface(listing([]));
     expect(container.innerHTML).toBe("");

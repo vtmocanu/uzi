@@ -47,17 +47,16 @@ export function HostedWorkers({
    *  `{ manual: false }` when hosting is disabled, quota is 0, or the config read rejects. */
   onAvailability?: (a: { manual: boolean }) => void;
 }) {
-  const { user, refresh } = useAuth();
+  const { user, updateUser } = useAuth();
   const [config, setConfig] = useState<HostedConfig | null>(null);
   const [template, setTemplate] = useState<string>(DEFAULT_WORKER_TEMPLATE);
   const [size, setSize] = useState<string>(DEFAULT_WORKER_SIZE);
-  // Opt into a rootless Docker-in-Docker sidecar (PRD #83 M3). Off by default: the
+  // Opt into a Docker-in-Docker sidecar (PRD #83 M3). Off by default: the
   // plain worker is the common case, docker is the extra one you ask for.
   const [docker, setDocker] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  // The ephemeral opt-in write is in flight: disable the toggle so a double-flip cannot
-  // race the refresh.
+  // Both ephemeral preference controls stay disabled until the saved user is applied.
   const [ephemeralBusy, setEphemeralBusy] = useState(false);
   // The ephemeral toggle carries its OWN error slot, rendered beside the toggle at the
   // bottom of the card, so a failed write is visible where the user acted — not in the
@@ -130,21 +129,18 @@ export function HostedWorkers({
     }
   };
 
-  // Flip this user's ephemeral auto-provision opt-in. Mirrors the RunDefaults
-  // judge/autopilot pattern: write, then refresh() so useAuth().user reflects the new
-  // value everywhere. On error we surface it in the toggle's OWN alert (beside the
-  // toggle) and leave it showing user.ephemeral_workers_enabled — which refresh() never
-  // advanced — so it never shows a state that did not persist.
-  const toggleEphemeral = async (next: boolean) => {
+  // Both preferences share a pending lock. Keep rendering confirmed auth values;
+  // a rejected write therefore restores the control without a speculative value.
+  // Apply the saved user directly so an older session probe cannot undo the write.
+  const toggleEphemeral = async (prefs: boolean | { docker: boolean }) => {
+    if (ephemeralBusy) return;
     setEphemeralError("");
     setEphemeralBusy(true);
     try {
-      await api.setEphemeralWorkersEnabled(next);
-      await refresh();
+      const { user: savedUser } = await api.setEphemeralWorkersEnabled(prefs);
+      updateUser(savedUser);
     } catch (err) {
-      setEphemeralError(
-        errorMessage(err, "Failed to update auto-provisioning"),
-      );
+      setEphemeralError(errorMessage(err, "Failed to update ephemeral workers"));
     } finally {
       setEphemeralBusy(false);
     }
@@ -178,6 +174,7 @@ export function HostedWorkers({
       <SectionTitle>Hosted workers</SectionTitle>
       {showManual && (
         <>
+          <h3 className="text-sm font-medium">Persistent worker</h3>
           {/* The manual form's own error stays with the form. The success notice is NOT
               here: the page owns one announcement slot for both provisioning and
               deleting, because a delete must be able to replace a provision's message
@@ -223,12 +220,8 @@ export function HostedWorkers({
                 </Select>
               </Field>
             </div>
-            {/* This stays a plain checkbox on purpose: it is a FORM FIELD submitted with
-                the Provision button below, not a persisted setting. Its semantics differ
-                from the ephemeral Toggle further down (which persists on flip), so the
-                two controls are deliberately different primitives. The label wraps the
-                input so the whole thing is one click target with no htmlFor to keep in
-                sync. */}
+            {/* This checkbox is submitted with the provision form. The ephemeral
+                checkbox below is a persisted preference, saved on change. */}
             <label className="flex items-center gap-2 pb-2 text-sm">
               <input
                 type="checkbox"
@@ -263,42 +256,49 @@ export function HostedWorkers({
             </span>
           </form>
           <p className="text-xs text-muted">
-            A hosted worker runs in the cluster, not on your machine: there is no join token to
-            copy and no container to start. It shows up under <strong>Your workers</strong> and
-            comes online on its own, and you delete it there like any other worker. Tick{" "}
-            <em>Docker-capable</em> to give its agent
-            a rootless, isolated Docker daemon (for docker and docker&nbsp;compose); it costs extra
-            CPU and storage and needs an instance that offers the docker tier.
+            Runs in the cluster, not on your machine: no join token, no container to start.
+            It shows up under <strong>Your workers</strong> and you delete it there.{" "}
+            <em>Docker-capable</em> gives it a Docker daemon for container builds and tests,
+            at extra CPU and storage.
           </p>
         </>
       )}
       {showEphemeral && (
-        <div className="space-y-1">
-          {/* Uses the app's Toggle primitive (a role="switch" button) rather than a
-              checkbox because this is a PERSISTED, consequential opt-in written the
-              moment it flips — the exact analog of the "Trusted repo" master switch in
-              Repos.tsx, and the app convention for such settings. (The Docker-capable
-              control above stays a checkbox: it is a form field, not a persisted
-              setting.) `aria-describedby` links the caveat copy below so a screen reader
-              reads the informed-consent caveat with the switch. */}
-          <div className="flex items-center gap-2">
-            <Toggle
-              label="Auto-provision on demand"
-              checked={user?.ephemeral_workers_enabled ?? false}
-              disabled={ephemeralBusy}
-              aria-describedby="ephemeral-toggle-desc"
-              onChange={(next) => toggleEphemeral(next)}
-            />
-            <span className="text-sm">Auto-provision on demand</span>
+        <div className={showManual ? "space-y-1 border-t border-edge pt-4" : "space-y-1"}>
+          <h3 className="text-sm font-medium">Ephemeral workers</h3>
+          {/* The agreed UI uses a switch for auto-provision and a persisted Docker
+              checkbox on the same row. Both save on change, even with auto-provision off. */}
+          <div className="flex flex-wrap items-center gap-4">
+            <div className="flex items-center gap-2">
+              <Toggle
+                label="Auto-provision on demand"
+                checked={user?.ephemeral_workers_enabled ?? false}
+                disabled={ephemeralBusy}
+                aria-describedby="ephemeral-toggle-desc"
+                onChange={(next) => toggleEphemeral(next)}
+              />
+              <span className="text-sm">Auto-provision on demand</span>
+            </div>
+            {config.docker_enabled && (
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  aria-label="Docker-capable ephemeral workers"
+                  aria-describedby="ephemeral-toggle-desc"
+                  checked={user?.ephemeral_docker_enabled ?? false}
+                  disabled={ephemeralBusy}
+                  onChange={(e) => toggleEphemeral({ docker: e.target.checked })}
+                />
+                Docker-capable
+              </label>
+            )}
           </div>
           <p id="ephemeral-toggle-desc" className="text-xs text-muted">
-            When on, uzi spins up a throwaway hosted worker on demand when one of your runs
-            needs a capability no online worker has. After the run finishes, the worker may be
-            kept warm, by default for up to 2 hours unless your admin turned that off, so a
-            follow-up run on the same repository and branch can reuse it; then it is removed.
-            While kept warm it still counts toward your ephemeral worker limit.
-            This is <em>experimental</em>, and each new ephemeral worker pays a one-time
-            ~2.6&nbsp;GiB tool-cache cold start.
+            uzi spins up a throwaway hosted worker when a run needs a capability no online
+            worker has, or when every capable worker stays busy. It may be kept warm for up
+            to 2 hours for a follow-up run on the same branch, and counts toward your
+            ephemeral limit meanwhile.
+            {config.docker_enabled && " Docker-capable includes Docker for repositories your admin allows, at extra CPU and storage."}
           </p>
           {/* The ephemeral write's own error slot, next to the toggle where the user
               acted — not the manual form's alert at the top of the card. */}

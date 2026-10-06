@@ -853,6 +853,8 @@ describe("PredecessorSettler live leg (issue #1751 M2)", () => {
   it("an abort consumes no attempt: the sent leg stays due", async () => {
     await j.put(adoptedRecord({ live: liveLeg() }));
     const ctl = new AbortController();
+    let entered!: () => void;
+    const requestEntered = new Promise<void>((resolve) => { entered = resolve; });
     const s2 = new PredecessorSettler({
       journal: j,
       client: {
@@ -860,6 +862,7 @@ describe("PredecessorSettler live leg (issue #1751 M2)", () => {
         settleRecoveryHoldLive: (_r, _h, _req, signal) =>
           new Promise((_res, rej) => {
             signal?.addEventListener("abort", () => rej(new Error("aborted")), { once: true });
+            entered(); // The sent leg is persisted and the request can observe abort.
             setTimeout(() => rej(new Error("never aborted")), 2_000).unref();
           }),
       },
@@ -868,8 +871,10 @@ describe("PredecessorSettler live leg (issue #1751 M2)", () => {
       log: nullLogger(),
     });
     const p = s2.settleLive(RUN, ctl.signal);
-    await new Promise((r) => setImmediate(r));
-    await new Promise((r) => setTimeout(r, 20));
+    await Promise.race([
+      requestEntered,
+      p.then(() => { throw new Error("settlement ended before the live request"); }),
+    ]);
     ctl.abort();
     await p;
     assert.deepEqual((await one())!.live, liveLeg({ sent: true }), "sent persisted; no attempt counted, still due");

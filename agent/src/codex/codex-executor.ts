@@ -98,7 +98,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
+import { buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -3098,6 +3098,12 @@ export class CodexExecutor implements Executor {
         // epoch 0. Every new CodexExecutor.run invocation starts again at epoch 0, so a re-claim gets
         // a fresh lineage even when thread/resume emits no thread/started notification.
         accountant,
+        onTokenUsageIncomplete: () => {
+          ctx.emit({ kind: "status", agent: "worker", payload: {
+            event: "codex_token_usage_incomplete",
+            text: "Token usage for this resumed claim is unavailable; recorded run totals are incomplete. Execution continues.",
+          } });
+        },
         emitClaimInit: epochIndex === 0,
         // Issue #1583: projected tool frames are scrubbed of runtime-released Codex tokens.
         scrubProjected,
@@ -3929,7 +3935,9 @@ export class CodexExecutor implements Executor {
     // #1416 (MR-rework): thread autoApprove so an autopilot Codex run gets the autopilot-safe
     // rewrite guidance, not the human-only `ask_user` wording (matches the SDK builders).
     const note = publishedTipNote(ctx.publishedTip, ctx.defaultBranchCommit, ctx.autoApprove);
-    return note ? `${note}\n\n${body}` : body;
+    const prompt = note ? `${note}\n\n${body}` : body;
+    const dockerResume = dockerScratchResumeNote(ctx.dockerScratchResume);
+    return dockerResume ? `${prompt}\n\n${dockerResume}` : prompt;
   }
 
   /** `gatedPlan` is the plan this run's in-process gate approved (#1586). When present it is
@@ -3970,7 +3978,9 @@ export class CodexExecutor implements Executor {
     // Codex framing. Empty (no approved breakdown) leaves the prompt byte-identical.
     const prompt = withMilestoneNote(note ? `${note}\n\n${withClaims}` : withClaims, milestoneNote);
     const block = buildEnvironmentFactsBlock(facts);
-    return block ? `${prompt}\n\n${block}` : prompt;
+    const withFacts = block ? `${prompt}\n\n${block}` : prompt;
+    const dockerResume = dockerScratchResumeNote(ctx.dockerScratchResume);
+    return dockerResume ? `${withFacts}\n\n${dockerResume}` : withFacts;
   }
 
   /** Issue #1866 M2: the Codex environment-probe spawner, routed through `epoch`'s registered

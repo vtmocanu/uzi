@@ -122,6 +122,68 @@ class ThrowingExecutor implements Executor {
   }
 }
 
+it("unit 1: deferred hook preserves finalize and latches across held-skip ACK retirement", async () => {
+  const { gitlab } = fakeGitlab();
+  const outbox = await mkOutbox();
+  const runId = "run-deferred-held-skip";
+  const gen = 4;
+  await outbox.journalFinalize(runId, gen);
+  await outbox.journalTerminal(runId, gen, "running", 42, { status: "completed", branch: "agent/original" });
+  const root = (outbox as unknown as { root: string }).root;
+  const file = path.join(root, runId, `terminal-${gen}.json`);
+  const bytes = await fsp.readFile(file);
+  const finalize = path.join(root, runId, `finalize-${gen}.json`);
+  const finalizeBytes = await fsp.readFile(finalize);
+  await fsp.unlink(file);
+  await fsp.mkdir(file);
+  const events: string[] = [];
+  const bodies: StateRequest[] = [];
+  const flight = Object.assign(minimalFailFlight({
+    runId, gen, events,
+    reportState: async () => ({ applied: true, status: "completed" }),
+  }), {
+    redactText: (s: string) => s,
+    batcher: { currentSeq: () => 5, close: async () => undefined, awaitPermanentFailureSettled: async () => undefined, emit: () => events.push("emit") },
+  });
+  flight.reportState = async (body: unknown) => {
+    assert.equal(flight.terminalResolved, true, "deferral must latch before the post-release send");
+    events.push("send");
+    bodies.push(structuredClone(body as StateRequest));
+    return { applied: true, status: "completed" };
+  };
+  const run = runner(new StubExecutor(nullLogger()), gitlab, undefined, { outbox, outboxTerminalMaxBytes: 1 << 20, gapFillMax: 100 });
+  const hooks = run as unknown as {
+    reapRecoveryProviderForSettle: () => Promise<boolean>;
+    reportGenericFailure: (claim: unknown, flight: unknown, err: unknown, opts: { keepCustody: boolean }) => Promise<void>;
+  };
+  let finalizeDuringHook = false;
+  hooks.reapRecoveryProviderForSettle = async () => {
+    events.push("reap");
+    finalizeDuringHook = fs.existsSync(finalize);
+    assert.equal(outbox.isTerminalResolveHeld(runId, gen), true);
+    outbox.noteHeldSkip(runId, gen);
+    await fsp.rmdir(file);
+    await fsp.writeFile(file, bytes);
+    return true;
+  };
+  await callHandle(run, failClaim(runId, gen), flight, "competing failure");
+  assert.equal(finalizeDuringHook, true, "deferral must preserve finalize before abort/reap");
+  assert.deepEqual(await fsp.readFile(finalize), finalizeBytes);
+  assert.deepEqual(events, ["abort", "reap", "send"], "only post-release resolution sends");
+  assert.equal(bodies.length, 1);
+  const delivered = bodies[0];
+  assert.ok(delivered);
+  assert.equal(delivered.status, "completed");
+  assert.equal(delivered.branch, "agent/original");
+  assert.equal(outbox.hasPendingTerminal(runId, gen), false, "post-release ACK retired original");
+  assert.equal(outbox.isTerminalResolveHeld(runId, gen), false);
+  assert.equal(flight.permanentFailureReap, true);
+  assert.equal(flight.terminalResolved, true, "deferral reaches the latch before release retires pending");
+  await hooks.reportGenericFailure(failClaim(runId, gen), flight, new Error("late failure"), { keepCustody: true });
+  assert.equal(bodies.length, 1, "generic failure must not emit another outcome after pending retirement");
+  assert.deepEqual(events, ["abort", "reap", "send"]);
+});
+
 describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
   it("journals the COMPLETED terminal write-ahead at finishCommittedPublish; a 409 running keeps the durable journal", async () => {
     const { gitlab } = fakeGitlab();

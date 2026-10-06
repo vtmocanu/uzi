@@ -571,7 +571,9 @@ require_real_carveout_root "$CODEX_CMD_CACHE_DIR"
 "$MKDIR" -p "$CODEX_CMD_CACHE_DIR"
 require_real_carveout_root "$CODEX_CMD_CACHE_DIR"
 "$CHOWN" -h 0:0 "$CODEX_CMD_CACHE_DIR"
-"$CHMOD" 0700 "$CODEX_CMD_CACHE_DIR"
+# GNU chmod preserves directory setgid with 0700; five-digit 00700 clears special bits
+# with both GNU and BusyBox chmod, leaving exactly 0700.
+"$CHMOD" 00700 "$CODEX_CMD_CACHE_DIR"
 "$CHOWN" -h "$CODEX_CMD_CACHE_OWNER" "$CODEX_CMD_CACHE_DIR"
 
 # --- (b) token: force 0400 worker on the join-token secret ---------------------

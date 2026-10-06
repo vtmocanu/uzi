@@ -333,6 +333,7 @@ func (h *Handler) HostedConfig(w http.ResponseWriter, r *http.Request) {
 	ephemeralEnabled, _ := h.settings.EphemeralWorkersEnabled(r.Context())
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"enabled":           h.cfg.WorkerHostingEnabled,
+		"docker_enabled":    h.cfg.WorkerHostingEnabled && h.cfg.WorkerDockerEnabled,
 		"quota":             quota,
 		"ephemeral_enabled": ephemeralEnabled,
 	})

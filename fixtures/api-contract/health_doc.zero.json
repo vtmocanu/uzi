@@ -1,5 +1,6 @@
 {
   "status": "",
+  "blocking": false,
   "checked_at": "",
   "counts": {
     "ok": 0,

@@ -772,8 +772,12 @@ A few worth knowing:
   controller report, background loops, the database, integrations, housekeeping), with an
   overall verdict and a per-severity tally. By default it prints only the checks needing
   attention (everything that is not `ok` and not `na`) as
-  `SEVERITY CHECK SINCE SUMMARY`, then the verdict and the tally. `--all` lists every
-  check. `--json` emits the endpoint's document unchanged. **Its exit code is a probe
+  `SEVERITY CHECK SINCE SUMMARY`, then overall status,
+  `blocking: true/false (instance-wide)` and the tally. The server's blocking flag
+  means an instance-scoped check is danger; owner-only danger remains visible and still exits 8.
+  `--all` lists every check. `--json` emits the endpoint's document unchanged.
+  See [admin health](admin-health.md#severity) for scope and banner/episode routing.
+  **Its exit code is a probe
   contract:** 0 unless the overall status is `danger`, then **8**; `--strict` also exits
   8 on `warn` or `unknown`. Exit 8 is a **success-path** exit — the HTTP call returned
   200 carrying an unhealthy verdict — so the full report prints first, and a transport or
@@ -973,6 +977,14 @@ uzi run recovery <run-id> [--json]
   the same information as `checkpoint_ref`, `checkpoint_tip`, and `checkpoint_state` on each
   hold. A hold with no retained checkpoint ref omits the line (and the `--json` fields are
   absent).
+
+- A hold with `terminal_record_rejection: "mac_failure"` also shows the fixed diagnostic:
+  “terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody”.
+  JSON preserves that field and adds the fixed text as `terminal_rejection`, alongside the
+  exact hold and generation. The diagnostic supplies no completion or replay authority and
+  does not change attention or export availability. Export still requires an independently
+  verified available capture. See [terminal record authentication failures](run-recovery.md#when-a-terminal-record-fails-authentication-after-restart)
+  for negotiated reporting, retained source, and positive custody cleanup after settlement.
 
 When a capture-less hold is genuinely not worth keeping, discard that one exact held
 source:
@@ -1388,14 +1400,93 @@ A newer release is available.
   and recommendations, with the same resolve/dismiss/undo triage described
   under [Reviewing and triaging from the CLI](#reviewing-and-triaging-from-the-cli).
 
+### Workers and the floor fleet summary
+
+Press `2` for the workers list. Rows put danger first, then warnings,
+information, and workers with no attention item; names break ties. Selection
+stays on the same worker when a refresh changes the order. `/` filters names
+case-insensitively. Blank lines separate the column header and selected-worker
+readout; at 120 columns the readout uses one clamped line, with separate items below
+120. Press `?` for the disk and state legend.
+
+At 80 columns the list shows name, state, kind, run occupancy, and attention.
+At 120 columns, including in split view, it adds CPU, memory (used/total when
+a limit is reported),
+worst disk reading (label, usage bar and percentage), version, and heartbeat
+age. Factory scope adds owner: `you` for your workers, otherwise the email
+local part. Versions expand to the longest filtered value, capped at 18 cells
+including an upgrade marker (`↑` outdated, `✕` failed). Offline resource
+readings are faint and marked `~` as stale.
+
+Floor and workers share a fleet summary on the title line's right edge:
+worker count, online count, slots in use, unknown capacities, holds, drains,
+cordons, and workers needing attention. It drops optional segments as space
+shrinks; when its shortest form cannot fit beside the title, it uses a separate
+line. Factory scope labels it `factory workers`. Occupancy is not spare
+capacity: holding, draining, and cordoned workers may not take new work.
+A `?` cap means unknown advertised slots. Only danger and warning items count
+as needing attention; a lease or lone chat is information. Disk percentages
+are visual cues; DinD and inode readings are display-only.
+
+Press `enter` or `→` on a worker to open its full-screen detail. Below the tab
+strip, `worker ›` introduces its name, state, and kind; faint uptime and
+heartbeat share that line when they fit, otherwise appear below. Unknown
+uptime and heartbeat values are omitted; offline workers with a heartbeat
+show its age.
+The lowercase sections are `attention`, `reported runs`, `resources`, and
+`configuration`. Attention explains upgrade failures, unpublished-work holds,
+outbox queues, and pending outcomes. Reported runs show issue/title and engine
+when cached, otherwise a short run ID, followed by worker phase, cached run
+stage, and claim generation. `enter` or `→` opens the selected reported run
+even when it is not cached; an invisible run shows `run not visible`.
+
+Resources show `?` for missing readings or a null limit; process samples cover
+only the worker process. Data, nix, and DinD use usage bars and percentages;
+reported inode percentages sit alongside them. Healthy readings use normal
+ink, 75–89% uses warning colour, and 90% or more uses alarm colour. Offline
+readings remain faint. DinD and inode readings are display-only. The largest
+reported HOME appears on one line with its sample age and `≥` for a truncated
+measurement (a lower bound). Configuration shows version and upgrade target,
+capabilities (`none` when empty), declared template and any reported drift,
+effective token mode,
+kind, and ephemeral lease. Reported runs do not establish an ephemeral
+worker's binding.
+
+In run detail, uppercase `W` opens the run's worker; lowercase `w` keeps its
+existing rework action. A run without a worker shows `no worker yet`.
+`esc` from a reported run returns to its worker, and `esc` or `←` from the worker
+returns to the original list or run. Cross-links retain one original return
+target, including its originating pane, rather than a navigation history.
+Returning to a run starts a fresh session: it fetches the current run and
+newest transcript tail, opens a new stream, then fills older history in the
+background. It does not restore loaded transcript state. The reported-run
+preflight fetch supplies the initial run DTO without a second initial fetch.
+Opening a PR from a run and returning also starts a fresh run session.
+
+At 120 columns floor rows include a faint worker cell; below 120 it is omitted.
+A missing name reads `no worker yet` on a non-terminal run and `—` on a
+completed, failed, or cancelled run. The floor run summary (cost, count, and
+visible row range) sits right-aligned with the account meters, or on its own
+line when space is insufficient.
+
+The floor summary, workers list and worker detail share one request chain,
+polling every 5s while any is visible, including an unfocused top pane.
+Failures back off to at most 60s and keep the last snapshot. Polling pauses
+in run, PR and CI run detail and help; returning fetches immediately.
+`r` refreshes immediately.
+On the floor or workers list, `a` toggles their shared own/factory scope.
+Factory scope needs a `uza_` admin token and adds owners and server-reported
+disk pressure; a denied request returns both views to your own scope.
+
 ### The forge screens: `pulls` and `ci`
 
-A tab strip in the header — `▚▚ uzi · floor  pulls  ci` — sits beside the
-board (labelled `floor` on screen) and adds two more top-level screens, both
+The tab strip reads `▚▚ uzi · floor  workers  pulls  ci`, without numeric
+key hints. `?` help still lists the `1`–`4` shortcuts.
+The two forge screens are both
 read straight through the API's stored forge connection PAT: no `gh`, no
 personal token, no leaving the terminal to see whether a PR went green.
-Without a split, `tab` cycles floor → pulls → ci → floor; `1`/`2`/`3`
-jump directly. Both forge lists scope to one repo at a time — `R` cycles
+In either layout, `tab` cycles floor → workers → pulls → ci → floor;
+`shift+tab` reverses the order and `1`–`4` jump directly. Both forge lists scope to one repo at a time — `R` cycles
 your enabled repos (hidden when only one is enabled), defaulting to the
 repo of your newest run — and `/` filters a list by title, branch, author,
 or workflow name.
@@ -1434,23 +1525,29 @@ view for that run's merge request, when it has one.
 
 With the default `auto` setting, a terminal at least 80 columns wide and
 tall enough shows the floor on top and the scoped repo's CI list below it.
-The header and footer are shared; a separator names the bottom tab and
-repo. The bracketed label (`[floor]`, `[ci]`, or `[pulls]`) shows which
-pane has focus. Both visible lists keep refreshing. Press `tab` to cycle
-floor → CI → pulls → floor, or `shift+tab` to cycle backwards. `ctrl+w`
-switches focus between the floor and the currently selected bottom tab;
-`1` focuses the floor, `2` opens pulls below, and `3` opens CI below.
-`esc` from the bottom focuses the floor. `R` cycles the scoped repo when
-the bottom pane has focus. Run, PR, and CI run detail still open full-screen;
-`esc` returns to the originating pane with its tab and selection.
+The top pane can show floor or workers; the bottom pane can show pulls or CI.
+The top title keeps `floor · workers` visible; the bottom separator keeps
+`pulls · ci` visible and names the repo. The fleet summary stays on the title
+line whichever top tab is selected. Account meters and the floor run summary
+appear only with floor on top. The footer is shared.
+The bracketed label (`[floor]`, `[workers]`, `[ci]`, or `[pulls]`)
+shows which pane has focus. Both visible lists keep refreshing. Press `tab`
+to cycle floor → workers → pulls → ci → floor, or `shift+tab` backwards.
+`ctrl+w` switches focus between the selected top and bottom tabs;
+`1`/`2` select floor/workers on top, and `3`/`4` select pulls/CI below.
+`esc` from the bottom focuses the selected top tab. `R` cycles the scoped repo when
+the bottom pane has focus. Run, worker, PR, and CI run detail open full-screen;
+`enter` or `→` on a top-pane worker opens its detail, and `esc` or `←` returns to the
+originating pane with its tab, selected worker and focus.
 
-Press `s` on a list to collapse the split to the full-screen floor for this
-session; press it again to restore the split when the terminal is large
-enough. A resize that makes the terminal too small also collapses to the
-floor. The bottom tab, cursor, filter, and repo are kept for the next
-split, while the floor takes focus after collapse. The split enters at
-42 rows (`minHeight + 2`) and leaves below 40 rows (`minHeight`), avoiding
-a layout flip on a one-row resize. The 40-row minimum is derived from the
+Press `s` on a list to collapse the split to its selected top tab (floor or
+workers) for this session; press it again to restore the split when the
+terminal is large enough. A resize that makes the terminal too small also
+collapses to that top tab. Both tabs, cursors, filters, and the scoped repo
+are kept for the next split, while the top tab takes focus after collapse.
+The split enters at 43 rows (`minHeight + 2`) and leaves below 41 rows
+(`minHeight`), avoiding a layout flip on a one-row resize. The 41-row minimum
+includes the fleet summary and is derived from the
 shared header, separator, footer, each pane's worst-case headings and
 spacers, and eight actual list rows per pane; the layout changes only on
 a resize. If the
@@ -1477,9 +1574,11 @@ The `off` setting also disables `s`. `uzi tui --demo` and
 j/k, ↑/↓     move within the focused pane (board: row · detail: between agents on the rail, or scroll the transcript)
 g            detail: follow live — re-attach and jump to the newest output (live runs only)
 c            detail: fold / unfold the crew list; it also folds by itself when MILESTONES/SPEND/ACCOUNTS would not fit
-enter        open the selected run (board)
-/            filter the board
-a            toggle the factory-wide admin board (board only)
+enter / →    open the selected run (board), worker (workers), or reported run (worker detail)
+←            worker detail: return to its originating list or run
+W            open the run's worker (run detail; lowercase w still reworks)
+/            filter the board or workers list
+a            toggle shared own/factory scope (board or workers; admin token required)
 h            hide finished runs — completed/failed/cancelled, keeps active + needs-you (board only; no-op on the admin board)
 r            refresh
 v            open/close the review overlay (detail)
@@ -1518,14 +1617,14 @@ plan gate gets, but `y`/`n` don't apply to it. Answer from another terminal
 with `uzi run answer <id>` (see [Commands](#commands)), from the web run
 view, or from Slack; the TUI picks the change up on its next refresh.
 
-The `pulls`, `ci`, and their two drill-ins (PR view, CI run view) share a
-second set of bindings:
+The list screens and forge drill-ins (PR view, CI run view) use these
+navigation bindings:
 
 ```
-tab          unsplit: floor → pulls → ci → floor; split: floor → ci → pulls → floor
-shift+tab    split: cycle backwards through floor, ci, pulls
-ctrl+w       split: switch focus between floor and the selected bottom tab
-1 / 2 / 3    focus floor / pulls / ci
+tab          floor → workers → pulls → ci → floor (both layouts)
+shift+tab    cycle backwards through the same list order
+ctrl+w       split: switch focus between the selected top and bottom tabs
+1 / 2 / 3 / 4  focus floor / workers / pulls / ci
 s            collapse or restore the split for this session (list screens)
 R            cycle the scoped repo (forge list focused; hidden with one enabled repo)
 enter / →    open the selected row (pulls → PR view · ci → CI run view)

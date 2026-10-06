@@ -47,7 +47,7 @@ export function HealthDangerBanner({ now = Date.now }: { now?: () => number } = 
   // time (D2). forceRender's value is unused — bumping it to force the re-render is the point.
   const [, forceRender] = useState(0);
   useEffect(() => {
-    if (!doc || doc.status !== "danger") return;
+    if (!doc || !healthVerdict(doc).blocking) return;
     const server = doc.snoozed_until != null ? Date.parse(doc.snoozed_until) : 0;
     const local = optimistic != null && optimistic.episode === doc.episode_id ? optimistic.until : 0;
     const delay = Math.max(server, local) - now();
@@ -56,9 +56,9 @@ export function HealthDangerBanner({ now = Date.now }: { now?: () => number } = 
     return () => clearTimeout(timer);
   }, [doc, optimistic, now]);
 
-  // null doc = a non-admin (no fetch) or before the first load. Follow `status` so the banner
-  // appears the moment the instance crosses into danger.
-  if (!doc || doc.status !== "danger") return null;
+  // null doc = a non-admin (no fetch) or before the first load. The shared verdict
+  // selects instance blockers, with conservative fallback for older servers.
+  if (!doc || !healthVerdict(doc).blocking) return null;
 
   const nowMs = now();
   // The caller's own server-confirmed snooze for the current episode (0 when absent), and the
@@ -70,10 +70,10 @@ export function HealthDangerBanner({ now = Date.now }: { now?: () => number } = 
   const effectiveSnoozedUntil = Math.max(serverUntil, localUntil);
   if (effectiveSnoozedUntil > nowMs) return null;
 
-  const verdict = healthVerdict(doc.status, doc.counts);
-  // The cause line is the worst check's own server-authored summary (danger sorts first). It
-  // is never free text: the server composes every summary from a fixed template plus numbers.
-  const topDanger = doc.checks.find((c) => c.severity === "danger");
+  const verdict = healthVerdict(doc);
+  // The shared verdict selects the first instance danger, or the first danger on the
+  // legacy contract. Its summary is server-authored and rendered as React text.
+  const topDanger = verdict.cause;
 
   const snooze = async () => {
     setSnoozing(true);

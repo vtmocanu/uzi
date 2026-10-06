@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/slacksvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -457,7 +458,7 @@ func (f *fakeEpisodeSettings) PublicBaseURL(context.Context) (string, error) {
 // admins are configured, so the danger-and-already-open path reaches notifyAdmins but sends
 // nothing. The M6 notice tests build the reconciler directly to drive the fan-out.
 func newEpisodeReconciler(status string, st *fakeEpisodeStore) *EpisodeReconciler {
-	r := NewEpisodeReconciler(fakeEvaluator{doc: Doc{Status: status}}, st, &fakeEpisodeNotifier{}, &fakeEpisodeSettings{enabled: true}, nil)
+	r := NewEpisodeReconciler(fakeEvaluator{doc: noticeDoc(status, []apitypes.HealthCheckDTO{{ID: "db", Scope: "instance", Severity: status}})}, st, &fakeEpisodeNotifier{}, &fakeEpisodeSettings{enabled: true}, nil)
 	r.now = func() time.Time { return fixedNow }
 	return r
 }

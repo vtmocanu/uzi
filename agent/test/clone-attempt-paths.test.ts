@@ -398,6 +398,8 @@ function transientFactory(onRun: (ctx: RunContext) => void = () => {}): { factor
 
 // ─── P-seed ────────────────────────────────────────────────────────────────────────────────
 
+const LINUX_ONLY = process.platform !== "linux" ? "requires Linux runner process-proof and attributed-reap semantics" : false;
+
 describe("issue #1783 M2 P-seed: a wired worker seeds <key>.attempt-<id>, an unwired one the canonical path", () => {
   it("wired: the clone, the marker, the journal and the ledger carry one attempt id", async () => {
     const iid = 2001;
@@ -763,7 +765,7 @@ describe("issue #1783 hermetic: an unreadable_unattributed process on a fake pro
     return withQuiescenceView({ procRoot: root }, fn, FILE_VIEW).finally(() => fs.rmSync(root, { recursive: true, force: true }));
   }
 
-  it("capture: the predecessor capture is refused (worker_residue_blocked); journal, ledger and path untouched", async () => {
+  it("capture: the predecessor capture is refused (worker_residue_blocked); journal, ledger and path untouched", { skip: LINUX_ONLY }, async () => {
     const iid = 2041;
     const runId = randomUUID();
     const pred = await seedPredecessor(iid, runId, { attempt: true });
@@ -797,7 +799,7 @@ describe("issue #1783 hermetic: an unreadable_unattributed process on a fake pro
     assert.equal(trackingHas(iid, "ONLY_COPY.txt"), true, "the predecessor's work was fetched back");
   });
 
-  it("seed + terminal retire: the fresh attempt seeds (N6), but the retire keeps the clone and the ledger entry live", async () => {
+  it("seed + terminal retire: the fresh attempt seeds (N6), but the retire keeps the clone and the ledger entry live", { skip: LINUX_ONLY }, async () => {
     const iid = 2043;
     let worktree = "";
     const { factory, started } = transientFactory((ctx) => {

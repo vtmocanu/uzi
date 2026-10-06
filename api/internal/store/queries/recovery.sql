@@ -601,6 +601,7 @@ SELECT
     h.updated_at,
     h.released_at,
     h.original_worker_id,
+    h.terminal_record_rejection,
     COALESCE(w.name, '')::text AS worker_name,
     (EXISTS (SELECT 1 FROM recovery_captures c
         WHERE c.hold_id = h.id AND c.state = 'available'))::boolean AS has_available_capture,
@@ -760,3 +761,38 @@ SELECT n.user_id
 FROM custody_episode_notices n
 WHERE (SELECT count(*) FROM recovery_custody_holds h
        WHERE h.user_id = n.user_id AND h.state = 'open') < @custody_hold_limit::int;
+
+-- name: LockTerminalRejectionHolds :many
+SELECT id FROM recovery_custody_holds
+WHERE user_id = @user_id AND original_worker_id = @worker_id
+  AND run_id = @run_id AND generation = @generation AND state = 'open'
+ORDER BY id FOR UPDATE;
+
+-- name: AnnotateTerminalRejectionHold :exec
+UPDATE recovery_custody_holds SET terminal_record_rejection = 'mac_failure', updated_at = now()
+WHERE id = @id AND terminal_record_rejection IS DISTINCT FROM 'mac_failure';
+
+-- name: RetroTerminalRejectionReason :exec
+UPDATE runs SET failure_reason = 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody'
+WHERE id = @run_id AND user_id = @user_id AND worker_id = @worker_id
+  AND claim_generation = @generation AND status = 'failed' AND fail_origin = 'worker_lost'
+  AND failure_reason IS DISTINCT FROM 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody';
+
+-- name: TerminalRejectionCustodySnapshot :one
+WITH scoped AS MATERIALIZED (
+    SELECT id, generation, state FROM recovery_custody_holds
+    WHERE user_id = @user_id AND original_worker_id = @worker_id AND run_id = @run_id
+), exact AS MATERIALIZED (
+    SELECT * FROM scoped WHERE generation = @generation
+), siblings AS MATERIALIZED (
+    SELECT * FROM scoped WHERE generation <> @generation AND state = 'open'
+)
+SELECT
+    (SELECT count(*) FROM exact)::bigint AS exact_count,
+    (SELECT count(*) FROM siblings)::bigint AS sibling_count,
+    (SELECT count(*) FROM exact WHERE state = 'open')::bigint AS open_count,
+    (SELECT count(*) FROM exact WHERE state NOT IN ('released', 'discarded'))::bigint AS unsettled_count,
+    COALESCE((SELECT jsonb_agg(jsonb_build_object('id', id, 'state', state) ORDER BY id)
+      FROM (SELECT * FROM exact ORDER BY id LIMIT 256) limited), '[]'::jsonb)::jsonb AS exact_holds,
+    COALESCE((SELECT jsonb_agg(jsonb_build_object('id', id, 'generation', generation) ORDER BY id)
+      FROM (SELECT * FROM siblings ORDER BY id LIMIT 256) limited), '[]'::jsonb)::jsonb AS sibling_holds;

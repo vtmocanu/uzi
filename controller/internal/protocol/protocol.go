@@ -81,7 +81,9 @@ type DesiredWorker struct {
 	// and /data volumes (teardown + reprovision), unless the worker is Ephemeral or a
 	// just-recycled worker is still within the recycle cooldown. Mirrors the api's
 	// hostedsvc.DesiredWorker.DiskPressure; the shared golden pins the two in lockstep.
-	DiskPressure bool `json:"disk_pressure"`
+	DiskPressure        bool             `json:"disk_pressure"`
+	DiskPressureVolumes []string         `json:"disk_pressure_volumes"`
+	DindMaintenance     *DindMaintenance `json:"dind_maintenance,omitempty"`
 	// Ephemeral is true for a run-bound worker whose lifetime is a single run (PRD #837
 	// M4). Such a worker is EXCLUDED from every disk recycle arm: recycling volumes out
 	// from under a run-bound worker would be pointless churn — the worker is torn down
@@ -189,4 +191,17 @@ type WorkerStatus struct {
 	BlockingReason    *string `json:"blocking_reason"`
 	RestartCount      int32   `json:"restart_count"`
 	LastExitCode      *int32  `json:"last_exit_code"`
+}
+
+// DindMaintenance binds controller transitions to one operation and incarnation.
+type DindMaintenance struct {
+	ID            string `json:"id"`
+	Nonce         string `json:"nonce"`
+	Phase         string `json:"phase"`
+	DeploymentUID string `json:"deployment_uid"`
+	PVCUID        string `json:"pvc_uid"`
+	RegisterNonce string `json:"register_nonce"`
+	Fenced        bool   `json:"fenced"`
+	ReadyACK      bool   `json:"ready_ack"`
+	Reason        string `json:"reason,omitempty"`
 }

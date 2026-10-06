@@ -31,21 +31,20 @@ const (
 	keyHome         = "home"
 	keyEnd          = "end"
 	keySpaceName    = "space" // v2 names the space key "space", never " "
-	// Forge-view navigation (PRD #1255 D1). tab cycles the list screens (floor → pulls →
-	// ci → floor; ci lands in M4b, so for now it cycles floor ↔ pulls); 1/2/3 jump directly;
-	// R cycles the scoped repo. R is shift+r (distinct from r = refresh) so it does not
-	// collide with the board/list refresh key.
-	keyViewFloor = "1"
-	keyViewPulls = "2"
-	keyViewCI    = "3"
-	keyRepoCycle = "R"
+	// Tab and shift+tab cycle floor, workers, pulls, ci in both layouts.
+	keyViewFloor   = "1"
+	keyViewWorkers = "2"
+	keyViewPulls   = "3"
+	keyViewCI      = "4"
+	keyRepoCycle   = "R"
 	// Forge actions (PRD #1255 M5, D1/D12), bound on BOTH the pulls list row and the PR drill-in:
 	// u opens the PR's linked uzi run in the run view, w reworks that run, f queues a CI-fix run
 	// for the PR's head branch. keyPRView (m) is the run view → PR view cross-link.
-	keyRunLink = "u"
-	keyRework  = "w"
-	keyFixCI   = "f"
-	keyPRView  = "m"
+	keyRunLink    = "u"
+	keyRework     = "w"
+	keyFixCI      = "f"
+	keyPRView     = "m"
+	keyWorkerView = "W"
 )
 
 // keyString normalizes a v2 key press to the string form the switches below compare
@@ -93,24 +92,39 @@ func helpLines(v tuiView) []string {
 			"tab        cycle the focused pane",
 			"↑ / ↓      move within the focused pane (agents · scroll)",
 			"g          follow live: re-attach and jump to newest (live runs)",
-			"c          fold / unfold the crew list (folds by itself when the blocks below would not fit)",
+			"c          fold / unfold crew (auto-folds when blocks below do not fit)",
+			"W          open this run's worker",
 			"m          open the PR view for this run's merge request (when it has one)",
 		}, common...)
+	case viewWorker:
+		return []string{"j / ↓      select reported run", "k / ↑      select reported run", "pgup/pgdn  scroll worker detail", "enter / →  open reported run", "esc / ←    back to origin", "r          refresh workers", "?          this help", "q          quit"}
+	case viewWorkers:
+		return append(append([]string{
+			"enter / →  open selected worker",
+			"a          toggle your workers / factory workers (admin token)",
+			"tab / shift+tab  floor · workers · pulls · ci",
+			"1 / 2 / 3 / 4  floor / workers / pulls / ci",
+			"runs       occupancy / advertised slots; ? = unknown cap (chat excluded)",
+			"disk ≥90%  fixed visual cue; dind and inodes are display-only",
+			"~          stale, last-known resources (also dimmed)",
+			"✕ danger · ▲/state glyph warn · · info; danger/warn need attention",
+			"↑ version outdated · ✕ upgrade failed",
+		}, common[:2]...), common[3:]...)
 	case viewPulls:
 		return append([]string{
 			"enter / →  open the selected PR (checks · reviews · merge)",
 			"u          open the PR's linked uzi run (when one exists)",
 			"w          rework the linked run",
 			"f          fix ci: queue a CI-fix run for the PR's branch",
-			"tab        switch screen (floor · pulls · ci)",
-			"1 / 2 / 3  jump to the floor / pulls / ci",
+			"tab / shift+tab  floor · workers · pulls · ci",
+			"1 / 2 / 3 / 4  floor / workers / pulls / ci",
 			"R          cycle the scoped repo (when several are enabled)",
 		}, common...)
 	case viewCI:
 		return append([]string{
 			"enter / →  open the selected run's jobs (jobs · steps)",
-			"tab        switch screen (floor · pulls · ci)",
-			"1 / 2 / 3  jump to the floor / pulls / ci",
+			"tab / shift+tab  floor · workers · pulls · ci",
+			"1 / 2 / 3 / 4  floor / workers / pulls / ci",
 			"R          cycle the scoped repo (when several are enabled)",
 		}, common...)
 	case viewPR:
@@ -132,9 +146,10 @@ func helpLines(v tuiView) []string {
 	default:
 		return append([]string{
 			"a          toggle the factory-wide admin board (needs a uza_ token)",
-			"h          hide finished runs (completed/failed/cancelled); keeps active + needs-you",
+			"h          hide finished runs; keep active and needs-you",
 			"+ after 7d cost means subscription/unreported costs excluded",
-			"tab        switch screen (floor · pulls · ci)",
+			"tab / shift+tab  floor · workers · pulls · ci",
+			"1 / 2 / 3 / 4  floor / workers / pulls / ci",
 		}, common...)
 	}
 }

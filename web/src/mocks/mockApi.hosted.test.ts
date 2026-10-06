@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 
 // Each test gets a fresh mockApi module so the in-memory fleet starts from seed.
 async function fresh() {
@@ -27,7 +27,7 @@ describe("mockApi hosted workers (PRD #58 M5)", () => {
     // so the mock is the only place M5 can be seen at all.
     const api = await fresh();
     await api.login("vlad@uzi.local", "x");
-    expect(await api.hostedConfig()).toEqual({ enabled: true, quota: 5, ephemeral_enabled: true });
+    expect(await api.hostedConfig()).toEqual({ enabled: true, quota: 5, ephemeral_enabled: true, docker_enabled: true });
   });
 
   it("puts the at-quota journey three clicks away: four seeded hosted workers of five", async () => {
@@ -99,5 +99,141 @@ describe("mockApi hosted workers (PRD #58 M5)", () => {
     expect(res.worker.kind).toBe("external");
     expect(res.worker.hosted_size).toBeNull();
     expect(res.token).toMatch(/^uzi_wk_/);
+  });
+});
+
+
+describe("mockApi ephemeral preferences partial updates", () => {
+  const key = "uzi.mock.v4";
+
+  beforeEach(() => {
+    const values = new Map<string, string>();
+    vi.stubGlobal("localStorage", {
+      getItem: (k: string) => values.get(k) ?? null,
+      setItem: (k: string, value: string) => void values.set(k, value),
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("restores both preferences in the default session and backing users after hard reloads", async () => {
+    let api = await fresh();
+    const admin = (await api.me()).user;
+    await api.setEphemeralWorkersEnabled({ docker: true });
+    api = await fresh();
+    expect((await api.me()).user).toMatchObject({ id: admin.id, ephemeral_workers_enabled: false, ephemeral_docker_enabled: true });
+    await api.logout();
+    expect((await api.login("vlad@uzi.local", "x")).user).toMatchObject({ ephemeral_workers_enabled: false, ephemeral_docker_enabled: true });
+    await api.setEphemeralWorkersEnabled(true);
+    await api.putMySettings({ theme: "mission" });
+    api = await fresh();
+    expect((await api.me()).user).toMatchObject({ ephemeral_workers_enabled: true, ephemeral_docker_enabled: true });
+    expect((await api.getMySettings()).settings.theme).toBe("mission");
+    await api.setEphemeralWorkersEnabled({ enabled: false, docker: false });
+    api = await fresh();
+    expect((await api.me()).user).toMatchObject({ ephemeral_workers_enabled: false, ephemeral_docker_enabled: false });
+  });
+
+  it("retains isolated preferences for another user through settings writes and reloads", async () => {
+    let api = await fresh();
+    const admin = (await api.setEphemeralWorkersEnabled({ docker: true })).user;
+    await api.logout();
+    const other = (await api.login("mira@uzi.local", "x")).user;
+    expect(other).toMatchObject({ ephemeral_workers_enabled: false, ephemeral_docker_enabled: false });
+    await api.setEphemeralWorkersEnabled({ enabled: true, docker: false });
+    await api.updateSettings({ ephemeral_workers_enabled: "true" });
+    api = await fresh();
+    expect((await api.me()).user).toMatchObject({ id: admin.id, ephemeral_workers_enabled: false, ephemeral_docker_enabled: true });
+    await api.logout();
+    expect((await api.login("mira@uzi.local", "x")).user).toMatchObject({ id: other.id, ephemeral_workers_enabled: true, ephemeral_docker_enabled: false });
+    const blob = JSON.parse(localStorage.getItem(key)!);
+    expect(blob.ephemeralPreferences).toEqual({
+      [admin.id]: { ephemeral_workers_enabled: false, ephemeral_docker_enabled: true },
+      [other.id]: { ephemeral_workers_enabled: true, ephemeral_docker_enabled: false },
+    });
+  });
+
+  it("rejects tierless writes before changing storage or either preference", async () => {
+    let api = await fresh();
+    await api.setEphemeralWorkersEnabled({ enabled: false, docker: false });
+    const before = localStorage.getItem(key);
+    const { workersApi } = await import("./mockApi/workers");
+    const config = vi.spyOn(workersApi, "hostedConfig").mockResolvedValue({ enabled: true, quota: 5, ephemeral_enabled: true, docker_enabled: false });
+    try {
+      await expect(api.setEphemeralWorkersEnabled({ enabled: true, docker: true })).rejects.toMatchObject({ status: 409 });
+      expect(localStorage.getItem(key)).toBe(before);
+      expect((await api.me()).user).toMatchObject({ ephemeral_workers_enabled: false, ephemeral_docker_enabled: false });
+    } finally {
+      config.mockRestore();
+    }
+    api = await fresh();
+    expect((await api.me()).user).toMatchObject({ ephemeral_workers_enabled: false, ephemeral_docker_enabled: false });
+  });
+
+  it.each([[undefined], [null], [[]], ["invalid"], [{ malformed: true }]])("accepts old blobs and fails closed on malformed preference maps: %j", async (prefs) => {
+    let api = await fresh();
+    const admin = (await api.me()).user;
+    await api.putMySettings({ theme: "mission" });
+    const blob = JSON.parse(localStorage.getItem(key)!);
+    blob.ephemeralPreferences = prefs;
+    localStorage.setItem(key, JSON.stringify(blob));
+    api = await fresh();
+    expect((await api.getMySettings()).settings.theme).toBe("mission");
+    expect((await api.me()).user).toMatchObject({ id: admin.id, ephemeral_workers_enabled: false, ephemeral_docker_enabled: false });
+  });
+
+  it("rejects malformed preference pairs without trusting extra identity fields", async () => {
+    let api = await fresh();
+    const admin = (await api.me()).user;
+    await api.putMySettings({ theme: "mission" });
+    const blob = JSON.parse(localStorage.getItem(key)!);
+    blob.ephemeralPreferences = { [admin.id]: { ephemeral_workers_enabled: true, ephemeral_docker_enabled: "true", is_admin: false } };
+    localStorage.setItem(key, JSON.stringify(blob));
+    api = await fresh();
+    expect((await api.me()).user).toMatchObject({ is_admin: true, ephemeral_workers_enabled: false, ephemeral_docker_enabled: false });
+    blob.ephemeralPreferences[admin.id] = { ephemeral_workers_enabled: true, ephemeral_docker_enabled: true, is_admin: false };
+    localStorage.setItem(key, JSON.stringify(blob));
+    api = await fresh();
+    expect((await api.me()).user).toMatchObject({ is_admin: true, ephemeral_workers_enabled: true, ephemeral_docker_enabled: true });
+    await api.setEphemeralWorkersEnabled({});
+    expect(JSON.parse(localStorage.getItem(key)!).ephemeralPreferences[admin.id]).toEqual({ ephemeral_workers_enabled: true, ephemeral_docker_enabled: true });
+  });
+
+  it("preserves omitted fields, supports both/neither, and retains Docker with auto-provision off across login", async () => {
+    const api = await fresh();
+    await api.login("vlad@uzi.local", "x");
+    const prefs = (u: { ephemeral_workers_enabled: boolean; ephemeral_docker_enabled: boolean }) =>
+      [u.ephemeral_workers_enabled, u.ephemeral_docker_enabled];
+    expect(prefs((await api.setEphemeralWorkersEnabled({ enabled: true, docker: true })).user)).toEqual([true, true]);
+    expect(prefs((await api.setEphemeralWorkersEnabled(false)).user)).toEqual([false, true]);
+    expect(prefs((await api.setEphemeralWorkersEnabled({})).user)).toEqual([false, true]);
+    expect(prefs((await api.setEphemeralWorkersEnabled({ docker: false })).user)).toEqual([false, false]);
+    await api.setEphemeralWorkersEnabled({ docker: true });
+    expect(prefs((await api.me()).user)).toEqual([false, true]);
+    await api.logout();
+    expect(prefs((await api.login("vlad@uzi.local", "x")).user)).toEqual([false, true]);
+    // Another user's backing record must be unchanged.
+    await api.logout();
+    expect(prefs((await api.login("mira@uzi.local", "x")).user)).toEqual([false, false]);
+  });
+
+  it("refuses tierless Docker atomically, including backing user; disabling remains allowed", async () => {
+    const api = await fresh();
+    const { workersApi } = await import("./mockApi/workers");
+    await api.login("vlad@uzi.local", "x");
+    await api.setEphemeralWorkersEnabled({ docker: true });
+    const config = vi.spyOn(workersApi, "hostedConfig").mockResolvedValue({ enabled: true, quota: 5, ephemeral_enabled: true, docker_enabled: false });
+    try {
+      await expect(api.setEphemeralWorkersEnabled({ enabled: true, docker: true })).rejects.toMatchObject({ status: 409 });
+      expect((await api.me()).user).toMatchObject({ ephemeral_workers_enabled: false, ephemeral_docker_enabled: true });
+      await api.logout();
+      expect((await api.login("vlad@uzi.local", "x")).user).toMatchObject({ ephemeral_workers_enabled: false, ephemeral_docker_enabled: true });
+      expect((await api.setEphemeralWorkersEnabled({ docker: false })).user).toMatchObject({ ephemeral_workers_enabled: false, ephemeral_docker_enabled: false });
+      expect((await api.setEphemeralWorkersEnabled(true)).user).toMatchObject({ ephemeral_workers_enabled: true, ephemeral_docker_enabled: false });
+    } finally {
+      config.mockRestore();
+    }
   });
 });

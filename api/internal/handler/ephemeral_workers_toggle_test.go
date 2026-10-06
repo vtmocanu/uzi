@@ -11,12 +11,14 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/config"
 
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// fakeEphemeralUserDB is a store.DBTX that answers SetUserEphemeralWorkersEnabled from
+// fakeEphemeralUserDB is a store.DBTX that answers SetUserEphemeralWorkerPreferences from
 // memory, capturing the id + flag the handler passed so a test can assert WHICH id the
 // toggle acted on (session vs body). It echoes the captured values back as the
 // RETURNING row.
@@ -24,6 +26,7 @@ type fakeEphemeralUserDB struct {
 	gotID        uuid.UUID
 	gotEphemeral bool
 	called       bool
+	gotDocker    bool
 }
 
 func (f *fakeEphemeralUserDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
@@ -35,22 +38,20 @@ func (f *fakeEphemeralUserDB) Query(context.Context, string, ...any) (pgx.Rows, 
 func (f *fakeEphemeralUserDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
 	if strings.Contains(sql, "UPDATE users SET ephemeral_workers_enabled") {
 		f.called = true
-		if id, ok := args[0].(uuid.UUID); ok {
-			f.gotID = id
+		f.gotID = args[2].(uuid.UUID)
+		if b := args[0].(pgtype.Bool); b.Valid {
+			f.gotEphemeral = b.Bool
 		}
-		if b, ok := args[1].(bool); ok {
-			f.gotEphemeral = b
+		if b := args[1].(pgtype.Bool); b.Valid {
+			f.gotDocker = b.Bool
 		}
-		return fakeScanRow{scanEphemeralUserRow(f.gotID, f.gotEphemeral)}
+		return fakeScanRow{scanEphemeralUserRow(f.gotID, f.gotEphemeral, f.gotDocker)}
 	}
 	return fakeScanRow{func(...any) error { return pgx.ErrNoRows }}
 }
 
-// scanEphemeralUserRow fills only the id + ephemeral_workers_enabled columns of the
-// RETURNING row (the 1st and the 26th/last — see setUserEphemeralWorkersEnabled in
-// users.sql.go); the rest keep their zero values, which is all the toggle response
-// needs.
-func scanEphemeralUserRow(id uuid.UUID, ephemeral bool) func(dest ...any) error {
+// scanEphemeralUserRow follows the projection in users.sql.go.
+func scanEphemeralUserRow(id uuid.UUID, ephemeral, docker bool) func(dest ...any) error {
 	return func(dest ...any) error {
 		if p, ok := dest[0].(*uuid.UUID); ok {
 			*p = id
@@ -60,6 +61,7 @@ func scanEphemeralUserRow(id uuid.UUID, ephemeral bool) func(dest ...any) error 
 				*p = ephemeral
 			}
 		}
+		*dest[42].(*bool) = docker
 		return nil
 	}
 }
@@ -90,7 +92,7 @@ func TestSetEphemeralWorkersEnabledUsesSession(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 	if !db.called {
-		t.Fatal("SetUserEphemeralWorkersEnabled was not called")
+		t.Fatal("SetUserEphemeralWorkerPreferences was not called")
 	}
 	if db.gotID != sessionID {
 		t.Errorf("toggle acted on id %v, want the SESSION id %v", db.gotID, sessionID)
@@ -150,5 +152,53 @@ func TestSetEphemeralWorkersEnabledRequiresSession(t *testing.T) {
 	}
 	if db.called {
 		t.Fatal("the toggle must not run without a session user")
+	}
+}
+
+func TestEphemeralPreferencesPartialBodies(t *testing.T) {
+	for _, tc := range []struct {
+		name, body                     string
+		hosting, tier, enabled, docker bool
+		status                         int
+	}{
+		{"enabled only", `{"enabled":false}`, true, true, false, true, 200},
+		{"docker only", `{"docker":false}`, true, true, true, false, 200},
+		{"both", `{"enabled":false,"docker":false}`, true, true, false, false, 200},
+		{"neither", `{}`, true, true, true, true, 200},
+		{"empty", ``, true, true, true, true, 200},
+		{"denied combined", `{"enabled":false,"docker":true}`, true, false, true, true, 409},
+		{"hosting unavailable", `{"docker":true}`, false, true, true, true, 409},
+		{"disable unavailable", `{"docker":false}`, false, false, true, false, 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := uuid.New()
+			db := &fakeEphemeralUserDB{gotEphemeral: true, gotDocker: true}
+			h := &Handler{q: store.New(db), cfg: config.Config{WorkerHostingEnabled: tc.hosting, WorkerDockerEnabled: tc.tier}}
+			req := userReq(http.MethodPut, "/api/me/ephemeral-workers", tc.body, id, nil)
+			rec := httptest.NewRecorder()
+			h.SetEphemeralWorkersEnabled(rec, req)
+			if rec.Code != tc.status {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if db.called != (tc.status == 200) {
+				t.Fatalf("SQL called=%v", db.called)
+			}
+			if db.gotEphemeral != tc.enabled || db.gotDocker != tc.docker {
+				t.Fatalf("preferences=%v/%v", db.gotEphemeral, db.gotDocker)
+			}
+			if tc.status == 200 {
+				var out struct {
+					User struct {
+						Docker bool `json:"ephemeral_docker_enabled"`
+					} `json:"user"`
+				}
+				if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+					t.Fatal(err)
+				}
+				if out.User.Docker != tc.docker {
+					t.Fatalf("DTO docker=%v", out.User.Docker)
+				}
+			}
+		})
 	}
 }

@@ -150,7 +150,7 @@ func TestRecoveryHoldsDecodes(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"aggregate":{"open_holds":2,"custody_hold_limit":8,"decision_needed":1,"blocked_runs":0},` +
 			`"holds":[{"id":"h1","run_id":"r1","generation":1,"state":"open","attention":"source_only",` +
-			`"worker_id":"w1","worker_name":"alpha","has_available_capture":false,` +
+			`"worker_id":"w1","worker_name":"alpha","has_available_capture":false,"terminal_record_rejection":"mac_failure",` +
 			`"created_at":"2026-09-13T00:00:00Z","updated_at":"2026-09-13T00:00:00Z"}]}`))
 	}))
 	defer srv.Close()
@@ -168,7 +168,7 @@ func TestRecoveryHoldsDecodes(t *testing.T) {
 	if got.Aggregate.OpenHolds != 2 || got.Aggregate.CustodyHoldLimit != 8 || got.Aggregate.DecisionNeeded != 1 {
 		t.Errorf("aggregate = %+v, want open 2 / limit 8 / decision 1", got.Aggregate)
 	}
-	if len(got.Holds) != 1 || got.Holds[0].ID != "h1" || got.Holds[0].Attention != "source_only" {
+	if len(got.Holds) != 1 || got.Holds[0].ID != "h1" || got.Holds[0].Attention != "source_only" || got.Holds[0].TerminalRecordRejection != "mac_failure" {
 		t.Errorf("holds = %+v, want the single source_only hold h1", got.Holds)
 	}
 }

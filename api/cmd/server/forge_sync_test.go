@@ -83,8 +83,8 @@ func (s *wiringStore) ListLargestRunDiskForWorkers(context.Context, store.ListLa
 func (s *wiringStore) ListOwnersWaitingNoCapacity(context.Context, store.ListOwnersWaitingNoCapacityParams) ([]store.ListOwnersWaitingNoCapacityRow, error) {
 	return nil, nil
 }
-func (s *wiringStore) OldestWaitingWorkerRun(context.Context) (pgtype.Timestamptz, error) {
-	return pgtype.Timestamptz{}, nil
+func (s *wiringStore) ListWaitingWorkerRuns(context.Context) ([]store.ListWaitingWorkerRunsRow, error) {
+	return nil, nil
 }
 func (s *wiringStore) OldestUndispatchedTaskRun(context.Context) (pgtype.Timestamptz, error) {
 	return pgtype.Timestamptz{}, nil

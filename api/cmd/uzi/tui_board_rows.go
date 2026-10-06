@@ -313,10 +313,19 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	if mc.fullW > 0 {
 		markerAllow = mc.fullW + 2
 	}
-	avail := m.width - boardRowPrefixWidth(m.board.admin, m.boardShowMile(), showCred, m.boardShowCost()) - markerAllow
-	if avail < 10 {
-		avail = 10
+	// The outer list field shadows RunDTO.WorkerName; project it explicitly.
+	text := struct{ runWorkerName string }{runWorkerName: "no worker yet"}
+	if r.WorkerName != nil {
+		text.runWorkerName = *r.WorkerName
+	} else if terminalRunStatuses[r.Status] {
+		text.runWorkerName = "—"
 	}
+	workerWidth := 0
+	if m.width >= 120 {
+		workerWidth = 18 // two spaces and a fixed 16-column worker cell
+	}
+	contentWidth := m.width - workerWidth
+	avail := max(0, contentWidth-visualWidth(row)-markerAllow)
 	if avail > boardTitleMax {
 		avail = boardTitleMax
 	}
@@ -329,21 +338,23 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 		styledIID := paintSeg(idC, bg, sel, "#"+itoa(int(*r.IssueIID)))
 		titlePrefix = m.issueLink(r.RunDTO, styledIID) + paintSeg(nil, bg, false, " ")
 		avail -= visualWidth(titlePrefix)
-		if avail < 10 {
-			avail = 10
-		}
+		avail = max(0, avail)
 	}
 	row += titlePrefix + paintSeg(titleC, bg, false, clampVisual(m.renderer.Plain(runTitle(r.RunDTO), avail), avail))
 
 	// Judge marker (own board only; AdminListRuns carries no JudgeVerdict), flushed to the right
 	// edge so the ⚖ icon and count align down the board.
 	if mc.fullW > 0 && !m.board.admin && r.JudgeVerdict != nil {
-		row = padSeg(row, m.width-mc.fullW, bg) + m.verdictMarker(*r.JudgeVerdict, r.JudgeTodoCount, mc.verdictW, mc.countW, bg)
+		row = padSeg(clampVisual(row, contentWidth-mc.fullW), contentWidth-mc.fullW, bg) + m.verdictMarker(*r.JudgeVerdict, r.JudgeTodoCount, mc.verdictW, mc.countW, bg)
 	} else if sel {
 		// Keep the warm selection bar spanning the full width even with no trailing marker.
-		row = padSeg(row, m.width, bg)
+		row = padSeg(clampVisual(row, contentWidth), contentWidth, bg)
 	}
-	return row
+	if workerWidth > 0 {
+		row = padSeg(clampVisual(row, contentWidth), contentWidth, bg) + gap +
+			paintSeg(m.pal.faintC, bg, false, padCell(m.renderer.Plain(text.runWorkerName, 16), 16))
+	}
+	return clampVisual(row, m.width)
 }
 
 // boardCredSeg renders the run's snapshotted credential label. A run with no recorded
@@ -393,15 +404,12 @@ func (m tuiModel) boardCostSeg(r apitypes.RunListItemDTO, bg color.Color) string
 	return paintSeg(m.pal.faintC, bg, false, s)
 }
 
-// boardRowPrefixWidth is the visual width of every column before TITLE, so the title can be
-// sized to what remains. cursor(1)+strip(1)+glyph(1)+space(1)+id, then two-space gaps around
-// the status-word and AGE cells, the micro-bar cell when shown, the credential cell when
+// boardRowPrefixWidth measures the fixed prefix without the milestone micro-bar
+// for column visibility thresholds. cursor(1)+strip(1)+glyph(1)+space(1)+id, then two-space gaps around
+// the status-word and AGE cells, the credential cell when
 // shown, the cost cell when shown, plus the admin owner cell.
-func boardRowPrefixWidth(admin, mile, cred, cost bool) int {
+func boardRowPrefixWidth(admin, cred, cost bool) int {
 	w := 4 + boardIDWidth + 2 + boardStatusWordWidth + 2 + boardAgeWidth + 2
-	if mile {
-		w += boardMileWidth + 2
-	}
 	if cred {
 		w += boardCredWidth + 2
 	}

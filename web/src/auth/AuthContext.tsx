@@ -100,6 +100,8 @@ interface AuthState {
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
+  // Apply an authoritative current-user DTO returned by a successful settings save.
+  updateUser: (savedUser: User) => void;
   // serverUnreachable is true when the session probe failed for a reason other than
   // 401 (a 503 from a transient DB outage, or a network error), so the SPA does not
   // know whether the visitor is signed in. Route guards show a retry panel instead
@@ -118,6 +120,9 @@ const AuthContext = createContext<AuthState | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
+  // Track identity synchronously with every user write, including batched updates.
+  // A late settings save must be rejected before it invalidates a current probe.
+  const currentUserID = useRef<User["id"] | null>(null);
   const [loading, setLoading] = useState(true);
   const [uziLabel, setUziLabel] = useState(DEFAULT_UZI_LABEL);
   const [autopilotLabel, setAutopilotLabel] = useState(DEFAULT_AUTOPILOT_LABEL);
@@ -131,9 +136,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [effectiveJudgeModel, setEffectiveJudgeModel] = useState("");
   const [serverUnreachable, setServerUnreachable] = useState(false);
   // At most one session probe is in flight: a refresh while one is pending joins it,
-  // so probe results can never settle out of order. sessionGen is bumped only by an
-  // explicit login, register or logout, or by another request's 401; a probe that
-  // started before one of those drops its result, so it cannot undo the newer state.
+  // so probe results can never settle out of order. sessionGen is bumped by an
+  // explicit login, register, logout, settings update or another request's 401;
+  // a probe started before one of those drops its result rather than undoing it.
   const probeInFlight = useRef<Promise<void> | null>(null);
   const sessionGen = useRef(0);
 
@@ -145,6 +150,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // the deprecated single-theme trio so the app still paints. applyAppearance
   // stamps data-theme/data-font and arms the live system-mode listener.
   const applySession = useCallback((session: SessionResponse) => {
+    currentUserID.current = session.user?.id ?? null;
     setUser(session.user);
     setServerUnreachable(false);
     setLoading(false);
@@ -174,6 +180,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setEffectiveJudgeModel(session.effective_judge_model ?? "");
   }, []);
 
+  const updateUser = useCallback((savedUser: User) => {
+    // Only the current identity may invalidate older probes or be reconciled:
+    // a late save cannot undo logout or replace a different user's session.
+    // Session metadata stays untouched.
+    if (currentUserID.current !== savedUser.id) return;
+    sessionGen.current += 1;
+    currentUserID.current = savedUser.id;
+    setUser((current) => (current?.id === savedUser.id ? savedUser : current));
+  }, []);
+
   const refresh = useCallback(() => {
     if (probeInFlight.current) return probeInFlight.current;
     const gen = sessionGen.current;
@@ -185,6 +201,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       } catch (err) {
         if (gen !== sessionGen.current) return;
         if (err instanceof ApiError && err.status === 401) {
+          currentUserID.current = null;
           setUser(null);
           setServerUnreachable(false);
         } else {
@@ -211,6 +228,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // Another request's 401: the session is gone. Invalidate any pending probe
       // so its later result cannot restore the user.
       sessionGen.current += 1;
+      currentUserID.current = null;
       setUser(null);
       setServerUnreachable(false);
       setLoading(false);
@@ -289,6 +307,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       await api.logout();
     } finally {
       sessionGen.current += 1;
+      currentUserID.current = null;
       setUser(null);
       setServerUnreachable(false);
       setLoading(false);
@@ -311,6 +330,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       login,
       logout,
       refresh,
+      updateUser,
       serverUnreachable,
       retry: refresh,
     }),
@@ -329,6 +349,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       login,
       logout,
       refresh,
+      updateUser,
       serverUnreachable,
     ],
   );

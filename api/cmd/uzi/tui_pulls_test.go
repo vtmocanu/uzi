@@ -443,7 +443,11 @@ func TestTUIPullsTabAndEscNavigation(t *testing.T) {
 	next, _ := m.Update(reposMsg{repos: fake.Repos})
 	m = next.(tuiModel)
 
-	// tab from the floor opens the pulls screen.
+	// tab visits workers before pulls.
+	m = press(t, m, keyTab)
+	if m.view != viewWorkers {
+		t.Fatalf("tab from floor did not open workers (view=%v)", m.view)
+	}
 	m = press(t, m, keyTab)
 	if m.view != viewPulls {
 		t.Fatalf("tab from the floor did not open the pulls screen (view=%v)", m.view)
@@ -453,8 +457,11 @@ func TestTUIPullsTabAndEscNavigation(t *testing.T) {
 	if m.view != viewBoard {
 		t.Fatalf("esc on the pulls screen did not return to the floor (view=%v)", m.view)
 	}
-	// tab reopens pulls, tab again advances to ci, tab again returns to the floor (the full
-	// floor → pulls → ci → floor cycle, completed in M4b).
+	// The full strip order is floor → workers → pulls → ci → floor.
+	m = press(t, m, keyTab)
+	if m.view != viewWorkers {
+		t.Fatalf("tab from floor did not reopen workers (view=%v)", m.view)
+	}
 	m = press(t, m, keyTab)
 	if m.view != viewPulls {
 		t.Fatalf("tab from the floor did not reopen the pulls screen (view=%v)", m.view)

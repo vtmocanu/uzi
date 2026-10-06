@@ -66,16 +66,6 @@ func (f *fakeStore) PruneNotificationsForUser(_ context.Context, arg store.Prune
 	return 0, f.pruneErr
 }
 
-// The two PRD #333 coalescing queries. The base fakeStore is used by the Notify tests
-// that never coalesce, so find reports "no latch row" (pgx.ErrNoRows) and update is
-// an unused stub; the stateful coalescingStore below exercises the real coalescing path.
-func (f *fakeStore) FindNotificationForRunKind(context.Context, store.FindNotificationForRunKindParams) (store.Notification, error) {
-	return store.Notification{}, pgx.ErrNoRows
-}
-func (f *fakeStore) UpdateNotificationPayload(_ context.Context, arg store.UpdateNotificationPayloadParams) (store.Notification, error) {
-	return store.Notification{ID: arg.ID, UserID: arg.UserID, Payload: arg.Payload}, nil
-}
-
 // fakeSlacker records PublishNotification calls, sharing the store's order slice
 // so the insert→prune→slack sequence is asserted end to end.
 type fakeSlacker struct {

@@ -7,6 +7,7 @@ import { useNow } from "../lib/useNow";
 import { formatCountdown } from "../lib/limitWait";
 import {
   captureView,
+  TERMINAL_MAC_FAILURE_COPY,
   formatArchiveSize,
   recoverySectionKind,
   shortSha,
@@ -21,11 +22,13 @@ import { ShieldIcon, TrashIcon } from "./icons";
 // captures: it distinguishes legacy/unsupported, an open-hold-still-preparing, and each
 // capture lifecycle state (available / needs-action / expired / discarded / preparing).
 //
-// It fetches its own summary. The endpoint is strict-owner (a non-owner, incl. an admin
-// viewing a foreign run, gets 404), so any fetch failure is treated as "no recovery
-// data" and the section renders nothing — the section never leaks the existence of an
-// archive to a viewer the server would refuse.
+// Archive availability and panel visibility come only from the strict-owner summary.
 export function RecoveryArchivesPanel({ run }: { run: Run }) {
+  // Changing runs clears the owner-scoped summary before the next fetch settles.
+  return <RecoveryArchivesContent key={run.id} run={run} />;
+}
+
+function RecoveryArchivesContent({ run }: { run: Run }) {
   const [summary, setSummary] = useState<RecoveryArchiveSummary | null>(null);
 
   // Re-fetch the owner-scoped summary. Used on mount/status-change AND after a Delete
@@ -57,9 +60,12 @@ export function RecoveryArchivesPanel({ run }: { run: Run }) {
     // is captured at the finalization boundary, so a run that just failed grows one.
   }, [run.id, run.status]);
 
-  if (!summary) return null;
-  const kind = recoverySectionKind(summary, run.status);
+  const kind = summary ? recoverySectionKind(summary, run.status) : null;
   if (!kind) return null;
+  // The existing failed-run reason supplies cosmetic copy only, never custody metadata.
+  const terminalRejection = run.status === "failed" &&
+    run.failure_reason === TERMINAL_MAC_FAILURE_COPY;
+  const inferredPreparation = terminalRejection && summary?.archives.length === 0;
 
   return (
     // id anchor so the Workers custody surface can deep-link straight to a run's archives.
@@ -68,6 +74,8 @@ export function RecoveryArchivesPanel({ run }: { run: Run }) {
         <ShieldIcon className="h-4 w-4 text-muted" aria-hidden="true" />
         <SectionTitle>Recovery archives</SectionTitle>
       </div>
+
+      {terminalRejection && <p className="text-sm text-muted">{TERMINAL_MAC_FAILURE_COPY}</p>}
 
       {/* What this is — and, just as importantly, what it is NOT (D7). */}
       <p className="text-sm text-muted">
@@ -90,14 +98,14 @@ export function RecoveryArchivesPanel({ run }: { run: Run }) {
         </p>
       )}
 
-      {kind === "preparing" && (
+      {kind === "preparing" && !inferredPreparation && (
         <div className="rounded-lg border border-info/40 bg-info/10 px-3 py-2 text-sm text-info">
           Preparing the recovery archive. The committed history is being captured and
           stored, and a download appears here once it is ready.
         </div>
       )}
 
-      {kind === "captures" && (
+      {kind === "captures" && summary && (
         <>
           {/* The secret warning sits directly above every download control, so it is on
               every download surface (D7). */}

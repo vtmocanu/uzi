@@ -34,6 +34,7 @@ type reviewState struct {
 }
 
 type reviewLoadedMsg struct {
+	gen          uint64
 	runID        string
 	review       *apitypes.ReviewDTO
 	pendingJudge *apitypes.PendingJudgeDTO
@@ -41,15 +42,16 @@ type reviewLoadedMsg struct {
 }
 
 type dispositionDoneMsg struct {
+	gen   uint64
 	runID string
 	err   error
 }
 
 func (m tuiModel) loadReviewCmd(runID string) tea.Cmd {
-	c, ctx := m.client, m.ctx
+	c, ctx, gen := m.client, m.ctx, m.detail.gen
 	return func() tea.Msg {
 		rv, pj, err := c.RunReview(ctx, runID)
-		return reviewLoadedMsg{runID: runID, review: rv, pendingJudge: pj, err: err}
+		return reviewLoadedMsg{runID: runID, gen: gen, review: rv, pendingJudge: pj, err: err}
 	}
 }
 
@@ -57,24 +59,24 @@ func (m tuiModel) loadReviewCmd(runID string) tea.Cmd {
 // short-id resolution `uzi review resolve|dismiss` uses — so a short id means the same
 // thing in both surfaces and neither can drift into its own matching rule.
 func (m tuiModel) setDispositionCmd(recID, status, reason string) tea.Cmd {
-	c, ctx, runID := m.client, m.ctx, m.detail.runID
+	c, ctx, runID, gen := m.client, m.ctx, m.detail.runID, m.detail.gen
 	return func() tea.Msg {
 		full, err := resolveRecID(ctx, c, runID, recID)
 		if err != nil {
-			return dispositionDoneMsg{runID: runID, err: err}
+			return dispositionDoneMsg{runID: runID, gen: gen, err: err}
 		}
-		return dispositionDoneMsg{runID: runID, err: c.SetDisposition(ctx, runID, full, status, reason)}
+		return dispositionDoneMsg{runID: runID, gen: gen, err: c.SetDisposition(ctx, runID, full, status, reason)}
 	}
 }
 
 func (m tuiModel) deleteDispositionCmd(recID string) tea.Cmd {
-	c, ctx, runID := m.client, m.ctx, m.detail.runID
+	c, ctx, runID, gen := m.client, m.ctx, m.detail.runID, m.detail.gen
 	return func() tea.Msg {
 		full, err := resolveRecID(ctx, c, runID, recID)
 		if err != nil {
-			return dispositionDoneMsg{runID: runID, err: err}
+			return dispositionDoneMsg{runID: runID, gen: gen, err: err}
 		}
-		return dispositionDoneMsg{runID: runID, err: c.DeleteDisposition(ctx, runID, full)}
+		return dispositionDoneMsg{runID: runID, gen: gen, err: c.DeleteDisposition(ctx, runID, full)}
 	}
 }
 

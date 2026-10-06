@@ -1,9 +1,13 @@
 import { Readable } from "node:stream";
 import { readPlanCrossCheckReconciliation } from "./cross-check-reconciliation.js";
+import type { DindMeterSample } from "./dind-meter.js";
 import type { Logger } from "./log.js";
 import type { UsageWireRequest } from "./usage-recorder.js";
 import {
   WORKER_API_PREFIX,
+  type TerminalRejectionsRequest,
+  type TerminalRejectionsResponse,
+  type TerminalRejectionCustodyResponse,
   type ActiveSnapshot,
   type PrDescriptionAckRequest,
   type PrDescriptionAckResponse,
@@ -34,6 +38,8 @@ import {
   type WallParkRequest,
   type ReportFindingRequest,
   type HeartbeatRequest,
+  type DindMaintenance,
+  type DindMaintenanceReadyACK,
   type MessagesRequest,
   type OutboxHeartbeatEntry,
   type OutgoingMessage,
@@ -805,6 +811,42 @@ export interface CompletionPermitResult {
   permit?: CompletionPermit;
 }
 
+function isDindUUID(value: unknown): value is string {
+  return typeof value === "string" && value.length === 36 && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+function decodeDindMaintenance(value: unknown): DindMaintenance | null | undefined {
+  if (value === null) return null;
+  if (!isRecord(value)) return undefined;
+  const boundedIdentity = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= 128;
+  if (!isDindUUID(value.id) || !isDindUUID(value.register_nonce) ||
+      !boundedIdentity(value.nonce) || !boundedIdentity(value.deployment_uid) || !boundedIdentity(value.pvc_uid) ||
+      typeof value.fenced !== "boolean" || typeof value.ready_ack !== "boolean") return undefined;
+  switch (value.phase) {
+    case "requested": case "ready": case "stopping": case "recycling": case "complete": case "cancelled":
+      break;
+    default:
+      return undefined;
+  }
+  if (value.reason !== undefined && value.reason !== "below_threshold" && value.reason !== "recycle_disabled") return undefined;
+  return {
+    id: value.id, nonce: value.nonce, phase: value.phase,
+    deployment_uid: value.deployment_uid, pvc_uid: value.pvc_uid,
+    register_nonce: value.register_nonce, fenced: value.fenced, ready_ack: value.ready_ack,
+    ...(value.reason === undefined ? {} : { reason: value.reason }),
+  };
+}
+
+function validDindSample(sample: DindMeterSample | null | undefined): sample is DindMeterSample {
+  if (!sample || ![sample.epochS, sample.bytesUsed, sample.bytesTotal, sample.inodesUsed, sample.inodesTotal]
+    .every((v) => Number.isSafeInteger(v) && v >= 0)) return false;
+  const sampledMs = sample.epochS * 1000;
+  const ageMs = Date.now() - sampledMs;
+  return Number.isSafeInteger(sampledMs) && ageMs >= 0 && ageMs <= 45_000 &&
+    sample.bytesTotal > 0 && sample.bytesUsed <= sample.bytesTotal &&
+    sample.inodesTotal > 0 && sample.inodesUsed <= sample.inodesTotal;
+}
+
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
   private readonly sleep: (ms: number) => Promise<void>;
@@ -844,6 +886,13 @@ export class WorkerClient {
    * register (process restart) regardless.
    */
   private registerNonce: string | undefined;
+
+  private latestDindMaintenanceValue: DindMaintenance | null | undefined;
+
+  /** Latest heartbeat observation: null means known none; undefined means unknown. */
+  get latestDindMaintenance(): DindMaintenance | null | undefined {
+    return this.latestDindMaintenanceValue;
+  }
 
   /**
    * PRD #1391 Run B M4: the api's server-side terminal-pending outbox cap
@@ -911,6 +960,8 @@ export class WorkerClient {
     protocolCapabilities?: string[],
     initialSnapshot?: ActiveSnapshot,
   ): Promise<RegisterResponse> {
+    this.latestDindMaintenanceValue = undefined;
+    this.registerNonce = undefined;
     const body: RegisterRequest = { name, version: this.version };
     // Only send the field when known: an image without ENV WORKER_TEMPLATE reports
     // no template, and the server stores NULL (PRD #18). The server's decoder
@@ -980,13 +1031,16 @@ export class WorkerClient {
    *  restarts (a re-register would re-populate it). */
   clearFeatures(): void {
     this.serverFeatures.clear();
+    this.latestDindMaintenanceValue = undefined;
   }
 
   async heartbeat(
     stats?: WorkerStats,
     outbox?: OutboxHeartbeatEntry[],
     activeSnapshot?: ActiveSnapshot,
+    maintenance?: { sample?: DindMeterSample | null; ack?: DindMaintenanceReadyACK },
   ): Promise<boolean | undefined> {
+    this.latestDindMaintenanceValue = undefined;
     const body: HeartbeatRequest = { version: this.version };
     // Only attach stats when the collector produced a sample (PRD #49): an absent
     // field is the same wire shape as today, so a pre-#49 server ignores the extra
@@ -1003,14 +1057,37 @@ export class WorkerClient {
     // as `outbox`.
     const includeSnapshot = this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined;
     if (includeSnapshot) body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
-    const includeExtension = includeOutbox || includeSnapshot;
+    if (this.hasFeature("dind_maintenance_v1") && isDindUUID(this.registerNonce)) {
+      const sample = maintenance?.sample;
+      if (validDindSample(sample)) {
+        body.dind_meter = {
+          register_nonce: this.registerNonce,
+          epoch: sample.epochS,
+          sampled_at: new Date(sample.epochS * 1000).toISOString(),
+        };
+      }
+      if (maintenance?.ack) {
+        body.dind_maintenance_ready_ack = { ...maintenance.ack, register_nonce: this.registerNonce };
+      }
+    }
+    const includeExtension = includeOutbox || includeSnapshot || body.dind_meter !== undefined ||
+      body.dind_maintenance_ready_ack !== undefined;
     try {
-      return await this.postHeartbeat(body);
+      try {
+        return await this.postHeartbeat(body);
+      } catch (err) {
+        // A stale ACK gets one ACK-free resync; sibling extensions remain intact.
+        // Any failure of that request reaches the usual strict-decode fallback below.
+        if (!body.dind_maintenance_ready_ack || !(err instanceof RequestError) || err.status !== 409) throw err;
+        const resync = { ...body };
+        delete resync.dind_maintenance_ready_ack;
+        return await this.postHeartbeat(resync);
+      }
     } catch (err) {
       // Rollback fallback (PRD #1391 M5, extended by #1390 M2a): a rolled-back api that no
       // longer knows a negotiated heartbeat extension strict-decodes it as an unknown field
       // and answers a generic `invalid request body` 400. Retry the SAME heartbeat ONCE with
-      // EVERY negotiated extension stripped (both `outbox` AND `active_snapshot`); if the
+      // EVERY negotiated extension stripped (outbox, snapshot, meter and ACK); if the
       // stripped retry SUCCEEDS, clear the WHOLE cached feature set so nothing negotiated is
       // sent again until process restart. A heartbeat must NEVER be lost to a rolled-back api,
       // so a stripped success is the outcome, not the original 400. Deliberately WHOLE-SET, not
@@ -1041,6 +1118,7 @@ export class WorkerClient {
    * body does not parse is still a successful heartbeat.
    */
   private async postHeartbeat(body: HeartbeatRequest): Promise<boolean | undefined> {
+    this.latestDindMaintenanceValue = undefined;
     const path = `${WORKER_API_PREFIX}/heartbeat`;
     const res = await this.fetchRaw("POST", path, body);
     if (res.status >= 400) throw await this.toError("POST", path, res);
@@ -1052,6 +1130,11 @@ export class WorkerClient {
       return undefined;
     }
     if (typeof decoded !== "object" || decoded === null) return undefined;
+    if (this.hasFeature("dind_maintenance_v1")) {
+      this.latestDindMaintenanceValue = decodeDindMaintenance(
+        (decoded as { dind_maintenance?: unknown }).dind_maintenance,
+      );
+    }
     const worker = (decoded as { worker?: unknown }).worker;
     if (typeof worker !== "object" || worker === null) return undefined;
     const threshold = (worker as { disk_pressure_threshold?: unknown }).disk_pressure_threshold;
@@ -1070,12 +1153,17 @@ export class WorkerClient {
    *  api's pre-claim dedupe sees the runs this worker is already executing BEFORE the first
    *  post-outage heartbeat lands. If not negotiated the claim posts an empty body `{}`, which
    *  an old api ignores (harmless — the run-lane claim was bodyless before this). */
-  async claimRun(activeSnapshot?: ActiveSnapshot): Promise<ClaimResponse | null> {
+  async claimRun(activeSnapshot?: ActiveSnapshot, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<ClaimResponse | null> {
+    // The same deadline reaches fetch AND its body. Await the real request rather than a race:
+    // admission must remain held until a late transport has definitively stopped.
+    const deadline = AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]);
+    deadline.throwIfAborted();
     const body: ClaimRequest = {};
     if (this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined) {
       body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
     }
-    const res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/claim`, body);
+    const res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/claim`, body, timeoutMs, deadline);
+    deadline.throwIfAborted();
     if (res.status === 204) return null;
     if (res.status >= 400) throw await this.toError("POST", `${WORKER_API_PREFIX}/runs/claim`, res);
     const marker = res.headers.get("X-Uzi-Claim-Kind");
@@ -1091,6 +1179,7 @@ export class WorkerClient {
     if ((marker === "cross_check") !== (isRecord(claim) && claim.kind === "cross_check")) {
       throw new Error("cross-check claim marker and kind disagree");
     }
+    deadline.throwIfAborted();
     // PRD #1798 D9: the pr_description is validated or dropped, never cast (decodePrState, the
     // same check as the bind / lookup / ack responses). The warning carries the run id only,
     // never the value (untrusted text). The isRecord guard keeps a `null` (or other non-object)
@@ -2579,8 +2668,9 @@ export class WorkerClient {
     }
     let text: string;
     try {
-      text = await res.text();
-    } catch {
+      text = await readCodexSuccessText(res);
+    } catch (err) {
+      if (err instanceof CodexRequestFailure && err.kind === "response") throw err;
       throw failure();
     }
     if (!text) throw new CodexRequestFailure("transport");
@@ -2588,6 +2678,82 @@ export class WorkerClient {
       return JSON.parse(text) as unknown;
     } catch {
       throw codexResponseError();
+    }
+  }
+
+  /** No retries or feature cache: check the shared negotiated set at each transport. */
+  async reportTerminalRejections(request: TerminalRejectionsRequest, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<TerminalRejectionsResponse | undefined> {
+    if (!this.hasFeature("terminal_rejection_report")) return undefined;
+    if (!request || !Array.isArray(request.rejections) || request.rejections.length > 256 ||
+        request.rejections.some(r => !terminalUUID(r.run_id) || !terminalGeneration(r.claim_generation) || r.reason !== "mac_failure")) throw terminalResponseError();
+    const body = { rejections: request.rejections.map(r => ({ run_id: r.run_id.toLowerCase(), claim_generation: r.claim_generation, reason: r.reason })) };
+    if (Buffer.byteLength(JSON.stringify(body)) > TERMINAL_REJECTION_RESPONSE_MAX_BYTES) throw terminalResponseError();
+    const response = await this.terminalRejectionJSON("POST", `${WORKER_API_PREFIX}/terminal-rejections`, body, signal, timeoutMs);
+    if (response === undefined) return undefined;
+    const obj = terminalObject(response);
+    if (!Array.isArray(obj.dispositions) || obj.dispositions.length !== body.rejections.length || obj.dispositions.length > 256) throw terminalResponseError();
+    // Compare the whole ordered batch; duplicates, if requested, retain their exact slots.
+    for (const [i, value] of obj.dispositions.entries()) {
+      const d = terminalObject(value);
+      const requested = body.rejections[i]!;
+      if (d.run_id !== requested.run_id || d.claim_generation !== requested.claim_generation || d.reason !== "mac_failure" ||
+          (d.disposition !== "recorded" && d.disposition !== "skipped")) throw terminalResponseError();
+    }
+    return response as TerminalRejectionsResponse;
+  }
+
+  async getTerminalRejectionCustody(runId: string, generation: number, workerId: string, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<TerminalRejectionCustodyResponse | undefined> {
+    if (!this.hasFeature("terminal_rejection_report")) return undefined;
+    if (!terminalUUID(runId) || !terminalUUID(workerId) || !terminalGeneration(generation)) throw terminalResponseError();
+    runId = runId.toLowerCase();
+    workerId = workerId.toLowerCase();
+    const response = await this.terminalRejectionJSON("GET", `${WORKER_API_PREFIX}/runs/${runId}/terminal-rejection-custody?generation=${generation}`, undefined, signal, timeoutMs);
+    if (response === undefined) return undefined;
+    const obj = terminalObject(response);
+    if (obj.run_id !== runId || obj.worker_id !== workerId || obj.generation !== generation ||
+        !Array.isArray(obj.exact_holds) || !Array.isArray(obj.sibling_holds) ||
+        !terminalGeneration(obj.exact_count) || !terminalGeneration(obj.sibling_count) ||
+        typeof obj.exact_complete !== "boolean" || typeof obj.sibling_complete !== "boolean" || typeof obj.complete !== "boolean" ||
+        (typeof obj.outcome !== "string" || !["retained", "settled", "unknown"].includes(obj.outcome))) throw terminalResponseError();
+    const exactCount = obj.exact_count as number;
+    const siblingCount = obj.sibling_count as number;
+    if (obj.exact_holds.length !== Math.min(exactCount, 256) || obj.sibling_holds.length !== Math.min(siblingCount, 256) ||
+        obj.exact_complete !== (exactCount <= 256) || obj.sibling_complete !== (siblingCount <= 256) ||
+        obj.complete !== (obj.exact_complete && obj.sibling_complete)) throw terminalResponseError();
+    const ids = new Set<string>();
+    let open = false;
+    let closed = true;
+    for (const value of obj.exact_holds) {
+      const hold = terminalObject(value);
+      if (!terminalUUID(hold.id) || ids.has(hold.id.toLowerCase()) || (typeof hold.state !== "string" || !["open", "released", "discarded"].includes(hold.state))) throw terminalResponseError();
+      ids.add(hold.id.toLowerCase());
+      open ||= hold.state === "open";
+      closed &&= hold.state === "released" || hold.state === "discarded";
+    }
+    for (const value of obj.sibling_holds) {
+      const hold = terminalObject(value);
+      if (!terminalUUID(hold.id) || ids.has(hold.id.toLowerCase()) || !terminalGeneration(hold.generation) || hold.generation === generation) throw terminalResponseError();
+      ids.add(hold.id.toLowerCase());
+    }
+    const settled = obj.complete && exactCount >= 1 && closed && siblingCount === 0;
+    if ((obj.outcome === "settled" && !settled) || (obj.outcome === "retained" && obj.exact_complete && !open) ||
+        (obj.complete && obj.outcome !== (open ? "retained" : settled ? "settled" : "unknown"))) throw terminalResponseError();
+    return response as TerminalRejectionCustodyResponse;
+  }
+
+  private async terminalRejectionJSON(method: "GET" | "POST", path: string, body: unknown, callerSignal: AbortSignal | undefined, timeoutMs: number): Promise<unknown> {
+    const abort = new AbortController();
+    const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(timeoutMs), ...(callerSignal ? [callerSignal] : [])]);
+    // This is the last operation before every actual transport, including a shared-client clear.
+    if (!this.hasFeature("terminal_rejection_report")) return undefined;
+    const res = await this.fetchRaw(method, path, body, timeoutMs, signal);
+    try {
+      const raw = await readTerminalRejectionBody(res, signal);
+      if (!res.ok) throw new RequestError(method, path, res.status, "");
+      try { return JSON.parse(raw) as unknown; } catch { throw terminalResponseError(); }
+    } catch (err) {
+      abort.abort();
+      throw err;
     }
   }
 
@@ -2652,6 +2818,33 @@ function retryAfterMsOf(h: string | null): number | undefined {
  * reserving another 64 KiB for keys/metadata stays below 6 MiB. Count actual streamed bytes,
  * never Content-Length; only the three cross-check methods opt in. */
 const CROSS_CHECK_RESPONSE_MAX_BYTES = 6 * 1024 * 1024;
+/** Maximum success body size for the Codex release and refresh envelopes. */
+const CODEX_SUCCESS_BODY_MAX_BYTES = 64 * 1024;
+
+/** Read through EOF, including at the exact cap; never retain or decode an overflowing chunk. */
+async function readCodexSuccessText(res: Response): Promise<string> {
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  try {
+    // EOF or the byte cap bounds retained data; fetch's signal bounds stalled reads.
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.byteLength > CODEX_SUCCESS_BODY_MAX_BYTES - total) throw codexResponseError();
+      total += value.byteLength;
+      parts.push(value);
+    }
+    return new TextDecoder().decode(Buffer.concat(parts, total));
+  } catch (err) {
+    // One best-effort cancel; cleanup failure must not replace the original classification.
+    try { await reader.cancel(); } catch { /* ignore cleanup failure */ }
+    throw err;
+  } finally {
+    try { reader.releaseLock(); } catch { /* ignore cleanup failure */ }
+  }
+}
 
 /** Most bytes of an error response body toError reads. */
 const ERROR_BODY_MAX_BYTES = 4096;
@@ -2921,4 +3114,49 @@ function abortableSleep(
       },
     );
   });
+}
+
+const TERMINAL_REJECTION_RESPONSE_MAX_BYTES = 128 * 1024;
+function terminalResponseError(): Error { return new Error("invalid terminal rejection response"); }
+function terminalUUID(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+function terminalGeneration(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+function terminalObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw terminalResponseError();
+  return value as Record<string, unknown>;
+}
+
+/** Count actual streamed bytes, including whitespace, before decoding any JSON.
+ * Each read is deadline/abort bound; EOF or 128 KiB+1 observed bytes ends the loop.
+ * Oversize and HTTP errors never use Response.text or retain raw error bodies. */
+async function readTerminalRejectionBody(res: Response, signal: AbortSignal): Promise<string> {
+  if (!res.body) throw terminalResponseError();
+  const reader = res.body.getReader();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  const onAbort = () => { void reader.cancel().catch(() => undefined); };
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    while (true) {
+      signal.throwIfAborted();
+      const { done, value } = await reader.read();
+      signal.throwIfAborted();
+      if (done) break;
+      if (!value.byteLength) continue;
+      if (value.byteLength > TERMINAL_REJECTION_RESPONSE_MAX_BYTES - total) throw terminalResponseError();
+      total += value.byteLength;
+      parts.push(value);
+    }
+    return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(parts, total));
+  } catch (err) {
+    // One best-effort cancellation; a stalled cancellation promise cannot extend the deadline.
+    void reader.cancel().catch(() => undefined);
+    throw err;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    reader.releaseLock();
+  }
 }

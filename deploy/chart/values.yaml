@@ -257,7 +257,7 @@ api:
     # opt-in. These env knobs only TUNE an already-enabled feature; leave them
     # unset to use config.go's defaults. Uncomment to override.
     # UZI_EPHEMERAL_MAX_PER_USER: "2"          # per-user concurrent-ephemeral cap
-    # UZI_EPHEMERAL_DEFAULT_SIZE: m            # provision size preset: s|m|l
+    # UZI_EPHEMERAL_DEFAULT_SIZE: l            # provision size preset: s|m|l
     # UZI_EPHEMERAL_PROVISION_DEADLINE: 10m    # GC deadline for never-booted / idle-stolen workers
     # UZI_EPHEMERAL_SATURATION_DELAY: 90s     # debounce before bursting on a saturated (all capable workers full) fleet
     # Job files and product skill sets (PRD #1909). Unset => config.go's defaults
@@ -594,7 +594,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.85.1"
+    tag: "0.85.2"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
@@ -755,21 +755,20 @@ workers:
   # Namespace ResourceQuota (Decision 8). Defense in depth under the api's per-user
   # quota: an app-level bug must not noisy-neighbour a shared cluster.
   #
-  # CPU and memory track the DEFAULT `m` size (issue #1341 raised m's request to 4Gi),
-  # not the worst case: 20 workers x 500m = 10 CPU and 20 x 4Gi = 80Gi requested. STORAGE
-  # instead tracks the WORST-CASE `l` size — 20 x (25Gi data + 20Gi nix) = 900Gi of PVC —
-  # and is the binding constraint, not CPU or memory. Raising m's memory request WITHOUT
-  # raising this key caps the admissible fleet below `deployments`: the next worker is
-  # QUOTA-refused at admission ("provisions and never appears"), a failure no repo test
-  # catches (issue #1341). So keep requestsMemory = deployments x the m request.
-  # dev-cluster's real budget is M6's rollout conversation.
+  # CPU and memory track the DEFAULT size, now `l` (ADR-2240): 20 workers x 1 CPU
+  # = 20 CPU and 20 x 8Gi = 160Gi requested. Keep these ceilings aligned with
+  # deployments x the default request, or admission caps the fleet below deployments
+  # (issue #1341). ResourceQuotas are ceilings, not node-capacity reservations.
+  # STORAGE tracks `l` too: 20 x (25Gi data + 20Gi nix) = 900Gi of PVC.
+  # Requests follow render.go; the rendered-fleet regression checks CPU, memory
+  # and per-container LimitRange maxima.
   #
   # WORST CASE MEANS `l`, NOT `m`, AND THAT IS THE WHOLE POINT OF THE NUMBER. Nothing
   # scopes a size to a tier — preset.SizeNames() is global and render.go feeds
   # spec.Size.DataSize to both tiers — so any of these 20 workers may be an `l` with a
   # 25Gi /data. Sizing on `m` (10Gi) gave 600Gi, which caps at 13 `l` workers against
   # a tier advertising 20: the 14th is refused with a QUOTA error rather than a
-  # scheduling one, and no test in this repo can see it. If `l` should not be
+  # scheduling one. If `l` should not be
   # available here, the fix is to scope it off the tier, not to under-budget.
   #
   # A RUN-BOUND worker's /data is a separate term (ephemeralWorkerDataSize above, 20Gi,
@@ -801,8 +800,8 @@ workers:
   # costs.
   quota:
     enabled: true
-    requestsCPU: "10"
-    requestsMemory: 80Gi
+    requestsCPU: "20"
+    requestsMemory: 160Gi
     requestsStorage: 900Gi
     persistentVolumeClaims: "40"
     # READ BY A CONTROLLER TEST, not merely documented here. This is the restricted
@@ -942,21 +941,19 @@ workers:
     # since issue #224 M-a is its OWN PVC (dindDataSize below), not an emptyDir on node
     # ephemeral storage.
     #
-    # Sized for the 10 workers `deployments` advertises. MEMORY tracks the DEFAULT `m`
-    # size plus the DinD sidecar (issue #1341 raised m's request to 4Gi): 10 x (4Gi worker
-    # + ~256Mi sidecar request) ~= 42.5Gi, rounded up to 48Gi for headroom. STORAGE tracks
-    # THREE PVCs each: 10 x (25Gi data + 20Gi nix + 20Gi dind) = 650Gi, and 10 x 3 = 30
-    # claims. The data term is `l`'s, the worst case. STORAGE is the binding constraint
-    # here too — and it already was before M-a: at 140Gi / 20 claims this tier held 3 `l`
-    # workers against the 10 it advertises, so the triple was never self-consistent. As on
-    # the plain tier, raising m's memory request WITHOUT raising requestsMemory would
-    # QUOTA-refuse workers below `deployments`, a failure no repo test catches (issue
-    # #1341). Raising a quota PROVISIONS NOTHING (a ceiling on claims, not a reservation),
-    # so this costs zero storage until the workers exist.
+    # Sized for the 10 workers deployments advertises. CPU and memory track the
+    # DEFAULT size, now `l` (ADR-2240), plus all sidecars from render.go/render_dind.go.
+    # Ten rendered pods need 13.1 CPU / about 83Gi, rounded to 14 CPU / 96Gi.
+    # Keep requests aligned with the rendered fleet, including sidecar overrides,
+    # or admission caps it below deployments
+    # (issue #1341). ResourceQuotas are ceilings, not capacity reservations.
+    # STORAGE tracks three PVCs each: 10 x (25Gi data + 20Gi nix + 20Gi dind) =
+    # 650Gi, and 10 x 3 = 30 claims. Raising a quota provisions nothing until
+    # workers exist.
     quota:
       enabled: true
-      requestsCPU: "8"
-      requestsMemory: 48Gi
+      requestsCPU: "14"
+      requestsMemory: 96Gi
       requestsStorage: 650Gi
       # BOTH CLAUSES OF WHAT THIS COMMENT USED TO SAY WERE FALSE, and issue #224 M-a
       # falsified the first of them a second time over. It read: "emptyDir dind data
@@ -1130,11 +1127,13 @@ workers:
       service: []
       node: []
     # The lane's own ResourceQuota and LimitRange, the restricted tier's shape. Lane
-    # workers are run-bound (one run, then removed), so the fleet is sized small.
+    # workers are run-bound (one run, then removed). CPU and memory ceilings cover
+    # ten DEFAULT `l` workers from render.go (ADR-2240): 10 x 1 CPU / 8Gi = 10 CPU / 80Gi.
+    # The quota is a ceiling, not a reservation of node capacity.
     quota:
       enabled: true
-      requestsCPU: "8"
-      requestsMemory: 48Gi
+      requestsCPU: "10"
+      requestsMemory: 80Gi
       requestsStorage: 400Gi
       persistentVolumeClaims: "20"
       deployments: "10"

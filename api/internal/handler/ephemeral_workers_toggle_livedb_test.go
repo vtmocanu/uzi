@@ -148,3 +148,59 @@ func TestEphemeralWorkersSeamLiveDB(t *testing.T) {
 		t.Fatalf("hosted config ephemeral_enabled = %v, want false (admin gate off)", got)
 	}
 }
+
+func TestEphemeralDockerPreferencesLiveDB(t *testing.T) {
+	h, pool := ephemeralSeamHandler(t, true)
+	h.cfg.WorkerDockerEnabled = true
+	owner, stranger := mkSecretUser(t, pool), mkSecretUser(t, pool)
+	for _, tc := range []struct {
+		name, body            string
+		tier, enabled, docker bool
+		status                int
+	}{
+		{"docker only", `{"docker":true}`, true, false, true, 200},
+		{"enabled on", `{"enabled":true}`, true, true, true, 200},
+		{"enabled off retains", `{"enabled":false}`, true, false, true, 200},
+		{"enabled on retains", `{"enabled":true}`, true, true, true, 200},
+		{"neither", `{}`, true, true, true, 200},
+		{"empty", ``, true, true, true, 200},
+		{"denial no partial write", `{"enabled":false,"docker":true}`, false, true, true, 409},
+		{"disable tier unavailable", `{"docker":false}`, false, true, false, 200},
+		{"both", `{"enabled":false,"docker":true}`, true, false, true, 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h.cfg.WorkerDockerEnabled = tc.tier
+			rec := httptest.NewRecorder()
+			h.SetEphemeralWorkersEnabled(rec, userReq(http.MethodPut, "/api/me/ephemeral-workers", tc.body, owner, nil))
+			if rec.Code != tc.status {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			u := meReq(t, h, owner)
+			if u["ephemeral_workers_enabled"] != tc.enabled || u["ephemeral_docker_enabled"] != tc.docker {
+				t.Fatalf("persisted=%v", u)
+			}
+			if tc.status == 200 {
+				var out struct {
+					User map[string]any `json:"user"`
+				}
+				if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+					t.Fatal(err)
+				}
+				if out.User["ephemeral_docker_enabled"] != tc.docker || out.User["ephemeral_workers_enabled"] != tc.enabled {
+					t.Fatalf("response=%v", out.User)
+				}
+			}
+			u = meReq(t, h, stranger)
+			if u["ephemeral_workers_enabled"] != false || u["ephemeral_docker_enabled"] != false {
+				t.Fatal("stranger changed")
+			}
+			if got := hostedConfig(t, h)["docker_enabled"]; got != tc.tier {
+				t.Fatalf("hosted docker=%v", got)
+			}
+		})
+	}
+	h.cfg.WorkerHostingEnabled = false
+	if got := hostedConfig(t, h)["docker_enabled"]; got != false {
+		t.Fatalf("hosting off docker=%v", got)
+	}
+}

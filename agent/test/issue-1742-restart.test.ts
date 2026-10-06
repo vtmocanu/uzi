@@ -123,7 +123,7 @@ describe("issue #1742 restart fault probes", () => {
     try {
       await Promise.race([
         entered,
-        new Promise<void>((_, reject) => setTimeout(() => reject(new Error("terminal write seam was not reached")), 5_000)),
+        execution.then(() => { throw new Error("execution ended before the terminal write seam"); }),
       ]);
       assert.equal(executorReturned, true, "the real executor returned before the terminal write");
       const disk = await terminalFiles(root, claim.run_id);

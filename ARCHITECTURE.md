@@ -1009,8 +1009,9 @@ chain in the diagram above, with no intervening `running`.
   glyph; every other failed run, plan rejections and an escalated or no-live-worker auto-stop
   included, posts a ❌ Failed message with its reason. The DM is not gated on `stop_kind`.
   The `notifications` table itself is not gone (PRD #1650): it stays as a
-  pruned (200 rows/user), write-only event log and the incidental-finding
-  Slack de-dup latch (`notifysvc.Notify`). One exception (#1675): the two halt
+  pruned (200 rows/user), write-only event log (`notifysvc.Notify`). Incidental
+  findings no longer send Slack DMs or create new latch rows (#2271); existing
+  rows remain subject to pruning. One exception (#1675): the two halt
   DMs ("CI auto-fix stopped", "MR rework stopped") store their DM render in
   `notifications.slack_render` and are delivered at-least-once. The Slack drain
   marks a row delivered on a successful post, or terminally when the owner has
@@ -1327,7 +1328,9 @@ tool can never be mistaken for (or promoted into) a turn-ending signal. Full
 design rationale is in the PRD (`prds/done/333-incidental-findings.md`, especially
 its Decision Log); the durable seams are in
 [adr/0333-incidental-findings.md](adr/0333-incidental-findings.md); user-facing
-usage is [docs/findings.md](docs/findings.md).
+usage is [docs/findings.md](docs/findings.md). Capture, storage, listing,
+backlog, filing and dispositions are unchanged by #2271; findings appear in
+stream cards and the backlog without Slack DMs or new notification latch rows.
 
 - **Capture is worker→api, never worker→forge.** The tool posts to a
   `RequireWorker` endpoint the same way a chat proposal does; the worker holds
@@ -1682,6 +1685,10 @@ docker tier's own privileged-namespace ruling (Q-B) and Decision 3's
 separate-mount-namespace invariant are recorded in
 `prds/done/83-docker-capable-worker.md`.
 
+New persistent and ephemeral workers default to the large preset. The decision,
+capacity cost, and preservation of existing stored sizes are recorded in
+[ADR-2240](adr/2240-hosted-worker-default-size.md).
+
 **Codex on a hosted worker needs a third identity, and that is opt-in.** The
 restricted-tier namespace above starts every worker single-uid, which is one
 identity short of what the Codex harness's fail-closed launcher requires (a
@@ -1857,9 +1864,10 @@ open (a CLI drain verb, live-cluster validation) are in
 
 ### Worker disk: observed on the heartbeat, self-healed by the controller (PRD #837)
 
-A worker now samples `/nix` and `/data` filesystem usage on the existing
-heartbeat and reports it display-only, alongside CPU/memory (PRD #49); no
-scheduling query reads it. The controller gained two new drift arms that both
+A worker samples `/nix` and `/data` filesystem usage on the existing
+heartbeat alongside CPU/memory (PRD #49). Gauges display the usage; derived
+pressure also drives lifecycle maintenance and worker-local disk admission/reclaim.
+The legacy controller has two drift arms that both
 resolve to the same delete-and-remint mechanism (a pod roll re-attaches the
 same PVC, so it cannot reclaim disk): one reconciles a worker whose `/nix` PVC
 is smaller than the current `preset.nixSize` constant, the other recycles
@@ -1871,13 +1879,27 @@ still-Terminating PVC, the default-ON decision over reviewer dissent, and the
 thrash-cooldown-as-capacity-signal — is in
 [adr/0837-worker-disk-lifecycle.md](adr/0837-worker-disk-lifecycle.md).
 
+Issue #1760 adds a separate DinD-only arm for sustained fresh byte or inode
+pressure. All non-terminal worker-owned runs, including parks and approval waits,
+block it. Requested maintenance drains new run/chat claims while owned runs may
+resume; only an atomic terminal-only claim fence, drained local activity and fresh
+custody clearance permit gated anonymous-volume prune and stop authorization.
+The controller observes the old Deployment and pods gone before deleting only
+`dind-data`, then publishes replacement readiness before reopening claims.
+DinD is scratch, including named volumes; replacing the Deployment also loses
+run-workdir. DinD never uses ForceRoll or the drain deadline. Simultaneous pressure
+runs legacy first, DinD on a later tick; standalone legacy overrides are unchanged.
+Admins see cleanup pending; ephemeral and unsupported workers report pressure only.
+See [ADR-1759](adr/1759-dind-data-metering-and-prune.md) for the safe gate,
+Docker-only ReplicaSet-list permission, bounded observations and upgrade policy.
+
 ### Admin in-app health (PRD #1484)
 
-An admin-only, read-only Health tab, Overview card, app-wide Danger banner (with a
-per-admin 1h snooze), `uzi admin health`, and a per-admin danger-episode notice roll
-up a closed registry of checks over worker rolls/capacity, the queue, the
-controller's own liveness, background loops, the database, integrations, and
-housekeeping. It **never reads the Kubernetes API** — `api` stays credential-free,
+An admin-only, read-only Health tab, Overview card and `uzi admin health`
+show the full closed registry of checks over worker rolls/capacity, the queue,
+the controller's own liveness, background loops, the database, integrations,
+and housekeeping. The app-wide Danger banner (with a per-admin 1h snooze)
+follows instance blockers. In-app health **never reads the Kubernetes API** — `api` stays credential-free,
 exactly as the worker controller section above requires — so every
 Kubernetes-derived fact (a worker pod stuck rolling) still arrives only over the
 existing controller report; pod-level health of the `api`/`web`/database/controller
@@ -1885,6 +1907,34 @@ pods themselves stays out of scope, owned by cluster monitoring. See
 [PRD #1484](prds/1484-admin-health-tab.md) and
 [ADR-1484](adr/1484-in-app-health-boundary.md) for the checks, the boundary
 rationale, and the deferred items (version skew, per-connection sync freshness).
+
+The health registry supplies each check's `scope` (#2293): `db`,
+`controller.report`, `loops` and `fleet.roll` are `instance`; the rest are
+`owner`. `fleet.roll` remains instance infrastructure even for a single owner.
+The server emits `blocking` on every document, true exactly when an instance
+check is danger. Overall status, counts, attention pips, history and CLI exit
+status still cover the full registry. Episodes, admin Slack notices, banner
+and snooze follow `blocking`, superseding #2271's overall-episode timing:
+the opening tick sends nothing; the next still-blocking tick claims a notice
+per admin with instance-danger checks. Clearing instance danger closes and
+rearms even if owner danger remains. Owner-only danger opens no episode,
+sends no admin DM and raises no banner; owner run-health routing is unchanged.
+
+The web derives blocker count/cause from server scope with no client ID map.
+A present `blocking` is authoritative; an absent field conservatively uses
+legacy status/danger count/first danger, including the snooze expiry timer.
+This accepted follow-up replaces the originally deferred mixed-version fallback.
+Api-before-web upgrades and web-before-api rollbacks are preferred to avoid
+legacy owner false positives, not required to prevent suppressed banners.
+
+Capacity and queue share one evaluation-local, run-memoized confirmation
+coordinator (capacity first, 200 calls, 2s per call, lazy shared 4s budget).
+The full `waiting_worker` population excludes confirmed upgrade drains from
+`queue.waiting`, even overdue ones; `fleet.capacity` retains D18's 24h
+later-wait/drain overlap, independent of controller deadlines. Failed or invalid
+confirmation leaves a genuine wait. See
+[docs/admin-health.md](docs/admin-health.md) for predicates, evidence bounds,
+thresholds and the notice contract.
 
 Issue-sync failure streaks have shipped as `forge.sync`
 ([#2203](https://github.com/vtmocanu/uzi/issues/2203)), separate from deferred

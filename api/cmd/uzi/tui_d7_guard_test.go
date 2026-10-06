@@ -217,6 +217,12 @@ var d7UntrustedFields = []string{
 	// reuses the existing "WebURL" tripwire via ciRunJobURLLine (like prCheckURLLine / pullLink).
 	"jobName",
 	"stepName",
+	// Worker projections and attention text (tui_workers.go).
+	"workerName", "workerVersion", "templateDeclared", "templateReported",
+	"upgradeDetail", "upgradeTarget", "blockingContainer", "blockingReason",
+	"outboxBlockedText", "tokenLabel", "hostedSize", "capabilityText",
+	"workerOwner", "pressureText", "attnShort", "attnDetail",
+	"runWorkerName",
 }
 
 // d7Writers are the calls that put a string on the screen. lipgloss's Render is one:

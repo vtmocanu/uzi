@@ -10,7 +10,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -28,30 +27,31 @@ import (
 // an admin surface.
 const maxEvidenceBytes = 96
 
-// checkMeta is the fixed per-id metadata: the group, the human title, and the docs slug
+// checkMeta is the fixed per-id metadata: the scope, group, human title, and docs slug
 // (empty ⇒ no doc link in M1). The registry order in Evaluate is the stable order; this
 // map only supplies the constant fields so each check builder sets just severity + text.
 var checkMeta = map[string]struct {
+	scope string
 	group string
 	title string
 	doc   string
 }{
-	"fleet.roll":         {groupWorkers, "Worker image roll", "worker-upgrades"},
-	"fleet.capacity":     {groupWorkers, "Worker capacity", "hosted-workers"},
-	"fleet.disk":         {groupWorkers, "Worker disk", "hosted-workers"},
-	"fleet.rundisk":      {groupWorkers, "Run disk size", "hosted-workers"},
-	"queue.waiting":      {groupQueue, "Runs waiting for a worker", ""},
-	"queue.undispatched": {groupQueue, "Undispatched task runs", ""},
-	"controller.report":  {groupControl, "Controller reporting", "hosted-workers"},
-	"db":                 {groupControl, "Database", ""},
-	"loops":              {groupControl, "Background loops", ""},
-	"forge.sync":         {groupIntegrations, "Forge issue sync", ""},
-	"forge.ciwatch":      {groupIntegrations, "CI watch capacity", ""},
-	"slack.socket":       {groupIntegrations, "Slack socket", ""},
-	"schedules.paused":   {groupHousekeeping, "Paused schedules", ""},
-	"board.drift":        {groupHousekeeping, "Board drift", ""},
-	"custody.holds":      {groupHousekeeping, "Recovery custody holds", ""},
-	"release.check":      {groupHousekeeping, "Upstream release", ""},
+	"fleet.roll":         {"instance", groupWorkers, "Worker image roll", "worker-upgrades"},
+	"fleet.capacity":     {"owner", groupWorkers, "Worker capacity", "hosted-workers"},
+	"fleet.disk":         {"owner", groupWorkers, "Worker disk", "hosted-workers"},
+	"fleet.rundisk":      {"owner", groupWorkers, "Run disk size", "hosted-workers"},
+	"queue.waiting":      {"owner", groupQueue, "Runs waiting for a worker", ""},
+	"queue.undispatched": {"owner", groupQueue, "Undispatched task runs", ""},
+	"controller.report":  {"instance", groupControl, "Controller reporting", "hosted-workers"},
+	"db":                 {"instance", groupControl, "Database", ""},
+	"loops":              {"instance", groupControl, "Background loops", ""},
+	"forge.sync":         {"owner", groupIntegrations, "Forge issue sync", ""},
+	"forge.ciwatch":      {"owner", groupIntegrations, "CI watch capacity", ""},
+	"slack.socket":       {"owner", groupIntegrations, "Slack socket", ""},
+	"schedules.paused":   {"owner", groupHousekeeping, "Paused schedules", ""},
+	"board.drift":        {"owner", groupHousekeeping, "Board drift", ""},
+	"custody.holds":      {"owner", groupHousekeeping, "Recovery custody holds", ""},
+	"release.check":      {"owner", groupHousekeeping, "Upstream release", ""},
 }
 
 // base returns a check DTO pre-filled with the id's fixed metadata and a non-nil (empty)
@@ -61,6 +61,7 @@ func (s *Service) base(id string) apitypes.HealthCheckDTO {
 	c := apitypes.HealthCheckDTO{
 		ID:       id,
 		Group:    m.group,
+		Scope:    m.scope,
 		Title:    m.title,
 		Evidence: []apitypes.HealthEvidenceDTO{},
 	}
@@ -245,12 +246,7 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 	return c
 }
 
-// checkFleetCapacity confirms stored roll waits against current composed eligibility.
-// The loop is bounded by the waiting rows and fleetCapacityMaxRollConfirmations; each
-// callback runs at most once under fleetCapacityConfirmTimeout within the shared
-// fleetCapacityConfirmBudget, and a failed, timed-out, over-cap or over-budget row
-// follows genuine capacity treatment without suppressing any sibling row.
-func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health healthDetectorState) apitypes.HealthCheckDTO {
+func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health healthDetectorState, shared ...*waitConfirmations) apitypes.HealthCheckDTO {
 	c := s.base("fleet.capacity")
 	switch health {
 	case healthDetectorDisabled:
@@ -272,27 +268,17 @@ func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health 
 	genuine, overdue, affected, rolling := map[uuid.UUID]bool{}, map[uuid.UUID]bool{}, map[uuid.UUID]bool{}, map[uuid.UUID]bool{}
 	unconfirmed := map[uuid.UUID]bool{}
 	var genuineSince, overdueSince time.Time
-	confirmations := 0
-	// One shared budget for every confirmation; ctx itself stays intact for later checks.
-	budgetCtx, cancelBudget := context.WithTimeout(ctx, fleetCapacityConfirmBudget)
-	defer cancelBudget()
+	confirm := &waitConfirmations{}
+	if len(shared) > 0 {
+		confirm = shared[0]
+	} else {
+		defer confirm.close()
+	}
+	unknownAge := false
+	evidence := waitEvidence{rows: c.Evidence}
 	for _, r := range rows {
-		confirmed := false
-		var overlap time.Time
-		if r.HasRollReason && r.HealthSince.Valid && r.HealthSince.InfinityModifier == pgtype.Finite && !r.HealthSince.Time.IsZero() && !r.HealthSince.Time.After(now) && s.cfg.WorkerEligibilityForHealth != nil && confirmations < fleetCapacityMaxRollConfirmations && budgetCtx.Err() == nil {
-			confirmations++
-			cctx, cancel := context.WithTimeout(budgetCtx, fleetCapacityConfirmTimeout)
-			e, err := s.cfg.WorkerEligibilityForHealth(cctx, now, r.RunID)
-			cancel()
-			drain := e.LatestSuitableDrainingSince
-			if err == nil && e.DrainingEligible > 0 && e.NonDrainingEligible == 0 && e.SuitableOwnDraining == 0 && drain.Valid && drain.InfinityModifier == pgtype.Finite && !drain.Time.IsZero() && !drain.Time.After(now) {
-				confirmed = true
-				overlap = r.HealthSince.Time
-				if drain.Time.After(overlap) {
-					overlap = drain.Time
-				}
-			}
-		}
+		evidence.append(r.RunID, r.UserID, r.HealthReason, r.HealthSince, now)
+		confirmed, overlap := confirm.confirm(s, ctx, now, r.RunID, r.HealthReason, r.HealthSince)
 		if confirmed {
 			rolling[r.UserID] = true
 			if now.Sub(overlap) >= fleetCapacityRollDanger {
@@ -304,13 +290,18 @@ func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health 
 			continue
 		}
 		unconfirmed[r.UserID] = true
-		if r.HealthSince.Valid && r.HealthSince.InfinityModifier == pgtype.Finite && !r.HealthSince.Time.IsZero() && now.Sub(r.HealthSince.Time) >= fleetCapacityDanger {
+		if !validWaitTime(r.HealthSince, now) {
+			unknownAge = true
+			continue
+		}
+		if now.Sub(r.HealthSince.Time) >= fleetCapacityDanger {
 			genuine[r.UserID], affected[r.UserID] = true, true
 			if genuineSince.IsZero() || r.HealthSince.Time.Before(genuineSince) {
 				genuineSince = r.HealthSince.Time
 			}
 		}
 	}
+	c.Evidence = evidence.finish()
 	// Only owners whose every waiting row was confirmed can be described as rolling.
 	for owner := range unconfirmed {
 		delete(rolling, owner)
@@ -318,7 +309,7 @@ func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health 
 	if len(affected) > 0 {
 		c.Severity = sevDanger
 		c.Summary = fmt.Sprintf("%d owner(s) affected.", len(affected))
-		c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Owners affected", Value: fmt.Sprint(len(affected))}}
+		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Owners affected", Value: fmt.Sprint(len(affected))})
 		if len(genuine) > 0 {
 			c.Summary += fmt.Sprintf(" %d owner(s) have queued runs and no usable worker (oldest waiting %s).", len(genuine), humanDur(now.Sub(genuineSince)))
 			c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Owners without capacity", Value: fmt.Sprint(len(genuine))}, apitypes.HealthEvidenceDTO{Label: "Capacity wait since", Value: genuineSince.UTC().Format(time.RFC3339)})
@@ -344,33 +335,56 @@ func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health 
 	}
 	c.Severity = sevOK
 	c.Summary = "Owners waiting for a worker are within the transient window."
+	if unknownAge {
+		c.Severity = sevUnknown
+		c.Summary = "Waiting run age is unavailable."
+		return c
+	}
 	if len(rolling) > 0 {
 		c.Summary = fmt.Sprintf("%d owner(s) are waiting while workers finish their current runs before an upgrade.", len(rolling))
 	}
 	return c
 }
 
-// checkFleetDisk warns when any worker (of any kind) with a fresh heartbeat has a debounced
-// disk-pressure streak of at least diskPressureStreakWarn consecutive polls. There is no
-// danger, unknown or na band for it (it reads live workers, no controller signal).
+// checkFleetDisk preserves the legacy disk-pressure count, adds fresh sustained DinD
+// pressure, and displays pending cleanup even when an operation has outlasted telemetry.
+// There is no danger, unknown or na band.
 func (s *Service) checkFleetDisk(now time.Time, workers []store.ListAllWorkersRow) apitypes.HealthCheckDTO {
 	c := s.base("fleet.disk")
-	var affected int
-	for _, w := range workers {
-		fresh := w.Worker.LastHeartbeatAt.Valid && now.Sub(w.Worker.LastHeartbeatAt.Time) <= s.heartbeatStale()
-		if fresh && w.Worker.StatsDiskPressureStreak >= diskPressureStreakWarn {
+	var affected, pending int
+	for _, row := range workers {
+		w := row.Worker
+		// Keep the legacy heartbeat/streak count unchanged, including its clock semantics.
+		fresh := w.LastHeartbeatAt.Valid && now.Sub(w.LastHeartbeatAt.Time) <= s.heartbeatStale()
+		dind := fresh && !w.LastHeartbeatAt.Time.After(now) && w.DindPressureStreak >= 2 &&
+			w.DindMeterAt.Valid && !w.DindMeterAt.Time.After(now) && now.Sub(w.DindMeterAt.Time) <= 45*time.Second
+		if (fresh && w.StatsDiskPressureStreak >= diskPressureStreakWarn) || dind {
 			affected++
 		}
+		cleanup := dind
+		if w.MaintenanceID.Valid {
+			switch w.MaintenancePhase {
+			case "requested", "ready", "stopping", "recycling":
+				cleanup = true
+			}
+		}
+		if cleanup {
+			pending++
+		}
 	}
-	if affected == 0 {
-		c.Severity = sevOK
-		c.Summary = "No worker is under sustained disk pressure."
-		return c
+	c.Severity = sevOK
+	c.Summary = "No worker is under sustained disk pressure."
+	if affected > 0 {
+		c.Severity = sevWarn
+		c.Summary = fmt.Sprintf("%d worker(s) are under sustained disk pressure.", affected)
+		c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Workers", Value: fmt.Sprintf("%d", affected)}}
+		c.Action = strPtr("Free disk on the affected worker(s) or increase the worker volume size.")
 	}
-	c.Severity = sevWarn
-	c.Summary = fmt.Sprintf("%d worker(s) are under sustained disk pressure.", affected)
-	c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Workers", Value: fmt.Sprintf("%d", affected)}}
-	c.Action = strPtr("Free disk on the affected worker(s) or increase the worker volume size.")
+	if pending > 0 {
+		c.Severity = sevWarn
+		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Cleanup pending", Value: fmt.Sprintf("%d worker(s)", pending)})
+		c.Action = strPtr("DinD cleanup pending can be report-only or waiting safely for active work and retained unpublished work to clear. An active operation can outlast fresh telemetry. Inspect uzi admin workers; wait for safe cleanup, or increase volume capacity.")
+	}
 	return c
 }
 
@@ -450,12 +464,8 @@ func runDiskWarnPercent() int {
 // queue group
 // -------------------------------------------------------------------------
 
-// checkQueueWaiting bands the oldest admission-related waiting_worker run by age;
-// expected plan cross-check waits are excluded. Warn at queueWaitingWarn,
-// danger at queueWaitingDanger. `unknown` when health_enabled is off (the writer is gated
-// by it, D6), and `unknown` when the kill-switch read itself failed (the signal cannot be
-// trusted to read green, so the run tables are not queried).
-func (s *Service) checkQueueWaiting(ctx context.Context, now time.Time, health healthDetectorState) apitypes.HealthCheckDTO {
+// checkQueueWaiting evaluates every genuine waiting row; confirmed drains belong to capacity.
+func (s *Service) checkQueueWaiting(ctx context.Context, now time.Time, health healthDetectorState, shared ...*waitConfirmations) apitypes.HealthCheckDTO {
 	c := s.base("queue.waiting")
 	switch health {
 	case healthDetectorDisabled:
@@ -463,30 +473,56 @@ func (s *Service) checkQueueWaiting(ctx context.Context, now time.Time, health h
 	case healthDetectorUnknown:
 		return unknownHealthReadFailed(c)
 	}
-	ts, err := s.cfg.Store.OldestWaitingWorkerRun(ctx)
+	rows, err := s.cfg.Store.ListWaitingWorkerRuns(ctx)
 	if err != nil {
 		return degradeUnknown(c, "queue.waiting", err)
 	}
-	if !ts.Valid {
-		c.Severity = sevOK
-		c.Summary = "No run is waiting for a worker."
-		return c
+	confirm := &waitConfirmations{}
+	if len(shared) > 0 {
+		confirm = shared[0]
+	} else {
+		defer confirm.close()
 	}
-	age := now.Sub(ts.Time)
-	switch {
-	case age >= queueWaitingDanger:
-		c.Severity = sevDanger
-		c.Summary = fmt.Sprintf("A run has been waiting for a worker for %s.", humanDur(age))
-		c.Since = sincePtr(ts.Time)
-		c.Action = strPtr("Check fleet.capacity and fleet.roll — a stuck roll or zero capacity is the usual cause.")
-	case age >= queueWaitingWarn:
+	var oldest time.Time
+	unknownAge := false
+	genuine := 0
+	evidence := waitEvidence{rows: c.Evidence}
+	for _, r := range rows {
+		if confirmed, _ := confirm.confirm(s, ctx, now, r.RunID, r.HealthReason, r.HealthSince); confirmed {
+			continue
+		}
+		genuine++
+		evidence.append(r.RunID, r.UserID, r.HealthReason, r.HealthSince, now)
+		if !validWaitTime(r.HealthSince, now) {
+			unknownAge = true
+			continue
+		}
+		if oldest.IsZero() || r.HealthSince.Time.Before(oldest) {
+			oldest = r.HealthSince.Time
+		}
+	}
+	c.Evidence = evidence.finish()
+	c.Severity = sevOK
+	c.Summary = "No run has been waiting for a worker longer than 10 minutes."
+	if genuine == 0 {
+		c.Summary = "No run is waiting for a worker."
+		if len(rows) > 0 {
+			c.Summary = "Runs are waiting while workers finish their current runs before an upgrade."
+		}
+	}
+	if !oldest.IsZero() && now.Sub(oldest) >= queueWaitingWarn {
 		c.Severity = sevWarn
-		c.Summary = fmt.Sprintf("A run has been waiting for a worker for %s.", humanDur(age))
-		c.Since = sincePtr(ts.Time)
+		if now.Sub(oldest) >= queueWaitingDanger {
+			c.Severity = sevDanger
+		}
+		c.Summary = fmt.Sprintf("A run has been waiting for a worker for %s.", humanDur(now.Sub(oldest)))
+		c.Since = sincePtr(oldest)
 		c.Action = strPtr("Check fleet.capacity and fleet.roll — a stuck roll or zero capacity is the usual cause.")
-	default:
-		c.Severity = sevOK
-		c.Summary = "No run has been waiting for a worker longer than 10 minutes."
+	}
+	if unknownAge && c.Severity != sevDanger {
+		c.Severity = sevUnknown
+		c.Summary = "Waiting run age is unavailable."
+		c.Since = nil
 	}
 	return c
 }

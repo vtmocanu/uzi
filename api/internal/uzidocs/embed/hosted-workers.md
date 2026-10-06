@@ -35,8 +35,8 @@ particular token afterwards from **Settings → Workers** if you want one.
 [Worker templates](./worker-setup.md#worker-templates) for a self-run worker:
 `base` (Node + git, most repos) or `jvm` (`base` plus a JDK).
 
-**Size** picks how much CPU, memory, and disk the worker gets: **S**, **M**
-(the default), or **L**, each step roughly doubling the last. The provision
+**Size** picks how much CPU, memory, and disk the worker gets: **S**, **M**,
+or **L** (the default), with larger presets providing more capacity. The provision
 form shows the exact numbers next to each option when you pick — they live
 there, not here, so they can't say something different from what you'll
 actually get. Every size also gets the same 20Gi tools cache (`/nix`),
@@ -49,8 +49,14 @@ lease](#ephemeral-worker-lease)), is the exception on `/data`: its `/data` is
 its own setting, 20Gi by default and set by the operator, whatever size the
 worker runs at. Its CPU and memory still follow its size.
 
-**M** is the default because it matches what a self-run worker gets out of
-the box. **Every size costs you the same, 1 of your quota below** — there's
+New persistent and ephemeral hosted workers default to **L** for more build
+and test headroom. Compared with **M**, **L** doubles the CPU and memory
+requests (1 CPU / 8Gi instead of 500m / 4Gi), reserving more node capacity.
+Existing workers keep their stored size. Operators can change the ephemeral
+default through `UZI_EPHEMERAL_DEFAULT_SIZE`; users can choose another size
+when provisioning a persistent worker.
+
+**Every size costs you the same, 1 of your quota below**; there's
 no personal cost to picking bigger. Size for your actual workload anyway,
 not to save quota: **L** for large projects (a big JVM test suite, a large
 `go build`), **S** for light repos. A hosted worker's CPU, memory and disk
@@ -105,6 +111,10 @@ and shows a free run slot, but isn't picking up a run sitting in the queue.
 That's expected while it's cordoned — it isn't a bug, and it isn't stuck. It
 resumes claiming runs on its own once the roll finishes. There's no manual
 way to cordon a worker yourself; it's driven entirely by the cluster.
+
+The Workers page's **Ephemeral workers → Docker-capable** preference adds
+Docker when auto-provisioning for repositories your admin allows; see
+[the triggers, scope and warm-reuse policy](./scheduling.md#auto-provisioning-a-worker-for-an-unmet-capability).
 
 ## Ephemeral worker lease
 
@@ -200,7 +210,8 @@ Two things now self-heal without you deleting and re-provisioning by hand:
 
 - **A tools cache smaller than the current size** (provisioned before a size
   bump, like the one above) gets reconciled to the current size automatically:
-  only the `/nix` cache is recycled, and the `/data` workspace is preserved.
+  only the `/nix` cache PVC is recycled, and the `/data` PVC is preserved.
+  On Docker workers, Deployment replacement still loses run-workdir emptyDir.
 - **A volume that fills up** (at or above 90% used, sustained across a couple
   of heartbeats) gets recycled: the worker is drained first if it's busy —
   same cordon behavior as above — then **both** its volumes are deleted and
@@ -208,11 +219,40 @@ Two things now self-heal without you deleting and re-provisioning by hand:
   the `/data` workspace is permanently lost. A worker recycled this way shows
   the same draining/cordoned pills while it happens.
 
-Both are cluster-driven, like cordoning; there's no button for either. An
-admin can turn the self-heal off entirely via chart config if it's ever not
-wanted.
+A **persistent Docker-capable worker** also has a separate DinD-only
+pressure recycle. It preserves the `/nix` and `/data` PVCs, worker UUID,
+and join Secret, but **loses all DinD state, including named Docker volumes,
+and the shared run-workdir emptyDir** when the Deployment is replaced.
+Deliverables belong in git, published checkpoints, or captured work.
+**This destructive behavior defaults on for existing installs on upgrade.**
 
-This full-volume recycle is the **last resort**. Before a volume gets anywhere
+DinD maintenance waits for every run to finish (`completed`, `failed`, or
+`cancelled`); parked, paused, approval, input, and follow-up waits block
+cleanup. A pending drain refuses new run/chat work while letting this
+worker's own parked runs resume to finish. It then fences claims and
+requires fresh custody clearance and zero local activity before gated
+anonymous-volume pruning or stop. No timer, forced park, or force-roll
+override bypasses this DinD gate. The legacy `/nix`+ `/data` recycle and
+ordinary rolls retain their current drain-deadline/force override behavior.
+
+If legacy and DinD pressure coincide, the legacy recycle goes first; the
+pending DinD intent resumes on a later tick before another legacy recycle.
+The legacy cooldown does not delay DinD cleanup, whose cooldown reads its
+own PVC's creation time. Older workers are report-only; ephemeral Docker
+workers report metering/admin pending state but use terminal teardown
+instead of prune/recycle. See
+[Docker inside a worker](./worker-docker.md#dind-scratch-and-pressure-recycle).
+
+These are cluster-driven; there is no self-heal button. An admin can set
+`UZI_WORKER_DISK_RECYCLE_ENABLED=false` to opt out before DinD stop;
+an operation already stopping finishes safely. Upgrade the chart's Docker
+controller Role with the controller: replacement readiness requires
+`apps/replicasets` `list` in the Docker namespace only, with no Secret
+read permission. An observation limit or list failure leaves maintenance
+pending/fenced rather than granting cleanup; see
+[ADR-1759](../adr/1759-dind-data-metering-and-prune.md#d9--fresh-bounded-observation-and-replacement-readiness).
+
+The legacy nix/data full-volume recycle is the **last resort**. Before that data volume gets anywhere
 near it, a run's own build caches are bounded and reclaimed on their own —
 see [Worker disk safety](./worker-setup.md#worker-disk-safety-prd-1809) for
 the cache drop, in-run cache cap, periodic reclaim, admission stop, and the

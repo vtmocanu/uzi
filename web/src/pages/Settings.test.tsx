@@ -61,6 +61,7 @@ const baseUser: User = {
   ci_autofix_enabled: false,
   attribution_enabled: true,
   ephemeral_workers_enabled: false,
+  ephemeral_docker_enabled: false,
   wait_on_limit: false,
   notify_early_limit_reset: false,
   judge_anthropic_secret_id: null,
@@ -101,6 +102,7 @@ function mockAuth(user: User, appearance = baseAppearance()) {
     login: vi.fn(),
     logout: vi.fn(),
     refresh,
+    updateUser: vi.fn(),
     serverUnreachable: false,
     retry: vi.fn(),
   });

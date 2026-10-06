@@ -46,14 +46,17 @@ func durationToInterval(d time.Duration) pgtype.Interval {
 }
 
 // EphemeralSettings is the narrow settings dependency of the provisioner: the
-// instance-wide kill-switch. *settings.Cache satisfies it via EphemeralWorkersEnabled.
+// instance-wide kill-switch and Docker repository scope. *settings.Cache satisfies it.
 type EphemeralSettings interface {
 	EphemeralWorkersEnabled(ctx context.Context) (bool, error)
+	DockerRepoAllowlist(ctx context.Context) ([]uuid.UUID, error)
 }
 
 // EphemeralConfig carries the tuning knobs the provisioner needs (PRD #529 M2), lifted
 // out of config.Config so hostedsvc does not depend on the config package.
 type EphemeralConfig struct {
+	// DockerEnabled is the effective deployment Docker tier (config.WorkerDockerEnabled).
+	DockerEnabled bool
 	// IsolatedLaneEnabled reports whether the deployment enabled the isolated research lane
 	// (config.Config.IsolatedLaneEnabled). The zero value is off and fails closed: with it off
 	// ProvisionPass never lists or provisions isolated-lane workers (issue #1965), since the
@@ -141,6 +144,16 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		return 0, nil
 	}
 
+	allowlist, err := p.settings.DockerRepoAllowlist(ctx)
+	if err != nil {
+		slog.Warn("ephemeral provisioner: read Docker allowlist; continuing without preference-driven Docker", "error", err)
+		allowlist = []uuid.UUID{}
+	}
+
+	if allowlist == nil {
+		allowlist = []uuid.UUID{}
+	}
+
 	// @max_per_user is the cross-user FAIRNESS filter (see the query comment): it excludes
 	// runs whose owner is already at/over the per-user ephemeral cap so one at-cap user with
 	// a large backlog cannot monopolize every batch. It is an unlocked snapshot, so it is
@@ -159,7 +172,9 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		MaxPerUser:     int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
 		EphemeralLease: workersvc.LeaseInterval(p.cfg.Lease),
 		// PRD #2006: the lease arm mirrors ClaimRun's custom-Codex-model gate.
-		CodexCuratedModels: workersvc.CodexCuratedModels(),
+		CodexCuratedModels:  workersvc.CodexCuratedModels(),
+		WorkerDockerEnabled: p.cfg.DockerEnabled,
+		DockerRepoAllowlist: allowlist,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("hostedsvc: list unplaceable queued runs: %w", err)
@@ -170,7 +185,9 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		MaxPerUser:      int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
 		EphemeralLease:  workersvc.LeaseInterval(p.cfg.Lease),
 		// PRD #2006: the lease arm mirrors ClaimRun's custom-Codex-model gate.
-		CodexCuratedModels: workersvc.CodexCuratedModels(),
+		CodexCuratedModels:  workersvc.CodexCuratedModels(),
+		WorkerDockerEnabled: p.cfg.DockerEnabled,
+		DockerRepoAllowlist: allowlist,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("hostedsvc: list saturation queued runs: %w", err)
@@ -195,10 +212,13 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 	// so under a full batch it takes priority over saturation runs, which are transient and
 	// may still be claimed by a freeing slot.
 	type ephemeralCandidate struct {
-		id      uuid.UUID
-		userID  uuid.UUID
-		caps    []string
-		trigger string
+		id               uuid.UUID
+		userID           uuid.UUID
+		caps             []string
+		trigger          string
+		repoID           pgtype.UUID
+		kind             string
+		dockerPreference bool
 	}
 	candidates := make([]ephemeralCandidate, 0, len(laneRuns)+len(gapRuns)+len(satRuns))
 	seen := make(map[uuid.UUID]struct{}, len(laneRuns)+len(gapRuns)+len(satRuns))
@@ -212,14 +232,14 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 			continue
 		}
 		seen[run.ID] = struct{}{}
-		candidates = append(candidates, ephemeralCandidate{id: run.ID, userID: run.UserID, caps: run.RequiredCapabilities, trigger: triggerCapabilityGap})
+		candidates = append(candidates, ephemeralCandidate{id: run.ID, userID: run.UserID, caps: run.RequiredCapabilities, trigger: triggerCapabilityGap, repoID: run.RepoID, kind: run.Kind, dockerPreference: run.EphemeralDockerEnabled})
 	}
 	for _, run := range satRuns {
 		if _, dup := seen[run.ID]; dup {
 			continue
 		}
 		seen[run.ID] = struct{}{}
-		candidates = append(candidates, ephemeralCandidate{id: run.ID, userID: run.UserID, caps: run.RequiredCapabilities, trigger: triggerSaturation})
+		candidates = append(candidates, ephemeralCandidate{id: run.ID, userID: run.UserID, caps: run.RequiredCapabilities, trigger: triggerSaturation, repoID: run.RepoID, kind: run.Kind, dockerPreference: run.EphemeralDockerEnabled})
 	}
 	if len(candidates) > int(ephemeralProvisionBatch) {
 		candidates = candidates[:ephemeralProvisionBatch]
@@ -243,6 +263,9 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 				"run_id", c.id, "trigger", c.trigger, "required_capabilities", c.caps)
 			continue
 		}
+		if !isolated && EphemeralDockerPreferenceApplies(c.dockerPreference, p.cfg.DockerEnabled, c.repoID, pgtype.Text{String: c.kind, Valid: true}, pgtype.UUID{}, allowlist) {
+			docker = true
+		}
 		ok, perr := p.provisionOne(ctx, c.userID, c.id, template, docker, isolated)
 		if perr != nil {
 			slog.Error("ephemeral provisioner: provision failed; continuing with the rest of the pass",
@@ -256,6 +279,20 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		}
 	}
 	return created, nil
+}
+
+// EphemeralDockerPreferenceApplies mirrors fn_ephemeral_docker_preference_applies.
+// Ordinary candidates have no egress profile; callers must retain the isolated-trigger guard.
+func EphemeralDockerPreferenceApplies(preference, tier bool, repo pgtype.UUID, kind pgtype.Text, profile pgtype.UUID, allowlist []uuid.UUID) bool {
+	if !preference || !tier || !repo.Valid || !kind.Valid || kind.String == "job" || profile.Valid {
+		return false
+	}
+	for _, id := range allowlist {
+		if id == uuid.UUID(repo.Bytes) {
+			return true
+		}
+	}
+	return false
 }
 
 // ReapPass is the orphan/failure GC backstop (PRD #529 M5), wired as a sweeper.Pass.

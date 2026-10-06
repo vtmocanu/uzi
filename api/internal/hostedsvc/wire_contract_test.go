@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // wireContractFixture is the single golden file both sides of the controller
@@ -49,8 +51,9 @@ func samplePollResponse() PollResponse {
 			// (false/true), so BOTH states of BOTH new M4 fields ride one wire and a drop of
 			// either on either side reddens (PRD #837 M4), the same both-states rationale as
 			// Docker/Busy above.
-			DiskPressure: true,
-			Ephemeral:    false,
+			DiskPressure:        true,
+			DiskPressureVolumes: []string{"nix", "dind"},
+			Ephemeral:           false,
 			// CustodyHeld true here, false on the second worker: both states of the new
 			// PRD #1296 M1 field ride one wire so a drop on either side reddens, the same
 			// both-states rationale as Docker/Busy/DiskPressure above.
@@ -77,14 +80,25 @@ func samplePollResponse() PollResponse {
 			DrainingSince: func() *time.Time { t := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC); return &t }(),
 			// DiskPressure false, Ephemeral true: the mirror of the first worker, so both
 			// states of both M4 fields appear on one wire (PRD #837 M4).
-			DiskPressure: false,
-			Ephemeral:    true,
+			DiskPressure:        false,
+			DiskPressureVolumes: []string{},
+			Ephemeral:           true,
 			// CustodyHeld false: the mirror of the first worker, so both states of the
 			// PRD #1296 M1 field appear on one wire.
 			CustodyHeld: false,
 			// No token to write: a pod already proved it holds one (its plaintext
 			// lives only in the cluster Secret now), or the buffer expired unread.
 			JoinToken: nil,
+		},
+		{
+			ID:       "33333333-3333-3333-3333-333333333333",
+			Template: "base", Size: "m", Generation: 1, Docker: true,
+			DiskPressureVolumes: []string{"dind"},
+			DindMaintenance: &workersvc.DindMaintenance{
+				ID: "44444444-4444-4444-4444-444444444444", Nonce: "maintenance-operation",
+				Phase: "requested", DeploymentUID: "deployment-uid", PVCUID: "pvc-uid",
+				RegisterNonce: "registration-nonce",
+			},
 		},
 	}}
 }

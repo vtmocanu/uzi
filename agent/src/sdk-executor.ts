@@ -70,6 +70,7 @@ import {
   buildRepoInstructionsContext,
   buildRevisePlanPrompt,
   buildSelfImprovePlanPrompt,
+  dockerScratchResumeNote,
   isNotCodePlan,
 } from "./prompt.js";
 import { resolveRunKind } from "./run-kind.js";
@@ -93,7 +94,8 @@ import {
 import { classifyLimitEvidence, LimitReachedError } from "./limit.js";
 import { PauseNowSignal, CredentialSwitchSignal, PLAN_APPROVAL_TIMEOUT_REASON, type PlanVerdict } from "./steering.js";
 import { DiskParkSignal } from "./cache-cap.js";
-import { type RunProcessReap, type RunProcessScan, reapRunProcesses, scanRunProcesses } from "./run-procs.js";
+import { type RunProcessOps, type RunProcessReap, type RunProcessScan, defaultRunProcessOps } from "./run-procs.js";
+export type { RunProcessOps } from "./run-procs.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { buildForgeToolsServer, FORGE_SERVER_NAME } from "./forge-tools.js";
 import { buildFindingsToolsServer, FINDINGS_SERVER_NAME } from "./findings-tools.js";
@@ -478,18 +480,6 @@ function emitEnvironmentFactsStatus(ctx: RunContext, facts: EnvFacts): void {
   if (text) ctx.emit({ kind: "status", agent: "worker", payload: { text } });
 }
 
-/** PRD #1809 D4: the run-process attribution the executor uses (see run-procs.ts). */
-export interface RunProcessOps {
-  /** `spawnedPids`: the run's live CLI pids, which link an unreadable descendant to the run. */
-  scan: (home: string, worktree: string | undefined, spawnedPids: readonly number[]) => Promise<RunProcessScan>;
-  reap: (home: string, worktree: string | undefined, spawnedPids: readonly number[]) => Promise<RunProcessReap>;
-}
-
-const defaultRunProcesses: RunProcessOps = {
-  scan: (home, worktree, spawnedPids) => scanRunProcesses(home, worktree, spawnedPids),
-  reap: (home, worktree, spawnedPids) => reapRunProcesses(home, worktree, spawnedPids),
-};
-
 /**
  * PRD #1809 D4: throw the hard layer's COUNTED disk park when the worker-local `disk` stop is set
  * (steering's sticky pause mode). Called at every implement boundary and on every path that clears
@@ -826,7 +816,7 @@ export class SdkExecutor implements Executor {
     this.cliGroupPresent = opts.cliGroupPresent ?? processGroupPresent;
     this.rootStartTime = opts.rootStartTime;
     this.quietSettleMs = opts.quietSettleMs ?? QUIET_SETTLE_MS;
-    this.runProcesses = opts.runProcesses ?? defaultRunProcesses;
+    this.runProcesses = opts.runProcesses ?? defaultRunProcessOps();
     this.envProbeSpawner = opts.envProbeSpawner;
     this.secretPaths = opts.secretPaths ?? [];
     // Provisioning HOME + root are SHARED worker-lifetime paths (Decision 5): they
@@ -1927,6 +1917,8 @@ export class SdkExecutor implements Executor {
             environmentFacts,
           });
         }
+        const dockerResume = dockerScratchResumeNote(ctx.dockerScratchResume);
+        if (dockerResume) planPrompt += `\n\n${dockerResume}`;
         // PRD #1247 M5b (D13): both paths below set `approvedPlan` + the candidate milestone list,
         // then share the gate + revision loop. A resume-at-gate run does NOT run a planning turn —
         // it re-presents the ALREADY-CAPTURED plan (the persisted plan_md → ctx.approvedPlan) at the
@@ -2743,6 +2735,7 @@ export class SdkExecutor implements Executor {
             // written against the old tree is not acted on as if that work survived. The
             // reseedNote gate is first-turn-only, so later turns are unchanged.
             resumed: ctx.resumed,
+            dockerScratchResume: ctx.dockerScratchResume,
             // PRD #759 M2/R1: the reseed recovered an uncommitted WIP snapshot, so the
             // first implement turn tells a cold resumed lead to reconcile the dirty tree
             // against the plan (and supersedes the now-false reseedNote). First turn only.

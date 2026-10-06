@@ -105,6 +105,8 @@ function forceRm(dir: string): void {
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+const LINUX_ONLY = process.platform !== "linux" ? "requires Linux runner process-proof and attributed-reap semantics" : false;
+
 describe("RunRunner — cache drop on a process-ending park (PRD #1809 M1)", () => {
   it("a usage-limit park drops the caches, keeps the resume state, and the resume continues the parked session", async (t) => {
     // The drop pins descriptors through /proc/self/fd and refuses without it (rmHomeSubtree).
@@ -253,7 +255,7 @@ describe("RunRunner — cache drop on a process-ending park (PRD #1809 M1)", () 
     });
   }
 
-  it("the finalize security reap awaits the attributed reap BEFORE the PAT-bearing push (N-a)", async () => {
+  it("the finalize security reap awaits the attributed reap BEFORE the PAT-bearing push (N-a)", { skip: LINUX_ONLY }, async () => {
     const { gitlab } = fakeGitlab();
     simulateCommittedWork();
     const events: string[] = [];

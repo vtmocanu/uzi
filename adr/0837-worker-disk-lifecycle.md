@@ -48,7 +48,7 @@ The reconcile loop is stateless, so rather than persist "last recycled", the pre
 
 The multi-phase machine deletes the old PVC **before** the new one is re-minted. If the new PVC cannot bind (storage class unavailable, quota exhausted, no schedulable node), the old data is already gone and there is nothing to roll back to — the worker is left with no volume, a permanent outage plus loss of whatever the recycled volume held. This is inherent to reclaim-by-delete and cannot be made atomic without keeping two PVCs' worth of quota reserved per worker, which the ceiling/quota model (`ValidatePVCCeilings`) does not budget for. The mitigation is **detection, not prevention**: a re-mint stuck `Pending` past a bound timeout should surface loudly (a stable log token, the display-only report path) so an operator intervenes. Do **not** attempt an automatic rollback — there is no prior state to restore, and papering over that with a "retry from scratch" would hide the real failure (an exhausted storage class or quota) behind a busy-loop instead of surfacing it.
 
-**The detector (#1115, landed).** `observeNamespace` now records each LIVE `/nix` and `/data` PVC's `.status.phase`, and `Materializer.flagStrandedPVCs` — run over the assembled observed set once per tick inside `Observe`, after the pod pass so its synthesized health is not clobbered — treats a target PVC still `Pending` past a **bound-timeout of 10 minutes** as stranded. The timeout is `pvcBindTimeout`, a package constant in `controller/internal/kube/materializer.go`, deliberately **not** an env/`RecyclePolicy` knob in v1 (promote it to one if a backend legitimately provisions slower). **Start event:** the PVC's own `.metadata.creationTimestamp` — the loop is stateless, so Pending-age is `now − creationTimestamp`, the same signal the D5 recycle cooldown reads. A strand emits the **stable log token** `pvc-bind-timeout worker=<id> pvc=<name> pending_for=<dur>` (one line per stranded volume) and **surfaces on the display-only roll-health report path** by synthesizing a `stuck` `WorkerStatus` — `BlockingContainer=<PVC name>`, `BlockingReason="stranded Pending past 10m0s bind-timeout; no auto-rollback"` (kept within the api's 64-byte self-reported display cap so it renders in full) — which the api classifies `upgrade_failed` and the Workers UI renders on the failed-worker strip, no new wire field. Detection covers the two recycle targets `/nix` and `/data` (`dind-data` stays the documented v1 gap below), names `/nix` first when both are stranded, is **ungated by the recycle toggle** (it is display-only, issues no create/delete/patch, and must stay visible even with recycle off), and performs **no auto-rollback** — surfacing the exhausted storageclass/quota for an operator is the whole point.
+**The detector (#1115, landed).** `observeNamespace` now records each LIVE `/nix` and `/data` PVC's `.status.phase`, and `Materializer.flagStrandedPVCs` — run over the assembled observed set once per tick inside `Observe`, after the pod pass so its synthesized health is not clobbered — treats a target PVC still `Pending` past a **bound-timeout of 10 minutes** as stranded. The timeout is `pvcBindTimeout`, a package constant in `controller/internal/kube/materializer.go`, deliberately **not** an env/`RecyclePolicy` knob in v1 (promote it to one if a backend legitimately provisions slower). **Start event:** the PVC's own `.metadata.creationTimestamp` — the loop is stateless, so Pending-age is `now − creationTimestamp`, the same signal the D5 recycle cooldown reads. A strand emits the **stable log token** `pvc-bind-timeout worker=<id> pvc=<name> pending_for=<dur>` (one line per stranded volume) and **surfaces on the display-only roll-health report path** by synthesizing a `stuck` `WorkerStatus` — `BlockingContainer=<PVC name>`, `BlockingReason="stranded Pending past 10m0s bind-timeout; no auto-rollback"` (kept within the api's 64-byte self-reported display cap so it renders in full) — which the api classifies `upgrade_failed` and the Workers UI renders on the failed-worker strip, no new wire field. Detection now covers `/nix`, `/data` and, after #1760, `dind-data` (this display-only detector does not establish DinD replacement readiness; see the current policy below), names `/nix` first when both are stranded, is **ungated by the recycle toggle** (it is display-only, issues no create/delete/patch, and must stay visible even with recycle off), and performs **no auto-rollback** — surfacing the exhausted storageclass/quota for an operator is the whole point.
 
 ### D7 — Both recycle arms exclude ephemeral workers and share one helper
 
@@ -64,13 +64,48 @@ The multi-phase machine deletes the old PVC **before** the new one is re-minted.
 
 ## Known gap
 
-The docker-tier `dind-data` PVC (the build/image cache on a docker-capable hosted worker) is neither metered nor recycled in v1 — M1 samples only `/nix` and `/data`. It is the volume most likely to fill on a docker-tier worker, and `disk_pressure` can never fire on it. Documented as a deliberate v1 boundary and fast-follow (meter it in a later pass, then the existing M4 arm can act on it without further design work), not a regression.
+In the original #837 scope, the docker-tier `dind-data` PVC (the build/image cache on a docker-capable hosted worker) was neither metered nor recycled — M1 sampled only `/nix` and `/data`. It is the volume most likely to fill on a docker-tier worker, and `disk_pressure` can never fire on it. That was a deliberate v1 boundary. DinD now has a separate maintenance arm, rather than extending the legacy M4 nix/data arm.
 
-**Update (issue #1759):** the metering half of this gap is closed — a `dind-meter` sidecar now samples `dind-data` and the worker runs a gated, allowlisted cache prune under pressure — but `disk_pressure` still never sees this volume and there is still no recycle of the PVC itself; see [ADR-1759](1759-dind-data-metering-and-prune.md).
+**Update (#1759/#1760; maintainer decision 2026-10-04, AI-synced 2026-10-05):**
+`dind-meter` meters DinD bytes/inodes; eligible cache pruning remains the
+first reclaim attempt. Separate per-volume flags now request **DinD-only**
+PVC recycling after at least two distinct fresh current-registration
+epochs, with a 45s freshness bound and reset across gaps. The legacy
+`disk_pressure` boolean remains nix/data-only.
+
+DinD readiness is terminal-only: any run status except completed, failed or
+cancelled blocks cleanup, including parked/paused/approval/input/follow-up
+waits. Pending drain refuses new run/chat work but lets own parked resumes
+finish; the later atomic all-claims fence also requires zero local activity
+and fresh post-activity matching custody clearance. There is no DinD
+`ForceRoll`/`DrainDeadline` bypass. **D7's ordinary legacy override behavior
+is unchanged**, not universally terminal-gated.
+
+Within the strict gate, an optional server API >=1.42 check permits exactly
+`docker volume prune -f` (unreferenced anonymous volumes only). Skip/failure
+or insufficient reclaim does not block recycling. UID-bound foreground
+Deployment deletion must be followed by observation that it and old pods,
+including Terminating pods, are gone before the UID-bound DinD PVC delete.
+Replacement binding, pod readiness, fresh registration heartbeat and
+published readiness precede fence release; a failed bind stays fenced,
+with no rollback. DinD cooldown reads its own PVC creation time.
+
+**Default-on upgrade warning:** the DinD PVC recycle loses containers,
+named/anonymous volumes, networks, images and build cache, and Deployment
+replacement loses run-workdir emptyDir. Nix/data PVCs, worker UUID and join
+Secret survive. Deliverables use git/checkpoints/capture, with no
+preservation inventory or migration. Set
+`UZI_WORKER_DISK_RECYCLE_ENABLED=false` before stop to opt out; a started
+safe operation finishes even if disabled. Simultaneous pressure runs
+legacy first with pending DinD intent, then DinD on a later tick before
+another legacy recycle; legacy cooldown does not delay DinD. See
+[ADR-1759 D7-D9](1759-dind-data-metering-and-prune.md#d7--dind-is-scratch-readiness-is-terminal-only-not-executor-idle)
+for capability, ephemeral/compose, observation-limit and RBAC boundaries.
+Real-cluster validation is maintainer post-release work and has not run.
 
 ## Consequences
 
-- Disk joins CPU/memory as a first-class, display-only worker metric; the `stats_disk_*` columns must stay out of every scheduling/claim/assignment/sweeper query, exactly like the existing `stats_*` columns.
+- Disk joins CPU/memory as a first-class worker metric. The gauges display usage; derived pressure also drives lifecycle maintenance and worker-local disk admission/reclaim. The legacy `disk_pressure` boolean is nix/data-only; separate DinD pressure and maintenance fences have the boundaries documented above.
 - A hosted worker's `/nix`/`/data` volumes are no longer a one-way ratchet toward full — both an undersized-PVC drift and a genuinely full volume now self-heal without an operator manually deleting and reprovisioning the worker.
 - The await-gone gate and the Terminating-PVC observe fix are the two properties that make any *future* delete-and-remint drift arm on this codebase safe; a new arm that skips either reintroduces the quota-churn and doomed-Deployment failure modes this ADR exists to avoid.
 - The default-ON decision (D9) means an operator who wants to observe before trusting automated teardown must explicitly set `UZI_WORKER_DISK_RECYCLE_ENABLED=false` rather than relying on a shipped-off default.

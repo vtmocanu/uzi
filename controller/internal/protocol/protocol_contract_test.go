@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -34,12 +35,15 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 		t.Fatalf("decode golden: %v", err)
 	}
 
-	if len(resp.Workers) != 2 {
-		t.Fatalf("%d workers, want 2", len(resp.Workers))
+	if len(resp.Workers) != 3 {
+		t.Fatalf("%d workers, want 3", len(resp.Workers))
 	}
 
 	// A worker whose token is still awaiting delivery.
 	pending := resp.Workers[0]
+	if !slices.Equal(pending.DiskPressureVolumes, []string{"nix", "dind"}) {
+		t.Fatalf("disk_pressure_volumes = %v, want [nix dind]", pending.DiskPressureVolumes)
+	}
 	if pending.ID != "11111111-1111-1111-1111-111111111111" {
 		t.Fatalf("id = %q", pending.ID)
 	}
@@ -102,6 +106,9 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	// nil is load-bearing — it means "write nothing", not "this worker has no token"
 	// — so the pointer type must survive the round trip rather than collapsing to "".
 	noToken := resp.Workers[1]
+	if noToken.DiskPressureVolumes == nil || len(noToken.DiskPressureVolumes) != 0 {
+		t.Fatalf("disk_pressure_volumes = %v, want non-nil empty array", noToken.DiskPressureVolumes)
+	}
 	if noToken.JoinToken != nil {
 		t.Fatal("a null join_token must parse as nil")
 	}
@@ -139,6 +146,30 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	}
 	if !noToken.Isolated {
 		t.Fatal("isolated must parse as true for the golden's second worker (the lane worker)")
+	}
+
+	// DinD-only pressure leaves the legacy boolean false; the operation binding
+	// must survive both protocol mirrors without dropping identity or gate fields.
+	dind := resp.Workers[2]
+	wantOperation := DindMaintenance{
+		ID: "44444444-4444-4444-4444-444444444444", Nonce: "maintenance-operation",
+		Phase: "requested", DeploymentUID: "deployment-uid", PVCUID: "pvc-uid",
+		RegisterNonce: "registration-nonce",
+	}
+	if !dind.Docker || dind.DiskPressure || !slices.Equal(dind.DiskPressureVolumes, []string{"dind"}) ||
+		dind.DindMaintenance == nil || *dind.DindMaintenance != wantOperation {
+		t.Fatalf("DinD-only worker lost pressure or maintenance binding: %+v", dind)
+	}
+	roundTrip, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded PollResponse
+	if err := json.Unmarshal(roundTrip, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Workers[2].DindMaintenance == nil || *decoded.Workers[2].DindMaintenance != wantOperation {
+		t.Fatal("maintenance binding changed on round-trip")
 	}
 }
 

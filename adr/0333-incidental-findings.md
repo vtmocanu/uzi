@@ -6,9 +6,11 @@
 **PRD**: [prds/done/333-incidental-findings.md](../prds/done/333-incidental-findings.md) (GitLab issue [vtmocanu/uzi#333](https://github.com/vtmocanu/uzi/issues/333)) — the PRD carries the eight milestones, the full evidence base, and the Decision Log (D1–D12); this ADR carries only the durable seams a future change must respect, and the alternatives that were rejected, so a reader rebuilding from specs need not reread it.
 **Numbering**: `0333` is the **PRD / issue** number, like `0065` and `0238`; it is not an ADR sequence number. A reader who assumes "ADR number == ADR count" will miscount.
 
+**Partial supersession — 2026-10-05, #2271**: Incidental findings no longer send Slack DMs or create new notification latch rows; this retires the original notification and re-notify promises. Capture, storage, listing, backlog, filing and dispositions remain unchanged. The coordinate/content-hash re-open invariant below remains binding; re-surfacing means returning to the backlog, not sending a notice. The original PRD Decision Log remains historical.
+
 ## Decision (summary)
 
-A worker mid-run can flag a bug it noticed **outside its task** without stopping or ending its turn. The finding is recorded, the user is told asynchronously (inbox + Slack), and it becomes a forge issue only on an explicit human file action, on the user's own connection — the same guardrail every forge write in uzi already honours: **the human gates every filing; the worker never writes to the forge.**
+A worker mid-run can flag a bug it noticed **outside its task** without stopping or ending its turn. The finding is recorded and appears in the run stream and Findings backlog, and it becomes a forge issue only on an explicit human file action, on the user's own connection — the same guardrail every forge write in uzi already honours: **the human gates every filing; the worker never writes to the forge.**
 
 Four seams are durable and are the subject of this ADR:
 
@@ -17,11 +19,11 @@ Four seams are durable and are the subject of this ADR:
 3. **The content-hash re-open rule** — the anti-nag invariant: a report on an already-resolved coordinate re-surfaces iff its normalised content hash *differs*.
 4. **Human-gated, claim-first filing** — a guarded `open→filing` UPDATE makes concurrent double-file produce exactly one issue; a stranded `filing` is reaped by a sweeper.
 
-Everything else in the feature (the web surfaces, the CLI, the notification renderer, the label assembly) is conventional reuse of existing patterns and lives only in the PRD.
+Everything else in the feature (the web surfaces, the CLI, the label assembly) is conventional reuse of existing patterns and lives only in the PRD.
 
 ## Context
 
-Headless uzi runs have no one watching the stream, so Claude Code's local move — *asking* "want me to file these as issues?" — is the wrong shape. The worker routinely reads code adjacent to its task and notices a real, unrelated bug; its only prior options were to smuggle an out-of-scope fix into the task MR (widening the diff and risking `main`-adjacent scope creep), bury it in prose nobody reads, or drop it. The feature is the headless equivalent of the local prompt: flag without blocking, tell the user out-of-band, let them file or dismiss on their own schedule.
+Headless uzi runs have no one watching the stream, so Claude Code's local move — *asking* "want me to file these as issues?" — is the wrong shape. The worker routinely reads code adjacent to its task and notices a real, unrelated bug; its only prior options were to smuggle an out-of-scope fix into the task MR (widening the diff and risking `main`-adjacent scope creep), bury it in prose nobody reads, or drop it. The feature is the headless equivalent of the local prompt: flag without blocking, collect it in the backlog, let them file or dismiss on their own schedule.
 
 Three existing structures set the constraints, and getting the seam right was mostly about **not** reaching for the nearest one:
 
@@ -64,12 +66,12 @@ The `(user_id, repo_id, location)` coordinate has **no content discriminator** �
 
 So `finding_dispositions.content_hash` — the sha256 of the normalised title+description (the judge's `rationale_hash` idea reinstated) — decides re-surfacing:
 
-- A report on a `filed`/`dismissed` coordinate whose hash **matches** records the evidence row but does **not** notify and does **not** re-enter the to-file bucket. **A dismissed bug stays gone across runs.**
-- A report whose hash **differs materially** re-opens the coordinate (back to `open`, re-notify).
+- A report on a `filed`/`dismissed` coordinate whose hash **matches** records the evidence row but does **not** re-enter the to-file bucket. **A dismissed bug stays gone across runs.**
+- A report whose hash **differs materially** re-opens the coordinate (back to `open` in the backlog, without a notification).
 
-**This is the invariant a future change to the capture or dedup path must preserve.** If you change how `location` is canonicalised, how the coordinate is keyed, or how the hash is computed, you are changing whether a dismissed finding can nag again — and the anti-nag guarantee is the whole reason the feature is safe to leave on. The guarantee is pinned by a dedicated end-to-end scenario (report → dismiss → re-report same coordinate from a later run → no notification, absent from to-file; then a materially-different report re-opens and notifies).
+**This is the invariant a future change to the capture or dedup path must preserve.** If you change how `location` is canonicalised, how the coordinate is keyed, or how the hash is computed, you are changing whether a dismissed finding can nag again — and the anti-nag guarantee is the whole reason the feature is safe to leave on. The capture/disposition scenario in `api/internal/handler/findings_e2e_livedb_test.go` covers report → dismiss → re-report same coordinate from a later run → absent from to-file; then a materially different report re-opens the coordinate. Notification and re-notify expectations from the original decision are superseded by #2271.
 
-The `open` insert is atomic via `UNIQUE(coordinate)` + `ON CONFLICT DO NOTHING`; the re-open is a *separate guarded UPDATE* on a hash mismatch, not part of the upsert. The suppression check is a benign read-then-notify: a report racing a concurrent file/dismiss of the same coordinate may emit one harmless extra ping — acceptable, not a correctness break.
+The `open` insert is atomic via `UNIQUE(coordinate)` + `ON CONFLICT DO NOTHING`; the re-open is a *separate guarded UPDATE* on a hash mismatch, not part of the upsert. Capture has no notification step; a report racing a concurrent file/dismiss does not send a Slack ping.
 
 ### D4 — Human-gated, claim-first filing is the forge-write-safety seam
 

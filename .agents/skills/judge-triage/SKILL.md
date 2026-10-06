@@ -165,6 +165,7 @@ prints the exact undo command — keep it). After a batch, re-run
   was deleted (its run was deleted) shows `-` in `uzi findings list` and has
   nothing `resolve` can act on, so mark it done from the web Findings page
   instead. Leave the rest open unless the user chooses another disposition.
-- Until grouped filing is available, manually file one issue per coherent root
-  cause and list its finding IDs. This does not link their dispositions or
-  enable automatic Done; leave their triage state unchanged.
+- File one issue per coherent root cause through the Findings page's grouped-file
+  dialog (select the rows, edit the server text before filing), which links each
+  finding to the issue. `uzi findings file ID ID...` posts the unedited server
+  text only. Label filed issues per `.agents/skills/issue-triage/references/taxonomy.md`.

@@ -138,6 +138,13 @@ export class StatsCollector {
   private readonly dataDir: string;
   private readonly dindMeter: () => DindMeterSample | null;
 
+  private latestDindSampleValue: DindMeterSample | null = null;
+
+  /** The exact sample attached by the latest collect, without another meter read. */
+  get latestDindSample(): DindMeterSample | null {
+    return this.latestDindSampleValue;
+  }
+
   private prevSource?: WorkerStats["source"];
   private prevCpuUsec?: bigint;
   private prevTimeNs?: bigint;
@@ -162,6 +169,7 @@ export class StatsCollector {
    * a defensive last resort so a collector failure can never surface to the caller.
    */
   collect(): WorkerStats | undefined {
+    this.latestDindSampleValue = null;
     try {
       const cg = this.readCgroupSample();
       const reading: CgroupReading = cg ?? this.readProcessSample();
@@ -245,7 +253,9 @@ export class StatsCollector {
       stats.disk_dind_total_bytes = s.bytesTotal;
       stats.disk_dind_inodes = s.inodesUsed;
       stats.disk_dind_total_inodes = s.inodesTotal;
+      this.latestDindSampleValue = s;
     } catch {
+      this.latestDindSampleValue = null;
       // An injected source that throws is treated as "no sample".
     }
   }

@@ -224,6 +224,8 @@ export interface CodexHarnessOptions {
    *  its explicit init marker gives that resumed delta a new server lineage. When ABSENT (a
    *  single-epoch or test construction) this defaults to a fresh accountant. */
   readonly accountant?: CodexUsageAccountant;
+  /** Fixed, claim-wide usage diagnostic. Failure must never interrupt model execution. */
+  readonly onTokenUsageIncomplete?: () => void | Promise<void>;
   /** Emit this executor claim leg's one explicit `initialized` event. The first provider epoch sets
    *  this true; recreated internal epochs set it false, so each worker claim creates exactly one
    *  persisted usage-lineage marker regardless of app-server `thread/started` behavior. */
@@ -255,6 +257,29 @@ function noteThreadId(note: CodexNotification): string | undefined {
   if (note.kind !== "activity") return note.threadId;
   const params = asObject(note.params);
   return asString(params?.threadId);
+}
+
+/** Resumed accounting requires raw numeric evidence, including unpriced reasoning/total.
+ * Transport coercion preserves liveness but cannot establish a historical baseline. */
+function validResumedUsage(note: Extract<CodexNotification, { kind: "token_usage_updated" }>): boolean {
+  const container = asObject(asObject(note.params)?.tokenUsage);
+  if (!container || note.usage.pricingEvidenceComplete === false) return false;
+  for (const name of ["total", "last"] as const) {
+    const raw = asObject(container[name]);
+    if (!raw) return false;
+    const decoded = note.usage[name];
+    for (const key of ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens",
+      "outputTokens", "reasoningOutputTokens", "totalTokens"] as const) {
+      const value = raw[key];
+      if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value !== decoded[key])
+        return false;
+    }
+    if (decoded.cachedInputTokens + decoded.cacheWriteInputTokens > decoded.inputTokens ||
+        decoded.reasoningOutputTokens > decoded.outputTokens ||
+        decoded.totalTokens !== decoded.inputTokens + decoded.outputTokens) return false;
+  }
+  return (["inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens",
+    "reasoningOutputTokens", "totalTokens"] as const).every(key => note.usage.last[key] <= note.usage.total[key]);
 }
 
 /** Extract non-empty text off an item, from a bare `text` string and/or a `content`
@@ -419,6 +444,10 @@ export class CodexHarness implements RunHarness {
   // the claim leg's cumulative-since-baseline modelUsage, which one server lineage row de-duplicates
   // with GREATEST. A later worker claim gets a new accountant and a new explicit init lineage.
   private readonly accountant: CodexUsageAccountant;
+  private readonly onTokenUsageIncomplete?: () => void | Promise<void>;
+  private resumedRoot = false;
+  private resumeBoundarySeen = false;
+  private resumeReplay?: Extract<CodexNotification, { kind: "token_usage_updated" }>["usage"];
   private readonly emitClaimInit: boolean;
   private claimInitEmitted = false;
 
@@ -493,6 +522,7 @@ export class CodexHarness implements RunHarness {
     this.credentialValue = opts.credentialValue;
     this.authMode = opts.authMode;
     this.accountant = opts.accountant ?? new CodexUsageAccountant();
+    this.onTokenUsageIncomplete = opts.onTokenUsageIncomplete;
     this.emitClaimInit = opts.emitClaimInit ?? true;
     this.scrubProjected = opts.scrubProjected ?? ((s: string): string => s);
     this.idNonce = opts.idNonce ?? newProjectionNonce();
@@ -945,6 +975,7 @@ export class CodexHarness implements RunHarness {
     // A local watchdog/cancel (owner-aborted signal) ends the stream FIRST (rule 9).
     // requestStop()/close() also settle it via `stopTurn`, so a turn wedged in a pending
     // broker callback ends promptly and does not depend on a new notification arriving.
+    let attemptedResumedRoot: string | undefined;
     let onAbort: (() => void) | undefined;
     let settleStop: (() => void) | undefined;
     const abortPromise = new Promise<"aborted">((resolve) => {
@@ -967,6 +998,10 @@ export class CodexHarness implements RunHarness {
       }
       // 1. Ensure the provider root + transport (launched once, reused after).
       await this.ensureRoot(request.signal);
+      if (request.signal.aborted || this.stopRequested) {
+        this.turnClosed = true;
+        return;
+      }
       const transport = this.transport;
       const notes = this.notes;
       if (!transport || !notes) {
@@ -977,6 +1012,7 @@ export class CodexHarness implements RunHarness {
       //    and NEVER a hook-trust bypass. Reused across turns once established.
       if (this.threadId === undefined) {
         const resumed = request.resumeSessionId !== undefined;
+        this.resumedRoot = resumed;
         this.threadId = resumed
           ? await this.resumeThread(transport, request, rendered)
           : await this.startThread(transport, rendered, request.signal);
@@ -986,7 +1022,14 @@ export class CodexHarness implements RunHarness {
         this.accountant.registerThread(this.threadId, this.currentModel ?? this.provider.model, resumed);
       }
 
-      // 3. Start the turn with the rendered prompt / model / effort.
+      // 3. Stop before sending model work if cancellation arrived during thread setup.
+      if (request.signal.aborted || this.stopRequested) {
+        this.turnClosed = true;
+        return;
+      }
+      // The peer can accept and persist spend before the RPC reply arrives. Record the
+      // resumed attempt before awaiting startTurnRpc, including a rejected pending reply.
+      if (this.resumedRoot) attemptedResumedRoot = this.threadId;
       this.activeTurnId = await this.startTurnRpc(transport, this.threadId, rendered, request.signal);
       if (request.signal.aborted || this.stopRequested) {
         // A stop during launch/thread/turn setup could not name a turn earlier. Now
@@ -1063,9 +1106,8 @@ export class CodexHarness implements RunHarness {
         // consumer. An unknown/unregistered thread id is dropped inside record() (never
         // attributed to root). The note still flows on to its normal handling below (a child's
         // routes to its sink; a root's maps to `activity`), so decode behavior is unchanged.
-        if (step.value.kind === "token_usage_updated") {
-          this.accountant.record(step.value.threadId, step.value.usage);
-        }
+        this.recordUsageNote(step.value);
+        await this.deliverIncompleteNotice();
         // CHILD-THREAD DEMUX (part C). A frame carrying a REGISTERED child thread id is a
         // delegated child's frame: route its CONTENT to the child controller's sink and
         // NEVER map/yield that content on the root loop. But routing must still count as
@@ -1139,6 +1181,10 @@ export class CodexHarness implements RunHarness {
         }
       }
     } finally {
+      // An attempted resumed turn may persist new work before its RPC reply or replay boundary.
+      // A later epoch must not baseline that work away as history of this same claim.
+      if (attemptedResumedRoot !== undefined && !this.accountant.hasBaseline(attemptedResumedRoot))
+        this.accountant.markIncomplete();
       if (onAbort) request.signal.removeEventListener("abort", onAbort);
       if (this.stopTurn === settleStop) this.stopTurn = undefined;
       // Close the outbox for this turn: a callback settling after the stream ended drops its
@@ -1150,7 +1196,14 @@ export class CodexHarness implements RunHarness {
         this.outbox = [];
         this.wakeOutbox = undefined;
       }
+      await this.deliverIncompleteNotice();
     }
+  }
+
+  private async deliverIncompleteNotice(): Promise<void> {
+    if (!this.onTokenUsageIncomplete || !this.accountant.takeIncompleteNotice()) return;
+    // One attempt per shared claim. A rejected diagnostic is nonfatal, with no retry.
+    try { await this.onTokenUsageIncomplete(); } catch { /* execution continues */ }
   }
 
   private async ensureRoot(signal?: AbortSignal): Promise<void> {
@@ -1255,6 +1308,7 @@ export class CodexHarness implements RunHarness {
         "thread/resume",
         {
           threadId: resumeId,
+          excludeTurns: true,
           model: this.currentModel,
           modelProvider: this.provider.name,
           cwd: this.workspace,
@@ -1805,6 +1859,58 @@ export class CodexHarness implements RunHarness {
     return [];
   }
 
+  /** Observe usage in inbound order. Outbound turn/start is not a replay boundary. */
+  private recordUsageNote(note: CodexNotification): void {
+    const root = noteThreadId(note) === this.threadId;
+    if (this.resumedRoot && root &&
+        ((note.kind === "turn_started" && note.turnId === this.activeTurnId) ||
+         (note.kind === "turn_completed" && note.turnId === this.activeTurnId))) {
+      if (!this.resumeBoundarySeen) {
+        // A matching completion without a start cannot prove the historical boundary.
+        if (note.kind === "turn_started" && this.resumeReplay)
+          this.accountant.record(this.threadId!, this.resumeReplay, true);
+        else if (!this.accountant.hasBaseline(this.threadId!)) this.accountant.markIncomplete();
+        this.resumeBoundarySeen = true;
+      }
+    }
+    if (note.method !== "thread/tokenUsage/updated") return;
+    if (this.resumedRoot) {
+      const threadId = noteThreadId(note);
+      const turnId = note.kind === "token_usage_updated"
+        ? note.turnId : asString(asObject(note.params)?.turnId);
+      // Unknown thread identity or malformed root turn identity cannot establish root
+      // usage. Foreign/child turn IDs do not taint root; retain opaque nonblank IDs as-is.
+      if (threadId === undefined || threadId.trim() === "" ||
+          (root && (turnId === undefined || turnId.trim() === ""))) {
+        this.accountant.markIncomplete();
+        return;
+      }
+    }
+    if (this.resumedRoot && root) {
+      if (this.resumeBoundarySeen && note.kind === "token_usage_updated" &&
+          note.turnId !== this.activeTurnId) return;
+      if (note.kind !== "token_usage_updated" || !validResumedUsage(note)) {
+        this.accountant.markIncomplete();
+        return;
+      }
+      if (!this.resumeBoundarySeen) {
+        if (note.turnId === this.activeTurnId) {
+          this.accountant.markIncomplete();
+          return;
+        }
+        // Multiple/stale replay snapshots may precede the boundary. Pick the largest full
+        // snapshot before registering it; never move an existing claim baseline.
+        if (!this.resumeReplay || note.usage.total.totalTokens > this.resumeReplay.total.totalTokens)
+          this.resumeReplay = note.usage;
+        return;
+      }
+      // Late historical/duplicate replay is not new work.
+      if (note.turnId !== this.activeTurnId) return;
+    }
+    if (note.kind === "token_usage_updated")
+      this.accountant.record(note.threadId, note.usage);
+  }
+
   /** Decode a `turn/completed` note into a neutral {@link HarnessTerminal}. Outcome is
    *  success only for status `completed`; anything else (incl. absent) is fail-closed
    *  `failed`. A terminal PROVIDER failure is DATA here — it is never also thrown. */
@@ -1832,7 +1938,10 @@ export class CodexHarness implements RunHarness {
     // table keeps the injectable-clock seam (D5) so the Sol boundary is deterministic in tests.
     const pricing = this.authMode === undefined ? undefined : { authMode: this.authMode, now: new Date() };
     const modelUsage = this.accountant.aggregateByModel(pricing);
-    const usage = attachModelUsage(normalizeCodexUsage(turn?.usage, "turn"), modelUsage);
+    // An ambiguous base turn usage must not bypass the incomplete claim accounting.
+    const usage = this.accountant.usageIncomplete
+      ? undefined
+      : attachModelUsage(normalizeCodexUsage(turn?.usage, "turn"), modelUsage);
     // The RUN-level cost status: subscription/metered/unreported, folded with D5's unreported
     // dominance. Undefined auth mode leaves it `unreported` (price-free), matching `modelUsage`.
     const cost = this.authMode === undefined ? { kind: "unreported" as const } : deriveCodexRunCost(modelUsage, this.authMode);

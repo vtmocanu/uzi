@@ -152,15 +152,22 @@ function emptyDockerConfigDir(): string {
   return dockerConfigDir;
 }
 
+/** Shared by the two frozen command runners; never inherits worker credentials. */
+export function dockerExecEnvironment(dockerHost: string): NodeJS.ProcessEnv {
+  const configDir = emptyDockerConfigDir();
+  return { PATH: CHILD_PATH, HOME: configDir, DOCKER_CONFIG: configDir, DOCKER_HOST: dockerHost };
+}
+
 /** Runs `<file> <argv>` and resolves its stdout; rejects on non-zero exit or timeout. */
 export type DockerExec = (
   argv: readonly string[],
   opts: { file: string; env: NodeJS.ProcessEnv; timeoutMs: number; signal?: AbortSignal },
 ) => Promise<string>;
 
-const execDocker: DockerExec = (argv, opts) =>
+export const execDocker: DockerExec = (argv, opts) =>
   new Promise((resolve, reject) => {
-    execFile(
+    let result: { err: Error | null; stdout: string } | undefined;
+    const child = execFile(
       opts.file,
       [...argv],
       {
@@ -170,8 +177,15 @@ const execDocker: DockerExec = (argv, opts) =>
         maxBuffer: MAX_STDOUT_BYTES,
         ...(opts.signal ? { signal: opts.signal } : {}),
       },
-      (err, stdout) => (err ? reject(err) : resolve(String(stdout))),
+      (err, stdout) => { result = { err, stdout: String(stdout) }; },
     );
+    // execFile can call back on AbortSignal before the child exits. The close event
+    // confirms termination and closed stdio before controllers release their claims.
+    child.once("close", () => {
+      if (!result) return; // Unconfirmed completion must keep claims fenced.
+      if (result.err) reject(result.err);
+      else resolve(result.stdout);
+    });
   });
 
 /**
@@ -182,12 +196,12 @@ const execDocker: DockerExec = (argv, opts) =>
  * slip a run in between the idle check and the prune.
  */
 export class DindPruneGate {
-  private closed = false;
+  private readonly blockers = new Set<"cache" | "maintenance">();
   private inFlight = 0;
 
   /** False while the prune holds the gate; otherwise counts one in-flight claim. */
   tryEnterClaim(): boolean {
-    if (this.closed) return false;
+    if (this.claimsClosed()) return false;
     this.inFlight++;
     return true;
   }
@@ -199,15 +213,19 @@ export class DindPruneGate {
 
   /** Whether the prune currently holds the gate (claim loops sleep a poll and retry). */
   claimsClosed(): boolean {
-    return this.closed;
+    return this.blockers.size > 0;
   }
 
-  close(): void {
-    this.closed = true;
+  close(owner: "cache" | "maintenance" = "cache"): void {
+    this.blockers.add(owner);
   }
 
-  open(): void {
-    this.closed = false;
+  open(owner: "cache" | "maintenance" = "cache"): void {
+    this.blockers.delete(owner);
+  }
+
+  heldBy(owner: "cache" | "maintenance"): boolean {
+    return this.blockers.has(owner);
   }
 
   inFlightClaims(): number {
@@ -454,7 +472,7 @@ export class DindPruneController {
    *  and released in `finally` on every path. */
   private async attempt(signal?: AbortSignal): Promise<DindPruneOutcome> {
     // Cheap pre-check so a busy worker's claim loops are not paused every tick.
-    if (!this.idleNow()) return this.deferred("active-work");
+    if (this.gate.claimsClosed() || !this.idleNow()) return this.deferred("active-work");
     this.gate.close();
     try {
       const drained = await this.waitClaimsDrained(signal);
@@ -531,13 +549,7 @@ export class DindPruneController {
    *  starts empty (buildx may write its own state there). */
   private async docker(argv: readonly string[], timeoutMs: number, signal?: AbortSignal): Promise<string> {
     assertDockerArgvAllowed(argv);
-    const configDir = emptyDockerConfigDir();
-    const env: NodeJS.ProcessEnv = {
-      PATH: CHILD_PATH,
-      HOME: configDir,
-      DOCKER_CONFIG: configDir,
-      DOCKER_HOST: this.dockerHost,
-    };
+    const env = dockerExecEnvironment(this.dockerHost);
     return this.exec(argv, { file: DOCKER_BIN, env, timeoutMs, ...(signal ? { signal } : {}) });
   }
 

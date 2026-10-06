@@ -1,5 +1,7 @@
 # PRD #529: Auto-provision ephemeral workers on unmet capability
 
+The original `m` provisioning default below is superseded by [ADR-2240](../../adr/2240-hosted-worker-default-size.md): new ephemeral workers default to `l`. The earlier milestones remain the implementation history.
+
 **Status**: Complete (M1–M8 shipped 2026-08-23; opt-in and off by default). Path 1 (pre-claim, capability-unmet) only; size-aware provisioning and Path 2 (approve-time 409) remain deferred (see Risks).
 **Priority**: Medium (the issue is explicitly "not near-term"; see Risks)
 **Depends on / relates to**: PRD #84 (capability-aware scheduling — closed, designed the gate to support this as a mode), PRD #58 (hosted k8s workers — closed, shipped *static* provisioning only and left spawn-on-demand + teardown as explicit non-goals), PRD #422 (worker roll/drain), issue #79 (ephemeral-worker cost / nix-store GC — the cost tradeoff, resolved in-body below), issue #91 / [ADR-91](../../adr/0091-runner-cross-run-persistence-residual.md) (the runner cross-run/cross-repo executable-persistence residual this feature structurally closes — a run-bound worker has its own fresh `-nix`/`-data` PVCs, so there is no shared `/nix` or provisioning HOME to plant into).

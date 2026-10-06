@@ -463,7 +463,7 @@ function NavItem({
   // A new TONE rather than a new mechanism, deliberately: two badge implementations
   // would drift in position, size and collapsed-rail behaviour, and the rail's dot has
   // no room to distinguish them by anything but colour. `warn` (amber, PRD #1648 D9) is
-  // the "something is degraded, nothing is blocked" tone; its contrast measurement lives
+  // health attention tone; its contrast measurement lives
   // with the pill in CountPill (ui.tsx).
   badgeTone?: CountPillTone;
   // badgeLabel is the NOUN the accessible count announces — "in progress" for the Runs

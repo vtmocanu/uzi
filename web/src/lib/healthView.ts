@@ -4,7 +4,7 @@ import type { HealthCheck, HealthDoc } from "./api";
 // Overview admin card and the app-wide danger banner all read the SAME verdict wording and
 // the SAME attention ordering from here, so the three surfaces can never disagree about what
 // the document says. HealthDoc carries no verdict or cause field — those are derived from the
-// severity tally so the copy stays true for any danger/warn cause.
+// document and scoped checks so the copy distinguishes owner attention from instance blockers.
 
 // Attention = every non-ok, non-na check. na cannot apply on this deployment and ok is
 // passing; neither is attention.
@@ -21,33 +21,36 @@ export function attentionChecks(doc: HealthDoc): HealthCheck[] {
   return doc.checks.filter(isAttention).sort((a, b) => (RANK[a.severity] ?? 9) - (RANK[b.severity] ?? 9));
 }
 
-// healthVerdict is the headline + sub the verdict card, the overview card and the banner
-// share. Derived from `counts` ONLY, so the copy stays true for any danger/warn cause rather
-// than describing one scenario. Punctuation follows the mock (comma for the warn line, colon
-// for the danger one).
-export function healthVerdict(status: string, counts: HealthDoc["counts"]): { title: string; sub: string } {
-  if (status === "danger") {
-    // danger implies counts.danger > 0. Warns present alongside are not blocking, so the
-    // headline counts only the blocking (danger) checks.
-    const d = counts.danger;
+// Present blocking is authoritative. An older server omitting it retains the conservative
+// status/tally/first-danger presentation, including the banner's snooze expiry timer.
+export function healthVerdict(doc: HealthDoc | Omit<HealthDoc, "blocking">): { title: string; sub: string; blocking: boolean; cause: HealthCheck | undefined } {
+  const legacy = !("blocking" in doc);
+  const dangers = doc.checks.filter((c) => c.severity === "danger" && (legacy || c.scope === "instance"));
+  const blocking = legacy ? doc.status === "danger" : doc.blocking;
+  const cause = dangers[0];
+  if (blocking) {
+    const d = legacy ? doc.counts.danger : dangers.length;
     return {
       title: `uzi cannot run work: ${d} blocking ${d === 1 ? "check" : "checks"}`,
       sub: "Work is blocked until these clear. Start with the flagged checks below.",
+      blocking,
+      cause,
     };
   }
-  if (status === "warn" || status === "unknown") {
-    // warn implies at least one warn or unknown check. The verdict headline folds unknowns
-    // into "warning" (the pips' healthPipLabel names unknown separately, since a pip has no
-    // headline to lean on).
-    const n = counts.warn + counts.unknown;
+  if (doc.status === "danger" || doc.status === "warn" || doc.status === "unknown") {
+    const n = doc.checks.filter(isAttention).length;
     return {
-      title: `${n} ${n === 1 ? "warning" : "warnings"}, nothing is blocked`,
-      sub: "Work is still flowing. These are the quiet no-ops that otherwise only surface as a log line.",
+      title: `${n} ${n === 1 ? "check needs" : "checks need"} attention${doc.status === "danger" ? "; no instance-wide blocker detected" : ""}`,
+      sub: "Review the flagged checks below for evidence and what to do.",
+      blocking,
+      cause,
     };
   }
   return {
     title: "All systems normal",
     sub: "Every check uzi can make about itself is passing.",
+    blocking,
+    cause,
   };
 }
 

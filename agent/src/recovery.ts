@@ -141,6 +141,7 @@ export interface RecoveryOutcome {
 /** The archive RPC subset {@link RecoveryCoordinator} needs — WorkerClient satisfies it
  *  structurally; a test supplies a fake. */
 export interface RecoveryArchiveClient {
+  hasFeature?(feature: string): boolean;
   reserveRecoveryCapture(runId: string, req: RecoveryReserveRequest): Promise<RecoveryReserveResponse>;
   getRecoveryCaptureStatus(runId: string, captureId: string): Promise<RecoveryCaptureStatusResponse>;
   uploadRecoveryBundle(
@@ -217,6 +218,8 @@ export interface CaptureInput {
 }
 
 export interface RecoveryCoordinatorOptions {
+  terminalRecordProtection?: (runId: string) => Promise<boolean>;
+  onAuthoritativeGenerationReleased?: (runId: string, generation: number) => void;
   client: RecoveryArchiveClient;
   git: RecoveryBundleProducer;
   log: Logger;
@@ -528,6 +531,8 @@ const recoveryJournalLocks = new RunDiskLocks();
  * upload can safely happen after (or across a restart from) the terminal report.
  */
 export class RecoveryCoordinator {
+  private readonly terminalRecordProtection: RecoveryCoordinatorOptions["terminalRecordProtection"];
+  private readonly onAuthoritativeGenerationReleased: RecoveryCoordinatorOptions["onAuthoritativeGenerationReleased"];
   private readonly client: RecoveryArchiveClient;
   private readonly git: RecoveryBundleProducer;
   private readonly log: Logger;
@@ -550,6 +555,8 @@ export class RecoveryCoordinator {
   private readonly lastAttemptAt = new Map<string, number>();
 
   constructor(opts: RecoveryCoordinatorOptions) {
+    this.terminalRecordProtection = opts.terminalRecordProtection;
+    this.onAuthoritativeGenerationReleased = opts.onAuthoritativeGenerationReleased;
     this.client = opts.client;
     this.git = opts.git;
     this.log = opts.log;
@@ -1024,7 +1031,8 @@ export class RecoveryCoordinator {
    * is the completed-run boundary, so the whole run dir is removed RECURSIVELY, which also sweeps
    * MAC-mismatch/tampered `.json` records, orphan `<captureId>.bundle` files and `*.tmp` leftovers
    * (they would otherwise leak worker disk forever). The v1 fallback (generation omitted, at most
-   * one record) removes the whole run dir.
+   * one record) removes the whole run dir. Both recursive sweeps are suppressed when physical
+   * terminal protection is present or its callback fails; only an empty-dir rmdir is attempted.
    */
   async release(runId: string, generation?: number, releaseEvidence?: string): Promise<void> {
     if (!this.enabled) return;
@@ -1044,6 +1052,12 @@ export class RecoveryCoordinator {
         } else {
           await this.withJournalLock(runId, () => this.removeRunDir(runId));
         }
+      }
+      // Metadata locks have unwound. This is only a hint; the scheduler must GET authority.
+      if (res.run_id === runId && res.released === true && !res.retained &&
+          generation !== undefined && Number.isSafeInteger(generation) && generation >= 0 &&
+          res.generation === generation && this.client.hasFeature?.("recovery_release_exact_echo") === true) {
+        this.onAuthoritativeGenerationReleased?.(runId, generation);
       }
     } catch (err) {
       this.log.warn("recovery: custody release failed (a reconciler will retry; completion is unaffected)", {
@@ -1636,6 +1650,16 @@ export class RecoveryCoordinator {
 
   /** The caller holds this run's journal lock, including for legacy whole-run release. */
   private async removeRunDir(runId: string): Promise<void> {
+    let protectedNow = true;
+    try {
+      protectedNow = await this.terminalRecordProtection?.(runId) ?? false;
+    } catch {
+      // An unavailable protection inventory retains unknown files.
+    }
+    if (protectedNow) {
+      await fs.rmdir(this.runDir(runId)).catch(() => undefined);
+      return;
+    }
     await fs.rm(this.runDir(runId), { recursive: true, force: true }).catch(() => undefined);
   }
 
@@ -1646,7 +1670,8 @@ export class RecoveryCoordinator {
    *
    * - `sweep_if_last` (exact-generation {@link release}, the completed-run boundary): when no
    *   authenticated sibling generation remains, the whole run dir is removed RECURSIVELY, sweeping
-   *   tampered `.json` records, orphan bundles and `*.tmp` leftovers along with it.
+   *   tampered `.json` records, orphan bundles and `*.tmp` leftovers along with it, unless physical
+   *   terminal protection (including an inventory error) requires a non-recursive rmdir instead.
    * - `rmdir_if_empty` ({@link forgetGeneration}, issue #1751 M2 rework N5): runs while the
    *   successor generation is live and may be writing into the same dir concurrently, so the dir
    *   is never removed recursively from a count taken earlier; only a non-recursive rmdir is

@@ -89,7 +89,7 @@ function rig(options: {
   ops.push(op.op);
   if (op.op === "stat" && options.holdStat) return;
   emit({ id: op.id, ok: op.op === "stat" || (op.op === "read" && op.path === "anchor.ts"),
-   data: Buffer.from("export const anchor = true;").toString("base64"), size: 27 });
+   data: Buffer.from("export const anchor = true;").toString("base64"), size: Buffer.byteLength("export const anchor = true;") });
  });
  const deps: CrossCheckModelDeps = {
   prepareHome: async () => {},
@@ -121,7 +121,12 @@ it("uses claimed model/effort, required wrappers, real Read broker and strict co
   onToolReply: (frame, emit) => {
    assert.equal(frame.result.success, true);
    assert.match(frame.result.contentItems[0].text, /repository_excerpt_/);
-   assert.match(frame.result.contentItems[0].text, /contentBase64/);
+   const excerpt = /^<(repository_excerpt_[a-f0-9]{32})>\n([\s\S]*)\n<\/\1>$/.exec(frame.result.contentItems[0].text);
+   assert.ok(excerpt, "Read output remains inside its untrusted repository fence");
+   assert.deepEqual(JSON.parse(excerpt[2]!), {
+    size: Buffer.byteLength("export const anchor = true;"), content: "export const anchor = true;", offset: 1,
+    linesReturned: 1, partialLastLine: false, truncated: false,
+   });
    r.terminal(emit);
   },
  });

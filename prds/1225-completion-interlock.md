@@ -58,8 +58,8 @@ These seams are fixed here so each merged child extends rather than replaces its
 
 ## Epic acceptance
 
-- [ ] #1226 merged: a 4/5 completion cannot open a closing PR; same-lead structural rework and safe hold exist.
-- [ ] #1227 merged: only the owner/admin can continue, reduce exact scope or accept exact criteria with a reason.
+- [x] #1226 merged: a 4/5 completion cannot open a closing PR; same-lead structural rework and safe hold exist.
+- [x] #1227 merged: only the owner/admin can continue, reduce exact scope or accept exact criteria with a reason.
 - [ ] #1228 merged: one encrypted, bounded provider-context primitive exists for both consumer lifecycles.
 - [ ] #1229 merged: completion holds preserve Git and supported provider context across worker replacement.
 - [ ] #1230 merged: the per-repo semantic setting has default-off storage and a read seam with no write path or runtime effect, and the dormant compiler/reviewer produce independently reviewed source-backed semantic contracts under test.

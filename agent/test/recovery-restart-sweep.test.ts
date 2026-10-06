@@ -9,6 +9,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache, RecoveryBundleTooLargeError } from "../src/git.js";
+import { Outbox } from "../src/outbox.js";
 import { canonicalJson, RecoveryCoordinator, type RecoveryArchiveClient, type RecoveryRecord } from "../src/recovery.js";
 import type {
   RecoveryCaptureStatusResponse,
@@ -140,6 +141,33 @@ function guardedWrite(coord: RecoveryCoordinator, record: RecoveryRecord, next: 
 }
 
 const FIN = { bareDir: BARE_DIR, defaultBranch: "main", finalizationPin: true } as const;
+const TRUST_RUN = "11111111-1111-4111-8111-111111111111";
+const OUTBOX_SCRATCH = fs.realpathSync(os.tmpdir());
+
+async function rejectedTerminal(root: string): Promise<{ outbox: Outbox; file: string; physical: string }> {
+  const reopenOutbox = async (): Promise<Outbox> => {
+    const outbox = new Outbox({ root, log: nullLogger(), runMaxBytes: 1e6, maxBytes: 1e7, retentionMs: 1 });
+    await outbox.init();
+    return outbox;
+  };
+  const original = await reopenOutbox();
+  assert.equal((await original.journalTerminal(TRUST_RUN, 7, "implement", 0, {
+    status: "completed",
+  })).journaled, true);
+  assert.equal((await original.observeTerminalAuthentication(TRUST_RUN, 7)).kind, "authenticated");
+  const file = path.join(root, TRUST_RUN, "terminal-7.json");
+  const envelope = JSON.parse(await fsp.readFile(file, "utf8"));
+  assert.equal(typeof envelope.mac, "string");
+  envelope.mac = (envelope.mac[0] === "0" ? "1" : "0") + envelope.mac.slice(1);
+  const physical = JSON.stringify(envelope);
+  await fsp.writeFile(file, physical);
+  const outbox = await reopenOutbox();
+  assert.equal((await outbox.observeTerminalAuthentication(TRUST_RUN, 7)).kind, "mac_failure");
+  assert.equal(await outbox.readTerminalJournal(TRUST_RUN, 7), undefined);
+  assert.deepEqual(outbox.listPendingTerminals(), []);
+  assert.deepEqual(outbox.listPendingFinalizes(), []);
+  return { outbox, file, physical };
+}
 
 async function only(coord: RecoveryCoordinator, runId: string): Promise<RecoveryRecord> {
   const records = await coord.inspect(runId);
@@ -218,6 +246,83 @@ describe("RecoveryCoordinator.resumePending — pinned records after restart (is
     assert.ok(client.uploadCalls[0]!.bytes > 0);
     assert.equal((await only(restarted, "r1")).state, "uploaded");
     assert.equal((await only(restarted, "r1")).recoveryPinBareDir, BARE_DIR);
+  });
+
+  it("M3 captures an independent authenticated finalization pin despite a rejected terminal at the same UUID/G7", async () => {
+    const root = await fsp.mkdtemp(path.join(OUTBOX_SCRATCH, "recovery-terminal-trust-"));
+    try {
+      const { outbox, file, physical } = await rejectedTerminal(root);
+      const client = new FakeClient();
+      const restarted = coordinator(client);
+      await restarted.resumePending();
+      assert.deepEqual(await restarted.inspect(TRUST_RUN), [], "the rejected terminal grants no recovery authority");
+      assert.equal(client.reserveCalls.length, 0);
+      assert.equal(client.uploadCalls.length, 0);
+
+      // The source comes from the real-Git fixture, independently of the rejected terminal.
+      await coordinator().pin({
+        runId: TRUST_RUN, sourceSha: workSha, kind: "issue", branch: "agent/issue-1", generation: 7, ...FIN,
+      });
+      await restarted.resumePending();
+      assert.equal(client.reserveCalls.length, 1);
+      assert.equal(client.reserveCalls[0]!.runId, TRUST_RUN);
+      assert.equal(client.reserveCalls[0]!.req.generation, 7);
+      assert.equal(client.reserveCalls[0]!.req.source_sha, workSha);
+      assert.equal(client.uploadCalls.length, 1);
+      assert.equal(client.uploadCalls[0]!.runId, TRUST_RUN);
+      assert.ok(client.uploadCalls[0]!.bytes > 0, "real bundle bytes reached the client's available response");
+      const captured = await only(restarted, TRUST_RUN);
+      assert.equal(captured.state, "uploaded");
+      assert.equal(captured.sourceSha, workSha);
+      assert.equal(captured.generation, 7);
+      assert.equal(captured.recoveryPinBareDir, BARE_DIR);
+      assert.equal(await fsp.readFile(file, "utf8"), physical, "capture preserves the rejected terminal byte for byte");
+      assert.equal((await outbox.observeTerminalAuthentication(TRUST_RUN, 7)).kind, "mac_failure");
+      assert.equal(await outbox.readTerminalJournal(TRUST_RUN, 7), undefined);
+      assert.deepEqual(outbox.listPendingTerminals(), []);
+      assert.deepEqual(outbox.listPendingFinalizes(), []);
+    } finally {
+      await fsp.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("M3 rejects a tampered recovery record even with surviving real-Git work and a rejected terminal", async () => {
+    const root = await fsp.mkdtemp(path.join(OUTBOX_SCRATCH, "recovery-record-trust-"));
+    try {
+      const { outbox, file, physical } = await rejectedTerminal(root);
+      const client = new FakeClient();
+      const coord = coordinator(client);
+      const pinned = await coord.pin({
+        runId: TRUST_RUN, sourceSha: workSha, kind: "issue", branch: "agent/issue-1", generation: 7, ...FIN,
+      });
+      assert.ok(pinned);
+      const snapshot = await coord.snapshotBootRecords();
+      assert.equal(snapshot.length, 1);
+      assert.equal(snapshot[0]!.sourceSha, workSha);
+      const recordFile = path.join(cache.recoveryRoot, TRUST_RUN, `${pinned.captureId}.json`);
+      const envelope = JSON.parse(await fsp.readFile(recordFile, "utf8"));
+      assert.equal(typeof envelope.mac, "string");
+      envelope.sourceSha = baseSha; // Change an authenticated field without recalculating its MAC.
+      const tampered = JSON.stringify(envelope);
+      await fsp.writeFile(recordFile, tampered);
+      assert.equal((await cache.resolveRestartSource(BARE_DIR, workSha, "main")).status, "unpublished");
+
+      const restarted = coordinator(client);
+      assert.deepEqual(await restarted.inspect(TRUST_RUN), []);
+      assert.deepEqual(await restarted.snapshotBootRecords(), []);
+      await restarted.resumePending(undefined, snapshot); // Even a previously trusted snapshot must be reauthenticated.
+      await restarted.resumePending();
+      assert.equal(client.reserveCalls.length, 0);
+      assert.equal(client.uploadCalls.length, 0);
+      assert.equal(await fsp.readFile(recordFile, "utf8"), tampered, "the unauthenticated recovery record stays untouched");
+      assert.equal(await fsp.readFile(file, "utf8"), physical);
+      assert.equal((await outbox.observeTerminalAuthentication(TRUST_RUN, 7)).kind, "mac_failure");
+      assert.equal(await outbox.readTerminalJournal(TRUST_RUN, 7), undefined);
+      assert.deepEqual(outbox.listPendingTerminals(), []);
+      assert.deepEqual(outbox.listPendingFinalizes(), []);
+    } finally {
+      await fsp.rm(root, { recursive: true, force: true });
+    }
   });
 
   it("holds a finalization-pinned head already on the default branch: no bundle, no reserve", async () => {

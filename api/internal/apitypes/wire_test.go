@@ -51,7 +51,7 @@ func TestUserDTOTags(t *testing.T) {
 		// behavior); when false the worker suppresses the Co-Authored-By trailer.
 		"attribution_enabled",
 		// PRD #649: the per-user opt-in to ephemeral worker auto-provisioning.
-		"ephemeral_workers_enabled",
+		"ephemeral_workers_enabled", "ephemeral_docker_enabled",
 		// PRD #35 Decision 7: the per-user DEFAULT for the usage-limit park. A default,
 		// not a policy — every run carries its own, stamped at creation.
 		"wait_on_limit",
@@ -924,7 +924,7 @@ func TestWorkerDTOTags(t *testing.T) {
 }
 
 func TestAdminWorkerDTOTags(t *testing.T) {
-	want := append(append([]string{}, workerDTOKeys...), "owner_email")
+	want := append(append([]string{}, workerDTOKeys...), "owner_email", "disk_pressure_volumes", "cleanup_pending")
 	assertTags(t, "AdminWorkerDTO", AdminWorkerDTO{}, want...)
 }
 

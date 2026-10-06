@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -69,7 +70,10 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		t.Skip("set UZI_UXLAB_GEN=1 to (re)generate the ux-lab frames")
 	}
 
-	outDir := filepath.Join("uxlab", "frames")
+	outDir := os.Getenv("UZI_UXLAB_OUT_DIR")
+	if outDir == "" {
+		outDir = filepath.Join("uxlab", "frames")
+	}
 	if err := os.MkdirAll(outDir, 0o755); err != nil { //nolint:gosec // G301: dev-tool frame output dir holds non-sensitive generated artifacts; 0755 keeps it browsable
 		t.Fatal(err)
 	}
@@ -122,6 +126,10 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"split-needs-you-unfocused":    func(d bool) string { return splitScene(d, now, "needs-you") },
 		"split-ci-empty":               func(d bool) string { return splitScene(d, now, "ci-empty") },
 		"split-filtering":              func(d bool) string { return splitScene(d, now, "filtering") },
+	}
+
+	for _, name := range append(append([]string{}, workerSceneNames...), workerDetailSceneNames...) {
+		scenes[name] = func(dark bool) string { return workersScene(dark, name).View().Content }
 	}
 
 	names := make([]string, 0, len(scenes))
@@ -217,6 +225,140 @@ func splitScene(dark bool, now time.Time, scene string) string {
 		m = key(m, "u")
 	}
 	return m.View().Content
+}
+
+var workerSceneNames = []string{"workers-list-120", "workers-list-80", "workers-factory", "workers-cordoned", "split-workers-top", "floor-fleet", "workers-stale-stats"}
+
+var workerDetailSceneNames = []string{"worker-upgrade-failed", "worker-outcome-outbox", "worker-holding"}
+
+// workersScene uses the shipped model and the interactive demo's client.
+func workersScene(dark bool, name string) tuiModel {
+	fake := newDemoClient()
+	if name == "workers-stale-stats" {
+		for i := range fake.Workers {
+			w := &fake.Workers[i]
+			if w.Name == "forge-small" {
+				w.StatsCPUPct = fPtr(100)
+				w.StatsMemBytes = i64(12 << 30)
+				w.StatsMemLimitBytes = i64(16 << 30)
+				w.StatsDiskDataBytes = i64(100)
+				w.StatsDiskDataTotalBytes = i64(100)
+			}
+		}
+	}
+	target := map[string]string{"worker-upgrade-failed": "forge-small", "worker-outcome-outbox": "forge-docker", "worker-holding": "recovery"}[name]
+	if target != "" {
+		// Scene-local samples keep the demo fleet's state and attention counts intact.
+		for i := range fake.Workers {
+			w := &fake.Workers[i]
+			if w.Name != target {
+				continue
+			}
+			if w.StatsDiskDataBytes != nil {
+				w.StatsDiskDataBytes = i64(*w.StatsDiskDataBytes << 30)
+				w.StatsDiskDataTotalBytes = i64(100 << 30)
+			}
+			if target == "forge-docker" {
+				w.StatsDiskDindBytes, w.StatsDiskDindTotalBytes = i64(20<<30), i64(50<<30)
+			}
+			if target != "forge-small" {
+				runID := fake.Runs[0].ID
+				if len(w.ReportedRuns) > 0 {
+					runID = w.ReportedRuns[0].RunID
+				} else {
+					for _, run := range fake.Runs {
+						if run.Status == "failed" {
+							runID = run.ID
+							break
+						}
+					}
+				}
+				w.RunDisk = []apitypes.WorkerRunDiskDTO{{RunID: runID, HomeBytes: 8 << 30, CacheBytes: 2 << 30, Truncated: true, SampledAt: time.Now().Add(-2 * time.Minute)}}
+			}
+		}
+	}
+	m := uxModel(fake, "", dark)
+	width, height := 120, 34
+	if target != "" {
+		height = 52
+	}
+	if name == "workers-list-80" {
+		width = 80
+	}
+	if name == "split-workers-top" {
+		height = 60
+	}
+	m = step(m, tea.WindowSizeMsg{Width: width, Height: height})
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: fake.Runs})
+	if name != "floor-fleet" {
+		m = key(m, keyViewWorkers)
+	}
+	if name == "workers-factory" || name == "workers-cordoned" {
+		m = key(m, keyAdmin)
+	}
+	msg := m.fetchWorkersCmd(m.board.admin, m.workers.waitID)()
+	m = step(m, msg)
+	if name == "workers-cordoned" {
+		for i, r := range m.workers.visible(time.Now()) {
+			if r.w.Name == "b-runner" {
+				m.workers.cursor = i
+				m.workers.selectedID = r.w.ID
+			}
+		}
+	}
+	if target != "" {
+		for i, r := range m.workers.visible(time.Now()) {
+			if r.w.Name == target {
+				m.workers.cursor, m.workers.selectedID = i, r.w.ID
+			}
+		}
+		m = key(m, keyEnter)
+	}
+	if name == "split-workers-top" {
+		m = step(m, reposMsg{repos: []apitypes.RepoDTO{oneRepo()}})
+		m = step(m, ciMsg{reqID: m.ci.waitID, runs: sampleCIRuns(time.Now())})
+	}
+	return m
+}
+
+func TestWorkerDetailScenesContentAndBounds(t *testing.T) {
+	for _, name := range workerDetailSceneNames {
+		for _, dark := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/dark=%t", name, dark), func(t *testing.T) {
+				m := workersScene(dark, name)
+				if m.view != viewWorker || m.workerDetail.workerID == "" {
+					t.Fatal("scene did not enter the production worker detail")
+				}
+				out := stripANSI(m.View().Content)
+				last := -1
+				for _, section := range []string{"attention", "reported runs", "resources", "configuration"} {
+					at := strings.Index(out, section)
+					if at <= last {
+						t.Fatalf("missing or reordered %s:\n%s", section, out)
+					}
+					last = at
+				}
+				requireWorkerText(t, out, "nix", "token", "template", "enter/→ run", "esc/← back")
+				switch name {
+				case "worker-upgrade-failed":
+					requireWorkerText(t, out, "forge-small", "upgrade failed", "seed-nix", "ImagePullBackOff", "last-known, stale", "cpu", "~ ?", "memory", "? / ?", "0.85.0", "target 0.85.1")
+				case "worker-outcome-outbox":
+					requireWorkerText(t, out, "forge-docker", "outcome pending", "not yet delivered/acknowledged", "outbox", "14", "worker phase running", "gen 1", "data", "41%", "dind", "40%", "largest HOME", "≥8.0 GiB", "sampled 2m ago", "token         auto")
+				case "worker-holding":
+					requireWorkerText(t, out, "recovery", "unpublished work", "none", "data", "48%", "largest HOME", "≥8.0 GiB", "sampled 2m ago", "token         default")
+				}
+				assertNoRawControls(t, name, out)
+				if len(strings.Split(out, "\n")) > m.height {
+					t.Fatal("scene exceeds physical height")
+				}
+				for _, line := range strings.Split(out, "\n") {
+					if visualWidth(line) > m.width {
+						t.Fatalf("scene exceeds width: %q", line)
+					}
+				}
+			})
+		}
+	}
 }
 
 // ---- board fixtures -------------------------------------------------------

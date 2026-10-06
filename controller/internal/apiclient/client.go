@@ -110,11 +110,9 @@ func (c *Client) Poll(ctx context.Context) (protocol.PollResponse, error) {
 
 // Report POSTs per-worker roll health to the api (PRD #113 M3).
 //
-// This is the ONLY thing this controller asserts to the api, and it is display-only
-// (Decision 10): the api renders it and nothing else reads it. The poll stays a pure
-// read, and PRD #58's "the controller asserts nothing" continues to hold for
-// everything that matters — token delivery is still settled by the worker's own
-// registration, which this call cannot touch.
+// The api stores this report for display. DinD maintenance additionally requires
+// successful readiness publication before its separate completion control write.
+// Token delivery is still settled by the worker's own registration.
 //
 // A 404 is SUCCESS, not an error. An api without the endpoint (older image, or
 // hosting disabled, where the route is absent rather than present-and-refusing) is
@@ -128,6 +126,15 @@ func (c *Client) Poll(ctx context.Context) (protocol.PollResponse, error) {
 // api that DOES have the endpoint is a real signal and must not be flattened into
 // the same silence as a 404.
 func (c *Client) Report(ctx context.Context, report protocol.StatusReport) error {
+	return c.reportStatus(ctx, report, false)
+}
+
+// ReportReadiness requires the status endpoint to actually accept publication.
+func (c *Client) ReportReadiness(ctx context.Context, report protocol.StatusReport) error {
+	return c.reportStatus(ctx, report, true)
+}
+
+func (c *Client) reportStatus(ctx context.Context, report protocol.StatusReport, strict bool) error {
 	body, err := json.Marshal(report)
 	if err != nil {
 		return fmt.Errorf("apiclient: marshal status report: %w", err)
@@ -145,7 +152,7 @@ func (c *Client) Report(ctx context.Context, report protocol.StatusReport) error
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode == http.StatusNotFound {
+	if resp.StatusCode == http.StatusNotFound && !strict {
 		c.noStatusEndpoint.Do(func() {
 			c.log.Info("api has no /api/controller/status endpoint; roll health will not be reported (expected against an older api, or with worker hosting disabled). Logged once per process.")
 		})

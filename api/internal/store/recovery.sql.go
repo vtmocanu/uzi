@@ -12,6 +12,16 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const annotateTerminalRejectionHold = `-- name: AnnotateTerminalRejectionHold :exec
+UPDATE recovery_custody_holds SET terminal_record_rejection = 'mac_failure', updated_at = now()
+WHERE id = $1 AND terminal_record_rejection IS DISTINCT FROM 'mac_failure'
+`
+
+func (q *Queries) AnnotateTerminalRejectionHold(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, annotateTerminalRejectionHold, id)
+	return err
+}
+
 const bindCaptureManifest = `-- name: BindCaptureManifest :one
 
 UPDATE recovery_captures
@@ -415,7 +425,7 @@ func (q *Queries) GetCustodyAggregateForOwner(ctx context.Context, arg GetCustod
 }
 
 const getCustodyHoldForSettle = `-- name: GetCustodyHoldForSettle :one
-SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target FROM recovery_custody_holds
+SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection FROM recovery_custody_holds
 WHERE id = $1 AND run_id = $2
 `
 
@@ -454,6 +464,7 @@ func (q *Queries) GetCustodyHoldForSettle(ctx context.Context, arg GetCustodyHol
 		&i.ReleaseSuccessorGeneration,
 		&i.ReleaseBranch,
 		&i.ReleaseTarget,
+		&i.TerminalRecordRejection,
 	)
 	return i, err
 }
@@ -723,6 +734,7 @@ SELECT
     h.updated_at,
     h.released_at,
     h.original_worker_id,
+    h.terminal_record_rejection,
     COALESCE(w.name, '')::text AS worker_name,
     (EXISTS (SELECT 1 FROM recovery_captures c
         WHERE c.hold_id = h.id AND c.state = 'available'))::boolean AS has_available_capture,
@@ -754,21 +766,22 @@ type ListCustodyHoldsForOwnerParams struct {
 }
 
 type ListCustodyHoldsForOwnerRow struct {
-	ID                  uuid.UUID          `json:"id"`
-	RunID               uuid.UUID          `json:"run_id"`
-	Generation          int64              `json:"generation"`
-	State               string             `json:"state"`
-	CreatedAt           pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
-	ReleasedAt          pgtype.Timestamptz `json:"released_at"`
-	OriginalWorkerID    uuid.UUID          `json:"original_worker_id"`
-	WorkerName          string             `json:"worker_name"`
-	HasAvailableCapture bool               `json:"has_available_capture"`
-	CaptureState        string             `json:"capture_state"`
-	RunStatus           string             `json:"run_status"`
-	CheckpointRef       pgtype.Text        `json:"checkpoint_ref"`
-	CheckpointTip       pgtype.Text        `json:"checkpoint_tip"`
-	CheckpointState     pgtype.Text        `json:"checkpoint_state"`
+	ID                      uuid.UUID          `json:"id"`
+	RunID                   uuid.UUID          `json:"run_id"`
+	Generation              int64              `json:"generation"`
+	State                   string             `json:"state"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt               pgtype.Timestamptz `json:"updated_at"`
+	ReleasedAt              pgtype.Timestamptz `json:"released_at"`
+	OriginalWorkerID        uuid.UUID          `json:"original_worker_id"`
+	TerminalRecordRejection pgtype.Text        `json:"terminal_record_rejection"`
+	WorkerName              string             `json:"worker_name"`
+	HasAvailableCapture     bool               `json:"has_available_capture"`
+	CaptureState            string             `json:"capture_state"`
+	RunStatus               string             `json:"run_status"`
+	CheckpointRef           pgtype.Text        `json:"checkpoint_ref"`
+	CheckpointTip           pgtype.Text        `json:"checkpoint_tip"`
+	CheckpointState         pgtype.Text        `json:"checkpoint_state"`
 }
 
 // PRD #1349 M1 (D7): the owner-scoped, bounded hold list the web Workers surface and the
@@ -817,6 +830,7 @@ func (q *Queries) ListCustodyHoldsForOwner(ctx context.Context, arg ListCustodyH
 			&i.UpdatedAt,
 			&i.ReleasedAt,
 			&i.OriginalWorkerID,
+			&i.TerminalRecordRejection,
 			&i.WorkerName,
 			&i.HasAvailableCapture,
 			&i.CaptureState,
@@ -975,7 +989,7 @@ func (q *Queries) ListOwnersWithClearedCustodyEpisode(ctx context.Context, custo
 }
 
 const listReleasableCustodyHolds = `-- name: ListReleasableCustodyHolds :many
-SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at, h.release_evidence, h.release_pushed_sha, h.release_source_sha, h.release_adopted_sha, h.release_final_head_sha, h.release_successor_generation, h.release_branch, h.release_target,
+SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at, h.release_evidence, h.release_pushed_sha, h.release_source_sha, h.release_adopted_sha, h.release_final_head_sha, h.release_successor_generation, h.release_branch, h.release_target, h.terminal_record_rejection,
     CASE
         WHEN EXISTS (SELECT 1 FROM runs r
                        WHERE r.id = h.run_id
@@ -1019,6 +1033,7 @@ type ListReleasableCustodyHoldsRow struct {
 	ReleaseSuccessorGeneration pgtype.Int8        `json:"release_successor_generation"`
 	ReleaseBranch              pgtype.Text        `json:"release_branch"`
 	ReleaseTarget              pgtype.Text        `json:"release_target"`
+	TerminalRecordRejection    pgtype.Text        `json:"terminal_record_rejection"`
 	Reason                     string             `json:"reason"`
 }
 
@@ -1089,11 +1104,51 @@ func (q *Queries) ListReleasableCustodyHolds(ctx context.Context) ([]ListReleasa
 			&i.ReleaseSuccessorGeneration,
 			&i.ReleaseBranch,
 			&i.ReleaseTarget,
+			&i.TerminalRecordRejection,
 			&i.Reason,
 		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockTerminalRejectionHolds = `-- name: LockTerminalRejectionHolds :many
+SELECT id FROM recovery_custody_holds
+WHERE user_id = $1 AND original_worker_id = $2
+  AND run_id = $3 AND generation = $4 AND state = 'open'
+ORDER BY id FOR UPDATE
+`
+
+type LockTerminalRejectionHoldsParams struct {
+	UserID     uuid.UUID `json:"user_id"`
+	WorkerID   uuid.UUID `json:"worker_id"`
+	RunID      uuid.UUID `json:"run_id"`
+	Generation int64     `json:"generation"`
+}
+
+func (q *Queries) LockTerminalRejectionHolds(ctx context.Context, arg LockTerminalRejectionHoldsParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockTerminalRejectionHolds,
+		arg.UserID,
+		arg.WorkerID,
+		arg.RunID,
+		arg.Generation,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -1646,6 +1701,30 @@ func (q *Queries) ReserveCaptureExact(ctx context.Context, arg ReserveCaptureExa
 	return i, err
 }
 
+const retroTerminalRejectionReason = `-- name: RetroTerminalRejectionReason :exec
+UPDATE runs SET failure_reason = 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody'
+WHERE id = $1 AND user_id = $2 AND worker_id = $3
+  AND claim_generation = $4 AND status = 'failed' AND fail_origin = 'worker_lost'
+  AND failure_reason IS DISTINCT FROM 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody'
+`
+
+type RetroTerminalRejectionReasonParams struct {
+	RunID      uuid.UUID   `json:"run_id"`
+	UserID     uuid.UUID   `json:"user_id"`
+	WorkerID   pgtype.UUID `json:"worker_id"`
+	Generation int64       `json:"generation"`
+}
+
+func (q *Queries) RetroTerminalRejectionReason(ctx context.Context, arg RetroTerminalRejectionReasonParams) error {
+	_, err := q.db.Exec(ctx, retroTerminalRejectionReason,
+		arg.RunID,
+		arg.UserID,
+		arg.WorkerID,
+		arg.Generation,
+	)
+	return err
+}
+
 const runHasAvailableCapture = `-- name: RunHasAvailableCapture :one
 SELECT EXISTS (
     SELECT 1 FROM recovery_captures c
@@ -1666,4 +1745,59 @@ func (q *Queries) RunHasAvailableCapture(ctx context.Context, arg RunHasAvailabl
 	var column_1 bool
 	err := row.Scan(&column_1)
 	return column_1, err
+}
+
+const terminalRejectionCustodySnapshot = `-- name: TerminalRejectionCustodySnapshot :one
+WITH scoped AS MATERIALIZED (
+    SELECT id, generation, state FROM recovery_custody_holds
+    WHERE user_id = $1 AND original_worker_id = $2 AND run_id = $3
+), exact AS MATERIALIZED (
+    SELECT id, generation, state FROM scoped WHERE generation = $4
+), siblings AS MATERIALIZED (
+    SELECT id, generation, state FROM scoped WHERE generation <> $4 AND state = 'open'
+)
+SELECT
+    (SELECT count(*) FROM exact)::bigint AS exact_count,
+    (SELECT count(*) FROM siblings)::bigint AS sibling_count,
+    (SELECT count(*) FROM exact WHERE state = 'open')::bigint AS open_count,
+    (SELECT count(*) FROM exact WHERE state NOT IN ('released', 'discarded'))::bigint AS unsettled_count,
+    COALESCE((SELECT jsonb_agg(jsonb_build_object('id', id, 'state', state) ORDER BY id)
+      FROM (SELECT id, generation, state FROM exact ORDER BY id LIMIT 256) limited), '[]'::jsonb)::jsonb AS exact_holds,
+    COALESCE((SELECT jsonb_agg(jsonb_build_object('id', id, 'generation', generation) ORDER BY id)
+      FROM (SELECT id, generation, state FROM siblings ORDER BY id LIMIT 256) limited), '[]'::jsonb)::jsonb AS sibling_holds
+`
+
+type TerminalRejectionCustodySnapshotParams struct {
+	UserID     uuid.UUID `json:"user_id"`
+	WorkerID   uuid.UUID `json:"worker_id"`
+	RunID      uuid.UUID `json:"run_id"`
+	Generation int64     `json:"generation"`
+}
+
+type TerminalRejectionCustodySnapshotRow struct {
+	ExactCount     int64  `json:"exact_count"`
+	SiblingCount   int64  `json:"sibling_count"`
+	OpenCount      int64  `json:"open_count"`
+	UnsettledCount int64  `json:"unsettled_count"`
+	ExactHolds     []byte `json:"exact_holds"`
+	SiblingHolds   []byte `json:"sibling_holds"`
+}
+
+func (q *Queries) TerminalRejectionCustodySnapshot(ctx context.Context, arg TerminalRejectionCustodySnapshotParams) (TerminalRejectionCustodySnapshotRow, error) {
+	row := q.db.QueryRow(ctx, terminalRejectionCustodySnapshot,
+		arg.UserID,
+		arg.WorkerID,
+		arg.RunID,
+		arg.Generation,
+	)
+	var i TerminalRejectionCustodySnapshotRow
+	err := row.Scan(
+		&i.ExactCount,
+		&i.SiblingCount,
+		&i.OpenCount,
+		&i.UnsettledCount,
+		&i.ExactHolds,
+		&i.SiblingHolds,
+	)
+	return i, err
 }

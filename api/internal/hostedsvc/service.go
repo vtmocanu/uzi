@@ -12,6 +12,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // Store is the narrow store dependency of the controller protocol.
@@ -212,8 +213,14 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 			// disk-pressured worker (PRD #837). DiskPressure is the debounced, freshness-gated
 			// SQL derivation (streak>=2 AND fresh); Ephemeral is the raw column. Both are plain
 			// SQL booleans, mapped straight through.
-			DiskPressure: row.DiskPressure,
-			Ephemeral:    row.Ephemeral,
+			DiskPressure:        row.DiskPressure,
+			DiskPressureVolumes: append([]string{}, row.DiskPressureVolumes...),
+			DindMaintenance: workersvc.DindMaintenanceFromWorker(store.Worker{
+				MaintenanceID: row.MaintenanceID, MaintenanceNonce: row.MaintenanceNonce, MaintenancePhase: row.MaintenancePhase,
+				MaintenanceDeploymentUid: row.MaintenanceDeploymentUid, MaintenancePvcUid: row.MaintenancePvcUid,
+				MaintenanceRegisterNonce: row.MaintenanceRegisterNonce, MaintenanceFenced: row.MaintenanceFenced, MaintenanceReadyAck: row.MaintenanceReadyAck,
+			}),
+			Ephemeral: row.Ephemeral,
 			// PRD #1296 M4 (D3/D9): the custody-held signal, now sourced from the DB — true
 			// when the worker holds any OPEN custody hold (ListHostedWorkersForController's
 			// custody_held EXISTS column). A distinct desired-worker signal, independent of

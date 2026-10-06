@@ -17,7 +17,17 @@ func TestHealthPlanCrossCheckWaitExcludedLiveDB(t *testing.T) {
 		mustExec(fx.ctx, t, fx.pool, "DELETE FROM users WHERE id=$1", fx.userID)
 	})
 	now := time.Now().UTC().Truncate(time.Second)
-	baseline, err := fx.q.OldestWaitingWorkerRun(fx.ctx)
+	oldestWaiting := func() (pgtype.Timestamptz, error) {
+		rows, err := fx.q.ListWaitingWorkerRuns(fx.ctx)
+		var oldest pgtype.Timestamptz
+		for _, row := range rows {
+			if row.HealthSince.Valid && (!oldest.Valid || row.HealthSince.Time.Before(oldest.Time)) {
+				oldest = row.HealthSince
+			}
+		}
+		return oldest, err
+	}
+	baseline, err := oldestWaiting()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,12 +57,12 @@ func TestHealthPlanCrossCheckWaitExcludedLiveDB(t *testing.T) {
 	expected := seed("waiting for plan cross-check", since, true)
 	assertOldest := func(t *testing.T, want pgtype.Timestamptz) {
 		t.Helper()
-		got, err := fx.q.OldestWaitingWorkerRun(fx.ctx)
+		got, err := oldestWaiting()
 		if err != nil {
 			t.Fatal(err)
 		}
 		if got.Valid != want.Valid || (got.Valid && !got.Time.Equal(want.Time)) {
-			t.Errorf("OldestWaitingWorkerRun=%+v want %+v", got, want)
+			t.Errorf("ListWaitingWorkerRuns oldest=%+v want %+v", got, want)
 		}
 	}
 	assertCapacity := func(t *testing.T, want map[uuid.UUID]time.Time) {

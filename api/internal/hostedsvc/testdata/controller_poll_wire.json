@@ -9,6 +9,10 @@
       "busy": true,
       "draining_since": null,
       "disk_pressure": true,
+      "disk_pressure_volumes": [
+        "nix",
+        "dind"
+      ],
       "ephemeral": false,
       "custody_held": true,
       "generation": 1,
@@ -23,9 +27,37 @@
       "busy": false,
       "draining_since": "2026-01-02T03:04:05Z",
       "disk_pressure": false,
+      "disk_pressure_volumes": [],
       "ephemeral": true,
       "custody_held": false,
       "generation": 4,
+      "join_token": null
+    },
+    {
+      "id": "33333333-3333-3333-3333-333333333333",
+      "template": "base",
+      "size": "m",
+      "docker": true,
+      "isolated": false,
+      "busy": false,
+      "draining_since": null,
+      "disk_pressure": false,
+      "disk_pressure_volumes": [
+        "dind"
+      ],
+      "dind_maintenance": {
+        "id": "44444444-4444-4444-4444-444444444444",
+        "nonce": "maintenance-operation",
+        "phase": "requested",
+        "deployment_uid": "deployment-uid",
+        "pvc_uid": "pvc-uid",
+        "register_nonce": "registration-nonce",
+        "fenced": false,
+        "ready_ack": false
+      },
+      "ephemeral": false,
+      "custody_held": false,
+      "generation": 1,
       "join_token": null
     }
   ]

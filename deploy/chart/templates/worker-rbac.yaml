@@ -161,16 +161,16 @@ imagePullSecrets:
   The controller's reach into the DOCKER tier's namespace (PRD #83 M3).
 
   A Role is namespace-scoped, so the controller needs a SECOND Role + RoleBinding to
-  create/roll/tear-down docker workers in workers.docker.namespace — with the EXACT
-  SAME minimal verbs as the restricted-namespace Role above. The Secrets line is
+  create/roll/tear-down docker workers in workers.docker.namespace. It retains the
+  restricted Role's verbs and adds ReplicaSet list only for replacement readiness.
+  The Secrets line is
   identical and identically load-bearing: create/delete ONLY, never get/list. Read the
   restricted Role's Secrets comment before touching this; the reasoning is verbatim,
   and the docker namespace holding privileged pods makes fleet-wide token disclosure
   from a widened verb no less catastrophic here than there.
 
-  The controller's ServiceAccount is unchanged — one identity, now bound into two
-  namespaces. That is exactly the reach we intend: the controller creates workers in
-  the restricted default AND the privileged docker tier, and nowhere else.
+  The controller's ServiceAccount is unchanged: one identity bound to the restricted
+  default, the privileged docker tier, and the optional isolated lane below.
 */}}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -185,6 +185,10 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["create", "list", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    # Replacement readiness resolves controller UIDs; no Secret contents are read.
+    verbs: ["list"]
   - apiGroups: [""]
     resources: ["secrets"]
     # ================= DO NOT ADD `get` OR `list` HERE. EVER. =================
@@ -233,7 +237,8 @@ subjects:
 {{- if include "uzi.isolatedLaneEnabled" . }}
 {{- /*
   The controller's reach into the ISOLATED lane's namespace (PRD #1906 M6), copied from
-  the docker tier's Role above with the SAME minimal verbs. The Secrets line is identical
+  the restricted Role above with the same minimal verbs and no DinD ReplicaSet read.
+  The Secrets line is identical
   and identically load-bearing: create/delete ONLY, never get/list (read the restricted
   Role's comment). One controller identity, now bound into a third namespace.
 */}}

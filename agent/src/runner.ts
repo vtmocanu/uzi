@@ -1584,11 +1584,13 @@ interface RunFlight {
   uncertainWallPark: boolean;
   /** PRD #1391 Run B M3 (N2/D5): true once ANY terminal outcome for this generation has been
    *  sent/resolved through {@link RunRunner.journalAndSendTerminal} — a run-lane completed/failed
-   *  site, the permanent-failure hook, or reportGenericFailure itself. A journaled outcome is FINAL,
-   *  so once this latches, reportGenericFailure never reports a SECOND `failed` — even after a 200
+   *  site, the permanent-failure hook, or reportGenericFailure itself — or a competing outcome has
+   *  been deferred for an unavailable selected winner. Deferral suppresses replacement without
+   *  claiming current durable adoption. The latch is set before the hook releases its resolve hold.
+   *  Once this latches, reportGenericFailure never reports a SECOND `failed` — even after a 200
    *  RETIRED the journal (which makes `hasPendingTerminal` read false), the exact fall-through this
    *  latch closes. Distinct from `hasPendingTerminal`: that reads the on-disk journal (kept), this
-   *  survives the journal's retirement. false until the first terminal resolve. */
+   *  survives the journal's retirement. false until the first terminal resolve or deferral. */
   terminalResolved: boolean;
   /** #1539: the outcome of the permanent-failure hook's pre-settle reap, or undefined when the
    *  hook never ran (every ordinary path). true iff the reap confirmed while the run was still
@@ -1836,6 +1838,7 @@ export interface CheckpointTestHooks {
 
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
 export interface RunnerOptions {
+  queueTerminalRejectionReconciliation?: (runId: string, generation: number) => void;
   /** How often the steering channel polls /inputs (default 3s). */
   pollMs?: number;
   /** issue #1783: the resolved Docker endpoint (DockerWiring.dockerHost) the run-quiescence
@@ -2177,6 +2180,8 @@ export class RunRunner {
         git: this.git,
         log: this.log,
         recoveryRoot: this.git.recoveryRoot,
+        terminalRecordProtection: (runId) => this.git.hasPhysicalTerminalProtection(runId),
+        onAuthoritativeGenerationReleased: opts.queueTerminalRejectionReconciliation,
         workerToken: this.joinToken,
         now: opts.now,
       });
@@ -2199,6 +2204,7 @@ export class RunRunner {
         deleteSettlementRefs: (bare, runId, holdId) => gitCache.deleteSettlementRefs(bare, runId, holdId),
         deleteRecoveryPin: (bare, runId, gen) => gitCache.deleteRecoveryPin(bare, runId, gen),
         forgetGeneration: (runId, gen) => recovery.forgetGeneration(runId, gen),
+        onAuthoritativeGenerationReleased: opts.queueTerminalRejectionReconciliation,
       },
       // issue #1751 M2: the live leg's local checks + `published` pin, in the trusted bare.
       liveGit: {
@@ -3547,7 +3553,7 @@ export class RunRunner {
           } else {
             // No bare/branch to key the journal on (a run that never journaled): fall
             // back to the bare recursive remove.
-            await this.git.removeRunnerClone(flight.worktreePath);
+            await this.git.removeRunnerClone(flight.worktreePath, runId);
           }
         } catch (e) {
           runLog.warn("runner clone cleanup failed", { error: errMessage(e) });
@@ -3726,10 +3732,10 @@ export class RunRunner {
     phase: string,
     body: Parameters<RunFlight["reportState"]>[0],
     send: SendTerminalState,
-    // #1539: an optional hook that runs AFTER the durable install and BEFORE the resolve/send (on
-    // the no-outbox branch too, before the direct `send`). The permanent-failure hook uses it to abort
-    // the attempt and reap the provider WHILE the run is still actively-claimed — the journal is on
-    // disk first (D5), the reap runs before the terminal is sent, and the reconcile is authorized
+    // #1539: an optional hook that runs AFTER the install/deferral decision and BEFORE any resolve/send
+    // (on the no-outbox branch too, before the direct `send`). The permanent-failure hook uses it to abort
+    // the attempt and reap the provider WHILE the run is still actively-claimed — a fresh journal is
+    // installed first (D5), an unavailable selected winner is preserved, and the reconcile is authorized
     // because the abort has not yet reported terminal. Every other caller passes nothing, so their
     // behaviour is identical.
     beforeResolve?: () => Promise<void>,
@@ -3779,10 +3785,12 @@ export class RunRunner {
     // Issue #1742 retirement site (a): G's terminal journal is installed, so the #1391 lease takes
     // over and the finalize-pending record is no longer needed (independent of the send below).
     if (installed.journaled) await this.retireFinalizeRecord(flight, "terminal_journal_installed");
-    // #1539: the durable install is now on disk. Run the hook (abort + reap for the permanent
-    // failure hook) BEFORE the resolve/send.
+    // #1539: run the hook (abort + reap for the permanent failure hook) after the install
+    // decision, including deferral, and BEFORE any resolve/send.
     await beforeResolve?.();
-    if (!installed.journaled) {
+    if (!installed.journaled && "deferred" in installed) {
+      // Preserve finalize and the selected winner; reach the latch before the hook releases its hold.
+    } else if (!installed.journaled) {
       // reserve_exhausted: send unjournaled. A throw here propagates (skipping the latch below), so the
       // executor catch finds NO journal and takes today's fallback — unchanged from journalAndResolveTerminal.
       await sendUnjournaledTerminal(deps, installed.canonical, fence, wrappedSend);
@@ -3796,7 +3804,7 @@ export class RunRunner {
         send: wrappedSend,
       });
     }
-    // PRD #1391 Run B M3 (N2/D5): latch that a terminal outcome for this generation has resolved, so
+    // PRD #1391 Run B M3 (N2/D5): latch terminal resolution or selected-winner deferral, so
     // a later reportGenericFailure never reports a SECOND `failed` — even after a 200 RETIRED the
     // journal (hasPendingTerminal then reads false). Skipped on a throw above (reserve_exhausted's
     // un-journaled send that failed), so that fallback still reports failed as today.
@@ -3808,10 +3816,11 @@ export class RunRunner {
    * batcher's onPermanentFailureReport closure so its ORDERING is unit-testable against the REAL
    * shipping code (runner-terminal-journal.test.ts) rather than a synthetic hand-rolled handler.
    *
-   * The order is: (1) DURABLE first-writer-wins install of the `failed` journal, then (2) ABORT the
-   * attempt, then (3) REAP this generation's provider WHILE the run is still actively-claimed, then
-   * (4) resolve/send the terminal. Steps 2+3 run in the `beforeResolve` hook, between the install and
-   * the send, so a completion racing the trip can never reverse the first durable winner (the
+   * The order is: (1) first-writer-wins install of the `failed` journal, or deferral to preserve an
+   * unavailable selected winner, then (2) ABORT the attempt, then (3) REAP this generation's provider
+   * WHILE the run is still actively-claimed, then (4) resolve/send unless deferred. Steps 2+3 run in
+   * the `beforeResolve` hook after the install/deferral decision and before any send, so a completion
+   * racing the trip can never reverse the selected first winner (the
    * no-replace install in journalTerminal arbitrates, D4) AND the Codex per-sink credential reconcile
    * inside the reap's withBoundary is authorized (the abort has not yet reported terminal, so the run
    * is still in codexActivelyClaimedStatuses — reaping AFTER the terminal report would be refused 409
@@ -3846,9 +3855,9 @@ export class RunRunner {
         },
         (b, sig) => flight.reportState(b, sig),
         async () => {
-          // (2) Abort the attempt ONLY AFTER the durable journal is installed (D5/D4), so execute()
-          // falls into its catch (→ reportGenericFailure, which awaits this handler's settlement,
-          // finds the durable journal / the terminalResolved latch, and does NOT report a second
+          // (2) Abort after the install/deferral decision preserves the selected outcome (D5/D4), so
+          // execute() falls into its catch (→ reportGenericFailure, which awaits this handler's settlement,
+          // finds the pending winner / the terminalResolved latch, and does NOT report a second
           // `failed`). (3) Then reap this generation's provider while the run is still actively-claimed
           // and record the outcome + the reaped safety epoch, for reportGenericFailure to settle on.
           if (!flight.cancel.signal.aborted) flight.cancel.abort();
@@ -3967,30 +3976,29 @@ export class RunRunner {
     if (boundaryDiagnostic !== undefined) {
       runLog.error("codex boundary failed", { ...codexBoundaryFieldsOf(err), detail: redactText(boundaryDiagnostic) });
     }
-    // PRD #1391 Run B M3 (D5): if the permanent-failure hook tripped, AWAIT its settlement first — it
-    // journals `failed` durably and aborts the attempt (which routed us here), so the journal must be
-    // observed as installed before the hasPendingTerminal check below. Resolves immediately when the
+    // PRD #1391 Run B M3 (D5): if the permanent-failure hook tripped, AWAIT its settlement first —
+    // its install/deferral decision and latch must precede the suppression check below.
+    // The hook aborts the attempt, routing us here. Resolves immediately when the
     // breaker never tripped (every ordinary failure), so this is a no-op on the common path.
     await batcher.awaitPermanentFailureSettled();
-    // PRD #1391 Run B M3 (fact 2, D5, N2): a JOURNALED/RESOLVED outcome is FINAL. Do NOT fall through
-    // to a SECOND `failed` when EITHER a terminal outcome for this generation has already resolved
-    // (the `terminalResolved` latch — set even after a 200 RETIRED the journal, so hasPendingTerminal
-    // reads false) OR a write-ahead journal is still installed (the permanent-failure hook's durable
-    // `failed`, or a terminal site that journaled before throwing into this catch). The first durable
-    // winner stands (the no-replace install arbitrates, D4). Still close the batcher and settle
+    // PRD #1391 Run B M3 (fact 2, D5, N2): suppress a SECOND `failed` when a terminal outcome
+    // resolved or a competing outcome was deferred for an unavailable selected winner
+    // (the `terminalResolved` latch survives a 200 retiring the journal), or a pending terminal
+    // remains selected. Pending metadata alone does not claim current durable adoption.
+    // Still close the batcher and settle
     // recovery custody (clone cleanup is independent of the report).
     if (
       flight.terminalResolved ||
       (this.outbox && this.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration))
     ) {
-      runLog.info("run outcome already journaled write-ahead; not reporting a second failed", {
+      runLog.info("run outcome already selected; not reporting a second failed", {
         run_id: flight.runId,
         claim_generation: flight.claimGeneration,
       });
       await batcher.close().catch(() => undefined);
       if (opts.keepCustody) return;
       // #1539: when the permanent-failure hook handled this terminal it ALREADY reaped the
-      // provider between the install and the send (while still actively-claimed), so there is no
+      // provider after the install/deferral decision and before any send (while still actively-claimed), so there is no
       // second reap here — settle custody ONCE, gated by the stale-epoch guard. Any OTHER writer that
       // reaches this arm (the finalize sites at :2600/:2611) already settles via driveRecoveryTerminal
       // under the finalize boundary, so its reapThenSettle here is a redundant backstop kept unchanged.
@@ -7514,9 +7522,9 @@ export class RunRunner {
       parked: false,
       holdOrWallParkConfirmed: false,
       uncertainWallPark: false,
-      // PRD #1391 Run B M3 (N2/D5): no terminal outcome resolved yet. Set by journalAndSendTerminal
-      // the moment any completed/failed for this generation is sent/resolved (write-ahead or not),
-      // so reportGenericFailure never falls through to a SECOND `failed` once one is final.
+      // PRD #1391 Run B M3 (N2/D5): no terminal outcome selected yet. Set by journalAndSendTerminal
+      // when an outcome is resolved or a competing outcome is deferred for an unavailable selected
+      // winner, so reportGenericFailure never falls through to a SECOND `failed` after either decision.
       terminalResolved: false,
       // #1539: set by the permanent-failure hook (undefined until then) — the pre-settle reap
       // outcome and the safety epoch it reaped, for reportGenericFailure's one-time custody settle.
@@ -7543,19 +7551,19 @@ export class RunRunner {
       result: undefined,
     };
 
-    // PRD #1391 Run B M3 (D5) / #1539: a PERMANENT message failure now journals `failed` WRITE-AHEAD
-    // (durable), then ABORTS the attempt, then REAPS this generation's provider while the run is still
-    // actively-claimed, then resolves/sends the terminal — replacing today's fire-and-forget `failed`
+    // PRD #1391 Run B M3 (D5) / #1539: a PERMANENT message failure installs `failed` WRITE-AHEAD
+    // or defers for an unavailable selected winner, then ABORTS the attempt, then REAPS this generation's
+    // provider while the run is still actively-claimed, then resolves/sends unless deferred — replacing the fire-and-forget `failed`
     // report that left the executor running (the split-brain in miniature, fact 1). The handler is
     // ASYNC and trip() captures its promise into batcher.permanentFailureSettled, which
-    // reportGenericFailure AWAITS before it checks the journal — so the abort's terminal `failed` is
-    // observable ONLY AFTER the outcome is durable, and a completion that races the trip can never
-    // reverse the first durable winner (the no-replace install in journalTerminal arbitrates, D4). The
-    // reap runs between the install and the send (in beforeResolve), so the Codex reconcile is
+    // reportGenericFailure AWAITS before it checks the selected outcome/latch — so a completion
+    // racing the trip can never reverse the selected first winner (the no-replace install in
+    // journalTerminal arbitrates, D4). The reap runs after the install/deferral decision and before
+    // any send (in beforeResolve), so the Codex reconcile is
     // authorized (still actively-claimed) rather than refused 409 after a terminal report — the #1539
     // fix. Chat keeps today's non-journal behaviour (chat-runner.ts). When no outbox is wired this
     // degrades to today's direct `failed` report + abort + reap.
-    // The hook body lives in handlePermanentFailure (a named method) so its install-BEFORE-abort,
+    // The hook body lives in handlePermanentFailure (a named method) so its install/decision-BEFORE-abort,
     // abort-BEFORE-reap, reap-BEFORE-send ordering is unit-testable against the REAL code — a mutation
     // to any of those orderings reddens a test.
     batcher.onPermanentFailureReport(({ reason }) => this.handlePermanentFailure(claim, flight, reason));
@@ -9068,6 +9076,8 @@ export class RunRunner {
       // a dropped-session resume still had its tree destroyed. Same discriminator the
       // reseed feed-status uses (this.emit "starting from the default branch" above).
       resumed: claim.session_id != null,
+      dockerScratchResume: this.dockerHost !== undefined &&
+        (claim.session_id != null || (claim.claim_generation ?? 0) > 1),
       // PRD #35 Decision 6b + PRD #209 D4. The RUNNER is the only layer that knows
       // all the facts, which is why it resolves them here rather than the executor
       // reading the claim: the server said the plan is approved, and EITHER a session

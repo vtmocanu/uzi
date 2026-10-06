@@ -14,7 +14,7 @@ import (
 
 const cordonHostedWorker = `-- name: CordonHostedWorker :execrows
 UPDATE workers
-   SET draining_since = COALESCE(draining_since, now()), updated_at = now(),
+   SET draining_since = COALESCE(draining_since, now()), maintenance_owns_drain = false, updated_at = now(),
        lease_since = NULL, lease_repo_id = NULL, lease_branch = NULL
  WHERE id = $1 AND kind = 'hosted'
 `
@@ -108,7 +108,7 @@ func (q *Queries) CountHostedWorkersForUser(ctx context.Context, userID uuid.UUI
 const createEphemeralHostedWorker = `-- name: CreateEphemeralHostedWorker :one
 INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, ephemeral, ephemeral_run_id, anthropic_bind_mode, isolated_lane)
 VALUES ($1, $2, $3, $4, 'hosted', $5, $6, true, $7::uuid, $8, $9::boolean)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor
 `
 
 type CreateEphemeralHostedWorkerParams struct {
@@ -206,6 +206,25 @@ func (q *Queries) CreateEphemeralHostedWorker(ctx context.Context, arg CreateEph
 		&i.LeaseSince,
 		&i.LeaseRepoID,
 		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
 	)
 	return i, err
 }
@@ -213,7 +232,7 @@ func (q *Queries) CreateEphemeralHostedWorker(ctx context.Context, arg CreateEph
 const createHostedWorker = `-- name: CreateHostedWorker :one
 INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, anthropic_bind_mode)
 VALUES ($1, $2, $3, $4, 'hosted', $5, $6, $7)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor
 `
 
 type CreateHostedWorkerParams struct {
@@ -309,6 +328,25 @@ func (q *Queries) CreateHostedWorker(ctx context.Context, arg CreateHostedWorker
 		&i.LeaseSince,
 		&i.LeaseRepoID,
 		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
 	)
 	return i, err
 }
@@ -614,6 +652,14 @@ SELECT w.id,
        COALESCE(w.stats_disk_pressure_streak >= $1::int
         AND w.last_heartbeat_at IS NOT NULL
         AND w.last_heartbeat_at >= $2, false)::boolean AS disk_pressure,
+       ARRAY_REMOVE(ARRAY[
+         CASE WHEN w.stats_disk_pressure_streak >= 2 AND w.nix_pressure AND w.last_heartbeat_at >= $2 THEN 'nix'::text END,
+         CASE WHEN w.stats_disk_pressure_streak >= 2 AND w.data_pressure AND w.last_heartbeat_at >= $2 THEN 'data'::text END,
+         CASE WHEN w.dind_pressure_streak >= 2 AND w.dind_meter_at >= now() - interval '45 seconds' THEN 'dind'::text END
+       ], NULL)::text[] AS disk_pressure_volumes,
+       w.maintenance_id, w.maintenance_nonce, w.maintenance_phase,
+       w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce,
+       w.maintenance_fenced, w.maintenance_ready_ack,
        w.ephemeral,
        -- isolated_lane (PRD #1906 M5): the server-set lane marker, mapped to DesiredWorker.Isolated
        -- so the controller renders the worker into the isolated lane's namespace.
@@ -642,18 +688,27 @@ type ListHostedWorkersForControllerParams struct {
 }
 
 type ListHostedWorkersForControllerRow struct {
-	ID               uuid.UUID          `json:"id"`
-	TemplateDeclared pgtype.Text        `json:"template_declared"`
-	HostedSize       pgtype.Text        `json:"hosted_size"`
-	HostedGeneration int64              `json:"hosted_generation"`
-	DockerEnabled    pgtype.Bool        `json:"docker_enabled"`
-	Busy             bool               `json:"busy"`
-	DrainingSince    pgtype.Timestamptz `json:"draining_since"`
-	DiskPressure     bool               `json:"disk_pressure"`
-	Ephemeral        bool               `json:"ephemeral"`
-	IsolatedLane     bool               `json:"isolated_lane"`
-	CustodyHeld      bool               `json:"custody_held"`
-	TokenCiphertext  []byte             `json:"token_ciphertext"`
+	ID                       uuid.UUID          `json:"id"`
+	TemplateDeclared         pgtype.Text        `json:"template_declared"`
+	HostedSize               pgtype.Text        `json:"hosted_size"`
+	HostedGeneration         int64              `json:"hosted_generation"`
+	DockerEnabled            pgtype.Bool        `json:"docker_enabled"`
+	Busy                     bool               `json:"busy"`
+	DrainingSince            pgtype.Timestamptz `json:"draining_since"`
+	DiskPressure             bool               `json:"disk_pressure"`
+	DiskPressureVolumes      []string           `json:"disk_pressure_volumes"`
+	MaintenanceID            pgtype.UUID        `json:"maintenance_id"`
+	MaintenanceNonce         string             `json:"maintenance_nonce"`
+	MaintenancePhase         string             `json:"maintenance_phase"`
+	MaintenanceDeploymentUid string             `json:"maintenance_deployment_uid"`
+	MaintenancePvcUid        string             `json:"maintenance_pvc_uid"`
+	MaintenanceRegisterNonce string             `json:"maintenance_register_nonce"`
+	MaintenanceFenced        bool               `json:"maintenance_fenced"`
+	MaintenanceReadyAck      bool               `json:"maintenance_ready_ack"`
+	Ephemeral                bool               `json:"ephemeral"`
+	IsolatedLane             bool               `json:"isolated_lane"`
+	CustodyHeld              bool               `json:"custody_held"`
+	TokenCiphertext          []byte             `json:"token_ciphertext"`
 }
 
 // Hosted workers (PRD #58) --------------------------------------------------
@@ -692,6 +747,15 @@ func (q *Queries) ListHostedWorkersForController(ctx context.Context, arg ListHo
 			&i.Busy,
 			&i.DrainingSince,
 			&i.DiskPressure,
+			&i.DiskPressureVolumes,
+			&i.MaintenanceID,
+			&i.MaintenanceNonce,
+			&i.MaintenancePhase,
+			&i.MaintenanceDeploymentUid,
+			&i.MaintenancePvcUid,
+			&i.MaintenanceRegisterNonce,
+			&i.MaintenanceFenced,
+			&i.MaintenanceReadyAck,
 			&i.Ephemeral,
 			&i.IsolatedLane,
 			&i.CustodyHeld,
@@ -970,7 +1034,10 @@ func (q *Queries) RebindLeasedEphemeralWorker(ctx context.Context, arg RebindLea
 
 const uncordonHostedWorker = `-- name: UncordonHostedWorker :execrows
 UPDATE workers
-   SET draining_since = NULL, updated_at = now()
+   -- Releasing the legacy cordon hands a pending drain to maintenance for cleanup.
+   SET draining_since = CASE WHEN maintenance_phase IN ('requested','ready','stopping','recycling') THEN draining_since ELSE NULL END,
+       maintenance_owns_drain = maintenance_phase IN ('requested','ready','stopping','recycling'),
+       updated_at = now()
  WHERE id = $1 AND kind = 'hosted'
 `
 

@@ -800,9 +800,14 @@ func (q *Queries) ClaimAutopilotTerminalComment(ctx context.Context, id uuid.UUI
 }
 
 const claimRun = `-- name: ClaimRun :one
-WITH target AS (
+WITH claimant AS MATERIALIZED (
+    SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor FROM workers WHERE id = $1 FOR UPDATE
+), target AS (
     SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id FROM runs r
     WHERE r.user_id = $2
+      AND EXISTS (SELECT 1 FROM claimant c WHERE NOT c.maintenance_fenced
+        AND (c.draining_since IS NULL AND c.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+             OR r.worker_id = c.id))
       AND r.kind <> 'chat'
       -- PRD #400 Decision 6: a task run is claimable ONLY after the CLI has seeded its
       -- uzi/task/<id> branch and stamped dispatched_at — otherwise a worker could claim
@@ -852,7 +857,7 @@ WITH target AS (
            OR NOT EXISTS (
                SELECT 1 FROM workers ow
                WHERE ow.id = r.worker_id
-                 AND (ow.draining_since IS NOT NULL
+                 AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced
                       OR (ow.last_heartbeat_at IS NOT NULL
                           AND ow.last_heartbeat_at >= $3)))
            -- Generous ceiling bounding the live-but-can't-serve case; @affinity_cutoff is
@@ -1075,7 +1080,7 @@ WITH target AS (
       -- clause above. The caller rebinds the worker to the claimed run in the same transaction.
       AND (NOT $14::boolean
            OR r.id = $15::uuid
-           OR (fn_ephemeral_lease_admits(
+           OR ((fn_ephemeral_lease_admits(
                    $16::timestamptz,
                    $17::uuid,
                    $18::text,
@@ -1083,6 +1088,7 @@ WITH target AS (
                    $19::interval,
                    $20::timestamptz,
                    r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies((SELECT owner.ephemeral_docker_enabled FROM users owner WHERE owner.id = r.user_id), $21::boolean, r.repo_id, r.kind, r.egress_profile_id, $7::uuid[]) OR COALESCE($6::boolean, false)))
                AND NOT EXISTS (
                    SELECT 1 FROM workers bw
                    WHERE bw.ephemeral AND bw.ephemeral_run_id = r.id)
@@ -1106,7 +1112,7 @@ WITH target AS (
       -- claim (a minimum-loaded worker never defers, guaranteeing claimability).
       AND (
           r.worker_id = $1
-          OR r.updated_at < $21
+          OR r.updated_at < $22
           OR NOT EXISTS (
               SELECT 1
               FROM workers p
@@ -1123,7 +1129,7 @@ WITH target AS (
                 AND p.last_heartbeat_at >= $3
                 -- A draining peer claims nothing (PRD #422 Decision 7), so never DEFER a
                 -- run to it — it would never pick the run up.
-                AND p.draining_since IS NULL
+                AND p.draining_since IS NULL AND NOT p.maintenance_fenced AND p.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
                 -- PRD #529 Decision 4: an ephemeral peer claims ONLY its own bound run
                 -- (ClaimRun's claimant clause above), so it would never pick up a
                 -- FOREIGN run — same failure mode as the draining-peer guard. Deferring
@@ -1134,10 +1140,11 @@ WITH target AS (
                 -- PRD #2006: ...or a LEASED ephemeral peer that may claim r through its lease
                 -- (the claimant clause's lease arm), advisory like this whole mirror, so now().
                 AND (NOT p.ephemeral OR p.ephemeral_run_id = r.id
-                     OR fn_ephemeral_lease_admits(
+                     OR (fn_ephemeral_lease_admits(
                             p.lease_since, p.lease_repo_id, p.lease_branch, p.draining_since IS NOT NULL,
                             $19::interval, now(),
-                            r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id))
+                            r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies((SELECT owner.ephemeral_docker_enabled FROM users owner WHERE owner.id = r.user_id), $21::boolean, r.repo_id, r.kind, r.egress_profile_id, $7::uuid[]) OR COALESCE(p.docker_enabled, false))))
                 AND p.max_concurrent_runs IS NOT NULL
                 AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), $7::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, $9::boolean)
                 -- PRD #1226 M1 (D2): MIRROR the non-bypassable completion-protocol clause for
@@ -1252,7 +1259,7 @@ WITH target AS (
             -- PRD #1497 M1 (D16): a RELEASED flight's fresh snapshot must NOT block the reclaim of a
             -- server-parked run — the release is exactly the signal the old flight is over.
             AND r.claim_released_at IS NULL
-            AND (a.reported_at >= $22
+            AND (a.reported_at >= $23
                  OR (a.terminal_pending AND a.terminal_pending_until > now())))
       -- (2) Request-array exclusion (fact 7): the claimant's OWN request snapshot excludes its
       -- listed runs at the CURRENT generation, so the exclusion holds BEFORE the first heartbeat
@@ -1262,8 +1269,8 @@ WITH target AS (
       -- Empty arrays (no request snapshot, or the no-snapshot path) match nothing → no exclusion.
       AND NOT EXISTS (
           SELECT 1
-          FROM unnest($23::uuid[]) WITH ORDINALITY AS req_id(id, ord)
-          JOIN unnest($24::bigint[]) WITH ORDINALITY AS req_gen(gen, ord)
+          FROM unnest($24::uuid[]) WITH ORDINALITY AS req_id(id, ord)
+          JOIN unnest($25::bigint[]) WITH ORDINALITY AS req_gen(gen, ord)
                ON req_gen.ord = req_id.ord
           WHERE req_id.id = r.id AND req_gen.gen = r.claim_generation)
       -- (3) Overflow closure (D11): never claim a run whose OWNER is under an unexpired
@@ -1294,7 +1301,7 @@ WITH target AS (
     -- fail-open: a demoted run created before it reads as stale, so
     -- fn_run_priority returns normal and background work never starves.
     ORDER BY COALESCE(r.worker_id = $1, false) DESC,
-             fn_run_priority(r.kind, r.priority, r.created_at < $25) DESC,
+             fn_run_priority(r.kind, r.priority, r.created_at < $26) DESC,
              r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -1314,9 +1321,9 @@ hold AS (
          original_worker_id, original_worker_identity, live_worker_id, live_run_id,
          created_at, updated_at)
     SELECT gen_random_uuid(), t.user_id, t.repo_id, t.id, t.claim_generation + 1, 'open',
-           $1, $26::text, $1, t.id, now(), now()
+           $1, $27::text, $1, t.id, now(), now()
     FROM target t
-    WHERE $27::boolean
+    WHERE $28::boolean
       AND t.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
       -- PRD #1906 M5: a profile-bound run publishes no code (no repo, no forge credential, no
       -- push), so it never opens a custody hold, whatever the claiming worker advertises.
@@ -1386,6 +1393,7 @@ type ClaimRunParams struct {
 	LeaseBranch           pgtype.Text        `json:"lease_branch"`
 	EphemeralLease        pgtype.Interval    `json:"ephemeral_lease"`
 	LeaseAt               pgtype.Timestamptz `json:"lease_at"`
+	WorkerDockerEnabled   bool               `json:"worker_docker_enabled"`
 	SpreadCutoff          pgtype.Timestamptz `json:"spread_cutoff"`
 	SnapshotFreshCutoff   pgtype.Timestamptz `json:"snapshot_fresh_cutoff"`
 	RequestActiveIds      []uuid.UUID        `json:"request_active_ids"`
@@ -1452,6 +1460,7 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		arg.LeaseBranch,
 		arg.EphemeralLease,
 		arg.LeaseAt,
+		arg.WorkerDockerEnabled,
 		arg.SpreadCutoff,
 		arg.SnapshotFreshCutoff,
 		arg.RequestActiveIds,
@@ -2026,18 +2035,20 @@ func (q *Queries) CountOnlineEligibleWorkersForRepo(ctx context.Context, arg Cou
 
 const countOnlineWorkersClaimableForRun = `-- name: CountOnlineWorkersClaimableForRun :one
 WITH candidates AS (
-SELECT w.draining_since,
+SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','ready','stopping','recycling') THEN COALESCE(w.draining_since, w.maintenance_activity_floor) ELSE w.draining_since END AS draining_since,
        (w.status = 'online') AS online,
        (w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs) AS free_slot,
-       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR fn_ephemeral_lease_admits(
-              w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
-              $1::interval, now(),
-              run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)) AS advisory_binding,
-       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (
-           fn_ephemeral_lease_admits(
+       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (fn_ephemeral_lease_admits(
               w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
               $1::interval, now(),
               run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, $2::boolean, run.repo_id, run.kind, run.egress_profile_id, $3::uuid[]) OR COALESCE(w.docker_enabled, false)))) AS advisory_binding,
+       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (
+           (fn_ephemeral_lease_admits(
+              w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+              $1::interval, now(),
+              run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, $2::boolean, run.repo_id, run.kind, run.egress_profile_id, $3::uuid[]) OR COALESCE(w.docker_enabled, false)))
            AND NOT EXISTS (SELECT 1 FROM workers bw WHERE bw.ephemeral AND bw.ephemeral_run_id = run.id)
            AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds ch WHERE ch.live_worker_id = w.id AND ch.state = 'open')
        )) AS strict_binding,
@@ -2045,10 +2056,11 @@ SELECT w.draining_since,
        (NOT w.ephemeral) AS persistent,
        (run.worker_id IS NULL OR run.worker_id = w.id
         OR NOT EXISTS (SELECT 1 FROM workers ow WHERE ow.id = run.worker_id
-                       AND (ow.draining_since IS NOT NULL OR
-                            (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= $2)))
-        OR run.updated_at < $3) AS affinity
+                       AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced OR
+                            (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= $4)))
+        OR run.updated_at < $5) AS affinity
 FROM runs run
+JOIN users owner ON owner.id = run.user_id
 JOIN workers w ON w.user_id = run.user_id
 CROSS JOIN LATERAL (
     SELECT count(*) AS active FROM runs pr
@@ -2056,17 +2068,17 @@ CROSS JOIN LATERAL (
       AND pr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
       AND pr.kind <> 'chat'
 ) wa
-WHERE run.id = $4
+WHERE run.id = $6
   AND w.last_heartbeat_at IS NOT NULL
-  AND w.last_heartbeat_at >= $2
+  AND w.last_heartbeat_at >= $4
   AND fn_worker_can_claim(
         COALESCE(w.docker_enabled, false),
-        $5::uuid[],
+        $3::uuid[],
         run.repo_id,
         run.kind,
         COALESCE(w.capabilities, '{}')::text[],
         run.required_capabilities,
-        $6::boolean)
+        $7::boolean)
   AND (run.completion_contract_version IS NULL
        OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
@@ -2086,9 +2098,9 @@ WHERE run.id = $4
           AND run.kind NOT IN ('judge', 'chat')
           AND run.review_target_run_id IS NULL
           AND COALESCE(
-              NOT ((CASE WHEN run.model = ANY($7::text[]) THEN run.model
+              NOT ((CASE WHEN run.model = ANY($8::text[]) THEN run.model
                          ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id) END)
-                   = ANY($7::text[])),
+                   = ANY($8::text[])),
               false)
       )
       OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
@@ -2119,10 +2131,11 @@ FROM candidates
 
 type CountOnlineWorkersClaimableForRunParams struct {
 	EphemeralLease      pgtype.Interval    `json:"ephemeral_lease"`
+	WorkerDockerEnabled bool               `json:"worker_docker_enabled"`
+	DockerRepoAllowlist []uuid.UUID        `json:"docker_repo_allowlist"`
 	HeartbeatCutoff     pgtype.Timestamptz `json:"heartbeat_cutoff"`
 	AffinityCutoff      pgtype.Timestamptz `json:"affinity_cutoff"`
 	RunID               uuid.UUID          `json:"run_id"`
-	DockerRepoAllowlist []uuid.UUID        `json:"docker_repo_allowlist"`
 	CapabilityAware     bool               `json:"capability_aware"`
 	CodexCuratedModels  []string           `json:"codex_curated_models"`
 }
@@ -2161,10 +2174,11 @@ type CountOnlineWorkersClaimableForRunRow struct {
 func (q *Queries) CountOnlineWorkersClaimableForRun(ctx context.Context, arg CountOnlineWorkersClaimableForRunParams) (CountOnlineWorkersClaimableForRunRow, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersClaimableForRun,
 		arg.EphemeralLease,
+		arg.WorkerDockerEnabled,
+		arg.DockerRepoAllowlist,
 		arg.HeartbeatCutoff,
 		arg.AffinityCutoff,
 		arg.RunID,
-		arg.DockerRepoAllowlist,
 		arg.CapabilityAware,
 		arg.CodexCuratedModels,
 	)
@@ -2200,7 +2214,7 @@ const countOnlineWorkersSatisfyingCaps = `-- name: CountOnlineWorkersSatisfyingC
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -2248,7 +2262,7 @@ const countOnlineWorkersSatisfyingCodexCompletion = `-- name: CountOnlineWorkers
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -2279,7 +2293,7 @@ const countOnlineWorkersSatisfyingCodexHarness = `-- name: CountOnlineWorkersSat
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -2316,7 +2330,7 @@ const countOnlineWorkersSatisfyingCodexRuntime = `-- name: CountOnlineWorkersSat
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -2338,7 +2352,7 @@ const countOnlineWorkersSatisfyingCustomCodex = `-- name: CountOnlineWorkersSati
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -2377,7 +2391,7 @@ const countOnlineWorkersSatisfyingJobRunner = `-- name: CountOnlineWorkersSatisf
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   AND NOT COALESCE(w.docker_enabled, false)
   AND 'job_runner_v1' = ANY(w.protocol_capabilities)
@@ -2408,7 +2422,7 @@ const countOnlineWorkersSatisfyingProtocol = `-- name: CountOnlineWorkersSatisfy
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
   AND w.status = 'online'
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -2447,7 +2461,7 @@ WHERE w.user_id = $1
   AND w.status = 'online'
   -- A draining worker has no free slot for NEW work (it claims nothing), so the
   -- queued-run reason resolver must not count it as an idle worker (PRD #422 Decision 7).
-  AND w.draining_since IS NULL
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
   -- AND NOT w.ephemeral (PRD #529 M2, Correction B; issue #1624): an ephemeral worker is
   -- bound to ONE run (it can claim only its ephemeral_run_id), so it never has a free
   -- slot for ANOTHER run, even when idle, with a NULL cap, or below an advertised cap.
@@ -3894,7 +3908,7 @@ const createWorker = `-- name: CreateWorker :one
 
 INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id, anthropic_bind_mode)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor
 `
 
 type CreateWorkerParams struct {
@@ -3985,6 +3999,25 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 		&i.LeaseSince,
 		&i.LeaseRepoID,
 		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
 	)
 	return i, err
 }
@@ -4387,159 +4420,6 @@ func (q *Queries) ExtendAndResumeWallPark(ctx context.Context, arg ExtendAndResu
 	return budget_extension_seconds, err
 }
 
-const failAttestedFinalizeRunsOverCap = `-- name: FailAttestedFinalizeRunsOverCap :many
-WITH candidates AS MATERIALIZED (
-    SELECT runs.id, runs.kind FROM runs
-    WHERE runs.worker_id = $2
-  AND runs.claim_released_at IS NULL
-  AND runs.status = 'running'
-  AND runs.kind <> 'chat'
-  AND runs.id = ANY($3::uuid[])
-  AND runs.claim_generation = ($4::bigint[])[array_position($3::uuid[], runs.id)]
-  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
-                    AND a.terminal_pending_until > now()
-                    AND a.claim_generation = runs.claim_generation)
-  AND runs.requeue_count >= $5
-  AND NOT ($5 > 0 AND runs.finalize_resume_generation IS NULL)
-), parent_mapping AS MATERIALIZED (
-    SELECT candidates.id AS run_id, parent.id AS parent_id
-    FROM candidates
-    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
-        AND cc.checker_run_id = candidates.id
-    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
-        THEN cc.lead_run_id ELSE candidates.id END
-        AND parent.kind <> 'cross_check'
-), locked_parents AS MATERIALIZED (
-    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason FROM runs lead
-    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
-      AND lead.kind <> 'cross_check'
-    ORDER BY lead.id
-    FOR UPDATE OF lead
-), parent_lock_set AS MATERIALIZED (
-    -- Consume every selected parent lock before taking a checker lock.
-    SELECT array_agg(id) AS ids FROM locked_parents
-), locked_targets AS MATERIALIZED (
-    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM runs
-    JOIN parent_mapping mapping ON mapping.run_id = runs.id
-    CROSS JOIN parent_lock_set locks
-    WHERE runs.id IN (SELECT id FROM candidates)
-      AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
-      AND runs.worker_id = $2
-  AND runs.claim_released_at IS NULL
-  AND runs.status = 'running'
-  AND runs.kind <> 'chat'
-  AND runs.id = ANY($3::uuid[])
-  AND runs.claim_generation = ($4::bigint[])[array_position($3::uuid[], runs.id)]
-  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
-                    AND a.terminal_pending_until > now()
-                    AND a.claim_generation = runs.claim_generation)
-  AND runs.requeue_count >= $5
-  AND NOT ($5 > 0 AND runs.finalize_resume_generation IS NULL)
-
-    ORDER BY runs.id
-    FOR UPDATE OF runs
-), target_lock_set AS MATERIALIZED (
-    SELECT array_agg(id) AS ids FROM locked_targets
-), final_targets AS MATERIALIZED (
-    -- Recheck the refreshed locked rows, not initial candidate membership.
-    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM locked_targets runs CROSS JOIN target_lock_set locks
-    WHERE runs.id = ANY(locks.ids)
-      AND runs.worker_id = $2
-  AND runs.claim_released_at IS NULL
-  AND runs.status = 'running'
-  AND runs.kind <> 'chat'
-  AND runs.id = ANY($3::uuid[])
-  AND runs.claim_generation = ($4::bigint[])[array_position($3::uuid[], runs.id)]
-  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
-                    AND a.terminal_pending_until > now()
-                    AND a.claim_generation = runs.claim_generation)
-  AND runs.requeue_count >= $5
-  AND NOT ($5 > 0 AND runs.finalize_resume_generation IS NULL)
-
-), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00297 owns cancellation only
-    -- for an unreleased active lead with a pending plan round-one check.
-    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
-), eligible_candidates AS MATERIALIZED (
-    SELECT target.id AS run_id FROM final_targets target
-    WHERE (target.kind = 'cross_check'
-           OR target.id IN (SELECT id FROM eligible_parent_exits))
-      AND NOT EXISTS (
-          SELECT 1 FROM cross_checks cc
-          JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
-          WHERE cc.checker_run_id = target.id
-            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
-            AND exiting.status IN ('claimed', 'running')
-            AND exiting.claim_released_at IS NULL
-      )
-)
-UPDATE runs SET plan_cross_check_gate_reason = NULL,
-    status = 'failed', status_since = now(), failure_reason = $1,
-    fail_origin = 'worker_lost',
-    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
-    milestones_in_progress = NULL,
-    milestones_agents = NULL,
-    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
-    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
-    health = 'ok', health_reason = NULL, health_since = NULL,
-    updated_at = now()
-WHERE runs.worker_id = $2
-  AND runs.claim_released_at IS NULL
-  AND runs.status = 'running'
-  AND runs.kind <> 'chat'
-  -- Positional pairing of the two parallel arrays (run ids are unique: Register validates the
-  -- list). array_position is NULL for an unlisted run, so the equality is then never true.
-  AND runs.id = ANY($3::uuid[])
-  AND runs.claim_generation = ($4::bigint[])[array_position($3::uuid[], runs.id)]
-  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
-                    AND a.terminal_pending_until > now()
-                    AND a.claim_generation = runs.claim_generation)
-  AND runs.requeue_count >= $5
-  AND NOT ($5 > 0 AND runs.finalize_resume_generation IS NULL)
-  AND runs.id IN (SELECT run_id FROM eligible_candidates)
-RETURNING runs.id
-`
-
-type FailAttestedFinalizeRunsOverCapParams struct {
-	FailureReason    pgtype.Text `json:"failure_reason"`
-	WorkerID         pgtype.UUID `json:"worker_id"`
-	RunIds           []uuid.UUID `json:"run_ids"`
-	ClaimGenerations []int64     `json:"claim_generations"`
-	MaxRequeues      int32       `json:"max_requeues"`
-}
-
-// An attested run that is over budget and not eligible for the one-shot allowance (allowance
-// already used, or RUN_MAX_REQUEUES = 0) fails exactly as FailWorkerRunsOverCap fails it.
-func (q *Queries) FailAttestedFinalizeRunsOverCap(ctx context.Context, arg FailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, failAttestedFinalizeRunsOverCap,
-		arg.FailureReason,
-		arg.WorkerID,
-		arg.RunIds,
-		arg.ClaimGenerations,
-		arg.MaxRequeues,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []uuid.UUID{}
-	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		items = append(items, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const failClaimAssemblyExact = `-- name: FailClaimAssemblyExact :execrows
 UPDATE runs SET
     plan_cross_check_gate_reason = NULL,
@@ -4707,541 +4587,6 @@ func (q *Queries) FailRunAutoStop(ctx context.Context, arg FailRunAutoStopParams
 		return 0, err
 	}
 	return result.RowsAffected(), nil
-}
-
-const failRunsMissingFromSnapshot = `-- name: FailRunsMissingFromSnapshot :many
-WITH candidates AS MATERIALIZED (
-    SELECT runs.id, runs.kind FROM runs
-    WHERE runs.worker_id = $2
-  AND runs.kind <> 'chat'
-  AND runs.status = 'running'
-  AND runs.claim_released_at IS NULL
-  AND runs.status_since < $3
-  AND runs.requeue_count >= $4
-  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
-    AND runs.completion_attempts = 0
-    AND runs.started_at < ($5::timestamptz
-      - make_interval(secs => COALESCE(runs.budget_wall_seconds, $6::int)
-                            + runs.budget_paused_seconds + runs.budget_extension_seconds
-                            + runs.budget_finalize_seconds
-                            + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
-                                (LEAST($5::timestamptz, cc.deadline_at) - cc.created_at)))::int)
-                                FROM cross_checks cc WHERE cc.lead_run_id = runs.id
-                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
-  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                  WHERE a.worker_id = $2 AND a.run_id = runs.id
-                    AND a.claim_generation = runs.claim_generation)
-  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
-                    AND a.terminal_pending AND a.terminal_pending_until > now()
-                    AND a.claim_generation = runs.claim_generation)
-  AND NOT EXISTS (SELECT 1 FROM workers w
-                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
-), parent_mapping AS MATERIALIZED (
-    SELECT candidates.id AS run_id, parent.id AS parent_id
-    FROM candidates
-    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
-        AND cc.checker_run_id = candidates.id
-    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
-        THEN cc.lead_run_id ELSE candidates.id END
-        AND parent.kind <> 'cross_check'
-), locked_parents AS MATERIALIZED (
-    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason FROM runs lead
-    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
-      AND lead.kind <> 'cross_check'
-    ORDER BY lead.id
-    FOR UPDATE OF lead
-), parent_lock_set AS MATERIALIZED (
-    -- Consume every selected parent lock before taking a checker lock.
-    SELECT array_agg(id) AS ids FROM locked_parents
-), locked_targets AS MATERIALIZED (
-    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM runs
-    JOIN parent_mapping mapping ON mapping.run_id = runs.id
-    CROSS JOIN parent_lock_set locks
-    WHERE runs.id IN (SELECT id FROM candidates)
-      AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
-      AND runs.worker_id = $2
-  AND runs.kind <> 'chat'
-  AND runs.status = 'running'
-  AND runs.claim_released_at IS NULL
-  AND runs.status_since < $3
-  AND runs.requeue_count >= $4
-  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
-    AND runs.completion_attempts = 0
-    AND runs.started_at < ($5::timestamptz
-      - make_interval(secs => COALESCE(runs.budget_wall_seconds, $6::int)
-                            + runs.budget_paused_seconds + runs.budget_extension_seconds
-                            + runs.budget_finalize_seconds
-                            + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
-                                (LEAST($5::timestamptz, cc.deadline_at) - cc.created_at)))::int)
-                                FROM cross_checks cc WHERE cc.lead_run_id = runs.id
-                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
-  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                  WHERE a.worker_id = $2 AND a.run_id = runs.id
-                    AND a.claim_generation = runs.claim_generation)
-  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
-                    AND a.terminal_pending AND a.terminal_pending_until > now()
-                    AND a.claim_generation = runs.claim_generation)
-  AND NOT EXISTS (SELECT 1 FROM workers w
-                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
-
-    ORDER BY runs.id
-    FOR UPDATE OF runs
-), target_lock_set AS MATERIALIZED (
-    SELECT array_agg(id) AS ids FROM locked_targets
-), final_targets AS MATERIALIZED (
-    -- Recheck the refreshed locked rows, not initial candidate membership.
-    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM locked_targets runs CROSS JOIN target_lock_set locks
-    WHERE runs.id = ANY(locks.ids)
-      AND runs.worker_id = $2
-  AND runs.kind <> 'chat'
-  AND runs.status = 'running'
-  AND runs.claim_released_at IS NULL
-  AND runs.status_since < $3
-  AND runs.requeue_count >= $4
-  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
-    AND runs.completion_attempts = 0
-    AND runs.started_at < ($5::timestamptz
-      - make_interval(secs => COALESCE(runs.budget_wall_seconds, $6::int)
-                            + runs.budget_paused_seconds + runs.budget_extension_seconds
-                            + runs.budget_finalize_seconds
-                            + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
-                                (LEAST($5::timestamptz, cc.deadline_at) - cc.created_at)))::int)
-                                FROM cross_checks cc WHERE cc.lead_run_id = runs.id
-                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
-  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                  WHERE a.worker_id = $2 AND a.run_id = runs.id
-                    AND a.claim_generation = runs.claim_generation)
-  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
-                    AND a.terminal_pending AND a.terminal_pending_until > now()
-                    AND a.claim_generation = runs.claim_generation)
-  AND NOT EXISTS (SELECT 1 FROM workers w
-                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
-
-), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00297 owns cancellation only
-    -- for an unreleased active lead with a pending plan round-one check.
-    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
-), eligible_candidates AS MATERIALIZED (
-    SELECT target.id AS run_id FROM final_targets target
-    WHERE (target.kind = 'cross_check'
-           OR target.id IN (SELECT id FROM eligible_parent_exits))
-      AND NOT EXISTS (
-          SELECT 1 FROM cross_checks cc
-          JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
-          WHERE cc.checker_run_id = target.id
-            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
-            AND exiting.status IN ('claimed', 'running')
-            AND exiting.claim_released_at IS NULL
-      )
-)
-UPDATE runs SET plan_cross_check_gate_reason = NULL,
-    status = 'failed', status_since = now(), failure_reason = $1,
-    fail_origin = 'worker_lost',
-    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
-    milestones_in_progress = NULL,
-    milestones_agents = NULL,
-    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
-    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
-    health = 'ok', health_reason = NULL, health_since = NULL,
-    updated_at = now()
-WHERE runs.worker_id = $2
-  AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
-  AND runs.status = 'running'
-  AND runs.claim_released_at IS NULL                        -- #1247 fence
-  AND runs.status_since < $3                   -- fence: stale window + one heartbeat interval, D4
-  AND runs.requeue_count >= $4
-  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
-    AND runs.completion_attempts = 0
-    AND runs.started_at < ($5::timestamptz
-      - make_interval(secs => COALESCE(runs.budget_wall_seconds, $6::int)
-                            + runs.budget_paused_seconds + runs.budget_extension_seconds
-                            + runs.budget_finalize_seconds
-                            + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
-                                (LEAST($5::timestamptz, cc.deadline_at) - cc.created_at)))::int)
-                                FROM cross_checks cc WHERE cc.lead_run_id = runs.id
-                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
-  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
-                  WHERE a.worker_id = $2 AND a.run_id = runs.id
-                    AND a.claim_generation = runs.claim_generation)
-  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- D11 terminal-pending lease (worker-scoped, defense-in-depth)
-                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
-                    AND a.terminal_pending AND a.terminal_pending_until > now()
-                    AND a.claim_generation = runs.claim_generation)
-  AND NOT EXISTS (SELECT 1 FROM workers w                   -- D11 pending_overflow closure (worker-level, ESSENTIAL)
-                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
-  AND runs.id IN (SELECT run_id FROM eligible_candidates)
-RETURNING runs.id, runs.user_id, runs.status
-`
-
-type FailRunsMissingFromSnapshotParams struct {
-	FailureReason        pgtype.Text        `json:"failure_reason"`
-	WorkerID             pgtype.UUID        `json:"worker_id"`
-	MissingCutoff        pgtype.Timestamptz `json:"missing_cutoff"`
-	MaxRequeues          int32              `json:"max_requeues"`
-	Now                  pgtype.Timestamptz `json:"now"`
-	GlobalTimeoutSeconds int32              `json:"global_timeout_seconds"`
-}
-
-type FailRunsMissingFromSnapshotRow struct {
-	ID     uuid.UUID `json:"id"`
-	UserID uuid.UUID `json:"user_id"`
-	Status string    `json:"status"`
-}
-
-// PRD #1390 M2b (SC2, over cap): a run-lane `running` run this worker OWNS but no longer lists (its
-// execution is lost) — past the fence, and out of re-queue budget — is FAILED (fail-first with the
-// requeue twin below). Its SET list mirrors FailRunsOfStaleWorkersOverCap (fail_origin='worker_lost',
-// the pause/switch/milestone clears, health reset, move_pending_since for the reconcile origin
-// restore). Held states are never targeted (status = 'running' only). Chat is a target restriction
-// (kind <> 'chat', D10) — these writers only ever touch run-lane runs. @missing_cutoff is the stale
-// window plus one heartbeat interval (D4); @max_requeues is RUN_MAX_REQUEUES.
-func (q *Queries) FailRunsMissingFromSnapshot(ctx context.Context, arg FailRunsMissingFromSnapshotParams) ([]FailRunsMissingFromSnapshotRow, error) {
-	rows, err := q.db.Query(ctx, failRunsMissingFromSnapshot,
-		arg.FailureReason,
-		arg.WorkerID,
-		arg.MissingCutoff,
-		arg.MaxRequeues,
-		arg.Now,
-		arg.GlobalTimeoutSeconds,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []FailRunsMissingFromSnapshotRow{}
-	for rows.Next() {
-		var i FailRunsMissingFromSnapshotRow
-		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const failRunsOfStaleWorkersOverCap = `-- name: FailRunsOfStaleWorkersOverCap :many
-WITH locked AS (
-    SELECT workers.id FROM workers
-    WHERE workers.last_heartbeat_at IS NULL OR workers.last_heartbeat_at < $3
-    ORDER BY workers.id
-    FOR UPDATE
-), candidates AS MATERIALIZED (
-    SELECT runs.id, runs.kind FROM runs
-    WHERE runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-      AND runs.requeue_count >= $2
-      AND runs.worker_id IN (SELECT id FROM locked)
-      AND (runs.kind = 'chat'
-           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
-                             AND a.terminal_pending_until > now()
-                             AND a.claim_generation = runs.claim_generation)
-               AND NOT EXISTS (SELECT 1 FROM workers w
-                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-), parent_mapping AS MATERIALIZED (
-    SELECT candidates.id AS run_id, parent.id AS parent_id
-    FROM candidates
-    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
-        AND cc.checker_run_id = candidates.id
-    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
-        THEN cc.lead_run_id ELSE candidates.id END
-        AND parent.kind <> 'cross_check'
-), locked_parents AS MATERIALIZED (
-    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason FROM runs lead
-    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
-      AND lead.kind <> 'cross_check'
-    ORDER BY lead.id
-    FOR UPDATE OF lead
-), parent_lock_set AS MATERIALIZED (
-    -- Collect the actual locked IDs completely before any checker can be mutated.
-    SELECT array_agg(id) AS ids FROM locked_parents
-), locked_targets AS MATERIALIZED (
-    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM runs
-    JOIN parent_mapping mapping ON mapping.run_id = runs.id
-    CROSS JOIN parent_lock_set locks
-    WHERE runs.id IN (SELECT id FROM candidates)
-      AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
-      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-      AND runs.requeue_count >= $2
-      AND runs.worker_id IN (SELECT id FROM locked)
-      AND (runs.kind = 'chat'
-           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
-                             AND a.terminal_pending_until > now()
-                             AND a.claim_generation = runs.claim_generation)
-               AND NOT EXISTS (SELECT 1 FROM workers w
-                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-
-    ORDER BY runs.id
-    FOR UPDATE OF runs
-), target_lock_set AS MATERIALIZED (
-    SELECT array_agg(id) AS ids FROM locked_targets
-), final_targets AS MATERIALIZED (
-    -- Recheck the refreshed locked rows, not initial candidate membership.
-    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM locked_targets runs CROSS JOIN target_lock_set locks
-    WHERE runs.id = ANY(locks.ids)
-      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-      AND runs.requeue_count >= $2
-      AND runs.worker_id IN (SELECT id FROM locked)
-      AND (runs.kind = 'chat'
-           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
-                             AND a.terminal_pending_until > now()
-                             AND a.claim_generation = runs.claim_generation)
-               AND NOT EXISTS (SELECT 1 FROM workers w
-                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-
-), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00297 owns cancellation only
-    -- for an unreleased active lead with a pending plan round-one check.
-    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
-), eligible_candidates AS MATERIALIZED (
-    SELECT target.id AS run_id FROM final_targets target
-    WHERE (target.kind = 'cross_check'
-           OR target.id IN (SELECT id FROM eligible_parent_exits))
-      AND NOT EXISTS (
-          SELECT 1 FROM cross_checks cc
-          JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
-          WHERE cc.checker_run_id = target.id
-            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
-            AND exiting.status IN ('claimed', 'running')
-            AND exiting.claim_released_at IS NULL
-      )
-)
-UPDATE runs SET plan_cross_check_gate_reason = NULL,
-    status = 'failed', status_since = now(), failure_reason = $1,
-    -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
-    fail_origin = 'worker_lost',
-    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
-    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
-    milestones_in_progress = NULL,
-    milestones_agents = NULL,
-    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
-    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
-    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
-    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
-    health = 'ok', health_reason = NULL, health_since = NULL,
-    updated_at = now()
-FROM eligible_candidates candidate
-WHERE runs.id = candidate.run_id
-  AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND runs.requeue_count >= $2
-  AND runs.worker_id IN (SELECT id FROM locked)
-  -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
-  AND (runs.kind = 'chat'
-       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
-                         AND a.terminal_pending_until > now()
-                         AND a.claim_generation = runs.claim_generation)
-           AND NOT EXISTS (SELECT 1 FROM workers w
-                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-RETURNING runs.id, runs.user_id, runs.status
-`
-
-type FailRunsOfStaleWorkersOverCapParams struct {
-	FailureReason pgtype.Text        `json:"failure_reason"`
-	MaxRequeues   int32              `json:"max_requeues"`
-	FailCutoff    pgtype.Timestamptz `json:"fail_cutoff"`
-}
-
-type FailRunsOfStaleWorkersOverCapRow struct {
-	ID     uuid.UUID `json:"id"`
-	UserID uuid.UUID `json:"user_id"`
-	Status string    `json:"status"`
-}
-
-// A stale worker's non-terminal run that has already used its re-queue budget →
-// failed instead of re-queued. Stamps move_pending_since (reconcile restores the
-// origin column; the sweep itself never touches the forge — worker-loss recovery
-// must not wait on a down forge).
-//
-// PRD #1390 M1 (D9): the FAIL path requires TWO consecutive stale windows —
-// @fail_cutoff = now() - 2*WORKER_HEARTBEAT_STALE (the Go caller computes it) — so a run
-// that was requeued once and then hits a partition just over one window is not terminated
-// before a heartbeat can re-adopt it; terminal cannot be undone. The stale workers are
-// locked FIRST in a `locked` CTE that takes each worker row FOR UPDATE ordered by id (the
-// canonical lock order), so this statement serialises with HeartbeatWorker and re-checks
-// staleness after a concurrent heartbeat commits — the race where a heartbeat lands between
-// the staleness read and the terminal write is closed.
-//
-// PRD #1390 M1 (D11): a run under an unexpired terminal-pending lease for its CURRENT
-// generation is NOT failed (an outcome is journaled on the worker, #1391), and neither is
-// any run owned by a worker flagged pending_overflow (the worker-level closure for outcomes
-// it could not list). Chat is exempt from the lease/overflow PROTECTION (D10) — it is still
-// failed as before — so the guard is `kind = 'chat' OR NOT EXISTS(...)`, never a top-level
-// kind <> 'chat'. The lease/overflow expiries (one clock) are the dead-worker backstop.
-func (q *Queries) FailRunsOfStaleWorkersOverCap(ctx context.Context, arg FailRunsOfStaleWorkersOverCapParams) ([]FailRunsOfStaleWorkersOverCapRow, error) {
-	rows, err := q.db.Query(ctx, failRunsOfStaleWorkersOverCap, arg.FailureReason, arg.MaxRequeues, arg.FailCutoff)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []FailRunsOfStaleWorkersOverCapRow{}
-	for rows.Next() {
-		var i FailRunsOfStaleWorkersOverCapRow
-		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const failWorkerRunsOverCap = `-- name: FailWorkerRunsOverCap :many
-
-WITH candidates AS MATERIALIZED (
-    SELECT runs.id, runs.kind FROM runs
-    WHERE runs.worker_id = $2
-      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-      AND runs.requeue_count >= $3
-      AND (runs.kind = 'chat'
-           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
-                             AND a.terminal_pending_until > now()
-                             AND a.claim_generation = runs.claim_generation)
-               AND NOT EXISTS (SELECT 1 FROM workers w
-                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-), parent_mapping AS MATERIALIZED (
-    SELECT candidates.id AS run_id, parent.id AS parent_id
-    FROM candidates
-    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
-        AND cc.checker_run_id = candidates.id
-    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
-        THEN cc.lead_run_id ELSE candidates.id END
-        AND parent.kind <> 'cross_check'
-), locked_parents AS MATERIALIZED (
-    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason FROM runs lead
-    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
-      AND lead.kind <> 'cross_check'
-    ORDER BY lead.id
-    FOR UPDATE OF lead
-), parent_lock_set AS MATERIALIZED (
-    -- Collect the actual locked IDs completely before any checker can be mutated.
-    SELECT array_agg(id) AS ids FROM locked_parents
-), locked_targets AS MATERIALIZED (
-    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM runs
-    JOIN parent_mapping mapping ON mapping.run_id = runs.id
-    CROSS JOIN parent_lock_set locks
-    WHERE runs.id IN (SELECT id FROM candidates)
-      AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
-      AND runs.worker_id = $2
-      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-      AND runs.requeue_count >= $3
-      AND (runs.kind = 'chat'
-           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
-                             AND a.terminal_pending_until > now()
-                             AND a.claim_generation = runs.claim_generation)
-               AND NOT EXISTS (SELECT 1 FROM workers w
-                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-
-    ORDER BY runs.id
-    FOR UPDATE OF runs
-), target_lock_set AS MATERIALIZED (
-    SELECT array_agg(id) AS ids FROM locked_targets
-), final_targets AS MATERIALIZED (
-    -- Recheck the refreshed locked rows, not initial candidate membership.
-    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM locked_targets runs CROSS JOIN target_lock_set locks
-    WHERE runs.id = ANY(locks.ids)
-      AND runs.worker_id = $2
-      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-      AND runs.requeue_count >= $3
-      AND (runs.kind = 'chat'
-           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
-                             AND a.terminal_pending_until > now()
-                             AND a.claim_generation = runs.claim_generation)
-               AND NOT EXISTS (SELECT 1 FROM workers w
-                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-
-), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00297 owns cancellation only
-    -- for an unreleased active lead with a pending plan round-one check.
-    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
-), eligible_candidates AS MATERIALIZED (
-    SELECT target.id AS run_id FROM final_targets target
-    WHERE (target.kind = 'cross_check'
-           OR target.id IN (SELECT id FROM eligible_parent_exits))
-      AND NOT EXISTS (
-          SELECT 1 FROM cross_checks cc
-          JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
-          WHERE cc.checker_run_id = target.id
-            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
-            AND exiting.status IN ('claimed', 'running')
-            AND exiting.claim_released_at IS NULL
-      )
-)
-UPDATE runs SET plan_cross_check_gate_reason = NULL,
-    status = 'failed', status_since = now(), failure_reason = $1,
-    -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
-    fail_origin = 'worker_lost',
-    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
-    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
-    milestones_in_progress = NULL,
-    milestones_agents = NULL,
-    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
-    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
-    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
-    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
-    health = 'ok', health_reason = NULL, health_since = NULL,
-    updated_at = now()
-FROM eligible_candidates candidate
-WHERE runs.id = candidate.run_id
-  AND runs.worker_id = $2
-  AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND runs.requeue_count >= $3
-  -- PRD #1390 D11: register's orphan fail honours the terminal-pending lease + pending_overflow
-  -- closure exactly as the stale-worker passes do (chat-exempt, D10) — a fresh worker process
-  -- must not fail its own run whose outcome is journaled and about to be replayed (#1391).
-  AND (runs.kind = 'chat'
-       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
-                         AND a.terminal_pending_until > now()
-                         AND a.claim_generation = runs.claim_generation)
-           AND NOT EXISTS (SELECT 1 FROM workers w
-                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-RETURNING runs.id
-`
-
-type FailWorkerRunsOverCapParams struct {
-	FailureReason pgtype.Text `json:"failure_reason"`
-	WorkerID      pgtype.UUID `json:"worker_id"`
-	MaxRequeues   int32       `json:"max_requeues"`
-}
-
-// Register-time orphan recovery (worker-scoped) ------------------------------
-// On register a worker declares a fresh start, so any run it still holds is
-// orphaned (its execution is gone). Over its re-queue budget → failed. failed →
-// origin restore, applied by the reconcile loop (register does no forge I/O), so
-// it stamps move_pending_since. RETURNING id so the caller can funnel these
-// committed-terminal (worker-lost) runs into the judge (PRD #46 Decision 2), exactly
-// as the sweeper's FailRunsOfStaleWorkersOverCap does.
-func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, failWorkerRunsOverCap, arg.FailureReason, arg.WorkerID, arg.MaxRequeues)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []uuid.UUID{}
-	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		items = append(items, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
 }
 
 const getActiveMRReworkRunForMR = `-- name: GetActiveMRReworkRunForMR :one
@@ -7018,7 +6363,7 @@ func (q *Queries) GetUnconsumedCompletionPermit(ctx context.Context, arg GetUnco
 }
 
 const getWorkerByID = `-- name: GetWorkerByID :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch FROM workers WHERE id = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor FROM workers WHERE id = $1
 `
 
 func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, error) {
@@ -7072,12 +6417,31 @@ func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, erro
 		&i.LeaseSince,
 		&i.LeaseRepoID,
 		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
 	)
 	return i, err
 }
 
 const getWorkerByIDForUser = `-- name: GetWorkerByIDForUser :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch FROM workers WHERE id = $1 AND user_id = $2
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor FROM workers WHERE id = $1 AND user_id = $2
 `
 
 type GetWorkerByIDForUserParams struct {
@@ -7136,12 +6500,31 @@ func (q *Queries) GetWorkerByIDForUser(ctx context.Context, arg GetWorkerByIDFor
 		&i.LeaseSince,
 		&i.LeaseRepoID,
 		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
 	)
 	return i, err
 }
 
 const getWorkerByTokenHash = `-- name: GetWorkerByTokenHash :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch FROM workers WHERE token_hash = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor FROM workers WHERE token_hash = $1
 `
 
 // Worker auth: Bearer join token → sha256 → this lookup.
@@ -7196,12 +6579,31 @@ func (q *Queries) GetWorkerByTokenHash(ctx context.Context, tokenHash []byte) (W
 		&i.LeaseSince,
 		&i.LeaseRepoID,
 		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
 	)
 	return i, err
 }
 
 const getWorkerForUpdate = `-- name: GetWorkerForUpdate :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch FROM workers WHERE id = $1 FOR UPDATE
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor FROM workers WHERE id = $1 FOR UPDATE
 `
 
 // PRD #1390 M2a: lock the worker row FOR UPDATE at the top of the Register transaction, in
@@ -7260,6 +6662,25 @@ func (q *Queries) GetWorkerForUpdate(ctx context.Context, id uuid.UUID) (Worker,
 		&i.LeaseSince,
 		&i.LeaseRepoID,
 		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
 	)
 	return i, err
 }
@@ -7303,32 +6724,105 @@ UPDATE workers SET
     -- service (diskOverThreshold): a nil/absent stats sample lands here as false, which
     -- correctly resets. The poll derives disk_pressure = streak>=2 AND fresh; this column
     -- is display/lifecycle-only and never a scheduling input (Decision 5).
+    nix_pressure = $15::boolean,
+    data_pressure = $16::boolean,
+    -- Duplicate fresh samples preserve evidence; invalid/reversed samples clear
+    -- the streak and below evidence without advancing the last accepted watermark.
+    dind_pressure_streak = CASE
+        WHEN $17::boolean
+          AND $18::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM $19::timestamptz) = $20::bigint
+          AND $19::timestamptz > dind_register_floor
+          AND $19::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND $20::bigint = dind_meter_epoch
+          AND $19::timestamptz = dind_meter_at
+          AND $21::boolean = dind_meter_over THEN dind_pressure_streak
+        WHEN $17::boolean
+          AND $18::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM $19::timestamptz) = $20::bigint
+          AND $19::timestamptz > dind_register_floor
+          AND $19::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND $20::bigint > dind_meter_epoch
+          AND (dind_meter_at IS NULL OR $19::timestamptz > dind_meter_at)
+          AND $21::boolean
+        THEN CASE WHEN dind_meter_at IS NOT NULL
+                    AND $19::timestamptz - dind_meter_at <= interval '45 seconds'
+                  THEN LEAST(dind_pressure_streak + 1, 100) ELSE 1 END
+        ELSE 0 END,
+    dind_below_threshold = CASE
+        WHEN $17::boolean
+          AND $18::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM $19::timestamptz) = $20::bigint
+          AND $19::timestamptz > dind_register_floor
+          AND $19::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND $20::bigint = dind_meter_epoch
+          AND $19::timestamptz = dind_meter_at
+          AND $21::boolean = dind_meter_over THEN dind_below_threshold
+        WHEN $17::boolean
+          AND $18::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM $19::timestamptz) = $20::bigint
+          AND $19::timestamptz > dind_register_floor
+          AND $19::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND $20::bigint > dind_meter_epoch
+          AND (dind_meter_at IS NULL OR $19::timestamptz > dind_meter_at) THEN NOT $21::boolean
+        ELSE false END,
+    dind_meter_over = CASE WHEN $17::boolean
+          AND $18::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM $19::timestamptz) = $20::bigint
+          AND $19::timestamptz > dind_register_floor
+          AND $19::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND $20::bigint > dind_meter_epoch
+          AND (dind_meter_at IS NULL OR $19::timestamptz > dind_meter_at)
+        THEN $21::boolean ELSE dind_meter_over END,
+    dind_meter_epoch = CASE WHEN $17::boolean
+          AND $18::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM $19::timestamptz) = $20::bigint
+          AND $19::timestamptz > dind_register_floor
+          AND $19::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND $20::bigint > dind_meter_epoch
+          AND (dind_meter_at IS NULL OR $19::timestamptz > dind_meter_at)
+        THEN $20::bigint ELSE dind_meter_epoch END,
+    dind_meter_at = CASE WHEN $17::boolean
+          AND $18::text = snapshot_register_nonce
+          AND EXTRACT(EPOCH FROM $19::timestamptz) = $20::bigint
+          AND $19::timestamptz > dind_register_floor
+          AND $19::timestamptz BETWEEN now() - interval '45 seconds' AND now()
+          AND $20::bigint > dind_meter_epoch
+          AND (dind_meter_at IS NULL OR $19::timestamptz > dind_meter_at)
+        THEN $19::timestamptz ELSE dind_meter_at END,
     stats_disk_pressure_streak = CASE
-        WHEN $15::boolean THEN LEAST(workers.stats_disk_pressure_streak + 1, 100)
+        WHEN $22::boolean THEN LEAST(workers.stats_disk_pressure_streak + 1, 100)
         ELSE 0
     END,
     updated_at            = now()
-WHERE id = $16
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch
+WHERE id = $23
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor
 `
 
 type HeartbeatWorkerParams struct {
-	StatsCpuPct              pgtype.Float4 `json:"stats_cpu_pct"`
-	StatsMemBytes            pgtype.Int8   `json:"stats_mem_bytes"`
-	StatsMemLimitBytes       pgtype.Int8   `json:"stats_mem_limit_bytes"`
-	StatsSource              pgtype.Text   `json:"stats_source"`
-	StatsDiskNixBytes        pgtype.Int8   `json:"stats_disk_nix_bytes"`
-	StatsDiskNixTotalBytes   pgtype.Int8   `json:"stats_disk_nix_total_bytes"`
-	StatsDiskDataBytes       pgtype.Int8   `json:"stats_disk_data_bytes"`
-	StatsDiskDataTotalBytes  pgtype.Int8   `json:"stats_disk_data_total_bytes"`
-	StatsDiskDindBytes       pgtype.Int8   `json:"stats_disk_dind_bytes"`
-	StatsDiskDindTotalBytes  pgtype.Int8   `json:"stats_disk_dind_total_bytes"`
-	StatsDiskDindInodes      pgtype.Int8   `json:"stats_disk_dind_inodes"`
-	StatsDiskDindTotalInodes pgtype.Int8   `json:"stats_disk_dind_total_inodes"`
-	StatsDiskDataInodes      pgtype.Int8   `json:"stats_disk_data_inodes"`
-	StatsDiskDataTotalInodes pgtype.Int8   `json:"stats_disk_data_total_inodes"`
-	DiskOverThreshold        bool          `json:"disk_over_threshold"`
-	ID                       uuid.UUID     `json:"id"`
+	StatsCpuPct              pgtype.Float4      `json:"stats_cpu_pct"`
+	StatsMemBytes            pgtype.Int8        `json:"stats_mem_bytes"`
+	StatsMemLimitBytes       pgtype.Int8        `json:"stats_mem_limit_bytes"`
+	StatsSource              pgtype.Text        `json:"stats_source"`
+	StatsDiskNixBytes        pgtype.Int8        `json:"stats_disk_nix_bytes"`
+	StatsDiskNixTotalBytes   pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
+	StatsDiskDataBytes       pgtype.Int8        `json:"stats_disk_data_bytes"`
+	StatsDiskDataTotalBytes  pgtype.Int8        `json:"stats_disk_data_total_bytes"`
+	StatsDiskDindBytes       pgtype.Int8        `json:"stats_disk_dind_bytes"`
+	StatsDiskDindTotalBytes  pgtype.Int8        `json:"stats_disk_dind_total_bytes"`
+	StatsDiskDindInodes      pgtype.Int8        `json:"stats_disk_dind_inodes"`
+	StatsDiskDindTotalInodes pgtype.Int8        `json:"stats_disk_dind_total_inodes"`
+	StatsDiskDataInodes      pgtype.Int8        `json:"stats_disk_data_inodes"`
+	StatsDiskDataTotalInodes pgtype.Int8        `json:"stats_disk_data_total_inodes"`
+	NixPressure              bool               `json:"nix_pressure"`
+	DataPressure             bool               `json:"data_pressure"`
+	DindSampleValid          bool               `json:"dind_sample_valid"`
+	DindRegisterNonce        string             `json:"dind_register_nonce"`
+	DindMeterAt              pgtype.Timestamptz `json:"dind_meter_at"`
+	DindMeterEpoch           int64              `json:"dind_meter_epoch"`
+	DindOverThreshold        bool               `json:"dind_over_threshold"`
+	DiskOverThreshold        bool               `json:"disk_over_threshold"`
+	ID                       uuid.UUID          `json:"id"`
 }
 
 // Refresh liveness AND overwrite the worker's latest resource sample (PRD #49). The
@@ -7354,6 +6848,13 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 		arg.StatsDiskDindTotalInodes,
 		arg.StatsDiskDataInodes,
 		arg.StatsDiskDataTotalInodes,
+		arg.NixPressure,
+		arg.DataPressure,
+		arg.DindSampleValid,
+		arg.DindRegisterNonce,
+		arg.DindMeterAt,
+		arg.DindMeterEpoch,
+		arg.DindOverThreshold,
 		arg.DiskOverThreshold,
 		arg.ID,
 	)
@@ -7406,6 +6907,25 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 		&i.LeaseSince,
 		&i.LeaseRepoID,
 		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
 	)
 	return i, err
 }
@@ -8304,7 +7824,7 @@ func (q *Queries) ListActiveRunsForWorkers(ctx context.Context, workerIds []uuid
 }
 
 const listAllWorkers = `-- name: ListAllWorkers :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
@@ -8426,6 +7946,25 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.Worker.LeaseSince,
 			&i.Worker.LeaseRepoID,
 			&i.Worker.LeaseBranch,
+			&i.Worker.DindRegisterFloor,
+			&i.Worker.DindMeterEpoch,
+			&i.Worker.DindMeterAt,
+			&i.Worker.DindPressureStreak,
+			&i.Worker.DindMeterOver,
+			&i.Worker.DindBelowThreshold,
+			&i.Worker.MaintenanceOwnsDrain,
+			&i.Worker.NixPressure,
+			&i.Worker.DataPressure,
+			&i.Worker.MaintenanceID,
+			&i.Worker.MaintenanceNonce,
+			&i.Worker.MaintenancePhase,
+			&i.Worker.MaintenanceDeploymentUid,
+			&i.Worker.MaintenancePvcUid,
+			&i.Worker.MaintenanceRegisterNonce,
+			&i.Worker.MaintenanceFenced,
+			&i.Worker.MaintenanceReadyAck,
+			&i.Worker.MaintenanceAckAt,
+			&i.Worker.MaintenanceActivityFloor,
 			&i.Busy,
 			&i.ActiveRuns,
 			&i.OwnerEmail,
@@ -8937,18 +8476,20 @@ func (q *Queries) ListLimitWaitReeval(ctx context.Context, now pgtype.Timestampt
 
 const listOwnersWaitingNoCapacity = `-- name: ListOwnersWaitingNoCapacity :many
 
-SELECT r.user_id, r.id AS run_id, r.health_since,
+SELECT r.user_id, r.id AS run_id, r.health_since, r.health_reason,
        (COALESCE(r.health_reason = $1::text, false))::boolean AS has_roll_reason
 FROM runs r
 WHERE r.health = 'waiting_worker'
+  AND r.kind <> 'cross_check'
   AND r.health_reason IS DISTINCT FROM 'waiting for plan cross-check'
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
-        AND w.draining_since IS NULL
+        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
         AND w.last_heartbeat_at IS NOT NULL
         AND w.last_heartbeat_at >= $2
   )
+ORDER BY CASE WHEN isfinite(r.health_since) THEN 0 ELSE 1 END, r.health_since, r.id
 `
 
 type ListOwnersWaitingNoCapacityParams struct {
@@ -8960,6 +8501,7 @@ type ListOwnersWaitingNoCapacityRow struct {
 	UserID        uuid.UUID          `json:"user_id"`
 	RunID         uuid.UUID          `json:"run_id"`
 	HealthSince   pgtype.Timestamptz `json:"health_since"`
+	HealthReason  pgtype.Text        `json:"health_reason"`
 	HasRollReason bool               `json:"has_roll_reason"`
 }
 
@@ -8993,6 +8535,7 @@ func (q *Queries) ListOwnersWaitingNoCapacity(ctx context.Context, arg ListOwner
 			&i.UserID,
 			&i.RunID,
 			&i.HealthSince,
+			&i.HealthReason,
 			&i.HasRollReason,
 		); err != nil {
 			return nil, err
@@ -10213,7 +9756,7 @@ func (q *Queries) ListRunsPendingUsageRefold(ctx context.Context, arg ListRunsPe
 }
 
 const listSaturationQueuedRunsForEphemeral = `-- name: ListSaturationQueuedRunsForEphemeral :many
-SELECT r.id, r.user_id, r.required_capabilities
+SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_docker_enabled
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
@@ -10228,7 +9771,7 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
-        AND w.draining_since IS NULL
+        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
         AND (NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
@@ -10237,6 +9780,7 @@ WHERE r.status = 'queued'
                     w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
                     $2::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[]) OR COALESCE(w.docker_enabled, false))
                  -- The lease admits only runs outside the isolated lane.
                  AND NOT w.isolated_lane))
         -- Protocol requirements apply to persistent and leased workers alike.
@@ -10253,9 +9797,9 @@ WHERE r.status = 'queued'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
-                             NOT ((CASE WHEN r.model = ANY($3::text[]) THEN r.model
+                             NOT ((CASE WHEN r.model = ANY($5::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
-                                  = ANY($3::text[])),
+                                  = ANY($5::text[])),
                              false)
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
@@ -10273,7 +9817,7 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
-        AND w.draining_since IS NULL
+        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
         AND (NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
@@ -10282,6 +9826,7 @@ WHERE r.status = 'queued'
                     w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
                     $2::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[]) OR COALESCE(w.docker_enabled, false))
                  -- The lease admits only runs outside the isolated lane.
                  AND NOT w.isolated_lane))
         -- Protocol requirements apply to persistent and leased workers alike.
@@ -10298,9 +9843,9 @@ WHERE r.status = 'queued'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
-                             NOT ((CASE WHEN r.model = ANY($3::text[]) THEN r.model
+                             NOT ((CASE WHEN r.model = ANY($5::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
-                                  = ANY($3::text[])),
+                                  = ANY($5::text[])),
                              false)
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
@@ -10334,23 +9879,28 @@ WHERE r.status = 'queued'
                                     AND lr.status NOT IN ('completed', 'failed', 'cancelled'))
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
-      ) < $4::int
+      ) < $6::int
 ORDER BY r.status_since ASC
-LIMIT $5
+LIMIT $7
 `
 
 type ListSaturationQueuedRunsForEphemeralParams struct {
-	SaturationDelay    pgtype.Interval `json:"saturation_delay"`
-	EphemeralLease     pgtype.Interval `json:"ephemeral_lease"`
-	CodexCuratedModels []string        `json:"codex_curated_models"`
-	MaxPerUser         int32           `json:"max_per_user"`
-	MaxRows            int32           `json:"max_rows"`
+	SaturationDelay     pgtype.Interval `json:"saturation_delay"`
+	EphemeralLease      pgtype.Interval `json:"ephemeral_lease"`
+	WorkerDockerEnabled bool            `json:"worker_docker_enabled"`
+	DockerRepoAllowlist []uuid.UUID     `json:"docker_repo_allowlist"`
+	CodexCuratedModels  []string        `json:"codex_curated_models"`
+	MaxPerUser          int32           `json:"max_per_user"`
+	MaxRows             int32           `json:"max_rows"`
 }
 
 type ListSaturationQueuedRunsForEphemeralRow struct {
-	ID                   uuid.UUID `json:"id"`
-	UserID               uuid.UUID `json:"user_id"`
-	RequiredCapabilities []string  `json:"required_capabilities"`
+	ID                     uuid.UUID   `json:"id"`
+	UserID                 uuid.UUID   `json:"user_id"`
+	RequiredCapabilities   []string    `json:"required_capabilities"`
+	RepoID                 pgtype.UUID `json:"repo_id"`
+	Kind                   string      `json:"kind"`
+	EphemeralDockerEnabled bool        `json:"ephemeral_docker_enabled"`
 }
 
 // The SATURATION sibling of ListUnplaceableQueuedRunsForEphemeral (issue #747 M1).
@@ -10425,6 +9975,8 @@ func (q *Queries) ListSaturationQueuedRunsForEphemeral(ctx context.Context, arg 
 	rows, err := q.db.Query(ctx, listSaturationQueuedRunsForEphemeral,
 		arg.SaturationDelay,
 		arg.EphemeralLease,
+		arg.WorkerDockerEnabled,
+		arg.DockerRepoAllowlist,
 		arg.CodexCuratedModels,
 		arg.MaxPerUser,
 		arg.MaxRows,
@@ -10436,7 +9988,14 @@ func (q *Queries) ListSaturationQueuedRunsForEphemeral(ctx context.Context, arg 
 	items := []ListSaturationQueuedRunsForEphemeralRow{}
 	for rows.Next() {
 		var i ListSaturationQueuedRunsForEphemeralRow
-		if err := rows.Scan(&i.ID, &i.UserID, &i.RequiredCapabilities); err != nil {
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.RequiredCapabilities,
+			&i.RepoID,
+			&i.Kind,
+			&i.EphemeralDockerEnabled,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -10448,7 +10007,7 @@ func (q *Queries) ListSaturationQueuedRunsForEphemeral(ctx context.Context, arg 
 }
 
 const listUnplaceableQueuedRunsForEphemeral = `-- name: ListUnplaceableQueuedRunsForEphemeral :many
-SELECT r.id, r.user_id, r.required_capabilities
+SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_docker_enabled
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
@@ -10458,27 +10017,29 @@ WHERE r.status = 'queued'
   -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
   -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
   AND r.egress_profile_id IS NULL
-  -- PRD #1908 (D-A): the two conjuncts below are the ORIGINAL non-job predicate, kept
-  -- byte-for-byte. They are wrapped in an OR so a repo-less 'job' (whose required_capabilities is
+  -- PRD #1908 (D-A): the non-job placement predicate stays separate from jobs.
+  -- The OR lets a repo-less 'job' (whose required_capabilities is
   -- always '{}', so the first conjunct is false for it) is decided by the job arm instead. AND
   -- binds tighter than OR, so ` + "`" + `TRUE AND a AND b OR c` + "`" + ` reads (a AND b) OR c; TRUE only gives the
   -- original leading AND something to attach to.
   AND (
       TRUE
-  AND (cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check')
+  AND (cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $1::boolean, r.repo_id, r.kind, r.egress_profile_id, $2::uuid[]))
+
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
-        AND w.draining_since IS NULL
+        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
         AND (NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
              OR (fn_ephemeral_lease_admits(
                     w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
-                    $1::interval, now(),
+                    $3::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $1::boolean, r.repo_id, r.kind, r.egress_profile_id, $2::uuid[]) OR COALESCE(w.docker_enabled, false))
                  -- The lease admits only runs outside the isolated lane.
                  AND NOT w.isolated_lane))
         -- Protocol requirements apply to persistent and leased workers alike.
@@ -10495,9 +10056,9 @@ WHERE r.status = 'queued'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
-                             NOT ((CASE WHEN r.model = ANY($2::text[]) THEN r.model
+                             NOT ((CASE WHEN r.model = ANY($4::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
-                                  = ANY($2::text[])),
+                                  = ANY($4::text[])),
                              false)
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
@@ -10513,7 +10074,7 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers wj
       WHERE wj.user_id = r.user_id
         AND wj.status = 'online'
-        AND wj.draining_since IS NULL
+        AND wj.draining_since IS NULL AND NOT wj.maintenance_fenced AND wj.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
         AND NOT wj.ephemeral
         AND NOT COALESCE(wj.docker_enabled, false)
         AND 'job_runner_v1' = ANY(wj.protocol_capabilities)
@@ -10540,22 +10101,27 @@ WHERE r.status = 'queued'
                                     AND lr.status NOT IN ('completed', 'failed', 'cancelled'))
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
-      ) < $3::int
+      ) < $5::int
 ORDER BY r.created_at ASC
-LIMIT $4
+LIMIT $6
 `
 
 type ListUnplaceableQueuedRunsForEphemeralParams struct {
-	EphemeralLease     pgtype.Interval `json:"ephemeral_lease"`
-	CodexCuratedModels []string        `json:"codex_curated_models"`
-	MaxPerUser         int32           `json:"max_per_user"`
-	MaxRows            int32           `json:"max_rows"`
+	WorkerDockerEnabled bool            `json:"worker_docker_enabled"`
+	DockerRepoAllowlist []uuid.UUID     `json:"docker_repo_allowlist"`
+	EphemeralLease      pgtype.Interval `json:"ephemeral_lease"`
+	CodexCuratedModels  []string        `json:"codex_curated_models"`
+	MaxPerUser          int32           `json:"max_per_user"`
+	MaxRows             int32           `json:"max_rows"`
 }
 
 type ListUnplaceableQueuedRunsForEphemeralRow struct {
-	ID                   uuid.UUID `json:"id"`
-	UserID               uuid.UUID `json:"user_id"`
-	RequiredCapabilities []string  `json:"required_capabilities"`
+	ID                     uuid.UUID   `json:"id"`
+	UserID                 uuid.UUID   `json:"user_id"`
+	RequiredCapabilities   []string    `json:"required_capabilities"`
+	RepoID                 pgtype.UUID `json:"repo_id"`
+	Kind                   string      `json:"kind"`
+	EphemeralDockerEnabled bool        `json:"ephemeral_docker_enabled"`
 }
 
 // The trigger query for the ephemeral auto-provisioner (PRD #529 M2). It returns the
@@ -10573,10 +10139,8 @@ type ListUnplaceableQueuedRunsForEphemeralRow struct {
 //     nothing has claimed yet, excluding the chat lane (which never carries capability
 //     requirements and is served by ClaimChatRun).
 //
-//   - cardinality(r.required_capabilities) > 0 — for every kind EXCEPT 'job', a run with no
-//     capability requirement is never "unplaceable for a capability", so it is not our
-//     concern (mirrors health.go's len(RequiredCapabilities) > 0 guard on the display
-//     reason). A kind='job' run always has required_capabilities = '{}' yet CAN be
+//   - Non-job runs need a capability requirement or an effective Docker preference.
+//     A kind='job' run always has required_capabilities = '{}' yet CAN be
 //     unplaceable: it needs an online, non-docker worker advertising 'job_runner_v1'. That
 //     kind is decided by the job arm of the OR below (PRD #1908 D-A), not by this conjunct.
 //
@@ -10611,6 +10175,8 @@ type ListUnplaceableQueuedRunsForEphemeralRow struct {
 // @max_rows bounds the work per tick.
 func (q *Queries) ListUnplaceableQueuedRunsForEphemeral(ctx context.Context, arg ListUnplaceableQueuedRunsForEphemeralParams) ([]ListUnplaceableQueuedRunsForEphemeralRow, error) {
 	rows, err := q.db.Query(ctx, listUnplaceableQueuedRunsForEphemeral,
+		arg.WorkerDockerEnabled,
+		arg.DockerRepoAllowlist,
 		arg.EphemeralLease,
 		arg.CodexCuratedModels,
 		arg.MaxPerUser,
@@ -10623,7 +10189,56 @@ func (q *Queries) ListUnplaceableQueuedRunsForEphemeral(ctx context.Context, arg
 	items := []ListUnplaceableQueuedRunsForEphemeralRow{}
 	for rows.Next() {
 		var i ListUnplaceableQueuedRunsForEphemeralRow
-		if err := rows.Scan(&i.ID, &i.UserID, &i.RequiredCapabilities); err != nil {
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.RequiredCapabilities,
+			&i.RepoID,
+			&i.Kind,
+			&i.EphemeralDockerEnabled,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWaitingWorkerRuns = `-- name: ListWaitingWorkerRuns :many
+SELECT id AS run_id, user_id, health_reason, health_since
+FROM runs
+WHERE health = 'waiting_worker'
+  AND kind <> 'cross_check'
+  AND health_reason IS DISTINCT FROM 'waiting for plan cross-check'
+ORDER BY CASE WHEN isfinite(health_since) THEN 0 ELSE 1 END, health_since, id
+`
+
+type ListWaitingWorkerRunsRow struct {
+	RunID        uuid.UUID          `json:"run_id"`
+	UserID       uuid.UUID          `json:"user_id"`
+	HealthReason pgtype.Text        `json:"health_reason"`
+	HealthSince  pgtype.Timestamptz `json:"health_since"`
+}
+
+// Full waiting population, including owners with usable capacity and unknown ages.
+func (q *Queries) ListWaitingWorkerRuns(ctx context.Context) ([]ListWaitingWorkerRunsRow, error) {
+	rows, err := q.db.Query(ctx, listWaitingWorkerRuns)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListWaitingWorkerRunsRow{}
+	for rows.Next() {
+		var i ListWaitingWorkerRunsRow
+		if err := rows.Scan(
+			&i.RunID,
+			&i.UserID,
+			&i.HealthReason,
+			&i.HealthSince,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -10670,7 +10285,7 @@ func (q *Queries) ListWorkerPendingSince(ctx context.Context, workerID uuid.UUID
 }
 
 const listWorkersByUser = `-- name: ListWorkersByUser :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor,
        s.label AS anthropic_secret_label,
        EXISTS (
            SELECT 1 FROM runs r
@@ -10765,6 +10380,25 @@ type ListWorkersByUserRow struct {
 	LeaseSince               pgtype.Timestamptz `json:"lease_since"`
 	LeaseRepoID              pgtype.UUID        `json:"lease_repo_id"`
 	LeaseBranch              pgtype.Text        `json:"lease_branch"`
+	DindRegisterFloor        pgtype.Timestamptz `json:"dind_register_floor"`
+	DindMeterEpoch           int64              `json:"dind_meter_epoch"`
+	DindMeterAt              pgtype.Timestamptz `json:"dind_meter_at"`
+	DindPressureStreak       int32              `json:"dind_pressure_streak"`
+	DindMeterOver            bool               `json:"dind_meter_over"`
+	DindBelowThreshold       bool               `json:"dind_below_threshold"`
+	MaintenanceOwnsDrain     bool               `json:"maintenance_owns_drain"`
+	NixPressure              bool               `json:"nix_pressure"`
+	DataPressure             bool               `json:"data_pressure"`
+	MaintenanceID            pgtype.UUID        `json:"maintenance_id"`
+	MaintenanceNonce         string             `json:"maintenance_nonce"`
+	MaintenancePhase         string             `json:"maintenance_phase"`
+	MaintenanceDeploymentUid string             `json:"maintenance_deployment_uid"`
+	MaintenancePvcUid        string             `json:"maintenance_pvc_uid"`
+	MaintenanceRegisterNonce string             `json:"maintenance_register_nonce"`
+	MaintenanceFenced        bool               `json:"maintenance_fenced"`
+	MaintenanceReadyAck      bool               `json:"maintenance_ready_ack"`
+	MaintenanceAckAt         pgtype.Timestamptz `json:"maintenance_ack_at"`
+	MaintenanceActivityFloor pgtype.Timestamptz `json:"maintenance_activity_floor"`
 	AnthropicSecretLabel     pgtype.Text        `json:"anthropic_secret_label"`
 	Busy                     bool               `json:"busy"`
 	ActiveRuns               int64              `json:"active_runs"`
@@ -10857,6 +10491,25 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.LeaseSince,
 			&i.LeaseRepoID,
 			&i.LeaseBranch,
+			&i.DindRegisterFloor,
+			&i.DindMeterEpoch,
+			&i.DindMeterAt,
+			&i.DindPressureStreak,
+			&i.DindMeterOver,
+			&i.DindBelowThreshold,
+			&i.MaintenanceOwnsDrain,
+			&i.NixPressure,
+			&i.DataPressure,
+			&i.MaintenanceID,
+			&i.MaintenanceNonce,
+			&i.MaintenancePhase,
+			&i.MaintenanceDeploymentUid,
+			&i.MaintenancePvcUid,
+			&i.MaintenanceRegisterNonce,
+			&i.MaintenanceFenced,
+			&i.MaintenanceReadyAck,
+			&i.MaintenanceAckAt,
+			&i.MaintenanceActivityFloor,
 			&i.AnthropicSecretLabel,
 			&i.Busy,
 			&i.ActiveRuns,
@@ -11137,6 +10790,365 @@ func (q *Queries) LockCodexAccountWaitRunForUpdate(ctx context.Context, id uuid.
 		&i.PlanCrossCheckGateReason,
 	)
 	return i, err
+}
+
+const lockFailAttestedFinalizeRunsOverCap = `-- name: LockFailAttestedFinalizeRunsOverCap :many
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+WHERE runs.worker_id = $1
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind <> 'chat'
+  -- Positional pairing of the two parallel arrays (run ids are unique: Register validates the
+  -- list). array_position is NULL for an unlisted run, so the equality is then never true.
+  AND runs.id = ANY($2::uuid[])
+  AND runs.claim_generation = ($3::bigint[])[array_position($2::uuid[], runs.id)]
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                    AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND runs.requeue_count >= $4
+  AND NOT ($4 > 0 AND runs.finalize_resume_generation IS NULL)
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.id FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    SELECT array_agg(id) AS ids FROM locked_parents
+)
+SELECT runs.id FROM runs
+JOIN parent_mapping mapping ON mapping.run_id = runs.id
+CROSS JOIN parent_lock_set locks
+
+WHERE runs.worker_id = $1
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind <> 'chat'
+  -- Positional pairing of the two parallel arrays (run ids are unique: Register validates the
+  -- list). array_position is NULL for an unlisted run, so the equality is then never true.
+  AND runs.id = ANY($2::uuid[])
+  AND runs.claim_generation = ($3::bigint[])[array_position($2::uuid[], runs.id)]
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                    AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND runs.requeue_count >= $4
+  AND NOT ($4 > 0 AND runs.finalize_resume_generation IS NULL)
+  AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+ORDER BY runs.id
+FOR UPDATE OF runs
+`
+
+type LockFailAttestedFinalizeRunsOverCapParams struct {
+	WorkerID         pgtype.UUID `json:"worker_id"`
+	RunIds           []uuid.UUID `json:"run_ids"`
+	ClaimGenerations []int64     `json:"claim_generations"`
+	MaxRequeues      int32       `json:"max_requeues"`
+}
+
+// Lock parent leads before checker targets; the separate writer reads a fresh custody snapshot.
+func (q *Queries) LockFailAttestedFinalizeRunsOverCap(ctx context.Context, arg LockFailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockFailAttestedFinalizeRunsOverCap,
+		arg.WorkerID,
+		arg.RunIds,
+		arg.ClaimGenerations,
+		arg.MaxRequeues,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockFailRunsMissingFromSnapshot = `-- name: LockFailRunsMissingFromSnapshot :many
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs    WHERE runs.worker_id = $1
+  AND runs.kind <> 'chat'
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL
+  AND runs.status_since < $2
+  AND runs.requeue_count >= $3
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < ($4::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, $5::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds
+                            + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                (LEAST($4::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = $1 AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.id FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    SELECT array_agg(id) AS ids FROM locked_parents
+)
+SELECT runs.id FROM runs
+JOIN parent_mapping mapping ON mapping.run_id = runs.id
+CROSS JOIN parent_lock_set locks
+    WHERE runs.worker_id = $1
+  AND runs.kind <> 'chat'
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL
+  AND runs.status_since < $2
+  AND runs.requeue_count >= $3
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < ($4::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, $5::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds
+                            + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                (LEAST($4::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = $1 AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+  AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+ORDER BY runs.id
+FOR UPDATE OF runs
+`
+
+type LockFailRunsMissingFromSnapshotParams struct {
+	WorkerID             pgtype.UUID        `json:"worker_id"`
+	MissingCutoff        pgtype.Timestamptz `json:"missing_cutoff"`
+	MaxRequeues          int32              `json:"max_requeues"`
+	Now                  pgtype.Timestamptz `json:"now"`
+	GlobalTimeoutSeconds int32              `json:"global_timeout_seconds"`
+}
+
+// Lock parent leads before checker targets; the separate writer reads a fresh custody snapshot.
+func (q *Queries) LockFailRunsMissingFromSnapshot(ctx context.Context, arg LockFailRunsMissingFromSnapshotParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockFailRunsMissingFromSnapshot,
+		arg.WorkerID,
+		arg.MissingCutoff,
+		arg.MaxRequeues,
+		arg.Now,
+		arg.GlobalTimeoutSeconds,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockFailRunsOfStaleWorkersOverCap = `-- name: LockFailRunsOfStaleWorkersOverCap :many
+WITH locked AS (
+    SELECT workers.id FROM workers
+    WHERE workers.last_heartbeat_at IS NULL OR workers.last_heartbeat_at < $2
+    ORDER BY workers.id
+    FOR UPDATE
+), candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+WHERE runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.requeue_count >= $1
+  AND runs.worker_id IN (SELECT id FROM locked)
+  -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.id FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    SELECT array_agg(id) AS ids FROM locked_parents
+)
+SELECT runs.id FROM runs
+JOIN parent_mapping mapping ON mapping.run_id = runs.id
+CROSS JOIN parent_lock_set locks
+
+WHERE runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.requeue_count >= $1
+  AND runs.worker_id IN (SELECT id FROM locked)
+  -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+  AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+ORDER BY runs.id
+FOR UPDATE OF runs
+`
+
+type LockFailRunsOfStaleWorkersOverCapParams struct {
+	MaxRequeues int32              `json:"max_requeues"`
+	FailCutoff  pgtype.Timestamptz `json:"fail_cutoff"`
+}
+
+// Lock parent leads before checker targets; the separate writer reads a fresh custody snapshot.
+func (q *Queries) LockFailRunsOfStaleWorkersOverCap(ctx context.Context, arg LockFailRunsOfStaleWorkersOverCapParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockFailRunsOfStaleWorkersOverCap, arg.MaxRequeues, arg.FailCutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockFailWorkerRunsOverCap = `-- name: LockFailWorkerRunsOverCap :many
+
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+WHERE runs.worker_id = $1
+  AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.requeue_count >= $2
+  -- PRD #1390 D11: register's orphan fail honours the terminal-pending lease + pending_overflow
+  -- closure exactly as the stale-worker passes do (chat-exempt, D10) — a fresh worker process
+  -- must not fail its own run whose outcome is journaled and about to be replayed (#1391).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.id FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    SELECT array_agg(id) AS ids FROM locked_parents
+)
+SELECT runs.id FROM runs
+JOIN parent_mapping mapping ON mapping.run_id = runs.id
+CROSS JOIN parent_lock_set locks
+
+WHERE runs.worker_id = $1
+  AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.requeue_count >= $2
+  -- PRD #1390 D11: register's orphan fail honours the terminal-pending lease + pending_overflow
+  -- closure exactly as the stale-worker passes do (chat-exempt, D10) — a fresh worker process
+  -- must not fail its own run whose outcome is journaled and about to be replayed (#1391).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+  AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+ORDER BY runs.id
+FOR UPDATE OF runs
+`
+
+type LockFailWorkerRunsOverCapParams struct {
+	WorkerID    pgtype.UUID `json:"worker_id"`
+	MaxRequeues int32       `json:"max_requeues"`
+}
+
+// Register-time orphan recovery (worker-scoped) ------------------------------
+// Lock parent leads before checker targets; the separate writer reads a fresh custody snapshot.
+func (q *Queries) LockFailWorkerRunsOverCap(ctx context.Context, arg LockFailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockFailWorkerRunsOverCap, arg.WorkerID, arg.MaxRequeues)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const lockOpenCustodyHoldsForRunWorkerGeneration = `-- name: LockOpenCustodyHoldsForRunWorkerGeneration :many
@@ -11837,26 +11849,6 @@ func (q *Queries) OldestUndispatchedTaskRun(ctx context.Context) (pgtype.Timesta
 	var oldest_created_at pgtype.Timestamptz
 	err := row.Scan(&oldest_created_at)
 	return oldest_created_at, err
-}
-
-const oldestWaitingWorkerRun = `-- name: OldestWaitingWorkerRun :one
-SELECT min(health_since)::timestamptz AS oldest_health_since
-FROM runs
-WHERE health = 'waiting_worker'
-  AND health_reason IS DISTINCT FROM 'waiting for plan cross-check'
-`
-
-// health queue.waiting: the oldest health_since across every run in
-// health='waiting_worker', excluding expected plan cross-check waits, or NULL when
-// none is waiting for admission. healthsvc applies warn >= 10 min
-// and danger >= 30 min. This is the sole reader of the age; the writer (detectRunHealth)
-// is gated by health_enabled, so when that setting is off the check reports unknown, not
-// ok, rather than reading this NULL as "nothing waiting".
-func (q *Queries) OldestWaitingWorkerRun(ctx context.Context) (pgtype.Timestamptz, error) {
-	row := q.db.QueryRow(ctx, oldestWaitingWorkerRun)
-	var oldest_health_since pgtype.Timestamptz
-	err := row.Scan(&oldest_health_since)
-	return oldest_health_since, err
 }
 
 const parkQueuedCodexAccountUnavailablePage = `-- name: ParkQueuedCodexAccountUnavailablePage :one
@@ -13997,7 +13989,9 @@ WITH prev AS (
         -- without it, a drained worker stays cordoned forever. HeartbeatWorker deliberately
         -- does NOT touch draining_since: a draining worker heartbeats and must STAY draining
         -- until it actually rolls.
-        draining_since      = NULL,
+        -- Clear-on-roll releases the legacy cordon; pending maintenance inherits its drain.
+        draining_since      = CASE WHEN maintenance_phase IN ('requested', 'ready', 'stopping', 'recycling') THEN draining_since ELSE NULL END,
+        maintenance_owns_drain = maintenance_phase IN ('requested', 'ready', 'stopping', 'recycling'),
         -- PRD #2006: a register is a FRESH pod incarnation, so it ends any ephemeral lease: the
         -- row's warm state (the pod the lease kept) is gone. The reaper then releases the row.
         lease_since         = NULL,
@@ -14009,6 +14003,12 @@ WITH prev AS (
         -- before the poll re-derives disk_pressure. (Distinct from HeartbeatWorker's
         -- increment/reset CASE: this is reset-on-action, unconditional.)
         stats_disk_pressure_streak = 0,
+        nix_pressure = false, data_pressure = false,
+        dind_register_floor = now(), dind_meter_epoch = 0, dind_meter_at = NULL,
+        dind_pressure_streak = 0, dind_meter_over = false, dind_below_threshold = false,
+        maintenance_ready_ack = false, maintenance_ack_at = NULL,
+        maintenance_phase = CASE WHEN maintenance_phase = 'ready' THEN 'requested' ELSE maintenance_phase END,
+        maintenance_activity_floor = now(),
         -- PRD #1390 M2a: rotate the register nonce every snapshot must echo and RESET the
         -- snapshot epoch to 0 under it (D3). A fresh worker process starts its epoch at 1, so
         -- resetting to 0 here means its very first post-register snapshot (epoch 1) is accepted
@@ -14020,7 +14020,7 @@ WITH prev AS (
         last_heartbeat_at   = now(),
         updated_at          = now()
     WHERE workers.id = $1
-    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch
+    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor
 ), cleared AS (
     UPDATE worker_upgrade_reports r
        SET upgrading_since    = NULL,
@@ -14072,7 +14072,7 @@ WITH prev AS (
        -- preserves that.
        AND split_part($2::text, '+', 1) IS DISTINCT FROM split_part(prev.old_version, '+', 1)
 )
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch FROM upd
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor FROM upd
 `
 
 type RegisterWorkerParams struct {
@@ -14133,6 +14133,25 @@ type RegisterWorkerRow struct {
 	LeaseSince               pgtype.Timestamptz `json:"lease_since"`
 	LeaseRepoID              pgtype.UUID        `json:"lease_repo_id"`
 	LeaseBranch              pgtype.Text        `json:"lease_branch"`
+	DindRegisterFloor        pgtype.Timestamptz `json:"dind_register_floor"`
+	DindMeterEpoch           int64              `json:"dind_meter_epoch"`
+	DindMeterAt              pgtype.Timestamptz `json:"dind_meter_at"`
+	DindPressureStreak       int32              `json:"dind_pressure_streak"`
+	DindMeterOver            bool               `json:"dind_meter_over"`
+	DindBelowThreshold       bool               `json:"dind_below_threshold"`
+	MaintenanceOwnsDrain     bool               `json:"maintenance_owns_drain"`
+	NixPressure              bool               `json:"nix_pressure"`
+	DataPressure             bool               `json:"data_pressure"`
+	MaintenanceID            pgtype.UUID        `json:"maintenance_id"`
+	MaintenanceNonce         string             `json:"maintenance_nonce"`
+	MaintenancePhase         string             `json:"maintenance_phase"`
+	MaintenanceDeploymentUid string             `json:"maintenance_deployment_uid"`
+	MaintenancePvcUid        string             `json:"maintenance_pvc_uid"`
+	MaintenanceRegisterNonce string             `json:"maintenance_register_nonce"`
+	MaintenanceFenced        bool               `json:"maintenance_fenced"`
+	MaintenanceReadyAck      bool               `json:"maintenance_ready_ack"`
+	MaintenanceAckAt         pgtype.Timestamptz `json:"maintenance_ack_at"`
+	MaintenanceActivityFloor pgtype.Timestamptz `json:"maintenance_activity_floor"`
 }
 
 // Worker announces version + its self-reported template and comes online;
@@ -14241,6 +14260,25 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		&i.LeaseSince,
 		&i.LeaseRepoID,
 		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
 	)
 	return i, err
 }
@@ -18670,7 +18708,7 @@ SET anthropic_secret_id = $1,
     anthropic_bind_mode = $2,
     updated_at = now()
 WHERE id = $3 AND user_id = $4
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor
 `
 
 type SetWorkerAnthropicSecretParams struct {
@@ -18758,6 +18796,25 @@ func (q *Queries) SetWorkerAnthropicSecret(ctx context.Context, arg SetWorkerAnt
 		&i.LeaseSince,
 		&i.LeaseRepoID,
 		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
 	)
 	return i, err
 }
@@ -19673,4 +19730,710 @@ func (q *Queries) UpsertWorkerActiveRun(ctx context.Context, arg UpsertWorkerAct
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const failAttestedFinalizeRunsOverCapLocked = `-- name: failAttestedFinalizeRunsOverCapLocked :many
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.worker_id = $2
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind <> 'chat'
+  AND runs.id = ANY($3::uuid[])
+  AND runs.claim_generation = ($4::bigint[])[array_position($3::uuid[], runs.id)]
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                    AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND runs.requeue_count >= $5
+  AND NOT ($5 > 0 AND runs.finalize_resume_generation IS NULL)
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_targets AS MATERIALIZED (
+    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM runs
+    JOIN parent_mapping mapping ON mapping.run_id = runs.id
+    CROSS JOIN parent_lock_set locks
+    WHERE runs.id IN (SELECT id FROM candidates)
+      AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      AND runs.worker_id = $2
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind <> 'chat'
+  AND runs.id = ANY($3::uuid[])
+  AND runs.claim_generation = ($4::bigint[])[array_position($3::uuid[], runs.id)]
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                    AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND runs.requeue_count >= $5
+  AND NOT ($5 > 0 AND runs.finalize_resume_generation IS NULL)
+
+    ORDER BY runs.id
+    FOR UPDATE OF runs
+), target_lock_set AS MATERIALIZED (
+    SELECT array_agg(id) AS ids FROM locked_targets
+), final_targets AS MATERIALIZED (
+    -- Recheck the refreshed locked rows, not initial candidate membership.
+    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM locked_targets runs CROSS JOIN target_lock_set locks
+    WHERE runs.id = ANY(locks.ids)
+      AND runs.worker_id = $2
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind <> 'chat'
+  AND runs.id = ANY($3::uuid[])
+  AND runs.claim_generation = ($4::bigint[])[array_position($3::uuid[], runs.id)]
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                    AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND runs.requeue_count >= $5
+  AND NOT ($5 > 0 AND runs.finalize_resume_generation IS NULL)
+
+), eligible_parent_exits AS MATERIALIZED (
+    -- Shared by parent writes and suppression; 00300 owns cancellation only
+    -- for an unreleased active lead with a pending plan round-one check.
+    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
+), eligible_candidates AS MATERIALIZED (
+    SELECT target.id AS run_id FROM final_targets target
+    WHERE (target.kind = 'cross_check'
+           OR target.id IN (SELECT id FROM eligible_parent_exits))
+      AND NOT EXISTS (
+          SELECT 1 FROM cross_checks cc
+          JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
+          WHERE cc.checker_run_id = target.id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND exiting.status IN ('claimed', 'running')
+            AND exiting.claim_released_at IS NULL
+      )
+)
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE $1 END,
+    fail_origin = 'worker_lost',
+    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.worker_id = $2
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind <> 'chat'
+  -- Positional pairing of the two parallel arrays (run ids are unique: Register validates the
+  -- list). array_position is NULL for an unlisted run, so the equality is then never true.
+  AND runs.id = ANY($3::uuid[])
+  AND runs.claim_generation = ($4::bigint[])[array_position($3::uuid[], runs.id)]
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                    AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND runs.requeue_count >= $5
+  AND NOT ($5 > 0 AND runs.finalize_resume_generation IS NULL)
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND runs.id = ANY($6::uuid[])
+RETURNING runs.id
+`
+
+type failAttestedFinalizeRunsOverCapLockedParams struct {
+	FailureReason    pgtype.Text `json:"failure_reason"`
+	WorkerID         pgtype.UUID `json:"worker_id"`
+	RunIds           []uuid.UUID `json:"run_ids"`
+	ClaimGenerations []int64     `json:"claim_generations"`
+	MaxRequeues      int32       `json:"max_requeues"`
+	LockedRunIds     []uuid.UUID `json:"locked_run_ids"`
+}
+
+// An attested run that is over budget and not eligible for the one-shot allowance (allowance
+// already used, or RUN_MAX_REQUEUES = 0) fails exactly as FailWorkerRunsOverCap fails it.
+func (q *Queries) failAttestedFinalizeRunsOverCapLocked(ctx context.Context, arg failAttestedFinalizeRunsOverCapLockedParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, failAttestedFinalizeRunsOverCapLocked,
+		arg.FailureReason,
+		arg.WorkerID,
+		arg.RunIds,
+		arg.ClaimGenerations,
+		arg.MaxRequeues,
+		arg.LockedRunIds,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const failRunsMissingFromSnapshotLocked = `-- name: failRunsMissingFromSnapshotLocked :many
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.worker_id = $2
+  AND runs.kind <> 'chat'
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL
+  AND runs.status_since < $3
+  AND runs.requeue_count >= $4
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < ($5::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, $6::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds
+                            + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                (LEAST($5::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = $2 AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_targets AS MATERIALIZED (
+    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM runs
+    JOIN parent_mapping mapping ON mapping.run_id = runs.id
+    CROSS JOIN parent_lock_set locks
+    WHERE runs.id IN (SELECT id FROM candidates)
+      AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      AND runs.worker_id = $2
+  AND runs.kind <> 'chat'
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL
+  AND runs.status_since < $3
+  AND runs.requeue_count >= $4
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < ($5::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, $6::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds
+                            + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                (LEAST($5::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = $2 AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+
+    ORDER BY runs.id
+    FOR UPDATE OF runs
+), target_lock_set AS MATERIALIZED (
+    SELECT array_agg(id) AS ids FROM locked_targets
+), final_targets AS MATERIALIZED (
+    -- Recheck the refreshed locked rows, not initial candidate membership.
+    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM locked_targets runs CROSS JOIN target_lock_set locks
+    WHERE runs.id = ANY(locks.ids)
+      AND runs.worker_id = $2
+  AND runs.kind <> 'chat'
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL
+  AND runs.status_since < $3
+  AND runs.requeue_count >= $4
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < ($5::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, $6::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds
+                            + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                (LEAST($5::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = $2 AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+
+), eligible_parent_exits AS MATERIALIZED (
+    -- Shared by parent writes and suppression; 00300 owns cancellation only
+    -- for an unreleased active lead with a pending plan round-one check.
+    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
+), eligible_candidates AS MATERIALIZED (
+    SELECT target.id AS run_id FROM final_targets target
+    WHERE (target.kind = 'cross_check'
+           OR target.id IN (SELECT id FROM eligible_parent_exits))
+      AND NOT EXISTS (
+          SELECT 1 FROM cross_checks cc
+          JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
+          WHERE cc.checker_run_id = target.id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND exiting.status IN ('claimed', 'running')
+            AND exiting.claim_released_at IS NULL
+      )
+)
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE $1 END,
+    fail_origin = 'worker_lost',
+    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.worker_id = $2
+  AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL                        -- #1247 fence
+  AND runs.status_since < $3                   -- fence: stale window + one heartbeat interval, D4
+  AND runs.requeue_count >= $4
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < ($5::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, $6::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds
+                            + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
+                                (LEAST($5::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                FROM cross_checks cc WHERE cc.lead_run_id = runs.id
+                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
+                  WHERE a.worker_id = $2 AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- D11 terminal-pending lease (worker-scoped, defense-in-depth)
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w                   -- D11 pending_overflow closure (worker-level, ESSENTIAL)
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND runs.id = ANY($7::uuid[])
+RETURNING runs.id, runs.user_id, runs.status
+`
+
+type failRunsMissingFromSnapshotLockedParams struct {
+	FailureReason        pgtype.Text        `json:"failure_reason"`
+	WorkerID             pgtype.UUID        `json:"worker_id"`
+	MissingCutoff        pgtype.Timestamptz `json:"missing_cutoff"`
+	MaxRequeues          int32              `json:"max_requeues"`
+	Now                  pgtype.Timestamptz `json:"now"`
+	GlobalTimeoutSeconds int32              `json:"global_timeout_seconds"`
+	LockedRunIds         []uuid.UUID        `json:"locked_run_ids"`
+}
+
+type failRunsMissingFromSnapshotLockedRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
+// PRD #1390 M2b (SC2, over cap): a run-lane `running` run this worker OWNS but no longer lists (its
+// execution is lost) — past the fence, and out of re-queue budget — is FAILED (fail-first with the
+// requeue twin below). Its SET list mirrors FailRunsOfStaleWorkersOverCap (fail_origin='worker_lost',
+// the pause/switch/milestone clears, health reset, move_pending_since for the reconcile origin
+// restore). Held states are never targeted (status = 'running' only). Chat is a target restriction
+// (kind <> 'chat', D10) — these writers only ever touch run-lane runs. @missing_cutoff is the stale
+// window plus one heartbeat interval (D4); @max_requeues is RUN_MAX_REQUEUES.
+func (q *Queries) failRunsMissingFromSnapshotLocked(ctx context.Context, arg failRunsMissingFromSnapshotLockedParams) ([]failRunsMissingFromSnapshotLockedRow, error) {
+	rows, err := q.db.Query(ctx, failRunsMissingFromSnapshotLocked,
+		arg.FailureReason,
+		arg.WorkerID,
+		arg.MissingCutoff,
+		arg.MaxRequeues,
+		arg.Now,
+		arg.GlobalTimeoutSeconds,
+		arg.LockedRunIds,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []failRunsMissingFromSnapshotLockedRow{}
+	for rows.Next() {
+		var i failRunsMissingFromSnapshotLockedRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const failRunsOfStaleWorkersOverCapLocked = `-- name: failRunsOfStaleWorkersOverCapLocked :many
+WITH locked AS (
+    SELECT workers.id FROM workers
+    WHERE workers.last_heartbeat_at IS NULL OR workers.last_heartbeat_at < $4
+    ORDER BY workers.id
+    FOR UPDATE
+), candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+      AND runs.requeue_count >= $2
+      AND runs.worker_id IN (SELECT id FROM locked)
+      AND (runs.kind = 'chat'
+           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                             AND a.terminal_pending_until > now()
+                             AND a.claim_generation = runs.claim_generation)
+               AND NOT EXISTS (SELECT 1 FROM workers w
+                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Collect the actual locked IDs completely before any checker can be mutated.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_targets AS MATERIALIZED (
+    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM runs
+    JOIN parent_mapping mapping ON mapping.run_id = runs.id
+    CROSS JOIN parent_lock_set locks
+    WHERE runs.id IN (SELECT id FROM candidates)
+      AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+      AND runs.requeue_count >= $2
+      AND runs.worker_id IN (SELECT id FROM locked)
+      AND (runs.kind = 'chat'
+           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                             AND a.terminal_pending_until > now()
+                             AND a.claim_generation = runs.claim_generation)
+               AND NOT EXISTS (SELECT 1 FROM workers w
+                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+
+    ORDER BY runs.id
+    FOR UPDATE OF runs
+), target_lock_set AS MATERIALIZED (
+    SELECT array_agg(id) AS ids FROM locked_targets
+), final_targets AS MATERIALIZED (
+    -- Recheck the refreshed locked rows, not initial candidate membership.
+    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM locked_targets runs CROSS JOIN target_lock_set locks
+    WHERE runs.id = ANY(locks.ids)
+      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+      AND runs.requeue_count >= $2
+      AND runs.worker_id IN (SELECT id FROM locked)
+      AND (runs.kind = 'chat'
+           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                             AND a.terminal_pending_until > now()
+                             AND a.claim_generation = runs.claim_generation)
+               AND NOT EXISTS (SELECT 1 FROM workers w
+                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+
+), eligible_parent_exits AS MATERIALIZED (
+    -- Shared by parent writes and suppression; 00300 owns cancellation only
+    -- for an unreleased active lead with a pending plan round-one check.
+    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
+), eligible_candidates AS MATERIALIZED (
+    SELECT target.id AS run_id FROM final_targets target
+    WHERE (target.kind = 'cross_check'
+           OR target.id IN (SELECT id FROM eligible_parent_exits))
+      AND NOT EXISTS (
+          SELECT 1 FROM cross_checks cc
+          JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
+          WHERE cc.checker_run_id = target.id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND exiting.status IN ('claimed', 'running')
+            AND exiting.claim_released_at IS NULL
+      )
+)
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE $1 END,
+    -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
+    fail_origin = 'worker_lost',
+    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+FROM eligible_candidates candidate
+WHERE runs.id = candidate.run_id
+  AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.requeue_count >= $2
+  AND runs.worker_id IN (SELECT id FROM locked)
+  -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+  AND runs.id = ANY($3::uuid[])
+RETURNING runs.id, runs.user_id, runs.status
+`
+
+type failRunsOfStaleWorkersOverCapLockedParams struct {
+	FailureReason pgtype.Text        `json:"failure_reason"`
+	MaxRequeues   int32              `json:"max_requeues"`
+	LockedRunIds  []uuid.UUID        `json:"locked_run_ids"`
+	FailCutoff    pgtype.Timestamptz `json:"fail_cutoff"`
+}
+
+type failRunsOfStaleWorkersOverCapLockedRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
+// A stale worker's non-terminal run that has already used its re-queue budget →
+// failed instead of re-queued. Stamps move_pending_since (reconcile restores the
+// origin column; the sweep itself never touches the forge — worker-loss recovery
+// must not wait on a down forge).
+//
+// PRD #1390 M1 (D9): the FAIL path requires TWO consecutive stale windows —
+// @fail_cutoff = now() - 2*WORKER_HEARTBEAT_STALE (the Go caller computes it) — so a run
+// that was requeued once and then hits a partition just over one window is not terminated
+// before a heartbeat can re-adopt it; terminal cannot be undone. The stale workers are
+// locked FIRST by LockFailRunsOfStaleWorkersOverCap, ordered by id (the canonical
+// lock order), before run locks. This writer rechecks with a fresh snapshot after
+// staleness after a concurrent heartbeat commits — the race where a heartbeat lands between
+// the staleness read and the terminal write is closed.
+//
+// PRD #1390 M1 (D11): a run under an unexpired terminal-pending lease for its CURRENT
+// generation is NOT failed (an outcome is journaled on the worker, #1391), and neither is
+// any run owned by a worker flagged pending_overflow (the worker-level closure for outcomes
+// it could not list). Chat is exempt from the lease/overflow PROTECTION (D10) — it is still
+// failed as before — so the guard is `kind = 'chat' OR NOT EXISTS(...)`, never a top-level
+// kind <> 'chat'. The lease/overflow expiries (one clock) are the dead-worker backstop.
+func (q *Queries) failRunsOfStaleWorkersOverCapLocked(ctx context.Context, arg failRunsOfStaleWorkersOverCapLockedParams) ([]failRunsOfStaleWorkersOverCapLockedRow, error) {
+	rows, err := q.db.Query(ctx, failRunsOfStaleWorkersOverCapLocked,
+		arg.FailureReason,
+		arg.MaxRequeues,
+		arg.LockedRunIds,
+		arg.FailCutoff,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []failRunsOfStaleWorkersOverCapLockedRow{}
+	for rows.Next() {
+		var i failRunsOfStaleWorkersOverCapLockedRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const failWorkerRunsOverCapLocked = `-- name: failWorkerRunsOverCapLocked :many
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.worker_id = $2
+      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+      AND runs.requeue_count >= $3
+      AND (runs.kind = 'chat'
+           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                             AND a.terminal_pending_until > now()
+                             AND a.claim_generation = runs.claim_generation)
+               AND NOT EXISTS (SELECT 1 FROM workers w
+                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Collect the actual locked IDs completely before any checker can be mutated.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_targets AS MATERIALIZED (
+    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM runs
+    JOIN parent_mapping mapping ON mapping.run_id = runs.id
+    CROSS JOIN parent_lock_set locks
+    WHERE runs.id IN (SELECT id FROM candidates)
+      AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+      AND runs.worker_id = $2
+      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+      AND runs.requeue_count >= $3
+      AND (runs.kind = 'chat'
+           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                             AND a.terminal_pending_until > now()
+                             AND a.claim_generation = runs.claim_generation)
+               AND NOT EXISTS (SELECT 1 FROM workers w
+                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+
+    ORDER BY runs.id
+    FOR UPDATE OF runs
+), target_lock_set AS MATERIALIZED (
+    SELECT array_agg(id) AS ids FROM locked_targets
+), final_targets AS MATERIALIZED (
+    -- Recheck the refreshed locked rows, not initial candidate membership.
+    SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason FROM locked_targets runs CROSS JOIN target_lock_set locks
+    WHERE runs.id = ANY(locks.ids)
+      AND runs.worker_id = $2
+      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+      AND runs.requeue_count >= $3
+      AND (runs.kind = 'chat'
+           OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                             AND a.terminal_pending_until > now()
+                             AND a.claim_generation = runs.claim_generation)
+               AND NOT EXISTS (SELECT 1 FROM workers w
+                               WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+
+), eligible_parent_exits AS MATERIALIZED (
+    -- Shared by parent writes and suppression; 00300 owns cancellation only
+    -- for an unreleased active lead with a pending plan round-one check.
+    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
+), eligible_candidates AS MATERIALIZED (
+    SELECT target.id AS run_id FROM final_targets target
+    WHERE (target.kind = 'cross_check'
+           OR target.id IN (SELECT id FROM eligible_parent_exits))
+      AND NOT EXISTS (
+          SELECT 1 FROM cross_checks cc
+          JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
+          WHERE cc.checker_run_id = target.id
+            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND exiting.status IN ('claimed', 'running')
+            AND exiting.claim_released_at IS NULL
+      )
+)
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE $1 END,
+    -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
+    fail_origin = 'worker_lost',
+    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+FROM eligible_candidates candidate
+WHERE runs.id = candidate.run_id
+  AND runs.worker_id = $2
+  AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.requeue_count >= $3
+  -- PRD #1390 D11: register's orphan fail honours the terminal-pending lease + pending_overflow
+  -- closure exactly as the stale-worker passes do (chat-exempt, D10) — a fresh worker process
+  -- must not fail its own run whose outcome is journaled and about to be replayed (#1391).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+  AND runs.id = ANY($4::uuid[])
+RETURNING runs.id
+`
+
+type failWorkerRunsOverCapLockedParams struct {
+	FailureReason pgtype.Text `json:"failure_reason"`
+	WorkerID      pgtype.UUID `json:"worker_id"`
+	MaxRequeues   int32       `json:"max_requeues"`
+	LockedRunIds  []uuid.UUID `json:"locked_run_ids"`
+}
+
+// On register a worker declares a fresh start, so any run it still holds is
+// orphaned (its execution is gone). Over its re-queue budget → failed. failed →
+// origin restore, applied by the reconcile loop (register does no forge I/O), so
+// it stamps move_pending_since. RETURNING id so the caller can funnel these
+// committed-terminal (worker-lost) runs into the judge (PRD #46 Decision 2), exactly
+// as the sweeper's FailRunsOfStaleWorkersOverCap does.
+func (q *Queries) failWorkerRunsOverCapLocked(ctx context.Context, arg failWorkerRunsOverCapLockedParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, failWorkerRunsOverCapLocked,
+		arg.FailureReason,
+		arg.WorkerID,
+		arg.MaxRequeues,
+		arg.LockedRunIds,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

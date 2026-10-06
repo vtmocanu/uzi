@@ -54,6 +54,80 @@ func ownerRecoveryFixture() apitypes.RecoveryCustodyHoldsDTO {
 	}
 }
 
+func TestRecoveryTerminalRejection(t *testing.T) {
+	const copy = "terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody"
+	for _, runSpecific := range []bool{false, true} {
+		for _, archive := range []bool{false, true} {
+			dto := ownerRecoveryFixture()
+			dto.Holds = []apitypes.RecoveryCustodyHoldDTO{
+				{ID: "hold-g7", RunID: "run-one", Generation: 7, State: "open", Attention: "source_only", WorkerName: "alpha", TerminalRecordRejection: "mac_failure"},
+				{ID: "hold-g8", RunID: "run-one", Generation: 8, State: "open", Attention: "active", TerminalRecordRejection: "untrusted flag"},
+			}
+			if archive {
+				dto.Holds = append(dto.Holds, apitypes.RecoveryCustodyHoldDTO{ID: "hold-g9", RunID: "run-one", Generation: 9, State: "open", Attention: "archive_ready", HasAvailableCapture: true, TerminalRecordRejection: "mac_failure"})
+			}
+			fc := &uzicli.FakeClient{RecoveryHoldsResult: dto, RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
+				"run-one": {Archives: []apitypes.RecoveryArchiveDTO{{ID: "cap-g9", HoldID: "hold-g9", State: "available"}}},
+			}}
+			args := []string{"run", "recovery"}
+			if runSpecific {
+				args = append(args, "run-one")
+			}
+			out, errb, code := runCLI(t, fakeEnv(fc), args...)
+			if code != uzicli.ExitOK {
+				t.Fatalf("exit=%d stderr=%s", code, errb)
+			}
+			if !strings.Contains(out, "run run-one hold hold-g7 gen 7: "+copy) ||
+				!strings.Contains(out, "hold hold-g7: no recovery archive; custody of worker alpha's local source is retained (export unavailable; it may be the only copy)") {
+				t.Fatalf("missing identity or copy: %s", out)
+			}
+			if strings.Contains(out, "untrusted flag") || strings.Contains(out, "uzi run export") != archive {
+				t.Fatalf("diagnostic changed export or rendered unknown flag: %s", out)
+			}
+			jsonOut, errb, code := runCLI(t, fakeEnv(fc), append(args, "--json")...)
+			if code != uzicli.ExitOK {
+				t.Fatalf("json exit=%d stderr=%s", code, errb)
+			}
+			var rows []map[string]any
+			if runSpecific {
+				if err := json.Unmarshal([]byte(jsonOut), &rows); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				var owner struct {
+					Holds []map[string]any `json:"holds"`
+				}
+				if err := json.Unmarshal([]byte(jsonOut), &owner); err != nil {
+					t.Fatal(err)
+				}
+				rows = owner.Holds
+			}
+			if len(rows) != len(dto.Holds) || rows[0]["id"] != "hold-g7" || rows[0]["run_id"] != "run-one" ||
+				rows[0]["generation"] != float64(7) || rows[0]["attention"] != "source_only" ||
+				rows[0]["terminal_record_rejection"] != "mac_failure" || rows[0]["terminal_rejection"] != copy {
+				t.Fatalf("JSON identity/copy changed: %s", jsonOut)
+			}
+			if runSpecific {
+				if caps := rows[0]["captures"].([]any); len(caps) != 0 {
+					t.Fatalf("capture attached to rejected source-only generation: %s", jsonOut)
+				}
+				if archive {
+					caps := rows[2]["captures"].([]any)
+					if len(caps) != 1 || caps[0].(map[string]any)["id"] != "cap-g9" || caps[0].(map[string]any)["state"] != "available" {
+						t.Fatalf("available capture lost: %s", jsonOut)
+					}
+				}
+			}
+			if _, ok := rows[1]["terminal_rejection"]; ok {
+				t.Fatalf("unknown flag got copy: %s", jsonOut)
+			}
+			if rows[1]["terminal_record_rejection"] != "untrusted flag" {
+				t.Fatalf("raw flag lost: %s", jsonOut)
+			}
+		}
+	}
+}
+
 func TestOwnerRecoveryHuman(t *testing.T) {
 	fc := &uzicli.FakeClient{RecoveryHoldsResult: ownerRecoveryFixture(),
 		RecoveryArchivesErr: uzicli.Exitf(uzicli.ExitGeneric, "archives must not be read")}

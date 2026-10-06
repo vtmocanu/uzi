@@ -83,11 +83,12 @@ func TestSplitAcceptanceReverseKeysAndRepoScope(t *testing.T) {
 		key          string
 		want, bottom tuiView
 	}{
-		{"shift+tab", viewPulls, viewPulls},
 		{"shift+tab", viewCI, viewCI},
-		{"shift+tab", viewBoard, viewCI},
-		{"ctrl+w", viewCI, viewCI},
-		{"ctrl+w", viewBoard, viewCI},
+		{"shift+tab", viewPulls, viewPulls},
+		{"shift+tab", viewWorkers, viewPulls},
+		{"shift+tab", viewBoard, viewPulls},
+		{"ctrl+w", viewPulls, viewPulls},
+		{"ctrl+w", viewBoard, viewPulls},
 		{keyViewPulls, viewPulls, viewPulls},
 		{keyViewFloor, viewBoard, viewPulls},
 		{"ctrl+w", viewPulls, viewPulls},

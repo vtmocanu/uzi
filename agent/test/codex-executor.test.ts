@@ -2724,6 +2724,39 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
   });
 });
 
+describe("CodexExecutor: incomplete resumed claim notice", () => {
+  for (const credential of [API_KEY, SUBSCRIPTION]) {
+    it(`${credential.auth_mode}: persists fixed worker notice once across epochs while execution completes`, async () => {
+      const rig = makeMultiEpochRig([
+        resumedEpochResponder("th-1", "tn-1", (t, th, tn) => {
+          t.push({ kind: "turn_started", method: "turn/started", threadId: th, turnId: tn, params: { threadId: th, turn: { id: tn } } })
+            .push(tokenUsageUpdated(th, tn, { inputTokens: 150, totalTokens: 150 }))
+            .push(toolCall(1, "checkpoint", {}, th, tn, "c-ckpt"))
+            .push(turnCompleted("completed", th, tn));
+        }),
+        resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+          t.push(tokenUsageUpdated(th, "historical", { inputTokens: 150, totalTokens: 150 }))
+            .push({ kind: "turn_started", method: "turn/started", threadId: th, turnId: tn, params: { threadId: th, turn: { id: tn } } })
+            .push(tokenUsageUpdated(th, tn, { inputTokens: 200, totalTokens: 200 }, { inputTokens: 50, totalTokens: 50 }))
+            .push(toolCall(2, "signal_done", {}, th, tn, "c-done"))
+            .push(turnCompleted("completed", th, tn));
+        }),
+      ]);
+      const { ctx, emitted } = makeCtx({ sessionId: "th-1", checkpoint: async () => undefined });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(credential)).run(ctx), 5000, "incomplete claim completes");
+      assert.equal(result.branch, "agent/issue-42");
+      assert.equal(rig.providerLaunches(), 2);
+      assert.deepEqual(emitted.filter(m => m.payload.event === "codex_token_usage_incomplete"), [{
+        kind: "status", agent: "worker", payload: {
+          event: "codex_token_usage_incomplete",
+          text: "Token usage for this resumed claim is unavailable; recorded run totals are incomplete. Execution continues.",
+        },
+      }]);
+      assert.equal(lastResultModelUsage(emitted), undefined);
+    });
+  }
+});
+
 describe("CodexExecutor: one claim-leg accountant survives provider-epoch recreation (CodeRabbit 4004800880)", () => {
   it("reports cumulative-since-claim-start across a checkpoint recreation, not just the resumed epoch's own delta", async () => {
     // The seam under test is the shared EpochSharedContext.accountant threaded into every epoch's
@@ -2749,7 +2782,8 @@ describe("CodexExecutor: one claim-leg accountant survives provider-epoch recrea
       resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
         // Resume replay: the restored cumulative (total=100); `last` is the prior leg's final
         // response (a subset already counted upstream). Then a genuinely-newer note (total=150).
-        t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }, { inputTokens: 100, totalTokens: 100 }))
+        t.push(tokenUsageUpdated(th, "historical", { inputTokens: 100, totalTokens: 100 }, { inputTokens: 100, totalTokens: 100 }))
+          .push({ kind: "turn_started", method: "turn/started", threadId: th, turnId: tn, params: { threadId: th, turn: { id: tn } } })
           .push(tokenUsageUpdated(th, tn, { inputTokens: 150, totalTokens: 150 }, { inputTokens: 50, totalTokens: 50 }))
           .push(toolCall(2, "signal_done", {}, th, tn, "c-done"))
           .push(turnCompleted("completed", th, tn));
@@ -2806,7 +2840,8 @@ describe("CodexExecutor: one claim-leg accountant survives provider-epoch recrea
 
     const resumedRig = makeMultiEpochRig([
       resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
-        t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }, { inputTokens: 100, totalTokens: 100 }))
+        t.push(tokenUsageUpdated(th, "historical", { inputTokens: 100, totalTokens: 100 }, { inputTokens: 100, totalTokens: 100 }))
+          .push({ kind: "turn_started", method: "turn/started", threadId: th, turnId: tn, params: { threadId: th, turn: { id: tn } } })
           .push(tokenUsageUpdated(th, tn, { inputTokens: 150, totalTokens: 150 }, { inputTokens: 50, totalTokens: 50 }))
           .push(toolCall(2, "signal_done", {}, th, tn, "c-done-2"))
           .push(turnCompleted("completed", th, tn));
@@ -2842,7 +2877,8 @@ describe("CodexExecutor: one claim-leg accountant survives provider-epoch recrea
       resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
         // A resumed claim replays the restored cumulative first (a no-op baseline), then a
         // genuinely-newer note charges the delta — so a per-model usage entry exists to key on.
-        t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }, { inputTokens: 100, totalTokens: 100 }))
+        t.push(tokenUsageUpdated(th, "historical", { inputTokens: 100, totalTokens: 100 }, { inputTokens: 100, totalTokens: 100 }))
+          .push({ kind: "turn_started", method: "turn/started", threadId: th, turnId: tn, params: { threadId: th, turn: { id: tn } } })
           .push(tokenUsageUpdated(th, tn, { inputTokens: 150, totalTokens: 150 }, { inputTokens: 50, totalTokens: 50 }))
           .push(toolCall(1, "signal_done", {}, th, tn, "c-done"))
           .push(turnCompleted("completed", th, tn));
@@ -5530,10 +5566,33 @@ describe("CodexExecutor: production tool-handler map (item 5)", () => {
   });
 });
 
-// PRD #1416 M1: the Codex executor's planPrompt/implementPrompt are trivial string builders that
-// bypass the shared buildPlanPrompt/buildImplementPrompt, so the published-floor paragraph is
-// prepended directly (from publishedTipNote). These assert it rides both prompts when
-// ctx.publishedTip is set (with AND without an approved plan) and is absent otherwise.
+describe("Docker scratch resume Codex prompts", () => {
+  const note = "Docker containers and volumes from before the pause may be gone. Recreate your Docker fixtures before relying on them.";
+  const exec = makeExecutor(makeRig(), bindingOf(SUBSCRIPTION));
+  const builders = exec as unknown as {
+    planPrompt(c: RunContext): string;
+    implementPrompt(c: RunContext, gatedPlan?: string): string;
+  };
+
+  for (const phase of ["planPrompt", "implementPrompt"] as const) {
+    it(`${phase} appends the note for a cold resume without a session`, () => {
+      const fresh = makeCtx({ sessionId: undefined, resumed: false }).ctx;
+      const baseline = builders[phase](fresh);
+      assert.ok(!baseline.includes(note));
+      assert.equal(builders[phase]({ ...fresh, dockerScratchResume: false }), baseline);
+      assert.equal(builders[phase]({ ...fresh, dockerScratchResume: true }), `${baseline}\n\n${note}`);
+    });
+  }
+
+  it("preserves gated plan framing while appending the note", () => {
+    const ctx = makeCtx({ sessionId: undefined, approvedPlan: undefined }).ctx;
+    const baseline = builders.implementPrompt(ctx, "approved steps");
+    assert.equal(builders.implementPrompt({ ...ctx, dockerScratchResume: true }, "approved steps"), `${baseline}\n\n${note}`);
+  });
+});
+
+// PRD #1416 M1: the Codex executor's planPrompt/implementPrompt bypass the shared builders.
+// Assert the published-floor paragraph rides both prompts when ctx.publishedTip is set.
 describe("CodexExecutor prompts — published-tip note (PRD #1416 M1)", () => {
   const P = "0123456789abcdef0123456789abcdef01234567";
   const DFLT = "fedcba9876543210fedcba9876543210fedcba98";
@@ -6252,16 +6311,54 @@ describe("CodexExecutor: run-wide wall and served lift (issue #1600)", () => {
     return { ctx, spies };
   }
 
-  it("cumulative active time across turns trips the wall; each turn does not get a fresh wall", async () => {
+  it("cumulative active time across turns trips the wall; each turn does not get a fresh wall", async (t) => {
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const controller = new AbortController();
     const rig = makeRig({ responder: timedTurns({ turnMs: 150, turns: 6 }) });
     rig.deps = { ...rig.deps, idleMs: 5000, wallMs: 350 };
-    const { ctx, spies } = lwallCtx();
-    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex cumulative wall");
-    // Each 150ms turn fits a 350ms wall on its own, so a per-turn wall never trips. Cumulatively the
-    // budget is spent inside turn 3.
-    assert.deepStrictEqual(result.walled, { reason: "codex run wall-clock timeout" }, "the run-wide budget tripped");
-    assert.equal(spies.parkForWallCalls, 1);
-    assert.equal(rig.transport.turnStartCount, 3, "tripped in turn 3 (150+150 spent, 50ms left)");
+    const { ctx, spies } = lwallCtx({ signal: controller.signal });
+    let watchdogHandle: ReturnType<typeof setTimeout> | undefined;
+    let cleanupHandle: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    const watchdog = new Promise<never>((_, reject) => {
+      watchdogHandle = realSetTimeout(() => reject(new Error("timed out waiting for cumulative wall")), 5000);
+    });
+    const bounded = <T,>(promise: Promise<T>): Promise<T> => Promise.race([promise, watchdog]);
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx).then(
+      (result) => { settled = true; return { result, error: undefined }; },
+      (error: unknown) => { settled = true; return { result: undefined, error }; },
+    );
+    try {
+      for (const turn of [1, 2, 3]) {
+        while (rig.transport.turnStartCount < turn) await bounded(tick());
+        await bounded(tick());
+        // No host scheduling delay consumes this test's virtual budget.
+        t.mock.timers.tick(turn === 3 ? 50 : 150);
+      }
+      const outcome = await bounded(running);
+      assert.ok(outcome.result, String(outcome.error));
+      assert.deepStrictEqual(outcome.result.walled, { reason: "codex run wall-clock timeout" }, "the run-wide budget tripped");
+      assert.equal(spies.parkForWallCalls, 1);
+      assert.equal(rig.transport.turnStartCount, 3, "tripped in turn 3 (150+150 spent, 50ms left)");
+    } finally {
+      if (watchdogHandle !== undefined) realClearTimeout(watchdogHandle);
+      try {
+        if (!settled) {
+          controller.abort();
+          const cleanupWatchdog = new Promise<never>((_, reject) => {
+            cleanupHandle = realSetTimeout(() => reject(new Error("timed out settling cumulative wall")), 5000);
+          });
+          await Promise.race([tick(), cleanupWatchdog]);
+          t.mock.timers.tick(5000);
+          await Promise.race([running, cleanupWatchdog]);
+        }
+      } finally {
+        if (cleanupHandle !== undefined) realClearTimeout(cleanupHandle);
+        t.mock.timers.reset();
+      }
+    }
   });
 
   it("a larger served total from reportIteration lifts the wall before the next turn", async () => {

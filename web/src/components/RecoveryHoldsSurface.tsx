@@ -39,12 +39,13 @@ export function RecoveryHoldsSurface() {
   usePollWhileVisible(load, 10000);
 
   if (!holds) return null;
-  // Decision-only surface (PRD #1371): render only holds that need an owner decision
-  // (needs_action / source_only). Healthy active/capturing/archive_ready and terminal
-  // released/discarded show nothing; the card self-hides when nothing needs a decision.
-  const decisionHolds = holds.holds.filter((h) => custodyHoldView(h).needsDecision);
-  if (decisionHolds.length === 0) return null;
-  const groups = groupHoldsByWorker(decisionHolds);
+  // Show owner decisions and exact MAC-rejected holds independently of attention.
+  // The diagnostic changes visibility only; classification, actions and counts stay intact.
+  const visibleHolds = holds.holds.filter((h) =>
+    custodyHoldView(h).needsDecision || h.terminal_record_rejection === "mac_failure",
+  );
+  if (visibleHolds.length === 0) return null;
+  const groups = groupHoldsByWorker(visibleHolds);
   // Open holds per run, counted over the FULL listing (not just the decision rows): the
   // retained checkpoint ref follows custody, so discarding a run's last open hold also deletes
   // that ref on the forge (PRD #1810). A healthy sibling hold filtered out above still counts.
@@ -218,6 +219,7 @@ function HoldRow({
             )}
           </div>
           <p className="text-sm text-muted">{view.summary}</p>
+          {view.terminalRejection && <p className="text-sm text-muted">{view.terminalRejection}</p>}
           <p className="flex flex-wrap items-center gap-x-2 text-xs text-faint">
             <span className="font-mono">run {runShort}</span>
             <span className="font-mono">hold {holdShort}</span>

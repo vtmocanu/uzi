@@ -45,6 +45,7 @@ import { hasTemplateDrift } from "../lib/workerTemplates";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerPendingOutcomeBadge } from "../components/WorkerPendingOutcomeBadge";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
+import { AdminWorkerResources } from "../components/AdminWorkerResources";
 import { WorkerCustodyBadge } from "../components/WorkerCustodyBadge";
 import { RunHealthBadge } from "../components/RunHealthBadge";
 import { JudgeRunBadge } from "../components/JudgeRunBadge";
@@ -745,6 +746,7 @@ export function RunsList() {
                       <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
                         {w.status}
                       </Badge>
+                      <AdminWorkerResources worker={w} />
                       <WorkerCordonBadge worker={w} />
                       <WorkerRunBadge worker={w} />
                       <WorkerPendingOutcomeBadge worker={w} />

@@ -77,8 +77,8 @@ type Store interface {
 	ListLargestRunDiskForWorkers(ctx context.Context, arg store.ListLargestRunDiskForWorkersParams) ([]store.WorkerRunDisk, error)
 	// fleet.capacity: owners waiting with zero usable (online, non-draining, fresh) workers.
 	ListOwnersWaitingNoCapacity(ctx context.Context, arg store.ListOwnersWaitingNoCapacityParams) ([]store.ListOwnersWaitingNoCapacityRow, error)
-	// queue.waiting: oldest waiting_worker run's health_since (nullable).
-	OldestWaitingWorkerRun(ctx context.Context) (pgtype.Timestamptz, error)
+	// queue.waiting: every waiting run, including nullable reason and age.
+	ListWaitingWorkerRuns(ctx context.Context) ([]store.ListWaitingWorkerRunsRow, error)
 	// queue.undispatched: oldest undispatched task run's created_at (nullable).
 	OldestUndispatchedTaskRun(ctx context.Context) (pgtype.Timestamptz, error)
 	// schedules.paused: count of users with a pause-all and >= 1 enabled schedule.
@@ -244,12 +244,17 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 	controllerReport := s.checkControllerReport(ctx, now, hostedConfigured)
 	controllerReportOK := controllerReport.Severity == sevOK
 
+	confirm := &waitConfirmations{}
+	capacity := s.checkFleetCapacity(ctx, now, healthState, confirm)
+	waiting := s.checkQueueWaiting(ctx, now, healthState, confirm)
+	confirm.close()
+
 	checks := []apitypes.HealthCheckDTO{
 		s.checkFleetRoll(now, workers, controllerReportOK),
-		s.checkFleetCapacity(ctx, now, healthState),
+		capacity,
 		s.checkFleetDisk(now, workers),
 		s.checkFleetRunDisk(ctx, now, workers),
-		s.checkQueueWaiting(ctx, now, healthState),
+		waiting,
 		s.checkQueueUndispatched(ctx, now),
 		controllerReport,
 		s.checkDB(ctx),
@@ -263,7 +268,16 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		s.checkReleaseCheck(ctx, now),
 	}
 
+	blocking := false
+	for _, c := range checks {
+		if c.Scope == "instance" && c.Severity == sevDanger {
+			blocking = true
+			break
+		}
+	}
+
 	return Doc{
+		Blocking:  blocking,
 		Status:    overallStatus(checks),
 		CheckedAt: now.UTC().Format(time.RFC3339),
 		Counts:    tally(checks),

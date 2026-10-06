@@ -154,6 +154,10 @@ func (s *Service) probeLeaseClaim(admitted, rebound bool) {
 // (the next provisioning pass retries). Neither corrupts state, and there is no retry here. A lease-off service, a non-ephemeral worker or an unleased one passes the
 // no-lease params (NULL columns), where ClaimRun's lease arm admits nothing.
 func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Queries, workerID uuid.UUID, reread store.Worker, params store.ClaimRunParams) (store.Run, bool, error) {
+	params.ClaimantDraining = reread.DrainingSince.Valid || maintenancePending(reread)
+	if reread.MaintenanceFenced {
+		return store.Run{}, false, nil
+	}
 	leased := s.ephemeralLease > 0 && reread.Ephemeral && reread.LeaseSince.Valid &&
 		reread.LeaseRepoID.Valid && reread.LeaseBranch.Valid
 	if !leased {

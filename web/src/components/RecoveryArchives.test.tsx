@@ -1,27 +1,31 @@
 // @vitest-environment jsdom
-import { afterEach, describe, it, expect, vi } from "vitest";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { RecoveryArchivesPanel } from "./RecoveryArchives";
 import { api, type RecoveryArchive, type RecoveryArchiveSummary, type Run } from "../lib/api";
 
-// The panel fetches its own owner-scoped summary via api.getRunArchives. Mock ONLY that
-// call; keep runArchiveDownloadUrl and the recovery display helpers real, since the whole
+// The panel fetches only its owner-scoped summary. Spy on holds to forbid a new read;
+// keep runArchiveDownloadUrl and the recovery display helpers real, since the whole
 // point of these pins is the real render path (D6/D7).
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
   return {
     ...actual,
-    api: { getRunArchives: vi.fn(), discardRunArchive: vi.fn() },
+    api: { getRunArchives: vi.fn(), getRecoveryHolds: vi.fn(), discardRunArchive: vi.fn() },
   };
 });
 const mockApi = vi.mocked(api);
+
+beforeEach(() => {
+  mockApi.getRecoveryHolds.mockReset();
+});
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
 });
 
-// The panel reads only run.id and run.status; a minimal cast matches the repo convention
+// A minimal run fixture matches the repo convention
 // (SteerQueueCard.test.tsx) rather than spelling out the whole Run.
 function aRun(over: Partial<Run> = {}): Run {
   return { id: "r1", status: "failed", ...over } as Run;
@@ -70,7 +74,102 @@ async function renderPanel(run: Run, s: RecoveryArchiveSummary) {
   return utils;
 }
 
+const DIAGNOSTIC = "terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody";
 const SECRET_WARNING = /Treat every archive as if it contains secrets/;
+
+describe("RecoveryArchivesPanel fixed failed-run copy", () => {
+  it("uses only the exact failed-run reason and suppresses inferred zero-row preparation", async () => {
+    await renderPanel(aRun({ failure_reason: DIAGNOSTIC }), summary({ has_open_hold: true }));
+    expect(screen.getByText(DIAGNOSTIC).textContent).toBe(DIAGNOSTIC);
+    expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Preparing the recovery archive/)).toBeNull();
+    expect(screen.queryByText(/No server archive exists|Decision required|gen 7|hold h1/)).toBeNull();
+    expect(screen.queryByRole("link", { name: "Export archive" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Export archive" })).toBeNull();
+    expect(screen.queryByText(/uzi run export/)).toBeNull();
+  });
+
+  it.each([
+    "mac_failure",
+    "unknown MAC failure",
+    DIAGNOSTIC + " ",
+    " " + DIAGNOSTIC,
+    DIAGNOSTIC.toUpperCase(),
+  ])("does not interpret an unknown or approximate reason: %s", async (failure_reason) => {
+    await renderPanel(aRun({ failure_reason }), summary({ has_open_hold: true }));
+    expect(screen.getByText(/Preparing the recovery archive/)).toBeTruthy();
+    expect(screen.queryByText(DIAGNOSTIC)).toBeNull();
+    expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
+  });
+
+  it("does not show rejection copy for a non-failed run", async () => {
+    await renderPanel(aRun({ status: "completed", failure_reason: DIAGNOSTIC }),
+      summary({ has_open_hold: true }));
+    expect(screen.getByText(/Preparing the recovery archive/)).toBeTruthy();
+    expect(screen.queryByText(DIAGNOSTIC)).toBeNull();
+    expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
+  });
+
+  it("keeps actual available capture export and the CLI hint", async () => {
+    await renderPanel(aRun({ failure_reason: DIAGNOSTIC, landing_state: "needs_landing" }),
+      summary({ archives: [archive()] }));
+    expect(screen.getByText(DIAGNOSTIC)).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Export archive" }).getAttribute("href"))
+      .toBe("/api/runs/r1/archives/cap1/download");
+    expect(screen.getByText("uzi run export r1 --output <path> --capture cap1")).toBeTruthy();
+    expect(screen.getByText(SECRET_WARNING)).toBeTruthy();
+    expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["preparing", "Preparing"],
+    ["uploading", "Uploading"],
+    ["needs_action", "Needs action"],
+  ] as const)("preserves an actual %s capture without enabling export", async (state, label) => {
+    await renderPanel(aRun({ failure_reason: DIAGNOSTIC, landing_state: "needs_landing" }),
+      summary({ has_open_hold: true, archives: [archive({ state })] }));
+    expect(screen.getByText(DIAGNOSTIC)).toBeTruthy();
+    expect(screen.getByText(label)).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "Export archive" })).toBeNull();
+    expect((screen.getByRole("button", { name: "Export archive" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByText(/uzi run export/)).toBeNull();
+    expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
+  });
+
+  it("hides the panel when the owner summary fails even with the fixed reason", async () => {
+    mockApi.getRunArchives.mockRejectedValueOnce(new Error("404"));
+    const { container } = render(<RecoveryArchivesPanel run={aRun({ failure_reason: DIAGNOSTIC })} />);
+    await act(async () => { await Promise.resolve(); });
+    expect(mockApi.getRunArchives).toHaveBeenCalledWith("r1");
+    expect(container.innerHTML).toBe("");
+    expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
+  });
+
+  it("clears a loaded summary immediately when changing runs", async () => {
+    const { rerender, container } = await renderPanel(aRun({ failure_reason: DIAGNOSTIC }),
+      summary({ archives: [archive()] }));
+    expect(screen.getByRole("link", { name: "Export archive" })).toBeTruthy();
+    let resolveNext!: (value: RecoveryArchiveSummary) => void;
+    mockApi.getRunArchives.mockImplementationOnce(() => new Promise((resolve) => { resolveNext = resolve; }));
+    rerender(<RecoveryArchivesPanel run={aRun({ id: "r2", status: "completed" })} />);
+    expect(container.innerHTML).toBe("");
+    await act(async () => { resolveNext(summary()); });
+    expect(container.innerHTML).toBe("");
+    expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
+  });
+
+  it("ignores a late summary from the previous run after the new owner's summary fails", async () => {
+    let resolveOld!: (value: RecoveryArchiveSummary) => void;
+    mockApi.getRunArchives.mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }));
+    const { rerender, container } = render(<RecoveryArchivesPanel run={aRun({ failure_reason: DIAGNOSTIC })} />);
+    mockApi.getRunArchives.mockRejectedValueOnce(new Error("404"));
+    rerender(<RecoveryArchivesPanel run={aRun({ id: "r2", failure_reason: DIAGNOSTIC })} />);
+    await act(async () => { resolveOld(summary({ archives: [archive()] })); });
+    expect(mockApi.getRunArchives).toHaveBeenCalledWith("r2");
+    expect(container.innerHTML).toBe("");
+    expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
+  });
+});
 
 describe("RecoveryArchivesPanel — zero-capture truthfulness", () => {
   it("shows the legacy/unsupported note on a failed run recovery never armed for", async () => {

@@ -63,7 +63,7 @@ export function HealthOverviewCard() {
     );
   }
 
-  const verdict = healthVerdict(doc.status, doc.counts);
+  const verdict = healthVerdict(doc);
   const top = attention.slice(0, 3);
 
   return (
@@ -89,6 +89,12 @@ export function HealthOverviewCard() {
             <span className="min-w-0 flex-1 text-sm">
               <span className="font-medium text-fg">{c.title}</span>{" "}
               <span className="text-muted">{c.summary}</span>
+              {c.evidence[0] && (
+                <span className="block break-words text-xs text-muted">
+                  <span className="font-medium">{c.evidence[0].label}:</span>{" "}
+                  {c.evidence[0].value}
+                </span>
+              )}
             </span>
             {c.since && <span className="shrink-0 text-xs tabular-nums text-faint">{sinceLabel(c.since)}</span>}
           </li>

@@ -42,14 +42,25 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
+# Normalize slash spelling without resolving symlinks (notably /var on macOS).
+# Parameter expansion cannot silently fail into an empty base as an external pipeline
+# could. The added slash makes the join root-safe; only an all-slash input becomes empty.
+temp_base="${TMPDIR:-/tmp}/"
+while :; do
+  case "$temp_base" in
+    *//*) temp_base="${temp_base%%//*}/${temp_base#*//}" ;;
+    *) break ;;
+  esac
+done
+temp_base="${temp_base%/}"
 # Portable template form (check:mktemp-portability): a full path with 6 X's, no -t.
-scratch="$(mktemp -d "${TMPDIR:-/tmp}/uzi-tmpdir-guard.XXXXXX")" || {
+scratch="$(mktemp -d "$temp_base/uzi-tmpdir-guard.XXXXXX")" || {
   echo "tmpdir-leak-guard: cannot create a scratch dir" >&2
   exit 2
 }
 
 # Outside the scratch dir, so it is never itself reported as a leftover.
-ledger="$(mktemp "${TMPDIR:-/tmp}/uzi-tmpdir-guard-ledger.XXXXXX")" || {
+ledger="$(mktemp "$temp_base/uzi-tmpdir-guard-ledger.XXXXXX")" || {
   rm -rf "$scratch"
   echo "tmpdir-leak-guard: cannot create a ledger file" >&2
   exit 2

@@ -736,6 +736,34 @@ wb cr_body_acked
 [ "$rc" -eq 0 ] || fail "an acknowledged CR review body still blocked, rc=$rc: $(cat "$WORK/wb.cr_body_acked")"
 unset REVIEWS_FILE
 
+# An APPROVED CodeRabbit review plus a separate tally-less COMMENTED nitpick review on the
+# same head: the verdict exists, so the nitpick body is gated by the ack alone. Before the
+# ack it blocks (unacked=1); after it, ready. cr_unconfirmed stays the raw count (1).
+export REVIEWS_FILE="$WORK/reviews.json"
+jq -n '[{id:5400000001,user:{login:"coderabbitai[bot]"},commit_id:"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",state:"APPROVED",submitted_at:"2026-09-27T16:40:00Z",body:""},
+  {id:5400000002,user:{login:"coderabbitai[bot]"},commit_id:"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",state:"COMMENTED",submitted_at:"2026-09-27T16:41:00Z",
+  body:"<details>\n<summary>Nitpick comments (1)</summary>\n\n`12-14`: _Nitpick_ rename this helper\n</details>"}]' > "$REVIEWS_FILE"
+set +e; MODE=full bash "$SCRIPT" test/repo 42 0 1 --reviewer coderabbit --reviewer-grace 0 > "$WORK/wb.cr_verdict_nit" 2>&1; rc=$?; set -e
+[ "$rc" -eq 3 ] || fail "an un-acked CR nitpick review next to a verdict did not block, rc=$rc: $(cat "$WORK/wb.cr_verdict_nit")"
+grep -q '^RESULT=findings live=1 cr=0 gr=0 cr_unconfirmed=1 threads=0 code_scanning=0 unacked=1$' "$WORK/wb.cr_verdict_nit" || fail "nitpick review not gated by unacked alone: $(cat "$WORK/wb.cr_verdict_nit")"
+nd=$(ack --show r5400000002 | grep -F '[review-body r5400000002@' | sed -E 's/.*r5400000002@([0-9a-f]+)\].*/\1/')
+ack "r5400000002@$nd" > "$WORK/ack.cr_nit" 2>&1 || fail "ack of the CR nitpick review failed: $(cat "$WORK/ack.cr_nit")"
+set +e; MODE=full bash "$SCRIPT" test/repo 42 0 1 --reviewer coderabbit --reviewer-grace 0 > "$WORK/wb.cr_verdict_nit_acked" 2>&1; rc=$?; set -e
+[ "$rc" -eq 0 ] || fail "an acked CR nitpick review next to a verdict still blocked, rc=$rc: $(cat "$WORK/wb.cr_verdict_nit_acked")"
+
+# The ONLY CodeRabbit review on the head is a tally-less COMMENTED one: no verdict, so it stays
+# unconfirmed and blocks even once acknowledged (matches pr-findings.sh).
+jq -n '[{id:5400000003,user:{login:"coderabbitai[bot]"},commit_id:"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",state:"COMMENTED",submitted_at:"2026-09-27T16:42:00Z",
+  body:"<details>\n<summary>Nitpick comments (1)</summary>\n\n`1-2`: _Nitpick_ only review\n</details>"}]' > "$REVIEWS_FILE"
+nd=$(ack --show r5400000003 | grep -F '[review-body r5400000003@' | sed -E 's/.*r5400000003@([0-9a-f]+)\].*/\1/')
+ack "r5400000003@$nd" > "$WORK/ack.cr_only" 2>&1 || fail "ack of the lone CR review failed: $(cat "$WORK/ack.cr_only")"
+set +e; MODE=full bash "$SCRIPT" test/repo 42 0 1 --reviewer coderabbit --reviewer-grace 0 > "$WORK/wb.cr_only_unconf" 2>&1; rc=$?; set -e
+# No verdict means the head is not "reviewed": watch-pr keeps waiting (exit 2, never ready)
+# with the unconfirmed review counted in live.
+[ "$rc" -eq 2 ] || fail "a lone tally-less CR review (no verdict) was not held back when acked, rc=$rc: $(cat "$WORK/wb.cr_only_unconf")"
+grep -q 'cr_reviewed=0 .* live=1 (cr=0 gr=0 cr_unconfirmed=1 threads=0 code_scanning=0 unacked=0)' "$WORK/wb.cr_only_unconf" || fail "lone tally-less CR review not counted as unconfirmed: $(cat "$WORK/wb.cr_only_unconf")"
+unset REVIEWS_FILE
+
 # CodeRabbit's walkthrough, its review-command and quota replies and bare trigger commands need no ack.
 jq -n '[
   {id:1,user:{login:"coderabbitai[bot]"},created_at:"2026-09-27T16:00:00Z",updated_at:"2026-09-27T16:54:24Z",body:"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- walkthrough_start -->\nWalkthrough text\n<!-- walkthrough_end -->"},

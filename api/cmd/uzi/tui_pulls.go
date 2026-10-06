@@ -414,6 +414,7 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 		m.fromSplit = m.splitDrawn()
 		m.view = viewPR
 		m.prReturn = viewPulls
+		m.prReturnRunID, m.prReturnRunTarget = "", viewBoard
 		m.forgeNotice = ""
 		return m, (&m).startPRReq()
 	case keyRunLink:
@@ -476,7 +477,7 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case keyTab:
-		// tab cycles floor → pulls → ci → floor, so from the pulls list it advances to ci.
+		// tab cycles floor → workers → pulls → ci → floor, so from the pulls list it advances to ci.
 		return m.gotoCI()
 	case keyViewFloor:
 		// 1 jumps to the floor directly.
@@ -485,7 +486,7 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 	case keyViewPulls:
 		return m, nil // already here
 	case keyViewCI:
-		// 3 jumps to the ci list directly.
+		// 4 jumps to the ci list directly.
 		return m.gotoCI()
 	case keyEsc:
 		// esc on a list returns to the floor (D1).

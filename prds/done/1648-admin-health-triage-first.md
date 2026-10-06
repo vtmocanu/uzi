@@ -77,6 +77,17 @@ Resolved local-code facts at the evidence baseline; the offline worker need not 
 - Right side: one severity badge per non-zero attention severity with its count (for example "3 Danger", "1 Unknown", "1 Warn"). No OK tally here.
 - The header band carries `role="alert"` for danger and `role="status"` otherwise, consistent with `HealthOverviewCard`.
 
+**#2293 supersession (2026-10-05).** The title and locally derived subtitle
+rules above are historical. Health and Overview now share `healthVerdict` title
+and subtitle: instance blockers use a scoped count/cause; owner-only danger
+reads "N checks need attention; no instance-wide blocker detected" (singular
+for one), and warn/unknown use neutral attention copy. The page no longer
+claims "nothing is blocked" or "Work is still flowing". Tone, badges and
+attention items still follow overall severity, retaining owner evidence.
+The banner and snooze follow `blocking`, with conservative legacy fallback
+when that field is absent; see [admin health](../../docs/admin-health.md#mixed-version-web-and-api).
+Completion and milestone checklists below remain the record of this PRD's landing.
+
 Below the band, every attention check, worst first (`attentionChecks`), **all fully expanded** (danger, unknown and warn alike; not a `<details>`): severity badge; title (`font-medium`), summary (`text-muted`), and a faint "· <group title>"; `since` on the right; then "**What to do.**" + action, the evidence `<dl>`, the command with a `Button` Copy, and a faint footer with the check id and its Docs link. For a check whose id starts with `fleet.`, the footer adds "See the affected workers in Fleet ↓", an in-page link to the Fleet card. Each item has `id="c-<check id>"` so in-page links land on it. All text in this card is `text-sm` (14px); evidence and footer `text-xs`.
 
 **D4. All-clear line (no attention checks).** A single-line `Card` instead of the attention card: a 18px ok-tinted check icon, "**All systems normal.** Nothing needs attention." and "refreshes every 10 s" on the right. `na` checks do not break the all-clear state (they are not attention, as today).

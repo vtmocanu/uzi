@@ -154,6 +154,41 @@ check "f: rc=0" rc_is 0
 check "f: ledger var set" test -n "$seen_ledger"
 check "f: ledger outside scratch" test "${seen_ledger#"$seen_tmpdir"/}" = "$seen_ledger"
 
+# A macOS caller commonly ends TMPDIR with a slash. The command must see the same
+# spelling as path.join, while the scratch and ledger still live under our parent.
+rc=0
+TMPDIR="$OUTER///" "$GUARD" "$FAKE" probe "$SEEN" > /dev/null 2> "$ERR" || rc=$?
+seen_ledger="$(sed -n 1p "$SEEN")"
+seen_tmpdir="$(sed -n 2p "$SEEN")"
+normalized_outer="$(printf '%s' "$OUTER" | tr -s '/')"
+check "trailing slash: rc=0" rc_is 0
+check "trailing slash: normalized scratch spelling" test "${seen_tmpdir#"$normalized_outer"/}" != "$seen_tmpdir"
+check "trailing slash: normalized ledger spelling" test "${seen_ledger#"$normalized_outer"/}" != "$seen_ledger"
+no_double_slash() { case "$1" in *//*) return 1 ;; *) return 0 ;; esac; }
+check "trailing slash: scratch has no double slash" no_double_slash "$seen_tmpdir"
+check "trailing slash: ledger has no double slash" no_double_slash "$seen_ledger"
+check "trailing slash: scratch and ledger removed" outer_empty
+
+# Prove the root-only spelling without creating anything at the filesystem root.
+FAKEBIN="$TMP/root-bin"
+mkdir -p "$FAKEBIN"
+REAL_MKTEMP="$(command -v mktemp)"
+cat > "$FAKEBIN/mktemp" <<'EOS'
+#!/bin/sh
+if [ "$1" = -d ]; then
+  case "$2" in /uzi-tmpdir-guard.XXXXXX) ;; *) exit 42 ;; esac
+  exec "$REAL_MKTEMP" -d "$ROOT_PROBE_PARENT/${2##*/}"
+fi
+case "$1" in /uzi-tmpdir-guard-ledger.XXXXXX) ;; *) exit 42 ;; esac
+exec "$REAL_MKTEMP" "$ROOT_PROBE_PARENT/${1##*/}"
+EOS
+chmod +x "$FAKEBIN/mktemp"
+rc=0
+TMPDIR=/ REAL_MKTEMP="$REAL_MKTEMP" ROOT_PROBE_PARENT="$OUTER" PATH="$FAKEBIN:$PATH" \
+  "$GUARD" "$FAKE" clean > /dev/null 2> "$ERR" || rc=$?
+check "root-only TMPDIR: single-slash template is valid" rc_is 0
+check "root-only TMPDIR: owned scratch and ledger removed" outer_empty
+
 echo "cases=$cases passed=$passed"
 if [ "$cases" -eq 0 ] || [ "$passed" -ne "$cases" ]; then
   exit 1

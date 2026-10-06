@@ -1,11 +1,13 @@
 ---
 name: issue-triage
-description: "Triages one GitHub issue on this repo from backlog to a queued or parked decision. Preflight lists spent one-time issue schedules to delete and open issues from non-maintainers, which go first. Then hunts silently un-sweepable issues (a bug/Planned selector without uzi eligibility, or eligible without a selector), then the un-triaged backlog, then parked brainstorm/Later issues. Explains the issue, recommends a verdict, checks freshness (premise, anchors, referenced PR/PRD merged), and on confirmation applies labels plus a freshness comment. A queue audit mode predicts which issues the next sweep fires and freshness-checks each. Use when triaging the backlog, finding issues the sweep never fires, or deciding what to send to uzi. Triggers include triage issue, triage the backlog, un-sweepable issues, next issue to implement, should we do this issue, queue an issue for uzi, clean up fired schedules, what goes to the sweep tonight."
+description: "Triages one GitHub issue on this repo from backlog to a queued or parked decision. Preflight lists spent one-time issue schedules to delete and open issues from non-maintainers, which go first. Then hunts silently un-sweepable issues (a bug/Planned selector without uzi eligibility, or eligible without a selector), then the un-triaged backlog, then parked brainstorm/Later issues, and finds issues missing an area or priority label. Explains the issue, recommends a verdict plus area and priority (references/taxonomy.md), checks freshness (premise, anchors, referenced PR/PRD merged), and on confirmation applies labels plus a freshness comment. A queue audit mode predicts which issues the next sweep fires and freshness-checks each. Use when triaging the backlog, finding issues the sweep never fires, or deciding what to send to uzi. Triggers include triage issue, triage the backlog, categorize issues, prioritize the backlog, un-sweepable issues, next issue to implement, should we do this issue, queue an issue for uzi, clean up fired schedules, what goes to the sweep tonight."
 ---
 
 # Issue triage
 
 One issue per run, or a queue audit (below). GitHub repo `vtmocanu/uzi`: use `gh` only.
+
+Area and priority labels, their rubric, and the labels that must never be renamed: [references/taxonomy.md](references/taxonomy.md). Read it before proposing labels.
 
 Out of scope, read instead:
 - Sweep gating and this instance's schedules: `CLAUDE.local.md` → "uzi scheduled jobs", `docs/scheduling.md`, `docs/admin-settings.md#run-eligibility`. Live truth: `uzi schedule list`.
@@ -68,7 +70,7 @@ uzi schedule list --json | jq '.[] | select(.target=="sweep") | {slug: .catalog_
 
 ## Step 1: Pick
 
-Order: user-named issue → lowest-numbered `external` from 0B → lowest-numbered issue in the highest non-empty tier. When the user asks for newest first, take the highest number instead, at each step.
+Order: user-named issue → lowest-numbered `external` from 0B → `recurring` and not moving (no active run, not fireable per the selector plus eligibility rule below, bot assignment included, no enabled one-time schedule still to fire, not `In Progress`; reconsider its priority with the incident count in the reason) → lowest-numbered issue in the highest non-empty tier. When the user asks for newest first, take the highest number instead, at each step.
 
 A sweep fires an issue only with BOTH a selector (`Planned`, or `bug`) AND eligibility (`uzi` label OR assigned to the uzi-bot account). Missing either half = looks queued, never runs.
 
@@ -102,7 +104,21 @@ gh issue list --repo vtmocanu/uzi --state open --json number,title,labels,assign
     | sort | .[]'
 ```
 
-Confirm the pick with the user. Gap issues still run Steps 2 to 4: the gap names the missing label, not whether adding it is right.
+**Categorization gap** (any tier, `reviewed` included): open issues missing an `area::*` or a `priority::*` label.
+
+```sh
+set -o pipefail
+gh issue list --repo vtmocanu/uzi --state open --limit 400 --json number,title,labels \
+  | jq -r '.[] | [.labels[].name] as $n
+      | [(if any($n[]; startswith("area::")) then empty else "area" end),
+         (if any($n[]; startswith("priority::")) then empty else "priority" end)] as $miss
+      | select($miss | length > 0)
+      | "#\(.number)\tmissing:\($miss | join("+"))\t[\($n | join(","))]\t\(.title[0:64])"'
+```
+
+Run Steps 2 and 3 on each and batch several into one proposal. A categorization-only change (area or priority, no selector, eligibility or verdict change) skips Step 4; any change that can make the issue fire is a dispatch gap and runs Steps 2 to 4.
+
+Confirm the pick with the user. Dispatch-gap issues still run Steps 2 to 4: the gap names the missing label, not whether adding it is right.
 
 ## Step 2: Explain
 
@@ -122,6 +138,7 @@ One verdict, one-line reason. Apply only after Step 5 confirmation.
 | **Already done** | premise gone (verified in code) | recommend close; cite code |
 | **Not worth it** | duplicate / invalid / out of scope | rationale comment + `wontfix`/`duplicate`/`invalid` |
 
+- Every verdict also names one `area::*` and one `priority::*` with its one-sentence reason (references/taxonomy.md). Leave either off when the evidence does not support it.
 - Recommend the best-practice option and say why.
 - No `prds/*.md` for a spec-in-body issue; `uzi` label suffices.
 - Tier 1: add only the missing half (1A → `uzi` or bot assignee; 1B → selector).
@@ -145,9 +162,11 @@ Do not trust issue line numbers.
 Labels and comments are public writes: propose first, apply on OK.
 
 ```sh
-gh issue edit NNN --repo vtmocanu/uzi --add-label "SELECTOR" --add-label "uzi"
+gh issue edit NNN --repo vtmocanu/uzi --add-label "SELECTOR" --add-label "uzi" --add-label "area::AREA" --add-label "priority::PRIO" \
+  --remove-label "area::OLD" --remove-label "priority::OLD"   # only the superseded ones it carries
 gh issue comment NNN --repo vtmocanu/uzi --body "$(cat <<'EOF'
 Queued for the nightly SELECTOR sweep (SELECTOR + uzi added; spec-in-body).
+Priority PRIO because X happens under Y; workaround Z.
 [anchor refresh + any pinned design direction from Step 4]
 EOF
 )"

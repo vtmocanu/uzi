@@ -60,6 +60,9 @@
 #      unacknowledged comments (RESULT splits them: cr= gr= cr_unconfirmed= threads=
 #      code_scanning= unacked=; the blocker rows print just above it). live= sums the
 #      gating parts: every open thread, the counted bots' non-thread findings, alerts, acks.
+#      cr_unconfirmed= is the raw count of tally-less non-APPROVED CodeRabbit reviews on the
+#      head; it adds to live= only while CodeRabbit has no verdict on the head. With a
+#      verdict, such a review body is gated by unacked= alone (clears once acknowledged).
 #   4  mr_rework active — an mr_rework run is on this MR; defer, let it finish, re-run.
 #   5  CodeRabbit rate-limited on this head, CI settled, and no Greptile review either.
 #      Prints CR_RESET_MIN=<n> when the walkthrough names the reset window. Wait it out
@@ -276,8 +279,10 @@ while [ "$i" -lt "$MAX" ]; do
   # (its clean pass: empty, tally-less body) or one carrying the "Actionable comments
   # posted: N" tally. A tally-less COMMENTED/CHANGES_REQUESTED review on the head is NOT a
   # verdict: CodeRabbit puts grouped / outside-diff findings in that review BODY, which the
-  # inline count below never sees, so it is counted as an UNCONFIRMED finding instead
-  # (pr-findings.sh classifies it the same way). Two gotchas handled here: `gh api --jq`
+  # inline count below never sees, so it is counted as an UNCONFIRMED finding instead when
+  # the head has no verdict (cr_reviewed=0: no APPROVED or tallied review on it). Next to a verdict,
+  # that body is gated by the every-author ack (unacked) only; see the live computation.
+  # Two gotchas handled here: `gh api --jq`
   # does NOT accept jq's --arg (so the head SHA is passed to standalone jq), and `gh api
   # --paginate` emits one array PER PAGE (so pages are slurped with `-s`/`.[][]`).
   cr_reviewed=0; cr_unconfirmed=0
@@ -545,7 +550,13 @@ while [ "$i" -lt "$MAX" ]; do
     greptile)   cr_counts=0 ;;
   esac
   live=0
-  [ "$cr_counts" -eq 1 ] && live=$(( live + cr_unconfirmed ))
+  # cr_unconfirmed gates only while CodeRabbit has NO verdict on the head (cr_reviewed=0:
+  # no same-head APPROVED, tallied or walkthrough-covered review, whatever the review order).
+  # Once a verdict exists, an extra tally-less COMMENTED review body is
+  # gated by the every-author unacked count below (it blocks until acknowledged), so counting
+  # it here too would hold watch-pr at findings forever after the ack. The poll and RESULT
+  # lines still print the raw cr_unconfirmed count.
+  [ "$cr_counts" -eq 1 ] && [ "$cr_reviewed" -eq 0 ] && live=$(( live + cr_unconfirmed ))
   [ "$gr_counts" -eq 1 ] && live=$(( live + gr_live ))
 
   # Author-agnostic blockers (lib/pr-comments.sh), counted whatever --reviewer says: every

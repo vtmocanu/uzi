@@ -19,19 +19,30 @@ vi.mock("../lib/api", async (importActual) => {
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
 
 const mockApi = vi.mocked(api);
-const refresh = vi.fn();
+const updateUser = vi.fn();
+const confirmedUser: User = {
+  id: "u1", email: "alice@example.com", display_name: "Alice",
+  is_admin: false, is_active: true, autopilot_enabled: false,
+  judge_enabled: false, ci_autofix_enabled: null, attribution_enabled: true,
+  ephemeral_workers_enabled: false, ephemeral_docker_enabled: false,
+  wait_on_limit: false, notify_early_limit_reset: true,
+  judge_anthropic_secret_id: null, judge_anthropic_secret_label: null,
+  judge_anthropic_bind_mode: "default", created_at: "2026-01-01T00:00:00Z",
+  last_login: null,
+};
 
-// HostedWorkers reads only `user` and `refresh()` from the auth context, so a light
+// HostedWorkers reads only `user` and `updateUser()` from the auth context, so a light
 // stub (the AdminUsers.test.tsx convention) is enough; the cast keeps it type-safe
 // without spelling out the whole AuthState.
 function mockUser(over: Partial<User> = {}) {
   vi.mocked(useAuth).mockReturnValue({
-    user: { ephemeral_workers_enabled: false, ...over } as User,
-    refresh,
+    user: { ...confirmedUser, ...over },
+    updateUser,
   } as unknown as ReturnType<typeof useAuth>);
 }
 
 beforeEach(() => {
+  updateUser.mockReset();
   mockUser();
 });
 
@@ -291,17 +302,23 @@ describe("HostedWorkers provisioning", () => {
     expect(screen.queryByRole("status")).toBeNull();
   });
 
-  it("defaults to compose parity — the base template at M", async () => {
-    // M, not S: it is what the repo's own sizing formula computes as the floor for a
-    // working worker (1 run slot + 1 unturnoffable chat session, + headroom = 4 GiB),
-    // and it matches both compose's AGENT_MEM_LIMIT default and the k8s block in
-    // docs/worker-setup.md. It is the preset a user hands themselves by not choosing,
-    // so it must be the known-good one rather than the cheapest.
+  it("preselects the large hosted size when provisioning without a size change", async () => {
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
     mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
     renderCard(0);
+    expect((await screen.findByLabelText("Hosted worker size") as HTMLSelectElement).value).toBe("l");
     fireEvent.click(await provisionButton());
-    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("base", "m", false));
+    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("base", "l", false));
+  });
+
+  it("resets a chosen size to large after successful provisioning", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
+    mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
+    renderCard(0);
+    fireEvent.change(await screen.findByLabelText("Hosted worker size"), { target: { value: "s" } });
+    fireEvent.click(await provisionButton());
+    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("base", "s", false));
+    await waitFor(() => expect((screen.getByLabelText("Hosted worker size") as HTMLSelectElement).value).toBe("l"));
   });
 
   it("shows the 409 quota refusal verbatim (the server's words, not ours)", async () => {
@@ -364,7 +381,7 @@ describe("HostedWorkers ephemeral auto-provision toggle (PRD #649)", () => {
     expect((await toggle()).getAttribute("aria-checked")).toBe("false");
   });
 
-  it("associates the experimental/cold-start caveat with the toggle via aria-describedby", async () => {
+  it("associates the shared provisioning description with the toggle via aria-describedby", async () => {
     // The informed-consent caveat must be programmatically linked so a screen reader
     // reads it alongside the switch's name.
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: true });
@@ -373,18 +390,19 @@ describe("HostedWorkers ephemeral auto-provision toggle (PRD #649)", () => {
     const describedby = (await toggle()).getAttribute("aria-describedby");
     expect(describedby).toBeTruthy();
     const caveat = document.getElementById(describedby as string);
-    expect(caveat?.textContent).toMatch(/experimental/i);
-    expect(caveat?.textContent).toMatch(/cold start/i);
+    expect(caveat?.textContent).toMatch(/every capable worker stays busy/);
+    expect(caveat?.textContent).toMatch(/kept warm/);
+    expect(caveat?.textContent).toMatch(/ephemeral limit/);
   });
 
-  it("writes the opt-in and refreshes the session on toggle", async () => {
+  it("writes the opt-in and updates auth with the saved user on toggle", async () => {
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: true });
-    mockApi.setEphemeralWorkersEnabled.mockResolvedValue({ user: {} as User });
+    mockApi.setEphemeralWorkersEnabled.mockResolvedValue({ user: { ...confirmedUser, ephemeral_workers_enabled: true } });
     mockUser({ ephemeral_workers_enabled: false });
     renderCard(0);
     fireEvent.click(await toggle());
     await waitFor(() => expect(mockApi.setEphemeralWorkersEnabled).toHaveBeenCalledWith(true));
-    await waitFor(() => expect(refresh).toHaveBeenCalled());
+    await waitFor(() => expect(updateUser).toHaveBeenCalledWith({ ...confirmedUser, ephemeral_workers_enabled: true }));
   });
 
   it("surfaces a write failure in the toggle's own local alert (not the manual form's)", async () => {
@@ -401,7 +419,7 @@ describe("HostedWorkers ephemeral auto-provision toggle (PRD #649)", () => {
     // The local ephemeral error slot renders an alert beside the toggle.
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toBe("boom");
-    expect(refresh).not.toHaveBeenCalled();
+    expect(updateUser).not.toHaveBeenCalled();
   });
 
   it("is ABSENT when the admin gate is off, while the manual form still shows", async () => {
@@ -423,5 +441,126 @@ describe("HostedWorkers ephemeral auto-provision toggle (PRD #649)", () => {
     // No manual provision affordance at quota 0.
     expect(screen.queryByLabelText("Hosted worker size")).toBeNull();
     expect(screen.queryByRole("button", { name: /provision/i })).toBeNull();
+  });
+});
+
+
+describe("HostedWorkers ephemeral Docker preference", () => {
+  const dockerBox = () => screen.findByRole("checkbox", { name: "Docker-capable ephemeral workers" });
+  const autoSwitch = () => screen.getByRole("switch", { name: "Auto-provision on demand" });
+
+  it.each([undefined, false])("hides Docker and its sentence when tier flag is %s (old API compatibility)", async (tier) => {
+    // Omit the field entirely for the old-API mount case.
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 0, ephemeral_enabled: true,
+      ...(tier === undefined ? {} : { docker_enabled: tier }) });
+    renderCard();
+    await screen.findByText("Ephemeral workers");
+    expect(screen.queryByRole("checkbox", { name: "Docker-capable ephemeral workers" })).toBeNull();
+    expect(document.getElementById("ephemeral-toggle-desc")?.textContent).not.toContain("Docker-capable includes");
+    expect(autoSwitch()).toBeTruthy();
+    expect(screen.queryByText("Persistent worker")).toBeNull();
+  });
+
+  it("renders independent subsections and one row with shared approved copy", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: true, docker_enabled: true });
+    renderCard();
+    const checkbox = await dockerBox();
+    expect(screen.getByText("Persistent worker")).toBeTruthy();
+    expect(screen.getByText("Ephemeral workers")).toBeTruthy();
+    expect(screen.getByText(/Runs in the cluster/).textContent).toBe(
+      "Runs in the cluster, not on your machine: no join token, no container to start. It shows up under Your workers and you delete it there. Docker-capable gives it a Docker daemon for container builds and tests, at extra CPU and storage.",
+    );
+    expect(checkbox.parentElement?.parentElement).toBe(autoSwitch().parentElement?.parentElement);
+    expect(checkbox.getAttribute("aria-describedby")).toBe(autoSwitch().getAttribute("aria-describedby"));
+    const copy = document.getElementById("ephemeral-toggle-desc")?.textContent;
+    expect(copy).toContain("Docker-capable includes Docker for repositories your admin allows, at extra CPU and storage.");
+    expect(copy).toMatch(/every capable worker stays busy/);
+    expect(document.body.textContent).not.toMatch(/experimental|2\.6|rootless/i);
+  });
+
+  it("hides the ephemeral subsection under the admin gate even with the Docker tier", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false, docker_enabled: true });
+    renderCard();
+    await screen.findByText("Persistent worker");
+    expect(screen.queryByText("Ephemeral workers")).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: "Docker-capable ephemeral workers" })).toBeNull();
+  });
+
+  it("retains Docker and lets it be changed while auto-provision is off", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 0, ephemeral_enabled: true, docker_enabled: true });
+    mockUser({ ephemeral_docker_enabled: true });
+    mockApi.setEphemeralWorkersEnabled.mockResolvedValue({ user: confirmedUser });
+    renderCard();
+    const checkbox = await dockerBox() as HTMLInputElement;
+    expect(checkbox.checked).toBe(true);
+    expect(checkbox.disabled).toBe(false);
+    expect(autoSwitch().getAttribute("aria-checked")).toBe("false");
+    fireEvent.click(checkbox);
+    await waitFor(() => expect(mockApi.setEphemeralWorkersEnabled).toHaveBeenCalledWith({ docker: false }));
+  });
+
+  it.each(["docker", "enabled"] as const)("locks both controls through %s save, then applies the authoritative response", async (field) => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 0, ephemeral_enabled: true, docker_enabled: true });
+    let finishWrite!: (result: { user: User }) => void;
+    mockApi.setEphemeralWorkersEnabled.mockReturnValue(new Promise((resolve) => { finishWrite = resolve; }));
+    updateUser.mockImplementation((savedUser: User) => mockUser(savedUser));
+    const { rerender } = render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onShowWorkers={() => {}} />);
+    const checkbox = await dockerBox() as HTMLInputElement;
+    fireEvent.click(field === "docker" ? checkbox : autoSwitch());
+    expect(mockApi.setEphemeralWorkersEnabled).toHaveBeenCalledWith(field === "docker" ? { docker: true } : true);
+    expect(checkbox.disabled).toBe(true);
+    expect(autoSwitch().hasAttribute("disabled")).toBe(true);
+    fireEvent.click(field === "docker" ? autoSwitch() : checkbox);
+    expect(mockApi.setEphemeralWorkersEnabled).toHaveBeenCalledTimes(1);
+    const savedUser = { ...confirmedUser,
+      ephemeral_docker_enabled: field === "docker", ephemeral_workers_enabled: field === "enabled" };
+    finishWrite({ user: savedUser });
+    await waitFor(() => expect(updateUser).toHaveBeenCalledWith(savedUser));
+    rerender(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} onShowWorkers={() => {}} />);
+    await waitFor(() => expect(checkbox.disabled).toBe(false));
+    expect(autoSwitch().hasAttribute("disabled")).toBe(false);
+    expect(checkbox.checked).toBe(field === "docker");
+    expect(autoSwitch().getAttribute("aria-checked")).toBe(String(field === "enabled"));
+  });
+
+  it("restores auto-provision and releases both controls after an enabled write fails", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 0, ephemeral_enabled: true, docker_enabled: true });
+    mockUser({ ephemeral_workers_enabled: true, ephemeral_docker_enabled: true });
+    let rejectWrite!: (error: ApiError) => void;
+    mockApi.setEphemeralWorkersEnabled.mockReturnValue(new Promise((_resolve, reject) => { rejectWrite = reject; }));
+    renderCard();
+    const checkbox = await dockerBox() as HTMLInputElement;
+    fireEvent.click(autoSwitch());
+    expect(mockApi.setEphemeralWorkersEnabled).toHaveBeenCalledWith(false);
+    expect(checkbox.disabled).toBe(true);
+    expect(autoSwitch().hasAttribute("disabled")).toBe(true);
+    rejectWrite(new ApiError(500, "auto-provision update failed"));
+    expect((await screen.findByRole("alert")).textContent).toBe("auto-provision update failed");
+    expect(autoSwitch().getAttribute("aria-checked")).toBe("true");
+    expect(checkbox.checked).toBe(true);
+    expect(checkbox.disabled).toBe(false);
+    expect(autoSwitch().hasAttribute("disabled")).toBe(false);
+    expect(updateUser).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [false, 400, 'json: unknown field "docker"'],
+    [true, 500, "preference update failed"],
+  ] as const)("restores confirmed Docker %s after rejection (%s)", async (confirmed, status, message) => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 0, ephemeral_enabled: true, docker_enabled: true });
+    mockUser({ ephemeral_docker_enabled: confirmed });
+    let rejectWrite!: (error: ApiError) => void;
+    mockApi.setEphemeralWorkersEnabled.mockReturnValue(new Promise((_resolve, reject) => { rejectWrite = reject; }));
+    renderCard();
+    const checkbox = await dockerBox() as HTMLInputElement;
+    fireEvent.click(checkbox);
+    expect(checkbox.disabled).toBe(true);
+    expect(autoSwitch().hasAttribute("disabled")).toBe(true);
+    rejectWrite(new ApiError(status, message));
+    expect((await screen.findByRole("alert")).textContent).toBe(message);
+    expect(checkbox.checked).toBe(confirmed);
+    expect(checkbox.disabled).toBe(false);
+    expect(autoSwitch().hasAttribute("disabled")).toBe(false);
+    expect(updateUser).not.toHaveBeenCalled();
   });
 });

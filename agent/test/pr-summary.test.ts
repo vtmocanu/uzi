@@ -209,10 +209,14 @@ describe("verifiedAtSha stamp (PRD #1798 M2)", () => {
 
   it("returns undefined (never throws) for a missing directory or a repo with no commit", async () => {
     const empty = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-prsum-empty-"));
+    const previousCeiling = process.env.GIT_CEILING_DIRECTORIES;
     try {
+      process.env.GIT_CEILING_DIRECTORIES = path.dirname(fs.realpathSync(empty));
       assert.equal(await readWorktreeHeadSha(path.join(empty, "missing")), undefined);
       assert.equal(await readWorktreeHeadSha(empty), undefined, "not a repository");
     } finally {
+      if (previousCeiling === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+      else process.env.GIT_CEILING_DIRECTORIES = previousCeiling;
       fs.rmSync(empty, { recursive: true, force: true });
     }
   });
@@ -243,10 +247,23 @@ describe("implement prompt pr_summary ask (PRD #1798 M2)", () => {
 });
 
 describe("issue #1783 × PRD #1798: the pr_summary HEAD read is a marked, transport-pinned runner git", () => {
-  it("carries the worker mark and GIT_ALLOW_PROTOCOL=none on top of GIT_NO_LAZY_FETCH", () => {
-    const env = worktreeHeadShaEnv();
-    assert.ok(env[WORKER_SPAWN_ENV], "worker-marked: a concurrent quiescence scan must not read it as run residue");
-    assert.equal(env.GIT_ALLOW_PROTOCOL, "none", "every transport pinned off, independent of the lazy-fetch pin");
-    assert.equal(env.GIT_NO_LAZY_FETCH, "1");
+  it("passes only the named discovery ceiling alongside the worker mark and transport pins", () => {
+    const previousCeiling = process.env.GIT_CEILING_DIRECTORIES;
+    try {
+      for (const ceiling of [undefined, "", path.dirname(fs.realpathSync(os.tmpdir()))]) {
+        if (ceiling === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+        else process.env.GIT_CEILING_DIRECTORIES = ceiling;
+        const env = worktreeHeadShaEnv();
+        assert.equal(env.GIT_CEILING_DIRECTORIES, ceiling, "the named ceiling is passed through exactly");
+        assert.equal(Object.hasOwn(env, "GIT_CEILING_DIRECTORIES"), ceiling !== undefined);
+        assert.ok(env[WORKER_SPAWN_ENV], "worker-marked: a concurrent quiescence scan must not read it as run residue");
+        assert.equal(env.GIT_ALLOW_PROTOCOL, "none", "every transport pinned off, independent of the lazy-fetch pin");
+        assert.equal(env.GIT_NO_LAZY_FETCH, "1");
+      }
+    } finally {
+      if (previousCeiling === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+      else process.env.GIT_CEILING_DIRECTORIES = previousCeiling;
+    }
+    assert.equal(worktreeHeadShaEnv().GIT_CEILING_DIRECTORIES, previousCeiling, "the prior ceiling is restored");
   });
 });

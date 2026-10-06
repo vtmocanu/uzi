@@ -65,6 +65,7 @@ func main() {
 		log.Error("kube client: this controller must run in-cluster with its own ServiceAccount", "error", err)
 		os.Exit(1)
 	}
+	restCfg.Wrap(kube.WrapMaintenanceReads)
 	kubeClient, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
 		log.Error("kube client", "error", err)

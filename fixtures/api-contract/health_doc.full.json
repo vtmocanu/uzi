@@ -1,5 +1,6 @@
 {
   "status": "x",
+  "blocking": true,
   "checked_at": "x",
   "counts": {
     "ok": 1,
@@ -14,6 +15,7 @@
     {
       "id": "x",
       "group": "x",
+      "scope": "x",
       "title": "x",
       "severity": "x",
       "summary": "x",

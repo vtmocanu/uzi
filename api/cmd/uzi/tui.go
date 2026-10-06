@@ -70,6 +70,8 @@ type tuiView int
 const (
 	viewBoard tuiView = iota
 	viewDetail
+	viewWorkers
+	viewWorker
 	// viewPulls is the forge `pulls` list screen (PRD #1255 M4a). viewCI is the forge
 	// `ci` list screen (PRD #1255 M4b). viewPR is the PR drill-in (PRD #1255 M5) — a peer of
 	// viewDetail, opened from the pulls list (enter/→) or the run view (m). viewCIRun is the
@@ -256,7 +258,10 @@ type streamEventsMsg struct {
 
 // pollFallbackMsg drives the D8 degradation: when the socket is unreachable the detail
 // view falls back to the same 2s REST poll `uzi run logs --follow` uses.
-type pollFallbackMsg struct{}
+type pollFallbackMsg struct {
+	runID string
+	gen   uint64
+}
 
 // detailMetaMsg carries a fresh run DTO for the drilled-in run, so the detail view's
 // non-streamed fields (milestones, health, kind, title, duration) stay current while the
@@ -293,9 +298,15 @@ type tuiModel struct {
 	// splitLatch changes only on resize; bottomTab survives collapse and drill-ins.
 	splitLatch, splitOff, fromSplit bool
 	splitMode                       string
+	topTab                          tuiView
 	bottomTab                       tuiView
 	boardReplied                    bool
 	splitNote                       string
+	workerDetail                    workerDetailState
+	workerOrigin                    workerOrigin
+	workerNav                       workerNavigation
+	workerGen                       uint64
+	workers                         workersState
 	board                           boardState
 	detail                          detailState
 	// pulls is the forge `pulls` screen's state (PRD #1255 M4a). It carries its OWN
@@ -316,10 +327,12 @@ type tuiModel struct {
 	// (D1): the PR view returns to prReturn (the pulls list, or the run view on detail→m→PR), and
 	// the run view returns to detailReturn (the board by default, or pulls / PR on a u ↳ run jump).
 	// prReturn defaults to viewPulls; detailReturn to viewBoard (the zero value), so the existing
-	// board↔detail behaviour is unchanged. The state returned to is never clobbered — m.pulls /
-	// m.detail persist on the model — so it is still loaded when esc lands back on it.
-	prReturn     tuiView
-	detailReturn tuiView
+	// board↔detail behaviour is unchanged. PR run returns retain only an ID and target;
+	// the run is reopened in a fresh session on return.
+	prReturn          tuiView
+	prReturnRunID     string
+	prReturnRunTarget tuiView
+	detailReturn      tuiView
 	// forgeNotice is the transient one-line confirmation / server-reason a w (rework) / f (fix ci)
 	// action leaves, drawn in the PR view's and the pulls screen's header-note area (D1/D12). It is
 	// set by prActionMsg, overwritten by the next action, and cleared when a PR view is opened fresh
@@ -519,6 +532,10 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 		m.view = viewDetail
 		m.detail = newDetailState(startRun)
 	}
+	if m.workersVisible() {
+		m.workers.active = true
+		m.workers.reqSeq, m.workers.waitID = 1, 1
+	}
 	return m
 }
 
@@ -550,6 +567,9 @@ func (m tuiModel) initCmds() []tea.Cmd {
 		// nothing.
 		ciRunTickAfter(ciRunPollInterval, m.cirun.tickGen),
 		tea.RequestBackgroundColor}
+	if m.workers.active {
+		cmds = append(cmds, m.fetchWorkersCmd(m.board.admin, m.workers.waitID))
+	}
 	if m.skewCheck {
 		cmds = append(cmds, m.fetchBuildInfoCmd(), skewTickCmd())
 	}
@@ -884,11 +904,17 @@ func readStreamCmd(runID string, gen uint64, s *uzicli.RunStream) tea.Cmd {
 // var so a test can shrink it and drain the re-armed tick without blocking on the real 2s.
 var pollFallbackInterval = 2 * time.Second
 
-func pollFallbackCmd() tea.Cmd {
-	return tea.Tick(pollFallbackInterval, func(time.Time) tea.Msg { return pollFallbackMsg{} })
+func pollFallbackCmd(runID string, gen uint64) tea.Cmd {
+	return tea.Tick(pollFallbackInterval, func(time.Time) tea.Msg { return pollFallbackMsg{runID: runID, gen: gen} })
 }
 
 func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.update(msg)
+	n := next.(tuiModel)
+	return n.reconcileWorkers(cmd)
+}
+
+func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -984,6 +1010,17 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(m.fetchBuildInfoCmd(), skewTickCmd())
 
+	case workerRunMsg:
+		return m.applyWorkerRun(msg)
+	case runWorkerMsg:
+		return m.applyRunWorker(msg)
+	case workersMsg:
+		return m.applyWorkers(msg)
+	case workersTickMsg:
+		if msg.gen != m.workers.tickGen || !m.workersVisible() || m.workers.waitID != 0 {
+			return m, nil
+		}
+		return m, (&m).startWorkersReq()
 	case boardRunsMsg:
 		// Drop a stale/out-of-order reply (PRD #1130 M1 D2): bubbletea runs each Cmd in its own
 		// goroutine and delivers in completion order, so an older board poll can resolve after a
@@ -993,7 +1030,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.board.waitID = 0
+		oldAdmin := m.board.admin
 		m.board.apply(msg)
+		var workersRefresh tea.Cmd
+		if oldAdmin != m.board.admin {
+			workersRefresh = tea.Batch((&m).startBoardReq(), (&m).startWorkersReq())
+		}
 		firstReply := !m.boardReplied
 		m.boardReplied = true
 		var activation tea.Cmd
@@ -1006,7 +1048,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// tickGen first so this new chain supersedes any tick a manual/admin refresh left
 		// pending — only one tick chain stays live.
 		m.board.tickGen++
-		return m, tea.Batch(tickAfter(boardTickInterval(m.board.errStreak), m.board.tickGen), m.maybeArmBlink(), activation)
+		return m, tea.Batch(tickAfter(boardTickInterval(m.board.errStreak), m.board.tickGen), m.maybeArmBlink(), activation, workersRefresh)
 
 	case reposMsg:
 		// The forge views' repo scope (PRD #1255 D2). A failure is recorded (the pulls scope
@@ -1402,7 +1444,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.maybeArmBlink()
 
 	case runInputsMsg:
-		if msg.runID != m.detail.runID {
+		if msg.runID != m.detail.runID || msg.gen != m.detail.gen {
 			return m, nil
 		}
 		m.detail.steer.access = steerAccessFor(m.detail.run, msg.err)
@@ -1412,7 +1454,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case steerResultMsg:
-		if msg.runID != m.detail.runID {
+		if msg.runID != m.detail.runID || msg.gen != m.detail.gen {
 			return m, nil
 		}
 		m.applySteerResult(msg)
@@ -1427,7 +1469,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.fetchInputsCmd(m.detail.runID)
 
 	case reviewLoadedMsg:
-		if msg.runID != m.detail.runID {
+		if msg.runID != m.detail.runID || msg.gen != m.detail.gen {
 			return m, nil
 		}
 		m.detail.review.loading = false
@@ -1439,7 +1481,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case dispositionDoneMsg:
-		if msg.runID != m.detail.runID {
+		if msg.runID != m.detail.runID || msg.gen != m.detail.gen {
 			return m, nil
 		}
 		if msg.err != nil {
@@ -1464,7 +1506,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// the same 2s REST poll `uzi run logs --follow` uses and say so on screen.
 			m.detail.streamErr = msg.err
 			m.detail.polling = true
-			return m, pollFallbackCmd()
+			return m, pollFallbackCmd(m.detail.runID, m.detail.gen)
 		}
 		m.detail.stream = msg.stream
 		m.detail.streamErr = nil
@@ -1502,15 +1544,15 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.detail.stream = nil
 			m.detail.streamErr = msg.err
 			m.detail.polling = true
-			return m, pollFallbackCmd()
+			return m, pollFallbackCmd(m.detail.runID, m.detail.gen)
 		}
 		return m, readStreamCmd(msg.runID, msg.gen, m.detail.stream)
 
 	case pollFallbackMsg:
-		if m.view != viewDetail || !m.detail.polling {
+		if msg.runID != m.detail.runID || msg.gen != m.detail.gen || m.view != viewDetail || !m.detail.polling {
 			return m, nil
 		}
-		cmds := []tea.Cmd{pollFallbackCmd()} // always re-arm the 2s tick while polling
+		cmds := []tea.Cmd{pollFallbackCmd(m.detail.runID, m.detail.gen)} // always re-arm the 2s tick while polling
 		if m.detail.metaWaitID == 0 {
 			cmds = append(cmds, (&m).startDetailMetaReq()) // one meta refresh, guarded (#1135)
 		}
@@ -1532,6 +1574,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
+	next, cmd := m.handleKeyInner(k)
+	n := next.(tuiModel)
+	return n.reconcileWorkers(cmd)
+}
+
+func (m tuiModel) handleKeyInner(k string) (tea.Model, tea.Cmd) {
 	// q quits immediately (user preference). ctrl+c still routes through a confirm modal so a
 	// stray ctrl+c cannot drop a watched run; a second ctrl+c quits at once.
 	if k == keyCtrlC {
@@ -1590,50 +1638,30 @@ func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
 			m.splitNote = "terminal too small to split"
 			return m, nil
 		}
+		if v, ok := stripDestination(m.view, k); ok {
+			return m.gotoList(v)
+		}
 		if m.splitDrawn() {
 			switch k {
-			case keyTab, "shift+tab":
-				if k == keyTab {
-					switch m.view {
-					case viewBoard:
-						return m.gotoCI()
-					case viewCI:
-						return m.gotoPulls()
-					default:
-						m.setListView(viewBoard)
-						return m, nil
-					}
-				}
-				switch m.view {
-				case viewBoard:
-					return m.gotoPulls()
-				case viewPulls:
-					return m.gotoCI()
-				default:
-					m.setListView(viewBoard)
-					return m, nil
-				}
 			case "ctrl+w":
-				if m.view == viewBoard {
+				if m.view == viewBoard || m.view == viewWorkers {
 					return m.focusBottom()
 				}
-				m.setListView(viewBoard)
+				m.setListView(m.top())
 				return m, nil
-			case keyEsc, keyViewFloor:
-				if m.view != viewBoard {
-					m.setListView(viewBoard)
-					return m, nil
-				}
-			case keyViewPulls:
-				return m.gotoPulls()
-			case keyViewCI:
-				return m.gotoCI()
+			case keyEsc:
+				m.setListView(m.top())
+				return m, nil
 			}
 		}
 	}
 	switch m.view {
 	case viewBoard:
 		return m.boardKey(k)
+	case viewWorker:
+		return m.workerKey(k)
+	case viewWorkers:
+		return m.workersKey(k)
 	case viewPulls:
 		return m.pullsKey(k)
 	case viewCI:
@@ -1648,7 +1676,8 @@ func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
 }
 
 func (m tuiModel) filtering() bool {
-	return (m.view == viewBoard && m.board.filtering) ||
+	return (m.view == viewWorkers && m.workers.filtering) ||
+		(m.view == viewBoard && m.board.filtering) ||
 		(m.view == viewPulls && m.pulls.filtering) ||
 		(m.view == viewCI && m.ci.filtering)
 }
@@ -1681,6 +1710,10 @@ func (m tuiModel) View() tea.View {
 		body = m.renderSplit()
 	case m.view == viewDetail:
 		body = m.renderDetail()
+	case m.view == viewWorker:
+		body = m.renderWorker()
+	case m.view == viewWorkers:
+		body = m.renderWorkers()
 	case m.view == viewPulls:
 		body = m.renderPulls()
 	case m.view == viewCI:
@@ -1702,17 +1735,14 @@ func (m tuiModel) renderHelp() string {
 		var splitLines []string
 		for _, line := range lines {
 			if strings.HasPrefix(line, "tab ") {
-				splitLines = append(splitLines, "tab        cycle floor, ci, pulls")
-				if m.view == viewBoard {
-					splitLines = append(splitLines, "1 / 2 / 3  focus floor / pulls / ci")
-				}
-			} else if strings.HasPrefix(line, "1 / 2 / 3 ") {
-				splitLines = append(splitLines, "1 / 2 / 3  focus floor / pulls / ci")
+				splitLines = append(splitLines, "tab        cycle floor, workers, pulls, ci")
+			} else if strings.HasPrefix(line, "1 / 2 / 3 / 4 ") {
+				splitLines = append(splitLines, "1/2 top floor/workers · 3/4 bottom pulls/ci")
 			} else {
 				splitLines = append(splitLines, line)
 			}
 		}
-		lines = append(splitLines, "shift+tab  cycle floor, pulls, ci", "ctrl+w     switch pane focus", "s          collapse / restore split")
+		lines = append(splitLines, "shift+tab  cycle ci, pulls, workers, floor", "ctrl+w     switch pane focus", "s          collapse / restore split")
 	}
 	return m.pal.title.Render("keybindings") + "\n\n" +
 		strings.Join(lines, "\n") + "\n\n" +

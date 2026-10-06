@@ -430,11 +430,11 @@ func TestTUIBoardAdminToggleSupersedesPeriodicReply(t *testing.T) {
 	}
 
 	// The admin reply (current reqID) is refused by the server: apply records the denial and falls
-	// back to own runs, and the reqID-matching case still clears the guard.
+	// back to own runs, clears the old guard, and immediately issues a fresh own-scope request.
 	next, _ = m.Update(boardRunsMsg{reqID: adminID, admin: true, err: uzicli.Exitf(uzicli.ExitAuth, "admin access required")})
 	m = next.(tuiModel)
-	if m.board.waitID != 0 {
-		t.Fatal("the admin reply did not clear the guard")
+	if m.board.waitID <= adminID {
+		t.Fatal("the admin reply did not supersede the guard with an own-scope request")
 	}
 	if m.board.admin {
 		t.Error("a refused admin reply left the board in admin mode; apply must fall back to own runs")

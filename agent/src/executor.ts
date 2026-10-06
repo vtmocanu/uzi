@@ -272,6 +272,8 @@ export interface RunContext {
    *  lead is warned before a queued follow-up written against the destroyed tree arrives.
    *  Optional; absent ⇒ false (the stub executor and older callers ignore it). */
   resumed?: boolean;
+  /** Docker-wired resumed attempt: pre-pause Docker fixtures may be gone, even without a session. */
+  dockerScratchResume?: boolean;
   /** PRD #35 Decision 6b + PRD #209 D4: this run's plan is ALREADY APPROVED, so the
    *  executor skips the Phase-1 planning turn and the gate and goes straight to
    *  implement⇄review with `approvedPlan` below.
@@ -1188,7 +1190,13 @@ const WORKTREE_HEAD_SHA_ARGS = ["rev-parse", "--verify", "HEAD^{commit}"] as con
  * (runnerGitSpawnEnv).
  */
 export function worktreeHeadShaEnv(): NodeJS.ProcessEnv {
-  const env = runnerGitSpawnEnv(WORKTREE_HEAD_SHA_ARGS, { ...gitEnv(), PATH: runnerPath() });
+  const env = runnerGitSpawnEnv(WORKTREE_HEAD_SHA_ARGS, {
+    ...gitEnv(),
+    PATH: runnerPath(),
+    ...(process.env.GIT_CEILING_DIRECTORIES !== undefined
+      ? { GIT_CEILING_DIRECTORIES: process.env.GIT_CEILING_DIRECTORIES }
+      : {}),
+  });
   const tmp = runnerTmpdir();
   if (tmp) env.TMPDIR = tmp;
   return env;

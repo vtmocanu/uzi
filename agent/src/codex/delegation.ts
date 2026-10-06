@@ -39,6 +39,7 @@ import {
   CODEX_SIGNAL_TOOLS,
   CodexCallbackBroker,
   canonicalizeCodexToolName,
+  delegationTaskInput,
   type CallbackResult,
   type CallbackRuntimeId,
   type ChildDelegationRequest,
@@ -164,17 +165,6 @@ function asString(v: unknown): string | undefined {
   return typeof v === "string" ? v : undefined;
 }
 
-/** The first present non-empty string among `keys` on `args`, else undefined. */
-function firstStr(args: unknown, keys: readonly string[]): string | undefined {
-  const o = asObject(args);
-  if (!o) return undefined;
-  for (const k of keys) {
-    const v = o[k];
-    if (typeof v === "string" && v.length > 0) return v;
-  }
-  return undefined;
-}
-
 /** Extract non-empty assistant text off an item (bare `text` and/or a `content` array
  *  of `{ text }` parts). Mirrors the CodexHarness/advice decode. */
 function extractText(item: Record<string, unknown>): string[] {
@@ -288,7 +278,7 @@ export class CodexDelegationRunner {
   ): Promise<ChildDelegationResult> {
     // A short dispatch description labels the child; use it as instructions only
     // when the parent supplied no dedicated instruction field.
-    const taskInput = firstStr(request.args, ["prompt", "task", "input", "message", "description"]) ?? "";
+    const taskInput = delegationTaskInput(request.args) ?? "";
 
     // Honor a stop that already fired before any child work begins.
     if (signal.aborted) {

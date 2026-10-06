@@ -112,6 +112,7 @@ func i64Ptr(n int64) *int64 { return &n }
 func newDemoClient() *uzicli.FakeClient {
 	now := time.Now()
 	runs := demoRuns(now)
+	workers, adminWorkers := demoWorkers(now, runs)
 	byID := map[string]apitypes.RunDTO{}
 	logs := map[string][]apitypes.MessageDTO{}
 	inputs := map[string][]apitypes.SteerInputDTO{}
@@ -122,7 +123,8 @@ func newDemoClient() *uzicli.FakeClient {
 		inputs[r.ID] = []apitypes.SteerInputDTO{}
 	}
 	return &uzicli.FakeClient{
-		Runs: runs, RunByID: byID, LogsByID: logs, InputsByID: inputs,
+		Runs: runs, AdminRuns: runs, Workers: workers, AdminWorkers: adminWorkers,
+		RunByID: byID, LogsByID: logs, InputsByID: inputs,
 		// Two Anthropic tokens so the own board clears the >1-token gate (PRD #295) and shows
 		// the credential column; the demo runs above carry meta/personal labels + reasons.
 		Secrets: []apitypes.SecretDTO{
@@ -200,6 +202,88 @@ func newDemoClient() *uzicli.FakeClient {
 		// "live"); the ticker above supplies the live frames.
 		StreamEvents: nil,
 	}
+}
+
+// demoWorkers mirrors the approved workers mock; reported IDs point at demo runs.
+func demoWorkers(now time.Time, runs []apitypes.RunListItemDTO) ([]apitypes.WorkerDTO, []apitypes.AdminWorkerDTO) {
+	str := func(s string) *string { return &s }
+	num := func(n int) *int { return &n }
+	at := func(d time.Duration) *time.Time { t := now.Add(d); return &t }
+	names := []string{"forge-large", "forge-docker", "eph-a10000", "eph-b20000", "forge-m-2", "forge-small", "recovery", "laptop", "chat-box", "b-runner"}
+	caps := []int{3, 2, 1, 1, 2, 1, 2, 0, 1, 1}
+	active := []int{2, 1, 1, 0, 1, 0, 0, 0, 0, 0}
+	cpu := []float64{41, 88, 12, 1, 9, 0, 3, 22, 6, 1}
+	mem := []float64{5.1, 7.4, 1.9, .3, 2.2, 0, 1.1, 2, .6, .4}
+	data := []int64{92, 41, 22, 4, 35, 0, 48, 31, 12, 9}
+	all := make([]apitypes.WorkerDTO, len(names))
+	for i, name := range names {
+		w := apitypes.WorkerDTO{
+			ID: "demo-worker-" + name, Name: name, Status: "online", Kind: "hosted",
+			HostedSize: str("m"), Docker: boolPtr(false), MaxConcurrentRuns: num(caps[i]),
+			ActiveRuns: active[i], Busy: active[i] > 0, Version: str("0.85.1"),
+			UpgradeStatus: "up_to_date", UpgradeTarget: "0.85.1",
+			OnlineSince: at(-48 * time.Hour), LastHeartbeatAt: at(-time.Duration(i+2) * time.Second), CreatedAt: now.Add(-24 * time.Hour),
+			StatsCPUPct: fPtr(cpu[i]), StatsMemBytes: i64Ptr(int64(mem[i] * (1 << 30))),
+			StatsMemLimitBytes: i64Ptr(4 << 30), StatsSource: str("cgroup"),
+			StatsDiskDataBytes: i64Ptr(data[i]), StatsDiskDataTotalBytes: i64Ptr(100),
+			TemplateDeclared: str("node-jvm"), TemplateReported: str("node-jvm"),
+			AnthropicBindMode: "default", Capabilities: []string{"jvm"},
+			ReportedRuns: []apitypes.WorkerReportedRunDTO{}, RunDisk: []apitypes.WorkerRunDiskDTO{},
+		}
+		all[i] = w
+	}
+	all[0].HostedSize, all[1].HostedSize = str("l"), str("l")
+	all[0].StatsMemLimitBytes, all[1].StatsMemLimitBytes = i64Ptr(8<<30), i64Ptr(8<<30)
+	all[1].Docker, all[1].Capabilities, all[1].AnthropicBindMode = boolPtr(true), []string{"docker", "jvm"}, "auto"
+	all[1].StatsDiskDindInodes, all[1].StatsDiskDindTotalInodes = i64Ptr(97), i64Ptr(100)
+	all[1].OutboxPendingMessages = num(14)
+	all[2].Ephemeral, all[3].Ephemeral = true, true
+	all[3].EphemeralLeaseExpiresAt = at(8 * time.Minute)
+	all[3].TemplateDeclared, all[3].TemplateReported = str("node"), str("node")
+	all[4].DrainingSince, all[4].AnthropicBindMode = at(-time.Hour), "pinned"
+	all[4].AnthropicSecretID, all[4].AnthropicSecretLabel = str("sec-work"), str("work-key")
+	all[4].StatsDiskNixBytes, all[4].StatsDiskNixTotalBytes = i64Ptr(78), i64Ptr(100)
+	all[5].Status, all[5].HostedSize, all[5].UpgradeStatus = "offline", str("s"), "upgrade_failed"
+	all[5].DrainingSince, all[5].LastHeartbeatAt, all[5].Version = at(-2*time.Hour), at(-2*time.Hour), str("0.85.0")
+	all[5].UpgradeBlockingContainer, all[5].UpgradeBlockingReason = str("seed-nix"), str("ImagePullBackOff")
+	all[5].UpgradeDetail = str("seed image could not be pulled")
+	all[5].StatsCPUPct, all[5].StatsMemBytes, all[5].StatsMemLimitBytes = nil, nil, nil
+	all[5].StatsDiskDataBytes, all[5].StatsDiskDataTotalBytes = nil, nil
+	all[6].RetainingUnpublishedWork = true
+	all[6].TemplateDeclared, all[6].TemplateReported = str("node"), str("node")
+	for _, i := range []int{7, 8} {
+		all[i].Kind, all[i].HostedSize, all[i].Docker = "external", nil, nil
+		all[i].Busy = true
+	}
+	all[7].MaxConcurrentRuns, all[7].StatsMemLimitBytes, all[7].StatsSource = nil, nil, str("process")
+	all[7].Version, all[7].UpgradeStatus, all[7].AnthropicBindMode = str("0.84.0"), "outdated", "auto"
+	all[7].TemplateReported = str("node")
+	all[7].OutboxBlocked = str("terminal outcome refused: run was re-claimed (gen 4)")
+	all[8].TemplateDeclared, all[8].TemplateReported, all[8].Capabilities = nil, nil, []string{}
+	all[9].DrainingSince = at(-time.Hour)
+	// The five occupied run slots and the separate chat map to demo runs.
+	// Chat is reported without adding to run-lane occupancy.
+	for _, binding := range []struct {
+		worker, run int
+		phase       string
+	}{
+		{0, 1, "running"}, {0, 3, "running"}, {1, 6, "running"},
+		{2, 5, "awaiting_input"}, {4, 2, "awaiting_approval"}, {8, 9, "running"},
+	} {
+		w, r := &all[binding.worker], &runs[binding.run]
+		r.WorkerID, r.WorkerName, r.RunDTO.WorkerName = str(w.ID), str(w.Name), str(w.Name)
+		report := apitypes.WorkerReportedRunDTO{RunID: r.ID, Phase: binding.phase, ClaimGeneration: 1}
+		if binding.worker == 1 {
+			report.TerminalPending, report.TerminalPendingSince = true, at(-12*time.Minute)
+		}
+		w.ReportedRuns = append(w.ReportedRuns, report)
+	}
+	admin := make([]apitypes.AdminWorkerDTO, len(all))
+	for i, w := range all {
+		admin[i] = apitypes.AdminWorkerDTO{WorkerDTO: w, OwnerEmail: "you@example.test", DiskPressureVolumes: []string{}}
+	}
+	admin[9].OwnerEmail, admin[9].DiskPressureVolumes = "user-b@example.test", []string{"data"}
+	return all[:9], admin
 }
 
 func demoRuns(now time.Time) []apitypes.RunListItemDTO {
@@ -297,6 +381,8 @@ func demoRuns(now time.Time) []apitypes.RunListItemDTO {
 		codexLive,
 		codexPast,
 		vault,
+		mk("demo-chat-1111-2222-3333-444444444444", "chat", "running", "Discuss the next factory improvement", "", nil, 0, 6*time.Minute),
+		{RunDTO: apitypes.RunDTO{ID: "demo-queued-1111-2222-3333-444444444444", Kind: "issue", Status: "queued", IssueTitle: "Queued, waiting for a worker", CreatedAt: now.Add(-30 * time.Second)}},
 	}
 }
 

@@ -277,3 +277,13 @@ func TestHostedConfigEphemeralDefaultsClosed(t *testing.T) {
 		t.Fatalf("ephemeral_enabled = %v, want the compiled-in default false", got["ephemeral_enabled"])
 	}
 }
+
+func TestHostedConfigDockerTier(t *testing.T) {
+	for _, tc := range []struct{ hosting, tier bool }{{false, false}, {false, true}, {true, false}, {true, true}} {
+		h := newHostedHandlerEphemeral(tc.hosting, "", true)
+		h.cfg.WorkerDockerEnabled = tc.tier
+		if got := hostedConfig(t, h)["docker_enabled"]; got != (tc.hosting && tc.tier) {
+			t.Fatalf("hosting=%v tier=%v docker=%v", tc.hosting, tc.tier, got)
+		}
+	}
+}

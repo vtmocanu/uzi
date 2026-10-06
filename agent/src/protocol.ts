@@ -538,7 +538,37 @@ export interface FinalizeResumeEntry {
   claim_generation: number;
 }
 
+export interface DindMeter {
+  register_nonce: string;
+  epoch: number;
+  sampled_at: string;
+}
+
+export interface DindMaintenance {
+  id: string;
+  nonce: string;
+  phase: "requested" | "ready" | "stopping" | "recycling" | "complete" | "cancelled";
+  deployment_uid: string;
+  pvc_uid: string;
+  register_nonce: string;
+  fenced: boolean;
+  ready_ack: boolean;
+  /** Request-only; recycle_disabled is controller-authenticated, never worker-authorized. */
+  reason?: "below_threshold" | "recycle_disabled";
+}
+
+export interface DindMaintenanceReadyACK extends DindMaintenance {
+  local_claims: number;
+  local_executions: number;
+  custody_clear: boolean;
+  custody_checked_at: string;
+  pruned: boolean;
+  resampled_epoch: number;
+}
+
 export interface HeartbeatRequest {
+  dind_meter?: DindMeter;
+  dind_maintenance_ready_ack?: DindMaintenanceReadyACK;
   version: string;
   /** Optional container resource sample (PRD #49), same absent-optional convention
    *  as `template` on register: the worker omits it when the collector produced
@@ -3080,4 +3110,28 @@ export interface PrDescriptionAckRequest {
 export interface PrDescriptionAckResponse {
   pr: PrDescriptionState;
   recovered_version_id: string | null;
+}
+
+/** #1974: diagnostics only; a disposition never authorizes local cleanup. */
+export interface TerminalRejection {
+  run_id: string;
+  claim_generation: number;
+  reason: "mac_failure";
+}
+export interface TerminalRejectionsRequest { rejections: TerminalRejection[] }
+export interface TerminalRejectionsResponse {
+  dispositions: (TerminalRejection & { disposition: "recorded" | "skipped" })[];
+}
+export interface TerminalRejectionCustodyResponse {
+  run_id: string;
+  worker_id: string;
+  generation: number;
+  exact_holds: { id: string; state: "open" | "released" | "discarded" }[];
+  sibling_holds: { id: string; generation: number }[];
+  exact_count: number;
+  sibling_count: number;
+  exact_complete: boolean;
+  sibling_complete: boolean;
+  complete: boolean;
+  outcome: "retained" | "settled" | "unknown";
 }
