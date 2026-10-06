@@ -2062,8 +2062,9 @@ export class RunRunner {
   private readonly shutdownPublishTimeoutMs: number;
   /** issue #1597 M2: the mid-turn checkpoint tick cadence (0 disables). */
   private readonly checkpointTickIntervalMs: number;
-  /** issue #1597 M2: test-only seams (undefined in production). */
+  /** Issue #1831: test-only teardown seams; production always uses pinned removal. */
   private readonly teardownTestDeps: TeardownTestDeps | undefined;
+  /** issue #1597 M2: test-only seams (undefined in production). */
   private readonly checkpointTestHooks: CheckpointTestHooks | undefined;
   private readonly recoveryRetryMs: number;
   /** PRD #1171 m4: bounded absolute deadline (ms) for a Codex durability-sink withBoundary. */

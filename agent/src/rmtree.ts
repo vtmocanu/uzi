@@ -897,8 +897,10 @@ async function identityOf(pinFd: number): Promise<string> {
  * INTERMEDIATE directory for a symlink mid-walk redirects the deletion outside the tree
  * (an audit's racer deleted outside files that way). Both running disk reclaim and
  * per-run teardown use the pinned walk: reaping one run does not stop sibling runs'
- * `runner`/`runner-cmd` writers on the same volume. Only startup sweeps retain
- * path-based removal, before claims begin. This is {@link PINNED_SUBTREE_SCRIPT}'s walk:
+ * `runner`/`runner-cmd` writers on the same volume. Startup sweeps retain
+ * {@link rmHomeTree} before claims begin. Other path-based cleanup sites remain
+ * outside issue #1831's four-tree scope; see ADR-1809's residual list. This is
+ * {@link PINNED_SUBTREE_SCRIPT}'s walk:
  *
  *  1. The worker pins `parent`, then `name` inside it through its descriptor with
  *     `O_PATH | O_DIRECTORY | O_NOFOLLOW`, refusing a symlink, a non-directory, and a
