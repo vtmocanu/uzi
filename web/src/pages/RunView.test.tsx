@@ -4835,7 +4835,7 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     expect(container.textContent).toContain(
       "If this is your run, unlock your vault with the banner at the top of the page.",
     );
-    expect(container.textContent).toContain("the run's work was saved before it parked");
+    expect(container.textContent).toContain("The run saved its work before parking");
     expect(container.textContent).not.toContain("transient interruption");
     expect(container.textContent).not.toContain("Waiting for the forge");
     expect(container.textContent).not.toContain("2 of 5");
@@ -6841,6 +6841,12 @@ describe("M1 plan cross-check detail refresh", () => {
 });
 
 describe("usage-limit provider regression #2360", () => {
+  it.each([false, undefined])("qualifies recovery when latest publication is not established: %s", (checkpoint_contains_latest) => {
+    const { container } = render(<LimitWaitPanel run={run({ status: "limit_wait", harness: "codex", checkpoint_contains_latest })} busy={false} onToggle={vi.fn()} onStop={vi.fn()} />);
+    expect(container.textContent).toContain("A successful recovery restores saved work.");
+    expect(container.textContent).toContain("recovery on another worker may be incomplete");
+    expect(container.textContent).not.toContain("Nothing is lost");
+  });
   it.each([
     ["codex", "Paused on a Codex usage limit"],
     ["claude", "Paused on an Anthropic usage limit"],

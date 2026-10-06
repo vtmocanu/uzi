@@ -1038,11 +1038,10 @@ export function LimitWaitPanel({
             )}
             {attemptClause && ` ${attemptClause}`}
           </p>
-          {/* text-muted, not text-faint (web-ux F1): at 4.56 this was the faintest
-              text on the panel while being the only thing telling a stuck user that
-              nothing is lost. The pointer to Stop is now the button beside it. */}
+          {/* Keep the recovery limits legible alongside the Stop control. */}
           <p className="mt-1.5 text-xs text-muted">
-            Nothing is lost — the run keeps its branch and its history and picks up where it left off.
+            A successful recovery restores saved work. If saving the latest changes failed,
+            recovery on another worker may be incomplete.
           </p>
           {/* PRD #1809 M6: checkpoint durability and the run's size on its worker. */}
           <RunParkDiskFacts run={run} />
@@ -1499,7 +1498,7 @@ function PoolWaitPanel({
               count down to — resumption is event-driven (a token is pooled), not
               time-driven. */}
           <p className="mt-1.5 text-xs text-muted">
-            Nothing is lost — the run keeps its branch and its history and picks up where it left off.
+            The run continues when a token is available, using any saved work it can recover.
           </p>
           {/* Always mounted (sr-only when empty) so the 409 note is announced when it
               arrives — a region created in the same tick as its first content is
@@ -1732,14 +1731,14 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
         )}
         <p className="mt-1.5 text-xs text-muted">
           {vaultPark
-            ? "Nothing is lost: the run's work was saved before it parked, and it picks up where it left off."
+            ? "The run saved its work before parking; resume uses that recovery data."
             : diskPark
               ? // PRD #1809: a disk park frees space on the worker, so the generic "keeps its
                 // branch and its history" line is not the claim to make. A first-claim park may
                 // have no branch or checkpoint yet, so only what the run already has is kept,
                 // plus the run's work the worker keeps until it resumes.
                 "Any branch or pushed checkpoint the run already has is kept, and the worker keeps the run's work until it resumes."
-              : "Nothing is lost — the run keeps its branch and its history and picks up where it left off."}
+              : "A successful recovery restores saved work. If saving the latest changes failed, recovery on another worker may be incomplete."}
         </p>
         {/* PRD #1809 M6: checkpoint durability and the run's size on its worker. */}
         <RunParkDiskFacts run={run} />

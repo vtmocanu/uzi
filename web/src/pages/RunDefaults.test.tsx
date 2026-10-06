@@ -660,21 +660,20 @@ describe("Run defaults — usage-limit default (PRD #35 M3)", () => {
   const limitToggle = () =>
     screen.getByLabelText("Pause my new runs on a usage limit instead of failing them") as HTMLInputElement;
 
-  it("explains the choice in terms of what the user loses without it", () => {
+  it("explains automatic resume, recovered work and retained disk", () => {
     const { container } = render(
       <MemoryRouter>
         <RunDefaults />
       </MemoryRouter>,
     );
-    const text = container.textContent ?? "";
-    // The stake, not the mechanism: today the run FAILS and its work is gone.
-    expect(text).toMatch(/fails?/i);
-    expect(text).toMatch(/pauses?/i);
-    expect(text).toMatch(/resumes/i);
-    // The runs that cannot opt in any other way — the reason this default exists.
+    const text = screen.getByText("Usage limits").parentElement?.textContent ?? "";
+    expect(text).toContain("Claude runs and Codex subscription runs");
+    expect(text).toMatch(/pause/i);
+    expect(text).toMatch(/resume/i);
+    expect(text).toContain("Recovered work and an approved plan carry forward");
     expect(text).toMatch(/autopilot/i);
-    // The cost the PRD requires surfacing: a parked run holds its disk.
     expect(text).toMatch(/disk/i);
+    expect(container.textContent).not.toContain("its work is lost");
   });
 
   it("🔴 says in the UI that it does NOT change runs that already exist", () => {
