@@ -930,6 +930,78 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
     assert.equal(rig.transport.turnStartCount, 1);
   });
 
+  it("policy refusal (#2321) preserves an active pause-boundary quiescence failure", async () => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) {
+          c.transport.push(toolCall(1, "spawn_agent", { subagent_type: "coder", prompt: "help" }, "th-1", "tn-1", "c-spawn"));
+          return { turn: { id: "tn-1" } };
+        }
+        c.transport.push(toolCall(11, "uzi_bash", { command: "echo child work" }, "th-child", "tn-child", "c-bash"));
+        return { turn: { id: "tn-child" } };
+      }
+      return {};
+    } });
+    let shellStarted = false;
+    let releaseShell!: () => void;
+    const shellGate = new Promise<void>(resolve => { releaseShell = resolve; });
+    // Keep the real child callback unsettled through the boundary, even after its signal aborts.
+    rig.deps = { ...rig.deps, spawnCommand: async () => {
+      shellStarted = true;
+      await shellGate;
+      return { code: 0, stdout: "late", stderr: "" };
+    } };
+    const abort = new AbortController();
+    let executor!: CodexExecutor;
+    let parks = 0;
+    let sinkCalled = false;
+    const { ctx, emitted } = makeCtx({
+      signal: abort.signal,
+      agents: [
+        { name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] },
+        { name: "coder", description: "coder", prompt_body: "coder", tools: null, skills: [] },
+      ],
+      pauseModeRequested: () => abort.signal.aborted ? "now" : null,
+      parkForPause: async () => {
+        parks++;
+        await executor.safety!.withBoundary({ boundary: "park", deadlineMs: 200 }, async () => { sinkCalled = true; });
+        return true;
+      },
+    });
+    ctx.emit = message => {
+      emitted.push(message);
+      if (message.payload.event === "provider_policy_refusal") abort.abort(new PauseNowSignal());
+    };
+    executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const running = executor.run(ctx);
+    // Attach the rejection assertion before delivering the competing terminal.
+    const rejected = assert.rejects(withTimeout(running, 4000, "policy refusal quiescence competition"), error => {
+      assert.ok(error instanceof CodexBoundaryError, `got ${String(error)}`);
+      assert.equal(error.stage, "quiesce");
+      assert.ok(error.errors.some(e => /callback\/child-turn reservation\(s\) unsettled/.test(e.message)), JSON.stringify(error.errors));
+      return true;
+    });
+    try {
+      await waitFor(() => shellStarted, "child callback before root refusal");
+      rig.transport.push({ ...turnCompleted("failed"), params: {
+        threadId: "th-1", turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "cyberPolicy" } },
+      } });
+      await rejected;
+      assert.equal(parks, 1, "the refusal competed with an active park boundary");
+      assert.equal(sinkCalled, false, "failed quiescence prevented the park sink");
+      const refusals = emitted.filter(message => message.payload.event === "provider_policy_refusal");
+      assert.equal(refusals.length, 1, "the refusal remains a separate observation");
+      assert.equal(refusals[0]!.payload.policy_tag, "cyberPolicy");
+      assert.equal(refusals[0]!.payload.origin, "root");
+      assert.equal(rig.providerLaunches(), 1, "no provider re-drive followed the failed boundary");
+    } finally {
+      releaseShell();
+      await running.catch(() => undefined);
+      await rejected;
+    }
+  });
+
   it("policy refusal (#2321) also preserves a sticky cancellation without an AbortSignal", async () => {
     const rig = makeRig();
     rig.transport.push(threadStarted()).push({ ...turnCompleted("failed"), params: { turn: { status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } });
