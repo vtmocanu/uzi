@@ -256,7 +256,7 @@ describe("FailedRunsBlock (PRD #1293)", () => {
     expect(bar?.getAttribute("aria-label")).toBe(
       "Finished runs: 5 completed, 1 cancelled, 1 plan rejected, 3 failed",
     );
-    expect((bar?.lastElementChild as HTMLElement).style.width).toBe("30%");
+    expect((bar?.lastElementChild as HTMLElement | null | undefined)?.style.width).toBe("30%");
     for (const row of container.querySelectorAll("tbody tr")) {
       const cells = row.querySelectorAll("td");
       expect(cells[1].textContent).toBe("8");
