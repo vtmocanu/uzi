@@ -163,8 +163,9 @@ func TestRecoveryInventoryOldGenerationFinalWithActiveSuccessorLiveDB(t *testing
 	current, run, _ := e.seedBound(t, "running", 2, false)
 	currentHold := inventoryLifecycleHold(t, e, current, run, 2, true)
 	old := uuid.New()
-	e.exec(`INSERT INTO workers(id,user_id,name,token_hash,status,kind,hosted_size,ephemeral)
- VALUES($1,$2,$3,$4,'online','hosted','m',true)`, old, e.userID, "old-"+old.String(), old[:])
+	e.exec(`INSERT INTO workers(id,user_id,name,token_hash,template_declared,kind,hosted_size,docker_enabled,ephemeral,
+ ephemeral_run_id,status,online_since,last_heartbeat_at)
+ VALUES($1,$2,$3,$4,'base','hosted','m',false,true,NULL,'online',now(),now())`, old, e.userID, "old-"+old.String(), old[:])
 	oldHold := inventoryLifecycleHold(t, e, old, run, 1, true)
 	worker := e.workerRow(t, old)
 	rs := inventoryLifecycleRecovery(e)
