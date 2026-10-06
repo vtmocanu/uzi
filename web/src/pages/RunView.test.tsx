@@ -6758,3 +6758,84 @@ describe("RunView — plan-gate verdicts bound to the gate revision (PRD #1795 M
     expect(submit.mock.calls[1]).toEqual(["reject_plan", "too broad", undefined, undefined, undefined, 4]);
   });
 });
+
+describe("M1 plan cross-check detail refresh", () => {
+  function message(seq: number): RunMessage {
+    return { seq, kind: "cross_check", agent: null, agent_instance: null, agent_label: null,
+      created_at: "2026-07-04T00:00:00Z", payload: { stage: "plan", verdict: "approve", reason_class: "approve", findings: null } };
+  }
+  function setup() {
+    let current = run({ status: "running" });
+    let messages: RunMessage[] = [];
+    let resolve: (() => void) | undefined;
+    const refreshRun = vi.fn(() => new Promise<void>((done) => { resolve = done; }));
+    const router = createMemoryRouter([{ path: "/runs/:id", element: <RunView /> }], { initialEntries: ["/runs/r1"] });
+    mockUseRunStream.mockImplementation(() => ({ run: current, messages, connected: true, error: "",
+      submit: vi.fn(), refreshRun, inputs: [], canSteer: false } as unknown as ReturnType<typeof useRunStream>));
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    const r = render(<RouterProvider router={router} />);
+    return { ...r, router, refreshRun,
+      async update(next: RunMessage[], detail?: Run["plan_cross_check_summary"]) {
+        messages = next;
+        if (detail) current = { ...current, plan_cross_check_summary: detail };
+        await act(async () => { await router.navigate("/runs/" + current.id); });
+      },
+      async settle() { await act(async () => { resolve?.(); }); },
+      changeRun(id: string) { current = { ...current, id }; messages = []; },
+    };
+  }
+  it("refreshes absent detail from an event without reload, deduplicates replay and coalesces bursts", async () => {
+    const r = setup();
+    expect(r.refreshRun).not.toHaveBeenCalled();
+    await r.update([message(3)]);
+    expect(r.refreshRun).toHaveBeenCalledTimes(1);
+    // useRunStream deduplicates replay frames before RunView receives messages.
+    await r.update([message(3)]);
+    await r.update([message(3), message(4), message(5)]);
+    expect(r.refreshRun).toHaveBeenCalledTimes(1);
+    await r.settle();
+    expect(r.refreshRun).toHaveBeenCalledTimes(2);
+    await r.settle();
+    await r.update([message(3), message(4), message(5)], {
+      round: 1, verdict: "approve", reason_class: "approve", findings: { summary: "# Refreshed evidence", items: null },
+      checker_run_id: null, checker_model: null, checker_effort: null, usage: null, historical: false,
+    });
+    expect(screen.getByRole("heading", { name: "Refreshed evidence" })).toBeTruthy();
+    await r.update([message(3), message(4), message(5)]);
+    expect(r.refreshRun).toHaveBeenCalledTimes(2);
+  });
+  it("M1 pending detail refreshes and non-plan events do not trigger reads", async () => {
+    const r = setup();
+    await r.update([{ ...message(1), payload: { stage: "implementation" } }], {
+      round: 1, verdict: "pending", reason_class: null, findings: null,
+      checker_run_id: null, checker_model: null, checker_effort: null, usage: null, historical: false,
+    });
+    expect(r.refreshRun).not.toHaveBeenCalled();
+    expect(screen.getByText("Checked candidate: Pending")).toBeTruthy();
+    await r.update([message(2)]);
+    expect(r.refreshRun).toHaveBeenCalledTimes(1);
+    await r.settle();
+    await r.update([message(2)], {
+      round: 1, verdict: "revise", reason_class: "revise", findings: { summary: "New checker evidence", items: null },
+      checker_run_id: null, checker_model: null, checker_effort: null, usage: null, historical: false,
+    });
+    expect(screen.getByText("New checker evidence")).toBeTruthy();
+    expect(r.refreshRun).toHaveBeenCalledTimes(1);
+  });
+  it("drops queued follow-ups after navigation and tracks sequence per run", async () => {
+    const r = setup();
+    await r.update([message(3)]);
+    await r.update([message(4)]);
+    r.changeRun("r2");
+    await act(async () => { await r.router.navigate("/runs/r2"); });
+    await r.settle();
+    expect(r.refreshRun).toHaveBeenCalledTimes(1);
+    await r.update([message(1)]);
+    expect(r.refreshRun).toHaveBeenCalledTimes(2);
+    await r.settle();
+    r.changeRun("r1");
+    await act(async () => { await r.router.navigate("/runs/r1"); });
+    await r.update([message(4)]);
+    expect(r.refreshRun).toHaveBeenCalledTimes(2);
+  });
+});

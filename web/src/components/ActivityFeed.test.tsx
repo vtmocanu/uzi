@@ -1,3 +1,4 @@
+import { MemoryRouter } from "react-router-dom";
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
@@ -1489,4 +1490,29 @@ describe("ActivityFeed lead context-window meter", () => {
     // Over-100 is near-compaction (danger), the fill saturating the channel.
     expect(meter.getAttribute("data-context-state")).toBe("near");
   });
+});
+
+describe("M1 null-agent plan cross-check narration", () => {
+  it.each(["timeline", "by_agent"])("renders and announces in %s", (view) => {
+    if (view === "timeline") selectTimelineView();
+    const message = { ...m(5, "cross_check", { stage: "plan", verdict: "failed", reason_class: "interrupted", findings: null }), agent: null };
+    const r = render(<MemoryRouter><ActivityFeed run={runFixture()} messages={[message]} connected runningLive={false} terminal={false} /></MemoryRouter>);
+    expect(r.container.querySelector('[aria-live="polite"]')?.textContent).toContain("Plan cross-check of checked candidate: Interrupted");
+    expect(r.container.textContent).toContain("Plan cross-check of checked candidate: Interrupted");
+    const buttons = Array.from(r.container.querySelectorAll("button"));
+    const lane = buttons.find((b) => b.getAttribute("aria-controls")?.startsWith("agent-body"));
+    if (lane?.getAttribute("aria-expanded") === "false") fireEvent.click(lane);
+    expect(r.getByRole("region", { name: "Plan cross-check event" })).toBeTruthy();
+  });
+});
+
+it("M1 historical cross-check announces earlier candidate evidence independently of the current gate", () => {
+  const checker = "11111111-1111-4111-8111-111111111111";
+  const message = { ...m(6, "cross_check", { stage: "plan", verdict: "approve", reason_class: "approve", checker_run_id: checker }), agent: null };
+  const r = render(<MemoryRouter><ActivityFeed run={runFixture({
+    plan_cross_check_gate_reason: "model_error",
+    plan_cross_check_summary: { round: 1, verdict: "approve", reason_class: "approve", findings: null,
+      checker_run_id: checker, checker_model: null, checker_effort: null, usage: null, historical: true },
+  })} messages={[message]} connected runningLive={false} terminal={false} /></MemoryRouter>);
+  expect(r.container.querySelector('[aria-live="polite"]')?.textContent).toBe("Plan cross-check of earlier-plan candidate: Passed");
 });

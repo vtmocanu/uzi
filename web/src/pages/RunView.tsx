@@ -80,6 +80,7 @@ import { ActivityFeed } from "../components/ActivityFeed";
 import { SteerQueueCard } from "../components/SteerQueueCard";
 import { QuestionPanel, UnreadableQuestion } from "../components/QuestionPanel";
 import { deriveOpenQuestion } from "../lib/runQuestion";
+import { PlanCrossCheck } from "../components/PlanCrossCheck";
 import { Markdown } from "../components/Markdown";
 import { JobResultPanel } from "./runView/JobResultPanel";
 import { Alert, Badge, Button, Card, PageHeader, Spinner, StatusPill, cx, type BadgeTone } from "../components/ui";
@@ -1841,6 +1842,46 @@ export function RunView() {
   const currentRunIdRef = useRef(id);
   currentRunIdRef.current = id;
   const { run, messages, connected, error, submit, refreshRun, inputs, canSteer } = useRunStream(id);
+  const planCheckSeqs = useRef(new Map<string, number>());
+  const planCheckRefresh = useRef<{ runId: string; busy: boolean; queued: boolean } | null>(null);
+  useEffect(() => {
+    planCheckRefresh.current = null;
+    return () => { planCheckRefresh.current = null; };
+  }, [id]);
+  useEffect(() => {
+    if (run?.id !== id) return;
+    let latest = 0;
+    for (const message of messages) {
+      if (message.kind === "cross_check" &&
+          (message.payload as { stage?: string } | null)?.stage === "plan") latest = Math.max(latest, message.seq);
+    }
+    if (latest <= (planCheckSeqs.current.get(id) ?? 0)) return;
+    planCheckSeqs.current.set(id, latest);
+    let state = planCheckRefresh.current;
+    if (!state || state.runId !== id) {
+      state = { runId: id, busy: false, queued: false };
+      planCheckRefresh.current = state;
+    }
+    if (state.busy) { state.queued = true; return; }
+    state.busy = true;
+    const active = state;
+    // Requests are bounded by newly observed sequence numbers, with no retries;
+    // updates during a request share one follow-up. refreshRun retains its own
+    // request lifecycle and generation fence. Navigation cancels queued follow-ups.
+    const refresh = async () => {
+      try { await refreshRun(); } catch {
+        // Best effort, as in useRunStream.refreshRun; a later new event can refresh.
+      } finally {
+        active.busy = false;
+        if (active.queued && currentRunIdRef.current === id && planCheckRefresh.current === active) {
+          active.queued = false;
+          active.busy = true;
+          void refresh();
+        }
+      }
+    };
+    void refresh();
+  }, [id, run?.id, messages, refreshRun]);
   const [incidentalSummary, setIncidentalSummary] = useState<{ runId: string; count: number } | null>(null);
   const findingsRunId = run?.id;
   const findingsTerminal = !!run && isTerminalRun(run.status);
@@ -2929,6 +2970,8 @@ export function RunView() {
           onCancel={() => cancelRun()}
         />
       )}
+
+      {run.status !== "awaiting_approval" && <PlanCrossCheck run={run} />}
 
       {/* PRD #209 M5: a SEEDED run's plan. It never enters awaiting_approval, so the
           PlanPanel above never renders and run.plan_md has no home on the page. This is

@@ -547,7 +547,17 @@ export const mockRuns: Run[] = [
     requeue_count: 0,
     iteration_count: 0,
     auto_approve: false,
-    plan_cross_check_required: false,
+    plan_cross_check_required: true,
+    plan_cross_check_gate_reason: "revise",
+    plan_cross_check_summary: {
+      round: 1, verdict: "revise", reason_class: "revise",
+      findings: { summary: "## Checker findings\n\nKeep notification delivery idempotent.", items: [
+        { file: "api/internal/notifier", severity: "warning", summary: "Avoid duplicate emails.", rationale: "A parked run may replay its approval transition." },
+      ] },
+      checker_run_id: null, checker_model: "gpt-5.4", checker_effort: "high",
+      usage: { input_tokens: 1200, output_tokens: 250, cache_read_tokens: 0, cache_creation_tokens: 0, cost_usd: 0, cost_status: "subscription" },
+      historical: false,
+    },
     worker_id: "w-laptop",
     branch: null,
     model: null,
@@ -901,7 +911,12 @@ export const mockRuns: Run[] = [
     requeue_count: 0,
     iteration_count: 2,
     auto_approve: true,
-    plan_cross_check_required: false,
+    plan_cross_check_required: true,
+    plan_cross_check_summary: {
+      round: 1, verdict: "approve", reason_class: "approve",
+      findings: { summary: "## Earlier-plan checker findings\n\nThe earlier candidate covered the happy path.", items: null },
+      checker_run_id: null, checker_model: "gpt-5.4", checker_effort: "medium", usage: null, historical: true,
+    },
     worker_id: "w-laptop",
     branch: "agent/issue-18",
     // PRD #300: a completed run whose schedule froze a per-run model, so the

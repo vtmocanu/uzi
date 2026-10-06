@@ -1,3 +1,5 @@
+import { planCheckEventText } from "./PlanCrossCheck";
+import type { PlanCrossCheckSummary } from "../lib/apiTypes";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Run, RunMessage } from "../lib/api";
 import { formatTokens } from "../lib/formatTokens";
@@ -316,7 +318,7 @@ const GLANCE_LANES = 6;
 // agentOneLiner is the live header summary ("Running go build", "Reading files",
 // "Thinking…") that updates IN PLACE from the agent's newest message — the thing you
 // read instead of expanding the log (Problem 1). Reuses RunEvent's own describers.
-function agentOneLiner(latest: RunMessage | undefined): string {
+function agentOneLiner(latest: RunMessage | undefined, detail?: PlanCrossCheckSummary): string {
   if (!latest) return "";
   switch (latest.kind) {
     case "tool_use": {
@@ -338,6 +340,9 @@ function agentOneLiner(latest: RunMessage | undefined): string {
       return describeStatus(latest.payload);
     case "error":
       return `Error: ${describeError(latest.payload)}`;
+    case "cross_check":
+      return (latest.payload as { stage?: string } | null)?.stage === "plan"
+        ? planCheckEventText(latest.payload, detail) : "Cross-check outcome unavailable";
     case "plan":
       return "Submitted a plan";
     case "plan_revising":
@@ -816,6 +821,7 @@ export function ActivityFeed({
     agent: undefined as string | undefined,
     seq: 0,
     terminal: false,
+    planCheckText: "",
   });
   useEffect(() => {
     const seen = announcedRef.current;
@@ -831,6 +837,7 @@ export function ActivityFeed({
         mm.kind === "status" ||
         mm.kind === "error" ||
         mm.kind === "plan" ||
+        (mm.kind === "cross_check" && (mm.payload as { stage?: string } | null)?.stage === "plan") ||
         mm.kind === "plan_revising" ||
         mm.kind === "plan_feedback" ||
         // PRD #35: a park is exactly the event this region exists for — the run goes
@@ -847,10 +854,16 @@ export function ActivityFeed({
       )
         meaningful = mm;
     }
-    if (meaningful && meaningful.seq !== seen.seq) {
+    const planCheckText = meaningful?.kind === "cross_check"
+      ? planCheckEventText(meaningful.payload, run.plan_cross_check_summary) : "";
+    if (meaningful && (meaningful.seq !== seen.seq ||
+        (planCheckText !== "" && planCheckText !== seen.planCheckText))) {
+      seen.planCheckText = planCheckText;
       seen.seq = meaningful.seq;
       next =
-        meaningful.kind === "error"
+        meaningful.kind === "cross_check"
+          ? planCheckEventText(meaningful.payload, run.plan_cross_check_summary)
+          : meaningful.kind === "error"
           ? `Error: ${describeError(meaningful.payload)}`
           : meaningful.kind === "plan"
             ? "Plan submitted, awaiting approval"
@@ -879,7 +892,7 @@ export function ActivityFeed({
     seen.terminal = terminal;
 
     if (next !== null) setAnnouncement(truncate(next, ANNOUNCE_MAX));
-  }, [messages, activeAgent, terminal]);
+  }, [messages, activeAgent, terminal, run.plan_cross_check_summary]);
 
   const anchored = new Set<string>();
 
@@ -1090,7 +1103,7 @@ export function ActivityFeed({
                   // The one-liner and the +N pill live on the LANE, not on an agent's
                   // first block: that first-block-only rule is exactly what made every
                   // repeat bar a near-empty label (Problem 1), and a lane has no repeats.
-                  oneLiner={agentOneLiner(laneAgg.get(l.key)?.latest)}
+                  oneLiner={agentOneLiner(laneAgg.get(l.key)?.latest, run.plan_cross_check_summary)}
                   unseen={unseenFor(l.key)}
                   onToggle={() => toggleActor(l.key)}
                   now={now}
@@ -1098,6 +1111,7 @@ export function ActivityFeed({
                   visibleToolUseIds={visibleToolUseIds}
                   phaseUsageBySeq={phaseUsageBySeq}
                   onFindingMutation={onFindingMutation}
+                  planCheckDetail={run.plan_cross_check_summary}
                   // PRD #516: the context-window meter rides the LEAD lane only. The lead
                   // lane is the one whose key is LEAD (null instance + null/"lead" agent);
                   // a repo-shipped `lead.md` subagent has a real instance id → its key is
@@ -1126,7 +1140,7 @@ export function ActivityFeed({
                     expanded={isExpanded(g.agent)}
                     followLive={followLive}
                     oneLiner={
-                      firstBlock ? agentOneLiner(crew.latest.get(g.agent)) : ""
+                      firstBlock ? agentOneLiner(crew.latest.get(g.agent), run.plan_cross_check_summary) : ""
                     }
                     unseen={firstBlock ? unseenFor(g.agent) : 0}
                     onToggle={() => toggleActor(g.agent)}
@@ -1135,6 +1149,7 @@ export function ActivityFeed({
                     visibleToolUseIds={visibleToolUseIds}
                     phaseUsageBySeq={phaseUsageBySeq}
                     onFindingMutation={onFindingMutation}
+                  planCheckDetail={run.plan_cross_check_summary}
                   />
                 );
               })}
@@ -1163,8 +1178,10 @@ function AgentBlock({
   visibleToolUseIds,
   phaseUsageBySeq,
   leadContext,
+  planCheckDetail,
   onFindingMutation,
 }: {
+  planCheckDetail?: PlanCrossCheckSummary;
   agent: string;
   // The lane's task label, ALREADY clamped by laneLabelText: model-authored text
   // rendered plain, never through <Markdown> (Decision 7). Empty ⇒ no `· task` suffix.
@@ -1250,6 +1267,7 @@ function AgentBlock({
         key={m.seq}
         msg={m}
         live={live}
+        planCheckDetail={planCheckDetail}
         phaseUsage={phaseUsageBySeq?.get(m.seq)}
         onFindingMutation={onFindingMutation}
       />,
