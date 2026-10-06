@@ -144,18 +144,24 @@ func (s *Service) parkForgeUnreachable(ctx context.Context, wkr store.Worker, ow
 	if len(holdIDs) != 1 {
 		return run, 0, ErrForgeParkCustodyUnsettled
 	}
-	released, err := qtx.ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
-		RunID:      run.ID,
-		Generation: *req.ClaimGeneration,
-		WorkerID:   wkr.ID,
-		// D3: a generation that never adopted a source has nothing to prove against the forge.
-		ReleaseEvidence: pgconv.TextOrNull("no_adopted_source"),
-	})
+	hold, err := qtx.GetCustodyHoldForSettle(ctx, store.GetCustodyHoldForSettleParams{HoldID: holdIDs[0], RunID: run.ID})
 	if err != nil {
 		return store.Run{}, 0, err
 	}
-	if released != 1 {
-		return run, 0, ErrForgeParkCustodyUnsettled
+	// A delivered claim can have adopted local sources before reporting a forge failure.
+	// Retain guarded inventory through this park; only the server's pre-delivery
+	// ReleaseClaimCustodyNoAdoptedSource path supplies that final disposition.
+	if !hold.InventoryGuarded {
+		released, err := qtx.ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
+			RunID: run.ID, Generation: *req.ClaimGeneration, WorkerID: wkr.ID,
+			ReleaseEvidence: pgconv.TextOrNull("no_adopted_source"),
+		})
+		if err != nil {
+			return store.Run{}, 0, err
+		}
+		if released != 1 {
+			return run, 0, ErrForgeParkCustodyUnsettled
+		}
 	}
 
 	// A stop verdict may have been stamped concurrently during the clone retries (fact 4: the

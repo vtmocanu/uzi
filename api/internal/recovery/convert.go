@@ -3,6 +3,8 @@ package recovery
 import (
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -109,10 +111,11 @@ var custodyRunTerminalStatuses = map[string]bool{"completed": true, "failed": tr
 
 // deriveHoldAttention computes a hold's server-derived Attention from its state, capture
 // summary and run status (PRD #1349 M5, D6/D8). Precedence for an OPEN hold: a ready archive
-// (archive_ready, self-releasing) → a capture in flight (capturing) → a stalled/failed capture
+// on a legacy hold (archive_ready, self-releasing) → a capture in flight (capturing) → a stalled/failed capture
 // (needs_action) → a still-live run (active protection) → otherwise a capture-less hold whose
 // run has ended, or whose run is gone/unknown, needs an owner decision (source_only). A
-// non-open hold reports its terminal disposition directly.
+// non-open hold reports its terminal disposition directly. A guarded hold retains its full
+// inventory even when an earlier archive is available to download.
 func deriveHoldAttention(row store.ListCustodyHoldsForOwnerRow) string {
 	switch row.State {
 	case "discarded":
@@ -121,7 +124,7 @@ func deriveHoldAttention(row store.ListCustodyHoldsForOwnerRow) string {
 		return attentionReleased
 	}
 	switch {
-	case row.HasAvailableCapture:
+	case row.HasAvailableCapture && !row.InventoryGuarded:
 		return attentionArchiveReady
 	case row.CaptureState == "preparing" || row.CaptureState == "uploading":
 		return attentionCapturing
@@ -148,6 +151,7 @@ func isDecisionAttention(attention string) bool {
 func custodyHoldToDTO(row store.ListCustodyHoldsForOwnerRow) apitypes.RecoveryCustodyHoldDTO {
 	out := apitypes.RecoveryCustodyHoldDTO{
 		TerminalRecordRejection: row.TerminalRecordRejection.String,
+		InventoryGuarded:        row.InventoryGuarded,
 		ID:                      row.ID.String(),
 		RunID:                   row.RunID.String(),
 		Generation:              row.Generation,
@@ -157,6 +161,16 @@ func custodyHoldToDTO(row store.ListCustodyHoldsForOwnerRow) apitypes.RecoveryCu
 		WorkerName:              row.WorkerName,
 		HasAvailableCapture:     row.HasAvailableCapture,
 		CaptureState:            row.CaptureState,
+	}
+	if row.FinalDisposition.Valid {
+		out.FinalReceipt = &apitypes.RecoveryFinalDisposition{
+			Kind:           row.FinalDisposition.String,
+			SourceSha:      row.FinalSourceSha.String,
+			CoverageDigest: row.FinalCoverageDigest.String,
+		}
+		if row.FinalCaptureID.Valid {
+			out.FinalReceipt.CaptureID = uuid.UUID(row.FinalCaptureID.Bytes).String()
+		}
 	}
 	if row.CreatedAt.Valid {
 		out.CreatedAt = row.CreatedAt.Time

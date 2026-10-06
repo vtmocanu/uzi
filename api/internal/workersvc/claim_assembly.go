@@ -582,7 +582,12 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		}
 	}
 
+	inventoryGuarded, err := s.RunInventoryGuard(ctx, wkr, run.ID, run.ClaimGeneration)
+	if err != nil {
+		return nil, err
+	}
 	payload := &ClaimPayload{
+		InventoryGuarded: inventoryGuarded,
 		RunID:            run.ID.String(),
 		Kind:             run.Kind,
 		IssueIID:         issueIID,

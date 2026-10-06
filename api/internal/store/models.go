@@ -703,6 +703,9 @@ type RecoveryCapture struct {
 	CreatedAt              pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
 	ReservedBytes          pgtype.Int8        `json:"reserved_bytes"`
+	CoverageDigest         pgtype.Text        `json:"coverage_digest"`
+	LocalReplicaWorkerID   pgtype.UUID        `json:"local_replica_worker_id"`
+	ReadyRetentionSeconds  pgtype.Int8        `json:"ready_retention_seconds"`
 }
 
 type RecoveryCaptureChunk struct {
@@ -735,6 +738,11 @@ type RecoveryCustodyHold struct {
 	ReleaseBranch              pgtype.Text        `json:"release_branch"`
 	ReleaseTarget              pgtype.Text        `json:"release_target"`
 	TerminalRecordRejection    pgtype.Text        `json:"terminal_record_rejection"`
+	InventoryGuarded           bool               `json:"inventory_guarded"`
+	FinalDisposition           pgtype.Text        `json:"final_disposition"`
+	FinalCaptureID             pgtype.UUID        `json:"final_capture_id"`
+	FinalSourceSha             pgtype.Text        `json:"final_source_sha"`
+	FinalCoverageDigest        pgtype.Text        `json:"final_coverage_digest"`
 }
 
 type Repo struct {

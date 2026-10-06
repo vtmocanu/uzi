@@ -59,6 +59,7 @@ function seedCustodyHolds(): RecoveryCustodyHold[] {
   const mk = (o: Partial<RecoveryCustodyHold> & Pick<RecoveryCustodyHold, "id" | "run_id" | "worker_id" | "attention">): RecoveryCustodyHold => ({
     generation: 1,
     state: o.attention === "released" || o.attention === "discarded" ? "released" : "open",
+    inventory_guarded: false,
     has_available_capture: false,
     created_at: t(180),
     updated_at: t(20),

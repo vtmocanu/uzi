@@ -1184,9 +1184,10 @@ hold AS (
     INSERT INTO recovery_custody_holds
         (id, user_id, repo_id, run_id, generation, state,
          original_worker_id, original_worker_identity, live_worker_id, live_run_id,
-         created_at, updated_at)
+         created_at, updated_at, inventory_guarded)
     SELECT gen_random_uuid(), t.user_id, t.repo_id, t.id, t.claim_generation + 1, 'open',
-           $1, $27::text, $1, t.id, now(), now()
+           $1, $27::text, $1, t.id, now(), now(),
+           ('recovery_inventory_v1' = ANY($11::text[]))
     FROM target t
     WHERE $28::boolean
       AND t.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')

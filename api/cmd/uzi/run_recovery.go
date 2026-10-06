@@ -37,9 +37,9 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			"claim generation, server-derived disposition, and the latest capture's state.\n\n" +
 			"Owner-only: you see only your own runs' holds. An `archive_ready` hold has a recovery " +
 			"archive: recover it with `run export`; the hold releases itself once the archive is " +
-			"durable. A `source_only` or `needs_action` hold has no archive and awaits your " +
+			"durable. A `source_only` or `needs_action` hold retains local inventory and awaits your " +
 			"decision to discard it with `run discard <run-id> --hold <hold-id> --yes`. `source_only` " +
-			"means no archive exists and custody of the worker's local source is retained. For " +
+			"means the worker's local inventory remains in custody until a final disposition. For " +
 			"`source_only` and `needs_action` holds the retained source may be the only copy, so " +
 			"discarding one can destroy the work. `active` is healthy protection " +
 			"of a still-running run and needs nothing.\n\n" +
@@ -196,12 +196,16 @@ type recoveryOwnerHoldJSON struct {
 	TerminalRejection string `json:"terminal_rejection,omitempty"`
 }
 
-// sourceOnlyLine explains a source_only hold: no archive exists, so `uzi run export` cannot
-// serve it, yet the worker still holds the source. Attention is the server-authoritative
+// sourceOnlyLine explains retained local inventory, including a guarded hold with an
+// earlier downloadable archive pending final coverage. Attention is the server-authoritative
 // value; id and worker name are server-supplied and pass cellText like the table cells.
 func sourceOnlyLine(h apitypes.RecoveryCustodyHoldDTO) string {
 	if h.Attention != "source_only" {
 		return ""
+	}
+	if h.InventoryGuarded && h.HasAvailableCapture {
+		return fmt.Sprintf("hold %s: earlier recovery archive available; final inventory disposition is pending; custody of worker %s is retained",
+			cellText(h.ID), cellText(recoveryWorkerLabel(h)))
 	}
 	return fmt.Sprintf("hold %s: no recovery archive; custody of worker %s's local source is retained (export unavailable; it may be the only copy)",
 		cellText(h.ID), cellText(recoveryWorkerLabel(h)))

@@ -221,6 +221,25 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 	}
 }
 
+func TestClaimInventoryGuardWire(t *testing.T) {
+	for _, guarded := range []bool{false, true} {
+		p := sampleClaimPayloadWithSkills()
+		p.InventoryGuarded = guarded
+		raw, err := json.Marshal(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatal(err)
+		}
+		value, present := body["inventory_guarded"]
+		if present != guarded || (guarded && value != true) {
+			t.Fatalf("guarded=%v: inventory_guarded=%v present=%v", guarded, value, present)
+		}
+	}
+}
+
 func TestClaimSkillsWireContract(t *testing.T) {
 	got, err := json.MarshalIndent(sampleClaimPayloadWithSkills(), "", "  ")
 	if err != nil {

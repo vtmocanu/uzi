@@ -3021,7 +3021,7 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 		//   - WorkerIdentity is the immutable provenance value recorded on the hold for a
 		//     later AAD-authenticated post-terminal recovery retry (never nulled).
 		CustodyHoldLimit: custodyHoldLimit,
-		RecoveryCapable:  slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV1),
+		RecoveryCapable:  (slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV1) || slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV2) || slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryInventoryV1)),
 		WorkerIdentity:   workerIdentity(wkr),
 		// PRD #1390 M3: the three snapshot-dedupe params. @snapshot_fresh_cutoff bounds the
 		// persisted-snapshot freshness test; the request arrays are the claimant's own listed runs

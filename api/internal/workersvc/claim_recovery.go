@@ -56,7 +56,7 @@ type claimFinishQueries interface {
 	LockCodexAccountForShareNowait(ctx context.Context, arg store.LockCodexAccountForShareNowaitParams) (uuid.UUID, error)
 	GetRunCodexAuthContext(ctx context.Context, id uuid.UUID) (store.GetRunCodexAuthContextRow, error)
 	LockOpenCustodyHoldsForRunWorkerGeneration(ctx context.Context, arg store.LockOpenCustodyHoldsForRunWorkerGenerationParams) ([]uuid.UUID, error)
-	ReleaseCustodyHoldExact(ctx context.Context, arg store.ReleaseCustodyHoldExactParams) (int64, error)
+	ReleaseClaimCustodyNoAdoptedSource(ctx context.Context, arg store.ReleaseClaimCustodyNoAdoptedSourceParams) (int64, error)
 	ParkRunCodexAccountUnavailable(ctx context.Context, arg store.ParkRunCodexAccountUnavailableParams) (store.Run, error)
 	LockSecretEnablementForShareNowait(ctx context.Context, arg store.LockSecretEnablementForShareNowaitParams) (bool, error)
 	ParkCredentialDisabledRun(ctx context.Context, arg store.ParkCredentialDisabledRunParams) (int64, error)
@@ -329,9 +329,8 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		return nil, "", errClaimRecoveryCustody
 	}
 	if expected == 1 {
-		n, err := q.ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
+		n, err := q.ReleaseClaimCustodyNoAdoptedSource(ctx, store.ReleaseClaimCustodyNoAdoptedSourceParams{
 			RunID: run.ID, Generation: run.ClaimGeneration, WorkerID: identity.workerID,
-			ReleaseEvidence: pgconv.TextOrNull("no_adopted_source"),
 		})
 		if err != nil {
 			return nil, "", err
