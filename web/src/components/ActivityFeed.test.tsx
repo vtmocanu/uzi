@@ -115,6 +115,64 @@ function runFixture(over: Partial<Run> = {}): Run {
   };
 }
 
+describe("draft capture presentation", () => {
+  const draft = (seq: number, plan_md: string, over: Record<string, unknown> = {}) =>
+    m(seq, "status", { event: "draft_plan_capture", version: 1,
+      label: "draft, unapproved, possibly incomplete", plan_md, truncated: false, ...over });
+
+  for (const view of ["agent", "timeline"] as const) {
+    it(`latest valid draft wins by seq in ${view}, including an appended revision`, () => {
+      window.localStorage.setItem("uzi.activity.view", JSON.stringify(view));
+      const messages = [
+        draft(4, "# Current draft"), draft(1, "# Earlier draft"),
+        draft(5, "# Future draft", { version: 2 }),
+        draft(6, "# Malformed draft", { truncated: null }),
+        { ...m(7, "text", { text: "Validator report: revise the scope" }, "reviewer"), agent_instance: "validation-review" },
+        m(8, "plan", { plan_md: "# Submitted plan" }),
+        m(9, "status", { text: "Plan status remains ordinary" }),
+      ];
+      const original = JSON.stringify(messages);
+      const props = { run: runFixture(), runningLive: true, connected: true, terminal: false };
+      const r = render(<ActivityFeed messages={messages} {...props} />);
+      fireEvent.click(r.getByText("Expand all"));
+      expect(r.getAllByTestId("draft-plan-capture")).toHaveLength(1);
+      expect(r.getByRole("heading", { name: "Current draft" })).toBeTruthy();
+      expect(r.queryByRole("heading", { name: "Earlier draft" })).toBeNull();
+      expect(r.queryByRole("heading", { name: "Future draft" })).toBeNull();
+      expect(r.queryByRole("heading", { name: "Malformed draft" })).toBeNull();
+      expect(r.getAllByText("status: draft_plan_capture")).toHaveLength(2);
+      expect(r.getByText("Validator report: revise the scope", { selector: "p" })).toBeTruthy();
+      expect(r.getByText("plan submitted (awaiting approval)")).toBeTruthy();
+      expect(r.getAllByText("Plan status remains ordinary").length).toBeGreaterThan(0);
+      const card = r.getByTestId("draft-plan-capture");
+      expect(card.querySelector("button")).toBeNull();
+      if (view === "timeline") {
+        expect(card.compareDocumentPosition(r.getByText("Validator report: revise the scope", { selector: "p" })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      }
+      r.rerender(<ActivityFeed messages={[...messages, draft(10, "# Revised draft")]} {...props} />);
+      expect(r.getAllByTestId("draft-plan-capture")).toHaveLength(1);
+      expect(r.getByRole("heading", { name: "Revised draft" })).toBeTruthy();
+      expect(r.queryByRole("heading", { name: "Current draft" })).toBeNull();
+      expect(r.getByText("Validator report: revise the scope", { selector: "p" })).toBeTruthy();
+      expect(JSON.stringify(messages)).toBe(original);
+    });
+
+    it(`derives from the full stream before the cap in ${view} and retains Show all`, () => {
+      window.localStorage.setItem("uzi.activity.view", JSON.stringify(view));
+      // Highest seq is outside the capped suffix: array order must not select a draft.
+      const messages = [draft(2000, "# Full stream latest"), ...Array.from({ length: 1000 }, (_, i) =>
+        m(i + 2, "status", { text: `ordinary ${i}` })), draft(1, "# Stale suffix")];
+      const original = JSON.stringify(messages);
+      const r = renderFeed(messages);
+      expect(r.queryByTestId("draft-plan-capture")).toBeNull();
+      fireEvent.click(r.getByRole("button", { name: /Show .* earlier messages/i }));
+      expect(r.getByRole("heading", { name: "Full stream latest" })).toBeTruthy();
+      expect(r.queryByRole("heading", { name: "Stale suffix" })).toBeNull();
+      expect(JSON.stringify(messages)).toBe(original);
+    });
+  }
+});
+
 const TERMINAL: RunStatus[] = ["completed", "failed", "cancelled"];
 
 // renderFeed centralizes the now-required `run` prop and keeps runningLive/terminal

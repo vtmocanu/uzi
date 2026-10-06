@@ -70,6 +70,26 @@ Autopilot runs skip this gate entirely — see [Autopilot](./autopilot.md).
 A full revision round also works end to end from
 [Slack](./slack.md#using-it), without opening the web UI.
 
+### Advisory draft captures
+
+Before validation and after each revision, the lead can explicitly call
+`save_draft_plan` with its draft Markdown. The exact response is
+"Draft capture requested; this is not plan submission or approval."
+The activity log renders the latest valid capture by sequence number in both
+Timeline and By agent, labelled **draft, unapproved, possibly incomplete**.
+Captures are capped at 32 KiB after redaction; a truncated card shows a notice.
+Earlier captures remain stored and available in raw CLI JSON, even though their
+cards are suppressed in the web presentation. The existing activity display cap
+still applies. Subsequent validator reports remain ordinary messages in Timeline
+sequence order.
+
+Capture uses normal message delivery and best-effort close: a circuit breaker or
+deadline may leave an unacknowledged capture undelivered. The response does not
+promise it was saved. A capture offers no approval controls and never becomes the
+Plan tab's submitted plan. It cannot recover a plan from prose or a later prompt,
+and is never automatically adopted; a retry requires fresh review and ordinary
+plan submission and approval.
+
 ## Answering a question
 
 Beyond the plan gate and a follow-up you send yourself, an agent can stop

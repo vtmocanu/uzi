@@ -18,6 +18,7 @@ import {
 import { parseAnswerPayload, parseQuestionsForDisplay } from "../lib/runQuestion";
 import { FindingCard } from "./FindingCard";
 import { PlanMissingCard } from "./PlanMissingCard";
+import { parseDraftPlanCapture } from "./DraftPlanCapture";
 
 // Terse, per-kind rendering of a run's event stream — one readable line per
 // event instead of a JSON dump. Kinds come from agent/src/sdk-messages.ts (the
@@ -1059,7 +1060,17 @@ export const RunEventRow = memo(function RunEventRow({
     case "tool_result":
       // Only reached for orphan results; folded ones are skipped by the parent.
       return <StandaloneResult result={msg} />;
-    case "status":
+    case "status": {
+      const draft = parseDraftPlanCapture(msg);
+      if (draft) {
+        return (
+          <div className="rounded-md border border-warn/40 bg-warn/10 px-2.5 py-1.5 text-sm" data-testid="draft-plan-capture">
+            <div className="mb-1 text-xs font-semibold text-warn">{draft.label}</div>
+            {draft.truncated && <p className="mb-1 text-xs text-muted">Draft capture truncated at 32 KiB after redaction.</p>}
+            <Markdown content={draft.plan_md} />
+          </div>
+        );
+      }
       // Issue #1593: a prose-only planning turn. The card, not the one-line MetaLine,
       // because the lead's last message is the whole point of the row; it is untrusted
       // model text and PlanMissingCard renders it inert (see that file).
@@ -1069,6 +1080,7 @@ export const RunEventRow = memo(function RunEventRow({
         );
       }
       return <MetaLine text={describeStatus(msg.payload)} usage={phaseUsage} />;
+    }
     // PRD #634: the worker acknowledging an operator scope directive — it finalized the
     // committed slice at the ceiling. Rendered as a status-style MetaLine (the same
     // escaped React-text sink `status` uses via describeStatus): `text` is worker-authored,
