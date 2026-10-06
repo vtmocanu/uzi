@@ -24,8 +24,8 @@ through `[0.52.0]`.)
 
 ### Added
 
-- **Repository author eligibility assessment ([#2345](https://github.com/vtmocanu/uzi/issues/2345)).**
-  The API can distinguish authors who meet the forge's repository input threshold from non-members and unknown permissions, including Forgejo owners and team access where the existing bot token can establish it; assessment work is limited to 30 seconds and 200 distinct authors.
+- **Scheduled issue runs require human plan approval when issue input cannot qualify for automatic approval ([#2345](https://github.com/vtmocanu/uzi/issues/2345)).**
+  The API assesses repository author access, withholds ineligible or unknown comment bodies, and disables requested auto-approval for pinned-issue, label-sweep, and assigned-sweep runs with below-threshold or unverifiable input; CLI and web run views show the stored reasons while runs still queue and plan normally. Every issue run freezes its target title/body, including live target reads after edits or approval, while eligible late comments remain available through filtered reads. Claude/Codex planning context uses nonce fences for captured fields and assessed comments, and isolated research fences captured fields without restoring comments; these resist delimiter spoofing but do not guarantee protection from semantic injection or planning-time exfiltration. Schedule defaults remain ON, old transcript text and approvals are not retracted, and oversized/chunked GitHub/GitLab decoded-response memory hardening remains deferred.
 
 - **Advisory draft plans in run activity ([#2323](https://github.com/vtmocanu/uzi/issues/2323)).**
   The latest valid explicit draft capture appears as Markdown in both activity views, labelled draft, unapproved, possibly incomplete, with a truncation notice when needed; earlier captures remain stored and submitted-plan approval stays separate.
