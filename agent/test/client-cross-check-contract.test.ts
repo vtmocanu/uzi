@@ -69,6 +69,80 @@ it("strict checked state rejects skew once with its exact generation and present
   assert.deepEqual(sent, [body]);
 });
 
+const ackMaxBytes = 6 * 1024 * 1024;
+const checkedState = { status: "awaiting_approval" as const, claim_generation: 3 };
+
+function streamedAck(byteLength: number, contentLength?: string) {
+  const prefix = Buffer.from(JSON.stringify({ run: { status: "awaiting_approval" }, gate_revision: 2 }));
+  let emitted = 0;
+  let cancelled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (emitted === byteLength) {
+        controller.close();
+        return;
+      }
+      const chunk = Buffer.alloc(Math.min(64 * 1024, byteLength - emitted), 32);
+      if (emitted === 0) prefix.copy(chunk);
+      emitted += chunk.byteLength;
+      controller.enqueue(chunk);
+    },
+    cancel() { cancelled = true; },
+  }, { highWaterMark: 0 });
+  return {
+    response: new Response(stream, { headers: contentLength === undefined ? {} : { "Content-Length": contentLength } }),
+    cancelled: () => cancelled,
+    emitted: () => emitted,
+  };
+}
+
+it("strict checked state rejects actual streamed ACK overflow and cancels without trusting Content-Length", async (t) => {
+  for (const contentLength of [undefined, "64"]) {
+    const streamed = streamedAck(8_388_659, contentLength);
+    const fetch = t.mock.method(globalThis, "fetch", async () => streamed.response);
+    const c = client();
+    c.protocolFeatures = ["gate_revision_v1"];
+    await assert.rejects(c.reportPlanCrossCheckGateState("run", checkedState), /response body exceeds 6291456 bytes/);
+    assert.equal(streamed.cancelled(), true);
+    assert.equal(streamed.emitted(), ackMaxBytes + 64 * 1024, "stop at the first overflowing chunk");
+    assert.equal(fetch.mock.callCount(), 1);
+  }
+});
+
+it("strict checked state accepts large ACKs through EOF at and below the byte cap", async (t) => {
+  for (const byteLength of [ackMaxBytes - 1, ackMaxBytes]) {
+    const streamed = streamedAck(byteLength);
+    t.mock.method(globalThis, "fetch", async () => streamed.response);
+    const c = client();
+    c.protocolFeatures = ["gate_revision_v1"];
+    const ack = await c.reportPlanCrossCheckGateState("run", checkedState);
+    assert.equal(ack.applied, true);
+    assert.equal(ack.status, "awaiting_approval");
+    assert.equal(ack.gateRevision, 2);
+    assert.equal(streamed.emitted(), byteLength);
+  }
+});
+
+it("strict checked state propagates ACK stream failures while ordinary state retains compatibility", async (t) => {
+  const response = () => new Response(new ReadableStream<Uint8Array>({
+    pull() { throw new Error("fixture ACK stream failure"); },
+  }));
+  t.mock.method(globalThis, "fetch", async () => response());
+  const c = client();
+  c.protocolFeatures = ["gate_revision_v1"];
+  await assert.rejects(c.reportPlanCrossCheckGateState("run", checkedState), /fixture ACK stream failure/);
+  assert.deepEqual(await c.reportState("run", { status: "running" }), { applied: true, status: undefined });
+});
+
+it("ordinary state still accepts an ACK larger than the strict byte cap", async (t) => {
+  const streamed = streamedAck(ackMaxBytes + 1);
+  t.mock.method(globalThis, "fetch", async () => streamed.response);
+  const ack = await client().reportState("run", { status: "running" });
+  assert.equal(ack.applied, true);
+  assert.equal(ack.status, "awaiting_approval");
+  assert.equal(streamed.emitted(), ackMaxBytes + 1);
+});
+
 it("strict checked state rejects missing negotiation or generation without sending", async (t) => {
   const fetch = t.mock.method(globalThis, "fetch", async () => { throw new Error("must not send"); });
   const c = client();

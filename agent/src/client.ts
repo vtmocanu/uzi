@@ -1440,7 +1440,7 @@ export class WorkerClient {
     if (!Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
         !this.serverFeatures.has("gate_revision_v1"))
       throw new Error("checked plan state requires generation and gate_revision_v1");
-    return this.reportStateOnce(runId, `${WORKER_API_PREFIX}/runs/${runId}/state`, body, signal);
+    return this.reportStateOnce(runId, `${WORKER_API_PREFIX}/runs/${runId}/state`, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
   }
 
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
@@ -1475,7 +1475,7 @@ export class WorkerClient {
    *  handling, 200/409 single-body ACK parse, already-terminal handling and logging. Split out of
    *  reportState (PRD #1247 fix round E) so the claim_generation send-gate + strict-decode
    *  strip-and-retry can drive it through withGenerationFallback, exactly as postMessages. */
-  private async reportStateOnce(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
+  private async reportStateOnce(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal, maxAckBytes?: number): Promise<StateAck> {
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted();
       try {
@@ -1488,7 +1488,7 @@ export class WorkerClient {
           // the ACK so a FRESH run — frozen mid-run at plan-approval, after its claim was
           // already issued — learns its scaled cap here (a resume gets it on the claim
           // config instead). Absent/non-numeric ⇒ left undefined = "no budget update".
-          const fields = await readRunAck(res);
+          const fields = await readRunAck(res, maxAckBytes);
           const ack: StateAck = {
             applied: res.status === 200,
             status: fields.status,
@@ -2903,7 +2903,7 @@ function retryAfterMsOf(h: string | null): number | undefined {
  * and 64 capability plus 64 tool names at 256 bytes each (32 KiB). NormalizeCrossCheckFindings caps
  * serialized findings at 32 KiB. Thus 6 * (256 + 512 + 32) + 256 + 32 = 5088 KiB;
  * reserving another 64 KiB for keys/metadata stays below 6 MiB. Count actual streamed bytes,
- * never Content-Length; only the three cross-check methods opt in. */
+ * never Content-Length; the cross-check methods and strict gate ACK opt in. */
 const CROSS_CHECK_RESPONSE_MAX_BYTES = 6 * 1024 * 1024;
 /** Maximum success body size for the Codex release and refresh envelopes. */
 const CODEX_SUCCESS_BODY_MAX_BYTES = 64 * 1024;
@@ -2969,7 +2969,11 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
  * ONCE — a Response body is single-use — so status and both budget numbers must come out
  * of one parse.
  *
- * TOTAL by construction: every failure — an unreadable stream, malformed JSON, a
+ * With maxAckBytes, readBoundedText rejects actual byte overflow or stream failure outside
+ * the compatibility catch, so a strict gate report cannot manufacture a successful ACK.
+ * JSON decoding and per-field absence semantics remain unchanged.
+ *
+ * Without maxAckBytes, TOTAL by construction: every failure — an unreadable stream, malformed JSON, a
  * body with no run, a non-string status, a non-numeric budget, an older server that sent
  * nothing — yields the field absent rather than throwing. That is not defensiveness for
  * its own sake: the status caller's rule is a POSITIVE test for one literal, so a missing
@@ -2978,7 +2982,7 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
  * report that appears to have failed, and would be retried against a server that already
  * applied it.
  */
-export async function readRunAck(res: Response): Promise<{
+export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   status?: string;
   holdReason?: string | null;
   budgetMaxIterations?: number;
@@ -2999,8 +3003,9 @@ export async function readRunAck(res: Response): Promise<{
   gateRevision?: number;
   reconciliation?: PlanCrossCheckReconciliation;
 }> {
+  const boundedText = maxAckBytes === undefined ? undefined : await readBoundedText(res, maxAckBytes, true);
   try {
-    const text = await res.text();
+    const text = boundedText ?? await res.text();
     if (!text) return {};
     const parsed = JSON.parse(text) as {
       // PRD #1392 M2 (D10): `reason` is TOP-LEVEL on the {run, reason?} ack body, NOT under run.
