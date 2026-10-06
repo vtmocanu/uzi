@@ -83,7 +83,7 @@ import { makeMemoryToolHandlers, memoryToolNames, type MemoryToolHandlers } from
 import { makeFindingsToolHandlers, reportIncidentalIssueToolName, type FindingsToolHandlers } from "../findings-tools.js";
 import { FORGE_SERVER_NAME, makeForgeToolHandlers, type ForgeToolHandlers } from "../forge-tools.js";
 import { provisionRunTools, removeProvisionDir } from "../provision-run.js";
-import { rmTeardownTree } from "../rmtree.js";
+import { rmTeardownTree, rmRunnerTeardownTree } from "../rmtree.js";
 import { asText } from "../tool-evidence.js";
 import {
   evidencesModelProcessing,
@@ -1119,7 +1119,9 @@ export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: Codex
         } finally {
           // Best-effort cleanup of the per-call trees; a failed rm never fails the advice call
           // (mirrors model-pass.ts's ephemeral-HOME cleanup posture for the Claude lane).
-          await fs.rm(ownedDataRoot, { recursive: true, force: true }).catch(() => undefined);
+          await rmRunnerTeardownTree(ownedDataRoot).catch((error) =>
+            log.warn("Codex advice data cleanup failed", { error: errMessage(error) }),
+          );
           await rmTeardownTree(cwd).catch((error) =>
             log.warn("Codex advice cwd cleanup failed", { error: errMessage(error) }),
           );

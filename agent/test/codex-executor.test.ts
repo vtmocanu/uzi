@@ -15,6 +15,7 @@ const HAS_PROCFS = process.platform === "linux";
 
 import {
   CodexExecutor,
+  makeProductionLaunchAdviceRoot,
   FailClosedExecutor,
   CodexAdviceCredentialBridge,
   buildRunLaneReconcile,
@@ -43,7 +44,7 @@ import { RunRunner } from "../src/runner.js";
 import { GitCache } from "../src/git.js";
 import { FakeApi } from "./fake-api.js";
 import { makeFixture } from "./fixture-repo.js";
-import { makeClaim, testGitCacheOptions } from "./helpers.js";
+import { makeClaim, testGitCacheOptions, recordingLogger } from "./helpers.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { WORKER_UID, RUNNER_UID, runnerCommand } from "../src/runner-uid.js";
@@ -5646,6 +5647,112 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
       : "requires running as WORKER_UID with WORKER_UID + RUNNER_UID group membership";
 
   describe("real worker-UID initialization and session cleanup", { skip: INIT_SKIP }, () => {
+describe("production advice data teardown (#2324)", () => {
+  it("advice ownedDataRoot preserves every outside file during runner-uid swaps", async () => {
+    const { runnerTeardownFixture, uidScript, seedRunnerRacedTree } = await import("./runner-teardown-fixtures.js");
+    const { startSwapRacer } = await import("./swap-racer.js");
+    const { assertOutsideFiles } = await import("./residual-fixtures.js");
+    await runnerTeardownFixture(async (root, victim) => {
+      const { logger } = recordingLogger();
+      const handle = await makeProductionLaunchAdviceRoot(root, "api_key", logger)({
+        kind: "advice", label: "review", provider: CODEX_PRODUCTION_PROVIDER, model: "gpt-6.1-sol",
+      });
+      const owned = path.join(root, "codex-advice-data", path.basename(handle.cwd));
+      // A sibling runner can make its own root listable by the worker. This fixture
+      // exposes the path-walk race rather than stopping at the baseline's private-root leak.
+      uidScript(runnerCommand, "require('node:fs').chmodSync(process.argv[1],0o2770)", owned);
+      seedRunnerRacedTree(owned, victim);
+      const racer = await startSwapRacer(owned, victim, root, runnerCommand);
+      let swaps = 0;
+      try { await handle.dispose(); }
+      finally { swaps = await racer.stop(); await handle.dispose().catch(() => undefined); }
+      await assertOutsideFiles(victim, swaps);
+    });
+  });
+
+  it("ordinary advice ownedDataRoot removes private runner-only content without leaking", async () => {
+    const { runnerTeardownFixture, writePrivateRunnerFile, assertGone } = await import("./runner-teardown-fixtures.js");
+    await runnerTeardownFixture(async (root) => {
+      const { logger, lines } = recordingLogger();
+      const handle = await makeProductionLaunchAdviceRoot(root, "api_key", logger)({
+        kind: "advice", label: "review", provider: CODEX_PRODUCTION_PROVIDER, model: "gpt-6.1-sol",
+      });
+      const owned = path.join(root, "codex-advice-data", path.basename(handle.cwd));
+      try {
+        assert.equal((await fs.lstat(owned)).uid, RUNNER_UID);
+        writePrivateRunnerFile(owned);
+        await handle.dispose();
+        await assertGone(owned);
+        await assertGone(handle.cwd);
+        assert.equal(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed"), false);
+      } finally { await handle.dispose().catch(() => undefined); }
+    });
+  });
+
+  it("advice data owner refusal warns, retains content and still removes cwd", async () => {
+    const { runnerTeardownFixture, uidScript, assertGone } = await import("./runner-teardown-fixtures.js");
+    await runnerTeardownFixture(async (root) => {
+      const { logger, lines } = recordingLogger();
+      const handle = await makeProductionLaunchAdviceRoot(root, "api_key", logger)({
+        kind: "advice", label: "review", provider: CODEX_PRODUCTION_PROVIDER, model: "gpt-6.1-sol",
+      });
+      const owned = path.join(root, "codex-advice-data", path.basename(handle.cwd));
+      try {
+        uidScript(runnerCommand, "require('node:fs').renameSync(process.argv[1],process.argv[1]+'.retained')", owned);
+        await fs.mkdir(owned);
+        await fs.writeFile(path.join(owned, "keep"), "keep");
+        await handle.dispose();
+        assert.equal(await fs.readFile(path.join(owned, "keep"), "utf8"), "keep");
+        await assertGone(handle.cwd);
+        assert.ok(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed" && /not owned/.test(String(rec(line).error))));
+      } finally { await handle.dispose().catch(() => undefined); }
+    });
+  });
+
+  it("advice data symlink refusal retains the link and outside content", async () => {
+    const { runnerTeardownFixture, uidScript, assertGone } = await import("./runner-teardown-fixtures.js");
+    await runnerTeardownFixture(async (root, victim) => {
+      const { logger, lines } = recordingLogger();
+      const handle = await makeProductionLaunchAdviceRoot(root, "api_key", logger)({
+        kind: "advice", label: "review", provider: CODEX_PRODUCTION_PROVIDER, model: "gpt-6.1-sol",
+      });
+      const owned = path.join(root, "codex-advice-data", path.basename(handle.cwd));
+      try {
+        uidScript(runnerCommand, "const fs=require('node:fs');fs.renameSync(process.argv[1],process.argv[1]+'.retained');fs.symlinkSync(process.argv[2],process.argv[1])", owned, victim);
+        await fs.writeFile(path.join(victim, "keep"), "outside");
+        await handle.dispose();
+        assert.ok((await fs.lstat(owned)).isSymbolicLink());
+        assert.equal(await fs.readFile(path.join(victim, "keep"), "utf8"), "outside");
+        await assertGone(handle.cwd);
+        assert.ok(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed"));
+      } finally { await handle.dispose().catch(() => undefined); }
+    });
+  });
+
+  it("advice disposal single-uid removes the actual worker-owned data root", async () => {
+    const { runnerTeardownFixture, uidScript, assertGone } = await import("./runner-teardown-fixtures.js");
+    await runnerTeardownFixture(async (root) => {
+      const { logger, lines } = recordingLogger();
+      const handle = await makeProductionLaunchAdviceRoot(root, "api_key", logger)({
+        kind: "advice", label: "review", provider: CODEX_PRODUCTION_PROVIDER, model: "gpt-6.1-sol",
+      });
+      const owned = path.join(root, "codex-advice-data", path.basename(handle.cwd));
+      try {
+        uidScript(runnerCommand, "require('node:fs').renameSync(process.argv[1],process.argv[1]+'.retained')", owned);
+        // The launcher requires the split. Exercise its actual disposal closure with
+        // a single-uid ownership fixture, then restore split before fixture disposal.
+        await fs.mkdir(owned);
+        await fs.writeFile(path.join(owned, "file"), "remove");
+        delete process.env.UZI_UID_SPLIT;
+        await handle.dispose();
+        await assertGone(owned);
+        await assertGone(handle.cwd);
+        assert.equal(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed"), false);
+      } finally { process.env.UZI_UID_SPLIT = "1"; await handle.dispose().catch(() => undefined); }
+    });
+  });
+});
+
   it(
     "run() initializes the FRESH per-run HOME to worker:runner 3770 BEFORE provisioning materializes it",
     async () => {
