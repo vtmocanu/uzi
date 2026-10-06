@@ -227,7 +227,14 @@ Matching is exact and case-sensitive after trimming whitespace from the config v
 
 ## Cross-check settings
 
-**Plan cross-check** is a per-user opt-in under **Settings → Run defaults → Cross-check**, not a deployment environment variable. Enabling it requires usable credentials for both Claude and Codex. The requirement is copied onto each new eligible auto-approved run, so toggling the setting does not change a run already created. In this release the checker is unavailable: required runs park at the human plan gate. See [Cross-check](./cross-check.md) for the covered runs and the later checker and code stages.
+**Plan cross-check** is a per-user opt-in under **Settings → Run defaults → Cross-check**, not a deployment environment variable. Enabling it requires usable credentials for both Claude and Codex. The requirement is copied onto each new eligible auto-approved run, so toggling the setting does not change a run already created. Claude-lead plans are checked on Codex; a non-pass normally forces a human plan gate, with terminal exceptions for irrecoverable delivery losses. Codex leads park as unsupported. See [Cross-check](./cross-check.md) for coverage and evidence display.
+
+| Var | Default | Notes |
+|---|---|---|
+| `PLAN_CROSS_CHECK_TIMEOUT` | `30m`, or half of `RUN_TIMEOUT` when `RUN_TIMEOUT` is 30 minutes or less | Server verdict deadline, including checker queue time. An explicit value must be a positive duration, at most `2h` and strictly below `RUN_TIMEOUT`; invalid values fail boot. Pending check time is excluded from the lead's wall budget. |
+| `CROSS_CHECK_MODEL_TIMEOUT` | `15m` | Worker checker-turn cap; positive and at most `2h`. The turn is also bounded by the remaining server verdict deadline. |
+
+Checker model and effort follow the child's resolved claim and are recorded as delivered. Stage-specific pins, dedicated checker slots, automatic checker revision, the Codex-lead direction and Code cross-check are not part of this release.
 
 ## Agent runtime (PRD #4)
 

@@ -131,7 +131,7 @@ A `ci_fix` run rides PRD #4's run machinery as a second run **kind** (`runs.kind
 
 **Verification** ("uzi verifies its work"): the pipeline sync stamps a `ci_fix` run's `fix_verdict` — `verified` when its post-fix pipeline passes, `fix_failed` when it fails — keyed on `runs.branch` (the fix branch, not the failed ref, which differ for a default-branch fix) with an `observed pipeline id > snapshot pipeline id` guard so the original failing pipeline never false-stamps. See [docs/configuration.md](docs/configuration.md#ci-status-integration-prd-6) for the env knobs and the documented residual risks (poll-based staleness, third-party secrets in logs, merge-result false-positives).
 
-**Automatic fixes (PRD #71)** extend this with an opt-in per-user trigger (`users.ci_autofix_enabled`, default off): a `CIAutoFix` detector on the same poller tick (after the pipeline sync) auto-queues the identical `ci_fix` run, auto-approved and skipping the plan gate, when a watched **agent-owned MR branch**'s pipeline fails and its owner opted in. `main`, the repo's default branch, and any non-MR ref are never eligible; only a branch an agent run itself produced is. A loop guard bounds retries (a per-branch attempt cap `CI_AUTOFIX_MAX_ATTEMPTS`, plus an early halt on a repeated failure signature), and a fix whose diff touches the CI config (`.gitlab-ci.yml`, `.gitlab/`, the project's configured CI config path) is parked for human approval with a fail-closed worker push guard as backstop. The manual **Fix CI** button remains the escape hatch. See [docs/ci-autofix.md](docs/ci-autofix.md) for the loop-guard rationale, the user-facing behavior, and the knobs.
+**Automatic fixes (PRD #71)** extend this with an opt-in per-user trigger (`users.ci_autofix_enabled`, default off): a `CIAutoFix` detector on the same poller tick (after the pipeline sync) auto-queues the identical `ci_fix` run, auto-approved (subject to the owner's [Plan cross-check](#plan-cross-check) snapshot), when a watched **agent-owned MR branch**'s pipeline fails and its owner opted in. `main`, the repo's default branch, and any non-MR ref are never eligible; only a branch an agent run itself produced is. A loop guard bounds retries (a per-branch attempt cap `CI_AUTOFIX_MAX_ATTEMPTS`, plus an early halt on a repeated failure signature), and a fix whose diff touches the CI config (`.gitlab-ci.yml`, `.gitlab/`, the project's configured CI config path) is parked for human approval with a fail-closed worker push guard as backstop. The manual **Fix CI** button remains the escape hatch. See [docs/ci-autofix.md](docs/ci-autofix.md) for the loop-guard rationale, the user-facing behavior, and the knobs.
 
 ### MR review watcher: auto-rework review comments (PRD #700)
 
@@ -557,6 +557,55 @@ the account it billed afterwards. That record is the attribution join
 `run_usage` (PRD #40) could never make; see
 `prds/done/111-auto-select-anthropic-token.md` for the ranking's rationale.
 
+### Plan cross-check
+
+An owner opts in through the cookie-only Run defaults setting; eligible new
+auto-approved `issue`, `prompt`, `self_improve`, `ci_fix` and `mr_rework` runs
+snapshot the requirement inside their INSERT. Seeded plans and gateless kinds
+are excluded. Required leads and `cross_check` children need a worker with
+`cross_check_v1`; the queued health reason exposes a missing capability.
+
+A Claude lead submits one bounded, normalized candidate with its immutable
+base commit and scanned planning diff. The API stores `cross_checks` and a
+report-only Codex child atomically through existing credential resolution.
+The lead retains its Claude credential, the child its Codex credential and
+usage attribution. The child has its own checkout, ordinary run slot and
+expedite priority; it publishes no branch/MR. The lead retains its slot while
+waiting, with pending wait excluded from its wall budget and banked on
+settlement. The server verdict deadline includes queue time.
+
+`SetRunAutopilotPlan` binds the latest opposite-harness APPROVE to the current
+claim generation, server-computed digest and matching approval-bearing
+fields. Adjacent running/progress/completion guards prevent an unchecked
+plan from being stored or completed through those paths. The worker must obey
+a refusal; server guards cannot prevent arbitrary execution by a worker that
+ignores them. Non-pass and refusal normally force a human gate; Codex leads
+park as unsupported.
+
+Irrecoverable preparation receipts fail with
+`plan cross-check: preparation receipts irrecoverably lost`; unrecoverable
+human presentation ACKs fail with
+`plan cross-check: human-presentation ACK unrecoverable`. After three
+preparation attempts and an acknowledged forced human gate, unresolved ACKs
+fail with `plan cross-check: preparation ACKs unrecoverable`. These paths do
+not enter `recovery_wait`, retry indefinitely or fabricate receipts/approval.
+D16 keeps the established human presentation/revision in execution-local
+context: status proof cannot mint or adopt a gate. Human revisions use the
+existing gate path; original checker findings remain historical evidence.
+
+The checker exposes Read and bounded Search, without shell/patch/delegation,
+and disables automatic repository instruction loading. Both fileop and direct
+provider access use required read-only checkout confinement. Explicit private
+home/Codex/sessions/XDG/tmp grants remain writable; broad shared access and
+escaping sibling/symlink reads are denied. This does not prove network
+isolation. Web and CLI show bounded findings and recorded child metadata,
+with current gate reason separate from historical candidate evidence; Slack
+shows the reason without findings. See [ADR-2149](adr/2149-cross-check.md) for
+confinement/proof limits and [PRD #2149](prds/2149-plan-cross-check.md) for
+rationale, validation provenance and pending hosted acceptance. Dedicated
+slots, automatic checker revision, Codex-lead checking, stage-specific pins
+and Code cross-check remain outside this implementation.
+
 ### Run lifecycle
 
 One `runs` row is the unit of work; an issue can accumulate several over its
@@ -647,14 +696,14 @@ queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiti
    ↳ cancel with no live poller → cancelled directly (server-side)
 ```
 
-The `runs.kind` domain itself (the nine values `issue`/`ci_fix`/`chat`/`judge`/`self_improve`/`prompt`/`task`/`mr_rework`/`job`; sections other than the job one below thread the first eight) has one Go
+The `runs.kind` domain itself (the ten values `issue`/`ci_fix`/`chat`/`judge`/`self_improve`/`prompt`/`task`/`mr_rework`/`job`/`cross_check`) has one Go
 home, `api/internal/runkind` (PRD #983): its constants and `All()` are pinned to the DB
 `runs_kind_check` constraint by a migration-parity test. The decoupled per-side mirrors
 each pin back to a source of truth: the agent's `RUN_KINDS` (`agent/src/protocol.ts`) to
 the same DB migration (`agent/test/run-kind-db-parity.test.ts`), and the web's `RUN_KINDS`
 (`web/src/lib/runKind.ts`) to the shared `fixtures/run-kinds/registry.json` (which the Go
 side pins too). The agent additionally collapses its per-kind behaviour into a
-`RUN_KIND_PROFILES` table (`agent/src/run-kind.ts`). Adding a tenth kind follows the
+`RUN_KIND_PROFILES` table (`agent/src/run-kind.ts`). Adding another kind follows the
 checklist in `api/internal/runkind/doc.go`.
 
 `running ⇄ awaiting_input` can fire twice over — once **pre-run**, ending the
@@ -984,9 +1033,10 @@ chain in the diagram above, with no intervening `running`.
   both, so the honest worst case is each **× (RUN_MAX_REQUEUES + 1)**, or **× (RUN_MAX_REQUEUES + 2)** for a run that used the one-shot finalize-resume allowance, issue #1742). **Only the
   deadline fails the run closed**; exhausting the cap emits a feed notice and the
   lead proceeds on its own judgment (the one cap-adjacent failure is pre-run-only:
-  looping on questions without ever reaching a plan). **Autopilot never parks**:
-  the same `claim.auto_approve` that short-circuits `gatePlan` short-circuits
-  `ask_user`, auto-resolving with the frozen `AUTOPILOT_SENTINEL_ANSWER` constant
+  looping on questions without ever reaching a plan). **Autopilot ordinary
+  questions auto-resolve**: `claim.auto_approve` short-circuits `ask_user`,
+  even though opted-in Plan cross-check can force a human plan gate,
+  auto-resolving with the frozen `AUTOPILOT_SENTINEL_ANSWER` constant
   (asserted byte-for-byte by a test, so do not paraphrase it here). The question
   surfaces on the run view, the owner's opt-in Slack DM, and `uzi run answer`, all
   three deriving it from the run feed rather than a dedicated field. See the PRD's

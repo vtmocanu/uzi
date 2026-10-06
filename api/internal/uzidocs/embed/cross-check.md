@@ -6,17 +6,58 @@ audience: user
 
 # Cross-check
 
-Cross-check asks the other model family for a second opinion on a run. Its two stages have different jobs:
+Cross-check asks the other model family for a second opinion on a run.
+**Plan cross-check** is a required gate on opted-in auto-approved plans.
+**Code cross-check** is a planned, separate advisory stage before publication;
+it is not available in this release.
 
-- **Plan cross-check** checks an auto-approved plan before implementation. It is a required gate for runs that have it enabled. A check that requests changes, blocks the plan, or cannot finish sends the run to a human plan gate. The owner can then approve, request changes, or reject the plan.
-- **Code cross-check** is a planned, separate opt-in stage before publication. It will review the finished code and provide advisory findings. It is not available in this release; enabling Plan cross-check does not enable Code cross-check.
+## 1. Enable Plan cross-check
 
-## Plan cross-check in this release
+In **Settings → Run defaults → Cross-check**, enable **Plan cross-check**.
+It is off by default and requires usable Claude and Codex credentials. The
+setting applies to new eligible auto-approved runs, not existing runs or
+human-gated plans. It covers issue, prompt, self-improvement, CI fix and merge
+request rework plans that reach the auto-approval gate. Gateless tasks and
+plans supplied at creation are outside this gate. Turning it off affects
+future runs only.
 
-In **Settings → Run defaults → Cross-check**, enable **Plan cross-check** for your account. It is off by default and requires usable Claude and Codex credentials. The setting applies to new auto-approved runs; it does not change runs already created or human-gated runs. It covers issue, prompt, self-improvement, CI fix, and merge request rework runs whose plans go through the auto-approval gate. Gateless tasks and plans supplied at creation are outside this gate.
+## 2. Wait for the checked plan
 
-This release establishes the required plan gate, but its checker is not connected yet. A new run that requires Plan cross-check waits in the queue until a worker advertising `cross_check_v1` can claim it. On a Claude lead, that worker parks the run at the human plan gate with **`plan cross-check: checker unavailable`**. An opted-in Codex lead parks with **`plan cross-check: not yet supported for a Codex lead`**. The run cannot implement an unchecked plan. Review the recorded plan there and approve, request changes, or reject it. Turning the setting off affects future runs only.
+Required runs wait for a worker advertising `cross_check_v1`. A **Claude
+lead's plan is checked on Codex** in a separate, read-only checker run.
+An APPROVE of the exact candidate permits implementation after the server
+acknowledges the matching plan. Changes requested, blocked, timeout or a
+failed check normally force a human plan gate. An unavailable checker,
+interrupted attempt, refused candidate/planning diff or submit failure also
+requires a human decision. An opted-in **Codex lead** parks with
+`plan cross-check: not yet supported for a Codex lead`.
 
-The next integration stage will check **Claude-lead plans on Codex**. An exact approval will let implementation proceed; a request for changes, block, timeout, or failed check will park the lead for a human decision. An opted-in **Codex-lead** run will park with **`plan cross-check: not yet supported for a Codex lead`** until the Codex-lead direction is implemented. It will not implement an unchecked plan. Code cross-check is a later feature with its own setting.
+Checker runs use ordinary worker slots; the lead holds its slot while
+waiting. The verdict deadline includes queue time. Waiting for the check is
+excluded from the lead's wall budget. See [Configuration](./configuration.md#cross-check-settings)
+for timeout defaults and bounds.
 
-For a parked run, open its plan gate in uzi to make the decision. Slack shows the cross-check **reason only** on the gate card, not checker findings. The detailed findings and child-run link arrive with the checker integration; they are not present in this release.
+## 3. Read the evidence and decide
+
+Open the run to see the current gate reason, checked-candidate outcome,
+findings, checker-run link, recorded model/effort and reported tokens/cost.
+Unknown or inconsistent outcomes show **Outcome unavailable**. Findings use
+hardened Markdown with a display cap of 16,384 source characters and 20 items;
+omitted text is disclosed. Missing cost shows unavailable; subscription usage
+is labelled separately from metered spend. After a human revision,
+**Earlier-plan evidence** does not certify the current plan. Approve, request
+changes or reject the plan shown at the current gate; the original check stays
+as history, without an automatic new checker round.
+
+[CLI](./cli.md#plan-cross-check-evidence) shows the reason and findings;
+[Slack](./slack.md#using-it) shows the reason without findings.
+
+## Terminal delivery failures
+
+Two delivery-loss exceptions fail the run instead of parking:
+`plan cross-check: preparation receipts irrecoverably lost` and
+`plan cross-check: human-presentation ACK unrecoverable`. After three
+preparation attempts and an acknowledged forced human gate, unresolved ACKs
+also fail with `plan cross-check: preparation ACKs unrecoverable`. These paths
+do not retry indefinitely, enter `recovery_wait`, invent receipts or approve.
+See the [architecture](../ARCHITECTURE.md#plan-cross-check) for the boundary.

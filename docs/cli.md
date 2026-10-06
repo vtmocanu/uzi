@@ -2187,6 +2187,28 @@ presented at the gate, `0` for a run that has never gated under this
 feature). See [Run activity pane](./run-activity.md#plan-approval-gate) and
 `--expected-gate-revision` above.
 
+### Plan cross-check evidence
+
+`uzi whoami` shows your `PLAN CROSS-CHECK` consent value. Change it in
+**Settings → Run defaults → Cross-check**; there is no CLI write verb for
+this cookie-only consent setting.
+
+`uzi run get <id>` shows `PLAN_CROSS_CHECK` for a current cross-check human
+gate reason. Its `PLAN_CHECK_*` rows show the stored candidate's result,
+reason, checker id, recorded model/effort, tokens/cost and findings. A human
+revision changes the evidence prefix to `EARLIER_PLAN_CHECK_*` and adds a
+warning that the check does not certify the current plan. Missing cost stays
+unavailable; subscription usage is distinguished from metered spend.
+
+The human view bounds findings to 20 items and sends displayed text through
+`Plain` for terminal/control sanitization. Use `uzi run get <id> --json` for
+the structured `plan_cross_check_required`, `plan_cross_check_gate_reason`
+and optional `plan_cross_check_summary` fields, or
+`uzi run get <id> --field plan_cross_check_required` for the run's snapshot.
+A stored checker APPROVE and a current human gate can coexist: decide against
+the displayed gate revision, not historical findings. See
+[Cross-check](./cross-check.md) for fallbacks and terminal delivery failures.
+
 A run's PRD-completion declaration is readable the same way:
 `uzi run get <id> --field prd_done_path` (the repo-relative path the run
 declared it moved a completed PRD to, e.g. `prds/done/72-x.md`) and <!-- check-docs:ignore-path: didactic example path, not a real PRD -->
