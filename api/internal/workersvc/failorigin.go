@@ -3,9 +3,9 @@ package workersvc
 // PRD #69 M7a Pass A (the SEAM): the server's authoritative copy of the fail_origin
 // vocabulary, modelled EXACTLY on the rate_limit_type precedent above (see
 // limitwait.go's rateLimitTypes / CoerceRateLimitType). The judge needs a TRUSTED,
-// structured failure ORIGIN for each failed run; today that origin lives only in
-// free-text failure_reason, which is never parsed. This is the closed enum stamped at
-// each terminal-failure write site (migration 00126's CHECK).
+// structured failure ORIGIN for each failed run, independent of free-text
+// failure_reason, which is never parsed. This is the closed enum stamped at
+// each terminal-failure write site (the latest runs_fail_origin_check migration).
 //
 // WHY THE ALLOWLIST IS THE WHOLE SANITIZER, and why it lives here rather than in the
 // worker: identical to rate_limit_type's argument. The worker reports fail_origin as
@@ -26,10 +26,10 @@ package workersvc
 // the judgeable agent-failure case — but that default is a decision made at the write
 // site, not smuggled in by the coercer.
 
-// failOrigins is the closed set migration 00126's CHECK enforces, in source order.
+// failOrigins is the closed set the latest runs_fail_origin_check migration enforces.
 //
-// Adding or removing a member here without moving 00126 in the same commit is caught
-// by TestFailOriginVocabularyMatchesCheck, which parses the CHECK out of the migration
+// Adding or removing a member requires an additive migration, checked
+// by TestFailOriginVocabularyMatchesCheck, which parses the latest Up CHECK
 // and compares — so a drift reddens at `go test` rather than raising 23514 on a user's
 // failed run.
 var failOrigins = []string{
@@ -136,6 +136,9 @@ var failOrigins = []string{
 	"no_job_capable_worker",
 	"ephemeral_worker_never_registered",
 	"job_no_result",
+	// #2321: a worker-reported provider safety refusal. Judge eligibility matches
+	// agent_failure, including resumed runs; no judge skip set includes this origin.
+	"provider_policy_refusal",
 }
 
 // failOriginSet is the lookup form. Built once; failOrigins stays the declaration so
@@ -159,8 +162,8 @@ func AllFailOrigins() []string {
 }
 
 // workerReportableFailOrigins is the SUBSET of the vocabulary a worker may report on its
-// own `failed` state. The other five — worker_lost, run_timeout, plan_rejected,
-// auto_stopped, guardrail_blocked — are stamped ONLY by the server's own sweeper/queries
+// own `failed` state. Server-only origins (including worker_lost, run_timeout,
+// plan_rejected, auto_stopped and guardrail_blocked) are stamped by server sweeper/queries
 // and claim-assembly recovery, never by a worker, so a worker value naming one of them is
 // a forgery: it would corrupt the TRUSTED classification the judge and any consumer key
 // on, and (guardrail_blocked being a Gate 4b member) let an untrusted report steer whether
@@ -182,7 +185,8 @@ func AllFailOrigins() []string {
 // prove the run's execution stopped or could not clear or quarantine residue at the run's clone
 // path, so it refused to push, capture or reseed), and skills_plugin_load_failed (issue #1888:
 // the Claude SDK reported load errors for the run's selected-skills plugin at session start, so
-// the worker failed the run rather than run it without its skills); agent_failure is included because it is the judgeable
+// the worker failed the run rather than run it without its skills), and provider_policy_refusal
+// (#2321: a provider safety refusal); agent_failure is included because it is the judgeable
 // default the `failed` arm applies anyway, so an explicit worker agent_failure is
 // harmless and semantically correct. The partition (worker-reportable + server-only ==
 // vocabulary) is pinned by TestCoerceFailOrigin.
@@ -207,6 +211,7 @@ var workerReportableFailOrigins = map[string]bool{
 	// issue #1888: the worker fails a run with selected skills whose Claude SDK skills plugin
 	// failed to load at session start (never judged; see failOrigins and neverJudgeFailOrigins).
 	"skills_plugin_load_failed": true,
+	"provider_policy_refusal":   true,
 }
 
 // CoerceFailOrigin maps a worker-reported fail_origin onto the WORKER-REPORTABLE subset.

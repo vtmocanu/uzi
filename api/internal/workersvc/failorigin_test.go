@@ -92,6 +92,44 @@ func TestPlanMissingIsWorkerReportableAndJudged(t *testing.T) {
 	}
 }
 
+// TestProviderPolicyRefusalIsWorkerReportableAndJudged pins #2321's additive origin.
+func TestProviderPolicyRefusalIsWorkerReportableAndJudged(t *testing.T) {
+	const origin = "provider_policy_refusal"
+	if !failOriginSet[origin] {
+		t.Fatal("provider_policy_refusal must be stored")
+	}
+	reported := origin
+	if got := CoerceFailOrigin(&reported); got == nil || *got != origin {
+		t.Fatalf("CoerceFailOrigin = %v, want passthrough", got)
+	}
+	for name, set := range map[string]map[string]bool{
+		"neverJudgeFailOrigins":    neverJudgeFailOrigins,
+		"preStartInfraFailOrigins": preStartInfraFailOrigins,
+		"envPublishFailOrigins":    envPublishFailOrigins,
+	} {
+		if set[origin] {
+			t.Fatalf("%s unexpectedly skips provider_policy_refusal", name)
+		}
+	}
+	for _, origin := range []string{origin, "agent_failure"} {
+		for _, iter := range []int32{0, 7} {
+			t.Run(origin+"/iteration_count="+strconv.Itoa(int(iter)), func(t *testing.T) {
+				fs, svc, run := eligibleFixture(t)
+				run.Status = "failed"
+				run.FailOrigin = pgconv.TextOrNull(origin)
+				run.IterationCount = iter
+				svc.maybeEnqueueJudge(context.Background(), run)
+				if fs.createdJudgeRun == nil {
+					t.Fatal("eligible failed run must enqueue a judge")
+				}
+				if !fs.createdJudgeRun.TargetRunID.Valid || fs.createdJudgeRun.TargetRunID.Bytes != [16]byte(run.ID) {
+					t.Fatal("judge must target the failed run")
+				}
+			})
+		}
+	}
+}
+
 // TestWorkerResidueBlockedIsWorkerReportableAndNeverJudged pins issue #1783's origin:
 // worker_residue_blocked is a stored vocabulary member, the worker may report it
 // (CoerceFailOrigin passes it through verbatim, so the typed failure is not flattened to
@@ -175,8 +213,8 @@ func TestSkillsPluginLoadFailedIsWorkerReportableAndNeverJudged(t *testing.T) {
 	}
 }
 
-// TestFailOriginVocabularyMatchesCheck is the instrument migration 00126's comment
-// promises, copied from TestRateLimitTypeVocabularyMatchesCheck (00091's) for the same
+// TestFailOriginVocabularyMatchesCheck checks the latest stored vocabulary, copied from
+// TestRateLimitTypeVocabularyMatchesCheck (00091's) for the same
 // reason it exists there: a value Go writes and the CHECK rejects becomes a constraint
 // violation (23514) at a failed run's write — turning a classification into a second
 // failure — and a value in the CHECK Go never writes is a promise nothing keeps. It
