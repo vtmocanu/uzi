@@ -563,7 +563,10 @@ export class MessageBatcher {
       releaseAppliedGate: (ack) => {
         if (!ack?.applied || ack.status !== "awaiting_approval" || ack.staleClaim ||
             !ack.reconciliation || ack.reconciliation.gateRevision < 1) return false;
-        return this.releaseReservation(r, ack.reconciliation);
+        const cursor = ack.reconciliation.leadLastSeq;
+        if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor > 0x7fffffff) return false;
+        return this.releaseReservation(r, { ...ack.reconciliation,
+          leadLastSeq: r.submitted ? cursor : Math.max(cursor, r.tail) });
       },
     };
   }

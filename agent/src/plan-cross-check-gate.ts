@@ -10,7 +10,7 @@ import type { StateAck } from "./protocol.js";
 export interface CheckedHumanGate {
   phase: "publishinginitial" | "confirmedwait" | "revisionplanning" | "publishingrevised" | "terminal";
   continueWait?: () => Promise<import("./steering.js").PlanVerdict>;
-  onApplied?: (ack: StateAck) => void;
+  onApplied?: (ack: StateAck) => void | Promise<void>;
 }
 
 export interface PlanCrossCheckTiming {
@@ -23,7 +23,8 @@ export interface PlanCrossCheckTiming {
 type CandidateResponse = Extract<PlanCrossCheckResponse, { result: "candidate" }>;
 export type CheckedPlanDecision =
   | { kind: "approve"; response: CandidateResponse }
-  | { kind: "human"; fields: PlanCrossCheckStateRequest; reservation?: CandidateTransportReservation };
+  | { kind: "human"; fields: PlanCrossCheckStateRequest; reservation?: CandidateTransportReservation;
+      completePreparation?: (signal: AbortSignal) => Promise<void> };
 
 /** One checker candidate, bounded preparation and submission retries, owner-cancellable polling.
  * Each failed HTTP attempt is awaited through cancellation before any sibling request starts.
@@ -70,33 +71,68 @@ export async function checkPlan(options: {
     identity ??= response;
     return response;
   };
+  let preparationAttempts = 0;
   try {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      signal.throwIfAborted();
-      const prepared = await reservation.prepare(timing?.preparationMs ?? 3000, signal);
-      signal.throwIfAborted();
-      if (prepared.prepared) break;
+    const prepare = async (owner: AbortSignal): Promise<boolean> => {
+      owner.throwIfAborted();
+      preparationAttempts++;
+      const preparationMs = Math.min(timing?.preparationMs ?? 3000, 3000);
+      const owned = AbortSignal.any([owner, AbortSignal.timeout(preparationMs)]);
+      const prepared = await reservation.prepare(preparationMs, owned);
+      owner.throwIfAborted();
+      if (prepared.prepared) {
+        const confirmed = await batcher.usage.drainConfirmed(preparationMs, owned);
+        owner.throwIfAborted();
+        if (batcher.usage.hasUnconfirmedLoss || batcher.usage.inactive)
+          throw new Error("plan cross-check: preparation receipts irrecoverably lost");
+        return confirmed;
+      }
       if (prepared.permanent) {
         const condition = prepared.reason === "usage_unconfirmed" || prepared.reason === "ownership_unknown"
           ? "preparation receipts irrecoverably lost"
           : `transport permanently failed (${prepared.reason ?? "unknown"})`;
         throw new Error(`plan cross-check: ${condition}`);
       }
-      if (attempt === 2) throw new Error("plan cross-check: preparation retries exhausted");
-      await delay(timing?.backoffMs?.[attempt] ?? (attempt + 1) * 1000, undefined, { signal });
-    }
-    const checkTransport = async (): Promise<void> => {
+      return false;
+    };
+    const heldHuman = (): CheckedPlanDecision => ({ kind: "human", reservation,
+      fields: { status: "awaiting_approval", plan_cross_check_gate_reason: "checker_failed",
+        plan_cross_check_refusal: "submit_failed" },
+      completePreparation: async (owner) => {
+        // Only the applied forced gate owns these remaining attempts. Keep the original
+        // reservation on exhaustion; MessageBatcher.close preserves its assigned replay.
+        while (preparationAttempts < 3) {
+          const backoff = preparationAttempts - 1;
+          await delay(timing?.backoffMs?.[backoff] ?? preparationAttempts * 1000, undefined, { signal: owner });
+          if (await prepare(owner)) return;
+        }
+        owner.throwIfAborted();
+        throw new Error("plan cross-check: preparation ACKs unrecoverable");
+      } });
+    if (!await prepare(signal)) return heldHuman();
+    const checkTransport = async (): Promise<boolean> => {
       signal.throwIfAborted();
       if (batcher.usage.hasUnconfirmedLoss || batcher.usage.inactive)
         throw new Error("plan cross-check: preparation receipts irrecoverably lost");
-      const prepared = await reservation.prepare(timing?.preparationMs ?? 3000, signal);
+      const preparationMs = Math.min(timing?.preparationMs ?? 3000, 3000);
+      const owned = AbortSignal.any([signal, AbortSignal.timeout(preparationMs)]);
+      const prepared = await reservation.prepare(preparationMs, owned);
       signal.throwIfAborted();
-      if (!prepared.prepared)
+      if (!prepared.prepared && prepared.permanent)
         throw new Error(`plan cross-check: transport permanently failed (${prepared.reason ?? "unknown"})`);
+      // prepare caches its successful receipt; usage produced while polling has its
+      // own ACK check and must join the same held completion if that check fails.
+      const confirmed = prepared.prepared &&
+        await batcher.usage.drainConfirmed(preparationMs, owned);
+      signal.throwIfAborted();
+      if (batcher.usage.hasUnconfirmedLoss || batcher.usage.inactive)
+        throw new Error("plan cross-check: preparation receipts irrecoverably lost");
+      if (!confirmed) preparationAttempts++;
+      return confirmed;
     };
     const human = async (reason: PlanCrossCheckGateReason,
       refusal?: PlanCrossCheckStateRequest["plan_cross_check_refusal"]): Promise<CheckedPlanDecision> => {
-      await checkTransport();
+      if (!await checkTransport()) return heldHuman();
       return { kind: "human", reservation, fields: { status: "awaiting_approval",
         plan_cross_check_gate_reason: reason, ...(refusal ? { plan_cross_check_refusal: refusal } : {}) } };
     };
@@ -104,7 +140,7 @@ export async function checkPlan(options: {
     // A no_row GET after POST is only a read-time observation. It cannot release transport.
     for (let attempt = 0; attempt < 3 && response === undefined; attempt++) {
       signal.throwIfAborted();
-      await checkTransport();
+      if (!await checkTransport()) return heldHuman();
       reservation.markSubmitted();
       try {
         response = await request((owned) => client.submitPlanCrossCheck(runId, generation, candidate, owned));
@@ -140,12 +176,12 @@ export async function checkPlan(options: {
     // Bound by the immutable stored deadline and owner cancellation. A transient status failure
     // retains the same identity; every iteration sleeps, including failed reads.
     while (current.verdict === "pending") {
-      await checkTransport();
+      if (!await checkTransport()) return heldHuman();
       const remaining = Date.parse(current.deadline_at) - Date.now();
       if (remaining <= 0) return await human("timed_out");
       await delay(Math.min(timing?.pollMs ?? 15_000, remaining), undefined, { signal });
       signal.throwIfAborted();
-      await checkTransport();
+      if (!await checkTransport()) return heldHuman();
       if (Date.now() >= Date.parse(current.deadline_at)) return await human("timed_out");
       let polled: PlanCrossCheckResponse;
       try {
@@ -166,7 +202,7 @@ export async function checkPlan(options: {
         return await human(validated.invalid, validated.invalid === "checker_failed" ? "submit_failed" : undefined);
       current = validated;
     }
-    await checkTransport();
+    if (!await checkTransport()) return heldHuman();
     if (current.verdict === "approve") {
       if (Date.now() >= Date.parse(current.deadline_at)) return await human("timed_out");
       if (!reservation.release(current))

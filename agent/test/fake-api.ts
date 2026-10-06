@@ -237,6 +237,9 @@ export class FakeApi {
   readonly crossCheckRequests: { runId: string; method: string; body: Record<string, unknown> }[] = [];
   readonly crossCheckReplies: { runId: string; method: string; status: number; acceptedCandidate: boolean; dropped: boolean }[] = [];
   usageHandler?: () => { status: number; body: unknown };
+  /** Focused receipt fixture: hold a message response until its request is aborted. */
+  holdMessagesUntilAbort?: (runId: string, body: Record<string, unknown>) => boolean;
+  abortedHeldMessages = 0;
   readonly usageRequests: Record<string, unknown>[] = [];
   checkedTransport = false;
   private readonly checkedFencedRuns = new Set<string>();
@@ -1205,8 +1208,14 @@ export class FakeApi {
     if (runMatch) {
       const runId = runMatch[1] as string;
       const kind = runMatch[2] as string;
-      if (req.method === "POST" && kind === "messages")
+      if (req.method === "POST" && kind === "messages") {
+        if (this.holdMessagesUntilAbort?.(runId, json)) {
+          await new Promise<void>((resolve) => res.once("close", resolve));
+          this.abortedHeldMessages++;
+          return;
+        }
         return this.handleMessages(res, runId, json);
+      }
       if (req.method === "POST" && kind === "state")
         return this.handleState(res, runId, json);
       if (req.method === "GET" && kind === "inputs") {

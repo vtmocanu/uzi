@@ -1113,7 +1113,8 @@ it("forced applied gate ACK requires current settled proof and completed receipt
     { ...ack, staleClaim: true }, { ...ack, reconciliation: undefined },
     { ...ack, reconciliation: { ...ack.reconciliation, claimGeneration: 2 } },
     { ...ack, reconciliation: { ...ack.reconciliation, planCrossCheckSettled: false } },
-    { ...ack, reconciliation: { ...ack.reconciliation, leadLastSeq: 0 } },
+    ...[-1, NaN, Infinity, 1.5, 0x80000000].map((leadLastSeq) =>
+      ({ ...ack, reconciliation: { ...ack.reconciliation, leadLastSeq } })),
   ]) assert.equal(r.releaseAppliedGate(bad), false);
   assert.equal(r.releaseAppliedGate(ack), true);
   assert.equal(r.releaseAppliedGate(ack), false);
@@ -1176,5 +1177,37 @@ it("overflow and cancellation are permanent and cannot resurrect through rearm o
     assert.equal(b.currentSeq(), 1);
     assert.equal(b.bufferedCount(), 1);
     await b.close();
+  }
+});
+
+it("an old valid applied gate ACK releases only never-submitted transport after delayed receipts", async () => {
+  for (const submitted of [false, true]) {
+    let offline = true;
+    const { b, sent } = fixture(async () => {
+      if (offline) throw new Error("offline before forced gate");
+    });
+    b.emit(event("original first"));
+    b.emit(event("original second"));
+    const r = b.reserveCandidateTransport();
+    b.emit(event("held completion"));
+    try {
+      assert.equal((await r.prepare()).prepared, false);
+      const ack = { applied: true, status: "awaiting_approval" as const,
+        reconciliation: { ...proof(1).reconciliation!, gateRevision: 2 } };
+      if (submitted) r.markSubmitted();
+      assert.equal(r.releaseAppliedGate(ack), false, "delayed receipts must first complete");
+      offline = false;
+      assert.equal((await r.prepare()).prepared, true);
+      assert.deepEqual(sent[1], sent[0], "the HTTP retry preserves assigned seq and payload");
+      assert.equal(r.releaseAppliedGate(ack), !submitted);
+      assert.equal(b.currentSeq(), submitted ? 2 : 3, "submitted transport retains the strict ACK cursor guard");
+      if (!submitted) {
+        await b.flush();
+        assert.deepEqual(sent.at(-1)?.map((m) => [m.seq, m.payload]), [[3, { text: "held completion" }]]);
+      }
+    } finally {
+      r.cancel();
+      await b.close();
+    }
   }
 });

@@ -150,25 +150,35 @@ describe("confirmed usage ownership", () => {
 
   it("keeps the second request unchanged after the first ACK and a later ambiguous ACK", async () => {
     const client = new FakeUsageClient();
-    const recorder = makeRecorder(client);
+    const recorder = makeRecorder(client, { debounceMs: 1 });
     const leg = recorder.startLeg();
     for (let i = 0; i <= USAGE_POST_MAX_RECORDS; i++)
       leg.observeAssistant(assistant(`batch-${i}`, { input_tokens: 1 }));
-    let retryStarted!: () => void;
-    const retry = new Promise<void>((resolve) => { retryStarted = resolve; });
+
     client.respond = async () => {
       if (client.calls.length === 2) {
         leg.observeAssistant(assistant(`batch-${USAGE_POST_MAX_RECORDS}`, { input_tokens: 9 }));
         throw new Error("second ACK lost");
       }
-      if (client.calls.length === 3) retryStarted();
+
     };
     assert.equal(await recorder.drainConfirmed(), false);
     const original = client.calls[1]!.body;
-    await retry;
+    const later = recorder.startLeg();
+    later.observeAssistant(assistant("later-leg", { input_tokens: 2 }));
+    later.close();
+    await sleep(30);
+    assert.equal(client.calls.length, 2, "new legs and updates cannot schedule a retained confirmed retry");
     assert.equal(await recorder.drainConfirmed(), true);
     assert.deepEqual(client.calls[2]!.body, original);
     assert.equal(client.calls[3]!.body.messages[0]!.input_tokens, 9);
+    const acknowledgedCalls = client.calls.length;
+    let debounced!: () => void;
+    const debounce = new Promise<void>((resolve) => { debounced = resolve; });
+    client.respond = async () => { debounced(); };
+    leg.observeAssistant(assistant("after-ACK", { input_tokens: 4 }));
+    await debounce;
+    assert.equal(client.calls.length, acknowledgedCalls + 1, "successful ACK resumes ordinary debounce");
     recorder.release();
   });
 

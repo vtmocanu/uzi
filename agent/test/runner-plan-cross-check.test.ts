@@ -2,6 +2,10 @@ import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
+import { Outbox } from "../src/outbox.js";
+import { RecoveryCoordinator, type RecoveryArchiveClient } from "../src/recovery.js";
+import type { OutgoingMessage } from "../src/protocol.js";
 import { createHash } from "node:crypto";
 import { PlanRejectedError, type Executor, type RunContext } from "../src/executor.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
@@ -50,11 +54,11 @@ function checkedExec(before?: (ctx: RunContext) => Promise<void>) {
   } };
   return { exec, verdicts };
 }
-async function start(exec: Executor, c = claim()) {
+function start(exec: Executor, c = claim()) {
   const forge = fakeGitlab();
-  await runner(exec, forge.gitlab, undefined, { planCrossCheckTiming: timing,
-    planApprovalTimeoutMs: 4000 }).execute(c);
-  return forge;
+  const run = runner(exec, forge.gitlab, undefined, { planCrossCheckTiming: timing,
+    planApprovalTimeoutMs: 4000 });
+  return Object.assign(run.execute(c).then(() => forge), { shutdown: () => run.shutdown() });
 }
 function terminal(runId: string, condition: string) {
   const states = api.states.filter((s) => s.runId === runId).map((s) => s.body);
@@ -65,6 +69,331 @@ function terminal(runId: string, condition: string) {
 }
 
 describe("U2 real runner checked gate", () => {
+  for (const action of ["approve_plan", "revise_plan", "reject_plan"] as const) {
+    it(`retryable preparation publishes once before replay and restores human ${action}`, async () => {
+      const c = claim();
+      const held = holdGateAck(c.run_id, PLAN);
+      const attempts: OutgoingMessage[][] = [];
+      const reserve = MessageBatcher.prototype.reserveCandidateTransport;
+      MessageBatcher.prototype.reserveCandidateTransport = function () {
+        this.emit({ kind: "status", payload: { text: "preparation prefix" } });
+        api.failMessagesNext(1);
+        return reserve.call(this);
+      };
+      const post = client.postMessages.bind(client);
+      const report = client.reportPlanCrossCheckGateState.bind(client);
+      let applied = false;
+      let inputId = 0;
+      const seen: PlanVerdict[] = [];
+      client.postMessages = async (id, msgs, generation, signal) => {
+        if (id === c.run_id && msgs.some((m) => (m.payload as { text?: string }).text === "preparation prefix")) {
+          attempts.push(structuredClone(msgs));
+          if (attempts.length > 1) {
+            assert.equal(gates(c.run_id).length, 1);
+            assert.equal(applied, true, "retry waits for the applied forced gate ACK");
+          }
+        }
+        return post(id, msgs, generation, signal);
+      };
+      client.reportPlanCrossCheckGateState = async (id, fields, signal) => {
+        const ack = await report(id, fields, signal);
+        if (id === c.run_id && fields.status === "awaiting_approval" && fields.plan_md === PLAN) {
+          assert.equal(fields.plan_cross_check_gate_reason, "checker_failed");
+          assert.equal(fields.plan_cross_check_refusal, "submit_failed");
+          applied = ack.applied;
+        }
+        return ack;
+      };
+      api.onState(c.run_id, (b) => {
+        if (b.status === "awaiting_approval")
+          inputId = send(c.run_id, row(b.plan_md === PLAN ? action : "reject_plan", "human choice"))[0]!.id;
+      });
+      const exec: Executor = { run: async (ctx) => {
+        const leg = ctx.usage!.startLeg();
+        leg.observeAssistant({ message: { id: "preparation-usage", model: "claude", usage: { input_tokens: 3 } } });
+        leg.close();
+        const first = await ctx.gatePlan!(PLAN);
+        seen.push(first);
+        if (first.kind === "revise") seen.push(await ctx.gatePlan!("# PLAN human revised", undefined, undefined, first.inputId));
+        const final = seen.at(-1)!;
+        if (final.kind === "reject") throw new PlanRejectedError(final.reason);
+        return { branch: ctx.branch };
+      } };
+      const done = start(exec, c);
+      try {
+        assert.ok(await until(() => inputId > 0));
+        await routed(c.run_id, inputId);
+        assert.equal(attempts.length, 1, "no retry before applied ACK");
+        assert.equal(seen.length, 0, "queued verdict cannot act before receipts and ACK");
+        assert.equal(api.crossCheckRequests.length, 0, "failed initial preparation never submits");
+        held.release();
+        await done;
+        assert.equal(attempts.length, 2);
+        assert.deepEqual(attempts[1], attempts[0], "exact assigned prefix replay");
+        assert.deepEqual(seen.map((v) => v.kind), action === "revise_plan" ? ["revise", "reject"] :
+          [action === "approve_plan" ? "approve" : "reject"]);
+        assert.ok(api.isApplied(c.run_id, inputId), "human input receipt settles after restoration");
+        assert.equal(api.crossCheckRequests.length, 0);
+        assert.equal(gates(c.run_id).length, action === "revise_plan" ? 2 : 1);
+      } finally {
+        held.release();
+        done.shutdown();
+        try { await done; } finally {
+          client.postMessages = post;
+          client.reportPlanCrossCheckGateState = report;
+          MessageBatcher.prototype.reserveCandidateTransport = reserve;
+        }
+      }
+    });
+  }
+
+  it("applied preparation gate resumes after real credential switch give-up without republishing", async () => {
+    const c = claim();
+    const reserve = MessageBatcher.prototype.reserveCandidateTransport;
+    const report = client.reportPlanCrossCheckGateState.bind(client);
+    const post = client.postMessages.bind(client);
+    const requests: PlanCrossCheckStateRequest[] = [];
+    let preparationAttempts = 0;
+    let switchAttempts = 0;
+    let gaveUp = false;
+    let applied = false;
+    MessageBatcher.prototype.reserveCandidateTransport = function () {
+      this.emit({ kind: "status", payload: { text: "switch prefix" } });
+      api.failMessagesNext(1);
+      return reserve.call(this);
+    };
+    client.postMessages = async (id, msgs, generation, signal) => {
+      if (id === c.run_id && msgs.some((m) => (m.payload as { text?: string }).text === "switch prefix")) {
+        preparationAttempts++;
+        if (preparationAttempts > 1) assert.ok(applied && gaveUp, "retry retains the applied ACK across give-up");
+      }
+      return post(id, msgs, generation, signal);
+    };
+    client.reportPlanCrossCheckGateState = async (id, fields, signal) => {
+      const ack = await report(id, fields, signal);
+      if (id === c.run_id && fields.status === "awaiting_approval") {
+        requests.push(fields);
+        applied = ack.applied;
+        api.requestCredentialSwitch(c.run_id, 1);
+        // Keep the real applied receipt until the real input control interrupts its owner.
+        if (!signal?.aborted) await new Promise<void>((resolve) => signal!.addEventListener("abort", () => resolve(), { once: true }));
+      }
+      return ack;
+    };
+    api.onState(c.run_id, (b) => {
+      if (b.status === "credential_switch_failed") {
+        gaveUp = true;
+        send(c.run_id, row("reject_plan", "reject restored preparation"));
+      }
+    });
+    const sdk = new SdkExecutor(nullLogger(), homeDir, { queryFn: planWithMilestonesThenDoneQuery([]) });
+    const exec: Executor = { run: async (ctx) => {
+      git.worktreeStatus = async () => ["M src/impl.ts"];
+      git.commitWipMarker = async () => false;
+      const switchAttempt = ctx.attemptCredentialSwitch!;
+      ctx.attemptCredentialSwitch = async () => {
+        assert.equal(++switchAttempts, 1, "one real switch attempt");
+        const outcome = await switchAttempt();
+        assert.equal(outcome, "gave_up");
+        return outcome;
+      };
+      return sdk.run(ctx);
+    } };
+    const forge = fakeGitlab();
+    try {
+      await runner(exec, forge.gitlab, undefined, { planCrossCheckTiming: timing,
+        recoveryRetryMs: 1, planApprovalTimeoutMs: 2000 }).execute(c);
+      assert.equal(switchAttempts, 1);
+      assert.equal(requests.length, 1, "one frozen strict request and applied ACK");
+      assert.equal(gates(c.run_id).length, 1, "no second publication on callback resumption");
+      assert.equal(preparationAttempts, 2);
+      assert.equal(api.crossCheckRequests.length, 0);
+      terminal(c.run_id, "reject restored preparation");
+    } finally {
+      MessageBatcher.prototype.reserveCandidateTransport = reserve;
+      client.reportPlanCrossCheckGateState = report;
+      client.postMessages = post;
+    }
+  });
+
+  it("owner cancellation aborts and settles remaining preparation HTTP before any queued approval", async () => {
+    const c = claim();
+    const reserve = MessageBatcher.prototype.reserveCandidateTransport;
+    const post = client.postMessages.bind(client);
+    let attempts = 0;
+    let entered = false;
+    let settled = false;
+    MessageBatcher.prototype.reserveCandidateTransport = function () {
+      this.emit({ kind: "status", payload: { text: "cancel prefix" } });
+      api.failMessagesNext(1);
+      return reserve.call(this);
+    };
+    client.postMessages = async (id, msgs, generation, signal) => {
+      if (id === c.run_id && msgs.some((m) => (m.payload as { text?: string }).text === "cancel prefix")) {
+        attempts++;
+        if (attempts === 2) {
+          try { return await post(id, msgs, generation, signal); }
+          finally { settled = true; }
+        }
+      }
+      return post(id, msgs, generation, signal);
+    };
+    api.holdMessagesUntilAbort = (id, body) => {
+      if (id !== c.run_id || attempts !== 2 || !(body.messages as OutgoingMessage[]).some(
+        (m) => (m.payload as { text?: string }).text === "cancel prefix")) return false;
+      entered = true;
+      send(c.run_id, row("cancel"));
+      return true;
+    };
+    api.onState(c.run_id, (b) => { if (b.status === "awaiting_approval") send(c.run_id, row("approve_plan")); });
+    const { exec, verdicts } = checkedExec();
+    try {
+      await start(exec, c);
+      assert.equal(entered, true);
+      assert.equal(settled, true, "client HTTP attempt settles before execution exits");
+      assert.ok(await until(() => api.abortedHeldMessages === 1), "server observes cancelled response");
+      assert.equal(attempts, 2, "no third attempt after cancellation");
+      assert.equal(verdicts.length, 0);
+      assert.equal(api.crossCheckRequests.length, 0);
+      assert.equal(gates(c.run_id).length, 1);
+      assert.ok(!api.states.some((s) => s.runId === c.run_id && s.body.failure_reason?.includes("preparation ACKs unrecoverable")));
+    } finally {
+      api.holdMessagesUntilAbort = undefined;
+      MessageBatcher.prototype.reserveCandidateTransport = reserve;
+      client.postMessages = post;
+    }
+  });
+
+  it("pending candidate usage failure shares the original preparation budget and falls back before another check", async () => {
+    const c = claim();
+    let context!: RunContext;
+    api.crossCheckHandler = ({ runId, body, method }) => {
+      assert.equal(method, "POST", "no fresh status check after retryable preparation failure");
+      const leg = context.usage!.startLeg();
+      leg.observeAssistant({ message: { id: "pending-usage", model: "claude", usage: { input_tokens: 4 } } });
+      leg.close();
+      api.usageHandler = () => ({ status: 503, body: { error: "transient usage" } });
+      return { status: 200, body: answer(runId, body, "pending", "") };
+    };
+    const held = holdGateAck(c.run_id, PLAN);
+    let queued = 0;
+    api.onState(c.run_id, (b) => { if (b.status === "awaiting_approval") queued = send(c.run_id, row("reject_plan"))[0]!.id; });
+    const { exec, verdicts } = checkedExec(async (ctx) => { context = ctx; });
+    const done = start(exec, c);
+    try {
+      assert.ok(await until(() => queued > 0));
+      await routed(c.run_id, queued);
+      // Observe beyond the recorder's first retry backoff while the forced ACK is held.
+      assert.equal(await until(() => api.usageRequests.length > 1, 1200), false,
+        "no independent usage retry before the applied forced gate ACK");
+      assert.equal(api.usageRequests.length, 1, "one failed usage request before forced ACK");
+      assert.equal(verdicts.length, 0);
+      api.usageHandler = () => ({ status: 200, body: {} });
+      held.release();
+      await done;
+      assert.equal(api.usageRequests.length, 2, "only one remaining preparation attempt after initial success and pending failure");
+      assert.deepEqual(api.usageRequests[1], api.usageRequests[0], "exact usage receipt replay");
+      assert.deepEqual(verdicts.map((v) => v.kind), ["reject"]);
+      assert.equal(api.crossCheckRequests.length, 1);
+    } finally {
+      held.release();
+      done.shutdown();
+      await done;
+    }
+  });
+
+  it("three preparation failures terminate only after applied forced gate and preserve assigned replay on close", async () => {
+    const c = claim();
+    const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "checked-preparation-"));
+    const outbox = new Outbox({ root: path.join(root, "outbox"), log: nullLogger(),
+      runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 86_400_000 });
+    await outbox.init();
+    let archived = false;
+    const archive: RecoveryArchiveClient = {
+      reserveRecoveryCapture: async () => ({ capture_id: "preparation-capture", state: "preparing" }),
+      getRecoveryCaptureStatus: async (_id, captureId) => ({ capture_id: captureId, state: "preparing", manifest_bound: false }),
+      uploadRecoveryBundle: async (_id, captureId, _manifest, bundle) => {
+        for await (const _chunk of bundle) { /* Consume the real Git bundle. */ }
+        archived = true;
+        return { capture_id: captureId, state: "available", manifest_bound: true };
+      },
+      releaseRecoveryCustody: async (id) => ({ run_id: id, released: true, holds_released: 1 }),
+      listRecoveryHolds: async (id) => ({ run_id: id, holds: [] }),
+    };
+    const recovery = new RecoveryCoordinator({ client: archive, git, log: nullLogger(),
+      recoveryRoot: path.join(root, "recovery"), workerToken: "preparation-worker-fixture" });
+    const held = holdGateAck(c.run_id, PLAN);
+    const reserve = MessageBatcher.prototype.reserveCandidateTransport;
+    MessageBatcher.prototype.reserveCandidateTransport = function () {
+      this.emit({ kind: "status", payload: { text: "persistent prefix" } });
+      api.failMessagesNext(100);
+      return reserve.call(this);
+    };
+    const post = client.postMessages.bind(client);
+    const report = client.reportPlanCrossCheckGateState.bind(client);
+    const attempts: OutgoingMessage[][] = [];
+    let applied = false;
+    let queued = 0;
+    let clone = "";
+    client.postMessages = async (id, msgs, generation, signal) => {
+      if (id === c.run_id && msgs.some((m) => (m.payload as { text?: string }).text === "persistent prefix")) {
+        attempts.push(structuredClone(msgs));
+        if (attempts.length > 1) assert.equal(applied, true);
+      }
+      return post(id, msgs, generation, signal);
+    };
+    client.reportPlanCrossCheckGateState = async (id, fields, signal) => {
+      const ack = await report(id, fields, signal);
+      if (id === c.run_id && fields.status === "awaiting_approval") applied = ack.applied;
+      return ack;
+    };
+    api.onState(c.run_id, (b) => {
+      if (b.status === "awaiting_approval") queued = send(c.run_id, row("approve_plan"), row("revise_plan", "queued"))[0]!.id;
+    });
+    const { exec, verdicts } = checkedExec(async (ctx) => {
+      clone = ctx.worktreePath;
+      fs.writeFileSync(path.join(clone, "preparation-custody.txt"), "retain planning work");
+      const leg = ctx.usage!.startLeg();
+      leg.observeAssistant({ message: { id: "persistent-usage", model: "claude", usage: { input_tokens: 3 } } });
+      leg.close();
+    });
+    const forge = fakeGitlab();
+    const run = runner(exec, forge.gitlab, undefined, { outbox, recovery, planCrossCheckTiming: timing,
+      planApprovalTimeoutMs: 4000 });
+    const done = Object.assign(run.execute(c), { shutdown: () => run.shutdown() });
+    try {
+      assert.ok(await until(() => queued > 0));
+      await routed(c.run_id, queued);
+      assert.equal(attempts.length, 1);
+      assert.equal(verdicts.length, 0);
+      held.release();
+      await done;
+      assert.equal(applied, true);
+      assert.equal(attempts.length, 3, "preparation attempts counted separately from close");
+      assert.deepEqual(attempts[1], attempts[0]);
+      assert.deepEqual(attempts[2], attempts[0]);
+      terminal(c.run_id, "plan cross-check: preparation ACKs unrecoverable");
+      assert.equal(verdicts.length, 0);
+      assert.equal(api.crossCheckRequests.length, 0);
+      assert.equal(gates(c.run_id).length, 1);
+      assert.equal(api.isApplied(c.run_id, queued), false);
+      assert.ok(outbox.hasUndrainedMessages(c.run_id), "close spills the reserved assigned prefix");
+      const recovered: OutgoingMessage[] = [];
+      await outbox.drainRun(c.run_id, async (msgs) => { recovered.push(...msgs); });
+      for (const original of attempts[0]!) assert.ok(recovered.some((m) => JSON.stringify(m) === JSON.stringify(original)));
+      assert.equal(archived, true, "existing terminal custody uploads a real Git bundle");
+    } finally {
+      held.release();
+      done.shutdown();
+      try { await done; } finally {
+        client.postMessages = post;
+        client.reportPlanCrossCheckGateState = report;
+        MessageBatcher.prototype.reserveCandidateTransport = reserve;
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
+
   for (const httpStatus of [400, 409]) {
     it(`negative canonical storage ACK ${httpStatus} prevents implementation`, async () => {
       const c = claim();
@@ -240,8 +569,8 @@ describe("U2 real runner checked gate", () => {
         assert.ok(!statuses(c.run_id).includes("completed") && !statuses(c.run_id).includes("recovery_wait"));
       } finally {
         held.release();
-        await done;
-        client.reportPlanCrossCheckGateState = report;
+        done.shutdown();
+        try { await done; } finally { client.reportPlanCrossCheckGateState = report; }
       }
     });
   }
@@ -257,7 +586,7 @@ describe("U2 real runner checked gate", () => {
     const { exec, verdicts } = checkedExec(async (ctx) => { context = ctx; });
     await start(exec, c);
     terminal(c.run_id, "preparation receipts irrecoverably lost");
-    assert.deepEqual(verdicts, []);
+    assert.equal(verdicts.length, 0);
     assert.equal(gates(c.run_id).length, 0);
     assert.equal(api.crossCheckRequests.length, 1);
   });

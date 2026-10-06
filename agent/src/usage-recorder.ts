@@ -422,7 +422,8 @@ export class UsageRecorder implements UsageSink {
   }
 
   private schedule(delayMs: number): void {
-    if (this.timer || this.inFlight || this.inactive || this.confirming) return;
+    if (this.timer || this.inFlight || this.inactive || this.confirming ||
+        (this.strictRetry && this.retryRequest)) return;
     const wait = Math.max(delayMs, this.backoffUntil - Date.now());
     this.timer = setTimeout(() => {
       this.timer = undefined;

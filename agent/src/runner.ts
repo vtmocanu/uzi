@@ -9325,7 +9325,8 @@ export class RunRunner {
                     reason === "block" ? "plan cross-check: blocked" :
                       reason === "timed_out" ? "plan cross-check: timed out" :
                         `plan cross-check: ${reason.replaceAll("_", " ")}`;
-                  checkedHuman.onApplied = (ack) => {
+                  checkedHuman.onApplied = async (ack) => {
+                    await decision.completePreparation?.(steering.lifecycleSignal());
                     if (decision.reservation && !decision.reservation.releaseAppliedGate(ack))
                       throw new Error("plan cross-check: forced gate settlement receipts unavailable");
                     releaseStateBarrier?.();
@@ -14453,11 +14454,12 @@ export class RunRunner {
       ...(associated ? { milestones: milestones ?? [] } : {}),
     };
     let confirmed = false;
+    let appliedAck: StateAck | undefined;
     let epoch: number;
     const publishAndWait = async (): Promise<PlanVerdict> => {
     if (!confirmed) {
     let ack: StateAck;
-    try { ack = await reportState(request); }
+    try { ack = appliedAck ?? await reportState(request); }
     catch (error) {
       if (!associated || isCheckedLifecycleControl(error)) throw error;
       throw new Error("plan cross-check: human-presentation ACK unrecoverable", { cause: error });
@@ -14465,7 +14467,8 @@ export class RunRunner {
     if (associated && (ack.applied !== true || ack.status !== "awaiting_approval" ||
         !Number.isSafeInteger(ack.gateRevision) || (ack.gateRevision ?? 0) <= 0))
       throw new Error("plan cross-check: human-presentation ACK unrecoverable");
-    associated?.onApplied?.(ack);
+    if (associated) appliedAck = ack;
+    await associated?.onApplied?.(ack);
     if (associated) associated.onApplied = undefined;
     // PRD #1795 (A3, decision 8): a refused report (a historical id, a changed payload under the
     // current id, a stale adoption) published nothing. Confirm nothing, take no verdict, and leave
