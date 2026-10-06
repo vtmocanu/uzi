@@ -881,7 +881,7 @@ describe("a run that fails quarantined archives its committed work and releases 
     return sites;
   }
 
-  it("a cancelled run on a latched worker still runs its terminal_retire quiesce and keeps its clone", TIMEOUT, async () => {
+  it("a cancelled run latched at its terminal report (recovery disabled) still runs its terminal_retire quiesce and keeps its clone", TIMEOUT, async () => {
     const iid = 22208;
     installSpies({ on: true });
     const claim = gitlabClaim(iid);

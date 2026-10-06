@@ -3494,8 +3494,11 @@ export class RunRunner {
       let retireBlocked = false;
       // issue #2213: the root guard for the worker residue quarantine is the read right before the
       // retire decision below, plus the latch gate on the predecessor release. It is NOT read here:
-      // the own-arm terminal_retire quiesce starts no credentialed child, so a latched worker still
-      // runs it (killAgentTree, HOME-attributed reap, Docker teardown) and only keeps the clone.
+      // the own-arm terminal_retire quiesce starts no credentialed child, so a latch arriving at or
+      // after the terminal report does not skip it (killAgentTree, HOME-attributed reap, Docker
+      // teardown); the read below then keeps the clone. A run whose failure path already set
+      // preserveRecoveryClone (e.g. it was latched when it failed) skips this quiesce, exactly as a
+      // residue-blocked run did before #2213.
       // issue #1783 M2: a CAPTURED predecessor attempt (the C′ flight on a Docker-wired worker) is
       // released IN PLACE — journal cleared (only now that its capture is verified), ledger
       // `abandoned`, NO filesystem operation on its path — and never retired or reused. Its
