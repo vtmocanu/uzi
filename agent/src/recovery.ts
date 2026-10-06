@@ -828,7 +828,9 @@ export class RecoveryCoordinator {
       });
     });
     if (result === "retained" || !sourceVerified) {
-      await this.writeExistingRecord(snapshot, cur => ({ ...cur, state: "needs_action", reason: "inventory_source_not_quiescent" }));
+      const retained = await this.writeExistingRecord(snapshot, cur => ({ ...cur,
+        state: cur.state === "uploaded" ? "uploaded" : "needs_action", reason: "inventory_source_not_quiescent" }));
+      return { state: retained.state, captureId: retained.captureId, reason: retained.reason };
     }
     return outcome;
   }

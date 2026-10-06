@@ -1571,6 +1571,7 @@ interface RunFlight {
   owedContext: Promise<OwedCandidateContext> | undefined;
   prepareTerminalInventory: () => Promise<void>;
   owedFeedClosed: boolean;
+  inventoryArchiveNotices: Set<string>;
   /** Credential deferral/switch leaves this generation's guarded inventory open for resume. */
   keepGuardedInventoryOpen: boolean;
   /** issue #1751 M2: the resolved claim kind, gating which live-settle trigger (checkpoint publish
@@ -7537,6 +7538,7 @@ export class RunRunner {
       owedDefaultBranch: claim.repo.default_branch?.trim() || undefined,
       owedContext: undefined,
       owedFeedClosed: false,
+      inventoryArchiveNotices: new Set(),
       keepGuardedInventoryOpen: false,
       prepareTerminalInventory: async () => {
         if (!this.recovery.enabled || !isCodePublishingKind(flight.runKind) || claim.inventory_guarded !== true || !flight.barePath || !flight.branch) return;
@@ -10349,12 +10351,16 @@ export class RunRunner {
       if (outcome.state === "uploaded") {
         // captureAndUpload persists the reservation on a newer journal revision.
         const uploaded = (await this.recovery.inspect(claim.run_id)).find(r => r.captureId === record.captureId);
-        if (uploaded?.serverCaptureId) {
+        if (uploaded?.serverCaptureId && uploaded.state === "uploaded") {
+          const noticeIdentity = JSON.stringify([uploaded.serverCaptureId, uploaded.finalAcknowledged === true]);
           const text = uploaded.finalAcknowledged
             ? `Recovery archive ${uploaded.serverCaptureId} covers the frozen inventory; custody transfer confirmed. Use uzi run recovery or uzi run export.`
             : `Earlier recovery archive ${uploaded.serverCaptureId} available; custody final ACK pending. Use uzi run recovery or uzi run export.`;
-          if (!flight.owedFeedClosed) flight.batcher.emit({ kind: "status", agent: "worker", payload: { text } });
-          else flight.runLog.info(text);
+          if (!flight.inventoryArchiveNotices.has(noticeIdentity)) {
+            flight.inventoryArchiveNotices.add(noticeIdentity);
+            if (!flight.owedFeedClosed) flight.batcher.emit({ kind: "status", agent: "worker", payload: { text } });
+            else flight.runLog.info(text);
+          }
         }
       }
       flight.runLog.info("recovery: guarded inventory disposition", {

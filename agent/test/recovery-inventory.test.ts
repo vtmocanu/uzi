@@ -94,7 +94,7 @@ it("issue1924 invalid ownership route body network and HTTP failures never FINAL
   }
 });
 
-async function fixture() {
+async function fixture(sourceBoundary = false) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "inventory-"));
   const context: PositiveOwedCandidateContext = {
     runId: "run-1", generation: 7, kind: "issue", branch: "task",
@@ -109,6 +109,7 @@ async function fixture() {
     reserveError: undefined as Error | undefined,
     finalError: undefined as Error | undefined,
     oversized: false, cloneHeads: [] as string[], cloneReadable: true,
+    sourceRefused: false, uploads: 0,
     produceWait: undefined as Promise<void> | undefined, produced: 0,
     onProduce: undefined as (() => void) | undefined,
   };
@@ -147,6 +148,7 @@ async function fixture() {
       for await (const chunk of stream) assert.ok(chunk);
       const capture = [...captures.values()].find(c => c.id === id);
       assert.ok(capture);
+      state.uploads++;
       capture.manifest = m;
       return { capture_id: id, state: "available", manifest_bound: true };
     },
@@ -184,11 +186,16 @@ async function fixture() {
         chunkCount: 1, prerequisiteShas: [], selfContained: true, alreadyPublished: false };
     },
   };
-  const make = () => new RecoveryCoordinator({
+  const make = (sourceBoundary = false) => new RecoveryCoordinator({
     recoveryRoot: path.join(root, "journal"), workerToken: "local-worker-fixture",
     log: nullLogger(), client: client as never, git: git as never, now: () => state.now,
+    withInventorySourceBoundary: sourceBoundary ? async (_context, action) => {
+      if (state.sourceRefused) return "retained";
+      await action(async () => !state.sourceRefused);
+      return "passed";
+    } : undefined,
   });
-  const coordinator = make();
+  const coordinator = make(sourceBoundary);
   const freeze = (originalSourceSha = H) => coordinator.freezeInventory({
     context, currentSha: H, originalSourceSha, defaultBranch: "main",
   });
@@ -970,6 +977,55 @@ it("a guarded journal never uses the legacy release RPC after feature loss", asy
 });
 
 
+for (const pendingFinal of [false, true]) {
+  it(`source refusal repeats backoff without replacing uploaded identity pendingFINAL=${pendingFinal}`, async () => {
+    const f = await fixture(true);
+    try {
+      const record = await f.freeze();
+      assert.ok(record);
+      if (pendingFinal) {
+        f.state.finalError = new Error("ACK unavailable");
+        await f.capture(record);
+      } else {
+        f.state.onProduce = () => { f.state.sourceRefused = true; };
+        await f.capture(record);
+      }
+      f.state.sourceRefused = true;
+      const before = (await f.coordinator.inspect("run-1"))[0]!;
+      const identity = (r: RecoveryRecord) => [r.captureId, r.serverCaptureId, r.sourceSha,
+        r.coverageDigest, r.checksum, r.finalRequest];
+      await f.coordinator.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+      const first = (await f.coordinator.inspect("run-1"))[0]!;
+      assert.equal(first.reason, "inventory_source_not_quiescent");
+      assert.equal(first.state, "uploaded");
+      assert.deepEqual(identity(first), identity(before));
+      f.state.now += 30_000;
+      f.state.sourceRefused = false;
+      f.state.finalError = undefined;
+      await f.coordinator.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+      assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, undefined);
+      f.state.sourceRefused = true;
+      f.state.now += 30_000;
+      await f.coordinator.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+      f.state.now += 60_000;
+      f.state.sourceRefused = false;
+      await f.coordinator.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+      assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, undefined);
+      f.state.now += 60_000;
+      await f.coordinator.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+      const after = (await f.coordinator.inspect("run-1"))[0]!;
+      assert.equal(after.finalAcknowledged, true);
+      assert.equal(after.captureId, before.captureId);
+      assert.equal(after.serverCaptureId, before.serverCaptureId);
+      if (pendingFinal) assert.deepEqual(after.finalRequest, before.finalRequest);
+      assert.equal(f.reserves(), 1);
+      assert.equal(f.state.uploads, 1);
+      assert.equal(f.state.produced, 1);
+      assert.equal(f.state.open, true);
+    } finally { await f.close(); }
+  });
+}
+
 it("physical clones fail closed without runner boundary even when heads are covered", async () => {
   const f = await fixture();
   try {
@@ -980,6 +1036,9 @@ it("physical clones fail closed without runner boundary even when heads are cove
     await f.capture(record);
     assert.equal(f.finals.length, 0);
     assert.equal(f.state.open, true);
-    assert.equal((await f.coordinator.inspect("run-1"))[0]?.state, "needs_action");
+    const retained = (await f.coordinator.inspect("run-1"))[0]!;
+    assert.equal(retained.state, "uploaded", "available bytes remain uploaded while FINAL is refused");
+    assert.equal(retained.reason, "inventory_source_not_quiescent");
+    assert.equal(retained.finalAcknowledged, undefined);
   } finally { await f.close(); }
 });
