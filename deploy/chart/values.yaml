@@ -207,8 +207,8 @@ api:
   diskPressureThreshold: 0.90
   resources:
     # Requests sized to a live fleet's steady state (~107m CPU / ~280Mi measured
-    # 2026-10-06 with 8 hosted workers); below it the api is the first eviction
-    # candidate under node memory pressure.
+    # 2026-10-06 with 8 hosted workers); running above its request
+    # raises the api's eviction risk under node memory pressure.
     requests:
       cpu: 100m
       memory: 320Mi
