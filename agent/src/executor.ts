@@ -381,6 +381,8 @@ export interface RunContext {
    * a fenced claim ends quietly. Absent on the stub/test executors ⇒ today's behaviour.
    */
   takeResumedGateEvent?(signal?: AbortSignal): Promise<PlanVerdict | undefined>;
+  /** An associated cross-check human gate continues its established wait after switch give-up. */
+  continueExistingPlanGate?(otherwise: () => Promise<PlanVerdict>): Promise<PlanVerdict>;
   /**
    * PRD #88 M1 clarification park. Called by the executor after a turn that made an
    * ask_user call: the runner emits the `question` run-message, posts /state

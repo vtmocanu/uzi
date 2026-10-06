@@ -16,6 +16,7 @@ import type { StateRequest } from "../src/protocol.js";
 import {
   api,
   assistant,
+  client,
   fakeGitlab,
   git,
   gitlabClaim,
@@ -889,13 +890,18 @@ describe("RunRunner — plan gate + steering end to end", () => {
   });
 });
 
-describe("RunRunner — M1 plan cross-check gate", () => {
+describe("RunRunner — required plan cross-check fallback", () => {
   for (const codexLead of [false, true]) {
     it(`parks a required ${codexLead ? "Codex" : "Claude"} autopilot plan and stops after human refusal`, async () => {
+      client.protocolFeatures = ["claim_generation_fence", "gate_revision_v1"];
+      api.gateRevisions = true;
+      api.checkedTransport = true;
+      api.crossCheckHandler = () => ({ status: 409, body: { reason: "checker_unavailable" } });
       const { gitlab, calls } = fakeGitlab();
       const claim = gitlabClaim(codexLead ? 21492 : 21491, {
         auto_approve: true,
         plan_cross_check_required: true,
+        claim_generation: 1,
         ...(codexLead ? { secrets: {
           forge_pat: "fixture-forge-pat-000000",
           codex: {

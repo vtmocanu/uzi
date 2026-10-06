@@ -574,6 +574,7 @@ export class MessageBatcher {
         r.abort.signal.aborted || r.outboxPending.size !== 0 || r.replay ||
         this.buffer.length !== 0 || this.pendingRangeFirst !== undefined ||
         this.outbox?.isDisabled() || this.outbox?.hasUndrainedMessages(this.runId) ||
+        this.usage.inactive || this.usage.hasUnconfirmedLoss ||
         p.claimGeneration !== this.generation || !Number.isSafeInteger(p.claimGeneration) || p.claimGeneration <= 0 ||
         p.planCrossCheckSettled !== true || !Number.isInteger(tail) ||
         tail < r.tail || tail > 0x7fffffff || tail + r.held.length > 0x7fffffff) return false;

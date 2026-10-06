@@ -1,0 +1,170 @@
+import { setTimeout as delay } from "node:timers/promises";
+import {
+  RequestError, type WorkerClient, type PlanCrossCheckCandidate, type PlanCrossCheckResponse,
+  type PlanCrossCheckStateRequest, type PlanCrossCheckGateReason,
+} from "./client.js";
+import type { CandidateTransportReservation, MessageBatcher } from "./batcher.js";
+import type { StateAck } from "./protocol.js";
+
+/** Execution-local context only. Status proofs never create or replace a presentation. */
+export interface CheckedHumanGate {
+  phase: "publishinginitial" | "confirmedwait" | "revisionplanning" | "publishingrevised" | "terminal";
+  continueWait?: () => Promise<import("./steering.js").PlanVerdict>;
+  onApplied?: (ack: StateAck) => void;
+}
+
+export interface PlanCrossCheckTiming {
+  preparationMs?: number;
+  backoffMs?: readonly [number, number];
+  requestMs?: number;
+  pollMs?: number;
+}
+
+type CandidateResponse = Extract<PlanCrossCheckResponse, { result: "candidate" }>;
+export type CheckedPlanDecision =
+  | { kind: "approve"; response: CandidateResponse }
+  | { kind: "human"; fields: PlanCrossCheckStateRequest; reservation?: CandidateTransportReservation };
+
+/** One checker candidate, bounded preparation and submission retries, owner-cancellable polling.
+ * Each failed HTTP attempt is awaited through cancellation before any sibling request starts.
+ */
+export async function checkPlan(options: {
+  client: WorkerClient; runId: string; generation: number; candidate: PlanCrossCheckCandidate;
+  batcher: MessageBatcher; signal: AbortSignal; timing?: PlanCrossCheckTiming;
+}): Promise<CheckedPlanDecision> {
+  const { client, runId, generation, candidate, batcher, signal } = options;
+  const timing = options.timing;
+  signal.throwIfAborted();
+  if (!Number.isSafeInteger(generation) || generation <= 0)
+    throw new Error("plan cross-check: invalid claim generation");
+  let reservation: CandidateTransportReservation;
+  try { reservation = batcher.reserveCandidateTransport(); }
+  catch { throw new Error("plan cross-check: transport reservation unavailable"); }
+  const cancel = (): void => reservation.cancel();
+  signal.addEventListener("abort", cancel, { once: true });
+  const human = (reason: PlanCrossCheckGateReason, refusal?: PlanCrossCheckStateRequest["plan_cross_check_refusal"]): CheckedPlanDecision =>
+    ({ kind: "human", reservation, fields: { status: "awaiting_approval",
+      plan_cross_check_gate_reason: reason, ...(refusal ? { plan_cross_check_refusal: refusal } : {}) } });
+  const request = async <T>(fn: (owned: AbortSignal) => Promise<T>, ms = timing?.requestMs ?? 3000): Promise<T> => {
+    signal.throwIfAborted();
+    // The client owns and settles HTTP cancellation; never race an unowned POST against a timer.
+    return fn(AbortSignal.any([signal, AbortSignal.timeout(ms)]));
+  };
+  let identity: CandidateResponse | undefined;
+  const guard = (response: PlanCrossCheckResponse): CandidateResponse => {
+    if (response.result === "parked")
+      throw new Error("plan cross-check: parked without an established human presentation");
+    if (response.result !== "candidate")
+      throw new Error("plan cross-check: candidate settlement unknown");
+    const deadline = Date.parse(response.deadline_at);
+    if (response.round !== 1 || response.candidate_generation !== generation ||
+        !Number.isSafeInteger(response.candidate_generation) || generation <= 0 ||
+        !/^[a-f0-9]{64}$/.test(response.candidate_digest) ||
+        response.candidate.base_commit !== candidate.base_commit ||
+        !Number.isFinite(deadline) || deadline > Date.now() + 2 * 60 * 60 * 1000 ||
+        (identity && (response.candidate_digest !== identity.candidate_digest ||
+          response.checker_run_id !== identity.checker_run_id ||
+          response.deadline_at !== identity.deadline_at ||
+          JSON.stringify(response.candidate) !== JSON.stringify(identity.candidate))))
+      throw new Error("plan cross-check: invalid or stale candidate identity");
+    identity ??= response;
+    return response;
+  };
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      signal.throwIfAborted();
+      const prepared = await reservation.prepare(timing?.preparationMs ?? 3000, signal);
+      signal.throwIfAborted();
+      if (prepared.prepared) break;
+      if (prepared.permanent) {
+        const condition = prepared.reason === "usage_unconfirmed" || prepared.reason === "ownership_unknown"
+          ? "preparation receipts irrecoverably lost"
+          : `transport permanently failed (${prepared.reason ?? "unknown"})`;
+        throw new Error(`plan cross-check: ${condition}`);
+      }
+      if (attempt === 2) throw new Error("plan cross-check: preparation retries exhausted");
+      await delay(timing?.backoffMs?.[attempt] ?? (attempt + 1) * 1000, undefined, { signal });
+    }
+    const checkTransport = async (): Promise<void> => {
+      signal.throwIfAborted();
+      if (batcher.usage.hasUnconfirmedLoss || batcher.usage.inactive)
+        throw new Error("plan cross-check: preparation receipts irrecoverably lost");
+      const prepared = await reservation.prepare(timing?.preparationMs ?? 3000, signal);
+      signal.throwIfAborted();
+      if (!prepared.prepared)
+        throw new Error(`plan cross-check: transport permanently failed (${prepared.reason ?? "unknown"})`);
+    };
+    let response: PlanCrossCheckResponse | undefined;
+    // A no_row GET after POST is only a read-time observation. It cannot release transport.
+    for (let attempt = 0; attempt < 3 && response === undefined; attempt++) {
+      signal.throwIfAborted();
+      await checkTransport();
+      reservation.markSubmitted();
+      try {
+        response = await request((owned) => client.submitPlanCrossCheck(runId, generation, candidate, owned));
+      } catch (error) {
+        signal.throwIfAborted();
+        if (error instanceof RequestError && error.status >= 400 && error.status < 500) {
+          let reason: unknown;
+          try { reason = (JSON.parse(error.body) as { reason?: unknown }).reason; } catch { /* absent attestation */ }
+          if (error.status === 413) return human("candidate_refused", "envelope_too_large");
+          if (error.status === 400) return human("candidate_refused",
+            reason === "candidate_too_large" ? "candidate_too_large" : "candidate_invalid");
+          if (error.status === 409 && (reason === "checker_unavailable" || reason === "interrupted"))
+            return human(reason);
+          return human("checker_failed", "submit_failed");
+        }
+        try {
+          const status = await request((owned) => client.planCrossCheckStatus(runId, generation, 1, owned));
+          if (status.result !== "no_row") response = status;
+        } catch {
+          signal.throwIfAborted();
+        }
+        if (response === undefined && attempt < 2)
+          await delay(timing?.backoffMs?.[attempt] ?? (attempt + 1) * 1000, undefined, { signal });
+      }
+    }
+    if (response === undefined || response.result === "no_row")
+      return human("checker_failed", "submit_failed");
+    let current = guard(response);
+    // Bound by the immutable stored deadline and owner cancellation. A transient status failure
+    // retains the same identity; every iteration sleeps, including failed reads.
+    while (current.verdict === "pending") {
+      await checkTransport();
+      const remaining = Date.parse(current.deadline_at) - Date.now();
+      if (remaining <= 0) return human("timed_out");
+      await delay(Math.min(timing?.pollMs ?? 15_000, remaining), undefined, { signal });
+      signal.throwIfAborted();
+      await checkTransport();
+      if (Date.now() >= Date.parse(current.deadline_at)) return human("timed_out");
+      let polled: PlanCrossCheckResponse;
+      try {
+        polled = await request((owned) => client.planCrossCheckStatus(runId, generation, 1, owned),
+          Math.max(1, Math.min(timing?.requestMs ?? 3000, Date.parse(current.deadline_at) - Date.now())));
+      } catch (error) {
+        signal.throwIfAborted();
+        if (error instanceof RequestError && error.status >= 400 && error.status < 500)
+          return human("checker_failed", "submit_failed");
+        // Invalid decoded responses are fail-closed rather than ignored until the deadline.
+        if (error instanceof Error && error.message.includes("invalid")) throw error;
+        continue;
+      }
+      current = guard(polled);
+    }
+    await checkTransport();
+    if (current.verdict === "approve") {
+      if (Date.now() >= Date.parse(current.deadline_at)) return human("timed_out");
+      if (!reservation.release(current))
+        throw new Error("plan cross-check: terminal settlement receipts unavailable");
+      return { kind: "approve", response: current };
+    }
+    // Keep the reservation until the applied forced gate fences any delayed submit.
+    return human(current.verdict === "revise" ? "revise" : current.verdict === "block" ? "block" :
+      current.reason_class === "" || current.reason_class === "approve" ? "checker_failed" : current.reason_class);
+  } catch (error) {
+    reservation.cancel();
+    throw error;
+  } finally {
+    signal.removeEventListener("abort", cancel);
+  }
+}

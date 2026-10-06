@@ -2055,6 +2055,7 @@ export class SdkExecutor implements Executor {
             ctx.gatePlan!(approvedPlan, gateMilestones, (planMd) =>
               this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
             ),
+            ctx.continueExistingPlanGate,
           );
           if ("released" in g0) return { branch: ctx.branch, switchReleased: true };
           verdict = g0.value;
@@ -2104,6 +2105,7 @@ export class SdkExecutor implements Executor {
             });
             const gExhausted = await this.runThroughSwitch(ctx, state, () =>
               ctx.gatePlan!(approvedPlan, gateMilestones, undefined, settles),
+              ctx.continueExistingPlanGate,
             );
             if ("released" in gExhausted) return { branch: ctx.branch, switchReleased: true };
             verdict = gExhausted.value;
@@ -2159,6 +2161,7 @@ export class SdkExecutor implements Executor {
               (planMd) => this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
               settles,
             ),
+            ctx.continueExistingPlanGate,
           );
           if ("released" in gRev) return { branch: ctx.branch, switchReleased: true };
           verdict = gRev.value;
@@ -3735,10 +3738,12 @@ export class SdkExecutor implements Executor {
     ctx: RunContext,
     state: RunDrive,
     run: () => Promise<T>,
+    continueWait?: (otherwise: () => Promise<T>) => Promise<T>,
   ): Promise<{ value: T } | { released: true }> {
+    let attempt = run;
     for (;;) {
       try {
-        return { value: await run() };
+        return { value: await attempt() };
       } catch (err) {
         if (!(err instanceof CredentialSwitchSignal)) throw err;
         const outcome = await ctx.attemptCredentialSwitch?.();
@@ -3748,6 +3753,7 @@ export class SdkExecutor implements Executor {
           // PRD #1809 D4: a `disk` stop that landed during the switch attempt lost its trip to the
           // switch's; it parks now instead of re-running the wait.
           throwIfDiskStop(ctx);
+          attempt = continueWait ? () => continueWait(run) : run;
           continue;
         }
         throw err; // no hook wired: let the runner's outer catch handle it, as before this fix

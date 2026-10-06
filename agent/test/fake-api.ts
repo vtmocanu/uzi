@@ -1,5 +1,5 @@
 import http from "node:http";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import type { FakePrDescApi, PrDescOp } from "./fake-pr-desc-api.js";
 import type {
@@ -230,6 +230,15 @@ export class FakeApi {
   private readonly orphanByRun = new Map<string, { httpStatus: number; identity?: RunOrphanClassificationResponse }>();
   private codexDelayMs = 0;
   private codexResponseOverride: unknown | undefined;
+
+  /** Focused lead-side cross-check transport seam; absent keeps existing fake routes unchanged. */
+  crossCheckHandler?: (request: { runId: string; method: string; body: Record<string, unknown> }) =>
+    Promise<{ status: number; body: unknown }> | { status: number; body: unknown };
+  readonly crossCheckRequests: { runId: string; method: string; body: Record<string, unknown> }[] = [];
+  usageHandler?: () => { status: number; body: unknown };
+  readonly usageRequests: Record<string, unknown>[] = [];
+  checkedTransport = false;
+  private readonly checkedFencedRuns = new Set<string>();
 
   // --- records -------------------------------------------------------------
   readonly registers: RecordedRegister[] = [];
@@ -1162,6 +1171,25 @@ export class FakeApi {
       return sendReceipt(200, { inputs: rows.filter((row) => ids.includes(row.id)).sort((a, b) => a.id - b.id), active, reason });
     }
 
+    if (req.method === "POST" && /^\/api\/worker\/runs\/[^/]+\/usage$/.test(p) && this.usageHandler) {
+      this.usageRequests.push(json);
+      const answer = this.usageHandler();
+      return send(res, answer.status, answer.body);
+    }
+
+    const crossCheckMatch = /^\/api\/worker\/runs\/([^/]+)\/cross-checks(?:\/plan\/1)?$/.exec(p);
+    if (crossCheckMatch && this.crossCheckHandler) {
+      const request = { runId: crossCheckMatch[1]!, method: req.method ?? "", body: json };
+      this.crossCheckRequests.push(request);
+      if (request.method === "POST" && this.checkedFencedRuns.has(request.runId))
+        return send(res, 409, { reason: "cross_check_refused" });
+      const answer = await this.crossCheckHandler(request);
+      // A request held across the applied forced gate is fenced under that same row lock.
+      if (request.method === "POST" && this.checkedFencedRuns.has(request.runId))
+        return send(res, 409, { reason: "cross_check_refused" });
+      return send(res, answer.status, answer.body);
+    }
+
     const runMatch =
       /^\/api\/worker\/runs\/([^/]+)\/(messages|state|inputs)$/.exec(p);
     if (runMatch) {
@@ -1548,6 +1576,7 @@ export class FakeApi {
       }
       gateRevision = verdict.revision;
     }
+    if (this.checkedTransport && body.status === "awaiting_approval") this.checkedFencedRuns.add(runId);
     this.states.push({ runId, body });
     this.requestLog.push(`state:${body.status}`);
     this.lastRecordedStatus.set(runId, body.status);
@@ -1584,6 +1613,13 @@ export class FakeApi {
       await after.action;
     }
     send(res, 200, {
+      ...(this.checkedTransport && body.status === "awaiting_approval" ? {
+        claim_generation: body.claim_generation, plan_cross_check_settled: true,
+        lead_last_seq: Math.max(0, ...this.messages(runId).map((m) => m.seq)),
+        current_plan_sha256: createHash("sha256").update(body.plan_md ?? "").digest("hex"),
+        gate_presentation_id: body.presentation_id,
+        gate_payload_digest: createHash("sha256").update(JSON.stringify(this.gateByRun.get(runId)?.snapshot)).digest("hex"),
+      } : {}),
       // PRD #1795 M1 (decision 5): the revision this report was answered with, top-level.
       ...(gateRevision !== undefined ? { gate_revision: gateRevision } : {}),
       run: {

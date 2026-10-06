@@ -31,6 +31,8 @@ import type {
   WallParkRefresh,
 } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
+import { checkPlan, type CheckedHumanGate, type PlanCrossCheckTiming } from "./plan-cross-check-gate.js";
+import type { PlanCrossCheckStateRequest, PlanCrossCheckDiffRefusal } from "./client.js";
 import type { BoundaryPermit, BoundaryRequest, BoundarySink, BoundaryStep, SafeBoundary } from "./harness.js";
 import { SinkGate } from "./sink-gate.js";
 import { cloneKeyOf } from "./attempt-path.js";
@@ -679,6 +681,9 @@ const MIDTURN_BUSY_FEED_AFTER = 3;
 function isAbortLikeError(err: unknown): boolean {
   return err instanceof Error && err.name === "AbortError";
 }
+
+/** Marks checked-gate failures whose escalation may be refused by held transport. */
+class PlanCrossCheckFailure extends Error {}
 
 /** PRD #974 follow-up (#1077): a terminal push_secret_blocked report whose reportState
  *  exhausted its bounded retries and threw. Carrying the typed origin + safe reason through
@@ -1559,7 +1564,10 @@ interface RunFlight {
   readonly reportState: (
     body: Parameters<WorkerClient["reportState"]>[1],
     signal?: AbortSignal,
+    checked?: boolean,
   ) => ReturnType<WorkerClient["reportState"]>;
+  checkedStateBarrier?: Promise<void>;
+  stateSenders?: Set<Promise<StateAck>>;
   observedSessionId: string | undefined;
   /** Issue #1626: the latest frozen completion-contract revision any /state ACK of THIS flight
    *  carried (StateAck.contractRevision, off RunDTO.completion_revision). A fresh interlocked run's
@@ -1838,6 +1846,8 @@ export interface CheckpointTestHooks {
 
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
 export interface RunnerOptions {
+  /** Test-only timing overrides; production uses the approved bounded retry/poll policy. */
+  planCrossCheckTiming?: PlanCrossCheckTiming;
   queueTerminalRejectionReconciliation?: (runId: string, generation: number) => void;
   /** How often the steering channel polls /inputs (default 3s). */
   pollMs?: number;
@@ -2062,6 +2072,7 @@ export class RunRunner {
   private readonly checkpointTickIntervalMs: number;
   /** issue #1597 M2: test-only seams (undefined in production). */
   private readonly checkpointTestHooks: CheckpointTestHooks | undefined;
+  private readonly planCrossCheckTiming: PlanCrossCheckTiming | undefined;
   private readonly recoveryRetryMs: number;
   /** PRD #1171 m4: bounded absolute deadline (ms) for a Codex durability-sink withBoundary. */
   private readonly codexBoundaryDeadlineMs: number;
@@ -2244,6 +2255,7 @@ export class RunRunner {
     this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
     this.checkpointTickIntervalMs = opts.checkpointTickIntervalMs ?? 5 * 60_000;
     this.checkpointTestHooks = opts.checkpointTestHooks;
+    this.planCrossCheckTiming = opts.planCrossCheckTiming;
     this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
     this.recoveryRetryMs = Math.max(1, Math.min(opts.recoveryRetryMs ?? 1_000, 30_000));
     // PRD #1171 m4: bounded, never unbounded. Clamp a caller-supplied 0/negative to the default.
@@ -4009,11 +4021,13 @@ export class RunRunner {
       await this.reapThenSettleRecoveryGeneration(claim, flight, runLog, "terminal");
       return;
     }
-    batcher.emit({
-      kind: "error",
-      agent: "worker",
-      payload: { text: reason },
-    });
+    if (err instanceof PlanCrossCheckFailure) {
+      // One best-effort escalation; a failed reservation must not block terminal reporting.
+      try { batcher.emit({ kind: "error", agent: "worker", payload: { text: reason } }); }
+      catch { /* Continue through the existing terminal report and custody settlement. */ }
+    } else {
+      batcher.emit({ kind: "error", agent: "worker", payload: { text: reason } });
+    }
     await batcher.close().catch(() => undefined);
     // PRD #1349 M2 (D4.5) / #1531: REAP THIS generation's provider FIRST, BEFORE the `failed`
     // report. A steering-cancel and an early agent failure both land here (a cancel aborts the
@@ -7393,7 +7407,11 @@ export class RunRunner {
       runKind: resolveRunKind(claim.kind),
       observedSessionId: undefined,
       latestContractRevision: undefined,
-      reportState: async (body, signal) => {
+      reportState: async (body, signal, checked = false) => {
+        // Session/roster/progress senders are separate from feed/usage transport. Hold new
+        // informational running reports until the checker sequence barrier has reconciled.
+        if (!checked && body.status === "running" && flight.checkedStateBarrier)
+          await flight.checkedStateBarrier;
         // Issue #1673: a routed input can trigger this report while its applied reply is
         // uncertain. Keep the report behind that receipt so the server's resume guards see it;
         // the wait throws once the receipt is given up, so neither a resume nor a completion goes
@@ -7435,13 +7453,22 @@ export class RunRunner {
         // single choke point every one of the ~71 report sites goes through (incl. the terminal
         // `failed` report), so the server's per-query fence engages uniformly. Additive/optional:
         // the observedSessionId injection is preserved, and claim_generation rides beside it.
-        const stamped: Parameters<WorkerClient["reportState"]>[1] = {
+        const stamped: Parameters<WorkerClient["reportState"]>[1] = checked ? body : {
           ...body,
           claim_generation: flight.claimGeneration,
           ...(flight.observedSessionId ? { session_id: flight.observedSessionId } : {}),
         };
+        if (checked && stamped.claim_generation !== flight.claimGeneration)
+          throw new Error("plan cross-check: state generation changed");
         const diskSeq = body.status !== undefined ? this.diskGovernor?.statusRequested(runId, body.status) : undefined;
-        const ack = await this.client.reportState(runId, stamped, signal);
+        const sending = checked
+          ? this.client.reportPlanCrossCheckGateState(runId, stamped, signal)
+          : this.client.reportState(runId, stamped, signal);
+        const senders = flight.stateSenders ??= new Set();
+        senders.add(sending);
+        let ack: StateAck;
+        try { ack = await sending; }
+        finally { senders.delete(sending); }
         if (diskSeq !== undefined) this.diskGovernor?.statusAcked(runId, diskSeq, ack.status);
         // PRD #1247 M5b (MINOR-7): the held-state switch signal rides the state ACK too — the
         // advertised SECONDARY transport beside /inputs. Feed it into the SAME generation-checked,
@@ -8996,6 +9023,27 @@ export class RunRunner {
       flight.attempt = attempt;
       this.liveAttempts.add(attempt);
     }
+    let checkedHuman: CheckedHumanGate | undefined;
+    let crossCheckSelected = false;
+    // Each strict operation freezes generation/session and the complete request before first send.
+    const checkedReports = new WeakMap<StateRequest, PlanCrossCheckStateRequest>();
+    const reportCheckedState = (body: StateRequest): Promise<StateAck> => {
+      let frozen = checkedReports.get(body);
+      if (!frozen) {
+        frozen = JSON.parse(JSON.stringify({ ...body, claim_generation: flight.claimGeneration,
+          ...(flight.observedSessionId ? { session_id: flight.observedSessionId } : {}) })) as PlanCrossCheckStateRequest;
+        checkedReports.set(body, frozen);
+      }
+      return flight.reportState(frozen, cancel.signal, true);
+    };
+    const checkedFailure = (error: unknown): never => {
+      cancel.signal.throwIfAborted();
+      if (error instanceof CredentialSwitchSignal) throw error;
+      const reason = errMessage(error).startsWith("plan cross-check:") ? errMessage(error) :
+        `plan cross-check: ${errMessage(error)}`;
+      if (checkedHuman) checkedHuman.phase = "terminal";
+      throw new PlanCrossCheckFailure(reason, { cause: error });
+    };
     const ctx: RunContext = {
       runId,
       claimGeneration: claim.claim_generation,
@@ -9213,14 +9261,76 @@ export class RunRunner {
         // force the gate by passing autoApprove=false for that case; gatePlan is otherwise
         // unchanged. Non-ci_fix and code-plan ci_fix runs keep today's behavior exactly.
         const forceGate = claim.kind === "ci_fix" && isCIConfigPlan(planMd);
-        // PRD #2149 M1: no checker runs yet. A required autopilot plan must use
-        // the existing human gate; the Codex lead gets its own actionable reason.
-        const crossCheckReason = claim.auto_approve && claim.plan_cross_check_required
-          ? claim.secrets.codex
-            ? "plan cross-check: not yet supported for a Codex lead"
-            : "plan cross-check: checker unavailable"
-          : undefined;
-        const effectiveAutoApprove = (claim.auto_approve ?? false) && !forceGate && !crossCheckReason;
+        const eligible = claim.auto_approve === true && claim.plan_cross_check_required === true &&
+          !seeded && !forceGate && ["issue", "prompt", "self_improve", "ci_fix", "mr_rework"].includes(resolveRunKind(claim.kind));
+        let crossCheckReason: string | undefined;
+        let checkedApproval: Extract<Awaited<ReturnType<typeof checkPlan>>, { kind: "approve" }>["response"] | undefined;
+        let checkedFields: PlanCrossCheckStateRequest | undefined;
+        let releaseStateBarrier: (() => void) | undefined;
+        let failStateBarrier: ((error: unknown) => void) | undefined;
+        if (eligible && !crossCheckSelected && !checkedHuman) {
+          crossCheckSelected = true; // One candidate per execution, including refusal/fallback.
+          checkedHuman = { phase: "publishinginitial" };
+          const barrier = new Promise<void>((resolve, reject) => {
+            releaseStateBarrier = () => { flight.checkedStateBarrier = undefined; resolve(); };
+            failStateBarrier = (error) => { flight.checkedStateBarrier = undefined; reject(error); };
+          });
+          void barrier.catch(() => undefined);
+          flight.checkedStateBarrier = barrier;
+          try {
+            // Settle roster/session/progress HTTP already started before the barrier. New sends
+            // wait at flight.reportState; heartbeat remains independent. Reservation.prepare
+            // separately drains usage debounce/in-flight HTTP and outbox delivery receipts.
+            await Promise.all([...flight.stateSenders ?? []]);
+            cancel.signal.throwIfAborted();
+            if (claim.secrets.codex) {
+              crossCheckReason = "plan cross-check: not yet supported for a Codex lead";
+              checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "codex_lead_unsupported" };
+              checkedHuman.onApplied = () => releaseStateBarrier?.();
+            } else {
+              const captured = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, cancel.signal, runLog);
+              if ("refusal" in captured) {
+                crossCheckReason = "plan cross-check: planning diff refused";
+                checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "planning_diff_refused",
+                  plan_cross_check_diff_refusal: captured.refusal };
+                checkedHuman.onApplied = () => releaseStateBarrier?.();
+              } else {
+                const decision = await checkPlan({ client: this.client, runId, generation: flight.claimGeneration,
+                  candidate: { plan_md: planMd, milestones: milestones ?? [],
+                    required_capabilities: toolchainDetection?.required_capabilities ?? [],
+                    required_tools: toolchainDetection?.required_tools ?? [],
+                    size_class: toolchainDetection?.size_class ?? "s", base_commit: runnerClone.baseCommit,
+                    planning_diff: captured.diff }, batcher, signal: cancel.signal, timing: this.planCrossCheckTiming });
+                if (decision.kind === "approve") {
+                  checkedApproval = decision.response;
+                  checkedHuman = undefined;
+                } else {
+                  checkedFields = decision.fields;
+                  const reason = checkedFields.plan_cross_check_gate_reason!;
+                  crossCheckReason = reason === "revise" ? "plan cross-check: changes requested" :
+                    reason === "block" ? "plan cross-check: blocked" :
+                      reason === "timed_out" ? "plan cross-check: timed out" :
+                        `plan cross-check: ${reason.replaceAll("_", " ")}`;
+                  checkedHuman.onApplied = (ack) => {
+                    if (decision.reservation && !decision.reservation.releaseAppliedGate(ack))
+                      throw new Error("plan cross-check: forced gate settlement receipts unavailable");
+                    releaseStateBarrier?.();
+                  };
+                }
+              }
+            }
+          } catch (error) {
+            if (!(error instanceof CredentialSwitchSignal)) failStateBarrier?.(error);
+            return checkedFailure(error);
+          }
+        } else if (checkedHuman) {
+          if (checkedHuman.phase !== "revisionplanning")
+            return checkedFailure(new Error("plan cross-check: new presentation outside human revision"));
+          checkedHuman.phase = "publishingrevised";
+          checkedHuman.continueWait = undefined;
+        }
+        const effectiveAutoApprove = (claim.auto_approve ?? false) && !forceGate &&
+          (!checkedHuman || checkedApproval !== undefined);
         // Issue #1604 (D3): a resumed claim with an unapproved persisted plan reports no
         // awaiting_approval before the inputs sent before the release are read (the replayed
         // backlog drained), whatever the executor. A gate shown first would bump the epoch, and a
@@ -9234,7 +9344,7 @@ export class RunRunner {
           milestones,
           batcher,
           steering,
-          reportState,
+          checkedHuman || checkedApproval ? reportCheckedState : reportState,
           runLog,
           effectiveAutoApprove,
           crossCheckReason,
@@ -9249,12 +9359,32 @@ export class RunRunner {
           flight.publishedTip,
           onAwaitingApproval,
           settles,
-        );
+          checkedHuman,
+          checkedFields,
+          checkedApproval,
+          cancel.signal,
+        ).catch((error) => {
+          if (checkedHuman || checkedApproval) {
+            if (!(error instanceof CredentialSwitchSignal)) failStateBarrier?.(error);
+            return checkedFailure(error);
+          }
+          throw error;
+        });
+        if (checkedApproval) releaseStateBarrier?.();
         // Human-in-the-loop iff the plan reached an approve verdict via the PARK path
         // (not the auto short-circuit). Read by the pre-push guard below.
         flight.ciFixHumanApproved = verdict.kind === "approve" && !effectiveAutoApprove;
         return verdict;
       },
+      ...(claim.auto_approve && claim.plan_cross_check_required && !seeded ? {
+        continueExistingPlanGate: async (otherwise: () => Promise<PlanVerdict>) => {
+          if (!checkedHuman) return otherwise();
+          if (!checkedHuman.continueWait || checkedHuman.phase === "terminal" || checkedHuman.phase === "revisionplanning")
+            return checkedFailure(new Error("plan cross-check: existing human wait unavailable"));
+          try { return await checkedHuman.continueWait(); }
+          catch (error) { return checkedFailure(error); }
+        },
+      } : {}),
       // PRD #88 clarification park: surface the question, post awaiting_input, and
       // return the answer the steering channel resolves. An autopilot claim
       // short-circuits to a sentinel answer (see askUser) — such a run never parks.
@@ -14023,6 +14153,47 @@ export class RunRunner {
    *  ABSOLUTE deadline computed on the first entry and threaded across rounds, so N
    *  revision rounds share ONE budget rather than resetting the clock each round. The
    *  autopilot short-circuit is unchanged and never returns a revise. */
+  private async captureCheckedPlanningDiff(
+    clonePath: string, baseCommit: string, signal: AbortSignal, runLog: Logger,
+  ): Promise<{ diff: string } | { refusal: PlanCrossCheckDiffRefusal }> {
+    if (!/^[a-f0-9]{40}$/.test(baseCommit)) return { refusal: "base_unavailable" };
+    const scope = new AbortController();
+    const ownerSignal = AbortSignal.any([signal, scope.signal]);
+    const timer = setTimeout(() => scope.abort(), 60_000);
+    const spawner = new TickSpawner({ signal: ownerSignal, log: runLog });
+    let result: { diff: string } | { refusal: PlanCrossCheckDiffRefusal };
+    try {
+      result = await this.git.withBoundaryProcessSpawner(spawner.spawn, ownerSignal, async () => {
+        let bytes: Buffer;
+        try { bytes = await this.git.capturePlanningDiff(clonePath, baseCommit); }
+        catch (error) {
+          signal.throwIfAborted();
+          const message = errMessage(error);
+          return { refusal: /untracked path cap/.test(message) ? "too_many_untracked" :
+            /patch cap|exceeded 512 KiB|source cap|total source cap/.test(message) ? "diff_too_large" :
+              /base object|base commit|base must|ENOENT/.test(message) ? "base_unavailable" : "diff_failed" };
+        }
+        if (bytes.length > 512 * 1024) return { refusal: "diff_too_large" };
+        const diff = bytes.toString("utf8");
+        if (!Buffer.from(diff, "utf8").equals(bytes)) return { refusal: "diff_failed" };
+        // Scan precisely the UTF-8 bytes that will be uploaded, never a lossy replacement.
+        const scan = await this.git.scanPatchForSecrets(diff);
+        signal.throwIfAborted();
+        if (!scan.trusted || ownerSignal.aborted) return { refusal: "scan_failed" };
+        if (scan.findings.length) return { refusal: "secret_detected" };
+        return { diff };
+      });
+    } finally {
+      clearTimeout(timer);
+      scope.abort();
+      await spawner.settled();
+    }
+    signal.throwIfAborted();
+    if (spawner.survivors().length)
+      throw new Error("plan cross-check: trusted preparation process did not settle");
+    return result;
+  }
+
   private async gatePlan(
     runId: string,
     planMd: string,
@@ -14065,6 +14236,10 @@ export class RunRunner {
     // persisted; a declined or failed report leaves the revise unapplied, so an interruption
     // replays it instead of re-presenting the superseded plan.
     settles?: number,
+    associated?: CheckedHumanGate,
+    checkedFields?: PlanCrossCheckStateRequest,
+    checkedApproval?: Extract<Awaited<ReturnType<typeof checkPlan>>, { kind: "approve" }>["response"],
+    ownerSignal?: AbortSignal,
   ): Promise<PlanVerdict> {
     // PRD #1795 (decision 6): nothing is confirmed until THIS gate's own applied awaiting_approval
     // ACK says which revision it published, so a verdict bound to an earlier gate cannot act on
@@ -14133,6 +14308,12 @@ export class RunRunner {
       // guard reads; without it a resumed autopilot run re-plans instead of
       // implementing (the RC1 incident).
       autopilotState.plan_md = planMd;
+      if (checkedApproval) {
+        const canonical = checkedApproval.candidate;
+        Object.assign(autopilotState, { plan_md: canonical.plan_md, milestones: canonical.milestones,
+          required_capabilities: canonical.required_capabilities, required_tools: canonical.required_tools,
+          size_class: canonical.size_class, candidate_digest: checkedApproval.candidate_digest });
+      }
       // AWAIT the ack and gate the approve on PROVEN storage — no `.catch` swallow.
       // The ack is the storage proof: HTTP 200 ⟺ the plan is durably stored, because
       // the server errors BEFORE the running write on a 0-row plan refusal (the guarded
@@ -14143,7 +14324,7 @@ export class RunRunner {
       // moved on — cancelled/parked concurrently — so the plan was NOT stored; throw
       // here rather than returning an approve verdict. Only a 200 (applied) proceeds.
       const ack = await reportState(autopilotState);
-      if (!ack.applied) {
+      if (!ack.applied || (checkedApproval && (ack.status !== "running" || ack.staleClaim))) {
         throw new TrustedExecutionRefusal(
           `autopilot plan not durably stored — the run is ${ack.status ?? "no longer running"}`,
         );
@@ -14166,6 +14347,10 @@ export class RunRunner {
       // branch below (a human sees the plan + the nudge and can revise/reject). The verdict is
       // UNCHANGED — this arms guidance beside the approve, it does not alter it.
       if (proposesRewrite) steering.pushSafetySteer(composePlanGateNudge(publishedTip!));
+      if (checkedApproval) return { kind: "approve", approval: "cross_check", selection: { status: "ok", selection },
+        canonical: { plan: checkedApproval.candidate.plan_md,
+          milestones: checkedApproval.candidate.milestones as Milestone[],
+          candidate_digest: checkedApproval.candidate_digest, claimGeneration: checkedApproval.candidate_generation } };
       return { kind: "approve", selection: { status: "ok", selection } };
     }
 
@@ -14209,7 +14394,8 @@ export class RunRunner {
       presentation.presentation_id = reuse?.presentationId ?? randomUUID();
       if (reuse && reuse.presentationId === undefined) presentation.adopt_gate_revision = reuse.revision;
     }
-    const ack = await reportState({
+    const request: StateRequest = {
+      ...checkedFields,
       status: "awaiting_approval",
       plan_md: planMd,
       ...presentation,
@@ -14223,7 +14409,23 @@ export class RunRunner {
       // spread — so each gate round REPLACES the server's list (M1's COALESCE clears on
       // empty), keeping a revision gate from showing a stale earlier round's writes.
       plan_changed_files: planChangedFiles,
-    });
+      ...(associated ? { milestones: milestones ?? [] } : {}),
+    };
+    let confirmed = false;
+    let epoch: number;
+    const publishAndWait = async (): Promise<PlanVerdict> => {
+    if (!confirmed) {
+    let ack: StateAck;
+    try { ack = await reportState(request); }
+    catch (error) {
+      if (!associated || error instanceof CredentialSwitchSignal) throw error;
+      throw new Error("plan cross-check: human-presentation ACK unrecoverable", { cause: error });
+    }
+    if (associated && (ack.applied !== true || ack.status !== "awaiting_approval" ||
+        !Number.isSafeInteger(ack.gateRevision) || (ack.gateRevision ?? 0) <= 0))
+      throw new Error("plan cross-check: human-presentation ACK unrecoverable");
+    associated?.onApplied?.(ack);
+    if (associated) associated.onApplied = undefined;
     // PRD #1795 (A3, decision 8): a refused report (a historical id, a changed payload under the
     // current id, a stale adoption) published nothing. Confirm nothing, take no verdict, and leave
     // every receipt unapplied (a revise it answers stays replayable): park through the existing
@@ -14252,7 +14454,9 @@ export class RunRunner {
       steering.setGateRevision(ack.gateRevision);
     if (this.gatedRuns.has(runId)) steering.bumpEpoch();
     else this.gatedRuns.add(runId);
-    const epoch = steering.currentEpoch();
+    epoch = steering.currentEpoch();
+    confirmed = true;
+    if (associated) associated.phase = "confirmedwait";
     runLog.info("plan gate: awaiting approval", {
       run_id: runId,
       gate_epoch: epoch,
@@ -14278,9 +14482,11 @@ export class RunRunner {
       }
     }
 
+    }
     // A terminal verdict ends the gate → clear the shared per-run gate state. A revise
     // keeps the shared budget/epoch state running; the re-report above does the bump.
     const settle = (v: PlanVerdict): PlanVerdict => {
+      if (associated) associated.phase = v.kind === "revise" ? "revisionplanning" : "terminal";
       if (v.kind !== "revise") {
         this.gateDeadlines.delete(runId);
         this.gatedRuns.delete(runId);
@@ -14292,7 +14498,7 @@ export class RunRunner {
     };
 
     if (this.planApprovalTimeoutMs <= 0)
-      return settle(await steering.awaitGateEvent(epoch, this.shutdownSignal.signal));
+      return settle(await steering.awaitGateEvent(epoch!, ownerSignal ?? this.shutdownSignal.signal));
 
     // One absolute deadline across all revision rounds: set it on the first entry and
     // reuse it, so the per-round timer counts down the REMAINING budget (not a fresh 24h).
@@ -14306,7 +14512,7 @@ export class RunRunner {
     // The timeout can win Promise.race while the gate waiter is still parked.
     // End that losing wait as well, without aborting the runner's shutdown signal.
     const gateWaitAbort = new AbortController();
-    const gateWaitSignal = AbortSignal.any([this.shutdownSignal.signal, gateWaitAbort.signal]);
+    const gateWaitSignal = AbortSignal.any([ownerSignal ?? this.shutdownSignal.signal, gateWaitAbort.signal]);
     const timeout = new Promise<PlanVerdict>((resolve) => {
       timer = setTimeout(
         () => resolve({ kind: "reject", reason: PLAN_APPROVAL_TIMEOUT_REASON }),
@@ -14316,12 +14522,15 @@ export class RunRunner {
     });
     try {
       return settle(
-        await Promise.race([steering.awaitGateEvent(epoch, gateWaitSignal), timeout]),
+        await Promise.race([steering.awaitGateEvent(epoch!, gateWaitSignal), timeout]),
       );
     } finally {
       if (timer) clearTimeout(timer);
       gateWaitAbort.abort(new Error("gate wait settled"));
     }
+    };
+    if (associated) associated.continueWait = publishAndWait;
+    return publishAndWait();
   }
 
   /**
