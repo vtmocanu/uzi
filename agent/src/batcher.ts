@@ -3,7 +3,7 @@ import { RequestError, isTransient } from "./client.js";
 import type { Logger } from "./log.js";
 import type { EmittedMessage } from "./executor.js";
 import type { Outbox } from "./outbox.js";
-import type { OutgoingMessage } from "./protocol.js";
+import type { OutgoingMessage, StateAck, PlanCrossCheckReconciliation } from "./protocol.js";
 import type { PayloadRedactor, TextRedactor } from "./redact.js";
 import { emptyCounts, countsTotal, sanitizePayload, sanitizeText } from "./sanitize.js";
 import { UsageRecorder } from "./usage-recorder.js";
@@ -275,7 +275,10 @@ interface TransportReservation {
   held: { msg: Omit<OutgoingMessage, "seq">; bytes: number }[];
   bytes: number;
   outboxPending: Set<symbol>;
-  preparing?: Promise<{ prepared: boolean; tail: number }>;
+  preparing?: Promise<CandidateTransportPreparation>;
+  submitted: boolean;
+  ownedAttemptFailed?: boolean;
+  failureReason?: CandidateTransportPreparation["reason"];
   /** Exact failed request prefix, even if later assigned frames follow it. */
   replay?: Buffered[];
 }
@@ -283,9 +286,19 @@ interface TransportReservation {
 /** Sequence reservation only; callers must establish the checked-route feature/fence first.
  * No checker approval or presentation authority is conveyed by this handle.
  */
+export interface CandidateTransportPreparation {
+  prepared: boolean;
+  tail: number;
+  reason?: "retryable" | "usage_unconfirmed" | "cancelled" | "overflow" | "outbox_unavailable" | "ownership_unknown";
+  permanent?: boolean;
+}
 export interface CandidateTransportReservation {
-  prepare(deadlineMs?: number, signal?: AbortSignal): Promise<{ prepared: boolean; tail: number }>;
+  prepare(deadlineMs?: number, signal?: AbortSignal): Promise<CandidateTransportPreparation>;
+  /** Latch synchronously before the first submit POST, including an ambiguous failure. */
+  markSubmitted(): void;
   release(proof: PlanCrossCheckResponse): boolean;
+  /** Transport authority only; the runner still owns the exact gate presentation. */
+  releaseAppliedGate(ack: StateAck): boolean;
   cancel(): void;
 }
 
@@ -457,6 +470,7 @@ export class MessageBatcher {
       // Reserve space for the eventual signed32-bit sequence without assigning it.
       const bytes = item.bytes + 10;
       if (r.state === "failed" || r.bytes + bytes > this.spillBufferBytes) {
+        if (r.state !== "failed") r.failureReason = "overflow";
         r.state = "failed";
         r.abort.abort();
         throw new Error("candidate transport reservation refused an event");
@@ -514,7 +528,7 @@ export class MessageBatcher {
       !Number.isInteger(this.seq) || this.seq < 0 || this.seq > 0x7fffffff)
       throw new Error("candidate transport cannot be reserved");
     const r: TransportReservation = {
-      tail: this.seq, state: "held", abort: new AbortController(), held: [], bytes: 0,
+      tail: this.seq, state: "held", abort: new AbortController(), held: [], bytes: 0, submitted: false,
       outboxPending: new Set(this.outbox?.pendingDeliveryIdentities(this.runId)),
     };
     this.reservation = r;
@@ -524,70 +538,97 @@ export class MessageBatcher {
       prepare: (deadlineMs = 3000, signal) => {
         if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 0)
           throw new RangeError("candidate transport deadline must be a nonnegative safe integer");
-        if (this.reservation !== r) return Promise.resolve({ prepared: false, tail: r.tail });
+        if (this.reservation !== r || r.abort.signal.aborted || r.state === "failed")
+          return Promise.resolve({ prepared: false, tail: r.tail, permanent: true, reason: r.failureReason ?? "cancelled" });
         if (!r.preparing && !r.abort.signal.aborted && this.reservation === r) {
           r.state = "held";
           r.preparing = this.prepareReservation(r, deadlineMs, signal);
           const attempt = r.preparing;
           void attempt.then((result) => { if (!result.prepared && r.preparing === attempt) r.preparing = undefined; });
         }
-        return r.preparing ?? Promise.resolve({ prepared: false, tail: r.tail });
+        return r.preparing ?? Promise.resolve({ prepared: false, tail: r.tail, permanent: true, reason: "cancelled" });
       },
-      cancel: () => { if (this.reservation === r) { r.state = "failed"; r.abort.abort(); } },
+      markSubmitted: () => { r.submitted = true; },
+      cancel: () => { if (this.reservation === r) { r.state = "failed"; r.failureReason ??= "cancelled"; r.abort.abort(); } },
       release: (proof) => {
-        if (this.reservation !== r || r.state !== "prepared" || this.closed || r.abort.signal.aborted)
-          return false;
         const p = proof?.reconciliation;
-        const tail = p?.leadLastSeq;
-        if (!p || p.claimGeneration !== this.generation || p.planCrossCheckSettled !== true ||
-          typeof tail !== "number" || !Number.isInteger(tail) || tail < r.tail || tail > 0x7fffffff ||
-          proof.lead_last_seq !== tail ||
+        if (!p || proof.lead_last_seq !== p.leadLastSeq ||
           !((proof.result === "candidate" && proof.candidate_generation === this.generation &&
             ["approve", "revise", "block", "failed"].includes(proof.verdict)) ||
-            (proof.result === "parked" &&
-              ["approve", "revise", "block", "failed"].includes(proof.verdict)))) return false;
-        if (tail + r.held.length > 0x7fffffff) return false;
-        this.seq = tail;
-        for (const item of r.held) {
-          const msg = { ...item.msg, seq: ++this.seq };
-          this.buffer.push({ msg, bytes: messageBytes(msg) });
-        }
-        this.reservation = undefined;
-        this.spilled = false;
-        this.consecutiveFailures = 0;
-        this.failingSince = undefined;
-        if (this.buffer.length) this.scheduleFlush();
-        return true;
+            (proof.result === "parked" && ["", "approve", "revise", "block", "failed"].includes(proof.verdict)) ||
+            (proof.result === "no_row" && proof.reason_class === "no_candidate" && !r.submitted)))
+          return false;
+        return this.releaseReservation(r, p);
+      },
+      releaseAppliedGate: (ack) => {
+        if (!ack?.applied || ack.status !== "awaiting_approval" || ack.staleClaim ||
+            !ack.reconciliation || ack.reconciliation.gateRevision < 1) return false;
+        return this.releaseReservation(r, ack.reconciliation);
       },
     };
+  }
+
+  private releaseReservation(r: TransportReservation, p: PlanCrossCheckReconciliation): boolean {
+    const tail = p.leadLastSeq;
+    if (this.reservation !== r || r.state !== "prepared" || this.closed || this.tripped ||
+        r.abort.signal.aborted || r.outboxPending.size !== 0 || r.replay ||
+        this.buffer.length !== 0 || this.pendingRangeFirst !== undefined ||
+        this.outbox?.isDisabled() || this.outbox?.hasUndrainedMessages(this.runId) ||
+        p.claimGeneration !== this.generation || !Number.isSafeInteger(p.claimGeneration) || p.claimGeneration <= 0 ||
+        p.planCrossCheckSettled !== true || !Number.isInteger(tail) ||
+        tail < r.tail || tail > 0x7fffffff || tail + r.held.length > 0x7fffffff) return false;
+    this.seq = tail;
+    for (const item of r.held) {
+      const msg = { ...item.msg, seq: ++this.seq };
+      this.buffer.push({ msg, bytes: messageBytes(msg) });
+    }
+    this.reservation = undefined;
+    this.spilled = false;
+    this.consecutiveFailures = 0;
+    this.failingSince = undefined;
+    this.splitLimit = undefined;
+    if (this.buffer.length) this.scheduleFlush();
+    return true;
   }
 
   private async prepareReservation(
     r: TransportReservation,
     deadlineMs: number, signal?: AbortSignal,
-  ): Promise<{ prepared: boolean; tail: number }> {
+  ): Promise<CandidateTransportPreparation> {
     const expiry = AbortSignal.any([r.abort.signal,
       AbortSignal.timeout(Math.max(0, Math.min(deadlineMs, 30_000))),
       ...(signal ? [signal] : [])]);
+    let usageUnconfirmed = false;
     const failed = (): boolean => r.state === "failed";
     const abortOwned = (): void => { this.inFlightAbort?.abort(); };
     expiry.addEventListener("abort", abortOwned, { once: true });
     try {
       if (expiry.aborted) abortOwned();
       await this.inFlight;
+      if (r.ownedAttemptFailed) {
+        r.ownedAttemptFailed = false;
+        throw new Error("owned request failed");
+      }
       if (expiry.aborted || failed() || this.closed || this.tripped ||
         this.outbox?.isDisabled()) throw new Error("reservation unavailable");
-      if (!await this.usage.drainConfirmed(Math.min(deadlineMs, 3000), expiry))
+      if (!await this.usage.drainConfirmed(Math.min(deadlineMs, 3000), expiry)) {
+        usageUnconfirmed = true;
         throw new Error("usage not ACK-proven");
+      }
       if (this.outbox) {
         const result = await this.outbox.drainRun(this.runId, async (msgs, generation) => {
-          if (expiry.aborted || generation !== this.generation ||
-            msgs.some((m) => m.seq > r.tail)) throw new Error("unproven durable generation/tail");
+          if (generation !== this.generation || msgs.some((m) => m.seq > r.tail)) {
+            r.failureReason = "ownership_unknown";
+            r.abort.abort();
+            throw new Error("unproven durable generation/tail");
+          }
+          expiry.throwIfAborted();
           await this.client.postMessages(this.runId, msgs, generation, expiry);
         }, (identity) => { r.outboxPending.delete(identity); }, expiry);
         const remaining = new Set(this.outbox.pendingDeliveryIdentities(this.runId));
         if ([...r.outboxPending].some((identity) => !remaining.has(identity)) ||
           result.staleRetired !== 0) {
+          r.failureReason = "ownership_unknown";
           r.abort.abort(); // External disappearance supplies no delivery receipt.
           throw new Error("outbox retirement not ACK-proven");
         }
@@ -611,15 +652,25 @@ export class MessageBatcher {
           throw err;
         }
       }
-      if (!await this.usage.drainConfirmed(Math.min(deadlineMs, 3000), expiry))
+      if (!await this.usage.drainConfirmed(Math.min(deadlineMs, 3000), expiry)) {
+        usageUnconfirmed = true;
         throw new Error("usage not ACK-proven");
+      }
       if (expiry.aborted || failed() || this.closed || this.outbox?.isDisabled())
         throw new Error("cancelled or unavailable");
       r.state = "prepared";
       return { prepared: true, tail: r.tail };
     } catch {
-      r.state = "failed";
-      return { prepared: false, tail: r.tail };
+      const permanent = r.abort.signal.aborted || this.closed || this.tripped ||
+        this.outbox?.isDisabled() === true || this.usage.inactive || this.usage.hasUnconfirmedLoss;
+      if (permanent) {
+        r.state = "failed";
+        r.failureReason ??= this.outbox?.isDisabled() ? "outbox_unavailable" :
+          this.usage.inactive || this.usage.hasUnconfirmedLoss ? "usage_unconfirmed" : "cancelled";
+        r.abort.abort();
+      } else r.state = "held";
+      return { prepared: false, tail: r.tail, permanent,
+        reason: r.failureReason ?? (usageUnconfirmed ? "usage_unconfirmed" : "retryable") };
     } finally {
       expiry.removeEventListener("abort", abortOwned);
     }
@@ -836,6 +887,11 @@ export class MessageBatcher {
   private trip(reason: string, lastSeq: number): void {
     if (this.tripped) return;
     this.tripped = true;
+    if (this.reservation) {
+      this.reservation.state = "failed";
+      this.reservation.failureReason ??= "cancelled";
+      this.reservation.abort.abort();
+    }
     this.tripReason = reason;
     const dropped = this.buffer.length;
     const text = this.redactText(
@@ -914,7 +970,7 @@ export class MessageBatcher {
         const verdict = classify(err);
         const reserved = this.reservation as TransportReservation | undefined;
         if (reserved) {
-          reserved.state = "failed";
+          reserved.ownedAttemptFailed = true;
           reserved.replay = half;
           return { remaining: batch.slice(lo), progressed };
         }
@@ -973,7 +1029,7 @@ export class MessageBatcher {
     } catch (err) {
       const reserved = this.reservation as TransportReservation | undefined;
       if (reserved) {
-        reserved.state = "failed";
+        reserved.ownedAttemptFailed = true;
         reserved.replay = [marker];
         return { remaining: [marker, ...batch.slice(lo + 1)], progressed };
       }
@@ -1023,7 +1079,7 @@ export class MessageBatcher {
           if (signal?.aborted) {
             this.buffer = batch.concat(this.buffer);
             const reserved = this.reservation as TransportReservation | undefined;
-            if (reserved) reserved.replay = batch;
+            if (reserved) { reserved.ownedAttemptFailed = true; reserved.replay = batch; }
             break;
           }
           if (await this.handleFailure(batch, err, signal)) break;
@@ -1046,7 +1102,7 @@ export class MessageBatcher {
       this.buffer = batch.concat(this.buffer);
       // An already-owned ordinary request may finish after reservation. Do not
       // replace its payload or spill it on a failed response.
-      this.reservation.state = "failed";
+      this.reservation.ownedAttemptFailed = true;
       this.reservation.replay = batch;
       return true;
     }
@@ -1375,6 +1431,7 @@ export class MessageBatcher {
     if (this.reservation) {
       const r = this.reservation;
       r.state = "failed";
+      r.failureReason ??= "cancelled";
       r.abort.abort();
       this.inFlightAbort?.abort();
       await this.inFlight;

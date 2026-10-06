@@ -391,6 +391,8 @@ export class UsageRecorder implements UsageSink {
 
   /** @internal Loss remains observable even after a finished leg is pruned. */
   noteUnconfirmedLoss(): void { this.unconfirmedLoss = true; }
+  /** A missing receipt after refused/abandoned usage cannot be repaired by a later drain. */
+  get hasUnconfirmedLoss(): boolean { return this.unconfirmedLoss; }
   private readonly debounceMs: number;
   private readonly requestTimeoutMs: number;
   private readonly backoffBaseMs: number;

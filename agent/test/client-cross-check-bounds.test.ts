@@ -72,7 +72,8 @@ describe("cross-check response byte bounds", () => {
     it(`${operation.name} accepts exactly the byte boundary including UTF-8 across chunks`, async (t) => {
       const bytes = Buffer.alloc(CAP, " ");
       // Put the two-byte character across a chunk boundary.
-      const json = '{"padding":"' + "a".repeat(CHUNK_BYTES - 13) + 'é"}';
+      const json = '{"padding":"' + "a".repeat(CHUNK_BYTES - 13) +
+        'é","result":"no_row","reason_class":"no_candidate","lead_last_seq":0}';
       bytes.set(Buffer.from(json));
       const stream = streamingResponse(bytes);
       t.mock.method(globalThis, "fetch", async () => stream.response);
@@ -130,9 +131,11 @@ describe("cross-check response byte bounds", () => {
   it("cross-check POSTs preserve empty and 204 responses", async (t) => {
     for (const operation of operations.filter((entry) => entry.name !== "planCrossCheckStatus")) {
       t.mock.method(globalThis, "fetch", async () => new Response(""));
-      assert.equal(await operation.call(newClient()), undefined);
+      if (operation.name === "submitPlanCrossCheck") await assert.rejects(operation.call(newClient()), /invalid cross-check/);
+      else assert.equal(await operation.call(newClient()), undefined);
       t.mock.method(globalThis, "fetch", async () => new Response(null, { status: 204 }));
-      assert.equal(await operation.call(newClient()), undefined);
+      if (operation.name === "submitPlanCrossCheck") await assert.rejects(operation.call(newClient()), /invalid cross-check/);
+      else assert.equal(await operation.call(newClient()), undefined);
     }
   });
 });

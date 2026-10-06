@@ -95,9 +95,7 @@ it("lost forced ACK can be recovered by parked status/submit with identity, curr
     assert.deepEqual(recovered.reconciliation, expectedParked);
     t.mock.method(globalThis, "fetch", async () => Response.json({ result: "parked", verdict: "pending",
       reason_class: "", ...parked, plan_cross_check_settled: false, candidate, findings: { summary: "hidden" } }));
-    const pending = await call(client());
-    assert.equal(pending.reconciliation?.planCrossCheckSettled, false);
-    assert.ok(!("candidate" in pending) && !("findings" in pending));
+    await assert.rejects(call(client()), /invalid parked/);
     for (const proof of [...invalid, running, { ...parked, claim_generation: 4 }]) {
       t.mock.method(globalThis, "fetch", async () => Response.json({ result: "parked", verdict: "", reason_class: "", ...proof }));
       await assert.rejects(call(client()), /invalid parked/);
@@ -113,7 +111,8 @@ it("legacy active/no-row and ordinary ACK shapes remain unchanged; incomplete pr
   for (const call of calls) {
     for (const value of [
       { result: "no_row", reason_class: "no_candidate", lead_last_seq: 7 },
-      { result: "candidate", candidate, candidate_digest: HASH, candidate_generation: 3, lead_last_seq: 7 },
+      { result: "candidate", round: 1, candidate, candidate_digest: HASH, candidate_generation: 3, lead_last_seq: 7,
+        verdict: "pending", reason_class: "", checker_run_id: null, findings: null, deadline_at: "2030-01-01T00:00:00Z" },
     ]) {
       t.mock.method(globalThis, "fetch", async () => Response.json(value));
       assert.deepEqual(await call(client()), value);

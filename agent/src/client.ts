@@ -118,22 +118,101 @@ export type PlanCrossCheckResponse = ({ reconciliation?: PlanCrossCheckReconcili
       verdict: "pending" | "approve" | "revise" | "block" | "failed";
       reason_class: "" | "approve" | PlanCrossCheckGateReason;
       findings: PlanCrossCheckFindings | null; deadline_at: string; lead_last_seq: number }));
+const CROSS_CHECK_FAILURE_REASONS = new Set([
+  "malformed", "model_error", "model_timeout", "checker_unavailable", "confinement_failed",
+  "timed_out", "superseded", "interrupted",
+]);
+const CROSS_CHECK_GATE_REASONS = new Set([...CROSS_CHECK_FAILURE_REASONS,
+  "revise", "block", "codex_lead_unsupported", "planning_diff_refused", "candidate_refused", "checker_failed"]);
+function crossCheckRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function crossCheckText(value: unknown, bytes: number): value is string {
+  return typeof value === "string" && Buffer.byteLength(value, "utf8") <= bytes;
+}
+function crossCheckDeadline(value: unknown): boolean {
+  if (typeof value !== "string" || value.length > 64 ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(value) ||
+      !Number.isFinite(Date.parse(value))) return false;
+  const year = Number(value.slice(0, 4)), month = Number(value.slice(5, 7)), day = Number(value.slice(8, 10));
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return year > 0 && month >= 1 && month <= 12 && day >= 1 && day <= days[month - 1]!;
+}
+function crossCheckPair(verdict: unknown, reason: unknown): boolean {
+  return verdict === "pending" ? reason === "" :
+    verdict === "failed" ? typeof reason === "string" && CROSS_CHECK_FAILURE_REASONS.has(reason) :
+      ["approve", "revise", "block"].includes(verdict as string) && reason === verdict;
+}
 function decodePlanCrossCheckResponse(value: unknown, generation: number): PlanCrossCheckResponse {
-  // Preserve legacy active/no-row decoding; only the derived group carries proof.
-  if (!value || typeof value !== "object" || Array.isArray(value)) return value as PlanCrossCheckResponse;
-  const wire = value as Record<string, unknown>;
-  const decoded = { ...wire };
-  delete decoded.reconciliation;
+  const invalid = (): never => { throw new Error("invalid " +
+    (crossCheckRecord(value) && value.result === "parked" ? "parked " : "") + "cross-check response"); };
+  if (!crossCheckRecord(value)) return invalid();
+  const wire = value;
+  if (!Number.isInteger(wire.lead_last_seq) || (wire.lead_last_seq as number) < 0 ||
+      (wire.lead_last_seq as number) > 0x7fffffff) return invalid();
   const proof = readPlanCrossCheckReconciliation(wire);
   const reconciliation = proof?.claimGeneration === generation ? proof : undefined;
-  if (wire.result === "parked" && (!reconciliation || reconciliation.gateRevision < 1 ||
-      typeof wire.verdict !== "string" || typeof wire.reason_class !== "string"))
-    throw new Error("invalid parked cross-check reconciliation");
-  if (wire.result === "parked" && reconciliation !== undefined) {
-    return { result: "parked", verdict: wire.verdict as string, reason_class: wire.reason_class as string,
+  const decoded = { ...wire };
+  delete decoded.reconciliation;
+  if (reconciliation) decoded.reconciliation = reconciliation;
+  if (wire.result === "no_row") {
+    if (wire.reason_class !== "no_candidate" || wire.candidate !== undefined) return invalid();
+    return decoded as PlanCrossCheckResponse;
+  }
+  if (wire.result === "parked") {
+    const verdict = wire.verdict === undefined ? "" : wire.verdict;
+    const reason = wire.reason_class === undefined ? "" : wire.reason_class;
+    if (!reconciliation || reconciliation.gateRevision < 1 ||
+        ["candidate", "candidate_digest", "candidate_generation", "checker_run_id", "findings", "round", "deadline_at"]
+          .some((key) => key in wire) ||
+        !(crossCheckPair(verdict, reason) ||
+          (verdict === "" && (reason === "" || CROSS_CHECK_GATE_REASONS.has(reason as string))))) return invalid();
+    return { result: "parked", verdict: verdict as string, reason_class: reason as string,
       lead_last_seq: reconciliation.leadLastSeq, reconciliation };
   }
-  if (reconciliation !== undefined) decoded.reconciliation = reconciliation;
+  if (wire.result !== "candidate" || wire.round !== 1 ||
+      !Number.isSafeInteger(wire.candidate_generation) || (wire.candidate_generation as number) <= 0 ||
+      (wire.checker_run_id !== null && (typeof wire.checker_run_id !== "string" ||
+        !/^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$/.test(wire.checker_run_id))) ||
+      typeof wire.candidate_digest !== "string" || !/^[a-fA-F0-9]{64}$/.test(wire.candidate_digest) ||
+      !crossCheckDeadline(wire.deadline_at) || !crossCheckPair(wire.verdict, wire.reason_class))
+    return invalid();
+  const c = wire.candidate;
+  if (!crossCheckRecord(c) || !crossCheckText(c.plan_md, 256 * 1024) ||
+      !crossCheckText(c.planning_diff, 512 * 1024) ||
+      typeof c.base_commit !== "string" || !/^[a-fA-F0-9]{40}$/.test(c.base_commit) ||
+      !["s", "m", "l"].includes(c.size_class as string) ||
+      !Array.isArray(c.milestones) || c.milestones.length > 64 ||
+      Buffer.byteLength(JSON.stringify(c.milestones), "utf8") > 256 * 1024) return invalid();
+  // Canonical stored nil capability/tool slices serialize as null, unlike milestones.
+  const list = (v: unknown): string[] | undefined =>
+    v === null ? [] : Array.isArray(v) && v.length <= 64 && v.every((s) => crossCheckText(s, 256)) ? v : undefined;
+  const caps = list(c.required_capabilities), tools = list(c.required_tools);
+  if (!caps || !tools) return invalid();
+  // The normalizer preserves extra milestone prose, bounded to depth 32 and total bytes.
+  const prose = (v: unknown, depth: number): boolean => depth <= 32 &&
+    (typeof v === "string" ? crossCheckText(v, 256 * 1024) :
+      Array.isArray(v) ? v.every((x) => prose(x, depth + 1)) :
+        crossCheckRecord(v) ? Object.entries(v).every(([k, x]) => crossCheckText(k, 128) && prose(x, depth + 1)) : true);
+  if (!prose(c.milestones, 0) || !c.milestones.every((m) => crossCheckRecord(m) &&
+      (m.id === undefined || m.id === null || crossCheckText(m.id, 64)) &&
+      (m.title === undefined || m.title === null || crossCheckText(m.title, 256 * 1024)))) return invalid();
+  const f = wire.findings;
+  if (f !== null) {
+    if (!crossCheckRecord(f) || !crossCheckText(f.summary, 4096) ||
+        !(f.items === null || Array.isArray(f.items)) ||
+        (Array.isArray(f.items) && (f.items.length > 20 || !f.items.every((item) =>
+          crossCheckRecord(item) && crossCheckText(item.file, 512) &&
+          ["info", "warning", "error"].includes(item.severity as string) &&
+          crossCheckText(item.summary, 1024) && crossCheckText(item.rationale, 2048) &&
+          Buffer.byteLength(item.file + item.severity + item.summary + item.rationale, "utf8") <= 2048 &&
+          Object.keys(item).every((key) => ["file", "severity", "summary", "rationale"].includes(key))))) ||
+        Object.keys(f).some((key) => !["summary", "items"].includes(key)) ||
+        Buffer.byteLength(JSON.stringify(f), "utf8") > 32 * 1024) return invalid();
+    decoded.findings = { ...f, items: f.items ?? [] };
+  }
+  decoded.candidate = { ...c, required_capabilities: caps, required_tools: tools };
   return decoded as PlanCrossCheckResponse;
 }
 
@@ -1354,6 +1433,14 @@ export class WorkerClient {
     await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-check-verdict`,
       { claim_generation: claimGeneration, ...result },
       this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+  }
+
+  /** Checked plan writes never downgrade their immutable generation or gate identity. */
+  async reportPlanCrossCheckGateState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
+    if (!Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
+        !this.serverFeatures.has("gate_revision_v1"))
+      throw new Error("checked plan state requires generation and gate_revision_v1");
+    return this.reportStateOnce(runId, `${WORKER_API_PREFIX}/runs/${runId}/state`, body, signal);
   }
 
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {

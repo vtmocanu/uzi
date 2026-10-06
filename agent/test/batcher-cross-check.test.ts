@@ -86,7 +86,12 @@ it("lost ACK retry retains identical old seq/body; failed preparation cannot rel
   b.emit(event("original"));
   const r = b.reserveCandidateTransport();
   b.emit(event("later"));
-  assert.equal((await r.prepare()).prepared, false);
+  const failed = await r.prepare();
+  assert.equal(failed.prepared, false);
+  assert.equal(failed.permanent, false);
+  b.emit(event("after failed prepare"));
+  await b.flush();
+  assert.equal(sent.length, 1, "ordinary flush stays blocked while held");
   assert.equal(r.release(proof()), false);
   fail = false;
   assert.equal((await r.prepare()).prepared, true);
@@ -94,7 +99,8 @@ it("lost ACK retry retains identical old seq/body; failed preparation cannot rel
   assert.equal(b.currentSeq(), 1);
   assert.equal(r.release(proof(2)), true);
   await b.close();
-  assert.deepEqual(sent[2]?.map((m) => m.seq), [3]);
+  assert.deepEqual(sent[2]?.map((m) => [m.seq, m.payload]),
+    [[3, { text: "later" }], [4, { text: "after failed prepare" }]]);
 });
 
 it("cancel and close abort and await preparation without numbering held events", async () => {
@@ -1058,4 +1064,117 @@ it("an already-owned bisection probe retries that exact prefix before the remain
     [[3, { text: "original-2" }], [4, { text: "original-3" }]]);
   r.cancel();
   await b.close();
+});
+
+it("settled parked proof releases transport without a checker verdict", async () => {
+  const { b, sent } = fixture();
+  const r = b.reserveCandidateTransport();
+  b.emit(event("held"));
+  assert.equal((await r.prepare()).prepared, true);
+  const parked = { result: "parked", verdict: "", reason_class: "", lead_last_seq: 4,
+    reconciliation: proof().reconciliation! } as Extract<PlanCrossCheckResponse, { result: "parked" }>;
+  assert.equal(r.release({ ...parked, verdict: "pending" }), false);
+  assert.equal(r.release(parked), true);
+  await b.close();
+  assert.deepEqual(sent.flat().map((m) => [m.seq, m.payload]), [[5, { text: "held" }]]);
+});
+
+it("no-row release is allowed only before any submit attempt", async () => {
+  for (const submitted of [false, true]) {
+    const { b, sent } = fixture();
+    const r = b.reserveCandidateTransport();
+    b.emit(event("held"));
+    assert.equal((await r.prepare()).prepared, true);
+    if (submitted) r.markSubmitted();
+    const noRow: PlanCrossCheckResponse = { result: "no_row", reason_class: "no_candidate",
+      lead_last_seq: 4, reconciliation: proof().reconciliation! };
+    assert.equal(r.release(noRow), !submitted);
+    if (submitted) {
+      assert.equal((await r.prepare()).prepared, true);
+      assert.equal(r.release(noRow), false, "preparing again never clears submitted identity");
+      r.cancel();
+    }
+    await b.close();
+    assert.equal(sent.length, submitted ? 0 : 1);
+  }
+});
+
+it("forced applied gate ACK requires current settled proof and completed receipts", async () => {
+  const { b, sent } = fixture();
+  b.emit(event("assigned"));
+  const r = b.reserveCandidateTransport();
+  b.emit(event("held"));
+  const ack = { applied: true, status: "awaiting_approval" as const,
+    reconciliation: { ...proof().reconciliation!, gateRevision: 2 } };
+  assert.equal(r.releaseAppliedGate(ack), false);
+  assert.equal((await r.prepare()).prepared, true);
+  for (const bad of [
+    { ...ack, applied: false }, { ...ack, status: "running" as const },
+    { ...ack, staleClaim: true }, { ...ack, reconciliation: undefined },
+    { ...ack, reconciliation: { ...ack.reconciliation, claimGeneration: 2 } },
+    { ...ack, reconciliation: { ...ack.reconciliation, planCrossCheckSettled: false } },
+    { ...ack, reconciliation: { ...ack.reconciliation, leadLastSeq: 0 } },
+  ]) assert.equal(r.releaseAppliedGate(bad), false);
+  assert.equal(r.releaseAppliedGate(ack), true);
+  assert.equal(r.releaseAppliedGate(ack), false);
+  await b.close();
+  assert.deepEqual(sent.flat().map((m) => m.seq), [1, 5]);
+});
+
+it("irreversible usage loss is detected at preparation without retrying its missing receipt", async () => {
+  let refused = true;
+  let usagePosts = 0;
+  let messagePosts = 0;
+  const b = new MessageBatcher({
+    async postUsage() {
+      usagePosts++;
+      if (refused) throw new RequestError("POST", "/usage", 400, "refused");
+    },
+    async postMessages() { messagePosts++; },
+  } as unknown as WorkerClient, runId, 0, 60_000, nullLogger(), undefined, undefined, { generation: 3 });
+  const leg = b.usage.startLeg();
+  leg.observeAssistant({ type: "assistant", message: {
+    id: "irreversible", model: "claude-sonnet-5-5", usage: { input_tokens: 1 }, content: [],
+  } });
+  leg.close();
+  await b.usage.drain();
+  const refusedPosts = usagePosts;
+  assert.ok(refusedPosts > 0);
+  refused = false;
+  b.emit(event("assigned"));
+  const r = b.reserveCandidateTransport();
+  b.emit(event("held"));
+  const result = await r.prepare();
+  assert.equal(result.prepared, false);
+  assert.equal(result.permanent, true, "a lost receipt cannot be recovered by another preparation");
+  assert.equal(result.reason, "usage_unconfirmed");
+  assert.equal((await r.prepare()).permanent, true);
+  assert.equal(usagePosts, refusedPosts);
+  assert.equal(messagePosts, 0);
+  assert.equal(r.release(proof()), false);
+  assert.equal(b.currentSeq(), 1);
+  assert.equal(b.bufferedCount(), 1);
+  await b.close();
+});
+
+it("overflow and cancellation are permanent and cannot resurrect through rearm or preparation", async () => {
+  for (const stop of ["overflow", "cancel", "close"] as const) {
+    const { b, sent } = fixture(undefined, undefined, 180);
+    b.emit(event("assigned"));
+    const r = b.reserveCandidateTransport();
+    b.emit(event("held"));
+    if (stop === "overflow") assert.throws(() => b.emit(event("x".repeat(200))));
+    if (stop === "cancel") r.cancel();
+    if (stop === "close") await b.close();
+    const outcome = await r.prepare();
+    assert.equal(outcome.prepared, false);
+    assert.equal(outcome.permanent, true);
+    b.rearm();
+    await b.flush();
+    assert.equal(r.release(proof()), false);
+    assert.equal(sent.length, 0);
+    assert.equal(b.currentSeq(), 1);
+    assert.equal(b.bufferedCount(), 1);
+    await b.close();
+  }
 });
