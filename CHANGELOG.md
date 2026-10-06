@@ -27,6 +27,9 @@ through `[0.52.0]`.)
 - **Ephemeral Docker preference on the Workers page ([#2278](https://github.com/vtmocanu/uzi/issues/2278)).**
   Persistent and ephemeral workers have separate sections. Instances offering the Docker tier show a saved Docker-capable checkbox beside auto-provision, usable even while auto-provision is off; writes share a pending lock and show local errors without changing confirmed preferences. Help text covers saturation, warm leases and the ephemeral cap, and qualifies Docker by the admin's repository allowlist. For eligible repositories, plain warm workers step aside so Docker-capable capacity can be provisioned immediately when no worker can claim the run; busy persistent workers retain the saturation debounce.
 
+- **Built-in agents synced to skills v0.46.0** ([#2298](https://github.com/vtmocanu/uzi/pull/2298)).
+  The auditor (v15), fact-checker (v12), reviewer (v20) and tester (v18) reuse a dispatch-assigned export slot for their throwaway commit copy instead of a fresh random directory, so path-keyed build caches stay warm across reviews.
+
 - **New hosted workers default to the large preset ([#2240](https://github.com/vtmocanu/uzi/issues/2240)).**
   Ephemeral provisioning defaults and falls back to L, and the persistent provision form preselects L. Existing workers keep their sizes; new workers reserve more CPU and memory capacity.
 
