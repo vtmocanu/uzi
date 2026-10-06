@@ -70,6 +70,7 @@ func TestM2IssueCreateClaimPersistedDowngradeLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	claimed = reclaimed
 	if reclaimed.ID != run.ID || reclaimed.IssueTitle != run.IssueTitle || reclaimed.IssueSavedBody != run.IssueSavedBody || reclaimed.IssueRawDigest != run.IssueRawDigest || strings.Join(reclaimed.AutoApproveBlockedReasons, ",") != "author_not_eligible,permission_unknown" || reclaimed.AutoApprove {
 		t.Fatalf("reclaim changed saved input: %+v", reclaimed)
 	}
@@ -96,6 +97,10 @@ func TestM2IssueCreateClaimPersistedDowngradeLiveDB(t *testing.T) {
 	// Persist a legacy thread, then publish a real gate before the owner's approval.
 	legacyThread := claimed.IssueComments
 	env.exec("UPDATE runs SET issue_comments=$2, status='running' WHERE id=$1", run.ID, legacyThread)
+	baseline, err := svc.GetRun(env.ctx, user, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	env.exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", worker, []string{capability.InputReceiptsV1, capability.GateRevisionV1})
 	wkr := wkrRow(t, env, worker)
 	req := gateReq(&reclaimed.ClaimGeneration, uid())
@@ -131,13 +136,14 @@ func TestM2IssueCreateClaimPersistedDowngradeLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if afterApproval.IssueTitle != run.IssueTitle || afterApproval.IssueSavedBody != run.IssueSavedBody || afterApproval.IssueRawDigest != run.IssueRawDigest || !slices.Equal(afterApproval.AutoApproveBlockedReasons, run.AutoApproveBlockedReasons) || afterApproval.AutoApprove || !bytes.Equal(afterApproval.IssueComments, legacyThread) {
+	if afterApproval.IssueTitle != baseline.IssueTitle || afterApproval.IssueSavedBody != baseline.IssueSavedBody || afterApproval.IssueRawDigest != baseline.IssueRawDigest || !slices.Equal(afterApproval.AutoApproveBlockedReasons, baseline.AutoApproveBlockedReasons) || afterApproval.AutoApprove != baseline.AutoApprove || !bytes.Equal(afterApproval.IssueComments, baseline.IssueComments) {
 		t.Fatalf("approval changed saved input: %+v", afterApproval)
 	}
 	approvedPayload, err := svc.assembleClaim(env.ctx, wkr, afterApproval)
 	if err != nil || approvedPayload.IssueComments == nil || len(approvedPayload.IssueComments.Comments) != 1 || approvedPayload.IssueComments.Comments[0].Body != issueinput.Placeholder || approvedPayload.IssueComments.Comments[0].Reason != issueinput.Unknown {
 		t.Fatalf("approval legacy projection=%+v err=%v", approvedPayload, err)
 	}
+	claimed = afterApproval
 	claimed.IssueComments = []byte("malformed")
 	malformed, err := svc.assembleClaim(env.ctx, wkrRow(t, env, worker), claimed)
 	if err != nil || malformed.IssueComments != nil {
