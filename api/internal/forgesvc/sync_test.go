@@ -306,9 +306,10 @@ func (f *fakeForge) LatestMRPipeline(_ context.Context, _, mrIID int64) (forge.P
 // MR-close watcher fields (candidates/issue/columns/mrStateWrites) are exercised
 // by mr_watch_test.go; the sync tests leave them zero.
 type fakeStore struct {
-	upserts      []store.UpsertIssueParams
-	labelUpserts []store.UpsertIssueLabelsParams // AutoMove / SetIssueLabel writes (PRD #767)
-	deleteCalls  []store.DeleteIssuesNotInParams
+	labelRemovals []store.RemoveCachedIssueLabelParams
+	upserts       []store.UpsertIssueParams
+	labelUpserts  []store.UpsertIssueLabelsParams // AutoMove / SetIssueLabel writes (PRD #767)
+	deleteCalls   []store.DeleteIssuesNotInParams
 
 	// Close/reopen state flips (PRD #1034 M2). stateUpdates records UpdateIssueState
 	// (bare close) calls, reopens records ReopenIssueState calls — each by identity so a
@@ -382,6 +383,11 @@ func (s *fakeStore) UpsertIssue(_ context.Context, arg store.UpsertIssueParams) 
 	// Echo the labels back so the full-sync re-cache returns the synced row.
 	return store.Issue{RepoID: arg.RepoID, ForgeIssueIid: arg.ForgeIssueIid, State: arg.State, Labels: arg.Labels}, nil
 }
+func (s *fakeStore) RemoveCachedIssueLabel(_ context.Context, arg store.RemoveCachedIssueLabelParams) (store.Issue, error) {
+	s.labelRemovals = append(s.labelRemovals, arg)
+	return s.issue, s.issueErr
+}
+
 func (s *fakeStore) UpsertIssueLabels(_ context.Context, arg store.UpsertIssueLabelsParams) (store.Issue, error) {
 	s.labelUpserts = append(s.labelUpserts, arg)
 	// Echo the labels back so AutoMove / SetIssueLabel's re-cache returns the moved row.

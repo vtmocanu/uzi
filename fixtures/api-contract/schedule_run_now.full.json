@@ -1,0 +1,35 @@
+{
+  "capacity": {
+    "in_flight": 1,
+    "limit": 1,
+    "room_needed": 1,
+    "room": 1,
+    "blocked": true
+  },
+  "created": 1,
+  "run_ids": [
+    "x"
+  ],
+  "matched": 1,
+  "capped": true,
+  "ineligible_matched": 1,
+  "started": [
+    {
+      "label_removed": true,
+      "label_remove_failed": true,
+      "selector_label": "x",
+      "issue_iid": 1,
+      "run_id": "x",
+      "title": "x",
+      "web_url": "x"
+    }
+  ],
+  "skips": [
+    {
+      "issue_iid": 1,
+      "title": "x",
+      "reason": "x",
+      "web_url": "x"
+    }
+  ]
+}

@@ -105,6 +105,7 @@ func HasPRDLink(description string) bool {
 // be unit-tested against a fake store (and a mocked Forge) without a live
 // database. *store.Queries satisfies it.
 type IssueStore interface {
+	RemoveCachedIssueLabel(context.Context, store.RemoveCachedIssueLabelParams) (store.Issue, error)
 	UpsertIssue(ctx context.Context, arg store.UpsertIssueParams) (store.Issue, error)
 	// UpsertIssueLabels is the label-only cache-write variant used by AutoMove and
 	// SetIssueLabel: it omits assignee_ids so a racing label mutation cannot clobber
@@ -578,10 +579,10 @@ func (s *Service) AutoMove(ctx context.Context, f forge.Forge, forgeProjectID in
 //
 // color is the label color to pin when apply auto-creates the label, and is
 // ignored on remove. It is a PARAMETER so the one caller (Promote) supplies the
-// color for the label it applies. Only on forge success does it upsert the incrementally-updated
-// label set — the one label added to / removed from the current cached set, never
-// a wholesale recompute from stale data — carrying HasPrdLink through verbatim
-// (this path never re-derives it). Returns the re-cached row; on a forge error the
+// color for the label it applies. Only on forge success does it update the cache. Apply keeps the existing
+// snapshot upsert; removal filters the CURRENT existing row with RemoveCachedIssueLabel,
+// leaving every other label and non-label column untouched. A missing cache row
+// is an error; removal never inserts one. Returns the re-cached row; on a forge error the
 // cache is untouched, so a failed toggle never desyncs the cache from the forge.
 func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProjectID int64, issue store.Issue, label, color string, apply bool) (store.Issue, error) {
 	var current []string
@@ -610,20 +611,14 @@ func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProject
 		return store.Issue{}, err
 	}
 
+	if !apply {
+		return s.q.RemoveCachedIssueLabel(ctx, store.RemoveCachedIssueLabelParams{RepoID: issue.RepoID, ForgeIssueIid: issue.ForgeIssueIid, Label: label})
+	}
+
 	// Incremental cache update on success only: add/remove the one label on the
 	// current set (order preserved, every other label kept), never an overwrite
 	// computed from a possibly-stale snapshot.
-	next := make([]string, 0, len(current)+1)
-	if apply {
-		next = append(next, current...)
-		next = append(next, label)
-	} else {
-		for _, l := range current {
-			if l != label {
-				next = append(next, l)
-			}
-		}
-	}
+	next := append(append([]string{}, current...), label)
 	labelsJSON, err := json.Marshal(next)
 	if err != nil {
 		return store.Issue{}, err

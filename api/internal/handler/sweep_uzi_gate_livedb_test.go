@@ -58,6 +58,10 @@ func (sweepGateForge) GetIssue(_ context.Context, _ int64, iid int64) (forge.Iss
 
 type sweepGateBuilder struct{ f forge.Forge }
 
+func (sweepGateBuilder) SetIssueLabel(context.Context, forge.Forge, int64, store.Issue, string, string, bool) (store.Issue, error) {
+	panic("unexpected label removal")
+}
+
 func (b sweepGateBuilder) ForgeForConnection(string, string, []byte) (forge.Forge, error) {
 	return b.f, nil
 }

@@ -247,6 +247,18 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 		httpx.Error(w, status, msg)
 		return store.RunSchedule{}, false
 	}
+	remove := cur.RemoveLabelOnDispatch
+	if req.RemoveLabelOnDispatch != nil {
+		remove = *req.RemoveLabelOnDispatch
+	}
+	removalReq := apitypes.ScheduleRequest{Target: cur.Target, Timing: cur.Timing, RemoveLabelOnDispatch: &remove}
+	if job, ok := schedtmpl.BySlug(cur.CatalogSlug.String); ok {
+		removalReq.Labels = job.Labels
+	}
+	if status, msg := h.validateScheduleRemoval(r.Context(), removalReq, selector); status != 0 {
+		httpx.Error(w, status, msg)
+		return store.RunSchedule{}, false
+	}
 	capacityLimit, capacityRoomNeeded := capacityColumn(capacityReq.CapacityLimit), capacityColumn(capacityReq.CapacityRoomNeeded)
 	cron := cur.CronExpr.String
 	if req.CronExpr != "" {
@@ -408,7 +420,7 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 	// OR-ed with a stale true — Reset and an exact-restore patch both un-customize).
 	customized := false
 	if job, ok := schedtmpl.BySlug(cur.CatalogSlug.String); ok {
-		customized = defaultEditableDiverges(job, cron, tz, model, autoApprove, waitOnLimit, mrRework, maxIssues, outputMode, capacityLimit, capacityRoomNeeded)
+		customized = defaultEditableDiverges(job, cron, tz, model, autoApprove, waitOnLimit, mrRework, maxIssues, outputMode, remove, capacityLimit, capacityRoomNeeded)
 	} else {
 		// Catalog entry gone: cannot compare, so preserve the stored flag rather than guess.
 		customized = cur.Customized
@@ -451,6 +463,7 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 		WaitOnLimit:                waitOnLimit,
 		MrReworkEnabled:            mrRework,
 		MaxIssues:                  maxIssues,
+		RemoveLabelOnDispatch:      remove,
 		CapacityLimit:              capacityLimit,
 		CapacityRoomNeeded:         capacityRoomNeeded,
 		Guidance:                   guidance,
@@ -549,7 +562,11 @@ func catalogEntryOutputMode(j schedtmpl.DefaultJob) string {
 // prompt/labels/guidance are excluded (they are never stored on the row). A blank catalog
 // model and a NULL row model both mean "inherit", so they compare equal; a 0 catalog
 // max_issues and a NULL row max_issues both mean "unlimited".
-func defaultEditableDiverges(job schedtmpl.DefaultJob, cron, tz string, model pgtype.Text, autoApprove, waitOnLimit bool, mrRework pgtype.Bool, maxIssues pgtype.Int4, outputMode pgtype.Text, capacity ...pgtype.Int4) bool {
+func defaultEditableDiverges(job schedtmpl.DefaultJob, cron, tz string, model pgtype.Text, autoApprove, waitOnLimit bool, mrRework pgtype.Bool, maxIssues pgtype.Int4, outputMode pgtype.Text, removeLabelOnDispatch bool, capacity ...pgtype.Int4) bool {
+	// M1 catalog baseline is false until removal defaults land in M2.
+	if removeLabelOnDispatch {
+		return true
+	}
 	for _, c := range capacity {
 		if c.Valid {
 			return true

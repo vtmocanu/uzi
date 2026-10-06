@@ -116,9 +116,8 @@ func TestSetIssueLabelRemovePreservesOtherLabels(t *testing.T) {
 	}
 	// Cache: only the one label dropped, everything else kept in order; has_prd_link
 	// preserved (true).
-	assertLabels(t, st.labelUpserts[0].Labels, []string{"PRD", "In Progress"})
-	if !st.labelUpserts[0].HasPrdLink {
-		t.Fatal("has_prd_link must be preserved verbatim (true)")
+	if len(st.labelUpserts) != 0 || len(st.labelRemovals) != 1 || st.labelRemovals[0].RepoID != issue.RepoID || st.labelRemovals[0].ForgeIssueIid != 4 || st.labelRemovals[0].Label != "uzi" {
+		t.Fatalf("cache removal=%+v upserts=%+v", st.labelRemovals, st.labelUpserts)
 	}
 }
 
