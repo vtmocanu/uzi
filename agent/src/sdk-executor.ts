@@ -1336,7 +1336,7 @@ export class SdkExecutor implements Executor {
       this.secretPaths,
       this.dockerWired,
     );
-    const pathHook = buildPathGuardHook(ctx.worktreePath, this.log);
+    const pathHook = buildPathGuardHook(ctx.worktreePath, this.log, this.secretPaths, { sdkHomeDir: this.homeDir });
     const preToolUse = (
       allowedSubagents: string[],
     ): NonNullable<SdkOptions["hooks"]>["PreToolUse"] => [

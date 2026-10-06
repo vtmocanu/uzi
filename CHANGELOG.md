@@ -37,11 +37,17 @@ through `[0.52.0]`.)
 - **Runner-owned clone cleanup and executor advice fallback use pinned removal ([#2324](https://github.com/vtmocanu/uzi/issues/2324)).**
   The clone remover and executor fallback pin directory identities and require their expected owner without opening private directories to other identities. Advice-data fallback removal requires positively confirmed clean disposal; unclean or unconfirmed disposal retains data and warns. Advice cwd cleanup still runs.
 
+- **Codex subagents prefer AGENTS.md repository instructions ([#2264](https://github.com/vtmocanu/uzi/issues/2264)).**
+  Child prompts guide AGENTS.md reads first and bounded Git-index metadata fallback for inaccessible instruction symlinks when Bash is already granted, while preserving file-tool denial and permission limits.
+
 - **Codex provider safety-policy refusals have a distinct failure origin ([#2321](https://github.com/vtmocanu/uzi/issues/2321)).**
   Runs refused for `cyberPolicy` or `misalignmentPolicyViolation` now report `provider_policy_refusal` with a fixed, content-free reason. Run logs retain bounded root/child provenance with role, phase and opaque correlation IDs; the lead may continue after a child refusal. Refusals remain terminal execution failures, included in failure totals and eligible for retrospective judging.
 
 - **Additional worker-owned cleanup resists directory swaps ([#2324](https://github.com/vtmocanu/uzi/issues/2324)).**
   Leftover job replacement, terminal skills-plugin cleanup, Codex advice working directories and session staging use descriptor-pinned removal. Refused leftovers are never reused for a job or adopted as session state; disposable cleanup warns and retains refused trees.
+
+- **A Claude run can Read its own oversized tool output ([#2332](https://github.com/vtmocanu/uzi/issues/2332)).**
+  When the SDK spills a large tool result to a file under the run's HOME and tells the agent where, the agent's `Read` of that one file is no longer denied as outside the worktree. Only the run's own current session spill directory qualifies, and only direct-child regular files (no symlinks or nested paths); Write, Edit, Glob, Grep, Bash screening, the secret and `.git` denies, and the chat, isolated, job-runner and Codex lanes are unchanged.
 
 ## [0.86.0] - 2026-10-06
 
