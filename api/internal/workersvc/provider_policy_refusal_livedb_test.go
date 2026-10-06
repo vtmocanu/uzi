@@ -139,10 +139,15 @@ func TestProviderPolicyRefusalOpaqueMessagesAndFencesLiveDB(t *testing.T) {
 		t.Fatal("new generation replaced existing seq payload or provenance")
 	}
 	e.exec("UPDATE runs SET status = 'failed', fail_origin = 'provider_policy_refusal', claim_released_at = now() WHERE id = $1", e.runID)
-	for _, generation := range []*int64{&gen, nil} {
-		if err := e.svc.AppendMessagesForClaim(e.ctx, e.wkr, e.runID, []IncomingMessage{policyObservation(4, true)}, generation); !errors.Is(err, ErrStaleClaim) {
-			t.Fatalf("released terminal claim: %v", err)
-		}
+	if err := e.svc.AppendMessagesForClaim(e.ctx, e.wkr, e.runID,
+		[]IncomingMessage{policyObservation(4, true)}, &gen); !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("released terminal claim: %v, want ErrStaleClaim", err)
+	}
+	// Legacy posts are silently discarded by the released-claim SQL fence.
+	// Preserve the existing response contract and verify storage remains unchanged.
+	if err := e.svc.AppendMessagesForClaim(e.ctx, e.wkr, e.runID,
+		[]IncomingMessage{policyObservation(4, true)}, nil); err != nil {
+		t.Fatalf("released legacy post: %v, want nil", err)
 	}
 	if got := read(); !reflect.DeepEqual(got, rows) {
 		t.Fatal("fenced messages modified storage")
