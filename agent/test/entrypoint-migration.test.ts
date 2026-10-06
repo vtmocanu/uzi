@@ -26,6 +26,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { ensureCodexSharedDirectory } from "../src/codex/codex-executor.js";
@@ -65,13 +66,67 @@ interface Harness {
   script: string;
 }
 
+function selectFixtureScratch(templateEntrypoint: string, runtimeTmp = os.tmpdir()): string {
+  const templates = path.dirname(templateEntrypoint);
+  const agent = path.dirname(templates);
+  if (path.basename(templates) === "templates" && path.basename(agent) === "agent") {
+    return path.join(path.dirname(agent), ".uzi", "scratch");
+  }
+  return path.join(runtimeTmp, ".uzi", "scratch");
+}
+
+function allocateFixture(templateEntrypoint = entrypointPath, runtimeTmp = os.tmpdir()): string {
+  const scratch = selectFixtureScratch(templateEntrypoint, runtimeTmp);
+  fs.mkdirSync(scratch, { recursive: true });
+  return fs.mkdtempSync(path.join(scratch, "uzi-entrypoint-m2-"));
+}
+
+describe("entrypoint fixture scratch selection", () => {
+  it("uses repository scratch for agent/templates", () => {
+    assert.equal(selectFixtureScratch("/repo/agent/templates/entrypoint.sh", "/runtime-tmp"), "/repo/.uzi/scratch");
+  });
+
+  it("uses runtime scratch for flattened image templates", () => {
+    assert.equal(selectFixtureScratch("/app/templates/entrypoint.sh", "/runtime-tmp"), "/runtime-tmp/.uzi/scratch");
+  });
+
+  it("allocates writable image fixtures and cleans only owned roots", () => {
+    const repositoryScratch = selectFixtureScratch(entrypointPath);
+    fs.mkdirSync(repositoryScratch, { recursive: true });
+    const repositoryParent = fs.statSync(repositoryScratch);
+    const runtimeTmp = fs.mkdtempSync(path.join(repositoryScratch, "uzi-image-runtime-"));
+    const roots: string[] = [];
+    try {
+      const scratch = path.join(runtimeTmp, ".uzi", "scratch");
+      roots.push(allocateFixture("/app/templates/entrypoint.sh", runtimeTmp));
+      roots.push(allocateFixture("/app/templates/entrypoint.sh", runtimeTmp));
+      assert.notEqual(roots[0], roots[1], "unique fixture roots");
+      for (const root of roots) {
+        assert.equal(path.dirname(root), scratch);
+        fs.writeFileSync(path.join(root, "state"), "fixture-state");
+        assert.equal(fs.readFileSync(path.join(root, "state"), "utf8"), "fixture-state");
+      }
+      const parent = fs.statSync(scratch);
+      fs.rmSync(roots[0], { recursive: true });
+      assert.equal(fs.existsSync(roots[0]), false);
+      assert.equal(fs.readFileSync(path.join(roots[1], "state"), "utf8"), "fixture-state");
+      fs.rmSync(roots[1], { recursive: true });
+      assert.deepEqual(fs.readdirSync(scratch), []);
+      assert.equal(fs.statSync(scratch).ino, parent.ino, "shared scratch parent retained");
+      assert.equal(fs.statSync(scratch).mode, parent.mode, "shared scratch parent mode retained");
+    } finally {
+      fs.rmSync(runtimeTmp, { recursive: true, force: true });
+    }
+    assert.equal(fs.statSync(repositoryScratch).ino, repositoryParent.ino, "repository scratch parent retained");
+    assert.equal(fs.statSync(repositoryScratch).mode, repositoryParent.mode, "repository scratch parent mode retained");
+  });
+});
+
 // tokenViaEnv (issue #1761): leave the entrypoint's TOKEN line as shipped, so the token
 // path can only reach the script through UZI_WORKER_TOKEN_FILE (run() passes it). Proves
 // the posture checks follow the env rather than a /run/secrets literal.
 function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?: boolean; realChmod?: string[] } = {}): Harness {
-  const scratch = path.resolve(path.dirname(entrypointPath), "../../.uzi/scratch");
-  fs.mkdirSync(scratch, { recursive: true });
-  const root = fs.mkdtempSync(path.join(scratch, "uzi-entrypoint-m2-"));
+  const root = allocateFixture();
   const data = path.join(root, "data");
   const nix = path.join(root, "nix");
   const token = path.join(root, "token");
