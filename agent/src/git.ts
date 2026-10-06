@@ -5122,7 +5122,6 @@ export class GitCache {
         total += size;
         if (!Number.isSafeInteger(size) || size > 4 * 1024 * 1024 ||
             total > 128 * 1024 * 1024 || manifest.length >= 20000) return null;
-        if (match[4]!.includes("\uFFFD")) return null; // Refuse lossy UTF-8 path decoding.
         manifest.push([match[4]!, match[1]!, match[2]!, size]);
       }
       // config/index/ref reads cannot invoke a clean/process filter. Reading all effective

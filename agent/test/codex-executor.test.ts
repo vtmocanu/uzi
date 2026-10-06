@@ -1188,7 +1188,7 @@ describe("m1 credential-free owner cancel", () => {
     assert.equal(failed.reserveLaunch("command").kind, "reserved");
     assert.equal((await failed.settleForCapture(10)).kind, "incomplete");
     Object.assign(executor, { unverifiedEpochRegistries: new Set([current, failed]) });
-    executor.safety = createCodexExecutionSafety(current);
+    executor.safety = createCodexExecutionSafety(current, async () => { throw new Error("no roots"); });
     try {
       const result = await executor.settleForCredentialFreeCapture(100, "cancel");
       assert.equal(result.kind, "incomplete", "the older pending launch blocks cancellation");
@@ -1228,7 +1228,7 @@ describe("m1 credential-free owner cancel", () => {
   });
 
   const cases = [
-    ...["clean", "dirty", "untracked", "committed", "replace", "forged-stat", "hidden", "assume", "skip", "filter"].map(work => ({ work })),
+    ...["clean", "dirty", "untracked", "committed", "replace", "forged-stat", "lossy-path", "hidden", "assume", "skip", "filter"].map(work => ({ work })),
     ...["wrong", "missing", "retained", "error"].map(release => ({ work: "clean", release })),
     ...["survivors", "unverified", "new-writer"].map(process => ({ work: "clean", process })),
     { work: "clean", docker: "docker_error" },
@@ -1253,6 +1253,17 @@ describe("m1 credential-free owner cancel", () => {
       const api = new FakeApi("cancel-worker");
       const url = await api.listen();
       const fx = makeFixture();
+      const rawName = Buffer.concat([Buffer.from("lossy-"), Buffer.from([0xff]), Buffer.from(".txt")]);
+      const twinName = "lossy-\uFFFD.txt";
+      const rawPath = (root: string) => Buffer.concat([Buffer.from(root + path.sep), rawName]);
+      if (work === "lossy-path") {
+        await fs.writeFile(rawPath(fx.originPath), "same initial bytes\n");
+        await fs.writeFile(path.join(fx.originPath, twinName), "same initial bytes\n");
+        for (const args of [["add", "."], ["commit", "-m", "seed distinct raw paths"]]) {
+          const result = spawnSync("git", ["-C", fx.originPath, ...args], { env: gitEnv(), encoding: "utf8" });
+          assert.equal(result.status, 0, result.stderr);
+        }
+      }
       const recoveryClient = new FakeRecoveryClient();
       const recoveryGit = new FakeRecoveryGit();
       const recovery = makeRecoveryCoordinator(recoveryClient, recoveryGit);
@@ -1390,10 +1401,21 @@ describe("m1 credential-free owner cancel", () => {
           gitInClone("update-index", work === "assume" ? "--assume-unchanged" : "--skip-worktree", "README.md");
           await fs.appendFile(path.join(clone, "README.md"), "hidden change");
         }
-        if (work === "forged-stat") {
+        if (work === "forged-stat" || work === "lossy-path") {
           gitInClone("config", "index.version", "2");
           gitInClone("update-index", "--index-version", "2");
-          const file = path.join(clone, "README.md");
+          const file = work === "lossy-path" ? rawPath(clone) : path.join(clone, "README.md");
+          if (work === "lossy-path") {
+            const names = await fs.readdir(clone, { encoding: "buffer" });
+            assert.ok(names.some(name => name.equals(rawName)), "raw invalid UTF-8 filename exists");
+            assert.ok(names.some(name => name.equals(Buffer.from(twinName))), "distinct valid replacement-character twin exists");
+            assert.deepEqual(await fs.readFile(file), await fs.readFile(path.join(clone, twinName)));
+            const tree = spawnSync("git", ["-C", bare, "ls-tree", "-r", "--name-only", "-z", startHead],
+              { env: gitEnv() });
+            assert.equal(tree.status, 0, tree.stderr.toString());
+            assert.ok(tree.stdout.includes(Buffer.concat([rawName, Buffer.from([0])])), "trusted bare contains raw filename");
+            assert.ok(tree.stdout.includes(Buffer.concat([Buffer.from(twinName), Buffer.from([0])])), "trusted bare contains valid twin");
+          }
           const original = await fs.readFile(file);
           await fs.writeFile(file, Buffer.alloc(original.length, 120));
           const past = new Date(Date.now() - 86400000);
@@ -1401,11 +1423,23 @@ describe("m1 credential-free owner cancel", () => {
           const stat = await fs.stat(file, { bigint: true });
           const indexPath = path.join(clone, ".git", "index");
           const index = await fs.readFile(indexPath);
-          assert.equal(index.readUInt32BE(8), 1, "fixture has one tracked entry");
+          const entries = index.readUInt32BE(8);
+          assert.equal(entries, work === "lossy-path" ? 3 : 1, "fixture tracked entry count");
+          const target = work === "lossy-path" ? rawName : Buffer.from("README.md");
+          let offset = 12;
+          let targetOffset: number | undefined;
+          for (let entry = 0; entry < entries; entry++) {
+            const end = index.indexOf(0, offset + 62);
+            assert.ok(end >= offset + 62, "index v2 entry has a terminated raw name");
+            if (index.subarray(offset + 62, end).equals(target)) targetOffset = offset;
+            offset += Math.ceil((end + 1 - offset) / 8) * 8;
+          }
+          assert.notEqual(targetOffset, undefined, "changed raw path found in index");
           const values = [stat.ctimeNs / 1000000000n, stat.ctimeNs % 1000000000n,
             stat.mtimeNs / 1000000000n, stat.mtimeNs % 1000000000n,
-            stat.dev, stat.ino, stat.mode, stat.uid, stat.gid, stat.size];
-          values.forEach((value, i) => index.writeUInt32BE(Number(value & 0xffffffffn), 12 + i * 4));
+            // Git stores a normalized tracked mode, not all filesystem permission bits.
+            stat.dev, stat.ino, BigInt(index.readUInt32BE(targetOffset! + 24)), stat.uid, stat.gid, stat.size];
+          values.forEach((value, i) => index.writeUInt32BE(Number(value & 0xffffffffn), targetOffset! + i * 4));
           createHash("sha1").update(index.subarray(0, -20)).digest().copy(index, index.length - 20);
           await fs.writeFile(indexPath, index);
           const status = spawnSync("git", ["-C", clone, "--no-replace-objects", "status", "--porcelain"],
@@ -1413,6 +1447,7 @@ describe("m1 credential-free owner cancel", () => {
           assert.equal(status.status, 0, status.stderr);
           assert.equal(status.stdout, "", "forged stat cache hides changed tracked bytes");
           assert.notDeepEqual(await fs.readFile(file), original);
+          if (work === "lossy-path") assert.deepEqual(await fs.readFile(path.join(clone, twinName)), original, "only raw invalid path changed");
         }
         if (work === "filter") {
           gitInClone("config", "filter.delayed.clean", "touch FILTER-RAN");
@@ -1420,13 +1455,15 @@ describe("m1 credential-free owner cancel", () => {
         }
         const beforeCancel = new Map<string, Buffer>();
         for (const name of ["README.md", "NEW.txt", "RECOVERED.txt", ".gitattributes",
-          ...(work === "forged-stat" ? [".git/index", ".git/config"] : [])]) {
+          ...(["forged-stat", "lossy-path"].includes(work) ? [".git/index", ".git/config"] : []),
+          ...(work === "lossy-path" ? [twinName] : [])]) {
           const bytes = await fs.readFile(path.join(clone, name)).catch(error => {
             if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
             throw error;
           });
           if (bytes !== undefined) beforeCancel.set(name, bytes);
         }
+        const rawBeforeCancel = work === "lossy-path" ? await fs.readFile(rawPath(clone)) : undefined;
         api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
         await withTimeout(execution, 10000, "runner owner cancel");
         assert.equal(lifecycle?.aborted, true, "real steering forwards genuine lifecycle abort");
@@ -1450,6 +1487,10 @@ describe("m1 credential-free owner cancel", () => {
         else {
           assert.equal((await fs.stat(clone)).isDirectory(), true, "source retained");
           for (const [name, bytes] of beforeCancel) assert.deepEqual(await fs.readFile(path.join(clone, name)), bytes, `${name} bytes retained exactly`);
+          if (rawBeforeCancel !== undefined) {
+            assert.ok((await fs.readdir(clone, { encoding: "buffer" })).some(name => name.equals(rawName)), "raw filename retained exactly");
+            assert.deepEqual(await fs.readFile(rawPath(clone)), rawBeforeCancel, "raw invalid-path bytes retained exactly");
+          }
         }
         assert.equal(await fs.access(path.join(clone, "FILTER-RAN")).then(() => true, () => false), false);
       } finally {
