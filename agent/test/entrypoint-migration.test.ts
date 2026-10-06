@@ -95,11 +95,12 @@ describe("entrypoint fixture scratch selection", () => {
     fs.mkdirSync(repositoryScratch, { recursive: true });
     const repositoryParent = fs.statSync(repositoryScratch);
     const runtimeTmp = fs.mkdtempSync(path.join(repositoryScratch, "uzi-image-runtime-"));
-    const roots: string[] = [];
     try {
       const scratch = path.join(runtimeTmp, ".uzi", "scratch");
-      roots.push(allocateFixture("/app/templates/entrypoint.sh", runtimeTmp));
-      roots.push(allocateFixture("/app/templates/entrypoint.sh", runtimeTmp));
+      const roots = [
+        allocateFixture("/app/templates/entrypoint.sh", runtimeTmp),
+        allocateFixture("/app/templates/entrypoint.sh", runtimeTmp),
+      ] as const;
       assert.notEqual(roots[0], roots[1], "unique fixture roots");
       for (const root of roots) {
         assert.equal(path.dirname(root), scratch);
