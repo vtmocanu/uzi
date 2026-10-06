@@ -590,6 +590,26 @@ export interface HeartbeatRequest {
    * strict-decode rollback retry.
    */
   active_snapshot?: ActiveSnapshot;
+  /**
+   * issue #2213: the worker's residue quarantine latch (an unreadable, unattributed runner-uid
+   * process was found; the worker claims nothing and starts no credentialed git or new provider
+   * turn until its container restarts). Sent ONLY while latched and ONLY when the server advertised
+   * `worker_residue_quarantine` in `RegisterResponse.protocol_features`; stripped alongside `outbox`
+   * on the strict-decode rollback retry. Absent means "not latched". `cause` is the agent-sanitized
+   * detail (at most 160 characters, untrusted to the api); `run_id` is null when no run detected it.
+   */
+  residue_quarantine?: ResidueQuarantineWire;
+}
+
+/** The wire shape of {@link HeartbeatRequest.residue_quarantine}
+ *  (fixtures/worker-heartbeat-residue-quarantine/latched.json). */
+export interface ResidueQuarantineWire {
+  cause: string;
+  /** RFC 3339. */
+  latched_at: string;
+  run_id: string | null;
+  /** The detection site: `pre_clone`, a quiescence site name, or `review_pre_fetch`. */
+  site: string;
 }
 
 /**

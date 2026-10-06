@@ -46,6 +46,7 @@ import type { SdkQueryFn } from "./sdk-executor.js";
 import { buildSdkEnv, type SdkEnv } from "./sdk-env.js";
 import { defaultQueryFn, isErrorResult, isResult, mapSdkMessage, promptStream } from "./sdk-messages.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
+import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
 
 /** The fixed, named tool set of a profile-bound research run (PRD #1906 Decision 5). A
  *  profile-bound JOB (PRD #1976) runs on the JobRunner's lane mode, which reuses every layer of
@@ -459,6 +460,8 @@ export class IsolatedExecutor {
     let refusal: string | undefined;
     let resultFrame: unknown;
     try {
+      // issue #2213: the last statement before the credential-bearing provider spawn.
+      assertResidueQuarantineOpen("provider_turn");
       const stream = this.queryFn({ prompt: promptStream(ctx.prompt), options });
       for await (const msg of stream) {
         // Every init frame is checked (a resumed or re-initialized session re-announces its

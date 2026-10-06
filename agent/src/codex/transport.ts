@@ -31,6 +31,22 @@
 import type { Readable, Writable } from "node:stream";
 
 import type { HarnessError, HarnessErrorCategory } from "../harness.js";
+import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
+
+/** issue #2213: the JSON-RPC requests that start or authenticate a provider turn. */
+const QUARANTINE_GATED_METHODS: ReadonlySet<string> = new Set([
+  "account/login/start",
+  "thread/start",
+  "thread/resume",
+  "turn/start",
+]);
+
+/** issue #2213: true for a request that starts or authenticates a provider turn (the set the
+ *  transport refuses while the worker is quarantined). Callers that hold a transport DOUBLE assert
+ *  at their own call site with this, so the check never depends on which transport is behind it. */
+export function isProviderTurnMethod(method: string): boolean {
+  return QUARANTINE_GATED_METHODS.has(method);
+}
 
 /** Mirrors e2e/codex-m0/harness.mjs:12 `MAX_BYTES`. Per-line cap, enforced on read. */
 const DEFAULT_MAX_FRAME_BYTES = 4 * 1024 * 1024;
@@ -383,6 +399,17 @@ class CodexTransportImpl implements CodexTransport {
       if (signal?.aborted) {
         reject(fail("aborted", "codex transport request aborted before send"));
         return;
+      }
+      // issue #2213: on a quarantined worker no new provider turn is dispatched. The refusal is a
+      // rejected promise carrying the ResidueQuarantinedError itself (never a CodexTransportError,
+      // so no retry or resume-remap treats it as a transport fault), raised before any frame exists.
+      if (QUARANTINE_GATED_METHODS.has(method)) {
+        try {
+          assertResidueQuarantineOpen("provider_turn");
+        } catch (err) {
+          reject(err);
+          return;
+        }
       }
       const id = this.nextId++;
       let timer: ReturnType<typeof setTimeout> | undefined;

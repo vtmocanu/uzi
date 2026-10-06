@@ -19,6 +19,8 @@ import path from "node:path";
 import { setQuiescenceViewForTests, type QuiescenceView } from "../../src/run-quiescence.js";
 import { setDefaultEnvProbeSpawnerForTests, type EnvProbeSpawner } from "../../src/env-probe.js";
 import { setDefaultRunProcessOpsForTests, type RunProcessOps } from "../../src/run-procs.js";
+import { afterEach } from "node:test";
+import { resetResidueQuarantineForTests } from "../../src/residue-quarantine.js";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-hermetic-proc-"));
 process.on("exit", () => fs.rmSync(root, { recursive: true, force: true }));
@@ -62,3 +64,17 @@ export function restoreHermeticRunProcessOps(): void {
 }
 
 restoreHermeticRunProcessOps();
+
+/**
+ * issue #2213: the residue quarantine latch is process-wide state with no production release, so a
+ * test that latches it (directly, or through a runner flow over a planted unreadable process) must
+ * not leak the latch into the next test of the same file. Call this once at the top level of a test
+ * file: it resets the latch after every test. Deliberately a function, not a preload side effect:
+ * registering a node:test hook at import time would make every child script that imports a test
+ * helper start the test runner and print its summary to stdout.
+ */
+export function resetResidueQuarantineAfterEach(): void {
+  afterEach(() => {
+    resetResidueQuarantineForTests();
+  });
+}

@@ -40,6 +40,7 @@ import {
   gitlabClaim,
   homeDir,
   installHarness,
+  plantAfterFetch,
   runnerWith,
   simulateCommittedWork,
 } from "./runner-harness.js";
@@ -761,7 +762,9 @@ describe("issue #1783 hermetic: an unreadable_unattributed process on a fake pro
   /** Run `fn` with a fake proc root holding one unreadable, unattributed same-uid process. */
   function withUnreadable<T>(fn: () => Promise<T>): Promise<T> {
     const root = makeFakeProcRoot();
-    plantUnreadableUnattributed(root, 4242);
+    // issue #2213: planted right after the run's clone fetch: the worker-wide pre-fetch check would
+    // otherwise refuse the run before any of the later proof sites this suite exercises.
+    plantAfterFetch(() => plantUnreadableUnattributed(root, 4242));
     return withQuiescenceView({ procRoot: root }, fn, FILE_VIEW).finally(() => fs.rmSync(root, { recursive: true, force: true }));
   }
 

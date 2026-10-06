@@ -71,6 +71,7 @@ import type {
   SessionPresence,
   TurnSignals,
 } from "./harness.js";
+import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
 
 function asRecord(v: unknown): Record<string, unknown> | undefined {
   return v && typeof v === "object" ? (v as Record<string, unknown>) : undefined;
@@ -347,6 +348,8 @@ export class ClaudeHarness implements RunHarness {
       // Created lazily on first iteration so a synchronous queryFn throw surfaces
       // to the owner's for-await (its trip>throw>terminal precedence handles it),
       // exactly where the pre-extraction loop created the query.
+      // issue #2213: the last statement before the credential-bearing provider spawn.
+      assertResidueQuarantineOpen("provider_turn");
       queryInstance = deps.queryFn({
         prompt: promptStream(request.prompt),
         options: turnOptions,

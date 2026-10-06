@@ -9,6 +9,7 @@ import { RateLimitObserver, type RateLimitObservation } from "./limit.js";
 import type { Logger } from "./log.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import type { AdviceHarness, AdviceRequest, AdviceResult, AdviceResultPolicy } from "./harness.js";
+import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
 
 /** A PreToolUse deny for EVERY tool: the advice runners (judge/review/summary) are
  *  read-only. A deny is authoritative even under bypassPermissions (the same property
@@ -75,6 +76,8 @@ export class ClaudeAdviceHarness implements AdviceHarness {
     let terminalMsg: unknown;
     let terminalIsError = false;
     const rateLimits = new RateLimitObserver();
+    // issue #2213: the last statement before the credential-bearing provider spawn.
+    assertResidueQuarantineOpen("provider_turn");
     for await (const msg of this.inputs.queryFn({ prompt: promptStream(request.prompt), options })) {
       rateLimits.observe(msg);
       for (const em of mapSdkMessage(msg)) {

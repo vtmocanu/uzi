@@ -109,6 +109,7 @@ import {
   type TerminalOutboxDeps,
 } from "./terminal-resolve.js";
 import { rmTeardownTree, type TeardownTestDeps } from "./rmtree.js";
+import { uidSplitActive } from "./runner-uid.js";
 import { dropRunCaches } from "./run-caches.js";
 import type { RunDiskLocks } from "./run-disk-locks.js";
 import type { CachesDroppedMemo } from "./disk-reclaim.js";
@@ -125,6 +126,17 @@ import {
 } from "./steering.js";
 import { GitLabClient, ForgejoClient, GitHubClient, type ForgeClient } from "./forge.js";
 import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
+import {
+  archiveFailureReasonSuffix,
+  archiveQuarantinedSource,
+  type QuarantineArchiveResult,
+} from "./quarantine-archive.js";
+import {
+  ResidueQuarantinedError,
+  RunResidueBlockedError,
+  assertResidueQuarantineOpen,
+  latchOnUnattributedUnreadable,
+} from "./residue-quarantine.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { CodexSessionStore } from "./codex/session-state.js";
@@ -929,32 +941,6 @@ class RunningAckTerminalError extends Error {
  *  CloneResidueBlockedError). failOriginForReason maps it to the fail_origin
  *  `worker_residue_blocked`. Defined in git.ts, where CloneResidueBlockedError is thrown. */
 export { REASON_WORKER_RESIDUE_BLOCKED };
-
-/**
- * issue #1783: the run's clone is not provably quiescent at a boundary that must not proceed
- * without it. At finalize it fails the run (fail_origin `worker_residue_blocked`, the clone kept);
- * at a limit/wall park or a completion hold it means the credentialed sink body was skipped
- * (nothing published, the park stands); at a pause park it means no checkpoint and no park (the
- * pause reports pause_failed and the run continues, Decision 8); at the graceful-shutdown sink it
- * means nothing published (the requeue stands); at a milestone checkpoint it means that
- * checkpoint's publish is skipped (the run continues).
- */
-class RunResidueBlockedError extends Error {
-  readonly detail: string;
-  /** `preClone` marks the phaseClone reap, which fails before any clone exists: its text must not
-   *  claim a clone was kept. The reason prefix is the same, so failOriginForReason maps both. */
-  constructor(detail: string, opts: { preClone?: boolean } = {}) {
-    // The detail reaches the run's failure_reason: short, and stripped of control/bidi characters.
-    const clean = sanitizeForLog(detail, 160);
-    super(
-      opts.preClone
-        ? `${REASON_WORKER_RESIDUE_BLOCKED}: the run's HOME-attributed processes could not be proven gone before the clone fetch (${clean}); no clone was fetched`
-        : `${REASON_WORKER_RESIDUE_BLOCKED}: the run's clone could not be proven quiescent (${clean}); the clone is kept for inspection`,
-    );
-    this.detail = clean;
-    this.name = "RunResidueBlockedError";
-  }
-}
 
 /** Most pids a HOME-attributed reap verdict names in its detail (the detail reaches failure_reason). */
 const ATTRIBUTED_REAP_DETAIL_PIDS = 5;
@@ -3945,6 +3931,11 @@ export class RunRunner {
     opts: { keepCustody?: boolean } = {},
   ): Promise<void> {
     const { batcher, redactText, runLog } = flight;
+    // issue #2213: a run stopped by the worker quarantine (raised at a turn boundary, a provider
+    // dispatch or a git funnel, possibly with no finalize gate in front of it) keeps its clone and
+    // its recovery journal exactly like a finalize-gate residue block: the terminal retire must not
+    // discard a tree the ordinary recovery settle cannot capture while a survivor may read credentials.
+    if (err instanceof ResidueQuarantinedError) flight.preserveRecoveryClone = true;
     const rawReason =
       err instanceof ProviderPolicyRefusal
         ? policyRefusalMessage(err.policyRefusal.policy_tag)
@@ -4045,6 +4036,19 @@ export class RunRunner {
         : flight.permanentFailureReap !== undefined
           ? this.permanentFailureReapValid(flight)
           : await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
+    // issue #2213: a run that failed because the worker is quarantined keeps a verified local copy of
+    // the committed work already in the worker bare (additive, credential-free; see
+    // archiveQuarantinedSource). It runs after the failure is decided and before the terminal
+    // report, and its outcome never changes the typed failure: H and the bundle sha256 are only
+    // APPENDED to the reason, an integrity anchor a same-uid survivor cannot reach.
+    const archiveSuffix =
+      err instanceof ResidueQuarantinedError
+        ? archiveFailureReasonSuffix(await this.archiveQuarantinedSource(claim, flight))
+        : "";
+    const reportedReason =
+      archiveSuffix === ""
+        ? reason.slice(0, MAX_FAILURE_REASON_LEN)
+        : reason.slice(0, MAX_FAILURE_REASON_LEN - archiveSuffix.length) + archiveSuffix;
     // Cap what lands in the run row (matches the GitLab error-body cap). Journal it WRITE-AHEAD then
     // resolve it (D3): on reserve_exhausted it degrades to today's direct send, whose throw the
     // .catch below still logs; on the journaled path journalAndSendTerminal never throws (a send that
@@ -4054,7 +4058,7 @@ export class RunRunner {
       TERMINAL_JOURNAL_PHASE,
       {
         status: "failed",
-        failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+        failure_reason: reportedReason,
         fail_origin: failOrigin,
       },
       (b, sig) => flight.reportState(b, sig),
@@ -7846,6 +7850,75 @@ export class RunRunner {
     });
   }
 
+  /**
+   * issue #2213: the additive archival capture of a run that failed with ResidueQuarantinedError
+   * (see quarantine-archive.ts). It reads only the worker bare and runs only credential-free
+   * worker-uid git: no runner-clone git, no provider, no reserve/upload/release client call, no
+   * recovery-pin delete, no journal or hold change. Never throws; the outcome is logged and the
+   * run's typed failure is unchanged.
+   */
+  private async archiveQuarantinedSource(claim: ClaimResponse, flight: RunFlight): Promise<QuarantineArchiveResult> {
+    try {
+      return await archiveQuarantinedSource(this.git, flight.runLog, {
+        runId: flight.runId,
+        generation: claim.claim_generation ?? 0,
+        barePath: flight.barePath,
+        branch: flight.branch,
+      });
+    } catch (err) {
+      flight.runLog.warn("quarantine archival capture crashed; the failure is unchanged", { error: errMessage(err) });
+      return { outcome: "incomplete", detail: "the capture crashed" };
+    }
+  }
+
+  /**
+   * issue #2213: the WORKER-WIDE residue check that precedes every credentialed fetch (the clone
+   * fetch of every claim, both harnesses, and the review runner's). A single-uid worker's forge-PAT
+   * git child carries the PAT in its environment, which any same-uid process that is not
+   * dumpable-protected can read from /proc, so it asks whether any runner-uid process exists whose
+   * env and cwd cannot be read and that nothing ties to another live attempt. It only detects:
+   * nothing is in scope and nothing is signalled (ScanRequest.workerWide). A non-quiescent verdict
+   * throws RunResidueBlockedError({preClone: true}) so no fetch starts, and an
+   * `unreadable_unattributed` entry also latches the worker. Skipped under the uid split (the
+   * runner-uid boundary and the solitary kill already contain it) and off Linux, never faked.
+   */
+  async checkWorkerResidueBeforeFetch(runId: string, site: string, log: Logger = this.log): Promise<void> {
+    if (process.platform !== "linux" || uidSplitActive()) return;
+    let outcome: QuiesceRunOutcome;
+    try {
+      // quiesceRunAttempt directly, not the injectable quiesceImpl: this is a process-table read with
+      // nothing in scope.
+      outcome = await quiesceRunAttempt({
+        mode: "capture",
+        attempt: undefined,
+        cloneKey: "",
+        targetPaths: [],
+        processes: true,
+        workerWide: true,
+        dockerHost: undefined,
+        registry: this.liveAttempts,
+        site,
+      });
+    } catch (err) {
+      // The contract says never throws; a rejection reads as unverified, like quiesceRun.
+      outcome = {
+        process: { state: "unverified", processes: [], killed: [], detail: `quiescence failed: ${errMessage(err)}` },
+        docker: { state: "not_wired", removed: [], detail: "worker-wide check" },
+      };
+    }
+    const verdict = outcome.process;
+    if (verdict === undefined || verdict.state === "quiescent") return;
+    latchOnUnattributedUnreadable(verdict, { runId, site, log });
+    log.warn("worker-wide residue check found a process nothing ties to a run; no credentialed fetch will start", {
+      run_id: runId,
+      site,
+      state: verdict.state,
+      detail: sanitizeForLog(verdict.detail),
+      processes: describeProcesses(verdict),
+    });
+    throw new RunResidueBlockedError(verdict.detail, { preClone: true });
+  }
+
   private async phaseClone(claim: ClaimResponse, flight: RunFlight): Promise<void> {
     const { runLog, reportState, steering, batcher, cancel } = flight;
     const runId = claim.run_id;
@@ -7871,6 +7944,11 @@ export class RunRunner {
     // follow-ups earlier claims consumed so they keep reaching this claim's subagents.
     await this.rehydrateOperatorConstraints(runId, steering, batcher, runLog);
     steering.start();
+
+    // issue #2213: a quarantined worker starts no credentialed git or provider turn. The claim
+    // loop already refuses new claims while latched; this refuses a claim that was in flight (or
+    // returned by a claimRun pending) when the latch was set, before any fetch.
+    assertResidueQuarantineOpen("claim");
 
     // PRD #1390 M4 — env-gated e2e DROP-EXECUTION seam. OFF unless UZI_E2E_DROP_ON_SENTINEL
     // is set (so this whole block is inert in production). The run has just reported `running`
@@ -7936,6 +8014,9 @@ export class RunRunner {
         throw new RunResidueBlockedError(cause.detail, { preClone: true });
       }
     }
+    // issue #2213: the HOME reap above cannot see a survivor nothing ties to this run, and it skips
+    // a run's first claim and every Codex run. The worker-wide check runs on EVERY claim.
+    await this.checkWorkerResidueBeforeFetch(runId, "pre_clone", runLog);
     let barePath: string;
     try {
       // PRD #1809 D6: a clone/fetch that fails because the data volume is full runs the D7
@@ -9967,6 +10048,9 @@ export class RunRunner {
         };
       }
       outcome = fold(outcome);
+      // issue #2213: detection only. An `unreadable_unattributed` entry latches the worker (single-uid
+      // Linux); whether this verdict blocks its caller is unchanged.
+      latchOnUnattributedUnreadable(outcome.process, { runId: flight.runId, site: opts.site, log: flight.runLog });
       const blocked = outcome.process !== undefined && outcome.process.state !== "quiescent";
       if (blocked) {
         flight.runLog.warn("run clone is not quiescent", {

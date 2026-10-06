@@ -26,6 +26,7 @@ import {
   parseRetainedArtifactName,
 } from "./attempt-path.js";
 import { sanitizeForLog } from "./run-quiescence.js";
+import { REASON_WORKER_RESIDUE_BLOCKED, RunResidueBlockedError, assertResidueQuarantineOpen } from "./residue-quarantine.js";
 
 import {
   commitsScannedFromStderr,
@@ -760,6 +761,14 @@ function runnerTrackingRef(branch: string): string {
 // is the leaf, so the namespace is D/F-safe and dodges the branch-slash D/F hazard that affected
 // `refs/uzi-runner` (issue #887) — it never carries the branch.
 const RECOVERY_PIN_PREFIX = "refs/uzi-recovery-pin/";
+// issue #2213 — the quarantine archival anchor `refs/uzi-archive/<runId>/g<generation>`. The runId is a
+// single sanitized path component and the leaf starts with `g` (the existing refs/uzi-archive leaf is
+// a 40-hex sha, which never starts with `g`), so the two uses of the namespace cannot collide or
+// D/F-conflict. Nothing in agent/src reads or deletes refs/uzi-archive/*.
+function quarantineArchiveRef(runId: string, generation: number): string {
+  const rid = runId.replace(/[^A-Za-z0-9_-]/g, "-");
+  return `refs/uzi-archive/${rid}/g${Math.max(0, Math.trunc(generation))}`;
+}
 // issue #1582 M2 — the settlement pins for an older-generation custody hold a same-worker successor
 // adopted: `refs/uzi-settle/<runId>/<holdId>/{source,adopted,pushed,published}`. They keep the candidate
 // commits a settle request names reachable (`published` is the live-publication tip a
@@ -893,8 +902,9 @@ export class CapturePathMismatchError extends Error {
 
 /** issue #1783: the failure-reason prefix of a run whose clone (or the canonical clone path it
  *  must free) could not be proven quiescent or freed. The runner's failOriginForReason maps it to
- *  the fail_origin `worker_residue_blocked`; the runner re-exports it. */
-export const REASON_WORKER_RESIDUE_BLOCKED = "worker_residue_blocked";
+ *  the fail_origin `worker_residue_blocked`; the runner re-exports it. Defined in
+ *  residue-quarantine.ts (issue #2213) so the error classes there share it without an import cycle. */
+export { REASON_WORKER_RESIDUE_BLOCKED };
 
 /**
  * issue #1783 M3 — the canonical runner clone path could not be freed for a reseed: the scoped
@@ -1305,6 +1315,11 @@ export class GitCache {
    *  predecessor hold). A SIBLING of `recoveryRoot`, never inside it: the recovery restart sweep
    *  treats every entry under `recovery/` as a runId. Worker-owned. */
   readonly recoverySettlementRoot: string;
+  /** issue #2213 — the worker-owned 0700 store of verified quarantine archives
+   *  (`<root>/<runId>/g<generation>.bundle` plus its manifest). A SIBLING of `recovery/`, never
+   *  inside it: it is not custody (nothing reads it to release or retire anything), and the
+   *  recovery restart sweep treats every entry under `recovery/` as a runId. */
+  readonly recoveryArchiveRoot: string;
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
@@ -1345,6 +1360,7 @@ export class GitCache {
     this.runnerHoldingRoot = path.join(dataDir, "runner-quarantine");
     this.recoveryRoot = path.join(dataDir, "recovery");
     this.recoverySettlementRoot = path.join(dataDir, "recovery-settlement");
+    this.recoveryArchiveRoot = path.join(dataDir, "recovery-archive");
   }
 
   /** Scope every subprocess and bare-lock acquisition created by `action` to the
@@ -1735,6 +1751,8 @@ export class GitCache {
       await this.scratchPublicationPreflight(barePath, branch, fresh);
       forwardAdvance = true;
     } catch (cause) {
+      // issue #2213: a quarantine refusal is not an unverifiable floor: it reaches the runner typed.
+      if (cause instanceof RunResidueBlockedError) throw cause;
       const abort = this.boundaryAbortError(cause);
       if (abort) throw abort;
       if (cause instanceof ScratchPublicationError) throw cause;
@@ -3647,6 +3665,74 @@ export class GitCache {
   }
 
   /**
+   * issue #2213 — create-only archive anchor `refs/uzi-archive/<runId>/g<generation>` at `sha`, under
+   * the bare lock, for the quarantine archival capture. `update-ref <ref> <sha> ""` creates the ref
+   * and refuses to move an existing one; an existing ref already at `sha` is idempotent success. The
+   * ref keeps `sha`'s objects reachable (a `--all` gc root). Worker-uid, local, credential-free.
+   * Never writes a recovery pin and never deletes anything. Throws only on an unexpected git
+   * failure; a conflicting existing ref returns "conflict".
+   */
+  async createQuarantineArchiveRef(
+    barePath: string,
+    runId: string,
+    generation: number,
+    sha: string,
+  ): Promise<"created" | "exists" | "conflict" | "absent"> {
+    if (!/^[0-9a-f]{40}$/.test(sha)) return "absent";
+    const ref = quarantineArchiveRef(runId, generation);
+    return this.withLock(barePath, async () => {
+      const present = (await this.runGit(barePath, ["rev-parse", "--verify", `${sha}^{commit}`]).catch(() => "")).trim();
+      if (present !== sha) return "absent";
+      const existing = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", "-q", ref])).trim();
+      if (existing !== "") return existing === sha ? "exists" : "conflict";
+      await this.runGit(barePath, ["update-ref", ref, sha, ""]);
+      return "created";
+    });
+  }
+
+  /** issue #2213 — the current value of the quarantine archive ref (40-hex), or null when absent.
+   *  Read under the bare lock so it is ordered against {@link createQuarantineArchiveRef}. */
+  async quarantineArchiveRefTip(barePath: string, runId: string, generation: number): Promise<string | null> {
+    const ref = quarantineArchiveRef(runId, generation);
+    return this.withLock(barePath, async () => {
+      const sha = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", "-q", ref])).trim();
+      return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+    });
+  }
+
+  /**
+   * issue #2213 — prove a bundle file reproduces the commit `sha` on its own. The bundle is
+   * unbundled into a FRESH temporary bare repository under `scratchRoot` (`git bundle unbundle`
+   * runs `index-pack`, which recomputes every object's hash from its content, so a forged loose
+   * object substituted under an existing OID cannot import as that OID), and there: `list-heads`
+   * names exactly `sha`, `rev-parse --verify sha^{commit}` succeeds, and `rev-list --objects sha`
+   * completes (the history is connected). Worker-uid, credential-free; the temporary repo is always
+   * removed. Returns undefined when verified, else a short reason (never throws).
+   */
+  async verifyBundleReproduces(bundlePath: string, sha: string, scratchRoot: string): Promise<string | undefined> {
+    let dir: string | undefined;
+    try {
+      dir = await fs.mkdtemp(path.join(scratchRoot, "verify-"));
+      await this.runGit(undefined, ["init", "--bare", "-q", dir]);
+      const heads = (await this.runGit(dir, ["bundle", "list-heads", bundlePath]))
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l !== "");
+      const oids = new Set(heads.map((l) => l.split(/\s+/)[0] ?? ""));
+      if (oids.size !== 1 || !oids.has(sha)) return "the bundle's heads are not exactly the committed head";
+      await this.runGit(dir, ["bundle", "unbundle", bundlePath]);
+      const tip = (await this.runGit(dir, ["rev-parse", "--verify", `${sha}^{commit}`])).trim();
+      if (tip !== sha) return "the unbundled head does not resolve to the committed head";
+      await this.runGit(dir, ["rev-list", "--objects", "--quiet", sha]);
+      return undefined;
+    } catch (err) {
+      return `bundle verification failed: ${sanitizeForLog(gitErrorMessage(err), 120)}`;
+    } finally {
+      if (dir !== undefined) await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /**
    * issue #1507 — best-effort remove a pin ref planted by {@link anchorRecoveryHead}, once a durable
    * replacement exists (the bundle was archived, or the head is already forge-published). Never
    * throws: a failed cleanup only leaves a harmless ref on the long-lived bare (the same
@@ -4560,6 +4646,9 @@ export class GitCache {
         () => onStep?.("default_fetch"),
       );
     } catch (e) {
+      // issue #2213: a quarantine refusal is not "could not resolve": the checkpoint's publish is
+      // skipped (the runner's RunResidueBlockedError arm), never shipped on a fallback.
+      if (e instanceof RunResidueBlockedError) throw e;
       const abort = this.boundaryAbortError(e);
       if (abort) throw abort;
       this.log.warn("checkpoint overlay: could not resolve the default tip — shipping realTip", {
@@ -4994,6 +5083,7 @@ export class GitCache {
           const sha = await this.resolveCommitStrict(barePath, tempRef);
           return sha === match[1] ? { kind: "present", sha } as const : { kind: "unavailable" } as const;
         } catch (cause) {
+          if (cause instanceof RunResidueBlockedError) throw cause; // issue #2213
           const abort = this.boundaryAbortError(cause);
           if (abort) throw abort;
           return { kind: "unavailable" } as const;
@@ -5013,6 +5103,7 @@ export class GitCache {
         }
       });
     } catch (cause) {
+      if (cause instanceof RunResidueBlockedError) throw cause; // issue #2213
       const abort = this.boundaryAbortError(cause);
       if (abort) throw abort;
       return { kind: "unavailable" };
@@ -6836,6 +6927,9 @@ export class GitCache {
     const boundary = this.boundaryProcesses.getStore();
     const { input, ...execOptions } = options;
     if (!boundary) {
+      // issue #2213: the second quarantine check, keyed on the credential itself, synchronously
+      // before the child is created (nothing awaits between this and execFileAsync).
+      assertNoCredentialedGitWhileQuarantined(options.env);
       // issue #1597 M2: optional stdin (the checkpoint scan's cat-file / gitleaks stdin). An EPIPE on
       // an early-exiting child is swallowed here; the exit status carries the failure.
       const pending = execFileAsync(command, args, execOptions);
@@ -6856,6 +6950,8 @@ export class GitCache {
     const childTimeout = remainingSoft === undefined
       ? options.timeout
       : Math.min(options.timeout ?? Infinity, remainingSoft);
+    // issue #2213: as above, on the Codex boundary path; no await between this and the spawn call.
+    assertNoCredentialedGitWhileQuarantined(options.env);
     const process = await boundary.spawn({ argv: [executable, ...args], cwd, env: options.env, identity,
       ...(childTimeout === undefined ? {} : { timeoutMs: childTimeout }),
       ...(remainingSoft === undefined ? {} : { recoverableTimeout: true }),
@@ -6966,6 +7062,8 @@ export class GitCache {
       });
       return stdout;
     } catch (err) {
+      // issue #2213: the quarantine refusal reaches the runner unwrapped (a typed worker fault).
+      if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
       throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
@@ -6995,6 +7093,7 @@ export class GitCache {
       });
       return stdout;
     } catch (err) {
+      if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
       throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
@@ -7240,10 +7339,13 @@ export class GitCache {
 
   /** Run git, returning the exit code (0 on success) instead of throwing. */
   private async tryGit(cwd: string | undefined, args: string[], pat?: string): Promise<number> {
+    // issue #2213: built outside the try so a quarantine refusal is never read as an exit code.
+    const env = gitEnv(pat);
     try {
-      await this.execScoped("git", withDir(cwd, args), { env: gitEnv(pat), timeout: GIT_TIMEOUT_MS });
+      await this.execScoped("git", withDir(cwd, args), { env, timeout: GIT_TIMEOUT_MS });
       return 0;
     } catch (err) {
+      if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
       const code = (err as { code?: unknown }).code;
@@ -7258,10 +7360,12 @@ export class GitCache {
    *  keeps its historical coerce-to-1 for callers that only care whether the op succeeded; this
    *  sibling exists for callers (ancestry) that MUST NOT treat a broken read as a data answer. */
   private async tryGitExit(cwd: string | undefined, args: string[], pat?: string): Promise<number | null> {
+    const env = gitEnv(pat);
     try {
-      await this.execScoped("git", withDir(cwd, args), { env: gitEnv(pat), timeout: GIT_TIMEOUT_MS });
+      await this.execScoped("git", withDir(cwd, args), { env, timeout: GIT_TIMEOUT_MS });
       return 0;
     } catch (err) {
+      if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
       const code = (err as { code?: unknown }).code;
@@ -7533,6 +7637,22 @@ export function runnerGitSpawnEnv(args: readonly string[], runnerEnv: NodeJS.Pro
 }
 
 
+/** issue #2213: true when a git child's env carries the forge credential: any `GIT_CONFIG_VALUE_n`
+ *  that is a Basic Authorization header (gitEnv's PAT pair). Keyed on the env, not on the spawn
+ *  identity, which defaults to `worker_pat` for PAT-less git too. */
+function carriesForgeCredential(childEnv: NodeJS.ProcessEnv): boolean {
+  return Object.entries(childEnv).some(
+    ([k, v]) => k.startsWith("GIT_CONFIG_VALUE_") && typeof v === "string" && v.startsWith("Authorization: Basic"),
+  );
+}
+
+/** issue #2213: refuse (synchronously, typed) to start a child that carries the forge credential
+ *  while the worker is quarantined. Called immediately before the spawn, so nothing awaits between
+ *  the check and the child's creation. */
+function assertNoCredentialedGitWhileQuarantined(childEnv: NodeJS.ProcessEnv): void {
+  if (carriesForgeCredential(childEnv)) assertResidueQuarantineOpen("git");
+}
+
 export function gitEnv(pat?: string, httpScope?: string, username?: string): NodeJS.ProcessEnv {
   // REPLACEMENT env (M10 audit), NOT a process.env spread. A git subprocess can spawn
   // agent-controlled code (a hook at the default path) as the worker uid, outside the
@@ -7607,6 +7727,8 @@ export function gitEnv(pat?: string, httpScope?: string, username?: string): Nod
     ...GIT_CODE_EXEC_KEY_PINS.map(([k, v]) => [k, v] as [string, string]),
   ];
   if (pat) {
+    // issue #2213: a quarantined worker builds no forge credential into a git child's environment.
+    assertResidueQuarantineOpen("git");
     // HTTP Basic (base64(user:pat)) — git-over-HTTPS auth, unlike GitLab's
     // REST-only PRIVATE-TOKEN. Scope the header + pin followRedirects to the repo
     // host so neither the credential nor a redirect can reach another host.

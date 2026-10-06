@@ -30,7 +30,7 @@ import {
   scopedRealView,
   withQuiescenceView,
 } from "./fake-proc.js";
-import { api, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith, simulateCommittedWork, worktreeDirFor } from "./runner-harness.js";
+import { api, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, plantAfterFetch, runnerWith, simulateCommittedWork, worktreeDirFor } from "./runner-harness.js";
 import { restoreHermeticView } from "./setup/hermetic-proc.js";
 import { realProcfsSkip } from "./real-procfs.js";
 
@@ -384,7 +384,7 @@ describe("runner flows over the real quiescence primitive and a fake proc root",
       const iid = blocked ? 3901 : 3902;
       const canonical = worktreeDirFor(iid);
       fs.mkdirSync(path.join(canonical, "old"), { recursive: true });
-      plant();
+      plantAfterFetch(plant);
       const { factory, started } = factoryOf(async () => {
         throw new Error("stop after the seed");
       });
@@ -403,7 +403,7 @@ describe("runner flows over the real quiescence primitive and a fake proc root",
 
     it(`terminal retire, ${label}`, async () => {
       const iid = blocked ? 3911 : 3912;
-      plant();
+      plantAfterFetch(plant);
       const { factory } = factoryOf(async () => {
         throw new Error("agent crashed");
       });
@@ -416,7 +416,7 @@ describe("runner flows over the real quiescence primitive and a fake proc root",
 
     it(`limit park, ${label}`, async () => {
       const iid = blocked ? 3921 : 3922;
-      plant();
+      plantAfterFetch(plant);
       const { factory } = factoryOf(async (ctx) => {
         commitWork(ctx.worktreePath);
         throw new LimitReachedError({ resetsAtMs: Date.now() + 5 * 3600_000, rateLimitType: "five_hour" });
@@ -435,7 +435,7 @@ describe("runner flows over the real quiescence primitive and a fake proc root",
 
     it(`wall park (capture), ${label}`, async () => {
       const iid = blocked ? 3931 : 3932;
-      plant();
+      plantAfterFetch(plant);
       const outcomes: unknown[] = [];
       const { factory } = factoryOf(async (ctx) => {
         commitWork(ctx.worktreePath);
@@ -464,7 +464,7 @@ describe("runner flows over the real quiescence primitive and a fake proc root",
     it(`finalize, ${label}`, async () => {
       const iid = blocked ? 3941 : 3942;
       simulateCommittedWork();
-      plant();
+      plantAfterFetch(plant);
       const { gitlab, calls: mrCalls } = fakeGitlab();
       const { factory } = factoryOf(async (ctx) => ({ branch: ctx.branch, summary: "done" }));
       const claim = gitlabClaim(iid);
