@@ -3091,6 +3091,15 @@ export class CodexExecutor implements Executor {
           this.log.warn("Codex session seed cleanup refused", { error: errMessage(error) });
           throw new TrustedExecutionRefusal("Codex session seed cleanup refused");
         }
+        // The worker-owned sticky parent protects this freshly created entry;
+        // 0750 gives the runner read/traverse access without permission to populate it.
+        // An entry planted after removal must never be adopted.
+        try {
+          await fs.mkdir(sessionSeedHome, { mode: 0o750 });
+        } catch (error) {
+          this.log.warn("Codex session seed preparation refused", { error: errMessage(error) });
+          throw new TrustedExecutionRefusal("Codex session seed preparation refused");
+        }
         const adopted = await this.sessionStore.adopt(
           storeDir,
           sessionSeedHome,

@@ -46,7 +46,7 @@ import { makeFixture } from "./fixture-repo.js";
 import { makeClaim, testGitCacheOptions } from "./helpers.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
-import { WORKER_UID, RUNNER_UID } from "../src/runner-uid.js";
+import { WORKER_UID, RUNNER_UID, runnerCommand } from "../src/runner-uid.js";
 import { gitEnv } from "../src/git.js";
 import { forgeToolNames } from "../src/forge-tools.js";
 import { memoryToolNames } from "../src/memory-tools.js";
@@ -5751,6 +5751,65 @@ describe("production session-seed cleanup (#2324)", () => {
       assert.ok((await fs.lstat(planted)).isSymbolicLink(), "refused root remains for inspection");
       assert.equal(await fs.readFile(join(victim, "keep"), "utf8"), "outside");
     } finally { joinMock.mock.restore(); }
+  });
+
+  it("refuses a runner seed planted between removal and exclusive creation", async (t) => {
+    const root = await fs.mkdtemp("/tmp/cdr-seed-create-");
+    await fs.chown(root, -1, RUNNER_UID);
+    await fs.chmod(root, 0o3775);
+    const home = path.join(root, "home");
+    const work = path.join(root, "work");
+    await fs.mkdir(work);
+    await fs.chown(work, -1, RUNNER_UID);
+    await fs.chmod(work, 0o2770);
+    const rig = makeRig();
+    let adopted = 0;
+    let launched = 0;
+    let planted: string | undefined;
+    const open = fs.open;
+    const openMock = t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+      try { return await open(...args); }
+      catch (error) {
+        const name = String(args[0]);
+        if ((error as NodeJS.ErrnoException).code === "ENOENT" && name.startsWith("/proc/self/fd/") && name.endsWith(".session-seed") && planted === undefined) {
+          planted = path.join(home, "codex-data", path.basename(name));
+          const create = runnerCommand(process.execPath, ["-e", "const fs=require('node:fs');fs.mkdirSync(process.argv[1],{mode:0o750});fs.writeFileSync(process.argv[1]+'/keep','not adopted')", planted]);
+          const result = spawnSync(create.command, create.args, { env: { PATH: "/usr/bin:/bin" }, timeout: 10_000 });
+          assert.equal(result.status, 0, result.stderr?.toString());
+        }
+        throw error;
+      }
+    });
+    t.after(async () => {
+      openMock.mock.restore();
+      if (planted) {
+        const clean = runnerCommand(process.execPath, ["-e", "require('node:fs').rmSync(process.argv[1],{recursive:true,force:true})", planted]);
+        const result = spawnSync(clean.command, clean.args, { env: { PATH: "/usr/bin:/bin" }, timeout: 10_000 });
+        assert.equal(result.status, 0, "runner-owned planted fixture cleanup");
+      }
+      const { restoreTreeWritability } = await import("../src/rmtree.js");
+      await restoreTreeWritability(root);
+      await fs.rm(root, { recursive: true, force: true });
+    });
+    const executor = new CodexExecutor(noopLog, home, {
+      binding: bindingOf(API_KEY), client: rig.client as never, provider, provisionHomeDir: root,
+    }, {
+      ...rig.deps,
+      provisionRunTools: async () => ({ toolEnv: {} }),
+      spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls),
+      launchProviderRoot: async () => { launched++; throw new Error("must not launch with a planted seed"); },
+      sessionStore: { ...rig.deps.sessionStore!, adopt: async () => { adopted++; return { files: 0 }; } },
+    });
+    Object.defineProperty(executor, "providerLaunchInjected", { value: () => false });
+    try {
+      await assert.rejects(executor.run(makeCtx({ worktreePath: work }).ctx), /Codex session seed preparation refused/);
+      assert.ok(planted, "the runner planted an entry at the actual removal/creation boundary");
+      assert.equal(adopted, 0);
+      assert.equal(launched, 0);
+      const st = await fs.stat(planted);
+      assert.equal(st.uid, RUNNER_UID);
+      assert.equal(await fs.readFile(path.join(planted, "keep"), "utf8"), "not adopted");
+    } finally { openMock.mock.restore(); }
   });
 
   it("the production staging finally preserves outside files during swaps", async (t) => {
