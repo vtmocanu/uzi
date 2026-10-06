@@ -52,6 +52,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Agent startup reclaims stale terminal journal temps ([#2308](https://github.com/vtmocanu/uzi/issues/2308)).**
+  Startup removes canonical regular-file terminal install temps before key loading so interrupted writes no longer pin empty runs; installed journals, unknown entries and live-write retirement protection remain intact.
+
 - **Recorded finding-group settlement errors no longer stop issue sync ([#1946](https://github.com/vtmocanu/uzi/issues/1946)).**
   Board refresh and polling continue updating the issue cache when a recorded finding group cannot settle. The failed group stays claimed, is logged for diagnosis, and is retried on a later pass while other recorded groups on the page still settle.
 
