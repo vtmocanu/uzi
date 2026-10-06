@@ -30,7 +30,7 @@ func mergeScheduleCapacity(cur store.RunSchedule, req apitypes.ScheduleRequest) 
 func validateScheduleCapacity(req apitypes.ScheduleRequest, selector string) (int, string) {
 	a, b := req.CapacityLimit, req.CapacityRoomNeeded
 	if (a.Present && a.Value == nil) || (b.Present && b.Value == nil) {
-		if !(a.Present && b.Present && a.Value == nil && b.Value == nil) {
+		if !a.Present || !b.Present || a.Value != nil || b.Value != nil {
 			return http.StatusBadRequest, "clear both capacity fields together"
 		}
 		return 0, ""

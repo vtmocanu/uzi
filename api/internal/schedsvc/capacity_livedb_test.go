@@ -168,7 +168,7 @@ func TestCapacitySchedulerLiveDB(t *testing.T) {
 						t.Fatalf("blocked created runs: %d", n)
 					}
 				} else {
-					if st.lists != 1 || st.probes != 1 || !st.scan.Valid || st.scan.Int32 != int32(tc.starts+backfillHeadroom) {
+					if st.lists != 1 || st.probes != 1 || !st.scan.Valid || int(st.scan.Int32) != tc.starts+backfillHeadroom {
 						t.Fatalf("candidate queries=%+v", st)
 					}
 					for i, call := range runs.autopilot {

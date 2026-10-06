@@ -108,7 +108,7 @@ func TestCapacityBatchAndBackfill(t *testing.T) {
 			if len(out.Started) != tc.want || out.Matched != tc.want+1 || !out.Capped || out.Capacity == nil || out.Capacity.Blocked {
 				t.Fatalf("out=%+v", out)
 			}
-			if h.st.sweepMaxIssuesParam.Int32 != int32(tc.want+backfillHeadroom) {
+			if int(h.st.sweepMaxIssuesParam.Int32) != tc.want+backfillHeadroom {
 				t.Fatalf("scan limit=%+v", h.st.sweepMaxIssuesParam)
 			}
 			if s.MaxIssues != tc.cap || len(h.st.advanceCalls) != 0 {
