@@ -206,12 +206,15 @@ api:
   # note, PRD Decision context).
   diskPressureThreshold: 0.90
   resources:
+    # Requests sized to a live fleet's steady state (~107m CPU / ~280Mi measured
+    # 2026-10-06 with 8 hosted workers); below it the api is the first eviction
+    # candidate under node memory pressure.
     requests:
-      cpu: 50m
-      memory: 128Mi
+      cpu: 100m
+      memory: 320Mi
     limits:
-      # 512Mi -> 1Gi (PRD #122 M8). The api's steady state is tiny (~37Mi measured),
-      # but the M8 checkpoint push broker (pushbroker) spikes ~194 MB RSS per publish
+      # 512Mi -> 1Gi (PRD #122 M8). On top of that steady state, the M8 checkpoint
+      # push broker (pushbroker) spikes ~194 MB RSS per publish
       # (a shallow go-git base fetch + thin-pack apply + push; the pre-shallow full
       # fetch spiked 742 MB and OOM-killed this pod). 1Gi is headroom for a few
       # CONCURRENT publishes (single-publish already fits under 512Mi post-shallow-fix).
@@ -475,7 +478,8 @@ workers:
     # duplicate work, not about correctness of a single pass.
     replicaCount: 1
     # It polls, renders and applies — no compilation, no large payloads. The api's
-    # own requests are 50m/128Mi and it does far more.
+    # own requests are 100m/320Mi and it does far more (this controller measured
+    # ~2m / ~22Mi live).
     resources:
       requests:
         cpu: 25m
@@ -1681,9 +1685,11 @@ postgres:
       size: 5Gi
       storageClass: ""        # per-cluster
     resources:
+      # 256Mi -> 512Mi: each instance ran at ~290-480Mi on a live install (measured
+      # 2026-10-06), so 256Mi left every instance over its request.
       requests:
         cpu: 100m
-        memory: 256Mi
+        memory: 512Mi
       limits:
         memory: 1Gi
     primaryUpdateMethod: switchover
