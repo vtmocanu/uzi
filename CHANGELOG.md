@@ -40,6 +40,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Agent lockfile: MCP TypeScript SDK bumped past GHSA-6qxp-vccf-f47h.**
+  `@modelcontextprotocol/sdk` (transitive via the Claude Agent SDK) moves from 1.30.0 to 1.32.1, clearing the high-severity advisory that reddened `validate-agent` on `main`.
+
 - **Runner-owned clone cleanup and executor advice fallback use pinned removal ([#2324](https://github.com/vtmocanu/uzi/issues/2324)).**
   The clone remover and executor fallback pin directory identities and require their expected owner without opening private directories to other identities. Advice-data fallback removal requires positively confirmed clean disposal; unclean or unconfirmed disposal retains data and warns. Advice cwd cleanup still runs.
 
