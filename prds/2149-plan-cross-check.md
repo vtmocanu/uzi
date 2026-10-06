@@ -1,6 +1,6 @@
 # PRD #2149: Plan cross-check for auto-approved runs (Claude lead, Codex checker)
 
-**Status**: Approved; runtime and web implementation present, M2 documentation prepared, hosted acceptance pending. Child 1 of 5 under umbrella #2148 (Cross-check). Followed by PRD #2169 (dedicated cross-check slots), PRD #2150 (automatic revise rounds and the Codex-lead direction), PRD #2151 (checker model and effort pins per stage) and PRD #2170 (code cross-check).
+**Status**: Implemented; web and documentation completion pass validated, hosted acceptance pending. Child 1 of 5 under umbrella #2148 (Cross-check). Followed by PRD #2169 (dedicated cross-check slots), PRD #2150 (automatic revise rounds and the Codex-lead direction), PRD #2151 (checker model and effort pins per stage) and PRD #2170 (code cross-check).
 
 Resolved facts below were read at `main` `8a5f138e`; the naming and D4 revision at `main` `8c35d39b`.
 
@@ -150,23 +150,28 @@ Boot validation refuses malformed or out-of-range knobs, and `PLAN_CROSS_CHECK_T
 ## Implementation and validation evidence (2026-10-06)
 
 The milestones below are the original delivery/gate bundles, not a claim that
-this pass reran their inherited runtime gates. Their broad boxes remain open
-until the remaining synchronization, validation and hosted acceptance have
-matching evidence. Current behavior supersedes M1's checker-unavailable
+this pass reran their inherited runtime gates. Their broad boxes remain open as original delivery bundles; this completion
+pass does not assert that every original runtime gate was rerun. Hosted
+acceptance remains outstanding. Current behavior supersedes M1's checker-unavailable
 scaffolding and M2's blanket “anything else parks” shorthand.
 
 | Scope | Evidence / remaining boundary |
 |---|---|
 | Runtime and confinement | Maintainer-provided provenance: PR2358 reviewer/tester/auditor at `631b28a1`, 2262 LiveDB tests and capable-host confinement PASS run by the lander. Not observed or rerun in this documentation pass. |
 | Web M1 | Committed at `e45d6cb` (implementation `bb0efb31`); dispatch records observed `gate:web` PASS: 5641 unit tests / 299 files, 8 Chromium tests / 2 files, docs checker PASS, and `npm run build` PASS. Initial gate lint failure was fixed and the gate rerun PASS. This is web evidence, not a new runtime validation claim. |
-| M2 documentation | Scoped docs, architecture and [ADR-2149](../adr/2149-cross-check.md) prepared in the current worktree. No M2 gate results yet; no repo-wide gates or confinement harness run here. Lead owns `task docs:sync`. |
+| M2 documentation | Docs, architecture, spec and [ADR-2149](../adr/2149-cross-check.md) committed at `ba73044a`; `task docs:sync` completed. Reviewer found no mandatory or optional findings. Observed `task gate:web` PASS (5641 unit tests / 299 files, 8 Chromium tests / 2 files, including `check-docs:web`), `npm --prefix web run build` PASS, `task gate:repo` PASS and `task gate:api` PASS (including the embedded-docs package). Secrets scan: zero tracked-file findings, both canaries DETECTED; SAST: zero findings, canary DETECTED. These component gates do not rerun the prior LiveDB or capable-host confinement proof. |
 | Hosted acceptance | Acceptance issue 2152 remains maintainer-owned and pending. Keep this PRD in `prds/`; implementation evidence does not complete hosted acceptance. |
 | Deferred scope | Automatic checker revision, Codex-lead checking, dedicated slots, stage-specific pins and code cross-check remain out of scope, as listed above. |
+
+Completed in this approved web/docs pass:
+
+- [x] Honest web outcomes, bounded untrusted findings, historical evidence, checker metadata and detail refresh; reviewer plus tester rounds completed at `bb0efb31` and `e45d6cb` with the mandatory lint finding fixed.
+- [x] Documentation, ADR, spec and embedded mirror updated; component gates observed passing at `ba73044a`.
 
 ## Milestones
 
 - [ ] **M1 (original milestone; implementation present, full gate bundle not rerun here): Opted-in auto-approved runs wait at a fail-closed plan cross-check gate.** Setting and route, run snapshot with its parity test and `PlanCrossCheckable`, the `cross_checks` table (its migration lands here because the guards below read it; no row is written until M2), both claim gates with mirrors and the health reason (the `cross_check` kind's claim gate lands with the kind in M2), server enforcement in `SetRunAutopilotPlan` / `SetRunRunning` / `SetRunCompleted`, and the historical scaffolding branch (superseded by the integrated checker) that, with no cross-checker yet, parked cross-check-required runs with `plan cross-check: checker unavailable` through the forced-gate path, with the Slack reason line, feed message and CLI line. Docs: a new `docs/cross-check.md` (audience `user`, introducing Cross-check and its two stages, stating this PRD checks Claude-lead plans only and Codex-lead runs park), `docs/autopilot.md`, `docs/scheduling.md`, `docs/configuration.md`, `docs/slack.md`, then `task docs:sync`; `specs/human.md` (amend the l.201 "zero uzi interaction" autopilot promise for opted-in users); CHANGELOG. Blocked by: none. Gates: `task gate:api`, `task gate:agent`, `task gate:web`, LiveDB via `./e2e/run-store-it.sh`, `task gate:repo`.
-- [ ] **M2 (implementation present; docs sync/validation and hosted acceptance pending): A Claude lead's plan is cross-checked on Codex; an exact-plan pass implements, non-pass normally forces a human gate with available findings, and irrecoverable delivery losses fail.** Spike the read-only broker grant set first. Then the first `cross_checks` writes, the `cross_check` kind (full runbook), the three worker routes, `CrossCheckRunner` (Codex, plan stage), planning-diff capture, priority, lifecycle and fences, wait-time crediting, `PlanPanel` findings and run-page child link, `uzi run get` findings, `docs/cross-check.md`, `docs/run-activity.md`, `docs/cli.md` then `task docs:sync`, `ARCHITECTURE.md` (autopilot section), an ADR for the server-enforced cross-check seam (adr/2149-cross-check.md), CHANGELOG. Blocked by: M1. Gates: as M1, plus `task scan:secrets` named explicitly with its canaries-detected line in the run evidence (the planning-diff gitleaks fixture is assembled at runtime, `.claude/rules/prds.md`).
+- [ ] **M2 (implementation and docs sync/validation present; hosted acceptance pending): A Claude lead's plan is cross-checked on Codex; an exact-plan pass implements, non-pass normally forces a human gate with available findings, and irrecoverable delivery losses fail.** Spike the read-only broker grant set first. Then the first `cross_checks` writes, the `cross_check` kind (full runbook), the three worker routes, `CrossCheckRunner` (Codex, plan stage), planning-diff capture, priority, lifecycle and fences, wait-time crediting, `PlanPanel` findings and run-page child link, `uzi run get` findings, `docs/cross-check.md`, `docs/run-activity.md`, `docs/cli.md` then `task docs:sync`, `ARCHITECTURE.md` (autopilot section), an ADR for the server-enforced cross-check seam (adr/2149-cross-check.md), CHANGELOG. Blocked by: M1. Gates: as M1, plus `task scan:secrets` named explicitly with its canaries-detected line in the run evidence (the planning-diff gitleaks fixture is assembled at runtime, `.claude/rules/prds.md`).
 
 No `.github/workflows/**` change in implementation or validation.
 
