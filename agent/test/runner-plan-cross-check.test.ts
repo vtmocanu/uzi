@@ -9,7 +9,7 @@ import { MessageBatcher } from "../src/batcher.js";
 import type { PlanCrossCheckCandidate, PlanCrossCheckStateRequest } from "../src/client.js";
 import type { PlanVerdict } from "../src/steering.js";
 import { nullLogger } from "./helpers.js";
-import { api, git, homeDir, installHarness, runner, runnerWith, fakeGitlab,
+import { api, client, git, homeDir, installHarness, runner, runnerWith, fakeGitlab,
   planWithMilestonesThenDoneQuery } from "./runner-harness.js";
 import { freshClaim, gates, holdGateAck, newApi, row, send, routed, statuses, until } from "./gate-revision-harness.js";
 
@@ -329,6 +329,120 @@ describe("U2 real runner checked gate", () => {
     assert.ok(!prompts.slice(1).some((p) => p.includes("local milestone")), "SDK clears local milestone list");
     assert.ok(statuses(c.run_id).includes("completed"));
   });
+});
+
+for (const committed of [false, true])
+it(`checked canonical storage resumes after real switch give-up with ${committed ? "committed held ACK" : "write not committed"}`, { timeout: 10_000 }, async () => {
+  const c = claim();
+  api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "approve", "approve", {
+    candidate: { ...body, plan_md: NORMALIZED, milestones: [], required_capabilities: [], required_tools: [], size_class: "s" },
+  }) });
+  let requested = false;
+  let gaveUp = false;
+  let attempts = 0;
+  let applied = false;
+  let retried = false;
+  let releaseAck!: () => void;
+  const heldAck = new Promise<void>((resolve) => { releaseAck = resolve; });
+  let releaseInitialAck!: () => void;
+  const initialAck = new Promise<void>((resolve) => { releaseInitialAck = resolve; });
+  const canonical = (b: PlanCrossCheckStateRequest) => b.status === "running" && b.candidate_digest === digest;
+  const requests: PlanCrossCheckStateRequest[] = [];
+  const snapshots: string[] = [];
+  const report = client.reportPlanCrossCheckGateState.bind(client);
+  client.reportPlanCrossCheckGateState = async (runId, body, signal) => {
+    if (canonical(body)) { requests.push(body); snapshots.push(JSON.stringify(body)); }
+    const ack = await report(runId, body, signal);
+    if (canonical(body)) {
+      assert.ok(ack.applied && ack.status === "running" && !ack.staleClaim);
+      applied = true;
+    }
+    return ack;
+  };
+  const restore = api.dropStatesWhen(c.run_id, (b) => {
+    if (!canonical(b)) return false;
+    if (!committed && !requested) {
+      requested = true;
+      api.requestCredentialSwitch(c.run_id, 1);
+    }
+    return !committed || requested;
+  });
+  if (committed) api.afterPersistState(c.run_id, (b) => {
+    if (!canonical(b)) return false;
+    requested = true;
+    api.requestCredentialSwitch(c.run_id, 1);
+    return true;
+  }, initialAck);
+  api.onState(c.run_id, (b) => {
+    if (b.status === "credential_switch_failed") {
+      gaveUp = true;
+      releaseInitialAck();
+      assert.equal(applied, false);
+      assert.equal(api.states.filter((s) => s.runId === c.run_id && canonical(s.body)).length, committed ? 1 : 0);
+      restore();
+      api.afterPersistState(c.run_id, (next) => {
+        if (!canonical(next)) return false;
+        retried = true;
+        return true;
+      }, heldAck);
+    }
+  });
+  const prompts: string[] = [];
+  const base = planWithMilestonesThenDoneQuery([{ id: "local", title: "local milestone" }]);
+  let turns = 0;
+  const queryFn: SdkQueryFn = (params) => {
+    if (turns++ > 0) assert.ok(applied, "implementation requires the applied canonical ACK");
+    const original = params.prompt;
+    params.prompt = (async function* () {
+      for await (const frame of original) { prompts.push(JSON.stringify(frame)); yield frame; }
+    })();
+    return base(params);
+  };
+  const sdk = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+  const exec: Executor = { run: async (ctx) => {
+    git.worktreeStatus = async () => ["M src/impl.ts"];
+    git.commitWipMarker = async () => false;
+    const switchAttempt = ctx.attemptCredentialSwitch!;
+    ctx.attemptCredentialSwitch = async () => {
+      if (++attempts > 1) throw new Error("repeated switch without a new request");
+      const outcome = await switchAttempt();
+      assert.equal(outcome, "gave_up");
+      return outcome;
+    };
+    return sdk.run(ctx);
+  } };
+  const forge = fakeGitlab();
+  const run = runner(exec, forge.gitlab, undefined, { planCrossCheckTiming: timing,
+    recoveryRetryMs: 1, planApprovalTimeoutMs: 2000 });
+  const done = run.execute(c);
+  try {
+    assert.ok(await until(() => retried, 3000), `canonical operation must retry after give-up: ${JSON.stringify(api.states)}`);
+    assert.ok(gaveUp);
+    assert.equal(applied, false, "held retry ACK cannot approve");
+    assert.equal(turns, 1, "no implementation before ACK");
+    assert.equal(requests.length, 2, "resume the original operation once");
+    assert.equal(requests[1], requests[0], "same immutable report object");
+    assert.equal(snapshots[1], snapshots[0], "same complete request, generation and session");
+    assert.equal(requests[1]!.plan_md, NORMALIZED);
+    assert.equal(requests[1]!.claim_generation, 1);
+    assert.deepEqual([requests[1]!.milestones, requests[1]!.required_tools, requests[1]!.required_capabilities], [[], [], []]);
+    releaseAck();
+    await done;
+    assert.equal(attempts, 1);
+    assert.equal(api.crossCheckRequests.length, 1);
+    assert.equal(gates(c.run_id).length, 0, "no human publication");
+    assert.ok(!statuses(c.run_id).includes("recovery_wait"));
+    assert.ok(statuses(c.run_id).includes("completed"));
+    assert.ok(prompts.slice(1).some((p) => p.includes("server normalized proposal")));
+    assert.ok(!prompts.slice(1).some((p) => p.includes("local milestone")));
+    assert.equal(api.messages(c.run_id).filter((m) => m.kind === "plan").length, 1, "no second initial plan emission");
+  } finally {
+    releaseInitialAck();
+    releaseAck();
+    run.shutdown();
+    await done;
+    client.reportPlanCrossCheckGateState = report;
+  }
 });
 
 for (const [checked, revised] of [[true, false], [false, false], [true, true]] as const)

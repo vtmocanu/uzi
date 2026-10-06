@@ -9037,6 +9037,7 @@ export class RunRunner {
       this.liveAttempts.add(attempt);
     }
     let checkedHuman: CheckedHumanGate | undefined;
+    let continueCheckedStorage: (() => Promise<PlanVerdict>) | undefined;
     let crossCheckSelected = false;
     // Each strict operation freezes generation/session and the complete request before first send.
     const checkedReports = new WeakMap<StateRequest, PlanCrossCheckStateRequest>();
@@ -9376,6 +9377,24 @@ export class RunRunner {
           checkedFields,
           checkedApproval,
           checkedHuman ? () => steering.lifecycleSignal() : undefined,
+          checkedApproval ? (resume) => {
+            // Keep the canonical operation and its original barrier across a switch give-up.
+            continueCheckedStorage = async () => {
+              try {
+                const approved = await resume();
+                releaseStateBarrier?.();
+                continueCheckedStorage = undefined;
+                flight.ciFixHumanApproved = false;
+                return approved;
+              } catch (error) {
+                if (!(error instanceof CredentialSwitchSignal)) {
+                  continueCheckedStorage = undefined;
+                  failStateBarrier?.(error);
+                }
+                return checkedFailure(error);
+              }
+            };
+          } : undefined,
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
             if (!(error instanceof CredentialSwitchSignal)) failStateBarrier?.(error);
@@ -9383,7 +9402,10 @@ export class RunRunner {
           }
           throw error;
         });
-        if (checkedApproval) releaseStateBarrier?.();
+        if (checkedApproval) {
+          releaseStateBarrier?.();
+          continueCheckedStorage = undefined;
+        }
         // Human-in-the-loop iff the plan reached an approve verdict via the PARK path
         // (not the auto short-circuit). Read by the pre-push guard below.
         flight.ciFixHumanApproved = verdict.kind === "approve" && !effectiveAutoApprove;
@@ -9391,6 +9413,7 @@ export class RunRunner {
       },
       ...(claim.auto_approve && claim.plan_cross_check_required && !seeded ? {
         continueExistingPlanGate: async (otherwise: () => Promise<PlanVerdict>) => {
+          if (continueCheckedStorage) return continueCheckedStorage();
           if (!checkedHuman) return otherwise();
           if (!checkedHuman.continueWait || checkedHuman.phase === "terminal" || checkedHuman.phase === "revisionplanning")
             return checkedFailure(new Error("plan cross-check: existing human wait unavailable"));
@@ -14253,6 +14276,7 @@ export class RunRunner {
     checkedFields?: PlanCrossCheckStateRequest,
     checkedApproval?: Extract<Awaited<ReturnType<typeof checkPlan>>, { kind: "approve" }>["response"],
     ownerSignal?: () => AbortSignal,
+    retainCheckedStorage?: (resume: () => Promise<PlanVerdict>) => void,
   ): Promise<PlanVerdict> {
     // PRD #1795 (decision 6): nothing is confirmed until THIS gate's own applied awaiting_approval
     // ACK says which revision it published, so a verdict bound to an earlier gate cannot act on
@@ -14336,35 +14360,39 @@ export class RunRunner {
       // checkpoint-preservation logic here). A 409 (applied === false) means the run
       // moved on — cancelled/parked concurrently — so the plan was NOT stored; throw
       // here rather than returning an approve verdict. Only a 200 (applied) proceeds.
-      const ack = await reportState(autopilotState);
-      if (!ack.applied || (checkedApproval && (ack.status !== "running" || ack.staleClaim))) {
-        throw new TrustedExecutionRefusal(
-          `autopilot plan not durably stored — the run is ${ack.status ?? "no longer running"}`,
-        );
-      }
-      batcher.emit({
-        kind: "status",
-        agent: "worker",
-        payload: { text: autopilotSelectionText(selection, repoAgents.length, repoAgentFolder) },
-      });
-      runLog.info("plan gate: auto-approved (autopilot)", {
-        run_id: runId,
-        agent_source: selection.source,
-      });
-      // PRD #1416 M5: on an AUTO-APPROVED run the human never sees the status nudge emitted above,
-      // so ALSO arm the M2 worker-authoritative safety steer with a plan-time PREVENTIVE body
-      // (composePlanGateNudge — distinct from composeSafetySteer, which references an already-
-      // rewritten tip H that does not exist yet at plan time). Both executors drain pullSafetySteer
-      // at their loop top, ahead of any follow-up and BEFORE the FIRST buildImplementPrompt, so the
-      // first implement turn is reminded not to rewrite at/below P. NOT armed on the human-gated
-      // branch below (a human sees the plan + the nudge and can revise/reject). The verdict is
-      // UNCHANGED — this arms guidance beside the approve, it does not alter it.
-      if (proposesRewrite) steering.pushSafetySteer(composePlanGateNudge(publishedTip!));
-      if (checkedApproval) return { kind: "approve", approval: "cross_check", selection: { status: "ok", selection },
-        canonical: { plan: checkedApproval.candidate.plan_md,
-          milestones: checkedApproval.candidate.milestones as Milestone[],
-          candidate_digest: checkedApproval.candidate_digest, claimGeneration: checkedApproval.candidate_generation } };
-      return { kind: "approve", selection: { status: "ok", selection } };
+      const completeStorage = async (): Promise<PlanVerdict> => {
+        const ack = await reportState(autopilotState);
+        if (!ack.applied || (checkedApproval && (ack.status !== "running" || ack.staleClaim))) {
+          throw new TrustedExecutionRefusal(
+            `autopilot plan not durably stored — the run is ${ack.status ?? "no longer running"}`,
+          );
+        }
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: autopilotSelectionText(selection, repoAgents.length, repoAgentFolder) },
+        });
+        runLog.info("plan gate: auto-approved (autopilot)", {
+          run_id: runId,
+          agent_source: selection.source,
+        });
+        // PRD #1416 M5: on an AUTO-APPROVED run the human never sees the status nudge emitted above,
+        // so ALSO arm the M2 worker-authoritative safety steer with a plan-time PREVENTIVE body
+        // (composePlanGateNudge — distinct from composeSafetySteer, which references an already-
+        // rewritten tip H that does not exist yet at plan time). Both executors drain pullSafetySteer
+        // at their loop top, ahead of any follow-up and BEFORE the FIRST buildImplementPrompt, so the
+        // first implement turn is reminded not to rewrite at/below P. NOT armed on the human-gated
+        // branch below (a human sees the plan + the nudge and can revise/reject). The verdict is
+        // UNCHANGED — this arms guidance beside the approve, it does not alter it.
+        if (proposesRewrite) steering.pushSafetySteer(composePlanGateNudge(publishedTip!));
+        if (checkedApproval) return { kind: "approve", approval: "cross_check", selection: { status: "ok", selection },
+          canonical: { plan: checkedApproval.candidate.plan_md,
+            milestones: checkedApproval.candidate.milestones as Milestone[],
+            candidate_digest: checkedApproval.candidate_digest, claimGeneration: checkedApproval.candidate_generation } };
+        return { kind: "approve", selection: { status: "ok", selection } };
+      };
+      if (checkedApproval) retainCheckedStorage?.(completeStorage);
+      return completeStorage();
     }
 
     if (crossCheckReason) {
