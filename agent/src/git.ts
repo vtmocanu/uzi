@@ -7785,10 +7785,12 @@ export class GitCache {
     if (observed.sha) divergence = observed.owner?.runId === c.runId
       ? await this.ancestry(barePath, observed.sha, incoming) : "foreign";
     try {
-      if (observed.sha && observed.owner?.runId === c.runId &&
-          !(await this.remotelyCovers(barePath, observed.sha, opts.remotelyConfirmedSha))) {
+      if (observed.sha && observed.owner &&
+          (observed.owner.runId !== c.runId ||
+            !(await this.remotelyCovers(barePath, observed.sha, opts.remotelyConfirmedSha)))) {
+        // Only this run's confirmation can discharge its own debt.
         await this.pinOwedUnderLock(await this.producingContext(barePath, branch, observed.owner), observed.sha);
-        retainedShas.push(observed.sha);
+        if (observed.owner.runId === c.runId) retainedShas.push(observed.sha);
       }
       await this.persistOwedContext(c);
       if (!(await this.remotelyCovers(barePath, incoming, opts.remotelyConfirmedSha))) {

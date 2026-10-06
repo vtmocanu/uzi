@@ -337,6 +337,64 @@ describe("issue1924 M2 owed candidates", () => {
     assert.equal(tip(), h);
   });
 
+  for (const provenance of ["historical", "receipt"] as const) {
+    it(`foreign ${provenance} sole anchor survives promotion and GC under its producing owner`, async () => {
+      const foreignRun = "foreign-run";
+      const h = root("foreign H");
+      if (provenance === "historical") {
+        gitIn(bare, ["-c", "protocol.file.allow=user", "fetch", "--no-tags", "--no-write-fetch-head",
+          `file://${clone}`, `refs/heads/${BRANCH}:refs/uzi-runner/${BRANCH}`]);
+        gitIn(bare, ["config", "--local", `uzi-trackowner.${BRANCH}.owner`, foreignRun]);
+      } else {
+        opts.context = { ...positiveContext(), runId: foreignRun, generation: 4 };
+        updated(await fetch());
+        await cache.reconcileOwedCandidates(bare, foreignRun, h);
+      }
+      assert.deepEqual(await cache.enumerateOwedCandidates(bare, foreignRun), []);
+      opts.context = { ...positiveContext(), runId: RUN, generation: 8 };
+      // The incoming run's confirmation cannot discharge a foreign owner's debt.
+      opts.remotelyConfirmedSha = h;
+      const h2 = root("unrelated current H2");
+      const result = updated(await fetch());
+      assert.equal(result.divergence, "foreign");
+      assert.deepEqual(result.retainedShas, [h2]);
+      assert.deepEqual(await pins(), [h2]);
+      assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-owed/${foreignRun}/${h}`]), h);
+      gitIn(bare, ["reflog", "expire", "--expire=now", "--all"]);
+      gitIn(bare, ["gc", "--prune=now"]);
+      assert.equal(gitIn(bare, ["cat-file", "-t", h]), "commit");
+      cache = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+      const discovery = await cache.discoverOwedCandidates();
+      const original = discovery.find((entry) => entry.context.runId === foreignRun)!;
+      assert.ok(original.candidates.some((candidate) => candidate.sha === h));
+      assert.equal(original.context.generation, provenance === "historical" ? null : 4);
+      if (provenance === "historical") {
+        assert.deepEqual(original.context, { barePath: bare, branch: BRANCH, runId: foreignRun,
+          generation: null, kind: null, defaultIdentity: null, origin: "historical", producer: "unknown" });
+      }
+    });
+  }
+
+  for (const failure of ["metadata", "pin"] as const) {
+    it(`foreign ${failure} preservation failure keeps the old anchor and stamp`, async () => {
+      const h = root("foreign old H");
+      gitIn(bare, ["-c", "protocol.file.allow=user", "fetch", "--no-tags", "--no-write-fetch-head",
+        `file://${clone}`, `refs/heads/${BRANCH}:refs/uzi-runner/${BRANCH}`]);
+      gitIn(bare, ["config", "--local", `uzi-trackowner.${BRANCH}.owner`, "foreign-run"]);
+      const configBefore = fs.readFileSync(path.join(bare, "config"), "utf8");
+      root("current H2");
+      const restore = failure === "metadata"
+        ? faultDisk((name, value) => name.startsWith("context-") && (value as { runId?: string }).runId === "foreign-run")
+        : faultGit((args) => args.includes("update-ref") && args.includes(`refs/uzi-owed/foreign-run/${h}`));
+      try {
+        assert.deepEqual(await fetch(), { kind: "not_updated", reason: "preservation_failed" });
+      } finally { restore(); }
+      assert.equal(tip(), h);
+      assert.equal(stamp(), "foreign-run");
+      assert.equal(fs.readFileSync(path.join(bare, "config"), "utf8"), configBefore);
+    });
+  }
+
   it("positively proved foreign ownership is distinct and never pinned as the current run", async () => {
     const foreign = root("foreign");
     opts.context = { ...opts.context, runId: "foreign-run" };

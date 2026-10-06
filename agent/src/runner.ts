@@ -12977,16 +12977,10 @@ export class RunRunner {
     // that CONTINUES after a pause_failed (Decision 8) restarts its interrupted step on a fresh
     // agent process, so the reap costs it only background processes the agent must restart.
     //
-    // The fetch-back is GATED on the clone carrying NEW work this cycle (its tip moved beyond the
-    // reseed base, including a marker just made). When the clone is still AT its base — a `now` pause
-    // before any commit, or a resume with no new work — it is DELIBERATELY skipped: an unconditional
-    // fetch-back would create a spurious base tracking ref, and the broker would then publish a
-    // base-only checkpoint (published:true) and PARK an empty pause, violating Decision 8. Skipping
-    // it leaves the ref exactly as the reseed did (absent on a fresh run → no owned checkpoint →
-    // pause_failed; the recovered tracking tip on a resume → re-published as before), i.e. today's
-    // behaviour. This is NOT the rejected base-tip SHORTCUT (which would SKIP the publish and CLAIM
-    // durability, unsafe on the seededFrom:"tracking" leg): the publish below always runs; only the
-    // redundant fetch-back is skipped when there is nothing new to move.
+    // Fetch new work, or a trusted tracking/checkpoint base recovered on resume. An unchanged
+    // recovered head still needs a committed receipt for this claim's generation before publish.
+    // Skip an unchanged origin/default base: fetching it would create a base-only tracking ref
+    // and let an empty first-turn pause park. The publish below still requires remote confirmation.
     let markerCreated = false;
     // PRD #1809 D8: whether the tracking ref the publish packs holds the clone's HEAD (read before
     // the bridge below, which may move the ref to a bridge commit carrying the same tree). Unknown
@@ -13013,7 +13007,8 @@ export class RunRunner {
         .branchTip(runnerClone.path, branch)
         .catch(() => null);
       let fetched: FetchBackOutcome = { kind: "updated" }; // ownership is checked even without a fetch
-      if (preTip !== null && preTip !== runnerClone.baseCommit) {
+      if (preTip !== null && (preTip !== runnerClone.baseCommit ||
+          runnerClone.seededFrom === "tracking" || runnerClone.seededFrom === "checkpoint")) {
         fetched = await this.fetchBackBestEffort(
           barePath,
           runnerClone.path,
