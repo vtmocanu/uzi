@@ -85,6 +85,11 @@ function definition(name: string): Omit<CodexDynamicToolSpec, "type" | "name"> {
           anyOf: [{ required: ["subagent_type"] }, { required: ["role"] }, { required: ["agent_type"] }],
         },
       };
+    case "save_draft_plan":
+      return {
+        description: "Lead only: request draft Markdown capture and keep working. This is not submission or approval.",
+        inputSchema: objectSchema({ plan_md: { type: "string", minLength: 1, maxLength: 65_536 } }, ["plan_md"], false),
+      };
     case "submit_plan":
       return {
         description: "Submit the implementation plan for the worker's approval gate.",

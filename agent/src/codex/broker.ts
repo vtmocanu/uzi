@@ -41,6 +41,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 
 import { screenBashCommand, screenToolPath } from "../guardrails.js";
+import { parseDraftPlan } from "../draft-plan.js";
 import { SIGNAL_SERVER_NAME, scanSignals } from "../signals.js";
 import type { ExecutionRegistry } from "./registry.js";
 
@@ -112,10 +113,11 @@ export function codexDynamicToolWireName(canonical: string): string | undefined 
   return CODEX_DYNAMIC_WIRE_NAMES.get(canonical) ?? canonical;
 }
 
-// The five workflow signalling tools (agent/src/signals.ts:28-32). Bare names; the
+// The workflow signalling tools from signals.ts. Bare names; the
 // `mcp__uzi__<name>` qualified forms normalize to these. scanSignals remains the
 // authoritative parser — this set is only for recognition/routing.
 export const CODEX_SIGNAL_TOOLS: ReadonlySet<string> = new Set([
+  "save_draft_plan",
   "submit_plan",
   "signal_done",
   "ask_user",
@@ -559,6 +561,11 @@ export class CodexCallbackBroker {
 
     // 2. Admission. The fingerprint binds (name + canonical args + origin); the same
     // tuple with a DIFFERENT fingerprint is a replay/forgery the registry poisons on.
+    if (canonicalizeCodexToolName(toolName) === "save_draft_plan") {
+      const plan_md = parseDraftPlan(args);
+      if (plan_md === undefined) return deny("invalid_signal", "draft Markdown must be nonblank and within the capture limits");
+      args = { plan_md };
+    }
     const fingerprint = this.fingerprint(toolName, args, org);
     const admission = this.registry.reserveCallback({
       threadId: rt.threadId,

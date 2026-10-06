@@ -172,6 +172,12 @@ export class RunTurnReducerImpl implements RunTurnReducer {
    *  questions keep the first 10 per turn; progress is last-wins AND delivered immediately via the
    *  reduction so the owner reports it off the hot stream without awaiting. */
   private foldSignals(s: Readonly<Partial<TurnSignals>>, reduction: TurnReduction): void {
+    for (const plan_md of s.draftPlans ?? []) {
+      reduction.messages.push({ kind: "status", agent: "lead", payload: {
+        event: "draft_plan_capture", version: 1,
+        label: "draft, unapproved, possibly incomplete", plan_md, truncated: false,
+      } });
+    }
     if (s.plan !== undefined) this.result.plan = s.plan;
     // Last-wins across the two exclusive shapes of a submit_plan milestone list (issue #1626):
     // the latest submit_plan's valid list, or its rejected (malformed or partly-malformed) one,

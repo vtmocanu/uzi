@@ -58,6 +58,7 @@
 
 import { renderCodexRun } from "./render.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
+import { DRAFT_PLAN_ACK } from "../draft-plan.js";
 import { CODEX_DELEGATE_TOOLS, CODEX_SIGNAL_TOOLS, canonicalizeCodexToolName } from "./broker.js";
 import {
   CodexTurnFailedError,
@@ -1514,7 +1515,9 @@ export class CodexHarness implements RunHarness {
       } catch {
         /* projection is best-effort (issue #1583): it never blocks the reply */
       }
-      this.safeRespond(transport, requestId, result);
+      const reply = canonical === "save_draft_plan" && result.ok
+        ? { ok: true as const, output: DRAFT_PLAN_ACK } : result;
+      this.safeRespond(transport, requestId, reply);
       return result;
     };
     const toolName = asString(p.tool);

@@ -5,6 +5,7 @@ import type { EmittedMessage } from "./executor.js";
 import type { Outbox } from "./outbox.js";
 import type { OutgoingMessage } from "./protocol.js";
 import type { PayloadRedactor, TextRedactor } from "./redact.js";
+import { clampUtf8Bytes } from "./decisions-memo.js";
 import { emptyCounts, countsTotal, sanitizePayload, sanitizeText } from "./sanitize.js";
 import { UsageRecorder } from "./usage-recorder.js";
 import { errMessage, sleep } from "./util.js";
@@ -385,6 +386,13 @@ export class MessageBatcher {
       kind: this.redactText(sanitizeText(msg.kind, counts)) as OutgoingMessage["kind"],
       payload: this.redact(sanitized),
     };
+    // Clamp only after whole-input sanitation and redaction, so a secret crossing
+    // the cutoff is matched in full. Classification uses the worker-authored event.
+    if (msg.kind === "status" && msg.payload["event"] === "draft_plan_capture" && typeof out.payload["plan_md"] === "string") {
+      const full = out.payload["plan_md"];
+      out.payload["plan_md"] = clampUtf8Bytes(full, 32_768);
+      out.payload["truncated"] = out.payload["plan_md"] !== full;
+    }
     if (msg.agent !== undefined) out.agent = this.redactText(sanitizeText(msg.agent, counts));
     // PRD #99: copied the same way as `agent` — present only when the frame had
     // them, so the API's pgText("") maps absence to SQL NULL rather than "".

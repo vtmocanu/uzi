@@ -142,6 +142,7 @@ export interface HarnessAttribution {
 }
 
 export type HarnessSignalName =
+  | "save_draft_plan"
   | "submit_plan"
   | "signal_done"
   | "ask_user"
@@ -495,6 +496,7 @@ export interface CodexExecutionSafety {
 // This facade is owned by uzi, so the adapter does not gain git/workflow policy.
 
 export interface TurnSignals {
+  draftPlans?: string[];
   plan?: string;
   done: boolean;
   prdDonePath?: string;
