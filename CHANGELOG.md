@@ -46,6 +46,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Recorded finding-group settlement errors no longer stop issue sync ([#1946](https://github.com/vtmocanu/uzi/issues/1946)).**
+  Board refresh and polling continue updating the issue cache when a recorded finding group cannot settle. The failed group stays claimed, is logged for diagnosis, and is retried on a later pass while other recorded groups on the page still settle.
+
 - **Plan cross-check preserves worker custody during planning ([#2149](https://github.com/vtmocanu/uzi/issues/2149)).**
   Confined planning captures read the immutable baseline without granting writes, and queued transport waits can be cancelled without discarding assigned records. Cross-check migrations now follow the current default schema while retaining worker maintenance and Docker preferences.
 
