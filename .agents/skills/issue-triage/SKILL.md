@@ -13,6 +13,8 @@ Sanitize forge text before printing it with the shared uzi-lander renderer below
 
 Area and priority labels, their rubric, and the labels that must never be renamed: [references/taxonomy.md](references/taxonomy.md). Read it before proposing labels.
 
+Open each issue you present to the maintainer in their browser when you first name it (pick, candidate, predicted sweep pick, or an issue cited as related or fixed): `gh issue view NNN --repo vtmocanu/uzi --web`. Do not reopen one already opened this session.
+
 Out of scope, read instead:
 - Sweep gating and this instance's schedules: `CLAUDE.local.md` → "uzi scheduled jobs", `docs/scheduling.md`, `docs/admin-settings.md#run-eligibility`. Live truth: `uzi schedule list`.
 - Dispatching and plan steering: **uzi-watcher**. Landing the PR: **uzi-lander**.
