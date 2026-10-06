@@ -454,7 +454,7 @@ void _buildInfoFull;
   const _scheduleInputZero: ZeroOf<
     Omit<
       ScheduleInput,
-      "labels" | "auto_approve" | "wait_on_limit" | "enabled" | "override_subagent_model" | "sibling_group_id"
+      "labels" | "auto_approve" | "wait_on_limit" | "enabled" | "override_subagent_model" | "sibling_group_id" | "capacity_limit" | "capacity_room_needed"
     >
   > = scheduleInputZero;
   const _scheduleInputFull: Widen<ScheduleInput> = scheduleInputFull;

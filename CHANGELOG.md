@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **Capacity gates for scheduled sweeps**
+  Recurring label sweeps can wait for room in the owner’s unfinished work and send batches within the available room, with API and CLI controls and recorded capacity outcomes.
+
 - **Advisory draft plans in run activity ([#2323](https://github.com/vtmocanu/uzi/issues/2323)).**
   The latest valid explicit draft capture appears as Markdown in both activity views, labelled draft, unapproved, possibly incomplete, with a truncation notice when needed; earlier captures remain stored and submitted-plan approval stays separate.
 

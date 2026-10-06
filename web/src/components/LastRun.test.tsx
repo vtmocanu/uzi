@@ -35,6 +35,8 @@ function sched(over: Partial<Schedule> = {}): Schedule {
     last_fire: null,
     auto_approve: true,
     wait_on_limit: true,
+    capacity_limit: null,
+    capacity_room_needed: null,
     max_issues: 3,
     guidance: null,
     baked_guidance: null,

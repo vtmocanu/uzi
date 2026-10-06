@@ -673,3 +673,29 @@ and already-bound runs are unchanged.
   workers comes online while the throwaway one is still cold-starting, it
   can claim the run first. That's harmless — the now-idle throwaway worker
   gets cleaned up shortly after.
+
+## When to send issues
+
+Recurring label-selected sweeps can use an optional capacity gate. Set a limit on
+unfinished runs and the room needed before sending another batch. Multiple selector
+labels are supported; an empty custom selector still uses the configured uzi label.
+Assigned sweeps, one-time schedules and other targets do not support this gate.
+
+The gate counts your unfinished work across all repos and origins, including job
+runs and queued, waiting and parked runs. Chat and judge runs and terminal runs are
+excluded. Room is the limit minus this count, clamped to zero. When room is below
+the required threshold, the fire records “Waiting for room”, starts nothing and
+advances to its next recurring check without contacting the forge. Otherwise it
+sends up to the smaller of room and **issues to send at a time** (the existing
+`max_issues` setting); an unlimited batch is still bounded by room.
+
+This is an advisory snapshot: other schedules or manual starts can exceed the
+limit. Run now uses the same check, including when a schedule is paused, and does
+not replace its recorded last fire. An automatic fire respects pause-all first.
+
+Use `uzi schedule create --sweep --capacity-limit 4 --room-needed 2` with the usual
+repo and recurring timing flags. Edit accepts the same paired flags, or
+`--clear-capacity` to turn the gate off. Unrelated edits preserve it. API PATCH
+may change one integer using the stored other value; clearing requires both
+`capacity_limit` and `capacity_room_needed` explicitly set to null. Resetting a
+default turns its gate off; clone and Add repo copy it.

@@ -1105,6 +1105,8 @@ type RunSchedule struct {
 	Harness                    pgtype.Text        `json:"harness"`
 	CredentialOverrideMode     pgtype.Text        `json:"credential_override_mode"`
 	CredentialOverrideSecretID pgtype.UUID        `json:"credential_override_secret_id"`
+	CapacityLimit              pgtype.Int4        `json:"capacity_limit"`
+	CapacityRoomNeeded         pgtype.Int4        `json:"capacity_room_needed"`
 }
 
 type RunUsage struct {

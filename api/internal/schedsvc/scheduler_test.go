@@ -25,7 +25,10 @@ import (
 // ── Fakes ────────────────────────────────────────────────────────────────────
 
 type fakeStore struct {
-	due []store.RunSchedule
+	inFlight      int64
+	inFlightErr   error
+	capacityCalls int
+	due           []store.RunSchedule
 
 	advanceCalls []store.AdvanceScheduleParams
 	statusCalls  []store.SetRunScheduleStatusParams
@@ -4187,4 +4190,9 @@ func TestTickSelfImproveCapForgeErrorRetriesTransiently(t *testing.T) {
 	if len(h2.st.statusCalls) != 0 {
 		t.Fatalf("transient cap error must NOT park: statusCalls = %+v", h2.st.statusCalls)
 	}
+}
+
+func (s *fakeStore) CountInProgressRunsForUser(context.Context, uuid.UUID) (int64, error) {
+	s.capacityCalls++
+	return s.inFlight, s.inFlightErr
 }

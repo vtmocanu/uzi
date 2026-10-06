@@ -246,6 +246,9 @@ func buildScheduleRequest(cmd *cobra.Command, c uzicli.Client) (apitypes.Schedul
 	if hpresent {
 		req.Harness = harness
 	}
+	if _, err := applyScheduleCapacityFlags(cmd, &req); err != nil {
+		return apitypes.ScheduleRequest{}, nil, err
+	}
 	return req, repos, nil
 }
 
@@ -479,6 +482,11 @@ func buildScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apitypes.Sc
 		req.Harness = harness
 		changed = true
 	}
+	capacityChanged, capacityErr := applyScheduleCapacityFlags(cmd, &req)
+	if capacityErr != nil {
+		return apitypes.ScheduleRequest{}, capacityErr
+	}
+	changed = changed || capacityChanged
 	if !changed {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "nothing to edit (pass at least one field to change)")
 	}
@@ -699,9 +707,43 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apit
 		req.Harness = harness
 		changed = true
 	}
+	capacityChanged, capacityErr := applyScheduleCapacityFlags(cmd, &req)
+	if capacityErr != nil {
+		return apitypes.ScheduleRequest{}, capacityErr
+	}
+	changed = changed || capacityChanged
 	if !changed {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage,
 			"nothing to edit (pass at least one editable field: --cron, --tz, --auto-approve, --wait-on-limit, --mr-rework, --max-issues, --guidance, --model, --output, --apply-model-to-agents, --token, --harness)")
 	}
 	return req, nil
+}
+
+// applyScheduleCapacityFlags sends the pair only when explicitly edited.
+func applyScheduleCapacityFlags(cmd *cobra.Command, req *apitypes.ScheduleRequest) (bool, error) {
+	f := cmd.Flags()
+	a, b := f.Changed("capacity-limit"), f.Changed("room-needed")
+	clear := false
+	if f.Lookup("clear-capacity") != nil {
+		clear, _ = f.GetBool("clear-capacity")
+	}
+	if a != b || (clear && (a || b)) {
+		return false, uzicli.Exitf(uzicli.ExitUsage, "pass --capacity-limit and --room-needed together, or --clear-capacity alone")
+	}
+	if clear {
+		req.CapacityLimit = apitypes.OptionalInteger{Present: true}
+		req.CapacityRoomNeeded = apitypes.OptionalInteger{Present: true}
+		return true, nil
+	}
+	if !a {
+		return false, nil
+	}
+	c, _ := f.GetInt("capacity-limit")
+	k, _ := f.GetInt("room-needed")
+	if k < 1 || c < k || c > 50 {
+		return false, uzicli.Exitf(uzicli.ExitUsage, "capacity must satisfy 1 <= room-needed <= capacity-limit <= 50")
+	}
+	req.CapacityLimit = apitypes.OptionalInteger{Present: true, Value: &c}
+	req.CapacityRoomNeeded = apitypes.OptionalInteger{Present: true, Value: &k}
+	return true, nil
 }

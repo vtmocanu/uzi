@@ -137,6 +137,14 @@ func (h *Handler) scheduleDTO(s store.RunSchedule, repoPath string) apitypes.Sch
 		t := s.LastFiredAt.Time
 		dto.LastFiredAt = &t
 	}
+	if s.CapacityLimit.Valid {
+		v := int(s.CapacityLimit.Int32)
+		dto.CapacityLimit = &v
+	}
+	if s.CapacityRoomNeeded.Valid {
+		v := int(s.CapacityRoomNeeded.Int32)
+		dto.CapacityRoomNeeded = &v
+	}
 	if s.MaxIssues.Valid {
 		v := int(s.MaxIssues.Int32)
 		dto.MaxIssues = &v

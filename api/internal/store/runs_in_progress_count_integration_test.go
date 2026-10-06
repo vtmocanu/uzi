@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -16,12 +17,9 @@ import (
 // (Decision 1), of the kinds the /runs page lists (Decision 4 — chat and judge
 // excluded), and nobody else's.
 //
-// The fixture spans every run status — the six non-terminal ones (queued, claimed,
-// running, awaiting_approval, awaiting_input, limit_wait) and all three terminal ones
-// (completed, failed, cancelled) — plus a non-terminal chat run and a non-terminal
-// judge run (both must be excluded by kind), plus a second user's non-terminal run
-// (must be excluded by owner scope). The expected count is therefore the six
-// non-terminal issue runs, and nothing else.
+// The fixture spans eight non-terminal statuses and all three terminal statuses,
+// chat and judge exclusions, owner scope, sibling repos, unfinished jobs and
+// all dispatch origins. Exactly twenty-three runs must count.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; the e2e runner
 // (e2e/run-store-it.sh) provides one. `go test ./...` without it SKIPs.
@@ -70,9 +68,9 @@ func TestCountInProgressRunsForUserLiveDB(t *testing.T) {
 		return id
 	}
 
-	// The six NON-TERMINAL statuses — every one must count.
+	// The eight NON-TERMINAL statuses — every one must count.
 	var iid int64
-	nonTerminal := []string{"queued", "claimed", "running", "awaiting_approval", "awaiting_input", "limit_wait"}
+	nonTerminal := []string{"queued", "claimed", "running", "awaiting_approval", "awaiting_input", "limit_wait", "paused", "pool_wait"}
 	for _, st := range nonTerminal {
 		iid++
 		issueRun(userID, iid, st)
@@ -100,13 +98,37 @@ func TestCountInProgressRunsForUserLiveDB(t *testing.T) {
 	// the repo but not the user, so only the user_id filter keeps it out of the count.
 	issueRun(otherID, 999, "running")
 
-	// Expect exactly the six non-terminal issue runs for userID.
+	// Owner work on a sibling repo and every dispatch origin must also count.
+	sibling := uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO repos (id,connection_id,forge_project_id,path_with_namespace,web_url,default_branch,enabled)
+ VALUES ($1,$2,2,'g/sibling','https://forge.e2e/g/sibling','main',true)`, sibling, connID)
+	sc, err := q.CreateRunSchedule(ctx, store.CreateRunScheduleParams{UserID: userID, RepoID: sibling, Target: "sweep", Timing: "recurring", CronExpr: pgtype.Text{String: "0 * * * *", Valid: true}, Timezone: "UTC"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, origin := range []string{"manual", "autopilot", "schedule", "self_improve", "ci_fix", "mr_rework", "chat", "task", "task_review", "then_fix", "judge", "judge_rerun", "resume"} {
+		var schedule any
+		var column any
+		if origin == "schedule" {
+			schedule = sc.ID
+		}
+		if origin == "autopilot" {
+			column = "PRD"
+		}
+		mustExec(ctx, t, pool, `INSERT INTO runs (user_id,repo_id,issue_iid,kind,status,issue_title,issue_description,schedule_id,origin_column,trigger_source)
+  VALUES ($1,$2,$3,'issue','queued','origin','d',$4,$5,$6)`, userID, sibling, 200+i, schedule, column, origin)
+	}
+	for _, st := range []string{"queued", "running", "completed", "failed", "cancelled"} {
+		mustExec(ctx, t, pool, `INSERT INTO runs (user_id,kind,job_type,status,issue_title,issue_description)
+  VALUES ($1,'job','research',$2,'job','d')`, userID, st)
+	}
+	// Eight issue statuses, thirteen origins and two unfinished jobs.
 	got, err := q.CountInProgressRunsForUser(ctx, userID)
 	if err != nil {
 		t.Fatalf("CountInProgressRunsForUser: %v", err)
 	}
-	if want := int64(len(nonTerminal)); got != want {
-		t.Fatalf("CountInProgressRunsForUser = %d, want %d (the six non-terminal issue runs; "+
+	if want := int64(23); got != want {
+		t.Fatalf("CountInProgressRunsForUser = %d, want %d (eight issue statuses, thirteen origins, two unfinished jobs; "+
 			"terminal, chat, judge, and the other user's run must all be excluded)", got, want)
 	}
 

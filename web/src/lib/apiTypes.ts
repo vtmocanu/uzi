@@ -1853,6 +1853,7 @@ export type ScheduleStatus = "active" | "fired" | "error";
 // The authoritative source is Go's schedsvc.SkipReason; scheduleSkipReasons.test.ts is a
 // cross-language drift guard that reddens if Go gains a reason this union lacks.
 export type ScheduleSkipReason =
+  | "config_not_supported"
   | "not_eligible"
   | "already_running"
   | "description_too_large"
@@ -1888,7 +1889,16 @@ export interface LastFireSkip {
 
 // The structured summary of a schedule's most recent persisted fire (PRD #308). matched
 // == started.length + skips.length balances.
+export interface ScheduleCapacityCheck {
+ in_flight: number;
+ limit: number;
+ room_needed: number;
+ room: number;
+ blocked: boolean;
+}
+
 export interface LastFire {
+ capacity?: ScheduleCapacityCheck;
   fired_at: string;
   matched: number;
   capped: boolean;
@@ -1904,6 +1914,7 @@ export interface LastFire {
 // back-compat and derivable from started; matched/capped/started/skips carry the full
 // per-candidate outcome.
 export type RunNowResponse = {
+ capacity?: ScheduleCapacityCheck;
   created: number;
   run_ids: string[];
   matched: number;
@@ -1915,6 +1926,8 @@ export type RunNowResponse = {
 };
 
 export interface Schedule {
+ capacity_limit: number | null;
+ capacity_room_needed: number | null;
   id: string;
   repo_id: string;
   // Best-effort display path ("vtmocanu/uzi"); "" when the repo can no longer be
@@ -2083,6 +2096,8 @@ export interface ScheduleCatalog {
 // wait_on_limit=true, enabled=true). On PATCH a field present is applied and an
 // absent one is left unchanged, so a per-row enable toggle sends just { enabled }.
 export interface ScheduleInput {
+ capacity_limit?: number | null;
+ capacity_room_needed?: number | null;
   target?: ScheduleTarget;
   issue_iid?: number | null;
   labels?: string[];

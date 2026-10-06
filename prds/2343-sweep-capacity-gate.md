@@ -1,6 +1,13 @@
 # PRD #2343: "When to send issues" capacity gate for label sweeps
 
-**Status**: Draft
+**Status**: In progress — M1 implemented; M2 pending
+
+## Implementation progress
+
+- [x] Capacity storage, scheduler admission, API/PATCH/default/reset/copy behavior, and optional fire outcomes.
+- [x] CLI flags and capacity rendering, synchronized client contracts, and scheduling documentation.
+- [x] Focused capacity tests executed against throwaway PostgreSQL; four mutation probes detected the intended defects and the restored control passed.
+- [ ] Web controls, capacity summaries, mock behavior, and visual parity evidence (M2).
 **Issue**: [#2343](https://github.com/vtmocanu/uzi/issues/2343) (part of umbrella #2342; followed by #2344)
 **Priority**: Medium
 **Design mock**: `prds/mockups/2342-capacity-gated-sweeps-mock.html` (shared with #2344; open it in a browser). This PRD implements the gate parts of frames 1 and 2; the removal toggle, label-removal last-fire states, the minutes cadence and frame 3 belong to #2344. The preview strip in frame 1 is a mock-only aid.
