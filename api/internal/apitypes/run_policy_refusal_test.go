@@ -11,8 +11,8 @@ func TestRunDTOProviderPolicyRefusalPassThrough(t *testing.T) {
 	if err := json.Unmarshal([]byte(wire), &run); err != nil {
 		t.Fatal(err)
 	}
-	// Compile-time assignment pins FailOrigin to the existing open string surface.
-	var origin *string = run.FailOrigin
+	// The existing string field passes the new origin through.
+	origin := run.FailOrigin
 	if origin == nil || *origin != "provider_policy_refusal" {
 		t.Fatalf("fail_origin = %v, want provider_policy_refusal", origin)
 	}
@@ -47,7 +47,7 @@ func TestMessageDTOProviderPolicyRefusalPassThrough(t *testing.T) {
 					t.Fatal(err)
 				}
 				// The payload stays raw JSON; this consumer does not validate worker metadata.
-				var raw json.RawMessage = message.Payload
+				raw := message.Payload
 				if string(raw) != payload {
 					t.Fatalf("decoded payload = %s, want %s", raw, payload)
 				}
