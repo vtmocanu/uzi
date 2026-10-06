@@ -58,8 +58,8 @@ func TestPlanCrossCheckDefaultBranchUpgradeLiveDB(t *testing.T) {
 	}
 	u.Path = "/" + name
 	upgradeDSN := u.String()
-	if err := store.MigrateTo(ctx, upgradeDSN, 296); err != nil {
-		t.Fatalf("MigrateTo(296): %v", err)
+	if err := store.MigrateTo(ctx, upgradeDSN, 298); err != nil {
+		t.Fatalf("MigrateTo(298): %v", err)
 	}
 	pool, err = store.OpenPool(ctx, upgradeDSN)
 	if err != nil {
@@ -75,7 +75,7 @@ func TestPlanCrossCheckDefaultBranchUpgradeLiveDB(t *testing.T) {
 			t.Fatalf("%s: assertion false", label)
 		}
 	}
-	assertSQL("default version", "SELECT max(version_id) = 296 FROM goose_db_version WHERE is_applied")
+	assertSQL("default version", "SELECT max(version_id) = 298 FROM goose_db_version WHERE is_applied")
 	assertSQL("cross-check table absent", "SELECT to_regclass('public.cross_checks') IS NULL")
 	assertSQL("cross-check function absent", "SELECT to_regprocedure('settle_exited_plan_cross_check()') IS NULL")
 	assertSQL("cross-check columns absent", `SELECT NOT EXISTS (
@@ -88,7 +88,7 @@ func TestPlanCrossCheckDefaultBranchUpgradeLiveDB(t *testing.T) {
 		AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recovery_custody_holds' AND column_name='terminal_record_rejection')
 		AND to_regprocedure('fn_ephemeral_docker_preference_applies(boolean,boolean,uuid,text,uuid,uuid[])') IS NOT NULL
 		AND EXISTS (SELECT 1 FROM pg_constraint WHERE conname='recovery_custody_holds_terminal_record_rejection_check')`
-	assertSQL("default features at 296", defaultFeatures)
+	assertSQL("default features at 298", defaultFeatures)
 
 	user, connection, repo, worker, lead, hold := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	mustExec(ctx, t, pool, `INSERT INTO users(id,email,password_hash,ephemeral_docker_enabled)
@@ -104,10 +104,10 @@ func TestPlanCrossCheckDefaultBranchUpgradeLiveDB(t *testing.T) {
 	mustExec(ctx, t, pool, `INSERT INTO recovery_custody_holds(id,user_id,repo_id,run_id,generation,state,
 		original_worker_id,original_worker_identity,live_worker_id,live_run_id,terminal_record_rejection)
 		VALUES($1,$2,$3,$4,1,'open',$5,$6,$5,$4,'mac_failure')`, hold, user, repo, lead, worker, worker.String())
-	if err := store.MigrateTo(ctx, upgradeDSN, 300); err != nil {
-		t.Fatalf("MigrateTo(300): %v", err)
+	if err := store.MigrateTo(ctx, upgradeDSN, 302); err != nil {
+		t.Fatalf("MigrateTo(302): %v", err)
 	}
-	assertSQL("upgraded version", "SELECT max(version_id) = 300 FROM goose_db_version WHERE is_applied")
+	assertSQL("upgraded version", "SELECT max(version_id) = 302 FROM goose_db_version WHERE is_applied")
 	assertSQL("default features after upgrade", defaultFeatures)
 	assertSQL("default data preserved", `SELECT u.ephemeral_docker_enabled AND NOT u.plan_cross_check_enabled
 		AND w.dind_meter_epoch=7 AND w.maintenance_phase='requested' AND w.maintenance_fenced
