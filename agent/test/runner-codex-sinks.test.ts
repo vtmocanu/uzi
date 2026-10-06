@@ -1879,6 +1879,67 @@ function assertCaptured(iid: number): void {
   assert.equal(trackedFile(iid, "DIRTY.txt"), "uncommitted edit\n", "the uncommitted edit is in the tracking ref (WIP commit)");
 }
 
+describe("RunRunner milestone2 — pre-settle reap diagnostics", () => {
+  const secret = "glpat-" + "milestone2fixture1234";
+  const cases: Array<{ label: string; error: () => Error; diagnostic?: string }> = [
+    {
+      label: "real boundary diagnostic is redacted",
+      error: () => new CodexBoundaryError("quiesce", [
+        { category: "protocol", message: `unsettled provider work token=${secret}` },
+      ]),
+      diagnostic: "codex boundary failed at quiesce: unsettled provider work token=***REDACTED***",
+    },
+    ...[
+      ["absent", undefined],
+      ["non-string", 42],
+      ["oversize", "x".repeat(501)],
+      ["control character", "forged\nline"],
+      ["format character", "forged\u202eline"],
+    ].map(([label, diagnostic]) => ({
+      label: `${label} diagnostic falls back to the error`,
+      error: () => Object.assign(new Error("codex boundary failed at quiesce"), {
+        name: "CodexBoundaryError",
+        ...(diagnostic === undefined ? {} : { diagnostic }),
+      }),
+    })),
+  ];
+
+  for (const c of cases) {
+    it(c.label, async () => {
+      const { gitlab } = fakeGitlab();
+      const rig = codexRig();
+      const originalWithBoundary = rig.safety.withBoundary.bind(rig.safety);
+      rig.safety.withBoundary = async (request, action) => {
+        if (request.boundary === "terminal") throw c.error();
+        return originalWithBoundary(request, action);
+      };
+      const { coord, archive } = enabledRecovery();
+      const { logger, lines } = recordingLogger();
+      const claim = gitlabClaim(2365, { claim_generation: 3, secrets: { forge_pat: secret } });
+      const exec = new FakeCodexExecutor(rig.safety, async () => {
+        throw new Error("execution failed");
+      });
+      await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger, {
+        recovery: coord,
+      }).execute(claim);
+
+      const warnings = lines.filter((line) =>
+        (line as { msg?: string }).msg === "recovery: pre-settle reap failed; retaining the generation hold (reporting unaffected)",
+      ) as Array<Record<string, unknown>>;
+      assert.ok(warnings.length > 0, "the real pre-settle reap logged its failure");
+      for (const warning of warnings) {
+        assert.equal(warning.run_id, claim.run_id);
+        assert.equal(warning.error, "codex boundary failed at quiesce");
+        assert.equal(warning.diagnostic, c.diagnostic);
+        assert.equal(Object.hasOwn(warning, "diagnostic"), c.diagnostic !== undefined);
+      }
+      assert.ok(!JSON.stringify(lines).includes(secret), "the run secret never reaches log records");
+      assert.equal(archive.releaseCalls.length, 0, "blocked reap retains custody");
+      assert.ok(statuses(claim.run_id).includes("failed"), "terminal reporting remains unaffected");
+    });
+  }
+});
+
 function receiptError(): Error {
   const e = new Error("input receipt given up");
   e.name = "InputReceiptError";

@@ -12283,7 +12283,7 @@ export class RunRunner {
         err instanceof RunResidueBlockedError
           ? "recovery: clone not provably quiescent; skipping the credentialed settle and retaining the generation hold (reporting unaffected)"
           : "recovery: pre-settle reap failed; retaining the generation hold (reporting unaffected)",
-        { run_id: claim.run_id, error: errMessage(err) },
+        { run_id: claim.run_id, error: errMessage(err), ...codexBoundaryDiagnosticField(err, flight.redactText) },
       );
       return false; // provider not confirmed reaped → do NOT run the credentialed fetch
     }
