@@ -83,10 +83,11 @@ function terminal(runId: string, condition: string) {
   assert.ok(!states.some((s) => s.status === "completed" || s.status === "recovery_wait"), "no completion/recovery");
 }
 
-// These runner paths reach native planning capture (Linux /proc); Linux CI runs this block.
-describe("U2 real runner checked gate", { skip: process.platform !== "linux" && "Linux /proc capture required" }, () => {
+// Runner paths that reach native planning capture walk Linux /proc; Linux CI runs them.
+const LINUX_CAPTURE = process.platform !== "linux" && "Linux /proc capture required";
+describe("U2 real runner checked gate", () => {
   for (const action of ["approve_plan", "revise_plan", "reject_plan"] as const) {
-    it(`retryable preparation publishes once before replay and restores human ${action}`, async () => {
+    it(`retryable preparation publishes once before replay and restores human ${action}`, { skip: LINUX_CAPTURE }, async () => {
       const c = claim();
       const held = holdGateAck(c.run_id, PLAN);
       const attempts: OutgoingMessage[][] = [];
@@ -163,7 +164,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     });
   }
 
-  it("applied preparation gate resumes after real credential switch give-up without republishing", async () => {
+  it("applied preparation gate resumes after real credential switch give-up without republishing", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     const reserve = MessageBatcher.prototype.reserveCandidateTransport;
     const report = client.reportPlanCrossCheckGateState.bind(client);
@@ -232,7 +233,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     }
   });
 
-  it("owner cancellation aborts and settles remaining preparation HTTP before any queued approval", async () => {
+  it("owner cancellation aborts and settles remaining preparation HTTP before any queued approval", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     const reserve = MessageBatcher.prototype.reserveCandidateTransport;
     const post = client.postMessages.bind(client);
@@ -280,7 +281,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     }
   });
 
-  it("pending checker expires at its fixed local deadline despite transient status failures", async () => {
+  it("pending checker expires at its fixed local deadline despite transient status failures", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     let stored!: ReturnType<typeof answer>;
     api.crossCheckHandler = ({ runId, method, body }) => {
@@ -313,7 +314,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
   });
 
   for (const control of ["cancel", "shutdown"] as const) {
-    it(`owner ${control} aborts a held pending checker status socket before runner settlement`, async () => {
+    it(`owner ${control} aborts a held pending checker status socket before runner settlement`, { skip: LINUX_CAPTURE }, async () => {
       const c = claim();
       let stored!: ReturnType<typeof answer>;
       api.crossCheckHandler = ({ runId, body, method }) => {
@@ -417,7 +418,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
   });
 
   for (const crossCheckFailure of [false, true]) {
-    it(`unrelated diagnostic emit exception propagates with identical refusal text (checked failure: ${crossCheckFailure})`, async () => {
+    it(`unrelated diagnostic emit exception propagates with identical refusal text (checked failure: ${crossCheckFailure})`, { skip: crossCheckFailure && LINUX_CAPTURE }, async () => {
       const c = claim();
       if (crossCheckFailure) api.usageHandler = () => ({ status: 400, body: { error: "usage refused" } });
       const { exec } = checkedExec(async (ctx) => {
@@ -440,7 +441,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     });
   }
 
-  it("reservation acquisition failure terminates after one call without candidate or human publication", async () => {
+  it("reservation acquisition failure terminates after one call without candidate or human publication", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     const reserve = MessageBatcher.prototype.reserveCandidateTransport;
     let attempts = 0;
@@ -459,7 +460,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     } finally { MessageBatcher.prototype.reserveCandidateTransport = reserve; }
   });
 
-  it("real disabled outbox is a permanent runner preparation failure before any candidate", async () => {
+  it("real disabled outbox is a permanent runner preparation failure before any candidate", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "checked-disabled-"));
     const blocked = path.join(root, "file");
@@ -480,7 +481,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     } finally { run.shutdown(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("runner cannot borrow an ACK when a current-generation external outbox drain retires its tracked identity", async () => {
+  it("runner cannot borrow an ACK when a current-generation external outbox drain retires its tracked identity", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     c.last_seq = 1;
     const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "checked-external-retire-"));
@@ -525,7 +526,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     }
   });
 
-  it("actual held producers overflow the bounded reservation before candidate preparation", async () => {
+  it("actual held producers overflow the bounded reservation before candidate preparation", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     const reserve = MessageBatcher.prototype.reserveCandidateTransport;
     let reserves = 0;
@@ -561,7 +562,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     } finally { MessageBatcher.prototype.reserveCandidateTransport = reserve; }
   });
 
-  it("public Worker heartbeats advance while its real checked runner holds the human state ACK", async () => {
+  it("public Worker heartbeats advance while its real checked runner holds the human state ACK", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "revise", "revise") });
     const held = holdGateAck(c.run_id, PLAN);
@@ -627,7 +628,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     }
   });
 
-  it("pending candidate usage failure shares the original preparation budget and falls back before another check", async () => {
+  it("pending candidate usage failure shares the original preparation budget and falls back before another check", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     let context!: RunContext;
     api.crossCheckHandler = ({ runId, body, method }) => {
@@ -665,7 +666,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     }
   });
 
-  it("three preparation failures terminate only after applied forced gate and preserve assigned replay on close", async () => {
+  it("three preparation failures terminate only after applied forced gate and preserve assigned replay on close", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "checked-preparation-"));
     const outbox = new Outbox({ root: path.join(root, "outbox"), log: nullLogger(),
@@ -758,7 +759,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
   });
 
   for (const httpStatus of [400, 409]) {
-    it(`negative canonical storage ACK ${httpStatus} prevents implementation`, async () => {
+    it(`negative canonical storage ACK ${httpStatus} prevents implementation`, { skip: LINUX_CAPTURE }, async () => {
       const c = claim();
       api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body) });
       api.failStateWhen(c.run_id, (b) => b.status === "running" && b.candidate_digest === digest,
@@ -770,7 +771,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     });
   }
   for (const decision of ["approve", "revise"]) {
-    it(`server wall park at ${decision} ACK preserves clone and emits no terminal`, async () => {
+    it(`server wall park at ${decision} ACK preserves clone and emits no terminal`, { skip: LINUX_CAPTURE }, async () => {
       const c = claim();
       let clone = "";
       api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, decision, decision) });
@@ -788,7 +789,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
         `server park must stay nonterminal and preserve clone + HOME: ${JSON.stringify(observed)}`);
     });
   }
-  it("stale canonical storage ACK ends quietly", async () => {
+  it("stale canonical storage ACK ends quietly", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body) });
     api.failStateWhen(c.run_id, (b) => b.status === "running" && b.candidate_digest === digest,
@@ -798,7 +799,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
   });
 
 
-  it("stores the server canonical bundle, including explicit empty arrays, before returning cross_check approval", async () => {
+  it("stores the server canonical bundle, including explicit empty arrays, before returning cross_check approval", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "approve", "approve", {
       candidate: { ...body, plan_md: NORMALIZED, milestones: [], required_tools: [], required_capabilities: [], size_class: "l" },
@@ -823,7 +824,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
   for (const [verdict, reason] of [["revise", "revise"], ["block", "block"],
     ...["malformed", "model_error", "model_timeout", "checker_unavailable", "confinement_failed",
       "timed_out", "superseded", "interrupted"].map((r) => ["failed", r])]) {
-    it(`forces a human gate for ${reason}, with no unchecked implementation`, async () => {
+    it(`forces a human gate for ${reason}, with no unchecked implementation`, { skip: LINUX_CAPTURE }, async () => {
       const c = claim();
       api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, verdict, reason) });
       api.onState(c.run_id, (b) => { if (b.status === "awaiting_approval") send(c.run_id, row("reject_plan", "decline")); });
@@ -843,7 +844,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     [409, "checker_unavailable", "checker_unavailable", undefined],
     [409, "interrupted", "interrupted", undefined],
   ] as const) {
-    it(`forces the supported human disposition on submit ${reason}`, async () => {
+    it(`forces the supported human disposition on submit ${reason}`, { skip: LINUX_CAPTURE }, async () => {
       const c = claim();
       api.crossCheckHandler = () => ({ status, body: { reason } });
       api.onState(c.run_id, (b) => { if (b.status === "awaiting_approval") send(c.run_id, row("reject_plan")); });
@@ -866,7 +867,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     ["checker_failed", { candidate_digest: "invalid" }, "invalid_submit", ""],
     ["checker_failed", { plan_cross_check_settled: false }, "approve", "approve"],
   ] as const) {
-    it(`forces human rejection for ${verdict} ${JSON.stringify(override)} with intact preparation`, async () => {
+    it(`forces human rejection for ${verdict} ${JSON.stringify(override)} with intact preparation`, { skip: LINUX_CAPTURE }, async () => {
       const c = verdict === "failed" ? freshClaim(2, { auto_approve: true, plan_cross_check_required: true }) : claim();
       let context!: RunContext;
       let submitted!: Record<string, unknown>;
@@ -938,7 +939,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     });
   }
 
-  it("inactive preparation remains terminal before an identity fallback", async () => {
+  it("inactive preparation remains terminal before an identity fallback", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     let context!: RunContext;
     api.crossCheckHandler = ({ runId, body }) => {
@@ -954,7 +955,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     assert.equal(api.crossCheckRequests.length, 1);
   });
 
-  it("a real usage 400 irrecoverably loses preparation receipts and terminates before submit", async () => {
+  it("a real usage 400 irrecoverably loses preparation receipts and terminates before submit", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     api.usageHandler = () => ({ status: 400, body: { error: "usage refused" } });
     api.crossCheckHandler = () => { throw new Error("must never submit"); };
@@ -980,7 +981,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
   });
 
   for (const revised of [false, true]) {
-    it(`unrecoverable ${revised ? "revised" : "initial"} human ACK uses named terminal failure`, async () => {
+    it(`unrecoverable ${revised ? "revised" : "initial"} human ACK uses named terminal failure`, { skip: LINUX_CAPTURE }, async () => {
       const c = claim();
       api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "revise", "revise") });
       const revisedPlan = "# PLAN revised";
@@ -999,7 +1000,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
   }
 
   for (const final of ["approve_plan", "reject_plan"] as const) {
-    it(`dropped initial ACK + queued revise before identical retry ACK resolves revised ${final}`, async () => {
+    it(`dropped initial ACK + queued revise before identical retry ACK resolves revised ${final}`, { skip: LINUX_CAPTURE }, async () => {
       const c = claim();
       const revisedPlan = "# PLAN human revision";
       api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "revise", "revise") });
@@ -1065,7 +1066,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
 
   for (const droppedRound of [0, 1]) {
     for (const final of ["approve_plan", "reject_plan"] as const) {
-      it(`SDK dropped ${droppedRound === 0 ? "initial" : "revised"} ACK routes next revise before retry ACK then current ${final}`, async () => {
+      it(`SDK dropped ${droppedRound === 0 ? "initial" : "revised"} ACK routes next revise before retry ACK then current ${final}`, { skip: LINUX_CAPTURE }, async () => {
         const c = claim();
         const plans = [PLAN, "# PLAN SDK revision B", "# PLAN SDK revision C"].slice(0, droppedRound + 2);
         const milestones = [
@@ -1204,7 +1205,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
   }
 
   for (const switchBeforeRevision of [false, true]) {
-    it(`checked SDK retains absolute human deadline through held revision planning${switchBeforeRevision ? " and switch give-up" : ""}`, async () => {
+    it(`checked SDK retains absolute human deadline through held revision planning${switchBeforeRevision ? " and switch give-up" : ""}`, { skip: LINUX_CAPTURE }, async () => {
       const c = claim();
       api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "revise", "revise") });
       const budgetMs = 1000;
@@ -1279,7 +1280,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     });
   }
 
-  it("late round-one POSTs are refused after no_row fallback commit while its ACK is held", async () => {
+  it("late round-one POSTs are refused after no_row fallback commit while its ACK is held", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     let context!: RunContext;
     let releasePosts!: () => void;
@@ -1329,7 +1330,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     }
   });
 
-  it("dropped submit ACK resolves the current candidate by GET and stores one canonical bundle", async () => {
+  it("dropped submit ACK resolves the current candidate by GET and stores one canonical bundle", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     let stored!: ReturnType<typeof answer>;
     api.crossCheckHandler = ({ runId, method, body }) => {
@@ -1352,7 +1353,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
   });
 
   for (const decision of ["approve", "revise"] as const) {
-    it(`concurrent feed producers and session sender preserve sequences through ${decision} proof`, async () => {
+    it(`concurrent feed producers and session sender preserve sequences through ${decision} proof`, { skip: LINUX_CAPTURE }, async () => {
       const c = claim();
       let context!: RunContext;
       let releasePost!: () => void;
@@ -1418,7 +1419,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     });
   }
 
-  it("dropped revised ACK preserves revision identity after the previous revision was confirmed", async () => {
+  it("dropped revised ACK preserves revision identity after the previous revision was confirmed", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     const plans = [PLAN, "# PLAN revision one", "# PLAN revision two"];
     let release!: () => void;
@@ -1472,7 +1473,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     }
   });
 
-  it("scan refusal precedes any candidate upload", async () => {
+  it("scan refusal precedes any candidate upload", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     const original = git.scanPatchForSecrets.bind(git);
     git.scanPatchForSecrets = async () => ({ trusted: false, findings: [] });
@@ -1496,7 +1497,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     assert.equal((gates(c.run_id)[0] as PlanCrossCheckStateRequest).plan_cross_check_diff_refusal, "diff_failed");
   });
 
-  it("captures and scans identical planning bytes against the immutable clone base", async () => {
+  it("captures and scans identical planning bytes against the immutable clone base", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     let capturedBase = "";
     let scanned = "";
@@ -1514,7 +1515,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
     assert.ok(scanned.includes("planning bytes"));
   });
 
-  it("real runner APPROVE reaches SDK implementation with server normalization and []", async () => {
+  it("real runner APPROVE reaches SDK implementation with server normalization and []", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "approve", "approve", {
       candidate: { ...body, plan_md: NORMALIZED, milestones: [], required_capabilities: [], required_tools: [], size_class: "s" },
@@ -1547,7 +1548,7 @@ describe("U2 real runner checked gate", { skip: process.platform !== "linux" && 
 });
 
 for (const committed of [false, true])
-it(`checked canonical storage resumes after real switch give-up with ${committed ? "committed held ACK" : "write not committed"}`, { timeout: 10_000, skip: process.platform !== "linux" && "Linux /proc capture required" }, async () => {
+it(`checked canonical storage resumes after real switch give-up with ${committed ? "committed held ACK" : "write not committed"}`, { timeout: 10_000, skip: LINUX_CAPTURE }, async () => {
   const c = claim();
   api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "approve", "approve", {
     candidate: { ...body, plan_md: NORMALIZED, milestones: [], required_capabilities: [], required_tools: [], size_class: "s" },
@@ -1686,7 +1687,7 @@ it(`checked canonical storage resumes after real switch give-up with ${committed
 });
 
 for (const [checked, revised] of [[true, false], [false, false], [true, true]] as const)
-it(`${checked ? "checked" : "ordinary"} confirmed human wait survives one real switch give-up${revised ? " then human revision" : ""}`, { skip: checked && process.platform !== "linux" && "Linux /proc capture required" }, async () => {
+it(`${checked ? "checked" : "ordinary"} confirmed human wait survives one real switch give-up${revised ? " then human revision" : ""}`, { skip: checked && LINUX_CAPTURE }, async () => {
   const c = claim();
   if (!checked) { c.auto_approve = false; c.plan_cross_check_required = false; }
   api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "revise", "revise") });
