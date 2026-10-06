@@ -68,10 +68,10 @@ DSN="postgres://uzi:$PGPASS@127.0.0.1:$PORT/uzi?sslmode=disable"
 
 say "waiting for Postgres to accept connections (up to ${PGWAIT}s)"
 for _ in $(seq 1 "$PGWAIT"); do
-  docker exec "$NAME" pg_isready -U uzi -d uzi >/dev/null 2>&1 && break
+  docker exec "$NAME" pg_isready -h 127.0.0.1 -U uzi -d uzi >/dev/null 2>&1 && break
   sleep 1
 done
-if ! docker exec "$NAME" pg_isready -U uzi -d uzi >/dev/null 2>&1; then
+if ! docker exec "$NAME" pg_isready -h 127.0.0.1 -U uzi -d uzi >/dev/null 2>&1; then
   # LOUD, unmistakable banner: a readiness timeout is an INFRASTRUCTURE fault,
   # not a test result. Without it the run ends with no package times and, to
   # whoever tallies the log, RUN=0 PASS=0 FAIL=0 — indistinguishable from the

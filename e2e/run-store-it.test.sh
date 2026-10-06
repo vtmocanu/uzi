@@ -73,6 +73,18 @@ case "$rm_line" in
                    fails=$((fails + 1)) ;;
 esac
 
+# Issue #2304: readiness must be polled over TCP. A socket-only pg_isready succeeds
+# against initdb's temporary server, which then shuts down, and the recheck reports a
+# readiness timeout seconds after the wait began. RED on the pre-fix socket probe.
+probes="$(grep -c 'pg_isready' "$LOG" || true)"
+tcp_probes="$(grep -c 'pg_isready -h 127.0.0.1 ' "$LOG" || true)"
+if [ "$probes" -gt 0 ] && [ "$probes" = "$tcp_probes" ]; then
+  printf 'PASS: every pg_isready probe uses TCP (-h 127.0.0.1)\n'
+else
+  printf 'FAIL: %s of %s pg_isready probes use TCP (-h 127.0.0.1)\n' "$tcp_probes" "$probes"
+  fails=$((fails + 1))
+fi
+
 if [ "$fails" -eq 0 ]; then
   printf '\nrun-store-it teardown test: all assertions passed\n'
   exit 0
