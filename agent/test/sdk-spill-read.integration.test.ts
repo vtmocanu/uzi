@@ -16,6 +16,9 @@ import { FakeAnthropicApi, type MessagesRequest, type ScriptedTurn } from "./fak
 // a Read of the SDK HOME's settings.json. The model is a scripted local fake of the
 // Anthropic Messages API, so nothing leaves 127.0.0.1 and the guard never parses prose.
 
+// Per-drive abort budget: two drives (resume) must finish inside the 120s test cap, so the abort
+// (which stops the CLI child) fires before the test timeout.
+const DRIVE_BUDGET_MS = 50_000;
 const MARKER = "SPILL-MARKER-7c1e9d";
 const MARKER_LINE = 1400;
 const SUBAGENT_TOKEN = "SUBAGENT-TASK-5b2f";
@@ -68,6 +71,7 @@ describe("a Claude run Reads its own SDK spill file through the real CLI (issue 
   let baseUrl: string;
   let home: string;
   let worktree: string;
+  let tmp: string;
   const hookRecords: Array<{ input: HookInput; decision: HookJSONOutput }> = [];
 
   after(() => {
@@ -119,7 +123,9 @@ describe("a Claude run Reads its own SDK spill file through the real CLI (issue 
     home = path.join(root, "home");
     worktree = path.join(root, "worktree");
     fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+    tmp = path.join(root, "tmp");
     fs.mkdirSync(worktree, { recursive: true });
+    fs.mkdirSync(tmp, { recursive: true });
     fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
     observed.length = 0;
     hookRecords.length = 0;
@@ -147,6 +153,8 @@ describe("a Claude run Reads its own SDK spill file through the real CLI (issue 
       env: {
         PATH: process.env.PATH ?? "",
         HOME: home,
+        // Keeps the CLI's /tmp/claude-<uid>/... task dirs inside the root the test removes.
+        TMPDIR: tmp,
         ANTHROPIC_BASE_URL: baseUrl,
         ANTHROPIC_API_KEY: ["dummy", "key"].join("-"),
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
@@ -165,7 +173,7 @@ describe("a Claude run Reads its own SDK spill file through the real CLI (issue 
   /** Run one query to completion; returns the session id from the init message. */
   async function drive(prompt: string, extra: Partial<Options> = {}): Promise<string> {
     let sid = "";
-    const deadline = AbortSignal.timeout(100_000);
+    const deadline = AbortSignal.timeout(DRIVE_BUDGET_MS);
     const controller = new AbortController();
     deadline.addEventListener("abort", () => controller.abort());
     try {
@@ -207,6 +215,14 @@ describe("a Claude run Reads its own SDK spill file through the real CLI (issue 
     const result = resultAt(scenario, readStep);
     assert.ok(result.includes(MARKER), `the spill Read result lacks the marker${diag()}`);
     assert.ok(!result.includes("denied by guardrail"), `the spill Read result was a denial${diag()}`);
+    // The Read must be bounded so reading the spill does not itself spill (and point at another file).
+    for (const r of reads) {
+      const ti = (r.input as { tool_input?: { offset?: unknown; limit?: unknown } }).tool_input;
+      assert.equal(typeof ti?.offset, "number", `the spill Read has no numeric offset: ${JSON.stringify(ti)}${diag()}`);
+      assert.equal(typeof ti?.limit, "number", `the spill Read has no numeric limit: ${JSON.stringify(ti)}${diag()}`);
+      assert.ok((ti?.limit as number) <= 20, `the spill Read limit is not small: ${JSON.stringify(ti)}${diag()}`);
+    }
+    assert.ok(!/Full output saved to|saved to:/.test(result), `the spill Read result itself spilled${diag()}`);
   }
 
   it("fresh run: a bounded Read of the spill is allowed, settings.json is still denied", { timeout: 120_000 }, async () => {
@@ -220,12 +236,19 @@ describe("a Claude run Reads its own SDK spill file through the real CLI (issue 
 
   it("resumed run: the same session id keeps the spill allowed", { timeout: 120_000 }, async () => {
     const first = await drive("SCENARIO:FRESH");
+    const before = new Set(spillFiles(first));
+    assert.ok(before.size > 0, `the fresh run left no spill file${diag()}`);
     hookRecords.length = 0;
     const second = await drive("SCENARIO:RESUMED", { resume: first });
     assert.equal(second, first, `resume changed the session id${diag()}`);
     assertSpillAllowed(second, "RESUMED", 2);
-    for (const f of spillFiles(second)) assert.ok(f.includes(`${path.sep}${second}${path.sep}tool-results${path.sep}`), f);
-    assert.ok(spillReads(second).every((r) => r.input.session_id === first), "the hook saw a different session id");
+    const fresh = spillFiles(second).filter((f) => !before.has(f));
+    assert.ok(fresh.length > 0, `the resumed run wrote no new spill file${diag()}`);
+    const dirs = new Set([...before, ...fresh].map((f) => path.dirname(f)));
+    assert.equal(dirs.size, 1, `spill files are not all in one <sid>/tool-results dir: ${[...dirs].join(", ")}`);
+    const resumedReads = spillReads(second).filter((r) => fresh.includes(String(filePathOf(r.input))));
+    assert.ok(resumedReads.length > 0, `the resumed run never Read its new spill file${diag()}`);
+    assert.ok(resumedReads.every((r) => !denied(r.decision)), `the resumed spill Read was denied${diag()}`);
   });
 
   it("subagent: its spill lands in the root session's tool-results and is readable", { timeout: 120_000 }, async () => {
