@@ -1857,11 +1857,30 @@ export class CodexExecutor implements Executor {
         return { kind: "incomplete", errors: [{ category: "timeout", message: "codex cancel settle expired" }] };
       }
       const current = this.safety;
-      if (current instanceof CodexExecutionSafetyImpl) {
-        return current.settleForCredentialFreeCapture(Math.max(0, deadlineAt - Date.now()));
+      if (current !== undefined && !(current instanceof CodexExecutionSafetyImpl)) {
+        return { kind: "incomplete", errors: [{ category: "protocol", message: "codex cancel settle: unsupported safety facade" }] };
       }
-      if (current !== undefined || this.unverifiedEpochRegistries.size > 0) {
-        return { kind: "incomplete", errors: [{ category: "protocol", message: "codex cancel settle: outstanding epoch registry without verified drain" }] };
+      const currentProof = current instanceof CodexExecutionSafetyImpl
+        ? await current.settleForCredentialFreeCapture(Math.max(0, deadlineAt - Date.now()))
+        : undefined;
+      // One bounded settle per known registry, all sharing the absolute cancel deadline.
+      // A failed sibling does not skip the others; disposed/cleared tables refuse the proof.
+      const outstanding = [...this.unverifiedEpochRegistries];
+      const proofs = await Promise.all(outstanding.map(async registry => {
+        if (!(registry instanceof ExecutionRegistry)) {
+          return { kind: "incomplete" as const, errors: [{ category: "protocol" as const, message: "codex cancel settle: unsupported epoch registry" }] };
+        }
+        try {
+          return await registry.settleForCapture(Math.max(0, deadlineAt - Date.now()));
+        } catch {
+          return { kind: "incomplete" as const, errors: [{ category: "protocol" as const, message: "codex cancel settle: epoch registry drain failed" }] };
+        }
+      }));
+      if (currentProof?.kind === "incomplete") return currentProof;
+      const incomplete = proofs.find(proof => proof.kind === "incomplete");
+      if (incomplete) return incomplete;
+      if ([...this.unverifiedEpochRegistries].some(registry => !outstanding.includes(registry))) {
+        return { kind: "incomplete", errors: [{ category: "protocol", message: "codex cancel settle: epoch registry created during drain" }] };
       }
       return { kind: "observed_empty" };
     }
@@ -1887,10 +1906,9 @@ export class CodexExecutor implements Executor {
     };
   }
 
-  /** Issue #1766: every epoch registry {@link startProviderEpoch} created, minus the half-built
-   *  ones whose teardown was verified clean. A registry that became a live epoch stays here, but
-   *  it is then reachable through `this.safety` (set once, never unset), so this set is consulted
-   *  only while `this.safety` is undefined. */
+  /** Every epoch registry {@link startProviderEpoch} created, minus failed-setup or abandoned
+   *  epochs whose teardown was verified clean. Capture consults this set when no safety exists;
+   *  cancel proves every outstanding registry even when the current safety is healthy. */
   private readonly unverifiedEpochRegistries = new Set<ExecutionRegistry>();
 
   /** Owned across epochs, replaced on sequential reuse; expiry never drops the handle. */
@@ -3379,7 +3397,8 @@ export class CodexExecutor implements Executor {
         // survive into the next epoch), then close the harness/transport and dispose the fileop.
         dispose: async (): Promise<void> => {
           await settleDepsInstall();
-          await this.tearDownEpoch(registry, epochHarness, epochFileop, boundaryDeadlineMs, true);
+          const clean = await this.tearDownEpoch(registry, epochHarness, epochFileop, boundaryDeadlineMs, true);
+          if (clean) this.unverifiedEpochRegistries.delete(registry);
         },
       };
     } catch (error) {

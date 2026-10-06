@@ -12128,7 +12128,7 @@ export class RunRunner {
           (process.platform === "linux" && initial.outcome.process?.state !== "quiescent")) return "retained";
       const trusted = flight.trustedPublishedStart;
       if (!trusted || !/^[0-9a-f]{40}$/.test(trusted)) return "retained";
-      const head = await this.git.credentialFreeCancelCleanHead(flight.worktreePath!);
+      const head = await this.git.credentialFreeCancelCleanHead(flight.worktreePath!, flight.barePath!, trusted);
       const present = await this.git.revParse(flight.barePath!, `${trusted}^{commit}`);
       // Finish every Git observation before the final process proof. A newly killed writer
       // invalidates the observations even if the scan then reports quiescent.

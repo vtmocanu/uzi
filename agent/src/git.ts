@@ -5080,12 +5080,16 @@ export class GitCache {
   }
 
   /**
-   * Owner-cancel inspection only. All observations run as the runner uid without optional
-   * locks. Refuse executable conversion surfaces and hidden index entries before status.
-   * Gitlinks are conservatively unverified; ignored files retain ordinary status semantics.
+   * Owner-cancel inspection only. Clone observations run as the runner uid without optional
+   * locks. Status is only a metadata/untracked check: a separate runner-identity reader
+   * hashes actual regular-file bytes against the trusted bare starting tree, never the
+   * clone's index or object store. Unsupported types/platforms and budgets retain custody.
+   * Ignored files retain ordinary status semantics.
    */
-  async credentialFreeCancelCleanHead(cwd: string): Promise<string | null> {
+  async credentialFreeCancelCleanHead(cwd: string, barePath: string, trustedStart: string): Promise<string | null> {
     const pins = [
+      // Compare the real HEAD tree: runner-owned refs/replace must not hide private bytes.
+      "--no-replace-objects",
       "--no-optional-locks",
       "-c", "core.fsmonitor=false",
       "-c", "core.untrackedCache=false",
@@ -5097,6 +5101,30 @@ export class GitCache {
     ];
     const read = (args: string[]) => this.runGitAsRunner(cwd, [...pins, ...args]);
     try {
+      if (process.platform !== "linux" || !path.isAbsolute(cwd) ||
+          path.resolve(cwd) !== cwd || !/^[0-9a-f]{40}$/.test(trustedStart)) return null;
+      // Pure worker-side object enumeration: the private clone cannot supply the tree.
+      // Each subprocess has a deadline/output cap; no retries or sibling work.
+      const tree = await this.execScoped(GIT_BIN,
+        withDir(barePath, ["--no-replace-objects", "ls-tree", "-r", "-l", "-z", trustedStart]), {
+          env: workerSpawnEnv(gitEnv()), timeout: 5000, maxBuffer: 2 * 1024 * 1024,
+        });
+      const manifest: Array<[string, string, string, number]> = [];
+      let total = 0;
+      for (const entry of tree.stdout.split("\0")) {
+        if (!entry) continue;
+        const match = /^(100644|100755) blob ([0-9a-f]{40}) +([0-9]+)\t([\s\S]+)$/.exec(entry);
+        if (!match) return null;
+        // execScoped decodes UTF-8. Refuse replacement characters so distinct raw
+        // Git paths cannot collapse to the same runner-reader path.
+        if (match[4]!.includes("\uFFFD")) return null;
+        const size = Number(match[3]);
+        total += size;
+        if (!Number.isSafeInteger(size) || size > 4 * 1024 * 1024 ||
+            total > 128 * 1024 * 1024 || manifest.length >= 20000) return null;
+        if (match[4]!.includes("\uFFFD")) return null; // Refuse lossy UTF-8 path decoding.
+        manifest.push([match[4]!, match[1]!, match[2]!, size]);
+      }
       // config/index/ref reads cannot invoke a clean/process filter. Reading all effective
       // config also sees included config files; any read failure refuses the proof.
       const config = await read(["config", "--null", "--list"]);
@@ -5110,10 +5138,22 @@ export class GitCache {
       const flags = await read(["ls-files", "-v", "-z"]);
       if (flags.split("\0").some(entry => entry && (entry[0] === "S" || /^[a-z]/.test(entry)))) return null;
       const index = await read(["ls-files", "--stage", "-z"]);
-      if (index.split("\0").some(entry => entry.startsWith("160000 "))) return null;
+      const expectedIndex = manifest.map(([name, mode, oid]) => mode + " " + oid + " 0\t" + name + "\0").join("");
+      if (index !== expectedIndex) return null;
       const before = (await read(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
-      if (!/^[0-9a-f]{40}$/.test(before)) return null;
+      if (before !== trustedStart) return null;
       const status = await read(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"]);
+      if (status.length !== 0) return null;
+      const wrapped = this.boundaryProcesses.getStore()
+        ? { command: process.execPath, args: ["-e", CANCEL_CONTENT_HELPER, cwd] }
+        : runnerCommand(process.execPath, ["-e", CANCEL_CONTENT_HELPER, cwd]);
+      const input = JSON.stringify(manifest);
+      if (Buffer.byteLength(input) > 2 * 1024 * 1024) return null;
+      const proof = await this.execScoped(wrapped.command, wrapped.args, {
+        env: unmarkedSpawnEnv({ ...gitEnv(), PATH: runnerPath() }),
+        cwd, input, timeout: 30000, maxBuffer: 1024,
+      }, "command");
+      if (proof.stdout !== "clean\n") return null;
       const after = (await read(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
       return status.length === 0 && before === after ? after : null;
     } catch {
@@ -7523,6 +7563,92 @@ export class GitCache {
     return result;
   }
 }
+
+// Trusted cancel reader: Linux pinned descriptors, no Git, config, filters or writes.
+// One failed path aborts the proof. At most 20,000 files, depth 64, 4 MiB/file,
+// 128 MiB total; synchronous reads check a 28s deadline, execScoped caps at 30s.
+const CANCEL_CONTENT_HELPER = String.raw`
+const fs = require("node:fs");
+const { createHash } = require("node:crypto");
+const C = fs.constants, O_PATH = 0x200000;
+const root = process.argv[1], deadline = Date.now() + 28000;
+const fds = new Set();
+let total = 0;
+function check() { if (Date.now() > deadline) throw Error("content deadline"); }
+function close(fd) { fs.closeSync(fd); fds.delete(fd); }
+function fp(fd) { return "/proc/" + process.pid + "/fd/" + fd; }
+function open(p, flags) {
+  check();
+  const fd = fs.openSync(p, flags);
+  fds.add(fd);
+  return fd;
+}
+function parts(p) {
+  const a = p.split("/");
+  if (!p || a.length > 64 || a.some(x => !x || x === "." || x === ".." || x.toLowerCase() === ".git")
+      || p.includes("\0") || Buffer.from(p).toString() !== p) throw Error("unsafe path");
+  return a;
+}
+try {
+  if (process.platform !== "linux" || !root.startsWith("/") || root.length > 4096 ||
+      root.split("/").length > 64) throw Error("unsupported root");
+  // Pin every absolute ancestor without following a source-controlled symlink.
+  let dir = open("/", O_PATH | C.O_NOFOLLOW);
+  for (const part of root.slice(1).split("/")) {
+    if (!part || part === "." || part === "..") throw Error("unsafe root");
+    const next = open(fp(dir) + "/" + part, O_PATH | C.O_NOFOLLOW);
+    if (!fs.fstatSync(next).isDirectory()) throw Error("non-directory root");
+    close(dir); dir = next;
+  }
+  const input = fs.readFileSync(0);
+  if (input.length > 2 * 1024 * 1024) throw Error("manifest cap");
+  const manifest = JSON.parse(input.toString("utf8"));
+  if (!Array.isArray(manifest) || manifest.length > 20000) throw Error("path cap");
+  for (const [name, mode, oid, size] of manifest) {
+    check();
+    if (!["100644", "100755"].includes(mode) || !/^[0-9a-f]{40}$/.test(oid) ||
+        !Number.isSafeInteger(size) || size < 0 || size > 4 * 1024 * 1024) throw Error("unsupported entry");
+    total += size;
+    if (total > 128 * 1024 * 1024) throw Error("aggregate cap");
+    const components = parts(name);
+    let parent = dir;
+    try {
+      for (const component of components.slice(0, -1)) {
+        const next = open(fp(parent) + "/" + component, O_PATH | C.O_NOFOLLOW);
+        if (!fs.fstatSync(next).isDirectory()) throw Error("non-directory ancestor");
+        if (parent !== dir) close(parent);
+        parent = next;
+      }
+      const fd = open(fp(parent) + "/" + components.at(-1), C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
+      try {
+        const before = fs.fstatSync(fd, { bigint: true });
+        if (!before.isFile() || before.size !== BigInt(size) ||
+            ((before.mode & 0o100n) !== 0n) !== (mode === "100755")) throw Error("file type/size/mode");
+        const hash = createHash("sha1").update("blob " + size + "\0");
+        const buf = Buffer.alloc(65536);
+        let n = 0;
+        while (true) {
+          check();
+          const got = fs.readSync(fd, buf, 0, Math.min(buf.length, size + 1 - n), null);
+          if (!got) break;
+          n += got;
+          if (n > size) throw Error("file grew");
+          hash.update(buf.subarray(0, got));
+        }
+        const after = fs.fstatSync(fd, { bigint: true });
+        if (n !== size || hash.digest("hex") !== oid ||
+            ["dev", "ino", "size", "mode", "mtimeNs", "ctimeNs"].some(k => before[k] !== after[k]))
+          throw Error("content mismatch or unstable file");
+      } finally { close(fd); }
+    } finally { if (parent !== dir) close(parent); }
+  }
+  process.stdout.write("clean\n");
+} catch {
+  process.exitCode = 1;
+} finally {
+  for (const fd of fds) fs.closeSync(fd);
+}
+`;
 
 /**
  * Trusted inline runner program, never loaded from the clone. Linux descriptor

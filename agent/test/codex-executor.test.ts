@@ -1,7 +1,7 @@
 import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { getEventListeners } from "node:events";
 import fs from "node:fs/promises";
 import { symlinkSync } from "node:fs";
@@ -1174,15 +1174,61 @@ describe("m1 credential-free owner cancel", () => {
         threadId: "thread", turnId: "turn", callId: "pending", fingerprint: "pending",
       }).kind, "admitted");
       if (state === "launch") assert.equal(registry.reserveLaunch("command").kind, "reserved");
-      if (state === "disposed") await registry.disposeTools();
+      if (state === "disposed") await registry.disposeTools(200);
       if (state === "unsupported") executor.safety = { kind: "codex" } as never;
       assert.equal((await executor.settleForCredentialFreeCapture(20, "cancel")).kind, "incomplete");
       assert.equal(reconcile, 0);
-      await registry.disposeTools();
+      await registry.disposeTools(200);
     });
 
+  it("cancel cleanup checks a failed outstanding epoch alongside healthy current safety", async () => {
+    const executor = makeExecutor(makeRig(), bindingOf(SUBSCRIPTION));
+    const current = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const failed = new ExecutionRegistry(newLocalExecutionEpoch(2));
+    assert.equal(failed.reserveLaunch("command").kind, "reserved");
+    assert.equal((await failed.settleForCapture(10)).kind, "incomplete");
+    Object.assign(executor, { unverifiedEpochRegistries: new Set([current, failed]) });
+    executor.safety = createCodexExecutionSafety(current);
+    try {
+      const result = await executor.settleForCredentialFreeCapture(100, "cancel");
+      assert.equal(result.kind, "incomplete", "the older pending launch blocks cancellation");
+      if (result.kind === "incomplete") assert.ok(result.errors.some(e => /launch reservation/.test(e.message)));
+    } finally {
+      await current.disposeTools(200);
+      await failed.disposeTools(200);
+    }
+  });
+
+  it("cancel cleanup accepts healthy multiple epochs after verified abandoned epoch retirement", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "the plan" }, th, tn, "c-plan")).push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("resumed-1", "tn-2", () => undefined),
+    ]);
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const controller = new AbortController();
+    const { ctx } = makeCtx({ signal: controller.signal, planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never) });
+    const run = executor.run(ctx).catch(() => undefined);
+    try {
+      await waitFor(() => rig.epochs[1]!.transport.turnStartCount === 1, "second provider epoch");
+      assert.equal(rig.providerLaunches(), 2);
+      assert.ok(rig.epochs[0]!.disposed() >= 1, "abandoned epoch was disposed");
+      controller.abort(new Error("owner cancel"));
+      await withTimeout(run, 5000, "multi epoch cancellation");
+      assert.deepEqual(await executor.settleForCredentialFreeCapture(200, "cancel"), { kind: "observed_empty" });
+      assert.equal(rig.client.releaseCalls.length, 2, "only startup credential releases");
+    } finally {
+      controller.abort();
+      await withTimeout(run, 5000, "multi epoch cleanup");
+      await executor.safety?.dispose({ boundary: "terminal", deadlineMs: 200 });
+    }
+  });
+
   const cases = [
-    ...["clean", "dirty", "untracked", "committed", "hidden", "assume", "skip", "filter"].map(work => ({ work })),
+    ...["clean", "dirty", "untracked", "committed", "replace", "forged-stat", "hidden", "assume", "skip", "filter"].map(work => ({ work })),
     ...["wrong", "missing", "retained", "error"].map(release => ({ work: "clean", release })),
     ...["survivors", "unverified", "new-writer"].map(process => ({ work: "clean", process })),
     { work: "clean", docker: "docker_error" },
@@ -1262,11 +1308,13 @@ describe("m1 credential-free owner cancel", () => {
       }), cancelLog, 20, undefined, {
         recovery: recovery.coord, pollMs: 5, recoveryRetryMs: 5,
         quiesceRun: async req => {
-          observations.push(req.site);
-          if (req.site.startsWith("owner_cancel")) assert.equal(req.processes, HAS_PROCFS);
-          const state = req.site.startsWith("owner_cancel") && scenario.process === "survivors" ? "survivors" :
-            req.site.startsWith("owner_cancel") && scenario.process === "unverified" ? "unverified" : "quiescent";
-          return { process: HAS_PROCFS ? { state, processes: [], killed: req.site === "owner_cancel_after_inspection" && scenario.process === "new-writer" ? [101] : [] } : undefined,
+          const site = req.site ?? "";
+          observations.push(site);
+          if (site === "owner_cancel_after_inspection") assert.ok(observations.includes("inspect"), "final scan follows cleanliness inspection");
+          if (site.startsWith("owner_cancel")) assert.equal(req.processes, HAS_PROCFS);
+          const state = site.startsWith("owner_cancel") && scenario.process === "survivors" ? "survivors" :
+            site.startsWith("owner_cancel") && scenario.process === "unverified" ? "unverified" : "quiescent";
+          return { process: HAS_PROCFS ? { state, processes: [], killed: site === "owner_cancel_after_inspection" && scenario.process === "new-writer" ? [101] : [], detail: "cancel fixture process proof" } : undefined,
             docker: { state: scenario.docker === "docker_error" ? "docker_error" : "docker_unconfirmed", removed: [], detail: "late-create race" } };
         },
       });
@@ -1281,6 +1329,14 @@ describe("m1 credential-free owner cancel", () => {
         };
       }
       if (scenario.inspect === "unreadable") git.credentialFreeCancelCleanHead = async () => null;
+      const inspect = git.credentialFreeCancelCleanHead.bind(git);
+      git.credentialFreeCancelCleanHead = async (...args) => {
+        assert.ok(observations.includes("owner_cancel"), "initial scan precedes restore inspection");
+        assert.ok(cancelLogs.some(line => rec(line).msg === "owner cancel Docker teardown"), "Docker teardown is logged before restore inspection");
+        assert.equal(observations.includes("owner_cancel_after_inspection"), false, "every restore inspection precedes the final scan");
+        observations.push("inspect");
+        return inspect(...args);
+      };
       if (scenario.drain === "root") rig.root.reap = async () => ({ ok: false, error: { category: "tool", message: "root survives" } });
       const sendState = client.reportState.bind(client);
       client.reportState = async (...args) => {
@@ -1312,6 +1368,7 @@ describe("m1 credential-free owner cancel", () => {
         assert.ok(startHead);
         await recovery.coord.pin({ runId: claim.run_id, sourceSha: startHead, kind: "issue", branch: "agent/issue-1", generation: 8 });
         assert.equal(await git.anchorRecoveryHead(bare, claim.run_id, 8, startHead), true);
+        assert.equal(await git.anchorRecoveryHead(bare, claim.run_id, 7, startHead), true);
         if (scenario.inspect === "head") await fs.rename(path.join(clone, ".git", "HEAD"), path.join(clone, ".git", "HEAD-unreadable"));
         if (work === "dirty") await fs.appendFile(path.join(clone, "README.md"), "changed");
         if (work === "untracked" || work === "hidden") await fs.writeFile(path.join(clone, "NEW.txt"), "unpublished");
@@ -1320,13 +1377,55 @@ describe("m1 credential-free owner cancel", () => {
           await fs.writeFile(path.join(clone, "NEW.txt"), "unpublished");
           gitInClone("add", "NEW.txt"); gitInClone("commit", "-m", "unpublished");
         }
+        if (work === "replace") {
+          const privateHead = commitInTree(clone, "NEW.txt", "committed private bytes");
+          gitInClone("reset", "--soft", startHead);
+          gitInClone("replace", startHead, privateHead);
+          assert.equal(await git.worktreeHead(clone), startHead, "HEAD still reports the trusted original hash");
+          const status = spawnSync("git", ["-C", clone, "status", "--porcelain"], { env: gitEnv(), encoding: "utf8" });
+          assert.equal(status.status, 0, status.stderr);
+          assert.equal(status.stdout, "", "replacement hides the private index/files from ordinary status");
+        }
         if (work === "assume" || work === "skip") {
           gitInClone("update-index", work === "assume" ? "--assume-unchanged" : "--skip-worktree", "README.md");
           await fs.appendFile(path.join(clone, "README.md"), "hidden change");
         }
+        if (work === "forged-stat") {
+          gitInClone("config", "index.version", "2");
+          gitInClone("update-index", "--index-version", "2");
+          const file = path.join(clone, "README.md");
+          const original = await fs.readFile(file);
+          await fs.writeFile(file, Buffer.alloc(original.length, 120));
+          const past = new Date(Date.now() - 86400000);
+          await fs.utimes(file, past, past);
+          const stat = await fs.stat(file, { bigint: true });
+          const indexPath = path.join(clone, ".git", "index");
+          const index = await fs.readFile(indexPath);
+          assert.equal(index.readUInt32BE(8), 1, "fixture has one tracked entry");
+          const values = [stat.ctimeNs / 1000000000n, stat.ctimeNs % 1000000000n,
+            stat.mtimeNs / 1000000000n, stat.mtimeNs % 1000000000n,
+            stat.dev, stat.ino, stat.mode, stat.uid, stat.gid, stat.size];
+          values.forEach((value, i) => index.writeUInt32BE(Number(value & 0xffffffffn), 12 + i * 4));
+          createHash("sha1").update(index.subarray(0, -20)).digest().copy(index, index.length - 20);
+          await fs.writeFile(indexPath, index);
+          const status = spawnSync("git", ["-C", clone, "--no-replace-objects", "status", "--porcelain"],
+            { env: gitEnv(), encoding: "utf8" });
+          assert.equal(status.status, 0, status.stderr);
+          assert.equal(status.stdout, "", "forged stat cache hides changed tracked bytes");
+          assert.notDeepEqual(await fs.readFile(file), original);
+        }
         if (work === "filter") {
           gitInClone("config", "filter.delayed.clean", "touch FILTER-RAN");
           await fs.writeFile(path.join(clone, ".gitattributes"), "README.md filter=delayed\n");
+        }
+        const beforeCancel = new Map<string, Buffer>();
+        for (const name of ["README.md", "NEW.txt", "RECOVERED.txt", ".gitattributes",
+          ...(work === "forged-stat" ? [".git/index", ".git/config"] : [])]) {
+          const bytes = await fs.readFile(path.join(clone, name)).catch(error => {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+            throw error;
+          });
+          if (bytes !== undefined) beforeCancel.set(name, bytes);
         }
         api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
         await withTimeout(execution, 10000, "runner owner cancel");
@@ -1343,11 +1442,15 @@ describe("m1 credential-free owner cancel", () => {
         assert.ok(records.some(record => record.generation === 8), "sibling journal untouched");
         assert.equal(records.some(record => record.generation === 7), !shouldRelease, "own journal follows exact release proof");
         assert.equal(await git.revParse(bare, `refs/uzi-recovery-pin/${claim.run_id}/8^{commit}`), startHead, "sibling pin untouched");
+        assert.equal(await git.revParse(bare, `refs/uzi-recovery-pin/${claim.run_id}/7^{commit}`), shouldRelease ? null : startHead, "own exact-generation pin follows release proof");
         assert.ok(observations.includes("owner_cancel"));
         assert.ok(cancelLogs.some(line => rec(line).msg === "owner cancel Docker teardown"), "every Docker state logged");
         if (shouldRelease) assert.ok(observations.includes("owner_cancel_after_inspection"));
         if (shouldRelease) assert.deepEqual(releases[0], [claim.run_id, 7]);
-        else assert.equal((await fs.stat(clone)).isDirectory(), true, "source retained");
+        else {
+          assert.equal((await fs.stat(clone)).isDirectory(), true, "source retained");
+          for (const [name, bytes] of beforeCancel) assert.deepEqual(await fs.readFile(path.join(clone, name)), bytes, `${name} bytes retained exactly`);
+        }
         assert.equal(await fs.access(path.join(clone, "FILTER-RAN")).then(() => true, () => false), false);
       } finally {
         await runner.shutdown();
