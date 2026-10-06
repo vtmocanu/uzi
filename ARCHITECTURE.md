@@ -739,7 +739,7 @@ chain in the diagram above, with no intervening `running`.
   terminal-status check); losing either loses the transcript. See
   [adr/0035-run-limit-retry.md](adr/0035-run-limit-retry.md) and
   `prds/done/35-run-limit-retry.md` and
-  [PRD #2360](prds/2360-codex-usage-limit-park.md).
+  [PRD #2360](prds/done/2360-codex-usage-limit-park.md).
   **Only committed history survives a park by itself**; PRD #759 additionally
   captures uncommitted mid-milestone work as a throwaway `wip(park):` commit that
   the checkpoint broker ([PRD #628](prds/done/628-cross-worker-resume-durability.md))
