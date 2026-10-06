@@ -685,6 +685,19 @@ function isAbortLikeError(err: unknown): boolean {
 /** Marks checked-gate failures whose escalation may be refused by held transport. */
 class PlanCrossCheckFailure extends Error {}
 
+/** Keep executeClaim's lifecycle and custody dispositions through checked-gate catches.
+ * Presentation refusals are deliberately excluded: associated gates fail terminally. */
+function isCheckedLifecycleControl(error: unknown): boolean {
+  return error instanceof LimitReachedError || error instanceof DiskParkSignal ||
+    error instanceof PauseNowSignal || error instanceof ForgeUnreachableAtCloneError ||
+    error instanceof DataVolumeFullError || error instanceof DataVolumeWaitShutdown ||
+    error instanceof ServerWallParkedError || error instanceof StaleClaimError ||
+    error instanceof RunningAckTerminalError || error instanceof CredentialSwitchRetainedStop ||
+    error instanceof CredentialSwitchSignal || error instanceof E2EDropExecutionError ||
+    error instanceof RunResidueBlockedError || isInputReceiptError(error) ||
+    codexDeferralOf(error) !== undefined;
+}
+
 /** PRD #974 follow-up (#1077): a terminal push_secret_blocked report whose reportState
  *  exhausted its bounded retries and threw. Carrying the typed origin + safe reason through
  *  execute()'s generic catch preserves fail_origin=push_secret_blocked (instead of defaulting
@@ -9034,11 +9047,11 @@ export class RunRunner {
           ...(flight.observedSessionId ? { session_id: flight.observedSessionId } : {}) })) as PlanCrossCheckStateRequest;
         checkedReports.set(body, frozen);
       }
-      return flight.reportState(frozen, cancel.signal, true);
+      return flight.reportState(frozen, steering.lifecycleSignal(), true);
     };
     const checkedFailure = (error: unknown): never => {
-      cancel.signal.throwIfAborted();
-      if (error instanceof CredentialSwitchSignal) throw error;
+      if (isCheckedLifecycleControl(error)) throw error;
+      steering.lifecycleSignal().throwIfAborted();
       const reason = errMessage(error).startsWith("plan cross-check:") ? errMessage(error) :
         `plan cross-check: ${errMessage(error)}`;
       if (checkedHuman) checkedHuman.phase = "terminal";
@@ -9281,14 +9294,14 @@ export class RunRunner {
             // Settle roster/session/progress HTTP already started before the barrier. New sends
             // wait at flight.reportState; heartbeat remains independent. Reservation.prepare
             // separately drains usage debounce/in-flight HTTP and outbox delivery receipts.
-            await Promise.all([...flight.stateSenders ?? []]);
-            cancel.signal.throwIfAborted();
+            await Promise.all(flight.stateSenders ?? []);
+            steering.lifecycleSignal().throwIfAborted();
             if (claim.secrets.codex) {
               crossCheckReason = "plan cross-check: not yet supported for a Codex lead";
               checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "codex_lead_unsupported" };
               checkedHuman.onApplied = () => releaseStateBarrier?.();
             } else {
-              const captured = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, cancel.signal, runLog);
+              const captured = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, steering.lifecycleSignal(), runLog);
               if ("refusal" in captured) {
                 crossCheckReason = "plan cross-check: planning diff refused";
                 checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "planning_diff_refused",
@@ -9300,7 +9313,7 @@ export class RunRunner {
                     required_capabilities: toolchainDetection?.required_capabilities ?? [],
                     required_tools: toolchainDetection?.required_tools ?? [],
                     size_class: toolchainDetection?.size_class ?? "s", base_commit: runnerClone.baseCommit,
-                    planning_diff: captured.diff }, batcher, signal: cancel.signal, timing: this.planCrossCheckTiming });
+                    planning_diff: captured.diff }, batcher, signal: steering.lifecycleSignal(), timing: this.planCrossCheckTiming });
                 if (decision.kind === "approve") {
                   checkedApproval = decision.response;
                   checkedHuman = undefined;
@@ -9337,7 +9350,7 @@ export class RunRunner {
         // replayed approve read after it would approve a plan no human saw. Resolves at once once
         // delivered (an SDK claim already awaited it in takeResumedGateEvent).
         if (claim.plan_approved !== true && !!claim.plan_md?.trim() && !effectiveAutoApprove)
-          await this.awaitResumedDelivery(runId, steering, batcher, runLog, cancel.signal);
+          await this.awaitResumedDelivery(runId, steering, batcher, runLog, checkedHuman ? steering.lifecycleSignal() : cancel.signal);
         const verdict = await this.gatePlan(
           runId,
           planMd,
@@ -9362,7 +9375,7 @@ export class RunRunner {
           checkedHuman,
           checkedFields,
           checkedApproval,
-          cancel.signal,
+          checkedHuman ? () => steering.lifecycleSignal() : undefined,
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
             if (!(error instanceof CredentialSwitchSignal)) failStateBarrier?.(error);
@@ -14239,7 +14252,7 @@ export class RunRunner {
     associated?: CheckedHumanGate,
     checkedFields?: PlanCrossCheckStateRequest,
     checkedApproval?: Extract<Awaited<ReturnType<typeof checkPlan>>, { kind: "approve" }>["response"],
-    ownerSignal?: AbortSignal,
+    ownerSignal?: () => AbortSignal,
   ): Promise<PlanVerdict> {
     // PRD #1795 (decision 6): nothing is confirmed until THIS gate's own applied awaiting_approval
     // ACK says which revision it published, so a verdict bound to an earlier gate cannot act on
@@ -14418,7 +14431,7 @@ export class RunRunner {
     let ack: StateAck;
     try { ack = await reportState(request); }
     catch (error) {
-      if (!associated || error instanceof CredentialSwitchSignal) throw error;
+      if (!associated || isCheckedLifecycleControl(error)) throw error;
       throw new Error("plan cross-check: human-presentation ACK unrecoverable", { cause: error });
     }
     if (associated && (ack.applied !== true || ack.status !== "awaiting_approval" ||
@@ -14498,7 +14511,7 @@ export class RunRunner {
     };
 
     if (this.planApprovalTimeoutMs <= 0)
-      return settle(await steering.awaitGateEvent(epoch!, ownerSignal ?? this.shutdownSignal.signal));
+      return settle(await steering.awaitGateEvent(epoch!, AbortSignal.any([ownerSignal?.() ?? this.shutdownSignal.signal, this.shutdownSignal.signal])));
 
     // One absolute deadline across all revision rounds: set it on the first entry and
     // reuse it, so the per-round timer counts down the REMAINING budget (not a fresh 24h).
@@ -14512,7 +14525,7 @@ export class RunRunner {
     // The timeout can win Promise.race while the gate waiter is still parked.
     // End that losing wait as well, without aborting the runner's shutdown signal.
     const gateWaitAbort = new AbortController();
-    const gateWaitSignal = AbortSignal.any([ownerSignal ?? this.shutdownSignal.signal, gateWaitAbort.signal]);
+    const gateWaitSignal = AbortSignal.any([ownerSignal?.() ?? this.shutdownSignal.signal, this.shutdownSignal.signal, gateWaitAbort.signal]);
     const timeout = new Promise<PlanVerdict>((resolve) => {
       timer = setTimeout(
         () => resolve({ kind: "reject", reason: PLAN_APPROVAL_TIMEOUT_REASON }),

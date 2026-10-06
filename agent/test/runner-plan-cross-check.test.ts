@@ -9,7 +9,7 @@ import { MessageBatcher } from "../src/batcher.js";
 import type { PlanCrossCheckCandidate, PlanCrossCheckStateRequest } from "../src/client.js";
 import type { PlanVerdict } from "../src/steering.js";
 import { nullLogger } from "./helpers.js";
-import { api, git, homeDir, installHarness, runner, fakeGitlab,
+import { api, git, homeDir, installHarness, runner, runnerWith, fakeGitlab,
   planWithMilestonesThenDoneQuery } from "./runner-harness.js";
 import { freshClaim, gates, holdGateAck, newApi, row, send, routed, statuses, until } from "./gate-revision-harness.js";
 
@@ -64,6 +64,47 @@ function terminal(runId: string, condition: string) {
 }
 
 describe("U2 real runner checked gate", () => {
+  for (const httpStatus of [400, 409]) {
+    it(`negative canonical storage ACK ${httpStatus} prevents implementation`, async () => {
+      const c = claim();
+      api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body) });
+      api.failStateWhen(c.run_id, (b) => b.status === "running" && b.candidate_digest === digest,
+        { httpStatus, runStatus: "cancelled" });
+      const { exec, verdicts } = checkedExec();
+      await start(exec, c);
+      assert.deepEqual(verdicts, [], "no implementation verdict after negative storage ACK");
+      assert.ok(!statuses(c.run_id).includes("completed"));
+    });
+  }
+  for (const decision of ["approve", "revise"]) {
+    it(`server wall park at ${decision} ACK preserves clone and emits no terminal`, async () => {
+      const c = claim();
+      let clone = "";
+      api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, decision, decision) });
+      api.failStateWhen(c.run_id, (b) => decision === "approve"
+        ? b.status === "running" && b.candidate_digest === digest : b.status === "awaiting_approval",
+        { httpStatus: 409, runStatus: "paused", disposition: "stale_claim", holdReason: "budget_exhausted" });
+      const { exec, verdicts } = checkedExec(async (ctx) => { clone = ctx.worktreePath; });
+      const forge = fakeGitlab();
+      await runnerWith(() => ({ executor: exec, homeDir }), forge.gitlab, undefined, nullLogger(),
+        { planCrossCheckTiming: timing, planApprovalTimeoutMs: 2000 }).execute(c);
+      assert.deepEqual(verdicts, [], "park does not approve");
+      const observed = { statuses: statuses(c.run_id), cloneRetained: fs.existsSync(clone),
+        homeRetained: fs.existsSync(homeDir) };
+      assert.ok(!observed.statuses.includes("failed") && observed.cloneRetained && observed.homeRetained,
+        `server park must stay nonterminal and preserve clone + HOME: ${JSON.stringify(observed)}`);
+    });
+  }
+  it("stale canonical storage ACK ends quietly", async () => {
+    const c = claim();
+    api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body) });
+    api.failStateWhen(c.run_id, (b) => b.status === "running" && b.candidate_digest === digest,
+      { httpStatus: 409, runStatus: "running", disposition: "stale_claim" });
+    await start(checkedExec().exec, c);
+    assert.ok(!statuses(c.run_id).includes("failed"), `superseded owner must not terminal-report: ${JSON.stringify(statuses(c.run_id))}`);
+  });
+
+
   it("stores the server canonical bundle, including explicit empty arrays, before returning cross_check approval", async () => {
     const c = claim();
     api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "approve", "approve", {
@@ -288,4 +329,56 @@ describe("U2 real runner checked gate", () => {
     assert.ok(!prompts.slice(1).some((p) => p.includes("local milestone")), "SDK clears local milestone list");
     assert.ok(statuses(c.run_id).includes("completed"));
   });
+});
+
+for (const [checked, revised] of [[true, false], [false, false], [true, true]] as const)
+it(`${checked ? "checked" : "ordinary"} confirmed human wait survives one real switch give-up${revised ? " then human revision" : ""}`, async () => {
+  const c = claim();
+  if (!checked) { c.auto_approve = false; c.plan_cross_check_required = false; }
+  api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "revise", "revise") });
+  const queryFn: SdkQueryFn = revised
+    ? (params) => planWithMilestonesThenDoneQuery([])(params)
+    : planWithMilestonesThenDoneQuery([]);
+  const sdk = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+  let attempts = 0;
+  let published = false;
+  let gaveUp = false;
+  api.onState(c.run_id, (b) => {
+    if (b.status === "awaiting_approval" && !published) {
+      published = true;
+      api.requestCredentialSwitch(c.run_id, 1);
+    }
+    if (b.status === "credential_switch_failed") {
+      gaveUp = true;
+      send(c.run_id, row(revised ? "revise_plan" : "reject_plan", revised ? "revise after give-up" : "reject after give-up"));
+    }
+    // Ordinary gates re-present under their legacy revision semantics; reject that
+    // current presentation too if the first rejection was bound to the prior one.
+    if ((!checked || revised) && gaveUp && b.status === "awaiting_approval")
+      send(c.run_id, row("reject_plan", "reject after give-up"));
+  });
+  const exec: Executor = { run: async (ctx) => {
+    git.worktreeStatus = async () => ["M src/impl.ts"];
+    git.commitWipMarker = async () => false;
+    const switchAttempt = ctx.attemptCredentialSwitch!;
+    ctx.attemptCredentialSwitch = async () => {
+      attempts++;
+      // Bound the regression's failure path rather than looping on the same old abort.
+      if (attempts > 1) throw new Error("repeated switch without a new request");
+      const outcome = await switchAttempt();
+      assert.equal(outcome, "gave_up");
+      return outcome;
+    };
+    return sdk.run(ctx);
+  } };
+  const forge = fakeGitlab();
+  await runner(exec, forge.gitlab, undefined, { planCrossCheckTiming: timing,
+    recoveryRetryMs: 1, planApprovalTimeoutMs: 2000 }).execute(c);
+  assert.equal(attempts, 1, "the old aborted owner signal must not trigger a second switch");
+  assert.ok(api.states.some((s) => s.runId === c.run_id && s.body.status === "failed" &&
+    s.body.failure_reason?.includes("reject after give-up")), "human rejection ends the run");
+  if (checked) {
+    assert.equal(gates(c.run_id).length, revised ? 2 : 1, "give-up retains the gate; only human revision publishes another");
+    assert.equal(api.crossCheckRequests.length, 1, "no second candidate after give-up");
+  }
 });
