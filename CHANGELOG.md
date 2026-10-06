@@ -25,7 +25,7 @@ through `[0.52.0]`.)
 ### Changed
 
 - **Higher default resource requests for the api and the CNPG database.**
-  The chart now requests 100m CPU / 320Mi for the api (was 50m / 128Mi) and 512Mi per CNPG instance (was 256Mi), matching what a live install actually uses which reduces their eviction risk under node memory pressure. Limits are unchanged; override `api.resources` or `postgres.cluster.resources` to size differently.
+  The chart now requests 100m CPU / 320Mi for the api (was 50m / 128Mi) and 512Mi per CNPG instance (was 256Mi), matching what a live install actually uses, which reduces their eviction risk under node memory pressure. Limits are unchanged; override `api.resources` or `postgres.cluster.resources` to size differently.
 
 ## [0.86.0] - 2026-10-06
 
