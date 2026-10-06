@@ -1245,10 +1245,12 @@ describe("m1 credential-free owner cancel", () => {
     { work: "clean", route: "deferred", terminal: "immediate" },
   ] as Array<{ work: string; release?: string; process?: string; docker?: string; trust?: string;
     inspect?: string; drain?: string; terminal?: string; route?: string }>;
-  for (const scenario of cases.filter(scenario => HAS_PROCFS || !scenario.process))
+  for (const scenario of cases.filter(scenario => (HAS_PROCFS || !scenario.process) &&
+      (scenario.work !== "lossy-path" || process.platform === "linux")))
     it(`actual runner owner cancel ${JSON.stringify(scenario)}`, async () => {
       const { work } = scenario;
-      const shouldRelease = work === "clean" && !scenario.release && !scenario.process &&
+      // The bounded descriptor reader conservatively refuses unsupported platforms.
+      const shouldRelease = process.platform === "linux" && work === "clean" && !scenario.release && !scenario.process &&
         !scenario.trust && !scenario.inspect && !scenario.drain;
       const api = new FakeApi("cancel-worker");
       const url = await api.listen();
