@@ -1,3 +1,5 @@
+import { PlanCrossCheckEvent } from "./PlanCrossCheck";
+import type { PlanCrossCheckSummary } from "../lib/apiTypes";
 import { memo, useEffect, useRef, useState, type ReactNode } from "react";
 import type { RunMessage } from "../lib/api";
 import type { PhaseUsage } from "../lib/runUsage";
@@ -1038,7 +1040,9 @@ export const RunEventRow = memo(function RunEventRow({
   live,
   phaseUsage,
   onFindingMutation,
+  planCheckDetail,
 }: {
+  planCheckDetail?: PlanCrossCheckSummary;
   msg: RunMessage;
   result?: RunMessage;
   live: boolean;
@@ -1101,6 +1105,8 @@ export const RunEventRow = memo(function RunEventRow({
           )}
         </div>
       );
+    case "cross_check":
+      return rec?.["stage"] === "plan" ? <PlanCrossCheckEvent payload={msg.payload} detail={planCheckDetail} /> : <MetaLine text="Cross-check outcome unavailable" />;
     case "plan":
       return (
         <div className="inline-flex items-center gap-1.5 rounded-md border border-warn/40 bg-warn/10 px-2 py-1 text-xs text-warn">

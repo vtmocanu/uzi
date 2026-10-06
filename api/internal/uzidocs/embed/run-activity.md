@@ -48,14 +48,16 @@ plan by accident. A **reject** or **request changes** sent the same way is
 not ignored: it still applies at the run's first gate, the same
 fail-closed handling these two actions have always had.
 
-If a worker cannot re-present a plan gate it previously showed — for
-example after a restart or credential switch that lost track of what was
+For ordinary plan gates, if a worker cannot re-present a gate it previously
+showed — for example after a restart or credential switch that lost track of what was
 on screen — the run parks at `recovery_wait` (see [Recovery
 wait](./run-recovery-wait.md)) rather than showing a gate it can't stand
 behind, and a fresh claim retries. This is bounded: past
 `RUN_GATE_REFUSAL_MAX` such refusals for one run (see
 [Configuration](./configuration.md)), the next one fails the run instead
-of parking it again, with reason `gate_presentation_refused`.
+of parking it again, with reason `gate_presentation_refused`. Cross-check's
+irrecoverable receipt/presentation ACK losses instead fail terminally; see
+[Terminal delivery failures](./cross-check.md#terminal-delivery-failures).
 
 If the planning turn itself wrote anything to the worktree — a file the
 agent created or modified while it was still just planning, which would
@@ -66,9 +68,34 @@ sure you're approving with the full picture. A plan turn that touched
 nothing shows no such list. The same list is available from the terminal
 via `uzi run get` (see [the CLI docs](./cli.md#commands)).
 
-Autopilot runs skip this gate entirely — see [Autopilot](./autopilot.md).
+Autopilot normally skips the human gate. With [Plan cross-check](./cross-check.md),
+a Claude lead proceeds after an exact-plan pass; a non-pass normally forces
+this gate, and Codex leads park as unsupported. See [Autopilot](./autopilot.md).
 A full revision round also works end to end from
 [Slack](./slack.md#using-it), without opening the web UI.
+
+### Plan cross-check evidence
+
+The plan panel and run detail show **Plan cross-check** evidence separately
+from the current human gate: checked-candidate outcome, findings, checker-run
+link, recorded model/effort and reported tokens/cost. The activity feed
+includes plan cross-check events even when there is no agent lane. Pending,
+passed, changes requested, blocked, verdict deadline, checker model timeout,
+malformed/model/confinement failures, interruption and refusal have distinct
+labels; unknown or inconsistent verdict/reason pairs show unavailable.
+
+Findings use hardened Markdown, capped at 16,384 source characters across
+20 items, with a notice when truncated. Metadata is bounded and sanitized;
+missing model/effort is unreported, missing cost unavailable, and subscription
+usage is labelled separately from metered spend. New plan cross-check events
+refresh detail; a failed refresh waits for a later new event rather than
+retrying indefinitely.
+
+After a human revision, the original candidate is **Earlier-plan evidence**
+and does not certify the current plan. The current gate reason can clear
+while those findings remain visible. Decisions still act on the established
+presentation and revision; a status read cannot create or replace that gate.
+No automatic checker revision or fresh check is added by a human revision.
 
 ### Advisory draft captures
 

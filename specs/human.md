@@ -206,9 +206,9 @@ Tracked as GitLab issue vtmocanu/uzi#19; PRD at `prds/done/19-admin-settings-and
 
 - Generic admin-only instance-settings infrastructure; the PRD label and the autopilot label are its first two configurable keys.
 - Admins can change the PRD label and the autopilot label; the board reflects the new label set after a resync (no code fork).
-- Autopilot: adding the autopilot label (alongside the PRD label) to an issue in GitLab normally runs it end to end without uzi interaction. An owner opted in to Plan cross-check may need to decide at the human plan gate: the M1 checker-unavailable park always requires that decision; later, a check that does not approve the plan does too. (AI-synced 2026-10-03)
+- Autopilot: adding the autopilot label (alongside the run-eligibility label, default `uzi`) to an issue in GitLab normally runs it end to end without uzi interaction. With Plan cross-check enabled, a Claude lead proceeds only after Codex approves the exact plan and the handoff is acknowledged; a non-pass normally requires a human plan decision, and Codex leads park as unsupported. Irrecoverable preparation receipts or human-presentation ACK loss fails terminally; unresolved preparation ACKs after three attempts and an acknowledged forced human gate also fail. Historical findings do not certify a human revision. See [Cross-check](../docs/cross-check.md). (AI-synced 2026-10-06)
 - (AI-synced 2026-08-29) PRD #764 removed the `prd_label` setting (and its special-casing) and added a configurable `uzi_label` (default `uzi`) as the single run-eligibility key; autopilot now rides alongside `uzi`, not `PRD`. The generic admin-settings infrastructure and the configurable `autopilot_label` are unchanged.
-- Progress is visible via the existing board label moves; the user need never open uzi.
+- Progress is visible via the existing board label moves; an opted-in Plan cross-check fallback can require a human gate decision in uzi, the CLI or Slack. (AI-synced 2026-10-06)
 - Outcome returns as one GitLab issue comment: MR link on success; on failure, one comment with a run link.
 - Consent is per-user opt-in, default off — a third party must never be able to spend your Anthropic tokens without your opt-in.
 - Each user self-declares their own forge (human) username on their connection (the mapping autopilot attributes runs to).

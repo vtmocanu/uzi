@@ -65,10 +65,12 @@ including the assigned-sweep default. Issue-target fires also assess the
 issue author and comments before honoring that request — see [Issue input
 and the approval gate](#issue-input-and-the-approval-gate). Turn the toggle
 off to have runs wait for a human, same as a manual start. For an owner who
-opted in to [Plan cross-check](./cross-check.md), an auto-approved schedule
-run must pass that gate before implementing. In this release the checker is
-unavailable, so these runs park for a human plan decision even though the
-schedule has auto-approve on. The plan is
+opted in to [Plan cross-check](./cross-check.md), an eligible auto-approved
+schedule run must pass that gate before implementing. A Claude lead proceeds
+after a Codex APPROVE of the exact plan; a non-pass normally parks for a human
+decision even with auto-approve on. Codex leads park as unsupported.
+Irrecoverable delivery losses fail the run; see
+[Cross-check](./cross-check.md#terminal-delivery-failures). The plan is
 recorded either way, and a human still merges the resulting MR; the
 [main-branch guardrails](../ARCHITECTURE.md#guardrail-layers-the-primary-directive)
 apply independently of schedule approval.
