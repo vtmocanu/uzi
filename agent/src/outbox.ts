@@ -584,7 +584,7 @@ export class Outbox {
         for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
           if (!entry.isFile()) continue;
           const match = /^(terminal-\d+\.json)\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/.exec(entry.name);
-          if (!match) continue;
+          if (!match?.[1]) continue;
           const generation = parseTerminalFileName(match[1]);
           if (generation === undefined || match[1] !== terminalFileName(generation)) continue;
           const file = path.join(dir, entry.name);
