@@ -5963,7 +5963,9 @@ describe("CodexExecutor clarification turns (#1584)", () => {
         let exec!: CodexExecutor;
         const sinks: string[] = [];
         const iterations: number[] = [];
+        const controller = new AbortController();
         const { ctx } = makeCtx({
+          signal: controller.signal,
           kind: "issue", completionInterlock: interlocked, config: { max_iterations: 1 },
           askUser: async () => {
             assert.equal(rig.sessionOps.persist, checkpoint ? 1 : 0);
@@ -5981,23 +5983,46 @@ describe("CodexExecutor clarification turns (#1584)", () => {
         });
         exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
         const running = exec.run(ctx).finally(() => { settled = true; });
-        await waitFor(() => asked || settled, "question or premature exit");
-        // Always release the instrument before asserting, including on a broken implementation.
-        const observed = {
-          asked, settled, launches: rig.providerLaunches(), turns: rig.epochs[0]!.transport.turnStartCount,
-          attempts, remediation, sinks: [...sinks],
-        };
-        answer?.({ kind: "answer", answers: ["retained-answer"] });
-        await withTimeout(running, 5000, "pending answer continuation");
-        assert.deepEqual(observed, { asked: true, settled: false, launches: 1, turns: 1,
-          attempts: 0, remediation: 0, sinks: checkpoint ? ["milestone_checkpoint"] : [] });
-        assert.equal(attempts, interlocked ? 1 : 0);
-        assert.equal(remediation, 1);
-        assert.deepEqual(iterations, checkpoint ? [1, 1] : [1]);
-        assert.deepEqual(sinks, [...(checkpoint ? ["milestone_checkpoint"] : []), ...(interlocked ? ["done_checkpoint"] : [])]);
-        const transport = rig.epochs[checkpoint ? 1 : 0]!.transport;
-        assert.match(promptTexts(transport)[checkpoint ? 0 : 1]!, /A: retained-answer/);
-        if (checkpoint) assert.ok(transport.requests.some((r) => r.method === "thread/resume"));
+        // Attach a rejection handler immediately, even if observation fails before joining.
+        const joined = running.catch(() => undefined);
+        let observationError: unknown;
+        let cleanupError: unknown;
+        try {
+          await waitFor(() => asked || settled, "question or premature exit");
+          const observed = {
+            asked, settled, launches: rig.providerLaunches(), turns: rig.epochs[0]!.transport.turnStartCount,
+            attempts, remediation, sinks: [...sinks],
+          };
+          answer?.({ kind: "answer", answers: ["retained-answer"] });
+          await withTimeout(running, 5000, "pending answer continuation");
+          assert.deepEqual(observed, { asked: true, settled: false, launches: 1, turns: 1,
+            attempts: 0, remediation: 0, sinks: checkpoint ? ["milestone_checkpoint"] : [] });
+          assert.equal(attempts, interlocked ? 1 : 0);
+          assert.equal(remediation, 1);
+          assert.deepEqual(iterations, checkpoint ? [1, 1] : [1]);
+          assert.deepEqual(sinks, [...(checkpoint ? ["milestone_checkpoint"] : []), ...(interlocked ? ["done_checkpoint"] : [])]);
+          const transport = rig.epochs[checkpoint ? 1 : 0]!.transport;
+          assert.match(promptTexts(transport)[checkpoint ? 0 : 1]!, /A: retained-answer/);
+          if (checkpoint) assert.ok(transport.requests.some((r) => r.method === "thread/resume"));
+        } catch (error) {
+          observationError = error;
+        } finally {
+          // One release/cancel attempt and a five-second join; no retry loop.
+          answer?.({ kind: "answer", answers: ["retained-answer"] });
+          if (!settled) controller.abort();
+          try {
+            await withTimeout(joined, 5000, "pending answer cleanup");
+          } catch (error) {
+            cleanupError = error;
+          }
+        }
+        if (cleanupError !== undefined) {
+          if (observationError !== undefined) {
+            throw new AggregateError([observationError, cleanupError], "observation and pending answer cleanup failed");
+          }
+          throw cleanupError;
+        }
+        if (observationError !== undefined) throw observationError;
       });
     }
   }

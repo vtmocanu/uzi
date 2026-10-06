@@ -311,11 +311,13 @@ describe("Codex RunRunner clarification completion (#2284)", () => {
       let worktree = "";
       let launches = 0;
       let reaps = 0;
+      let persists = 0;
       let publishes = 0;
       let mrCalls = 0;
       let settled = false;
       let checkpointAtAsk = 0;
       let reapsAtAsk = 0;
+      let persistsAtAsk = 0;
       const first = new ClarificationTransport((t) => {
         commitMarker(worktree, "checkpoint before clarification");
         t.push({ kind: "thread_started", method: "thread/started", threadId: "th-clarify",
@@ -365,7 +367,7 @@ describe("Codex RunRunner clarification completion (#2284)", () => {
           };
         },
         sessionStore: { adopt: async () => ({ files: 0 }), inspect: async () => "absent",
-          remove: async () => {}, persist: async () => ({ files: 0, bytes: 0 }) },
+          remove: async () => {}, persist: async () => { persists++; return { files: 0, bytes: 0 }; } },
       };
       const executor = new CodexExecutor(log, path.join(fx.dataDir, "codex"),
         { binding: selection.binding, client, commandSandbox: "off",
@@ -387,6 +389,7 @@ describe("Codex RunRunner clarification completion (#2284)", () => {
           questionId = body.open_question_id ?? "";
           checkpointAtAsk = publishes;
           reapsAtAsk = reaps;
+          persistsAtAsk = persists;
         }
       });
       const runner = new RunRunner(client, git, () => ({ executor: {
@@ -421,7 +424,7 @@ describe("Codex RunRunner clarification completion (#2284)", () => {
       };
       try {
         await wait(() => !!questionId && answerDeadline.delay() !== undefined);
-        const parked = { questionId, checkpointAtAsk, reapsAtAsk, launches, turns: first.turns, settled, mrCalls };
+        const parked = { questionId, checkpointAtAsk, reapsAtAsk, persistsAtAsk, launches, turns: first.turns, settled, mrCalls };
         assert.equal(answerDeadline.delay(), 3000, "the answer deadline is controlled while pending");
         if (schedule === "tick published before answer") {
           assert.equal(tick.delay(), 1000, "the deferred checkpoint armed its short kick");
@@ -430,8 +433,10 @@ describe("Codex RunRunner clarification completion (#2284)", () => {
           assert.deepEqual(tickOutcomes, ["published"]);
         } else {
           assert.deepEqual(tickOutcomes, [], "the quick answer schedule fires no tick");
-          assert.equal(publishes, 0);
+          assert.equal(publishes, 0, "withholding the controlled tick leaves publication deferred");
         }
+        assert.equal(statuses(claim.run_id).at(-1), "awaiting_input",
+          "the unanswered run remains parked after the controlled tick schedule");
         assert.deepEqual({ launches, turns: first.turns, freshTurns: fresh.turns, settled, mrCalls },
           { launches: 1, turns: 1, freshTurns: 0, settled: false, mrCalls: 0 },
           "checkpoint publication does not start a provider turn or finalize an MR while the answer is pending");
@@ -447,18 +452,12 @@ describe("Codex RunRunner clarification completion (#2284)", () => {
         assert.equal(parked.checkpointAtAsk, 0);
         assert.ok(logs.some((entry) => (entry as { message: string }).message.includes("scan_deferred")));
         if (schedule === "tick published before answer") {
-          // Preparatory reproduction: preserve the old assertion and its named failure until
-          // the next milestone replaces it with the final publication semantics.
-          assert.throws(
-            () => assert.equal(answered.publishes, 0, "remote publication remains deferred while clarification resumes"),
-            { name: "AssertionError", actual: 1, expected: 0,
-              message: "remote publication remains deferred while clarification resumes\n\n1 !== 0\n" },
-          );
-          assert.equal(answered.publishes, 1, "the deferred checkpoint published before the answer");
+          assert.equal(answered.publishes, 1, "the controlled tick published the checkpoint before the answer");
         } else {
-          assert.equal(answered.publishes, 0, "remote publication remains deferred while clarification resumes");
+          assert.equal(answered.publishes, 0, "withholding the controlled tick leaves publication deferred through answer continuation");
         }
-        assert.ok(parked.reapsAtAsk > 0, "real boundary reaped before asking");
+        assert.equal(parked.persistsAtAsk, 1, "the mocked session persist completed before awaiting_input");
+        assert.ok(parked.reapsAtAsk > 0, "real boundary reaped before awaiting_input");
         assert.deepEqual({ launches: parked.launches, turns: parked.turns, settled: parked.settled, mrCalls: parked.mrCalls },
           { launches: 1, turns: 1, settled: false, mrCalls: 0 });
         assert.equal(answered.launches, 2);
