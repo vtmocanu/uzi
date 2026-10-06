@@ -601,7 +601,16 @@ async function runSharedCloneSection(
   // worker-uid fixture process trips git's dubious-ownership check; read it as the runner.
   const markerWrapped = runner.runnerCommand("git", ["-C", seed.path, "rev-parse", "HEAD"]);
   const marker = (await exec(markerWrapped.command, markerWrapped.args, { env: { PATH: "/usr/bin:/bin" } })).stdout.trim();
-  await gitCache.fetchAgentBranch(bare, seed.path, branch, seedRunId);
+  // Fresh TEST fixture claim; resolve the default identity from the worker-owned bare.
+  const fixtureDefaultBranch = await gitCache.defaultBranchName(bare);
+  assert.ok(fixtureDefaultBranch);
+  const fixtureDefaultSha = await gitCache.originBranchTip(bare, fixtureDefaultBranch);
+  assert.ok(fixtureDefaultSha);
+  const fixtureFetched = await gitCache.fetchAgentBranch(bare, seed.path, branch, seedRunId, {
+    context: { barePath: bare, branch, runId: seedRunId, generation: 1, kind: "issue",
+      defaultIdentity: { ref: `refs/remotes/origin/${fixtureDefaultBranch}`, sha: fixtureDefaultSha } },
+  });
+  assert.equal(fixtureFetched.kind, "updated", JSON.stringify(fixtureFetched));
   const packed = await gitCache.checkpointPack(bare, branch);
   if (!packed) throw new Error("checkpointPack returned null — nothing to publish");
   const packBuf = await drain(packed.pack);

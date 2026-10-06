@@ -1,3 +1,4 @@
+import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -162,7 +163,7 @@ describe("gitEnv M0 hardening: code-exec keys neutralized in real git (functiona
     runGit(rc.path, ["add", file], plainEnv());
     runGit(rc.path, [...IDENT, "commit", "-m", "work"], plainEnv());
     const tipSha = gitOut(rc.path, ["rev-parse", "HEAD"]);
-    const ref = await git.fetchAgentBranch(bare, rc.path, `agent/issue-${iid}`, "run-fixture");
+    const ref = await fixtureFetchTracking(git, bare, rc.path, `agent/issue-${iid}`, "run-fixture");
     return { ref, baseSha, tipSha };
   }
 
@@ -260,7 +261,7 @@ describe("gitEnv M0 hardening: code-exec keys neutralized in real git (functiona
     // 2.55.0; kept as a regression guard (B2 invariant 6).
     plant(rc.path, "uploadpack.packObjectsHook", evil);
     resetMarker();
-    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-200", "run-fixture");
+    const ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-200", "run-fixture");
     assert.equal(fired(), false, "a runner-planted uploadpack.packObjectsHook must NOT execute in the worker's fetch-back");
     // The mitigation must not break the fetch — the agent branch still lands in the bare.
     assert.match(gitOut(bare, ["rev-parse", ref]), /^[0-9a-f]{40}$/, "the fetch-back still landed the agent branch");
@@ -276,7 +277,7 @@ describe("gitEnv M0 hardening: code-exec keys neutralized in real git (functiona
 
     // The worker's ONE op that touches the clone is the file://+pack fetch-back, which runs
     // BEFORE any corruption while the clone is still valid.
-    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-301", "run-fixture");
+    const ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-301", "run-fixture");
 
     // Documentation-grade regression MARKER for the commondir/gitdir vector, honest about
     // what it proves. A compromised runner rewrites its OWN clone's `.git/commondir` to

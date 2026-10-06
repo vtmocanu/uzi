@@ -482,6 +482,46 @@ describe("RunRunner — settle transfers the clone-only head into the trusted ba
     }
   });
 
+  for (const failure of ["refused-fetch", "head-mismatch"] as const) {
+    it(`settle transfer ${failure} retains the clone without reserving a payload`, async () => {
+      const { gitlab } = fakeGitlab();
+      const { coord, fakeClient, root } = makeCoord();
+      const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-bare-xfer-control-"));
+      const originalFetch = git.fetchAgentBranch.bind(git);
+      const originalVerify = git.verifyRunnerTrackingCovers.bind(git);
+      const originalHead = git.worktreeHead.bind(git);
+      let verified = false;
+      try {
+        const iid = failure === "refused-fetch" ? 5110 : 5111;
+        const claim = gitlabClaim(iid, { claim_generation: 22 });
+        if (failure === "refused-fetch") {
+          git.fetchAgentBranch = (async () => ({ kind: "not_updated", reason: "preservation_failed" } as const)) as unknown as typeof git.fetchAgentBranch;
+        } else {
+          git.verifyRunnerTrackingCovers = async (...args) => {
+            verified = await originalVerify(...args);
+            return verified;
+          };
+          git.worktreeHead = async (...args) => verified ? "f".repeat(40) : originalHead(...args);
+        }
+        await runnerWith(commitThenFailFactory(homeRoot), gitlab, undefined, nullLogger(), {
+          recovery: coord,
+        }).execute(claim);
+        assert.ok(hasStatus(claim.run_id, "failed"));
+        if (failure === "head-mismatch") assert.equal(verified, true, "the mismatch follows a real positive verify");
+        assert.equal(fakeClient.reserveCalls.length, 0, "no current payload reserved");
+        assert.equal(fakeClient.uploadCalls.length, 0);
+        assert.equal(fakeClient.releaseCalls.length, 0);
+        assert.equal(fs.existsSync(worktreeDirFor(iid)), true, "the recoverable clone survives");
+      } finally {
+        git.fetchAgentBranch = originalFetch;
+        git.verifyRunnerTrackingCovers = originalVerify;
+        git.worktreeHead = originalHead;
+        fs.rmSync(homeRoot, { recursive: true, force: true });
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+
   it("9. a concurrent run moving the shared tracking ref between verify and retrieval never pins the foreign head, and the verified head stays durable through a prune (issue #1507)", async () => {
     const { gitlab } = fakeGitlab();
     const { coord, fakeClient, root } = makeCoord();

@@ -1,3 +1,4 @@
+import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -1277,7 +1278,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
     // Commit locally off the fork point and fetch it back (a first park — never pushed).
     const rc = await git.createOrAttachRunnerClone(bare, 210, noProofReseed, RUN);
     const local = commitInTree(rc.path, "LOCAL.txt", "local\n");
-    await git.fetchAgentBranch(bare, rc.path, "agent/issue-210", RUN);
+    await fixtureFetchTracking(git, bare, rc.path, "agent/issue-210", RUN);
     await git.removeRunnerClone(rc.path);
 
     // The default branch moves PAST the fork point, then the bare is refreshed.
@@ -1317,7 +1318,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
     // Push O1 to origin's agent/issue-211 (this fetch-back stamps the owner = RUN).
     const first = await git.createOrAttachRunnerClone(bare, 211, noProofReseed, RUN);
     const o1 = commitInTree(first.path, "ORIGIN.txt", "origin\n");
-    await git.fetchAgentBranch(bare, first.path, "agent/issue-211", RUN);
+    await fixtureFetchTracking(git, bare, first.path, "agent/issue-211", RUN);
     await git.pushBranch(bare, "agent/issue-211", "", fx.originPath);
     await git.removeRunnerClone(first.path);
     await git.ensureClone(fx.originPath); // learn origin/agent/issue-211 = O1
@@ -1328,7 +1329,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
     // it), so RUN still owns the (now diverged) ref.
     const tmp = await git.createOrAttachRunnerClone(bare, 2110, noProofReseed, "run-tmp");
     const l1 = commitInTree(tmp.path, "LOCAL.txt", "local\n");
-    await git.fetchAgentBranch(bare, tmp.path, "agent/issue-2110", "run-tmp");
+    await fixtureFetchTracking(git, bare, tmp.path, "agent/issue-2110", "run-tmp");
     await git.removeRunnerClone(tmp.path);
     gitUpdateRef(bare, trackingRef(211), l1);
 
@@ -1351,11 +1352,11 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
     const bare = await git.ensureClone(fx.originPath);
     const rc = await git.createOrAttachRunnerClone(bare, 212, noProofReseed, RUN);
     const o1 = commitInTree(rc.path, "O.txt", "o\n");
-    await git.fetchAgentBranch(bare, rc.path, "agent/issue-212", RUN);
+    await fixtureFetchTracking(git, bare, rc.path, "agent/issue-212", RUN);
     await git.pushBranch(bare, "agent/issue-212", "", fx.originPath);
     // Build ON TOP of the pushed tip (descends), fetch that back — do NOT push it.
     const l1 = commitInTree(rc.path, "L.txt", "l\n");
-    await git.fetchAgentBranch(bare, rc.path, "agent/issue-212", RUN);
+    await fixtureFetchTracking(git, bare, rc.path, "agent/issue-212", RUN);
     await git.removeRunnerClone(rc.path);
     await git.ensureClone(fx.originPath); // origin/agent/issue-212 stays at O1
 
@@ -1385,7 +1386,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
     // A tracking ref a permanently-dead run (run-dead) left behind, no origin branch.
     const tmp = await git.createOrAttachRunnerClone(bare, 213, noProofReseed, "run-dead");
     commitInTree(tmp.path, "STALE.txt", "stale\n");
-    await git.fetchAgentBranch(bare, tmp.path, "agent/issue-213", "run-dead");
+    await fixtureFetchTracking(git, bare, tmp.path, "agent/issue-213", "run-dead");
     await git.removeRunnerClone(tmp.path);
     assert.ok(shaInBare(bare, trackingRef(213)), "precondition: the stale ref exists");
 

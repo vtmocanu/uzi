@@ -1,3 +1,4 @@
+import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -100,7 +101,7 @@ describe("pushBranch secret flow", () => {
     // that fetchAgentBranch writes, so the fetch-back must run first.
     const bare = await git.ensureClone(fx.originPath);
     const rc = await git.createOrAttachRunnerClone(bare, 7, noProofReseed);
-    await git.fetchAgentBranch(bare, rc.path, "agent/issue-7", "run-fixture");
+    await fixtureFetchTracking(git, bare, rc.path, "agent/issue-7", "run-fixture");
 
     const oldPath = process.env.PATH ?? "";
     process.env.PATH = shimDir + path.delimiter + oldPath;

@@ -1,3 +1,4 @@
+import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -40,7 +41,7 @@ describe("GitCache.ancestry (PRD #1416 M2)", () => {
     fs.writeFileSync(path.join(rc.path, "impl.ts"), "export const x = 1;\n");
     gitIn(rc.path, ["add", "impl.ts"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "impl"]);
-    await git.fetchAgentBranch(bare, rc.path, "agent/issue-1", "run-a");
+    await fixtureFetchTracking(git, bare, rc.path, "agent/issue-1", "run-a");
     const descTip = await git.trackingTip(bare, "agent/issue-1");
     assert.ok(descTip && descTip !== mainTip);
 
@@ -57,7 +58,7 @@ describe("GitCache.ancestry (PRD #1416 M2)", () => {
     fs.writeFileSync(path.join(rc.path, "a.ts"), "export const a = 1;\n");
     gitIn(rc.path, ["add", "a.ts"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "X"]);
-    await git.fetchAgentBranch(bare, rc.path, "agent/issue-1", "run-a");
+    await fixtureFetchTracking(git, bare, rc.path, "agent/issue-1", "run-a");
     const tipX = await git.trackingTip(bare, "agent/issue-1");
     // REWRITE below X: reset to main and commit a DIFFERENT change → tipY shares main with X
     // but neither descends from the other. The `+` fetch force-moves the tracking ref to Y.
@@ -65,7 +66,7 @@ describe("GitCache.ancestry (PRD #1416 M2)", () => {
     fs.writeFileSync(path.join(rc.path, "b.ts"), "export const b = 2;\n");
     gitIn(rc.path, ["add", "b.ts"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "Y"]);
-    await git.fetchAgentBranch(bare, rc.path, "agent/issue-1", "run-a");
+    await fixtureFetchTracking(git, bare, rc.path, "agent/issue-1", "run-a");
     const tipY = await git.trackingTip(bare, "agent/issue-1");
     assert.ok(tipX && tipY && tipX !== tipY);
 

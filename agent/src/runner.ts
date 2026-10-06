@@ -6,7 +6,7 @@ import os from "node:os";
 import { basename as pathBasename, join, resolve as resolvePath } from "node:path";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
-import type { GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange } from "./git.js";
+import type { GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
   gitBasicCredential,
@@ -567,7 +567,7 @@ function publishSkipLabel(raw: unknown): PublishSkipLabel {
  *  was an AbortError even with no aborted signal (e.g. the client's own request timeout) — silent on
  *  the feed either way; the shutdown sink names the latter `publish_error`, since its permit did not
  *  expire — and `error` = any other throw. */
-type PublishFailClass = "no_local_tip" | "skipped" | "rejected" | "aborted" | "scratch_publication_refused" | "error";
+type PublishFailClass = "preservation_refused" | "no_local_tip" | "skipped" | "rejected" | "aborted" | "scratch_publication_refused" | "error";
 
 /** issue #1597 M1: the typed result of {@link RunRunner.publishCheckpointOutcome}. Only the
  *  allowlisted skip label and the numeric HTTP status are carried — never an error message,
@@ -617,6 +617,7 @@ function shutdownOutcomeOf(
       return permitSignal?.aborted ? "timeout" : "publish_error";
     case "scratch_publication_refused":
       return "scratch_publication_refused";
+    case "preservation_refused":
     case "error":
       return "publish_error";
   }
@@ -745,7 +746,20 @@ type BridgeOutcome =
   | { kind: "clean" }
   | { kind: "unknown" }
   | { kind: "bridged"; bridge: string }
+  | { kind: "failed" }
+  | { kind: "preservation_refused" };
+
+type FetchBackOutcome =
+  | { kind: "updated" }
+  | { kind: "refused" }
   | { kind: "failed" };
+
+class PreservationRefusedError extends Error {
+  constructor() {
+    super("tracking preservation refused");
+    this.name = "PreservationRefusedError";
+  }
+}
 
 /**
  * PRD #1392 M2 — `ensureClone` exhausted `withForgeRetry` with a TRANSIENT verdict: the forge
@@ -1553,6 +1567,8 @@ interface RunFlight {
    *  0 (chat's legacy sentinel) is never sent, and a rolled-back api's strict-decode 400 strips it
    *  and retries ONCE. Server-side NOT NULL DEFAULT 0. */
   readonly claimGeneration: number;
+  readonly owedDefaultBranch: string | undefined;
+  owedContext: Promise<OwedCandidateContext> | undefined;
   /** issue #1751 M2: the resolved claim kind, gating which live-settle trigger (checkpoint publish
    *  or finalize branch push) this run may fire. */
   readonly runKind: RunKind;
@@ -2721,7 +2737,8 @@ export class RunRunner {
                 // filter AFTER the proof above; re-prove before the fetch-back, overlay and publish.
                 // Blocked → RunResidueBlockedError, handled below exactly like a blocked first proof.
                 await this.quiesceOrBlockSink(flight, executor, "park", { processOnly: true });
-                const fetched = await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+                const fetched = await this.fetchBackBestEffort(barePath, worktreePath, branch, flight, runLog);
+                if (fetched.kind === "refused") return;
                 // PRD #1809 D8: what the publish below packs is the tracking ref; it holds the
                 // latest work only when this fetch-back landed and the ref equals the clone HEAD.
                 parkHoldsLatest = await this.trackingHoldsLatest(fetched, barePath, worktreePath, branch);
@@ -2729,7 +2746,7 @@ export class RunRunner {
                 // reseed on resume adopts B (the rewritten work), not the published tip. Best-effort:
                 // a park that fails is worse than a park that loses work (D4), so it NEVER throws —
                 // "failed"/"unknown" only log and the park continues.
-                await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "limit-park");
+                if ((await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "limit-park")).kind === "preservation_refused") return;
                 // PRD #628 M2: publish a ONE-SHOT checkpoint to origin so a DIFFERENT worker
                 // re-claiming this limit_wait run recovers the committed tree from
                 // refs/uzi-checkpoints/<branch> instead of cold-starting from default. Runs
@@ -2962,11 +2979,12 @@ export class RunRunner {
                   // issue #1783 (auditor M1): re-prove after the marker's runner-clone git, before
                   // the credentialed overlay + publish (blocked → RunResidueBlockedError below).
                   await this.quiesceOrBlockSink(flight, executor, "shutdown", { processOnly: true });
-                  await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+                  const fetched = await this.fetchBackBestEffort(barePath, worktreePath, branch, flight, runLog);
+                  if (fetched.kind === "refused") return;
                   // PRD #1416 M3 (C6): bridge a divergent tracking tip BEFORE the shutdown publish so
                   // a resume adopts B, not the published tip. Best-effort — a shutdown checkpoint must
                   // never throw (it is inside the k8s termination grace race, D4).
-                  await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "shutdown");
+                  if ((await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "shutdown")).kind === "preservation_refused") return;
                   // PRD #1062 M2 (#1036): the path is reaped above, so the overlay's PAT
                   // default-fetch is permitted — a behind-on-workflows branch checkpoints durably.
                   const shutdownOverlay = await this.buildCheckpointOverlay(claim, flight, barePath);
@@ -5191,12 +5209,7 @@ export class RunRunner {
     // depend on the (soon torn-down) runner clone. `trackingRef` is what push +
     // changedFiles read; the runner clone is never a git source for either.
     steps?.enter("fetch_back");
-    const trackingRef = await this.git.fetchAgentBranch(
-      barePath,
-      runnerClone.path,
-      result.branch,
-      runId,
-    );
+    const { trackingRef } = await this.fetchTracking(flight, barePath, runnerClone.path, result.branch);
 
     // PRD #1296 M3 (D1) — the protected finalization boundary. Pin the ORIGINAL committed
     // head H into the authenticated durable journal FIRST, unconditionally, and BEFORE any
@@ -5765,7 +5778,8 @@ export class RunRunner {
           workflowOverlayForbidden = hits.length > 0 && workflowBranchChanges === null;
         }
       } catch (error) {
-        rethrowWorkflowAbort(error);
+        if (error instanceof PreservationRefusedError) throw error;
+              rethrowWorkflowAbort(error);
         runLog.warn("workflow precheck unavailable; deferring to fresh alignment eligibility", { run_id: runId, error: errMessage(error) });
       }
       if (hits && hits.length > 0 && workflowBranchChanges?.some((file) => file.startsWith(".github/workflows/"))) {
@@ -5853,11 +5867,13 @@ export class RunRunner {
     const pushToOrigin = () =>
       withForgeRetry(
         async () => {
+          await this.requireTrackingOwned(flight, finalizeBarePath, result.branch);
           if (claim.repo.forge_type === "github" && !workflowUnavailable) {
             let hits: string[] | null = null;
             try {
               hits = await freshWorkflowFiles(trackingRef);
             } catch (error) {
+              if (error instanceof PreservationRefusedError) throw error;
               rethrowWorkflowAbort(error);
               runLog.warn("final workflow check unavailable; pushing normally", { run_id: runId, error: errMessage(error) });
             }
@@ -6305,12 +6321,7 @@ export class RunRunner {
               // filter or merge driver. Re-prove BEFORE the refetch and the PAT push; blocked throws
               // RunResidueBlockedError, which every push catch below rethrows unchanged.
               await this.reproveFinalizeOrThrow(flight, "finalize_align");
-              await this.git.fetchAgentBranch(
-                alignBarePath,
-                runnerClone.path,
-                result.branch,
-                runId,
-              );
+              await this.fetchTracking(flight, alignBarePath, runnerClone.path, result.branch);
               // PRD #1416 M3 (C4): the align chain re-fetched the CLONE's aligned tip into the
               // tracking ref — and a rebase-fallback align rewrites P (fact 14), so the aligned tip
               // can itself be divergent below P. Bridge it here, AFTER the re-fetch and BEFORE the
@@ -6325,6 +6336,7 @@ export class RunRunner {
                 flight,
                 runLog,
               );
+              if (o.kind === "preservation_refused") throw new PreservationRefusedError();
               if (o.kind === "failed") throw new HistoryRewrittenError(flight.publishedTip!);
               // PRD #1416 (MR-rework, finding 1): re-check the retained flagged commits and run the
               // merge-aware scan of everything above the published floors before pushing the bridged,
@@ -6636,6 +6648,7 @@ export class RunRunner {
         flight,
         runLog,
       );
+      if (o.kind === "preservation_refused") throw new PreservationRefusedError();
       if (o.kind === "failed") {
         await failHistoryRewritten(flight.publishedTip!);
         return;
@@ -7268,6 +7281,9 @@ export class RunRunner {
     // `?? 0` covers a pre-#1296 payload that omits the field. Held on the flight and stamped on
     // every mutating report + message batch so the server's per-query fence can engage.
     const claimGeneration = claim.claim_generation ?? 0;
+    if (!Number.isSafeInteger(claimGeneration) || claimGeneration < 0) {
+      throw new Error("invalid claim generation");
+    }
     const batcher = new MessageBatcher(
       this.client,
       runId,
@@ -7390,6 +7406,8 @@ export class RunRunner {
       cancel,
       steering,
       claimGeneration,
+      owedDefaultBranch: claim.repo.default_branch?.trim() || undefined,
+      owedContext: undefined,
       runKind: resolveRunKind(claim.kind),
       observedSessionId: undefined,
       latestContractRevision: undefined,
@@ -8516,7 +8534,8 @@ export class RunRunner {
       const cloneTip = await this.git.branchTip(runnerClone.path, runnerClone.branch);
       const trackTip = await this.git.trackingTip(barePath, runnerClone.branch);
       const tipUnmovedSinceFetch =
-        trackTip !== null && cloneTip !== null && trackTip === cloneTip;
+        trackTip !== null && cloneTip !== null && trackTip === cloneTip &&
+        await this.trackingOwned(flight, barePath, runnerClone.branch, cloneTip);
 
       // PRD #267: "new committed work not yet on origin". Depends ONLY on cloneTip (read at
       // the top) and flight.lastPublishedTip, neither of which the fetch-back changes, so it
@@ -8548,7 +8567,7 @@ export class RunRunner {
       // whose deadline the scan must not push it past (issue #1597 M2 review item 7).
       // `noReport`: skip the running report (the post-permit deferred publish; the milestone's own
       // pass already reported it).
-      const doCheckpointPublish = async (
+      const doCheckpointPublishOwned = async (
         overlay?: CheckpointOverlayContext | (() => Promise<CheckpointOverlayContext | undefined>),
         inPermit = false,
         noReport = false,
@@ -8565,7 +8584,7 @@ export class RunRunner {
         // iteration can become publish-eligible on a later tip-unmoved iteration).
         // PRD #1809 D8: whether the tracking ref (what the publish packs) holds cloneTip: the tip was
         // unmoved since the last fetch-back, or this fetch-back landed.
-        let fetchedBack = tipUnmovedSinceFetch;
+        let fetchedBack: FetchBackOutcome = { kind: "updated" };
         if (!tipUnmovedSinceFetch) {
           // Fetch back, credential-free (#218's helper): brings the committed work into
           // refs/uzi-runner/<branch> where the reseed reads it. Best-effort, never fails.
@@ -8573,7 +8592,7 @@ export class RunRunner {
             barePath,
             runnerClone.path,
             runnerClone.branch,
-            runId,
+            flight,
             runLog,
           );
         } else {
@@ -8582,6 +8601,12 @@ export class RunRunner {
             branch: runnerClone.branch,
           });
         }
+
+        if (fetchedBack.kind === "refused") {
+          bodyOutcome = "no_new_work";
+          return;
+        }
+        await this.requireTrackingOwned(flight, barePath, runnerClone.branch);
 
         // PRD #1416 M2: on the tip that was just fetched into the bare, detect a history
         // rewrite at/below the published floor P (and floor C) and steer the agent to restore
@@ -8603,6 +8628,10 @@ export class RunRunner {
           flight,
           runLog,
         );
+        if (bridgeOutcome.kind === "preservation_refused") {
+          bodyOutcome = "no_new_work";
+          return;
+        }
         if (bridgeOutcome.kind === "failed" || bridgeOutcome.kind === "unknown") {
           runLog.info("PRD #1416 M3: mid-run checkpoint bridge did not advance the tracking ref", {
             run_id: runId,
@@ -8624,6 +8653,7 @@ export class RunRunner {
         // the last CLEAN trusted gate scan, so a commit landing after that scan cannot slip out
         // unscanned through the GitHub overlay (which is otherwise unscanned). lastPublish,
         // lastPublishedTip, checkpointFloor and pendingPublish are left as they are.
+        await this.requireTrackingOwned(flight, barePath, runnerClone.branch);
         const remediation = flight.secretRemediation;
         // A commit only the mid-turn scan flagged (flaggedCommits, no `known`) holds too while it is
         // still an ancestor of the tip about to be published (unknown ancestry counts as reachable, an
@@ -8738,6 +8768,10 @@ export class RunRunner {
                 trace ? (step) => trace.enter(step) : undefined,
               );
               const outcome = await withCheckpointSoftGit(publish);
+              if (!outcome.published && outcome.reason === "preservation_refused") {
+                bodyOutcome = "no_new_work";
+                return;
+              }
               if (!outcome.published && checkpointSoft?.signal.aborted) throw new CheckpointSoftDeadlineError();
               published = outcome.published;
               bodyOutcome = outcome.published
@@ -8787,7 +8821,7 @@ export class RunRunner {
                 // fetch-back the checkpoint is the OLDER tracking tip `fetchedTip`: cloneTip was never
                 // published, so it is neither lastPublishedTip (hasNewWork stays true and the next
                 // checkpoint retries, and a pause cannot shortcut on it) nor the floor.
-                const packedClone = fetchedBack && cloneTip !== null && fetchedTip === cloneTip;
+                const packedClone = fetchedBack.kind === "updated" && cloneTip !== null && fetchedTip === cloneTip;
                 if (packedClone) flight.lastPublishedTip = cloneTip;
                 // N1: a checkpoint landed either way; the report-only orphan guards key on this.
                 flight.landedCheckpoint = true;
@@ -8857,6 +8891,15 @@ export class RunRunner {
               error: errMessage(e),
             }),
           );
+        }
+      };
+      const doCheckpointPublish = async (...args: Parameters<typeof doCheckpointPublishOwned>): Promise<void> => {
+        try {
+          await doCheckpointPublishOwned(...args);
+        } catch (error) {
+          if (!(error instanceof PreservationRefusedError)) throw error;
+          // Losing ownership at any attribution boundary skips only this checkpoint.
+          bodyOutcome = "no_new_work";
         }
       };
 
@@ -10041,17 +10084,75 @@ export class RunRunner {
     return (await this.dataVolume?.classify(err, destination)) === "data_volume_full" ? { cause: "data_volume_full" } : {};
   }
 
+  private async owedOptions(flight: RunFlight, barePath: string, branch: string): Promise<FetchAgentBranchOptions> {
+    flight.owedContext ??= (async (): Promise<OwedCandidateContext> => {
+      const defaultBranch = flight.owedDefaultBranch ?? await this.git.defaultBranchName(barePath);
+      if (!defaultBranch) throw new Error("owed candidate default branch unavailable");
+      const sha = await this.git.originBranchTip(barePath, defaultBranch);
+      if (!sha) throw new Error("owed candidate default identity unavailable");
+      const identity = {
+        runId: flight.runId, branch, kind: flight.runKind, barePath,
+        defaultIdentity: Object.freeze({ ref: `refs/remotes/origin/${defaultBranch}`, sha }),
+      };
+      const generation = flight.claimGeneration;
+      if (!Number.isSafeInteger(generation) || generation < 0) throw new Error("invalid claim generation");
+      return Object.freeze(generation === 0
+        ? { ...identity, generation: null, legacy: true }
+        : { ...identity, generation });
+    })();
+    const context = await flight.owedContext;
+    if (context.barePath !== barePath || context.branch !== branch) throw new Error("owed candidate flight context changed");
+    return { context, remotelyConfirmedSha: flight.lastCheckpointRefTip };
+  }
+
+  private preservationRefused(flight: RunFlight, reason: string): PreservationRefusedError {
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    flight.runLog.warn("tracking preservation refused", {
+      run_id: flight.runId, reason: sanitizeForLog(reason, 80),
+    });
+    return new PreservationRefusedError();
+  }
+
+  private async trackingOwned(flight: RunFlight, barePath: string, branch: string, expectedSha?: string): Promise<boolean> {
+    const { context } = await this.owedOptions(flight, barePath, branch);
+    const owned = await this.git.committedTrackingOwnership(
+      barePath, branch, flight.runId, expectedSha, context.generation ?? undefined,
+    );
+    return owned.kind === "owned" && owned.context.generation === context.generation &&
+      owned.context.runId === context.runId && owned.context.branch === context.branch &&
+      owned.context.barePath === context.barePath && owned.context.kind === context.kind &&
+      owned.context.defaultIdentity.ref === context.defaultIdentity.ref &&
+      owned.context.defaultIdentity.sha === context.defaultIdentity.sha;
+  }
+
+  private async requireTrackingOwned(flight: RunFlight, barePath: string, branch: string, expectedSha?: string): Promise<void> {
+    if (!await this.trackingOwned(flight, barePath, branch, expectedSha)) {
+      throw this.preservationRefused(flight, "ownership_unknown");
+    }
+  }
+
+  private async fetchTracking(flight: RunFlight, barePath: string, worktreePath: string, branch: string): Promise<Extract<TrackingUpdateResult, { kind: "updated" }>> {
+    const result = await this.git.fetchAgentBranch(
+      barePath, worktreePath, branch, flight.runId, await this.owedOptions(flight, barePath, branch),
+    );
+    if (result.kind === "not_updated") throw this.preservationRefused(flight, result.reason);
+    await this.requireTrackingOwned(flight, barePath, branch, result.candidateSha);
+    return result;
+  }
+
   private async fetchBackBestEffort(
     barePath: string,
     worktreePath: string,
     branch: string,
-    runId: string,
+    flight: RunFlight,
     runLog: Logger,
-  ): Promise<boolean> {
+  ): Promise<FetchBackOutcome> {
     try {
-      await this.git.fetchAgentBranch(barePath, worktreePath, branch, runId);
-      return true;
+      await this.fetchTracking(flight, barePath, worktreePath, branch);
+      return { kind: "updated" };
     } catch (e) {
+      if (e instanceof PreservationRefusedError) return { kind: "refused" };
       // PRD #1809 D6: name a fetch-back that failed because the data volume (where the worker
       // bare lives) is full, and start a reclaim pass so the resume has room. Not awaited and not
       // retried here: this runs inside park/shutdown boundaries with their own deadlines, and a
@@ -10062,7 +10163,7 @@ export class RunRunner {
         ...(full ? { cause: "data_volume_full" } : {}),
       });
       if (full) void this.dataVolume?.reclaim();
-      return false;
+      return { kind: "failed" };
     }
   }
 
@@ -10083,12 +10184,12 @@ export class RunRunner {
    * ref to a bridge commit carrying the same tree. False on any failure (never throws).
    */
   private async trackingHoldsLatest(
-    fetchedBack: boolean,
+    fetchedBack: FetchBackOutcome,
     barePath: string,
     worktreePath: string,
     branch: string,
   ): Promise<boolean> {
-    if (!fetchedBack) return false;
+    if (fetchedBack.kind !== "updated") return false;
     return this.git.verifyRunnerTrackingCovers(barePath, worktreePath, branch).catch(() => false);
   }
 
@@ -10184,6 +10285,10 @@ export class RunRunner {
     flight: RunFlight,
     runLog: Logger,
   ): Promise<BridgeOutcome> {
+    if (!await this.trackingOwned(flight, barePath, branch)) {
+      this.preservationRefused(flight, "ownership_unknown");
+      return { kind: "preservation_refused" };
+    }
     const publishedTip = flight.publishedTip;
     if (!publishedTip) return { kind: "clean" }; // no published floor (fact 17) — nothing to bridge
     // Read H from the WORKER-owned bare tracking ref; null ⇒ nothing published yet on this seam.
@@ -10272,8 +10377,14 @@ export class RunRunner {
     await this.git.scratchPublicationPreflight(barePath, branch, bridge);
     // Adopt B: advance the bare tracking ref (worker-uid) and the checkpoint floor C.
     try {
-      await this.git.updateTrackingRef(barePath, branch, bridge);
+      const update = await this.git.updateTrackingRef(barePath, branch, bridge, await this.owedOptions(flight, barePath, branch));
+      if (update.kind === "not_updated") {
+        this.preservationRefused(flight, update.reason);
+        return { kind: "preservation_refused" };
+      }
+      await this.requireTrackingOwned(flight, barePath, branch, update.candidateSha);
     } catch (e) {
+      if (e instanceof PreservationRefusedError) return { kind: "preservation_refused" };
       runLog.warn("PRD #1416 M3: could not advance the tracking ref to the bridge", {
         run_id: flight.runId,
         bridge,
@@ -10305,7 +10416,7 @@ export class RunRunner {
     flight: RunFlight,
     runLog: Logger,
     sink: string,
-  ): Promise<void> {
+  ): Promise<BridgeOutcome> {
     try {
       const o = await this.bridgeBareTrackingRefIfDivergent(barePath, branch, flight, runLog);
       if (o.kind === "failed" || o.kind === "unknown") {
@@ -10316,11 +10427,13 @@ export class RunRunner {
           outcome: o.kind,
         });
       }
+      return o;
     } catch (e) {
+      if (e instanceof PreservationRefusedError) return { kind: "preservation_refused" };
       if (e instanceof ScratchPublicationError) {
         logScratchPublicationRefused(runLog, flight.redactText, e, "park_bridge");
         this.reportPublishOutcome(flight, "scratch_publication_refused", "checkpoint publish failed: scratch_publication_refused");
-        return;
+        return { kind: "failed" };
       }
       // Never let a bridge failure undo a park/shutdown/capture (D4).
       runLog.warn("PRD #1416 M3: park/capture bridge threw; continuing best-effort", {
@@ -10329,6 +10442,11 @@ export class RunRunner {
         sink,
         error: errMessage(e),
       });
+      if (!await this.trackingOwned(flight, barePath, branch)) {
+        this.preservationRefused(flight, "ownership_unknown");
+        return { kind: "preservation_refused" };
+      }
+      return { kind: "failed" };
     }
   }
 
@@ -10370,6 +10488,7 @@ export class RunRunner {
     flight: RunFlight,
     barePath: string,
   ): Promise<CheckpointOverlayContext | undefined> {
+    await this.requireTrackingOwned(flight, barePath, flight.branch!);
     if (claim.repo.forge_type !== "github") return undefined;
     const defaultBranch =
       claim.repo.default_branch?.trim() ||
@@ -10758,10 +10877,11 @@ export class RunRunner {
       return { action: "proceed" };
     };
     try {
-      const fetched = await this.fetchBackBestEffort(barePath, runnerClone.path, branch, runId, runLog);
+      const fetched = await this.fetchBackBestEffort(barePath, runnerClone.path, branch, flight, runLog);
       const cloneTip = await this.git.branchTip(runnerClone.path, branch);
       const trackTip = await this.git.trackingTip(barePath, branch);
-      if (!fetched || cloneTip === null || trackTip === null || cloneTip !== trackTip) {
+      if (fetched.kind === "refused") throw new PreservationRefusedError();
+      if (fetched.kind !== "updated" || cloneTip === null || trackTip === null || cloneTip !== trackTip) {
         return await failOrProceed("tracking_tip_stale");
       }
       const scanned = await this.scanRemediationRange(flight, barePath, branch, cloneTip);
@@ -10866,6 +10986,7 @@ export class RunRunner {
         }),
       };
     } catch (e) {
+      if (e instanceof PreservationRefusedError) throw e;
       return await failOrProceed(`gate_threw: ${errMessage(e)}`);
     }
   }
@@ -11205,6 +11326,7 @@ export class RunRunner {
     // the first landed ACK.
     let packedTip: string | undefined;
     try {
+      await this.requireTrackingOwned(flight, barePath, branch, pinned?.tipSha);
       // issue #1597 M2: `pinned` is passed only by the scanned (overlay-less) publish; every other
       // caller keeps the unpinned 3-argument call shape.
       const packed = pinned
@@ -11264,6 +11386,7 @@ export class RunRunner {
       );
       return { published: false, reason: "rejected", httpStatus: res.httpStatus };
     } catch (e) {
+      if (e instanceof PreservationRefusedError) return { published: false, reason: "preservation_refused" };
       if (e instanceof ScratchPublicationError) {
         logScratchPublicationRefused(flight.runLog, flight.redactText, e, "checkpoint_publish");
         this.reportPublishOutcome(flight, "scratch_publication_refused", "checkpoint publish failed: scratch_publication_refused");
@@ -11853,8 +11976,9 @@ export class RunRunner {
     // Fetch the run's tip into the worker bare's tracking ref (refs/uzi-runner/<branch>), so the exact
     // clone-only head's objects are now present in the trusted bare. fetchAgentBranch THROWS on
     // failure (unlike the void fetchBackBestEffort), so a failed transfer is caught here.
+    let fetched: Extract<TrackingUpdateResult, { kind: "updated" }>;
     try {
-      await this.git.fetchAgentBranch(barePath, worktreePath, branch, flight.runId);
+      fetched = await this.fetchTracking(flight, barePath, worktreePath, branch);
     } catch (e) {
       runLog.warn("recovery: settle transfer fetch-back failed", { error: errMessage(e) });
       return null;
@@ -11876,8 +12000,9 @@ export class RunRunner {
     // between verify and read, so its reread is by-design, and its head feeds a PRD #218
     // owner-stamp-gated same-worker reseed, not a directly-archived cross-run bundle.)
     const head = await this.git.worktreeHead(worktreePath);
-    if (head === null) {
-      runLog.warn("recovery: settle transfer — verified, but the run HEAD is unresolvable");
+    if (head === null || head !== fetched.candidateSha) {
+      this.preservationRefused(flight, "ownership_unknown");
+      runLog.warn("recovery: settle transfer — run HEAD does not match the proved fetched candidate");
       return null;
     }
     // Durably anchor the exact verified head under a run+generation-scoped pin ref, so it stays
@@ -12886,6 +13011,7 @@ export class RunRunner {
     // the bridge below, which may move the ref to a bridge commit carrying the same tree). Unknown
     // without a runner clone to compare against, or when the quiescence proof blocked the sink.
     let holdsLatest: boolean | undefined;
+    let preservationRefused = false;
     if (!residueBlocked && barePath && branch && runnerClone) {
       markerCreated = await this.git.commitWipMarker(runnerClone.path).catch(() => false);
       // issue #1783 (auditor M1): the marker's status/add/commit can start an agent-planted filter
@@ -12905,23 +13031,33 @@ export class RunRunner {
       const preTip = await this.git
         .branchTip(runnerClone.path, branch)
         .catch(() => null);
-      let fetched = true; // nothing new to move: the ref is what the reseed left
-      if (preTip !== null && preTip !== runnerClone.baseCommit) {
+      let fetched: FetchBackOutcome = { kind: "updated" }; // ownership is checked even without a fetch
+      if (preTip !== null && (preTip !== runnerClone.baseCommit ||
+          !await this.trackingOwned(flight, barePath, branch, preTip))) {
         fetched = await this.fetchBackBestEffort(
           barePath,
           runnerClone.path,
           branch,
-          flight.runId,
+          flight,
           runLog,
         );
       }
-      holdsLatest = await this.trackingHoldsLatest(fetched, barePath, runnerClone.path, branch);
+      if (fetched.kind === "refused" || !await this.trackingOwned(
+        flight, barePath, branch, fetched.kind === "updated" ? preTip ?? undefined : undefined,
+      )) {
+        this.preservationRefused(flight, "ownership_unknown");
+        preservationRefused = true;
+      }
+      holdsLatest = !preservationRefused && await this.trackingHoldsLatest(fetched, barePath, runnerClone.path, branch);
       // PRD #1416 M3 (C7): bridge a divergent tracking tip BEFORE the pause-park publish so a resume
       // adopts B (the rewritten work), not the published tip. handlePausePark is checkpoint-first and
       // does NOT route through the doCheckpointPublish/reapForSink machinery C1/C5/C6 cover, so it is
       // wired here directly; the PauseNowSignal catch and the parkForPause callback both reach it, so
       // this one placement covers both. Best-effort — a park must never throw (D4).
-      await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "pause-park");
+      if (!preservationRefused &&
+          (await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "pause-park")).kind === "preservation_refused") {
+        preservationRefused = true;
+      }
     }
 
     // Checkpoint FIRST (Decision 8). An already-durable tip (a prior mid-run publish
@@ -12935,7 +13071,7 @@ export class RunRunner {
     // locally-recovered tracking-ref tip and is durable on origin only if the prior park's
     // best-effort publish actually landed.
     let published = false;
-    if (!residueBlocked && barePath && branch) {
+    if (!residueBlocked && !preservationRefused && barePath && branch) {
       const cloneTip = runnerClone
         ? await this.git
             .branchTip(runnerClone.path, branch)
@@ -13142,7 +13278,7 @@ export class RunRunner {
     // fetchAgentBranch THROWS on failure (unlike the void fetchBackBestEffort), so a
     // failed fetch-back is caught here rather than being swallowed.
     try {
-      await this.git.fetchAgentBranch(barePath, worktreePath, branch, flight.runId);
+      await this.fetchTracking(flight, barePath, worktreePath, branch);
     } catch (e) {
       if (opts.terminalDisk) {
         this.terminalDiskInterruption(flight);
@@ -13166,7 +13302,13 @@ export class RunRunner {
     // the recovery restore point + its published checkpoint hold B — a reseed on resume adopts B
     // (which descends from P) instead of the rewritten H being set aside. Best-effort — a recovery
     // capture must never throw.
-    await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "recovery-capture");
+    if ((await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "recovery-capture")).kind === "preservation_refused") {
+      return { verified: false, published: false };
+    }
+    if (!await this.trackingOwned(flight, barePath, branch)) {
+      this.preservationRefused(flight, "ownership_unknown");
+      return { verified: false, published: false };
+    }
     // Remote publish is SEPARATE and best-effort. The agent tree was already reaped by the
     // caller (handleRecoveryExhausted's killAgentTree, untouched), so the overlay's PAT
     // default-fetch is permitted. publishCheckpointBestEffort surfaces the HTTP/skip outcome
@@ -13765,7 +13907,7 @@ export class RunRunner {
     // fetchAgentBranch THROWS on failure (unlike the void fetchBackBestEffort), so a failed
     // fetch-back is caught here rather than swallowed.
     try {
-      await this.git.fetchAgentBranch(barePath, worktreePath, branch, flight.runId);
+      await this.fetchTracking(flight, barePath, worktreePath, branch);
     } catch (e) {
       runLog.warn("completion hold capture: fetch-back failed", { error: errMessage(e) });
       return NONE;
@@ -13778,11 +13920,12 @@ export class RunRunner {
     // still confirms the tracking ref covered H) and BEFORE the head is read + published, so a
     // credential-switch release captures B, not the rewritten H — the completion-hold head and the
     // published checkpoint both carry B, and a same-worker reclaim's reseed adopts it. Best-effort.
-    await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "hold-capture");
+    if ((await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "hold-capture")).kind === "preservation_refused") return NONE;
     // The captured head is the verified tracking tip. A verified ref whose tip is unresolvable is
     // treated as unverified (retain) — the hold contract requires a real head H for the permit.
     const head = await this.git.trackingTip(barePath, branch);
-    if (head === null) {
+    if (head === null || !await this.trackingOwned(flight, barePath, branch, head)) {
+      this.preservationRefused(flight, "ownership_unknown");
       runLog.warn("completion hold capture: tracking ref verified but its tip is unresolvable");
       return NONE;
     }

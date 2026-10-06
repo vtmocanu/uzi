@@ -818,11 +818,11 @@ describe("RunRunner — recovery cancellation reaps BEFORE the terminal report (
     let allowFetch = false;
     const realFetch = git.fetchAgentBranch.bind(git);
     const captureFailed = deferred();
-    git.fetchAgentBranch = async (...args: Parameters<typeof realFetch>) => {
+    git.fetchAgentBranch = (async (...args: Parameters<typeof realFetch>) => {
       if (allowFetch) return realFetch(...args);
       captureFailed.resolve();
       throw new Error("injected recovery-capture fetch failure (before publish)");
-    };
+    }) as typeof git.fetchAgentBranch;
     return { armAllow: () => { allowFetch = true; }, captureFailed };
   }
 

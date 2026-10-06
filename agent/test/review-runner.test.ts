@@ -122,7 +122,7 @@ function fakeGit(diff: string) {
     },
     fetchAgentBranch: async () => {
       calls.fetchAgentBranch++;
-      return "refs/uzi-runner/x";
+      throw new Error("review fixture must never fetch tracking work");
     },
   } as unknown as GitCache;
   return { git, calls };
