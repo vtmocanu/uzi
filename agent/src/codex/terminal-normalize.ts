@@ -207,11 +207,15 @@ export function normalizeCodexErrorInfo(raw: unknown): CodexErrorClassification 
 
 /** Choose the classification to surface: prefer a RECOGNIZED (non-"unknown") one — the
  *  notification first, then the terminal turn.error fallback — else whichever exists
- *  (an "unknown", or undefined when neither is present). */
+ *  (an "unknown", or undefined when neither is present). Exception: a terminal
+ *  `policy_refusal` always wins over a non-policy notification, so a provider policy refusal
+ *  is never masked by an earlier transport/other notification (it must stay a terminal
+ *  failure, never retried or recovery-parked). */
 export function pickCodexClassification(
   fromNotification: CodexErrorClassification | undefined,
   fromTerminal: CodexErrorClassification | undefined,
 ): CodexErrorClassification | undefined {
+  if (fromTerminal !== undefined && fromTerminal.category === "policy_refusal") return fromTerminal;
   if (fromNotification !== undefined && fromNotification.classification !== "unknown") return fromNotification;
   if (fromTerminal !== undefined && fromTerminal.classification !== "unknown") return fromTerminal;
   return fromNotification ?? fromTerminal;

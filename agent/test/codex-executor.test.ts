@@ -11586,6 +11586,44 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     assert.equal(errorResults(emitted).length, 1, "only the failed attempt published an error result");
   });
 
+  // #2321 review finding: a non-retrying transport error notification followed by a failed
+  // terminal that classifies as a provider policy refusal must stay a terminal policy refusal.
+  for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) {
+    it(`(b0) a transport notification then a ${tag} terminal is NOT retried or recovery-parked`, async () => {
+      const responder: Responder = (c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) c.transport.push(threadStarted());
+          c.transport
+            .push({
+              kind: "codex_error", method: "error", threadId: "th-1", turnId: "tn-1", willRetry: false,
+              params: { error: { codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 503 } } } },
+            })
+            .push(turnCompletedWithError(tag));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      };
+      const rig = makeRig({ responder });
+      tinyBackoff(rig);
+      const { ctx, emitted } = makeCtx();
+      await assert.rejects(
+        withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "policy refusal not retried"),
+        (e: Error) => {
+          assert.ok(!(e instanceof TransientRecoveryError), `got ${e.name}: ${e.message}`);
+          assert.match(e.message, new RegExp(`${tag}`));
+          return true;
+        },
+      );
+      assert.equal(rig.transport.turnStartCount, 1, "exactly one provider turn");
+      assert.deepEqual(retryNotices(emitted), []);
+      const refusals = emitted.filter((m) => rec(m.payload).event === "provider_policy_refusal");
+      assert.equal(refusals.length, 1);
+      assert.equal(rec(refusals[0]!.payload).policy_tag, tag);
+      assert.equal(rec(refusals[0]!.payload).origin, "root");
+    });
+  }
+
   it("(b) every attempt serverOverloaded: TransientRecoveryError after exactly 1+N turn starts", async () => {
     const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
     tinyBackoff(rig);

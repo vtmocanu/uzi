@@ -555,6 +555,29 @@ describe("CodexDelegationRunner: terminal + cancellation", () => {
     assert.equal(controller.closed, true);
   });
 
+  for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) {
+    it(`a transport notification then a ${tag} child terminal yields child_policy_refused (#2321)`, async () => {
+      const controller = new FakeController({ threadId: "ct", turnId: "cu", notes: [] });
+      withNotes(controller, [
+        { kind: "codex_error", method: "error", threadId: controller.threadId, turnId: controller.turnId, willRetry: false,
+          params: { error: { codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 503 } } } } },
+        { kind: "turn_completed", method: "turn/completed", threadId: controller.threadId, turnId: controller.turnId,
+          params: { turn: { status: "failed", error: { codexErrorInfo: tag } } } },
+      ]);
+      const events: PolicyRefusalPayload[] = [];
+      const parent = admitPolicyTurn("plan");
+      const res = await makeRunner({ controller, policy: {
+        policyParent: () => parent,
+        policySink: async p => { events.push(p); },
+      } }).runner.run(delegReq());
+      assert.equal(res.ok, false);
+      assert.equal(res.code, "child_policy_refused");
+      assert.equal(events.length, 1);
+      assert.equal(events[0]!.policy_tag, tag);
+      assert.equal(controller.closed, true);
+    });
+  }
+
   it("returns success when a completed child terminal still carries error params", async () => {
     const controller = new FakeController({ threadId: "ct", turnId: "cu", notes: [] });
     withNotes(controller, [
