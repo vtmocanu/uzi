@@ -7778,7 +7778,7 @@ export class GitCache {
   private async promoteTrackingUnderLock(barePath: string, branch: string, incoming: string,
     observed: { sha?: string; owner?: CheckedTrackingOwner }, opts: FetchAgentBranchOptions): Promise<TrackingUpdateResult> {
     const c = opts.context;
-    if (c.generation === null && observed.owner?.generation !== undefined &&
+    if (c.generation === null && observed.owner?.runId === c.runId && observed.owner.generation !== undefined &&
         observed.owner.generation !== null) return { kind: "not_updated", reason: "ownership_unknown" };
     const retainedShas: string[] = [];
     let divergence: "none" | "ancestor" | "divergent" | "unknown" | "foreign" = "none";

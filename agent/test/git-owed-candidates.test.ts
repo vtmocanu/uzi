@@ -904,6 +904,46 @@ describe("issue1924 M2 owed candidates", () => {
     assert.equal(fs.existsSync(path.join(bare, "uzi-owed")), false);
   });
 
+  it("foreign positive generation transfers to a different legacy run with honest provenance", async () => {
+    const foreignRun = "foreign-run";
+    opts.context = { ...positiveContext(), runId: foreignRun, generation: 4 };
+    const foreignContext = { ...opts.context };
+    const h = root("foreign positive H"); updated(await fetch());
+    // Leave H's owned tracking ref as its sole reachability anchor.
+    await cache.reconcileOwedCandidates(bare, foreignRun, h);
+    assert.deepEqual(await cache.enumerateOwedCandidates(bare, foreignRun), []);
+
+    opts.context = { ...positiveContext(), runId: RUN };
+    legacyContext();
+    const h2 = root("different legacy H2");
+    const result = updated(await fetch());
+    assert.equal(result.candidateSha, h2);
+    assert.equal(result.divergence, "foreign");
+    assert.deepEqual(result.retainedShas, [h2]);
+    assert.equal(tip(), h2);
+    assert.equal(stamp(), RUN);
+    assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-owed/${foreignRun}/${h}`]), h);
+    assert.deepEqual((await cache.enumerateOwedCandidates(bare, foreignRun)).map(
+      (candidate) => [candidate.sha, candidate.contexts]), [[h, [foreignContext]]]);
+    const candidates = await cache.enumerateOwedCandidates(bare, RUN);
+    assert.deepEqual(candidates.map((candidate) => candidate.sha), [h2]);
+    assert.deepEqual(candidates[0]!.contexts, [opts.context]);
+
+    const receipt = JSON.parse(fs.readFileSync(receiptPath(), "utf8"));
+    assert.equal(receipt.runId, RUN);
+    assert.equal(receipt.generation, null);
+    assert.equal(receipt.trackingSha, h2);
+    assert.equal(receipt.phase, "committed");
+    const context = JSON.parse(fs.readFileSync(path.join(bare, "uzi-owed", receipt.context), "utf8"));
+    assert.equal(context.runId, RUN);
+    assert.equal(context.generation, null);
+    assert.equal(context.legacy, true);
+    assert.equal("origin" in context, false);
+    const proof = await cache.committedTrackingOwnership(bare, BRANCH, RUN, h2);
+    assert.equal(proof.kind, "owned");
+    assert.deepEqual(await cache.committedTrackingOwnership(bare, BRANCH, RUN, h2, 4), { kind: "not_owned" });
+  });
+
   it("positive generation stays real without a guard flag and cannot downgrade to unknown legacy", async () => {
     opts.context = { ...positiveContext(), generation: 19 };
     const h = root("real generation"); updated(await fetch());
