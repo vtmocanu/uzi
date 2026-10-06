@@ -1125,7 +1125,7 @@ describe("RunEventRow — limit_wait / limit_hit (PRD #35)", () => {
         live={false}
       />,
     );
-    expect(container.textContent).toContain("Anthropic usage limit reached");
+    expect(container.textContent).toContain("Usage limit reached");
     expect(container.textContent).toContain("paused until it resets");
     expect(container.textContent).toContain("5-hour window");
     // Warn, not danger: nothing failed and the run comes back on its own.
@@ -1140,7 +1140,7 @@ describe("RunEventRow — limit_wait / limit_hit (PRD #35)", () => {
         live={false}
       />,
     );
-    expect(container.textContent).toContain("Anthropic usage limit reached");
+    expect(container.textContent).toContain("Usage limit reached");
     expect(container.textContent).not.toContain("paused");
     expect(container.textContent).toContain("7-day Opus window");
     expect(container.querySelector(".text-danger")).not.toBeNull();
@@ -1202,7 +1202,7 @@ describe("RunEventRow — limit_wait / limit_hit (PRD #35)", () => {
     expect(container.textContent).not.toContain("onerror");
     expect(container.textContent).not.toContain("img src");
     // The row is still useful without the clause.
-    expect(container.textContent).toContain("Anthropic usage limit reached");
+    expect(container.textContent).toContain("Usage limit reached");
   });
 
   it("drops a malformed resets_at rather than rendering a plausible-looking wrong date", () => {
@@ -1262,7 +1262,7 @@ describe("RunEventRow — limit_wait / limit_hit (PRD #35)", () => {
     for (const payload of [{}, null]) {
       cleanup();
       const { container } = render(<RunEventRow msg={msg({ seq: 8, kind: "limit_wait", payload })} live={false} />);
-      expect(container.textContent).toContain("Anthropic usage limit reached");
+      expect(container.textContent).toContain("Usage limit reached");
       expect(container.textContent).not.toContain("(");
     }
   });
@@ -1303,4 +1303,33 @@ describe("RunEventRow — steer_ack (PRD #634)", () => {
     );
     expect(container.textContent).not.toContain("unrenderable");
   });
+});
+
+describe("usage-limit provider regression #2360", () => {
+  it.each([
+    ["codex", "Codex usage limit"],
+    ["claude", "Anthropic usage limit"],
+    [undefined, "Usage limit"],
+    ["unrecognized-provider", "Usage limit"],
+  ])("uses closed run context %s for both outcomes", (harness, label) => {
+    for (const kind of ["limit_wait", "limit_hit"]) {
+      cleanup();
+      const { container } = render(<RunEventRow
+        msg={msg({ seq: 1, kind, payload: { harness: "payload-provider", provider: "payload-provider", rate_limit_type: "five_hour" } })}
+        live={false} harness={harness}
+      />);
+      expect(container.textContent).toContain(`${label} reached — ${kind === "limit_wait" ? "paused until it resets" : "the run failed here"}`);
+      expect(container.textContent).toContain("5-hour window");
+      expect(container.textContent).not.toContain("payload-provider");
+      expect(container.textContent).not.toContain("unrecognized-provider");
+    }
+  });
+});
+
+it("usage-limit provider regression #2360: memo rows respond to context", () => {
+  const event = msg({ seq: 1, kind: "limit_wait", payload: {} });
+  const { container, rerender } = render(<RunEventRow msg={event} live={false} harness="claude" />);
+  expect(container.textContent).toContain("Anthropic usage limit reached");
+  rerender(<RunEventRow msg={event} live={false} harness="codex" />);
+  expect(container.textContent).toContain("Codex usage limit reached");
 });

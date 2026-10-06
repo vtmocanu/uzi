@@ -64,6 +64,7 @@ import type { Readable, Writable } from "node:stream";
 import type { Logger } from "../log.js";
 import { codexDeferralReason, codexRefreshFailure, isTransientStatus, type WorkerClient } from "../client.js";
 import { TransientRecoveryError } from "../sdk-executor.js";
+import { classifyLimitEvidence, LimitReachedError } from "../limit.js";
 import { CodexTurnFailedError, formatCodexClassification, isCodexTransientClassification } from "./terminal-normalize.js";
 import type { DockerWiring } from "../docker-wiring.js";
 import { PlanRejectedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
@@ -101,7 +102,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { depsProvisionPlanNote, depsProvisionImplementNote, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
+import { depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -2536,6 +2537,8 @@ export class CodexExecutor implements Executor {
         }
         if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason);
         if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
+        if (verdict.approval === "cross_check")
+          throw new TrustedExecutionRefusal("codex cannot consume checked plan approval");
         pauseNow.vaultLock.gateOpen = false;
         gatedPlan = planMd;
         approvedMilestones = planResult.milestones;
@@ -3171,7 +3174,10 @@ export class CodexExecutor implements Executor {
             },
           };
         },
-        commandEffectSpec(worktreePath, worktreePath, FILEOP_BIN, ["--root", worktreePath], commandEnv, commandSandbox),
+        commandEffectSpec(
+          worktreePath, worktreePath, FILEOP_BIN, ["--root", worktreePath], commandEnv,
+          (ctx.kind as string | undefined) === "cross_check" ? "required" : commandSandbox,
+        ),
         boundaryDeadlineMs,
         "command",
         this.log,
@@ -3585,7 +3591,7 @@ export class CodexExecutor implements Executor {
       // (c) a failed terminal is classified ONCE and materialized+thrown here.
       if (sawTerminal && terminal && terminal.outcome === "failed") {
         const thrown = terminal.failure
-          ? terminal.failure.materialize(undefined)
+          ? terminal.failure.materialize(classifyLimitEvidence(terminal.limitEvidence ?? { explicitExhaustion: false }, Date.now()))
           : { original: new Error("codex run failed: unknown") };
         throw thrown.original;
       }
@@ -3754,6 +3760,11 @@ export class CodexExecutor implements Executor {
           if (lockedMsg !== REASON_PAUSE && lockedMsg !== REASON_WALL && lockedMsg !== REASON_IDLE) {
             throw new CodexCredentialDeferredError();
           }
+        }
+        if (caught instanceof LimitReachedError) {
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+          const reason = this.pendingInterruption(ctx, pauseNow, wall);
+          if (reason !== undefined) err = new CodexTurnTripError(reason, pauseNow.capture());
         }
         // Issue #2099: a transient PROVIDER failure (closed classification, never message text) is
         // retried in the same thread, a bounded number of times, then escalates as
@@ -4150,9 +4161,11 @@ export class CodexExecutor implements Executor {
 
   /** Issue #1866 M2: `facts` appends the run-start environment facts block (empty ⇒ unchanged). */
   private planPrompt(ctx: RunContext, facts?: EnvFacts): string {
-    const head = ctx.issueIid != null ? `Issue #${ctx.issueIid}: ${ctx.issueTitle}` : ctx.issueTitle;
+    const head = ctx.issueIid != null
+      ? [buildIssueContext(ctx.issueTitle, ctx.issueDescription, ctx.issueIid), buildIssueCommentsContext(ctx.issueComments)].filter(Boolean).join("\n\n")
+      : `${ctx.issueTitle}\n\n${ctx.issueDescription}`;
     const block = buildEnvironmentFactsBlock(facts);
-    const body = `${head}\n\n${ctx.issueDescription}\n\nProduce a plan for this work and submit it for approval.\n\n${depsProvisionPlanNote()}${block ? `\n\n${block}` : ""}`;
+    const body = `${head}\n\nProduce a plan for this work and submit it for approval.\n\n${depsProvisionPlanNote()}${block ? `\n\n${block}` : ""}`;
     // PRD #1416 M1: these Codex builders bypass the shared buildPlanPrompt/buildImplementPrompt,
     // so prepend the published-floor paragraph here. Empty ⇒ unchanged (a fresh branch).
     // #1416 (MR-rework): thread autoApprove so an autopilot Codex run gets the autopilot-safe
@@ -4178,7 +4191,6 @@ export class CodexExecutor implements Executor {
    *  block. Empty block ⇒ byte-identical. */
   private implementPrompt(ctx: RunContext, gatedPlan?: string, milestoneNote = "", facts?: EnvFacts): string {
     const approved = ctx.approvedPlan?.trim();
-    const head = ctx.issueIid != null ? `Issue #${ctx.issueIid}: ${ctx.issueTitle}` : ctx.issueTitle;
     const body = gatedPlan !== undefined
       ? [
           "Your plan was approved at the gate. Implement it now on the current branch, delegating to",
@@ -4189,7 +4201,9 @@ export class CodexExecutor implements Executor {
           gatedPlan,
           "</approved_plan>",
         ].join("\n")
-      : approved ? approved : `${head}\n\n${ctx.issueDescription}`;
+      : approved ? approved : ctx.issueIid != null
+        ? [buildIssueContext(ctx.issueTitle, ctx.issueDescription, ctx.issueIid), buildIssueCommentsContext(ctx.issueComments)].filter(Boolean).join("\n\n")
+        : `${ctx.issueTitle}\n\n${ctx.issueDescription}`;
     // PRD #1416 M1: prepend the published-floor paragraph whether or not a plan is approved.
     // Empty ⇒ unchanged (a fresh branch).
     // #1416 (MR-rework): thread autoApprove so an autopilot Codex run gets the autopilot-safe

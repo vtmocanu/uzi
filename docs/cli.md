@@ -2186,7 +2186,7 @@ A run's trigger provenance — what/how/who started it — is readable this way:
 (DEFAULT `manual`, so always set; historical rows carry a best-effort
 backfilled value), one of: `manual`, `autopilot`, `schedule`, `self_improve`,
 `ci_fix`, `mr_rework`, `chat`, `task`, `task_review`, `then_fix`, `judge`,
-`judge_rerun`, `resume`. The human `run get` view prints it as a `TRIGGER` row,
+`judge_rerun`, `resume`, `cross_check`. The human `run get` view prints it as a `TRIGGER` row,
 and `uzi admin runs` shows it as a `TRIGGER` column.
 
 A run's plan-gate revision is readable the same way:
@@ -2194,6 +2194,28 @@ A run's plan-gate revision is readable the same way:
 presented at the gate, `0` for a run that has never gated under this
 feature). See [Run activity pane](./run-activity.md#plan-approval-gate) and
 `--expected-gate-revision` above.
+
+### Plan cross-check evidence
+
+`uzi whoami` shows your `PLAN CROSS-CHECK` consent value. Change it in
+**Settings → Run defaults → Cross-check**; there is no CLI write verb for
+this cookie-only consent setting.
+
+`uzi run get <id>` shows `PLAN_CROSS_CHECK` for a current cross-check human
+gate reason. Its `PLAN_CHECK_*` rows show the stored candidate's result,
+reason, checker id, recorded model/effort, tokens/cost and findings. A human
+revision changes the evidence prefix to `EARLIER_PLAN_CHECK_*` and adds a
+warning that the check does not certify the current plan. Missing cost stays
+unavailable; subscription usage is distinguished from metered spend.
+
+The human view bounds findings to 20 items and sends displayed text through
+`Plain` for terminal/control sanitization. Use `uzi run get <id> --json` for
+the structured `plan_cross_check_required`, `plan_cross_check_gate_reason`
+and optional `plan_cross_check_summary` fields, or
+`uzi run get <id> --field plan_cross_check_required` for the run's snapshot.
+A stored checker APPROVE and a current human gate can coexist: decide against
+the displayed gate revision, not historical findings. See
+[Cross-check](./cross-check.md) for fallbacks and terminal delivery failures.
 
 A run's PRD-completion declaration is readable the same way:
 `uzi run get <id> --field prd_done_path` (the repo-relative path the run
@@ -2273,8 +2295,9 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
   does **not** auto-resume on its own — wind it down explicitly with `run
   stop`, or let its worker-side idle timeout finalize it — see [Interactive
   mode](./handoff.md#interactive-mode);
-- `limit_wait` — parked while an Anthropic usage limit resets, promoted back to
-  `queued` once past its `retry_not_before`;
+- `limit_wait` — parked on a Claude or Codex subscription usage window, promoted
+  back to `queued` once past its `retry_not_before` (reset plus jitter, or bounded
+  fallback when no usable reset is known); see [Paused on a usage limit](run-limit-wait.md);
 - `pool_wait` — an `auto` worker held because its Anthropic token pool is
   genuinely empty, resumed once a token is pooled — see [Letting uzi pick the
   token](anthropic-token.md#letting-uzi-pick-the-token-auto-selection);

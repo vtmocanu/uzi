@@ -301,15 +301,16 @@ type Label struct {
 // Issue is a forge issue as uzi caches it. Description is carried so the caller
 // can compute the PRD-link check at fetch time; it is never persisted.
 type Issue struct {
-	IID         int64
-	Title       string
-	State       string // "opened" | "closed"
-	Labels      []string
-	Description string
-	Author      string // username, may be empty
-	WebURL      string
-	UpdatedAt   time.Time
-	Assignees   []int64 // forge user ids of the issue's assignees (may be empty, never nil after mapping)
+	IID               int64
+	Title             string
+	State             string // "opened" | "closed"
+	Labels            []string
+	Description       string
+	Author            string // username, may be empty
+	AuthorForgeUserID int64  // stable author identity; zero means unresolved
+	WebURL            string
+	UpdatedAt         time.Time
+	Assignees         []int64 // forge user ids of the issue's assignees (may be empty, never nil after mapping)
 }
 
 // LabelEvent is one resource label event on an issue: a record that a user added
@@ -696,6 +697,10 @@ type ListIssuesOptions struct {
 // redacted errors (the PAT never appears in an error string). Implementations
 // paginate internally and return complete result sets.
 type Forge interface {
+	// RepositoryAuthorEligibility assesses a stable user ID independently of the
+	// authenticated bot's ProjectRole. Missing/deleted identities and incomplete
+	// evidence return AuthorUnknown with an error.
+	RepositoryAuthorEligibility(ctx context.Context, projectID, authorForgeUserID int64) (AuthorEligibility, error)
 	// VerifyToken confirms the PAT works and returns the bot identity.
 	VerifyToken(ctx context.Context) (BotIdentity, error)
 	// ListProjects returns every project the bot has at least Developer access

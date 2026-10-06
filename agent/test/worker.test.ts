@@ -862,6 +862,7 @@ describe("Worker — job dispatch and capability (PRD #1908 M4)", () => {
     await done;
     assert.ok(caps?.includes("job_runner_v1"), "job_runner_v1 is on the register wire");
     assert.ok(caps?.includes("job_files_v1"), "job_files_v1 (PRD #1909 M1 rollout gate) is on the register wire next to job_runner_v1");
+    assert.ok(caps?.includes("cross_check_v1"), "cross_check_v1 is advertised even when Codex is unavailable on this worker");
   });
 });
 
@@ -925,7 +926,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "codex_refresh_recovery_v1", "wall_park_v1", "input_receipts_v1", "input_inclusion_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1", "job_files_v1", CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY],
+      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "codex_refresh_recovery_v1", "wall_park_v1", "input_receipts_v1", "input_inclusion_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1", "job_files_v1", "cross_check_v1", CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY],
       "an advertising result appends codex_harness_v1 then codex_custom_model_v1 (PRD #1551 D6) after the always-present protocol caps (v2 by PRD #1349 M1, credential_switch_v1 by PRD #1247 M5b, wall_park_v1 by PRD #1497 M2)",
     );
   });
@@ -946,7 +947,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "codex_refresh_recovery_v1", "wall_park_v1", "input_receipts_v1", "input_inclusion_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1", "job_files_v1"],
+      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "codex_refresh_recovery_v1", "wall_park_v1", "input_receipts_v1", "input_inclusion_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1", "job_files_v1", "cross_check_v1"],
       "a non-advertising result leaves the always-present protocol caps unchanged (Claude service intact)",
     );
     assert.ok(!caps?.includes(CODEX_HARNESS_CAPABILITY), "codex_harness_v1 is absent when not advertising");
@@ -959,7 +960,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     const caps = await advertisedCapabilities(fakeConfig());
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "codex_refresh_recovery_v1", "wall_park_v1", "input_receipts_v1", "input_inclusion_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1", "job_files_v1"],
+      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "codex_refresh_recovery_v1", "wall_park_v1", "input_receipts_v1", "input_inclusion_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1", "job_files_v1", "cross_check_v1"],
       "an absent availability result advertises only the always-present protocol caps",
     );
   });
@@ -1017,4 +1018,40 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
       "codex_custom_model_v1 absent when the availability result is absent",
     );
   });
+});
+
+it("routes cross-check before review and ordinary runners in an ordinary slot and drains cancellation", async () => {
+ const controller = new AbortController();
+ const calls: string[] = [];
+ let claimCount = 0;
+ let started!: () => void;
+ const begin = new Promise<void>((resolve) => { started = resolve; });
+ const client = {
+  register: async () => ({}), heartbeat: async () => {},
+  claimChat: async () => null,
+  claimRun: async () => {
+   claimCount++;
+   return claimCount === 1 ? { run_id: "check", kind: "cross_check", review_target_run_id: "lead" } : null;
+  },
+ } as unknown as WorkerClient;
+ const runner = { ...noResumeRecoveries, execute: async () => { calls.push("ordinary"); } } as unknown as RunRunner;
+ const review = { execute: async () => { calls.push("review"); } } as unknown as ReviewRunner;
+ const { logger } = recordingLogger();
+ const worker = new Worker(fakeConfig(), client, runner, {} as ChatRunner, noJudge, review,
+  logger, okPreflight, undefined, undefined, undefined, undefined, undefined, undefined,
+  undefined, undefined, undefined, undefined, undefined, undefined, {
+   execute: async (_claim, signal) => {
+    calls.push("checker");
+    started();
+    await new Promise<void>((resolve) => signal!.addEventListener("abort", () => resolve(), { once: true }));
+    calls.push("drained");
+   },
+  });
+ const done = worker.run(controller.signal);
+ try {
+  await begin;
+  await tick(20);
+  assert.equal(claimCount, 1, "checker occupies the only ordinary slot");
+ } finally { controller.abort(); await done; }
+ assert.deepEqual(calls, ["checker", "drained"]);
 });

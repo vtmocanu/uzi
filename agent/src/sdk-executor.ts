@@ -714,6 +714,8 @@ interface DriveState {
   resumeId: string | undefined;
   // --- Products of phasePlanGate (P5), consumed by phaseRunLoop (P6-P8) ---
   approvedPlan?: string;
+  /** Checked canonical instructions replace the local plan carried by the planning session. */
+  checkedPlan?: boolean;
   approvedSelection?: AgentSelectionParse;
   preApproved?: boolean;
   /** Issue #2083: the decisions memo block was already placed in this execution's plan or
@@ -1889,7 +1891,7 @@ export class SdkExecutor implements Executor {
             issueTitle: ctx.issueTitle,
             issueDescription: ctx.issueDescription,
             // PRD #381: the snapshotted issue comments, rendered under a per-prompt
-            // nonce fence after <issue_description>. Absent/null/empty injects nothing.
+            // nonce fence after the captured issue context. Absent/null/empty injects nothing.
             issueComments: ctx.issueComments,
             // PRD #700 M4: the mr_rework run's snapshotted MR review comments, rendered
             // under a per-prompt nonce fence beside the issue-comments block. Absent/
@@ -2055,6 +2057,7 @@ export class SdkExecutor implements Executor {
             ctx.gatePlan!(approvedPlan, gateMilestones, (planMd) =>
               this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
             ),
+            ctx.continueExistingPlanGate,
           );
           if ("released" in g0) return { branch: ctx.branch, switchReleased: true };
           verdict = g0.value;
@@ -2106,6 +2109,7 @@ export class SdkExecutor implements Executor {
             });
             const gExhausted = await this.runThroughSwitch(ctx, state, () =>
               ctx.gatePlan!(approvedPlan, gateMilestones, undefined, settles),
+              ctx.continueExistingPlanGate,
             );
             if ("released" in gExhausted) return { branch: ctx.branch, switchReleased: true };
             verdict = gExhausted.value;
@@ -2161,6 +2165,7 @@ export class SdkExecutor implements Executor {
               (planMd) => this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
               settles,
             ),
+            ctx.continueExistingPlanGate,
           );
           if ("released" in gRev) return { branch: ctx.branch, switchReleased: true };
           verdict = gRev.value;
@@ -2174,6 +2179,31 @@ export class SdkExecutor implements Executor {
           throw new TrustedExecutionRefusal(
             `unexpected plan verdict: ${(verdict as { kind: string }).kind}`,
           );
+        if (verdict.approval === "cross_check") {
+          const canonical = verdict.canonical;
+          // Validate the entire bundle before adopting either value. The digest is an opaque
+          // server SHA-256 identity, not a locally recomputed proof of approval.
+          if (
+            !canonical || typeof canonical !== "object" ||
+            typeof canonical.plan !== "string" || !canonical.plan.trim() ||
+            !Array.isArray(canonical.milestones) ||
+            !Array.from(canonical.milestones).every((m) =>
+              m !== null && typeof m === "object" &&
+              typeof m.id === "string" && m.id.trim().length > 0 &&
+              typeof m.title === "string" && m.title.trim().length > 0
+            ) ||
+            typeof canonical.candidate_digest !== "string" ||
+            canonical.candidate_digest.length !== 64 ||
+            !/^[0-9a-f]{64}$/.test(canonical.candidate_digest) ||
+            !Number.isSafeInteger(canonical.claimGeneration) || canonical.claimGeneration <= 0 ||
+            !Number.isSafeInteger(ctx.claimGeneration) || (ctx.claimGeneration ?? 0) <= 0 ||
+            canonical.claimGeneration !== ctx.claimGeneration
+          ) throw new TrustedExecutionRefusal("invalid checked plan approval bundle");
+          // Preserve server values verbatim, including nested keys and explicit [].
+          approvedPlan = canonical.plan;
+          candidateMilestones = canonical.milestones;
+          drive.checkedPlan = true;
+        }
         approvedSelection = verdict.selection;
         // PRD #122 M6: freeze the APPROVED milestone breakdown for the implement loop.
         // `candidateMilestones` is block-scoped and REPLACED across revision rounds
@@ -2353,6 +2383,12 @@ export class SdkExecutor implements Executor {
       // undefined. buildImplementPrompt embeds it first-turn-only, as authoritative
       // instructions (D5), never untrusted-fenced. The gate is embedSeededPlan (extracted
       // so its defense-in-depth `seeded` term is testable — see that function's doc).
+      // Repeat the checked server contract on every implement attempt: an interrupted
+      // first attempt may not have delivered it to the model or updated the old session.
+      // Serialize the entire approved list, including nested values and explicit [].
+      const checkedImplementationContext = drive.checkedPlan
+        ? `The following server contract is explicitly approved for implementation and supersedes the local plan in this session. Follow its prose and full milestone contract.\n\n${approvedPlan}\n\n<approved_milestone_contract>\n${JSON.stringify(frozenMilestones)}\n</approved_milestone_contract>\n\n`
+        : "";
       const seededPlanBody = embedSeededPlan({
         preApproved,
         seeded: ctx.seeded === true,
@@ -2689,7 +2725,7 @@ export class SdkExecutor implements Executor {
           implementConfig,
           "implement",
           resumeId,
-          buildImplementPrompt({
+          checkedImplementationContext + buildImplementPrompt({
             branch: ctx.branch,
             subagentNames: selectedNames,
             // PRD #266 M1: the implement roster's OWN capability map (selectedCanWrite),
@@ -2718,9 +2754,7 @@ export class SdkExecutor implements Executor {
             // supplied the plan, not that it was "approved". First turn only (gated
             // inside buildImplementPrompt); false/absent for every non-seeded run.
             seeded: ctx.seeded,
-            // PRD #209 (M2 validation): the seeded plan body, embedded first-turn-only.
-            // Undefined for every path except the session-less seeded cold start (see
-            // seededPlanBody above), so resume/gated implement prompts are unchanged.
+            // Ordinary seeded/resume plan embedding remains first-turn-only.
             seededPlan: seededPlanBody,
             followUp: followUp ?? ownerRides?.body,
             // #157: the join above populated these, so the first implement turn can be told
@@ -3625,10 +3659,12 @@ export class SdkExecutor implements Executor {
     ctx: RunContext,
     state: RunDrive,
     run: () => Promise<T>,
+    continueWait?: (otherwise: () => Promise<T>) => Promise<T>,
   ): Promise<{ value: T } | { released: true }> {
+    let attempt = run;
     for (;;) {
       try {
-        return { value: await run() };
+        return { value: await attempt() };
       } catch (err) {
         if (!(err instanceof CredentialSwitchSignal)) throw err;
         const outcome = await ctx.attemptCredentialSwitch?.();
@@ -3638,6 +3674,7 @@ export class SdkExecutor implements Executor {
           // PRD #1809 D4: a `disk` stop that landed during the switch attempt lost its trip to the
           // switch's; it parks now instead of re-running the wait.
           throwIfDiskStop(ctx);
+          attempt = continueWait ? () => continueWait(run) : run;
           continue;
         }
         throw err; // no hook wired: let the runner's outer catch handle it, as before this fix

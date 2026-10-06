@@ -56,6 +56,7 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 		{"REPO", strOr(&s.RepoPath, "-")},
 		{"TIMING", s.Timing},
 		{"WHEN", scheduleWhen(s)},
+		{"WHEN TO SEND", scheduleCapacitySetting(s)},
 	}
 	if s.Timing == schedTimingOnce && s.RunAt != nil {
 		rows = append(rows, []string{"RUN_AT", s.RunAt.UTC().Format(time.RFC3339)})
@@ -130,6 +131,7 @@ func scheduleTokenCell(s apitypes.ScheduleDTO) string {
 // reason falls back to the raw wire string in skipReasonLabel, so a new server-side reason
 // degrades gracefully rather than rendering blank.
 var skipReasonLabels = map[string]string{ //nolint:gosec // G101: schedule skip-reason labels (credential_disabled is a VOCABULARY value), no credential.
+	"config_not_supported":  "configuration not supported",
 	"not_eligible":          "not eligible",
 	"already_running":       "already running",
 	"description_too_large": "description too large",
@@ -204,6 +206,9 @@ func renderLastFire(p *uzicli.Printer, lf *apitypes.LastFire) {
 		return
 	}
 	p.Printf("Last fire:\n")
+	if lf.Capacity != nil {
+		p.Printf("  %s\n", capacityLine(lf.Capacity))
+	}
 	p.Printf("  fired %s · examined %d · started %d · skipped %d\n",
 		lf.FiredAt.UTC().Format(time.RFC3339), lf.Matched, len(lf.Started), len(lf.Skips))
 	for _, st := range lf.Started {
@@ -231,6 +236,10 @@ func renderLastFire(p *uzicli.Printer, lf *apitypes.LastFire) {
 // unless the label sweep reports ineligible selector matches, in which case it says there
 // were no eligible candidates (issue #1543). The ineligible line ends every other path.
 func renderRunNow(p *uzicli.Printer, id string, res apitypes.RunNowResponse) {
+	if res.Capacity != nil && res.Capacity.Blocked {
+		p.Printf("%s\n", capacityLine(res.Capacity))
+		return
+	}
 	if res.Created == 0 && len(res.Skips) == 0 {
 		if ineligibleMatchedLine(res.IneligibleMatched) != "" {
 			// Nothing was a candidate because every selector match is ineligible (issue
@@ -268,4 +277,21 @@ func renderRunNow(p *uzicli.Printer, id string, res apitypes.RunNowResponse) {
 		}
 	}
 	printIneligibleMatched(p, res.IneligibleMatched)
+}
+
+func scheduleCapacitySetting(s apitypes.ScheduleDTO) string {
+	if s.CapacityLimit == nil || s.CapacityRoomNeeded == nil {
+		return "off"
+	}
+	return fmt.Sprintf("limit %d · room %d", *s.CapacityLimit, *s.CapacityRoomNeeded)
+}
+func capacityLine(c *apitypes.CapacityCheck) string {
+	noun := "runs"
+	if c.Room == 1 {
+		noun = "run"
+	}
+	if c.Blocked {
+		return fmt.Sprintf("Waiting for room: space for %d more %s; needs %d", c.Room, noun, c.RoomNeeded)
+	}
+	return fmt.Sprintf("Capacity: %d unfinished runs · limit %d · room %d · needs %d", c.InFlight, c.Limit, c.Room, c.RoomNeeded)
 }

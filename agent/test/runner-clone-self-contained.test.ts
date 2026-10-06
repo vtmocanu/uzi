@@ -10,9 +10,9 @@ import { api, client, fakeGitlab, fx, gitlabClaim, installHarness } from "./runn
 
 installHarness();
 
-// issue #1769 m1 — the runner asks for a SELF-CONTAINED runner clone iff the executor runs
-// model commands in the Codex command sandbox (`executor.sandboxesCommands === true`, known at
-// construction). NOT `executor.safety`: a real CodexExecutor populates that only inside run(),
+// The runner asks for a self-contained runner clone when commands are sandboxed or planning
+// cross-check capture is required, including Claude. `executor.sandboxesCommands` is known at
+// construction; `executor.safety` is not: a real CodexExecutor populates that only inside run(),
 // so it is still unset at seed time. The git double records the option and stops the run at
 // the seed, so nothing past phaseClone (and no Codex boundary, no executor.run) is exercised.
 
@@ -63,7 +63,7 @@ function fakeSafety(): CodexExecutionSafety {
 async function recordSeed(
   executor: Executor,
   issue: number,
-  wiring: { dockerHost?: string; resume?: boolean } = {},
+  wiring: { dockerHost?: string; resume?: boolean; crossCheckRequired?: boolean } = {},
 ): Promise<RecordingGit> {
   const recording = new RecordingGit(fx.dataDir);
   const { gitlab } = fakeGitlab();
@@ -76,6 +76,7 @@ async function recordSeed(
     ...(wiring.dockerHost ? { dockerHost: wiring.dockerHost } : {}),
   });
   const claim = gitlabClaim(issue);
+  if (wiring.crossCheckRequired !== undefined) claim.plan_cross_check_required = wiring.crossCheckRequired;
   // A resume is `session_id != null` (a run that executed before, re-claimed after a park).
   if (wiring.resume) claim.session_id = "11111111-2222-4333-8444-555555555555";
   await runner.execute(claim);
@@ -90,10 +91,32 @@ async function seedOptsFor(executor: Executor, issue: number): Promise<Array<{ s
   return (await recordSeed(executor, issue)).seen;
 }
 
-describe("RunRunner — self-contained runner clone for Codex (issue #1769 m1)", () => {
+describe("RunRunner — self-contained runner clone for sandboxed commands and required planning capture", () => {
   it("a Claude/stub executor (no safety) seeds with selfContained false", async () => {
     const seen = await seedOptsFor({ run: neverRun }, 1769);
     assert.deepStrictEqual(seen, [{ selfContained: false }]);
+  });
+
+  it("a Claude/stub executor with required planning cross-check seeds with selfContained true", async () => {
+    const recording = await recordSeed({ run: neverRun }, 2149, { crossCheckRequired: true });
+    assert.deepStrictEqual(recording.seen, [{ selfContained: true }]);
+    assert.deepStrictEqual(recording.attempts, [undefined], "the unwired worker uses the canonical seed");
+  });
+
+  it("a Claude/stub executor with planning cross-check explicitly off seeds with selfContained false", async () => {
+    const recording = await recordSeed({ run: neverRun }, 2150, { crossCheckRequired: false });
+    assert.deepStrictEqual(recording.seen, [{ selfContained: false }]);
+  });
+
+  it("a Claude/stub executor with required planning cross-check on Docker RESUME seeds a self-contained attempt", async () => {
+    const recording = await recordSeed({ run: neverRun }, 2151, {
+      dockerHost: "unix:///nonexistent/uzi-test-docker.sock",
+      resume: true,
+      crossCheckRequired: true,
+    });
+    assert.deepStrictEqual(recording.seen, [{ selfContained: true }]);
+    assert.strictEqual(recording.attempts.length, 1);
+    assert.ok(recording.attempts[0], "the Docker-wired seed carries an attempt id");
   });
 
   it("a real CodexExecutor (safety still unset before run) seeds with selfContained true", async () => {

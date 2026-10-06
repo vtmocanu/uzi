@@ -67,6 +67,7 @@ function fakeRun(): Run {
     requeue_count: 0,
     iteration_count: 0,
     auto_approve: false,
+    plan_cross_check_required: false,
     worker_id: "worker-1",
     branch: null,
     model: null,

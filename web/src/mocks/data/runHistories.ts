@@ -79,6 +79,7 @@ function histRun(i: number, minsBack: number): Run {
     requeue_count: 0,
     iteration_count: 1 + (i % 4),
     auto_approve: i % 5 === 0,
+    plan_cross_check_required: false,
     worker_id: HIST_WORKERS[i % HIST_WORKERS.length],
     branch: `agent/issue-${400 + i}`,
     model: null,
@@ -174,6 +175,7 @@ export const mockOtherUserRuns: Run[] = [
     requeue_count: 0,
     iteration_count: 2,
     auto_approve: false,
+    plan_cross_check_required: false,
     worker_id: "w-mira",
     branch: "agent/issue-61",
     model: null,
@@ -237,6 +239,7 @@ export const mockOtherUserRuns: Run[] = [
     requeue_count: 0,
     iteration_count: 0,
     auto_approve: false,
+    plan_cross_check_required: false,
     worker_id: null,
     branch: null,
     model: null,
@@ -517,6 +520,11 @@ export const mockAwaitingMessages: RunMessage[] = [
   am("tool_result", "lead", { tool_use_id: "aw-1", content: "# PRD 9 — Plan-approval notifications\n\nEmail the run owner when a plan parks…" }, 8),
   am("plan", "lead", { text: SAMPLE_PLAN() }, 6),
   am("status", null, { text: "plan submitted — awaiting approval" }, 6),
+  am("cross_check", null, { stage: "plan", verdict: "revise", reason_class: "revise",
+    findings: { summary: "## Checker findings\n\nKeep notification delivery idempotent.", items: [
+      { file: "api/internal/notifier", severity: "warning", summary: "Avoid duplicate emails.", rationale: "A parked run may replay its approval transition." },
+    ] }, checker_run_id: null, findings_author: "checker",
+  }, 5),
 ];
 
 // ── Unreadable-question history (PRD #88) ────────────────────────────────────

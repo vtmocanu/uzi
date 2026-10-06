@@ -110,7 +110,8 @@ the `session-peers` skill (`buddy: @NAME`), or else a **local buddy**, a subagen
   user-authorized multi-round loop run `peers.py budget allow buddy --replies N` once,
   not a reset per round. A correlated `ask`/`dispatch` reply needs no allowance.
 - **Issues you file** (follow-ups, inherited or incidental findings): label `reviewed`
-  per the root `CLAUDE.md` rule.
+  per the root `CLAUDE.md` rule, and decide with the buddy whether each is sweep-ready
+  (step 8).
 - **Skill or script PRs you open**: the buddy reviews the final draft, then add the
   `reviewed` label, so the user sees both agents agreed. Same with a local buddy.
 - The buddy's `APPROVE` is required where this skill says so below. It never
@@ -420,7 +421,11 @@ changes it); trust it over a handover's claim.
      only the unedited server text, so use it only when that text is the approved draft.
      Deferred notes without findings: `gh issue create --body-file`. Then add `area::*` and
      `priority::*` per `.agents/skills/issue-triage/references/taxonomy.md` (omit when
-     unsure) and `reviewed`. A set over the grouped-filing limit (50) is "needs you"; never
+     unsure) and `reviewed`. Decide with the buddy, per issue, whether it is sweep-ready
+     (premise verified, fix scoped, no design decision open, no `.github/workflows/**` change,
+     which a uzi push cannot carry): if so add its sweep selector (`bug` for a defect,
+     `Planned` for planned work) plus `uzi`; if not, leave both off and
+     say why in the trail. A set over the grouped-filing limit (50) is "needs you"; never
      split or truncate it silently. Name each issue in the trail.
    - Already-tracked issue not moving (no active run, not sweep-fireable per issue-triage's
      Step 1 selector plus `uzi` or bot assignment, no enabled one-time schedule still to

@@ -126,7 +126,7 @@ function spawnReal(request: BoundaryProcessRequest): { child: ChildProcess; hand
     child.once("error", reject);
     child.once("close", (code) => resolve({ code: code ?? 128 }));
   });
-  return { child, handle: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed } };
+  return { child, handle: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; }, completed } };
 }
 
 /** A producer that STALLS: a real process that writes nothing and never exits on its own. It is
@@ -136,7 +136,7 @@ function stalledProducer(): { child: ChildProcess; handle: BoundaryProcessHandle
   const child = spawn("sleep", ["600"], { stdio: ["pipe", "pipe", "pipe"] });
   child.stdout.once("close", () => child.kill("SIGKILL"));
   const completed = new Promise<{ code: number }>((resolve) => child.once("close", (code) => resolve({ code: code ?? 137 })));
-  return { child, handle: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed } };
+  return { child, handle: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; }, completed } };
 }
 
 /** A stdin that accepts and discards everything and never closes on its own (a supervisor
@@ -308,7 +308,7 @@ describe("GitCache.ensureRunnerCloneObjects (issue #1769 m2)", () => {
         child.once("error", reject);
         child.once("close", (code) => resolve({ code: code ?? 128 }));
       });
-      return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed };
+      return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; }, completed };
     };
     await git.withBoundaryProcessSpawner(spawner, new AbortController().signal, () =>
       git.ensureRunnerCloneObjects(bare, rc.path, defaultTip, [rc.baseCommit]),
@@ -371,7 +371,7 @@ describe("GitCache.ensureRunnerCloneObjects (issue #1769 m2)", () => {
           stdin: openSink(),
           stdout: null,
           stderr: Readable.from(["fatal: consumer broke\n"]),
-          completed: new Promise((resolve) => setImmediate(() => resolve({ code: 1 }))),
+          cancel: async () => {}, completed: new Promise((resolve) => setImmediate(() => resolve({ code: 1 }))),
         };
       }
       return spawnReal(request).handle;
@@ -398,7 +398,7 @@ describe("GitCache.ensureRunnerCloneObjects (issue #1769 m2)", () => {
           stdin: openSink(),
           stdout: new PassThrough(),
           stderr: Readable.from(["fatal: producer broke\n"]),
-          completed: new Promise((resolve) => setImmediate(() => resolve({ code: 1 }))),
+          cancel: async () => {}, completed: new Promise((resolve) => setImmediate(() => resolve({ code: 1 }))),
         };
       }
       if (request.argv.includes("index-pack")) {
@@ -441,7 +441,7 @@ describe("GitCache.ensureRunnerCloneObjects (issue #1769 m2)", () => {
           stdin,
           stdout: null,
           stderr: Readable.from(["fatal: early EOF\n"]),
-          completed: producerDone.promise.then(() => ({ code: 1 })),
+          cancel: async () => {}, completed: producerDone.promise.then(() => ({ code: 1 })),
         };
       }
       return spawnReal(request).handle;
@@ -468,7 +468,7 @@ describe("GitCache.ensureRunnerCloneObjects (issue #1769 m2)", () => {
           stdin: openSink(),
           stdout: producerOut,
           stderr: null,
-          completed: consumerDone.promise.then(() => ({ code: 1 })),
+          cancel: async () => {}, completed: consumerDone.promise.then(() => ({ code: 1 })),
         };
       }
       if (request.argv.includes("index-pack")) {
@@ -657,12 +657,12 @@ describe("GitCache.ensureRunnerCloneObjects (issue #1769 m2)", () => {
     const spawner: BoundaryProcessSpawner = async (request) => {
       if (request.argv.includes("pack-objects")) {
         // Holds its output open until the import tears it down, then reports a clean exit.
-        return { stdin: openSink(), stdout: producerOut, stderr: null, completed: producerDone.promise.then(() => ({ code: 0 })) };
+        return { stdin: openSink(), stdout: producerOut, stderr: null, cancel: async () => {}, completed: producerDone.promise.then(() => ({ code: 0 })) };
       }
       if (request.argv.includes("index-pack")) {
         const stdin = openSink();
         setImmediate(() => stdin.destroy(Object.assign(new Error("write EPIPE"), { code: "EPIPE" })));
-        return { stdin, stdout: null, stderr: null, completed: producerDone.promise.then(() => ({ code: 0 })) };
+        return { stdin, stdout: null, stderr: null, cancel: async () => {}, completed: producerDone.promise.then(() => ({ code: 0 })) };
       }
       return spawnReal(request).handle;
     };
@@ -682,11 +682,11 @@ describe("GitCache.ensureRunnerCloneObjects (issue #1769 m2)", () => {
     producerOut.once("close", () => producerDone.resolve());
     const spawner: BoundaryProcessSpawner = async (request) => {
       if (request.argv.includes("pack-objects")) {
-        return { stdin: openSink(), stdout: producerOut, stderr: null, completed: producerDone.promise.then(() => ({ code: 0 })) };
+        return { stdin: openSink(), stdout: producerOut, stderr: null, cancel: async () => {}, completed: producerDone.promise.then(() => ({ code: 0 })) };
       }
       if (request.argv.includes("index-pack")) {
         setImmediate(() => producerOut.destroy(new Error("pack stream broke")));
-        return { stdin: openSink(), stdout: null, stderr: null, completed: producerDone.promise.then(() => ({ code: 0 })) };
+        return { stdin: openSink(), stdout: null, stderr: null, cancel: async () => {}, completed: producerDone.promise.then(() => ({ code: 0 })) };
       }
       return spawnReal(request).handle;
     };
@@ -1099,7 +1099,7 @@ describe("GitCache spawnGit exit-gated stdout, finalize import (issue #1769)", (
   it("inside a boundary: a source error errors the returned stream with that error", async () => {
     const source = new PassThrough();
     const done = deferred<{ code: number }>();
-    const spawner: BoundaryProcessSpawner = async () => ({ stdin: openSink(), stdout: source, stderr: null, completed: done.promise });
+    const spawner: BoundaryProcessSpawner = async () => ({ stdin: openSink(), stdout: source, stderr: null, cancel: async () => {}, completed: done.promise });
     const res = await git.withBoundaryProcessSpawner(spawner, new AbortController().signal, () =>
       (git as unknown as Internals).spawnGit(fx.dataDir, PACK_ARGS, ""));
     source.write("partial");
@@ -1118,7 +1118,7 @@ describe("GitCache spawnGit exit-gated stdout, finalize import (issue #1769)", (
   it("inside a boundary: a source that closes before its end errors the returned stream", async () => {
     const source = new PassThrough();
     const done = deferred<{ code: number }>();
-    const spawner: BoundaryProcessSpawner = async () => ({ stdin: openSink(), stdout: source, stderr: null, completed: done.promise });
+    const spawner: BoundaryProcessSpawner = async () => ({ stdin: openSink(), stdout: source, stderr: null, cancel: async () => {}, completed: done.promise });
     const res = await git.withBoundaryProcessSpawner(spawner, new AbortController().signal, () =>
       (git as unknown as Internals).spawnGit(fx.dataDir, PACK_ARGS, ""));
     source.write("partial");
@@ -1139,7 +1139,7 @@ describe("GitCache spawnGit exit-gated stdout, finalize import (issue #1769)", (
     let consumer: ChildProcess | undefined;
     const spawner: BoundaryProcessSpawner = async (request) => {
       if (request.argv.includes("pack-objects")) {
-        return { stdin: openSink(), stdout: source, stderr: null, completed: done.promise };
+        return { stdin: openSink(), stdout: source, stderr: null, cancel: async () => {}, completed: done.promise };
       }
       const { child, handle } = spawnReal(request);
       track(child);

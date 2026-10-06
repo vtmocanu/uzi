@@ -31,6 +31,7 @@ vi.mock("../lib/api", async (importActual) => {
       // never open a delete confirmation.
       listWorkers: vi.fn().mockResolvedValue({ workers: [] }),
       setAutopilotEnabled: vi.fn(),
+      setPlanCrossCheckEnabled: vi.fn(),
       setWaitOnLimit: vi.fn(),
       setNotifyEarlyReset: vi.fn(),
       setJudgeEnabled: vi.fn(),
@@ -188,6 +189,43 @@ describe("Run defaults — autopilot opt-in (PRD #19 M3, Decision 7)", () => {
 
     expect(await screen.findByText("internal error")).toBeTruthy();
     expect(toggle().disabled).toBe(false);
+  });
+});
+
+describe("Run defaults — plan cross-check consent", () => {
+  const crossCheckToggle = () =>
+    screen.getByLabelText("Plan cross-check · Required before implementation") as HTMLInputElement;
+
+  it("shows the stage and helper with the saved state", () => {
+    mockAuth({ ...baseUser, plan_cross_check_enabled: true });
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    expect(screen.getByText("Cross-check")).toBeTruthy();
+    expect(screen.getByText(/A second opinion from the other model family/)).toBeTruthy();
+    expect(crossCheckToggle().checked).toBe(true);
+  });
+
+  it("sends plan consent and shows the API warning after refreshing", async () => {
+    mockApi.setPlanCrossCheckEnabled.mockResolvedValue({
+      user: { ...baseUser, plan_cross_check_enabled: true },
+      warning: "No online worker can run Codex plan cross-checks",
+    });
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    fireEvent.click(crossCheckToggle());
+    await waitFor(() => expect(mockApi.setPlanCrossCheckEnabled).toHaveBeenCalledWith(true));
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("No online worker can run Codex plan cross-checks")).toBeTruthy();
+  });
+
+  it("keeps the saved value and allows retry after refusal", async () => {
+    mockApi.setPlanCrossCheckEnabled.mockRejectedValue(
+      new ApiError(409, "both Claude and Codex credentials must be usable"),
+    );
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    fireEvent.click(crossCheckToggle());
+    expect(await screen.findByText("both Claude and Codex credentials must be usable")).toBeTruthy();
+    expect(crossCheckToggle().checked).toBe(false);
+    expect(crossCheckToggle().disabled).toBe(false);
+    expect(refresh).not.toHaveBeenCalled();
   });
 });
 
@@ -622,21 +660,20 @@ describe("Run defaults — usage-limit default (PRD #35 M3)", () => {
   const limitToggle = () =>
     screen.getByLabelText("Pause my new runs on a usage limit instead of failing them") as HTMLInputElement;
 
-  it("explains the choice in terms of what the user loses without it", () => {
+  it("explains automatic resume, recovered work and retained disk", () => {
     const { container } = render(
       <MemoryRouter>
         <RunDefaults />
       </MemoryRouter>,
     );
-    const text = container.textContent ?? "";
-    // The stake, not the mechanism: today the run FAILS and its work is gone.
-    expect(text).toMatch(/fails?/i);
-    expect(text).toMatch(/pauses?/i);
-    expect(text).toMatch(/resumes/i);
-    // The runs that cannot opt in any other way — the reason this default exists.
+    const text = screen.getByText("Usage limits").parentElement?.textContent ?? "";
+    expect(text).toContain("Claude runs and Codex subscription runs");
+    expect(text).toMatch(/pause/i);
+    expect(text).toMatch(/resume/i);
+    expect(text).toContain("Recovered work and an approved plan carry forward");
     expect(text).toMatch(/autopilot/i);
-    // The cost the PRD requires surfacing: a parked run holds its disk.
     expect(text).toMatch(/disk/i);
+    expect(container.textContent).not.toContain("its work is lost");
   });
 
   it("🔴 says in the UI that it does NOT change runs that already exist", () => {
@@ -1326,4 +1363,13 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
     codexSel.focus();
     expect(document.activeElement).toBe(codexSel);
   });
+});
+
+it("usage-limit provider regression #2360: shared default has neutral copy", () => {
+  mockAuth(baseUser);
+  render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+  expect(screen.getByText("Usage limits")).toBeTruthy();
+  expect(screen.getByText(/Claude runs and Codex subscription runs can/).textContent).toContain("On by default.");
+  // The saved opt-out stays off even though newly-created users default on.
+  expect((screen.getByLabelText("Pause my new runs on a usage limit instead of failing them") as HTMLInputElement).checked).toBe(false);
 });

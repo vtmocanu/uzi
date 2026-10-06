@@ -38,6 +38,9 @@ import (
 // a create-by-patch the direct POST path also blocks.
 func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time, allowSelfImprove bool) (apitypes.ScheduleRequest, int, string) {
 	n := req
+	if status, msg := validateScheduleCapacity(n, schedtmpl.SelectorLabel); status != 0 {
+		return n, status, msg
+	}
 	n.Timezone = strings.TrimSpace(n.Timezone)
 	if n.Timezone == "" {
 		n.Timezone = "UTC"
@@ -235,7 +238,7 @@ func onlyEnabled(req apitypes.ScheduleRequest) bool {
 		!req.CredentialOverride.Present &&
 		// PRD #1429 M4a: a PRESENT harness (even an explicit clear/null) likewise makes this
 		// NOT an enabled-only PATCH, mirroring credential_override above.
-		!req.Harness.Present
+		!req.Harness.Present && !req.CapacityLimit.Present && !req.CapacityRoomNeeded.Present
 }
 
 // mergeSchedule overlays the provided PATCH fields onto the current stored schedule,
@@ -255,6 +258,7 @@ func mergeSchedule(cur store.RunSchedule, req apitypes.ScheduleRequest) apitypes
 		WaitOnLimit: &waitOnLimit,
 		Enabled:     &enabled,
 	}
+	m.CapacityLimit, m.CapacityRoomNeeded = mergeScheduleCapacity(cur, req)
 	if cur.IssueIid.Valid {
 		v := cur.IssueIid.Int64
 		m.IssueIID = &v

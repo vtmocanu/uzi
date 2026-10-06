@@ -111,7 +111,7 @@ func TestPauseRow2LinesPerStatus(t *testing.T) {
 	if !strings.Contains(parkedOut, "pause requested") {
 		t.Errorf("a limit_wait run carrying a pending pause is missing the pause-requested line:\n%s", parkedOut)
 	}
-	if !strings.Contains(parkedOut, "waiting: Anthropic usage limit") {
+	if !strings.Contains(parkedOut, "waiting: usage limit") {
 		t.Errorf("a limit_wait run must still draw the rate-limit park line beside the pause line:\n%s", parkedOut)
 	}
 	if strings.Contains(parkedOut, "paused by you") {
@@ -224,8 +224,8 @@ func TestLimitWaitLineReworded(t *testing.T) {
 	retry := time.Now().Add(4 * time.Hour)
 	r := apitypes.RunDTO{Status: statusLimitWait, RetryNotBefore: &retry, RateLimitType: sp("five_hour")}
 	line := limitWaitLine(r, time.Now())
-	if !strings.HasPrefix(line, "waiting: Anthropic usage limit") {
-		t.Errorf("rate-limit line must start with 'waiting: Anthropic usage limit', got %q", line)
+	if !strings.HasPrefix(line, "waiting: usage limit") {
+		t.Errorf("rate-limit line must start with 'waiting: usage limit', got %q", line)
 	}
 	if strings.Contains(line, "paused: Anthropic") {
 		t.Errorf("the old 'paused: Anthropic' wording must be gone from the rate-limit line, got %q", line)

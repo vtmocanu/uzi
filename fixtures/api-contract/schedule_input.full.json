@@ -1,4 +1,6 @@
 {
+  "capacity_limit": 1,
+  "capacity_room_needed": 1,
   "target": "x",
   "repo_id": "x",
   "issue_iid": 1,

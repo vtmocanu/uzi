@@ -13,7 +13,7 @@ import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { LimitReachedError } from "../src/limit.js";
 import { EnvProbeCleanupError } from "../src/env-probe.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
-import type { PlanVerdict } from "../src/steering.js";
+import { CredentialSwitchSignal, type PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill, Milestone, MilestoneAgent, MilestoneProgress } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
 import { mrCompletionBlock } from "../src/runner.js";
@@ -1285,6 +1285,161 @@ function transitionFrames(emits: EmittedMessage[]): string[] {
     .filter((m) => m.kind === "status" && String(m.payload["text"]).startsWith("milestone "))
     .map((m) => String(m.payload["text"]));
 }
+
+describe("SdkExecutor checked canonical approval", () => {
+  const canonical = {
+    plan: "# Canonical scrubbed plan\nUse the approved server contract.",
+    milestones: [{ id: "server-id", title: "Server scrubbed title", children: [{ id: "child-id", title: "Nested scrubbed title", detail: { preserved: ["Nested scrubbed detail", { exact: true, count: 2, optional: null }] } }] }],
+    candidate_digest: "a".repeat(64),
+    claimGeneration: 7,
+  };
+  function checked(bundle: unknown = canonical): PlanVerdict {
+    // Cast exercises the runtime boundary, including malformed bundles.
+    return { kind: "approve", approval: "cross_check", selection: { status: "absent" }, canonical: bundle } as PlanVerdict;
+  }
+
+  it("uses canonical prose and milestones in the actual implement prompt and tracker", async () => {
+    const localMilestones = [{ id: "local-id", title: "LOCAL unsanitized title", children: [{ id: "LOCAL-child", title: "LOCAL nested title", detail: { localOnly: "LOCAL nested detail" } }] }];
+    const { queryFn, turns } = fakeTurns([
+      [submitPlanWithMilestones(localMilestones, "# LOCAL unsanitized prose"), resultSuccess()],
+      [reportProgress([], ["server-id"]), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ claimGeneration: 7, reportProgress: async () => {} } as Partial<RunContext>, checked());
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    const prompt = turns[1]!.promptText!;
+    assert.ok(prompt.includes(canonical.plan));
+    assert.ok(prompt.includes("server-id"));
+    assert.ok(prompt.includes("Server scrubbed title"));
+    assert.ok(prompt.includes("Nested scrubbed title"));
+    assert.ok(prompt.includes("Nested scrubbed detail"));
+    const contract = prompt.match(/<approved_milestone_contract>\n([\s\S]*?)\n<\/approved_milestone_contract>/);
+    assert.ok(contract, "actual query carries the explicitly approved milestone contract");
+    assert.deepStrictEqual(JSON.parse(contract[1]!), canonical.milestones);
+    assert.ok(!prompt.includes("LOCAL"));
+    assert.ok(!prompt.includes("localOnly"));
+    assert.deepStrictEqual(transitionFrames(probe.emits), ["milestone server-id started — Server scrubbed title"]);
+  });
+
+  it("adopts the checked bundle after revise instead of either local planning candidate", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlanWithMilestones(MILESTONES, "LOCAL first plan"), resultSuccess()],
+      [submitPlanWithMilestones([{ id: "revision-id", title: "LOCAL revision title" }], "LOCAL revised plan"), resultSuccess()],
+      [reportProgress([], ["server-id"]), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ claimGeneration: 7, reportProgress: async () => {} }, [
+      { kind: "revise", feedback: "scrub and tighten" }, checked(),
+    ]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.equal(turns.length, 3);
+    assert.ok(turns[2]!.promptText!.includes(canonical.plan));
+    assert.ok(!turns[2]!.promptText!.includes("LOCAL"));
+    assert.deepStrictEqual(transitionFrames(probe.emits), ["milestone server-id started — Server scrubbed title"]);
+  });
+
+  it("explicit empty milestones replace both local and claim lists", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlanWithMilestones([{ id: "local-id", title: "LOCAL title" }], "LOCAL prose"), resultSuccess()],
+      [reportProgress([], ["claim-id"]), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({
+      claimGeneration: 7,
+      frozenMilestones: [{ id: "claim-id", title: "CLAIM fallback title" }],
+      reportProgress: async () => {},
+    } as Partial<RunContext>, checked({ ...canonical, milestones: [] }));
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(turns[1]!.promptText!.includes(canonical.plan));
+    assert.ok(!turns[1]!.promptText!.includes("LOCAL"));
+    assert.ok(!turns[1]!.promptText!.includes("CLAIM"));
+    const contract = turns[1]!.promptText!.match(/<approved_milestone_contract>\n([\s\S]*?)\n<\/approved_milestone_contract>/);
+    assert.ok(contract);
+    assert.deepStrictEqual(JSON.parse(contract[1]!), []);
+    assert.deepStrictEqual(transitionFrames(probe.emits), ["milestone claim-id started"]);
+  });
+
+  it("keeps an explicit empty checked contract without claim milestones", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlanWithMilestones(MILESTONES, "LOCAL prose"), resultSuccess()],
+      [reportProgress([], ["m1"]), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({
+      claimGeneration: 7,
+      reportProgress: async () => {},
+    }, checked({ ...canonical, milestones: [] }));
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    const prompt = turns[1]!.promptText!;
+    assert.ok(prompt.includes(canonical.plan));
+    const contract = prompt.match(/<approved_milestone_contract>\n([\s\S]*?)\n<\/approved_milestone_contract>/);
+    assert.ok(contract);
+    assert.deepStrictEqual(JSON.parse(contract[1]!), []);
+    assert.ok(!prompt.includes("LOCAL"));
+    assert.deepStrictEqual(transitionFrames(probe.emits), ["milestone m1 started"]);
+  });
+
+  it("retains the checked contract after an interrupted first implementation attempt on an old session", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlanWithMilestones(MILESTONES, "LOCAL old session prose"), resultSuccess()],
+      () => (async function* () {
+        yield* [];
+        throw new CredentialSwitchSignal();
+      })(),
+      [assistantText("working"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({
+      claimGeneration: 7,
+      sessionId: "old-session",
+      attemptCredentialSwitch: async () => "gave_up" as const,
+    }, checked());
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.equal(turns.length, 4);
+    assert.equal(turns[0]!.options.resume, "old-session");
+    for (const turn of turns.slice(1)) {
+      const prompt = turn.promptText!;
+      assert.ok(prompt.includes(canonical.plan), "checked prose survives interruption and subsequent turns");
+      const contract = prompt.match(/<approved_milestone_contract>\n([\s\S]*?)\n<\/approved_milestone_contract>/);
+      assert.ok(contract, "checked milestones survive interruption and subsequent turns");
+      assert.deepStrictEqual(JSON.parse(contract[1]!), canonical.milestones);
+      assert.ok(!prompt.includes("LOCAL"));
+    }
+  });
+
+  const sparseMilestones: unknown[] = [];
+  sparseMilestones.length = 1;
+  const invalid: Array<[string, unknown, number | undefined]> = [
+    ["missing bundle", undefined, 7],
+    ["null bundle", null, 7],
+    ["missing plan", { ...canonical, plan: undefined }, 7],
+    ["blank plan", { ...canonical, plan: " " }, 7],
+    ["missing milestones", { ...canonical, milestones: undefined }, 7],
+    ["malformed milestone", { ...canonical, milestones: [{ id: "x", title: 42 }] }, 7],
+    ["sparse milestones", { ...canonical, milestones: sparseMilestones }, 7],
+    ["invalid digest", { ...canonical, candidate_digest: "xyz" }, 7],
+    ["missing digest", { ...canonical, candidate_digest: undefined }, 7],
+    ["digest with newline", { ...canonical, candidate_digest: "a".repeat(64) + "\n" }, 7],
+    ["fractional generation", { ...canonical, claimGeneration: 7.5 }, 7],
+    ["mismatched generation", canonical, 8],
+    ["missing current generation", canonical, undefined],
+    ["zero generation", { ...canonical, claimGeneration: 0 }, 7],
+    ["unsafe generation", { ...canonical, claimGeneration: Number.MAX_SAFE_INTEGER + 1 }, 7],
+  ];
+  for (const [name, bundle, generation] of invalid) {
+    it(`refuses ${name} before implementation or progress`, async () => {
+      const { queryFn, turns } = fakeTurns([
+        [submitPlanWithMilestones(), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      let progress = 0;
+      const verdict = checked(bundle);
+      if (bundle === undefined) delete (verdict as unknown as { canonical?: unknown }).canonical;
+      const probe = makeCtx({ claimGeneration: generation, reportProgress: async () => { progress++; } } as Partial<RunContext>, verdict);
+      await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx), /checked plan approval/);
+      assert.equal(turns.length, 1);
+      assert.deepStrictEqual(probe.iterations, []);
+      assert.equal(progress, 0);
+      assert.deepStrictEqual(transitionFrames(probe.emits), []);
+    });
+  }
+});
 
 describe("SdkExecutor gate milestones for an entirely-malformed list (issue #1626)", () => {
   it("reports the lead's rejected entries on the gate (so the server drops the candidate), but keeps no breakdown itself", async () => {
@@ -6041,6 +6196,9 @@ describe("SdkExecutor decisions memo (issue #2083)", () => {
     ]);
     const probe = makeCtx({
       ...reworkBase,
+      issueTitle: "CAPTURED-TITLE-MARK",
+      issueDescription: "CAPTURED-BODY-MARK",
+      issueComments: { truncated: false, comments: [{ author_username: "legacy", author_forge_user_id: 1, created_at: "now", body: "LEGACY-BODY-MARK" }] },
       planApproved: false,
       resumePhase: "awaiting_approval",
       takeResumedGateEvent: async () => ({ kind: "revise", feedback: "split it" }),
@@ -6048,6 +6206,10 @@ describe("SdkExecutor decisions memo (issue #2083)", () => {
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
     assert.match(turns[0]!.promptText!, memoBlock, "the revise prompt re-sends the planning prompt");
     assert.ok(!turns[1]!.promptText!.includes(MEMO), "the implement prompt does not repeat it");
+    assert.doesNotMatch(turns[0]!.promptText!, /LEGACY-BODY-MARK/);
+    assert.match(turns[0]!.promptText!, /permission_unknown/);
+    assert.match(turns[0]!.promptText!, /<issue_context_([0-9a-f]+)>\nTitle:\nCAPTURED-TITLE-MARK\nDescription:\nCAPTURED-BODY-MARK\n<\/issue_context_\1>/);
+    assert.doesNotMatch(turns[1]!.promptText!, /CAPTURED-TITLE-MARK|CAPTURED-BODY-MARK|LEGACY-BODY-MARK/);
     assert.strictEqual(injectedLines(probe.emits).length, 1);
   });
 

@@ -137,8 +137,8 @@ Runs list, the run page, or [`uzi run expedite <run-id>`](./cli.md)
 (`--clear` to undo). It only matters while `queued`; a claimed run's
 ordering is fixed.
 
-**A run paused on an Anthropic usage limit never gets one of these flags,
-even after hours.** It isn't stuck — see
+**A run parked at `limit_wait` on a Claude or Codex usage window is excluded
+from these running-state flags, even after hours.** It isn't stuck — see
 [Paused on a usage limit](run-limit-wait.md) for that state.
 
 ## This is an early-warning aid, not a guardrail

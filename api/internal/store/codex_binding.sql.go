@@ -248,18 +248,48 @@ func (q *Queries) CommitCodexRefresh(ctx context.Context, arg CommitCodexRefresh
 }
 
 const failCodexAccountWaitRun = `-- name: FailCodexAccountWaitRun :execrows
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = $3 AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause = 'codex_account_unavailable'
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = cc.lead_run_id
+        AND parent.kind <> 'cross_check'
+    WHERE candidates.kind = 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason, lead.issue_raw_digest, lead.issue_saved_body, lead.issue_input_reason, lead.auto_approve_blocked_reasons FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+    UNION ALL
+    SELECT candidates.id FROM candidates CROSS JOIN parent_lock_set locks
+    WHERE candidates.kind <> 'cross_check'
+)
 UPDATE runs SET
+    plan_cross_check_gate_reason = NULL,
     status = 'failed', status_since = now(), failure_reason = $1,
     fail_origin = $2,
-    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,
+    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END,
     finished_at = now(),
     milestones_in_progress = NULL, milestones_agents = NULL,
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     credential_switch_requested_at = NULL, credential_switch_generation = NULL,
     health = 'ok', health_reason = NULL, health_since = NULL,
-    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
-WHERE id = $3 AND status = 'recovery_wait' AND recovery_wait_cause = 'codex_account_unavailable'
+WHERE runs.id = $3 AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause = 'codex_account_unavailable'
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
 `
 
 type FailCodexAccountWaitRunParams struct {
@@ -1562,7 +1592,7 @@ WHERE id = $2 AND worker_id = $3
   AND claim_generation = $4
   AND status IN (
       'claimed', 'running', 'awaiting_approval',
-      'awaiting_input', 'awaiting_followup', 'limit_wait'
+      'awaiting_input', 'awaiting_followup'
   )
 RETURNING codex_claim_epoch
 `
@@ -1585,14 +1615,13 @@ type SetRunCodexClaimCapabilityParams struct {
 // PRD #1147 F7 (defense-in-depth) extends the same revoke to the park/promote paths that
 // likewise leave a run without a live owner: RequeueClaimAssemblyExact (claimed→pool_wait hold),
 // PromotePoolWaitRun (pool_wait→queued), and PromoteLimitWaitRuns (limit_wait→queued).
-// SetRunLimitWait is INTENTIONALLY EXCLUDED: limit_wait is an actively-claimed status that
-// keeps its live capability by design (persist-before-park), so revoking there would strip
-// a run that still legitimately holds its claim.
+// SetRunLimitWait also revokes atomically at park: boundary reconciliation has already
+// persisted recovery material, and the parked flight must no longer spend credentials.
 //
 // STATUS GUARD (PRD #1147): the mint is additionally gated on the run being in one of the
 // actively-claimed statuses ('claimed','running','awaiting_approval','awaiting_input',
-// 'awaiting_followup','limit_wait'), the exact set of codexActivelyClaimedStatuses in
-// codexauthz.go. It EXCLUDES the non-executing states (queued/pool_wait and the terminals):
+// 'awaiting_followup'). The authorization status map in codexauthz.go additionally
+// admits revoked parks; their hash and epoch deny credential operations. It EXCLUDES the non-executing states (queued/pool_wait and the terminals):
 // a run requeued out from under the worker (RequeueClaimedRunToQueued / SweepClaimedNeverStarted
 // in runtime.sql clear the cap + bump the epoch but RETAIN worker_id) would otherwise still
 // match on worker_id and let the departed worker re-mint a fresh capability. Closing this

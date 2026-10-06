@@ -29,6 +29,7 @@ function chatRun(over: Partial<Run> & { id: string; title: string; status: Run["
     requeue_count: 0,
     iteration_count: 0,
     auto_approve: false,
+    plan_cross_check_required: false,
     worker_id: "w-laptop",
     branch: null,
     model: null,

@@ -469,7 +469,10 @@ export interface BoundaryProcessHandle {
   readonly stdin: Writable | null;
   readonly stdout: Readable | null;
   readonly stderr: Readable | null;
+  /** Completion includes cleanup of the whole owned root or process group. */
   readonly completed: Promise<{ readonly code: number; readonly softTimedOut?: true }>;
+  /** Idempotently stop only this child and await its whole-root cleanup. */
+  cancel(): Promise<void>;
 }
 
 export interface CodexExecutionSafety {

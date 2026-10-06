@@ -183,7 +183,7 @@ docker run -d --name "$PG_NAME" --network "$NET" \
 log "waiting for Postgres to accept connections (up to 120s)"
 pg_ready=0
 for _ in $(seq 1 120); do
-  if docker exec "$PG_NAME" pg_isready -U uzi -d uzi >/dev/null 2>&1; then
+  if docker exec "$PG_NAME" pg_isready -h 127.0.0.1 -U uzi -d uzi >/dev/null 2>&1; then
     pg_ready=1
     break
   fi

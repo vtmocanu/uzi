@@ -1,7 +1,7 @@
 // RUN_KINDS is the web mirror of runs.kind, in DB runs_kind_check order. The
 // authoritative set is the DB CHECK / api/internal/runkind; this list is pinned to
 // the shared fixtures/run-kinds/registry.json by runKindContract.test.ts.
-export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task", "mr_rework", "job"] as const;
+export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task", "mr_rework", "job", "cross_check"] as const;
 export type RunKind = (typeof RUN_KINDS)[number];
 
 // runKindLabel maps an issue-less run's kind to a short human label for the chip

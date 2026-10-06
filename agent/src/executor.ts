@@ -33,6 +33,7 @@ import { buildRepoInstructionsContext, type PriorWork } from "./prompt.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { readRepoInstructions } from "./repo-instructions.js";
 import { LimitReachedError } from "./limit.js";
+import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { provisionRunTools, removeProvisionDir } from "./provision-run.js";
 import type { provisionTools } from "./provision.js";
 import { AGENT_GIT_IDENTITY, gitEnv, runnerGitSpawnEnv } from "./git.js";
@@ -115,6 +116,8 @@ export type SecretRemediationDecision =
  */
 export interface RunContext {
   runId: string;
+  /** Current server claim fence; required to consume a checked plan approval. */
+  claimGeneration?: number;
   /** Run kind (PRD #6). "issue" (default when absent) works issueIid's card;
    *  "ci_fix" diagnoses + fixes `pipeline`. */
   kind?: RunKind;
@@ -378,6 +381,8 @@ export interface RunContext {
    * a fenced claim ends quietly. Absent on the stub/test executors ⇒ today's behaviour.
    */
   takeResumedGateEvent?(signal?: AbortSignal): Promise<PlanVerdict | undefined>;
+  /** An associated cross-check human gate continues its established wait after switch give-up. */
+  continueExistingPlanGate?(otherwise: () => Promise<PlanVerdict>): Promise<PlanVerdict>;
   /**
    * PRD #88 M1 clarification park. Called by the executor after a turn that made an
    * ask_user call: the runner emits the `question` run-message, posts /state
@@ -1506,6 +1511,9 @@ export class StubExecutor implements Executor {
         if (verdict.kind === "reject")
           throw new PlanRejectedError(verdict.reason);
         if (verdict.kind === "cancel") throw new Error("run cancelled");
+        // Stub implementation is fixed behaviour and does not implement the approved plan text.
+        if (verdict.approval === "cross_check")
+          throw new TrustedExecutionRefusal("stub cannot consume checked plan approval");
       }
       if (notCode) {
         ctx.emit({

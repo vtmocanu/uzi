@@ -60,13 +60,20 @@ every candidate it matches is already eligible. The **ad-hoc prompt** target
 is the deliberate exception: with no issue to gate on, it bypasses the
 eligibility requirement by design.
 
-Each schedule also has its own **auto-approve** toggle, **on by default** —
-the point of a 02:00 fire is that it actually proceeds instead of sitting at
-the plan-approval gate waiting for someone awake. Turn it off for a given
-schedule to make its runs stop and wait for a human, same as a manual start.
-Either way, the plan is still recorded on the run to read afterwards, and a
-human still merges the resulting MR: `main` is never written under any
-target, timing, or approval setting.
+Each schedule also has its own **auto-approve** toggle, **on by default**,
+including the assigned-sweep default. Issue-target fires also assess the
+issue author and comments before honoring that request — see [Issue input
+and the approval gate](#issue-input-and-the-approval-gate). Turn the toggle
+off to have runs wait for a human, same as a manual start. For an owner who
+opted in to [Plan cross-check](./cross-check.md), an eligible auto-approved
+schedule run must pass that gate before implementing. A Claude lead proceeds
+after a Codex APPROVE of the exact plan; a non-pass normally parks for a human
+decision even with auto-approve on. Codex leads park as unsupported.
+Irrecoverable delivery losses fail the run; see
+[Cross-check](./cross-check.md#terminal-delivery-failures). The plan is
+recorded either way, and a human still merges the resulting MR; the
+[main-branch guardrails](../ARCHITECTURE.md#guardrail-layers-the-primary-directive)
+apply independently of schedule approval.
 
 A schedule also has its own **wait-on-limit** toggle, **on by default** for a
 new schedule: a fired run parks until the Anthropic usage window reopens
@@ -76,6 +83,71 @@ default case), not just the ones that stop at the plan gate. Turn it off for
 a given schedule to have a fired run fail outright on a usage limit instead
 of waiting. An existing schedule keeps whatever it already had — this is a
 create-time default, not a retroactive change.
+
+## Issue input and the approval gate
+
+Pinned-issue, label-sweep, and assigned-sweep fires requesting auto-approve
+start with a server-side author assessment. An issue author below the
+repository input threshold, withheld comments, or unknown permissions
+(including a comments-fetch failure) disables auto-approve **for that run**.
+The run still queues and plans normally, then parks at `awaiting_approval`.
+Known, wholly eligible input keeps auto-approve. This does not change the
+schedule's saved toggle or its ON default.
+
+The CLI and web run detail show creation-time assessment history, with the
+applicable `auto_approve_blocked_reasons`: `author_not_eligible`,
+`permission_unknown`, or both. These are approval reasons, not run failures,
+health alerts, or recovery holds. Later comments do not flip the stored
+approval flag; live reads still filter comments and can show eligible late
+comments. Explicit auto-approve OFF, manual starts, autopilot, MR rework,
+self-improve, CI fixes, prompt schedules, and job approval flags retain
+their existing behavior.
+
+The input thresholds use stable numeric identities: GitHub effective
+Triage/Push/Maintain/Admin from a complete all-affiliations collaborator
+list; GitLab active inherited membership at Reporter (20) or above, excluding
+Planner (15) and custom Guest roles below 20; Forgejo proven personal owners,
+direct collaborators including Read, or effective organization-team
+Write/Admin/Owner, including the Owners team. Forgejo uses the existing
+token; a Write bot forbidden to look up an arbitrary user's effective access
+produces unknown. Custom-role names, author associations, team-member lists,
+and assignees do not establish authorization, and no new scopes are needed.
+
+Each capture/live read has a 30-second child deadline starting before the
+issue fetch and a 200-distinct-author budget with an operation-local cache.
+Missing identity, errors, incomplete evidence, deadline or budget exhaustion
+produce unknown. A valid raw capture can persist after child expiry under a
+valid parent, with auto-approval disabled; no raw capture means no new run.
+The complete comment thread is assessed before its newest 200 / 32 KiB body
+tail is retained oldest-first. Older withheld comments still affect approval.
+Only uzi's own bot is excluded by stable ID (GitLab system notes are already
+dropped); other bots face the author threshold. An unknown bot ID omits
+comments and disables requested scheduled auto-approval. Withheld bodies become fixed
+author/time/reason placeholders, not newly stored or delivered raw comments.
+
+Every issue run saves its target title/body once, regardless of author
+access; owner guidance stays separate from the raw-field digest. Resume and
+reclaim retain those fields, and a new run captures current fields. Target
+`get_issue` reads and matching list titles keep the saved fields even after
+an edit, promotion, or approval. Changes produce a fixed changed-content
+note, not changed text or a diff; unavailable comparison or current metadata
+does not replace saved fields. Other-issue live fields require an eligible
+current author, which **does not establish eligible editors**: GitLab
+assignees and Planner users can edit title/body, and editor attribution is
+not implemented. Other list summaries are unchanged.
+
+Use `uzi run revise` at the plan gate and `uzi run follow-up` during
+implementation (read on the next ordinary turn) to steer the run.
+Nonce fences resist delimiter/header spoofing, but eligible comments or a
+frozen outsider's task can still steer a plan; human review cannot guarantee
+injection detection or prevent planning-time exfiltration. Until the API
+and workers are upgraded, turn auto-approve **OFF** for public-repository
+issue-target schedules. Upgrades do not retract old transcript text or
+rewrite existing approvals/flags; cancel and start a new run for clean
+context. The time/author limits do not bound decoded memory: oversized or
+chunked GitHub/GitLab responses remain deferred hardening. See the
+[architecture boundary](../ARCHITECTURE.md#issue-comments-as-untrusted-worker-input-prd-381)
+for prompt compatibility, forge evidence, and egress residuals.
 
 ## Sweep cap
 
@@ -462,8 +534,11 @@ the catalog — its entry is cadence and model only (see
   the source is how you replicate a schedule across repos.
 - **Auto-approve, on by default.** Like any new schedule, a default is
   created with auto-approve and wait-on-limit both on — the point of a
-  default is that it runs unattended off-hours. Nothing a default job does
-  merges on its own. In their default `issues` mode, feature bingo and
+  default is that it runs unattended off-hours. Issue-target defaults,
+  including assigned-sweep, still apply the [issue-input approval
+  gate](#issue-input-and-the-approval-gate) per run; prompt defaults keep
+  their existing approval behavior. Nothing a default job does merges on
+  its own. In their default `issues` mode, feature bingo and
   refactor scout file proposal issues; `--output mr` retains their idea-file
   and MR path. The other prompt jobs open merge requests when they produce a
   change: docs hygiene lands its mechanical fixes (broken links, stale refs,
@@ -673,3 +748,29 @@ and already-bound runs are unchanged.
   workers comes online while the throwaway one is still cold-starting, it
   can claim the run first. That's harmless — the now-idle throwaway worker
   gets cleaned up shortly after.
+
+## When to send issues
+
+Recurring label-selected sweeps can use an optional capacity gate. Set a limit on
+unfinished runs and the room needed before sending another batch. Multiple selector
+labels are supported; an empty custom selector still uses the configured uzi label.
+Assigned sweeps, one-time schedules and other targets do not support this gate.
+
+The gate counts your unfinished work across all repos and origins, including job
+runs and queued, waiting and parked runs. Chat and judge runs and terminal runs are
+excluded. Room is the limit minus this count, clamped to zero. When room is below
+the required threshold, the fire records “Waiting for room”, starts nothing and
+advances to its next recurring check without contacting the forge. Otherwise it
+sends up to the smaller of room and **issues to send at a time** (the existing
+`max_issues` setting); an unlimited batch is still bounded by room.
+
+This is an advisory snapshot: other schedules or manual starts can exceed the
+limit. Run now uses the same check, including when a schedule is paused, and does
+not replace its recorded last fire. An automatic fire respects pause-all first.
+
+Use `uzi schedule create --sweep --capacity-limit 4 --room-needed 2` with the usual
+repo and recurring timing flags. Edit accepts the same paired flags, or
+`--clear-capacity` to turn the gate off. Unrelated edits preserve it. API PATCH
+may change one integer using the stored other value; clearing requires both
+`capacity_limit` and `capacity_room_needed` explicitly set to null. Resetting a
+default turns its gate off; clone and Add repo copy it.

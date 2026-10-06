@@ -85,12 +85,12 @@ codex_m3b_up() {
   _codex_m3b_say "waiting for Postgres to accept connections (up to ${CDR_M3B_PG_WAIT}s)"
   local i
   for (( i = 0; i < CDR_M3B_PG_WAIT; i++ )); do
-    if docker exec "$CDR_M3B_PG_NAME" pg_isready -U uzi -d uzi >/dev/null 2>&1; then
+    if docker exec "$CDR_M3B_PG_NAME" pg_isready -h 127.0.0.1 -U uzi -d uzi >/dev/null 2>&1; then
       break
     fi
     sleep 1
   done
-  if ! docker exec "$CDR_M3B_PG_NAME" pg_isready -U uzi -d uzi >/dev/null 2>&1; then
+  if ! docker exec "$CDR_M3B_PG_NAME" pg_isready -h 127.0.0.1 -U uzi -d uzi >/dev/null 2>&1; then
     _codex_m3b_say "INFRASTRUCTURE FAILURE: throwaway Postgres never became ready within ${CDR_M3B_PG_WAIT}s"
     codex_m3b_down
     return 1

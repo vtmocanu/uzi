@@ -29,6 +29,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/schedtmpl"
@@ -79,6 +80,7 @@ var errBadConfig = ErrBadConfig
 
 // Store is the DB surface the scheduler reads and writes. *store.Queries satisfies it.
 type Store interface {
+	CountInProgressRunsForUser(context.Context, uuid.UUID) (int64, error)
 	ClaimDueSchedules(ctx context.Context) ([]store.RunSchedule, error)
 	AdvanceSchedule(ctx context.Context, arg store.AdvanceScheduleParams) (store.RunSchedule, error)
 	SetRunScheduleStatus(ctx context.Context, arg store.SetRunScheduleStatusParams) (store.RunSchedule, error)
@@ -534,14 +536,15 @@ func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) (Fir
 		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iidCopy, Reason: SkipAlreadyRunning}}}, nil
 	}
 
-	issue, err := f.GetIssue(ctx, repo.ForgeProjectID, iid)
+	capture, err := issueinput.Fetch(ctx, f, repo.ForgeProjectID, iid, repo.BotForgeUserID)
 	if err != nil {
 		// A forge error on an ISSUE target is transient (retry next tick), NOT a recorded
 		// fetch_failed skip — that bucketing is a sweep-only choice (PRD #308). Return the
 		// zero outcome so nothing is recorded for this fire.
 		return FireOutcome{}, fmt.Errorf("get issue %d: %w", iid, err) // transient forge error
 	}
-	return e.createIssueRun(ctx, sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL)
+	issue := capture.Issue
+	return e.createIssueRun(issueinput.WithCapture(ctx, capture), sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL)
 }
 
 // fireSweep resolves the label selector (an empty/NULL selector defaults to the PRD
@@ -612,6 +615,25 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 		// assignment instead of by label; the catalog entry carries the kind.
 		if job.SelectorKind != "" {
 			selectorKind = job.SelectorKind
+		}
+	}
+	var capacity *CapacityCheck
+	if sched.CapacityLimit.Valid {
+		if selectorKind != schedtmpl.SelectorLabel {
+			return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipConfigNotSupported}}}, nil
+		}
+		count, err := e.store.CountInProgressRunsForUser(ctx, sched.UserID)
+		if err != nil {
+			return FireOutcome{}, err
+		}
+		room := max(int64(0), int64(sched.CapacityLimit.Int32)-count)
+		capacity = &CapacityCheck{InFlight: count, Limit: int(sched.CapacityLimit.Int32), RoomNeeded: int(sched.CapacityRoomNeeded.Int32), Room: int(room), Blocked: room < int64(sched.CapacityRoomNeeded.Int32)}
+		if capacity.Blocked {
+			return FireOutcome{Capacity: capacity}, nil
+		}
+		// This local cap bounds both the backfill scan and starts; the stored cap is unchanged.
+		if !sched.MaxIssues.Valid || int64(sched.MaxIssues.Int32) > room {
+			sched.MaxIssues = pgtype.Int4{Int32: int32(room), Valid: true} //nolint:gosec // room is bounded by capacity_limit <= 50.
 		}
 	}
 	repo, f, err := e.resolveRepoForge(ctx, sched)
@@ -692,7 +714,7 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 	// invariant (PRD #308 Decision 4) by construction. Every candidate the loop reaches
 	// lands in exactly one of Started/Skips; the loop stops early once max_issues have
 	// started, so Matched counts attempts (may exceed max_issues), not the whole window.
-	out := FireOutcome{Capped: capped, IneligibleMatched: ineligibleMatched}
+	out := FireOutcome{Capacity: capacity, Capped: capped, IneligibleMatched: ineligibleMatched}
 	for _, c := range candidates {
 		iid := c.ForgeIssueIid
 		iidCopy := iid
@@ -710,13 +732,14 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Reason: SkipAlreadyRunning})
 			continue
 		}
-		issue, err := f.GetIssue(ctx, repo.ForgeProjectID, iid)
+		capture, err := issueinput.Fetch(ctx, f, repo.ForgeProjectID, iid, repo.BotForgeUserID)
 		if err != nil {
 			e.logger.Warn("scheduler: sweep fetch issue", "schedule", sched.ID.String(), "issue", iid, "error", err)
 			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Reason: SkipFetchFailed})
 			continue
 		}
-		res, err := e.createIssueRun(ctx, sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL)
+		issue := capture.Issue
+		res, err := e.createIssueRun(issueinput.WithCapture(ctx, capture), sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL)
 		if holdsOnceCredentialDisabled(sched, err) {
 			// PRD #1732 D2: the schedule-wide pin is disabled, so every candidate would be
 			// refused the same way. A one-time sweep that has started nothing yet is held

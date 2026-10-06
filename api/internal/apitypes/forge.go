@@ -29,6 +29,13 @@ type ForgeIssueDTO struct {
 	DescriptionTruncated bool                   `json:"description_truncated"`
 	Comments             []ForgeIssueCommentDTO `json:"comments"`
 	CommentsTruncated    bool                   `json:"comments_truncated"`
+	ContentReason        string                 `json:"content_reason,omitempty"`
+	CommentsWithheld     bool                   `json:"comments_withheld"`
+	CommentsUnknown      bool                   `json:"comments_unknown"`
+	SnapshotComparison   string                 `json:"snapshot_comparison"`
+	SnapshotNote         string                 `json:"snapshot_note,omitempty"`
+	ContentChanged       bool                   `json:"content_changed"`
+	MetadataUnavailable  bool                   `json:"metadata_unavailable"`
 }
 
 // ForgeIssueCommentDTO is one HUMAN issue comment (PRD #381). Bot-authored and forge
@@ -38,6 +45,7 @@ type ForgeIssueCommentDTO struct {
 	Author    string `json:"author"`
 	CreatedAt string `json:"created_at"` // RFC3339
 	Body      string `json:"body"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // ForgeIssueSummaryDTO is a list-row issue: no description (the list never carries

@@ -17,6 +17,9 @@
   "conflict": true,
   "forge_updated_at": "2020-01-02T03:04:05Z",
   "latest_run": {
+    "auto_approve_blocked_reasons": [
+      "x"
+    ],
     "id": "x",
     "status": "x",
     "mr_iid": 1,

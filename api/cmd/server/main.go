@@ -303,6 +303,7 @@ func run() error {
 	// its inbound handler at construction.
 	wsvc := workersvc.New(q, box, workersvc.Params{
 		RunTimeout:                  cfg.RunTimeout,
+		PlanCrossCheckTimeout:       cfg.PlanCrossCheckTimeout,
 		RunIdleTimeout:              cfg.RunIdleTimeout,
 		WorkerTaskIdleTimeout:       cfg.WorkerTaskIdleTimeout,
 		RunMaxIterations:            cfg.RunMaxIterations,

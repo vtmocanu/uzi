@@ -117,12 +117,21 @@ func DecodeJSON(r *http.Request, dst any) error {
 // bounded sentinel byte past maxBodyBytes before decoding, so a first value ending exactly
 // at the cap cannot hide a trailing value behind LimitReader's synthetic EOF.
 func DecodeJSONStrict(r *http.Request, dst any) error {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	return DecodeJSONStrictBounded(r, dst, maxBodyBytes)
+}
+
+// DecodeJSONStrictBounded applies a route-specific encoded byte limit. The extra
+// sentinel byte detects overflow even when a complete JSON value ends at the cap.
+func DecodeJSONStrictBounded(r *http.Request, dst any, limit int64) error {
+	if limit <= 0 {
+		return errors.New("invalid strict JSON limit")
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	if err != nil {
 		return err
 	}
-	if len(body) > maxBodyBytes {
-		return errors.New("request body exceeds strict JSON limit")
+	if int64(len(body)) > limit {
+		return &http.MaxBytesError{Limit: limit}
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()

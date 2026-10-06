@@ -425,7 +425,7 @@ function DefaultOptions({ s, showApprove }: { s: Schedule; showApprove: boolean 
     <>
       <OptionChip>{s.model ? `model ${s.model}` : "inherit model"}</OptionChip>
       {s.target === "sweep" && s.labels?.map((l) => <OptionChip key={l}>label {l}</OptionChip>)}
-      {s.target === "sweep" && s.max_issues != null && s.max_issues > 0 && <OptionChip>max {s.max_issues}</OptionChip>}
+      <CapacityOptions s={s} />
       {s.wait_on_limit && <OptionChip>wait-on-limit</OptionChip>}
       {showApprove && <OptionChip>auto-approve</OptionChip>}
       {s.mr_rework_enabled != null && <OptionChip>mr-rework: {s.mr_rework_enabled ? "on" : "off"}</OptionChip>}
@@ -438,14 +438,27 @@ function DefaultOptions({ s, showApprove }: { s: Schedule; showApprove: boolean 
 function UserOptions({ s, showApprove }: { s: Schedule; showApprove: boolean }) {
   return (
     <>
+      <CapacityOptions s={s} />
       {s.wait_on_limit && <OptionChip>wait-on-limit</OptionChip>}
       {showApprove && <OptionChip>auto-approve</OptionChip>}
       {s.mr_rework_enabled != null && <OptionChip>mr-rework: {s.mr_rework_enabled ? "on" : "off"}</OptionChip>}
-      {!s.wait_on_limit && !showApprove && s.mr_rework_enabled == null && (
+      {s.target !== "sweep" && !s.wait_on_limit && !showApprove && s.mr_rework_enabled == null && (
         <span className="text-[12px] text-faint">defaults</span>
       )}
     </>
   );
+}
+
+function CapacityOptions({ s }: { s: Schedule }) {
+  if (s.target !== "sweep") return null;
+  const gated = s.capacity_limit != null && s.capacity_room_needed != null;
+  return <>
+    <span className={cx("inline-flex items-center rounded-full border px-2 py-0.5 text-[11px]",
+      gated ? "border-brand/40 text-brand" : "border-edge text-muted")}>
+      {gated ? `limit ${s.capacity_limit} · room ${s.capacity_room_needed}` : "no limit"}
+    </span>
+    <OptionChip>{s.max_issues == null ? (gated ? "available room at a time" : "unlimited at a time") : `${s.max_issues} at a time`}</OptionChip>
+  </>;
 }
 
 function OptionChip({ children }: { children: React.ReactNode }) {

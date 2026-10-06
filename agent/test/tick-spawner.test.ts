@@ -10,7 +10,7 @@ import { WORKER_SPAWN_ENV, workerSpawnEnv, workerSpawnNonce } from "../src/worke
 import { realProcfsSkip } from "./real-procfs.js";
 
 // issue #1597 M2 — the mid-turn checkpoint tick's spawner: own process group per child, SIGTERM
-// then SIGKILL after a grace, `completed` only after exit, settled(), and PROVEN-ownership lock
+// then SIGKILL after a grace, `completed` after whole-group cleanup, settled(), and PROVEN-ownership lock
 // custody (pre-spawn snapshot + /proc fd evidence + dev/ino re-check). Real child processes.
 
 const NODE = process.execPath;
@@ -80,6 +80,48 @@ describe("TickSpawner (issue #1597 M2)", () => {
     assert.deepEqual(await h.completed, { code: 3 });
     await sp.settled();
     assert.equal(sp.cancelledAny(), false);
+  });
+
+  it("cancel is child-only, idempotent, and waits for group cleanup", async () => {
+    const ac = new AbortController();
+    const sp = new TickSpawner({ signal: ac.signal, killGraceMs: 50 });
+    const sibling = await sp.spawn(req([NODE, stubborn()]));
+    const child = await sp.spawn(req([NODE, leaderWithStubbornGrandchild()]));
+    await ready(sibling);
+    const grandchild = await grandchildOf(child);
+    try {
+      const first = child.cancel();
+      assert.strictEqual(child.cancel(), first);
+      await first;
+      assert.notEqual((await child.completed).code, 0);
+      assert.equal(alive(grandchild), false);
+      assert.equal(alive(sp.pids()[0]!), true);
+      assert.equal(ac.signal.aborted, false);
+      await child.cancel();
+    } finally {
+      await sibling.cancel();
+    }
+  });
+
+  it("cancel stops a grandchild after its leader exited", async () => {
+    const ac = new AbortController();
+    const sp = new TickSpawner({ signal: ac.signal, killGraceMs: 5_000 });
+    const child = await sp.spawn(req([NODE, leaderWithStubbornGrandchild(100)]));
+    const grandchild = await grandchildOf(child);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    let finished = false;
+    void child.completed.then(() => { finished = true; });
+    assert.equal(finished, false);
+    await child.cancel();
+    assert.equal(alive(grandchild), false);
+    await child.cancel();
+  });
+
+  it("an ENOENT handle supports cancellation and preserves the spawn failure", async () => {
+    const sp = new TickSpawner({ signal: new AbortController().signal });
+    const child = await sp.spawn(req([path.join(dir, "missing")]));
+    await assert.rejects(child.completed, /ENOENT/);
+    await assert.rejects(child.cancel(), /ENOENT/);
   });
 
   it("identity `command` runs through runnerCommand (a passthrough single-uid) in the given cwd", async () => {
@@ -170,7 +212,7 @@ ${exitAfterMs === undefined ? "setInterval(() => {}, 1000);" : `setTimeout(() =>
     const h = await sp.spawn(req([NODE, leaderWithStubbornGrandchild()]));
     const grandchild = await grandchildOf(h);
     ac.abort();
-    await h.completed; // the leader dies on SIGTERM at once; its group gets the SIGKILL next
+    await h.completed; // includes the SIGKILL cleanup of the group after its leader exits
     await sp.settled();
     assert.equal(alive(grandchild), false, "settled() did not resolve while the grandchild lived");
     assert.deepEqual(sp.survivors(), []);
@@ -181,13 +223,13 @@ ${exitAfterMs === undefined ? "setInterval(() => {}, 1000);" : `setTimeout(() =>
     const sp = new TickSpawner({ signal: ac.signal, killGraceMs: 200 });
     const h = await sp.spawn(req([NODE, leaderWithStubbornGrandchild(100)]));
     const grandchild = await grandchildOf(h);
-    assert.deepEqual(await h.completed, { code: 0 }, "completed still tracks the leader alone");
+    assert.deepEqual(await h.completed, { code: 0 }, "completion includes group cleanup");
     await sp.settled();
     assert.equal(alive(grandchild), false, "settled() did not resolve while the grandchild lived");
     assert.equal(sp.cancelledAny(), false);
   });
 
-  it("escalates to SIGKILL after the grace for a SIGTERM-ignoring child; completed only after exit", async () => {
+  it("escalates to SIGKILL after the grace for a SIGTERM-ignoring child; completion includes group cleanup", async () => {
     const ac = new AbortController();
     const sp = new TickSpawner({ signal: ac.signal, killGraceMs: 200 });
     const h = await sp.spawn(req([NODE, stubborn()]));
@@ -226,6 +268,18 @@ ${exitAfterMs === undefined ? "setInterval(() => {}, 1000);" : `setTimeout(() =>
     assert.equal(ac.signal.aborted, false);
   });
 
+  it("cleanup probe failure remains a blocking survivor after settlement", async () => {
+    const sp = new TickSpawner({
+      signal: new AbortController().signal,
+      hooks: { groupAlive: () => { throw new Error("group probe failed"); } },
+    });
+    const h = await sp.spawn(req([NODE, "-e", "process.exit(0)"]));
+    await assert.rejects(h.completed);
+    await sp.settled();
+    assert.deepEqual(sp.survivors(), [{ pgid: sp.pids()[0], identity: "worker_pat", killConfirmed: false }]);
+    await assert.rejects(h.cancel());
+  });
+
   it("a group that survives SIGKILL past the bounded wait is reported by survivors(); settled() still resolves", async () => {
     const ac = new AbortController();
     let forceAlive = true;
@@ -235,7 +289,8 @@ ${exitAfterMs === undefined ? "setInterval(() => {}, 1000);" : `setTimeout(() =>
       hooks: { groupAlive: () => (forceAlive ? true : undefined) },
     });
     const h = await sp.spawn(req([NODE, "-e", "process.exit(0)"]));
-    await h.completed;
+    await assert.rejects(h.completed, /survived cleanup/);
+    await assert.rejects(h.cancel(), /survived cleanup/);
     await sp.settled();
     assert.deepEqual(sp.survivors(), [{ pgid: sp.pids()[0], identity: "worker_pat", killConfirmed: true }]);
     forceAlive = false;
@@ -262,7 +317,7 @@ ${exitAfterMs === undefined ? "setInterval(() => {}, 1000);" : `setTimeout(() =>
       assert.deepEqual(sp.survivors(), [{ pgid: pid, identity: "worker_pat", killConfirmed: false }]);
     } finally {
       process.kill(-pid!, "SIGKILL");
-      await h.completed;
+      await assert.rejects(h.completed, /survived cleanup/);
     }
   });
 

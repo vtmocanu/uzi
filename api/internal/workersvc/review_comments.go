@@ -115,7 +115,7 @@ func IsActionableReviewComment(c ReviewCommentSnapshot) bool {
 // bots like CodeRabbit — that third-party feedback is the whole point of the feature.
 // Input is oldest-first (the M1 driver guarantee) and the output stays oldest-first
 // among kept comments; the byte cap charges body bytes only, same truncation semantics
-// as buildIssueCommentsSnapshot.
+// as issueinput.ProjectThread's body-byte bounds.
 //
 // It is exported because the M3 poller detector (poller/mr_review_watch.go) builds the
 // snapshot itself — it needs the kept comments to compute the high-water mark and gate

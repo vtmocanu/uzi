@@ -230,8 +230,8 @@ func newWhoamiCmd(env Env, gf *globalFlags) *cobra.Command {
 				return p.JSON(u)
 			}
 			return p.Table(
-				[]string{"ID", "EMAIL", "ADMIN"},
-				[][]string{{u.ID, u.Email, fmt.Sprintf("%t", u.IsAdmin)}},
+				[]string{"ID", "EMAIL", "ADMIN", "PLAN CROSS-CHECK"},
+				[][]string{{u.ID, u.Email, fmt.Sprintf("%t", u.IsAdmin), fmt.Sprintf("%t", u.PlanCrossCheckEnabled)}},
 			)
 		},
 	}

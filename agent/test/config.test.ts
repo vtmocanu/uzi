@@ -421,3 +421,13 @@ describe("loadConfig UZI_CODEX_COMMAND_SANDBOX (PRD #1493 M3)", () => {
     assert.deepStrictEqual(loadConfig(baseEnv()).codexHarness, { advertise: false, degraded: false, landlock: "probe-failed" });
   });
 });
+
+describe("cross-check model timeout boot validation", () => {
+ it("defaults to 15m and accepts the exact 2h maximum", () => {
+  assert.equal(loadConfig(baseEnv()).crossCheckModelTimeoutMs, 15 * 60_000);
+  assert.equal(loadConfig(baseEnv({ CROSS_CHECK_MODEL_TIMEOUT: "2h" })).crossCheckModelTimeoutMs, 2 * 60 * 60_000);
+ });
+ for (const value of ["0", "-1s", "7200001ms", "invalid"]) {
+  it("refuses " + value, () => assert.throws(() => loadConfig(baseEnv({ CROSS_CHECK_MODEL_TIMEOUT: value }))));
+ }
+});

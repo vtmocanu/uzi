@@ -143,7 +143,8 @@ WHERE run_id = @run_id AND kind = 'follow_up';
 -- so a queued chat waiting for a worker (no messages yet) is never reaped — a queued
 -- run sits indefinitely by design. RETURNING drives the same broadcast fan-out as
 -- the other sweeps.
-UPDATE runs SET status = 'completed', status_since = now(), finished_at = now(), updated_at = now()
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'completed', status_since = now(), finished_at = now(), updated_at = now()
 WHERE kind = 'chat'
   AND status IN ('claimed', 'running')
   AND id IN (

@@ -42,8 +42,11 @@
   // throwaway CA and server certificates for the fake uzi-fetcher, so no private key is
   // ever committed. It is a system utility, not a project dependency. Unlike the mkfifo
   // test, that suite does NOT skip without it: it proves the fetch tool's certificate
-  // check, so a missing openssl fails it loudly. These two are the only ignored binaries.
-  "ignoreBinaries": ["mkfifo", "openssl"],
+  // check, so a missing openssl fails it loudly. `task` is the system gate runner used by the confinement delegation.
+  "ignoreBinaries": ["mkfifo", "openssl", "task"],
+
+  // The root Taskfile deliberately owns this opt-in proof recipe.
+  "entry": ["test/cross-check-confinement-packaged.probe.ts"],
 
   // An exported type/interface referenced only within its OWN declaring file is
   // legitimate in-file contract surface, not dead-export debt: the src/protocol.ts

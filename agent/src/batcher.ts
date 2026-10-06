@@ -1,9 +1,9 @@
-import type { WorkerClient } from "./client.js";
+import type { WorkerClient, PlanCrossCheckResponse } from "./client.js";
 import { RequestError, isTransient } from "./client.js";
 import type { Logger } from "./log.js";
 import type { EmittedMessage } from "./executor.js";
 import type { Outbox } from "./outbox.js";
-import type { OutgoingMessage } from "./protocol.js";
+import type { OutgoingMessage, StateAck, PlanCrossCheckReconciliation } from "./protocol.js";
 import type { PayloadRedactor, TextRedactor } from "./redact.js";
 import { clampUtf8Bytes } from "./decisions-memo.js";
 import { emptyCounts, countsTotal, sanitizePayload, sanitizeText } from "./sanitize.js";
@@ -269,7 +269,50 @@ export interface MessageBatcherOptions {
  * earned, failing a run that was fine. Capping and splitting first removes the
  * growth, so the 4xx rule can later be applied to genuine poison only.
  */
+interface TransportReservation {
+  tail: number;
+  state: "held" | "prepared" | "failed";
+  abort: AbortController;
+  held: { msg: Omit<OutgoingMessage, "seq">; bytes: number }[];
+  bytes: number;
+  outboxPending: Set<symbol>;
+  preparing?: Promise<CandidateTransportPreparation>;
+  submitted: boolean;
+  ownedAttemptFailed?: boolean;
+  failureReason?: CandidateTransportPreparation["reason"];
+  /** Exact failed request prefix, even if later assigned frames follow it. */
+  replay?: Buffered[];
+}
+
+/** Sequence reservation only; callers must establish the checked-route feature/fence first.
+ * No checker approval or presentation authority is conveyed by this handle.
+ */
+export interface CandidateTransportPreparation {
+  prepared: boolean;
+  tail: number;
+  reason?: "retryable" | "usage_unconfirmed" | "cancelled" | "overflow" | "outbox_unavailable" | "ownership_unknown";
+  permanent?: boolean;
+}
+/** An event refused by a reservation that had already permanently failed. */
+export class CandidateReservationRefusedError extends Error {
+  constructor(readonly reason: CandidateTransportPreparation["reason"]) {
+    super("candidate transport reservation refused an event");
+    this.name = "CandidateReservationRefusedError";
+  }
+}
+
+export interface CandidateTransportReservation {
+  prepare(deadlineMs?: number, signal?: AbortSignal): Promise<CandidateTransportPreparation>;
+  /** Latch synchronously before the first submit POST, including an ambiguous failure. */
+  markSubmitted(): void;
+  release(proof: PlanCrossCheckResponse): boolean;
+  /** Transport authority only; the runner still owns the exact gate presentation. */
+  releaseAppliedGate(ack: StateAck): boolean;
+  cancel(): void;
+}
+
 export class MessageBatcher {
+  private reservation: TransportReservation | undefined;
   private buffer: Buffered[] = [];
   /** Consecutive FAILED flushes; drives the backoff delay and resets on any 2xx. */
   private consecutiveFailures = 0;
@@ -365,7 +408,7 @@ export class MessageBatcher {
       });
       return;
     }
-    this.seq += 1;
+    if (!this.reservation) this.seq += 1;
     // SANITIZE BEFORE REDACT, and the order is a security property, not a style
     // choice. The redactors are exact-substring matchers (`redact.ts`), so a secret
     // carrying an embedded NUL does not match and survives redaction — and
@@ -438,6 +481,22 @@ export class MessageBatcher {
     // serialized line a second time); UZI_LOG_LEVEL=debug turns it on, info stays
     // terse. The browser never shows raw JSON — this is the debug surface.
     this.log.debug("run event", { seq: out.seq, kind: out.kind, agent: out.agent, payload: out.payload });
+    if (this.reservation) {
+      const r = this.reservation;
+      // Reserve space for the eventual signed32-bit sequence without assigning it.
+      const bytes = item.bytes + 10;
+      if (r.state === "failed") throw new CandidateReservationRefusedError(r.failureReason);
+      if (r.bytes + bytes > this.spillBufferBytes) {
+        r.failureReason = "overflow";
+        r.state = "failed";
+        r.abort.abort();
+        throw new Error("candidate transport reservation refused an event");
+      }
+      const { seq: _seq, ...held } = item.msg;
+      r.held.push({ msg: held, bytes });
+      r.bytes += bytes;
+      return;
+    }
     // PRD #1391 M2: while SPILLED, cap the in-memory buffer. A message that would push
     // it over the cap is DROPPED and folded into a pending range record the next spill
     // flush writes durably (never a per-frame sync, never unbounded memory). The first
@@ -476,6 +535,168 @@ export class MessageBatcher {
     if (seq > this.pendingRangeLast) this.pendingRangeLast = seq;
   }
 
+  /** Synchronously stop sequence assignment before a candidate submission.
+   * Preparation owns no service loop. Its deadline bounds requests; one failed
+   * ACK ends the attempt and retains the reservation and original replay.
+   */
+  reserveCandidateTransport(): CandidateTransportReservation {
+    if (this.reservation || this.closed || this.tripped ||
+      !Number.isSafeInteger(this.generation) || this.generation <= 0 ||
+      !Number.isInteger(this.seq) || this.seq < 0 || this.seq > 0x7fffffff)
+      throw new Error("candidate transport cannot be reserved");
+    const r: TransportReservation = {
+      tail: this.seq, state: "held", abort: new AbortController(), held: [], bytes: 0, submitted: false,
+      outboxPending: new Set(this.outbox?.pendingDeliveryIdentities(this.runId)),
+    };
+    this.reservation = r;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    return {
+      prepare: (deadlineMs = 3000, signal) => {
+        if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 0)
+          throw new RangeError("candidate transport deadline must be a nonnegative safe integer");
+        if (this.reservation !== r || r.abort.signal.aborted || r.state === "failed")
+          return Promise.resolve({ prepared: false, tail: r.tail, permanent: true, reason: r.failureReason ?? "cancelled" });
+        if (!r.preparing && !r.abort.signal.aborted && this.reservation === r) {
+          r.state = "held";
+          r.preparing = this.prepareReservation(r, deadlineMs, signal);
+          const attempt = r.preparing;
+          void attempt.then((result) => { if (!result.prepared && r.preparing === attempt) r.preparing = undefined; });
+        }
+        return r.preparing ?? Promise.resolve({ prepared: false, tail: r.tail, permanent: true, reason: "cancelled" });
+      },
+      markSubmitted: () => { r.submitted = true; },
+      cancel: () => { if (this.reservation === r) { r.state = "failed"; r.failureReason ??= "cancelled"; r.abort.abort(); } },
+      release: (proof) => {
+        const p = proof?.reconciliation;
+        if (!p || proof.lead_last_seq !== p.leadLastSeq ||
+          !((proof.result === "candidate" && proof.candidate_generation === this.generation &&
+            ["approve", "revise", "block", "failed"].includes(proof.verdict)) ||
+            (proof.result === "parked" && ["", "approve", "revise", "block", "failed"].includes(proof.verdict)) ||
+            (proof.result === "no_row" && proof.reason_class === "no_candidate" && !r.submitted)))
+          return false;
+        return this.releaseReservation(r, p);
+      },
+      releaseAppliedGate: (ack) => {
+        if (!ack?.applied || ack.status !== "awaiting_approval" || ack.staleClaim ||
+            !ack.reconciliation || ack.reconciliation.gateRevision < 1) return false;
+        const cursor = ack.reconciliation.leadLastSeq;
+        if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor > 0x7fffffff) return false;
+        return this.releaseReservation(r, { ...ack.reconciliation,
+          leadLastSeq: r.submitted ? cursor : Math.max(cursor, r.tail) });
+      },
+    };
+  }
+
+  private releaseReservation(r: TransportReservation, p: PlanCrossCheckReconciliation): boolean {
+    const tail = p.leadLastSeq;
+    if (this.reservation !== r || r.state !== "prepared" || this.closed || this.tripped ||
+        r.abort.signal.aborted || r.outboxPending.size !== 0 || r.replay ||
+        this.buffer.length !== 0 || this.pendingRangeFirst !== undefined ||
+        this.outbox?.isDisabled() || this.outbox?.hasUndrainedMessages(this.runId) ||
+        this.usage.inactive || this.usage.hasUnconfirmedLoss ||
+        p.claimGeneration !== this.generation || !Number.isSafeInteger(p.claimGeneration) || p.claimGeneration <= 0 ||
+        p.planCrossCheckSettled !== true || !Number.isInteger(tail) ||
+        tail < r.tail || tail > 0x7fffffff || tail + r.held.length > 0x7fffffff) return false;
+    this.seq = tail;
+    for (const item of r.held) {
+      const msg = { ...item.msg, seq: ++this.seq };
+      this.buffer.push({ msg, bytes: messageBytes(msg) });
+    }
+    this.reservation = undefined;
+    this.spilled = false;
+    this.consecutiveFailures = 0;
+    this.failingSince = undefined;
+    this.splitLimit = undefined;
+    if (this.buffer.length) this.scheduleFlush();
+    return true;
+  }
+
+  private async prepareReservation(
+    r: TransportReservation,
+    deadlineMs: number, signal?: AbortSignal,
+  ): Promise<CandidateTransportPreparation> {
+    const expiry = AbortSignal.any([r.abort.signal,
+      AbortSignal.timeout(Math.max(0, Math.min(deadlineMs, 30_000))),
+      ...(signal ? [signal] : [])]);
+    let usageUnconfirmed = false;
+    const failed = (): boolean => r.state === "failed";
+    const abortOwned = (): void => { this.inFlightAbort?.abort(); };
+    expiry.addEventListener("abort", abortOwned, { once: true });
+    try {
+      if (expiry.aborted) abortOwned();
+      await this.inFlight;
+      if (r.ownedAttemptFailed) {
+        r.ownedAttemptFailed = false;
+        throw new Error("owned request failed");
+      }
+      if (expiry.aborted || failed() || this.closed || this.tripped ||
+        this.outbox?.isDisabled()) throw new Error("reservation unavailable");
+      if (!await this.usage.drainConfirmed(Math.min(deadlineMs, 3000), expiry)) {
+        usageUnconfirmed = true;
+        throw new Error("usage not ACK-proven");
+      }
+      if (this.outbox) {
+        const result = await this.outbox.drainRun(this.runId, async (msgs, generation) => {
+          if (generation !== this.generation || msgs.some((m) => m.seq > r.tail)) {
+            r.failureReason = "ownership_unknown";
+            r.abort.abort();
+            throw new Error("unproven durable generation/tail");
+          }
+          expiry.throwIfAborted();
+          await this.client.postMessages(this.runId, msgs, generation, expiry);
+        }, (identity) => { r.outboxPending.delete(identity); }, expiry);
+        const remaining = new Set(this.outbox.pendingDeliveryIdentities(this.runId));
+        if ([...r.outboxPending].some((identity) => !remaining.has(identity)) ||
+          result.staleRetired !== 0) {
+          r.failureReason = "ownership_unknown";
+          r.abort.abort(); // External disappearance supplies no delivery receipt.
+          throw new Error("outbox retirement not ACK-proven");
+        }
+        if (!result.retired || r.outboxPending.size !== 0 || this.outbox.isDisabled() ||
+          this.outbox.hasUndrainedMessages(this.runId))
+          throw new Error("outbox not ACK-proven");
+      }
+      // Existing ranges retain their assigned sequence and bounded tombstone replay.
+      // Every prefix is sent once per preparation, with no poison replacement.
+      while (this.buffer.length || this.pendingRangeFirst !== undefined) {
+        if (expiry.aborted || failed() || this.closed) throw new Error("cancelled");
+        if (!this.buffer.length) this.refillPendingRangeChunk();
+        const batch = r.replay ?? this.takePrefix();
+        if (r.replay) this.buffer.splice(0, batch.length);
+        try {
+          await this.client.postMessages(this.runId, batch.map((b) => b.msg), this.generation, expiry);
+          r.replay = undefined;
+        } catch (err) {
+          r.replay = batch;
+          this.buffer = batch.concat(this.buffer);
+          throw err;
+        }
+      }
+      if (!await this.usage.drainConfirmed(Math.min(deadlineMs, 3000), expiry)) {
+        usageUnconfirmed = true;
+        throw new Error("usage not ACK-proven");
+      }
+      if (expiry.aborted || failed() || this.closed || this.outbox?.isDisabled())
+        throw new Error("cancelled or unavailable");
+      r.state = "prepared";
+      return { prepared: true, tail: r.tail };
+    } catch {
+      const permanent = r.abort.signal.aborted || this.closed || this.tripped ||
+        this.outbox?.isDisabled() === true || this.usage.inactive || this.usage.hasUnconfirmedLoss;
+      if (permanent) {
+        r.state = "failed";
+        r.failureReason ??= this.outbox?.isDisabled() ? "outbox_unavailable" :
+          this.usage.inactive || this.usage.hasUnconfirmedLoss ? "usage_unconfirmed" : "cancelled";
+        r.abort.abort();
+      } else r.state = "held";
+      return { prepared: false, tail: r.tail, permanent,
+        reason: r.failureReason ?? (usageUnconfirmed ? "usage_unconfirmed" : "retryable") };
+    } finally {
+      expiry.removeEventListener("abort", abortOwned);
+    }
+  }
+
   /** Highest seq assigned so far (for pinning / diagnostics). */
   currentSeq(): number {
     return this.seq;
@@ -512,7 +733,7 @@ export class MessageBatcher {
    * after close.
    */
   rearm(): void {
-    if (!this.spilled || this.closed) return;
+    if (this.reservation || !this.spilled || this.closed) return;
     this.spilled = false;
     this.consecutiveFailures = 0;
     this.failingSince = undefined;
@@ -598,7 +819,7 @@ export class MessageBatcher {
   }
 
   private scheduleFlush(): void {
-    if (this.timer || this.closed) return;
+    if (this.reservation || this.timer || this.closed) return;
     this.timer = setTimeout(() => {
       this.timer = undefined;
       void this.flushMessages();
@@ -645,6 +866,7 @@ export class MessageBatcher {
    * calls {@link flushMessages} directly: the recorder has its own debounce.
    */
   async flush(signal?: AbortSignal): Promise<void> {
+    if (this.reservation) return;
     await this.usage.drain(undefined, signal);
     await this.flushMessages(signal);
   }
@@ -654,16 +876,16 @@ export class MessageBatcher {
     // M2): SPILLED → doSpillFlush writes it durably; network → doFlush drains it as
     // bounded tombstone chunks.
     const hasWork = this.buffer.length > 0 || this.pendingRangeFirst !== undefined;
-    if (this.flushing || !hasWork || this.tripped) return;
+    if (this.reservation || this.flushing || !hasWork || this.tripped) return;
     this.flushing = true;
     const abort = new AbortController();
     const onAbort = (): void => abort.abort(signal?.reason);
     if (signal?.aborted) onAbort();
     else signal?.addEventListener("abort", onAbort, { once: true });
     this.inFlightAbort = abort;
-    // PRD #1391 M2: SPILLED flushes go to the outbox (local, fast — the boundary signal
-    // is irrelevant); network flushes stay abort-aware as before.
-    this.inFlight = this.spilled ? this.doSpillFlush() : this.doFlush(abort.signal);
+    // Both targets share owned cancellation: an outbox write can queue behind
+    // an independent drainer. Active writes still await their real settlement.
+    this.inFlight = this.spilled ? this.doSpillFlush(abort.signal) : this.doFlush(abort.signal);
     try {
       await this.inFlight;
     } finally {
@@ -686,6 +908,11 @@ export class MessageBatcher {
   private trip(reason: string, lastSeq: number): void {
     if (this.tripped) return;
     this.tripped = true;
+    if (this.reservation) {
+      this.reservation.state = "failed";
+      this.reservation.failureReason ??= "cancelled";
+      this.reservation.abort.abort();
+    }
     this.tripReason = reason;
     const dropped = this.buffer.length;
     const text = this.redactText(
@@ -740,6 +967,7 @@ export class MessageBatcher {
     let posts = 0;
     let progressed = false;
     while (hi - lo > 1) {
+      if (this.reservation) return { remaining: batch.slice(lo), progressed };
       if (posts >= MAX_BISECT_POSTS) {
         this.trip(
           `a poisoned message could not be isolated within ${MAX_BISECT_POSTS} posts`,
@@ -761,6 +989,12 @@ export class MessageBatcher {
         progressed = true; // a sub-batch was persisted
       } catch (err) {
         const verdict = classify(err);
+        const reserved = this.reservation as TransportReservation | undefined;
+        if (reserved) {
+          reserved.ownedAttemptFailed = true;
+          reserved.replay = half;
+          return { remaining: batch.slice(lo), progressed };
+        }
         if (verdict === "fatal") {
           this.trip(`the api rejected the run's messages with ${errMessage(err)}`, batch[lo]!.msg.seq);
           return { remaining: [], progressed };
@@ -795,6 +1029,7 @@ export class MessageBatcher {
         hi = mid;
       }
     }
+    if (this.reservation) return { remaining: batch.slice(lo), progressed };
     if (hi - lo < 1) return { remaining: batch.slice(lo), progressed }; // nothing left to isolate
 
     // `batch[lo]` is the poison. Tombstone it under its OWN seq so the stream stays
@@ -813,6 +1048,12 @@ export class MessageBatcher {
       progressed = true; // the poison was isolated and tombstoned
       return { remaining: batch.slice(lo + 1), progressed };
     } catch (err) {
+      const reserved = this.reservation as TransportReservation | undefined;
+      if (reserved) {
+        reserved.ownedAttemptFailed = true;
+        reserved.replay = [marker];
+        return { remaining: [marker, ...batch.slice(lo + 1)], progressed };
+      }
       if (classify(err) === "transient") {
         // Keep the tombstone (not the original) queued: the payload is known bad.
         return { remaining: [marker, ...batch.slice(lo + 1)], progressed };
@@ -837,7 +1078,7 @@ export class MessageBatcher {
    */
   private async doFlush(signal?: AbortSignal): Promise<void> {
     try {
-      while ((this.buffer.length > 0 || this.pendingRangeFirst !== undefined) && !this.tripped && !signal?.aborted) {
+      while ((this.buffer.length > 0 || this.pendingRangeFirst !== undefined) && !this.tripped && !signal?.aborted && !this.reservation) {
         // Materialise the next bounded tombstone chunk only once the buffer has drained,
         // so each chunk is fully sent before the next is pulled (memory stays bounded to
         // one chunk and chunks stay ascending).
@@ -858,6 +1099,8 @@ export class MessageBatcher {
         } catch (err) {
           if (signal?.aborted) {
             this.buffer = batch.concat(this.buffer);
+            const reserved = this.reservation as TransportReservation | undefined;
+            if (reserved) { reserved.ownedAttemptFailed = true; reserved.replay = batch; }
             break;
           }
           if (await this.handleFailure(batch, err, signal)) break;
@@ -876,6 +1119,14 @@ export class MessageBatcher {
    */
   private async handleFailure(batch: Buffered[], err: unknown, signal?: AbortSignal): Promise<boolean> {
     const verdict = classify(err);
+    if (this.reservation) {
+      this.buffer = batch.concat(this.buffer);
+      // An already-owned ordinary request may finish after reservation. Do not
+      // replace its payload or spill it on a failed response.
+      this.reservation.ownedAttemptFailed = true;
+      this.reservation.replay = batch;
+      return true;
+    }
     const lastSeq = batch[0]?.msg.seq ?? this.seq;
 
     // A rejected TOMBSTONE is the one true drop. The marker is worker-minted ASCII
@@ -941,14 +1192,14 @@ export class MessageBatcher {
       }
       const { remaining, progressed } = await this.bisect(batch, signal);
       this.buffer = remaining.concat(this.buffer);
-      if (this.tripped) return true;
+      if (this.reservation || this.tripped) return true;
       if (!progressed) {
         // bisect abandoned on its FIRST probe (a transient or a 413) with nothing
         // persisted and nothing tombstoned. Treat it as the transient failure it is:
         // back off and keep the sustained-failure breaker clock running. Resetting the
         // accounting here — as the old code did — re-posted with no backoff and wiped
         // failingSince, reopening the PRD #108 retry storm through the bisect door.
-        await this.noteTransientFailure(batch.length, lastSeq, err);
+        await this.noteTransientFailure(batch.length, lastSeq, err, signal);
         return true;
       }
       // Real progress: a sub-batch was persisted, or the poison was isolated and
@@ -962,7 +1213,7 @@ export class MessageBatcher {
     // whole buffer no longer rides on one request, so this re-buffer can no longer
     // grow a body across the server's cap — the next attempt re-splits.
     this.buffer = batch.concat(this.buffer);
-    await this.noteTransientFailure(batch.length, lastSeq, err);
+    await this.noteTransientFailure(batch.length, lastSeq, err, signal);
     return true;
   }
 
@@ -970,7 +1221,7 @@ export class MessageBatcher {
    *  sustained-failure spill/trip. The caller has already re-buffered the batch. After
    *  `transientTripMs` of unbroken transient failure the batcher SPILLS to the outbox
    *  (PRD #1391 M2) instead of tripping; with no outbox it falls back to today's trip. */
-  private async noteTransientFailure(count: number, lastSeq: number, err: unknown): Promise<void> {
+  private async noteTransientFailure(count: number, lastSeq: number, err: unknown, signal?: AbortSignal): Promise<void> {
     this.consecutiveFailures += 1;
     const now = Date.now();
     this.failingSince ??= now;
@@ -988,7 +1239,7 @@ export class MessageBatcher {
       // as "no durable store" and TRIP (surfacing the failure), exactly as today with
       // no outbox at all.
       if (this.outbox && !this.outbox.isDisabled()) {
-        await this.enterSpill(lastSeq);
+        await this.enterSpill(lastSeq, signal);
       } else {
         this.trip(
           `the api has been unreachable or failing for ${Math.round((now - this.failingSince) / 1000)}s`,
@@ -1006,7 +1257,7 @@ export class MessageBatcher {
    * restart. If marking fails the store is unusable, so fall back to today's trip
    * rather than silently losing the tail.
    */
-  private async enterSpill(lastSeq: number): Promise<void> {
+  private async enterSpill(lastSeq: number, signal?: AbortSignal): Promise<void> {
     if (this.spilled || this.tripped) return;
     // No durable store — absent, or failed closed at init (a disabled store's writes
     // are silent no-ops). Trip rather than pretend to spill into the void.
@@ -1015,8 +1266,9 @@ export class MessageBatcher {
       return;
     }
     try {
-      await this.outbox.markSpillUnclean(this.runId);
+      await this.outbox.markSpillUnclean(this.runId, signal);
     } catch (err) {
+      if (signal?.aborted) return; // Cancelled acquisition leaves the assigned tail buffered.
       this.log.error("outbox: could not mark spill unclean; tripping instead of spilling", {
         run_id: this.runId,
         error: errMessage(err),
@@ -1041,7 +1293,7 @@ export class MessageBatcher {
    * tail is durable at that instant). One `appendSegment` is the durability point — no
    * per-frame sync.
    */
-  private async doSpillFlush(): Promise<void> {
+  private async doSpillFlush(signal?: AbortSignal): Promise<void> {
     try {
       const outbox = this.outbox;
       if (!outbox) return; // defensive: only ever reached while spilled, which requires an outbox
@@ -1052,7 +1304,7 @@ export class MessageBatcher {
       // that restart reads as clean — a silent tail loss. Back off and retry instead.
       if (this.buffer.length > 0 || this.pendingRangeFirst !== undefined) {
         try {
-          await outbox.markSpillUnclean(this.runId);
+          await outbox.markSpillUnclean(this.runId, signal);
         } catch (err) {
           if (this.spilled) {
             this.consecutiveFailures += 1;
@@ -1070,7 +1322,8 @@ export class MessageBatcher {
         const first = this.pendingRangeFirst;
         const last = this.pendingRangeLast;
         try {
-          await outbox.appendRangeRecord(this.runId, this.generation, first, last);
+          await outbox.appendRangeRecord(this.runId, this.generation, first, last,
+            (identity) => { this.reservation?.outboxPending.add(identity); }, signal);
           this.pendingRangeFirst = undefined;
           this.pendingRangeLast = undefined;
         } catch (err) {
@@ -1094,7 +1347,7 @@ export class MessageBatcher {
       // outbox — otherwise a late segment would be delivered out of order AFTER the
       // network has re-armed. The remaining buffer flushes over the network; the
       // finally below reschedules a (now network) flush for it.
-      while (this.buffer.length > 0 && !this.closed && this.spilled) {
+      while (this.buffer.length > 0 && !this.closed && this.spilled && !this.reservation) {
         const batch = this.takePrefix();
         if (batch.length === 0) break;
         try {
@@ -1102,6 +1355,8 @@ export class MessageBatcher {
             this.runId,
             this.generation,
             batch.map((b) => b.msg),
+            (identity) => { this.reservation?.outboxPending.add(identity); },
+            signal,
           );
         } catch (err) {
           this.buffer = batch.concat(this.buffer);
@@ -1123,7 +1378,7 @@ export class MessageBatcher {
       if (this.buffer.length === 0 && this.pendingRangeFirst === undefined) {
         this.consecutiveFailures = 0;
         this.failingSince = undefined;
-        await outbox.clearSpillUnclean(this.runId).catch(() => undefined);
+        await outbox.clearSpillUnclean(this.runId, signal).catch(() => undefined);
       }
     } finally {
       this.flushing = false;
@@ -1136,7 +1391,7 @@ export class MessageBatcher {
    *  to the outbox (durable, replayed later by the drainer) and clear the unclean flag
    *  once the tail is on disk. A write failure leaves the flag set so restart admits
    *  the possible loss. */
-  private async finalSpillOnClose(): Promise<void> {
+  private async finalSpillOnClose(signal?: AbortSignal): Promise<void> {
     const outbox = this.outbox;
     if (!outbox) return;
     try {
@@ -1155,10 +1410,11 @@ export class MessageBatcher {
       // cleared the flag), an unwritable manifest can record nothing durably and the
       // loss is admitted by the "may be lost" log alone.
       if (this.buffer.length > 0 || this.pendingRangeFirst !== undefined) {
-        await outbox.markSpillUnclean(this.runId);
+        await outbox.markSpillUnclean(this.runId, signal);
       }
       if (this.pendingRangeFirst !== undefined && this.pendingRangeLast !== undefined) {
-        await outbox.appendRangeRecord(this.runId, this.generation, this.pendingRangeFirst, this.pendingRangeLast);
+        await outbox.appendRangeRecord(this.runId, this.generation, this.pendingRangeFirst, this.pendingRangeLast,
+          (identity) => { this.reservation?.outboxPending.add(identity); }, signal);
         this.pendingRangeFirst = undefined;
         this.pendingRangeLast = undefined;
       }
@@ -1170,13 +1426,15 @@ export class MessageBatcher {
             this.runId,
             this.generation,
             batch.map((b) => b.msg),
+            (identity) => { this.reservation?.outboxPending.add(identity); },
+            signal,
           );
         } catch (err) {
           this.buffer = batch.concat(this.buffer);
           throw err;
         }
       }
-      await outbox.clearSpillUnclean(this.runId);
+      await outbox.clearSpillUnclean(this.runId, signal);
     } catch (err) {
       this.log.warn("message batcher: spilling the tail to the outbox on close failed; it may be lost", {
         run_id: this.runId,
@@ -1191,6 +1449,26 @@ export class MessageBatcher {
    * close cannot outlive the owning boundary on an independent HTTP timeout. */
   async close(signal?: AbortSignal): Promise<void> {
     this.closed = true;
+    if (this.reservation) {
+      const r = this.reservation;
+      r.state = "failed";
+      r.failureReason ??= "cancelled";
+      r.abort.abort();
+      this.inFlightAbort?.abort();
+      await this.inFlight;
+      await r.preparing;
+      await this.usage.drainConfirmed(0);
+      this.usage.release();
+      // These messages already own their original sequence numbers. Preserve
+      // them for identical replay; the held events must never enter this writer.
+      if (this.outbox && !this.outbox.isDisabled()) await this.finalSpillOnClose(signal);
+      else if (this.buffer.length || this.pendingRangeFirst !== undefined)
+        this.warnUndeliveredAtClose("candidate transport ended without a durable store");
+      this.log.warn("closed with candidate transport reservation held", {
+        run_id: this.runId, unassigned: r.held.length, assigned_tail: r.tail,
+      });
+      return;
+    }
     await this.usage.drain(undefined, signal);
     // Past close nothing can be retried: stop the recorder so a failing api cannot keep it retrying.
     this.usage.release();
@@ -1219,7 +1497,7 @@ export class MessageBatcher {
     // clear the unclean flag once the tail is durable. Never a network drain here (the
     // api is unreachable, which is why we spilled).
     if (this.spilled) {
-      await this.finalSpillOnClose();
+      await this.finalSpillOnClose(signal);
       return;
     }
     // A tripped breaker skips the drain entirely. The 3 attempts plus 600ms of

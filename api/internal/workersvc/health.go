@@ -213,7 +213,8 @@ const (
 	// job in a fleet of old-image or docker-only workers is unclaimable until a job-capable worker
 	// comes online. PRD #1909 M1: a job stamped with runs.job_protocol additionally needs
 	// 'job_files_v1', so the text names both. Maps to the SAME healthWaitingWorker enum (runs.health_reason is free text).
-	reasonNoJobCapableWorker = "no online worker supports jobs (job_runner_v1, job_files_v1); update or provision a non-Docker worker"
+	reasonNoJobCapableWorker        = "no online worker supports jobs (job_runner_v1, job_files_v1); update or provision a non-Docker worker"
+	reasonNoCrossCheckCapableWorker = "no online worker supports plan cross-check (cross_check_v1); update or provision a capable worker"
 	// reasonWaitingIsolatedLane (PRD #1906 M5) is the queued reason for a PROFILE-BOUND run: only
 	// a worker the api provisions into the isolated lane can claim it (ClaimRun's two-way lane
 	// clause), so no ordinary worker reason applies. Maps to the SAME healthWaitingWorker enum.
@@ -279,7 +280,8 @@ const (
 	// pendingOutcomeFlagHeartbeats heartbeat intervals. It maps to the SAME healthStalled enum as
 	// reasonOutboxQueued, is a warning only, and never touches the lease or authorizes a reclaim,
 	// fail or discard. Same fixed-string contract as its siblings.
-	reasonOutcomeUndelivered = "the run's outcome is journaled on its worker but has not been delivered"
+	reasonOutcomeUndelivered    = "the run's outcome is journaled on its worker but has not been delivered"
+	reasonPlanCrossCheckWaiting = "waiting for plan cross-check"
 	// reasonLongToolCall (issue #2046) flags a running run whose oldest open lead tool call
 	// (delegation dispatches excluded) has been in flight longer than health_tool_call_seconds
 	// while the run itself has gone quiet. It maps to healthStalled, NOT healthSlow: slow
@@ -424,6 +426,11 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		if reason == reasonHandoffSetup {
 			nudge = false
 		}
+		// A live plan cross-check is expected waiting, not an owner-actionable warning.
+		// Preserve the existing notification stamp and cooldown for ordinary health episodes.
+		if reason == reasonPlanCrossCheckWaiting {
+			nudge = false
+		}
 		notifiedAt := pgtype.Timestamptz{}
 		if nudge {
 			notifiedAt = pgconv.Time(now)
@@ -508,8 +515,13 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 	}
 }
 
+// Optional reader keeps Store implementations without cross-check queries compatible.
+type livePlanCrossCheckReader interface {
+	HasLivePlanCrossCheck(context.Context, uuid.UUID) (bool, error)
+}
+
 // runningTarget computes the flag for a running run, priority persist-looping >
-// tool-looping > stalled > long tool call > near-timeout (Decision 3, extended by
+// tool-looping > live plan cross-check > stalled > long tool call > near-timeout (Decision 3, extended by
 // PRD #108 M4, #1170 D5 and issue #2046): looping is the strongest evidence of
 // pathology, and near-timeout is a budget-relative backstop that must not mask a
 // more specific signal.
@@ -554,6 +566,19 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 	// in-flight — a run repeating the same call is pathological even mid-call.
 	if stats.looping {
 		return healthLooping, reasonLooping
+	}
+
+	// The live query owns the current-generation, deadline and required-check predicate;
+	// the strict pending/settlement helper is deliberately not a health signal.
+	if runkind.PlanCrossCheckable(r.Kind) {
+		if reader, ok := s.q.(livePlanCrossCheckReader); ok {
+			live, err := reader.HasLivePlanCrossCheck(ctx, r.ID)
+			if err != nil {
+				slog.Error("health: read live plan cross-check", "run_id", r.ID, "error", err)
+			} else if live {
+				return healthWaitingWorker, reasonPlanCrossCheckWaiting
+			}
+		}
 	}
 
 	// stalled: silence past the threshold, suppressed while a LEAD tool call is in
@@ -1078,6 +1103,29 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			slog.Error("health: count workers satisfying Codex completion protocol", "run_id", r.ID, "error", cerr)
 		} else if c == 0 {
 			return reasonNoCodexCompletionCapableWorker
+		}
+	}
+	// The snapshot is absent from ListActiveRunsForHealth's projection. Read it only
+	// after the queued threshold, then inspect the owner's fleet for the protocol
+	// capability ClaimRun requires. A failed read falls through.
+	if run, rerr := s.q.GetRunByID(ctx, r.ID); rerr != nil {
+		slog.Error("health: read cross-check requirement", "run_id", r.ID, "error", rerr)
+	} else if run.PlanCrossCheckRequired || run.Kind == "cross_check" {
+		workers, werr := s.q.ListWorkersByUser(ctx, r.UserID)
+		if werr != nil {
+			slog.Error("health: read cross-check capable workers", "run_id", r.ID, "error", werr)
+		} else {
+			capable := false
+			for _, worker := range workers {
+				if worker.Status == "online" && !worker.DrainingSince.Valid && !worker.Ephemeral && !worker.IsolatedLane &&
+					slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckV1) {
+					capable = true
+					break
+				}
+			}
+			if !capable {
+				return reasonNoCrossCheckCapableWorker
+			}
 		}
 	}
 	// A queued run the kind-derived priority DEMOTED (PRD #320 D9) is not stuck — it is

@@ -680,6 +680,7 @@ func toIssue(i *gitlab.Issue) Issue {
 	}
 	if i.Author != nil {
 		issue.Author = i.Author.Username
+		issue.AuthorForgeUserID = i.Author.ID
 	}
 	if i.UpdatedAt != nil {
 		issue.UpdatedAt = *i.UpdatedAt

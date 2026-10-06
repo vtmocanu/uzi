@@ -66,6 +66,8 @@ const CATALOG = {
       prompt: "",
       labels: ["bug"],
       guidance: "Triage the bug.",
+      capacity_limit: null,
+      capacity_room_needed: null,
       max_issues: 3,
       auto_approve: true,
       wait_on_limit: true,
@@ -96,6 +98,8 @@ function sched(over: Partial<Schedule>): Schedule {
     last_fire: null,
     auto_approve: true,
     wait_on_limit: true,
+    capacity_limit: null,
+    capacity_room_needed: null,
     max_issues: 10,
     guidance: null,
     baked_guidance: null,
@@ -259,6 +263,8 @@ describe("Schedules — enable-default sends the browser timezone (issue #660)",
         prompt: "",
         labels: ["bug"],
         guidance: "Triage the bug.",
+        capacity_limit: null,
+        capacity_room_needed: null,
         max_issues: 3,
         auto_approve: true,
         wait_on_limit: true,
@@ -346,6 +352,8 @@ describe("Schedules — fire outcomes (PRD #308 M4)", () => {
   it("backfill (issue #416): a fire that backfilled past a skip shows the started runs AND the flagged skip, and the tally is relabeled 'examined' (may exceed max_issues)", async () => {
     only1({
       target: "sweep",
+      capacity_limit: null,
+      capacity_room_needed: null,
       max_issues: 3,
       // examined 4 = started 3 (10, 30, 40 — 30/40 backfilled past the skip) + skipped 1 (20).
       // matched is the WIRE field name (unchanged); it now carries the examined count.
@@ -379,6 +387,8 @@ describe("Schedules — fire outcomes (PRD #308 M4)", () => {
   it("started-nothing: an amber '0 started · 1 skipped' badge, expandable to the skip + its reason", async () => {
     only1({
       target: "sweep",
+      capacity_limit: null,
+      capacity_room_needed: null,
       max_issues: 5,
       last_fire: fire({
         matched: 1,
@@ -486,6 +496,8 @@ describe("Schedules — issue links on fire rows (PRD #411)", () => {
   it("a fire row with a null issue_iid renders the 'prompt' marker, not an anchor", async () => {
     only1({
       target: "sweep",
+      capacity_limit: null,
+      capacity_room_needed: null,
       max_issues: 5,
       last_fire: fire({
         matched: 1,
@@ -507,6 +519,8 @@ describe("Schedules — the cap hint (PRD #308 M4, Goal 2)", () => {
   it("renders when capped && skipped>0 && started===0", async () => {
     only1({
       target: "sweep",
+      capacity_limit: null,
+      capacity_room_needed: null,
       max_issues: 1,
       last_fire: fire({
         matched: 1,
@@ -522,6 +536,8 @@ describe("Schedules — the cap hint (PRD #308 M4, Goal 2)", () => {
   it("does NOT render when capped but something started", async () => {
     only1({
       target: "sweep",
+      capacity_limit: null,
+      capacity_room_needed: null,
       max_issues: 1,
       last_fire: fire({
         matched: 2,
@@ -538,6 +554,8 @@ describe("Schedules — the cap hint (PRD #308 M4, Goal 2)", () => {
   it("does NOT render when skips exist but the fire was not capped", async () => {
     only1({
       target: "sweep",
+      capacity_limit: null,
+      capacity_room_needed: null,
       max_issues: 10,
       last_fire: fire({
         matched: 1,
@@ -767,6 +785,8 @@ const customizedDefault = (over: Partial<Schedule> = {}) =>
     catalog_slug: "bug-triage",
     target: "sweep",
     labels: ["bug"],
+    capacity_limit: null,
+    capacity_room_needed: null,
     max_issues: 3,
     cron_expr: "30 7 * * 1-5",
     timezone: "Europe/Bucharest",
@@ -927,7 +947,7 @@ describe("Schedules — default rows on the unified list (PRD #1645 D4)", () => 
     expect(within(row).queryByText("inherit model")).toBeNull();
     // Sealed labels and the max-issues cap are chips from the row too.
     expect(within(row).getByText("label bug")).toBeTruthy();
-    expect(within(row).getByText("max 3")).toBeTruthy();
+    expect(within(row).getByText("3 at a time")).toBeTruthy();
     // Provenance: lock marker, kind pill, customized badge.
     expect(within(row).getByLabelText("Baked prompt, read-only")).toBeTruthy();
     expect(within(row).getByText("sweep")).toBeTruthy();
@@ -1947,6 +1967,8 @@ describe("Schedules — Job catalog (PRD #1645 D7)", () => {
     name: "Docs hygiene",
     target: "prompt" as const,
     labels: [],
+    capacity_limit: null,
+    capacity_room_needed: null,
     max_issues: 0,
   };
   const docsRow = (over: Partial<Schedule> = {}) =>

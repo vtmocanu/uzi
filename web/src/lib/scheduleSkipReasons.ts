@@ -9,6 +9,7 @@
 import type { ScheduleSkipReason } from "./api";
 
 export const SCHEDULE_SKIP_REASON_LABELS: Record<ScheduleSkipReason, string> = {
+  config_not_supported: "configuration not supported",
   not_eligible: "not eligible",
   already_running: "already running",
   description_too_large: "description too large",

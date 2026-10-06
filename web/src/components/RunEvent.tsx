@@ -1,7 +1,9 @@
+import { PlanCrossCheckEvent } from "./PlanCrossCheck";
+import type { PlanCrossCheckSummary } from "../lib/apiTypes";
 import { memo, useEffect, useRef, useState, type ReactNode } from "react";
 import type { RunMessage } from "../lib/api";
 import type { PhaseUsage } from "../lib/runUsage";
-import { feedWindowLabel, parseFeedInstant } from "../lib/limitWait";
+import { feedWindowLabel, parseFeedInstant, usageLimitLabel } from "../lib/limitWait";
 import { formatTokens, formatCost } from "../lib/formatTokens";
 import { useNow } from "../lib/useNow";
 import { Markdown } from "./Markdown";
@@ -984,9 +986,11 @@ function StandaloneResult({ result }: { result: RunMessage }) {
  * no per-row information is lost by leaving the count out entirely.
  */
 function LimitRow({
+  harness,
   payload,
   parked = false,
 }: {
+  harness?: string;
   payload?: Record<string, unknown>;
   parked?: boolean;
 }) {
@@ -1022,8 +1026,8 @@ function LimitRow({
           own failure path and gaining a feed line there is a one-line change. The
           outcome is true for every emitter; the cause is true for the current one. */}
       {parked
-        ? "Anthropic usage limit reached — paused until it resets"
-        : "Anthropic usage limit reached — the run failed here"}
+        ? `${usageLimitLabel(harness)} reached — paused until it resets`
+        : `${usageLimitLabel(harness)} reached — the run failed here`}
       {detail && <span className="font-normal opacity-90">({detail})</span>}
     </div>
   );
@@ -1033,12 +1037,16 @@ function LimitRow({
 // result flips undefined→object once when a tool call completes; live flips once
 // when the run leaves running) so an append never re-renders settled rows.
 export const RunEventRow = memo(function RunEventRow({
+  harness,
   msg,
   result,
   live,
   phaseUsage,
   onFindingMutation,
+  planCheckDetail,
 }: {
+  planCheckDetail?: PlanCrossCheckSummary;
+  harness?: string;
   msg: RunMessage;
   result?: RunMessage;
   live: boolean;
@@ -1101,6 +1109,8 @@ export const RunEventRow = memo(function RunEventRow({
           )}
         </div>
       );
+    case "cross_check":
+      return rec?.["stage"] === "plan" ? <PlanCrossCheckEvent payload={msg.payload} detail={planCheckDetail} /> : <MetaLine text="Cross-check outcome unavailable" />;
     case "plan":
       return (
         <div className="inline-flex items-center gap-1.5 rounded-md border border-warn/40 bg-warn/10 px-2 py-1 text-xs text-warn">
@@ -1237,17 +1247,17 @@ export const RunEventRow = memo(function RunEventRow({
         </div>
       );
     }
-    // PRD #35: the run hit an Anthropic usage limit and PARKED. Warn-toned, not
+    // PRD #35: the run hit a usage limit and PARKED. Warn-toned, not
     // danger — nothing failed, and the run resumes on its own. The row is the
     // moment-of-park record; the live countdown lives in the run-view header, which
     // reads the run row rather than this payload.
     case "limit_wait":
-      return <LimitRow parked payload={rec} />;
+      return <LimitRow parked payload={rec} harness={harness} />;
     // PRD #35: the run hit a usage limit and did NOT park — the owner opted out, or
     // it is a kind that never parks (a judge run). This is a terminal outcome, so it
     // is the one of the pair that reads as breakage.
     case "limit_hit":
-      return <LimitRow payload={rec} />;
+      return <LimitRow payload={rec} harness={harness} />;
     // PRD #333 M7: an incidental (off-task) finding the worker flagged mid-run. The card is
     // the durable record AND the file/dismiss affordance (info/blue, D10) — its buttons act on
     // the persisted finding `{id}`. Without an id there is nothing to act on, so it degrades to

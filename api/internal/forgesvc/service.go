@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"regexp"
 	"slices"
@@ -294,12 +295,12 @@ func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([
 		}
 		_, err := store.SettleFindingGroup(ctx, s.groupDB, op.UserID, op.ID)
 		if err != nil {
-			reconcileErr = errors.Join(reconcileErr, err)
+			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("settle finding group operation %s: %w", op.ID, err))
 		}
 		// A failed or raced settlement stays claimed for a later pass.
 	}
 	if reconcileErr != nil {
-		return ops, finish, noop, reconcileErr
+		return ops, finish, noop, nil
 	}
 	advance := func() {
 		if len(ops) == 0 {

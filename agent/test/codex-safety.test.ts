@@ -501,6 +501,143 @@ describe("CodexExecutionSafety.spawnBoundaryProcess: permit-owned subprocesses",
     return new ctor();
   }
 
+  it("cancel waits for delayed reap, is idempotent, and leaves its permit usable", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1913));
+    const reaped = defer<ReapOutcome>();
+    let disposals = 0;
+    let reaps = 0;
+    let launches = 0;
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, undefined, async () => {
+      launches += 1;
+      return {
+        root: {
+          kind: "boundary_action",
+          dispose: async () => { disposals += 1; },
+          reap: async () => { reaps += 1; return reaped.promise; },
+        },
+        stdin: null, stdout: null, stderr: null,
+        waitChild: async () => launches === 1 ? new Promise(() => {}) : { code: 0 },
+      };
+    });
+    await safety.withBoundary(req("finalize"), async (permit) => {
+      const request = { argv: ["/bin/true"], cwd: "/tmp", env: {}, identity: "worker_pat" as const };
+      const child = await safety.spawnBoundaryProcess(permit, request);
+      const first = child.cancel();
+      assert.strictEqual(child.cancel(), first);
+      let done = false;
+      void first.then(() => { done = true; });
+      await tick();
+      assert.equal(done, false);
+      assert.equal(disposals, 1);
+      assert.equal(reaps, 1);
+      reaped.resolve({ ok: true });
+      await first;
+      assert.deepEqual(await child.completed, { code: -1 });
+      await child.cancel();
+      assert.equal(permit.signal.aborted, false);
+      const sibling = await safety.spawnBoundaryProcess(permit, request);
+      assert.deepEqual(await sibling.completed, { code: 0 });
+      await sibling.cancel();
+      assert.equal(disposals, 1);
+    });
+    assert.equal(reg.isPoisoned(), false);
+  });
+
+  it("a permit abort during launch still disposes and reaps the returned root once", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1910));
+    const launched = defer<void>();
+    const entered = defer<void>();
+    let fire!: () => void;
+    let disposals = 0;
+    let reaps = 0;
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, undefined, async () => {
+      entered.resolve();
+      await launched.promise;
+      return {
+        root: {
+          kind: "boundary_action",
+          dispose: async () => { disposals += 1; },
+          reap: async () => { reaps += 1; return { ok: true }; },
+        },
+        stdin: null, stdout: null, stderr: null,
+        waitChild: async () => { throw new Error("an aborted launch must not wait for its child"); },
+      };
+    }, (_request, _ms, trigger) => { fire = trigger; return () => {}; });
+    const boundary = safety.withBoundary(req("finalize"), async (permit) => {
+      const child = await safety.spawnBoundaryProcess(permit, {
+        argv: ["/bin/true"], cwd: "/tmp", env: {}, identity: "worker_pat",
+      });
+      await assert.rejects(child.cancel(), /deadline exceeded/);
+    });
+    const rejected = assert.rejects(boundary, CodexBoundaryError);
+    await entered.promise;
+    fire();
+    launched.resolve();
+    await rejected;
+    assert.equal(disposals, 1);
+    assert.equal(reaps, 1);
+    assert.equal(reg.isPoisoned(), true);
+  });
+
+  it("cancel during natural-exit reap shares the completion owner", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1911));
+    const reaped = defer<ReapOutcome>();
+    let reaps = 0;
+    let disposals = 0;
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, undefined, async () => ({
+      root: {
+        kind: "boundary_action",
+        dispose: async () => { disposals += 1; },
+        reap: async () => { reaps += 1; return reaped.promise; },
+      },
+      stdin: null, stdout: null, stderr: null,
+      waitChild: async () => ({ code: 0 }),
+    }));
+    await safety.withBoundary(req("finalize"), async (permit) => {
+      const child = await safety.spawnBoundaryProcess(permit, {
+        argv: ["/bin/true"], cwd: "/tmp", env: {}, identity: "worker_pat",
+      });
+      await tick();
+      assert.equal(reaps, 1);
+      const cancelled = child.cancel();
+      await tick();
+      assert.equal(disposals, 1);
+      reaped.resolve({ ok: true });
+      await cancelled;
+      assert.deepEqual(await child.completed, { code: -1 });
+      assert.equal(reaps, 1);
+      assert.equal(disposals, 1);
+    });
+  });
+
+  for (const failure of ["dispose", "reap"] as const) {
+    it(`cancel fails closed on ${failure} failure`, async () => {
+      const reg = new ExecutionRegistry(newLocalExecutionEpoch(1912));
+      let reaps = 0;
+      const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, undefined, async () => ({
+        root: {
+          kind: "boundary_action",
+          dispose: async () => { if (failure === "dispose") throw new Error("disposal failed"); },
+          reap: async () => {
+            reaps += 1;
+            return failure === "reap" ? failReap(1_000) : { ok: true };
+          },
+        },
+        stdin: null, stdout: null, stderr: null,
+        waitChild: async () => new Promise(() => {}),
+      }));
+      await assert.rejects(safety.withBoundary(req("finalize"), async (permit) => {
+        const child = await safety.spawnBoundaryProcess(permit, {
+          argv: ["/bin/true"], cwd: "/tmp", env: {}, identity: "worker_pat",
+        });
+        await assert.rejects(child.cancel(), /disposal failed|reap cleanly/);
+        await assert.rejects(child.completed, /disposal failed|reap cleanly/);
+        assert.equal(reaps, 1);
+      }), CodexBoundaryError);
+      assert.equal(reg.isPoisoned(), true);
+    });
+  }
+
   it("a checkpoint opt-in returns a soft timeout only after disposal and full root reap", async () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(1914));
     const events: string[] = [];
