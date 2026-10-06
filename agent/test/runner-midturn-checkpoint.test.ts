@@ -1297,6 +1297,7 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
   });
 
   it("(i) survivor: a tick process group that outlives its SIGKILL blocks ticks, delays gated sinks, and unblocks once gone", async () => {
+    const selected = new Set<number>();
     const tmp = scratchDir("survivor");
     const shim = writeShim(tmp, "detect");
     const iid = 1597_235;
@@ -1306,7 +1307,15 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
     // cancelled fetch child, so settlement gives up after its bounded wait and reports it.
     let forceAlive = true;
     const ctl = control({
-      tickSpawn: { rewrite: fetchBecomes(stubborn), groupAlive: () => (forceAlive ? true : undefined) },
+      tickSpawn: {
+        rewrite: fetchBecomes(stubborn),
+        groupAlive: (pid) => (forceAlive && selected.has(pid) ? true : undefined),
+        onSpawn: (pid, argv) => {
+          ctl.pids.push(pid);
+          ctl.spawned.push([...argv]);
+          if (argv.includes("fetch")) selected.add(pid);
+        },
+      },
       tickKillGraceMs: 300,
     });
     const pub = stubPublish(async (_n, _tip, pack) => {
@@ -1376,6 +1385,7 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
   });
 
   it("(i) survivor, SIGKILL unconfirmed: the milestone sink still runs (never silently skipped) and the residual is an error", async () => {
+    const selected = new Set<number>();
     const tmp = scratchDir("survivor-unconfirmed");
     const shim = writeShim(tmp, "detect");
     const iid = 1597_236;
@@ -1385,7 +1395,12 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
     const ctl = control({
       tickSpawn: {
         rewrite: fetchBecomes(stubborn),
-        groupAlive: () => (forceAlive ? true : undefined),
+        groupAlive: (pid) => (forceAlive && selected.has(pid) ? true : undefined),
+        onSpawn: (pid, argv) => {
+          ctl.pids.push(pid);
+          ctl.spawned.push([...argv]);
+          if (argv.includes("fetch")) selected.add(pid);
+        },
         // Delivery can never be confirmed (models EPERM / a failed runner-uid kill wrapper).
         signalGroup: (pgid, sig) => {
           try {
@@ -1393,7 +1408,7 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
           } catch {
             /* gone */
           }
-          return forceAlive ? false : undefined;
+          return forceAlive && selected.has(pgid) ? false : undefined;
         },
       },
       tickKillGraceMs: 300,
@@ -1980,7 +1995,7 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
           child.once("error", reject);
           child.once("exit", (code, sig) => resolve({ code: code ?? (sig ? 128 : 1) }));
         });
-        return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed };
+        return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; }, completed };
       },
       dispose: async () => ({ kind: "disposed" }),
     };
@@ -2070,7 +2085,7 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
           child.once("error", reject);
           child.once("exit", (code, sig) => resolve({ code: code ?? (sig ? 128 : 1) }));
         });
-        return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed };
+        return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; }, completed };
       },
       dispose: async () => ({ kind: "disposed" }),
     };
@@ -2692,7 +2707,7 @@ function fakeCodex(): { safety: CodexExecutionSafety; inPermit: () => boolean; b
         child.once("error", reject);
         child.once("exit", (code, sig) => resolve({ code: code ?? (sig ? 128 : 1) }));
       });
-      return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed };
+      return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; }, completed };
     },
     dispose: async () => ({ kind: "disposed" }),
   };

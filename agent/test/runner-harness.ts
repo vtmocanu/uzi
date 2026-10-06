@@ -59,7 +59,7 @@ export function installHarness(): void {
     baseUrl = await api.listen();
     fx = makeFixture({}, { testName: t.fullName ?? t.name });
     git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
-    homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-runnerhome-"));
+    homeDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "uzi-runnerhome-"));
     client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), {
       sleep: async () => {},
       terminalRetrySchedule: [1, 1],

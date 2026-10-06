@@ -398,6 +398,7 @@ type Config struct {
 	// (they tune the run queue / worker liveness, not security). RunIdleTimeout
 	// and RunMaxIterations are enforced worker-side and shipped in the claim
 	// payload; the rest drive the server sweeper and claim affinity.
+	PlanCrossCheckTimeout time.Duration // bounded checker wall-clock budget
 	RunTimeout            time.Duration // wall clock before a running run is failed
 	RunIdleTimeout        time.Duration // worker-side no-message idle cap
 	WorkerTaskIdleTimeout time.Duration // PRD #517 M5: interactive-task park idle cap (worker-side); rides the claim
@@ -1045,6 +1046,22 @@ func Load() (Config, error) {
 	cfg.AnthropicHTTPTimeout = parseDuration("UZI_ANTHROPIC_HTTP_TIMEOUT", 15*time.Second)
 
 	cfg.RunTimeout = parseDuration("RUN_TIMEOUT", 2*time.Hour)
+	cfg.PlanCrossCheckTimeout = 30 * time.Minute
+	if cfg.RunTimeout > 0 && cfg.PlanCrossCheckTimeout >= cfg.RunTimeout {
+		// An install with a short RUN_TIMEOUT and no explicit checker timeout must
+		// still boot after upgrade; an explicit value is validated strictly below.
+		cfg.PlanCrossCheckTimeout = cfg.RunTimeout / 2
+	}
+	if raw, present := os.LookupEnv("PLAN_CROSS_CHECK_TIMEOUT"); present {
+		value, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("PLAN_CROSS_CHECK_TIMEOUT: %w", err)
+		}
+		cfg.PlanCrossCheckTimeout = value
+	}
+	if cfg.PlanCrossCheckTimeout <= 0 || cfg.PlanCrossCheckTimeout > 2*time.Hour || cfg.PlanCrossCheckTimeout >= cfg.RunTimeout {
+		return Config{}, fmt.Errorf("PLAN_CROSS_CHECK_TIMEOUT must be positive, at most 2h, and below RUN_TIMEOUT")
+	}
 	cfg.RunIdleTimeout = parseDuration("RUN_IDLE_TIMEOUT", 10*time.Minute)
 	// PRD #517 M5: the interactive-task park's worker-side idle backstop, delivered on
 	// the claim (like RunIdleTimeout). Shorter than chat's 60m because a parked task pins

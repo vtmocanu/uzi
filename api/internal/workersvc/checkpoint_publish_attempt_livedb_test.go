@@ -375,14 +375,17 @@ func (f *supersedeFix) assertSupersededAt(t *testing.T, tip string) {
 
 // TestLivePublishPrePushBudgetLiveDB: a live-routed publish sends no push once its pre-push budget
 // has elapsed since it was routed: neither the first push (a slow slot claim) nor the retry after
-// freeCheckpointSlot (a slow settle of the record holding the branch).
+// freeCheckpointSlot (a slow settle of the record holding the branch). Synchronous hooks advance
+// each fixture's clock deterministically instead of waiting for wall time.
 func TestLivePublishPrePushBudgetLiveDB(t *testing.T) {
 	t.Run("first push after a slow slot claim", func(t *testing.T) {
 		f := newSupersedeFix(t)
+		clock := time.Date(2026, time.October, 6, 12, 0, 0, 0, time.UTC)
+		f.svc2.now = func() time.Time { return clock }
 		f.svc2.livePublishPrePushBudget = 200 * time.Millisecond
 		f.svc2.retentionHooks = &retentionTestHooks{beforeForgeWrite: func(_ uuid.UUID, op string) {
 			if op == "create" {
-				time.Sleep(400 * time.Millisecond)
+				clock = clock.Add(400 * time.Millisecond)
 			}
 		}}
 		res := f.publishNew(t, f.svc2)
@@ -413,10 +416,12 @@ func TestLivePublishPrePushBudgetLiveDB(t *testing.T) {
 		if r := f.row(t); r.State != retentionSettling {
 			t.Fatalf("setup: record = %q, want settling", r.State)
 		}
+		clock := time.Date(2026, time.October, 6, 12, 0, 0, 0, time.UTC)
+		f.svc2.now = func() time.Time { return clock }
 		f.svc2.livePublishPrePushBudget = 300 * time.Millisecond
 		f.svc2.retentionHooks = &retentionTestHooks{beforeForgeWrite: func(_ uuid.UUID, op string) {
 			if op == "delete" {
-				time.Sleep(600 * time.Millisecond)
+				clock = clock.Add(600 * time.Millisecond)
 			}
 		}}
 		res := f.publishNew(t, f.svc2)

@@ -39,6 +39,7 @@ import { LimitReachedError } from "./limit.js";
 import type { Logger } from "./log.js";
 import type { Outbox } from "./outbox.js";
 import type { ClaimResponse, IsolatedFetchClaim, StateRequest } from "./protocol.js";
+import { buildIssueContext } from "./prompt.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { ChatSteering } from "./steering.js";
@@ -139,9 +140,8 @@ export function preflightReason(
 function buildPrompt(claim: ClaimResponse, grant: IsolatedFetchClaim): string {
   const hosts = grant.hosts.length ? grant.hosts.map((h) => `- ${h}`).join("\n") : "- (none)";
   return [
-    `Research task: ${claim.issue_title ?? ""}`,
-    "",
-    claim.issue_description ?? "",
+    "Research task: ",
+    buildIssueContext(claim.issue_title ?? "", claim.issue_description ?? "", claim.issue_iid),
     "",
     `Allowed site list "${grant.profile}" (the fetcher enforces it; other hosts are refused):`,
     hosts,

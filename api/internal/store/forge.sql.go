@@ -216,7 +216,35 @@ func (q *Queries) DeleteBoardColumnsByRepo(ctx context.Context, repoID uuid.UUID
 }
 
 const deleteForgeConnectionForUser = `-- name: DeleteForgeConnectionForUser :execrows
-DELETE FROM forge_connections WHERE id = $1 AND user_id = $2
+WITH deletion_scope AS MATERIALIZED (
+    SELECT id FROM forge_connections WHERE id = $1 AND user_id = $2
+), candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs WHERE runs.repo_id IN (SELECT repos.id FROM repos WHERE repos.connection_id IN (SELECT id FROM deletion_scope))
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason, lead.issue_raw_digest, lead.issue_saved_body, lead.issue_input_reason, lead.auto_approve_blocked_reasons FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume the selected parent IDs before allowing the cascading deletion.
+    SELECT array_agg(id) AS ids FROM locked_parents
+)
+
+DELETE FROM forge_connections WHERE forge_connections.id = $1 AND forge_connections.user_id = $2
+  AND NOT EXISTS (
+      SELECT 1 FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+      WHERE mapping.parent_id IS NOT NULL
+        AND NOT COALESCE(mapping.parent_id = ANY(locks.ids), false)
+  )
 `
 
 type DeleteForgeConnectionForUserParams struct {
@@ -259,10 +287,40 @@ func (q *Queries) DeleteIssuesNotIn(ctx context.Context, arg DeleteIssuesNotInPa
 }
 
 const deleteRepoForUser = `-- name: DeleteRepoForUser :execrows
+WITH deletion_scope AS MATERIALIZED (
+    SELECT repos.id FROM repos WHERE repos.id = $1
+      AND repos.connection_id IN (SELECT id FROM forge_connections WHERE user_id = $2)
+      AND repos.enabled = false
+), candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs WHERE runs.repo_id IN (SELECT id FROM deletion_scope)
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason, lead.issue_raw_digest, lead.issue_saved_body, lead.issue_input_reason, lead.auto_approve_blocked_reasons FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume the selected parent IDs before allowing the cascading deletion.
+    SELECT array_agg(id) AS ids FROM locked_parents
+)
+
 DELETE FROM repos
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $2)
   AND repos.enabled = false
+  AND NOT EXISTS (
+      SELECT 1 FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+      WHERE mapping.parent_id IS NOT NULL
+        AND NOT COALESCE(mapping.parent_id = ANY(locks.ids), false)
+  )
 `
 
 type DeleteRepoForUserParams struct {
@@ -358,6 +416,7 @@ SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_
        -- PRD #1497 M1: budget_finalize_seconds is the third RunDeadline term; hold_reason lets the
        -- board badge render a wall park ('budget_exhausted') as needing the owner.
        r.budget_finalize_seconds, r.hold_reason,
+       r.auto_approve_blocked_reasons,
        r.created_at, r.updated_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER () AS run_count
@@ -375,35 +434,36 @@ type GetLatestRunForIssueParams struct {
 }
 
 type GetLatestRunForIssueRow struct {
-	ID                     uuid.UUID          `json:"id"`
-	UserID                 uuid.UUID          `json:"user_id"`
-	Status                 string             `json:"status"`
-	MrIid                  pgtype.Int8        `json:"mr_iid"`
-	MrWebUrl               pgtype.Text        `json:"mr_web_url"`
-	MrState                pgtype.Text        `json:"mr_state"`
-	FailureReason          pgtype.Text        `json:"failure_reason"`
-	StopKind               pgtype.Text        `json:"stop_kind"`
-	StopReason             pgtype.Text        `json:"stop_reason"`
-	Kind                   string             `json:"kind"`
-	IterationCount         int32              `json:"iteration_count"`
-	HasPlanMd              pgtype.Bool        `json:"has_plan_md"`
-	Health                 string             `json:"health"`
-	HealthReason           pgtype.Text        `json:"health_reason"`
-	HealthSince            pgtype.Timestamptz `json:"health_since"`
-	StartedAt              pgtype.Timestamptz `json:"started_at"`
-	FirstStartedAt         pgtype.Timestamptz `json:"first_started_at"`
-	FinishedAt             pgtype.Timestamptz `json:"finished_at"`
-	BudgetWallSeconds      pgtype.Int4        `json:"budget_wall_seconds"`
-	BudgetPausedSeconds    int32              `json:"budget_paused_seconds"`
-	Interactive            bool               `json:"interactive"`
-	BudgetExtensionSeconds int32              `json:"budget_extension_seconds"`
-	BudgetFinalizeSeconds  int32              `json:"budget_finalize_seconds"`
-	HoldReason             pgtype.Text        `json:"hold_reason"`
-	CreatedAt              pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
-	OwnerName              pgtype.Text        `json:"owner_name"`
-	WorkerName             pgtype.Text        `json:"worker_name"`
-	RunCount               int64              `json:"run_count"`
+	ID                        uuid.UUID          `json:"id"`
+	UserID                    uuid.UUID          `json:"user_id"`
+	Status                    string             `json:"status"`
+	MrIid                     pgtype.Int8        `json:"mr_iid"`
+	MrWebUrl                  pgtype.Text        `json:"mr_web_url"`
+	MrState                   pgtype.Text        `json:"mr_state"`
+	FailureReason             pgtype.Text        `json:"failure_reason"`
+	StopKind                  pgtype.Text        `json:"stop_kind"`
+	StopReason                pgtype.Text        `json:"stop_reason"`
+	Kind                      string             `json:"kind"`
+	IterationCount            int32              `json:"iteration_count"`
+	HasPlanMd                 pgtype.Bool        `json:"has_plan_md"`
+	Health                    string             `json:"health"`
+	HealthReason              pgtype.Text        `json:"health_reason"`
+	HealthSince               pgtype.Timestamptz `json:"health_since"`
+	StartedAt                 pgtype.Timestamptz `json:"started_at"`
+	FirstStartedAt            pgtype.Timestamptz `json:"first_started_at"`
+	FinishedAt                pgtype.Timestamptz `json:"finished_at"`
+	BudgetWallSeconds         pgtype.Int4        `json:"budget_wall_seconds"`
+	BudgetPausedSeconds       int32              `json:"budget_paused_seconds"`
+	Interactive               bool               `json:"interactive"`
+	BudgetExtensionSeconds    int32              `json:"budget_extension_seconds"`
+	BudgetFinalizeSeconds     int32              `json:"budget_finalize_seconds"`
+	HoldReason                pgtype.Text        `json:"hold_reason"`
+	AutoApproveBlockedReasons []string           `json:"auto_approve_blocked_reasons"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
+	OwnerName                 pgtype.Text        `json:"owner_name"`
+	WorkerName                pgtype.Text        `json:"worker_name"`
+	RunCount                  int64              `json:"run_count"`
 }
 
 // One issue's newest run with the same display fields as the board lateral join,
@@ -441,6 +501,7 @@ func (q *Queries) GetLatestRunForIssue(ctx context.Context, arg GetLatestRunForI
 		&i.BudgetExtensionSeconds,
 		&i.BudgetFinalizeSeconds,
 		&i.HoldReason,
+		&i.AutoApproveBlockedReasons,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.OwnerName,
@@ -1006,6 +1067,7 @@ SELECT DISTINCT ON (r.issue_iid)
        -- PRD #1497 M1: budget_finalize_seconds is the third RunDeadline term; hold_reason lets the
        -- board badge render a wall park ('budget_exhausted') as needing the owner.
        r.budget_finalize_seconds, r.hold_reason,
+       r.auto_approve_blocked_reasons,
        r.created_at, r.updated_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER (PARTITION BY r.issue_iid) AS run_count
@@ -1017,36 +1079,37 @@ ORDER BY r.issue_iid, r.created_at DESC
 `
 
 type ListLatestRunsForRepoRow struct {
-	IssueIid               pgtype.Int8        `json:"issue_iid"`
-	ID                     uuid.UUID          `json:"id"`
-	UserID                 uuid.UUID          `json:"user_id"`
-	Status                 string             `json:"status"`
-	MrIid                  pgtype.Int8        `json:"mr_iid"`
-	MrWebUrl               pgtype.Text        `json:"mr_web_url"`
-	MrState                pgtype.Text        `json:"mr_state"`
-	FailureReason          pgtype.Text        `json:"failure_reason"`
-	StopKind               pgtype.Text        `json:"stop_kind"`
-	StopReason             pgtype.Text        `json:"stop_reason"`
-	Kind                   string             `json:"kind"`
-	IterationCount         int32              `json:"iteration_count"`
-	HasPlanMd              pgtype.Bool        `json:"has_plan_md"`
-	Health                 string             `json:"health"`
-	HealthReason           pgtype.Text        `json:"health_reason"`
-	HealthSince            pgtype.Timestamptz `json:"health_since"`
-	StartedAt              pgtype.Timestamptz `json:"started_at"`
-	FirstStartedAt         pgtype.Timestamptz `json:"first_started_at"`
-	FinishedAt             pgtype.Timestamptz `json:"finished_at"`
-	BudgetWallSeconds      pgtype.Int4        `json:"budget_wall_seconds"`
-	BudgetPausedSeconds    int32              `json:"budget_paused_seconds"`
-	Interactive            bool               `json:"interactive"`
-	BudgetExtensionSeconds int32              `json:"budget_extension_seconds"`
-	BudgetFinalizeSeconds  int32              `json:"budget_finalize_seconds"`
-	HoldReason             pgtype.Text        `json:"hold_reason"`
-	CreatedAt              pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
-	OwnerName              pgtype.Text        `json:"owner_name"`
-	WorkerName             pgtype.Text        `json:"worker_name"`
-	RunCount               int64              `json:"run_count"`
+	IssueIid                  pgtype.Int8        `json:"issue_iid"`
+	ID                        uuid.UUID          `json:"id"`
+	UserID                    uuid.UUID          `json:"user_id"`
+	Status                    string             `json:"status"`
+	MrIid                     pgtype.Int8        `json:"mr_iid"`
+	MrWebUrl                  pgtype.Text        `json:"mr_web_url"`
+	MrState                   pgtype.Text        `json:"mr_state"`
+	FailureReason             pgtype.Text        `json:"failure_reason"`
+	StopKind                  pgtype.Text        `json:"stop_kind"`
+	StopReason                pgtype.Text        `json:"stop_reason"`
+	Kind                      string             `json:"kind"`
+	IterationCount            int32              `json:"iteration_count"`
+	HasPlanMd                 pgtype.Bool        `json:"has_plan_md"`
+	Health                    string             `json:"health"`
+	HealthReason              pgtype.Text        `json:"health_reason"`
+	HealthSince               pgtype.Timestamptz `json:"health_since"`
+	StartedAt                 pgtype.Timestamptz `json:"started_at"`
+	FirstStartedAt            pgtype.Timestamptz `json:"first_started_at"`
+	FinishedAt                pgtype.Timestamptz `json:"finished_at"`
+	BudgetWallSeconds         pgtype.Int4        `json:"budget_wall_seconds"`
+	BudgetPausedSeconds       int32              `json:"budget_paused_seconds"`
+	Interactive               bool               `json:"interactive"`
+	BudgetExtensionSeconds    int32              `json:"budget_extension_seconds"`
+	BudgetFinalizeSeconds     int32              `json:"budget_finalize_seconds"`
+	HoldReason                pgtype.Text        `json:"hold_reason"`
+	AutoApproveBlockedReasons []string           `json:"auto_approve_blocked_reasons"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
+	OwnerName                 pgtype.Text        `json:"owner_name"`
+	WorkerName                pgtype.Text        `json:"worker_name"`
+	RunCount                  int64              `json:"run_count"`
 }
 
 // The board payload's run half (PRD #12 M2): the newest run per issue for a repo,
@@ -1101,6 +1164,7 @@ func (q *Queries) ListLatestRunsForRepo(ctx context.Context, repoID uuid.UUID) (
 			&i.BudgetExtensionSeconds,
 			&i.BudgetFinalizeSeconds,
 			&i.HoldReason,
+			&i.AutoApproveBlockedReasons,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.OwnerName,

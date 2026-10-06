@@ -243,6 +243,7 @@ func toForgejoIssue(i *gitea.Issue) Issue {
 	}
 	if i.Poster != nil {
 		issue.Author = i.Poster.UserName
+		issue.AuthorForgeUserID = i.Poster.ID
 	}
 	return issue
 }

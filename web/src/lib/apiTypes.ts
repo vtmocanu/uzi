@@ -14,6 +14,8 @@ export interface User {
   // autopilot_enabled is the per-user opt-in to unattended autopilot runs (PRD #19
   // M3). Default false; toggled from the user's own Settings page.
   autopilot_enabled: boolean;
+  // Per-user consent for the required plan cross-check on new auto-approved runs.
+  plan_cross_check_enabled?: boolean;
   // judge_enabled is the per-user opt-in to run retrospectives (PRD #46). Default
   // false; the user toggles their own from Settings, an admin can force any user's.
   judge_enabled: boolean;
@@ -741,6 +743,8 @@ export interface ToolAllowlistWriteInput {
 // issue has never run. Display-only: no secrets. is_mine gates the in-app run-view
 // link (a non-owner would 403 on the run); run_count drives the "×N" retry hint.
 export interface LatestRun {
+  /** Stored creation history; [] on a current API. Optional for older payloads. */
+  auto_approve_blocked_reasons?: string[];
   id: string;
   status: RunStatus;
   mr_iid: number | null;
@@ -2599,7 +2603,7 @@ export interface MilestoneLive {
 }
 
 /** The create-entrypoint family that started a run (server column `trigger_source`,
- *  a closed 13-value enum). Mirrors the Go CHECK constraint / RunDTO. */
+ *  a closed 14-value enum). Mirrors the Go CHECK constraint / RunDTO. */
 export type RunTriggerSource =
   | "manual"
   | "autopilot"
@@ -2613,7 +2617,8 @@ export type RunTriggerSource =
   | "then_fix"
   | "judge"
   | "judge_rerun"
-  | "resume";
+  | "resume"
+  | "cross_check";
 
 /** PRD #1227 M1: one owner-deferred (out-of-scope) milestone on a revised completion contract —
  *  the milestone id, the owner's reason, and the contract revision the deferral was recorded at. */
@@ -2730,9 +2735,19 @@ export interface Run {
   /** PRD #19: an autopilot run (poller-started, plan auto-approved). Drives the
    *  "autopilot" badge; a manually-started run is false. */
   auto_approve: boolean;
+  /** Stored creation history, independent of current status or approval controls.
+   *  A current API sends [] / null; older payloads may omit these fields. */
+  auto_approve_blocked_reasons?: string[];
+  issue_input_reason?: string | null;
+  /** The run's snapshot of the owner's plan cross-check setting. */
+  plan_cross_check_required: boolean;
+  /** Persisted forced-gate reason; optional for older server and mock responses. */
+  plan_cross_check_gate_reason?: string | null;
+  /** Owner detail only. Historical findings describe an earlier plan. */
+  plan_cross_check_summary?: PlanCrossCheckSummary;
   /** issue #857: what/how/who started the run (manual, autopilot, schedule,
    *  self_improve, ci_fix, mr_rework, chat, task, task_review, then_fix, judge,
-   *  judge_rerun, resume). A NOT NULL server column (DEFAULT 'manual'), so it is
+   *  judge_rerun, resume, cross_check). A NOT NULL server column (DEFAULT 'manual'), so it is
    *  always present on a live read; OPTIONAL here only to avoid forcing mock-object
    *  updates. RunListItem extends Run, so list rows inherit it. */
   trigger_source?: RunTriggerSource;
@@ -3040,7 +3055,7 @@ export interface Run {
    *  (the tail of an interrupted Claude session). Omitted when the run has none. Always shown
    *  APART from `usage` and never added to it. */
   usage_estimated_tail?: UsageTail | null;
-  /** PRD #35: this run's usage-limit opt-in — on a sustained Anthropic usage limit
+  /** PRD #35: this run's usage-limit opt-in — on a sustained usage limit
    *  the run parks at status "limit_wait" and resumes when the window reopens,
    *  instead of failing. Present on every run from creation, so it is what a "will
    *  retry on limit" affordance renders BEFORE any park has happened. */
@@ -3398,6 +3413,25 @@ export interface RunActivity {
   at: string;
   /** The frame's per-run seq — the deterministic tiebreak across interleaved subagents. */
   seq: number;
+}
+
+export interface PlanCrossCheckFinding {
+  file: string;
+  severity: string;
+  summary: string;
+  rationale: string;
+}
+
+export interface PlanCrossCheckSummary {
+  round: number;
+  verdict: string;
+  reason_class: string | null;
+  findings: { summary: string; items: PlanCrossCheckFinding[] | null } | null;
+  checker_run_id: string | null;
+  checker_model: string | null;
+  checker_effort: string | null;
+  usage: RunUsage | null;
+  historical: boolean;
 }
 
 // RunUsage is a run's server-rolled token/cost totals (PRD #40). The run VIEW

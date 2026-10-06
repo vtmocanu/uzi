@@ -35,6 +35,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/planpolicy"
@@ -1345,8 +1346,9 @@ type Store interface {
 
 // Params are the runtime knobs the service needs, mirrored from config.
 type Params struct {
-	RunTimeout     time.Duration
-	RunIdleTimeout time.Duration
+	PlanCrossCheckTimeout time.Duration
+	RunTimeout            time.Duration
+	RunIdleTimeout        time.Duration
 	// WorkerTaskIdleTimeout (PRD #517 M5, WORKER_TASK_IDLE_TIMEOUT) is the interactive-task
 	// park's worker-side idle backstop. Mirrored from config and shipped in the claim (like
 	// RunIdleTimeout) so the worker's own park idle timer matches what the server configured
@@ -2374,28 +2376,46 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	if err != nil {
 		return store.Worker{}, "", err
 	}
-	// (c) Persist a register-carried snapshot BEFORE the orphan pass, so its leased rows protect
-	// #1391's pending outcomes from the D11-predicated fail/requeue that follows. #1390's worker
-	// never sends one; the path exists for #1391. An invalid register snapshot is ignored, never
-	// fatal (register must not wedge on soft input).
+	// Validate before any snapshot/FK write and capture the conservative union,
+	// including orphan phases even when there is no valid active snapshot.
+	entries, snapshotValid, err := s.validatedActiveSnapshot(store.Worker(row), snapshot, snapshotModeRegister)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	attested := validatedFinalizeResume{}
+	if finalizeOK {
+		attested = finalize
+	}
+	locks, err := captureWorkerRecoveryLocks(ctx, qtx, row.ID, entries, attested)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	frozen, parents, err := locks.parameters()
+	if err != nil {
+		return store.Worker{}, "", err
+	}
 	snapshotApplied := false
-	if snapshot != nil {
-		snapshotApplied, err = s.ReplaceWorkerActiveRuns(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister)
+	if snapshotValid {
+		snapshotApplied, err = s.applyWorkerActiveSnapshot(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister, entries, locks)
 		if err != nil {
 			return store.Worker{}, "", err
 		}
 	}
-	// (d0) Issue #1742: the attested finalize pass, after the snapshot apply (so the exact-generation
-	// lease predicate reads settled rows) and before the ordinary orphan pass.
-	if err := runAttested(qtx); err != nil {
-		return store.Worker{}, "", err
-	}
-	// (d) Orphan pass — fail-over-cap then requeue, both D11-lease/overflow-predicated (M1).
-	orphanFailed, err := qtx.FailWorkerRunsOverCap(ctx, failParams)
+	finalizeFailed, finalizeRequeued, finalizeAllowance, err = s.runFrozenAttested(ctx, qtx, row.ID, max,
+		store.FrozenFailWorkerRunsOverCapParams{FailureReason: failParams.FailureReason}, finalize, finalizeOK, locks)
 	if err != nil {
 		return store.Worker{}, "", err
 	}
-	requeued, err := qtx.RequeueWorkerRuns(ctx, requeueParams)
+	orphanFailed, err := qtx.FrozenFailWorkerRunsOverCap(ctx, store.FrozenFailWorkerRunsOverCapParams{
+		FailureReason: failParams.FailureReason, WorkerID: failParams.WorkerID, MaxRequeues: max,
+		FrozenTargets: frozen, LockedParentIds: parents,
+	})
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	requeued, err := qtx.FrozenRequeueWorkerRuns(ctx, store.FrozenRequeueWorkerRunsParams{
+		WorkerID: requeueParams.WorkerID, MaxRequeues: max, FrozenTargets: frozen, LockedParentIds: parents,
+	})
 	if err != nil {
 		return store.Worker{}, "", err
 	}
@@ -2519,11 +2539,11 @@ type RunDiskSample struct {
 // on the next empty report" contract).
 //
 // When a snapshot is carried it runs inside ONE transaction in the canonical order (PRD #1390
-// M2b): HeartbeatWorker (locks the worker row), then LockOwnedRunsByIDs (pre-locks the runs the
-// snapshot lists so a sibling's concurrent FOR UPDATE SKIP LOCKED claim skips them), then
-// ReplaceWorkerActiveRuns in heartbeat mode. ONLY when the snapshot was applied does it then
-// reconcile: ReadoptRunsFromSnapshot (restore a queued run the worker still lists), then
-// FailRunsMissingFromSnapshot then RequeueRunsMissingFromSnapshot (fail before requeue) for a
+// M2b): HeartbeatWorker locks the worker row, pure validation normalizes the snapshot, and
+// LockWorkerRecoveryParents locks the complete recovery parent set, including omitted leads,
+// before frozen snapshot locking or FK writes. ONLY when the snapshot was applied does it then
+// reconcile through FrozenReadoptRunsFromSnapshot (restore a listed queued run), then
+// FrozenFailRunsMissingFromSnapshot and FrozenRequeueRunsMissingFromSnapshot (fail first) for a
 // running run this worker owns but no longer lists, past the missing fence. Each reconciled
 // transition is published post-commit (never inside the tx), mirroring publishRegisterSweeps.
 // An invalid/stale/wrong-nonce snapshot is IGNORED (applied=false) — a warning, no error, rows
@@ -2591,42 +2611,44 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 	if err != nil {
 		return store.Worker{}, err
 	}
-	// (b) Pre-lock the runs the snapshot lists, in canonical id order, BEFORE the replace and the
-	// reconciliation writes — so a sibling's concurrent claim (FOR UPDATE SKIP LOCKED) skips them
-	// until this tx commits. Unparseable ids are skipped (they cannot name a real run); an id for a
-	// run this worker does not own is a no-op (the WHERE excludes it), never locked.
-	if ids := snapshotRunIDs(snapshot); len(ids) > 0 {
-		if _, err := qtx.LockOwnedRunsByIDs(ctx, store.LockOwnedRunsByIDsParams{
-			RunIds:   ids,
-			WorkerID: pgconv.UUID(updated.ID),
-		}); err != nil {
-			return store.Worker{}, err
-		}
-	}
-	// (c) heartbeat mode: an invalid snapshot returns (false, nil) — ignored, not fatal — so the
-	// heartbeat's liveness refresh still commits. Only a real DB error aborts the tx. CAPTURE
-	// applied: the reconciliation runs ONLY when the snapshot was actually applied (an invalid,
-	// stale-epoch or wrong-nonce snapshot must not drive readopt/requeue off rows it did not write).
-	applied, err := s.ReplaceWorkerActiveRuns(ctx, qtx, updated, snapshot, snapshotModeHeartbeat)
+	entries, valid, err := s.validatedActiveSnapshot(updated, snapshot, snapshotModeHeartbeat)
 	if err != nil {
 		return store.Worker{}, err
 	}
+	var locks workerRecoveryLockSet
+	applied := false
+	if valid {
+		// Include omitted owned leads before any snapshot child or FK write.
+		locks, err = captureWorkerRecoveryLocks(ctx, qtx, updated.ID, entries, validatedFinalizeResume{})
+		if err != nil {
+			return store.Worker{}, err
+		}
+		applied, err = s.applyWorkerActiveSnapshot(ctx, qtx, updated, snapshot, snapshotModeHeartbeat, entries, locks)
+		if err != nil {
+			return store.Worker{}, err
+		}
+	}
 	var (
-		readopted       []store.ReadoptRunsFromSnapshotRow
-		missingFailed   []store.FailRunsMissingFromSnapshotRow
-		missingRequeued []store.RequeueRunsMissingFromSnapshotRow
+		readopted       []store.FrozenReadoptRunsFromSnapshotRow
+		missingFailed   []store.FrozenFailRunsMissingFromSnapshotRow
+		missingRequeued []store.FrozenRequeueRunsMissingFromSnapshotRow
 	)
 	if applied {
+		frozen, parents, err := locks.parameters()
+		if err != nil {
+			return store.Worker{}, err
+		}
 		// (d) Reconcile, fail before requeue (over-cap fail-first ordering). The missing fence is the
 		// stale window plus one heartbeat interval (D4). max_requeues is RUN_MAX_REQUEUES.
 		now := s.now()
 		missingCutoff := pgconv.Time(now.Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval)))
 		maxRequeues := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
-		readopted, err = qtx.ReadoptRunsFromSnapshot(ctx, updated.ID)
+		readopted, err = qtx.FrozenReadoptRunsFromSnapshot(ctx, store.FrozenReadoptRunsFromSnapshotParams{WorkerID: updated.ID, FrozenTargets: frozen, LockedParentIds: parents})
 		if err != nil {
 			return store.Worker{}, err
 		}
-		missingFailed, err = qtx.FailRunsMissingFromSnapshot(ctx, store.FailRunsMissingFromSnapshotParams{
+		missingFailed, err = qtx.FrozenFailRunsMissingFromSnapshot(ctx, store.FrozenFailRunsMissingFromSnapshotParams{
+			FrozenTargets: frozen, LockedParentIds: parents,
 			FailureReason:        pgconv.TextOrNull("worker lost the execution; exceeded re-queue budget"),
 			WorkerID:             pgconv.UUID(updated.ID),
 			MissingCutoff:        missingCutoff,
@@ -2637,7 +2659,8 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		if err != nil {
 			return store.Worker{}, err
 		}
-		missingRequeued, err = qtx.RequeueRunsMissingFromSnapshot(ctx, store.RequeueRunsMissingFromSnapshotParams{
+		missingRequeued, err = qtx.FrozenRequeueRunsMissingFromSnapshot(ctx, store.FrozenRequeueRunsMissingFromSnapshotParams{
+			FrozenTargets: frozen, LockedParentIds: parents,
 			WorkerID:             pgconv.UUID(updated.ID),
 			MissingCutoff:        missingCutoff,
 			MaxRequeues:          maxRequeues,
@@ -2753,23 +2776,6 @@ func (s *Service) replaceRunDisk(ctx context.Context, wkr store.Worker, stats *W
 	if err := s.q.ReplaceWorkerRunDisk(ctx, arg); err != nil {
 		slog.Warn("heartbeat: store run disk sizes", "worker_id", wkr.ID.String(), "error", err)
 	}
-}
-
-// snapshotRunIDs parses the run ids an ActiveSnapshot lists into uuids for the canonical pre-lock
-// (PRD #1390 M2b). Unparseable ids are skipped (ReplaceWorkerActiveRuns rejects the whole snapshot
-// on a bad uuid anyway; the pre-lock only needs the parseable ones for its FOR UPDATE). Returns nil
-// for a nil/empty snapshot so the caller can skip the lock statement.
-func snapshotRunIDs(snap *ActiveSnapshot) []uuid.UUID {
-	if snap == nil || len(snap.Active) == 0 {
-		return nil
-	}
-	ids := make([]uuid.UUID, 0, len(snap.Active))
-	for _, e := range snap.Active {
-		if id, err := uuid.Parse(e.RunID); err == nil {
-			ids = append(ids, id)
-		}
-	}
-	return ids
 }
 
 // DiskPressureThreshold returns the configured UZI_DISK_PRESSURE_THRESHOLD (Params),
@@ -3083,21 +3089,18 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 	if err != nil {
 		return nil, err
 	}
-	// (b) Pre-lock the request snapshot's own runs in deterministic id order (skip when empty), so a
-	// sibling's concurrent FOR UPDATE SKIP LOCKED claim skips them until this tx commits its
-	// replacement. An id for a run this worker does not own is a no-op (the WHERE excludes it).
-	if ids := snapshotRunIDs(snapshot); len(ids) > 0 {
-		if _, err := qtx.LockOwnedRunsByIDs(ctx, store.LockOwnedRunsByIDsParams{
-			RunIds:   ids,
-			WorkerID: pgconv.UUID(wkr.ID),
-		}); err != nil {
-			return nil, err
-		}
+	entries, valid, err := s.validatedActiveSnapshot(locked, snapshot, snapshotModeClaim)
+	if err != nil {
+		return nil, err
 	}
-	// (c) Replace the snapshot in CLAIM mode: an invalid/stale-epoch/wrong-nonce snapshot returns
-	// ErrActiveSnapshotInvalid — ROLLBACK (via the defer) and return it so the handler fails the
-	// claim CLOSED (400, no claim, no side effect). A real DB error propagates the same way.
-	if _, err := s.ReplaceWorkerActiveRuns(ctx, qtx, locked, snapshot, snapshotModeClaim); err != nil {
+	if !valid {
+		return nil, ErrActiveSnapshotInvalid
+	}
+	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, validatedFinalizeResume{})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.applyWorkerActiveSnapshot(ctx, qtx, locked, snapshot, snapshotModeClaim, entries, locks); err != nil {
 		return nil, err
 	}
 	// (d) Claimant guard (snapshot-replace BEFORE overflow, blocker 2). The replace just set/cleared
@@ -3542,10 +3545,14 @@ type StateRequest struct {
 	// byte-identical to before. The field MUST exist here because httpx.DecodeJSON sets
 	// DisallowUnknownFields — a fence-capable worker that sends it would 400 otherwise. A negative
 	// value is invalid (ErrInvalidState). Ignored on every non-terminal report.
-	MessagesThroughSeq *int64  `json:"messages_through_seq"`
-	PlanMd             *string `json:"plan_md"`
-	Branch             *string `json:"branch"`
-	MrIID              *int64  `json:"mr_iid"`
+	MessagesThroughSeq        *int64  `json:"messages_through_seq"`
+	CandidateDigest           string  `json:"candidate_digest,omitempty"`
+	PlanCrossCheckGateReason  *string `json:"plan_cross_check_gate_reason"`
+	PlanCrossCheckDiffRefusal string  `json:"plan_cross_check_diff_refusal"`
+	PlanCrossCheckRefusal     string  `json:"plan_cross_check_refusal"`
+	PlanMd                    *string `json:"plan_md"`
+	Branch                    *string `json:"branch"`
+	MrIID                     *int64  `json:"mr_iid"`
 	// Head is the EXACT source-branch tip H a `completed` report is being made against
 	// (PRD #1226 M2, D5). It is REQUIRED for an INTERLOCKED run's completion: SetState routes
 	// such a completion through completeRunWithPermitLease, which consumes the permit issued for
@@ -3867,7 +3874,7 @@ func (s *Service) terminalMessageFence(ctx context.Context, q Store, runID uuid.
 // "already terminal" as success and learns it was cancelled), per the M2 wire
 // contract.
 func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest) (run store.Run, applied bool, err error) {
-	return s.setState(ctx, wkr, runID, req, nil)
+	return s.setState(ctx, wkr, runID, req, nil, nil)
 }
 
 // SetStateReport is SetState plus the plan-gate revision (PRD #1795 M1) an applied
@@ -3876,11 +3883,11 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 // commit. 0 when the report allocated nothing (every other state, a declined report, a chat or
 // judge run, or a refusal).
 func (s *Service) SetStateReport(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest) (run store.Run, applied bool, gateRevision int64, err error) {
-	run, applied, err = s.setState(ctx, wkr, runID, req, &gateRevision)
+	run, applied, err = s.setState(ctx, wkr, runID, req, &gateRevision, nil)
 	return run, applied, gateRevision, err
 }
 
-func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, gateRevisionOut *int64) (run store.Run, applied bool, err error) {
+func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, gateRevisionOut *int64, reconciliationOut **LeadReconciliation) (run store.Run, applied bool, err error) {
 	// PRD #1392 M1: validate the TYPED recovery cause against the server enum BEFORE any state
 	// SQL, so an unknown non-nil value is a loud 400 (ErrInvalidState) rather than a
 	// constraint violation at the park write. Absent (nil) is fine (an ordinary report or a
@@ -4015,6 +4022,10 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		if req.AdoptGateRevision != nil && *req.AdoptGateRevision <= 0 {
 			return store.Run{}, false, fmt.Errorf("%w: adopt_gate_revision must be positive", ErrInvalidState)
 		}
+	}
+	// Required reconciliation cannot infer authority from an unfenced report.
+	if reconciliationOut != nil && owned.PlanCrossCheckRequired && (req.State == "running" || req.State == "awaiting_approval") && req.ClaimGeneration == nil {
+		return owned, false, ErrClaimGenerationRequired
 	}
 	q := Store(s.q)
 	var fenceTx pgx.Tx
@@ -4161,11 +4172,15 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				q = store.New(tx)
 			}
 			var planRows int64
-			planRows, err = q.SetRunAutopilotPlan(ctx, store.SetRunAutopilotPlanParams{
-				PlanMd:   planBody,
-				ID:       runID,
-				WorkerID: pgconv.UUID(wkr.ID),
-			})
+			planParams := store.SetRunAutopilotPlanParams{
+				PlanMd: planBody, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+			}
+			if owned.PlanCrossCheckRequired {
+				if err := bindPlanCrossCheckWrite(&planParams, owned, &req); err != nil {
+					return store.Run{}, false, err
+				}
+			}
+			planRows, err = q.SetRunAutopilotPlan(ctx, planParams)
 			if err != nil {
 				return store.Run{}, false, err
 			}
@@ -4259,8 +4274,20 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// as an absent-safe pgtype.Text, so an off-vocabulary or absent value is an invalid
 		// (SQL NULL) param the query's COALESCE keeps out of the column.
 		inferredCaps, inferredTools, sizeClass := inferredRequirementParams(req)
+		if owned.PlanCrossCheckRequired {
+			if req.ClaimGeneration == nil {
+				return owned, false, ErrClaimGenerationRequired
+			}
+			if err := s.validatePlanCrossCheckGateReason(ctx, q, wkr, owned, req, gateTracked && fenceTx != nil); err != nil {
+				return owned, false, err
+			}
+		} else if req.PlanCrossCheckGateReason != nil || req.PlanCrossCheckDiffRefusal != "" || req.PlanCrossCheckRefusal != "" {
+			return owned, false, ErrInvalidState
+		}
 		approvalParams := store.SetRunAwaitingApprovalParams{
-			PlanMd: stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+			PlanCrossCheckGateReason: pgconv.TextPtr(req.PlanCrossCheckGateReason),
+			ClaimGeneration:          pgconv.Int8Ptr(req.ClaimGeneration),
+			PlanMd:                   stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			// Issue #1626: an interlocked run's FIRST plan-bearing report with no milestones is the
 			// explicit `[]` (planMilestonesParam), so the approve freeze builds a criteria:[]
 			// contract. `owned` predates this report's plan_md write, which is what lets
@@ -4532,7 +4559,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// cancel/cap-fail, failForgeUnsettleable returns no row at all, and `owned` is
 			// unlocked. A normal park re-reads as recovery_wait and leaves the row pending.
 			if s.txBeginner == nil {
-				rows, err = s.failForgeUnsettleable(ctx, wkr, runID, req, sessionID)
+				rows, err = s.failForgeUnsettleable(ctx, wkr, runID, owned.Harness, req, sessionID)
 				break
 			}
 			var frun store.Run
@@ -4630,7 +4657,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// for a generation-less one, where the single statement is what keeps the two
 			// writes together. rows counts transitioned runs, exactly as SetRunFailed's did.
 			rows, err = q.SetRunFailedPlanRejected(ctx, store.SetRunFailedPlanRejectedParams{
-				FailureReason:  limitAwareFailureReason(req),
+				FailureReason:  limitAwareFailureReason(owned.Harness, req),
 				FailOrigin:     pgconv.TextOrNull("plan_rejected"),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
@@ -4679,7 +4706,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				// compromised worker cannot smuggle a non-enum rate_limit_type past the
 				// server" would then be false on exactly the path a human reads. When the
 				// fields are absent this is nil and every other failure path is untouched.
-				FailureReason:  limitAwareFailureReason(req),
+				FailureReason:  limitAwareFailureReason(owned.Harness, req),
 				FailOrigin:     pgconv.TextOrNull(failOrigin),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
@@ -4696,6 +4723,20 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	}
 	if err != nil {
 		return store.Run{}, false, err
+	}
+	// Capture after state, trigger settlement, and presentation writes, while the
+	// owning lock is still held. Early returns, refusals and zero-row writes grant no proof.
+	var reconciliation *LeadReconciliation
+	if reconciliationOut != nil && owned.PlanCrossCheckRequired && rows > 0 && gateRefusal == nil &&
+		(req.State == "awaiting_approval" || req.State == "running") {
+		reader, ok := q.(reconciliationReader)
+		if fenceTx == nil || req.ClaimGeneration == nil || !ok {
+			return store.Run{}, false, ErrCrossCheckRefused
+		}
+		reconciliation, err = captureLeadReconciliation(ctx, reader, wkr, runID, *req.ClaimGeneration)
+		if err != nil {
+			return store.Run{}, false, err
+		}
 	}
 	// PRD #1247 M5 (D3): the fenced transition applied — COMMIT it, releasing the FOR UPDATE
 	// lock, BEFORE the post-transition automation below. That automation runs on s.q (a
@@ -4716,6 +4757,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			return store.Run{}, false, cerr
 		}
 		fenceTx = nil
+	}
+	if reconciliationOut != nil {
+		*reconciliationOut = reconciliation
 	}
 	// issue #329: record the MR the worker opened INDEPENDENT of the terminal status
 	// the switch above wrote. If SetRunCompleted applied, ReconcileRunMR is a COALESCE
@@ -5619,6 +5663,11 @@ type ForgeConn struct {
 	// unmarshal it into a ReviewCommentsSnapshot and reject any reply/resolve id not
 	// present in it (the Decision-11 server-side scope check).
 	ReviewComments []byte
+	IssueIID       *int64
+	SavedTitle     string
+	SavedBody      string
+	RawDigest      *string
+	InputReason    string
 }
 
 // ForgeConnForRun authorizes a worker's forge read against a run it holds and returns
@@ -5649,6 +5698,20 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 	// PRD #700 M4: carry the run's source mr_iid and raw review-comments snapshot from
 	// the SAME owned run read, so the mr_rework write-back endpoints can enforce the
 	// Decision-11 scope check without a second (unscoped) run read.
+	var issueIID *int64
+	if run.Kind == runkind.Issue && run.IssueIid.Valid {
+		v := run.IssueIid.Int64
+		issueIID = &v
+	}
+	var digest *string
+	if run.IssueRawDigest.Valid {
+		v := run.IssueRawDigest.String
+		digest = &v
+	}
+	body := run.IssueDescription
+	if run.IssueSavedBody.Valid {
+		body = run.IssueSavedBody.String
+	}
 	var mrIID *int64
 	if run.MrIid.Valid {
 		v := run.MrIid.Int64
@@ -5662,6 +5725,7 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 		BotForgeUserID:  row.BotForgeUserID,
 		MRIID:           mrIID,
 		ReviewComments:  run.ReviewComments,
+		IssueIID:        issueIID, SavedTitle: run.IssueTitle, SavedBody: body, RawDigest: digest, InputReason: run.IssueInputReason.String,
 	}, nil
 }
 
@@ -5693,7 +5757,7 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	// live-routed push must be SENT within livePublishPrePushBudget of that routing. The clock
 	// starts BEFORE the read, so a slow read can only shorten the budget, never start it after the
 	// run's terminal commit.
-	routedAt := time.Now()
+	routedAt := s.now()
 
 	// 1. Server-derived authorization: the run must be owned by THIS worker.
 	// ErrRunNotOwned bubbles to the handler → 404. This is the only thing the worker
@@ -6327,8 +6391,9 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 
 // CreateRun queues a manually-started run from a board card. The issue must be a
 // cached issue carrying the uzi_label (PRD #764 M1) in a repo the user owns; its
-// title is snapshotted from the cache and its description from the request, so the
-// run is self-contained even if the issue cache is later evicted. A PRD link is no
+// title and body are captured from the forge by createRun, with the raw digest
+// persisted separately from composed guidance. The saved input survives later
+// forge edits and cache eviction. A PRD link is no
 // longer required. The one-non-terminal-run-per-issue index rejects a duplicate
 // active run.
 // PRD #1429 M2: explicit is the manual request's optional harness (D2), nil ⇒ implicit D11;
@@ -6410,13 +6475,15 @@ func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoI
 	// false force (issue #856): a scheduled autopilot run never bypasses the open-MR dedup.
 	// credOverride: the schedule's stored override; explicit: the schedule's pinned harness
 	// (nil ⇒ implicit D11 at fire time), PRD #1429 M2.
-	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false /*force*/, nil /*seed*/, credOverride, explicit, nil /*rawOverride*/)
+	return s.createRun(context.WithValue(ctx, scheduleApprovalKey{}, true), userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false /*force*/, nil /*seed*/, credOverride, explicit, nil /*rawOverride*/)
 }
 
 // SeededPlan carries a create-time externally-authored plan and its optional agent
 // selection (PRD #209). A run created with a SeededPlan skips the Phase-1 planning
 // turn and the approval gate: the worker implements PlanMD directly. Nil for an
 // ordinary run planned from the issue alone.
+type scheduleApprovalKey struct{}
+
 type SeededPlan struct {
 	// PlanMD is the externally-authored plan. Untrusted input (D5): capped and
 	// secret-scrubbed before storage, and an empty/whitespace plan is rejected (D8).
@@ -6626,20 +6693,55 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	if fixing > 0 {
 		return store.Run{}, ErrBranchInUse
 	}
-	// PRD #381: snapshot the issue's human comments alongside the description. One
-	// extra forge round-trip, centralized here so every issue-backed origin (manual,
-	// autopilot, scheduled) captures it (D6) without rippling the Create*Run seam.
-	// Best-effort: a forge glitch, a nil forge builder (tests), or an unknown bot id
-	// (D9) all degrade to a NULL snapshot rather than failing run creation.
+	// Capture issue fields and assessed comments once for every issue-backed origin.
+	// A nil builder supports manual test fixtures; unattended schedules remain blocked.
 	var issueCommentsJSON []byte
-	if s.forges != nil {
-		if snap := s.fetchIssueCommentsSnapshot(ctx, row, issueIID); snap != nil {
-			if b, err := json.Marshal(snap); err != nil {
-				slog.Error("workersvc: marshal issue comments snapshot", "issue_iid", issueIID, "error", err)
-			} else {
-				issueCommentsJSON = b
+	capture := issueinput.FromContext(ctx, row.ForgeProjectID, issueIID)
+	handedOff := capture != nil
+	if capture == nil && s.forges != nil {
+		f, ferr := s.forges.ForgeForConnection(row.ForgeType, row.BaseUrl, row.TokenCiphertext)
+		if ferr != nil {
+			return store.Run{}, ErrForgeBuild
+		}
+		capture, err = issueinput.Fetch(ctx, f, row.ForgeProjectID, issueIID, row.BotForgeUserID)
+		if err != nil {
+			return store.Run{}, ErrForgeIssueRead
+		}
+	}
+	savedBody, rawDigest, inputReason := pgtype.Text{}, pgtype.Text{}, pgtype.Text{}
+	blockedReasons := []string{}
+	title := issue.Title
+	if capture != nil {
+		title = capture.Issue.Title
+		savedBody = pgconv.Text(capture.Issue.Description)
+		rawDigest = pgconv.Text(capture.Digest)
+		inputReason = pgconv.TextOrNull(capture.Reason)
+		// Only scheduler guidance composed from this capture may supplement it.
+		if _, scheduled := ctx.Value(scheduleApprovalKey{}).(bool); !handedOff || (!scheduled && triggerSource != "schedule") {
+			description = capture.Issue.Description
+		}
+		issueCommentsJSON, err = json.Marshal(capture.Thread)
+		if err != nil {
+			return store.Run{}, err
+		}
+		if requested, _ := ctx.Value(scheduleApprovalKey{}).(bool); requested && autoApprove {
+			blockedReasons = capture.Reasons()
+			if len(blockedReasons) != 0 {
+				autoApprove = false
 			}
 		}
+	}
+	if capture == nil {
+		if requested, _ := ctx.Value(scheduleApprovalKey{}).(bool); requested && autoApprove {
+			autoApprove = false
+			blockedReasons = []string{issueinput.Unknown}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return store.Run{}, err
+	}
+	if len(description) > MaxIssueDescriptionBytes {
+		return store.Run{}, ErrDescriptionTooLarge
 	}
 	// PRD #1226 M1 (D1), #1626: stamp the run as INTERLOCKED before its first claim when the
 	// completion-interlock switch is on (default ON; an explicit "false" row is the
@@ -6720,13 +6822,17 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			completionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
 		}
 		return q.CreateRun(ctx, store.CreateRunParams{
-			UserID:           userID,
-			RepoID:           repoID,
-			IssueIid:         pgtype.Int8{Int64: issueIID, Valid: true},
-			IssueTitle:       issue.Title,
-			IssueDescription: description,
-			OriginColumn:     originColumn,
-			AutoApprove:      autoApprove,
+			UserID:                    userID,
+			RepoID:                    repoID,
+			IssueIid:                  pgtype.Int8{Int64: issueIID, Valid: true},
+			IssueTitle:                title,
+			IssueDescription:          description,
+			IssueSavedBody:            savedBody,
+			IssueRawDigest:            rawDigest,
+			IssueInputReason:          inputReason,
+			AutoApproveBlockedReasons: blockedReasons,
+			OriginColumn:              originColumn,
+			AutoApprove:               autoApprove,
 			// PRD #35 Decision 7. Stamped at creation from the owner's default (or the
 			// caller's explicit choice), never read from users at park time: a run must
 			// keep the behaviour it was created with, so flipping the default later cannot
@@ -6796,24 +6902,6 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	s.notify(run.ID, "queued")
 	logRunCreated(run)
 	return run, nil
-}
-
-// fetchIssueCommentsSnapshot builds a forge driver from the run's repo connection,
-// reads the issue's comments, and returns the filtered/capped snapshot (PRD #381).
-// Returns nil (→ NULL) on any error or when the D1/D9 filter leaves nothing — a
-// comment snapshot is best-effort run CONTEXT, never a reason to fail creation.
-func (s *Service) fetchIssueCommentsSnapshot(ctx context.Context, row store.GetRepoForUserRow, issueIID int64) *IssueCommentsSnapshot {
-	f, err := s.forges.ForgeForConnection(row.ForgeType, row.BaseUrl, row.TokenCiphertext)
-	if err != nil {
-		slog.Error("workersvc: build forge for issue comments", "issue_iid", issueIID, "error", err)
-		return nil
-	}
-	comments, err := f.ListIssueComments(ctx, row.ForgeProjectID, issueIID)
-	if err != nil {
-		slog.Error("workersvc: list issue comments", "issue_iid", issueIID, "error", err) // err is PAT-redacted by the driver
-		return nil
-	}
-	return buildIssueCommentsSnapshot(comments, row.BotForgeUserID)
 }
 
 // uziLabel resolves the configured run-eligibility label (PRD #764 M1), falling back

@@ -401,80 +401,106 @@ describe("RunDiskSampler (PRD #1809 D8) — sampled_at, partial samples and rota
 });
 
 describe("Worker heartbeat — PRD #1809 D8 run_disk", () => {
-  it("carries the sampler's latest finished reading and keeps beating while a measure is stuck", async () => {
-    await withRoot(async (root) => {
-      fs.mkdirSync(path.join(root, id(1)));
-      const release = deferred();
-      let measuring = 0;
-      const sampler = new RunDiskSampler({
-        homeRoot: root,
-        intervalMs: 1,
-        isRunLive: () => true,
-        statusOf: async () => undefined,
-        log: nullLogger(),
-        measure: async () => {
-          measuring++;
-          await release.promise;
-          return { homeBytes: 7 * GIB, cacheBytes: 3 * GIB, entries: 1, truncated: false };
-        },
+  for (const delayedDiscovery of [false, true]) {
+    it(`carries the sampler's latest finished reading and keeps beating with ${delayedDiscovery ? "delayed" : "normal"} discovery while a measure is stuck`, async () => {
+      await withRoot(async (root) => {
+        fs.mkdirSync(path.join(root, id(1)));
+        const releaseDiscovery = deferred();
+        const release = deferred();
+        let discoveryEntered = false;
+        let measuring = 0;
+        const sampler = new RunDiskSampler({
+          homeRoot: root,
+          intervalMs: 1,
+          isRunLive: () => true,
+          statusOf: async () => undefined,
+          log: nullLogger(),
+          ...(delayedDiscovery
+            ? {
+                lstat: async (p: string) => {
+                  discoveryEntered = true;
+                  await releaseDiscovery.promise;
+                  return fs.promises.lstat(p);
+                },
+              }
+            : {}),
+          measure: async () => {
+            measuring++;
+            await release.promise;
+            return { homeBytes: 7 * GIB, cacheBytes: 3 * GIB, entries: 1, truncated: false };
+          },
+        });
+        const beats: Array<WorkerStats | undefined> = [];
+        const client = {
+          register: async () => ({ worker_id: "wid-1" }),
+          heartbeat: async (stats: WorkerStats | undefined) => {
+            beats.push(stats === undefined ? undefined : { ...stats });
+            return false;
+          },
+          hasFeature: () => false,
+          claimRun: async (): Promise<ClaimResponse | null> => null,
+          claimChat: async (): Promise<ChatClaimResponse | null> => null,
+        } as unknown as WorkerClient;
+        const config = {
+          workerName: "w1",
+          workerTemplate: "base",
+          pollIntervalMs: 1,
+          heartbeatIntervalMs: 2,
+          chatPollMs: 1,
+          chatSessions: 1,
+          maxConcurrentRuns: 1,
+          dataDir: root,
+        } as unknown as Config;
+        const runner = { resumePendingRecoveries: async () => {}, execute: async () => {} } as unknown as RunRunner;
+        const worker = new Worker(
+          config,
+          client,
+          runner,
+          { execute: async () => {} } as unknown as ChatRunner,
+          { execute: async () => {} } as unknown as JudgeRunner,
+          { execute: async () => {} } as unknown as ReviewRunner,
+          nullLogger(),
+          () => ({ ok: true, missing: [] as string[] }),
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          sampler,
+          // issue #1863: stub only the RSS read (the default reads the proc filesystem, which the
+          // Landlock test sandbox denies), so every beat carries a stats sample to attach to.
+          (dataDir) => new StatsCollector({ dataDir, processRss: () => 64 * 1024 * 1024 }),
+        );
+        const ac = new AbortController();
+        const done = worker.run(ac.signal);
+        try {
+          if (delayedDiscovery) {
+            await until(() => discoveryEntered, "discovery to start");
+            const beatsAtDiscovery = beats.length;
+            await until(() => beats.length >= beatsAtDiscovery + 5, "five further heartbeats while discovery is stuck");
+            assert.strictEqual(measuring, 0, "no measure starts before discovery finishes");
+            assert.ok(beats.every((b) => b !== undefined && !("run_disk" in b)), "no run_disk before discovery finishes");
+            releaseDiscovery.resolve();
+          }
+          await until(() => measuring === 1, "the measure to start");
+          const beatsAtMeasurement = beats.length;
+          await until(() => beats.length >= beatsAtMeasurement + 5, "five further heartbeats while the measure is stuck");
+          assert.strictEqual(measuring, 1, "one measure in flight, the heartbeat never started another");
+          assert.ok(beats.every((b) => b !== undefined && !("run_disk" in b)), "no run_disk before a sample finishes");
+          release.resolve();
+          await until(() => beats.some((b) => b?.run_disk !== undefined), "a heartbeat with run_disk");
+          const withDisk = beats.find((b) => b?.run_disk !== undefined);
+          assert.deepStrictEqual(sizesOf(withDisk?.run_disk), [{ run_id: id(1), home_bytes: 7 * GIB, cache_bytes: 3 * GIB }]);
+          assert.match(withDisk?.run_disk?.[0]?.sampled_at ?? "", /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/);
+        } finally {
+          releaseDiscovery.resolve();
+          release.resolve();
+          ac.abort();
+          await done.catch(() => undefined);
+          await sampler.settled();
+        }
       });
-      const beats: Array<WorkerStats | undefined> = [];
-      const client = {
-        register: async () => ({ worker_id: "wid-1" }),
-        heartbeat: async (stats: WorkerStats | undefined) => {
-          beats.push(stats === undefined ? undefined : { ...stats });
-          return false;
-        },
-        hasFeature: () => false,
-        claimRun: async (): Promise<ClaimResponse | null> => null,
-        claimChat: async (): Promise<ChatClaimResponse | null> => null,
-      } as unknown as WorkerClient;
-      const config = {
-        workerName: "w1",
-        workerTemplate: "base",
-        pollIntervalMs: 1,
-        heartbeatIntervalMs: 2,
-        chatPollMs: 1,
-        chatSessions: 1,
-        maxConcurrentRuns: 1,
-        dataDir: root,
-      } as unknown as Config;
-      const runner = { resumePendingRecoveries: async () => {}, execute: async () => {} } as unknown as RunRunner;
-      const worker = new Worker(
-        config,
-        client,
-        runner,
-        { execute: async () => {} } as unknown as ChatRunner,
-        { execute: async () => {} } as unknown as JudgeRunner,
-        { execute: async () => {} } as unknown as ReviewRunner,
-        nullLogger(),
-        () => ({ ok: true, missing: [] as string[] }),
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        sampler,
-        // issue #1863: stub only the RSS read (the default reads the proc filesystem, which the
-        // Landlock test sandbox denies), so every beat carries a stats sample to attach to.
-        (dataDir) => new StatsCollector({ dataDir, processRss: () => 64 * 1024 * 1024 }),
-      );
-      const ac = new AbortController();
-      const done = worker.run(ac.signal);
-      try {
-        await until(() => beats.length >= 5, "heartbeats while the measure is stuck");
-        assert.strictEqual(measuring, 1, "one measure in flight, the heartbeat never started another");
-        assert.ok(beats.every((b) => b !== undefined && !("run_disk" in b)), "no run_disk before a sample finishes");
-        release.resolve();
-        await until(() => beats.some((b) => b?.run_disk !== undefined), "a heartbeat with run_disk");
-        const withDisk = beats.find((b) => b?.run_disk !== undefined);
-        assert.deepStrictEqual(sizesOf(withDisk?.run_disk), [{ run_id: id(1), home_bytes: 7 * GIB, cache_bytes: 3 * GIB }]);
-        assert.match(withDisk?.run_disk?.[0]?.sampled_at ?? "", /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/);
-      } finally {
-        ac.abort();
-        await done.catch(() => undefined);
-      }
     });
-  });
+  }
 });

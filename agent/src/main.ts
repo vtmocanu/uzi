@@ -18,6 +18,7 @@ import { JudgeRunner } from "./judge-runner.js";
 import { IsolatedExecutor } from "./isolated-executor.js";
 import { IsolatedRunner } from "./isolated-runner.js";
 import { ReviewRunner } from "./review-runner.js";
+import { CrossCheckRunner } from "./cross-check-runner.js";
 import { SummaryRunner } from "./summary-runner.js";
 import { stubJudgeQueryFn } from "./judge-runner-stub.js";
 import { JobRunner } from "./job-runner.js";
@@ -648,6 +649,12 @@ async function main(): Promise<void> {
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 
+  const crossCheckRunner = new CrossCheckRunner(client, git, log, {
+    homeRoot: sdkHomeRoot, modelTimeoutMs: config.crossCheckModelTimeoutMs,
+    pollMs: config.pollIntervalMs, activeRuns, outbox,
+    outboxTerminalMaxBytes: config.outboxTerminalMaxBytes, gapFillMax: config.gapFillMax,
+  });
+
   // The review lane (PRD #400 M4b): a slim runner for a `task` claim carrying a
   // review_target_run_id. Like the judge it reuses the SDK HOME root, but it also needs
   // `git` (RunRunner-style) to clone the reviewed branch and compute the diff before the
@@ -816,6 +823,7 @@ async function main(): Promise<void> {
     jobRunner,
     dindMaintenance,
     terminalRejections,
+    crossCheckRunner,
   );
 
   // Signal handlers FIRST, before anything that can take real time. Until these

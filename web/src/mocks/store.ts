@@ -56,7 +56,12 @@ export interface MockState {
 // value, else its updated_at: the same backfill the issue #1727 migration applied to existing
 // rows, so every stored run carries the field a current server always sends.
 function seedRun(r: Run): Run {
-  return { ...r, status_since: r.status_since ?? r.updated_at };
+  return {
+    ...r,
+    auto_approve_blocked_reasons: r.auto_approve_blocked_reasons ?? [],
+    issue_input_reason: r.issue_input_reason ?? null,
+    status_since: r.status_since ?? r.updated_at,
+  };
 }
 
 function seed(): MockState {
@@ -146,7 +151,17 @@ function seed(): MockState {
   for (const p of mockProposals) proposals.set(p.id, { ...p });
   const boards = new Map<string, Board>();
   for (const [id, b] of Object.entries(mockBoards)) {
-    boards.set(id, { ...b, columns: [...b.columns], cards: b.cards.map((c) => ({ ...c })) });
+    boards.set(id, {
+      ...b,
+      columns: [...b.columns],
+      cards: b.cards.map((c) => ({
+        ...c,
+        latest_run: c.latest_run ? {
+          ...c.latest_run,
+          auto_approve_blocked_reasons: c.latest_run.auto_approve_blocked_reasons ?? [],
+        } : null,
+      })),
+    });
   }
   // Auth is instant/fake in mock mode: the session starts signed in as admin so
   // the whole app is browsable with zero steps. Logout still works (and any
@@ -220,6 +235,7 @@ export function appendMessage(
 // fields (run_count, is_mine, owner_name, worker_name) that a run patch must never
 // clobber, and Run carries a great deal a card has no business holding.
 const CARD_MIRRORED_FIELDS = [
+  "auto_approve_blocked_reasons",
   "status",
   // issue #321: the server-derived planning flag rides the card the same way status does,
   // so a scripted transition out of planning is reflected on the board card too.

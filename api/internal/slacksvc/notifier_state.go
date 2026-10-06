@@ -443,7 +443,15 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 				n.logf("post plan in thread", err)
 			}
 		}
-		ts, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, "Plan ready for review in uzi", gateBlocks(rc.ID, base, rc.RepoAgentNames, rc.RepoAgentFolder))
+		// Only the persisted reason describes this gate; a cleared reason after
+		// human revision must not imply checker unavailability.
+		crossCheckReason := ""
+		if run, rerr := n.store.GetRunByID(ctx, rc.ID); rerr != nil {
+			n.logf("load gate cross-check reason", rerr)
+		} else if run.PlanCrossCheckRequired && run.PlanCrossCheckGateReason.Valid {
+			crossCheckReason = run.PlanCrossCheckGateReason.String
+		}
+		ts, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, "Plan ready for review in uzi", gateBlocks(rc.ID, base, rc.RepoAgentNames, rc.RepoAgentFolder, crossCheckReason))
 		if err != nil {
 			n.logf("post gate", err)
 			return

@@ -57,7 +57,7 @@ function fakeProcess(): {
   });
   completed.catch(() => undefined);
   const spawner: BoundaryProcessSpawner = () =>
-    Promise.resolve({ stdin: new PassThrough(), stdout, stderr: new PassThrough(), completed });
+    Promise.resolve({ stdin: new PassThrough(), stdout, stderr: new PassThrough(), cancel: async () => { await completed; }, completed });
   return { spawner, stdout, settle };
 }
 

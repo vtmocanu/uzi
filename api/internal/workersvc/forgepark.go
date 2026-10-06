@@ -260,13 +260,13 @@ func (s *Service) parkForgeUnreachable(ctx context.Context, wkr store.Worker, ow
 // coerced/default origin exactly as a pre-#1392 forge clone failure did, and the custody-release
 // reconciler remains the backstop for the still-open hold. In production txBeginner is always
 // wired, so this is the tests/degraded-deployment path.
-func (s *Service) failForgeUnsettleable(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, sessionID pgtype.Text) (int64, error) {
+func (s *Service) failForgeUnsettleable(ctx context.Context, wkr store.Worker, runID uuid.UUID, harness string, req StateRequest, sessionID pgtype.Text) (int64, error) {
 	failOrigin := "agent_failure"
 	if o := CoerceFailOrigin(req.FailOrigin); o != nil {
 		failOrigin = *o
 	}
 	return s.q.SetRunFailed(ctx, store.SetRunFailedParams{
-		FailureReason:  limitAwareFailureReason(req),
+		FailureReason:  limitAwareFailureReason(harness, req),
 		FailOrigin:     pgconv.TextOrNull(failOrigin),
 		PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 		SessionID:      sessionID,

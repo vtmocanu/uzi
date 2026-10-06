@@ -6,14 +6,14 @@ audience: user
 
 # Paused on a usage limit
 
-When a run hits your Anthropic 5-hour or 7-day usage cap partway through, uzi can pause it instead of failing it outright, and pick it back up on its own once the window resets — no re-running by hand.
+When a Claude run hits your Anthropic usage cap, or a Codex subscription run hits a recognized window usage limit, uzi can park it instead of failing it and resume it automatically after the reset.
 
 ## On by default
 
-Every new run waits out a usage limit unless you turn it off, in two places:
+Waiting is on by default for recognized usage windows, with two controls:
 
-- **Settings → Anthropic usage limits** — *"Pause my new runs on a usage limit instead of failing them"* sets the default for every new run, and is the **only** way to change it for an autopilot, CI-fix, or self-improvement run: none of those has a start button of its own.
-- **The run view** — *"Wait out future Anthropic usage limits on this run"* overrides the default for one run, live, for as long as it's still going.
+- **Settings → Usage limits** — *"Pause my new runs on a usage limit instead of failing them"* sets the default inherited by new runs, including autopilot, CI-fix and self-improvement runs.
+- **The run view** — *"Wait out future usage limits on this run"* overrides the default for one run, live, for as long as it's still going.
 
 Starting a run by hand stays one click and inherits the Settings default; there's no checkbox at start. The API accepts the flag per run for scripted callers.
 
@@ -22,8 +22,8 @@ Starting a run by hand stays one click and inherits the Settings default; there'
 ## What you'll see
 
 - **Board card**: a **limit wait** badge.
-- **Run view**: a warn-toned strip reading *"Paused on an Anthropic usage limit"*, with a countdown to when it resumes, which window it hit (5-hour, 7-day, …), and — from the second pause on — *"attempt N"*.
-- **Activity feed**: *"Anthropic usage limit reached — paused until it resets"*, with the window and reset time alongside it.
+- **Run view**: a warn-toned strip naming **Codex** or **Anthropic** from the run’s harness, with a countdown to its scheduled resume, which window it hit (5-hour, 7-day, …), and — from the second pause on — *"attempt N"*.
+- **Activity feed**: the usage-limit event names the provider when the full run is available, with the window and reset time alongside it. Board latest-run summaries have no harness and use neutral usage-limit wording.
 - **Slack** (if you've linked a Slack account): the run's DM thread gets a
   `⏸️ Paused · usage limit` reply when it parks, and a `▶️ Resumed · usage
   limit cleared` reply the first time it's working again — the resume
@@ -37,17 +37,25 @@ The run's status stays visibly "waiting" the whole time — never "stalled" — 
 
 ## What happens automatically
 
-Once the window resets, the run usually resumes on the same worker, in the same session, keeping its branch and its history — including any edits it hadn't committed yet when it paused, which come back exactly as they were and never show up as their own commit in the eventual merge request. If you had already approved its plan before the pause, it goes straight back to work instead of asking you to approve the plan again. In the uncommon case it has to come back on a different worker, it recovers your work whenever it cleanly can and resumes just the same. An already-approved run asks you to approve a fresh plan again only on a total loss — when it comes back and can recover neither its committed progress nor those uncommitted edits; if it kept its committed progress but not the last uncommitted edits, it resumes without re-approving.
+A successful park capture preserves committed progress and uncommitted edits through a throwaway WIP marker; recovery restores the marker as uncommitted work. Durability depends on capture and publish succeeding: a failed sink does not claim the checkpoint holds the latest work, and failed capture retains the source clone for recovery. It cannot promise recovery after that retained tree is lost. An already-approved plan is reused when work is recovered; total loss of both committed and uncommitted progress keeps the existing re-approval policy.
 
-That's the trade: a parked run keeps holding its issue and its worker's disk for as long as it waits, which is the price of never losing work to a mid-run limit.
+A parked run keeps its issue’s active-run lock and worker disk. For a run-bound hosted worker, it can also hold the worker and PVC for up to `RUN_LIMIT_MAX_PARK` per park (8 days by default).
 
-The pause itself also updates that credential's rate-limit meter right away, so it reads as exhausted for anyone else's claim too — see [Claude rate limits](rate-limits.md) for what that looks like. And the resuming claim goes further: it skips the credential that just paused it even when the meter alone wouldn't have ruled it out, which is what keeps an `auto` worker from immediately picking the very token that just refused it.
+For **Claude**, the pause itself also updates that credential's rate-limit meter right away, so it reads as exhausted for anyone else's claim too — see [Claude rate limits](rate-limits.md) for what that looks like. And the resuming claim goes further: it skips the credential that just paused it even when the meter alone wouldn't have ruled it out, which is what keeps an `auto` worker from immediately picking the very token that just refused it.
 
 A run can pause and resume more than once if the limit keeps recurring, backing off between attempts, up to a cap; a second cap bounds how far out any single pause may reach. Both are operator-configured — see [Configuration](configuration.md) to change them.
 
+## Codex: window evidence and same-account resume
+
+A final `usageLimitExceeded` failure parks only for subscription authentication with accepted structured `account/rateLimits/updated` evidence from that turn. The latest bucket snapshot replaces earlier evidence; uzi does not infer resets from provider prose, an account-read request, or a poller. Exhausted windows (at least 100% used) select the latest reset. With `rate_limit_reached` but no window at 100%, the highest-used windows are selected, including ties. If any selected window lacks a usable reset, or the reset is already past, the bounded fallback applies: 15 minutes doubling per park, capped at 4 hours. The default five-park budget can therefore exhaust before a weekly window reopens.
+
+Limits classified as non-window fail with typed `rate_limited` origin and no reset promise: missing or unaccepted snapshots, API-key or undefined authentication, spend-control flags, or credit, quota, plan and unknown rejection evidence. The last snapshot cannot prove that the terminal error carried it: an earlier exhausted sampling snapshot followed by a quota or plan failure without contrary evidence can still park, bounded by the wait and park budgets. `rateLimitExceeded` remains outside this window-park behavior ([follow-up #2361](https://github.com/vtmocanu/uzi/issues/2361)); `sessionBudgetExceeded` is unchanged.
+
+Codex resumes on the same frozen account: no Anthropic token switching, pool lowering, or Anthropic gauge updates. The updated API revokes the parked flight’s Codex capability; a resumed claim gets fresh authority. If that account becomes unavailable or quarantined, promotion does not bypass the claim check: Claim refuses it, then Sweep parks it at `recovery_wait` / `codex_account_unavailable`. On a non-Docker worker with a resolvable thread, resume continues that thread. Docker attempt paths retain the existing fresh-thread lineage break, with work restored from the branch, tracking ref, or checkpoint when available.
+
 ## Switching to a different token while parked
 
-A park driven by one token can also end on a **different** one, instead of
+A Claude park driven by one token can also end on a **different** one, instead of
 waiting out the reset — two ways:
 
 - **Automatically, for an auto-select worker.** A parked run is re-checked on
@@ -74,7 +82,7 @@ waiting out the reset — two ways:
 
 ## If a run isn't waiting out limits
 
-A run that isn't set up to wait still fails the moment it hits a limit, the same as before — but the failure now says why, instead of a bare error: *"Anthropic usage limit (5-hour) reached; resets at 2026-07-28T02:00:00Z"*. Re-run it once that time passes, or turn on waiting so next time it doesn't have to.
+A run that opts out fails on a recognized usage limit with a server-composed reason naming **Codex** or **Anthropic** and the window, plus the reset when known: *"Codex usage limit (seven_day) reached; resets at 2026-10-13T02:00:00Z"*. Without a usable reset, the reason makes no reset promise. Waiting uses the existing `wait_on_limit` default and per-run override; there is no new setting or migration.
 
 ## Alert when the 7-day window resets early
 
@@ -91,7 +99,7 @@ quiet on: a window that was barely used before it cleared (weekly usage already
 near zero), or one whose reset time the poller can't read from Anthropic at that
 moment.
 
-- **On by default** — the same **Settings → Anthropic usage limits** card as
+- **On by default** — the same **Settings → Usage limits** card as
   the pause toggle above has its own checkbox, *"Alert me when my 7-day limit
   resets early"*. It's independent of whether waiting on limits is turned on.
 - **A Slack DM, loud on purpose, and Slack-only** — a `🚨 7-DAY RATE LIMIT
@@ -110,9 +118,9 @@ moment.
 
 A **`limit_wait`** pause (this page), a **`pool_wait`** hold and a
 **`recovery_wait`** park are all non-terminal waits, but for different
-reasons with different resolutions. `limit_wait` means a token you were
-actually spending hit its Anthropic rate limit, and it clears when that
-window resets. `pool_wait` means an `auto`-lane worker's token pool was
+reasons with different resolutions. `limit_wait` means the run hit a recognized
+provider usage window, and it is scheduled to resume after the reset or bounded
+fallback. `pool_wait` means an `auto`-lane worker's token pool was
 genuinely empty — there was nothing to spend at all — and it clears when you
 opt a token into the pool, or on demand with `uzi run resume-now`. See
 [Letting uzi pick the token (auto-selection)](anthropic-token.md#letting-uzi-pick-the-token-auto-selection)
@@ -123,6 +131,6 @@ error — not a limit or an empty pool at all — see
 
 ## Not the same as pausing
 
-A `limit_wait` park (this page) happens *to* the run — a token it was spending hit its rate limit — and it resumes on its own, with a fresh clock, once the window resets. [Pausing](run-pause.md) is something the run's owner asks for, on demand, and it only ever resumes when the owner says so, handing back exactly the budget that was left rather than a fresh clock. The two can overlap: a pause requested while a run is still `running` survives a `limit_wait` park that overtakes it, and takes effect at the first boundary once the run is working again — you don't have to ask twice.
+A `limit_wait` park (this page) happens *to* the run — its provider usage window was exhausted — and it is scheduled to resume on its own, with a fresh clock, after the reset or bounded fallback. [Pausing](run-pause.md) is something the run's owner asks for, on demand, and it only ever resumes when the owner says so, handing back exactly the budget that was left rather than a fresh clock. The two can overlap: a pause requested while a run is still `running` survives a `limit_wait` park that overtakes it, and takes effect at the first boundary once the run is working again — you don't have to ask twice.
 
 Related: [Claude rate limits](rate-limits.md) · [Anthropic tokens](anthropic-token.md) · [Run health](run-health.md) · [Pausing and resuming a run](run-pause.md) · [Configuration](configuration.md) · [Slack notifications](slack.md) · [Recovering from a transient interruption](run-recovery-wait.md)

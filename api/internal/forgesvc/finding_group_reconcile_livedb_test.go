@@ -287,6 +287,126 @@ func TestFindingGroupReconcileSettlesRecordedOperationWithoutForgeMatchLiveDB(t 
 	}
 }
 
+func TestFindingGroupReconcileRecordedSettlementFailureContinuesIssueSyncLiveDB(t *testing.T) {
+	for _, mode := range []string{"FullSync", "IncrementalSync"} {
+		t.Run(mode, func(t *testing.T) {
+			e := newRCEnv(t)
+			fixed := time.Date(2026, time.October, 4, 12, 0, 0, 0, time.UTC)
+			first, firstIDs := e.inFlight(e.user, 2)
+			later, laterIDs := e.inFlight(e.user, 1)
+			for i, op := range []store.FindingGroupClaimOperation{first, later} {
+				iid := int64(31 + i)
+				if ok, err := store.RecordFindingGroupIssue(e.ctx, e.pool, e.user, op.ID, iid,
+					fmt.Sprintf("https://forge.e2e/g/rc/-/issues/%d", iid)); err != nil || !ok {
+					t.Fatalf("record %s: %v %v", op.ID, ok, err)
+				}
+				e.exec(`UPDATE finding_group_operations SET created_at=$2 WHERE id=$1`, op.ID, fixed.Add(time.Duration(i)*time.Second))
+			}
+			e.exec(`UPDATE finding_dispositions SET filing_since=$2 WHERE group_operation_id=$1`, first.ID, fixed)
+
+			// The phase transition follows the member updates in SettleFindingGroup;
+			// raising here exercises rollback of those updates as well as the phase.
+			fixture := "rc_settle_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+			t.Cleanup(func() {
+				if _, err := e.pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS `+fixture+` ON finding_group_operations`); err != nil {
+					t.Errorf("drop settlement trigger: %v", err)
+				}
+				if _, err := e.pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS `+fixture+`_fn()`); err != nil {
+					t.Errorf("drop settlement function: %v", err)
+				}
+			})
+			e.exec(`CREATE FUNCTION ` + fixture + `_fn() RETURNS trigger LANGUAGE plpgsql AS $f$
+				BEGIN RAISE EXCEPTION 'recorded settlement fault'; END $f$`)
+			e.exec(`CREATE TRIGGER ` + fixture + ` AFTER UPDATE ON finding_group_operations FOR EACH ROW
+				WHEN (OLD.phase IS DISTINCT FROM NEW.phase AND NEW.phase = 'settled'
+					AND NEW.id = '` + first.ID.String() + `') EXECUTE FUNCTION ` + fixture + `_fn()`)
+
+			capture := &captureHandler{}
+			prev := slog.Default()
+			slog.SetDefault(slog.New(capture))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+			cursor := store.FindingGroupCursor{CreatedAt: fixed.Add(-time.Second), ID: uuid.New()}
+			e.svc.groupCursors = map[uuid.UUID]store.FindingGroupCursor{e.repoID: cursor}
+			want := Marks{PRD: fixed.Add(time.Minute), Open: fixed.Add(2 * time.Minute), Finding: fixed.Add(3 * time.Minute)}
+			prd, open, finding := rcIssue(41, ""), rcIssue(42, ""), rcIssue(43, "")
+			prd.Title, prd.State, prd.Labels, prd.UpdatedAt = "prd", "closed", []string{"uzi"}, want.PRD
+			open.Title, open.Labels, open.UpdatedAt = "open", nil, want.Open
+			finding.Title, finding.State, finding.UpdatedAt = "finding", "closed", want.Finding
+			e.fake.set(prd, open, finding)
+			start := Marks{PRD: fixed, Open: fixed, Finding: fixed}
+			sync := func() (Marks, error) {
+				if mode == "FullSync" {
+					return e.svc.FullSync(e.ctx, e.repoID, 7001, e.fake)
+				}
+				return e.svc.IncrementalSync(e.ctx, e.repoID, 7001, e.fake, start)
+			}
+			for pass := 0; pass < 2; pass++ {
+				capture.mu.Lock()
+				capture.recs = nil
+				capture.mu.Unlock()
+				got, err := sync()
+				if err != nil || got != want {
+					t.Fatalf("pass %d: marks=%v error=%v, want %v", pass, got, err, want)
+				}
+				if n := e.cachedIssueRows(); n != 3 {
+					t.Fatalf("pass %d: cached rows=%d, want 3", pass, n)
+				}
+				for _, issue := range []forge.Issue{prd, open, finding} {
+					var title, state string
+					var updated time.Time
+					if err := e.pool.QueryRow(e.ctx, `SELECT title,state,forge_updated_at FROM issues
+						WHERE repo_id=$1 AND forge_issue_iid=$2`, e.repoID, issue.IID).Scan(&title, &state, &updated); err != nil {
+						t.Fatal(err)
+					}
+					if title != issue.Title || state != issue.State || !updated.Equal(issue.UpdatedAt) {
+						t.Fatalf("cached #%d = %q %q %v, want %+v", issue.IID, title, state, updated, issue)
+					}
+				}
+				rec, ok := capture.find("finding group reconciliation pending", e.repoID)
+				if !ok || rec.Level != slog.LevelWarn {
+					t.Fatalf("pass %d: missing settlement warning for repo %s", pass, e.repoID)
+				}
+				attrs := map[string]any{}
+				rec.Attrs(func(a slog.Attr) bool { attrs[a.Key] = a.Value.Any(); return true })
+				warning := fmt.Sprint(attrs["error"])
+				if !strings.Contains(warning, first.ID.String()) || !strings.Contains(warning, "recorded settlement fault") {
+					t.Fatalf("pass %d: warning error=%q", pass, warning)
+				}
+				e.requireClaimed(firstIDs)
+				for _, id := range firstIDs {
+					var group uuid.UUID
+					var since time.Time
+					if err := e.pool.QueryRow(e.ctx, `SELECT group_operation_id,filing_since FROM finding_dispositions WHERE id=$1`, id).Scan(&group, &since); err != nil {
+						t.Fatal(err)
+					}
+					if group != first.ID || !since.Equal(fixed) {
+						t.Fatalf("member %s: group=%s filing_since=%v, want %s %v", id, group, since, first.ID, fixed)
+					}
+				}
+				if phase, iid := e.phase(first.ID); phase != "issue_recorded" || iid == nil || *iid != 31 {
+					t.Fatalf("faulted operation: phase=%s iid=%v", phase, iid)
+				}
+				e.requireSettled(32, laterIDs)
+				if phase, iid := e.phase(later.ID); phase != "settled" || iid == nil || *iid != 32 {
+					t.Fatalf("later operation: phase=%s iid=%v", phase, iid)
+				}
+				if got, exists := e.svc.groupCursors[e.repoID]; !exists || got != cursor {
+					t.Fatalf("pass %d: cursor=%+v exists=%v, want %+v", pass, got, exists, cursor)
+				}
+			}
+			e.exec(`DROP TRIGGER ` + fixture + ` ON finding_group_operations`)
+			if got, err := sync(); err != nil || got != want {
+				t.Fatalf("recovery: marks=%v error=%v", got, err)
+			}
+			e.requireSettled(31, firstIDs)
+			e.requireSettled(32, laterIDs)
+			if phase, _ := e.phase(first.ID); phase != "settled" {
+				t.Fatalf("recovered operation phase=%s", phase)
+			}
+		})
+	}
+}
+
 func TestFindingGroupReconcileNoMatchAndAmbiguousStayClaimedLiveDB(t *testing.T) {
 	e := newRCEnv(t)
 	absent, absentIDs := e.inFlight(e.user, 2)

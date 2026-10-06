@@ -12,6 +12,7 @@ import { useSeededCredential } from "../../lib/useSeededCredential";
 import { stripUnsafeChars } from "../../lib/safeText";
 import { effectiveWorkerCaps } from "../../lib/workerCaps";
 import { AgentPicker, selectionLabel, type OwnTemplate } from "../../components/AgentPicker";
+import { PlanCrossCheck } from "../../components/PlanCrossCheck";
 import { Markdown } from "../../components/Markdown";
 import { TokenPicker } from "../../components/TokenPicker";
 import { Alert, Badge, Button, Field, Spinner, Textarea, cx } from "../../components/ui";
@@ -436,6 +437,7 @@ export function PlanPanel({
           </div>
         </div>
         <div className="p-4">
+          <PlanCrossCheck run={run} />
           <RevisionThread feedback={rev.latestFeedback} working />
         </div>
       </div>
@@ -449,6 +451,7 @@ export function PlanPanel({
 
   return (
     <div className="overflow-hidden rounded-xl border border-warn/50 bg-warn/5">
+      <PlanCrossCheck run={run} />
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-warn/30 bg-warn/10 px-4 py-3">
         <div>
           <h2 className="flex items-center gap-2 text-sm font-semibold text-warn">

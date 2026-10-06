@@ -48,7 +48,8 @@ const codexCoordQuarantined = "quarantined"
 //
 // parked states ARE included on purpose — 'limit_wait', 'recovery_wait' (issue #1197) and
 // the awaiting_* parks are a worker still holding the run, and D4 requires
-// persist-before-park, so a park must be able to persist recovery material. recovery_wait
+// persist-before-park. SetRunLimitWait revokes the capability after boundary reconciliation;
+// the hash and epoch deny the parked flight despite its status remaining in this map. recovery_wait
 // is a MID-EXECUTION park like limit_wait (a running worker parked the run on a transient
 // recovery). A pre-execution codex_account_unavailable recovery_wait also belongs here:
 // its park revokes the capability, so no credential operation can use it. The following

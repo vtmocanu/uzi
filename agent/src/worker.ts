@@ -8,6 +8,7 @@ import type { ChatRunner } from "./chat-runner.js";
 import type { JudgeRunner } from "./judge-runner.js";
 import type { JobRunner } from "./job-runner.js";
 import type { ReviewRunner } from "./review-runner.js";
+import type { CrossCheckRunner } from "./cross-check-runner.js";
 import type { IsolatedRunner } from "./isolated-runner.js";
 import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
@@ -114,6 +115,7 @@ export class Worker {
     },
     private readonly dindMaintenance?: DindMaintenanceController,
     private readonly terminalRejections?: TerminalRejectionCoordinator,
+    private readonly crossCheckRunner?: Pick<CrossCheckRunner, "execute">,
   ) {
     // Existing constructor callers with a real outbox/client also reconcile after restart.
     if (!this.terminalRejections && outbox && typeof client.reportTerminalRejections === "function" &&
@@ -549,6 +551,10 @@ export class Worker {
           // clause then lets only a worker advertising 'job_files_v1' claim it, so an api rolled
           // ahead of the fleet never hands a new-protocol job to an image without this.
           "job_files_v1",
+          // PRD #2149 M1: claims requiring a plan cross-check park at the human gate
+          // until the checker arrives in M2. The server only offers them to workers
+          // that advertise this fail-closed gate.
+          "cross_check_v1",
         ];
         // PRD #1906 M4: advertise isolated_fetch_v1 ONLY when this worker is configured for the
         // isolated lane (UZI_FETCHER_URL and UZI_FETCHER_CA_FILE both set, which the chart does
@@ -963,7 +969,12 @@ export class Worker {
           const releaseProtection = this.terminalRejections?.protectExecution(claim.run_id);
           let exec: Promise<void>;
           try {
-            exec = claim.isolated_fetch
+            exec = claim.kind === "cross_check"
+            ? this.crossCheckRunner
+              ? this.crossCheckRunner.execute(claim, signal)
+              : this.client.reportState(claim.run_id, { status: "failed", claim_generation: claim.claim_generation,
+                  failure_reason: "No cross-check runner wired" }).then(() => undefined)
+            : claim.isolated_fetch
             ? claim.kind === "job"
               ? this.jobRunner.execute(claim)
               : this.executeIsolated(claim)

@@ -970,6 +970,7 @@ describe("round trip: the renderer's own output always parses ok", () => {
     ["task", { issue_iid: null, branch: "uzi/task/x", base_branch: hostile }],
     ["mr_rework", { issue_iid: null, branch: "agent/issue-42" }],
     ["job", { issue_iid: null }],
+    ["cross_check", { issue_iid: null }],
   ];
   assert.deepEqual([...new Set(kinds.map(([k]) => k))].sort(), [...RUN_KINDS].sort());
   const scopes: Array<ClaimConfig["completion_scope"]> = [

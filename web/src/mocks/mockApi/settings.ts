@@ -965,6 +965,16 @@ export const settingsApi = {
     return delay({ user: { ...u } }, 200);
   },
 
+  // ── Plan cross-check consent (PRD #2149 M1) ─────────────────────────────────
+  setPlanCrossCheckEnabled: async (plan: boolean) => {
+    const u = requireSession();
+    if (plan && (!hasAnthropicToken(secrets) || !isCodexUsable(secrets))) {
+      throw new ApiError(409, "both Claude and Codex credentials must be usable");
+    }
+    u.plan_cross_check_enabled = plan;
+    return delay({ user: { ...u } }, 200);
+  },
+
   // ── Usage-limit default (PRD #35 M3) ─────────────────────────────────────────
   // 🔴 TOUCHES THE USER ROW ONLY. It must not walk `state.runs` "helpfully" applying
   // the new default: the flag is copied onto a run at CREATION, so a sweep would

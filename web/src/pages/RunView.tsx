@@ -24,7 +24,7 @@ import {
 import { useAuth } from "../auth/AuthContext";
 import { mergeRequestUrl } from "../lib/forgeUrls";
 import { errorMessage } from "../lib/apiError";
-import { canToggleWaitOnLimit, formatCountdown, runWindowLabel } from "../lib/limitWait";
+import { canToggleWaitOnLimit, formatCountdown, runWindowLabel, usageLimitPhrase } from "../lib/limitWait";
 import {
   budgetRightLabel,
   extendBudgetView,
@@ -80,6 +80,7 @@ import { ActivityFeed } from "../components/ActivityFeed";
 import { SteerQueueCard } from "../components/SteerQueueCard";
 import { QuestionPanel, UnreadableQuestion } from "../components/QuestionPanel";
 import { deriveOpenQuestion } from "../lib/runQuestion";
+import { PlanCrossCheck } from "../components/PlanCrossCheck";
 import { Markdown } from "../components/Markdown";
 import { JobResultPanel } from "./runView/JobResultPanel";
 import { Alert, Badge, Button, Card, PageHeader, Spinner, StatusPill, cx, type BadgeTone } from "../components/ui";
@@ -939,14 +940,14 @@ export function LimitWaitPanel({
         onChange={(e) => onToggle(e.target.checked)}
       />
       <span className={parked ? "text-fg" : "text-muted"}>
-        Wait out future Anthropic usage limits on this run
+        Wait out future usage limits on this run
       </span>
     </label>
   ) : (
     <span className={cx("text-xs", parked ? "text-fg" : "text-muted")}>
       {run.wait_on_limit
-        ? "Waiting out future Anthropic usage limits on this run — only its owner can change this."
-        : "Not waiting out future Anthropic usage limits on this run — only its owner can change this."}
+        ? "Waiting out future usage limits on this run — only its owner can change this."
+        : "Not waiting out future usage limits on this run — only its owner can change this."}
     </span>
   );
 
@@ -1017,7 +1018,7 @@ export function LimitWaitPanel({
               which is the kind that stops the next person from checking.) */}
           <p role="status" className="text-sm font-semibold text-warn">
             <span aria-hidden="true">⏸ </span>
-            Paused on an Anthropic usage limit
+            {`Paused on ${usageLimitPhrase(run.harness)}`}
           </p>
           <p className="mt-0.5 text-xs text-muted">
             {countdown ? (
@@ -1037,11 +1038,10 @@ export function LimitWaitPanel({
             )}
             {attemptClause && ` ${attemptClause}`}
           </p>
-          {/* text-muted, not text-faint (web-ux F1): at 4.56 this was the faintest
-              text on the panel while being the only thing telling a stuck user that
-              nothing is lost. The pointer to Stop is now the button beside it. */}
+          {/* Keep the recovery limits legible alongside the Stop control. */}
           <p className="mt-1.5 text-xs text-muted">
-            Nothing is lost — the run keeps its branch and its history and picks up where it left off.
+            A successful recovery restores saved work. If saving the latest changes failed,
+            recovery on another worker may be incomplete.
           </p>
           {/* PRD #1809 M6: checkpoint durability and the run's size on its worker. */}
           <RunParkDiskFacts run={run} />
@@ -1498,7 +1498,7 @@ function PoolWaitPanel({
               count down to — resumption is event-driven (a token is pooled), not
               time-driven. */}
           <p className="mt-1.5 text-xs text-muted">
-            Nothing is lost — the run keeps its branch and its history and picks up where it left off.
+            The run continues when a token is available, using any saved work it can recover.
           </p>
           {/* Always mounted (sr-only when empty) so the 409 note is announced when it
               arrives — a region created in the same tick as its first content is
@@ -1731,14 +1731,14 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
         )}
         <p className="mt-1.5 text-xs text-muted">
           {vaultPark
-            ? "Nothing is lost: the run's work was saved before it parked, and it picks up where it left off."
+            ? "The run saved its work before parking; resume uses that recovery data."
             : diskPark
               ? // PRD #1809: a disk park frees space on the worker, so the generic "keeps its
                 // branch and its history" line is not the claim to make. A first-claim park may
                 // have no branch or checkpoint yet, so only what the run already has is kept,
                 // plus the run's work the worker keeps until it resumes.
                 "Any branch or pushed checkpoint the run already has is kept, and the worker keeps the run's work until it resumes."
-              : "Nothing is lost — the run keeps its branch and its history and picks up where it left off."}
+              : "A successful recovery restores saved work. If saving the latest changes failed, recovery on another worker may be incomplete."}
         </p>
         {/* PRD #1809 M6: checkpoint durability and the run's size on its worker. */}
         <RunParkDiskFacts run={run} />
@@ -1836,11 +1836,86 @@ function outcomePendingReasonLabel(reason: string): string {
   }
 }
 
+// These fields describe creation-time assessment, never current authorization.
+function IssueInputHistory({ run }: { run: Run }) {
+  const blocked = [...new Set(run.auto_approve_blocked_reasons ?? [])];
+  const issueReason = run.issue_input_reason;
+  if (blocked.length === 0 && !issueReason) return null;
+  const blockedCopy = (reason: string) => {
+    switch (reason) {
+      case "author_not_eligible":
+        return "Required repo access was missing for some issue input.";
+      case "permission_unknown":
+        return "Repo access couldn't be checked for some issue input.";
+      default:
+        return "Some issue input could not be verified for automatic approval.";
+    }
+  };
+  const issueCopy = issueReason === "author_not_eligible"
+    ? "At run creation, the issue author's repo access was below the required threshold."
+    : issueReason === "permission_unknown"
+      ? "At run creation, the issue author's repo access couldn't be checked."
+      : "At run creation, the issue author's repo access could not be verified.";
+  return (
+    <section aria-label="Issue input at run creation" className="rounded-lg border border-info/40 bg-info/10 p-4 text-sm">
+      {blocked.length > 0 && (
+        <>
+          <p className="font-medium">Scheduled automatic approval was disabled.</p>
+          <ul className="mt-2 list-disc pl-5">
+            {[...new Set(blocked.map(blockedCopy))].map((copy) => <li key={copy}>{copy}</li>)}
+          </ul>
+        </>
+      )}
+      {issueReason && <p className={blocked.length > 0 ? "mt-2" : undefined}>{issueCopy}</p>}
+    </section>
+  );
+}
+
 export function RunView() {
   const { id = "" } = useParams();
   const currentRunIdRef = useRef(id);
   currentRunIdRef.current = id;
   const { run, messages, connected, error, submit, refreshRun, inputs, canSteer } = useRunStream(id);
+  const planCheckSeqs = useRef(new Map<string, number>());
+  const planCheckRefresh = useRef<{ runId: string; busy: boolean; queued: boolean } | null>(null);
+  useEffect(() => {
+    planCheckRefresh.current = null;
+    return () => { planCheckRefresh.current = null; };
+  }, [id]);
+  useEffect(() => {
+    if (run?.id !== id) return;
+    let latest = 0;
+    for (const message of messages) {
+      if (message.kind === "cross_check" &&
+          (message.payload as { stage?: string } | null)?.stage === "plan") latest = Math.max(latest, message.seq);
+    }
+    if (latest <= (planCheckSeqs.current.get(id) ?? 0)) return;
+    planCheckSeqs.current.set(id, latest);
+    let state = planCheckRefresh.current;
+    if (!state || state.runId !== id) {
+      state = { runId: id, busy: false, queued: false };
+      planCheckRefresh.current = state;
+    }
+    if (state.busy) { state.queued = true; return; }
+    state.busy = true;
+    const active = state;
+    // Requests are bounded by newly observed sequence numbers, with no retries;
+    // updates during a request share one follow-up. refreshRun retains its own
+    // request lifecycle and generation fence. Navigation cancels queued follow-ups.
+    const refresh = async () => {
+      try { await refreshRun(); } catch {
+        // Best effort, as in useRunStream.refreshRun; a later new event can refresh.
+      } finally {
+        active.busy = false;
+        if (active.queued && currentRunIdRef.current === id && planCheckRefresh.current === active) {
+          active.queued = false;
+          active.busy = true;
+          void refresh();
+        }
+      }
+    };
+    void refresh();
+  }, [id, run?.id, messages, refreshRun]);
   const [incidentalSummary, setIncidentalSummary] = useState<{ runId: string; count: number } | null>(null);
   const findingsRunId = run?.id;
   const findingsTerminal = !!run && isTerminalRun(run.status);
@@ -2549,6 +2624,8 @@ export function RunView() {
         {resumeAnnounce || parkAnnounce}
       </div>
 
+      <IssueInputHistory run={run} />
+
       {error && <Alert message={error} />}
       {actionErr && <Alert message={actionErr} />}
       {/* PRD #1795 D5: a refused plan verdict whose refetch shows the run has left the gate.
@@ -2595,8 +2672,8 @@ export function RunView() {
 
       {/* Issue #754: the pool-empty hold + Resume-now. Ordered ABOVE the usage-limit
           strip deliberately (web-ux should-fix): on a pool_wait run the strip below
-          renders its NON-parked "Wait out future Anthropic usage limits" toggle, and
-          two Anthropic controls stacked let a user read that usage-limit checkbox as
+          renders its NON-parked "Wait out future usage limits" toggle, and
+          two recovery controls stacked let a user read that usage-limit checkbox as
           the way to un-wait the pool hold, which it is not. Putting the pool panel
           first makes the hold read as one self-contained unit (its own Resume-now is
           the action), with the unrelated future-limit toggle clearly beneath it. This
@@ -2607,8 +2684,8 @@ export function RunView() {
 
       {/* Issue #1197: the transient-recovery hold. Ordered here beside PoolWaitPanel and
           above the usage-limit strip for the SAME reason (web-ux): on a recovery_wait run
-          the strip below renders its NON-parked "Wait out future Anthropic usage limits"
-          toggle, and two Anthropic-adjacent controls stacked let a user misread that
+          the strip below renders its NON-parked "Wait out future usage limits"
+          toggle, and two recovery controls stacked let a user misread that
           usage-limit checkbox as the way to un-wait the recovery hold, which it is not.
           RecoveryWaitPanel self-hides on every status but recovery_wait, so it does not
           disturb the limit_wait/pool_wait layouts. It carries no control of its own — the
@@ -2929,6 +3006,8 @@ export function RunView() {
           onCancel={() => cancelRun()}
         />
       )}
+
+      {run.status !== "awaiting_approval" && <PlanCrossCheck run={run} />}
 
       {/* PRD #209 M5: a SEEDED run's plan. It never enters awaiting_approval, so the
           PlanPanel above never renders and run.plan_md has no home on the page. This is

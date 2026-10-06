@@ -13,13 +13,17 @@ Sanitize forge text before printing it with the shared uzi-lander renderer below
 
 Area and priority labels, their rubric, and the labels that must never be renamed: [references/taxonomy.md](references/taxonomy.md). Read it before proposing labels.
 
+Open each issue you present to the maintainer in their browser when you first name it (pick, candidate, predicted sweep pick, or an issue cited as related or fixed): `gh issue view NNN --repo vtmocanu/uzi --web`. Do not reopen one already opened this session.
+
 Out of scope, read instead:
 - Sweep gating and this instance's schedules: `CLAUDE.local.md` → "uzi scheduled jobs", `docs/scheduling.md`, `docs/admin-settings.md#run-eligibility`. Live truth: `uzi schedule list`.
 - Dispatching and plan steering: **uzi-watcher**. Landing the PR: **uzi-lander**.
 
 ## Step 0: Preflight
 
-Run both checks; report results before Step 1.
+Run the checks below; report results before Step 1.
+
+**Skill freshness.** Before live triage, run `git fetch origin main` and compare the working-tree `.agents/skills/issue-triage/` package with `origin/main`. Distinguish a content difference from a command failure. If the checkout is stale, read the current package from `origin/main`, including referenced resources; do not switch branches or overwrite local edits. Report freshness as unverified if fetching fails.
 
 - Run each pipeline with `set -o pipefail` and check its exit status. Empty output after a failure is not an empty result.
 - Never `2>&1` or `2>/dev/null` into `jq`: stderr stays on the terminal (the CLI's version-skew warning breaks `jq`; hiding it hides real errors).
@@ -72,6 +76,7 @@ uzi schedule list --json | jq '.[] | select(.target=="sweep") | {slug: .catalog_
 - An enabled one-shot `target=issue` schedule fires its issue separately; another session may own it. Report it, do not re-triage or re-dispatch it.
 - A pick retried after last fire's run `failed`: read its `failure_reason`. An infra failure (claim/forge) leaves the issue sound.
 - Run Steps 2 to 4 on every predicted pick (independent picks fan out to read-only researchers), then Step 5 for any body fixes. Report a per-fire table: time, sweep, issues, one-line verdict each.
+- Before applying queue changes, predict each affected sweep with the proposed additions using the audit rules above. Name the issues within the cap and those deferred by it. Recompute after applying changes; predictions remain subject to cache freshness and intervening runs.
 
 ## Step 1: Pick
 
@@ -158,7 +163,7 @@ One verdict, one-line reason. Apply only after Step 5 confirmation.
 
 Do not trust issue line numbers.
 
-1. **Premise**: grep the target code. Already implemented → **Already done**.
+1. **Premise**: inspect current code. Already implemented → **Already done**, even if the issue remains open. Search `git log -S`/`--grep` for the mechanism. For a reported recurrence, check whether its tree contains the fix: ancestry (`git merge-base --is-ancestor FIX RECURRENCE`) establishes inclusion, but non-ancestry requires inspecting equivalent cherry-picked or rebased changes before concluding the fix was absent.
 2. **Referenced PR/PRD**: confirm merged (`gh pr view NNN --json state,mergedAt`). Before deferring to, or folding scope into, another issue, confirm that issue is open and its implementation has not landed: inspect its linked PRs and the current code.
 3. **Anchors**: re-grep named symbols; record current locations and omitted/extra sites.
 4. **Design forks**: pin a direction with reason; verify any ADR/PRD conflict against code, not the issue's framing.

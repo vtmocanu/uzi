@@ -22,7 +22,7 @@ import (
 // value); the single 'manual' case is corroborated by the fakeStore param assertion and by
 // the fact its threaded param is the same code path proved for schedule/autopilot here.
 //
-// Coverage — all 13 trigger_source values, by path:
+// Coverage — all 14 trigger_source values, by path:
 //
 //	manual        service CreateRun
 //	schedule      service CreateScheduledRun     (and store CreatePromptRun)
@@ -37,6 +37,7 @@ import (
 //	then_fix      store CreateThenFixRun
 //	judge         store CreateJudgeRun (param "judge")
 //	judge_rerun   store CreateJudgeRun (param "judge_rerun")
+//	cross_check   store CreatePlanCrossCheckChild
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (named OUTSIDE the
 // uzi- namespace, per the store live-DB harness). A package that prints `ok` with PASS=0 is
@@ -212,10 +213,18 @@ func TestTriggerSourceStampedLiveDB(t *testing.T) {
 	})
 	assert(t, "CreateJudgeRun(judge_rerun)", "judge_rerun", r, err)
 
-	// Every one of the 13 CHECK-constraint values must have been asserted by some path.
+	exec(`UPDATE runs SET status='running',worker_id=$2,auto_approve=true,
+        plan_cross_check_required=true,claim_generation=1 WHERE id=$1`, base1, workerID)
+	r, err = q.CreatePlanCrossCheckChild(ctx, store.CreatePlanCrossCheckChildParams{
+		ChildID: uuid.New(), LeadRunID: base1, UserID: userID,
+		WorkerID: tUUID(workerID), ClaimGeneration: 1, BudgetWallSeconds: 1800,
+	})
+	assert(t, "CreatePlanCrossCheckChild", "cross_check", r, err)
+
+	// Every one of the 14 CHECK-constraint values must have been asserted by some path.
 	for _, v := range []string{
 		"manual", "autopilot", "schedule", "self_improve", "ci_fix", "mr_rework",
-		"chat", "task", "task_review", "then_fix", "judge", "judge_rerun", "resume",
+		"chat", "task", "task_review", "then_fix", "judge", "judge_rerun", "resume", "cross_check",
 	} {
 		if !seen[v] {
 			t.Errorf("trigger_source value %q was never asserted by any create path", v)

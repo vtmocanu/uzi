@@ -191,6 +191,9 @@ describe("forge tools — success path wraps every payload as evidence (PRD #158
       .instance._registeredTools;
     const desc = registered.get_issue!.description;
     assert.match(desc, /comment/i, "the get_issue description mentions comments");
+    assert.match(desc, /frozen captured title\/description/);
+    assert.match(desc, /server finds the author eligible/);
+    assert.match(desc, /fixed placeholders and structured reason codes/);
     assert.match(desc, /untrusted evidence/i, "comment bodies are framed as untrusted evidence");
   });
 });

@@ -29,6 +29,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/schedtmpl"
@@ -540,14 +541,15 @@ func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) (Fir
 		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iidCopy, Reason: SkipAlreadyRunning}}}, nil
 	}
 
-	issue, err := f.GetIssue(ctx, repo.ForgeProjectID, iid)
+	capture, err := issueinput.Fetch(ctx, f, repo.ForgeProjectID, iid, repo.BotForgeUserID)
 	if err != nil {
 		// A forge error on an ISSUE target is transient (retry next tick), NOT a recorded
 		// fetch_failed skip — that bucketing is a sweep-only choice (PRD #308). Return the
 		// zero outcome so nothing is recorded for this fire.
 		return FireOutcome{}, fmt.Errorf("get issue %d: %w", iid, err) // transient forge error
 	}
-	return e.createIssueRun(ctx, sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL)
+	issue := capture.Issue
+	return e.createIssueRun(issueinput.WithCapture(ctx, capture), sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL)
 }
 
 // fireSweep resolves the label selector (an empty/NULL selector defaults to the PRD
@@ -747,13 +749,14 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Reason: SkipAlreadyRunning})
 			continue
 		}
-		issue, err := f.GetIssue(ctx, repo.ForgeProjectID, iid)
+		capture, err := issueinput.Fetch(ctx, f, repo.ForgeProjectID, iid, repo.BotForgeUserID)
 		if err != nil {
 			e.logger.Warn("scheduler: sweep fetch issue", "schedule", sched.ID.String(), "issue", iid, "error", err)
 			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Reason: SkipFetchFailed})
 			continue
 		}
-		res, err := e.createIssueRun(ctx, sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL)
+		issue := capture.Issue
+		res, err := e.createIssueRun(issueinput.WithCapture(ctx, capture), sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL)
 		if holdsOnceCredentialDisabled(sched, err) {
 			// PRD #1732 D2: the schedule-wide pin is disabled, so every candidate would be
 			// refused the same way. A one-time sweep that has started nothing yet is held

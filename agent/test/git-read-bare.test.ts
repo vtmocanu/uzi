@@ -168,7 +168,7 @@ describe("GitCache.readBare (PRD #1798 M5)", () => {
       requests.push(request);
       const stdout = new PassThrough();
       stdout.end("hello");
-      return { stdin: null, stdout, stderr: null, completed: Promise.resolve({ code: 0 }) };
+      return { stdin: null, stdout, stderr: null, cancel: async () => {}, completed: Promise.resolve({ code: 0 }) };
     };
     const ac = new AbortController();
     try {

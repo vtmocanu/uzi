@@ -406,6 +406,7 @@ tasks:
       # without one. Its hermetic suite runs first so a gutted check cannot read green.
       - task: test:changelog-entry
       - task: check:changelog-entry
+      - task: test:livedb-skip-guard
       # CI and the baked worker share one SAST engine (#2093): CI installs the
       # worker lock's semgrep, and this fails if CI grows a pin of its own.
       - task: test:semgrep-parity
@@ -957,6 +958,11 @@ tasks:
     desc: hermetic exit-code contract for check:changelog-entry (throwaway git repos, no network), tally-guarded
     cmds:
       - ./scripts/check-changelog-entry.test.sh
+
+  test:livedb-skip-guard:
+    desc: hermetic exit-code contract for the shared LiveDB zero-skip guard (synthetic go test logs, nested skips), tally-guarded
+    cmds:
+      - ./scripts/livedb-skip-guard.test.sh
 
   test:semgrep-parity:
     desc: hermetic CI and worker semgrep parity fixtures, including fail-closed inputs
@@ -2640,6 +2646,46 @@ tasks:
     desc: Opt-in Linux supervisor mechanism characterization
     cmds:
       - python3 -B e2e/codex-m0/supervisor-mechanism.test.py
+
+  test:cross-check-confinement:
+    desc: Required plan checker filesystem confinement and packaged provider/fileop proofs
+    env:
+      UZI_UID_SPLIT: "1"
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=vendor -buildvcs=false
+    cmds:
+      - |
+        set -eu
+        if [ "$(uname -s)" != Linux ]; then
+          echo "NOT RUN: cross-check confinement requires Linux" >&2
+          exit 2
+        fi
+        for prerequisite in go node; do
+          if ! command -v "$prerequisite" >/dev/null; then
+            echo "NOT RUN: missing $prerequisite for confinement proof" >&2
+            exit 2
+          fi
+        done
+        if ! (cd agent && node --import tsx -e ""); then
+          echo "NOT RUN: agent test dependencies unavailable" >&2
+          exit 2
+        fi
+        mkdir -p .uzi/scratch
+        proof_dir="$(mktemp -d .uzi/scratch/cross-check-proof.XXXXXX)"
+        chmod 755 "$proof_dir"
+        proof_dir="$(cd "$proof_dir" && pwd)"
+        trap 'rm -rf "$proof_dir"' EXIT
+        go -C agent/codex/supervisor build -o "$proof_dir/sandbox" ./cmdsandbox
+        go -C agent/codex/supervisor build -o "$proof_dir/supervisor" .
+        go -C agent/codex/supervisor build -o "$proof_dir/fileop" ./fileop
+        export UZI_CROSS_CHECK_SANDBOX="$proof_dir/sandbox"
+        export UZI_CROSS_CHECK_SUPERVISOR="$proof_dir/supervisor"
+        export UZI_CROSS_CHECK_FILEOP="$proof_dir/fileop"
+        export UZI_CROSS_CHECK_CONFINEMENT_REQUIRED=1
+        go -C agent/codex/supervisor test -count=1 ./cmdsandbox -run TestCrossCheck
+        node agent/test/cross-check-confinement-probe.mjs
+        cd agent
+        node --import tsx --test --test-concurrency=1 --test-timeout=120000 test/cross-check-confinement-packaged.probe.ts
 
   test:codex-supervisor:
     desc: Opt-in Linux-only gofmt vet and unit tests for the static Codex process supervisor module

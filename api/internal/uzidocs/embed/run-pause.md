@@ -94,10 +94,10 @@ apart.
 
 A pause (this page) is something *you* asked for; [a usage-limit
 wait](run-limit-wait.md) is something that happened to the run because a
-token it was spending hit its Anthropic rate limit. They look similar — both
-are non-terminal parks that keep the run's session and worker affinity — but
-resolve differently: a usage-limit wait resumes on its own once the window
-resets and gives the run a fresh clock, while a pause only ever resumes when
+provider usage window was exhausted (Claude or Codex subscription). They look
+similar — both are non-terminal parks that keep the run's session and worker affinity — but
+resolve differently: a usage-limit wait resumes on its own after the reset or
+bounded fallback and gives the run a fresh clock, while a pause only ever resumes when
 you ask it to and hands back exactly the budget that was left. If you pause
 a run and it then happens to hit a usage limit before reaching your
 requested boundary, your pause request survives that wait and takes effect

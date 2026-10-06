@@ -1,5 +1,5 @@
 import http from "node:http";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import type { FakePrDescApi, PrDescOp } from "./fake-pr-desc-api.js";
 import type {
@@ -79,7 +79,7 @@ export class FakeApi {
   /** GET response send attempts; a held GET has one more entry than send attempt. */
   readonly inputGetSendAttempts = new Map<string, number>();
   /** Issue #1604: /state reports this run drops (connection destroyed, nothing recorded). */
-  private readonly droppedStates = new Map<string, (body: StateRequest) => boolean>();
+  private readonly droppedStates = new Map<string, { matches: (body: StateRequest) => boolean; beforeDrop?: Promise<void> }>();
   /** Issue #1604: the created_at of each recorded `plan` run_message, with its plan_md, per run. */
   private readonly planFramesByRun = new Map<string, Array<{ at: string; plan_md: unknown }>>();
   /** Issue #1604: runs.stop_kind as CreateStopVerdictInput stamps it (last write wins): a
@@ -230,6 +230,22 @@ export class FakeApi {
   private readonly orphanByRun = new Map<string, { httpStatus: number; identity?: RunOrphanClassificationResponse }>();
   private codexDelayMs = 0;
   private codexResponseOverride: unknown | undefined;
+
+  /** Focused lead-side cross-check transport seam; absent keeps existing fake routes unchanged. */
+  crossCheckHandler?: (request: { runId: string; method: string; body: Record<string, unknown> }) =>
+    Promise<{ status: number; body: unknown; drop?: boolean }> | { status: number; body: unknown; drop?: boolean };
+  /** Hold a pending status response until the owning client's HTTP request aborts. */
+  holdCrossCheckStatusUntilAbort?: (runId: string) => boolean;
+  abortedHeldCrossCheckStatuses = 0;
+  readonly crossCheckRequests: { runId: string; method: string; body: Record<string, unknown> }[] = [];
+  readonly crossCheckReplies: { runId: string; method: string; status: number; acceptedCandidate: boolean; dropped: boolean }[] = [];
+  usageHandler?: () => { status: number; body: unknown };
+  /** Focused receipt fixture: hold a message response until its request is aborted. */
+  holdMessagesUntilAbort?: (runId: string, body: Record<string, unknown>) => boolean;
+  abortedHeldMessages = 0;
+  readonly usageRequests: Record<string, unknown>[] = [];
+  checkedTransport = false;
+  private readonly checkedFencedRuns = new Set<string>();
 
   // --- records -------------------------------------------------------------
   readonly registers: RecordedRegister[] = [];
@@ -614,11 +630,13 @@ export class FakeApi {
 
   /** Issue #1604: drop every /state report for this run matching `matches` (the connection is
    *  destroyed before anything is recorded), modelling a worker that dies before the report lands.
-   *  Returns a function that stops dropping. */
-  dropStatesWhen(runId: string, matches: (body: StateRequest) => boolean): () => void {
-    this.droppedStates.set(runId, matches);
+   *  An optional hold delays destruction of matching requests without committing them.
+   *  Returns a function that stops dropping future requests; already matched requests still drop. */
+  dropStatesWhen(runId: string, matches: (body: StateRequest) => boolean, beforeDrop?: Promise<void>): () => void {
+    const drop = { matches, beforeDrop };
+    this.droppedStates.set(runId, drop);
     return () => {
-      if (this.droppedStates.get(runId) === matches) this.droppedStates.delete(runId);
+      if (this.droppedStates.get(runId) === drop) this.droppedStates.delete(runId);
     };
   }
 
@@ -1162,13 +1180,50 @@ export class FakeApi {
       return sendReceipt(200, { inputs: rows.filter((row) => ids.includes(row.id)).sort((a, b) => a.id - b.id), active, reason });
     }
 
+    if (req.method === "POST" && /^\/api\/worker\/runs\/[^/]+\/usage$/.test(p) && this.usageHandler) {
+      this.usageRequests.push(json);
+      const answer = this.usageHandler();
+      return send(res, answer.status, answer.body);
+    }
+
+    const crossCheckMatch = /^\/api\/worker\/runs\/([^/]+)\/cross-checks(?:\/plan\/1)?$/.exec(p);
+    if (crossCheckMatch && this.crossCheckHandler) {
+      const request = { runId: crossCheckMatch[1]!, method: req.method ?? "", body: json };
+      this.crossCheckRequests.push(request);
+      const reply = (status: number, body: unknown, drop = false): void => {
+        this.crossCheckReplies.push({ ...request, status, dropped: drop,
+          acceptedCandidate: request.method === "POST" && status === 200 &&
+            (body as { result?: string } | null)?.result === "candidate" });
+        if (drop) res.destroy();
+        else send(res, status, body);
+      };
+      if (request.method === "POST" && this.checkedFencedRuns.has(request.runId))
+        return reply(409, { reason: "cross_check_refused" });
+      if (request.method === "GET" && this.holdCrossCheckStatusUntilAbort?.(request.runId)) {
+        await new Promise<void>((resolve) => res.once("close", resolve));
+        this.abortedHeldCrossCheckStatuses++;
+        return;
+      }
+      const answer = await this.crossCheckHandler(request);
+      // A request held across the applied forced gate is fenced under that same row lock.
+      if (request.method === "POST" && this.checkedFencedRuns.has(request.runId))
+        return reply(409, { reason: "cross_check_refused" });
+      return reply(answer.status, answer.body, answer.drop);
+    }
+
     const runMatch =
       /^\/api\/worker\/runs\/([^/]+)\/(messages|state|inputs)$/.exec(p);
     if (runMatch) {
       const runId = runMatch[1] as string;
       const kind = runMatch[2] as string;
-      if (req.method === "POST" && kind === "messages")
+      if (req.method === "POST" && kind === "messages") {
+        if (this.holdMessagesUntilAbort?.(runId, json)) {
+          await new Promise<void>((resolve) => res.once("close", resolve));
+          this.abortedHeldMessages++;
+          return;
+        }
         return this.handleMessages(res, runId, json);
+      }
       if (req.method === "POST" && kind === "state")
         return this.handleState(res, runId, json);
       if (req.method === "GET" && kind === "inputs") {
@@ -1454,7 +1509,9 @@ export class FakeApi {
       return;
     }
     const body = json as unknown as StateRequest;
-    if (this.droppedStates.get(runId)?.(body)) {
+    const drop = this.droppedStates.get(runId);
+    if (drop?.matches(body)) {
+      if (drop.beforeDrop !== undefined) await drop.beforeDrop;
       res.destroy();
       return;
     }
@@ -1548,6 +1605,7 @@ export class FakeApi {
       }
       gateRevision = verdict.revision;
     }
+    if (this.checkedTransport && body.status === "awaiting_approval") this.checkedFencedRuns.add(runId);
     this.states.push({ runId, body });
     this.requestLog.push(`state:${body.status}`);
     this.lastRecordedStatus.set(runId, body.status);
@@ -1584,6 +1642,13 @@ export class FakeApi {
       await after.action;
     }
     send(res, 200, {
+      ...(this.checkedTransport && body.status === "awaiting_approval" ? {
+        claim_generation: body.claim_generation, plan_cross_check_settled: true,
+        lead_last_seq: Math.max(0, ...this.messages(runId).map((m) => m.seq)),
+        current_plan_sha256: createHash("sha256").update(body.plan_md ?? "").digest("hex"),
+        gate_presentation_id: body.presentation_id,
+        gate_payload_digest: createHash("sha256").update(JSON.stringify(this.gateByRun.get(runId)?.snapshot)).digest("hex"),
+      } : {}),
       // PRD #1795 M1 (decision 5): the revision this report was answered with, top-level.
       ...(gateRevision !== undefined ? { gate_revision: gateRevision } : {}),
       run: {

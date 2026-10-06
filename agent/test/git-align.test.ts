@@ -168,7 +168,7 @@ describe("fetchWorkflowTargetTip", () => {
         const stderr = new PassThrough();
         stdout.end(output);
         stderr.end();
-        return { stdin, stdout, stderr, completed: Promise.resolve({ code: 0 }) };
+        return { stdin, stdout, stderr, cancel: async () => {}, completed: Promise.resolve({ code: 0 }) };
       };
       await assert.rejects(git.withBoundaryProcessSpawner(spawner, hard.signal,
         () => git.fetchWorkflowTargetTip(bare, "agent/published"), {
@@ -214,7 +214,7 @@ describe("fetchWorkflowTargetTip", () => {
         const stderr = new PassThrough();
         stdout.end(output);
         stderr.end();
-        return { stdin, stdout, stderr, completed: Promise.resolve({ code }) };
+        return { stdin, stdout, stderr, cancel: async () => {}, completed: Promise.resolve({ code }) };
       };
       const read = () => git.withBoundaryProcessSpawner(spawner, new AbortController().signal,
         () => git.fetchWorkflowTargetTip(bare, "agent/published"));

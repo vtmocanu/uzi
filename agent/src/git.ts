@@ -1784,6 +1784,33 @@ export class GitCache {
     return path.join(this.runnerRoot, repoDir, key);
   }
 
+  /** A report-only checker owns a fresh clone and selects only the immutable candidate SHA. */
+  async runnerCloneAtCommit(barePath: string, baseCommit: string, runId: string): Promise<string> {
+    if (!/^[a-f0-9]{40}$/.test(baseCommit) || !/^[a-zA-Z0-9_-]+$/.test(runId)) {
+      throw new Error("invalid exact-commit checker identity");
+    }
+    return this.withLock(barePath, async () => {
+      const resolved = (await this.runGit(barePath, ["rev-parse", "--verify", `${baseCommit}^{commit}`])).trim();
+      if (resolved !== baseCommit) throw new Error("checker base commit unavailable");
+      const key = `cross-check-${runId}-${randomUUID()}`;
+      const clonePath = this.runnerClonePath(barePath, key);
+      await fs.mkdir(path.dirname(clonePath), { recursive: true });
+      try {
+        await this.runGitAsRunner(undefined, ["clone", "--shared", "--no-checkout", barePath, clonePath]);
+        await this.disableAutoMaintenance(clonePath, true);
+        await this.runGitAsRunner(clonePath, ["checkout", "--detach", baseCommit]);
+        await this.materializeRunnerClone(clonePath, [baseCommit]);
+        const head = (await this.runGitAsRunner(clonePath, ["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+        if (head !== baseCommit) throw new Error("checker checkout does not match candidate base");
+        return clonePath;
+      } catch (err) {
+        await this.removeRunnerClone(clonePath).catch((cleanup) =>
+          this.log.warn("checker clone cleanup failed", { error: gitErrorMessage(cleanup) }));
+        throw err;
+      }
+    });
+  }
+
   /**
    * Seed a RUNNER CLONE for an EXPLICIT branch — the PRD #6 ci_fix targets (a fresh
    * `ci-fix/pipeline-{id}` off the default branch, or an existing `agent/issue-{iid}`
@@ -1872,12 +1899,12 @@ export class GitCache {
    * {@link freeCanonicalClonePath}: a scoped process proof first, then the runner-uid delete, and a
    * same-parent quarantine of whatever the delete could not remove. An attempt seed never uses it.
    *
-   * issue #1769 — `opts.selfContained` (the runner passes `executor.sandboxesCommands === true`,
-   * i.e. Codex, whose command sandbox is fixed at executor construction):
+   * `opts.selfContained` is required for sandboxed commands and planning cross-check
+   * capture, whose object reads must remain within the clone:
    * after every ref/checkpoint step, still under this bare's lock, the clone is dissociated
    * from the bare (materializeRunnerClone), because the Codex command sandbox does not grant
-   * the bare and git there cannot follow the alternate. Default false: the Claude path keeps
-   * the shared clone unchanged. It applies to BOTH seeds: the canonical one and
+   * the bare and planning capture refuses alternates. Default false: ordinary Claude
+   * runs keep the shared clone unchanged. It applies to BOTH seeds: the canonical one and
    * (issue #1783) the per-attempt one on a Docker-wired worker.
    */
   async runnerCloneForBranch(
@@ -3062,7 +3089,7 @@ export class GitCache {
         if ((err as { code?: unknown }).code === 5) return;
         throw err;
       });
-      // issue #1769 — a Codex (selfContained) clone is dissociated from the bare HERE, after
+      // A selfContained clone is dissociated from the bare HERE, after
       // every ref/checkpoint step and still inside this bare's withLock, so no bare maintenance
       // can interleave with the copy. A failure throws RunnerCloneMaterializationError, which
       // fails the run before the executor starts.
@@ -5256,7 +5283,7 @@ export class GitCache {
    * On the bound, the timeout and the abort, the stdout stream is abandoned (destroyed). What
    * that does to the child depends on the spawn path ({@link spawnGit}):
    * - Outside a boundary scope, abandoning the stream kills the child (SIGTERM) at once.
-   * - Inside a boundary scope (withBoundaryProcessSpawner) the handle exposes no kill: abandoning
+   * - Inside a boundary scope (withBoundaryProcessSpawner) this path does not call the handle's cancel(): abandoning
    *   the stream only unpipes and destroys its stdout, so a child that is still writing meets a
    *   closed pipe on its next write and an idle one keeps running. Its termination is then left to
    *   the `timeoutMs` forwarded to the spawner (BoundaryProcessRequest.timeoutMs, whose contract is
@@ -7120,6 +7147,82 @@ export class GitCache {
   }
 
   /**
+   * Capture raw planning bytes as the command identity. Refusals throw; these
+   * bytes still require scanPatchForSecrets before any planning consumer.
+   */
+  async capturePlanningDiff(clonePath: string, baseCommit: string): Promise<Buffer> {
+    const root = path.resolve(this.runnerRoot);
+    if (!path.isAbsolute(clonePath) || path.resolve(clonePath) !== clonePath
+        || !isWithinPath(clonePath, root) || path.dirname(path.dirname(clonePath)) !== root) {
+      throw new Error("planning clone must be <runnerRoot>/<repoDir>/<key>");
+    }
+    if (!/^[a-f0-9]{40}$/.test(baseCommit)) throw new Error("planning base must be immutable 40-hex");
+    return this.readBoundedPlanningOutput(clonePath,
+      [process.execPath, "-e", PLANNING_CAPTURE_HELPER, clonePath, baseCommit, GIT_BIN], 30_000);
+  }
+
+  /**
+   * Transport for the trusted planning reader: argv must never come from clone
+   * configuration. Captured bytes still require a trusted clean secret scan.
+   * Require a whole-root owner rather than a legacy spawn fallback.
+   * @internal Transport for the planning reader; not a source-capture API.
+   */
+  async readBoundedPlanningOutput(
+    cwd: string,
+    argv: readonly string[],
+    timeoutMs = GIT_TIMEOUT_MS,
+  ): Promise<Buffer> {
+    const boundary = this.boundaryProcesses.getStore();
+    if (!boundary) throw new Error("bounded runner stdout requires a trusted boundary spawner");
+    if (!path.isAbsolute(cwd) || !argv[0] || !path.isAbsolute(argv[0])) {
+      throw new Error("bounded runner stdout requires trusted absolute executable and clone cwd");
+    }
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("invalid stdout deadline");
+    if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
+    const env = unmarkedSpawnEnv({ ...gitEnv(), PATH: runnerPath() });
+    const tmp = runnerTmpdir();
+    if (tmp) env.TMPDIR = tmp;
+    const handle = await boundary.spawn({ argv, cwd, env, identity: "command", timeoutMs });
+    // Attach both paused collectors before any further await. An async spawner
+    // may hand us pipes after child_process flushStdio: refuse any prior read.
+    const stop = new AbortController();
+    const stdout = collectBoundedRunnerPipe(handle.stdout, stop.signal);
+    const stderr = collectBoundedRunnerPipe(handle.stderr, stop.signal);
+    const onAbort = (): void => stop.abort(new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE));
+    boundary.signal.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(() => stop.abort(new Error("bounded runner stdout timed out")), timeoutMs);
+    let rejectAbort!: (error: unknown) => void;
+    const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
+    const onStop = (): void => rejectAbort(stop.signal.reason);
+    stop.signal.addEventListener("abort", onStop, { once: true });
+    if (boundary.signal.aborted) onAbort();
+    handle.stdin?.on("error", () => undefined);
+    handle.stdin?.end();
+    const all = Promise.all([stdout.result, stderr.result, handle.completed] as const);
+    try {
+      const [bytes, diagnostic, terminal] = await Promise.race([all, aborted]);
+      if (terminal.code !== 0 || terminal.softTimedOut) throw new Error("bounded runner process failed: " + diagnostic.toString());
+      return bytes;
+    } catch (error) {
+      stop.abort(error);
+      // One cancellation attempt; the trusted owner bounds termination/reap.
+      // A refused cleanup overrides the output error, and no bytes escape.
+      const cleanup = await Promise.allSettled([handle.cancel(), handle.completed]);
+      await Promise.allSettled([stdout.result, stderr.result]);
+      if (cleanup.some((result) => result.status === "rejected")) {
+        throw new Error("bounded runner stdout cleanup failed", { cause: error });
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      boundary.signal.removeEventListener("abort", onAbort);
+      stop.signal.removeEventListener("abort", onStop);
+      stdout.dispose();
+      stderr.dispose();
+    }
+  }
+
+  /**
    * Run a git op as the RUNNER uid (PRD #51 M4) — the runner-clone seed + checkout,
    * which must be runner-owned. NEVER carries a PAT (a local, non-credentialed op), and
    * runs on gitEnv's config pins (safe.directory / hooksPath / M0 code-exec-key pins)
@@ -7379,6 +7482,424 @@ export class GitCache {
   }
 }
 
+/**
+ * Trusted inline runner program, never loaded from the clone. Linux descriptor
+ * traversal is deliberately required. Unsupported indexes/objects fail closed.
+ * Metadata: 2 MiB per Git pipe/index, 20,000 tracked paths, 30,000 entries,
+ * 2,048 directories, depth 64. Patches: 512 KiB total and per diff pipe.
+ * Sources: 4 MiB per worktree file/blob, 128 MiB total including ignore/index,
+ * object-store snapshot and authenticated commit/tree/blob pipe reads, plus one
+ * overflow sentinel byte; 200 nonignored untracked files. Object files (including
+ * packs) may use the remaining aggregate budget, without the 4 MiB file cap.
+ * Copying the entire bounded object store can conservatively refuse large histories.
+ * Patch pipes likewise consume at most 512 KiB total plus one sentinel byte.
+ * One error aborts the entire capture.
+ * Child commands have a 5s deadline; capture has a 30s whole-root deadline.
+ */
+const PLANNING_CAPTURE_HELPER = String.raw`
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawn } = require("node:child_process");
+const { createHash } = require("node:crypto");
+const [clone, base, git] = process.argv.slice(1);
+const C = fs.constants;
+// Linux O_PATH is not exported by every Node build; this helper already uses Linux proc-fd paths.
+const O_PATH = 0x200000;
+const PATCH_LIMIT = 512 * 1024, METADATA_LIMIT = 2 * 1024 * 1024;
+const FILE_LIMIT = 4 * 1024 * 1024, TOTAL_LIMIT = 128 * 1024 * 1024;
+const PATH_LIMIT = 20000, ENTRY_LIMIT = 30000, DIR_LIMIT = 2048, DEPTH_LIMIT = 64;
+let total = 0, entries = 0, dirs = 0, temp, child;
+const fds = new Set();
+const deadline = Date.now() + 28000;
+function check() { if (Date.now() > deadline) throw Error("capture deadline"); }
+function close(fd) { fs.closeSync(fd); fds.delete(fd); }
+function fdpath(fd) { return "/proc/" + process.pid + "/fd/" + fd; }
+function directory(parent, name) {
+  check();
+  const fd = fs.openSync(fdpath(parent) + "/" + name, C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW);
+  fds.add(fd); return fd;
+}
+function pathOnly(p) {
+  check();
+  const fd = fs.openSync(p, O_PATH | C.O_NOFOLLOW);
+  fds.add(fd); return fd;
+}
+function absoluteDirectory(p) {
+  let fd = pathOnly("/");
+  for (const part of p.split("/").filter(Boolean)) {
+    if (part === "." || part === "..") throw Error("unsafe root");
+    const next = pathOnly(fdpath(fd) + "/" + part);
+    if (!fs.fstatSync(next).isDirectory()) throw Error("non-directory root");
+    close(fd); fd = next;
+  }
+  // Ancestors need lookup authority only. Acquire read authority at the pinned checkout.
+  const root = directory(fd, "."); close(fd); return root;
+}
+function components(p) {
+  const parts = p.split("/");
+  if (!p || p.includes("\0") || parts.length > DEPTH_LIMIT + 1 || parts.some(x => !x || x === "." || x === ".." || x.toLowerCase() === ".git")
+      || Buffer.from(p).toString() !== p) throw Error("unsafe path");
+  return parts;
+}
+function openFile(root, p, replacementAbsent = false) {
+  const parts = components(p); let parent = root, owned = false;
+  try {
+    for (const part of parts.slice(0, -1)) {
+      const next = pathOnly(fdpath(parent) + "/" + part);
+      const st = fs.fstatSync(next);
+      if (!st.isDirectory()) {
+        close(next);
+        // Only a pinned regular file proves a former descendant is absent.
+        if (replacementAbsent && st.isFile()) return undefined;
+        throw Error("non-directory source ancestor");
+      }
+      if (owned) close(parent); parent = next; owned = true;
+    }
+    const fd = fs.openSync(fdpath(parent) + "/" + parts.at(-1), C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
+    fds.add(fd);
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) {
+      close(fd);
+      if (replacementAbsent && st.isDirectory()) return undefined;
+      throw Error("nonregular source");
+    }
+    return fd;
+  } finally { if (owned) close(parent); }
+}
+function read(fd, cap) {
+  const before = fs.fstatSync(fd, { bigint: true });
+  if (before.size > BigInt(cap)) throw Error("source cap");
+  const chunks = []; let n = 0;
+  while (n <= cap) {
+    check();
+    const b = Buffer.alloc(Math.min(16384, cap + 1 - n, TOTAL_LIMIT + 1 - total));
+    const got = fs.readSync(fd, b, 0, b.length, null);
+    if (!got) break;
+    n += got; if (n > cap) throw Error("source cap");
+    total += got; if (total > TOTAL_LIMIT) throw Error("total source cap");
+    chunks.push(b.subarray(0, got));
+  }
+  const after = fs.fstatSync(fd, { bigint: true });
+  if (before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs)
+    throw Error("source changed during read");
+  return Buffer.concat(chunks, n);
+}
+function optional(root, p, cap) {
+  let fd;
+  try { fd = openFile(root, p); return read(fd, cap); }
+  catch (e) { if (e.code === "ENOENT") return null; throw e; }
+  finally { if (fd !== undefined) close(fd); }
+}
+function cleanup() {
+  if (temp) fs.rmSync(temp, { recursive: true, force: true });
+  for (const fd of fds) fs.closeSync(fd);
+  fds.clear();
+}
+process.on("SIGTERM", () => {
+  if (child) child.kill("SIGKILL");
+  try { cleanup(); } finally { process.exit(143); }
+});
+const env = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "uzi-no-transport",
+  GIT_ATTR_NOSYSTEM: "1", GIT_OPTIONAL_LOCKS: "0", GIT_EXTERNAL_DIFF: "",
+  GIT_CEILING_DIRECTORIES: "/", GIT_CONFIG_COUNT: "0" };
+function command(args, cap = METADATA_LIMIT, input, allowDiff = false, cwd = temp, extra = {}, source = false) {
+  check();
+  return new Promise((resolve, reject) => {
+    const p = spawn(git, ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+      "-c", "core.attributesFile=/dev/null", "-c", "core.excludesFile=/dev/null",
+      "-c", "core.quotePath=true", "-c", "diff.external=", ...args],
+      { cwd, env: { ...env, ...extra }, stdio: ["pipe", "pipe", "pipe"] });
+    child = p;
+    let error, bytes = 0, errBytes = 0; const chunks = [];
+    const fail = e => {
+      error ||= e; p.kill("SIGKILL");
+      // Overflow stops reads. Destroy both pipes so close/reap settles even
+      // when unread buffered output remains after the child has exited.
+      p.stdout.destroy(); p.stderr.destroy();
+    };
+    function collect(s, stderr) {
+      s.on("readable", () => {
+        try {
+          let n = stderr ? errBytes : bytes;
+          while (!error) {
+            const b = s.read(Math.min(16384, Math.max(1, s.readableLength), cap + 1 - n,
+              source && !stderr ? TOTAL_LIMIT + 1 - total : Infinity));
+            if (b === null) break;
+            n += b.length;
+            if (source && !stderr) {
+              total += b.length;
+              if (total > TOTAL_LIMIT) { fail(Error("total source cap")); break; }
+            }
+            if (stderr) errBytes = n; else bytes = n;
+            if (n > cap) { fail(Error("Git pipe cap")); break; }
+            if (!stderr) chunks.push(b);
+          }
+        } catch (e) { fail(e); }
+      });
+      s.on("error", fail);
+    }
+    collect(p.stdout, false); collect(p.stderr, true);
+    const timer = setTimeout(() => fail(Error("Git deadline")), Math.min(5000, deadline - Date.now()));
+    p.on("error", fail);
+    p.on("close", code => {
+      clearTimeout(timer); child = undefined;
+      if (error) reject(error);
+      else if (code !== 0 && !(allowDiff && code === 1)) reject(Error("Git refused capture"));
+      else resolve(Buffer.concat(chunks, bytes));
+    });
+    p.stdin.on("error", fail); p.stdin.end(input);
+  });
+}
+function paths(bytes) {
+  if (bytes.length && bytes.at(-1) !== 0) throw Error("incomplete path metadata");
+  const text = bytes.toString("utf8");
+  if (!Buffer.from(text).equals(bytes)) throw Error("non UTF8 path metadata");
+  return bytes.length ? text.slice(0, -1).split("\0") : [];
+}
+function indexEntries(bytes) {
+  const result = new Set();
+  if (!bytes) return result;
+  if (bytes.length < 32 || bytes.toString("ascii", 0, 4) !== "DIRC"
+      || ![2, 3].includes(bytes.readUInt32BE(4))) throw Error("unsupported index");
+  const checksum = createHash("sha1").update(bytes.subarray(0, -20)).digest();
+  if (!checksum.equals(bytes.subarray(-20))) throw Error("index checksum");
+  const count = bytes.readUInt32BE(8);
+  if (count > PATH_LIMIT) throw Error("index path cap");
+  let offset = 12;
+  for (let i = 0; i < count; i++) {
+    const start = offset;
+    if (offset + 62 > bytes.length - 20) throw Error("short index");
+    const flags = bytes.readUInt16BE(offset + 60);
+    if (flags & 0x7000) throw Error("unsupported index flags/stage");
+    const end = bytes.indexOf(0, offset + 62);
+    if (end < 0 || end >= bytes.length - 20) throw Error("short index path");
+    const raw = bytes.subarray(offset + 62, end), name = raw.toString("utf8");
+    if (!Buffer.from(name).equals(raw)) throw Error("non UTF8 path");
+    components(name);
+    const mode = bytes.readUInt32BE(start + 24);
+    if (mode !== 0o100644 && mode !== 0o100755) throw Error("unsupported tracked mode");
+    if (result.has(name)) throw Error("duplicate index path");
+    result.add(name);
+    offset = start + Math.ceil((end + 1 - start) / 8) * 8;
+  }
+  // Optional extensions are skipped; required extensions (e.g. split index) refuse.
+  while (offset < bytes.length - 20) {
+    if (offset + 8 > bytes.length - 20 || bytes[offset] < 65 || bytes[offset] > 90)
+      throw Error("unsupported index extension");
+    offset += 8 + bytes.readUInt32BE(offset + 4);
+  }
+  if (offset !== bytes.length - 20) throw Error("short index extension");
+  return result;
+}
+(async () => {
+  const root = absoluteDirectory(clone);
+  const gd = directory(root, ".git"), objects = directory(gd, "objects");
+  const info = directory(objects, "info");
+  // Alternates could redirect base reads outside this clone. Missing objects refuse.
+  if (optional(info, "alternates", 65536) !== null) throw Error("object alternates unsupported");
+  temp = fs.mkdtempSync(path.join(process.env.TMPDIR || "/tmp", "uzi-planning-"));
+  fs.chmodSync(temp, 0o700);
+  await command(["init", "--quiet", "--template=", temp]);
+  // info/attributes has precedence over every captured .gitattributes, including itself.
+  fs.mkdirSync(path.join(temp, ".git/info"), { recursive: true });
+  fs.writeFileSync(path.join(temp, ".git/info/attributes"), "* diff -filter -text -ident -working-tree-encoding\n");
+  const attrNames = ["a/.gitattributes", "b/.gitattributes"];
+  const attributes = await command(["check-attr", "-z", "diff", "filter", "--", ...attrNames]);
+  const expectedAttributes = Buffer.from(attrNames.map(name => name + "\0diff\0set\0" + name + "\0filter\0unset\0").join(""));
+  if (!attributes.equals(expectedAttributes)) throw Error("neutral attributes unavailable");
+  // A directory descriptor pins traversal only: Git can follow links inside it.
+  // Git receives only runner-owned copies, never paths into the mutable clone.
+  const objectStore = path.join(temp, "object-store");
+  fs.mkdirSync(objectStore);
+  function snapshot(fd, dst, depth) {
+    if (++dirs > DIR_LIMIT || depth > DEPTH_LIMIT) throw Error("directory cap");
+    const stream = fs.opendirSync(fdpath(fd), { encoding: "buffer" });
+    try {
+      let ent;
+      while ((ent = stream.readSync())) {
+        check(); if (++entries > ENTRY_LIMIT) throw Error("metadata entry cap");
+        const raw = ent.name, name = raw.toString("utf8");
+        if (!Buffer.from(name).equals(raw)) throw Error("non UTF8 object filename");
+        if (components(name).length !== 1) throw Error("unsafe object filename");
+        const target = path.join(dst, name);
+        if (ent.isDirectory()) {
+          const sub = directory(fd, name);
+          try {
+            fs.mkdirSync(target);
+            snapshot(sub, target, depth + 1);
+          } finally { close(sub); }
+        } else {
+          const src = openFile(fd, name);
+          try { fs.writeFileSync(target, read(src, TOTAL_LIMIT - total), { flag: "wx", mode: 0o600 }); }
+          finally { close(src); }
+        }
+      }
+    } finally { stream.closeSync(); }
+  }
+  snapshot(objects, objectStore, 0);
+  // Check the owned snapshot as well: alternates could have appeared during copying.
+  for (const name of ["alternates", "http-alternates"]) {
+    if (fs.existsSync(path.join(objectStore, "info", name))) throw Error("object alternates unsupported");
+  }
+  const objectEnv = { GIT_OBJECT_DIRECTORY: objectStore };
+  async function object(type, oid, cap) {
+    if (!/^[0-9a-f]{40}$/.test(oid)) throw Error("invalid object identity");
+    const description = (await command(["cat-file", "--batch-check=%(objecttype) %(objectsize)"],
+      METADATA_LIMIT, oid + "\n", false, temp, objectEnv)).toString();
+    const match = /^(commit|tree|blob) (0|[1-9][0-9]*)\n$/.exec(description);
+    if (!match || match[1] !== type) throw Error("base object type mismatch");
+    const size = Number(match[2]);
+    if (!Number.isSafeInteger(size) || size > cap || total + size > TOTAL_LIMIT)
+      throw Error("base source cap");
+    const bytes = await command(["cat-file", type, oid], size, undefined, false, temp, objectEnv, true);
+    if (bytes.length !== size || createHash("sha1").update(type + " " + bytes.length + "\0")
+        .update(bytes).digest("hex") !== oid) throw Error("base object integrity mismatch");
+    return bytes;
+  }
+  const commit = await object("commit", base, METADATA_LIMIT);
+  const treeHeader = /^tree ([0-9a-f]{40})\n/.exec(commit.subarray(0, 46).toString("ascii"));
+  if (!treeHeader || !commit.subarray(0, 46).equals(Buffer.from(treeHeader[0]))) throw Error("invalid base commit tree");
+  const old = new Map();
+  let treeBytes = 0;
+  async function tree(oid, prefix, depth) {
+    if (++dirs > DIR_LIMIT || depth > DEPTH_LIMIT) throw Error("directory cap");
+    const bytes = await object("tree", oid, METADATA_LIMIT - treeBytes);
+    treeBytes += bytes.length;
+    let at = 0, prior = null;
+    const names = new Set();
+    while (at < bytes.length) {
+      check(); if (++entries > ENTRY_LIMIT) throw Error("metadata entry cap");
+      const space = bytes.indexOf(32, at), end = bytes.indexOf(0, at);
+      if (space < at || end <= space || end + 21 > bytes.length) throw Error("invalid base tree");
+      const mode = bytes.toString("ascii", at, space);
+      if (!["40000", "100644", "100755"].includes(mode)
+          || !bytes.subarray(at, space).equals(Buffer.from(mode))) throw Error("unsupported base mode");
+      const raw = bytes.subarray(space + 1, end), name = raw.toString("utf8");
+      if (!Buffer.from(name).equals(raw)) throw Error("non UTF8 path metadata");
+      if (components(name).length !== 1 || names.has(name)) throw Error("invalid base tree name");
+      names.add(name);
+      const key = Buffer.concat([raw, Buffer.from(mode === "40000" ? "/" : "\0")]);
+      if (prior && Buffer.compare(prior, key) >= 0) throw Error("noncanonical base tree");
+      prior = key;
+      const childOid = bytes.subarray(end + 1, end + 21).toString("hex");
+      at = end + 21;
+      const rel = prefix + name; components(rel);
+      if (mode === "40000") await tree(childOid, rel + "/", depth + 1);
+      else {
+        old.set(rel, { mode: parseInt(mode, 8), oid: childOid });
+        if (old.size > PATH_LIMIT) throw Error("base path cap");
+      }
+    }
+  }
+  await tree(treeHeader[1], "", 0);
+
+  const ixfd = (() => { try { return openFile(gd, "index"); } catch (e) { if (e.code === "ENOENT") return null; throw e; } })();
+  let ix = null;
+  if (ixfd !== null) {
+    try { ix = read(ixfd, METADATA_LIMIT); } finally { close(ixfd); }
+  }
+  const indexed = indexEntries(ix);
+  const tracked = new Set([...old.keys(), ...indexed.keys()]);
+  if (tracked.size > PATH_LIMIT) throw Error("tracked path cap");
+  const trackedParents = new Set();
+  for (const name of tracked) {
+    let end = name.lastIndexOf("/");
+    while (end !== -1) {
+      trackedParents.add(name.slice(0, end));
+      end = name.lastIndexOf("/", end - 1);
+    }
+  }
+  const candidates = new Set(tracked), untracked = [];
+  const exclude = optional(gd, "info/exclude", 65536);
+  if (exclude) {
+    fs.mkdirSync(path.join(temp, ".git/info"), { recursive: true });
+    fs.writeFileSync(path.join(temp, ".git/info/exclude"), exclude);
+  }
+  async function walk(fd, prefix, depth) {
+    if (++dirs > DIR_LIMIT || depth > DEPTH_LIMIT) throw Error("directory cap");
+    const ignore = optional(fd, ".gitignore", 65536);
+    if (ignore) {
+      const dst = path.join(temp, prefix, ".gitignore");
+      fs.mkdirSync(path.dirname(dst), { recursive: true }); fs.writeFileSync(dst, ignore);
+    }
+    const directoryStream = fs.opendirSync(fdpath(fd), { encoding: "buffer" });
+    const names = [];
+    try {
+      let ent;
+      while ((ent = directoryStream.readSync())) {
+        check(); if (++entries > ENTRY_LIMIT) throw Error("metadata entry cap");
+        const raw = ent.name, name = raw.toString("utf8");
+        if (!Buffer.from(name).equals(raw)) throw Error("non UTF8 filename");
+        if (name.toLowerCase() === ".git") continue;
+        const rel = prefix + name; components(rel);
+        names.push({ name, rel, dir: ent.isDirectory() });
+      }
+    } finally { directoryStream.closeSync(); }
+    const queries = names.map(x => x.rel + (x.dir ? "/" : ""));
+    const queryBytes = Buffer.from(queries.join("\0") + (queries.length ? "\0" : ""));
+    if (queryBytes.length > METADATA_LIMIT) throw Error("ignore query cap");
+    const ignored = new Set(paths(await command(["check-ignore", "--no-index", "-z", "--stdin"],
+      METADATA_LIMIT, queryBytes, true)));
+    for (const item of names) {
+      check();
+      const needed = tracked.has(item.rel) || trackedParents.has(item.rel);
+      if (ignored.has(item.rel + (item.dir ? "/" : "")) && !needed) continue;
+      if (item.dir) {
+        const sub = directory(fd, item.name);
+        try { await walk(sub, item.rel + "/", depth + 1); } finally { close(sub); }
+      } else if (!tracked.has(item.rel)) {
+        untracked.push(item.rel);
+        if (untracked.length > 200) throw Error("untracked path cap");
+      }
+    }
+  }
+  await walk(root, "", 0);
+  for (const name of untracked) candidates.add(name);
+  let patchBytes = 0;
+  for (const name of candidates) {
+    check();
+    let fd, content = null, mode = 0o100644;
+    const previous = old.get(name);
+    try {
+      try { fd = openFile(root, name, true); } catch (e) { if (e.code !== "ENOENT") throw e; }
+      if (fd !== undefined) {
+        const st = fs.fstatSync(fd, { bigint: true });
+        mode = st.mode & 0o111n ? 0o100755 : 0o100644;
+        // The mutable index identifies paths only; current bytes must always be read.
+        content = read(fd, FILE_LIMIT);
+      }
+    } finally { if (fd !== undefined) close(fd); }
+    if (!previous && content === null) continue;
+    if (previous && content !== null && previous.mode === mode
+        && createHash("sha1").update("blob " + content.length + "\0").update(content).digest("hex") === previous.oid) continue;
+    let before = null;
+    if (previous) {
+      before = await object("blob", previous.oid, FILE_LIMIT);
+    }
+    // Git's binary sample convention, before creating any diff inputs.
+    if ((before && before.subarray(0, 8000).includes(0)) || (content && content.subarray(0, 8000).includes(0))) continue;
+    for (const [side, bytes, fileMode] of [["a", before, previous?.mode], ["b", content, mode]]) {
+      if (bytes === null) continue;
+      const dst = path.join(temp, side, name);
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      fs.writeFileSync(dst, bytes, { mode: fileMode & 0o777 });
+    }
+    // Captured attributes are ordinary diff inputs; neutral info/attributes overrides them.
+    const patch = await command(["diff", "--no-index", "--no-ext-diff", "--no-textconv",
+      "--no-renames", "--src-prefix=", "--dst-prefix=", "--",
+      before === null ? "/dev/null" : "a/" + name, content === null ? "/dev/null" : "b/" + name],
+      PATCH_LIMIT - patchBytes, undefined, true);
+    patchBytes += patch.length;
+    if (patchBytes > PATCH_LIMIT) throw Error("patch cap");
+    if (!process.stdout.write(patch)) await new Promise(resolve => process.stdout.once("drain", resolve));
+    for (const side of ["a", "b"]) fs.rmSync(path.join(temp, side), { recursive: true, force: true });
+  }
+})().then(() => { cleanup(); }, (error) => {
+  try { cleanup(); } finally { process.stderr.write(String(error.stack)); process.exitCode = 1; }
+});
+`;
+
 function withDir(cwd: string | undefined, args: string[]): string[] {
   return cwd ? ["-C", cwd, ...args] : args;
 }
@@ -7390,6 +7911,78 @@ function commandCwd(args: readonly string[]): string {
     throw new Error("permit-held runner git requires an absolute -C worktree");
   }
   return cwd;
+}
+
+/**
+ * Paused byte-mode consumption: read at most 512 KiB plus one overflow sentinel
+ * per pipe. No flowing collector or truncation of an already-read large chunk.
+ */
+function collectBoundedRunnerPipe(stream: Readable | null, signal: AbortSignal): {
+  result: Promise<Buffer>;
+  dispose: () => void;
+} {
+  const cap = 512 * 1024;
+  let dispose = (): void => {};
+  const result = new Promise<Buffer>((resolve, reject) => {
+    if (!stream) { reject(new Error("bounded runner process has no output pipe")); return; }
+    let bytes = 0;
+    let settled = false;
+    const chunks: Buffer[] = [];
+    const fail = (error: unknown): void => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    const drain = (): void => {
+      if (settled) return;
+      try {
+        while (!settled) {
+          const size = Math.min(16 * 1024, Math.max(1, stream.readableLength), cap + 1 - bytes);
+          const chunk: unknown = stream.read(size);
+          if (chunk === null) break;
+          if (!Buffer.isBuffer(chunk) || chunk.length > size) {
+            throw new Error("bounded runner output is not a byte pipe");
+          }
+          bytes += chunk.length;
+          if (bytes > cap) throw new Error("bounded runner stdout exceeded 512 KiB");
+          chunks.push(chunk);
+        }
+      } catch (error) { fail(error); }
+    };
+    const end = (): void => {
+      if (settled) return;
+      drain();
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks, bytes));
+    };
+    const close = (): void => {
+      if (!stream.readableEnded) fail(new Error("bounded runner output closed before end"));
+      else end();
+    };
+    const abort = (): void => fail(signal.reason);
+    stream.pause();
+    stream.on("readable", drain);
+    stream.on("end", end);
+    stream.on("close", close);
+    // Keep the error listener until whole-root cleanup, even after overflow.
+    stream.on("error", fail);
+    signal.addEventListener("abort", abort, { once: true });
+    dispose = (): void => {
+      stream.removeListener("readable", drain);
+      stream.removeListener("end", end);
+      stream.removeListener("close", close);
+      stream.removeListener("error", fail);
+      signal.removeEventListener("abort", abort);
+    };
+    if (stream.readableDidRead || stream.errored || stream.readableObjectMode || stream.readableEncoding) {
+      fail(new Error("bounded runner output was consumed or is not a fresh byte pipe"));
+    } else if (stream.readableEnded) end();
+    else if (stream.destroyed) close();
+    else drain();
+    if (signal.aborted) abort();
+  });
+  return { result, dispose: () => dispose() };
 }
 
 export function resolveBoundaryExecutable(command: string): string {

@@ -77,7 +77,7 @@ const PLAN_BASE = {
 
 describe("buildPlanPrompt environment facts", () => {
   it("is byte-identical without facts and with all-ok facts", () => {
-    assert.equal(buildPlanPrompt({ ...PLAN_BASE, environmentFacts: ALL_OK }), buildPlanPrompt(PLAN_BASE));
+    assert.equal(buildPlanPrompt({ ...PLAN_BASE, environmentFacts: ALL_OK }).replace(/issue_context_[0-9a-f]+/g, "issue_context_NONCE"), buildPlanPrompt(PLAN_BASE).replace(/issue_context_[0-9a-f]+/g, "issue_context_NONCE"));
   });
   it("renders the block after the deps note when a limit exists", () => {
     const facts: EnvFacts = { ...ALL_OK, proc: "limited" };
@@ -85,7 +85,7 @@ describe("buildPlanPrompt environment facts", () => {
     const block = buildEnvironmentFactsBlock(facts);
     assert.ok(p.includes(`\n\n${block}\n\n`));
     const without = buildPlanPrompt(PLAN_BASE);
-    assert.equal(p.replace(`\n\n${block}`, ""), without);
+    assert.equal(p.replace(`\n\n${block}`, "").replace(/issue_context_[0-9a-f]+/g, "issue_context_NONCE"), without.replace(/issue_context_[0-9a-f]+/g, "issue_context_NONCE"));
   });
 });
 

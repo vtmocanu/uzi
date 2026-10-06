@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -206,40 +207,22 @@ func (s *Service) validateFinalizeResume(wkr store.Worker, snap *ActiveSnapshot)
 	return out, true
 }
 
-// ReplaceWorkerActiveRuns validates a worker's active-run snapshot and, when valid, applies it
-// atomically inside the caller's transaction (PRD #1390 M2a). qtx MUST be a transaction-bound
-// *store.Queries — the function issues several statements that are only correct together.
-//
-// Returns (applied, err): applied reports whether rows/leases were written. In heartbeat and
-// register mode an invalid snapshot returns (false, nil) with a warning and touches nothing; in
-// claim mode it returns (false, ErrActiveSnapshotInvalid). A real DB error is returned verbatim
-// (a 500), never swallowed.
-func (s *Service) ReplaceWorkerActiveRuns(ctx context.Context, qtx *store.Queries, wkr store.Worker, snap *ActiveSnapshot, mode snapshotMode) (bool, error) {
+// normalizeActiveSnapshot only validates wire input; it performs no database reads or writes.
+func normalizeActiveSnapshot(p Params, wkr store.Worker, snap *ActiveSnapshot, mode snapshotMode) ([]validatedEntry, string) {
 	if snap == nil {
-		return false, nil
+		return nil, ""
 	}
-	// invalid returns the mode-appropriate (applied, err): ignore for heartbeat/register, a
-	// sentinel error for claim. The warning names the worker and the reason so an operator can
-	// see a persistently-rejected snapshot without a debugger.
-	invalid := func(reason string) (bool, error) {
-		slog.Warn("active snapshot rejected", "worker_id", wkr.ID.String(), "mode", mode, "reason", reason)
-		if mode == snapshotModeClaim {
-			return false, ErrActiveSnapshotInvalid
-		}
-		return false, nil
-	}
-
 	// Nonce (heartbeat/claim only; register is nonce-exempt). A snapshot whose nonce is not the
 	// worker's CURRENT one is discarded — this is what makes a delayed high-epoch snapshot from a
 	// previous worker process (whose nonce the register rotated away) rejected across an api
 	// restart, when the epoch alone could not.
 	if mode != snapshotModeRegister {
 		if !wkr.SnapshotRegisterNonce.Valid || snap.RegisterNonce != wkr.SnapshotRegisterNonce.String {
-			return invalid("register nonce mismatch")
+			return nil, "register nonce mismatch"
 		}
 		// Epoch must strictly advance (equal or older is a stale/duplicate capture).
 		if snap.SnapshotEpoch <= wkr.SnapshotEpoch {
-			return invalid("stale snapshot epoch")
+			return nil, "stale snapshot epoch"
 		}
 	}
 
@@ -251,16 +234,16 @@ func (s *Service) ReplaceWorkerActiveRuns(ctx context.Context, qtx *store.Querie
 	for _, e := range snap.Active {
 		id, perr := uuid.Parse(e.RunID)
 		if perr != nil {
-			return invalid("entry run_id is not a uuid")
+			return nil, "entry run_id is not a uuid"
 		}
 		if e.ClaimGeneration < 0 {
-			return invalid("entry claim_generation is negative")
+			return nil, "entry claim_generation is negative"
 		}
 		if !snapshotPhases[e.Phase] {
-			return invalid("entry phase is not in the allowed set")
+			return nil, "entry phase is not in the allowed set"
 		}
 		if seen[id] {
-			return invalid("duplicate run_id in snapshot")
+			return nil, "duplicate run_id in snapshot"
 		}
 		seen[id] = true
 		if e.TerminalPending {
@@ -279,20 +262,74 @@ func (s *Service) ReplaceWorkerActiveRuns(ctx context.Context, qtx *store.Querie
 	// Caps: total under the absolute server ceiling; live under max_concurrent_runs + 2 (live
 	// slots plus judge/review headroom); pending under the outbox quota. A worker that never
 	// advertised its concurrency cap has no per-type live cap — the total ceiling still bounds it.
-	if len(entries) > s.p.ActiveSnapshotMaxEntries {
-		return invalid("snapshot exceeds the absolute entry ceiling")
+	if len(entries) > p.ActiveSnapshotMaxEntries {
+		return nil, "snapshot exceeds the absolute entry ceiling"
 	}
-	liveCap := s.p.ActiveSnapshotMaxEntries
+	liveCap := p.ActiveSnapshotMaxEntries
 	if wkr.MaxConcurrentRuns.Valid {
 		liveCap = int(wkr.MaxConcurrentRuns.Int32) + 2
 	}
 	if liveCount > liveCap {
-		return invalid("snapshot exceeds the live-entry cap")
+		return nil, "snapshot exceeds the live-entry cap"
 	}
-	if pendingCount > s.p.WorkerOutboxMaxPending {
-		return invalid("snapshot exceeds the pending-entry cap")
+	if pendingCount > p.WorkerOutboxMaxPending {
+		return nil, "snapshot exceeds the pending-entry cap"
 	}
 
+	return entries, ""
+}
+
+func (s *Service) validatedActiveSnapshot(wkr store.Worker, snap *ActiveSnapshot, mode snapshotMode) ([]validatedEntry, bool, error) {
+	entries, reason := normalizeActiveSnapshot(s.p, wkr, snap, mode)
+	if reason != "" {
+		slog.Warn("active snapshot rejected", "worker_id", wkr.ID.String(), "mode", mode, "reason", reason)
+		if mode == snapshotModeClaim {
+			return nil, false, ErrActiveSnapshotInvalid
+		}
+		return nil, false, nil
+	}
+	return entries, snap != nil, nil
+}
+
+// ReplaceWorkerActiveRuns validates a worker's active-run snapshot and, when valid, applies it
+// atomically inside the caller's transaction (PRD #1390 M2a). qtx MUST be a transaction-bound
+// *store.Queries — the function issues several statements that are only correct together.
+//
+// Returns (applied, err): applied reports whether rows/leases were written. In heartbeat and
+// register mode an invalid snapshot returns (false, nil) with a warning and touches nothing; in
+// claim mode it returns (false, ErrActiveSnapshotInvalid). A real DB error is returned verbatim
+// (a 500), never swallowed.
+// ReplaceWorkerActiveRuns is the compatibility entrypoint for a provided transaction.
+// It acquires the worker row itself and uses the same frozen ledger as production callers.
+func (s *Service) ReplaceWorkerActiveRuns(ctx context.Context, qtx *store.Queries, wkr store.Worker, snap *ActiveSnapshot, mode snapshotMode) (bool, error) {
+	if snap == nil {
+		return false, nil
+	}
+	locked, err := qtx.GetWorkerForUpdate(ctx, wkr.ID)
+	if err != nil {
+		return false, err
+	}
+	entries, valid, err := s.validatedActiveSnapshot(locked, snap, mode)
+	if err != nil || !valid {
+		return false, err
+	}
+	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, validatedFinalizeResume{})
+	if err != nil {
+		return false, err
+	}
+	return s.applyWorkerActiveSnapshot(ctx, qtx, locked, snap, mode, entries, locks)
+}
+
+func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Queries, wkr store.Worker, snap *ActiveSnapshot, mode snapshotMode, entries []validatedEntry, locks workerRecoveryLockSet) (bool, error) {
+	frozen, parents, err := locks.parameters()
+	if err != nil {
+		return false, err
+	}
+	if _, err := qtx.LockFrozenWorkerSnapshotRuns(ctx, store.LockFrozenWorkerSnapshotRunsParams{
+		WorkerID: pgconv.UUID(wkr.ID), RunIds: validatedSnapshotIDs(entries), FrozenTargets: frozen, LockedParentIds: parents,
+	}); err != nil {
+		return false, err
+	}
 	// ---- Apply (validated) --------------------------------------------------
 	// TerminalPendingLease is a small bounded config duration (env TERMINAL_PENDING_LEASE); its
 	// whole seconds never come near the int32 range, so the truncation is safe.
@@ -346,7 +383,8 @@ func (s *Service) ReplaceWorkerActiveRuns(ctx context.Context, qtx *store.Querie
 		if p, ok := prior[e.runID]; ok && e.terminalPending && p.gen == e.claimGeneration && p.since.Valid {
 			pendingSince = p.since
 		}
-		rows, err := qtx.UpsertWorkerActiveRun(ctx, store.UpsertWorkerActiveRunParams{
+		rows, err := qtx.UpsertFrozenWorkerActiveRun(ctx, store.UpsertFrozenWorkerActiveRunParams{
+			FrozenTargets: frozen, LockedParentIds: parents,
 			WorkerID:        wkr.ID,
 			RunID:           e.runID,
 			ClaimGeneration: e.claimGeneration,
@@ -360,9 +398,9 @@ func (s *Service) ReplaceWorkerActiveRuns(ctx context.Context, qtx *store.Querie
 			return false, err
 		}
 		if rows == 0 {
-			// The run is not owned by this worker — a worker can only describe its own runs, so
-			// the entry is DROPPED (never persisted, never leased) and logged, not an error.
-			slog.Warn("active snapshot entry dropped: run not owned by worker",
+			// UpsertFrozenWorkerActiveRun rejected ownership or frozen identity drift.
+			// The entry is not persisted or leased; log without further discovery.
+			slog.Warn("active snapshot entry dropped: ownership or frozen identity changed",
 				"worker_id", wkr.ID.String(), "run_id", e.runID.String())
 		}
 	}

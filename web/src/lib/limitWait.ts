@@ -1,5 +1,5 @@
 // PRD #35 (usage-limit park): the pure half of every web surface for a run parked
-// on an Anthropic usage limit — the window vocabulary, the resume countdown, and
+// on a usage limit — the window vocabulary, the resume countdown, and
 // the per-run toggle's inertness rule. Framework-free and unit-tested in isolation,
 // the same split runBadge.ts uses and for the same reason: RunView needs routing, a
 // live stream and a dozen API mocks to mount, so logic left inside it is only ever
@@ -31,6 +31,30 @@
 
 import { isTerminalRun } from "./api";
 import { stripUnsafeChars } from "./safeText";
+
+// Only these stored harness values name a provider; missing or unknown context
+// stays neutral and never echoes a worker payload or a raw harness value.
+export function usageLimitLabel(harness: unknown): string {
+  switch (harness) {
+    case "codex":
+      return "Codex usage limit";
+    case "claude":
+      return "Anthropic usage limit";
+    default:
+      return "Usage limit";
+  }
+}
+
+export function usageLimitPhrase(harness: unknown): string {
+  switch (harness) {
+    case "codex":
+      return "a Codex usage limit";
+    case "claude":
+      return "an Anthropic usage limit";
+    default:
+      return "a usage limit";
+  }
+}
 
 /**
  * The SDK's `SDKRateLimitInfo.rateLimitType` vocabulary, plus the server's

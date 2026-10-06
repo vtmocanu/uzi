@@ -40,7 +40,7 @@ func pauseFrameRuns() []struct {
 	}{
 		{"paused", paused, []string{"paused by you"}},
 		{"running with pending pause", pending, []string{"pause requested"}},
-		{"limit_wait with pending pause", limit, []string{"waiting: Anthropic usage limit", "pause requested"}},
+		{"limit_wait with pending pause", limit, []string{"waiting: usage limit", "pause requested"}},
 		{"vault park with pending pause", vault, []string{"waiting for vault unlock", "pause requested"}},
 		{"credential_disabled hold", cred, []string{"waiting: credential disabled"}},
 	}

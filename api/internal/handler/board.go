@@ -108,9 +108,10 @@ type cardDTO struct {
 // no second listRuns fan-in. OwnerName drives the "started by X" treatment;
 // IsMine gates the run-view link (a non-owner would 403 on GetRunByIDForUser).
 type latestRunDTO struct {
-	ID     string `json:"id"`
-	Status string `json:"status"`
-	MrIID  *int64 `json:"mr_iid"`
+	AutoApproveBlockedReasons []string `json:"auto_approve_blocked_reasons"`
+	ID                        string   `json:"id"`
+	Status                    string   `json:"status"`
+	MrIID                     *int64   `json:"mr_iid"`
 	// MrWebURL is the forge-supplied merge/pull-request web URL persisted by the
 	// worker at MR creation (PRD #65 D8), null on rows created before it landed —
 	// the web renders it directly (through isHttpsUrl) and falls back to the legacy
@@ -203,7 +204,8 @@ func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iteratio
 		Health:      health,
 		HealthSince: timePtr(healthSince.Valid, healthSince.Time),
 		// PRD #1497 M1: the paused-run hold class, so the board badge can render a wall park.
-		HoldReason: textPtrValue(holdReason.Valid, holdReason.String),
+		HoldReason:                textPtrValue(holdReason.Valid, holdReason.String),
+		AutoApproveBlockedReasons: []string{},
 		// PRD #1170: the wall-clock deadline the near-timeout badge counts down to; nil
 		// for a run with no wall deadline (not running, chat/judge/interactive, no start).
 		DeadlineAt: workersvc.RunDeadline(startedAt, budgetWallSeconds, budgetPausedSeconds, kind, interactive, status, globalTimeout, budgetExtensionSeconds, budgetFinalizeSeconds),
@@ -639,6 +641,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 			rr.MrState, rr.FailureReason, rr.StopKind, rr.StopReason, rr.Health, rr.HealthReason, rr.HealthSince, rr.HoldReason,
 			rr.StartedAt, rr.FirstStartedAt, rr.FinishedAt, rr.BudgetWallSeconds, rr.BudgetPausedSeconds, rr.BudgetExtensionSeconds, rr.BudgetFinalizeSeconds, rr.Interactive,
 			rr.OwnerName, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID, globalTimeout)
+		dto.AutoApproveBlockedReasons = nonNilStrings(rr.AutoApproveBlockedReasons)
 		dto.IsRevising = revising[rr.ID] // nil map ⇒ false (issue #750)
 		latestByIID[rr.IssueIid.Int64] = dto
 	}
@@ -1042,6 +1045,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 			lr.MrState, lr.FailureReason, lr.StopKind, lr.StopReason, lr.Health, lr.HealthReason, lr.HealthSince, lr.HoldReason,
 			lr.StartedAt, lr.FirstStartedAt, lr.FinishedAt, lr.BudgetWallSeconds, lr.BudgetPausedSeconds, lr.BudgetExtensionSeconds, lr.BudgetFinalizeSeconds, lr.Interactive,
 			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID, h.cfg.RunTimeout)
+		card.LatestRun.AutoApproveBlockedReasons = nonNilStrings(lr.AutoApproveBlockedReasons)
 		h.setLatestRunRevising(r.Context(), card.LatestRun, lr.ID) // issue #750
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for moved card", "error", err)
@@ -1150,6 +1154,7 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 			lr.MrState, lr.FailureReason, lr.StopKind, lr.StopReason, lr.Health, lr.HealthReason, lr.HealthSince, lr.HoldReason,
 			lr.StartedAt, lr.FirstStartedAt, lr.FinishedAt, lr.BudgetWallSeconds, lr.BudgetPausedSeconds, lr.BudgetExtensionSeconds, lr.BudgetFinalizeSeconds, lr.Interactive,
 			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID, h.cfg.RunTimeout)
+		card.LatestRun.AutoApproveBlockedReasons = nonNilStrings(lr.AutoApproveBlockedReasons)
 		h.setLatestRunRevising(r.Context(), card.LatestRun, lr.ID) // issue #750
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for promoted card", "error", err)

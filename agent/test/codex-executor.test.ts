@@ -8,7 +8,9 @@ import { symlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { CodexSessionStore } from "../src/codex/session-state.js";
+import { fakeGitlab } from "./runner-harness.js";
 import { realProcfsSkip } from "./real-procfs.js";
 
 const HAS_PROCFS = process.platform === "linux";
@@ -66,7 +68,7 @@ import { makeRedactor, makeTextRedactor } from "../src/redact.js";
 import { MessageBatcher } from "../src/batcher.js";
 import { MAX_PROJECTED_BYTES } from "../src/codex/projection.js";
 import type { OutgoingMessage } from "../src/protocol.js";
-import { CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
+import { createCodexTransport, CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
 import type { RunContext, EmittedMessage, Executor, WallParkOutcome, SecretRemediationDecision } from "../src/executor.js";
 import { PauseNowSignal } from "../src/steering.js";
 import { scanSignals } from "../src/signals.js";
@@ -830,6 +832,294 @@ describe("CodexExecutor: dark selection seam (the makeExecutor decision)", () =>
       // No model work: FailClosedExecutor never touches a harness/registry — it throws only.
     }
   });
+});
+
+describe("Codex usage-limit sticky interruption precedence #2360", () => {
+  for (const mode of ["cancel", "pause"] as const) it(mode, async () => {
+    const controller = new AbortController();
+    let armed = false;
+    let fired = false;
+    let onPause: (() => void) | undefined;
+    const remove = controller.signal.removeEventListener.bind(controller.signal);
+    controller.signal.removeEventListener = ((...args: Parameters<AbortSignal["removeEventListener"]>) => {
+      remove(...args);
+      if (armed && !fired) {
+        fired = true;
+        if (mode === "pause") onPause?.();
+      }
+    }) as AbortSignal["removeEventListener"];
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        armed = true;
+        c.transport.push({ kind: "rate_limits_updated", method: "account/rateLimits/updated",
+          rateLimits: { primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: 2000000000 } }, params: {} });
+        c.transport.push({ ...turnCompleted("failed"), params: { threadId: "th-1",
+          turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "usageLimitExceeded" } } } });
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    let parks = 0;
+    const { ctx } = makeCtx({
+      signal: controller.signal, cancelRequested: () => mode === "cancel" && fired,
+      pauseModeRequested: () => mode === "pause" && fired ? "now" : null,
+      onPauseNow: cb => { onPause = cb; },
+      parkForPause: async () => { parks++; return true; },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    if (mode === "cancel") await assert.rejects(running, { message: "run cancelled" });
+    else {
+      const result = await running;
+      assert.ok(result.pausedAt);
+      assert.equal(parks, 1);
+    }
+    assert.equal(fired, true);
+    assert.equal(rig.transport.turnStartCount, 1);
+  });
+});
+
+describe("Codex usage-limit wall and vault precedence #2360", () => {
+  it("spent wall after decoded limit terminal parks for wall", async () => {
+    const realNow = Date.now.bind(Date);
+    let skew = 0;
+    let fired = false;
+    const controller = new AbortController();
+    mock.method(Date, "now", () => realNow() + skew);
+    try {
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          // Spend the armed turn budget before its finally block debits elapsed time.
+          fired = true;
+          skew = 2000;
+          c.transport.push({ kind: "rate_limits_updated", method: "account/rateLimits/updated",
+            rateLimits: { primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: 2000000000 } }, params: {} });
+          c.transport.push({ ...turnCompleted("failed"), params: { threadId: "th-1",
+            turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "usageLimitExceeded" } } } });
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      } });
+      rig.deps = { ...rig.deps, wallMs: 1000 };
+      let parks = 0;
+      const { ctx } = makeCtx({ signal: controller.signal, parkForWall: async () => { parks++; return "parked"; } });
+      const result = await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      assert.deepEqual(result.walled, { reason: "codex run wall-clock timeout" });
+      assert.equal(parks, 1);
+      assert.equal(fired, true);
+      assert.equal(rig.transport.turnStartCount, 1);
+    } finally { mock.restoreAll(); }
+  });
+
+  it("confirmed vault lock wins over usage-limit evidence and terminal", async () => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push({ kind: "rate_limits_updated", method: "account/rateLimits/updated",
+          rateLimits: { primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: 2000000000 } }, params: {} });
+        c.transport.push({ kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 91,
+          params: { reason: "unauthorized", previousAccountId: null } });
+        c.transport.push({ ...turnCompleted("failed"), params: { threadId: "th-1",
+          turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "usageLimitExceeded" } } } });
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    let refreshes = 0;
+    rig.client.refreshCodex = async () => { refreshes++; throw vaultLocked409("refresh"); };
+    await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), CodexCredentialDeferredError);
+    assert.equal(refreshes, 1);
+    assert.equal(rig.transport.turnStartCount, 1);
+    assert.equal(rig.client.releaseCalls.length, 1);
+  });
+});
+
+describe("decoded Codex usage limits reach RunRunner #2360", () => {
+  for (const scenario of ["window", "docker", "optout", "nonwindow", "publish-failed"] as const) {
+    it(scenario, async () => {
+      const diagnostics = recordingLog();
+      const api = new FakeApi("usage-worker");
+      const url = await api.listen();
+      const fx = makeFixture();
+      const rig = makeRig();
+      const inbound = new PassThrough();
+      const outbound = new PassThrough();
+      const transport = createCodexTransport({ inbound, outbound });
+      const sent: string[] = [];
+      let buffer = "";
+      const resetSeconds = Math.floor(Date.now() / 1000) + 3600;
+      const emit = (frame: unknown) => inbound.write(JSON.stringify(frame) + "\n");
+      outbound.on("data", chunk => {
+        buffer += String(chunk);
+        for (;;) {
+          const newline = buffer.indexOf("\n");
+          if (newline < 0) break;
+          const request = JSON.parse(buffer.slice(0, newline));
+          buffer = buffer.slice(newline + 1);
+          sent.push(request.method);
+          if (request.id === undefined) continue;
+          const result = request.method === "initialize"
+            ? { userAgent: "codex/test", codexHome: "/owned/codex", platformFamily: "unix", platformOs: "linux" }
+            : request.method === "account/login/start" ? { type: request.params.type }
+            : request.method === "thread/start" ? { thread: { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" } }
+            : request.method === "turn/start" ? { turn: { id: "tn-1" } } : {};
+          emit({ id: request.id, result });
+          if (request.method === "turn/start") {
+            emit({ method: "account/rateLimits/updated", params: { rateLimits: {
+              limitId: "private-bucket", limitName: "PRIVATE-METADATA",
+              primary: { usedPercent: 41, windowDurationMins: 300, resetsAt: resetSeconds - 1800 },
+              secondary: { usedPercent: 100, windowDurationMins: 10080, resetsAt: resetSeconds },
+              ...(scenario === "nonwindow" ? { spendControlReached: true } : {}),
+            } } });
+            emit({ method: "error", params: { threadId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", turnId: "tn-1",
+              willRetry: false, error: { codexErrorInfo: "usageLimitExceeded", message: "PRIVATE-PROVIDER" } } });
+            emit({ method: "turn/completed", params: { threadId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+              turn: { id: "tn-1", status: "failed" } } });
+          }
+        }
+      });
+      const launchFileop = rig.deps.launchEffectRoot!;
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true,
+        launchProviderRoot: async () => ({ root: rig.root, transport, supervisorPid: 1234 }),
+        launchEffectRoot: async (spec, deadline) => {
+          const handle = await launchFileop(spec, deadline);
+          const argv = spec.command.endsWith("/uzi-codex-command-sandbox")
+            ? spec.args.slice(spec.args.indexOf("--") + 1) : [spec.command, ...spec.args];
+          if (argv[0] !== "/usr/bin/git" && argv[0] !== "/usr/local/bin/gitleaks") return handle;
+          // Only runner-owned git/scan sinks execute here; provider/model commands use the fake seam.
+          const child = spawn(argv[0], argv.slice(1), { cwd: spec.cwd, env: spec.env, stdio: "pipe" });
+          const timer = setTimeout(() => child.kill(), deadline);
+          const exited = new Promise<{ event: "child_exit"; code: number }>((resolve, reject) => {
+            child.once("error", reject);
+            child.once("close", code => { clearTimeout(timer); resolve({ event: "child_exit", code: code ?? 1 }); });
+          });
+          return { ...handle, transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
+            waitChild: async () => exited, dispose: async ms => { await exited; return handle.dispose(ms); } };
+        },
+      };
+      const client = new WorkerClient(url, "usage-worker", "test", noopLog, { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+      client.protocolFeatures = ["run_checkpoint_durability"];
+      const published: string[] = [];
+      const publishedTrees: string[] = [];
+      client.publishCheckpoint = async (_runId, tip, pack) => {
+        for await (const _chunk of pack) { /* Drain the actual checkpoint pack. */ }
+        published.push(tip);
+        const tree = spawnSync("/usr/bin/git", ["-C", worktree, "show", `${tip}:LIMIT-WIP.txt`], { encoding: "utf8" });
+        assert.equal(tree.status, 0, tree.stderr);
+        publishedTrees.push(tree.stdout);
+        return scenario === "publish-failed" ? { ok: false, httpStatus: 500 } :
+          { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/test" } };
+      };
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
+      let worktree = "";
+      const homeDir = path.join(fx.dataDir, "usage-home");
+      const claim = makeClaim({
+        repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+        wait_on_limit: scenario !== "optout",
+        plan_approved: true, plan_source: "agent", plan_md: "human-approved agent plan",
+        secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+      });
+      try {
+        const run = executor.run.bind(executor);
+        executor.run = async ctx => {
+          worktree = ctx.worktreePath;
+          const source = path.join(fx.dataDir, "session-source");
+          await fs.mkdir(path.join(source, "sessions"), { recursive: true });
+          await fs.mkdir(homeDir, { recursive: true });
+          await fs.writeFile(path.join(source, "sessions", "rollout-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl"),
+            JSON.stringify({ type: "session_meta", payload: { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", cwd: worktree } }) + "\n");
+          await CodexSessionStore.persist(source, path.join(homeDir, "codex-session-store"));
+          await fs.writeFile(path.join(worktree, "LIMIT-WIP.txt"), "recover this work\n");
+          return run(ctx);
+        };
+        await new RunRunner(client, git, () => ({ executor, homeDir }), diagnostics.log, 20, undefined, {
+          pollMs: 5,
+          ...(scenario === "docker" ? { dockerHost: "unix:///2360-fixture-only.sock" } : {}),
+          quiesceRun: async () => ({
+            process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+            docker: { state: "not_wired", removed: [], detail: "not wired" },
+          }),
+        }).execute(claim);
+        const report = api.states.at(-1)?.body;
+        assert.ok(report);
+        assert.ok(sent.includes("turn/start"), "actual executor ran decoded app-server turn");
+        if (scenario === "nonwindow") {
+          assert.equal(report.status, "failed");
+          assert.equal(report.fail_origin, "rate_limited");
+          assert.equal(report.failure_reason, "codex turn failed: failed (usageLimitExceeded)");
+          assert.equal(report.limit_resets_at, undefined);
+          assert.equal(report.rate_limit_type, undefined);
+        } else {
+          assert.equal(report.status, scenario === "optout" ? "failed" : "limit_wait");
+          assert.equal(report.limit_resets_at, resetSeconds * 1000);
+          assert.equal(report.rate_limit_type, "seven_day");
+          if (scenario === "optout") {
+            assert.equal(report.fail_origin, "rate_limited");
+            assert.equal(published.length, 0);
+          } else {
+            assert.equal(published.length, 1, `existing park sink published WIP: ${diagnostics.lines.join("\n")}`);
+            assert.equal(report.checkpoint_contains_latest, scenario === "publish-failed" ? undefined : true);
+            assert.deepEqual(publishedTrees, ["recover this work\n"]);
+            if (scenario === "window" || scenario === "docker") {
+              const resumed = makeRig({ responder: c => {
+                if (c.method === "thread/resume") return { thread: { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" } };
+                if (c.method === "thread/start") {
+                  assert.equal(scenario, "docker", "plain worker must reuse the parked thread");
+                  return { thread: { id: "th-1" } };
+                }
+                if (c.method === "turn/start") {
+                  const id = scenario === "docker" ? "th-1" : "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+                  c.transport.push(signalDone(id)).push(turnCompleted("completed", id));
+                  return { turn: { id: "tn-1" } };
+                }
+                return {};
+              } });
+              resumed.deps = { ...resumed.deps, deferRegistryTeardown: true,
+                launchEffectRoot: rig.deps.launchEffectRoot, sessionStore: {
+                ...resumed.deps.sessionStore!, inspect: async () => "present",
+              } };
+              const resumeExecutor = makeExecutor(resumed, bindingOf(SUBSCRIPTION));
+              const resumeRun = resumeExecutor.run.bind(resumeExecutor);
+              resumeExecutor.run = async ctx => {
+                assert.equal(ctx.planApproved, true, "approval reused on second flight");
+                assert.equal(ctx.sessionId, scenario === "docker" ? undefined : "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+                assert.equal(await fs.readFile(path.join(ctx.worktreePath, "LIMIT-WIP.txt"), "utf8"), "recover this work\n");
+                const committed = spawnSync("/usr/bin/git", ["-C", ctx.worktreePath, "add", "LIMIT-WIP.txt"], { encoding: "utf8" });
+                assert.equal(committed.status, 0, committed.stderr);
+                const finished = spawnSync("/usr/bin/git", ["-C", ctx.worktreePath, "-c", "user.name=Fixture",
+                  "-c", "user.email=fixture@example.test", "commit", "-m", "Finish recovered limit work", "--", "LIMIT-WIP.txt"], { encoding: "utf8" });
+                assert.equal(finished.status, 0, finished.stderr);
+                return resumeRun(ctx);
+              };
+              await new RunRunner(client, git, () => ({ executor: resumeExecutor, homeDir }), diagnostics.log, 20, undefined, {
+                gitlab: fakeGitlab().gitlab,
+                pollMs: 5,
+                ...(scenario === "docker" ? { dockerHost: "unix:///2360-fixture-only.sock" } : {}),
+                quiesceRun: async () => ({
+                  process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+                  docker: { state: "not_wired", removed: [], detail: "not wired" },
+                }),
+              }).execute({ ...claim, session_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", last_seq: 1000 });
+              assert.equal(api.states.at(-1)?.body.status, "completed", diagnostics.lines.join("\n"));
+              assert.equal(resumed.transport.requests.filter(r => r.method === "thread/resume").length, scenario === "docker" ? 0 : 1);
+              assert.equal(resumed.transport.requests.filter(r => r.method === "thread/start").length, scenario === "docker" ? 1 : 0);
+              assert.equal(api.messages(claim.run_id).some(m => m.payload.reason === "cwd_changed_attempt_path"), scenario === "docker");
+              assert.equal(api.states.some(s => s.body.status === "awaiting_approval"), false);
+            }
+          }
+        }
+        assert.doesNotMatch(JSON.stringify(api.states), /private-bucket|PRIVATE-METADATA|PRIVATE-PROVIDER/);
+      } finally {
+        transport.close();
+        inbound.destroy();
+        outbound.destroy();
+        await api.close();
+        fx.cleanup();
+      }
+    });
+  }
 });
 
 describe("approved actual CodexExecutor policy flow (#2321)", () => {
@@ -4228,6 +4518,31 @@ describe("CodexExecutor: per-turn phase-correct broker (plan write ban)", () => 
 // are fail-old/pass-fixed: without the signals frame planResult.plan is undefined and run()
 // throws "produced no plan" before the gate, so a resolving success test can only pass wired.
 describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
+  it("refuses checked plan approval before provider epoch recreation or implementation", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "local plan" }, th, tn, "c-plan")).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    let iterations = 0;
+    const { ctx } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      claimGeneration: 7,
+      reportIteration: async () => { iterations++; return undefined; },
+      gatePlan: async () => ({
+        kind: "approve", approval: "cross_check", selection: { status: "absent" },
+        canonical: { plan: "canonical", milestones: [], candidate_digest: "a".repeat(64), claimGeneration: 7 },
+      }),
+    });
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "checked approval refusal"),
+      /codex cannot consume checked plan approval/,
+    );
+    assert.equal(iterations, 0);
+    assert.equal(rig.epochs.length, 1);
+    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+  });
   it("(m2-1) a folded submit_plan gates, approval recreates a fresh provider epoch, and a root signal_done on the NEW root resolves { branch }", async () => {
     // m4 change: plan approval now RECREATES the provider epoch (new-root resume), so the plan
     // turn and the implement turn run on DISTINCT provider roots/transports. Each epoch is scripted
@@ -5325,18 +5640,26 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     assert.ok(!args.includes("best-effort"), "the tool env's best-effort value is nowhere in the sandbox argv");
   });
 
-  it("the worker Config best-effort mode flows into the emitted --mode token", async () => {
-    const rig = makeRig();
-    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
-    const { ctx } = makeCtx();
-    const executor = new CodexExecutor(
-      noopLog,
-      "/data/agent-home/run-1",
-      { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider, commandSandbox: "best-effort" },
-      rig.deps,
-    );
-    await withTimeout(executor.run(ctx), 3000, "best-effort mode run");
-    assert.equal(modeFlagOf(rig.fileopSpawns[0]!.args), "best-effort", "the worker's best-effort mode reaches the sandbox argv");
+  it("the fileop root uses required mode only for cross_check runs", async () => {
+    for (const { kind, configuredMode, expectedMode } of [
+      { kind: undefined, configuredMode: "best-effort", expectedMode: "best-effort" },
+      { kind: undefined, configuredMode: "off", expectedMode: "off" },
+      { kind: "cross_check", configuredMode: "best-effort", expectedMode: "required" },
+      { kind: "cross_check", configuredMode: "off", expectedMode: "required" },
+    ] as const) {
+      const rig = makeRig();
+      rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+      // M2 will add cross_check to RunKind; widen only this fixture until then.
+      const { ctx } = makeCtx({ kind: kind as RunContext["kind"] });
+      const executor = new CodexExecutor(
+        noopLog,
+        "/data/agent-home/run-1",
+        { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider, commandSandbox: configuredMode },
+        rig.deps,
+      );
+      await withTimeout(executor.run(ctx), 3000, `${kind ?? "ordinary"} ${configuredMode} mode run`);
+      assert.equal(modeFlagOf(rig.fileopSpawns[0]!.args), expectedMode, `${kind ?? "ordinary"} run with ${configuredMode} mode`);
+    }
   });
 
   it("writes ONE degraded-mode line into the run feed when commandSandboxDegraded is set, none otherwise", async () => {
@@ -6238,10 +6561,11 @@ describe("Docker scratch resume Codex prompts", () => {
   for (const phase of ["planPrompt", "implementPrompt"] as const) {
     it(`${phase} appends the note for a cold resume without a session`, () => {
       const fresh = makeCtx({ sessionId: undefined, resumed: false }).ctx;
-      const baseline = builders[phase](fresh);
+      const normalize = (p: string) => p.replace(/issue_context_[0-9a-f]+/g, "issue_context_NONCE");
+      const baseline = normalize(builders[phase](fresh));
       assert.ok(!baseline.includes(note));
-      assert.equal(builders[phase]({ ...fresh, dockerScratchResume: false }), baseline);
-      assert.equal(builders[phase]({ ...fresh, dockerScratchResume: true }), `${baseline}\n\n${note}`);
+      assert.equal(normalize(builders[phase]({ ...fresh, dockerScratchResume: false })), baseline);
+      assert.equal(normalize(builders[phase]({ ...fresh, dockerScratchResume: true })), `${baseline}\n\n${note}`);
     });
   }
 
@@ -6325,6 +6649,23 @@ describe("CodexExecutor prompts — published-tip note (PRD #1416 M1)", () => {
     assert.ok(withStale.includes("GATED-PLAN-XYZ") && !withStale.includes("STALE-CLAIM-PLAN"));
   });
 
+  it("approved implementation plans never read captured issue fields", () => {
+    for (const gatedPlan of [undefined, "GATED-PLAN"]) {
+      const ctx = { ...makeCtx({ approvedPlan: "PERSISTED-PLAN" }).ctx };
+      for (const field of ["issueTitle", "issueDescription", "issueComments"] as const) {
+        Object.defineProperty(ctx, field, { get() { throw new Error(`read ${field}`); } });
+      }
+      const out = implementPromptGated(ctx, gatedPlan);
+      if (gatedPlan === undefined) {
+        assert.equal(out, `PERSISTED-PLAN\n\n${PR_SUMMARY_GUIDANCE}`);
+      } else {
+        assert.ok(out.includes("<approved_plan>\nGATED-PLAN\n</approved_plan>"));
+        assert.ok(!out.includes("PERSISTED-PLAN"));
+      }
+      assert.doesNotMatch(out, /issue_context_|issue_comments_/);
+    }
+  });
+
   it("#1586 implementPrompt with a gated plan still prepends the published-tip note before the framing", () => {
     const out = implementPromptGated(makeCtx({ approvedPlan: undefined, publishedTip: P, defaultBranchCommit: DFLT }).ctx, "GATED-PLAN-XYZ");
     const noteIdx = out.indexOf("already published on the forge");
@@ -6338,12 +6679,14 @@ describe("CodexExecutor prompts — published-tip note (PRD #1416 M1)", () => {
     for (const overrides of [{}, { approvedPlan: undefined }, { approvedPlan: undefined, publishedTip: P }, { publishedTip: P, defaultBranchCommit: DFLT }]) {
       const ctx = makeCtx(overrides).ctx;
       const out = implementPromptGated(ctx, undefined);
-      assert.equal(out, implementPrompt(ctx));
+      assert.equal(out.replace(/issue_context_[0-9a-f]+/g, "issue_context_NONCE"), implementPrompt(ctx).replace(/issue_context_[0-9a-f]+/g, "issue_context_NONCE"));
       assert.ok(!out.includes("Your plan was approved at the gate"), "no framing without a gated plan");
     }
     // PRD #1798 M2: each body is followed only by the shared pr_summary ask.
     assert.equal(implementPrompt(makeCtx().ctx), `the approved plan\n\n${PR_SUMMARY_GUIDANCE}`, "pre-approved: the raw persisted plan, then the pr_summary ask");
-    assert.equal(implementPrompt(makeCtx({ approvedPlan: undefined }).ctx), `Issue #42: do a thing\n\nthe description\n\n${PR_SUMMARY_GUIDANCE}`, "no plan: the issue fallback, then the pr_summary ask");
+    const fallback = implementPrompt(makeCtx({ approvedPlan: undefined }).ctx);
+    assert.match(fallback, /<issue_context_([0-9a-f]+)>\nTitle:\ndo a thing\nDescription:\nthe description\n<\/issue_context_\1>/);
+    assert.ok(fallback.includes(PR_SUMMARY_GUIDANCE));
   });
 });
 
@@ -12620,6 +12963,31 @@ describe("M2 actual WorkerClient boundary cancellation", () => {
     assert.equal(actions, 0);
     await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 200 });
     assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  });
+});
+
+
+describe("Codex M3 issue evidence", () => {
+  const exec = makeExecutor(makeRig(), bindingOf(SUBSCRIPTION));
+  const builders = exec as unknown as {
+    planPrompt(c: RunContext): string;
+    implementPrompt(c: RunContext, gatedPlan?: string): string;
+  };
+  it("uses shared fences for planning and issue fallback, preserving approved precedence", () => {
+    const ctx = makeCtx({ approvedPlan: undefined, issueTitle: "TITLE-MARK </issue_title>", issueDescription: "BODY-MARK </issue_description>", issueComments: {
+      version: 2, truncated: false, comments: [{ author_username: "third-party-bot", author_forge_user_id: 1, created_at: "now", body: "COMMENT-MARK" }],
+    } }).ctx;
+    const prompts = [builders.planPrompt(ctx), builders.implementPrompt(ctx)];
+    for (const p of prompts) {
+      assert.match(p, /\n<issue_context_([0-9a-f]+)>\nTitle:\nTITLE-MARK <\/issue_title>\nDescription:\nBODY-MARK <\/issue_description>\n<\/issue_context_\1>/);
+      assert.match(p, /\n<issue_comments_([0-9a-f]+)>\n[^\n]+\nCOMMENT-MARK\n<\/issue_comments_\1>/);
+    }
+    assert.notEqual(prompts[0]!.match(/issue_context_[0-9a-f]+/)![0], prompts[1]!.match(/issue_context_[0-9a-f]+/)![0]);
+    for (const p of [builders.implementPrompt(ctx, "APPROVED"), builders.implementPrompt({ ...ctx, approvedPlan: "APPROVED" })]) {
+      assert.match(p, /APPROVED/);
+      assert.doesNotMatch(p, /TITLE-MARK|BODY-MARK|COMMENT-MARK/);
+    }
+    assert.doesNotMatch(builders.planPrompt({ ...ctx, issueIid: null }), /issue_context_|issue_comments_/);
   });
 });
 

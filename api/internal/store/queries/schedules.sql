@@ -384,9 +384,10 @@ WHERE schedule_id = @schedule_id
 -- to a pre-#1247 prompt run. M1 always passes NULL; M6 wires the schedule's stored
 -- override onto the fired run through this seam.
 INSERT INTO runs (
-    user_id, repo_id, kind, issue_title, issue_description, schedule_id, auto_approve, wait_on_limit, mr_rework_enabled, model, override_subagent_model, required_capabilities, trigger_source, harness, credential_override_mode, credential_override_secret_id
+    user_id, repo_id, kind, issue_title, issue_description, schedule_id, auto_approve, wait_on_limit, mr_rework_enabled, model, override_subagent_model, required_capabilities, trigger_source, harness, credential_override_mode, credential_override_secret_id, plan_cross_check_required
 ) VALUES (
     @user_id, @repo_id::uuid, 'prompt', @issue_title, @issue_description, @schedule_id::uuid, @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('model'), @override_subagent_model,
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'schedule', @harness, sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id')
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'schedule', @harness, sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id'),
+    (@auto_approve AND (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id))
 )
 RETURNING *;

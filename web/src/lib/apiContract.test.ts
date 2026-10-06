@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { PlanCrossCheckSummary } from "./apiTypes";
 import { readFileSync } from "node:fs";
 import type {
   Run,
@@ -21,6 +22,7 @@ import type {
   AdminCliToken,
   Board,
   Card,
+  LatestRun,
   BoardColumn,
   Skill,
   SettingsResponse,
@@ -283,6 +285,8 @@ void _buildInfoFull;
     // (handler/runs_dto.go) but its zero fixture is a null nil-slice, so it is
     // never-null on the wire and the null zero value is exempted here.
     | "credential_epochs"
+    // nonNilStrings in runs_dto.go normalizes the recorded nil slice to [].
+    | "auto_approve_blocked_reasons"
   > = runZero;
   // 3. value kinds, literal unions widened.
   const _runFull: Widen<Run> = runFull;
@@ -323,6 +327,8 @@ void _buildInfoFull;
     | "completion_deferred"
     | "completion_accepted"
     | "credential_epochs"
+    // nonNilStrings in runs_dto.go normalizes the recorded nil slice to [].
+    | "auto_approve_blocked_reasons"
   > = runListItemZero;
   const _runListItemFull: Widen<RunListItem> = runListItemFull;
   void _runListItemMissing;
@@ -710,6 +716,10 @@ void _buildInfoFull;
   const _cardExtra: never = null as unknown as Exclude<keyof typeof cardFull, keyof Card>;
   const _cardZero: ZeroOf<Card, "labels" | "assignee_ids"> = cardZero;
   const _cardFull: Widen<Card> = cardFull;
+  const _latestRunMissing: never = null as unknown as Exclude<keyof LatestRun, keyof typeof cardFull.latest_run>;
+  const _latestRunExtra: never = null as unknown as Exclude<keyof typeof cardFull.latest_run, keyof LatestRun>;
+  void _latestRunMissing;
+  void _latestRunExtra;
   void _cardMissing;
   void _cardExtra;
   void _cardZero;
@@ -1401,6 +1411,23 @@ describe("api-contract fixtures are present and discriminating", () => {
   }
 });
 
+// TestPlanCrossCheckSummaryNullableItems records this accepted server wire case.
+// Explicit typing makes a narrower array-only declaration fail typecheck.
+it("plan-check findings permit a null item array", () => {
+  const summary: PlanCrossCheckSummary = {
+    round: 1,
+    verdict: "approve",
+    reason_class: "approve",
+    findings: { summary: "ok", items: null },
+    checker_run_id: null,
+    checker_model: null,
+    checker_effort: null,
+    usage: null,
+    historical: false,
+  };
+  expect(summary.findings?.items).toBeNull();
+});
+
 
 describe("worker custody decision contract", () => {
   it("records populated counts while zero DTOs omit the optional field", () => {
@@ -1419,4 +1446,21 @@ it("records removal flags and selector snapshots in both fire responses", () => 
   for (const started of [scheduleFull.last_fire.started[0], scheduleRunNowFull.started[0]]) {
     expect(started).toMatchObject({ selector_label: "x", label_removed: true, label_remove_failed: true });
   }
+});
+
+
+describe("issue-input history contract", () => {
+  it("records Run and list history fields without hand-authored fixtures", () => {
+    for (const [zero, full] of [[runZero, runFull], [runListItemZero, runListItemFull]]) {
+      expect(zero.auto_approve_blocked_reasons).toBeNull(); // nil slice before mapper normalization
+      expect(zero.issue_input_reason).toBeNull();
+      expect(full.auto_approve_blocked_reasons).toEqual(["x"]);
+      expect(full.issue_input_reason).toBe("x");
+    }
+  });
+
+  it("records blocked reasons on the card's latest run", () => {
+    expect(cardFull.latest_run.auto_approve_blocked_reasons).toEqual(["x"]);
+    expect(boardFull.cards[0].latest_run.auto_approve_blocked_reasons).toEqual(["x"]);
+  });
 });

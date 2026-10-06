@@ -13,6 +13,26 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
+func TestHealthQueuedCrossCheckCapability(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		caps []string
+		want string
+	}{
+		{name: "old worker", want: reasonNoCrossCheckCapableWorker},
+		{name: "capable worker", caps: []string{"cross_check_v1"}, want: reasonWaitingWorker},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs, svc, r := capSvc(nil, 0, nil)
+			fs.crossCheckRun = store.Run{ID: r.ID, UserID: r.UserID, PlanCrossCheckRequired: true}
+			fs.crossCheckWorkers = []store.ListWorkersByUserRow{{Status: "online", ProtocolCapabilities: tc.caps}}
+			if got := svc.queuedReason(context.Background(), time.Now(), r); got != tc.want {
+				t.Fatalf("queued reason = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // PRD #84 M3: a queued run whose required_capabilities are not a subset of ANY online
 // worker's effective caps must surface reasonNoEligibleWorker — a capability-specific
 // "no eligible worker" reason — instead of the generic wait, gated by the
