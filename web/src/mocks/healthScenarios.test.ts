@@ -5,7 +5,9 @@ import { workersApi } from "./mockApi/workers";
 import { ownerOnlyWaitingOwnerId, ownerOnlyWaitingRunId } from "./data/health";
 import { mockScenario } from "./mockApi/shared";
 
-vi.mock("./mockApi/shared", () => ({
+vi.mock("./mockApi/shared", async (importOriginal) => ({
+  ...await importOriginal<typeof import("./mockApi/shared")>(),
+  requireSession: vi.fn(),
   delay: <T>(value: T) => Promise.resolve(value),
   mockScenario: vi.fn(),
   requireAdmin: vi.fn(),
