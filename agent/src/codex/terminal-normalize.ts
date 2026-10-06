@@ -137,8 +137,8 @@ const CODEX_ERROR_INFO_MAP: ReadonlyMap<string, CodexErrorInfoEntry> = new Map<s
   ["internalServerError", { shape: "scalar", display: "internalServerError", category: "transport" }],
   ["badRequest", { shape: "scalar", display: "badRequest", category: "unknown" }],
   ["sandboxError", { shape: "scalar", display: "sandboxError", category: "unknown" }],
-  ["cyberPolicy", { shape: "scalar", display: "cyberPolicy", category: "unknown" }],
-  ["misalignmentPolicyViolation", { shape: "scalar", display: "misalignmentPolicyViolation", category: "unknown" }],
+  ["cyberPolicy", { shape: "scalar", display: "cyberPolicy", category: "policy_refusal" }],
+  ["misalignmentPolicyViolation", { shape: "scalar", display: "misalignmentPolicyViolation", category: "policy_refusal" }],
   ["threadRollbackFailed", { shape: "scalar", display: "threadRollbackFailed", category: "unknown" }],
   ["other", { shape: "scalar", display: "other", category: "unknown" }],
   // Tagged variants: a one-key externally-tagged object `{ "<tag>": { ... } }`.

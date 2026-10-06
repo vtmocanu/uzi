@@ -39,6 +39,12 @@
 
 import path from "node:path";
 import { createHash } from "node:crypto";
+import {
+  validatePolicyRefusal,
+  policyRefusalMessage,
+  sanitizePolicyRole,
+  type PolicyRefusalPayload,
+} from "../provider-policy-refusal.js";
 
 import { screenBashCommand, screenToolPath } from "../guardrails.js";
 import { SIGNAL_SERVER_NAME, scanSignals } from "../signals.js";
@@ -142,6 +148,7 @@ export const CODEX_DELEGATE_TOOLS: ReadonlySet<string> = new Set([
  *  than forwarding an arbitrary provider/model-controlled code. */
 const CHILD_FAILURE_CODES: ReadonlySet<string> = new Set([
   "child_failed",
+  "child_policy_refused",
   "child_aborted",
   "child_timeout",
   "child_denied",
@@ -222,7 +229,7 @@ export type CallbackOrigin = "root" | "child" | "unknown";
  *  or transport frame. */
 export type CallbackResult =
   | { readonly ok: true; readonly output: unknown }
-  | { readonly ok: false; readonly code: string; readonly message: string };
+  | { readonly ok: false; readonly code: string; readonly message: string; readonly policyRefusal?: PolicyRefusalPayload };
 
 /** One fileop request, mapped to the NDJSON op protocol
  *  (agent/codex/supervisor/fileop). `path`/`newPath` are worktree-RELATIVE (the
@@ -321,6 +328,7 @@ export interface ChildDelegationRequest {
 
 /** The result the delegation seam returns once the child settles. */
 export interface ChildDelegationResult {
+  readonly policyRefusal?: PolicyRefusalPayload;
   readonly ok: boolean;
   readonly output?: unknown;
   readonly code?: string;
@@ -353,6 +361,7 @@ export interface RunGrants {
 /** Everything the broker is constructed with: the registry, the injected seams, the
  *  immutable grants, and optional routing/screening config. */
 export interface CodexCallbackBrokerOptions {
+  readonly scrubPolicyRole?: (role: string) => string;
   readonly registry: ExecutionRegistry;
   readonly spawnCommand: SpawnCommandSeam;
   readonly fileop: FileopClient;
@@ -516,7 +525,7 @@ export class CodexCallbackBroker {
   private readonly dockerWired: boolean;
   private readonly signal: AbortSignal | undefined;
 
-  constructor(opts: CodexCallbackBrokerOptions) {
+  constructor(private readonly opts: CodexCallbackBrokerOptions) {
     this.registry = opts.registry;
     this.spawnCommand = opts.spawnCommand;
     this.fileop = opts.fileop;
@@ -951,8 +960,16 @@ export class CodexCallbackBroker {
       return deny("bad_args", "delegation requires nonblank instructions in prompt, task, input, message, or description");
     }
     // Await the child SYNCHRONOUSLY: the parent callback resolves only after it settles.
+    const policyRole = sanitizePolicyRole(role, this.opts.scrubPolicyRole);
     const child = await this.delegateSeam({ tool: canonical, role, args, parent: rt });
     if (child.ok) return { ok: true, output: child.output };
+    if (child.code === "child_policy_refused") {
+      const payload = validatePolicyRefusal(child.policyRefusal);
+      if (!payload || payload.origin !== "child" || payload.role !== policyRole) {
+        return deny("child_failed", "the delegated child failed");
+      }
+      return { ok: false, code: "child_policy_refused", message: policyRefusalMessage(payload.policy_tag), policyRefusal: payload };
+    }
     const code = child.code !== undefined && CHILD_FAILURE_CODES.has(child.code)
       ? child.code
       : "child_failed";

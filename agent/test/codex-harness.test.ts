@@ -1,4 +1,11 @@
 import { describe, it } from "node:test";
+import { RunRunner } from "../src/runner.js";
+import { FakeApi } from "./fake-api.js";
+import { makeFixture } from "./fixture-repo.js";
+import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
+import { WorkerClient } from "../src/client.js";
+import { GitCache } from "../src/git.js";
+import type { Executor } from "../src/executor.js";
 import { PassThrough } from "node:stream";
 import { createCodexTransport } from "../src/codex/transport.js";
 import assert from "node:assert/strict";
@@ -2145,6 +2152,46 @@ describe("CodexHarness: terminal provider fields are bounded + redacted", () => 
     const thrown = terminal.failure!.materialize();
     assert.match(thrown.failure.message, /codex turn failed: unknown/);
     assert.ok(!thrown.failure.message.includes("mystery-provider-status"), "no raw status in the failure message");
+  });
+});
+
+describe("approved root planning policy refusal through RunRunner (#2321)", () => {
+  it("reports the typed provider origin after successful worker setup", async () => {
+    const api = new FakeApi("policy-test-worker");
+    const url = await api.listen();
+    const fx = makeFixture();
+    let runs = 0;
+    const log = nullLogger();
+    const client = new WorkerClient(url, "policy-test-worker", "test", log, {
+      sleep: async () => {}, terminalRetrySchedule: [1, 1],
+    });
+    const git = new GitCache(fx.dataDir, log, undefined, testGitCacheOptions());
+    const fakeCodexExecutor: Executor = {
+      async run(ctx) {
+        runs++;
+        assert.ok(ctx.worktreePath, "worker setup and clone succeeded before planning");
+        const { harness, transport } = makeHarness();
+        transport.push(threadStarted()).push(turnCompletedWithError("cyberPolicy")).end();
+        const events = await collect(harness.startTurn(makeRequest({ phase: "plan" })).events);
+        const last = events.at(-1)!;
+        assert.equal(last.kind, "turn_finished", "provider turn reached its behavior seam");
+        if (last.kind !== "turn_finished") throw new Error("missing terminal");
+        throw last.terminal.failure!.materialize().original;
+      },
+    };
+    const claim = makeClaim({
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+    });
+    try {
+      await new RunRunner(client, git, () => ({ executor: fakeCodexExecutor }), log, 20, undefined, { pollMs: 5 }).execute(claim);
+      assert.equal(runs, 1, "worker setup succeeded and planning ran once");
+      const failed = api.states.filter(s => s.body.status === "failed").at(-1)?.body;
+      assert.ok(failed);
+      assert.equal(failed.fail_origin, "provider_policy_refusal");
+      assert.equal(failed.failure_reason, "Codex provider safety-policy refusal (cyberPolicy)");
+    } finally {
+      try { await api.close(); } finally { fx.cleanup(); }
+    }
   });
 });
 

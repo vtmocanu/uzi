@@ -3046,6 +3046,9 @@ export class CodexExecutor implements Executor {
           screenPolicy,
           signal,
           childTurnDeadlineMs,
+          policyParent: () => harness?.policyAdmission,
+          policySink: async (payload) => { await ctx.emit({ kind: "status", agent: "worker", payload: { ...payload } }); },
+          scrubPolicyRole: scrubProjected,
         });
         return new CodexCallbackBroker({
           registry,
@@ -3056,6 +3059,7 @@ export class CodexExecutor implements Executor {
           delegate: delegationRunner.toDelegateSeam(),
           toolHandlers,
           allowedRoles: runPlan.allowedRoles,
+          scrubPolicyRole: scrubProjected,
           screenPolicy,
           signal,
         });
@@ -3372,9 +3376,14 @@ export class CodexExecutor implements Executor {
         if (event.kind === "turn_finished") {
           sawTerminal = true;
           terminal = event.terminal;
+          if (terminal.policyRefusal) await ctx.emit({ kind: "status", agent: "worker", payload: { ...terminal.policyRefusal } });
           turn.requestStop("terminal");
           break;
         }
+      }
+      if (terminal?.policyRefusal) {
+        const pending = ctx.cancelRequested?.() ? REASON_CANCEL : this.pendingInterruption(ctx, pauseNow, wall);
+        if (pending !== undefined) trip(pending);
       }
       // (a) FIRST-WINS trip.
       if (tripReason) throw this.tripError(tripReason, tripToken!);

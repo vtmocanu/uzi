@@ -1,4 +1,5 @@
 import { describe, it } from "node:test";
+import { admitPolicyTurn, type PolicyRefusalPayload } from "../src/provider-policy-refusal.js";
 import { PassThrough } from "node:stream";
 import { createCodexTransport } from "../src/codex/transport.js";
 import assert from "node:assert/strict";
@@ -6,6 +7,7 @@ import assert from "node:assert/strict";
 import {
   CodexDelegationRunner,
   type ChildThreadController,
+  type CodexDelegationRunnerOptions,
   type DelegationRole,
   type StartChildTurnSpec,
 } from "../src/codex/delegation.js";
@@ -115,6 +117,7 @@ interface Built {
 }
 
 function makeRunner(opts: {
+  policy?: Pick<CodexDelegationRunnerOptions, "policyParent" | "policySink" | "scrubPolicyRole">;
   controller?: ChildThreadController;
   roles?: Map<string, DelegationRole>;
   signal?: AbortSignal;
@@ -141,6 +144,7 @@ function makeRunner(opts: {
     worktreePath: WORKTREE,
     signal: opts.signal,
     childTurnDeadlineMs: opts.childTurnDeadlineMs,
+    ...opts.policy,
   });
   return { runner, registry, spawn, fileop, startSpecs };
 }
@@ -182,6 +186,83 @@ function agentMessageNote(ctrl: ChildThreadController, text: string): CodexNotif
 function turnCompletedNote(ctrl: ChildThreadController, status: string): CodexNotification {
   return { kind: "turn_completed", method: "turn/completed", threadId: ctrl.threadId, turnId: ctrl.turnId, status, params: {} };
 }
+
+describe("child policy refusal settlement (#2321)", () => {
+  function failed(tag = "cyberPolicy", threadId = "child-thread", turnId = "child-turn", status = "failed"): CodexNotification {
+    return { kind: "turn_completed", method: "turn/completed", threadId, turnId, status,
+      params: { turn: { status, error: { codexErrorInfo: tag, message: "PRIVATE", additionalDetails: "PRIVATE" } } } };
+  }
+  it("awaits the dedicated sink before teardown and result despite absent display hooks", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const entry = new Promise<void>(resolve => { entered = resolve; });
+    const events: PolicyRefusalPayload[] = [];
+    const ctrl = new FakeController({ notes: [failed()] });
+    const parent = admitPolicyTurn("plan");
+    const { runner } = makeRunner({ controller: ctrl, policy: {
+      policyParent: () => parent,
+      policySink: async p => { events.push(p); entered(); await gate; },
+    } });
+    let settled = false;
+    const pending = runner.run(delegReq()).then(r => { settled = true; return r; });
+    await entry;
+    assert.equal(settled, false);
+    assert.equal(ctrl.closed, false);
+    release();
+    const result = await pending;
+    assert.equal(ctrl.closed, true);
+    assert.equal(result.code, "child_policy_refused");
+    assert.equal(events.length, 1);
+    assert.deepEqual(result.policyRefusal, events[0]);
+    assert.equal(events[0]!.phase, "planning");
+    assert.ok(!JSON.stringify(result).includes("PRIVATE"));
+  });
+  it("concurrent same-role children get separate correlations and immutable admitted parent/phase", async () => {
+    let parent = admitPolicyTurn("plan");
+    const original = parent;
+    const events: PolicyRefusalPayload[] = [];
+    const { runner } = makeRunner({ startImpl: async () => new FakeController({ notes: [failed()] }), policy: {
+      policyParent: () => parent, policySink: p => { events.push(p); },
+    } });
+    const a = runner.run(delegReq());
+    const b = runner.run(delegReq());
+    parent = admitPolicyTurn("implement");
+    const results = await Promise.all([a, b]);
+    assert.equal(events.length, 2);
+    assert.notEqual(events[0]!.correlation_id, events[1]!.correlation_id);
+    for (const [i, event] of events.entries()) {
+      assert.equal(event.phase, "planning");
+      assert.equal(event.origin, "child");
+      if (event.origin !== "child") throw new Error("expected child");
+      assert.equal(event.parent_correlation_id, original.correlation_id);
+      assert.equal(event.role, "coder");
+      assert.deepEqual(results[i]!.policyRefusal, event);
+      assert.ok(!JSON.stringify(event).includes("root-thread"));
+    }
+  });
+  it("foreign/stale completions and retrying metadata never fabricate a refusal", async () => {
+    const ctrl = new FakeController({ notes: [failed("cyberPolicy", "foreign"), failed("cyberPolicy", "child-thread", "stale"),
+      { kind: "codex_error", method: "error", threadId: "child-thread", turnId: "child-turn", willRetry: true,
+        params: { error: { codexErrorInfo: "cyberPolicy" } } }, failed("cyberPolicy", "child-thread", "child-turn", "completed")] });
+    const events: PolicyRefusalPayload[] = [];
+    const { runner } = makeRunner({ controller: ctrl, policy: { policySink: p => { events.push(p); } } });
+    assert.equal((await runner.run(delegReq())).ok, true);
+    assert.equal(events.length, 0);
+  });
+  it("scrubs and bounds admitted role and never reads provider text", async () => {
+    const secretRole = "PRIVATE" + "x".repeat(100);
+    const { runner } = makeRunner({ roles: new Map([[secretRole, role()]]),
+      controller: new FakeController({ notes: [failed("misalignmentPolicyViolation")] }),
+      policy: { scrubPolicyRole: s => s.replace("PRIVATE", "redacted") } });
+    const result = await runner.run(delegReq({ role: secretRole }));
+    assert.equal(result.code, "child_policy_refused");
+    assert.equal(result.policyRefusal?.origin, "child");
+    if (result.policyRefusal?.origin !== "child") throw new Error("expected child");
+    assert.equal(result.policyRefusal.role.length, 64);
+    assert.ok(!JSON.stringify(result).includes("PRIVATE"));
+  });
+});
 
 /** Read the `success` flag off a recorded respond call's `{ result: { success } }`. */
 function respondSuccess(controller: FakeController, idx: number): boolean {

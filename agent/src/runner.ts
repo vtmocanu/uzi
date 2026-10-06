@@ -1,3 +1,4 @@
+import { ProviderPolicyRefusal, policyRefusalMessage } from "./provider-policy-refusal.js";
 import { TrustedExecutionRefusal, legacyTrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { AsyncResource } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
@@ -3946,7 +3947,9 @@ export class RunRunner {
   ): Promise<void> {
     const { batcher, redactText, runLog } = flight;
     const rawReason =
-      err instanceof PlanRejectedError
+      err instanceof ProviderPolicyRefusal
+        ? policyRefusalMessage(err.policyRefusal.policy_tag)
+        : err instanceof PlanRejectedError
         ? err.reason
         : err instanceof TerminalReportError
           ? err.reason
@@ -3967,10 +3970,15 @@ export class RunRunner {
     // run's unapplied reject_plan inputs in that same transition (issue #1604); it ignores a
     // worker-sent origin there.
     const failOrigin =
-      err instanceof TerminalReportError
+      err instanceof ProviderPolicyRefusal
+        ? "provider_policy_refusal"
+        : err instanceof TerminalReportError
         ? err.failOrigin
         : failOriginForReason(rawReason);
-    runLog.error("run failed", { error: reason });
+    runLog.error("run failed", {
+      error: reason,
+      ...(err instanceof ProviderPolicyRefusal ? { policyRefusal: err.policyRefusal } : {}),
+    });
     if (err instanceof ScratchPublicationError) logScratchPublicationRefused(runLog, redactText, err, "finalize");
     // Issue #1864: a Codex boundary failure also logs which stage, boundary and sink failed.
     const boundaryDiagnostic = codexBoundaryDiagnosticOf(err);

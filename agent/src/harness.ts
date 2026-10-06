@@ -106,6 +106,7 @@ export type HarnessErrorCategory =
   | "timeout"
   | "authentication"
   | "authorization"
+  | "policy_refusal"
   | "rate_limit"
   | "model"
   | "effort"
@@ -169,6 +170,7 @@ export type HarnessItem =
     };
 
 export interface HarnessTerminal {
+  policyRefusal?: import("./provider-policy-refusal.js").PolicyRefusalPayload;
   outcome: "success" | "failed";
   // Exact uzi display subtype and String-mapped provider error array.
   subtype: string;

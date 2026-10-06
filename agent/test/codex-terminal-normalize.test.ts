@@ -12,6 +12,20 @@ import {
 } from "../src/codex/terminal-normalize.js";
 import { isTransientStatus } from "../src/client.js";
 
+describe("approved policy tag categories (#2321)", () => {
+  it("maps exactly the two scalar policy tags to policy_refusal", () => {
+    for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"]) {
+      assert.deepEqual(normalizeCodexErrorInfo(tag), { classification: tag, category: "policy_refusal" });
+      assert.deepEqual(normalizeCodexErrorInfo({ [tag]: { misalignment: "private" } }), {
+        classification: "unknown", category: "unknown",
+      });
+    }
+    assert.deepEqual(normalizeCodexErrorInfo("tooManyDenials"), {
+      classification: "tooManyDenials", category: "unknown",
+    });
+  });
+});
+
 describe("Codex 0.159.3 error tags", () => {
   it("recognizes new scalar tags while rejecting attacker-shaped objects", () => {
     assert.deepEqual(normalizeCodexErrorInfo("flexUnavailable"), {

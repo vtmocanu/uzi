@@ -248,6 +248,7 @@ export class RunTurnReducerImpl implements RunTurnReducer {
         total_cost_usd: terminal.metrics.wire?.total_cost_usd,
       },
     });
+    if (terminal.policyRefusal) em.payload["policyRefusal"] = terminal.policyRefusal;
     // Attach the (concurrently-read) lead context to the turn's terminal frame on
     // success OR failure. Only turn completion waits, and only up to the read's own
     // timeout on a genuine hang; absence/error/hang omit context and never fail.
