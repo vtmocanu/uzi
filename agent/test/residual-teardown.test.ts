@@ -51,7 +51,7 @@ describe("residual worker-owned cleanup (#2324)", () => {
   }));
 
   it("teardown permits only the exact generated hidden plugin prefix", async (t) => fixture(async (root) => {
-    for (const name of [".other", ".uzi-skills-", ".uzi-skills-.x", ".uzi-skills--x", ".", ".."]) {
+    for (const name of [".other", ".uzi-skills-", ".uzi-skills-.x", ".uzi-skills--x", ".uzi-skills-a\u0000", ".uzi-skills-a\n", ".uzi-skills-a\u007f", ".uzi-skills-a\u0085", ".", ".."]) {
       let invoked = false;
       await assert.rejects(rmTeardownTree(`${root}/${name}`, {
         removeTreePinned: async (parent, leaf, opts) => {
@@ -62,15 +62,37 @@ describe("residual worker-owned cleanup (#2324)", () => {
       }));
       assert.equal(invoked, true);
     }
-    for (const name of [".uzi-skills-/child", ".uzi-skills-../child", "../.uzi-skills-child"]) {
+    for (const name of [".uzi-skills-/child", ".uzi-skills-../child", "../.uzi-skills-child", ".uzi-skills-a\\child"]) {
       await assert.rejects(rmTreePinned(root, name, { allowSkillsPluginName: true }), /not one path component/);
     }
     if (process.platform !== "linux") return t.skip("real pinned success requires Linux");
-    const target = path.join(root, ".uzi-skills-issue-2324");
-    await fs.mkdir(target);
-    await fs.writeFile(path.join(target, "skill"), "body");
-    await rmTeardownTree(target);
-    await assert.rejects(fs.stat(target), { code: "ENOENT" });
+    for (const name of [".uzi-skills-issue-2324", ".uzi-skills-feat-a+b", ".uzi-skills-機能-更新"]) {
+      const target = path.join(root, name);
+      await fs.mkdir(target);
+      await fs.writeFile(path.join(target, "skill"), "body");
+      await assert.rejects(rmTreePinned(root, name), /not one path component/);
+      await rmTeardownTree(target);
+      await assert.rejects(fs.stat(target), { code: "ENOENT" });
+    }
+  }));
+
+  it("plugin opt-in preserves owner and symlink refusals", { skip: process.platform !== "linux" }, async () => fixture(async (root, victim) => {
+    const name = ".uzi-skills-feat-a+b";
+    const target = path.join(root, name);
+    await fs.mkdir(target, { mode: 0o700 });
+    await fs.writeFile(path.join(target, "keep"), "retained");
+    const mode = (await fs.stat(target)).mode;
+    await assert.rejects(rmTreePinned(root, name, {
+      allowSkillsPluginName: true, getuid: () => process.getuid!() + 1,
+    }), /not owned by this worker/);
+    assert.equal((await fs.stat(target)).mode, mode);
+    assert.equal(await fs.readFile(path.join(target, "keep"), "utf8"), "retained");
+    await fs.rm(target, { recursive: true });
+    await fs.writeFile(path.join(victim, "keep"), "outside");
+    await fs.symlink(victim, target, "dir");
+    await assert.rejects(rmTreePinned(root, name, { allowSkillsPluginName: true }), /symlink or non-directory/);
+    assert.ok((await fs.lstat(target)).isSymbolicLink());
+    assert.equal(await fs.readFile(path.join(victim, "keep"), "utf8"), "outside");
   }));
 
   it("leftover job replacement never deletes an outside file during swaps", { skip: process.platform !== "linux" }, async () => fixture(async (root, victim) => {

@@ -842,7 +842,7 @@ const SELF_FD = "/proc/self/fd/";
 /** One path component: no separator, not `.`/`..`, not dash-leading (it becomes a bare
  *  `node -e` argument). Run ids and `mkdtemp` names (`uzi-judge-XXXXXX`) all fit. */
 const TREE_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
-const SKILLS_PLUGIN_TREE_NAME_RE = /^\.uzi-skills-[A-Za-z0-9_][A-Za-z0-9._-]*$/;
+const SKILLS_PLUGIN_TREE_NAME_RE = /^\.uzi-skills-(?![.-])[^\p{Cc}/\\]+$/u;
 
 /** The worker itself as a helper's uid: the command unchanged. */
 const asWorker: CommandWrapper = (command, args) => ({ command, args: [...args] });
