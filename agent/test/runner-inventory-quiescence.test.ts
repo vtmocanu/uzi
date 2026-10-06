@@ -3,9 +3,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import os from "node:os";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 installHarness();
-for (const mode of ["boot", "live"] as const) for (const source of ["dirty-unverified", "clean-unverified", "dirty-quiescent", "foreground-wip"] as const) it(`${source} physical custody through runner ${mode} recovery`, async () => {
+for (const mode of ["boot", "live"] as const) for (const source of ["dirty-unverified", "clean-unverified", "dirty-quiescent", "foreground-wip"] as const) it(`${source} physical custody through runner ${mode} recovery`, async t => {
   const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("GIT_")));
   const cmd = (dir:string, args:string[]) => execFileSync("git", ["-C", dir, ...args], {env:cleanEnv, encoding:"utf8", timeout:10000}).trim();
   const claim = gitlabClaim(2997, {claim_generation:37, inventory_guarded:true});
@@ -17,12 +19,21 @@ for (const mode of ["boot", "live"] as const) for (const source of ["dirty-unver
   let queued: Promise<void> | undefined;
   const qSites:string[] = [];
   let manifest: import("../src/protocol.js").RecoveryUploadManifest | undefined;
+  let uploadedBundle: Buffer | undefined;
 
   const id = "00000000-0000-4000-8000-000000002997";
   client.listRecoveryHolds = async runId => ({run_id:runId, holds:open ? [{hold_id:"tester-hold", generation:37, inventory_guarded:true, has_available_capture:false}] : []});
   client.reserveRecoveryCapture = async () => ({capture_id:id, state:"preparing"});
   client.uploadRecoveryBundle = async (_run,_id,m,stream) => {
-    for await (const chunk of stream) assert.ok(chunk.length);
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) {
+      assert.ok(chunk.length);
+      chunks.push(Buffer.from(chunk));
+    }
+    uploadedBundle = Buffer.concat(chunks);
+    assert.equal(uploadedBundle.length, m.byte_size, "uploaded size matches manifest");
+    assert.equal(createHash("sha256").update(uploadedBundle).digest("hex"), m.checksum,
+      "uploaded bytes match manifest checksum");
     manifest=m;
     return {capture_id:id, state:"available", manifest_bound:true};
   };
@@ -30,8 +41,18 @@ for (const mode of ["boot", "live"] as const) for (const source of ["dirty-unver
   client.releaseRecoveryCustody = async (_run, _generation, _evidence, disposition) => {
     if (source === "foreground-wip") {
       assert.ok(disposition?.kind === "archive");
-      assert.equal(cmd(git.barePathFor(fx.originPath), ["show", disposition.source_sha + ":tester-source.txt"]),
-        "unpublished dirty source", "the covering archive includes foreground WIP contents");
+      assert.ok(uploadedBundle, "FINAL has captured upload bytes");
+      const imported = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-uploaded-wip-"));
+      fs.chmodSync(imported, 0o700);
+      t.after(() => fs.rmSync(imported, { recursive: true, force: true }));
+      const bundlePath = path.join(imported, "uploaded.bundle");
+      fs.writeFileSync(bundlePath, uploadedBundle, { mode: 0o600 });
+      cmd(imported, ["init"]);
+      cmd(imported, ["bundle", "verify", bundlePath]);
+      cmd(imported, ["fetch", bundlePath, "refs/heads/recovered-source:refs/heads/recovered-source"]);
+      assert.equal(cmd(imported, ["rev-parse", "refs/heads/recovered-source"]), disposition.source_sha);
+      assert.equal(cmd(imported, ["show", disposition.source_sha + ":tester-source.txt"]),
+        "unpublished dirty source", "the uploaded archive includes foreground WIP contents");
       assert.ok(queued, "claim queued during physical proof");
       await new Promise<void>(resolve => setImmediate(resolve));
       assert.equal(executions, 1, "queued executor cannot write during FINAL");

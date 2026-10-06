@@ -80,6 +80,11 @@ func recoveryTestCfg() config.Config {
 // the worker and run, mirroring what ClaimRun writes.
 func newRecoveryEnv(t *testing.T) *recoveryEnv {
 	t.Helper()
+	return newRecoveryEnvGuarded(t, false)
+}
+
+func newRecoveryEnvGuarded(t *testing.T, inventoryGuarded bool) *recoveryEnv {
+	t.Helper()
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
@@ -117,9 +122,9 @@ func newRecoveryEnv(t *testing.T) *recoveryEnv {
 	exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status)
 	      VALUES ($1, $2, $3, 'issue', 1, 'do x', 'ctx', 'running')`, e.run, e.user, e.repo)
 	exec(`INSERT INTO recovery_custody_holds
-	      (id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id)
-	      VALUES ($1, $2, $3, $4, 1, 'open', $5, $6, $5, $4)`,
-		e.holdID, e.user, e.repo, e.run, workerID, e.worker.Name)
+	      (id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, inventory_guarded)
+	      VALUES ($1, $2, $3, $4, 1, 'open', $5, $6, $5, $4, $7)`,
+		e.holdID, e.user, e.repo, e.run, workerID, e.worker.Name, inventoryGuarded)
 	return e
 }
 

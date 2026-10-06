@@ -27,7 +27,7 @@ func inventoryGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := exec.CommandContext(ctx, "git", args...) //nolint:gosec // G204: fixed Git binary; args are test-only literal operations and owned fixture paths/SHAs, no shell.
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0")
 	out, err := cmd.CombinedOutput()
@@ -73,7 +73,7 @@ func inventoryBundle(t *testing.T) ([]byte, string, string, string) {
 	if got := inventoryGit(t, dir, "bundle", "list-heads", path); got != q+" refs/heads/recovered-source" {
 		t.Fatalf("bundle refs = %q, want only recovered-source at Q", got)
 	}
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // G304: bundle path is created by this test in its own temporary directory.
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func inventoryImport(t *testing.T, data []byte, h, h2 string) {
 		if got := inventoryGit(t, dir, "rev-parse", "HEAD"); got != tc.sha {
 			t.Fatalf("checkout = %s, want %s", got, tc.sha)
 		}
-		got, err := os.ReadFile(filepath.Join(dir, "work.txt"))
+		got, err := os.ReadFile(filepath.Join(dir, "work.txt")) //nolint:gosec // G304: fixed fixture filename in this test-created temporary repository.
 		if err != nil || string(got) != tc.content+"\n" {
 			t.Fatalf("restored content = %q, %v", got, err)
 		}
@@ -117,7 +117,7 @@ func inventoryBuildCLI(t *testing.T, dir string) string {
 	binary := filepath.Join(dir, "uzi")
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-o", binary, "../../cmd/uzi")
+	cmd := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-o", binary, "../../cmd/uzi") //nolint:gosec // G204: fixed Go build command/args; output is a test-owned temporary binary, no shell.
 	cmd.WaitDelay = time.Second
 	for _, entry := range os.Environ() {
 		if !strings.HasPrefix(entry, "TMPDIR=") {
@@ -151,7 +151,7 @@ func inventoryCLIExport(t *testing.T, binary, url, ownerToken, runID, captureID 
 	run := func() ([]byte, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, binary, "--url", url, "run", "export", runID, "--capture", captureID, "--output", output)
+		cmd := exec.CommandContext(ctx, binary, "--url", url, "run", "export", runID, "--capture", captureID, "--output", output) //nolint:gosec // G204: test-built binary, fixed export command, local test server and fixture IDs/paths, no shell.
 		cmd.Env = env
 		cmd.Dir = dir
 		cmd.WaitDelay = time.Second
@@ -162,7 +162,7 @@ func inventoryCLIExport(t *testing.T, binary, url, ownerToken, runID, captureID 
 	}
 	read := func() []byte {
 		t.Helper()
-		got, err := os.ReadFile(output)
+		got, err := os.ReadFile(output) //nolint:gosec // G304: output is a test-created destination in this test-owned temporary directory.
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -188,7 +188,7 @@ func inventoryCLIExport(t *testing.T, binary, url, ownerToken, runID, captureID 
 	if err == nil || !strings.Contains(string(out), "refusing to overwrite existing path") {
 		t.Fatalf("CLI overwrite = %v, want existing-destination refusal: %s", err, out)
 	}
-	if got, err := os.ReadFile(output); err != nil || !bytes.Equal(got, sentinel) {
+	if got, err := os.ReadFile(output); err != nil || !bytes.Equal(got, sentinel) { //nolint:gosec // G304: output is the test-owned temporary destination populated with the sentinel above.
 		t.Fatalf("CLI overwrite changed existing destination: %q, %v", got, err)
 	}
 	return downloaded
@@ -202,7 +202,11 @@ func TestRecoveryInventoryClosureLiveDB(t *testing.T) {
 	var cliBinary string
 	for _, deletion := range []string{"manual", "ephemeral-reaper"} {
 		t.Run(deletion, func(t *testing.T) {
-			e := newRecoveryEnv(t)
+			e := newRecoveryEnvGuarded(t, true)
+			var guarded bool
+			if err := e.pool.QueryRow(e.ctx, "SELECT inventory_guarded FROM recovery_custody_holds WHERE id=$1", e.holdID).Scan(&guarded); err != nil || !guarded {
+				t.Fatalf("initial hold inventory_guarded = %t, want true: %v", guarded, err)
+			}
 			if cliBinary == "" {
 				cliBinary = inventoryBuildCLI(t, privateDir)
 			}
@@ -219,7 +223,6 @@ func TestRecoveryInventoryClosureLiveDB(t *testing.T) {
 			}
 			cliMustExec(t, e.pool, "UPDATE workers SET token_hash=$2, protocol_capabilities=$3 WHERE id=$1",
 				e.worker.ID, hash, []string{capability.RecoveryArchiveV1, capability.RecoveryInventoryV1})
-			cliMustExec(t, e.pool, "UPDATE recovery_custody_holds SET inventory_guarded=true WHERE id=$1", e.holdID)
 			cliMustExec(t, e.pool, "UPDATE runs SET worker_id=$2, claim_generation=1 WHERE id=$1", e.run, e.worker.ID)
 			if deletion == "ephemeral-reaper" {
 				cliMustExec(t, e.pool, "UPDATE workers SET kind='hosted', hosted_size='m', template_declared='base', ephemeral=true, ephemeral_run_id=$2 WHERE id=$1", e.worker.ID, e.run)
