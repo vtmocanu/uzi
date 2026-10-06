@@ -10,6 +10,7 @@ import type { EmittedMessage, RunContext } from "../src/executor.js";
 import type { ClaimConfig } from "../src/protocol.js";
 import type { ProvisionInput, ProvisionResult } from "../src/provision.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
+import { RACED_FILES, seedRacedTree, startSwapRacer } from "./swap-racer.js";
 
 let worktree: string;
 let provisionRoot: string;
@@ -22,6 +23,9 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await fs.rm(worktree, { recursive: true, force: true });
+  // Unsupported production platforms retain read-only trees. Restore fixture
+  // permissions here, before removal; a test-local after hook runs too late.
+  await restoreTreeWritability(provisionRoot);
   await fs.rm(provisionRoot, { recursive: true, force: true });
   await fs.rm(homeDir, { recursive: true, force: true });
 });
@@ -200,14 +204,28 @@ async function exists(p: string): Promise<boolean> {
 }
 
 describe("provision dir cleanup is uid-aware (PRD #1809 M3)", () => {
-  it("removes a failed install's provision dir even with a read-only (0555) subtree", async (t) => {
-    if (process.getuid?.() === 0) {
-      t.skip("running as uid 0 — the 0555 part of this fixture is inert for root");
-      return;
+  it("removeProvisionDir keeps outside names and contents intact during intermediate swaps", async (t) => {
+    if (process.platform !== "linux") return t.skip("the swap racer exercises Linux removal");
+    const target = path.join(provisionRoot, "run");
+    await seedRacedTree(target, homeDir);
+    const { logger, lines } = recordingLogger();
+    const racer = await startSwapRacer(target, homeDir, worktree);
+    let swaps: number;
+    try {
+      await removeProvisionDir(target, logger);
+    } finally {
+      swaps = await racer.stop();
     }
-    // A failed run must not leave a read-only provision tree behind; if it does, restore write
-    // access so the suite's own cleanup can still remove it (and report the leak as the failure).
-    t.after(() => restoreTreeWritability(provisionRoot));
+    assert.ok(swaps > 0, "the racer made positive intermediate swaps");
+    const names = await fs.readdir(homeDir);
+    console.log(JSON.stringify({ swaps, outsideRemaining: names.length, outsideLost: RACED_FILES - names.length }));
+    assert.deepEqual(names.sort(), Array.from({ length: RACED_FILES }, (_, i) => `f${i}`).sort());
+    for (const name of names) assert.equal(await fs.readFile(path.join(homeDir, name), "utf8"), "keep\n");
+    assert.ok(!(await exists(target)) || lines.some((l) => JSON.stringify(l).includes("provision dir cleanup failed")));
+  });
+  it("removes a failed install's provision dir even with a read-only (0555) subtree", async () => {
+    // Linux removes the failed install's tree; unsupported platforms retain it.
+    // The file-level cleanup restores writability before removing retained fixtures.
     const h = makeCtx({ tool_packages: ["go@1.24"] });
     const provision = (async (input: ProvisionInput): Promise<ProvisionResult> => {
       await readOnlyInstall(input.runDir);
@@ -218,12 +236,12 @@ describe("provision dir cleanup is uid-aware (PRD #1809 M3)", () => {
       err.message.startsWith(REASON_PROVISION_FAILED),
     );
 
-    assert.equal(await exists(path.join(provisionRoot, h.ctx.runId)), false, "the provision dir is removed");
+    assert.equal(await exists(path.join(provisionRoot, h.ctx.runId)), process.platform !== "linux", "Linux removes the tree; other platforms retain it");
   });
 
   it("removeProvisionDir never throws and logs a dir it cannot remove", async () => {
     const { logger, lines } = recordingLogger();
-    // rmHomeTree refuses a relative path outright: the failure is logged, not thrown.
+    // rmTeardownTree refuses a relative path outright: the failure is logged, not thrown.
     await removeProvisionDir("relative/provision/dir", logger);
     assert.ok(
       lines.some((l) => JSON.stringify(l).includes("provision dir cleanup failed")),

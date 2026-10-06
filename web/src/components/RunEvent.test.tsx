@@ -22,6 +22,72 @@ function msg(partial: Partial<RunMessage> & { kind: string; seq: number }): RunM
   return { agent: "lead", agent_instance: null, agent_label: null, payload: {}, created_at: "2026-07-04T00:00:00.000Z", ...partial };
 }
 
+describe("draft capture status card", () => {
+  const capture = (over: Record<string, unknown> = {}) => msg({
+    seq: 1, kind: "status", payload: {
+      event: "draft_plan_capture", version: 1,
+      label: "draft, unapproved, possibly incomplete",
+      plan_md: "# Draft heading\n\n- first step\n- second step", truncated: false, ...over,
+    },
+  });
+
+  it("renders Markdown with the literal advisory label and no approval controls", () => {
+    const r = render(<RunEventRow msg={capture()} live={false} />);
+    expect(r.getByTestId("draft-plan-capture")).toBeTruthy();
+    expect(r.getByText("draft, unapproved, possibly incomplete")).toBeTruthy();
+    expect(r.getByRole("heading", { name: "Draft heading" })).toBeTruthy();
+    expect(r.getAllByRole("listitem").map((el) => el.textContent)).toEqual(["first step", "second step"]);
+    expect(r.queryAllByRole("button")).toHaveLength(0);
+    expect(r.queryByText(/truncated at/)).toBeNull();
+  });
+
+  it("shows the truncation notice without interpreting hostile HTML, bidi or controls", () => {
+    const hostile = "# Safe\u202e\u0007 heading\n\n<script>alert(1)</script>\n\n<img src=x onerror=alert(1)>\n\n[bad](javascript:alert(1))";
+    const r = render(<RunEventRow msg={capture({ plan_md: hostile, truncated: true })} live={false} />);
+    const card = r.getByTestId("draft-plan-capture");
+    expect(r.getByRole("heading", { name: "Safe heading" })).toBeTruthy();
+    expect(r.getByText("Draft capture truncated at 32 KiB after redaction.")).toBeTruthy();
+    expect(card.textContent).toContain("<script>alert(1)</script>");
+    expect(card.querySelector("script, img, [onerror]")).toBeNull();
+    expect(card.textContent).not.toContain("\u202e");
+    expect(card.textContent).not.toContain("\u0007");
+    for (const el of Array.from(card.querySelectorAll("*"))) {
+      for (const attr of ["href", "src", "title", "aria-label", "style"]) {
+        const value = el.getAttribute(attr) ?? "";
+        expect(value).not.toMatch(/javascript:|alert\(1\)/);
+        expect(value).not.toContain("\u202e");
+        expect(value).not.toContain("\u0007");
+      }
+    }
+  });
+
+  it("strips entity-encoded bidi from the draft Markdown heading and link title", () => {
+    const r = render(<RunEventRow msg={capture({
+      plan_md: '# Report &#x202e;denied&#x202c;\n\n[details](https://example.com "review &#8238;denied&#8236;")',
+    })} live={false} />);
+    const card = r.getByTestId("draft-plan-capture");
+    expect(r.getByRole("heading", { name: "Report denied" })).toBeTruthy();
+    expect(card.querySelector("a")?.getAttribute("title")).toBe("review denied");
+    expect(card.textContent).not.toMatch(/[\p{Cf}]/u);
+  });
+
+  it("does not treat a subagent capture as the lead's draft", () => {
+    const r = render(<RunEventRow msg={{ ...capture(), agent: "coder", agent_instance: "child" }} live={false} />);
+    expect(r.queryByTestId("draft-plan-capture")).toBeNull();
+    expect(r.getByText("status: draft_plan_capture")).toBeTruthy();
+  });
+
+  it.each([
+    { version: 2 }, { plan_md: 42 }, { truncated: "false" },
+    { label: "approved" }, { event: "other" },
+  ])("uses the ordinary status fallback for invalid payload %j", (over) => {
+    const message = capture(over);
+    const r = render(<RunEventRow msg={message} live={false} />);
+    expect(r.queryByTestId("draft-plan-capture")).toBeNull();
+    expect(r.container.textContent).toContain(describeStatus(message.payload));
+  });
+});
+
 describe("toolSummary", () => {
   it("keeps the full multi-line command for Bash (no first-line truncation)", () => {
     // PRD #38 Decision 1: the full command is the source of truth; truncation is

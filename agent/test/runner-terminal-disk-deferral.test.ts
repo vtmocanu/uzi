@@ -1,4 +1,5 @@
 import { describe, it } from "node:test";
+import { ProviderPolicyRefusal, admitPolicyTurn } from "../src/provider-policy-refusal.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -127,6 +128,36 @@ function supervisedSafety(mode: "empty" | "absent" | "incomplete"): CodexExecuti
 const LINUX_CAPTURE = process.platform !== "linux" ? "requires Linux terminal-capture process proof" : false;
 
 describe("terminal execution disk deferral", () => {
+  for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) it(`policy refusal (#2321) ${tag} remains terminal on a full data volume`, async () => {
+    const error = new ProviderPolicyRefusal({ ...admitPolicyTurn("implement"), event: "provider_policy_refusal",
+      provider: "codex", category: "policy_refusal", origin: "root", policy_tag: tag });
+    const f = fixture({ error });
+    await f.runner.execute(f.claim);
+    assert.equal(f.calls(), 1);
+    assert.equal(f.reclaims(), 0, "policy refusal never enters the disk reclaim/retry path");
+    assert.equal(parks().length, 0);
+    const failed = api.states.find(s => s.body.status === "failed")!.body;
+    assert.equal(failed.fail_origin, "provider_policy_refusal");
+    assert.equal(failed.failure_reason, `Codex provider safety-policy refusal (${tag})`);
+  });
+
+  it("policy refusal retains its origin when terminal retirement cannot prove quiescence", async () => {
+    const error = new ProviderPolicyRefusal({ ...admitPolicyTurn("implement"), event: "provider_policy_refusal",
+      provider: "codex", category: "policy_refusal", origin: "root", policy_tag: "cyberPolicy" });
+    let proofs = 0;
+    const f = fixture({ error, runner: { quiesceRun: async req => {
+      if (req.site !== "terminal_retire") return QUIESCENT;
+      proofs++;
+      return { ...QUIESCENT, process: { state: "unverified", processes: [], killed: [], detail: "unknown process" } };
+    } } });
+    await f.runner.execute(f.claim);
+    assert.equal(proofs, 1);
+    assert.equal(api.states.find(s => s.body.status === "failed")?.body.fail_origin, "provider_policy_refusal");
+    assert.equal(f.reclaims(), 0);
+    assert.equal(parks().length, 0);
+    assert.equal(fs.readFileSync(path.join(f.clone(), "DIRTY.txt"), "utf8"), "dirty sentinel\n");
+  });
+
   it("setup failure on a full volume keeps the original failure path", async () => {
     const f = fixture();
     git.createOrAttachRunnerClone = async () => { f.setFull(); throw new Error("opaque setup failure"); };

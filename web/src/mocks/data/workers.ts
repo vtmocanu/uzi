@@ -9,6 +9,9 @@ import { mockAdmin } from "./users";
 
 export const mockWorkers: Worker[] = [
   {
+    // Healthy busy retention: unpublished work alone needs no owner decision.
+    retaining_unpublished_work: true,
+    custody_decisions_needed: 0,
     id: "w-laptop",
     name: "laptop",
     status: "online",
@@ -149,6 +152,10 @@ export const mockWorkers: Worker[] = [
   {
     // Un-quota'd / cgroup-v1 host → process fallback: no known limit (absolute mem,
     // no percentage bar) and the "worker process only" label.
+    // Idle after retaining unpublished committed work: the owner must decide
+    // whether to archive or explicitly discard it.
+    retaining_unpublished_work: true,
+    custody_decisions_needed: 1,
     id: "w-nas",
     name: "nas-runner",
     status: "online",
@@ -383,6 +390,7 @@ export const mockAdminWorkers: AdminWorker[] = [
   { ...mockWorkers[0], owner_email: mockAdmin.email, disk_pressure_volumes: [], cleanup_pending: false },
   { ...mockWorkers[1], owner_email: mockAdmin.email, disk_pressure_volumes: [], cleanup_pending: false },
   { ...mockWorkers[2], owner_email: mockAdmin.email, disk_pressure_volumes: [], cleanup_pending: false },
+  // Include the owner-decision case in the admin demo as well.
   { ...mockWorkers[3], owner_email: mockAdmin.email, disk_pressure_volumes: [], cleanup_pending: false },
   {
     // A cap-2 worker running both slots → "2/2 runs" badge demo (PRD #42), and a

@@ -236,6 +236,18 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 		return store.RunSchedule{}, false
 	}
 
+	capacityReq := req
+	capacityReq.Target, capacityReq.Timing = cur.Target, cur.Timing
+	capacityReq.CapacityLimit, capacityReq.CapacityRoomNeeded = mergeScheduleCapacity(cur, req)
+	selector := schedtmpl.SelectorLabel
+	if job, ok := schedtmpl.BySlug(cur.CatalogSlug.String); ok {
+		selector = job.SelectorKind
+	}
+	if status, msg := validateScheduleCapacity(capacityReq, selector); status != 0 {
+		httpx.Error(w, status, msg)
+		return store.RunSchedule{}, false
+	}
+	capacityLimit, capacityRoomNeeded := capacityColumn(capacityReq.CapacityLimit), capacityColumn(capacityReq.CapacityRoomNeeded)
 	cron := cur.CronExpr.String
 	if req.CronExpr != "" {
 		cron = req.CronExpr
@@ -396,7 +408,7 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 	// OR-ed with a stale true — Reset and an exact-restore patch both un-customize).
 	customized := false
 	if job, ok := schedtmpl.BySlug(cur.CatalogSlug.String); ok {
-		customized = defaultEditableDiverges(job, cron, tz, model, autoApprove, waitOnLimit, mrRework, maxIssues, outputMode)
+		customized = defaultEditableDiverges(job, cron, tz, model, autoApprove, waitOnLimit, mrRework, maxIssues, outputMode, capacityLimit, capacityRoomNeeded)
 	} else {
 		// Catalog entry gone: cannot compare, so preserve the stored flag rather than guess.
 		customized = cur.Customized
@@ -422,7 +434,7 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 	// harness (PRD #1429 M4a) is likewise a run option, not a catalog field: its catalog
 	// baseline is no pin (NULL), so any stored pin diverges = customized. A cleared pin does
 	// not, so an exact-restore un-customizes. Mirrors credential_override's precedent above.
-	customized = customized || harness.Valid
+	customized = customized || harness.Valid || capacityLimit.Valid || capacityRoomNeeded.Valid
 
 	final, err := h.q.UpdateRunSchedule(r.Context(), store.UpdateRunScheduleParams{
 		Target:                     cur.Target,
@@ -439,6 +451,8 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 		WaitOnLimit:                waitOnLimit,
 		MrReworkEnabled:            mrRework,
 		MaxIssues:                  maxIssues,
+		CapacityLimit:              capacityLimit,
+		CapacityRoomNeeded:         capacityRoomNeeded,
 		Guidance:                   guidance,
 		Model:                      model,
 		OutputMode:                 outputMode,
@@ -535,7 +549,12 @@ func catalogEntryOutputMode(j schedtmpl.DefaultJob) string {
 // prompt/labels/guidance are excluded (they are never stored on the row). A blank catalog
 // model and a NULL row model both mean "inherit", so they compare equal; a 0 catalog
 // max_issues and a NULL row max_issues both mean "unlimited".
-func defaultEditableDiverges(job schedtmpl.DefaultJob, cron, tz string, model pgtype.Text, autoApprove, waitOnLimit bool, mrRework pgtype.Bool, maxIssues pgtype.Int4, outputMode pgtype.Text) bool {
+func defaultEditableDiverges(job schedtmpl.DefaultJob, cron, tz string, model pgtype.Text, autoApprove, waitOnLimit bool, mrRework pgtype.Bool, maxIssues pgtype.Int4, outputMode pgtype.Text, capacity ...pgtype.Int4) bool {
+	for _, c := range capacity {
+		if c.Valid {
+			return true
+		}
+	}
 	if cron != job.Cron {
 		return true
 	}

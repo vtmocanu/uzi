@@ -63,8 +63,9 @@ const MODEL_PASS_HOME_RE = /^uzi-(?:judge|review|summary)-/;
 
 /**
  * The margin {@link modelPassMinAgeMs} adds to the longest model-pass timeout: the abort
- * grace (500 ms) and the pass's own HOME cleanup (`rmHomeTree`: up to three 120 s helper
- * passes plus two worker passes), with room to spare.
+ * grace (500 ms) and the pass's own HOME cleanup (`rmTeardownTree`: one shared 120 s
+ * deadline for worker waiting), with room to spare. Foreign-uid helpers check their
+ * time budgets cooperatively; the worker cannot kill one blocked in a syscall.
  */
 const MODEL_PASS_AGE_MARGIN_MS = 15 * 60_000;
 
@@ -74,7 +75,7 @@ const MODEL_PASS_AGE_MARGIN_MS = 15 * 60_000;
  * summary; `timeoutsMs`) plus {@link MODEL_PASS_AGE_MARGIN_MS}. main.ts derives it from the
  * configured timeouts, so raising one (e.g. SUMMARY_MODEL_TIMEOUT_MS) raises this with it.
  *
- * The proof that the owner of an old unregistered HOME is stopped:
+ * The registry and age guard for collecting an unregistered HOME:
  *
  *  - A pass in this process registers its HOME right after `mkdtemp` and unregisters it
  *    only after its own cleanup ran (model-pass.ts `isLiveModelPassHome`), so a HOME a live
@@ -84,8 +85,9 @@ const MODEL_PASS_AGE_MARGIN_MS = 15 * 60_000;
  *    previous life of this worker. No other worker process shares this data volume: it is
  *    one worker process per data dir (run-disk-locks.ts relies on the same). A pass holds
  *    its HOME for at most its wall-clock cap plus the abort grace and its own cleanup,
- *    after which it never writes there again, and a HOME's mtime is never earlier than its
- *    creation, so an mtime older than this bound means its pass has ended.
+ *    after which this worker stops waiting. A blocked foreign-uid helper may outlive its
+ *    cooperative budget, and an aborted query may outlive its grace: age is not proof that
+ *    every writer stopped. Removal remains descriptor-pinned even after the age guard.
  */
 export function modelPassMinAgeMs(timeoutsMs: readonly number[]): number {
   return Math.max(0, ...timeoutsMs) + MODEL_PASS_AGE_MARGIN_MS;

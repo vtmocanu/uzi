@@ -620,10 +620,14 @@ func (h *Handler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		ids = append(ids, row.ID)
 	}
+	decisions := h.custodyDecisionsByWorker(r.Context(), ids)
 	reported := h.reportedRunsByWorker(r.Context(), ids)
 	runDisk := h.runDiskByWorker(r.Context(), ids)
 	for _, row := range rows {
 		dto := workerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+		if count, ok := decisions[row.ID]; ok {
+			dto.CustodyDecisionsNeeded = &count
+		}
 		h.overlayEphemeralLease(&dto, row.LeaseSince, row.DrainingSince)
 		h.overlayOutbox(&dto, row.ID)
 		h.overlayReportedRuns(&dto, reported, row.ID)
@@ -647,10 +651,14 @@ func (h *Handler) AdminListWorkers(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		ids = append(ids, row.Worker.ID)
 	}
+	decisions := h.custodyDecisionsByWorker(r.Context(), ids)
 	reported := h.reportedRunsByWorker(r.Context(), ids)
 	runDisk := h.runDiskByWorker(r.Context(), ids)
 	for _, row := range rows {
 		dto := adminWorkerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt, h.cfg.WorkerHeartbeatStale)
+		if count, ok := decisions[row.Worker.ID]; ok {
+			dto.CustodyDecisionsNeeded = &count
+		}
 		h.overlayEphemeralLease(&dto.WorkerDTO, row.Worker.LeaseSince, row.Worker.DrainingSince)
 		h.overlayOutbox(&dto.WorkerDTO, row.Worker.ID)
 		h.overlayReportedRuns(&dto.WorkerDTO, reported, row.Worker.ID)
@@ -835,4 +843,17 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 	h.overlayReportedRuns(&dto, reported, wkr.ID)
 	overlayRunDisk(&dto, h.runDiskByWorker(r.Context(), []uuid.UUID{wkr.ID}), wkr.ID)
 	httpx.JSON(w, http.StatusOK, map[string]any{"worker": dto})
+}
+
+// custodyDecisionsByWorker is a best-effort list overlay. Errors omit every count.
+func (h *Handler) custodyDecisionsByWorker(ctx context.Context, ids []uuid.UUID) map[uuid.UUID]int {
+	if len(ids) == 0 || (h.q == nil && h.recoverySvc == nil) {
+		return nil
+	}
+	counts, err := h.recovery().CustodyDecisionsByWorker(ctx, ids)
+	if err != nil {
+		slog.Error("overlay custody decisions", "error", err)
+		return nil
+	}
+	return counts
 }

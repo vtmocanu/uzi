@@ -16,6 +16,13 @@ import (
 
 func TestWorkersDemoFleet(t *testing.T) {
 	f := newDemoClient()
+	held, healthy := f.Workers[6], f.Workers[2]
+	if !held.RetainingUnpublishedWork || held.CustodyDecisionsNeeded == nil || *held.CustodyDecisionsNeeded != 1 {
+		t.Fatal("demo held worker needs retained source and one owner decision")
+	}
+	if !healthy.RetainingUnpublishedWork || healthy.CustodyDecisionsNeeded == nil || *healthy.CustodyDecisionsNeeded != 0 || !healthy.Busy || healthy.ActiveRuns == 0 {
+		t.Fatal("demo healthy busy worker needs retained source and no owner decisions")
+	}
 	m := workersScene(true, "workers-list-120")
 	want := "workers · 9 · 8 online · 5/12 slots in use +1 ?cap · 1 holding · 1 draining · 6 need attention"
 	if got := stripANSI(m.workersSummary(120)); got != want {
@@ -122,8 +129,8 @@ func TestWorkerStatePrecedence(t *testing.T) {
 		w    apitypes.WorkerDTO
 		want string
 	}{
-		{"offline wins", apitypes.WorkerDTO{Status: "offline", RetainingUnpublishedWork: true, DrainingSince: &now, Busy: true}, "offline"},
-		{"holding wins", apitypes.WorkerDTO{Status: "online", RetainingUnpublishedWork: true, DrainingSince: &now, Busy: true}, "holding"},
+		{"offline wins", apitypes.WorkerDTO{Status: "offline", RetainingUnpublishedWork: true, CustodyDecisionsNeeded: custodyCount(1), DrainingSince: &now, Busy: true}, "offline"},
+		{"holding wins", apitypes.WorkerDTO{Status: "online", RetainingUnpublishedWork: true, CustodyDecisionsNeeded: custodyCount(1), DrainingSince: &now, Busy: true}, "holding"},
 		{"draining", apitypes.WorkerDTO{Status: "online", DrainingSince: &now, ActiveRuns: 1, Busy: true}, "draining"},
 		{"cordoned", apitypes.WorkerDTO{Status: "online", DrainingSince: &now, Busy: true}, "cordoned"},
 		{"chat busy", apitypes.WorkerDTO{Status: "online", Busy: true}, "busy"},
@@ -716,7 +723,7 @@ func TestWorkersSummaryDropsSegmentsInPriorityOrder(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			m := workersScene(true, "workers-list-80")
 			m.workers.rows = []workerRow{
-				{w: apitypes.WorkerDTO{ID: "held", Status: "online", ActiveRuns: tc.used, MaxConcurrentRuns: &tc.cap, RetainingUnpublishedWork: true}},
+				{w: apitypes.WorkerDTO{ID: "held", Status: "online", ActiveRuns: tc.used, MaxConcurrentRuns: &tc.cap, RetainingUnpublishedWork: true, CustodyDecisionsNeeded: custodyCount(1)}},
 				{w: apitypes.WorkerDTO{ID: "unknown", Status: "online"}},
 			}
 			if wide := m.workersSummary(160); !strings.Contains(wide, "+1 ?cap") || !strings.Contains(wide, "1 holding") || !strings.Contains(wide, "2 online") {
@@ -974,7 +981,7 @@ func TestWorkersZeroSummaryAndMaximumAttentionBounds(t *testing.T) {
 	r := m.workers.rows[0]
 	r.w.OutboxBlocked = sp(strings.Repeat("blocked ", 100))
 	r.w.UpgradeStatus = "upgrade_failed"
-	r.w.RetainingUnpublishedWork = true
+	r.w.RetainingUnpublishedWork, r.w.CustodyDecisionsNeeded = true, custodyCount(1)
 	r.w.Status = "offline"
 	r.w.DrainingSince = tp(time.Now())
 	for i := 0; i < 100; i++ {

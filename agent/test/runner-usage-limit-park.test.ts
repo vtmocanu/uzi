@@ -1278,7 +1278,9 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
     const rc = await git.createOrAttachRunnerClone(bare, 210, noProofReseed, RUN);
     const local = commitInTree(rc.path, "LOCAL.txt", "local\n");
     await git.fetchAgentBranch(bare, rc.path, "agent/issue-210", RUN);
-    await git.removeRunnerClone(rc.path);
+    // Simulate a missing checkout in this isolated reseed fixture; worker-uid tests
+    // exercise production teardown, which deliberately refuses off Linux.
+    fs.rmSync(rc.path, { recursive: true, force: true });
 
     // The default branch moves PAST the fork point, then the bare is refreshed.
     const moved = commitInTree(fx.originPath, "MOVED.txt", "moved\n");
@@ -1319,7 +1321,9 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
     const o1 = commitInTree(first.path, "ORIGIN.txt", "origin\n");
     await git.fetchAgentBranch(bare, first.path, "agent/issue-211", RUN);
     await git.pushBranch(bare, "agent/issue-211", "", fx.originPath);
-    await git.removeRunnerClone(first.path);
+    // Simulate a missing checkout in this isolated reseed fixture; worker-uid tests
+    // exercise production teardown, which deliberately refuses off Linux.
+    fs.rmSync(first.path, { recursive: true, force: true });
     await git.ensureClone(fx.originPath); // learn origin/agent/issue-211 = O1
 
     // A DIVERGED tracking ref: a commit off main that is NOT a descendant of O1. Bring
@@ -1329,7 +1333,9 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
     const tmp = await git.createOrAttachRunnerClone(bare, 2110, noProofReseed, "run-tmp");
     const l1 = commitInTree(tmp.path, "LOCAL.txt", "local\n");
     await git.fetchAgentBranch(bare, tmp.path, "agent/issue-2110", "run-tmp");
-    await git.removeRunnerClone(tmp.path);
+    // Simulate a missing checkout in this isolated reseed fixture; worker-uid tests
+    // exercise production teardown, which deliberately refuses off Linux.
+    fs.rmSync(tmp.path, { recursive: true, force: true });
     gitUpdateRef(bare, trackingRef(211), l1);
 
     const resumed = await git.runnerCloneForBranch(
@@ -1356,7 +1362,9 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
     // Build ON TOP of the pushed tip (descends), fetch that back — do NOT push it.
     const l1 = commitInTree(rc.path, "L.txt", "l\n");
     await git.fetchAgentBranch(bare, rc.path, "agent/issue-212", RUN);
-    await git.removeRunnerClone(rc.path);
+    // Simulate a missing checkout in this isolated reseed fixture; worker-uid tests
+    // exercise production teardown, which deliberately refuses off Linux.
+    fs.rmSync(rc.path, { recursive: true, force: true });
     await git.ensureClone(fx.originPath); // origin/agent/issue-212 stays at O1
 
     const resumed = await git.runnerCloneForBranch(
@@ -1386,7 +1394,9 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
     const tmp = await git.createOrAttachRunnerClone(bare, 213, noProofReseed, "run-dead");
     commitInTree(tmp.path, "STALE.txt", "stale\n");
     await git.fetchAgentBranch(bare, tmp.path, "agent/issue-213", "run-dead");
-    await git.removeRunnerClone(tmp.path);
+    // Simulate a missing checkout in this isolated reseed fixture; worker-uid tests
+    // exercise production teardown, which deliberately refuses off Linux.
+    fs.rmSync(tmp.path, { recursive: true, force: true });
     assert.ok(shaInBare(bare, trackingRef(213)), "precondition: the stale ref exists");
 
     // A different run (run-fresh) reseeds the same branch — it does not own the ref.

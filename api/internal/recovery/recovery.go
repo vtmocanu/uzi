@@ -59,6 +59,7 @@ var (
 // transactional upload/reserve paths use the pgx pool directly (they need a row lock and
 // a single bounded transaction, D4), so their queries are not on this interface.
 type Store interface {
+	ListOpenCustodyHoldsForWorkers(ctx context.Context, workerIDs []uuid.UUID) ([]store.ListOpenCustodyHoldsForWorkersRow, error)
 	GetCaptureForOwner(ctx context.Context, arg store.GetCaptureForOwnerParams) (store.RecoveryCapture, error)
 	ListCapturesForRunOwner(ctx context.Context, arg store.ListCapturesForRunOwnerParams) ([]store.RecoveryCapture, error)
 	GetRecoverySummaryForRun(ctx context.Context, arg store.GetRecoverySummaryForRunParams) (store.GetRecoverySummaryForRunRow, error)

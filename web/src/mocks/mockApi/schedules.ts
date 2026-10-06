@@ -6,10 +6,11 @@ import {
   type SchedulePauseDTO,
   type SchedulePreviewInput,
 } from "../../lib/api";
+import { isTerminalRun } from "../../lib/runStatus";
 import { ApiError } from "../../lib/apiError";
-import { mockRepos, mockSecrets } from "../data";
+import { mockOtherRunOwners, mockRepos, mockSecrets } from "../data";
 import { minsAgo } from "../data/time";
-import { nextRunId } from "../store";
+import { nextRunId, state } from "../store";
 import { delay, requireSession } from "./shared";
 import { repos } from "./forge";
 
@@ -29,6 +30,30 @@ function assertGuidanceWithinCap(guidance: string | null | undefined): void {
   if (guidance != null && new TextEncoder().encode(guidance).length > MAX_GUIDANCE_BYTES) {
     throw new ApiError(422, "guidance is too large");
   }
+}
+
+// Capacity PATCH is presence-aware: integers merge, but clearing needs both explicit nulls.
+function applyCapacity(s: Schedule, input: ScheduleInput): void {
+  const limit = input.capacity_limit;
+  const needed = input.capacity_room_needed;
+  if ((limit === null || needed === null) && !(limit === null && needed === null)) {
+    throw new ApiError(400, "clear both capacity fields together");
+  }
+  if (limit !== undefined) s.capacity_limit = limit;
+  if (needed !== undefined) s.capacity_room_needed = needed;
+  const c = s.capacity_limit;
+  const k = s.capacity_room_needed;
+  if ((c == null) !== (k == null)) throw new ApiError(400, "capacity fields must be set together");
+  if (c != null && k != null) {
+    if (!Number.isInteger(c) || !Number.isInteger(k) || k < 1 || k > c || c > 50)
+      throw new ApiError(400, "capacity must satisfy 1 <= room_needed <= limit <= 50");
+    const entry = s.origin === "default" && s.catalog_slug ? catalogBySlug(s.catalog_slug) : undefined;
+    if (s.target !== "sweep" || s.timing !== "recurring" ||
+      (s.origin === "default" && (!entry || (entry.selector_kind ?? "label") !== "label")))
+      throw new ApiError(400, "capacity requires a recurring label-selected sweep");
+  }
+  if (s.max_issues != null && (!Number.isInteger(s.max_issues) || s.max_issues < 1 || s.max_issues > 10000))
+    throw new ApiError(400, "max_issues must be an integer between 1 and 10000");
 }
 
 // PRD #1247 M6/M7: map a schedule's WRITE-side credential override ({mode, secret_id?})
@@ -139,6 +164,8 @@ const userSchedules: Omit<
     timing: "recurring", cron_expr: "0 2 * * 1-5", run_at: null,
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(-1, 2), auto_approve: true, wait_on_limit: true,
+    capacity_limit: null,
+    capacity_room_needed: null,
     max_issues: 1,
     guidance: "Keep the diff small and add a failing test first.",
     model: "fable",
@@ -171,6 +198,8 @@ const userSchedules: Omit<
     timing: "recurring", cron_expr: "0 3 * * *", run_at: null,
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(0, 3), auto_approve: false, wait_on_limit: true,
+    capacity_limit: null,
+    capacity_room_needed: null,
     max_issues: null,
     guidance: "Prefer the smallest change that closes the issue; no new deps.",
     model: null,
@@ -198,6 +227,8 @@ const userSchedules: Omit<
     timing: "once", cron_expr: "", run_at: daysFromNow(1, 9),
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: null, auto_approve: true, wait_on_limit: false,
+    capacity_limit: null,
+    capacity_room_needed: null,
     max_issues: null,
     guidance: null,
     model: null,
@@ -215,6 +246,8 @@ const userSchedules: Omit<
     timing: "recurring", cron_expr: "0 4 * * *", run_at: null,
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(0, 4), auto_approve: false, wait_on_limit: true,
+    capacity_limit: null,
+    capacity_room_needed: null,
     max_issues: null,
     guidance: null,
     model: null,
@@ -243,6 +276,8 @@ const userSchedules: Omit<
     timing: "recurring", cron_expr: "0 9 * * 1", run_at: null,
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(-7, 9), auto_approve: true, wait_on_limit: false,
+    capacity_limit: null,
+    capacity_room_needed: null,
     max_issues: null,
     guidance: null,
     model: null,
@@ -257,6 +292,8 @@ const userSchedules: Omit<
     timing: "recurring", cron_expr: "0 */6 * * *", run_at: null,
     timezone: "UTC", next_fire_at: null,
     last_fired_at: daysFromNow(-3, 18), auto_approve: true, wait_on_limit: false,
+    capacity_limit: null,
+    capacity_room_needed: null,
     max_issues: 3,
     guidance: null,
     model: null,
@@ -285,6 +322,8 @@ const userSchedules: Omit<
     timing: "recurring", cron_expr: "30 1 * * *", run_at: null,
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(-1, 1, 30), auto_approve: true, wait_on_limit: false,
+    capacity_limit: null,
+    capacity_room_needed: null,
     max_issues: null,
     guidance: null,
     model: null,
@@ -304,6 +343,8 @@ const userSchedules: Omit<
     timing: "once", cron_expr: "", run_at: minsAgo(226),
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: minsAgo(226), auto_approve: true, wait_on_limit: true,
+    capacity_limit: null,
+    capacity_room_needed: null,
     max_issues: null,
     guidance: null,
     model: null,
@@ -330,6 +371,8 @@ const userSchedules: Omit<
     timing: "once", cron_expr: "", run_at: minsAgo(11),
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: minsAgo(11), auto_approve: false, wait_on_limit: true,
+    capacity_limit: null,
+    capacity_room_needed: null,
     max_issues: null,
     guidance: null,
     model: null,
@@ -425,6 +468,7 @@ const scheduleCatalog: CatalogEntry[] = [
       "Implement the sweep's planned-work issue. Treat the issue description (and any linked spec) as the specification, deliver the change end to end with tests, and run the project's gate before finishing. Keep the work scoped to what the issue asks for and stop to report if it turns out to depend on something not yet in place.",
   },
   {
+    selector_kind: "assigned",
     slug: "assigned-sweep",
     name: "Assigned-work sweep",
     description: "Daily sweep over open issues assigned to the uzi bot account, starting a run for the oldest few.",
@@ -479,6 +523,8 @@ function materializeDefault(
     // is inherit until an override sets it, so seed the explicit null sentinel here rather
     // than leaving the field undefined (which would diverge from the server response shape).
     mr_rework_enabled: null,
+    capacity_limit: null,
+    capacity_room_needed: null,
     max_issues: entry.target === "sweep" ? entry.max_issues : null,
     // Owner OVERLAY (issue #675): null by default; a seed sets it via `...over`.
     guidance: null,
@@ -563,6 +609,20 @@ let schedules: Schedule[] = [
   ...seededDefaults,
 ];
 
+// Capacity demos use custom rows; shipped catalog defaults remain ungated.
+const capacityDemo = schedules.find((s) => s.target === "sweep" && s.origin === "user")!;
+schedules.push(
+  { ...capacityDemo, id: "sch-capacity-blocked", capacity_limit: 4, capacity_room_needed: 2,
+    max_issues: 1, cron_expr: "*/10 * * * *", last_fired_at: minsAgo(10),
+    last_fire: { fired_at: minsAgo(10), matched: 0, capped: false, started: [], skips: [],
+      capacity: { in_flight: 3, limit: 4, room_needed: 2, room: 1, blocked: true } } },
+  { ...capacityDemo, id: "sch-capacity-passing", capacity_limit: 4, capacity_room_needed: 2,
+    max_issues: null, cron_expr: "0 2 * * *", last_fired_at: minsAgo(20),
+    last_fire: { fired_at: minsAgo(20), matched: 1, capped: false,
+      started: [{ issue_iid: 1001, run_id: "run-done", title: "Capacity demo" }], skips: [],
+      capacity: { in_flight: 2, limit: 4, room_needed: 2, room: 2, blocked: false } } },
+);
+
 // PRD #1732 D11: the schedules whose stored credential override pins the Anthropic token
 // `label`, for the dependents read behind the Disable dialog.
 export function schedulesPinnedTo(label: string): { id: string; target: string }[] {
@@ -639,7 +699,9 @@ export const schedulesApi = {
           ? scheduleOverrideToRead(input.credential_override, target)
           : null,
       // Sweep-only; new sweeps default to 10 (mirrors the server), unlimited otherwise.
-      max_issues: target === "sweep" ? (input.max_issues ?? 10) : null,
+      capacity_limit: null,
+      capacity_room_needed: null,
+      max_issues: target === "sweep" ? (input.max_issues === undefined ? 10 : input.max_issues) : null,
       // Guidance on issue/sweep only; null (none) for prompt (re-nulled per target).
       guidance: target === "issue" || target === "sweep" ? (input.guidance ?? null) : null,
       // Baked catalog guidance is a default-sweep-only field (issue #675); null for a user row.
@@ -659,11 +721,12 @@ export const schedulesApi = {
       customized: false,
       // A bare create sends no group id (standalone). Multi-repo fan-out (PRD #636 M2)
       // stamps a shared id via the create input; a single-repo create stays NULL here.
-      sibling_group_id: null,
+      sibling_group_id: input.sibling_group_id ?? null,
       created_at: now,
       updated_at: now,
       next_fires: [],
     };
+    applyCapacity(s, input);
     schedules = [s, ...schedules];
     return delay(scheduleDTO(s), 250);
   },
@@ -758,6 +821,7 @@ export const schedulesApi = {
       m.repo_id = repo.id;
       m.repo_path = repo.path_with_namespace;
     }
+    applyCapacity(m, input);
     // Re-null the fields the (possibly changed) target/timing does not use, so the
     // stored shape matches the DB's field-presence CHECK.
     m.issue_iid = m.target === "issue" ? m.issue_iid : null;
@@ -781,6 +845,7 @@ export const schedulesApi = {
       const entry = catalogBySlug(m.catalog_slug);
       if (entry) {
         m.customized =
+          m.capacity_limit != null || m.capacity_room_needed != null ||
           m.cron_expr !== entry.cron ||
           m.timezone !== entry.timezone ||
           (m.model ?? "") !== entry.model ||
@@ -816,20 +881,24 @@ export const schedulesApi = {
     requireSession();
     const s = schedules.find((x) => x.id === id);
     if (!s) throw new ApiError(404, "schedule not found");
-    // The demo does not spin up a live worker run; it reports one fired, matching
-    // the seam's typical single-run outcome for a pinned issue / prompt.
-    const runId = nextRunId();
-    return delay(
-      {
-        created: 1,
-        run_ids: [runId],
-        matched: 1,
-        capped: false,
-        started: [{ issue_iid: s.issue_iid, run_id: runId, title: s.prompt || `#${s.issue_iid ?? ""}` }],
-        skips: [],
-      },
-      250,
-    );
+    // Use the mock store's owner attribution, across repos and all run origins.
+    const inFlight = [...state.runs.values()].filter((r) =>
+      !isTerminalRun(r.status) &&
+      r.kind !== "chat" && r.kind !== "judge" && !(r.id in mockOtherRunOwners)).length;
+    const capacity = s.capacity_limit != null && s.capacity_room_needed != null
+      ? { in_flight: inFlight, limit: s.capacity_limit, room_needed: s.capacity_room_needed,
+          room: Math.max(0, s.capacity_limit - inFlight),
+          blocked: Math.max(0, s.capacity_limit - inFlight) < s.capacity_room_needed }
+      : undefined;
+    // Mock Run Now returns a summary only; it never persists last_fire or starts a worker.
+    const count = capacity?.blocked ? 0 : s.target === "sweep"
+      ? Math.min(s.max_issues ?? capacity?.room ?? 3, capacity?.room ?? Infinity) : 1;
+    const started = Array.from({ length: count }, (_, i) => ({
+      issue_iid: s.target === "sweep" ? 1001 + i : s.issue_iid,
+      run_id: nextRunId(), title: s.prompt || `#${s.issue_iid ?? 1001 + i}`,
+    }));
+    return delay({ created: count, run_ids: started.map((r) => r.run_id),
+      matched: count, capped: false, started, skips: [], capacity }, 250);
   },
   previewSchedule: async (input: SchedulePreviewInput) => {
     requireSession();

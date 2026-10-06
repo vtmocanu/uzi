@@ -58,6 +58,8 @@
 
 import { renderCodexRun } from "./render.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
+import { DRAFT_PLAN_ACK } from "../draft-plan.js";
+import { emptyCounts, sanitizeText } from "../sanitize.js";
 import { CODEX_DELEGATE_TOOLS, CODEX_SIGNAL_TOOLS, canonicalizeCodexToolName } from "./broker.js";
 import {
   CodexTurnFailedError,
@@ -102,6 +104,12 @@ import type {
   ToolDisposal,
   TurnSignals,
 } from "../harness.js";
+import {
+  admitPolicyTurn,
+  isPolicyRefusalTag,
+  ProviderPolicyRefusal,
+  validatePolicyRefusal,
+} from "../provider-policy-refusal.js";
 import type { CallbackResult, CodexCallbackBroker } from "./broker.js";
 import type { CodexAppServerAuthMode, CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { ExecutionRegistry, RegisteredRoot } from "./registry.js";
@@ -823,6 +831,11 @@ export class CodexHarness implements RunHarness {
     }
   }
 
+  private activePolicyAdmission?: ReturnType<typeof admitPolicyTurn>;
+  get policyAdmission(): ReturnType<typeof admitPolicyTurn> | undefined {
+    return this.activePolicyAdmission;
+  }
+
   startTurn(request: RunTurnRequest): HarnessTurn {
     if (this.closed) {
       throw new CodexHarnessError({ category: "transport", message: "codex harness is closed" });
@@ -833,6 +846,7 @@ export class CodexHarness implements RunHarness {
     // terminal precedence handles it), exactly as the Claude adapter defers query
     // creation.
     const rendered = this.render(request);
+    this.activePolicyAdmission = admitPolicyTurn(request.phase);
     this.turnClosed = false;
     this.terminalEmitted = false;
     this.activeTurnId = undefined;
@@ -1514,7 +1528,9 @@ export class CodexHarness implements RunHarness {
       } catch {
         /* projection is best-effort (issue #1583): it never blocks the reply */
       }
-      this.safeRespond(transport, requestId, result);
+      const reply = canonical === "save_draft_plan" && result.ok
+        ? { ok: true as const, output: DRAFT_PLAN_ACK } : result;
+      this.safeRespond(transport, requestId, reply);
       return result;
     };
     const toolName = asString(p.tool);
@@ -1557,7 +1573,14 @@ export class CodexHarness implements RunHarness {
     // scanned}`), which the caller surfaces on a main-origin signals frame. A DENIED signal
     // (result.ok === false) folds nothing; a non-signal effect (shell/file/mcp) is undefined.
     if (isSignal && result.ok) {
-      return { signals: result.output as Readonly<Partial<TurnSignals>> };
+      const signals = result.output as Readonly<Partial<TurnSignals>>;
+      // Scrub accepted drafts with the live runtime-token/claim-secret projection
+      // seam before the reducer emits them. Sanitize the full text first so a
+      // control-split secret matches; MessageBatcher owns the later UTF8 cap.
+      return { signals: signals.draftPlans === undefined ? signals : {
+        ...signals,
+        draftPlans: signals.draftPlans.map((plan) => this.scrubProjected(sanitizeText(plan, emptyCounts()))),
+      } };
     }
     return undefined;
   }
@@ -1597,7 +1620,8 @@ export class CodexHarness implements RunHarness {
       return (result) => {
         let output: string;
         try {
-          output = projectToolOutput(result, this.scrubProjected);
+          output = projectToolOutput(!result.ok && result.policyRefusal
+            ? { ok: true, output: { code: result.code, message: result.message, policyRefusal: result.policyRefusal } } : result, this.scrubProjected);
         } catch {
           output = "[projection failed]";
         }
@@ -1659,7 +1683,8 @@ export class CodexHarness implements RunHarness {
     this.closeOpenChildTools(dispatch);
     let output: string;
     try {
-      output = projectToolOutput(result, this.scrubProjected);
+      output = projectToolOutput(!result.ok && result.policyRefusal
+        ? { ok: true, output: { code: result.code, message: result.message, policyRefusal: result.policyRefusal } } : result, this.scrubProjected);
     } catch {
       output = "[projection failed]";
     }
@@ -1789,7 +1814,8 @@ export class CodexHarness implements RunHarness {
    *  The stable machine `code` and human `message` are already bounded by the broker; a
    *  denial is returned as `success:false` so it lands as a failed tool result. */
   private replyOf(result: CallbackResult): { result: unknown } {
-    const text = result.ok ? this.stringifyOutput(result.output) : result.message;
+    const text = result.ok ? this.stringifyOutput(result.output)
+      : result.policyRefusal ? JSON.stringify({ code: result.code, message: result.message, policyRefusal: result.policyRefusal }) : result.message;
     return { result: { success: result.ok, contentItems: [{ type: "inputText", text }] } };
   }
 
@@ -1929,6 +1955,12 @@ export class CodexHarness implements RunHarness {
     const fromTerminal = normalizeCodexErrorInfo(asObject(turn?.error)?.codexErrorInfo);
     const classification = pickCodexClassification(this.pendingCodexError, fromTerminal);
     const errors = normalizeCodexTerminalErrors(subtype, outcome, classification);
+    const policyRefusal = outcome === "failed" && isPolicyRefusalTag(classification?.classification) && this.policyAdmission
+      ? validatePolicyRefusal({
+        ...this.policyAdmission, event: "provider_policy_refusal", provider: "codex",
+        category: "policy_refusal", origin: "root", policy_tag: classification.classification,
+      })
+      : undefined;
     // PRD #1332 C4a/C4b: attach the per-model token accounting as the result-frame `modelUsage`,
     // now carrying each model's closed `costStatus` (and `costUSD` when metered) projected from
     // the run's auth mode against the D5 price table (C4b). The reducer emits
@@ -1949,6 +1981,7 @@ export class CodexHarness implements RunHarness {
       outcome,
       subtype,
       errors,
+      ...(policyRefusal ? { policyRefusal } : {}),
       usage,
       metrics: { cost },
       failure: {
@@ -1960,7 +1993,9 @@ export class CodexHarness implements RunHarness {
         // the category defaults to "unknown", byte-identical to before #1534.
         materialize: (_limit): HarnessThrownFailure => {
           const suffix = classification !== undefined ? ` (${formatCodexClassification(classification)})` : "";
-          const original = new CodexTurnFailedError(`codex turn failed: ${subtype}${suffix}`, classification);
+          const original = policyRefusal
+            ? new ProviderPolicyRefusal(policyRefusal)
+            : new CodexTurnFailedError(`codex turn failed: ${subtype}${suffix}`, classification);
           const category = classification?.category ?? "unknown";
           return { failure: { category, message: original.message }, original };
         },

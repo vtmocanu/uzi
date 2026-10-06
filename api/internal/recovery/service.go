@@ -932,3 +932,25 @@ func (s *Service) DiscardHold(ctx context.Context, userID, runID, holdID uuid.UU
 	s.custodySettledAfterCommit(runID) // PRD #1810 D3: after the discard's commit
 	return true, nil
 }
+
+// CustodyDecisionsByWorker counts owner decisions for the authorized listed worker IDs.
+// A failed read discards all rows, including any partial result, so callers can omit the overlay.
+func (s *Service) CustodyDecisionsByWorker(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]int, error) {
+	counts := make(map[uuid.UUID]int, len(ids))
+	for _, id := range ids {
+		counts[id] = 0
+	}
+	if len(ids) == 0 {
+		return counts, nil
+	}
+	rows, err := s.store.ListOpenCustodyHoldsForWorkers(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		if _, requested := counts[row.WorkerID]; requested && isDecisionAttention(deriveHoldAttention(batchHoldAttentionInput(row))) {
+			counts[row.WorkerID]++
+		}
+	}
+	return counts, nil
+}

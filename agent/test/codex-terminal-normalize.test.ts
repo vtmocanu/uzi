@@ -12,6 +12,20 @@ import {
 } from "../src/codex/terminal-normalize.js";
 import { isTransientStatus } from "../src/client.js";
 
+describe("approved policy tag categories (#2321)", () => {
+  it("maps exactly the two scalar policy tags to policy_refusal", () => {
+    for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"]) {
+      assert.deepEqual(normalizeCodexErrorInfo(tag), { classification: tag, category: "policy_refusal" });
+      assert.deepEqual(normalizeCodexErrorInfo({ [tag]: { misalignment: "private" } }), {
+        classification: "unknown", category: "unknown",
+      });
+    }
+    assert.deepEqual(normalizeCodexErrorInfo("tooManyDenials"), {
+      classification: "tooManyDenials", category: "unknown",
+    });
+  });
+});
+
 describe("Codex 0.159.3 error tags", () => {
   it("recognizes new scalar tags while rejecting attacker-shaped objects", () => {
     assert.deepEqual(normalizeCodexErrorInfo("flexUnavailable"), {
@@ -299,6 +313,21 @@ describe("pickCodexClassification", () => {
   it("prefers the RECOGNIZED terminal when the notification collapsed to 'unknown' (precedence guard)", () => {
     // A malformed notification's "unknown" must NOT mask a valid terminal turn.error.
     assert.deepEqual(pickCodexClassification(unknown, terminalRecognized), terminalRecognized);
+  });
+
+  for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) {
+    it(`a terminal ${tag} policy refusal wins over a recognized transport notification (#2321)`, () => {
+      const transport = { classification: "httpConnectionFailed", category: "transport", httpStatus: 503 } as const;
+      const policy = { classification: tag, category: "policy_refusal" } as const;
+      assert.deepEqual(pickCodexClassification(transport, policy), policy);
+      // A notification that is itself the policy refusal still wins over a non-policy terminal.
+      assert.deepEqual(pickCodexClassification(policy, transport), policy);
+    });
+  }
+
+  it("keeps notification-first precedence when neither side is a policy refusal", () => {
+    const transport = { classification: "httpConnectionFailed", category: "transport" } as const;
+    assert.deepEqual(pickCodexClassification(transport, terminalRecognized), transport);
   });
 
   it("returns an 'unknown' when BOTH are unknown (neither recognized)", () => {

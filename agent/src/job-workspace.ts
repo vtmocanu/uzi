@@ -32,7 +32,7 @@ import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 
 import type { Logger } from "./log.js";
-import { rmHomeTree } from "./rmtree.js";
+import { rmHomeTree, rmTeardownTree, type TeardownTestDeps } from "./rmtree.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { errMessage, RUN_ID_RE } from "./util.js";
 
@@ -164,7 +164,8 @@ async function assertRealJobsRoot(jobsRoot: string): Promise<void> {
 }
 
 /** Create `<jobsRoot>/<runId>` (0700 single-uid; under the uid split the setgid codex-session modes: root 2750, home 2770, work 2750 then 2770, inputs 2750, outputs 2770, files 0640) with its home/work/inputs/outputs subtree. A leftover tree for the
- *  same run id (a requeue on this worker after a hard kill) is removed first. */
+ *  same run id (a requeue on this worker after a hard kill) is removed only after an
+ *  exclusive mkdir reports EEXIST. Refusal aborts; retained content is never reused. */
 export async function createJobWorkspace(
   jobsRoot: string,
   runId: string,
@@ -176,8 +177,15 @@ export async function createJobWorkspace(
   await fs.mkdir(jobsRoot, { recursive: true, mode: 0o700 });
   const m = modes(split);
   const root = path.join(jobsRoot, runId);
-  await fs.rm(root, { recursive: true, force: true }).catch(() => undefined);
-  await fs.mkdir(root, { mode: m.root });
+  try {
+    await fs.mkdir(root, { mode: m.root });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    // Only a leftover needs removal. Refusal retains it and aborts creation;
+    // the exclusive mkdir also refuses a replacement planted after removal.
+    await rmTeardownTree(root);
+    await fs.mkdir(root, { mode: m.root });
+  }
   const home = path.join(root, "home");
   const work = path.join(root, "work");
   const inputsDir = path.join(work, "inputs");
@@ -347,9 +355,9 @@ export async function openJobWorkspace(ws: JobWorkspace, split: boolean = uidSpl
 }
 
 /** Remove a job workspace tree. Best-effort by contract: a cleanup failure is logged and never
- *  fails or reclassifies the run. */
-export async function removeJobWorkspace(ws: JobWorkspace, log: Logger): Promise<void> {
-  await rmHomeTree(ws.root).catch((err) =>
+ *  fails or reclassifies the run. Sibling writers require descriptor-pinned removal. */
+export async function removeJobWorkspace(ws: JobWorkspace, log: Logger, testDeps?: TeardownTestDeps): Promise<void> {
+  await rmTeardownTree(ws.root, testDeps).catch((err) =>
     log.warn("job workspace cleanup failed", { workspace: ws.root, error: errMessage(err) }),
   );
 }

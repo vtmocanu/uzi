@@ -22,15 +22,60 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Plan cross-check opt-in establishes a required gate for auto-approved plans ([#2149](https://github.com/vtmocanu/uzi/issues/2149)).**
+  Settings → Run defaults offers a per-user Plan cross-check switch when Claude and Codex are usable. An opted-in auto-approved Claude run sends its plan to a Codex checker before implementing: a pass approves the exact checked plan, and any other outcome (changes requested, blocked, timed out, checker unavailable, submit failure) parks the run at the human plan gate with the reason. Run-page rendering of cross-check results follows in a later change.
+
+- **Capacity gates for scheduled sweeps**
+  Recurring label sweeps can wait for room in the owner’s unfinished work and send batches within the available room, with API and CLI controls and recorded capacity outcomes.
+
+- **Advisory draft plans in run activity ([#2323](https://github.com/vtmocanu/uzi/issues/2323)).**
+  The latest valid explicit draft capture appears as Markdown in both activity views, labelled draft, unapproved, possibly incomplete, with a truncation notice when needed; earlier captures remain stored and submitted-plan approval stays separate.
+
+### Changed
+
+- **Higher default resource requests for the api and the CNPG database.**
+  The chart now requests 100m CPU / 320Mi for the api (was 50m / 128Mi) and 512Mi per CNPG instance (was 256Mi), matching what a live install actually uses, which reduces their eviction risk under node memory pressure. Limits are unchanged; override `api.resources` or `postgres.cluster.resources` to size differently.
+
+- **Codex runs provision JavaScript dependencies before implementation ([#1743](https://github.com/vtmocanu/uzi/issues/1743)).**
+  Dependency installation overlaps planning, reports installed and failed projects before the first implementation turn, and settles before capture, credential reconciliation and teardown across provider epochs.
+
 ### Fixed
 
 - **Plan cross-check preserves worker custody during planning ([#2149](https://github.com/vtmocanu/uzi/issues/2149)).**
   Confined planning captures read the immutable baseline without granting writes, and queued transport waits can be cancelled without discarding assigned records. Cross-check migrations now follow the current default schema while retaining worker maintenance and Docker preferences.
 
+- **Agent lockfile: MCP TypeScript SDK bumped past GHSA-6qxp-vccf-f47h.**
+  `@modelcontextprotocol/sdk` (transitive via the Claude Agent SDK) moves from 1.30.0 to 1.32.1, clearing the high-severity advisory that reddened `validate-agent` on `main`.
+
+- **Runner-owned clone cleanup and executor advice fallback use pinned removal ([#2324](https://github.com/vtmocanu/uzi/issues/2324)).**
+  The clone remover and executor fallback pin directory identities and require their expected owner without opening private directories to other identities. Advice-data fallback removal requires positively confirmed clean disposal; unclean or unconfirmed disposal retains data and warns. Advice cwd cleanup still runs.
+
+- **Codex subagents prefer AGENTS.md repository instructions ([#2264](https://github.com/vtmocanu/uzi/issues/2264)).**
+  Child prompts guide AGENTS.md reads first and bounded Git-index metadata fallback for inaccessible instruction symlinks when Bash is already granted, while preserving file-tool denial and permission limits.
+
+- **Codex provider safety-policy refusals have a distinct failure origin ([#2321](https://github.com/vtmocanu/uzi/issues/2321)).**
+  Runs refused for `cyberPolicy` or `misalignmentPolicyViolation` now report `provider_policy_refusal` with a fixed, content-free reason. Run logs retain bounded root/child provenance with role, phase and opaque correlation IDs; the lead may continue after a child refusal. Refusals remain terminal execution failures, included in failure totals and eligible for retrospective judging.
+
+- **Additional worker-owned cleanup resists directory swaps ([#2324](https://github.com/vtmocanu/uzi/issues/2324)).**
+  Leftover job replacement, terminal skills-plugin cleanup, Codex advice working directories and session staging use descriptor-pinned removal. Refused leftovers are never reused for a job or adopted as session state; disposable cleanup warns and retains refused trees.
+
+- **A Claude run can Read its own oversized tool output ([#2332](https://github.com/vtmocanu/uzi/issues/2332)).**
+  When the SDK spills a large tool result to a file under the run's HOME and tells the agent where, the agent's `Read` of that one file is no longer denied as outside the worktree. Only the run's own current session spill directory qualifies, and only direct-child regular files (no symlinks or nested paths); Write, Edit, Glob, Grep, Bash screening, the secret and `.git` denies, and the chat, isolated, job-runner and Codex lanes are unchanged.
+
+## [0.86.0] - 2026-10-06
+
 ### Changed
+
+- **Routine dependency bump: `gitlab.com/gitlab-org/api/client-go/v3` to v3.15.0 ([#2315](https://github.com/vtmocanu/uzi/pull/2315)).**
+  No uzi code change required.
 
 - **Ephemeral Docker preference on the Workers page ([#2278](https://github.com/vtmocanu/uzi/issues/2278)).**
   Persistent and ephemeral workers have separate sections. Instances offering the Docker tier show a saved Docker-capable checkbox beside auto-provision, usable even while auto-provision is off; writes share a pending lock and show local errors without changing confirmed preferences. Help text covers saturation, warm leases and the ephemeral cap, and qualifies Docker by the admin's repository allowlist. For eligible repositories, plain warm workers step aside so Docker-capable capacity can be provisioned immediately when no worker can claim the run; busy persistent workers retain the saturation debounce.
+
+- **Built-in agents synced to skills v0.46.0** ([#2298](https://github.com/vtmocanu/uzi/pull/2298)).
+  When a dispatch assigns a valid export slot, the auditor (v15), fact-checker (v12), reviewer (v20) and tester (v18) reuse its path for sequential throwaway exports, allowing path-keyed build caches to reuse unchanged packages.
 
 - **New hosted workers default to the large preset ([#2240](https://github.com/vtmocanu/uzi/issues/2240)).**
   Ephemeral provisioning defaults and falls back to L, and the persistent provision form preselects L. Existing workers keep their sizes; new workers reserve more CPU and memory capacity.
@@ -38,12 +83,36 @@ through `[0.52.0]`.)
 - **The agent gate distinguishes Linux-only contracts on macOS ([#1912](https://github.com/vtmocanu/uzi/issues/1912)).**
   Linux process-proof and descriptor-pinned filesystem cases report named skips on other platforms; portable cases retain coverage. The scratch guard normalizes slash spelling, while timing checks use controlled clocks, CPU budgets, and readiness or completion events.
 
+- **Agent gates report quota and concurrency diagnostics ([#2240](https://github.com/vtmocanu/uzi/issues/2240)).**
+  Gates print Node/libuv versions, detected parallelism, readable CPU quota, selected test-file concurrency and unit/M4 durations. A two-CPU default runs two unit files at a time; caller overrides and the procfs-denied serial cap keep precedence, and one-CPU workers keep Node's default.
+
 ### Added
+
+- **Healthy busy workers no longer show custody attention.**
+  The TUI holding state and web retaining-work badge appear only for recovery holds requiring an owner decision. Owner and admin worker lists include the decision count, omitting it if its read fails while preserving all custody safety guards.
 
 - **`uzi tui` has a workers tab ([#2275](https://github.com/vtmocanu/uzi/issues/2275)).**
   A `workers` tab (key `2`; pulls and ci move to `3` and `4`) lists your workers, or the factory's with `a`, attention first: state, kind, slots, CPU, memory, worst disk, version, heartbeat and what needs a human; `enter` or `→` opens a worker's detail (attention, reported runs, resources, configuration) and its runs. Uppercase `W` in a run opens its worker, and `esc`/`←` returns to where you came from. The fleet status rides right-aligned on the title line, the split's top pane can show floor or workers, and the floor names each run's worker on wide terminals.
 
 ### Fixed
+
+- **Run teardown resists directory swaps ([#1831](https://github.com/vtmocanu/uzi/issues/1831)).**
+  Teardown of terminal run HOMEs, provision directories, model-pass HOMEs and job workspaces now uses descriptor-pinned deletion with one shared two-minute deadline for worker waiting. Unsafe roots, exhausted budgets and unsupported platforms warn and retain leftovers without changing the run outcome; startup sweeps keep their existing behavior.
+
+- **Codex advice ignores async question text ([#2239](https://github.com/vtmocanu/uzi/issues/2239)).**
+  Items whose delivery is exactly `"async"` no longer contaminate advice prose or structured verdicts. Other delivery values preserve text unchanged and in order; advice surfaces and answers no questions, while the native capability stays available.
+
+- **Checkpoint scans exclude confirmed real history beneath overlays ([#1963](https://github.com/vtmocanu/uzi/issues/1963)).**
+  Mid-turn and iteration checkpoint scans use confirmed published real tips as scan floors, so an earlier overlay publication does not block clean new work by rescanning already-public history. New unpublished secrets remain blocked, and local-only checkpoint bridges do not qualify as scan floors.
+
+- **Source ref advertisements enforce the clone wire budget ([#2266](https://github.com/vtmocanu/uzi/issues/2266)).**
+  Ref listing and source fetches reject over-budget advertisements even when the Git decoder succeeds, returning the existing wire-budget diagnostic before accepting refs or fetching a pack.
+
+- **Codex answers clarification before accepting completion ([#2284](https://github.com/vtmocanu/uzi/issues/2284)).**
+  Implementation questions require a fresh completion signal after the answer. For a simultaneous milestone checkpoint, session persistence and reaping finish before asking; publication follows the runner's existing best-effort or deferred behavior. The saved session resumes with the answer in the same iteration; premature completion claims are ignored.
+
+- **Private temporary directories normalize to exactly 0700 ([#2269](https://github.com/vtmocanu/uzi/issues/2269)).**
+  Worker and runner scratch roots and adopted nested directories use 00700 to clear special bits with GNU and BusyBox chmod, including setgid inherited from a shared parent.
 
 - **Secret scans reuse the pinned worker scanner offline ([#2289](https://github.com/vtmocanu/uzi/issues/2289)).**
   The repository gate reuses installed gitleaks only when Go build metadata proves the exact module and version without replacements. Unknown or different builds use the pinned fetch, and every scan still must detect its canaries.
@@ -60,6 +129,7 @@ through `[0.52.0]`.)
 - **Recovery distinguishes a rejected terminal record from verified work ([#1974](https://github.com/vtmocanu/uzi/issues/1974)).**
   After restart, a MAC-rejected terminal record is identified in run recovery and retains source custody without authorizing completion, replay, or extra retries. Export still requires an independently verified archive. Negotiated reconciliation can remove the rejected file after exact-generation custody and sibling holds settle; unsupported servers leave local bytes retained.
 
+
 ## [0.85.2] - 2026-10-05
 
 ### Changed
@@ -71,15 +141,12 @@ through `[0.52.0]`.)
   Text reads support one-based line offsets and limits, default to 200 lines, and return at most 64 KiB with excerpt metadata; unranged binary reads preserve exact base64, while malformed or oversized helper responses fail with neutral denials.
 
 - **Codex's documented execution boundary explicitly accepts async messages and UTC clock reads ([#1566](https://github.com/vtmocanu/uzi/issues/1566)).**
-  The ADR records the pinned 0.159.3 runtime's immediate async acceptance and successful read-only clock calls, with no worker effects, across root start, resume, child and advice characterization; async text can still contaminate advice, filtering remains deferred, and the underlying clock-provider path remains unverified. This is documentation of accepted exceptions, not a runtime suppression or security fix.
+  The ADR records the pinned 0.159.3 runtime's immediate async acceptance and successful read-only clock calls, with no worker effects, across root start, resume, child and advice characterization; at release, async text could still contaminate advice and filtering was deferred (resolved subsequently by [#2239](https://github.com/vtmocanu/uzi/issues/2239)), while the underlying clock-provider path remains unverified. This is documentation of accepted exceptions, not a runtime suppression or security fix.
 
 - **Hosted Docker workers can reclaim a full DinD disk automatically, including named volumes ([#1760](https://github.com/vtmocanu/uzi/issues/1760)).**
   Upgrade warning: this destructive behavior defaults on for existing installs. DinD containers, named and anonymous volumes, networks, images and build cache are scratch; replacing the Deployment also loses the shared run-workdir emptyDir. Sustained fresh byte or inode pressure requests a drain that lets the worker's own parked runs finish, then a terminal-only claim fence and fresh custody/local-idle proof guard optional anonymous-volume pruning and DinD-only PVC replacement. The nix/data PVCs, worker UUID and join Secret survive; admission stays fenced until replacement binding, pod readiness and a fresh replacement registration heartbeat, with no rollback on failed binding. Set `UZI_WORKER_DISK_RECYCLE_ENABLED=false` before stop to opt out; started stop/rebuild finishes safely if disabled. Old workers remain report-only, ephemeral workers use terminal teardown, and compose stays manual. Real-cluster validation is a maintainer post-release task and has not run; the focused throwaway DinD check's scope is Docker prune semantics only, not the production gate, and no result is claimed here. See [Docker inside a worker](docs/worker-docker.md#dind-scratch-and-pressure-recycle).
 
 ### Added
-
-- **Plan cross-check opt-in establishes a required gate for auto-approved plans ([#2149](https://github.com/vtmocanu/uzi/issues/2149)).**
-  Settings → Run defaults offers a per-user Plan cross-check switch when Claude and Codex are usable. In this first stage, an opted-in run parks for human plan approval with `plan cross-check: checker unavailable`; the checker integration follows in the next stage. The Cross-check docs describe the future advisory Code cross-check separately.
 
 - **See the estimated usage of an interrupted Claude session apart from the metered total ([#2014](https://github.com/vtmocanu/uzi/issues/2014)).**
   Usage after the last SDK result of a parked, stopped or crashed Claude run is recorded and shown as "Estimated, not metered" on the run page and as an EST. TAIL row in `uzi run get` (and `usage_estimated_tail` in its JSON), with price-table provenance, "cost unknown" when unpriced and a plain-words coverage note; it is never added to the metered total, usage aggregates or any budget.
@@ -4876,7 +4943,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.85.2...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.86.0...HEAD
+[0.86.0]: https://github.com/vtmocanu/uzi/compare/v0.85.2...v0.86.0
 [0.85.2]: https://github.com/vtmocanu/uzi/compare/v0.85.1...v0.85.2
 [0.85.1]: https://github.com/vtmocanu/uzi/compare/v0.85.0...v0.85.1
 [0.85.0]: https://github.com/vtmocanu/uzi/compare/v0.84.0...v0.85.0

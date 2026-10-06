@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { WorkersSettings } from "./WorkersSettings";
 import { api, type SecretMeta, type Worker } from "../lib/api";
@@ -1105,6 +1105,60 @@ describe("WorkersSettings token binding (PRD #104)", () => {
     renderPage();
     await screen.findByText("laptop");
     expect(screen.queryByLabelText("Anthropic token for laptop")).toBeNull();
+  });
+
+  it.each([0, undefined, 4])("keeps the latest custody sample through rebind, then replaces it with refresh count %s", async (refreshCount) => {
+    vi.useFakeTimers();
+    const retained = aWorker({ retaining_unpublished_work: true, custody_decisions_needed: 0 });
+    mockApi.listWorkers.mockResolvedValue({ workers: [retained] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
+    let resolveRebind!: (value: { worker: Worker }) => void;
+    mockApi.setWorkerBindMode.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveRebind = resolve;
+    }));
+    renderPage();
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.queryByText("retaining work")).toBeNull();
+    fireEvent.change(screen.getByLabelText("Anthropic token for laptop"), { target: { value: "console-key" } });
+    expect(mockApi.setWorkerBindMode).toHaveBeenCalledWith("w1", "pinned", "console-key");
+
+    // A newer list sample arrives while the mutation is in flight.
+    mockApi.listWorkers.mockResolvedValue({ workers: [{ ...retained, custody_decisions_needed: 2 }] });
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(screen.getByText("retaining work")).toBeTruthy();
+    await act(async () => {
+      resolveRebind({ worker: aWorker({
+        retaining_unpublished_work: true,
+        anthropic_bind_mode: "pinned",
+        anthropic_secret_id: "sec-console",
+        anthropic_secret_label: "console-key",
+      }) });
+    });
+    expect(screen.getByText("retaining work")).toBeTruthy();
+    expect((screen.getByLabelText("Anthropic token for laptop") as HTMLSelectElement).value).toBe("console-key");
+
+    mockApi.listWorkers.mockResolvedValue({ workers: [{ ...retained, custody_decisions_needed: refreshCount }] });
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    if (refreshCount === 4) expect(screen.getByText("retaining work")).toBeTruthy();
+    else expect(screen.queryByText("retaining work")).toBeNull();
+    expect((screen.getByLabelText("Anthropic token for laptop") as HTMLSelectElement).value).toBe("");
+  });
+
+  it("honors a rebind response with an explicit zero custody count", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({
+      retaining_unpublished_work: true, custody_decisions_needed: 1,
+    })] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
+    mockApi.setWorkerBindMode.mockResolvedValueOnce({ worker: aWorker({
+      retaining_unpublished_work: true, custody_decisions_needed: 0,
+      anthropic_bind_mode: "pinned", anthropic_secret_id: "sec-console",
+      anthropic_secret_label: "console-key",
+    }) });
+    renderPage();
+    expect(await screen.findByText("retaining work")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Anthropic token for laptop"), { target: { value: "console-key" } });
+    await screen.findByText(/from its next claim/i);
+    expect(screen.queryByText("retaining work")).toBeNull();
   });
 
   it("rebinds a worker to a named token by label", async () => {

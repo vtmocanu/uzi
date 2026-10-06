@@ -86,11 +86,15 @@ describe("SummaryRunner.generateIntentSummary", () => {
     assert.equal(out, null);
   });
 
-  it("cleans up the ephemeral homeDir", async () => {
+  it("applies the platform cleanup policy to the ephemeral homeDir", async () => {
     const { runner, homeRoot } = await makeRunner(replyingQueryFn("done"));
     await runner.generateIntentSummary(intentInput);
     const entries = await fs.readdir(homeRoot);
-    assert.deepEqual(entries, [], "the per-turn uzi-summary-* HOME was removed");
+    if (process.platform === "linux") assert.deepEqual(entries, [], "the per-turn HOME was removed");
+    else {
+      assert.equal(entries.length, 1, "unsupported platforms retain the per-turn HOME");
+      assert.ok(entries[0]!.startsWith("uzi-summary-"));
+    }
     await fs.rm(homeRoot, { recursive: true, force: true });
   });
 

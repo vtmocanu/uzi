@@ -16,6 +16,7 @@ import {
 } from "./RunEvent";
 import { ChevronRightIcon } from "./icons";
 import { cx } from "./ui";
+import { parseDraftPlanCapture } from "./DraftPlanCapture";
 
 // Each agent gets a stable accent so consecutive blocks are scannable — the
 // same role that avatars + status colors play on a chat message list.
@@ -580,7 +581,18 @@ export function ActivityFeed({
 
   const capped = messages.length > CAP_TRIGGER && !showAll;
   const hiddenCount = capped ? messages.length - CAP_VISIBLE : 0;
-  const visible = capped ? messages.slice(-CAP_VISIBLE) : messages;
+  // Select from the full loaded stream, before the presentation cap. A future
+  // version or malformed payload cannot supersede the last valid draft.
+  const latestDraftSeq = useMemo(() => {
+    let latest: number | undefined;
+    for (const msg of messages) {
+      if (parseDraftPlanCapture(msg) && (latest === undefined || msg.seq > latest)) latest = msg.seq;
+    }
+    return latest;
+  }, [messages]);
+  const visible = (capped ? messages.slice(-CAP_VISIBLE) : messages).filter(
+    (msg) => !parseDraftPlanCapture(msg) || msg.seq === latestDraftSeq,
+  );
   const groups = useMemo(() => groupByAgent(visible), [visible]);
   const lanes = useMemo(() => groupByInstance(visible), [visible]);
   // PRD #516: the lead's live context-window fill (latest-wins, lead-only). Prefer the

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -441,38 +442,22 @@ func TestCodexFencedWriteTakesSecretMutationLockLiveDB(t *testing.T) {
 				if err := conn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&writer); err != nil {
 					t.Fatal(err)
 				}
-				type result struct {
-					n   int64
-					err error
-				}
-				done := make(chan result, 1)
-				go func() {
-					n, werr := w.fn(ctx, store.New(conn), user, acc, started)
-					done <- result{n, werr}
-				}()
+				pending := startCodexLockWriter(ctx, func(wctx context.Context) (int64, error) {
+					return w.fn(wctx, store.New(conn), user, acc, started)
+				})
+				// Registered after conn.Release: cancel and join before releasing the
+				// writer's connection or rolling back the holder transaction.
+				defer pending.stop()
 
-				deadline := time.Now().Add(10 * time.Second)
-				for {
-					var onAdvisory bool
-					var waitType, waitEvent string
-					if err := pool.QueryRow(ctx, `SELECT
-							$2::int = ANY(pg_blocking_pids(pid)) AND wait_event_type = 'Lock' AND wait_event = 'advisory',
-							COALESCE(wait_event_type, ''), COALESCE(wait_event, '')
-						FROM pg_stat_activity WHERE pid = $1`, writer, holder).Scan(&onAdvisory, &waitType, &waitEvent); err != nil {
-						t.Fatal(err)
-					}
-					if onAdvisory {
-						break
-					}
-					select {
-					case r := <-done:
-						t.Fatalf("the fenced write did not wait for the secret-mutation lock: (%d, %v)", r.n, r.err)
-					default:
-					}
-					if time.Now().After(deadline) {
-						t.Fatalf("the fenced write never waited on the advisory lock (last wait %s/%s)", waitType, waitEvent)
-					}
-					time.Sleep(20 * time.Millisecond)
+				pctx, pcancel := context.WithTimeout(ctx, 10*time.Second)
+				defer pcancel()
+				if err := probeCodexLock(pctx, func(ctx context.Context) pgx.Row {
+					return pool.QueryRow(ctx, `SELECT `+codexLockPredicate+`,
+						COALESCE(wait_event_type, ''), COALESCE(wait_event, '')
+						FROM (SELECT wait_event_type, wait_event, pg_blocking_pids(pid) AS blocking_pids
+							FROM pg_stat_activity WHERE pid = $1) AS activity`, writer, holder)
+				}, pending.result); err != nil {
+					t.Fatal(err)
 				}
 
 				// The hand-off must not wait on the blocked write: it holds no alias row.
@@ -491,7 +476,12 @@ func TestCodexFencedWriteTakesSecretMutationLockLiveDB(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				r := <-done
+				rctx, rcancel := context.WithTimeout(ctx, 10*time.Second)
+				defer rcancel()
+				r, err := waitCodexLockResult(rctx, pending.result)
+				if err != nil {
+					t.Fatal(err)
+				}
 				if code := pgCode(r.err); code == "40P01" {
 					t.Fatalf("the fenced write deadlocked against the hand-off: %v", r.err)
 				}

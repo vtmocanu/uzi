@@ -20,12 +20,12 @@ INSERT INTO run_schedules (
     user_id, repo_id, target, issue_iid, labels, prompt,
     timing, cron_expr, run_at, timezone, next_fire_at,
     auto_approve, wait_on_limit, mr_rework_enabled, enabled, max_issues, guidance, model, output_mode, override_subagent_model,
-    sibling_group_id, harness, credential_override_mode, credential_override_secret_id
+    capacity_limit, capacity_room_needed, sibling_group_id, harness, credential_override_mode, credential_override_secret_id
 ) VALUES (
     @user_id, @repo_id, @target, sqlc.narg('issue_iid'), sqlc.narg('labels'), sqlc.narg('prompt'),
     @timing, sqlc.narg('cron_expr'), sqlc.narg('run_at'), @timezone, sqlc.narg('next_fire_at'),
     @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), @enabled, sqlc.narg('max_issues'), sqlc.narg('guidance'), sqlc.narg('model'), sqlc.narg('output_mode'), @override_subagent_model,
-    sqlc.narg('sibling_group_id'), sqlc.narg('harness'), sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id')
+    sqlc.narg('capacity_limit'), sqlc.narg('capacity_room_needed'), sqlc.narg('sibling_group_id'), sqlc.narg('harness'), sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id')
 )
 RETURNING *;
 
@@ -46,12 +46,12 @@ INSERT INTO run_schedules (
     user_id, repo_id, target, catalog_slug, origin, customized,
     issue_iid, labels, prompt, guidance,
     timing, cron_expr, timezone, next_fire_at,
-    auto_approve, wait_on_limit, mr_rework_enabled, enabled, max_issues, model, output_mode
+    auto_approve, wait_on_limit, mr_rework_enabled, enabled, max_issues, model, output_mode, capacity_limit, capacity_room_needed
 ) VALUES (
     @user_id, @repo_id, @target, @catalog_slug, 'default', false,
     NULL, NULL, NULL, NULL,
     'recurring', @cron_expr, @timezone, @next_fire_at,
-    @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), true, sqlc.narg('max_issues'), sqlc.narg('model'), sqlc.narg('output_mode')
+    @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), true, sqlc.narg('max_issues'), sqlc.narg('model'), sqlc.narg('output_mode'), NULL, NULL
 )
 ON CONFLICT (user_id, repo_id, catalog_slug) WHERE origin = 'default' DO NOTHING
 RETURNING *;
@@ -96,6 +96,8 @@ SET cron_expr     = @cron_expr,
     guidance      = NULL,
     output_mode   = sqlc.narg('output_mode'),
     override_subagent_model = false,
+    capacity_limit = NULL,
+    capacity_room_needed = NULL,
     harness       = NULL,
     credential_override_mode = NULL,
     credential_override_secret_id = NULL,
@@ -157,6 +159,8 @@ SET target        = @target,
     model         = sqlc.narg('model'),
     output_mode   = sqlc.narg('output_mode'),
     override_subagent_model = @override_subagent_model,
+    capacity_limit = sqlc.narg('capacity_limit'),
+    capacity_room_needed = sqlc.narg('capacity_room_needed'),
     harness       = sqlc.narg('harness'),
     credential_override_mode = sqlc.narg('credential_override_mode'),
     credential_override_secret_id = sqlc.narg('credential_override_secret_id'),

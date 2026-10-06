@@ -26,6 +26,10 @@ terse and tag each AI edit `(AI-synced YYYY-MM-DD)`.
 
 - Text Read accepts path/file_path and optional one-based positive safe integer offset (default 1), limit 1–2000 (default 200); excerpts preserve UTF-8/BOM and LF/CRLF, cap at 64 KiB, and report size/content/offset/linesReturned/partialLastLine/truncated without duplicate base64 or a cursor. Strict helper validation retains the 1 MiB file ceiling and neutral errors. Invalid UTF-8 or NUL returns exact base64 only without explicit ranges; ranged binary is refused. Root and child replies must fit the existing 4 MiB transport cap. Full contract: [ADR 0296](../adr/0296-codex-bounded-text-reads.md). (AI-synced 2026-10-05)
 
+## Claude SDK spill Read (#2332)
+
+- On the Claude run lane the file-tool path guard lets `Read` (only) open a direct-child regular file of the run's own SDK tool-result spill directory (`<run HOME>/.claude/projects/<P>/<session_id>/tool-results/`), keyed on the SDK-supplied session_id/transcript_path and the worker-supplied HOME; other sessions' or runs' directories, symlinks and nested paths stay denied, and the /proc, secret and `.git` denies are unchanged. Full contract: [ADR 2332](../adr/2332-sdk-spill-read-allowance.md). (AI-synced 2026-10-06)
+
 ## MVP / infrastructure
 
 - Initial MVP is a local laptop demo via docker-compose.
@@ -489,7 +493,7 @@ Tracked as GitLab issue vtmocanu/uzi#58 (closed); PRD at `prds/done/58-hosted-k8
 - Three sizes stay, and the picker displays what each size buys. [user 2026-07-17]
 - Deleting a hosted worker requires a confirmation (it destroys the worker's volumes); deleting an external worker stays one click. [user 2026-07-16]
 - Hosted k8s gains an opt-in uid-split worker profile for Codex (default off; while on, the kube-native worker namespace's PodSecurity admission drops from `restricted` to `baseline`, while the separate Docker-capable tier keeps its own `privileged` namespace); Landlock is optional via a mode knob (`required` fails closed, `best-effort` runs unconfined on a kernel without it, relying on the uid split alone). A worker without the split, or without usable Landlock under `required`, stops advertising Codex — those runs (including tool-less Codex advice) simply queue instead of being claimed and then failing. (AI-synced 2026-09-20)
-- Codex advice has zero worker callbacks; native async questions and read-only UTC remain permitted. Async question text currently appends to advice and may fail verdict validation; filtering is deferred. Other native effectful surfaces stay disabled, except the authority-free run code host. (AI-synced 2026-10-04) [AI-synced, #1566]
+- Codex advice has zero worker callbacks; native async questions and read-only UTC remain permitted. Advice ignores text from items whose delivery is exactly `"async"`; no questions are surfaced or answered, and the native capability stays available. This resolves the earlier filtering deferral under #2239. Other native effectful surfaces stay disabled, except the authority-free run code host. (AI-synced 2026-10-05) [AI-synced, #1566]
 - Landlock for Codex commands is off by default (a third mode, `off`, is the default everywhere: worker, controller, chart); `required` and `best-effort` remain opt-ins. User decision after repeated Landlock-caused run failures (#1769, #1863, #1598). (AI-synced 2026-09-28)
 - Restricted-tier hosted workers may reach `api.openai.com`, `chatgpt.com` and `auth.openai.com` on 443, fleet-wide for the tier (Claude-only workers included), per PRD #1106 D12. (AI-synced 2026-09-24)
 
@@ -982,6 +986,7 @@ Tracked as GitHub issue vtmocanu/uzi#1593.
 - The existing `awaiting_input` answer deadline (`QUESTION_TIMEOUT_SECONDS`) applies unchanged, and an unanswered attended run timing out is the intended outcome here, not a special case. [user, #1593]
 - An auto-approved (autopilot) run, or any run with no one to ask, never parks: after the nudge it fails closed with the distinct fail_origin `plan_missing` and a fixed `failure_reason`. [user, #1593]
 - Nothing is ever inferred from the lead's prose — it never becomes a plan, a question, or part of a later prompt. [user, #1593]
+- (AI-synced 2026-10-06) Explicit draft captures are advisory activity only, never submission, approval, prompt recovery or automatic adoption; retries require fresh review. [user, #2323]
 
 ## Feature #1598 — Codex command storage no longer accumulates in the writable layer
 

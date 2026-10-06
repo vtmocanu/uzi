@@ -455,7 +455,7 @@ void _buildInfoFull;
   const _scheduleInputZero: ZeroOf<
     Omit<
       ScheduleInput,
-      "labels" | "auto_approve" | "wait_on_limit" | "enabled" | "override_subagent_model" | "sibling_group_id"
+      "labels" | "auto_approve" | "wait_on_limit" | "enabled" | "override_subagent_model" | "sibling_group_id" | "capacity_limit" | "capacity_room_needed"
     >
   > = scheduleInputZero;
   const _scheduleInputFull: Widen<ScheduleInput> = scheduleInputFull;
@@ -1397,4 +1397,14 @@ it("plan-check findings permit a null item array", () => {
     historical: false,
   };
   expect(summary.findings?.items).toBeNull();
+});
+
+
+describe("worker custody decision contract", () => {
+  it("records populated counts while zero DTOs omit the optional field", () => {
+    expect(workerFull.custody_decisions_needed).toBe(1);
+    expect(adminWorkerFull.custody_decisions_needed).toBe(1);
+    expect(workerZero).not.toHaveProperty("custody_decisions_needed");
+    expect(adminWorkerZero).not.toHaveProperty("custody_decisions_needed");
+  });
 });

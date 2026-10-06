@@ -35,6 +35,8 @@ function sched(over: Partial<Schedule> = {}): Schedule {
     last_fire: null,
     auto_approve: true,
     wait_on_limit: true,
+    capacity_limit: null,
+    capacity_room_needed: null,
     max_issues: 3,
     guidance: null,
     baked_guidance: null,
@@ -297,5 +299,27 @@ describe("LastRunOutcome — a starved sweep does not read matched 0 (#1727)", (
     const badge = screen.getByText("matched 0");
     expect(badge.className).not.toMatch(/warn/);
     expect(screen.queryByText(/not eligible/)).toBeNull();
+  });
+});
+
+describe("capacity fire presentation", () => {
+  it("gives blocked capacity precedence in compact and detail views with nothing examined", () => {
+    const blocked: LastFire = { ...fire([]),
+      capacity: { in_flight: 3, limit: 4, room_needed: 2, room: 1, blocked: true } };
+    render(<MemoryRouter><LastRunOutcome fire={blocked} expanded={false} onToggle={vi.fn()} panelId="detail" />
+      <LastFireDetail s={sched()} fire={blocked} /></MemoryRouter>);
+    expect(screen.getAllByText("Waiting for room")).toHaveLength(2);
+    expect(screen.getByText(/3 unfinished runs, limit 4/).textContent).toContain("space for 1 more run; needs 2 · nothing examined");
+    expect(screen.queryByText("matched 0")).toBeNull();
+    expect(screen.queryByText("examined")).toBeNull();
+  });
+  it("shows passing capacity alongside the ordinary outcome", () => {
+    const passing: LastFire = { ...fire([]), matched: 1,
+      started: [{ issue_iid: 1001, run_id: "r1", title: "An issue" }],
+      capacity: { in_flight: 2, limit: 4, room_needed: 2, room: 2, blocked: false } };
+    renderDetail(passing);
+    expect(screen.getByText("1 started")).toBeTruthy();
+    expect(screen.getByText(/2 unfinished runs, limit 4/)).toBeTruthy();
+    expect(screen.queryByText("Waiting for room")).toBeNull();
   });
 });

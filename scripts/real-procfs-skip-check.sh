@@ -12,15 +12,20 @@
 # `task test:agent` wraps its `npm test` with this, so CI's test-agent job runs it.
 #
 # SECOND DUTY: the same probe runs once BEFORE the command. Where enumeration is denied,
-# node cannot read its cgroup CPU quota either (libuv finds the cgroup through the proc
-# root), so os.availableParallelism() reports the host's CPU count, and `node --test`, whose
-# default concurrency is availableParallelism() - 1, runs a host-sized batch of agent test
-# files at once on a small quota, which fails timing-sensitive tests. So on a denied probe
+# libuv may also fail to discover its cgroup CPU quota through procfs. In that case
+# os.availableParallelism() reports the host's CPU count, and `node --test`, whose
+# default concurrency is max(availableParallelism() - 1, 1), runs a host-sized batch of agent test
+# files at once on a small quota, which fails timing-sensitive tests. On a denied probe
 # this exports UZI_AGENT_TEST_CONCURRENCY=1, which agent/package.json's test script turns
 # into --test-concurrency=1 (not settable through NODE_OPTIONS). A caller's value is kept
 # when it is a positive integer; any other value (empty, 0, text) is replaced by 1 with a
 # warning, since the npm script splices it into the node command line verbatim. Where the
 # probe says enumerable, the caller's value is left alone.
+#
+# With no caller value set and no denied-procfs cap, availableParallelism() == 2
+# otherwise gives one file at a time. Floor that case at 2 (issue #2240); leave a
+# one-CPU worker unchanged. Print the runtime, quota, effective concurrency/source
+# and unit-stage duration so hosted gate measurements can be compared honestly.
 #
 # Usage: scripts/real-procfs-skip-check.sh <command> [args...]
 #   UZI_REAL_PROCFS_PROBE_DIR    the directory to probe, before and after the command
@@ -76,6 +81,9 @@ catch (err) {
 # Probe once up front; the post-run verdict reuses this result. No node here is not an error
 # yet: it only matters (exit 2) if a skip later needs the verdict.
 probed=0
+available_parallelism=unknown
+concurrency_source=node-default
+if [ -n "${UZI_AGENT_TEST_CONCURRENCY:-}" ]; then concurrency_source=caller-override; fi
 if command -v node > /dev/null 2>&1; then
   run_probe
   if [ "$probe" -eq 3 ]; then
@@ -83,19 +91,43 @@ if command -v node > /dev/null 2>&1; then
       '')
         UZI_AGENT_TEST_CONCURRENCY=1
         export UZI_AGENT_TEST_CONCURRENCY
-        echo "real-procfs-skip-check: $probe_dir is not enumerable, so node cannot read its cgroup CPU quota and over-reports availableParallelism; running agent test files serially (UZI_AGENT_TEST_CONCURRENCY=1) rather than at the host CPU count"
+        concurrency_source=procfs-denied-cap
+        echo "real-procfs-skip-check: $probe_dir is not enumerable; node may over-report availableParallelism without its cgroup CPU quota, so running agent test files serially (UZI_AGENT_TEST_CONCURRENCY=1) rather than at the host CPU count"
         ;;
       *[!0-9]* | 0*)
         echo "real-procfs-skip-check: warning: UZI_AGENT_TEST_CONCURRENCY='$UZI_AGENT_TEST_CONCURRENCY' is not a positive integer; $probe_dir is not enumerable, so using UZI_AGENT_TEST_CONCURRENCY=1" >&2
         UZI_AGENT_TEST_CONCURRENCY=1
         export UZI_AGENT_TEST_CONCURRENCY
+        concurrency_source=procfs-denied-cap
         ;;
     esac
   fi
+  available_parallelism="$(node -p 'require("node:os").availableParallelism()' 2>/dev/null)" || available_parallelism=unknown
+  if [ "${UZI_AGENT_TEST_CONCURRENCY+x}" != x ] && [ "$available_parallelism" = 2 ]; then
+    UZI_AGENT_TEST_CONCURRENCY=2
+    export UZI_AGENT_TEST_CONCURRENCY
+    concurrency_source=floor
+  fi
+  # shellcheck disable=SC2016 # JavaScript template expressions, not shell variables
+  node -e '
+const fs = require("node:fs");
+const [parallelism, override, source] = process.argv.slice(1);
+const count = Number(parallelism);
+const fallback = Number.isSafeInteger(count) && count > 0 ? Math.max(count - 1, 1) : "unknown";
+const concurrency = override ? (/^[1-9][0-9]*$/.test(override) ? override : "invalid") : fallback;
+let quota = "unreadable";
+try { quota = fs.readFileSync("/sys/fs/cgroup/cpu.max", "utf8").trim().replace(/\s+/g, " "); } catch {}
+console.log(`agent-tests: node=${process.versions.node} libuv=${process.versions.uv} availableParallelism=${parallelism} cpu.max=${quota} --test-concurrency=${concurrency} source=${source}`);
+' -- "$available_parallelism" "${UZI_AGENT_TEST_CONCURRENCY:-}" "$concurrency_source" ||
+    echo "agent-tests: runtime diagnostics unavailable" >&2
+else
+  echo "agent-tests: node unavailable; runtime diagnostics and concurrency selection unavailable" >&2
 fi
 
 rc=0
+unit_started_at="$(date +%s)"
 UZI_REAL_PROCFS_SKIP_LOG="$log" "$@" || rc=$?
+printf 'agent-stage: unit duration_seconds=%s exit=%s\n' "$(($(date +%s) - unit_started_at))" "$rc"
 
 # Fail closed when the log is gone (the command deleted it): the skip count is unknowable, and
 # counting a missing file as 0 would pass a run whose skips were never seen. A non-zero command

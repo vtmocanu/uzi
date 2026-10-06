@@ -25,7 +25,10 @@ import (
 // ── Fakes ────────────────────────────────────────────────────────────────────
 
 type fakeStore struct {
-	due []store.RunSchedule
+	inFlight      int64
+	inFlightErr   error
+	capacityCalls int
+	due           []store.RunSchedule
 
 	advanceCalls []store.AdvanceScheduleParams
 	statusCalls  []store.SetRunScheduleStatusParams
@@ -1427,8 +1430,8 @@ func TestSkipReasonForErr(t *testing.T) {
 	// issue #856 added open_mr_exists; PRD #1093 M1 added schedules_paused; PRD #1429 M2 added
 	// codex_override_conflict; a PRD #1429 review fix added no_usable_credential; PRD #1732 added
 	// credential_disabled).
-	if len(AllSkipReasons) != 11 {
-		t.Fatalf("AllSkipReasons has %d reasons, want 11", len(AllSkipReasons))
+	if len(AllSkipReasons) != 12 {
+		t.Fatalf("AllSkipReasons has %d reasons, want 12", len(AllSkipReasons))
 	}
 }
 
@@ -4187,4 +4190,9 @@ func TestTickSelfImproveCapForgeErrorRetriesTransiently(t *testing.T) {
 	if len(h2.st.statusCalls) != 0 {
 		t.Fatalf("transient cap error must NOT park: statusCalls = %+v", h2.st.statusCalls)
 	}
+}
+
+func (s *fakeStore) CountInProgressRunsForUser(context.Context, uuid.UUID) (int64, error) {
+	s.capacityCalls++
+	return s.inFlight, s.inFlightErr
 }

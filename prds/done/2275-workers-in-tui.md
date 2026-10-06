@@ -1,6 +1,6 @@
 # PRD #2275: Workers in the TUI
 
-**Status**: Implemented with automated acceptance coverage. M1 and M2 are implemented; ANSI scenes are generated and asserted in both themes. D12 PNG rendering, the `tui-ux` screenshot review and the maintainer's `--demo` and live drive are done; the maintainer's review round is recorded as D14-D21. Resolved facts below were read at `main` `10d18291`. Reviewed by an architect, a tui-ux reviewer and a Codex peer before landing.
+**Status**: Complete (2026-10-06). Merged in PR #2291 (`17d103fc`). Implemented with automated acceptance coverage. M1 and M2 are implemented; ANSI scenes are generated and asserted in both themes. D12 PNG rendering, the `tui-ux` screenshot review and the maintainer's `--demo` and live drive are done; the maintainer's review round is recorded as D14-D21. Resolved facts below were read at `main` `10d18291`. Reviewed by an architect, a tui-ux reviewer and a Codex peer before landing.
 
 **Design mock**: `prds/mockups/2275-workers-tui-mock.sh` (run `bash prds/mockups/2275-workers-tui-mock.sh` in a terminal; its header lists the keys). The mock is the agreed visual and navigation reference. It is a throwaway bash script with static fixture data. It is not shipped code and never a parallel model for the TUI (`.claude/rules/tui.md`). Where the mock and this PRD disagree, this PRD wins. The mock's `w` (width 80/120) and `z` (summary on/off) keys exist only for comparing layouts; they are not product keys (`w` is the shipped `keyRework`).
 

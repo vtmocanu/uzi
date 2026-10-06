@@ -29,8 +29,9 @@
 #   - Every shipping path is a dependency manifest (basename go.mod, go.sum, Dockerfile or
 #     devbox.lock) AND every shipping commit is `chore(deps):`/`fix(deps):`/`build(deps):`
 #     typed, so a behavior edit to a Dockerfile under a fix title is not spared.
-#     Dependency bumps are cited in bulk at cut time, as before; this only spares the
-#     bot branch a per-PR commit. deploy/chart/** is never exempt.
+#     deploy/chart/** is never exempt. Both predicates live in scripts/lib/dependency-bump.sh,
+#     which release-cut.sh also sources to cite exactly these merges in one bullet at cut
+#     time; this only spares the bot branch a per-PR commit.
 # Merge commits (a pull_request checkout's synthetic merge, a merged-in main) are skipped
 # for messages, so their "Merge ..." subject neither breaks nor satisfies a rule.
 #
@@ -53,6 +54,8 @@ ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
 cd "$ROOT"
 # shellcheck source=scripts/lib/shipping-paths.sh
 . "$ROOT/scripts/lib/shipping-paths.sh"
+# shellcheck source=scripts/lib/dependency-bump.sh
+. "$ROOT/scripts/lib/dependency-bump.sh"
 
 BASE_REF="refs/remotes/origin/main"
 if ! git rev-parse --verify --quiet "$BASE_REF^{commit}" > /dev/null; then
@@ -81,11 +84,7 @@ while read -r f; do
   is_shipping "$f" || continue
   shipping=1
   printf '%s\n' "$f" >> "$TMP/shipping"
-  case "${f##*/}" in
-    go.mod|go.sum|Dockerfile|devbox.lock) ;;
-    *) manifest_only=0 ;;
-  esac
-  case "$f" in deploy/chart/*) manifest_only=0 ;; esac
+  is_dependency_manifest "$f" || manifest_only=0
 done < "$TMP/files"
 
 pass() { echo "check-changelog-entry.sh: OK: $1"; exit 0; }
@@ -142,7 +141,7 @@ all_shipping_commits '^docs(\([^)]*\))?:' && pass "every shipping commit is docs
 # Dependency exemption: manifest paths only AND every shipping commit dependency-typed
 # (Renovate's `chore(deps):` / `fix(deps):`), so a behavior edit to a Dockerfile under a
 # fix title is not spared.
-[ "$manifest_only" = 1 ] && all_shipping_commits '^(chore|fix|build)\(deps\)!?:' \
+[ "$manifest_only" = 1 ] && all_shipping_commits "$DEPENDENCY_SUBJECT_ERE" \
   && pass "only dependency manifests changed, in dependency-typed commits (cited in bulk at cut time)"
 
 echo "check-changelog-entry.sh: FAIL: shipping paths changed with no CHANGELOG.md entry:" >&2

@@ -249,7 +249,8 @@ func demoWorkers(now time.Time, runs []apitypes.RunListItemDTO) ([]apitypes.Work
 	all[5].UpgradeDetail = str("seed image could not be pulled")
 	all[5].StatsCPUPct, all[5].StatsMemBytes, all[5].StatsMemLimitBytes = nil, nil, nil
 	all[5].StatsDiskDataBytes, all[5].StatsDiskDataTotalBytes = nil, nil
-	all[6].RetainingUnpublishedWork = true
+	all[2].RetainingUnpublishedWork, all[2].CustodyDecisionsNeeded = true, num(0)
+	all[6].RetainingUnpublishedWork, all[6].CustodyDecisionsNeeded = true, num(1)
 	all[6].TemplateDeclared, all[6].TemplateReported = str("node"), str("node")
 	for _, i := range []int{7, 8} {
 		all[i].Kind, all[i].HostedSize, all[i].Docker = "external", nil, nil

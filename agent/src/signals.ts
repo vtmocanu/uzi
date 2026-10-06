@@ -23,11 +23,13 @@ import type {
   MilestoneProgress,
   Proposal,
 } from "./protocol.js";
+import { DRAFT_PLAN_ACK, parseDraftPlan } from "./draft-plan.js";
 import { clampUtf8Bytes, DECISIONS_MEMO_TRANSPORT_MAX_BYTES } from "./decisions-memo.js";
 
 /** The in-process MCP server name; tools surface as `mcp__uzi__<tool>`. */
 export const SIGNAL_SERVER_NAME = "uzi";
 const SUBMIT_PLAN_TOOL = "submit_plan";
+const SAVE_DRAFT_PLAN_TOOL = "save_draft_plan";
 const SIGNAL_DONE_TOOL = "signal_done";
 export const ASK_USER_TOOL = "ask_user";
 const REPORT_PROGRESS_TOOL = "report_progress";
@@ -47,6 +49,7 @@ const CHECKPOINT_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${CHECKPOINT_TOOL}`;
 
 /** What the worker extracts from one SDK message's tool_use blocks. */
 export interface ScannedSignals {
+  draftPlans?: string[];
   /** plan_md from a submit_plan call, if the message carried one. */
   plan?: string;
   /** true if the message carried a signal_done call. */
@@ -460,6 +463,12 @@ export function buildSignalMcpServer(
     version: "1.0.0",
     tools: [
       tool(
+        SAVE_DRAFT_PLAN_TOOL,
+        "Lead only: request capture of a draft Markdown plan and keep working. This is not submission or approval.",
+        { plan_md: z.string().max(65_536).refine((value) => value.length <= 65_536 && value.trim().length > 0, "Markdown must be nonblank") },
+        async () => ({ content: [{ type: "text" as const, text: DRAFT_PLAN_ACK }] }),
+      ),
+      tool(
         SUBMIT_PLAN_TOOL,
         "Submit your implementation plan for human approval. Call this EXACTLY ONCE when the plan is ready, then STOP and end your turn — do not begin implementing. A human approves or rejects the plan out of band; you will be re-prompted to implement only after approval. Pass the plan as the 'plan_md' argument (Markdown).",
         planShape,
@@ -588,6 +597,7 @@ export function isSignalToolName(name: unknown): boolean {
   // attacker-influenceable text — a test pinning escaped render for kind=question
   // would stay green while the same strings rendered through the tool rail.
   return (
+    name === `mcp__${SIGNAL_SERVER_NAME}__${SAVE_DRAFT_PLAN_TOOL}` ||
     name === SUBMIT_PLAN_QUALIFIED ||
     name === SIGNAL_DONE_QUALIFIED ||
     name === ASK_USER_QUALIFIED ||
@@ -937,7 +947,10 @@ export function scanSignals(message: unknown): ScannedSignals {
     const block = asRecord(raw);
     if (!block || block["type"] !== "tool_use") continue;
     const name = block["name"];
-    if (name === SUBMIT_PLAN_QUALIFIED) {
+    if (name === `mcp__${SIGNAL_SERVER_NAME}__${SAVE_DRAFT_PLAN_TOOL}`) {
+      const plan = parseDraftPlan(block["input"]);
+      if (plan !== undefined) (out.draftPlans ??= []).push(plan);
+    } else if (name === SUBMIT_PLAN_QUALIFIED) {
       const input = asRecord(block["input"]);
       const plan = input?.["plan_md"];
       if (typeof plan === "string") out.plan = plan;

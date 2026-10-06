@@ -2,10 +2,115 @@ package agentsource
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"net/http"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/protocol/packp"
+	"github.com/go-git/go-git/v5/plumbing/transport"
+	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 )
+
+func TestAdvertisementReadRefsWireBudget(t *testing.T) {
+	const sha = "1111111111111111111111111111111111111111"
+	packet := func(line string) string { return fmt.Sprintf("%04x%s", len(line)+4, line) }
+	body := packet("# service=git-upload-pack\n") + "0000" +
+		packet(sha+" HEAD\x00symref=HEAD:refs/heads/main\n") +
+		packet(sha+" refs/heads/main\n") + "0000"
+
+	newAdvertisement := func(t *testing.T, capBytes int) *advertisement {
+		t.Helper()
+		budget := &wireBudget{remaining: int64(capBytes)}
+		client := githttp.NewClient(&http.Client{Transport: &boundedRoundTripper{
+			base: refAdvertisementRoundTripper{t: t, body: body}, budget: budget,
+		}})
+		endpoint, err := transport.NewEndpoint("http://example.com/roster.git")
+		if err != nil {
+			t.Fatal(err)
+		}
+		session, err := client.NewUploadPackSession(endpoint, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), cloneTimeout)
+		a := &advertisement{session: session, budget: budget, ctx: ctx, cancel: cancel, scrub: scrubber("")}
+		t.Cleanup(a.close)
+		return a
+	}
+	assertRefs := func(t *testing.T, refs *packp.AdvRefs) {
+		t.Helper()
+		if refs == nil || refs.Head == nil || *refs.Head != plumbing.NewHash(sha) ||
+			refs.References["refs/heads/main"] != plumbing.NewHash(sha) {
+			t.Fatalf("advertised refs = %+v, want HEAD and main at %s", refs, sha)
+		}
+		if got := refs.Capabilities.Get("symref"); len(got) != 1 || got[0] != "HEAD:refs/heads/main" {
+			t.Fatalf("symref = %v, want HEAD:refs/heads/main", got)
+		}
+	}
+
+	t.Run("decoder masks budget error", func(t *testing.T) {
+		a := newAdvertisement(t, len(body)-1)
+		refs, err := a.session.AdvertisedReferencesContext(a.ctx)
+		if err != nil {
+			t.Fatalf("real decoder error = %v, want success despite the budget trip", err)
+		}
+		assertRefs(t, refs)
+		if !a.budget.tripped() {
+			t.Fatal("real decoder must trip the reduced wire budget")
+		}
+	})
+
+	t.Run("rejects decoded refs after budget trip", func(t *testing.T) {
+		a := newAdvertisement(t, len(body)-1)
+		err := a.readRefs()
+		const want = "agentsource: list refs: source response exceeded the 50331648-byte clone wire budget"
+		if err == nil || err.Error() != want {
+			t.Errorf("readRefs error = %v, want %q", err, want)
+		}
+		if !a.budget.tripped() {
+			t.Error("readRefs must trip the reduced wire budget")
+		}
+		if a.refs != nil {
+			t.Errorf("readRefs accepted over-budget refs: %+v", a.refs)
+		}
+	})
+
+	t.Run("exact fit accepts refs", func(t *testing.T) {
+		a := newAdvertisement(t, len(body))
+		if err := a.readRefs(); err != nil {
+			t.Fatalf("readRefs: %v", err)
+		}
+		assertRefs(t, a.refs)
+		if a.budget.tripped() {
+			t.Fatal("exact-fit advertisement must not trip the wire budget")
+		}
+	})
+}
+
+type refAdvertisementRoundTripper struct {
+	t    *testing.T
+	body string
+}
+
+func (r refAdvertisementRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.t.Helper()
+	if req.Method != http.MethodGet || req.URL.Path != "/roster.git/info/refs" ||
+		req.URL.Query().Get("service") != "git-upload-pack" {
+		r.t.Fatalf("unexpected advertisement request: %s %s", req.Method, req.URL)
+	}
+	// The tiny strings.Reader returns the whole advertisement in the decoder's
+	// buffered read; boundedBody returns those bytes together with the budget error.
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"application/x-git-upload-pack-advertisement"}},
+		Body:       io.NopCloser(strings.NewReader(r.body)),
+	}, nil
+}
 
 // TestPickLatestSemverTag is the PURE unit test of the semver selection rule (Decision
 // 4), no git remote. It is the discriminating check: a lexical/string compare of

@@ -2088,7 +2088,10 @@ describe("dependency provisioning notes (#157)", () => {
       const rows = fenced(note);
       assert.match(rows, /installed:\n1\. web/);
       assert.match(rows, /failed:\n2\. agent/);
-      assert.match(note, /genuinely absent in the `failed` directories/);
+      assert.match(note, /worker attempted to provision/);
+      assert.match(note, /Provisioning failed or is unconfirmed/);
+      assert.match(note, /Check the actual\ndependencies there before retrying/);
+      assert.doesNotMatch(note, /genuinely absent|gates there will not/);
       assert.ok(!/installed:\n1\. web\n2\. agent/.test(rows), "a failed dir must never be listed as installed");
     });
 

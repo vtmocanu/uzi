@@ -285,6 +285,7 @@ tasks:
     cmds:
       - task: lint:shell
       - task: lint:yaml
+      - task: check:skill-triage-render
       - task: lint:formula
       # Workflow linting (actionlint + zizmor). Grouped with the other lint:* checks;
       # like them it fail-open SKIPs when its tools are absent on a laptop and is
@@ -353,6 +354,9 @@ tasks:
       # hermetic (~1s, fake go + gofmt on PATH): fmt-check:api and fmt-check:controller run
       # the module toolchain's gofmt, not a stale PATH gofmt, and still fail closed.
       - task: test:fmt-check-toolchain
+      # Offline fake-go contract: govulncheck install and child package loading use
+      # the module-selected toolchain, preserving host/target settings and failures.
+      - task: test:govulncheck-toolchain
       - task: test:brew-tap-guard
       # cheapest-first: this whole-file duplicate check is sub-second, so it runs
       # before `scan:secrets`, which is deliberately last because it dominates.
@@ -1067,6 +1071,11 @@ tasks:
     cmds:
       - ./scripts/fmt-check-toolchain.test.sh
 
+  test:govulncheck-toolchain:
+    desc: hermetic govulncheck module toolchain, host-native install, analysis environment and exit contract (fake go)
+    cmds:
+      - ./scripts/govulncheck-toolchain.test.sh
+
   test:uzi-lander:
     desc: hermetic tests of uzi-lander review routing, quota timing, CI discovery, required-check completeness, stale-base push guards, base-move tolerance, CHANGELOG union and release fold, the post-rebase CHANGELOG placement guard, and orphan run-PR claims
     cmds:
@@ -1253,6 +1262,16 @@ tasks:
       # No .github/workflows edit: the lint-repo job runs `task gate:repo`, which lists this.
       # See the script header.
       - ./scripts/check-api-v1-compat.sh "{{.OASDIFF_VERSION}}" scripts/api-v1-compat-canary api/openapi/v1.yaml
+
+  check:skill-triage-render:
+    # The sanitizer runs inside jq, so the offline hostile-field suite is required
+    # under bash in CI. Also execute the documented snippets under zsh when present
+    # to catch quoting/word-splitting differences; print a bash-only note if absent.
+    # Local zsh verification is required when editing these workstation snippets.
+    # No forge reads: the regression mocks gh and exercises SKILL.md's real pipelines.
+    desc: reject terminal-control and bidi bytes in issue-triage renderers
+    cmds:
+      - python3 -B .agents/skills/issue-triage/scripts/test-rendering.py
 
   check:skill-size:
     desc: no repo skill's SKILL.md exceeds the 65536-byte runtime cap (over-cap skills are dropped silently at run time), with a canary proving the detector fired
@@ -2245,15 +2264,12 @@ tasks:
       # UZI_DEADCODE_WEB_REQUIRED=1 (see .github/workflows/ci.yml), which turns a missing knip
       # into exit 2, so a skip in CI (image regressed) can never look like a pass.
       #
-      # 🔴 WHAT GATES AND WHAT DOES NOT, because a green here does NOT mean "no
-      # unused exports". `web/knip.jsonc` stages `exports`/`types` and the rest of
-      # that family at `warn`, and WARN-SEVERITY ISSUES ARE PRINTED IN FULL AND DO
-      # NOT SET THE EXIT CODE. As of 2026-08-02 that is 22 findings on this package
-      # (9 exports + 13 exported types), reported on every run and gating nothing;
-      # unused FILES and DEPENDENCIES gate at zero. `--max-issues` is NOT a fallback
-      # for the warn tier - measured, it counts error-severity issues only and exits
-      # 0 with the warn findings printed. Burning the export tier down and promoting
-      # it to `error` is issue #206, not this milestone.
+      # 🔴 WHAT GATES: `web/knip.jsonc` sets every reported rule to `error`, the
+      # `exports`/`types` family included, so a green here DOES mean "no unused
+      # files, dependencies or exports". Only `error` severity sets the exit code; a
+      # rule staged at `warn` would print and gate nothing, and `--max-issues` counts
+      # error-severity issues only. Keep DTO/contract types exported via
+      # `ignoreExportsUsedInFile`, not by lowering a rule to `warn`.
       #
       # 🔴 AND NEVER ADD `--fix`. knip's fix mode edits files in the repo (it strips
       # `export` keywords, and with --allow-remove-files deletes files). Nothing in
@@ -2411,10 +2427,9 @@ tasks:
       # the wrapper cd's into the component so there is no `dir:` here. Two
       # differences specific to this package:
       #
-      #   - the export/type tier here is at `error`, gating at zero: issue #597
-      #     burned down the warn-tier backlog and promoted the six export/type
-      #     rules. web's sibling tier (issue #206) is still staged at `warn`, so
-      #     the two packages' knip staging is no longer symmetric.
+      #   - the export/type tier here is at `error`, gating at zero, as on web:
+      #     issue #597 burned down this package's warn-tier backlog and promoted
+      #     the six export/type rules.
       #   - `agent-browser` is in `ignoreDependencies`, because it is resolved BY
       #     PATH at runtime rather than by an import. `agent/knip.jsonc` states why;
       #     deleting that line makes knip demand the removal of a dependency the
@@ -2533,12 +2548,15 @@ tasks:
       # The wrapper sits OUTSIDE the leak guard: its skip log must not live in the
       # guard's scratch TMPDIR, where it would count as a leftover. Its own hermetic test
       # runs first, so a gutted verdict table reddens here too.
-      # Where the probe says denied, node cannot read its cgroup CPU quota either, so
-      # availableParallelism() reports host CPUs and --test, whose default concurrency is
-      # availableParallelism() - 1, runs files sized to the host on a small quota. The
+      # Where the probe says denied, libuv may not discover its cgroup CPU quota, so
+      # availableParallelism() can report host CPUs and --test, whose default concurrency is
+      # max(availableParallelism() - 1, 1), runs files sized to the host on a small quota. The
       # wrapper then exports UZI_AGENT_TEST_CONCURRENCY=1 (unless set to a positive integer),
       # which the npm test script turns into --test-concurrency=1: node rejects that flag
       # in NODE_OPTIONS, so it has to go on the command line.
+      # Issue #2240: with no caller override or denied-procfs cap, the wrapper floors
+      # availableParallelism()==2 at two files, leaves one CPU untouched, and prints
+      # runtime/quota/concurrency diagnostics plus the unit-stage duration.
       # This self-test validates the wrapper used by both legs. Run it once in
       # shard 1 with M4, and once in the unsharded local composition.
       # tmpdir-leak-guard.test.sh (issue #2020) is the same kind of self-test: it proves a
@@ -2944,12 +2962,18 @@ tasks:
       # agent) and the macOS runner's host->container mount resolve it unambiguously.
       EVIDENCE:
         sh: echo "$(git rev-parse --show-toplevel)/e2e/codex-m4/.evidence/run-$$.jsonl"
+      # Task-scoped timestamp, evaluated only for this stage, never an unrelated task.
+      M4_STARTED_AT:
+        sh: date +%s
     env:
       # Quoted template into the process ENV (NOT a `sh -c` splice, so the splicing ban does not
       # apply), so every leg - the native tests, the macOS container runner, run-completeness.ts -
       # reads the SAME per-invocation file.
       CODEX_M4_EVIDENCE: "{{.EVIDENCE}}"
+      UZI_M4_STARTED_AT: "{{.M4_STARTED_AT}}"
     cmds:
+      # Report duration on failure too; defer preserves the stage's original exit status.
+      - defer: printf 'agent-stage M4 duration_seconds=%s\n' "$(($(date +%s) - UZI_M4_STARTED_AT))"
       - ./node_modules/.bin/tsc --noEmit -p ../e2e/codex-m4/tsconfig.json
       - mkdir -p "$(dirname "$CODEX_M4_EVIDENCE")"
       - rm -f "$CODEX_M4_EVIDENCE"                       # only THIS invocation's file

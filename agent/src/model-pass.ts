@@ -29,7 +29,7 @@ import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 
 import { ClaudeAdviceHarness } from "./claude-advice-harness.js";
 import { uidSplitActive } from "./runner-uid.js";
-import { rmHomeTree } from "./rmtree.js";
+import { rmTeardownTree, type TeardownTestDeps } from "./rmtree.js";
 import { LimitReachedError, type RateLimitObservation } from "./limit.js";
 import { errMessage } from "./util.js";
 import type { Logger } from "./log.js";
@@ -69,6 +69,8 @@ export interface ReadOnlyModelPassOpts {
    *  DEFAULT_ABORT_GRACE_MS; the three runners omit it. Tests inject a value to drive
    *  the timeout path deterministically. */
   graceMs?: number;
+  /** Test-only teardown seams; production retains the pinned deadline and refusal policy. */
+  teardownTestDeps?: TeardownTestDeps;
   queryFn: SdkQueryFn;
   /** The deny-hook reason string (verbatim per runner). */
   denyReason: string;
@@ -168,7 +170,7 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
   // grants the group nothing) and the CLI cannot write $HOME/.claude. Under the split,
   // widen it to 2770 (group `runner` rwx) so the runner can use it. Group membership
   // does NOT let the worker rm it: the CLI writes runner-owned private (0700) dirs
-  // inside, which only a `runner`-uid helper can remove (rmHomeTree, #1607). The unit-test / single-uid (#58)
+  // inside, which only a `runner`-uid helper can remove (rmTeardownTree). The unit-test / single-uid (#58)
   // path leaves 0700 (the pass runs as the worker — same uid, 0700 is correct + tighter).
   try {
     if (uidSplitActive()) await fs.chmod(homeDir, 0o2770);
@@ -235,8 +237,9 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
     // directory: it is named `uzi-<label>-*`, not a run UUID. The running disk reclaim
     // (PRD #1809 D7, disk-reclaim.ts) collects a stranded one once no pass in this process
     // owns it and it is older than any pass lives. Still best-effort: a cleanup must never
-    // fail a run.
-    await rmHomeTree(homeDir).catch((e) =>
+    // fail a run. Sibling writers can remain live even after this query settles, so
+    // deletion stays descriptor-pinned; refusal warns and retains the tree.
+    await rmTeardownTree(homeDir, opts.teardownTestDeps).catch((e) =>
       opts.log.warn(`${opts.label} HOME cleanup failed`, { home_dir: homeDir, error: errMessage(e) }),
     );
     // PRD #1809 D7: the pass is over; a dir its cleanup could not remove is now the disk

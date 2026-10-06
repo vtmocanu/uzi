@@ -3,7 +3,8 @@
 #
 # The release train cuts release CANDIDATES by default and PROMOTES a candidate to
 # stable in lockstep with cutting the next candidate. This script is the mechanical
-# spine: discover the tag state, apply the CHANGELOG section, bump the chart, auto-bump
+# spine: discover the tag state, apply the CHANGELOG section (citing the dependency bumps
+# the per-PR changelog check spared, scripts/lib/dependency-bump.sh), bump the chart, auto-bump
 # the worker tag, refresh links, commit, and verify with the coverage oracle. It does
 # NOT push. It tags only the promoted STABLE (locally, on a throwaway release branch);
 # the RC tag on main is applied by the lead after ci.yml is green. A tag push publishes
@@ -91,6 +92,10 @@ cd "$ROOT" || { echo "cannot cd to repo root $ROOT" >&2; exit 3; }
 # coverage oracle uses), so promote-only and the oracle can never disagree about "shipping".
 # shellcheck source=scripts/lib/shipping-paths.sh
 . "$ROOT/scripts/lib/shipping-paths.sh"
+# is_dependency_manifest / is_dependency_subject: the per-PR changelog check's dependency
+# exemption, shared so the merges it spares are exactly the ones cited at cut time.
+# shellcheck source=scripts/lib/dependency-bump.sh
+. "$ROOT/scripts/lib/dependency-bump.sh"
 
 # --- version helpers ----------------------------------------------------------
 # ver_cmp <a> <b> -> -1|0|1 for a<b|a==b|a>b, comparing the X.Y.Z base only.
@@ -306,7 +311,10 @@ fold_or_insert() { # writes the [BASE] section into CHANGELOG (fold [Unreleased]
     ' CHANGELOG.md > "$tmp" || { echo "release-cut: CHANGELOG insert failed" >&2; rm -f "$tmp"; exit 3; }
   else
     local body; body="$(changelog_unreleased_body | tr -d '[:space:]')"
-    if [ -z "$body" ]; then
+    # A window whose only shipping merges are dependency bumps has nothing in [Unreleased]
+    # (the per-PR check spared them) but still has something to release: open the section
+    # and let autocite_dependency_merges fill it.
+    if [ -z "$body" ] && [ -z "$DEP_REFS" ]; then
       echo "release-cut: [Unreleased] is empty and no --changelog-file given — nothing to release" >&2; rm -f "$tmp"; exit 3
     fi
     awk -v ver="$base" -v d="$TODAY" '
@@ -484,6 +492,93 @@ run_links() {
   bash scripts/changelog-links.sh || { echo "release-cut: changelog-links.sh failed" >&2; exit 1; }
 }
 
+# dependency_merge_refs <prev> -> one citation per first-parent merge in <prev>..HEAD that
+# the per-PR check spared as a dependency bump (scripts/lib/dependency-bump.sh): a
+# dependency-typed subject, at least one shipping path, every shipping path a dependency
+# manifest, CHANGELOG.md untouched and no `Changelog: none` (the oracle skips those two
+# anyway). Each line is `<citation><TAB><short SHA>`: the citation is the subject's trailing
+# PR number `#N`, else the short SHA; the oracle accepts either, so both identities are
+# carried to the already-cited check. Empty <prev> (first release ever) yields nothing.
+dependency_merge_refs() {
+  local prev="$1" sha subject files f shipping manifest_only touched_cl pr short
+  [ -n "$prev" ] || return 0
+  while IFS= read -r sha; do
+    [ -n "$sha" ] || continue
+    subject="$(git log -1 --format=%s "$sha")"
+    is_dependency_subject "$subject" || continue
+    if git log -1 --format=%B "$sha" | grep -iE '^Changelog:[[:space:]]*none' >/dev/null; then continue; fi
+    files="$(git diff --name-only "$sha^1" "$sha" 2>/dev/null || git show --name-only --format= "$sha")"
+    shipping=0; manifest_only=1; touched_cl=0
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      [ "$f" != CHANGELOG.md ] || touched_cl=1
+      is_shipping "$f" || continue
+      shipping=1
+      is_dependency_manifest "$f" || manifest_only=0
+    done <<EOF
+$files
+EOF
+    [ "$shipping" = 1 ] && [ "$manifest_only" = 1 ] && [ "$touched_cl" = 0 ] || continue
+    pr="$(printf '%s\n' "$subject" | sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p')"
+    short="$(git rev-parse --short "$sha")"
+    if [ -n "$pr" ]; then printf '#%s\t%s\n' "$pr" "$short"; else printf '%s\t%s\n' "$short" "$short"; fi
+  done <<EOF
+$(git log --first-parent --reverse --format=%H "$prev..HEAD")
+EOF
+}
+
+# autocite_dependency_merges <base>: cite every DEP_REFS merge the [base] section does not
+# already cite by either identity (the oracle's own matching: `#N` not followed by a digit,
+# or the literal short SHA) in ONE `### Changed` bullet. An existing bullet is extended rather than
+# duplicated, so a next candidate, a re-run or a hand-drafted citation never repeats one.
+DEP_BULLET_TITLE='Routine dependency updates'
+autocite_dependency_merges() {
+  local base="$1" sec ref short n new="" tmp
+  [ -n "$DEP_REFS" ] || return 0
+  sec="$(awk -v h="## [$base]" 'index($0, h) == 1 { s = 1; next } s && /^## \[/ { exit } s' CHANGELOG.md)"
+  while IFS="$(printf '\t')" read -r ref short; do
+    [ -n "$ref" ] || continue
+    if printf '%s\n' "$sec" | grep -F -- "$short" >/dev/null; then continue; fi
+    case "$ref" in
+      \#*) n="${ref#\#}"; if printf '%s\n' "$sec" | grep -E "#0*$n([^0-9]|\$)" >/dev/null; then continue; fi ;;
+    esac
+    new="${new:+$new, }$ref"
+  done <<EOF
+$DEP_REFS
+EOF
+  [ -n "$new" ] || return 0
+  tmp="$(mktemp)"
+  awk -v h="## [$base]" -v title="$DEP_BULLET_TITLE" -v refs="$new" '
+    function bullet() {
+      print "- **" title " (" refs ").**"
+      print "  Dependency manifest and image bumps that carry no entry of their own."
+    }
+    # Pass 1: does the section already carry the bullet? Then pass 2 only extends it.
+    FNR == NR {
+      if (index($0, h) == 1) s = 1; else if (s && /^## \[/) s = 0
+      if (s && index($0, "- **" title " (") == 1 && /\)\.\*\*$/) have = 1
+      next
+    }
+    index($0, h) == 1 && !done { inB = 1; print; next }
+    inB && /^## \[/ {
+      if (!done) { if (!blank) print ""; print "### Changed"; print ""; bullet(); print "" }
+      inB = 0; done = 1; print; next
+    }
+    inB && !done && index($0, "- **" title " (") == 1 && /\)\.\*\*$/ {
+      sub(/\)\.\*\*$/, ", " refs ").**"); print; done = 1; next
+    }
+    inB && !done && !have && /^### Changed[[:space:]]*$/ { print; print ""; bullet(); pending = 1; done = 1; next }
+    pending { pending = 0; if ($0 ~ /[^[:space:]]/) print "" }
+    { print; blank = ($0 !~ /[^[:space:]]/) }
+    END {
+      if (inB && !done) { if (!blank) print ""; print "### Changed"; print ""; bullet() }
+      else if (!done && !inB) { print "release-cut: no ## [" base "] section to cite dependency merges in" > "/dev/stderr"; exit 3 }
+    }
+  ' CHANGELOG.md CHANGELOG.md > "$tmp" || { rm -f "$tmp"; echo "release-cut: citing dependency merges failed; CHANGELOG untouched" >&2; exit 3; }
+  mv "$tmp" CHANGELOG.md
+  echo "  CHANGELOG: cited dependency merge(s) $new under [$base] ### Changed"
+}
+
 # --- promote (D5): tag a stable vIB from a throwaway release branch -----------
 promote_inflight() {
   local relbranch="release/$IB" tagB="v$IB" wt
@@ -622,6 +717,14 @@ if [ "$OP" = promote ] || [ "$OP" = promoteonly ]; then
   fi
 fi
 
+# --- PREV (the coverage window base) + the dependency merges to cite in it ---
+if [ -n "$PREV_OVERRIDE" ]; then
+  PREV="$PREV_OVERRIDE"
+else
+  PREV="$(prev_stable_below "$BASE")"
+fi
+DEP_REFS="$(dependency_merge_refs "$PREV")"
+
 # --- CHANGELOG (main half) ----------------------------------------------------
 case "$OP" in
   rc1|stable)
@@ -641,8 +744,10 @@ case "$OP" in
     fold_or_insert "$BASE" ;;
 esac
 echo "  CHANGELOG: [$BASE] section applied ($OP)"
+autocite_dependency_merges "$BASE"
 # A cut of a NEW base also reconciles the previous stable's heading date (a no-op unless that
-# stable was promoted without touching main). nextrc stays CHANGELOG-free by contract (D3).
+# stable was promoted without touching main). nextrc keeps its base, so it never syncs a
+# heading (D3); its CHANGELOG change is the [Unreleased] fold and the dependency citation.
 [ "$OP" = nextrc ] || sync_stable_heading "$(prev_stable_below "$BASE")"
 
 # --- Chart.yaml + autobump + links --------------------------------------------
@@ -653,13 +758,6 @@ WT="$(awk -F'"' '/^PINNED_TAG=/{print $2; exit}' scripts/assert-worker-tag-decou
 echo "  worker tag now: ${WT:-<unreadable>} (rolls the fleet iff it changed from the prior pin)"
 run_links
 echo "  changelog-links: refreshed"
-
-# --- PREV for the oracle ------------------------------------------------------
-if [ -n "$PREV_OVERRIDE" ]; then
-  PREV="$PREV_OVERRIDE"
-else
-  PREV="$(prev_stable_below "$BASE")"
-fi
 
 git add -- CHANGELOG.md deploy/chart/Chart.yaml deploy/chart/values.yaml scripts/assert-worker-tag-decoupled.sh 2>/dev/null || true
 

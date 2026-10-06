@@ -424,6 +424,7 @@ seed_repo() {
   done
   # The shared shipping-path lib the oracle and release-cut both source.
   cp "$SCRIPTS_DIR/lib/shipping-paths.sh" "$d/scripts/lib/shipping-paths.sh"
+  cp "$SCRIPTS_DIR/lib/dependency-bump.sh" "$d/scripts/lib/dependency-bump.sh"
   cat > "$d/deploy/chart/Chart.yaml" <<'YAML'
 apiVersion: v2
 name: uzi
@@ -1230,6 +1231,98 @@ git -C "$SE" add deploy/chart/values.yaml; gcommit "$SE" "test: pin a tag on ori
 ( cd "$SE" && bash scripts/worker-tag-autobump.sh 0.8.0 >/dev/null 2>&1 ); se_rc=$?
 assert_eq "autobump exits 2 when the pin tag is on origin but not local" "2"          "$se_rc"
 assert_eq "autobump does NOT repin on the broken-instrument path"        "0.7.0-rc.1" "$(pin_tag "$SE")"
+
+echo "=== M2: release-cut cites dependency merges the per-PR check spared ==="
+# add_dep <dir> <path> <subject>: a dependency-style merge touching only <path>.
+add_dep() {
+  mkdir -p "$(dirname "$1/$2")"
+  echo "// bump $3" >> "$1/$2"
+  git -C "$1" add -A
+  gcommit "$1" "$3"
+}
+dep_bullets() { grep -c '^- \*\*Routine dependency updates' "$1/CHANGELOG.md" || true; }
+dep_bullet()  { grep '^- \*\*Routine dependency updates' "$1/CHANGELOG.md" || true; }
+feature_201_changelog() { printf '# Changelog\n\n## [Unreleased]\n### Added\n- **Feature 201** (#201)\n\n## [0.1.0] - 2026-09-01\n### Added\n- **Initial** (#100)\n' | put_changelog "$1"; }
+
+# A Renovate-style go.mod bump alongside an entry-carrying feature: cited automatically.
+SDA="$(mktemp -d)"; seed_repo "$SDA"; add_feature "$SDA" 201
+add_dep "$SDA" api/go.mod "fix(deps): update module example.com/x to v1.2.0 (#300)"
+feature_201_changelog "$SDA"
+run_rc "$SDA" 0.2.0
+assert_eq "dependency merge: first RC exits 0 (oracle satisfied)" "0" "$RC_RC"
+assert_eq "dependency merge: one Routine bullet" "1" "$(dep_bullets "$SDA")"
+assert_contains "dependency merge: bullet cites #300" "#300" "$(dep_bullet "$SDA")"
+assert_eq "dependency merge: bullet sits under [0.2.0] ### Changed" "### Changed" \
+  "$(awk '/^## \[0\.2\.0\]/{s=1;next} s&&/^## \[/{exit} s&&/^### /{h=$0} s&&/^- \*\*Routine dependency updates/{print h; exit}' "$SDA/CHANGELOG.md")"
+
+# The next candidate adds a Dockerfile digest bump: the existing bullet is extended.
+git -C "$SDA" tag v0.2.0-rc.1
+add_dep "$SDA" agent/src/Dockerfile "chore(deps): update node digest to abc123 (#302)"
+run_rc "$SDA" 0.2.0
+assert_eq "next RC with a new dependency merge exits 0" "0" "$RC_RC"
+assert_eq "next RC extends the bullet instead of adding one" "1" "$(dep_bullets "$SDA")"
+assert_contains "extended bullet still cites #300" "#300" "$(dep_bullet "$SDA")"
+assert_contains "extended bullet cites #302" "#302" "$(dep_bullet "$SDA")"
+
+# A dependency-only window: [Unreleased] is empty, yet the cut has something to release.
+SDB="$(mktemp -d)"; seed_repo "$SDB"
+add_dep "$SDB" api/go.sum "build(deps)!: bump example.com/y (#310)"
+run_rc "$SDB" 0.2.0
+assert_eq "dependency-only window with empty [Unreleased] exits 0" "0" "$RC_RC"
+assert_contains "dependency-only window cites #310" "#310" "$(dep_bullet "$SDB")"
+
+# No PR number in the subject: the short SHA is the citation the oracle accepts.
+SDC="$(mktemp -d)"; seed_repo "$SDC"; add_feature "$SDC" 201
+add_dep "$SDC" api/devbox.lock "chore(deps): lock file maintenance"
+sdc_short="$(git -C "$SDC" rev-parse --short HEAD)"
+feature_201_changelog "$SDC"
+run_rc "$SDC" 0.2.0
+assert_eq "dependency merge without a PR number exits 0" "0" "$RC_RC"
+assert_contains "dependency merge without a PR number is cited by short SHA" "$sdc_short" "$(dep_bullet "$SDC")"
+
+# Already cited by hand: no bullet, nothing duplicated.
+SDD="$(mktemp -d)"; seed_repo "$SDD"
+add_dep "$SDD" api/go.mod "fix(deps): update module example.com/x to v1.2.0 (#300)"
+printf '# Changelog\n\n## [Unreleased]\n### Changed\n- **Bumped x** (#300)\n\n## [0.1.0] - 2026-09-01\n### Added\n- **Initial** (#100)\n' | put_changelog "$SDD"
+run_rc "$SDD" 0.2.0
+assert_eq "hand-cited dependency merge exits 0" "0" "$RC_RC"
+assert_eq "hand-cited dependency merge adds no bullet" "0" "$(dep_bullets "$SDD")"
+
+# Already cited by short SHA: the PR number is the same merge, so no bullet either.
+SDI="$(mktemp -d)"; seed_repo "$SDI"
+add_dep "$SDI" api/go.mod "fix(deps): update module example.com/x to v1.2.0 (#300)"
+sdi_short="$(git -C "$SDI" rev-parse --short HEAD)"
+printf '# Changelog\n\n## [Unreleased]\n### Changed\n- **Bumped x** (%s)\n\n## [0.1.0] - 2026-09-01\n### Added\n- **Initial** (#100)\n' "$sdi_short" | put_changelog "$SDI"
+run_rc "$SDI" 0.2.0
+assert_eq "SHA-cited dependency merge exits 0" "0" "$RC_RC"
+assert_eq "SHA-cited dependency merge is not re-cited by its PR number" "0" "$(dep_bullets "$SDI")"
+
+# Not spared by the per-PR check, so not auto-cited: the oracle still refuses.
+SDE="$(mktemp -d)"; seed_repo "$SDE"; add_feature "$SDE" 201
+add_dep "$SDE" api/go.mod "fix(deps): update module example.com/x to v1.2.0 (#300)"
+add_feature "$SDE" 320    # an ordinary shipping merge with no entry
+feature_201_changelog "$SDE"
+run_rc "$SDE" 0.2.0
+assert_eq "uncited ordinary merge still fails the cut" "1" "$RC_RC"
+assert_contains "oracle names the uncited ordinary merge" "Feature 320 (#320)" "$RC_OUT"
+SDF="$(mktemp -d)"; seed_repo "$SDF"; add_feature "$SDF" 201
+add_dep "$SDF" deploy/chart/Dockerfile "chore(deps): update chart image (#330)"
+feature_201_changelog "$SDF"
+run_rc "$SDF" 0.2.0
+assert_eq "a chart path is never auto-cited (cut fails)" "1" "$RC_RC"
+assert_contains "oracle names the chart dependency merge" "(#330)" "$RC_OUT"
+SDG="$(mktemp -d)"; seed_repo "$SDG"; add_feature "$SDG" 201
+add_dep "$SDG" api/go.mod "fix: hand-edited go.mod (#340)"
+feature_201_changelog "$SDG"
+run_rc "$SDG" 0.2.0
+assert_eq "a manifest change under a non-dependency subject is not auto-cited (cut fails)" "1" "$RC_RC"
+SDH="$(mktemp -d)"; seed_repo "$SDH"; add_feature "$SDH" 201
+mkdir -p "$SDH/api"; echo 'package main // x' > "$SDH/api/x.go"; echo '// bump' >> "$SDH/api/go.mod"
+git -C "$SDH" add -A; gcommit "$SDH" "fix(deps): bump x and adapt (#350)"
+feature_201_changelog "$SDH"
+run_rc "$SDH" 0.2.0
+assert_eq "a dependency merge that also changes source is not auto-cited (cut fails)" "1" "$RC_RC"
+rm -rf "$SDA" "$SDB" "$SDC" "$SDD" "$SDE" "$SDF" "$SDG" "$SDH" "$SDI"
 
 rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S8P" "$S8O" "$S8R" "$S8N" "$S8A" "$S8B" "$S8C" "$S9" "$S10" "$SA" "$SB" "$SC" "$SD" "$SE" \
        "$S8.origin.git" "$S8P.origin.git" "$S8O.origin.git" "$S8R.origin.git" "$S8A.origin.git" "$S8B.origin.git" "$S9.origin.git" "$S10.origin.git" "$SD.origin.git" "$SE.origin.git" \

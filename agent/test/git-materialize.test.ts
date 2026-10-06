@@ -207,7 +207,9 @@ describe("runner clone materialization (issue #1769 m1)", () => {
     const pushed = commit(first.path, "PUSHED.txt");
     await git.fetchAgentBranch(bare, first.path, "agent/issue-13", "run-1");
     await git.pushBranch(bare, "agent/issue-13", "", fx.originPath);
-    await git.removeRunnerClone(first.path);
+    // Simulate a missing checkout in this isolated recovery fixture. Production
+    // teardown is covered by the worker-uid tests and deliberately refuses off Linux.
+    fs.rmSync(first.path, { recursive: true, force: true });
     await git.ensureClone(fx.originPath);
     assert.strictEqual(await git.originBranchTip(bare, "agent/issue-13"), pushed);
 

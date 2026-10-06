@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { buildSdkEnv, type SdkEnv } from "../src/sdk-env.js";
+import { runnerPath } from "../src/runner-uid.js";
 
 // The sparse-env guarantee (primary directive): the SDK subprocess sees ONLY
 // the Anthropic OAuth token + HOME + PATH. The worker's own secrets (join token,
@@ -22,7 +23,10 @@ beforeEach(() => {
     UZI_FORGE_PAT: process.env.UZI_FORGE_PAT,
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
     ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN,
+    UZI_RUNNER_PATH: process.env.UZI_RUNNER_PATH,
+    PATH: process.env.PATH,
   };
+  delete process.env.UZI_RUNNER_PATH;
   process.env.UZI_WORKER_TOKEN = FAKE_JOIN_TOKEN;
   process.env.UZI_FORGE_PAT = FAKE_PAT;
   process.env.ANTHROPIC_API_KEY = FAKE_API_KEY;
@@ -43,9 +47,9 @@ describe("buildSdkEnv", () => {
     assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, FAKE_OAUTH);
     assert.strictEqual(env.HOME, HOME_DIR);
     // The RUNNER PATH (PRD #51 M4): UZI_RUNNER_PATH under the split, else process.env.PATH.
-    // Unset in THIS fixture, so it equals process.env.PATH. On a real single-uid worker it
-    // is no longer unset — since PRD #120 the entrypoint pins it on both branches, so the
-    // fallback is the non-entrypoint case only.
+    // beforeEach explicitly deletes UZI_RUNNER_PATH, so runnerPath falls back to PATH.
+    // Since PRD #120 the entrypoint pins it on both worker branches; this fallback
+    // covers non-entrypoint starts.
     assert.strictEqual(env.PATH, process.env.PATH);
     assert.strictEqual(env.ANTHROPIC_API_KEY, undefined);
     assert.strictEqual(env.ANTHROPIC_AUTH_TOKEN, undefined);
@@ -55,6 +59,23 @@ describe("buildSdkEnv", () => {
     const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS"]);
     if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
     assert.deepStrictEqual(new Set(Object.keys(env)), expected);
+  });
+
+  it("uses a nonempty runner pin ahead of the ambient PATH", () => {
+    process.env.PATH = "/runner/ambient/bin:/usr/bin";
+    process.env.UZI_RUNNER_PATH = "/runner/pinned/bin:/usr/bin";
+    assert.notStrictEqual(process.env.PATH, "/runner/pinned/bin:/usr/bin");
+    // runnerPath's documented entrypoint precedence: a nonempty pin wins over PATH.
+    assert.strictEqual(runnerPath(), "/runner/pinned/bin:/usr/bin");
+    assert.strictEqual(buildSdkEnv(FAKE_OAUTH, HOME_DIR).PATH, "/runner/pinned/bin:/usr/bin");
+  });
+
+  it("falls back to the ambient PATH for an explicitly empty runner pin", () => {
+    const ambientPath = process.env.PATH;
+    process.env.UZI_RUNNER_PATH = "";
+    // runnerPath treats an empty pin like an absent pin at non-entrypoint starts.
+    assert.strictEqual(runnerPath(), ambientPath);
+    assert.strictEqual(buildSdkEnv(FAKE_OAUTH, HOME_DIR).PATH, ambientPath);
   });
 
   it("always sets AGENT_BROWSER_ARGS with --no-sandbox and --disable-dev-shm-usage", () => {
@@ -104,6 +125,9 @@ describe("buildSdkEnv", () => {
   });
 
   it("folds in provisioned tool env (PRD #18 M3): PATH replaced, nix vars added", () => {
+    process.env.UZI_RUNNER_PATH = "/runner/pinned/bin:/usr/bin";
+    // Provisioned PATH replaces even the nonempty entrypoint pin selected by runnerPath.
+    assert.strictEqual(runnerPath(), "/runner/pinned/bin:/usr/bin");
     const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {
       PATH: "/nix/store/kubectl/bin:/usr/bin",
       NIX_SSL_CERT_FILE: "/etc/ssl/cert.pem",

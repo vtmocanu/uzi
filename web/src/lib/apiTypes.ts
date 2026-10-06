@@ -1855,6 +1855,7 @@ export type ScheduleStatus = "active" | "fired" | "error";
 // The authoritative source is Go's schedsvc.SkipReason; scheduleSkipReasons.test.ts is a
 // cross-language drift guard that reddens if Go gains a reason this union lacks.
 export type ScheduleSkipReason =
+  | "config_not_supported"
   | "not_eligible"
   | "already_running"
   | "description_too_large"
@@ -1890,7 +1891,16 @@ export interface LastFireSkip {
 
 // The structured summary of a schedule's most recent persisted fire (PRD #308). matched
 // == started.length + skips.length balances.
+export interface ScheduleCapacityCheck {
+ in_flight: number;
+ limit: number;
+ room_needed: number;
+ room: number;
+ blocked: boolean;
+}
+
 export interface LastFire {
+ capacity?: ScheduleCapacityCheck;
   fired_at: string;
   matched: number;
   capped: boolean;
@@ -1906,6 +1916,7 @@ export interface LastFire {
 // back-compat and derivable from started; matched/capped/started/skips carry the full
 // per-candidate outcome.
 export type RunNowResponse = {
+ capacity?: ScheduleCapacityCheck;
   created: number;
   run_ids: string[];
   matched: number;
@@ -1917,6 +1928,8 @@ export type RunNowResponse = {
 };
 
 export interface Schedule {
+ capacity_limit: number | null;
+ capacity_room_needed: number | null;
   id: string;
   repo_id: string;
   // Best-effort display path ("vtmocanu/uzi"); "" when the repo can no longer be
@@ -2085,6 +2098,8 @@ export interface ScheduleCatalog {
 // wait_on_limit=true, enabled=true). On PATCH a field present is applied and an
 // absent one is left unchanged, so a per-row enable toggle sends just { enabled }.
 export interface ScheduleInput {
+ capacity_limit?: number | null;
+ capacity_room_needed?: number | null;
   target?: ScheduleTarget;
   issue_iid?: number | null;
   labels?: string[];
@@ -2234,11 +2249,12 @@ export interface Worker {
   // literals compile while the wire contract stays a never-null array (pinned by the api-contract
   // parity check against the recorded fixtures).
   reported_runs?: WorkerReportedRun[];
-  // retaining_unpublished_work (PRD #1296 M4): true when the worker holds an OPEN
-  // durable-recovery custody hold (unpublished committed work not yet archived), so
-  // teardown is deferred. Distinct from busy/active_runs — it consumes no run slot.
+  // True for ANY open custody hold, healthy live runs included. Protects local source
+  // through deletion, cleanup and hosted-quota safety guards; independent of owner decisions.
   // Optional in TS (mocks/older payloads may omit it); the api always sends it.
   retaining_unpublished_work?: boolean;
+  // List-only owner decision count; explicit zero on success, absent on a failed read.
+  custody_decisions_needed?: number;
   // disk_pressure_threshold (PRD #1809 D5): the api's UZI_DISK_PRESSURE_THRESHOLD, set only
   // on the worker's own heartbeat response (the worker derives its reclaim/admission and hard-stop
   // thresholds from it); absent from every list/admin response.

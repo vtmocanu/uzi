@@ -30,6 +30,7 @@ const ALL_SCHEDULE_SKIP_REASONS: ScheduleSkipReason[] = [
   "schedules_paused",
   "no_usable_credential",
   "credential_disabled",
+  "config_not_supported",
 ];
 
 function reasonsFromGo(): string[] {

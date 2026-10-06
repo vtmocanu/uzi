@@ -40,13 +40,24 @@ func TestDeriveHoldAttention(t *testing.T) {
 		{"open + gone/unknown run, no capture", row("open", "", "", false), attentionSourceOnly},
 		// Precedence: a ready archive / in-flight capture outranks the run's terminality, so a
 		// terminal run with a durable/in-progress capture is never a source_only decision.
+		{"any available archive beats newest failed capture", row("open", "needs_action", "running", true), attentionArchiveReady},
 		{"available archive beats a terminal run", row("open", "available", "failed", true), attentionArchiveReady},
 		{"capturing beats a terminal run", row("open", "preparing", "completed", false), attentionCapturing},
 		{"needs_action beats a live run", row("open", "needs_action", "running", false), attentionNeedsAction},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := deriveHoldAttention(tc.row); got != tc.want {
+			batch := store.ListOpenCustodyHoldsForWorkersRow{State: tc.row.State, HasAvailableCapture: tc.row.HasAvailableCapture, CaptureState: tc.row.CaptureState, RunStatus: tc.row.RunStatus}
+			if ownerHoldAttentionInput(tc.row) != batchHoldAttentionInput(batch) {
+				t.Fatal("owner/batch adapter inputs differ")
+			}
+			if got := custodyHoldToDTO(tc.row).Attention; got != tc.want {
+				t.Fatalf("DTO attention = %q, want %q", got, tc.want)
+			}
+			if got := deriveHoldAttention(batchHoldAttentionInput(batch)); got != tc.want {
+				t.Fatalf("batch attention = %q, want %q", got, tc.want)
+			}
+			if got := deriveHoldAttention(ownerHoldAttentionInput(tc.row)); got != tc.want {
 				t.Errorf("deriveHoldAttention(%+v) = %q, want %q", tc.row, got, tc.want)
 			}
 		})

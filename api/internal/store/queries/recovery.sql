@@ -796,3 +796,19 @@ SELECT
       FROM (SELECT * FROM exact ORDER BY id LIMIT 256) limited), '[]'::jsonb)::jsonb AS exact_holds,
     COALESCE((SELECT jsonb_agg(jsonb_build_object('id', id, 'generation', generation) ORDER BY id)
       FROM (SELECT * FROM siblings ORDER BY id LIMIT 256) limited), '[]'::jsonb)::jsonb AS sibling_holds;
+
+-- name: ListOpenCustodyHoldsForWorkers :many
+-- Display-only attention inputs for the authorized workers returned by a list endpoint.
+-- Live custody determines which worker holds the source; original custody is provenance.
+SELECT w.id AS worker_id, h.state,
+    (EXISTS (SELECT 1 FROM recovery_captures c
+        WHERE c.hold_id = h.id AND c.state = 'available'))::boolean AS has_available_capture,
+    COALESCE((SELECT c.state FROM recovery_captures c
+        WHERE c.hold_id = h.id
+        ORDER BY c.created_at DESC, c.id DESC
+        LIMIT 1), '')::text AS capture_state,
+    COALESCE(r.status, '')::text AS run_status
+FROM workers w
+JOIN recovery_custody_holds h ON h.live_worker_id = w.id AND h.user_id = w.user_id
+LEFT JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
+WHERE w.id = ANY(@worker_ids::uuid[]) AND h.state = 'open';

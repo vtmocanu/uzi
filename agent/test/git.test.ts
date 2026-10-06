@@ -926,7 +926,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
 
   // Issue #134 (the production half of #127). Any git that writes into a repo spawns a
   // DETACHED `git maintenance run --auto --detach` that outlives the awaited process and keeps
-  // writing inside `.git`. removeRunnerClone() (runner.ts:454) `fs.rm`s the clone moments after
+  // writing inside `.git`. removeRunnerClone() removes the clone through pinned teardown moments after
   // the agent's last commit and our push, and `force: true` suppresses ENOENT, not ENOTEMPTY.
   // Pinning the CONFIG rather than trying to observe a race: the config is deterministic, the
   // race is not — and #127 spent two agents' effort failing to reproduce the race on demand.
@@ -1802,7 +1802,9 @@ describe("issue #909 — the owner-stamp reader falls back to the pre-#887 flatt
     gitIn(first.path, [...IDENT, "commit", "-m", "unpushed work"]);
     const workSha = gitIn(first.path, ["rev-parse", "HEAD"]);
     await git.fetchAgentBranch(bare, first.path, branch, runId);
-    await git.removeRunnerClone(first.path);
+    // Simulate a missing checkout in this isolated recovery fixture. Production
+    // teardown is covered by the worker-uid tests and deliberately refuses off Linux.
+    fs.rmSync(first.path, { recursive: true, force: true });
 
     // Simulate a PRE-#887 persistent bare: no #887 subsection stamp, only the old FLATTENED
     // 2-part key (no `.owner`). Drop the new-key stamp fetchAgentBranch just wrote and plant

@@ -19,6 +19,7 @@ import { useAuth } from "../auth/AuthContext";
 // benign, self-resolving ones (already running, body too large) read neutral.
 // Exhaustive so a new union member is a tsc error, not a default.
 const SKIP_REASON_TONES: Record<ScheduleSkipReason, BadgeTone> = {
+  config_not_supported: "warning",
   not_eligible: "warning",
   already_running: "neutral",
   description_too_large: "neutral",
@@ -70,7 +71,9 @@ export function LastRunOutcome({
         <OutcomeBadge fire={fire} />
       </span>
       <span className="text-[11px] text-faint tabular-nums">
-        {formatStamp(fire.fired_at)} · examined {fire.matched}
+        {formatStamp(fire.fired_at)} · {fire.capacity?.blocked
+          ? `space for ${fire.capacity.room} more run${fire.capacity.room === 1 ? "" : "s"}; needs ${fire.capacity.room_needed}`
+          : `examined ${fire.matched}`}
       </span>
       {/* A DISCLOSURE, not a link (ux-tweaks item 2): it expands the detail row in
           place, so it must not wear the app's link costume (text-info + underline
@@ -117,6 +120,7 @@ function ineligibleMatched(fire: LastFire): number {
 // runs until it is labelled or assigned; an amber skip such as no_usable_credential never
 // clears until a credential is repaired), so neither count may hide the other.
 function OutcomeBadge({ fire }: { fire: LastFire }) {
+  if (fire.capacity?.blocked) return <Badge tone="warning" dot>Waiting for room</Badge>;
   if (fire.started.length > 0) {
     return (
       <Badge tone="ok" dot>
@@ -186,10 +190,21 @@ export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
   const ineligible = ineligibleMatched(fire);
   // Nothing started although the fire had skipped candidates or ineligible matches: the
   // header reads amber, not the neutral "matched 0" of a genuinely empty sweep (#1727).
+
   const startedNothing = !good && (fire.skips.length > 0 || ineligible > 0);
   // Anything rendered between the tally and the note (candidate rows, the paused row, the
   // cap hint — all imply started or skips) earns the note a top margin.
   const hasBody = fire.started.length > 0 || fire.skips.length > 0;
+  if (fire.capacity?.blocked) {
+    return <div className="rounded-lg border border-edge border-l-2 border-l-warn/60 bg-surface p-4">
+      <div className="flex flex-wrap items-center gap-2.5">
+        <span className="text-[13px] font-semibold">Last fire</span>
+        <span className="font-mono text-[12px] text-faint">{formatStamp(fire.fired_at)} · {s.timezone}</span>
+        <OutcomeBadge fire={fire} />
+      </div>
+      <p className="mt-3 text-[12px] text-muted">{fire.capacity.in_flight} unfinished runs, limit {fire.capacity.limit} · space for {fire.capacity.room} more run{fire.capacity.room === 1 ? "" : "s"}; needs {fire.capacity.room_needed} · nothing examined</p>
+    </div>;
+  }
   return (
     <div
       className={cx(
@@ -203,22 +218,13 @@ export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
           {formatStamp(fire.fired_at)} · {s.timezone}
         </span>
         <span className="ml-auto">
-          {good ? (
-            <Badge tone="ok" dot>
-              {fire.started.length} started
-            </Badge>
-          ) : startedNothing ? (
-            <Badge tone="warning" dot>
-              started nothing
-            </Badge>
-          ) : (
-            <Badge tone="neutral" dot>
-              matched 0
-            </Badge>
-          )}
+          {good ? <Badge tone="ok" dot>{fire.started.length} started</Badge>
+            : startedNothing ? <Badge tone="warning" dot>started nothing</Badge>
+            : <Badge tone="neutral" dot>matched 0</Badge>}
         </span>
       </div>
 
+      {fire.capacity && <p className="mb-3 text-[12px] text-muted">{fire.capacity.in_flight} unfinished runs, limit {fire.capacity.limit} · space for {fire.capacity.room} more run{fire.capacity.room === 1 ? "" : "s"}; needs {fire.capacity.room_needed}</p>}
       <div className="mb-3.5 flex flex-wrap gap-x-5 gap-y-2">
         <Tally n={fire.matched} label="examined" tone="mut" />
         <Tally n={fire.started.length} label="started" tone={fire.started.length > 0 ? "ok" : "mut"} />

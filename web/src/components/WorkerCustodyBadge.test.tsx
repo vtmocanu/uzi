@@ -1,35 +1,37 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
+import type { AdminWorker, Worker } from "../lib/api";
+import { mockWorkers } from "../mocks/data/workers";
 import { WorkerCustodyBadge } from "./WorkerCustodyBadge";
 
 afterEach(cleanup);
 
-// Regression pin for PRD #1296 M4/M5 E25 (D4): the "retaining work" pill marks a worker
-// whose teardown is deferred because it holds unpublished committed work. It must appear
-// ONLY on an open custody hold, and vanish (not fall back to some other pill) when the
-// field is false or absent on the wire.
-
 describe("WorkerCustodyBadge", () => {
-  it("renders the 'retaining work' pill when the worker holds an open custody hold", () => {
-    render(<WorkerCustodyBadge worker={{ retaining_unpublished_work: true }} />);
+  it.each([1, 3])("renders when %i custody decisions need the owner", (count) => {
+    render(<WorkerCustodyBadge worker={{ custody_decisions_needed: count }} />);
     const pill = screen.getByText("retaining work");
-    expect(pill).toBeTruthy();
-    // The title copy is the operator's only explanation of why teardown is deferred; pin it
-    // verbatim so a wording drift is caught (jsdom reads the title attribute a visual pass
-    // never can).
     expect(pill.getAttribute("title")).toBe(
-      "Retaining unpublished committed work for durable recovery. Teardown is deferred until the work is archived or explicitly discarded; this holds no run slot.",
+      "Retaining unpublished committed work that needs an owner decision.",
     );
   });
 
-  it("renders nothing when retaining_unpublished_work is false", () => {
-    const { container } = render(<WorkerCustodyBadge worker={{ retaining_unpublished_work: false }} />);
+  it.each([0, undefined])("renders nothing for count %s even with the old retention flag", (count) => {
+    const worker: Worker = {
+      ...mockWorkers[0],
+      retaining_unpublished_work: true,
+      custody_decisions_needed: count,
+    };
+    const { container } = render(<WorkerCustodyBadge worker={worker} />);
     expect(container.innerHTML).toBe("");
   });
 
-  it("renders nothing when the field is absent (older payload / mock)", () => {
-    const { container } = render(<WorkerCustodyBadge worker={{}} />);
-    expect(container.innerHTML).toBe("");
+  it("accepts owner and admin worker payloads", () => {
+    const owner: Worker = { ...mockWorkers[0], custody_decisions_needed: 1 };
+    const admin: AdminWorker = {
+      ...owner, owner_email: "owner@example.com", disk_pressure_volumes: [], cleanup_pending: false,
+    };
+    render(<><WorkerCustodyBadge worker={owner} /><WorkerCustodyBadge worker={admin} /></>);
+    expect(screen.getAllByText("retaining work")).toHaveLength(2);
   });
 });

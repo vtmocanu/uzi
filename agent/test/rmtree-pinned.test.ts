@@ -1,10 +1,10 @@
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { restoreTreeWritability, rmTreePinned, type CommandWrapper } from "../src/rmtree.js";
+import { restoreTreeWritability, rmTreePinned, rmRunnerTeardownTree, type CommandWrapper } from "../src/rmtree.js";
 import { noProcFd, RACED_FILES, seedRacedTree, startSwapRacer } from "./swap-racer.js";
 
 /**
@@ -285,7 +285,9 @@ describe("rmTreePinned (PRD #1809 M3)", () => {
         swaps = await racer.stop();
       }
       assert.ok(swaps > 0, "the racer swapped at least one directory mid-walk (the race happened)");
-      assert.equal(await countFiles(victim), RACED_FILES, "no victim file outside the tree was deleted");
+      const names = (await fs.readdir(victim)).sort();
+      assert.deepEqual(names, Array.from({ length: RACED_FILES }, (_, i) => `f${i}`).sort(), "every outside name survives");
+      for (const name of names) assert.equal(await fs.readFile(path.join(victim, name), "utf8"), "keep\n");
       // Each swapped symlink is unlinked and each moved dir re-listed, so the tree goes; the
       // only other acceptable outcome is the typed not-removed verdict (a swap landing after
       // the final re-read), never a crash or a refusal of the root.
@@ -299,6 +301,56 @@ describe("rmTreePinned (PRD #1809 M3)", () => {
       await forceCleanup(parent);
       await forceCleanup(victim);
       await forceCleanup(scratch);
+    }
+  });
+});
+
+
+describe("runner-owned teardown entry point (#2324)", () => {
+  it("single-uid removes private and read-only directories with supported clone names", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const saved = process.env.UZI_UID_SPLIT;
+    delete process.env.UZI_UID_SPLIT;
+    const parent = await mktmp();
+    try {
+      for (const name of ["ordinary", "ci-fix-a+b", "mr-rework-ș"] ) {
+        const leaf = path.join(parent, name);
+        await fs.mkdir(path.join(leaf, "private"), { recursive: true, mode: 0o700 });
+        await fs.writeFile(path.join(leaf, "private", "file"), "remove");
+        await fs.chmod(path.join(leaf, "private"), 0o555);
+        if (name !== "ordinary") {
+          await assert.rejects(rmTreePinned(parent, name), /not one path component/);
+          await assert.rejects(rmRunnerTeardownTree(leaf), /not one path component/);
+        }
+        await rmRunnerTeardownTree(leaf, { allowCloneName: true });
+        assert.equal(await exists(leaf), false);
+      }
+    } finally {
+      if (saved === undefined) delete process.env.UZI_UID_SPLIT; else process.env.UZI_UID_SPLIT = saved;
+      await forceCleanup(parent);
+    }
+  });
+
+  it("refuses unknown single-uid identity and malformed clone components", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const saved = process.env.UZI_UID_SPLIT;
+    delete process.env.UZI_UID_SPLIT;
+    const parent = await mktmp();
+    try {
+      const leaf = path.join(parent, "ordinary");
+      await fs.mkdir(leaf);
+      await fs.writeFile(path.join(leaf, "keep"), "keep");
+      const unknown = mock.method(process as { getuid: () => number | undefined }, "getuid", () => undefined);
+      try { await assert.rejects(rmRunnerTeardownTree(leaf), /not owned/); }
+      finally { unknown.mock.restore(); }
+      assert.equal(await fs.readFile(path.join(leaf, "keep"), "utf8"), "keep");
+      for (const name of [".hidden", "-option", "a\\b", "a\nb"]) {
+        await assert.rejects(rmRunnerTeardownTree(path.join(parent, name), { allowCloneName: true }), /not one path component/);
+      }
+      await assert.rejects(rmRunnerTeardownTree("relative"), /non-absolute/);
+    } finally {
+      if (saved === undefined) delete process.env.UZI_UID_SPLIT; else process.env.UZI_UID_SPLIT = saved;
+      await forceCleanup(parent);
     }
   });
 });

@@ -16,6 +16,7 @@ import (
 type SkipReason string
 
 const (
+	SkipConfigNotSupported SkipReason = "config_not_supported"
 	// SkipNotEligible ← workersvc.ErrNotPRDIssue: the issue does not carry the uzi label.
 	SkipNotEligible SkipReason = "not_eligible"
 
@@ -99,6 +100,7 @@ const (
 // AllSkipReasons lists every SkipReason in the closed set. The cross-language contract
 // test (a later milestone) reads this to enumerate the Go side.
 var AllSkipReasons = []SkipReason{
+	SkipConfigNotSupported,
 	SkipNotEligible,
 	SkipAlreadyRunning,
 	SkipDescriptionTooLarge,

@@ -36,9 +36,10 @@ type lastFireSkip struct {
 // is the advance instant (the scheduler's now at persist time), so the UI can show WHEN
 // the last fire happened alongside WHAT it did.
 type lastFireRecord struct {
-	FiredAt time.Time `json:"fired_at"`
-	Matched int       `json:"matched"`
-	Capped  bool      `json:"capped"`
+	Capacity *CapacityCheck `json:"capacity,omitempty"`
+	FiredAt  time.Time      `json:"fired_at"`
+	Matched  int            `json:"matched"`
+	Capped   bool           `json:"capped"`
 	// IneligibleMatched is FireOutcome.IneligibleMatched (issue #1543): omitted when nil
 	// (non-label sweeps, issue/prompt), emitted when set — including 0.
 	IneligibleMatched *int64            `json:"ineligible_matched,omitempty"`
@@ -54,6 +55,7 @@ type lastFireRecord struct {
 func marshalLastFire(out FireOutcome, firedAt time.Time) ([]byte, error) {
 	rec := lastFireRecord{
 		FiredAt:           firedAt,
+		Capacity:          out.Capacity,
 		Matched:           out.Matched,
 		Capped:            out.Capped,
 		IneligibleMatched: out.IneligibleMatched,

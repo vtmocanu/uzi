@@ -1251,7 +1251,7 @@ function gatesUnverifiedSection(dirs?: readonly string[], discoveryTruncated?: b
   if (named.length > 0) {
     const list = named.map((d) => codeSpan(d)).join(", ");
     parts.push(
-      `JS dependencies did not install in: ${list}. Gates that need them (e.g. \`vitest\`, \`knip\`) could not run on this change, so treat those gates as unverified, not passing.`,
+      `JS dependency provisioning failed or is unconfirmed in: ${list}. Existing dependencies may still be usable. Require actual gate evidence for gates that need them (e.g. \`vitest\`, \`knip\`); provisioning failure alone does not establish whether those gates ran or passed.`,
     );
   }
   if (discoveryTruncated) {

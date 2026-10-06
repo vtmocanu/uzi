@@ -106,7 +106,8 @@ func IsUnknown(err error) bool {
 // issue #1341 for the measured figures), and the requests below were recalibrated in
 // issue #1341 above those measured multi-agent peaks.
 //
-// `m` is compose parity at the limit and is the default. The default cap is 1
+// `m` is compose parity at the limit. New hosted workers default to `l` (issue #2240:
+// the api's UZI_EPHEMERAL_DEFAULT_SIZE and the web dialog's preselection). The default cap is 1
 // (WORKER_MAX_CONCURRENT_RUNS), so a size still buys headroom for ONE run. That cap
 // is now operator-configurable (chart workers.maxConcurrentRuns → the controller's
 // UZI_WORKER_MAX_CONCURRENT_RUNS), and an operator raising it must pick a size that

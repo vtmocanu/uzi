@@ -1,3 +1,4 @@
+import { ProviderPolicyRefusal, policyRefusalMessage } from "./provider-policy-refusal.js";
 import { TrustedExecutionRefusal, legacyTrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { AsyncResource } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
@@ -109,7 +110,7 @@ import {
   type SendTerminalState,
   type TerminalOutboxDeps,
 } from "./terminal-resolve.js";
-import { rmHomeTree } from "./rmtree.js";
+import { rmTeardownTree, type TeardownTestDeps } from "./rmtree.js";
 import { dropRunCaches } from "./run-caches.js";
 import type { RunDiskLocks } from "./run-disk-locks.js";
 import type { CachesDroppedMemo } from "./disk-reclaim.js";
@@ -1861,6 +1862,8 @@ export interface CheckpointTestHooks {
 export interface RunnerOptions {
   /** Test-only timing overrides; production uses the approved bounded retry/poll policy. */
   planCrossCheckTiming?: PlanCrossCheckTiming;
+  /** Test-only teardown seams; production uses the pinned walk with one 120 s deadline. */
+  teardownTestDeps?: TeardownTestDeps;
   queueTerminalRejectionReconciliation?: (runId: string, generation: number) => void;
   /** How often the steering channel polls /inputs (default 3s). */
   pollMs?: number;
@@ -2083,6 +2086,8 @@ export class RunRunner {
   private readonly shutdownPublishTimeoutMs: number;
   /** issue #1597 M2: the mid-turn checkpoint tick cadence (0 disables). */
   private readonly checkpointTickIntervalMs: number;
+  /** Issue #1831: test-only teardown seams; production always uses pinned removal. */
+  private readonly teardownTestDeps: TeardownTestDeps | undefined;
   /** issue #1597 M2: test-only seams (undefined in production). */
   private readonly checkpointTestHooks: CheckpointTestHooks | undefined;
   private readonly planCrossCheckTiming: PlanCrossCheckTiming | undefined;
@@ -2269,6 +2274,7 @@ export class RunRunner {
     this.checkpointTickIntervalMs = opts.checkpointTickIntervalMs ?? 5 * 60_000;
     this.checkpointTestHooks = opts.checkpointTestHooks;
     this.planCrossCheckTiming = opts.planCrossCheckTiming;
+    this.teardownTestDeps = opts.teardownTestDeps;
     this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
     this.recoveryRetryMs = Math.max(1, Math.min(opts.recoveryRetryMs ?? 1_000, 30_000));
     // PRD #1171 m4: bounded, never unbounded. Clamp a caller-supplied 0/negative to the default.
@@ -3574,7 +3580,7 @@ export class RunRunner {
             ownAttemptRetired = flight.runnerClone?.attemptId !== undefined;
           } else {
             // No bare/branch to key the journal on (a run that never journaled): fall
-            // back to the bare recursive remove.
+            // back to pinned runner-owned removal.
             await this.git.removeRunnerClone(flight.worktreePath, runId);
           }
         } catch (e) {
@@ -3601,8 +3607,7 @@ export class RunRunner {
       // sweep deletes both.
       const removeSkills = !terminalDisposeUnproven && (flight.predecessorCapture ? false : ownAttemptRetired || !preserveResumeArtifacts);
       if (flight.worktreePath && removeSkills) {
-        await fs
-          .rm(skillsPluginDir(flight.worktreePath), { recursive: true, force: true })
+        await rmTeardownTree(skillsPluginDir(flight.worktreePath), this.teardownTestDeps)
           .catch((e) =>
             runLog.warn("skills plugin cleanup failed", {
               error: errMessage(e),
@@ -3613,15 +3618,11 @@ export class RunRunner {
       // session transcript under it is only needed to resume, and a terminal run
       // never resumes. A concurrent sibling's HOME is a distinct dir, untouched.
       //
-      // rmHomeTree, not fs.rm (PRD #108 M6, #1607): the Go module cache under this HOME
-      // writes its package directories mode 0555, and `force: true` suppresses
-      // ENOENT — not the EACCES that unlinking inside a read-only directory
-      // raises. Every Go-touching run stranded its module cache (167.3 MB
-      // measured for one run). Still best-effort and still swallowing its own
-      // error: this is a `finally`, and a cleanup that threw would convert a
-      // completed run into a failed one, which is strictly worse than a leak.
+      // rmTeardownTree pins every directory and removes read-only agent-owned caches.
+      // Reaping this run does not stop sibling writers swapping intermediate directories.
+      // Refusal warns and retains the tree; cleanup must never change the run's outcome.
       if (runHome && !preserveResumeArtifacts) {
-        await rmHomeTree(runHome).catch((e) =>
+        await rmTeardownTree(runHome, this.teardownTestDeps).catch((e) =>
           runLog.warn("run HOME cleanup failed", { error: errMessage(e) }),
         );
       }
@@ -3967,7 +3968,9 @@ export class RunRunner {
   ): Promise<void> {
     const { batcher, redactText, runLog } = flight;
     const rawReason =
-      err instanceof PlanRejectedError
+      err instanceof ProviderPolicyRefusal
+        ? policyRefusalMessage(err.policyRefusal.policy_tag)
+        : err instanceof PlanRejectedError
         ? err.reason
         : err instanceof TerminalReportError
           ? err.reason
@@ -3988,10 +3991,15 @@ export class RunRunner {
     // run's unapplied reject_plan inputs in that same transition (issue #1604); it ignores a
     // worker-sent origin there.
     const failOrigin =
-      err instanceof TerminalReportError
+      err instanceof ProviderPolicyRefusal
+        ? "provider_policy_refusal"
+        : err instanceof TerminalReportError
         ? err.failOrigin
         : failOriginForReason(rawReason);
-    runLog.error("run failed", { error: reason });
+    runLog.error("run failed", {
+      error: reason,
+      ...(err instanceof ProviderPolicyRefusal ? { policyRefusal: err.policyRefusal } : {}),
+    });
     if (err instanceof ScratchPublicationError) logScratchPublicationRefused(runLog, redactText, err, "finalize");
     // Issue #1864: a Codex boundary failure also logs which stage, boundary and sink failed.
     const boundaryDiagnostic = codexBoundaryDiagnosticOf(err);
@@ -10700,9 +10708,11 @@ export class RunRunner {
       return { kind: "blocked", outcome: "secret_scan_untrusted" };
     };
     try {
-      // Scan floors: the default branch and the last CONFIRMED checkpoint tip (already public).
+      // Scan floors: the default branch, the last confirmed checkpoint ref tip, and confirmed
+      // published real tips beneath overlays (already public). Local-only checkpointFloor is excluded.
       const range = await this.git.resolveCheckpointRange(barePath, branch, {
         confirmedTip: flight.lastCheckpointRefTip,
+        extraFloors: flight.publishedRealTips,
       });
       if (!range) {
         if ((await this.git.trackingTip(barePath, branch)) === null) return { kind: "none" };

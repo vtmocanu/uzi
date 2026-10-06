@@ -426,21 +426,48 @@ describe("CodexAdviceHarness: kind + a text advice pass", () => {
     );
   });
 
-  it("#1566 appends async question text to advice without a delivery filter", async () => {
-    const bits = makeHarness();
-    bits.transport.push(threadStarted()).push({
-      kind: "activity", method: "item/completed",
-      params: { threadId: "th-1", item: { type: "agentMessage", text: "Choose validation",
-        delivery: "async", questions: [{ title: "Which validation?", options: ["Focused", "Defer"] }] } },
-    }).push(agentMessage('{"verdict":"approve"}')).push(turnCompleted("completed")).end();
-    const result = await bits.harness.run(makeAdviceRequest(), noThrowPolicy);
-    assert.equal(result.text, 'Choose validation{"verdict":"approve"}');
-    // Characterize contamination, not a filter fix: structured-verdict validation may fail.
-    assert.throws(() => JSON.parse(result.text));
-    assert.equal(result.end.kind, "terminal");
-    assert.deepEqual(bits.transport.responses, []);
-    assert.equal(bits.disposeCalls(), 1);
-  });
+  for (const type of ["agentMessage", "assistantMessage", "agent_message"]) {
+    it(`#2239 filters async question text for ${type}`, async () => {
+      const bits = makeHarness();
+      bits.transport.push(threadStarted()).push({
+        kind: "activity", method: "item/completed",
+        params: { threadId: "th-1", item: { type, text: "Choose validation",
+          delivery: "async", questions: [{ title: "Which validation?", options: ["Focused", "Defer"] }] } },
+      }).push({
+        kind: "activity", method: "item/completed",
+        params: { threadId: "th-1", item: { type, text: '{"verdict":' } },
+      }).push({
+        kind: "activity", method: "item/completed",
+        params: { threadId: "th-1", item: { type, text: '"approve"}', delivery: "sync" } },
+      }).push(turnCompleted("completed")).end();
+      const result = await bits.harness.run(makeAdviceRequest(), noThrowPolicy);
+      assert.equal(result.text, '{"verdict":"approve"}');
+      assert.deepEqual(JSON.parse(result.text), { verdict: "approve" });
+      assert.equal(result.end.kind, "terminal");
+      assert.deepEqual(bits.transport.responses, []);
+      assert.equal(bits.disposeCalls(), 1);
+    });
+
+    it(`#2239 preserves non-async delivery text unchanged and in order for ${type}`, async () => {
+      const bits = makeHarness();
+      bits.transport.push(threadStarted()).push({
+        kind: "activity", method: "item/completed",
+        params: { threadId: "th-1", item: { type, text: " absent " } },
+      });
+      for (const delivery of ["sync", "Async", "", null, false, 0]) {
+        bits.transport.push({
+          kind: "activity", method: "item/completed",
+          params: { threadId: "th-1", item: { type, text: `[${JSON.stringify(delivery)}]\n`, delivery } },
+        });
+      }
+      bits.transport.push(turnCompleted("completed")).end();
+      const result = await bits.harness.run(makeAdviceRequest(), noThrowPolicy);
+      assert.equal(result.text, ' absent ["sync"]\n["Async"]\n[""]\n[null]\n[false]\n[0]\n');
+      assert.equal(result.end.kind, "terminal");
+      assert.deepEqual(bits.transport.responses, []);
+      assert.equal(bits.disposeCalls(), 1);
+    });
+  }
 
   it("accumulates assistant text and returns the terminal with turn-basis usage", async () => {
     const bits = makeHarness();
@@ -1043,6 +1070,18 @@ describe("CodexAdviceHarness: provider error classification folds into the advic
     assert.equal(result.end.kind, "terminal");
     if (result.end.kind !== "terminal") throw new Error("expected a terminal advice result");
     return result.end.terminal;
+  }
+
+  for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) {
+    it(`classifies ${tag} with the shared policy_refusal category`, async () => {
+      const bits = makeHarness();
+      bits.transport.push(threadStarted()).push(codexError(tag)).push(turnCompleted("failed")).end();
+      const terminal = await terminalOf(bits);
+      const thrown = terminal.failure!.materialize();
+      assert.equal(thrown.failure.category, "policy_refusal");
+      assert.deepEqual(terminal.errors, [`codex turn ended with status: failed (${tag})`]);
+      assert.equal(terminal.policyRefusal, undefined, "advice carries category without run provenance");
+    });
   }
 
   it("captures a non-retrying scalar codex_error and folds it into the advice terminal (errors + message + category)", async () => {

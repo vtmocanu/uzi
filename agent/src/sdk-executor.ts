@@ -34,7 +34,8 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { Executor, ExecutorResult, RunContext, WallParkOutcome } from "./executor.js";
 import type { Logger } from "./log.js";
-import { buildCheckEnv, buildSdkEnv } from "./sdk-env.js";
+import { buildSdkEnv } from "./sdk-env.js";
+import { startDepsInstall, reportDepsInstall, safeDirLabel } from "./js-deps-provision.js";
 import { makeProgressObserver } from "./milestone-progress-observer.js";
 import type { DockerWiring } from "./docker-wiring.js";
 import { provisionTools } from "./provision.js";
@@ -118,7 +119,7 @@ import type {
 import { evidencesModelProcessing } from "./harness.js";
 import { PlanRejectedError, stampPrSummaryHead } from "./executor.js";
 import { emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "./plan-missing.js";
-import { clampToDirCharset, errMessage } from "./util.js";
+import { errMessage } from "./util.js";
 import { SummaryRunner, type PlanSummaryResult } from "./summary-runner.js";
 import { resolvePrdInput, type PrdInput } from "./prd-link.js";
 import {
@@ -1338,7 +1339,7 @@ export class SdkExecutor implements Executor {
       this.secretPaths,
       this.dockerWired,
     );
-    const pathHook = buildPathGuardHook(ctx.worktreePath, this.log);
+    const pathHook = buildPathGuardHook(ctx.worktreePath, this.log, this.secretPaths, { sdkHomeDir: this.homeDir });
     const preToolUse = (
       allowedSubagents: string[],
     ): NonNullable<SdkOptions["hooks"]>["PreToolUse"] => [
@@ -3488,9 +3489,8 @@ export class SdkExecutor implements Executor {
         }
       }
 
-      // js_deps rides the completion log so a finished run's record says whether its
-      // gates were runnable — the same question M4 will have to answer from a durable
-      // source. It is also what keeps depsResults READ rather than merely assigned.
+      // js_deps records dependency provisioning outcomes in the completion log;
+      // it does not establish whether quality gates ran or passed.
       this.log.info("SDK run completed", {
         run_id: ctx.runId,
         branch: ctx.branch,
@@ -3524,9 +3524,9 @@ export class SdkExecutor implements Executor {
       if (isIssueRun && declaredMilestonesCompleted !== undefined) {
         result.milestonesCompleted = declaredMilestonesCompleted;
       }
-      // Issue #293 M2: carry the dirs whose deps did not install so the MR can be
-      // annotated honestly (a component whose deps are absent could not have run its
-      // gates). Reuses the js_deps `ok` signal, which is corroborated against the
+      // Issue #293 M2: carry the dirs whose dependency provisioning is unverified so
+      // the MR requires actual gate evidence; existing deps may still be usable.
+      // Reuses the js_deps `ok` signal, which is corroborated against the
       // filesystem so a false "deps ready" cannot be minted. Dir names are clamped
       // with safeDirLabel (repo-controlled text). OMITTED-not-undefined, issue-run
       // only, same convention as prdDonePath/milestonesCompleted above.
@@ -3535,14 +3535,11 @@ export class SdkExecutor implements Executor {
       // package.json but NO recognized lockfile is `{manager:"none", ok:false,
       // detail:DETAIL_NO_LOCKFILE}` — uzi refuses to guess a package manager, so it was
       // never installed rather than failed, and annotating it would cry wolf on a fine
-      // delivery. But `manager:"none"` has a SECOND producer: the belt-to-braces
-      // `discovery failed` record (`{dir:".", manager:"none", ok:false}`, js-deps.ts),
-      // which IS a genuine total failure that must annotate. Keying the exclusion on
-      // `manager !== "none"` dropped both and turned that failure into a false green
-      // (latent today: discovery is non-throwing, so the record is unreachable until a
-      // refactor makes it throw — fixed here so it stays honest if that day comes).
-      // Everything else with ok:false (a real manager that failed/was cancelled, or the
-      // discovery failure) annotates.
+      // delivery. But `manager:"none"` also marks discovery throws/aborts caught by
+      // installJsDeps and generic installer failures caught by startDepsInstall.
+      // Both leave provisioning unverified and must annotate; filtering all
+      // `manager:"none"` records would hide those failures. Everything else with
+      // ok:false (including failed/cancelled installs) annotates.
       const gatesUnverified = depsResults
         .filter((r) => !r.ok && r.detail !== DETAIL_NO_LOCKFILE)
         .map((r) => safeDirLabel(r.dir));
@@ -3551,8 +3548,8 @@ export class SdkExecutor implements Executor {
       }
       // Issue #293 M2 / review F1: discovery can stop at MAX_PROJECT_DIRS / MAX_SCAN_DIRS
       // (depsTruncated), leaving components past the cap NEVER scanned and so ABSENT from
-      // depsResults — their gates could not have run either, but gatesUnverified cannot
-      // name them. Carry the flag so the MR annotation says coverage was capped; a silent
+      // depsResults — their provisioning coverage is unexamined, and gatesUnverified
+      // cannot name them. Carry the flag so the MR annotation says coverage was capped; a silent
       // cap reading as full coverage is the exact lie this PRD exists to remove.
       if (isIssueRun && depsTruncated) {
         result.gatesDiscoveryTruncated = true;
@@ -3617,102 +3614,21 @@ export class SdkExecutor implements Executor {
       return result;
   }
 
-  /**
-   * Start provisioning the clone's JS dependencies (PRD #121 M2), returning a promise
-   * that NEVER rejects.
-   *
-   * The `.catch` is attached HERE, at creation, not at the join — between the two the
-   * promise is floating, and a rejection reaching an empty microtask queue is an
-   * unhandled rejection that kills the worker process. `installJsDeps` is contracted
-   * never to throw, but that contract belongs to the module; this call site must not
-   * depend on it holding.
-   *
-   * ENV: the same scrubbed REPLACEMENT env the self-improve checks use (`buildCheckEnv`)
-   * — never a `process.env` spread. The install executes repo-authored package.json /
-   * lockfile resolution, so the worker's join token, API URL, forge PAT and OAuth token
-   * are absent by construction; PATH comes from the run's provisioned toolEnv so the
-   * install uses the RUN's node/npm. HOME is the PER-RUN SDK home, matching what
-   * runner.ts already passes for the self-improve checks. Per-run and not the shared
-   * provisioning HOME on purpose: a shared HOME would warm the npm cache across runs,
-   * but every run's install writes it under the same `runner` uid, so one run could seed
-   * content a later run installs. A cold cache per run is the cheaper side of that
-   * trade, and the run's HOME is torn down with the run.
-   */
   private startDepsInstall(
     ctx: RunContext,
     toolEnv: Record<string, string> | undefined,
     signal: AbortSignal,
   ): Promise<JsDepsInstall> {
-    ctx.emit({
-      kind: "status",
-      agent: "worker",
-      payload: {
-        text: "installing the repo's JS dependencies (in the background)",
-      },
-    });
-    return this.installDeps(
-      ctx.worktreePath,
-      buildCheckEnv(process.env, this.homeDir, toolEnv),
-      { signal },
-    ).catch((err: unknown) => {
-      // Best-effort, always: provisioning can never fail the run. Unlike
-      // provisionRunTools (whose failure DOES fail the run — the agent would be
-      // missing its declared toolchain), a missing node_modules degrades to the
-      // agent installing them itself, exactly as it does today.
-      this.log.warn("JS dependency provisioning failed", {
-        run_id: ctx.runId,
-        error: errMessage(err),
-      });
-      return { results: [], truncated: false };
-    });
+    return startDepsInstall(ctx, this.log, this.homeDir, toolEnv, signal, this.installDeps);
   }
 
-  /**
-   * Wait for the dependency install and report what it did on the run's feed. Never
-   * throws: the promise carries its own catch, and a provisioning result — however bad —
-   * is information for the user, not a run failure.
-   */
   private async joinDepsInstall(
     ctx: RunContext,
     depsInstall: Promise<JsDepsInstall>,
   ): Promise<JsDepsInstall> {
-    const { results, truncated } = await depsInstall;
+    const result = await depsInstall;
     this.depsJoined = true;
-    if (results.length === 0) {
-      ctx.emit({
-        kind: "status",
-        agent: "worker",
-        payload: { text: "no JS dependencies to install (no lockfile found)" },
-      });
-      return { results, truncated };
-    }
-    // One line, naming every dir and — for anything that did not install — why. A
-    // silent skip here resurfaces later as an inexplicable `vitest: not found`.
-    const installed = results
-      .filter((r) => r.ok)
-      .map((r) => safeDirLabel(r.dir));
-    const skipped = results.filter((r) => !r.ok);
-    const parts: string[] = [];
-    if (installed.length > 0)
-      parts.push(`installed JS dependencies in ${installed.join(", ")}`);
-    for (const s of skipped) parts.push(`${safeDirLabel(s.dir)}: ${s.detail}`);
-    // Truncation goes on the FEED, not just in a log: without it the line above reads as
-    // full coverage, and a `vitest: not found` in dir 13 becomes unexplainable.
-    if (truncated)
-      parts.push(
-        "discovery hit its directory bound — some project dirs were not installed",
-      );
-    ctx.emit({
-      kind: "status",
-      agent: "worker",
-      payload: { text: parts.join(" — ") },
-    });
-    this.log.info("JS dependency provisioning", {
-      run_id: ctx.runId,
-      results,
-      truncated,
-    });
-    return { results, truncated };
+    return reportDepsInstall(ctx, this.log, result);
   }
 
   /** Drive ONE SDK turn to its result frame, capturing signals + the session id. */
@@ -4685,20 +4601,4 @@ export function embedSeededPlan(args: {
     (args.seeded || args.reviewedResume === true) &&
     !args.hasSession
   );
-}
-
-/**
- * Render a discovered directory name for the run's activity feed. `dir` comes from
- * `readdir`, i.e. it is REPO-CONTROLLED text: a repo can commit a directory whose name
- * contains newlines, backticks, or instruction-shaped prose, and this string is
- * persisted to `run_messages` and rendered to a human. Not a path escape and React
- * escapes the HTML, but untrusted text should not be able to shape a status line, so the
- * charset is clamped to what a real project dir needs and the length is bounded.
- */
-function safeDirLabel(dir: string): string {
-  // 120 chars: this is a rendered feed line, where a long-but-real directory name is
-  // more useful than a short one, and React escapes the output — the clamp here is
-  // cosmetic plus defence in depth. The PROMPT clamp is load-bearing and uses a
-  // tighter bound; both share the charset deliberately (clampToDirCharset).
-  return clampToDirCharset(dir, 120);
 }
