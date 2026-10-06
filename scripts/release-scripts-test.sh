@@ -1288,6 +1288,15 @@ run_rc "$SDD" 0.2.0
 assert_eq "hand-cited dependency merge exits 0" "0" "$RC_RC"
 assert_eq "hand-cited dependency merge adds no bullet" "0" "$(dep_bullets "$SDD")"
 
+# Already cited by short SHA: the PR number is the same merge, so no bullet either.
+SDI="$(mktemp -d)"; seed_repo "$SDI"
+add_dep "$SDI" api/go.mod "fix(deps): update module example.com/x to v1.2.0 (#300)"
+sdi_short="$(git -C "$SDI" rev-parse --short HEAD)"
+printf '# Changelog\n\n## [Unreleased]\n### Changed\n- **Bumped x** (%s)\n\n## [0.1.0] - 2026-09-01\n### Added\n- **Initial** (#100)\n' "$sdi_short" | put_changelog "$SDI"
+run_rc "$SDI" 0.2.0
+assert_eq "SHA-cited dependency merge exits 0" "0" "$RC_RC"
+assert_eq "SHA-cited dependency merge is not re-cited by its PR number" "0" "$(dep_bullets "$SDI")"
+
 # Not spared by the per-PR check, so not auto-cited: the oracle still refuses.
 SDE="$(mktemp -d)"; seed_repo "$SDE"; add_feature "$SDE" 201
 add_dep "$SDE" api/go.mod "fix(deps): update module example.com/x to v1.2.0 (#300)"
@@ -1313,7 +1322,7 @@ git -C "$SDH" add -A; gcommit "$SDH" "fix(deps): bump x and adapt (#350)"
 feature_201_changelog "$SDH"
 run_rc "$SDH" 0.2.0
 assert_eq "a dependency merge that also changes source is not auto-cited (cut fails)" "1" "$RC_RC"
-rm -rf "$SDA" "$SDB" "$SDC" "$SDD" "$SDE" "$SDF" "$SDG" "$SDH"
+rm -rf "$SDA" "$SDB" "$SDC" "$SDD" "$SDE" "$SDF" "$SDG" "$SDH" "$SDI"
 
 rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S8P" "$S8O" "$S8R" "$S8N" "$S8A" "$S8B" "$S8C" "$S9" "$S10" "$SA" "$SB" "$SC" "$SD" "$SE" \
        "$S8.origin.git" "$S8P.origin.git" "$S8O.origin.git" "$S8R.origin.git" "$S8A.origin.git" "$S8B.origin.git" "$S9.origin.git" "$S10.origin.git" "$SD.origin.git" "$SE.origin.git" \

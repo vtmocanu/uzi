@@ -496,10 +496,11 @@ run_links() {
 # the per-PR check spared as a dependency bump (scripts/lib/dependency-bump.sh): a
 # dependency-typed subject, at least one shipping path, every shipping path a dependency
 # manifest, CHANGELOG.md untouched and no `Changelog: none` (the oracle skips those two
-# anyway). The citation is the subject's trailing PR number `#N`, else the short SHA; both
-# are what the coverage oracle accepts. Empty <prev> (first release ever) yields nothing.
+# anyway). Each line is `<citation><TAB><short SHA>`: the citation is the subject's trailing
+# PR number `#N`, else the short SHA; the oracle accepts either, so both identities are
+# carried to the already-cited check. Empty <prev> (first release ever) yields nothing.
 dependency_merge_refs() {
-  local prev="$1" sha subject files f shipping manifest_only touched_cl pr
+  local prev="$1" sha subject files f shipping manifest_only touched_cl pr short
   [ -n "$prev" ] || return 0
   while IFS= read -r sha; do
     [ -n "$sha" ] || continue
@@ -519,26 +520,27 @@ $files
 EOF
     [ "$shipping" = 1 ] && [ "$manifest_only" = 1 ] && [ "$touched_cl" = 0 ] || continue
     pr="$(printf '%s\n' "$subject" | sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p')"
-    if [ -n "$pr" ]; then echo "#$pr"; else git rev-parse --short "$sha"; fi
+    short="$(git rev-parse --short "$sha")"
+    if [ -n "$pr" ]; then printf '#%s\t%s\n' "$pr" "$short"; else printf '%s\t%s\n' "$short" "$short"; fi
   done <<EOF
 $(git log --first-parent --reverse --format=%H "$prev..HEAD")
 EOF
 }
 
-# autocite_dependency_merges <base>: cite every DEP_REFS entry the [base] section does not
-# already cite (the oracle's own matching: `#N` not followed by a digit, or the literal
-# short SHA) in ONE `### Changed` bullet. An existing bullet is extended rather than
+# autocite_dependency_merges <base>: cite every DEP_REFS merge the [base] section does not
+# already cite by either identity (the oracle's own matching: `#N` not followed by a digit,
+# or the literal short SHA) in ONE `### Changed` bullet. An existing bullet is extended rather than
 # duplicated, so a next candidate, a re-run or a hand-drafted citation never repeats one.
 DEP_BULLET_TITLE='Routine dependency updates'
 autocite_dependency_merges() {
-  local base="$1" sec ref n new="" tmp
+  local base="$1" sec ref short n new="" tmp
   [ -n "$DEP_REFS" ] || return 0
   sec="$(awk -v h="## [$base]" 'index($0, h) == 1 { s = 1; next } s && /^## \[/ { exit } s' CHANGELOG.md)"
-  while IFS= read -r ref; do
+  while IFS="$(printf '\t')" read -r ref short; do
     [ -n "$ref" ] || continue
+    if printf '%s\n' "$sec" | grep -F -- "$short" >/dev/null; then continue; fi
     case "$ref" in
       \#*) n="${ref#\#}"; if printf '%s\n' "$sec" | grep -E "#0*$n([^0-9]|\$)" >/dev/null; then continue; fi ;;
-      *)   if printf '%s\n' "$sec" | grep -F -- "$ref" >/dev/null; then continue; fi ;;
     esac
     new="${new:+$new, }$ref"
   done <<EOF
@@ -549,7 +551,7 @@ EOF
   awk -v h="## [$base]" -v title="$DEP_BULLET_TITLE" -v refs="$new" '
     function bullet() {
       print "- **" title " (" refs ").**"
-      print "  Dependency manifest and image bumps only; no uzi source changed."
+      print "  Dependency manifest and image bumps that carry no entry of their own."
     }
     # Pass 1: does the section already carry the bullet? Then pass 2 only extends it.
     FNR == NR {
@@ -744,7 +746,8 @@ esac
 echo "  CHANGELOG: [$BASE] section applied ($OP)"
 autocite_dependency_merges "$BASE"
 # A cut of a NEW base also reconciles the previous stable's heading date (a no-op unless that
-# stable was promoted without touching main). nextrc stays CHANGELOG-free by contract (D3).
+# stable was promoted without touching main). nextrc keeps its base, so it never syncs a
+# heading (D3); its CHANGELOG change is the [Unreleased] fold and the dependency citation.
 [ "$OP" = nextrc ] || sync_stable_heading "$(prev_stable_below "$BASE")"
 
 # --- Chart.yaml + autobump + links --------------------------------------------
