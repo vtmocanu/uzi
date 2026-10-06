@@ -37,6 +37,9 @@ through `[0.52.0]`.)
 - **Codex provider safety-policy refusals have a distinct failure origin ([#2321](https://github.com/vtmocanu/uzi/issues/2321)).**
   Runs refused for `cyberPolicy` or `misalignmentPolicyViolation` now report `provider_policy_refusal` with a fixed, content-free reason. Run logs retain bounded root/child provenance with role, phase and opaque correlation IDs; the lead may continue after a child refusal. Refusals remain terminal execution failures, included in failure totals and eligible for retrospective judging.
 
+- **Additional worker-owned cleanup resists directory swaps ([#2324](https://github.com/vtmocanu/uzi/issues/2324)).**
+  Leftover job replacement, terminal skills-plugin cleanup, Codex advice working directories and session staging use descriptor-pinned removal. Refused leftovers are never reused for a job or adopted as session state; disposable cleanup warns and retains refused trees.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed
@@ -68,9 +71,6 @@ through `[0.52.0]`.)
   A `workers` tab (key `2`; pulls and ci move to `3` and `4`) lists your workers, or the factory's with `a`, attention first: state, kind, slots, CPU, memory, worst disk, version, heartbeat and what needs a human; `enter` or `→` opens a worker's detail (attention, reported runs, resources, configuration) and its runs. Uppercase `W` in a run opens its worker, and `esc`/`←` returns to where you came from. The fleet status rides right-aligned on the title line, the split's top pane can show floor or workers, and the floor names each run's worker on wide terminals.
 
 ### Fixed
-
-- **Additional worker-owned cleanup resists directory swaps ([#2324](https://github.com/vtmocanu/uzi/issues/2324)).**
-  Leftover job replacement, terminal skills-plugin cleanup, Codex advice working directories and session staging use descriptor-pinned removal. Refused leftovers are never reused for a job or adopted as session state; disposable cleanup warns and retains refused trees.
 
 - **Run teardown resists directory swaps ([#1831](https://github.com/vtmocanu/uzi/issues/1831)).**
   Teardown of terminal run HOMEs, provision directories, model-pass HOMEs and job workspaces now uses descriptor-pinned deletion with one shared two-minute deadline for worker waiting. Unsafe roots, exhausted budgets and unsupported platforms warn and retain leftovers without changing the run outcome; startup sweeps keep their existing behavior.
