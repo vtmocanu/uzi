@@ -16,17 +16,33 @@ save it — not in the UI, not in an API response, not in a log.
 
 ## Which credential to use
 
-Prefer the first.
+Either works; pick the one that matches how you pay for Claude.
 
 | Credential | How you get it | Best for |
 |---|---|---|
-| **OAuth token** (recommended) | `claude setup-token` (needs the Claude Code CLI and a Claude Pro/Max subscription login) | Anyone already on Claude Code; billed against your subscription. |
+| **OAuth token** | `claude setup-token` (needs the Claude Code CLI and a Claude Pro/Max subscription login) | Anyone already on Claude Code; billed against your subscription. |
 | **Console API key** | [console.anthropic.com](https://console.anthropic.com) → **API keys** → **Create key** | Anyone on usage-based API billing without a subscription. |
 
 Both paste into the same field; uzi doesn't check for a particular prefix,
 so either kind is accepted. Storing one of each is the common reason to hold
 more than one token: subscription for the work, console key for the
 retrospectives.
+
+### Whose credentials
+
+uzi is self-hosted: it runs the official Claude Agent SDK (the Claude Code
+binary) on your own infrastructure, with a credential you minted yourself
+using Anthropic's own tooling. Keep it that way:
+
+- **One person, one token.** Store only credentials that are yours. Never
+  share a token with another person or store someone else's; Anthropic's
+  terms forbid sharing account credentials.
+- **Know which terms apply.** A Console API key falls under Anthropic's
+  [Commercial Terms](https://www.anthropic.com/legal/commercial-terms); an
+  OAuth token spends your Claude subscription under its
+  [Consumer Terms](https://www.anthropic.com/legal/consumer-terms). Review
+  them for your situation; a Console API key is the unambiguous choice for
+  an instance shared by a team.
 
 ## 1. Mint a credential
 
