@@ -1224,5 +1224,10 @@ func TestFleetQuarantine(t *testing.T) {
 		if c.Since == nil {
 			t.Fatal("since must carry the oldest latch time")
 		}
+		// The action must name surfaces that actually render the cause: the admin table
+		// never does.
+		if c.Action == nil || !strings.Contains(*c.Action, "uzi admin workers --json") || !strings.Contains(*c.Action, "uzi tui") {
+			t.Fatalf("action = %v, want it to name uzi admin workers --json and uzi tui", c.Action)
+		}
 	})
 }

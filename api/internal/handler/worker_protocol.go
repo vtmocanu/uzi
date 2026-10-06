@@ -596,11 +596,13 @@ const (
 
 // parseWorkerResidueQuarantine is the heartbeat's defensive second-step parse of the
 // isolated `residue_quarantine` member (issue #2213). It NEVER fails the heartbeat: an
-// absent/null member, an oversized or malformed one, an unparseable `latched_at` or a
-// `run_id` that is neither null nor a UUID drops the WHOLE member (returns nil, logging a
-// warning for the invalid cases), so the worker reads as not latched on this tick and the
-// next valid heartbeat restores it. Dropping rather than guessing keeps every surfaced
-// field one the api could validate. cause and site are sanitized and bounded.
+// absent/null member returns nil; an oversized or malformed (non-object) one drops the
+// WHOLE member (nil, with a logged warning), so the worker reads as not latched on this
+// tick and the next valid heartbeat restores it. A member that proves a latch exists but
+// carries a bad field degrades instead, so visibility never fails open: a missing or
+// unparseable `latched_at` keeps the latch stamped with the api receive time (now), and a
+// `run_id` that is neither null nor a UUID drops only run_id. cause and site are sanitized
+// and bounded.
 //
 // A `latched_at` more than a minute ahead of the api clock is clamped to now, so a skewed
 // or hostile worker clock cannot show a latch from the future.
@@ -626,7 +628,8 @@ func parseWorkerResidueQuarantine(raw json.RawMessage, workerID uuid.UUID, now t
 	}
 	at, err := time.Parse(time.RFC3339Nano, in.LatchedAt)
 	if err != nil {
-		return drop("latched_at")
+		slog.Warn("worker reported invalid residue_quarantine latched_at; using receive time", "worker_id", workerID.String())
+		at = now
 	}
 	if at.After(now.Add(time.Minute)) {
 		at = now
@@ -635,9 +638,10 @@ func parseWorkerResidueQuarantine(raw json.RawMessage, workerID uuid.UUID, now t
 	if in.RunID != nil {
 		id, perr := uuid.Parse(*in.RunID)
 		if perr != nil {
-			return drop("run_id")
+			slog.Warn("worker reported invalid residue_quarantine run_id; dropping the field", "worker_id", workerID.String())
+		} else {
+			runID = &id
 		}
-		runID = &id
 	}
 	cause := sanitizeSelfReported(in.Cause, maxResidueQuarantineCauseBytes)
 	if cause == "" {

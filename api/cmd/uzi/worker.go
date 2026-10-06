@@ -277,7 +277,8 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 // Every field this reads except the quarantine one (Status, DrainingSince, ActiveRuns,
 // Ephemeral) is control-plane-owned (Decision 1), so those need no scrub. The quarantine
 // field is worker self-report, so this reads ONLY whether it is present, never its
-// content; the cause itself is shown only by the detail views, through cellText. The raw
+// content; the cause is never put in a table cell. The only renderer of the cause text is
+// the TUI worker view (tui_workers.go, through renderer.Plain). The raw
 // draining_since, ephemeral and residue_quarantine_* fields also ride along in `--json`
 // untouched, so scripting keys off them rather than parsing this annotation.
 func statusCell(w apitypes.WorkerDTO) string {

@@ -443,7 +443,7 @@ func (s *Service) checkFleetQuarantine(now time.Time, workers []store.ListAllWor
 		}
 		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Worker", Value: l})
 	}
-	c.Action = strPtr("Restart the quarantined worker's container to clear the latch; inspect uzi admin workers for the reported cause.")
+	c.Action = strPtr("Restart the quarantined worker's container to clear the latch; read the reported cause in `uzi admin workers --json` (residue_quarantine_cause) or the worker view in `uzi tui`.")
 	c.Since = sincePtr(oldest)
 	return c
 }

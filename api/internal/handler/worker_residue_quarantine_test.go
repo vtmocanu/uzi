@@ -125,9 +125,6 @@ func TestHeartbeatQuarantineCauseIsSanitizedAndBounded(t *testing.T) {
 
 func TestHeartbeatInvalidQuarantineMemberDropsAndClears(t *testing.T) {
 	for name, member := range map[string]string{
-		"bad latched_at":   `{"cause":"c","latched_at":"yesterday","run_id":null,"site":"s"}`,
-		"missing latch":    `{"cause":"c","run_id":null,"site":"s"}`,
-		"bad run_id":       `{"cause":"c","latched_at":"2026-10-06T16:42:57Z","run_id":"not-a-uuid","site":"s"}`,
 		"not an object":    `"latched"`,
 		"oversized member": `{"cause":"` + strings.Repeat("a", 5000) + `","latched_at":"2026-10-06T16:42:57Z","run_id":null,"site":"s"}`,
 	} {
@@ -141,6 +138,33 @@ func TestHeartbeatInvalidQuarantineMemberDropsAndClears(t *testing.T) {
 			}
 			if at != nil || cause != nil {
 				t.Fatalf("invalid member must read as not latched: at=%v cause=%v", at, cause)
+			}
+		})
+	}
+}
+
+// A member that proves a latch exists but has a bad field keeps the latch (visibility
+// must not fail open): a bad or missing latched_at takes the api receive time, a bad
+// run_id drops only run_id.
+func TestParseQuarantineBadFieldsKeepLatch(t *testing.T) {
+	now := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	for name, tc := range map[string]struct {
+		member string
+		wantAt time.Time
+		wantID bool
+	}{
+		"bad latched_at": {`{"cause":"c","latched_at":"yesterday","run_id":null,"site":"s"}`, now, false},
+		"missing latch":  {`{"cause":"c","run_id":null,"site":"s"}`, now, false},
+		"bad run_id":     {`{"cause":"c","latched_at":"2026-10-06T10:00:00Z","run_id":"not-a-uuid","site":"s"}`, time.Date(2026, 10, 6, 10, 0, 0, 0, time.UTC), false},
+		"good run_id":    {`{"cause":"c","latched_at":"2026-10-06T10:00:00Z","run_id":"` + uuid.Nil.String() + `","site":"s"}`, time.Date(2026, 10, 6, 10, 0, 0, 0, time.UTC), true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := parseWorkerResidueQuarantine(json.RawMessage(tc.member), uuid.New(), now)
+			if got == nil {
+				t.Fatal("latch must be kept")
+			}
+			if !got.LatchedAt.Equal(tc.wantAt) || got.Cause != "c" || (got.RunID != nil) != tc.wantID {
+				t.Fatalf("got %+v, want at=%v runID=%v", got, tc.wantAt, tc.wantID)
 			}
 		})
 	}
