@@ -285,15 +285,9 @@ jobs:
             ./internal/poller/...
           )
           go test -count=1 -v -race -p 1 -run 'LiveDB$' "${PKGS[@]}" 2>&1 | tee livedb.log
-          ran=$(grep -c '^--- PASS' livedb.log || true)
-          skipped=$(grep -c '^--- SKIP' livedb.log || true)
-          echo "LiveDB: $ran passed, $skipped skipped"
-          if [ "$ran" -eq 0 ] || [ "$skipped" -gt 0 ]; then
-            echo "FAIL: the live-DB tests did not actually run against Postgres. They skip when"
-            echo "UZI_TEST_DATABASE_URL is unset or the service is unreachable, and 'go test' still"
-            echo "prints ok -- so this job would be green while testing nothing."
-            exit 1
-          fi
+          # Aggregate check shared with e2e/run-store-it.sh: something ran, and nothing
+          # skipped at any indentation (a skipped subtest is an indented `--- SKIP:`).
+          ../scripts/livedb-skip-guard.sh livedb.log
           # Per package: a listed package that contributes zero *LiveDB tests prints
           # `ok <pkg> 0.01s [no tests to run]`, which the aggregate count above cannot
           # see. Each root package must have a plain `ok <pkg> <N>s` line.
