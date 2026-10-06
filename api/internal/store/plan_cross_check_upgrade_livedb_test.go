@@ -181,6 +181,12 @@ func testCrossCheckRecoveryLockOrder(t *testing.T, pool *pgxpool.Pool, user, rep
 		size_class,base_commit,candidate_digest,checker_run_id,deadline_at)
 		VALUES($1,'plan',1,1,'plan','[]','s',repeat('a',40),$2,$3,now()+interval '30 minutes')`,
 		lead, []byte("digest"), child)
+	// Create the live-pointer FKs before recovery owns the worker row. Updating
+	// only the annotation below must not acquire a conflicting worker FK lock.
+	hold := uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO recovery_custody_holds(id,user_id,repo_id,run_id,generation,state,
+		original_worker_id,original_worker_identity,live_worker_id,live_run_id)
+		VALUES($1,$2,$3,$4,1,'open',$5,$6,$5,$4)`, hold, user, repo, child, worker, worker.String())
 	holder, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -262,10 +268,8 @@ func testCrossCheckRecoveryLockOrder(t *testing.T, pool *pgxpool.Pool, user, rep
 	}
 	// Commit a custody annotation while recovery waits. Only the writer's separate
 	// READ COMMITTED statement can see it after the locking query's old snapshot.
-	if _, err := holder.Exec(ctx, `INSERT INTO recovery_custody_holds(user_id,repo_id,run_id,generation,state,
-		original_worker_id,original_worker_identity,live_worker_id,live_run_id,terminal_record_rejection)
-		VALUES($1,$2,$3,1,'open',$4,$5,$4,$3,'mac_failure')`, user, repo, child, worker, worker.String()); err != nil {
-		t.Fatal(err)
+	if _, err := holder.Exec(ctx, "UPDATE recovery_custody_holds SET terminal_record_rejection='mac_failure' WHERE id=$1", hold); err != nil {
+		t.Fatalf("annotate custody after locking checker: %v", err)
 	}
 	if err := holder.Commit(ctx); err != nil {
 		t.Fatal(err)

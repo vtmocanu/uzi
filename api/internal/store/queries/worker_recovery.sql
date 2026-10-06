@@ -492,7 +492,7 @@ WITH candidates AS MATERIALIZED (
       )
 )
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
-    status = 'failed', status_since = now(), failure_reason = @failure_reason,
+    status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE @failure_reason END,
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     milestones_in_progress = NULL,
@@ -965,7 +965,7 @@ WITH candidates AS MATERIALIZED (
       )
 )
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
-    status = 'failed', status_since = now(), failure_reason = @failure_reason,
+    status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE @failure_reason END,
     -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
@@ -1395,7 +1395,7 @@ WITH candidates AS MATERIALIZED (
       )
 )
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
-    status = 'failed', status_since = now(), failure_reason = @failure_reason,
+    status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE @failure_reason END,
     fail_origin = 'worker_lost',
     move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     milestones_in_progress = NULL,

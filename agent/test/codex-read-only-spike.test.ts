@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 
 import { CodexCallbackBroker, type FileopClient, type RunGrants } from "../src/codex/broker.js";
 import { buildCodexDynamicTools } from "../src/codex/dynamic-tools.js";
@@ -103,7 +104,7 @@ describe("read-only Codex spike", () => {
     } catch {
       return t.skip("packaged fileop and sandbox binaries unavailable");
     }
-    const base = await fs.mkdtemp(path.join(process.cwd(), "../.uzi/scratch/readonly-"));
+    const base = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "readonly-"));
     const checkout = path.join(base, "checkout");
     const privateTmp = path.join(base, "private");
     const outside = path.join(base, "outside.txt");
@@ -134,7 +135,13 @@ describe("read-only Codex spike", () => {
         broker.handleToolCall({ threadId: "t", turnId: "turn", callId: String(++call) }, name, args, "root");
       const read = await invoke("uzi_read", { path: "sample.txt" });
       assert.equal(read.ok, true, JSON.stringify({ read, stderr, exitCode: child.exitCode, signalCode: child.signalCode }));
-      if (read.ok) assert.equal(Buffer.from((read.output as { contentBase64: string }).contentBase64, "base64").toString(), "needle\nsecond line\n");
+      if (read.ok) {
+        assert.deepEqual(read.output, {
+          size: Buffer.byteLength("needle\nsecond line\n"),
+          content: "needle\nsecond line\n", offset: 1, linesReturned: 2,
+          partialLastLine: false, truncated: false,
+        });
+      }
       const search = await invoke("uzi_search", { query: "needle" });
       assert.equal(search.ok, true, stderr);
       if (search.ok) assert.deepEqual((search.output as { matches: unknown }).matches, [{ path: "sample.txt", line: 1, text: "needle" }]);

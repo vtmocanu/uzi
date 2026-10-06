@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Plan cross-check preserves worker custody during planning ([#2149](https://github.com/vtmocanu/uzi/issues/2149)).**
+  Confined planning captures read the immutable baseline without granting writes, and queued transport waits can be cancelled without discarding assigned records. Cross-check migrations now follow the current default schema while retaining worker maintenance and Docker preferences.
+
 ### Changed
 
 - **Ephemeral Docker preference on the Workers page ([#2278](https://github.com/vtmocanu/uzi/issues/2278)).**
