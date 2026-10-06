@@ -263,12 +263,13 @@ export class Worker {
   private async resolveBootTerminals(signal: AbortSignal): Promise<void> {
     const outbox = this.outbox;
     if (!outbox) return;
-    const deps = makeTerminalOutboxDeps(outbox, this.client, {
+    let deps = makeTerminalOutboxDeps(outbox, this.client, {
       gapFillMax: this.config.gapFillMax,
       terminalMaxBytes: this.config.outboxTerminalMaxBytes,
       log: this.log,
     });
     if (!deps) return; // no usable outbox (failed closed) — nothing durable to resolve
+    if (typeof this.runner.protectRecoveryTerminalDeps === "function") deps = this.runner.protectRecoveryTerminalDeps(deps);
     for (const entry of outbox.listPendingTerminals()) {
       if (signal.aborted) return;
       const gen = entry.claim_generation;
@@ -288,7 +289,7 @@ export class Worker {
         const stillPending = outbox
           .listPendingTerminals()
           .some((p) => p.run_id === entry.run_id && p.claim_generation === gen);
-        if (!stillPending) await outbox.retireFinalizesThrough(entry.run_id, gen);
+        if (!stillPending && !(await this.runner.recoveryInventoryPending?.(entry.run_id, gen))) await outbox.retireFinalizesThrough(entry.run_id, gen);
       } catch (err) {
         this.log.warn("outbox: boot terminal resolve failed for a run; leaving it listed for a later resolve", {
           run_id: entry.run_id,
@@ -335,12 +336,13 @@ export class Worker {
   private async resolveRunTerminal(runId: string, signal?: AbortSignal): Promise<void> {
     const outbox = this.outbox;
     if (!outbox) return;
-    const deps = makeTerminalOutboxDeps(outbox, this.client, {
+    let deps = makeTerminalOutboxDeps(outbox, this.client, {
       gapFillMax: this.config.gapFillMax,
       terminalMaxBytes: this.config.outboxTerminalMaxBytes,
       log: this.log,
     });
     if (!deps) return; // no usable outbox (failed closed) — nothing durable to resolve
+    if (typeof this.runner.protectRecoveryTerminalDeps === "function") deps = this.runner.protectRecoveryTerminalDeps(deps);
     for (const entry of outbox.listPendingTerminals()) {
       if (entry.run_id !== runId) continue;
       if (signal?.aborted) return;
@@ -366,12 +368,13 @@ export class Worker {
     if (this.sweepingTerminals) return; // single-flight
     this.sweepingTerminals = true;
     try {
-      const deps = makeTerminalOutboxDeps(outbox, this.client, {
+      let deps = makeTerminalOutboxDeps(outbox, this.client, {
         gapFillMax: this.config.gapFillMax,
         terminalMaxBytes: this.config.outboxTerminalMaxBytes,
         log: this.log,
       });
       if (!deps) return; // no usable outbox (failed closed) — nothing durable to resolve
+      if (typeof this.runner.protectRecoveryTerminalDeps === "function") deps = this.runner.protectRecoveryTerminalDeps(deps);
       for (const entry of outbox.listPendingTerminals()) {
         if (signal?.aborted) return;
         await this.resolveLiveTerminal(outbox, deps, entry, "sweep", signal);
@@ -431,7 +434,7 @@ export class Worker {
       const stillPending = outbox
         .listPendingTerminals()
         .some((p) => p.run_id === runId && p.claim_generation === gen);
-      if (!stillPending) await outbox.retireFinalizesThrough(runId, gen);
+      if (!stillPending && !(await this.runner.recoveryInventoryPending?.(runId, gen))) await outbox.retireFinalizesThrough(runId, gen);
     } catch (err) {
       this.log.warn("outbox: live terminal resolve failed for a run; leaving it listed for a later resolve", {
         run_id: runId,
@@ -508,6 +511,7 @@ export class Worker {
           "completion_interlock_v1",
           "recovery_archive_v1",
           "recovery_archive_v2",
+          "recovery_inventory_v1",
           // PRD #1247 M5b (D3/protocol §9): this image implements the held-state credential-switch
           // protocol — it stamps claim_generation on every mutating report (already landed in W2a),
           // surfaces the credential_switch signal, and performs the two-phase release. Advertised
@@ -609,7 +613,11 @@ export class Worker {
         // retire failure must not turn an accepted register into a retry loop.
         if (sentFinalizes.length > 0) {
           try {
-            await this.outbox?.retireFinalizes(sentFinalizes);
+            const releasable = [];
+            for (const entry of sentFinalizes) {
+              if (!(await this.runner.recoveryInventoryPending?.(entry.run_id, entry.claim_generation))) releasable.push(entry);
+            }
+            await this.outbox?.retireFinalizes(releasable);
           } catch (err) {
             this.log.warn("register finalize snapshot: retiring the offered records failed", {
               error: errMessage(err),

@@ -1569,6 +1569,10 @@ interface RunFlight {
   readonly claimGeneration: number;
   readonly owedDefaultBranch: string | undefined;
   owedContext: Promise<OwedCandidateContext> | undefined;
+  prepareTerminalInventory: () => Promise<void>;
+  owedFeedClosed: boolean;
+  /** Credential deferral/switch leaves this generation's guarded inventory open for resume. */
+  keepGuardedInventoryOpen: boolean;
   /** issue #1751 M2: the resolved claim kind, gating which live-settle trigger (checkpoint publish
    *  or finalize branch push) this run may fire. */
   readonly runKind: RunKind;
@@ -2199,6 +2203,7 @@ export class RunRunner {
         log: this.log,
         recoveryRoot: this.git.recoveryRoot,
         terminalRecordProtection: (runId) => this.git.hasPhysicalTerminalProtection(runId),
+        isExecuting: (runId) => this.isExecuting(runId),
         onAuthoritativeGenerationReleased: opts.queueTerminalRejectionReconciliation,
         workerToken: this.joinToken,
         now: opts.now,
@@ -2297,14 +2302,26 @@ export class RunRunner {
   /** issue #1742 D4(a) — the previous process's recovery records, snapshotted by the worker BEFORE
    *  register and handed to {@link resumePendingRecoveries}. Best-effort: [] on any failure. */
   async snapshotBootRecoveries(): Promise<RecoveryRecord[]> {
-    return this.recovery.snapshotBootRecords().catch(() => []);
+    try {
+      await this.recovery.snapshotOwedInventory();
+    } catch (err) {
+      this.log.warn("recovery: boot inventory discovery failed; inventory unknown", { error: errMessage(err) });
+    }
+    return this.recovery.snapshotBootRecords().catch(err => {
+      this.log.warn("recovery: boot journal snapshot failed", { error: errMessage(err) });
+      return [];
+    });
   }
 
   /** PRD #1296 M3 — restart-safe recovery resume (called once by the worker after
    *  registration). Re-uploads any journaled bundle BYTE-IDENTICALLY with no forge PAT.
    *  Best-effort; never throws to the caller. */
   async resumePendingRecoveries(signal?: AbortSignal, snapshot?: RecoveryRecord[]): Promise<void> {
-    await this.recovery.resumePending(signal, snapshot).catch((err) => {
+    const discovered = await this.recovery.materializeBootInventory(signal).catch(err => {
+      this.log.warn("recovery: boot materialization failed; independent journals still retried", { error: errMessage(err) });
+      return [];
+    });
+    await this.recovery.resumePending(signal, [...(snapshot ?? await this.recovery.snapshotBootRecords()), ...discovered]).catch((err) => {
       this.log.warn("recovery: resume sweep failed", { error: errMessage(err) });
     });
   }
@@ -2837,13 +2854,14 @@ export class RunRunner {
           // Close the batcher on the park path (handleLimitReached deferred the close so the
           // checkpoint-publish outcome above could reach the feed). Closed exactly once here
           // for every parked run, including the edge where the paths above were absent.
+          if (claim.inventory_guarded === true && !parkResidueBlocked) await this.settleRecoveryGeneration(claim, flight, runLog);
           await batcher.close().catch(() => undefined);
           // PRD #1349 M2 (D4): settle this generation's hold before the limit-park requeue. The
           // reapForSink above already reaped the agent tree, so the credentialed fresh-forge
           // comparison is safe: a verified-empty limit park releases its exact hold, work-bearing
           // committed history is promoted into the generation-bound archive, and a failed
           // comparison or upload retains. Best-effort; runs after the park report landed.
-          if (!parkResidueBlocked) await this.settleRecoveryGeneration(claim, flight, runLog);
+          if (claim.inventory_guarded !== true && !parkResidueBlocked) await this.settleRecoveryGeneration(claim, flight, runLog);
         } else {
           // PRD #1349 M2 (F4) / #1539: EVERY non-parked limit outcome, not just the opt-out.
           // handleLimitReached returns parked=false on THREE distinct paths: the usage-limit
@@ -3524,6 +3542,19 @@ export class RunRunner {
       // `abandoned`, NO filesystem operation on its path — and never retired or reused. Its
       // capture already ran behind the predecessor-scoped capture-mode proof.
       let ownAttemptRetired = false;
+      if (flight.barePath && flight.branch && !terminalDisposeUnproven && typeof this.git.retainCurrentOwedCandidate === "function") {
+        const q = await this.quiesceRun(flight, executor, { mode: "own", site: "terminal_retire" });
+        if (!q.blocked) {
+          try {
+            const retained = await this.git.retainCurrentOwedCandidate(flight.barePath, await this.owedOptions(flight, flight.barePath, flight.branch));
+            if (retained.kind === "not_updated" && claim.inventory_guarded === true) flight.preserveRecoveryClone = true;
+            if (claim.inventory_guarded === true && !flight.active?.shuttingDown) await this.settleGuardedInventory(claim, flight);
+          } catch (err) {
+            if (claim.inventory_guarded === true) flight.preserveRecoveryClone = true;
+            runLog.warn("recovery: retirement inventory unknown", { error: errMessage(err), guarded: claim.inventory_guarded === true });
+          }
+        }
+      }
       if (flight.predecessorCapture && flight.worktreePath && !flight.preserveRecoveryClone) {
         if (flight.barePath && flight.branch && flight.predecessorCaptureVerified) {
           // The release appends the ledger BEFORE it clears the journal, so every failure it can
@@ -3713,6 +3744,7 @@ export class RunRunner {
    */
   private async retireFinalizeRecord(flight: RunFlight, site: string): Promise<void> {
     if (!this.outbox) return;
+    if (await this.recoveryInventoryPending(flight.runId, flight.claimGeneration)) return;
     try {
       await this.outbox.retireFinalize(flight.runId, flight.claimGeneration);
     } catch (err) {
@@ -3728,15 +3760,40 @@ export class RunRunner {
   /** PRD #1391 Run B M3b: the terminal-resolve deps for this runner, or undefined when no usable
    *  outbox is wired (a test without spill, or a store that failed closed) — in which case the
    *  write-ahead terminal send path falls back to today's un-journaled `reportState`. */
+  async recoveryInventoryPending(runId: string, generation: number): Promise<boolean> {
+    try {
+      const records = (await this.recovery.inspect(runId)).filter(r => r.generation === generation);
+      if (records.some(r => r.inventoryGuarded && r.coverageDigest && r.finalAcknowledged)) return false;
+      if (records.some(r => r.inventoryGuarded)) return true;
+      if (this.client.hasFeature("recovery_inventory_v1")) {
+        return (await this.client.listRecoveryHolds(runId)).holds.some(h => h.generation === generation && h.inventory_guarded === true);
+      }
+      return false;
+    } catch { return true; } // Unknown inventory never permits cleanup.
+  }
+
+  protectRecoveryTerminalDeps(deps: TerminalOutboxDeps): TerminalOutboxDeps {
+    const outbox = new Proxy(deps.outbox, {
+      get: (target, property) => {
+        if (property === "retireTerminal") return async (runId: string, generation: number) => {
+          if (!(await this.recoveryInventoryPending(runId, generation))) await target.retireTerminal(runId, generation);
+        };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    return { ...deps, outbox };
+  }
+
   private terminalDeps(): TerminalOutboxDeps | undefined {
     if (!this.outbox || this.outbox.isDisabled()) return undefined;
-    return {
+    return this.protectRecoveryTerminalDeps({
       outbox: this.outbox,
       client: this.client,
       gapFillMax: this.gapFillMax,
       terminalMaxBytes: this.outboxTerminalMaxBytes,
       log: this.log,
-    };
+    });
   }
 
   /**
@@ -3770,6 +3827,7 @@ export class RunRunner {
       // (there is no journal to stale-retire on this degradation path), so this branch is otherwise
       // byte-for-byte unchanged.
       await beforeResolve?.();
+      await flight.prepareTerminalInventory();
       await send(body);
       flight.terminalResolved = true;
       return;
@@ -3804,10 +3862,12 @@ export class RunRunner {
     });
     // Issue #1742 retirement site (a): G's terminal journal is installed, so the #1391 lease takes
     // over and the finalize-pending record is no longer needed (independent of the send below).
-    if (installed.journaled) await this.retireFinalizeRecord(flight, "terminal_journal_installed");
+    // Retire finalize evidence only after the reaped inventory has been persisted.
     // #1539: run the hook (abort + reap for the permanent failure hook) after the install
     // decision, including deferral, and BEFORE any resolve/send.
     await beforeResolve?.();
+    if (installed.journaled || !("deferred" in installed)) await flight.prepareTerminalInventory();
+    if (installed.journaled) await this.retireFinalizeRecord(flight, "terminal_journal_installed");
     if (!installed.journaled && "deferred" in installed) {
       // Preserve finalize and the selected winner; reach the latch before the hook releases its hold.
     } else if (!installed.journaled) {
@@ -4034,7 +4094,6 @@ export class RunRunner {
       agent: "worker",
       payload: { text: reason },
     });
-    await batcher.close().catch(() => undefined);
     // PRD #1349 M2 (D4.5) / #1531: REAP THIS generation's provider FIRST, BEFORE the `failed`
     // report. A steering-cancel and an early agent failure both land here (a cancel aborts the
     // controller with the same error, then reports failed), and neither reaches the finalization
@@ -4057,6 +4116,8 @@ export class RunRunner {
         : flight.permanentFailureReap !== undefined
           ? this.permanentFailureReapValid(flight)
           : await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
+    if (reaped && !opts.keepCustody) await flight.prepareTerminalInventory();
+    await batcher.close().catch(() => undefined);
     // Cap what lands in the run row (matches the GitLab error-body cap). Journal it WRITE-AHEAD then
     // resolve it (D3): on reserve_exhausted it degrades to today's direct send, whose throw the
     // .catch below still logs; on the journaled path journalAndSendTerminal never throws (a send that
@@ -4820,6 +4881,10 @@ export class RunRunner {
     ): Promise<void> => {
       const status = (body as { status?: string }).status;
       try {
+        if (claim.inventory_guarded === true && ["completed", "failed", "cancelled"].includes(status ?? "")) {
+          await this.settleGuardedInventory(claim, flight, recoveryRecord?.sourceSha, status === "completed" ? body as StateRequest : undefined, boundarySignal);
+          return;
+        }
         if (status === "completed") {
           // A completed run published its head (a full publication) OR committed nothing (a
           // no-code completion: report_only / not_code / scope-capped-empty). EITHER way this
@@ -4913,6 +4978,7 @@ export class RunRunner {
     ): Promise<void> => {
       if (deferCommittedTerminal) {
         deferCommittedTerminal(async () => {
+          await flight.prepareTerminalInventory();
           await batcher.close();
           // Journal write-ahead here too (D3): the deferred Codex sink sends through
           // flight.reportState + driveRecoveryTerminal, so wrap that pair as the resolve `send`.
@@ -4927,6 +4993,7 @@ export class RunRunner {
         });
         return;
       }
+      await flight.prepareTerminalInventory();
       await closeBatcher();
       await journalTerminalReport(body);
       runLog.info(logMessage, fields);
@@ -5237,6 +5304,7 @@ export class RunRunner {
           // this generation's record after clone; matching by generation UPDATES it to the
           // committed head H here rather than minting a duplicate.
           generation: claim.claim_generation,
+          inventoryGuarded: claim.inventory_guarded === true,
           // issue #1742 D4(a): the restart-sweep facts. The finalization pin (the committed head H,
           // NOT the early start-tip pin) records where H lives so a restart can re-verify and
           // capture it without a forge fetch.
@@ -7406,6 +7474,30 @@ export class RunRunner {
       claimGeneration,
       owedDefaultBranch: claim.repo.default_branch?.trim() || undefined,
       owedContext: undefined,
+      owedFeedClosed: false,
+      keepGuardedInventoryOpen: false,
+      prepareTerminalInventory: async () => {
+        if (!this.recovery.enabled || !isCodePublishingKind(flight.runKind) || claim.inventory_guarded !== true || !flight.barePath || !flight.branch) return;
+        try {
+          const q = await this.quiesceRun(flight, flight.executor, { mode: "own", site: "terminal_retire" });
+          if (q.blocked) { flight.preserveRecoveryClone = true; return; }
+          // This terminal boundary ends a continuing switch generation; until here its
+          // unresolved pins and hold must stay open for further executor work.
+          flight.keepGuardedInventoryOpen = false;
+          const source = await this.transferRestorePointToTrustedBare(flight, runLog, runId, claimGeneration);
+          if (!source) {
+            flight.preserveRecoveryClone = true;
+            flight.keepGuardedInventoryOpen = true;
+            const head = flight.worktreePath && await this.git.worktreeHead(flight.worktreePath);
+            if (head) await this.pinRecoveryGeneration(claim, flight, head);
+            return;
+          }
+          await this.settleGuardedInventory(claim, flight, source ?? undefined, undefined, undefined, true);
+        } catch (err) {
+          flight.preserveRecoveryClone = true;
+          runLog.warn("recovery: preterminal snapshot failed; source retained, reporting continues", { error: errMessage(err) });
+        }
+      },
       runKind: resolveRunKind(claim.kind),
       observedSessionId: undefined,
       latestContractRevision: undefined,
@@ -7582,6 +7674,11 @@ export class RunRunner {
     // The hook body lives in handlePermanentFailure (a named method) so its install/decision-BEFORE-abort,
     // abort-BEFORE-reap, reap-BEFORE-send ordering is unit-testable against the REAL code — a mutation
     // to any of those orderings reddens a test.
+    const close = batcher.close.bind(batcher);
+    batcher.close = async (...args: Parameters<MessageBatcher["close"]>) => {
+      flight.owedFeedClosed = true;
+      return close(...args);
+    };
     batcher.onPermanentFailureReport(({ reason }) => this.handlePermanentFailure(claim, flight, reason));
 
     return flight;
@@ -10102,6 +10199,103 @@ export class RunRunner {
     return { context, remotelyConfirmedSha: flight.lastCheckpointRefTip };
   }
 
+  private announceOwedHeads(flight: RunFlight, shas: string[], archived = false): void {
+    if (flight.owedFeedClosed) {
+      flight.runLog.info("recovery: retained heads after feed close", { heads: shas, archived });
+      return;
+    }
+    // Eight bounded SHA labels per row; the finite inventory determines the row count.
+    for (let i = 0; i < shas.length; i += 8) {
+      const labels = shas.slice(i, i + 8).filter(s => /^[0-9a-f]{40}$/.test(s)).map(s => s.slice(0, 12));
+      if (!labels.length) continue;
+      flight.batcher.emit({ kind: "status", agent: "worker", payload: { text:
+        archived ? `Earlier recovery archive covers retained heads ${labels.join(", ")}; final custody ACK pending. Use uzi run recovery or uzi run export.`
+          : `Retained heads ${labels.join(", ")} are worker-local, not checkpoint durable; recovery needs action. Use uzi run recovery or uzi run export.`,
+      } });
+    }
+  }
+
+  private async reconcileConfirmedOwed(flight: RunFlight, barePath: string, confirmedSha: string): Promise<void> {
+    try {
+      const result = await this.git.reconcileOwedCandidates(barePath, flight.runId, confirmedSha);
+      this.announceOwedHeads(flight, result.retainedShas);
+    } catch (err) {
+      flight.runLog.warn("owed reconciliation failed; extra pins retained", { error: errMessage(err) });
+    }
+  }
+
+  /** Called only at a reaped disposition boundary. Credential-free coverage includes every
+   * unresolved run root; it never advances tracking, checkpoint, or settlement evidence. */
+  private async settleGuardedInventory(
+    claim: ClaimResponse, flight: RunFlight, originalSourceSha?: string,
+    completedBody?: StateRequest, signal?: AbortSignal, locallyQuiescent = false,
+  ): Promise<void> {
+    const barePath = flight.barePath, branch = flight.branch;
+    if (flight.keepGuardedInventoryOpen || !barePath || !branch || !claim.claim_generation || !this.recovery.enabled ||
+        !isCodePublishingKind(resolveRunKind(claim.kind))) return;
+    try {
+      const options = await this.owedOptions(flight, barePath, branch);
+      if (options.context.generation === null) return;
+      // Before any clone/anchor retirement, retain the current positively owned head.
+      const retained = await this.git.retainCurrentOwedCandidate(barePath, options);
+      if (retained.kind === "updated") this.announceOwedHeads(flight, retained.retainedShas);
+      else flight.preserveRecoveryClone = true;
+      const own = await this.client.getRunOwnership(claim.run_id);
+      if (!locallyQuiescent && (own.claim_generation === undefined ||
+          !(own.claim_generation > claim.claim_generation ||
+            (own.claim_generation === claim.claim_generation && own.inventory_guarded === true &&
+             ["completed", "failed", "cancelled", "paused", "recovery_wait", "limit_wait"].includes(own.status))))) return;
+      // Publication can classify an authoritative empty inventory, never clear owed pins.
+      const publication = completedBody && own.status === "completed" &&
+        own.claim_generation === claim.claim_generation && flight.successfulPushedSha &&
+        !completedBody.report_only && !!completedBody.branch;
+      const candidates = await this.git.enumerateOwedCandidates(barePath, claim.run_id);
+      // A supplied transfer source is current; earlier adoption evidence is only a coverage root.
+      let currentSha = originalSourceSha;
+      // Only an exact-generation authenticated disposition source may augment coverage.
+      originalSourceSha ??= (await this.recovery.inspect(claim.run_id)).find(r =>
+        r.generation === claim.claim_generation && !r.coverageDigest)?.sourceSha;
+      if (!currentSha && retained.kind === "updated") {
+        const owned = await this.git.committedTrackingOwnership(barePath, branch, claim.run_id, retained.candidateSha, claim.claim_generation);
+        if (owned.kind === "owned" && owned.context.generation === claim.claim_generation) currentSha = retained.candidateSha;
+      }
+      // A matching owned pin can recover independently of a partially failed shared-ref write.
+      currentSha ??= candidates.find(c => c.contexts.some(ctx =>
+        ctx.runId === claim.run_id && ctx.generation === claim.claim_generation))?.sha;
+      currentSha ??= originalSourceSha;
+      if (!currentSha) { flight.preserveRecoveryClone = true; return; }
+      const record = await this.recovery.freezeInventory({
+        context: options.context, currentSha, originalSourceSha, locallyQuiescent,
+        defaultBranch: claim.repo.default_branch?.trim() || await this.git.defaultBranchName(barePath) || "main",
+        ...(publication && retained.kind === "updated" && !flight.preserveRecoveryClone && !candidates.length
+          ? { settledEvidence: "publication" as const } : {}),
+      });
+      if (!record) { flight.preserveRecoveryClone = true; return; }
+      const outcome = await this.recovery.captureAndUpload({
+        record, barePath, defaultBranch: record.defaultBranch!, signal,
+      });
+      if (outcome.state !== "uploaded") flight.preserveRecoveryClone = true;
+      this.announceOwedHeads(flight, record.originalRoots?.map(r => r.sha) ?? [], outcome.state === "uploaded");
+      if (outcome.state === "uploaded") {
+        // captureAndUpload persists the reservation on a newer journal revision.
+        const uploaded = (await this.recovery.inspect(claim.run_id)).find(r => r.captureId === record.captureId);
+        if (uploaded?.serverCaptureId) {
+          const text = uploaded.finalAcknowledged
+            ? `Recovery archive ${uploaded.serverCaptureId} covers the frozen inventory; custody transfer confirmed. Use uzi run recovery or uzi run export.`
+            : `Earlier recovery archive ${uploaded.serverCaptureId} available; custody final ACK pending. Use uzi run recovery or uzi run export.`;
+          if (!flight.owedFeedClosed) flight.batcher.emit({ kind: "status", agent: "worker", payload: { text } });
+          else flight.runLog.info(text);
+        }
+      }
+      flight.runLog.info("recovery: guarded inventory disposition", {
+        generation: claim.claim_generation, capture_id: record.captureId, state: outcome.state, reason: outcome.reason,
+      });
+    } catch (err) {
+      flight.preserveRecoveryClone = true;
+      flight.runLog.warn("recovery: guarded inventory retained; reporting unaffected", { error: errMessage(err) });
+    }
+  }
+
   private preservationRefused(flight: RunFlight, reason: string): PreservationRefusedError {
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
@@ -10139,6 +10333,15 @@ export class RunRunner {
     );
     if (result.kind === "not_updated") throw this.preservationRefused(flight, result.reason);
     await this.requireTrackingOwned(flight, barePath, branch, result.candidateSha);
+    if (result.divergence === "divergent") {
+      const heads = result.displacedSha && result.retainedShas.includes(result.displacedSha) ? [result.displacedSha] : [];
+      for (const sha of heads) if (/^[0-9a-f]{40}$/.test(sha) && !flight.owedFeedClosed) {
+        flight.batcher.emit({ kind: "status", agent: "worker", payload: { text:
+          `Rewrite/divergence preserved head ${sha.slice(0, 12)} before ${result.candidateSha.slice(0, 12)}; worker-local, not checkpoint durable. Use uzi run recovery or uzi run export.`,
+        } });
+      }
+    }
+    this.announceOwedHeads(flight, result.retainedShas);
     return result;
   }
 
@@ -11343,6 +11546,7 @@ export class RunRunner {
         // declared tip (the overlay `O_ov`, or realTip on the no-overlay path), so the NEXT
         // overlay carries it as parent[0] (base-first) and stays a fast-forward the broker takes.
         flight.lastCheckpointRefTip = packed.tipOid;
+        await this.reconcileConfirmedOwed(flight, barePath, packed.tipOid);
         // issue #1086 (F2): a confirmed publish reconciles the broker's ref, so clear any pending
         // attempted tip — the confirmed tip is now authoritative.
         flight.lastAttemptedCheckpointRefTip = undefined;
@@ -11634,6 +11838,14 @@ export class RunRunner {
       await this.settler.supersedeOlderGenerations(claim.run_id, claim.claim_generation);
     }
     try {
+      if (flight.barePath && claim.checkpoint_tip) await this.reconcileConfirmedOwed(flight, flight.barePath, claim.checkpoint_tip);
+      if (flight.barePath) {
+        const pins = await this.git.enumerateOwedCandidates(flight.barePath, claim.run_id);
+        this.announceOwedHeads(flight, pins.map(p => p.sha));
+      }
+      if (claim.inventory_guarded !== true) flight.batcher.emit({ kind: "status", agent: "worker", payload: {
+        text: "UNGUARDED legacy generation: worker-local retention is available; terminal and reclamation protection are unsupported.",
+      } });
       const startTip = await this.currentRestorePointHead(flight);
       await this.pinRecoveryGeneration(claim, flight, startTip);
       const holds = await this.recovery.inventoryHolds(claim.run_id);
@@ -11648,7 +11860,7 @@ export class RunRunner {
             capture_state: h.capture_state,
           })),
         });
-        await this.recordAdoptionEvidence(claim, flight, holds);
+        await this.recordAdoptionEvidence(claim, flight, holds.filter(h => h.inventory_guarded !== true));
       }
     } catch (err) {
       flight.runLog.warn(
@@ -11688,7 +11900,7 @@ export class RunRunner {
         // is left behind and two ids that sanitize alike can never share one.
         if (!isSafeSettlementId(claim.run_id) || !isSafeSettlementId(hold.hold_id)) continue;
         const pred = records.find((r) => r.generation === hold.generation);
-        if (!pred) continue; // no authenticated predecessor source → no evidence; hold retained
+        if (!pred || pred.inventoryGuarded) continue; // no authenticated predecessor source → no evidence; hold retained
         // Local pre-filter (it can only skip, never release; the server does the forge proof): record
         // evidence only when the predecessor's source is contained in (an ancestor of, or equal to)
         // the adopted base in the trusted bare. A recovered wip(park) marker is reset --soft out of
@@ -11897,6 +12109,7 @@ export class RunRunner {
       kind: resolveRunKind(claim.kind),
       branch,
       generation: claim.claim_generation,
+      inventoryGuarded: claim.inventory_guarded === true,
     });
   }
 
@@ -12026,6 +12239,22 @@ export class RunRunner {
     if (!isCodePublishingKind(resolveRunKind(claim.kind))) return;
     const barePath = flight.barePath;
     if (!barePath) return;
+    if (claim.inventory_guarded === true) {
+      // The reaped caller may still be registered locally. Require server disposition before
+      // using that quiescence proof; a refused park keeps its inventory unsealed.
+      try {
+        const own = await this.client.getRunOwnership(claim.run_id);
+        if (own.claim_generation === undefined || claim.claim_generation === undefined ||
+            !(own.claim_generation > claim.claim_generation ||
+              (own.claim_generation === claim.claim_generation && own.inventory_guarded === true &&
+               ["completed", "failed", "cancelled", "paused", "recovery_wait", "limit_wait"].includes(own.status)))) return;
+        await this.settleGuardedInventory(claim, flight, undefined, undefined, signal, true);
+      } catch (err) {
+        flight.preserveRecoveryClone = true;
+        runLog.warn("recovery: guarded disposition unavailable; custody retained", { error: errMessage(err) });
+      }
+      return;
+    }
     try {
       // issue #1507 — the pin ref anchoring the transferred head is keyed on this run's exact claim
       // generation; a v1 claim without one falls back to 0. This value need NOT match the journal
@@ -12332,6 +12561,7 @@ export class RunRunner {
     // Both credential deferrals use the same credential-free proof/custody posture.
     // Unknown outcomes never imply a locked vault or send an API recovery cause.
     let credentialDeferred = cause.kind === "vault_locked" || cause.kind === "refresh_unknown";
+    if (credentialDeferred) flight.keepGuardedInventoryOpen = true;
     let feed = cause.kind === "vault_locked" ? VAULT_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
     // PRD #1809 D4: the mid-run disk park (the cache cap's preventive park, or the hard pressure
     // stop's counted one). The transient park's steps, with the typed cause on the park report and
@@ -12635,6 +12865,7 @@ export class RunRunner {
             if (deferral !== undefined) {
               cause = { kind: deferral };
               credentialDeferred = true;
+              flight.keepGuardedInventoryOpen = true;
               feed = deferral === "vault_locked" ? VAULT_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
               confirmedRunning = false;
               settled = false;
@@ -13157,10 +13388,8 @@ export class RunRunner {
     // PRD #1349 M2 (D4): record this generation's checkpointed restore point in the durable
     // journal. This sink is the reap:false / no-overlay class (the run may CONTINUE), so it MUST
     // stay credential-free even though issue #1783's gate reaped above (a pause never runs a PAT
-    // git, and the settle belongs to the resume-terminal). Pin only
-    // (a local journal write over the credential-free join-token seam, the same safety class as
-    // the checkpoint publish above); a resume mints a new generation hold, and
-    // the paused generation's hold settles on its reaped resume-terminal or the reconciler.
+    // git). Legacy custody remains pinned for resume. Guarded inventory capture below uses only
+    // the trusted bare and join-token archive seam after the accepted park ACK.
     await this.pinRecoveryGeneration(
       claim,
       flight,
@@ -13173,6 +13402,7 @@ export class RunRunner {
         ...(await this.diskFullCauseOf(e, this.git.recoveryRoot)),
       }),
     );
+    if (claim.inventory_guarded === true) await this.settleGuardedInventory(claim, flight, undefined, undefined, undefined, true);
     return true;
   }
 
@@ -13720,6 +13950,7 @@ export class RunRunner {
     // steering channel trips only on a generation match). Logged for provenance; the release
     // report's claim_generation is stamped by the reportState closure from flight.claimGeneration.
     const generation = flight.steering.pendingCredentialSwitch();
+    flight.keepGuardedInventoryOpen = true;
     // 1. Reap BEFORE any credentialed capture git (idempotent — run()'s finally reaps again).
     flight.executor.killAgentTree?.();
     // 2. Retain EVERYTHING up front so an uncertain capture cannot strand the only copy of work.

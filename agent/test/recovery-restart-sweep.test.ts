@@ -558,41 +558,168 @@ describe("RecoveryCoordinator.resumePending — retry, second restart, live-flig
     });
   }
 
-  it("does not resurrect a record the live flight removed while the sweep bundles", async () => {
+  it("queues cleanup while the sweep bundles; upload finishes before cleanup without resurrection", async () => {
     const client = new FakeClient();
     const coord = coordinator(client);
-    await coord.pin({ runId: "r1", sourceSha: workSha, kind: "issue", branch: "agent/issue-1", generation: 7, ...FIN });
-    let produced = "";
+    const pinned = await coord.pin({ runId: "r1", sourceSha: workSha, kind: "issue", branch: "agent/issue-1", generation: 7, ...FIN });
+    assert.ok(pinned);
+    let entered!: () => void;
+    const paused = new Promise<void>((resolve) => { entered = resolve; });
+    let resume!: () => void;
+    const released = new Promise<void>((resolve) => { resume = resolve; });
+    const sequence: string[] = [];
+    const reserve = client.reserveRecoveryCapture.bind(client);
+    mock.method(client, "reserveRecoveryCapture", async (...args: Parameters<typeof reserve>) => {
+      sequence.push("reserve");
+      return reserve(...args);
+    });
+    const upload = client.uploadRecoveryBundle.bind(client);
+    mock.method(client, "uploadRecoveryBundle", async (...args: Parameters<typeof upload>) => {
+      const current = await only(coord, "r1");
+      assert.equal(current.captureId, pinned.captureId, "upload retains the final capture identity");
+      assert.equal(current.sourceSha, pinned.sourceSha, "upload retains the final source");
+      assert.equal(args[0], pinned.runId);
+      assert.equal(args[1], current.serverCaptureId);
+      assert.deepEqual(args[2], {
+        byte_size: current.byteSize, checksum: current.checksum, chunk_count: current.chunkCount,
+      });
+      const result = await upload(...args);
+      sequence.push("upload");
+      return result;
+    });
+    const produced: string[] = [];
     const producer = {
       fetchDefaultTip: cache.fetchDefaultTip.bind(cache),
       resolveRestartSource: cache.resolveRestartSource.bind(cache),
       async produceRecoveryBundle(b: string, o: Parameters<GitCache["produceRecoveryBundle"]>[1]) {
+        produced.push(o.outPath);
         const res = await cache.produceRecoveryBundle(b, o);
-        produced = res.bundlePath;
-        await coord.forgetGeneration("r1", 7); // the live G+1 flight's cleanup lands mid-sweep
+        entered();
+        await released;
+        assert.equal(fs.existsSync(res.bundlePath), true, "the producer really created bundle bytes");
         return res;
       },
     };
     const sweeper = new RecoveryCoordinator({
       client, git: producer, log: nullLogger(), recoveryRoot: cache.recoveryRoot, workerToken: TOKEN,
     });
-    await sweeper.resumePending();
-    assert.deepEqual(await coord.inspect("r1"), [], "not resurrected");
-    assert.ok(produced);
-    assert.equal(fs.existsSync(produced), false, "the bundle this sweep produced is removed");
-    assert.equal(client.reserveCalls.length, 0);
+    const sweep = sweeper.resumePending();
+    let cleanup: Promise<void> | undefined;
+    let cleaned = false;
+    try {
+      await paused;
+      const blocked = await only(coord, "r1");
+      assert.equal(blocked.captureId, pinned.captureId);
+      assert.equal(blocked.sourceSha, pinned.sourceSha);
+      cleanup = coord.forgetGeneration("r1", 7).then(() => {
+        cleaned = true;
+        sequence.push("cleanup");
+      });
+      // Drain runnable work without releasing the explicit producer/HTTP barrier.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(cleaned, false, "cleanup is queued behind the generation capture cycle");
+      assert.deepEqual(await only(coord, "r1"), blocked, "the final capture stays unchanged while cleanup waits");
+      assert.deepEqual(sequence, []);
+      assert.equal(fs.existsSync(produced[0]!), true, "queued cleanup leaves the new bundle intact");
+      // With generation serialization, reserve and upload finish BEFORE local cleanup.
+      // The legacy fake does not simulate a server hold closing during this cycle.
+      resume();
+      await sweep;
+      await cleanup;
+    } finally {
+      resume();
+      await Promise.allSettled([sweep, ...(cleanup ? [cleanup] : [])]);
+    }
+    assert.deepEqual(sequence, ["reserve", "upload", "cleanup"]);
+    assert.deepEqual(client.reserveCalls, [{ runId: "r1", req: {
+      run_id: "r1", idempotency_key: pinned.captureId, source_sha: pinned.sourceSha, generation: 7,
+    } }]);
+    assert.equal(client.uploadCalls.length, 1);
+    assert.equal(client.uploadCalls[0]!.runId, "r1");
+    assert.ok(client.uploadCalls[0]!.bytes > 0);
+    assert.equal(produced.length, 1);
+    assert.equal(fs.existsSync(produced[0]!), false, "the new temporary bundle is removed");
+    assert.equal(fs.existsSync(path.join(cache.recoveryRoot, "r1", `${pinned.captureId}.bundle`)), false, "no installed bundle remains");
+    assert.deepEqual(await coord.inspect("r1"), [], "cleanup leaves no resurrected journal");
+    const dir = path.join(cache.recoveryRoot, "r1");
+    assert.deepEqual(fs.existsSync(dir) ? fs.readdirSync(dir) : [], [], "no journal, temporary or orphan bundle files");
+    await assert.rejects(guardedWrite(coord, pinned, pinned), /was removed/, "a stale write cannot resurrect the capture");
   });
 
-  it("does not resurrect a record the live flight removed while the sweep reserves", async () => {
+  it("queues cleanup while the sweep reserves; upload finishes before cleanup without resurrection", async () => {
     const client = new FakeClient();
     const coord = coordinator(client);
-    await coord.pin({ runId: "r1", sourceSha: workSha, kind: "issue", branch: "agent/issue-1", generation: 7, ...FIN });
-    client.onReserve = async () => coord.forgetGeneration("r1", 7);
-    await coordinator(client).resumePending();
-    assert.deepEqual(await coord.inspect("r1"), []);
-    assert.equal(client.uploadCalls.length, 0);
+    const pinned = await coord.pin({ runId: "r1", sourceSha: workSha, kind: "issue", branch: "agent/issue-1", generation: 7, ...FIN });
+    assert.ok(pinned);
+    let entered!: () => void;
+    const paused = new Promise<void>((resolve) => { entered = resolve; });
+    let resume!: () => void;
+    const released = new Promise<void>((resolve) => { resume = resolve; });
+    const sequence: string[] = [];
+    const reserve = client.reserveRecoveryCapture.bind(client);
+    mock.method(client, "reserveRecoveryCapture", async (...args: Parameters<typeof reserve>) => {
+      sequence.push("reserve");
+      return reserve(...args);
+    });
+    const upload = client.uploadRecoveryBundle.bind(client);
+    mock.method(client, "uploadRecoveryBundle", async (...args: Parameters<typeof upload>) => {
+      const current = await only(coord, "r1");
+      assert.equal(current.captureId, pinned.captureId, "upload retains the final capture identity");
+      assert.equal(current.sourceSha, pinned.sourceSha, "upload retains the final source");
+      assert.equal(args[0], pinned.runId);
+      assert.equal(args[1], current.serverCaptureId);
+      assert.deepEqual(args[2], {
+        byte_size: current.byteSize, checksum: current.checksum, chunk_count: current.chunkCount,
+      });
+      const result = await upload(...args);
+      sequence.push("upload");
+      return result;
+    });
+    client.onReserve = async () => {
+      entered();
+      await released;
+    };
+    const sweeper = coordinator(client);
+    const sweep = sweeper.resumePending();
+    let cleanup: Promise<void> | undefined;
+    let cleaned = false;
+    try {
+      await paused;
+      const blocked = await only(coord, "r1");
+      assert.equal(blocked.captureId, pinned.captureId);
+      assert.equal(blocked.sourceSha, pinned.sourceSha);
+      cleanup = coord.forgetGeneration("r1", 7).then(() => {
+        cleaned = true;
+        sequence.push("cleanup");
+      });
+      // Drain runnable work without releasing the explicit producer/HTTP barrier.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(cleaned, false, "cleanup is queued behind the generation capture cycle");
+      assert.deepEqual(await only(coord, "r1"), blocked, "the final capture stays unchanged while cleanup waits");
+      assert.deepEqual(sequence, ["reserve"]);
+      assert.ok(blocked.bundlePath);
+      assert.equal(fs.existsSync(blocked.bundlePath), true, "queued cleanup leaves the journaled bundle intact");
+      // With generation serialization, reserve and upload finish BEFORE local cleanup.
+      // The legacy fake does not simulate a server hold closing during this cycle.
+      resume();
+      await sweep;
+      await cleanup;
+    } finally {
+      resume();
+      await Promise.allSettled([sweep, ...(cleanup ? [cleanup] : [])]);
+    }
+    assert.deepEqual(sequence, ["reserve", "upload", "cleanup"]);
+    assert.deepEqual(client.reserveCalls, [{ runId: "r1", req: {
+      run_id: "r1", idempotency_key: pinned.captureId, source_sha: pinned.sourceSha, generation: 7,
+    } }]);
+    assert.equal(client.uploadCalls.length, 1);
+    assert.equal(client.uploadCalls[0]!.runId, "r1");
+    assert.ok(client.uploadCalls[0]!.bytes > 0);
+    assert.equal(fs.existsSync(path.join(cache.recoveryRoot, "r1", `${pinned.captureId}.bundle`)), false, "no installed bundle remains");
+    assert.deepEqual(await coord.inspect("r1"), [], "cleanup leaves no resurrected journal");
     const dir = path.join(cache.recoveryRoot, "r1");
-    assert.deepEqual(fs.existsSync(dir) ? fs.readdirSync(dir).filter((n) => !n.endsWith(".tmp")) : [], []);
+    assert.deepEqual(fs.existsSync(dir) ? fs.readdirSync(dir) : [], [], "no journal, temporary or orphan bundle files");
+    await assert.rejects(guardedWrite(coord, pinned, pinned), /was removed/, "a stale write cannot resurrect the capture");
   });
 
   it("refuses an oversized self-contained bundle and leaves no bundle file behind", async () => {
@@ -620,32 +747,93 @@ describe("RecoveryCoordinator.resumePending — retry, second restart, live-flig
     assert.equal(client.reserveCalls.length, 0);
   });
 
-  it("removes the bundle file when the record is removed before the bundle is journaled", async () => {
+  it("queues cleanup before bundle bytes exist; upload finishes before cleanup without orphan files", async () => {
     const client = new FakeClient();
     const coord = coordinator(client);
-    await coord.pin({ runId: "r1", sourceSha: workSha, kind: "issue", branch: "agent/issue-1", generation: 7, ...FIN });
-    let produced = "";
+    const pinned = await coord.pin({ runId: "r1", sourceSha: workSha, kind: "issue", branch: "agent/issue-1", generation: 7, ...FIN });
+    assert.ok(pinned);
+    let entered!: () => void;
+    const paused = new Promise<void>((resolve) => { entered = resolve; });
+    let resume!: () => void;
+    const released = new Promise<void>((resolve) => { resume = resolve; });
+    const sequence: string[] = [];
+    const reserve = client.reserveRecoveryCapture.bind(client);
+    mock.method(client, "reserveRecoveryCapture", async (...args: Parameters<typeof reserve>) => {
+      sequence.push("reserve");
+      return reserve(...args);
+    });
+    const upload = client.uploadRecoveryBundle.bind(client);
+    mock.method(client, "uploadRecoveryBundle", async (...args: Parameters<typeof upload>) => {
+      const current = await only(coord, "r1");
+      assert.equal(current.captureId, pinned.captureId, "upload retains the final capture identity");
+      assert.equal(current.sourceSha, pinned.sourceSha, "upload retains the final source");
+      assert.equal(args[0], pinned.runId);
+      assert.equal(args[1], current.serverCaptureId);
+      assert.deepEqual(args[2], {
+        byte_size: current.byteSize, checksum: current.checksum, chunk_count: current.chunkCount,
+      });
+      const result = await upload(...args);
+      sequence.push("upload");
+      return result;
+    });
+    const produced: string[] = [];
     const producer = {
       fetchDefaultTip: cache.fetchDefaultTip.bind(cache),
       resolveRestartSource: cache.resolveRestartSource.bind(cache),
       async produceRecoveryBundle(b: string, o: Parameters<GitCache["produceRecoveryBundle"]>[1]) {
-        // The record disappears after the sweep's existence check, BEFORE the bundle bytes exist,
-        // so the live flight's own cleanup cannot have removed the file this sweep then writes.
-        await coord.forgetGeneration("r1", 7);
-        fs.mkdirSync(path.dirname(o.outPath), { recursive: true }); // forget removed the empty run dir
+        produced.push(o.outPath);
+        // Cleanup starts before bytes exist, but must wait for the entire capture cycle.
+        entered();
+        await released;
         const res = await cache.produceRecoveryBundle(b, o);
-        produced = res.bundlePath;
+        assert.equal(fs.existsSync(res.bundlePath), true, "the producer really created bundle bytes");
         return res;
       },
     };
     const sweeper = new RecoveryCoordinator({
       client, git: producer, log: nullLogger(), recoveryRoot: cache.recoveryRoot, workerToken: TOKEN,
     });
-    await sweeper.resumePending();
-    assert.ok(produced);
-    assert.equal(fs.existsSync(produced), false, "no orphan bundle file");
-    assert.deepEqual(await coord.inspect("r1"), []);
-    assert.equal(client.reserveCalls.length, 0);
+    const sweep = sweeper.resumePending();
+    let cleanup: Promise<void> | undefined;
+    let cleaned = false;
+    try {
+      await paused;
+      const blocked = await only(coord, "r1");
+      assert.equal(blocked.captureId, pinned.captureId);
+      assert.equal(blocked.sourceSha, pinned.sourceSha);
+      cleanup = coord.forgetGeneration("r1", 7).then(() => {
+        cleaned = true;
+        sequence.push("cleanup");
+      });
+      // Drain runnable work without releasing the explicit producer/HTTP barrier.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(cleaned, false, "cleanup is queued behind the generation capture cycle");
+      assert.deepEqual(await only(coord, "r1"), blocked, "the final capture stays unchanged while cleanup waits");
+      assert.deepEqual(sequence, []);
+      assert.equal(fs.existsSync(produced[0]!), false, "the producer is paused before writing bytes");
+      // With generation serialization, reserve and upload finish BEFORE local cleanup.
+      // The legacy fake does not simulate a server hold closing during this cycle.
+      resume();
+      await sweep;
+      await cleanup;
+    } finally {
+      resume();
+      await Promise.allSettled([sweep, ...(cleanup ? [cleanup] : [])]);
+    }
+    assert.deepEqual(sequence, ["reserve", "upload", "cleanup"]);
+    assert.deepEqual(client.reserveCalls, [{ runId: "r1", req: {
+      run_id: "r1", idempotency_key: pinned.captureId, source_sha: pinned.sourceSha, generation: 7,
+    } }]);
+    assert.equal(client.uploadCalls.length, 1);
+    assert.equal(client.uploadCalls[0]!.runId, "r1");
+    assert.ok(client.uploadCalls[0]!.bytes > 0);
+    assert.equal(produced.length, 1);
+    assert.equal(fs.existsSync(produced[0]!), false, "the new temporary bundle is removed");
+    assert.equal(fs.existsSync(path.join(cache.recoveryRoot, "r1", `${pinned.captureId}.bundle`)), false, "no installed bundle remains");
+    assert.deepEqual(await coord.inspect("r1"), [], "cleanup leaves no resurrected journal");
+    const dir = path.join(cache.recoveryRoot, "r1");
+    assert.deepEqual(fs.existsSync(dir) ? fs.readdirSync(dir) : [], [], "no journal, temporary or orphan bundle files");
+    await assert.rejects(guardedWrite(coord, pinned, pinned), /was removed/, "a stale write cannot resurrect the capture");
   });
 
   it("a journal write failure on one record does not abort the sweep of the next", async () => {

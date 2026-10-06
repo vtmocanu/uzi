@@ -3837,10 +3837,102 @@ export class GitCache {
     });
   }
 
-  private async readRecoveryCapture(barePath: string, branch: string): Promise<RecoveryJournalEntry | undefined> {
+  /** Read only worker-journaled/ledger-owned heads. Ref files are size-bounded;
+   * no retries, and any failed sibling read refuses the whole verification.
+   * Runner config is never consulted, and every traversed component rejects symlinks. */
+  async readInventoryCloneHeads(barePath: string, runId: string): Promise<
+    { kind: "verified"; heads: string[]; foreignOwners: string[] } | { kind: "unknown" }
+  > {
+    try {
+      if (typeof runId !== "string" || !OWED_RUN_ID.test(runId) ||
+          await this.resolveRecoveryBareDir(path.basename(barePath)) !== barePath) return { kind: "unknown" };
+      return await this.withLock(barePath, async () => {
+        const paths = new Map<string, { branch: string; runId: string }>();
+        const foreignOwners = new Set<string>();
+        const config = await this.runGit(barePath, ["config", "--local", "--null", "--list"]);
+        const entries = config.split("\0");
+        for (const item of entries) {
+          const nl = item.indexOf("\n");
+          const match = /^uzi-recovery\.(.+)\.clone$/.exec(item.slice(0, nl));
+          if (!match) continue;
+          const journal = await this.readRecoveryCapture(barePath, match[1]!, entries);
+          if (!journal) continue;
+          if (journal.runId !== runId) { foreignOwners.add(journal.runId); continue; }
+          paths.set(journal.clonePath, { branch: match[1]!, runId });
+        }
+        // Unlike advisory backup readers, FINAL cannot skip malformed ledger evidence.
+        for (const [, raw] of await this.readAllAttemptLedgerRaw(barePath)) {
+          if (!parseAttemptLedgerEntry(raw)) throw new Error("unreadable attempt attribution");
+        }
+        for (const entry of (await this.readAllAttemptLedgers(barePath)).values()) {
+          if (entry.runId !== runId) { foreignOwners.add(entry.runId); continue; }
+          paths.set(entry.clonePath, { branch: entry.branch, runId });
+        }
+        const heads = new Set<string>();
+        for (const [clone, owner] of paths) {
+          const parsed = parseAttemptPath(clone, path.resolve(this.runnerRoot));
+          const key = parsed?.key ?? path.basename(clone);
+          if (!parsed && !/^[A-Za-z0-9_-]+$/.test(key)) throw new Error("unknown canonical clone key");
+          if (!await this.classifyOwnerClonePath(barePath, owner.branch, key, runId, clone)) {
+            throw new Error("unknown retained clone path");
+          }
+          const root = path.resolve(this.runnerRoot);
+          if (!path.isAbsolute(clone) || path.resolve(clone) !== clone ||
+              path.dirname(path.dirname(clone)) !== root) throw new Error("unsafe clone path");
+          // ENOENT proves no physical clone remains, only after validating all parents.
+          for (const dir of [root, path.dirname(clone)]) {
+            const st = await fs.lstat(dir);
+            if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("unsafe clone parent");
+          }
+          let st: Stats;
+          try { st = await fs.lstat(clone); }
+          catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue; throw err; }
+          if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("unsafe clone");
+          const gitdir = path.join(clone, ".git");
+          const gs = await fs.lstat(gitdir);
+          if (!gs.isDirectory() || gs.isSymbolicLink()) throw new Error("unsafe clone git directory");
+          const readRef = async (relative: string): Promise<string> => {
+            const parts = relative.split("/");
+            for (let i = 1; i < parts.length; i++) {
+              const ds = await fs.lstat(path.join(gitdir, ...parts.slice(0, i)));
+              if (!ds.isDirectory() || ds.isSymbolicLink()) throw new Error("unsafe ref parent");
+            }
+            const file = await fs.open(path.join(gitdir, relative), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+            try {
+              const stat = await file.stat();
+              if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("unsafe ref file");
+              const bytes = Buffer.alloc(1024 * 1024 + 1);
+              const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+              if (bytesRead > 1024 * 1024) throw new Error("ref exceeds verification bound");
+              return bytes.subarray(0, bytesRead).toString("utf8").trim();
+            } finally { await file.close(); }
+          };
+          let head = await readRef("HEAD");
+          if (head.startsWith("ref: ")) {
+            const ref = head.slice(5);
+            if (ref.length > 256 || !/^refs\/heads\/[A-Za-z0-9_./-]+$/.test(ref) ||
+                ref.split("/").some(p => !p || p === "." || p === "..")) throw new Error("unsafe HEAD ref");
+            try { head = await readRef(ref); }
+            catch (err) {
+              if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+              const packed = await readRef("packed-refs");
+              head = packed.split("\n").find(line => line.slice(41) === ref)?.slice(0, 40) ?? "";
+            }
+          }
+          if (!SHA40_RE.test(head)) throw new Error("unreadable retained HEAD");
+          heads.add(head);
+        }
+        return { kind: "verified", heads: [...heads], foreignOwners: [...foreignOwners] };
+      });
+    } catch {
+      return { kind: "unknown" };
+    }
+  }
+
+  private async readRecoveryCapture(barePath: string, branch: string, snapshot?: string[]): Promise<RecoveryJournalEntry | undefined> {
     // Unlike tryGitStdout, --list succeeds when the key is absent and throws on
     // an unreadable/corrupt config. Never interpret a failed read as no journal.
-    const entries = (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
+    const entries = snapshot ?? (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
     const prefix = `${recoveryCaptureKey(branch)}\n`;
     const entry = entries.filter((item) => item.startsWith(prefix)).at(-1);
     const value = entry?.slice(prefix.length);

@@ -239,6 +239,9 @@ describe("RunRunner — owner-requested pause park (PRD #1190 M2)", () => {
       assert.equal(args[1], h);
       assert.equal(api.states.some((state) => state.body.status === "paused"), false);
       assert.equal((await git.committedTrackingOwnership(bare, branch, claim.run_id, h, 2)).kind, "owned");
+      const owed = await git.enumerateOwedCandidates(bare, claim.run_id);
+      assert.ok(owed.find(candidate => candidate.sha === h)?.contexts.some(context => context.generation === 1),
+        "producing generation stays recoverable before remote confirmation");
       return publish(...args);
     };
     try {
@@ -251,7 +254,7 @@ describe("RunRunner — owner-requested pause park (PRD #1190 M2)", () => {
       assert.notEqual(parked.body.checkpoint_contains_latest, false);
       assert.equal((await git.committedTrackingOwnership(bare, branch, claim.run_id, h, 2)).kind, "owned");
       const old = (await git.enumerateOwedCandidates(bare, claim.run_id)).find((candidate) => candidate.sha === h);
-      assert.ok(old?.contexts.some((context) => context.generation === 1), "old producing pin remains");
+      assert.equal(old, undefined, "only the confirmed checkpoint containing H clears the old producing pin");
     } finally {
       restore();
       fs.rmSync(homeRoot, { recursive: true, force: true });
