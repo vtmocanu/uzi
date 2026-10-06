@@ -53,7 +53,7 @@ function checkedExec(before?: (ctx: RunContext) => Promise<void>) {
 async function start(exec: Executor, c = claim()) {
   const forge = fakeGitlab();
   await runner(exec, forge.gitlab, undefined, { planCrossCheckTiming: timing,
-    planApprovalTimeoutMs: 2000 }).execute(c);
+    planApprovalTimeoutMs: 4000 }).execute(c);
   return forge;
 }
 function terminal(runId: string, condition: string) {
@@ -164,9 +164,9 @@ describe("U2 real runner checked gate", () => {
   }
 
   for (const [reason, override, verdict, checkerReason] of [
-    ["interrupted", { candidate_generation: 2 }, "approve", "approve"],
+    ["checker_failed", { candidate_generation: 2 }, "approve", "approve"],
     ["checker_failed", { claim_generation: 2 }, "approve", "approve"],
-    ["interrupted", { candidate_digest: "b".repeat(64), candidate_generation: 3 }, "approve", "approve"],
+    ["checker_failed", { candidate_digest: "b".repeat(64), candidate_generation: 3 }, "approve", "approve"],
     // cross_check.go returns the historical candidate generation with current claim proof.
     ["interrupted", { candidate_generation: 1, claim_generation: 2 }, "failed", "interrupted"],
     ["checker_failed", { candidate_digest: "b".repeat(64) }, "pending", ""],
@@ -307,19 +307,33 @@ describe("U2 real runner checked gate", () => {
   }
 
   for (const final of ["approve_plan", "reject_plan"] as const) {
-    it(`lost initial ACK + queued revise retains presentation and resolves revised ${final}`, async () => {
+    it(`dropped initial ACK + queued revise before identical retry ACK resolves revised ${final}`, async () => {
       const c = claim();
       const revisedPlan = "# PLAN human revision";
       api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "revise", "revise") });
-      const held = holdGateAck(c.run_id, PLAN);
+      let release!: () => void;
+      const retryAck = new Promise<void>((resolve) => { release = resolve; });
+      const initial = (b: { status: string; plan_md?: string }) => b.status === "awaiting_approval" && b.plan_md === PLAN;
+      api.afterPersistState(c.run_id, initial, "drop");
+      let attempts = 0;
       let reviseId = 0;
+      let finalId = 0;
+      let context!: RunContext;
       const seen: PlanVerdict[] = [];
       api.onState(c.run_id, (b) => {
-        if (b.status === "awaiting_approval" && b.plan_md === PLAN && !reviseId)
-          reviseId = send(c.run_id, row("revise_plan", "human changes"))[0]!.id;
-        if (b.status === "awaiting_approval" && b.plan_md === revisedPlan) send(c.run_id, row(final, "final"));
+        if (initial(b)) {
+          attempts++;
+          if (attempts === 1) context.emit({ kind: "status", payload: { text: "initial ACK reserved feed" } });
+          if (attempts === 2) {
+            api.afterPersistState(c.run_id, initial, retryAck);
+            reviseId = send(c.run_id, row("revise_plan", "human changes"))[0]!.id;
+          }
+        }
+        if (b.status === "awaiting_approval" && b.plan_md === revisedPlan)
+          finalId = send(c.run_id, row(final, "final"))[0]!.id;
       });
       const exec: Executor = { run: async (ctx) => {
+        context = ctx;
         const first = await ctx.gatePlan!(PLAN);
         seen.push(first);
         assert.equal(first.kind, "revise");
@@ -330,18 +344,225 @@ describe("U2 real runner checked gate", () => {
         return { branch: ctx.branch };
       } };
       const done = start(exec, c);
-      assert.ok(await until(() => reviseId > 0));
-      await routed(c.run_id, reviseId);
-      assert.equal(seen.length, 0, "unconfirmed presentation cannot consume queued revise");
-      held.release();
-      await done;
-      assert.equal(api.crossCheckRequests.length, 1, "no second check");
-      assert.deepEqual(gates(c.run_id).map((g) => g.plan_md), [PLAN, revisedPlan]);
-      assert.deepEqual(seen.map((v) => v.kind), ["revise", final === "approve_plan" ? "approve" : "reject"]);
-      assert.ok(api.isApplied(c.run_id, reviseId), "revise input settled on revised applied ACK");
-      assert.ok(!statuses(c.run_id).includes("recovery_wait"));
+      try {
+        assert.ok(await until(() => reviseId > 0));
+        await routed(c.run_id, reviseId);
+        assert.equal(attempts, 2, "persisted first ACK was dropped and retried");
+        assert.equal(seen.length, 0, "unconfirmed presentation cannot consume queued revise");
+        assert.ok(!api.messages(c.run_id).some((m) => (m.payload as { text?: string }).text === "initial ACK reserved feed"));
+        const presentations = gates(c.run_id);
+        assert.deepEqual(presentations[0], presentations[1], "retry preserves complete body and presentation id");
+        release();
+        await done;
+        assert.equal(api.crossCheckRequests.length, 1, "no second check or candidate overwrite");
+        assert.deepEqual(gates(c.run_id).map((g) => g.plan_md), [PLAN, PLAN, revisedPlan]);
+        assert.notEqual(gates(c.run_id)[2]!.presentation_id, presentations[0]!.presentation_id);
+        assert.deepEqual(seen.map((v) => v.kind), ["revise", final === "approve_plan" ? "approve" : "reject"]);
+        assert.ok(api.isApplied(c.run_id, reviseId), "revise input settled on revised applied ACK");
+        assert.ok(api.isApplied(c.run_id, finalId), "current final verdict receipt settled");
+        assert.equal(api.messages(c.run_id).filter((m) => (m.payload as { text?: string }).text === "initial ACK reserved feed").length, 1,
+          "delivery restored exactly once after confirmed retry");
+        assert.ok(!statuses(c.run_id).includes("recovery_wait"));
+        assert.equal(api.crossCheckReplies.filter((r) => r.acceptedCandidate).length, 1);
+      } finally {
+        release();
+        await done;
+      }
     });
   }
+
+  it("late round-one POSTs are refused after no_row fallback commit while its ACK is held", async () => {
+    const c = claim();
+    let context!: RunContext;
+    let releasePosts!: () => void;
+    const posts = new Promise<void>((resolve) => { releasePosts = resolve; });
+    api.crossCheckHandler = async ({ runId, method, body }) => {
+      if (method === "GET") return { status: 200, body: { result: "no_row", reason_class: "no_candidate", ...proof(runId) } };
+      context.emit({ kind: "status", payload: { text: "held candidate feed" } });
+      await posts;
+      return { status: 200, body: answer(runId, body) };
+    };
+    const held = holdGateAck(c.run_id, PLAN);
+    let rejectId = 0;
+    api.onState(c.run_id, (b) => {
+      if (b.status === "awaiting_approval") rejectId = send(c.run_id, row("reject_plan", "late decline"))[0]!.id;
+    });
+    const { exec, verdicts } = checkedExec(async (ctx) => { context = ctx; });
+    const done = start(exec, c);
+    try {
+      assert.ok(await until(() => rejectId > 0));
+      await routed(c.run_id, rejectId);
+      const submitted = api.crossCheckRequests.filter((r) => r.method === "POST");
+      assert.equal(submitted.length, 3, "bounded identical candidate attempts");
+      for (const attempt of submitted) assert.deepEqual(attempt.body, submitted[0]!.body);
+      assert.equal(api.crossCheckRequests.filter((r) => r.method === "GET").length, 3);
+      assert.equal((gates(c.run_id)[0] as PlanCrossCheckStateRequest).plan_cross_check_gate_reason, "checker_failed");
+      assert.equal((gates(c.run_id)[0] as PlanCrossCheckStateRequest).plan_cross_check_refusal, "submit_failed");
+      assert.equal(verdicts.length, 0);
+      assert.ok(!api.messages(c.run_id).some((m) => (m.payload as { text?: string }).text === "held candidate feed"),
+        "settled no_row proofs and persisted-but-unconfirmed gate cannot release feed");
+      releasePosts();
+      assert.ok(await until(() => api.crossCheckReplies.filter((r) => r.method === "POST").length === 3));
+      assert.deepEqual(api.crossCheckReplies.filter((r) => r.method === "POST").map((r) => r.status), [409, 409, 409]);
+      assert.equal(api.crossCheckReplies.filter((r) => r.acceptedCandidate).length, 0);
+      assert.equal(verdicts.length, 0, "late replies grant no authority");
+      held.release();
+      await done;
+      assert.deepEqual(verdicts.map((v) => v.kind), ["reject"]);
+      assert.equal(api.messages(c.run_id).filter((m) => (m.payload as { text?: string }).text === "held candidate feed").length, 3);
+      const seqs = api.messages(c.run_id).map((m) => m.seq);
+      assert.deepEqual(seqs, Array.from({ length: seqs.length }, (_, i) => i + 1));
+    } finally {
+      releasePosts();
+      held.release();
+      await done;
+      assert.ok(await until(() => api.crossCheckReplies.filter((r) => r.method === "POST").length ===
+        api.crossCheckRequests.filter((r) => r.method === "POST").length), "all started handlers settled");
+    }
+  });
+
+  it("dropped submit ACK resolves the current candidate by GET and stores one canonical bundle", async () => {
+    const c = claim();
+    let stored!: ReturnType<typeof answer>;
+    api.crossCheckHandler = ({ runId, method, body }) => {
+      if (method === "GET") return { status: 200, body: stored };
+      stored = answer(runId, body, "approve", "approve", {
+        candidate: { ...body, plan_md: NORMALIZED, milestones: [], required_tools: [], required_capabilities: [] },
+      });
+      return { status: 200, body: stored, drop: true };
+    };
+    const { exec, verdicts } = checkedExec();
+    await start(exec, c);
+    assert.deepEqual(api.crossCheckRequests.map((r) => r.method), ["POST", "GET"]);
+    assert.equal(api.crossCheckReplies.filter((r) => r.acceptedCandidate && r.dropped).length, 1);
+    assert.equal(api.states.filter((s) => s.runId === c.run_id && s.body.plan_md === NORMALIZED).length, 1);
+    const canonical = api.states.find((s) => s.runId === c.run_id && s.body.plan_md === NORMALIZED)!.body;
+    assert.deepEqual([canonical.milestones, canonical.required_tools, canonical.required_capabilities], [[], [], []]);
+    assert.equal(canonical.candidate_digest, digest);
+    assert.ok(verdicts[0]?.kind === "approve" && verdicts[0].approval === "cross_check");
+    assert.equal(gates(c.run_id).length, 0);
+  });
+
+  for (const decision of ["approve", "revise"] as const) {
+    it(`concurrent feed producers and session sender preserve sequences through ${decision} proof`, async () => {
+      const c = claim();
+      let context!: RunContext;
+      let releasePost!: () => void;
+      const post = new Promise<void>((resolve) => { releasePost = resolve; });
+      let entered = false;
+      api.crossCheckHandler = async ({ runId, body }) => {
+        assert.equal(api.usageRequests.length, 1, "usage ACK before candidate POST");
+        assert.ok(api.messages(runId).some((m) => (m.payload as { text?: string }).text === "before reservation"),
+          "message ACK before candidate POST");
+        entered = true;
+        await post;
+        return { status: 200, body: answer(runId, body, decision, decision) };
+      };
+      const held = decision === "revise" ? holdGateAck(c.run_id, PLAN) : undefined;
+      let rejectId = 0;
+      api.onState(c.run_id, (b) => {
+        if (b.status === "awaiting_approval") rejectId = send(c.run_id, row("reject_plan", "decline"))[0]!.id;
+      });
+      const { exec, verdicts } = checkedExec(async (ctx) => {
+        context = ctx;
+        ctx.emit({ kind: "status", payload: { text: "before reservation" } });
+        const leg = ctx.usage!.startLeg();
+        leg.observeAssistant({ message: { id: "concurrent-usage", model: "claude", usage: { input_tokens: 3 } } });
+        leg.close();
+      });
+      // This race intentionally keeps the POST within its owned request deadline.
+      const forge = fakeGitlab();
+      const done = runner(exec, forge.gitlab, undefined, {
+        planCrossCheckTiming: { ...timing, requestMs: 1000 }, planApprovalTimeoutMs: 4000,
+      }).execute(c);
+      try {
+        assert.ok(await until(() => entered));
+        await Promise.all(Array.from({ length: 4 }, async (_, i) => {
+          context.emit({ kind: "status", payload: { text: `producer ${i}` } });
+        }));
+        context.onSessionId!("concurrent-session");
+        const feed = api.messages(c.run_id);
+        feed.push({ seq: feed.at(-1)!.seq + 1, kind: "status", payload: { text: "server checker event" } });
+        assert.ok(!feed.some((m) => String((m.payload as { text?: string }).text).startsWith("producer ")));
+        releasePost();
+        if (held) {
+          assert.ok(await until(() => rejectId > 0));
+          await routed(c.run_id, rejectId);
+          assert.equal(verdicts.length, 0);
+          assert.ok(!api.messages(c.run_id).some((m) => String((m.payload as { text?: string }).text).startsWith("producer ")));
+          held.release();
+        }
+        await done;
+        assert.deepEqual(verdicts.map((v) => v.kind), [decision === "approve" ? "approve" : "reject"]);
+        assert.ok(api.states.some((s) => s.runId === c.run_id && s.body.session_id === "concurrent-session"),
+          "independent state sender settles after the transport reservation releases");
+        const messages = api.messages(c.run_id);
+        for (let i = 0; i < 4; i++)
+          assert.equal(messages.filter((m) => (m.payload as { text?: string }).text === `producer ${i}`).length, 1);
+        assert.equal(messages.filter((m) => (m.payload as { text?: string }).text === "server checker event").length, 1);
+        assert.deepEqual(messages.map((m) => m.seq), Array.from({ length: messages.length }, (_, i) => i + 1));
+        assert.equal(api.crossCheckRequests.length, 1);
+      } finally {
+        releasePost();
+        held?.release();
+        await done;
+      }
+    });
+  }
+
+  it("dropped revised ACK preserves revision identity after the previous revision was confirmed", async () => {
+    const c = claim();
+    const plans = [PLAN, "# PLAN revision one", "# PLAN revision two"];
+    let release!: () => void;
+    const retry = new Promise<void>((resolve) => { release = resolve; });
+    const matches = (b: { status: string; plan_md?: string }) => b.status === "awaiting_approval" && b.plan_md === plans[1];
+    api.afterPersistState(c.run_id, matches, "drop");
+    api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "revise", "revise") });
+    let attempts = 0;
+    const reviseIds: number[] = [];
+    let approvalId = 0;
+    api.onState(c.run_id, (b) => {
+      if (b.status !== "awaiting_approval") return;
+      if (b.plan_md === PLAN) reviseIds.push(send(c.run_id, row("revise_plan", "first change"))[0]!.id);
+      if (matches(b) && ++attempts === 2) {
+        api.afterPersistState(c.run_id, matches, retry);
+        reviseIds.push(send(c.run_id, row("revise_plan", "second change"))[0]!.id);
+      }
+      if (b.plan_md === plans[2]) approvalId = send(c.run_id, row("approve_plan"))[0]!.id;
+    });
+    const seen: PlanVerdict[] = [];
+    const exec: Executor = { run: async (ctx) => {
+      let settles: number | undefined;
+      for (const plan of plans) {
+        const v = await ctx.gatePlan!(plan, [], undefined, settles);
+        seen.push(v);
+        if (v.kind === "approve") return { branch: ctx.branch };
+        assert.equal(v.kind, "revise");
+        if (v.kind !== "revise") throw new Error("expected revise");
+        settles = v.inputId;
+      }
+      throw new Error("missing approval");
+    } };
+    const done = start(exec, c);
+    try {
+      assert.ok(await until(() => reviseIds.length === 2));
+      await routed(c.run_id, reviseIds[1]!);
+      assert.deepEqual(seen.map((v) => v.kind), ["revise"], "previous presentation confirmed; retry still unconfirmed");
+      assert.deepEqual(gates(c.run_id)[1], gates(c.run_id)[2], "same revision body/id across drop");
+      release();
+      await done;
+      assert.deepEqual(seen.map((v) => v.kind), ["revise", "revise", "approve"]);
+      assert.deepEqual(gates(c.run_id).map((g) => g.plan_md), [plans[0], plans[1], plans[1], plans[2]]);
+      assert.equal(new Set(gates(c.run_id).map((g) => g.presentation_id)).size, 3);
+      for (const id of [...reviseIds, approvalId]) assert.ok(api.isApplied(c.run_id, id), `receipt ${id} settled`);
+      assert.equal(api.crossCheckRequests.length, 1);
+      assert.equal(api.crossCheckReplies.filter((r) => r.acceptedCandidate).length, 1);
+      assert.ok(!statuses(c.run_id).includes("recovery_wait"));
+    } finally {
+      release();
+      await done;
+    }
+  });
 
   it("scan refusal precedes any candidate upload", async () => {
     const c = claim();

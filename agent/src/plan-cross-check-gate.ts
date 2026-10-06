@@ -55,7 +55,7 @@ export async function checkPlan(options: {
     if (response.result !== "candidate")
       return { invalid: "checker_failed" };
     if (response.candidate_generation !== generation)
-      return { invalid: "interrupted" };
+      return { invalid: response.candidate_generation < generation ? "interrupted" : "checker_failed" };
     const deadline = Date.parse(response.deadline_at);
     if (response.round !== 1 ||
         !Number.isSafeInteger(response.candidate_generation) || generation <= 0 ||

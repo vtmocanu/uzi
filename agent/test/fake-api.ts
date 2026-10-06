@@ -233,8 +233,9 @@ export class FakeApi {
 
   /** Focused lead-side cross-check transport seam; absent keeps existing fake routes unchanged. */
   crossCheckHandler?: (request: { runId: string; method: string; body: Record<string, unknown> }) =>
-    Promise<{ status: number; body: unknown }> | { status: number; body: unknown };
+    Promise<{ status: number; body: unknown; drop?: boolean }> | { status: number; body: unknown; drop?: boolean };
   readonly crossCheckRequests: { runId: string; method: string; body: Record<string, unknown> }[] = [];
+  readonly crossCheckReplies: { runId: string; method: string; status: number; acceptedCandidate: boolean; dropped: boolean }[] = [];
   usageHandler?: () => { status: number; body: unknown };
   readonly usageRequests: Record<string, unknown>[] = [];
   checkedTransport = false;
@@ -1181,13 +1182,20 @@ export class FakeApi {
     if (crossCheckMatch && this.crossCheckHandler) {
       const request = { runId: crossCheckMatch[1]!, method: req.method ?? "", body: json };
       this.crossCheckRequests.push(request);
+      const reply = (status: number, body: unknown, drop = false): void => {
+        this.crossCheckReplies.push({ ...request, status, dropped: drop,
+          acceptedCandidate: request.method === "POST" && status === 200 &&
+            (body as { result?: string } | null)?.result === "candidate" });
+        if (drop) res.destroy();
+        else send(res, status, body);
+      };
       if (request.method === "POST" && this.checkedFencedRuns.has(request.runId))
-        return send(res, 409, { reason: "cross_check_refused" });
+        return reply(409, { reason: "cross_check_refused" });
       const answer = await this.crossCheckHandler(request);
       // A request held across the applied forced gate is fenced under that same row lock.
       if (request.method === "POST" && this.checkedFencedRuns.has(request.runId))
-        return send(res, 409, { reason: "cross_check_refused" });
-      return send(res, answer.status, answer.body);
+        return reply(409, { reason: "cross_check_refused" });
+      return reply(answer.status, answer.body, answer.drop);
     }
 
     const runMatch =
