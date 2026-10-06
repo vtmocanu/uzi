@@ -101,6 +101,41 @@ backlog at once; raise it, or in the web modal blank the field for unlimited
 an unlimited sweep is web-only). An existing sweep created before this cap
 existed stays unbounded until you set one.
 
+### Remove the selector label on dispatch
+
+A recurring **single-label sweep** can opt in to
+`remove_label_on_dispatch` (off by default, including on existing schedules).
+Once an issue's run is **created**, uzi removes the selector label on the
+forge, then applies an **atomic label delta** to the current cached issue
+row. That cache write preserves unrelated labels and non-label fields,
+including assignments, rather than replacing them from an older snapshot.
+A skipped candidate keeps its label; removal doesn't wait for the run to
+finish. The eligibility gate, active-run dedup, assignment handling and
+cache-backed candidate scan windows are unchanged.
+
+Removal requires exactly one non-blank selector label after trimming.
+Pinned issues, prompt targets, one-time schedules, assigned-selector sweeps,
+empty selectors and multi-label selectors cannot enable it. The configured
+`uzi` eligibility label is protected: create/edit refuses it as a removal
+selector, and the scheduler rechecks the **live** setting after creating
+each run. If an admin has made the selector the eligibility label since the
+schedule was saved, that fire leaves the label in place without recording
+a removal failure.
+
+**Best effort, not strict once-only dispatch.** A removal error keeps the
+started run and records `label_remove_failed`; a successful forge and cache
+write records `label_removed` (see [Fire outcomes](#fire-outcomes)). Stopping
+between run creation, the forge write and the cache write, or a failed
+write, can leave the selector on the forge or in the cache. A later
+authoritative forge sync can restore a label in the cache, and re-adding the
+same label can make the issue a candidate again. There is no strict
+once-only ledger or automatic label-removal retry; active-run dedup still
+protects an issue while its run is live. While the selector remains absent,
+a failed issue run stays out of that sweep; there is no automatic failed-issue
+retry. The owner **re-adds the selector label to retry it**. If removal
+failed and the label remains, remove it by hand to prevent a later fire
+from picking the issue again.
+
 ## Guidance
 
 A pinned-issue or label-sweep schedule can carry optional **guidance**: free
@@ -175,8 +210,26 @@ idea-file and MR delivery.
   offers cadence presets (weekdays, every day, every N hours) plus an
   advanced raw-cron field, and a live "next fires" preview. Pause, resume,
   and run-now are per-schedule row actions on the list.
-- **CLI**: `uzi schedule create | list | get | pause | resume | run-now |
+- **CLI**: `uzi schedule create | edit | list | get | pause | resume | run-now |
   delete` — see [the CLI reference](./cli.md#commands) for the full flag list.
+
+### Configuring dispatch label removal
+
+Use `uzi schedule create --sweep --label Planned --remove-label-on-dispatch`
+with the usual repo and recurring timing flags, or
+`uzi schedule edit <id> --remove-label-on-dispatch` to enable it on an
+existing single-label sweep. Pass `--remove-label-on-dispatch=false` to turn
+it off. Unrelated edits preserve the setting. `uzi schedule get` prints
+`REMOVE_LABEL_ON_DISPATCH`, and both `get` and `run-now` describe removal on
+each started run (see [Fire outcomes](#fire-outcomes)).
+
+The API exposes `remove_label_on_dispatch` as a boolean on the schedule DTO
+and create/PATCH requests. Omission on create means false; omission on PATCH
+preserves the stored value, and explicit false disables it. Enabling an
+unsupported configuration returns HTTP 400. This is also an owner-editable
+field on a default-origin schedule whose effective catalog selector meets
+the same single-label constraints. Clone and Add repo copy it; Reset turns
+it off. The catalog-owned selector itself stays read-only.
 
 ### Which harness a schedule runs on
 
@@ -357,6 +410,30 @@ exceed `max_issues` once backfill walks past a skip), which ones
   fire, and fires once you enable the credential or change the schedule's
   token. The web shows it as "pinned credential is disabled"; `uzi schedule
   get` prints the same label with a hint pointing at Settings.
+- `config_not_supported` — a removal-enabled schedule's effective target,
+  timing or selector no longer supports removal (for example, a catalog
+  selector changed to multiple labels). The fire starts nothing; an invalid
+  selector is rejected before listing candidates.
+
+Started entries can also carry **label-removal outcomes**; these are not
+skip reasons, since the run already exists:
+
+- `label_removed: true` — the selector was removed on the forge and from the
+  cached issue.
+- `label_remove_failed: true` — removal failed, but the run still started
+  and counts toward the cap. The sweep continues to later candidates within
+  its existing scan window.
+
+These fields appear on `last_fire.started[]` and the run-now response's
+`started[]`, with false values omitted. An optional `selector_label` stores
+the **fire-time selector snapshot**, so later schedule edits do not rename
+historical removal outcomes. `uzi schedule get` and `run-now` use that
+snapshot for messages such as "Planned removed" or "Planned could not be
+removed (the run started; remove it by hand)". Legacy entries without a
+snapshot use the generic word "label", rather than the schedule's current
+selector. Absence of both removal flags makes no claim that removal
+succeeded; for example, the live eligibility-label protection leaves both
+unset.
 
 `examined == started + skipped` always holds — every candidate the fire
 reaches lands in exactly one bucket, so the tally never silently drops one.

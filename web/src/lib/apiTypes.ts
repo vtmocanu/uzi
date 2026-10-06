@@ -1868,6 +1868,9 @@ export type ScheduleSkipReason =
 
 // One run a persisted fire actually created; issue_iid is null for a prompt schedule.
 export interface LastFireStarted {
+  label_removed?: boolean;
+  label_remove_failed?: boolean;
+  selector_label?: string;
   issue_iid: number | null;
   run_id: string;
   title: string;
@@ -1926,6 +1929,7 @@ export type RunNowResponse = {
 };
 
 export interface Schedule {
+  remove_label_on_dispatch: boolean;
  capacity_limit: number | null;
  capacity_room_needed: number | null;
   id: string;
@@ -2096,6 +2100,7 @@ export interface ScheduleCatalog {
 // wait_on_limit=true, enabled=true). On PATCH a field present is applied and an
 // absent one is left unchanged, so a per-row enable toggle sends just { enabled }.
 export interface ScheduleInput {
+  remove_label_on_dispatch?: boolean;
  capacity_limit?: number | null;
  capacity_room_needed?: number | null;
   target?: ScheduleTarget;

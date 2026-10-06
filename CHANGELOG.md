@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **Recurring single-label sweeps can consume their selector label after dispatch ([#2344](https://github.com/vtmocanu/uzi/issues/2344)).**
+  Single-label recurring sweeps can remove their selector after a run starts, with API, CLI and web controls. Fire history reports removal success or failure using the original label; failures keep the started run, and owners re-add a successfully removed label to retry failed work.
+
 - **Capacity gates for scheduled sweeps**
   Recurring label sweeps can wait for room in the owner’s unfinished work and send batches within the available room, with API and CLI controls and recorded capacity outcomes.
 

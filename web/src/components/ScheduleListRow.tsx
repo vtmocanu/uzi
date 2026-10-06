@@ -457,6 +457,7 @@ function CapacityOptions({ s }: { s: Schedule }) {
       gated ? "border-brand/40 text-brand" : "border-edge text-muted")}>
       {gated ? `limit ${s.capacity_limit} · room ${s.capacity_room_needed}` : "no limit"}
     </span>
+    {s.remove_label_on_dispatch && <OptionChip>removes label</OptionChip>}
     <OptionChip>{s.max_issues == null ? (gated ? "available room at a time" : "unlimited at a time") : `${s.max_issues} at a time`}</OptionChip>
   </>;
 }

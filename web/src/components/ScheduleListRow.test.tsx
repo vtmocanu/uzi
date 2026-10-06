@@ -35,3 +35,12 @@ describe("schedule capacity options", () => {
     expect(screen.getByText(/space for 1 more run; needs 2/)).toBeTruthy();
   });
 });
+
+ it.each(["user", "default"] as const)("shows removes label only for enabled removal on %s rows", async (origin) => {
+   const template = (await mockApi.listSchedules()).find((s) => s.target === "sweep")!;
+   const view = row({ ...template, origin, remove_label_on_dispatch: true });
+   expect(screen.getByText("removes label")).toBeTruthy();
+   view.unmount();
+   row({ ...template, origin, remove_label_on_dispatch: false });
+   expect(screen.queryByText("removes label")).toBeNull();
+ });
