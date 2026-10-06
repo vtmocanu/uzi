@@ -189,8 +189,14 @@ interface Rig {
   executed: string[];
 }
 
+const rigRoots: string[] = [];
+afterEach(() => {
+  for (const r of rigRoots.splice(0)) fs.rmSync(r, { recursive: true, force: true });
+});
+
 function makeRig(opts: { runClaim?: () => Promise<ClaimResponse | null> } = {}): Rig {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-2213-worker-"));
+  rigRoots.push(root);
   const beats: Rig["beats"] = [];
   const claims = { run: 0, chat: 0 };
   const executed: string[] = [];

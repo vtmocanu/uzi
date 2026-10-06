@@ -136,6 +136,7 @@ import {
   RunResidueBlockedError,
   assertResidueQuarantineOpen,
   latchOnUnattributedUnreadable,
+  residueQuarantine,
 } from "./residue-quarantine.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
@@ -3936,6 +3937,11 @@ export class RunRunner {
     // its recovery journal exactly like a finalize-gate residue block: the terminal retire must not
     // discard a tree the ordinary recovery settle cannot capture while a survivor may read credentials.
     if (err instanceof ResidueQuarantinedError) flight.preserveRecoveryClone = true;
+    // issue #2213: on a quarantined worker NO failing run reaps or settles custody (the settle starts
+    // runner-clone git, uploads and releases): a failure with some other cause keeps its clone and
+    // custody exactly like a quarantine failure, until the worker restarts.
+    const quarantined = residueQuarantine() !== undefined;
+    if (quarantined) flight.preserveRecoveryClone = true;
     const rawReason =
       err instanceof ProviderPolicyRefusal
         ? policyRefusalMessage(err.policyRefusal.policy_tag)
@@ -3995,7 +4001,7 @@ export class RunRunner {
         claim_generation: flight.claimGeneration,
       });
       await batcher.close().catch(() => undefined);
-      if (opts.keepCustody) return;
+      if (opts.keepCustody || quarantined) return;
       // #1539: when the permanent-failure hook handled this terminal it ALREADY reaped the
       // provider after the install/deferral decision and before any send (while still actively-claimed), so there is no
       // second reap here — settle custody ONCE, gated by the stale-epoch guard. Any OTHER writer that
@@ -4031,7 +4037,7 @@ export class RunRunner {
     // process survived the reap, so no PAT-bearing git may start while it lives. issue #1766: a
     // custody-keeping park (opts.keepCustody) keeps the provider hold for the recovery settle.
     const reaped =
-      opts.keepCustody || err instanceof RunResidueBlockedError
+      opts.keepCustody || quarantined || err instanceof RunResidueBlockedError
         ? false
         : flight.permanentFailureReap !== undefined
           ? this.permanentFailureReapValid(flight)
@@ -7878,7 +7884,7 @@ export class RunRunner {
    * dumpable-protected can read from /proc, so it asks whether any runner-uid process exists whose
    * env and cwd cannot be read and that nothing ties to another live attempt. It only detects:
    * nothing is in scope and nothing is signalled (ScanRequest.workerWide). A non-quiescent verdict
-   * throws RunResidueBlockedError({preClone: true}) so no fetch starts, and an
+   * throws RunResidueBlockedError({preClone: "worker_wide"}) so no fetch starts, and an
    * `unreadable_unattributed` entry also latches the worker. Skipped under the uid split (the
    * runner-uid boundary and the solitary kill already contain it) and off Linux, never faked.
    */
@@ -7916,7 +7922,7 @@ export class RunRunner {
       detail: sanitizeForLog(verdict.detail),
       processes: describeProcesses(verdict),
     });
-    throw new RunResidueBlockedError(verdict.detail, { preClone: true });
+    throw new RunResidueBlockedError(verdict.detail, { preClone: "worker_wide" });
   }
 
   private async phaseClone(claim: ClaimResponse, flight: RunFlight): Promise<void> {
@@ -8011,7 +8017,7 @@ export class RunRunner {
           run_id: runId,
           detail: sanitizeForLog(cause.detail),
         });
-        throw new RunResidueBlockedError(cause.detail, { preClone: true });
+        throw new RunResidueBlockedError(cause.detail, { preClone: "home_reap" });
       }
     }
     // issue #2213: the HOME reap above cannot see a survivor nothing ties to this run, and it skips
@@ -12624,6 +12630,16 @@ export class RunRunner {
               feed = deferral === "vault_locked" ? VAULT_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
               confirmedRunning = false;
               settled = false;
+            }
+            if (captureError instanceof ResidueQuarantinedError) {
+              // issue #2213: the worker latched mid-capture. Retrying would loop forever (every
+              // credentialed step is refused until a restart) and the clone is the only copy:
+              // keep it and fail the run worker_residue_blocked. Reported here, not thrown, for the
+              // reason the blocked-capture cap below documents.
+              flight.preserveRecoveryClone = true;
+              flight.preserveSession = true;
+              await this.reportGenericFailure(claim, flight, captureError, { keepCustody: credentialDeferred || opts.terminalDisk });
+              return false;
             }
             runLog.warn("recovery capture failed; retaining work for retry", {
               error: errMessage(captureError),

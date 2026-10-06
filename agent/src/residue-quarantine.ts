@@ -33,15 +33,19 @@ export const REASON_WORKER_RESIDUE_BLOCKED = "worker_residue_blocked";
  */
 export class RunResidueBlockedError extends Error {
   readonly detail: string;
-  /** `preClone` marks the phaseClone check, which fails before any clone exists: its text must not
-   *  claim a clone was kept. The reason prefix is the same, so failOriginForReason maps both. */
-  constructor(detail: string, opts: { preClone?: boolean } = {}) {
+  /** `preClone` marks a pre-fetch check, which fails before any clone exists: its text must not
+   *  claim a clone was kept, and it names the check that actually refused (`home_reap`: the run's
+   *  HOME-attributed reap; `worker_wide`: the worker-wide detection scan). The reason prefix is the
+   *  same, so failOriginForReason maps every shape. */
+  constructor(detail: string, opts: { preClone?: "home_reap" | "worker_wide" } = {}) {
     // The detail reaches the run's failure_reason: short, and stripped of control/bidi characters.
     const clean = sanitizeForLog(detail, 160);
     super(
-      opts.preClone
-        ? `${REASON_WORKER_RESIDUE_BLOCKED}: a process that could not be attributed to any run, or the run's HOME-attributed processes, could not be proven gone by the worker-wide check before the clone fetch (${clean}); no clone was fetched`
-        : `${REASON_WORKER_RESIDUE_BLOCKED}: the run's clone could not be proven quiescent (${clean}); the clone is kept for inspection`,
+      opts.preClone === "worker_wide"
+        ? `${REASON_WORKER_RESIDUE_BLOCKED}: a process that could not be attributed to any run could not be proven gone by the worker-wide check before the clone fetch (${clean}); no clone was fetched`
+        : opts.preClone === "home_reap"
+          ? `${REASON_WORKER_RESIDUE_BLOCKED}: the run's HOME-attributed processes could not be proven gone by the HOME reap before the clone fetch (${clean}); no clone was fetched`
+          : `${REASON_WORKER_RESIDUE_BLOCKED}: the run's clone could not be proven quiescent (${clean}); the clone is kept for inspection`,
     );
     this.detail = clean;
     this.name = "RunResidueBlockedError";
@@ -119,6 +123,21 @@ export function residueQuarantine(): ResidueQuarantineState | undefined {
  */
 export function assertResidueQuarantineOpen(site: ResidueQuarantineRefusalSite): void {
   if (latched !== undefined) throw new ResidueQuarantinedError(site, latched.cause);
+}
+
+/** True when a git child's env carries the forge credential: any `GIT_CONFIG_VALUE_n` that is a
+ *  Basic Authorization header (gitEnv's PAT pair). Keyed on the env, not on the spawn identity,
+ *  which defaults to `worker_pat` for PAT-less git too. */
+function carriesForgeCredential(childEnv: NodeJS.ProcessEnv): boolean {
+  return Object.entries(childEnv).some(
+    ([k, v]) => k.startsWith("GIT_CONFIG_VALUE_") && typeof v === "string" && v.startsWith("Authorization: Basic"),
+  );
+}
+
+/** Refuse (synchronously, typed) to start a child that carries the forge credential while the worker
+ *  is quarantined. Call it immediately before the spawn, with nothing awaited in between. */
+export function assertNoCredentialedGitWhileQuarantined(childEnv: NodeJS.ProcessEnv): void {
+  if (carriesForgeCredential(childEnv)) assertResidueQuarantineOpen("git");
 }
 
 /**

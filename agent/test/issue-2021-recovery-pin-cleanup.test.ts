@@ -11,6 +11,10 @@ import { GitCache } from "../src/git.js";
 import { canonicalJson, RecoveryCoordinator, type RecoveryArchiveClient, type RecoveryBundleProducer, type RecoveryRecord } from "../src/recovery.js";
 import { PredecessorSettler, SettlementJournal } from "../src/recovery-settlement.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
+import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
+
+resetResidueQuarantineAfterEach();
 
 const TOKEN = "issue-2021-worker-fixture";
 const NAME = "forge.example+org+repo.git";
@@ -118,6 +122,29 @@ beforeEach(async () => {
 afterEach(async () => {
   mock.restoreAll();
   await fs.rm(root, { recursive: true, force: true });
+});
+
+describe("issue #2213: a quarantined worker's live re-drive does nothing", () => {
+  it("makes no reserve, upload or release call, deletes no pin, and leaves the record as it was", async () => {
+    const bundled = await journal(4);
+    assert.ok(present(4));
+    const reservesBefore = archive.reserves;
+    const uploadsBefore = archive.uploads;
+    archive.uploadError = undefined;
+    latchResidueQuarantine({ cause: "c", site: "t" }, nullLogger());
+    const c = coord();
+    await retry(c, "live");
+    await retry(c, "live");
+    assert.equal(archive.reserves, reservesBefore, "no reserve call");
+    assert.equal(archive.uploads, uploadsBefore, "no upload call");
+    assert.ok(present(4), "the recovery pin is kept");
+    assert.deepEqual(await only(c), bundled, "the journal record is unchanged");
+    assert.ok(bundled.bundlePath && (await fs.stat(bundled.bundlePath)), "the journaled bytes are kept");
+    resetResidueQuarantineForTests();
+    await retry(c, "live");
+    assert.equal(archive.uploads, uploadsBefore + 1, "control: unlatched, the same pass uploads");
+    assert.equal(present(4), false, "control: and cleans the pin up");
+  });
 });
 
 for (const mode of ["boot", "live"] as const) describe(`${mode} durable pin cleanup`, () => {

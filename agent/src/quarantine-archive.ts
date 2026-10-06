@@ -171,27 +171,37 @@ async function capture(
     if (digest.sha256 !== produced.checksum || digest.size !== produced.byteSize) {
       return fail(head, "the bundle file changed after it was produced");
     }
-    if (state.cancelled) return fail(head, "the capture deadline passed before publication");
-
-    await fs.chmod(tmpBundle, 0o600);
-    const manifest = {
-      version: 1,
-      run_id: runId,
-      generation,
-      head,
-      sha256: digest.sha256,
-      size: digest.size,
-      archived_at: new Date().toISOString(),
+    // Every publish step re-checks the deadline: a capture that overruns it reports `incomplete`, so
+    // it must also leave no final file behind. The last check runs with nothing awaited between it
+    // and the return, so the deadline timer cannot fire after it and before `archived` is reported.
+    const deadlinePassed = (): void => {
+      if (state.cancelled) throw new Error("the capture deadline passed before publication");
     };
-    await fs.writeFile(tmpManifest, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600, flag: "wx" });
     try {
+      deadlinePassed();
+      await fs.chmod(tmpBundle, 0o600);
+      deadlinePassed();
+      const manifest = {
+        version: 1,
+        run_id: runId,
+        generation,
+        head,
+        sha256: digest.sha256,
+        size: digest.size,
+        archived_at: new Date().toISOString(),
+      };
+      await fs.writeFile(tmpManifest, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+      deadlinePassed();
       await fs.rename(tmpBundle, finalBundle);
+      deadlinePassed();
       await fs.rename(tmpManifest, finalManifest);
+      deadlinePassed();
     } catch (err) {
-      // Never leave a bundle that reads as verified without its manifest.
+      // Never leave a bundle that reads as verified without its manifest, nor any final file for a
+      // capture that is reported incomplete.
       await fs.rm(finalBundle, { force: true }).catch(() => undefined);
       await fs.rm(finalManifest, { force: true }).catch(() => undefined);
-      return fail(head, `could not publish the archive: ${errMessage(err)}`);
+      return fail(head, state.cancelled ? "the capture deadline passed before publication" : `could not publish the archive: ${errMessage(err)}`);
     }
     return { outcome: "archived", head, sha256: digest.sha256, size: digest.size };
   } catch (err) {

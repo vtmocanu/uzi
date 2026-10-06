@@ -26,7 +26,7 @@ import {
   parseRetainedArtifactName,
 } from "./attempt-path.js";
 import { sanitizeForLog } from "./run-quiescence.js";
-import { REASON_WORKER_RESIDUE_BLOCKED, RunResidueBlockedError, assertResidueQuarantineOpen } from "./residue-quarantine.js";
+import { REASON_WORKER_RESIDUE_BLOCKED, RunResidueBlockedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen } from "./residue-quarantine.js";
 
 import {
   commitsScannedFromStderr,
@@ -6950,7 +6950,10 @@ export class GitCache {
     const childTimeout = remainingSoft === undefined
       ? options.timeout
       : Math.min(options.timeout ?? Infinity, remainingSoft);
-    // issue #2213: as above, on the Codex boundary path; no await between this and the spawn call.
+    // issue #2213: as above, on the Codex boundary path. boundary.spawn is awaited and its own
+    // chain (the tick spawner's lock snapshot, the safety spawn boundary) awaits before the actual
+    // spawn, so this check is early; TickSpawner.spawnWith and launchCodexEffectRoot repeat it
+    // synchronously immediately before their own spawn call.
     assertNoCredentialedGitWhileQuarantined(options.env);
     const process = await boundary.spawn({ argv: [executable, ...args], cwd, env: options.env, identity,
       ...(childTimeout === undefined ? {} : { timeoutMs: childTimeout }),
@@ -7636,22 +7639,6 @@ export function runnerGitSpawnEnv(args: readonly string[], runnerEnv: NodeJS.Pro
   return env;
 }
 
-
-/** issue #2213: true when a git child's env carries the forge credential: any `GIT_CONFIG_VALUE_n`
- *  that is a Basic Authorization header (gitEnv's PAT pair). Keyed on the env, not on the spawn
- *  identity, which defaults to `worker_pat` for PAT-less git too. */
-function carriesForgeCredential(childEnv: NodeJS.ProcessEnv): boolean {
-  return Object.entries(childEnv).some(
-    ([k, v]) => k.startsWith("GIT_CONFIG_VALUE_") && typeof v === "string" && v.startsWith("Authorization: Basic"),
-  );
-}
-
-/** issue #2213: refuse (synchronously, typed) to start a child that carries the forge credential
- *  while the worker is quarantined. Called immediately before the spawn, so nothing awaits between
- *  the check and the child's creation. */
-function assertNoCredentialedGitWhileQuarantined(childEnv: NodeJS.ProcessEnv): void {
-  if (carriesForgeCredential(childEnv)) assertResidueQuarantineOpen("git");
-}
 
 export function gitEnv(pat?: string, httpScope?: string, username?: string): NodeJS.ProcessEnv {
   // REPLACEMENT env (M10 audit), NOT a process.env spread. A git subprocess can spawn

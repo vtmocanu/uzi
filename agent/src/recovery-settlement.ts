@@ -29,6 +29,7 @@ import { RequestError } from "./client.js";
 import type { Logger } from "./log.js";
 import type { RecoveryLiveSettleRequest, RecoverySettleRequest, RecoverySettleResponse } from "./protocol.js";
 import { canonicalJson } from "./recovery.js";
+import { residueQuarantine } from "./residue-quarantine.js";
 
 /** Local settlement lifecycle.
  *   - `adopted`: the successor adopted the predecessor's work; no pushed head yet (never sent).
@@ -413,6 +414,8 @@ export class PredecessorSettler {
   private readonly holdLocks = new Map<string, Promise<void>>();
   /** At most one hint per active hold; discarded from memory at lock release. */
   private readonly pendingReleaseHints = new Map<string, number>();
+  /** issue #2213: the quarantine skip of a sweep is logged once. */
+  private loggedQuarantineSkip = false;
 
   constructor(opts: PredecessorSettlerOptions) {
     this.journal = opts.journal;
@@ -613,6 +616,15 @@ export class PredecessorSettler {
    *  observed. */
   async sweep(signal?: AbortSignal): Promise<void> {
     if (!this.journal.enabled) return;
+    // issue #2213: a quarantined worker settles and releases nothing; every record stays journaled
+    // until the worker restarts.
+    if (residueQuarantine() !== undefined) {
+      if (!this.loggedQuarantineSkip) {
+        this.loggedQuarantineSkip = true;
+        this.log.warn("recovery settlement: sweep skipped; the worker is quarantined");
+      }
+      return;
+    }
     try {
       const now = this.journal.now();
       for (const rec of await this.journal.listAll()) {

@@ -25,6 +25,10 @@ import {
 import type { RecoveryLiveSettleRequest, RecoverySettleRequest, RecoverySettleResponse } from "../src/protocol.js";
 import { FakeRecoveryClient, FakeRecoveryGit } from "./codex-reap-fixture.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
+import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
+
+resetResidueQuarantineAfterEach();
 
 // issue #1582 M2 — the worker-side ancestry-settlement journal + settle driver, unit level.
 
@@ -353,6 +357,20 @@ describe("PredecessorSettler outcome rules (issue #1582 M2)", () => {
     assert.equal(await settler.settleOne(record({ holdId: HOLD3, state: "pushed" })), "skipped");
     await settler.settleRun(RUN);
     assert.ok(!client.calls.some((c) => c.holdId === HOLD3), "a pushed record is never sent by any path");
+  });
+
+  it("issue #2213: a quarantined worker's sweep sends nothing and cleans nothing; the record stays journaled", async () => {
+    await j.put(record());
+    client.answers = [{ run_id: RUN, hold_id: HOLD, outcome: "released", final_head_sha: PUSHED }];
+    latchResidueQuarantine({ cause: "c", site: "t" }, nullLogger());
+    await settler.sweep();
+    await settler.sweep();
+    assert.equal(client.calls.length, 0, "no settle call");
+    assert.deepEqual(cleanup.calls, [], "no pin or ref cleanup");
+    assert.equal((await j.listRun(RUN)).length, 1, "the record is kept");
+    resetResidueQuarantineForTests();
+    await settler.sweep();
+    assert.deepEqual(client.calls.map((c) => c.holdId), [HOLD], "control: unlatched, the same sweep settles it");
   });
 
   for (const status of [401, 403]) {

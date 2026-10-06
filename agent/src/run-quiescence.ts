@@ -653,8 +653,8 @@ export function scanOnce(
     // well-formed attempt marker, which is what every agent CLI spawn carries.
     const inScope =
       req.workerWide !== true &&
-      (env.get(RUN_CLONE_KEY_ENV) === req.targetKey && wellFormedAttemptMarker(env.get(RUN_ATTEMPT_ENV))) ||
-      req.targetPaths.some((p) => isWithinPath(stripDeleted(cwd), p));
+      ((env.get(RUN_CLONE_KEY_ENV) === req.targetKey && wellFormedAttemptMarker(env.get(RUN_ATTEMPT_ENV))) ||
+        req.targetPaths.some((p) => isWithinPath(stripDeleted(cwd), p)));
     if (!inScope) continue;
     const entry = (reason: string): QuiesceProcess => ({
       pid,
@@ -1422,6 +1422,8 @@ function isScanRequest(v: unknown): v is ScanRequest {
     Number.isInteger(o.targetUid) &&
     typeof o.targetKey === "string" &&
     strings(o.targetPaths) &&
+    // issue #2213: a worker-wide detection scan scopes nothing, so it carries no target paths.
+    (o.workerWide !== true || (o.targetPaths as string[]).length === 0) &&
     (o.ownMarker === undefined || typeof o.ownMarker === "string") &&
     strings(o.liveMarkers) &&
     (o.mayKillUnreadableUnattributed === undefined || typeof o.mayKillUnreadableUnattributed === "boolean") &&

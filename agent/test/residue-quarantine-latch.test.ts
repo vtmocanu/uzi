@@ -17,6 +17,7 @@ import { failOriginForReason } from "../src/runner.js";
 import { GitCache, gitEnv } from "../src/git.js";
 import { defaultQueryFn } from "../src/sdk-messages.js";
 import { spawnDetached } from "../src/sdk-spawn.js";
+import { TickSpawner } from "../src/tick-spawner.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
@@ -212,22 +213,25 @@ describe("the Claude provider belts (issue #2213)", () => {
   it("spawnDetached refuses a spawn whose env carries a provider credential, and spawns nothing", () => {
     latchResidueQuarantine({ cause: "c", site: "t" }, nullLogger());
     const marker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "uzi-2213-spawn-")), "ran");
-    for (const key of ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]) {
-      assert.throws(
-        () =>
-          spawnDetached({
-            command: "/bin/sh",
-            args: ["-c", `echo ran > '${marker}'`],
-            cwd: "/",
-            env: { PATH: "/usr/bin:/bin", [key]: "a-provider-credential-value" },
-            signal: new AbortController().signal,
-          }),
-        ResidueQuarantinedError,
-        key,
-      );
+    try {
+      for (const key of ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]) {
+        assert.throws(
+          () =>
+            spawnDetached({
+              command: "/bin/sh",
+              args: ["-c", `echo ran > '${marker}'`],
+              cwd: "/",
+              env: { PATH: "/usr/bin:/bin", [key]: "a-provider-credential-value" },
+              signal: new AbortController().signal,
+            }),
+          ResidueQuarantinedError,
+          key,
+        );
+      }
+      assert.equal(fs.existsSync(marker), false);
+    } finally {
+      fs.rmSync(path.dirname(marker), { recursive: true, force: true });
     }
-    assert.equal(fs.existsSync(marker), false);
-    fs.rmSync(path.dirname(marker), { recursive: true, force: true });
   });
 
   it("control: while open the same spawn starts; and a credential-free spawn is not a turn", async () => {
@@ -254,6 +258,42 @@ describe("the Claude provider belts (issue #2213)", () => {
       });
       await new Promise((r) => free.once("exit", r));
       assert.equal(fs.existsSync(marker), true, "a credential-free spawn is untouched");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("the mid-turn tick spawner (issue #2213)", () => {
+  const credentialedEnv = { PATH: "/usr/bin:/bin", GIT_CONFIG_VALUE_0: "Authorization: Basic ZmFrZTpmYWtl" };
+
+  it("a latch set while the lock snapshot awaits spawns no credentialed child", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-2213-tick-"));
+    try {
+      const bare = path.join(dir, "bare.git");
+      fs.mkdirSync(path.join(bare, "refs", "uzi-runner", "agent"), { recursive: true });
+      fs.mkdirSync(path.join(bare, "objects", "info"), { recursive: true });
+      const marker = path.join(dir, "ran");
+      const ac = new AbortController();
+      const sp = new TickSpawner({ signal: ac.signal, barePath: bare, branch: "agent/issue-1" });
+      const pending = sp.spawn({ argv: ["/bin/sh", "-c", `echo ran > '${marker}'`], cwd: dir, env: credentialedEnv, identity: "worker_pat" });
+      // spawnWith is suspended in its snapshotLocks await: the latch lands inside that window.
+      latchResidueQuarantine({ cause: "c", site: "t" }, nullLogger());
+      await assert.rejects(pending, ResidueQuarantinedError);
+      await new Promise((r) => setTimeout(r, 100));
+      assert.equal(fs.existsSync(marker), false, "no child was spawned");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("control: a credential-free tick child still starts while latched", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-2213-tick-"));
+    try {
+      latchResidueQuarantine({ cause: "c", site: "t" }, nullLogger());
+      const sp = new TickSpawner({ signal: new AbortController().signal });
+      const h = await sp.spawn({ argv: ["/bin/true"], cwd: dir, env: { PATH: "/usr/bin:/bin" }, identity: "worker_pat" });
+      assert.deepEqual(await h.completed, { code: 0 });
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

@@ -6,6 +6,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { deflateSync } from "node:zlib";
+
+const fsp = fs.promises;
 import { GitCache, RecoveryBundleTooLargeError } from "../src/git.js";
 import {
   archiveFailureReasonSuffix,
@@ -13,7 +15,9 @@ import {
   type QuarantineArchiveGit,
   type QuarantineArchiveResult,
 } from "../src/quarantine-archive.js";
-import { RunResidueBlockedError, assertResidueQuarantineOpen, latchResidueQuarantine, residueQuarantine } from "../src/residue-quarantine.js";
+import { ResidueQuarantinedError, RunResidueBlockedError, assertResidueQuarantineOpen, latchResidueQuarantine, residueQuarantine } from "../src/residue-quarantine.js";
+import { TransientRecoveryError } from "../src/sdk-executor.js";
+import type { RunRunner } from "../src/runner.js";
 import type { ExecutorFactory } from "../src/runner.js";
 import type { ExecutorResult, RunContext } from "../src/executor.js";
 import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
@@ -160,13 +164,18 @@ describe("the archival capture over a real bare (issue #2213)", () => {
     assert.equal((await capture(topo, wrapped(topo), { branch: undefined })).outcome, "no_source");
   });
 
-  it("(i) the tracking ref moves to H' between resolve and bundle: the archive still reproduces H, anchored by its ref", async () => {
-    git(topo.work, ["commit", "--allow-empty", "-m", "later"]);
+  it("(i) the tracking ref moves to H' between resolve and bundle: the archive still reproduces H, anchored only by its ref", async () => {
+    // H' is unrelated to H (it branches off the base), so once the tracking ref leaves H nothing but
+    // the archive ref reaches H, and a prune in the bare deletes it unless that ref anchors it.
+    git(topo.work, ["checkout", "-q", "-b", "other", topo.baseSha]);
+    git(topo.work, ["-c", "user.email=f@uzi.local", "-c", "user.name=f", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "unrelated"]);
     const hPrime = git(topo.work, ["rev-parse", "HEAD"]);
     git(topo.work, ["push", topo.bare, `HEAD:refs/uzi-runner/other-staging`]);
     const g = wrapped(topo, {
       produceRecoveryBundle: async (b, o) => {
         git(topo.bare, ["update-ref", `refs/uzi-runner/${topo.branch}`, hPrime]);
+        git(topo.bare, ["update-ref", "-d", "refs/uzi-runner/other-staging"]);
+        git(topo.bare, ["prune", "--expire=now"]);
         return topo.cache.produceRecoveryBundle(b, o);
       },
     });
@@ -174,6 +183,7 @@ describe("the archival capture over a real bare (issue #2213)", () => {
     assert.equal(r.outcome, "archived", r.detail);
     assert.equal(r.head, topo.head, "H as resolved, not H'");
     assert.equal(refOf(topo, archiveRef(topo)), topo.head);
+    assert.equal(git(topo.bare, ["cat-file", "-t", topo.head]), "commit", "H survived the prune");
     const heads = git(topo.base, ["bundle", "list-heads", path.join(runDir(topo), "g1.bundle")]);
     assert.equal(heads.split(" ")[0], topo.head);
   });
@@ -285,6 +295,31 @@ describe("the archival capture over a real bare (issue #2213)", () => {
       await new Promise((resolve) => setTimeout(resolve, 1500)); // let the late work finish
       assert.ok(!listRunDir(topo).includes("g1.bundle"), "nothing is published after the deadline");
     });
+
+    for (const step of ["chmod", "rename"] as const) {
+      it(`the deadline passes during a slow publish ${step}: incomplete, and no g1.bundle or manifest appears afterwards`, async () => {
+        const real = fsp[step] as (...a: unknown[]) => Promise<unknown>;
+        let delayed = false;
+        (fsp as unknown as Record<string, unknown>)[step] = async (...a: unknown[]) => {
+          const target = String(a[0]);
+          if (!delayed && target.endsWith(".bundle.tmp")) {
+            delayed = true;
+            await new Promise((r) => setTimeout(r, 1000));
+          }
+          return real(...a);
+        };
+        try {
+          const r = await capture(topo, wrapped(topo), { deadlineMs: 700 });
+          assert.equal(r.outcome, "incomplete");
+          assert.match(String(r.detail), /did not finish within 700 ms/);
+          await new Promise((resolve) => setTimeout(resolve, 1500)); // let the late work run to its end
+          assert.equal(delayed, true, "the slow step was reached");
+          assert.deepEqual(listRunDir(topo).filter((f) => f === "g1.bundle" || f === "g1.manifest.json" || f.endsWith(".tmp")), []);
+        } finally {
+          (fsp as unknown as Record<string, unknown>)[step] = real;
+        }
+      });
+    }
   });
 });
 
@@ -408,20 +443,216 @@ describe("a run that fails quarantined archives its committed work and releases 
     assert.deepEqual(spy.clientCalls, []);
   });
 
-  it("an archival crash never masks the typed failure", TIMEOUT, async () => {
-    const iid = 22192;
+  /** Everything the failure path must leave exactly as it was. */
+  function retained(iid: number, runId: string) {
+    const bare = harnessGit.barePathFor(fx.originPath);
+    const readTree = (dir: string): Record<string, string> => {
+      const out: Record<string, string> = {};
+      const walk = (d: string): void => {
+        if (!fs.existsSync(d)) return;
+        for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+          const f = path.join(d, e.name);
+          if (e.isDirectory()) walk(f);
+          else out[path.relative(dir, f)] = fs.readFileSync(f, "utf8");
+        }
+      };
+      walk(dir);
+      return out;
+    };
+    return {
+      pins: git(bare, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-recovery-pin"]),
+      journalClone: journalOf(iid),
+      recoveryFiles: readTree(path.join(harnessGit.recoveryRoot, runId)),
+      settlementFiles: readTree(path.join(harnessGit.recoverySettlementRoot, runId)),
+    };
+  }
+
+  /** Spies the runner's reap and settle: neither may run on a quarantined worker. */
+  function spyReapSettle(runner: RunRunner): { reaps: number; settles: number } {
+    const counts = { reaps: 0, settles: 0 };
+    const priv = runner as unknown as Record<string, unknown>;
+    priv.reapRecoveryProviderForSettle = async () => {
+      counts.reaps++;
+      return false;
+    };
+    priv.settleRecoveryGeneration = async () => {
+      counts.settles++;
+    };
+    return counts;
+  }
+
+  /** Commits work, checkpoints it into the bare, plants a recovery pin, latches, snapshots, then `fail`s. */
+  function failingAfterLatch(iid: number, afterLatch: { on: boolean }, snap: { before?: ReturnType<typeof retained> }, fail: () => never): ExecutorFactory {
+    return (runId) => ({
+      homeDir: path.join(homeDir, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          fs.writeFileSync(path.join(ctx.worktreePath, "WORK.txt"), "committed work\n");
+          execFileSync("git", ["-C", ctx.worktreePath, "add", "WORK.txt"], { env: GIT_ENV, stdio: "pipe" });
+          execFileSync("git", ["-C", ctx.worktreePath, ...IDENT, "commit", "-m", "work"], { env: GIT_ENV, stdio: "pipe" });
+          await harnessGit.fetchAgentBranch(harnessGit.barePathFor(fx.originPath), ctx.worktreePath, ctx.branch, runId);
+          const bare = harnessGit.barePathFor(fx.originPath);
+          git(bare, ["update-ref", `refs/uzi-recovery-pin/${runId}/3`, git(bare, ["rev-parse", `refs/uzi-runner/${ctx.branch}`])]);
+          latchResidueQuarantine({ cause: `runner-uid pid 4242 "ssh-agent" could not be attributed (env/cwd unreadable)`, runId, site: "pre_clone" }, nullLogger());
+          afterLatch.on = true;
+          snap.before = retained(iid, runId);
+          return fail();
+        },
+      },
+    });
+  }
+
+  function assertNothingReleased(iid: number, runId: string, spy: Spy, counts: { reaps: number; settles: number }, before: ReturnType<typeof retained> | undefined): void {
+    assert.ok(before, "the snapshot was taken");
+    assert.deepEqual(spy.clientCalls, [], "no reserve, upload or release client call");
+    assert.deepEqual(spy.deletedPins, [], "no recovery pin was deleted");
+    assert.deepEqual(counts, { reaps: 0, settles: 0 }, "no reap and no custody settle ran");
+    assert.deepEqual(retained(iid, runId), before, "pins, the journal and the recovery files are exactly as they were");
+    assert.ok(journalOf(iid), "the journal still points at the kept clone");
+    assert.equal(fs.existsSync(path.join(worktreeDirFor(iid), "WORK.txt")), true, "the clone is kept");
+  }
+
+  for (const c of [
+    {
+      name: "incomplete (the archive ref is force-moved during the capture)",
+      iid: 22194,
+      tweak: () => {
+        const real = harnessGit.quarantineArchiveRefTip.bind(harnessGit);
+        harnessGit.quarantineArchiveRefTip = async (b, r, g) => {
+          await real(b, r, g);
+          return "0".repeat(40);
+        };
+      },
+      outcome: /incomplete/,
+    },
+    {
+      name: "too_large",
+      iid: 22195,
+      tweak: () => {
+        harnessGit.produceRecoveryBundle = async () => {
+          throw new RecoveryBundleTooLargeError(99, 1);
+        };
+      },
+      outcome: /too_large/,
+    },
+  ]) {
+    it(`a ${c.name} archive keeps the typed failure and releases, deletes and retires nothing`, TIMEOUT, async () => {
+      const afterLatch = { on: false };
+      const spy = installSpies(afterLatch);
+      c.tweak();
+      const { logger, lines } = recordingLogger();
+      const snap: { before?: ReturnType<typeof retained> } = {};
+      const claim = gitlabClaim(c.iid, { claim_generation: 3 });
+      const factory = failingAfterLatch(c.iid, afterLatch, snap, () => {
+        assertResidueQuarantineOpen("provider_turn");
+        throw new Error("unreachable");
+      });
+      const runner = runnerWith(factory, fakeGitlab().gitlab, undefined, logger, { checkpointIntervalMs: 0, recoveryRetryMs: 1 });
+      const counts = spyReapSettle(runner);
+      await runner.execute(claim);
+      const failed = lastFailed(claim.run_id);
+      assert.equal(failed?.fail_origin, "worker_residue_blocked");
+      assert.match(String(failed?.failure_reason), /this worker is quarantined/);
+      assert.doesNotMatch(String(failed?.failure_reason), /archived on the worker/);
+      assert.ok(
+        (lines as Array<{ msg?: string; outcome?: string }>).some((l) => l.msg === "quarantine archival capture finished" && c.outcome.test(String(l.outcome))),
+        "the capture ran and reported its non-archived outcome",
+      );
+      assert.equal(fs.existsSync(path.join(harnessGit.recoveryArchiveRoot, claim.run_id, "g3.bundle")), false, "nothing was published");
+      assertNothingReleased(c.iid, claim.run_id, spy, counts, snap.before);
+    });
+  }
+
+  it("a non-quarantine failure on an already-latched worker reaps and settles nothing and keeps the clone", TIMEOUT, async () => {
+    const iid = 22196;
+    const afterLatch = { on: false };
+    const spy = installSpies(afterLatch);
+    const snap: { before?: ReturnType<typeof retained> } = {};
+    const claim = gitlabClaim(iid, { claim_generation: 3 });
+    const factory = failingAfterLatch(iid, afterLatch, snap, () => {
+      throw new Error("the agent failed for an unrelated reason");
+    });
+    const runner = runnerWith(factory, fakeGitlab().gitlab, undefined, undefined, { checkpointIntervalMs: 0, recoveryRetryMs: 1 });
+    const counts = spyReapSettle(runner);
+    await runner.execute(claim);
+    const failed = lastFailed(claim.run_id);
+    assert.ok(failed, "the run failed");
+    assert.doesNotMatch(String(failed?.failure_reason), /quarantined/, "an unrelated failure, not the quarantine one");
+    assertNothingReleased(iid, claim.run_id, spy, counts, snap.before);
+  });
+
+  it("control: the same unrelated failure on an UNLATCHED worker does reap and settle", TIMEOUT, async () => {
+    const iid = 22197;
     const afterLatch = { on: false };
     installSpies(afterLatch);
+    const factory: ExecutorFactory = (runId) => ({
+      homeDir: path.join(homeDir, runId),
+      executor: {
+        run: async (): Promise<ExecutorResult> => {
+          throw new Error("the agent failed for an unrelated reason");
+        },
+      },
+    });
+    const runner = runnerWith(factory, fakeGitlab().gitlab);
+    const counts = spyReapSettle(runner);
+    await runner.execute(gitlabClaim(iid));
+    assert.ok(counts.reaps >= 1, "the ordinary failure path reaps for the settle");
+  });
+
+  it("a latch during the recovery-exhausted capture fails the run worker_residue_blocked instead of retrying forever", TIMEOUT, async () => {
+    const iid = 22198;
+    const afterLatch = { on: false };
+    const spy = installSpies(afterLatch);
+    let captureCalls = 0;
+    harnessGit.commitWipMarker = async () => {
+      captureCalls++;
+      latchResidueQuarantine({ cause: `runner-uid pid 4242 "ssh-agent" could not be attributed (env/cwd unreadable)`, site: "recovery_capture" }, nullLogger());
+      afterLatch.on = true;
+      throw new ResidueQuarantinedError("git", "pid 4242");
+    };
+    const factory: ExecutorFactory = (runId) => ({
+      homeDir: path.join(homeDir, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          fs.writeFileSync(path.join(ctx.worktreePath, "WORK.txt"), "uncommitted work\n");
+          throw new TransientRecoveryError();
+        },
+      },
+    });
+    const claim = gitlabClaim(iid);
+    const runner = runnerWith(factory, fakeGitlab().gitlab, undefined, undefined, { checkpointIntervalMs: 0, recoveryRetryMs: 1 });
+    const counts = spyReapSettle(runner);
+    await runner.execute(claim);
+    const failed = lastFailed(claim.run_id);
+    assert.equal(failed?.fail_origin, "worker_residue_blocked", String(failed?.failure_reason));
+    assert.equal(captureCalls, 1, "the capture was not retried");
+    assert.deepEqual(spy.clientCalls, []);
+    assert.deepEqual(counts, { reaps: 0, settles: 0 });
+    assert.equal(fs.existsSync(path.join(worktreeDirFor(iid), "WORK.txt")), true, "the clone is kept");
+  });
+
+  it("an archival crash never masks the typed failure, and still releases, deletes and retires nothing", TIMEOUT, async () => {
+    const iid = 22192;
+    const afterLatch = { on: false };
+    const spy = installSpies(afterLatch);
     harnessGit.createQuarantineArchiveRef = async () => {
       throw new Error("the archive exploded");
     };
     const { logger, lines } = recordingLogger();
+    const snap: { before?: ReturnType<typeof retained> } = {};
     const claim = gitlabClaim(iid);
-    await runnerWith(latchingExecutor(iid, afterLatch), fakeGitlab().gitlab, undefined, logger).execute(claim);
+    const factory = failingAfterLatch(iid, afterLatch, snap, () => {
+      assertResidueQuarantineOpen("provider_turn");
+      throw new Error("unreachable");
+    });
+    const runner = runnerWith(factory, fakeGitlab().gitlab, undefined, logger);
+    const counts = spyReapSettle(runner);
+    await runner.execute(claim);
     const failed = lastFailed(claim.run_id);
     assert.equal(failed?.fail_origin, "worker_residue_blocked");
     assert.doesNotMatch(String(failed?.failure_reason), /archived/);
     assert.ok((lines as Array<{ msg?: string; outcome?: string }>).some((l) => l.msg === "quarantine archival capture finished" && l.outcome === "incomplete"));
+    assertNothingReleased(iid, claim.run_id, spy, counts, snap.before);
   });
 
   it("control: a plain residue block (not quarantined) runs no archival capture", TIMEOUT, async () => {

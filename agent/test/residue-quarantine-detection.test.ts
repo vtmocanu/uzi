@@ -100,6 +100,7 @@ describe("the pre-fetch worker-wide check refuses the first fetch (issue #2213)"
       const reason = String(failed?.failure_reason);
       assert.match(reason, /no clone was fetched/);
       assert.match(reason, /worker-wide check/);
+      assert.doesNotMatch(reason, /HOME reap/, "names the check that refused");
       assert.match(reason, /pid 4242 "ssh-agent" could not be attributed/);
       assert.doesNotMatch(reason, /kept for inspection/);
       assert.ok(!statuses(claim.run_id).includes("recovery_wait"), "a worker fault, never a forge park");
@@ -255,6 +256,9 @@ describe("what does not latch (issue #2213)", LINUX, () => {
     const r = await reachesFetch(22157, factory, {}, 2);
     assert.equal(r.reached, false);
     assert.match(r.reason, /HOME-attributed reap left 1 process\(es\)/);
+    assert.match(r.reason, /by the HOME reap before the clone fetch/);
+    assert.match(r.reason, /no clone was fetched/);
+    assert.doesNotMatch(r.reason, /worker-wide check/, "the worker-wide check never ran at this site");
     assert.equal(residueQuarantine(), undefined);
   });
 

@@ -56,7 +56,7 @@ import {
 } from "./config.js";
 import type { CodexAppServerAuthMode } from "./appserver-auth.js";
 import { SESSION_SEED_APP_ROOT, sessionSeedInvocation } from "./session-seed-cli.js";
-import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
+import { assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen } from "../residue-quarantine.js";
 
 // ─── Bounds (fixture-derived; supervisor-side limits are matched, not trusted) ────
 const MAX_EVIDENCE_LINES = 256;
@@ -834,6 +834,9 @@ export async function launchCodexEffectRoot(
   const wrapped = spec.identity === "command"
     ? commandRootCommand(spec.supervisorBin, supervisorArgv)
     : workerBoundaryCommand(spec.supervisorBin, supervisorArgv);
+  // issue #2213: an effect root whose env carries the forge credential (a boundary git) starts
+  // nothing once quarantined; synchronous, immediately before the spawn.
+  assertNoCredentialedGitWhileQuarantined(spec.env);
   const child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
     cwd: spec.cwd,
     // issue #1783 (R4): NO worker mark. A command root runs model-directed shells, and neither

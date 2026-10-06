@@ -33,6 +33,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
 import type { Logger } from "./log.js";
+import { assertNoCredentialedGitWhileQuarantined } from "./residue-quarantine.js";
 import { runnerCommand, uidSplitActive } from "./runner-uid.js";
 import { WORKER_SPAWN_ENV, unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 
@@ -339,6 +340,9 @@ export class TickSpawner {
     // issue #1597 M2: identity `command` = the runner uid, exactly as runGitAsRunner applies it
     // outside a scope (setpriv under the uid split, a passthrough single-uid). worker_pat = this uid.
     const wrapped = req.identity === "command" ? runnerCommand(exe!, args) : { command: exe!, args };
+    // issue #2213: the quarantine latch may have been set during the lock-snapshot await above;
+    // synchronous, immediately before the spawn, keyed on the credential in the child's env.
+    assertNoCredentialedGitWhileQuarantined(req.env);
     const child: ChildProcess = spawn(wrapped.command, wrapped.args, {
       cwd: req.cwd,
       // issue #1783 (R4): a tick child is the worker's own op (it runs only while holding the

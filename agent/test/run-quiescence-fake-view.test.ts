@@ -215,6 +215,12 @@ describe("a malformed view is refused by the setter and by the helper", () => {
     }
   });
 
+  it("the helper refuses a workerWide request that also carries target paths (issue #2213)", { skip: !HAS_LINUX }, () => {
+    const v = helperVerdict({ ...req({ workerWide: true }), view: { procRoot: root } });
+    assert.equal(v.detail, "helper request invalid");
+    assert.notEqual(helperVerdict({ ...req({ workerWide: true, targetPaths: [] }), view: { procRoot: root } }).detail, "helper request invalid", "control: no paths is valid");
+  });
+
   it("control: the timing bounds themselves are accepted (deadline 0..5000 ms, interval 1..5000 ms)", () => {
     for (const view of [
       { procRoot: root, deadlineMs: 0, intervalMs: 1 },

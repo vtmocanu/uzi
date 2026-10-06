@@ -26,6 +26,7 @@ import type { Readable } from "node:stream";
 
 import { RequestError } from "./client.js";
 import type { Logger } from "./log.js";
+import { residueQuarantine } from "./residue-quarantine.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import type {
   RecoveryCaptureStatusResponse,
@@ -548,6 +549,8 @@ export class RecoveryCoordinator {
   private readonly passes = new Set<Promise<void>>();
   /** The earliest time the next live pass may run (the coordinator's `now()` clock). */
   private nextPassAt = 0;
+  /** issue #2213: the quarantine skip of a live pass is logged once. */
+  private loggedQuarantineSkip = false;
   /** Consecutive live passes that ended with a transient failure (drives the backoff). */
   private transientPasses = 0;
   /** Set by any 401: a live pass runs only for a heartbeat sent after it. */
@@ -1354,6 +1357,15 @@ export class RecoveryCoordinator {
    */
   async resumeLive(opts: ResumeLiveOptions): Promise<void> {
     if (!this.enabled || this.passes.size > 0) return;
+    // issue #2213: a quarantined worker re-uploads and releases nothing (an unattributable runner-uid
+    // process may read credentials); journaled bundles stay put until the worker restarts.
+    if (residueQuarantine() !== undefined) {
+      if (!this.loggedQuarantineSkip) {
+        this.loggedQuarantineSkip = true;
+        this.log.warn("recovery: live re-drive skipped; the worker is quarantined");
+      }
+      return;
+    }
     if (this.now() < this.nextPassAt) return;
     if (this.credentialBlockedAt !== undefined && opts.authenticatedAtMs <= this.credentialBlockedAt) return;
     await this.trackPass(() => this.livePass(opts));
