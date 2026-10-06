@@ -11,7 +11,7 @@ import type { Logger } from "./log.js";
 import type { RunContext } from "./executor.js";
 import { provisionTools } from "./provision.js";
 import { extractRepoDevboxPackages, mergeToolPackages, filterDeniedPackages } from "./repo-tools.js";
-import { rmHomeTree } from "./rmtree.js";
+import { rmTeardownTree, type TeardownTestDeps } from "./rmtree.js";
 import { errMessage, RUN_ID_RE } from "./util.js";
 
 /** Reason prefix for a FATAL provisioning failure. Tier-1 (uzi-stored) failure
@@ -26,13 +26,14 @@ export const REASON_PROVISION_FAILED = "tool provisioning failed before the agen
 
 /**
  * PRD #1809 M3: remove a per-run provision dir (`<dataDir>/provision/<runId>`), best-effort
- * and logged. Through {@link rmHomeTree}, not `fs.rm`: the install runs as the agent uid
+ * and logged. Through {@link rmTeardownTree}: sibling runs may still swap directories,
+ * and the install runs as the agent uid
  * under the PRD #51 split, so the dir holds agent-owned, possibly read-only subtrees that a
  * plain `fs.rm` as the worker cannot remove (the provision-dir leak). Never throws: every
  * caller is a cleanup that must not fail the run.
  */
-export async function removeProvisionDir(dir: string, log: Logger): Promise<void> {
-  await rmHomeTree(dir).catch((err) =>
+export async function removeProvisionDir(dir: string, log: Logger, testDeps?: TeardownTestDeps): Promise<void> {
+  await rmTeardownTree(dir, testDeps).catch((err) =>
     log.warn("provision dir cleanup failed", { provision_dir: dir, error: errMessage(err) }),
   );
 }

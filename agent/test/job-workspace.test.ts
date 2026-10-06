@@ -83,7 +83,8 @@ describe("job workspace (PRD #1908 M4)", () => {
     const ws = await createJobWorkspace(await tmpRoot(), randomUUID());
     await writeJobInputs(ws, [{ name: "doc.md", content: "x" }]);
     await removeJobWorkspace(ws, nullLogger());
-    await assert.rejects(() => fsp.stat(ws.root), { code: "ENOENT" });
+    if (process.platform === "linux") await assert.rejects(() => fsp.stat(ws.root), { code: "ENOENT" });
+    else assert.ok((await fsp.stat(ws.root)).isDirectory(), "unsupported platforms retain the tree");
   });
 
   it("the startup reaper removes run-id-named leftovers and leaves other entries alone", async () => {

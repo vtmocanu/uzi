@@ -723,8 +723,8 @@ function helperFailure(e: HelperExecError): Error {
  *  only when the helper could not be spawned or the worker stopped waiting for it (its
  *  timeout): no exit status is then a verdict. The timeout does NOT stop a helper under the uid
  *  split: the worker has no CAP_KILL over the agent uids, so its kill fails and the helper runs
- *  on until its own in-script budget (`budgetMs`, set {@link HELPER_SLACK_MS} short of the
- *  timeout) ends it. Single-uid the kill lands. The env is minimal and explicit, as in
+ *  on until its cooperative in-script budget (`budgetMs`, set {@link HELPER_SLACK_MS} short of the
+ *  timeout) is checked; a blocked syscall can delay that check. Single-uid the kill lands. The env is minimal and explicit, as in
  *  {@link purgeChildrenAsAgents}. */
 async function runHelper(wrap: CommandWrapper, script: string, args: readonly string[], timeout: number): Promise<number> {
   const wrapped = wrap(process.execPath, ["-e", script, ...args]);
@@ -846,13 +846,34 @@ const TREE_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
 /** The worker itself as a helper's uid: the command unchanged. */
 const asWorker: CommandWrapper = (command, args) => ({ command, args: [...args] });
 
+/** Test-only seams for {@link rmTeardownTree}; production always uses the pinned walk. */
+export interface TeardownTestDeps {
+  now?: () => number;
+  removeTreePinned?: typeof rmTreePinned;
+}
+
+/**
+ * Remove a worker-owned teardown tree while sibling runs may still be writing.
+ * One shared 120 s deadline bounds worker waiting across the ordered pinned passes.
+ * Helper entry/time budgets are cooperative: under the uid split the worker cannot
+ * kill a foreign-uid helper blocked in a syscall. Refusals propagate to the caller's
+ * warning catch; there is no path-based fallback, including on non-Linux hosts.
+ */
+export async function rmTeardownTree(target: string, testDeps: TeardownTestDeps = {}): Promise<void> {
+  if (!path.isAbsolute(target)) throw new Error(`rmTeardownTree: refusing non-absolute path ${target}`);
+  await (testDeps.removeTreePinned ?? rmTreePinned)(path.dirname(target), path.basename(target), {
+    deadline: (testDeps.now ?? Date.now)() + 120_000,
+  });
+}
+
 /** Test seams and the caller's deadline for {@link rmTreePinned}. */
 export interface PinnedTreeRemovalOptions {
   /** The uids to run the emptying passes as, in order (default: see {@link rmTreePinned}). */
   wrappers?: readonly CommandWrapper[];
   /** Dirents one pass may read before it stops (default {@link REMOVE_MAX_ENTRIES}). */
   maxEntries?: number;
-  /** Epoch ms after which no pass starts and a running one is cut short. */
+  /** Epoch ms after which no pass starts and worker waiting stops. Helper budgets are
+   *  cooperative; the worker cannot kill a blocked foreign-uid helper under the split. */
   deadline?: number;
   /** Whether the PRD #51 uid split is active (default: {@link uidSplitActive}). */
   splitActive?: boolean;
@@ -874,10 +895,10 @@ async function identityOf(pinFd: number): Promise<string> {
  *
  * {@link rmHomeTree} walks by path (`fs.rm`), so a same-uid process that swaps an
  * INTERMEDIATE directory for a symlink mid-walk redirects the deletion outside the tree
- * (an audit's racer deleted 82 files outside `agent-home` that way). The boot sweep and a
- * run's own teardown keep using it; the running disk reclaim cannot, because it deletes
- * while other runs' `runner`/`runner-cmd` processes are live on the same volume. So this
- * is {@link PINNED_SUBTREE_SCRIPT}'s walk:
+ * (an audit's racer deleted outside files that way). Both running disk reclaim and
+ * per-run teardown use the pinned walk: reaping one run does not stop sibling runs'
+ * `runner`/`runner-cmd` writers on the same volume. Only startup sweeps retain
+ * path-based removal, before claims begin. This is {@link PINNED_SUBTREE_SCRIPT}'s walk:
  *
  *  1. The worker pins `parent`, then `name` inside it through its descriptor with
  *     `O_PATH | O_DIRECTORY | O_NOFOLLOW`, refusing a symlink, a non-directory, and a

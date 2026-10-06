@@ -285,7 +285,9 @@ describe("rmTreePinned (PRD #1809 M3)", () => {
         swaps = await racer.stop();
       }
       assert.ok(swaps > 0, "the racer swapped at least one directory mid-walk (the race happened)");
-      assert.equal(await countFiles(victim), RACED_FILES, "no victim file outside the tree was deleted");
+      const names = (await fs.readdir(victim)).sort();
+      assert.deepEqual(names, Array.from({ length: RACED_FILES }, (_, i) => `f${i}`).sort(), "every outside name survives");
+      for (const name of names) assert.equal(await fs.readFile(path.join(victim, name), "utf8"), "keep\n");
       // Each swapped symlink is unlinked and each moved dir re-listed, so the tree goes; the
       // only other acceptable outcome is the typed not-removed verdict (a swap landing after
       // the final re-read), never a crash or a refusal of the root.

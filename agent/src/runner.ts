@@ -107,7 +107,7 @@ import {
   type SendTerminalState,
   type TerminalOutboxDeps,
 } from "./terminal-resolve.js";
-import { rmHomeTree } from "./rmtree.js";
+import { rmTeardownTree, type TeardownTestDeps } from "./rmtree.js";
 import { dropRunCaches } from "./run-caches.js";
 import type { RunDiskLocks } from "./run-disk-locks.js";
 import type { CachesDroppedMemo } from "./disk-reclaim.js";
@@ -1838,6 +1838,8 @@ export interface CheckpointTestHooks {
 
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
 export interface RunnerOptions {
+  /** Test-only teardown seams; production uses the pinned walk with one 120 s deadline. */
+  teardownTestDeps?: TeardownTestDeps;
   queueTerminalRejectionReconciliation?: (runId: string, generation: number) => void;
   /** How often the steering channel polls /inputs (default 3s). */
   pollMs?: number;
@@ -2061,6 +2063,7 @@ export class RunRunner {
   /** issue #1597 M2: the mid-turn checkpoint tick cadence (0 disables). */
   private readonly checkpointTickIntervalMs: number;
   /** issue #1597 M2: test-only seams (undefined in production). */
+  private readonly teardownTestDeps: TeardownTestDeps | undefined;
   private readonly checkpointTestHooks: CheckpointTestHooks | undefined;
   private readonly recoveryRetryMs: number;
   /** PRD #1171 m4: bounded absolute deadline (ms) for a Codex durability-sink withBoundary. */
@@ -2244,6 +2247,7 @@ export class RunRunner {
     this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
     this.checkpointTickIntervalMs = opts.checkpointTickIntervalMs ?? 5 * 60_000;
     this.checkpointTestHooks = opts.checkpointTestHooks;
+    this.teardownTestDeps = opts.teardownTestDeps;
     this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
     this.recoveryRetryMs = Math.max(1, Math.min(opts.recoveryRetryMs ?? 1_000, 30_000));
     // PRD #1171 m4: bounded, never unbounded. Clamp a caller-supplied 0/negative to the default.
@@ -3591,15 +3595,11 @@ export class RunRunner {
       // session transcript under it is only needed to resume, and a terminal run
       // never resumes. A concurrent sibling's HOME is a distinct dir, untouched.
       //
-      // rmHomeTree, not fs.rm (PRD #108 M6, #1607): the Go module cache under this HOME
-      // writes its package directories mode 0555, and `force: true` suppresses
-      // ENOENT — not the EACCES that unlinking inside a read-only directory
-      // raises. Every Go-touching run stranded its module cache (167.3 MB
-      // measured for one run). Still best-effort and still swallowing its own
-      // error: this is a `finally`, and a cleanup that threw would convert a
-      // completed run into a failed one, which is strictly worse than a leak.
+      // rmTeardownTree pins every directory and removes read-only agent-owned caches.
+      // Reaping this run does not stop sibling writers swapping intermediate directories.
+      // Refusal warns and retains the tree; cleanup must never change the run's outcome.
       if (runHome && !preserveResumeArtifacts) {
-        await rmHomeTree(runHome).catch((e) =>
+        await rmTeardownTree(runHome, this.teardownTestDeps).catch((e) =>
           runLog.warn("run HOME cleanup failed", { error: errMessage(e) }),
         );
       }

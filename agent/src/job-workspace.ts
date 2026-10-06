@@ -32,7 +32,7 @@ import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 
 import type { Logger } from "./log.js";
-import { rmHomeTree } from "./rmtree.js";
+import { rmHomeTree, rmTeardownTree, type TeardownTestDeps } from "./rmtree.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { errMessage, RUN_ID_RE } from "./util.js";
 
@@ -347,9 +347,9 @@ export async function openJobWorkspace(ws: JobWorkspace, split: boolean = uidSpl
 }
 
 /** Remove a job workspace tree. Best-effort by contract: a cleanup failure is logged and never
- *  fails or reclassifies the run. */
-export async function removeJobWorkspace(ws: JobWorkspace, log: Logger): Promise<void> {
-  await rmHomeTree(ws.root).catch((err) =>
+ *  fails or reclassifies the run. Sibling writers require descriptor-pinned removal. */
+export async function removeJobWorkspace(ws: JobWorkspace, log: Logger, testDeps?: TeardownTestDeps): Promise<void> {
+  await rmTeardownTree(ws.root, testDeps).catch((err) =>
     log.warn("job workspace cleanup failed", { workspace: ws.root, error: errMessage(err) }),
   );
 }
