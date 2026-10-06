@@ -62,6 +62,9 @@ through `[0.52.0]`.)
 - **Run teardown resists directory swaps ([#1831](https://github.com/vtmocanu/uzi/issues/1831)).**
   Teardown of terminal run HOMEs, provision directories, model-pass HOMEs and job workspaces now uses descriptor-pinned deletion with one shared two-minute deadline for worker waiting. Unsafe roots, exhausted budgets and unsupported platforms warn and retain leftovers without changing the run outcome; startup sweeps keep their existing behavior.
 
+- **Codex provider safety-policy refusals have a distinct failure origin ([#2321](https://github.com/vtmocanu/uzi/issues/2321)).**
+  Runs refused for `cyberPolicy` or `misalignmentPolicyViolation` now report `provider_policy_refusal` with a fixed, content-free reason. Run logs retain bounded root/child provenance with role, phase and opaque correlation IDs; the lead may continue after a child refusal. Refusals remain terminal execution failures, included in failure totals and eligible for retrospective judging.
+
 - **Codex advice ignores async question text ([#2239](https://github.com/vtmocanu/uzi/issues/2239)).**
   Items whose delivery is exactly `"async"` no longer contaminate advice prose or structured verdicts. Other delivery values preserve text unchanged and in order; advice surfaces and answers no questions, while the native capability stays available.
 

@@ -124,7 +124,7 @@ export interface HarnessLimitFailure {
 }
 
 export type HarnessErrorCategory =
-  | "aborted" | "timeout" | "authentication" | "authorization"
+  | "aborted" | "timeout" | "authentication" | "authorization" | "policy_refusal"
   | "rate_limit" | "model" | "effort" | "transport" | "tool"
   | "protocol" | "session_missing" | "unknown";
 
@@ -172,6 +172,7 @@ export type HarnessItem =
     };
 
 export interface HarnessTerminal {
+  policyRefusal?: import("./provider-policy-refusal.js").PolicyRefusalPayload;
   outcome: "success" | "failed";
   // Exact uzi display subtype and String-mapped provider error array.
   subtype: string;
@@ -432,6 +433,54 @@ Subscription cost is `kind:"subscription"`, never metered USD 0. API-key cost is
 otherwise it is `unreported`. This represents both required auth modes without
 pretending M0 has solved the currently open SC5 pricing contract. Claude's exact
 reported cost remains in its wire capsule, including failed results.
+
+### Codex provider safety-policy refusals (#2321)
+
+The implemented Codex run lane maps exactly the scalar `codexErrorInfo`
+tags `cyberPolicy` and `misalignmentPolicyViolation` to harness category
+`policy_refusal`. Unknown, malformed and non-policy classifications retain
+their existing mapping. A failed root terminal materializes
+`ProviderPolicyRefusal`; when it determines the run failure, the runner sends
+`fail_origin: provider_policy_refusal`. Its fixed message is
+`Codex provider safety-policy refusal (cyberPolicy)` or
+`Codex provider safety-policy refusal (misalignmentPolicyViolation)`.
+Provider message, details, content and prompt are not reflected in that
+message or metadata. The classification is an observed provider tag,
+not independent provider-policy attestation.
+
+`PolicyRefusalPayload` is a closed, validated worker record:
+`event: provider_policy_refusal`, `provider: codex`,
+`category: policy_refusal`, `policy_tag: cyberPolicy|misalignmentPolicyViolation`,
+`origin: root|child`, `phase: planning|implementation`, and
+`correlation_id`. A child adds its admitted sanitized `role`
+(1–64 characters matching `[a-zA-Z0-9_.-]`) and
+`parent_correlation_id` pointing to the originating root.
+Admission captures are immutable: the worker allocates an opaque nonce/counter
+ID at root turn start and a separate ID at child admission (37–52 characters).
+Provider call/thread/turn IDs and display projection IDs are excluded;
+the existing display projection pairing remains unchanged.
+
+The executor emits a dedicated durable `kind: status` event with that payload,
+independent of display frames. A refused child callback returns
+`child_policy_refused` with the fixed message and `policyRefusal` metadata.
+The root error, result payload and worker diagnostic share the root metadata.
+A child refusal does not force parent failure: parent success remains success,
+an unrelated later failure keeps its own origin, and a later root refusal
+uses root provenance. Observation does not override the winning cancel,
+pause, wall-clock or quiescence outcome.
+
+Refused execution stays terminal, without automatic retry, requeue, park,
+disk deferral or harness switch. Judge eligibility stays the same as
+`agent_failure`; reviewing earlier work is retrospective, not execution retry.
+Failure totals and origin buckets count run rows once, not child observations.
+Refusal-occurrence analysis deduplicates by run ID (child observation plus
+eventual run failure is one run); no public metric or denominator is added.
+
+The API origin allowlist and database migration must ship before workers'
+origin can be accepted. Unobserved or non-durable historical refusals cannot
+be reconstructed. Provenance travels with run-log retrieval and is deleted
+with run history. This addition leaves the recorded extraction and precedence
+rules below intact.
 
 ### Event, reducer and error authority
 

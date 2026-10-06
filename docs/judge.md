@@ -183,13 +183,21 @@ page shows a "judge incomplete" badge next to the verdict.
 When the reviewed run **failed**, the judge is also handed a trusted
 **failure class** — a single closed-vocabulary label for *why* the run failed
 (for example `provisioning_failed`, `credential_unavailable`,
-`guardrail_blocked`, `agent_failure`, `run_timeout`). It is derived from the
-run's own structured state at the moment it failed, never by reading the
+`guardrail_blocked`, `agent_failure`, `provider_policy_refusal`, `run_timeout`).
+It is derived from the run's own structured state at the moment it failed, never by reading the
 free-text failure reason, so the judge weighs a fact rather than a string. The
 practical effect: a network timeout or connection error is **not** treated as
 automatically transient, and a policy- or config-denied failure does not draw a
 "just retry / add backoff" recommendation — that class of block stays until the
 configuration or policy is fixed.
+
+For Codex, `provider_policy_refusal` records exactly `cyberPolicy` or
+`misalignmentPolicyViolation`, not a classification inferred from provider
+prose. The reason is a fixed literal, with no provider message, details,
+content, or prompt reflected. It records the provider's classification,
+not independent proof of a policy violation. See
+[provider safety-policy refusals](./run-activity.md#when-codex-reports-a-provider-safety-policy-refusal)
+for the literals and bounded root/child provenance.
 
 ## Reading a review from the CLI
 
@@ -386,6 +394,12 @@ did nothing, so the judge is skipped. **The failed-run Slack DM still lands** �
 the skip drops only the retrospective, never the "your run failed" alert. (A run
 that started and then crashed early is *not* in this set; it carries agent
 behaviour and is still judged.)
+
+A run with `fail_origin = provider_policy_refusal` has the same eligibility
+as `agent_failure`, including a resumed run. The judge may review substantial
+work completed before the refusal; retrospective review does not retry the
+terminal execution. A child refusal is an observation, not a separate failed
+run or a new reason to skip judging; the parent's outcome still governs.
 
 ## Admins: the All users view
 
