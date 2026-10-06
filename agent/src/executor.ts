@@ -734,12 +734,14 @@ export interface ExecutorResult {
    *  when no mid-run progress was reported. Absent when the lead declared nothing, which
    *  is the common case. StubExecutor never sets it. */
   milestonesCompleted?: string[];
-  /** Issue #293 M2 (gate honesty): component dirs whose JS dependencies did NOT
-   *  install this run, so the gates that need them (e.g. `vitest`, `knip`) could not
-   *  have run. Rendered as an "unverified gates" annotation on the issue-run MR body
+  /** Issue #293 M2 (gate honesty): component dirs with failed or unconfirmed JS
+   *  dependency provisioning this run; this does not prove dependencies are absent
+   *  or whether gates (e.g. `vitest`, `knip`) ran or passed. Rendered as an "unverified
+   *  gates" annotation on the issue-run MR body asking for actual gate evidence
    *  (ANNOTATE posture — never blocks). Dir names are already charset/length-clamped
-   *  via safeDirLabel. ISSUE RUNS ONLY and OMITTED (never `[]`/undefined) when every
-   *  dir installed, which is the common case. StubExecutor never sets it. */
+   *  via safeDirLabel. ISSUE RUNS ONLY and OMITTED (never `[]`/undefined) when no
+   *  qualifying failure remains after excluding deliberate no-lockfile skips
+   *  (!r.ok && r.detail !== DETAIL_NO_LOCKFILE). StubExecutor never sets it. */
   gatesUnverified?: string[];
   /** Issue #293 M2 (review F1): true when dependency DISCOVERY was truncated at its scan
    *  cap, so components past the cap were never examined and cannot appear in
