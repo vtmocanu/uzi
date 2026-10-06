@@ -3492,19 +3492,25 @@ export class RunRunner {
       // journal — retiring a tree a live process still writes would hand the next attempt a
       // half-removed clone. The Docker half never blocks the retire; it is logged.
       let retireBlocked = false;
-      // issue #2213: the root guard for the worker residue quarantine. Whatever path reached this
-      // finally (a settle that latched mid-await, a reap that returned false, a cancel or shutdown
-      // arm that cleared preserveRecoveryClone), a latched worker keeps the clone and its journal:
-      // the recovery settle could not capture them. Read synchronously here and again after the
-      // quiesce await below, right before the retire decision.
-      if (residueQuarantine() !== undefined) flight.preserveRecoveryClone = true;
+      // issue #2213: the root guard for the worker residue quarantine is the read right before the
+      // retire decision below, plus the latch gate on the predecessor release. It is NOT read here:
+      // the own-arm terminal_retire quiesce starts no credentialed child, so a latched worker still
+      // runs it (killAgentTree, HOME-attributed reap, Docker teardown) and only keeps the clone.
       // issue #1783 M2: a CAPTURED predecessor attempt (the C′ flight on a Docker-wired worker) is
       // released IN PLACE — journal cleared (only now that its capture is verified), ledger
       // `abandoned`, NO filesystem operation on its path — and never retired or reused. Its
       // capture already ran behind the predecessor-scoped capture-mode proof.
       let ownAttemptRetired = false;
-      if (flight.predecessorCapture && flight.worktreePath && !flight.preserveRecoveryClone) {
-        if (flight.barePath && flight.branch && flight.predecessorCaptureVerified) {
+      if (flight.predecessorCapture && flight.worktreePath) {
+        // A latched worker keeps the predecessor's journal too (the release clears it): read the
+        // latch synchronously here, alongside preserveRecoveryClone.
+        if (
+          !flight.preserveRecoveryClone &&
+          residueQuarantine() === undefined &&
+          flight.barePath &&
+          flight.branch &&
+          flight.predecessorCaptureVerified
+        ) {
           // The release appends the ledger BEFORE it clears the journal, so every failure it can
           // throw leaves the journal in place; the warning names the step that failed.
           await this.git
@@ -4858,9 +4864,10 @@ export class RunRunner {
             !completedBody.report_only && typeof completedBody.branch === "string" && completedBody.branch !== ""
               ? "publication"
               : undefined;
-          // issue #2213: the completed-run publication release is the one release a latched worker still sends.
+          // issue #2213: the completed run's custody release (the same one the unlatched flow sends at
+          // completion) is the one release a latched worker still sends; the finally keeps the clone.
           await this.recovery.release(claim.run_id, claim.claim_generation, releaseEvidence, {
-            completedPublication: true,
+            completedRun: true,
           });
         } else if (status === "failed" || status === "cancelled") {
           const capBarePath = flight.barePath;

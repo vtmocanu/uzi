@@ -707,7 +707,7 @@ describe("a run that fails quarantined archives its committed work and releases 
     assert.ok(journalOf(iid), "the journal is kept");
   });
 
-  it("a completed run's publication release still goes out while latched; every other release stays gated", TIMEOUT, async () => {
+  it("a completed run's custody release still goes out while latched; every other release stays gated", TIMEOUT, async () => {
     const iid = 22207;
     const releases: unknown[][] = [];
     (client as unknown as Record<string, unknown>).releaseRecoveryCustody = async (...a: unknown[]) => {
@@ -734,7 +734,7 @@ describe("a run that fails quarantined archives its committed work and releases 
     await runnerWith(factory, fakeGitlab().gitlab, undefined, undefined, { checkpointIntervalMs: 0, recoveryRetryMs: 1, recovery }).execute(claim);
     assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"), "the run completed");
     assert.notEqual(residueQuarantine(), undefined, "the worker is latched");
-    assert.equal(releases.length, 1, "the completed publication release went out exactly once");
+    assert.equal(releases.length, 1, "the completed run's custody release went out exactly once");
     // Every other caller stays gated.
     await recovery.release(claim.run_id, 3, "forge_no_output");
     await recovery.release(claim.run_id, 3);
@@ -864,6 +864,72 @@ describe("a run that fails quarantined archives its committed work and releases 
       }
     });
   }
+
+  /** Records every quiesceRun site (calling through), and lets a test stub one site. */
+  function spyQuiesce(runner: RunRunner, stub?: { site: string; fn: () => void }): string[] {
+    const sites: string[] = [];
+    const priv = runner as unknown as { quiesceRun: (f: unknown, e: unknown, o: { mode: string; site: string }) => Promise<unknown> };
+    const real = priv.quiesceRun.bind(runner);
+    priv.quiesceRun = async (f, e, o) => {
+      sites.push(o.site);
+      if (stub && o.site === stub.site) {
+        stub.fn();
+        return { blocked: false, outcome: {} };
+      }
+      return real(f, e, o);
+    };
+    return sites;
+  }
+
+  it("a cancelled run on a latched worker still runs its terminal_retire quiesce and keeps its clone", TIMEOUT, async () => {
+    const iid = 22208;
+    installSpies({ on: true });
+    const claim = gitlabClaim(iid);
+    let runner: RunRunner | undefined;
+    const factory: ExecutorFactory = (runId) => ({
+      homeDir: path.join(homeDir, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          fs.writeFileSync(path.join(ctx.worktreePath, "WORK.txt"), "uncommitted work\n");
+          const f = (runner as unknown as { activeRuns: Map<string, { steering: { cancelled: boolean } }> }).activeRuns.get(runId);
+          f!.steering.cancelled = true;
+          throw new Error("the agent stopped for the cancel");
+        },
+      },
+    });
+    runner = runnerWith(factory, fakeGitlab().gitlab, undefined, undefined, { checkpointIntervalMs: 0, recoveryRetryMs: 1 });
+    const sites = spyQuiesce(runner);
+    // The latch lands as the cancel is reported (after every failure-path snapshot, before the finally).
+    api.onState(claim.run_id, (body) => {
+      if (body.status === "failed") LATCH(claim.run_id, "terminal_drive");
+    });
+    await runner.execute(claim);
+    assert.notEqual(residueQuarantine(), undefined, "the worker is latched");
+    assert.ok(sites.includes("terminal_retire"), `the terminal quiesce ran (sites: ${sites.join(",")})`);
+    assert.equal(fs.existsSync(path.join(worktreeDirFor(iid), "WORK.txt")), true, "the clone is kept");
+  });
+
+  it("a latch landing during the terminal_retire quiesce keeps the clone and its journal", TIMEOUT, async () => {
+    const iid = 22209;
+    installSpies({ on: false });
+    const claim = gitlabClaim(iid);
+    const factory: ExecutorFactory = (runId) => ({
+      homeDir: path.join(homeDir, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          fs.writeFileSync(path.join(ctx.worktreePath, "WORK.txt"), "uncommitted work\n");
+          throw new Error("the agent failed for an unrelated reason");
+        },
+      },
+    });
+    const runner = runnerWith(factory, fakeGitlab().gitlab, undefined, undefined, { checkpointIntervalMs: 0, recoveryRetryMs: 1 });
+    const sites = spyQuiesce(runner, { site: "terminal_retire", fn: () => LATCH(claim.run_id, "terminal_retire") });
+    await runner.execute(claim);
+    assert.ok(sites.includes("terminal_retire"), "the stubbed quiesce ran");
+    assert.notEqual(residueQuarantine(), undefined, "the worker is latched");
+    assert.equal(fs.existsSync(path.join(worktreeDirFor(iid), "WORK.txt")), true, "the clone is kept");
+    assert.ok(journalOf(iid), "the journal is kept");
+  });
 
   it("an archival crash never masks the typed failure, and still releases, deletes and retires nothing", TIMEOUT, async () => {
     const iid = 22192;

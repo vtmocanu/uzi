@@ -1056,20 +1056,22 @@ export class RecoveryCoordinator {
    * terminal protection is present or its callback fails; only an empty-dir rmdir is attempted.
    *
    * issue #2213: a latched worker releases no custody (the hold, record and pin stay), with ONE
-   * exception: `opts.completedPublication`, passed only by the runner's completed-run arm
-   * (driveRecoveryTerminal). A completed run's publication already happened before the report (its
-   * push cannot have run while latched), and the release is an in-process api call, not a
-   * credentialed child; refusing it would leave the server hold open forever and turn into a false
-   * early_pin_only_after_restart needs_action after the restart. Every other caller stays gated.
+   * exception: `opts.completedRun`, passed only by the runner's completed-run arm
+   * (driveRecoveryTerminal) for every completed code-publishing run, including no-code completions
+   * (report_only, not_code, scope-capped-empty) where nothing was published. It is the completed
+   * run's custody release, the same one the unlatched flow sends at completion; it is an in-process
+   * api call, not a credentialed child, and refusing it would leave the server hold open forever
+   * and turn into a false early_pin_only_after_restart needs_action after the restart. The run's
+   * clone is kept by executeClaim's finally while latched. Every other caller stays gated.
    */
   async release(
     runId: string,
     generation?: number,
     releaseEvidence?: string,
-    opts: { completedPublication?: boolean } = {},
+    opts: { completedRun?: boolean } = {},
   ): Promise<void> {
     if (!this.enabled) return;
-    if (residueQuarantine() !== undefined && opts.completedPublication !== true) return;
+    if (residueQuarantine() !== undefined && opts.completedRun !== true) return;
     try {
       const res = await this.client.releaseRecoveryCustody(runId, generation, releaseEvidence);
       this.log.info("recovery: released custody after verified no-unpublished-output", {
