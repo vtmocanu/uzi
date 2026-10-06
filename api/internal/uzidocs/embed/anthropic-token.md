@@ -31,18 +31,23 @@ retrospectives.
 ### Whose credentials
 
 uzi is self-hosted: it runs the official Claude Agent SDK (the Claude Code
-binary) on your own infrastructure, with a credential you minted yourself
-using Anthropic's own tooling. Keep it that way:
+binary) on your own infrastructure, with a credential you minted yourself.
+uzi technically supports both kinds; which one your use is authorized for is
+set by Anthropic's terms, not by uzi.
 
-- **One person, one token.** Store only credentials that are yours. Never
-  share a token with another person or store someone else's; Anthropic's
-  terms forbid sharing account credentials.
-- **Know which terms apply.** A Console API key falls under Anthropic's
-  [Commercial Terms](https://www.anthropic.com/legal/commercial-terms); an
-  OAuth token spends your Claude subscription under its
-  [Consumer Terms](https://www.anthropic.com/legal/consumer-terms). Review
-  them for your situation; a Console API key is the unambiguous choice for
-  an instance shared by a team.
+- **Use only your own credentials.** Never store someone else's token or
+  share yours; Anthropic's terms forbid sharing account credentials.
+- **Subscription (OAuth) tokens.** The
+  [Agent SDK overview](https://code.claude.com/docs/en/agent-sdk/overview)
+  says Anthropic does not allow third-party developers to offer claude.ai
+  login or rate limits for their products, including agents built on the
+  Agent SDK, unless previously approved. uzi has no such approval; the
+  docs do not say whether a self-hosted tool running your own token counts,
+  so decide for your own use. Subscription use falls under the
+  [Consumer Terms](https://www.anthropic.com/legal/consumer-terms).
+- **Console API keys** fall under Anthropic's
+  [Commercial Terms](https://www.anthropic.com/legal/commercial-terms), the
+  authentication the Agent SDK documentation directs third-party products to.
 
 ## 1. Mint a credential
 
