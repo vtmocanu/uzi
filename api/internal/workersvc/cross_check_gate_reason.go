@@ -12,7 +12,7 @@ import (
 
 // validatePlanCrossCheckGateReason validates declarations only; SetRunAwaitingApproval
 // derives the authoritative row outcome in its owned, generation-fenced UPDATE.
-func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store, worker store.Worker, lead store.Run, req StateRequest) error {
+func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store, worker store.Worker, lead store.Run, req StateRequest, fencedGate bool) error {
 	reason := ""
 	if req.PlanCrossCheckGateReason != nil {
 		reason = *req.PlanCrossCheckGateReason
@@ -31,10 +31,14 @@ func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store,
 		return ErrInvalidState
 	}
 	if reason == "candidate_refused" || reason == "checker_failed" {
-		// A lost ACK may replay the bounded declaration on its persisted human gate.
-		// Presentation classification still rejects historical IDs and changed payloads.
+		// SQL may replace the declaration with its authoritative outcome. On the
+		// locked, tracked gate path, let a current-ID replay reach classifyGateReport,
+		// which still checks the approval-bearing payload before any report write.
 		active := lead.AutoApprove && (lead.Status == "claimed" || lead.Status == "running")
-		retained := lead.Status == "awaiting_approval" && !lead.AutoApprove && lead.PlanCrossCheckGateReason.String == reason
+		current := fencedGate && lead.ClaimGeneration > 0 && req.PresentationID != nil &&
+			lead.GatePresentationID.Valid && uuid.UUID(lead.GatePresentationID.Bytes) == *req.PresentationID
+		retained := lead.Status == "awaiting_approval" && !lead.AutoApprove &&
+			(lead.PlanCrossCheckGateReason.String == reason || current)
 		if !lead.PlanCrossCheckRequired || (!active && !retained) || lead.Harness != string(HarnessClaude) ||
 			req.ClaimGeneration == nil || *req.ClaimGeneration != lead.ClaimGeneration ||
 			lead.ClaimReleasedAt.Valid || lead.WorkerID != pgconv.UUID(worker.ID) || lead.UserID != worker.UserID {

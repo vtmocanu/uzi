@@ -4277,7 +4277,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			if req.ClaimGeneration == nil {
 				return owned, false, ErrClaimGenerationRequired
 			}
-			if err := s.validatePlanCrossCheckGateReason(ctx, q, wkr, owned, req); err != nil {
+			if err := s.validatePlanCrossCheckGateReason(ctx, q, wkr, owned, req, gateTracked && fenceTx != nil); err != nil {
 				return owned, false, err
 			}
 		} else if req.PlanCrossCheckGateReason != nil || req.PlanCrossCheckDiffRefusal != "" || req.PlanCrossCheckRefusal != "" {

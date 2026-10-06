@@ -101,8 +101,8 @@ func TestPlanCrossCheckGateReasonPersistedOutcomeLiveDB(t *testing.T) {
 				}
 			}
 			report(tc.want)
-			// A retry of the same human presentation retains its server-derived reason,
-			// even when the worker omits the declaration.
+			// Replay the original declaration before testing an omitted declaration.
+			report(tc.want)
 			req.PlanCrossCheckGateReason = nil
 			req.PlanCrossCheckRefusal, req.PlanCrossCheckDiffRefusal = "", ""
 			report(tc.want)
