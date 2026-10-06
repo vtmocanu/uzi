@@ -2664,6 +2664,7 @@ tasks:
           echo "NOT RUN: agent test dependencies unavailable" >&2
           exit 2
         fi
+        mkdir -p .uzi/scratch
         proof_dir="$(mktemp -d .uzi/scratch/cross-check-proof.XXXXXX)"
         chmod 755 "$proof_dir"
         proof_dir="$(cd "$proof_dir" && pwd)"
