@@ -57,6 +57,27 @@ func TestM2IssueCreateClaimPersistedDowngradeLiveDB(t *testing.T) {
 	if err != nil || conn.IssueIID == nil || *conn.IssueIID != 4 || conn.SavedTitle != "captured title" || conn.SavedBody != "captured body" || conn.RawDigest == nil {
 		t.Fatalf("owned conn=%+v err=%v", conn, err)
 	}
+	// Requeue and reclaim the same persisted run after the forge author is promoted.
+	svc.SetForges(m2Builder{&m2Forge{disposition: forge.AuthorEligible}})
+	env.exec("UPDATE runs SET status='queued',worker_id=NULL,updated_at=now()-interval '3 hours' WHERE id=$1", run.ID)
+	reclaimed, err := env.q.ClaimRun(env.ctx, claimRunParams(wkrRow(t, env, worker)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reclaimed.ID != run.ID || reclaimed.IssueTitle != run.IssueTitle || reclaimed.IssueSavedBody != run.IssueSavedBody || reclaimed.IssueRawDigest != run.IssueRawDigest || strings.Join(reclaimed.AutoApproveBlockedReasons, ",") != "author_not_eligible,permission_unknown" || reclaimed.AutoApprove {
+		t.Fatalf("reclaim changed saved input: %+v", reclaimed)
+	}
+	resumed, err := svc.assembleClaim(env.ctx, wkrRow(t, env, worker), reclaimed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumedRaw, err := json.Marshal(resumed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.IssueDescription != "captured body" || resumed.IssueComments == nil || resumed.IssueComments.Comments[0].Body != issueinput.Placeholder || resumed.IssueComments.Comments[0].Reason != issueinput.NotEligible || strings.Contains(string(resumedRaw), "WITHHELD_RAW_CREATE") || strings.Contains(string(resumedRaw), "UNKNOWN_RAW_CREATE") {
+		t.Fatalf("resumed projection=%s", resumedRaw)
+	}
 	// A legacy thread cannot regain access on a resumed claim.
 	claimed.IssueComments = []byte(`{"comments":[{"author_username":"legacy","body":"LEGACY_RAW"}],"truncated":false}`)
 	legacy, err := svc.assembleClaim(env.ctx, wkrRow(t, env, worker), claimed)

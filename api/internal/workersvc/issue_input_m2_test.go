@@ -18,13 +18,14 @@ type m2Forge struct {
 	forgetest.BaseFake
 	disposition forge.AuthorEligibility
 	comments    []forge.IssueComment
+	commentsErr error
 }
 
 func (f *m2Forge) GetIssue(context.Context, int64, int64) (forge.Issue, error) {
 	return forge.Issue{IID: 4, Title: "captured title", Description: "captured body", AuthorForgeUserID: 2}, nil
 }
 func (f *m2Forge) ListIssueComments(context.Context, int64, int64) ([]forge.IssueComment, error) {
-	return f.comments, nil
+	return f.comments, f.commentsErr
 }
 func (f *m2Forge) RepositoryAuthorEligibility(_ context.Context, _, id int64) (forge.AuthorEligibility, error) {
 	if id == 3 {
@@ -124,5 +125,52 @@ func TestM2ScheduledWithoutCaptureBlocksAutoApproval(t *testing.T) {
 	}
 	if fs.createRunParams.AutoApprove || strings.Join(fs.createRunParams.AutoApproveBlockedReasons, ",") != issueinput.Unknown {
 		t.Fatalf("unassessed schedule: %+v", fs.createRunParams)
+	}
+}
+
+func TestM2ScheduledEligibleAndFailedComments(t *testing.T) {
+	for _, mode := range []string{"eligible", "list_failure", "lookup_failure", "outside_cap", "requested_false"} {
+		t.Run(mode, func(t *testing.T) {
+			f := &m2Forge{disposition: forge.AuthorEligible, comments: []forge.IssueComment{{AuthorForgeUserID: 2, Body: "eligible"}}}
+			want := ""
+			if mode == "list_failure" {
+				f.commentsErr = errors.New("unavailable")
+				want = issueinput.Unknown
+			}
+			if mode == "lookup_failure" {
+				f.comments = append(f.comments, forge.IssueComment{AuthorForgeUserID: 4, Body: "UNKNOWN_RAW"})
+				want = issueinput.Unknown
+			}
+			if mode == "outside_cap" {
+				f.comments = []forge.IssueComment{{AuthorForgeUserID: 3, Body: "WITHHELD_RAW"}, {AuthorForgeUserID: 4, Body: "UNKNOWN_RAW"}}
+				for i := 0; i < 201; i++ {
+					f.comments = append(f.comments, forge.IssueComment{AuthorForgeUserID: 2, Body: "eligible"})
+				}
+				want = "author_not_eligible,permission_unknown"
+			}
+			fs := &fakeStore{repoRow: store.GetRepoForUserRow{BotForgeUserID: 1}, issueByID: store.Issue{Labels: uziLabels()}, createRunResult: store.Run{ID: uuid.New()}}
+			svc := New(fs, newBox(t), testParams())
+			svc.SetForges(m2Builder{f})
+			var err error
+			if mode == "requested_false" {
+				_, err = svc.CreateScheduledRun(context.Background(), uuid.New(), uuid.New(), 4, "d", nil, nil, nil, false, nil, nil, nil)
+			} else {
+				_, err = svc.CreateScheduledAutopilotRun(context.Background(), uuid.New(), uuid.New(), 4, "d", nil, nil, nil, false, nil, nil)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := fs.createRunParams
+			if p.AutoApprove != (want == "" && mode != "requested_false") || strings.Join(p.AutoApproveBlockedReasons, ",") != want {
+				t.Fatalf("policy=%+v", p)
+			}
+			var thread issueinput.Thread
+			if err := json.Unmarshal(p.IssueComments, &thread); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "outside_cap" && (!thread.Truncated || !thread.Withheld || !thread.Unknown || len(thread.Comments) != 200 || thread.Comments[0].Body != "eligible") {
+				t.Fatalf("wire thread=%+v", thread)
+			}
+		})
 	}
 }

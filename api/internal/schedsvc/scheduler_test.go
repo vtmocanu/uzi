@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/schedtmpl"
 	"github.com/vtmocanu/uzi/api/internal/settings"
@@ -337,6 +338,7 @@ type promptCall struct {
 }
 
 type fakeRuns struct {
+	inspectM2 func(context.Context, int64, string)
 	autopilot []autopilotCall
 	runs      []runCall
 	prompts   []promptCall
@@ -427,7 +429,7 @@ func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUI
 	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, nil, nil, nil, false, nil, nil})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error) {
+func (f *fakeRuns) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error) {
 	// The auto-approve scheduled path (PRD #274 Decision 1a): recorded in the same
 	// `autopilot` bucket as CreateAutopilotRun so the existing count assertions still
 	// observe it, but it CAPTURES waitOnLimit (which CreateAutopilotRun drops), the
@@ -436,6 +438,9 @@ func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID
 	// so a test can prove all are threaded through.
 	if err := f.effErr(issueIID); err != nil {
 		return store.Run{}, err
+	}
+	if f.inspectM2 != nil {
+		f.inspectM2(ctx, issueIID, description)
 	}
 	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, credOverride, explicit})
 	return store.Run{ID: uuid.New()}, nil
@@ -665,6 +670,46 @@ func (h *harness) countKind(kind string) int {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+
+func TestM2SchedulerRawCaptureHandoff(t *testing.T) {
+	for _, target := range []string{"pinned", "label", "assigned"} {
+		t.Run(target, func(t *testing.T) {
+			h := newHarness()
+			h.fb.f.issue.Title = "raw title"
+			h.fb.f.issue.Description = "raw body"
+			s := h.issueSchedule()
+			if target != "pinned" {
+				s = h.sweepSchedule(pgtype.Int4{})
+				if target == "assigned" {
+					s.Origin = "default"
+					s.CatalogSlug = pgtype.Text{String: "assigned-sweep", Valid: true}
+				}
+				h.st.repoRow.BotForgeUserID = 1
+				h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 7}}
+			}
+			s.Guidance = pgtype.Text{String: "OWNER GUIDANCE", Valid: true}
+			inspected := false
+			h.runs.inspectM2 = func(ctx context.Context, iid int64, composed string) {
+				inspected = true
+				c := issueinput.FromContext(ctx, 42, iid)
+				if c == nil || c.Issue.Title != "raw title" || c.Issue.Description != "raw body" || c.Digest != issueinput.Digest("raw title", "raw body") {
+					t.Fatalf("capture=%+v", c)
+				}
+				if !strings.HasPrefix(composed, "raw body") || !strings.Contains(composed, "OWNER GUIDANCE") || c.Digest == issueinput.Digest("raw title", composed) {
+					t.Fatalf("raw/composed separation lost: %q", composed)
+				}
+				if issueinput.FromContext(ctx, 43, iid) != nil {
+					t.Fatal("capture escaped project identity")
+				}
+			}
+			h.st.due = []store.RunSchedule{s}
+			h.sched.Boot(context.Background())
+			if !inspected {
+				t.Fatal("scheduled creation never inspected")
+			}
+		})
+	}
+}
 
 func TestTickIssueScheduleFiresAndAdvances(t *testing.T) {
 	h := newHarness()

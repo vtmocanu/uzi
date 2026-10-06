@@ -6348,8 +6348,9 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 
 // CreateRun queues a manually-started run from a board card. The issue must be a
 // cached issue carrying the uzi_label (PRD #764 M1) in a repo the user owns; its
-// title is snapshotted from the cache and its description from the request, so the
-// run is self-contained even if the issue cache is later evicted. A PRD link is no
+// title and body are captured from the forge by createRun, with the raw digest
+// persisted separately from composed guidance. The saved input survives later
+// forge edits and cache eviction. A PRD link is no
 // longer required. The one-non-terminal-run-per-issue index rejects a duplicate
 // active run.
 // PRD #1429 M2: explicit is the manual request's optional harness (D2), nil ⇒ implicit D11;

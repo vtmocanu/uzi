@@ -3,7 +3,6 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -666,19 +665,29 @@ func forgeMockHandlerBot(t *testing.T, botForgeUserID int64, routes map[string]h
 func eligibleIssueRoutes(routes map[string]http.HandlerFunc) map[string]http.HandlerFunc {
 	routes["/api/v4/users/"] = func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimPrefix(r.URL.Path, "/api/v4/users/")
+		numericID, err := strconv.ParseInt(id, 10, 64)
+		if err != nil || numericID <= 0 {
+			http.Error(w, "invalid id", http.StatusBadRequest)
+			return
+		}
 		name := "alice"
 		if id == "20" {
 			name = "bob"
 		}
-		fmt.Fprintf(w, `{"id":%s,"username":%q,"state":"active"}`, id, name)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": numericID, "username": name, "state": "active"})
 	}
 	routes["/api/v4/projects/4242/members/all/"] = func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimPrefix(r.URL.Path, "/api/v4/projects/4242/members/all/")
+		numericID, err := strconv.ParseInt(id, 10, 64)
+		if err != nil || numericID <= 0 {
+			http.Error(w, "invalid id", http.StatusBadRequest)
+			return
+		}
 		name := "alice"
 		if id == "20" {
 			name = "bob"
 		}
-		fmt.Fprintf(w, `{"id":%s,"username":%q,"state":"active","access_level":30}`, id, name)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": numericID, "username": name, "state": "active", "access_level": 30})
 	}
 	return routes
 }
