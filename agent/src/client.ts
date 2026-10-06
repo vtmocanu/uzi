@@ -2933,6 +2933,14 @@ async function readCodexSuccessText(res: Response): Promise<string> {
   }
 }
 
+/** Actual response byte overflow is permanent; transport read failures remain retryable. */
+class ResponseBodyOverflowError extends Error {
+  constructor(maxBytes: number) {
+    super(`response body exceeds ${maxBytes} bytes`);
+    this.name = "ResponseBodyOverflowError";
+  }
+}
+
 /** Most bytes of an error response body toError reads. */
 const ERROR_BODY_MAX_BYTES = 4096;
 
@@ -2951,7 +2959,7 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
       const { done, value } = await reader.read();
       if (done) break;
       if (rejectOverflow && value.byteLength > maxBytes - total) {
-        throw new Error(`response body exceeds ${maxBytes} bytes`);
+        throw new ResponseBodyOverflowError(maxBytes);
       }
       parts.push(value.length > maxBytes - total ? value.subarray(0, maxBytes - total) : value);
       total += parts[parts.length - 1]!.length;
@@ -3172,7 +3180,7 @@ export function isTransientStatus(status: number): boolean {
  *  2xx pr-description response, {@link PrDescriptionMalformedResponse}). */
 export function isTransient(err: unknown): boolean {
   // A malformed 2xx pr-description body: the api answered, so retrying could re-apply a write.
-  if (err instanceof PrDescriptionMalformedResponse) return false;
+  if (err instanceof PrDescriptionMalformedResponse || err instanceof ResponseBodyOverflowError) return false;
   if (err instanceof RequestError) {
     return isTransientStatus(err.status);
   }
