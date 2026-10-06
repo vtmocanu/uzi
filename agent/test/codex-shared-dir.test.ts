@@ -28,6 +28,7 @@ import {
   makeProductionLaunchAdviceRoot,
 } from "../src/codex/codex-executor.js";
 import { WORKER_UID, RUNNER_UID } from "../src/runner-uid.js";
+import { nullLogger } from "./helpers.js";
 import { CodexUnsupportedProfileError } from "../src/codex/launcher.js";
 import type { CodexAdviceLaunchSpec } from "../src/codex/codex-advice-harness.js";
 
@@ -444,7 +445,7 @@ describe("Issue #1492: production paths repair worker-inherited dirs to RUNNER_U
       const homeRoot = path.join(base, "agent-home");
       await makeSetgidParent(homeRoot, WORKER_UID, WORKER_UID);
 
-      const seam = makeProductionLaunchAdviceRoot(homeRoot, "subscription");
+      const seam = makeProductionLaunchAdviceRoot(homeRoot, "subscription", nullLogger());
       // A type-valid spec whose provider.envKey is INTENTIONALLY invalid. This does not rely
       // on UZI_UID_SPLIT being unset: the seam creates + repairs the advice dirs BEFORE
       // launchCodexRoot, and the invalid envKey forces an early launch failure in BOTH modes —
@@ -507,7 +508,7 @@ describe("Issue #1492: production paths repair worker-inherited dirs to RUNNER_U
         assert.equal(st.gid, WORKER_UID, `${name} starts group-owned worker (pre-rc.2 shape)`);
       }
 
-      const seam = makeProductionLaunchAdviceRoot(homeRoot, "subscription");
+      const seam = makeProductionLaunchAdviceRoot(homeRoot, "subscription", nullLogger());
       // Same invalid-envKey spec as the advice repair test: the seam creates/recovers the advice
       // parents BEFORE launchCodexRoot, and the invalid envKey forces an early launch failure in
       // BOTH modes (single-uid CodexUnsupportedProfileError, split fails the envKey allowlist).

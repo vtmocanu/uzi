@@ -3585,8 +3585,7 @@ export class RunRunner {
       // sweep deletes both.
       const removeSkills = !terminalDisposeUnproven && (flight.predecessorCapture ? false : ownAttemptRetired || !preserveResumeArtifacts);
       if (flight.worktreePath && removeSkills) {
-        await fs
-          .rm(skillsPluginDir(flight.worktreePath), { recursive: true, force: true })
+        await rmTeardownTree(skillsPluginDir(flight.worktreePath), this.teardownTestDeps)
           .catch((e) =>
             runLog.warn("skills plugin cleanup failed", {
               error: errMessage(e),

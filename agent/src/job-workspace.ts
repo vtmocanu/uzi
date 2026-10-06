@@ -176,8 +176,15 @@ export async function createJobWorkspace(
   await fs.mkdir(jobsRoot, { recursive: true, mode: 0o700 });
   const m = modes(split);
   const root = path.join(jobsRoot, runId);
-  await fs.rm(root, { recursive: true, force: true }).catch(() => undefined);
-  await fs.mkdir(root, { mode: m.root });
+  try {
+    await fs.mkdir(root, { mode: m.root });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    // Only a leftover needs removal. Refusal retains it and aborts creation;
+    // the exclusive mkdir also refuses a replacement planted after removal.
+    await rmTeardownTree(root);
+    await fs.mkdir(root, { mode: m.root });
+  }
   const home = path.join(root, "home");
   const work = path.join(root, "work");
   const inputsDir = path.join(work, "inputs");

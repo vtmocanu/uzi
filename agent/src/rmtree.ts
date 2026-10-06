@@ -842,6 +842,7 @@ const SELF_FD = "/proc/self/fd/";
 /** One path component: no separator, not `.`/`..`, not dash-leading (it becomes a bare
  *  `node -e` argument). Run ids and `mkdtemp` names (`uzi-judge-XXXXXX`) all fit. */
 const TREE_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
+const SKILLS_PLUGIN_TREE_NAME_RE = /^\.uzi-skills-[A-Za-z0-9_][A-Za-z0-9._-]*$/;
 
 /** The worker itself as a helper's uid: the command unchanged. */
 const asWorker: CommandWrapper = (command, args) => ({ command, args: [...args] });
@@ -861,13 +862,18 @@ export interface TeardownTestDeps {
  */
 export async function rmTeardownTree(target: string, testDeps: TeardownTestDeps = {}): Promise<void> {
   if (!path.isAbsolute(target)) throw new Error(`rmTeardownTree: refusing non-absolute path ${target}`);
-  await (testDeps.removeTreePinned ?? rmTreePinned)(path.dirname(target), path.basename(target), {
+  const name = path.basename(target);
+  await (testDeps.removeTreePinned ?? rmTreePinned)(path.dirname(target), name, {
     deadline: (testDeps.now ?? Date.now)() + 120_000,
+    ...(SKILLS_PLUGIN_TREE_NAME_RE.test(name) ? { allowSkillsPluginName: true } : {}),
   });
 }
 
 /** Test seams and the caller's deadline for {@link rmTreePinned}. */
 export interface PinnedTreeRemovalOptions {
+  /** Internal teardown opt-in for the fixed .uzi-skills- prefix only.
+   * Disk reclaim keeps its ordinary-name contract unless explicitly opted in. */
+  allowSkillsPluginName?: boolean;
   /** The uids to run the emptying passes as, in order (default: see {@link rmTreePinned}). */
   wrappers?: readonly CommandWrapper[];
   /** Dirents one pass may read before it stops (default {@link REMOVE_MAX_ENTRIES}). */
@@ -922,7 +928,10 @@ export async function rmTreePinned(
   opts: PinnedTreeRemovalOptions = {},
 ): Promise<"removed" | "absent"> {
   if (!path.isAbsolute(parent)) throw new Error(`rmTreePinned: refusing non-absolute parent ${parent}`);
-  if (!TREE_NAME_RE.test(name)) throw new Error(`rmTreePinned: refusing ${JSON.stringify(name)}, not one path component`);
+  const skillsPluginName = opts.allowSkillsPluginName === true && SKILLS_PLUGIN_TREE_NAME_RE.test(name);
+  if (!TREE_NAME_RE.test(name) && !skillsPluginName) {
+    throw new Error(`rmTreePinned: refusing ${JSON.stringify(name)}, not one path component`);
+  }
   if (process.platform !== "linux") throw new Error("rmTreePinned: refusing, no descriptor-pinned walk here");
   const split = opts.splitActive ?? uidSplitActive();
   const target = path.join(parent, name);

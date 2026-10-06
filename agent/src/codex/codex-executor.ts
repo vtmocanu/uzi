@@ -83,6 +83,7 @@ import { makeMemoryToolHandlers, memoryToolNames, type MemoryToolHandlers } from
 import { makeFindingsToolHandlers, reportIncidentalIssueToolName, type FindingsToolHandlers } from "../findings-tools.js";
 import { FORGE_SERVER_NAME, makeForgeToolHandlers, type ForgeToolHandlers } from "../forge-tools.js";
 import { provisionRunTools, removeProvisionDir } from "../provision-run.js";
+import { rmTeardownTree } from "../rmtree.js";
 import { asText } from "../tool-evidence.js";
 import {
   evidencesModelProcessing,
@@ -1062,7 +1063,7 @@ function buildAdviceAuthConfig(
  * pre-existing worker:worker parent left by pre-rc.2 code is renamed OUT and recreated fresh
  * as worker:runner (never adopted), so a rolled worker starts clean instead of throwing.
  */
-export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: CodexAppServerAuthMode): LaunchAdviceRootSeam {
+export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: CodexAppServerAuthMode, log: Logger): LaunchAdviceRootSeam {
   return async (spec) => {
     const id = randomUUID();
     const dataParent = path.join(homeRoot, "codex-advice-data");
@@ -1119,7 +1120,9 @@ export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: Codex
           // Best-effort cleanup of the per-call trees; a failed rm never fails the advice call
           // (mirrors model-pass.ts's ephemeral-HOME cleanup posture for the Claude lane).
           await fs.rm(ownedDataRoot, { recursive: true, force: true }).catch(() => undefined);
-          await fs.rm(cwd, { recursive: true, force: true }).catch(() => undefined);
+          await rmTeardownTree(cwd).catch((error) =>
+            log.warn("Codex advice cwd cleanup failed", { error: errMessage(error) }),
+          );
         }
       },
     };
@@ -1158,7 +1161,7 @@ export function makeProductionCodexAdviceHarnessFactory(
 ): CodexAdviceHarnessFactory {
   return async ({ runId, binding, signal }: CodexAdviceHarnessBuildParams): Promise<CodexAdviceHarness> => {
     const bridge = new CodexAdviceCredentialBridge(runId, client, binding);
-    const launchRoot = makeProductionLaunchAdviceRoot(homeRoot, binding.authMode);
+    const launchRoot = makeProductionLaunchAdviceRoot(homeRoot, binding.authMode, log);
     return makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal);
   };
 }
@@ -3082,7 +3085,12 @@ export class CodexExecutor implements Executor {
           return providerLaunchRoot(spec, binding.authMode);
         }
         const sessionSeedHome = `${ownedDataRoot}.session-seed`;
-        await fs.rm(sessionSeedHome, { recursive: true, force: true }).catch(() => undefined);
+        try {
+          await rmTeardownTree(sessionSeedHome);
+        } catch (error) {
+          this.log.warn("Codex session seed cleanup refused", { error: errMessage(error) });
+          throw new TrustedExecutionRefusal("Codex session seed cleanup refused");
+        }
         const adopted = await this.sessionStore.adopt(
           storeDir,
           sessionSeedHome,
@@ -3094,7 +3102,9 @@ export class CodexExecutor implements Executor {
             binding.authMode,
           );
         } finally {
-          await fs.rm(sessionSeedHome, { recursive: true, force: true }).catch(() => undefined);
+          await rmTeardownTree(sessionSeedHome).catch((error) =>
+            this.log.warn("Codex session seed cleanup failed", { error: errMessage(error) }),
+          );
         }
       };
 

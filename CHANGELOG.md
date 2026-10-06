@@ -69,6 +69,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Additional worker-owned cleanup resists directory swaps ([#2324](https://github.com/vtmocanu/uzi/issues/2324)).**
+  Leftover job replacement, terminal skills-plugin cleanup, Codex advice working directories and session staging use descriptor-pinned removal. Refused leftovers are never reused for a job or adopted as session state; disposable cleanup warns and retains refused trees.
+
 - **Run teardown resists directory swaps ([#1831](https://github.com/vtmocanu/uzi/issues/1831)).**
   Teardown of terminal run HOMEs, provision directories, model-pass HOMEs and job workspaces now uses descriptor-pinned deletion with one shared two-minute deadline for worker waiting. Unsafe roots, exhausted budgets and unsupported platforms warn and retain leftovers without changing the run outcome; startup sweeps keep their existing behavior.
 
