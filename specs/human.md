@@ -982,7 +982,7 @@ Tracked as GitHub issue vtmocanu/uzi#1593.
 - The existing `awaiting_input` answer deadline (`QUESTION_TIMEOUT_SECONDS`) applies unchanged, and an unanswered attended run timing out is the intended outcome here, not a special case. [user, #1593]
 - An auto-approved (autopilot) run, or any run with no one to ask, never parks: after the nudge it fails closed with the distinct fail_origin `plan_missing` and a fixed `failure_reason`. [user, #1593]
 - Nothing is ever inferred from the lead's prose — it never becomes a plan, a question, or part of a later prompt. [user, #1593]
-- Explicit draft captures are advisory activity only, never submission, approval, prompt recovery or automatic adoption; retries require fresh review. [user, #2323]
+- (AI-synced 2026-10-06) Explicit draft captures are advisory activity only, never submission, approval, prompt recovery or automatic adoption; retries require fresh review. [user, #2323]
 
 ## Feature #1598 — Codex command storage no longer accumulates in the writable layer
 

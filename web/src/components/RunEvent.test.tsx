@@ -49,10 +49,14 @@ describe("draft capture status card", () => {
     expect(r.getByText("Draft capture truncated at 32 KiB after redaction.")).toBeTruthy();
     expect(card.textContent).toContain("<script>alert(1)</script>");
     expect(card.querySelector("script, img, [onerror]")).toBeNull();
-    expect(card.textContent).not.toMatch(/[\u202e\u0007]/);
+    expect(card.textContent).not.toContain("\u202e");
+    expect(card.textContent).not.toContain("\u0007");
     for (const el of Array.from(card.querySelectorAll("*"))) {
       for (const attr of ["href", "src", "title", "aria-label", "style"]) {
-        expect(el.getAttribute(attr) ?? "").not.toMatch(/javascript:|alert\(1\)|[\u202e\u0007]/);
+        const value = el.getAttribute(attr) ?? "";
+        expect(value).not.toMatch(/javascript:|alert\(1\)/);
+        expect(value).not.toContain("\u202e");
+        expect(value).not.toContain("\u0007");
       }
     }
   });
