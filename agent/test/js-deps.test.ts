@@ -1,6 +1,8 @@
-import { after, describe, it } from "node:test";
+import { after, describe, it, mock } from "node:test";
+import { execFileSync } from "node:child_process";
+import fsp, { type FileHandle } from "node:fs/promises";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, constants as fsConstants, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -610,6 +612,211 @@ describe("discoverJsProjects over uzi's own repo (the self-improve check phase d
       assert.equal(p.manager, "npm", `${dir}/ must resolve to npm — its lockfile is package-lock.json`);
     }
   });
+});
+
+
+describe("discoverJsProjects: bounded manifest descriptors and cooperative cancellation", () => {
+  const cap = 1024 * 1024;
+  const metadata = '{"workspaces":["members/*"],"dependencies":{"fixture":"1"}}';
+  const cancelled = {
+    results: [{ dir: ".", manager: "none", ok: false, detail: "discovery failed: discovery cancelled" }],
+    truncated: false,
+  };
+
+  // Wrap real descriptors through the public filesystem seam, never a private export.
+  function instrument(opts: {
+    shortReads?: boolean;
+    afterStat?: () => void;
+    afterRead?: () => void;
+    afterClose?: () => void;
+    closeError?: boolean;
+  } = {}) {
+    const realOpen = fsp.open.bind(fsp);
+    const reads: { requested: number; returned: number; offset: number; capacity: number }[] = [];
+    const opened: string[] = [];
+    let closed = 0;
+    const patched = mock.method(fsp, "open", async (p: string, flags: number) => {
+      opened.push(p);
+      assert.equal(flags, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+      const real = await realOpen(p, flags);
+      return {
+        stat: async () => {
+          const stat = await real.stat();
+          opts.afterStat?.();
+          return stat;
+        },
+        read: async (buffer: Buffer, offset: number, length: number, position: null) => {
+          const result = await real.read(buffer, offset, opts.shortReads ? Math.min(length, 8191) : length, position);
+          reads.push({ requested: length, returned: result.bytesRead, offset, capacity: buffer.length });
+          opts.afterRead?.();
+          return result;
+        },
+        close: async () => {
+          await real.close();
+          closed++;
+          opts.afterClose?.();
+          if (opts.closeError) throw new Error("synthetic close failure");
+        },
+      } as unknown as FileHandle;
+    });
+    return { patched, reads, opened, get closed() { return closed; } };
+  }
+
+  function assertBudget(reads: { requested: number; returned: number; offset: number; capacity: number }[]) {
+    assert.ok(reads.length > 0, "descriptor reads must be intercepted");
+    let returned = 0;
+    for (const read of reads) {
+      assert.ok(read.capacity <= cap + 1, "total buffer allocation is bounded");
+      assert.equal(read.offset, returned, "advance by actual bytes, including short reads");
+      assert.ok(read.requested > 0 && read.requested <= cap + 1 - returned, "request fits remaining byte budget");
+      assert.ok(read.returned <= read.requested);
+      returned += read.returned;
+    }
+    assert.ok(returned <= cap + 1, "actual returned total is bounded");
+    return returned;
+  }
+
+  for (const shortReads of [false, true]) {
+    it(`accepts exactly 1 MiB through ${shortReads ? "short" : "full"} descriptor reads`, async () => {
+      const root = mkClone({ "package.json": metadata.padEnd(cap), "package-lock.json": "",
+        "members/a/package.json": PKG, "members/a/package-lock.json": "" });
+      const observed = instrument({ shortReads });
+      try {
+        const scan = await discoverJsProjects(root);
+        assert.equal(observed.patched.mock.callCount(), 1);
+        assert.equal(observed.closed, 1);
+        assert.equal(assertBudget(observed.reads), cap);
+        if (!shortReads) assert.equal(observed.reads.reduce((n, r) => n + r.requested, 0), cap + 1);
+        assert.deepEqual(scan, { projects: [{ dir: ".", manager: "npm", lockfile: "package-lock.json",
+          workspaceRoot: true, declaresDependencies: true }], truncated: false });
+      } finally {
+        observed.patched.mock.restore();
+      }
+    });
+  }
+
+  it("rejects a known cap+1 size before any read, preserves the project and does not prune", async () => {
+    const root = mkClone({ "package.json": metadata.padEnd(cap + 1), "package-lock.json": "",
+      "members/a/package.json": PKG_WITH_DEPS, "members/a/package-lock.json": "" });
+    const observed = instrument();
+    try {
+      const { projects } = await discoverJsProjects(root);
+      assert.equal(observed.patched.mock.callCount(), 2);
+      assert.equal(observed.closed, 2);
+      assert.deepEqual(projects.map((p) => [p.dir, p.workspaceRoot, p.declaresDependencies]),
+        [[".", false, false], ["members/a", false, true]]);
+      assert.equal(observed.reads.reduce((n, r) => n + r.returned, 0), Buffer.byteLength(PKG_WITH_DEPS),
+        "only the member manifest was read");
+    } finally {
+      observed.patched.mock.restore();
+    }
+  });
+
+  for (const shortReads of [false, true]) {
+    it(`rejects growth after fstat with ${shortReads ? "short" : "full"} reads at cap+1 actual bytes`, async () => {
+      const root = mkClone({ "package.json": metadata, "package-lock.json": "" });
+      const observed = instrument({ shortReads, afterStat: () => {
+        // Still valid JSON if decoded: rejection must be the byte bound, not JSON syntax.
+        writeFileSync(join(root, "package.json"), metadata.padEnd(cap * 3));
+      } });
+      try {
+        const { projects } = await discoverJsProjects(root);
+        assert.equal(observed.patched.mock.callCount(), 1);
+        assert.equal(observed.closed, 1);
+        assert.equal(assertBudget(observed.reads), cap + 1);
+        if (!shortReads) assert.equal(observed.reads.reduce((n, r) => n + r.requested, 0), cap + 1);
+        assert.equal(projects[0]!.workspaceRoot, false);
+        assert.equal(projects[0]!.declaresDependencies, false);
+        const { results } = await installJsDeps(root, {}, { exec: recorder().exec });
+        assert.equal(results[0]!.ok, true, "metadata unknown preserves existing success corroboration");
+      } finally {
+        observed.patched.mock.restore();
+      }
+    });
+  }
+
+  it("pre-aborted discovery does zero opens, reads, or installs and returns an honest fixed failure", async () => {
+    const root = mkClone({ "package.json": PKG, "package-lock.json": "" });
+    const ac = new AbortController();
+    ac.abort(new Error("private caller reason"));
+    const observed = instrument();
+    const { exec, calls } = recorder();
+    try {
+      assert.deepEqual(await installJsDeps(root, {}, { signal: ac.signal, exec }), cancelled);
+      await assert.rejects(discoverJsProjects(root, { signal: ac.signal }), /^Error: discovery cancelled$/);
+      assert.equal(observed.patched.mock.callCount(), 0);
+      assert.equal(observed.reads.length, 0);
+      assert.equal(calls.length, 0);
+    } finally {
+      observed.patched.mock.restore();
+    }
+  });
+
+  for (const phase of ["stat", "read", "close"] as const) {
+    it(`cancellation after ${phase} closes the descriptor and never reaches later directories`, async () => {
+      const root = mkClone({ "a/package.json": PKG, "a/package-lock.json": "",
+        "b/package.json": PKG, "b/package-lock.json": "" });
+      const ac = new AbortController();
+      const abort = () => ac.abort("private caller reason");
+      const observed = instrument({
+        afterStat: phase === "stat" ? abort : undefined,
+        afterRead: phase === "read" ? abort : undefined,
+        afterClose: phase === "close" ? abort : undefined,
+        closeError: true,
+      });
+      const { exec, calls } = recorder();
+      try {
+        assert.deepEqual(await installJsDeps(root, {}, { signal: ac.signal, exec }), cancelled);
+        assert.equal(observed.patched.mock.callCount(), 1, "no later directory manifest opened");
+        assert.deepEqual(observed.opened, [join(root, "a/package.json")]);
+        assert.equal(observed.closed, 1, "close errors cannot mask cancellation");
+        assert.equal(observed.reads.length, phase === "stat" ? 0 : phase === "read" ? 1 : 2);
+        assert.equal(calls.length, 0);
+      } finally {
+        observed.patched.mock.restore();
+      }
+    });
+  }
+
+  for (const fail of [false, true]) {
+    it(`checks cancellation after ${fail ? "failed" : "successful"} readdir even for an empty root`, async () => {
+      const root = mkClone({});
+      const ac = new AbortController();
+      const realReaddir = fsp.readdir.bind(fsp);
+      const patched = mock.method(fsp, "readdir", async (...args: Parameters<typeof fsp.readdir>) => {
+        ac.abort("private reason");
+        if (fail) throw new Error("synthetic directory failure");
+        return realReaddir(...args);
+      });
+      try {
+        assert.deepEqual(await installJsDeps(root, {}, { signal: ac.signal, exec: recorder().exec }), cancelled);
+        assert.equal(patched.mock.callCount(), 1, "readdir interception must happen");
+      } finally {
+        patched.mock.restore();
+      }
+    });
+  }
+
+  for (const kind of ["symlink", "fifo"] as const) {
+    it(`rejects a ${kind} manifest without reading or waiting for a writer`, { timeout: 3000 }, async () => {
+      const root = mkClone({ "package-lock.json": "", "target.json": metadata });
+      const manifest = join(root, "package.json");
+      if (kind === "symlink") symlinkSync(join(root, "target.json"), manifest);
+      else execFileSync("mkfifo", [manifest]);
+      const observed = instrument();
+      try {
+        const { projects, truncated } = await discoverJsProjects(root);
+        assert.equal(observed.patched.mock.callCount(), 1);
+        assert.equal(observed.reads.length, 0);
+        assert.equal(observed.closed, kind === "fifo" ? 1 : 0);
+        assert.equal(truncated, false);
+        assert.deepEqual(projects, [{ dir: ".", manager: "npm", lockfile: "package-lock.json",
+          workspaceRoot: false, declaresDependencies: false }]);
+      } finally {
+        observed.patched.mock.restore();
+      }
+    });
+  }
 });
 
 describe("installJsDeps: the sandbox is UNCHANGED (runner uid + the caller's scrubbed env)", () => {
