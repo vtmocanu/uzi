@@ -124,6 +124,7 @@ export interface CodexThreadTokenUsage {
 }
 
 export type CodexNotification =
+  | { readonly kind: "rate_limits_updated"; readonly method: string; readonly rateLimits: unknown; readonly params: unknown }
   | { readonly kind: "thread_started"; readonly method: string; readonly threadId: string; readonly params: unknown }
   | {
       readonly kind: "turn_started";
@@ -636,7 +637,9 @@ class CodexTransportImpl implements CodexTransport {
   private decodeNotification(method: string, params: unknown, requestId: number | string | undefined): CodexNotification {
     // Server-initiated requests (method + id) and unknown methods are liveness only.
     if (requestId === undefined) {
-      if (method === "thread/started") {
+      if (method === "account/rateLimits/updated") {
+        return { kind: "rate_limits_updated", method, rateLimits: readObjectProp(params, "rateLimits"), params };
+      } else if (method === "thread/started") {
         const threadId = readStringProp((params as Record<string, unknown> | undefined)?.thread, "id");
         if (threadId !== undefined) return { kind: "thread_started", method, threadId, params };
       } else if (method === "turn/started") {

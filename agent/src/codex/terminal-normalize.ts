@@ -30,7 +30,7 @@ export interface CodexErrorClassification {
  * retry from the structured category, never from message text. The message is unchanged.
  */
 export class CodexTurnFailedError extends Error {
-  constructor(message: string, readonly classification?: CodexErrorClassification) {
+  constructor(message: string, readonly classification?: CodexErrorClassification, readonly failOrigin?: "rate_limited") {
     super(message);
     this.name = "CodexTurnFailedError";
   }

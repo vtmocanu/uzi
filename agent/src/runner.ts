@@ -60,6 +60,7 @@ import {
   type TickSpawnerTestHooks,
 } from "./tick-spawner.js";
 import { skillsPluginDir } from "./skills-plugin.js";
+import { CodexTurnFailedError } from "./codex/terminal-normalize.js";
 import { describeLimit, LimitReachedError } from "./limit.js";
 import type { Logger } from "./log.js";
 import type {
@@ -3993,7 +3994,7 @@ export class RunRunner {
     const failOrigin =
       err instanceof ProviderPolicyRefusal
         ? "provider_policy_refusal"
-        : err instanceof TerminalReportError
+        : err instanceof TerminalReportError || (err instanceof CodexTurnFailedError && err.failOrigin !== undefined)
         ? err.failOrigin
         : failOriginForReason(rawReason);
     runLog.error("run failed", {

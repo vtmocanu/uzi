@@ -64,6 +64,7 @@ import type { Readable, Writable } from "node:stream";
 import type { Logger } from "../log.js";
 import { codexDeferralReason, codexRefreshFailure, isTransientStatus, type WorkerClient } from "../client.js";
 import { TransientRecoveryError } from "../sdk-executor.js";
+import { classifyLimitEvidence, LimitReachedError } from "../limit.js";
 import { CodexTurnFailedError, formatCodexClassification, isCodexTransientClassification } from "./terminal-normalize.js";
 import type { DockerWiring } from "../docker-wiring.js";
 import { PlanRejectedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
@@ -3584,7 +3585,7 @@ export class CodexExecutor implements Executor {
       // (c) a failed terminal is classified ONCE and materialized+thrown here.
       if (sawTerminal && terminal && terminal.outcome === "failed") {
         const thrown = terminal.failure
-          ? terminal.failure.materialize(undefined)
+          ? terminal.failure.materialize(classifyLimitEvidence(terminal.limitEvidence ?? { explicitExhaustion: false }, Date.now()))
           : { original: new Error("codex run failed: unknown") };
         throw thrown.original;
       }
@@ -3753,6 +3754,11 @@ export class CodexExecutor implements Executor {
           if (lockedMsg !== REASON_PAUSE && lockedMsg !== REASON_WALL && lockedMsg !== REASON_IDLE) {
             throw new CodexCredentialDeferredError();
           }
+        }
+        if (caught instanceof LimitReachedError) {
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+          const reason = this.pendingInterruption(ctx, pauseNow, wall);
+          if (reason !== undefined) err = new CodexTurnTripError(reason, pauseNow.capture());
         }
         // Issue #2099: a transient PROVIDER failure (closed classification, never message text) is
         // retried in the same thread, a bounded number of times, then escalates as
