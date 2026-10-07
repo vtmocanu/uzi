@@ -6,14 +6,138 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
+
+// crossCheckPinOrderTracer synchronizes only the first UPSERT on each connection.
+// Waiting after it would block the sorted transactions on the same first row.
+// The request deadline bounds the barrier and DB work; neither save is retried.
+type crossCheckPinOrderTracer struct {
+	mu     sync.Mutex
+	orders map[*pgx.Conn][]string
+	ready  chan struct{}
+}
+
+func (tr *crossCheckPinOrderTracer) TraceQueryStart(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if !strings.HasPrefix(data.SQL, "-- name: PatchUserCrossCheckPin :exec\n") {
+		return ctx
+	}
+	tr.mu.Lock()
+	first := len(tr.orders[conn]) == 0
+	tr.orders[conn] = append(tr.orders[conn], data.Args[1].(string)+"/"+data.Args[2].(string))
+	if first && len(tr.orders) == 2 {
+		close(tr.ready)
+	}
+	tr.mu.Unlock()
+	if first {
+		select {
+		case <-tr.ready:
+		case <-ctx.Done():
+		}
+	}
+	return ctx
+}
+
+func (*crossCheckPinOrderTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {
+}
+
+func TestCrossCheckPinOppositeOrderSavesLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via ./e2e/run-store-it.sh")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatal(err)
+	}
+	for _, existing := range []bool{false, true} {
+		name := "new cells"
+		if existing {
+			name = "existing cells"
+		}
+		t.Run(name, func(t *testing.T) {
+			tracer := &crossCheckPinOrderTracer{orders: make(map[*pgx.Conn][]string), ready: make(chan struct{})}
+			config, err := pgxpool.ParseConfig(dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			config.MaxConns = 2
+			config.ConnConfig.Tracer = tracer
+			pool, err := pgxpool.NewWithConfig(ctx, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pool.Close()
+			q := store.New(pool)
+			h := &Handler{pool: pool, q: q, wsvc: workersvc.New(q, nil, workersvc.Params{})}
+			user := mkSecretUser(t, pool)
+			if existing {
+				_, err = pool.Exec(ctx, `INSERT INTO user_cross_check_pins (user_id,stage,harness,model,effort)
+					VALUES ($1,'plan','claude','sonnet','low'),($1,'plan','codex','gpt-6-sol','low')`, user)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			var wg sync.WaitGroup
+			results := make(chan *httptest.ResponseRecorder, 2)
+			for _, body := range []string{
+				`{"cross_check_pins":[{"stage":"plan","harness":"claude","model":"haiku"},{"stage":"plan","harness":"codex","model":null}]}`,
+				`{"cross_check_pins":[{"stage":"plan","harness":"codex","effort":"xhigh"},{"stage":"plan","harness":"claude","effort":"high"}]}`,
+			} {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					req := userReq(http.MethodPut, "/api/me/settings", body, user, nil)
+					reqCtx, stop := context.WithTimeout(req.Context(), 10*time.Second)
+					defer stop()
+					rec := httptest.NewRecorder()
+					h.PutMySettings(rec, req.WithContext(reqCtx))
+					results <- rec
+				}()
+			}
+			wg.Wait()
+			close(results)
+			// Assert the actual SQL sequence even if an unsorted mutation happens
+			// to avoid a deadlock through scheduling.
+			tracer.mu.Lock()
+			if len(tracer.orders) != 2 {
+				t.Errorf("UPSERT connections: got %d, want 2", len(tracer.orders))
+			}
+			for conn, order := range tracer.orders {
+				if !slices.Equal(order, []string{"plan/claude", "plan/codex"}) {
+					t.Errorf("connection %p UPSERT order: got %v, want [plan/claude plan/codex]", conn, order)
+				}
+			}
+			tracer.mu.Unlock()
+			for rec := range results {
+				if rec.Code != http.StatusOK {
+					t.Errorf("concurrent save: %d %s", rec.Code, rec.Body.String())
+				}
+			}
+			pins, err := q.ListUserCrossCheckPins(ctx, user)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(pins) != 2 || pins[0].Model.String != "haiku" || !pins[0].Model.Valid ||
+				pins[0].Effort.String != "high" || !pins[0].Effort.Valid ||
+				pins[1].Model.Valid || pins[1].Effort.String != "xhigh" || !pins[1].Effort.Valid {
+				t.Fatalf("concurrent saves lost omitted fields or explicit null: %+v", pins)
+			}
+		})
+	}
+}
 
 func TestCrossCheckPinSettingsLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")

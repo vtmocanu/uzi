@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -95,6 +96,13 @@ func (h *Handler) saveCrossCheckPins(ctx context.Context, patches []store.PatchU
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := store.New(tx)
+	// Acquire cell locks in the same order for every saveCrossCheckPins request.
+	sort.Slice(patches, func(i, j int) bool {
+		if patches[i].Stage != patches[j].Stage {
+			return patches[i].Stage < patches[j].Stage
+		}
+		return patches[i].Harness < patches[j].Harness
+	})
 	for _, patch := range patches {
 		if err := q.PatchUserCrossCheckPin(ctx, patch); err != nil {
 			return err

@@ -338,6 +338,101 @@ func TestCrossCheckPinsPlacementMirrorsLiveDB(t *testing.T) {
 	}
 }
 
+func TestCrossCheckPinsCapabilityTimeoutLiveDB(t *testing.T) {
+	f := newCrossCheckContentionFixture(t)
+	e := checkerPlacementEnv(t, f)
+	caps := checkerPinCaps(true, false)
+	setCheckerPin(f, "codex", customCodexModel, "xhigh")
+	f.env.exec(`UPDATE users SET default_codex_model=$2,default_codex_effort='high' WHERE id=$1`,
+		f.userID, curatedCodexModel)
+	f.env.exec(`UPDATE workers SET protocol_capabilities=$2,last_heartbeat_at=now(),max_concurrent_runs=1 WHERE id=$1`,
+		f.workerID, caps)
+	before := mustRun(t, f.env, f.runID)
+	pending, err := f.env.q.GetPlanCrossCheck(f.env.ctx, f.lead)
+	if err != nil || pending.Verdict != "pending" {
+		t.Fatalf("queued checker setup: verdict=%s err=%v", pending.Verdict, err)
+	}
+	if _, err := e.q.ClaimRun(e.ctx, e.claimParams(f.workerID, caps, false)); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("custom pin admitted worker without custom-model capability: err=%v", err)
+	}
+	child := mustRun(t, f.env, f.runID)
+	if child.Status != "queued" || child.WorkerID.Valid || child.ClaimGeneration != before.ClaimGeneration {
+		t.Fatalf("blocked checker changed claim: status=%s worker=%v generation=%d",
+			child.Status, child.WorkerID.Valid, child.ClaimGeneration)
+	}
+	assertCheckerNoMint(t, f, before.CodexClaimEpoch)
+
+	// Expire the same pending check that placement could not dispatch.
+	f.env.exec(`UPDATE cross_checks SET created_at=now()-interval '120 seconds',
+		deadline_at=now()-interval '1 second' WHERE id=$1 AND verdict='pending'`, pending.ID)
+	var credit int
+	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT CEIL(EXTRACT(EPOCH FROM (deadline_at-created_at)))::int
+		FROM cross_checks WHERE id=$1`, pending.ID).Scan(&credit); err != nil {
+		t.Fatal(err)
+	}
+	if credit <= 0 {
+		t.Fatalf("expired check has no wait credit: %d", credit)
+	}
+	leadBefore := mustRun(t, f.env, f.lead)
+	worker := store.Worker{ID: uuid.UUID(leadBefore.WorkerID.Bytes), UserID: f.userID}
+	cc, seq, err := f.svc.PlanCrossCheckStatus(f.env.ctx, worker, f.lead, leadBefore.ClaimGeneration, pending.Round)
+	if err != nil || cc.ID != pending.ID || cc.Verdict != "failed" ||
+		!cc.ReasonClass.Valid || cc.ReasonClass.String != "timed_out" || seq != leadBefore.LastSeq+1 {
+		t.Fatalf("capability timeout status: verdict=%s reason=%s seq=%d err=%v",
+			cc.Verdict, cc.ReasonClass.String, seq, err)
+	}
+	child = mustRun(t, f.env, f.runID)
+	lead := mustRun(t, f.env, f.lead)
+	if child.Status != "cancelled" || !child.ClaimReleasedAt.Valid ||
+		lead.LastSeq != seq || int64(lead.BudgetPausedSeconds) != int64(leadBefore.BudgetPausedSeconds)+int64(credit) {
+		t.Fatalf("capability timeout settlement: child=%s released=%v seq=%d budget=%d credit=%d",
+			child.Status, child.ClaimReleasedAt.Valid, lead.LastSeq, lead.BudgetPausedSeconds, credit)
+	}
+	assertCheckerNoMint(t, f, before.CodexClaimEpoch)
+	assertPinUnchanged := func() {
+		t.Helper()
+		var model, effort pgtype.Text
+		if err := f.env.pool.QueryRow(f.env.ctx, `SELECT model,effort FROM user_cross_check_pins
+			WHERE user_id=$1 AND stage='plan' AND harness='codex'`, f.userID).Scan(&model, &effort); err != nil {
+			t.Fatal(err)
+		}
+		if !model.Valid || model.String != customCodexModel || !effort.Valid || effort.String != "xhigh" {
+			t.Fatalf("capability timeout changed pin: model=%v effort=%v", model, effort)
+		}
+	}
+	assertPinUnchanged()
+	var eventSeq int32
+	var generation int64
+	var verdict, reason, author string
+	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT seq,claim_generation,payload->>'verdict',
+		payload->>'reason_class',payload->>'findings_author' FROM run_messages
+		WHERE run_id=$1 AND kind='cross_check'`, f.lead).Scan(&eventSeq, &generation, &verdict, &reason, &author); err != nil {
+		t.Fatal(err)
+	}
+	if eventSeq != seq || generation != leadBefore.ClaimGeneration ||
+		verdict != "failed" || reason != "timed_out" || author != "server" {
+		t.Fatalf("capability timeout event: seq=%d generation=%d verdict=%s reason=%s author=%s",
+			eventSeq, generation, verdict, reason, author)
+	}
+
+	repeated, repeatedSeq, err := f.svc.PlanCrossCheckStatus(f.env.ctx, worker, f.lead, leadBefore.ClaimGeneration, pending.Round)
+	if err != nil || !reflect.DeepEqual(cc, repeated) || repeatedSeq != seq {
+		t.Fatalf("repeat capability timeout status: seq=%d err=%v", repeatedSeq, err)
+	}
+	after := mustRun(t, f.env, f.lead)
+	var events int
+	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT count(*) FROM run_messages
+		WHERE run_id=$1 AND kind='cross_check'`, f.lead).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 || after.LastSeq != lead.LastSeq || after.BudgetPausedSeconds != lead.BudgetPausedSeconds ||
+		!reflect.DeepEqual(child, mustRun(t, f.env, f.runID)) {
+		t.Fatal("repeat capability timeout changed child, emitted another event or double-banked wait")
+	}
+	assertCheckerNoMint(t, f, before.CodexClaimEpoch)
+	assertPinUnchanged()
+}
+
 func TestCrossCheckPinsSpreadPeerMirrorsLiveDB(t *testing.T) {
 	for _, tc := range []struct {
 		name                              string
