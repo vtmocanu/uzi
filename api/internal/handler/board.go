@@ -130,11 +130,12 @@ type latestRunDTO struct {
 	// The non-sensitive StopKind enum below stays visible to everyone for the
 	// stopped-vs-failed badge, so classification never depends on this field.
 	FailureReason *string `json:"failure_reason"`
-	// StopKind is the server-stamped deliberate-stop signal (PRD #33): "cancelled"
-	// or "plan_rejected", null otherwise. The board badge reads it (not the
-	// failure_reason text) to render a deliberate stop as calm "stopped".
+	// StopKind is the server-stamped stop or scope disposition. A branch_moved
+	// cancellation is a proven concurrent advance of an mr_rework or ci_fix branch.
+	// The board badge reads the status and stop_kind, not failure_reason.
 	StopKind *string `json:"stop_kind"`
-	// StopReason is the operator's OPTIONAL free-text cancel reason (issue #525). Unlike
+	// StopReason carries an optional operator reason or server-composed supersession
+	// diagnostics (cause and superseding tip). Unlike
 	// the non-sensitive StopKind enum above, it is owner-gated below (assigned only when
 	// IsMine) exactly like FailureReason — a shared board must not leak another user's
 	// typed text (PRD #33 Decision 5). Null for a non-owner viewer and when no reason was given.

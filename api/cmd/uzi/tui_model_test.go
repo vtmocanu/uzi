@@ -2125,12 +2125,39 @@ func TestTUIStripTickRefetchesMeters(t *testing.T) {
 	}
 }
 
+// shortenTUIInitTicks shortens the Init ticks armed by the default board test fixtures.
+// These tests drain the full Init batch; keep this helper in sync with future waiting Init Cmds.
+func shortenTUIInitTicks(t *testing.T) {
+	t.Helper()
+	origBoard := boardPollInterval
+	origStrip := rateLimitPollInterval
+	origTheme := themePollInterval
+	origPulls := pullsPollInterval
+	origCI := ciPollInterval
+	origPR := prPollInterval
+	origCIRun := ciRunPollInterval
+	t.Cleanup(func() {
+		boardPollInterval = origBoard
+		rateLimitPollInterval = origStrip
+		themePollInterval = origTheme
+		pullsPollInterval = origPulls
+		ciPollInterval = origCI
+		prPollInterval = origPR
+		ciRunPollInterval = origCIRun
+	})
+	boardPollInterval = time.Millisecond
+	rateLimitPollInterval = time.Millisecond
+	themePollInterval = time.Millisecond
+	pullsPollInterval = time.Millisecond
+	ciPollInterval = time.Millisecond
+	prPollInterval = time.Millisecond
+	ciRunPollInterval = time.Millisecond
+}
+
 // Init must start the strip's own 60s ticker, so the rate-limit strip refreshes without the
 // user pressing the manual refresh key.
 func TestTUIInitStartsStripTicker(t *testing.T) {
-	orig := rateLimitPollInterval
-	rateLimitPollInterval = time.Millisecond
-	t.Cleanup(func() { rateLimitPollInterval = orig })
+	shortenTUIInitTicks(t)
 
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 	cmd := m.Init()
@@ -2211,15 +2238,7 @@ func TestTUIThemeTickRequeriesBackground(t *testing.T) {
 // TestTUIInitStartsThemeTicker pins that Init arms the slow theme ticker at startup, so a live
 // dark↔light switch is picked up without a restart (issue #1348).
 func TestTUIInitStartsThemeTicker(t *testing.T) {
-	orig := themePollInterval
-	themePollInterval = time.Millisecond
-	t.Cleanup(func() { themePollInterval = orig })
-	// Walking the Init batch executes every inner Cmd, including stripTickCmd()'s tea.Tick, which
-	// otherwise blocks up to the 60s rateLimitPollInterval; shrink it too so this test matches the
-	// strip ticker test's cadence instead of stalling on the strip's minute boundary.
-	origStrip := rateLimitPollInterval
-	rateLimitPollInterval = time.Millisecond
-	t.Cleanup(func() { rateLimitPollInterval = origStrip })
+	shortenTUIInitTicks(t)
 
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 	cmd := m.Init()

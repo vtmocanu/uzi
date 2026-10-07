@@ -22,6 +22,7 @@ import {
 } from "../../lib/theme";
 import { daysAgo, mockBuildInfo } from "../data";
 import { hasAnthropicToken, isCodexUsable } from "../../lib/hasToken";
+import { trustedBotsValueError } from "../../lib/trustedReviewBots";
 import { state } from "../store";
 import { delay, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
@@ -141,6 +142,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   // DefaultRunExtensionCapSeconds). 0 would turn extending off instance-wide.
   run_extension_cap_seconds: "57600",
   docker_repo_allowlist: "",
+  // Issue #2347: trusted review-bot allowlist, default empty (no bot trusted, fail closed).
+  mr_review_trusted_bots: "",
   // PRD #84 M2: capability-aware scheduling kill-switch, default ON.
   capability_aware_scheduling: "true",
   // Issue #1626: completion interlock kill-switch, default ON (Claude issue runs only).
@@ -287,7 +290,10 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // PRD #1906: the five fetch caps joined without a key bump; a blob that predates them
     // (undefined) is filled from the seed on load, a malformed non-string is refused.
     Object.keys(FETCH_CAP_BOUNDS).every((k) => a[k] === undefined || typeof a[k] === "string") &&
-    typeof a.docker_repo_allowlist === "string";
+    typeof a.docker_repo_allowlist === "string" &&
+    // Issue #2347: a blob that predates the trusted review-bot allowlist (undefined) is
+    // filled from the seed on load; a malformed non-string is refused.
+    (a.mr_review_trusted_bots === undefined || typeof a.mr_review_trusted_bots === "string");
   return okUser && okApp;
 }
 
@@ -938,6 +944,14 @@ export const settingsApi = {
           );
         }
         nonSecret.docker_repo_allowlist = value;
+        continue;
+      }
+      // mr_review_trusted_bots (issue #2347), following the server's validateTrustedBots
+      // through the same rules the admin card uses (stricter in places, never looser). Empty is valid (no bot trusted).
+      if (key === "mr_review_trusted_bots") {
+        const problem = trustedBotsValueError(value);
+        if (problem) throw new ApiError(400, `mr_review_trusted_bots: ${problem}`);
+        nonSecret.mr_review_trusted_bots = value;
         continue;
       }
       if (key !== "autopilot_label" && key !== "uzi_label") {

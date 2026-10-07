@@ -7,12 +7,13 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { type ExecutorResult, type RunContext } from "../src/executor.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, noProofReseed } from "./helpers.js";
 import {
   api,
   client,
   fakeGitlab,
   git,
+  fx,
   gitlabClaim,
   installHarness,
 } from "./runner-harness.js";
@@ -215,6 +216,51 @@ const stateStatuses = (runId: string): string[] =>
 const messageKinds = (runId: string): string[] => api.messages(runId).map((m) => m.kind);
 
 describe("RunRunner — owner-requested pause park (PRD #1190 M2)", () => {
+  it("unchanged generation 2 resume publishes generation 1 work before parking", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(1935, { claim_generation: 2, session_id: "resume-session",
+      pause_pending: true, pause_mode: "now" });
+    const branch = "agent/issue-1935";
+    const bare = await git.ensureClone(fx.originPath);
+    const seed = await git.runnerCloneForBranch(bare, branch, "issue-1935", noProofReseed, claim.run_id);
+    assert.ok(seed.defaultBranchCommit);
+    commitInTree(seed.path, "WORK.txt", "generation 1 work\n");
+    const h = execFileSync("git", ["-C", seed.path, "rev-parse", "HEAD"], { env: GIT_ENV }).toString().trim();
+    const result = await git.fetchAgentBranch(bare, seed.path, branch, claim.run_id, {
+      context: { barePath: bare, branch, runId: claim.run_id, generation: 1, kind: "issue",
+        defaultIdentity: { ref: "refs/remotes/origin/main", sha: seed.defaultBranchCommit } },
+    });
+    assert.equal(result.kind, "updated");
+    assert.equal((await git.committedTrackingOwnership(bare, branch, claim.run_id, h, 1)).kind, "owned");
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-resume-pause-"));
+    const { calls, restore } = spyPublish();
+    const publish = client.publishCheckpoint.bind(client);
+    client.publishCheckpoint = async (...args) => {
+      assert.equal(args[1], h);
+      assert.equal(api.states.some((state) => state.body.status === "paused"), false);
+      assert.equal((await git.committedTrackingOwnership(bare, branch, claim.run_id, h, 2)).kind, "owned");
+      const owed = await git.enumerateOwedCandidates(bare, claim.run_id);
+      assert.ok(owed.find(candidate => candidate.sha === h)?.contexts.some(context => context.generation === 1),
+        "producing generation stays recoverable before remote confirmation");
+      return publish(...args);
+    };
+    try {
+      const { factory, parkResults } = emptyPauseFactory(homeRoot);
+      await runnerWithGit(factory, gitlab).execute(claim);
+      assert.deepEqual(parkResults, [true]);
+      assert.deepEqual(calls, [{ runId: claim.run_id, tipOid: h }]);
+      const parked = api.states.find((state) => state.body.status === "paused");
+      assert.ok(parked);
+      assert.notEqual(parked.body.checkpoint_contains_latest, false);
+      assert.equal((await git.committedTrackingOwnership(bare, branch, claim.run_id, h, 2)).kind, "owned");
+      const old = (await git.enumerateOwedCandidates(bare, claim.run_id)).find((candidate) => candidate.sha === h);
+      assert.equal(old, undefined, "only the confirmed checkpoint containing H clears the old producing pin");
+    } finally {
+      restore();
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("reports `paused` ONLY after a successful checkpoint publish, and does not finalize", async () => {
     const { gitlab, calls: mrCalls } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1190-ok-"));

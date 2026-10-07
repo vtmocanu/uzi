@@ -62,7 +62,7 @@ func (t *fakeClaimFinishTx) LockOpenCustodyHoldsForRunWorkerGeneration(context.C
 	return t.f.claimFinishHolds, nil
 }
 
-func (t *fakeClaimFinishTx) ReleaseCustodyHoldExact(context.Context, store.ReleaseCustodyHoldExactParams) (int64, error) {
+func (t *fakeClaimFinishTx) ReleaseClaimCustodyNoAdoptedSource(context.Context, store.ReleaseClaimCustodyNoAdoptedSourceParams) (int64, error) {
 	n := int64(1)
 	if t.f.claimReleaseRows != nil {
 		n = *t.f.claimReleaseRows

@@ -156,7 +156,7 @@ func TestResolveBuildsTheImageReferenceFromConfig(t *testing.T) {
 	if want := "harbor.example.com/uzi/agent-jvm:v0.4.0"; spec.Image != want {
 		t.Errorf("Image = %q, want %q", spec.Image, want)
 	}
-	if spec.Size.CPULimit.String() != "4" || spec.Size.MemoryLimit.String() != "12Gi" {
+	if spec.Size.CPULimit.String() != "4" || spec.Size.MemoryLimit.String() != "20Gi" {
 		t.Errorf("size l = %+v, want the approved l quantities", spec.Size)
 	}
 }
@@ -467,20 +467,20 @@ func TestEveryPresetRequestsMoreMemoryThanTheMeasuredAgentPeak(t *testing.T) {
 // captured. Measured on the hosted cluster (issue #1341): an `l` worker's writable set
 // peaked at ~7451Mi (≈7.1 GiB) against its old 4Gi request — the captured eviction — with
 // a web-ux median of ~4.5 GiB, while a non-web-ux `m` run peaks ~2.7 GiB. Issue #1341
-// recalibrated every request above its size's measured peak (`l` 8Gi, `m` 4Gi, `s` 2Gi),
-// restoring the invariant.
+// recalibrated every request above its size's measured peak (`l` 8Gi and `m` 4Gi at the time, `s` 2Gi),
+// restoring the invariant; `l` and `m` were later raised to 14Gi and 8Gi (issue #2127).
 //
 // The thresholds are PER SIZE on purpose: a single global 7.1Gi floor would wrongly fail
 // `s` and `m`, which never carry an `l`'s multi-agent web-ux load. Each size is asserted
 // BOTH ways — its owner-approved request value exactly AND that the request clears that
 // size's measured peak — so this fails on the pre-#1341 values (old `l` = 4Gi fails both
-// the ==8Gi and the >7451Mi checks).
+// the ==request and the >7451Mi checks).
 func TestEveryPresetRequestSitsAboveItsSizesMeasuredPeak(t *testing.T) {
 	// size -> {owner-approved request, that size's measured per-run peak from issue #1341}.
 	expected := map[string]struct{ request, peak string }{
-		"s": {request: "2Gi", peak: "676Mi"},  // the measured single-agent SDK peak
-		"m": {request: "4Gi", peak: "2764Mi"}, // ~2.7 GiB, a non-web-ux run's peak
-		"l": {request: "8Gi", peak: "7451Mi"}, // ≈7.1 GiB, the captured eviction figure
+		"s": {request: "2Gi", peak: "676Mi"},   // the measured single-agent SDK peak
+		"m": {request: "8Gi", peak: "2764Mi"},  // peak ~2.7 GiB, a non-web-ux run's (#1341); request 8Gi per #2127 (deadcode reached 7.3-7.5 GiB)
+		"l": {request: "14Gi", peak: "7451Mi"}, // peak ≈7.1 GiB, the #1341 captured eviction figure; request 14Gi per #2127 (two overlapping ~7.5 GiB Go analyzers)
 	}
 	if len(sizes) == 0 {
 		t.Fatal("the preset size table is empty; the request assertions below would pass vacuously")

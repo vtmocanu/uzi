@@ -425,8 +425,9 @@ type RunDTO struct {
 	//
 	// Later values widen this set: "scope_capped" (PRD #634) and "scope_reduced" (PRD #1227)
 	// are completed-status scope dispositions, and "branch_moved" (issue #1117) is a
-	// cancelled-status disposition for an mr_rework rework whose finalize push was superseded
-	// by a concurrent same-branch writer (a non-fast-forward push rejection).
+	// cancelled-status disposition for mr_rework or ci_fix when a concurrent branch
+	// advance is proven. Detection may precede a wire push rejection; further publication
+	// stops, but a lost push response means the candidate may already have been published.
 	//
 	// A "stopped" run's happy path lands `completed` (the worker finalizes — push + MR iff
 	// open_mr — and reports completed); on the edge where that finalize throws (or a
@@ -442,10 +443,10 @@ type RunDTO struct {
 	// own "run cancelled", so this field is the ONLY thing that distinguishes an
 	// auto-stop from a user cancel.
 	StopKind *string `json:"stop_kind"`
-	// StopReason is the operator's OPTIONAL free-text cancel reason (PRD #503 M3),
-	// captured beside StopKind on the cancel paths and surfaced here on the read path
-	// (issue #525). Null when no reason was given. Free text — treated like FailureReason,
-	// not like the StopKind enum.
+	// StopReason carries an optional operator free-text cancel reason (PRD #503 M3,
+	// issue #525) or server-composed bounded diagnostics, such as a proven concurrent
+	// branch advance's cause and superseding tip. Null when no reason is recorded.
+	// Treated as free text like FailureReason, not like the StopKind enum.
 	StopReason *string `json:"stop_reason"`
 	// Run health (PRD #47). This DTO is owner-scoped (ListRuns owner-only,
 	// AdminListRuns admin-only, GetRun owner/admin), so health_reason rides

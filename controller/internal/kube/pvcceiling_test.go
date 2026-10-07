@@ -15,11 +15,12 @@ import (
 func TestValidatePVCCeilings(t *testing.T) {
 	resolver := testResolver(t)
 	// The largest claims in the shipped tables, named so a failure below is readable:
-	// nixSize is 20Gi flat, `l`'s DataSize is 25Gi, the dind default is 20Gi.
+	// nixSize is 20Gi flat, `m` and `l` DataSize are 25Gi, the dind default is 20Gi.
 	for _, tc := range []struct {
-		name    string
-		cfg     RenderConfig
-		wantErr []string // substrings that must ALL appear; empty = must succeed
+		name              string
+		cfg               RenderConfig
+		wantErr           []string // substrings that must ALL appear; empty = must succeed
+		wantLargestPreset bool     // either M or L may supply the tied 25Gi maximum
 	}{
 		{
 			name: "no ceilings supplied: both tiers skipped",
@@ -35,9 +36,10 @@ func TestValidatePVCCeilings(t *testing.T) {
 			wantErr: []string{"restricted tier", "-nix", "20Gi", "UZI_WORKER_MAX_PVC_STORAGE", "10Gi"},
 		},
 		{
-			name:    "restricted ceiling below the largest preset's DataSize (the pre-#1757 20Gi)",
-			cfg:     RenderConfig{MaxPVCStorage: "20Gi"},
-			wantErr: []string{"restricted tier", "-data", `"l"`},
+			name:              "restricted ceiling below the largest preset's DataSize (the pre-#1757 20Gi)",
+			cfg:               RenderConfig{MaxPVCStorage: "20Gi"},
+			wantErr:           []string{"restricted tier", "-data", "25Gi"},
+			wantLargestPreset: true,
 		},
 		{
 			name: "docker ceiling below the dind data root's EFFECTIVE default",
@@ -92,6 +94,9 @@ func TestValidatePVCCeilings(t *testing.T) {
 			if err == nil {
 				t.Fatalf("want an error naming %v, got nil — an oversized claim that boots is a fleet that "+
 					"provisions and never appears", tc.wantErr)
+			}
+			if tc.wantLargestPreset && !strings.Contains(err.Error(), `preset "m"`) && !strings.Contains(err.Error(), `preset "l"`) {
+				t.Errorf("error must name a preset with the 25Gi maximum: %v", err)
 			}
 			for _, want := range tc.wantErr {
 				if !strings.Contains(err.Error(), want) {

@@ -58,6 +58,10 @@ type Cache struct {
 	values  map[string]string // last fetched rows; replaced wholesale, never mutated in place
 	fetched time.Time
 	valid   bool
+	// gen counts Invalidate calls. A refresh publishes its rows only if no invalidation ran
+	// while it was fetching: a fetch that read the rows before an admin write committed must
+	// not overwrite the invalidation and serve the pre-write values as fresh (#2347).
+	gen uint64
 }
 
 // New builds a cache reading through q, refreshing at most once per ttl.
@@ -79,6 +83,7 @@ func (c *Cache) ConfigureSecrets(box *secretbox.Box, env map[string]string) {
 func (c *Cache) Invalidate() {
 	c.mu.Lock()
 	c.valid = false
+	c.gen++
 	c.mu.Unlock()
 }
 
@@ -88,21 +93,32 @@ func (c *Cache) Invalidate() {
 //
 // On a refresh error it serves the last known-good snapshot when one exists
 // (stale-on-error keeps reads working through a transient DB blip); only a cold
-// cache with no prior snapshot propagates the error.
+// cache with no prior snapshot propagates the error. strictSnapshot does not.
 func (c *Cache) snapshot(ctx context.Context) (map[string]string, error) {
+	return c.load(ctx, false)
+}
+
+// strictSnapshot is snapshot without stale-on-error: a failed refresh of an expired cache
+// returns the error, so a fail-closed caller never acts on values it could not re-read.
+func (c *Cache) strictSnapshot(ctx context.Context) (map[string]string, error) {
+	return c.load(ctx, true)
+}
+
+func (c *Cache) load(ctx context.Context, strict bool) (map[string]string, error) {
 	c.mu.RLock()
 	if c.valid && c.now().Sub(c.fetched) < c.ttl {
 		m := c.values
 		c.mu.RUnlock()
 		return m, nil
 	}
+	gen := c.gen
 	c.mu.RUnlock()
 
 	rows, err := c.q.ListAppSettings(ctx)
 	if err != nil {
 		c.mu.RLock()
 		defer c.mu.RUnlock()
-		if c.valid {
+		if c.valid && !strict {
 			return c.values, nil
 		}
 		return nil, err
@@ -113,9 +129,11 @@ func (c *Cache) snapshot(ctx context.Context) (map[string]string, error) {
 		m[r.Key] = r.Value
 	}
 	c.mu.Lock()
-	c.values = m
-	c.fetched = c.now()
-	c.valid = true
+	if c.gen == gen {
+		c.values = m
+		c.fetched = c.now()
+		c.valid = true
+	}
 	c.mu.Unlock()
 	return m, nil
 }
@@ -450,6 +468,8 @@ func Validate(key, value string) error {
 		return validateBool(value)
 	case KeyMrReworkCap:
 		return validateMrReworkCap(value)
+	case KeyMrReviewTrustedBots:
+		return validateTrustedBots(value)
 	case KeyAppLogoMode:
 		return validateEnum(value, "default", "custom", "preset")
 	case KeyAppLogoPreset:

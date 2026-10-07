@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,8 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
+	"github.com/vtmocanu/uzi/api/internal/reviewauthortest"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -44,13 +47,47 @@ type mrwStore struct {
 	ledgers map[string]store.MrReworkLedger
 	getErr  error
 
-	upserts   []store.UpsertMRReworkLedgerParams
-	haltSets  []store.SetMRReworkHaltNotifiedParams
-	evicts    []uuid.UUID
-	upsertErr error
-	haltErr   error
+	upserts []store.UpsertMRReworkLedgerParams
+	// pendingRemovals records the pending-only removals (no run created).
+	pendingRemovals []store.RemoveMRReworkPendingIDsParams
+	haltSets        []store.SetMRReworkHaltNotifiedParams
+	evicts          []uuid.UUID
+	haltErr         error
 
 	ops *[]string
+
+	// clock feeds the review-author model (admitted_at / last_attempt_at); nil means time.Now.
+	clock func() time.Time
+	rat   *reviewauthortest.Store
+}
+
+// ras is the in-memory review-author verdict cache and queue (issue #2347), created on first
+// use so the many tests that build a bare &mrwStore{} need no setup.
+func (s *mrwStore) ras() *reviewauthortest.Store {
+	if s.rat == nil {
+		s.rat = reviewauthortest.New(s.clock)
+	}
+	return s.rat
+}
+
+func (s *mrwStore) ListReviewAuthorQueue(ctx context.Context, arg store.ListReviewAuthorQueueParams) ([]store.ListReviewAuthorQueueRow, error) {
+	return s.ras().ListReviewAuthorQueue(ctx, arg)
+}
+
+func (s *mrwStore) ListFreshNotEligibleAuthors(ctx context.Context, arg store.ListFreshNotEligibleAuthorsParams) ([]int64, error) {
+	return s.ras().ListFreshNotEligibleAuthors(ctx, arg)
+}
+
+func (s *mrwStore) UpsertReviewAuthorVerdict(ctx context.Context, arg store.UpsertReviewAuthorVerdictParams) error {
+	return s.ras().UpsertReviewAuthorVerdict(ctx, arg)
+}
+
+func (s *mrwStore) DeleteExpiredReviewAuthorVerdicts(ctx context.Context, arg store.DeleteExpiredReviewAuthorVerdictsParams) (int64, error) {
+	return s.ras().DeleteExpiredReviewAuthorVerdicts(ctx, arg)
+}
+
+func (s *mrwStore) ListStaleReviewAuthorQueueRefs(ctx context.Context, arg store.ListStaleReviewAuthorQueueRefsParams) ([]string, error) {
+	return s.ras().ListStaleReviewAuthorQueueRefs(ctx, arg)
 }
 
 func (s *mrwStore) ListMRReworkCandidates(context.Context, uuid.UUID) ([]store.ListMRReworkCandidatesRow, error) {
@@ -68,15 +105,15 @@ func (s *mrwStore) GetMRReworkLedger(_ context.Context, arg store.GetMRReworkLed
 	return store.MrReworkLedger{}, pgx.ErrNoRows
 }
 
-func (s *mrwStore) UpsertMRReworkLedger(_ context.Context, arg store.UpsertMRReworkLedgerParams) error {
-	if s.upsertErr != nil {
-		return s.upsertErr
-	}
+// applyUpsert mirrors UpsertMRReworkLedger. The detector no longer writes the ledger itself
+// (the create does, in its own transaction), so only the mrwRuns fake reaches it.
+func (s *mrwStore) applyUpsert(arg store.UpsertMRReworkLedgerParams) {
 	s.upserts = append(s.upserts, arg)
 	if s.ledgers == nil {
 		s.ledgers = map[string]store.MrReworkLedger{}
 	}
 	cur := s.ledgers[arg.Ref]
+	priorHighWater := cur.HighWater
 	cur.RepoID = arg.RepoID
 	cur.Ref = arg.Ref
 	cur.AttemptCount++ // INSERT count=1 or increment
@@ -84,10 +121,97 @@ func (s *mrwStore) UpsertMRReworkLedger(_ context.Context, arg store.UpsertMRRew
 		cur.HighWater = arg.HighWater // GREATEST(existing, new): advance-only
 	}
 	cur.HaltNotified = false // a proceed resets the latch
+	cur.PendingUnknownIds = mergePending(cur.PendingUnknownIds, arg.PendingAdd, arg.PendingRemove, arg.PendingSuperseded, arg.PendingSupersededBy, priorHighWater)
 	s.ledgers[arg.Ref] = cur
-	if s.ops != nil {
-		*s.ops = append(*s.ops, "upsert")
+}
+
+// mergePending mirrors mr_rework_merge_pending: (existing UNION added ids above the prior
+// high-water mark) minus removed ids; each (superseded, superseded-by) pair applies only when
+// both ids are in that set, dropping the older id unless it is itself a replacement; then the
+// OLDEST ReviewPendingCap slots are kept, a replacement taking the slot of the smallest id it
+// replaces. Ascending.
+func mergePending(existing, added, removed, superseded, supersededBy []int64, priorHighWater int64) []int64 {
+	base := map[int64]bool{}
+	for _, id := range existing {
+		base[id] = true
 	}
+	for _, id := range added {
+		if id > priorHighWater {
+			base[id] = true
+		}
+	}
+	for _, id := range removed {
+		delete(base, id)
+	}
+	dropped := map[int64]bool{}
+	replacement := map[int64]bool{}
+	slot := map[int64]int64{}
+	for i, o := range superseded {
+		if i >= len(supersededBy) {
+			break
+		}
+		n := supersededBy[i]
+		if o == n || !base[o] || !base[n] {
+			continue
+		}
+		dropped[o] = true
+		replacement[n] = true
+		if cur, ok := slot[n]; !ok || o < cur {
+			slot[n] = o
+		}
+	}
+	for n := range replacement {
+		delete(dropped, n)
+	}
+	type kept struct{ x, slot int64 }
+	var ks []kept
+	for x := range base {
+		if dropped[x] {
+			continue
+		}
+		sl := x
+		if s, ok := slot[x]; ok {
+			sl = min(s, x)
+		}
+		ks = append(ks, kept{x, sl})
+	}
+	sort.Slice(ks, func(i, j int) bool {
+		if ks[i].slot != ks[j].slot {
+			return ks[i].slot < ks[j].slot
+		}
+		return ks[i].x < ks[j].x
+	})
+	if len(ks) > workersvc.ReviewPendingCap {
+		ks = ks[:workersvc.ReviewPendingCap]
+	}
+	out := make([]int64, 0, len(ks))
+	for _, k := range ks {
+		out = append(out, k.x)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// RemoveMRReworkPendingIDs mirrors the SQL: array subtraction on the pending set of an
+// existing row, leaving every other column alone.
+func (s *mrwStore) RemoveMRReworkPendingIDs(_ context.Context, arg store.RemoveMRReworkPendingIDsParams) error {
+	cur, ok := s.ledgers[arg.Ref]
+	if !ok {
+		return nil
+	}
+	s.pendingRemovals = append(s.pendingRemovals, arg)
+	drop := map[int64]bool{}
+	for _, id := range arg.Ids {
+		drop[id] = true
+	}
+	kept := []int64{}
+	for _, id := range cur.PendingUnknownIds {
+		if !drop[id] {
+			kept = append(kept, id)
+		}
+	}
+	cur.PendingUnknownIds = kept
+	s.ledgers[arg.Ref] = cur
 	return nil
 }
 
@@ -121,6 +245,8 @@ type mrwRunCall struct {
 	mrIID                       int64
 	title, desc                 string
 	snapshot                    *workersvc.ReviewCommentsSnapshot
+	capLimit                    int
+	plan                        workersvc.ReviewPlan // the advance that rode the create
 }
 
 type mrwRuns struct {
@@ -128,15 +254,38 @@ type mrwRuns struct {
 	calls []mrwRunCall
 	runID uuid.UUID
 	ops   *[]string
+	// st is the ledger the fake create re-validates and advances, standing in for
+	// workersvc's in-transaction recheck and upsert; newMRW binds it.
+	st *mrwStore
 }
 
-func (r *mrwRuns) CreateAutoMRReworkRun(_ context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, desc string, snapshot *workersvc.ReviewCommentsSnapshot) (store.Run, error) {
-	r.calls = append(r.calls, mrwRunCall{userID, repoID, sourceRunID, ref, mrIID, title, desc, snapshot})
+func (r *mrwRuns) CreateAutoMRReworkRunAndAdvance(_ context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, desc string, res *workersvc.ReviewSnapshotResult, capLimit int) (store.Run, error) {
+	plan := res.PlanAssessed()
+	r.calls = append(r.calls, mrwRunCall{userID, repoID, sourceRunID, ref, mrIID, title, desc, res.Snapshot, capLimit, plan})
 	if r.ops != nil {
 		*r.ops = append(*r.ops, "create")
 	}
 	if r.err != nil {
 		return store.Run{}, r.err
+	}
+	if r.st != nil {
+		// The same re-validation the real create runs under the branch lock.
+		cur := r.st.ledgers[ref]
+		if int(cur.AttemptCount) >= capLimit {
+			return store.Run{}, workersvc.ErrMRReworkCapReached
+		}
+		if !res.HasNewAgainst(cur.HighWater, cur.PendingUnknownIds) {
+			return store.Run{}, workersvc.ErrReworkNothingNew
+		}
+		r.st.applyUpsert(store.UpsertMRReworkLedgerParams{
+			RepoID:              repoID,
+			Ref:                 ref,
+			HighWater:           plan.MaxActionableID,
+			PendingAdd:          plan.PendingAdd,
+			PendingRemove:       plan.PendingRemove,
+			PendingSuperseded:   plan.PendingSuperseded,
+			PendingSupersededBy: plan.PendingSupersededBy,
+		})
 	}
 	if r.runID == (uuid.UUID{}) {
 		r.runID = uuid.New()
@@ -178,6 +327,12 @@ type mrwSettings struct {
 	capErr     error
 	baseURL    string
 	baseErr    error
+	bots       []settings.TrustedBot
+	botsErr    error
+}
+
+func (s mrwSettings) MrReviewTrustedBots(context.Context) ([]settings.TrustedBot, error) {
+	return s.bots, s.botsErr
 }
 
 func (s mrwSettings) MrReworkEnabled(context.Context) (bool, error) { return s.enabled, s.enabledErr }
@@ -190,9 +345,32 @@ type mrwForge struct {
 	*cfForge
 	comments    []forge.MRComment
 	commentsErr error
+
+	// eligibility answers a repository-access lookup (issue #2347). Nil means every author is
+	// eligible, so the pre-existing tests keep their meaning; lookups records each call.
+	eligibility func(ctx context.Context, authorID int64) (forge.AuthorEligibility, error)
+	lookups     []int64
+
+	// onList, when set, runs while ListMergeRequestComments is "fetching": it stands for a
+	// concurrent writer that updates the ledger during the listing.
+	onList func()
+	// listCalls counts ListMergeRequestComments calls.
+	listCalls int
+}
+
+func (f *mrwForge) RepositoryAuthorEligibility(ctx context.Context, _ int64, authorID int64) (forge.AuthorEligibility, error) {
+	f.lookups = append(f.lookups, authorID)
+	if f.eligibility == nil {
+		return forge.AuthorEligible, nil
+	}
+	return f.eligibility(ctx, authorID)
 }
 
 func (f *mrwForge) ListMergeRequestComments(context.Context, int64, int64) ([]forge.MRComment, error) {
+	f.listCalls++
+	if f.onList != nil {
+		f.onList()
+	}
 	return f.comments, f.commentsErr
 }
 
@@ -243,7 +421,8 @@ func newMRW(st *mrwStore, runs *mrwRuns, notifier *mrwNotifier, set mrwSettings)
 	if notifier != nil {
 		n = notifier
 	}
-	return NewMRReviewWatch(st, runs, n, set, 5, 5*time.Minute)
+	runs.st = st
+	return NewMRReviewWatch(st, runs, st.ras(), n, set, 5, 5*time.Minute)
 }
 
 func landedForge(comments ...forge.MRComment) *mrwForge {
@@ -281,9 +460,13 @@ func TestMRReworkProceedStartsRun(t *testing.T) {
 	if got := st.ledgers[mrwRef].AttemptCount; got != 1 {
 		t.Fatalf("attempt_count = %d, want 1", got)
 	}
-	// create → upsert (create-then-record).
-	if strings.Join(ops, ",") != "create,upsert" {
-		t.Fatalf("op order = %v, want [create upsert]", ops)
+	// The advance rides the create (one transaction in the real service): the poller makes no
+	// ledger write of its own after it, and the create carries the plan and the cap.
+	if strings.Join(ops, ",") != "create" {
+		t.Fatalf("op order = %v, want [create] only", ops)
+	}
+	if c.capLimit != 5 || c.plan.MaxActionableID != 120 {
+		t.Fatalf("create carried capLimit=%d plan.MaxActionableID=%d, want 5/120", c.capLimit, c.plan.MaxActionableID)
 	}
 	if len(f.notes) != 0 || len(notifier.calls) != 0 {
 		t.Fatalf("a proceed posts no halt comment/notify, got notes=%d notifs=%d", len(f.notes), len(notifier.calls))
@@ -482,6 +665,38 @@ func TestMRReworkAtCapHaltsOnceThenSilent(t *testing.T) {
 	if len(f2.notes) != 0 || len(notifier.calls) != 1 || len(st.haltSets) != 1 {
 		t.Fatalf("the halt latch must be silent on the next tick: notes=%d notifs=%d halts=%d",
 			len(f2.notes), len(notifier.calls), len(st.haltSets))
+	}
+}
+
+func TestMRReworkHaltedAndNotifiedSkipsListingAndLookups(t *testing.T) {
+	// At the cap with the halt already notified, no path can start a run, so the tick must not
+	// spend a comment listing or author lookups on the MR (#2347 review). A new comment from an
+	// eligible author would otherwise reach the assessment every tick.
+	st := &mrwStore{
+		candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
+		ledgers:    map[string]store.MrReworkLedger{mrwRef: {Ref: mrwRef, AttemptCount: 5, HighWater: 120, HaltNotified: true}},
+	}
+	runs := &mrwRuns{}
+	notifier := &mrwNotifier{}
+	f := landedForge(mrwComment(200, landed(), mrwHeadSHA))
+	d := newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5})
+
+	d.detect(context.Background(), mrwRepoRow(), f)
+
+	if f.listCalls != 0 || len(f.lookups) != 0 {
+		t.Fatalf("a halted, notified MR must skip the listing and lookups: list=%d lookups=%d", f.listCalls, len(f.lookups))
+	}
+	if len(runs.calls) != 0 || len(f.notes) != 0 || len(notifier.calls) != 0 || len(st.haltSets) != 0 {
+		t.Fatalf("a halted, notified MR must stay silent: runs=%d notes=%d notifs=%d halts=%d",
+			len(runs.calls), len(f.notes), len(notifier.calls), len(st.haltSets))
+	}
+
+	// Raising the cap un-halts it: the next tick lists again and proceeds.
+	d2 := newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 6})
+	f2 := landedForge(mrwComment(200, landed(), mrwHeadSHA))
+	d2.detect(context.Background(), mrwRepoRow(), f2)
+	if f2.listCalls != 1 || len(runs.calls) != 1 {
+		t.Fatalf("under a raised cap the MR must be listed and reworked: list=%d runs=%d", f2.listCalls, len(runs.calls))
 	}
 }
 

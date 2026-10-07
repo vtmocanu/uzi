@@ -22,74 +22,20 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-### Added
-
-- **A worker that finds an unattributable runner-uid process now quarantines itself instead of starting credentialed work ([#2213](https://github.com/vtmocanu/uzi/issues/2213)).**
-  On a single-uid Linux worker, a worker-wide credential-free scan on every claim and quiescence proof that finds an unreadable runner-uid process nothing ties to a live run latches an in-memory quarantine, released only by restarting the worker container: the worker claims nothing, starts no forge-credentialed git child and no new Claude or Codex turn, a turn already in flight runs to its boundary, and active runs fail `worker_residue_blocked` with their clone, hold and recovery pins kept. A run stopped by its own blocking quiescence check fails with a plain residue-blocked reason, usually naming the process (no archive); runs stopped because the latch refused their turn, credentialed git or claim fail with a "this worker is quarantined" reason and, when the capture succeeds, a verified local archive of the committed work already in the worker bare (head and sha256 appended to the failure reason). Nothing is uploaded or released while latched except a completed run's custody release and a pre-clone park's hold release, and a completed run's clone is kept until cleaned by hand. It shows as `(quarantined)` in `uzi worker list` and `uzi admin workers`, in the TUI and web worker views, in `residue_quarantined_at`/`residue_quarantine_cause` on the worker JSON, and as the admin Health warning `fleet.quarantine`; see [Quarantined worker](docs/worker-setup.md#quarantined-worker) and ADR-2213. Under the uid split nothing changes (nor does a Codex run's own-mode proof, which does not scan processes), and a process that becomes unreadable after a clean scan is seen only at the next scan.
-
-- **Recurring single-label sweeps can consume their selector label after dispatch ([#2344](https://github.com/vtmocanu/uzi/issues/2344)).**
-  Single-label recurring sweeps can remove their selector after a run starts, with API, CLI and web controls. Fire history reports removal success or failure using the original label; failures keep the started run, and owners re-add a successfully removed label to retry failed work. The new On-deck sweep (`ondeck-sweep`) provides a triaged `on-deck` backlog drain every 10 minutes (`*/10 * * * *`, UTC), starting at most one issue when at least two slots remain under an unfinished-work limit of four, with best-effort selector removal after creation and an advisory missing-label check. Enable and Reset persist catalog capacity and removal values; owner edits mark divergence, exact restoration or Reset clears it, and editable gate/removal settings are not overlaid at fire time. Older catalog entries retain null gates and removal off; existing schedules keep their settings. The Every N minutes preset accepts 1, 2, 3, 4, 5, 6, 10, 12, 15, 20 and 30 as `*/N * * * *`; uneven steps such as `*/40` stay custom cron.
-
-- **Plan cross-check opt-in establishes a required gate for auto-approved plans ([#2149](https://github.com/vtmocanu/uzi/issues/2149)).**
-  Settings → Run defaults offers a per-user Plan cross-check switch when Claude and Codex are usable. An opted-in auto-approved Claude run sends its plan to a read-only Codex child before implementing: an exact-plan pass permits implementation, while changes requested, blocked, timeout, unavailable checker or submission failure normally forces a human gate. Codex leads park as unsupported. Irrecoverable receipt loss fails with `plan cross-check: preparation receipts irrecoverably lost`; presentation ACK loss fails with `plan cross-check: human-presentation ACK unrecoverable`; unresolved preparation ACKs after three attempts and an acknowledged forced human gate fail with `plan cross-check: preparation ACKs unrecoverable`. None of these delivery failures approves, retries indefinitely or enters recovery wait.
-
-- **Plan cross-check evidence is visible on the run page and CLI ([#2149](https://github.com/vtmocanu/uzi/issues/2149)).**
-  The web plan panel, run detail and activity feed show honest candidate outcomes, bounded hardened Markdown findings, a checker-run link and recorded model/effort and reported tokens/cost; a new cross-check event refreshes detail. Current gate reasons stay separate from earlier-plan evidence, which does not certify a human revision. Missing or inconsistent outcomes stay unavailable, and subscription usage is distinguished from metered cost. `uzi run get` renders bounded findings safely for the terminal; Slack carries the reason without findings. Dedicated slots, automatic checker revision, checker pins, the Codex-lead direction and Code cross-check remain outside this change.
-
-- **Capacity gates for scheduled sweeps**
-  Recurring label sweeps can wait for room in the owner’s unfinished work and send batches within the available room, with API and CLI controls and recorded capacity outcomes.
-
-- **Scheduled issue runs require human plan approval when issue input cannot qualify for automatic approval ([#2345](https://github.com/vtmocanu/uzi/issues/2345)).**
-  The API assesses repository author access, withholds ineligible or unknown comment bodies, and disables requested auto-approval for pinned-issue, label-sweep, and assigned-sweep runs with below-threshold or unverifiable input; CLI and web run views show the stored reasons while runs still queue and plan normally. Every issue run freezes its target title/body, including live target reads after edits or approval, while eligible late comments remain available through filtered reads. Claude/Codex planning context uses nonce fences for captured fields and assessed comments, and isolated research fences captured fields without restoring comments; these resist delimiter spoofing but do not guarantee protection from semantic injection or planning-time exfiltration. Schedule defaults remain ON, old transcript text and approvals are not retracted, and oversized/chunked GitHub/GitLab decoded-response memory hardening remains deferred.
-
-- **Advisory draft plans in run activity ([#2323](https://github.com/vtmocanu/uzi/issues/2323)).**
-  The latest valid explicit draft capture appears as Markdown in both activity views, labelled draft, unapproved, possibly incomplete, with a truncation notice when needed; earlier captures remain stored and submitted-plan approval stays separate.
-
 ### Changed
 
-- **Codex subscription runs can wait out a usage window and resume automatically ([#2360](https://github.com/vtmocanu/uzi/issues/2360)).**
-  The existing default-on usage-limit preference now covers recognized Codex window failures using structured evidence from the failed turn, with the latest exhausted-window reset or bounded fallback; Settings and per-run controls use shared Usage limits wording. Resume keeps the same Codex account and restores captured work, with approval reused when recovered; Docker workers retain the existing fresh-thread lineage break. Missing or unaccepted evidence and non-window limits fail as typed `rate_limited` without a reset promise; `rateLimitExceeded` and `sessionBudgetExceeded` are unchanged (#2361 tracks the former). Capture and publish can fail, so latest-work durability is conditional; each park can hold an issue lock and a run-bound hosted worker/PVC for up to the default 8 days, while fallback retries can exhaust the wait budget before a weekly reset.
+- **MR review rework now reads only comments from people with repository access and allowlisted review bots ([#2347](https://github.com/vtmocanu/uzi/issues/2347)).**
+  Review comments from authors without repository access, or whose access can't be verified in time, are withheld from the rework's snapshot and prompt (the agent sees only a fixed count note) and never trigger a rework. An admin allowlists bots such as CodeRabbit or Greptile in the new admin-only `mr_review_trusted_bots` setting (`<base_url>#<forge_user_id>` entries, matched by forge instance and numeric id; edit it in the Admin Settings "Trusted review bots" card, list it read-only with `uzi admin review-bots`); allowlisting only permits ingestion, and a trusted bot's summary comment never triggers. Reply and resolve are allowed only on threads with an eligible comment in the run's snapshot, so a wholly withheld thread is refused (403); resolving a mixed thread also resolves the outsider's replies in it. Comments that could not be verified are retried on later ticks and fire once their author checks out, and an on-demand rework answers a distinct 409 when that is the only reason it has nothing to do. Authors waiting for a check sit in a per-MR FIFO queue, so an outsider flood does not suppress an eligible finding unless the pending set (one entry per unverified author, accumulated across fires; near the cap, when superseding could not be guaranteed to fit, an author's older id is kept so an author may briefly hold two entries rather than risk losing both) exceeds 10,000 entries, but it can delay it; the delay is bounded only under stated conditions (see the MR review rework doc), a departure from the issue's zero-delay criterion that the maintainer accepted on 2026-10-07. **Upgrade note:** after upgrading, CodeRabbit, Greptile and other non-collaborator review bots stop triggering reworks and stop reaching the prompt until an admin allowlists them, and `mr_rework` runs already in flight replay no review comments and cannot reply or resolve; one that had already started (it has a session or a stored plan) fails at its next claim instead, so start a fresh Rework now from its source run. See [MR review rework](docs/mr-review-watcher.md#the-trust-model).
+- **One Usage card with an All time / Last 7 days toggle ([#2430](https://github.com/vtmocanu/uzi/pull/2430)).**
+  The dashboard's usage cards and per-user table merge into one card whose toggle (default Last 7 days, remembered per browser) switches personal and factory cost, failure rate, tokens, outcomes and top causes together; the per-user breakdown stays all time for now, and the old "need landing" count is now described as recoverable work that may already have been landed (`uzi admin usage` prints "recoverable").
 
-- **Higher default resource requests for the api and the CNPG database.**
-  The chart now requests 100m CPU / 320Mi for the api (was 50m / 128Mi) and 512Mi per CNPG instance (was 256Mi), matching what a live install actually uses, which reduces their eviction risk under node memory pressure. Limits are unchanged; override `api.resources` or `postgres.cluster.resources` to size differently.
-
-- **Codex runs provision JavaScript dependencies before implementation ([#1743](https://github.com/vtmocanu/uzi/issues/1743)).**
-  Dependency installation overlaps planning, reports installed and failed projects before the first implementation turn, and settles before capture, credential reconciliation and teardown across provider epochs.
+- **CI-fix and MR-rework runs stop neutrally when a verified remote branch advance supersedes their work ([#2404](https://github.com/vtmocanu/uzi/issues/2404)).**
+  When the worker proves a stable forward remote advance, further publication stops and the upgraded api records the run as cancelled with a branch-moved stop reason, rather than failed; the activity feed and owner API, board, CLI and web views carry the cause and exact observed remote tip. Publication refusals involving other run kinds, rewritten candidate history or unverifiable checks remain failures, with allowlisted code-only reasons rather than untrusted remote or command-error text. Upgrade the api before workers: older servers retain MR-only handling and a static reason, so CI-fix can still appear failed. The proof covers the observed remote interval, not later writes or whether an earlier push applied; recovery uses existing capture and custody, and a reclaimed run gets a new publication baseline. See [Worker setup](docs/worker-setup.md#publication-refusal-and-branch-supersession).
 
 ### Fixed
 
 - **Codex MR rework receives its captured review findings ([#2393](https://github.com/vtmocanu/uzi/issues/2393)).**
   Planning and ordinary implementation prompts, including cold starts and resumes, carry the shared untrusted review-comment block with the exact reply and resolve identifiers; approved plans retain precedence, and runs without review comments keep their existing prompts.
-
-- **Memory warnings and repository validation are more precise ([#296](https://github.com/vtmocanu/uzi/issues/296)).**
-  Memory advisories distinguish direct executable-availability claims from test-rig and feature prose, Git fixture initialization ignores inherited Git redirection and configuration variables, and Semgrep reports bounded sanitized diagnostics from a single scan per stage while rejecting timeouts, inconsistent reports and incomplete captures. Strict scanning and canary verification remain required when the scanner runs.
-
-- **Agent startup reclaims stale terminal journal temps ([#2308](https://github.com/vtmocanu/uzi/issues/2308)).**
-  Startup removes canonical regular-file terminal install temps before key loading so interrupted writes no longer pin empty runs; installed journals, unknown entries and live-write retirement protection remain intact.
-
-- **Recorded finding-group settlement errors no longer stop issue sync ([#1946](https://github.com/vtmocanu/uzi/issues/1946)).**
-  Board refresh and polling continue updating the issue cache when a recorded finding group cannot settle. The failed group stays claimed, is logged for diagnosis, and is retried on a later pass while other recorded groups on the page still settle.
-
-- **Plan cross-check preserves worker custody during planning ([#2149](https://github.com/vtmocanu/uzi/issues/2149)).**
-  Confined planning captures read the immutable baseline without granting writes, and queued transport waits can be cancelled without discarding assigned records. Cross-check migrations now follow the current default schema while retaining worker maintenance and Docker preferences.
-
-- **Agent lockfile: MCP TypeScript SDK bumped past GHSA-6qxp-vccf-f47h.**
-  `@modelcontextprotocol/sdk` (transitive via the Claude Agent SDK) moves from 1.30.0 to 1.32.1, clearing the high-severity advisory that reddened `validate-agent` on `main`.
-
-- **Runner-owned clone cleanup and executor advice fallback use pinned removal ([#2324](https://github.com/vtmocanu/uzi/issues/2324)).**
-  The clone remover and executor fallback pin directory identities and require their expected owner without opening private directories to other identities. Advice-data fallback removal requires positively confirmed clean disposal; unclean or unconfirmed disposal retains data and warns. Advice cwd cleanup still runs.
-
-- **Codex subagents prefer AGENTS.md repository instructions ([#2264](https://github.com/vtmocanu/uzi/issues/2264)).**
-  Child prompts guide AGENTS.md reads first and bounded Git-index metadata fallback for inaccessible instruction symlinks when Bash is already granted, while preserving file-tool denial and permission limits.
-
-- **Codex provider safety-policy refusals have a distinct failure origin ([#2321](https://github.com/vtmocanu/uzi/issues/2321)).**
-  Runs refused for `cyberPolicy` or `misalignmentPolicyViolation` now report `provider_policy_refusal` with a fixed, content-free reason. Run logs retain bounded root/child provenance with role, phase and opaque correlation IDs; the lead may continue after a child refusal. Refusals remain terminal execution failures, included in failure totals and eligible for retrospective judging.
-
-- **Additional worker-owned cleanup resists directory swaps ([#2324](https://github.com/vtmocanu/uzi/issues/2324)).**
-  Leftover job replacement, terminal skills-plugin cleanup, Codex advice working directories and session staging use descriptor-pinned removal. Refused leftovers are never reused for a job or adopted as session state; disposable cleanup warns and retains refused trees.
-
-- **A Claude run can Read its own oversized tool output ([#2332](https://github.com/vtmocanu/uzi/issues/2332)).**
-  When the SDK spills a large tool result to a file under the run's HOME and tells the agent where, the agent's `Read` of that one file is no longer denied as outside the worktree. Only the run's own current session spill directory qualifies, and only direct-child regular files (no symlinks or nested paths); Write, Edit, Glob, Grep, Bash screening, the secret and `.git` denies, and the chat, isolated, job-runner and Codex lanes are unchanged.
 
 ## [0.86.0] - 2026-10-06
 
@@ -113,6 +59,21 @@ through `[0.52.0]`.)
 - **Agent gates report quota and concurrency diagnostics ([#2240](https://github.com/vtmocanu/uzi/issues/2240)).**
   Gates print Node/libuv versions, detected parallelism, readable CPU quota, selected test-file concurrency and unit/M4 durations. A two-CPU default runs two unit files at a time; caller overrides and the procfs-denied serial cap keep precedence, and one-CPU workers keep Node's default.
 
+- **Hosted worker sizes `l` and `m` get more memory: `l` 14Gi request / 20Gi limit, `m` 8Gi request / 12Gi limit ([#2127](https://github.com/vtmocanu/uzi/issues/2127)).**
+  Workers running whole-program Go analyzer gates were OOMKilled at the old limits; the chart's worker LimitRange ceilings and memory quotas rise to match (CPU and disk are unchanged), at the cost of fewer `l` workers per node.
+
+- **Codex subscription runs can wait out a usage window and resume automatically ([#2360](https://github.com/vtmocanu/uzi/issues/2360)).**
+  The existing default-on usage-limit preference now covers recognized Codex window failures using structured evidence from the failed turn, with the latest exhausted-window reset or bounded fallback; Settings and per-run controls use shared Usage limits wording. Resume keeps the same Codex account and restores captured work, with approval reused when recovered; Docker workers retain the existing fresh-thread lineage break. Missing or unaccepted evidence and non-window limits fail as typed `rate_limited` without a reset promise; `rateLimitExceeded` and `sessionBudgetExceeded` are unchanged ([#2361](https://github.com/vtmocanu/uzi/pull/2361) tracks the former). Capture and publish can fail, so latest-work durability is conditional; each park can hold an issue lock and a run-bound hosted worker/PVC for up to the default 8 days, while fallback retries can exhaust the wait budget before a weekly reset.
+
+- **Higher default resource requests for the api and the CNPG database.**
+  The chart now requests 100m CPU / 320Mi for the api (was 50m / 128Mi) and 512Mi per CNPG instance (was 256Mi), matching what a live install actually uses, which reduces their eviction risk under node memory pressure. Limits are unchanged; override `api.resources` or `postgres.cluster.resources` to size differently.
+
+- **Codex runs provision JavaScript dependencies before implementation ([#1743](https://github.com/vtmocanu/uzi/issues/1743)).**
+  Dependency installation overlaps planning, reports installed and failed projects before the first implementation turn, and settles before capture, credential reconciliation and teardown across provider epochs.
+
+- **Ephemeral workers default to M, with chart-configurable sizing ([#2412](https://github.com/vtmocanu/uzi/issues/2412)).**
+  New ephemeral workers reserve 8Gi instead of 14Gi by default; operators can select S, M or L through `workers.ephemeralDefaultSize`. M now matches the earlier L preset: 1/4 CPU, 8Gi/12Gi memory and 25Gi persistent data; ephemeral data retains its separate 20Gi default. Persistent provisioning still preselects L; existing workers keep their stored size and existing M workers receive the CPU changes on their next controller roll, while existing 10Gi data PVCs stay at that size until reprovisioned. Upgrade note: an `UZI_EPHEMERAL_DEFAULT_SIZE` set under `api.config` or `api.secretEnv` now fails the render; move it to `workers.ephemeralDefaultSize`.
+
 ### Added
 
 - **Healthy busy workers no longer show custody attention.**
@@ -120,6 +81,30 @@ through `[0.52.0]`.)
 
 - **`uzi tui` has a workers tab ([#2275](https://github.com/vtmocanu/uzi/issues/2275)).**
   A `workers` tab (key `2`; pulls and ci move to `3` and `4`) lists your workers, or the factory's with `a`, attention first: state, kind, slots, CPU, memory, worst disk, version, heartbeat and what needs a human; `enter` or `→` opens a worker's detail (attention, reported runs, resources, configuration) and its runs. Uppercase `W` in a run opens its worker, and `esc`/`←` returns to where you came from. The fleet status rides right-aligned on the title line, the split's top pane can show floor or workers, and the floor names each run's worker on wide terminals.
+
+- **A worker that finds an unattributable runner-uid process now quarantines itself instead of starting credentialed work ([#2213](https://github.com/vtmocanu/uzi/issues/2213)).**
+  On a single-uid Linux worker, a worker-wide credential-free scan on every claim and quiescence proof that finds an unreadable runner-uid process nothing ties to a live run latches an in-memory quarantine, released only by restarting the worker container: the worker claims nothing, starts no forge-credentialed git child and no new Claude or Codex turn, a turn already in flight runs to its boundary, and active runs fail `worker_residue_blocked` with their clone, hold and recovery pins kept. A run stopped by its own blocking quiescence check fails with a plain residue-blocked reason, usually naming the process (no archive); runs stopped because the latch refused their turn, credentialed git or claim fail with a "this worker is quarantined" reason and, when the capture succeeds, a verified local archive of the committed work already in the worker bare (head and sha256 appended to the failure reason). Nothing is uploaded or released while latched except a completed run's custody release and a pre-clone park's hold release, and a completed run's clone is kept until cleaned by hand. It shows as `(quarantined)` in `uzi worker list` and `uzi admin workers`, in the TUI and web worker views, in `residue_quarantined_at`/`residue_quarantine_cause` on the worker JSON, and as the admin Health warning `fleet.quarantine`; see [Quarantined worker](docs/worker-setup.md#quarantined-worker) and ADR-2213. Under the uid split nothing changes (nor does a Codex run's own-mode proof, which does not scan processes), and a process that becomes unreadable after a clean scan is seen only at the next scan.
+
+- **Recurring single-label sweeps can consume their selector label after dispatch ([#2344](https://github.com/vtmocanu/uzi/issues/2344)).**
+  Single-label recurring sweeps can remove their selector after a run starts, with API, CLI and web controls. Fire history reports removal success or failure using the original label; failures keep the started run, and owners re-add a successfully removed label to retry failed work. The new On-deck sweep (`ondeck-sweep`) provides a triaged `on-deck` backlog drain every 10 minutes (`*/10 * * * *`, UTC), starting at most one issue when at least two slots remain under an unfinished-work limit of four, with best-effort selector removal after creation and an advisory missing-label check. Enable and Reset persist catalog capacity and removal values; owner edits mark divergence, exact restoration or Reset clears it, and editable gate/removal settings are not overlaid at fire time. Older catalog entries retain null gates and removal off; existing schedules keep their settings. The Every N minutes preset accepts 1, 2, 3, 4, 5, 6, 10, 12, 15, 20 and 30 as `*/N * * * *`; uneven steps such as `*/40` stay custom cron.
+
+- **Plan cross-check opt-in establishes a required gate for auto-approved plans ([#2149](https://github.com/vtmocanu/uzi/issues/2149)).**
+  Settings → Run defaults offers a per-user Plan cross-check switch when Claude and Codex are usable. An opted-in auto-approved Claude run sends its plan to a read-only Codex child before implementing: an exact-plan pass permits implementation, while changes requested, blocked, timeout, unavailable checker or submission failure normally forces a human gate. Codex leads park as unsupported. Irrecoverable receipt loss fails with `plan cross-check: preparation receipts irrecoverably lost`; presentation ACK loss fails with `plan cross-check: human-presentation ACK unrecoverable`; unresolved preparation ACKs after three attempts and an acknowledged forced human gate fail with `plan cross-check: preparation ACKs unrecoverable`. None of these delivery failures approves, retries indefinitely or enters recovery wait.
+
+- **Plan cross-check evidence is visible on the run page and CLI ([#2149](https://github.com/vtmocanu/uzi/issues/2149)).**
+  The web plan panel, run detail and activity feed show honest candidate outcomes, bounded hardened Markdown findings, a checker-run link and recorded model/effort and reported tokens/cost; a new cross-check event refreshes detail. Current gate reasons stay separate from earlier-plan evidence, which does not certify a human revision. Missing or inconsistent outcomes stay unavailable, and subscription usage is distinguished from metered cost. `uzi run get` renders bounded findings safely for the terminal; Slack carries the reason without findings. Dedicated slots, automatic checker revision, checker pins, the Codex-lead direction and Code cross-check remain outside this change.
+
+- **Capacity gates for scheduled sweeps**
+  Recurring label sweeps can wait for room in the owner’s unfinished work and send batches within the available room, with API and CLI controls and recorded capacity outcomes.
+
+- **Scheduled issue runs require human plan approval when issue input cannot qualify for automatic approval ([#2345](https://github.com/vtmocanu/uzi/issues/2345)).**
+  The API assesses repository author access, withholds ineligible or unknown comment bodies, and disables requested auto-approval for pinned-issue, label-sweep, and assigned-sweep runs with below-threshold or unverifiable input; CLI and web run views show the stored reasons while runs still queue and plan normally. Every issue run freezes its target title/body, including live target reads after edits or approval, while eligible late comments remain available through filtered reads. Claude/Codex planning context uses nonce fences for captured fields and assessed comments, and isolated research fences captured fields without restoring comments; these resist delimiter spoofing but do not guarantee protection from semantic injection or planning-time exfiltration. Schedule defaults remain ON, old transcript text and approvals are not retracted, and oversized/chunked GitHub/GitLab decoded-response memory hardening remains deferred.
+
+- **Advisory draft plans in run activity ([#2323](https://github.com/vtmocanu/uzi/issues/2323)).**
+  The latest valid explicit draft capture appears as Markdown in both activity views, labelled draft, unapproved, possibly incomplete, with a truncation notice when needed; earlier captures remain stored and submitted-plan approval stays separate.
+
+- **Time since the last failed run on Overview ([#2399](https://github.com/vtmocanu/uzi/issues/2399)).**
+  Your usage, Factory total, and the admin per-user breakdown show adaptive elapsed time since the last failed run; the cards also show completed runs since that failure and link to it. The admin usage CLI includes failure recency too; the usage cards omit the Top causes line, group recoverable failures in the legend, align their sections, keep the last-failure detail on one line, and put the value before each summary label.
 
 ### Fixed
 
@@ -156,6 +141,51 @@ through `[0.52.0]`.)
 - **Recovery distinguishes a rejected terminal record from verified work ([#1974](https://github.com/vtmocanu/uzi/issues/1974)).**
   After restart, a MAC-rejected terminal record is identified in run recovery and retains source custody without authorizing completion, replay, or extra retries. Export still requires an independently verified archive. Negotiated reconciliation can remove the rejected file after exact-generation custody and sibling holds settle; unsupported servers leave local bytes retained.
 
+- **Release-candidate update checks share strict tag validation ([#1923](https://github.com/vtmocanu/uzi/issues/1923)).**
+  Server release selection and TUI update prompts reject published `-rc.0` tags; the CLI skew warning still accepts valid build metadata on an RC binary stamp when choosing the upgrade formula.
+
+- **Memory warnings and repository validation are more precise ([#296](https://github.com/vtmocanu/uzi/issues/296)).**
+  Memory advisories distinguish direct executable-availability claims from test-rig and feature prose, Git fixture initialization ignores inherited Git redirection and configuration variables, and Semgrep reports bounded sanitized diagnostics from a single scan per stage while rejecting timeouts, inconsistent reports and incomplete captures. Strict scanning and canary verification remain required when the scanner runs.
+
+- **Manual vault locks retain their notification acknowledgement.**
+  An older unlock delayed during secret migration no longer erases a later manual lock’s acknowledgement, preventing unwanted unlock reminders while the vault remains locked.
+
+- **Agent startup reclaims stale terminal journal temps ([#2308](https://github.com/vtmocanu/uzi/issues/2308)).**
+  Startup removes canonical regular-file terminal install temps before key loading so interrupted writes no longer pin empty runs; installed journals, unknown entries and live-write retirement protection remain intact.
+
+- **Recorded finding-group settlement errors no longer stop issue sync ([#1946](https://github.com/vtmocanu/uzi/issues/1946)).**
+  Board refresh and polling continue updating the issue cache when a recorded finding group cannot settle. The failed group stays claimed, is logged for diagnosis, and is retried on a later pass while other recorded groups on the page still settle.
+
+- **Codex steering cancellation releases exact recovery custody after clean settlement ([#2365](https://github.com/vtmocanu/uzi/issues/2365)).**
+  Clean steering cancellation releases the exact claim generation’s recovery custody; incomplete proof retains local work and custody. Pre-settle reap warnings include validated, redacted Codex boundary diagnostics, and pin logs distinguish stored finalization provenance from early pins.
+
+- **Plan cross-check preserves worker custody during planning ([#2149](https://github.com/vtmocanu/uzi/issues/2149)).**
+  Confined planning captures read the immutable baseline without granting writes, and queued transport waits can be cancelled without discarding assigned records. Cross-check migrations now follow the current default schema while retaining worker maintenance and Docker preferences.
+
+- **Agent lockfile: MCP TypeScript SDK bumped past GHSA-6qxp-vccf-f47h.**
+  `@modelcontextprotocol/sdk` (transitive via the Claude Agent SDK) moves from 1.30.0 to 1.32.1, clearing the high-severity advisory that reddened `validate-agent` on `main`.
+
+- **Runner-owned clone cleanup and executor advice fallback use pinned removal ([#2324](https://github.com/vtmocanu/uzi/issues/2324)).**
+  The clone remover and executor fallback pin directory identities and require their expected owner without opening private directories to other identities. Advice-data fallback removal requires positively confirmed clean disposal; unclean or unconfirmed disposal retains data and warns. Advice cwd cleanup still runs.
+
+- **Codex subagents prefer AGENTS.md repository instructions ([#2264](https://github.com/vtmocanu/uzi/issues/2264)).**
+  Child prompts guide AGENTS.md reads first and bounded Git-index metadata fallback for inaccessible instruction symlinks when Bash is already granted, while preserving file-tool denial and permission limits.
+
+- **Codex provider safety-policy refusals have a distinct failure origin ([#2321](https://github.com/vtmocanu/uzi/issues/2321)).**
+  Runs refused for `cyberPolicy` or `misalignmentPolicyViolation` now report `provider_policy_refusal` with a fixed, content-free reason. Run logs retain bounded root/child provenance with role, phase and opaque correlation IDs; the lead may continue after a child refusal. Refusals remain terminal execution failures, included in failure totals and eligible for retrospective judging.
+
+- **Additional worker-owned cleanup resists directory swaps ([#2324](https://github.com/vtmocanu/uzi/issues/2324)).**
+  Leftover job replacement, terminal skills-plugin cleanup, Codex advice working directories and session staging use descriptor-pinned removal. Refused leftovers are never reused for a job or adopted as session state; disposable cleanup warns and retains refused trees.
+
+- **A Claude run can Read its own oversized tool output ([#2332](https://github.com/vtmocanu/uzi/issues/2332)).**
+  When the SDK spills a large tool result to a file under the run's HOME and tells the agent where, the agent's `Read` of that one file is no longer denied as outside the worktree. Only the run's own current session spill directory qualifies, and only direct-child regular files (no symlinks or nested paths); Write, Edit, Glob, Grep, Bash screening, the secret and `.git` denies, and the chat, isolated, job-runner and Codex lanes are unchanged.
+
+- **Recovery custody retains complete candidate inventories ([#1924](https://github.com/vtmocanu/uzi/issues/1924)).**
+  Workers retain divergent unpublished heads under worker-local refs, distinguish them from durable remote checkpoints in the feed, and freeze a recovery-only aggregate whose ancestry preserves the original heads with one current source tree. Inventory-guarded generations keep custody open despite completion or an earlier available archive until the exact final covering archive or verified empty inventory is acknowledged; an owner-readable receipt identifies the selected capture and coverage digest. The selected archive is protected while its local worker exists, and physical worker deletion renews the configured normal ready-retention window (7 days by default); earlier non-final and legacy captures keep their existing TTL. Dirty or unverified source and pending final acknowledgments retain custody with bounded retries. A guarded claim that parks or fails before its clone closes its own empty hold with a settled release once nothing is proven adopted locally. Older APIs report unguarded generations without promising complete terminal or reclamation protection; local pins alone are not durable recovery. A run retains at most 64 such heads: at the limit the worker keeps the existing pins and the clone and stops the run as a preservation failure instead of letting a rewriting agent grow worker-local pins without bound, and the feed announces each retained head only once.
+
+- **Checkpoint pushes with lost acknowledgements can be confirmed while a run is live ([#2395](https://github.com/vtmocanu/uzi/issues/2395)).**
+  After the broker records an actual advance or a potentially sent push with an unknown outcome, reconciliation can confirm the matching forge tip. Later unchanged-tip retries and restarted claims recognize the durable checkpoint without creating live retention or deletion obligations. Unclassified attempts remain pending competing claims; another run's claims and newer checkpoint or slot state prevent adoption. Broker acknowledgements retain their raw success/rejection markers and have a cumulative 1 MiB response limit.
+  Migration 00306 is additive, leaves legacy attempts pending without backfill, and retains readiness evidence on rollback. A crash before disposition recording can still leave a landed push pending. The existing terminal stalled-sender hazard remains outside this fix (finding 5b641106-d2cf-4767-813f-e29d0692c228).
 
 ## [0.85.2] - 2026-10-05
 

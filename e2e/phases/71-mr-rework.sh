@@ -23,8 +23,13 @@
 # phase drives the detector end to end and asserts the id-gate in both directions.
 #
 # The forge-fake note author defaults to id 2 (a reviewer): forge-fake's /api/v4/user
-# returns id 1 (the bot), and BuildReviewCommentsSnapshot drops notes authored by the bot
-# id, so a bot-authored note is a SILENT no-fire. Every injected note passes author_id=2.
+# returns id 1 (the bot), and the review assessor (workersvc.ReviewAssessor) drops notes
+# authored by the bot id, so a bot-authored note is a SILENT no-fire. Every injected note
+# passes author_id=2. Since issue #2347 the watcher also asks the forge whether the author may
+# be trusted (GitLab: GET /users/2 then GET /projects/:id/members/all/2). forge-fake answers
+# for id 2 as an active project member at Developer level (its GITLAB_USERS table), so the
+# note stays eligible; an author the fake does not know is withheld as permission_unknown
+# and this phase would stop firing.
 #
 # WATCHED-REF CAP (issue #996): card #$IID (agent/issue-$IID) is the OLDEST agent branch in
 # the suite — it is the phase-15 happy-path branch and this phase runs last. Both GATE 1's

@@ -1,14 +1,11 @@
 package workersvc
 
 import (
-	"context"
-	"log/slog"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
-	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // ReviewCommentSnapshot is one MR review comment captured for an mr_rework run
@@ -34,10 +31,25 @@ type ReviewCommentSnapshot struct {
 // ReviewCommentsSnapshot is the structured JSONB stored in runs.review_comments and
 // carried on the mr_rework claim. Truncated is set whenever the thread was clipped
 // to fit the shared #381 bounds — i.e. the worker is not seeing every comment.
+//
+// Version is ReviewSnapshotVersion for every snapshot built since author eligibility reached
+// this lane (issue #2347) and 0 for a legacy row, whose comments were never assessed: the
+// reply/resolve scope check authorizes nothing from it and the claim replays it empty.
+// Comments holds ELIGIBLE comments only; the withheld counts report how many other
+// (non-self) comments were left out, without carrying any of their content.
 type ReviewCommentsSnapshot struct {
-	Comments  []ReviewCommentSnapshot `json:"comments"`
-	Truncated bool                    `json:"truncated"`
+	Version             int                     `json:"version"`
+	Comments            []ReviewCommentSnapshot `json:"comments"`
+	Truncated           bool                    `json:"truncated"`
+	WithheldNotEligible int                     `json:"withheld_not_eligible"`
+	WithheldUnknown     int                     `json:"withheld_unknown"`
 }
+
+// ReviewSnapshotVersion is the snapshot version whose comments are author-assessed. It is the
+// review lane's own contract (pinned to 2 by TestReviewSnapshotVersionIsPinnedToTwo), not an
+// alias of the issue lane's issueinput.SnapshotVersion: bumping one lane must not silently
+// re-version, and so legacy-withhold, the other's stored snapshots.
+const ReviewSnapshotVersion = 2
 
 // CodeRabbit tags its non-actionable top-level notes with these HTML markers. They
 // are forge-agnostic: on GitLab/Forgejo CodeRabbit posts as an ordinary user (no
@@ -83,10 +95,12 @@ func isBotControlComment(body string) bool {
 // sentinel defaults to actionable, so the trigger set can only ever shrink relative to
 // the pre-#1142 behavior, never grow.
 //
-// It reads only the fields BuildReviewCommentsSnapshot already carries; the poller
-// detector (poller/mr_review_watch.go) calls it to compute the trigger high-water,
-// while the full snapshot — including the non-actionable notes — still rides a run
-// that fires (they are useful context; the change is to what COUNTS, not what is read).
+// It reads only the fields ReviewCommentSnapshot carries; the poller detector
+// (poller/mr_review_watch.go) calls it, through ReviewAssessment, to compute the trigger
+// high-water, while the full eligible snapshot — including the non-actionable notes — still
+// rides a run that fires (they are useful context; the change is to what COUNTS, not what
+// is read). A summary note from an allowlisted review bot is never actionable, whatever its
+// text (ReviewAssessment applies that on top of this classifier).
 func IsActionableReviewComment(c ReviewCommentSnapshot) bool {
 	if c.ReviewState != forge.ReviewCommentSummary {
 		return true
@@ -103,63 +117,25 @@ func IsActionableReviewComment(c ReviewCommentSnapshot) bool {
 	return true
 }
 
-// BuildReviewCommentsSnapshot filters, caps, and orders an MR's review comments
-// into the structured snapshot the mr_rework run carries (PRD #700 M2). It REUSES
-// the #381 issue-comment caps (maxIssueCommentsBytes / maxIssueCommentsCount) and
-// the same D1 bot self-filter and D9 unknown-bot-id bail, so the two untrusted-input
-// snapshots stay bounded identically.
-//
-// It returns nil (→ store NULL) whenever the feature should be omitted entirely: an
-// unknown bot id (D9), or nothing left after the bot self-filter (D1). The self-filter
-// drops the CONNECTION's own bot (botForgeUserID) while KEEPING third-party review
-// bots like CodeRabbit — that third-party feedback is the whole point of the feature.
-// Input is oldest-first (the M1 driver guarantee) and the output stays oldest-first
-// among kept comments; the byte cap charges body bytes only, same truncation semantics
-// as issueinput.ProjectThread's body-byte bounds.
-//
-// It is exported because the M3 poller detector (poller/mr_review_watch.go) builds the
-// snapshot itself — it needs the kept comments to compute the high-water mark and gate
-// on review-landedness — then passes it to CreateAutoMRReworkRun, mirroring how the
-// ci-autofix detector builds a FailureSnapshot and passes it to CreateAutoCIFixRun.
-func BuildReviewCommentsSnapshot(comments []forge.MRComment, botForgeUserID int64) *ReviewCommentsSnapshot {
-	// D9 fail-safe: an unknown/zero bot id cannot power the D1 self-filter, so omit
-	// the feature rather than risk feeding uzi its own comments back into the prompt.
-	if botForgeUserID == 0 {
-		return nil
-	}
-
-	// D1 self-filter: drop every comment uzi's OWN bot authored (KEEP third-party
-	// review bots), preserving order.
-	kept := make([]forge.MRComment, 0, len(comments))
-	for _, c := range comments {
-		if c.AuthorForgeUserID == botForgeUserID {
-			continue
-		}
-		kept = append(kept, c)
-	}
-	if len(kept) == 0 {
-		return nil
-	}
-
+// capReviewComments applies the shared #381 count and byte caps to the ELIGIBLE comments,
+// oldest-first in and out, keeping the NEWEST tail: the count cap first, so a flood of tiny
+// comments cannot retain an unbounded number of entries, then the byte cap over body bytes.
+// A single newest body over the byte cap is cut on a UTF-8 rune boundary. The caps only ever
+// see eligible comments, so a flood of withheld ones cannot evict an eligible comment.
+func capReviewComments(kept []ReviewCommentSnapshot) ([]ReviewCommentSnapshot, bool) {
 	truncated := false
-
-	// Count cap over the NEWEST tail, applied before the byte cap so a flood of tiny
-	// comments cannot retain an unbounded number of entries (metadata amplification).
 	if len(kept) > maxIssueCommentsCount {
 		kept = kept[len(kept)-maxIssueCommentsCount:]
 		truncated = true
 	}
-
-	// D4 byte cap over the NEWEST tail. Sum the kept bodies; if they fit, keep all.
 	total := 0
 	for _, c := range kept {
 		total += len(c.Body)
 	}
 	if total > maxIssueCommentsBytes {
 		truncated = true
-		// Walk from the newest (last) backward, accumulating until adding the
-		// next-older body would exceed the cap; the retained window is [start:].
-		// Always keep at least the single newest comment.
+		// Walk from the newest backward, accumulating until adding the next-older body
+		// would exceed the cap; the retained window is [start:]. Always keep the newest.
 		start := len(kept) - 1
 		sum := len(kept[start].Body)
 		for i := len(kept) - 2; i >= 0; i-- {
@@ -170,51 +146,9 @@ func BuildReviewCommentsSnapshot(comments []forge.MRComment, botForgeUserID int6
 			start = i
 		}
 		kept = kept[start:]
-		// If the single newest comment's body alone exceeds the cap, truncate it
-		// byte-safe on a UTF-8 rune boundary (shared with the issue-comment path).
 		if len(kept) == 1 && len(kept[0].Body) > maxIssueCommentsBytes {
 			kept[0].Body = truncateCommentBody(kept[0].Body)
 		}
 	}
-
-	out := make([]ReviewCommentSnapshot, 0, len(kept))
-	for _, c := range kept {
-		out = append(out, ReviewCommentSnapshot{
-			ID:                c.ID,
-			AuthorUsername:    c.AuthorUsername,
-			AuthorForgeUserID: c.AuthorForgeUserID,
-			CreatedAt:         c.CreatedAt,
-			Body:              c.Body,
-			Path:              c.Path,
-			Line:              c.Line,
-			ReplyID:           c.ReplyID,
-			ResolveID:         c.ResolveID,
-			HeadSHA:           c.HeadSHA,
-			ReviewState:       c.ReviewState,
-		})
-	}
-	return &ReviewCommentsSnapshot{Comments: out, Truncated: truncated}
-}
-
-// fetchReviewCommentsSnapshot builds a forge driver from the run's repo connection,
-// reads the MR's review comments, and returns the filtered/capped snapshot (PRD #700
-// M2). It mirrors fetchIssueCommentsSnapshot but reads the MR (mrIID) rather than the
-// issue. Returns nil (→ NULL) on any error or when the D1/D9 filter leaves nothing — a
-// review-comment snapshot is best-effort run CONTEXT, never a reason to fail creation.
-//
-// It has no production caller yet; M3's CreateAutoMRReworkRun will call it. The
-// degrade-on-failure test in review_comments_test.go references it so the dead-code
-// gate does not flag it.
-func (s *Service) fetchReviewCommentsSnapshot(ctx context.Context, row store.GetRepoForUserRow, mrIID int64) *ReviewCommentsSnapshot {
-	f, err := s.forges.ForgeForConnection(row.ForgeType, row.BaseUrl, row.TokenCiphertext)
-	if err != nil {
-		slog.Error("workersvc: build forge for review comments", "mr_iid", mrIID, "error", err)
-		return nil
-	}
-	comments, err := f.ListMergeRequestComments(ctx, row.ForgeProjectID, mrIID)
-	if err != nil {
-		slog.Error("workersvc: list merge request comments", "mr_iid", mrIID, "error", err) // err is PAT-redacted by the driver
-		return nil
-	}
-	return BuildReviewCommentsSnapshot(comments, row.BotForgeUserID)
+	return kept, truncated
 }

@@ -268,8 +268,9 @@ func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRRew
 
 const createManualMRReworkRunAndAdvance = `-- name: CreateManualMRReworkRunAndAdvance :one
 WITH led AS (
-    INSERT INTO mr_rework_ledger (repo_id, ref, high_water)
-    SELECT $2::uuid, $5, $11
+    INSERT INTO mr_rework_ledger (repo_id, ref, high_water, pending_unknown_ids)
+    SELECT $2::uuid, $5, $11,
+           mr_rework_merge_pending('{}'::bigint[], $12::bigint[], $13::bigint[], $14::bigint[], $15::bigint[], 0)
     WHERE NOT EXISTS (
         SELECT 1 FROM runs
         WHERE repo_id = $2::uuid
@@ -280,6 +281,7 @@ WITH led AS (
     ON CONFLICT (repo_id, ref) DO UPDATE
     SET high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
         halt_notified = false,
+        pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, $12::bigint[], $13::bigint[], $14::bigint[], $15::bigint[], mr_rework_ledger.high_water),
         updated_at    = now()
 )
 INSERT INTO runs (
@@ -304,17 +306,21 @@ RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, statu
 `
 
 type CreateManualMRReworkRunAndAdvanceParams struct {
-	UserID           uuid.UUID   `json:"user_id"`
-	RepoID           uuid.UUID   `json:"repo_id"`
-	IssueTitle       string      `json:"issue_title"`
-	IssueDescription string      `json:"issue_description"`
-	PipelineRef      pgtype.Text `json:"pipeline_ref"`
-	MrIid            pgtype.Int8 `json:"mr_iid"`
-	TargetRunID      pgtype.UUID `json:"target_run_id"`
-	ReviewComments   []byte      `json:"review_comments"`
-	WaitOnLimit      bool        `json:"wait_on_limit"`
-	Harness          string      `json:"harness"`
-	HighWater        int64       `json:"high_water"`
+	UserID              uuid.UUID   `json:"user_id"`
+	RepoID              uuid.UUID   `json:"repo_id"`
+	IssueTitle          string      `json:"issue_title"`
+	IssueDescription    string      `json:"issue_description"`
+	PipelineRef         pgtype.Text `json:"pipeline_ref"`
+	MrIid               pgtype.Int8 `json:"mr_iid"`
+	TargetRunID         pgtype.UUID `json:"target_run_id"`
+	ReviewComments      []byte      `json:"review_comments"`
+	WaitOnLimit         bool        `json:"wait_on_limit"`
+	Harness             string      `json:"harness"`
+	HighWater           int64       `json:"high_water"`
+	PendingAdd          []int64     `json:"pending_add"`
+	PendingRemove       []int64     `json:"pending_remove"`
+	PendingSuperseded   []int64     `json:"pending_superseded"`
+	PendingSupersededBy []int64     `json:"pending_superseded_by"`
 }
 
 // ATOMIC on-demand (manual) mr_rework create + ledger advance (PRD #1202, review-finding
@@ -348,6 +354,10 @@ func (q *Queries) CreateManualMRReworkRunAndAdvance(ctx context.Context, arg Cre
 		arg.WaitOnLimit,
 		arg.Harness,
 		arg.HighWater,
+		arg.PendingAdd,
+		arg.PendingRemove,
+		arg.PendingSuperseded,
+		arg.PendingSupersededBy,
 	)
 	var i Run
 	err := row.Scan(
@@ -548,7 +558,7 @@ func (q *Queries) DeleteMRReworkLedgerNotIn(ctx context.Context, repoID uuid.UUI
 }
 
 const getMRReworkLedger = `-- name: GetMRReworkLedger :one
-SELECT repo_id, ref, attempt_count, high_water, halt_notified, updated_at
+SELECT repo_id, ref, attempt_count, high_water, halt_notified, updated_at, pending_unknown_ids
 FROM mr_rework_ledger
 WHERE repo_id = $1::uuid AND ref = $2
 `
@@ -572,6 +582,7 @@ func (q *Queries) GetMRReworkLedger(ctx context.Context, arg GetMRReworkLedgerPa
 		&i.HighWater,
 		&i.HaltNotified,
 		&i.UpdatedAt,
+		&i.PendingUnknownIds,
 	)
 	return i, err
 }
@@ -700,6 +711,35 @@ func (q *Queries) ListMRReworkCandidates(ctx context.Context, repoID uuid.UUID) 
 	return items, nil
 }
 
+const removeMRReworkPendingIDs = `-- name: RemoveMRReworkPendingIDs :exec
+UPDATE mr_rework_ledger
+SET pending_unknown_ids = ARRAY(
+    SELECT x FROM (
+        SELECT unnest(mr_rework_ledger.pending_unknown_ids) AS x
+        EXCEPT
+        SELECT r AS x FROM unnest(COALESCE($1::bigint[], '{}'::bigint[])) AS r
+    ) t
+    ORDER BY x
+)
+WHERE repo_id = $2::uuid AND ref = $3
+`
+
+type RemoveMRReworkPendingIDsParams struct {
+	Ids    []int64   `json:"ids"`
+	RepoID uuid.UUID `json:"repo_id"`
+	Ref    string    `json:"ref"`
+}
+
+// Drop ids from a ledger row's pending_unknown_ids WITHOUT spending a cycle (issue #2347): the
+// pending ids the snapshot caps evicted (an eligible pending comment that no longer fits the
+// capped snapshot falls back to human review, so it must stop re-triggering the assessment).
+// Array subtraction only: attempt_count, high_water, halt_notified and updated_at are left
+// alone, and no row is created when the ref has none.
+func (q *Queries) RemoveMRReworkPendingIDs(ctx context.Context, arg RemoveMRReworkPendingIDsParams) error {
+	_, err := q.db.Exec(ctx, removeMRReworkPendingIDs, arg.Ids, arg.RepoID, arg.Ref)
+	return err
+}
+
 const setMRReworkHaltNotified = `-- name: SetMRReworkHaltNotified :exec
 INSERT INTO mr_rework_ledger (repo_id, ref, halt_notified)
 VALUES ($1::uuid, $2, true)
@@ -724,19 +764,25 @@ func (q *Queries) SetMRReworkHaltNotified(ctx context.Context, arg SetMRReworkHa
 }
 
 const upsertMRReworkLedger = `-- name: UpsertMRReworkLedger :exec
-INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water)
-VALUES ($1::uuid, $2, 1, $3)
+INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water, pending_unknown_ids)
+VALUES ($1::uuid, $2, 1, $3,
+        mr_rework_merge_pending('{}'::bigint[], $4::bigint[], $5::bigint[], $6::bigint[], $7::bigint[], 0))
 ON CONFLICT (repo_id, ref) DO UPDATE
 SET attempt_count = mr_rework_ledger.attempt_count + 1,
     high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
     halt_notified = false,
+    pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, $4::bigint[], $5::bigint[], $6::bigint[], $7::bigint[], mr_rework_ledger.high_water),
     updated_at    = now()
 `
 
 type UpsertMRReworkLedgerParams struct {
-	RepoID    uuid.UUID `json:"repo_id"`
-	Ref       string    `json:"ref"`
-	HighWater int64     `json:"high_water"`
+	RepoID              uuid.UUID `json:"repo_id"`
+	Ref                 string    `json:"ref"`
+	HighWater           int64     `json:"high_water"`
+	PendingAdd          []int64   `json:"pending_add"`
+	PendingRemove       []int64   `json:"pending_remove"`
+	PendingSuperseded   []int64   `json:"pending_superseded"`
+	PendingSupersededBy []int64   `json:"pending_superseded_by"`
 }
 
 // The PROCEED path: record that a rework cycle was spent and advance the consumed
@@ -747,7 +793,22 @@ type UpsertMRReworkLedgerParams struct {
 // false on every proceed (INSERT defaults it false): the latch is one comment per
 // halt episode, so once a proceed advances the counter a later cap halt can comment
 // again.
+// pending_unknown_ids (issue #2347): the permission-unknown comment ids the mark moved past
+// (@pending_add, kept only when above the mark the row had BEFORE this update) merged with
+// the existing set, minus @pending_remove (ids consumed, now not-eligible, or gone). An author's
+// older id is replaced by its newer representative only through the parallel
+// @pending_superseded / @pending_superseded_by pairs, which the merge applies only when the
+// replacement is retained in the same statement (a stale writer's rejected add leaves the older
+// id in place); the merge keeps the oldest 10000 slots (mr_rework_merge_pending).
 func (q *Queries) UpsertMRReworkLedger(ctx context.Context, arg UpsertMRReworkLedgerParams) error {
-	_, err := q.db.Exec(ctx, upsertMRReworkLedger, arg.RepoID, arg.Ref, arg.HighWater)
+	_, err := q.db.Exec(ctx, upsertMRReworkLedger,
+		arg.RepoID,
+		arg.Ref,
+		arg.HighWater,
+		arg.PendingAdd,
+		arg.PendingRemove,
+		arg.PendingSuperseded,
+		arg.PendingSupersededBy,
+	)
 	return err
 }

@@ -1,0 +1,16 @@
+{
+  "last_failed_at": "2020-01-02T03:04:05Z",
+  "last_failed_run_id": "x",
+  "last_failed_origin": "x",
+  "last_failed_user_id": "x",
+  "completed_since_last_failure": 1,
+  "finished": 1,
+  "completed": 1,
+  "cancelled": 1,
+  "plan_rejected": 1,
+  "failed": 1,
+  "needs_landing": 1,
+  "fail_origins": {
+    "x": 1
+  }
+}

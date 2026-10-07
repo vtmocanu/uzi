@@ -204,7 +204,9 @@ func TestASecondReconcileTreatsAlreadyExistsAsSuccess(t *testing.T) {
 // goes RED (two pvc creates reach the apiserver).
 func TestReconcileDoesNotRecreateAlreadyObservedPVCs(t *testing.T) {
 	existing := deployedWorker("w1", 0, "h")
-	m, client := newMat(t, existing, pvcFor("w1", "data"), pvcFor("w1", "nix"))
+	dataPVC := pvcFor("w1", "data")
+	dataPVC.Spec.Resources.Requests = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")}
+	m, client := newMat(t, existing, dataPVC, pvcFor("w1", "nix"))
 
 	// Steady state: the pod already holds its token, so join_token is nil (write no
 	// Secret). The PVCs and Deployment were seen by the last Observe.
@@ -231,6 +233,16 @@ func TestReconcileDoesNotRecreateAlreadyObservedPVCs(t *testing.T) {
 			"An unconditional create every tick re-charges the ResourceQuota (used.requests.storage) at admission "+
 			"and k8s never decrements it on the AlreadyExists rejection (upstream #119593), pinning the quota at its "+
 			"hard limit until new workers are refused. The create must be gated on obs.HasDataPVC/HasNixPVC.", pvcCreates)
+	}
+	// Issue #2412: increasing M's preset data size must leave an existing
+	// 10Gi claim untouched; only a newly provisioned worker gets 25Gi.
+	kept, err := client.CoreV1().PersistentVolumeClaims(testConfig().Namespace).Get(context.Background(), dataPVC.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := kept.Spec.Resources.Requests[corev1.ResourceStorage]
+	if storage.Cmp(resource.MustParse("10Gi")) != 0 {
+		t.Errorf("existing data PVC changed to %s, want 10Gi", storage.String())
 	}
 	assertNoSecretReads(t, client)
 }

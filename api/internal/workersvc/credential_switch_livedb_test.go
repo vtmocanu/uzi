@@ -1017,62 +1017,87 @@ func TestTerminalTransitionSettlesCredentialSwitchSignalLiveDB(t *testing.T) {
 	}
 }
 
-// TestSetStateBranchMovedSupersedeUnderFenceLiveDB (PRD #1247 fix round) pins the branch_moved
-// supersede against the FOR UPDATE generation fence. SetState's failed/branch_moved arm runs INSIDE
-// the fence transaction (a credential_switch_v1 worker's generation-bearing report opens it, holding
-// a row lock on the run). The supersede must therefore run on the TX-bound querier: issuing it on
-// the POOL (the s.q -> q bug) waits on the transaction's own uncommitted lock until the context
-// deadline, hanging every capability-worker mr_rework branch_moved report.
-//
-// Asserts on the RETURNED (got, applied, err), NOT just the DB row: on the broken code the blocked
-// pool UPDATE may commit AFTER the fence tx is cancelled while SetState returns a deadline error and
-// SKIPS the terminal automation — so a status-only check could false-green. Reverting q -> s.q makes
-// SetState return a context-deadline error (err != nil / applied false), reddening this.
+// TestSetStateBranchMovedSupersedeUnderFenceLiveDB exercises both allowed kinds
+// through the generation fence, including ownership, terminal and hold guards.
 func TestSetStateBranchMovedSupersedeUnderFenceLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
-	svc := fenceSvc(env) // wires txBeginner: a generation-bearing report opens the FOR UPDATE fence tx
+	svc := fenceSvc(env)
 	o := seedReevalOwner(t, env, BindModeAuto, false)
-	// A capability worker so the report engages the fence transaction.
 	env.exec(`UPDATE workers SET protocol_capabilities = $2 WHERE id = $1`, o.workerID, []string{capability.CredentialSwitchV1})
 	wkr := store.Worker{ID: o.workerID, UserID: o.userID}
-	g := int64(5)
-
-	// The reworked target, then the mr_rework run (runs_kind_shape: repo_id/pipeline_ref/mr_iid/
-	// target_run_id NOT NULL, issue_iid NULL), running at generation G under the capability worker.
 	targetID := uuid.New()
-	env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, status_since)
-	          VALUES ($1, $2, $3, 'issue', 990, 't', 'd', 'completed', now())`, targetID, o.userID, o.repoID)
-	runID := uuid.New()
-	env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_title, issue_description, status, status_since,
-	             worker_id, started_at, claim_generation, pipeline_ref, mr_iid, target_run_id)
-	          VALUES ($1, $2, $3, 'mr_rework', 't', 'd', 'running', now(), $4, now(), $5, 'agent/issue-990', 77, $6)`,
-		runID, o.userID, o.repoID, o.workerID, g, targetID)
-
-	// A bounded deadline: with the fix (tx querier) the supersede completes in a few ms; with the bug
-	// (pool querier) it blocks on the fence tx's own lock until this deadline.
-	ctx, cancel := context.WithTimeout(env.ctx, 5*time.Second)
-	defer cancel()
-	moved := true
-	reason := "the MR branch moved under the rework"
-	// The bounded 5s context is the discriminator: on the broken s.q path the supersede blocks on the
-	// fence tx's own lock until this deadline, so SetState returns a context-deadline err (caught by
-	// the first assertion below). A wall-clock threshold is deliberately NOT asserted — it adds no
-	// discriminating power over err != nil and would only false-red correct code under CI/DB load.
-	got, applied, err := svc.SetState(ctx, wkr, runID, StateRequest{
-		State: "failed", FailureReason: &reason, BranchMoved: &moved, ClaimGeneration: &g,
-	})
-
-	if err != nil {
-		t.Fatalf("SetState(branch_moved under fence) err = %v (want nil) — the supersede must run on the tx querier, not deadlock on the pool", err)
-	}
-	if !applied {
-		t.Fatal("applied=false: the branch_moved supersede did not apply")
-	}
-	if got.Status != "cancelled" {
-		t.Fatalf("returned status = %q, want cancelled", got.Status)
-	}
-	if got.StopKind.String != "branch_moved" {
-		t.Fatalf("returned stop_kind = %q, want branch_moved", got.StopKind.String)
+	env.exec(`INSERT INTO runs (id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,status)
+ VALUES ($1,$2,$3,'issue',990,'t','d','completed')`, targetID, o.userID, o.repoID)
+	for kindIndex, kind := range []string{"mr_rework", "ci_fix"} {
+		for guardIndex, guard := range []string{"accepted", "wrong_worker", "stale_generation", "released", "terminal", "budget_exhausted", "completion_blocked"} {
+			t.Run(kind+"/"+guard, func(t *testing.T) {
+				exec := func(sql string, args ...any) {
+					t.Helper()
+					if _, err := env.pool.Exec(env.ctx, sql, args...); err != nil {
+						t.Fatalf("exec %q: %v", sql, err)
+					}
+				}
+				// Guard no-ops leave active runs, so each case needs its own MR and pipeline.
+				identity := int64(kindIndex*7 + guardIndex)
+				g := int64(5)
+				runID := uuid.New()
+				exec(`INSERT INTO runs (id,user_id,repo_id,kind,issue_title,issue_description,status,worker_id,started_at,claim_generation,pipeline_ref,mr_iid,target_run_id,pipeline_id,failure_reason,fail_origin)
+     VALUES ($1,$2,$3,$4,'t','d','running',$5,now(),$6,$7,$8,$9,$10,'old failure','agent_failure')`,
+					runID, o.userID, o.repoID, kind, o.workerID, g, "agent/m2-"+runID.String(), 77+identity, targetID, 123+identity)
+				reportWorker := wkr
+				switch guard {
+				case "wrong_worker":
+					reportWorker.ID = uuid.New()
+				case "stale_generation":
+					g--
+				case "released":
+					exec(`UPDATE runs SET claim_released_at=now() WHERE id=$1`, runID)
+				case "terminal":
+					exec(`UPDATE runs SET status='completed' WHERE id=$1`, runID)
+				case "budget_exhausted", "completion_blocked":
+					exec(`UPDATE runs SET status='paused',hold_reason=$2 WHERE id=$1`, runID, guard)
+				}
+				before := mustRun(t, env, runID)
+				// Each fixture makes one report with a five-second deadline; siblings run independently.
+				ctx, cancel := context.WithTimeout(env.ctx, 5*time.Second)
+				defer cancel()
+				moved := true
+				reason := branchMovedCanonical
+				got, applied, err := svc.SetState(ctx, reportWorker, runID, StateRequest{State: "failed", BranchMoved: &moved, FailureReason: &reason, ClaimGeneration: &g})
+				if guard == "accepted" {
+					if err != nil || !applied {
+						t.Fatalf("SetState: applied=%v err=%v", applied, err)
+					}
+					for _, row := range []store.Run{got, mustRun(t, env, runID)} {
+						if row.Status != "cancelled" || row.StopKind.String != "branch_moved" || !row.StopReason.Valid || row.StopReason.String != branchMovedDetailedReason || row.FailOrigin.Valid || row.FailureReason.Valid {
+							t.Fatalf("supersession: status=%s kind=%v reason=%v origin=%v failure=%v", row.Status, row.StopKind, row.StopReason, row.FailOrigin, row.FailureReason)
+						}
+					}
+				} else {
+					if applied {
+						t.Fatal("guarded report applied")
+					}
+					switch guard {
+					case "wrong_worker":
+						if !errors.Is(err, ErrRunNotOwned) {
+							t.Fatalf("wrong worker: %v", err)
+						}
+					case "stale_generation", "released":
+						if !errors.Is(err, ErrStaleClaim) {
+							t.Fatalf("stale claim: %v", err)
+						}
+					default:
+						if err != nil {
+							t.Fatal(err)
+						}
+					}
+					after := mustRun(t, env, runID)
+					if after.Status != before.Status || after.StopKind != before.StopKind || after.StopReason != before.StopReason || after.FailureReason != before.FailureReason || after.FailOrigin != before.FailOrigin {
+						t.Fatalf("guarded run changed: before=%+v after=%+v", before, after)
+					}
+				}
+			})
+		}
 	}
 }
 

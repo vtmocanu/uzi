@@ -88,6 +88,13 @@ func (f *FakeClient) AdminBlockedRepos(context.Context) (apitypes.AdminBlockedRe
 	return f.BlockedReposV, nil
 }
 
+func (f *FakeClient) AdminSettings(context.Context) (AdminSettingsView, error) {
+	if f.Err != nil {
+		return AdminSettingsView{}, f.Err
+	}
+	return f.AdminSettingsV, nil
+}
+
 func (f *FakeClient) AdminListEgressProfiles(context.Context) ([]apitypes.EgressProfileDTO, error) {
 	if f.Err != nil {
 		return nil, f.Err

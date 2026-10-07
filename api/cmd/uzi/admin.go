@@ -439,7 +439,7 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(users, runs, workers, health, usage, rateLimits, cliTokens, products, guardrailImpact, blockedRepos, newAdminAgentSourceCmd(env, gf), newAdminReviewCmd(env, gf), newAdminEgressProfileCmd(env, gf))
+	cmd.AddCommand(users, runs, workers, health, usage, rateLimits, cliTokens, products, guardrailImpact, blockedRepos, newAdminAgentSourceCmd(env, gf), newAdminReviewCmd(env, gf), newAdminReviewBotsCmd(env, gf), newAdminEgressProfileCmd(env, gf))
 	return cmd
 }
 
@@ -814,33 +814,27 @@ func failRate(failed, finished int64) string {
 	return fmt.Sprintf("%.1f%%", float64(failed)/float64(finished)*100)
 }
 
-// failedFigure renders the failed count with the needs-landing sub-cut appended when any of
-// those failed runs is human-landable (issue #1418): "106" normally, "106 (3 need landing)"
-// when needs_landing > 0. This is the CLI twin of the dashboard splitting the `failed` bar into
-// "failed" and "failed, needs landing". needs_landing is a SUBSET of failed (needs_landing <=
-// failed), never a new denominator member, so it rides beside the figure rather than as a
-// separate column; the clause is emit-only-when-positive, keeping the common no-landing case
-// terse and every existing zero-landing row byte-for-byte unchanged.
+// failedFigure adds the issue #1418 recoverable subset when positive. Recoverable
+// work may already have been landed; this is not an outstanding-work count.
 func failedFigure(failed, needsLanding int64) string {
 	if needsLanding > 0 {
-		return fmt.Sprintf("%d (%d need landing)", failed, needsLanding)
+		return fmt.Sprintf("%d (%d recoverable)", failed, needsLanding)
 	}
 	return fmt.Sprintf("%d", failed)
 }
 
 // renderAdminUsage prints the factory lifetime totals plus the per-user breakdown.
 // The factory line and the per-user table carry the PRD #1293 failed-run figures
-// (lifetime), mirroring the web column order (D8): Runs · Failed · Fail rate come
+// (lifetime), mirroring the web column order (D8): Runs · Failed · Fail rate · Since last failure come
 // before the token columns. SHARE stays web-only.
 func renderAdminUsage(p *uzicli.Printer, u apitypes.AdminUsageDTO) error {
+	now := time.Now()
 	lt := u.Factory.Lifetime
 	lo := u.Factory.Outcomes.Lifetime
-	// failed carries the needs-landing sub-cut inline (issue #1418): "failed=106" normally,
-	// "failed=106 (3 need landing)" when some failed runs are human-landable — the CLI half of
-	// the dashboard's failed-bar split, terse and appended only when needs_landing > 0.
-	p.Printf("factory (lifetime): input=%d cache_read=%d cache_creation=%d output=%d cost=$%.2f (runs=%d) finished=%d failed=%s fail_rate=%s\n",
+	// Match the dashboard's recoverable-work note without claiming a landing backlog.
+	p.Printf("factory (lifetime): input=%d cache_read=%d cache_creation=%d output=%d cost=$%.2f (runs=%d) finished=%d failed=%s fail_rate=%s since_last_failure=%s\n",
 		lt.InputTokens, lt.CacheReadTokens, lt.CacheCreationTokens, lt.OutputTokens, lt.CostUSD, u.Factory.RunCount,
-		lo.Finished, failedFigure(lo.Failed, lo.NeedsLanding), failRate(lo.Failed, lo.Finished))
+		lo.Finished, failedFigure(lo.Failed, lo.NeedsLanding), failRate(lo.Failed, lo.Finished), sinceLastFailure(lo, now))
 	if len(u.Users) == 0 {
 		return nil
 	}
@@ -854,12 +848,34 @@ func renderAdminUsage(p *uzicli.Printer, u apitypes.AdminUsageDTO) error {
 			// per-user row and the total read the split the same way (no new column).
 			failedFigure(row.Outcomes.Failed, row.Outcomes.NeedsLanding),
 			failRate(row.Outcomes.Failed, row.Outcomes.Finished),
+			sinceLastFailure(row.Outcomes, now),
 			fmt.Sprintf("%d", row.Usage.InputTokens),
 			fmt.Sprintf("%d", row.Usage.OutputTokens),
 			fmt.Sprintf("$%.2f", row.Usage.CostUSD),
 		})
 	}
-	return p.Table([]string{"EMAIL", "RUNS", "FAILED", "FAIL%", "INPUT", "OUTPUT", "COST"}, rows)
+	return p.Table([]string{"EMAIL", "RUNS", "FAILED", "FAIL%", "SINCE", "INPUT", "OUTPUT", "COST"}, rows)
+}
+
+// sinceLastFailure uses the same whole-minute/hour/day boundaries as the Overview.
+func sinceLastFailure(o apitypes.RunOutcomesDTO, now time.Time) string {
+	if o.LastFailedAt == nil {
+		if o.Finished == 0 {
+			return "-"
+		}
+		return "no failures"
+	}
+	minutes := int64(now.Sub(*o.LastFailedAt) / time.Minute)
+	if minutes < 1 {
+		return "<1m"
+	}
+	if minutes < 60 {
+		return fmt.Sprintf("%dm", minutes)
+	}
+	if minutes < 1440 {
+		return fmt.Sprintf("%dh", minutes/60)
+	}
+	return fmt.Sprintf("%dd", minutes/1440)
 }
 
 func vaultCell(locked bool) string {

@@ -17,9 +17,11 @@ even after the worker and its disk are gone.
 uzi captures at other boundaries too, not only at final failure: when a run
 is parked (a usage limit or a recovery wait) or gracefully stopped while it
 holds committed work, uzi archives that exact work before its source can be
-torn down. If the same boundary can *prove* the work is already published,
-it releases the hold instead of archiving; if it can neither prove that nor
-archive, it keeps the source held for you to decide (see below). A hard
+torn down. For guarded generations, release requires final acknowledgment
+of a covering archive or a verified empty inventory, not just publication
+of the current head. Legacy generations can release on proof that their
+recorded work is published. If the boundary cannot verify and resolve the
+source, it keeps the source held for you to decide (see below). A hard
 crash with no shutdown window — a killed node, an out-of-memory kill — is
 outside this guarantee.
 
@@ -108,8 +110,9 @@ for the full flag and exit-code contract.
 
 ## Importing the bundle
 
-A downloaded archive is a real Git bundle carrying the original committed
-head on a dedicated ref, importable into a clean clone of the forge repo:
+A downloaded archive is a real Git bundle with a dedicated
+`refs/heads/recovered-source` ref, importable into a clean clone of the forge
+repo:
 
 ```sh
 git bundle verify recovered.bundle
@@ -121,8 +124,27 @@ git checkout recovered-source
 
 Where possible the bundle relies on your repo's existing default-branch
 history as its prerequisite (so it stays small); when no such history was
-reachable, it is self-contained instead. Either way it imports with
-identical commit ids, parent relationships, tree, and binary contents.
+reachable, it is self-contained instead. The original commits retain
+identical commit ids, parent relationships, trees, and binary contents.
+
+For an inventory-guarded capture, `recovered-source` can be a **synthetic
+aggregate**, with the current source tree and the retained divergent heads
+in its ancestry. It is not necessarily an original agent commit, and its
+tree does not combine the contents of those divergent heads. Inspect the
+ancestor history, then check out the exact original SHA you need:
+
+```sh
+git log --graph --oneline recovered-source
+git show <original-sha>
+git checkout -b recovered-original <original-sha>
+```
+
+The worker's retained-head feed notices and recovery journal identify the
+original roots; feed labels may abbreviate SHAs, so resolve them against the
+imported history. The server receipt identifies the selected archive and
+its `coverage_digest`; it does not provide a new server-side root list or
+prove Git ancestry. Preserve the downloaded bundle while reviewing which
+original head to land.
 
 ## Limits
 
@@ -134,7 +156,7 @@ operator-configurable environment variable on the API:
 | Max bundle size | 64 MiB | A larger archive is refused, not truncated; the source stays retained and is retried once capacity allows. |
 | Ready payload per owner | 1 GiB | Total bytes of *your* ready (downloadable) archives. |
 | Instance byte quota | 4 GiB | Total ready bytes across the whole deployment (scoped to the owner who breached it, never a global stop). |
-| Ready-artifact retention | 7 days | How long a ready archive stays downloadable, counted from when it became ready. |
+| Ready-artifact retention | 7 days | Normal ready-download window. Earlier non-final and legacy captures count from readiness; a selected final guarded archive is protected while its local worker exists, then gets this window renewed on physical worker deletion. |
 | Automatic upload-retry window | 24 hours | How long uzi keeps retrying a stalled upload before it needs your attention. |
 | Captures per claim | 16 | Distinct capture attempts one worker claim can accumulate. |
 | Retained captures per owner | 256 | Total captures you can have on file at once. |
@@ -169,6 +191,76 @@ produced the work, so a later run on the same worker never drops an older
 claim's only copy.
 
 ## Where the work is kept
+
+Inventory-capable workers pin each divergent unpublished head locally at
+`refs/uzi-owed/<run-id>/<sha>` before replacing its tracking head. These
+pins retain the original SHAs without descendant compaction. Feed notices
+separate **worker-local, not checkpoint durable** heads from confirmed
+remote copies: a local pin does not survive loss of that worker's disk.
+Only containment in a broker-confirmed or claim-confirmed remote head can
+clear a candidate through publication reconciliation; a local tracking ref
+or checkpoint bridge is not that evidence.
+
+**Retention is capped at 64 heads per run.** A run that keeps rewriting its
+branch without a confirmed checkpoint cannot grow its pins (which block
+garbage collection on the worker disk) without bound. At 64 retained heads the
+worker keeps every existing pin and the run's working clone, refuses to
+retain or supersede another head, and stops the run through the normal
+preservation-failure path: the run reports failed with
+"tracking preservation refused: the retained owed-head limit (64) was
+reached", even when the checkpoint that hit the limit was a best-effort one.
+Retaining a head that is already pinned costs nothing, and a confirmed
+checkpoint releases every pin it covers, freeing capacity. Recover the
+retained heads with `uzi run recovery` or `uzi run export`. The feed lists a
+retained head once: a later checkpoint or a resume on the same worker
+announces only heads it has not announced, and archive notices are tracked
+separately from head notices.
+
+### Guarded inventory and final custody transfer
+
+A claim is inventory-guarded when it has `inventory_guarded: true` and the
+API supports `recovery_inventory_v1`. Its hold stays **open** despite run
+completion or an earlier **Available** archive. At a verified source/process
+boundary, the worker freezes the unresolved inventory and constructs a
+recovery-only aggregate covering the retained roots by ancestry, with one
+current source tree. This aggregate never becomes the task branch or a
+checkpoint, and introduces no new publication path.
+
+Custody transfers only after the API acknowledges the final disposition:
+either the exact selected available archive (capture id, source SHA and
+`coverage_digest`) or a verified empty inventory with settlement evidence.
+The owner-readable receipt remains visible through `uzi run recovery`, and
+the selected available archive remains downloadable through `uzi run export`
+after the hold closes, including after worker deletion. This receipt is an
+identity acknowledgment; the worker verifies ancestry locally, not the server.
+Closed custody does not authorize new archive reservations or uploads, and a
+deleted worker's credentials receive 401 from worker authentication.
+
+A guarded generation that parks (forge unreachable) or fails before its
+repository was ever cloned adopted nothing, yet its hold stays open until a
+final disposition. The worker closes that empty hold itself: after reporting
+the park or failure it sends a settled `forge_no_output` release for exactly
+that generation, with the empty-inventory digest, and retries a few times if
+the API is not ready. It does this only when it can prove nothing was adopted
+locally (no journal record for the generation, no retained pin or clone of
+the run); on any doubt the hold stays open. The API accepts that release for
+a parked run only for a `forge_unreachable` park and only for the settled
+`forge_no_output` class. A parked run that adopted source keeps its hold.
+
+A dirty or unverified source, or an unproven process boundary, retains the
+clone and hold, reports **Needs action**, and uses bounded retries. Boot
+recovery cannot automatically capture dirty source and has no forge PAT.
+An **Available** source archive with final custody acknowledgment still
+pending is not safe terminal release or permission to reclaim the source.
+
+The **selected final archive** is protected from automatic expiry while its
+local worker row exists. Physical worker deletion renews its configured
+normal ready-retention window (7 days by default); protection is not
+perpetual. Earlier non-final and legacy ready captures keep their existing
+TTL. Size limits, quotas, owner-only access and explicit discard behavior
+are unchanged.
+
+### Published checkpoint refs
 
 A finished run that already published a checkpoint to your forge keeps that
 ref, `refs/uzi-checkpoints/<branch>`, for as long as any of its custody
@@ -209,6 +301,10 @@ settlement) or discarded (`uzi run discard`) — the same custody lifecycle
 that governs the recovery archives above.
 
 ## Automatic settlement of an older held generation
+
+The ancestry settlement below applies to legacy, unguarded holds. Guarded
+holds use the [final inventory disposition](#guarded-inventory-and-final-custody-transfer)
+above; publishing one adopted head does not settle their divergent inventory.
 
 When a run is resumed on the same worker (after a rate-limit park, a
 recovery restart, or a similar restart), the new generation may adopt an
@@ -270,8 +366,10 @@ state that separates normal active protection from holds that actually need
 you. Each row offers the right action for its state:
 
 - **Export archive** — download a ready archive (same bundle as `uzi run
-  export`). An archive-ready hold releases itself automatically once you have
-  a copy; it offers Export only and does not count as needing a decision.
+  export`). Downloading does not itself release custody. Legacy holds can
+  release automatically when an archive becomes ready; guarded holds await
+  final inventory acknowledgment even if an earlier archive is available.
+  An Export-only row is not proof that guarded custody has closed.
 - **Discard held work** — for a hold whose source may be the only copy (no
   ready archive can restore it), permanently release custody so the worker
   and its disk can be torn down. The confirmation names the run, worker, and
@@ -280,8 +378,9 @@ you. Each row offers the right action for its state:
 On the run page, the **Recovery archives** section offers **Export archive**
 and, once you have a copy, **Delete archive** — archive-artifact cleanup that
 is deliberately distinct from discarding a held source. Deleting an archive
-while its hold is still open does not resolve custody; left untouched, an
-archive simply expires after its retention window instead (see Limits above).
+while its hold is still open does not resolve custody; left untouched, a
+non-final or legacy archive expires after its retention window. A selected
+final guarded archive follows the worker-deletion retention rule above.
 
 From the CLI, list a run's holds and captures with `uzi run recovery
 <run-id>`, then discard one exact held source:
@@ -369,7 +468,8 @@ a terminal status alone does not make the older work disposable.
    do not prove dirty or untracked bytes disposable during orphan reclaim.
 
 This reclaim does not request custody release. The server-proof automatic
-settlement described above continues to govern eligible older holds.
+settlement described above governs eligible legacy holds; guarded holds
+require final inventory acknowledgment.
 
 #### Reading orphan-reclaim diagnostics
 
@@ -436,6 +536,12 @@ Durable recovery needs a worker and an API that both support it. A run that
 executed on an older worker, or against an older server, is honestly
 reported as **unsupported** rather than silently promised a recovery that
 was never captured. Upgrading your fleet only protects runs going forward.
+
+If the API lacks `recovery_inventory_v1` or the claim is not guarded, the
+worker emits an **UNGUARDED legacy generation** notice. Local pins may still
+retain commits, but complete inventory protection at terminal release and
+worker reclamation is unsupported. Once a generation's guard has latched,
+later feature loss retains custody rather than falling back to legacy release.
 
 ## Salvage copies
 

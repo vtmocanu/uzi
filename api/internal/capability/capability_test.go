@@ -129,6 +129,17 @@ func TestFilterProtocol_DropsUnknownsKeepsVocabulary(t *testing.T) {
 	}
 }
 
+func TestFilterProtocolRecoveryInventory(t *testing.T) {
+	got := FilterProtocol([]string{RecoveryInventoryV1, RecoveryArchiveV2, RecoveryArchiveV1, RecoveryInventoryV1})
+	want := []string{RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("recovery capabilities = %v, want %v", got, want)
+	}
+	if got := Filter([]string{RecoveryInventoryV1}); len(got) != 0 {
+		t.Fatalf("inventory capability leaked into scheduler vocabulary: %v", got)
+	}
+}
+
 func TestFilterProtocol_DedupesStableOrderAndEmpty(t *testing.T) {
 	if got := FilterProtocol([]string{"completion_interlock_v1", "completion_interlock_v1"}); !reflect.DeepEqual(got, []string{"completion_interlock_v1"}) {
 		t.Errorf("FilterProtocol(dupes) = %v, want [completion_interlock_v1]", got)

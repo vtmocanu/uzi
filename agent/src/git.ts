@@ -10,6 +10,7 @@ import { pipeline } from "node:stream/promises";
 import { deflateSync } from "node:zlib";
 import { PassThrough, Transform, Writable, type Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
+import { RUN_KINDS, type RunKind } from "./protocol.js";
 import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest, BoundaryStep } from "./harness.js";
 import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
@@ -175,7 +176,9 @@ function consumerInputSink(target: Writable): Writable {
 /** Why publication was refused; `exec_failed` is the default for a bare reason with no classification. */
 export type ScratchPublicationKind =
   | "tip_unavailable" | "shallow_history" | "missing_objects" | "object_walk_failed"
-  | "exec_failed" | "scratch_present" | "floor_unverified" | "checkpoint_range";
+  | "exec_failed" | "scratch_present" | "floor_unverified" | "checkpoint_range"
+  | "remote_changed_during_refresh" | "remote_candidate_diverged"
+  | "new_remote_candidate_diverged" | "remote_branch_advanced";
 /** The check that refused. */
 export type ScratchPublicationStep =
   | "resolve_tip" | "shallow_check" | "object_walk" | "scratch_walk" | "floor_refresh" | "checkpoint_floor";
@@ -318,10 +321,24 @@ function isAbortLike(error: unknown): error is Error {
   return error instanceof Error && error.name === "AbortError";
 }
 
-class RemoteBranchAdvancedError extends Error {
-  constructor() {
-    super("non-fast-forward: remote branch advanced");
+/** Claim-scoped remote floor, captured under the clone/adoption lock. */
+export type PublicationFloor =
+  | { readonly kind: "pinned"; readonly oid: string }
+  | { readonly kind: "absent" }
+  | { readonly kind: "unverified" };
+
+export interface PublicationCandidate {
+  readonly floor: PublicationFloor;
+  readonly originalHead: string;
+  readonly candidate: string;
+}
+
+/** Only a complete locked proof may create this disposition. */
+export class RemoteBranchAdvancedError extends ScratchPublicationError {
+  constructor(readonly proof: Readonly<{ P: string; H: string; C: string; R: string; cause: "remote_branch_advanced" }>) {
+    super("remote_branch_advanced", undefined, { kind: "remote_branch_advanced", step: "floor_refresh" });
     this.name = "RemoteBranchAdvancedError";
+    Object.freeze(proof);
   }
 }
 
@@ -527,6 +544,9 @@ export interface GitCacheOptions {
    *  absolute `/usr/local/bin/gitleaks` inside one via resolveBoundaryExecutable). A test injects an
    *  absolute path to a shim. */
   gitleaksBin?: string;
+  /** Test-only override of {@link MAX_OWED_CANDIDATES_PER_RUN} so the cap boundary is cheap to
+   *  exercise. Production never passes it. */
+  maxOwedCandidates?: number;
   /** Test-only stand-in for runner-clone scratch provisioning, for the non-Linux dev loop.
    *  Production never passes it, so the real provisioner runs and fails closed off Linux. */
   scratchProvisioner?: (clonePath: string) => Promise<void>;
@@ -1133,7 +1153,7 @@ export interface AttemptSeedOptions {
 // (`/`, `.` -> `-`), so this key is NOT branch-injective: never WRITE under it, and read it only
 // through readTrackingOwner()'s collision guard plus the caller's runId-equality gate.
 function legacyFlatTrackingOwnerKey(branch: string): string {
-  return `uzi-trackowner.${branch.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+  return `uzi-trackowner.${branch.replace(/[^A-Za-z0-9_-]/g, "-").toLowerCase()}`;
 }
 
 /**
@@ -1158,6 +1178,8 @@ export interface CheckpointOverlayContext {
 }
 
 export interface RunnerClone {
+  /** Separate from recovered baseCommit and any local checkpoint/bridge floor. */
+  publicationFloor?: PublicationFloor;
   /** Absolute path to the runner clone's working tree (the ONLY working tree under
    *  (b) — the worker is bare-only). The agent checks out + commits here. */
   path: string;
@@ -1302,6 +1324,86 @@ export interface RunnerClone {
  * never carry the token. The runner-clone seed and the worker's fetch-BACK are LOCAL
  * (no credential).
  */
+/** Trusted claim identity supplied by the worker, never reconstructed from runner config. */
+type OwedContextIdentity = {
+  runId: string;
+  branch: string;
+  kind: RunKind;
+  barePath: string;
+  defaultIdentity: { ref: string; sha: string };
+};
+export type PositiveOwedCandidateContext = OwedContextIdentity & { generation: number; legacy?: never };
+export type OwedCandidateContext = PositiveOwedCandidateContext |
+  (OwedContextIdentity & { generation: null; legacy: true });
+export type HistoricalOwedContext = {
+  runId: string; branch: string; barePath: string; generation: null;
+  origin: "historical"; producer: "unknown"; kind: null; defaultIdentity: null;
+};
+type StoredOwedContext = OwedCandidateContext | HistoricalOwedContext;
+export type CommittedTrackingOwnership =
+  | { kind: "owned"; sha: string; context: OwedCandidateContext }
+  | { kind: "not_owned" };
+export interface FetchAgentBranchOptions {
+  context: OwedCandidateContext;
+  remotelyConfirmedSha?: string;
+}
+export type TrackingUpdateResult =
+  | { kind: "updated"; trackingRef: string; candidateSha: string; retainedShas: string[];
+      displacedSha?: string; divergence: "none" | "ancestor" | "divergent" | "unknown" | "foreign" }
+  | { kind: "not_updated"; reason: "ownership_unknown" | "preservation_failed" | "owed_limit" |
+      "receipt_pending_failed" | "tracking_update_failed" | "owner_stamp_failed" | "receipt_commit_failed" };
+/** One validated read of a bare's owed metadata (see GitCache.readOwedMetadataUnderLock). */
+interface OwedMetadata {
+  names: string[];
+  contexts: Map<string, StoredOwedContext>;
+  records: Array<{ runId: string; sha: string; contextName: string; c: StoredOwedContext }>;
+}
+export interface OwedCandidate {
+  sha: string;
+  pinRef: string;
+  contexts: StoredOwedContext[];
+}
+export interface RecoveryCoverage {
+  sha: string;
+  coverageRef: string;
+  fingerprint: string;
+  originalShas: string[];
+  currentSha: string;
+}
+type TrackingReceipt = {
+  version: 1; branch: string; runId: string; generation: number | null; context: string;
+  trackingSha: string; phase: "pending" | "committed";
+};
+type CheckedTrackingOwner = { runId: string; generation?: number | null; context?: string } | undefined;
+const OWED_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const OWED_OID = /^[0-9a-f]{40}$/;
+
+/**
+ * Hard cap on the heads one run may keep pinned as owed candidates (`refs/uzi-owed/<runId>/<sha>`) in
+ * a worker bare. An untrusted agent that rewrites its branch repeatedly displaces one head per
+ * checkpoint; without a bound the pins (which block `git gc` on the worker PVC), the candidate
+ * metadata, and the feed announcements grow with the rewrite count. 64 is far above what a
+ * well-behaved run holds between two confirmed checkpoints (a confirmed checkpoint releases every
+ * pin it covers) and small enough that the full retained set stays recoverable and announceable in
+ * a handful of feed rows. At the cap `pinOwedUnderLock` refuses a NEW pin; a head that is already
+ * pinned never consumes capacity.
+ */
+export const MAX_OWED_CANDIDATES_PER_RUN = 64;
+
+/** The refusal reason for a failed pin: the cap is distinguished so the runner can stop the run. */
+function preservationReason(cause: unknown): "owed_limit" | "preservation_failed" {
+  return cause instanceof OwedCandidateLimitError ? "owed_limit" : "preservation_failed";
+}
+
+/** Thrown under the bare lock by `pinOwedUnderLock` at {@link MAX_OWED_CANDIDATES_PER_RUN}; every
+ *  pin-producing caller maps it to the `owed_limit` refusal rather than a generic failure. */
+class OwedCandidateLimitError extends Error {
+  constructor() {
+    super("owed candidate limit reached");
+    this.name = "OwedCandidateLimitError";
+  }
+}
+
 export class GitCache {
   private readonly reposRoot: string;
   /** Runner-owned clone store (the working trees). A distinct /data subtree from the
@@ -1337,6 +1439,7 @@ export class GitCache {
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
   /** issue #1597 M2: the gitleaks executable (see {@link GitCacheOptions.gitleaksBin}). */
   private readonly gitleaksBin: string;
+  private readonly maxOwedCandidates: number;
   /** See {@link GitCacheOptions.scratchProvisioner}; undefined in production. */
   private readonly scratchProvisioner: ((clonePath: string) => Promise<void>) | undefined;
   /** See {@link GitCacheOptions.retentionDelete}; undefined in production. */
@@ -1363,6 +1466,7 @@ export class GitCache {
     opts: GitCacheOptions = {},
   ) {
     this.gitleaksBin = opts.gitleaksBin ?? "gitleaks";
+    this.maxOwedCandidates = opts.maxOwedCandidates ?? MAX_OWED_CANDIDATES_PER_RUN;
     this.scratchProvisioner = opts.scratchProvisioner;
     this.retentionDeleteSeam = opts.retentionDelete;
     this.canonicalFreeSeam = opts.canonicalFree;
@@ -1586,15 +1690,43 @@ export class GitCache {
    * resolved to a pinned commit before pushing, keeping the runner's branch out
    * of the bare's heads namespace (B2 invariant 2).
    */
-  async pushBranch(barePath: string, branch: string, pat: string, repoUrl: string, username?: string): Promise<void> {
+  async pushBranch(
+    barePath: string, branch: string, pat: string, repoUrl: string, username?: string,
+    publication?: PublicationCandidate,
+  ): Promise<void> {
     const scope = httpScopeForUrl(repoUrl);
     await this.withLock(barePath, async () => {
-      const tip = await this.resolveCommitStrict(barePath, runnerTrackingRef(branch));
+      const tip = publication?.candidate ?? await this.resolveCommitStrict(barePath, runnerTrackingRef(branch));
       const candidate = await this.scratchPublicationPreflight(barePath, branch, tip);
-      await this.refreshScratchPublicationFloor(barePath, branch, candidate, pat, scope, username);
-      // A literal OID keeps the candidate fixed even if the tracking ref moves.
-      await this.runGit(barePath, ["push", "origin", `${candidate}:refs/heads/${branch}`], pat, scope, username);
+      // Legacy callers have no claim floor and cannot produce a supersession proof.
+      const group = publication ?? { floor: { kind: "absent" } as const, originalHead: candidate, candidate };
+      await this.refreshScratchPublicationFloor(barePath, branch, group, pat, scope, username);
+      try {
+        await this.runGit(barePath, ["push", "origin", `${candidate}:refs/heads/${branch}`], pat, scope, username);
+      } catch (error) {
+        // Stderr only selects a new complete proof; it never establishes movement.
+        if (isNonFastForwardRejection(error)) {
+          await this.scratchPublicationPreflight(barePath, branch, candidate);
+          await this.refreshScratchPublicationFloor(barePath, branch, group, pat, scope, username);
+        }
+        throw error;
+      }
     });
+  }
+
+  private async capturePublicationFloor(barePath: string, ref: string): Promise<PublicationFloor> {
+    try {
+      const { stdout } = await this.execScoped("git", withDir(barePath, [
+        "rev-parse", "--verify", "--quiet", ref,
+      ]), { env: gitEnv(), timeout: GIT_TIMEOUT_MS });
+      const oid = stdout.trim();
+      if (!SHA40_RE.test(oid) || await this.resolveCommitStrict(barePath, ref) !== oid) return { kind: "unverified" };
+      return Object.freeze({ kind: "pinned", oid });
+    } catch (error) {
+      const failure = classifyExecFailure(error);
+      if (failure.exitCode === 1 && !failure.stdout.trim() && !failure.stderr.trim()) return { kind: "absent" };
+      return { kind: "unverified" };
+    }
   }
 
   /** Publication-path commit resolver: unlike revParse it never reads an exec failure as
@@ -1712,58 +1844,64 @@ export class GitCache {
   }
 
   private async refreshScratchPublicationFloor(
-    barePath: string, branch: string, candidate: string, pat: string, scope: string | undefined, username?: string,
+    barePath: string, branch: string, group: PublicationCandidate, pat: string,
+    scope: string | undefined, username?: string,
   ): Promise<void> {
     const remoteRef = `refs/heads/${branch}`;
     const scratchRef = `refs/uzi-publication-floor/${branch}`;
-    let forwardAdvance = false;
-    try {
+    const refuse = (kind: ScratchPublicationKind): never => {
+      throw new ScratchPublicationError("cannot verify fresh remote floor", undefined, {
+        kind, step: "floor_refresh",
+      });
+    };
+    const observe = async (): Promise<string | null> => {
       const listed = (await this.runGit(barePath, ["ls-remote", "origin", remoteRef], pat, scope, username)).trim();
-      if (!listed) {
-        if (await this.refExists(barePath, `refs/remotes/origin/${branch}`)) throw new Error("remote branch rewound away");
+      if (!listed) return null;
+      const oid = listed.slice(0, 40);
+      if (!SHA40_RE.test(oid) || listed !== `${oid}\t${remoteRef}`) refuse("floor_unverified");
+      return oid;
+    };
+    const relation = async (floor: string, tip: string): Promise<"ancestor" | "divergent"> => {
+      const answer = await this.ancestry(barePath, floor, tip);
+      if (answer === "unknown") refuse("floor_unverified");
+      return answer as "ancestor" | "divergent";
+    };
+    try {
+      if (group.floor.kind === "unverified") refuse("floor_unverified");
+      const R = await observe();
+      if (R === null) {
+        if (group.floor.kind !== "absent") refuse("floor_unverified");
+        if (await observe() !== null) refuse("remote_changed_during_refresh");
         return;
       }
-      const match = /^([0-9a-f]{40})\trefs\/heads\/.+$/.exec(listed);
-      if (!match || listed !== `${match[1]}\t${remoteRef}`) throw new Error("remote branch response is ambiguous");
       await this.runGit(barePath, ["fetch", "--refmap=", "origin", `+${remoteRef}:${scratchRef}`], pat, scope, username);
-      // Strict read: an exec failure must not look like "the branch changed". Re-wrap a refusal
-      // from the resolver as this step's floor_unverified, keeping its detail.
-      const fresh = await this.resolveCommitStrict(barePath, scratchRef).catch((resolveErr: unknown) => {
-        if (resolveErr instanceof ScratchPublicationError) {
-          throw new ScratchPublicationError("cannot verify fresh remote floor", resolveErr.cause ?? resolveErr, {
-            kind: "floor_unverified", step: "floor_refresh",
-            ...(resolveErr.detail !== undefined ? { detail: resolveErr.detail } : {}),
-            ...(resolveErr.rawDetail !== undefined ? { rawDetail: resolveErr.rawDetail } : {}),
-          });
-        }
-        throw resolveErr;
+      const fetched = await this.resolveCommitStrict(barePath, scratchRef).catch((error: unknown) => {
+        if (error instanceof RunResidueBlockedError || isAbortLike(error)) throw error;
+        throw new ScratchPublicationError("cannot verify fresh remote floor", error, {
+          kind: "floor_unverified", step: "floor_refresh",
+          ...(error instanceof ScratchPublicationError
+            ? { detail: error.detail, rawDetail: error.rawDetail }
+            : execDetail(classifyExecFailure(error))),
+        });
       });
-      if (fresh !== match[1]) throw new Error("remote branch changed during refresh");
-      const priorRef = `refs/remotes/origin/${branch}`;
-      const prior = await this.revParse(barePath, `${priorRef}^{commit}`);
-      if (prior) {
-        if ((await this.ancestry(barePath, prior, fresh)) !== "ancestor") {
-          throw new Error("remote branch floor is unavailable or rewound");
-        }
-      } else if (await this.tryGit(barePath, ["rev-parse", "--verify", "--quiet", priorRef]) === 0) {
-        // The tracking ref exists but names no commit: a broken floor, not an absent one.
-        throw new Error("remote branch floor is unavailable");
+      if (fetched !== R) refuse("remote_changed_during_refresh");
+      const { originalHead: H, candidate: C, floor } = group;
+      if (floor.kind === "pinned" && await relation(floor.oid, R) !== "ancestor") refuse("floor_unverified");
+      const remoteInCandidate = await relation(R, C);
+      if (remoteInCandidate === "ancestor") {
+        if (await observe() !== R) refuse("remote_changed_during_refresh");
+        return;
       }
-      // With no prior (the branch appeared remotely after the last fetch) the rewind
-      // check has nothing to compare; the fast-forward below must still be proven.
-      const freshToCandidate = await this.ancestry(barePath, fresh, candidate);
-      if (freshToCandidate === "ancestor") return;
-      if (!prior) throw new Error("new remote branch is not an ancestor of candidate");
-      if (freshToCandidate !== "divergent") throw new Error("remote branch ancestry is unavailable");
-      // Only a strictly newer, scratch-free remote tip outside a candidate that
-      // still descends from the old floor is a concurrent forward advance.
-      if (prior === fresh || (await this.ancestry(barePath, prior, candidate)) !== "ancestor") {
-        throw new Error("remote branch and candidate diverged");
+      if (floor.kind !== "pinned") return refuse("new_remote_candidate_diverged");
+      const P = floor.oid;
+      // Check H separately: an ancestry bridge in C cannot rehabilitate rewritten H.
+      if (P === R || await relation(P, H) !== "ancestor" || await relation(P, C) !== "ancestor") {
+        refuse("remote_candidate_diverged");
       }
-      await this.scratchPublicationPreflight(barePath, branch, fresh);
-      forwardAdvance = true;
+      await this.scratchPublicationPreflight(barePath, branch, R);
+      if (await observe() !== R) refuse("remote_changed_during_refresh");
+      throw new RemoteBranchAdvancedError({ P, H, C, R, cause: "remote_branch_advanced" });
     } catch (cause) {
-      // issue #2213: a quarantine refusal is not an unverifiable floor: it reaches the runner typed.
       if (cause instanceof RunResidueBlockedError) throw cause;
       const abort = this.boundaryAbortError(cause);
       if (abort) throw abort;
@@ -1772,10 +1910,14 @@ export class GitCache {
         kind: "floor_unverified", step: "floor_refresh", ...execDetail(classifyExecFailure(cause)),
       });
     } finally {
-      await this.runGit(barePath, ["update-ref", "-d", scratchRef]).catch(() => undefined);
+      // One local cleanup attempt per proof; failure does not authorize publication.
+      await this.runGit(barePath, ["update-ref", "-d", scratchRef]).catch((cause: unknown) => {
+        if (cause instanceof RunResidueBlockedError || isAbortLike(cause)) throw cause;
+        throw new ScratchPublicationError("cannot clean publication floor", cause, {
+          kind: "floor_unverified", step: "floor_refresh", ...execDetail(classifyExecFailure(cause)),
+        });
+      });
     }
-    // The caller verifies the moved branch before reporting branch_moved.
-    if (forwardAdvance) throw new RemoteBranchAdvancedError();
   }
 
   /** The default branch's short name (e.g. `main`), for an MR target. */
@@ -2600,6 +2742,7 @@ export class GitCache {
       // documented above. All three candidate refs live in the bare (the clone does not
       // necessarily carry the default branch), so the resolution happens here.
       const originRef = `refs/remotes/origin/${branch}`;
+      const publicationFloor = await this.capturePublicationFloor(barePath, originRef);
       const trackingRef = runnerTrackingRef(branch);
       // issue #781 — disjoint-history guard. Resolve the default ref ONCE up front, then
       // qualify EACH candidate base ref: it counts as existing only if it also shares
@@ -3142,7 +3285,7 @@ export class GitCache {
       // marker's parent when a wip(park) marker was reset --soft'd back to uncommitted, and
       // baseSha (byte-identical) on every other leg. wipRecovered surfaces the recovery to
       // M4/M5.
-      return { path: clonePath, branch, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered };
+      return { path: clonePath, branch, publicationFloor, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered };
     }
   }
 
@@ -3464,26 +3607,62 @@ export class GitCache {
    * clone (objects-integrity win). Returns the worker-side tracking ref pushBranch/
    * changedFiles then read.
    */
-  async fetchAgentBranch(barePath: string, clonePath: string, branch: string, runId: string): Promise<string> {
-    const dst = runnerTrackingRef(branch);
-    await this.withLock(barePath, async () => {
-      // issue #887: clear any legacy FLAT tracking ref that is a strict path-prefix
-      // (directory ancestor) of `dst`, or the fetch below aborts. See the helper's own
-      // doc for the full mechanism. Runs FIRST, under the same lock as the fetch/stamp,
-      // so the namespace is clear before the ref-store tries to create the dst directory.
-      await this.clearConflictingAncestorTrackingRefs(barePath, dst);
+  async fetchAgentBranch(barePath: string, clonePath: string, branch: string, runId: string,
+    opts: FetchAgentBranchOptions): Promise<TrackingUpdateResult> {
+    if (!opts) throw new Error("fetchAgentBranch requires trusted claim context");
+    opts = this.snapshotOwedOptions(opts);
+    await this.validateOwedContext(barePath, branch, opts.context);
+    if (runId !== opts.context.runId) throw new Error("fetchAgentBranch run identity mismatch");
+    this.validateConfirmedSha(opts.remotelyConfirmedSha);
+    // Only a worker-selected clone path is admitted to the pack transport.
+    if (!path.isAbsolute(clonePath) || !isWithinPath(path.resolve(clonePath), path.resolve(this.runnerRoot))) {
+      throw new Error("fetchAgentBranch requires a trusted runner clone path");
+    }
+    return this.withLock(barePath, async () => {
+      const observed = await this.observeTrackingUnderLock(barePath, branch);
+      const stage = `refs/uzi-incoming/${randomUUID()}`;
+      // Ordinary transport failures (including boundary aborts) deliberately throw.
       await this.runGit(barePath, [
-        "-c", "protocol.file.allow=user",
-        "fetch", "--no-tags", `file://${clonePath}`,
-        `+refs/heads/${branch}:${dst}`,
+        "-c", "protocol.file.allow=user", "fetch", "--refmap=", "--no-tags",
+        "--no-write-fetch-head", `file://${clonePath}`, `+refs/heads/${branch}:${stage}`,
       ]);
-      // PRD #218: stamp the run that owns this ref, under the SAME lock as the ref write
-      // so the two are always consistent. The reseed (runnerCloneForBranch) reads it back
-      // and takes the tracking ref only when this run wrote it — the anchor that stops a
-      // different run on the same issue from inheriting orphaned work.
-      await this.runGit(barePath, ["config", "--local", runnerTrackingOwnerKey(branch), runId]);
+      const incoming = await this.resolveCommitStrict(barePath, stage);
+      await this.requireOwedCommit(barePath, incoming);
+      let result: TrackingUpdateResult;
+      if (observed) {
+        result = await this.promoteTrackingUnderLock(barePath, branch, incoming, observed, opts);
+      } else {
+        // The producing fetch context proves only incoming, never the unknown shared head.
+        try {
+          await this.pinOwedUnderLock(opts.context, incoming);
+          result = { kind: "not_updated", reason: "ownership_unknown" };
+        } catch (cause) {
+          const abort = this.boundaryAbortError(cause);
+          if (abort) throw abort;
+          result = { kind: "not_updated", reason: preservationReason(cause) };
+        }
+      }
+      // A refusal can leave stage as the sole anchor if metadata/pinning failed.
+      // Delete it only after an independently verified durable anchor exists.
+      try {
+        if (await this.hasOwedAnchorUnderLock(barePath, opts.context.runId, incoming)) {
+          await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+        } else if (result.kind === "updated" &&
+            await this.checkedTrackingSha(barePath, branch) === incoming) {
+          await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+        } else if (result.kind === "not_updated" && result.reason === "owed_limit") {
+          // At the cap the incoming head is deliberately unpreserved (the run is stopped and its
+          // clone kept), so its stage must not accumulate one ref per refused attempt.
+          await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+        }
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        if (result.kind === "updated") throw cause;
+        // One cleanup attempt; a harmless stage must not erase the refusal reason.
+      }
+      return result;
     });
-    return dst;
   }
 
   /**
@@ -3512,9 +3691,9 @@ export class GitCache {
    * under the pre-#887 flattened key too (issue #909). Deepest-first so a partially-migrated
    * bare with several stacked ancestors is cleaned bottom-up.
    */
-  private async clearConflictingAncestorTrackingRefs(barePath: string, dst: string): Promise<void> {
+  private async clearConflictingAncestorTrackingRefs(barePath: string, dst: string, opts: FetchAgentBranchOptions): Promise<boolean> {
     // Only refs inside the tracking namespace can D/F-conflict with a tracking-ref dst.
-    if (!dst.startsWith(RUNNER_TRACKING_PREFIX)) return;
+    if (!dst.startsWith(RUNNER_TRACKING_PREFIX)) return true;
     const suffix = dst.slice(RUNNER_TRACKING_PREFIX.length);
     const parts = suffix.split("/");
     // Cumulative prefixes STRICTLY shorter than the full branch: every part except the last.
@@ -3527,18 +3706,38 @@ export class GitCache {
       acc = `${acc}/${part}`;
       candidates.push(acc);
     }
-    // Deepest-first: delete the most specific blocking leaf before its shorter ancestors.
+    // Preflight the whole ancestor set before deleting anything. A failed read is unknown.
+    const conflicts: Array<{ candidate: string; sha: string; branch: string }> = [];
     for (const candidate of candidates.reverse()) {
-      if (!(await this.refExists(barePath, candidate))) continue;
-      const sha = (await this.runGit(barePath, ["rev-parse", candidate])).trim();
+      const ancestorBranch = candidate.slice(RUNNER_TRACKING_PREFIX.length);
+      const observed = await this.observeTrackingUnderLock(barePath, ancestorBranch);
+      if (!observed) return false;
+      if (!observed.sha) continue;
+      if (observed.owner?.runId === opts.context.runId &&
+          !(await this.remotelyCovers(barePath, observed.sha, opts.remotelyConfirmedSha))) {
+        await this.pinOwedUnderLock(await this.producingContext(barePath, ancestorBranch, observed.owner), observed.sha);
+      }
+      conflicts.push({ candidate, sha: observed.sha, branch: ancestorBranch });
+    }
+    for (const { candidate, sha, branch: ancestorBranch } of conflicts) {
       // Archive first so a possibly-unmerged tip is never lost by the delete. The
       // <sanitized>/<sha> shape is D/F-safe within refs/uzi-archive (the sha leaf never
       // collides with a sibling branch's subtree) and idempotent (re-archiving the same
       // tip writes the same ref to the same sha).
-      const ancestorBranch = candidate.slice(RUNNER_TRACKING_PREFIX.length);
       const sanitized = ancestorBranch.replace(/[^A-Za-z0-9_-]/g, "-");
-      await this.runGit(barePath, ["update-ref", `refs/uzi-archive/${sanitized}/${sha}`, sha]);
-      await this.runGit(barePath, ["update-ref", "-d", candidate]);
+      const archive = `refs/uzi-archive/${sanitized}/${sha}`;
+      await this.runGit(barePath, ["update-ref", archive, sha]);
+      if (await this.checkedRefSha(barePath, archive) !== sha) throw new Error("tracking archive readback mismatch");
+      await this.runGit(barePath, ["update-ref", "-d", candidate, sha]);
+      if (await this.checkedRefSha(barePath, candidate) !== undefined) throw new Error("tracking ancestor deletion mismatch");
+      // Keep governance permanently; only the archived/deleted branch's receipt is cleared.
+      const dir = this.owedDirectory(barePath);
+      const receipt = await this.readOwedFile(barePath, `receipt-${this.receiptName(ancestorBranch)}.json`);
+      if (receipt !== undefined) {
+        await fs.unlink(path.join(dir, `receipt-${this.receiptName(ancestorBranch)}.json`));
+        const handle = await fs.open(dir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+        try { await handle.sync(); } finally { await handle.close(); }
+      }
       // Clear the now-dangling PRD #218 owner stamp for the deleted ref. tryGit swallows
       // exit 5 (key absent), which runGit would instead throw on — see the helper notes.
       await this.tryGit(barePath, ["config", "--local", "--unset", runnerTrackingOwnerKey(ancestorBranch)]);
@@ -3551,6 +3750,7 @@ export class GitCache {
         await this.tryGit(barePath, ["config", "--local", "--unset", legacyFlatTrackingOwnerKey(ancestorBranch)]);
       }
     }
+    return true;
   }
 
   /** PRD #122 M6: the tip of the worker-side tracking ref `fetchAgentBranch` wrote
@@ -3577,8 +3777,18 @@ export class GitCache {
    *  synthesised bridge B, so everything a reseed, capture, align or push then reads off the
    *  tracking ref carries B. Throws on failure (unlike the best-effort reads) so the caller can
    *  fall back to a "failed" outcome rather than silently pushing the un-bridged H. */
-  async updateTrackingRef(barePath: string, branch: string, sha: string): Promise<void> {
-    await this.runGit(barePath, ["update-ref", runnerTrackingRef(branch), sha]);
+  async updateTrackingRef(barePath: string, branch: string, sha: string,
+    opts: FetchAgentBranchOptions): Promise<TrackingUpdateResult> {
+    if (!opts) throw new Error("updateTrackingRef requires trusted claim context");
+    opts = this.snapshotOwedOptions(opts);
+    await this.validateOwedContext(barePath, branch, opts.context);
+    this.validateConfirmedSha(opts.remotelyConfirmedSha);
+    await this.requireOwedCommit(barePath, sha);
+    return this.withLock(barePath, async () => {
+      const observed = await this.observeTrackingUnderLock(barePath, branch);
+      if (!observed) return { kind: "not_updated", reason: "ownership_unknown" };
+      return this.promoteTrackingUnderLock(barePath, branch, sha, observed, opts);
+    });
   }
 
   /** issue #1117: the CURRENT origin-tracking tip of `refs/remotes/origin/<branch>`,
@@ -3945,10 +4155,104 @@ export class GitCache {
     });
   }
 
-  private async readRecoveryCapture(barePath: string, branch: string): Promise<RecoveryJournalEntry | undefined> {
+  /** Read only worker-journaled/ledger-owned heads. Ref files are size-bounded;
+   * no retries, and any failed sibling read refuses the whole verification.
+   * Runner config is never consulted, and every traversed component rejects symlinks. */
+  async readInventoryCloneHeads(barePath: string, runId: string): Promise<
+    { kind: "verified"; heads: string[]; clones: Array<{ clonePath: string; branch: string; runId: string }>; foreignOwners: string[] } | { kind: "unknown" }
+  > {
+    try {
+      if (typeof runId !== "string" || !OWED_RUN_ID.test(runId) ||
+          await this.resolveRecoveryBareDir(path.basename(barePath)) !== barePath) return { kind: "unknown" };
+      return await this.withLock(barePath, async () => {
+        const paths = new Map<string, { branch: string; runId: string }>();
+        const foreignOwners = new Set<string>();
+        const config = await this.runGit(barePath, ["config", "--local", "--null", "--list"]);
+        const entries = config.split("\0");
+        for (const item of entries) {
+          const nl = item.indexOf("\n");
+          const match = /^uzi-recovery\.(.+)\.clone$/.exec(item.slice(0, nl));
+          if (!match) continue;
+          const journal = await this.readRecoveryCapture(barePath, match[1]!, entries);
+          if (!journal) throw new Error("unreadable recovery attribution");
+          if (journal.runId !== runId) { foreignOwners.add(journal.runId); continue; }
+          paths.set(journal.clonePath, { branch: match[1]!, runId });
+        }
+        // Unlike advisory backup readers, FINAL cannot skip malformed ledger evidence.
+        for (const [, raw] of await this.readAllAttemptLedgerRaw(barePath)) {
+          if (!parseAttemptLedgerEntry(raw)) throw new Error("unreadable attempt attribution");
+        }
+        for (const entry of (await this.readAllAttemptLedgers(barePath)).values()) {
+          if (entry.runId !== runId) { foreignOwners.add(entry.runId); continue; }
+          paths.set(entry.clonePath, { branch: entry.branch, runId });
+        }
+        const heads = new Set<string>();
+        const clones: Array<{ clonePath: string; branch: string; runId: string }> = [];
+        for (const [clone, owner] of paths) {
+          const parsed = parseAttemptPath(clone, path.resolve(this.runnerRoot));
+          const key = parsed?.key ?? path.basename(clone);
+          if (!parsed && !/^[A-Za-z0-9_-]+$/.test(key)) throw new Error("unknown canonical clone key");
+          if (!await this.classifyOwnerClonePath(barePath, owner.branch, key, runId, clone)) {
+            throw new Error("unknown retained clone path");
+          }
+          const root = path.resolve(this.runnerRoot);
+          if (!path.isAbsolute(clone) || path.resolve(clone) !== clone ||
+              path.dirname(path.dirname(clone)) !== root) throw new Error("unsafe clone path");
+          // ENOENT proves no physical clone remains, only after validating all parents.
+          for (const dir of [root, path.dirname(clone)]) {
+            const st = await fs.lstat(dir);
+            if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("unsafe clone parent");
+          }
+          let st: Stats;
+          try { st = await fs.lstat(clone); }
+          catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue; throw err; }
+          if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("unsafe clone");
+          const gitdir = path.join(clone, ".git");
+          const gs = await fs.lstat(gitdir);
+          if (!gs.isDirectory() || gs.isSymbolicLink()) throw new Error("unsafe clone git directory");
+          const readRef = async (relative: string): Promise<string> => {
+            const parts = relative.split("/");
+            for (let i = 1; i < parts.length; i++) {
+              const ds = await fs.lstat(path.join(gitdir, ...parts.slice(0, i)));
+              if (!ds.isDirectory() || ds.isSymbolicLink()) throw new Error("unsafe ref parent");
+            }
+            const file = await fs.open(path.join(gitdir, relative), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+            try {
+              const stat = await file.stat();
+              if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("unsafe ref file");
+              const bytes = Buffer.alloc(1024 * 1024 + 1);
+              const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+              if (bytesRead > 1024 * 1024) throw new Error("ref exceeds verification bound");
+              return bytes.subarray(0, bytesRead).toString("utf8").trim();
+            } finally { await file.close(); }
+          };
+          let head = await readRef("HEAD");
+          if (head.startsWith("ref: ")) {
+            const ref = head.slice(5);
+            if (ref.length > 256 || !/^refs\/heads\/[A-Za-z0-9_./-]+$/.test(ref) ||
+                ref.split("/").some(p => !p || p === "." || p === "..")) throw new Error("unsafe HEAD ref");
+            try { head = await readRef(ref); }
+            catch (err) {
+              if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+              const packed = await readRef("packed-refs");
+              head = packed.split("\n").find(line => line.slice(41) === ref)?.slice(0, 40) ?? "";
+            }
+          }
+          if (!SHA40_RE.test(head)) throw new Error("unreadable retained HEAD");
+          heads.add(head);
+          clones.push({ clonePath: clone, ...owner });
+        }
+        return { kind: "verified", heads: [...heads], clones, foreignOwners: [...foreignOwners] };
+      });
+    } catch {
+      return { kind: "unknown" };
+    }
+  }
+
+  private async readRecoveryCapture(barePath: string, branch: string, snapshot?: string[]): Promise<RecoveryJournalEntry | undefined> {
     // Unlike tryGitStdout, --list succeeds when the key is absent and throws on
     // an unreadable/corrupt config. Never interpret a failed read as no journal.
-    const entries = (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
+    const entries = snapshot ?? (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
     const prefix = `${recoveryCaptureKey(branch)}\n`;
     const entry = entries.filter((item) => item.startsWith(prefix)).at(-1);
     const value = entry?.slice(prefix.length);
@@ -4232,12 +4536,15 @@ export class GitCache {
     overlay?: CheckpointOverlayContext,
     pinned?: CheckpointRange,
     onStep?: (step: BoundaryStep) => void,
+    /** Exact committed ownership snapshot supplied by the runner; never a source ref name. */
+    sourceSha?: string,
   ): Promise<{ tipOid: string; pack: Readable; exited: Promise<number> } | null> {
     // A pinned range uses literal commit OIDs for the pack floor and candidate.
     // If an overlay is requested, its wrapper becomes the wanted OID while the
     // excluded floor remains pinned.
     if (pinned) {
-      if (!SHA40_RE.test(pinned.tipSha) || !SHA40_RE.test(pinned.excludeSha)) {
+      if (!SHA40_RE.test(pinned.tipSha) || !SHA40_RE.test(pinned.excludeSha) ||
+          (sourceSha !== undefined && sourceSha !== pinned.tipSha)) {
         throw new ScratchPublicationError("pinned checkpoint range must be two 40-hex commit SHAs", undefined, {
           kind: "checkpoint_range", step: "checkpoint_floor", detail: "pinned range is not two 40-hex commit SHAs",
         });
@@ -4259,7 +4566,7 @@ export class GitCache {
       );
       return { tipOid: wanted, pack: stdout, exited };
     }
-    const realTip = await this.trackingTip(barePath, branch);
+    const realTip = sourceSha ?? await this.trackingTip(barePath, branch);
     if (!realTip) return null;
     onStep?.("scratch_preflight");
     await this.scratchPublicationPreflight(barePath, branch, realTip);
@@ -5337,6 +5644,94 @@ export class GitCache {
         error: gitErrorMessage(err),
       });
       return [];
+    }
+  }
+
+  /**
+   * Owner-cancel inspection only. Clone observations run as the runner uid without optional
+   * locks. Status is only a metadata/untracked check: a separate runner-identity reader
+   * hashes regular-file bytes and raw symlink target bytes against the trusted bare starting
+   * tree, never following targets or trusting the clone's index or object store.
+   * Unsupported types/platforms and budgets retain custody.
+   * Ignored untracked .gitignore retains custody, even in trusted-ignored directories such as Python virtualenvs.
+   * Trusted tracked .gitignore semantics remain unchanged. External excludes are disabled;
+   * info/exclude permits only the exact worker-source '/.uzi/scratch/' baseline plus
+   * column-zero comments and empty or ASCII-space-only blanks. Uncertain rules retain custody.
+   */
+  async credentialFreeCancelCleanHead(cwd: string, barePath: string, trustedStart: string): Promise<string | null> {
+    const pins = [
+      // Compare the real HEAD tree: runner-owned refs/replace must not hide private bytes.
+      "--no-replace-objects",
+      "--no-optional-locks",
+      "-c", "core.fsmonitor=false",
+      "-c", "core.untrackedCache=false",
+      "-c", "core.ignoreStat=false",
+      "-c", "core.checkStat=default",
+      "-c", "core.trustctime=true",
+      "-c", "core.fileMode=true",
+      "-c", "core.ignoreCase=false",
+      "-c", "core.excludesFile=/dev/null",
+    ];
+    const read = (args: string[]) => this.runGitAsRunner(cwd, [...pins, ...args]);
+    try {
+      if (process.platform !== "linux" || !path.isAbsolute(cwd) ||
+          path.resolve(cwd) !== cwd || !/^[0-9a-f]{40}$/.test(trustedStart)) return null;
+      // Pure worker-side object enumeration: the private clone cannot supply the tree.
+      // Each subprocess has a deadline/output cap; no retries or sibling work.
+      const tree = await this.execScoped(GIT_BIN,
+        withDir(barePath, ["--no-replace-objects", "ls-tree", "-r", "-l", "-z", trustedStart]), {
+          env: workerSpawnEnv(gitEnv()), timeout: 5000, maxBuffer: 2 * 1024 * 1024,
+        });
+      const manifest: Array<[string, string, string, number]> = [];
+      let total = 0;
+      for (const entry of tree.stdout.split("\0")) {
+        if (!entry) continue;
+        const match = /^(100644|100755|120000) blob ([0-9a-f]{40}) +([0-9]+)\t([\s\S]+)$/.exec(entry);
+        if (!match) return null;
+        // execScoped decodes UTF-8. Refuse replacement characters so distinct raw
+        // Git paths cannot collapse to the same runner-reader path.
+        if (match[4]!.includes("\uFFFD")) return null;
+        const size = Number(match[3]);
+        total += size;
+        if (!Number.isSafeInteger(size) || size > 4 * 1024 * 1024 ||
+            total > 128 * 1024 * 1024 || manifest.length >= 20000) return null;
+        manifest.push([match[4]!, match[1]!, match[2]!, size]);
+      }
+      // config/index/ref reads cannot invoke a clean/process filter. Reading all effective
+      // config also sees included config files; any read failure refuses the proof.
+      const config = await read(["config", "--null", "--list"]);
+      for (const entry of config.split("\0")) {
+        const split = entry.indexOf("\n");
+        const key = (split < 0 ? entry : entry.slice(0, split)).toLowerCase();
+        if (/^filter\..*\.(clean|process)$/.test(key) ||
+            key === "core.worktree" || key === "core.sparsecheckout" ||
+            key === "extensions.worktreeconfig") return null;
+      }
+      const flags = await read(["ls-files", "-v", "-z"]);
+      if (flags.split("\0").some(entry => entry && (entry[0] === "S" || /^[a-z]/.test(entry)))) return null;
+      const index = await read(["ls-files", "--stage", "-z"]);
+      const expectedIndex = manifest.map(([name, mode, oid]) => mode + " " + oid + " 0\t" + name + "\0").join("");
+      if (index !== expectedIndex) return null;
+      const before = (await read(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+      if (before !== trustedStart) return null;
+      const status = await read(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"]);
+      if (status.length !== 0) return null;
+      const ignored = await read(["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", ":(glob)**/.gitignore", ":(exclude).uzi/scratch/**"]);
+      if (ignored.split("\0").some(entry => entry && !entry.startsWith(".uzi/scratch/"))) return null;
+      const wrapped = this.boundaryProcesses.getStore()
+        ? { command: process.execPath, args: ["-e", CANCEL_CONTENT_HELPER, cwd] }
+        : runnerCommand(process.execPath, ["-e", CANCEL_CONTENT_HELPER, cwd]);
+      const input = JSON.stringify(manifest);
+      if (Buffer.byteLength(input) > 2 * 1024 * 1024) return null;
+      const proof = await this.execScoped(wrapped.command, wrapped.args, {
+        env: unmarkedSpawnEnv({ ...gitEnv(), PATH: runnerPath() }),
+        cwd, input, timeout: 30000, maxBuffer: 1024,
+      }, "command");
+      if (proof.stdout !== "clean\n") return null;
+      const after = (await read(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+      return status.length === 0 && before === after ? after : null;
+    } catch {
+      return null;
     }
   }
 
@@ -7656,28 +8051,711 @@ export class GitCache {
    *  the caller's runId-equality test (a foreign branch's stamp carries a different, globally
    *  unique runId). Returns "" when neither form is present. Best-effort throughout. */
   private async readTrackingOwner(barePath: string, branch: string): Promise<string> {
-    const current = await this.tryGitStdout(barePath, ["config", "--get", runnerTrackingOwnerKey(branch)]);
-    if (current) return current;
-    const legacy = await this.tryGitStdout(barePath, ["config", "--get", legacyFlatTrackingOwnerKey(branch)]);
-    if (!legacy) return "";
-    if (await this.flatOwnerKeyAmbiguous(barePath, branch)) return "";
-    return legacy;
+    try {
+      await this.assertOwedBare(barePath);
+      const sha = await this.checkedTrackingSha(barePath, branch);
+      return sha ? (await this.checkedTrackingOwner(barePath, branch, sha))?.runId ?? "" : "";
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return "";
+    }
   }
 
   /** issue #909 — true when a DISTINCT live tracking ref (refs/uzi-runner/<branch>) flattens to
    *  the same pre-#887 flat owner key as `branch`, making a legacy flat stamp unattributable.
    *  Enumerates the tracking namespace; the ref suffix is the branch. Best-effort. */
   private async flatOwnerKeyAmbiguous(barePath: string, branch: string): Promise<boolean> {
-    const token = branch.replace(/[^A-Za-z0-9_-]/g, "-");
-    const out = await this.tryGitStdout(barePath, ["for-each-ref", "--format=%(refname)", RUNNER_TRACKING_PREFIX]);
-    if (!out) return false;
+    const token = branch.replace(/[^A-Za-z0-9_-]/g, "-").toLowerCase();
+    const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname)", RUNNER_TRACKING_PREFIX]);
+    if (!out.trim()) return false;
     for (const ref of out.split("\n")) {
       if (!ref.startsWith(RUNNER_TRACKING_PREFIX)) continue;
       const other = ref.slice(RUNNER_TRACKING_PREFIX.length);
       if (other === branch) continue;
-      if (other.replace(/[^A-Za-z0-9_-]/g, "-") === token) return true;
+      if (other.replace(/[^A-Za-z0-9_-]/g, "-").toLowerCase() === token) return true;
     }
     return false;
+  }
+
+  /** Worker-only directories are the ownership root; runner-provided Git config is not. */
+  private async assertOwedBare(barePath: string): Promise<void> {
+    const root = path.resolve(this.reposRoot);
+    if (typeof barePath !== "string" || path.dirname(barePath) !== root || path.resolve(barePath) !== barePath) {
+      throw new Error("owed candidates require a known worker bare path");
+    }
+    for (const dir of [root, barePath]) {
+      const st = await fs.lstat(dir);
+      if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() ||
+          (st.mode & 0o002) !== 0 ||
+          ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() ||
+            (uidSplitActive() && st.gid === RUNNER_UID)))) throw new Error("unsafe worker bare directory");
+    }
+    if ((await this.runGit(barePath, ["rev-parse", "--is-bare-repository"])).trim() !== "true") {
+      throw new Error("owed candidates require a bare repository");
+    }
+  }
+
+  private snapshotOwedOptions(opts: FetchAgentBranchOptions): FetchAgentBranchOptions {
+    const c = opts.context;
+    return { context: { ...c, defaultIdentity: c?.defaultIdentity && { ...c.defaultIdentity } },
+      remotelyConfirmedSha: opts.remotelyConfirmedSha };
+  }
+
+  private async validateOwedContext(barePath: string, branch: string, c: StoredOwedContext,
+    historical = false, stored = false): Promise<void> {
+    const raw = c as unknown as Record<string, unknown>;
+    const isHistorical = raw?.origin === "historical";
+    const expectedKeys = isHistorical
+      ? "barePath,branch,defaultIdentity,generation,kind,origin,producer,runId"
+      : c?.generation === null ? "barePath,branch,defaultIdentity,generation,kind,legacy,runId"
+        : "barePath,branch,defaultIdentity,generation,kind,runId";
+    const validShape = !!c && Object.keys(c).sort().join(",") === expectedKeys;
+    const validGeneration = !!c && (isHistorical
+      ? historical && c.generation === null && raw.producer === "unknown" &&
+        c.kind === null && c.defaultIdentity === null && raw.legacy === undefined
+      : (c.generation === null ? raw.legacy === true
+        : Number.isSafeInteger(c.generation) && c.generation > 0 && raw.legacy === undefined));
+    if (!c || !validShape || typeof c.runId !== "string" || !OWED_RUN_ID.test(c.runId) || !validGeneration ||
+        typeof branch !== "string" || typeof barePath !== "string" ||
+        typeof c.branch !== "string" || typeof c.barePath !== "string" ||
+        c.branch !== branch || c.barePath !== barePath ||
+        (!isHistorical && (!(RUN_KINDS as readonly unknown[]).includes(c.kind) ||
+          !c.defaultIdentity || Object.keys(c.defaultIdentity).sort().join(",") !== "ref,sha" ||
+          typeof c.defaultIdentity.ref !== "string" ||
+          !c.defaultIdentity.ref.startsWith("refs/") || typeof c.defaultIdentity.sha !== "string" || !OWED_OID.test(c.defaultIdentity.sha)))) {
+      throw new Error("invalid owed candidate context");
+    }
+    await this.assertOwedBare(barePath);
+    if (!(await this.isPlainBranchName(barePath, branch))) throw new Error("invalid owed branch");
+    if (c.defaultIdentity) {
+      await this.runGit(barePath, ["check-ref-format", c.defaultIdentity.ref]);
+      if (!stored) {
+        const name = this.contextName(c);
+        const record = await this.readOwedFile(barePath, name);
+        if (record === undefined) {
+          // First admission proves the default identity is an actual commit.
+          await this.requireOwedCommit(barePath, c.defaultIdentity.sha);
+        } else {
+          // Worker-owned immutable context proves identity, not object reachability
+          // or remote containment. Its original default commit may have been pruned.
+          const proven = await this.parseOwedContext(barePath, record);
+          if (this.contextName(proven) !== name || "origin" in proven ||
+              proven.runId !== c.runId || proven.branch !== c.branch || proven.barePath !== c.barePath ||
+              proven.generation !== c.generation || proven.kind !== c.kind ||
+              proven.defaultIdentity.ref !== c.defaultIdentity.ref ||
+              proven.defaultIdentity.sha !== c.defaultIdentity.sha) {
+            throw new Error("owed context identity mismatch");
+          }
+        }
+      }
+    }
+  }
+
+  private validateConfirmedSha(sha: string | undefined): void {
+    if (sha !== undefined && (typeof sha !== "string" || !OWED_OID.test(sha))) throw new Error("invalid remotely confirmed SHA");
+  }
+
+  private async requireOwedCommit(barePath: string, sha: string): Promise<void> {
+    if (typeof sha !== "string" || !OWED_OID.test(sha) ||
+        (await this.runGit(barePath, ["cat-file", "-t", sha])).trim() !== "commit") {
+      throw new Error("owed candidate is not an actual lowercase commit OID");
+    }
+  }
+
+  private owedDirectory(barePath: string): string { return path.join(barePath, "uzi-owed"); }
+  private receiptName(branch: string): string {
+    return createHash("sha256").update(branch).digest("hex");
+  }
+
+  private async ensureOwedDirectory(barePath: string): Promise<string> {
+    const dir = this.owedDirectory(barePath);
+    try {
+      await fs.mkdir(dir, { mode: 0o700 });
+      const parent = await fs.open(barePath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+      try { await parent.sync(); } finally { await parent.close(); }
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code !== "EEXIST") throw cause;
+    }
+    const st = await fs.lstat(dir);
+    if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0) {
+      throw new Error("unsafe owed metadata directory");
+    }
+    return dir;
+  }
+
+  /** ENOENT alone means absent. Bounded regular-file no-follow read, worker ownership required. */
+  private async readOwedFile(barePath: string, name: string): Promise<unknown | undefined> {
+    const dir = this.owedDirectory(barePath);
+    try {
+      const st = await fs.lstat(dir);
+      if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0) {
+        throw new Error("unsafe owed metadata directory");
+      }
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw cause;
+    }
+    let file: import("node:fs/promises").FileHandle;
+    try {
+      file = await fs.open(path.join(dir, name), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw cause;
+    }
+    try {
+      const st = await file.stat();
+      if (!st.isFile() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0 || st.size > 65536) {
+        throw new Error("unsafe owed metadata file");
+      }
+      const buf = Buffer.alloc(65537);
+      const { bytesRead } = await file.read(buf, 0, buf.length, 0);
+      if (bytesRead > 65536) throw new Error("oversized owed metadata");
+      return JSON.parse(buf.toString("utf8", 0, bytesRead)) as unknown;
+    } finally { await file.close(); }
+  }
+
+  /** Temp is exclusive/no-follow, synced before rename; rename and directory sync precede readback. */
+  private async writeOwedFile(barePath: string, name: string, value: unknown): Promise<void> {
+    const dir = await this.ensureOwedDirectory(barePath);
+    const temp = path.join(dir, `.tmp-${randomUUID()}`);
+    const file = await fs.open(temp, fsConstants.O_WRONLY | fsConstants.O_CREAT |
+      fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    try {
+      await file.writeFile(JSON.stringify(value) + "\n");
+      await file.sync();
+    } finally { await file.close(); }
+    try {
+      // Read an existing destination to reject symlinks, FIFOs and foreign-owned files.
+      await this.readOwedFile(barePath, name);
+      await fs.rename(temp, path.join(dir, name));
+      const directory = await fs.open(dir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+      try { await directory.sync(); } finally { await directory.close(); }
+      if (JSON.stringify(await this.readOwedFile(barePath, name)) !== JSON.stringify(value)) {
+        throw new Error("owed metadata readback mismatch");
+      }
+    } finally { await fs.rm(temp, { force: true }); }
+  }
+
+  private async removeOwedFile(barePath: string, name: string): Promise<void> {
+    const dir = this.owedDirectory(barePath);
+    await fs.unlink(path.join(dir, name));
+    const handle = await fs.open(dir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+    try { await handle.sync(); } finally { await handle.close(); }
+  }
+
+  private contextName(c: StoredOwedContext): string {
+    const identity = [c.runId, c.branch, c.barePath, c.generation, c.kind,
+      c.defaultIdentity?.ref ?? null, c.defaultIdentity?.sha ?? null,
+      "origin" in c ? "historical" : c.generation === null ? "legacy" : "claim"];
+    return `context-${createHash("sha256").update(JSON.stringify(identity)).digest("hex")}.json`;
+  }
+
+  private async persistOwedContext(c: StoredOwedContext): Promise<void> {
+    const name = this.contextName(c);
+    const record = { version: 1, runId: c.runId, branch: c.branch, barePath: c.barePath,
+      generation: c.generation, kind: c.kind, defaultIdentity: c.defaultIdentity
+        ? { ref: c.defaultIdentity.ref, sha: c.defaultIdentity.sha } : null,
+      ...("origin" in c ? { origin: c.origin, producer: c.producer }
+        : c.generation === null ? { legacy: true } : {}) };
+    const existing = await this.readOwedFile(c.barePath, name);
+    if (existing !== undefined) {
+      if (JSON.stringify(existing) !== JSON.stringify(record)) throw new Error("owed context identity changed");
+      return;
+    }
+    await this.writeOwedFile(c.barePath, name, record);
+  }
+
+  private async parseOwedContext(barePath: string, value: unknown): Promise<StoredOwedContext> {
+    const v = value as StoredOwedContext & { version?: unknown };
+    const keys = v && Object.keys(v).sort().join(",");
+    const expected = v && "origin" in v
+      ? "barePath,branch,defaultIdentity,generation,kind,origin,producer,runId,version"
+      : v?.generation === null
+        ? "barePath,branch,defaultIdentity,generation,kind,legacy,runId,version"
+        : "barePath,branch,defaultIdentity,generation,kind,runId,version";
+    if (!v || v.version !== 1 || keys !== expected ||
+        (v.defaultIdentity !== null && Object.keys(v.defaultIdentity ?? {}).sort().join(",") !== "ref,sha")) {
+      throw new Error("invalid owed context record");
+    }
+    const { version: _version, ...c } = v;
+    await this.validateOwedContext(barePath, c.branch, c, true, true);
+    return c;
+  }
+
+  /** Caller MUST hold the bare lock: the count-then-pin below is only atomic under it. Every
+   *  pin-producing path (fetchAgentBranch, promoteTrackingUnderLock, clearConflictingAncestorTrackingRefs,
+   *  retainCurrentOwedCandidate) funnels through here. The check precedes every write, so a refusal
+   *  leaves the existing pins, metadata and refs untouched. */
+  private async pinOwedUnderLock(c: StoredOwedContext, sha: string): Promise<void> {
+    await this.requireOwedCommit(c.barePath, sha);
+    const ref = `refs/uzi-owed/${c.runId}/${sha}`;
+    const held = (await this.runGit(c.barePath, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/uzi-owed/${c.runId}/`]))
+      .split("\n").filter(Boolean).map((line) => line.split(" ")[0]!);
+    if (!held.includes(ref) && held.length >= this.maxOwedCandidates) throw new OwedCandidateLimitError();
+    await this.persistOwedContext(c); // Durable discovery precedes the first pin.
+    const context = this.contextName(c);
+    const name = `candidate-${c.runId}-${sha}-${context.slice(8, -5)}.json`;
+    const record = { version: 1, runId: c.runId, context, sha };
+    const old = await this.readOwedFile(c.barePath, name);
+    if (old !== undefined && JSON.stringify(old) !== JSON.stringify(record)) throw new Error("invalid owed candidate record");
+    if (old === undefined) await this.writeOwedFile(c.barePath, name, record);
+    await this.runGit(c.barePath, ["update-ref", ref, sha]);
+    if (await this.checkedRefSha(c.barePath, ref) !== sha) throw new Error("owed pin readback mismatch");
+  }
+
+  /** Checked enumeration distinguishes a genuinely absent exact ref from a failed read. */
+  private async checkedRefSha(barePath: string, ref: string): Promise<string | undefined> {
+    const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)", ref]);
+    const matches = out.trim().split("\n").filter((line) => line.startsWith(ref + " "));
+    if (matches.length === 0) return undefined;
+    if (matches.length !== 1) throw new Error("ambiguous tracking ref");
+    const sha = matches[0]!.slice(ref.length + 1);
+    await this.requireOwedCommit(barePath, sha);
+    return sha;
+  }
+  private checkedTrackingSha(barePath: string, branch: string): Promise<string | undefined> {
+    return this.checkedRefSha(barePath, runnerTrackingRef(branch));
+  }
+
+  private async checkedOwnerStamp(barePath: string, branch: string, allowLegacy: boolean): Promise<string | undefined> {
+    const raw = await this.runGit(barePath, ["config", "--local", "--null", "--list"]);
+    const values = (key: string): string[] => raw.split("\0")
+      .filter((item) => item.startsWith(key + "\n")).map((item) => item.slice(key.length + 1));
+    let found = values(runnerTrackingOwnerKey(branch));
+    if (found.length === 0 && allowLegacy) {
+      const key = legacyFlatTrackingOwnerKey(branch);
+      found = raw.split("\0").filter((item) => item.slice(0, item.indexOf("\n")).toLowerCase() === key)
+        .map((item) => item.slice(item.indexOf("\n") + 1));
+      if (found.length && await this.flatOwnerKeyAmbiguous(barePath, branch)) return undefined;
+    }
+    return found.length === 1 && OWED_RUN_ID.test(found[0]!) ? found[0] : undefined;
+  }
+
+  private async checkedReceiptGovernance(barePath: string, branch: string): Promise<"absent" | "governed" | "invalid"> {
+    const key = `uzi-trackowner.${branch}.receiptversion`;
+    const raw = await this.runGit(barePath, ["config", "--local", "--null", "--list"]);
+    const values = raw.split("\0").filter((item) => item.startsWith(key + "\n"))
+      .map((item) => item.slice(key.length + 1));
+    return values.length === 0 ? "absent" : values.length === 1 && values[0] === "1" ? "governed" : "invalid";
+  }
+
+  private async checkedTrackingOwner(barePath: string, branch: string, sha: string): Promise<CheckedTrackingOwner> {
+    const governance = await this.checkedReceiptGovernance(barePath, branch);
+    if (governance === "invalid") return undefined;
+    const hash = this.receiptName(branch);
+    const marker = await this.readOwedFile(barePath, `governed-${hash}.json`);
+    const receipt = await this.readOwedFile(barePath, `receipt-${hash}.json`) as TrackingReceipt | undefined;
+    if (governance === "absent" && marker === undefined && receipt === undefined) {
+      const runId = await this.checkedOwnerStamp(barePath, branch, true);
+      return runId ? { runId } : undefined;
+    }
+    if (JSON.stringify(marker) !== JSON.stringify({ version: 1, branch }) || !receipt ||
+        Object.keys(receipt).sort().join(",") !== "branch,context,generation,phase,runId,trackingSha,version" ||
+        receipt.version !== 1 || receipt.branch !== branch || typeof receipt.runId !== "string" || !OWED_RUN_ID.test(receipt.runId) ||
+        typeof receipt.context !== "string" || !/^context-[0-9a-f]{64}\.json$/.test(receipt.context) ||
+        receipt.trackingSha !== sha || receipt.phase !== "committed") return undefined;
+    if (await this.checkedOwnerStamp(barePath, branch, false) !== receipt.runId) return undefined;
+    const c = await this.parseOwedContext(barePath,
+      await this.readOwedFile(barePath, receipt.context));
+    if ("origin" in c || c.branch !== branch || c.runId !== receipt.runId ||
+        c.generation !== receipt.generation || this.contextName(c) !== receipt.context) return undefined;
+    return { runId: receipt.runId, generation: receipt.generation, context: receipt.context };
+  }
+
+  private async observeTrackingUnderLock(barePath: string, branch: string):
+    Promise<{ sha?: string; owner?: CheckedTrackingOwner } | undefined> {
+    try {
+      const sha = await this.checkedTrackingSha(barePath, branch);
+      const owner = sha ? await this.checkedTrackingOwner(barePath, branch, sha) : undefined;
+      if (sha && !owner) return undefined;
+      // Even absent refs must not bypass unreadable config/sidecar state.
+      if (!sha) {
+        await this.checkedOwnerStamp(barePath, branch, false);
+        if (await this.checkedReceiptGovernance(barePath, branch) === "invalid") return undefined;
+        const hash = this.receiptName(branch);
+        const marker = await this.readOwedFile(barePath, `governed-${hash}.json`);
+        const receipt = await this.readOwedFile(barePath, `receipt-${hash}.json`);
+        if (marker !== undefined && JSON.stringify(marker) !== JSON.stringify({ version: 1, branch })) return undefined;
+        if (receipt !== undefined) return undefined;
+      }
+      return { sha, owner };
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return undefined;
+    }
+  }
+
+  private async remotelyCovers(barePath: string, sha: string, confirmed: string | undefined): Promise<boolean> {
+    if (confirmed === undefined) return false;
+    try {
+      await this.requireOwedCommit(barePath, confirmed);
+      return await this.ancestry(barePath, sha, confirmed) === "ancestor";
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return false;
+    }
+  }
+
+  private async producingContext(barePath: string, branch: string, owner: CheckedTrackingOwner): Promise<StoredOwedContext> {
+    if (!owner) throw new Error("missing producing owner");
+    if (!owner.context) {
+      return { barePath, branch, runId: owner.runId, generation: null, origin: "historical",
+        producer: "unknown", kind: null, defaultIdentity: null };
+    }
+    const c = await this.parseOwedContext(barePath, await this.readOwedFile(barePath, owner.context));
+    if (c.branch !== branch || c.runId !== owner.runId || c.generation !== owner.generation ||
+        this.contextName(c) !== owner.context) throw new Error("producing context mismatch");
+    return c;
+  }
+
+  /** Local committed ownership only; this is never confirmation of remote containment. */
+  async committedTrackingOwnership(barePath: string, branch: string, runId: string,
+    expectedSha?: string, generation?: number): Promise<CommittedTrackingOwnership> {
+    if (typeof runId !== "string" || !OWED_RUN_ID.test(runId) ||
+        typeof branch !== "string" || typeof barePath !== "string" ||
+        (expectedSha !== undefined && (typeof expectedSha !== "string" || !OWED_OID.test(expectedSha))) ||
+        (generation !== undefined && (!Number.isSafeInteger(generation) || generation <= 0))) {
+      return { kind: "not_owned" };
+    }
+    try { await this.assertOwedBare(barePath); }
+    catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return { kind: "not_owned" };
+    }
+    return this.withLock(barePath, async () => {
+      const observed = await this.observeTrackingUnderLock(barePath, branch);
+      if (!observed?.sha || !observed.owner?.context || observed.owner.runId !== runId ||
+          (expectedSha !== undefined && observed.sha !== expectedSha) ||
+          (generation !== undefined && observed.owner.generation !== generation)) return { kind: "not_owned" };
+      try {
+        const context = await this.parseOwedContext(barePath,
+          await this.readOwedFile(barePath, observed.owner.context));
+        if ("origin" in context || this.contextName(context) !== observed.owner.context ||
+            context.runId !== runId || context.branch !== branch ||
+            context.generation !== observed.owner.generation) return { kind: "not_owned" };
+        return { kind: "owned", sha: observed.sha, context };
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return { kind: "not_owned" };
+      }
+    });
+  }
+
+  private async hasOwedAnchorUnderLock(barePath: string, runId: string, sha: string): Promise<boolean> {
+    return (await this.enumerateOwedUnderLock(barePath, runId)).some((c) => c.sha === sha);
+  }
+
+  private async promoteTrackingUnderLock(barePath: string, branch: string, incoming: string,
+    observed: { sha?: string; owner?: CheckedTrackingOwner }, opts: FetchAgentBranchOptions): Promise<TrackingUpdateResult> {
+    const c = opts.context;
+    if (c.generation === null && observed.owner?.runId === c.runId && observed.owner.generation !== undefined &&
+        observed.owner.generation !== null) return { kind: "not_updated", reason: "ownership_unknown" };
+    const retainedShas: string[] = [];
+    let divergence: "none" | "ancestor" | "divergent" | "unknown" | "foreign" = "none";
+    if (observed.sha) divergence = observed.owner?.runId === c.runId
+      ? await this.ancestry(barePath, observed.sha, incoming) : "foreign";
+    try {
+      if (observed.sha && observed.owner &&
+          (observed.owner.runId !== c.runId ||
+            !(await this.remotelyCovers(barePath, observed.sha, opts.remotelyConfirmedSha)))) {
+        // Only this run's confirmation can discharge its own debt.
+        await this.pinOwedUnderLock(await this.producingContext(barePath, branch, observed.owner), observed.sha);
+        if (observed.owner.runId === c.runId) retainedShas.push(observed.sha);
+      }
+      await this.persistOwedContext(c);
+      if (!(await this.remotelyCovers(barePath, incoming, opts.remotelyConfirmedSha))) {
+        await this.pinOwedUnderLock(c, incoming);
+        retainedShas.push(incoming);
+      }
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return { kind: "not_updated", reason: preservationReason(cause) };
+    }
+    try {
+      const key = `uzi-trackowner.${branch}.receiptversion`;
+      await this.runGit(barePath, ["config", "--local", "--replace-all", key, "1"]);
+      if (await this.checkedReceiptGovernance(barePath, branch) !== "governed") {
+        throw new Error("receipt governance readback mismatch");
+      }
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return { kind: "not_updated", reason: "receipt_pending_failed" };
+    }
+    try {
+      const cleared = await this.clearConflictingAncestorTrackingRefs(barePath, runnerTrackingRef(branch), opts);
+      if (!cleared) return { kind: "not_updated", reason: "ownership_unknown" };
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return { kind: "not_updated", reason: preservationReason(cause) };
+    }
+    const receipt: TrackingReceipt = { version: 1, branch, runId: c.runId, generation: c.generation, context: this.contextName(c),
+      trackingSha: incoming, phase: "pending" };
+    try {
+      await this.writeOwedFile(barePath, `governed-${this.receiptName(branch)}.json`, { version: 1, branch });
+      await this.writeOwedFile(barePath, `receipt-${this.receiptName(branch)}.json`, receipt);
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return { kind: "not_updated", reason: "receipt_pending_failed" };
+    }
+    try {
+      await this.runGit(barePath, ["update-ref", runnerTrackingRef(branch), incoming, observed.sha ?? "0".repeat(40)]);
+      if (await this.checkedTrackingSha(barePath, branch) !== incoming) throw new Error("tracking CAS readback mismatch");
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return { kind: "not_updated", reason: "tracking_update_failed" };
+    }
+    try {
+      await this.runGit(barePath, ["config", "--local", "--replace-all", runnerTrackingOwnerKey(branch), c.runId]);
+      if (await this.checkedOwnerStamp(barePath, branch, false) !== c.runId) throw new Error("owner stamp readback mismatch");
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return { kind: "not_updated", reason: "owner_stamp_failed" };
+    }
+    try {
+      await this.writeOwedFile(barePath, `receipt-${this.receiptName(branch)}.json`, { ...receipt, phase: "committed" });
+      const owner = await this.checkedTrackingOwner(barePath, branch, incoming);
+      if (owner?.runId !== c.runId || owner.generation !== c.generation || owner.context !== this.contextName(c)) throw new Error("committed owner readback mismatch");
+    } catch (cause) {
+      // One best-effort invalidation after an indeterminate committed write/readback.
+      // No retries: if the disk remains unavailable the original owed pin still survives.
+      await this.writeOwedFile(barePath, `receipt-${this.receiptName(branch)}.json`, receipt)
+        .catch(() => undefined);
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return { kind: "not_updated", reason: "receipt_commit_failed" };
+    }
+    return { kind: "updated", trackingRef: runnerTrackingRef(branch), candidateSha: incoming,
+      retainedShas: [...new Set(retainedShas)].sort(), displacedSha: observed.sha, divergence };
+  }
+
+  /** Strict restart enumeration; malformed metadata or pins throw rather than appearing empty. */
+  async enumerateOwedCandidates(barePath: string, runId: string): Promise<OwedCandidate[]> {
+    if (typeof runId !== "string" || !OWED_RUN_ID.test(runId)) throw new Error("invalid owed run ID");
+    await this.assertOwedBare(barePath);
+    return this.withLock(barePath, () => this.enumerateOwedUnderLock(barePath, runId));
+  }
+
+  private async owedMetadataNames(barePath: string): Promise<string[]> {
+    const dir = this.owedDirectory(barePath);
+    try {
+      const st = await fs.lstat(dir);
+      if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0) {
+        throw new Error("unsafe owed discovery directory");
+      }
+      const names = await fs.readdir(dir);
+      for (const name of names) {
+        if (!/^(?:context-[0-9a-f]{64}|candidate-[A-Za-z0-9_-]+-[0-9a-f]{40}-[0-9a-f]{64}|(?:governed|receipt)-[0-9a-f]{64})\.json$/.test(name) &&
+            !/^\.tmp-[0-9a-f-]{36}$/.test(name)) throw new Error("unknown owed metadata entry");
+      }
+      return names.sort();
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw cause;
+    }
+  }
+
+  /** Read and validate EVERY owed context and candidate file once. Callers that enumerate several
+   *  runs of one bare (boot/live discovery) share one result instead of rereading per run or per
+   *  context. Any unreadable or malformed entry throws: nothing here ever skips a bad file. */
+  private async readOwedMetadataUnderLock(barePath: string): Promise<OwedMetadata> {
+    const names = await this.owedMetadataNames(barePath);
+    const contexts = new Map<string, StoredOwedContext>();
+    const records: OwedMetadata["records"] = [];
+    for (const name of names.filter((n) => n.startsWith("context-"))) {
+      const c = await this.parseOwedContext(barePath, await this.readOwedFile(barePath, name));
+      if (name !== this.contextName(c)) throw new Error("owed context filename mismatch");
+      contexts.set(name, c);
+    }
+    for (const name of names.filter((n) => n.startsWith("candidate-"))) {
+      const v = await this.readOwedFile(barePath, name) as { version: number; runId: string; context: string; sha: string };
+      if (!v || v.version !== 1 || Object.keys(v).sort().join(",") !== "context,runId,sha,version" ||
+          typeof v.runId !== "string" || !OWED_RUN_ID.test(v.runId) || typeof v.sha !== "string" || !OWED_OID.test(v.sha) ||
+          typeof v.context !== "string" || !/^context-[0-9a-f]{64}\.json$/.test(v.context) ||
+          name !== `candidate-${v.runId}-${v.sha}-${v.context.slice(8, -5)}.json`) throw new Error("invalid owed candidate metadata");
+      const c = contexts.get(v.context);
+      if (!c || c.runId !== v.runId) throw new Error("owed candidate has no discovery context");
+      records.push({ runId: v.runId, sha: v.sha, contextName: v.context, c });
+    }
+    return { names, contexts, records };
+  }
+
+  private async enumerateOwedUnderLock(barePath: string, runId: string, metadata?: OwedMetadata): Promise<OwedCandidate[]> {
+    const loaded = metadata ?? await this.readOwedMetadataUnderLock(barePath);
+    const records = loaded.records.filter((r) => r.runId === runId);
+    const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/uzi-owed/${runId}/`]);
+    const result: OwedCandidate[] = [];
+    for (const line of out.trim().split("\n").filter(Boolean)) {
+      const m = /^refs\/uzi-owed\/([^/]+)\/([0-9a-f]{40}) ([0-9a-f]{40})$/.exec(line);
+      if (!m || m[1] !== runId || m[2] !== m[3]) throw new Error("malformed owed pin");
+      const sha = m[2]!;
+      await this.requireOwedCommit(barePath, sha);
+      const producing = records.filter((r) => r.sha === sha).map((r) => r.c).sort((a, b) =>
+        a.generation === null ? (b.generation === null ? this.contextName(a).localeCompare(this.contextName(b)) : -1)
+          : b.generation === null ? 1 : a.generation - b.generation || this.contextName(a).localeCompare(this.contextName(b)));
+      if (!producing.length) throw new Error("owed pin has no discovery metadata");
+      result.push({ sha, pinRef: `refs/uzi-owed/${runId}/${sha}`, contexts: producing });
+    }
+    return result.sort((a, b) => a.sha.localeCompare(b.sha));
+  }
+
+  /** Boot discovery walks only this worker's known bare store, independent of HOME/journals. */
+  async discoverOwedCandidates(): Promise<Array<{ context: StoredOwedContext; candidates: OwedCandidate[] }>> {
+    const result: Array<{ context: StoredOwedContext; candidates: OwedCandidate[] }> = [];
+    let dirs: string[];
+    try { dirs = await fs.readdir(this.reposRoot); }
+    catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw cause;
+    }
+    for (const name of dirs.sort()) {
+      const bare = path.join(path.resolve(this.reposRoot), name);
+      await this.assertOwedBare(bare);
+      await this.withLock(bare, async () => {
+        // One metadata read per bare, and one enumeration (git calls) per run, however many
+        // contexts exist: the contexts of a run share its enumeration.
+        const metadata = await this.readOwedMetadataUnderLock(bare);
+        const allPins = await this.runGit(bare, ["for-each-ref", "--format=%(refname)", "refs/uzi-owed/"]);
+        const runs = new Set<string>();
+        const perRun = new Map<string, OwedCandidate[]>();
+        for (const [n, context] of metadata.contexts) {
+          runs.add(context.runId);
+          let enumerated = perRun.get(context.runId);
+          if (!enumerated) {
+            enumerated = await this.enumerateOwedUnderLock(bare, context.runId, metadata);
+            perRun.set(context.runId, enumerated);
+          }
+          const candidates = enumerated.filter((candidate) => candidate.contexts.some((c) => this.contextName(c) === n));
+          result.push({ context, candidates });
+        }
+        for (const ref of allPins.trim().split("\n").filter(Boolean)) {
+          if (!/^refs\/uzi-owed\/[^/]+\/[0-9a-f]{40}$/.test(ref) || !runs.has(ref.split("/")[2]!)) {
+            throw new Error("owed pin has no boot discovery context");
+          }
+        }
+      });
+    }
+    return result.sort((a, b) => a.context.barePath.localeCompare(b.context.barePath) ||
+      a.context.runId.localeCompare(b.context.runId) ||
+      (a.context.generation === null ? (b.context.generation === null ? 0 : -1)
+        : b.context.generation === null ? 1 : a.context.generation - b.context.generation) ||
+      this.contextName(a.context).localeCompare(this.contextName(b.context)));
+  }
+
+  /** Before relinquishing a claim, retain its proven current head; no nested bare lock. */
+  async retainCurrentOwedCandidate(barePath: string, opts: FetchAgentBranchOptions): Promise<TrackingUpdateResult> {
+    opts = this.snapshotOwedOptions(opts);
+    await this.validateOwedContext(barePath, opts.context.branch, opts.context);
+    this.validateConfirmedSha(opts.remotelyConfirmedSha);
+    return this.withLock(barePath, async () => {
+      const observed = await this.observeTrackingUnderLock(barePath, opts.context.branch);
+      if (!observed?.sha || observed.owner?.runId !== opts.context.runId) {
+        return { kind: "not_updated", reason: "ownership_unknown" };
+      }
+      try {
+        const retainedShas: string[] = [];
+        if (!(await this.remotelyCovers(barePath, observed.sha, opts.remotelyConfirmedSha))) {
+          await this.pinOwedUnderLock(await this.producingContext(barePath, opts.context.branch, observed.owner), observed.sha);
+          retainedShas.push(observed.sha);
+        }
+        return { kind: "updated", trackingRef: runnerTrackingRef(opts.context.branch),
+          candidateSha: observed.sha, retainedShas, divergence: "none" };
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return { kind: "not_updated", reason: preservationReason(cause) };
+      }
+    });
+  }
+
+  /** Only a server-confirmed full commit and positive ancestry proof release an owed pin. */
+  async reconcileOwedCandidates(barePath: string, runId: string, remotelyConfirmedSha: string):
+    Promise<{ removedShas: string[]; retainedShas: string[] }> {
+    if (typeof runId !== "string" || !OWED_RUN_ID.test(runId)) throw new Error("invalid owed run ID");
+    this.validateConfirmedSha(remotelyConfirmedSha);
+    await this.assertOwedBare(barePath);
+    return this.withLock(barePath, async () => {
+      const candidates = await this.enumerateOwedUnderLock(barePath, runId);
+      const removedShas: string[] = [], retainedShas: string[] = [];
+      for (const candidate of candidates) {
+        if (await this.remotelyCovers(barePath, candidate.sha, remotelyConfirmedSha)) {
+          await this.runGit(barePath, ["update-ref", "-d", candidate.pinRef, candidate.sha]);
+          if (await this.checkedRefSha(barePath, candidate.pinRef) !== undefined) throw new Error("owed pin deletion mismatch");
+          // Ref first, metadata second: a crash between them leaves harmless metadata, never a
+          // pin without discovery metadata. Without this, candidate-*.json would outlive every
+          // released pin and enumerateOwedUnderLock would read them all forever.
+          for (const ctx of candidate.contexts) {
+            const name = `candidate-${runId}-${candidate.sha}-${this.contextName(ctx).slice(8, -5)}.json`;
+            if (await this.readOwedFile(barePath, name) !== undefined) await this.removeOwedFile(barePath, name);
+          }
+          removedShas.push(candidate.sha);
+        } else retainedShas.push(candidate.sha);
+      }
+      return { removedShas, retainedShas };
+    });
+  }
+
+  /** Recovery-only aggregate, never a tracking/checkpoint/publication ref.
+   * Parent batches have at most 32 roots; every round reduces the count, with no retries.
+   * A failed construction/proof stops the aggregate, retaining all original owed pins. */
+  async buildRecoveryCoverage(barePath: string, context: PositiveOwedCandidateContext, originalShas: string[],
+    currentSha: string): Promise<RecoveryCoverage> {
+    context = this.snapshotOwedOptions({ context }).context as PositiveOwedCandidateContext;
+    if (!Number.isSafeInteger(context.generation) || context.generation <= 0 ||
+        "legacy" in context || "origin" in context) throw new Error("recovery coverage requires positive claim context");
+    await this.validateOwedContext(barePath, context.branch, context);
+    return this.withLock(barePath, async () => {
+      const roots = [...new Set(originalShas)].sort();
+      if (!roots.length) throw new Error("recovery coverage needs original roots");
+      await this.requireOwedCommit(barePath, currentSha);
+      for (const root of roots) await this.requireOwedCommit(barePath, root);
+      const tree = (await this.runGit(barePath, ["rev-parse", `${currentSha}^{tree}`])).trim();
+      if (!OWED_OID.test(tree) || (await this.runGit(barePath, ["cat-file", "-t", tree])).trim() !== "tree") {
+        throw new Error("recovery current tree unavailable");
+      }
+      const fingerprint = createHash("sha256").update(JSON.stringify({ roots, currentSha, tree })).digest("hex");
+      let parents = [...new Set([...roots, currentSha])].sort();
+      let round = 0;
+      do {
+        const next: string[] = [];
+        for (let start = 0; start < parents.length; start += 32) {
+          const args = ["-c", "commit.gpgsign=false", "commit-tree", tree];
+          for (const parent of parents.slice(start, start + 32)) args.push("-p", parent);
+          args.push("-m", `uzi recovery coverage ${fingerprint} round ${round} batch ${start / 32}`);
+          const sha = (await this.runGitWithEnv(barePath, args, {
+            GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name, GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
+            GIT_COMMITTER_NAME: AGENT_GIT_IDENTITY.name, GIT_COMMITTER_EMAIL: AGENT_GIT_IDENTITY.email,
+            GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
+          })).trim();
+          await this.requireOwedCommit(barePath, sha);
+          next.push(sha);
+        }
+        parents = next;
+        round++;
+      } while (parents.length > 1);
+      const sha = parents[0]!;
+      for (const root of [...roots, currentSha]) {
+        if (await this.ancestry(barePath, root, sha) !== "ancestor") throw new Error("recovery coverage proof failed");
+      }
+      if ((await this.runGit(barePath, ["rev-parse", `${sha}^{tree}`])).trim() !== tree) {
+        throw new Error("recovery coverage tree mismatch");
+      }
+      await this.persistOwedContext(context);
+      const coverageRef = `refs/uzi-coverage/${context.runId}/${context.generation}/${fingerprint}`;
+      await this.runGit(barePath, ["update-ref", coverageRef, sha]);
+      if (await this.checkedRefSha(barePath, coverageRef) !== sha) throw new Error("recovery coverage pin mismatch");
+      return { sha, coverageRef, fingerprint, originalShas: roots, currentSha };
+    });
   }
 
   private async tryGitStdout(cwd: string | undefined, args: string[]): Promise<string> {
@@ -7758,6 +8836,156 @@ export class GitCache {
     return result;
   }
 }
+
+// Trusted cancel reader: Linux pinned parents, regular-file descriptors and raw readlink
+// bytes; no target traversal, Git, config, filters or writes. One failed path aborts
+// the proof. At most 20,000 entries, depth 64, 4 MiB/entry,
+// 128 MiB total; synchronous reads check a 28s deadline, execScoped caps at 30s.
+const CANCEL_CONTENT_HELPER = String.raw`
+const fs = require("node:fs");
+const { createHash } = require("node:crypto");
+const C = fs.constants, O_PATH = 0x200000;
+const root = process.argv[1], deadline = Date.now() + 28000;
+const fds = new Set();
+let total = 0;
+function check() { if (Date.now() > deadline) throw Error("content deadline"); }
+function close(fd) { fs.closeSync(fd); fds.delete(fd); }
+function fp(fd) { return "/proc/" + process.pid + "/fd/" + fd; }
+function open(p, flags) {
+  check();
+  const fd = fs.openSync(p, flags);
+  fds.add(fd);
+  return fd;
+}
+function parts(p) {
+  const a = p.split("/");
+  if (!p || a.length > 64 || a.some(x => !x || x === "." || x === ".." || x.toLowerCase() === ".git")
+      || p.includes("\0") || Buffer.from(p).toString() !== p) throw Error("unsafe path");
+  return a;
+}
+try {
+  if (process.platform !== "linux" || !root.startsWith("/") || root.length > 4096 ||
+      root.split("/").length > 64) throw Error("unsupported root");
+  // Pin every absolute ancestor without following a source-controlled symlink.
+  let dir = open("/", O_PATH | C.O_NOFOLLOW);
+  for (const part of root.slice(1).split("/")) {
+    if (!part || part === "." || part === "..") throw Error("unsafe root");
+    const next = open(fp(dir) + "/" + part, O_PATH | C.O_NOFOLLOW);
+    if (!fs.fstatSync(next).isDirectory()) throw Error("non-directory root");
+    close(dir); dir = next;
+  }
+  // Fixed metadata traversal is separate from parts(), which forbids manifest .git paths.
+  // One failure aborts the proof; exclude reads stop at 64 KiB plus an overflow sentinel.
+  let metadata = dir;
+  try {
+    for (const component of [".git", "info"]) {
+      let next;
+      try { next = open(fp(metadata) + "/" + component, O_PATH | C.O_NOFOLLOW); }
+      catch (e) { if (component === "info" && e.code === "ENOENT") break; throw e; }
+      if (!fs.fstatSync(next).isDirectory()) throw Error("unsafe exclude ancestor");
+      // O_PATH pins identity but does not prove read authority.
+      const readable = open(fp(next) + "/.", C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW);
+      close(readable);
+      if (metadata !== dir) close(metadata);
+      metadata = next;
+      if (component !== "info") continue;
+      let fd;
+      try { fd = open(fp(metadata) + "/exclude", C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK); }
+      catch (e) { if (e.code === "ENOENT") break; throw e; }
+      try {
+        const before = fs.fstatSync(fd, { bigint: true });
+        if (!before.isFile() || before.size > 65536n) throw Error("exclude type/cap");
+        const bytes = Buffer.alloc(65537);
+        let n = 0;
+        while (n < bytes.length) {
+          check();
+          const got = fs.readSync(fd, bytes, n, bytes.length - n, null);
+          if (!got) break;
+          n += got;
+          if (n > 65536) throw Error("exclude cap");
+        }
+        check();
+        const after = fs.fstatSync(fd, { bigint: true });
+        if (BigInt(n) !== before.size ||
+            ["dev", "ino", "size", "mode", "mtimeNs", "ctimeNs"].some(k => before[k] !== after[k]))
+          throw Error("unstable exclude");
+        const content = bytes.subarray(0, n);
+        if (!require("node:buffer").isUtf8(content) || content.includes(0))
+          throw Error("exclude encoding");
+        const lines = content.toString("utf8").split("\n");
+        for (let i = 0; i < lines.length; i++) {
+          check();
+          const line = i < lines.length - 1 && lines[i].endsWith("\r")
+            ? lines[i].slice(0, -1) : lines[i];
+          if (line.includes("\r") ||
+              !(line.startsWith("#") || /^ *$/.test(line) || line === "/.uzi/scratch/"))
+            throw Error("untrusted exclude rule");
+        }
+      } finally { close(fd); }
+    }
+  } finally { if (metadata !== dir) close(metadata); }
+  const input = fs.readFileSync(0);
+  if (input.length > 2 * 1024 * 1024) throw Error("manifest cap");
+  const manifest = JSON.parse(input.toString("utf8"));
+  if (!Array.isArray(manifest) || manifest.length > 20000) throw Error("path cap");
+  for (const [name, mode, oid, size] of manifest) {
+    check();
+    if (!["100644", "100755", "120000"].includes(mode) || !/^[0-9a-f]{40}$/.test(oid) ||
+        !Number.isSafeInteger(size) || size < 0 || size > 4 * 1024 * 1024) throw Error("unsupported entry");
+    total += size;
+    if (total > 128 * 1024 * 1024) throw Error("aggregate cap");
+    const components = parts(name);
+    let parent = dir;
+    try {
+      for (const component of components.slice(0, -1)) {
+        const next = open(fp(parent) + "/" + component, O_PATH | C.O_NOFOLLOW);
+        if (!fs.fstatSync(next).isDirectory()) throw Error("non-directory ancestor");
+        if (parent !== dir) close(parent);
+        parent = next;
+      }
+      if (mode === "120000") {
+        const leaf = fp(parent) + "/" + components.at(-1);
+        const before = fs.lstatSync(leaf, { bigint: true });
+        if (!before.isSymbolicLink() || before.size !== BigInt(size)) throw Error("link type/size");
+        const target = fs.readlinkSync(leaf, { encoding: "buffer" });
+        check();
+        const after = fs.lstatSync(leaf, { bigint: true });
+        if (target.length !== size ||
+            createHash("sha1").update("blob " + size + "\0").update(target).digest("hex") !== oid ||
+            ["dev", "ino", "size", "mode", "mtimeNs", "ctimeNs"].some(k => before[k] !== after[k]))
+          throw Error("content mismatch or unstable link");
+        continue;
+      }
+      const fd = open(fp(parent) + "/" + components.at(-1), C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
+      try {
+        const before = fs.fstatSync(fd, { bigint: true });
+        if (!before.isFile() || before.size !== BigInt(size) ||
+            ((before.mode & 0o100n) !== 0n) !== (mode === "100755")) throw Error("file type/size/mode");
+        const hash = createHash("sha1").update("blob " + size + "\0");
+        const buf = Buffer.alloc(65536);
+        let n = 0;
+        while (true) {
+          check();
+          const got = fs.readSync(fd, buf, 0, Math.min(buf.length, size + 1 - n), null);
+          if (!got) break;
+          n += got;
+          if (n > size) throw Error("file grew");
+          hash.update(buf.subarray(0, got));
+        }
+        const after = fs.fstatSync(fd, { bigint: true });
+        if (n !== size || hash.digest("hex") !== oid ||
+            ["dev", "ino", "size", "mode", "mtimeNs", "ctimeNs"].some(k => before[k] !== after[k]))
+          throw Error("content mismatch or unstable file");
+      } finally { close(fd); }
+    } finally { if (parent !== dir) close(parent); }
+  }
+  process.stdout.write("clean\n");
+} catch {
+  process.exitCode = 1;
+} finally {
+  for (const fd of fds) fs.closeSync(fd);
+}
+`;
 
 /**
  * Trusted inline runner program, never loaded from the clone. Linux descriptor

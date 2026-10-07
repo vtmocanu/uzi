@@ -73,7 +73,23 @@ func (q *Queries) AckRunInputRows(ctx context.Context, arg AckRunInputRowsParams
 }
 
 const adminRunOutcomes = `-- name: AdminRunOutcomes :one
+WITH last_failure AS MATERIALIZED (
+    SELECT  id, user_id, COALESCE(finished_at, status_since) AS ended_at,
+           COALESCE(fail_origin, 'unknown') AS origin
+    FROM runs
+    WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
+      AND kind NOT IN ('chat', 'judge', 'cross_check')
+    ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
+)
 SELECT
+    (SELECT f.ended_at FROM last_failure f)::timestamptz AS last_failed_at,
+    COALESCE((SELECT f.id FROM last_failure f), '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS last_failed_run_id,
+    COALESCE((SELECT f.origin FROM last_failure f), '')::text AS last_failed_origin,
+    COALESCE((SELECT f.user_id FROM last_failure f), '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS last_failed_user_id,
+    COALESCE((SELECT count(*)::bigint
+       FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
+       WHERE r3.status = 'completed' AND r3.kind NOT IN ('chat', 'judge', 'cross_check')
+       GROUP BY f.id), 0)::bigint AS completed_since_last_failure,
     count(*)::bigint                                                                       AS lifetime_finished,
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
     count(*) FILTER (WHERE status = 'cancelled')::bigint                                   AS lifetime_cancelled,
@@ -122,20 +138,25 @@ WHERE status IN ('completed', 'failed', 'cancelled')
 `
 
 type AdminRunOutcomesRow struct {
-	LifetimeFinished     int64  `json:"lifetime_finished"`
-	LifetimeCompleted    int64  `json:"lifetime_completed"`
-	LifetimeCancelled    int64  `json:"lifetime_cancelled"`
-	LifetimePlanRejected int64  `json:"lifetime_plan_rejected"`
-	LifetimeFailed       int64  `json:"lifetime_failed"`
-	Last7Finished        int64  `json:"last7_finished"`
-	Last7Completed       int64  `json:"last7_completed"`
-	Last7Cancelled       int64  `json:"last7_cancelled"`
-	Last7PlanRejected    int64  `json:"last7_plan_rejected"`
-	Last7Failed          int64  `json:"last7_failed"`
-	LifetimeNeedsLanding int64  `json:"lifetime_needs_landing"`
-	Last7NeedsLanding    int64  `json:"last7_needs_landing"`
-	LifetimeFailOrigins  []byte `json:"lifetime_fail_origins"`
-	Last7FailOrigins     []byte `json:"last7_fail_origins"`
+	LastFailedAt              pgtype.Timestamptz `json:"last_failed_at"`
+	LastFailedRunID           uuid.UUID          `json:"last_failed_run_id"`
+	LastFailedOrigin          string             `json:"last_failed_origin"`
+	LastFailedUserID          uuid.UUID          `json:"last_failed_user_id"`
+	CompletedSinceLastFailure int64              `json:"completed_since_last_failure"`
+	LifetimeFinished          int64              `json:"lifetime_finished"`
+	LifetimeCompleted         int64              `json:"lifetime_completed"`
+	LifetimeCancelled         int64              `json:"lifetime_cancelled"`
+	LifetimePlanRejected      int64              `json:"lifetime_plan_rejected"`
+	LifetimeFailed            int64              `json:"lifetime_failed"`
+	Last7Finished             int64              `json:"last7_finished"`
+	Last7Completed            int64              `json:"last7_completed"`
+	Last7Cancelled            int64              `json:"last7_cancelled"`
+	Last7PlanRejected         int64              `json:"last7_plan_rejected"`
+	Last7Failed               int64              `json:"last7_failed"`
+	LifetimeNeedsLanding      int64              `json:"lifetime_needs_landing"`
+	Last7NeedsLanding         int64              `json:"last7_needs_landing"`
+	LifetimeFailOrigins       []byte             `json:"lifetime_fail_origins"`
+	Last7FailOrigins          []byte             `json:"last7_fail_origins"`
 }
 
 // Factory-wide run outcome counts for BOTH windows (PRD #1293 M1); same shape as
@@ -146,6 +167,11 @@ func (q *Queries) AdminRunOutcomes(ctx context.Context, landableOrigins []string
 	row := q.db.QueryRow(ctx, adminRunOutcomes, landableOrigins)
 	var i AdminRunOutcomesRow
 	err := row.Scan(
+		&i.LastFailedAt,
+		&i.LastFailedRunID,
+		&i.LastFailedOrigin,
+		&i.LastFailedUserID,
+		&i.CompletedSinceLastFailure,
 		&i.LifetimeFinished,
 		&i.LifetimeCompleted,
 		&i.LifetimeCancelled,
@@ -165,7 +191,22 @@ func (q *Queries) AdminRunOutcomes(ctx context.Context, landableOrigins []string
 }
 
 const adminRunOutcomesPerUser = `-- name: AdminRunOutcomesPerUser :many
+WITH last_failure AS MATERIALIZED (
+    SELECT DISTINCT ON (user_id) id, user_id, COALESCE(finished_at, status_since) AS ended_at,
+           COALESCE(fail_origin, 'unknown') AS origin
+    FROM runs
+    WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
+      AND kind NOT IN ('chat', 'judge', 'cross_check')
+    ORDER BY user_id, COALESCE(finished_at, status_since) DESC, id DESC
+)
 SELECT u.id AS user_id, u.email,
+    (SELECT f.ended_at FROM last_failure f WHERE f.user_id = u.id)::timestamptz AS last_failed_at,
+    COALESCE((SELECT f.id FROM last_failure f WHERE f.user_id = u.id), '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS last_failed_run_id,
+    COALESCE((SELECT f.origin FROM last_failure f WHERE f.user_id = u.id), '')::text AS last_failed_origin,
+    COALESCE((SELECT count(*)::bigint
+       FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
+       WHERE r3.user_id = u.id AND r3.status = 'completed' AND r3.kind NOT IN ('chat', 'judge', 'cross_check') AND f.user_id = u.id
+       GROUP BY f.id), 0)::bigint AS completed_since_last_failure,
     count(*)::bigint                                                                       AS finished,
     count(*) FILTER (WHERE r.status = 'completed')::bigint                                 AS completed,
     count(*) FILTER (WHERE r.status = 'cancelled')::bigint                                 AS cancelled,
@@ -201,15 +242,19 @@ ORDER BY u.id
 `
 
 type AdminRunOutcomesPerUserRow struct {
-	UserID       uuid.UUID `json:"user_id"`
-	Email        string    `json:"email"`
-	Finished     int64     `json:"finished"`
-	Completed    int64     `json:"completed"`
-	Cancelled    int64     `json:"cancelled"`
-	PlanRejected int64     `json:"plan_rejected"`
-	Failed       int64     `json:"failed"`
-	NeedsLanding int64     `json:"needs_landing"`
-	FailOrigins  []byte    `json:"fail_origins"`
+	UserID                    uuid.UUID          `json:"user_id"`
+	Email                     string             `json:"email"`
+	LastFailedAt              pgtype.Timestamptz `json:"last_failed_at"`
+	LastFailedRunID           uuid.UUID          `json:"last_failed_run_id"`
+	LastFailedOrigin          string             `json:"last_failed_origin"`
+	CompletedSinceLastFailure int64              `json:"completed_since_last_failure"`
+	Finished                  int64              `json:"finished"`
+	Completed                 int64              `json:"completed"`
+	Cancelled                 int64              `json:"cancelled"`
+	PlanRejected              int64              `json:"plan_rejected"`
+	Failed                    int64              `json:"failed"`
+	NeedsLanding              int64              `json:"needs_landing"`
+	FailOrigins               []byte             `json:"fail_origins"`
 }
 
 // Per-user LIFETIME outcome counts for the admin factory breakdown (PRD #1293 M1, D5).
@@ -228,6 +273,10 @@ func (q *Queries) AdminRunOutcomesPerUser(ctx context.Context, landableOrigins [
 		if err := rows.Scan(
 			&i.UserID,
 			&i.Email,
+			&i.LastFailedAt,
+			&i.LastFailedRunID,
+			&i.LastFailedOrigin,
+			&i.CompletedSinceLastFailure,
 			&i.Finished,
 			&i.Completed,
 			&i.Cancelled,
@@ -1309,7 +1358,7 @@ WITH claimant AS MATERIALIZED (
 hold AS (
     -- PRD #1296 M1 (D2/D3): open the H-free custody hold atomically with the claim, for a
     -- RECOVERY-CAPABLE worker (@recovery_capable, derived from the worker's advertised
-    -- recovery_archive_v1 protocol capability) on one of the six code-publishing profiles.
+    -- recovery_archive_v1, recovery_archive_v2 or recovery_inventory_v1 protocol capability) on one of the six code-publishing profiles.
     -- Reads FROM ` + "`" + `target` + "`" + `, so it inserts exactly one hold iff a run was actually claimable
     -- (an admission-gated or idle claim produces no ` + "`" + `target` + "`" + ` row and thus no hold). Both live
     -- FKs point at the claimed run + claiming worker (ON DELETE RESTRICT while open), and the
@@ -1319,9 +1368,10 @@ hold AS (
     INSERT INTO recovery_custody_holds
         (id, user_id, repo_id, run_id, generation, state,
          original_worker_id, original_worker_identity, live_worker_id, live_run_id,
-         created_at, updated_at)
+         created_at, updated_at, inventory_guarded)
     SELECT gen_random_uuid(), t.user_id, t.repo_id, t.id, t.claim_generation + 1, 'open',
-           $1, $27::text, $1, t.id, now(), now()
+           $1, $27::text, $1, t.id, now(), now(),
+           ('recovery_inventory_v1' = ANY($11::text[]))
     FROM target t
     WHERE $28::boolean
       AND t.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
@@ -15989,7 +16039,22 @@ func (q *Queries) RunPriorityClassForRun(ctx context.Context, arg RunPriorityCla
 
 const selfRunOutcomes = `-- name: SelfRunOutcomes :one
 
+WITH last_failure AS MATERIALIZED (
+    SELECT  id, user_id, COALESCE(finished_at, status_since) AS ended_at,
+           COALESCE(fail_origin, 'unknown') AS origin
+    FROM runs
+    WHERE user_id = $1 AND status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
+      AND kind NOT IN ('chat', 'judge', 'cross_check')
+    ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
+)
 SELECT
+    (SELECT f.ended_at FROM last_failure f)::timestamptz AS last_failed_at,
+    COALESCE((SELECT f.id FROM last_failure f), '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS last_failed_run_id,
+    COALESCE((SELECT f.origin FROM last_failure f), '')::text AS last_failed_origin,
+    COALESCE((SELECT count(*)::bigint
+       FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
+       WHERE r3.user_id = $1 AND r3.status = 'completed' AND r3.kind NOT IN ('chat', 'judge', 'cross_check')
+       GROUP BY f.id), 0)::bigint AS completed_since_last_failure,
     count(*)::bigint                                                                       AS lifetime_finished,
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
     count(*) FILTER (WHERE status = 'cancelled')::bigint                                   AS lifetime_cancelled,
@@ -16008,14 +16073,14 @@ SELECT
     -- fan out and corrupt the sibling counts, so it stays a subquery.
     count(*) FILTER (
         WHERE status = 'failed'
-          AND fail_origin = ANY($1::text[])
+          AND fail_origin = ANY($2::text[])
           AND (EXISTS (SELECT 1 FROM recovery_captures c
                        WHERE c.run_id = runs.id AND c.user_id = runs.user_id AND c.state = 'available')
                OR preserved_patch IS NOT NULL)
     )::bigint AS lifetime_needs_landing,
     count(*) FILTER (
         WHERE status = 'failed'
-          AND fail_origin = ANY($1::text[])
+          AND fail_origin = ANY($2::text[])
           AND (EXISTS (SELECT 1 FROM recovery_captures c
                        WHERE c.run_id = runs.id AND c.user_id = runs.user_id AND c.state = 'available')
                OR preserved_patch IS NOT NULL)
@@ -16029,44 +16094,48 @@ SELECT
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
-              WHERE r2.user_id = $2
+              WHERE r2.user_id = $1
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               GROUP BY 1) o) AS lifetime_fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
-              WHERE r2.user_id = $2
+              WHERE r2.user_id = $1
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               AND r2.created_at >= now() - interval '7 days'
               GROUP BY 1) o) AS last7_fail_origins
 FROM runs
-WHERE runs.user_id = $2
+WHERE runs.user_id = $1
   AND status IN ('completed', 'failed', 'cancelled')
   AND kind NOT IN ('chat', 'judge', 'cross_check')
 `
 
 type SelfRunOutcomesParams struct {
-	LandableOrigins []string  `json:"landable_origins"`
 	UserID          uuid.UUID `json:"user_id"`
+	LandableOrigins []string  `json:"landable_origins"`
 }
 
 type SelfRunOutcomesRow struct {
-	LifetimeFinished     int64  `json:"lifetime_finished"`
-	LifetimeCompleted    int64  `json:"lifetime_completed"`
-	LifetimeCancelled    int64  `json:"lifetime_cancelled"`
-	LifetimePlanRejected int64  `json:"lifetime_plan_rejected"`
-	LifetimeFailed       int64  `json:"lifetime_failed"`
-	Last7Finished        int64  `json:"last7_finished"`
-	Last7Completed       int64  `json:"last7_completed"`
-	Last7Cancelled       int64  `json:"last7_cancelled"`
-	Last7PlanRejected    int64  `json:"last7_plan_rejected"`
-	Last7Failed          int64  `json:"last7_failed"`
-	LifetimeNeedsLanding int64  `json:"lifetime_needs_landing"`
-	Last7NeedsLanding    int64  `json:"last7_needs_landing"`
-	LifetimeFailOrigins  []byte `json:"lifetime_fail_origins"`
-	Last7FailOrigins     []byte `json:"last7_fail_origins"`
+	LastFailedAt              pgtype.Timestamptz `json:"last_failed_at"`
+	LastFailedRunID           uuid.UUID          `json:"last_failed_run_id"`
+	LastFailedOrigin          string             `json:"last_failed_origin"`
+	CompletedSinceLastFailure int64              `json:"completed_since_last_failure"`
+	LifetimeFinished          int64              `json:"lifetime_finished"`
+	LifetimeCompleted         int64              `json:"lifetime_completed"`
+	LifetimeCancelled         int64              `json:"lifetime_cancelled"`
+	LifetimePlanRejected      int64              `json:"lifetime_plan_rejected"`
+	LifetimeFailed            int64              `json:"lifetime_failed"`
+	Last7Finished             int64              `json:"last7_finished"`
+	Last7Completed            int64              `json:"last7_completed"`
+	Last7Cancelled            int64              `json:"last7_cancelled"`
+	Last7PlanRejected         int64              `json:"last7_plan_rejected"`
+	Last7Failed               int64              `json:"last7_failed"`
+	LifetimeNeedsLanding      int64              `json:"lifetime_needs_landing"`
+	Last7NeedsLanding         int64              `json:"last7_needs_landing"`
+	LifetimeFailOrigins       []byte             `json:"lifetime_fail_origins"`
+	Last7FailOrigins          []byte             `json:"last7_fail_origins"`
 }
 
 // Failed-run rate outcome aggregates (PRD #1293 M1) -------------------------
@@ -16093,9 +16162,13 @@ type SelfRunOutcomesRow struct {
 // brings recovery_captures (which also has created_at/user_id) into the analyzer's scope
 // (issue #1418); status/fail_origin/preserved_patch are unique to runs, so they stay bare.
 func (q *Queries) SelfRunOutcomes(ctx context.Context, arg SelfRunOutcomesParams) (SelfRunOutcomesRow, error) {
-	row := q.db.QueryRow(ctx, selfRunOutcomes, arg.LandableOrigins, arg.UserID)
+	row := q.db.QueryRow(ctx, selfRunOutcomes, arg.UserID, arg.LandableOrigins)
 	var i SelfRunOutcomesRow
 	err := row.Scan(
+		&i.LastFailedAt,
+		&i.LastFailedRunID,
+		&i.LastFailedOrigin,
+		&i.CompletedSinceLastFailure,
 		&i.LifetimeFinished,
 		&i.LifetimeCompleted,
 		&i.LifetimeCancelled,
@@ -19249,7 +19322,7 @@ func (q *Queries) SupersedeExitedPlanCrossChecks(ctx context.Context) ([]uuid.UU
 const supersedeRunByWorker = `-- name: SupersedeRunByWorker :execrows
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
-    WHERE runs.id = $1 AND runs.worker_id = $2
+    WHERE runs.id = $2 AND runs.worker_id = $3
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
   AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
@@ -19279,7 +19352,8 @@ UPDATE runs SET
     plan_cross_check_gate_reason = NULL,
     status             = 'cancelled',
     stop_kind          = 'branch_moved',
-    stop_reason        = 'The MR branch was advanced by a concurrent writer, so this rework was superseded and not applied. The branch and the concurrent commits are intact.',
+    stop_reason        = $1::text,
+    failure_reason     = NULL,
     status_since       = now(),
     fail_origin        = NULL,
     move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END,
@@ -19290,7 +19364,7 @@ UPDATE runs SET
     credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
-WHERE runs.id = $1 AND runs.worker_id = $2
+WHERE runs.id = $2 AND runs.worker_id = $3
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
   AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
@@ -19298,21 +19372,17 @@ WHERE runs.id = $1 AND runs.worker_id = $2
 `
 
 type SupersedeRunByWorkerParams struct {
-	ID       uuid.UUID   `json:"id"`
-	WorkerID pgtype.UUID `json:"worker_id"`
+	StopReason string      `json:"stop_reason"`
+	ID         uuid.UUID   `json:"id"`
+	WorkerID   pgtype.UUID `json:"worker_id"`
 }
 
-// Issue #1117: a LIVE mr_rework worker whose finalize push was rejected non-fast-forward
-// because a concurrent same-branch writer (a human / uzi-watcher landing review fixes)
-// advanced the MR branch under it reports `failed` + branch_moved. SetState's failed arm
-// routes HERE (guarded on kind='mr_rework') instead of SetRunFailed, so a benign, expected
-// race is NOT mis-classified as 'agent_failure' (and is not judged — status 'cancelled',
-// Gate 0). Distinct from CancelRunByWorker in that it STAMPS stop_kind='branch_moved' +
-// a static stop_reason in the same statement (branch_moved has no pre-stamp, unlike a
-// CreateStopVerdictInput cancel). Terminal cleanup mirrors CancelRunByWorker. Its extra
-// hold guard keeps a late failed report from cancelling a wall or completion hold.
+// SetState allowlists mr_rework/ci_fix branch_moved reports and composes the bounded
+// stop_reason server-side. Stamp the cancellation and clear both failure fields together.
+// Terminal cleanup mirrors CancelRunByWorker; ownership, release, terminal and hold
+// guards keep late reports from changing runs they no longer control.
 func (q *Queries) SupersedeRunByWorker(ctx context.Context, arg SupersedeRunByWorkerParams) (int64, error) {
-	result, err := q.db.Exec(ctx, supersedeRunByWorker, arg.ID, arg.WorkerID)
+	result, err := q.db.Exec(ctx, supersedeRunByWorker, arg.StopReason, arg.ID, arg.WorkerID)
 	if err != nil {
 		return 0, err
 	}

@@ -472,6 +472,50 @@ func TestRunToDTOForgeParkFields(t *testing.T) {
 	}
 }
 
+// Concurrent branch advances remain cancellations, with diagnostics on stop_reason.
+func TestGetRunBranchAdvanceStopReason(t *testing.T) {
+	const reason = "superseded by a concurrent branch advance; further publication stopped. cause=remote_branch_advanced; superseding_tip=0123456789abcdef0123456789abcdef01234567"
+	for _, kind := range []string{"mr_rework", "ci_fix"} {
+		t.Run(kind, func(t *testing.T) {
+			owner := store.User{ID: uuid.New()}
+			runID := uuid.New()
+			st := &runsStore{ownerID: owner.ID, run: store.Run{
+				ID: runID, UserID: owner.ID, Kind: kind, Status: "cancelled",
+				StopKind: txt("branch_moved"), StopReason: txt(reason),
+				FailureReason: nullTxt(), FailOrigin: nullTxt(),
+			}}
+			h := newRunsHandler(t, st)
+			rec := httptest.NewRecorder()
+			h.GetRun(rec, runReq(owner, runID))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("owner GetRun = %d, want 200: %s", rec.Code, rec.Body.String())
+			}
+			var body struct {
+				Run map[string]json.RawMessage `json:"run"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode owner DTO: %v", err)
+			}
+			for key, want := range map[string]string{
+				"kind": kind, "status": "cancelled", "stop_kind": "branch_moved", "stop_reason": reason,
+			} {
+				var got string
+				if err := json.Unmarshal(body.Run[key], &got); err != nil {
+					t.Fatalf("decode %s: %v", key, err)
+				}
+				if got != want {
+					t.Errorf("%s = %q, want %q", key, got, want)
+				}
+			}
+			for _, key := range []string{"failure_reason", "fail_origin"} {
+				if string(body.Run[key]) != "null" {
+					t.Errorf("%s = %s, want explicit null", key, body.Run[key])
+				}
+			}
+		})
+	}
+}
+
 func TestGetRunOwnerNonOwnerAdmin(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	runID := uuid.New()

@@ -2,6 +2,16 @@
 {{- include "uzi.validateCommandSandbox" . }}
 {{- include "uzi.validateSecretMountPath" . }}
 {{- if .Values.api.enabled }}
+{{- $ephemeralDefaultSize := .Values.workers.ephemeralDefaultSize }}
+{{- if not (has $ephemeralDefaultSize (list "s" "m" "l")) }}
+{{- fail "workers.ephemeralDefaultSize must be one of s, m, l" }}
+{{- end }}
+{{- if hasKey (.Values.api.secretEnv | default dict) "UZI_EPHEMERAL_DEFAULT_SIZE" }}
+{{- fail "Set UZI_EPHEMERAL_DEFAULT_SIZE through workers.ephemeralDefaultSize, not api.secretEnv" }}
+{{- end }}
+{{- if hasKey (.Values.api.config | default dict) "UZI_EPHEMERAL_DEFAULT_SIZE" }}
+{{- fail "Set UZI_EPHEMERAL_DEFAULT_SIZE through workers.ephemeralDefaultSize, not api.config (the chart value now overrides it)" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -103,6 +113,9 @@ spec:
             # as a string so an explicit 0 (lease disabled) survives and is never read as
             # unset. The api validates it (max 2h) and refuses to boot on a bad value.
             {{- $ephemeralLease := .Values.workers.ephemeralLease }}
+            # Issue #2412: chart-owned size; api.config/api.secretEnv duplicates fail above.
+            - name: UZI_EPHEMERAL_DEFAULT_SIZE
+              value: {{ $ephemeralDefaultSize | quote }}
             - name: UZI_EPHEMERAL_LEASE
               value: {{ if kindIs "invalid" $ephemeralLease }}"2h"{{ else }}{{ toString $ephemeralLease | quote }}{{ end }}
             - name: WORKER_DOCKER_ENABLED

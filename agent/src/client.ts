@@ -255,6 +255,18 @@ export class RequestError extends Error {
   }
 }
 
+/** Exact current-worker ownership loss; generic route/auth/transport failures are unknown. */
+export function isRunOwnershipLost(err: unknown, runId: string): boolean {
+  if (!(err instanceof RequestError) || err.method !== "GET" || err.status !== 404 ||
+      err.path !== `${WORKER_API_PREFIX}/runs/${runId}/ownership` || err.body.length > 1024) return false;
+  try {
+    const body: unknown = JSON.parse(err.body);
+    return typeof body === "object" && body !== null && !Array.isArray(body) &&
+      Object.keys(body).length === 1 &&
+      (body as { error?: unknown }).error === "run not found for this worker";
+  } catch { return false; }
+}
+
 /** Issue #1766: the typed Codex credential deferral a locked owner vault produces. A Codex
  *  refresh/release that passed authorization but hit a locked vault answers HTTP 409 with
  *  `{"reason":"vault_locked"}` in the body. Returns "vault_locked" ONLY for that exact shape
@@ -929,6 +941,22 @@ function validDindSample(sample: DindMeterSample | null | undefined): sample is 
 
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
+  private readonly inventoryGuardedClaims = new Set<string>();
+  private readonly settledInventoryGuardedClaims = new Set<string>();
+
+  /** Exact positive server claim evidence survives capability refreshes, until that exact
+   *  generation's empty guarded hold was settled by a validated release ACK. The claim stays in
+   *  the downgrade and legacy-release guards; only the "custody still pending" answer ends. */
+  knowsInventoryGuardedClaim(runId: string, generation: number): boolean {
+    const key = `${runId}:${generation}`;
+    return this.inventoryGuardedClaims.has(key) && !this.settledInventoryGuardedClaims.has(key);
+  }
+
+  /** Record that this exact guarded generation's hold was confirmed released (empty settle). */
+  markInventoryGuardedClaimSettled(runId: string, generation: number): void {
+    const key = `${runId}:${generation}`;
+    if (this.inventoryGuardedClaims.has(key)) this.settledInventoryGuardedClaims.add(key);
+  }
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly terminalRetrySchedule: number[];
   private readonly permitRetryBudgetMs: number;
@@ -1272,6 +1300,17 @@ export class WorkerClient {
       throw new Error("cross-check claim marker and kind disagree");
     }
     deadline.throwIfAborted();
+    if (isRecord(claim) && claim.inventory_guarded !== undefined &&
+        (typeof claim.inventory_guarded !== "boolean" ||
+         (claim.inventory_guarded === true &&
+          (!Number.isSafeInteger(claim.claim_generation) || (claim.claim_generation ?? 0) <= 0 ||
+           !this.hasFeature("recovery_inventory_v1"))))) {
+      throw new Error("malformed or contradictory inventory guard claim");
+    }
+    if (this.inventoryGuardedClaims.has(`${claim?.run_id}:${claim?.claim_generation}`) && claim.inventory_guarded !== true) {
+      throw new Error("guarded generation cannot downgrade its claim assertion");
+    }
+    if (claim?.inventory_guarded === true) this.inventoryGuardedClaims.add(`${claim.run_id}:${claim.claim_generation}`);
     // PRD #1798 D9: the pr_description is validated or dropped, never cast (decodePrState, the
     // same check as the bind / lookup / ack responses). The warning carries the run id only,
     // never the value (untrusted text). The isRecord guard keeps a `null` (or other non-object)
@@ -1657,6 +1696,10 @@ export class WorkerClient {
     runId: string,
     req: RecoveryReserveRequest,
   ): Promise<RecoveryReserveResponse> {
+    // Keep the identity-bound digest intact while a rolled-back API is incompatible.
+    if (req.coverage_digest !== undefined && !this.hasFeature("recovery_inventory_v1")) {
+      throw new Error("inventory feature unavailable; coverage-bound reserve retained");
+    }
     return (await this.postJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/archives/reserve`,
       req,
@@ -1719,12 +1762,23 @@ export class WorkerClient {
     runId: string,
     generation?: number,
     releaseEvidence?: string,
+    finalDisposition?: RecoveryReleaseRequest["final_disposition"],
   ): Promise<RecoveryReleaseResponse> {
     // Backward-compatible: an omitted generation posts an empty body (the v1 settle-by-
     // run+worker path); a v2 caller names the exact generation (PRD #1349 M1, D1/D2).
+    if (this.inventoryGuardedClaims.has(`${runId}:${generation}`) && finalDisposition === undefined) {
+      throw new Error("guarded generation requires final inventory; legacy release refused");
+    }
     const body: RecoveryReleaseRequest = generation !== undefined ? { generation } : {};
     // PRD #1392 M1/M2 (fact 9): stamp the release's evidence class when the caller knows it
     // ({publication, forge_no_output}); an omitted class is allowed (the api stores NULL).
+    if (finalDisposition !== undefined) {
+      if (!Number.isSafeInteger(generation) || (generation ?? 0) <= 0) {
+        throw new Error("final inventory release requires an exact positive safe generation");
+      }
+      if (!this.hasFeature("recovery_inventory_v1")) throw new Error("inventory feature unavailable; final release retained");
+      body.final_disposition = finalDisposition;
+    }
     if (releaseEvidence !== undefined) body.release_evidence = releaseEvidence;
     return (await this.postJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/archives/release`,

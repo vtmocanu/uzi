@@ -34,6 +34,38 @@ func TestSharedBoardLatestRunExcludesCodexCredential(t *testing.T) {
 	}
 }
 
+func TestMapLatestRunBranchAdvanceStopReason(t *testing.T) {
+	const reason = "superseded by a concurrent branch advance; further publication stopped. cause=remote_branch_advanced; superseding_tip=0123456789abcdef0123456789abcdef01234567"
+	owner, otherViewer, runID := uuid.New(), uuid.New(), uuid.New()
+	now := time.Date(2026, 10, 7, 0, 0, 0, 0, time.UTC)
+	for _, kind := range []string{"mr_rework", "ci_fix"} {
+		t.Run(kind, func(t *testing.T) {
+			for _, viewer := range []uuid.UUID{owner, otherViewer} {
+				dto := mapLatestRun(runID, owner, "cancelled", kind, 3, false, pgtype.Int8{}, nullTxt(), nullTxt(),
+					nullTxt(), txt("branch_moved"), txt(reason),
+					"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
+					nullTxt(), nullTxt(), 1, tstamp(now), tstamp(now), viewer, 0)
+				if dto.Status != "cancelled" {
+					t.Fatalf("board status = %s, want cancelled", dto.Status)
+				}
+				if dto.StopKind == nil || *dto.StopKind != "branch_moved" {
+					t.Fatalf("board must expose branch_moved to every viewer, got %v", dto.StopKind)
+				}
+				if dto.FailureReason != nil {
+					t.Fatalf("branch advance must carry no failure_reason, got %q", *dto.FailureReason)
+				}
+				if viewer == owner {
+					if !dto.IsMine || dto.StopReason == nil || *dto.StopReason != reason {
+						t.Fatalf("owner must see the exact branch advance reason: %+v", dto)
+					}
+				} else if dto.IsMine || dto.StopReason != nil {
+					t.Fatalf("non-owner must not see branch advance diagnostics: %+v", dto)
+				}
+			}
+		})
+	}
+}
+
 func TestMapLatestRun(t *testing.T) {
 	viewer := uuid.New()
 	runID := uuid.New()

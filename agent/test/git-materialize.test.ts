@@ -1,3 +1,4 @@
+import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -129,7 +130,7 @@ describe("runner clone materialization (issue #1769 m1)", () => {
     const bare = await git.ensureClone(fx.originPath);
     const seed = await git.createOrAttachRunnerClone(bare, 10, noProofReseed, "run-A");
     const work = commit(seed.path, "WORK.txt");
-    await git.fetchAgentBranch(bare, seed.path, "agent/issue-10", "run-A");
+    await fixtureFetchTracking(git, bare, seed.path, "agent/issue-10", "run-A");
     const rc = await git.createOrAttachRunnerClone(bare, 10, noProofReseed, "run-A", true, undefined, undefined, SELF);
     assert.strictEqual(rc.seededFrom, "tracking");
     assert.strictEqual(rc.baseCommit, work);
@@ -146,7 +147,7 @@ describe("runner clone materialization (issue #1769 m1)", () => {
     fs.writeFileSync(path.join(seed.path, "WIP.txt"), "in-progress work\n");
     assert.strictEqual(await git.commitWipMarker(seed.path), true);
     const marker = gitIn(seed.path, ["rev-parse", "HEAD"]);
-    await git.fetchAgentBranch(bare, seed.path, "agent/issue-11", "run-A");
+    await fixtureFetchTracking(git, bare, seed.path, "agent/issue-11", "run-A");
 
     const rc = await git.createOrAttachRunnerClone(bare, 11, noProofReseed, "run-A", true, undefined, undefined, SELF);
     assert.strictEqual(rc.wipRecovered, true);
@@ -170,7 +171,7 @@ describe("runner clone materialization (issue #1769 m1)", () => {
     assert.strictEqual(await gitA.commitWipMarker(seed.path), true);
     const marker = gitIn(seed.path, ["rev-parse", "HEAD"]);
     assert.ok(gitIn(seed.path, ["log", "-1", "--format=%s"]).startsWith(WIP_PARK_COMMIT_PREFIX));
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
     const packed = await gitA.checkpointPack(bareA, branch);
     assert.ok(packed);
     const pack = await drain(packed!.pack);
@@ -205,7 +206,7 @@ describe("runner clone materialization (issue #1769 m1)", () => {
     const bare = await git.ensureClone(fx.originPath);
     const first = await git.createOrAttachRunnerClone(bare, 13, noProofReseed, "run-1");
     const pushed = commit(first.path, "PUSHED.txt");
-    await git.fetchAgentBranch(bare, first.path, "agent/issue-13", "run-1");
+    await fixtureFetchTracking(git, bare, first.path, "agent/issue-13", "run-1");
     await git.pushBranch(bare, "agent/issue-13", "", fx.originPath);
     // Simulate a missing checkout in this isolated recovery fixture. Production
     // teardown is covered by the worker-uid tests and deliberately refuses off Linux.
@@ -334,7 +335,7 @@ describe("runner clone materialization (issue #1769 m1)", () => {
     const rc = await git.createOrAttachRunnerClone(bare, 27, noProofReseed, "run-1", false, undefined, undefined, SELF);
     assert.strictEqual(fs.existsSync(alternatesPath(rc.path)), false);
     const work = commit(rc.path, "FETCHBACK.txt");
-    const dst = await git.fetchAgentBranch(bare, rc.path, "agent/issue-27", "run-1");
+    const dst = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-27", "run-1");
     assert.strictEqual(gitIn(bare, ["rev-parse", dst]), work, "the bare tracking ref is the agent commit");
     assert.ok(resolves(bare, work), "the agent commit landed in the bare");
   });
@@ -422,7 +423,7 @@ describe("attempt-path seed materialization (issue #1783 M2 x #1769)", () => {
     const bare = await git.ensureClone(fx.originPath);
     const first = await git.runnerCloneForBranch(bare, "agent/issue-41", "issue-41", noProofReseed, "run-A", false, undefined, attemptOpts(1), SELF);
     const work = commit(first.path, "WORK.txt");
-    await git.fetchAgentBranch(bare, first.path, "agent/issue-41", "run-A");
+    await fixtureFetchTracking(git, bare, first.path, "agent/issue-41", "run-A");
     const second = attemptOpts(2);
     const rc = await git.runnerCloneForBranch(bare, "agent/issue-41", "issue-41", noProofReseed, "run-A", true, undefined, second, SELF);
     assert.notStrictEqual(rc.path, first.path, "the resume seeds a fresh attempt path");

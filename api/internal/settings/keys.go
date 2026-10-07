@@ -275,6 +275,11 @@ const (
 	// half answers enabled=false until an admin turns it on.
 	KeyDecisionsMemoEnabled = "decisions_memo_enabled"
 	KeyMrReworkCap          = "mr_rework_cap"
+	// KeyMrReviewTrustedBots (issue #2347) is the admin allowlist of review bots whose MR
+	// comments skip the author-eligibility lookup: comma-separated "<base_url>#<forge_user_id>"
+	// entries (e.g. "https://github.com#136622811"). Matched on the connection's normalized base
+	// URL and the stable forge user id, never a login or a "[bot]" suffix. Empty by default.
+	KeyMrReviewTrustedBots = "mr_review_trusted_bots"
 	// CI-autofix admin gate (PRD #914). ci_autofix_enabled is the instance-wide admin
 	// kill-switch for CI autofix (text "true"/"false"): a THREE-STATE, error-propagating
 	// read (present-true / present-false / absent → the default) that ships ON — a
@@ -566,6 +571,7 @@ var Defaults = map[string]string{
 	KeyMrReworkEnabled:      DefaultMrReworkEnabled,
 	KeyDecisionsMemoEnabled: DefaultDecisionsMemoEnabled,
 	KeyMrReworkCap:          DefaultMrReworkCap,
+	KeyMrReviewTrustedBots:  "",
 	// PRD #914 CI-autofix admin kill-switch. Same no-seeded-row pattern as the judge
 	// keys: an absent row synthesizes to the default (true), so All/AdminView surface it
 	// to the settings page on every instance and no migration seeds it.

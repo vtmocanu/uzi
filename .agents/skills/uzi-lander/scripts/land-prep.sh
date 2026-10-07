@@ -25,15 +25,15 @@
 #                    derives them from the changed paths (api/, web/, agent/, controller/);
 #                    `none` skips gates (only when CI is the arbiter, e.g. a docs-only PR).
 #   --no-push        stop before the push (inspect the worktree first).
-#   --no-rework-check  skip the mr_rework guard (ONLY for a repo that is not on uzi).
+#   --no-rework-check  skip the mr_rework and ci_fix guards (ONLY for a repo that is not on uzi).
 #   --allow-changelog-removals  push even though the branch deletes CHANGELOG.md lines the
 #                    base carries (a deliberate reword); without it that stops with exit 9.
 #   --allow-workflow-edit  push a .github/workflows change onto a uzi-owned branch anyway
 #                    (exit 10 otherwise). Only when no uzi push to it can follow.
 #   --repo-root DIR  the checkout whose .git the worktree is added to (default: cwd's root).
 #
-# Guards, in order: no active mr_rework on the MR (a rework push would collide; the check
-# fails CLOSED when uzi cannot answer); the remote branch head and base SHA are persisted
+# Guards, in order: no active mr_rework on the MR or ci_fix on its branch (worker pushes
+# would collide; the check fails CLOSED when uzi cannot answer); the remote branch head and base SHA are persisted
 # when the landing starts; the push uses a branch lease and refuses if either coordinate
 # moved during gates or a --skip-rebase re-entry; the branch must be the PR's own head
 # branch in THIS repository (never main, never a renovate branch, never a fork's).
@@ -43,7 +43,8 @@
 #      CodeRabbit, so re-run watch-pr.sh afterwards
 #   2  usage
 #   3  gh/git error, or refusing (branch is main / not the PR's head branch)
-#   4  an mr_rework run is active on this MR — defer (scripts/wait-mrrework.sh)
+#   4  an mr_rework run is active on this MR — defer (scripts/wait-mrrework.sh), or a ci_fix
+#      run is active on its branch — let it finish or cancel it
 #   5  rebase conflict — the worktree is left mid-rebase: resolve, `git add`, `git rebase
 #      --continue`, then re-run with --skip-rebase. A stop whose ONLY conflicted path is
 #      CHANGELOG.md is resolved automatically (changelog-union.sh keeps both sides) and the
@@ -145,7 +146,7 @@ case "$BRANCH" in
 esac
 log "branch=$BRANCH base=$BASE head=${HEAD0:0:8}"
 
-# ---- guard: mr_rework ---------------------------------------------------------------------
+# ---- guard: mr_rework and ci_fix ---------------------------------------------------------------------
 # FAIL CLOSED: an absent `uzi`, a failed listing, or unreadable JSON cannot rule out an
 # active rework, so each is a refusal (exit 4). Only a listing that SUCCEEDED and shows the
 # repo is not connected to uzi skips the check; --no-rework-check is the explicit bypass
@@ -164,6 +165,11 @@ mrw_check() {
     '[.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr and ((.status|test("completed|failed|cancelled"))|not))]|length') \
     || { log "could not parse uzi run list; cannot rule out an active mr_rework"; return 4; }
   if [ "${n:-0}" -gt 0 ]; then log "an mr_rework run is ACTIVE on #$PR — defer (scripts/wait-mrrework.sh)"; return 4; fi
+  # ci_fix shares the worker-owned branch; match pipeline_ref rather than the PR number.
+  n=$(printf '%s' "$runs" | jq -r --arg repo "$repo_id" --arg br "$BRANCH" \
+    '[.[]|select(.kind=="ci_fix" and .repo_id==$repo and .pipeline_ref==$br and ((.status|test("completed|failed|cancelled"))|not))|.id]|join(" ")') \
+    || { log "could not parse uzi run list; cannot rule out an active ci_fix"; return 4; }
+  if [ -n "$n" ]; then log "a ci_fix run is ACTIVE on $BRANCH ($n) — let it finish, or cancel it (uzi run cancel <id>) before pushing a local fix"; return 4; fi
   return 0
 }
 mrw_check || exit 4

@@ -1027,6 +1027,56 @@ describe("RunFailureReason — the worker-supplied failure reason (#124, text ch
 // path leaves failure_reason the generic "run cancelled", so this is the line that says WHY.
 // Untrusted free text, same channel as failure_reason, so it must go through stripUnsafeChars.
 describe("RunStopReason — the operator's cancel reason (#525, text channel)", () => {
+  it.each(["ci_fix", "mr_rework"] as const)(
+    "branch advance shows exact diagnostics on the neutral full RunView page for %s",
+    async (kind) => {
+      const stopReason = "superseded by a concurrent branch advance; further publication stopped. cause=remote_branch_advanced; superseding_tip=0123456789abcdef0123456789abcdef01234567";
+      mockUseRunStream.mockReturnValue({
+        run: {
+          ...run({
+            kind,
+            status: "cancelled",
+            stop_kind: "branch_moved",
+            stop_reason: stopReason,
+            failure_reason: null,
+          }),
+          fail_origin: null,
+        },
+        messages: [],
+        connected: true,
+        error: "",
+        submit: vi.fn(),
+        refreshRun: vi.fn(),
+        inputs: [],
+        canSteer: false,
+      } as unknown as ReturnType<typeof useRunStream>);
+      mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+      const { container } = render(
+        <MemoryRouter initialEntries={["/runs/r1"]}>
+          <RunView />
+        </MemoryRouter>,
+      );
+      await screen.findByText("Add rate limiting");
+      const reason = screen.getByText(`Reason: ${stopReason}`);
+      expect(reason.textContent).toBe(`Reason: ${stopReason}`);
+      expect(reason.classList.contains("text-muted")).toBe(true);
+      const stopped = screen.getByText("Run stopped");
+      expect(stopped.classList.contains("text-fg")).toBe(true);
+      const hero = stopped.closest(".rounded-xl");
+      expect(hero).not.toBeNull();
+      expect(hero?.classList.contains("border-edge")).toBe(true);
+      expect(hero?.classList.contains("bg-raised/50")).toBe(true);
+      expect(hero?.classList.contains("border-danger/40")).toBe(false);
+      expect(hero?.classList.contains("bg-danger/10")).toBe(false);
+      const badge = screen.getByText("stopped");
+      for (const neutralClass of ["border-neutral-border", "bg-neutral-surface", "text-neutral-fg"]) {
+        expect(badge.classList.contains(neutralClass)).toBe(true);
+      }
+      expect(screen.queryByText("Run failed")).toBeNull();
+      expect(container.querySelector('[class*="text-danger"], [class*="border-danger"], [class*="bg-danger"]')).toBeNull();
+    },
+  );
+
   it("renders the reason (bidi/zero-width stripped) for a stopped run that carries one", () => {
     const { container } = render(
       <RunStopReason

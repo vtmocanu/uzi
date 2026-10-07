@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 )
 
 func TestValidateSecretRejectsUnsafe(t *testing.T) {
@@ -1059,6 +1060,22 @@ func TestLoadSalvageForges(t *testing.T) {
 		t.Setenv("UZI_SALVAGE_FORGES", raw)
 		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_SALVAGE_FORGES") {
 			t.Errorf("UZI_SALVAGE_FORGES=%q: Load() err = %v, want a UZI_SALVAGE_FORGES error", raw, err)
+		}
+	}
+}
+
+// TestNormalizeTrustedBotBaseURLMatchesConfig pins settings.NormalizeTrustedBotBaseURL (a copy,
+// because this package imports settings) to NormalizeForgeBaseURL: the trusted review-bot
+// allowlist is matched against the connection's normalized base URL, so the two must agree.
+func TestNormalizeTrustedBotBaseURLMatchesConfig(t *testing.T) {
+	for _, raw := range []string{
+		"https://github.com", "https://GitHub.com/", "https://api.github.com/x/y", " https://gitlab.example.com:8443/a ",
+		"http://github.com", "ftp://x.test", "github.com", "", "https://", "://bad", "https://host with space",
+	} {
+		want, wantErr := NormalizeForgeBaseURL(raw)
+		got, gotErr := settings.NormalizeTrustedBotBaseURL(raw)
+		if got != want || (gotErr == nil) != (wantErr == nil) {
+			t.Errorf("%q: settings = (%q, %v), config = (%q, %v)", raw, got, gotErr, want, wantErr)
 		}
 	}
 }

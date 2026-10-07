@@ -1,3 +1,4 @@
+import { establishTrackingOwnership } from "./publication-fixture.js";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync, type SpawnSyncReturns } from "node:child_process";
@@ -26,8 +27,8 @@ async function child(mode: Mode): Promise<void> {
   fs.writeFileSync(path.join(fx.originPath, "work.txt"), "checkpoint\n");
   execFileSync("git", ["-C", fx.originPath, "add", "work.txt"], { env });
   execFileSync("git", ["-C", fx.originPath, "commit", "-qm", "checkpoint"], { env });
-  execFileSync("git", ["-C", bare, "fetch", "--no-tags", fx.originPath,
-    `refs/heads/main:refs/uzi-runner/${branch}`], { env });
+  execFileSync("git", ["-C", fx.originPath, "branch", branch], { env });
+  const context = await establishTrackingOwnership(git, bare, fx.originPath, branch, "run-1725", 1, "issue");
 
   const shimDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "ckpt-git-shim-"));
   const release = path.join(shimDir, "release");
@@ -79,6 +80,9 @@ async function child(mode: Mode): Promise<void> {
   if (mode === "success-refused") batcher.reserveCandidateTransport().cancel();
   const flight = {
     runId: "run-1725",
+    runKind: "issue",
+    claimGeneration: 1,
+    owedContext: Promise.resolve(context),
     lastCheckpointRefTip: "OLD_CONFIRMED",
     lastAttemptedCheckpointRefTip: undefined as string | undefined,
     reportedPublishOutcomes: new Set<string>(mode === "success-refused" ? ["error"] : []),

@@ -6,6 +6,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { type Executor } from "../src/executor.js";
 import type { Logger } from "../src/log.js";
+import type { OwedCandidateContext } from "../src/git.js";
 import { ScratchPublicationError } from "../src/git.js";
 import type { PublishResult } from "../src/protocol.js";
 import {
@@ -47,7 +48,7 @@ function spyFetch(events: string[]): () => void {
     ...args: unknown[]
   ) => {
     events.push("fetch");
-    return (orig as (...a: unknown[]) => Promise<string>)(...args);
+    return (orig as (...a: unknown[]) => Promise<unknown>)(...args);
   };
   return () => {
     (git as unknown as { fetchAgentBranch: unknown }).fetchAgentBranch = orig;
@@ -1162,6 +1163,9 @@ describe("RunRunner — reap precedes the #1036 overlay's credentialed fetch (RE
 describe("issue #1086: two-tip checkpoint reconciliation (F2)", () => {
   interface TestFlight {
     runId: string;
+    branch: string;
+    claimGeneration: number;
+    owedContext: Promise<OwedCandidateContext>;
     lastCheckpointRefTip: string | undefined;
     lastAttemptedCheckpointRefTip: string | undefined;
     reportedPublishOutcomes: Set<string>;
@@ -1181,8 +1185,16 @@ describe("issue #1086: two-tip checkpoint reconciliation (F2)", () => {
       removeSecret() {},
       child: () => log,
     };
+    const context: OwedCandidateContext = {
+      runId: "run-1086", branch: "branch", kind: "issue", barePath: "bare", generation: 9,
+      defaultIdentity: { ref: "refs/remotes/origin/main", sha: "a".repeat(40) },
+    };
+    git.committedTrackingOwnership = async () => ({ kind: "owned", sha: "b".repeat(40), context });
     return {
       runId: "run-1086",
+      branch: "branch",
+      claimGeneration: 9,
+      owedContext: Promise.resolve(context),
       lastCheckpointRefTip: undefined,
       lastAttemptedCheckpointRefTip: undefined,
       reportedPublishOutcomes: new Set<string>(),

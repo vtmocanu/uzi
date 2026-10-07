@@ -905,16 +905,20 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
     let scanned: { tipSha: string; excludeSha: string } | undefined;
     let c2 = "";
     const ctl = control({
-      afterCheckpointScan: async ({ range }) => {
-        scanned = { ...range };
-        // Widen: move the exclude floor BACK below O1 (O1 was never scanned) …
+      afterCheckpointScan: async ({ range }) => { scanned = { ...range }; },
+    });
+    const pack = g.checkpointPack.bind(g);
+    g.checkpointPack = async (...args) => {
+      const range = args[3];
+      if (range) {
+        assert.equal(args[5], range.tipSha, "the publisher proved the scanned source before packing");
         gitIn(bare(), ["update-ref", `refs/remotes/origin/${branch}`, main]);
-        // … and advance the tracking ref to a NEW unscanned commit.
         const tree = gitIn(bare(), ["rev-parse", `${range.tipSha}^{tree}`]);
         c2 = gitIn(bare(), [...IDENT, "commit-tree", tree, "-p", range.tipSha, "-m", "unscanned C2"]);
         gitIn(bare(), ["update-ref", `refs/uzi-runner/${branch}`, c2]);
-      },
-    });
+      }
+      return pack(...args);
+    };
     let packBytes: Buffer | undefined;
     const pub = stubPublish(async (_n, _tip, pack) => {
       packBytes = await drain(pack);
@@ -2035,6 +2039,95 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
       assert.equal(kickDelay, 1_000, "a tick was kicked soon after the deferral (not a full interval)");
       assert.equal(tickOutcome, "published", "the deferred publish went out on the next tick, time gate or not");
       assert.deepEqual(pub.tips, [milestoneSha]);
+      assert.ok(shimCalls(shim).length >= 1, "the scan ran — outside the permit");
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("(inventory deferred rewrite) actual Codex scan deferral retains the earlier divergent owned head", async () => {
+    const tmp = scratchDir("codexdefer");
+    const shim = writeShim(tmp, "detect");
+    const boundaryErrors: string[] = [];
+    let inPermit = false;
+    const scansInPermit: number[] = [];
+    const safety: CodexExecutionSafety = {
+      kind: "codex",
+      withBoundary: async (req, action) => {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(new Error("boundary deadline")), req.deadlineMs);
+        inPermit = true;
+        try {
+          const value = await action({ epoch: 1, boundary: req.boundary, signal: ac.signal } as unknown as BoundaryPermit);
+          scansInPermit.push(shimCalls(shim).length);
+          if (ac.signal.aborted) {
+            boundaryErrors.push(req.boundary);
+            throw new CodexBoundaryError("action", [{ category: "timeout", message: "late" }]);
+          }
+          return value;
+        } finally {
+          inPermit = false;
+          clearTimeout(timer);
+        }
+      },
+      spawnBoundaryProcess: async (_permit, request) => {
+        const [command, ...args] = request.argv;
+        const child = spawn(command!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
+        const completed = new Promise<{ code: number }>((resolve, reject) => {
+          child.once("error", reject);
+          child.once("exit", (code, sig) => resolve({ code: code ?? (sig ? 128 : 1) }));
+        });
+        return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; }, completed };
+      },
+      dispose: async () => ({ kind: "disposed" }),
+    };
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      assert.equal(inPermit, false, "never published from inside the permit");
+      await drain(pack);
+      return LANDED;
+    });
+    const ctl = control();
+    const claim = gitlabClaim(1597_253, { claim_generation: 7 });
+    const { logger, lines } = recordingLogger();
+    const g = mkGit(fx.dataDir, shim);
+    let milestoneSha = "", rewrittenSha = "";
+    let kickDelay: number | undefined;
+    let tickOutcome = "";
+    try {
+      const factory: ExecutorFactory = () => ({
+        executor: {
+          run: async (ctx: RunContext) => {
+            await recordingTurnErrors(async () => {
+              const base = execFileSync("git", ["-C", ctx.worktreePath, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+              milestoneSha = commitIn(ctx.worktreePath, "K.txt", "k\n");
+              await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+              const before = await g.enumerateOwedCandidates(g.barePathFor(fx.originPath), claim.run_id);
+              assert.ok(before.some(root => root.sha === milestoneSha), "deferred milestone already pinned");
+              execFileSync("git", ["-C", ctx.worktreePath, "reset", "--hard", base]);
+              rewrittenSha = commitIn(ctx.worktreePath, "H2.txt", "rewritten\n");
+              kickDelay = ctl.armedDelay();
+              tickOutcome = await ctl.fire(); // the kicked tick, outside any permit
+            });
+            return { branch: ctx.branch };
+          },
+          safety,
+        },
+      });
+      await mkRunner(g, factory, ctl, { codexBoundaryDeadlineMs: 5_000 }, logger).execute(claim);
+      assert.deepEqual(boundaryErrors, []);
+      assert.equal(finalStatus(claim.run_id), "completed");
+      assert.equal(scansInPermit[0], 0, "no gitleaks call inside the checkpoint permit");
+      assert.ok(
+        (lines as Array<Record<string, unknown>>).some((l) => l.msg === "checkpoint publish deferred out of the Codex permit (scan_deferred)"),
+      );
+      assert.equal(kickDelay, 1_000, "a tick was kicked soon after the deferral (not a full interval)");
+      assert.equal(tickOutcome, "published", "the deferred publish went out on the next tick, time gate or not");
+      assert.deepEqual(pub.tips, [rewrittenSha]);
+      const roots = await g.enumerateOwedCandidates(g.barePathFor(fx.originPath), claim.run_id);
+      assert.ok(roots.some(root => root.sha === milestoneSha));
+      assert.ok(JSON.stringify(api.messages(claim.run_id)).includes(milestoneSha.slice(0, 12)));
+      assert.match(JSON.stringify(api.messages(claim.run_id)), /Rewrite\/divergence/);
       assert.ok(shimCalls(shim).length >= 1, "the scan ran — outside the permit");
     } finally {
       pub.restore();

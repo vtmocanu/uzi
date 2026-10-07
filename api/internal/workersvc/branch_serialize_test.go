@@ -82,7 +82,7 @@ func TestCreateMRReworkRunRefusesActiveIssueRun(t *testing.T) {
 	if fs.mrReworkRunParams != nil {
 		t.Fatal("auto: the mr_rework insert ran despite the active issue run")
 	}
-	if _, err := svc.CreateManualMRReworkRun(context.Background(), uuid.New(), uuid.New(), "agent/issue-9", 9, uuid.New(), "t", "d", nil, 5); !errors.Is(err, ErrBranchInUse) {
+	if _, err := svc.CreateManualMRReworkRun(context.Background(), uuid.New(), uuid.New(), "agent/issue-9", 9, uuid.New(), "t", "d", nil, ReviewPlan{MaxActionableID: 5}, nil); !errors.Is(err, ErrBranchInUse) {
 		t.Fatalf("manual: err = %v, want ErrBranchInUse", err)
 	}
 	if fs.mrReworkAndAdvanceParams != nil {

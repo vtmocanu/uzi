@@ -719,8 +719,8 @@ func TestRecoveryHelpTiesExportToArchiveReady(t *testing.T) {
 	flat := strings.Join(strings.Fields(out), " ")
 	for _, want := range []string{
 		"An `archive_ready` hold has a recovery archive: recover it with `run export`",
-		"A `source_only` or `needs_action` hold has no archive and awaits your decision to discard it",
-		"`source_only` means no archive exists and custody of the worker's local source is retained",
+		"A `source_only` or `needs_action` hold retains local inventory and awaits your decision to discard it",
+		"`source_only` means the worker's local inventory remains in custody until a final disposition",
 		"For `source_only` and `needs_action` holds the retained source may be the only copy, so discarding one can destroy the work",
 	} {
 		if !strings.Contains(flat, want) {
@@ -729,6 +729,21 @@ func TestRecoveryHelpTiesExportToArchiveReady(t *testing.T) {
 	}
 	if strings.Contains(flat, "recover the archive with `run export` when one is available") {
 		t.Errorf("stale export guidance in help:\n%s", out)
+	}
+}
+
+func TestGuardedSourceOnlyLineDistinguishesEarlierArchive(t *testing.T) {
+	h := apitypes.RecoveryCustodyHoldDTO{
+		ID: "guarded", Attention: "source_only", InventoryGuarded: true,
+		HasAvailableCapture: true, WorkerName: "worker",
+	}
+	line := sourceOnlyLine(h)
+	if !strings.Contains(line, "earlier recovery archive available") ||
+		!strings.Contains(line, "final inventory disposition is pending") {
+		t.Fatalf("incomplete inventory guidance: %q", line)
+	}
+	if strings.Contains(line, "no recovery archive") || strings.Contains(line, "export unavailable") {
+		t.Fatalf("earlier archive incorrectly hidden: %q", line)
 	}
 }
 

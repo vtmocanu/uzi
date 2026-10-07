@@ -258,6 +258,7 @@ uzi admin products egress-profiles <product>
 uzi admin products connections <product>
 uzi admin guardrail-impact
 uzi admin blocked-repos
+uzi admin review-bots
 uzi admin agent-source get
 uzi admin agent-source status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category <label,label>]
@@ -1565,6 +1566,11 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   forwarding as `uzi review backlog`, but no `--run`: an anchor names a run). `stats` is
   the all-users triage tally. Same `uza_`-token, read-only ceiling as every other `uzi
   admin` verb; the cross-user Mark done / Undo stay cookie-only in the web UI.
+- `uzi admin review-bots` (issue #2347) — the read-only view of the `mr_review_trusted_bots`
+  instance setting: review bots (`BASE URL`/`FORGE USER ID`/`STATUS`) whose MR review
+  comments the rework lane ingests though the bot is not a collaborator. Empty prints a
+  note that third-party bot comments are withheld; a malformed entry is shown verbatim and
+  flagged. Edit in the web Admin Settings page; the CLI never writes.
 - `uzi admin egress-profile list|show <name>` (PRD #1906) — the read-only view of the
   instance's egress profiles: named site lists for official-sources research. `list`
   prints `NAME`/`HOSTS`/`OVERRIDES`/`UPDATED`/`DESCRIPTION`; `show` prints the profile's

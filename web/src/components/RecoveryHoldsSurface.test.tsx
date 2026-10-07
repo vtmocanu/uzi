@@ -38,6 +38,7 @@ function hold(over: Partial<RecoveryCustodyHold> = {}): RecoveryCustodyHold {
     attention: "active",
     worker_id: "w1",
     worker_name: "base (M)",
+    inventory_guarded: false,
     has_available_capture: false,
     created_at: "2026-09-14T00:00:00Z",
     updated_at: "2026-09-14T00:00:00Z",

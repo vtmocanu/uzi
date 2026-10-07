@@ -1,3 +1,4 @@
+import { mockCommittedTracking } from "./runner-tracking-fixture.js";
 import { after, describe, it } from "node:test";
 import { createServer } from "node:http";
 import { AsyncResource } from "node:async_hooks";
@@ -1224,7 +1225,7 @@ describe("RunRunner issue #1784 - Codex finalize boundary on a hold or wall park
         commitInTree(ctx.worktreePath, "WORK.txt", "work before the hold\n");
         // Deterministic capture verdict (the clone is already seeded), as runner-completion-hold does.
         git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
-        git.fetchAgentBranch = (async () => `refs/uzi-runner/${ctx.branch}`) as typeof git.fetchAgentBranch;
+        mockCommittedTracking(git, HELD_HEAD);
         git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
         git.trackingTip = (async () => HELD_HEAD) as typeof git.trackingTip;
         git.checkpointPack = (async () => null) as typeof git.checkpointPack;
@@ -1618,13 +1619,13 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
     let armed = false;
     let fetchFailures = 0;
     const fetch = git.fetchAgentBranch.bind(git);
-    git.fetchAgentBranch = async (...args) => {
+    git.fetchAgentBranch = (async (...args: Parameters<typeof fetch>) => {
       if (armed && fetchFailures === 0) {
         fetchFailures += 1;
         throw new Error("injected fetch-back failure");
       }
       return fetch(...args);
-    };
+    }) as typeof git.fetchAgentBranch;
     const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "RETRY.txt", "work\n");
       armed = true;
@@ -1878,6 +1879,67 @@ function assertCaptured(iid: number): void {
   assert.equal(trackedFile(iid, "COMMITTED.txt"), "committed, not yet fetched back\n", "the unfetched commit is in the tracking ref");
   assert.equal(trackedFile(iid, "DIRTY.txt"), "uncommitted edit\n", "the uncommitted edit is in the tracking ref (WIP commit)");
 }
+
+describe("RunRunner milestone2 — pre-settle reap diagnostics", () => {
+  const secret = "glpat-" + "milestone2fixture1234";
+  const cases: Array<{ label: string; error: () => Error; diagnostic?: string }> = [
+    {
+      label: "real boundary diagnostic is redacted",
+      error: () => new CodexBoundaryError("quiesce", [
+        { category: "protocol", message: `unsettled provider work token=${secret}` },
+      ]),
+      diagnostic: "codex boundary failed at quiesce: unsettled provider work token=***REDACTED***",
+    },
+    ...[
+      ["absent", undefined],
+      ["non-string", 42],
+      ["oversize", "x".repeat(501)],
+      ["control character", "forged\nline"],
+      ["format character", "forged\u202eline"],
+    ].map(([label, diagnostic]) => ({
+      label: `${label} diagnostic falls back to the error`,
+      error: () => Object.assign(new Error("codex boundary failed at quiesce"), {
+        name: "CodexBoundaryError",
+        ...(diagnostic === undefined ? {} : { diagnostic }),
+      }),
+    })),
+  ];
+
+  for (const c of cases) {
+    it(c.label, async () => {
+      const { gitlab } = fakeGitlab();
+      const rig = codexRig();
+      const originalWithBoundary = rig.safety.withBoundary.bind(rig.safety);
+      rig.safety.withBoundary = async (request, action) => {
+        if (request.boundary === "terminal") throw c.error();
+        return originalWithBoundary(request, action);
+      };
+      const { coord, archive } = enabledRecovery();
+      const { logger, lines } = recordingLogger();
+      const claim = gitlabClaim(2365, { claim_generation: 3, secrets: { forge_pat: secret } });
+      const exec = new FakeCodexExecutor(rig.safety, async () => {
+        throw new Error("execution failed");
+      });
+      await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger, {
+        recovery: coord,
+      }).execute(claim);
+
+      const warnings = lines.filter((line) =>
+        (line as { msg?: string }).msg === "recovery: pre-settle reap failed; retaining the generation hold (reporting unaffected)",
+      ) as Array<Record<string, unknown>>;
+      assert.ok(warnings.length > 0, "the real pre-settle reap logged its failure");
+      for (const warning of warnings) {
+        assert.equal(warning.run_id, claim.run_id);
+        assert.equal(warning.error, "codex boundary failed at quiesce");
+        assert.equal(warning.diagnostic, c.diagnostic);
+        assert.equal(Object.hasOwn(warning, "diagnostic"), c.diagnostic !== undefined);
+      }
+      assert.ok(!JSON.stringify(lines).includes(secret), "the run secret never reaches log records");
+      assert.equal(archive.releaseCalls.length, 0, "blocked reap retains custody");
+      assert.ok(statuses(claim.run_id).includes("failed"), "terminal reporting remains unaffected");
+    });
+  }
+});
 
 function receiptError(): Error {
   const e = new Error("input receipt given up");
@@ -2398,10 +2460,10 @@ describe("RunRunner #1766 — the park loop's exits after running is confirmed",
     const w = workThenDefer(rig, settle);
     ctxRef = w.ctx;
     const fetch = git.fetchAgentBranch.bind(git);
-    git.fetchAgentBranch = async (...args) => {
+    git.fetchAgentBranch = (async (...args: Parameters<typeof fetch>) => {
       if (w.deferred()) throw new Error("injected fetch-back failure");
       return fetch(...args);
-    };
+    }) as typeof git.fetchAgentBranch;
     const claim = gitlabClaim(1797);
     const { logger, lines } = recordingLogger();
     const runner = runnerWith(() => ({ executor: w.exec }), gitlab, undefined, logger, { recoveryRetryMs: 5 });
@@ -3562,13 +3624,13 @@ describe("RunRunner M2 — unknown refresh sink retries and local recovery", () 
       assert.ok(!statuses(claim.run_id).includes("completed"));
     };
     const fetch = git.fetchAgentBranch.bind(git);
-    git.fetchAgentBranch = async (...args) => {
+    git.fetchAgentBranch = (async (...args: Parameters<typeof fetch>) => {
       if (w.deferred() && captureFailures++ === 0) {
         retained();
         throw new Error("injected capture failure");
       }
       return fetch(...args);
-    };
+    }) as typeof git.fetchAgentBranch;
     const report = client.reportState.bind(client);
     client.reportState = async (runId, body, signal) => {
       if (body.status === "recovery_wait") {

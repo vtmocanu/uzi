@@ -4,12 +4,51 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
+
+// poolQueue is the production queue mutation (begin, lock, fn, commit) over a pool, standing in
+// for workersvc.Service.MutateReviewAuthorQueue without building a whole Service.
+type poolQueue struct{ pool *pgxpool.Pool }
+
+func (p poolQueue) MutateReviewAuthorQueue(ctx context.Context, repoID uuid.UUID, ref string, fn func(workersvc.ReviewAuthorQueueOps) error) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := store.New(tx)
+	if err := q.LockReviewAuthorQueue(ctx, store.LockReviewAuthorQueueParams{RepoID: repoID, Ref: ref}); err != nil {
+		return err
+	}
+	if err := fn(q); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// startCounter counts the creates a real MRReworkRunStarter is asked for and the ones it accepts.
+type startCounter struct {
+	inner    MRReworkRunStarter
+	attempts int // every create call, accepted or refused
+	starts   int // accepted creates only
+}
+
+func (c *startCounter) CreateAutoMRReworkRunAndAdvance(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, res *workersvc.ReviewSnapshotResult, capLimit int) (store.Run, error) {
+	c.attempts++
+	run, err := c.inner.CreateAutoMRReworkRunAndAdvance(ctx, userID, repoID, ref, mrIID, sourceRunID, title, description, res, capLimit)
+	if err == nil {
+		c.starts++
+	}
+	return run, err
+}
 
 // TestMRReworkEligibilityRoundTripLiveDB exercises detection with real queries:
 // temporary eligibility changes must preserve the consumed review and loop budget.
@@ -46,11 +85,15 @@ func TestMRReworkEligibilityRoundTripLiveDB(t *testing.T) {
 			addToken()
 			exec("INSERT INTO runs (id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,branch,mr_iid,mr_state,status,created_at) VALUES ($1,$2,$3,'issue',7,'t','d',$4,$5,'opened','completed','2020-01-01')", source, owner, repo, mrwRef, mrwMrIID)
 			exec("INSERT INTO pipeline_statuses (repo_id,ref,pipeline_id,sha,status,web_url,synced_at) VALUES ($1,$2,7001,$3,'success','https://forge.test/p','2020-01-01')", repo, mrwRef, mrwHeadSHA)
-			runs := &mrwRuns{}
+			// The REAL workersvc create (recheck + atomic ledger advance over the pool), wrapped to
+			// count the starts it accepts.
+			svc := workersvc.New(q, nil, workersvc.Params{})
+			svc.SetTxBeginner(pool)
+			runs := &startCounter{inner: svc}
 			f := landedForge(mrwComment(120, time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), mrwHeadSHA))
 			row := mrwRepoRow()
 			row.ID = repo
-			watch := NewMRReviewWatch(q, runs, nil, mrwSettings{enabled: true, capVal: 5}, 5, 0)
+			watch := NewMRReviewWatch(q, runs, poolQueue{pool}, nil, mrwSettings{enabled: true, capVal: 5}, 5, 0)
 			ledger := func(count int32, highwater int64) store.MrReworkLedger {
 				t.Helper()
 				got, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repo, Ref: mrwRef})
@@ -75,8 +118,8 @@ func TestMRReworkEligibilityRoundTripLiveDB(t *testing.T) {
 			candidates(1)
 			watch.detect(ctx, row, f)
 			before := ledger(1, 120)
-			if len(runs.calls) != 1 {
-				t.Fatalf("first note: starts=%d", len(runs.calls))
+			if runs.starts != 1 {
+				t.Fatalf("first note: starts=%d", runs.starts)
 			}
 			switch toggle {
 			case "token":
@@ -89,11 +132,11 @@ func TestMRReworkEligibilityRoundTripLiveDB(t *testing.T) {
 			candidates(0)
 			watch.detect(ctx, row, f)
 			after := ledger(1, 120)
-			if after != before {
+			if !reflect.DeepEqual(after, before) {
 				t.Fatalf("ineligible tick changed ledger: before=%+v after=%+v", before, after)
 			}
-			if len(runs.calls) != 1 {
-				t.Fatalf("ineligible tick: starts=%d", len(runs.calls))
+			if runs.starts != 1 || runs.attempts != 1 {
+				t.Fatalf("ineligible tick: starts=%d attempts=%d, want 1 and 1 (no new create attempt)", runs.starts, runs.attempts)
 			}
 			switch toggle {
 			case "token":
@@ -106,14 +149,16 @@ func TestMRReworkEligibilityRoundTripLiveDB(t *testing.T) {
 			candidates(1)
 			watch.detect(ctx, row, f)
 			ledger(1, 120)
-			if len(runs.calls) != 1 {
-				t.Fatalf("same consumed note duplicated: starts=%d", len(runs.calls))
+			if runs.starts != 1 || runs.attempts != 1 {
+				t.Fatalf("same consumed note duplicated: starts=%d attempts=%d, want 1 and 1 (no new create attempt)", runs.starts, runs.attempts)
 			}
+			// The first rework run finishes before the next cycle (one active rework per MR).
+			exec("UPDATE runs SET status='completed' WHERE kind='mr_rework' AND target_run_id=$1", source)
 			f.comments = append(f.comments, mrwComment(121, time.Date(2020, 1, 2, 0, 0, 0, 0, time.UTC), mrwHeadSHA))
 			watch.detect(ctx, row, f)
 			ledger(2, 121)
-			if len(runs.calls) != 2 {
-				t.Fatalf("higher-ID positive control: starts=%d", len(runs.calls))
+			if runs.starts != 2 {
+				t.Fatalf("higher-ID positive control: starts=%d", runs.starts)
 			}
 		})
 	}

@@ -42,8 +42,9 @@ forge-credentialed git child and no new provider turn, and claims nothing.
 A worker-wide, credential-free scan (a process-table read with nothing in scope and
 nothing signalled) runs on every claim before the clone fetch, for both harnesses
 and before the review runner's fetch, and inside the quiescence proofs that scan
-processes. A Codex run's own-mode proof does not (`quiesceRun` sets `processes:
-(!executor.safety || mode !== "own")`), so it neither scans nor latches.
+processes. A Codex run's own-mode proof normally neither scans nor latches;
+`quiesceRun` enables process scanning for an own-mode Codex proof only through the
+owner-cancellation-only `forceProcessScan` exception.
 
 The latch cause is narrowed to the verdict reason `unreadable_unattributed`, and
 only that reason (an approver decision). A `kill_unconfirmed`, a HOME reap that left

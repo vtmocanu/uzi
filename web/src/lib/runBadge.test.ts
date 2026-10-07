@@ -1156,6 +1156,27 @@ describe("stop_kind='stopped' (PRD #517 M4, deliberate HUMAN_STOP_KINDS exclusio
 });
 
 describe("stop_kind='branch_moved' (issue #1117, cancelled-status disposition)", () => {
+  it.each(["ci_fix", "mr_rework"] as const)(
+    "branch advance renders an actual neutral stopped badge for %s",
+    (kind) => {
+      const superseded = {
+        ...run({
+          status: "cancelled",
+          stop_kind: "branch_moved",
+          stop_reason: "superseded by a concurrent branch advance; further publication stopped. cause=remote_branch_advanced; superseding_tip=0123456789abcdef0123456789abcdef01234567",
+          failure_reason: null,
+        }),
+        kind,
+      };
+      expect(runBadge(superseded, NOW)).toMatchObject({
+        kind: "badge",
+        label: "stopped",
+        tone: "neutral",
+        pulse: false,
+      });
+    },
+  );
+
   it("type-checks as a StopKind and renders calm because it lands status='cancelled'", () => {
     // 'branch_moved' is a valid StopKind (compile-time: this assignment fails to build if
     // the union omits it).

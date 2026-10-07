@@ -303,8 +303,9 @@ nothing on that worker can kill or contain it.
 that one finding (the process-quiescence verdict reason `unreadable_unattributed`).
 A worker-wide, credential-free scan runs on every claim before the clone fetch
 (both harnesses, and the review lane before its fetch) and inside the quiescence
-proofs that scan processes. A Codex run's own-mode proof does not scan processes,
-so it neither scans nor latches. Under the [uid split](proc-hardening.md) a worker never
+proofs that scan processes. A Codex run's own-mode proof normally does not scan
+processes, so it neither scans nor latches; the one exception is the owner-cancellation
+cleanup, which forces a process scan and can therefore latch. Under the [uid split](proc-hardening.md) a worker never
 quarantines: the existing solitary-kill path and the uid boundary already contain
 the process. Every other unproven state (a kill that could not be confirmed, a
 HOME reap that left a process, an unreadable status file, a helper failure) keeps
@@ -525,6 +526,41 @@ line to the run's activity summarizing the facts, e.g. `environment facts
 This is what makes the [uzi-watcher](../.agents/skills/uzi-watcher/SKILL.md)
 plan-trap check for a gate the environment facts affect actionable without
 reading the full transcript.
+
+## Publication refusal and branch supersession
+
+A CI-fix or MR-rework run stops further publication when the worker proves a
+stable forward advance on the remote branch that supersedes its candidate.
+With the upgraded api, the run is `cancelled` with stop kind `branch_moved`,
+shown as a neutral stopped outcome. The worker activity feed reports
+`remote_branch_advanced` and the exact observed remote tip; the existing
+`stop_reason` carries them in the owner API, board, CLI and web views.
+Publication refusals on other run kinds keep a `scratch_publication_refused`
+failure. A refusal involving rewritten candidate history or an unknown or
+failed verification is also a failure, rather than benign supersession. Publication-refusal reasons use
+allowlisted codes; untrusted remote text and command stderr are not displayed
+in those reasons.
+
+The worker captures the publication baseline once under the Git lock during
+clone creation or adoption for each claim: a pinned tip, confirmed absence,
+or an unverified state. Only a pinned baseline with verified ancestry supports
+supersession. Reclaiming a run captures a new baseline; the original
+run's baseline is not promised across worker restarts. The proof covers the
+observed remote interval and does not prevent a write after the final
+observation. A push may already have applied even if its response was lost
+and the remote then advanced: this outcome means further publication stopped,
+not that the candidate was never applied. Candidate recovery uses existing
+[capture and custody](./run-recovery.md), with no new capture guarantee.
+The landing interlock tracked in #2403 is outside this change.
+
+**Rollout: upgrade the api server before upgrading workers.** The upgraded
+server handles both CI-fix and MR-rework supersession and accepts the bounded
+cause and tip through existing fields; no new wire fields are required.
+Older servers accept those fields but retain MR-only handling and a static
+cancellation reason, so CI-fix can still land as failed. An upgraded worker
+paired with an older api may show an MR cancellation reason implying the
+candidate was not applied; that older wording does not establish whether an
+earlier push applied.
 
 ## Concurrent runs
 

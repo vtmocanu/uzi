@@ -48,7 +48,7 @@ func TestStartMRReworkForRunHappyPathStampsManual(t *testing.T) {
 	}
 	svc := New(fs, newBox(t), testParams())
 
-	run, err := svc.StartMRReworkForRun(context.Background(), user, runID, "only fix the migration thread", sampleReviewSnapshot())
+	run, err := svc.StartMRReworkForRun(context.Background(), user, runID, "only fix the migration thread", reviewResultOf(sampleReviewSnapshot()))
 	if err != nil {
 		t.Fatalf("StartMRReworkForRun: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestStartMRReworkForRunGuidanceOnlyStillAdvances(t *testing.T) {
 	}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.StartMRReworkForRun(context.Background(), user, runID, "please redo the naming nits", sampleReviewSnapshot()); err != nil {
+	if _, err := svc.StartMRReworkForRun(context.Background(), user, runID, "please redo the naming nits", reviewResultOf(sampleReviewSnapshot())); err != nil {
 		t.Fatalf("guidance-only trigger with nothing new should proceed: %v", err)
 	}
 	// The advance is inseparable from the create: the combined atomic call MUST have fired
@@ -127,6 +127,8 @@ func TestStartMRReworkForRun409Classes(t *testing.T) {
 		name    string
 		mutate  func(*fakeStore)
 		wantErr error
+		// assessedHighWater is the ledger mark the assessment began with; the plan uses it, not a re-read.
+		assessedHighWater int64
 	}{
 		{
 			name:    "run not found",
@@ -173,7 +175,8 @@ func TestStartMRReworkForRun409Classes(t *testing.T) {
 			mutate: func(f *fakeStore) {
 				f.mrReworkLedger = store.MrReworkLedger{Ref: "agent/issue-7", HighWater: 500}
 			},
-			wantErr: ErrReworkNothingNew,
+			assessedHighWater: 500,
+			wantErr:           ErrReworkNothingNew,
 		},
 	}
 
@@ -191,7 +194,9 @@ func TestStartMRReworkForRun409Classes(t *testing.T) {
 
 			// A bare trigger (no guidance) so the nothing-new class fires; the other classes
 			// bail before the guidance check anyway.
-			_, err := svc.StartMRReworkForRun(context.Background(), user, runID, "", sampleReviewSnapshot())
+			res := reviewResultOf(sampleReviewSnapshot())
+			res.highWater = tc.assessedHighWater
+			_, err := svc.StartMRReworkForRun(context.Background(), user, runID, "", res)
 			if err != tc.wantErr {
 				t.Fatalf("err = %v, want %v", err, tc.wantErr)
 			}
@@ -225,7 +230,7 @@ func TestStartMRReworkForRunMapsCreateErrors(t *testing.T) {
 				mrReworkRunErr:    tc.err,
 			}
 			svc := New(fs, newBox(t), testParams())
-			if _, err := svc.StartMRReworkForRun(context.Background(), user, runID, "g", sampleReviewSnapshot()); err != tc.err {
+			if _, err := svc.StartMRReworkForRun(context.Background(), user, runID, "g", reviewResultOf(sampleReviewSnapshot())); err != tc.err {
 				t.Fatalf("err = %v, want %v", err, tc.err)
 			}
 		})

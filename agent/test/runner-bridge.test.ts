@@ -1,3 +1,4 @@
+import { fixtureFetchTracking, fixtureUpdateTracking, fixtureTrackingOptions } from "./runner-tracking-fixture.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -265,41 +266,41 @@ const REFUSAL_CASES: RefusalCase[] = [
   {
     name: "tip_unavailable", kind: "tip_unavailable", step: "resolve_tip", reason: "candidate commit is unavailable",
     detail: "ref does not resolve to a commit",
-    expectReason: "scratch_publication_refused: candidate history cannot be published (tip_unavailable at resolve_tip: ref does not resolve to a commit)",
+    expectReason: "scratch_publication_refused: candidate history cannot be published (tip_unavailable at resolve_tip)",
   },
   {
     name: "shallow_history", kind: "shallow_history", step: "shallow_check", reason: "cannot prove scratch-free candidate history",
     detail: "history is shallow",
-    expectReason: "scratch_publication_refused: candidate history cannot be published (shallow_history at shallow_check: history is shallow)",
+    expectReason: "scratch_publication_refused: candidate history cannot be published (shallow_history at shallow_check)",
   },
   {
     name: "object_walk_failed", kind: "object_walk_failed", step: "object_walk", reason: "cannot prove scratch-free candidate history",
     detail: "exit 128; fatal: bad tree",
     cause: new Error("git rev-list failed"),
-    expectReason: "scratch_publication_refused: candidate history cannot be published (object_walk_failed at object_walk: exit 128; fatal: bad tree)",
+    expectReason: "scratch_publication_refused: candidate history cannot be published (object_walk_failed at object_walk)",
     expectCause: "git rev-list failed",
   },
   {
     name: "checkpoint_range", kind: "checkpoint_range", step: "checkpoint_floor", reason: "checkpoint floor is unavailable or not an ancestor of candidate",
     detail: "floor is unavailable or not an ancestor of candidate",
-    expectReason: "scratch_publication_refused: candidate history cannot be published (checkpoint_range at checkpoint_floor: floor is unavailable or not an ancestor of candidate)",
+    expectReason: "scratch_publication_refused: candidate history cannot be published (checkpoint_range at checkpoint_floor)",
   },
   {
     name: "missing_objects", kind: "missing_objects", step: "object_walk", reason: "cannot prove scratch-free candidate history",
     detail: "bad object abc123",
-    expectReason: "scratch_publication_refused: candidate history cannot be published (missing_objects at object_walk: bad object abc123)",
+    expectReason: "scratch_publication_refused: candidate history cannot be published (missing_objects at object_walk)",
   },
   {
     name: "exec_failed", kind: "exec_failed", step: "scratch_walk", reason: "cannot prove scratch-free candidate history",
     detail: "exit 128",
     cause: new Error("fatal: spawn git ENOENT"),
-    expectReason: "scratch_publication_refused: candidate history cannot be published (exec_failed at scratch_walk: exit 128)",
+    expectReason: "scratch_publication_refused: candidate history cannot be published (exec_failed at scratch_walk)",
     expectCause: "fatal: spawn git ENOENT",
   },
   {
     name: "scratch_present", kind: "scratch_present", step: "scratch_walk", reason: "candidate history contains scratch",
     detail: ".uzi/scratch appears in candidate history",
-    expectReason: "scratch_publication_refused: candidate history cannot be published (scratch_present at scratch_walk: .uzi/scratch appears in candidate history)",
+    expectReason: "scratch_publication_refused: candidate history cannot be published (scratch_present at scratch_walk)",
   },
   {
     name: "floor_unverified", kind: "floor_unverified", step: "floor_refresh", reason: "cannot verify fresh remote floor",
@@ -368,7 +369,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
     const line = lines.find((l) => l.msg === "scratch publication refused");
     assert.ok(line);
-    assert.match(String(failed?.failure_reason), /^scratch_publication_refused: candidate history cannot be published \(exec_failed at object_walk: /);
+    assert.equal(failed?.failure_reason, "scratch_publication_refused: candidate history cannot be published (exec_failed at object_walk)");
     assert.ok(!String(failed?.failure_reason).includes(PAT));
     assert.equal(line.fields?.site, "finalize");
     assert.ok(!JSON.stringify(line.fields).includes(PAT));
@@ -419,7 +420,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     const detail = sanitizeForLog(raw, 197);
     assert.ok(!detail.includes(PAT), "the sanitized copy alone no longer matches the redactor");
     const { reason, fields } = await finalizeRefusal("redact-tab", undefined, detail, raw);
-    assertNoPatPrefix(reason);
+    assert.equal(reason, "scratch_publication_refused: candidate history cannot be published (exec_failed at object_walk)");
     assertNoPatPrefix(fields);
   });
 
@@ -428,7 +429,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
       const raw = `fatal: ${PAT.slice(0, 16)}${sep}${PAT.slice(16)}\nhint: later line`;
       const detail = "fatal: " + PAT.slice(0, 16);
       const { reason, fields } = await finalizeRefusal(`redact-${label}`, undefined, detail, raw);
-      assertNoPatPrefix(reason);
+      assert.equal(reason, "scratch_publication_refused: candidate history cannot be published (exec_failed at object_walk)");
       assertNoPatPrefix(fields);
     });
   }
@@ -445,7 +446,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     it(`redacts a secret pushed onto the raw bound by leading ${label} (failure_reason and log)`, async () => {
       const raw = `${pad.repeat(4080)}${PAT}`;
       const { reason, fields } = await finalizeRefusal(`redact-pad-${label.replace(" ", "-")}`, undefined, "exit 1", raw);
-      assertNoPatPrefix(reason);
+      assert.equal(reason, "scratch_publication_refused: candidate history cannot be published (exec_failed at object_walk)");
       assertNoPatPrefix(fields);
     });
   }
@@ -460,7 +461,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
   it("omits an oversized rawDetail whose secret is split by interior padding (failure_reason and log)", async () => {
     const raw = `fatal: ${PAT.slice(0, 16)}${"\n".repeat(5000)}${PAT.slice(16)}`;
     const { reason, fields } = await finalizeRefusal("redact-interior-pad", undefined, "exit 1", raw);
-    assertOmittedNoPatPrefix(reason);
+    assert.equal(reason, "scratch_publication_refused: candidate history cannot be published (exec_failed at object_walk)");
     assertOmittedNoPatPrefix(fields);
   });
 
@@ -475,7 +476,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     const detail = sanitizeForLog(raw, 197);
     assert.ok(detail.endsWith("..."));
     const { reason, fields } = await finalizeRefusal("redact-cap", undefined, detail, raw);
-    assertNoPatPrefix(reason);
+    assert.equal(reason, "scratch_publication_refused: candidate history cannot be published (exec_failed at object_walk)");
     assertNoPatPrefix(fields);
   });
 
@@ -506,11 +507,15 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     const branch = "feature/refusal-checkpoint";
     const P = publishBranch(branch);
     const bare = await git.ensureClone(fx.originPath);
-    await git.runnerCloneForBranch(bare, branch, "feature-rc", noProofReseed, "R1");
+    const rc = await git.runnerCloneForBranch(bare, branch, "feature-rc", noProofReseed, "R1");
+    await fixtureFetchTracking(git, bare, rc.path, branch, "R1");
     const { logger, lines } = recordingLogger();
     const feed: string[] = [];
     const flight = {
       runId: "R1",
+      claimGeneration: 1,
+      runKind: "issue",
+      owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),
       publishedTip: P,
       checkpointFloor: P,
       lastCheckpointRefTip: "CONFIRMED",
@@ -552,11 +557,15 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     const branch = "feature/refusal-noredactor";
     const P = publishBranch(branch);
     const bare = await git.ensureClone(fx.originPath);
-    await git.runnerCloneForBranch(bare, branch, "feature-rc", noProofReseed, "R1");
+    const rc = await git.runnerCloneForBranch(bare, branch, "feature-rc", noProofReseed, "R1");
+    await fixtureFetchTracking(git, bare, rc.path, branch, "R1");
     const { logger, lines } = recordingLogger();
     const feed: string[] = [];
     const flight = {
       runId: "R1",
+      claimGeneration: 1,
+      runKind: "issue",
+      owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),
       publishedTip: P,
       checkpointFloor: P,
       lastCheckpointRefTip: "CONFIRMED",
@@ -731,7 +740,7 @@ describe("RunRunner — the reseed after a bridge adopts B (PRD #1416 M3, SC2)",
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "--amend", "--no-edit"]);
     const H = gitIn(rc.path, ["rev-parse", "HEAD"]);
-    await git.fetchAgentBranch(bare, rc.path, branch, "R1"); // tracking ref = H (divergent), owner R1
+    await fixtureFetchTracking(git, bare, rc.path, branch, "R1"); // tracking ref = H (divergent), owner R1
 
     // CONTROL — today's behaviour: with the tracking ref left at the divergent H, a reseed sets it
     // aside and seeds from origin, losing the rewritten work.
@@ -742,7 +751,7 @@ describe("RunRunner — the reseed after a bridge adopts B (PRD #1416 M3, SC2)",
     const bridgeResult = await git.bridgeToFloors(bare, H, [P]);
     assert.strictEqual(bridgeResult.kind, "built", "a bridge was built");
     const B = (bridgeResult as { kind: "built"; sha: string }).sha;
-    await git.updateTrackingRef(bare, branch, B);
+    await fixtureUpdateTracking(git, bare, branch, B, "R1");
 
     // Now the reseed adopts B — the run resumes on its rewritten work.
     const after = await git.runnerCloneForBranch(bare, branch, "feature-reseed", noProofReseed, "R1");
@@ -913,9 +922,11 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "--amend", "--no-edit"]);
     const H = gitIn(rc.path, ["rev-parse", "HEAD"]);
-    await git.fetchAgentBranch(bare, rc.path, branch, "R1");
+    await fixtureFetchTracking(git, bare, rc.path, branch, "R1");
 
-    const flight = { runId: "R1", publishedTip: P, checkpointFloor: P };
+    const flight = { runId: "R1", claimGeneration: 1, runKind: "issue",
+        owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),
+        publishedTip: P, checkpointFloor: P };
     const r = runner({ run: async (c) => ({ branch: c.branch }) }, gitlab);
     const outcome = await callBridge(r, bare, branch, flight);
     assert.strictEqual(outcome.kind, "bridged");
@@ -935,10 +946,12 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     fs.writeFileSync(path.join(rc.path, "ontop.ts"), "1\n");
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "clean work on top of P"]);
-    await git.fetchAgentBranch(bare, rc.path, branch, "R1");
+    await fixtureFetchTracking(git, bare, rc.path, branch, "R1");
     const tipBefore = await git.trackingTip(bare, branch);
 
-    const flight = { runId: "R1", publishedTip: P, checkpointFloor: P };
+    const flight = { runId: "R1", claimGeneration: 1, runKind: "issue",
+        owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),
+        publishedTip: P, checkpointFloor: P };
     const r = runner({ run: async (c) => ({ branch: c.branch }) }, gitlab);
     const outcome = await callBridge(r, bare, branch, flight);
     assert.strictEqual(outcome.kind, "clean");
@@ -955,11 +968,14 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     fs.writeFileSync(path.join(rc.path, ".uzi", "scratch", "note"), "local only\n");
     gitIn(rc.path, ["add", "-f", ".uzi/scratch/note"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "scratch checkpoint"]);
-    await git.fetchAgentBranch(bare, rc.path, branch, "R1");
+    await fixtureFetchTracking(git, bare, rc.path, branch, "R1");
     const H = await git.trackingTip(bare, branch);
     const lines: string[] = [];
     const flight = {
       runId: "R1",
+      claimGeneration: 1,
+      runKind: "issue",
+      owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),
       publishedTip: P,
       checkpointFloor: P,
       lastCheckpointRefTip: "CONFIRMED",
@@ -992,13 +1008,15 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     fs.writeFileSync(path.join(rc.path, "REWRITE.md"), "rewrite\n");
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "--amend", "--no-edit"]);
-    await git.fetchAgentBranch(bare, rc.path, branch, "R1");
+    await fixtureFetchTracking(git, bare, rc.path, branch, "R1");
     const tipBefore = await git.trackingTip(bare, branch);
 
     const origAncestry = git.ancestry.bind(git);
     (git as unknown as { ancestry: unknown }).ancestry = async () => "unknown";
     try {
-      const flight = { runId: "R1", publishedTip: P, checkpointFloor: P };
+      const flight = { runId: "R1", claimGeneration: 1, runKind: "issue",
+        owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),
+        publishedTip: P, checkpointFloor: P };
       const r = runner({ run: async (c) => ({ branch: c.branch }) }, gitlab);
       const outcome = await callBridge(r, bare, branch, flight);
       assert.strictEqual(outcome.kind, "unknown");
@@ -1018,7 +1036,7 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "--amend", "--no-edit"]);
     const H = gitIn(rc.path, ["rev-parse", "HEAD"]);
-    await git.fetchAgentBranch(bare, rc.path, branch, "R1"); // tracking ref = divergent H
+    await fixtureFetchTracking(git, bare, rc.path, branch, "R1"); // tracking ref = divergent H
     const tipBefore = await git.trackingTip(bare, branch);
 
     // A malformed "bridge": parents H and P (so BOTH are definitively ancestors) but P's tree, NOT
@@ -1032,7 +1050,9 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
       sha: malformed,
     });
     try {
-      const flight = { runId: "R1", publishedTip: P, checkpointFloor: P };
+      const flight = { runId: "R1", claimGeneration: 1, runKind: "issue",
+        owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),
+        publishedTip: P, checkpointFloor: P };
       const r = runner({ run: async (c) => ({ branch: c.branch }) }, gitlab);
       const outcome = await callBridge(r, bare, branch, flight);
       assert.strictEqual(outcome.kind, "failed", "a tree-mismatched bridge is a definitive failure");
@@ -1051,7 +1071,7 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     fs.writeFileSync(path.join(rc.path, "REWRITE.md"), "rewrite\n");
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "--amend", "--no-edit"]);
-    await git.fetchAgentBranch(bare, rc.path, branch, "R1"); // tracking ref = divergent H
+    await fixtureFetchTracking(git, bare, rc.path, branch, "R1"); // tracking ref = divergent H
     const tipBefore = await git.trackingTip(bare, branch);
 
     // The divergence detection + the REAL bridge build both run; only the post-build validation's
@@ -1060,7 +1080,9 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     const origRevParse = git.revParse.bind(git);
     (git as unknown as { revParse: unknown }).revParse = async () => null;
     try {
-      const flight = { runId: "R1", publishedTip: P, checkpointFloor: P };
+      const flight = { runId: "R1", claimGeneration: 1, runKind: "issue",
+        owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),
+        publishedTip: P, checkpointFloor: P };
       const r = runner({ run: async (c) => ({ branch: c.branch }) }, gitlab);
       const outcome = await callBridge(r, bare, branch, flight);
       assert.strictEqual(outcome.kind, "unknown", "a transient validation read maps to unknown, not failed");

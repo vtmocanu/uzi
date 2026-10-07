@@ -257,6 +257,9 @@ type Client interface {
 	// AdminBlockedRepos reads the admin cross-user blocked-repos list from the
 	// stored privilege report (PRD #66 M9): GET /api/admin/blocked-repos.
 	AdminBlockedRepos(ctx context.Context) (apitypes.AdminBlockedReposDTO, error)
+	// AdminSettings reads the instance settings map and per-key sources (issue #2347):
+	// GET /api/admin/settings. READ-ONLY — writes are cookie-only and stay in the web UI.
+	AdminSettings(ctx context.Context) (AdminSettingsView, error)
 	// AdminAgentSource reads the agent-source config + sync status + staged
 	// snapshot (PRD #602 M6): GET /api/admin/agent-source. READ-ONLY — the sync/
 	// apply writes stay web-only (cookie-only), so the CLI never triggers a fetch.

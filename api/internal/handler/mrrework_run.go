@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -139,15 +140,44 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Snapshot the MR's review comments from the forge (the FULL kept set rides the run,
-	// Decision 3). Guarded on a real MR: a run with no mr_iid gets a nil snapshot and the
-	// service returns the precise "this run has no merge request" 409 rather than a spurious
-	// forge error. A forge read failure is 502 with the already-redacted error, as Fix CI is.
-	var snapshot *workersvc.ReviewCommentsSnapshot
-	if run.MrIid.Valid {
+	// Snapshot the MR's review comments from the forge, keeping ELIGIBLE comments only
+	// (issue #2347): the FULL eligible set rides the run (Decision 3), comments from authors
+	// without repository access (or whose access could not be verified in time) are withheld.
+	// Guarded on a real MR and branch: a run with no mr_iid gets a nil result and the service
+	// returns the precise "this run has no merge request" 409 rather than a spurious forge
+	// error. A forge read failure is 502 with the already-redacted error, as Fix CI is.
+	var res *workersvc.ReviewSnapshotResult
+	if run.MrIid.Valid && run.Branch.Valid && run.Branch.String != "" {
+		// The trusted review-bot allowlist is a security control, so an unreadable list fails
+		// closed like the kill-switch above rather than sending bots through the lookup.
+		trusted, err := h.settings.MrReviewTrustedBots(r.Context())
+		if err != nil {
+			slog.Warn("mr-rework trusted review bots read", "error", err)
+			httpx.Error(w, http.StatusConflict, "MR rework is unavailable: the trusted review bot list could not be read")
+			return
+		}
 		f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 		if err != nil {
 			slog.Error("mr-rework: build forge for connection", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		// The queue's prune bound is read BEFORE the comment listing (see the watcher): rows a
+		// concurrent assessor admits afterwards can never be pruned by this request's keep set.
+		assessor := &workersvc.ReviewAssessor{Store: h.q, Queue: h.wsvc, Timeout: h.reviewLookupTimeout}
+		queueBound, err := assessor.QueueBound(r.Context(), repo.ID, run.Branch.String)
+		if err != nil {
+			slog.Error("mr-rework: read review author queue", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		// The ledger row is read BEFORE the comment listing: every pending id in it existed before
+		// the list was fetched, so a pending id absent from the list is gone, whatever the forge's
+		// comment-id order. StartMRReworkForRun plans against these values (carried on the
+		// assessment result), never a later re-read.
+		led, err := h.q.GetMRReworkLedger(r.Context(), store.GetMRReworkLedgerParams{RepoID: repo.ID, Ref: run.Branch.String})
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			slog.Error("mr-rework: read ledger", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
@@ -157,10 +187,31 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadGateway, "could not read the merge request comments: "+err.Error())
 			return
 		}
-		snapshot = workersvc.BuildReviewCommentsSnapshot(comments, repo.BotForgeUserID)
+		as, err := assessor.Begin(r.Context(), workersvc.ReviewAssessParams{
+			RepoID:         repo.ID,
+			Ref:            run.Branch.String,
+			ProjectID:      repo.ForgeProjectID,
+			BaseURL:        repo.BaseUrl,
+			BotForgeUserID: repo.BotForgeUserID,
+			Lookup:         f,
+			Trusted:        trusted,
+			Comments:       comments,
+			HighWater:      led.HighWater,
+			Pending:        led.PendingUnknownIds,
+			QueueBound:     queueBound,
+		})
+		if err != nil {
+			slog.Error("mr-rework: assess review comment authors", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if as != nil {
+			res = as.Snapshot(r.Context())
+			as.Close()
+		}
 	}
 
-	run, err = h.wsvc.StartMRReworkForRun(r.Context(), user.ID, runID, req.Guidance, snapshot)
+	run, err = h.wsvc.StartMRReworkForRun(r.Context(), user.ID, runID, req.Guidance, res)
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotFound):
@@ -171,7 +222,8 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			errors.Is(err, workersvc.ErrReworkNoBranch),
 			errors.Is(err, workersvc.ErrReworkMRNotOpen),
 			errors.Is(err, workersvc.ErrReworkNoToken),
-			errors.Is(err, workersvc.ErrReworkNothingNew):
+			errors.Is(err, workersvc.ErrReworkNothingNew),
+			errors.Is(err, workersvc.ErrReworkPermissionUnknown):
 			// Each carries its own user-facing reason (the service's sentinel message).
 			httpx.Error(w, http.StatusConflict, err.Error())
 		case errors.Is(err, workersvc.ErrBranchInUse):

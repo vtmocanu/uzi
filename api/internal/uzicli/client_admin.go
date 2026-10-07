@@ -141,6 +141,23 @@ func (c *HTTPClient) AdminBlockedRepos(ctx context.Context) (apitypes.AdminBlock
 	return out, nil
 }
 
+// AdminSettingsView is the subset of GET /api/admin/settings the CLI renders: the
+// effective non-secret settings and where each value came from ("db", "env", "default").
+type AdminSettingsView struct {
+	Settings map[string]string `json:"settings"`
+	Sources  map[string]string `json:"sources"`
+}
+
+// AdminSettings reads the instance settings (issue #2347). Read-only: an admin read token
+// works, the PUT is cookie-only.
+func (c *HTTPClient) AdminSettings(ctx context.Context) (AdminSettingsView, error) {
+	var out AdminSettingsView
+	if err := c.get(ctx, "/api/admin/settings", &out); err != nil {
+		return AdminSettingsView{}, err
+	}
+	return out, nil
+}
+
 // AdminAgentSource reads the agent-source config + sync status + staged snapshot
 // (PRD #602 M6): GET /api/admin/agent-source. Read-only — the "Sync now" and
 // approve-and-apply writes are cookie-only, so there is nothing here for a uza_

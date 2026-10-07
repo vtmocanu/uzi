@@ -37,7 +37,8 @@ func TestWallHoldRejectsLateFailuresLiveDB(t *testing.T) {
 					t.Fatalf("SetRunFailedPlanRejected = (%d,%v), want (0,nil)", n, err)
 				}
 				n, err = fx.q.SupersedeRunByWorker(fx.ctx, store.SupersedeRunByWorkerParams{
-					ID: id, WorkerID: pgtype.UUID{Bytes: worker, Valid: true},
+					StopReason: "superseded by a concurrent branch advance; further publication stopped.",
+					ID:         id, WorkerID: pgtype.UUID{Bytes: worker, Valid: true},
 				})
 				if err != nil || n != 0 {
 					t.Fatalf("SupersedeRunByWorker = (%d,%v), want (0,nil)", n, err)

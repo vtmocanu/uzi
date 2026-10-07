@@ -59,7 +59,7 @@ go install github.com/go-task/task/v3/cmd/task@v3.53.1   # pinned, sumdb-verifie
 - **Component gates run serially, deliberately.** CPU contention is a measured flake source, and interleaved output defeats reading the named failing test.
 - `task gate:api` carries `-race`, which the hand-typed `go test -count=1 ./...` it replaced did not and CI always did. It runs longer (51.8s, measured 2026-08-02) and can redden on a real data race.
 - Read the `test:api` comment in `Taskfile.yml` for `-race` / `-count=1` provenance, not a commit cited from memory.
-- Read `web/vite.config.ts` for its `testTimeout` rather than trusting a quoted figure: the suite-wide value is 20000 and two tests carry a per-test cap of 120000.
+- Read `web/vite.config.ts` for the default `testTimeout` and individual tests for overrides, rather than trusting a quoted figure: the default is 20000, two route-smoke tests in `web/src/App.routes.test.tsx` set 30000, and `hookTimeout` is unset (Vitest's default).
 - Not everything is a target: a single-test invocation, `sqlc generate`, the compose stack and the e2e harness stay written out as commands in `.claude/rules/go.md` and `.claude/rules/stack.md`.
 
 ### Lint ratchet

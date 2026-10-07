@@ -64,6 +64,25 @@ func TestDeriveHoldAttention(t *testing.T) {
 	}
 }
 
+func TestGuardedInventoryAttentionDoesNotSettleOnEarlierArchive(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		want   string
+	}{
+		{"running", attentionActive},
+		{"completed", attentionSourceOnly},
+	} {
+		row := store.ListCustodyHoldsForOwnerRow{
+			State: "open", CaptureState: "available", RunStatus: tc.status,
+			HasAvailableCapture: true, InventoryGuarded: true,
+		}
+		dto := custodyHoldToDTO(row)
+		if dto.Attention != tc.want || !dto.HasAvailableCapture || !dto.InventoryGuarded {
+			t.Fatalf("guarded earlier archive: %+v", dto)
+		}
+	}
+}
+
 func TestIsDecisionAttention(t *testing.T) {
 	// Only needs_action and source_only await an owner decision (D10). active protection and
 	// self-releasing archive_ready/capturing rows, plus settled released/discarded, do not.

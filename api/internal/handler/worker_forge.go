@@ -467,7 +467,12 @@ func (h *Handler) mrReworkThreadScope(w http.ResponseWriter, conn workersvc.Forg
 		}
 	}
 	// An absent/empty snapshot leaves snap.Comments nil, so every scope check below fails
-	// closed: a run with no review snapshot can write back to nothing.
+	// closed: a run with no review snapshot can write back to nothing. A legacy snapshot
+	// (issue #2347: captured before comment authors were assessed) is treated the same way:
+	// its threads were never vetted, so none of them may be an anchor.
+	if snap.Version != workersvc.ReviewSnapshotVersion {
+		snap = workersvc.ReviewCommentsSnapshot{}
+	}
 	return snap, *conn.MRIID, true
 }
 

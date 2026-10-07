@@ -83,7 +83,7 @@ WHERE per_branch.branch <> rp.default_branch
 -- fresh candidate): the generated :one returns a zero-value struct alongside
 -- pgx.ErrNoRows, which the detector reads as attempt_count=0, high_water=0,
 -- halt_notified=false.
-SELECT repo_id, ref, attempt_count, high_water, halt_notified, updated_at
+SELECT repo_id, ref, attempt_count, high_water, halt_notified, updated_at, pending_unknown_ids
 FROM mr_rework_ledger
 WHERE repo_id = @repo_id::uuid AND ref = @ref;
 
@@ -96,13 +96,39 @@ WHERE repo_id = @repo_id::uuid AND ref = @ref;
 -- false on every proceed (INSERT defaults it false): the latch is one comment per
 -- halt episode, so once a proceed advances the counter a later cap halt can comment
 -- again.
-INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water)
-VALUES (@repo_id::uuid, @ref, 1, @high_water)
+-- pending_unknown_ids (issue #2347): the permission-unknown comment ids the mark moved past
+-- (@pending_add, kept only when above the mark the row had BEFORE this update) merged with
+-- the existing set, minus @pending_remove (ids consumed, now not-eligible, or gone). An author's
+-- older id is replaced by its newer representative only through the parallel
+-- @pending_superseded / @pending_superseded_by pairs, which the merge applies only when the
+-- replacement is retained in the same statement (a stale writer's rejected add leaves the older
+-- id in place); the merge keeps the oldest 10000 slots (mr_rework_merge_pending).
+INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water, pending_unknown_ids)
+VALUES (@repo_id::uuid, @ref, 1, @high_water,
+        mr_rework_merge_pending('{}'::bigint[], @pending_add::bigint[], @pending_remove::bigint[], @pending_superseded::bigint[], @pending_superseded_by::bigint[], 0))
 ON CONFLICT (repo_id, ref) DO UPDATE
 SET attempt_count = mr_rework_ledger.attempt_count + 1,
     high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
     halt_notified = false,
+    pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, @pending_add::bigint[], @pending_remove::bigint[], @pending_superseded::bigint[], @pending_superseded_by::bigint[], mr_rework_ledger.high_water),
     updated_at    = now();
+
+-- name: RemoveMRReworkPendingIDs :exec
+-- Drop ids from a ledger row's pending_unknown_ids WITHOUT spending a cycle (issue #2347): the
+-- pending ids the snapshot caps evicted (an eligible pending comment that no longer fits the
+-- capped snapshot falls back to human review, so it must stop re-triggering the assessment).
+-- Array subtraction only: attempt_count, high_water, halt_notified and updated_at are left
+-- alone, and no row is created when the ref has none.
+UPDATE mr_rework_ledger
+SET pending_unknown_ids = ARRAY(
+    SELECT x FROM (
+        SELECT unnest(mr_rework_ledger.pending_unknown_ids) AS x
+        EXCEPT
+        SELECT r AS x FROM unnest(COALESCE(@ids::bigint[], '{}'::bigint[])) AS r
+    ) t
+    ORDER BY x
+)
+WHERE repo_id = @repo_id::uuid AND ref = @ref;
 
 -- name: SetMRReworkHaltNotified :exec
 -- The HALT comment-once latch: once the per-MR cap halt has posted its explanatory
@@ -216,8 +242,9 @@ RETURNING *;
 -- (ErrActiveMRReworkExists/ErrBranchInUse); success -> run + ledger commit together. `ref` on
 -- the ledger is the pipeline_ref (the branch), exactly as the two-step path passed it.
 WITH led AS (
-    INSERT INTO mr_rework_ledger (repo_id, ref, high_water)
-    SELECT @repo_id::uuid, @pipeline_ref, @high_water
+    INSERT INTO mr_rework_ledger (repo_id, ref, high_water, pending_unknown_ids)
+    SELECT @repo_id::uuid, @pipeline_ref, @high_water,
+           mr_rework_merge_pending('{}'::bigint[], @pending_add::bigint[], @pending_remove::bigint[], @pending_superseded::bigint[], @pending_superseded_by::bigint[], 0)
     WHERE NOT EXISTS (
         SELECT 1 FROM runs
         WHERE repo_id = @repo_id::uuid
@@ -228,6 +255,7 @@ WITH led AS (
     ON CONFLICT (repo_id, ref) DO UPDATE
     SET high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
         halt_notified = false,
+        pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, @pending_add::bigint[], @pending_remove::bigint[], @pending_superseded::bigint[], @pending_superseded_by::bigint[], mr_rework_ledger.high_water),
         updated_at    = now()
 )
 INSERT INTO runs (

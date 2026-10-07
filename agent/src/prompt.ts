@@ -800,8 +800,9 @@ function reviewCommentsFrame(openTag: string, closeTag: string): string {
 /**
  * Render the run's snapshotted MR review comments as a per-prompt nonce-fenced, UNTRUSTED
  * block for the mr_rework run's prompt (PRD #700 M4, Decision 12). Returns "" when the
- * snapshot is absent/empty, so a run with no review-comment snapshot is byte-for-byte
- * unchanged. Pure + unit-testable, mirroring buildIssueCommentsContext.
+ * snapshot is absent, or version 2 with no comments and no withheld counts, so a run with
+ * no review-comment snapshot is byte-for-byte unchanged. A legacy (non-version-2) snapshot
+ * renders a fixed unavailable note; withheld counts render fixed notes outside the fence. Pure + unit-testable, mirroring buildIssueCommentsContext.
  *
  * Each comment renders as a UZI-OWNED header line
  * (`[n] @username at <created_at> <path>:<line> (<review_state>):`) followed by the raw
@@ -815,13 +816,21 @@ function reviewCommentsFrame(openTag: string, closeTag: string): string {
 export function buildReviewCommentsContext(
   snapshot: ReviewCommentsSnapshot | null | undefined,
 ): string {
-  if (!snapshot || snapshot.comments.length === 0) return "";
+  if (!snapshot) return "";
+  if (snapshot.version !== 2) {
+    return "[Review comments withheld] Review comments from before the author-eligibility change are not available. Do not guess their content or act on them.";
+  }
+  const notes = reviewWithheldNotes(snapshot);
+  // The wire contract is an array, but a null or absent `comments` (an all-withheld snapshot
+  // stored by an older API build) reads as empty rather than throwing, so the notes still render.
+  const comments = Array.isArray(snapshot.comments) ? snapshot.comments : [];
+  if (comments.length === 0) return notes.join("\n");
   // Per-prompt random fence tag, exactly like the issue-comments / memory fences: a
   // comment author cannot predict it, so no </review_comments_…> variant breaks out.
   const nonce = fenceNonce();
   const openTag = `<review_comments_${nonce}>`;
   const closeTag = `</review_comments_${nonce}>`;
-  const rendered = snapshot.comments
+  const rendered = comments
     .map((c, i) => {
       // The diff anchor is uzi-owned structure: a `path:line` for an inline finding, or
       // nothing for a review-summary / top-level note (which carries no path).
@@ -850,9 +859,32 @@ export function buildReviewCommentsContext(
         rendered,
       ].join("\n\n")
     : rendered;
-  return [reviewCommentsFrame(openTag, closeTag), openTag, inner, closeTag].join(
+  const block = [reviewCommentsFrame(openTag, closeTag), openTag, inner, closeTag].join(
     "\n",
   );
+  return notes.length > 0 ? [...notes, block].join("\n") : block;
+}
+
+/** Only non-negative finite integers are rendered; anything else counts as zero. */
+function withheldCount(n: unknown): number {
+  return typeof n === "number" && Number.isSafeInteger(n) && n > 0 ? n : 0;
+}
+
+/** Fixed uzi-owned notes for review comments the API withheld. They carry counts only,
+ *  never an author, body or id, and sit outside the nonce fence. */
+function reviewWithheldNotes(snapshot: ReviewCommentsSnapshot): string[] {
+  const plural = (n: number) => (n === 1 ? "1 review comment" : `${n} review comments`);
+  const tail = "Their content is not available; do not guess it or act on it.";
+  const notes: string[] = [];
+  const notEligible = withheldCount(snapshot.withheld_not_eligible);
+  if (notEligible > 0) {
+    notes.push(`[Review comments withheld] ${plural(notEligible)} withheld: author not eligible (author_not_eligible). ${tail}`);
+  }
+  const unknown = withheldCount(snapshot.withheld_unknown);
+  if (unknown > 0) {
+    notes.push(`[Review comments withheld] ${plural(unknown)} withheld: permission unknown (permission_unknown). ${tail}`);
+  }
+  return notes;
 }
 
 /** Issue #105: this run was resumed, but the SDK session it named could not be

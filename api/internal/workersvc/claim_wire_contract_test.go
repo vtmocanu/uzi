@@ -84,6 +84,7 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 		// ABSENT when the field is nil (the omitempty contract). Timestamp FIXED for a
 		// byte-stable golden.
 		ReviewComments: &ReviewCommentsSnapshot{
+			Version: ReviewSnapshotVersion,
 			Comments: []ReviewCommentSnapshot{
 				{
 					ID:                5001,
@@ -99,7 +100,9 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 					ReviewState:       "inline",
 				},
 			},
-			Truncated: true,
+			Truncated:           true,
+			WithheldNotEligible: 1,
+			WithheldUnknown:     2,
 		},
 		Status:         "claimed",
 		Branch:         strptr("agent/issue-42"),
@@ -218,6 +221,25 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 			// tests (TestClaimDeliversOverrideSubagentModelWhenFrozenOn /
 			// TestClaimOmitsOverrideSubagentModelWhenFrozenOff), not by mutating this golden.
 		},
+	}
+}
+
+func TestClaimInventoryGuardWire(t *testing.T) {
+	for _, guarded := range []bool{false, true} {
+		p := sampleClaimPayloadWithSkills()
+		p.InventoryGuarded = guarded
+		raw, err := json.Marshal(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatal(err)
+		}
+		value, present := body["inventory_guarded"]
+		if present != guarded || (guarded && value != true) {
+			t.Fatalf("guarded=%v: inventory_guarded=%v present=%v", guarded, value, present)
+		}
 	}
 }
 

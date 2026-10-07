@@ -316,8 +316,8 @@ Tracked as GitLab issue vtmocanu/uzi#40; PRD at `prds/done/40-token-usage-report
 
 - Report token usage and cost per run, per user, and factory-wide. [user]
 - Run view shows the run's usage, broken down per phase and per agent ("coder used 800k"). [user 2026-07-12]
-- Every user sees their own "Your usage" (lifetime + last-7-days); the factory total and per-user breakdown are admin-only. [user]
-- Tokens are the headline figure; cost is a secondary estimate — a $0 cost (subscription-auth runs) renders as "—", not "$0.00". [user]
+- One Usage card has a shared All time / Last 7 days toggle, defaulting to seven days and remembered per viewer in the browser. Personal figures are shown to everyone; factory figures and the embedded per-user breakdown are admin-only. Per-user figures stay all time. [AI-synced 2026-10-07]
+- The dashboard highlights metered cost, failed-run rate and tokens for the selected window. Metered $0 is shown as $0.00; subscription and unreported runs are disclosed separately from cost (#1429 D7). [AI-synced 2026-10-07]
 - Failed and cancelled runs still count their spend. [user]
 - Chat runs are out of scope (not counted). [user]
 - Shipped surfaces validated against the approved mock (+ addendum). [user 2026-07-12]
@@ -486,10 +486,11 @@ Tracked as GitLab issue vtmocanu/uzi#58 (closed); PRD at `prds/done/58-hosted-k8
 - Trimmed v1 surface: sizes are built-in constants (no preset CRUD), no restart endpoint, heartbeat-only status. [user 2026-07-16]
 - Sizes are Burstable (requests < limits): `s` 250m–1 CPU / 1–2Gi RAM; `m` 500m–2 / 2–4Gi; `l` 1–4 / 4–8Gi; `/data` 5/10/20Gi; `/nix` a flat 4Gi. [user 2026-07-17]
   - `/nix` is now a flat **20Gi** — raised for PRD #87's prebaked Chromium closure. [user, PRD #87]
-  - `l`'s RAM limit is now **12Gi** (request was 4Gi; now 8Gi, #1341), raised to stop runtime OOMKills from multi-agent runs (parallel subagent waves plus the web-ux browser). [user, #131]
+  - `l`'s RAM limit was raised to **12Gi** (request was 4Gi; then 8Gi, #1341; superseded below by #2127), raised to stop runtime OOMKills from multi-agent runs (parallel subagent waves plus the web-ux browser). [user, #131]
   - Per-size RAM raised: `s` 2–4Gi, `m` 4–8Gi, `l` 8–12Gi — each request lifted above that size's measured per-run peak (all still Burstable). Stops kubelet node-memory-pressure eviction of workers that sat over their request, incl. mid-run. [user, #1341]
+  - `l` RAM raised again to request **14Gi** / limit **20Gi** (#2127): a persistent `l` worker running two concurrent runs was OOMKilled twice at 12Gi while both runs were in whole-program Go analyzer gates; owner-selected sizing, not a measured capacity guarantee; reduced node placement capacity accepted. `m` likewise raised to request **8Gi** / limit **12Gi** (a single run's `deadcode` hit 7.3-7.5 GiB at the old 8Gi limit and was OOMKilled twice). [user, #2127] (AI-synced 2026-10-07)
   - Hosted worker pods now carry a default `priorityClassName` (a modest cluster-scoped PriorityClass, value 1000, `globalDefault: false`), so under node memory pressure other lower-priority pods are evicted before ours. `preemptionPolicy: PreemptLowerPriority` (owner's choice): a worker that cannot be scheduled for lack of room also preempts lower-priority pods to get placed. Operators can set `Never` to drop that scheduling-time preemption. [user, #1341]
-- Default size is `l` for new hosted workers, persistent picker and ephemeral provisioning alike; explicit choices and existing workers keep their sizes. Was `m` [user 2026-07-16]. [user 2026-10-05, #2240] (AI-synced 2026-10-05)
+- New ephemeral hosted workers default to `m`, configurable through chart `workers.ephemeralDefaultSize` (`s`, `m`, `l`, invalid values refuse rendering); non-chart API defaults and invalid-value fallback use `m`. The persistent picker stays at `l`; existing workers keep their stored sizes. `m` matches the pre-#2127 `l`: 1/4 CPU, 8Gi/12Gi memory, 25Gi persistent data. Ephemeral data retains its separate 20Gi default; existing persistent `m` PVCs keep 10Gi until reprovisioned. [user, #2412] (AI-synced 2026-10-07)
 - Three sizes stay, and the picker displays what each size buys. [user 2026-07-17]
 - Deleting a hosted worker requires a confirmation (it destroys the worker's volumes); deleting an external worker stays one click. [user 2026-07-16]
 - Hosted k8s gains an opt-in uid-split worker profile for Codex (default off; while on, the kube-native worker namespace's PodSecurity admission drops from `restricted` to `baseline`, while the separate Docker-capable tier keeps its own `privileged` namespace); Landlock is optional via a mode knob (`required` fails closed, `best-effort` runs unconfined on a kernel without it, relying on the uid split alone). A worker without the split, or without usable Landlock under `required`, stops advertising Codex — those runs (including tool-less Codex advice) simply queue instead of being claimed and then failing. (AI-synced 2026-09-20)
@@ -943,7 +944,8 @@ Tracked as GitHub issue vtmocanu/uzi#1995; ADR at `adr/1296-durable-run-recovery
 ## Feature #1418 — "Needs landing" bucket for failed runs whose work is human-landable
 
 - A failed run whose committed work is still human-landable surfaces a secondary "needs landing" presentation bucket (`landing_state`), derived server-side from the run's `fail_origin` and whether its work is recoverable (a preserved diff or an available durable-recovery archive). The four human-landable origins are the publish-time failures `finalize_base_align_conflict`, `workflow_scope_missing`, `push_secret_blocked`, and `history_rewritten`. [AI-synced 2026-09-19, #1418]
-- The bucket renders everywhere a run is shown: the web run list and run page, the TUI, `uzi run list` / `uzi run get`, the failed-run-rate dashboard (the failed bar splits into "failed" and "failed, needs landing" at the same total), and the Slack run-finished copy. [AI-synced 2026-09-19, #1418]
+- The per-run bucket renders in the web run list and run page, the TUI, `uzi run list` / `uzi run get`, and Slack run-finished copy. [AI-synced 2026-10-07]
+- The dashboard keeps one failed bar segment and shows a per-window "failed runs with recoverable work" note, qualified because work may already have been landed; CLI usage summaries call the subset "recoverable". [AI-synced 2026-10-07]
 - These runs still count as failures — they extend, not amend, the #1293 failed-run rate (the factory did not publish its output). [AI-synced 2026-09-19, #1418]
 - The judge skips retrospecting the environment-caused subset (`finalize_base_align_conflict`, `workflow_scope_missing`, `push_secret_blocked`); `history_rewritten` stays judge-eligible as an agent defect. [AI-synced 2026-09-19, #1418]
 
@@ -1024,6 +1026,15 @@ Tracked as GitHub issue vtmocanu/uzi#1650; PRD at `prds/done/1650-retire-notific
 Tracked as GitHub issue vtmocanu/uzi#1695.
 
 - A top-level MR comment consisting solely of an allowlisted review-bot control command (CodeRabbit's `@coderabbitai review` family; Greptile's `@greptileai review` / `@greptile review`) is not actionable review feedback and never starts an mr_rework; any added prose, or an inline comment, still counts. (AI-synced 2026-09-25)
+
+## Feature #2347 — Author eligibility for MR review comments
+
+Tracked as GitHub issue vtmocanu/uzi#2347; design rationale in `adr/2347-review-comment-author-trust.md`.
+
+- An MR review comment reaches an mr_rework run, and can trigger one, only when its author has repository access or is an allowlisted review bot; comments from anyone else, and from authors whose access cannot be verified in time, are withheld (omitted, with counts shown to the agent). Unknown never triggers. (AI-synced 2026-10-07)
+- The instance setting `mr_review_trusted_bots` (admin-only, default empty) lists trusted bots as `<base_url>#<forge_user_id>`; a bot matches by forge instance plus numeric user id, never login. Allowlisting only permits ingestion: bot text stays untrusted, and a trusted bot's summary or walkthrough comment never triggers. (AI-synced 2026-10-07)
+- Reply/resolve is allowed only on a thread with an included (eligible) comment in the run's snapshot; a wholly withheld thread is refused 403. Snapshots from before this change are replayed empty and authorize no thread. (AI-synced 2026-10-07)
+- An outsider flood does not suppress an eligible finding unless the pending set (one entry per unverified author, accumulated across fires; near the cap, when superseding could not be guaranteed to fit, an author's older id is kept so an author may briefly hold two entries rather than risk losing both) exceeds 10,000 entries, but may delay it, bounded only conditionally; this departs from the issue's zero-delay criterion and the maintainer accepted it on 2026-10-07. (AI-synced 2026-10-07)
 
 ## Feature #1732 — Disable and re-enable account credentials
 

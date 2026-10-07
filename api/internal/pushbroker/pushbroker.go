@@ -77,9 +77,23 @@ type Options struct {
 	Pack []byte
 }
 
+// PublishDisposition describes evidence from this publish's receive-pack command.
+type PublishDisposition uint8
+
+const (
+	// PublishUnclassified is the default for pre-command failures, rejections and AlreadyCurrent.
+	PublishUnclassified PublishDisposition = iota
+	// PublishAdvanced means this command received a successful acknowledgement of the update.
+	PublishAdvanced
+	// PublishOutcomeUnknown means ReceivePack was invoked and the returned failure
+	// leaves the outcome uncertain, including a failure after a successful report.
+	PublishOutcomeUnknown
+)
+
 // Result reports the ref that was (or would have been) advanced.
 type Result struct {
-	Ref string
+	Ref         string
+	Disposition PublishDisposition
 	// AlreadyCurrent: origin's checkpoint ref already pointed at the declared tip, so nothing
 	// was written. The success proves only that origin holds the tip, not who wrote it; the
 	// caller decides whether the tip is the run's own (PRD #1810).
@@ -409,24 +423,36 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	// The already-up-to-date case (checkpointTip == tipHash) returned success far above,
 	// before the pack apply and ancestry checks, so by here the declared tip strictly
 	// descends the fetched checkpoint tip and there is a real update to forward.
-	pushErr := forwardPack(ctx, remote, auth, checkpointRef, checkpointTip, tipHash, o.Pack)
+	outcome, pushErr := forwardPack(ctx, remote, auth, checkpointRef, checkpointTip, tipHash, o.Pack)
+	disposition := PublishUnclassified
+	if outcome.invoked && !outcome.rejected && (!outcome.success || pushErr != nil) {
+		// Without definitive rejection evidence for this command, rejection-like error text
+		// cannot prove refusal. Keep the outcome unknown and preserve its cause.
+		if pushErr == nil {
+			pushErr = errors.New("missing or incomplete receive-pack acknowledgement")
+		}
+		return Result{Disposition: PublishOutcomeUnknown}, fmt.Errorf("pushbroker: push: %w", pushErr)
+	} else if outcome.success && pushErr == nil {
+		disposition = PublishAdvanced
+	}
+	result.Disposition = disposition
 	switch {
 	case pushErr == nil:
 		return result, nil
-	case isWorkflowScopeRejection(pushErr):
+	case outcome.rejected && isWorkflowScopeRejection(errors.New(outcome.reason)):
 		// The branch is behind on .github/workflows/** relative to the default branch
 		// and the bot PAT lacks the `workflow` scope. Not an infra fault — the caller
 		// skips the checkpoint cleanly (best-effort; PRD #456 M4). Checked BEFORE the
 		// non-fast-forward arm so a rejection carrying both signals routes to the scope
 		// sentinel, and so it never surfaces as a 5xx.
-		return Result{}, ErrWorkflowScopeRejected
-	case isNonFastForward(pushErr):
+		return Result{Disposition: disposition}, ErrWorkflowScopeRejected
+	case outcome.rejected && isNonFastForward(errors.New(outcome.reason)):
 		// origin advanced its checkpoint (or a human moved the branch) between our fetch
 		// and our push, so the receive-pack compare-and-swap on the fetched Old refused
 		// the update — exactly the protocol-level guarantee the non-forced invariant wants.
-		return Result{}, ErrNotDescendant
+		return Result{Disposition: disposition}, ErrNotDescendant
 	default:
-		return Result{}, fmt.Errorf("pushbroker: push: %w", pushErr)
+		return Result{Disposition: disposition}, fmt.Errorf("pushbroker: push: %w", pushErr)
 	}
 }
 
@@ -983,6 +1009,13 @@ func openReceivePack(ctx context.Context, remote *git.Remote, auth transport.Aut
 	return sess, ar, nil
 }
 
+type forwardPackResult struct {
+	invoked  bool
+	success  bool
+	rejected bool
+	reason   string // Authoritative raw rejection only; never a transport error.
+}
+
 // forwardPack ships the worker's (non-thin) packfile to origin through a MANUAL
 // git-receive-pack session and returns the outcome. Unlike remote.PushContext it does
 // NOT recompute a send-set — it forwards `pack` verbatim and lets the remote resolve
@@ -997,28 +1030,34 @@ func openReceivePack(ctx context.Context, remote *git.Remote, auth transport.Aut
 // session talks to the identical host over the identical transport. The receive-pack
 // session does its OWN reference advertisement (AdvertisedReferencesContext); the
 // earlier upload-pack List from fetchBaseRefs is a different service and is not reusable.
-func forwardPack(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, ref plumbing.ReferenceName, oldHash, newHash plumbing.Hash, pack []byte) error {
+func forwardPack(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, ref plumbing.ReferenceName, oldHash, newHash plumbing.Hash, pack []byte) (forwardPackResult, error) {
 	urls := remote.Config().URLs
 	if len(urls) == 0 {
-		return fmt.Errorf("pushbroker: remote has no URL")
+		return forwardPackResult{}, fmt.Errorf("pushbroker: remote has no URL")
 	}
 	ep, err := transport.NewEndpoint(urls[0])
 	if err != nil {
-		return fmt.Errorf("pushbroker: endpoint: %w", err)
+		return forwardPackResult{}, fmt.Errorf("pushbroker: endpoint: %w", err)
 	}
-	c, err := transportFor(ep)
+	raw := &rawReport{ref: ref.String()}
+	var c transport.Transport
+	if ep.Protocol == "http" || ep.Protocol == "https" {
+		c, err = rawHTTPTransport(ep, raw)
+	} else {
+		c, err = transportFor(ep)
+	}
 	if err != nil {
-		return fmt.Errorf("pushbroker: transport client: %w", err)
+		return forwardPackResult{}, fmt.Errorf("pushbroker: transport client: %w", err)
 	}
 	sess, err := c.NewReceivePackSession(ep, auth)
 	if err != nil {
-		return fmt.Errorf("pushbroker: receive-pack session: %w", err)
+		return forwardPackResult{}, fmt.Errorf("pushbroker: receive-pack session: %w", err)
 	}
 	defer func() { _ = sess.Close() }()
 
 	ar, err := sess.AdvertisedReferencesContext(ctx)
 	if err != nil {
-		return fmt.Errorf("pushbroker: advertise: %w", err)
+		return forwardPackResult{}, fmt.Errorf("pushbroker: advertise: %w", err)
 	}
 	req := packp.NewReferenceUpdateRequestFromCapabilities(ar.Capabilities)
 	req.Commands = []*packp.Command{{
@@ -1029,11 +1068,45 @@ func forwardPack(ctx context.Context, remote *git.Remote, auth transport.AuthMet
 	if len(pack) > 0 {
 		req.Packfile = io.NopCloser(bytes.NewReader(pack))
 	}
-	// ReceivePack returns the report-status AND report.Error() (nil on success, else the
-	// first failing command's "ng <ref> <reason>" text or the unpack error). The caller
-	// classifies on that error's text via isWorkflowScopeRejection / isNonFastForward.
-	_, err = sess.ReceivePack(ctx, req)
-	return err
+	if err := ctx.Err(); err != nil {
+		return forwardPackResult{}, err
+	}
+	if ep.Protocol != "http" && ep.Protocol != "https" {
+		if err := attachRawStdout(sess, raw); err != nil {
+			return forwardPackResult{}, err
+		}
+	}
+	return receiveObservedPack(ctx, sess, req, raw)
+}
+
+// receiveObservedPack observes the capabilities selected by the caller and uses
+// the complete raw report to classify the same ReceivePack invocation.
+func receiveObservedPack(ctx context.Context, sess transport.ReceivePackSession, req *packp.ReferenceUpdateRequest, raw *rawReport) (forwardPackResult, error) {
+	raw.sideband = req.Capabilities.Supports(capability.Sideband64k) || req.Capabilities.Supports(capability.Sideband)
+	outcome := forwardPackResult{invoked: true}
+	_, err := sess.ReceivePack(ctx, req)
+	if raw.exhausted {
+		// ReportStatus.Decode can replace a reader error with "missing flush".
+		// Preserve that returned cause while retaining the bounded reader cause.
+		err = errors.Join(err, errReportResponseLimit)
+	}
+	// ReportStatus discards the command marker. Only the observed, complete raw
+	// report can distinguish "ng <ref> ok" from a successful command.
+	if raw.complete() {
+		switch {
+		case raw.unpack != "ok":
+			outcome.rejected, outcome.reason = true, raw.unpack
+		case raw.marker == "ng":
+			outcome.rejected, outcome.reason = true, raw.reason
+		case raw.marker == "ok":
+			outcome.success = true
+		}
+	}
+	if outcome.rejected && err == nil {
+		// The synthesized error omits the raw reason; classification uses reason only.
+		err = errors.New("pushbroker: receive-pack rejected update")
+	}
+	return outcome, err
 }
 
 // scanPackBudget rejects a worker pack that would inflate past the budget constants above,

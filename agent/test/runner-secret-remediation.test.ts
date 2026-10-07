@@ -633,9 +633,9 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
       iid: 1932_218,
       forge: "gitlab",
       configureRunner: (r) => {
-        const rr = r as unknown as { fetchBackBestEffort: (...a: unknown[]) => Promise<boolean> };
+        const rr = r as unknown as { fetchBackBestEffort: (...a: unknown[]) => Promise<{ kind: "updated" | "failed" | "refused" }> };
         const orig = rr.fetchBackBestEffort.bind(r);
-        rr.fetchBackBestEffort = async (...a) => (failFetch ? false : orig(...a));
+        rr.fetchBackBestEffort = async (...a) => (failFetch ? { kind: "failed" } : orig(...a));
       },
       body: async (ctx, gate) => {
         const flagged = commitIn(ctx.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
@@ -1592,9 +1592,9 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
       iid: 1932_274,
       forge: "gitlab",
       configureRunner: (r) => {
-        const rr = r as unknown as { fetchBackBestEffort: (...a: unknown[]) => Promise<boolean> };
+        const rr = r as unknown as { fetchBackBestEffort: (...a: unknown[]) => Promise<{ kind: "updated" | "failed" | "refused" }> };
         const orig = rr.fetchBackBestEffort.bind(r);
-        rr.fetchBackBestEffort = async (...a) => (failFetch ? false : orig(...a));
+        rr.fetchBackBestEffort = async (...a) => (failFetch ? { kind: "failed" } : orig(...a));
       },
       body: async (ctx, gate) => {
         const w = ctx.worktreePath;

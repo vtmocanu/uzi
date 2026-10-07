@@ -266,12 +266,13 @@ export class Worker {
   private async resolveBootTerminals(signal: AbortSignal): Promise<void> {
     const outbox = this.outbox;
     if (!outbox) return;
-    const deps = makeTerminalOutboxDeps(outbox, this.client, {
+    let deps = makeTerminalOutboxDeps(outbox, this.client, {
       gapFillMax: this.config.gapFillMax,
       terminalMaxBytes: this.config.outboxTerminalMaxBytes,
       log: this.log,
     });
     if (!deps) return; // no usable outbox (failed closed) — nothing durable to resolve
+    if (typeof this.runner.protectRecoveryTerminalDeps === "function") deps = this.runner.protectRecoveryTerminalDeps(deps);
     for (const entry of outbox.listPendingTerminals()) {
       if (signal.aborted) return;
       const gen = entry.claim_generation;
@@ -291,7 +292,7 @@ export class Worker {
         const stillPending = outbox
           .listPendingTerminals()
           .some((p) => p.run_id === entry.run_id && p.claim_generation === gen);
-        if (!stillPending) await outbox.retireFinalizesThrough(entry.run_id, gen);
+        if (!stillPending && !(await this.runner.recoveryInventoryPending?.(entry.run_id, gen))) await outbox.retireFinalizesThrough(entry.run_id, gen);
       } catch (err) {
         this.log.warn("outbox: boot terminal resolve failed for a run; leaving it listed for a later resolve", {
           run_id: entry.run_id,
@@ -338,12 +339,13 @@ export class Worker {
   private async resolveRunTerminal(runId: string, signal?: AbortSignal): Promise<void> {
     const outbox = this.outbox;
     if (!outbox) return;
-    const deps = makeTerminalOutboxDeps(outbox, this.client, {
+    let deps = makeTerminalOutboxDeps(outbox, this.client, {
       gapFillMax: this.config.gapFillMax,
       terminalMaxBytes: this.config.outboxTerminalMaxBytes,
       log: this.log,
     });
     if (!deps) return; // no usable outbox (failed closed) — nothing durable to resolve
+    if (typeof this.runner.protectRecoveryTerminalDeps === "function") deps = this.runner.protectRecoveryTerminalDeps(deps);
     for (const entry of outbox.listPendingTerminals()) {
       if (entry.run_id !== runId) continue;
       if (signal?.aborted) return;
@@ -369,12 +371,13 @@ export class Worker {
     if (this.sweepingTerminals) return; // single-flight
     this.sweepingTerminals = true;
     try {
-      const deps = makeTerminalOutboxDeps(outbox, this.client, {
+      let deps = makeTerminalOutboxDeps(outbox, this.client, {
         gapFillMax: this.config.gapFillMax,
         terminalMaxBytes: this.config.outboxTerminalMaxBytes,
         log: this.log,
       });
       if (!deps) return; // no usable outbox (failed closed) — nothing durable to resolve
+      if (typeof this.runner.protectRecoveryTerminalDeps === "function") deps = this.runner.protectRecoveryTerminalDeps(deps);
       for (const entry of outbox.listPendingTerminals()) {
         if (signal?.aborted) return;
         await this.resolveLiveTerminal(outbox, deps, entry, "sweep", signal);
@@ -434,7 +437,7 @@ export class Worker {
       const stillPending = outbox
         .listPendingTerminals()
         .some((p) => p.run_id === runId && p.claim_generation === gen);
-      if (!stillPending) await outbox.retireFinalizesThrough(runId, gen);
+      if (!stillPending && !(await this.runner.recoveryInventoryPending?.(runId, gen))) await outbox.retireFinalizesThrough(runId, gen);
     } catch (err) {
       this.log.warn("outbox: live terminal resolve failed for a run; leaving it listed for a later resolve", {
         run_id: runId,
@@ -501,8 +504,8 @@ export class Worker {
         // recovery_archive_v1 — the flag M1's ClaimRun reads to open a custody hold for
         // this worker on a code-publishing run — AND the PRD #1349 generation-exact
         // extension recovery_archive_v2, advertised ALONGSIDE v1 during rollout (v2 is a
-        // strict superset; the server's RecoveryCapable gate stays keyed on v1 until a
-        // later milestone flips it, so advertising both is safe). Kept SEPARATE from
+        // strict superset; the server's RecoveryCapable gate accepts any of v1, v2 and
+        // recovery_inventory_v1, so advertising several is safe). Kept SEPARATE from
         // `capabilities` (the scheduler vocabulary) on the wire: the server stores it in
         // workers.protocol_capabilities and the ClaimRun hard clause reads it there,
         // OUTSIDE required_capabilities and the capability_aware kill-switch, so an old
@@ -511,6 +514,7 @@ export class Worker {
           "completion_interlock_v1",
           "recovery_archive_v1",
           "recovery_archive_v2",
+          "recovery_inventory_v1",
           // PRD #1247 M5b (D3/protocol §9): this image implements the held-state credential-switch
           // protocol — it stamps claim_generation on every mutating report (already landed in W2a),
           // surfaces the credential_switch signal, and performs the two-phase release. Advertised
@@ -616,7 +620,11 @@ export class Worker {
         // retire failure must not turn an accepted register into a retry loop.
         if (sentFinalizes.length > 0) {
           try {
-            await this.outbox?.retireFinalizes(sentFinalizes);
+            const releasable = [];
+            for (const entry of sentFinalizes) {
+              if (!(await this.runner.recoveryInventoryPending?.(entry.run_id, entry.claim_generation))) releasable.push(entry);
+            }
+            await this.outbox?.retireFinalizes(releasable);
           } catch (err) {
             this.log.warn("register finalize snapshot: retiring the offered records failed", {
               error: errMessage(err),

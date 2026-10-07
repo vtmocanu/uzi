@@ -1,3 +1,4 @@
+import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -244,7 +245,7 @@ describe("branchWorkflowFiles", () => {
     gitIn(rc.path, [...IDENT, "merge", "--no-ff", "-m", "merge default", fresh]);
     const published = gitIn(rc.path, ["rev-parse", "HEAD"]);
     gitIn(rc.path, ["push", fx.originPath, "HEAD:refs/heads/agent/issue-1870"]);
-    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-1870", "duplicate");
+    const ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-1870", "duplicate");
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref, published), [], "published duplicate blob is permitted");
   });
 
@@ -261,12 +262,12 @@ describe("branchWorkflowFiles", () => {
     fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), "name: default\n");
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "mix blobs"]);
-    let ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-1871", "mixed");
+    let ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-1871", "mixed");
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref, target), []);
     gitIn(rc.path, ["rm", ".github/workflows/ci.yml"]);
     gitIn(rc.path, ["mv", odd, ".github/workflows/renamed.yml"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "rename and delete"]);
-    ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-1871", "renamed");
+    ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-1871", "renamed");
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref, target), [".github/workflows/renamed.yml"]);
     assert.strictEqual(await git.branchWorkflowFiles(bare, "f".repeat(40), ref), null);
   });
@@ -281,7 +282,7 @@ describe("branchWorkflowFiles", () => {
     }
     gitIn(rc.path, ["add", "--", ...paths]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "workflow paths"]);
-    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-104", "run-paths");
+    const ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-104", "run-paths");
     assert.deepStrictEqual(await git.changedFiles(bare, ref), [...paths].sort());
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, base, ref), [...paths].sort());
   });
@@ -330,7 +331,7 @@ describe("branchWorkflowFiles", () => {
     fs.writeFileSync(path.join(rc.path, "impl.ts"), "agent work\n");
     gitIn(rc.path, ["add", "impl.ts"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "agent work"]);
-    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-101", "run-stale");
+    const ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-101", "run-stale");
     const old = gitIn(bare, ["rev-parse", `${base}^`]);
     gitIn(bare, ["update-ref", "refs/remotes/origin/main", old]);
     assert.deepStrictEqual(await git.changedFiles(bare, ref), [".github/workflows/ci.yml", "impl.ts"]);
@@ -348,7 +349,7 @@ describe("branchWorkflowFiles", () => {
     fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), `${oldBlob}\n`);
     gitIn(rc.path, ["add", ".github/workflows/ci.yml"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", `chore: align .github/workflows with ${fresh}`]);
-    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-102", "run-restore");
+    const ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-102", "run-restore");
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), [".github/workflows/ci.yml"]);
   });
 
@@ -359,7 +360,7 @@ describe("branchWorkflowFiles", () => {
     const fresh = await git.fetchDefaultTip(bare, "main");
     gitIn(rc.path, ["rm", ".github/workflows/ci.yml"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", `chore: align .github/workflows with ${fresh}`]);
-    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-103", "run-remove");
+    const ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-103", "run-remove");
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), []);
   });
 
@@ -373,14 +374,14 @@ describe("branchWorkflowFiles", () => {
     gitIn(rc.path, [...IDENT, "commit", "-m", `chore: align .github/workflows with ${older}`]);
     advanceOriginMain(fx.originPath, { ".github/workflows/ci.yml": "name: newest\n" }, "new default");
     const fresh = await git.fetchDefaultTip(bare, "main");
-    let ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-1", "run-a");
+    let ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-1", "run-a");
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), [".github/workflows/ci.yml"]);
     const published = gitIn(rc.path, ["rev-parse", "HEAD"]);
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref, published), []);
     fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), "name: agent edit\n");
     gitIn(rc.path, ["add", ".github/workflows/ci.yml"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "agent edits workflow"]);
-    ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-1", "run-b");
+    ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-1", "run-b");
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref, published), [".github/workflows/ci.yml"]);
   });
 
@@ -392,7 +393,7 @@ describe("branchWorkflowFiles", () => {
     fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), "name: current\n");
     gitIn(rc.path, ["add", ".github/workflows/ci.yml"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", `chore: align .github/workflows with ${fresh}`]);
-    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-4", "run-current");
+    const ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-4", "run-current");
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), []);
   });
 
@@ -409,7 +410,7 @@ describe("branchWorkflowFiles", () => {
     fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), "name: current\n");
     gitIn(rc.path, ["add", ".github/workflows/ci.yml"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", `chore: align .github/workflows with ${missing}`]);
-    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-106", "run-missing");
+    const ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-106", "run-missing");
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), []);
   });
 
@@ -422,7 +423,7 @@ describe("branchWorkflowFiles", () => {
     fs.writeFileSync(path.join(rc.path, "impl.ts"), "agent work\n");
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "-m", `chore: align .github/workflows with ${fresh}`]);
-    let ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-3", "run-mixed");
+    let ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-3", "run-mixed");
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), []);
 
     // A later workflow edit still differs from the allowed default blob, regardless of subject.
@@ -431,7 +432,7 @@ describe("branchWorkflowFiles", () => {
     fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), "name: later edit\n");
     gitIn(rc.path, ["add", ".github/workflows/ci.yml"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", `chore: align .github/workflows with ${fresh}`]);
-    ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-3", "run-parent");
+    ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-3", "run-parent");
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), [".github/workflows/ci.yml"]);
   });
 
@@ -440,13 +441,13 @@ describe("branchWorkflowFiles", () => {
     const rc = await git.createOrAttachRunnerClone(bare, 5, noProofReseed);
     const initial = await git.fetchDefaultTip(bare, "main");
     gitIn(rc.path, [...IDENT, "commit", "--allow-empty", "-m", `chore: align .github/workflows with ${initial}`]);
-    let ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-5", "run-empty");
+    let ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-5", "run-empty");
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, initial, ref), []);
     advanceOriginMain(fx.originPath, { ".github/workflows/ci.yml": "name: merged\n" }, "default workflow");
     const fresh = await git.fetchDefaultTip(bare, "main");
     gitIn(rc.path, ["fetch", fx.originPath, "main"]);
     gitIn(rc.path, [...IDENT, "merge", "--no-ff", "-m", `chore: align .github/workflows with ${fresh}`, fresh]);
-    ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-5", "run-merge");
+    ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-5", "run-merge");
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), []);
   });
 
@@ -480,7 +481,7 @@ describe("branchWorkflowFiles", () => {
     fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), "name: forged\n");
     gitIn(rc.path, ["add", ".github/workflows/ci.yml"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", `chore: align .github/workflows with ${fresh}`]);
-    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-2", "run-c");
+    const ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-2", "run-c");
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), [".github/workflows/ci.yml"]);
   });
 });
@@ -493,7 +494,7 @@ describe("workflowTreeDiffers", () => {
     fs.writeFileSync(path.join(rc.path, "impl.ts"), "export const x = 1;\n");
     gitIn(rc.path, ["add", "impl.ts"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "impl"]);
-    const trackingRef = await git.fetchAgentBranch(bare, rc.path, "agent/issue-1", "run-a");
+    const trackingRef = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-1", "run-a");
 
     // Before main moves, the workflow trees match → no divergence.
     const tipBefore = await git.fetchDefaultTip(bare, "main");

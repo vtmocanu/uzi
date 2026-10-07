@@ -768,7 +768,7 @@ export interface LatestRun {
   // non-stop run. Read by isStoppedRun, which renders the two HUMAN kinds as a calm
   // "stopped" and deliberately leaves "auto_stopped" looking like the breakage it is.
   stop_kind: StopKind | null;
-  // issue #525: the operator's OPTIONAL free-text cancel reason. Owner-gated on the
+  // Optional operator cancel reason or server-composed stop diagnostics. Owner-gated on the
   // shared board (the server sends it only to the run's owner, like failure_reason;
   // a non-owner viewer gets null). Untrusted free text — render via stripUnsafeChars.
   stop_reason: string | null;
@@ -1012,6 +1012,11 @@ export interface AppSettings {
   // workers are unaffected. The admin UI edits it as a repo multiselect writing the
   // ids — admins pick paths, never paste UUIDs.
   docker_repo_allowlist: string;
+  // Trusted review-bot allowlist (issue #2347): comma-separated `<base_url>#<forge_user_id>`
+  // entries, e.g. `https://github.com#136622811`. MR review comments from non-collaborators
+  // are withheld from automatic MR rework; a listed bot's comments are ingested (still as
+  // untrusted evidence). Empty (the default) trusts no bot. Rules: lib/trustedReviewBots.ts.
+  mr_review_trusted_bots: string;
   // Capability-aware scheduling kill-switch (PRD #84 M2). The text "true"/"false"
   // (default "true"). When on, a run is routed only to a worker that can run it
   // (e.g. a docker-needing run only to a docker worker). Turning it OFF reverts to
@@ -2516,9 +2521,9 @@ export type RunStatus =
 // directive truncated. PRD #1227 M2: "scope_reduced" is stamped on a completed run whose
 // owner `partial` decision deferred part of its frozen scope. Both land
 // status="completed" (green success), so — like "stopped" — neither is a HUMAN_STOP_KIND.
-// Issue #1117: "branch_moved" is stamped on an mr_rework run whose finalize push was
-// rejected non-fast-forward because a concurrent same-branch writer advanced the MR branch
-// under it (a benign, expected race, not an agent failure). It lands status="cancelled", so
+// "branch_moved" is stamped on ci_fix or mr_rework runs when a concurrent same-branch
+// advance is proved before publication or after a push rejection. This benign supersession
+// lands status="cancelled", so
 // isStoppedRun already renders it calm regardless of stop_kind — it is NOT a HUMAN_STOP_KIND
 // (those govern the status="failed" case only).
 export type StopKind =
@@ -2802,12 +2807,12 @@ export interface Run {
   mr_rework_auto_cycles?: number | null;
   mr_rework_auto_cap?: number | null;
   failure_reason: string | null;
-  /** Server-stamped stop signal (PRD #33, widened by #108 M5): "cancelled" or
-   *  "plan_rejected" (human), "auto_stopped" (server), null otherwise. isStoppedRun
-   *  reads this, not failure_reason — and treats only the two human kinds as calm. */
+  /** Server-stamped stop or scope disposition (see StopKind). isStoppedRun reads
+   *  status and this enum, not failure_reason: cancelled runs, including branch_moved,
+   *  render calmly; on failed runs only the human stop kinds do. */
   stop_kind: StopKind | null;
-  /** issue #525: the operator's OPTIONAL free-text cancel reason, stamped beside
-   *  stop_kind on the cancel paths. This DTO is owner/admin-scoped, so it rides
+  /** Optional operator cancel reason or server-composed stop diagnostics, stamped beside
+   *  stop_kind. This DTO is owner/admin-scoped, so it rides
    *  unconditionally (like failure_reason). Untrusted free text — via stripUnsafeChars. */
   stop_reason: string | null;
   /** Run-health flag (PRD #47). This owner-scoped DTO carries health_reason
@@ -3542,6 +3547,13 @@ export interface RunListItem extends Run {
 // It is always needs_landing <= failed and does NOT enter finished — the dashboard splits the
 // `failed` bar into "failed" and "failed, needs landing" whose widths sum to the same failed.
 export interface RunOutcomes {
+  /** Lifetime-only recency; null without a failure and in last_7_days. */
+  last_failed_at: string | null;
+  last_failed_run_id: string | null;
+  last_failed_origin: string | null;
+  /** Factory-only owner attribution. */
+  last_failed_user_id: string | null;
+  completed_since_last_failure: number | null;
   finished: number;
   completed: number;
   cancelled: number;
@@ -4737,6 +4749,8 @@ export interface RecoveryArchiveSummary {
 // checkpoint lives on origin: the branch checkpoint ref, or refs/uzi-recovery/<run id> once
 // superseded; all three are absent when the run has no live retention record.
 export interface RecoveryCustodyHold {
+  inventory_guarded: boolean;
+  final_receipt?: { kind: string; capture_id?: string; source_sha?: string; coverage_digest: string };
   terminal_record_rejection?: string;
   id: string;
   run_id: string;

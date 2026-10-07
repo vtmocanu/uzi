@@ -1,4 +1,11 @@
 {
+  "inventory_guarded": true,
+  "final_receipt": {
+    "kind": "x",
+    "capture_id": "x",
+    "source_sha": "x",
+    "coverage_digest": "x"
+  },
   "terminal_record_rejection": "x",
   "id": "x",
   "run_id": "x",

@@ -38,6 +38,17 @@ function git(cwd: string, args: string[]): string {
   return execFileSync("git", ["-C", cwd, ...args], { env: GIT_ENV, encoding: "utf8", stdio: "pipe" }).trim();
 }
 
+// #1924: fetchAgentBranch requires the trusted claim context; the harness claims run at generation 3.
+async function fetchBackOwed(clonePath: string, branch: string, runId: string): Promise<void> {
+  const bare = harnessGit.barePathFor(fx.originPath);
+  await harnessGit.fetchAgentBranch(bare, clonePath, branch, runId, {
+    context: {
+      runId, generation: 3, branch, kind: "issue", barePath: bare,
+      defaultIdentity: { ref: "refs/remotes/origin/main", sha: git(bare, ["rev-parse", "--verify", "refs/remotes/origin/main"]).trim() },
+    },
+  });
+}
+
 // ─── part 1: the capture over a real bare ──────────────────────────────────────────────────
 
 interface Topo {
@@ -659,7 +670,7 @@ describe("a run that fails quarantined archives its committed work and releases 
           fs.writeFileSync(path.join(ctx.worktreePath, "WORK.txt"), "committed work\n");
           execFileSync("git", ["-C", ctx.worktreePath, "add", "WORK.txt"], { env: GIT_ENV, stdio: "pipe" });
           execFileSync("git", ["-C", ctx.worktreePath, ...IDENT, "commit", "-m", "work"], { env: GIT_ENV, stdio: "pipe" });
-          await harnessGit.fetchAgentBranch(harnessGit.barePathFor(fx.originPath), ctx.worktreePath, ctx.branch, runId);
+          await fetchBackOwed(ctx.worktreePath, ctx.branch, runId);
           latchResidueQuarantine({ cause: `runner-uid pid 4242 "ssh-agent" could not be attributed (env/cwd unreadable)`, runId, site: "pre_clone" }, nullLogger());
           afterLatch.on = true;
           assertResidueQuarantineOpen("provider_turn"); // the boundary check at the loop top
@@ -775,7 +786,7 @@ describe("a run that fails quarantined archives its committed work and releases 
           fs.writeFileSync(path.join(ctx.worktreePath, "WORK.txt"), "committed work\n");
           execFileSync("git", ["-C", ctx.worktreePath, "add", "WORK.txt"], { env: GIT_ENV, stdio: "pipe" });
           execFileSync("git", ["-C", ctx.worktreePath, ...IDENT, "commit", "-m", "work"], { env: GIT_ENV, stdio: "pipe" });
-          await harnessGit.fetchAgentBranch(harnessGit.barePathFor(fx.originPath), ctx.worktreePath, ctx.branch, runId);
+          await fetchBackOwed(ctx.worktreePath, ctx.branch, runId);
           const bare = harnessGit.barePathFor(fx.originPath);
           git(bare, ["update-ref", `refs/uzi-recovery-pin/${runId}/3`, git(bare, ["rev-parse", `refs/uzi-runner/${ctx.branch}`])]);
           latchResidueQuarantine({ cause: `runner-uid pid 4242 "ssh-agent" could not be attributed (env/cwd unreadable)`, runId, site: "pre_clone" }, nullLogger());
@@ -904,7 +915,7 @@ describe("a run that fails quarantined archives its committed work and releases 
           fs.writeFileSync(path.join(ctx.worktreePath, "WORK.txt"), "committed work\n");
           execFileSync("git", ["-C", ctx.worktreePath, "add", "WORK.txt"], { env: GIT_ENV, stdio: "pipe" });
           execFileSync("git", ["-C", ctx.worktreePath, ...IDENT, "commit", "-m", "work"], { env: GIT_ENV, stdio: "pipe" });
-          await harnessGit.fetchAgentBranch(harnessGit.barePathFor(fx.originPath), ctx.worktreePath, ctx.branch, runId);
+          await fetchBackOwed(ctx.worktreePath, ctx.branch, runId);
           const bare = harnessGit.barePathFor(fx.originPath);
           git(bare, ["update-ref", `refs/uzi-recovery-pin/${runId}/3`, git(bare, ["rev-parse", `refs/uzi-runner/${ctx.branch}`])]);
           snap.before = retained(iid, runId);
@@ -1250,7 +1261,7 @@ describe("a run that fails quarantined archives its committed work and releases 
           fs.writeFileSync(path.join(ctx.worktreePath, "WORK.txt"), "w\n");
           execFileSync("git", ["-C", ctx.worktreePath, "add", "WORK.txt"], { env: GIT_ENV, stdio: "pipe" });
           execFileSync("git", ["-C", ctx.worktreePath, ...IDENT, "commit", "-m", "work"], { env: GIT_ENV, stdio: "pipe" });
-          await harnessGit.fetchAgentBranch(harnessGit.barePathFor(fx.originPath), ctx.worktreePath, ctx.branch, runId);
+          await fetchBackOwed(ctx.worktreePath, ctx.branch, runId);
           throw new RunResidueBlockedError("a clone survivor");
         },
       },

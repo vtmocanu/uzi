@@ -56,7 +56,7 @@ function stubPublish(httpStatus?: number): string[] {
 function failFetchBackAfter(ok: number, opts: { objectsLand?: boolean } = {}): void {
   const real = git.fetchAgentBranch.bind(git);
   let calls = 0;
-  git.fetchAgentBranch = async (...args: Parameters<typeof real>) => {
+  git.fetchAgentBranch = (async (...args: Parameters<typeof real>) => {
     calls += 1;
     if (calls > ok) {
       if (opts.objectsLand) {
@@ -70,7 +70,7 @@ function failFetchBackAfter(ok: number, opts: { objectsLand?: boolean } = {}): v
       throw new Error("fatal: unable to write loose object file: No space left on device");
     }
     return await real(...args);
-  };
+  }) as typeof git.fetchAgentBranch;
 }
 
 /** Commit milestone 1, fetch it back to the tracking ref (the mid-run checkpoint's job), commit

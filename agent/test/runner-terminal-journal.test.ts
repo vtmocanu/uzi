@@ -90,6 +90,7 @@ function minimalFailFlight(opts: {
     // issue #1783: the pre-settle reap now proves quiescence inside the flight's sink gate (a real
     // RunFlight always carries one). No clone path here, so the proof is just the killAgentTree reap.
     sinkGate: new SinkGate(),
+    prepareTerminalInventory: async () => {},
     terminalResolved: false,
     permanentFailureReap: undefined as boolean | undefined,
     permanentFailureReapSafety: undefined as unknown,

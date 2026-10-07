@@ -44,6 +44,7 @@ import { SummarySettingsCard } from "./adminSettings/SummarySettingsCard";
 import { AgentSourceSettingsCard } from "./adminSettings/AgentSourceSettingsCard";
 import { HealthSettingsCard } from "./adminSettings/HealthSettingsCard";
 import { DockerAllowlistCard } from "./adminSettings/DockerAllowlistCard";
+import { TrustedReviewBotsCard } from "./adminSettings/TrustedReviewBotsCard";
 import { CapabilitySchedulingCard } from "./adminSettings/CapabilitySchedulingCard";
 import { CompletionInterlockCard } from "./adminSettings/CompletionInterlockCard";
 import { GithubProjectSyncCard } from "./adminSettings/GithubProjectSyncCard";
@@ -271,6 +272,7 @@ export function AdminSettings() {
           { id: "slack", label: "Slack" },
           { id: "run-health", label: "Run health" },
           { id: "docker-allowlist", label: "Docker workers" },
+          { id: "review-bots", label: "Review bots" },
           { id: "ephemeral-workers", label: "Ephemeral workers" },
           { id: "capability-scheduling", label: "Capability scheduling" },
           { id: "completion-interlock", label: "Completion check" },
@@ -499,6 +501,12 @@ export function AdminSettings() {
       {!loading && saved && (
         <section id="docker-allowlist" className="scroll-mt-6">
           <DockerAllowlistCard settings={saved} sources={sources} onSaved={applyResponse} />
+        </section>
+      )}
+
+      {!loading && saved && (
+        <section id="review-bots" className="scroll-mt-6">
+          <TrustedReviewBotsCard settings={saved} sources={sources} onSaved={applyResponse} />
         </section>
       )}
 

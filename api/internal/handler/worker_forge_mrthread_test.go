@@ -98,7 +98,7 @@ func mrThreadIID() *int64 { v := int64(mrThreadMRIID); return &v }
 // runs.review_comments.
 func snapshotJSON(t *testing.T, comments ...workersvc.ReviewCommentSnapshot) []byte {
 	t.Helper()
-	b, err := json.Marshal(workersvc.ReviewCommentsSnapshot{Comments: comments})
+	b, err := json.Marshal(workersvc.ReviewCommentsSnapshot{Version: workersvc.ReviewSnapshotVersion, Comments: comments})
 	if err != nil {
 		t.Fatalf("marshal snapshot: %v", err)
 	}

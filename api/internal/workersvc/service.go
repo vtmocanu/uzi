@@ -475,6 +475,10 @@ type Store interface {
 	// spending an automatic cycle; UserHasEnabledAnthropicToken is the door-check that the
 	// owner can pay for the run the endpoint would mint.
 	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.MrReworkLedger, error)
+	RemoveMRReworkPendingIDs(ctx context.Context, arg store.RemoveMRReworkPendingIDsParams) error
+	// UpsertMRReworkLedger records an automatic cycle (issue #2347): the watcher's create runs
+	// it in the same transaction as the run INSERT (CreateAutoMRReworkRunAndAdvance).
+	UpsertMRReworkLedger(ctx context.Context, arg store.UpsertMRReworkLedgerParams) error
 	// CreateManualMRReworkRunAndAdvance folds the on-demand run INSERT and the non-counting
 	// high-water advance into ONE atomic statement (PRD #1202, review-finding hardening):
 	// Postgres commits BOTH or NEITHER, so a create can never leave an unadvanced ledger that
@@ -603,6 +607,7 @@ type Store interface {
 	// call (checkpoint_publish_attempts, 00267), and the sweeper's attempts arm that reconciles a
 	// push whose outcome the api never learned.
 	RecordCheckpointPublishAttempt(ctx context.Context, arg store.RecordCheckpointPublishAttemptParams) (uuid.UUID, error)
+	MarkCheckpointPublishAttemptReady(ctx context.Context, id uuid.UUID) (int64, error)
 	DeleteCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (int64, error)
 	GetCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (store.CheckpointPublishAttempt, error)
 	RunHasCheckpointPublishAttempt(ctx context.Context, arg store.RunHasCheckpointPublishAttemptParams) (bool, error)
@@ -958,9 +963,9 @@ type Store interface {
 	// converging with CancelRunServerSide — rather than being mis-classified as
 	// agent_failure. Worker-scoped because SetState holds a worker, not a user.
 	CancelRunByWorker(ctx context.Context, arg store.CancelRunByWorkerParams) (int64, error)
-	// SupersedeRunByWorker (issue #1117) is the live-worker terminal transition for an
-	// mr_rework run whose finalize push lost to a concurrent same-branch writer: status
-	// 'cancelled', stop_kind='branch_moved', fail_origin NULL, a static stop_reason. Like
+	// SupersedeRunByWorker is the live-worker terminal transition for an mr_rework or
+	// ci_fix run superseded by a concurrent branch advance: status 'cancelled',
+	// stop_kind='branch_moved', NULL failure fields, a server-composed stop_reason. Like
 	// CancelRunByWorker it is worker-scoped and a 0-row no-op onto an already-terminal run.
 	SupersedeRunByWorker(ctx context.Context, arg store.SupersedeRunByWorkerParams) (int64, error)
 	RejectRunServerSide(ctx context.Context, arg store.RejectRunServerSideParams) (int64, error)
@@ -3049,15 +3054,16 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 		// PRD #1296 M1 (D2/D3/D4): the durable-recovery claim/custody contract.
 		//   - CustodyHoldLimit gates admission: a claim is blocked once the owner holds
 		//     >= this many unresolved (open) custody holds (owner-scoped, never global).
-		//   - RecoveryCapable derives from the worker's advertised recovery_archive_v1
-		//     protocol capability (D9 additive versioned contract): the custody hold is
+		//   - RecoveryCapable derives from the worker's advertised recovery_archive_v1,
+		//     recovery_archive_v2 or recovery_inventory_v1 protocol capability (D9 additive
+		//     versioned contract; any one of the three suffices): the custody hold is
 		//     opened in the claim CTE only for a capable worker on a code-publishing
 		//     profile, so an old worker on a supporting API is honestly unsupported rather
 		//     than falsely promised recovery.
 		//   - WorkerIdentity is the immutable provenance value recorded on the hold for a
 		//     later AAD-authenticated post-terminal recovery retry (never nulled).
 		CustodyHoldLimit: custodyHoldLimit,
-		RecoveryCapable:  slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV1),
+		RecoveryCapable:  (slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV1) || slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV2) || slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryInventoryV1)),
 		WorkerIdentity:   workerIdentity(wkr),
 		// PRD #1390 M3: the three snapshot-dedupe params. @snapshot_fresh_cutoff bounds the
 		// persisted-snapshot freshness test; the request arrays are the claimant's own listed runs
@@ -3272,13 +3278,13 @@ var errRunVanished = errors.New("run vanished before claim assembly")
 // no secret bytes.
 var errCustomModelCapabilityMissing = errors.New("worker lacks codex_custom_model_v1 for a custom Codex root model")
 
-// errGuardrailBlockedClaim marks a claim the #66 default-branch guardrail refused
-// AT CLAIM (D1 layer 3, the security net): the bot can reach the repo's default
-// branch, or that could not be verified (fail-closed). finishRunClaim treats
-// it as TERMINAL (like errCredentialUnavailable, not the transient errVaultLocked
-// requeue), so the run is failed rather than pushing. Its message is safe to store
-// as a run failure reason — it carries only the block finding messages, never any
-// secret bytes.
+// errGuardrailBlockedClaim marks a claim refused AT CLAIM for a terminal, run-level reason:
+// the #66 default-branch guardrail (D1 layer 3, the security net) found the bot can reach the
+// repo's default branch or could not verify it (fail-closed), or a legacy mr_rework run
+// (legacyReviewClaimError, issue #2347) cannot resume. finishRunClaim treats it as TERMINAL
+// (like errCredentialUnavailable, not the transient errVaultLocked requeue), so the run is
+// failed rather than pushing. Its message is safe to store as a run failure reason: it carries
+// only the block finding messages or the legacy refusal text, never any secret bytes.
 var errGuardrailBlockedClaim = errors.New("run refused by the default-branch guardrail at claim")
 
 // errVaultLocked marks a claim that cannot open the owner's DEK-sealed Anthropic
@@ -3542,6 +3548,22 @@ const (
 // and the worker's batcher retries a failed batch at head forever (poison loop).
 const maxCostUSD = 999999.999999
 
+// Anchored canonical diagnostics accept one cause and exactly one lowercase SHA-1.
+// Length checking bounds parsing even for hostile worker prose.
+var branchMovedDiagnostic = regexp.MustCompile(`\Abranch_moved: (remote_branch_advanced); superseding_tip=([0-9a-f]{40})\z`)
+
+func branchMovedStopReason(reason *string) string {
+	const generic = "superseded by a concurrent branch advance; further publication stopped."
+	if reason == nil || len(*reason) != len("branch_moved: remote_branch_advanced; superseding_tip=")+40 {
+		return generic
+	}
+	match := branchMovedDiagnostic.FindStringSubmatch(*reason)
+	if match == nil {
+		return generic
+	}
+	return generic + " cause=" + match[1] + "; superseding_tip=" + match[2]
+}
+
 // StateRequest is the worker's report of a run's new state. Only the fields
 // relevant to State are read. The wire key is `status` (matches the runs.status
 // column and the M2 worker client); the Go field stays
@@ -3644,12 +3666,9 @@ type StateRequest struct {
 	// normal completion stay byte-identical on the wire. httpx.DecodeJSON rejects unknown
 	// fields, so this field MUST exist here or a new worker's report 400s.
 	ScopeCapped *bool `json:"scope_capped"`
-	// BranchMoved (issue #1117) is the worker's DECLARATION, on an mr_rework `failed` report,
-	// that the finalize push was rejected non-fast-forward because a concurrent same-branch
-	// writer advanced the MR branch. UNTRUSTED like ScopeCapped: the server honors it ONLY when
-	// the run's own kind is mr_rework (owned.Kind == runkind.MRRework), routing to a
-	// 'cancelled'/'branch_moved' disposition instead of defaulting to 'agent_failure'. Absent/
-	// false on every other report ⇒ byte-identical to before.
+	// BranchMoved declares a concurrent branch advance on a failed report. The server
+	// honors it only for its own mr_rework or ci_fix run kind. FailureReason diagnostics
+	// alone grant no supersession; absent/false retains the ordinary failure path.
 	BranchMoved *bool `json:"branch_moved"`
 	// RepoAgents is the roster the worker parsed from the clone's .claude/agents/
 	// (PRD #37), reported on the first `running` report after checkout. A POINTER to
@@ -4698,15 +4717,10 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				// preserved.
 				ClaimGeneration: pgtype.Int8{},
 			})
-		case req.BranchMoved != nil && *req.BranchMoved && owned.Kind == runkind.MRRework:
-			// Issue #1117: an mr_rework finalize push rejected non-fast-forward because a concurrent
-			// same-branch writer advanced the MR branch is a benign, expected race (the "double-fix
-			// collision" the uzi-watcher warns about), NOT an agent failure. Route to a distinct
-			// 'cancelled'/stop_kind='branch_moved' disposition (fail_origin NULL, not judged — Gate 0)
-			// rather than the agent_failure default. GUARDED on the run's own kind (a server-known fact,
-			// like ScopeCapped's scope_ceiling guard) so an untrusted worker cannot mint the benign
-			// disposition on any other kind. Placed after the operator-stop arms so a concurrent operator
-			// cancel/stop (which pre-stamped owned.StopKind) still wins.
+		case req.BranchMoved != nil && *req.BranchMoved && (owned.Kind == runkind.MRRework || owned.Kind == runkind.CIFix):
+			// The server-owned kind allowlist limits supersession to branch-maintenance runs.
+			// Operator stop arms above retain priority. Diagnostics only decorate this
+			// explicit signal; they cannot prove supersession or whether a push applied.
 			//
 			// PRD #1247 fix round: use the TX-bound q (not s.q). This arm runs under the outer
 			// FOR UPDATE fence (q rebound to qtx), which holds a row lock on runID; issuing the
@@ -4714,7 +4728,8 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// the context deadline, hanging every capability-worker mr_rework branch_moved report.
 			// Every sibling arm uses q for exactly this reason.
 			rows, err = q.SupersedeRunByWorker(ctx, store.SupersedeRunByWorkerParams{
-				ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+				StopReason: branchMovedStopReason(req.FailureReason),
+				ID:         runID, WorkerID: pgconv.UUID(wkr.ID),
 			})
 		default:
 			// PRD #69 M7a: stamp the TRUSTED failure class. The worker-reported origin is
@@ -6901,8 +6916,9 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			// (D9), or when no forge builder is wired (tests).
 			IssueComments: issueCommentsJSON,
 			// PRD #700 M2: issue runs never carry MR review comments — always NULL here.
-			// The mr_rework create path (M3's CreateAutoMRReworkRun) fetches the MR review
-			// snapshot via fetchReviewCommentsSnapshot and populates this itself.
+			// The mr_rework create paths (CreateAutoMRReworkRun, CreateManualMRReworkRun) take
+			// the author-assessed MR review snapshot from their callers and populate this
+			// themselves.
 			ReviewComments: nil,
 			// issue #857 M2: the provenance stamp threaded from each public entrypoint
 			// ("manual"/"schedule"/"autopilot"), so a run records why it fired.

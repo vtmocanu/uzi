@@ -208,11 +208,12 @@ func retentionArmOrder(cursor uint32, n int) []int {
 // earlier in the same pass: each settles what it moves to settling itself, and what one leaves
 // for another is due on a later pass anyway.
 //
-//  2. attempts: an outstanding checkpoint push of a terminal run (checkpoint_publish_attempts,
-//     written before the push and never accounted for) is compared with origin's branch ref; a
-//     ref at the attempted tip is re-recorded on the run's record (compare-and-set on what was
-//     read before the list), or CAS-deleted at that tip when the run's slot was handed on and no
-//     custody hold of the run is open (reconcilePublishAttempts, #1810 residual 2);
+//  2. attempts: an outstanding terminal push or ready live push (checkpoint_publish_attempts,
+//     written before the push and awaiting confirmation) is compared with origin's branch ref.
+//     A ready live attempt only confirms the run's tip, with no retention or forge mutation.
+//     A terminal attempt can re-record the run's retention record (compare-and-set on what was
+//     read before the list), or CAS-delete an untracked ref when its slot was handed on and no
+//     custody hold is open (reconcilePublishAttempts, #1810 residual 2 and #2395);
 //  3. work: a due `settling` record retries its CAS delete; a due `superseding` record is
 //     re-driven, or, when its supersession stopped (last_error set) and no hold is open, exited;
 //  4. unheld: a `retained`/`superseded` record whose run has no open hold moves to settling and

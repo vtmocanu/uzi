@@ -504,13 +504,27 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 
 	// PRD #700 M2: replay the structured MR review-comments snapshot captured at
 	// mr_rework run creation. A malformed column degrades to nil-and-log rather than
-	// failing the claim, exactly like the issue-comments decode above.
+	// failing the claim, exactly like the issue-comments decode above. Only a current-version
+	// (author-assessed) snapshot is replayed with its comments.
 	var reviewComments *ReviewCommentsSnapshot
 	if len(run.ReviewComments) > 0 {
 		var snap ReviewCommentsSnapshot
 		if err := json.Unmarshal(run.ReviewComments, &snap); err != nil {
 			slog.Error("workersvc: decode run review comments", "run_id", run.ID, "error", err)
+		} else if snap.Version != ReviewSnapshotVersion {
+			// Issue #2347: a snapshot captured before author eligibility reached this lane was
+			// never assessed, so its bodies are not replayed. Version 0 tells the agent a
+			// legacy snapshot was withheld rather than that the MR had no comments. A run that
+			// already carries a transcript or a stored plan was written after reading those
+			// unvetted bodies, and an auto-approved resume would reuse them, so it fails closed.
+			if strings.TrimSpace(run.SessionID.String) != "" || strings.TrimSpace(run.PlanMd.String) != "" {
+				return nil, legacyReviewClaimError{targetRunID: run.TargetRunID}
+			}
+			reviewComments = &ReviewCommentsSnapshot{Comments: []ReviewCommentSnapshot{}}
 		} else {
+			if snap.Comments == nil {
+				snap.Comments = []ReviewCommentSnapshot{} // a stored "comments":null replays as an array
+			}
 			reviewComments = &snap
 		}
 	}
@@ -620,7 +634,12 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		}
 	}
 
+	inventoryGuarded, err := s.RunInventoryGuard(ctx, wkr, run.ID, run.ClaimGeneration)
+	if err != nil {
+		return nil, err
+	}
 	payload := &ClaimPayload{
+		InventoryGuarded: inventoryGuarded,
 		RunID:            run.ID.String(),
 		Kind:             run.Kind,
 		IssueIID:         issueIID,
@@ -1141,3 +1160,20 @@ func decodePackageList(raw []byte) []string {
 	}
 	return out
 }
+
+// legacyReviewClaimError refuses a claim for an mr_rework run whose review_comments snapshot
+// predates author assessment and which already carries reusable context (a session or a plan).
+// Unwrap yields errGuardrailBlockedClaim so claimAssemblyOrigin fails the run terminally; the
+// message is its own nonsecret text.
+type legacyReviewClaimError struct{ targetRunID pgtype.UUID }
+
+func (e legacyReviewClaimError) Error() string {
+	msg := "this MR rework was created before review-comment authors were verified and has already run, " +
+		"so it cannot resume; start a new rework with Rework now on the source run's page"
+	if e.targetRunID.Valid {
+		msg += " (run " + uuid.UUID(e.targetRunID.Bytes).String() + ")"
+	}
+	return msg
+}
+
+func (e legacyReviewClaimError) Unwrap() error { return errGuardrailBlockedClaim }

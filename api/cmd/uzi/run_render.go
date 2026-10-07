@@ -184,9 +184,9 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if r.StopKind != nil && *r.StopKind != "" {
 		rows = append(rows, []string{"STOP_KIND", sanitizeTTY(*r.StopKind)})
 	}
-	// STOP_REASON is the operator's OPTIONAL free-text cancel reason (issue #525),
-	// captured beside stop_kind on the cancel paths. Unlike the STOP_KIND enum it is
-	// free text, so it goes through sanitizeTTY like FAILURE_REASON above; emitted only
+	// STOP_REASON carries an optional operator reason or server-composed branch
+	// supersession diagnostics. Treat the text as untrusted and sanitizeTTY like
+	// FAILURE_REASON above; emitted only
 	// when set, so a non-stopped run (or a stop with no reason given) carries no blank row.
 	if r.StopReason != nil && *r.StopReason != "" {
 		rows = append(rows, []string{"STOP_REASON", sanitizeTTY(*r.StopReason)})
