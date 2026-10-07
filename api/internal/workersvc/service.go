@@ -3019,8 +3019,9 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 		// PRD #1296 M1 (D2/D3/D4): the durable-recovery claim/custody contract.
 		//   - CustodyHoldLimit gates admission: a claim is blocked once the owner holds
 		//     >= this many unresolved (open) custody holds (owner-scoped, never global).
-		//   - RecoveryCapable derives from the worker's advertised recovery_archive_v1
-		//     protocol capability (D9 additive versioned contract): the custody hold is
+		//   - RecoveryCapable derives from the worker's advertised recovery_archive_v1,
+		//     recovery_archive_v2 or recovery_inventory_v1 protocol capability (D9 additive
+		//     versioned contract; any one of the three suffices): the custody hold is
 		//     opened in the claim CTE only for a capable worker on a code-publishing
 		//     profile, so an old worker on a supporting API is honestly unsupported rather
 		//     than falsely promised recovery.

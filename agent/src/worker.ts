@@ -503,8 +503,8 @@ export class Worker {
         // recovery_archive_v1 — the flag M1's ClaimRun reads to open a custody hold for
         // this worker on a code-publishing run — AND the PRD #1349 generation-exact
         // extension recovery_archive_v2, advertised ALONGSIDE v1 during rollout (v2 is a
-        // strict superset; the server's RecoveryCapable gate stays keyed on v1 until a
-        // later milestone flips it, so advertising both is safe). Kept SEPARATE from
+        // strict superset; the server's RecoveryCapable gate accepts any of v1, v2 and
+        // recovery_inventory_v1, so advertising several is safe). Kept SEPARATE from
         // `capabilities` (the scheduler vocabulary) on the wire: the server stores it in
         // workers.protocol_capabilities and the ClaimRun hard clause reads it there,
         // OUTSIDE required_capabilities and the capability_aware kill-switch, so an old
