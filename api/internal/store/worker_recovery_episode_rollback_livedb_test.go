@@ -16,7 +16,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Replay the actual 00308 Down/Up over production exhaustion holds. All fixture
+// Replay the actual 00309 Down/Up over production exhaustion holds. All fixture
 // writes and schema changes share one rollback-only transaction, including when
 // Down aborts while validating runs_recovery_wait_cause_check.
 func TestWorkerRecoveryEpisodeRollbackLiveDB(t *testing.T) {
@@ -190,9 +190,9 @@ func TestWorkerRecoveryEpisodeRollbackLiveDB(t *testing.T) {
 		held: snapshot(attemptsRow, held), noHold: snapshot(attemptsRow, noHold),
 	}
 
-	for _, stmt := range migrationDownStatements(t, "00308_worker_recovery_episode.sql") {
+	for _, stmt := range migrationDownStatements(t, "00309_worker_recovery_episode.sql") {
 		if _, err := tx.Exec(ctx, stmt); err != nil {
-			t.Fatalf("DownMustTerminalizeExhaustedRecoveryHoldsBeforeNarrowingCauseCheck: actual 00308 Down rejected a production held row: %v", err)
+			t.Fatalf("DownMustTerminalizeExhaustedRecoveryHoldsBeforeNarrowingCauseCheck: actual 00309 Down rejected a production held row: %v", err)
 		}
 	}
 	assertSQL("DownMustDropEpisodeColumns", `SELECT count(*)=0 FROM information_schema.columns
@@ -263,7 +263,7 @@ func TestWorkerRecoveryEpisodeRollbackLiveDB(t *testing.T) {
 	for _, id := range all {
 		afterDown[id] = snapshot(survivingRow, id)
 	}
-	for _, stmt := range migrationUpStatements(t, "00308_worker_recovery_episode.sql") {
+	for _, stmt := range migrationUpStatements(t, "00309_worker_recovery_episode.sql") {
 		exec(stmt)
 	}
 	for _, id := range all {

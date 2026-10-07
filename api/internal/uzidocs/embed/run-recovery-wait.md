@@ -419,7 +419,7 @@ their configured cap, and owner Resume cannot renew that marker. See [Configurat
 
 ### Deliberate schema downgrade
 
-Before executing migration `00308` Down, stop or replace the newer application:
+Before executing migration `00309` Down, stop or replace the newer application:
 its queries require columns that Down drops. The table alterations and constraint
 validation can lock and scan `runs`; plan maintenance around those operations.
 
