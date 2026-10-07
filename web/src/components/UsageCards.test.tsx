@@ -1,12 +1,13 @@
 // @vitest-environment jsdom
-import { afterEach, describe, it, expect } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { act, cleanup, render } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { YourUsageCard, FactoryTotalCard, PerUserUsageTable } from "./UsageCards";
 import type { SelfUsage, AdminUsage, RunOutcomes } from "../lib/api";
 import type { ReactNode } from "react";
+import { setDemoMode } from "../lib/demoMode";
 
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.useRealTimers(); setDemoMode(false); });
 
 const bundle = (inp: number, cr: number, out: number, cost: number) => ({
   input_tokens: inp,
@@ -263,8 +264,8 @@ describe("FailedRunsBlock (PRD #1293)", () => {
       expect(cells[2].textContent).toBe("3");
       expect(cells[3].textContent).toBe("30.0%");
       expect(cells[3].getAttribute("title")).toBe("3 of 10 finished runs");
-      expect(cells[4].textContent).toBe("1.0k");
-      expect(cells[6].textContent).toBe("$1.25");
+      expect(cells[5].textContent).toBe("1.0k");
+      expect(cells[7].textContent).toBe("$1.25");
     }
     expect(container.querySelectorAll("tbody tr").length).toBe(2);
   });
@@ -399,10 +400,10 @@ describe("PerUserUsageTable failed columns (PRD #1293)", () => {
     earliest_run: null,
   };
 
-  it("orders the header exactly User · Runs · Failed · Fail rate · Tokens · Out · Cost · Share (D8)", () => {
+  it("orders the header exactly User · Runs · Failed · Fail rate · Since last failure · Tokens · Out · Cost · Share (D8)", () => {
     const { container } = wrap(<PerUserUsageTable admin={adminRich} />);
     const headers = Array.from(container.querySelectorAll("thead th")).map((th) => th.textContent);
-    expect(headers).toEqual(["User", "Runs", "Failed", "Fail rate", "Tokens", "Out", "Cost", "Share"]);
+    expect(headers).toEqual(["User", "Runs", "Failed", "Fail rate", "Since last failure", "Tokens", "Out", "Cost", "Share"]);
   });
 
   it("puts the exact fraction on every fail-rate cell's title (D9)", () => {
@@ -500,5 +501,58 @@ describe("FactoryTotalCard + PerUserUsageTable cost disclosure (PRD #1429 D7)", 
     // ...and the total row discloses the factory-wide sum (3 subscription + 1 unreported),
     // not just this one row's count.
     expect(container.textContent).toContain("Cost excludes 3 Codex subscription runs and 1 unreported run");
+  });
+});
+
+describe("failure recency cards and table (#2399)", () => {
+  const usage = (lifetime: RunOutcomes): SelfUsage => ({
+    lifetime: bundle(0, 0, 0, 0), last_7_days: bundle(0, 0, 0, 0), run_count: 0,
+    ...noAggregateCostCounts, outcomes: { lifetime, last_7_days: outcomes(0, 0, 0, 0, 0) },
+  });
+  const failed = (): RunOutcomes => ({
+    ...outcomes(20, 19, 0, 0, 1, { worker_lost: 1 }),
+    last_failed_at: new Date(Date.now() - 6 * 3_600_000).toISOString(),
+    last_failed_run_id: "7c41a2e0-0000-4000-8000-000000000001",
+    last_failed_origin: "worker_lost", completed_since_last_failure: 14,
+  });
+  it("shows recency and a reachable run link even without token usage", () => {
+    const { getByText, getByRole } = wrap(<YourUsageCard usage={usage(failed())} />);
+    expect(getByText("6h")).toBeTruthy();
+    expect(getByText("14 completed since")).toBeTruthy();
+    expect(getByText(/last: worker lost/)).toBeTruthy();
+    expect(getByRole("link", { name: /run 7c41a2e0/ }).getAttribute("href")).toBe("/runs/7c41a2e0-0000-4000-8000-000000000001");
+  });
+  it("distinguishes no finished runs from completed runs without failures", () => {
+    const { getByText, rerender } = wrap(<YourUsageCard usage={usage(outcomes(0, 0, 0, 0, 0))} />);
+    expect(getByText("No finished runs yet")).toBeTruthy();
+    rerender(<MemoryRouter><YourUsageCard usage={usage(outcomes(4, 3, 1, 0, 0))} /></MemoryRouter>);
+    expect(getByText("No recorded failures · 3 completed runs, none failed")).toBeTruthy();
+  });
+  it("advances elapsed time between API refreshes", async () => {
+    vi.useFakeTimers();
+    const row = { ...failed(), last_failed_at: new Date(Date.now() - 59_000).toISOString() };
+    const { getByText } = wrap(<YourUsageCard usage={usage(row)} />);
+    expect(getByText("<1m")).toBeTruthy();
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(getByText("1m")).toBeTruthy();
+  });
+  it("attributes the factory failure and renders all per-user states plus factory total", () => {
+    const row = failed();
+    const admin: AdminUsage = {
+      factory: usage({ ...row, last_failed_user_id: "owner" }), earliest_run: null,
+      users: [
+        { user_id: "owner", email: "owner@example.com", usage: bundle(0, 0, 0, 0), run_count: 0, ...noUserCostCounts, outcomes: row },
+        { user_id: "clean", email: "clean@example.com", usage: bundle(0, 0, 0, 0), run_count: 0, ...noUserCostCounts, outcomes: outcomes(3, 3, 0, 0, 0) },
+        { user_id: "empty", email: "empty@example.com", usage: bundle(0, 0, 0, 0), run_count: 0, ...noUserCostCounts, outcomes: outcomes(0, 0, 0, 0, 0) },
+      ],
+    };
+    const { container, getByText } = wrap(<><FactoryTotalCard admin={admin} /><PerUserUsageTable admin={admin} /></>);
+    expect(getByText("· owner@example.com")).toBeTruthy();
+    expect(getByText("Since last failure")).toBeTruthy();
+    const rows = container.querySelectorAll("tbody tr");
+    expect(Array.from(rows).map((r) => r.querySelectorAll("td")[4].textContent)).toEqual(["6h", "no failures", "–", "6h"]);
+    act(() => { setDemoMode(true); });
+    expect(getByText("· User")).toBeTruthy();
+    expect(container.textContent).not.toContain("owner@example.com");
   });
 });

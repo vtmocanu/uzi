@@ -1,4 +1,7 @@
 import type { ReactNode } from "react";
+import { Link } from "react-router-dom";
+import { failureRecency } from "../lib/failureRecency";
+import { useNow } from "../lib/useNow";
 import type { SelfUsage, AdminUsage, RunUsage, RunOutcomes } from "../lib/api";
 import { formatTokens, formatCost } from "../lib/formatTokens";
 import { failOriginLabel } from "../lib/failOriginLabel";
@@ -186,6 +189,39 @@ function FailedRunsBlock({ lifetime, last7 }: { lifetime: RunOutcomes; last7: Ru
   );
 }
 
+function SinceLastFailedRun({ outcomes, owner }: { outcomes: RunOutcomes; owner?: string }) {
+  const now = useNow(30_000);
+  const value = failureRecency(outcomes, now);
+  const hasFailure = outcomes.last_failed_at != null && value !== "Unavailable";
+  return (
+    <div className="mt-3 border-t border-edge pt-3">
+      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+        <SectionTitle>Since last failed run</SectionTitle>
+        {hasFailure ? (
+          <span className="font-mono text-[22px] font-semibold tabular-nums tracking-tight text-fg">{value}</span>
+        ) : (
+          <span className="text-xs text-muted">
+            {value === "Unavailable" ? "Unavailable" : outcomes.finished === 0 ? "No finished runs yet" :
+              `No recorded failures · ${outcomes.completed} completed runs, none failed`}
+          </span>
+        )}
+      </div>
+      {hasFailure && (
+        <p className="mt-1 flex flex-wrap items-baseline gap-x-1 text-xs text-muted">
+          <span>{outcomes.completed_since_last_failure ?? 0} completed since</span>
+          <span>· last: {failOriginLabel(outcomes.last_failed_origin ?? "unknown")}</span>
+          {owner && <span>· {owner}</span>}
+          {outcomes.last_failed_run_id && (
+            <Link className="text-brand hover:underline" to={`/runs/${outcomes.last_failed_run_id}`}>
+              · run {outcomes.last_failed_run_id.slice(0, 8)} →
+            </Link>
+          )}
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function YourUsageCard({ usage }: { usage: SelfUsage }) {
   const life = breakdown(usage.lifetime);
   const last7 = breakdown(usage.last_7_days);
@@ -211,11 +247,15 @@ export function YourUsageCard({ usage }: { usage: SelfUsage }) {
         </>
       )}
       <FailedRunsBlock lifetime={usage.outcomes.lifetime} last7={usage.outcomes.last_7_days} />
+      <SinceLastFailedRun outcomes={usage.outcomes.lifetime} />
     </Card>
   );
 }
 
 export function FactoryTotalCard({ admin }: { admin: AdminUsage }) {
+  const demo = useDemoMode();
+  const failureOwner = admin.users.find((u) => u.user_id === admin.factory.outcomes.lifetime.last_failed_user_id);
+  const owner = failureOwner ? maskEmail(failureOwner.email, demo) : undefined;
   const f = breakdown(admin.factory.lifetime);
   const disclosure = aggregateDisclosure(
     admin.factory.lifetime_subscription_run_count,
@@ -238,6 +278,7 @@ export function FactoryTotalCard({ admin }: { admin: AdminUsage }) {
         </>
       )}
       <FailedRunsBlock lifetime={admin.factory.outcomes.lifetime} last7={admin.factory.outcomes.last_7_days} />
+      <SinceLastFailedRun outcomes={admin.factory.outcomes.lifetime} owner={owner} />
     </Card>
   );
 }
@@ -280,6 +321,7 @@ function Td({
 }
 
 export function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
+  const now = useNow(30_000);
   const demo = useDemoMode();
   const factory = breakdown(admin.factory.lifetime);
   const rows = admin.users.map((u) => ({ ...u, b: breakdown(u.usage) }));
@@ -304,6 +346,7 @@ export function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
                 <Th>Runs</Th>
                 <Th>Failed</Th>
                 <Th>Fail rate</Th>
+                <Th>Since last failure</Th>
                 <Th>Tokens</Th>
                 <Th>Out</Th>
                 <Th>Cost</Th>
@@ -327,6 +370,7 @@ export function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
                     <Td title={`${u.outcomes.failed} of ${u.outcomes.finished} finished runs`}>
                       {failRate(u.outcomes)}
                     </Td>
+                    <Td>{failureRecency(u.outcomes, now)}</Td>
                     <Td>{formatTokens(u.b.total)}</Td>
                     <Td>{formatTokens(u.b.out)}</Td>
                     <Td cost>
@@ -360,6 +404,7 @@ export function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
                 >
                   {failRate(admin.factory.outcomes.lifetime)}
                 </Td>
+                <Td total>{failureRecency(admin.factory.outcomes.lifetime, now)}</Td>
                 <Td total>{formatTokens(factory.total)}</Td>
                 <Td total>{formatTokens(factory.out)}</Td>
                 <Td total cost>

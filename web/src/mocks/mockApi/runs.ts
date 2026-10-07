@@ -33,6 +33,25 @@ import { delay, mockScenario, requireSession } from "./shared";
 import { LEAD_NAME_RE, templates } from "./agents";
 import { visibleCodexAccounts, visibleTokenMeters } from "./secrets";
 
+// Fixed at module load so refreshing usage does not reset the demo's elapsed clock.
+const recencyDemoNow = Date.now();
+function demoFailureRecency(hours: number, origin: string, completed: number) {
+  return {
+    last_failed_at: new Date(recencyDemoNow - hours * 3_600_000).toISOString(),
+    last_failed_run_id: null,
+    last_failed_origin: origin,
+    last_failed_user_id: null,
+    completed_since_last_failure: completed,
+  };
+}
+
+const demoLinkedFailure = {
+  ...demoFailureRecency(13.2, "workflow_scope_missing", 14),
+  // Match the existing drill-in fixture's actual end time and failure reason.
+  last_failed_at: getRun("run-workflow-scope")?.finished_at ?? new Date(recencyDemoNow - 13.2 * 3_600_000).toISOString(),
+  last_failed_run_id: "run-workflow-scope",
+};
+
 function listRunsFor(): Run[] {
   return [...state.runs.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
 }
@@ -480,7 +499,7 @@ export const runsApi = {
       outcomes: {
         lifetime: {
           finished: 30, completed: 22, cancelled: 2, plan_rejected: 1, failed: 5, needs_landing: 2,
-          last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: { agent_failure: 1, run_timeout: 1, workflow_scope_missing: 1, push_secret_blocked: 1, unknown: 1 },
+          ...demoLinkedFailure, fail_origins: { agent_failure: 1, run_timeout: 1, workflow_scope_missing: 1, push_secret_blocked: 1, unknown: 1 },
         },
         last_7_days: {
           finished: 8, completed: 6, cancelled: 1, plan_rejected: 0, failed: 1, needs_landing: 0,
@@ -499,12 +518,12 @@ export const runsApi = {
         last_7_days: { input_tokens: 900_000, cache_read_tokens: 9_100_000, cache_creation_tokens: 120_000, output_tokens: 410_000, cost_usd: 14.9, cost_status: "" as const },
         run_count: 79,
         // Factory lifetime outcomes are the sum of the four per-user rows below (finished 38 +
-        // 30 + 21 + 8 = 97, failed 5 + 5 + 2 + 1 = 13, needs_landing 1 + 2 + 0 + 0 = 3); the
+        // 30 + 21 + 8 = 97, failed 5 + 5 + 2 + 0 = 12, needs_landing 1 + 2 + 0 + 0 = 3); the
         // fail_origins likewise sum the per-user maps. last_7_days is a smaller window.
         outcomes: {
           lifetime: {
-            finished: 97, completed: 77, cancelled: 5, plan_rejected: 2, failed: 13, needs_landing: 3,
-            last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: { agent_failure: 4, run_timeout: 3, worker_lost: 1, finalize_base_align_conflict: 1, workflow_scope_missing: 1, push_secret_blocked: 1, unknown: 2 },
+            finished: 97, completed: 78, cancelled: 5, plan_rejected: 2, failed: 12, needs_landing: 3,
+            ...demoLinkedFailure, completed_since_last_failure: 31, last_failed_user_id: "u-vlad", fail_origins: { agent_failure: 4, run_timeout: 2, worker_lost: 1, finalize_base_align_conflict: 1, workflow_scope_missing: 1, push_secret_blocked: 1, unknown: 2 },
           },
           last_7_days: {
             finished: 25, completed: 20, cancelled: 1, plan_rejected: 1, failed: 3, needs_landing: 0,
@@ -517,10 +536,10 @@ export const runsApi = {
         last7_unreported_run_count: 0,
       },
       users: [
-        { user_id: "u-maria", email: "maria@example.com", usage: { input_tokens: 2_490_000, cache_read_tokens: 22_400_000, cache_creation_tokens: 400_000, output_tokens: 1_020_000, cost_usd: 37.83, cost_status: "metered" as const }, run_count: 31, outcomes: { finished: 38, completed: 30, cancelled: 2, plan_rejected: 1, failed: 5, needs_landing: 1, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: { agent_failure: 2, run_timeout: 1, finalize_base_align_conflict: 1, unknown: 1 } }, subscription_run_count: 0, unreported_run_count: 0 },
-        { user_id: "u-vlad", email: "vlad@example.com", usage: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 26.4, cost_status: "metered" as const }, run_count: 23, outcomes: { finished: 30, completed: 22, cancelled: 2, plan_rejected: 1, failed: 5, needs_landing: 2, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: { agent_failure: 1, run_timeout: 1, workflow_scope_missing: 1, push_secret_blocked: 1, unknown: 1 } }, subscription_run_count: 0, unreported_run_count: 0 },
-        { user_id: "u-andrei", email: "andrei@example.com", usage: { input_tokens: 1_010_000, cache_read_tokens: 13_600_000, cache_creation_tokens: 210_000, output_tokens: 550_000, cost_usd: 19.71, cost_status: "metered" as const }, run_count: 19, outcomes: { finished: 21, completed: 18, cancelled: 1, plan_rejected: 0, failed: 2, needs_landing: 0, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: { agent_failure: 1, worker_lost: 1 } }, subscription_run_count: 0, unreported_run_count: 0 },
-        { user_id: "u-dana", email: "dana@example.com", usage: { input_tokens: 290_000, cache_read_tokens: 3_500_000, cache_creation_tokens: 50_000, output_tokens: 120_000, cost_usd: 4.21, cost_status: "metered" as const }, run_count: 6, outcomes: { finished: 8, completed: 7, cancelled: 0, plan_rejected: 0, failed: 1, needs_landing: 0, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: { run_timeout: 1 } }, subscription_run_count: 0, unreported_run_count: 0 },
+        { user_id: "u-maria", email: "maria@example.com", usage: { input_tokens: 2_490_000, cache_read_tokens: 22_400_000, cache_creation_tokens: 400_000, output_tokens: 1_020_000, cost_usd: 37.83, cost_status: "metered" as const }, run_count: 31, outcomes: { finished: 38, completed: 30, cancelled: 2, plan_rejected: 1, failed: 5, needs_landing: 1, ...demoFailureRecency(24, "agent_failure", 8), fail_origins: { agent_failure: 2, run_timeout: 1, finalize_base_align_conflict: 1, unknown: 1 } }, subscription_run_count: 0, unreported_run_count: 0 },
+        { user_id: "u-vlad", email: "vlad@example.com", usage: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 26.4, cost_status: "metered" as const }, run_count: 23, outcomes: { finished: 30, completed: 22, cancelled: 2, plan_rejected: 1, failed: 5, needs_landing: 2, ...demoLinkedFailure, fail_origins: { agent_failure: 1, run_timeout: 1, workflow_scope_missing: 1, push_secret_blocked: 1, unknown: 1 } }, subscription_run_count: 0, unreported_run_count: 0 },
+        { user_id: "u-andrei", email: "andrei@example.com", usage: { input_tokens: 1_010_000, cache_read_tokens: 13_600_000, cache_creation_tokens: 210_000, output_tokens: 550_000, cost_usd: 19.71, cost_status: "metered" as const }, run_count: 19, outcomes: { finished: 21, completed: 18, cancelled: 1, plan_rejected: 0, failed: 2, needs_landing: 0, ...demoFailureRecency(72, "worker_lost", 3), fail_origins: { agent_failure: 1, worker_lost: 1 } }, subscription_run_count: 0, unreported_run_count: 0 },
+        { user_id: "u-dana", email: "dana@example.com", usage: { input_tokens: 290_000, cache_read_tokens: 3_500_000, cache_creation_tokens: 50_000, output_tokens: 120_000, cost_usd: 4.21, cost_status: "metered" as const }, run_count: 6, outcomes: { finished: 8, completed: 8, cancelled: 0, plan_rejected: 0, failed: 0, needs_landing: 0, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: {} }, subscription_run_count: 0, unreported_run_count: 0 },
       ],
       earliest_run: "2026-05-12T09:00:00Z",
     }),
