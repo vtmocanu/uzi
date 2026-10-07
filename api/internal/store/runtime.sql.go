@@ -20212,7 +20212,9 @@ type failAttestedFinalizeRunsOverCapLockedRow struct {
 }
 
 // An attested run that is over budget and not eligible for the one-shot allowance (allowance
-// already used, or RUN_MAX_REQUEUES = 0) fails exactly as FailWorkerRunsOverCap fails it.
+// already used, or RUN_MAX_REQUEUES = 0) gets the same evidence-based disposition as any other
+// exhausted run: an owner hold when recovery evidence or unresolved custody is recorded, else failed
+// as FailWorkerRunsOverCap fails it.
 func (q *Queries) failAttestedFinalizeRunsOverCapLocked(ctx context.Context, arg failAttestedFinalizeRunsOverCapLockedParams) ([]failAttestedFinalizeRunsOverCapLockedRow, error) {
 	rows, err := q.db.Query(ctx, failAttestedFinalizeRunsOverCapLocked,
 		arg.ExhaustionEvidence,
@@ -20440,8 +20442,10 @@ type failRunsMissingFromSnapshotLockedRow struct {
 }
 
 // PRD #1390 M2b (SC2, over cap): a run-lane `running` run this worker OWNS but no longer lists (its
-// execution is lost) — past the fence, and out of re-queue budget — is FAILED (fail-first with the
-// requeue twin below). Its SET list mirrors FailRunsOfStaleWorkersOverCap (fail_origin='worker_lost',
+// execution is lost) — past the fence, and out of episode re-queue budget — gets the #2394
+// evidence-based disposition: an owner hold (recovery_wait, worker_requeue_exhausted) when recovery
+// evidence or unresolved custody is recorded, else FAILED worker_lost (fail-first with the requeue
+// twin below). The failure path SET list mirrors FailRunsOfStaleWorkersOverCap (fail_origin='worker_lost',
 // the pause/switch/milestone clears, health reset, move_pending_since for the reconcile origin
 // restore). Held states are never targeted (status = 'running' only). Chat is a target restriction
 // (kind <> 'chat', D10) — these writers only ever touch run-lane runs. @missing_cutoff is the stale
