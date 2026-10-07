@@ -138,11 +138,6 @@ function FailedRunsBlock({ lifetime, last7 }: { lifetime: RunOutcomes; last7: Ru
       : []),
   ];
   const barLabel = "Finished runs: " + segments.map((s) => `${s.count} ${s.label}`).join(", ");
-  // Top causes: up to 4 fail_origin buckets, descending by count. Array.sort is stable, so
-  // ties keep the map's insertion (vocabulary) order. Omit the line when there are none.
-  const causes = Object.entries(lifetime.fail_origins)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 4);
   return (
     <div className="mt-auto border-t border-edge pt-3.5">
       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
@@ -173,18 +168,6 @@ function FailedRunsBlock({ lifetime, last7 }: { lifetime: RunOutcomes; last7: Ru
           </li>
         ))}
       </ul>
-      {causes.length > 0 && (
-        <p className="mt-2 text-[11.5px] text-faint">
-          Top causes{" "}
-          {causes.map(([origin, n], i) => (
-            <span key={origin}>
-              {i > 0 ? " · " : ""}
-              <span className="text-muted">{failOriginLabel(origin)}</span>{" "}
-              <span className="tabular-nums text-muted">{n}</span>
-            </span>
-          ))}
-        </p>
-      )}
     </div>
   );
 }
