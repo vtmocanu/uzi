@@ -32,6 +32,11 @@ through `[0.52.0]`.)
 - **CI-fix and MR-rework runs stop neutrally when a verified remote branch advance supersedes their work ([#2404](https://github.com/vtmocanu/uzi/issues/2404)).**
   When the worker proves a stable forward remote advance, further publication stops and the upgraded api records the run as cancelled with a branch-moved stop reason, rather than failed; the activity feed and owner API, board, CLI and web views carry the cause and exact observed remote tip. Publication refusals involving other run kinds, rewritten candidate history or unverifiable checks remain failures, with allowlisted code-only reasons rather than untrusted remote or command-error text. Upgrade the api before workers: older servers retain MR-only handling and a static reason, so CI-fix can still appear failed. The proof covers the observed remote interval, not later writes or whether an earlier push applied; recovery uses existing capture and custody, and a reclaimed run gets a new publication baseline. See [Worker setup](docs/worker-setup.md#publication-refusal-and-branch-supersession).
 
+### Fixed
+
+- **Plan cross-check works on repositories with tracked symlinks ([#2410](https://github.com/vtmocanu/uzi/issues/2410)).**
+  Planning-diff capture now accepts an unchanged tracked symlink, comparing its raw link target to the base blob without opening or following it; any other symlink case and any submodule gitlink refuses with the new sub-code `unsupported_entry`, and gitlink support is deferred until a proof exists that publication preserves the base gitlink. The refusal sub-code (`base_unavailable`, `diff_failed`, `diff_too_large`, `too_many_untracked`, `secret_detected`, `scan_failed`, `unsupported_entry`) is stored on the run (migration 00306) and shown with the gate reason while it is `planning_diff_refused`, on the run page, in `uzi run get` (and the `plan_cross_check_diff_refusal` JSON field) and in the Slack gate message; the object-store snapshot copy now has its own 128 MiB budget separate from the 128 MiB source-read budget. Roll out in two phases because nothing orders them: deploy the api and migration and confirm readiness first, then let the worker pin advance, since an older api rejects `unsupported_entry` from a newer worker.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed

@@ -2232,9 +2232,13 @@ unavailable; subscription usage is distinguished from metered spend.
 
 The human view bounds findings to 20 items and sends displayed text through
 `Plain` for terminal/control sanitization. Use `uzi run get <id> --json` for
-the structured `plan_cross_check_required`, `plan_cross_check_gate_reason`
-and optional `plan_cross_check_summary` fields, or
+the structured `plan_cross_check_required`, `plan_cross_check_gate_reason`,
+optional `plan_cross_check_diff_refusal` and optional `plan_cross_check_summary`
+fields, or
 `uzi run get <id> --field plan_cross_check_required` for the run's snapshot.
+While the gate reason is `planning_diff_refused`, the `PLAN_CROSS_CHECK` row
+appends the refusal sub-code, e.g. `(unsupported_entry)`; see
+[planning-diff refusals](./cross-check.md#planning-diff-refusals).
 A stored checker APPROVE and a current human gate can coexist: decide against
 the displayed gate revision, not historical findings. See
 [Cross-check](./cross-check.md) for fallbacks and terminal delivery failures.
