@@ -2244,25 +2244,6 @@ export class RecoveryCoordinator {
     return createHmac("sha256", this.key).update(canonicalJson(record)).digest("hex");
   }
 
-  /** Generations of a run whose guarded recovery journal is not final-acknowledged. Their owed
-   *  contexts must stay discoverable until the final disposition is acknowledged. Reads the
-   *  journal strictly: an unreadable or unauthenticated record throws instead of being skipped, so
-   *  uncertainty can never read as an empty protection set. */
-  async unsettledGuardedGenerations(runId: string): Promise<Set<number>> {
-    const out = new Set<number>();
-    const records = await this.checkedRecords(runId);
-    const guarded = new Set<number>();
-    for (const r of records) if (r.inventoryGuarded && typeof r.generation === "number") guarded.add(r.generation);
-    // Settled exactly when inventoryCleanupState says so (a covering FINAL ACK), per generation.
-    for (const generation of guarded) if (await this.cleanupStateOf(records, generation) !== "acknowledged") out.add(generation);
-    // A missing journal proves nothing: every generation the server still holds open stays
-    // protected. One read per call; a failed read throws, so the caller prunes nothing.
-    if (this.client.hasFeature?.("recovery_inventory_v1")) {
-      for (const h of await this.guardedHolds(runId)) out.add(h.generation);
-    }
-    return out;
-  }
-
   /** All authenticated records for a run (skips tampered/unreadable files). */
   private async listRecords(runId: string): Promise<RecoveryRecord[]> {
     let names: string[];

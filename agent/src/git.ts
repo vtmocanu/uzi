@@ -8622,8 +8622,7 @@ export class GitCache {
   }
 
   /** Only a server-confirmed full commit and positive ancestry proof release an owed pin. */
-  async reconcileOwedCandidates(barePath: string, runId: string, remotelyConfirmedSha: string,
-    keepContext?: OwedCandidateContext, keepGenerations?: ReadonlySet<number>):
+  async reconcileOwedCandidates(barePath: string, runId: string, remotelyConfirmedSha: string):
     Promise<{ removedShas: string[]; retainedShas: string[] }> {
     if (typeof runId !== "string" || !OWED_RUN_ID.test(runId)) throw new Error("invalid owed run ID");
     this.validateConfirmedSha(remotelyConfirmedSha);
@@ -8631,7 +8630,6 @@ export class GitCache {
     return this.withLock(barePath, async () => {
       const candidates = await this.enumerateOwedUnderLock(barePath, runId);
       const removedShas: string[] = [], retainedShas: string[] = [];
-      const releasedContexts = new Set<string>();
       for (const candidate of candidates) {
         if (await this.remotelyCovers(barePath, candidate.sha, remotelyConfirmedSha)) {
           await this.runGit(barePath, ["update-ref", "-d", candidate.pinRef, candidate.sha]);
@@ -8642,64 +8640,12 @@ export class GitCache {
           for (const ctx of candidate.contexts) {
             const name = `candidate-${runId}-${candidate.sha}-${this.contextName(ctx).slice(8, -5)}.json`;
             if (await this.readOwedFile(barePath, name) !== undefined) await this.removeOwedFile(barePath, name);
-            releasedContexts.add(this.contextName(ctx));
           }
           removedShas.push(candidate.sha);
         } else retainedShas.push(candidate.sha);
       }
-      if (releasedContexts.size || keepGenerations) {
-        await this.pruneReleasedOwedContexts(barePath, runId, releasedContexts,
-          keepContext ? this.contextName(keepContext) : undefined, keepGenerations);
-      }
       return { removedShas, retainedShas };
     });
-  }
-
-  /** Drop the metadata file of a context whose pins were all just released, so discovery stops
-   *  reading and enumerating it on every pass. Best-effort and fail closed: a context stays when any
-   *  remaining candidate file or any tracking receipt still names it, when it is the caller's live
-   *  context, or when any receipt is unreadable or malformed. The pins are already gone, so a failure
-   *  here only leaves harmless metadata. `keepGenerations` names generations with an unsettled
-   *  recovery journal; their contexts are never pruned, and when given, earlier-preserved zero-pin contexts
-   *  of the same run are pruned once unprotected. Caller MUST hold the bare lock. */
-  private async pruneReleasedOwedContexts(barePath: string, runId: string, released: Set<string>, keep: string | undefined,
-    keepGenerations?: ReadonlySet<number>): Promise<void> {
-    try {
-      const names = await this.owedMetadataNames(barePath);
-      const stillNamed = new Set<string>();
-      for (const name of names) {
-        const candidate = /^candidate-[A-Za-z0-9_-]+-[0-9a-f]{40}-([0-9a-f]{64})\.json$/.exec(name);
-        if (candidate) stillNamed.add(`context-${candidate[1]}.json`);
-        if (name.startsWith("receipt-")) {
-          const receipt = await this.readOwedFile(barePath, name) as { context?: unknown } | undefined;
-          if (!receipt || typeof receipt.context !== "string" || !/^context-[0-9a-f]{64}\.json$/.test(receipt.context)) return;
-          stillNamed.add(receipt.context);
-        }
-      }
-      // With a protection set the caller has proven the journal state, so a context of THIS run that
-      // was preserved earlier (zero pins, generation protected then) is revisited once it is no
-      // longer protected; without one only the contexts released by this call are candidates.
-      const candidates = new Set(released);
-      if (keepGenerations) for (const name of names) if (/^context-[0-9a-f]{64}\.json$/.test(name)) candidates.add(name);
-      for (const name of candidates) {
-        if (name === keep || stillNamed.has(name) || !names.includes(name)) continue;
-        if (keepGenerations && !released.has(name)) {
-          const own = await this.readOwedFile(barePath, name) as { runId?: unknown } | undefined;
-          if (own?.runId !== runId) continue;
-        }
-        if (keepGenerations) {
-          // A generation whose recovery journal is not final-acknowledged stays discoverable:
-          // recovery rebuilds its custody from the context. Unreadable context: keep it.
-          const stored = await this.readOwedFile(barePath, name) as { generation?: unknown } | undefined;
-          if (typeof stored?.generation !== "number" || keepGenerations.has(stored.generation)) continue;
-        }
-        await this.removeOwedFile(barePath, name);
-      }
-    } catch (cause) {
-      const abort = this.boundaryAbortError(cause);
-      if (abort) throw abort;
-      this.log.warn("owed context metadata not pruned", { error: cause instanceof Error ? cause.message : String(cause) });
-    }
   }
 
   /** Recovery-only aggregate, never a tracking/checkpoint/publication ref.

@@ -39,16 +39,7 @@ it("review probe: a history of acknowledged generations does not cause exponenti
   } finally { await f.close(); }
 });
 
-it("review probe: a malformed guarded-hold flag cannot prove no guarded custody", async () => {
-  const f = await fixture();
-  try {
-    clientOf(f).listRecoveryHolds = async () => ({ run_id: "run-1", holds: [{ generation: 7, inventory_guarded: "true" }] });
-    await assert.rejects(f.coordinator.unsettledGuardedGenerations("run-1"),
-      "malformed guarded status must stop pruning rather than discard an unknown hold");
-  } finally { await f.close(); }
-});
-
-it("review probe: an initial guarded pin does not keep an acknowledged generation unsettled", async () => {
+it("an initial guarded pin record does not stop a covering FINAL ACK from authorizing cleanup", async () => {
   const f = await fixture();
   try {
     f.state.closeOnRelease = true;
@@ -58,26 +49,6 @@ it("review probe: an initial guarded pin does not keep an acknowledged generatio
     await f.capture(record);
     assert.equal((await f.coordinator.inspect("run-1")).find(r => r.captureId === record.captureId)?.finalAcknowledged, true);
     assert.equal(await f.coordinator.inventoryCleanupState("run-1", 7), "acknowledged");
-    assert.deepEqual([...await f.coordinator.unsettledGuardedGenerations("run-1")], [],
-      "the covering final ACK settles the generation, including its original pin record");
-  } finally { await f.close(); }
-});
-
-it("review probe: an open guarded hold without a journal must keep its discovery context", async () => {
-  const f = await fixture();
-  try {
-    assert.equal(f.state.open, true);
-    assert.deepEqual([...await f.coordinator.unsettledGuardedGenerations("run-1")], [7],
-      "a missing local journal cannot prove the exact server hold closed");
-  } finally { await f.close(); }
-});
-
-it("issue1924 a failed hold read stops pruning instead of reading as no open hold", async () => {
-  const f = await fixture();
-  try {
-    (f.coordinator as unknown as { client: { listRecoveryHolds: () => Promise<never> } }).client.listRecoveryHolds =
-      async () => { throw new Error("api unavailable"); };
-    await assert.rejects(f.coordinator.unsettledGuardedGenerations("run-1"), /api unavailable/);
   } finally { await f.close(); }
 });
 
@@ -107,20 +78,6 @@ it("issue1924 an acknowledged older generation's source journal does not block a
       "an older generation whose own FINAL is acknowledged must not block this generation's FINAL");
     assert.equal(await f.coordinator.inventoryCleanupState("run-1", 7), "acknowledged",
       "a later FINAL accepted without the separately archived old head must authorize cleanup too");
-    assert.deepEqual([...await f.coordinator.unsettledGuardedGenerations("run-1")], [],
-      "neither acknowledged generation should keep its discovery context protected");
-  } finally { await f.close(); }
-});
-
-it("review probe: unreadable guarded journal cannot prove its generation settled", async () => {
-  const f = await fixture();
-  try {
-    const record = await f.freeze();
-    assert.ok(record);
-    assert.deepEqual([...await f.coordinator.unsettledGuardedGenerations("run-1")], [7]);
-    await fs.writeFile(path.join(f.root, "journal", "run-1", record.captureId + ".json"), "{}");
-    await assert.rejects(f.coordinator.unsettledGuardedGenerations("run-1"),
-      "unreadable journal must stop pruning instead of returning an empty protection set");
   } finally { await f.close(); }
 });
 
@@ -214,19 +171,6 @@ it("issue1924 invalid ownership route body network and HTTP failures never FINAL
       assert.equal(f.state.open, true, "the hold stays open");
     } finally { await f.close(); }
   }
-});
-
-it("issue1924 a guarded generation is unsettled until its FINAL is acknowledged", async () => {
-  const f = await fixture();
-  try {
-    f.state.closeOnRelease = true;
-    const record = await f.freeze();
-    assert.ok(record);
-    assert.deepEqual([...await f.coordinator.unsettledGuardedGenerations("run-1")], [7]);
-    await f.capture(record);
-    assert.equal((await f.coordinator.inspect("run-1"))[0]?.finalAcknowledged, true);
-    assert.deepEqual([...await f.coordinator.unsettledGuardedGenerations("run-1")], []);
-  } finally { await f.close(); }
 });
 
 it("issue1924 a discovery that no longer returns a context drops it from the boot queue", async () => {
