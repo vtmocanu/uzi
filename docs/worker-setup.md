@@ -587,9 +587,16 @@ Raising the cap is an informed trade-off, not a free speedup:
   prompt-injected run could shell-write into a sibling's worktree or the shared
   bare-repo cache.
 - **One container, one memory budget.** A runaway run can OOM the whole container,
-  requeuing every in-flight run together; raise `RUN_MAX_REQUEUES` (default 1)
+  requeuing every in-flight run together; raise the API's `RUN_MAX_REQUEUES`
   alongside any cap above 1 so an innocent sibling isn't failed outright by another
-  run's crash.
+  run's crash. The API default is 1; 0 disables automatic requeue. For a Helm
+  deployment, set the budget through `api.config`, for example:
+
+  ```yaml
+  api:
+    config:
+      RUN_MAX_REQUEUES: "3"
+  ```
 - **One Anthropic token, N runs.** Every slot on a worker shares that worker's
   credential, so a higher cap multiplies 429 pressure on it — the SDK's own
   retry/backoff is the only mitigation today. Binding two *workers* to two
