@@ -39,3 +39,6 @@ CI runs the base-only lane on every main push and on PRs changing agent sources,
 this harness, Taskfile or the CI workflow. The existing required `test-agent`
 aggregator accepts a skipped lane only when a successful PR path filter explicitly
 reports no relevant changes. Image-validation builds retain their existing role.
+
+[Issue #2397: partial investigation](issue-2397-investigation.md) records the
+available evidence and remaining diagnosis work.
