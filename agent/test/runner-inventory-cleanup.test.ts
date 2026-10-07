@@ -12,6 +12,14 @@ import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner }
 
 installHarness();
 
+function enableGuardedJournalCreation(runId: string, generation: number): void {
+  client.hasFeature = name => name === "recovery_inventory_v1";
+  client.listRecoveryHolds = async () => ({ run_id: runId, holds: [
+    { hold_id: "33333333-3333-4333-8333-333333333333", generation,
+      inventory_guarded: true, has_available_capture: false },
+  ] });
+}
+
 for (const damage of ["mac", "unreadable", "malformed-guard", "dangling-dir", "legacy", "empty", "known-missing", "no-key"] as const) {
   it(`inventory cleanup authority rollback ${damage}`, async () => {
     const { gitlab } = fakeGitlab();
@@ -23,10 +31,12 @@ for (const damage of ["mac", "unreadable", "malformed-guard", "dangling-dir", "l
       retireFinalizeRecord(flight: { runId: string; claimGeneration: number }, site: string): Promise<void>;
     };
     const runId = "cleanup-run", generation = 7;
+    enableGuardedJournalCreation(runId, generation);
     const record = damage === "no-key" ? undefined : await internals.recovery.pin({
       runId, generation, kind: "issue", branch: "task", sourceSha: "a".repeat(40),
       inventoryGuarded: damage !== "legacy" && damage !== "empty",
     });
+    if (damage !== "no-key") assert.ok(record, "the damage fixture needs an authenticated journal");
     const dir = path.join(git.recoveryRoot, runId);
     if (record) {
       const file = path.join(dir, record.captureId + ".json");
@@ -60,6 +70,7 @@ for (const damage of ["mac", "unreadable", "malformed-guard", "dangling-dir", "l
     // Reconstruct the coordinator from persisted files, as a feature-loss restart does.
     internals.recovery = (runner({ run: async () => ({ branch: "task" }) }, gitlab,
       damage === "no-key" ? undefined : "journal-key") as unknown as { recovery: RecoveryCoordinator }).recovery;
+    delete (client as unknown as { hasFeature?: unknown }).hasFeature;
     client.clearFeatures();
     let holdReads = 0, terminalRetires = 0, finalizeRetires = 0;
     client.listRecoveryHolds = async () => { holdReads++; throw new Error("unsupported"); };
@@ -172,6 +183,7 @@ for (const scenario of ["discarded", "released", "absent-released", "absent-lega
     let journal: string | undefined;
     let original: string | undefined;
     if (!absent) {
+      enableGuardedJournalCreation(runId, generation);
       const record = await internals.recovery.pin({
         runId, generation, kind: "issue", branch: "task", sourceSha: "a".repeat(40), inventoryGuarded: true,
       });
@@ -245,6 +257,7 @@ it("stale terminal supersession preserves guarded recovery and finalize custody"
   internals.client = new WorkerClient("http://retirement.test", "join-token", "test", nullLogger());
   await internals.client.register("test");
   await internals.client.claimRun();
+  enableGuardedJournalCreation(runId, generation);
   const record = await internals.recovery.pin({
     runId, generation, kind: "issue", branch: "task", sourceSha: "a".repeat(40), inventoryGuarded: true,
   });
