@@ -584,7 +584,7 @@ wrapper always completes with 0.
   `scripts/pr-findings.sh` findings from both bots; `scripts/cr-rate-limit.sh` reset +
   wait; `scripts/review-quota.sh` who else consumes reviews; `scripts/wait-mrrework.sh`
   defer to uzi's rework.
-- `scripts/land-prep.sh` rebase / renumber / gate / lease push (`scripts/changelog-union.sh`
+- `scripts/land-prep.sh` rebase / renumber / optional gate / lease push (`scripts/changelog-union.sh`
   unions a CHANGELOG-only conflict or refuses); `scripts/merge.sh` the
   guarded admin merge; `scripts/watch-run-ci.sh` job-level CI for a run, a branch, or a
   merge SHA; `scripts/watch-prs-ci.sh` CI-only for a batch of PRs (shared

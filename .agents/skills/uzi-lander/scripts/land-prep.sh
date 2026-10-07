@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # land-prep.sh — the deterministic base-hygiene pipeline for a PR branch that cannot merge
 # as-is: sibling worktree → fetch → rebase onto the base → renumber colliding migrations
-# → run the touched component gates → force-with-lease push. Everything that needs no
+# → the component gates when --gate asks (default none: CI is the gate) → force-with-lease push. Everything that needs no
 # judgment; it STOPS (with a distinct exit code and the worktree left in place) at the
 # points that do — a rebase conflict, a renumber that touched more than the migrations
 # directory, a red gate.

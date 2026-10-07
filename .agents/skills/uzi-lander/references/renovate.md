@@ -115,7 +115,8 @@ fix, and let Renovate auto-close its PR.
    impact (often "none").
 2. **One branch off `main`** (`fix/<dep>-<version>` or `chore/<dep>-<version>`): bump the
    dep yourself (`go get <mod>@<v> && go mod tidy`, or `npm install <pkg>@<v>`), apply only
-   the fix the bump forces, run `task gate:<component>`, push, open a PR. Title it honestly
+   the fix the bump forces, run the cheap local floor and the focused tests that reproduced
+   the failure (SKILL.md *CI is the gate*), push, open a PR; CI runs the full gates. Title it honestly
    (`fix(deps): …` / `chore(deps): …`); never contort the title to dodge the bot skip.
 3. **Land it with the loop.** It is Renovate-class for SKILL.md step 2. CodeRabbit
    auto-skips a `*(deps)` title (`.coderabbit.yaml` `ignore_title_keywords`, beside
