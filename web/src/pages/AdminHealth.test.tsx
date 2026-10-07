@@ -246,9 +246,11 @@ describe("AdminHealth — All checks inventory (M4)", () => {
     expect(screen.getByText("17 of 17 passing")).toBeTruthy();
     // workers (5, fleet.rundisk and fleet.quarantine included), queue (2), control (3),
     // integrations (3), housekeeping (4).
-    for (const t of ["all 5 passing", "all 2 passing", "all 3 passing", "all 2 passing", "all 4 passing"]) {
-      expect(screen.getAllByText(t).length).toBeGreaterThan(0);
-    }
+    // Exact per-string tallies: control and integrations both read "all 3 passing".
+    expect(screen.getAllByText("all 5 passing").length).toBe(1);
+    expect(screen.getAllByText("all 2 passing").length).toBe(1);
+    expect(screen.getAllByText("all 3 passing").length).toBe(2);
+    expect(screen.getAllByText("all 4 passing").length).toBe(1);
     expect(screen.getAllByText(/^all \d passing$/).length).toBe(5);
   });
 
