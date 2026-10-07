@@ -121,6 +121,11 @@ func ownerHoldAttentionInput(row store.ListCustodyHoldsForOwnerRow) holdAttentio
 	return holdAttentionInput{State: row.State, HasAvailableCapture: row.HasAvailableCapture, InventoryGuarded: row.InventoryGuarded, CaptureState: row.CaptureState, RunStatus: row.RunStatus}
 }
 
+// OwnerHoldNeedsDecision is a stable adapter to the canonical listing-row decision result. Before #2445, it delegates to the existing Go classifier; after #2445, it returns the canonical SQL-projected decision result.
+func OwnerHoldNeedsDecision(row store.ListCustodyHoldsForOwnerRow) bool {
+	return isDecisionAttention(deriveHoldAttention(ownerHoldAttentionInput(row)))
+}
+
 func batchHoldAttentionInput(row store.ListOpenCustodyHoldsForWorkersRow) holdAttentionInput {
 	return holdAttentionInput{State: row.State, HasAvailableCapture: row.HasAvailableCapture, InventoryGuarded: row.InventoryGuarded, CaptureState: row.CaptureState, RunStatus: row.RunStatus}
 }

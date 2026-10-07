@@ -47,6 +47,9 @@ type fakeStore struct {
 	gaveUpErr       error
 	custodyOwners   []uuid.UUID
 	custodyErr      error
+	custodySelect   func(context.Context, int32) ([]uuid.UUID, error)
+	custodyList     func(context.Context, store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error)
+	custodyQueries  []store.ListCustodyHoldsForOwnerParams
 	controller      pgtype.Timestamptz
 	controllerErr   error
 	ciwatch         []store.CountEligibleCIWatchRefsPerRepoRow
@@ -79,8 +82,18 @@ func (f *fakeStore) CountUsersPausedWithEnabledSchedules(context.Context, pgtype
 func (f *fakeStore) ListGaveUpColumnMoves(context.Context, store.ListGaveUpColumnMovesParams) ([]store.ListGaveUpColumnMovesRow, error) {
 	return f.gaveUp, f.gaveUpErr
 }
-func (f *fakeStore) ListOwnersOverCustodyLimit(context.Context, int32) ([]uuid.UUID, error) {
+func (f *fakeStore) ListOwnersOverCustodyLimit(ctx context.Context, limit int32) ([]uuid.UUID, error) {
+	if f.custodySelect != nil {
+		return f.custodySelect(ctx, limit)
+	}
 	return f.custodyOwners, f.custodyErr
+}
+func (f *fakeStore) ListCustodyHoldsForOwner(ctx context.Context, arg store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error) {
+	f.custodyQueries = append(f.custodyQueries, arg)
+	if f.custodyList != nil {
+		return f.custodyList(ctx, arg)
+	}
+	return nil, nil
 }
 func (f *fakeStore) GetControllerReport(context.Context) (pgtype.Timestamptz, error) {
 	return f.controller, f.controllerErr
@@ -596,6 +609,198 @@ func TestCustodyHolds(t *testing.T) {
 			c := svc.checkCustodyHolds(context.Background())
 			if c.Severity != tc.wantSev || !strings.Contains(c.Summary, tc.wantSubstr) {
 				t.Fatalf("got %q / %q", c.Severity, c.Summary)
+			}
+		})
+	}
+}
+
+func TestCustodyHoldsAdvice(t *testing.T) {
+	active := store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "running", RunID: uuid.New(), Generation: 2}
+	capturing := store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "failed", CaptureState: "uploading"}
+	ready := store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "failed", HasAvailableCapture: true, CaptureState: "needs_action"}
+	decision := store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "running", CaptureState: "needs_action"}
+	sourceOnly := store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "completed", RunID: uuid.New(), Generation: 1}
+	guarded := ready
+	guarded.InventoryGuarded = true
+	for _, tc := range []struct {
+		name          string
+		holds         [][]store.ListCustodyHoldsForOwnerRow
+		with, without string
+		action        string
+	}{
+		{"no decisions", [][]store.ListCustodyHoldsForOwnerRow{{active, capturing, ready}}, "0", "1",
+			"No owner decision is currently required; admission resumes when counted holds settle."},
+		{"decisions counted once", [][]store.ListCustodyHoldsForOwnerRow{{decision, sourceOnly, guarded}}, "1", "0",
+			"Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when counted holds settle."},
+		{"mixed", [][]store.ListCustodyHoldsForOwnerRow{{decision, sourceOnly}, {active, capturing, ready}}, "1", "1",
+			"Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when counted holds settle. Other at-limit owners need no decision; admission resumes when their counted holds settle."},
+		// A hold from the terminal predecessor still needs a decision even when
+		// the same owner's newer run has an active hold.
+		{"terminal predecessor", [][]store.ListCustodyHoldsForOwnerRow{{sourceOnly, active}}, "1", "0",
+			"Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when counted holds settle."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &fakeStore{}
+			byOwner := make(map[uuid.UUID][]store.ListCustodyHoldsForOwnerRow)
+			for _, holds := range tc.holds {
+				owner := uuid.New()
+				fs.custodyOwners = append(fs.custodyOwners, owner)
+				byOwner[owner] = holds
+			}
+			fs.custodyList = func(_ context.Context, arg store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error) {
+				return byOwner[arg.UserID], nil
+			}
+			c := newSvc(fs, &fakeSettings{}).checkCustodyHolds(context.Background())
+			if c.Severity != sevWarn || c.Action == nil || *c.Action != tc.action {
+				t.Fatalf("advice = %+v (action %v), want warn with %q", c, c.Action, tc.action)
+			}
+			want := []apitypes.HealthEvidenceDTO{
+				{Label: "Owners", Value: fmt.Sprint(len(tc.holds))},
+				{Label: "Owners with decisions", Value: tc.with},
+				{Label: "Owners without decisions", Value: tc.without},
+			}
+			if fmt.Sprint(c.Evidence) != fmt.Sprint(want) {
+				t.Fatalf("evidence = %+v, want %+v", c.Evidence, want)
+			}
+			if len(fs.custodyQueries) != len(fs.custodyOwners) {
+				t.Fatalf("listing calls = %d, want %d", len(fs.custodyQueries), len(fs.custodyOwners))
+			}
+			for i, arg := range fs.custodyQueries {
+				wantArg := store.ListCustodyHoldsForOwnerParams{UserID: fs.custodyOwners[i], State: pgtype.Text{String: "open", Valid: true}}
+				if arg != wantArg {
+					t.Fatalf("listing filter = %+v, want %+v", arg, wantArg)
+				}
+			}
+		})
+	}
+}
+
+func TestCustodyHoldsReadFailures(t *testing.T) {
+	owners := []uuid.UUID{uuid.New(), uuid.New()}
+	decision := []store.ListCustodyHoldsForOwnerRow{{State: "open", RunStatus: "failed"}}
+	for _, tc := range []struct {
+		name string
+		at   int
+	}{
+		{"first owner", 0},
+		{"second owner after partial classification", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &fakeStore{custodyOwners: owners}
+			fs.custodyList = func(_ context.Context, arg store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error) {
+				if arg.UserID == owners[tc.at] {
+					return nil, errors.New("listing failed")
+				}
+				return decision, nil
+			}
+			c := newSvc(fs, &fakeSettings{}).checkCustodyHolds(context.Background())
+			if c.Severity != sevUnknown || c.Action != nil || len(c.Evidence) != 0 {
+				t.Fatalf("failed listing returned advice or partial evidence: %+v", c)
+			}
+		})
+	}
+}
+
+func TestCustodyHoldsCancellation(t *testing.T) {
+	for _, stage := range []string{"pre-cancel", "selection wait", "listing wait", "after empty selection", "before owner", "before advice"} {
+		t.Run(stage, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+			owner := uuid.New()
+			fs := &fakeStore{custodyOwners: []uuid.UUID{owner}}
+			fs.custodySelect = func(readCtx context.Context, _ int32) ([]uuid.UUID, error) {
+				switch stage {
+				case "selection wait":
+					<-readCtx.Done()
+					return nil, readCtx.Err()
+				case "after empty selection":
+					cancel()
+					return nil, nil
+				case "before owner":
+					cancel()
+				}
+				return fs.custodyOwners, nil
+			}
+			fs.custodyList = func(readCtx context.Context, _ store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error) {
+				if stage == "listing wait" {
+					<-readCtx.Done()
+					return nil, readCtx.Err()
+				}
+				if stage == "before advice" {
+					cancel()
+				}
+				return []store.ListCustodyHoldsForOwnerRow{{State: "open", RunStatus: "failed"}}, nil
+			}
+			if stage == "pre-cancel" {
+				cancel()
+			}
+			start := time.Now()
+			c := newSvc(fs, &fakeSettings{}).checkCustodyHolds(ctx)
+			if c.Severity != sevUnknown || c.Action != nil || len(c.Evidence) != 0 {
+				t.Fatalf("cancelled read returned health, advice or partial evidence: %+v", c)
+			}
+			if time.Since(start) > time.Second {
+				t.Fatal("read did not honor short parent deadline")
+			}
+			if (stage == "pre-cancel" || stage == "before owner" || stage == "after empty selection") && len(fs.custodyQueries) != 0 {
+				t.Fatal("listed holds after cancellation")
+			}
+		})
+	}
+}
+
+func TestCustodyHoldsSharedReadBudget(t *testing.T) {
+	owner := uuid.New()
+	fs := &fakeStore{}
+	var selectionCtx context.Context
+	start := time.Now()
+	fs.custodySelect = func(ctx context.Context, limit int32) ([]uuid.UUID, error) {
+		if limit != 3 {
+			t.Fatalf("owner selection limit = %d, want 3", limit)
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok || deadline.Before(start.Add(3*time.Second)) || deadline.After(start.Add(4*time.Second+100*time.Millisecond)) {
+			t.Fatalf("selection deadline = %v, present = %v; want four-second budget", deadline, ok)
+		}
+		selectionCtx = ctx
+		return []uuid.UUID{owner}, nil
+	}
+	fs.custodyList = func(ctx context.Context, _ store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error) {
+		if ctx != selectionCtx {
+			t.Fatal("owner reads must share selection context and budget")
+		}
+		return nil, nil
+	}
+	c := newSvc(fs, &fakeSettings{}).checkCustodyHolds(context.Background())
+	if c.Severity != sevWarn {
+		t.Fatalf("severity = %q, want warn", c.Severity)
+	}
+	if selectionCtx.Err() != context.Canceled {
+		t.Fatal("read context was not cancelled on return")
+	}
+}
+
+func TestCustodyHoldsSkipListing(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		limit  int32
+		owners []uuid.UUID
+		want   string
+	}{
+		{"disabled", 0, []uuid.UUID{uuid.New()}, sevNA},
+		{"no owners", 3, nil, sevOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &fakeStore{custodyOwners: tc.owners}
+			fs.custodySelect = func(context.Context, int32) ([]uuid.UUID, error) {
+				if tc.limit == 0 {
+					t.Fatal("selected owners when disabled")
+				}
+				return tc.owners, nil
+			}
+			c := New(Config{Store: fs, CustodyHoldLimit: tc.limit}).checkCustodyHolds(context.Background())
+			if c.Severity != tc.want || len(fs.custodyQueries) != 0 || c.Action != nil {
+				t.Fatalf("skip listing = %+v, calls = %d", c, len(fs.custodyQueries))
 			}
 		})
 	}

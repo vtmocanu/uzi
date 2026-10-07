@@ -83,6 +83,36 @@ func TestGuardedInventoryAttentionDoesNotSettleOnEarlierArchive(t *testing.T) {
 	}
 }
 
+func TestOwnerHoldNeedsDecision(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		row  store.ListCustodyHoldsForOwnerRow
+		want bool
+	}{
+		{"active", store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "running"}, false},
+		{"preparing terminal", store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "completed", CaptureState: "preparing"}, false},
+		{"uploading terminal", store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "failed", CaptureState: "uploading"}, false},
+		{"archive beats failed capture", store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "failed", CaptureState: "needs_action", HasAvailableCapture: true}, false},
+		{"failed capture beats active run", store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "running", CaptureState: "needs_action"}, true},
+		{"completed source only", store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "completed"}, true},
+		{"failed source only", store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "failed"}, true},
+		{"cancelled source only", store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "cancelled"}, true},
+		{"missing run", store.ListCustodyHoldsForOwnerRow{State: "open"}, true},
+		{"guarded archive terminal", store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "completed", CaptureState: "available", HasAvailableCapture: true, InventoryGuarded: true}, true},
+		{"guarded archive active", store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "running", CaptureState: "available", HasAvailableCapture: true, InventoryGuarded: true}, false},
+		{"guarded capture in flight", store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "completed", CaptureState: "preparing", HasAvailableCapture: true, InventoryGuarded: true}, false},
+		{"guarded failed capture", store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "running", CaptureState: "needs_action", HasAvailableCapture: true, InventoryGuarded: true}, true},
+		{"released", store.ListCustodyHoldsForOwnerRow{State: "released", RunStatus: "failed", CaptureState: "needs_action"}, false},
+		{"discarded", store.ListCustodyHoldsForOwnerRow{State: "discarded", RunStatus: "failed"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := OwnerHoldNeedsDecision(tc.row); got != tc.want {
+				t.Fatalf("OwnerHoldNeedsDecision(%+v) = %v, want %v", tc.row, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIsDecisionAttention(t *testing.T) {
 	// Only needs_action and source_only await an owner decision (D10). active protection and
 	// self-releasing archive_ready/capturing rows, plus settled released/discarded, do not.

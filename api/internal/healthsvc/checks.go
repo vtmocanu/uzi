@@ -10,9 +10,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/recovery"
 	"github.com/vtmocanu/uzi/api/internal/releasecheck"
 	"github.com/vtmocanu/uzi/api/internal/slacksvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -993,8 +995,16 @@ func (s *Service) checkCustodyHolds(ctx context.Context) apitypes.HealthCheckDTO
 		c.Summary = "Custody-hold admission is not configured."
 		return c
 	}
+	ctx, cancel := context.WithTimeout(ctx, custodyHoldsReadBudget)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return degradeUnknown(c, "custody.holds", err)
+	}
 	owners, err := s.cfg.Store.ListOwnersOverCustodyLimit(ctx, s.cfg.CustodyHoldLimit)
 	if err != nil {
+		return degradeUnknown(c, "custody.holds", err)
+	}
+	if err := ctx.Err(); err != nil {
 		return degradeUnknown(c, "custody.holds", err)
 	}
 	if len(owners) == 0 {
@@ -1002,10 +1012,49 @@ func (s *Service) checkCustodyHolds(ctx context.Context) apitypes.HealthCheckDTO
 		c.Summary = "No owner is at the custody-hold admission limit."
 		return c
 	}
+	// Each selected owner is read once; the shared deadline bounds the whole loop.
+	// Any failed read aborts classification, so partial counts never become advice.
+	withDecisions := 0
+	for _, owner := range owners {
+		if err := ctx.Err(); err != nil {
+			return degradeUnknown(c, "custody.holds", err)
+		}
+		holds, err := s.cfg.Store.ListCustodyHoldsForOwner(ctx, store.ListCustodyHoldsForOwnerParams{
+			UserID: owner,
+			State:  pgtype.Text{String: "open", Valid: true},
+		})
+		if err != nil {
+			return degradeUnknown(c, "custody.holds", err)
+		}
+		for _, hold := range holds {
+			if err := ctx.Err(); err != nil {
+				return degradeUnknown(c, "custody.holds", err)
+			}
+			if recovery.OwnerHoldNeedsDecision(hold) {
+				withDecisions++
+				break
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return degradeUnknown(c, "custody.holds", err)
+	}
+	withoutDecisions := len(owners) - withDecisions
 	c.Severity = sevWarn
 	c.Summary = fmt.Sprintf("%d owner(s) are at the custody-hold admission limit.", len(owners))
-	c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Owners", Value: fmt.Sprintf("%d", len(owners))}}
-	c.Action = strPtr("Their new runs are blocked until they discard or resolve held work (uzi run recovery).")
+	c.Evidence = []apitypes.HealthEvidenceDTO{
+		{Label: "Owners", Value: fmt.Sprintf("%d", len(owners))},
+		{Label: "Owners with decisions", Value: fmt.Sprintf("%d", withDecisions)},
+		{Label: "Owners without decisions", Value: fmt.Sprintf("%d", withoutDecisions)},
+	}
+	switch {
+	case withDecisions == 0:
+		c.Action = strPtr("No owner decision is currently required; admission resumes when counted holds settle.")
+	case withoutDecisions == 0:
+		c.Action = strPtr("Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when counted holds settle.")
+	default:
+		c.Action = strPtr("Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when counted holds settle. Other at-limit owners need no decision; admission resumes when their counted holds settle.")
+	}
 	return c
 }
 
