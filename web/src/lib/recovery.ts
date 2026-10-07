@@ -187,15 +187,22 @@ export interface CustodyAlertView {
 // admission limit is reached). A fleet carrying only healthy active protection is NOT an
 // incident (D6), so the alert stays hidden — it is not "another permanent alarm card".
 //
-// ESCALATES to `danger` styling the moment open_holds reaches custody_hold_limit: at the
+// ESCALATES to `danger` styling the moment counted holds reach custody_hold_limit: at the
 // limit every further code-run claim for the owner stops, which is the incident this whole
 // PRD exists to surface. Below the limit it is `warning`.
+// The server owns admission classification. Older servers omit this count; explicit zero
+// means no capacity is consumed even when custody remains open.
+export function recoveryCapacityUsed(agg: RecoveryCustodyAggregate): number {
+  return agg.admission_counted_holds ?? agg.open_holds;
+}
+
 export function custodyAlertView(
   agg: RecoveryCustodyAggregate,
   recoveryWaitCount: number,
 ): CustodyAlertView | null {
+  const capacityUsed = recoveryCapacityUsed(agg);
   const atLimit =
-    agg.custody_hold_limit > 0 && agg.open_holds >= agg.custody_hold_limit;
+    agg.custody_hold_limit > 0 && capacityUsed >= agg.custody_hold_limit;
   const show =
     agg.open_holds > 0 &&
     (agg.decision_needed > 0 || agg.blocked_runs > 0 || atLimit);
@@ -203,8 +210,8 @@ export function custodyAlertView(
   return {
     tone: atLimit ? "danger" : "warning",
     atLimit,
-    slotsLabel: `${agg.open_holds} / ${agg.custody_hold_limit} custody slots used`,
-    slotsUsed: agg.open_holds,
+    slotsLabel: `${capacityUsed} / ${agg.custody_hold_limit} custody slots used`,
+    slotsUsed: capacityUsed,
     slotsLimit: agg.custody_hold_limit,
     decisionNeeded: agg.decision_needed,
     blockedRuns: agg.blocked_runs,

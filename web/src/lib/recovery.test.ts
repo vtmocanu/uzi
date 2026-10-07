@@ -226,6 +226,29 @@ function hold(over: Partial<RecoveryCustodyHold> = {}): RecoveryCustodyHold {
 }
 
 describe("custodyAlertView — self-hide + escalation (D6/D8)", () => {
+  it.each([8, 12])("does not treat total custody %s as capacity", (open_holds) => {
+    expect(custodyAlertView(agg({ open_holds }), 3)).toBeNull();
+    const view = custodyAlertView(agg({ open_holds, admission_counted_holds: 2, decision_needed: 1 }), 0);
+    expect(view?.slotsUsed).toBe(2);
+    expect(view?.atLimit).toBe(false);
+    expect(view?.tone).toBe("warning");
+  });
+
+  it.each([undefined, 0, 8])("uses compatibility fallback only for absent capacity %s", (admission_counted_holds) => {
+    const input = agg({ open_holds: 8, admission_counted_holds, decision_needed: 1 });
+    if (admission_counted_holds === undefined) delete input.admission_counted_holds;
+    const view = custodyAlertView(input, 0);
+    expect(view?.slotsUsed).toBe(admission_counted_holds ?? 8);
+    expect(view?.atLimit).toBe(admission_counted_holds !== 0);
+  });
+
+  it.each([0, -1])("keeps decision and blocked policy with disabled limit %s", (custody_hold_limit) => {
+    const view = custodyAlertView(agg({ open_holds: 12, admission_counted_holds: 12, custody_hold_limit, blocked_runs: 1 }), 2);
+    expect(view?.tone).toBe("warning");
+    expect(view?.atLimit).toBe(false);
+    expect(view?.blockedRuns).toBe(1);
+  });
+
   it("self-hides when there are no open holds at all", () => {
     expect(custodyAlertView(agg({ open_holds: 0, decision_needed: 0, blocked_runs: 0 }), 0)).toBeNull();
   });
@@ -237,7 +260,7 @@ describe("custodyAlertView — self-hide + escalation (D6/D8)", () => {
   });
 
   it("shows a WARNING when a hold needs a decision but claims still flow", () => {
-    const v = custodyAlertView(agg({ open_holds: 4, decision_needed: 2, blocked_runs: 0 }), 0);
+    const v = custodyAlertView(agg({ open_holds: 4, admission_counted_holds: 4, decision_needed: 2, blocked_runs: 0 }), 0);
     expect(v?.tone).toBe("warning");
     expect(v?.atLimit).toBe(false);
     expect(v?.slotsLabel).toBe("4 / 8 custody slots used");
@@ -245,12 +268,12 @@ describe("custodyAlertView — self-hide + escalation (D6/D8)", () => {
   });
 
   it("shows a WARNING when runs are blocked below the admission limit", () => {
-    const v = custodyAlertView(agg({ open_holds: 5, decision_needed: 0, blocked_runs: 1 }), 0);
+    const v = custodyAlertView(agg({ open_holds: 5, admission_counted_holds: 5, decision_needed: 0, blocked_runs: 1 }), 0);
     expect(v?.tone).toBe("warning");
   });
 
-  it("ESCALATES to danger the moment open holds reach the admission limit", () => {
-    const v = custodyAlertView(agg({ open_holds: 8, custody_hold_limit: 8, decision_needed: 1 }), 3);
+  it("ESCALATES to danger the moment counted holds reach the admission limit", () => {
+    const v = custodyAlertView(agg({ open_holds: 8, admission_counted_holds: 8, custody_hold_limit: 8, decision_needed: 1 }), 3);
     expect(v?.tone).toBe("danger");
     expect(v?.atLimit).toBe(true);
     expect(v?.headline).toMatch(/blocking new runs/);

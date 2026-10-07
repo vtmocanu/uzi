@@ -45,13 +45,55 @@ async function renderAlert(resp: RecoveryCustodyHolds, recoveryWaitCount = 0) {
 }
 
 describe("CustodyBoardAlert", () => {
+  it.each([8, 12])("hides healthy total custody %s when capacity is zero", async (open_holds) => {
+    const { container } = await renderAlert(holds({ open_holds, admission_counted_holds: 0 }));
+    expect(container.innerHTML).toBe("");
+  });
+
+  it.each([
+    [undefined, 8, "alert"],
+    [0, 0, "status"],
+    [3, 3, "status"],
+    [8, 8, "alert"],
+  ] as const)("renders capacity %s independently of total custody and rows", async (admission_counted_holds, used, role) => {
+    const resp = holds({ open_holds: 12, admission_counted_holds, decision_needed: 1 });
+    if (admission_counted_holds === undefined) {
+      delete resp.aggregate.admission_counted_holds;
+      resp.aggregate.open_holds = 8;
+    }
+    const { container } = await renderAlert(resp);
+    expect(screen.getByRole(role)).toBeTruthy();
+    expect(screen.getByText(`${used} / 8 custody slots used`)).toBeTruthy();
+    const total = screen.getByText(/open custody holds/);
+    expect(total.textContent).toBe(`${resp.aggregate.open_holds} open custody holds`);
+    expect(container.querySelectorAll('[aria-hidden="true"] .bg-danger, [aria-hidden="true"] .bg-warn').length).toBe(used);
+    expect(screen.getByRole("link", { name: /Review held work/ })).toBeTruthy();
+  });
+
+  it("keeps blocked continuations visible below capacity without a decision CTA", async () => {
+    await renderAlert(holds({ open_holds: 12, admission_counted_holds: 2, blocked_runs: 1 }), 4);
+    expect(screen.getByRole("status")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByText("2 / 8 custody slots used")).toBeTruthy();
+    expect(screen.getByText(/run blocked/)).toBeTruthy();
+    expect(screen.getByText(/runs waiting to recover/)).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /Review held work/ })).toBeNull();
+  });
+
+  it.each([0, -1])("does not escalate with disabled limit %s", async (custody_hold_limit) => {
+    await renderAlert(holds({ open_holds: 12, admission_counted_holds: 12, custody_hold_limit, decision_needed: 1 }));
+    expect(screen.getByRole("status")).toBeTruthy();
+    expect(screen.getByText(`12 / ${custody_hold_limit} custody slots used`)).toBeTruthy();
+    expect(screen.getByRole("link", { name: /Review held work/ })).toBeTruthy();
+  });
+
   it("self-hides when nothing needs action", async () => {
     const { container } = await renderAlert(holds({ open_holds: 3 }));
     expect(container.innerHTML).toBe("");
   });
 
   it("renders a warning (role=status) with the slot line and counts when a decision is needed", async () => {
-    await renderAlert(holds({ open_holds: 4, decision_needed: 2, blocked_runs: 1 }), 5);
+    await renderAlert(holds({ open_holds: 4, admission_counted_holds: 4, decision_needed: 2, blocked_runs: 1 }), 5);
     const region = screen.getByRole("status");
     expect(region.getAttribute("aria-live")).toBe("polite");
     expect(screen.getByText(/Held work needs your attention/)).toBeTruthy();
@@ -67,7 +109,7 @@ describe("CustodyBoardAlert", () => {
   });
 
   it("escalates to an assertive alert at the admission limit and links to the resolution surface", async () => {
-    await renderAlert(holds({ open_holds: 8, custody_hold_limit: 8, decision_needed: 1, blocked_runs: 2 }));
+    await renderAlert(holds({ open_holds: 8, admission_counted_holds: 8, custody_hold_limit: 8, decision_needed: 1, blocked_runs: 2 }));
     const region = screen.getByRole("alert");
     expect(region.getAttribute("aria-live")).toBe("assertive");
     expect(screen.getByText(/Held work is blocking new runs/)).toBeTruthy();
@@ -86,7 +128,7 @@ describe("CustodyBoardAlert", () => {
     // shows (atLimit), but neither count line renders — matching how recoveryWaitCount is
     // already gated > 0. And since the Workers panel is now decision-only, the "Review held
     // work" CTA is omitted and the body shows non-actionable wait copy, not "resolve" copy.
-    await renderAlert(holds({ open_holds: 8, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 }));
+    await renderAlert(holds({ open_holds: 8, admission_counted_holds: 8, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 }));
     expect(screen.getByRole("alert")).toBeTruthy();
     expect(screen.getByText(/Held work is blocking new runs/)).toBeTruthy();
     expect(screen.queryByText(/needs? a decision/)).toBeNull();
@@ -101,7 +143,7 @@ describe("CustodyBoardAlert", () => {
     // At the limit with blocked runs but NO hold needing a decision. The Workers "Held work"
     // panel now self-hides in this state, so the CTA that points at it must not render, and
     // the body must not promise a resolution the owner cannot reach.
-    await renderAlert(holds({ open_holds: 8, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 2 }));
+    await renderAlert(holds({ open_holds: 8, admission_counted_holds: 8, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 2 }));
     expect(screen.getByRole("alert")).toBeTruthy();
     expect(screen.getByText(/Held work is blocking new runs/)).toBeTruthy();
     // The blocked-runs count still renders (it gates on > 0); the decision line does not.
@@ -118,7 +160,7 @@ describe("CustodyBoardAlert", () => {
     // First fetch: healthy (hidden). Later poll: at the limit (danger).
     mockApi.getRecoveryHolds
       .mockResolvedValueOnce(holds({ open_holds: 2 }))
-      .mockResolvedValue(holds({ open_holds: 8, custody_hold_limit: 8, decision_needed: 1, blocked_runs: 2 }));
+      .mockResolvedValue(holds({ open_holds: 8, admission_counted_holds: 8, custody_hold_limit: 8, decision_needed: 1, blocked_runs: 2 }));
     render(
       <MemoryRouter>
         <CustodyBoardAlert recoveryWaitCount={0} />

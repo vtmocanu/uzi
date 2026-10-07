@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 
 import { api, type RecoveryCustodyHold, type RecoveryCustodyHolds } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
-import { custodyHoldView, groupHoldsByWorker, type CustodyCheckpointView } from "../lib/recovery";
+import { custodyHoldView, groupHoldsByWorker, recoveryCapacityUsed, type CustodyCheckpointView } from "../lib/recovery";
 import { stripUnsafeChars } from "../lib/safeText";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { Badge, Button, Card, SectionTitle, cx } from "./ui";
@@ -58,6 +58,7 @@ export function RecoveryHoldsSurface() {
     openHoldsByRun.set(h.run_id, (openHoldsByRun.get(h.run_id) ?? 0) + 1);
   }
   const { open_holds, custody_hold_limit, decision_needed } = holds.aggregate;
+  const capacityUsed = recoveryCapacityUsed(holds.aggregate);
 
   return (
     <Card id="recovery-holds" className="scroll-mt-20 space-y-4">
@@ -68,9 +69,11 @@ export function RecoveryHoldsSurface() {
         </div>
         <p className="text-xs text-faint">
           <span className="tabular-nums text-muted">
-            {open_holds} / {custody_hold_limit}
+            {capacityUsed} / {custody_hold_limit}
           </span>{" "}
           custody slots used
+          {" · "}
+          <span className="tabular-nums text-muted">{open_holds} open custody {open_holds === 1 ? "hold" : "holds"}</span>
           {decision_needed > 0 && (
             <>
               {" · "}

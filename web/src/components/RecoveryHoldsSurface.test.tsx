@@ -46,15 +46,16 @@ function hold(over: Partial<RecoveryCustodyHold> = {}): RecoveryCustodyHold {
   };
 }
 
-function listing(holds: RecoveryCustodyHold[]): RecoveryCustodyHolds {
+function listing(holds: RecoveryCustodyHold[], over: Partial<RecoveryCustodyHolds["aggregate"]> = {}): RecoveryCustodyHolds {
   const open = holds.filter((h) => h.state === "open");
   return {
     aggregate: {
       open_holds: open.length,
-      admission_counted_holds: open.length,
+      admission_counted_holds: 0,
       custody_hold_limit: 8,
       decision_needed: open.filter((h) => h.attention === "source_only" || h.attention === "needs_action").length,
       blocked_runs: 0,
+      ...over,
     },
     holds,
   };
@@ -75,6 +76,36 @@ async function renderSurface(resp: RecoveryCustodyHolds) {
 }
 
 describe("RecoveryHoldsSurface", () => {
+  it.each([
+    [8, undefined, 8, 8],
+    [8, 0, 8, 0],
+    [12, 3, 8, 3],
+    [12, 8, 8, 8],
+    [12, 8, 0, 8],
+    [12, 8, -1, 8],
+  ])("renders total %s and capacity %s with limit %s independently", async (open_holds, admission_counted_holds, custody_hold_limit, used) => {
+    const resp = listing([hold({ attention: "source_only" })], {
+      open_holds, admission_counted_holds, custody_hold_limit,
+    });
+    if (admission_counted_holds === undefined) delete resp.aggregate.admission_counted_holds;
+    await renderSurface(resp);
+    expect(screen.getByText(`${used} / ${custody_hold_limit}`)).toBeTruthy();
+    expect(screen.getByText(/open custody holds/).textContent).toContain(`${open_holds} open custody holds`);
+    expect(screen.getByRole("button", { name: /Discard held work/ })).toBeTruthy();
+  });
+
+  it("uses aggregate capacity for an older counted hold whose attention is still active", async () => {
+    await renderSurface(listing([
+      hold({ id: "older", attention: "active", terminal_record_rejection: "mac_failure" }),
+      hold({ id: "newer", attention: "active" }),
+    ], { admission_counted_holds: 1 }));
+    expect(screen.getByText("1 / 8")).toBeTruthy();
+    expect(screen.getByText(/open custody holds/).textContent).toContain("2 open custody holds");
+    expect(screen.getByText("Active protection")).toBeTruthy();
+    expect(screen.queryByText(/need a decision|to resolve/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /Discard held work/ })).toBeNull();
+  });
+
   it("shows fixed rejection separately on the exact source-only generation without export", async () => {
     await renderSurface(listing([
       hold({ id: "hold-gen7", run_id: "run-one", generation: 7, attention: "source_only", terminal_record_rejection: "mac_failure" }),
@@ -118,7 +149,7 @@ describe("RecoveryHoldsSurface", () => {
     expect(within(row).queryByRole("button", { name: /Discard held work/ })).toBeNull();
     expect(screen.queryByText("gen 8")).toBeNull();
     expect(document.body.textContent).not.toContain("unknown MAC failure");
-    expect(screen.getByText("2 / 8")).toBeTruthy();
+    expect(screen.getByText("0 / 8")).toBeTruthy();
     expect(screen.queryByText(/need a decision|to resolve/)).toBeNull();
     expect(mockApi.discardHold).not.toHaveBeenCalled();
   });
