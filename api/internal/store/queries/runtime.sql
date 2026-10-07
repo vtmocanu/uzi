@@ -10502,7 +10502,7 @@ WHERE child.id = @child_id AND child.worker_id = @worker_id
   AND cc.stage = 'plan' AND cc.verdict = 'pending' AND now() < cc.deadline_at
   AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
   AND lead.claim_generation = cc.lead_claim_generation
-FOR UPDATE OF lead;
+FOR UPDATE OF lead, cc;
 
 -- name: DecidePlanCrossCheck :one
 UPDATE cross_checks cc SET verdict = @verdict, reason_class = @reason_class,

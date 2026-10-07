@@ -11515,7 +11515,7 @@ WHERE child.id = $1 AND child.worker_id = $2
   AND cc.stage = 'plan' AND cc.verdict = 'pending' AND now() < cc.deadline_at
   AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
   AND lead.claim_generation = cc.lead_claim_generation
-FOR UPDATE OF lead
+FOR UPDATE OF lead, cc
 `
 
 type LockPlanCrossCheckLeadForVerdictParams struct {
