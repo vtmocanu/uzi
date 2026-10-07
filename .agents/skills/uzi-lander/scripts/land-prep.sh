@@ -21,9 +21,12 @@
 #                    Local commits the remote lacks are kept under
 #                    refs/uzi-lander/fresh-backup/pr-<PR>/<old HEAD sha> (FRESH_BACKUP=) and
 #                    named, for a cherry-pick back after the rebase.
-#   --gate           which `task gate:<c>` targets to run before pushing. `auto` (default)
-#                    derives them from the changed paths (api/, web/, agent/, controller/);
-#                    `none` skips gates (only when CI is the arbiter, e.g. a docs-only PR).
+#   --gate           which `task gate:<c>` targets to run before pushing. `none` (default):
+#                    no local gate; CI on the pushed head is the gate (merge.sh refuses red,
+#                    pending or missing required checks), and the run prints
+#                    LOCAL_GATES=none so nobody reports it as a local pass. `auto` runs the
+#                    full component gates derived from the changed paths (api/, web/, agent/,
+#                    controller/; gate:repo when none match); a comma list names them.
 #   --no-push        stop before the push (inspect the worktree first).
 #   --no-rework-check  skip the mr_rework and ci_fix guards (ONLY for a repo that is not on uzi).
 #   --allow-changelog-removals  push even though the branch deletes CHANGELOG.md lines the
@@ -95,7 +98,7 @@
 #      after the CHANGELOG guard (exit 9), also after a pre-push base-move rebase
 set -uo pipefail
 
-REPO=""; PR=""; WT=""; WT_EXPLICIT=0; SKIP_REBASE=0; GATE="auto"; PUSH=1; ROOT=""; REWORK_CHECK=1; FRESH=0; ALLOW_CL_RM=0; ALLOW_WF=0
+REPO=""; PR=""; WT=""; WT_EXPLICIT=0; SKIP_REBASE=0; GATE="none"; PUSH=1; ROOT=""; REWORK_CHECK=1; FRESH=0; ALLOW_CL_RM=0; ALLOW_WF=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --worktree) WT="${2:?}"; WT_EXPLICIT=1; shift 2;;
@@ -433,17 +436,50 @@ fi
 # remote head $LEASE against that head's merge-base with origin/$BASE) must each still sit
 # under [Unreleased] in HEAD; one that HEAD holds only outside [Unreleased] (misplaced) or nowhere (missing) stops
 # here (exit 11), each named with which it is. No automatic relocation: move it by hand, commit, re-run --skip-rebase. A block is a
-# `- ` line plus its indented continuation lines, compared verbatim.
+# `- ` line plus its indented continuation lines, compared verbatim, with one exception: a
+# migration renumber (a migration file the branch head adds that HEAD carries under the same
+# name with a new number prefix) may change that number inside the branch's own bullet. Only
+# those OLD->NEW pairs are substituted, as whole digit tokens; any other edit still stops.
 # Each file read gets a trailing blank line so awk sees a first record even when it is empty.
 changelog_placement_guard() {
-  local mb gd stray
+  local mb gd stray subs lease_m head_m n pfx rest h hp
   mb=$(git merge-base "$LEASE" "origin/$BASE" 2>/dev/null) \
     || { log "cannot find the merge-base of the branch head and origin/$BASE for the CHANGELOG placement check"; exit 3; }
   gd=$(mktemp -d "${TMPDIR:-/tmp}/land-prep-${PR}-clplace.XXXXXX") || exit 3
   { git show "$mb:CHANGELOG.md" 2>/dev/null; echo; } > "$gd/1"
   { git show "$LEASE:CHANGELOG.md" 2>/dev/null; echo; } > "$gd/2"
   { git show "HEAD:CHANGELOG.md" 2>/dev/null; echo; } > "$gd/3"
-  stray=$(awk '
+  subs=""
+  lease_m=$(git ls-tree --name-only "$LEASE" -- api/internal/store/migrations/ 2>/dev/null | sed 's|.*/||')
+  head_m=$(git ls-tree --name-only HEAD -- api/internal/store/migrations/ 2>/dev/null | sed 's|.*/||')
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    printf '%s\n' "$head_m" | grep -qxF "$n" && continue
+    pfx=$(printf '%s' "$n" | grep -oE '^[0-9]+' || true); [ -n "$pfx" ] || continue
+    rest=${n#"$pfx"}
+    while IFS= read -r h; do
+      [ -n "$h" ] || continue
+      printf '%s\n' "$lease_m" | grep -qxF "$h" && continue
+      hp=$(printf '%s' "$h" | grep -oE '^[0-9]+' || true)
+      [ -n "$hp" ] && [ "${h#"$hp"}" = "$rest" ] && subs="$subs ${pfx}:${hp}"
+    done <<< "$head_m"
+  done <<< "$lease_m"
+  stray=$(awk -v subs="$subs" '
+    function renum(s,   i, j, np, pr, old, new, out, pre, post) {
+      np = split(subs, pr, " ")
+      for (j = 1; j <= np; j++) {
+        old = pr[j]; sub(/:.*/, "", old); new = pr[j]; sub(/^[^:]*:/, "", new)
+        out = ""
+        while ((i = index(s, old)) > 0) {
+          pre = (i > 1) ? substr(s, i - 1, 1) : ""; post = substr(s, i + length(old), 1)
+          if (pre !~ /[0-9]/ && post !~ /[0-9]/) out = out substr(s, 1, i - 1) new
+          else out = out substr(s, 1, i - 1 + length(old))
+          s = substr(s, i + length(old))
+        }
+        s = out s
+      }
+      return s
+    }
     function out() { if (cur != "") { if (isu) U[f, cur] = 1; else R[f, cur] = 1; if (isu && f == 2) B[++nb] = cur; cur = "" } }
     FNR == 1 { out(); f++ }
     /^## / { out(); isu = ($0 ~ /^## \[Unreleased\]/); next }
@@ -455,7 +491,7 @@ changelog_placement_guard() {
       out()
       for (i = 1; i <= nb; i++) {
         b = B[i]
-        if (!((1, b) in U) && !((3, b) in U)) {
+        if (!((1, b) in U) && !((3, b) in U) && !(subs != "" && (3, renum(b)) in U)) {
           t = b; sub(/\037.*/, "", t)
           print (((3, b) in R) ? "misplaced (only in a released section): " : "missing (absent from the rebased file; a removal or reword needs a human): ") t
         }
@@ -608,6 +644,9 @@ if [ "$GATE" != "none" ]; then
     fi
     log "task $g green"
   done
+else
+  log "local gates not run (--gate none): CI on the pushed head is the gate"
+  echo "LOCAL_GATES=none (awaiting CI on the pushed head; not a local pass)"
 fi
 
 # ---- workflow-file stop ----------------------------------------------------------------------
