@@ -22,6 +22,12 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Checkpoint pushes with lost acknowledgements can be confirmed while a run is live ([#2395](https://github.com/vtmocanu/uzi/issues/2395)).**
+  After the broker records an actual advance or a potentially sent push with an unknown outcome, reconciliation can confirm the matching forge tip. Later unchanged-tip retries and restarted claims recognize the durable checkpoint without creating live retention or deletion obligations. Unclassified attempts remain pending competing claims; another run's claims and newer checkpoint or slot state prevent adoption. Broker acknowledgements retain their raw success/rejection markers and have a cumulative 1 MiB response limit.
+  Migration 00306 is additive, leaves legacy attempts pending without backfill, and retains readiness evidence on rollback. A crash before disposition recording can still leave a landed push pending. The existing terminal stalled-sender hazard remains outside this fix (finding 5b641106-d2cf-4767-813f-e29d0692c228).
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed
