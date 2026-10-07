@@ -317,7 +317,8 @@ gets. The near-timeout health flag stays proportional to the effective budget;
 `needs_attention` and idle detection continue to flag stalled work before the larger
 wall budget is exhausted. A longer wall budget can still spend more tokens on a
 run that keeps producing activity. Operators who relied on the previous defaults
-can explicitly set `RUN_TIMEOUT=2h`, `RUN_WALL_CEILING=8h`, and `RUN_MAX_REQUEUES=1`.
+can explicitly set `RUN_TIMEOUT=2h`, `RUN_WALL_CEILING=8h`, and `RUN_MAX_REQUEUES=1`;
+a job created without `wall_seconds` then gets 8h (the ceiling), not the old `RUN_TIMEOUT` fallback.
 The chart inherits these server defaults unless `api.config` overrides them;
 the render-test fixture's explicit `RUN_TIMEOUT=6h` is already aligned.
 

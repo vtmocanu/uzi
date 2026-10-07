@@ -2190,6 +2190,11 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 	if p.DispatchGrace <= 0 {
 		p.DispatchGrace = defaultDispatchGrace
 	}
+	// An unwired ceiling must not freeze 0-second walls (LEAST(…, 0)): fall back to the
+	// same derived default config.Load uses for an unset RUN_WALL_CEILING (#2279).
+	if p.RunWallCeiling <= 0 {
+		p.RunWallCeiling = min(max(24*time.Hour, p.RunTimeout), 72*time.Hour)
+	}
 	return &Service{
 		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), outbox: newOutboxTracker(), quarantine: newQuarantineTracker(),
 		publishFn:            pushbroker.Publish,

@@ -195,8 +195,8 @@ with the bot, so the sender is already `uzi`. Glyph legend:
     restarts — the honest worst case is the timeout times one more than the
     requeue limit, not the timeout flat. The per-run question cap
     (`QUESTION_MAX`, 5 by default) resets the same way for the same reason,
-    so it has the identical caveat: a run may ask up to 10 questions over its
-    life, not 5, if a worker dies and it's requeued in between (one attempt
+    so it has the identical caveat: a run may ask up to 20 questions over its
+    life on defaults (`RUN_MAX_REQUEUES` is 3), not 5, if a worker dies and it's requeued in between (one attempt
     more for a run resumed through the one-shot finalize-resume allowance,
     issue #1742).
   - **The ✅ means "recorded", not "delivered".** It is added once uzi has

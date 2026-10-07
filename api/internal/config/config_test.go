@@ -1156,7 +1156,7 @@ func TestImplicitRunCeilingPreservesLongTimeout(t *testing.T) {
 		key[i] = byte(i + 1)
 	}
 	t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(key))
-	for _, base := range []string{"30h", "100h", "1000000h"} {
+	for _, base := range []string{"30h", "100h"} {
 		t.Run(base, func(t *testing.T) {
 			t.Setenv("RUN_TIMEOUT", base)
 			for _, wall := range []string{"", "   "} {

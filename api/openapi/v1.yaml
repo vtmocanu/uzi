@@ -786,7 +786,7 @@ components:
           type:
             - integer
             - "null"
-          description: The job's wall-clock limit; null while the instance default applies.
+          description: The job's wall-clock limit, frozen at create; null only for a job created before defaults were frozen at create, which uses the instance `RUN_TIMEOUT`.
         created_at:
           type: string
           format: date-time
