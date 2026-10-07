@@ -4209,8 +4209,8 @@ export class RunRunner {
     // permanent-failure hook (abort, reap, one terminal report), which the reap decision below
     // must observe. This close sets owedFeedClosed (the wrapped batcher.close), so the
     // terminal-inventory snapshot below announces its retained-head, archive and divergence
-    // notices to the run log only, never the feed; the batcher is not reopened. The second close
-    // after the snapshot is an idempotent drain of anything already queued.
+    // notices to the run log only, never the feed; the batcher is not reopened. The close
+    // after the snapshot below joins this one (the wrapped batcher.close runs the real close once).
     await batcher.close().catch(() => undefined);
     // PRD #1349 M2 (D4.5) / #1531: REAP THIS generation's provider FIRST, BEFORE the `failed`
     // report. A steering-cancel and an early agent failure both land here (a cancel aborts the
@@ -7809,9 +7809,13 @@ export class RunRunner {
     // abort-BEFORE-reap, reap-BEFORE-send ordering is unit-testable against the REAL code — a mutation
     // to any of those orderings reddens a test.
     const close = batcher.close.bind(batcher);
-    batcher.close = async (...args: Parameters<MessageBatcher["close"]>) => {
+    // Idempotent: the failure path closes before the provider reap and again after the terminal
+    // inventory snapshot; the second call joins the first close instead of closing the batcher twice.
+    let closing: ReturnType<MessageBatcher["close"]> | undefined;
+    batcher.close = (...args: Parameters<MessageBatcher["close"]>) => {
       flight.owedFeedClosed = true;
-      return close(...args);
+      closing ??= close(...args);
+      return closing;
     };
     batcher.onPermanentFailureReport(({ reason }) => this.handlePermanentFailure(claim, flight, reason));
 
