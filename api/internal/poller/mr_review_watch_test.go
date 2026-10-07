@@ -52,7 +52,6 @@ type mrwStore struct {
 	pendingRemovals []store.RemoveMRReworkPendingIDsParams
 	haltSets        []store.SetMRReworkHaltNotifiedParams
 	evicts          []uuid.UUID
-	upsertErr       error
 	haltErr         error
 
 	ops *[]string
@@ -106,10 +105,9 @@ func (s *mrwStore) GetMRReworkLedger(_ context.Context, arg store.GetMRReworkLed
 	return store.MrReworkLedger{}, pgx.ErrNoRows
 }
 
-func (s *mrwStore) UpsertMRReworkLedger(_ context.Context, arg store.UpsertMRReworkLedgerParams) error {
-	if s.upsertErr != nil {
-		return s.upsertErr
-	}
+// applyUpsert mirrors UpsertMRReworkLedger. The detector no longer writes the ledger itself
+// (the create does, in its own transaction), so only the mrwRuns fake reaches it.
+func (s *mrwStore) applyUpsert(arg store.UpsertMRReworkLedgerParams) {
 	s.upserts = append(s.upserts, arg)
 	if s.ledgers == nil {
 		s.ledgers = map[string]store.MrReworkLedger{}
@@ -125,10 +123,6 @@ func (s *mrwStore) UpsertMRReworkLedger(_ context.Context, arg store.UpsertMRRew
 	cur.HaltNotified = false // a proceed resets the latch
 	cur.PendingUnknownIds = mergePending(cur.PendingUnknownIds, arg.PendingAdd, arg.PendingRemove, arg.PendingSuperseded, arg.PendingSupersededBy, priorHighWater)
 	s.ledgers[arg.Ref] = cur
-	if s.ops != nil {
-		*s.ops = append(*s.ops, "upsert")
-	}
-	return nil
 }
 
 // mergePending mirrors mr_rework_merge_pending: (existing UNION added ids above the prior
@@ -251,6 +245,8 @@ type mrwRunCall struct {
 	mrIID                       int64
 	title, desc                 string
 	snapshot                    *workersvc.ReviewCommentsSnapshot
+	capLimit                    int
+	plan                        workersvc.ReviewPlan // the advance that rode the create
 }
 
 type mrwRuns struct {
@@ -258,15 +254,38 @@ type mrwRuns struct {
 	calls []mrwRunCall
 	runID uuid.UUID
 	ops   *[]string
+	// st is the ledger the fake create re-validates and advances, standing in for
+	// workersvc's in-transaction recheck and upsert; newMRW binds it.
+	st *mrwStore
 }
 
-func (r *mrwRuns) CreateAutoMRReworkRun(_ context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, desc string, snapshot *workersvc.ReviewCommentsSnapshot) (store.Run, error) {
-	r.calls = append(r.calls, mrwRunCall{userID, repoID, sourceRunID, ref, mrIID, title, desc, snapshot})
+func (r *mrwRuns) CreateAutoMRReworkRunAndAdvance(_ context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, desc string, res *workersvc.ReviewSnapshotResult, capLimit int) (store.Run, error) {
+	plan := res.PlanAssessed()
+	r.calls = append(r.calls, mrwRunCall{userID, repoID, sourceRunID, ref, mrIID, title, desc, res.Snapshot, capLimit, plan})
 	if r.ops != nil {
 		*r.ops = append(*r.ops, "create")
 	}
 	if r.err != nil {
 		return store.Run{}, r.err
+	}
+	if r.st != nil {
+		// The same re-validation the real create runs under the branch lock.
+		cur := r.st.ledgers[ref]
+		if int(cur.AttemptCount) >= capLimit {
+			return store.Run{}, workersvc.ErrMRReworkCapReached
+		}
+		if !res.HasNewAgainst(cur.HighWater, cur.PendingUnknownIds) {
+			return store.Run{}, workersvc.ErrReworkNothingNew
+		}
+		r.st.applyUpsert(store.UpsertMRReworkLedgerParams{
+			RepoID:              repoID,
+			Ref:                 ref,
+			HighWater:           plan.MaxActionableID,
+			PendingAdd:          plan.PendingAdd,
+			PendingRemove:       plan.PendingRemove,
+			PendingSuperseded:   plan.PendingSuperseded,
+			PendingSupersededBy: plan.PendingSupersededBy,
+		})
 	}
 	if r.runID == (uuid.UUID{}) {
 		r.runID = uuid.New()
@@ -399,6 +418,7 @@ func newMRW(st *mrwStore, runs *mrwRuns, notifier *mrwNotifier, set mrwSettings)
 	if notifier != nil {
 		n = notifier
 	}
+	runs.st = st
 	return NewMRReviewWatch(st, runs, st.ras(), n, set, 5, 5*time.Minute)
 }
 
@@ -437,9 +457,13 @@ func TestMRReworkProceedStartsRun(t *testing.T) {
 	if got := st.ledgers[mrwRef].AttemptCount; got != 1 {
 		t.Fatalf("attempt_count = %d, want 1", got)
 	}
-	// create → upsert (create-then-record).
-	if strings.Join(ops, ",") != "create,upsert" {
-		t.Fatalf("op order = %v, want [create upsert]", ops)
+	// The advance rides the create (one transaction in the real service): the poller makes no
+	// ledger write of its own after it, and the create carries the plan and the cap.
+	if strings.Join(ops, ",") != "create" {
+		t.Fatalf("op order = %v, want [create] only", ops)
+	}
+	if c.capLimit != 5 || c.plan.MaxActionableID != 120 {
+		t.Fatalf("create carried capLimit=%d plan.MaxActionableID=%d, want 5/120", c.capLimit, c.plan.MaxActionableID)
 	}
 	if len(f.notes) != 0 || len(notifier.calls) != 0 {
 		t.Fatalf("a proceed posts no halt comment/notify, got notes=%d notifs=%d", len(f.notes), len(notifier.calls))

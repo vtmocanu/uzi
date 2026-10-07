@@ -247,3 +247,38 @@ func TestOnDemandReworkLeavesAConcurrentlyStoredPendingIDAloneLiveDB(t *testing.
 		t.Fatalf("pending = %v, want 170 kept: the listing never saw it", pending)
 	}
 }
+
+// A stale bare request must not rework comments another request already handled. Request A reads
+// the ledger (high-water 150) and lists the thread; while it is listing, request B consumes
+// comment 190 and its run completes (so the one-active-rework index no longer blocks A). A's
+// create must re-validate against the current ledger under the branch lock and refuse.
+func TestOnDemandReworkStaleBareRequestDoesNotReconsumeLiveDB(t *testing.T) {
+	rig := newReworkRig(t, &settingsStore{}, time.Minute)
+	rig.f.answers[11] = forge.AuthorEligible
+	q := store.New(rig.pool)
+	ctx := context.Background()
+	if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
+		RepoID: rig.repoID, Ref: reworkRef, HighWater: 150,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rig.f.comments = []forge.MRComment{rcomment(190, 11, "please rename the helper")}
+	rig.f.onList = func() {
+		rig.f.onList = nil // one-shot: the nested request lists without a hook
+		if rec := rig.post(t, `{}`); rec.Code != http.StatusCreated {
+			t.Errorf("concurrent request: status %d body %s, want 201", rec.Code, rec.Body.String())
+			return
+		}
+		if _, err := rig.pool.Exec(ctx, `UPDATE runs SET status = 'completed' WHERE kind = 'mr_rework' AND target_run_id = $1`, rig.runID); err != nil {
+			t.Error(err)
+		}
+	}
+
+	rec := rig.post(t, `{}`)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "nothing to rework") {
+		t.Fatalf("stale request: status %d body %s, want the nothing-to-rework 409", rec.Code, rec.Body.String())
+	}
+	if n := rig.reworkRuns(t); n != 1 {
+		t.Fatalf("mr_rework runs = %d, want 1: the stale request must not duplicate the rework", n)
+	}
+}

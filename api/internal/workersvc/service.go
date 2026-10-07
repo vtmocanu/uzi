@@ -476,6 +476,9 @@ type Store interface {
 	// owner can pay for the run the endpoint would mint.
 	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.MrReworkLedger, error)
 	RemoveMRReworkPendingIDs(ctx context.Context, arg store.RemoveMRReworkPendingIDsParams) error
+	// UpsertMRReworkLedger records an automatic cycle (issue #2347): the watcher's create runs
+	// it in the same transaction as the run INSERT (CreateAutoMRReworkRunAndAdvance).
+	UpsertMRReworkLedger(ctx context.Context, arg store.UpsertMRReworkLedgerParams) error
 	// CreateManualMRReworkRunAndAdvance folds the on-demand run INSERT and the non-counting
 	// high-water advance into ONE atomic statement (PRD #1202, review-finding hardening):
 	// Postgres commits BOTH or NEITHER, so a create can never leave an unadvanced ledger that

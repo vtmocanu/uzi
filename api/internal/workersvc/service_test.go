@@ -507,6 +507,8 @@ type fakeStore struct {
 	mrReworkRunResult store.Run
 	mrReworkRunErr    error
 	mrReworkRunParams *store.CreateAutoMRReworkRunParams
+	ledgerUpserts     []store.UpsertMRReworkLedgerParams
+	ledgerUpsertErr   error
 	// On-demand mr_rework (PRD #1202). StartMRReworkForRun reads the ledger + token gate,
 	// then the manual create folds the run INSERT and the non-counting high-water advance
 	// into ONE atomic call (CreateManualMRReworkRunAndAdvance). mrReworkAndAdvanceParams
@@ -1665,6 +1667,11 @@ func (f *fakeStore) CreateAutoMRReworkRun(_ context.Context, arg store.CreateAut
 func (f *fakeStore) RemoveMRReworkPendingIDs(_ context.Context, arg store.RemoveMRReworkPendingIDsParams) error {
 	f.pendingRemovals = append(f.pendingRemovals, arg)
 	return f.pendingRemovalErr
+}
+
+func (f *fakeStore) UpsertMRReworkLedger(_ context.Context, arg store.UpsertMRReworkLedgerParams) error {
+	f.ledgerUpserts = append(f.ledgerUpserts, arg)
+	return f.ledgerUpsertErr
 }
 
 func (f *fakeStore) GetMRReworkLedger(_ context.Context, _ store.GetMRReworkLedgerParams) (store.MrReworkLedger, error) {

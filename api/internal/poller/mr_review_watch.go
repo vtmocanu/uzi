@@ -27,7 +27,6 @@ import (
 type mrReviewWatchStore interface {
 	ListMRReworkCandidates(ctx context.Context, repoID uuid.UUID) ([]store.ListMRReworkCandidatesRow, error)
 	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.MrReworkLedger, error)
-	UpsertMRReworkLedger(ctx context.Context, arg store.UpsertMRReworkLedgerParams) error
 	RemoveMRReworkPendingIDs(ctx context.Context, arg store.RemoveMRReworkPendingIDsParams) error
 	SetMRReworkHaltNotified(ctx context.Context, arg store.SetMRReworkHaltNotifiedParams) error
 	DeleteMRReworkLedgerNotIn(ctx context.Context, repoID uuid.UUID) (int64, error)
@@ -36,12 +35,13 @@ type mrReviewWatchStore interface {
 }
 
 // MRReworkRunStarter creates an automatic mr_rework run through workersvc's shared
-// create path (PRD #700 M3). *workersvc.Service satisfies it. Keeping run creation on
+// create path (PRD #700 M3), together with the cycle's ledger advance in one transaction
+// (issue #2347), after re-validating freshness and the cap under the branch lock. *workersvc.Service satisfies it. Keeping run creation on
 // the workersvc side is what makes the run go through the SAME guards — the
 // one-active-mr_rework-per-MR index and the create-time cross-kind branch guard — so
 // the detector receives ErrActiveMRReworkExists / ErrBranchInUse to swallow on a race.
 type MRReworkRunStarter interface {
-	CreateAutoMRReworkRun(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, snapshot *workersvc.ReviewCommentsSnapshot) (store.Run, error)
+	CreateAutoMRReworkRunAndAdvance(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, res *workersvc.ReviewSnapshotResult, capLimit int) (store.Run, error)
 }
 
 // MRReviewNotifier records the halt notification and sends its Slack DM to the MR
@@ -190,7 +190,7 @@ func (d *MRReviewWatch) detect(ctx context.Context, r store.ListEnabledReposWith
 // detectOne runs the loop-guard state machine for one candidate MR (PRD #700 M3). The
 // gates fire in order, each a distinct NEGATIVE case: green head pipeline → an ELIGIBLE new
 // actionable comment (issue #2347) → review landed (debounce + current HeadSHA) → under the
-// capLimit → branch free (checked at create time inside CreateAutoMRReworkRun). Any gate
+// capLimit → branch free (checked at create time inside CreateAutoMRReworkRunAndAdvance). Any gate
 // that fails is a silent no-op (no ledger write, no comment) except the capLimit halt,
 // which comments once.
 func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, f forge.Forge, cand store.ListMRReworkCandidatesRow, capLimit int, trusted []settings.TrustedBot) {
@@ -301,7 +301,6 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	}
 
 	res := as.Snapshot(ctx)
-	snap := res.Snapshot
 	// The newest ELIGIBLE comment (the snapshot is oldest-first) drives the review-landed gate.
 	newest, found := res.NewestEligible()
 	if !found {
@@ -358,6 +357,11 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	// the next tick retries. A latch-write failure returns before the comment: the next tick
 	// re-notifies (a duplicate DM, accepted) but a comment never lacks its latch. Net: the DM
 	// is at-least-once, the comment at-most-once.
+	//
+	// This gate reads the ledger taken before the comment listing and is only an early exit:
+	// the authoritative cap check runs under the creation lock (CreateAutoMRReworkRunAndAdvance
+	// refuses with ErrMRReworkCapReached), and a refusal there is followed on the next tick by
+	// this halt path.
 	if int(led.AttemptCount) >= capLimit {
 		if !led.HaltNotified {
 			if err := d.notifyHalt(ctx, cand, issueIID, capLimit); err != nil {
@@ -379,33 +383,29 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	}
 
 	// GATE 5 / PROCEED — start the automatic mr_rework run. The cross-kind branch guard
-	// and the one-active-mr_rework-per-MR index are enforced inside CreateAutoMRReworkRun;
-	// a race surfaces as ErrBranchInUse / ErrActiveMRReworkExists, swallowed here.
+	// and the one-active-mr_rework-per-MR index are enforced inside
+	// CreateAutoMRReworkRunAndAdvance; a race surfaces as ErrBranchInUse /
+	// ErrActiveMRReworkExists, swallowed here.
 	//
-	// CREATE-THEN-RECORD: create the run first, then advance the ledger (high_water to
-	// the max ACTIONABLE kept id, attempt_count +1). A crash between the two re-evaluates
-	// next tick; the same-kind index keeps it from doubling.
+	// ATOMIC CREATE-AND-RECORD: the run INSERT and the ledger advance (high_water to the max
+	// ACTIONABLE kept id, attempt_count +1, the pending delta) commit in ONE transaction under
+	// the branch lock, so a returned run always has its cycle recorded and a refused create
+	// writes nothing. Under that lock the create also re-reads the ledger: another request or
+	// cycle that consumed these comments, or spent the cap, since the pre-listing read above
+	// is refused (ErrReworkNothingNew / ErrReworkPermissionUnknown / ErrMRReworkCapReached),
+	// swallowed here without a ledger write; the next tick re-evaluates from the new row.
 	title := fmt.Sprintf("Rework MR review: %s (!%d)", ref, mrIID)
 	description := fmt.Sprintf("Address the new review comments on merge request !%d for `%s`, folding the fixes onto the existing branch.", mrIID, ref)
 
-	_, err = d.runs.CreateAutoMRReworkRun(ctx, cand.UserID, r.ID, ref, mrIID, cand.SourceRunID, title, description, snap)
+	_, err = d.runs.CreateAutoMRReworkRunAndAdvance(ctx, cand.UserID, r.ID, ref, mrIID, cand.SourceRunID, title, description, res, capLimit)
 	switch {
 	case err == nil:
-		if err := d.q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
-			RepoID:              r.ID,
-			Ref:                 ref,
-			HighWater:           plan.MaxActionableID,
-			PendingAdd:          plan.PendingAdd,
-			PendingRemove:       plan.PendingRemove,
-			PendingSuperseded:   plan.PendingSuperseded,
-			PendingSupersededBy: plan.PendingSupersededBy,
-		}); err != nil {
-			// The run is active; the next tick's branch guard keeps it from doubling.
-			slog.Error("poller: mr-rework upsert ledger", "repo", r.PathWithNamespace, "ref", ref, "error", err)
-		}
-	case errors.Is(err, workersvc.ErrBranchInUse), errors.Is(err, workersvc.ErrActiveMRReworkExists):
-		// A race with a ci_fix on the branch, or a concurrent rework on this MR: swallow,
-		// do not advance the ledger, retry next tick.
+	case errors.Is(err, workersvc.ErrBranchInUse), errors.Is(err, workersvc.ErrActiveMRReworkExists),
+		errors.Is(err, workersvc.ErrMRReworkCapReached), errors.Is(err, workersvc.ErrReworkNothingNew),
+		errors.Is(err, workersvc.ErrReworkPermissionUnknown):
+		// A race with a ci_fix on the branch, a concurrent rework on this MR, or a concurrent
+		// cycle that consumed these comments or spent the cap: swallow, nothing was written,
+		// retry next tick.
 	case errors.Is(err, workersvc.ErrNoCredentialForHarness):
 		// PRD #1429 M2 (D4): the automatic rework INHERITS the source run's harness explicitly; if
 		// that harness is no longer usable, creation refuses with no fallback. Record a legible,

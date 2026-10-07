@@ -609,10 +609,25 @@ type ReviewPlan struct {
 
 // PlanAssessed plans against the ledger values the assessment began with, which the caller
 // read before listing the comments. A pending id in that set therefore existed before the
-// listing, so one absent from the listing is gone whatever the forge's id order. Callers must
-// not re-read the ledger after the listing and plan against that instead.
+// listing, so one absent from the listing is gone whatever the forge's id order. The DELTAS
+// (pending add/remove/supersession and MaxActionableID) must come from that pre-listing row:
+// a later re-read cannot tell a pending id the listing lost from one added after it. Whether
+// there is still something new is a separate question, HasNewAgainst, which the create paths
+// re-validate against the current row under the branch lock.
 func (res *ReviewSnapshotResult) PlanAssessed() ReviewPlan {
 	return res.Plan(res.highWater, res.pending)
+}
+
+// HasNewAgainst reports whether an eligible actionable comment in the snapshot is above
+// highWater or in pending: the freshness test the create paths re-run against the CURRENT
+// ledger row under the branch lock. It carries no deltas.
+func (res *ReviewSnapshotResult) HasNewAgainst(highWater int64, pending []int64) bool {
+	for _, id := range res.eligibleActionable {
+		if id > highWater || slices.Contains(pending, id) {
+			return true
+		}
+	}
+	return false
 }
 
 // Plan computes the plan against a ledger row's high-water mark and pending set. The row must
@@ -627,10 +642,8 @@ func (res *ReviewSnapshotResult) Plan(highWater int64, pending []int64) ReviewPl
 		if id > plan.MaxActionableID {
 			plan.MaxActionableID = id
 		}
-		if id > highWater || pendingSet[id] {
-			plan.HasNew = true
-		}
 	}
+	plan.HasNew = res.HasNewAgainst(highWater, pending)
 	newMark := max(highWater, plan.MaxActionableID)
 	// One representative pending id per unverified author: that author's NEWEST unknown
 	// actionable id among those the ledger merge will accept (above the old mark and at or below
