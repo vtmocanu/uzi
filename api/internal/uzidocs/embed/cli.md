@@ -421,7 +421,15 @@ A few worth knowing:
   number is repo-relative), so `--repo A --repo B ... --issue N` is a usage error
   (exit 2) before any create; `--sweep` and `--prompt` targets group freely.
   `--auto-approve` defaults **on** (an off-hours run should proceed past the plan
-  gate); pass `--auto-approve=false` to keep the gate. `--wait-on-limit` also
+  gate); pass `--auto-approve=false` to keep the gate. **To start an
+  auto-approved run on one issue now**, use a disabled one-shot schedule:
+  `run create` has no auto-approve flag, since auto-approval is reserved for
+  unattended paths. Run `schedule create --repo <id> --issue <iid> --at <any
+  future time> --enabled=false`, then `schedule run-now <schedule-id>`, then
+  `schedule delete <schedule-id>`. `run-now` fires a disabled schedule and
+  never consumes a one-shot; leaving the schedule enabled instead fires the
+  issue a second time at `--at`. The run takes the same auto-approve path as a
+  sweep, Plan cross-check included. `--wait-on-limit` also
   defaults **on** for a new schedule — a fired run parks until the Anthropic
   usage window reopens instead of failing — and this now takes effect even on
   the common auto-approve path (a schedule's own setting used to be silently

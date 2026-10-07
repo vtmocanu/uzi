@@ -770,6 +770,11 @@ nothing a manual start cannot.
     is read in (default `UTC`).
   - `--auto-approve` defaults **on** (the run proceeds past the plan gate unattended, the
     point of an off-hours schedule); pass `--auto-approve=false` to keep the gate.
+    `run create` has no auto-approve flag. To start an auto-approved run on one issue
+    now: `schedule create --repo <id> --issue <iid> --at <any future> --enabled=false`,
+    then `schedule run-now <schedule-id>`, then `schedule delete <schedule-id>`.
+    `run-now` fires a disabled schedule and never consumes a one-shot; an enabled one
+    fires the issue again at `--at`. Same path as a sweep, Plan cross-check included.
     `--wait-on-limit` parks a fired run until the Anthropic usage window reopens instead
     of failing it. `--mr-rework` sets whether fired runs' MR review comments are
     auto-reworked (`--mr-rework=false` to force off); omit it to inherit the account
