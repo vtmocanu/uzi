@@ -2043,7 +2043,20 @@ export class RecoveryCoordinator {
   }
 
   /** The one settlement rule, shared by cleanup authority and owed-context pruning. */
-  private async cleanupStateOf(records: RecoveryRecord[], generation: number): Promise<"legacy" | "pending" | "acknowledged"> {
+  private cleanupStateOf(records: RecoveryRecord[], generation: number): Promise<"legacy" | "pending" | "acknowledged"> {
+    // One evaluation per generation per journal snapshot: the memo is keyed by the snapshot array
+    // itself (weakly), so it never outlives or crosses a snapshot. Without it every generation
+    // re-evaluates all earlier ones through settledEarlierGenerations, which is exponential.
+    let memo = this.cleanupMemo.get(records);
+    if (!memo) { memo = new Map(); this.cleanupMemo.set(records, memo); }
+    let state = memo.get(generation);
+    if (!state) { state = this.evaluateCleanupState(records, generation); memo.set(generation, state); }
+    return state;
+  }
+
+  private readonly cleanupMemo = new WeakMap<RecoveryRecord[], Map<number, Promise<"legacy" | "pending" | "acknowledged">>>();
+
+  private async evaluateCleanupState(records: RecoveryRecord[], generation: number): Promise<"legacy" | "pending" | "acknowledged"> {
     const relevant = records.filter(r => r.generation === generation);
     const guarded = relevant.filter(r => r.inventoryGuarded === true);
     if (guarded.length === 0) return "legacy";

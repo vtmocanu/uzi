@@ -13,6 +13,32 @@ import { nullLogger, testGitCacheOptions } from "./helpers.js";
 const H = "a".repeat(40);
 const H2 = "b".repeat(40);
 
+it("review probe: a history of acknowledged generations does not cause exponential settlement work", async () => {
+  const f = await fixture();
+  try {
+    f.state.closeOnRelease = true;
+    const snapshot = await f.freeze();
+    assert.ok(snapshot);
+    await f.capture(snapshot);
+    const template = (await f.coordinator.inspect("run-1"))[0]!;
+    assert.equal(template.finalAcknowledged, true);
+    const count = 12;
+    const records = Array.from({ length: count }, (_, index) => ({
+      ...structuredClone(template), captureId: `generation-${index + 1}`, generation: index + 1,
+      coverageContext: { ...template.coverageContext!, generation: index + 1 },
+    }));
+    const inner = f.coordinator as unknown as {
+      cleanupStateOf(records: RecoveryRecord[], generation: number): Promise<string>;
+    };
+    const cleanup = inner.cleanupStateOf.bind(inner);
+    let calls = 0;
+    inner.cleanupStateOf = (rs, generation) => { calls++; return cleanup(rs, generation); };
+    assert.equal(await inner.cleanupStateOf(records, count), "acknowledged");
+    assert.ok(calls <= count * count,
+      `${calls} settlement evaluations for ${count} generations must not grow exponentially`);
+  } finally { await f.close(); }
+});
+
 it("review probe: a malformed guarded-hold flag cannot prove no guarded custody", async () => {
   const f = await fixture();
   try {
