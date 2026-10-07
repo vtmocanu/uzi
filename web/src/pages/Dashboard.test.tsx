@@ -211,7 +211,7 @@ beforeEach(() => {
   // Default: no custody holds, so the board alert self-hides and existing assertions are
   // unaffected. Tests that exercise the alert override this.
   mockApi.getRecoveryHolds.mockResolvedValue({
-    aggregate: { open_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 },
+    aggregate: { open_holds: 0, admission_counted_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 },
     holds: [],
   });
 });

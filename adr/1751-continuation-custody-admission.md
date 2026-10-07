@@ -1,6 +1,6 @@
 # ADR-1751: A run resuming its own custody is exempt from custody-count admission
 
-**Status**: Accepted (issue #1751, amends PRD #1296 D2/D4)
+**Status**: Accepted (issue #1751, amends PRD #1296 D2/D4); admission accounting amended by [ADR-2445](2445-custody-admission-accounting.md)
 **Date**: 2026-09-26
 **Deciders**: Vlad Mocanu (maintainer approval of the admission-policy change) + agent team
 
@@ -8,7 +8,7 @@
 
 **Continuation may create another generation hold, but is exempt from custody-count admission.**
 
-A queued run with `claim_generation >= 1` that still has at least one owner-scoped `open` custody hold for that exact run, and fewer than the limit of its own, is admitted by `ClaimRun` even when its owner is at or above the custody hold limit (`workersvc.custodyHoldLimit`, 8). A fresh run (`claim_generation = 0`), a previously claimed run whose holds are all settled, or a run that itself holds the limit's worth of open holds is gated exactly as before.
+A queued run with `claim_generation >= 1` that still has at least one owner-scoped `open` custody hold for that exact run, and fewer than the limit of its own, is admitted by `ClaimRun` even when its owner's `admission_counted_holds` is at or above the custody hold limit (`workersvc.custodyHoldLimit`, 8). A fresh run (`claim_generation = 0`), a previously claimed run whose holds are all settled, or a run that itself holds the limit's worth of open holds uses the ordinary owner admission gate. ADR-2445 separates that gate's admission count from total open custody; this exemption's per-run bound still uses total open holds.
 
 ## Context
 
@@ -24,7 +24,7 @@ Rejected: subtracting the candidate's own holds from the owner count. It fixes t
 
 ### D2: Health and the owner aggregate read the same predicate
 
-`GetCustodyAdmissionForRun` returns the owner's open-hold count and the same `continuation_exempt` expression, and the health resolver shows the custody-limit reason only for a run the claim actually blocks. `GetCustodyAggregateForOwner.blocked_runs` excludes exempt queued runs. The owner-at-limit alert and Slack episode (`ListOwnersOverCustodyLimit`) are unchanged: the owner is still at the limit and fresh runs are still blocked.
+`GetCustodyAdmissionForRun` returns the owner's total `open_holds`, `admission_counted_holds` and the same `continuation_exempt` expression. Under ADR-2445, claim and health compare the admission count to the limit, and `GetCustodyAggregateForOwner.blocked_runs` excludes exempt queued runs. Owner-at-limit health and Slack episode crossing/re-arm also use admission accounting with the configured heartbeat cutoff. The continuation bound remains the exact run's total owner-scoped open-hold count.
 
 ### D2a: The exemption is bounded per run
 
@@ -34,7 +34,7 @@ Exact rule: a queued run with `claim_generation >= 1` bypasses owner-count admis
 
 ### D3: No strict ceiling
 
-The owner hold count can now exceed the limit (by design, for continuations), and #1318 already records that concurrent claims can overshoot it. The limit is an admission gate for new work, not a transactional ceiling on holds.
+The owner hold count can exceed the limit (by design, for continuations), and #1318 already records that concurrent claims can overshoot it. ADR-2445's `STABLE` accounting function uses a statement snapshot without owner serialization; concurrent claims and later heartbeat staleness can also put admission-counted holds above the limit. The limit remains an admission gate for new work, not a transactional ceiling.
 
 ### D4: Live same-worker predecessor settlement (second milestone)
 

@@ -51,6 +51,7 @@ function listing(holds: RecoveryCustodyHold[]): RecoveryCustodyHolds {
   return {
     aggregate: {
       open_holds: open.length,
+      admission_counted_holds: open.length,
       custody_hold_limit: 8,
       decision_needed: open.filter((h) => h.attention === "source_only" || h.attention === "needs_action").length,
       blocked_runs: 0,

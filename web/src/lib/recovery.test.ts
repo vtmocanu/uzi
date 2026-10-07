@@ -206,7 +206,7 @@ describe("sortedArchives", () => {
 // ── PRD #1349 M6: owner custody surface logic ─────────────────────────────────
 
 function agg(over: Partial<RecoveryCustodyAggregate> = {}): RecoveryCustodyAggregate {
-  return { open_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0, ...over };
+  return { open_holds: 0, admission_counted_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0, ...over };
 }
 
 function hold(over: Partial<RecoveryCustodyHold> = {}): RecoveryCustodyHold {

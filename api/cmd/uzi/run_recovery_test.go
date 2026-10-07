@@ -38,7 +38,7 @@ func ownerRecoveryFixture() apitypes.RecoveryCustodyHoldsDTO {
 	old := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
 	newer := old.Add(time.Hour)
 	return apitypes.RecoveryCustodyHoldsDTO{
-		Aggregate: apitypes.RecoveryCustodyAggregateDTO{OpenHolds: 3, CustodyHoldLimit: 8, DecisionNeeded: 2, BlockedRuns: 1},
+		Aggregate: apitypes.RecoveryCustodyAggregateDTO{OpenHolds: 3, AdmissionCountedHolds: 2, CustodyHoldLimit: 8, DecisionNeeded: 2, BlockedRuns: 1},
 		Holds: []apitypes.RecoveryCustodyHoldDTO{
 			{ID: "hold-z", RunID: "run-z", Generation: 3, State: "open", Attention: "active",
 				WorkerID: "worker-z", CreatedAt: newer},
@@ -157,7 +157,7 @@ func TestOwnerRecoveryHuman(t *testing.T) {
 		strings.Contains(out, "run-r") || strings.Contains(out, "run-d") {
 		t.Errorf("settled hold in human view: %q", out)
 	}
-	if !strings.Contains(out, "open_holds: 3  custody_hold_limit: 8  decision_needed: 2  blocked_runs: 1") {
+	if !strings.Contains(out, "open_holds: 3  admission_counted_holds: 2  custody_hold_limit: 8  decision_needed: 2  blocked_runs: 1") {
 		t.Errorf("aggregate absent: %q", out)
 	}
 	if !strings.Contains(out, "2 hold(s) await a decision") || !strings.Contains(out, "run discard <run-id> --hold <hold-id> --yes") {
@@ -181,6 +181,9 @@ func TestOwnerRecoveryJSON(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &got); err != nil {
 		t.Fatal(err)
 	}
+	if !strings.Contains(out, `"open_holds": 3`) || !strings.Contains(out, `"admission_counted_holds": 2`) {
+		t.Errorf("JSON missing distinct counts: %s", out)
+	}
 	if !reflect.DeepEqual(got, dto) {
 		t.Errorf("JSON changed owner DTO: got %+v, want %+v", got, dto)
 	}
@@ -196,7 +199,7 @@ func TestOwnerRecoveryEmptyAndNoHint(t *testing.T) {
 		}}
 		out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery")
 		if code != uzicli.ExitOK || !strings.Contains(out, "no open custody holds") ||
-			!strings.Contains(out, "open_holds: 0  custody_hold_limit: 8  decision_needed: 0  blocked_runs: 0") ||
+			!strings.Contains(out, "open_holds: 0  admission_counted_holds: 0  custody_hold_limit: 8  decision_needed: 0  blocked_runs: 0") ||
 			strings.Contains(out, "await a decision") || strings.Contains(out, "settled") {
 			t.Errorf("empty human view: code=%d output=%q", code, out)
 		}
@@ -249,7 +252,7 @@ func TestOwnerRecoverySanitizesCells(t *testing.T) {
 
 func recoveryHoldsFixture() apitypes.RecoveryCustodyHoldsDTO {
 	return apitypes.RecoveryCustodyHoldsDTO{
-		Aggregate: apitypes.RecoveryCustodyAggregateDTO{OpenHolds: 2, CustodyHoldLimit: 8, DecisionNeeded: 1, BlockedRuns: 0},
+		Aggregate: apitypes.RecoveryCustodyAggregateDTO{OpenHolds: 2, AdmissionCountedHolds: 1, CustodyHoldLimit: 8, DecisionNeeded: 1, BlockedRuns: 0},
 		Holds: []apitypes.RecoveryCustodyHoldDTO{
 			{ID: "hold-run1-gen1", RunID: "run1", Generation: 1, State: "open", Attention: "source_only",
 				WorkerID: "w1", WorkerName: "alpha", CaptureState: ""},

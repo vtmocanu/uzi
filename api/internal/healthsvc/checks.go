@@ -986,14 +986,15 @@ func (s *Service) checkBoardDrift(ctx context.Context, now time.Time) apitypes.H
 // checkCustodyHolds warns when at least one owner is at the custody-hold admission limit.
 // `na` when the limit is non-positive (custody admission disabled) — a defensive guard the
 // caller's positive constant never trips in production.
-func (s *Service) checkCustodyHolds(ctx context.Context) apitypes.HealthCheckDTO {
+func (s *Service) checkCustodyHolds(ctx context.Context, now time.Time) apitypes.HealthCheckDTO {
 	c := s.base("custody.holds")
 	if s.cfg.CustodyHoldLimit <= 0 {
 		c.Severity = sevNA
 		c.Summary = "Custody-hold admission is not configured."
 		return c
 	}
-	owners, err := s.cfg.Store.ListOwnersOverCustodyLimit(ctx, s.cfg.CustodyHoldLimit)
+	cutoff := pgconv.Time(now.Add(-s.heartbeatStale()))
+	owners, err := s.cfg.Store.ListOwnersOverCustodyLimit(ctx, store.ListOwnersOverCustodyLimitParams{CustodyHoldLimit: s.cfg.CustodyHoldLimit, HeartbeatCutoff: cutoff})
 	if err != nil {
 		return degradeUnknown(c, "custody.holds", err)
 	}
@@ -1004,7 +1005,16 @@ func (s *Service) checkCustodyHolds(ctx context.Context) apitypes.HealthCheckDTO
 	}
 	c.Severity = sevWarn
 	c.Summary = fmt.Sprintf("%d owner(s) are at the custody-hold admission limit.", len(owners))
-	c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Owners", Value: fmt.Sprintf("%d", len(owners))}}
+	var total, counted int64
+	for _, owner := range owners {
+		agg, err := s.cfg.Store.GetCustodyAggregateForOwner(ctx, store.GetCustodyAggregateForOwnerParams{UserID: owner, CustodyHoldLimit: s.cfg.CustodyHoldLimit, HeartbeatCutoff: cutoff})
+		if err != nil {
+			return degradeUnknown(c, "custody.holds", err)
+		}
+		total += agg.OpenHolds
+		counted += agg.AdmissionCountedHolds
+	}
+	c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Owners", Value: fmt.Sprintf("%d", len(owners))}, {Label: "Admission-counted holds", Value: fmt.Sprint(counted)}, {Label: "Total open custody", Value: fmt.Sprint(total)}}
 	c.Action = strPtr("Their new runs are blocked until they discard or resolve held work (uzi run recovery).")
 	return c
 }

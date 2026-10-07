@@ -21,11 +21,13 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -39,8 +41,8 @@ const KindCustodyEpisode = "custody_episode"
 // M1 atomic claim / re-arm pair, and the frozen M1 owner aggregate. *store.Queries satisfies it;
 // tests inject a fake.
 type custodyEpisodeStore interface {
-	ListOwnersOverCustodyLimit(ctx context.Context, custodyHoldLimit int32) ([]uuid.UUID, error)
-	ListOwnersWithClearedCustodyEpisode(ctx context.Context, custodyHoldLimit int32) ([]uuid.UUID, error)
+	ListOwnersOverCustodyLimit(ctx context.Context, arg store.ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error)
+	ListOwnersWithClearedCustodyEpisode(ctx context.Context, arg store.ListOwnersWithClearedCustodyEpisodeParams) ([]uuid.UUID, error)
 	ClaimCustodyEpisodeNotice(ctx context.Context, userID uuid.UUID) (uuid.UUID, error)
 	ClearCustodyEpisodeNotice(ctx context.Context, userID uuid.UUID) error
 	GetCustodyAggregateForOwner(ctx context.Context, arg store.GetCustodyAggregateForOwnerParams) (store.GetCustodyAggregateForOwnerRow, error)
@@ -65,21 +67,24 @@ type custodyEpisodeSettings interface {
 // the custody admission limit (workersvc.CustodyHoldLimit), so a crossing at that exact limit is
 // what it notifies on.
 type CustodyEpisodeReconciler struct {
-	store    custodyEpisodeStore
-	notifier custodyEpisodeNotifier
-	settings custodyEpisodeSettings
-	limit    int
-	logger   *slog.Logger
+	store          custodyEpisodeStore
+	notifier       custodyEpisodeNotifier
+	settings       custodyEpisodeSettings
+	limit          int
+	heartbeatStale time.Duration
+	now            func() time.Time
+	logger         *slog.Logger
 }
 
 // NewCustodyEpisodeReconciler builds a CustodyEpisodeReconciler. limit is the custody admission
 // cap (main.go passes workersvc.CustodyHoldLimit); a non-positive limit disables the admission
-// gate, so Reconcile becomes a no-op. A nil logger defaults to slog.Default().
-func NewCustodyEpisodeReconciler(store custodyEpisodeStore, notifier custodyEpisodeNotifier, settings custodyEpisodeSettings, limit int, logger *slog.Logger) *CustodyEpisodeReconciler {
+// gate, so Reconcile becomes a no-op. heartbeatStale and now must be the configured
+// stale duration and a non-nil clock. A nil logger defaults to slog.Default().
+func NewCustodyEpisodeReconciler(store custodyEpisodeStore, notifier custodyEpisodeNotifier, settings custodyEpisodeSettings, limit int, heartbeatStale time.Duration, now func() time.Time, logger *slog.Logger) *CustodyEpisodeReconciler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &CustodyEpisodeReconciler{store: store, notifier: notifier, settings: settings, limit: limit, logger: logger}
+	return &CustodyEpisodeReconciler{store: store, notifier: notifier, settings: settings, limit: limit, logger: logger, heartbeatStale: heartbeatStale, now: now}
 }
 
 // Reconcile re-arms closed episodes then notifies every owner freshly at/over the custody limit,
@@ -111,11 +116,12 @@ func (r *CustodyEpisodeReconciler) Reconcile(ctx context.Context) {
 	if r.limit <= 0 {
 		return
 	}
+	cutoff := pgconv.Time(r.now().Add(-r.heartbeatStale))
 	limit := int32(r.limit) //nolint:gosec // G115: the custody admission limit is a small positive const (8)
 
 	// Re-arm FIRST: clear the notice for owners who dropped below the limit. Best-effort — a
 	// list/clear error is logged and the notify pass still runs.
-	if cleared, cerr := r.store.ListOwnersWithClearedCustodyEpisode(ctx, limit); cerr != nil {
+	if cleared, cerr := r.store.ListOwnersWithClearedCustodyEpisode(ctx, store.ListOwnersWithClearedCustodyEpisodeParams{CustodyHoldLimit: limit, HeartbeatCutoff: cutoff}); cerr != nil {
 		r.logger.Error("custody episode: list cleared owners", "error", cerr)
 	} else {
 		for _, uid := range cleared {
@@ -125,7 +131,7 @@ func (r *CustodyEpisodeReconciler) Reconcile(ctx context.Context) {
 		}
 	}
 
-	owners, err := r.store.ListOwnersOverCustodyLimit(ctx, limit)
+	owners, err := r.store.ListOwnersOverCustodyLimit(ctx, store.ListOwnersOverCustodyLimitParams{CustodyHoldLimit: limit, HeartbeatCutoff: cutoff})
 	if err != nil {
 		r.logger.Error("custody episode: list owners over limit", "error", err)
 		return
@@ -151,6 +157,7 @@ func (r *CustodyEpisodeReconciler) Reconcile(ctx context.Context) {
 		agg, err := r.store.GetCustodyAggregateForOwner(ctx, store.GetCustodyAggregateForOwnerParams{
 			UserID:           claimed,
 			CustodyHoldLimit: limit,
+			HeartbeatCutoff:  cutoff,
 		})
 		if err != nil {
 			r.logger.Error("custody episode: read aggregate", "user", claimed.String(), "error", err)
@@ -159,7 +166,7 @@ func (r *CustodyEpisodeReconciler) Reconcile(ctx context.Context) {
 			}
 			continue
 		}
-		n := buildCustodyEpisodeNotification(base, claimed, agg.OpenHolds, agg.BlockedRuns)
+		n := buildCustodyEpisodeNotification(base, claimed, agg.OpenHolds, agg.AdmissionCountedHolds, agg.BlockedRuns)
 		if _, err := r.notifier.Notify(ctx, n); err != nil {
 			r.logger.Warn("custody episode: notify", "user", claimed.String(), "error", err)
 		}
@@ -185,36 +192,39 @@ const (
 // command (never user or LLM text). The deep link is server-built from the operator base URL (the
 // /workers custody resolution surface, D8); an empty base yields no link. User-scoped (no
 // run/review anchor) — the episode is owner-level, not per-run.
-func buildCustodyEpisodeNotification(baseURL string, userID uuid.UUID, openHolds, blockedRuns int64) notifysvc.Notification {
+func buildCustodyEpisodeNotification(baseURL string, userID uuid.UUID, openHolds, admissionCountedHolds, blockedRuns int64) notifysvc.Notification {
 	return notifysvc.Notification{
 		UserID: userID,
 		Kind:   KindCustodyEpisode,
 		Payload: map[string]any{
-			"title":        custodyEpisodeTitle,
-			"body":         custodyEpisodeBody,
-			"open_holds":   openHolds,
-			"blocked_runs": blockedRuns,
-			"command":      custodyDiscardCommand,
+			"title":                   custodyEpisodeTitle,
+			"body":                    custodyEpisodeBody,
+			"open_holds":              openHolds,
+			"admission_counted_holds": admissionCountedHolds,
+			"blocked_runs":            blockedRuns,
+			"command":                 custodyDiscardCommand,
 		},
 		Slack: &notifysvc.SlackRender{
 			Emoji: "🛑",
 			Title: custodyEpisodeTitle,
 			Body:  custodyEpisodeBody,
 			Link:  custodyDeepLink(baseURL),
-			Facts: custodyEpisodeFacts(openHolds, blockedRuns),
+			Facts: custodyEpisodeFacts(openHolds, admissionCountedHolds, blockedRuns),
 		},
 	}
 }
 
 // custodyEpisodeFacts renders the aggregate as TRUSTED mrkdwn Facts: the open-hold count, the
-// blocked-run count, and the exact discard command as a `code` chip. All three are server-built
+// admission-counted holds, blocked-run count, and the exact discard command as a `code` chip.
+// All four are server-built
 // from closed ints and a compile-time literal, so the `*bold*`/`code` markup is intended (Facts
 // are ScrubSecrets'd but NOT mrkdwn-escaped by the notifier). The count facts always render (the
 // reconciler only reaches here for an owner at the limit, so open_holds >= limit > 0); a
 // blocked_runs of 0 (all held runs momentarily off-queue) still renders "0 blocked runs" so the
 // pressure is not understated to nothing.
-func custodyEpisodeFacts(openHolds, blockedRuns int64) []string {
+func custodyEpisodeFacts(openHolds, admissionCountedHolds, blockedRuns int64) []string {
 	return []string{
+		fmt.Sprintf("*%d* admission-counted holds", admissionCountedHolds),
 		fmt.Sprintf("*%d* held %s", openHolds, plural(openHolds, "source", "sources")),
 		fmt.Sprintf("*%d* blocked %s", blockedRuns, plural(blockedRuns, "run", "runs")),
 		"Discard held work: `" + custodyDiscardCommand + "`",

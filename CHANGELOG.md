@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Healthy live custody no longer consumes a recovery admission slot ([#2445](https://github.com/vtmocanu/uzi/issues/2445)).**
+  The fixed owner limit remains 8, but admission excludes at most one non-decision hold per run with exact current-generation, unreleased live ownership and a fresh worker heartbeat. Total open custody remains visible and protected; decision holds, older generations and unknown or stale claims still count. CLI, queued-run health, owner health and Slack capacity facts use the admission count separately from total holds; older API responses fall back to total when the new field is absent, preserving explicit zero. Continuations retain their 1–7 own-open-hold exemption. This is a statement-snapshot gate, so concurrent claims and later staleness can exceed the limit. No-action UX copy and tone stay with #2444.
+
 - **Checkpoint uploads hold remembered secret findings across current-flight publish paths ([#1964](https://github.com/vtmocanu/uzi/issues/1964)).**
   Park, shutdown, pause, recovery and completion-hold checkpoints now withhold publication while the current run remembers a live secret finding, including findings reachable through an overlay. Local captures remain available on that worker, with no new origin durability and a risk of loss if its disk is lost; a fresh pause whose checkpoint is withheld fails and the run continues. These paths still add no scans, and finding memory is lost on reclaim, so previously flagged local work can publish in a later unscanned run before another finding is recorded.
 

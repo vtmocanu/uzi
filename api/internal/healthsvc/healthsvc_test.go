@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -29,30 +30,34 @@ import (
 // ---- fakes -----------------------------------------------------------------
 
 type fakeStore struct {
-	enabledIDs      []uuid.UUID
-	enabledErr      error
-	workers         []store.ListAllWorkersRow
-	workersErr      error
-	capacityRows    []store.ListOwnersWaitingNoCapacityRow
-	capacityErr     error
-	capacityQueries atomic.Int32
-	waitingQueries  atomic.Int32
-	waitingRows     []store.ListWaitingWorkerRunsRow
-	waitingErr      error
-	undispatched    pgtype.Timestamptz
-	undispatchErr   error
-	pausedCount     int64
-	pausedErr       error
-	gaveUp          []store.ListGaveUpColumnMovesRow
-	gaveUpErr       error
-	custodyOwners   []uuid.UUID
-	custodyErr      error
-	controller      pgtype.Timestamptz
-	controllerErr   error
-	ciwatch         []store.CountEligibleCIWatchRefsPerRepoRow
-	ciwatchErr      error
-	runDisk         []store.WorkerRunDisk
-	runDiskErr      error
+	enabledIDs             []uuid.UUID
+	enabledErr             error
+	workers                []store.ListAllWorkersRow
+	workersErr             error
+	capacityRows           []store.ListOwnersWaitingNoCapacityRow
+	capacityErr            error
+	capacityQueries        atomic.Int32
+	waitingQueries         atomic.Int32
+	waitingRows            []store.ListWaitingWorkerRunsRow
+	waitingErr             error
+	undispatched           pgtype.Timestamptz
+	undispatchErr          error
+	pausedCount            int64
+	pausedErr              error
+	gaveUp                 []store.ListGaveUpColumnMovesRow
+	gaveUpErr              error
+	custodyOwners          []uuid.UUID
+	custodyErr             error
+	custodyAggregateErr    error
+	custodyAggregate       store.GetCustodyAggregateForOwnerRow
+	custodyListParams      []store.ListOwnersOverCustodyLimitParams
+	custodyAggregateParams []store.GetCustodyAggregateForOwnerParams
+	controller             pgtype.Timestamptz
+	controllerErr          error
+	ciwatch                []store.CountEligibleCIWatchRefsPerRepoRow
+	ciwatchErr             error
+	runDisk                []store.WorkerRunDisk
+	runDiskErr             error
 }
 
 func (f *fakeStore) ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error) {
@@ -79,8 +84,13 @@ func (f *fakeStore) CountUsersPausedWithEnabledSchedules(context.Context, pgtype
 func (f *fakeStore) ListGaveUpColumnMoves(context.Context, store.ListGaveUpColumnMovesParams) ([]store.ListGaveUpColumnMovesRow, error) {
 	return f.gaveUp, f.gaveUpErr
 }
-func (f *fakeStore) ListOwnersOverCustodyLimit(context.Context, int32) ([]uuid.UUID, error) {
+func (f *fakeStore) ListOwnersOverCustodyLimit(_ context.Context, arg store.ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error) {
+	f.custodyListParams = append(f.custodyListParams, arg)
 	return f.custodyOwners, f.custodyErr
+}
+func (f *fakeStore) GetCustodyAggregateForOwner(_ context.Context, arg store.GetCustodyAggregateForOwnerParams) (store.GetCustodyAggregateForOwnerRow, error) {
+	f.custodyAggregateParams = append(f.custodyAggregateParams, arg)
+	return f.custodyAggregate, f.custodyAggregateErr
 }
 func (f *fakeStore) GetControllerReport(context.Context) (pgtype.Timestamptz, error) {
 	return f.controller, f.controllerErr
@@ -593,7 +603,7 @@ func TestCustodyHolds(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := New(Config{Store: &fakeStore{custodyOwners: tc.owners}, Settings: &fakeSettings{}, Now: func() time.Time { return fixedNow }, CustodyHoldLimit: tc.limit})
-			c := svc.checkCustodyHolds(context.Background())
+			c := svc.checkCustodyHolds(context.Background(), svc.now())
 			if c.Severity != tc.wantSev || !strings.Contains(c.Summary, tc.wantSubstr) {
 				t.Fatalf("got %q / %q", c.Severity, c.Summary)
 			}
@@ -797,7 +807,7 @@ func TestDegradeUnknownOnQueryError(t *testing.T) {
 	t.Run("custody.holds", func(t *testing.T) {
 		// CustodyHoldLimit is 3 (via newSvc), so the na guard does not fire first.
 		svc := newSvc(&fakeStore{custodyErr: boom}, &fakeSettings{})
-		assertUnknown(t, svc.checkCustodyHolds(context.Background()), degradeSummary)
+		assertUnknown(t, svc.checkCustodyHolds(context.Background(), svc.now()), degradeSummary)
 	})
 	t.Run("release.check enabled read", func(t *testing.T) {
 		svc := newSvc(&fakeStore{}, &fakeSettings{relEnabledErr: boom})
@@ -1230,4 +1240,50 @@ func TestFleetQuarantine(t *testing.T) {
 			t.Fatalf("action = %v, want it to name uzi admin workers --json and uzi tui", c.Action)
 		}
 	})
+}
+
+func TestCustodyHoldsConfiguredCutoffAndFacts(t *testing.T) {
+	owners := []uuid.UUID{uuid.New(), uuid.New()}
+	st := &fakeStore{custodyOwners: owners, custodyAggregate: store.GetCustodyAggregateForOwnerRow{OpenHolds: 11, AdmissionCountedHolds: 8}}
+	calls := 0
+	svc := New(Config{Store: st, Settings: &fakeSettings{}, CustodyHoldLimit: 8, HeartbeatStale: 73 * time.Second, Now: func() time.Time {
+		calls++
+		return time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC).Add(time.Duration(calls-1) * time.Hour)
+	}})
+	doc, err := svc.Evaluate(context.Background())
+	if err != nil || calls != 1 {
+		t.Fatalf("Evaluate err=%v clock calls=%d", err, calls)
+	}
+	var got apitypes.HealthCheckDTO
+	for _, check := range doc.Checks {
+		if check.ID == "custody.holds" {
+			got = check
+		}
+	}
+	want := []apitypes.HealthEvidenceDTO{{Label: "Owners", Value: "2"}, {Label: "Admission-counted holds", Value: "16"}, {Label: "Total open custody", Value: "22"}}
+	if got.Severity != sevWarn || !reflect.DeepEqual(got.Evidence, want) {
+		t.Fatalf("custody check=%+v, want evidence=%v", got, want)
+	}
+	cutoff := time.Date(2026, 10, 7, 11, 58, 47, 0, time.UTC)
+	if len(st.custodyListParams) != 1 || len(st.custodyAggregateParams) != 2 {
+		t.Fatalf("list=%v aggregates=%v", st.custodyListParams, st.custodyAggregateParams)
+	}
+	list := st.custodyListParams[0]
+	if list.CustodyHoldLimit != 8 || !list.HeartbeatCutoff.Valid || !list.HeartbeatCutoff.Time.Equal(cutoff) {
+		t.Fatalf("list params=%v", list)
+	}
+	for i, arg := range st.custodyAggregateParams {
+		if arg.UserID != owners[i] || arg.CustodyHoldLimit != 8 || arg.HeartbeatCutoff != list.HeartbeatCutoff {
+			t.Fatalf("aggregate params=%v", arg)
+		}
+	}
+}
+
+func TestCustodyHoldsAggregateError(t *testing.T) {
+	st := &fakeStore{custodyOwners: []uuid.UUID{uuid.New()}, custodyAggregateErr: errors.New("aggregate failed")}
+	svc := New(Config{Store: st, CustodyHoldLimit: 8, HeartbeatStale: 73 * time.Second})
+	got := svc.checkCustodyHolds(context.Background(), fixedNow)
+	if got.Severity != sevUnknown || len(got.Evidence) != 0 {
+		t.Fatalf("failed aggregate check=%+v", got)
+	}
 }

@@ -25,7 +25,7 @@ afterEach(() => {
 
 function holds(over: Partial<RecoveryCustodyHolds["aggregate"]> = {}): RecoveryCustodyHolds {
   return {
-    aggregate: { open_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0, ...over },
+    aggregate: { open_holds: 0, admission_counted_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0, ...over },
     holds: [],
   };
 }

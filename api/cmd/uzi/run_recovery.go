@@ -164,8 +164,8 @@ func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyH
 		}
 	}
 	a := dto.Aggregate
-	p.Printf("open_holds: %d  custody_hold_limit: %d  decision_needed: %d  blocked_runs: %d\n",
-		a.OpenHolds, a.CustodyHoldLimit, a.DecisionNeeded, a.BlockedRuns)
+	p.Printf("open_holds: %d  admission_counted_holds: %d  custody_hold_limit: %d  decision_needed: %d  blocked_runs: %d\n",
+		a.OpenHolds, a.AdmissionCountedHolds, a.CustodyHoldLimit, a.DecisionNeeded, a.BlockedRuns)
 	if !gf.quiet {
 		first := true
 		for _, h := range open {
