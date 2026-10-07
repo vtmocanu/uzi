@@ -1598,6 +1598,10 @@ interface RunFlight {
   readonly owedDefaultBranch: string | undefined;
   owedContext: Promise<OwedCandidateContext> | undefined;
   prepareTerminalInventory: () => Promise<void>;
+  /** True once the latest {@link prepareTerminalInventory} proved this run's clone quiescent. The
+   *  post-report terminal drive reuses that proof: it runs while execute() still holds the run's
+   *  execution lane, so the coordinator's own executing check would otherwise reject the freeze. */
+  terminalInventoryQuiesced: boolean;
   owedFeedClosed: boolean;
   /** Set once the per-run owed-candidate cap refused a pin: the run is stopped through the
    *  ordinary preservation-failure path ({@link RunRunner.stopForOwedLimit}). */
@@ -5000,7 +5004,8 @@ export class RunRunner {
       const status = (body as { status?: string }).status;
       try {
         if (claim.inventory_guarded === true && ["completed", "failed", "cancelled"].includes(status ?? "")) {
-          await this.settleGuardedInventory(claim, flight, recoveryRecord?.sourceSha, status === "completed" ? body as StateRequest : undefined, boundarySignal);
+          await this.settleGuardedInventory(claim, flight, recoveryRecord?.sourceSha, status === "completed" ? body as StateRequest : undefined, boundarySignal,
+            flight.terminalInventoryQuiesced);
           return;
         }
         if (status === "completed") {
@@ -7597,11 +7602,14 @@ export class RunRunner {
       owedAnnounced: this.owedAnnouncedFor(runId),
       inventoryArchiveNotices: new Set(),
       keepGuardedInventoryOpen: false,
+      terminalInventoryQuiesced: false,
       prepareTerminalInventory: async () => {
+        flight.terminalInventoryQuiesced = false;
         if (!this.recovery.enabled || !isCodePublishingKind(flight.runKind) || claim.inventory_guarded !== true || !flight.barePath || !flight.branch) return;
         try {
           const q = await this.quiesceRun(flight, flight.executor, { mode: "own", site: "terminal_retire" });
           if (q.blocked) { flight.preserveRecoveryClone = true; return; }
+          flight.terminalInventoryQuiesced = true;
           // This terminal boundary ends a continuing switch generation; until here its
           // unresolved pins and hold must stay open for further executor work.
           flight.keepGuardedInventoryOpen = false;
