@@ -121,12 +121,14 @@ fi
 # (or by typing the flag, which is a deliberate act, not an ambient one). Do not
 # "simplify" this back into an env check, and do not swap in a cleverer sentinel — any
 # value the ambient environment can supply is this same bug wearing a different hat.
+# Preserve UZI_E2E_NO_RECLAIM: it only disables pre-run cleanup, and cannot
+# override a shipped compose configuration value.
 if [ "${1:-}" != "--e2e-sanitized" ]; then
   _e2e_env=()
   for _v in \
     HOME PATH TMPDIR TERM CI \
     DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG DOCKER_CERT_PATH DOCKER_TLS_VERIFY DOCKER_TLS_CERTDIR \
-    UZI_E2E_EXECUTOR UZI_E2E_COMPOSE_PROJECT UZI_E2E_COMPLETE_TIMEOUT UZI_E2E_FORGE \
+    UZI_E2E_EXECUTOR UZI_E2E_NO_RECLAIM UZI_E2E_COMPOSE_PROJECT UZI_E2E_COMPLETE_TIMEOUT UZI_E2E_FORGE \
     E2E_RUN_DIR E2E_GIT_SMART_HTTP KEEP_STACK KEEP_RUNDIR \
     PHASES_DIR E2E_ONLY E2E_SKIP E2E_STRICT_LEAKS E2E_FAULT_PHASE E2E_FAULT_PREFLIGHT
   do
