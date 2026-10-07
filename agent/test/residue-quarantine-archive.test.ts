@@ -90,7 +90,7 @@ function wrapped(topo: Topo, hooks: Partial<QuarantineArchiveGit> = {}): Quarant
     createQuarantineArchiveRef: (b, r, g, s) => c.createQuarantineArchiveRef(b, r, g, s),
     quarantineArchiveRefTip: (b, r, g) => c.quarantineArchiveRefTip(b, r, g),
     produceRecoveryBundle: (b, o) => c.produceRecoveryBundle(b, o),
-    verifyBundleReproduces: (p, s, r) => c.verifyBundleReproduces(p, s, r),
+    verifyBundleReproduces: (b, s, r) => c.verifyBundleReproduces(b, s, r),
     ...hooks,
   };
 }
@@ -219,15 +219,56 @@ describe("the archival capture over a real bare (issue #2213)", () => {
     assert.equal(archiveFailureReasonSuffix(r), "");
   });
 
+  it("an A/B/A swap of the temp file cannot launder a corrupted bundle into an archived outcome", async () => {
+    // A = the real bundle with a flipped byte in the pack (hashed at production); B = the valid one.
+    let validB: Buffer | undefined;
+    let corruptA: Buffer | undefined;
+    const g = wrapped(topo, {
+      produceRecoveryBundle: async (b, o) => {
+        const res = await topo.cache.produceRecoveryBundle(b, o);
+        validB = fs.readFileSync(o.outPath);
+        corruptA = Buffer.from(validB);
+        corruptA.writeUInt8(~corruptA.readUInt8(corruptA.length - 30) & 0xff, corruptA.length - 30);
+        fs.writeFileSync(o.outPath, corruptA);
+        return { ...res, checksum: createHash("sha256").update(corruptA).digest("hex"), byteSize: corruptA.length };
+      },
+      // Old path-based seam: swap valid B in for the verification, then restore A. The bytes-based
+      // seam receives A itself, so this swap is unreachable there.
+      verifyBundleReproduces: async (arg, s, r) => {
+        const asPath: unknown = arg;
+        if (typeof asPath === "string") {
+          fs.writeFileSync(asPath, validB as Buffer);
+          const reason = await (topo.cache.verifyBundleReproduces as unknown as (p: string, s: string, r: string) => Promise<string | undefined>)(asPath, s, r);
+          fs.writeFileSync(asPath, corruptA as Buffer);
+          return reason;
+        }
+        return topo.cache.verifyBundleReproduces(arg, s, r);
+      },
+    });
+    const r = await capture(topo, g);
+    assert.notEqual(r.outcome, "archived", `${r.outcome}: ${r.detail}`);
+    assert.ok(!listRunDir(topo).some((f) => f === "g1.bundle" || f === "g1.manifest.json"), listRunDir(topo).join(","));
+    assert.equal(archiveFailureReasonSuffix(r), "");
+  });
+
+  it("the published bundle is exactly the reported sha256 and unbundles to H", async () => {
+    const r = await capture(topo, wrapped(topo));
+    assert.equal(r.outcome, "archived", r.detail);
+    const published = fs.readFileSync(path.join(runDir(topo), "g1.bundle"));
+    assert.equal(createHash("sha256").update(published).digest("hex"), r.sha256);
+    assert.equal(published.length, r.size);
+    assert.equal(await topo.cache.verifyBundleReproduces(published, topo.head, topo.archiveRoot), undefined);
+  });
+
   it("the verification itself rejects a bundle that does not carry exactly H", async () => {
     const out = path.join(topo.base, "other.bundle");
     git(topo.bare, ["update-ref", "refs/heads/recovered-source", topo.baseSha]);
     git(topo.bare, ["bundle", "create", out, "refs/heads/recovered-source"]);
     git(topo.bare, ["update-ref", "-d", "refs/heads/recovered-source"]);
     fs.mkdirSync(topo.archiveRoot, { recursive: true });
-    const reason = await topo.cache.verifyBundleReproduces(out, topo.head, topo.archiveRoot);
+    const reason = await topo.cache.verifyBundleReproduces(fs.readFileSync(out), topo.head, topo.archiveRoot);
     assert.match(String(reason), /heads are not exactly/);
-    assert.equal(await topo.cache.verifyBundleReproduces(out, topo.baseSha, topo.archiveRoot), undefined, "control: the right head verifies");
+    assert.equal(await topo.cache.verifyBundleReproduces(fs.readFileSync(out), topo.baseSha, topo.archiveRoot), undefined, "control: the right head verifies");
     assert.deepEqual(fs.readdirSync(topo.archiveRoot), [], "the scratch repo is removed");
   });
 
@@ -297,13 +338,13 @@ describe("the archival capture over a real bare (issue #2213)", () => {
       assert.ok(!listRunDir(topo).includes("g1.bundle"), "nothing is published after the deadline");
     });
 
-    for (const step of ["chmod", "rename"] as const) {
+    for (const step of ["writeFile", "rename"] as const) {
       it(`the deadline passes during a slow publish ${step}: incomplete, and no g1.bundle or manifest appears afterwards`, async () => {
         const real = fsp[step] as (...a: unknown[]) => Promise<unknown>;
         let delayed = false;
         (fsp as unknown as Record<string, unknown>)[step] = async (...a: unknown[]) => {
           const target = String(a[0]);
-          if (!delayed && target.endsWith(".bundle.tmp")) {
+          if (!delayed && target.endsWith(".publish.tmp")) {
             delayed = true;
             await new Promise((r) => setTimeout(r, 1000));
           }

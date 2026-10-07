@@ -3739,26 +3739,39 @@ export class GitCache {
   }
 
   /**
-   * issue #2213 — prove a bundle file reproduces the commit `sha` on its own. The bundle is
-   * unbundled into a FRESH temporary bare repository under `scratchRoot` (`git bundle unbundle`
-   * runs `index-pack`, which recomputes every object's hash from its content, so a forged loose
-   * object substituted under an existing OID cannot import as that OID), and there: `list-heads`
-   * names exactly `sha`, `rev-parse --verify sha^{commit}` succeeds, and `rev-list --objects sha`
-   * completes (the history is connected). Worker-uid, credential-free; the temporary repo is always
-   * removed. Returns undefined when verified, else a short reason (never throws).
+   * issue #2213 — prove a bundle reproduces the commit `sha` on its own. The caller passes the
+   * bundle BYTES (an immutable in-memory snapshot, not a path a same-uid writer can swap), which are
+   * fed to git over stdin (`-`). They are unbundled into a FRESH temporary bare repository under
+   * `scratchRoot` (`git bundle unbundle` runs `index-pack`, which recomputes every object's hash
+   * from its content, so a forged loose object substituted under an existing OID cannot import as
+   * that OID), and there: `list-heads` names exactly `sha`, `rev-parse --verify sha^{commit}`
+   * succeeds, and `rev-list --objects` completes (the history is connected). Worker-uid,
+   * credential-free (`gitEnv()`); the temporary repo is always removed. Returns undefined when
+   * verified, else a short reason (never throws).
    */
-  async verifyBundleReproduces(bundlePath: string, sha: string, scratchRoot: string): Promise<string | undefined> {
+  async verifyBundleReproduces(bundle: Buffer, sha: string, scratchRoot: string): Promise<string | undefined> {
     let dir: string | undefined;
+    const withStdin = async (cwd: string, args: string[]): Promise<string> => {
+      const full = withDir(cwd, args);
+      this.log.debug("git (stdin)", { cwd, args });
+      const { stdout } = await this.execScoped("git", full, {
+        env: gitEnv(),
+        timeout: GIT_TIMEOUT_MS,
+        maxBuffer: GIT_MAX_BUFFER,
+        input: bundle,
+      });
+      return stdout;
+    };
     try {
       dir = await fs.mkdtemp(path.join(scratchRoot, "verify-"));
       await this.runGit(undefined, ["init", "--bare", "-q", dir]);
-      const heads = (await this.runGit(dir, ["bundle", "list-heads", bundlePath]))
+      const heads = (await withStdin(dir, ["bundle", "list-heads", "-"]))
         .split("\n")
         .map((l) => l.trim())
         .filter((l) => l !== "");
       const oids = new Set(heads.map((l) => l.split(/\s+/)[0] ?? ""));
       if (oids.size !== 1 || !oids.has(sha)) return "the bundle's heads are not exactly the committed head";
-      await this.runGit(dir, ["bundle", "unbundle", bundlePath]);
+      await withStdin(dir, ["bundle", "unbundle", "-"]);
       const tip = (await this.runGit(dir, ["rev-parse", "--verify", `${sha}^{commit}`])).trim();
       if (tip !== sha) return "the unbundled head does not resolve to the committed head";
       await this.runGit(dir, ["rev-list", "--objects", "--quiet", sha]);
@@ -7004,7 +7017,7 @@ export class GitCache {
   private async execScoped(
     command: string,
     args: string[],
-    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string },
+    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer },
     identity: BoundaryProcessRequest["identity"] = "worker_pat",
   ): Promise<{ stdout: string; stderr: string }> {
     const boundary = this.boundaryProcesses.getStore();

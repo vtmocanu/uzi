@@ -10,9 +10,12 @@
 //   2. anchor H at the create-only archive ref `refs/uzi-archive/<runId>/g<generation>`;
 //   3. bundle H from the bare (self-contained, no forge tip, the recovery size cap) into a temp file
 //      in a worker-owned 0700 directory;
-//   4. verify the bundle reproduces H by unbundling it into a fresh temporary bare repository;
-//   5. re-read the archive ref (must still be H) and re-hash the file, then publish
-//      `g<generation>.bundle` (0600) and its manifest by rename.
+//   4. read the temp file ONCE into memory (bounded by the size cap), require its sha256 and size to
+//      equal the producer's, then verify those bytes (fed over stdin, never re-read from a path) by
+//      unbundling into a fresh temporary bare repository;
+//   5. re-read the archive ref (must still be H), write exactly the verified bytes to a fresh
+//      exclusive temp and publish `g<generation>.bundle` (0600) and its manifest by rename; the
+//      reported sha256 and size are the in-memory digest of those same bytes.
 //
 // It reads only the worker bare and runs only credential-free worker-uid git. It never runs git in
 // the runner clone, spawns no provider, makes no reserve/upload/release client call, never deletes a
@@ -21,11 +24,10 @@
 // that overruns it reports `incomplete` and publishes nothing afterwards.
 
 import { createHash, randomBytes } from "node:crypto";
-import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
-import { RecoveryBundleTooLargeError, type RecoveryBundleResult } from "./git.js";
+import { RECOVERY_MAX_BUNDLE_BYTES, RecoveryBundleTooLargeError, type RecoveryBundleResult } from "./git.js";
 import { sanitizeForLog } from "./run-quiescence.js";
 import { errMessage, RUN_ID_RE } from "./util.js";
 
@@ -58,7 +60,7 @@ export interface QuarantineArchiveGit {
     barePath: string,
     opts: { sourceSha: string; outPath: string; maxBytes?: number },
   ): Promise<RecoveryBundleResult>;
-  verifyBundleReproduces(bundlePath: string, sha: string, scratchRoot: string): Promise<string | undefined>;
+  verifyBundleReproduces(bundle: Buffer, sha: string, scratchRoot: string): Promise<string | undefined>;
 }
 
 export interface QuarantineArchiveInput {
@@ -133,11 +135,13 @@ async function capture(
 
   const suffix = randomBytes(6).toString("hex");
   const tmpBundle = path.join(dir, `.g${generation}.${suffix}.bundle.tmp`);
+  const tmpPublish = path.join(dir, `.g${generation}.${suffix}.publish.tmp`);
   const tmpManifest = path.join(dir, `.g${generation}.${suffix}.manifest.tmp`);
   const finalBundle = path.join(dir, `g${generation}.bundle`);
   const finalManifest = path.join(dir, `g${generation}.manifest.json`);
   const cleanupTemps = async (): Promise<void> => {
     await fs.rm(tmpBundle, { force: true }).catch(() => undefined);
+    await fs.rm(tmpPublish, { force: true }).catch(() => undefined);
     await fs.rm(tmpManifest, { force: true }).catch(() => undefined);
   };
   try {
@@ -157,7 +161,25 @@ async function capture(
     }
     if (produced.sourceSha !== head) return fail(head, "the produced bundle names another head");
 
-    const reason = await git.verifyBundleReproduces(tmpBundle, head, dir);
+    // Snapshot the produced file ONCE. Everything after (digest, verification, publication) uses
+    // these in-memory bytes, so a same-uid writer touching the temp path cannot make the verified
+    // bytes differ from the hashed or published ones.
+    const cap = Math.min(input.maxBytes ?? RECOVERY_MAX_BUNDLE_BYTES, RECOVERY_MAX_BUNDLE_BYTES);
+    if (produced.byteSize > cap) return fail(head, "the produced bundle exceeds the size cap");
+    let bytes: Buffer;
+    try {
+      bytes = await readBounded(tmpBundle, produced.byteSize);
+    } catch (err) {
+      return fail(head, `could not read the produced bundle: ${errMessage(err)}`);
+    }
+    // The produced file is no longer trusted for anything; drop it now.
+    await fs.rm(tmpBundle, { force: true }).catch(() => undefined);
+    const digest = { sha256: createHash("sha256").update(bytes).digest("hex"), size: bytes.length };
+    if (digest.sha256 !== produced.checksum || digest.size !== produced.byteSize) {
+      return fail(head, "the bundle file changed after it was produced");
+    }
+
+    const reason = await git.verifyBundleReproduces(bytes, head, dir);
     if (reason !== undefined) return fail(head, reason);
 
     // The archive ref must still be H: a force-move during the capture means the anchor no longer
@@ -165,12 +187,6 @@ async function capture(
     const anchorNow = await git.quarantineArchiveRefTip(barePath, runId, generation);
     if (anchorNow !== head) return fail(head, "the archive ref no longer names the committed head");
 
-    // The bytes verified are the bytes hashed at production: a same-uid writer cannot swap the temp
-    // file between the two.
-    const digest = await sha256File(tmpBundle);
-    if (digest.sha256 !== produced.checksum || digest.size !== produced.byteSize) {
-      return fail(head, "the bundle file changed after it was produced");
-    }
     // Every publish step re-checks the deadline: a capture that overruns it reports `incomplete`, so
     // it must also leave no final file behind. The last check runs with nothing awaited between it
     // and the return, so the deadline timer cannot fire after it and before `archived` is reported.
@@ -179,7 +195,7 @@ async function capture(
     };
     try {
       deadlinePassed();
-      await fs.chmod(tmpBundle, 0o600);
+      await fs.writeFile(tmpPublish, bytes, { mode: 0o600, flag: "wx" });
       deadlinePassed();
       const manifest = {
         version: 1,
@@ -192,7 +208,7 @@ async function capture(
       };
       await fs.writeFile(tmpManifest, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600, flag: "wx" });
       deadlinePassed();
-      await fs.rename(tmpBundle, finalBundle);
+      await fs.rename(tmpPublish, finalBundle);
       deadlinePassed();
       await fs.rename(tmpManifest, finalManifest);
       deadlinePassed();
@@ -215,20 +231,23 @@ async function capture(
   }
 }
 
-async function sha256File(file: string): Promise<{ sha256: string; size: number }> {
-  const hash = createHash("sha256");
-  let size = 0;
-  await new Promise<void>((resolve, reject) => {
-    const rs = createReadStream(file);
-    rs.on("data", (c: Buffer | string) => {
-      const buf = Buffer.isBuffer(c) ? c : Buffer.from(c);
-      size += buf.length;
-      hash.update(buf);
-    });
-    rs.on("error", reject);
-    rs.on("end", resolve);
-  });
-  return { sha256: hash.digest("hex"), size };
+/** Read `file` into memory, refusing a file that is not exactly `expected` bytes (read at most
+ *  expected + 1 so an oversized replacement is never fully buffered). */
+async function readBounded(file: string, expected: number): Promise<Buffer> {
+  const fh = await fs.open(file, "r");
+  try {
+    const buf = Buffer.alloc(expected + 1);
+    let n = 0;
+    for (;;) {
+      const { bytesRead } = await fh.read(buf, n, buf.length - n, null);
+      if (bytesRead === 0) break;
+      n += bytesRead;
+      if (n > expected) throw new Error("the bundle file is larger than it was produced");
+    }
+    return buf.subarray(0, n);
+  } finally {
+    await fh.close();
+  }
 }
 
 /** The failure-reason suffix naming an archived capture (H and the bundle sha256): a server-side

@@ -105,13 +105,16 @@ deletes a pin or changes the journal or the hold:
    collide with the existing 40-hex leaves);
 2. bundle H from the bare into a temporary file in a worker-owned 0700 directory,
    under the recovery size cap;
-3. verify it by unbundling into a fresh temporary bare repository (`index-pack`
-   rehashes every object), requiring `list-heads` to name exactly H and
-   `rev-list --objects` to complete;
-4. re-read the archive ref (still H) and re-hash the file against the producer's
-   sha256 and size;
-5. publish `<dataDir>/recovery-archive/<runId>/g<gen>.bundle` (0600) and its
-   manifest by rename, all within a 120-second deadline that also stops publication.
+3. read the bundle once into memory (bounded by the size cap), requiring its sha256
+   and size to equal the producer's, and verify those bytes, fed over stdin, by
+   unbundling into a fresh temporary bare repository (`index-pack` rehashes every
+   object), requiring `list-heads` to name exactly H and `rev-list --objects` to
+   complete;
+4. re-read the archive ref (still H);
+5. write exactly the verified bytes to a fresh exclusive temp and publish
+   `<dataDir>/recovery-archive/<runId>/g<gen>.bundle` (0600) and its manifest by
+   rename, all within a 120-second deadline that also stops publication; the reported
+   sha256 is the digest of those same bytes.
 
 H and the sha256 are appended to the run's `failure_reason`. They live in the api's
 run row, which a same-uid survivor cannot reach, and detect a later tampering with
