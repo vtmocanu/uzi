@@ -83,6 +83,7 @@ type FakeClient struct {
 	CodexRateLimits []apitypes.CodexAdminRateLimitRowDTO
 	GuardrailV      apitypes.GuardrailImpactDTO
 	BlockedReposV   apitypes.AdminBlockedReposDTO
+	AdminSettingsV  AdminSettingsView
 	AgentSourceV    apitypes.AgentSourceDTO
 	// EgressProfiles drives AdminListEgressProfiles and AdminGetEgressProfile (PRD #1906
 	// M1); a name not in the list is an ExitNotFound error, like the server's 404.

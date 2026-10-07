@@ -439,7 +439,7 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(users, runs, workers, health, usage, rateLimits, cliTokens, products, guardrailImpact, blockedRepos, newAdminAgentSourceCmd(env, gf), newAdminReviewCmd(env, gf), newAdminEgressProfileCmd(env, gf))
+	cmd.AddCommand(users, runs, workers, health, usage, rateLimits, cliTokens, products, guardrailImpact, blockedRepos, newAdminAgentSourceCmd(env, gf), newAdminReviewCmd(env, gf), newAdminReviewBotsCmd(env, gf), newAdminEgressProfileCmd(env, gf))
 	return cmd
 }
 
