@@ -8,6 +8,8 @@ import type { Executor } from "../src/executor.js";
 import type { TrackingUpdateResult } from "../src/git.js";
 import { MAX_OWED_CANDIDATES_PER_RUN } from "../src/git.js";
 import { api, client, fakeGitlab, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
+import { RunRunner } from "../src/runner.js";
+import { CandidateReservationRefusedError } from "../src/batcher.js";
 
 installHarness();
 
@@ -136,4 +138,56 @@ it("an ordinary preservation failure at a checkpoint does not stop the run", asy
     killAgentTree: () => {},
   }, gitlab).execute(claim);
   assert.equal(aborted, false);
+});
+
+// A row's heads count as announced only after the batcher accepted that row.
+type AnnounceFlight = {
+  owedFeedClosed: boolean;
+  owedAnnounced: { heads: Set<string>; archived: Set<string> };
+  batcher: { emit(message: unknown): void };
+};
+const announce = (RunRunner.prototype as unknown as {
+  announceOwedHeads(flight: AnnounceFlight, heads: string[]): void;
+}).announceOwedHeads;
+const sha = (n: number): string => n.toString(16).padStart(2, "0").repeat(20);
+const rowHeads = (message: unknown): string =>
+  String((message as { payload: { text: string } }).payload.text);
+
+it("a refused first announcement is re-announced on retry", () => {
+  let refuse = true;
+  const emitted: unknown[] = [];
+  const flight: AnnounceFlight = {
+    owedFeedClosed: false,
+    owedAnnounced: { heads: new Set(), archived: new Set() },
+    batcher: { emit(message) { if (refuse) throw new CandidateReservationRefusedError("cancelled"); emitted.push(message); } },
+  };
+  assert.throws(() => announce.call(null, flight, [sha(1)]), CandidateReservationRefusedError);
+  assert.equal(flight.owedAnnounced.heads.size, 0, "a refused row marks nothing as announced");
+  refuse = false;
+  announce.call(null, flight, [sha(1)]);
+  assert.equal(emitted.length, 1);
+});
+
+it("a refusal after an earlier row succeeds re-announces only the refused row", () => {
+  const heads = Array.from({ length: 9 }, (_, i) => sha(i + 1)); // two rows: 8 + 1
+  let calls = 0;
+  let refuseSecond = true;
+  const emitted: unknown[] = [];
+  const flight: AnnounceFlight = {
+    owedFeedClosed: false,
+    owedAnnounced: { heads: new Set(), archived: new Set() },
+    batcher: { emit(message) {
+      calls++;
+      if (refuseSecond && calls === 2) throw new CandidateReservationRefusedError("cancelled");
+      emitted.push(message);
+    } },
+  };
+  assert.throws(() => announce.call(null, flight, heads), CandidateReservationRefusedError);
+  assert.equal(emitted.length, 1, "the first row was accepted");
+  assert.equal(flight.owedAnnounced.heads.size, 8, "only the accepted row's heads are marked");
+  refuseSecond = false;
+  announce.call(null, flight, heads);
+  assert.equal(emitted.length, 2, "the retry emits only the refused row");
+  assert.ok(rowHeads(emitted[1]).includes(sha(9).slice(0, 12)));
+  assert.ok(!rowHeads(emitted[1]).includes(sha(1).slice(0, 12)));
 });

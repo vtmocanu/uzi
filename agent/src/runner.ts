@@ -10498,14 +10498,17 @@ export class RunRunner {
       flight.runLog.info("recovery: retained heads after feed close", { heads: fresh, archived });
       return;
     }
-    for (const s of fresh) seen.add(s);
     // Eight bounded SHA labels per row; the finite inventory determines the row count.
+    // A row's heads count as announced only once the batcher accepted that row, so a
+    // refused emit (e.g. a candidate reservation refusal) is re-announced on retry.
     for (let i = 0; i < fresh.length; i += 8) {
-      const labels = fresh.slice(i, i + 8).map(s => s.slice(0, 12));
+      const chunk = fresh.slice(i, i + 8);
+      const labels = chunk.map(s => s.slice(0, 12));
       flight.batcher.emit({ kind: "status", agent: "worker", payload: { text:
         archived ? `Earlier recovery archive covers retained heads ${labels.join(", ")}; final custody ACK pending. Use uzi run recovery or uzi run export.`
           : `Retained heads ${labels.join(", ")} are worker-local, not checkpoint durable; recovery needs action. Use uzi run recovery or uzi run export.`,
       } });
+      for (const s of chunk) seen.add(s);
     }
   }
 
