@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Completed guarded recovery can settle after attributed clone parents disappear ([#2433](https://github.com/vtmocanu/uzi/issues/2433)).**
+  After loss of the runner tree, verified absence of an attributed clone's parent directories no longer blocks archive-backed FINAL for a completed run with a valid durable capture; once FINAL is acknowledged, replay can retire its pending terminal journal. Discarded holds (#2417) and unresolved initial clone survival remain outside this fix.
+
 ### Changed
 
 - **Per-user usage follows the selected window ([#2439](https://github.com/vtmocanu/uzi/issues/2439)).**
