@@ -34,6 +34,9 @@ COPY fixtures/milestone-attribution/ /app/fixtures/milestone-attribution/
 COPY fixtures/pr-size-line/ /app/fixtures/pr-size-line/
 # Same reason for the grouped findings draft: Findings.test.tsx imports it. Mirrors web/Dockerfile.
 COPY fixtures/finding-group-draft/ /app/fixtures/finding-group-draft/
+# Same reason for the shared schedule presets (#2344): schedulePresets.test.ts imports them.
+# Mirrors web/Dockerfile.
+COPY fixtures/schedule-presets/ /app/fixtures/schedule-presets/
 ENV VITE_UZI_MOCK=1
 RUN npm run build
 
