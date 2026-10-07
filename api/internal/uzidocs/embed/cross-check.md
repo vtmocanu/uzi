@@ -73,7 +73,7 @@ raw helper stderr and filenames are never logged or shown.
 | `too_many_untracked` | More untracked files than the capture allows. |
 | `secret_detected` | The secret scan flagged the diff. |
 | `scan_failed` | The secret scan could not complete. |
-| `unsupported_entry` | The worktree, index or base holds an entry the capture does not support: a changed or untracked symlink, any submodule, a special file (FIFO, socket, device), a non-directory where a directory was tracked, or an unsupported file mode. |
+| `unsupported_entry` | The worktree, index or base holds an entry the capture does not support: a changed or untracked symlink, any submodule, a special file (FIFO, socket, device), or an unsupported file mode. |
 
 An **unchanged tracked symlink** does not block the check: its raw link
 target is compared with the base blob and is never opened or followed.
