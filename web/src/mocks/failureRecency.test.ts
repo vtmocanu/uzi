@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
-import { expect, it } from "vitest";
+import { afterEach, expect, it } from "vitest";
+import { createElement, Fragment } from "react";
+import { cleanup, render, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { YourUsageCard, FactoryTotalCard, PerUserUsageTable } from "../components/UsageCards";
 import { mockApi } from "./mockApi";
+
+afterEach(cleanup);
 
 it("demo shows matching failure recency, a valid drill-in, and a never-failed user", async () => {
   const [self, admin] = await Promise.all([mockApi.getUsage(), mockApi.getAdminUsage()]);
@@ -21,4 +27,32 @@ it("demo shows matching failure recency, a valid drill-in, and a never-failed us
   expect(Object.values(factory.fail_origins).reduce((sum, count) => sum + count, 0)).toBe(factory.failed);
   expect(admin.users.reduce((sum, u) => sum + u.outcomes.completed, 0)).toBe(factory.completed);
   expect(self.outcomes.last_7_days.last_failed_at).toBeNull();
+  // Billing populations remain consistent across self, factory, and user rows.
+  expect(self.lifetime_subscription_run_count).toBe(mine.subscription_run_count);
+  expect(self.last7_subscription_run_count).toBeGreaterThan(0);
+  expect(self.last7_subscription_run_count).toBeLessThanOrEqual(self.lifetime_subscription_run_count);
+  expect(admin.factory.lifetime_subscription_run_count).toBe(admin.users.reduce((sum, user) => sum + user.subscription_run_count, 0));
+  expect(admin.factory.last7_subscription_run_count).toBeGreaterThan(0);
+  expect(admin.factory.last7_subscription_run_count).toBeLessThanOrEqual(admin.factory.lifetime_subscription_run_count);
+  expect(admin.users.filter((user) => user.subscription_run_count > 0).length).toBe(2);
+  for (const user of admin.users) {
+    expect(user.subscription_run_count).toBeLessThanOrEqual(user.run_count);
+    expect(user.unreported_run_count).toBe(0);
+  }
+});
+
+it("demo renders subscription cost exclusions on the self card and factory total row", async () => {
+  const [self, admin] = await Promise.all([mockApi.getUsage(), mockApi.getAdminUsage()]);
+  const { getByText } = render(createElement(MemoryRouter, null,
+    createElement(Fragment, null,
+      createElement(YourUsageCard, { usage: self }),
+      createElement(FactoryTotalCard, { admin }),
+      createElement(PerUserUsageTable, { admin }),
+    ),
+  ));
+  const selfCard = getByText("Your usage").parentElement!;
+  expect(within(selfCard).getByText("Cost excludes 8 Codex subscription runs")).toBeTruthy();
+  expect(within(selfCard).getByText(/Cost excludes 2 Codex subscription runs/)).toBeTruthy();
+  const totalRow = getByText("uzi total").closest("tr")!;
+  expect(within(totalRow).getByText("Cost excludes 20 Codex subscription runs")).toBeTruthy();
 });
