@@ -939,6 +939,10 @@ export class Worker {
       try {
         releaseAdmission = await this.terminalRejections?.acquireAdmission(signal);
         if (signal.aborted) continue;
+        // issue #2213: a latch landing while the admission await was pending must still stop this claim;
+        // nothing is awaited between this recheck and claimRun. The finally releases admission and the
+        // next iteration's top-of-loop gate logs and sleeps.
+        if (residueQuarantine() !== undefined) continue;
         // PRD #1390 M2a: carry the active-run snapshot on the claim (built from the SAME
         // monotonic epoch counter the heartbeat draws from) so the api's pre-claim dedupe
         // sees this worker's live runs even before the first post-outage heartbeat lands.

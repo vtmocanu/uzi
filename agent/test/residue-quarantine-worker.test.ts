@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { WorkerClient } from "../src/client.js";
 import type { Config } from "../src/config.js";
 import { latchResidueQuarantine, residueQuarantine } from "../src/residue-quarantine.js";
+import type { TerminalRejectionCoordinator } from "../src/terminal-rejections.js";
 import { Worker } from "../src/worker.js";
 import type { RunRunner } from "../src/runner.js";
 import type { ChatRunner } from "../src/chat-runner.js";
@@ -194,7 +195,7 @@ afterEach(() => {
   for (const r of rigRoots.splice(0)) fs.rmSync(r, { recursive: true, force: true });
 });
 
-function makeRig(opts: { runClaim?: () => Promise<ClaimResponse | null> } = {}): Rig {
+function makeRig(opts: { runClaim?: () => Promise<ClaimResponse | null>; terminalRejections?: TerminalRejectionCoordinator } = {}): Rig {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-2213-worker-"));
   rigRoots.push(root);
   const beats: Rig["beats"] = [];
@@ -249,6 +250,10 @@ function makeRig(opts: { runClaim?: () => Promise<ClaimResponse | null> } = {}):
     undefined,
     undefined,
     (dataDir) => new StatsCollector({ dataDir, processRss: () => 64 * 1024 * 1024 }),
+    undefined,
+    undefined,
+    undefined,
+    opts.terminalRejections,
   );
   return { worker, beats, claims, executed };
 }
@@ -305,6 +310,35 @@ describe("a quarantined worker admits nothing (issue #2213)", () => {
       await new Promise((r) => setTimeout(r, 60));
       assert.equal(rig.claims.run, run, "no further run claim");
       assert.equal(rig.claims.chat, chat, "no further chat claim");
+    } finally {
+      ac.abort();
+      await done.catch(() => undefined);
+    }
+  });
+
+  it("a latch landing while admission is pending stops the claim and releases the admission", async () => {
+    let acquired = 0;
+    let released = 0;
+    const terminalRejections = {
+      acquireAdmission: async () => {
+        acquired++;
+        await new Promise((r) => setTimeout(r, 5));
+        latchResidueQuarantine({ cause: "latched during admission", site: "finalize" }, nullLogger());
+        return () => {
+          released++;
+        };
+      },
+      loop: async () => {},
+      protectExecution: () => () => {},
+    } as unknown as TerminalRejectionCoordinator;
+    const rig = makeRig({ terminalRejections });
+    const ac = new AbortController();
+    const done = rig.worker.run(ac.signal);
+    try {
+      await until(() => acquired >= 1 && released >= 1, "admission acquired and released");
+      await new Promise((r) => setTimeout(r, 40));
+      assert.equal(rig.claims.run, 0, "no claimRun after the latch landed mid-admission");
+      assert.equal(released, acquired, "every acquired admission was released");
     } finally {
       ac.abort();
       await done.catch(() => undefined);
