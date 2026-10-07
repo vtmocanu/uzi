@@ -1471,6 +1471,10 @@ describe("m1 credential-free owner cancel", () => {
       const ensureClone = git.ensureClone.bind(git);
       git.ensureClone = async (...args) => { bare = await ensureClone(...args); return bare; };
       const observations: string[] = [];
+      // The runner's owner-cancel catch turns a thrown seam assertion into "retained", which the
+      // retain scenarios expect; record seam invariants here and assert them after settlement.
+      const seamViolations: string[] = [];
+      const check = (ok: boolean, msg: string): void => { if (!ok) seamViolations.push(msg); };
       const { logger: cancelLog, lines: cancelLogs } = recordingLogger();
       const claim = makeClaim({
         claim_generation: 7,
@@ -1502,8 +1506,8 @@ describe("m1 credential-free owner cancel", () => {
         quiesceRun: async req => {
           const site = req.site ?? "";
           observations.push(site);
-          if (site === "owner_cancel_after_inspection") assert.ok(observations.includes("inspect"), "final scan follows cleanliness inspection");
-          if (site.startsWith("owner_cancel")) assert.equal(req.processes, HAS_PROCFS);
+          if (site === "owner_cancel_after_inspection") check(observations.includes("inspect"), "final scan follows cleanliness inspection");
+          if (site.startsWith("owner_cancel")) check(req.processes === HAS_PROCFS, `${site} processes=${String(req.processes)}`);
           const state = site.startsWith("owner_cancel") && scenario.process === "survivors" ? "survivors" :
             site.startsWith("owner_cancel") && scenario.process === "unverified" ? "unverified" : "quiescent";
           return { process: HAS_PROCFS ? { state, processes: [], killed: site === "owner_cancel_after_inspection" && scenario.process === "new-writer" ? [101] : [], detail: "cancel fixture process proof" } : undefined,
@@ -1523,13 +1527,13 @@ describe("m1 credential-free owner cancel", () => {
       if (scenario.inspect === "unreadable") git.credentialFreeCancelCleanHead = async () => null;
       const inspect = git.credentialFreeCancelCleanHead.bind(git);
       git.credentialFreeCancelCleanHead = async (...args) => {
-        assert.ok(observations.includes("owner_cancel"), "initial scan precedes restore inspection");
-        assert.ok(cancelLogs.some(line => rec(line).msg === "owner cancel Docker teardown"), "Docker teardown is logged before restore inspection");
-        assert.equal(observations.includes("owner_cancel_after_inspection"), false, "every restore inspection precedes the final scan");
+        check(observations.includes("owner_cancel"), "initial scan precedes restore inspection");
+        check(cancelLogs.some(line => rec(line).msg === "owner cancel Docker teardown"), "Docker teardown is logged before restore inspection");
+        check(!observations.includes("owner_cancel_after_inspection"), "every restore inspection precedes the final scan");
         observations.push("inspect");
         const result = await inspect(...args);
         if (excludeBeforeCancel !== undefined) {
-          assert.deepEqual(await fs.readFile(path.join(clone, ".git/info/exclude")), excludeBeforeCancel,
+          check((await fs.readFile(path.join(clone, ".git/info/exclude"))).equals(excludeBeforeCancel),
             "cleanliness inspection preserves exclude bytes");
         }
         return result;
@@ -1720,6 +1724,7 @@ describe("m1 credential-free owner cancel", () => {
         const rawBeforeCancel = work === "lossy-path" ? await fs.readFile(rawPath(clone)) : undefined;
         api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
         await withTimeout(execution, 10000, "runner owner cancel");
+        assert.deepEqual(seamViolations, [], "owner-cancel seam invariants (the runner's catch would otherwise swallow them)");
         assert.equal(lifecycle?.aborted, true, "real steering forwards genuine lifecycle abort");
         assert.equal(rig.client.refreshCalls.length, 0, "cleanup never refreshes");
         assert.equal(rig.client.releaseCalls.length, 1, "cleanup never releases Codex credentials");
