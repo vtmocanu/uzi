@@ -570,6 +570,13 @@ func TestRemoveMRReworkPendingIDsLiveDB(t *testing.T) {
 	if after.AttemptCount != before.AttemptCount || after.HighWater != before.HighWater || after.HaltNotified != before.HaltNotified || !after.UpdatedAt.Time.Equal(before.UpdatedAt.Time) {
 		t.Fatalf("a pending-only removal changed other columns: %+v -> %+v", before, after)
 	}
+	// A nil id list (pgx sends NULL) must be a no-op too, not empty the set.
+	if err := q.RemoveMRReworkPendingIDs(ctx, store.RemoveMRReworkPendingIDsParams{RepoID: repo, Ref: ref, Ids: nil}); err != nil {
+		t.Fatal(err)
+	}
+	if nilKept, _ := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repo, Ref: ref}); !slices.Equal(nilKept.PendingUnknownIds, []int64{12}) {
+		t.Fatalf("nil Ids changed the pending set: %v, want [12]", nilKept.PendingUnknownIds)
+	}
 	// An empty id list is a no-op, and an unknown ref creates no row.
 	if err := q.RemoveMRReworkPendingIDs(ctx, store.RemoveMRReworkPendingIDsParams{RepoID: repo, Ref: ref, Ids: []int64{}}); err != nil {
 		t.Fatal(err)

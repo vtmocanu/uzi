@@ -120,7 +120,7 @@ UPDATE mr_rework_ledger
 SET pending_unknown_ids = ARRAY(
     SELECT p.x
     FROM unnest(mr_rework_ledger.pending_unknown_ids) AS p(x)
-    WHERE p.x <> ALL (@ids::bigint[])
+    WHERE p.x <> ALL (COALESCE(@ids::bigint[], '{}'::bigint[]))
     ORDER BY p.x
 )
 WHERE repo_id = @repo_id::uuid AND ref = @ref;

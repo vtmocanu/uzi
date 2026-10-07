@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/google/uuid"
@@ -378,8 +379,10 @@ func (s *Service) StartMRReworkForRun(ctx context.Context, userID, runID uuid.UU
 	if !plan.HasNew && strings.TrimSpace(guidance) == "" {
 		// Pending ids the caps evicted fall back to human review even though no run is created
 		// (with guidance the create below removes them in its own statement).
+		// Best-effort, like the watcher: a failed removal must not turn the 409 refusal into a 500.
+		// The next tick retries the same removal, so only the error text (no comment bodies) is logged.
 		if err := s.dropEvictedPending(ctx, repoID, ref, plan); err != nil {
-			return store.Run{}, err
+			slog.Warn("mr rework: dropping evicted pending review comment ids failed; still refusing", "repo_id", repoID, "ref", ref, "error", err)
 		}
 		if plan.UnknownNew > 0 {
 			return store.Run{}, ErrReworkPermissionUnknown

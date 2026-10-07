@@ -42,6 +42,7 @@ func uziLabels(extra ...string) []byte {
 type fakeStore struct {
 	// pendingRemovals records the pending-only ledger removals (no run created).
 	pendingRemovals    []store.RemoveMRReworkPendingIDsParams
+	pendingRemovalErr  error
 	promoteVaultLocked func(context.Context, uuid.UUID) ([]store.PromoteVaultLockedRecoveryWaitRunsRow, error)
 	// reviseErr forces CreateRunReviseInputIfUnderCap to fail (PRD #1795: a 0-row race).
 	reviseErr error
@@ -1663,7 +1664,7 @@ func (f *fakeStore) CreateAutoMRReworkRun(_ context.Context, arg store.CreateAut
 }
 func (f *fakeStore) RemoveMRReworkPendingIDs(_ context.Context, arg store.RemoveMRReworkPendingIDsParams) error {
 	f.pendingRemovals = append(f.pendingRemovals, arg)
-	return nil
+	return f.pendingRemovalErr
 }
 
 func (f *fakeStore) GetMRReworkLedger(_ context.Context, _ store.GetMRReworkLedgerParams) (store.MrReworkLedger, error) {

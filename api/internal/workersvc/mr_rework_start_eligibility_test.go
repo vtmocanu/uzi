@@ -233,6 +233,20 @@ func TestStartMRReworkRefusalDropsPendingIDsTheCapsEvicted(t *testing.T) {
 	}
 }
 
+// A failed pending removal on the refusal path is best-effort: the caller still gets the
+// refusal sentinel (a 409), never the removal's plain error (a 500).
+func TestStartMRReworkRefusalSurvivesFailedPendingRemoval(t *testing.T) {
+	fs, svc, user, runID := reworkFixture(t, 200, []int64{50})
+	fs.pendingRemovalErr = errors.New("db down")
+	_, err := svc.StartMRReworkForRun(context.Background(), user, runID, "", evictedPendingSnapshot(t))
+	if !errors.Is(err, ErrReworkNothingNew) {
+		t.Fatalf("err = %v, want ErrReworkNothingNew despite the failed removal", err)
+	}
+	if len(fs.pendingRemovals) != 1 {
+		t.Fatalf("removal not attempted: %+v", fs.pendingRemovals)
+	}
+}
+
 // With guidance the run proceeds and the atomic create statement carries the removal.
 func TestStartMRReworkGuidanceRemovesEvictedPendingIDsAtomically(t *testing.T) {
 	fs, svc, user, runID := reworkFixture(t, 200, []int64{50})
