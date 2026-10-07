@@ -4541,6 +4541,8 @@ export class GitCache {
     onStep?: (step: BoundaryStep) => void,
     /** Exact committed ownership snapshot supplied by the runner; never a source ref name. */
     sourceSha?: string,
+    /** Judge the actual candidate after overlay/floor validation, before starting a producer. */
+    beforePack?: (wantedSha: string) => Promise<void>,
   ): Promise<{ tipOid: string; pack: Readable; exited: Promise<number> } | null> {
     // A pinned range uses literal commit OIDs for the pack floor and candidate.
     // If an overlay is requested, its wrapper becomes the wanted OID while the
@@ -4561,6 +4563,7 @@ export class GitCache {
         await this.scratchPublicationPreflight(barePath, branch, wanted);
       }
       await this.validateCheckpointFloor(barePath, pinned.excludeSha, wanted);
+      await beforePack?.(wanted);
       onStep?.("checkpoint_pack");
       const { stdout, exited } = await this.spawnGit(
         barePath,
@@ -4611,6 +4614,7 @@ export class GitCache {
     // reachable through the wrapper's first parent but not through realTip.
     const wanted = wantRev;
     await this.validateCheckpointFloor(barePath, excludeSha, wanted);
+    await beforePack?.(wanted);
     onStep?.("checkpoint_pack");
     const { stdout, exited } = await this.spawnGit(
       barePath,

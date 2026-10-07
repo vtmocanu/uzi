@@ -588,8 +588,12 @@ function publishSkipLabel(raw: unknown): PublishSkipLabel {
  *  `rejected` = a non-2xx, `aborted` = the caller's signal (permit/deadline/tick) aborted OR the throw
  *  was an AbortError even with no aborted signal (e.g. the client's own request timeout) — silent on
  *  the feed either way; the shutdown sink names the latter `publish_error`, since its permit did not
- *  expire — and `error` = any other throw. */
-type PublishFailClass = "preservation_refused" | "no_local_tip" | "skipped" | "rejected" | "aborted" | "scratch_publication_refused" | "error";
+ *  expire — `secret_remediation_pending` is a local hold before packing or upload, and
+ *  `error` = any other throw. */
+type PublishFailClass = "secret_remediation_pending" | "preservation_refused" | "no_local_tip" | "skipped" | "rejected" | "aborted" | "scratch_publication_refused" | "error";
+
+/** Local refusal before any checkpoint pack producer or broker attempt. */
+class SecretRemediationPendingError extends Error {}
 
 /** issue #1597 M1: the typed result of {@link RunRunner.publishCheckpointOutcome}. Only the
  *  allowlisted skip label and the numeric HTTP status are carried — never an error message,
@@ -615,6 +619,7 @@ type ShutdownCheckpointOutcome =
   | "publish_skipped"
   | "publish_error"
   | "scratch_publication_refused"
+  | "secret_remediation_pending"
   | "no_local_tip"
   | "bare_lock_retained"
   | "tick_process_survived";
@@ -629,6 +634,8 @@ function shutdownOutcomeOf(
   if (!outcome) return "publish_error";
   if (outcome.published) return "published";
   switch (outcome.reason) {
+    case "secret_remediation_pending":
+      return "secret_remediation_pending";
     case "no_local_tip":
       return "no_local_tip";
     case "skipped":
@@ -1782,10 +1789,11 @@ interface RunFlight {
   steeredTips?: Set<string>;
   /** issue #1932: per-flight state of the pre-exit secret remediation gate (see
    *  RunRunner.runSecretRemediationGate). `known` = findings of the last trusted gate scan that
-   *  still suppress the checkpointBody publish paths (tick, milestone, done, reap), and that make
-   *  finalize fail (`push_secret_blocked`, no push) while non-empty. The park / shutdown / pause /
-   *  capture sinks are unscanned by design (#1597) and may publish a known finding; finalize (D5) is
-   *  the guard that still fails the run. `blocked` = findings that make finalize fail terminally
+   *  suppress every checkpoint publication and make finalize fail (`push_secret_blocked`, no push)
+   *  while non-empty. Park / shutdown / pause / capture sinks remain unscanned (#1597), but hold
+   *  remembered findings in this flight. This memory does not survive a new flight/reclaim and
+   *  does not contain never-flagged content, including trees copied into an overlay.
+   *  `blocked` = findings that make finalize fail terminally
    *  (cap exhausted, or an untrusted gate scan after a known finding); `cleanTip` = the tracking tip
    *  of the last CLEAN trusted gate scan, used by the reap-publish hold and to decide at finalize
    *  whether the branch moved since (a moved branch is RE-SCANNED there, never failed on this field
@@ -9032,52 +9040,17 @@ export class RunRunner {
         // remote publication runs out of budget. The soft stop begins to govern
         // only the overlay/pack/upload path below.
         if (hasNewWork && checkpointSoft?.signal.aborted) throw new CheckpointSoftDeadlineError();
-        // issue #1932 D3: while the pre-exit secret remediation gate holds a known/blocked finding,
-        // checkpointBody publishes nothing on any path (overlay and pinned, reap true/false, the
-        // mid-turn tick, the deferred pendingPublish): the fetch-back / steer / bridge above stay
-        // (local only), but the flagged commit must never reach the checkpoint ref from here. The
-        // park / shutdown / pause / capture / completion-hold sinks publish unscanned by design
-        // (#1597): an accepted residual outside this hold. After a finding has been known in this
-        // run, a reap:true (milestone/done) publish also requires the tracking tip to be the tip of
-        // the last CLEAN trusted gate scan, so a commit landing after that scan cannot slip out
-        // unscanned through the GitHub overlay (which is otherwise unscanned). lastPublish,
-        // lastPublishedTip, checkpointFloor and pendingPublish are left as they are.
+        // Local fetch-back/bridge stays intact. All sinks hold findings remembered in this flight;
+        // reap publishes also require the last clean-scanned source. Sinks remain unscanned and
+        // do not contain never-flagged content (including overlay trees) or a new flight's history.
         const postBridgeTip = await this.requireTrackingOwned(flight, barePath, runnerClone.branch);
-        const remediation = flight.secretRemediation;
-        // A commit only the mid-turn scan flagged (flaggedCommits, no `known`) holds too while it is
-        // still an ancestor of the tip about to be published (unknown ancestry counts as reachable, an
-        // unreadable tip fails closed), or once the list overflowed: the GitHub reap:true overlay
-        // publish is unscanned, so ancestry is the only guard there. The tip judged is the POST-bridge
-        // owned snapshot postBridgeTip, rather than fetchedTip: the bridge can produce a commit that
-        // wraps a local-only floor containing the flagged commit. Read only when remediation state
-        // exists, so a clean run pays nothing extra.
         const timeGateOpen =
           this.checkpointIntervalMs > 0 &&
           this.now() - flight.lastPublish >= this.checkpointIntervalMs;
-        let flaggedHold = false;
-        let holdTip: string | null = fetchedTip;
-        // Only a publish that would otherwise happen is held here (a closed time gate keeps its own outcome).
-        if (hasNewWork && (opts.reap || timeGateOpen || flight.pendingPublish) && remediation !== undefined) {
-          holdTip = postBridgeTip;
-          if (remediation.overflow === true) {
-            flaggedHold = true;
-          } else if ((remediation.flaggedCommits?.length ?? 0) > 0) {
-            try {
-              flaggedHold =
-                holdTip === null ||
-                (await this.reachableFlaggedFindings(remediation, barePath, holdTip)).length > 0;
-            } catch {
-              flaggedHold = true; // fail closed
-            }
-          }
-        }
+        // Keep a closed time gate's own outcome; judge the post-bridge candidate before any overlay.
         const remediationHold =
-          hasNewWork &&
-          remediation !== undefined &&
-          (flaggedHold ||
-            (remediation.known?.length ?? 0) > 0 ||
-            (remediation.blocked?.length ?? 0) > 0 ||
-            (opts.reap && remediation.everKnown === true && holdTip !== remediation.cleanTip));
+          hasNewWork && (opts.reap || timeGateOpen || flight.pendingPublish) &&
+          await this.checkpointRemediationHold(flight, barePath, postBridgeTip, opts.reap);
         // Resolve the GitHub overlay context after the candidate is in the
         // worker bare. Even a slow local default-branch lookup now runs under
         // the same checkpoint-only child budget as the remote default fetch.
@@ -9155,96 +9128,101 @@ export class RunRunner {
                   : opts.signal,
                 scanned.kind === "pinned" ? scanned.range : undefined,
                 trace ? (step) => trace.enter(step) : undefined,
+                opts.reap,
               );
               const outcome = await withCheckpointSoftGit(publish);
               if (!outcome.published && outcome.reason === "preservation_refused") {
                 bodyOutcome = "no_new_work";
                 return;
               }
-              if (!outcome.published && checkpointSoft?.signal.aborted) throw new CheckpointSoftDeadlineError();
-              published = outcome.published;
-              bodyOutcome = outcome.published
-                ? "published"
-                : outcome.reason === "aborted" || opts.signal?.aborted
-                  ? "aborted"
-                  : `publish_failed:${outcome.reason}`;
-              // Advance the time-gate on every ATTEMPT (not just success): bounds broker retry
-              // cadence to <= 1 publish/interval/run even under a persistent broker failure. An owed
-              // (deferred) publish is settled by the attempt too (issue #1597 M2 round 4), so the gate
-              // — not pendingPublish — governs every retry.
-              flight.lastPublish = this.now();
-              if (bodyOutcome !== "aborted") flight.pendingPublish = false;
-              // PRD #267 Fix 1 (Decision 9): advance lastPublishedTip ONLY on a CONFIRMED landed
-              // publish, so a transient broker failure leaves hasNewWork true and the time-gate
-              // retries the SAME tip at the next interval boundary (bounded loss).
-              if (published && scanned.kind === "pinned") {
-                // issue #1597 M2 (review item 3): the PINNED path published exactly `range.tipSha`, read
-                // from the tracking ref AFTER the fetch-back/bridge — not `cloneTip`, read at the top
-                // of this body: the agent may commit (or reset) in between, and recording cloneTip
-                // would either republish the same tip next interval or set floor C to a commit that
-                // was never published (a false #1416 steer, or a bridge resurrecting a dropped commit).
-                // When THIS body bridged, tipSha is the bridge B: C = B (the durable floor) while
-                // lastPublishedTip = the fetched H that B wraps (it drives hasNewWork against cloneTip,
-                // exactly as the unpinned path keeps H there).
-                const tipSha = scanned.range.tipSha;
-                const bridgedTip = bridgeOutcome.kind === "bridged" && bridgeOutcome.bridge === tipSha;
-                flight.lastPublishedTip = bridgedTip && fetchedTip ? fetchedTip : tipSha;
-                flight.landedCheckpoint = true;
-                flight.checkpointFloor = tipSha;
-                this.recordPublishedRealTip(flight, tipSha);
-                this.checkpointTestHooks?.afterPinnedPublish?.({
-                  publishedTip: tipSha,
-                  lastPublishedTip: flight.lastPublishedTip,
-                  checkpointFloor: flight.checkpointFloor,
-                });
-                if (!opts.reap) {
-                  runLog.info("checkpoint published to origin (time-based)", {
-                    run_id: runId,
-                    branch: runnerClone.branch,
-                    tip: tipSha,
+              if (!outcome.published && outcome.reason === "secret_remediation_pending") {
+                bodyOutcome = "secret_remediation_pending";
+              } else {
+                if (!outcome.published && checkpointSoft?.signal.aborted) throw new CheckpointSoftDeadlineError();
+                published = outcome.published;
+                bodyOutcome = outcome.published
+                  ? "published"
+                  : outcome.reason === "aborted" || opts.signal?.aborted
+                    ? "aborted"
+                    : `publish_failed:${outcome.reason}`;
+                // Advance the time-gate on every ATTEMPT (not just success): bounds broker retry
+                // cadence to <= 1 publish/interval/run even under a persistent broker failure. An owed
+                // (deferred) publish is settled by the attempt too (issue #1597 M2 round 4), so the gate
+                // — not pendingPublish — governs every retry.
+                flight.lastPublish = this.now();
+                if (bodyOutcome !== "aborted") flight.pendingPublish = false;
+                // PRD #267 Fix 1 (Decision 9): advance lastPublishedTip ONLY on a CONFIRMED landed
+                // publish, so a transient broker failure leaves hasNewWork true and the time-gate
+                // retries the SAME tip at the next interval boundary (bounded loss).
+                if (published && scanned.kind === "pinned") {
+                  // issue #1597 M2 (review item 3): the PINNED path published exactly `range.tipSha`, read
+                  // from the tracking ref AFTER the fetch-back/bridge — not `cloneTip`, read at the top
+                  // of this body: the agent may commit (or reset) in between, and recording cloneTip
+                  // would either republish the same tip next interval or set floor C to a commit that
+                  // was never published (a false #1416 steer, or a bridge resurrecting a dropped commit).
+                  // When THIS body bridged, tipSha is the bridge B: C = B (the durable floor) while
+                  // lastPublishedTip = the fetched H that B wraps (it drives hasNewWork against cloneTip,
+                  // exactly as the unpinned path keeps H there).
+                  const tipSha = scanned.range.tipSha;
+                  const bridgedTip = bridgeOutcome.kind === "bridged" && bridgeOutcome.bridge === tipSha;
+                  flight.lastPublishedTip = bridgedTip && fetchedTip ? fetchedTip : tipSha;
+                  flight.landedCheckpoint = true;
+                  flight.checkpointFloor = tipSha;
+                  this.recordPublishedRealTip(flight, tipSha);
+                  this.checkpointTestHooks?.afterPinnedPublish?.({
+                    publishedTip: tipSha,
+                    lastPublishedTip: flight.lastPublishedTip,
+                    checkpointFloor: flight.checkpointFloor,
                   });
-                }
-              } else if (published) {
-                // PRD #1809 D8: the publish packed the tracking ref, which holds cloneTip only when the
-                // fetch-back landed (or the tip was unmoved since the last one). After a failed
-                // fetch-back the checkpoint is the OLDER tracking tip `fetchedTip`: cloneTip was never
-                // published, so it is neither lastPublishedTip (hasNewWork stays true and the next
-                // checkpoint retries, and a pause cannot shortcut on it) nor the floor.
-                const packedClone = fetchedBack.kind === "updated" && cloneTip !== null && fetchedTip === cloneTip;
-                if (packedClone) flight.lastPublishedTip = cloneTip;
-                // N1: a checkpoint landed either way; the report-only orphan guards key on this.
-                flight.landedCheckpoint = true;
-                // PRD #1416 M3 (C2): advance the checkpoint floor C to the DURABLE published floor on
-                // EVERY confirmed publish (PRD line 62). When this tick BRIDGED, C is already B (the
-                // helper set it) and cloneTip is the un-bridged H — so DO NOT regress C back to H;
-                // otherwise C is the confirmed checkpoint tip: cloneTip, or the older tracking tip a
-                // failed fetch-back left. lastPublishedTip (H when it was packed, above) drives
-                // hasNewWork, a separate concern from the floor.
-                flight.checkpointFloor =
-                  bridgeOutcome.kind === "bridged"
-                    ? bridgeOutcome.bridge
-                    : packedClone
-                      ? cloneTip
-                      : (fetchedTip ?? flight.checkpointFloor);
-                // Record only a tip this publish actually confirmed: not the unchanged prior floor a
-                // failed fetch-back falls back to.
-                if (bridgeOutcome.kind === "bridged" || packedClone || fetchedTip !== null) {
-                  this.recordPublishedRealTip(flight, flight.checkpointFloor);
-                }
-                this.checkpointTestHooks?.afterUnpinnedPublish?.({
-                  cloneTip,
-                  fetchedTip,
-                  lastPublishedTip: flight.lastPublishedTip,
-                  checkpointFloor: flight.checkpointFloor,
-                });
-                // PRD #267 M3: make the time-based publish observable, only for the time path so
-                // we do not double-log the milestone case.
-                if (!opts.reap) {
-                  runLog.info("checkpoint published to origin (time-based)", {
-                    run_id: runId,
-                    branch: runnerClone.branch,
-                    tip: cloneTip,
+                  if (!opts.reap) {
+                    runLog.info("checkpoint published to origin (time-based)", {
+                      run_id: runId,
+                      branch: runnerClone.branch,
+                      tip: tipSha,
+                    });
+                  }
+                } else if (published) {
+                  // PRD #1809 D8: the publish packed the tracking ref, which holds cloneTip only when the
+                  // fetch-back landed (or the tip was unmoved since the last one). After a failed
+                  // fetch-back the checkpoint is the OLDER tracking tip `fetchedTip`: cloneTip was never
+                  // published, so it is neither lastPublishedTip (hasNewWork stays true and the next
+                  // checkpoint retries, and a pause cannot shortcut on it) nor the floor.
+                  const packedClone = fetchedBack.kind === "updated" && cloneTip !== null && fetchedTip === cloneTip;
+                  if (packedClone) flight.lastPublishedTip = cloneTip;
+                  // N1: a checkpoint landed either way; the report-only orphan guards key on this.
+                  flight.landedCheckpoint = true;
+                  // PRD #1416 M3 (C2): advance the checkpoint floor C to the DURABLE published floor on
+                  // EVERY confirmed publish (PRD line 62). When this tick BRIDGED, C is already B (the
+                  // helper set it) and cloneTip is the un-bridged H — so DO NOT regress C back to H;
+                  // otherwise C is the confirmed checkpoint tip: cloneTip, or the older tracking tip a
+                  // failed fetch-back left. lastPublishedTip (H when it was packed, above) drives
+                  // hasNewWork, a separate concern from the floor.
+                  flight.checkpointFloor =
+                    bridgeOutcome.kind === "bridged"
+                      ? bridgeOutcome.bridge
+                      : packedClone
+                        ? cloneTip
+                        : (fetchedTip ?? flight.checkpointFloor);
+                  // Record only a tip this publish actually confirmed: not the unchanged prior floor a
+                  // failed fetch-back falls back to.
+                  if (bridgeOutcome.kind === "bridged" || packedClone || fetchedTip !== null) {
+                    this.recordPublishedRealTip(flight, flight.checkpointFloor);
+                  }
+                  this.checkpointTestHooks?.afterUnpinnedPublish?.({
+                    cloneTip,
+                    fetchedTip,
+                    lastPublishedTip: flight.lastPublishedTip,
+                    checkpointFloor: flight.checkpointFloor,
                   });
+                  // PRD #267 M3: make the time-based publish observable, only for the time path so
+                  // we do not double-log the milestone case.
+                  if (!opts.reap) {
+                    runLog.info("checkpoint published to origin (time-based)", {
+                      run_id: runId,
+                      branch: runnerClone.branch,
+                      tip: cloneTip,
+                    });
+                  }
                 }
               }
             }
@@ -11315,7 +11293,8 @@ export class RunRunner {
    * never published. Never throws.
    *
    * BY DESIGN the park / shutdown / pause / capture publishes (and every overlay publish) are NOT
-   * scanned: the api pushes them UNSCANNED to the forge's refs/uzi-checkpoints/<branch>
+   * scanned: permitted candidates reach the forge UNSCANNED, but #1964 holds findings
+   * remembered in this flight at the shared pack/publish seam before any producer starts.
    * (Service.Publish in api/internal/workersvc/service.go) — they are the run's last chance to be
    * durable before the worker stops working on it, and a blocked or slow scan there would lose the
    * work outright. The scan guards the frequent, mid-run checkpoint stream only; a Codex milestone
@@ -11356,9 +11335,9 @@ export class RunRunner {
         this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs() }),
       );
       if (scan.findings.length > 0) {
-        // A TRUSTED finding is remembered (flaggedCommits only, not `known`, so the tick does not
-        // itself suppress later publishes or trip the gate on its own) so the remediation gate, the
-        // pre-push re-check and the post-bridge scan know a commit a later local bridge might hide.
+        // A TRUSTED finding is remembered as flaggedCommits (without setting `known`). Its SHA
+        // holds later checkpoint candidates while reachable, including through a local bridge;
+        // remediation and finalize also consult the retained findings.
         if (scan.trusted) {
           this.recordFlaggedCommits((flight.secretRemediation ??= { attempts: 0 }), scan.findings, flight.runLog);
         }
@@ -11978,6 +11957,34 @@ export class RunRunner {
     };
   }
 
+  /**
+   * Hold only process-local remembered findings, independently of finding-display metadata.
+   * At most the capped flaggedCommits list is read, serially; the first reachable/unknown SHA
+   * or git error holds the whole candidate. Clean-tip equality judges the source, not its wrapper.
+   */
+  private async checkpointRemediationHold(
+    flight: RunFlight,
+    barePath: string,
+    candidate: string | null,
+    reap: boolean,
+    sourceSha: string | null = candidate,
+  ): Promise<boolean> {
+    const state = flight.secretRemediation;
+    if (!state) return false;
+    if ((state.known?.length ?? 0) > 0 || (state.blocked?.length ?? 0) > 0 || state.overflow === true) return true;
+    if (reap && state.everKnown === true && (sourceSha === null || sourceSha !== state.cleanTip)) return true;
+    if ((state.flaggedCommits?.length ?? 0) === 0) return false;
+    if (candidate === null) return true;
+    try {
+      for (const sha of state.flaggedCommits!) {
+        if (await this.git.ancestry(barePath, sha, candidate) !== "divergent") return true;
+      }
+    } catch {
+      return true;
+    }
+    return false;
+  }
+
   private async publishCheckpointBestEffort(
     flight: RunFlight,
     barePath: string,
@@ -12007,6 +12014,7 @@ export class RunRunner {
     /** issue #1597 M2: the scanned range — pack exactly these SHAs (see GitCache.checkpointPack). */
     pinned?: CheckpointRange,
     onStep?: (step: BoundaryStep) => void,
+    reap = true,
   ): Promise<PublishOutcome> {
     // issue #1086 (F2): two-tip reconciliation. The CONFIRMED tip advances only on a real ACK; an
     // ambiguous result (non-2xx, or a throw after the pack tip is known) records the ATTEMPTED tip
@@ -12017,7 +12025,16 @@ export class RunRunner {
     let packedTip: string | undefined;
     try {
       const sourceSha = await this.requireTrackingOwned(flight, barePath, branch, pinned?.tipSha);
-      const packed = await this.git.checkpointPack(barePath, branch, overlay, pinned, onStep, sourceSha);
+      if (await this.checkpointRemediationHold(flight, barePath, sourceSha, reap)) {
+        throw new SecretRemediationPendingError();
+      }
+      const packed = await this.git.checkpointPack(barePath, branch, overlay, pinned, onStep, sourceSha,
+        async (wantedSha) => {
+          // The clean scan names the owned source, while ancestry judges the actual overlay/bridge.
+          if (await this.checkpointRemediationHold(flight, barePath, wantedSha, reap, sourceSha)) {
+            throw new SecretRemediationPendingError();
+          }
+        });
       // tracking tip unresolved (no tracking ref, or it could not be read) — nothing to pack; not a
       // publish failure, stay silent
       if (!packed) return { published: false, reason: "no_local_tip" };
@@ -12069,6 +12086,10 @@ export class RunRunner {
       );
       return { published: false, reason: "rejected", httpStatus: res.httpStatus };
     } catch (e) {
+      if (e instanceof SecretRemediationPendingError) {
+        this.reportPublishOutcome(flight, "secret:remediation", "checkpoint publish skipped: secret_remediation_pending");
+        return { published: false, reason: "secret_remediation_pending" };
+      }
       if (e instanceof PreservationRefusedError) return { published: false, reason: "preservation_refused" };
       if (e instanceof ScratchPublicationError) {
         logScratchPublicationRefused(flight.runLog, flight.redactText, e, "checkpoint_publish");

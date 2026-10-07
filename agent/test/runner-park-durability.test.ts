@@ -276,7 +276,7 @@ describe("RunRunner — PRD #1809 D8: the owner pause park reports what its chec
       // The overlay's default-tip wrapper needs a forge fetch; pack the plain tracking ref instead.
       // The runner still took the overlay (unpinned) publish path.
       const realPack = git.checkpointPack.bind(git);
-      git.checkpointPack = async (barePath, branch, _overlay, pinned) => await realPack(barePath, branch, undefined, pinned);
+      git.checkpointPack = async (barePath, branch, _overlay, ...rest) => await realPack(barePath, branch, undefined, ...rest);
       const { github } = fakeGitHub();
       const { gitlab } = fakeGitlab();
       const claim = gitlabClaim(18088, {
@@ -420,7 +420,7 @@ describe("RunRunner — PRD #1809 D8: an overlay publish after a failed fetch-ba
    *  the plain tracking ref: the overlay's default-tip wrapper would need a forge fetch. */
   function overlayClaim(n: number) {
     const realPack = git.checkpointPack.bind(git);
-    git.checkpointPack = async (barePath, branch, _overlay, pinned) => await realPack(barePath, branch, undefined, pinned);
+    git.checkpointPack = async (barePath, branch, _overlay, ...rest) => await realPack(barePath, branch, undefined, ...rest);
     return gitlabClaim(n, {
       repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
     });
