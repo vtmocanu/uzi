@@ -1,6 +1,6 @@
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { WorkerClient } from "../src/client.js";
+import { RequestError, WorkerClient } from "../src/client.js";
 import { makeClaim, nullLogger } from "./helpers.js";
 
 const run = "11111111-1111-4111-8111-111111111111";
@@ -29,6 +29,7 @@ async function fixture() {
     }
     if (path.endsWith("/ownership")) {
       if (ownership instanceof Error) throw ownership;
+      if (ownership instanceof Response) return ownership;
       return Response.json(ownership);
     }
     if (path.endsWith("/runs/claim")) return Response.json(claim);
@@ -39,6 +40,99 @@ async function fixture() {
     setOwnership: (v: unknown) => { ownership = v; }, setCustody: (v: Record<string, unknown>) => { custody = v; },
     custody: () => structuredClone(custody), setClaim: (v: unknown) => { claim = v; } };
 }
+
+// Finite 1 KiB chunks, with no prefetch: uncapped readers reach EOF, while bounded
+// readers cancel before the unread tail. No timers or background producers.
+function streamedOwnership(body: string, status = 200, contentLength?: string) {
+  const bytes = new TextEncoder().encode(body);
+  let offset = 0;
+  let cancelled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (offset === bytes.length) { controller.close(); return; }
+      const end = Math.min(offset + 1024, bytes.length);
+      controller.enqueue(bytes.subarray(offset, end));
+      offset = end;
+    },
+    cancel() { cancelled = true; },
+  }, { highWaterMark: 0 });
+  const headers = new Headers({ "Content-Type": "application/json", "Retry-After": "7" });
+  if (contentLength !== undefined) headers.set("Content-Length", contentLength);
+  return {
+    response: new Response(stream, { status, headers }),
+    cancelled: () => cancelled,
+    bytesRead: () => offset,
+  };
+}
+
+test("oversized streamed ownership refuses retirement and retains guarded custody", async () => {
+  for (const state of ["absent", "pending"] as const) {
+    for (const contentLength of [undefined, "1"]) {
+      const f = await fixture();
+      await f.c.claimRun();
+      const body = JSON.stringify({
+        status: "completed", claim_generation: 3, inventory_guarded: true,
+        padding: "x".repeat(32 * 1024),
+      });
+      const streamed = streamedOwnership(body, 200, contentLength);
+      f.setOwnership(streamed.response);
+      await assert.rejects(f.c.hasRecoveryRetirementAuthority(run, 3, state), /response body exceeds 16384 bytes/);
+      assert.equal(streamed.cancelled(), true);
+      assert.equal(streamed.bytesRead(), 17 * 1024);
+      assert.equal(f.c.knowsInventoryGuardedClaim(run, 3), true);
+      assert.equal(f.paths.some(p => p.includes("terminal-rejection-custody")), false);
+    }
+  }
+});
+
+test("oversized ownership errors remain bounded and preserve status and guarded custody", async () => {
+  for (const state of ["absent", "pending"] as const) {
+    for (const status of [404, 503]) {
+      for (const contentLength of [undefined, "1"]) {
+        const f = await fixture();
+        await f.c.claimRun();
+        const streamed = streamedOwnership("x".repeat(32 * 1024), status, contentLength);
+        f.setOwnership(streamed.response);
+        await assert.rejects(f.c.hasRecoveryRetirementAuthority(run, 3, state), (err: unknown) => {
+          assert.ok(err instanceof RequestError);
+          assert.equal(err.method, "GET");
+          assert.equal(err.path, `/api/worker/runs/${run}/ownership`);
+          assert.equal(err.status, status);
+          assert.equal(err.body, "x".repeat(4096));
+          assert.equal(err.retryAfterHeaderMs, 7000);
+          return true;
+        });
+        assert.equal(streamed.cancelled(), true);
+        assert.equal(streamed.bytesRead(), 4096);
+        assert.equal(f.c.knowsInventoryGuardedClaim(run, 3), true);
+        assert.equal(f.paths.some(p => p.includes("terminal-rejection-custody")), false);
+      }
+    }
+  }
+});
+
+test("bounded ownership preserves normal responses, exact-cap bodies and small errors", async () => {
+  const f = await fixture();
+  const ownership = { status: "completed", claim_generation: 3, inventory_guarded: true };
+  for (const size of [undefined, 16 * 1024]) {
+    const json = JSON.stringify(ownership);
+    const body = size === undefined ? json : json.padEnd(size, " ");
+    f.setOwnership(streamedOwnership(body, 200, "1").response);
+    assert.deepEqual(await f.c.getRunOwnership(run), ownership);
+    await f.c.claimRun();
+    f.setOwnership(streamedOwnership(body, 200, "1").response);
+    assert.equal(await f.c.hasRecoveryRetirementAuthority(run, 3, "pending"), true);
+    assert.equal(f.c.knowsInventoryGuardedClaim(run, 3), false);
+  }
+  f.setOwnership(streamedOwnership("not owned", 404, "1").response);
+  await assert.rejects(f.c.getRunOwnership(run), (err: unknown) => {
+    assert.ok(err instanceof RequestError);
+    assert.equal(err.status, 404);
+    assert.equal(err.body, "not owned");
+    assert.equal(err.retryAfterHeaderMs, 7000);
+    return true;
+  });
+});
 
 test("pending journal requires all discarded; absent journal accepts complete released custody", async () => {
   const f = await fixture();

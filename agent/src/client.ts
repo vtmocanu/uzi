@@ -1939,7 +1939,8 @@ export class WorkerClient {
    *  the caller distinguishes a DEFINITIVE 404 (run not owned / reclaimed) from a transient
    *  error via `err.status`. Reuses GetRunOwnedByWorker server-side; no new query. */
   async getRunOwnership(runId: string): Promise<RunOwnershipResponse> {
-    return (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/ownership`)) as RunOwnershipResponse;
+    // Bound actual streamed bytes before ownership can authorize recovery retirement.
+    return (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/ownership`, undefined, 16 * 1024)) as RunOwnershipResponse;
   }
 
   /** PRD #1391 Run B M3 (D3): read a page of a run's MISSING message-seq ranges in `[1..through]`
