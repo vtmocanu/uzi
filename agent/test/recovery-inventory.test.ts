@@ -104,6 +104,18 @@ it("issue1924 invalid ownership route body network and HTTP failures never FINAL
   }
 });
 
+it("issue1924 a guarded generation is unsettled until its FINAL is acknowledged", async () => {
+  const f = await fixture();
+  try {
+    const record = await f.freeze();
+    assert.ok(record);
+    assert.deepEqual([...await f.coordinator.unsettledGuardedGenerations("run-1")], [7]);
+    await f.capture(record);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]?.finalAcknowledged, true);
+    assert.deepEqual([...await f.coordinator.unsettledGuardedGenerations("run-1")], []);
+  } finally { await f.close(); }
+});
+
 it("issue1924 a discovery that no longer returns a context drops it from the boot queue", async () => {
   const f = await fixture();
   try {

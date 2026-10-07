@@ -112,6 +112,17 @@ describe("issue1924 owed discovery cost", () => {
     assert.equal((await cache.committedTrackingOwnership(bare, BRANCH, RUN, heads[N - 1], N)).kind, "owned");
   });
 
+  it("keeps a released generation discoverable while its recovery journal is unsettled", async () => {
+    const N = 4;
+    const heads = await buildGenerations(N);
+    // Generation 2 still owes a final disposition to the server: its context must survive the
+    // release of its pins, or discovery drops it and its open hold can never be settled.
+    await cache.reconcileOwedCandidates(bare, RUN, heads[N - 1]!, contextFor(N).context, new Set([2]));
+    const discovered = await cache.discoverOwedCandidates();
+    assert.deepEqual(discovered.map((d) => d.context.generation), [2, N]);
+    assert.deepEqual(discovered.map((d) => d.candidates.length), [0, 0]);
+  });
+
   it("keeps a still-pinned context and prunes nothing while a receipt is unreadable (fail closed)", async () => {
     const N = 4;
     const heads = await buildGenerations(N);

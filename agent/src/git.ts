@@ -8623,7 +8623,7 @@ export class GitCache {
 
   /** Only a server-confirmed full commit and positive ancestry proof release an owed pin. */
   async reconcileOwedCandidates(barePath: string, runId: string, remotelyConfirmedSha: string,
-    keepContext?: OwedCandidateContext):
+    keepContext?: OwedCandidateContext, keepGenerations?: ReadonlySet<number>):
     Promise<{ removedShas: string[]; retainedShas: string[] }> {
     if (typeof runId !== "string" || !OWED_RUN_ID.test(runId)) throw new Error("invalid owed run ID");
     this.validateConfirmedSha(remotelyConfirmedSha);
@@ -8648,7 +8648,8 @@ export class GitCache {
         } else retainedShas.push(candidate.sha);
       }
       if (releasedContexts.size) {
-        await this.pruneReleasedOwedContexts(barePath, releasedContexts, keepContext ? this.contextName(keepContext) : undefined);
+        await this.pruneReleasedOwedContexts(barePath, releasedContexts, keepContext ? this.contextName(keepContext) : undefined,
+          keepGenerations);
       }
       return { removedShas, retainedShas };
     });
@@ -8658,8 +8659,10 @@ export class GitCache {
    *  reading and enumerating it on every pass. Best-effort and fail closed: a context stays when any
    *  remaining candidate file or any tracking receipt still names it, when it is the caller's live
    *  context, or when any receipt is unreadable or malformed. The pins are already gone, so a failure
-   *  here only leaves harmless metadata. Caller MUST hold the bare lock. */
-  private async pruneReleasedOwedContexts(barePath: string, released: Set<string>, keep: string | undefined): Promise<void> {
+   *  here only leaves harmless metadata. `keepGenerations` names generations with an unsettled
+   *  recovery journal; their contexts are never pruned. Caller MUST hold the bare lock. */
+  private async pruneReleasedOwedContexts(barePath: string, released: Set<string>, keep: string | undefined,
+    keepGenerations?: ReadonlySet<number>): Promise<void> {
     try {
       const names = await this.owedMetadataNames(barePath);
       const stillNamed = new Set<string>();
@@ -8674,6 +8677,12 @@ export class GitCache {
       }
       for (const name of released) {
         if (name === keep || stillNamed.has(name) || !names.includes(name)) continue;
+        if (keepGenerations?.size) {
+          // A generation whose recovery journal is not final-acknowledged stays discoverable:
+          // recovery rebuilds its custody from the context. Unreadable context: keep it.
+          const stored = await this.readOwedFile(barePath, name) as { generation?: unknown } | undefined;
+          if (typeof stored?.generation !== "number" || keepGenerations.has(stored.generation)) continue;
+        }
         await this.removeOwedFile(barePath, name);
       }
     } catch (cause) {

@@ -10701,7 +10701,8 @@ export class RunRunner {
     try {
       // The flight's own context stays: its next checkpoint is admitted against it.
       const result = await this.git.reconcileOwedCandidates(barePath, flight.runId, confirmedSha,
-        flight.owedContext ? await flight.owedContext : undefined);
+        flight.owedContext ? await flight.owedContext : undefined,
+        await this.recovery.unsettledGuardedGenerations(flight.runId));
       // Released heads are no longer owed: forget them so the ledger tracks only live pins.
       for (const sha of result.removedShas) {
         flight.owedAnnounced.heads.delete(sha);

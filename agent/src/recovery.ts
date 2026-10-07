@@ -2197,6 +2197,16 @@ export class RecoveryCoordinator {
     return createHmac("sha256", this.key).update(canonicalJson(record)).digest("hex");
   }
 
+  /** Generations of a run whose guarded recovery journal is not final-acknowledged. Their owed
+   *  contexts must stay discoverable until the final disposition is acknowledged. */
+  async unsettledGuardedGenerations(runId: string): Promise<Set<number>> {
+    const out = new Set<number>();
+    for (const r of await this.listRecords(runId)) {
+      if (r.inventoryGuarded && !r.finalAcknowledged && typeof r.generation === "number") out.add(r.generation);
+    }
+    return out;
+  }
+
   /** All authenticated records for a run (skips tampered/unreadable files). */
   private async listRecords(runId: string): Promise<RecoveryRecord[]> {
     let names: string[];
