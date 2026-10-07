@@ -12,6 +12,46 @@ import { FakeRecoveryClient } from "./codex-reap-fixture.js";
 import { nullLogger } from "./helpers.js";
 
 installHarness();
+
+it("a rewritten run head cannot be replaced by a concurrent shared tracking write", async () => {
+  const branch = "agent/issue-2404";
+  const remote = path.join(fx.dataDir, "remote.git");
+  cmd(fx.dataDir, "clone", "--bare", fx.originPath, remote);
+  const writer = path.join(fx.dataDir, "writer");
+  cmd(fx.dataDir, "clone", remote, writer);
+  cmd(writer, "checkout", "-b", branch);
+  cmd(writer, "commit", "--allow-empty", "-m", "P");
+  cmd(writer, "push", "origin", branch);
+  const P = cmd(writer, "rev-parse", "HEAD");
+  const claim = gitlabClaim(2404, { kind: "ci_fix", branch, base_branch: "main",
+    repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: remote } });
+  const fetch = git.fetchAgentBranch.bind(git);
+  let importedH = "";
+  git.fetchAgentBranch = async (...args) => {
+    // Rewrite below P just before import, then replace shared tracking after import.
+    cmd(args[1], "reset", "--hard", "main");
+    cmd(args[1], "commit", "--allow-empty", "-m", "rewritten H");
+    importedH = cmd(args[1], "rev-parse", "HEAD");
+    const tracking = await fetch(...args);
+    cmd(args[0], "update-ref", tracking, P);
+    return tracking;
+  };
+  const push = git.pushBranch.bind(git);
+  let provenH = "";
+  git.pushBranch = async (...args) => {
+    provenH = args[5]?.originalHead ?? "";
+    cmd(writer, "commit", "--allow-empty", "-m", "R");
+    cmd(writer, "push", "origin", branch);
+    return push(...args);
+  };
+  await runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab).execute(claim);
+  const terminal = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
+  assert.ok(terminal);
+  assert.equal(terminal.branch_moved, undefined, "rewritten H never gets benign supersession");
+  assert.equal(provenH, importedH, "proof uses the reaped clone's H, not mutable tracking");
+  assert.match(terminal.failure_reason ?? "", /remote_candidate_diverged/);
+});
+
 function cmd(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-C", cwd, "-c", "maintenance.auto=false", "-c", "gc.auto=0",
     "-c", "user.name=Test", "-c", "user.email=test@example.org", "-c", "commit.gpgsign=false", ...args],

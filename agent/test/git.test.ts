@@ -10,7 +10,7 @@ import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
-import { GitCache, ScratchProvisionError, bareDirName, gitEnv } from "../src/git.js";
+import { GitCache, ScratchProvisionError, ScratchPublicationError, bareDirName, gitEnv } from "../src/git.js";
 import { TickSpawner } from "../src/tick-spawner.js";
 
 let fx: Fixture;
@@ -524,7 +524,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     // silently rewrite origin history; a plain (non-forced) push is refused as non-ff.
     await assert.rejects(
       git.pushBranch(bare, "agent/issue-400", "", fx.originPath),
-      /non-fast-forward|\[rejected\]|failed to push/i,
+      (error: unknown) => error instanceof ScratchPublicationError && error.kind === "new_remote_candidate_diverged",
       "a non-forced push MUST refuse a non-fast-forward update — no history rewrite is possible",
     );
 

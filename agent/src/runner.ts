@@ -5482,7 +5482,8 @@ export class RunRunner {
     steps?.enter("fetch_back");
     const { trackingRef } = await this.fetchTracking(flight, barePath, runnerClone.path, result.branch);
 
-    const publicationOriginalHead = await this.git.trackingTip(barePath, result.branch);
+    // The reaped run clone owns H; another run may replace shared tracking after fetch-back.
+    const publicationOriginalHead = await this.git.branchTip(runnerClone.path, result.branch);
 
     // PRD #1296 M3 (D1) — the protected finalization boundary. Pin the ORIGINAL committed
     // head H into the authenticated durable journal FIRST, unconditionally, and BEFORE any
