@@ -53,12 +53,11 @@ import (
 //     and must not go through the generic stale check (like credential_switch / pause_failed).
 //   - pause_failed: handled before the fence (it withdraws a pending pause, not a transition).
 //
-// A CHAT run is EXEMPT regardless of state (PRD #1247 M5 rework): chat has no claim-generation
-// contract (its batcher sends generation 0 and the run may omit it entirely), so fencing a
-// capability worker's chat report would 409 it. The chat guard below returns false for every
-// state so no chat transition is ever fenced.
+// Legacy generation-zero chats retain the PRD #1247 exemption, including supplied mismatches.
+// Fresh chat claims advance the generation, so supplied generations use the normal fence.
+// Chat reports may still omit their generation for compatibility with the chat runner.
 func stateUsesGenerationFence(state string, owned store.Run) bool {
-	if owned.Kind == runkind.Chat {
+	if owned.Kind == runkind.Chat && owned.ClaimGeneration == 0 {
 		return false
 	}
 	switch state {

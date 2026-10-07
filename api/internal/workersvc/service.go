@@ -4047,6 +4047,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// excluded here (stateUsesGenerationFence is false for it) and enforces the identical check
 	// inside completeRunWithPermitLease's permit transaction, where the rest of that arm's fence lives.
 	if req.ClaimGeneration == nil &&
+		owned.Kind != runkind.Chat &&
 		stateUsesGenerationFence(req.State, owned) &&
 		slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
 		return owned, false, ErrMissingClaimGeneration
@@ -4190,7 +4191,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// Empty means "no settle". The failed arm also sets it 'declined' for a scope-directed run;
 	// the limit_wait rate-limit opt-out settles inline in limitwait.go instead.
 	// Issue #1399: those arm decisions read `owned`, which for any report that skips the FOR
-	// UPDATE fence (a legacy nil-generation report, a chat run, an interlocked completion; see
+	// UPDATE fence (a legacy nil-generation report, a generation-zero chat, an interlocked completion; see
 	// stateUsesGenerationFence / stateUsesForUpdateFence) is the UNLOCKED pre-switch snapshot, so
 	// a scope directive can commit after it and before the terminal write. The applied-transition
 	// block therefore also settles when it is still empty and the post-transition re-read is
