@@ -229,18 +229,22 @@ func TestLiveConfirmationRaceGuardsLiveDB(t *testing.T) {
 }
 
 func TestLiveSameTipConfirmationPreservesTimestampLiveDB(t *testing.T) {
- f := newLiveAttemptFix(t)
- id := readyLiveAttempt(t, f)
- f.e.exec(t, "UPDATE runs SET checkpoint_tip=$2,checkpoint_tip_at=now()+interval '1 hour' WHERE id=$1", f.oldRun, lateTip)
- before, err := f.e.q.GetRunByID(f.e.ctx, f.oldRun)
- if err != nil { t.Fatal(err) }
- f.reconcileAttempts(t, f.svc1)
- assertLiveEvidence(t, f, id, lateTip, true)
- after, err := f.e.q.GetRunByID(f.e.ctx, f.oldRun)
- if err != nil { t.Fatal(err) }
- if after.CheckpointTipAt.Time.Before(before.CheckpointTipAt.Time) {
-  t.Fatalf("confirmation regressed timestamp: %v -> %v", before.CheckpointTipAt, after.CheckpointTipAt)
- }
+	f := newLiveAttemptFix(t)
+	id := readyLiveAttempt(t, f)
+	f.e.exec(t, "UPDATE runs SET checkpoint_tip=$2,checkpoint_tip_at=now()+interval '1 hour' WHERE id=$1", f.oldRun, lateTip)
+	before, err := f.e.q.GetRunByID(f.e.ctx, f.oldRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.reconcileAttempts(t, f.svc1)
+	assertLiveEvidence(t, f, id, lateTip, true)
+	after, err := f.e.q.GetRunByID(f.e.ctx, f.oldRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.CheckpointTipAt.Time.Before(before.CheckpointTipAt.Time) {
+		t.Fatalf("confirmation regressed timestamp: %v -> %v", before.CheckpointTipAt, after.CheckpointTipAt)
+	}
 }
 
 func TestLiveAttemptListingReadinessLiveDB(t *testing.T) {
