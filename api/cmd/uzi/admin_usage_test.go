@@ -158,7 +158,11 @@ func TestRenderAdminUsageRecoverable(t *testing.T) {
 	if alice := lineWith(t, out, "alice@example.com"); !strings.Contains(alice, "40 (3 recoverable)") {
 		t.Errorf("alice FAILED cell missing \"40 (3 recoverable)\": %q", alice)
 	}
-	if bob := lineWith(t, out, "bob@example.com"); strings.Contains(bob, "recoverable") {
+	bob := lineWith(t, out, "bob@example.com")
+	if f := strings.Fields(bob); len(f) <= 2 || f[2] != "2" {
+		t.Errorf("bob FAILED field = %v, want 2", f)
+	}
+	if strings.Contains(bob, "recoverable") {
 		t.Errorf("bob has zero recoverable work and must show a bare FAILED count, got: %q", bob)
 	}
 }
