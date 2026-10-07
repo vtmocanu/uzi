@@ -14690,7 +14690,7 @@ type RequestWallParksRow struct {
 //   - Per-run interval (PRD #122 M2 Decision 5b): a scaled-budget run carries budget_wall_seconds;
 //     a NULL-budget run falls back to global_timeout_seconds (RUN_TIMEOUT). Computed against now so
 //     the per-run interval applies in SQL.
-//   - The 8h wall CEILING (budget_wall_ceiling_seconds) is NOT re-applied here — it is enforced by
+//   - The configured wall CEILING (budget_wall_ceiling_seconds) is NOT re-applied here — it is enforced by
 //     the freeze WRITERS (SetRunRunning / CreateApprovePlanInput). This consumer trusts
 //     budget_wall_seconds as an already-capped, server-only, IMMUTABLE value.
 //   - budget_extension_seconds (PRD #1189) and budget_finalize_seconds (PRD #1497 Stop allowance)

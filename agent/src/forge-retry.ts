@@ -42,7 +42,7 @@ export const FORGE_RETRY_SCHEDULE = [1_000, 2_000, 4_000, 8_000, 16_000];
  *      SIGTERM kill, which {@link classifyDevboxError} classifies PERMANENT and so
  *      stops immediately (never retried). This schedule therefore governs only
  *      fast-failing transient errors, and the total retry wall-clock stays far
- *      under RUN_TIMEOUT (2h).
+ *      under RUN_TIMEOUT (6h by default).
  */
 export const DEVBOX_RETRY_SCHEDULE = [1_000, 4_000, 10_000];
 

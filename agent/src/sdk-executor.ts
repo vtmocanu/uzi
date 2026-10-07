@@ -139,8 +139,9 @@ import {
 // defaults. On a milestone-structured run the server scales the effective budget by
 // milestone count (Decisions 5/5b) and serves the scaled numbers — on the claim config
 // for a resume, on the per-iteration state-report ACK for a fresh run — which the loop
-// applies over these. A run with no milestones keeps exactly these values.
-const DEFAULT_RUN_TIMEOUT_SECONDS = 2 * 60 * 60; // 2h
+// applies over these. A small/medium-repo run with no milestones keeps these base values;
+// the server also applies a large-repo floor.
+const DEFAULT_RUN_TIMEOUT_SECONDS = 6 * 60 * 60; // 6h, mirrors the server RUN_TIMEOUT default
 const DEFAULT_IDLE_TIMEOUT_SECONDS = 10 * 60; // 10m
 const DEFAULT_MAX_ITERATIONS = 5; // PRD: RUN_MAX_ITERATIONS default 5 (single-milestone)
 // PRD #41: the plan-revision cap (PLAN_MAX_REVISIONS, default 3). The server also

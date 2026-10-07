@@ -96,8 +96,8 @@ export const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
 /**
  * How stale a directory must be before it is even a candidate.
  *
- * Sized against `RUN_TIMEOUT` (2h by default, `api/internal/config/config.go:537`)
- * plus an hour of margin.
+ * A fixed 3h candidate filter, independent of `RUN_TIMEOUT` (6h by default).
+ * The terminal-status check below protects live runs, including longer scaled runs.
  *
  * **This filter is much weaker than it looks, and it is NOT a second line of
  * defence for a live run.** A directory's mtime tracks only its own DIRECT
@@ -105,7 +105,7 @@ export const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
  * `.claude/projects/<x>.jsonl`, several levels down — do not refresh the HOME's
  * own mtime at all. Measured 2026-07-21: a deep write left the top-level mtime
  * byte-identical, while touching a direct child refreshed it. So any run older
- * than `minAgeMs` sails straight past this check, and with `RUN_TIMEOUT` at 2h
+ * than `minAgeMs` sails straight past this check, and with the default `RUN_TIMEOUT` at 6h
  * runs routinely live in that gap.
  *
  * **Past `minAgeMs`, the API's terminal-status check is the ONLY thing standing

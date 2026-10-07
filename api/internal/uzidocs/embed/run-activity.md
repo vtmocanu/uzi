@@ -153,10 +153,10 @@ A few things worth knowing:
   is no configurable default action. The timer is held by the worker, so if
   it dies and the run is picked up again the clock restarts: the honest
   worst case is the timeout **times one more than the requeue limit**
-  (`RUN_MAX_REQUEUES`, default 1) — 48h, not 24, on the defaults. The
+  (`RUN_MAX_REQUEUES`, default 3), 96h on the defaults. The
   question cap (`QUESTION_MAX`, default 5 per attempt) resets the same way,
   for the same reason, so its honest lifetime bound is likewise **× (requeue
-  limit + 1)** — 10 questions, not 5. A run that a restarted worker resumed
+  limit + 1)**, 20 questions on the defaults. A run that a restarted worker resumed
   through the one-shot finalize-resume allowance (issue #1742) gets one more
   attempt, so both bounds become **× (requeue limit + 2)** for that run.
 - **Autopilot runs never park on a question.** With nobody in the loop, the

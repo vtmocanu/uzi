@@ -52,7 +52,7 @@ func newSiteListEnv(t *testing.T) *siteListEnv {
 	// A service the lane flow can claim through: real run budgets, the transaction source
 	// isolateClaim mints its credential with, and a job-file store.
 	svc := workersvc.New(h.q, h.box, workersvc.Params{
-		RunTimeout: 2 * time.Hour, RunIdleTimeout: 10 * time.Minute, RunMaxIterations: 5, PlanMaxRevisions: 3,
+		RunTimeout: 2 * time.Hour, RunWallCeiling: 8 * time.Hour, RunIdleTimeout: 10 * time.Minute, RunMaxIterations: 5, PlanMaxRevisions: 3,
 		QuestionMax: 5, QuestionTimeoutSeconds: 86400, RunMaxRequeues: 1,
 		WorkerHeartbeatStale: 45 * time.Second, WorkerHeartbeatInterval: 15 * time.Second,
 		TerminalPendingLease: time.Hour, ActiveSnapshotMaxEntries: 256, WorkerOutboxMaxPending: 32,

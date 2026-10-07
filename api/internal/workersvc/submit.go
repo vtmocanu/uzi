@@ -797,7 +797,7 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 		RunTimeoutSeconds:        int32(s.p.RunTimeout.Seconds()),
 		MilestoneBudgetCap:       milestoneBudgetCap,
 		SizeBudgetFactorL:        sizeBudgetFactorL,
-		BudgetWallCeilingSeconds: budgetWallCeilingSeconds,
+		BudgetWallCeilingSeconds: budgetDurationSeconds(s.p.RunWallCeiling),
 	})
 	if err != nil {
 		return SubmitInputResult{}, store.RunUserInput{}, err

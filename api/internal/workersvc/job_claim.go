@@ -161,8 +161,10 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 		slog.Warn("job claim: read user default effort", "user", run.UserID.String(), "error", eerr)
 	}
 
+	// Legacy NULL-wall jobs retain RUN_TIMEOUT, matching the server backstop.
+	// New jobs freeze their server-computed default at create, preserving a larger base.
 	wall := coalesceInt(run.BudgetWallSeconds, int(s.p.RunTimeout.Seconds()))
-	wall32 := int32(wall) //nolint:gosec // G115: a clamped wall budget, at most budgetWallCeilingSeconds
+	wall32 := int32(wall) //nolint:gosec // G115: a clamped wall budget, bounded when persisted; legacy RUN_TIMEOUT has its existing int32 range limit
 	cfg := ClaimConfig{
 		RunTimeoutSeconds:      wall,
 		IdleTimeoutSeconds:     int(s.p.RunIdleTimeout.Seconds()),

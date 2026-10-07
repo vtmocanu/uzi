@@ -435,6 +435,7 @@ Tracked as GitLab issue vtmocanu/uzi#47; PRD at `prds/done/47-loop-hang-detectio
 - A lead tool call in flight past an admin-set threshold (default 20 minutes, 0 disables) on a quiet run is flagged stalled with a fixed reason (the outbox-queued reason during an api outage); an open delegation to a subagent is never aged. (AI-synced 2026-10-01, #2046)
 - A run's owner can extend its wall-clock budget from the web or CLI, up to an admin-set allowance; the frozen budget itself never changes. [user, #1189]
 - A run that runs out of time is parked and its owner is asked to extend or stop; it is never failed for the clock alone, the park never expires, and this is not configurable. [user, #1497]
+- Run defaults are 6h base wall time and 3 stale-worker requeues. RUN_WALL_CEILING defaults to min(max(24h, RUN_TIMEOUT), 72h), with empty/unset deriving the default so an existing larger base still boots. An explicit value must be at least 1s and the base timeout, and at most 72h; it caps scaled, non-interactive handoff and caller-requested job walls server-side. Explicit operator values win. Existing frozen budgets and the separate extension allowance stay unchanged. (AI-synced 2026-10-07, #2279)
 
 ## Feature #49 — Worker resource stats (live per-worker CPU/memory)
 
@@ -873,6 +874,7 @@ Tracked as GitHub issue vtmocanu/uzi#1908; PRD at `prds/1908-repo-less-jobs-api.
 - A job naming a site list is refused at create (503 `isolated_lane_unavailable`) when the instance has no isolated lane enabled, rather than queued; no lane worker is provisioned while the lane is off. (AI-synced 2026-10-01)
 - Revoking the creating product token, disabling or deleting its product, or deactivating the owner cancels the job. Token expiry alone never does. (AI-synced 2026-09-30)
 - A job fails rather than waits: a usage limit, its time budget, a disabled credential or an ephemeral worker that cannot serve it ends it `failed`. (AI-synced 2026-09-30)
+- A new job with no caller wall budget freezes min(max(12h, RUN_TIMEOUT), max(RUN_WALL_CEILING, RUN_TIMEOUT)) at creation. An omitted wall preserves the existing base even above the derived ceiling; positive caller values, including shorter values, are capped at RUN_WALL_CEILING. Jobs remain non-extendable. (AI-synced 2026-10-07, #2279)
 - Each user has a cap on active jobs (default 10, admin-tunable) and a per-user `/api/v1` rate limit. (AI-synced 2026-09-30)
 - Job runs appear in the web runs list and run detail with their report and findings. `uzi job create|get|result|cancel|list` mirrors the API. (AI-synced 2026-09-30)
 - `/api/v1` breaking changes fail `gate:repo`. (AI-synced 2026-09-30)

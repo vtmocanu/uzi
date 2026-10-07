@@ -264,7 +264,7 @@ func TestCompletionContractFreezesAtApprovalLiveDB(t *testing.T) {
 		RunMaxIterations:         5,
 		MilestoneBudgetCap:       milestoneBudgetCap,
 		RunTimeoutSeconds:        7200,
-		BudgetWallCeilingSeconds: budgetWallCeilingSeconds,
+		BudgetWallCeilingSeconds: 8 * 60 * 60,
 	}
 	if _, err := e.q.CreateApprovePlanInput(e.ctx, approveParams); err != nil {
 		t.Fatalf("CreateApprovePlanInput: %v", err)
@@ -329,7 +329,7 @@ func TestCompletionContractFreezesAtRunningReportLiveDB(t *testing.T) {
 		RunMaxIterations:         5,
 		MilestoneBudgetCap:       milestoneBudgetCap,
 		RunTimeoutSeconds:        7200,
-		BudgetWallCeilingSeconds: budgetWallCeilingSeconds,
+		BudgetWallCeilingSeconds: 8 * 60 * 60,
 		ID:                       runID,
 		WorkerID:                 pgtype.UUID{Bytes: worker, Valid: true},
 	}
@@ -396,7 +396,7 @@ func TestCompletionContractNotFrozenBeforeMilestonesLiveDB(t *testing.T) {
 		RunMaxIterations:         5,
 		MilestoneBudgetCap:       milestoneBudgetCap,
 		RunTimeoutSeconds:        7200,
-		BudgetWallCeilingSeconds: budgetWallCeilingSeconds,
+		BudgetWallCeilingSeconds: 8 * 60 * 60,
 		ID:                       runID,
 		WorkerID:                 pgtype.UUID{Bytes: worker, Valid: true},
 	}

@@ -552,7 +552,7 @@ Raising the cap is an informed trade-off, not a free speedup:
   prompt-injected run could shell-write into a sibling's worktree or the shared
   bare-repo cache.
 - **One container, one memory budget.** A runaway run can OOM the whole container,
-  requeuing every in-flight run together; raise `RUN_MAX_REQUEUES` (default 1)
+  requeuing every in-flight run together; raise `RUN_MAX_REQUEUES` (default 3)
   alongside any cap above 1 so an innocent sibling isn't failed outright by another
   run's crash.
 - **One Anthropic token, N runs.** Every slot on a worker shares that worker's

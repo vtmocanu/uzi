@@ -399,7 +399,8 @@ type Config struct {
 	// and RunMaxIterations are enforced worker-side and shipped in the claim
 	// payload; the rest drive the server sweeper and claim affinity.
 	PlanCrossCheckTimeout time.Duration // bounded checker wall-clock budget
-	RunTimeout            time.Duration // wall clock before a running run is failed
+	RunTimeout            time.Duration // base wall clock before a running run parks at budget_exhausted
+	RunWallCeiling        time.Duration // server-enforced ceiling on scaled and handoff wall budgets
 	RunIdleTimeout        time.Duration // worker-side no-message idle cap
 	WorkerTaskIdleTimeout time.Duration // PRD #517 M5: interactive-task park idle cap (worker-side); rides the claim
 	RunMaxIterations      int           // implement⇄review loop cap (worker-side)
@@ -1045,7 +1046,18 @@ func Load() (Config, error) {
 	cfg.UsageProbe = usageProbe
 	cfg.AnthropicHTTPTimeout = parseDuration("UZI_ANTHROPIC_HTTP_TIMEOUT", 15*time.Second)
 
-	cfg.RunTimeout = parseDuration("RUN_TIMEOUT", 2*time.Hour)
+	cfg.RunTimeout = parseDuration("RUN_TIMEOUT", 6*time.Hour)
+	cfg.RunWallCeiling = min(max(24*time.Hour, cfg.RunTimeout), 72*time.Hour)
+	if raw := strings.TrimSpace(os.Getenv("RUN_WALL_CEILING")); raw != "" {
+		var err error
+		cfg.RunWallCeiling, err = time.ParseDuration(strings.TrimSpace(raw))
+		if err != nil {
+			return Config{}, fmt.Errorf("RUN_WALL_CEILING: %w", err)
+		}
+		if cfg.RunWallCeiling < time.Second || cfg.RunWallCeiling < cfg.RunTimeout || cfg.RunWallCeiling > 72*time.Hour {
+			return Config{}, fmt.Errorf("RUN_WALL_CEILING must be at least 1s, at least RUN_TIMEOUT, and at most 72h")
+		}
+	}
 	cfg.PlanCrossCheckTimeout = 30 * time.Minute
 	if cfg.RunTimeout > 0 && cfg.PlanCrossCheckTimeout >= cfg.RunTimeout {
 		// An install with a short RUN_TIMEOUT and no explicit checker timeout must
@@ -1080,7 +1092,7 @@ func Load() (Config, error) {
 	cfg.QuestionTimeoutSeconds = parseInt("QUESTION_TIMEOUT_SECONDS", 86400)
 	// PRD #1226 M5 (D6): the completion-hold owner-continue window, default 900s.
 	cfg.CompletionHoldWindowSeconds = parseInt("COMPLETION_HOLD_WINDOW_SECONDS", 900)
-	cfg.RunMaxRequeues = parseNonNegInt("RUN_MAX_REQUEUES", 1)
+	cfg.RunMaxRequeues = parseNonNegInt("RUN_MAX_REQUEUES", 3)
 	cfg.WorkerHeartbeatInterval = parseDuration("WORKER_HEARTBEAT_INTERVAL", 15*time.Second)
 	cfg.WorkerHeartbeatStale = parseDuration("WORKER_HEARTBEAT_STALE", 45*time.Second)
 	// PRD #837 M4: the disk-pressure threshold. There is no shared float parser, so parse

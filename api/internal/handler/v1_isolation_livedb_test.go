@@ -93,7 +93,7 @@ func v1LiveDBMax(t *testing.T, maxConns int32) (*Handler, *pgxpool.Pool) {
 		ControllerTokenSHA256: controllerHash,
 		WorkerHeartbeatStale:  time.Minute,
 	}
-	wsvc := workersvc.New(q, box, workersvc.Params{})
+	wsvc := workersvc.New(q, box, workersvc.Params{RunTimeout: 6 * time.Hour, RunWallCeiling: 24 * time.Hour})
 	// As cmd/server wires it: a job create needs the transaction beginner (its cap check and
 	// inserts are one atomic unit), so the /api/v1/jobs tests run through the same service.
 	wsvc.SetTxBeginner(pool)

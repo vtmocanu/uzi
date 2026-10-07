@@ -3,9 +3,11 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"math"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -81,7 +83,7 @@ func TestCreateJobRunRefusalsBeforeTheStore(t *testing.T) {
 func TestValidateCreateJob(t *testing.T) {
 	label := func(s string) *string { return &s }
 	ok := CreateJobParams{Title: "Quarterly summary", Prompt: "do it", RequestedByLabel: label("  alice@example.com ")}
-	v, err := validateCreateJob(ok)
+	v, err := validateDefaultCreateJob(ok)
 	if err != nil {
 		t.Fatalf("valid request refused: %v", err)
 	}
@@ -90,7 +92,7 @@ func TestValidateCreateJob(t *testing.T) {
 	}
 
 	// NUL is stripped from the prompt and input content rather than refused.
-	v, err = validateCreateJob(CreateJobParams{Title: "t", Prompt: "a\x00b", Inputs: []JobInput{{Name: "a.txt", Content: "x\x00y"}}})
+	v, err = validateDefaultCreateJob(CreateJobParams{Title: "t", Prompt: "a\x00b", Inputs: []JobInput{{Name: "a.txt", Content: "x\x00y"}}})
 	if err != nil || v.prompt != "ab" || v.inputs[0].Content != "xy" {
 		t.Errorf("NUL strip: prompt=%q inputs=%+v err=%v", v.prompt, v.inputs, err)
 	}
@@ -125,7 +127,7 @@ func TestValidateCreateJob(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := validateCreateJob(tc.p)
+			_, err := validateDefaultCreateJob(tc.p)
 			var inv *JobInvalidError
 			if !errors.Is(err, ErrJobInvalid) || !errors.As(err, &inv) {
 				t.Fatalf("err = %v, want ErrJobInvalid", err)
@@ -136,14 +138,14 @@ func TestValidateCreateJob(t *testing.T) {
 		})
 	}
 
-	// The wall clock is clamped to the 8h ceiling, not refused.
-	huge := budgetWallCeilingSeconds * 10
-	v, err = validateCreateJob(CreateJobParams{Title: "t", Prompt: "p", WallSeconds: &huge})
-	if err != nil || !v.wall.Valid || int(v.wall.Int32) != budgetWallCeilingSeconds {
-		t.Errorf("wall clamp = %+v err=%v, want %d", v.wall, err, budgetWallCeilingSeconds)
+	// The wall clock is clamped to the configured 24h ceiling, not refused.
+	huge := 24 * 3600 * 10
+	v, err = validateDefaultCreateJob(CreateJobParams{Title: "t", Prompt: "p", WallSeconds: &huge})
+	if err != nil || !v.wall.Valid || int(v.wall.Int32) != 24*3600 {
+		t.Errorf("wall clamp = %+v err=%v, want %d", v.wall, err, 24*3600)
 	}
 	small := 90
-	v, _ = validateCreateJob(CreateJobParams{Title: "t", Prompt: "p", WallSeconds: &small})
+	v, _ = validateDefaultCreateJob(CreateJobParams{Title: "t", Prompt: "p", WallSeconds: &small})
 	if v.wall.Int32 != 90 {
 		t.Errorf("wall = %d, want 90 unchanged", v.wall.Int32)
 	}
@@ -190,5 +192,56 @@ func TestCreateJobRunRefusesWithoutTransaction(t *testing.T) {
 	p := CreateJobParams{Caller: JobCaller{UserID: uuid.New()}, JobType: runkind.JobTypeResearch, Title: "t", Prompt: "p"}
 	if _, err := svc.CreateJobRun(context.Background(), p); !errors.Is(err, errJobNoTransaction) {
 		t.Fatalf("err = %v, want errJobNoTransaction", err)
+	}
+}
+
+func validateDefaultCreateJob(p CreateJobParams) (validatedJob, error) {
+	return validateCreateJob(p, 24*3600, 6*3600)
+}
+
+func TestJobWallDefaultsAndConfiguredCeiling(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		requested     *int
+		ceiling, want int32
+	}{
+		{"default 12h", nil, 24 * 3600, 12 * 3600},
+		{"caller 1h", func() *int { n := 3600; return &n }(), 24 * 3600, 3600},
+		{"30h capped at 24h", func() *int { n := 30 * 3600; return &n }(), 24 * 3600, 24 * 3600},
+		{"10h ceiling caps default", nil, 10 * 3600, 10 * 3600},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v, err := validateCreateJob(CreateJobParams{Title: "t", Prompt: "p", WallSeconds: tc.requested}, tc.ceiling, 6*3600)
+			if err != nil || !v.wall.Valid || v.wall.Int32 != tc.want {
+				t.Fatalf("wall=%v err=%v want=%d", v.wall, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestJobImplicitDefaultPreservesLongBase(t *testing.T) {
+	for _, tc := range []struct{ base, ceiling, want int32 }{{16 * 3600, 24 * 3600, 16 * 3600}, {30 * 3600, 30 * 3600, 30 * 3600}, {100 * 3600, 72 * 3600, 100 * 3600}, {6 * 3600, 24 * 3600, 12 * 3600}, {6 * 3600, 10 * 3600, 10 * 3600}} {
+		v, err := validateCreateJob(CreateJobParams{Title: "t", Prompt: "p"}, tc.ceiling, tc.base)
+		if err != nil || !v.wall.Valid || v.wall.Int32 != tc.want {
+			t.Fatalf("base=%d ceiling=%d wall=%v err=%v want%d", tc.base, tc.ceiling, v.wall, err, tc.want)
+		}
+	}
+}
+func TestBudgetDurationSecondsSQLRange(t *testing.T) {
+	for _, tc := range []struct {
+		d    time.Duration
+		want int32
+	}{{24 * time.Hour, 86400}, {100 * time.Hour, 360000}, {time.Duration(math.MaxInt32) * time.Second, math.MaxInt32}, {time.Duration(math.MaxInt32)*time.Second + time.Hour, math.MaxInt32}} {
+		if got := budgetDurationSeconds(tc.d); got != tc.want {
+			t.Fatalf("duration=%v seconds=%d want%d", tc.d, got, tc.want)
+		}
+	}
+}
+
+func TestLongBaseJobCallerStillUsesCeiling(t *testing.T) {
+	requested := 200 * 3600
+	v, err := validateCreateJob(CreateJobParams{Title: "t", Prompt: "p", WallSeconds: &requested}, 72*3600, 100*3600)
+	if err != nil || !v.wall.Valid || v.wall.Int32 != 72*3600 {
+		t.Fatalf("caller wall=%v err=%v want259200", v.wall, err)
 	}
 }

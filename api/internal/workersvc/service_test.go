@@ -1797,6 +1797,7 @@ func (f *fakeStore) ListToolAllowlist(_ context.Context) ([]store.ToolAllowlist,
 func testParams() Params {
 	return Params{
 		RunTimeout:             2 * time.Hour,
+		RunWallCeiling:         8 * time.Hour,
 		RunIdleTimeout:         10 * time.Minute,
 		WorkerTaskIdleTimeout:  30 * time.Minute, // PRD #517 M5 interactive-task park idle cap
 		RunMaxIterations:       5,

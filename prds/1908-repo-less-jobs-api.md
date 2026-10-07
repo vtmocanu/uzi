@@ -119,6 +119,11 @@ Completion evidence for M1–M8 (2026-09-30, branch `agent/issue-1908`, final tr
 
 ## Decision Log
 
+### #2279 wall-budget defaults (AI-synced 2026-10-07)
+
+Maintainer decision superseding Decision 13's 8h wall clamp: jobs default to min(max(12h, RUN_TIMEOUT), max(RUN_WALL_CEILING, RUN_TIMEOUT)) when wall_seconds is omitted, frozen at creation. Positive caller values remain allowed, capped at RUN_WALL_CEILING (24h by default). Jobs remain non-extendable here; owner extension is separate work. Existing persisted job budgets keep their frozen value. Empty/unset RUN_WALL_CEILING derives min(max(24h, RUN_TIMEOUT), 72h). A larger base still boots. Omitted job walls preserve that larger base as a compatibility exception; explicit caller walls still cap at the ceiling. Newly expanded scaled, handoff and requested job timers remain <=72h, avoiding native timer overflow. The pre-existing base timer limit above about 596h is unchanged. Persisted ceiling and new-job parameters clamp to the SQL int4 seconds range; the pre-existing base-timeout int32 conversion is unchanged.
+
+
 - 2026-09-29: Drafted. Chose the judge precedent (run lane, repo-less fork in `assembleClaim`) over a chat-style dedicated lane, because it reuses ephemeral provisioning and the docker fail-closed rule unchanged. Chose `job` + `job_type` over one kind per job type so later types need no kind migration.
 - 2026-09-29: Revised after cross-PRD review and security review.
   - C1 now depends on PRD #1907: it uses `RequireV1Caller`, B1's scopes and B1's spec file, and drops its own Bearer-only auth variant and the "whichever merges first" spec rule. `/api/v1` accepts `uzc_` and `uzp_` only; `uza_` is refused, and admin views stay on non-v1 routes.

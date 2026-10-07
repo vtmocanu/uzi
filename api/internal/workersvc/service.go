@@ -1353,6 +1353,7 @@ type Store interface {
 type Params struct {
 	PlanCrossCheckTimeout time.Duration
 	RunTimeout            time.Duration
+	RunWallCeiling        time.Duration
 	RunIdleTimeout        time.Duration
 	// WorkerTaskIdleTimeout (PRD #517 M5, WORKER_TASK_IDLE_TIMEOUT) is the interactive-task
 	// park's worker-side idle backstop. Mirrored from config and shipped in the claim (like
@@ -4261,7 +4262,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		runningParams.RunTimeoutSeconds = int32(s.p.RunTimeout.Seconds())
 		runningParams.MilestoneBudgetCap = milestoneBudgetCap
 		runningParams.SizeBudgetFactorL = sizeBudgetFactorL
-		runningParams.BudgetWallCeilingSeconds = budgetWallCeilingSeconds
+		runningParams.BudgetWallCeilingSeconds = budgetDurationSeconds(s.p.RunWallCeiling)
 		// PRD #84 M4: an AUTOPILOT run auto-approves its own plan and NEVER reports
 		// awaiting_approval, so it rides the plan-time INFERRED requirement set on this
 		// self-contained `running` report instead (runner.ts toolchainReportFields, the
