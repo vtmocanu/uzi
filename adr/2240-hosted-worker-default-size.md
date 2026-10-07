@@ -67,8 +67,9 @@ Figures below are the sizes at the time of this decision; issue #2127 later rais
 
 The persistent provision form retains `l`. New ephemeral workers instead default
 to `m`, configured by chart `workers.ephemeralDefaultSize` (`s`, `m`, or `l`).
-The chart rejects invalid values and renders a direct API environment entry,
-which takes precedence over `api.config`; `api.secretEnv` cannot duplicate it.
+The chart rejects invalid values and renders a direct API environment entry;
+setting the same key in `api.config` or `api.secretEnv` fails the render, so an
+older override cannot be silently ignored.
 Non-chart deployments default and fall back to `m` through
 `UZI_EPHEMERAL_DEFAULT_SIZE`. Stored worker sizes remain unchanged.
 

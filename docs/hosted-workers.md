@@ -59,8 +59,9 @@ stay at 10Gi until reprovisioned: the controller does not resize existing PVCs.
 Existing workers keep their stored size; existing **M** workers receive the
 1-CPU request and 4-CPU limit when the controller next rolls their pod spec.
 Operators set `workers.ephemeralDefaultSize` in the chart (`s`, `m`, or `l`);
-invalid values fail rendering. The chart's direct environment entry overrides
-`api.config.UZI_EPHEMERAL_DEFAULT_SIZE`. Non-chart deployments can set
+invalid values fail rendering, and so does setting
+`UZI_EPHEMERAL_DEFAULT_SIZE` in `api.config` or `api.secretEnv` (move it to
+`workers.ephemeralDefaultSize`). Non-chart deployments can set
 `UZI_EPHEMERAL_DEFAULT_SIZE`, which defaults and falls back to `m`.
 Users can choose another size when provisioning a persistent worker.
 

@@ -83,10 +83,6 @@ check() {
     echo "BROKEN: UZI_EPHEMERAL_LEASE was absent from the render for case '$_label'" >&2
     exit 2
   fi
-  if [ -z "$_got" ]; then
-    echo "BROKEN ($_label): render emitted no UZI_EPHEMERAL_DEFAULT_SIZE" >&2
-    exit 2
-  fi
   if [ "$_got" != "$_want" ]; then
     echo "FAIL ($_label): UZI_EPHEMERAL_LEASE is '$_got', expected '$_want'" >&2
     fail=1
@@ -117,6 +113,10 @@ check_size() {
     /- name: UZI_EPHEMERAL_DEFAULT_SIZE$/ { hit = 1; next }
     hit && /value:/ { v = $2; gsub(/"/, "", v); print v; hit = 0 }
   ' "$WORK/size.yaml")
+  if [ -z "$_got" ]; then
+    echo "BROKEN ($_label): render emitted no UZI_EPHEMERAL_DEFAULT_SIZE" >&2
+    exit 2
+  fi
   if [ "$_got" != "$_want" ]; then
     echo "FAIL ($_label): UZI_EPHEMERAL_DEFAULT_SIZE is '$_got', expected exactly one '$_want'" >&2
     exit 1
