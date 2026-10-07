@@ -664,11 +664,12 @@ func (res *ReviewSnapshotResult) Plan(highWater int64, pending []int64) ReviewPl
 	}
 	// One id per author across ticks: an older pending id of an author whose newer representative
 	// is being added (or already pending) is superseded, but only when the merged set is
-	// guaranteed to fit. The ledger merge (mr_rework_merge_pending) keeps the OLDEST
-	// ReviewPendingCap ids, so on a full set the new representative can be the one dropped; the
-	// older id is then kept, and the author never ends up with no pending id.
+	// guaranteed to fit. The ledger merge (mr_rework_merge_pending) subtracts the removed ids
+	// BEFORE it keeps the OLDEST ReviewPendingCap ids, so the fit condition counts the
+	// superseded ids as removed; when the set would still overflow, the new representative can be
+	// the one dropped, so the older id is kept and the author never ends up with no pending id.
 	incoming := len(pending) + newAdds - len(plan.PendingRemove)
-	if incoming <= ReviewPendingCap {
+	if incoming-len(superseded) <= ReviewPendingCap {
 		plan.PendingRemove = append(plan.PendingRemove, superseded...)
 	} else {
 		slog.Warn("workersvc: review pending set would exceed its cap; the ledger keeps the oldest ids",

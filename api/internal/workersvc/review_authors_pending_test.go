@@ -193,3 +193,63 @@ func TestPlanCapWarningIgnoresAlreadyPendingIDs(t *testing.T) {
 		t.Fatalf("warned although nothing new is added: %s", buf.String())
 	}
 }
+
+// The merge subtracts removed ids before it caps, so superseding an author's older id is safe
+// whenever the post-merge set fits: 9,999 pending plus two new representatives is 10,001, and
+// superseding A's 100 brings it to exactly the cap, keeping both new ids.
+func TestPlanSupersedesWhenPostMergeSetFitsTheCap(t *testing.T) {
+	h := newHarness()
+	fillers := bulkComments(workersvc.ReviewPendingCap-2, 101) // ids 101..10098
+	comments := append([]forge.MRComment{inline(100, flakyID, "xavier", "a old", raT0)}, fillers...)
+	comments = append(comments,
+		inline(15000, flakyID, "xavier", "a new", raT0.Add(time.Hour)),
+		inline(20000, flakyID+1, "yolanda", "b new", raT0.Add(time.Hour+time.Second)),
+		inline(30000, coderabbit, "coderabbitai[bot]", "bot finding", raT0.Add(2*time.Hour)),
+	)
+	pending := []int64{100}
+	for _, c := range fillers {
+		pending = append(pending, c.ID)
+	}
+	p := h.params(comments...)
+	p.Trusted = []settings.TrustedBot{{BaseURL: "https://github.com", ForgeUserID: coderabbit}}
+	res := h.snapshot(t, p)
+	plan := res.Plan(99, pending)
+	if !slices.Contains(plan.PendingRemove, 100) {
+		t.Fatalf("pending remove = %d ids without 100, want A's older id superseded", len(plan.PendingRemove))
+	}
+	got := applyDelta(pending, plan)
+	if len(got) != workersvc.ReviewPendingCap || !slices.Contains(got, 15000) || !slices.Contains(got, 20000) {
+		t.Fatalf("after the merge size %d, contains 15000: %t, 20000: %t; want exactly the cap with both new ids",
+			len(got), slices.Contains(got, 15000), slices.Contains(got, 20000))
+	}
+}
+
+// The cap warning does fire when genuinely new ids push the set over the cap.
+func TestPlanCapWarningFiresWhenNewIDsExceedTheCap(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	h := newHarness()
+	fillers := bulkComments(workersvc.ReviewPendingCap, 101)
+	comments := append([]forge.MRComment{}, fillers...)
+	comments = append(comments,
+		inline(15000, flakyID+1, "yolanda", "new author", raT0.Add(time.Hour)),
+		inline(30000, coderabbit, "coderabbitai[bot]", "bot finding", raT0.Add(2*time.Hour)),
+	)
+	pending := make([]int64, 0, len(fillers))
+	for _, c := range fillers {
+		pending = append(pending, c.ID)
+	}
+	p := h.params(comments...)
+	p.Trusted = []settings.TrustedBot{{BaseURL: "https://github.com", ForgeUserID: coderabbit}}
+	res := h.snapshot(t, p)
+	plan := res.Plan(99, pending)
+	if !slices.Contains(plan.PendingAdd, 15000) {
+		t.Fatalf("pending add lacks the new author's 15000: setup is not exercising a new add")
+	}
+	if !bytes.Contains(buf.Bytes(), []byte("would exceed its cap")) {
+		t.Fatalf("no cap warning although a new id overflows the set; log: %q", buf.String())
+	}
+}

@@ -66,7 +66,7 @@ would be skipped forever once the mark moves. Their ids are kept in
 re-added, and trigger once their author is eligible. The set holds one id per
 unverified author, that author's newest unknown actionable comment id that is
 above the previous mark (and at or below the new one) or already pending, capped at 10,000 entries; on overflow the oldest ids are kept,
-so a flood arriving after a finding cannot displace it. The set accumulates across fires, so displacement needs it to exceed 10,000
+so a flood arriving after a finding cannot displace it. Near the cap, when superseding could not be guaranteed to fit, an author's older id is kept (so an author may briefly hold two entries) rather than risk losing both. The set accumulates across fires, so displacement needs it to exceed 10,000
 entries (one per unverified author; documented residual). A concurrent ledger
 writer that moves the mark past a new representative id can drop it while the
 supersede removes the older id (narrow; overlaps the scalar-mark limitation). If an author deletes their own representative (newest) comment while

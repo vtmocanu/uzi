@@ -158,7 +158,7 @@ their author checks out as eligible. The ledger keeps **one id per unverified
 author**: that author's newest unknown actionable comment that is above the
 previous high-water mark (and at or below the new one) or already pending,
 capped at 10,000 entries. On overflow the **oldest** ids are
-kept, so a flood that arrives after a finding can't displace it. A comment
+kept, so a flood that arrives after a finding can't displace it. Near the cap, when superseding could not be guaranteed to fit, an author's older id is kept (so an author may briefly hold two entries) rather than risk losing both. A comment
 whose author turns out not to be eligible is dropped and never fires. Two
 residuals fall back to a human noticing the comment in review: an author who
 deletes their own newest (representative) comment while older unknown ones
