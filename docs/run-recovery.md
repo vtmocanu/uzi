@@ -236,6 +236,42 @@ identity acknowledgment; the worker verifies ancestry locally, not the server.
 Closed custody does not authorize new archive reservations or uploads, and a
 deleted worker's credentials receive 401 from worker authentication.
 
+After an authenticated final acknowledgment covers the inventory, the worker
+can retire that generation's local recovery, coverage and owed-head pins,
+bundles and recovery journals. It checks ref deletion before removing bundles,
+then removes source journals and the covering acknowledgment journal last.
+If an earlier step fails, the acknowledgment stays for bounded retries on
+restart or while the worker is live; completed steps can safely be repeated.
+Removal of the now-empty directory is best-effort and never recursive.
+Unknown, unreadable, malformed, foreign or uncovered inventory keeps local
+custody. Shared owed-head pins, sibling generations and lightweight context
+metadata still referenced by tracking or publication records remain intact.
+Archive coverage is not evidence that the work was published to your forge.
+
+The server keeps the durable disposition receipt and selected archive after
+local cleanup; the worker adds no new local receipt or tombstone. Execution
+or worker quarantine keeps the local evidence. Rejected credentials stop
+network recovery work, but bounded local cleanup of an already acknowledged
+inventory can still retry when execution and quarantine guards permit it.
+Boot discovery does not recreate journals for closed or discarded holds.
+
+Retiring a queued completion or finalization report is a separate decision.
+Without a covering acknowledgment, the worker needs fresh proof of terminal
+ownership and a complete, nonempty custody decision for that exact generation,
+with no open sibling holds on that worker. Pending guarded inventory requires
+every exact hold to be **discarded**; a mixture of released and discarded
+holds is insufficient. With absent recovery journals, released or discarded
+exact holds can authorize report retirement, but absence alone cannot. A
+positively verified legacy generation follows its existing report policy.
+Missing ownership, transferred ownership or unavailable evidence keeps the
+report. A `stale_claim` response supersedes the report; it does not settle or
+delete recovery inventory. Exact discard authorizes report retirement alone:
+physical clone or recovery-source retirement still requires the existing
+quiescence and retention rules, and guarded recovery journals require a
+covering final acknowledgment. See [ADR-2417](../adr/2417-guarded-local-retention.md)
+for the exact checks; the [bad-MAC terminal-record cleanup](#when-a-terminal-record-fails-authentication-after-restart)
+below remains a distinct policy.
+
 A guarded generation that parks (forge unreachable) or fails before its
 repository was ever cloned adopted nothing, yet its hold stays open until a
 final disposition. The worker closes that empty hold itself: after reporting
@@ -255,10 +291,11 @@ pending is not safe terminal release or permission to reclaim the source.
 
 The **selected final archive** is protected from automatic expiry while its
 local worker row exists. Physical worker deletion renews its configured
-normal ready-retention window (7 days by default); protection is not
-perpetual. Earlier non-final and legacy ready captures keep their existing
-TTL. Size limits, quotas, owner-only access and explicit discard behavior
-are unchanged.
+normal ready-retention window (7 days by default) and clears the server's
+local-replica marker; protection is not perpetual. Local acknowledgment
+cleanup leaves that marker and the archive's expiry unchanged. Earlier
+non-final and legacy ready captures keep their existing TTL. Size limits,
+quotas, owner-only access and explicit discard behavior are unchanged.
 
 ### Published checkpoint refs
 
