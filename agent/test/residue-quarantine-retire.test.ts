@@ -101,6 +101,23 @@ describe("worker residue quarantine latching inside the git release methods (#22
     assert.ok(fs.existsSync(path.join(s.clonePath, "OWNER.txt")));
   });
 
+  it("a latch during pinned teardown preparation keeps the standalone clone", async () => {
+    const s = await seed(22992);
+    const origOpen = fsp.open.bind(fsp);
+    let fired = false;
+    mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+      const handle = await origOpen(...args);
+      if (!fired && String(args[0]) === path.dirname(s.clonePath)) {
+        fired = true;
+        latch();
+      }
+      return handle;
+    });
+    await git.removeRunnerClone(s.clonePath, owner).catch(() => undefined);
+    assert.equal(fired, true, "latch fired during the pinned removal's parent open");
+    assert.equal(fs.existsSync(path.join(s.clonePath, "OWNER.txt")), true, "the latched clone must remain");
+  });
+
   it("retire: a latch during the journal read means the clone is never moved (pre-rename recheck)", async () => {
     const s = await seed(2206);
     const renames: string[] = [];

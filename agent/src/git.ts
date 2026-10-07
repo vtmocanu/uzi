@@ -4898,14 +4898,22 @@ export class GitCache {
   /** Remove the run's runner clone (a standalone clone, not a linked worktree — no
    *  bare interaction). The warm bare and the fetched refs/objects are kept. */
   async removeRunnerClone(clonePath: string, ownerRunId?: string): Promise<void> {
+    const refuseUnderQuarantine = (): void => {
+      if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
+    };
     if (ownerRunId !== undefined) {
       if (await this.hasPhysicalTerminalProtection(ownerRunId)) {
         throw new Error("terminal record custody retains runner clone");
       }
       // issue #2213: a latch that landed during the protection read keeps the clone.
-      if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
+      refuseUnderQuarantine();
     }
-    await rmRunnerTeardownTree(clonePath, { allowCloneName: true });
+    // The pinned teardown awaits several opens and stats before it deletes anything, so a
+    // latch landing in that window is rechecked synchronously at each destructive dispatch.
+    await rmRunnerTeardownTree(clonePath, {
+      allowCloneName: true,
+      ...(ownerRunId !== undefined ? { beforeDestroy: refuseUnderQuarantine } : {}),
+    });
   }
 
   /**
