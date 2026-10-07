@@ -8647,9 +8647,9 @@ export class GitCache {
           removedShas.push(candidate.sha);
         } else retainedShas.push(candidate.sha);
       }
-      if (releasedContexts.size) {
-        await this.pruneReleasedOwedContexts(barePath, releasedContexts, keepContext ? this.contextName(keepContext) : undefined,
-          keepGenerations);
+      if (releasedContexts.size || keepGenerations) {
+        await this.pruneReleasedOwedContexts(barePath, runId, releasedContexts,
+          keepContext ? this.contextName(keepContext) : undefined, keepGenerations);
       }
       return { removedShas, retainedShas };
     });
@@ -8660,8 +8660,9 @@ export class GitCache {
    *  remaining candidate file or any tracking receipt still names it, when it is the caller's live
    *  context, or when any receipt is unreadable or malformed. The pins are already gone, so a failure
    *  here only leaves harmless metadata. `keepGenerations` names generations with an unsettled
-   *  recovery journal; their contexts are never pruned. Caller MUST hold the bare lock. */
-  private async pruneReleasedOwedContexts(barePath: string, released: Set<string>, keep: string | undefined,
+   *  recovery journal; their contexts are never pruned, and when given, earlier-preserved zero-pin contexts
+   *  of the same run are pruned once unprotected. Caller MUST hold the bare lock. */
+  private async pruneReleasedOwedContexts(barePath: string, runId: string, released: Set<string>, keep: string | undefined,
     keepGenerations?: ReadonlySet<number>): Promise<void> {
     try {
       const names = await this.owedMetadataNames(barePath);
@@ -8675,9 +8676,18 @@ export class GitCache {
           stillNamed.add(receipt.context);
         }
       }
-      for (const name of released) {
+      // With a protection set the caller has proven the journal state, so a context of THIS run that
+      // was preserved earlier (zero pins, generation protected then) is revisited once it is no
+      // longer protected; without one only the contexts released by this call are candidates.
+      const candidates = new Set(released);
+      if (keepGenerations) for (const name of names) if (/^context-[0-9a-f]{64}\.json$/.test(name)) candidates.add(name);
+      for (const name of candidates) {
         if (name === keep || stillNamed.has(name) || !names.includes(name)) continue;
-        if (keepGenerations?.size) {
+        if (keepGenerations && !released.has(name)) {
+          const own = await this.readOwedFile(barePath, name) as { runId?: unknown } | undefined;
+          if (own?.runId !== runId) continue;
+        }
+        if (keepGenerations) {
           // A generation whose recovery journal is not final-acknowledged stays discoverable:
           // recovery rebuilds its custody from the context. Unreadable context: keep it.
           const stored = await this.readOwedFile(barePath, name) as { generation?: unknown } | undefined;

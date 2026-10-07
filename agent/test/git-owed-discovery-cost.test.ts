@@ -121,6 +121,10 @@ describe("issue1924 owed discovery cost", () => {
     const discovered = await cache.discoverOwedCandidates();
     assert.deepEqual(discovered.map((d) => d.context.generation), [2, N]);
     assert.deepEqual(discovered.map((d) => d.candidates.length), [0, 0]);
+    // FINAL is now acknowledged, so generation 2 no longer needs discovery.
+    await cache.reconcileOwedCandidates(bare, RUN, heads[N - 1]!, contextFor(N).context, new Set());
+    assert.deepEqual((await cache.discoverOwedCandidates()).map((d) => d.context.generation), [N],
+      "a protected zero-pin context must be pruned once its generation is acknowledged");
   });
 
   it("keeps a still-pinned context and prunes nothing while a receipt is unreadable (fail closed)", async () => {
