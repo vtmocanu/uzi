@@ -1,6 +1,8 @@
 {
   "cross_check_pins": null,
   "default_model": null,
+  "default_claude_model": null,
+  "default_codex_model": null,
   "default_effort": null,
   "default_codex_effort": null,
   "judge_model": null,
@@ -13,7 +15,5 @@
   "light_theme": null,
   "dark_theme": null,
   "typeface": null,
-  "default_harness": null,
-  "default_claude_model": null,
-  "default_codex_model": null
+  "default_harness": null
 }

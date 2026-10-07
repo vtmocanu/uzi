@@ -13,6 +13,8 @@
     }
   ],
   "default_model": "x",
+  "default_claude_model": "x",
+  "default_codex_model": "x",
   "default_effort": "x",
   "default_codex_effort": "x",
   "judge_model": "x",
@@ -29,7 +31,5 @@
   "light_theme": "x",
   "dark_theme": "x",
   "typeface": "x",
-  "default_harness": "x",
-  "default_claude_model": "x",
-  "default_codex_model": "x"
+  "default_harness": "x"
 }

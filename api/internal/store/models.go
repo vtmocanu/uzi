@@ -280,6 +280,8 @@ type CrossCheck struct {
 	DecidedAt            pgtype.Timestamptz `json:"decided_at"`
 	DeadlineAt           pgtype.Timestamptz `json:"deadline_at"`
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	CheckerModelSource   pgtype.Text        `json:"checker_model_source"`
+	CheckerEffortSource  pgtype.Text        `json:"checker_effort_source"`
 }
 
 type CustodyEpisodeNotice struct {
@@ -1382,6 +1384,14 @@ type User struct {
 	DefaultCodexEffort      pgtype.Text        `json:"default_codex_effort"`
 	EphemeralDockerEnabled  bool               `json:"ephemeral_docker_enabled"`
 	PlanCrossCheckEnabled   bool               `json:"plan_cross_check_enabled"`
+}
+
+type UserCrossCheckPin struct {
+	UserID  uuid.UUID   `json:"user_id"`
+	Stage   string      `json:"stage"`
+	Harness string      `json:"harness"`
+	Model   pgtype.Text `json:"model"`
+	Effort  pgtype.Text `json:"effort"`
 }
 
 type UserSecret struct {

@@ -161,7 +161,7 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 		return nil, nil
 	}
 	transient := errors.Is(assemblyErr, errVaultLocked) || errors.Is(assemblyErr, errAutoPoolEmpty) ||
-		errors.Is(assemblyErr, errCustomModelCapabilityMissing)
+		errors.Is(assemblyErr, errCustomModelCapabilityMissing) || errors.Is(assemblyErr, errCrossCheckPinsCapabilityMissing)
 	// errCredentialDisabled is its own non-terminal classification (PRD #1732 D14): neither
 	// transient nor terminal, so it must pass this early return to reach the fenced park.
 	if assemblyErr != nil && !transient && !claimAssemblyTerminal(assemblyErr) &&
@@ -209,6 +209,28 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		return nil, "", err
 	}
 	defer func() { _ = q.Rollback(ctx) }()
+	// Intrinsic pin failures enter lead-first, before the child row lock below.
+	// LockPlanCrossCheckLeadForVerdict applies the live lead and child fences.
+	var checkerLead store.Run
+	var checkerQueries *store.Queries
+	if run.Kind == "cross_check" && errors.Is(assemblyErr, errCheckerPinUnavailable) {
+		live, ok := q.(pgxClaimFinishTx)
+		if !ok {
+			return nil, "", errClaimRecoveryNoTx
+		}
+		checkerQueries = live.Queries
+		checkerLead, err = checkerQueries.LockPlanCrossCheckLeadForVerdict(ctx, store.LockPlanCrossCheckLeadForVerdictParams{
+			ChildID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, "", nil
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		if checkerLead.UserID != run.UserID {
+			return nil, "", nil
+		}
+	}
 	locked, err := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{
 		ID: run.ID, WorkerID: pgconv.UUID(identity.workerID),
 	})
@@ -339,6 +361,30 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			return nil, "", errClaimRecoveryCustody
 		}
 	}
+	var checkerEvent []byte
+	var checkerSeq int32
+	if checkerQueries != nil && errors.Is(decision, errCheckerPinUnavailable) {
+		cc, decideErr := checkerQueries.DecidePlanCrossCheck(ctx, store.DecidePlanCrossCheckParams{
+			ChildID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
+			Verdict: "failed", ReasonClass: pgconv.TextOrNull("checker_unavailable"), Findings: []byte("null")})
+		if errors.Is(decideErr, pgx.ErrNoRows) {
+			return nil, "", nil
+		}
+		if decideErr != nil {
+			return nil, "", decideErr
+		}
+		banked, bankErr := checkerQueries.BankPlanCrossCheckWait(ctx, cc.ID)
+		if bankErr != nil {
+			return nil, "", bankErr
+		}
+		if banked != 1 {
+			return nil, "", ErrCrossCheckRefused
+		}
+		checkerSeq, checkerEvent, err = appendPlanCrossCheckEvent(ctx, checkerQueries, checkerLead, cc, "system")
+		if err != nil {
+			return nil, "", err
+		}
+	}
 	var n int64
 	switch {
 	case credDisabled:
@@ -378,6 +424,9 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	}
 	if err := q.Commit(ctx); err != nil {
 		return nil, "", err
+	}
+	if checkerEvent != nil && s.bcast != nil {
+		s.bcast.PublishMessage(checkerLead.ID, checkerSeq, "cross_check", "", "", "", checkerEvent, s.now())
 	}
 	if expected == 1 {
 		// PRD #1810 D3: the exact hold's release committed with the outcome above; if it was
@@ -445,6 +494,8 @@ func isLockNotAvailable(err error) bool {
 
 func claimAssemblyOrigin(err error) string {
 	switch {
+	case errors.Is(err, errCheckerPinUnavailable):
+		return "guardrail_blocked"
 	case errors.Is(err, errCredentialUnavailable):
 		return "credential_unavailable"
 	case errors.Is(err, errToolPackagesRejected):

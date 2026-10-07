@@ -213,8 +213,9 @@ const (
 	// job in a fleet of old-image or docker-only workers is unclaimable until a job-capable worker
 	// comes online. PRD #1909 M1: a job stamped with runs.job_protocol additionally needs
 	// 'job_files_v1', so the text names both. Maps to the SAME healthWaitingWorker enum (runs.health_reason is free text).
-	reasonNoJobCapableWorker        = "no online worker supports jobs (job_runner_v1, job_files_v1); update or provision a non-Docker worker"
-	reasonNoCrossCheckCapableWorker = "no online worker supports plan cross-check (cross_check_v1); update or provision a capable worker"
+	reasonNoJobCapableWorker           = "no online worker supports jobs (job_runner_v1, job_files_v1); update or provision a non-Docker worker"
+	reasonNoCrossCheckCapableWorker    = "no online worker supports plan cross-check (cross_check_v1); update or provision a capable worker"
+	reasonNoCrossCheckPinCapableWorker = "no online worker supports pinned plan cross-check (cross_check_pins_v1); update or provision a pin-aware worker"
 	// reasonWaitingIsolatedLane (PRD #1906 M5) is the queued reason for a PROFILE-BOUND run: only
 	// a worker the api provisions into the isolated lane can claim it (ClaimRun's two-way lane
 	// clause), so no ordinary worker reason applies. Maps to the SAME healthWaitingWorker enum.
@@ -1119,12 +1120,19 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			capable := false
 			for _, worker := range workers {
 				if worker.Status == "online" && !worker.DrainingSince.Valid && !worker.Ephemeral && !worker.IsolatedLane &&
-					slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckV1) {
+					slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckV1) &&
+					(!r.CrossCheckPinRequired || slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckPinsV1)) &&
+					(!r.CodexCustomRoot || slices.Contains(worker.ProtocolCapabilities, capability.CodexCustomModelV1)) &&
+					(run.Harness != harnessCodex || (slices.Contains(worker.ProtocolCapabilities, capability.CodexHarnessV1) && slices.Contains(worker.ProtocolCapabilities, capability.CodexRuntimeV2))) &&
+					!worker.MaintenanceFenced && worker.MaintenancePhase != "requested" && worker.MaintenancePhase != "ready" && worker.MaintenancePhase != "stopping" && worker.MaintenancePhase != "recycling" {
 					capable = true
 					break
 				}
 			}
 			if !capable {
+				if r.CrossCheckPinRequired {
+					return reasonNoCrossCheckPinCapableWorker
+				}
 				return reasonNoCrossCheckCapableWorker
 			}
 		}

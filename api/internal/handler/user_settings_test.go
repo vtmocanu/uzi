@@ -62,8 +62,22 @@ func (f *fakeSettingsDB) Exec(context.Context, string, ...any) (pgconn.CommandTa
 	return pgconn.CommandTag{}, nil
 }
 
-func (f *fakeSettingsDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
-	return nil, errors.New("fakeSettingsDB: Query not used")
+func (f *fakeSettingsDB) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+	if strings.Contains(sql, "-- name: ListUserCrossCheckPins") {
+		rows := &fakeNotifRows{}
+		for _, harness := range []string{"claude", "codex"} {
+			rows.scans = append(rows.scans, func(dest ...any) error {
+				*dest[0].(*string), *dest[1].(*string) = "plan", harness
+				values := []pgtype.Text{{}, {}, f.claudeModel, f.codexModel, f.effort, f.codexEffort, {}}
+				for i, v := range values {
+					*dest[i+2].(*pgtype.Text) = v
+				}
+				return nil
+			})
+		}
+		return rows, nil
+	}
+	return nil, errors.New("fakeSettingsDB: unexpected Query")
 }
 
 func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {

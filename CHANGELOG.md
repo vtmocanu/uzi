@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Plan cross-check model and effort pins (#2151)**
+  Account settings store separate Claude and Codex checker pins; plan checker claims honor hard pins and record their sources.
+
 ### Changed
 
 - **Per-user usage follows the selected window ([#2439](https://github.com/vtmocanu/uzi/issues/2439)).**
