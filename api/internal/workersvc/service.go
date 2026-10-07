@@ -4768,11 +4768,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				FailOrigin:     pgconv.TextOrNull(failOrigin),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
-				// PRD #1247 M5a-1 rework (m6): explicit nil. A fenced (non-chat, generation-bearing)
-				// capability report was already generation-checked under the outer FOR UPDATE fence
-				// upstream, so the per-query fence is redundant here; a legacy or chat report skips the
-				// lock and carries no generation (chat is deliberately fence-exempt), so nil is correct
-				// there too. Behavior preserved.
+				// The stamped report was already generation-checked under the outer FOR UPDATE
+				// fence, so the per-query generation guard is redundant. An unstamped report or
+				// generation-zero chat skips that lock and retains the legacy nil guard.
 				ClaimGeneration: pgtype.Int8{},
 			})
 		}
@@ -4856,7 +4854,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// and skips it.
 		//
 		// Issue #1399: an arm's decision reads `owned`, which is unlocked for any report that
-		// skips the FOR UPDATE fence (legacy nil-generation, chat, interlocked completion; see
+		// skips the FOR UPDATE fence (legacy nil-generation, generation-zero chat, interlocked completion; see
 		// stateUsesGenerationFence), and the forge park arm decides nothing. A scope directive
 		// that committed after that read but before the terminal write shows up only in this
 		// post-transition re-read, so a terminal (completed/failed/cancelled) scope-directed run
