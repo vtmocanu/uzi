@@ -447,6 +447,10 @@ export interface ScanRequest {
   liveMarkers: string[];
   /** Explicit permission for solitary uid-split reaping; omission is false. */
   mayKillUnreadableUnattributed?: boolean;
+  /** issue #2213: a WORKER-WIDE detection scan (the pre-fetch check). No process is in scope and
+   *  none is ever signalled: the scan only reports the runner-uid processes whose env and cwd
+   *  cannot be read and that nothing ties to another live attempt. */
+  workerWide?: boolean;
   /** Recorded roots (pid + start time) of every OTHER live attempt on this worker (Claude CLI
    *  groups, Codex provider supervisors), plus the long-lived runner-uid roots the worker itself
    *  launched. A root matches only while a live process has BOTH its pid and its start time. */
@@ -624,6 +628,7 @@ export function scanOnce(
       // even when it came from a finished run. A future worker spawn that can become
       // non-dumpable must be recorded as a root or this invariant breaks.
       if (
+        req.workerWide !== true &&
         req.mayKillUnreadableUnattributed === true &&
         req.liveMarkers.length === 0 &&
         descendant === false &&
@@ -647,8 +652,9 @@ export function scanOnce(
     // UZI_RUN_CLONE_KEY with no marker and wedge that key's every seed); only together with a
     // well-formed attempt marker, which is what every agent CLI spawn carries.
     const inScope =
-      (env.get(RUN_CLONE_KEY_ENV) === req.targetKey && wellFormedAttemptMarker(env.get(RUN_ATTEMPT_ENV))) ||
-      req.targetPaths.some((p) => isWithinPath(stripDeleted(cwd), p));
+      req.workerWide !== true &&
+      ((env.get(RUN_CLONE_KEY_ENV) === req.targetKey && wellFormedAttemptMarker(env.get(RUN_ATTEMPT_ENV))) ||
+        req.targetPaths.some((p) => isWithinPath(stripDeleted(cwd), p)));
     if (!inScope) continue;
     const entry = (reason: string): QuiesceProcess => ({
       pid,
@@ -1343,6 +1349,9 @@ export interface QuiesceRunRequest {
   targetPaths: string[];
   /** false skips the process half (a Codex run: its supervisor already proves process drain). */
   processes: boolean;
+  /** issue #2213: a worker-wide detection scan (see ScanRequest.workerWide): nothing in scope,
+   *  nothing signalled. The caller passes dockerHost undefined. */
+  workerWide?: boolean;
   dockerHost: string | undefined;
   registry: LiveAttemptRegistry;
   /** Whether another claim is executing, including before it registers an attempt. */
@@ -1377,7 +1386,9 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       targetPaths: req.targetPaths.map((p) => path.resolve(p)),
       ownMarker: req.attempt?.marker,
       liveMarkers: others.map((a) => a.marker),
-      mayKillUnreadableUnattributed: uidSplitActive() && req.otherClaimInFlight === false && others.length === 0,
+      mayKillUnreadableUnattributed:
+        req.workerWide !== true && uidSplitActive() && req.otherClaimInFlight === false && others.length === 0,
+      ...(req.workerWide === true ? { workerWide: true } : {}),
       // Other live attempts' recorded roots (Claude CLI groups, Codex provider supervisors) plus
       // every long-lived runner-uid root this worker launched and recorded itself.
       liveRoots: [
@@ -1411,9 +1422,12 @@ function isScanRequest(v: unknown): v is ScanRequest {
     Number.isInteger(o.targetUid) &&
     typeof o.targetKey === "string" &&
     strings(o.targetPaths) &&
+    // issue #2213: a worker-wide detection scan scopes nothing, so it carries no target paths.
+    (o.workerWide !== true || (o.targetPaths as string[]).length === 0) &&
     (o.ownMarker === undefined || typeof o.ownMarker === "string") &&
     strings(o.liveMarkers) &&
     (o.mayKillUnreadableUnattributed === undefined || typeof o.mayKillUnreadableUnattributed === "boolean") &&
+    (o.workerWide === undefined || typeof o.workerWide === "boolean") &&
     Array.isArray(o.liveRoots) &&
     o.liveRoots.every(
       (r) =>

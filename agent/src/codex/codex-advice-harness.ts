@@ -65,6 +65,7 @@ import type { CodexProviderConfig } from "./codex-harness.js";
 import type { CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { CodexNotification, CodexTransport } from "./transport.js";
 import type { RenderedCodexAdvice } from "./render.js";
+import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
 
 // --- typed advice error -------------------------------------------------------
 
@@ -509,6 +510,8 @@ export class CodexAdviceHarness implements AdviceHarness {
     model: string | undefined,
     signal: AbortSignal,
   ): Promise<string> {
+    // issue #2213: synchronous, immediately before the provider dispatch (also checked in the transport).
+    assertResidueQuarantineOpen("provider_turn");
     const res = await transport.request<{ thread?: { id?: string } }>(
       "thread/start",
       {
@@ -544,6 +547,8 @@ export class CodexAdviceHarness implements AdviceHarness {
     };
     if (model !== undefined) params.model = model;
     if (rendered.modelReasoningEffort !== undefined) params.effort = rendered.modelReasoningEffort;
+    // issue #2213: synchronous, immediately before the provider dispatch (also checked in the transport).
+    assertResidueQuarantineOpen("provider_turn");
     const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal });
     const id = res?.turn?.id;
     if (typeof id !== "string" || id.length === 0) {

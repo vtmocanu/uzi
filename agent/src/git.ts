@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { pipeline } from "node:stream/promises";
+import { deflateSync } from "node:zlib";
 import { PassThrough, Transform, Writable, type Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { RUN_KINDS, type RunKind } from "./protocol.js";
@@ -27,6 +28,7 @@ import {
   parseRetainedArtifactName,
 } from "./attempt-path.js";
 import { sanitizeForLog } from "./run-quiescence.js";
+import { REASON_WORKER_RESIDUE_BLOCKED, RunResidueBlockedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen, residueQuarantine } from "./residue-quarantine.js";
 
 import {
   commitsScannedFromStderr,
@@ -334,6 +336,17 @@ export class AttemptReleaseError extends Error {
   ) {
     super(`attempt release failed at the ${stage === "ledger" ? "ledger append" : "journal clear"}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
     this.name = "AttemptReleaseError";
+  }
+}
+
+/** issue #2213 — a destructive step of a runner-clone release/retire/removal found the worker
+ *  residue quarantine latched. A latched worker keeps a failed run's clone, journal and holds, so
+ *  the step is refused (or, once a move already happened, undone) rather than completed. Not a
+ *  RunResidueBlockedError: it never changes how a run is classified, callers only log it. */
+export class CloneRetainedByQuarantineError extends Error {
+  constructor() {
+    super("worker residue quarantine latched: runner clone retained");
+    this.name = "CloneRetainedByQuarantineError";
   }
 }
 
@@ -764,6 +777,14 @@ function runnerTrackingRef(branch: string): string {
 // is the leaf, so the namespace is D/F-safe and dodges the branch-slash D/F hazard that affected
 // `refs/uzi-runner` (issue #887) — it never carries the branch.
 const RECOVERY_PIN_PREFIX = "refs/uzi-recovery-pin/";
+// issue #2213 — the quarantine archival anchor `refs/uzi-archive/<runId>/g<generation>`. The runId is a
+// single sanitized path component and the leaf starts with `g` (the existing refs/uzi-archive leaf is
+// a 40-hex sha, which never starts with `g`), so the two uses of the namespace cannot collide or
+// D/F-conflict. Nothing in agent/src reads or deletes refs/uzi-archive/*.
+function quarantineArchiveRef(runId: string, generation: number): string {
+  const rid = runId.replace(/[^A-Za-z0-9_-]/g, "-");
+  return `refs/uzi-archive/${rid}/g${Math.max(0, Math.trunc(generation))}`;
+}
 // issue #1582 M2 — the settlement pins for an older-generation custody hold a same-worker successor
 // adopted: `refs/uzi-settle/<runId>/<holdId>/{source,adopted,pushed,published}`. They keep the candidate
 // commits a settle request names reachable (`published` is the live-publication tip a
@@ -897,8 +918,9 @@ export class CapturePathMismatchError extends Error {
 
 /** issue #1783: the failure-reason prefix of a run whose clone (or the canonical clone path it
  *  must free) could not be proven quiescent or freed. The runner's failOriginForReason maps it to
- *  the fail_origin `worker_residue_blocked`; the runner re-exports it. */
-export const REASON_WORKER_RESIDUE_BLOCKED = "worker_residue_blocked";
+ *  the fail_origin `worker_residue_blocked`; the runner re-exports it. Defined in
+ *  residue-quarantine.ts (issue #2213) so the error classes there share it without an import cycle. */
+export { REASON_WORKER_RESIDUE_BLOCKED };
 
 /**
  * issue #1783 M3 — the canonical runner clone path could not be freed for a reseed: the scoped
@@ -1383,6 +1405,11 @@ export class GitCache {
    *  predecessor hold). A SIBLING of `recoveryRoot`, never inside it: the recovery restart sweep
    *  treats every entry under `recovery/` as a runId. Worker-owned. */
   readonly recoverySettlementRoot: string;
+  /** issue #2213 — the worker-owned 0700 store of verified quarantine archives
+   *  (`<root>/<runId>/g<generation>.bundle` plus its manifest). A SIBLING of `recovery/`, never
+   *  inside it: it is not custody (nothing reads it to release or retire anything), and the
+   *  recovery restart sweep treats every entry under `recovery/` as a runId. */
+  readonly recoveryArchiveRoot: string;
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
@@ -1425,6 +1452,7 @@ export class GitCache {
     this.runnerHoldingRoot = path.join(dataDir, "runner-quarantine");
     this.recoveryRoot = path.join(dataDir, "recovery");
     this.recoverySettlementRoot = path.join(dataDir, "recovery-settlement");
+    this.recoveryArchiveRoot = path.join(dataDir, "recovery-archive");
   }
 
   /** Scope every subprocess and bare-lock acquisition created by `action` to the
@@ -1815,6 +1843,8 @@ export class GitCache {
       await this.scratchPublicationPreflight(barePath, branch, fresh);
       forwardAdvance = true;
     } catch (cause) {
+      // issue #2213: a quarantine refusal is not an unverifiable floor: it reaches the runner typed.
+      if (cause instanceof RunResidueBlockedError) throw cause;
       const abort = this.boundaryAbortError(cause);
       if (abort) throw abort;
       if (cause instanceof ScratchPublicationError) throw cause;
@@ -3821,6 +3851,168 @@ export class GitCache {
   }
 
   /**
+   * issue #2213 — create-only archive anchor `refs/uzi-archive/<runId>/g<generation>` at `sha`, under
+   * the bare lock, for the quarantine archival capture. `update-ref <ref> <sha> ""` creates the ref
+   * and refuses to move an existing one; an existing ref already at `sha` is idempotent success. The
+   * ref keeps `sha`'s objects reachable (a `--all` gc root). Worker-uid, local, credential-free.
+   * Never writes a recovery pin and never deletes anything. Throws only on an unexpected git
+   * failure; a conflicting existing ref returns "conflict".
+   */
+  async createQuarantineArchiveRef(
+    barePath: string,
+    runId: string,
+    generation: number,
+    sha: string,
+  ): Promise<"created" | "exists" | "conflict" | "absent"> {
+    if (!/^[0-9a-f]{40}$/.test(sha)) return "absent";
+    const ref = quarantineArchiveRef(runId, generation);
+    return this.withLock(barePath, async () => {
+      const present = (await this.runGit(barePath, ["rev-parse", "--verify", `${sha}^{commit}`]).catch(() => "")).trim();
+      if (present !== sha) return "absent";
+      const existing = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", "-q", ref])).trim();
+      if (existing !== "") return existing === sha ? "exists" : "conflict";
+      await this.runGit(barePath, ["update-ref", ref, sha, ""]);
+      return "created";
+    });
+  }
+
+  /** issue #2213 — the current value of the quarantine archive ref (40-hex), or null when absent.
+   *  Read under the bare lock so it is ordered against {@link createQuarantineArchiveRef}. */
+  async quarantineArchiveRefTip(barePath: string, runId: string, generation: number): Promise<string | null> {
+    const ref = quarantineArchiveRef(runId, generation);
+    return this.withLock(barePath, async () => {
+      const sha = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", "-q", ref])).trim();
+      return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+    });
+  }
+
+  /**
+   * issue #2213 — prove a bundle reproduces the commit `sha` on its own. The caller passes the
+   * bundle BYTES (an immutable in-memory snapshot, not a path a same-uid writer can swap).
+   *
+   * Completeness is decided from the snapshot bytes alone, never from a repository's object store
+   * (a same-uid survivor can write one: a thin bundle plus a planted loose blob would otherwise pass,
+   * and git does not check a loose object's content against its name). Steps:
+   *   1. a header gate in TS: `# v2 git bundle`, or v3 whose only capability is
+   *      `@object-format=sha1`; no prerequisite lines; exactly ONE ref line, naming `sha`; the pack
+   *      has the `PACK` signature, version 2 or 3, and its 20-byte trailer is the sha1 of the
+   *      preceding bytes;
+   *   2. a probe tag object pointing at `sha` is appended to the pack in memory, and
+   *      `git index-pack --stdin --strict --check-self-contained-and-connected` (an internal git
+   *      option, pinned by tests) runs on it in a FRESH temporary bare repository: exit 0 and stdout
+   *      exactly `pack\t<new trailer>\n` prove that every object reachable from `sha` is inside the
+   *      pack. The git environment pins `GIT_SHALLOW_FILE` and `GIT_GRAFT_FILE` to `/dev/null`, so a
+   *      planted `shallow` or `info/grafts` file in the temporary repository cannot cut the walk
+   *      short; the rest of the repository's store can only lower this verdict (never `--fix-thin`);
+   *   3. `git bundle list-heads -` over stdin names exactly `sha` (cross-check).
+   * SHA-256 repositories are rejected at step 1. Worker-uid, credential-free (`gitEnv()`); the
+   * temporary repo is always removed. Returns undefined when verified, else a short reason (never
+   * throws).
+   */
+  async verifyBundleReproduces(bundle: Buffer, sha: string, scratchRoot: string): Promise<string | undefined> {
+    let dir: string | undefined;
+    const withStdin = async (cwd: string, args: string[], input: Buffer, extraEnv: Record<string, string> = {}): Promise<string> => {
+      const full = withDir(cwd, args);
+      this.log.debug("git (stdin)", { cwd, args });
+      const { stdout } = await this.execScoped("git", full, {
+        env: { ...gitEnv(), ...extraEnv },
+        timeout: GIT_TIMEOUT_MS,
+        maxBuffer: GIT_MAX_BUFFER,
+        input,
+      });
+      return stdout;
+    };
+    try {
+      if (!/^[0-9a-f]{40}$/.test(sha)) return "the committed head is not a 40-hex object id";
+      const parsed = GitCache.parseBundleForProbe(bundle, sha);
+      if (typeof parsed === "string") return parsed;
+      dir = await fs.mkdtemp(path.join(scratchRoot, "verify-"));
+      await this.runGit(undefined, ["init", "--bare", "-q", dir]);
+      const heads = (await withStdin(dir, ["bundle", "list-heads", "-"], bundle))
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l !== "");
+      const oids = new Set(heads.map((l) => l.split(/\s+/)[0] ?? ""));
+      if (oids.size !== 1 || !oids.has(sha)) return "the bundle's heads are not exactly the committed head";
+      let out: string;
+      try {
+        out = await withStdin(
+          dir,
+          ["index-pack", "--stdin", "--strict", "--check-self-contained-and-connected"],
+          parsed.probePack,
+          { GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null" },
+        );
+      } catch (err) {
+        return `the bundle is not self-contained and connected: ${sanitizeForLog(gitErrorMessage(err), 120)}`;
+      }
+      if (out !== `pack\t${parsed.probeTrailerHex}\n`) return "the bundle's connectivity proof did not report the expected pack";
+      return undefined;
+    } catch (err) {
+      return `bundle verification failed: ${sanitizeForLog(gitErrorMessage(err), 120)}`;
+    } finally {
+      if (dir !== undefined) await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * issue #2213 — the header gate and in-memory probe-tag append behind {@link verifyBundleReproduces}.
+   * Returns the probe pack (the bundle's pack plus one tag object naming `sha`, object count bumped,
+   * trailer recomputed) and its trailer in hex, or a short rejection reason.
+   */
+  private static parseBundleForProbe(bundle: Buffer, sha: string): { probePack: Buffer; probeTrailerHex: string } | string {
+    let pos = 0;
+    const line = (): string | null => {
+      const nl = bundle.indexOf(0x0a, pos);
+      if (nl < 0) return null;
+      const s = bundle.toString("latin1", pos, nl);
+      pos = nl + 1;
+      return s;
+    };
+    const first = line();
+    if (first !== "# v2 git bundle" && first !== "# v3 git bundle") return "the bundle header is not a v2 or v3 git bundle";
+    const refs: string[] = [];
+    let blank = false;
+    for (let l = line(); l !== null; l = line()) {
+      if (l === "") {
+        blank = true;
+        break;
+      }
+      if (l.startsWith("@")) {
+        if (first === "# v3 git bundle" && l === "@object-format=sha1") continue;
+        return "the bundle declares an unsupported capability";
+      }
+      if (l.startsWith("-")) return "the bundle has prerequisites, so it is not self-contained";
+      if (!/^[0-9a-f]{40} \S/.test(l)) return "the bundle header has a malformed ref line";
+      refs.push(l.slice(0, 40));
+    }
+    if (!blank) return "the bundle header is not terminated";
+    if (refs.length !== 1) return "the bundle must carry exactly one head";
+    if (refs[0] !== sha) return "the bundle's heads are not exactly the committed head";
+    const pack = bundle.subarray(pos);
+    if (pack.length < 32 || pack.toString("latin1", 0, 4) !== "PACK") return "the bundle has no pack";
+    const version = pack.readUInt32BE(4);
+    if (version !== 2 && version !== 3) return "the bundle pack version is unsupported";
+    const body = pack.subarray(0, pack.length - 20);
+    const trailer = pack.subarray(pack.length - 20);
+    if (!createHash("sha1").update(body).digest().equals(trailer)) return "the bundle pack trailer does not match its content";
+    const content = Buffer.from(`object ${sha}\ntype commit\ntag uzi-archive-probe\ntagger uzi <uzi> 0 +0000\n\nprobe\n`, "latin1");
+    const hdr: number[] = [];
+    let size = content.length;
+    let b = 0x40 | (size & 0x0f); // OBJ_TAG is type 4, in bits 6-4
+    size >>>= 4;
+    while (size > 0) {
+      hdr.push(b | 0x80);
+      b = size & 0x7f;
+      size >>>= 7;
+    }
+    hdr.push(b);
+    const grown = Buffer.concat([body, Buffer.from(hdr), deflateSync(content)]);
+    grown.writeUInt32BE(pack.readUInt32BE(8) + 1, 8);
+    const probeTrailer = createHash("sha1").update(grown).digest();
+    return { probePack: Buffer.concat([grown, probeTrailer]), probeTrailerHex: probeTrailer.toString("hex") };
+  }
+
+  /**
    * issue #1507 — best-effort remove a pin ref planted by {@link anchorRecoveryHead}, once a durable
    * replacement exists (the bundle was archived, or the head is already forge-published). Never
    * throws: a failed cleanup only leaves a harmless ref on the long-lived bare (the same
@@ -4209,6 +4401,8 @@ export class GitCache {
       if (pending?.runId !== runId || pending.clonePath !== clonePath) {
         throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, runId);
       }
+      // issue #2213: a latch that landed during the lock wait / journal read keeps the journal.
+      if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
       const attemptId = pending.attemptId ?? parseAttemptPath(clonePath, path.resolve(this.runnerRoot))?.attemptId;
       if (attemptId !== undefined) {
         try {
@@ -4220,6 +4414,10 @@ export class GitCache {
         // A legacy canonical path has no attempt identity; it is never reseeded on a wired worker.
         this.log.info("releasing a legacy canonical clone in place (no attempt ledger entry)", { clone: clonePath, state });
       }
+      // issue #2213: recheck right before the clear (the ledger append awaited). It sits OUTSIDE the
+      // try so it surfaces as CloneRetainedByQuarantineError, not a journal-stage AttemptReleaseError;
+      // nothing is awaited between it and the clear's runGit.
+      if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
       try {
         await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       } catch (err) {
@@ -4831,6 +5029,9 @@ export class GitCache {
         () => onStep?.("default_fetch"),
       );
     } catch (e) {
+      // issue #2213: a quarantine refusal is not "could not resolve": the checkpoint's publish is
+      // skipped (the runner's RunResidueBlockedError arm), never shipped on a fallback.
+      if (e instanceof RunResidueBlockedError) throw e;
       const abort = this.boundaryAbortError(e);
       if (abort) throw abort;
       this.log.warn("checkpoint overlay: could not resolve the default tip — shipping realTip", {
@@ -4941,10 +5142,22 @@ export class GitCache {
   /** Remove the run's runner clone (a standalone clone, not a linked worktree — no
    *  bare interaction). The warm bare and the fetched refs/objects are kept. */
   async removeRunnerClone(clonePath: string, ownerRunId?: string): Promise<void> {
-    if (ownerRunId !== undefined && await this.hasPhysicalTerminalProtection(ownerRunId)) {
-      throw new Error("terminal record custody retains runner clone");
+    const refuseUnderQuarantine = (): void => {
+      if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
+    };
+    if (ownerRunId !== undefined) {
+      if (await this.hasPhysicalTerminalProtection(ownerRunId)) {
+        throw new Error("terminal record custody retains runner clone");
+      }
+      // issue #2213: a latch that landed during the protection read keeps the clone.
+      refuseUnderQuarantine();
     }
-    await rmRunnerTeardownTree(clonePath, { allowCloneName: true });
+    // The pinned teardown awaits several opens and stats before it deletes anything, so a
+    // latch landing in that window is rechecked synchronously at each destructive dispatch.
+    await rmRunnerTeardownTree(clonePath, {
+      allowCloneName: true,
+      ...(ownerRunId !== undefined ? { beforeDestroy: refuseUnderQuarantine } : {}),
+    });
   }
 
   /**
@@ -5022,6 +5235,8 @@ export class GitCache {
       let scratch: string | undefined;
       let exdev = false;
       stage = "rename";
+      // issue #2213: a latch that landed during the awaits above keeps the clone; nothing moved.
+      if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
       try {
         await fs.rename(clonePath, holdingDest);
       } catch (err) {
@@ -5041,7 +5256,7 @@ export class GitCache {
             // socket / FIFO the clone may carry. No holdingDest is used on this path.
             stage = "intra_device_rename";
             const scratchParent = await this.createRetireScratchParent();
-            renamed = await this.renameCanonicalOrConfirmFree(clonePath, path.join(scratchParent, "clone"));
+            renamed = await this.renameIntoScratchUnlessLatched(clonePath, scratchParent);
             scratch = scratchParent;
           } else {
             // Rare foreign-orphan reclaim: the quarantine is RETAINED FOREVER, so
@@ -5076,7 +5291,7 @@ export class GitCache {
             // rename is deliberately OUTSIDE the copy's cleanup catch above.
             stage = "intra_device_rename";
             const scratchParent = await this.createRetireScratchParent();
-            renamed = await this.renameCanonicalOrConfirmFree(clonePath, path.join(scratchParent, "clone"));
+            renamed = await this.renameIntoScratchUnlessLatched(clonePath, scratchParent, holdingDest);
             holding = holdingDest; // retained; step 6 no-ops since discard === false
             scratch = scratchParent;
           }
@@ -5109,6 +5324,25 @@ export class GitCache {
       //    concurrent successor must never have its journal cleared by us.
       stage = "journal_clear";
       const still = await this.readRecoveryCapture(barePath, branch);
+      if (residueQuarantine() !== undefined) {
+        // issue #2213: a latch landed after the move. Undo it (best-effort), keep the journal and
+        // dispose of nothing; the latched worker keeps the clone at its journaled path.
+        const movedTo = renamed ? (exdev ? (scratch ? path.join(scratch, "clone") : undefined) : holdingDest) : undefined;
+        if (movedTo !== undefined) {
+          await fs.rename(movedTo, clonePath).then(
+            async () => {
+              if (scratch) await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+            },
+            (renameErr: unknown) =>
+              this.log.warn("retireRunnerClone: worker residue quarantine latched mid-retire and the clone could not be moved back; it is retained at the holding path", {
+                clone: clonePath,
+                retained_at: movedTo,
+                error: gitErrorMessage(renameErr),
+              }),
+          );
+        }
+        throw new CloneRetainedByQuarantineError();
+      }
       if (still?.runId === ownerRunId && still.clonePath === clonePath) {
         await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       }
@@ -5138,6 +5372,18 @@ export class GitCache {
     //    scratch rm is harmless residue.
     const { holding, scratch } = result;
     const protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId);
+    // issue #2213: a latch that landed during the protection read keeps the holding and scratch dirs.
+    if (residueQuarantine() !== undefined) {
+      if (holding || scratch) {
+        this.log.warn("retireRunnerClone: worker residue quarantine latched after the journal clear; the holding/scratch dirs are retained, not disposed", {
+          run_id: ownerRunId,
+          clone: clonePath,
+          holding,
+          scratch,
+        });
+      }
+      return result.disposition;
+    }
     if (holding && opts.discard && !protectedNow) {
       await fs.rm(holding, { recursive: true, force: true }).catch((e) =>
         this.log.warn("retireRunnerClone: holding dispose failed", {
@@ -5164,6 +5410,19 @@ export class GitCache {
     const st = await fs.lstat(scratchParent);
     if (!st.isDirectory()) throw new Error("retire scratch parent is not a directory");
     return scratchParent;
+  }
+
+  /** issue #2213 — {@link renameCanonicalOrConfirmFree} into `<scratchParent>/clone`, guarded by a
+   *  latch read issued with nothing awaited before the rename. On a latch nothing moved: the empty
+   *  scratch parent (and the completed off-tree copy at `copy`, if any) are removed best-effort and
+   *  the canonical clone stays. */
+  private async renameIntoScratchUnlessLatched(clonePath: string, scratchParent: string, copy?: string): Promise<boolean> {
+    if (residueQuarantine() !== undefined) {
+      await fs.rm(scratchParent, { recursive: true, force: true }).catch(() => undefined);
+      if (copy) await fs.rm(copy, { recursive: true, force: true }).catch(() => undefined);
+      throw new CloneRetainedByQuarantineError();
+    }
+    return this.renameCanonicalOrConfirmFree(clonePath, path.join(scratchParent, "clone"));
   }
 
   /** issue #1354 — atomically rename the canonical clone to `dest`, applying the same
@@ -5265,6 +5524,7 @@ export class GitCache {
           const sha = await this.resolveCommitStrict(barePath, tempRef);
           return sha === match[1] ? { kind: "present", sha } as const : { kind: "unavailable" } as const;
         } catch (cause) {
+          if (cause instanceof RunResidueBlockedError) throw cause; // issue #2213
           const abort = this.boundaryAbortError(cause);
           if (abort) throw abort;
           return { kind: "unavailable" } as const;
@@ -5284,6 +5544,7 @@ export class GitCache {
         }
       });
     } catch (cause) {
+      if (cause instanceof RunResidueBlockedError) throw cause; // issue #2213
       const abort = this.boundaryAbortError(cause);
       if (abort) throw abort;
       return { kind: "unavailable" };
@@ -7101,12 +7362,15 @@ export class GitCache {
   private async execScoped(
     command: string,
     args: string[],
-    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string },
+    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer },
     identity: BoundaryProcessRequest["identity"] = "worker_pat",
   ): Promise<{ stdout: string; stderr: string }> {
     const boundary = this.boundaryProcesses.getStore();
     const { input, ...execOptions } = options;
     if (!boundary) {
+      // issue #2213: the second quarantine check, keyed on the credential itself, synchronously
+      // before the child is created (nothing awaits between this and execFileAsync).
+      assertNoCredentialedGitWhileQuarantined(options.env);
       // issue #1597 M2: optional stdin (the checkpoint scan's cat-file / gitleaks stdin). An EPIPE on
       // an early-exiting child is swallowed here; the exit status carries the failure.
       const pending = execFileAsync(command, args, execOptions);
@@ -7127,6 +7391,11 @@ export class GitCache {
     const childTimeout = remainingSoft === undefined
       ? options.timeout
       : Math.min(options.timeout ?? Infinity, remainingSoft);
+    // issue #2213: as above, on the Codex boundary path. boundary.spawn is awaited and its own
+    // chain (the tick spawner's lock snapshot, the safety spawn boundary) awaits before the actual
+    // spawn, so this check is early; TickSpawner.spawnWith and launchCodexEffectRoot repeat it
+    // synchronously immediately before their own spawn call.
+    assertNoCredentialedGitWhileQuarantined(options.env);
     const process = await boundary.spawn({ argv: [executable, ...args], cwd, env: options.env, identity,
       ...(childTimeout === undefined ? {} : { timeoutMs: childTimeout }),
       ...(remainingSoft === undefined ? {} : { recoverableTimeout: true }),
@@ -7237,6 +7506,8 @@ export class GitCache {
       });
       return stdout;
     } catch (err) {
+      // issue #2213: the quarantine refusal reaches the runner unwrapped (a typed worker fault).
+      if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
       throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
@@ -7266,6 +7537,7 @@ export class GitCache {
       });
       return stdout;
     } catch (err) {
+      if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
       throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
@@ -7587,10 +7859,13 @@ export class GitCache {
 
   /** Run git, returning the exit code (0 on success) instead of throwing. */
   private async tryGit(cwd: string | undefined, args: string[], pat?: string): Promise<number> {
+    // issue #2213: built outside the try so a quarantine refusal is never read as an exit code.
+    const env = gitEnv(pat);
     try {
-      await this.execScoped("git", withDir(cwd, args), { env: gitEnv(pat), timeout: GIT_TIMEOUT_MS });
+      await this.execScoped("git", withDir(cwd, args), { env, timeout: GIT_TIMEOUT_MS });
       return 0;
     } catch (err) {
+      if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
       const code = (err as { code?: unknown }).code;
@@ -7605,10 +7880,12 @@ export class GitCache {
    *  keeps its historical coerce-to-1 for callers that only care whether the op succeeded; this
    *  sibling exists for callers (ancestry) that MUST NOT treat a broken read as a data answer. */
   private async tryGitExit(cwd: string | undefined, args: string[], pat?: string): Promise<number | null> {
+    const env = gitEnv(pat);
     try {
-      await this.execScoped("git", withDir(cwd, args), { env: gitEnv(pat), timeout: GIT_TIMEOUT_MS });
+      await this.execScoped("git", withDir(cwd, args), { env, timeout: GIT_TIMEOUT_MS });
       return 0;
     } catch (err) {
+      if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
       const code = (err as { code?: unknown }).code;
@@ -9113,6 +9390,8 @@ export function gitEnv(pat?: string, httpScope?: string, username?: string): Nod
     ...GIT_CODE_EXEC_KEY_PINS.map(([k, v]) => [k, v] as [string, string]),
   ];
   if (pat) {
+    // issue #2213: a quarantined worker builds no forge credential into a git child's environment.
+    assertResidueQuarantineOpen("git");
     // HTTP Basic (base64(user:pat)) — git-over-HTTPS auth, unlike GitLab's
     // REST-only PRIVATE-TOKEN. Scope the header + pin followRedirects to the repo
     // host so neither the credential nor a redirect can reach another host.

@@ -404,7 +404,7 @@ func TestEpisodeNoticeM2Allowed(t *testing.T) {
 }
 
 func TestEpisodeNoticeM2ExcludedAndSeverities(t *testing.T) {
-	for _, id := range []string{"queue.waiting", "fleet.capacity", "queue.undispatched", "fleet.disk", "fleet.rundisk", "forge.sync", "forge.ciwatch", "slack.socket", "schedules.paused", "board.drift", "custody.holds", "release.check", "future.check"} {
+	for _, id := range []string{"queue.waiting", "fleet.capacity", "queue.undispatched", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "forge.sync", "forge.ciwatch", "slack.socket", "schedules.paused", "board.drift", "custody.holds", "release.check", "future.check"} {
 		for _, severity := range []string{sevWarn, sevUnknown, sevOK} {
 			t.Run(id+"/"+severity, func(t *testing.T) {
 				st := &m2EpisodeStore{fakeEpisodeStore: &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: uuid.New(), admins: []uuid.UUID{uuid.New()}}}

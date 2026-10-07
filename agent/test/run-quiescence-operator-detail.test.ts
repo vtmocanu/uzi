@@ -16,7 +16,7 @@ import {
 import { workerSpawnNonce } from "../src/worker-spawn-mark.js";
 import { makeFakeProcRoot, plantFakeProc, plantUnreadableUnattributed } from "./fake-proc.js";
 import { recordingLogger } from "./helpers.js";
-import { api, fakeGitlab, gitlabClaim, homeDir, installHarness, runnerWith, simulateCommittedWork, worktreeDirFor } from "./runner-harness.js";
+import { api, fakeGitlab, gitlabClaim, homeDir, installHarness, plantAfterFetch, runnerWith, simulateCommittedWork, worktreeDirFor } from "./runner-harness.js";
 import { restoreHermeticView } from "./setup/hermetic-proc.js";
 
 // issue #1783 M2 — operator visibility. When a proof is blocked by an unreadable runner-uid process
@@ -201,7 +201,7 @@ function notQuiescentLines(lines: unknown[]): Array<Record<string, unknown>> {
 describe("issue #1783 M2: the run's failure_reason and warn line name the blocking process", { skip: !HAS_LINUX }, () => {
   it("finalize: RunResidueBlockedError's reason names pid and comm; the warn line marks it unattributed", async () => {
     simulateCommittedWork();
-    plantUnreadableUnattributed(root, PID);
+    plantAfterFetch(() => plantUnreadableUnattributed(root, PID));
     const { logger, lines } = recordingLogger();
     const claim = gitlabClaim(3951);
     await runnerWith(factoryOf(async (ctx) => ({ branch: ctx.branch, summary: "done" })), fakeGitlab().gitlab, undefined, logger).execute(claim);
@@ -221,7 +221,7 @@ describe("issue #1783 M2: the run's failure_reason and warn line name the blocki
   it("canonical reseed: CloneResidueBlockedError's reason names pid and comm", async () => {
     const iid = 3952;
     fs.mkdirSync(path.join(worktreeDirFor(iid), "old"), { recursive: true });
-    plantUnreadableUnattributed(root, PID);
+    plantAfterFetch(() => plantUnreadableUnattributed(root, PID));
     const claim = gitlabClaim(iid);
     await runnerWith(
       factoryOf(async () => {
@@ -241,7 +241,7 @@ describe("issue #1783 M2: the run's failure_reason and warn line name the blocki
 
   it("a hostile comm never reaches the failure_reason or the warn line raw", async () => {
     simulateCommittedWork();
-    plantUnreadable(PID, "\u202ex\u0007)y");
+    plantAfterFetch(() => plantUnreadable(PID, "\u202ex\u0007)y"));
     const { logger, lines } = recordingLogger();
     const claim = gitlabClaim(3953);
     await runnerWith(factoryOf(async (ctx) => ({ branch: ctx.branch, summary: "done" })), fakeGitlab().gitlab, undefined, logger).execute(claim);
@@ -255,7 +255,7 @@ describe("issue #1783 M2: the run's failure_reason and warn line name the blocki
 
   it("a spoofing comm cannot make the failure_reason name a second pid", async () => {
     simulateCommittedWork();
-    plantUnreadable(PID, SPOOF_COMMS[0]!);
+    plantAfterFetch(() => plantUnreadable(PID, SPOOF_COMMS[0]!));
     const claim = gitlabClaim(3955);
     await runnerWith(factoryOf(async (ctx) => ({ branch: ctx.branch, summary: "done" })), fakeGitlab().gitlab).execute(claim);
     const reason = String(lastFailed(claim.run_id)?.failure_reason);
@@ -266,7 +266,7 @@ describe("issue #1783 M2: the run's failure_reason and warn line name the blocki
   it("many long-comm pids: the failure_reason still carries the first pid and its whole comm", async () => {
     simulateCommittedWork();
     const long = "k".repeat(64);
-    for (let i = 0; i < 5; i++) plantUnreadable(PID + i, long);
+    plantAfterFetch(() => { for (let i = 0; i < 5; i++) plantUnreadable(PID + i, long); });
     const claim = gitlabClaim(3954);
     await runnerWith(factoryOf(async (ctx) => ({ branch: ctx.branch, summary: "done" })), fakeGitlab().gitlab).execute(claim);
     const reason = String(lastFailed(claim.run_id)?.failure_reason);

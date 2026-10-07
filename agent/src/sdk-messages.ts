@@ -47,6 +47,7 @@ import type { SdkQueryFn } from "./sdk-executor.js"; // type-only — erased at 
 import type { HarnessAttribution, HarnessItem } from "./harness.js";
 import { projectInit, projectItem, projectResult } from "./harness-messages.js";
 import { parsePluginErrors } from "./plugin-errors.js";
+import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
 
 /** One-shot user-turn prompt stream: the SDK consumes a single user message. */
 export async function* promptStream(text: string): AsyncGenerator<unknown> {
@@ -56,8 +57,12 @@ export async function* promptStream(text: string): AsyncGenerator<unknown> {
 // The real SDK `Query` has a required getContextUsage() returning the wider
 // SDKControlGetContextUsageResponse; it satisfies the optional, narrower seam
 // type by covariance, so no cast is needed here.
-export const defaultQueryFn: SdkQueryFn = (params) =>
-  sdkQuery({ prompt: params.prompt as never, options: params.options });
+export const defaultQueryFn: SdkQueryFn = (params) => {
+  // issue #2213 (belt): the call sites assert before they call; this keeps a future caller of the
+  // default from starting a credential-bearing provider spawn on a quarantined worker.
+  assertResidueQuarantineOpen("provider_turn");
+  return sdkQuery({ prompt: params.prompt as never, options: params.options });
+};
 
 /** The lead runs on the main thread; subagents carry a `subagent_type`. */
 const LEAD = "lead";

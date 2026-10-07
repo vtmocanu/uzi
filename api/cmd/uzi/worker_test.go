@@ -608,6 +608,10 @@ func TestStatusCell(t *testing.T) {
 		// statusCell keys on ActiveRuns, not on Busy — there is no way to set Busy on the
 		// DTO to change this output, which is the point: ActiveRuns:0 IS the cordoned case.
 		{"chat-only cordoned (ActiveRuns 0)", apitypes.WorkerDTO{Status: "online", DrainingSince: &ts, ActiveRuns: 0}, "online (cordoned)"},
+		// Issue #2213: a residue-quarantined worker carries the FIXED suffix, keyed on the
+		// timestamp alone; the worker's self-reported cause never reaches the status cell.
+		{"quarantined", apitypes.WorkerDTO{Status: "online", ResidueQuarantinedAt: &ts, ResidueQuarantineCause: strPtrT("pid 4242 \x1b[31mssh-agent")}, "online (quarantined)"},
+		{"quarantined and cordoned", apitypes.WorkerDTO{Status: "online", DrainingSince: &ts, ResidueQuarantinedAt: &ts}, "online (cordoned) (quarantined)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := statusCell(tc.w); got != tc.want {
@@ -850,6 +854,39 @@ func TestStatusCellLease(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := statusCell(tc.w); got != tc.want {
 				t.Errorf("statusCell = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func strPtrT(s string) *string { return &s }
+
+// TestQuarantinedWorkerStatusInBothTables (issue #2213): `uzi worker list` and `uzi admin
+// workers` both mark a quarantined worker with the fixed " (quarantined)" suffix and never
+// print the worker-reported cause.
+func TestQuarantinedWorkerStatusInBothTables(t *testing.T) {
+	now := time.Now()
+	hostile := strPtrT("RAWCAUSE \x1b[31m\u202e")
+	dto := apitypes.WorkerDTO{ID: "w1", Name: "latched", Status: "online", AnthropicBindMode: "default", ResidueQuarantinedAt: &now, ResidueQuarantineCause: hostile}
+	for name, tc := range map[string]struct {
+		args []string
+		fc   *uzicli.FakeClient
+	}{
+		"worker list":   {[]string{"worker", "list"}, &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{dto}}},
+		"admin workers": {[]string{"admin", "workers"}, &uzicli.FakeClient{AdminWorkers: []apitypes.AdminWorkerDTO{{WorkerDTO: dto, OwnerEmail: "o@uzi.test"}}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			out, _, code := runCLI(t, fakeEnv(tc.fc), tc.args...)
+			if code != uzicli.ExitOK {
+				t.Fatalf("exit = %d", code)
+			}
+			if !strings.Contains(out, "online (quarantined)") {
+				t.Errorf("missing the quarantined status suffix:\n%s", out)
+			}
+			for _, bad := range []string{"RAWCAUSE", "\x1b", "\u202e"} {
+				if strings.Contains(out, bad) {
+					t.Errorf("the reported cause leaked into the table (%q):\n%s", bad, out)
+				}
 			}
 		})
 	}

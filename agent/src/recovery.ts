@@ -27,6 +27,7 @@ import type { Readable } from "node:stream";
 import { RUN_KINDS } from "./protocol.js";
 import { RequestError, isRunOwnershipLost } from "./client.js";
 import type { Logger } from "./log.js";
+import { residueQuarantine } from "./residue-quarantine.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import type {
   RecoveryFinalDisposition,
@@ -142,6 +143,12 @@ export interface RecoveryRecord {
    *  `sourceSha` in the same generation CLEARS this flag and `bareDir`/`defaultBranch`, since the
    *  label is only true for the finalization head. */
   finalizationPin?: boolean;
+}
+
+/** issue #2213: the outcome of a capture/upload refused because the worker is latched. A
+ *  non-uploaded `needs_action` that writes nothing, so every caller keeps the clone and the pin. */
+function quarantinedOutcome(captureId: string): RecoveryOutcome {
+  return { state: "needs_action", captureId, reason: "worker_quarantined" };
 }
 
 /** The outcome of a capture attempt, surfaced to the runner for logging. */
@@ -589,6 +596,8 @@ export class RecoveryCoordinator {
   private readonly passes = new Set<Promise<void>>();
   /** The earliest time the next live pass may run (the coordinator's `now()` clock). */
   private nextPassAt = 0;
+  /** issue #2213: the quarantine skip of a live pass is logged once. */
+  private loggedQuarantineSkip = false;
   /** Consecutive live passes that ended with a transient failure (drives the backoff). */
   private transientPasses = 0;
   /** Set by any 401: a live pass runs only for a heartbeat sent after it. */
@@ -1016,6 +1025,8 @@ export class RecoveryCoordinator {
    */
   async captureAndUpload(input: CaptureInput): Promise<RecoveryOutcome> {
     if (!this.enabled) return { state: "pinned", captureId: input.record.captureId };
+    // issue #2213: a latched worker captures and uploads nothing; the record and pin stay as they are.
+    if (residueQuarantine() !== undefined) return quarantinedOutcome(input.record.captureId);
     return runCaptureCycle(await this.cycleKey(input.record), "wait", () => this.captureCycle(input));
   }
 
@@ -1075,6 +1086,9 @@ export class RecoveryCoordinator {
           // H is already on the fresh forge tip — verified no-unpublished-output (D2/D3).
           // Release THIS generation's exact hold and drop the local journal; nothing to archive.
           // PRD #1392 M1/M2 (fact 9): a proven fresh-forge no-output release stamps forge_no_output.
+          // issue #2213: a latch that landed during the fetch must not report "uploaded" (the caller
+          // then deletes the pin) while release() is a no-op.
+          if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
           await this.release(record.runId, record.generation, "forge_no_output");
           return { state: "uploaded", captureId: record.captureId, reason: "already_published" };
         }
@@ -1252,6 +1266,8 @@ export class RecoveryCoordinator {
     mode: UploadMode,
   ): Promise<RecoveryOutcome> {
     const swallow = mode === "capture";
+    // issue #2213: refuse before any journal write too (markFailure below), not just before the client call.
+    if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
     if (!hasJournaledBundle(record)) {
       return this.markFailure(record, "incomplete_local_inputs", swallow);
     }
@@ -1261,6 +1277,9 @@ export class RecoveryCoordinator {
     }
     let current: RecoveryRecord = record;
     await this.requirePresent(current);
+    // issue #2213: synchronous check immediately before the first client call (the awaits above have
+    // returned). Nothing is journaled: the record, its bundle and the pin stay exactly as they are.
+    if (residueQuarantine() !== undefined) return quarantinedOutcome(current.captureId);
     if (!current.serverCaptureId) {
       // Reserve once; the local captureId is the idempotency_key so a lost ACK re-reserves the
       // SAME server capture rather than duplicating it.
@@ -1295,6 +1314,8 @@ export class RecoveryCoordinator {
     };
     // Last custody check before the stream opens: a record removed while the reserve ran is not uploaded.
     await this.requirePresent(current);
+    // issue #2213: a latch that landed during the reserve or the check above stops the stream.
+    if (residueQuarantine() !== undefined) return quarantinedOutcome(current.captureId);
     let status: RecoveryCaptureStatusResponse;
     try {
       status = await this.client.uploadRecoveryBundle(
@@ -1411,13 +1432,28 @@ export class RecoveryCoordinator {
    * (they would otherwise leak worker disk forever). The v1 fallback (generation omitted, at most
    * one record) removes the whole run dir. Both recursive sweeps are suppressed when physical
    * terminal protection is present or its callback fails; only an empty-dir rmdir is attempted.
+   *
+   * issue #2213: a latched worker releases no custody (the hold, record and pin stay), with ONE
+   * exception: `opts.completedRun`, passed only by the runner's completed-run arm
+   * (driveRecoveryTerminal) for every completed code-publishing run, including no-code completions
+   * (report_only, not_code, scope-capped-empty) where nothing was published. It is the completed
+   * run's custody release, the same one the unlatched flow sends at completion; it is an in-process
+   * api call, not a credentialed child, and refusing it would leave the server hold open forever
+   * and turn into a false early_pin_only_after_restart needs_action after the restart. The run's
+   * clone is kept by executeClaim's finally while latched. Every other caller stays gated.
    */
-  async release(runId: string, generation?: number, releaseEvidence?: string): Promise<void> {
+  async release(
+    runId: string,
+    generation?: number,
+    releaseEvidence?: string,
+    opts: { completedRun?: boolean } = {},
+  ): Promise<void> {
     if (!this.enabled) return;
     if ((await this.listRecords(runId)).some(r => (generation === undefined || r.generation === generation) && r.inventoryGuarded)) {
       this.log.warn("recovery: guarded inventory requires final disposition; custody retained", { run_id: runId, generation });
       return;
     }
+    if (residueQuarantine() !== undefined && opts.completedRun !== true) return;
     try {
       const res = await this.client.releaseRecoveryCustody(runId, generation, releaseEvidence);
       this.log.info("recovery: released custody after verified no-unpublished-output", {
@@ -1739,6 +1775,15 @@ export class RecoveryCoordinator {
    */
   async resumeLive(opts: ResumeLiveOptions): Promise<void> {
     if (!this.enabled || this.passes.size > 0) return;
+    // issue #2213: a quarantined worker re-uploads and releases nothing (an unattributable runner-uid
+    // process may read credentials); journaled bundles stay put until the worker restarts.
+    if (residueQuarantine() !== undefined) {
+      if (!this.loggedQuarantineSkip) {
+        this.loggedQuarantineSkip = true;
+        this.log.warn("recovery: live re-drive skipped; the worker is quarantined");
+      }
+      return;
+    }
     if (this.now() < this.nextPassAt) return;
     if (this.credentialBlockedAt !== undefined && opts.authenticatedAtMs <= this.credentialBlockedAt) return;
     await this.trackPass(() => this.livePass(opts));

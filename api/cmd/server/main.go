@@ -1088,6 +1088,7 @@ func run() error {
 	// standalone reconciler with a boot pass then a one-minute ticker.
 	healthSvc := healthsvc.New(healthsvc.Config{
 		WorkerEligibilityForHealth: wsvc.WorkerEligibilityForHealth,
+		ResidueQuarantine:          wsvc.ResidueQuarantineFor,
 		Store:                      q,
 		Pool:                       pool,
 		Settings:                   settingsCache,

@@ -3,7 +3,7 @@
 // which has no `npm test` preload) never reaps against the host's live process table. The module is
 // evaluated once per process (it is the same module the preload loads), so this import neither
 // re-runs nor clobbers a view a test later installs explicitly.
-import "./setup/hermetic-proc.js";
+import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import { afterEach, beforeEach } from "node:test";
 import fs from "node:fs";
 import os from "node:os";
@@ -54,6 +54,8 @@ export let homeDir: string;
  * splitting runner.test.ts needed no edits inside any test body.
  */
 export function installHarness(): void {
+  // issue #2213: a runner flow over a planted unreadable process latches the worker-wide quarantine.
+  resetResidueQuarantineAfterEach();
   beforeEach(async (t) => {
     api = new FakeApi(TOKEN);
     baseUrl = await api.listen();
@@ -87,6 +89,23 @@ export function worktreeDirFor(iid: number): string {
     .basename(git.barePathFor(fx.originPath))
     .replace(/\.git$/, "");
   return path.join(fx.dataDir, "runner", repoDir, `issue-${iid}`);
+}
+
+/**
+ * issue #2213: run `plant` right AFTER the run's clone fetch returns. The worker-wide residue check
+ * (RunRunner.checkWorkerResidueBeforeFetch) now runs before every fetch and refuses a planted
+ * unreadable, unattributed process there, so a test of a LATER proof site (the seed, a park, the
+ * finalize gate, the terminal retire) plants its process after the fetch, exactly where a survivor
+ * the earlier scans missed would appear. Patches this test's own GitCache (the harness builds a
+ * fresh one per test), so nothing needs restoring.
+ */
+export function plantAfterFetch(plant: () => void): void {
+  const real = git.ensureClone.bind(git);
+  git.ensureClone = (async (...a: Parameters<typeof real>) => {
+    const out = await real(...a);
+    plant();
+    return out;
+  }) as typeof git.ensureClone;
 }
 
 export function isAlive(pid: number): boolean {

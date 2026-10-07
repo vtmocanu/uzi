@@ -2410,6 +2410,16 @@ export interface Worker {
   outbox_pending_terminal?: number | null;
   outbox_stale_retired?: number | null;
   outbox_blocked?: string | null;
+  // The worker's residue-quarantine latch (issue #2213): it found an unreadable,
+  // unattributed process running as its own uid, so it claims nothing and starts no
+  // forge-credentialed git and no new Claude/Codex turn until its container restarts.
+  // Both null unless the worker's last heartbeat reported the latch; the api overlays
+  // them from an in-process tracker, the same optional-overlay convention as outbox_*.
+  // residue_quarantined_at is when the worker latched (worker clock).
+  // residue_quarantine_cause is UNTRUSTED worker self-report (api-sanitized, bounded):
+  // render it as plain text only (WorkerQuarantineBadge).
+  residue_quarantined_at?: string | null;
+  residue_quarantine_cause?: string | null;
 }
 
 /** The closed set of worker bind modes (PRD #111 M3), mirroring the server's CHECK. */

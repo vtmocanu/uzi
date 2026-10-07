@@ -124,3 +124,64 @@ describe("production code never installs a quiescence test view", () => {
     assert.deepEqual(matches(withoutStrings(src), /(?<![.\w$])view\s*[,}]/g), []);
   });
 });
+
+// issue #2213 — the residue quarantine latch has no production release (a container restart is the
+// only one), so production code must never reset it. Only the test-only reset's own definition names
+// it in agent/src; the hermetic preload resets it after every test.
+describe("production code never resets the residue quarantine latch", () => {
+  const OWNER_Q = path.join(SRC, "residue-quarantine.ts");
+  const files = sourceFiles(SRC);
+
+  it("scans the owning module", () => {
+    assert.ok(files.includes(OWNER_Q));
+  });
+
+  it("no other src file names the reset", () => {
+    const offenders = files
+      .filter((f) => f !== OWNER_Q)
+      .filter((f) => /\b(resetResidueQuarantineForTests)\b/.test(fs.readFileSync(f, "utf8")))
+      .map((f) => path.relative(SRC, f));
+    assert.deepEqual(offenders, []);
+  });
+
+  it("in residue-quarantine.ts, the reset is only defined, never called", () => {
+    const src = code(OWNER_Q);
+    assert.deepEqual(matches(src, /(export\s+function\s+)?\bresetResidueQuarantineForTests\s*\(/g), [
+      "export function resetResidueQuarantineForTests(",
+    ]);
+  });
+
+  it("in residue-quarantine.ts, the latch state is written only by the first-wins latch and the reset", () => {
+    const src = code(OWNER_Q);
+    const writes = matches(src, /\blatched\s*=(?!=)[^;]*;/g);
+    assert.deepEqual(writes, [
+      "latched = { cause, runId: input.runId, site, latchedAt: now.toISOString() };",
+      "latched = undefined;",
+    ]);
+  });
+});
+
+// issue #2213 — every place agent/src starts a Claude provider turn through an injected `queryFn`
+// carries the synchronous quarantine check as the statement right before the call, so a new call
+// site cannot be added without it. (The Codex funnels and the git funnel are proven by behaviour in
+// the residue-quarantine-*.test.ts files; the spawn belts are proven by their own unit tests.)
+describe("every queryFn call site asserts the residue quarantine immediately before the call", () => {
+  const files = sourceFiles(SRC);
+  const CALL = /\bqueryFn\(\s*\{/;
+  const sites = files.flatMap((f) => {
+    const lines = code(f).split("\n");
+    return lines.flatMap((line, i) => (CALL.test(line) ? [{ file: path.relative(SRC, f), line, before: lines.slice(Math.max(0, i - 3), i) }] : []));
+  });
+
+  it("finds the five known call sites", () => {
+    assert.deepEqual(
+      sites.map((s) => s.file).sort(),
+      ["chat-executor.ts", "claude-advice-harness.ts", "claude-harness.ts", "isolated-executor.ts", "job-runner.ts"],
+    );
+  });
+
+  it("each is preceded (within the three lines before) by assertResidueQuarantineOpen(\"provider_turn\")", () => {
+    const missing = sites.filter((s) => !s.before.some((l) => l.includes('assertResidueQuarantineOpen("provider_turn")'))).map((s) => s.file);
+    assert.deepEqual(missing, []);
+  });
+});

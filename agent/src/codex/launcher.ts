@@ -56,6 +56,7 @@ import {
 } from "./config.js";
 import type { CodexAppServerAuthMode } from "./appserver-auth.js";
 import { SESSION_SEED_APP_ROOT, sessionSeedInvocation } from "./session-seed-cli.js";
+import { assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen } from "../residue-quarantine.js";
 
 // ─── Bounds (fixture-derived; supervisor-side limits are matched, not trusted) ────
 const MAX_EVIDENCE_LINES = 256;
@@ -769,6 +770,10 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   // model-directed work, so anything it leaks must stay reapable and the nonce must stay out of
   // its env. A runner-uid (provider) root makes itself non-dumpable instead, so the reaper
   // attributes it through the worker-launched-root registry, recorded here until it exits.
+  // issue #2213: a quarantined worker starts no new provider app-server (a fresh run epoch, an epoch
+  // recreation, an advice root). Synchronous, immediately before the spawn; command and worker_pat
+  // effect roots are untouched (their PAT is covered by the git belt).
+  if (spec.kind === "provider") assertResidueQuarantineOpen("provider_turn");
   const child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
     cwd: spec.cwd,
     env: replacedEnv,
@@ -840,6 +845,9 @@ export async function launchCodexEffectRoot(
   const wrapped = spec.identity === "command"
     ? commandRootCommand(deps.helperBinsForTest?.supervisor ?? spec.supervisorBin, supervisorArgv)
     : workerBoundaryCommand(deps.helperBinsForTest?.supervisor ?? spec.supervisorBin, supervisorArgv);
+  // issue #2213: an effect root whose env carries the forge credential (a boundary git) starts
+  // nothing once quarantined; synchronous, immediately before the spawn.
+  assertNoCredentialedGitWhileQuarantined(spec.env);
   const child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
     cwd: spec.cwd,
     // issue #1783 (R4): NO worker mark. A command root runs model-directed shells, and neither

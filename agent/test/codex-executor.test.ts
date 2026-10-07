@@ -71,6 +71,8 @@ import type { OutgoingMessage } from "../src/protocol.js";
 import { createCodexTransport, CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
 import type { RunContext, EmittedMessage, Executor, WallParkOutcome, SecretRemediationDecision } from "../src/executor.js";
 import { PauseNowSignal } from "../src/steering.js";
+import { ResidueQuarantinedError, latchResidueQuarantine } from "../src/residue-quarantine.js";
+import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import { scanSignals } from "../src/signals.js";
 import { detectRepoAgents } from "../src/repoagents.js";
 import { CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND } from "../src/prompt.js";
@@ -13495,5 +13497,113 @@ describe("Codex dependency provisioning M2", () => {
     } finally {
       for (const key of keys) { const value = saved[key]; if (value === undefined) delete process.env[key]; else process.env[key] = value; }
     }
+  });
+});
+
+// issue #2213 — a quarantined worker starts no new Codex provider turn. Layer: CodexExecutor.run over
+// this file's transport DOUBLE, so the proof is the harness/executor call sites (the real transport's
+// own gate is proven in residue-quarantine-codex.test.ts).
+describe("CodexExecutor: residue quarantine (issue #2213)", () => {
+  resetResidueQuarantineAfterEach();
+  const GATED_FRAMES = ["account/login/start", "thread/start", "thread/resume", "turn/start"];
+  const latch = (): void => latchResidueQuarantine({ cause: "runner-uid pid 7 unattributed", runId: "run-1", site: "pre_clone" }, noopLog);
+
+  it("a run that starts latched fails typed before any provider turn frame, and no credential is released", async () => {
+    latch();
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "latched run"),
+      (err: unknown) => err instanceof ResidueQuarantinedError,
+    );
+    assert.deepEqual(rig.transport.requests.filter((r) => GATED_FRAMES.includes(r.method)), [], "no thread/turn/login frame");
+    assert.equal(rig.client.releaseCalls.length, 0, "no releaseCodex call for an epoch that cannot start");
+  });
+
+  it("a delegated child's turn is refused: no child thread/turn start frame, and the lead receives child_failed", async () => {
+    const agents: AgentTemplate[] = [
+      { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [] },
+    ];
+    const rig = makeRig({
+      responder: (c) => {
+        if (c.method === "thread/start") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          latch(); // the worker is quarantined while the root turn is in flight
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      },
+    });
+    rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-root"));
+    const { ctx } = makeCtx({ agents });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "the lead's spawn_agent reply");
+    rig.transport.push(signalDone("th-1", "tn-1")).push(turnCompleted("completed", "th-1", "tn-1")).end();
+    await runP.catch(() => undefined);
+    assert.equal(rig.transport.threadStartCount, 1, "no child thread/start was sent");
+    assert.equal(rig.transport.turnStartCount, 1, "no child turn/start was sent");
+    const reply = rig.transport.responses.find((r) => r.requestId === 1);
+    assert.match(JSON.stringify(reply), /the delegated child failed to start/, "the lead's tool result is the child_failed refusal");
+    assert.match(JSON.stringify(reply), /"success":false/);
+  });
+
+  it("a latch set at plan approval stops the run before the recreated epoch's credential release and turn", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "the codex plan body" }, th, tn, "c-plan")).push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("resumed-1", "tn-2", (t, th, tn) => {
+        t.push(toolCall(2, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const { ctx } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      gatePlan: async () => {
+        latch(); // the worker is quarantined while the plan waits at the gate
+        return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
+      },
+    });
+    const releasesAfterPlan = (): number => rig.client.releaseCalls.length;
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "latched at approval"),
+      (err: unknown) => err instanceof ResidueQuarantinedError,
+    );
+    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1, "the plan turn ran before the latch");
+    assert.equal(rig.epochs[1]?.transport.turnStartCount ?? 0, 0, "no implementation turn on the recreated epoch");
+    assert.ok(releasesAfterPlan() <= 1, "no credential was released for the recreated epoch");
+  });
+
+  it("the turn/start call site alone: latched after login and thread/resume, the turn/start is never sent; typed, not retried or remapped", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "the codex plan body" }, th, tn, "c-plan")).push(turnCompleted("completed", th, tn));
+      }),
+      // The recreated epoch: login and thread/resume succeed, and the worker is quarantined as the
+      // resume is answered, i.e. after every earlier gate and before the turn/start request.
+      (c) => {
+        if (c.method === "thread/resume") {
+          latch();
+          return { thread: { id: "resumed-1" } };
+        }
+        if (c.method === "turn/start") {
+          c.transport.push(toolCall(2, "signal_done", {}, "resumed-1", "tn-2", "c-done")).push(turnCompleted("completed", "resumed-1", "tn-2"));
+          return { turn: { id: "tn-2" } };
+        }
+        return {};
+      },
+    ]);
+    const { ctx } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } }) as never,
+    });
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "latched before turn/start"),
+      (err: unknown) => err instanceof ResidueQuarantinedError && !(err instanceof CodexTransportError),
+    );
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 0, "the implementation turn/start was never sent");
+    assert.equal(rig.providerLaunches(), 2, "no retry launched another epoch");
   });
 });

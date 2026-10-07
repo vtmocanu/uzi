@@ -12,6 +12,7 @@
 // permanent (fail fast — the safe default).
 
 import { ForgeError, ForgeResponseTooLarge } from "./forge.js";
+import { RunResidueBlockedError } from "./residue-quarantine.js";
 
 /**
  * The push/MR-create backoff schedule (~30s total). N sleeps ⇒ N+1 attempts.
@@ -98,6 +99,8 @@ const TRANSIENT_PATTERNS: RegExp[] = [
  * Classify a forge/git error as "transient" (retry) or "permanent" (fail fast).
  *
  * Precedence is load-bearing (D9): permanent-first.
+ *   - A `RunResidueBlockedError` (issue #2213: the worker is quarantined) is permanent before
+ *     anything else: retrying could only spend the schedule on a refusal that cannot change.
  *   - A `ForgeError` is classified by HTTP status: 0 (transport failure) ⇒
  *     transient; >=500 || 408 || 429 ⇒ transient; any other status ⇒ permanent.
  *     This mirrors `isTransient` (`client.ts:443`).
@@ -106,6 +109,7 @@ const TRANSIENT_PATTERNS: RegExp[] = [
  *   - No match ⇒ permanent (the safe default: fail fast).
  */
 export function classifyForgeError(err: unknown): "transient" | "permanent" {
+  if (err instanceof RunResidueBlockedError) return "permanent";
   if (err instanceof ForgeError) {
     // PRD #1798: an over-cap response is deterministic (the same resource is just as large on a
     // retry), so it is permanent even though it carries no HTTP status.

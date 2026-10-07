@@ -139,7 +139,7 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 					cleanup = "cleanup pending"
 				}
 				rows = append(rows, []string{
-					w.ID, cellText(w.OwnerEmail), cellText(w.Name), w.Status,
+					w.ID, cellText(w.OwnerEmail), cellText(w.Name), w.Status + quarantineMark(w.WorkerDTO),
 					version, upgradeCell(w.WorkerDTO), blockingCell(w.WorkerDTO),
 					reportedRunsCell(w.WorkerDTO), disk, cleanup, largestRunCell(w.WorkerDTO), outboxCell(w.WorkerDTO),
 				})

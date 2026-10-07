@@ -24,6 +24,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // Doc is the evaluated health document. It is the exact wire type the handler marshals,
@@ -122,9 +123,14 @@ type Config struct {
 	// WorkerEligibilityForHealth confirms a stored roll reason against current composed eligibility.
 	// A nil callback or an error leaves the row on the genuine-capacity path.
 	WorkerEligibilityForHealth func(context.Context, time.Time, uuid.UUID) (store.CountOnlineWorkersClaimableForRunRow, error)
-	Store                      Store
-	Pool                       *pgxpool.Pool
-	Settings                   Settings
+	// ResidueQuarantine reports a worker's last heartbeat-reported residue-quarantine latch
+	// (issue #2213); workersvc.Service.ResidueQuarantineFor satisfies it. nil reads as
+	// "nothing latched" (a struct-literal test, or a deployment without a worker service),
+	// so fleet.quarantine is ok.
+	ResidueQuarantine func(workerID uuid.UUID) (workersvc.ResidueQuarantine, bool)
+	Store             Store
+	Pool              *pgxpool.Pool
+	Settings          Settings
 	// SlackState reports the live Slack socket state (slacksvc.State* strings); nil reads
 	// as StateDisabled, so slack.socket is `na`.
 	SlackState func() string
@@ -254,6 +260,7 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		capacity,
 		s.checkFleetDisk(now, workers),
 		s.checkFleetRunDisk(ctx, now, workers),
+		s.checkFleetQuarantine(now, workers),
 		waiting,
 		s.checkQueueUndispatched(ctx, now),
 		controllerReport,

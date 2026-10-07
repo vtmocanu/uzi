@@ -14,6 +14,7 @@ import { randomUUID } from "node:crypto";
 
 import type { HarnessError } from "../harness.js";
 import type { CodexNotification, CodexTransport } from "./transport.js";
+import { RunResidueBlockedError, assertResidueQuarantineOpen } from "../residue-quarantine.js";
 
 /** Outer bridge budget: above WorkerClient's 8s cap, below app-server's hard 10s cap. */
 export const CODEX_REFRESH_BRIDGE_BUDGET_MS = 9_000;
@@ -177,6 +178,8 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
       (error: unknown) => {
         this.poison();
         if (error instanceof CodexAppServerAuthError) throw error;
+        // issue #2213: the quarantine refusal reaches the runner as itself, never as a transport fault.
+        if (error instanceof RunResidueBlockedError) throw error;
         throw transportError("codex authentication startup failed");
       },
     );
@@ -326,6 +329,8 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
           chatgptAccountId: this.config.initial.accountId,
           chatgptPlanType: null,
         };
+    // issue #2213: a quarantined worker sends no provider credential (also checked in the transport).
+    assertResidueQuarantineOpen("provider_turn");
     const response = await transport.request<unknown>(LOGIN_METHOD, loginParams, { signal });
     const expected = this.config.mode === "api_key" ? "apiKey" : "chatgptAuthTokens";
     if (asObject(response)?.type !== expected) {

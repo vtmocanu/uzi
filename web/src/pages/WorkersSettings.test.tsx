@@ -177,6 +177,29 @@ describe("WorkersSettings — cleanup state stays admin-only", () => {
   });
 });
 
+describe("WorkersSettings — residue quarantine badge (issue #2213)", () => {
+  it("badges a latched worker with its cause as plain text, and leaves a clear worker unbadged", async () => {
+    const cause = '<script>alert("x")</script> [31mcomm=??[0m';
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [
+        aWorker({ id: "w-q", name: "latched-one", residue_quarantined_at: "2026-07-14T00:00:00Z", residue_quarantine_cause: cause }),
+        aWorker({ id: "w-c", name: "clear-one", residue_quarantined_at: null, residue_quarantine_cause: null }),
+      ],
+    });
+    const { container } = renderPage();
+    await screen.findByText("latched-one");
+    const pills = screen.getAllByText("quarantined");
+    expect(pills).toHaveLength(1);
+    expect(pills[0].getAttribute("title")).toContain(`Reported cause: "${cause}".`);
+    expect(pills[0].getAttribute("title")).toContain("Restart the worker's container to clear it.");
+    expect(container.querySelector("script")).toBeNull();
+    // The pill sits in the latched row, not the clear one.
+    const row = (name: string) => screen.getByText(name).closest("li");
+    expect(row("latched-one")?.contains(pills[0])).toBe(true);
+    expect(row("clear-one")?.textContent).not.toContain("quarantined");
+  });
+});
+
 describe("WorkersSettings — always-visible worker-setup guide link (PRD #57 M2)", () => {
   it("renders the worker-setup guide link in the page header", async () => {
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });

@@ -917,6 +917,10 @@ var workerDTOKeys = []string{
 	// an in-process, restart-losing tracker, never stored — this tag set is the only
 	// wire contract these four fields have.
 	"outbox_pending_messages", "outbox_pending_terminal", "outbox_stale_retired", "outbox_blocked",
+	// Issue #2213: the worker's heartbeat-reported residue quarantine latch (when it latched
+	// and why). Both null unless the last heartbeat reported it; overlaid from an in-process
+	// tracker, never stored. The cause is untrusted text.
+	"residue_quarantined_at", "residue_quarantine_cause",
 }
 
 func TestWorkerDTOTags(t *testing.T) {

@@ -40,6 +40,7 @@ var checkMeta = map[string]struct {
 	"fleet.capacity":     {"owner", groupWorkers, "Worker capacity", "hosted-workers"},
 	"fleet.disk":         {"owner", groupWorkers, "Worker disk", "hosted-workers"},
 	"fleet.rundisk":      {"owner", groupWorkers, "Run disk size", "hosted-workers"},
+	"fleet.quarantine":   {"owner", groupWorkers, "Worker residue quarantine", "hosted-workers"},
 	"queue.waiting":      {"owner", groupQueue, "Runs waiting for a worker", ""},
 	"queue.undispatched": {"owner", groupQueue, "Undispatched task runs", ""},
 	"controller.report":  {"instance", groupControl, "Controller reporting", "hosted-workers"},
@@ -385,6 +386,65 @@ func (s *Service) checkFleetDisk(now time.Time, workers []store.ListAllWorkersRo
 		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Cleanup pending", Value: fmt.Sprintf("%d worker(s)", pending)})
 		c.Action = strPtr("DinD cleanup pending can be report-only or waiting safely for active work and retained unpublished work to clear. An active operation can outlast fresh telemetry. Inspect uzi admin workers; wait for safe cleanup, or increase volume capacity.")
 	}
+	return c
+}
+
+// checkFleetQuarantine (issue #2213) warns when any worker with a fresh heartbeat reports
+// a latched residue quarantine: it found an unreadable, unattributed runner-uid process
+// and claims nothing until its container restarts. The latch is the worker's own
+// heartbeat self-report held in an in-process tracker (Config.ResidueQuarantine), so a
+// worker without a fresh heartbeat is skipped: its last report may be stale and
+// fleet.capacity already covers a silent worker. The summary and evidence are a fixed
+// template plus the worker name (re-bounded through safe), the latch age and the detecting
+// run id (a parsed UUID); the raw worker-reported cause is NOT rendered. There is no
+// danger band: the remedy is a container restart, and fleet.capacity owns the
+// no-usable-worker case.
+// maxQuarantineEvidence caps the per-worker evidence rows; the summary carries the full count.
+const maxQuarantineEvidence = 10
+
+func (s *Service) checkFleetQuarantine(now time.Time, workers []store.ListAllWorkersRow) apitypes.HealthCheckDTO {
+	c := s.base("fleet.quarantine")
+	var latched []string
+	var oldest time.Time
+	if s.cfg.ResidueQuarantine != nil {
+		for _, row := range workers {
+			w := row.Worker
+			if !w.LastHeartbeatAt.Valid || now.Sub(w.LastHeartbeatAt.Time) > s.heartbeatStale() {
+				continue
+			}
+			q, ok := s.cfg.ResidueQuarantine(w.ID)
+			if !ok {
+				continue
+			}
+			age := now.Sub(q.LatchedAt)
+			if age < 0 {
+				age = 0
+			}
+			run := "no run"
+			if q.RunID != nil {
+				run = "run " + q.RunID.String()
+			}
+			latched = append(latched, fmt.Sprintf("%s (latched %s ago, detected by %s)", orDash(safe(w.Name)), humanDur(age), run))
+			if oldest.IsZero() || q.LatchedAt.Before(oldest) {
+				oldest = q.LatchedAt
+			}
+		}
+	}
+	if len(latched) == 0 {
+		c.Severity = sevOK
+		c.Summary = "No worker reports a residue quarantine."
+		return c
+	}
+	c.Severity = sevWarn
+	c.Summary = fmt.Sprintf("%d worker(s) are quarantined and claim nothing until restarted.", len(latched))
+	for i, l := range latched {
+		if i == maxQuarantineEvidence {
+			break
+		}
+		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Worker", Value: l})
+	}
+	c.Action = strPtr("Restart the quarantined worker's container to clear the latch; read the reported cause in `uzi admin workers --json` (residue_quarantine_cause) or the worker view in `uzi tui`.")
+	c.Since = sincePtr(oldest)
 	return c
 }
 

@@ -105,6 +105,7 @@ import { safeReportFailed } from "./model-pass.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { describeSkillDrop, qualifiedSkillName, SKILL_NAME_RE, SKILLS_PLUGIN_NAME } from "./skills-plugin.js";
 import { errMessage, sleep } from "./util.js";
+import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
 
 /** The in-process MCP server name; its tool surfaces as `mcp__job__submit_job_result`. */
 const JOB_SERVER_NAME = "job";
@@ -1108,6 +1109,8 @@ export class JobRunner {
     let sawResult = false;
     let iterationError: unknown;
     try {
+      // issue #2213: the last statement before the credential-bearing provider spawn.
+      assertResidueQuarantineOpen("provider_turn");
       const q = this.queryFn({ prompt: promptStream(args.prompt), options });
       for await (const msg of q) {
         if (args.lane) {

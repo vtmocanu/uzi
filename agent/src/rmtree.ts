@@ -877,14 +877,21 @@ export async function rmTeardownTree(target: string, testDeps: TeardownTestDeps 
 }
 
 /** Runner-owned disposal only: fixed runner owner under the split, current uid otherwise.
+ * `beforeDestroy` is a synchronous veto called with no await between it and each
+ * destructive dispatch (every emptying pass, and the final rmdir); it throws to refuse.
+
  * Does not open private roots to the group. Inaccessible mixed-private content refuses.
  * Clone names opt into the same component predicate as skills suffixes; advice UUIDs do not.
  */
-export async function rmRunnerTeardownTree(target: string, opts: { allowCloneName?: boolean } = {}): Promise<void> {
+export async function rmRunnerTeardownTree(
+  target: string,
+  opts: { allowCloneName?: boolean; beforeDestroy?: () => void } = {},
+): Promise<void> {
   if (!path.isAbsolute(target)) throw new Error(`rmRunnerTeardownTree: refusing non-absolute path ${target}`);
   await removePinnedTree(path.dirname(target), path.basename(target), { deadline: Date.now() + 120_000 }, {
     runnerOwned: true,
     allowCloneName: opts.allowCloneName === true,
+    ...(opts.beforeDestroy ? { beforeDestroy: opts.beforeDestroy } : {}),
   });
 }
 
@@ -954,7 +961,7 @@ async function removePinnedTree(
   parent: string,
   name: string,
   opts: PinnedTreeRemovalOptions,
-  policy: { runnerOwned?: boolean; allowCloneName?: boolean } = {},
+  policy: { runnerOwned?: boolean; allowCloneName?: boolean; beforeDestroy?: () => void } = {},
 ): Promise<"removed" | "absent"> {
   if (!path.isAbsolute(parent)) throw new Error(`rmTreePinned: refusing non-absolute parent ${parent}`);
   const cloneName = policy.allowCloneName === true && isTeardownComponent(name);
@@ -1010,6 +1017,7 @@ async function removePinnedTree(
           break;
         }
         const budgetMs = Math.max(0, timeout - HELPER_SLACK_MS);
+        policy.beforeDestroy?.();
         const code = await runHelper(
           wrap,
           PINNED_SUBTREE_SCRIPT,
@@ -1053,6 +1061,7 @@ async function removePinnedTree(
         }
         if (current === expect) {
           try {
+            policy.beforeDestroy?.();
             await fs.rmdir(at);
           } catch (err) {
             if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;

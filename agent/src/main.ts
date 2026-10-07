@@ -671,6 +671,8 @@ async function main(): Promise<void> {
     outboxTerminalMaxBytes: config.outboxTerminalMaxBytes,
     gapFillMax: config.gapFillMax,
     codexAdviceHarnessFactory,
+    // issue #2213: the worker-wide residue check before the review's credentialed fetch.
+    preFetchCheck: (runId, site) => runner.checkWorkerResidueBeforeFetch(runId, site),
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 

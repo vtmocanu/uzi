@@ -120,6 +120,7 @@ import { evidencesModelProcessing } from "./harness.js";
 import { PlanRejectedError, stampPrSummaryHead } from "./executor.js";
 import { emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "./plan-missing.js";
 import { errMessage } from "./util.js";
+import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
 import { SummaryRunner, type PlanSummaryResult } from "./summary-runner.js";
 import { resolvePrdInput, type PrdInput } from "./prd-link.js";
 import {
@@ -2076,6 +2077,8 @@ export class SdkExecutor implements Executor {
         }
         let revisions = 0;
         while (verdict.kind === "revise") {
+          // issue #2213: a quarantined worker stops before recording feedback or building a revise prompt.
+          assertResidueQuarantineOpen("provider_turn");
           const feedback = verdict.feedback;
           // Issue #1604 (D2): the re-gate of the revised plan settles THIS revise, once the revised
           // plan is confirmed persisted; until then an interruption replays it.
@@ -2533,6 +2536,8 @@ export class SdkExecutor implements Executor {
         // handled was swallowed by that path's `tripReason = undefined; continue`; checking the
         // sticky mode here (not only inside the pause branch below) is what still parks it.
         throwIfDiskStop(ctx);
+        // issue #2213: stop at the boundary, before the iteration report and the next prompt.
+        assertResidueQuarantineOpen("provider_turn");
         // PRD #122 M2: report the iteration (carrying the latest milestone progress) and
         // apply the server-served effective budget. The cap only ever RISES (a scaled run
         // gets more turns; a single/zero-milestone run's ACK carries none, so this is
@@ -3704,6 +3709,9 @@ export class SdkExecutor implements Executor {
     idleMs: number,
     budget: { asked: number },
   ): Promise<TurnResult & { plan: string }> {
+    // issue #2213: a quarantined worker stops at the planning boundary, before the prompt is used;
+    // the queryFn call-site gate remains the guarantee.
+    assertResidueQuarantineOpen("provider_turn");
     let turnPrompt = prompt;
     // Bounded independently of the park cap. The cap bounds how many times we ASK;
     // this bounds how many times we re-plan, which also covers the rounds where the

@@ -175,6 +175,7 @@ import type { CodexNotification } from "./transport.js";
 import type { CodexBinding } from "./select.js";
 import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "./config.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
+import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
 import { CodexAdviceHarness, type LaunchAdviceRootSeam } from "./codex-advice-harness.js";
 import {
   createCodexAppServerAuth,
@@ -2434,6 +2435,9 @@ export class CodexExecutor implements Executor {
         return answeredPrompt(questions, verdict.answers);
       };
       const drivePlan = async (initialPrompt: string) => {
+        // issue #2213: a quarantined worker stops a run cleanly at the plan and revise boundaries,
+        // before the next prompt is built; the call-site gates remain the guarantee.
+        assertResidueQuarantineOpen("provider_turn");
         let prompt = initialPrompt;
         // #1593: the prose-only recovery budget, LOCAL to this invocation so the initial plan
         // turn and every revision turn each get one nudge and one owner park.
@@ -2678,6 +2682,8 @@ export class CodexExecutor implements Executor {
         // controller was spent (a refused wall park, a declined pause) survives only in the sticky
         // steering flag, so re-check it at every boundary before any further work.
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+        // issue #2213: stop at the boundary, before the iteration report and the next prompt.
+        assertResidueQuarantineOpen("provider_turn");
         // Report the iteration boundary before any implementation work. Besides carrying the
         // latest progress, this is the post-approval `awaiting_approval` → `running` transition.
         // Match sdk-executor's upward-only served iteration cap. A smaller or absent
@@ -3952,6 +3958,8 @@ export class CodexExecutor implements Executor {
         }
       : { authMode: "api_key" as const };
     let released: Awaited<ReturnType<WorkerClient["releaseCodex"]>>;
+    // issue #2213: no provider credential is fetched for an epoch that cannot start.
+    assertResidueQuarantineOpen("provider_turn");
     try {
       released = await this.opts.client.releaseCodex(
         ctx.runId,

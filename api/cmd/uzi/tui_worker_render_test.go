@@ -202,3 +202,30 @@ func TestWorkerRenderRailNameAndFoldBudget(t *testing.T) {
 		t.Fatal("worker row never charged to auto-fold budget")
 	}
 }
+
+// TestWorkerQuarantineRendersCauseThroughPlain (issue #2213): a quarantined worker shows the
+// state in the list and the detail view, and a hostile worker-reported cause (ESC sequences, a
+// bidi override, newlines, an oversized body) reaches the screen only through renderer.Plain.
+func TestWorkerQuarantineRendersCauseThroughPlain(t *testing.T) {
+	const hostile = "pid 4242 \x1b[31mred\x1b]0;title\x07 \u202eevil\nforged row\r\t"
+	for _, dark := range []bool{true, false} {
+		m := workerRenderModel(dark)
+		w := &m.workers.rows[0].w
+		at := time.Now().Add(-90 * time.Minute)
+		w.ResidueQuarantinedAt = &at
+		cause := hostile + strings.Repeat("x", 600)
+		w.ResidueQuarantineCause = &cause
+		m = step(m, tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+		detail := m.View().Content
+		assertNoRawControls(t, "worker detail", detail)
+		requireWorkerText(t, stripANSI(detail), "quarantined", "pid 4242", "claims nothing until the worker container restarts")
+		if strings.Contains(stripANSI(detail), "forged row\n") {
+			t.Fatalf("a newline in the cause forged a row:\n%s", detail)
+		}
+		m.view = viewWorkers
+		m.workers.cursor = 0
+		list := m.renderWorkers()
+		assertNoRawControls(t, "worker list", list)
+		requireWorkerText(t, stripANSI(list), "quarantined")
+	}
+}

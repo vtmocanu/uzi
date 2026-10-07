@@ -30,6 +30,7 @@ import { makeFakeProcRoot, plantUnreadableUnattributed, scopedRealView, withQuie
 import { HERMETIC_VIEW, restoreHermeticView } from "./setup/hermetic-proc.js";
 import { listenUnix, shortUnixSocket } from "./unix-socket.js";
 import { REAL_PROCFS_DENIED, realProcfsSkip } from "./real-procfs.js";
+import { latchResidueQuarantine } from "../src/residue-quarantine.js";
 import { nullLogger, recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import {
   api,
@@ -40,6 +41,7 @@ import {
   gitlabClaim,
   homeDir,
   installHarness,
+  plantAfterFetch,
   runnerWith,
   simulateCommittedWork,
 } from "./runner-harness.js";
@@ -761,7 +763,9 @@ describe("issue #1783 hermetic: an unreadable_unattributed process on a fake pro
   /** Run `fn` with a fake proc root holding one unreadable, unattributed same-uid process. */
   function withUnreadable<T>(fn: () => Promise<T>): Promise<T> {
     const root = makeFakeProcRoot();
-    plantUnreadableUnattributed(root, 4242);
+    // issue #2213: planted right after the run's clone fetch: the worker-wide pre-fetch check would
+    // otherwise refuse the run before any of the later proof sites this suite exercises.
+    plantAfterFetch(() => plantUnreadableUnattributed(root, 4242));
     return withQuiescenceView({ procRoot: root }, fn, FILE_VIEW).finally(() => fs.rmSync(root, { recursive: true, force: true }));
   }
 
@@ -1209,6 +1213,29 @@ describe("issue #1783 M2 review: the predecessor release warning names what actu
     const warn = lines.find((l) => ((l as { msg?: string }).msg ?? "").startsWith("predecessor attempt release"));
     assert.equal((warn as { msg?: string } | undefined)?.msg, "predecessor attempt release failed at the ledger append; journal kept");
     assert.equal(readJournal(iid)?.clonePath, pred.clonePath, "the journal IS kept, as the warning says");
+    assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "live", "no release recorded");
+  });
+
+  it("issue #2213: a latched worker keeps the verified predecessor's journal (the in-place release is gated)", async () => {
+    const iid = 2094;
+    const runId = randomUUID();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    const { runner, git: rg } = restartedWorker(transientFactory().factory, {});
+    const seam = rg as unknown as { releaseAttemptInPlace: (...a: unknown[]) => Promise<void> };
+    const releases: unknown[][] = [];
+    const real = seam.releaseAttemptInPlace.bind(rg);
+    seam.releaseAttemptInPlace = async (...a: unknown[]) => {
+      releases.push(a);
+      return real(...a);
+    };
+    // The latch lands after the capture verified (as the run's park report goes out, before the finally).
+    api.onState(runId, (body) => {
+      if (body.status !== "running") latchResidueQuarantine({ cause: "c", runId, site: "terminal_drive" }, nullLogger());
+    });
+    await runner.execute(gitlabClaim(iid, { run_id: runId, session_id: randomUUID() }));
+    assert.ok(trackingHas(iid, "ONLY_COPY.txt"), "the capture itself verified");
+    assert.deepEqual(releases, [], "no in-place release ran while latched");
+    assert.equal(readJournal(iid)?.clonePath, pred.clonePath, "the journal is kept");
     assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "live", "no release recorded");
   });
 

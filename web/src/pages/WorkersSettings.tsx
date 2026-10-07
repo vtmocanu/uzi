@@ -17,6 +17,7 @@ import { HostedWorkers } from "../components/HostedWorkers";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerPendingOutcomeBadge } from "../components/WorkerPendingOutcomeBadge";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
+import { WorkerQuarantineBadge } from "../components/WorkerQuarantineBadge";
 import { WorkerLeaseBadge } from "../components/WorkerLeaseBadge";
 import { WorkerCustodyBadge } from "../components/WorkerCustodyBadge";
 import { RecoveryHoldsSurface } from "../components/RecoveryHoldsSurface";
@@ -718,6 +719,7 @@ export function WorkersSettings() {
                         {w.status}
                       </Badge>
                       <WorkerCordonBadge worker={w} />
+                      <WorkerQuarantineBadge worker={w} />
                       <WorkerRunBadge worker={w} />
                       <WorkerPendingOutcomeBadge worker={w} />
                       <WorkerCustodyBadge worker={w} />
