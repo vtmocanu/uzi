@@ -2,7 +2,6 @@ package runkind
 
 import (
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -68,8 +67,11 @@ func TestCrossCheckLaneSQLExclusionParity(t *testing.T) {
 		known[d.file+"/"+d.name] = d
 	}
 	seen := map[string]bool{}
-	for _, file := range []string{"runtime", "credential_disabled"} {
-		raw, err := os.ReadFile(filepath.Join("..", "store", "queries", file+".sql"))
+	for file, path := range map[string]string{
+		"runtime":             "../store/queries/runtime.sql",
+		"credential_disabled": "../store/queries/credential_disabled.sql",
+	} {
+		raw, err := os.ReadFile(path) // #nosec G304 -- fixed repository query paths above
 		if err != nil {
 			t.Fatal(err)
 		}

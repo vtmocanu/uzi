@@ -204,7 +204,7 @@ func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Querie
 		}
 		return store.Run{}, false, err
 	}
-	if run.ID != uuid.UUID(reread.EphemeralRunID.Bytes) && !(run.CrossCheckLane && run.TargetRunID == reread.EphemeralRunID) {
+	if run.ID != uuid.UUID(reread.EphemeralRunID.Bytes) && (!run.CrossCheckLane || run.TargetRunID != reread.EphemeralRunID) {
 		if s.leaseClaimWindow != nil {
 			s.leaseClaimWindow()
 		}

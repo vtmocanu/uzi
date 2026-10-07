@@ -41,7 +41,12 @@ func TestPlanCrossCheckPersistentProvisioningMirrorsLiveDB(t *testing.T) {
 					mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET plan_cross_check_required=true,harness='codex' WHERE id=$1`, runID)
 				case "cross_check child":
 					leadID := fx.queuedRun()
-					mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET status='running' WHERE id=$1`, leadID)
+					mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET status='running',claim_generation=1 WHERE id=$1`, leadID)
+					mustExec(fx.ctx, t, fx.pool, `INSERT INTO cross_checks
+     (id,lead_run_id,checker_run_id,stage,round,lead_claim_generation,
+      plan_md,milestones,size_class,base_commit,candidate_digest,checker_harness,deadline_at)
+     VALUES ($1,$2,$3,'plan',1,1,'plan','[]'::jsonb,'s',repeat('a',40),
+      $4,'codex',now()+interval '5 minutes')`, uuid.New(), leadID, runID, []byte("test-digest"))
 					mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET kind='cross_check',issue_iid=NULL,target_run_id=$2,
 						harness='codex',report_only=true,budget_wall_seconds=1800 WHERE id=$1`, runID, leadID)
 				}
@@ -113,14 +118,18 @@ func TestPlanCrossCheckReleasedWorkerPlacementLiveDB(t *testing.T) {
 			releasedCaps := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}
 			mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET protocol_capabilities=$2 WHERE id=$1`, workerID, releasedCaps)
 			countParams := store.CountOnlineWorkersClaimableForRunParams{RunID: runID,
-				HeartbeatCutoff: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true}}
+				CrossCheckEvaluatedAt:    planCrossCheckTime(time.Now()),
+				CrossCheckAffinityCutoff: planCrossCheckTime(time.Now().Add(-2 * time.Minute)),
+				HeartbeatCutoff:          pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true}}
 			count, err := fx.q.CountOnlineWorkersClaimableForRun(fx.ctx, countParams)
 			if err != nil || count.Claimable != 0 {
 				t.Fatalf("released worker placement count=%d err=%v, want 0", count.Claimable, err)
 			}
 			params := store.ClaimRunParams{WorkerID: pgU(workerID), UserID: fx.userID,
-				AffinityCutoff:  pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Minute), Valid: true},
-				HeartbeatCutoff: countParams.HeartbeatCutoff, SpreadCutoff: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true},
+				CrossCheckEvaluatedAt:    countParams.CrossCheckEvaluatedAt,
+				CrossCheckAffinityCutoff: countParams.CrossCheckAffinityCutoff,
+				AffinityCutoff:           pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Minute), Valid: true},
+				HeartbeatCutoff:          countParams.HeartbeatCutoff, SpreadCutoff: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true},
 				WorkerProtocolCaps: releasedCaps, CapabilityAware: false}
 			if _, err := fx.q.ClaimRun(fx.ctx, params); !errors.Is(err, pgx.ErrNoRows) {
 				t.Fatalf("released worker claimed cross-check lane with ordinary capability matching off: %v", err)

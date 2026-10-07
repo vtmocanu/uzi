@@ -5565,7 +5565,7 @@ func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr sto
 		}
 		return store.Run{}, err
 	}
-	if laneMismatch(runID, run.EgressProfileID.Valid, wkr) {
+	if (run.Kind == "cross_check" && run.ClaimGeneration == 0) || laneMismatch(runID, run.EgressProfileID.Valid, wkr) {
 		return store.Run{}, ErrRunNotOwned
 	}
 	return run, nil

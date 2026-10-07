@@ -143,7 +143,7 @@ func TestCrossCheckLaneCompetingBodylessClaimsLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer held.Rollback(ctx)
+	defer func() { _ = held.Rollback(ctx) }()
 	if _, err := store.New(held).GetWorkerForUpdate(ctx, f.workerID); err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +322,7 @@ func TestCrossCheckLaneSnapshotBudgetLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(f.env.ctx)
+	defer func() { _ = tx.Rollback(f.env.ctx) }()
 	qtx := store.New(tx)
 	w := wkrRow(t, f.env, f.workerID)
 	applied, err := f.svc.ReplaceWorkerActiveRuns(f.env.ctx, qtx, w, snap, snapshotModeClaim)
