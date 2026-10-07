@@ -57,11 +57,13 @@ as history, without an automatic new checker round.
 When the worker cannot safely capture the planning diff it refuses, and the
 run parks at a human gate with reason `planning_diff_refused`. The refusal
 sub-code is shown with the gate reason, and only while that reason is
-current: the run page shows **Refusal: <label>**, `uzi run get` appends
-`(<sub code>)` to the `PLAN_CROSS_CHECK` row, and the Slack gate message
-carries it too. The worker log and feed line (`plan cross-check: planning
-diff refused (<refusal>: <diagnostic>)`) use a fixed vocabulary; raw helper
-stderr and filenames are never logged or shown.
+current: the run page shows `Refusal: <label>`, `uzi run get` appends the
+sub-code with underscores shown as spaces (for example
+`(unsupported entry)`) to the `PLAN_CROSS_CHECK` row, and the Slack gate
+message carries it the same way. The feed line
+(`plan cross-check: planning diff refused (<refusal>: <diagnostic>)`) and
+the worker log's `refusal` and `diagnostic` fields use a fixed vocabulary;
+raw helper stderr and filenames are never logged or shown.
 
 | Sub-code | Meaning |
 |----------|---------|
@@ -71,7 +73,7 @@ stderr and filenames are never logged or shown.
 | `too_many_untracked` | More untracked files than the capture allows. |
 | `secret_detected` | The secret scan flagged the diff. |
 | `scan_failed` | The secret scan could not complete. |
-| `unsupported_entry` | The tree holds a symlink or submodule the capture does not support. |
+| `unsupported_entry` | The worktree, index or base holds an entry the capture does not support: a changed or untracked symlink, any submodule, a special file (FIFO, socket, device), a non-directory where a directory was tracked, or an unsupported file mode. |
 
 An **unchanged tracked symlink** does not block the check: its raw link
 target is compared with the base blob and is never opened or followed.
@@ -88,15 +90,18 @@ Capture runs under two independent 128 MiB budgets: one for source reads
 (worktree compare reads and verified object reads) and one for the
 object-store snapshot copy, which is streamed in small chunks so cleanup can
 run on SIGTERM. The snapshot is a temporary tree on the worker's disk,
-removed when capture ends. On this repository the measured use was a 74.3 MiB
-snapshot (the temporary tree peaks near that size) and 99.7 MiB of source
-reads, in 6.6 s against a 28 s deadline.
+removed when capture ends. Measured once on a clone of the uzi repository
+(October 2026), capture used about a 74 MiB snapshot (the temporary tree
+peaks near that size) and about 100 MiB of source reads, in under 7 s
+against a 28 s deadline; a repository whose tracked text approaches
+128 MiB will refuse with `diff_too_large`.
 
 ### Rollout
 
 The refusal sub-code needs two phases, and nothing orders them
 automatically. Deploy the api and its migration first and confirm it is
-ready, then let the worker pin advance. An older api rejects
+ready, then let the worker pin advance (keep `workers.image.tag` at the
+previous release for the first deploy if the chart would move both). An older api rejects
 `unsupported_entry` from a newer worker. The chart's `Recreate` strategy
 orders pods within one Deployment only; it does not order the api against
 the controller or the worker pin.

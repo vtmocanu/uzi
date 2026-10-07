@@ -19,7 +19,7 @@ const reasons: Record<string, string> = {
 const diffRefusals: Record<string, string> = {
   base_unavailable: "Base unavailable", diff_failed: "Diff failed", diff_too_large: "Diff too large",
   too_many_untracked: "Too many untracked files", secret_detected: "Secret detected",
-  scan_failed: "Secret scan failed", unsupported_entry: "Unsupported entry (symlink or submodule change)",
+  scan_failed: "Secret scan failed", unsupported_entry: "Unsupported entry (symlink, submodule or special file)",
 };
 
 function diffRefusalLabel(code: unknown): string {

@@ -63,7 +63,7 @@ The lander retains the capable-host confinement merge gate against the PR head. 
 
 ## Planning-diff capture: symlinks, gitlinks and budgets (2026-10-07, #2410)
 
-Capture budgets are split: the object-store snapshot copy has its own 128 MiB budget, streamed in 16 KiB chunks that yield on a roughly 20 ms clock so SIGTERM cleanup runs inside the 2 s kill grace, and the source reads (worktree compares and verified object reads) keep a separate 128 MiB budget. Measured on this repository: snapshot 74.3 MiB, source 99.7 MiB, peak temporary tree near 74.3 MiB, wall 6.6 s against the 28 s deadline.
+Capture budgets are split: the object-store snapshot copy has its own 128 MiB budget, streamed in 16 KiB chunks that yield on a roughly 20 ms clock so SIGTERM cleanup runs inside the 2 s kill grace, and the source reads (worktree compares and verified object reads) keep a separate 128 MiB budget. Measured once during #2410 on a clone of this repository at 24f28b1d through a real TickSpawner: snapshot 74.3 MiB, source 99.7 MiB (about 78% of its budget, the tighter headroom), peak temporary tree near 74.3 MiB, wall 6.6 s against the 28 s deadline.
 
 Symlink posture: an unchanged tracked symlink is accepted by hashing its raw target against the base blob through a pinned parent descriptor; targets are never opened or followed. Added, removed, retargeted, file/link-swapped and untracked non-ignored symlinks refuse with `unsupported_entry`, and a symlinked `.gitignore` is treated as absent, as Git does.
 

@@ -2237,7 +2237,8 @@ optional `plan_cross_check_diff_refusal` and optional `plan_cross_check_summary`
 fields, or
 `uzi run get <id> --field plan_cross_check_required` for the run's snapshot.
 While the gate reason is `planning_diff_refused`, the `PLAN_CROSS_CHECK` row
-appends the refusal sub-code, e.g. `(unsupported_entry)`; see
+appends the refusal sub-code with underscores shown as spaces, e.g.
+`(unsupported entry)`; see
 [planning-diff refusals](./cross-check.md#planning-diff-refusals).
 A stored checker APPROVE and a current human gate can coexist: decide against
 the displayed gate revision, not historical findings. See

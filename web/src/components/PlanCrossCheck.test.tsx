@@ -133,7 +133,7 @@ describe("M1 plan cross-check outcomes at real sinks", () => {
 
 describe("planning-diff refusal sub-code", () => {
   it.each([
-    ["unsupported_entry", "Unsupported entry (symlink or submodule change)"],
+    ["unsupported_entry", "Unsupported entry (symlink, submodule or special file)"],
     ["diff_too_large", "Diff too large"],
     ["secret_detected", "Secret detected"],
     ["future_code", "Reason unavailable"],
