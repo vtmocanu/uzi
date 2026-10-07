@@ -950,8 +950,15 @@ export class RecoveryCoordinator {
         journals.every(r => typeof r.generation === "number" && r.generation > record.generation!) &&
         producers.every(laterContext);
     };
+    // An earlier generation whose own covering FINAL is acknowledged (the same rule inventoryCleanupState
+    // applies) already archived its heads durably, so its source journals no longer constrain this one.
+    const settledEarlier = new Set<number>();
+    for (const generation of new Set(sources.filter(r => r.inventoryGuarded && typeof r.generation === "number" &&
+        r.generation < record.generation!).map(r => r.generation!))) {
+      if (await this.cleanupStateOf(sources, generation) === "acknowledged") settledEarlier.add(generation);
+    }
     const sourceHeads = sources.filter(r => !r.coverageDigest &&
-      !(typeof r.generation === "number" && r.generation > record.generation!)).map(r => r.sourceSha);
+      !(typeof r.generation === "number" && (r.generation > record.generation! || settledEarlier.has(r.generation)))).map(r => r.sourceSha);
     // Later claims have their own holds. Only positive later-generation evidence can
     // exclude a retained head; unknown attribution still needs positive ancestry.
     const heads = [...new Set([...sourceHeads, ...clones.heads.filter(h => !laterHead(h))])];

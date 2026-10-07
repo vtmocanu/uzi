@@ -46,6 +46,33 @@ it("issue1924 a failed hold read stops pruning instead of reading as no open hol
   } finally { await f.close(); }
 });
 
+it("issue1924 an acknowledged older generation's source journal does not block a later FINAL", async () => {
+  const f = await fixture();
+  try {
+    f.state.closeOnRelease = true;
+    // Generation 5 archived its head H3 and was acknowledged; its unfrozen source journal stays on disk.
+    const H3 = "c".repeat(40);
+    f.state.ancestors.add(H3);
+    f.state.holdGeneration = 5; f.state.ownGeneration = 8;
+    const ctx5 = { ...f.context, generation: 5 };
+    f.state.candidates = [{ sha: H3, pinRef: "refs/owed/a", contexts: [structuredClone(ctx5)] }];
+    await f.coordinator.pin({ runId: "run-1", generation: 5, kind: "issue", branch: "task", sourceSha: H3, inventoryGuarded: true });
+    const rec5 = await f.coordinator.freezeInventory({ context: ctx5, currentSha: H3, defaultBranch: "main" });
+    assert.ok(rec5);
+    await f.capture(rec5);
+    assert.equal(await f.coordinator.inventoryCleanupState("run-1", 5), "acknowledged");
+    // The run resumed as generation 7 and rewrote H3 away; H3 stays durable via the generation-5 archive.
+    f.state.holdGeneration = 7; f.state.open = true; f.state.candidates = [];
+    await f.coordinator.pin({ runId: "run-1", generation: 7, kind: "issue", branch: "task", sourceSha: H, inventoryGuarded: true });
+    const rec7 = await f.coordinator.freezeInventory({ context: f.context, currentSha: H, defaultBranch: "main" });
+    assert.ok(rec7);
+    f.state.refused.set(H3, rec7.sourceSha); // the generation-7 archive does not contain H3
+    await f.capture(rec7);
+    assert.equal((await f.coordinator.inspect("run-1")).find(r => r.captureId === rec7.captureId)?.finalAcknowledged, true,
+      "an older generation whose own FINAL is acknowledged must not block this generation's FINAL");
+  } finally { await f.close(); }
+});
+
 it("review probe: unreadable guarded journal cannot prove its generation settled", async () => {
   const f = await fixture();
   try {
@@ -244,7 +271,7 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir()) {
     candidates: [{ sha: H, pinRef: "refs/owed/a", contexts: [structuredClone(context)] }] as OwedCandidate[],
     status: "failed", ownGeneration: 7, ownGuarded: true, feature: true, open: true, expires: "2099-01-01T00:00:00Z",
     ownershipError: undefined as Error | undefined,
-    loseAck: false, wrongAck: false, closeOnRelease: false, failProduce: false, now: 1000,
+    loseAck: false, wrongAck: false, closeOnRelease: false, holdGeneration: 7, ancestors: new Set<string>([H]), refused: new Map<string, string>(), failProduce: false, now: 1000,
     reserveError: undefined as Error | undefined,
     finalError: undefined as Error | undefined,
     oversized: false, cloneHeads: [] as string[], cloneReadable: true,
@@ -263,7 +290,7 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir()) {
       return { status: state.status, claim_generation: state.ownGeneration, inventory_guarded: state.ownGuarded };
     },
     listRecoveryHolds: async (runId = context.runId) => ({ run_id: runId, holds: state.open ? [{
-      hold_id: "hold-7", generation: 7, inventory_guarded: true, has_available_capture: false,
+      hold_id: "hold-7", generation: state.holdGeneration, inventory_guarded: true, has_available_capture: false,
     }] : [] }),
     reserveRecoveryCapture: async (_run: string, request: { idempotency_key: string }) => {
       reserves++;
@@ -296,13 +323,14 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir()) {
       if (state.finalError) throw state.finalError;
       if (state.loseAck) { state.open = false; throw new Error("ACK lost"); }
       if (state.closeOnRelease && !state.wrongAck) state.open = false; // opt-in: a real server closes the hold
-      return { run_id: state.wrongAck ? "other-run" : args[0], generation: 7, released: true, holds_released: 1 };
+      return { run_id: state.wrongAck ? "other-run" : args[0], generation: args[1] as number, released: true, holds_released: 1 };
     },
   };
   const git = {
     readInventoryCloneHeads: async () => state.cloneReadable
       ? ({ kind: "verified", heads: state.cloneHeads, clones: [], foreignOwners: [] }) : ({ kind: "unknown" }),
-    ancestry: async (_bare: string, head: string) => head === H ? "ancestor" : "unknown",
+    ancestry: async (_bare: string, head: string, target?: string) =>
+      state.ancestors.has(head) && state.refused.get(head) !== target ? "ancestor" : "unknown",
     enumerateOwedCandidates: async () => structuredClone(state.candidates),
     discoverOwedCandidates: async () => [{ context, candidates: structuredClone(state.candidates) }],
     resolveRecoveryBareDir: async () => context.barePath,
