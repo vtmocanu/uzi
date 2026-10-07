@@ -116,6 +116,14 @@ func TestPlanCrossCheckGateReasonPersistedOutcomeLiveDB(t *testing.T) {
 			req.PlanCrossCheckGateReason = nil
 			req.PlanCrossCheckRefusal, req.PlanCrossCheckDiffRefusal = "", ""
 			report(tc.want)
+			if tc.declaration == "planning_diff_refused" {
+				// A stale declaration outside the approval-race list retains the
+				// refused reason, so its sub-code must be retained with it.
+				stale := "revise"
+				req.PlanCrossCheckGateReason = &stale
+				report(tc.want)
+				req.PlanCrossCheckGateReason = nil
+			}
 			// A new human candidate clears the current reason, without deleting findings.
 			plan = "Review a revised human candidate"
 			presentation = uuid.New()
