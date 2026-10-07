@@ -742,9 +742,9 @@ func workerRecoveryDTO(r store.Run, limit int) *apitypes.WorkerRecoveryDTO {
 		return nil
 	}
 	used := r.RequeueCount - r.RequeueEpisodeBaseline
-	remaining := max(int64(0), int64(limit)-int64(used))
+	remaining := max(0, limit-int(used))
 	dto := &apitypes.WorkerRecoveryDTO{Episode: r.WorkerRecoveryEpisode,
-		AutomaticRequeueLimit: limit, EpisodeUsed: used, EpisodeRemaining: int32(remaining)}
+		AutomaticRequeueLimit: limit, EpisodeUsed: used, EpisodeRemaining: remaining}
 	if len(r.WorkerRecoveryEvidence) > 0 {
 		var evidence apitypes.WorkerRecoveryEvidenceDTO
 		if err := json.Unmarshal(r.WorkerRecoveryEvidence, &evidence); err != nil || strings.TrimSpace(string(r.WorkerRecoveryEvidence)) == "null" {

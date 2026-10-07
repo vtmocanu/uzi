@@ -335,7 +335,7 @@ func TestRecoveryTerminalParentOwnershipLiveDB(t *testing.T) {
 					wantChild, wantVerdict, wantBank = "cancelled", "failed", 25
 				case "approve", "failed":
 					wantVerdict = state
-				case "parent fence", "frozen parent fence":
+				case "released", "parent fence", "frozen parent fence":
 					wantLeadStatus = "running"
 				}
 				if child != wantChild || verdict != wantVerdict || leadStatus != wantLeadStatus || bank != wantBank {

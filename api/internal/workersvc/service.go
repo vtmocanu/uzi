@@ -2319,11 +2319,12 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 			return nil
 		}
 		failed, err := q.FailAttestedFinalizeRunsOverCap(ctx, store.FailAttestedFinalizeRunsOverCapParams{
-			FailureReason:    failParams.FailureReason,
-			WorkerID:         pgconv.UUID(wkr.ID),
-			MaxRequeues:      max,
-			RunIds:           finalize.ids,
-			ClaimGenerations: finalize.generations,
+			ReleasedWorkerNonceOverride: failParams.ReleasedWorkerNonceOverride,
+			FailureReason:               failParams.FailureReason,
+			WorkerID:                    pgconv.UUID(wkr.ID),
+			MaxRequeues:                 max,
+			RunIds:                      finalize.ids,
+			ClaimGenerations:            finalize.generations,
 		})
 		if err != nil {
 			return err
@@ -2350,6 +2351,11 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	// Tx-less degraded path: no pool wired (fake-store unit tests). No worker-row lock and no
 	// snapshot persist; still rotates the nonce and resets the epoch via RegisterWorker.
 	if s.txBeginner == nil {
+		prior, err := s.q.GetWorkerByID(ctx, wkr.ID)
+		if err != nil {
+			return store.Worker{}, "", err
+		}
+		failParams.ReleasedWorkerNonceOverride = &prior.SnapshotRegisterNonce
 		row, err := s.q.RegisterWorker(ctx, regParams)
 		if err != nil {
 			return store.Worker{}, "", err
@@ -2383,9 +2389,11 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	qtx := store.New(tx)
 	// (a) Lock the worker row FOR UPDATE — the canonical order that serialises Register against
 	// a concurrent heartbeat and the stale-worker passes (both of which lock the worker row).
-	if _, err := qtx.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
+	prior, err := qtx.GetWorkerForUpdate(ctx, wkr.ID)
+	if err != nil {
 		return store.Worker{}, "", err
 	}
+	failParams.ReleasedWorkerNonceOverride = &prior.SnapshotRegisterNonce
 	// (b) Rotate the nonce + reset the epoch (folded into RegisterWorker's update).
 	row, err := qtx.RegisterWorker(ctx, regParams)
 	if err != nil {
@@ -2417,12 +2425,13 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 		}
 	}
 	finalizeFailed, finalizeRequeued, finalizeAllowance, err = s.runFrozenAttested(ctx, qtx, row.ID, max,
-		store.FrozenFailWorkerRunsOverCapParams{FailureReason: failParams.FailureReason}, finalize, finalizeOK, locks)
+		store.FrozenFailWorkerRunsOverCapParams{FailureReason: failParams.FailureReason, ReleasedWorkerNonceOverride: failParams.ReleasedWorkerNonceOverride}, finalize, finalizeOK, locks)
 	if err != nil {
 		return store.Worker{}, "", err
 	}
 	orphanFailed, err := qtx.FrozenFailWorkerRunsOverCap(ctx, store.FrozenFailWorkerRunsOverCapParams{
-		FailureReason: failParams.FailureReason, WorkerID: failParams.WorkerID, MaxRequeues: max,
+		ReleasedWorkerNonceOverride: failParams.ReleasedWorkerNonceOverride,
+		FailureReason:               failParams.FailureReason, WorkerID: failParams.WorkerID, MaxRequeues: max,
 		FrozenTargets: frozen, LockedParentIds: parents,
 	})
 	if err != nil {

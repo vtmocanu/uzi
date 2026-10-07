@@ -185,49 +185,81 @@ const rejectionExplanation = "terminal record rejected after restart (MAC failur
 func TestTerminalRejectionWorkerLostWritersLiveDB(t *testing.T) {
 	for _, writer := range []string{"stale", "register", "attested", "snapshot"} {
 		for _, scope := range []string{"exact", "foreign", "history"} {
-			t.Run(writer+"/"+scope, func(t *testing.T) {
-				e := newSettleEnv(t)
-				e.wsvc.SetTxBeginner(e.pool)
-				e.exec("UPDATE runs SET status='running', claim_generation=1, requeue_count=2, claim_released_at=NULL, status_since=now()-interval '1 hour', started_at=now() WHERE id=$1", e.run)
-				generation := int64(1)
-				token := e.tokenA
-				if scope == "foreign" {
-					token = e.tokenB
-				}
-				if scope == "history" {
-					generation = 2
-				}
-				rec := rejectionHTTP(e, http.MethodPost, "/api/worker/terminal-rejections", token, fmt.Sprintf(`{"rejections":[{"run_id":"%s","claim_generation":%d,"reason":"mac_failure"}]}`, e.run, generation))
-				assertRejectionDisposition(t, rec, e.run, generation, "recorded")
-				q := store.New(e.pool)
-				generic := pgconv.TextOrNull("generic worker lost")
-				var err error
-				switch writer {
-				case "stale":
-					e.exec("UPDATE workers SET last_heartbeat_at=now()-interval '2 hours' WHERE id=$1", e.workerA)
-					_, err = q.FailRunsOfStaleWorkersOverCap(e.ctx, store.FailRunsOfStaleWorkersOverCapParams{FailureReason: generic, MaxRequeues: 2, FailCutoff: pgconv.Time(time.Now().Add(-time.Hour))})
-				case "register":
-					_, err = q.FailWorkerRunsOverCap(e.ctx, store.FailWorkerRunsOverCapParams{FailureReason: generic, WorkerID: pgconv.UUID(e.workerA), MaxRequeues: 2})
-				case "attested":
-					_, err = q.FailAttestedFinalizeRunsOverCap(e.ctx, store.FailAttestedFinalizeRunsOverCapParams{FailureReason: generic, WorkerID: pgconv.UUID(e.workerA), MaxRequeues: 0, RunIds: []uuid.UUID{e.run}, ClaimGenerations: []int64{1}})
-				case "snapshot":
-					_, err = q.FailRunsMissingFromSnapshot(e.ctx, store.FailRunsMissingFromSnapshotParams{FailureReason: generic, WorkerID: pgconv.UUID(e.workerA), MaxRequeues: 2, MissingCutoff: pgconv.Time(time.Now()), Now: pgconv.Time(time.Now()), GlobalTimeoutSeconds: 7200})
-				}
-				if err != nil {
-					t.Fatal(err)
-				}
-				var status, origin, reason string
-				if err := e.pool.QueryRow(e.ctx, "SELECT status,fail_origin,failure_reason FROM runs WHERE id=$1", e.run).Scan(&status, &origin, &reason); err != nil {
-					t.Fatal(err)
-				}
-				want := "generic worker lost"
-				if scope == "exact" {
-					want = rejectionExplanation
-				}
-				if status != "failed" || origin != "worker_lost" || reason != want {
-					t.Fatalf("run %s %s %q want failed worker_lost %q", status, origin, reason, want)
-				}
-			})
+			for _, custodyState := range []string{"open", "released", "discarded"} {
+				t.Run(writer+"/"+scope+"/"+custodyState, func(t *testing.T) {
+					e := newSettleEnv(t)
+					e.wsvc.SetTxBeginner(e.pool)
+					e.exec("UPDATE runs SET status='running', claim_generation=1, requeue_count=2, claim_released_at=NULL, status_since=now()-interval '1 hour', started_at=now() WHERE id=$1", e.run)
+					generation := int64(1)
+					token := e.tokenA
+					if scope == "foreign" {
+						token = e.tokenB
+					}
+					if scope == "history" {
+						generation = 2
+					}
+					rec := rejectionHTTP(e, http.MethodPost, "/api/worker/terminal-rejections", token, fmt.Sprintf(`{"rejections":[{"run_id":"%s","claim_generation":%d,"reason":"mac_failure"}]}`, e.run, generation))
+					assertRejectionDisposition(t, rec, e.run, generation, "recorded")
+					// Settled fixtures model explicit historical source settlement; retain all rows and diagnostics.
+					if custodyState != "open" {
+						e.exec("UPDATE recovery_custody_holds SET state=$2,live_worker_id=NULL,live_run_id=NULL WHERE run_id=$1 AND user_id=$3", e.run, custodyState, e.user)
+					}
+					var custodyBefore string
+					if err := e.pool.QueryRow(e.ctx, "SELECT jsonb_agg(to_jsonb(h) ORDER BY id)::text FROM recovery_custody_holds h WHERE run_id=$1", e.run).Scan(&custodyBefore); err != nil {
+						t.Fatal(err)
+					}
+					q := store.New(e.pool)
+					generic := pgconv.TextOrNull("generic worker lost")
+					var err error
+					switch writer {
+					case "stale":
+						e.exec("UPDATE workers SET last_heartbeat_at=now()-interval '2 hours' WHERE id=$1", e.workerA)
+						_, err = q.FailRunsOfStaleWorkersOverCap(e.ctx, store.FailRunsOfStaleWorkersOverCapParams{FailureReason: generic, MaxRequeues: 2, FailCutoff: pgconv.Time(time.Now().Add(-time.Hour))})
+					case "register":
+						_, err = q.FailWorkerRunsOverCap(e.ctx, store.FailWorkerRunsOverCapParams{FailureReason: generic, WorkerID: pgconv.UUID(e.workerA), MaxRequeues: 2})
+					case "attested":
+						_, err = q.FailAttestedFinalizeRunsOverCap(e.ctx, store.FailAttestedFinalizeRunsOverCapParams{FailureReason: generic, WorkerID: pgconv.UUID(e.workerA), MaxRequeues: 0, RunIds: []uuid.UUID{e.run}, ClaimGenerations: []int64{1}})
+					case "snapshot":
+						_, err = q.FailRunsMissingFromSnapshot(e.ctx, store.FailRunsMissingFromSnapshotParams{FailureReason: generic, WorkerID: pgconv.UUID(e.workerA), MaxRequeues: 2, MissingCutoff: pgconv.Time(time.Now()), Now: pgconv.Time(time.Now()), GlobalTimeoutSeconds: 7200})
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					var custodyAfter string
+					if err := e.pool.QueryRow(e.ctx, "SELECT jsonb_agg(to_jsonb(h) ORDER BY id)::text FROM recovery_custody_holds h WHERE run_id=$1", e.run).Scan(&custodyAfter); err != nil {
+						t.Fatal(err)
+					}
+					if custodyBefore != custodyAfter {
+						t.Fatalf("writer changed source custody or diagnostic provenance: before=%s after=%s", custodyBefore, custodyAfter)
+					}
+					if custodyState == "open" {
+						rejectionAssertPark(t, e)
+						e.assertOpen(e.pred, e.sibGen, e.sibWork)
+						return
+					}
+					var status, origin, reason string
+					if err := e.pool.QueryRow(e.ctx, "SELECT status,fail_origin,failure_reason FROM runs WHERE id=$1", e.run).Scan(&status, &origin, &reason); err != nil {
+						t.Fatal(err)
+					}
+					want := "generic worker lost"
+					if scope == "exact" {
+						want = rejectionExplanation
+					}
+					var absent bool
+					if err := e.pool.QueryRow(e.ctx, `SELECT finished_at IS NOT NULL
+					AND NOT (worker_recovery_evidence->>'custody_uncertain')::boolean
+					AND NOT (worker_recovery_evidence->>'unknown')::boolean
+					AND checkpoint_tip IS NULL
+					AND NOT EXISTS(SELECT 1 FROM recovery_captures WHERE run_id=r.id)
+					AND NOT EXISTS(SELECT 1 FROM checkpoint_publish_attempts WHERE run_id=r.id)
+					FROM runs r WHERE id=$1`, e.run).Scan(&absent); err != nil || !absent {
+						t.Fatalf("fallback absence not established: %t %v", absent, err)
+					}
+					if status != "failed" || origin != "worker_lost" || reason != want {
+						t.Fatalf("run %s %s %q want failed worker_lost %q", status, origin, reason, want)
+					}
+				})
+			}
 		}
 	}
 }

@@ -338,6 +338,7 @@ type fakeStore struct {
 	// PRD #46 judge: enqueue funnel + trace/review authz + review upsert.
 	runByIDPlain      store.Run // GetRunByID (non-user-scoped): swept-run reload + trace target
 	runByIDPlainErr   error
+	runByIDPlainCalls int
 	userByID          store.User
 	userByIDErr       error
 	createdJudgeRun   *store.CreateJudgeRunParams
@@ -1416,6 +1417,7 @@ func (f *fakeStore) GetRunByIDForUser(context.Context, store.GetRunByIDForUserPa
 
 // PRD #46 judge: enqueue funnel + trace/review.
 func (f *fakeStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
+	f.runByIDPlainCalls++
 	return f.runByIDPlain, f.runByIDPlainErr
 }
 func (f *fakeStore) GetUserByID(context.Context, uuid.UUID) (store.User, error) {

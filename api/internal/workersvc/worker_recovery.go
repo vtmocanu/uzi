@@ -89,7 +89,8 @@ func (s *Service) runFrozenAttested(ctx context.Context, qtx *store.Queries, wor
 		return nil, nil, 0, nil
 	}
 	failed, err := qtx.FrozenFailAttestedFinalizeRunsOverCap(ctx, store.FrozenFailAttestedFinalizeRunsOverCapParams{
-		FailureReason: reason.FailureReason, WorkerID: pgconv.UUID(workerID), MaxRequeues: max,
+		ReleasedWorkerNonceOverride: reason.ReleasedWorkerNonceOverride,
+		FailureReason:               reason.FailureReason, WorkerID: pgconv.UUID(workerID), MaxRequeues: max,
 		RunIds: finalize.ids, ClaimGenerations: finalize.generations, FrozenTargets: frozen, LockedParentIds: parents,
 	})
 	if err != nil {

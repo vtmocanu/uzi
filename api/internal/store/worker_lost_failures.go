@@ -48,7 +48,7 @@ func (q *Queries) FailRunsOfStaleWorkersOverCap(ctx context.Context, arg FailRun
 		if err != nil {
 			return nil, err
 		}
-		evidence, err := qtx.classifyWorkerExhaustion(ctx, ids)
+		evidence, err := qtx.classifyWorkerExhaustion(ctx, ids, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -57,9 +57,11 @@ func (q *Queries) FailRunsOfStaleWorkersOverCap(ctx context.Context, arg FailRun
 }
 
 type FailWorkerRunsOverCapParams struct {
-	FailureReason pgtype.Text `json:"failure_reason"`
-	WorkerID      pgtype.UUID `json:"worker_id"`
-	MaxRequeues   int32       `json:"max_requeues"`
+	// Nil means use the locked current incarnation; non-nil can capture a NULL nonce.
+	ReleasedWorkerNonceOverride *pgtype.Text `json:"-"`
+	FailureReason               pgtype.Text  `json:"failure_reason"`
+	WorkerID                    pgtype.UUID  `json:"worker_id"`
+	MaxRequeues                 int32        `json:"max_requeues"`
 }
 
 // FailWorkerRunsOverCap locks workers before runs and rechecks the failure predicate on a fresh snapshot.
@@ -74,7 +76,7 @@ func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsO
 		if err != nil {
 			return nil, err
 		}
-		evidence, err := qtx.classifyWorkerExhaustion(ctx, ids)
+		evidence, err := qtx.classifyWorkerExhaustion(ctx, ids, arg.ReleasedWorkerNonceOverride)
 		if err != nil {
 			return nil, err
 		}
@@ -84,7 +86,7 @@ func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsO
 		}
 		result := make([]WorkerRecoveryDisposition, 0, len(rows))
 		for _, row := range rows {
-			result = append(result, WorkerRecoveryDisposition{ID: row.ID, Status: row.Status})
+			result = append(result, WorkerRecoveryDisposition(row))
 		}
 		return result, nil
 
@@ -92,11 +94,13 @@ func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsO
 }
 
 type FailAttestedFinalizeRunsOverCapParams struct {
-	FailureReason    pgtype.Text `json:"failure_reason"`
-	WorkerID         pgtype.UUID `json:"worker_id"`
-	RunIds           []uuid.UUID `json:"run_ids"`
-	ClaimGenerations []int64     `json:"claim_generations"`
-	MaxRequeues      int32       `json:"max_requeues"`
+	// Nil means use the locked current incarnation; non-nil can capture a NULL nonce.
+	ReleasedWorkerNonceOverride *pgtype.Text `json:"-"`
+	FailureReason               pgtype.Text  `json:"failure_reason"`
+	WorkerID                    pgtype.UUID  `json:"worker_id"`
+	RunIds                      []uuid.UUID  `json:"run_ids"`
+	ClaimGenerations            []int64      `json:"claim_generations"`
+	MaxRequeues                 int32        `json:"max_requeues"`
 }
 
 // FailAttestedFinalizeRunsOverCap locks workers before runs and rechecks the failure predicate on a fresh snapshot.
@@ -111,7 +115,7 @@ func (q *Queries) FailAttestedFinalizeRunsOverCap(ctx context.Context, arg FailA
 		if err != nil {
 			return nil, err
 		}
-		evidence, err := qtx.classifyWorkerExhaustion(ctx, ids)
+		evidence, err := qtx.classifyWorkerExhaustion(ctx, ids, arg.ReleasedWorkerNonceOverride)
 		if err != nil {
 			return nil, err
 		}
@@ -121,7 +125,7 @@ func (q *Queries) FailAttestedFinalizeRunsOverCap(ctx context.Context, arg FailA
 		}
 		result := make([]WorkerRecoveryDisposition, 0, len(rows))
 		for _, row := range rows {
-			result = append(result, WorkerRecoveryDisposition{ID: row.ID, Status: row.Status})
+			result = append(result, WorkerRecoveryDisposition(row))
 		}
 		return result, nil
 
@@ -151,7 +155,7 @@ func (q *Queries) FailRunsMissingFromSnapshot(ctx context.Context, arg FailRunsM
 		if err != nil {
 			return nil, err
 		}
-		evidence, err := qtx.classifyWorkerExhaustion(ctx, ids)
+		evidence, err := qtx.classifyWorkerExhaustion(ctx, ids, nil)
 		if err != nil {
 			return nil, err
 		}

@@ -21,6 +21,9 @@ func TestRegisterPublishesActualExhaustionDisposition(t *testing.T) {
 			if got, ok := spy.statusFor(run); !ok || got != "recovery_wait" {
 				t.Fatalf("published %q,%v instead of actual park", got, ok)
 			}
+			if fs.runByIDPlainCalls != 0 {
+				t.Fatalf("park attempted %d judge reloads", fs.runByIDPlainCalls)
+			}
 			if fs.createdJudgeRun != nil {
 				t.Fatal("park was offered to the judge")
 			}

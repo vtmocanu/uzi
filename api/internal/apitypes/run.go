@@ -156,7 +156,7 @@ type WorkerRecoveryDTO struct {
 	Episode               int64                      `json:"episode"`
 	AutomaticRequeueLimit int                        `json:"automatic_requeue_limit"`
 	EpisodeUsed           int32                      `json:"episode_used"`
-	EpisodeRemaining      int32                      `json:"episode_remaining"`
+	EpisodeRemaining      int                        `json:"episode_remaining"`
 	Evidence              *WorkerRecoveryEvidenceDTO `json:"evidence"`
 }
 

@@ -138,6 +138,11 @@ func TestWorkerRecoveryResumeClaimEpisodesLiveDB(t *testing.T) {
 				if err != nil || unchanged.WorkerRecoveryEpisode != episode-1 {
 					t.Fatalf("foreign changed episode: %+v err=%v", unchanged, err)
 				}
+				exec("UPDATE runs SET status_since=now()-interval '2 minutes' WHERE id=$1", id)
+				heldBeforeResume, err := fx.q.GetRunByIDForUser(fx.ctx, store.GetRunByIDForUserParams{ID: id, UserID: fx.userID})
+				if err != nil {
+					t.Fatal(err)
+				}
 				rec := recoveryResumeRequest(h, id, fx.userID)
 				if rec.Code != http.StatusOK {
 					t.Fatalf("resume code=%d body=%s", rec.Code, rec.Body.String())
@@ -149,14 +154,14 @@ func TestWorkerRecoveryResumeClaimEpisodesLiveDB(t *testing.T) {
 					t.Fatal(err)
 				}
 				wr := body.Run.WorkerRecovery
-				if wr == nil || wr.Episode != episode || wr.AutomaticRequeueLimit != int(limit) || wr.EpisodeUsed != 0 || wr.EpisodeRemaining != limit || body.Run.RequeueCount != lifetime {
+				if wr == nil || wr.Episode != episode || wr.AutomaticRequeueLimit != int(limit) || wr.EpisodeUsed != 0 || wr.EpisodeRemaining != int(limit) || body.Run.RequeueCount != lifetime {
 					t.Fatalf("resume DTO=%+v lifetime=%d", wr, body.Run.RequeueCount)
 				}
 				resumed, err := fx.q.GetRunByIDForUser(fx.ctx, store.GetRunByIDForUserParams{ID: id, UserID: fx.userID})
 				if err != nil || resumed.Status != "queued" || resumed.RequeueEpisodeBaseline != lifetime || resumed.RecoveryWaitCause.Valid ||
 					len(resumed.WorkerRecoveryEvidence) != 0 || resumed.StaleRequeueGeneration.Valid || !resumed.ClaimReleasedAt.Valid ||
 					resumed.ClaimGeneration != generation || resumed.StartedAt != original.StartedAt || resumed.BudgetWallSeconds != original.BudgetWallSeconds ||
-					resumed.CheckpointTip.String != tip || resumed.IterationCount != 4 || resumed.BudgetPausedSeconds < original.BudgetPausedSeconds {
+					resumed.CheckpointTip.String != tip || resumed.IterationCount != 4 || (resumed.BudgetPausedSeconds-heldBeforeResume.BudgetPausedSeconds < 120 || resumed.BudgetPausedSeconds-heldBeforeResume.BudgetPausedSeconds > 125) {
 					t.Fatalf("resume invariants row=%+v err=%v", resumed, err)
 				}
 				var holdState, holdIdentity string

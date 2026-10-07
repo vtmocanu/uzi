@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // WorkerRecoveryDisposition records the actual committed mutation outcome.
@@ -28,8 +29,11 @@ type WorkerRecoveryEvidence struct {
 }
 
 type exhaustionDisposition struct {
-	Park     bool                   `json:"park"`
-	Evidence WorkerRecoveryEvidence `json:"evidence"`
+	// Server-only transient metadata; only Evidence is persisted on runs.
+	ReleaseNonceCaptured bool                   `json:"release_nonce_captured,omitempty"`
+	ReleasedWorkerNonce  *string                `json:"released_worker_nonce"`
+	Park                 bool                   `json:"park"`
+	Evidence             WorkerRecoveryEvidence `json:"evidence"`
 }
 
 var exhaustionCheckpointSHA = regexp.MustCompile("^[0-9a-f]{40}$")
@@ -38,11 +42,15 @@ var exhaustionCheckpointSHA = regexp.MustCompile("^[0-9a-f]{40}$")
 // completed its locks. A recoverable read/decode failure rolls back only that
 // savepoint and produces unknown observations for all targets. Rollback/commit
 // failures propagate: an unusable transaction must never look like a committed park.
-func (q *Queries) classifyWorkerExhaustion(ctx context.Context, ids []uuid.UUID) ([]byte, error) {
+func (q *Queries) classifyWorkerExhaustion(ctx context.Context, ids []uuid.UUID, nonceOverride *pgtype.Text) ([]byte, error) {
+	var releasedNonce *string
+	if nonceOverride != nil && nonceOverride.Valid {
+		releasedNonce = &nonceOverride.String
+	}
 	dispositions := make(map[string]exhaustionDisposition, len(ids))
 	recordedAt := time.Now().UTC()
 	for _, id := range ids {
-		dispositions[id.String()] = exhaustionDisposition{Park: true, Evidence: WorkerRecoveryEvidence{Unknown: true, RecordedAt: recordedAt}}
+		dispositions[id.String()] = exhaustionDisposition{ReleaseNonceCaptured: nonceOverride != nil, ReleasedWorkerNonce: releasedNonce, Park: true, Evidence: WorkerRecoveryEvidence{Unknown: true, RecordedAt: recordedAt}}
 	}
 	beginner, ok := q.db.(TxBeginner)
 	if !ok {
@@ -83,6 +91,7 @@ func (q *Queries) classifyWorkerExhaustion(ctx context.Context, ids []uuid.UUID)
 			evidence.CheckpointTip = &tip
 		}
 		dispositions[row.ID.String()] = exhaustionDisposition{
+			ReleaseNonceCaptured: nonceOverride != nil, ReleasedWorkerNonce: releasedNonce,
 			Park:     evidence.CheckpointTip != nil || evidence.AvailableCapture || evidence.PublicationUncertain || evidence.CaptureUncertain || evidence.CustodyUncertain || evidence.Unknown,
 			Evidence: evidence,
 		}

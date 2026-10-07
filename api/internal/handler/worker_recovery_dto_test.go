@@ -25,7 +25,7 @@ func TestWorkerRecoveryRunDTO(t *testing.T) {
 				RequeueEpisodeBaseline: tc.baseline}, "normal", 0, 0, 0, dtoTestNow, tc.limit)
 			wr := dto.WorkerRecovery
 			if wr == nil || wr.Episode != 2 || wr.AutomaticRequeueLimit != tc.limit ||
-				wr.EpisodeUsed != tc.used || wr.EpisodeRemaining != tc.remaining || dto.RequeueCount != tc.count {
+				wr.EpisodeUsed != tc.used || wr.EpisodeRemaining != int(tc.remaining) || dto.RequeueCount != tc.count {
 				t.Fatalf("recovery=%+v lifetime=%d", wr, dto.RequeueCount)
 			}
 			raw, err := json.Marshal(dto)

@@ -58,7 +58,7 @@ func (tx *exhaustionTestTx) Query(ctx context.Context, sql string, args ...any) 
 		case "read":
 			return nil, errors.New("injected exhaustion evidence reader failure")
 		case "sql":
-			_, err := tx.Tx.Exec(ctx, "SELECT 1/0")
+			_, err := tx.Exec(ctx, "SELECT 1/0")
 			return nil, err
 		case "connection":
 			if err := tx.Conn().Close(ctx); err != nil {

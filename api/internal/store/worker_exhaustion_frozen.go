@@ -8,11 +8,13 @@ import (
 )
 
 type FrozenFailWorkerRunsOverCapParams struct {
-	FailureReason   pgtype.Text `json:"failure_reason"`
-	WorkerID        pgtype.UUID `json:"worker_id"`
-	MaxRequeues     int32       `json:"max_requeues"`
-	FrozenTargets   []byte      `json:"frozen_targets"`
-	LockedParentIds []uuid.UUID `json:"locked_parent_ids"`
+	// Nil means use the locked current incarnation; non-nil can capture a NULL nonce.
+	ReleasedWorkerNonceOverride *pgtype.Text `json:"-"`
+	FailureReason               pgtype.Text  `json:"failure_reason"`
+	WorkerID                    pgtype.UUID  `json:"worker_id"`
+	MaxRequeues                 int32        `json:"max_requeues"`
+	FrozenTargets               []byte       `json:"frozen_targets"`
+	LockedParentIds             []uuid.UUID  `json:"locked_parent_ids"`
 }
 
 func (q *Queries) FrozenFailWorkerRunsOverCap(ctx context.Context, arg FrozenFailWorkerRunsOverCapParams) ([]WorkerRecoveryDisposition, error) {
@@ -21,7 +23,7 @@ func (q *Queries) FrozenFailWorkerRunsOverCap(ctx context.Context, arg FrozenFai
 		if err != nil {
 			return nil, err
 		}
-		evidence, err := qtx.classifyWorkerExhaustion(ctx, ids)
+		evidence, err := qtx.classifyWorkerExhaustion(ctx, ids, arg.ReleasedWorkerNonceOverride)
 		if err != nil {
 			return nil, err
 		}
@@ -31,7 +33,7 @@ func (q *Queries) FrozenFailWorkerRunsOverCap(ctx context.Context, arg FrozenFai
 		}
 		result := make([]WorkerRecoveryDisposition, 0, len(rows))
 		for _, row := range rows {
-			result = append(result, WorkerRecoveryDisposition{ID: row.ID, Status: row.Status})
+			result = append(result, WorkerRecoveryDisposition(row))
 		}
 		return result, nil
 
@@ -39,13 +41,15 @@ func (q *Queries) FrozenFailWorkerRunsOverCap(ctx context.Context, arg FrozenFai
 }
 
 type FrozenFailAttestedFinalizeRunsOverCapParams struct {
-	FailureReason    pgtype.Text `json:"failure_reason"`
-	WorkerID         pgtype.UUID `json:"worker_id"`
-	RunIds           []uuid.UUID `json:"run_ids"`
-	ClaimGenerations []int64     `json:"claim_generations"`
-	MaxRequeues      int32       `json:"max_requeues"`
-	FrozenTargets    []byte      `json:"frozen_targets"`
-	LockedParentIds  []uuid.UUID `json:"locked_parent_ids"`
+	// Nil means use the locked current incarnation; non-nil can capture a NULL nonce.
+	ReleasedWorkerNonceOverride *pgtype.Text `json:"-"`
+	FailureReason               pgtype.Text  `json:"failure_reason"`
+	WorkerID                    pgtype.UUID  `json:"worker_id"`
+	RunIds                      []uuid.UUID  `json:"run_ids"`
+	ClaimGenerations            []int64      `json:"claim_generations"`
+	MaxRequeues                 int32        `json:"max_requeues"`
+	FrozenTargets               []byte       `json:"frozen_targets"`
+	LockedParentIds             []uuid.UUID  `json:"locked_parent_ids"`
 }
 
 func (q *Queries) FrozenFailAttestedFinalizeRunsOverCap(ctx context.Context, arg FrozenFailAttestedFinalizeRunsOverCapParams) ([]WorkerRecoveryDisposition, error) {
@@ -54,7 +58,7 @@ func (q *Queries) FrozenFailAttestedFinalizeRunsOverCap(ctx context.Context, arg
 		if err != nil {
 			return nil, err
 		}
-		evidence, err := qtx.classifyWorkerExhaustion(ctx, ids)
+		evidence, err := qtx.classifyWorkerExhaustion(ctx, ids, arg.ReleasedWorkerNonceOverride)
 		if err != nil {
 			return nil, err
 		}
@@ -64,7 +68,7 @@ func (q *Queries) FrozenFailAttestedFinalizeRunsOverCap(ctx context.Context, arg
 		}
 		result := make([]WorkerRecoveryDisposition, 0, len(rows))
 		for _, row := range rows {
-			result = append(result, WorkerRecoveryDisposition{ID: row.ID, Status: row.Status})
+			result = append(result, WorkerRecoveryDisposition(row))
 		}
 		return result, nil
 
@@ -90,7 +94,7 @@ func (q *Queries) FrozenFailRunsMissingFromSnapshot(ctx context.Context, arg Fro
 		if err != nil {
 			return nil, err
 		}
-		evidence, err := qtx.classifyWorkerExhaustion(ctx, ids)
+		evidence, err := qtx.classifyWorkerExhaustion(ctx, ids, nil)
 		if err != nil {
 			return nil, err
 		}

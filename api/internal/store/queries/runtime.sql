@@ -5788,6 +5788,12 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     recovery_wait_cause = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'worker_requeue_exhausted' END,
+    -- Bank the old waiting interval before replacing status_since, only for a park.
+    budget_paused_seconds = runs.budget_paused_seconds
+        + CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true)
+                    AND runs.status IN ('awaiting_approval', 'awaiting_input')
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
+               ELSE 0 END,
     worker_recovery_evidence = @exhaustion_evidence::jsonb->runs.id::text->'evidence',
     recovery_retry_not_before = NULL, stale_requeue_generation = NULL,
     claim_released_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.claim_released_at END,
@@ -6091,11 +6097,21 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     recovery_wait_cause = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'worker_requeue_exhausted' END,
+    -- Bank the old waiting interval before replacing status_since, only for a park.
+    budget_paused_seconds = runs.budget_paused_seconds
+        + CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true)
+                    AND runs.status IN ('awaiting_approval', 'awaiting_input')
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
+               ELSE 0 END,
     worker_recovery_evidence = @exhaustion_evidence::jsonb->runs.id::text->'evidence',
     recovery_retry_not_before = NULL, stale_requeue_generation = NULL,
     claim_released_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.claim_released_at END,
     released_worker_id = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN runs.worker_id ELSE runs.released_worker_id END,
-    released_worker_nonce = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN (SELECT snapshot_register_nonce FROM workers WHERE id = runs.worker_id) ELSE runs.released_worker_nonce END,
+    released_worker_nonce = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN
+        CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'release_nonce_captured')::boolean, false)
+             THEN @exhaustion_evidence::jsonb->runs.id::text->>'released_worker_nonce'
+             ELSE (SELECT snapshot_register_nonce FROM workers WHERE id = runs.worker_id) END
+        ELSE runs.released_worker_nonce END,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
 FROM eligible_candidates candidate
@@ -6401,11 +6417,21 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     credential_switch_requested_at = NULL, credential_switch_generation = NULL,
     health = 'ok', health_reason = NULL, health_since = NULL,
     recovery_wait_cause = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'worker_requeue_exhausted' END,
+    -- Bank the old waiting interval before replacing status_since, only for a park.
+    budget_paused_seconds = runs.budget_paused_seconds
+        + CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true)
+                    AND runs.status IN ('awaiting_approval', 'awaiting_input')
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
+               ELSE 0 END,
     worker_recovery_evidence = @exhaustion_evidence::jsonb->runs.id::text->'evidence',
     recovery_retry_not_before = NULL, stale_requeue_generation = NULL,
     claim_released_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.claim_released_at END,
     released_worker_id = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN runs.worker_id ELSE runs.released_worker_id END,
-    released_worker_nonce = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN (SELECT snapshot_register_nonce FROM workers WHERE id = runs.worker_id) ELSE runs.released_worker_nonce END,
+    released_worker_nonce = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN
+        CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'release_nonce_captured')::boolean, false)
+             THEN @exhaustion_evidence::jsonb->runs.id::text->>'released_worker_nonce'
+             ELSE (SELECT snapshot_register_nonce FROM workers WHERE id = runs.worker_id) END
+        ELSE runs.released_worker_nonce END,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
 WHERE runs.worker_id = @worker_id
@@ -6979,6 +7005,12 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     credential_switch_requested_at = NULL, credential_switch_generation = NULL,
     health = 'ok', health_reason = NULL, health_since = NULL,
     recovery_wait_cause = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'worker_requeue_exhausted' END,
+    -- Bank the old waiting interval before replacing status_since, only for a park.
+    budget_paused_seconds = runs.budget_paused_seconds
+        + CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true)
+                    AND runs.status IN ('awaiting_approval', 'awaiting_input')
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
+               ELSE 0 END,
     worker_recovery_evidence = @exhaustion_evidence::jsonb->runs.id::text->'evidence',
     recovery_retry_not_before = NULL, stale_requeue_generation = NULL,
     claim_released_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.claim_released_at END,
