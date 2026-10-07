@@ -139,30 +139,30 @@ const CONFIG_CLAIM_RE = new RegExp(
  * (already-successful) save — never a rejection, exactly like the other two nudges;
  * the memory is stored either way and isError stays false.
  *
- * The discriminator (mirrors CONFIG_CLAIM_RE's discipline): fire ONLY when a
- * tool-ish token (ENV_TOOL) co-occurs with a presence/absence predicate
- * (ENV_PRESENCE) within a BOUNDED window — so bare tool-name prose ("openssl signs
- * the smoke-test cert") stays quiet. Like the other two nudges it is deliberately
- * warn-only/over-broad: plain prose such as "the feature is available" can trip it,
- * and that is acceptable — it never rejects.
+ * Only explicit command vocabulary, backtick identifiers, or identifiers directly
+ * cued by tool/binary/executable qualify. Require a direct copula + presence
+ * predicate, direct "on (the) PATH", or "absent: <tool>". Feature and technique
+ * prose stays quiet; unknown uncued bare names deliberately do not warn.
  *
- * COST COUPLING (same discipline as the other two): `body` is ≤ MEMORY_BODY_MAX_BYTES
- * (2048) by the early-return before this regex runs. The inter-token gap is a
- * BOUNDED `[\s\S]{0,20}` with no nested unbounded quantifier — the only `*` is the
- * simple char-class star in ENV_TOOL, linear in input — so the worst case is bounded
- * by the cap. Revisit if MEMORY_BODY_MAX_BYTES grows.
+ * COST COUPLING: saveMemory checks the 2048-byte MEMORY_BODY_MAX_BYTES cap before
+ * this regex runs. Identifier character classes cannot consume sentence-ending
+ * punctuation except dots within identifiers. Identifiers have at most four
+ * dot-separated segments of 1–32 characters each (131 characters total); grammar
+ * gaps contain only spaces and tabs and are capped at 20 characters. There are no
+ * arbitrary prose gaps or unbounded quantifiers. Revisit if the body cap grows.
  */
-// A tool-ish token: a backtick-wrapped identifier, or a bare lowercase
-// command-like word (openssl, jq, pg_isready).
-const ENV_TOOL = "(?:`[a-z][\\w.+-]*`|\\b[a-z][a-z0-9_+-]*\\b)";
-// Presence/absence predicate; negation ("not"/"isn't") and copula ("is")
-// live in the bounded gap, so the base word set stays small.
-const ENV_PRESENCE = "(?:absent|missing|unavailable|installed|available|present|on (?:the )?PATH)";
+const ENV_GAP = "[ \\t]{1,20}";
+const ENV_IDENTIFIER = "[a-z][\\w+-]{0,31}(?:\\.[\\w+-]{1,32}){0,3}";
+const ENV_COMMAND = "(?:openssl|jq|pg_isready|git|gh|curl|wget|node|nodejs|npm|npx|pnpm|yarn|bun|deno|python|python3|pip|pip3|go|gcc|g\\+\\+|cc|clang|make|cmake|bash|sh|zsh|fish|docker|podman|kubectl|helm|psql|sqlite3|redis-cli|rg|grep|sed|awk|tar|gzip|unzip|zip|ssh|scp|rsync|env|timeout|task|sqlc)";
+// Whole identifiers only: do not recognize jq inside unknown.jq or my-jq.
+const ENV_TOOL = "(?<![\\w.+`-])(?:`" + ENV_IDENTIFIER + "`|(?:tool|binary|executable)" +
+  ENV_GAP + "(?:`" + ENV_IDENTIFIER + "`|" + ENV_IDENTIFIER + ")|" + ENV_COMMAND + ")(?![\\w+`-]|\\.[\\w+-])";
+const ENV_PATH = "on" + ENV_GAP + "(?:the" + ENV_GAP + ")?PATH";
+const ENV_PRESENCE = "(?:absent|missing|unavailable|installed|available|present|" + ENV_PATH + ")";
+const ENV_COPULA = "(?:isn['’]t|is|was)(?:" + ENV_GAP + "not)?";
 const ENV_CAPABILITY_RE = new RegExp(
-  "(?:" +
-    ENV_TOOL + "[\\s\\S]{0,20}\\b" + ENV_PRESENCE + "\\b" +
-    "|\\b" + ENV_PRESENCE + "\\b[\\s\\S]{0,20}" + ENV_TOOL +
-  ")",
+  "(?:" + ENV_TOOL + ENV_GAP + "(?:" + ENV_COPULA + ENV_GAP + ENV_PRESENCE +
+    "|" + ENV_PATH + ")(?![\\w+-])|\\babsent:[ \\t]{0,20}" + ENV_TOOL + ")",
   "i",
 );
 

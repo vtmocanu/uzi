@@ -229,6 +229,134 @@ describe("save_memory handler (PRD #90 M2)", () => {
     }
   });
 
+  it("keeps technique, feature, and harness prose quiet while preserving the save and provenance", async () => {
+    for (const body of [
+      "The harness makes the fixture available before launching the gate",
+      "The test rig installs a fake tool before exercising the missing-file path",
+      "The feature is available after setup",
+      "the feature is available",
+      "the test rig is installed",
+      "the harness is missing a fixture",
+      "the technique is present in the guide",
+      "frobnicator is absent",
+      "openssl verifies that the feature is available",
+    ]) {
+      const { client, calls } = fakeClient();
+      const res = await handlers(client).saveMemory({ title: "  durable technique  ", body, basis: "observed", evidence: "  guide.md:7  " });
+      assert.notStrictEqual(res.isError, true);
+      assert.match(bodyText(res), /Saved cross-run memory/);
+      assert.deepStrictEqual(calls.saveMemory, [{
+        runId: "run-current",
+        body: { title: "durable technique", body, basis: "observed", evidence: "guide.md:7" },
+      }]);
+      assert.doesNotMatch(bodyText(res), /environment-capability facts change/i, body);
+    }
+  });
+
+  it("warns on direct claims, contractions, command vocabulary, and cued unknown identifiers without changing payloads", async () => {
+    for (const body of [
+      "jq isn't installed", "openssl isn’t available", "curl was present", "git was not missing",
+      "node is installed.", "docker on the PATH", "jq on PATH", "g++ is available", "absent: jq.",
+      "`custom.runner` is not installed", "tool frobnicator is absent",
+      "binary custom.runner was not available", "executable `custom.runner` isn’t on the PATH",
+      "absent: binary custom.runner",
+      "the feature is available. jq is absent",
+      "the harness is installed\n`custom.runner` is missing",
+      "jq" + " ".repeat(20) + "is" + "\t".repeat(20) + "installed",
+    ]) {
+      const { client, calls } = fakeClient();
+      const res = await handlers(client).saveMemory({ title: "claim", body, basis: "observed", evidence: "probe.txt:1" });
+      assert.notStrictEqual(res.isError, true, body);
+      assert.match(bodyText(res), /Saved cross-run memory/);
+      assert.match(bodyText(res), /environment-capability facts change/i, body);
+      assert.deepStrictEqual(calls.saveMemory, [{
+        runId: "run-current",
+        body: { title: "claim", body, basis: "observed", evidence: "probe.txt:1" },
+      }]);
+    }
+  });
+
+  it("does not bridge sentences, lines, extra tokens, oversized gaps, or identifier fragments", async () => {
+    for (const body of [
+      "jq. is absent", "jq! is absent", "jq? is absent", "jq\nis absent", "jq is\nabsent",
+      "`custom.runner`. is absent", "tool\nfrobnicator is absent",
+      "absent:\njq", "absent. jq", "installed: jq", "jq absent",
+      "jq is usually installed", "jq really is installed", "jq is not yet installed",
+      "tool the frobnicator is absent", "absent: custom.runner",
+      "custom.jq is absent", "my-jq is absent", "jq.extra is absent",
+      "jq" + " ".repeat(21) + "is absent", "jq is" + " ".repeat(21) + "absent",
+      "absent:" + " ".repeat(21) + "jq",
+      "`jq` " + "word ".repeat(100) + "is absent",
+    ]) {
+      const { client, calls } = fakeClient();
+      const res = await handlers(client).saveMemory({ title: "technique", body });
+      assert.notStrictEqual(res.isError, true, body);
+      assert.strictEqual(calls.saveMemory.length, 1, body);
+      assert.doesNotMatch(bodyText(res), /environment-capability facts change/i, body);
+    }
+  });
+
+  it("bounds identifiers to four segments of at most 32 characters without recognizing suffix fragments", async () => {
+    const segment = "a".repeat(32);
+    const longest = Array(4).fill(segment).join(".");
+    assert.strictEqual(longest.length, 131);
+    // Each fixture uses the public save handler; success still preserves provenance.
+    for (const [identifier, warns] of [
+      [segment, true],
+      ["a." + segment, true],
+      [longest, true],
+      ["a".repeat(33), false],
+      ["a." + "b".repeat(33), false],
+      ["a.a.a.a.a", false],
+      [longest + "a", false],
+      ["a".repeat(33) + ".jq", false],
+      ["a.a.a.a.jq", false],
+      ["a".repeat(33) + "-jq", false],
+      ["a".repeat(33) + "+jq", false],
+      ["a".repeat(33) + "jq", false],
+    ] as const) {
+      for (const body of [
+        "`" + identifier + "` is absent",
+        "tool " + identifier + " is absent",
+        "binary `" + identifier + "` is absent",
+        "absent: executable " + identifier,
+      ]) {
+        const { client, calls } = fakeClient();
+        const res = await handlers(client).saveMemory({ title: "claim", body, basis: "observed", evidence: "probe.txt:1" });
+        assert.notStrictEqual(res.isError, true, body);
+        assert.match(bodyText(res), /Saved cross-run memory/);
+        assert.deepStrictEqual(calls.saveMemory, [{
+          runId: "run-current",
+          body: { title: "claim", body, basis: "observed", evidence: "probe.txt:1" },
+        }]);
+        if (warns) assert.match(bodyText(res), /environment-capability facts change/i, body);
+        else assert.doesNotMatch(bodyText(res), /environment-capability facts change/i, body);
+      }
+      if (!warns) {
+        const body = identifier + " is absent";
+        const { client, calls } = fakeClient();
+        const res = await handlers(client).saveMemory({ title: "technique", body });
+        assert.notStrictEqual(res.isError, true, body);
+        assert.strictEqual(calls.saveMemory.length, 1, body);
+        assert.doesNotMatch(bodyText(res), /environment-capability facts change/i, body);
+      }
+    }
+  });
+
+  it("retains the 2048-byte body cap for environment claims", async () => {
+    const prefix = "`custom.runner` is absent ";
+    const body = prefix + "x".repeat(MEMORY_BODY_MAX_BYTES - Buffer.byteLength(prefix));
+    const { client, calls } = fakeClient();
+    const res = await handlers(client).saveMemory({ title: "claim", body });
+    assert.notStrictEqual(res.isError, true);
+    assert.match(bodyText(res), /environment-capability facts change/i);
+    assert.strictEqual(calls.saveMemory[0]!.body.body, body);
+    const rejected = await handlers(client).saveMemory({ title: "claim", body: body + "x" });
+    assert.strictEqual(rejected.isError, true);
+    assert.match(bodyText(rejected), /body is too long/);
+    assert.strictEqual(calls.saveMemory.length, 1);
+  });
+
   it("does NOT nudge tool-name-only prose with no presence/absence predicate (env-capability)", async () => {
     const negatives = [
       "openssl signs the smoke-test cert during e2e setup",
