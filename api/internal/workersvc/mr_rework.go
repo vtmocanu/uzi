@@ -83,8 +83,11 @@ func (s *Service) CreateAutoMRReworkRun(ctx context.Context, userID, repoID uuid
 // was only logged — a review finding, since a create that returned success with an
 // unadvanced ledger let the automatic watcher re-fire on the same comments (see
 // StartMRReworkForRun).
-func (s *Service) CreateManualMRReworkRun(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, snapshot *ReviewCommentsSnapshot, highWater int64) (store.Run, error) {
-	return s.createMRReworkRun(ctx, userID, repoID, ref, mrIID, sourceRunID, title, description, snapshot, "manual", &highWater)
+//
+// plan carries the ledger's pending_unknown_ids delta (issue #2347) that rides the same atomic
+// statement as the advance.
+func (s *Service) CreateManualMRReworkRun(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, snapshot *ReviewCommentsSnapshot, plan ReviewPlan) (store.Run, error) {
+	return s.createMRReworkRun(ctx, userID, repoID, ref, mrIID, sourceRunID, title, description, snapshot, "manual", &plan)
 }
 
 // createMRReworkRun is the shared body of the automatic and manual mr_rework create paths.
@@ -92,14 +95,14 @@ func (s *Service) CreateManualMRReworkRun(ctx context.Context, userID, repoID uu
 // the atomic INSERT … WHERE NOT EXISTS cross-kind guard, the 23505 mappings, the queued
 // notify) is identical, so the two paths cannot drift.
 //
-// highWater discriminates the two callers:
+// manual discriminates the two callers (its MaxActionableID is the high-water to advance to):
 //   - nil (automatic path): CreateAutoMRReworkRun, stamping trigger_source=triggerSource; the
 //     ledger is advanced separately by the poller's proceed step.
 //   - non-nil (manual path): CreateManualMRReworkRunAndAdvance, which stamps
 //     trigger_source='manual' in SQL AND folds the non-counting high-water advance
 //     (GREATEST(*highWater), halt_notified reset) into the SAME atomic statement, so the run
 //     and the ledger commit together or not at all. triggerSource is unused in this branch.
-func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, snapshot *ReviewCommentsSnapshot, triggerSource string, highWater *int64) (store.Run, error) {
+func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, snapshot *ReviewCommentsSnapshot, triggerSource string, manual *ReviewPlan) (store.Run, error) {
 	// Repo-ownership / existence check, mirroring createCIFixRun so an unknown repo is
 	// a clean ErrRepoNotFound rather than an FK error at INSERT.
 	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID}); err != nil {
@@ -162,7 +165,7 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 				return store.Run{}, ErrBranchInUse
 			}
 		}
-		if highWater == nil {
+		if manual == nil {
 			// Automatic path: the poller advances the ledger separately in its proceed step.
 			// PRD #1202: trigger_source is 'mr_rework' from the poller detector. kind stays
 			// 'mr_rework' either way; only trigger_source discriminates them (D7).
@@ -194,7 +197,9 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 			TargetRunID:      pgtype.UUID{Bytes: sourceRunID, Valid: true},
 			ReviewComments:   reviewJSON,
 			WaitOnLimit:      waitOnLimit,
-			HighWater:        *highWater,
+			HighWater:        manual.MaxActionableID,
+			PendingAdd:       nonNilIDs(manual.PendingAdd),
+			PendingRemove:    nonNilIDs(manual.PendingRemove),
 			// PRD #1429 M2 (D4): the inherited source-run harness, frozen in-tx.
 			Harness: string(resolved.Harness),
 		})
@@ -248,7 +253,20 @@ var (
 	ErrReworkMRNotOpen       = errors.New("the merge request is not open")
 	ErrReworkNoToken         = errors.New("add an Anthropic token first")
 	ErrReworkNothingNew      = errors.New("nothing to rework: no new review comments since the last cycle, and no guidance given")
+	// ErrReworkPermissionUnknown (issue #2347): there are new review comments, but none of
+	// their authors could be verified as having repository access yet (the forge lookup failed
+	// or ran out of time), and no guidance was given. Retrying later can succeed, which is what
+	// distinguishes it from ErrReworkNothingNew.
+	ErrReworkPermissionUnknown = errors.New("the new review comments are from authors whose repository access could not be verified yet; try again shortly, or give guidance")
 )
+
+// nonNilIDs makes a nil id slice an empty one so the pgx array parameter is never NULL.
+func nonNilIDs(ids []int64) []int64 {
+	if ids == nil {
+		return []int64{}
+	}
+	return ids
+}
 
 // StartMRReworkForRun mints an ON-DEMAND mr_rework run for a completed run's still-open MR,
 // past the automatic cap, with optional owner guidance (PRD #1202). It OWNS the run-state
@@ -264,8 +282,9 @@ var (
 // CreateManualMRReworkRun. The admin
 // kill-switch is enforced by the handler (the settings cache is out of workersvc's reach).
 //
-// snapshot is the FULL MR review-comment snapshot the handler read from the forge (nil is
-// fine — a guidance-only trigger still proceeds). On success it advances the consumed
+// res is the finished author assessment of the MR's review comments the handler built from
+// the forge (nil is fine — a guidance-only trigger still proceeds). Its snapshot carries
+// ELIGIBLE comments only (issue #2347). On success it advances the consumed
 // high-water WITHOUT spending an automatic cycle (GREATEST/advance-only, attempt_count
 // untouched) and resets the halt latch (halt_notified→false, unconditional even on a
 // guidance-only cycle) — Decision 1/9 — so the automatic watcher never re-fires on the same
@@ -278,7 +297,7 @@ var (
 // that let the automatic watcher fire a DUPLICATE cycle on the same comments once the manual
 // run went terminal. Folding them into one statement closes that window (the review finding
 // this hardening addresses).
-func (s *Service) StartMRReworkForRun(ctx context.Context, userID, runID uuid.UUID, guidance string, snapshot *ReviewCommentsSnapshot) (store.Run, error) {
+func (s *Service) StartMRReworkForRun(ctx context.Context, userID, runID uuid.UUID, guidance string, res *ReviewSnapshotResult) (store.Run, error) {
 	// Owner-scoped read — never trust a handler-supplied row. A foreign/missing run is
 	// ErrRunNotFound, which the handler maps to 404 (never 403).
 	run, err := s.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: userID})
@@ -343,22 +362,23 @@ func (s *Service) StartMRReworkForRun(ctx context.Context, userID, runID uuid.UU
 		return store.Run{}, fmt.Errorf("read mr_rework ledger: %w", err)
 	}
 
-	// maxActionableID over the snapshot, computed EXACTLY as the detector does
-	// (mr_review_watch.go): only an actionable kept comment counts, 0 when the snapshot is
-	// nil/empty. isNew is the "there is something the automatic watcher would fire on" test.
-	var maxActionableID int64
-	if snapshot != nil {
-		for _, c := range snapshot.Comments {
-			if IsActionableReviewComment(c) && c.ID > maxActionableID {
-				maxActionableID = c.ID
-			}
-		}
+	// What the assessed snapshot means for this ledger row, computed EXACTLY as the detector
+	// does (ReviewSnapshotResult.Plan): only an eligible actionable comment counts, and
+	// plan.HasNew is the "there is something the automatic watcher would fire on" test.
+	var snapshot *ReviewCommentsSnapshot
+	var plan ReviewPlan
+	if res != nil {
+		snapshot = res.Snapshot
+		plan = res.Plan(led.HighWater, led.PendingUnknownIds)
 	}
-	isNew := maxActionableID > led.HighWater
 
-	// A bare trigger with nothing new and no guidance is refused — there is nothing to do
-	// (Decision 3: guidance alone is a valid trigger).
-	if !isNew && strings.TrimSpace(guidance) == "" {
+	// A bare trigger with nothing new and no guidance is refused: there is nothing to do
+	// (Decision 3: guidance alone is a valid trigger). When the reason is that the new
+	// comments' authors could not be verified yet, say so: that one is worth retrying.
+	if !plan.HasNew && strings.TrimSpace(guidance) == "" {
+		if plan.UnknownNew > 0 {
+			return store.Run{}, ErrReworkPermissionUnknown
+		}
 		return store.Run{}, ErrReworkNothingNew
 	}
 
@@ -370,12 +390,12 @@ func (s *Service) StartMRReworkForRun(ctx context.Context, userID, runID uuid.UU
 	title := fmt.Sprintf("Rework MR review (on demand): %s (!%d)", ref, mrIID)
 
 	// The create and the non-counting high-water advance are ONE atomic statement
-	// (CreateManualMRReworkRunAndAdvance): maxActionableID is the mark to advance to
+	// (CreateManualMRReworkRunAndAdvance): plan.MaxActionableID is the mark to advance to
 	// (UNCONDITIONAL — GREATEST keeps it where it is on a guidance-only trigger, and the
 	// advance is what resets halt_notified for the new halt episode, Decision 9). Postgres
 	// commits the run and the advance together or rolls both back, so a returned run can
 	// never leave the ledger unadvanced.
-	run, err = s.CreateManualMRReworkRun(ctx, userID, repoID, ref, mrIID, run.ID, title, description, snapshot, maxActionableID)
+	run, err = s.CreateManualMRReworkRun(ctx, userID, repoID, ref, mrIID, run.ID, title, description, snapshot, plan)
 	if err != nil {
 		// ErrBranchInUse / ErrActiveMRReworkExists map straight through to the handler's 409s.
 		return store.Run{}, err

@@ -4,12 +4,35 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
+
+// poolQueue is the production queue mutation (begin, lock, fn, commit) over a pool, standing in
+// for workersvc.Service.MutateReviewAuthorQueue without building a whole Service.
+type poolQueue struct{ pool *pgxpool.Pool }
+
+func (p poolQueue) MutateReviewAuthorQueue(ctx context.Context, repoID uuid.UUID, ref string, fn func(workersvc.ReviewAuthorQueueOps) error) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := store.New(tx)
+	if err := q.LockReviewAuthorQueue(ctx, store.LockReviewAuthorQueueParams{RepoID: repoID, Ref: ref}); err != nil {
+		return err
+	}
+	if err := fn(q); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
 
 // TestMRReworkEligibilityRoundTripLiveDB exercises detection with real queries:
 // temporary eligibility changes must preserve the consumed review and loop budget.
@@ -50,7 +73,7 @@ func TestMRReworkEligibilityRoundTripLiveDB(t *testing.T) {
 			f := landedForge(mrwComment(120, time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), mrwHeadSHA))
 			row := mrwRepoRow()
 			row.ID = repo
-			watch := NewMRReviewWatch(q, runs, nil, mrwSettings{enabled: true, capVal: 5}, 5, 0)
+			watch := NewMRReviewWatch(q, runs, poolQueue{pool}, nil, mrwSettings{enabled: true, capVal: 5}, 5, 0)
 			ledger := func(count int32, highwater int64) store.MrReworkLedger {
 				t.Helper()
 				got, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repo, Ref: mrwRef})
@@ -89,7 +112,7 @@ func TestMRReworkEligibilityRoundTripLiveDB(t *testing.T) {
 			candidates(0)
 			watch.detect(ctx, row, f)
 			after := ledger(1, 120)
-			if after != before {
+			if !reflect.DeepEqual(after, before) {
 				t.Fatalf("ineligible tick changed ledger: before=%+v after=%+v", before, after)
 			}
 			if len(runs.calls) != 1 {

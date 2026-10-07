@@ -504,12 +504,18 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 
 	// PRD #700 M2: replay the structured MR review-comments snapshot captured at
 	// mr_rework run creation. A malformed column degrades to nil-and-log rather than
-	// failing the claim, exactly like the issue-comments decode above.
+	// failing the claim, exactly like the issue-comments decode above. Only a current-version
+	// (author-assessed) snapshot is replayed with its comments.
 	var reviewComments *ReviewCommentsSnapshot
 	if len(run.ReviewComments) > 0 {
 		var snap ReviewCommentsSnapshot
 		if err := json.Unmarshal(run.ReviewComments, &snap); err != nil {
 			slog.Error("workersvc: decode run review comments", "run_id", run.ID, "error", err)
+		} else if snap.Version != ReviewSnapshotVersion {
+			// Issue #2347: a snapshot captured before author eligibility reached this lane was
+			// never assessed, so its bodies are not replayed. Version 0 tells the agent a
+			// legacy snapshot was withheld rather than that the MR had no comments.
+			reviewComments = &ReviewCommentsSnapshot{Comments: []ReviewCommentSnapshot{}}
 		} else {
 			reviewComments = &snap
 		}

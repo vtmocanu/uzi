@@ -83,7 +83,7 @@ WHERE per_branch.branch <> rp.default_branch
 -- fresh candidate): the generated :one returns a zero-value struct alongside
 -- pgx.ErrNoRows, which the detector reads as attempt_count=0, high_water=0,
 -- halt_notified=false.
-SELECT repo_id, ref, attempt_count, high_water, halt_notified, updated_at
+SELECT repo_id, ref, attempt_count, high_water, halt_notified, updated_at, pending_unknown_ids
 FROM mr_rework_ledger
 WHERE repo_id = @repo_id::uuid AND ref = @ref;
 
@@ -96,12 +96,18 @@ WHERE repo_id = @repo_id::uuid AND ref = @ref;
 -- false on every proceed (INSERT defaults it false): the latch is one comment per
 -- halt episode, so once a proceed advances the counter a later cap halt can comment
 -- again.
-INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water)
-VALUES (@repo_id::uuid, @ref, 1, @high_water)
+-- pending_unknown_ids (issue #2347): the permission-unknown comment ids the mark moved past
+-- (@pending_add, kept only when above the mark the row had BEFORE this update) merged with
+-- the existing set, minus @pending_remove (ids consumed, now not-eligible, or gone); the
+-- merge keeps the newest 200 (mr_rework_merge_pending).
+INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water, pending_unknown_ids)
+VALUES (@repo_id::uuid, @ref, 1, @high_water,
+        mr_rework_merge_pending('{}'::bigint[], @pending_add::bigint[], @pending_remove::bigint[], 0))
 ON CONFLICT (repo_id, ref) DO UPDATE
 SET attempt_count = mr_rework_ledger.attempt_count + 1,
     high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
     halt_notified = false,
+    pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, @pending_add::bigint[], @pending_remove::bigint[], mr_rework_ledger.high_water),
     updated_at    = now();
 
 -- name: SetMRReworkHaltNotified :exec
@@ -216,8 +222,9 @@ RETURNING *;
 -- (ErrActiveMRReworkExists/ErrBranchInUse); success -> run + ledger commit together. `ref` on
 -- the ledger is the pipeline_ref (the branch), exactly as the two-step path passed it.
 WITH led AS (
-    INSERT INTO mr_rework_ledger (repo_id, ref, high_water)
-    SELECT @repo_id::uuid, @pipeline_ref, @high_water
+    INSERT INTO mr_rework_ledger (repo_id, ref, high_water, pending_unknown_ids)
+    SELECT @repo_id::uuid, @pipeline_ref, @high_water,
+           mr_rework_merge_pending('{}'::bigint[], @pending_add::bigint[], @pending_remove::bigint[], 0)
     WHERE NOT EXISTS (
         SELECT 1 FROM runs
         WHERE repo_id = @repo_id::uuid
@@ -228,6 +235,7 @@ WITH led AS (
     ON CONFLICT (repo_id, ref) DO UPDATE
     SET high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
         halt_notified = false,
+        pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, @pending_add::bigint[], @pending_remove::bigint[], mr_rework_ledger.high_water),
         updated_at    = now()
 )
 INSERT INTO runs (

@@ -450,6 +450,8 @@ func Validate(key, value string) error {
 		return validateBool(value)
 	case KeyMrReworkCap:
 		return validateMrReworkCap(value)
+	case KeyMrReviewTrustedBots:
+		return validateTrustedBots(value)
 	case KeyAppLogoMode:
 		return validateEnum(value, "default", "custom", "preset")
 	case KeyAppLogoPreset:

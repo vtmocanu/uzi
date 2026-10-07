@@ -12,8 +12,10 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/pipelinestatus"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -28,6 +30,8 @@ type mrReviewWatchStore interface {
 	UpsertMRReworkLedger(ctx context.Context, arg store.UpsertMRReworkLedgerParams) error
 	SetMRReworkHaltNotified(ctx context.Context, arg store.SetMRReworkHaltNotifiedParams) error
 	DeleteMRReworkLedgerNotIn(ctx context.Context, repoID uuid.UUID) (int64, error)
+	// The review-comment author verdict cache and queue reads (issue #2347).
+	workersvc.ReviewAuthorStore
 }
 
 // MRReworkRunStarter creates an automatic mr_rework run through workersvc's shared
@@ -57,6 +61,10 @@ type MRReviewNotifier interface {
 type MRReworkSettings interface {
 	MrReworkEnabled(ctx context.Context) (bool, error)
 	MrReworkCap(ctx context.Context) (int, error)
+	// MrReviewTrustedBots is the admin allowlist of review bots whose comments skip the author
+	// lookup (issue #2347). Strict like MrReworkEnabled: the detector skips the repo's tick on
+	// a read error rather than send every bot comment through the lookup.
+	MrReviewTrustedBots(ctx context.Context) ([]settings.TrustedBot, error)
 	// PublicBaseURL is the operator-set public base URL the mr_rework_halted Slack DM
 	// builds its run deep link from (PRD #1650 D3). An empty value or an error yields a
 	// DM with no link, never a dropped notification.
@@ -72,27 +80,45 @@ type MRReworkSettings interface {
 type MRReviewWatch struct {
 	q        mrReviewWatchStore
 	runs     MRReworkRunStarter
+	queue    workersvc.ReviewQueueMutator
 	notifier MRReviewNotifier
 	set      MRReworkSettings
 
 	maxAttemptsDefault int
 	quietPeriod        time.Duration
+
+	// lookupTimeout bounds one review-comment author lookup (issue #2347); now is the clock
+	// the debounce and the verdict TTL read. Tests shrink the first and fake the second.
+	lookupTimeout time.Duration
+	now           func() time.Time
+	// maxLookups lowers the per-tick cap on queued author lookups (zero keeps the assessor's
+	// own cap); tests use it to exercise the fair-progress bound with few authors.
+	maxLookups int
 }
 
 // NewMRReviewWatch builds a detector. q is the store, runs creates the automatic
-// mr_rework runs (workersvc), notifier sends the halt DM (notifysvc, nil-safe),
+// mr_rework runs (workersvc), queue runs the locked mutations of the review-author queue
+// (workersvc.Service too), notifier sends the halt DM (notifysvc, nil-safe),
 // set resolves the admin gate + capLimit (settings). maxAttemptsDefault is the fallback
 // per-MR capLimit used when the admin capLimit read errors; quietPeriod is the review-landed
 // debounce (fire only once the newest review comment has settled for this long).
-func NewMRReviewWatch(q mrReviewWatchStore, runs MRReworkRunStarter, notifier MRReviewNotifier, set MRReworkSettings, maxAttemptsDefault int, quietPeriod time.Duration) *MRReviewWatch {
+func NewMRReviewWatch(q mrReviewWatchStore, runs MRReworkRunStarter, queue workersvc.ReviewQueueMutator, notifier MRReviewNotifier, set MRReworkSettings, maxAttemptsDefault int, quietPeriod time.Duration) *MRReviewWatch {
 	return &MRReviewWatch{
 		q:                  q,
 		runs:               runs,
+		queue:              queue,
 		notifier:           notifier,
 		set:                set,
 		maxAttemptsDefault: maxAttemptsDefault,
 		quietPeriod:        quietPeriod,
+		lookupTimeout:      workersvc.DefaultReviewLookupTimeout,
+		now:                time.Now,
 	}
+}
+
+// assessor builds the author assessor over the watcher's collaborators.
+func (d *MRReviewWatch) assessor() *workersvc.ReviewAssessor {
+	return &workersvc.ReviewAssessor{Store: d.q, Queue: d.queue, Timeout: d.lookupTimeout, Now: d.now, MaxAttempts: d.maxLookups}
 }
 
 // detect is the post-SyncMRStates MR-review-rework hook. It runs AFTER PRD #24's
@@ -125,6 +151,14 @@ func (d *MRReviewWatch) detect(ctx context.Context, r store.ListEnabledReposWith
 		capLimit = d.maxAttemptsDefault
 	}
 
+	// The trusted review-bot allowlist is read ONCE per repo and fails CLOSED like the gate
+	// above: an unreadable list skips the repo's tick (issue #2347).
+	trusted, err := d.set.MrReviewTrustedBots(ctx)
+	if err != nil {
+		slog.Error("poller: mr-rework trusted review bots read", "repo", r.PathWithNamespace, "error", err)
+		return
+	}
+
 	cands, err := d.q.ListMRReworkCandidates(ctx, r.ID)
 	if err != nil {
 		slog.Error("poller: list mr-rework candidates", "repo", r.PathWithNamespace, "error", err)
@@ -135,7 +169,7 @@ func (d *MRReviewWatch) detect(ctx context.Context, r store.ListEnabledReposWith
 		if ctx.Err() != nil {
 			return
 		}
-		d.detectOne(ctx, r, f, cand, capLimit)
+		d.detectOne(ctx, r, f, cand, capLimit, trusted)
 	}
 
 	// Reconcile once per repo, best-effort: DeleteMRReworkLedgerNotIn retains rows
@@ -145,15 +179,20 @@ func (d *MRReviewWatch) detect(ctx context.Context, r store.ListEnabledReposWith
 	if _, err := d.q.DeleteMRReworkLedgerNotIn(ctx, r.ID); err != nil {
 		slog.Warn("poller: mr-rework ledger eviction", "repo", r.PathWithNamespace, "error", err)
 	}
+	// Same best-effort contract for the review-author housekeeping: expired verdicts and
+	// week-old queue rows.
+	if err := d.assessor().EvictStale(ctx, r.ID); err != nil {
+		slog.Warn("poller: mr-rework review author eviction", "repo", r.PathWithNamespace, "error", err)
+	}
 }
 
 // detectOne runs the loop-guard state machine for one candidate MR (PRD #700 M3). The
-// gates fire in order, each a distinct NEGATIVE case: green head pipeline → review
-// landed (debounce + current HeadSHA) → a new comment past the high-water → under the
+// gates fire in order, each a distinct NEGATIVE case: green head pipeline → an ELIGIBLE new
+// actionable comment (issue #2347) → review landed (debounce + current HeadSHA) → under the
 // capLimit → branch free (checked at create time inside CreateAutoMRReworkRun). Any gate
 // that fails is a silent no-op (no ledger write, no comment) except the capLimit halt,
 // which comments once.
-func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, f forge.Forge, cand store.ListMRReworkCandidatesRow, capLimit int) {
+func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, f forge.Forge, cand store.ListMRReworkCandidatesRow, capLimit int, trusted []settings.TrustedBot) {
 	ref := cand.Ref.String
 	mrIID := cand.MrIid.Int64
 
@@ -175,25 +214,22 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	}
 	headSHA := cand.PipelineSha.String
 
-	// Fetch the MR review comments and build the filtered snapshot (the detector builds
-	// it — it needs the kept comments to gate on high-water and review-landedness —
-	// then passes it to CreateAutoMRReworkRun, mirroring ci-autofix's BuildFailureSnapshot).
+	// Fetch the MR review comments first (the assessment's deadline must not be spent on
+	// the listing), then assess their authors. The detector builds the snapshot itself — it
+	// needs the eligible comments to gate on high-water and review-landedness — then passes it
+	// to CreateAutoMRReworkRun, mirroring ci-autofix's BuildFailureSnapshot.
 	comments, err := f.ListMergeRequestComments(ctx, r.ForgeProjectID, mrIID)
 	if err != nil {
 		// Already PAT-redacted by the driver.
 		slog.Warn("poller: mr-rework list comments", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 		return
 	}
-	snap := workersvc.BuildReviewCommentsSnapshot(comments, cand.BotForgeUserID)
-	if snap == nil || len(snap.Comments) == 0 {
-		// Nothing left after the bot self-filter (or an unknown bot id): no fire.
-		return
-	}
 
 	// The ledger row. No row means this MR was never reworked: the generated :one
 	// returns a zero-value struct alongside pgx.ErrNoRows (attempt_count=0,
-	// high_water=0, halt_notified=false), so every gate below keys on those values,
-	// NEVER on row-existence.
+	// high_water=0, halt_notified=false, no pending ids), so every gate below keys on those
+	// values, NEVER on row-existence. Read before the assessment: which comments are NEW
+	// (above the mark, or pending) decides which authors are worth a lookup.
 	led, err := d.q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: r.ID, Ref: ref})
 	switch {
 	case err == nil, errors.Is(err, pgx.ErrNoRows):
@@ -202,27 +238,66 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 		return
 	}
 
-	// The newest kept comment (snapshot is oldest-first) drives the review-landed gate.
-	newest := snap.Comments[len(snap.Comments)-1]
-
-	// The trigger + advance-only high-water anchor key on ACTIONABLE comments only
-	// (issue #1142): a non-actionable note (a bot walkthrough/summary, or a top-level
-	// note carrying a CodeRabbit summary/walkthrough marker) is context for a run that
-	// fires, never a reason to fire. maxActionableID is 0 when nothing actionable is
-	// kept, so a summary-only tick can never clear GATE 3 and never advances the ledger.
-	var maxActionableID int64
-	for _, c := range snap.Comments {
-		if workersvc.IsActionableReviewComment(c) && c.ID > maxActionableID {
-			maxActionableID = c.ID
-		}
+	as, err := d.assessor().Begin(ctx, workersvc.ReviewAssessParams{
+		RepoID:         r.ID,
+		Ref:            ref,
+		ProjectID:      r.ForgeProjectID,
+		BaseURL:        r.BaseUrl,
+		BotForgeUserID: cand.BotForgeUserID,
+		Lookup:         f,
+		Trusted:        trusted,
+		Comments:       comments,
+		HighWater:      led.HighWater,
+		Pending:        led.PendingUnknownIds,
+	})
+	if err != nil {
+		// Fail closed: with the verdicts or the queue unreadable no author is assessed.
+		slog.Warn("poller: mr-rework author assessment", "repo", r.PathWithNamespace, "ref", ref, "error", err)
+		return
 	}
+	if as == nil {
+		// Nothing left after the bot self-filter (or an unknown bot id): no fire.
+		return
+	}
+	defer as.Close()
+	if as.Attempted > 0 {
+		slog.Debug("poller: mr-rework author lookups", "repo", r.PathWithNamespace, "ref", ref, "attempted", as.Attempted)
+	}
+
+	// GATE — AN ELIGIBLE NEW ACTIONABLE COMMENT (issue #2347). Only a comment from an author
+	// with repository access (or an allowlisted review bot) can fire a rework; an outsider's
+	// comment is never a trigger and never gates, whatever its age or head SHA. When the only
+	// new comments are from authors that could not be verified, the skip is recorded, loudly
+	// and with its reason, instead of reading like "nothing new".
+	if !as.HasTrigger() {
+		if n := as.UnknownNewCount(); n > 0 {
+			slog.Warn("poller: mr-rework withheld: permission unknown",
+				"repo", r.PathWithNamespace, "ref", ref, "reason", issueinput.Unknown, "count", n, "attempted", as.Attempted)
+		}
+		return
+	}
+	// Cheap early debounce on the eligible comments decided so far: assessing more authors
+	// can only make the newest comment newer, so one still inside the quiet period stays
+	// inside it, and the context-only lookups below are skipped this tick.
+	if newest, found := as.NewestEligible(); found && d.now().Sub(newest.CreatedAt) < d.quietPeriod {
+		return
+	}
+
+	res := as.Snapshot(ctx)
+	snap := res.Snapshot
+	// The newest ELIGIBLE comment (the snapshot is oldest-first) drives the review-landed gate.
+	newest, found := res.NewestEligible()
+	if !found {
+		return // unreachable while HasTrigger held; never fire an empty eligible snapshot
+	}
+	plan := res.Plan(led.HighWater, led.PendingUnknownIds)
 
 	// GATE 2 — REVIEW LANDED (Decision 6). Two sub-gates: a quiet-period debounce (the
 	// review must have settled — the newest comment is older than quietPeriod) AND a
 	// staleness check (the comment was written against the CURRENT head SHA). Where the
 	// driver cannot supply a per-comment head SHA (a top-level note, HeadSHA==""), fall
 	// back to the debounce alone — do not assert a gate the driver cannot back.
-	if time.Since(newest.CreatedAt) < d.quietPeriod {
+	if d.now().Sub(newest.CreatedAt) < d.quietPeriod {
 		return // review still in flight (not debounced)
 	}
 	if newest.HeadSHA != "" && newest.HeadSHA != headSHA {
@@ -230,12 +305,13 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	}
 
 	// GATE 3 — NEW ACTIONABLE COMMENT PAST THE HIGH-WATER (Decision 2 / SC3, issue
-	// #1142). Fire only when an ACTIONABLE kept comment has id STRICTLY ABOVE the
-	// consumed high-water. A comment at/below the mark is never re-acted; a
-	// non-actionable note (a bot walkthrough/summary) never counts, and a summary-only
-	// tick does not advance the high-water — leaving the mark unmoved is what lets a
-	// later actionable comment with a lower forge id still fire (it also avoids widening
-	// the scalar-high-water skip below rather than narrowing it).
+	// #1142). Fire only when an eligible ACTIONABLE kept comment has id STRICTLY ABOVE the
+	// consumed high-water, or is pending (an earlier permission-unknown comment whose author
+	// has since resolved eligible, issue #2347). A comment at/below the mark is never
+	// re-acted; a non-actionable note (a bot walkthrough/summary) never counts, and a
+	// summary-only tick does not advance the high-water — leaving the mark unmoved is what
+	// lets a later actionable comment with a lower forge id still fire (it also avoids
+	// widening the scalar-high-water skip below rather than narrowing it).
 	//
 	// 🔴 KNOWN LIMITATION (documented decision, mirrored from the 00168 migration
 	// comment, NOT an oversight): GitHub/Forgejo source comment ids from DISTINCT
@@ -244,7 +320,7 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	// skipped comment falls back to human review, never a wrong write) and bounded by
 	// the capLimit. A per-sequence high-water is the robust follow-up; the scalar mark is
 	// what Decision 2 + SC3 specify.
-	if maxActionableID <= led.HighWater {
+	if !plan.HasNew {
 		return
 	}
 
@@ -289,9 +365,11 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	switch {
 	case err == nil:
 		if err := d.q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
-			RepoID:    r.ID,
-			Ref:       ref,
-			HighWater: maxActionableID,
+			RepoID:        r.ID,
+			Ref:           ref,
+			HighWater:     plan.MaxActionableID,
+			PendingAdd:    plan.PendingAdd,
+			PendingRemove: plan.PendingRemove,
 		}); err != nil {
 			// The run is active; the next tick's branch guard keeps it from doubling.
 			slog.Error("poller: mr-rework upsert ledger", "repo", r.PathWithNamespace, "ref", ref, "error", err)

@@ -84,6 +84,7 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 		// ABSENT when the field is nil (the omitempty contract). Timestamp FIXED for a
 		// byte-stable golden.
 		ReviewComments: &ReviewCommentsSnapshot{
+			Version: ReviewSnapshotVersion,
 			Comments: []ReviewCommentSnapshot{
 				{
 					ID:                5001,
@@ -99,7 +100,9 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 					ReviewState:       "inline",
 				},
 			},
-			Truncated: true,
+			Truncated:           true,
+			WithheldNotEligible: 1,
+			WithheldUnknown:     2,
 		},
 		Status:         "claimed",
 		Branch:         strptr("agent/issue-42"),

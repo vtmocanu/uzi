@@ -526,13 +526,29 @@ type JobResult struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
+type MrReviewAuthorQueue struct {
+	RepoID        uuid.UUID          `json:"repo_id"`
+	Ref           string             `json:"ref"`
+	ForgeUserID   int64              `json:"forge_user_id"`
+	QueueSeq      int64              `json:"queue_seq"`
+	AdmittedAt    pgtype.Timestamptz `json:"admitted_at"`
+	LastAttemptAt pgtype.Timestamptz `json:"last_attempt_at"`
+}
+
+type MrReviewAuthorVerdict struct {
+	RepoID        uuid.UUID          `json:"repo_id"`
+	ForgeUserID   int64              `json:"forge_user_id"`
+	NotEligibleAt pgtype.Timestamptz `json:"not_eligible_at"`
+}
+
 type MrReworkLedger struct {
-	RepoID       uuid.UUID          `json:"repo_id"`
-	Ref          string             `json:"ref"`
-	AttemptCount int32              `json:"attempt_count"`
-	HighWater    int64              `json:"high_water"`
-	HaltNotified bool               `json:"halt_notified"`
-	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	RepoID            uuid.UUID          `json:"repo_id"`
+	Ref               string             `json:"ref"`
+	AttemptCount      int32              `json:"attempt_count"`
+	HighWater         int64              `json:"high_water"`
+	HaltNotified      bool               `json:"halt_notified"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	PendingUnknownIds []int64            `json:"pending_unknown_ids"`
 }
 
 type Notification struct {

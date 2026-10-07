@@ -130,6 +130,9 @@ type Handler struct {
 	// settings is the read-through cache over app_settings (PRD #19), shared with
 	// the poller so both read the same configured labels.
 	settings *settings.Cache
+	// reviewLookupTimeout bounds one review-comment author lookup on the on-demand rework
+	// path (issue #2347); zero means workersvc.DefaultReviewLookupTimeout. Tests shrink it.
+	reviewLookupTimeout time.Duration
 	// reconciler is signalled after a label-affecting settings change so the poller
 	// full-syncs every repo on its next cycle (PRD #19 M2). Optional: nil in tests
 	// that don't exercise the poller; UpdateSettings nil-guards the call.

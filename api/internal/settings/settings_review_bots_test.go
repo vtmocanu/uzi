@@ -1,0 +1,133 @@
+package settings
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/vtmocanu/uzi/api/internal/store"
+)
+
+// The trusted review-bot allowlist (issue #2347): "<base_url>#<forge_user_id>" entries.
+
+func TestMrReviewTrustedBotsKnownWithEmptyDefault(t *testing.T) {
+	if !Known(KeyMrReviewTrustedBots) {
+		t.Fatalf("%s must be a known (admin-writable) key", KeyMrReviewTrustedBots)
+	}
+	if got, ok := Defaults[KeyMrReviewTrustedBots]; !ok || got != "" {
+		t.Fatalf("default = %q (present %t), want the empty allowlist", got, ok)
+	}
+	if err := Validate(KeyMrReviewTrustedBots, ""); err != nil {
+		t.Fatalf("the empty value must be valid: %v", err)
+	}
+}
+
+func TestValidateTrustedBots(t *testing.T) {
+	var fifty, fiftyOne []string
+	for i := 1; i <= 51; i++ {
+		e := fmt.Sprintf("https://github.com#%d", i)
+		if i <= 50 {
+			fifty = append(fifty, e)
+		}
+		fiftyOne = append(fiftyOne, e)
+	}
+	ok := []string{
+		"",
+		"https://github.com#136622811",
+		"https://github.com#1,https://gitlab.example.com#2",
+		" https://github.com#1 , https://github.com#2 ",
+		"https://api.github.com#5,https://github.com#5", // distinct spellings of one instance are distinct entries
+		"https://forge.example.com:8443#9",
+		strings.Join(fifty, ","),
+		"https://github.com#1,", // a trailing separator is an empty token
+	}
+	for _, v := range ok {
+		if err := Validate(KeyMrReviewTrustedBots, v); err != nil {
+			t.Errorf("Validate(%q) = %v, want nil", v, err)
+		}
+	}
+	bad := map[string]string{
+		"no id":               "https://github.com",
+		"no base":             "#5",
+		"http":                "http://github.com#5",
+		"not normalized path": "https://github.com/#5",
+		"not normalized case": "https://GitHub.com#5",
+		"deeper path":         "https://github.com/foo#5",
+		"id zero":             "https://github.com#0",
+		"id negative":         "https://github.com#-4",
+		"id text":             "https://github.com#bot",
+		"id with sign":        "https://github.com#+4",
+		"id leading zero":     "https://github.com#007",
+		"id overflow":         "https://github.com#99999999999999999999",
+		"duplicate":           "https://github.com#5,https://github.com#5",
+		"too many":            strings.Join(fiftyOne, ","),
+		"login not an id":     "https://github.com#coderabbitai[bot]",
+	}
+	for name, v := range bad {
+		if err := Validate(KeyMrReviewTrustedBots, v); err == nil {
+			t.Errorf("%s: Validate(%q) = nil, want a rejection", name, v)
+		}
+	}
+}
+
+func TestMrReviewTrustedBotsAccessor(t *testing.T) {
+	ctx := context.Background()
+	c := New(&fakeStore{}, time.Minute)
+	got, err := c.MrReviewTrustedBots(ctx)
+	if err != nil || got == nil || len(got) != 0 {
+		t.Fatalf("absent row = %v, %v, want a non-nil empty slice", got, err)
+	}
+
+	c = New(&fakeStore{rows: []store.AppSetting{row(KeyMrReviewTrustedBots, "https://github.com#136622811, https://gitlab.example.com#7,garbage,https://github.com#136622811")}}, time.Minute)
+	got, err = c.MrReviewTrustedBots(ctx)
+	want := []TrustedBot{{"https://github.com", 136622811}, {"https://gitlab.example.com", 7}}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("parsed = %v, %v, want %v (junk and duplicates skipped)", got, err, want)
+	}
+
+	// A store error is PROPAGATED, never read as "no bots": the callers fail closed on it.
+	boom := errors.New("app_settings unavailable")
+	c = New(&fakeStore{err: boom}, time.Minute)
+	if _, err := c.MrReviewTrustedBots(ctx); !errors.Is(err, boom) {
+		t.Fatalf("store error = %v, want it propagated", err)
+	}
+}
+
+func TestTrustedBotMatches(t *testing.T) {
+	bots := []TrustedBot{{"https://github.com", 136622811}, {"https://gitlab.example.com", 7}}
+	cases := []struct {
+		name string
+		base string
+		id   int64
+		want bool
+	}{
+		{"same instance and id", "https://github.com", 136622811, true},
+		{"connection URL spelling is normalized", "https://GitHub.com/", 136622811, true},
+		{"api.github.com is the github.com instance", "https://api.github.com", 136622811, true},
+		{"same id on another instance", "https://gitlab.example.com", 136622811, false},
+		{"same id on a lookalike host", "https://github.com.evil.test", 136622811, false},
+		{"other id on the right instance", "https://github.com", 136622812, false},
+		{"second entry matches its own instance", "https://gitlab.example.com", 7, true},
+		{"unresolvable id", "https://github.com", 0, false},
+		{"negative id", "https://github.com", -1, false},
+		{"base that does not normalize", "ftp://github.com", 136622811, false},
+		{"empty base", "", 136622811, false},
+	}
+	for _, tc := range cases {
+		if got := TrustedBotMatches(bots, tc.base, tc.id); got != tc.want {
+			t.Errorf("%s: TrustedBotMatches(%q, %d) = %t, want %t", tc.name, tc.base, tc.id, got, tc.want)
+		}
+	}
+	// The api.github.com spelling works on the entry side too.
+	apiEntry := []TrustedBot{{"https://api.github.com", 5}}
+	if !TrustedBotMatches(apiEntry, "https://github.com", 5) {
+		t.Error("an api.github.com entry must match a github.com connection")
+	}
+	if TrustedBotMatches(nil, "https://github.com", 5) {
+		t.Error("an empty allowlist matches nothing")
+	}
+}

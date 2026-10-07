@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,8 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
+	"github.com/vtmocanu/uzi/api/internal/reviewauthortest"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -51,6 +54,39 @@ type mrwStore struct {
 	haltErr   error
 
 	ops *[]string
+
+	// clock feeds the review-author model (admitted_at / last_attempt_at); nil means time.Now.
+	clock func() time.Time
+	rat   *reviewauthortest.Store
+}
+
+// ras is the in-memory review-author verdict cache and queue (issue #2347), created on first
+// use so the many tests that build a bare &mrwStore{} need no setup.
+func (s *mrwStore) ras() *reviewauthortest.Store {
+	if s.rat == nil {
+		s.rat = reviewauthortest.New(s.clock)
+	}
+	return s.rat
+}
+
+func (s *mrwStore) ListReviewAuthorQueue(ctx context.Context, arg store.ListReviewAuthorQueueParams) ([]store.ListReviewAuthorQueueRow, error) {
+	return s.ras().ListReviewAuthorQueue(ctx, arg)
+}
+
+func (s *mrwStore) ListFreshNotEligibleAuthors(ctx context.Context, arg store.ListFreshNotEligibleAuthorsParams) ([]int64, error) {
+	return s.ras().ListFreshNotEligibleAuthors(ctx, arg)
+}
+
+func (s *mrwStore) UpsertReviewAuthorVerdict(ctx context.Context, arg store.UpsertReviewAuthorVerdictParams) error {
+	return s.ras().UpsertReviewAuthorVerdict(ctx, arg)
+}
+
+func (s *mrwStore) DeleteExpiredReviewAuthorVerdicts(ctx context.Context, arg store.DeleteExpiredReviewAuthorVerdictsParams) (int64, error) {
+	return s.ras().DeleteExpiredReviewAuthorVerdicts(ctx, arg)
+}
+
+func (s *mrwStore) ListStaleReviewAuthorQueueRefs(ctx context.Context, arg store.ListStaleReviewAuthorQueueRefsParams) ([]string, error) {
+	return s.ras().ListStaleReviewAuthorQueueRefs(ctx, arg)
 }
 
 func (s *mrwStore) ListMRReworkCandidates(context.Context, uuid.UUID) ([]store.ListMRReworkCandidatesRow, error) {
@@ -77,6 +113,7 @@ func (s *mrwStore) UpsertMRReworkLedger(_ context.Context, arg store.UpsertMRRew
 		s.ledgers = map[string]store.MrReworkLedger{}
 	}
 	cur := s.ledgers[arg.Ref]
+	priorHighWater := cur.HighWater
 	cur.RepoID = arg.RepoID
 	cur.Ref = arg.Ref
 	cur.AttemptCount++ // INSERT count=1 or increment
@@ -84,11 +121,39 @@ func (s *mrwStore) UpsertMRReworkLedger(_ context.Context, arg store.UpsertMRRew
 		cur.HighWater = arg.HighWater // GREATEST(existing, new): advance-only
 	}
 	cur.HaltNotified = false // a proceed resets the latch
+	cur.PendingUnknownIds = mergePending(cur.PendingUnknownIds, arg.PendingAdd, arg.PendingRemove, priorHighWater)
 	s.ledgers[arg.Ref] = cur
 	if s.ops != nil {
 		*s.ops = append(*s.ops, "upsert")
 	}
 	return nil
+}
+
+// mergePending mirrors mr_rework_merge_pending: the newest 200 of (existing UNION added ids
+// above the prior high-water mark) minus removed ids, ascending.
+func mergePending(existing, added, removed []int64, priorHighWater int64) []int64 {
+	set := map[int64]bool{}
+	for _, id := range existing {
+		set[id] = true
+	}
+	for _, id := range added {
+		if id > priorHighWater {
+			set[id] = true
+		}
+	}
+	for _, id := range removed {
+		delete(set, id)
+	}
+	out := make([]int64, 0, len(set))
+	for id := range set {
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] > out[j] })
+	if len(out) > 200 {
+		out = out[:200]
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 func (s *mrwStore) SetMRReworkHaltNotified(_ context.Context, arg store.SetMRReworkHaltNotifiedParams) error {
@@ -178,6 +243,12 @@ type mrwSettings struct {
 	capErr     error
 	baseURL    string
 	baseErr    error
+	bots       []settings.TrustedBot
+	botsErr    error
+}
+
+func (s mrwSettings) MrReviewTrustedBots(context.Context) ([]settings.TrustedBot, error) {
+	return s.bots, s.botsErr
 }
 
 func (s mrwSettings) MrReworkEnabled(context.Context) (bool, error) { return s.enabled, s.enabledErr }
@@ -190,6 +261,19 @@ type mrwForge struct {
 	*cfForge
 	comments    []forge.MRComment
 	commentsErr error
+
+	// eligibility answers a repository-access lookup (issue #2347). Nil means every author is
+	// eligible, so the pre-existing tests keep their meaning; lookups records each call.
+	eligibility func(ctx context.Context, authorID int64) (forge.AuthorEligibility, error)
+	lookups     []int64
+}
+
+func (f *mrwForge) RepositoryAuthorEligibility(ctx context.Context, _ int64, authorID int64) (forge.AuthorEligibility, error) {
+	f.lookups = append(f.lookups, authorID)
+	if f.eligibility == nil {
+		return forge.AuthorEligible, nil
+	}
+	return f.eligibility(ctx, authorID)
 }
 
 func (f *mrwForge) ListMergeRequestComments(context.Context, int64, int64) ([]forge.MRComment, error) {
@@ -243,7 +327,7 @@ func newMRW(st *mrwStore, runs *mrwRuns, notifier *mrwNotifier, set mrwSettings)
 	if notifier != nil {
 		n = notifier
 	}
-	return NewMRReviewWatch(st, runs, n, set, 5, 5*time.Minute)
+	return NewMRReviewWatch(st, runs, st.ras(), n, set, 5, 5*time.Minute)
 }
 
 func landedForge(comments ...forge.MRComment) *mrwForge {

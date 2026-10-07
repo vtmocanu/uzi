@@ -16,6 +16,7 @@
     "truncated": true
   },
   "review_comments": {
+    "version": 2,
     "comments": [
       {
         "id": 5001,
@@ -31,7 +32,9 @@
         "review_state": "inline"
       }
     ],
-    "truncated": true
+    "truncated": true,
+    "withheld_not_eligible": 1,
+    "withheld_unknown": 2
   },
   "status": "claimed",
   "branch": "agent/issue-42",

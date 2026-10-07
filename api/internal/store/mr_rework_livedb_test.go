@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"testing"
 
 	"github.com/google/uuid"
@@ -269,7 +270,7 @@ func TestMRReworkLiveDB(t *testing.T) {
 		t.Fatalf("DeleteMRReworkLedgerNotIn: %v", err)
 	}
 	retained, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repoID, Ref: "agent/issue-7"})
-	if err != nil || retained != led {
+	if err != nil || !reflect.DeepEqual(retained, led) {
 		t.Fatalf("opened source must retain unchanged ledger: got %+v, err %v", retained, err)
 	}
 	exec("UPDATE runs SET mr_state='merged' WHERE id=$1", src7)
@@ -468,7 +469,7 @@ func TestMRReworkLedgerLifetimeLiveDB(t *testing.T) {
 	retained := func(want store.MrReworkLedger) {
 		t.Helper()
 		got, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: want.RepoID, Ref: want.Ref})
-		if err != nil || got != want {
+		if err != nil || !reflect.DeepEqual(got, want) {
 			t.Fatalf("ledger changed: got=%+v err=%v want=%+v", got, err, want)
 		}
 	}

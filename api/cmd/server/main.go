@@ -731,7 +731,7 @@ func run() error {
 	// settings.DefaultMrReworkCap (the admin-read fallback used only on a cap-read
 	// error); the review-landed quiet-period debounce (Decision 6) is now the
 	// MR_REVIEW_QUIET_PERIOD knob (cfg.MRReviewQuietPeriod, default 3m; PRD #966 M6).
-	engine.SetMRReviewWatch(poller.NewMRReviewWatch(q, wsvc, notifier, settingsCache, 5, cfg.MRReviewQuietPeriod))
+	engine.SetMRReviewWatch(poller.NewMRReviewWatch(q, wsvc, wsvc, notifier, settingsCache, 5, cfg.MRReviewQuietPeriod))
 	// Reverse GitHub Projects v2 sync (PRD #364 M6): a per-tick poller sibling for
 	// GitHub synced repos that reads item Statuses, diffs each against the stored
 	// marker, and writes the matching column label via AutoMove for GitHub-side

@@ -6901,8 +6901,9 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			// (D9), or when no forge builder is wired (tests).
 			IssueComments: issueCommentsJSON,
 			// PRD #700 M2: issue runs never carry MR review comments — always NULL here.
-			// The mr_rework create path (M3's CreateAutoMRReworkRun) fetches the MR review
-			// snapshot via fetchReviewCommentsSnapshot and populates this itself.
+			// The mr_rework create paths (CreateAutoMRReworkRun, CreateManualMRReworkRun) take
+			// the author-assessed MR review snapshot from their callers and populate this
+			// themselves.
 			ReviewComments: nil,
 			// issue #857 M2: the provenance stamp threaded from each public entrypoint
 			// ("manual"/"schedule"/"autopilot"), so a run records why it fired.

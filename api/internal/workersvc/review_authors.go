@@ -1,0 +1,635 @@
+package workersvc
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"slices"
+	"sort"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issueinput"
+	"github.com/vtmocanu/uzi/api/internal/settings"
+	"github.com/vtmocanu/uzi/api/internal/store"
+)
+
+// Author eligibility for the MR review-comment rework lane (issue #2347). A review comment
+// feeds an agent prompt, so its body is only captured when its AUTHOR may be trusted with that:
+// the author has repository access (the same forge.Forge.RepositoryAuthorEligibility question
+// the issue lane asks, through issueinput.Assessment), or is an allowlisted review bot
+// (settings.KeyMrReviewTrustedBots). ReviewAssessor does that work for both callers, the
+// poller's automatic watcher and the on-demand rework endpoint, so they cannot drift.
+//
+// The work is bounded and fair. One tick makes at most issueinput.MaxDistinctAuthors lookups
+// inside issueinput.AssessmentTimeout, each under a per-lookup timeout, and the authors whose
+// answer is still needed wait in a per-(repo, ref) FIFO queue (mr_review_author_queue) so a
+// flood of unanswerable authors cannot starve the one that matters: whoever was attempted goes
+// to the back, whoever was not reached keeps its place at the front.
+
+const (
+	// DefaultReviewLookupTimeout bounds one author lookup, so a single hanging forge call
+	// costs one slot of the tick instead of the whole assessment deadline.
+	DefaultReviewLookupTimeout = 5 * time.Second
+	// reviewVerdictTTL is how long a not-eligible answer is trusted before it is asked again.
+	reviewVerdictTTL = 6 * time.Hour
+	// reviewQueueStaleAfter is how long an untouched queue row survives eviction.
+	reviewQueueStaleAfter = 7 * 24 * time.Hour
+)
+
+// ReviewAuthorQueueOps is the set of queue statements that mutate a review-author queue.
+// *store.Queries satisfies it. They only ever run through ReviewQueueMutator, which holds the
+// per-(repo, ref) advisory lock around them.
+type ReviewAuthorQueueOps interface {
+	AdmitReviewAuthors(ctx context.Context, arg store.AdmitReviewAuthorsParams) error
+	RequeueReviewAuthors(ctx context.Context, arg store.RequeueReviewAuthorsParams) error
+	PruneReviewAuthorQueue(ctx context.Context, arg store.PruneReviewAuthorQueueParams) (int64, error)
+	DeleteStaleReviewAuthorQueue(ctx context.Context, arg store.DeleteStaleReviewAuthorQueueParams) (int64, error)
+}
+
+// ReviewQueueMutator runs fn against the queue of one (repo, ref) inside its own short
+// transaction, after taking the per-(repo, ref) advisory lock. *Service satisfies it.
+type ReviewQueueMutator interface {
+	MutateReviewAuthorQueue(ctx context.Context, repoID uuid.UUID, ref string, fn func(ReviewAuthorQueueOps) error) error
+}
+
+// ReviewAuthorStore is the unlocked half of the assessor's storage: the verdict cache and the
+// queue reads. *store.Queries satisfies it.
+type ReviewAuthorStore interface {
+	ListReviewAuthorQueue(ctx context.Context, arg store.ListReviewAuthorQueueParams) ([]store.ListReviewAuthorQueueRow, error)
+	ListFreshNotEligibleAuthors(ctx context.Context, arg store.ListFreshNotEligibleAuthorsParams) ([]int64, error)
+	UpsertReviewAuthorVerdict(ctx context.Context, arg store.UpsertReviewAuthorVerdictParams) error
+	DeleteExpiredReviewAuthorVerdicts(ctx context.Context, arg store.DeleteExpiredReviewAuthorVerdictsParams) (int64, error)
+	ListStaleReviewAuthorQueueRefs(ctx context.Context, arg store.ListStaleReviewAuthorQueueRefsParams) ([]string, error)
+}
+
+// MutateReviewAuthorQueue is the only way a review-author queue is changed. It begins a
+// transaction, takes the per-(repo, ref) advisory lock FIRST (store.ReviewAuthorQueueLockClass),
+// runs fn on the transaction-bound queries, and commits. The lock is held for fn's few SQL
+// statements only: fn must never call the forge or do a lookup. Read-then-write decisions are
+// made by the caller from an unlocked read, which is why the prune is bounded by the sequence
+// value observed at read time (PruneReviewAuthorQueue).
+func (s *Service) MutateReviewAuthorQueue(ctx context.Context, repoID uuid.UUID, ref string, fn func(ReviewAuthorQueueOps) error) error {
+	if s.txBeginner == nil {
+		return errors.New("review author queue: no transaction beginner wired")
+	}
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // a no-op after Commit
+	q := store.New(tx)
+	if err := q.LockReviewAuthorQueue(ctx, store.LockReviewAuthorQueueParams{RepoID: repoID, Ref: ref}); err != nil {
+		return err
+	}
+	if err := fn(q); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// ReviewAssessor assesses the authors of an MR's review comments. The zero Timeout and Now
+// mean DefaultReviewLookupTimeout and time.Now.
+type ReviewAssessor struct {
+	Store   ReviewAuthorStore
+	Queue   ReviewQueueMutator
+	Timeout time.Duration
+	Now     func() time.Time
+	// MaxAttempts caps the queued candidate lookups of one assessment; zero means
+	// issueinput.MaxDistinctAuthors, the most the shared Assessment allows anyway. Tests lower it
+	// to exercise the fair-progress bound with a handful of authors.
+	MaxAttempts int
+}
+
+func (a *ReviewAssessor) now() time.Time {
+	if a.Now != nil {
+		return a.Now()
+	}
+	return time.Now()
+}
+
+func (a *ReviewAssessor) maxAttempts() int {
+	if a.MaxAttempts > 0 {
+		return min(a.MaxAttempts, issueinput.MaxDistinctAuthors)
+	}
+	return issueinput.MaxDistinctAuthors
+}
+
+func (a *ReviewAssessor) timeout() time.Duration {
+	if a.Timeout > 0 {
+		return a.Timeout
+	}
+	return DefaultReviewLookupTimeout
+}
+
+// ReviewAssessParams is one assessment's input.
+type ReviewAssessParams struct {
+	RepoID         uuid.UUID
+	Ref            string
+	ProjectID      int64
+	BaseURL        string // the connection's base URL, for the trusted-bot instance match
+	BotForgeUserID int64
+	Lookup         issueinput.AuthorLookup
+	Trusted        []settings.TrustedBot
+	// Comments is the MR's complete comment list, oldest first (the driver guarantee).
+	Comments []forge.MRComment
+	// HighWater and Pending come from the ledger row: a comment is NEW when its id is above
+	// HighWater or is in Pending.
+	HighWater int64
+	Pending   []int64
+}
+
+type reviewClass int
+
+const (
+	classUnknown reviewClass = iota // not assessed, or the lookup failed
+	classEligible
+	classNotEligible
+)
+
+// timeoutLookup bounds each lookup with its own deadline. The child context keeps the
+// values of the assessment context (forge.BeginAuthorAssessment's evidence cache).
+type timeoutLookup struct {
+	inner issueinput.AuthorLookup
+	d     time.Duration
+}
+
+func (t timeoutLookup) RepositoryAuthorEligibility(ctx context.Context, projectID, authorID int64) (forge.AuthorEligibility, error) {
+	ctx, cancel := context.WithTimeout(ctx, t.d)
+	defer cancel()
+	return t.inner.RepositoryAuthorEligibility(ctx, projectID, authorID)
+}
+
+// ReviewAssessment is one assessment in flight. Begin runs the candidate phase; Snapshot
+// finishes it. Close releases the deadline and must always be called.
+type ReviewAssessment struct {
+	assessor *ReviewAssessor
+	p        ReviewAssessParams
+	asmt     *issueinput.Assessment
+	kept     []forge.MRComment // every non-self comment, in forge order (oldest first)
+	pending  map[int64]bool
+	trusted  map[int64]bool        // author ids matched by the allowlist
+	class    map[int64]reviewClass // author id -> decided class
+	tried    map[int64]bool        // author ids a lookup was attempted for
+
+	// Attempted is how many queued candidate authors this tick tried to look up (the A_t of
+	// the fair-progress bound); ContextAttempted counts the context-only authors Snapshot
+	// tried afterwards.
+	Attempted        int
+	ContextAttempted int
+}
+
+// Close releases the assessment's deadline timer.
+func (r *ReviewAssessment) Close() { r.asmt.Close() }
+
+// toReviewSnapshot converts a forge comment, sanitizing the author name for display.
+func toReviewSnapshot(c forge.MRComment) ReviewCommentSnapshot {
+	return ReviewCommentSnapshot{
+		ID:                c.ID,
+		AuthorUsername:    issueinput.AuthorName(c.AuthorUsername),
+		AuthorForgeUserID: c.AuthorForgeUserID,
+		CreatedAt:         c.CreatedAt,
+		Body:              c.Body,
+		Path:              c.Path,
+		Line:              c.Line,
+		ReplyID:           c.ReplyID,
+		ResolveID:         c.ResolveID,
+		HeadSHA:           c.HeadSHA,
+		ReviewState:       c.ReviewState,
+	}
+}
+
+func (r *ReviewAssessment) actionable(c forge.MRComment) bool {
+	if r.trusted[c.AuthorForgeUserID] && c.ReviewState == forge.ReviewCommentSummary {
+		return false // an allowlisted bot's summary note is never a reason to fire
+	}
+	return IsActionableReviewComment(toReviewSnapshot(c))
+}
+
+func (r *ReviewAssessment) isNew(c forge.MRComment) bool {
+	return c.ID > r.p.HighWater || r.pending[c.ID]
+}
+
+func commentLess(a, b forge.MRComment) bool {
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return a.CreatedAt.Before(b.CreatedAt)
+	}
+	return a.ID < b.ID
+}
+
+// Begin runs the candidate phase: it decides every author it can without a lookup (allowlist,
+// unresolvable id, fresh not-eligible verdict), admits the remaining candidate authors to the
+// queue, looks them up in queue order, records the not-eligible answers, and re-queues and
+// prunes. A candidate is the author of an actionable NEW comment. It returns (nil, nil) when
+// there is nothing to assess: an unknown bot id (the self-filter cannot work, so no snapshot)
+// or no comment left after the self-filter. Any error means the tick should be skipped: the
+// verdict or queue could not be read, or the admission write failed.
+func (a *ReviewAssessor) Begin(ctx context.Context, p ReviewAssessParams) (*ReviewAssessment, error) {
+	if p.BotForgeUserID <= 0 {
+		return nil, nil
+	}
+	kept := make([]forge.MRComment, 0, len(p.Comments))
+	for _, c := range p.Comments {
+		if c.AuthorForgeUserID == p.BotForgeUserID {
+			continue
+		}
+		kept = append(kept, c)
+	}
+	if len(kept) == 0 {
+		return nil, nil
+	}
+	r := &ReviewAssessment{
+		assessor: a,
+		p:        p,
+		asmt:     issueinput.NewAssessment(ctx, timeoutLookup{p.Lookup, a.timeout()}, p.ProjectID),
+		kept:     kept,
+		pending:  map[int64]bool{},
+		trusted:  map[int64]bool{},
+		class:    map[int64]reviewClass{},
+		tried:    map[int64]bool{},
+	}
+	for _, id := range p.Pending {
+		r.pending[id] = true
+	}
+	if err := r.begin(ctx); err != nil {
+		r.Close()
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *ReviewAssessment) begin(ctx context.Context) error {
+	a, p := r.assessor, r.p
+	fresh, err := a.Store.ListFreshNotEligibleAuthors(ctx, store.ListFreshNotEligibleAuthorsParams{
+		RepoID: p.RepoID,
+		Since:  pgtype.Timestamptz{Time: a.now().Add(-reviewVerdictTTL), Valid: true},
+	})
+	if err != nil {
+		return err
+	}
+	freshSet := make(map[int64]bool, len(fresh))
+	for _, id := range fresh {
+		freshSet[id] = true
+	}
+	for _, c := range r.kept {
+		id := c.AuthorForgeUserID
+		if _, done := r.class[id]; done {
+			continue
+		}
+		switch {
+		case settings.TrustedBotMatches(p.Trusted, p.BaseURL, id):
+			r.trusted[id] = true
+			r.class[id] = classEligible
+		case id <= 0:
+			r.class[id] = classNotEligible // unresolvable identity: never looked up
+		case freshSet[id]:
+			r.class[id] = classNotEligible
+		}
+	}
+
+	// Candidates, oldest candidate comment first (the admission order).
+	ordered := slices.Clone(r.kept)
+	sort.SliceStable(ordered, func(i, j int) bool { return commentLess(ordered[i], ordered[j]) })
+	var candidates []int64
+	isCandidate := map[int64]bool{}
+	for _, c := range ordered {
+		id := c.AuthorForgeUserID
+		if _, done := r.class[id]; done || isCandidate[id] || !r.isNew(c) || !r.actionable(c) {
+			continue
+		}
+		isCandidate[id] = true
+		candidates = append(candidates, id)
+	}
+
+	rows, err := r.admitAndList(ctx, candidates)
+	if err != nil {
+		return err
+	}
+	var observedMax int64
+	if n := len(rows); n > 0 {
+		observedMax = rows[n-1].QueueSeq
+	}
+	// Attempt order: ascending queue position. Candidates the read did not show (a concurrent
+	// eviction) follow, in admission order.
+	attemptOrder := make([]int64, 0, len(candidates))
+	queued := map[int64]bool{}
+	for _, row := range rows {
+		queued[row.ForgeUserID] = true
+		if isCandidate[row.ForgeUserID] {
+			attemptOrder = append(attemptOrder, row.ForgeUserID)
+		}
+	}
+	for _, id := range candidates {
+		if !queued[id] {
+			attemptOrder = append(attemptOrder, id)
+		}
+	}
+
+	var attempted []int64
+	for _, id := range attemptOrder {
+		if r.asmt.Context().Err() != nil || r.Attempted >= a.maxAttempts() {
+			break // the rest were not reached: they keep their place at the front
+		}
+		r.Attempted++
+		r.lookup(id)
+		attempted = append(attempted, id)
+	}
+	r.recordVerdicts(ctx, attempted)
+
+	var requeue []int64
+	for _, id := range attempted {
+		if r.class[id] != classEligible {
+			requeue = append(requeue, id) // unknown or not-eligible go to the back, in attempt order
+		}
+	}
+	if len(rows) > 0 || len(candidates) > 0 {
+		err := a.Queue.MutateReviewAuthorQueue(ctx, p.RepoID, p.Ref, func(q ReviewAuthorQueueOps) error {
+			if len(requeue) > 0 {
+				if err := q.RequeueReviewAuthors(ctx, store.RequeueReviewAuthorsParams{RepoID: p.RepoID, Ref: p.Ref, ForgeUserIds: requeue}); err != nil {
+					return err
+				}
+			}
+			keep := candidates
+			if keep == nil {
+				keep = []int64{}
+			}
+			_, err := q.PruneReviewAuthorQueue(ctx, store.PruneReviewAuthorQueueParams{
+				RepoID: p.RepoID, Ref: p.Ref, ObservedMaxSeq: observedMax, KeepIds: keep,
+			})
+			return err
+		})
+		if err != nil {
+			// Best effort: this tick's answers stand; the next tick re-queues and prunes.
+			slog.Warn("workersvc: review author queue requeue/prune", "repo", p.RepoID.String(), "ref", p.Ref, "error", err)
+		}
+	}
+	return nil
+}
+
+// admitAndList admits the candidates under the lock and then reads the queue unlocked. The
+// read happens after the admission so the max sequence observed bounds everything the later
+// prune may delete.
+func (r *ReviewAssessment) admitAndList(ctx context.Context, candidates []int64) ([]store.ListReviewAuthorQueueRow, error) {
+	a, p := r.assessor, r.p
+	if len(candidates) > 0 {
+		err := a.Queue.MutateReviewAuthorQueue(ctx, p.RepoID, p.Ref, func(q ReviewAuthorQueueOps) error {
+			return q.AdmitReviewAuthors(ctx, store.AdmitReviewAuthorsParams{RepoID: p.RepoID, Ref: p.Ref, ForgeUserIds: candidates})
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return a.Store.ListReviewAuthorQueue(ctx, store.ListReviewAuthorQueueParams{RepoID: p.RepoID, Ref: p.Ref})
+}
+
+// lookup asks the forge about one author through the shared Assessment, which caches the
+// answer, enforces the deadline and the distinct-author budget, and degrades any failure to
+// unknown.
+func (r *ReviewAssessment) lookup(id int64) {
+	r.tried[id] = true
+	name := ""
+	if c, ok := r.firstComment(id); ok {
+		name = c.AuthorUsername
+	}
+	d, _ := r.asmt.Author(forge.Issue{AuthorForgeUserID: id, Author: name})
+	switch d {
+	case forge.AuthorEligible:
+		r.class[id] = classEligible
+	case forge.AuthorNotEligible:
+		r.class[id] = classNotEligible
+	default:
+		r.class[id] = classUnknown
+	}
+}
+
+func (r *ReviewAssessment) firstComment(authorID int64) (forge.MRComment, bool) {
+	for _, c := range r.kept {
+		if c.AuthorForgeUserID == authorID {
+			return c, true
+		}
+	}
+	return forge.MRComment{}, false
+}
+
+// recordVerdicts stores the not-eligible answers just obtained. Best effort: a failed write
+// only costs one repeat lookup next tick.
+func (r *ReviewAssessment) recordVerdicts(ctx context.Context, ids []int64) {
+	p := r.p
+	for _, id := range ids {
+		if r.class[id] != classNotEligible {
+			continue
+		}
+		err := r.assessor.Store.UpsertReviewAuthorVerdict(ctx, store.UpsertReviewAuthorVerdictParams{
+			RepoID:        p.RepoID,
+			ForgeUserID:   id,
+			NotEligibleAt: pgtype.Timestamptz{Time: r.assessor.now(), Valid: true},
+		})
+		if err != nil {
+			slog.Warn("workersvc: record review author verdict", "repo", p.RepoID.String(), "error", err)
+		}
+	}
+}
+
+func (r *ReviewAssessment) classOf(c forge.MRComment) reviewClass {
+	return r.class[c.AuthorForgeUserID] // an author never assessed reads as unknown
+}
+
+// HasTrigger reports whether an ELIGIBLE, actionable, new comment exists among the authors
+// decided so far: the condition for the automatic watcher to go on and fire.
+func (r *ReviewAssessment) HasTrigger() bool {
+	for _, c := range r.kept {
+		if r.isNew(c) && r.actionable(c) && r.classOf(c) == classEligible {
+			return true
+		}
+	}
+	return false
+}
+
+// NewestEligible is the newest eligible comment decided so far. The watcher's cheap early
+// debounce check reads it: assessing more authors can only make the newest comment newer, so
+// a comment still inside the quiet period stays inside it.
+func (r *ReviewAssessment) NewestEligible() (forge.MRComment, bool) {
+	for i := len(r.kept) - 1; i >= 0; i-- {
+		if r.classOf(r.kept[i]) == classEligible {
+			return r.kept[i], true
+		}
+	}
+	return forge.MRComment{}, false
+}
+
+// UnknownNewCount counts the actionable new comments whose author is permission-unknown.
+func (r *ReviewAssessment) UnknownNewCount() int {
+	n := 0
+	for _, c := range r.kept {
+		if r.isNew(c) && r.actionable(c) && r.classOf(c) == classUnknown {
+			n++
+		}
+	}
+	return n
+}
+
+// ReviewSnapshotResult is the finished assessment: the eligible-only snapshot plus what the
+// ledger needs to know about every comment.
+type ReviewSnapshotResult struct {
+	Snapshot *ReviewCommentsSnapshot
+	// Attempted and ContextAttempted mirror the assessment's counters.
+	Attempted        int
+	ContextAttempted int
+
+	eligibleActionable []int64 // ids of actionable comments kept in the (capped) snapshot
+	unknownActionable  []int64 // ids of actionable comments whose author is unknown
+	class              map[int64]reviewClass
+	inSnapshot         map[int64]bool
+}
+
+// Snapshot finishes the assessment: it looks up the context-only authors (everyone not yet
+// decided, oldest comment first, never queued), classifies the whole comment list, and only
+// then applies the count and byte caps to the eligible comments. Comments of authors that
+// could not be assessed in time are withheld as permission_unknown.
+func (r *ReviewAssessment) Snapshot(ctx context.Context) *ReviewSnapshotResult {
+	ordered := slices.Clone(r.kept)
+	sort.SliceStable(ordered, func(i, j int) bool { return commentLess(ordered[i], ordered[j]) })
+	var ctxTried []int64
+	for _, c := range ordered {
+		id := c.AuthorForgeUserID
+		if _, done := r.class[id]; done || r.tried[id] {
+			continue
+		}
+		if r.asmt.Context().Err() != nil || len(r.tried) >= issueinput.MaxDistinctAuthors {
+			break
+		}
+		r.ContextAttempted++
+		r.lookup(id)
+		ctxTried = append(ctxTried, id)
+	}
+	r.recordVerdicts(ctx, ctxTried)
+
+	res := &ReviewSnapshotResult{
+		Attempted:        r.Attempted,
+		ContextAttempted: r.ContextAttempted,
+		class:            make(map[int64]reviewClass, len(r.kept)),
+		inSnapshot:       map[int64]bool{},
+	}
+	snap := &ReviewCommentsSnapshot{Version: ReviewSnapshotVersion, Comments: []ReviewCommentSnapshot{}}
+	var eligible []ReviewCommentSnapshot
+	var eligibleActionable []bool
+	for _, c := range r.kept {
+		cl := r.classOf(c)
+		res.class[c.ID] = cl
+		switch cl {
+		case classEligible:
+			eligible = append(eligible, toReviewSnapshot(c))
+			eligibleActionable = append(eligibleActionable, r.actionable(c))
+		case classNotEligible:
+			snap.WithheldNotEligible++
+		default:
+			snap.WithheldUnknown++
+			if r.actionable(c) {
+				res.unknownActionable = append(res.unknownActionable, c.ID)
+			}
+		}
+	}
+	snap.Comments, snap.Truncated = capReviewComments(eligible)
+	// The caps keep the newest tail, so the kept comments line up with the end of eligible.
+	offset := len(eligible) - len(snap.Comments)
+	for i, c := range snap.Comments {
+		res.inSnapshot[c.ID] = true
+		if eligibleActionable[offset+i] {
+			res.eligibleActionable = append(res.eligibleActionable, c.ID)
+		}
+	}
+	res.Snapshot = snap
+	return res
+}
+
+// ReviewPlan is what a snapshot means for one ledger row.
+type ReviewPlan struct {
+	// HasNew: an eligible actionable comment in the snapshot is above the high-water mark or
+	// pending, i.e. there is something to rework.
+	HasNew bool
+	// MaxActionableID is the high-water mark to advance to: the largest eligible actionable
+	// id in the (capped) snapshot, 0 when there is none.
+	MaxActionableID int64
+	// UnknownNew counts actionable comments from permission-unknown authors that are new.
+	UnknownNew int
+	// PendingAdd and PendingRemove are the ledger's pending_unknown_ids delta.
+	PendingAdd    []int64
+	PendingRemove []int64
+}
+
+// Plan computes the plan against a ledger row's high-water mark and pending set.
+func (res *ReviewSnapshotResult) Plan(highWater int64, pending []int64) ReviewPlan {
+	pendingSet := make(map[int64]bool, len(pending))
+	for _, id := range pending {
+		pendingSet[id] = true
+	}
+	var plan ReviewPlan
+	for _, id := range res.eligibleActionable {
+		if id > plan.MaxActionableID {
+			plan.MaxActionableID = id
+		}
+		if id > highWater || pendingSet[id] {
+			plan.HasNew = true
+		}
+	}
+	newMark := max(highWater, plan.MaxActionableID)
+	plan.PendingAdd = []int64{}
+	for _, id := range res.unknownActionable {
+		if id > highWater || pendingSet[id] {
+			plan.UnknownNew++
+		}
+		if id <= newMark {
+			plan.PendingAdd = append(plan.PendingAdd, id) // the ledger keeps only ids above its old mark
+		}
+	}
+	plan.PendingRemove = []int64{}
+	for _, id := range pending {
+		cl, present := res.class[id]
+		switch {
+		case !present, cl == classNotEligible:
+			plan.PendingRemove = append(plan.PendingRemove, id) // gone, or its author is now known to be out
+		case cl == classEligible && res.inSnapshot[id]:
+			plan.PendingRemove = append(plan.PendingRemove, id) // consumed by this snapshot
+		}
+	}
+	return plan
+}
+
+// NewestEligible is the newest eligible comment of the finished snapshot.
+func (res *ReviewSnapshotResult) NewestEligible() (ReviewCommentSnapshot, bool) {
+	if n := len(res.Snapshot.Comments); n > 0 {
+		return res.Snapshot.Comments[n-1], true
+	}
+	return ReviewCommentSnapshot{}, false
+}
+
+// EvictStale is the best-effort housekeeping the watcher runs once per repo tick: expired
+// verdicts, and queue rows untouched for a week. Each stale queue is evicted under its own
+// lock, so the eviction cannot interleave with a running mutation of that queue.
+func (a *ReviewAssessor) EvictStale(ctx context.Context, repoID uuid.UUID) error {
+	now := a.now()
+	var errs []error
+	if _, err := a.Store.DeleteExpiredReviewAuthorVerdicts(ctx, store.DeleteExpiredReviewAuthorVerdictsParams{
+		RepoID: repoID, Before: pgtype.Timestamptz{Time: now.Add(-reviewVerdictTTL), Valid: true},
+	}); err != nil {
+		errs = append(errs, err)
+	}
+	before := pgtype.Timestamptz{Time: now.Add(-reviewQueueStaleAfter), Valid: true}
+	refs, err := a.Store.ListStaleReviewAuthorQueueRefs(ctx, store.ListStaleReviewAuthorQueueRefsParams{RepoID: repoID, Before: before})
+	if err != nil {
+		return errors.Join(append(errs, err)...)
+	}
+	for _, ref := range refs {
+		err := a.Queue.MutateReviewAuthorQueue(ctx, repoID, ref, func(q ReviewAuthorQueueOps) error {
+			_, err := q.DeleteStaleReviewAuthorQueue(ctx, store.DeleteStaleReviewAuthorQueueParams{RepoID: repoID, Ref: ref, Before: before})
+			return err
+		})
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
