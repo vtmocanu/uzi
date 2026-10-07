@@ -39,6 +39,7 @@ func TestDefaultEditableDivergesOutputMode(t *testing.T) {
 			pgtype.Bool{}, // mr_rework: inherit
 			pgtype.Int4{}, // max_issues: unset (prompt has no cap)
 			outputMode,
+			false,
 		)
 	}
 

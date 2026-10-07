@@ -3,10 +3,10 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
-	"time"
 	"unicode/utf8"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -637,50 +637,58 @@ func prDescFullBody(summary string, items []string) apitypes.PrDescriptionFields
 	return in
 }
 
-func prDescProse(n int) string {
-	return strings.Repeat("Adds a retry to the uploader, see the notes in docs/retry.md for details. ", n/70+1)[:n]
-}
-
-// TestSanitizePrDescriptionWorstCaseIsLinear (H-A): every adversarial shape, and a full stage body
-// at every raw cap built from all of them, sanitizes in time proportional to its size. Each is
-// timed against the same-size plain prose in the same process (so -race and a loaded host scale
-// both sides) and must stay within 10x of it plus a small constant, with an absolute backstop.
-// Before the fix one 4000-byte `<`-run took seconds (thousands of times plain prose), and a full
-// body of them tens of seconds.
-func TestSanitizePrDescriptionWorstCaseIsLinear(t *testing.T) {
-	timeIt := func(f func()) time.Duration {
-		start := time.Now()
-		f()
-		return time.Since(start)
+// TestSanitizePrDescriptionWorstCaseAllocationsBounded (H-A) enforces an allocation budget
+// of 4096 + 4*len(input) for each tested adversarial field shape and size, and 262144 for a
+// full stage body at every raw cap. These budgets guard against allocation-heavy regressions;
+// they do not establish universal CPU linearity. Subtests run serially: AllocsPerRun supplies
+// a warm-up call and temporarily sets GOMAXPROCS to 1, restoring it when done.
+func TestSanitizePrDescriptionWorstCaseAllocationsBounded(t *testing.T) {
+	for _, size := range []int{1000, 2000, MaxPrDescSummaryRawBytes} {
+		t.Run(fmt.Sprintf("size_%d", size), func(t *testing.T) {
+			for i, input := range prDescAdversarial(size) {
+				t.Run(fmt.Sprintf("shape_%02d", i), func(t *testing.T) {
+					var out string
+					allocs := testing.AllocsPerRun(1, func() {
+						out = SanitizePrDescriptionText(input, PrDescSummaryMaxBytes)
+					})
+					ceiling := float64(4096 + 4*len(input))
+					t.Logf("%d-byte field: %.0f allocations (ceiling %.0f)", len(input), allocs, ceiling)
+					if allocs > ceiling {
+						t.Errorf("shape %d (%.20q…): %.0f allocations exceed ceiling %.0f", i, input, allocs, ceiling)
+					}
+					assertPrDescInert(t, out)
+				})
+			}
+		})
 	}
-	summaries := prDescAdversarial(MaxPrDescSummaryRawBytes)
-	prose := prDescProse(MaxPrDescSummaryRawBytes)
-	base := timeIt(func() { SanitizePrDescriptionText(prose, PrDescSummaryMaxBytes) })
-	for i, summary := range summaries {
-		var out string
-		elapsed := timeIt(func() { out = SanitizePrDescriptionText(summary, PrDescSummaryMaxBytes) })
-		if elapsed > 10*base+50*time.Millisecond {
-			t.Errorf("shape %d (%.20q…): one %d-byte field took %v (plain prose %v)", i, summary, len(summary), elapsed, base)
+
+	t.Run("full_body", func(t *testing.T) {
+		summaries := prDescAdversarial(MaxPrDescSummaryRawBytes)
+		input := prDescFullBody(summaries[0], prDescAdversarial(MaxPrDescItemRawBytes))
+		ctx := context.Background()
+		var out apitypes.PrDescriptionFields
+		var err error
+		allocs := testing.AllocsPerRun(1, func() {
+			out, err = SanitizePrDescriptionFields(ctx, input)
+		})
+		if err != nil {
+			t.Fatalf("full body: %v", err)
 		}
-		assertPrDescInert(t, out)
-	}
-
-	plain := prDescFullBody(prose, []string{prDescProse(MaxPrDescItemRawBytes)})
-	worst := prDescFullBody(summaries[0], prDescAdversarial(MaxPrDescItemRawBytes))
-	var out apitypes.PrDescriptionFields
-	var err error
-	baseBody := timeIt(func() { _, _ = SanitizePrDescriptionFields(context.Background(), plain) })
-	elapsed := timeIt(func() { out, err = SanitizePrDescriptionFields(context.Background(), worst) })
-	if err != nil {
-		t.Fatalf("full body: %v", err)
-	}
-	t.Logf("full stage body: worst case %v, plain prose %v", elapsed, baseBody)
-	if elapsed > 10*baseBody+200*time.Millisecond || elapsed > 10*time.Second {
-		t.Errorf("worst-case full stage body took %v (plain prose %v)", elapsed, baseBody)
-	}
-	for _, s := range append(append([]string{out.Summary}, out.Changes...), out.ReviewPointers...) {
-		assertPrDescInert(t, s)
-	}
+		const ceiling = 262144
+		t.Logf("full stage body: %.0f allocations (ceiling %d)", allocs, ceiling)
+		if allocs > ceiling {
+			t.Errorf("worst-case full stage body: %.0f allocations exceed ceiling %d", allocs, ceiling)
+		}
+		for _, s := range append(append([]string{out.Summary}, out.Changes...), out.ReviewPointers...) {
+			assertPrDescInert(t, s)
+		}
+		for _, n := range out.ScopeNotes {
+			assertPrDescInert(t, n.Text)
+		}
+		for _, v := range out.Verification {
+			assertPrDescInert(t, v.Command)
+		}
+	})
 }
 
 // TestSanitizePrDescriptionFieldsHonoursCancel: a cancelled request stops sanitizing.

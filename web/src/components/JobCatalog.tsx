@@ -142,7 +142,9 @@ function JobCard({
         {entry.model ? <Chip>model {entry.model}</Chip> : <Chip>inherit model</Chip>}
         {entry.target === "sweep" && assigned && <Chip>assigned to uzi</Chip>}
         {entry.target === "sweep" && !assigned && entry.labels?.map((l) => <Chip key={l}>label {l}</Chip>)}
-        {entry.target === "sweep" && entry.max_issues > 0 && <Chip>max {entry.max_issues}</Chip>}
+        {entry.target === "sweep" && entry.max_issues > 0 && <Chip>max {entry.max_issues}{entry.capacity_limit != null ? " at a time" : ""}</Chip>}
+        {entry.capacity_limit != null && <Chip>limit {entry.capacity_limit} · room {entry.capacity_room_needed}</Chip>}
+        {entry.remove_label_on_dispatch && <Chip>removes label</Chip>}
       </div>
 
       {/* The footer sits at the card's bottom edge so a row of cards lines up. */}

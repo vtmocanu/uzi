@@ -1160,6 +1160,206 @@ async function terminalFileNames(runDir: string): Promise<string[]> {
   return names.filter((n) => n.startsWith("terminal-") && n.endsWith(".json")).sort();
 }
 
+describe("Outbox startup terminal temp cleanup (#2308)", () => {
+  const uuid = "12345678-abcd-4abc-8abc-123456789abc";
+  const tempName = (gen: number) => `terminal-${gen}.json.${uuid}.tmp`;
+  const body = () => canonicalizeTerminalBody({ status: "completed", report_md: "preserve me" }, 1 << 20);
+
+  it("stale temp-only run loses protection on restart and can retire", async () => {
+    const root = await mkRoot();
+    const a = makeOutbox(root);
+    await a.init();
+    const dir = path.join(root, "r1");
+    await fs.mkdir(dir);
+    const tmp = path.join(dir, tempName(0));
+    await fs.writeFile(tmp, "interrupted write");
+    assert.equal(await a.hasPhysicalTerminalProtection("r1"), true);
+    const b = makeOutbox(root);
+    await b.init();
+    assert.equal(existsSync(tmp), false, "startup removes stale canonical terminal temp");
+    assert.equal(await b.hasPhysicalTerminalProtection("r1"), false);
+    await b.retireRun("r1");
+    assert.equal(existsSync(dir), false);
+  });
+
+  it("preserves installed bytes and pending state while removing separate and hardlinked temps", async () => {
+    const root = await mkRoot();
+    const a = makeOutbox(root);
+    await a.init();
+    await a.journalTerminal("r1", 1, "reviewing", 0, body());
+    const dir = path.join(root, "r1");
+    const installed = path.join(dir, "terminal-1.json");
+    const bytes = await fs.readFile(installed);
+    await fs.link(installed, path.join(dir, tempName(1)));
+    await fs.writeFile(path.join(dir, tempName(2)), "partial");
+    const b = makeOutbox(root);
+    await b.init();
+    assert.deepEqual((await fs.readdir(dir)).sort(), ["terminal-1.json"]);
+    assert.deepEqual(await fs.readFile(installed), bytes);
+    assert.equal(b.listPendingTerminals().length, 1);
+    assert.equal(b.hasPendingTerminal("r1", 1), true);
+    assert.equal(await b.hasPhysicalTerminalProtection("r1"), true);
+    await b.retireRun("r1");
+    assert.deepEqual(await fs.readFile(installed), bytes);
+  });
+
+  it("preserves unknown and near matches, symlinks, directories and finalize temps", async () => {
+    const root = await mkRoot();
+    const a = makeOutbox(root);
+    await a.init();
+    const dir = path.join(root, "r1");
+    await fs.mkdir(dir);
+    const names = [
+      tempName(1).replace("terminal-1", "terminal-01"),
+      tempName(1).replace("terminal-1", "terminal-9007199254740992"),
+      tempName(1).replace(uuid, uuid.toUpperCase()),
+      tempName(1).replace("-4abc-", "-3abc-"),
+      tempName(1).replace("-8abc-", "-7abc-"),
+      tempName(1) + ".extra",
+      tempName(1).replace("terminal-", "finalize-"),
+      "terminal-unknown.tmp",
+    ];
+    for (const name of names) await fs.writeFile(path.join(dir, name), "untouched");
+    const target = path.join(root, "target");
+    await fs.writeFile(target, "target bytes");
+    await fs.symlink(target, path.join(dir, tempName(2)));
+    await fs.mkdir(path.join(dir, tempName(3)));
+    const b = makeOutbox(root);
+    await b.init();
+    assert.deepEqual((await fs.readdir(dir)).sort(), [...names, tempName(2), tempName(3)].sort());
+    for (const name of names) assert.equal(await fs.readFile(path.join(dir, name), "utf8"), "untouched");
+    assert.equal((await fs.lstat(path.join(dir, tempName(2)))).isSymbolicLink(), true);
+    assert.equal((await fs.lstat(path.join(dir, tempName(3)))).isDirectory(), true);
+    assert.equal(await fs.readFile(target, "utf8"), "target bytes");
+    assert.equal(await b.hasPhysicalTerminalProtection("r1"), true);
+  });
+
+  it("cleans before the manifest-present key-missing early return", async () => {
+    const root = await mkRoot();
+    const a = makeOutbox(root);
+    await a.init();
+    await a.appendSegment("r1", 1, [textMsg(1, "message")]);
+    await a.journalTerminal("r1", 1, "reviewing", 1, body());
+    const dir = path.join(root, "r1");
+    const manifest = await fs.readFile(path.join(dir, "manifest.json"));
+    const installed = await fs.readFile(path.join(dir, "terminal-1.json"));
+    await fs.writeFile(path.join(dir, tempName(2)), "partial");
+    await fs.unlink(path.join(root, ".key"));
+    const b = makeOutbox(root);
+    await b.init();
+    assert.equal(existsSync(path.join(dir, tempName(2))), false);
+    assert.equal(existsSync(path.join(root, ".key")), false);
+    assert.deepEqual(await fs.readFile(path.join(dir, "manifest.json")), manifest);
+    assert.deepEqual(await fs.readFile(path.join(dir, "terminal-1.json")), installed);
+    assert.equal(b.listPendingTerminals().length, 0);
+    assert.equal(await b.hasPhysicalTerminalProtection("r1"), true);
+    await b.retireRun("r1");
+    assert.deepEqual(await fs.readFile(path.join(dir, "terminal-1.json")), installed);
+  });
+
+  for (const operation of ["readdir", "lstat", "unlink"] as const) {
+    it(`best-effort ${operation} failure retains the temp and physical protection`, async () => {
+      const root = await mkRoot();
+      const a = makeOutbox(root);
+      await a.init();
+      const dir = path.join(root, "r1");
+      await fs.mkdir(dir);
+      const tmp = path.join(dir, tempName(1));
+      await fs.writeFile(tmp, "partial");
+      const { logger, lines } = recordingLogger();
+      const b = makeOutbox(root, { log: logger });
+      const original = fs[operation];
+      let injected = false;
+      const replacement = async (...args: unknown[]) => {
+        if (String(args[0]) === (operation === "readdir" ? dir : tmp) && !injected) {
+          injected = true;
+          throw new Error("private filesystem detail");
+        }
+        return Reflect.apply(original, fs, args);
+      };
+      try {
+        Object.defineProperty(fs, operation, { value: replacement, configurable: true, writable: true });
+        await b.init();
+      } finally {
+        Object.defineProperty(fs, operation, { value: original, configurable: true, writable: true });
+      }
+      assert.equal(injected, true);
+      assert.equal(existsSync(tmp), true);
+      assert.equal(await b.hasPhysicalTerminalProtection("r1"), true);
+      assert.ok(lines.some((line) => (line as { msg: string }).msg === "outbox: terminal temp startup cleanup failed"));
+      assert.equal(JSON.stringify(lines).includes("private filesystem detail"), false);
+    });
+  }
+
+  it("fsyncs earlier removals even when a later unlink fails", async () => {
+    const root = await mkRoot();
+    const a = makeOutbox(root);
+    await a.init();
+    const dir = path.join(root, "r1");
+    await fs.mkdir(dir);
+    for (const gen of [1, 2]) await fs.writeFile(path.join(dir, tempName(gen)), "partial");
+    const originalUnlink = fs.unlink;
+    const originalOpen = fs.open;
+    let attempts = 0;
+    let synced = false;
+    try {
+      fs.unlink = async (file) => {
+        if (path.dirname(String(file)) === dir && ++attempts === 2) throw new Error("later failure");
+        return originalUnlink(file);
+      };
+      fs.open = async (...args) => {
+        const handle = await originalOpen(...args);
+        if (String(args[0]) === dir) {
+          const originalSync = handle.sync.bind(handle);
+          handle.sync = async () => { synced = true; await originalSync(); };
+        }
+        return handle;
+      };
+      await makeOutbox(root).init();
+    } finally {
+      fs.unlink = originalUnlink;
+      fs.open = originalOpen;
+    }
+    assert.equal(attempts, 2);
+    assert.equal(synced, true, "successful earlier unlink gets a directory fsync");
+    assert.equal((await fs.readdir(dir)).length, 1);
+    assert.equal(await a.hasPhysicalTerminalProtection("r1"), true);
+  });
+
+  it("retirement waits for a live terminal temp to be installed", async () => {
+    const root = await mkRoot();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let reached!: (file: string) => void;
+    const paused = new Promise<string>((resolve) => { reached = resolve; });
+    const rawWrite: RawWriteSeam = async (write, ctx) => {
+      await write();
+      if (ctx.kind === "terminal" && path.basename(ctx.path).startsWith("terminal-1.json.") && ctx.path.endsWith(".tmp")) {
+        reached(ctx.path);
+        await gate;
+      }
+    };
+    const a = makeOutbox(root, { rawWrite });
+    await a.init();
+    const journal = a.journalTerminal("r1", 1, "reviewing", 0, body());
+    let retirement: Promise<void> | undefined;
+    try {
+      const tmp = await paused;
+      assert.equal(existsSync(tmp), true);
+      assert.equal(existsSync(path.join(root, "r1", "terminal-1.json")), false);
+      assert.equal(await a.hasPhysicalTerminalProtection("r1"), true);
+      retirement = a.retireRun("r1");
+    } finally {
+      release();
+      const [result] = await Promise.all([journal, retirement]);
+      assert.deepEqual(result, { journaled: true, adopted: false });
+    }
+    assert.equal(a.hasPendingTerminal("r1", 1), true);
+    assert.equal(await a.hasPhysicalTerminalProtection("r1"), true);
+    assert.equal(existsSync(path.join(root, "r1", "terminal-1.json")), true);
+  });
+});
+
 describe("Outbox M3 terminal-journal store (PRD #1391 Run B)", () => {
   it("T1. journalTerminal installs terminal-<gen>.json crash-atomically and lists it as pending", async () => {
     const root = await mkRoot();

@@ -76,6 +76,7 @@ func contractCases() []contractCase {
 		newContractCase[RepoDTO]("repo"),
 		newContractCase[MessageDTO]("message"),
 		newContractCase[ScheduleDTO]("schedule"),
+		newContractCase[RunNowResponse]("schedule_run_now"),
 		// ScheduleRequest is a REQUEST body: its full.json round-trips through
 		// DisallowUnknownFields (the runtime-400 class the PRD names) like every other row.
 		newContractCase[ScheduleRequest]("schedule_input"),

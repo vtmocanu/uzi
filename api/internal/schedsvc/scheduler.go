@@ -80,6 +80,7 @@ var errBadConfig = ErrBadConfig
 
 // Store is the DB surface the scheduler reads and writes. *store.Queries satisfies it.
 type Store interface {
+	GetIssueByIID(context.Context, store.GetIssueByIIDParams) (store.Issue, error)
 	CountInProgressRunsForUser(context.Context, uuid.UUID) (int64, error)
 	ClaimDueSchedules(ctx context.Context) ([]store.RunSchedule, error)
 	AdvanceSchedule(ctx context.Context, arg store.AdvanceScheduleParams) (store.RunSchedule, error)
@@ -156,6 +157,7 @@ type RunCreator interface {
 // ForgeBuilder builds a forge driver from a stored (encrypted) connection — the same
 // seam selfimprove/autopilot use. *forgesvc.Service satisfies it.
 type ForgeBuilder interface {
+	SetIssueLabel(context.Context, forge.Forge, int64, store.Issue, string, string, bool) (store.Issue, error)
 	ForgeForConnection(forgeType, baseURL string, tokenCiphertext []byte) (forge.Forge, error)
 }
 
@@ -492,6 +494,9 @@ func (e *Scheduler) RunNow(ctx context.Context, sched store.RunSchedule) (FireOu
 // On any non-nil error the returned FireOutcome is the zero value: the outcome is only
 // meaningful on the success/benign advance path (M2 persists it there).
 func (e *Scheduler) fireOne(ctx context.Context, sched store.RunSchedule) (FireOutcome, error) {
+	if sched.RemoveLabelOnDispatch && (sched.Target != "sweep" || sched.Timing != "recurring") {
+		return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipConfigNotSupported}}}, nil
+	}
 	switch sched.Target {
 	case "issue":
 		return e.fireIssue(ctx, sched)
@@ -616,6 +621,18 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 		if job.SelectorKind != "" {
 			selectorKind = job.SelectorKind
 		}
+	}
+	selectorLabel := ""
+	if sched.RemoveLabelOnDispatch {
+		var raw []string
+		if err := json.Unmarshal(sched.Labels, &raw); err != nil || selectorKind != schedtmpl.SelectorLabel {
+			return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipConfigNotSupported}}}, nil
+		}
+		raw = nonBlank(raw)
+		if len(raw) != 1 {
+			return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipConfigNotSupported}}}, nil
+		}
+		selectorLabel = raw[0]
 	}
 	var capacity *CapacityCheck
 	if sched.CapacityLimit.Valid {
@@ -763,6 +780,38 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 		} else {
 			// createIssueRun returns a single-issue FireOutcome (one Started or one Skip);
 			// fold it into the sweep's buckets.
+			if sched.RemoveLabelOnDispatch && len(res.Started) > 0 {
+				// At most one lookup/write per started candidate, no retries. A failure
+				// keeps this run and does not block later candidates in the existing scan.
+				for i := range res.Started {
+					res.Started[i].SelectorLabel = selectorLabel
+				}
+				uziLabel := settings.DefaultUziLabel
+				var removeErr error
+				if e.settings != nil {
+					var live string
+					live, removeErr = e.settings.UziLabel(ctx)
+					if strings.TrimSpace(live) != "" {
+						uziLabel = live
+					}
+				}
+				if removeErr != nil || selectorLabel != uziLabel {
+					if removeErr == nil {
+						var cached store.Issue
+						cached, removeErr = e.store.GetIssueByIID(ctx, store.GetIssueByIIDParams{RepoID: repo.ID, ForgeIssueIid: iid})
+						if removeErr == nil {
+							_, removeErr = e.forge.SetIssueLabel(ctx, f, repo.ForgeProjectID, cached, selectorLabel, "", false)
+						}
+					}
+					for i := range res.Started {
+						res.Started[i].LabelRemoved = removeErr == nil
+						res.Started[i].LabelRemoveFailed = removeErr != nil
+					}
+					if removeErr != nil {
+						e.logger.Warn("scheduler: remove selector label", "schedule", sched.ID.String(), "issue", iid, "error", removeErr)
+					}
+				}
+			}
 			out.Started = append(out.Started, res.Started...)
 			out.Skips = append(out.Skips, res.Skips...)
 		}
@@ -1440,7 +1489,7 @@ func promptTitle(prompt string) string {
 func nonBlank(in []string) []string {
 	out := in[:0]
 	for _, s := range in {
-		if strings.TrimSpace(s) != "" {
+		if s = strings.TrimSpace(s); s != "" {
 			out = append(out, s)
 		}
 	}

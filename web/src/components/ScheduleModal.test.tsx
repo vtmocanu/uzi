@@ -230,6 +230,7 @@ function schedFixture(over: Partial<Schedule> = {}): Schedule {
     last_fire: null,
     auto_approve: true,
     wait_on_limit: true,
+    remove_label_on_dispatch: false,
     capacity_limit: null,
     capacity_room_needed: null,
     max_issues: 10,
@@ -1617,6 +1618,119 @@ describe("capacity-gated recurring label sweeps", () => {
     for (const [, input] of mockApi.createSchedule.mock.calls) {
       expect(input).toMatchObject({ labels, capacity_limit: 4, capacity_room_needed: 2, max_issues: 10 });
       expect(input.sibling_group_id).toBeTruthy();
+    }
+  });
+});
+
+describe("selector label removal", () => {
+  const name = "Remove the selector label when a run starts";
+  function edit(over: Partial<Schedule> = {}) {
+    return render(<MemoryRouter><ScheduleModal editing={schedFixture(over)} onClose={vi.fn()} onSaved={vi.fn()} /></MemoryRouter>);
+  }
+  const save = () => fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  it("seeds stored true and sends explicit false when switched off", async () => {
+    edit({ labels: ["on-deck"], remove_label_on_dispatch: true });
+    const toggle = screen.getByRole("switch", { name });
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    save();
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenLastCalledWith("sch-1", expect.objectContaining({ remove_label_on_dispatch: true })));
+    fireEvent.click(toggle);
+    save();
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenLastCalledWith("sch-1", expect.objectContaining({ remove_label_on_dispatch: false })));
+  });
+  it.each([[[]], [["bug", "other"]], [["uzi"]]])("disables with a visible reason for %j and never sends true", async (labels) => {
+    edit({ labels, remove_label_on_dispatch: true });
+    expect((screen.getByRole("switch", { name }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(labels.length === 1 ? "The uzi eligibility label cannot be removed." : "Needs a single selector label.")).toBeTruthy();
+    save();
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenLastCalledWith("sch-1", expect.objectContaining({ remove_label_on_dispatch: false })));
+  });
+  it("uses the live custom uzi label and allows the old uzi name", () => {
+    vi.mocked(useAuth).mockReturnValue({ uziLabel: "runnable" } as ReturnType<typeof useAuth>);
+    const view = edit({ labels: ["runnable"] });
+    expect((screen.getByRole("switch", { name }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText("The runnable eligibility label cannot be removed.")).toBeTruthy();
+    view.unmount();
+    edit({ labels: ["uzi"] });
+    expect((screen.getByRole("switch", { name }) as HTMLButtonElement).disabled).toBe(false);
+  });
+  it.each([{ target: "prompt" as const }, { target: "issue" as const }, { timing: "once" as const }])("hides on unsupported target/timing %j", (over) => {
+    edit(over);
+    expect(screen.queryByRole("switch", { name })).toBeNull();
+  });
+  it.each(["label", "assigned"])("uses effective default catalog selector %s, with explicit false", async (selector_kind) => {
+    const catalog = await realMockApi.listScheduleCatalog();
+    const entry = catalog.entries.find((e) => e.slug === "bug-triage")!;
+    mockApi.listScheduleCatalog.mockResolvedValueOnce({ entries: [{ ...entry, selector_kind, labels: ["on-deck"] }], enablements: [] });
+    edit({ origin: "default", catalog_slug: entry.slug, labels: ["uzi"] });
+    if (selector_kind === "label") {
+      const toggle = await screen.findByRole("switch", { name });
+      expect((toggle as HTMLButtonElement).disabled).toBe(false);
+      fireEvent.click(toggle);
+      save();
+      await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenLastCalledWith("sch-1", expect.objectContaining({ remove_label_on_dispatch: true })));
+      fireEvent.click(toggle);
+    } else {
+      await waitFor(() => expect(mockApi.listScheduleCatalog).toHaveBeenCalled());
+      expect(screen.queryByRole("switch", { name })).toBeNull();
+    }
+    save();
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenLastCalledWith("sch-1", expect.objectContaining({ remove_label_on_dispatch: false })));
+  });
+  it("blocks saving during pending catalog load and retains stored true after resolution", async () => {
+    let resolve!: (value: Awaited<ReturnType<typeof api.listScheduleCatalog>>) => void;
+    mockApi.listScheduleCatalog.mockReturnValueOnce(new Promise((done) => { resolve = done; }));
+    edit({ origin: "default", catalog_slug: "bug-triage", labels: [], remove_label_on_dispatch: true });
+    save();
+    expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(mockApi.updateSchedule).not.toHaveBeenCalled();
+    resolve(await realMockApi.listScheduleCatalog());
+    const toggle = await screen.findByRole("switch", { name });
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    save();
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenLastCalledWith("sch-1", expect.objectContaining({ remove_label_on_dispatch: true })));
+  });
+  it("sends removal on create for a supported custom sweep", async () => {
+    mockApi.listRepos.mockResolvedValue({ repos: [{ id: "repo-uzi", path_with_namespace: "owner/repo" }] } as Awaited<ReturnType<typeof api.listRepos>>);
+    renderModal();
+    fireEvent.click(screen.getByRole("radio", { name: /Label sweep/ }));
+    fireEvent.change(screen.getByPlaceholderText("add label…"), { target: { value: "on-deck" } });
+    fireEvent.keyDown(screen.getByPlaceholderText("add label…"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("switch", { name }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Create schedule" }).hasAttribute("disabled")).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "Create schedule" }));
+    await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalledWith("repo-uzi", expect.objectContaining({ remove_label_on_dispatch: true })));
+  });
+});
+
+describe("M2 minute cadence controls", () => {
+  it("uses the fixed minute choices, normalizes hours 23 and can return to hours from minutes 30", async () => {
+    renderModal();
+    const preset = await screen.findByLabelText("Cadence");
+    fireEvent.change(preset, { target: { value: "everyNHours" } });
+    fireEvent.change(screen.getByLabelText("Every N hours"), { target: { value: "23" } });
+    fireEvent.change(preset, { target: { value: "everyNMinutes" } });
+    const minutes = screen.getByLabelText("Every N minutes") as HTMLSelectElement;
+    expect(Array.from(minutes.options, (o) => Number(o.value))).toEqual([1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30]);
+    expect(minutes.value).toBe("10");
+    expect((screen.getByLabelText("Cron expression") as HTMLInputElement).value).toBe("*/10 * * * *");
+    for (const n of [1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30]) {
+      fireEvent.change(minutes, { target: { value: String(n) } });
+      expect((screen.getByLabelText("Cron expression") as HTMLInputElement).value).toBe(`*/${n} * * * *`);
+    }
+    fireEvent.change(preset, { target: { value: "everyNHours" } });
+    expect((screen.getByLabelText("Every N hours") as HTMLInputElement).value).toBe("6");
+    fireEvent.change(screen.getByLabelText("Cron expression"), { target: { value: "*/40 * * * *" } });
+    expect((preset as HTMLSelectElement).value).toBe("custom");
+  });
+  it.each([["*/10 * * * *", "everyNMinutes"], ["*/40 * * * *", "custom"]])("reopens %s as %s", async (cron, preset) => {
+    const row = await realMockApi.enableCatalogSchedule("repo-uzi", "ondeck-sweep");
+    render(<MemoryRouter><ScheduleModal editing={{ ...row, cron_expr: cron }} onClose={vi.fn()} onSaved={vi.fn()} /></MemoryRouter>);
+    expect((await screen.findByLabelText("Cadence") as HTMLSelectElement).value).toBe(preset);
+    if (preset === "everyNMinutes") {
+      expect((screen.getByLabelText("Every N minutes") as HTMLSelectElement).value).toBe("10");
+    } else {
+      expect(screen.queryByLabelText("Every N minutes")).toBeNull();
     }
   });
 });

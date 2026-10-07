@@ -126,7 +126,7 @@ func buildScheduleRequest(cmd *cobra.Command, c uzicli.Client) (apitypes.Schedul
 		return apitypes.ScheduleRequest{}, nil, uzicli.Exitf(uzicli.ExitUsage, "--output is only valid with --prompt")
 	}
 
-	req := apitypes.ScheduleRequest{}
+	req := apitypes.ScheduleRequest{RemoveLabelOnDispatch: scheduleRemoveLabelFlag(cmd)}
 	switch {
 	case issueSet:
 		if issue <= 0 {
@@ -363,7 +363,8 @@ func buildScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apitypes.Sc
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--mr-rework and --clear-mr-rework are mutually exclusive")
 	}
 
-	changed := false
+	req.RemoveLabelOnDispatch = scheduleRemoveLabelFlag(cmd)
+	changed := req.RemoveLabelOnDispatch != nil
 	if cronSet {
 		cron, _ := f.GetString("cron")
 		req.Timing = schedTimingRecurring
@@ -606,7 +607,8 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apit
 		req.Guidance = s.Guidance
 	}
 
-	changed := false
+	req.RemoveLabelOnDispatch = scheduleRemoveLabelFlag(cmd)
+	changed := req.RemoveLabelOnDispatch != nil
 	if f.Changed("cron") {
 		cron, _ := f.GetString("cron")
 		// Leave Timing empty: patchDefaultScheduleConfig always writes recurring.
@@ -714,9 +716,19 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apit
 	changed = changed || capacityChanged
 	if !changed {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage,
-			"nothing to edit (pass at least one editable field: --cron, --tz, --auto-approve, --wait-on-limit, --mr-rework, --max-issues, --guidance, --model, --output, --apply-model-to-agents, --token, --harness)")
+			"nothing to edit (pass at least one editable field: --cron, --tz, --auto-approve, --wait-on-limit, --mr-rework, --max-issues, --guidance, --model, --output, --apply-model-to-agents, --token, --harness, --remove-label-on-dispatch)")
 	}
 	return req, nil
+}
+
+// scheduleRemoveLabelFlag preserves omission for create and both edit paths.
+// In particular, an unrelated edit must never restate the fetched DTO value.
+func scheduleRemoveLabelFlag(cmd *cobra.Command) *bool {
+	if !cmd.Flags().Changed("remove-label-on-dispatch") {
+		return nil
+	}
+	v, _ := cmd.Flags().GetBool("remove-label-on-dispatch")
+	return &v
 }
 
 // applyScheduleCapacityFlags sends the pair only when explicitly edited.

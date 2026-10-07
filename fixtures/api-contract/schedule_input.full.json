@@ -1,4 +1,5 @@
 {
+  "remove_label_on_dispatch": true,
   "capacity_limit": 1,
   "capacity_room_needed": 1,
   "target": "x",

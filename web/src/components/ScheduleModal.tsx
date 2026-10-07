@@ -65,6 +65,7 @@ import {
   parseHHMM,
   presetFromCron,
   PRESET_OPTIONS,
+  MINUTE_INTERVALS,
   type CronPreset,
   type PresetState,
 } from "../lib/schedulePresets";
@@ -246,6 +247,7 @@ export function ScheduleModal({
   const [maxIssues, setMaxIssues] = useState<number | null>(editing ? editing.max_issues : 10);
   const [capacityLimit, setCapacityLimit] = useState<number | null>(editing?.capacity_limit ?? null);
   const [capacityRoom, setCapacityRoom] = useState<number | null>(editing?.capacity_room_needed ?? null);
+  const [removeLabel, setRemoveLabel] = useState(editing?.remove_label_on_dispatch ?? false);
   const [catalogEntry, setCatalogEntry] = useState<CatalogEntry | null>(null);
   useEffect(() => {
     if (!isDefault || !editing?.catalog_slug) return;
@@ -259,6 +261,17 @@ export function ScheduleModal({
   }, [isDefault, editing?.catalog_slug]);
   const capacitySupported = target === "sweep" && timing === "recurring" &&
     (!isDefault || (catalogEntry !== null && (catalogEntry.selector_kind ?? "label") === "label"));
+  const selectorLabels = (isDefault ? catalogEntry?.labels ?? [] : labels).map((label) => label.trim()).filter(Boolean);
+  const catalogPending = isDefault && catalogEntry === null;
+  const removalVisible = target === "sweep" && timing === "recurring" &&
+    (!isDefault || (catalogEntry !== null && (catalogEntry.selector_kind ?? "label") === "label"));
+  const removalReason = selectorLabels.length !== 1
+    ? "Needs a single selector label."
+    : selectorLabels[0] === uziLabel
+      ? `The ${uziLabel} eligibility label cannot be removed.` : "";
+  const removalSupported = removalVisible && removalReason === "";
+  // Omission keeps the stored flag while the effective catalog selector is unknown.
+  const removalPatch = () => catalogPending ? undefined : removalSupported && removeLabel;
   const capacityOn = capacitySupported && capacityLimit !== null;
   const clearCapacity = () => { setCapacityLimit(null); setCapacityRoom(null); };
   const changeTarget = (value: ScheduleTarget) => {
@@ -465,7 +478,9 @@ export function ScheduleModal({
       setPresetState((s) => ({ ...s, preset }));
       return;
     }
-    applyPreset({ ...presetState, preset });
+    const everyN = preset === "everyNMinutes" && !MINUTE_INTERVALS.includes(presetState.everyN)
+      ? 10 : preset === "everyNHours" && presetState.everyN > 23 ? 6 : presetState.everyN;
+    applyPreset({ ...presetState, preset, everyN });
   };
   const onTimeChange = (v: string) => {
     const t = parseHHMM(v);
@@ -474,7 +489,8 @@ export function ScheduleModal({
   };
   const onEveryNChange = (v: string) => {
     const n = Number(v);
-    if (!Number.isFinite(n) || n < 1 || n > 23) return;
+    if (!Number.isInteger(n) || (presetState.preset === "everyNMinutes"
+      ? !MINUTE_INTERVALS.includes(n) : n < 1 || n > 23)) return;
     applyPreset({ ...presetState, everyN: n });
   };
   const onRawCronChange = (v: string) => {
@@ -600,6 +616,7 @@ export function ScheduleModal({
     // to inherit clears any stored override (replace-semantics).
     mr_rework_enabled: mrRework,
     max_issues: target === "sweep" ? maxIssues : undefined,
+    remove_label_on_dispatch: removalPatch(),
     capacity_limit: capacityOn ? capacityLimit : null,
     capacity_room_needed: capacityOn ? capacityRoom : null,
     model: model.trim() === "" ? null : model,
@@ -631,6 +648,7 @@ export function ScheduleModal({
     // Sweep-only cap; send explicit null (not undefined) so clearing the field
     // clears the stored value to unlimited. Omitted on non-sweep targets.
     max_issues: target === "sweep" ? maxIssues : undefined,
+    remove_label_on_dispatch: removalPatch(),
     capacity_limit: capacityOn ? capacityLimit : null,
     capacity_room_needed: capacityOn ? capacityRoom : null,
     // Owner guidance on issue/sweep only; a blank/cleared textarea sends explicit
@@ -1046,6 +1064,17 @@ export function ScheduleModal({
               sweep, since it IS editable on a default (unlike labels/guidance). */}
           {isDefault && target === "sweep" && batchField}
 
+          {removalVisible && (
+            <div>
+              <div className="flex items-center gap-2.5">
+                <Toggle checked={removalSupported && removeLabel} disabled={!removalSupported}
+                  label="Remove the selector label when a run starts" onChange={setRemoveLabel} />
+                <span className="text-[13px]">Remove {selectorLabels.length === 1 ? <b className="font-medium text-brand">{selectorLabels[0]}</b> : "the selector label"} when a run starts</span>
+              </div>
+              <p className="mt-1 text-[11px] text-faint">{removalReason || "Removed once the run starts, so each issue is normally tried once. If its run fails, add the label again to retry."}</p>
+            </div>
+          )}
+
           {capacitySupported && (
             <fieldset className="rounded-xl border border-brand/45 bg-brand/[0.04] p-4">
               <legend className="px-1.5 text-[13px] font-semibold">When to send issues</legend>
@@ -1112,7 +1141,12 @@ export function ScheduleModal({
                     </option>
                   ))}
                 </Select>
-                {presetState.preset === "everyNHours" ? (
+                {presetState.preset === "everyNMinutes" ? (
+                  <Select aria-label="Every N minutes" value={presetState.everyN}
+                    onChange={(e) => onEveryNChange(e.target.value)}>
+                    {MINUTE_INTERVALS.map((n) => <option key={n} value={n}>{n}</option>)}
+                  </Select>
+                ) : presetState.preset === "everyNHours" ? (
                   <Input
                     type="number"
                     min={1}
