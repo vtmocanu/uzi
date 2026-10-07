@@ -104,7 +104,8 @@ function poisonedChild(scenario: PoisonScenario): void {
     }
     assert.equal(path.dirname(path.dirname(fx.originPath)), outer, "TMPDIR determines fixture location");
     assert.equal(process.env.PATH, env.PATH, "Git remains discoverable through inherited PATH");
-    assert.equal(git(fx.originPath, ["rev-parse", "--show-toplevel"]), fx.originPath);
+    // Git reports the physical path (macOS TMPDIR /var is a symlink to /private/var).
+    assert.equal(git(fx.originPath, ["rev-parse", "--show-toplevel"]), fs.realpathSync(fx.originPath));
     assert.equal(git(fx.originPath, ["symbolic-ref", "--short", "HEAD"]), "main");
     assert.equal(git(fx.originPath, ["rev-list", "--count", "HEAD"]), "1");
     assert.equal(git(fx.originPath, ["log", "-1", "--format=%s"]), "init");
