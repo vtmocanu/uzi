@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { pipeline } from "node:stream/promises";
+import { deflateSync } from "node:zlib";
 import { PassThrough, Transform, Writable, type Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import type { Logger } from "./log.js";
@@ -3740,47 +3741,121 @@ export class GitCache {
 
   /**
    * issue #2213 — prove a bundle reproduces the commit `sha` on its own. The caller passes the
-   * bundle BYTES (an immutable in-memory snapshot, not a path a same-uid writer can swap), which are
-   * fed to git over stdin (`-`). They are unbundled into a FRESH temporary bare repository under
-   * `scratchRoot` (`git bundle unbundle` runs `index-pack`, which recomputes every object's hash
-   * from its content, so a forged loose object substituted under an existing OID cannot import as
-   * that OID), and there: `list-heads` names exactly `sha`, `rev-parse --verify sha^{commit}`
-   * succeeds, and `rev-list --objects` completes (the history is connected). Worker-uid,
-   * credential-free (`gitEnv()`); the temporary repo is always removed. Returns undefined when
-   * verified, else a short reason (never throws).
+   * bundle BYTES (an immutable in-memory snapshot, not a path a same-uid writer can swap).
+   *
+   * Completeness is decided from the snapshot bytes alone, never from a repository's object store
+   * (a same-uid survivor can write one: a thin bundle plus a planted loose blob would otherwise pass,
+   * and git does not check a loose object's content against its name). Steps:
+   *   1. a header gate in TS: `# v2 git bundle`, or v3 whose only capability is
+   *      `@object-format=sha1`; no prerequisite lines; exactly ONE ref line, naming `sha`; the pack
+   *      has the `PACK` signature, version 2 or 3, and its 20-byte trailer is the sha1 of the
+   *      preceding bytes;
+   *   2. a probe tag object pointing at `sha` is appended to the pack in memory, and
+   *      `git index-pack --stdin --strict --check-self-contained-and-connected` (an internal git
+   *      option, pinned by tests) runs on it in a FRESH temporary bare repository: exit 0 and stdout
+   *      exactly `pack\t<new trailer>\n` prove that every object reachable from `sha` is inside the
+   *      pack. The repository's store can only lower this verdict (never `--fix-thin`);
+   *   3. `git bundle list-heads -` over stdin names exactly `sha` (cross-check).
+   * SHA-256 repositories are rejected at step 1. Worker-uid, credential-free (`gitEnv()`); the
+   * temporary repo is always removed. Returns undefined when verified, else a short reason (never
+   * throws).
    */
   async verifyBundleReproduces(bundle: Buffer, sha: string, scratchRoot: string): Promise<string | undefined> {
     let dir: string | undefined;
-    const withStdin = async (cwd: string, args: string[]): Promise<string> => {
+    const withStdin = async (cwd: string, args: string[], input: Buffer): Promise<string> => {
       const full = withDir(cwd, args);
       this.log.debug("git (stdin)", { cwd, args });
       const { stdout } = await this.execScoped("git", full, {
         env: gitEnv(),
         timeout: GIT_TIMEOUT_MS,
         maxBuffer: GIT_MAX_BUFFER,
-        input: bundle,
+        input,
       });
       return stdout;
     };
     try {
+      if (!/^[0-9a-f]{40}$/.test(sha)) return "the committed head is not a 40-hex object id";
+      const parsed = GitCache.parseBundleForProbe(bundle, sha);
+      if (typeof parsed === "string") return parsed;
       dir = await fs.mkdtemp(path.join(scratchRoot, "verify-"));
       await this.runGit(undefined, ["init", "--bare", "-q", dir]);
-      const heads = (await withStdin(dir, ["bundle", "list-heads", "-"]))
+      const heads = (await withStdin(dir, ["bundle", "list-heads", "-"], bundle))
         .split("\n")
         .map((l) => l.trim())
         .filter((l) => l !== "");
       const oids = new Set(heads.map((l) => l.split(/\s+/)[0] ?? ""));
       if (oids.size !== 1 || !oids.has(sha)) return "the bundle's heads are not exactly the committed head";
-      await withStdin(dir, ["bundle", "unbundle", "-"]);
-      const tip = (await this.runGit(dir, ["rev-parse", "--verify", `${sha}^{commit}`])).trim();
-      if (tip !== sha) return "the unbundled head does not resolve to the committed head";
-      await this.runGit(dir, ["rev-list", "--objects", "--quiet", sha]);
+      let out: string;
+      try {
+        out = await withStdin(dir, ["index-pack", "--stdin", "--strict", "--check-self-contained-and-connected"], parsed.probePack);
+      } catch (err) {
+        return `the bundle is not self-contained and connected: ${sanitizeForLog(gitErrorMessage(err), 120)}`;
+      }
+      if (out !== `pack\t${parsed.probeTrailerHex}\n`) return "the bundle's connectivity proof did not report the expected pack";
       return undefined;
     } catch (err) {
       return `bundle verification failed: ${sanitizeForLog(gitErrorMessage(err), 120)}`;
     } finally {
       if (dir !== undefined) await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
     }
+  }
+
+  /**
+   * issue #2213 — the header gate and in-memory probe-tag append behind {@link verifyBundleReproduces}.
+   * Returns the probe pack (the bundle's pack plus one tag object naming `sha`, object count bumped,
+   * trailer recomputed) and its trailer in hex, or a short rejection reason.
+   */
+  private static parseBundleForProbe(bundle: Buffer, sha: string): { probePack: Buffer; probeTrailerHex: string } | string {
+    let pos = 0;
+    const line = (): string | null => {
+      const nl = bundle.indexOf(0x0a, pos);
+      if (nl < 0) return null;
+      const s = bundle.toString("latin1", pos, nl);
+      pos = nl + 1;
+      return s;
+    };
+    const first = line();
+    if (first !== "# v2 git bundle" && first !== "# v3 git bundle") return "the bundle header is not a v2 or v3 git bundle";
+    const refs: string[] = [];
+    let blank = false;
+    for (let l = line(); l !== null; l = line()) {
+      if (l === "") {
+        blank = true;
+        break;
+      }
+      if (l.startsWith("@")) {
+        if (first === "# v3 git bundle" && l === "@object-format=sha1") continue;
+        return "the bundle declares an unsupported capability";
+      }
+      if (l.startsWith("-")) return "the bundle has prerequisites, so it is not self-contained";
+      if (!/^[0-9a-f]{40} \S/.test(l)) return "the bundle header has a malformed ref line";
+      refs.push(l.slice(0, 40));
+    }
+    if (!blank) return "the bundle header is not terminated";
+    if (refs.length !== 1) return "the bundle must carry exactly one head";
+    if (refs[0] !== sha) return "the bundle's heads are not exactly the committed head";
+    const pack = bundle.subarray(pos);
+    if (pack.length < 32 || pack.toString("latin1", 0, 4) !== "PACK") return "the bundle has no pack";
+    const version = pack.readUInt32BE(4);
+    if (version !== 2 && version !== 3) return "the bundle pack version is unsupported";
+    const body = pack.subarray(0, pack.length - 20);
+    const trailer = pack.subarray(pack.length - 20);
+    if (!createHash("sha1").update(body).digest().equals(trailer)) return "the bundle pack trailer does not match its content";
+    const content = Buffer.from(`object ${sha}\ntype commit\ntag uzi-archive-probe\ntagger uzi <uzi> 0 +0000\n\nprobe\n`, "latin1");
+    const hdr: number[] = [];
+    let size = content.length;
+    let b = 0x40 | (size & 0x0f); // OBJ_TAG is type 4, in bits 6-4
+    size >>>= 4;
+    while (size > 0) {
+      hdr.push(b | 0x80);
+      b = size & 0x7f;
+      size >>>= 7;
+    }
+    hdr.push(b);
+    const grown = Buffer.concat([body, Buffer.from(hdr), deflateSync(content)]);
+    grown.writeUInt32BE(pack.readUInt32BE(8) + 1, 8);
+    const probeTrailer = createHash("sha1").update(grown).digest();
+    return { probePack: Buffer.concat([grown, probeTrailer]), probeTrailerHex: probeTrailer.toString("hex") };
   }
 
   /**

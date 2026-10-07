@@ -106,10 +106,14 @@ deletes a pin or changes the journal or the hold:
 2. bundle H from the bare into a temporary file in a worker-owned 0700 directory,
    under the recovery size cap;
 3. read the bundle once into memory (bounded by the size cap), requiring its sha256
-   and size to equal the producer's, and verify those bytes, fed over stdin, by
-   unbundling into a fresh temporary bare repository (`index-pack` rehashes every
-   object), requiring `list-heads` to name exactly H and `rev-list --objects` to
-   complete;
+   and size to equal the producer's, and verify those bytes: a header gate (v2, or v3
+   with only `@object-format=sha1`; one head, equal to H; no prerequisites; pack
+   trailer checked) plus a probe-tag proof, an in-memory tag object naming H appended
+   to the pack and fed to `git index-pack --strict --check-self-contained-and-connected`
+   in a fresh temporary bare repository, computed from the snapshot bytes alone (the
+   object store can only lower the verdict), with `list-heads` as a cross-check. The
+   proof relies on an internal git option, pinned by tests. SHA-256 repositories get no
+   archive (the head read already requires 40-hex);
 4. re-read the archive ref (still H);
 5. write exactly the verified bytes to a fresh exclusive temp and publish
    `<dataDir>/recovery-archive/<runId>/g<gen>.bundle` (0600) and its manifest by

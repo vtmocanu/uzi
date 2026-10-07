@@ -161,9 +161,9 @@ async function capture(
     }
     if (produced.sourceSha !== head) return fail(head, "the produced bundle names another head");
 
-    // Snapshot the produced file ONCE. Everything after (digest, verification, publication) uses
-    // these in-memory bytes, so a same-uid writer touching the temp path cannot make the verified
-    // bytes differ from the hashed or published ones.
+    // Snapshot the produced file ONCE. Digest, verification and publication all use these
+    // in-memory bytes: the published bytes are written from the verified snapshot, and a later
+    // change to the file is detectable against the reported sha256.
     const cap = Math.min(input.maxBytes ?? RECOVERY_MAX_BUNDLE_BYTES, RECOVERY_MAX_BUNDLE_BYTES);
     if (produced.byteSize > cap) return fail(head, "the produced bundle exceeds the size cap");
     let bytes: Buffer;

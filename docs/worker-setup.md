@@ -367,19 +367,19 @@ is no verified archive (no committed work in the bare, a failed verification, a
 bundle over the recovery size cap, or the 120-second capture deadline). Only the
 commits already in the bare are covered; commits and uncommitted edits newer than
 the last checkpoint exist only in the kept clone. Check an archive on the worker
-against the head in the failure reason. `git bundle verify` needs a repository
-and the worker image's working directory (`/app`) is not one, so verify inside a
-throwaway bare repository:
+against the head in the failure reason. `git bundle verify` is not a completeness
+check (it reports a bundle with a missing blob as okay), so prove completeness by
+cloning the bundle into a throwaway directory:
 
 ```
 git bundle list-heads <dataDir>/recovery-archive/<runId>/g<generation>.bundle
 sha256sum <dataDir>/recovery-archive/<runId>/g<generation>.bundle
-git init --bare /tmp/verify.git
-git --git-dir=/tmp/verify.git bundle verify <dataDir>/recovery-archive/<runId>/g<generation>.bundle
+git clone --mirror <dataDir>/recovery-archive/<runId>/g<generation>.bundle "$(mktemp -d)/verify.git"
 ```
 
 `list-heads` (which works anywhere) must name exactly `<H>`, the `sha256sum` must
-equal `<S>`, and `bundle verify` must report the bundle is okay. Those
+equal `<S>`, and the `git clone --mirror` must succeed (an incomplete bundle fails with
+`remote did not send all necessary objects`). Those
 two values live in the api's run row, which a process on the worker cannot reach,
 so a mismatch means the file was altered after it was written. Nothing is
 uploaded off the worker: it is a local copy, not a recovery capture, and it is not

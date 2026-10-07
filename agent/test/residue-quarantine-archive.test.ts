@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -362,6 +362,207 @@ describe("the archival capture over a real bare (issue #2213)", () => {
         }
       });
     }
+  });
+});
+
+// ─── verifyBundleReproduces: the proof is computed from the snapshot bytes alone ───────────
+
+describe("verifyBundleReproduces judges completeness from the bundle bytes, not an object store (issue #2213)", () => {
+  let topo: Topo;
+  let ctr = 0;
+  beforeEach(() => {
+    topo = makeTopo();
+    fs.mkdirSync(topo.archiveRoot, { recursive: true });
+  });
+  afterEach(() => fs.rmSync(topo.base, { recursive: true, force: true }));
+
+  const gitBuf = (cwd: string, args: string[], input?: Buffer): Buffer =>
+    execFileSync("git", ["-C", cwd, ...args], { env: GIT_ENV, stdio: ["pipe", "pipe", "pipe"], maxBuffer: 64 << 20, ...(input === undefined ? {} : { input }) });
+  /** Every object of `rev`'s closure as `[oid, type]`. */
+  const closure = (rev: string): Array<[string, string]> =>
+    git(topo.bare, ["rev-list", "--objects", rev])
+      .split("\n")
+      .map((l) => l.split(" ")[0]!)
+      .map((o) => [o, git(topo.bare, ["cat-file", "-t", o])]);
+  /** A bundle file: `headerLines` then the blank line then a pack of exactly `oids`, non-thin. */
+  const craft = (headerLines: string[], oids: string[], mutate?: (pack: Buffer) => Buffer): Buffer => {
+    let pack = gitBuf(topo.bare, ["pack-objects", "--stdout", "-q"], Buffer.from(`${oids.join("\n")}\n`));
+    if (mutate !== undefined) pack = mutate(pack);
+    return Buffer.concat([Buffer.from(`${headerLines.join("\n")}\n\n`), pack]);
+  };
+  const hdr = (sha: string, version = "# v2 git bundle"): string[] => [version, `${sha} refs/heads/x`];
+  const verify = (b: Buffer, sha = topo.head): Promise<string | undefined> => topo.cache.verifyBundleReproduces(b, sha, topo.archiveRoot);
+  /** Write `oid` as a loose object into the bare repository `repo`, content from the fixture bare. */
+  const plant = (repo: string, oid: string): void => {
+    const type = git(topo.bare, ["cat-file", "-t", oid]);
+    const body = gitBuf(topo.bare, ["cat-file", type, oid]);
+    const f = path.join(repo, "objects", oid.slice(0, 2), oid.slice(2));
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    if (!fs.existsSync(f)) fs.writeFileSync(f, deflateSync(Buffer.concat([Buffer.from(`${type} ${body.length}\0`), body])));
+  };
+  /** While `work` runs, plant `oids` into every `verify-*` repo that appears under the archive root. */
+  const withPlanting = async <T>(oids: string[], work: () => Promise<T>): Promise<{ result: T; planted: number }> => {
+    let stop = false;
+    let planted = 0;
+    const seen = new Set<string>();
+    const poll = (async () => {
+      while (!stop) {
+        for (const d of fs.readdirSync(topo.archiveRoot).filter((n) => n.startsWith("verify-") && !seen.has(n))) {
+          seen.add(d);
+          for (const o of oids) plant(path.join(topo.archiveRoot, d), o);
+          planted++;
+        }
+        await new Promise((r) => setImmediate(r));
+      }
+    })();
+    try {
+      return { result: await work(), planted };
+    } finally {
+      stop = true;
+      await poll;
+    }
+  };
+
+  const blobOid = (): string => git(topo.bare, ["rev-parse", `${topo.head}:${topo.blobPath}`]);
+  const without = (rev: string, drop: string): string[] => closure(rev).map(([o]) => o).filter((o) => o !== drop);
+
+  it("accepts a complete bundle whose pack is delta-compressed", async () => {
+    const big = Array.from({ length: 400 }, (_, i) => `line ${i} of a file long enough to delta well`).join("\n");
+    let tip = "";
+    for (let i = 0; i < 4; i++) {
+      fs.writeFileSync(path.join(topo.work, "big.txt"), `${big}\nrevision ${i}\n`);
+      git(topo.work, ["add", "."]);
+      git(topo.work, [...IDENT, "commit", "-m", `rev ${i}`]);
+      tip = git(topo.work, ["rev-parse", "HEAD"]);
+    }
+    git(topo.work, ["push", topo.bare, `HEAD:refs/heads/delta`]);
+    git(topo.bare, ["repack", "-a", "-d", "-f", "--window=50", "--depth=50"]);
+    const bundle = path.join(topo.base, "delta.bundle");
+    git(topo.bare, ["bundle", "create", bundle, "refs/heads/delta"]);
+    const b = fs.readFileSync(bundle);
+    // The fixture really carries deltas.
+    const packOnly = b.subarray(b.indexOf("\n\n") + 2);
+    const packFile = path.join(topo.base, "delta.pack");
+    fs.writeFileSync(packFile, packOnly);
+    git(topo.base, ["index-pack", packFile]);
+    assert.match(git(topo.base, ["verify-pack", "-v", packFile]), /chain length = [1-9]/, "the pack has deltas");
+    assert.equal(await verify(b, tip), undefined);
+    assert.deepEqual(fs.readdirSync(topo.archiveRoot), [], "the scratch repo is removed");
+  });
+
+  it("accepts a v3 bundle whose only capability is object-format=sha1", async () => {
+    const b = craft([...hdr(topo.head, "# v3 git bundle").slice(0, 1), "@object-format=sha1", `${topo.head} refs/heads/x`], closure(topo.head).map(([o]) => o));
+    assert.equal(await verify(b), undefined);
+  });
+
+  it("pins git's index-pack contract: a missing blob is rejected with an empty store (128) and with the blob planted loose (1); a complete pack is 0", async () => {
+    const run = (oids: string[], plantOids: string[]): { status: number; stdout: string } => {
+      const repo = path.join(topo.base, `contract-${ctr++}.git`);
+      execFileSync("git", ["init", "--bare", "-q", repo], { env: GIT_ENV, stdio: "pipe" });
+      for (const o of plantOids) plant(repo, o);
+      const pack = gitBuf(topo.bare, ["pack-objects", "--stdout", "-q"], Buffer.from(`${oids.join("\n")}\n`));
+      const res = spawnSync("git", ["-C", repo, "index-pack", "--stdin", "--strict", "--check-self-contained-and-connected"], { env: GIT_ENV, input: pack });
+      return { status: res.status ?? -1, stdout: res.stdout.toString() };
+    };
+    const all = closure(topo.head).map(([o]) => o);
+    const missing = without(topo.head, blobOid());
+    const ok = run(all, []);
+    assert.equal(ok.status, 0);
+    assert.match(ok.stdout, /^pack\t[0-9a-f]{40}\n$/);
+    assert.equal(run(missing, []).status, 128);
+    assert.equal(run(missing, [blobOid()]).status, 1, "a planted loose blob must not make the pack self-contained");
+  });
+
+  it("rejects a bundle missing a blob (thin, no prerequisite line), with an empty store", async () => {
+    const b = craft(hdr(topo.head), without(topo.head, blobOid()));
+    assert.match(String(await verify(b)), /not self-contained and connected/);
+  });
+
+  it("rejects a bundle missing a blob even when that blob is planted loose in the verify repository", async () => {
+    const b = craft(hdr(topo.head), without(topo.head, blobOid()));
+    const { result, planted } = await withPlanting([blobOid()], () => verify(b));
+    assert.ok(planted >= 1, "the blob was planted into the verify repository");
+    assert.match(String(result), /not self-contained and connected/);
+  });
+
+  it("rejects a real thin ref-delta pack (git's --thin) with no prerequisite line", async () => {
+    const big = Array.from({ length: 400 }, (_, i) => `line ${i} of a file long enough to delta well`).join("\n");
+    fs.writeFileSync(path.join(topo.work, "big.txt"), `${big}\n`);
+    git(topo.work, ["add", "."]);
+    git(topo.work, [...IDENT, "commit", "-m", "big"]);
+    const prev = git(topo.work, ["rev-parse", "HEAD"]);
+    fs.writeFileSync(path.join(topo.work, "big.txt"), `${big}\nmore\n`);
+    git(topo.work, ["add", "."]);
+    git(topo.work, [...IDENT, "commit", "-m", "big2"]);
+    const tip = git(topo.work, ["rev-parse", "HEAD"]);
+    git(topo.work, ["push", topo.bare, "HEAD:refs/heads/thin"]);
+    const pack = gitBuf(topo.bare, ["pack-objects", "--revs", "--thin", "--stdout", "-q"], Buffer.from(`${tip}\n^${prev}\n`));
+    const b = Buffer.concat([Buffer.from(`${hdr(tip).join("\n")}\n\n`), pack]);
+    assert.match(String(await verify(b, tip)), /not self-contained and connected/);
+  });
+
+  it("rejects a pack that lacks H, even when H's whole closure is planted loose", async () => {
+    const b = craft(hdr(topo.head), closure(topo.baseSha).map(([o]) => o));
+    const { result, planted } = await withPlanting(closure(topo.head).map(([o]) => o), () => verify(b));
+    assert.ok(planted >= 1);
+    assert.match(String(result), /not self-contained and connected/);
+  });
+
+  it("rejects a pack whose trailer was corrupted", async () => {
+    const b = craft(hdr(topo.head), closure(topo.head).map(([o]) => o), (p) => {
+      const c = Buffer.from(p);
+      c[c.length - 1] = c[c.length - 1]! ^ 0xff;
+      return c;
+    });
+    assert.match(String(await verify(b)), /trailer/);
+  });
+
+  it("rejects a bundle with a prerequisite line", async () => {
+    const out = path.join(topo.base, "prereq.bundle");
+    git(topo.bare, ["update-ref", "refs/heads/recovered-source", topo.head]);
+    git(topo.bare, ["bundle", "create", out, "refs/heads/recovered-source", `^${topo.baseSha}`]);
+    const b = fs.readFileSync(out);
+    assert.match(b.toString("latin1", 0, 100), /\n-[0-9a-f]{40}/, "the fixture has a prerequisite");
+    assert.match(String(await verify(b)), /prerequisites/);
+  });
+
+  it("rejects an object-format=sha256 bundle", async () => {
+    const b = craft(["# v3 git bundle", "@object-format=sha256", `${topo.head} refs/heads/x`], closure(topo.head).map(([o]) => o));
+    assert.match(String(await verify(b)), /unsupported capability/);
+  });
+
+  it("rejects a bundle that names two heads", async () => {
+    const out = path.join(topo.base, "two.bundle");
+    git(topo.bare, ["update-ref", "refs/heads/a", topo.head]);
+    git(topo.bare, ["update-ref", "refs/heads/b", topo.head]);
+    git(topo.bare, ["bundle", "create", out, "refs/heads/a", "refs/heads/b"]);
+    const b = fs.readFileSync(out);
+    assert.equal(b.toString("latin1").split("\n").slice(1, 4).filter((l) => /^[0-9a-f]{40} /.test(l)).length, 2, "the fixture names two heads");
+    assert.match(String(await verify(b)), /exactly one head/);
+  });
+
+  it("the published bundle is the verified snapshot even if the produced temp file is rewritten after verification", async () => {
+    let produced: string | undefined;
+    let verified: Buffer | undefined;
+    const g = wrapped(topo, {
+      produceRecoveryBundle: async (b, o) => {
+        produced = o.outPath;
+        return topo.cache.produceRecoveryBundle(b, o);
+      },
+      verifyBundleReproduces: async (b, s, r) => {
+        verified = Buffer.from(b);
+        const reason = await topo.cache.verifyBundleReproduces(b, s, r);
+        // Swap whatever the temp path now holds (it must not be what gets published).
+        fs.writeFileSync(produced!, Buffer.from("swapped after verification"));
+        return reason;
+      },
+    });
+    const r = await capture(topo, g);
+    assert.equal(r.outcome, "archived", r.detail);
+    const published = fs.readFileSync(path.join(runDir(topo), "g1.bundle"));
+    assert.ok(published.equals(verified!), "the published bytes are the verified bytes");
+    assert.equal(createHash("sha256").update(published).digest("hex"), r.sha256);
+    assert.equal(await topo.cache.verifyBundleReproduces(published, topo.head, topo.archiveRoot), undefined);
   });
 });
 
