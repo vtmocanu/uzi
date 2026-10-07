@@ -95,7 +95,7 @@ SELECT w.*,
            SELECT count(*) FROM runs r
            WHERE r.worker_id = w.id
              AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-             AND r.kind <> 'chat'
+             AND r.kind <> 'chat' AND NOT r.cross_check_lane
        ) AS active_runs,
        -- retaining_unpublished_work (PRD #1296 M4, D4): does this worker hold any OPEN
        -- custody hold? Healthy live runs included: custody is independent of busy/active_runs
@@ -202,6 +202,7 @@ WITH prev AS (
         -- stores '{}', not NULL.
         protocol_capabilities = COALESCE(@protocol_capabilities::text[], '{}'),
         max_concurrent_runs = sqlc.narg('max_concurrent_runs'),
+        max_cross_check_slots = sqlc.narg('max_cross_check_slots'),
         -- online_since is the api-owned uptime anchor (PRD #251 M1): PRESERVE it if the
         -- worker is already online with one, else STAMP now() — so a steady stream of
         -- registers never moves it and the first register after an offline gap (or for a
@@ -809,7 +810,7 @@ SELECT sqlc.embed(w),
            SELECT count(*) FROM runs r
            WHERE r.worker_id = w.id
              AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-             AND r.kind <> 'chat'
+             AND r.kind <> 'chat' AND NOT r.cross_check_lane
        ) AS active_runs,
        u.email AS owner_email,
        rh.phase              AS roll_phase,
@@ -883,7 +884,12 @@ WITH claimant AS MATERIALIZED (
       AND EXISTS (SELECT 1 FROM claimant c WHERE NOT c.maintenance_fenced
         AND (c.draining_since IS NULL AND c.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
              OR r.worker_id = c.id))
-      AND r.kind <> 'chat'
+      AND r.kind <> 'chat' AND NOT r.cross_check_lane
+      AND ((COALESCE(@lane::text, '') IN ('', 'run', 'ordinary') AND r.kind <> 'cross_check')
+           OR (r.kind = 'cross_check' AND EXISTS (
+               SELECT 1 FROM claimant c WHERE fn_cross_check_child_eligible(c, r, true,
+                   CASE WHEN COALESCE(@lane::text, '') = '' THEN 'run' ELSE @lane::text END,
+                   @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))))
       -- PRD #400 Decision 6: a task run is claimable ONLY after the CLI has seeded its
       -- uzi/task/<id> branch and stamped dispatched_at — otherwise a worker could claim
       -- it before the branch exists (the claim-before-seed race). Every non-task kind is
@@ -912,7 +918,7 @@ WITH claimant AS MATERIALIZED (
               FOR UPDATE OF cc SKIP LOCKED
           ) locked_checks
       ))
-      AND (r.worker_id IS NULL
+      AND (r.kind = 'cross_check' OR r.worker_id IS NULL
            OR r.worker_id = @worker_id
            -- Hold the pin whenever the run's OWN worker ROW still exists AND it can
            -- still resume the run — i.e. it is either DRAINING (cordoned for an image
@@ -1154,6 +1160,7 @@ WITH claimant AS MATERIALIZED (
       -- absent lease admits nothing, so lease 0 / a non-leased worker is exactly the bound-run-only
       -- clause above. The caller rebinds the worker to the claimed run in the same transaction.
       AND (NOT @is_ephemeral::boolean
+           OR (r.kind = 'cross_check' AND r.target_run_id = sqlc.narg('ephemeral_run_id')::uuid)
            OR r.id = sqlc.narg('ephemeral_run_id')::uuid
            OR ((fn_ephemeral_lease_admits(
                    sqlc.narg('lease_since')::timestamptz,
@@ -1186,7 +1193,8 @@ WITH claimant AS MATERIALIZED (
       -- a 0 active count on me makes the RHS 0 -> no peer qualifies -> I always
       -- claim (a minimum-loaded worker never defers, guaranteeing claimability).
       AND (
-          r.worker_id = @worker_id
+          r.kind = 'cross_check'
+          OR r.worker_id = @worker_id
           OR r.updated_at < @spread_cutoff
           OR NOT EXISTS (
               SELECT 1
@@ -1196,7 +1204,7 @@ WITH claimant AS MATERIALIZED (
                   FROM runs pr
                   WHERE pr.worker_id = p.id
                     AND pr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-                    AND pr.kind <> 'chat'
+                    AND pr.kind <> 'chat' AND NOT pr.cross_check_lane
               ) pa
               WHERE p.user_id = @user_id
                 AND p.id <> @worker_id
@@ -1310,7 +1318,7 @@ WITH claimant AS MATERIALIZED (
                     < (SELECT count(*) FROM runs mr
                         WHERE mr.worker_id = @worker_id
                           AND mr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-                          AND mr.kind <> 'chat')
+                          AND mr.kind <> 'chat' AND NOT mr.cross_check_lane)
                       * p.max_concurrent_runs
           )
       )
@@ -1407,6 +1415,7 @@ hold AS (
     RETURNING 1
 )
 UPDATE runs SET
+    cross_check_lane = COALESCE(@lane::text = 'cross_check', false),
     status     = 'claimed',
     status_since = now(),
     worker_id  = @worker_id,
@@ -6666,6 +6675,7 @@ WITH candidates AS MATERIALIZED (
     WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = false
   AND r.worker_id = @worker_id
   AND r.status = 'queued'
+  AND (r.kind <> 'cross_check' OR r.claim_generation > 0)
   AND r.kind <> 'chat'
   AND r.claim_generation = a.claim_generation
   AND r.claim_released_at IS NULL
@@ -6722,6 +6732,7 @@ FROM worker_active_runs a
 WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = false
   AND r.worker_id = @worker_id
   AND r.status = 'queued'
+  AND (r.kind <> 'cross_check' OR r.claim_generation > 0)
   AND r.kind <> 'chat'
   AND r.claim_generation = a.claim_generation
   AND r.claim_released_at IS NULL
@@ -9167,13 +9178,14 @@ WHERE w.user_id = @user_id
 WITH candidates AS (
 SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','ready','stopping','recycling') THEN COALESCE(w.draining_since, w.maintenance_activity_floor) ELSE w.draining_since END AS draining_since,
        (w.status = 'online') AS online,
-       (w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs) AS free_slot,
-       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (fn_ephemeral_lease_admits(
+       (CASE WHEN run.kind = 'cross_check' THEN fn_cross_check_child_eligible(w, run, true, 'any', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz)
+             ELSE w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs END) AS free_slot,
+       (run.kind = 'cross_check' OR NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (fn_ephemeral_lease_admits(
               w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
               @ephemeral_lease::interval, now(),
               run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
                    AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, @worker_docker_enabled::boolean, run.repo_id, run.kind, run.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(w.docker_enabled, false)))) AS advisory_binding,
-       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (
+       (run.kind = 'cross_check' OR NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (
            (fn_ephemeral_lease_admits(
               w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
               @ephemeral_lease::interval, now(),
@@ -9184,7 +9196,7 @@ SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','re
        )) AS strict_binding,
        (run.worker_id = w.id) AS own_worker,
        (NOT w.ephemeral) AS persistent,
-       (run.worker_id IS NULL OR run.worker_id = w.id
+       (run.kind = 'cross_check' OR run.worker_id IS NULL OR run.worker_id = w.id
         OR NOT EXISTS (SELECT 1 FROM workers ow WHERE ow.id = run.worker_id
                        AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced OR
                             (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= @heartbeat_cutoff)))
@@ -9196,9 +9208,10 @@ CROSS JOIN LATERAL (
     SELECT count(*) AS active FROM runs pr
     WHERE pr.worker_id = w.id
       AND pr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-      AND pr.kind <> 'chat'
+      AND pr.kind <> 'chat' AND NOT pr.cross_check_lane
 ) wa
 WHERE run.id = @run_id
+  AND (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
   AND w.last_heartbeat_at IS NOT NULL
   AND w.last_heartbeat_at >= @heartbeat_cutoff
   AND fn_worker_can_claim(
@@ -9251,7 +9264,8 @@ WHERE run.id = @run_id
        OR run.released_worker_id <> w.id
        OR run.released_worker_nonce IS DISTINCT FROM w.snapshot_register_nonce)
 )
-SELECT count(*) FILTER (WHERE draining_since IS NULL AND free_slot AND advisory_binding)::bigint AS claimable,
+SELECT count(*) FILTER (WHERE online AND affinity AND strict_binding)::bigint AS strict_eligible,
+       count(*) FILTER (WHERE (draining_since IS NULL OR own_worker) AND free_slot AND advisory_binding)::bigint AS claimable,
        count(*) FILTER (WHERE online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::bigint AS draining_eligible,
        count(*) FILTER (WHERE online AND draining_since IS NULL AND affinity AND strict_binding)::bigint AS non_draining_eligible,
        count(*) FILTER (WHERE online AND draining_since IS NOT NULL AND own_worker AND affinity AND strict_binding)::bigint AS suitable_own_draining,
@@ -9317,7 +9331,7 @@ WHERE w.user_id = @user_id
        OR (SELECT count(*) FROM runs r
             WHERE r.worker_id = w.id
               AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-              AND r.kind <> 'chat') < w.max_concurrent_runs);
+              AND r.kind <> 'chat' AND NOT r.cross_check_lane) < w.max_concurrent_runs);
 
 -- name: CountOnlineWorkersSatisfyingCaps :one
 -- How many of a user's ONLINE, non-draining workers have EFFECTIVE caps
@@ -9560,8 +9574,9 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
-        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
-        AND (NOT w.ephemeral
+        AND (r.kind = 'cross_check' OR (w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')))
+        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, true, 'any', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
+        AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
@@ -9711,8 +9726,9 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
-        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
-        AND (NOT w.ephemeral
+        AND (r.kind = 'cross_check' OR (w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')))
+        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
+        AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
@@ -9757,8 +9773,9 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
-        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
-        AND (NOT w.ephemeral
+        AND (r.kind = 'cross_check' OR (w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')))
+        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, true, 'any', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
+        AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
@@ -9796,11 +9813,11 @@ WHERE r.status = 'queued'
         AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
                                  AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
                                  AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
-        AND (w.max_concurrent_runs IS NULL
+        AND (r.kind = 'cross_check' OR w.max_concurrent_runs IS NULL
              OR (SELECT count(*) FROM runs r2
                   WHERE r2.worker_id = w.id
                     AND r2.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-                    AND r2.kind <> 'chat') < w.max_concurrent_runs)
+                    AND r2.kind <> 'chat' AND NOT r2.cross_check_lane) < w.max_concurrent_runs)
   )
   AND NOT EXISTS (
       SELECT 1 FROM workers w2
@@ -10384,10 +10401,10 @@ SELECT * FROM cross_checks WHERE lead_run_id = @lead_run_id AND stage = 'plan' A
 -- name: CreatePlanCrossCheckChild :one
 INSERT INTO runs (id, user_id, repo_id, kind, target_run_id, harness, priority,
                   report_only, budget_wall_seconds, dispatched_at, auto_approve,
-                  issue_title, issue_description, required_capabilities, trigger_source)
+                  issue_title, issue_description, required_capabilities, trigger_source, worker_id)
 SELECT @child_id, lead.user_id, lead.repo_id, 'cross_check', lead.id, 'codex', 2,
        true, @budget_wall_seconds::int, now(), true, lead.issue_title, lead.issue_description,
-       COALESCE(repo.required_capabilities, '{}'), 'cross_check'
+       COALESCE(repo.required_capabilities, '{}'), 'cross_check', lead.worker_id
 FROM runs lead JOIN repos repo ON repo.id = lead.repo_id
 WHERE lead.id = @lead_run_id AND lead.user_id = @user_id
   AND lead.worker_id = @worker_id AND lead.claim_generation = @claim_generation
@@ -10522,3 +10539,11 @@ WHERE child.id = cc.checker_run_id AND lead.id = cc.lead_run_id
   AND lead.harness <> cc.checker_harness
   AND cc.stage = 'plan' AND cc.verdict = 'pending' AND now() < cc.deadline_at
 RETURNING cc.*;
+
+-- name: GetPlanCrossCheckChildForHealth :one
+SELECT child.id FROM cross_checks cc
+JOIN runs lead ON lead.id = cc.lead_run_id
+JOIN runs child ON child.id = cc.checker_run_id
+WHERE lead.id = @lead_run_id AND cc.stage = 'plan' AND cc.verdict = 'pending'
+  AND cc.deadline_at > now() AND cc.lead_claim_generation = lead.claim_generation
+  AND child.status = 'queued';
