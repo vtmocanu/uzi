@@ -4207,8 +4207,10 @@ export class RunRunner {
     this.emitWorkerDiagnostic(flight, "error", reason);
     // Close BEFORE the reap: a permanent message failure surfaces at close and trips the
     // permanent-failure hook (abort, reap, one terminal report), which the reap decision below
-    // must observe. The close after the terminal-inventory snapshot only drains what that
-    // snapshot emitted; owedFeedClosed (set by the wrapped close) routes later notices to the log.
+    // must observe. This close sets owedFeedClosed (the wrapped batcher.close), so the
+    // terminal-inventory snapshot below announces its retained-head, archive and divergence
+    // notices to the run log only, never the feed; the batcher is not reopened. The second close
+    // after the snapshot is an idempotent drain of anything already queued.
     await batcher.close().catch(() => undefined);
     // PRD #1349 M2 (D4.5) / #1531: REAP THIS generation's provider FIRST, BEFORE the `failed`
     // report. A steering-cancel and an early agent failure both land here (a cancel aborts the
