@@ -4,7 +4,7 @@ import { PassThrough } from "node:stream";
 import { createHash, randomUUID } from "node:crypto";
 import { getEventListeners } from "node:events";
 import fs from "node:fs/promises";
-import { symlinkSync } from "node:fs";
+import { readFileSync, symlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13763,6 +13763,7 @@ function m1Prompt(branch: M1Branch, ctx: RunContext): string {
   }, branch === "gated" ? "M1-GATED-PLAN" : undefined, "M1-MILESTONE-SUFFIX", m1Facts);
 }
 const m1ReviewSnapshot: NonNullable<RunContext["reviewComments"]> = {
+  version: 2, withheld_not_eligible: 0, withheld_unknown: 0,
   truncated: true,
   comments: [
     { id: 1, author_username: "human-reviewer", author_forge_user_id: 11, created_at: "2026-10-07T01:00:00Z",
@@ -13910,12 +13911,135 @@ describe("Codex M1 review absence", () => {
         delete ctx.reviewComments;
         if (absence === "undefined") ctx.reviewComments = undefined;
         if (absence === "null") ctx.reviewComments = null;
-        if (absence === "empty") ctx.reviewComments = { truncated: true, comments: [] };
+        if (absence === "empty") ctx.reviewComments = { version: 2, withheld_not_eligible: 0, withheld_unknown: 0, truncated: true, comments: [] };
         const prompt = m1Prompt(branch, ctx);
         assert.equal(m1IssueNormalize(prompt), m1BaselinePrompts[branch]);
         assert.doesNotMatch(prompt, /review_comments_/);
       });
     }
+  }
+});
+
+// #2393 M2: mixed/all-withheld are executed Go Begin -> Snapshot results, not
+// handwritten wire data. The fixture preserves source canaries separately and
+// includes the source SHA, appended generator and reproducible scratch-only overlay recipe.
+// ordinary_empty is explicitly synthetic: the generator proves zero-input Begin returns nil.
+type M2ReviewFixture = {
+  provenance: { source_sha: string; generated: string[]; ordinary_empty: string };
+  source_canaries: { id: number; author_username: string; body: string; reply_id: string; resolve_id: string }[];
+  mixed: NonNullable<RunContext["reviewComments"]>;
+  all_withheld: NonNullable<RunContext["reviewComments"]>;
+  ordinary_empty: NonNullable<RunContext["reviewComments"]>;
+};
+const m2ReviewFixture = JSON.parse(readFileSync(
+  new URL("./fixtures/2393-review-snapshot.json", import.meta.url), "utf8",
+)) as M2ReviewFixture;
+const m2Notes = [
+  ["author_not_eligible", "[Review comments withheld] 1 review comment withheld: author not eligible (author_not_eligible). Their content is not available; do not guess it or act on it."],
+  ["permission_unknown", "[Review comments withheld] 1 review comment withheld: permission unknown (permission_unknown). Their content is not available; do not guess it or act on it."],
+] as const;
+function m2ReviewFence(prompt: string) {
+  const open = prompt.match(/\n<review_comments_([0-9a-f]+)>\n/);
+  assert.ok(open, "eligible comments have a newline-delimited review fence");
+  const close = prompt.indexOf(`\n</review_comments_${open[1]}>`, open.index! + open[0].length);
+  assert.ok(close > open.index!, "matching review close follows the opening tag");
+  return { start: open.index!, inner: prompt.slice(open.index! + open[0].length, close) };
+}
+describe("Codex M2 author-assessed review evidence", () => {
+  it("fixture provenance distinguishes generated snapshots from synthetic ordinary empty", () => {
+    assert.equal(m2ReviewFixture.provenance.source_sha, "9cb606111b2b27a66ca96ff9a915d79fb46a80a5");
+    assert.deepEqual(m2ReviewFixture.provenance.generated, ["mixed", "all_withheld"]);
+    assert.match(m2ReviewFixture.provenance.ordinary_empty, /Synthetic.*Begin returns nil/);
+    assert.deepEqual(m2ReviewFixture.ordinary_empty, {
+      version: 2, comments: [], truncated: false, withheld_not_eligible: 0, withheld_unknown: 0,
+    });
+    assert.deepEqual(m2ReviewFixture.mixed.comments.map((c) => c.id), [239301, 239302]);
+    assert.equal(m2ReviewFixture.mixed.version, 2);
+    assert.equal(m2ReviewFixture.all_withheld.version, 2);
+    assert.deepEqual(m2ReviewFixture.all_withheld.comments, []);
+    for (const snapshot of [m2ReviewFixture.mixed, m2ReviewFixture.all_withheld]) {
+      assert.equal(snapshot.withheld_not_eligible, 1);
+      assert.equal(snapshot.withheld_unknown, 1);
+    }
+    assert.deepEqual(m2ReviewFixture.source_canaries.map((c) => c.id), [239303, 239304]);
+  });
+  for (const branch of ["plan", "gated", "persisted"] as const) {
+    const mixedPrompt = () => m1Prompt(branch, { ...m1Context(), reviewComments: m2ReviewFixture.mixed });
+    for (const [author, body, reply, resolve] of [
+      ["collaborator", "M2-ELIGIBLE-COLLABORATOR-BODY", "m2-reply-collaborator", "m2-resolve-collaborator"],
+      ["allowlisted bot", "M2-ELIGIBLE-BOT-BODY", "m2-reply-bot", "m2-resolve-bot"],
+    ] as const) {
+      it(`${branch}: eligible ${author} body stays inside the review fence`, () => {
+        assert.ok(m2ReviewFence(mixedPrompt()).inner.includes(body));
+      });
+      it(`${branch}: eligible ${author} reply id stays inside the review fence`, () => {
+        assert.ok(m2ReviewFence(mixedPrompt()).inner.includes(`reply_id=${reply}`));
+      });
+      it(`${branch}: eligible ${author} resolve id stays inside the review fence`, () => {
+        assert.ok(m2ReviewFence(mixedPrompt()).inner.includes(`resolve_id=${resolve}`));
+      });
+    }
+    for (const [reason, note] of m2Notes) {
+      it(`${branch}: exact ${reason} count note occurs once outside the review fence`, () => {
+        const prompt = mixedPrompt();
+        const fence = m2ReviewFence(prompt);
+        assert.equal(prompt.split(note).length - 1, 1);
+        const position = prompt.indexOf(note);
+        assert.ok(position >= 0 && position + note.length < fence.start);
+        assert.equal(prompt.split(`(${reason})`).length - 1, 1, "no second or changed count note");
+      });
+    }
+    for (const snapshot of ["mixed", "all_withheld"] as const) {
+      for (const canary of m2ReviewFixture.source_canaries) {
+        for (const field of ["body", "reply_id", "resolve_id"] as const) {
+          it(`${branch}: ${snapshot} excludes withheld ${canary.author_username} ${field} from the whole prompt`, () => {
+            const prompt = m1Prompt(branch, { ...m1Context(), reviewComments: m2ReviewFixture[snapshot] });
+            assert.ok(!prompt.includes(canary[field]), `withheld ${field} leaked into the complete prompt`);
+          });
+        }
+      }
+    }
+    for (const [reason, note] of m2Notes) {
+      it(`${branch}: all-withheld preserves exact ${reason} count note`, () => {
+        const prompt = m1Prompt(branch, { ...m1Context(), reviewComments: m2ReviewFixture.all_withheld });
+        assert.equal(prompt.split(note).length - 1, 1);
+        assert.equal(prompt.split(`(${reason})`).length - 1, 1);
+      });
+    }
+    it(`${branch}: all-withheld has no review fence or thread anchors`, () => {
+      const prompt = m1Prompt(branch, { ...m1Context(), reviewComments: m2ReviewFixture.all_withheld });
+      assert.doesNotMatch(prompt, /review_comments_|reply_id=|resolve_id=/);
+    });
+    if (branch === "gated" || branch === "persisted") {
+      for (const snapshot of ["mixed", "all_withheld"] as const) {
+        it(`${branch}: ${snapshot} preserves authoritative approved instructions without issue context`, () => {
+          const prompt = m1Prompt(branch, { ...m1Context(), reviewComments: m2ReviewFixture[snapshot] });
+          assert.doesNotMatch(prompt, /M1-ISSUE-TITLE|M1-ISSUE-BODY|M1-ISSUE-COMMENT|issue_context_|issue_comments_/);
+          if (branch === "gated") {
+            assert.ok(prompt.includes("<approved_plan>\nM1-GATED-PLAN\n</approved_plan>"));
+            assert.ok(prompt.includes("is your authoritative instruction for this run"));
+            assert.doesNotMatch(prompt, /M1-PERSISTED-PLAN/);
+            assert.ok(prompt.indexOf("[Review comments withheld]") > prompt.indexOf("</approved_plan>"),
+              "snapshot notes follow the approved plan's closing tag");
+            if (snapshot === "mixed") {
+              assert.ok(m2ReviewFence(prompt).start > prompt.indexOf("</approved_plan>"),
+                "eligible review fence follows the approved plan's closing tag");
+            }
+          } else {
+            assert.ok(prompt.includes("M1-PERSISTED-PLAN"));
+            assert.doesNotMatch(prompt, /approved_plan|M1-GATED-PLAN/);
+            assert.ok(prompt.indexOf("[Review comments withheld]") > prompt.indexOf("M1-PERSISTED-PLAN"));
+          }
+        });
+      }
+    }
+  }
+  for (const branch of m1Branches) {
+    it(`${branch}: synthetic ordinary-empty version 2 preserves the full baseline byte for byte`, () => {
+      const prompt = m1Prompt(branch, { ...m1Context(), reviewComments: m2ReviewFixture.ordinary_empty });
+      assert.equal(m1IssueNormalize(prompt), m1BaselinePrompts[branch]);
+      assert.doesNotMatch(prompt, /review_comments_|Review comments withheld|reply_id=|resolve_id=/);
+    });
   }
 });
 
