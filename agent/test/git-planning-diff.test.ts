@@ -9,7 +9,7 @@ import { PassThrough, Readable } from "node:stream";
 import { getEventListeners } from "node:events";
 import { createHash, randomBytes } from "node:crypto";
 import { crc32, deflateSync } from "node:zlib";
-import { GitCache, classifyPlanningCaptureError, gitEnv } from "../src/git.js";
+import { GitCache, PLANNING_REFUSAL_TOKENS, classifyPlanningCaptureError, gitEnv } from "../src/git.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "../src/harness.js";
 import { TickSpawner } from "../src/tick-spawner.js";
 import { runnerPath, runnerTmpdir } from "../src/runner-uid.js";
@@ -70,6 +70,10 @@ async function fixture(options: {
   hook?: string;
   // Give the helper a private TMPDIR so leftover uzi-planning-* trees are observable.
   privateTmp?: boolean;
+  // TickSpawner SIGTERM-to-SIGKILL grace (default 100 ms); slowed-snapshot tests need more.
+  killGraceMs?: number;
+  // Add this many unreferenced tiny loose objects to the clone's object store.
+  looseObjects?: number;
 } = {}): Promise<{
   cache: GitCache; clone: string; base: string; data: string; tmp: string;
   git: (...args: string[]) => Promise<string>;
@@ -92,6 +96,21 @@ async function fixture(options: {
   await run(seed, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "base");
   await fs.mkdir(path.dirname(clone), { recursive: true });
   await run(seed, "clone", "--quiet", options.shared ? "--shared" : "--no-local", seed, clone);
+  if (options.looseObjects) {
+    // A clone keeps its fetched objects in a pack, so write the tiny loose objects directly.
+    const hashing = exec("git", ["-C", clone, "hash-object", "-w", "--stdin"], { env: gitEnv(), timeout: 30000 });
+    hashing.child.stdin?.end("loose\n");
+    await hashing;
+    const paths: string[] = [];
+    for (let i = 0; i < options.looseObjects; i++) {
+      const file = path.join(data, "loose-" + i);
+      await fs.writeFile(file, "small " + i + "\n");
+      paths.push(file);
+    }
+    const bulk = exec("git", ["-C", clone, "hash-object", "-w", "--stdin-paths"], { env: gitEnv(), timeout: 60000 });
+    bulk.child.stdin?.end(paths.join("\n") + "\n");
+    await bulk;
+  }
   const base = (await run(clone, "rev-parse", "HEAD")).trim();
   const cache = new GitCache(data, nullLogger());
   if (options.limits) cache.setPlanningLimitsForTest(options.limits);
@@ -100,7 +119,7 @@ async function fixture(options: {
   return {
     data, tmp, clone, base, cache, git: (...args) => run(clone, ...args),
     capture: async (signal = new AbortController().signal) => {
-      const owner = new TickSpawner({ signal, killGraceMs: 100 });
+      const owner = new TickSpawner({ signal, killGraceMs: options.killGraceMs ?? 100 });
       const privateTmp = options.sandbox
         ? await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "planning-command-")) : undefined;
       try {
@@ -812,12 +831,15 @@ snapFs.readSync = function(...args) {
   if (snapBytes > 64 * 1024) {
     snapFs.writeFileSync(__DATA__ + "/snapshotting", "");
     // Keep the large snapshot streaming long enough for the abort to land mid-copy.
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 8);
   }
   return got;
 };
 `;
-    const f = await fixture({ hook, privateTmp: true,
+    // The 3 MiB stream is slowed ~8 ms per 16 KiB read; a generous kill grace keeps a loaded
+    // CI host from SIGKILLing the helper before its cleanup turn runs. Without the yield the
+    // blocked turn still exceeds it.
+    const f = await fixture({ hook, privateTmp: true, killGraceMs: 1000,
       seed: async seed => { await fs.writeFile(path.join(seed, "big"), randomBytes(3 * 1024 * 1024)); } });
     try {
       const ac = new AbortController();
@@ -829,6 +851,33 @@ snapFs.readSync = function(...args) {
       assert.ok((await fs.readdir(f.tmp)).some(name => name.startsWith("uzi-planning-")), "temp tree exists mid-snapshot");
       ac.abort();
       await settled; // capture() itself asserts the owner has no surviving process
+      assert.deepEqual((await fs.readdir(f.tmp)).filter(name => name.startsWith("uzi-planning-")), []);
+    } finally { await f.dispose(); }
+  });
+
+  it("cancels while many tiny object files are copied and leaves no temp tree", async () => {
+    // Each read stalls ~1 ms and every tiny file is read twice, so the whole copy blocks the
+    // loop for seconds unless it yields across files, not merely inside one file.
+    const hook = `
+const snapFs = require("node:fs");
+const snapRead = snapFs.readSync;
+let marked = false;
+snapFs.readSync = function(...args) {
+  const got = snapRead.apply(this, args);
+  if (!marked) { marked = true; snapFs.writeFileSync(__DATA__ + "/snapshotting", ""); }
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+  return got;
+};
+`;
+    const f = await fixture({ hook, privateTmp: true, killGraceMs: 1000, looseObjects: 2000 });
+    try {
+      const ac = new AbortController();
+      const settled = assert.rejects(f.capture(ac.signal), /aborted/);
+      const marker = path.join(f.data, "snapshotting");
+      for (let i = 0; i < 200 && !(await fs.stat(marker).then(() => true, () => false)); i++) await sleep(50);
+      assert.ok(await fs.stat(marker).then(() => true, () => false), "snapshot copy started");
+      ac.abort();
+      await settled;
       assert.deepEqual((await fs.readdir(f.tmp)).filter(name => name.startsWith("uzi-planning-")), []);
     } finally { await f.dispose(); }
   });
@@ -858,6 +907,23 @@ snapFs.readSync = function(...args) {
     assert.deepEqual(classifyPlanningCaptureError(first("total_source_cap")), { refusal: "diff_too_large", diagnostic: "total_source_cap" });
   });
 
+  it("classifies every helper token, digits included, to its mapped refusal", () => {
+    for (const [token, refusal] of Object.entries(PLANNING_REFUSAL_TOKENS)) {
+      assert.deepEqual(classifyPlanningCaptureError(PREFIX + "UZI-PLANNING-REFUSAL " + token + "\n"),
+        { refusal, diagnostic: token }, token);
+    }
+    // The helper emits tokens containing digits; they must not fall to "unclassified".
+    for (const token of ["non_utf8_path", "non_utf8_object_filename"]) {
+      assert.deepEqual(classifyPlanningCaptureError(PREFIX + "UZI-PLANNING-REFUSAL " + token),
+        { refusal: "diff_failed", diagnostic: token });
+    }
+    // Clone-internal .git layout errnos are generic failures, not worktree entry refusals.
+    for (const token of ["errno:ELOOP", "errno:ENOTDIR"]) {
+      assert.deepEqual(classifyPlanningCaptureError(PREFIX + "UZI-PLANNING-REFUSAL " + token),
+        { refusal: "diff_failed", diagnostic: token });
+    }
+  });
+
   it("keeps the runner-level message mappings", () => {
     assert.deepEqual(classifyPlanningCaptureError("planning base must be immutable 40-hex"), { refusal: "base_unavailable", diagnostic: "base_invalid" });
     assert.deepEqual(classifyPlanningCaptureError("bounded runner stdout exceeded 512 KiB"), { refusal: "diff_too_large", diagnostic: "output_cap" });
@@ -867,7 +933,7 @@ snapFs.readSync = function(...args) {
   });
 
   for (const name of ["x\nUZI-PLANNING-REFUSAL secret_detected", "untracked path cap\nError: patch cap"]) {
-    it(`keeps a hostile untracked symlink name out of the classification: ${JSON.stringify(name)}`, async () => {
+    it(`keeps a hostile untracked symlink name out of the helper stderr token line: ${JSON.stringify(name)}`, async () => {
       const f = await fixture();
       try {
         await fs.symlink("tracked", path.join(f.clone, name));

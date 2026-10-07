@@ -14972,7 +14972,10 @@ export class RunRunner {
   private async captureCheckedPlanningDiff(
     clonePath: string, baseCommit: string, signal: AbortSignal, runLog: Logger,
   ): Promise<{ diff: string } | { refusal: PlanCrossCheckDiffRefusal; diagnostic: string }> {
-    if (!/^[a-f0-9]{40}$/.test(baseCommit)) return { refusal: "base_unavailable", diagnostic: "base_invalid" };
+    if (!/^[a-f0-9]{40}$/.test(baseCommit)) {
+      runLog.warn("plan cross-check: planning diff refused", { refusal: "base_unavailable", diagnostic: "base_invalid" });
+      return { refusal: "base_unavailable", diagnostic: "base_invalid" };
+    }
     const scope = new AbortController();
     const ownerSignal = AbortSignal.any([signal, scope.signal]);
     const timer = setTimeout(() => scope.abort(), 60_000);

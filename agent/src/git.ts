@@ -9004,7 +9004,7 @@ const PLANNING_TOTAL_LIMIT = 128 * 1024 * 1024;
  * Fixed refusal vocabulary of PLANNING_CAPTURE_HELPER. Each token is a literal
  * the helper emits as `UZI-PLANNING-REFUSAL <token>`; none can carry a file name.
  */
-const PLANNING_REFUSAL_TOKENS: Readonly<Record<string, PlanCrossCheckDiffRefusal>> = {
+export const PLANNING_REFUSAL_TOKENS: Readonly<Record<string, PlanCrossCheckDiffRefusal>> = {
   untracked_path_cap: "too_many_untracked",
   patch_cap: "diff_too_large", source_cap: "diff_too_large", total_source_cap: "diff_too_large",
   base_source_cap: "diff_too_large", snapshot_cap: "diff_too_large",
@@ -9013,7 +9013,7 @@ const PLANNING_REFUSAL_TOKENS: Readonly<Record<string, PlanCrossCheckDiffRefusal
   unsupported_symlink: "unsupported_entry", unsupported_gitlink: "unsupported_entry",
   non_directory_ancestor: "unsupported_entry", nonregular_source: "unsupported_entry",
   unsupported_base_mode: "unsupported_entry", unsupported_tracked_mode: "unsupported_entry",
-  "errno:ELOOP": "unsupported_entry", "errno:ENOTDIR": "unsupported_entry",
+  "errno:ELOOP": "diff_failed", "errno:ENOTDIR": "diff_failed",
   capture_deadline: "diff_failed", unsafe_root: "diff_failed", non_directory_root: "diff_failed",
   unsafe_path: "diff_failed", source_changed: "diff_failed", git_pipe_cap: "diff_failed",
   git_deadline: "diff_failed", git_refused: "diff_failed", incomplete_path_metadata: "diff_failed",
@@ -9049,7 +9049,7 @@ export function classifyPlanningCaptureError(message: string): {
   if (message.startsWith(PLANNING_PROCESS_FAILED)) {
     const rest = message.slice(PLANNING_PROCESS_FAILED.length);
     const line = rest.slice(0, rest.includes("\n") ? rest.indexOf("\n") : rest.length);
-    const match = /^UZI-PLANNING-REFUSAL ([a-zA-Z_:]+)$/.exec(line);
+    const match = /^UZI-PLANNING-REFUSAL ([a-zA-Z0-9_:]+)$/.exec(line);
     const token = match?.[1];
     if (token !== undefined) {
       const known = Object.hasOwn(PLANNING_REFUSAL_TOKENS, token) ? PLANNING_REFUSAL_TOKENS[token] : undefined;
@@ -9133,7 +9133,7 @@ function components(p) {
       || Buffer.from(p).toString() !== p) refuse("unsafe_path");
   return parts;
 }
-function openFile(root, p, replacementAbsent = false) {
+function openFile(root, p) {
   const parts = components(p); let parent = root, owned = false;
   try {
     for (const part of parts.slice(0, -1)) {
@@ -9141,8 +9141,6 @@ function openFile(root, p, replacementAbsent = false) {
       const st = fs.fstatSync(next);
       if (!st.isDirectory()) {
         close(next);
-        // Only a pinned regular file proves a former descendant is absent.
-        if (replacementAbsent && st.isFile()) return undefined;
         refuse("non_directory_ancestor");
       }
       if (owned) close(parent); parent = next; owned = true;
@@ -9152,7 +9150,6 @@ function openFile(root, p, replacementAbsent = false) {
     const st = fs.fstatSync(fd);
     if (!st.isFile()) {
       close(fd);
-      if (replacementAbsent && st.isDirectory()) return undefined;
       refuse("nonregular_source");
     }
     return fd;
@@ -9352,21 +9349,29 @@ function indexEntries(bytes) {
   // Git receives only runner-owned copies, never paths into the mutable clone.
   const objectStore = path.join(temp, "object-store");
   fs.mkdirSync(objectStore);
+  // Yield to the event loop (so a pending SIGTERM runs cleanup) when more than
+  // ~20 ms of synchronous work has passed since the last yield. The clock is shared
+  // across chunks, files and directory entries, so many tiny files still yield.
+  let lastYield = Date.now();
+  async function maybeYield() {
+    if (Date.now() - lastYield < 20) return;
+    await new Promise(resolve => setImmediate(resolve));
+    lastYield = Date.now();
+  }
   async function copySnapshotFile(src, target) {
     const before = fs.fstatSync(src, { bigint: true });
     if (before.size > BigInt(SNAPSHOT_LIMIT - snapshotBytes)) refuse("snapshot_cap");
     const out = fs.openSync(target, C.O_WRONLY | C.O_CREAT | C.O_EXCL | C.O_NOFOLLOW, 0o600);
     try {
       const buffer = Buffer.alloc(16384);
-      for (let chunks = 0; ; chunks++) {
+      for (;;) {
         check();
         const got = fs.readSync(src, buffer, 0, Math.min(buffer.length, SNAPSHOT_LIMIT + 1 - snapshotBytes), null);
         if (!got) break;
         snapshotBytes += got;
         if (snapshotBytes > SNAPSHOT_LIMIT) refuse("snapshot_cap");
         for (let at = 0; at < got;) at += fs.writeSync(out, buffer, at, got - at);
-        // Let a pending SIGTERM run cleanup while a large store is copied.
-        if (chunks % 16 === 15) await new Promise(resolve => setImmediate(resolve));
+        await maybeYield();
       }
     } finally { fs.closeSync(out); }
     const after = fs.fstatSync(src, { bigint: true });
@@ -9380,6 +9385,7 @@ function indexEntries(bytes) {
       let ent;
       while ((ent = stream.readSync())) {
         check(); if (++entries > ENTRY_LIMIT) refuse("metadata_entry_cap");
+        await maybeYield();
         const raw = ent.name, name = raw.toString("utf8");
         if (!Buffer.from(name).equals(raw)) refuse("non_utf8_object_filename");
         if (components(name).length !== 1) refuse("unsafe_object_filename");
