@@ -2802,9 +2802,9 @@ export interface Run {
   mr_rework_auto_cycles?: number | null;
   mr_rework_auto_cap?: number | null;
   failure_reason: string | null;
-  /** Server-stamped stop signal (PRD #33, widened by #108 M5): "cancelled" or
-   *  "plan_rejected" (human), "auto_stopped" (server), null otherwise. isStoppedRun
-   *  reads this, not failure_reason — and treats only the two human kinds as calm. */
+  /** Server-stamped stop or scope disposition (see StopKind). isStoppedRun reads
+   *  status and this enum, not failure_reason: cancelled runs, including branch_moved,
+   *  render calmly; on failed runs only the human stop kinds do. */
   stop_kind: StopKind | null;
   /** Optional operator cancel reason or server-composed stop diagnostics, stamped beside
    *  stop_kind. This DTO is owner/admin-scoped, so it rides
