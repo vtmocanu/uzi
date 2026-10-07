@@ -43,6 +43,10 @@ M2 adds the rest of the apitypes hot set: `RepoDTO → Repo`, `MessageDTO → Ru
 `UserSettingsDTO → UserSettings`, `CatalogEntryDTO → CatalogEntry` (drift),
 `AdminCLITokenDTO → CliToken` (drift).
 
+`RunOutcomesDTO → RunOutcomes` records the outcome counts and lifetime failure
+recency fields (issue #2399). Its zero-marshal has a null `fail_origins`; the
+handler normalizes that map to `{}` on the real wire.
+
 ### M2 `ZeroOf` exemptions, each cited (Decision 7)
 
 Every exemption below is a field the TS type says never-null while the Go **mapper**

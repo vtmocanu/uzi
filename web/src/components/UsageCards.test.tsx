@@ -38,7 +38,7 @@ const outcomes = (
   plan_rejected: planRejected,
   failed,
   needs_landing: needsLanding,
-  fail_origins: origins,
+  last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: origins,
 });
 // The empty (nothing-finished) two-window shape, so a fixture that predates PRD #1293 keeps
 // the FailedRunsBlock hidden (finished === 0) and behaves exactly as before.

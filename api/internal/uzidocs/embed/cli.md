@@ -172,6 +172,12 @@ Global flags: `--json`, `--url <url>`, `--quiet`, `--no-color`,
 
 A few worth knowing:
 
+- **`uzi admin usage` includes failure recency.** The factory line and each
+  user's `SINCE` column show time since the last failed run in minutes, hours,
+  or days. A scope with finished runs but no failures shows `no failures`;
+  one with no finished runs shows `-`. These are the same lifetime definitions
+  as Overview: chat, judge, and rejected plans do not count as failures.
+
 - **`--harness` picks the run's execution engine; omit it to let the server
   resolve one.** `run create --harness claude|codex` and `schedule create
   --harness claude|codex` request a specific harness outright; omitting the

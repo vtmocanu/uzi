@@ -17,6 +17,7 @@ import type {
   Memory,
   SecretMeta,
   RunUsage,
+  RunOutcomes,
   UserSettings,
   CatalogEntry,
   AdminCliToken,
@@ -95,6 +96,8 @@ import secretZero from "../../../fixtures/api-contract/secret.zero.json";
 import secretFull from "../../../fixtures/api-contract/secret.full.json";
 import usageZero from "../../../fixtures/api-contract/usage.zero.json";
 import usageFull from "../../../fixtures/api-contract/usage.full.json";
+import runOutcomesZero from "../../../fixtures/api-contract/run_outcomes.zero.json";
+import runOutcomesFull from "../../../fixtures/api-contract/run_outcomes.full.json";
 import userSettingsZero from "../../../fixtures/api-contract/user_settings.zero.json";
 import userSettingsFull from "../../../fixtures/api-contract/user_settings.full.json";
 import catalogEntryZero from "../../../fixtures/api-contract/catalog_entry.zero.json";
@@ -593,6 +596,15 @@ void _buildInfoFull;
   void _usageExtra;
   void _usageZero;
   void _usageFull;
+}
+
+// RunOutcomes (#2399). fail_origins is normalized to {} by the handler.
+{
+  const missing: never = null as unknown as Exclude<keyof RunOutcomes, keyof typeof runOutcomesFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof runOutcomesFull, keyof RunOutcomes>;
+  const zero: ZeroOf<RunOutcomes, "fail_origins"> = runOutcomesZero;
+  const full: Widen<RunOutcomes> = runOutcomesFull;
+  void missing; void extra; void zero; void full;
 }
 
 // ── UserSettings (M2) ───────────────────────────────────────────────────────
@@ -1293,6 +1305,7 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // PRD #1732 D10: disabled_at is a present-as-null pointer while the credential is enabled.
   { stem: "secret", nullable: true },
   { stem: "usage", nullable: false },
+  { stem: "run_outcomes", nullable: true },
   { stem: "user_settings", nullable: true },
   { stem: "catalog_entry", nullable: true },
   { stem: "cli_token", nullable: true },

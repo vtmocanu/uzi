@@ -51,6 +51,24 @@ func runOutcomes(finished, completed, cancelled, planRejected, failed, needsLand
 	}
 }
 
+// withFailureRecency attaches the lifetime-only #2399 block. A missing failure
+// timestamp leaves every field null, including the count (never an invented streak).
+func withFailureRecency(o apitypes.RunOutcomesDTO, at pgtype.Timestamptz, runID uuid.UUID, origin string, completed int64, owner uuid.UUID) apitypes.RunOutcomesDTO {
+	if !at.Valid {
+		return o
+	}
+	id := runID.String()
+	o.LastFailedAt = &at.Time
+	o.LastFailedRunID = &id
+	o.LastFailedOrigin = &origin
+	o.CompletedSinceLastFailure = &completed
+	if owner != uuid.Nil {
+		uid := owner.String()
+		o.LastFailedUserID = &uid
+	}
+	return o
+}
+
 // decodeFailOrigins decodes a jsonb fail_origins column (issue #1451: the per-origin
 // breakdown computed in the same statement as the `failed` count) into the DTO map. The
 // query COALESCEs an empty group to '{}'; an absent column (nil, e.g. a zero-value row) also
@@ -119,9 +137,9 @@ func (h *Handler) SelfUsage(w http.ResponseWriter, r *http.Request) {
 		},
 		RunCount: row.RunCount,
 		Outcomes: apitypes.RunOutcomeWindowsDTO{
-			Lifetime: runOutcomes(outcomes.LifetimeFinished, outcomes.LifetimeCompleted,
+			Lifetime: withFailureRecency(runOutcomes(outcomes.LifetimeFinished, outcomes.LifetimeCompleted,
 				outcomes.LifetimeCancelled, outcomes.LifetimePlanRejected, outcomes.LifetimeFailed,
-				outcomes.LifetimeNeedsLanding, lifetimeOrigins),
+				outcomes.LifetimeNeedsLanding, lifetimeOrigins), outcomes.LastFailedAt, outcomes.LastFailedRunID, outcomes.LastFailedOrigin, outcomes.CompletedSinceLastFailure, uuid.Nil),
 			Last7Days: runOutcomes(outcomes.Last7Finished, outcomes.Last7Completed,
 				outcomes.Last7Cancelled, outcomes.Last7PlanRejected, outcomes.Last7Failed,
 				outcomes.Last7NeedsLanding, last7Origins),
@@ -217,8 +235,8 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 			// admin per-user breakdown discloses a non-metered component like the factory total.
 			SubscriptionRunCount: u.SubscriptionRunCount,
 			UnreportedRunCount:   u.UnreportedRunCount,
-			Outcomes: runOutcomes(oc.Finished, oc.Completed, oc.Cancelled, oc.PlanRejected, oc.Failed,
-				oc.NeedsLanding, originsByUser[u.UserID]),
+			Outcomes: withFailureRecency(runOutcomes(oc.Finished, oc.Completed, oc.Cancelled, oc.PlanRejected, oc.Failed,
+				oc.NeedsLanding, originsByUser[u.UserID]), oc.LastFailedAt, oc.LastFailedRunID, oc.LastFailedOrigin, oc.CompletedSinceLastFailure, uuid.Nil),
 		})
 	}
 	// D5: a user present in the outcomes aggregate but ABSENT from usage (every run died
@@ -236,8 +254,8 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 			// No usage row means no run_usage_totals rows, so both non-metered counts are zero.
 			SubscriptionRunCount: 0,
 			UnreportedRunCount:   0,
-			Outcomes: runOutcomes(oc.Finished, oc.Completed, oc.Cancelled, oc.PlanRejected, oc.Failed,
-				oc.NeedsLanding, originsByUser[oc.UserID]),
+			Outcomes: withFailureRecency(runOutcomes(oc.Finished, oc.Completed, oc.Cancelled, oc.PlanRejected, oc.Failed,
+				oc.NeedsLanding, originsByUser[oc.UserID]), oc.LastFailedAt, oc.LastFailedRunID, oc.LastFailedOrigin, oc.CompletedSinceLastFailure, uuid.Nil),
 		})
 	}
 	httpx.JSON(w, http.StatusOK, apitypes.AdminUsageDTO{
@@ -258,9 +276,9 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 			},
 			RunCount: totals.RunCount,
 			Outcomes: apitypes.RunOutcomeWindowsDTO{
-				Lifetime: runOutcomes(factoryOutcomes.LifetimeFinished, factoryOutcomes.LifetimeCompleted,
+				Lifetime: withFailureRecency(runOutcomes(factoryOutcomes.LifetimeFinished, factoryOutcomes.LifetimeCompleted,
 					factoryOutcomes.LifetimeCancelled, factoryOutcomes.LifetimePlanRejected,
-					factoryOutcomes.LifetimeFailed, factoryOutcomes.LifetimeNeedsLanding, factoryLifetimeOrigins),
+					factoryOutcomes.LifetimeFailed, factoryOutcomes.LifetimeNeedsLanding, factoryLifetimeOrigins), factoryOutcomes.LastFailedAt, factoryOutcomes.LastFailedRunID, factoryOutcomes.LastFailedOrigin, factoryOutcomes.CompletedSinceLastFailure, factoryOutcomes.LastFailedUserID),
 				Last7Days: runOutcomes(factoryOutcomes.Last7Finished, factoryOutcomes.Last7Completed,
 					factoryOutcomes.Last7Cancelled, factoryOutcomes.Last7PlanRejected,
 					factoryOutcomes.Last7Failed, factoryOutcomes.Last7NeedsLanding, factoryLast7Origins),

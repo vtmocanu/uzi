@@ -89,6 +89,7 @@ func contractCases() []contractCase {
 		newContractCase[AgentMemoryDTO]("agent_memory"),
 		newContractCase[SecretDTO]("secret"),
 		newContractCase[UsageDTO]("usage"),
+		newContractCase[RunOutcomesDTO]("run_outcomes"),
 		newContractCase[UserSettingsDTO]("user_settings"),
 		newContractCase[CatalogEntryDTO]("catalog_entry"),
 		newContractCase[AdminCLITokenDTO]("cli_token"),

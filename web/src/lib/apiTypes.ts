@@ -3542,6 +3542,13 @@ export interface RunListItem extends Run {
 // It is always needs_landing <= failed and does NOT enter finished — the dashboard splits the
 // `failed` bar into "failed" and "failed, needs landing" whose widths sum to the same failed.
 export interface RunOutcomes {
+  /** Lifetime-only recency; null without a failure and in last_7_days. */
+  last_failed_at: string | null;
+  last_failed_run_id: string | null;
+  last_failed_origin: string | null;
+  /** Factory-only owner attribution. */
+  last_failed_user_id: string | null;
+  completed_since_last_failure: number | null;
   finished: number;
   completed: number;
   cancelled: number;
