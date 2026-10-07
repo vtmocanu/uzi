@@ -76,7 +76,7 @@ it("credentialFree capture keeps a verified local restore point without publishi
   client.publishCheckpoint = async (_id, _tip, pack) => {
     uploads++;
     for await (const _chunk of pack) { /* drain real producer */ }
-    return { ok: true, httpStatus: 200, body: { published: true } };
+    return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/fixture" } };
   };
   await withFlight(async (ctx, flight, subject) => {
     const sha = commit(ctx.worktreePath);
@@ -94,7 +94,7 @@ function spyUploads(): string[] {
   client.publishCheckpoint = async (_id, tip, pack) => {
     tips.push(tip);
     for await (const _chunk of pack) { /* drain real producer */ }
-    return { ok: true, httpStatus: 200, body: { published: true } };
+    return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/fixture" } };
   };
   return tips;
 }
