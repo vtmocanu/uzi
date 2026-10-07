@@ -5,8 +5,28 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
+
+// seedClaimedMRRework seeds a completed source issue run and a claimed mr_rework run reworking
+// its MR (runs_kind_shape: pipeline_ref, mr_iid and target_run_id set, issue_iid NULL), so the
+// review-snapshot claim tests exercise the real rework shape. It returns the rework and source ids.
+func seedClaimedMRRework(t *testing.T, env codexTestEnv, userID, workerID, repoID uuid.UUID) (uuid.UUID, uuid.UUID) {
+	t.Helper()
+	sourceID := env.seedCodexRun(t, userID, workerID, repoID)
+	env.exec(`UPDATE runs SET issue_iid = 2, status = 'completed' WHERE id = $1`, sourceID)
+	runID := uuid.New()
+	env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_title, issue_description, status, worker_id,
+	             pipeline_ref, mr_iid, target_run_id)
+	          VALUES ($1, $2, $3, 'mr_rework', 't', 'd', 'claimed', $4, 'agent/issue-2', 77, $5)`,
+		runID, userID, repoID, workerID, sourceID)
+	if got := mustRun(t, env, runID).Kind; got != "mr_rework" {
+		t.Fatalf("seeded run kind = %q, want mr_rework", got)
+	}
+	return runID, sourceID
+}
 
 // TestAssembleClaimReplaysOnlyAssessedReviewSnapshotLiveDB drives the REAL assembleClaim against a
 // REAL Postgres (issue #2347). A runs.review_comments snapshot written before comment authors were
@@ -16,7 +36,7 @@ import (
 func TestAssembleClaimReplaysOnlyAssessedReviewSnapshotLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	userID, workerID, repoID := seedResumeClaimInfra(t, env)
-	runID := env.seedCodexRun(t, userID, workerID, repoID)
+	runID, _ := seedClaimedMRRework(t, env, userID, workerID, repoID)
 	svc := New(env.q, env.box, testParams())
 	wkr := store.Worker{ID: workerID, UserID: userID}
 
@@ -84,13 +104,11 @@ func TestLegacyReviewSnapshotWithReusableContextFailsClaimLiveDB(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			env := setupCodexLiveDB(t)
 			userID, workerID, repoID := seedResumeClaimInfra(t, env)
-			sourceID := env.seedCodexRun(t, userID, workerID, repoID)
-			env.exec(`UPDATE runs SET issue_iid = 2, status = 'completed' WHERE id = $1`, sourceID)
-			runID := env.seedCodexRun(t, userID, workerID, repoID)
+			runID, sourceID := seedClaimedMRRework(t, env, userID, workerID, repoID)
 			svc := New(env.q, env.box, testParams())
 			svc.SetTxBeginner(env.pool)
-			env.exec(`UPDATE runs SET review_comments = $2::jsonb, auto_approve = true, plan_source = 'agent',
-				target_run_id = $3, `+tc.set+` WHERE id = $1`, runID, legacy, sourceID)
+			env.exec(`UPDATE runs SET review_comments = $2::jsonb, auto_approve = true, plan_source = 'agent', `+
+				tc.set+` WHERE id = $1`, runID, legacy)
 
 			payload, err := svc.assembleAndFinishRunClaim(env.ctx, store.Worker{ID: workerID, UserID: userID}, mustRun(t, env, runID), false)
 			if err != nil || payload != nil {
