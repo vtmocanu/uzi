@@ -266,41 +266,41 @@ const REFUSAL_CASES: RefusalCase[] = [
   {
     name: "tip_unavailable", kind: "tip_unavailable", step: "resolve_tip", reason: "candidate commit is unavailable",
     detail: "ref does not resolve to a commit",
-    expectReason: "scratch_publication_refused: candidate history cannot be published (tip_unavailable at resolve_tip: ref does not resolve to a commit)",
+    expectReason: "scratch_publication_refused: candidate history cannot be published (tip_unavailable at resolve_tip)",
   },
   {
     name: "shallow_history", kind: "shallow_history", step: "shallow_check", reason: "cannot prove scratch-free candidate history",
     detail: "history is shallow",
-    expectReason: "scratch_publication_refused: candidate history cannot be published (shallow_history at shallow_check: history is shallow)",
+    expectReason: "scratch_publication_refused: candidate history cannot be published (shallow_history at shallow_check)",
   },
   {
     name: "object_walk_failed", kind: "object_walk_failed", step: "object_walk", reason: "cannot prove scratch-free candidate history",
     detail: "exit 128; fatal: bad tree",
     cause: new Error("git rev-list failed"),
-    expectReason: "scratch_publication_refused: candidate history cannot be published (object_walk_failed at object_walk: exit 128; fatal: bad tree)",
+    expectReason: "scratch_publication_refused: candidate history cannot be published (object_walk_failed at object_walk)",
     expectCause: "git rev-list failed",
   },
   {
     name: "checkpoint_range", kind: "checkpoint_range", step: "checkpoint_floor", reason: "checkpoint floor is unavailable or not an ancestor of candidate",
     detail: "floor is unavailable or not an ancestor of candidate",
-    expectReason: "scratch_publication_refused: candidate history cannot be published (checkpoint_range at checkpoint_floor: floor is unavailable or not an ancestor of candidate)",
+    expectReason: "scratch_publication_refused: candidate history cannot be published (checkpoint_range at checkpoint_floor)",
   },
   {
     name: "missing_objects", kind: "missing_objects", step: "object_walk", reason: "cannot prove scratch-free candidate history",
     detail: "bad object abc123",
-    expectReason: "scratch_publication_refused: candidate history cannot be published (missing_objects at object_walk: bad object abc123)",
+    expectReason: "scratch_publication_refused: candidate history cannot be published (missing_objects at object_walk)",
   },
   {
     name: "exec_failed", kind: "exec_failed", step: "scratch_walk", reason: "cannot prove scratch-free candidate history",
     detail: "exit 128",
     cause: new Error("fatal: spawn git ENOENT"),
-    expectReason: "scratch_publication_refused: candidate history cannot be published (exec_failed at scratch_walk: exit 128)",
+    expectReason: "scratch_publication_refused: candidate history cannot be published (exec_failed at scratch_walk)",
     expectCause: "fatal: spawn git ENOENT",
   },
   {
     name: "scratch_present", kind: "scratch_present", step: "scratch_walk", reason: "candidate history contains scratch",
     detail: ".uzi/scratch appears in candidate history",
-    expectReason: "scratch_publication_refused: candidate history cannot be published (scratch_present at scratch_walk: .uzi/scratch appears in candidate history)",
+    expectReason: "scratch_publication_refused: candidate history cannot be published (scratch_present at scratch_walk)",
   },
   {
     name: "floor_unverified", kind: "floor_unverified", step: "floor_refresh", reason: "cannot verify fresh remote floor",
@@ -369,7 +369,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
     const line = lines.find((l) => l.msg === "scratch publication refused");
     assert.ok(line);
-    assert.match(String(failed?.failure_reason), /^scratch_publication_refused: candidate history cannot be published \(exec_failed at object_walk: /);
+    assert.equal(failed?.failure_reason, "scratch_publication_refused: candidate history cannot be published (exec_failed at object_walk)");
     assert.ok(!String(failed?.failure_reason).includes(PAT));
     assert.equal(line.fields?.site, "finalize");
     assert.ok(!JSON.stringify(line.fields).includes(PAT));
@@ -420,7 +420,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     const detail = sanitizeForLog(raw, 197);
     assert.ok(!detail.includes(PAT), "the sanitized copy alone no longer matches the redactor");
     const { reason, fields } = await finalizeRefusal("redact-tab", undefined, detail, raw);
-    assertNoPatPrefix(reason);
+    assert.equal(reason, "scratch_publication_refused: candidate history cannot be published (exec_failed at object_walk)");
     assertNoPatPrefix(fields);
   });
 
@@ -429,7 +429,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
       const raw = `fatal: ${PAT.slice(0, 16)}${sep}${PAT.slice(16)}\nhint: later line`;
       const detail = "fatal: " + PAT.slice(0, 16);
       const { reason, fields } = await finalizeRefusal(`redact-${label}`, undefined, detail, raw);
-      assertNoPatPrefix(reason);
+      assert.equal(reason, "scratch_publication_refused: candidate history cannot be published (exec_failed at object_walk)");
       assertNoPatPrefix(fields);
     });
   }
@@ -446,7 +446,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     it(`redacts a secret pushed onto the raw bound by leading ${label} (failure_reason and log)`, async () => {
       const raw = `${pad.repeat(4080)}${PAT}`;
       const { reason, fields } = await finalizeRefusal(`redact-pad-${label.replace(" ", "-")}`, undefined, "exit 1", raw);
-      assertNoPatPrefix(reason);
+      assert.equal(reason, "scratch_publication_refused: candidate history cannot be published (exec_failed at object_walk)");
       assertNoPatPrefix(fields);
     });
   }
@@ -461,7 +461,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
   it("omits an oversized rawDetail whose secret is split by interior padding (failure_reason and log)", async () => {
     const raw = `fatal: ${PAT.slice(0, 16)}${"\n".repeat(5000)}${PAT.slice(16)}`;
     const { reason, fields } = await finalizeRefusal("redact-interior-pad", undefined, "exit 1", raw);
-    assertOmittedNoPatPrefix(reason);
+    assert.equal(reason, "scratch_publication_refused: candidate history cannot be published (exec_failed at object_walk)");
     assertOmittedNoPatPrefix(fields);
   });
 
@@ -476,7 +476,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     const detail = sanitizeForLog(raw, 197);
     assert.ok(detail.endsWith("..."));
     const { reason, fields } = await finalizeRefusal("redact-cap", undefined, detail, raw);
-    assertNoPatPrefix(reason);
+    assert.equal(reason, "scratch_publication_refused: candidate history cannot be published (exec_failed at object_walk)");
     assertNoPatPrefix(fields);
   });
 

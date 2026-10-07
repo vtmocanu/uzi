@@ -182,11 +182,17 @@ it("refuses a rewound remote floor before pushing", { skip: linuxCloneSkip }, as
   commit(clone, "one");
   await track(bare, clone);
   await cache.pushBranch(bare, branch, "", fx.originPath);
+  // A new claim captures the published tip; a checkpoint is not its claim floor.
+  const captured = await cache.createOrAttachRunnerClone(bare, 1719, noProofReseed);
+  const P = git(clone, "rev-parse", "HEAD");
+  assert.deepEqual(captured.publicationFloor, { kind: "pinned", oid: P });
   git(fx.originPath, "update-ref", `refs/heads/${branch}`, "refs/heads/main");
   fs.writeFileSync(path.join(clone, "two"), "two");
-  commit(clone, "two");
+  const H = commit(clone, "two");
   await track(bare, clone);
-  await assert.rejects(cache.pushBranch(bare, branch, "", fx.originPath), ScratchPublicationError);
+  await assert.rejects(cache.pushBranch(bare, branch, "", fx.originPath, undefined, {
+    floor: captured.publicationFloor!, originalHead: H, candidate: H,
+  }), ScratchPublicationError);
 });
 
 it("cannot publish when the remote rewinds to scratch history after the floor refresh", { skip: linuxCloneSkip }, async () => {

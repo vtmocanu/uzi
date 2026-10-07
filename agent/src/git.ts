@@ -176,7 +176,9 @@ function consumerInputSink(target: Writable): Writable {
 /** Why publication was refused; `exec_failed` is the default for a bare reason with no classification. */
 export type ScratchPublicationKind =
   | "tip_unavailable" | "shallow_history" | "missing_objects" | "object_walk_failed"
-  | "exec_failed" | "scratch_present" | "floor_unverified" | "checkpoint_range";
+  | "exec_failed" | "scratch_present" | "floor_unverified" | "checkpoint_range"
+  | "remote_changed_during_refresh" | "remote_candidate_diverged"
+  | "new_remote_candidate_diverged" | "remote_branch_advanced";
 /** The check that refused. */
 export type ScratchPublicationStep =
   | "resolve_tip" | "shallow_check" | "object_walk" | "scratch_walk" | "floor_refresh" | "checkpoint_floor";
@@ -319,10 +321,24 @@ function isAbortLike(error: unknown): error is Error {
   return error instanceof Error && error.name === "AbortError";
 }
 
-class RemoteBranchAdvancedError extends Error {
-  constructor() {
-    super("non-fast-forward: remote branch advanced");
+/** Claim-scoped remote floor, captured under the clone/adoption lock. */
+export type PublicationFloor =
+  | { readonly kind: "pinned"; readonly oid: string }
+  | { readonly kind: "absent" }
+  | { readonly kind: "unverified" };
+
+export interface PublicationCandidate {
+  readonly floor: PublicationFloor;
+  readonly originalHead: string;
+  readonly candidate: string;
+}
+
+/** Only a complete locked proof may create this disposition. */
+export class RemoteBranchAdvancedError extends ScratchPublicationError {
+  constructor(readonly proof: Readonly<{ P: string; H: string; C: string; R: string; cause: "remote_branch_advanced" }>) {
+    super("remote_branch_advanced", undefined, { kind: "remote_branch_advanced", step: "floor_refresh" });
     this.name = "RemoteBranchAdvancedError";
+    Object.freeze(proof);
   }
 }
 
@@ -1162,6 +1178,8 @@ export interface CheckpointOverlayContext {
 }
 
 export interface RunnerClone {
+  /** Separate from recovered baseCommit and any local checkpoint/bridge floor. */
+  publicationFloor?: PublicationFloor;
   /** Absolute path to the runner clone's working tree (the ONLY working tree under
    *  (b) — the worker is bare-only). The agent checks out + commits here. */
   path: string;
@@ -1672,15 +1690,43 @@ export class GitCache {
    * resolved to a pinned commit before pushing, keeping the runner's branch out
    * of the bare's heads namespace (B2 invariant 2).
    */
-  async pushBranch(barePath: string, branch: string, pat: string, repoUrl: string, username?: string, sourceSha?: string): Promise<void> {
+  async pushBranch(
+    barePath: string, branch: string, pat: string, repoUrl: string, username?: string,
+    publication?: PublicationCandidate,
+  ): Promise<void> {
     const scope = httpScopeForUrl(repoUrl);
     await this.withLock(barePath, async () => {
-      const tip = sourceSha ?? await this.resolveCommitStrict(barePath, runnerTrackingRef(branch));
+      const tip = publication?.candidate ?? await this.resolveCommitStrict(barePath, runnerTrackingRef(branch));
       const candidate = await this.scratchPublicationPreflight(barePath, branch, tip);
-      await this.refreshScratchPublicationFloor(barePath, branch, candidate, pat, scope, username);
-      // A literal OID keeps the candidate fixed even if the tracking ref moves.
-      await this.runGit(barePath, ["push", "origin", `${candidate}:refs/heads/${branch}`], pat, scope, username);
+      // Legacy callers have no claim floor and cannot produce a supersession proof.
+      const group = publication ?? { floor: { kind: "absent" } as const, originalHead: candidate, candidate };
+      await this.refreshScratchPublicationFloor(barePath, branch, group, pat, scope, username);
+      try {
+        await this.runGit(barePath, ["push", "origin", `${candidate}:refs/heads/${branch}`], pat, scope, username);
+      } catch (error) {
+        // Stderr only selects a new complete proof; it never establishes movement.
+        if (isNonFastForwardRejection(error)) {
+          await this.scratchPublicationPreflight(barePath, branch, candidate);
+          await this.refreshScratchPublicationFloor(barePath, branch, group, pat, scope, username);
+        }
+        throw error;
+      }
     });
+  }
+
+  private async capturePublicationFloor(barePath: string, ref: string): Promise<PublicationFloor> {
+    try {
+      const { stdout } = await this.execScoped("git", withDir(barePath, [
+        "rev-parse", "--verify", "--quiet", ref,
+      ]), { env: gitEnv(), timeout: GIT_TIMEOUT_MS });
+      const oid = stdout.trim();
+      if (!SHA40_RE.test(oid) || await this.resolveCommitStrict(barePath, ref) !== oid) return { kind: "unverified" };
+      return Object.freeze({ kind: "pinned", oid });
+    } catch (error) {
+      const failure = classifyExecFailure(error);
+      if (failure.exitCode === 1 && !failure.stdout.trim() && !failure.stderr.trim()) return { kind: "absent" };
+      return { kind: "unverified" };
+    }
   }
 
   /** Publication-path commit resolver: unlike revParse it never reads an exec failure as
@@ -1798,58 +1844,64 @@ export class GitCache {
   }
 
   private async refreshScratchPublicationFloor(
-    barePath: string, branch: string, candidate: string, pat: string, scope: string | undefined, username?: string,
+    barePath: string, branch: string, group: PublicationCandidate, pat: string,
+    scope: string | undefined, username?: string,
   ): Promise<void> {
     const remoteRef = `refs/heads/${branch}`;
     const scratchRef = `refs/uzi-publication-floor/${branch}`;
-    let forwardAdvance = false;
-    try {
+    const refuse = (kind: ScratchPublicationKind): never => {
+      throw new ScratchPublicationError("cannot verify fresh remote floor", undefined, {
+        kind, step: "floor_refresh",
+      });
+    };
+    const observe = async (): Promise<string | null> => {
       const listed = (await this.runGit(barePath, ["ls-remote", "origin", remoteRef], pat, scope, username)).trim();
-      if (!listed) {
-        if (await this.refExists(barePath, `refs/remotes/origin/${branch}`)) throw new Error("remote branch rewound away");
+      if (!listed) return null;
+      const oid = listed.slice(0, 40);
+      if (!SHA40_RE.test(oid) || listed !== `${oid}\t${remoteRef}`) refuse("floor_unverified");
+      return oid;
+    };
+    const relation = async (floor: string, tip: string): Promise<"ancestor" | "divergent"> => {
+      const answer = await this.ancestry(barePath, floor, tip);
+      if (answer === "unknown") refuse("floor_unverified");
+      return answer as "ancestor" | "divergent";
+    };
+    try {
+      if (group.floor.kind === "unverified") refuse("floor_unverified");
+      const R = await observe();
+      if (R === null) {
+        if (group.floor.kind !== "absent") refuse("floor_unverified");
+        if (await observe() !== null) refuse("remote_changed_during_refresh");
         return;
       }
-      const match = /^([0-9a-f]{40})\trefs\/heads\/.+$/.exec(listed);
-      if (!match || listed !== `${match[1]}\t${remoteRef}`) throw new Error("remote branch response is ambiguous");
       await this.runGit(barePath, ["fetch", "--refmap=", "origin", `+${remoteRef}:${scratchRef}`], pat, scope, username);
-      // Strict read: an exec failure must not look like "the branch changed". Re-wrap a refusal
-      // from the resolver as this step's floor_unverified, keeping its detail.
-      const fresh = await this.resolveCommitStrict(barePath, scratchRef).catch((resolveErr: unknown) => {
-        if (resolveErr instanceof ScratchPublicationError) {
-          throw new ScratchPublicationError("cannot verify fresh remote floor", resolveErr.cause ?? resolveErr, {
-            kind: "floor_unverified", step: "floor_refresh",
-            ...(resolveErr.detail !== undefined ? { detail: resolveErr.detail } : {}),
-            ...(resolveErr.rawDetail !== undefined ? { rawDetail: resolveErr.rawDetail } : {}),
-          });
-        }
-        throw resolveErr;
+      const fetched = await this.resolveCommitStrict(barePath, scratchRef).catch((error: unknown) => {
+        if (error instanceof RunResidueBlockedError || isAbortLike(error)) throw error;
+        throw new ScratchPublicationError("cannot verify fresh remote floor", error, {
+          kind: "floor_unverified", step: "floor_refresh",
+          ...(error instanceof ScratchPublicationError
+            ? { detail: error.detail, rawDetail: error.rawDetail }
+            : execDetail(classifyExecFailure(error))),
+        });
       });
-      if (fresh !== match[1]) throw new Error("remote branch changed during refresh");
-      const priorRef = `refs/remotes/origin/${branch}`;
-      const prior = await this.revParse(barePath, `${priorRef}^{commit}`);
-      if (prior) {
-        if ((await this.ancestry(barePath, prior, fresh)) !== "ancestor") {
-          throw new Error("remote branch floor is unavailable or rewound");
-        }
-      } else if (await this.tryGit(barePath, ["rev-parse", "--verify", "--quiet", priorRef]) === 0) {
-        // The tracking ref exists but names no commit: a broken floor, not an absent one.
-        throw new Error("remote branch floor is unavailable");
+      if (fetched !== R) refuse("remote_changed_during_refresh");
+      const { originalHead: H, candidate: C, floor } = group;
+      if (floor.kind === "pinned" && await relation(floor.oid, R) !== "ancestor") refuse("floor_unverified");
+      const remoteInCandidate = await relation(R, C);
+      if (remoteInCandidate === "ancestor") {
+        if (await observe() !== R) refuse("remote_changed_during_refresh");
+        return;
       }
-      // With no prior (the branch appeared remotely after the last fetch) the rewind
-      // check has nothing to compare; the fast-forward below must still be proven.
-      const freshToCandidate = await this.ancestry(barePath, fresh, candidate);
-      if (freshToCandidate === "ancestor") return;
-      if (!prior) throw new Error("new remote branch is not an ancestor of candidate");
-      if (freshToCandidate !== "divergent") throw new Error("remote branch ancestry is unavailable");
-      // Only a strictly newer, scratch-free remote tip outside a candidate that
-      // still descends from the old floor is a concurrent forward advance.
-      if (prior === fresh || (await this.ancestry(barePath, prior, candidate)) !== "ancestor") {
-        throw new Error("remote branch and candidate diverged");
+      if (floor.kind !== "pinned") return refuse("new_remote_candidate_diverged");
+      const P = floor.oid;
+      // Check H separately: an ancestry bridge in C cannot rehabilitate rewritten H.
+      if (P === R || await relation(P, H) !== "ancestor" || await relation(P, C) !== "ancestor") {
+        refuse("remote_candidate_diverged");
       }
-      await this.scratchPublicationPreflight(barePath, branch, fresh);
-      forwardAdvance = true;
+      await this.scratchPublicationPreflight(barePath, branch, R);
+      if (await observe() !== R) refuse("remote_changed_during_refresh");
+      throw new RemoteBranchAdvancedError({ P, H, C, R, cause: "remote_branch_advanced" });
     } catch (cause) {
-      // issue #2213: a quarantine refusal is not an unverifiable floor: it reaches the runner typed.
       if (cause instanceof RunResidueBlockedError) throw cause;
       const abort = this.boundaryAbortError(cause);
       if (abort) throw abort;
@@ -1858,10 +1910,14 @@ export class GitCache {
         kind: "floor_unverified", step: "floor_refresh", ...execDetail(classifyExecFailure(cause)),
       });
     } finally {
-      await this.runGit(barePath, ["update-ref", "-d", scratchRef]).catch(() => undefined);
+      // One local cleanup attempt per proof; failure does not authorize publication.
+      await this.runGit(barePath, ["update-ref", "-d", scratchRef]).catch((cause: unknown) => {
+        if (cause instanceof RunResidueBlockedError || isAbortLike(cause)) throw cause;
+        throw new ScratchPublicationError("cannot clean publication floor", cause, {
+          kind: "floor_unverified", step: "floor_refresh", ...execDetail(classifyExecFailure(cause)),
+        });
+      });
     }
-    // The caller verifies the moved branch before reporting branch_moved.
-    if (forwardAdvance) throw new RemoteBranchAdvancedError();
   }
 
   /** The default branch's short name (e.g. `main`), for an MR target. */
@@ -2686,6 +2742,7 @@ export class GitCache {
       // documented above. All three candidate refs live in the bare (the clone does not
       // necessarily carry the default branch), so the resolution happens here.
       const originRef = `refs/remotes/origin/${branch}`;
+      const publicationFloor = await this.capturePublicationFloor(barePath, originRef);
       const trackingRef = runnerTrackingRef(branch);
       // issue #781 — disjoint-history guard. Resolve the default ref ONCE up front, then
       // qualify EACH candidate base ref: it counts as existing only if it also shares
@@ -3228,7 +3285,7 @@ export class GitCache {
       // marker's parent when a wip(park) marker was reset --soft'd back to uncommitted, and
       // baseSha (byte-identical) on every other leg. wipRecovered surfaces the recovery to
       // M4/M5.
-      return { path: clonePath, branch, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered };
+      return { path: clonePath, branch, publicationFloor, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered };
     }
   }
 

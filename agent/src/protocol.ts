@@ -2356,14 +2356,13 @@ export interface StateRequest {
    *  a normal completion so an old worker's payload and a normal completion stay identical on
    *  the wire. Issue runs only; the server re-gates on the run having scope_ceiling set. */
   scope_capped?: boolean;
-  /** issue #1117: the worker's declaration, on an mr_rework `failed` report, that the
-   *  finalize push was rejected non-fast-forward because a concurrent same-branch writer
-   *  (a human, or uzi-watcher landing review fixes) advanced the MR branch `agent/issue-*`
-   *  under the run. The server honors it ONLY for an mr_rework run and routes such a
-   *  `failed` report to a non-error `cancelled`/stop_kind='branch_moved' disposition instead
-   *  of the generic agent_failure. Additive + optional and OMITTED ENTIRELY (never `false`)
-   *  on every other report, so an old worker's payload and every non-mr_rework report stay
-   *  identical on the wire. */
+  /** Verified remote supersession on ci_fix/mr_rework: failed + branch_moved:true,
+   *  no fail_origin, with canonical failure_reason
+   *  "branch_moved: remote_branch_advanced; superseding_tip=<40-lowercase-hex>".
+   *  The proof pins the claim floor, original imported head, publication candidate and
+   *  superseding remote tip. A lost push response can mean work was already published.
+   *  The current API honors mr_rework; ci_fix API disposition support is a separate milestone.
+   *  Omitted entirely on other reports; no new wire fields. */
   branch_moved?: boolean;
   /** failed carries a human-readable reason. */
   failure_reason?: string;

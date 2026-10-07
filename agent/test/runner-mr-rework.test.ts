@@ -159,12 +159,12 @@ describe("RunRunner — mr_rework kind (PRD #700 / issue #778)", () => {
     // now genuinely rejects non-fast-forward. `git` is reassigned per-test by installHarness().
     const originalPush = git.pushBranch.bind(git);
     let advanced = false;
-    git.pushBranch = (async (bare: string, branch: string, pat: string, url: string, user?: string) => {
+    git.pushBranch = (async (bare: string, branch: string, pat: string, url: string, user?: string, publication?: Parameters<typeof git.pushBranch>[5]) => {
       if (!advanced && branch === "agent/issue-42") {
         advanced = true;
         gitOrigin(["update-ref", "refs/heads/agent/issue-42", shaR]);
       }
-      return originalPush(bare, branch, pat, url, user);
+      return originalPush(bare, branch, pat, url, user, publication);
     }) as typeof git.pushBranch;
 
     const { gitlab, calls } = fakeGitlab();
@@ -182,6 +182,7 @@ describe("RunRunner — mr_rework kind (PRD #700 / issue #778)", () => {
     );
     assert.ok(terminal, "the superseded run reported a terminal failed state");
     assert.equal(terminal!.body.branch_moved, true, "the failed report declares branch_moved:true");
+    assert.equal(terminal!.body.failure_reason, `branch_moved: remote_branch_advanced; superseding_tip=${shaR}`);
     assert.equal(
       terminal!.body.fail_origin,
       undefined,
@@ -217,14 +218,14 @@ describe("RunRunner — mr_rework kind (PRD #700 / issue #778)", () => {
 
     const originalPush = git.pushBranch.bind(git);
     let advanced = false;
-    git.pushBranch = (async (bare: string, branch: string, pat: string, url: string, user?: string) => {
+    git.pushBranch = (async (bare: string, branch: string, pat: string, url: string, user?: string, publication?: Parameters<typeof git.pushBranch>[5]) => {
       if (!advanced && branch === "agent/issue-42") {
         advanced = true;
         // Rewind/diverge the MR branch to C — the worker's tip (a child of O) is not a
         // descendant of C, so the non-forced push rejects non-ff, but O is NOT an ancestor of C.
         gitOrigin(["update-ref", "refs/heads/agent/issue-42", shaC]);
       }
-      return originalPush(bare, branch, pat, url, user);
+      return originalPush(bare, branch, pat, url, user, publication);
     }) as typeof git.pushBranch;
 
     const { gitlab } = fakeGitlab();
