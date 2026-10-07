@@ -5085,6 +5085,7 @@ export class GitCache {
    * hashes regular-file bytes and raw symlink target bytes against the trusted bare starting
    * tree, never following targets or trusting the clone's index or object store.
    * Unsupported types/platforms and budgets retain custody.
+   * Ignored untracked .gitignore retains custody, even in trusted-ignored directories such as Python virtualenvs.
    * Trusted tracked .gitignore semantics remain unchanged. External excludes are disabled;
    * info/exclude permits only the exact worker-source '/.uzi/scratch/' baseline plus
    * column-zero comments and empty or ASCII-space-only blanks. Uncertain rules retain custody.
@@ -5147,6 +5148,8 @@ export class GitCache {
       if (before !== trustedStart) return null;
       const status = await read(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"]);
       if (status.length !== 0) return null;
+      const ignored = await read(["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", ":(glob)**/.gitignore", ":(exclude).uzi/scratch/**"]);
+      if (ignored.split("\0").some(entry => entry && !entry.startsWith(".uzi/scratch/"))) return null;
       const wrapped = this.boundaryProcesses.getStore()
         ? { command: process.execPath, args: ["-e", CANCEL_CONTENT_HELPER, cwd] }
         : runnerCommand(process.execPath, ["-e", CANCEL_CONTENT_HELPER, cwd]);
