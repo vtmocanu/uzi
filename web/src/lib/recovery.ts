@@ -158,13 +158,13 @@ export function sortedArchives(summary: RecoveryArchiveSummary): RecoveryArchive
 // Pure decision logic for the board alert and the Workers per-hold resolution surface.
 // The server derives each hold's `attention` (active | capturing | archive_ready |
 // needs_action | source_only | released | discarded) and the owner-wide aggregate; this
-// file only maps those onto presentation. It NEVER re-derives admission, severity, or the
-// decision-needed count from raw hold rows — those are server-authoritative (D6/D10).
+// file maps the aggregate onto presentation, including alert severity from blocked_runs.
+// Admission and decision counts remain server-authoritative; raw hold rows do not drive them.
 
 // CustodyAlertView is the board alert's resolved presentation, or `null` to render nothing.
 export interface CustodyAlertView {
-  // danger = the admission limit is reached and new claims are blocked (D8 escalation);
-  // warning = attention is required but claims still flow.
+  // danger = blocked_runs > 0; warning = every other visible case, including capacity.
+  // Capacity alone does not establish that any run is currently blocked.
   tone: "warning" | "danger";
   atLimit: boolean;
   // "6 / 8 custody slots used" — the safety-slot line.
@@ -182,14 +182,11 @@ export interface CustodyAlertView {
 
 // custodyAlertView decides whether the board alert renders and, if so, how loud it is.
 //
-// SELF-HIDES (returns null) unless attention is required OR claims are blocked (D8): there
-// is at least one open hold AND (a hold needs an owner decision, a run is blocked, or the
-// admission limit is reached). A fleet carrying only healthy active protection is NOT an
-// incident (D6), so the alert stays hidden — it is not "another permanent alarm card".
-//
-// ESCALATES to `danger` styling the moment open_holds reaches custody_hold_limit: at the
-// limit every further code-run claim for the owner stops, which is the incident this whole
-// PRD exists to surface. Below the limit it is `warning`.
+// SELF-HIDES unless there is an open hold AND a decision, a blocked run, or capacity
+// reached against a positive limit. Healthy protection below capacity stays hidden.
+// Capacity currently uses open_holds; custodyAlertView does not reclassify admission holds.
+// Danger requires blocked_runs > 0, even below capacity. All other visible states warn.
+// Headlines prioritize blocked runs, then decisions, then capacity alone.
 export function custodyAlertView(
   agg: RecoveryCustodyAggregate,
   recoveryWaitCount: number,
@@ -201,7 +198,7 @@ export function custodyAlertView(
     (agg.decision_needed > 0 || agg.blocked_runs > 0 || atLimit);
   if (!show) return null;
   return {
-    tone: atLimit ? "danger" : "warning",
+    tone: agg.blocked_runs > 0 ? "danger" : "warning",
     atLimit,
     slotsLabel: `${agg.open_holds} / ${agg.custody_hold_limit} custody slots used`,
     slotsUsed: agg.open_holds,
@@ -209,9 +206,11 @@ export function custodyAlertView(
     decisionNeeded: agg.decision_needed,
     blockedRuns: agg.blocked_runs,
     recoveryWaitCount,
-    headline: atLimit
+    headline: agg.blocked_runs > 0
       ? "Held work is blocking new runs"
-      : "Held work needs your attention",
+      : agg.decision_needed > 0
+        ? "Held work needs your attention"
+        : "Custody capacity reached",
   };
 }
 

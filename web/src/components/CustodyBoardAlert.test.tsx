@@ -5,9 +5,7 @@ import { MemoryRouter } from "react-router-dom";
 import { CustodyBoardAlert } from "./CustodyBoardAlert";
 import { api, type RecoveryCustodyHolds } from "../lib/api";
 
-// The alert fetches its own aggregate via api.getRecoveryHolds and refreshes on a visible
-// poll. Mock only that call; keep custodyAlertView real so these pins exercise the real
-// self-hide / escalation decision.
+// Mock the aggregate fetch only: rendering uses the real custodyAlertView rules.
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
   return { ...actual, api: { getRecoveryHolds: vi.fn() } };
@@ -45,94 +43,117 @@ async function renderAlert(resp: RecoveryCustodyHolds, recoveryWaitCount = 0) {
 }
 
 describe("CustodyBoardAlert", () => {
-  it("self-hides when nothing needs action", async () => {
-    const { container } = await renderAlert(holds({ open_holds: 3 }));
+  it.each([8, 9])("renders capacity-only holds at %i as a polite warning without action", async (open_holds) => {
+    await renderAlert(holds({ open_holds }));
+    const region = screen.getByRole("status");
+    expect(region.getAttribute("aria-live")).toBe("polite");
+    expect(region.classList.contains("bg-warn/10")).toBe(true);
+    expect(region.classList.contains("bg-danger/10")).toBe(false);
+    expect(screen.getByText("Custody capacity reached").classList.contains("text-warn")).toBe(true);
+    expect(screen.getByText(`${open_holds} / 8 custody slots used`)).toBeTruthy();
+    expect(screen.getByText("Custody capacity is reached. New code runs will wait; no action is needed. Admission resumes when counted holds settle.")).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /Review held work/ })).toBeNull();
+    expect(screen.queryByText(/needs? a decision/)).toBeNull();
+    expect(screen.queryByText(/runs? blocked/)).toBeNull();
+    expect(screen.queryByText(/Review the holds that need a decision/)).toBeNull();
+    expect(screen.queryByText(/Queued code runs are waiting/)).toBeNull();
+  });
+
+  it.each([
+    { open_holds: 3 },
+    { open_holds: 8, custody_hold_limit: 0 },
+    { open_holds: 8, custody_hold_limit: -1 },
+    { open_holds: 0, decision_needed: 1, blocked_runs: 1 },
+  ])("self-hides with aggregate %j despite recovery wait diagnostics", async (aggregate) => {
+    const { container } = await renderAlert(holds(aggregate), 5);
     expect(container.innerHTML).toBe("");
   });
 
-  it("renders a warning (role=status) with the slot line and counts when a decision is needed", async () => {
-    await renderAlert(holds({ open_holds: 4, decision_needed: 2, blocked_runs: 1 }), 5);
+  it.each([4, 8, 9])("renders decision-only holds at %i as a polite warning with targeted advice", async (open_holds) => {
+    await renderAlert(holds({ open_holds, decision_needed: 2 }), 5);
     const region = screen.getByRole("status");
     expect(region.getAttribute("aria-live")).toBe("polite");
-    expect(screen.getByText(/Held work needs your attention/)).toBeTruthy();
-    expect(screen.getByText("4 / 8 custody slots used")).toBeTruthy();
+    expect(region.classList.contains("bg-warn/10")).toBe(true);
+    expect(region.classList.contains("bg-danger/10")).toBe(false);
+    expect(screen.getByText("Held work needs your attention").classList.contains("text-warn")).toBe(true);
+    expect(screen.getByText("Review the holds that need a decision and choose how to preserve their work.")).toBeTruthy();
     expect(screen.getByText(/holds need a decision/)).toBeTruthy();
-    expect(screen.getByText(/run blocked/)).toBeTruthy();
-    // recovery_wait_count is surfaced for diagnosis.
     expect(screen.getByText(/runs waiting to recover/)).toBeTruthy();
-    // Actionable (a decision is pending): the CTA to the resolution surface renders and the
-    // body uses the "only you can resolve" copy (PRD #1371).
-    expect(screen.getByRole("link", { name: /Review held work/ })).toBeTruthy();
-    expect(screen.getByText(/only you can resolve/)).toBeTruthy();
+    expect(screen.queryByText(/runs? blocked/)).toBeNull();
+    expect(screen.queryByText(/Queued code runs are waiting/)).toBeNull();
+    expect(screen.queryByText(/New code runs will wait/)).toBeNull();
+    const link = screen.getByRole("link", { name: /Review held work/ });
+    expect(link.getAttribute("href")).toBe("/workers?tab=workers#recovery-holds");
+    expect(link.classList.contains("bg-raised")).toBe(true);
   });
 
-  it("escalates to an assertive alert at the admission limit and links to the resolution surface", async () => {
-    await renderAlert(holds({ open_holds: 8, custody_hold_limit: 8, decision_needed: 1, blocked_runs: 2 }));
+  it.each([4, 8, 9])("renders blocked runs without decisions at %i as danger with queued-wait advice", async (open_holds) => {
+    await renderAlert(holds({ open_holds, blocked_runs: 2 }));
     const region = screen.getByRole("alert");
     expect(region.getAttribute("aria-live")).toBe("assertive");
-    expect(screen.getByText(/Held work is blocking new runs/)).toBeTruthy();
+    expect(region.classList.contains("bg-danger/10")).toBe(true);
+    expect(region.classList.contains("bg-warn/10")).toBe(false);
+    expect(screen.getByText("Held work is blocking new runs").classList.contains("text-danger")).toBe(true);
+    expect(screen.getByText("Queued code runs are waiting for custody admission; no action is needed. Admission resumes when counted holds settle.")).toBeTruthy();
+    expect(screen.getByText(/runs blocked/)).toBeTruthy();
+    expect(screen.queryByText(/needs? a decision/)).toBeNull();
+    expect(screen.queryByRole("link", { name: /Review held work/ })).toBeNull();
+    expect(screen.queryByText(/Review the holds that need a decision/)).toBeNull();
+  });
+
+  it.each([4, 8])("prioritizes blocked runs over decisions at %i and links to targeted review", async (open_holds) => {
+    await renderAlert(holds({ open_holds, decision_needed: 1, blocked_runs: 2 }));
+    const region = screen.getByRole("alert");
+    expect(region.getAttribute("aria-live")).toBe("assertive");
+    expect(region.classList.contains("bg-danger/10")).toBe(true);
+    expect(screen.getByText("Held work is blocking new runs")).toBeTruthy();
+    expect(screen.getByText("Queued code runs are waiting for custody admission. Review the holds that need a decision and choose how to preserve their work.")).toBeTruthy();
+    expect(screen.getByText(/hold needs a decision/)).toBeTruthy();
+    expect(screen.getByText(/runs blocked/)).toBeTruthy();
     const link = screen.getByRole("link", { name: /Review held work/ });
-    expect(link.getAttribute("href")).toContain("/workers");
-    // a11y: the action is a SINGLE anchor styled as a button — never a <Link> wrapping a
-    // <Button>, which is two tab stops and a doubled screen-reader announcement. One
-    // focusable element, no nested button.
+    expect(link.getAttribute("href")).toBe("/workers?tab=workers#recovery-holds");
+    expect(link.classList.contains("bg-brand")).toBe(true);
+    // A single anchor, with no nested button or second tab stop.
     expect(link.tagName).toBe("A");
     expect(link.querySelector("button")).toBeNull();
     expect(screen.queryByRole("button", { name: /Review held work/ })).toBeNull();
   });
 
-  it("gates zero-valued counts and omits the CTA when no decision is pending (PRD #1371)", async () => {
-    // At the admission limit with no decisions and no blocked runs, the danger alert still
-    // shows (atLimit), but neither count line renders — matching how recoveryWaitCount is
-    // already gated > 0. And since the Workers panel is now decision-only, the "Review held
-    // work" CTA is omitted and the body shows non-actionable wait copy, not "resolve" copy.
-    await renderAlert(holds({ open_holds: 8, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 }));
-    expect(screen.getByRole("alert")).toBeTruthy();
-    expect(screen.getByText(/Held work is blocking new runs/)).toBeTruthy();
-    expect(screen.queryByText(/needs? a decision/)).toBeNull();
-    expect(screen.queryByText(/runs? blocked/)).toBeNull();
-    // Non-actionable: no CTA to the (now hidden) resolution panel, and wait copy not resolve copy.
-    expect(screen.queryByRole("link", { name: /Review held work/ })).toBeNull();
-    expect(screen.getByText(/New code runs must wait for a hold to release/)).toBeTruthy();
-    expect(screen.queryByText(/until you resolve held work/)).toBeNull();
-  });
-
-  it("stays truthful when the alert is up from admission pressure alone: wait copy, no CTA (PRD #1371, AC #6)", async () => {
-    // At the limit with blocked runs but NO hold needing a decision. The Workers "Held work"
-    // panel now self-hides in this state, so the CTA that points at it must not render, and
-    // the body must not promise a resolution the owner cannot reach.
-    await renderAlert(holds({ open_holds: 8, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 2 }));
-    expect(screen.getByRole("alert")).toBeTruthy();
-    expect(screen.getByText(/Held work is blocking new runs/)).toBeTruthy();
-    // The blocked-runs count still renders (it gates on > 0); the decision line does not.
-    expect(screen.getByText(/runs blocked/)).toBeTruthy();
-    expect(screen.queryByText(/needs? a decision/)).toBeNull();
-    // No CTA / anchor to the hidden panel, and non-actionable wait copy (not the resolve copy).
-    expect(screen.queryByRole("link", { name: /Review held work/ })).toBeNull();
-    expect(screen.getByText(/New code runs must wait for a hold to release/)).toBeTruthy();
-    expect(screen.queryByText(/until you resolve held work/)).toBeNull();
-  });
-
-  it("updates live: a poll that crosses the limit turns a hidden alert into a danger alert", async () => {
+  it("updates through hidden, capacity, blocked, decision-only, and hidden polling states", async () => {
     vi.useFakeTimers();
-    // First fetch: healthy (hidden). Later poll: at the limit (danger).
     mockApi.getRecoveryHolds
       .mockResolvedValueOnce(holds({ open_holds: 2 }))
-      .mockResolvedValue(holds({ open_holds: 8, custody_hold_limit: 8, decision_needed: 1, blocked_runs: 2 }));
-    render(
+      .mockResolvedValueOnce(holds({ open_holds: 8 }))
+      .mockResolvedValueOnce(holds({ open_holds: 4, blocked_runs: 2 }))
+      .mockResolvedValueOnce(holds({ open_holds: 8, decision_needed: 1 }))
+      .mockResolvedValue(holds({ open_holds: 3 }));
+    const { container } = render(
       <MemoryRouter>
         <CustodyBoardAlert recoveryWaitCount={0} />
       </MemoryRouter>,
     );
-    await act(async () => {
-      await Promise.resolve();
-    });
+    await act(async () => { await Promise.resolve(); });
+    expect(container.innerHTML).toBe("");
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(screen.getByRole("status").getAttribute("aria-live")).toBe("polite");
+    expect(screen.getByText("Custody capacity reached")).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /Review held work/ })).toBeNull();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(screen.getByRole("alert").getAttribute("aria-live")).toBe("assertive");
+    expect(screen.getByText("Held work is blocking new runs")).toBeTruthy();
+    expect(screen.queryByRole("status")).toBeNull();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(screen.getByRole("status").getAttribute("aria-live")).toBe("polite");
+    expect(screen.getByText("Held work needs your attention")).toBeTruthy();
+    expect(screen.getByRole("link", { name: /Review held work/ })).toBeTruthy();
     expect(screen.queryByRole("alert")).toBeNull();
-    // Advance one poll interval; the second fetch now reports the limit.
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(10000);
-    });
-    expect(screen.getByRole("alert")).toBeTruthy();
-    expect(screen.getByText(/blocking new runs/)).toBeTruthy();
+    expect(screen.queryByText(/Queued code runs are waiting/)).toBeNull();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(container.innerHTML).toBe("");
+    expect(mockApi.getRecoveryHolds).toHaveBeenCalledTimes(5);
   });
 });

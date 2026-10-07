@@ -32,10 +32,11 @@ through `[0.52.0]`.)
 - **Admins can discover repositories across owners for Docker trust ([#2432](https://github.com/vtmocanu/uzi/issues/2432)).**
   Admin Settings now lists enabled repositories across all owners and disabled repositories retained by the effective Docker allowlist, with owner and forge connection labels so matching paths remain distinguishable. Admins can grant or revoke trust from this picker while preserving stored IDs for deleted repositories.
 
+- **Custody capacity alone no longer raises a blocking-work alert ([#2444](https://github.com/vtmocanu/uzi/issues/2444)).**
+  The board warns when custody capacity is reached without blocked runs, explains that new code runs will wait, and says no action is needed when no hold needs a decision. Decision-bearing holds keep their review action; only reported blocked runs trigger danger styling and an assertive alert.
+
 - **Checkpoint uploads hold remembered secret findings across current-flight publish paths ([#1964](https://github.com/vtmocanu/uzi/issues/1964)).**
   Park, shutdown, pause, recovery and completion-hold checkpoints now withhold publication while the current run remembers a live secret finding, including findings reachable through an overlay. Local captures remain available on that worker, with no new origin durability and a risk of loss if its disk is lost; a fresh pause whose checkpoint is withheld fails and the run continues. These paths still add no scans, and finding memory is lost on reclaim, so previously flagged local work can publish in a later unscanned run before another finding is recorded.
-
-### Fixed
 
 - **Codex MR rework receives its captured review findings ([#2393](https://github.com/vtmocanu/uzi/issues/2393)).**
   Planning and ordinary implementation prompts, including cold starts and resumes, carry the shared untrusted review-comment block with the exact reply and resolve identifiers; approved plans retain precedence, and runs without review comments keep their existing prompts.

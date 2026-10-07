@@ -225,9 +225,16 @@ function hold(over: Partial<RecoveryCustodyHold> = {}): RecoveryCustodyHold {
   };
 }
 
-describe("custodyAlertView — self-hide + escalation (D6/D8)", () => {
+describe("custodyAlertView — self-hide, capacity, and blocked-run severity", () => {
+  it.each([8, 9])("shows capacity-only holds at %i as a warning", (open_holds) => {
+    const view = custodyAlertView(agg({ open_holds }), 0);
+    expect(view?.tone).toBe("warning");
+    expect(view?.headline).toBe("Custody capacity reached");
+    expect(view?.atLimit).toBe(true);
+  });
+
   it("self-hides when there are no open holds at all", () => {
-    expect(custodyAlertView(agg({ open_holds: 0, decision_needed: 0, blocked_runs: 0 }), 0)).toBeNull();
+    expect(custodyAlertView(agg({ open_holds: 0, decision_needed: 1, blocked_runs: 1 }), 0)).toBeNull();
   });
 
   it("self-hides when holds are only healthy active protection (nothing to act on)", () => {
@@ -236,7 +243,7 @@ describe("custodyAlertView — self-hide + escalation (D6/D8)", () => {
     expect(custodyAlertView(agg({ open_holds: 3, decision_needed: 0, blocked_runs: 0 }), 2)).toBeNull();
   });
 
-  it("shows a WARNING when a hold needs a decision but claims still flow", () => {
+  it("shows a warning when a decision is needed without blocked runs", () => {
     const v = custodyAlertView(agg({ open_holds: 4, decision_needed: 2, blocked_runs: 0 }), 0);
     expect(v?.tone).toBe("warning");
     expect(v?.atLimit).toBe(false);
@@ -244,18 +251,29 @@ describe("custodyAlertView — self-hide + escalation (D6/D8)", () => {
     expect(v?.headline).toMatch(/needs your attention/);
   });
 
-  it("shows a WARNING when runs are blocked below the admission limit", () => {
-    const v = custodyAlertView(agg({ open_holds: 5, decision_needed: 0, blocked_runs: 1 }), 0);
-    expect(v?.tone).toBe("warning");
+  it.each([0, 1])("shows danger below capacity with blocked runs and %i decisions", (decision_needed) => {
+    const v = custodyAlertView(agg({ open_holds: 5, decision_needed, blocked_runs: 1 }), 0);
+    expect(v?.tone).toBe("danger");
+    expect(v?.atLimit).toBe(false);
+    expect(v?.headline).toBe("Held work is blocking new runs");
   });
 
-  it("ESCALATES to danger the moment open holds reach the admission limit", () => {
-    const v = custodyAlertView(agg({ open_holds: 8, custody_hold_limit: 8, decision_needed: 1 }), 3);
-    expect(v?.tone).toBe("danger");
-    expect(v?.atLimit).toBe(true);
-    expect(v?.headline).toMatch(/blocking new runs/);
-    // recovery_wait_count is threaded through untouched for diagnosis.
+  it.each([4, 8, 9])("keeps decision-only holds at %i warning even at capacity", (open_holds) => {
+    const v = custodyAlertView(agg({ open_holds, decision_needed: 1 }), 3);
+    expect(v?.tone).toBe("warning");
+    expect(v?.atLimit).toBe(open_holds >= 8);
+    expect(v?.headline).toBe("Held work needs your attention");
     expect(v?.recoveryWaitCount).toBe(3);
+  });
+
+  it.each([0, -1])("does not treat disabled limit %i as reached", (custody_hold_limit) => {
+    expect(custodyAlertView(agg({ open_holds: 8, custody_hold_limit }), 0)).toBeNull();
+    const decision = custodyAlertView(agg({ open_holds: 8, custody_hold_limit, decision_needed: 1 }), 0);
+    expect(decision?.atLimit).toBe(false);
+    expect(decision?.tone).toBe("warning");
+    const blocked = custodyAlertView(agg({ open_holds: 8, custody_hold_limit, blocked_runs: 1 }), 0);
+    expect(blocked?.atLimit).toBe(false);
+    expect(blocked?.tone).toBe("danger");
   });
 
   it("recovery_wait_count alone never triggers the alert (no open holds)", () => {
