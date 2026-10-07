@@ -18,22 +18,41 @@ import (
 )
 
 // This loopback server exercises the broker's real HTTP transport and go-git's
-// report decoder. It needs no git-http-backend and sends no sideband framing.
+// report decoder. Sideband responses are unnegotiated protocol errors: Publish
+// preserves go-git's default capability selection even when sideband is advertised.
 func TestPublishHTTPDisposition(t *testing.T) {
 	const ref = "refs/uzi-checkpoints/main"
 	cases := []struct {
-		name      string
-		lines     []string
-		flush     bool
-		want      pushbroker.PublishDisposition
-		wantError bool
-		mapped    error
+		name         string
+		lines        []string
+		flush        bool
+		want         pushbroker.PublishDisposition
+		wantError    bool
+		mapped       error
+		sideband     bool
+		outerOnly    bool
+		progressOnly bool
+		fatal        bool
+		raw          string
 	}{
 		{name: "acknowledged", lines: []string{"unpack ok", "ok " + ref}, flush: true, want: pushbroker.PublishAdvanced},
+		{name: "rejection reason exactly ok", lines: []string{"unpack ok", "ng " + ref + " ok"}, flush: true, wantError: true},
 		{name: "unfamiliar rejection", lines: []string{"unpack ok", "ng " + ref + " novel policy"}, flush: true, wantError: true},
 		{name: "unpack rejection", lines: []string{"unpack invalid fixture"}, flush: true, wantError: true},
 		{name: "known workflow rejection", lines: []string{"unpack ok", "ng " + ref + " missing workflow scope"}, flush: true, wantError: true, mapped: pushbroker.ErrWorkflowScopeRejected},
 		{name: "known non-fast-forward rejection", lines: []string{"unpack ok", "ng " + ref + " non-fast-forward"}, flush: true, wantError: true, mapped: pushbroker.ErrNotDescendant},
+		{name: "duplicate success", lines: []string{"unpack ok", "ok " + ref, "ok " + ref}, flush: true, want: pushbroker.PublishOutcomeUnknown, wantError: true},
+		{name: "conflicting markers", lines: []string{"unpack ok", "ok " + ref, "ng " + ref + " ok"}, flush: true, want: pushbroker.PublishOutcomeUnknown, wantError: true},
+		{name: "duplicate unpack", lines: []string{"unpack ok", "unpack ok", "ok " + ref}, flush: true, want: pushbroker.PublishOutcomeUnknown, wantError: true},
+		{name: "overflow packet", raw: "ffff", want: pushbroker.PublishOutcomeUnknown, wantError: true},
+		{name: "malformed header", raw: "zzzz", want: pushbroker.PublishOutcomeUnknown, wantError: true},
+		{name: "empty packet is not flush", raw: "000dunpack ok0021ok refs/uzi-checkpoints/main\n0004", want: pushbroker.PublishOutcomeUnknown, wantError: true},
+		{name: "partial header", raw: "00", want: pushbroker.PublishOutcomeUnknown, wantError: true},
+		{name: "sideband split headers", lines: []string{"unpack ok", "ok " + ref}, flush: true, sideband: true, want: pushbroker.PublishOutcomeUnknown, wantError: true},
+		{name: "sideband ng ok", lines: []string{"unpack ok", "ng " + ref + " ok"}, flush: true, sideband: true, want: pushbroker.PublishOutcomeUnknown, wantError: true},
+		{name: "outer flush only", lines: []string{"unpack ok", "ok " + ref}, sideband: true, outerOnly: true, want: pushbroker.PublishOutcomeUnknown, wantError: true},
+		{name: "progress spoof", lines: []string{"unpack ok", "ok " + ref}, flush: true, sideband: true, progressOnly: true, want: pushbroker.PublishOutcomeUnknown, wantError: true},
+		{name: "fatal sideband", lines: []string{"unpack ok", "ok " + ref}, flush: true, sideband: true, fatal: true, want: pushbroker.PublishOutcomeUnknown, wantError: true},
 		{name: "missing response", want: pushbroker.PublishOutcomeUnknown, wantError: true},
 		{name: "unpack only", lines: []string{"unpack ok"}, flush: true, want: pushbroker.PublishOutcomeUnknown, wantError: true},
 		{name: "wrong ref", lines: []string{"unpack ok", "ok refs/heads/main"}, flush: true, want: pushbroker.PublishOutcomeUnknown, wantError: true},
@@ -58,6 +77,36 @@ func TestPublishHTTPDisposition(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if tc.raw != "" {
+				response.Reset()
+				response.WriteString(tc.raw)
+			}
+			if tc.sideband {
+				inner := append([]byte(nil), response.Bytes()...)
+				response.Reset()
+				enc := pktline.NewEncoder(&response)
+				// Every inner header crosses outer packet boundaries.
+				for _, b := range inner {
+					channel := byte(1)
+					if tc.progressOnly {
+						channel = 2
+					}
+					if tc.fatal {
+						channel = 3
+					}
+					if err := enc.Encode([]byte{channel, b}); err != nil {
+						t.Fatal(err)
+					}
+					if err := enc.Encode([]byte("\x02ok " + ref + "\n")); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if tc.outerOnly || tc.progressOnly {
+					if err := enc.Flush(); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
 			var invocations atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/info/refs") {
@@ -77,6 +126,12 @@ func TestPublishHTTPDisposition(t *testing.T) {
 						t.Error(err)
 						return
 					}
+					if tc.sideband {
+						if err := ar.Capabilities.Set(capability.Sideband64k); err != nil {
+							t.Error(err)
+							return
+						}
+					}
 					if err := ar.Encode(w); err != nil {
 						t.Error(err)
 					}
@@ -84,6 +139,14 @@ func TestPublishHTTPDisposition(t *testing.T) {
 				}
 				if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git-receive-pack") {
 					invocations.Add(1)
+					scanner := pktline.NewScanner(r.Body)
+					if !scanner.Scan() {
+						t.Errorf("missing receive-pack command: %v", scanner.Err())
+						return
+					}
+					if strings.Contains(string(scanner.Bytes()), "side-band") {
+						t.Error("Publish selected an optional sideband capability")
+					}
 					if _, err := io.Copy(io.Discard, r.Body); err != nil {
 						t.Error(err)
 						return

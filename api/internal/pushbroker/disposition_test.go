@@ -5,10 +5,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
 	"testing"
 
 	"github.com/go-git/go-git/v5/plumbing/format/pktline"
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp"
+	"github.com/go-git/go-git/v5/plumbing/protocol/packp/capability"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/go-git/go-git/v5/plumbing/transport/client"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
@@ -25,7 +27,7 @@ type dispositionTransport struct {
 	invoked    int
 }
 
-var dispositionFailure = errors.New("fixture transport failure")
+var errDispositionFailure = errors.New("fixture transport failure")
 
 func (d *dispositionTransport) NewUploadPackSession(ep *transport.Endpoint, auth transport.AuthMethod) (transport.UploadPackSession, error) {
 	copyEP := *ep
@@ -44,19 +46,19 @@ type dispositionUpload struct {
 
 func (s *dispositionUpload) AdvertisedReferencesContext(ctx context.Context) (*packp.AdvRefs, error) {
 	if s.d.stage == "list" {
-		return nil, dispositionFailure
+		return nil, errDispositionFailure
 	}
 	return s.UploadPackSession.AdvertisedReferencesContext(ctx)
 }
 func (s *dispositionUpload) UploadPack(ctx context.Context, req *packp.UploadPackRequest) (*packp.UploadPackResponse, error) {
 	if s.d.stage == "fetch" {
-		return nil, dispositionFailure
+		return nil, errDispositionFailure
 	}
 	return s.UploadPackSession.UploadPack(ctx, req)
 }
 func (d *dispositionTransport) NewReceivePackSession(ep *transport.Endpoint, auth transport.AuthMethod) (transport.ReceivePackSession, error) {
 	if d.stage == "session" {
-		return nil, dispositionFailure
+		return nil, errDispositionFailure
 	}
 	copyEP := *ep
 	copyEP.Protocol = "file"
@@ -69,14 +71,31 @@ func (d *dispositionTransport) NewReceivePackSession(ep *transport.Endpoint, aut
 
 type dispositionReceive struct {
 	transport.ReceivePackSession
-	d *dispositionTransport
+	d      *dispositionTransport
+	Stdout io.Reader
 }
 
 func (s *dispositionReceive) AdvertisedReferencesContext(ctx context.Context) (*packp.AdvRefs, error) {
 	if s.d.stage == "advertisement" {
-		return nil, dispositionFailure
+		return nil, errDispositionFailure
 	}
 	ar, err := s.ReceivePackSession.AdvertisedReferencesContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if s.d.stage == "advance" {
+		s.Stdout = reflect.ValueOf(s.ReceivePackSession).Elem().FieldByName("Stdout").Interface().(io.Reader)
+	} else {
+		ar.Capabilities.Delete(capability.Sideband)
+		ar.Capabilities.Delete(capability.Sideband64k)
+		var wire bytes.Buffer
+		if s.d.report != nil {
+			if err := s.d.report.Encode(&wire); err != nil {
+				return nil, err
+			}
+		}
+		s.Stdout = bytes.NewReader(wire.Bytes())
+	}
 	if s.d.stage == "cancel before" {
 		s.d.cancel()
 	}
@@ -85,15 +104,17 @@ func (s *dispositionReceive) AdvertisedReferencesContext(ctx context.Context) (*
 func (s *dispositionReceive) ReceivePack(ctx context.Context, req *packp.ReferenceUpdateRequest) (*packp.ReportStatus, error) {
 	s.d.invoked++
 	if s.d.stage == "advance" {
+		reflect.ValueOf(s.ReceivePackSession).Elem().FieldByName("Stdout").Set(reflect.ValueOf(s.Stdout))
 		return s.ReceivePackSession.ReceivePack(ctx, req)
 	}
 	if req.Packfile != nil {
-		defer req.Packfile.Close()
+		defer func() { _ = req.Packfile.Close() }()
 	}
 	if s.d.stage == "cancel after" {
 		s.d.cancel()
 		return nil, ctx.Err()
 	}
+	_, _ = io.Copy(io.Discard, s.Stdout)
 	return s.d.report, s.d.receiveErr
 }
 
@@ -119,6 +140,7 @@ func TestPublishDisposition(t *testing.T) {
 		}
 		return r
 	}
+	succeeded := decode("unpack ok", "ok "+ref)
 	rejected := decode("unpack ok", "ng "+ref+" novel server policy")
 	unpackRejected := decode("unpack invalid fixture")
 	partial := decode("unpack ok")
@@ -135,13 +157,18 @@ func TestPublishDisposition(t *testing.T) {
 		mapped  error
 	}{
 		{name: "advance", want: pushbroker.PublishAdvanced, calls: 1},
+		{name: "success ordinary close error", report: succeeded, err: errDispositionFailure, want: pushbroker.PublishOutcomeUnknown, calls: 1},
+		{name: "success workflow close error", report: succeeded, err: errors.New("missing workflow scope"), want: pushbroker.PublishOutcomeUnknown, calls: 1},
+		{name: "success non-fast-forward close error", report: succeeded, err: errors.New("non-fast-forward"), want: pushbroker.PublishOutcomeUnknown, calls: 1},
 		{name: "already current", current: true},
-		{name: "list", err: dispositionFailure},
-		{name: "fetch", err: dispositionFailure},
-		{name: "session", err: dispositionFailure},
-		{name: "advertisement", err: dispositionFailure},
+		{name: "list", err: errDispositionFailure},
+		{name: "fetch", err: errDispositionFailure},
+		{name: "session", err: errDispositionFailure},
+		{name: "advertisement", err: errDispositionFailure},
 		{name: "cancel before", err: context.Canceled},
 		{name: "unfamiliar rejection", report: rejected, err: rejected.Error(), calls: 1},
+		{name: "unfamiliar rejection workflow close text", report: rejected, err: errors.New("missing workflow scope"), calls: 1},
+		{name: "unfamiliar rejection non-fast-forward close text", report: rejected, err: errors.New("non-fast-forward"), calls: 1},
 		{name: "unpack rejection", report: unpackRejected, err: unpackRejected.Error(), calls: 1},
 		{name: "known workflow rejection", report: workflowRejected, err: workflowRejected.Error(), mapped: pushbroker.ErrWorkflowScopeRejected, calls: 1},
 		{name: "known non-fast-forward rejection", report: nonFastForward, err: nonFastForward.Error(), mapped: pushbroker.ErrNotDescendant, calls: 1},

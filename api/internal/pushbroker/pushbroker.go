@@ -424,28 +424,28 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	// descends the fetched checkpoint tip and there is a real update to forward.
 	outcome, pushErr := forwardPack(ctx, remote, auth, checkpointRef, checkpointTip, tipHash, o.Pack)
 	disposition := PublishUnclassified
-	if outcome.invoked && !outcome.definitive {
+	if outcome.invoked && !outcome.rejected && (!outcome.success || pushErr != nil) {
 		// Without report evidence for this command, rejection-like error text
 		// cannot prove refusal. Keep the outcome unknown and preserve its cause.
 		if pushErr == nil {
 			pushErr = errors.New("missing or incomplete receive-pack acknowledgement")
 		}
 		return Result{Disposition: PublishOutcomeUnknown}, fmt.Errorf("pushbroker: push: %w", pushErr)
-	} else if outcome.definitive && pushErr == nil {
+	} else if outcome.success && pushErr == nil {
 		disposition = PublishAdvanced
 	}
 	result.Disposition = disposition
 	switch {
 	case pushErr == nil:
 		return result, nil
-	case isWorkflowScopeRejection(pushErr):
+	case outcome.rejected && isWorkflowScopeRejection(errors.New(outcome.reason)):
 		// The branch is behind on .github/workflows/** relative to the default branch
 		// and the bot PAT lacks the `workflow` scope. Not an infra fault — the caller
 		// skips the checkpoint cleanly (best-effort; PRD #456 M4). Checked BEFORE the
 		// non-fast-forward arm so a rejection carrying both signals routes to the scope
 		// sentinel, and so it never surfaces as a 5xx.
 		return Result{Disposition: disposition}, ErrWorkflowScopeRejected
-	case isNonFastForward(pushErr):
+	case outcome.rejected && isNonFastForward(errors.New(outcome.reason)):
 		// origin advanced its checkpoint (or a human moved the branch) between our fetch
 		// and our push, so the receive-pack compare-and-swap on the fetched Old refused
 		// the update — exactly the protocol-level guarantee the non-forced invariant wants.
@@ -1009,9 +1009,10 @@ func openReceivePack(ctx context.Context, remote *git.Remote, auth transport.Aut
 }
 
 type forwardPackResult struct {
-	report     *packp.ReportStatus
-	invoked    bool
-	definitive bool
+	invoked  bool
+	success  bool
+	rejected bool
+	reason   string // Authoritative raw rejection only; never a transport error.
 }
 
 // forwardPack ships the worker's (non-thin) packfile to origin through a MANUAL
@@ -1037,7 +1038,13 @@ func forwardPack(ctx context.Context, remote *git.Remote, auth transport.AuthMet
 	if err != nil {
 		return forwardPackResult{}, fmt.Errorf("pushbroker: endpoint: %w", err)
 	}
-	c, err := transportFor(ep)
+	raw := &rawReport{ref: ref.String()}
+	var c transport.Transport
+	if ep.Protocol == "http" || ep.Protocol == "https" {
+		c, err = rawHTTPTransport(ep, raw)
+	} else {
+		c, err = transportFor(ep)
+	}
 	if err != nil {
 		return forwardPackResult{}, fmt.Errorf("pushbroker: transport client: %w", err)
 	}
@@ -1063,19 +1070,35 @@ func forwardPack(ctx context.Context, remote *git.Remote, auth transport.AuthMet
 	if err := ctx.Err(); err != nil {
 		return forwardPackResult{}, err
 	}
-	outcome := forwardPackResult{invoked: true}
-	outcome.report, err = sess.ReceivePack(ctx, req)
-	// go-git ReportStatus.Decode requires a flush but accepts zero command statuses.
-	// HTTP and file transports return nil on decode failure. A decoded unpack
-	// rejection is definitive even without command statuses; unpack success needs
-	// exactly the requested command, with a nonempty status (any rejection reason).
-	if report := outcome.report; report != nil && report.UnpackStatus != "" {
-		if report.UnpackStatus != "ok" {
-			outcome.definitive = true
-		} else if len(report.CommandStatuses) == 1 {
-			status := report.CommandStatuses[0]
-			outcome.definitive = status != nil && status.ReferenceName == ref && status.Status != ""
+	if ep.Protocol != "http" && ep.Protocol != "https" {
+		if err := attachRawStdout(sess, raw); err != nil {
+			return forwardPackResult{}, err
 		}
+	}
+	return receiveObservedPack(ctx, sess, req, raw)
+}
+
+// receiveObservedPack observes the capabilities selected by the caller and uses
+// the complete raw report to classify the same ReceivePack invocation.
+func receiveObservedPack(ctx context.Context, sess transport.ReceivePackSession, req *packp.ReferenceUpdateRequest, raw *rawReport) (forwardPackResult, error) {
+	raw.sideband = req.Capabilities.Supports(capability.Sideband64k) || req.Capabilities.Supports(capability.Sideband)
+	outcome := forwardPackResult{invoked: true}
+	_, err := sess.ReceivePack(ctx, req)
+	// ReportStatus discards the command marker. Only the observed, complete raw
+	// report can distinguish "ng <ref> ok" from a successful command.
+	if raw.complete() {
+		switch {
+		case raw.unpack != "ok":
+			outcome.rejected, outcome.reason = true, raw.unpack
+		case raw.marker == "ng":
+			outcome.rejected, outcome.reason = true, raw.reason
+		case raw.marker == "ok":
+			outcome.success = true
+		}
+	}
+	if outcome.rejected && err == nil {
+		// The synthesized error omits the raw reason; classification uses reason only.
+		err = errors.New("pushbroker: receive-pack rejected update")
 	}
 	return outcome, err
 }
