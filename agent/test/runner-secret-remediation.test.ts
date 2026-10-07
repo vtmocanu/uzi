@@ -684,6 +684,8 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     const d = await drive({
       iid: 1932_223,
       forge: "gitlab",
+      // Exercise an eligible (owed) publish; a closed time gate keeps its own outcome.
+      seedFlight: (flight) => { flight.pendingPublish = true; },
       body: async (ctx, gate) => {
         const w = ctx.worktreePath;
         commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
