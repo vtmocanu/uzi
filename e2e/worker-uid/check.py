@@ -12,10 +12,14 @@ def check(expected, root):
     if len(expected_keys) != len(expected):
         errors.append("duplicate source leaf identity")
 
-    def visit(element, names=(), blocked=False):
-        blocked = blocked or any(element.find(tag) is not None for tag in ("skipped", "failure", "error"))
+    def visit(element, names=(), diagnostics=()):
         if element.tag == "testsuite":
             names = (*names, element.get("name"))
+        origin_names = (*names, element.get("name")) if element.tag == "testcase" else names
+        origin = f"{element.tag}: {' > '.join(origin_names)}"
+        local = tuple((origin, tag, tuple(reason.attrib.items()), "".join(reason.itertext()).strip())
+                      for tag in ("skipped", "failure", "error") for reason in element.findall(tag))
+        diagnostics = (*diagnostics, *local)
         if element.tag == "testcase":
             raw = element.get("file", "").replace("\\", "/")
             file = "agent/test/" + raw.rsplit("/test/", 1)[-1] if "/test/" in raw else "agent/" + raw
@@ -25,9 +29,9 @@ def check(expected, root):
                 if element.find("skipped") is None:
                     errors.append(f"unexpected executed leaf: {file}: {' > '.join(key[1])}")
             else:
-                observed.setdefault(key, []).append(blocked)
+                observed.setdefault(key, []).append(diagnostics)
         for child in element:
-            visit(child, names, blocked)
+            visit(child, names, diagnostics)
 
     visit(root)
     if not expected:
@@ -35,11 +39,16 @@ def check(expected, root):
     for test in expected:
         key = (test["file"], tuple(test["names"]))
         matches = observed.get(key, [])
-        label = " > ".join(test["names"])
+        label = f"{test['file']}: {' > '.join(test['names'])}"
         if len(matches) != 1:
             errors.append(f"{label}: expected exactly one result, found {len(matches)}")
         elif matches[0]:
-            errors.append(f"{label}: skipped, failed or cancelled")
+            for origin, tag, attributes, text in matches[0]:
+                details = [f"{name}={value}" for name, value in attributes if value.strip()]
+                if text:
+                    details.append(text)
+                reason = "\n".join(details) or "no reason supplied"
+                errors.append(f"{label}: {tag} from {origin}: {reason}")
     return errors
 
 
