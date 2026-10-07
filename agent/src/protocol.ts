@@ -1077,6 +1077,13 @@ export interface ReviewCommentSnapshot {
  *  mr_rework claim (PRD #700 M2). Absent for a non-mr_rework kind and a connection with
  *  an unknown bot id (D9). `truncated` is set when the thread was clipped. */
 export interface ReviewCommentsSnapshot {
+  /** 2 for snapshots produced with author-eligibility filtering; absent/other for legacy
+   *  snapshots, which the server replays as an empty comments list. */
+  version?: number;
+  /** Count of comments omitted because the author is not an eligible collaborator. */
+  withheld_not_eligible?: number;
+  /** Count of comments omitted because the author's permission lookup failed. */
+  withheld_unknown?: number;
   comments: ReviewCommentSnapshot[];
   truncated: boolean;
 }
