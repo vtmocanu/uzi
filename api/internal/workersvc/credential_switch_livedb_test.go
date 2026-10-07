@@ -1028,14 +1028,22 @@ func TestSetStateBranchMovedSupersedeUnderFenceLiveDB(t *testing.T) {
 	targetID := uuid.New()
 	env.exec(`INSERT INTO runs (id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,status)
  VALUES ($1,$2,$3,'issue',990,'t','d','completed')`, targetID, o.userID, o.repoID)
-	for _, kind := range []string{"mr_rework", "ci_fix"} {
-		for _, guard := range []string{"accepted", "wrong_worker", "stale_generation", "released", "terminal", "budget_exhausted", "completion_blocked"} {
+	for kindIndex, kind := range []string{"mr_rework", "ci_fix"} {
+		for guardIndex, guard := range []string{"accepted", "wrong_worker", "stale_generation", "released", "terminal", "budget_exhausted", "completion_blocked"} {
 			t.Run(kind+"/"+guard, func(t *testing.T) {
+				exec := func(sql string, args ...any) {
+					t.Helper()
+					if _, err := env.pool.Exec(env.ctx, sql, args...); err != nil {
+						t.Fatalf("exec %q: %v", sql, err)
+					}
+				}
+				// Guard no-ops leave active runs, so each case needs its own MR and pipeline.
+				identity := int64(kindIndex*7 + guardIndex)
 				g := int64(5)
 				runID := uuid.New()
-				env.exec(`INSERT INTO runs (id,user_id,repo_id,kind,issue_title,issue_description,status,worker_id,started_at,claim_generation,pipeline_ref,mr_iid,target_run_id,pipeline_id,failure_reason,fail_origin)
-     VALUES ($1,$2,$3,$4,'t','d','running',$5,now(),$6,$7,77,$8,123,'old failure','agent_failure')`,
-					runID, o.userID, o.repoID, kind, o.workerID, g, "agent/m2-"+runID.String(), targetID)
+				exec(`INSERT INTO runs (id,user_id,repo_id,kind,issue_title,issue_description,status,worker_id,started_at,claim_generation,pipeline_ref,mr_iid,target_run_id,pipeline_id,failure_reason,fail_origin)
+     VALUES ($1,$2,$3,$4,'t','d','running',$5,now(),$6,$7,$8,$9,$10,'old failure','agent_failure')`,
+					runID, o.userID, o.repoID, kind, o.workerID, g, "agent/m2-"+runID.String(), 77+identity, targetID, 123+identity)
 				reportWorker := wkr
 				switch guard {
 				case "wrong_worker":
@@ -1043,11 +1051,11 @@ func TestSetStateBranchMovedSupersedeUnderFenceLiveDB(t *testing.T) {
 				case "stale_generation":
 					g--
 				case "released":
-					env.exec(`UPDATE runs SET claim_released_at=now() WHERE id=$1`, runID)
+					exec(`UPDATE runs SET claim_released_at=now() WHERE id=$1`, runID)
 				case "terminal":
-					env.exec(`UPDATE runs SET status='completed' WHERE id=$1`, runID)
+					exec(`UPDATE runs SET status='completed' WHERE id=$1`, runID)
 				case "budget_exhausted", "completion_blocked":
-					env.exec(`UPDATE runs SET status='paused',hold_reason=$2 WHERE id=$1`, runID, guard)
+					exec(`UPDATE runs SET status='paused',hold_reason=$2 WHERE id=$1`, runID, guard)
 				}
 				before := mustRun(t, env, runID)
 				// Each fixture makes one report with a five-second deadline; siblings run independently.
