@@ -94,6 +94,12 @@ type Vault struct {
 
 	mu    sync.RWMutex
 	cache map[uuid.UUID][]byte // userID → plaintext DEK; presence == unlocked
+
+	// notice orders one user's unlock-time lock-notice clear against that user's
+	// Lock (userID → *sync.Mutex). Per user, and never held with mu across I/O, so a
+	// slow clear cannot stall another user's Lock, Seal or Open. Entries are never
+	// deleted: a deleted entry could hand two callers different mutexes for one user.
+	notice sync.Map
 }
 
 // New constructs a Vault over the process master box and the store.
@@ -154,17 +160,24 @@ func (v *Vault) unlock(ctx context.Context, userID uuid.UUID, password string, a
 	return nil
 }
 
-// clearLockNotice re-arms notices only while the key remains cached. Hold the
-// cache read lock through the update: a manual Lock either evicts the key first
-// and suppresses this clear, or follows it and preserves its later pre-ack.
-// Rewrap stays outside this lock so a lock can interrupt a slow migration.
+// clearLockNotice re-arms notices only while the key remains cached. It holds the
+// user's notice mutex, never mu, across the update: a manual Lock either evicts the
+// key before the cache check, so the clear is skipped, or waits in its notice
+// barrier until the clear has finished, so the caller's later pre-ack is preserved.
+// Rewrap stays outside so a lock can interrupt a slow migration.
 func (v *Vault) clearLockNotice(ctx context.Context, userID uuid.UUID) error {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	if _, ok := v.cache[userID]; !ok {
+	m := v.noticeMutex(userID)
+	m.Lock()
+	defer m.Unlock()
+	if !v.Unlocked(userID) {
 		return nil
 	}
 	return v.q.ClearVaultLockNotice(ctx, userID)
+}
+
+func (v *Vault) noticeMutex(userID uuid.UUID) *sync.Mutex {
+	m, _ := v.notice.LoadOrStore(userID, &sync.Mutex{})
+	return m.(*sync.Mutex)
 }
 
 // cacheFromRow derives the KEK from the password + the row's salt, unwraps the
@@ -272,7 +285,18 @@ func (v *Vault) rewrapMasterSecrets(ctx context.Context, userID uuid.UUID) {
 // Lock evicts and best-effort zeroizes the user's cached DEK. Go gives no
 // guarantee the bytes were not already copied elsewhere by the runtime, so this
 // reduces — does not eliminate — DEK-in-RAM exposure. No-op if already locked.
+//
+// Eviction never waits on I/O. After releasing mu, Lock waits for any in-flight
+// notice clear of this user that saw the key before eviction, so a pre-ack the
+// caller writes after Lock returns cannot be erased by that clear.
 func (v *Vault) Lock(userID uuid.UUID) {
+	v.evict(userID)
+	m := v.noticeMutex(userID)
+	m.Lock()
+	m.Unlock() //nolint:staticcheck // SA2001: an ordering barrier, not a critical section
+}
+
+func (v *Vault) evict(userID uuid.UUID) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if dek, ok := v.cache[userID]; ok {
