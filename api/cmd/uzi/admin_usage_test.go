@@ -114,11 +114,9 @@ func TestRenderAdminUsageZeroFinished(t *testing.T) {
 	}
 }
 
-// TestRenderAdminUsageNeedsLanding covers the issue #1418 CLI parity: the needs-landing sub-cut
-// of the `failed` bucket rides inline beside the failed figure — "failed=N (K need landing)" on
-// the factory line and the same parenthetical in the per-user FAILED cell — shown only when the
-// sub-cut is positive, and never as a new column (the needs-landing split does not add a column).
-func TestRenderAdminUsageNeedsLanding(t *testing.T) {
+// TestRenderAdminUsageRecoverable covers issue #1418: the recoverable subset is
+// descriptive, shown beside both factory and per-user failures only when positive.
+func TestRenderAdminUsageRecoverable(t *testing.T) {
 	u := apitypes.AdminUsageDTO{
 		Factory: apitypes.SelfUsageDTO{
 			Lifetime: apitypes.UsageDTO{InputTokens: 1000, OutputTokens: 300, CostUSD: 12.34},
@@ -147,21 +145,21 @@ func TestRenderAdminUsageNeedsLanding(t *testing.T) {
 	out := renderUsageToString(t, u)
 
 	// Factory line: the failed figure carries the inline sub-cut.
-	if !strings.Contains(out, "failed=106 (7 need landing)") {
-		t.Errorf("factory line missing inline needs-landing sub-cut \"failed=106 (7 need landing)\":\n%s", out)
+	if !strings.Contains(out, "failed=106 (7 recoverable)") {
+		t.Errorf("factory line missing inline recoverable subset \"failed=106 (7 recoverable)\":\n%s", out)
 	}
-	// The needs-landing split rides the FAILED cell; recency has its own SINCE column.
+	// The recoverable subset rides the FAILED cell; recency has its own SINCE column.
 	header := firstHeaderLine(t, out)
 	wantOrder := []string{"EMAIL", "RUNS", "FAILED", "FAIL%", "SINCE", "INPUT", "OUTPUT", "COST"}
 	if got := strings.Fields(header); !equalStringSlices(got, wantOrder) {
 		t.Errorf("table header = %v, want %v\nheader line: %q", got, wantOrder, header)
 	}
-	// alice's FAILED cell carries the sub-cut; bob's (zero landing) stays a bare count.
-	if alice := lineWith(t, out, "alice@example.com"); !strings.Contains(alice, "40 (3 need landing)") {
-		t.Errorf("alice FAILED cell missing \"40 (3 need landing)\": %q", alice)
+	// alice's FAILED cell carries the sub-cut; bob's (zero recoverable) stays a bare count.
+	if alice := lineWith(t, out, "alice@example.com"); !strings.Contains(alice, "40 (3 recoverable)") {
+		t.Errorf("alice FAILED cell missing \"40 (3 recoverable)\": %q", alice)
 	}
-	if bob := lineWith(t, out, "bob@example.com"); strings.Contains(bob, "need landing") {
-		t.Errorf("bob has zero needs-landing and must show a bare FAILED count, got: %q", bob)
+	if bob := lineWith(t, out, "bob@example.com"); strings.Contains(bob, "recoverable") {
+		t.Errorf("bob has zero recoverable work and must show a bare FAILED count, got: %q", bob)
 	}
 }
 

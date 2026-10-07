@@ -21,7 +21,7 @@ import { useNow } from "../lib/useNow";
 import { MrChip } from "../components/MrChip";
 import { RunIssueRef } from "../components/RunIssueRef";
 import { mrAbbrev } from "../lib/forgeNoun";
-import { YourUsageCard, FactoryTotalCard, PerUserUsageTable } from "../components/UsageCards";
+import { UsageCard, type UsageWindow } from "../components/UsageCards";
 import { RunHealthBadge } from "../components/RunHealthBadge";
 import { WorkerStatLine, hasStats } from "../components/WorkerStats";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
@@ -95,10 +95,31 @@ function Step({
   );
 }
 
+// PRD #40: a browser preference only, never authoritative for usage or access.
+const USAGE_WINDOW_KEY = "uzi.usageWindow";
+
+function readUsageWindow(): UsageWindow {
+  try {
+    const stored = window.localStorage.getItem(USAGE_WINDOW_KEY);
+    return stored === "lifetime" ? "lifetime" : "last_7_days";
+  } catch {
+    return "last_7_days";
+  }
+}
+
 export function Dashboard() {
   const demo = useDemoMode();
   const { user } = useAuth();
   const [data, setData] = useState<Overview | null>(null);
+  const [usageWindow, setUsageWindow] = useState<UsageWindow>(readUsageWindow);
+  const changeUsageWindow = useCallback((value: UsageWindow) => {
+    setUsageWindow(value);
+    try {
+      window.localStorage.setItem(USAGE_WINDOW_KEY, value);
+    } catch {
+      // Storage restrictions must not prevent the current view from switching.
+    }
+  }, []);
 
   // First load fetches everything — volatile tiles plus the rarely-changing
   // fields the onboarding checklist reads. An error here keeps `data` null so the
@@ -380,19 +401,10 @@ export function Dashboard() {
         </Card>
       )}
 
-      {/* PRD #40 §3–4: "Your usage" for everyone; the factory total + per-user
-          breakdown only when an admin view was fetched (data.adminUsage non-null).
-          A non-admin never receives factory data, so it can never render. */}
-      {data?.selfUsage &&
-        (data.adminUsage ? (
-          <div className="grid gap-4 md:grid-cols-2 md:gap-y-0">
-            <YourUsageCard usage={data.selfUsage} />
-            <FactoryTotalCard admin={data.adminUsage} />
-          </div>
-        ) : (
-          <YourUsageCard usage={data.selfUsage} />
-        ))}
-      {data?.adminUsage && <PerUserUsageTable admin={data.adminUsage} />}
+      {/* Factory usage is rendered only from the admin-gated response. */}
+      {data?.selfUsage && (
+        <UsageCard self={data.selfUsage} admin={data.adminUsage ?? undefined} window={usageWindow} onWindowChange={changeUsageWindow} />
+      )}
 
       <Card>
         <div className="flex items-center justify-between">

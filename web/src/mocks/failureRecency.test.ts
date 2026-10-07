@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 import { afterEach, expect, it } from "vitest";
-import { createElement, Fragment } from "react";
+import { createElement } from "react";
 import { cleanup, render, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { YourUsageCard, FactoryTotalCard, PerUserUsageTable } from "../components/UsageCards";
+import { UsageCard } from "../components/UsageCards";
 import { mockApi } from "./mockApi";
 
 afterEach(cleanup);
@@ -41,18 +41,14 @@ it("demo shows matching failure recency, a valid drill-in, and a never-failed us
   }
 });
 
-it("demo renders subscription cost exclusions on the self card and factory total row", async () => {
+it("demo renders selected-window cost exclusions and all-time per-user totals", async () => {
   const [self, admin] = await Promise.all([mockApi.getUsage(), mockApi.getAdminUsage()]);
-  const { getByText } = render(createElement(MemoryRouter, null,
-    createElement(Fragment, null,
-      createElement(YourUsageCard, { usage: self }),
-      createElement(FactoryTotalCard, { admin }),
-      createElement(PerUserUsageTable, { admin }),
-    ),
+  const { getByRole, getByText } = render(createElement(MemoryRouter, null,
+    createElement(UsageCard, { self, admin, window: "last_7_days", onWindowChange: () => {} }),
   ));
-  const selfCard = getByText("Your usage").parentElement!;
-  expect(within(selfCard).getByText("Cost excludes 8 Codex subscription runs")).toBeTruthy();
-  expect(within(selfCard).getByText(/Cost excludes 2 Codex subscription runs/)).toBeTruthy();
+  const personal = within(getByRole("region", { name: "Your usage" }));
+  expect(personal.getByText("excl. 2 subscription runs").getAttribute("title")).toBe("Cost excludes 2 Codex subscription runs");
+  expect(getByText("Per-user figures are all time.")).toBeTruthy();
   const totalRow = getByText("uzi total").closest("tr")!;
   expect(within(totalRow).getByText("Cost excludes 20 Codex subscription runs")).toBeTruthy();
 });

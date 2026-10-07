@@ -31,6 +31,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **One Usage card with a remembered reporting window.**
+  Compare personal and factory cost, tokens and outcomes for the last seven days or all time, with truthful cost exclusions and recoverable-work wording; the embedded admin per-user breakdown stays all time.
+
 - **Routine dependency bump: `gitlab.com/gitlab-org/api/client-go/v3` to v3.15.0 ([#2315](https://github.com/vtmocanu/uzi/pull/2315)).**
   No uzi code change required.
 

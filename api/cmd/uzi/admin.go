@@ -814,16 +814,11 @@ func failRate(failed, finished int64) string {
 	return fmt.Sprintf("%.1f%%", float64(failed)/float64(finished)*100)
 }
 
-// failedFigure renders the failed count with the needs-landing sub-cut appended when any of
-// those failed runs is human-landable (issue #1418): "106" normally, "106 (3 need landing)"
-// when needs_landing > 0. This is the CLI twin of the dashboard splitting the `failed` bar into
-// "failed" and "failed, needs landing". needs_landing is a SUBSET of failed (needs_landing <=
-// failed), never a new denominator member, so it rides beside the figure rather than as a
-// separate column; the clause is emit-only-when-positive, keeping the common no-landing case
-// terse and every existing zero-landing row byte-for-byte unchanged.
+// failedFigure adds the issue #1418 recoverable subset when positive. Recoverable
+// work may already have been landed; this is not an outstanding-work count.
 func failedFigure(failed, needsLanding int64) string {
 	if needsLanding > 0 {
-		return fmt.Sprintf("%d (%d need landing)", failed, needsLanding)
+		return fmt.Sprintf("%d (%d recoverable)", failed, needsLanding)
 	}
 	return fmt.Sprintf("%d", failed)
 }
@@ -836,9 +831,7 @@ func renderAdminUsage(p *uzicli.Printer, u apitypes.AdminUsageDTO) error {
 	now := time.Now()
 	lt := u.Factory.Lifetime
 	lo := u.Factory.Outcomes.Lifetime
-	// failed carries the needs-landing sub-cut inline (issue #1418): "failed=106" normally,
-	// "failed=106 (3 need landing)" when some failed runs are human-landable — the CLI half of
-	// the dashboard's failed-bar split, terse and appended only when needs_landing > 0.
+	// Match the dashboard's recoverable-work note without claiming a landing backlog.
 	p.Printf("factory (lifetime): input=%d cache_read=%d cache_creation=%d output=%d cost=$%.2f (runs=%d) finished=%d failed=%s fail_rate=%s since_last_failure=%s\n",
 		lt.InputTokens, lt.CacheReadTokens, lt.CacheCreationTokens, lt.OutputTokens, lt.CostUSD, u.Factory.RunCount,
 		lo.Finished, failedFigure(lo.Failed, lo.NeedsLanding), failRate(lo.Failed, lo.Finished), sinceLastFailure(lo, now))

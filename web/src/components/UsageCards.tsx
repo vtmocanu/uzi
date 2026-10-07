@@ -6,14 +6,13 @@ import { stripUnsafeChars } from "../lib/safeText";
 import type { SelfUsage, AdminUsage, RunUsage, RunOutcomes } from "../lib/api";
 import { formatTokens, formatCost } from "../lib/formatTokens";
 import { failOriginLabel } from "../lib/failOriginLabel";
-import { aggregateDisclosure, type AggregateDisclosure } from "../lib/costStatus";
+import { aggregateDisclosure } from "../lib/costStatus";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail } from "../lib/demoMask";
-import { Card, SectionTitle } from "./ui";
+import { Card, SectionTitle, cx } from "./ui";
 
-// PRD #40 §3–4: the dashboard usage cards. "Your usage" is for everyone; the
-// factory total + per-user breakdown are admin-only (the page only fetches
-// /api/admin/usage for an admin, so a non-admin never receives the data).
+// PRD #40: one usage summary, with personal figures for everyone and factory
+// figures plus the lifetime per-user section only from the admin-gated response.
 
 // A RunUsage bundle split the way the run view splits it: fresh = fresh input +
 // cache creation, cached = cache reads, out = output; total = all three.
@@ -53,7 +52,7 @@ function tokenShares(totals: number[], factoryTotal: number): number[] {
 // PRD #1429 M4b (D7) superseded PRD #40 Decision 8's "$0 renders '—'" heuristic: an
 // aggregate's cost_usd is the METERED SUBSET's real dollar sum (a subscription or
 // unreported run contributes $0 to that stored numeric by construction), so it is
-// shown here as a genuine figure via formatCost — never hidden behind "—" — and any
+// shown here as a genuine dollar figure, never hidden behind a dash, and any
 // non-metered runs folded into the window are disclosed by count instead, via
 // `aggregateDisclosure` below. Showing the dollar figure ALONE, with no signal that
 // it excludes some runs, would be the aggregate shape of the same false-zero bug.
@@ -73,113 +72,70 @@ function formatSince(iso: string | null): string {
   return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 }
 
-function BigNum({ tokens }: { tokens: number }) {
-  return (
-    <div className="mt-1 font-mono text-[26px] font-semibold tabular-nums tracking-tight">
-      {formatTokens(tokens)} <em className="text-sm not-italic text-faint">tokens</em>
-    </div>
-  );
+export type UsageWindow = "lifetime" | "last_7_days";
+
+// Group dollars only in the summary cards; other usage surfaces keep their formatter.
+function summaryCost(usd: number): string {
+  const value = Number.isFinite(usd) && usd >= 0 ? usd : 0;
+  return "$" + new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: value >= 1000 ? 0 : 2,
+    maximumFractionDigits: value >= 1000 ? 0 : 2,
+  }).format(value);
 }
 
-// `disclosure` names the subscription/unreported runs folded into this window whose
-// dollar contribution is NOT in `usage.cost_usd` (PRD #1429 D7) — optional so a
-// per-user table row (which renders its own compact disclosure, see PerUserUsageTable)
-// can reuse `breakdown`'s cost figure without duplicating this line.
-function Subrow({ usage, disclosure }: { usage: RunUsage; disclosure?: AggregateDisclosure }) {
-  const b = breakdown(usage);
-  return (
-    <div className="mt-2">
-      <div className="flex flex-wrap gap-x-3.5 gap-y-1.5 text-xs text-muted">
-        <span>in <span className="tabular-nums text-fg">{formatTokens(b.fresh)}</span></span>
-        <span>cached <span className="tabular-nums text-fg">{formatTokens(b.cached)}</span></span>
-        <span>out <span className="tabular-nums text-fg">{formatTokens(b.out)}</span></span>
-        <span>cost <span className="tabular-nums text-brand">{formatCost(b.cost)}</span></span>
-      </div>
-      {/* Byte-identical to nothing when the window is fully metered (disclosure.text
-          is "" then) — no disclosure noise on the common case. */}
-      {disclosure?.incomplete && <p className="mt-1 text-[11px] text-faint">{disclosure.text}</p>}
-    </div>
-  );
+// Compact copy is derived from counts, independent of the full disclosure's wording.
+function shortCostDisclosure(subscriptionCount: number, unreportedCount: number): string {
+  const parts: string[] = [];
+  if (subscriptionCount > 0) parts.push(`${subscriptionCount} subscription run${subscriptionCount === 1 ? "" : "s"}`);
+  if (unreportedCount > 0) parts.push(`${unreportedCount} unreported run${unreportedCount === 1 ? "" : "s"}`);
+  return parts.length > 0 ? `excl. ${parts.join(" and ")}` : "";
 }
 
-// FailedRunsBlock is the PRD #1293 failed-run block folded under the token figures of a
-// usage card (mock variant A): the rate, the counts sentence with the 7-day window, the
-// stacked outcome bar (completed → cancelled → plan rejected → failed → failed, needs
-// landing) with a legend and an aria-label, and the top fail_origin causes. The last two
-// segments split the single `failed` bucket (issue #1418) but sum to the same width.
-// `lifetime` drives everything except the
-// "last 7d" clause, which reads `last7`. Hidden entirely when the scope has no
-// finished runs (mirrors the run_count === 0 precedent — never a fabricated 0%). The block
-// counts a different population from the card's run_count (D2), so they are never combined
-// into one fraction.
-function FailedRunsBlock({ lifetime, last7 }: { lifetime: RunOutcomes; last7: RunOutcomes }) {
-  if (lifetime.finished === 0) return null;
-  // Fixed order; colours are theme tokens only (no literal hex) so the bar reads in both
-  // Dawn and Ember. plan rejected is a 45° hatch so it stays distinct without colour.
-  const OK = "rgb(var(--ok))";
-  const CANCEL = "rgb(var(--edge-strong))";
-  const REJECT = "repeating-linear-gradient(135deg, rgb(var(--edge-strong)) 0 2px, rgb(var(--surface)) 2px 4px)";
-  const FAIL = "rgb(var(--danger))";
-  // issue #1418: "failed, needs landing" is a SUB-CUT of failed — same danger colour, but a
-  // 45° hatch (the plan-rejected hatch idiom keyed on --danger) so it reads as "failed, but
-  // its committed work is landable/recoverable" while staying visually part of the failed bar.
-  const NEEDS_LANDING = "repeating-linear-gradient(135deg, rgb(var(--danger)) 0 2px, rgb(var(--surface)) 2px 4px)";
-  // Split the single `failed` bucket into two ADJACENT segments driven by the same
-  // `/ lifetime.finished` denominator, so their combined width equals the old `failed` width.
-  // Math.max(0, …) is defensive: the server guarantees needs_landing <= failed. The
-  // needs-landing segment is added (next to failed) only when there IS something to land, so a
-  // scope with no landable failures reads exactly as before — no "0" clutter in the bar/legend.
+// PRD #1293: outcomes use the selected window and failed / finished denominator.
+// Issue #1418: remove the needs_landing hatch because an aggregate cannot know
+// whether recoverable work was landed later. It is a descriptive note, not backlog.
+function FailedRunsBlock({ outcomes, personal }: { outcomes: RunOutcomes; personal: boolean }) {
+  if (outcomes.finished === 0) return <p className="text-sm text-muted">No finished runs in this period.</p>;
   const segments = [
-    { label: "completed", count: lifetime.completed, background: OK },
-    { label: "cancelled", count: lifetime.cancelled, background: CANCEL },
-    { label: "plan rejected", count: lifetime.plan_rejected, background: REJECT },
-    { label: "failed", count: Math.max(0, lifetime.failed - lifetime.needs_landing), background: FAIL },
-    ...(lifetime.needs_landing > 0
-      ? [{ label: "failed, needs landing", count: lifetime.needs_landing, background: NEEDS_LANDING }]
-      : []),
-  ];
-  // #1418: keep both bar segments, but group their FULL failed total in the
-  // legend and accessible sentence, matching the headline and CLI figure.
-  const legend = [...segments.slice(0, 3), { label: "failed", count: lifetime.failed, background: FAIL }];
-  const landingHint = lifetime.needs_landing > 0 ? ` (${lifetime.needs_landing} need landing)` : "";
-  const barLabel = "Finished runs: " + legend.map((item) => `${item.count} ${item.label}${item.label === "failed" ? landingHint : ""}`).join(", ");
+    { label: "completed", count: outcomes.completed, background: "rgb(var(--ok))" },
+    { label: "cancelled", count: outcomes.cancelled, background: "rgb(var(--edge-strong))" },
+    { label: "plan rejected", count: outcomes.plan_rejected, background: "repeating-linear-gradient(135deg, rgb(var(--edge-strong)) 0 2px, rgb(var(--surface)) 2px 4px)" },
+    { label: "failed", count: outcomes.failed, background: "rgb(var(--danger))" },
+  ].filter((s) => s.count > 0);
   return (
-    <div className="mt-3.5 border-t border-edge pt-3.5">
-      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-        <h3 className="font-mono text-[26px] font-semibold tabular-nums tracking-tight text-fg">
-          <span>{failRate(lifetime)}</span>{" "}
-          <span className="text-sm font-normal text-muted">failed runs</span>
-        </h3>
-        <span className="text-xs text-muted">
-          <span className="tabular-nums text-fg">{lifetime.failed}</span> of{" "}
-          <span className="tabular-nums text-fg">{lifetime.finished}</span> finished runs ·{" "}
-          <span className="tabular-nums text-fg">{failRate(last7)}</span> ({last7.failed} of {last7.finished}) last 7d
-        </span>
+    <div className="border-t border-edge pt-3 space-y-2.5">
+      <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 text-xs">
+        <p className="text-muted"><span className="tabular-nums text-fg">{outcomes.failed.toLocaleString("en-US")}</span> failed of <span className="tabular-nums text-fg">{outcomes.finished.toLocaleString("en-US")}</span> finished runs</p>
+        {personal && <Link className="text-brand hover:underline" to="/runs/history?status=failed">Your failed runs →</Link>}
       </div>
-      <div className="mt-2.5 flex h-2 gap-0.5 overflow-hidden rounded" role="img" aria-label={barLabel}>
+      <div className="flex h-2 gap-0.5 overflow-hidden rounded" role="img" aria-label={"Finished runs: " + segments.map((s) => `${s.count} ${s.label}`).join(", ")}>
         {segments.map((s) => (
-          <span
-            key={s.label}
-            className="block h-full"
-            style={{ width: `${(s.count / lifetime.finished) * 100}%`, background: s.background }}
-          />
+          <span key={s.label} className="block h-full" style={{ width: `${s.count / outcomes.finished * 100}%`, background: s.background }} />
         ))}
       </div>
-      <ul className="mt-2 flex flex-wrap gap-x-3.5 gap-y-1 text-[11.5px] text-muted">
-        {legend.map((s) => (
+      <ul className="flex flex-wrap gap-x-3.5 gap-y-1 text-[11px] text-muted">
+        {segments.map((s) => (
           <li key={s.label} className="inline-flex items-center gap-1.5">
-            <span className="inline-flex gap-0.5">
-              <span aria-hidden="true" className="inline-block h-[9px] w-[9px] rounded-[2px]" style={{ background: s.background }} />
-              {s.label === "failed" && lifetime.needs_landing > 0 && (
-                <span aria-hidden="true" className="inline-block h-[9px] w-[9px] rounded-[2px]" style={{ background: NEEDS_LANDING }} />
-              )}
-            </span>
-            {s.label} <span className="tabular-nums text-fg">{s.count}</span>
-            {s.label === "failed" && landingHint}
+            <span aria-hidden="true" className="h-2 w-2 rounded-sm" style={{ background: s.background }} />
+            {s.label} <span className="tabular-nums text-fg">{s.count.toLocaleString("en-US")}</span>
           </li>
         ))}
       </ul>
     </div>
+  );
+}
+
+function TopCauses({ outcomes, personal }: { outcomes: RunOutcomes; personal: boolean }) {
+  const causes = Object.entries(outcomes.fail_origins)
+    .filter(([, count]) => count > 0)
+    .sort(([a, ac], [b, bc]) => bc - ac || a.localeCompare(b));
+  const hiddenCauses = Math.max(0, causes.length - 3);
+  if (outcomes.failed === 0 || causes.length === 0) return null;
+  return (
+    <p className="text-xs text-muted">
+      Top causes: {causes.slice(0, 3).map(([origin, count]) => `${stripUnsafeChars(failOriginLabel(origin))} ${count.toLocaleString("en-US")}`).join(" · ")}
+      {hiddenCauses > 0 && <>{" "}{personal ? <Link className="whitespace-nowrap text-brand hover:underline" to="/runs/history?status=failed">+{hiddenCauses} more</Link> : <span className="whitespace-nowrap">+{hiddenCauses} more</span>}</>}
+    </p>
   );
 }
 
@@ -190,105 +146,133 @@ function SinceLastFailedRun({ outcomes, owner }: { outcomes: RunOutcomes; owner?
   const originLabel = stripUnsafeChars(failOriginLabel(outcomes.last_failed_origin ?? "unknown"));
   const ownerLabel = owner ? stripUnsafeChars(owner) : undefined;
   return (
-    <div className="mt-3 min-w-0 border-t border-edge pt-3">
-      {hasFailure || value === "Unavailable" ? (
-        <h3 className="font-mono text-[26px] font-semibold tabular-nums tracking-tight text-fg">
-          <span>{value}</span>{" "}
-          <span className="text-sm font-normal text-muted">since last failed run</span>
-        </h3>
-      ) : (
-        <>
-          <h3 className={outcomes.finished === 0 ? "text-lg font-medium text-muted" : "text-lg font-medium text-ok"}>
-            {outcomes.finished === 0 ? "No finished runs yet" : "No recorded failures"}
-          </h3>
-          {outcomes.finished > 0 && (
-            <p className="mt-1 text-xs text-muted">{outcomes.completed} completed runs, none failed</p>
-          )}
-        </>
-      )}
-      {hasFailure && (
-        <p className="mt-1 flex min-w-0 flex-nowrap items-baseline gap-x-1 whitespace-nowrap text-xs text-muted">
+    <div className="min-w-0 border-t border-edge pt-3 text-xs text-muted">
+      {hasFailure ? (
+        <p className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
+          <span className="shrink-0 text-fg">Latest failure <span className="font-mono tabular-nums">{value}</span> ago</span>
+          <span className="flex min-w-0 flex-1 basis-[120px] items-baseline gap-x-3">
+            <span className="min-w-0 truncate" title={originLabel}>{originLabel}</span>
+            {/* Owner shrinks to an ellipsis before the cause loses its space. */}
+            {ownerLabel && <span className="min-w-0 max-w-max grow shrink-0 basis-[1em] truncate" title={ownerLabel}>{ownerLabel}</span>}
+          </span>
           <span className="shrink-0">{outcomes.completed_since_last_failure ?? 0} completed since</span>
-          <span className="min-w-0 truncate" title={originLabel}>· last: {originLabel}</span>
-          {/* The owner gets remaining space down to one ellipsis cell; only
-              then does the origin shrink. Figures and the link stay fixed. */}
-          {ownerLabel && <span className="min-w-0 max-w-max grow shrink-0 basis-[1em] truncate" title={ownerLabel}>· {ownerLabel}</span>}
           {outcomes.last_failed_run_id && (
-            <Link className="shrink-0 whitespace-nowrap text-brand hover:underline" to={`/runs/${outcomes.last_failed_run_id}`}>
-              · run {outcomes.last_failed_run_id.slice(0, 8)} →
-            </Link>
+            <Link className="shrink-0 whitespace-nowrap text-brand hover:underline" to={`/runs/${outcomes.last_failed_run_id}`}>run {outcomes.last_failed_run_id.slice(0, 8)} →</Link>
           )}
+        </p>
+      ) : value === "Unavailable" ? (
+        <p>Latest failure: unavailable</p>
+      ) : (
+        <p className={outcomes.finished > 0 ? "text-ok" : "text-muted"}>
+          {outcomes.finished === 0 ? "No finished runs yet" : `No recorded failures · ${outcomes.completed} completed runs, none failed`}
         </p>
       )}
     </div>
   );
 }
 
-export function YourUsageCard({ usage }: { usage: SelfUsage }) {
-  const life = breakdown(usage.lifetime);
-  const last7 = breakdown(usage.last_7_days);
-  const lifeDisclosure = aggregateDisclosure(usage.lifetime_subscription_run_count, usage.lifetime_unreported_run_count);
-  const last7Disclosure = aggregateDisclosure(usage.last7_subscription_run_count, usage.last7_unreported_run_count);
+function UsageColumn({ usage, window, personal, runCountLine, owner, aligned = false }: {
+  usage: SelfUsage;
+  window: UsageWindow;
+  personal: boolean;
+  runCountLine: ReactNode;
+  owner?: string;
+  aligned?: boolean;
+}) {
+  const selected = breakdown(usage[window]);
+  const outcomes = usage.outcomes[window];
+  const lifetime = usage.outcomes.lifetime;
+  const subscriptionCount = window === "lifetime" ? usage.lifetime_subscription_run_count : usage.last7_subscription_run_count;
+  const unreportedCount = window === "lifetime" ? usage.lifetime_unreported_run_count : usage.last7_unreported_run_count;
+  const disclosure = aggregateDisclosure(subscriptionCount, unreportedCount);
+  const shortDisclosure = shortCostDisclosure(subscriptionCount, unreportedCount);
+  const delta = lifetime.finished > 0 && outcomes.finished > 0
+    ? (outcomes.failed / outcomes.finished - lifetime.failed / lifetime.finished) * 100 : null;
+  const deltaText = delta == null ? "" : `${delta < 0 ? "−" : delta > 0 ? "+" : ""}${Math.abs(delta).toFixed(1)} pp vs all-time ${failRate(lifetime)}`;
   return (
-    <Card className="grid min-w-0 grid-cols-1 gap-y-0 md:row-span-3 md:grid-rows-subgrid">
-      <div className="min-w-0">
-        <SectionTitle>Your usage</SectionTitle>
-        {usage.run_count === 0 ? (
-          <p className="mt-2 text-sm text-faint">No usage recorded yet — it appears here once your runs spend tokens.</p>
-        ) : (
-          <>
-            <BigNum tokens={life.total} />
-            <Subrow usage={usage.lifetime} disclosure={lifeDisclosure} />
-            <p className="mt-2.5 text-[11px] text-faint">
-              Across <span className="tabular-nums text-muted">{usage.run_count}</span> run{usage.run_count === 1 ? "" : "s"}, all
-              time · <span className="tabular-nums text-muted">{formatTokens(last7.total)}</span> tok /{" "}
-              <span className="tabular-nums text-muted">{formatCost(last7.cost)}</span> last 7d
-              {last7Disclosure.incomplete && last7Disclosure.text !== lifeDisclosure.text && (
-                <> ({last7Disclosure.text})</>
-              )}
-            </p>
-          </>
-        )}
-      </div>
+    <section aria-label={personal ? "Your usage" : "Factory usage"} className={cx("min-w-0 space-y-3", aligned && "md:row-span-[7] md:grid md:grid-rows-subgrid md:space-y-0", aligned && !personal && "border-t border-edge pt-5 md:border-t-0 md:border-l md:pl-6 md:pt-0")}>
+      <div><h3 className="text-sm font-semibold text-fg">{personal ? "You" : "Factory · all users"}</h3></div>
       <div>
-        <FailedRunsBlock lifetime={usage.outcomes.lifetime} last7={usage.outcomes.last_7_days} />
+        <div className="grid grid-cols-3 gap-x-4">
+          <div className="min-w-0">
+            <h4 className="text-xs text-muted">Metered cost</h4>
+            <p className="mt-1 whitespace-nowrap font-mono text-[22px] font-semibold lg:text-[26px] tabular-nums tracking-tight text-brand">{summaryCost(selected.cost)}</p>
+            {disclosure.incomplete && <p className="mt-1 truncate whitespace-nowrap text-[11px] leading-relaxed text-muted" title={disclosure.text}>{shortDisclosure}</p>}
+          </div>
+          <div className="min-w-0">
+            <h4 className="text-xs text-muted">Failed runs rate</h4>
+            <p className="mt-1 whitespace-nowrap font-mono text-[22px] font-semibold lg:text-[26px] tabular-nums tracking-tight">{failRate(outcomes)}</p>
+            {window === "last_7_days" && delta !== null && <p className="mt-1 text-[11px] leading-relaxed text-muted">{deltaText}</p>}
+          </div>
+          <div className="min-w-0">
+            <h4 className="text-xs text-muted">Tokens</h4>
+            <p className="mt-1 whitespace-nowrap font-mono text-[22px] font-semibold lg:text-[26px] tabular-nums tracking-tight">{formatTokens(selected.total)}</p>
+            <ul className="mt-1 space-y-0.5 text-[11px] text-muted">
+              <li className="whitespace-nowrap">in <span className="font-mono tabular-nums text-fg">{formatTokens(selected.fresh)}</span></li>
+              <li className="whitespace-nowrap">cached <span className="font-mono tabular-nums text-fg">{formatTokens(selected.cached)}</span></li>
+              <li className="whitespace-nowrap">out <span className="font-mono tabular-nums text-fg">{formatTokens(selected.out)}</span></li>
+            </ul>
+          </div>
+        </div>
+        {usage.run_count === 0 && <p className="mt-3 text-xs text-muted">No token usage recorded yet.</p>}
       </div>
-      <SinceLastFailedRun outcomes={usage.outcomes.lifetime} />
-    </Card>
+      <div><FailedRunsBlock outcomes={outcomes} personal={personal} /></div>
+      <div><TopCauses outcomes={outcomes} personal={personal} /></div>
+      <div>{outcomes.needs_landing > 0 && <p className="text-[11px] text-muted">{outcomes.needs_landing.toLocaleString("en-US")} failed runs with recoverable work. May include work already landed.</p>}</div>
+      <div>{window === "lifetime" && <p className="text-[11px] text-muted">{runCountLine}</p>}</div>
+      <div><SinceLastFailedRun outcomes={lifetime} owner={owner} /></div>
+    </section>
   );
 }
 
-export function FactoryTotalCard({ admin }: { admin: AdminUsage }) {
-  const demo = useDemoMode();
-  const failureOwner = admin.users.find((u) => u.user_id === admin.factory.outcomes.lifetime.last_failed_user_id);
-  const owner = failureOwner ? maskEmail(failureOwner.email, demo) : undefined;
-  const f = breakdown(admin.factory.lifetime);
-  const disclosure = aggregateDisclosure(
-    admin.factory.lifetime_subscription_run_count,
-    admin.factory.lifetime_unreported_run_count,
-  );
+function WindowToggle({ value, onChange }: { value: UsageWindow; onChange: (window: UsageWindow) => void }) {
   return (
-    <Card className="grid min-w-0 grid-cols-1 gap-y-0 md:row-span-3 md:grid-rows-subgrid">
-      <div className="min-w-0">
-        <SectionTitle>Factory total · all users · admin</SectionTitle>
-        {admin.factory.run_count === 0 ? (
-          <p className="mt-2 text-sm text-faint">No usage across the factory yet.</p>
-        ) : (
-          <>
-            <BigNum tokens={f.total} />
-            <Subrow usage={admin.factory.lifetime} disclosure={disclosure} />
-            <p className="mt-2.5 text-[11px] text-faint">
-              <span className="tabular-nums text-muted">{admin.factory.run_count}</span> runs by{" "}
-              <span className="tabular-nums text-muted">{admin.users.length}</span> user{admin.users.length === 1 ? "" : "s"}
-              {formatSince(admin.earliest_run) && <> since {formatSince(admin.earliest_run)}</>}
-            </p>
-          </>
-        )}
+    <div role="group" aria-label="Usage reporting period" className="ml-auto inline-flex shrink-0 rounded-full border border-edge bg-raised p-0.5">
+      {(["lifetime", "last_7_days"] as const).map((window) => (
+        <button
+          key={window}
+          type="button"
+          aria-pressed={value === window}
+          onClick={() => onChange(window)}
+          className={cx(
+            "min-h-11 rounded-full border px-2.5 text-xs focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring sm:min-h-8",
+            value === window ? "border-edge-strong bg-surface font-semibold text-fg shadow-sm" : "border-transparent font-normal text-muted hover:text-fg",
+          )}
+        >
+          {window === "lifetime" ? "All time" : "Last 7 days"}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+export function UsageCard({ self, admin, window, onWindowChange }: {
+  self: SelfUsage;
+  admin?: AdminUsage;
+  window: UsageWindow;
+  onWindowChange: (window: UsageWindow) => void;
+}) {
+  const demo = useDemoMode();
+  const failureOwner = admin?.users.find((u) => u.user_id === admin.factory.outcomes.lifetime.last_failed_user_id);
+  const owner = failureOwner ? maskEmail(failureOwner.email, demo) : undefined;
+  const since = admin ? formatSince(admin.earliest_run) : "";
+  return (
+    <Card className="min-w-0">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <SectionTitle>Usage</SectionTitle>
+        <WindowToggle value={window} onChange={onWindowChange} />
       </div>
-      <div>
-        <FailedRunsBlock lifetime={admin.factory.outcomes.lifetime} last7={admin.factory.outcomes.last_7_days} />
+      <div className={cx("mt-4 grid gap-x-6 gap-y-3", admin && "md:grid-cols-2 md:grid-rows-[repeat(7,auto)]")}>
+        <UsageColumn usage={self} window={window} personal aligned={!!admin} runCountLine={`${self.run_count.toLocaleString("en-US")} ${self.run_count === 1 ? "run" : "runs"} with token usage`} />
+        {admin && <UsageColumn usage={admin.factory} window={window} personal={false} aligned owner={owner} runCountLine={`${admin.factory.run_count.toLocaleString("en-US")} runs with token usage by ${admin.users.length} ${admin.users.length === 1 ? "user" : "users"}${since ? ` since ${since}` : ""}`} />}
       </div>
-      <SinceLastFailedRun outcomes={admin.factory.outcomes.lifetime} owner={owner} />
+      {admin && (
+        <section aria-label="Per-user usage, all time" className="mt-5 border-t border-edge pt-4">
+          <h3 className="text-sm font-semibold text-fg">Per user · all time</h3>
+          {window === "last_7_days" && <p className="mt-1 text-xs text-muted">Per-user figures are all time.</p>}
+          <PerUserUsageTable admin={admin} />
+        </section>
+      )}
     </Card>
   );
 }
@@ -330,7 +314,7 @@ function Td({
   );
 }
 
-export function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
+function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
   const now = useNow(30_000);
   const demo = useDemoMode();
   const factory = breakdown(admin.factory.lifetime);
@@ -343,8 +327,7 @@ export function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
     admin.factory.lifetime_unreported_run_count,
   );
   return (
-    <Card>
-      <SectionTitle>Per-user breakdown · admin</SectionTitle>
+    <>
       {rows.length === 0 ? (
         <p className="mt-2 text-sm text-faint">No usage across the factory yet.</p>
       ) : (
@@ -429,6 +412,6 @@ export function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
           </table>
         </div>
       )}
-    </Card>
+    </>
   );
 }

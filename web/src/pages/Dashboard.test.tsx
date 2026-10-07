@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Dashboard } from "./Dashboard";
 import { api, type ForgeConnection, type Repo, type RunListItem, type SecretMeta, type Worker } from "../lib/api";
@@ -170,6 +170,7 @@ function renderDashboard() {
 }
 
 beforeEach(() => {
+  localStorage.clear();
   vi.mocked(useAuth).mockReturnValue({
     user,
     loading: false,
@@ -237,6 +238,7 @@ function emptySelf() {
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.clearAllMocks();
 });
 
@@ -465,53 +467,50 @@ describe("Dashboard usage cards (PRD #40)", () => {
     });
   };
 
-  it("shows the Your usage card for any user (lifetime total + last-7-days kicker)", async () => {
-    mockApi.getUsage.mockResolvedValue(selfWithUsage);
-    const { container } = renderDashboard();
-    await settle();
-    expect(screen.getByText("Your usage")).toBeTruthy();
-    // lifetime total = 1.61M + 16.1M + 0.71M = 18.42M tokens.
-    expect(container.textContent).toContain("18.42M");
-    const tokenSummary = screen.getByText(/Across/);
-    expect(tokenSummary).toBeTruthy();
-    expect(screen.getByText(/last 7d/)).toBeTruthy();
-    // Scoped negative: the token-summary node carries the trimmed "last 7d" and no longer
-    // the retired "in the last 7 days" wording.
-    expect(tokenSummary.textContent).toContain("last 7d");
-    expect(tokenSummary.textContent).not.toContain("in the last 7 days");
-  });
-
-  it("renders the empty 'nothing yet' state when the user has no usage", async () => {
-    // Default getUsage mock returns run_count 0.
-    renderDashboard();
-    await settle();
-    expect(screen.getByText("Your usage")).toBeTruthy();
-    expect(screen.getByText(/No usage recorded yet/)).toBeTruthy();
-  });
-
-  it("an admin sees the Factory total card + per-user breakdown", async () => {
+  it("defaults to seven days and switches both scopes while the embedded table stays all time", async () => {
     vi.mocked(useAuth).mockReturnValue({ user: { ...user, is_admin: true } } as unknown as ReturnType<typeof useAuth>);
     mockApi.getUsage.mockResolvedValue(selfWithUsage);
-    mockApi.getAdminUsage.mockResolvedValue(adminUsage);
-    renderDashboard();
-    await settle();
-
-    expect(screen.getByText(/Factory total/)).toBeTruthy();
-    expect(screen.getByText(/Per-user breakdown/)).toBeTruthy();
-    expect(screen.getByText("vlad@example.com")).toBeTruthy();
-    expect(screen.getByText("maria@example.com")).toBeTruthy();
-    expect(screen.getByText("uzi total")).toBeTruthy();
+    mockApi.getAdminUsage.mockResolvedValue({ ...adminUsage, factory: { ...adminUsage.factory, last_7_days: bundle(400_000, 800_000, 100_000, 9.25) } });
+    renderDashboard(); await settle();
+    const you = within(screen.getByRole("region", { name: "Your usage" }));
+    const factory = within(screen.getByRole("region", { name: "Factory usage" }));
+    const users = within(screen.getByRole("region", { name: "Per-user usage, all time" }));
+    expect(screen.getByRole("button", { name: "Last 7 days" }).getAttribute("aria-pressed")).toBe("true");
+    expect(you.getByText("$4.55")).toBeTruthy(); expect(factory.getByText("$9.25")).toBeTruthy();
+    expect(screen.getByText("Per-user figures are all time.")).toBeTruthy();
+    const table = users.getByRole("table").textContent;
+    fireEvent.click(screen.getByRole("button", { name: "All time" }));
+    expect(you.getByText("$26.40")).toBeTruthy(); expect(factory.getByText("$88.15")).toBeTruthy();
+    expect(screen.queryByText("Per-user figures are all time.")).toBeNull();
+    expect(users.getByRole("table").textContent).toBe(table);
+    expect(localStorage.getItem("uzi.usageWindow")).toBe("lifetime");
+    cleanup(); renderDashboard(); await settle();
+    expect(screen.getByRole("button", { name: "All time" }).getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Last 7 days" }));
+    expect(localStorage.getItem("uzi.usageWindow")).toBe("last_7_days");
   });
-
-  it("a NON-admin never sees factory data and never calls the admin endpoint", async () => {
-    // Default user has is_admin false.
-    mockApi.getUsage.mockResolvedValue(selfWithUsage);
-    renderDashboard();
-    await settle();
-
-    expect(screen.getByText("Your usage")).toBeTruthy();
-    expect(screen.queryByText(/Factory total/)).toBeNull();
-    expect(screen.queryByText(/Per-user breakdown/)).toBeNull();
+  it("falls back to seven days on invalid storage", async () => {
+    localStorage.setItem("uzi.usageWindow", "unsupported"); renderDashboard(); await settle();
+    expect(screen.getByRole("button", { name: "Last 7 days" }).getAttribute("aria-pressed")).toBe("true");
+  });
+  it("survives blocked storage reads and writes without blocking the toggle", async () => {
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => { throw new Error("storage blocked"); });
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new Error("storage blocked"); });
+    renderDashboard(); await settle();
+    expect(screen.getByRole("button", { name: "Last 7 days" }).getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "All time" }));
+    expect(screen.getByRole("button", { name: "All time" }).getAttribute("aria-pressed")).toBe("true");
+  });
+  it("renders the empty state without fabricated failure rates", async () => {
+    renderDashboard(); await settle();
+    expect(screen.getByText("Usage")).toBeTruthy(); expect(screen.getByText("No token usage recorded yet.")).toBeTruthy();
+    expect(screen.getByText("No finished runs in this period.")).toBeTruthy();
+  });
+  it("a non-admin never sees factory or per-user data and never calls the admin endpoint", async () => {
+    mockApi.getUsage.mockResolvedValue(selfWithUsage); renderDashboard(); await settle();
+    expect(screen.getByRole("region", { name: "Your usage" })).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Factory usage" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Per-user usage, all time" })).toBeNull();
     expect(mockApi.getAdminUsage).not.toHaveBeenCalled();
   });
 });

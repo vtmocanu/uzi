@@ -316,8 +316,8 @@ Tracked as GitLab issue vtmocanu/uzi#40; PRD at `prds/done/40-token-usage-report
 
 - Report token usage and cost per run, per user, and factory-wide. [user]
 - Run view shows the run's usage, broken down per phase and per agent ("coder used 800k"). [user 2026-07-12]
-- Every user sees their own "Your usage" (lifetime + last-7-days); the factory total and per-user breakdown are admin-only. [user]
-- Tokens are the headline figure; cost is a secondary estimate — a $0 cost (subscription-auth runs) renders as "—", not "$0.00". [user]
+- One Usage card has a shared All time / Last 7 days toggle, defaulting to seven days and remembered per viewer in the browser. Personal figures are shown to everyone; factory figures and the embedded per-user breakdown are admin-only. Per-user figures stay all time. [AI-synced 2026-10-07]
+- The dashboard highlights metered cost, failed-run rate and tokens for the selected window. Metered $0 is shown as $0.00; subscription and unreported runs are disclosed separately from cost (#1429 D7). [AI-synced 2026-10-07]
 - Failed and cancelled runs still count their spend. [user]
 - Chat runs are out of scope (not counted). [user]
 - Shipped surfaces validated against the approved mock (+ addendum). [user 2026-07-12]
@@ -944,7 +944,8 @@ Tracked as GitHub issue vtmocanu/uzi#1995; ADR at `adr/1296-durable-run-recovery
 ## Feature #1418 — "Needs landing" bucket for failed runs whose work is human-landable
 
 - A failed run whose committed work is still human-landable surfaces a secondary "needs landing" presentation bucket (`landing_state`), derived server-side from the run's `fail_origin` and whether its work is recoverable (a preserved diff or an available durable-recovery archive). The four human-landable origins are the publish-time failures `finalize_base_align_conflict`, `workflow_scope_missing`, `push_secret_blocked`, and `history_rewritten`. [AI-synced 2026-09-19, #1418]
-- The bucket renders everywhere a run is shown: the web run list and run page, the TUI, `uzi run list` / `uzi run get`, the failed-run-rate dashboard (the failed bar splits into "failed" and "failed, needs landing" at the same total), and the Slack run-finished copy. [AI-synced 2026-09-19, #1418]
+- The per-run bucket renders in the web run list and run page, the TUI, `uzi run list` / `uzi run get`, and Slack run-finished copy. [AI-synced 2026-10-07]
+- The dashboard keeps one failed bar segment and shows a per-window "failed runs with recoverable work" note, qualified because work may already have been landed; CLI usage summaries call the subset "recoverable". [AI-synced 2026-10-07]
 - These runs still count as failures — they extend, not amend, the #1293 failed-run rate (the factory did not publish its output). [AI-synced 2026-09-19, #1418]
 - The judge skips retrospecting the environment-caused subset (`finalize_base_align_conflict`, `workflow_scope_missing`, `push_secret_blocked`); `history_rewritten` stays judge-eligible as an agent defect. [AI-synced 2026-09-19, #1418]
 
