@@ -52,13 +52,14 @@ export type WorkerSizeSpec = {
 export const WORKER_SIZE_SPECS: Record<WorkerSize, WorkerSizeSpec> = {
   s: { cpuLimit: "1", memoryLimit: "4Gi", data: "5Gi" },
   m: { cpuLimit: "2", memoryLimit: "8Gi", data: "10Gi" },
-  l: { cpuLimit: "4", memoryLimit: "12Gi", data: "25Gi" },
+  l: { cpuLimit: "4", memoryLimit: "20Gi", data: "25Gi" },
 };
 
 /**
  * New hosted workers start at L (#2240), matching the ephemeral provisioning default.
  * Its 4-CPU limit gives build and test commands more concurrency headroom. Compared
- * with M, its CPU/memory requests double (1 CPU / 8Gi versus 500m / 4Gi), reserving
+ * with M, its CPU request doubles and its memory request is 3.5x (1 CPU / 14Gi versus
+ * 500m / 4Gi), reserving
  * more node capacity even while idle. S and M remain explicit choices; existing
  * workers keep the size stored at creation. Rationale: ADR-2240.
  */

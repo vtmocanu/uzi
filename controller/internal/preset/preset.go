@@ -48,13 +48,19 @@ import (
 // peak. Measured on the hosted cluster: an `l` worker's writable set peaked at ~7451Mi
 // (≈7.1 GiB) against its old 4Gi request — the captured eviction — with a web-ux median
 // of ~4.5 GiB; a non-web-ux `m` run peaks ~2.7 GiB, above the old 2Gi request. So `l` now
-// requests 8Gi, `m` 4Gi, and `s` 2Gi, each above its size's realistic peak, while every
-// size stays Burstable.
+// requested 8Gi (limit 12Gi), `m` 4Gi, and `s` 2Gi, each above its size's realistic peak,
+// while every size stays Burstable.
+//
+// `l` was later raised to 14Gi request / 20Gi limit (issue #2127): a persistent `l`
+// worker running two concurrent runs was OOMKilled at the 12Gi limit when two
+// whole-program Go analyzers (deadcode and golangci-lint in `task gate:api`, each about
+// 7-7.5 GiB) overlapped. 14Gi covers two such peaks; 20Gi leaves headroom above them.
+// The maintainer accepted the reduced node placement capacity.
 //
 // Owner decision (settled 2026-09-14) keeps all three Burstable. Guaranteed
 // (request==limit) was considered and dropped: it would strand a full memory limit per
-// IDLE worker (~150Mi idle), and a Guaranteed `l` at 12Gi cannot fit beside the system
-// pods on a ~13.58Gi node.
+// IDLE worker (~150Mi idle), and a Guaranteed `l` (12Gi limit at the time, now 20Gi)
+// could not fit beside the system pods on a ~13.58Gi node.
 type Size struct {
 	CPURequest    resource.Quantity
 	CPULimit      resource.Quantity
@@ -134,8 +140,8 @@ var sizes = map[string]Size{
 	"l": {
 		CPURequest:    resource.MustParse("1"),
 		CPULimit:      resource.MustParse("4"),
-		MemoryRequest: resource.MustParse("8Gi"),
-		MemoryLimit:   resource.MustParse("12Gi"),
+		MemoryRequest: resource.MustParse("14Gi"),
+		MemoryLimit:   resource.MustParse("20Gi"),
 		DataSize:      resource.MustParse("25Gi"), // issue #1757: was 20Gi; bare clones + tracking refs outgrew it
 	},
 }

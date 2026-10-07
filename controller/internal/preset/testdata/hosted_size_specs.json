@@ -20,8 +20,8 @@
       "name": "l",
       "cpu_request": "1",
       "cpu_limit": "4",
-      "memory_request": "8Gi",
-      "memory_limit": "12Gi",
+      "memory_request": "14Gi",
+      "memory_limit": "20Gi",
       "data": "25Gi"
     }
   ],

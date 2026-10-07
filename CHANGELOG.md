@@ -47,6 +47,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Hosted worker size `l` now requests 14Gi and is limited to 20Gi of memory ([#2127](https://github.com/vtmocanu/uzi/issues/2127)).**
+  A persistent `l` worker running two concurrent runs was OOMKilled at 12Gi when two whole-program Go analyzers overlapped; the chart's worker LimitRange ceilings and memory quotas rise to match (CPU and disk are unchanged), at the cost of fewer `l` workers per node.
+
 - **Codex subscription runs can wait out a usage window and resume automatically ([#2360](https://github.com/vtmocanu/uzi/issues/2360)).**
   The existing default-on usage-limit preference now covers recognized Codex window failures using structured evidence from the failed turn, with the latest exhausted-window reset or bounded fallback; Settings and per-run controls use shared Usage limits wording. Resume keeps the same Codex account and restores captured work, with approval reused when recovered; Docker workers retain the existing fresh-thread lineage break. Missing or unaccepted evidence and non-window limits fail as typed `rate_limited` without a reset promise; `rateLimitExceeded` and `sessionBudgetExceeded` are unchanged (#2361 tracks the former). Capture and publish can fail, so latest-work durability is conditional; each park can hold an issue lock and a run-bound hosted worker/PVC for up to the default 8 days, while fallback retries can exhaust the wait budget before a weekly reset.
 

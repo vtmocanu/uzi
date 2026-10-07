@@ -760,7 +760,7 @@ workers:
   # quota: an app-level bug must not noisy-neighbour a shared cluster.
   #
   # CPU and memory track the DEFAULT size, now `l` (ADR-2240): 20 workers x 1 CPU
-  # = 20 CPU and 20 x 8Gi = 160Gi requested. Keep these ceilings aligned with
+  # = 20 CPU and 20 x 14Gi = 280Gi requested. Keep these ceilings aligned with
   # deployments x the default request, or admission caps the fleet below deployments
   # (issue #1341). ResourceQuotas are ceilings, not node-capacity reservations.
   # STORAGE tracks `l` too: 20 x (25Gi data + 20Gi nix) = 900Gi of PVC.
@@ -805,7 +805,7 @@ workers:
   quota:
     enabled: true
     requestsCPU: "20"
-    requestsMemory: 160Gi
+    requestsMemory: 280Gi
     requestsStorage: 900Gi
     persistentVolumeClaims: "40"
     # READ BY A CONTROLLER TEST, not merely documented here. This is the restricted
@@ -818,7 +818,7 @@ workers:
   # The backstop, never the source: every hosted worker pod arrives from the
   # controller with explicit requests + limits from its size preset.
   #
-  # `max` MUST stay >= the LARGEST preset's limits (l = 4 CPU / 12Gi) or that preset
+  # `max` MUST stay >= the LARGEST preset's limits (l = 4 CPU / 20Gi) or that preset
   # stops being admissible — which would surface as a worker that provisions and never
   # appears. maxPVCStorage likewise >= l's /data (25Gi) and >= ephemeralWorkerDataSize
   # (a run-bound worker's /data, 20Gi).
@@ -843,7 +843,7 @@ workers:
       memory: 2Gi
     max:
       cpu: "4"
-      memory: 12Gi
+      memory: 20Gi
     maxPVCStorage: 25Gi
   # --- the docker-capable worker tier (PRD #83 M3, PRD #89) ---------------------
   #
@@ -947,7 +947,7 @@ workers:
     #
     # Sized for the 10 workers deployments advertises. CPU and memory track the
     # DEFAULT size, now `l` (ADR-2240), plus all sidecars from render.go/render_dind.go.
-    # Ten rendered pods need 13.1 CPU / about 83Gi, rounded to 14 CPU / 96Gi.
+    # Ten rendered pods need 13.1 CPU / about 143Gi (14640Mi each), rounded to 14 CPU / 144Gi.
     # Keep requests aligned with the rendered fleet, including sidecar overrides,
     # or admission caps it below deployments
     # (issue #1341). ResourceQuotas are ceilings, not capacity reservations.
@@ -957,7 +957,7 @@ workers:
     quota:
       enabled: true
       requestsCPU: "14"
-      requestsMemory: 96Gi
+      requestsMemory: 144Gi
       requestsStorage: 650Gi
       # BOTH CLAUSES OF WHAT THIS COMMENT USED TO SAY WERE FALSE, and issue #224 M-a
       # falsified the first of them a second time over. It read: "emptyDir dind data
@@ -1001,7 +1001,7 @@ workers:
         memory: 2Gi
       max:
         cpu: "4"
-        memory: 12Gi
+        memory: 20Gi
       # FOUR claimants sit at or under this ceiling: `l`'s DataSize (25Gi) exactly,
       # dindDataSize below, nixSize and a run-bound worker's /data
       # (workers.ephemeralWorkerDataSize, issue #1815; 20Gi each). Raising any of them
@@ -1024,7 +1024,7 @@ workers:
     # (dev-cluster sets 500m/2Gi req, 4/6Gi lim). RAISE THE REQUEST alongside the limit:
     # a large limit with a tiny request lets the scheduler place the pod on a node without
     # the memory and OOM it under contention. Limits must stay within limitRange.max above
-    # (per-container ceiling: 4 CPU / 12Gi). Any field left empty falls back to the
+    # (per-container ceiling: 4 CPU / 20Gi). Any field left empty falls back to the
     # controller's built-in default.
     dindResources:
       requests:
@@ -1132,12 +1132,12 @@ workers:
       node: []
     # The lane's own ResourceQuota and LimitRange, the restricted tier's shape. Lane
     # workers are run-bound (one run, then removed). CPU and memory ceilings cover
-    # ten DEFAULT `l` workers from render.go (ADR-2240): 10 x 1 CPU / 8Gi = 10 CPU / 80Gi.
+    # ten DEFAULT `l` workers from render.go (ADR-2240): 10 x 1 CPU / 14Gi = 10 CPU / 140Gi.
     # The quota is a ceiling, not a reservation of node capacity.
     quota:
       enabled: true
       requestsCPU: "10"
-      requestsMemory: 80Gi
+      requestsMemory: 140Gi
       requestsStorage: 400Gi
       persistentVolumeClaims: "20"
       deployments: "10"
@@ -1153,7 +1153,7 @@ workers:
         memory: 2Gi
       max:
         cpu: "4"
-        memory: 12Gi
+        memory: 20Gi
       maxPVCStorage: 25Gi
     # uzi-fetcher: a Deployment in the RELEASE namespace running /fetcher from the api
     # image (no new image). Lane workers dial it at

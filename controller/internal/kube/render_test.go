@@ -297,8 +297,8 @@ func TestRenderedResourcesComeFromThePreset(t *testing.T) {
 	if c.Resources.Requests.Cpu().String() != "1" || c.Resources.Limits.Cpu().String() != "4" {
 		t.Errorf("cpu = %s/%s, want 1/4", c.Resources.Requests.Cpu(), c.Resources.Limits.Cpu())
 	}
-	if c.Resources.Requests.Memory().String() != "8Gi" || c.Resources.Limits.Memory().String() != "12Gi" {
-		t.Errorf("memory = %s/%s, want 8Gi/12Gi", c.Resources.Requests.Memory(), c.Resources.Limits.Memory())
+	if c.Resources.Requests.Memory().String() != "14Gi" || c.Resources.Limits.Memory().String() != "20Gi" {
+		t.Errorf("memory = %s/%s, want 14Gi/20Gi", c.Resources.Requests.Memory(), c.Resources.Limits.Memory())
 	}
 }
 
