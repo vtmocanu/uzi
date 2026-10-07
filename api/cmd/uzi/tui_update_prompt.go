@@ -12,6 +12,7 @@ import (
 	"golang.org/x/mod/semver"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/rctag"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -83,13 +84,13 @@ func (m *tuiModel) maybeShowUpdatePrompt(latest, latestRC *apitypes.LatestReleas
 		}
 		return nil
 	}
-	wantRC := m.updatePrompt.owner == "uzi-cli-rc" || (m.updatePrompt.owner == "" && isRCTag(version))
+	wantRC := m.updatePrompt.owner == "uzi-cli-rc" || (m.updatePrompt.owner == "" && rctag.IsPublishedTag(version))
 	// Validate each channel fact before choosing the newer one. An invalid fact
 	// cannot hide a valid release on the other channel or become an update target.
 	if latest != nil && !isStableTag(latest.Version) {
 		latest = nil
 	}
-	if wantRC && latestRC != nil && isRCTag(latestRC.Version) {
+	if wantRC && latestRC != nil && rctag.IsPublishedTag(latestRC.Version) {
 		if latest == nil {
 			latest = latestRC
 		} else if cmp, ok := uzicli.CompareServerVersion(latest.Version, latestRC.Version); ok && cmp < 0 {
@@ -180,20 +181,6 @@ func detectBrewOwner(brew func(bool, ...string) (string, error), executable func
 		}
 	}
 	return owner
-}
-
-func isRCTag(tag string) bool {
-	base, n, ok := strings.Cut(tag, "-rc.")
-	if !ok || n == "" {
-		return false
-	}
-	for _, c := range n {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return semver.IsValid(tag) && semver.Prerelease(tag) == "-rc."+n &&
-		semver.Build(tag) == "" && semver.Canonical(base) == base
 }
 
 func isStableTag(tag string) bool {

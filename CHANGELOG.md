@@ -58,6 +58,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Release-candidate update checks share strict tag validation ([#1923](https://github.com/vtmocanu/uzi/issues/1923)).**
+  Server release selection and TUI update prompts reject published `-rc.0` tags; the CLI skew warning still accepts valid build metadata on an RC binary stamp when choosing the upgrade formula.
+
 - **Memory warnings and repository validation are more precise ([#296](https://github.com/vtmocanu/uzi/issues/296)).**
   Memory advisories distinguish direct executable-availability claims from test-rig and feature prose, Git fixture initialization ignores inherited Git redirection and configuration variables, and Semgrep reports bounded sanitized diagnostics from a single scan per stage while rejecting timeouts, inconsistent reports and incomplete captures. Strict scanning and canary verification remain required when the scanner runs.
 

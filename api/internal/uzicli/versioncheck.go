@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"golang.org/x/mod/semver"
+
+	"github.com/vtmocanu/uzi/api/internal/rctag"
 )
 
 // normSemver puts a version string into the `vX.Y.Z` shape golang.org/x/mod/semver
@@ -112,28 +114,13 @@ func SkewWarning(cliVersion, serverVersion, owner string) (string, bool) {
 	formula := owner
 	if formula != "uzi-cli" && formula != "uzi-cli-rc" {
 		formula = "uzi-cli"
-		if isRCPrerelease(cli) {
+		if rctag.IsStampedVersion(cli) {
 			formula = "uzi-cli-rc"
 		}
 	}
 	return fmt.Sprintf(
 		"uzi: CLI %s is behind server %s; some fields may be missing. Run: brew upgrade %s",
 		cliVersion, serverVersion, formula), true
-}
-
-// isRCPrerelease accepts the formula's exact -rc.N channel, including a version
-// carrying build metadata. The caller has already validated the full SemVer.
-func isRCPrerelease(v string) bool {
-	n, ok := strings.CutPrefix(semver.Prerelease(v), "-rc.")
-	if !ok || n == "" || n[0] == '0' {
-		return false
-	}
-	for _, digit := range n {
-		if digit < '0' || digit > '9' {
-			return false
-		}
-	}
-	return true
 }
 
 // CompareServerVersion reports how the CLI version compares to the server version

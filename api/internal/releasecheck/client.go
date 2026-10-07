@@ -13,6 +13,7 @@ import (
 	"golang.org/x/mod/semver"
 
 	"github.com/vtmocanu/uzi/api/internal/httptransport"
+	"github.com/vtmocanu/uzi/api/internal/rctag"
 )
 
 // defaultBaseURL is the GitHub REST API base. The fetch endpoint is a compile-time
@@ -94,7 +95,7 @@ func fetchLatestRC(ctx context.Context, client *http.Client, token string) (gith
 	}
 	var best githubRelease
 	for _, rel := range releases {
-		if rel.Draft || !exactRCTag(rel.TagName) {
+		if rel.Draft || !rctag.IsPublishedTag(rel.TagName) {
 			continue
 		}
 		if best.TagName == "" || semver.Compare(rel.TagName, best.TagName) > 0 {
@@ -102,22 +103,6 @@ func fetchLatestRC(ctx context.Context, client *http.Client, token string) (gith
 		}
 	}
 	return best, nil
-}
-
-func exactRCTag(tag string) bool {
-	if !semver.IsValid(tag) || semver.Canonical(tag) != tag {
-		return false
-	}
-	base, n, ok := strings.Cut(tag, "-rc.")
-	if !ok || strings.Contains(base, "-") || strings.Contains(n, ".") || n == "" || (len(n) > 1 && n[0] == '0') {
-		return false
-	}
-	for _, ch := range n {
-		if ch < '0' || ch > '9' {
-			return false
-		}
-	}
-	return true
 }
 
 func fetchJSON(ctx context.Context, client *http.Client, token, path string, dest any, maxBytes int64) error {

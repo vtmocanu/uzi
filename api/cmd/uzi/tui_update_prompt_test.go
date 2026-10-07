@@ -83,6 +83,35 @@ func (b *brewRec) upgradeCall() *brewCall {
 
 // ---- Update → msg (the show gate) --------------------------------------------------------
 
+func TestUpdatePromptRejectsRCZero(t *testing.T) {
+	for _, tc := range []struct {
+		name, stamp, owner, stable, rc, want string
+	}{
+		{"unknown owner zero stamp uses stable", "v0.85.0-rc.0", "", "v0.86.0", "v9.0.0-rc.1", "v0.86.0"},
+		{"higher zero fact ignored", "v0.85.0-rc.1", "uzi-cli-rc", "", "v9.0.0-rc.0", ""},
+		{"zero fact falls back to valid stable", "v0.85.0-rc.1", "uzi-cli-rc", "v0.86.0", "v9.0.0-rc.0", "v0.86.0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withVersion(t, tc.stamp)
+			m := updatePromptModel(t)
+			m.updatePrompt.owner = tc.owner
+			var stable *apitypes.LatestReleaseDTO
+			if tc.stable != "" {
+				stable = &apitypes.LatestReleaseDTO{Version: tc.stable}
+			}
+			next, _ := m.Update(buildInfoMsg{
+				latest:   stable,
+				latestRC: &apitypes.LatestReleaseDTO{Version: tc.rc},
+			})
+			m = next.(tuiModel)
+			if m.updatePrompt.showing != (tc.want != "") || m.updatePrompt.latestVersion != tc.want {
+				t.Fatalf("prompt showing=%v target=%q, want showing=%v target=%q",
+					m.updatePrompt.showing, m.updatePrompt.latestVersion, tc.want != "", tc.want)
+			}
+		})
+	}
+}
+
 func TestUpdatePromptShowsOnNewerStable(t *testing.T) {
 	withVersion(t, "v0.83.0")
 	m := updatePromptModel(t)
@@ -121,28 +150,6 @@ func TestUpdatePromptNotShownWhenCurrentOrAhead(t *testing.T) {
 			m = next.(tuiModel)
 			if m.updatePrompt.showing {
 				t.Fatalf("must not prompt when CLI is %s and latest is %s", tc.cli, tc.latest)
-			}
-		})
-	}
-}
-
-// TestUpdatePromptNeverOffersPrerelease guards the stable prompt against any prerelease,
-// whether its base is higher than or equal to the CLI.
-func TestIsRCTagExactPrerelease(t *testing.T) {
-	for _, tc := range []struct {
-		tag  string
-		want bool
-	}{
-		{"v0.85.0-rc.1", true},
-		{"v0.85.0+build-rc.1", false},
-		{"v0.85.0-rc.1+build", false},
-		{"v0.85.0-rc.01", false},
-		{"v00.85.0-rc.1", false},
-		{"0.85.0-rc.1", false},
-	} {
-		t.Run(tc.tag, func(t *testing.T) {
-			if got := isRCTag(tc.tag); got != tc.want {
-				t.Errorf("isRCTag(%q) = %v, want %v", tc.tag, got, tc.want)
 			}
 		})
 	}
@@ -449,6 +456,7 @@ func TestBrewOwnerAndPromptChannels(t *testing.T) {
 		{"stable rejects malformed", "v0.83.0", "v0.85.0-beta.01", "", "uzi-cli", ""},
 		{"unknown rc offers stable notes", "v0.85.0-rc.11", "v0.85.0", "", "", "v0.85.0"},
 		{"unknown rc offers newer rc notes", "v0.85.0-rc.11", "v0.85.0", "v0.86.0-rc.1", "", "v0.86.0-rc.1"},
+		{"unknown metadata stamp uses strict published channel", "v0.85.0-rc.11+meta", "v0.85.0", "v0.86.0-rc.1", "", "v0.85.0"},
 		{"handbuilt with both installed", "v0.83.0", "v0.85.0", "v0.90.0-rc.1", "", "v0.85.0"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
