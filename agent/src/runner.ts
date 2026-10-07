@@ -148,6 +148,7 @@ import { selectCodexBinding } from "./codex/select.js";
 import { errMessage, RUN_ID_RE, sleep } from "./util.js";
 import {
   AttemptReleaseError,
+  CloneRetainedByQuarantineError,
   emitOrphanDiagnostic,
   type OrphanDiagnostics,
   type OrphanStage,
@@ -3546,9 +3547,11 @@ export class RunRunner {
               runLog.warn(
                 e instanceof AttemptReleaseError
                   ? `predecessor attempt release failed at the ${e.stage === "ledger" ? "ledger append" : "journal clear"}; journal kept`
-                  : e instanceof CapturePathMismatchError
-                    ? "predecessor attempt release refused (the journal no longer names this attempt); nothing released"
-                    // The bare-lock wait, the journal read or its parse failed: all before any write.
+                  : e instanceof CloneRetainedByQuarantineError
+                    ? "predecessor attempt release skipped: worker residue quarantine latched; nothing released, journal kept"
+                    : e instanceof CapturePathMismatchError
+                      ? "predecessor attempt release refused (the journal no longer names this attempt); nothing released"
+                      // The bare-lock wait, the journal read or its parse failed: all before any write.
                     : "predecessor attempt release failed before any write (bare-lock wait, journal read or parse); nothing released, journal kept as found",
                 { error: errMessage(e) },
               ),
@@ -3592,6 +3595,9 @@ export class RunRunner {
           runLog.warn("runner clone cleanup failed", { error: errMessage(e) });
         }
       }
+      // issue #2213: a latch that landed inside the release/retire above made the git method refuse
+      // (or undo its move); keep the retention behaviour for the later steps.
+      if (residueQuarantine() !== undefined) flight.preserveRecoveryClone = true;
       // issue #1783 (R2): this attempt's final reap is done; it is no longer live.
       if (flight.attempt) this.liveAttempts.remove(flight.attempt.marker);
       // PRD #1392 M2: whether to KEEP the two resume artifacts (the sibling skills plugin dir

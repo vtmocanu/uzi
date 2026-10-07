@@ -26,7 +26,7 @@ import {
   parseRetainedArtifactName,
 } from "./attempt-path.js";
 import { sanitizeForLog } from "./run-quiescence.js";
-import { REASON_WORKER_RESIDUE_BLOCKED, RunResidueBlockedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen } from "./residue-quarantine.js";
+import { REASON_WORKER_RESIDUE_BLOCKED, RunResidueBlockedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen, residueQuarantine } from "./residue-quarantine.js";
 
 import {
   commitsScannedFromStderr,
@@ -334,6 +334,17 @@ export class AttemptReleaseError extends Error {
   ) {
     super(`attempt release failed at the ${stage === "ledger" ? "ledger append" : "journal clear"}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
     this.name = "AttemptReleaseError";
+  }
+}
+
+/** issue #2213 — a destructive step of a runner-clone release/retire/removal found the worker
+ *  residue quarantine latched. A latched worker keeps a failed run's clone, journal and holds, so
+ *  the step is refused (or, once a move already happened, undone) rather than completed. Not a
+ *  RunResidueBlockedError: it never changes how a run is classified, callers only log it. */
+export class CloneRetainedByQuarantineError extends Error {
+  constructor() {
+    super("worker residue quarantine latched: runner clone retained");
+    this.name = "CloneRetainedByQuarantineError";
   }
 }
 
@@ -4054,6 +4065,8 @@ export class GitCache {
       if (pending?.runId !== runId || pending.clonePath !== clonePath) {
         throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, runId);
       }
+      // issue #2213: a latch that landed during the lock wait / journal read keeps the journal.
+      if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
       const attemptId = pending.attemptId ?? parseAttemptPath(clonePath, path.resolve(this.runnerRoot))?.attemptId;
       if (attemptId !== undefined) {
         try {
@@ -4066,6 +4079,9 @@ export class GitCache {
         this.log.info("releasing a legacy canonical clone in place (no attempt ledger entry)", { clone: clonePath, state });
       }
       try {
+        // issue #2213: recheck right before the clear (the ledger append awaited); the latch read
+        // and the clear are issued with nothing awaited between them.
+        if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
         await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       } catch (err) {
         throw new AttemptReleaseError("journal", err);
@@ -4786,8 +4802,12 @@ export class GitCache {
   /** Remove the run's runner clone (a standalone clone, not a linked worktree — no
    *  bare interaction). The warm bare and the fetched refs/objects are kept. */
   async removeRunnerClone(clonePath: string, ownerRunId?: string): Promise<void> {
-    if (ownerRunId !== undefined && await this.hasPhysicalTerminalProtection(ownerRunId)) {
-      throw new Error("terminal record custody retains runner clone");
+    if (ownerRunId !== undefined) {
+      if (await this.hasPhysicalTerminalProtection(ownerRunId)) {
+        throw new Error("terminal record custody retains runner clone");
+      }
+      // issue #2213: a latch that landed during the protection read keeps the clone.
+      if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
     }
     await rmRunnerTeardownTree(clonePath, { allowCloneName: true });
   }
@@ -4867,6 +4887,8 @@ export class GitCache {
       let scratch: string | undefined;
       let exdev = false;
       stage = "rename";
+      // issue #2213: a latch that landed during the awaits above keeps the clone; nothing moved.
+      if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
       try {
         await fs.rename(clonePath, holdingDest);
       } catch (err) {
@@ -4886,7 +4908,7 @@ export class GitCache {
             // socket / FIFO the clone may carry. No holdingDest is used on this path.
             stage = "intra_device_rename";
             const scratchParent = await this.createRetireScratchParent();
-            renamed = await this.renameCanonicalOrConfirmFree(clonePath, path.join(scratchParent, "clone"));
+            renamed = await this.renameIntoScratchUnlessLatched(clonePath, scratchParent);
             scratch = scratchParent;
           } else {
             // Rare foreign-orphan reclaim: the quarantine is RETAINED FOREVER, so
@@ -4921,7 +4943,7 @@ export class GitCache {
             // rename is deliberately OUTSIDE the copy's cleanup catch above.
             stage = "intra_device_rename";
             const scratchParent = await this.createRetireScratchParent();
-            renamed = await this.renameCanonicalOrConfirmFree(clonePath, path.join(scratchParent, "clone"));
+            renamed = await this.renameIntoScratchUnlessLatched(clonePath, scratchParent, holdingDest);
             holding = holdingDest; // retained; step 6 no-ops since discard === false
             scratch = scratchParent;
           }
@@ -4954,6 +4976,25 @@ export class GitCache {
       //    concurrent successor must never have its journal cleared by us.
       stage = "journal_clear";
       const still = await this.readRecoveryCapture(barePath, branch);
+      if (residueQuarantine() !== undefined) {
+        // issue #2213: a latch landed after the move. Undo it (best-effort), keep the journal and
+        // dispose of nothing; the latched worker keeps the clone at its journaled path.
+        const movedTo = renamed ? (exdev ? (scratch ? path.join(scratch, "clone") : undefined) : holdingDest) : undefined;
+        if (movedTo !== undefined) {
+          await fs.rename(movedTo, clonePath).then(
+            async () => {
+              if (scratch) await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+            },
+            (renameErr: unknown) =>
+              this.log.warn("retireRunnerClone: worker residue quarantine latched mid-retire and the clone could not be moved back; it is retained at the holding path", {
+                clone: clonePath,
+                retained_at: movedTo,
+                error: gitErrorMessage(renameErr),
+              }),
+          );
+        }
+        throw new CloneRetainedByQuarantineError();
+      }
       if (still?.runId === ownerRunId && still.clonePath === clonePath) {
         await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       }
@@ -4983,6 +5024,8 @@ export class GitCache {
     //    scratch rm is harmless residue.
     const { holding, scratch } = result;
     const protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId);
+    // issue #2213: a latch that landed during the protection read keeps the holding and scratch dirs.
+    if (residueQuarantine() !== undefined) return result.disposition;
     if (holding && opts.discard && !protectedNow) {
       await fs.rm(holding, { recursive: true, force: true }).catch((e) =>
         this.log.warn("retireRunnerClone: holding dispose failed", {
@@ -5009,6 +5052,19 @@ export class GitCache {
     const st = await fs.lstat(scratchParent);
     if (!st.isDirectory()) throw new Error("retire scratch parent is not a directory");
     return scratchParent;
+  }
+
+  /** issue #2213 — {@link renameCanonicalOrConfirmFree} into `<scratchParent>/clone`, guarded by a
+   *  latch read issued with nothing awaited before the rename. On a latch nothing moved: the empty
+   *  scratch parent (and the completed off-tree copy at `copy`, if any) are removed best-effort and
+   *  the canonical clone stays. */
+  private async renameIntoScratchUnlessLatched(clonePath: string, scratchParent: string, copy?: string): Promise<boolean> {
+    if (residueQuarantine() !== undefined) {
+      await fs.rm(scratchParent, { recursive: true, force: true }).catch(() => undefined);
+      if (copy) await fs.rm(copy, { recursive: true, force: true }).catch(() => undefined);
+      throw new CloneRetainedByQuarantineError();
+    }
+    return this.renameCanonicalOrConfirmFree(clonePath, path.join(scratchParent, "clone"));
   }
 
   /** issue #1354 — atomically rename the canonical clone to `dest`, applying the same
