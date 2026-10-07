@@ -146,10 +146,10 @@ function FailedRunsBlock({ lifetime, last7 }: { lifetime: RunOutcomes; last7: Ru
   return (
     <div className="mt-3.5 border-t border-edge pt-3.5">
       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-        <SectionTitle>Failed runs</SectionTitle>
-        <span className="font-mono text-[22px] font-semibold tabular-nums tracking-tight text-fg">
-          {failRate(lifetime)}
-        </span>
+        <h3 className="font-mono text-[26px] font-semibold tabular-nums tracking-tight text-fg">
+          <span>{failRate(lifetime)}</span>{" "}
+          <em className="text-sm font-normal not-italic text-muted">failed runs</em>
+        </h3>
         <span className="text-xs text-muted">
           <span className="tabular-nums text-fg">{lifetime.failed}</span> of{" "}
           <span className="tabular-nums text-fg">{lifetime.finished}</span> finished runs ·{" "}
@@ -191,17 +191,19 @@ function SinceLastFailedRun({ outcomes, owner }: { outcomes: RunOutcomes; owner?
   const ownerLabel = owner ? stripUnsafeChars(owner) : undefined;
   return (
     <div className="mt-3 min-w-0 border-t border-edge pt-3">
-      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-        <SectionTitle>Since last failed run</SectionTitle>
-        {hasFailure ? (
-          <span className="font-mono text-[22px] font-semibold tabular-nums tracking-tight text-fg">{value}</span>
-        ) : (
-          <span className="text-xs text-muted">
-            {value === "Unavailable" ? "Unavailable" : outcomes.finished === 0 ? "No finished runs yet" :
-              `No recorded failures · ${outcomes.completed} completed runs, none failed`}
-          </span>
-        )}
-      </div>
+      {hasFailure || value === "Unavailable" ? (
+        <h3 className="font-mono text-[26px] font-semibold tabular-nums tracking-tight text-fg">
+          <span>{value}</span>{" "}
+          <em className="text-sm font-normal not-italic text-muted">since last failed run</em>
+        </h3>
+      ) : (
+        <>
+          <h3 className={outcomes.finished === 0 ? "text-lg font-medium text-muted" : "text-lg font-medium text-ok"}>
+            {outcomes.finished === 0 ? "No finished runs yet" : "No recorded failures"}
+          </h3>
+          <p className="mt-1 text-xs text-muted">{outcomes.completed} completed runs, none failed</p>
+        </>
+      )}
       {hasFailure && (
         <p className="mt-1 flex min-w-0 flex-nowrap items-baseline gap-x-1 whitespace-nowrap text-xs text-muted">
           <span className="shrink-0">{outcomes.completed_since_last_failure ?? 0} completed since</span>

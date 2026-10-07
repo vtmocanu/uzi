@@ -286,8 +286,8 @@ describe("FailedRunsBlock (PRD #1293)", () => {
         last_7_days: outcomes(38, 33, 1, 1, 3, { agent_failure: 2, run_timeout: 1 }),
       },
     };
-    const { container, getByText } = wrap(<YourUsageCard usage={usage} />);
-    expect(getByText("Failed runs")).toBeTruthy();
+    const { container, getByText, getByRole } = wrap(<YourUsageCard usage={usage} />);
+    expect(getByRole("heading", { name: "10.4% failed runs" })).toBeTruthy();
     // Lifetime rate + counts sentence with the 7-day clause, both one decimal.
     expect(container.textContent).toContain("10.4%");
     expect(container.textContent).toContain("106 of 1024 finished runs");
@@ -317,8 +317,9 @@ describe("FailedRunsBlock (PRD #1293)", () => {
       ...noAggregateCostCounts,
       outcomes: { lifetime: outcomes(0, 0, 0, 0, 0), last_7_days: outcomes(0, 0, 0, 0, 0) },
     };
-    const { container } = wrap(<YourUsageCard usage={usage} />);
-    expect(container.textContent).not.toContain("Failed runs");
+    const { container, getByRole, queryByRole } = wrap(<YourUsageCard usage={usage} />);
+    expect(getByRole("heading", { name: "No finished runs yet" })).toBeTruthy();
+    expect(queryByRole("heading", { name: /failed runs$/ })).toBeNull();
     expect(container.querySelector('[role="img"]')).toBeNull();
   });
 
@@ -520,16 +521,18 @@ describe("failure recency cards and table (#2399)", () => {
   });
   it("shows recency and a reachable run link even without token usage", () => {
     const { getByText, getByRole } = wrap(<YourUsageCard usage={usage(failed())} />);
-    expect(getByText("6h")).toBeTruthy();
+    expect(getByRole("heading", { name: "6h since last failed run" })).toBeTruthy();
     expect(getByText("14 completed since")).toBeTruthy();
     expect(getByText(/last: worker lost/)).toBeTruthy();
     expect(getByRole("link", { name: /run 7c41a2e0/ }).getAttribute("href")).toBe("/runs/7c41a2e0-0000-4000-8000-000000000001");
   });
   it("distinguishes no finished runs from completed runs without failures", () => {
-    const { getByText, rerender } = wrap(<YourUsageCard usage={usage(outcomes(0, 0, 0, 0, 0))} />);
-    expect(getByText("No finished runs yet")).toBeTruthy();
+    const { getByText, getByRole, rerender } = wrap(<YourUsageCard usage={usage(outcomes(0, 0, 0, 0, 0))} />);
+    expect(getByRole("heading", { name: "No finished runs yet" })).toBeTruthy();
+    expect(getByText("0 completed runs, none failed")).toBeTruthy();
     rerender(<MemoryRouter><YourUsageCard usage={usage(outcomes(4, 3, 1, 0, 0))} /></MemoryRouter>);
-    expect(getByText("No recorded failures · 3 completed runs, none failed")).toBeTruthy();
+    expect(getByRole("heading", { name: "No recorded failures" }).classList.contains("text-ok")).toBe(true);
+    expect(getByText("3 completed runs, none failed")).toBeTruthy();
   });
   it("advances elapsed time between API refreshes", async () => {
     vi.useFakeTimers();
@@ -587,7 +590,7 @@ describe("usage cards without the Top causes line (#2399)", () => {
     const { getByText, getByRole, queryByText } = wrap(scope === "self" ?
       <YourUsageCard usage={usage} /> : <FactoryTotalCard admin={admin} />);
     // Positive controls: the populated block and last origin still render.
-    expect(getByText("Failed runs")).toBeTruthy();
+    expect(getByRole("heading", { name: "30.0% failed runs" })).toBeTruthy();
     expect(getByRole("img", { name: "Finished runs: 5 completed, 1 cancelled, 1 plan rejected, 3 failed" })).toBeTruthy();
     expect(getByText(/last: worker lost/)).toBeTruthy();
     expect(queryByText(/Top causes/)).toBeNull();

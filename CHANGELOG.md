@@ -30,7 +30,7 @@ through `[0.52.0]`.)
 ### Added
 
 - **Time since the last failed run on Overview ([#2399](https://github.com/vtmocanu/uzi/issues/2399)).**
-  Your usage, Factory total, and the admin per-user breakdown show adaptive elapsed time since the last failed run; the cards also show completed runs since that failure and link to it. The admin usage CLI includes failure recency too; the usage cards omit the Top causes line, group recoverable failures in the legend, align their sections, and keep the last-failure detail on one line.
+  Your usage, Factory total, and the admin per-user breakdown show adaptive elapsed time since the last failed run; the cards also show completed runs since that failure and link to it. The admin usage CLI includes failure recency too; the usage cards omit the Top causes line, group recoverable failures in the legend, align their sections, keep the last-failure detail on one line, and put the value before each summary label.
 
 ## [0.86.0] - 2026-10-06
 
