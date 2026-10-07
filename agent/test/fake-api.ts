@@ -222,7 +222,7 @@ export class FakeApi {
   // 404 not-owned, or a transient 5xx.
   private readonly ownershipByRun = new Map<
     string,
-    { httpStatus: number; status?: string; generation?: number }
+    { httpStatus: number; status?: string; generation?: number; inventoryGuarded?: boolean }
   >();
   // issue #1319: the owner-scoped orphan-classification read. Keyed by OWNER run id (the
   // fake trusts the test for the claimant/authz; the runner's predicate logic is what's under
@@ -803,8 +803,8 @@ export class FakeApi {
    *  terminal status (completed/failed/cancelled) to drive the skip-path terminal throw.
    *  PRD #1391 Run B M4: an optional `generation` rides the 200 as `claim_generation`, so a test
    *  can model the queued-duplicate router seeing a DIFFERENT generation own the run. */
-  setOwnershipStatus(runId: string, status: string, generation?: number): void {
-    this.ownershipByRun.set(runId, { httpStatus: 200, status, generation });
+  setOwnershipStatus(runId: string, status: string, generation?: number, inventoryGuarded?: boolean): void {
+    this.ownershipByRun.set(runId, { httpStatus: 200, status, generation, ...(inventoryGuarded !== undefined ? { inventoryGuarded } : {}) });
   }
 
   /** issue #559 M3: answer the ownership probe with 404 — the DEFINITIVE not-owned
@@ -1313,6 +1313,7 @@ export class FakeApi {
       // test set one, so the default (issue #559) shape stays {status} for unrelated tests.
       const body: Record<string, unknown> = { status: o.status ?? "running" };
       if (o.generation !== undefined) body.claim_generation = o.generation;
+      if (o.inventoryGuarded !== undefined) body.inventory_guarded = o.inventoryGuarded;
       return send(res, 200, body);
     }
 
