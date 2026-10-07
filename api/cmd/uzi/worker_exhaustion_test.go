@@ -16,11 +16,11 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
-func workerExhaustionRun(limit int) apitypes.RunDTO {
+func workerExhaustionRun(limit int32) apitypes.RunDTO {
 	cause := "worker_requeue_exhausted"
 	retry := time.Now().Add(-time.Hour)
 	return apitypes.RunDTO{ID: "r1", Kind: "issue", Status: "recovery_wait", RecoveryWaitCause: &cause, RecoveryRetryNotBefore: &retry, RequeueCount: 9,
-		WorkerRecovery: &apitypes.WorkerRecoveryDTO{Episode: 4, AutomaticRequeueLimit: limit, EpisodeUsed: int32(limit), EpisodeRemaining: 0}}
+		WorkerRecovery: &apitypes.WorkerRecoveryDTO{Episode: 4, AutomaticRequeueLimit: int(limit), EpisodeUsed: limit, EpisodeRemaining: 0}}
 }
 
 func workerExhaustionServer(t *testing.T, runs []apitypes.RunDTO, polls *int, resume *bool) *httptest.Server {
@@ -68,7 +68,7 @@ func requireWorkerCopy(t *testing.T, output string, wants ...string) {
 }
 
 func TestWorkerExhaustionCLIGetEvidence(t *testing.T) {
-	for _, limit := range []int{0, 3} {
+	for _, limit := range []int32{0, 3} {
 		t.Run(fmt.Sprint(limit), func(t *testing.T) {
 			r := workerExhaustionRun(limit)
 			latest := true
@@ -292,7 +292,7 @@ func TestWorkerExhaustionCLITUIViews(t *testing.T) {
 }
 
 func TestWorkerExhaustionCLIInputs(t *testing.T) {
-	for _, limit := range []int{0, 3} {
+	for _, limit := range []int32{0, 3} {
 		t.Run(fmt.Sprint(limit), func(t *testing.T) {
 			r := workerExhaustionRun(limit)
 			polls, resume := 0, false

@@ -410,7 +410,7 @@ type Config struct {
 	HandoffRunTimeout       time.Duration // non-interactive handoff wall-clock budget
 	HandoffRunMaxIterations int           // non-interactive handoff implement⇄review loop cap
 	PlanMaxRevisions        int           // PRD #41 plan-revision cap at the approval gate (server + worker)
-	QuestionMax             int           // PRD #88 clarification-question cap per run (worker-enforced)
+	QuestionMax             int           // PRD #88 clarification-question cap per execute() attempt (worker-enforced)
 	QuestionTimeoutSeconds  int           // PRD #88 answer deadline before a parked run fails (worker-enforced)
 	// CompletionHoldWindowSeconds (PRD #1226 M5, D6) is the live owner-continue window a
 	// completion-blocked run waits before it parks: the worker's completion-question timer uses
@@ -1077,6 +1077,10 @@ func Load() (Config, error) {
 	cfg.HandoffRunTimeout = parseDuration("HANDOFF_RUN_TIMEOUT", 4*time.Hour)
 	cfg.HandoffRunMaxIterations = parseInt("HANDOFF_RUN_MAX_ITERATIONS", 10)
 	cfg.PlanMaxRevisions = parseInt("PLAN_MAX_REVISIONS", 3)
+	// Fresh execute() resets worker-memory question budgets, including ordinary
+	// transient/limit/credential redispatch within the same recovery episode.
+	// RUN_MAX_REQUEUES bounds charged worker-death retries, not total attempts
+	// or questions per episode or lifetime; this introduces no runtime budget.
 	cfg.QuestionMax = parseInt("QUESTION_MAX", 5)
 	cfg.QuestionTimeoutSeconds = parseInt("QUESTION_TIMEOUT_SECONDS", 86400)
 	// PRD #1226 M5 (D6): the completion-hold owner-continue window, default 900s.

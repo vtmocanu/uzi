@@ -589,7 +589,7 @@ Raising the cap is an informed trade-off, not a free speedup:
 - **One container, one memory budget.** A runaway run can OOM the whole container,
   requeuing eligible in-flight runs together; raise the API's `RUN_MAX_REQUEUES`
   alongside `workers.maxConcurrentRuns > 1` to give affected runs more automatic
-  attempts per episode. Registration cannot attribute the memory consumer, so
+  worker-death retries per episode. Registration cannot attribute the memory consumer, so
   there is no innocent-sibling exemption. At exhaustion, recorded recovery evidence
   or uncertainty holds for owner Resume; no recorded recovery evidence or unresolved
   custody keeps `worker_lost`, without proving absence of unrecorded work.

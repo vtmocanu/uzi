@@ -1755,12 +1755,15 @@ export class SdkExecutor implements Executor {
        *  NOT DURABLE, and the honest bound is worth stating because the other #88
        *  bound already states its own: this is worker memory, so if worker-death
        *  recovery re-queues the run, execute() runs fresh and the count restarts at 0.
-       *  Within one owner recovery episode the ceiling is QUESTION_MAX x
-       *  (RUN_MAX_REQUEUES + 1) — 10 on defaults, not 5. Initial episode 0 can get
-       *  one more attempt via the issue #1742 one-shot finalize-resume allowance
-       *  with a positive cap, so x (RUN_MAX_REQUEUES + 2). Further owner resumes
-       *  open new episodes; these settings alone impose no finite lifetime ceiling.
-       *  QUESTION_TIMEOUT_SECONDS multiplies for the identical reason.
+       *  With no other fresh executor execution, worker-death retries contribute
+       *  QUESTION_MAX x (RUN_MAX_REQUEUES + 1) — 10 on defaults. Initial episode 0
+       *  can get one extra via #1742 with a positive cap, so x (RUN_MAX_REQUEUES + 2).
+       *  Ordinary transient/limit/credential redispatch can also run execute() fresh
+       *  within the same episode, resetting worker-memory question budgets without
+       *  changing the episode or charged requeue_count. RUN_MAX_REQUEUES bounds
+       *  charged worker-death retries, not all executions; there is no unconditional
+       *  per-episode or lifetime question/attempt ceiling from it.
+       *  QUESTION_TIMEOUT_SECONDS has the same conditional multipliers.
        *  Documenting one and not the other would be worse than
        *  documenting neither: a reader who finds the timeout's caveat reasonably
        *  infers the cap has none. */

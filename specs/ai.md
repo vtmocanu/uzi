@@ -15526,14 +15526,18 @@ than the tail — the tail is not the maximum, and this gate asserts uniqueness 
   primary. "Worker-side" describes where the cap is *enforced* and says nothing about
   where it is *configured*. Defaults 5 and 86400; a worker that receives neither falls
   back to the same numbers, so an older server degrades to 5 rather than to unbounded.
-- **🔴 THE DOCUMENTED CEILINGS ARE PER-EXECUTION, AND THE HONEST ONES MULTIPLY.** Both
-  the counter and the deadline are worker-in-memory locals of `execute()`, so a requeue
-  restarts them. Within one owner recovery episode, the bounds are
+- **🔴 QUESTION BUDGETS ARE PER-EXECUTION; WORKER-DEATH MULTIPLIERS ARE CONDITIONAL.**
+  Both the counter and the deadline are worker-in-memory, so fresh `execute()`
+  resets them. With no other fresh executor execution, worker-death retries contribute
   `QUESTION_MAX × (RUN_MAX_REQUEUES + 1)` and
-  `QUESTION_TIMEOUT_SECONDS × (RUN_MAX_REQUEUES + 1)` — ten questions on defaults,
-  not five. Initial episode 0 can use the #1742 one-shot finalize-resume allowance
-  with a positive cap, giving each `× (RUN_MAX_REQUEUES + 2)` instead. Further owner
-  resumes open new episodes, so these settings alone impose no finite lifetime bound.
+  `QUESTION_TIMEOUT_SECONDS × (RUN_MAX_REQUEUES + 1)` — ten questions on defaults.
+  Initial episode 0 can use the #1742 one-shot finalize-resume allowance with a
+  positive cap, giving each `× (RUN_MAX_REQUEUES + 2)` instead. Ordinary transient,
+  limit and credential redispatch can reset these budgets within the same episode
+  without changing the episode or charged `requeue_count`. Charged automatic
+  worker-death retries remain bounded by `RUN_MAX_REQUEUES` per owner-started
+  episode, with the extra initial-only; this is no unconditional per-episode or
+  lifetime question/attempt ceiling and introduces no runtime budget.
   **Both caveats must be stated wherever either is**: documenting the timeout's and not
   the cap's is worse than documenting neither, because a reader who finds one
   reasonably infers the other has none.
@@ -15615,7 +15619,8 @@ otherwise be read as covering all of these, and it covers none of them.**
   and the credential prohibition are pinned by string assertions and by nothing
   behavioural. A real lead deciding *when* to ask is untested by construction.
 - **`QUESTION_MAX` enforcement is documented, not tested**, and neither is §458's
-  `× (RUN_MAX_REQUEUES + 1)` bound.
+  conditional `× (RUN_MAX_REQUEUES + 1)` worker-death retry contribution (with
+  no other fresh executor execution).
 
 ### Non-fix 1 — `FailRunAutoStop` GUARDS `awaiting_input`, and the clause is INERT TODAY ON PURPOSE
 

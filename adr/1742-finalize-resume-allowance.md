@@ -251,7 +251,8 @@ record and logs nothing), `register finalize snapshot` (count and a sample of ge
 - The allowance is **one-shot per run**, only in initial episode 0, through
   `runs.finalize_resume_generation`, off at `RUN_MAX_REQUEUES=0`. Owner Resume
   never renews the marker; ordinary under-budget requeues never stamp or overwrite
-  it. Owner-started episodes cannot exceed their configured automatic cap.
+  it. Charged worker-death retries in owner-started episodes cannot exceed
+  their configured automatic cap.
   The allowance charge is not a readoption-refund entitlement.
 - Any writer that re-queues a run must keep `ClaimRun`'s worker-level overflow exclusion as the
   gate on the re-claim.
@@ -287,13 +288,18 @@ record and logs nothing), `register finalize snapshot` (count and a sample of ge
   unresolved custody or uncertainty holds it for owner Resume, otherwise it fails
   `worker_lost` without proving absence of unrecorded work. The record
   cannot help a worker that never comes back in time.
-- **Attempt bounds are per episode.** Initial episode 0 has at most
-  `RUN_MAX_REQUEUES + 1` attempts, or `RUN_MAX_REQUEUES + 2` only if the
-  once-per-run allowance is used. Each owner-started episode has at most
-  `RUN_MAX_REQUEUES + 1` attempts. Multiply `QUESTION_MAX` and
-  `QUESTION_TIMEOUT_SECONDS` by those attempt counts for their per-episode
-  bounds. Further owner resumes mean these variables alone impose no finite
-  lifetime bound; the existing wall budget is preserved.
+- **The allowance bounds charged worker-death retries, not all executions.**
+  Each owner-started episode allows at most `RUN_MAX_REQUEUES` charged automatic
+  worker-death retries; the once-per-run extra applies only in initial episode 0
+  with a positive cap. With no other fresh executor execution, this contributes
+  `RUN_MAX_REQUEUES + 1` attempts, or `RUN_MAX_REQUEUES + 2` in the initial
+  episode if the extra allowance is used. The same conditional multipliers apply
+  to `QUESTION_MAX` and `QUESTION_TIMEOUT_SECONDS`. Ordinary transient, limit
+  and credential redispatch can create a fresh `execute()` in the same episode,
+  resetting worker-memory question budgets without changing the episode or
+  charged `requeue_count`. These formulas provide no unconditional per-episode
+  or lifetime question/attempt ceiling. This clarifies the approved design and
+  introduces no runtime budget; the existing wall budget is preserved.
 - **The 256-entry cap** mirrors the api's default `ACTIVE_SNAPSHOT_MAX_ENTRIES`. That limit is
   operator-configurable: an api set below the offered count drops the whole list, and the worker
   still retires the offered records after the accepted register (the retirement-gap limit above).
@@ -646,7 +652,8 @@ not a reset monotonic physical-death count. The wall budget is preserved:
 held time is banked only if its clock already started, and approval/input
 waits are banked at park. The unused finalize-resume allowance is eligible
 only in initial episode 0, with a positive maximum and exhausted allowance;
-owner-started episodes cannot exceed the cap or renew the lifetime marker.
+charged worker-death retries in owner-started episodes cannot exceed the cap,
+and owner Resume cannot renew the lifetime marker.
 
 User-facing behavior and exact historical-evidence wording live in
 [Worker recovery exhausted](../docs/run-recovery-wait.md#worker-recovery-exhausted);

@@ -2009,6 +2009,35 @@ export function RunView() {
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [actionErr, setActionErr] = useState("");
   const [busy, setBusy] = useState(false);
+  const exhaustionResumeAction = useRef<{ runId: string } | null>(null);
+  useEffect(() => () => {
+    // Retire this navigation's Resume, including a return to the same run ID.
+    if (exhaustionResumeAction.current) {
+      exhaustionResumeAction.current = null;
+      setBusy(false);
+      setActionErr("");
+    }
+  }, [id]);
+  const resumeExhaustedRun = async () => {
+    if (!canSteer || !workerExhausted || run?.id !== id) return;
+    const action = { runId: id };
+    exhaustionResumeAction.current = action;
+    const isCurrent = () => currentRunIdRef.current === action.runId &&
+      exhaustionResumeAction.current === action;
+    setActionErr("");
+    setBusy(true);
+    try {
+      await api.resumeRun(action.runId);
+      if (isCurrent()) await refreshRun();
+    } catch (e) {
+      if (isCurrent()) setActionErr(errorMessage(e, "Action failed"));
+    } finally {
+      if (isCurrent()) {
+        exhaustionResumeAction.current = null;
+        setBusy(false);
+      }
+    }
+  };
   // PRD #841: the owner's global MR-rework default, for the per-run checkbox's effective
   // display when this run inherits (mr_rework_enabled null). Lives on UserSettings, not
   // the session User, so it is fetched here. Best-effort — a failed read leaves null,
@@ -2762,13 +2791,7 @@ export function RunView() {
         run={run}
         ownerProof={canSteer && confirmedOwner === true}
         busy={busy}
-        onResume={() => {
-          if (!canSteer) return;
-          void act(async () => {
-            await api.resumeRun(run.id);
-            await refreshRun();
-          });
-        }}
+        onResume={() => { void resumeExhaustedRun(); }}
         onCancel={() => { void cancelRun(); }}
       />
 

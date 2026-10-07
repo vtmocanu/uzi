@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { RunView } from "./RunView";
 import { useRunStream } from "../lib/useRunStream";
 import { api, ApiError, type Run } from "../lib/api";
@@ -44,8 +44,11 @@ function view(run: Run, proof?: boolean, canSteer = true) {
     <Route path="/runs/:id" element={<RunView />} />
   </Routes></MemoryRouter>;
 }
-beforeEach(() => { vi.clearAllMocks(); });
-afterEach(cleanup);
+beforeEach(() => {
+  vi.clearAllMocks();
+  submit.mockReset().mockResolvedValue(undefined);
+});
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 it.each([0, 3])("renders limit %s and historical evidence even after captures disappear", (limit) => {
   render(view(held(limit), true));
@@ -113,6 +116,81 @@ it("keeps actions busy and surfaces resume errors", async () => {
   expect((screen.getByRole("button", { name: /^Cancel$/ }) as HTMLButtonElement).disabled).toBe(true);
   reject(new ApiError(409, "Recovery refused"));
   await waitFor(() => expect(screen.getByText("Recovery refused")).toBeTruthy());
+  expect((screen.getByRole("button", { name: /^Resume$/ }) as HTMLButtonElement).disabled).toBe(false);
+});
+// Keep RunView mounted while the router changes :id, as in the real page.
+function NavigationControls() {
+  const navigate = useNavigate();
+  return <><button onClick={() => navigate("/runs/held")}>Go A</button>
+    <button onClick={() => navigate("/runs/other")}>Go B</button></>;
+}
+function navigationView() {
+  const refreshA = vi.fn().mockResolvedValue(undefined);
+  const refreshB = vi.fn().mockResolvedValue(undefined);
+  vi.mocked(useRunStream).mockImplementation((id) => ({
+    run: { ...held(), id }, messages: [], connected: true, error: "",
+    submit, refreshRun: id === "held" ? refreshA : refreshB, inputs: [],
+    refreshInputs: vi.fn(), canSteer: true, confirmedOwner: true,
+  } as ReturnType<typeof useRunStream>));
+  render(<MemoryRouter initialEntries={["/runs/held"]}>
+    <NavigationControls /><Routes><Route path="/runs/:id" element={<RunView />} /></Routes>
+  </MemoryRouter>);
+  return { refreshA, refreshB };
+}
+async function deferredResume() {
+  const actual = await vi.importActual<typeof import("../lib/api")>("../lib/api");
+  let respond!: (response: Response) => void;
+  const post = new Promise<Response>((done) => { respond = done; });
+  const fetchPost = vi.fn((url: string, init?: RequestInit) => {
+    if (url === "/api/runs/held/resume-now" && init?.method === "POST") return post;
+    return Promise.resolve(new Response("{}", { status: 200 }));
+  });
+  vi.stubGlobal("fetch", fetchPost);
+  vi.mocked(api.resumeRun).mockImplementationOnce(actual.api.resumeRun);
+  return {
+    fetchPost,
+    succeed: async () => {
+      respond(new Response(JSON.stringify({ run: held() }), { status: 200 }));
+      await vi.mocked(api.resumeRun).mock.results[0].value;
+    },
+    refuse: async () => {
+      respond(new Response(JSON.stringify({ error: "Recovery refused on A" }), { status: 409 }));
+      await vi.mocked(api.resumeRun).mock.results[0].value.catch(() => {});
+    },
+  };
+}
+it("releases inherited resume busy on B and ignores A's late failure", async () => {
+  const oldResume = await deferredResume();
+  navigationView();
+  fireEvent.click(screen.getByRole("button", { name: /^Resume$/ }));
+  expect(api.resumeRun).toHaveBeenCalledWith("held");
+  expect(oldResume.fetchPost).toHaveBeenCalledWith("/api/runs/held/resume-now", expect.objectContaining({ method: "POST" }));
+  expect((screen.getByRole("button", { name: /^Cancel$/ }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Go B" }));
+  const inheritedBusy = (screen.getByRole("button", { name: /^Resume$/ }) as HTMLButtonElement).disabled;
+  await act(async () => oldResume.refuse());
+  expect(screen.queryByText("Recovery refused on A")).toBeNull();
+  expect(inheritedBusy).toBe(false);
+  expect((screen.getByRole("button", { name: /^Resume$/ }) as HTMLButtonElement).disabled).toBe(false);
+});
+it.each([["B", "success"], ["A", "success"], ["B", "failure"], ["A", "failure"]])("ignores old A resume after navigation to %s on %s and keeps a later cancel busy", async (destination, result) => {
+  const oldResume = await deferredResume();
+  let rejectCancel!: (error: Error) => void;
+  submit.mockImplementationOnce(() => new Promise((_, reject) => { rejectCancel = reject; }));
+  const { refreshA, refreshB } = navigationView();
+  fireEvent.click(screen.getByRole("button", { name: /^Resume$/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Go B" }));
+  if (destination === "A") fireEvent.click(screen.getByRole("button", { name: "Go A" }));
+  fireEvent.click(screen.getByRole("button", { name: /^Cancel$/ }));
+  const laterCancelStarted = submit.mock.calls.length;
+  await act(async () => result === "success" ? oldResume.succeed() : oldResume.refuse());
+  expect(screen.queryByText("Recovery refused on A")).toBeNull();
+  expect(refreshA).not.toHaveBeenCalled();
+  expect(refreshB).not.toHaveBeenCalled();
+  expect(laterCancelStarted).toBe(1);
+  expect((screen.getByRole("button", { name: /^Resume$/ }) as HTMLButtonElement).disabled).toBe(true);
+  await act(async () => rejectCancel(new ApiError(500, "Later cancel refused")));
+  expect(screen.getByText("Later cancel refused")).toBeTruthy();
   expect((screen.getByRole("button", { name: /^Resume$/ }) as HTMLButtonElement).disabled).toBe(false);
 });
 it("uses the normal cancel busy and error path", async () => {

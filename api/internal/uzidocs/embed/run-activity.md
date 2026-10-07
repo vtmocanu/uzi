@@ -151,15 +151,18 @@ A few things worth knowing:
 - **Nobody answers ⇒ the run fails**, "clarification timed out", once the
   answer deadline passes (`QUESTION_TIMEOUT_SECONDS`, 24h by default) — there
   is no configurable default action. The timer is held by the worker, so if
-  it dies and the run is picked up again the clock restarts: the honest
-  per-episode bound is `QUESTION_TIMEOUT_SECONDS × (RUN_MAX_REQUEUES + 1)`
-  — 48h on the defaults. The question cap (`QUESTION_MAX`, default 5 per
-  attempt) resets the same way: `QUESTION_MAX × (RUN_MAX_REQUEUES + 1)`
-  — 10 questions per episode on the defaults. Only the initial episode can
-  use the once-per-run finalize-resume allowance (#1742), making these
-  multipliers `RUN_MAX_REQUEUES + 2`. Each owner-started recovery episode
-  has at most `RUN_MAX_REQUEUES + 1` attempts. Further owner resumes mean
-  these variables alone impose no finite lifetime bound.
+  it dies and the run is picked up again the clock restarts. With no other
+  fresh executor execution, worker-death retries contribute
+  `QUESTION_TIMEOUT_SECONDS × (RUN_MAX_REQUEUES + 1)` — 48h on defaults.
+  The question cap (`QUESTION_MAX`, default 5 per attempt) resets the same
+  way: `QUESTION_MAX × (RUN_MAX_REQUEUES + 1)` — 10 questions on defaults
+  under that condition. Only the initial episode can use the once-per-run
+  finalize-resume allowance (#1742) with a positive cap, making these
+  multipliers `RUN_MAX_REQUEUES + 2`. Ordinary transient/limit/credential
+  redispatch can create fresh `execute()` within the same episode, resetting
+  worker-memory question budgets without changing its number or charged
+  `requeue_count`. `RUN_MAX_REQUEUES` bounds charged worker-death retries,
+  not total attempts or questions per episode or lifetime.
 - **Autopilot runs never park on a question.** With nobody in the loop, the
   agent auto-resolves with "proceed on your best judgment," notes the
   assumption it made in the run feed, and keeps going — see

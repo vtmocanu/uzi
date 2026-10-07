@@ -695,7 +695,15 @@ uzi version
   Worker-death exhaustion is `recovery_wait` / `worker_requeue_exhausted`:
   owner `uzi run resume <id>` (or `resume-now`) releases the exact run hold
   and queues one explicit attempt with the current `RUN_MAX_REQUEUES`
-  automatic allowance per episode. At 0 there are no automatic requeues.
+  automatic worker-death allowance per episode. At 0 there are no automatic
+  worker-death requeues. This bounds charged worker-death retries, not all
+  executions: ordinary transient/limit/credential redispatch can create fresh
+  `execute()` in the same episode, resetting worker-memory question budgets
+  without changing its number or charged `requeue_count`. `N+1` attempts
+  (`N = RUN_MAX_REQUEUES`, initial `N+2` with the positive-cap #1742 extra)
+  and the corresponding question-budget multipliers require no other fresh
+  executor execution; they give no unconditional per-episode or lifetime
+  question/attempt ceiling and introduce no runtime budget.
   Lifetime charged `requeue_count`, generation-proven readoption refunds and
   the existing wall budget survive; the #1742 extra allowance is initial-episode
   only and its lifetime marker is never renewed. Timers, credentials, vault,

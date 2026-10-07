@@ -414,8 +414,8 @@ worker registration cannot attribute which run consumed memory.
 
 The once-per-run finalize-resume allowance (#1742) is restricted to initial
 episode 0, with a positive maximum, exhausted allowance and unused lifetime
-marker. Owner-started episodes cannot exceed their configured cap or renew
-that marker. See [Configuration](configuration.md) and [ADR-1742](../adr/1742-finalize-resume-allowance.md).
+marker. Charged worker-death retries in owner-started episodes cannot exceed
+their configured cap, and owner Resume cannot renew that marker. See [Configuration](configuration.md) and [ADR-1742](../adr/1742-finalize-resume-allowance.md).
 
 ## Other waiting states
 
