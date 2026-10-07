@@ -44,14 +44,14 @@ func TestCheckpointPublishReadyMigrationReplayLiveDB(t *testing.T) {
 		}
 	}
 	assertEvidence()
-	result, err := provider.ApplyVersion(ctx, 305, false)
-	if err != nil || result == nil || result.Source.Version != 305 || result.Direction != "down" {
-		t.Fatalf("Down migration 305: result=%v err=%v", result, err)
+	result, err := provider.ApplyVersion(ctx, 306, false)
+	if err != nil || result == nil || result.Source.Version != 306 || result.Direction != "down" {
+		t.Fatalf("Down migration 306: result=%v err=%v", result, err)
 	}
 	assertEvidence()
-	result, err = provider.ApplyVersion(ctx, 305, true)
-	if err != nil || result == nil || result.Source.Version != 305 || result.Direction != "up" {
-		t.Fatalf("replay Up migration 305: result=%v err=%v", result, err)
+	result, err = provider.ApplyVersion(ctx, 306, true)
+	if err != nil || result == nil || result.Source.Version != 306 || result.Direction != "up" {
+		t.Fatalf("replay Up migration 306: result=%v err=%v", result, err)
 	}
 	assertEvidence()
 	pendingID := f.recordAttempt(t, retentionTestTip)
