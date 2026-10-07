@@ -941,6 +941,7 @@ function validDindSample(sample: DindMeterSample | null | undefined): sample is 
 
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
+  private registeredWorkerId: string | undefined;
   private readonly inventoryGuardedClaims = new Set<string>();
   private readonly settledInventoryGuardedClaims = new Set<string>();
 
@@ -1068,6 +1069,7 @@ export class WorkerClient {
     protocolCapabilities?: string[],
     initialSnapshot?: ActiveSnapshot,
   ): Promise<RegisterResponse> {
+    this.registeredWorkerId = undefined;
     this.latestDindMaintenanceValue = undefined;
     this.registerNonce = undefined;
     const body: RegisterRequest = { name, version: this.version };
@@ -1125,6 +1127,7 @@ export class WorkerClient {
       res.worker_outbox_max_pending >= 0
         ? Math.floor(res.worker_outbox_max_pending)
         : undefined;
+    this.registeredWorkerId = terminalUUID(res.worker_id) ? res.worker_id.toLowerCase() : undefined;
     return res;
   }
 
@@ -2854,6 +2857,33 @@ export class WorkerClient {
           (d.disposition !== "recorded" && d.disposition !== "skipped")) throw terminalResponseError();
     }
     return response as TerminalRejectionsResponse;
+  }
+
+  /** Fresh observation permits report retirement only, never recovery source deletion. */
+  async hasRecoveryRetirementAuthority(runId: string, generation: number, state: "absent" | "pending"): Promise<boolean> {
+    if (!terminalUUID(runId) || !terminalGeneration(generation) || generation <= 0) return false;
+    if (state === "pending" && (!this.registeredWorkerId || !this.hasFeature("terminal_rejection_report"))) return false;
+    const ownership = await this.getRunOwnership(runId);
+    if (!ownership || typeof ownership !== "object" ||
+        !["completed", "failed", "cancelled"].includes(ownership.status) ||
+        !terminalGeneration(ownership.claim_generation) || ownership.claim_generation <= 0) return false;
+    if (ownership.inventory_guarded !== undefined && typeof ownership.inventory_guarded !== "boolean") return false;
+    if (state === "absent" && typeof ownership.inventory_guarded !== "boolean") return false;
+    // Absence is not legacy evidence. An exact explicit server classification is, unless
+    // this process has already observed a guarded claim (including one since settled).
+    if (state === "absent" && ownership.claim_generation === generation && ownership.inventory_guarded === false &&
+        !this.inventoryGuardedClaims.has(`${runId}:${generation}`)) return true;
+    if (!["completed", "failed", "cancelled"].includes(ownership.status) || ownership.claim_generation! < generation) return false;
+    const workerId = this.registeredWorkerId;
+    if (!workerId) return false;
+    const custody = await this.getTerminalRejectionCustody(runId, generation, workerId);
+    if (workerId !== this.registeredWorkerId || !this.hasFeature("terminal_rejection_report") ||
+        !custody || custody.outcome !== "settled" || !custody.complete || !custody.exact_complete ||
+        !custody.sibling_complete || custody.exact_count < 1 || custody.sibling_count !== 0 ||
+        custody.exact_holds.length !== custody.exact_count || custody.sibling_holds.length !== 0 ||
+        !custody.exact_holds.every(h => state === "pending" ? h.state === "discarded" : h.state === "released" || h.state === "discarded")) return false;
+    this.markInventoryGuardedClaimSettled(runId, generation);
+    return true;
   }
 
   async getTerminalRejectionCustody(runId: string, generation: number, workerId: string, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<TerminalRejectionCustodyResponse | undefined> {

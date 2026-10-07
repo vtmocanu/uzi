@@ -64,6 +64,7 @@ async function registerWith(
   outbox: Outbox,
   register: (snapshot: ActiveSnapshot | undefined) => Promise<unknown>,
   withRegistry = true,
+  recoveryInventoryPending?: (runId: string, generation: number) => Promise<boolean>,
 ): Promise<void> {
   const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 0);
   const client = {
@@ -73,7 +74,7 @@ async function registerWith(
   const worker = new Worker(
     { workerName: "finalize-probe", workerTemplate: "base", maxConcurrentRuns: 1, pollIntervalMs: 1 } as Config,
     client,
-    {} as RunRunner,
+    { recoveryInventoryPending } as RunRunner,
     {} as ChatRunner,
     {} as JudgeRunner,
     {} as ReviewRunner,
@@ -244,6 +245,22 @@ describe("issue #1742 finalize record: Outbox", () => {
 });
 
 describe("issue #1742 finalize record: register hand-off", () => {
+  it("settled offered G2 cannot retire guarded pending G1", async () => {
+    const root = tmpRoot();
+    const outbox = makeOutbox(root);
+    await outbox.init();
+    await outbox.journalFinalize(RUN_A, 1);
+    await outbox.journalFinalize(RUN_A, 2);
+    const checked: number[] = [];
+    await registerWith(outbox, async () => ({}), true, async (runId, generation) => {
+      assert.equal(runId, RUN_A);
+      checked.push(generation);
+      return generation === 1;
+    });
+    assert.deepEqual(checked.sort(), [1, 2]);
+    assert.deepEqual(await finalizeFiles(root, RUN_A), ["finalize-1.json"]);
+  });
+
   it("retires exactly the offered set after an accepted register; a later record is kept", async () => {
     const root = tmpRoot();
     const outbox = makeOutbox(root);
@@ -345,7 +362,7 @@ describe("issue #1742 finalize record: isFinalizeBoundResult", () => {
 describe("issue #1742 finalize record: runner write and retirement", () => {
   const RUNNER_OPTS = { outboxTerminalMaxBytes: 1 << 20, gapFillMax: 100 };
 
-  it("a normal completion writes the record, then retires it with the terminal", async () => {
+  it("a normal completion retains the record without positive absent-journal authority", async () => {
     const root = tmpRoot();
     const { logger, lines } = recordingLogger();
     const outbox = makeOutbox(root, { log: logger });
@@ -359,11 +376,12 @@ describe("issue #1742 finalize record: runner write and retirement", () => {
     assert.equal(durable[0]?.run_id, claim.run_id);
     assert.equal(durable[0]?.claim_generation, 6);
     assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
-    assert.deepEqual(await finalizeFiles(root, claim.run_id), [], "retired once the terminal journal installed");
-    assert.deepEqual(outbox.listPendingFinalizes(), []);
+    assert.deepEqual(await finalizeFiles(root, claim.run_id), ["finalize-6.json"], "absence alone cannot retire");
+    assert.equal(outbox.hasPendingTerminal(claim.run_id, 6), true);
+    assert.deepEqual(outbox.listPendingFinalizes(), [], "pending terminal suppresses finalize offering");
   });
 
-  it("retires it after an unjournaled terminal send when the journal could not be installed", async () => {
+  it("retains it after an unjournaled terminal send without positive absent-journal authority", async () => {
     const root = tmpRoot();
     let failTerminal = false;
     const rawWrite: RawWriteSeam = async (write, ctx) => {
@@ -383,8 +401,8 @@ describe("issue #1742 finalize record: runner write and retirement", () => {
     await runner(new StubExecutor(nullLogger()), gitlab, undefined, { outbox, ...RUNNER_OPTS }).execute(claim);
     assert.equal(failTerminal, true, "the terminal journal write was refused");
     assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
-    assert.deepEqual(await finalizeFiles(root, claim.run_id), []);
-    assert.deepEqual(outbox.listPendingFinalizes(), []);
+    assert.deepEqual(await finalizeFiles(root, claim.run_id), ["finalize-2.json"]);
+    assert.deepEqual(outbox.listPendingFinalizes(), [{ run_id: claim.run_id, claim_generation: 2 }]);
   });
 
   it("a crash before the record is durable leaves no record and no register snapshot", async () => {

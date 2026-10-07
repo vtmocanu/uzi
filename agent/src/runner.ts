@@ -3880,8 +3880,9 @@ export class RunRunner {
     try {
       const state = await this.recovery.inventoryCleanupState(runId, generation);
       if (state === "acknowledged") return false;
-      if (state !== "legacy") return true;
-      if (this.client.knowsInventoryGuardedClaim?.(runId, generation) === true) return true;
+      if (state === "absent" || state === "pending" || this.client.knowsInventoryGuardedClaim?.(runId, generation) === true) {
+        return !(await this.client.hasRecoveryRetirementAuthority(runId, generation, state === "absent" ? "absent" : "pending"));
+      }
       if (this.client.hasFeature("recovery_inventory_v1")) {
         return (await this.client.listRecoveryHolds(runId)).holds.some(h => h.generation === generation && h.inventory_guarded === true);
       }

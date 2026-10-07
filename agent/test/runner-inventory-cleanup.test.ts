@@ -1,9 +1,12 @@
 import { it } from "node:test";
+import { WorkerClient } from "../src/client.js";
+import { nullLogger, makeClaim } from "./helpers.js";
+import { Outbox } from "../src/outbox.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import type { RecoveryCoordinator } from "../src/recovery.js";
-import type { TerminalOutboxDeps } from "../src/terminal-resolve.js";
+import { resolvePendingTerminal, type TerminalOutboxDeps } from "../src/terminal-resolve.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 
 installHarness();
@@ -66,12 +69,130 @@ for (const damage of ["mac", "unreadable", "malformed-guard", "dangling-dir", "l
     } as unknown as TerminalOutboxDeps["outbox"];
     await internals.terminalDeps().outbox.retireTerminal(runId, generation);
     await internals.retireFinalizeRecord({ runId, claimGeneration: generation }, "regression");
-    const expected = damage === "legacy" || damage === "empty" ? 1 : 0;
+    const expected = damage === "legacy" ? 1 : 0;
     assert.equal(terminalRetires, expected, "terminal cleanup needs checked authority");
     assert.equal(finalizeRetires, expected, "finalize cleanup needs checked authority");
     assert.equal(holdReads, 0, "feature loss never requires unsupported hold reads");
   });
 }
+
+it("authenticated pre-generation legacy journal preserves legacy retirement", async () => {
+  const { gitlab } = fakeGitlab();
+  const r = runner({ run: async () => ({ branch: "task" }) }, gitlab, "journal-key");
+  const internals = r as unknown as { recovery: RecoveryCoordinator };
+  await internals.recovery.pin({ runId: "legacy-run", kind: "issue", branch: "task", sourceSha: "a".repeat(40) });
+  client.clearFeatures();
+  assert.equal(await r.recoveryInventoryPending("legacy-run", 7), false);
+});
+
+for (const scenario of ["discarded", "released", "absent-released", "absent-legacy", "absent-unknown",
+  "absent-unavailable", "mac-discarded", "unreadable-discarded"] as const) {
+  it(`fresh WorkerClient normal retirement authority ${scenario}`, async t => {
+    const { gitlab } = fakeGitlab();
+    const r = runner({ run: async () => ({ branch: "task" }) }, gitlab, "journal-key");
+    const internals = r as unknown as {
+      client: WorkerClient; recovery: RecoveryCoordinator; outbox: TerminalOutboxDeps["outbox"];
+      terminalDeps(): TerminalOutboxDeps;
+      retireFinalizeRecord(flight: { runId: string; claimGeneration: number }, site: string): Promise<void>;
+    };
+    const runId = "11111111-1111-4111-8111-111111111111", generation = 7;
+    const workerId = "22222222-2222-4222-8222-222222222222";
+    const absent = scenario.startsWith("absent-");
+    let journal: string | undefined;
+    let original: string | undefined;
+    if (!absent) {
+      const record = await internals.recovery.pin({
+        runId, generation, kind: "issue", branch: "task", sourceSha: "a".repeat(40), inventoryGuarded: true,
+      });
+      assert.ok(record);
+      journal = path.join(git.recoveryRoot, runId, record.captureId + ".json");
+      if (scenario === "mac-discarded") {
+        const raw = JSON.parse(fs.readFileSync(journal, "utf8"));
+        raw.mac = "0".repeat(64);
+        fs.writeFileSync(journal, JSON.stringify(raw));
+      }
+      if (scenario === "unreadable-discarded") { fs.unlinkSync(journal); fs.mkdirSync(journal); }
+      else original = fs.readFileSync(journal, "utf8");
+    }
+    let custodyReads = 0;
+    t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/register")) return Response.json({
+        worker_id: workerId, protocol_features: scenario === "absent-legacy" ? [] : ["terminal_rejection_report"],
+      });
+      if (url.endsWith("/ownership")) {
+        if (scenario === "absent-unavailable") throw new Error("unavailable");
+        return Response.json({ status: "completed", claim_generation: generation,
+          ...(scenario === "absent-legacy" ? { inventory_guarded: false } :
+            scenario === "absent-unknown" ? {} : { inventory_guarded: true }) });
+      }
+      custodyReads++;
+      return Response.json({
+        run_id: runId, worker_id: workerId, generation,
+        exact_holds: [{ id: "33333333-3333-4333-8333-333333333333", state: scenario.includes("released") ? "released" : "discarded" }],
+        sibling_holds: [], exact_count: 1, sibling_count: 0, exact_complete: true, sibling_complete: true,
+        complete: true, outcome: "settled",
+      });
+    });
+    // Replace the transport itself, not just the coordinator: no process claim memory survives.
+    internals.client = new WorkerClient("http://retirement.test", "join-token", "test", nullLogger());
+    await internals.client.register("test");
+    let terminalRetires = 0, finalizeRetires = 0;
+    internals.outbox = {
+      isDisabled: () => false, retireTerminal: async () => { terminalRetires++; },
+      retireFinalize: async () => { finalizeRetires++; },
+    } as unknown as TerminalOutboxDeps["outbox"];
+    await internals.terminalDeps().outbox.retireTerminal(runId, generation);
+    await internals.retireFinalizeRecord({ runId, claimGeneration: generation }, "M1 regression");
+    const expected = ["discarded", "absent-released", "absent-legacy"].includes(scenario) ? 1 : 0;
+    assert.equal(terminalRetires, expected);
+    assert.equal(finalizeRetires, expected);
+    if (scenario === "mac-discarded" || scenario === "unreadable-discarded" || scenario === "absent-legacy") {
+      assert.equal(custodyReads, 0);
+    }
+    if (journal && original) assert.equal(fs.readFileSync(journal, "utf8"), original, "observation cannot mutate recovery journal");
+  });
+}
+
+it("stale terminal supersession preserves guarded recovery and finalize custody", async t => {
+  const { gitlab } = fakeGitlab();
+  const r = runner({ run: async () => ({ branch: "task" }) }, gitlab, "journal-key");
+  const internals = r as unknown as {
+    client: WorkerClient; recovery: RecoveryCoordinator; outbox: Outbox; terminalDeps(): TerminalOutboxDeps;
+    retireFinalizeRecord(flight: { runId: string; claimGeneration: number }, site: string): Promise<void>;
+  };
+  const runId = "11111111-1111-4111-8111-111111111111", generation = 7;
+  t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+    if (String(input).endsWith("/register")) return Response.json({
+      worker_id: "22222222-2222-4222-8222-222222222222", protocol_features: ["recovery_inventory_v1"],
+    });
+    if (String(input).endsWith("/runs/claim")) return Response.json({
+      ...makeClaim(), run_id: runId, claim_generation: generation, inventory_guarded: true,
+    });
+    return Response.json({ status: "completed", claim_generation: generation });
+  });
+  internals.client = new WorkerClient("http://retirement.test", "join-token", "test", nullLogger());
+  await internals.client.register("test");
+  await internals.client.claimRun();
+  const record = await internals.recovery.pin({
+    runId, generation, kind: "issue", branch: "task", sourceSha: "a".repeat(40), inventoryGuarded: true,
+  });
+  assert.ok(record);
+  const journal = path.join(git.recoveryRoot, runId, record.captureId + ".json");
+  const before = fs.readFileSync(journal, "utf8");
+  internals.outbox = new Outbox({ root: path.join(fx.dataDir, "stale-outbox"), log: nullLogger(),
+    runMaxBytes: 1e6, maxBytes: 1e7, retentionMs: 1 });
+  await internals.outbox.init();
+  await internals.outbox.journalTerminal(runId, generation, "running", 0, { status: "completed" });
+  await internals.outbox.journalFinalize(runId, generation);
+  await resolvePendingTerminal(internals.terminalDeps(), { runId, claimGeneration: generation,
+    send: async () => ({ applied: false, staleClaim: true, status: "completed" }), signal: new AbortController().signal });
+  assert.equal(internals.outbox.hasPendingTerminal(runId, generation), false);
+  assert.equal(internals.client.knowsInventoryGuardedClaim(runId, generation), true);
+  await internals.retireFinalizeRecord({ runId, claimGeneration: generation }, "stale regression");
+  assert.deepEqual(internals.outbox.listPendingFinalizes(), [{ run_id: runId, claim_generation: generation }]);
+  assert.equal(fs.readFileSync(journal, "utf8"), before);
+});
 
 for (const sibling of ["none", "unreadable", "uncovered"] as const) {
   it(`inventory cleanup authority FINAL ACK ${sibling}`, async () => {

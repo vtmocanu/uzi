@@ -2027,8 +2027,10 @@ export class RecoveryCoordinator {
   }
 
   /** Cleanup authority requires a complete authenticated physical journal, unlike inspect. */
-  async inventoryCleanupState(runId: string, generation: number): Promise<"legacy" | "pending" | "acknowledged"> {
-    return this.cleanupStateOf(await this.checkedRecords(runId), generation);
+  async inventoryCleanupState(runId: string, generation: number): Promise<"absent" | "legacy" | "pending" | "acknowledged"> {
+    const records = await this.checkedRecords(runId);
+    if (!records.some(r => r.generation === generation || r.generation === undefined)) return "absent";
+    return this.cleanupStateOf(records, generation);
   }
 
   /** Earlier generations whose own covering FINAL is acknowledged (cleanupStateOf says so): their

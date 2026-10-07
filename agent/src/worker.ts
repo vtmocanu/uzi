@@ -287,12 +287,13 @@ export class Worker {
         });
         // Issue #1742: a crash between installing G's terminal journal and retiring G's finalize
         // record leaves both files. Once the journal is settled (no longer pending), the finalize
-        // record for the run at generation <= G is obsolete, so retire it or it blocks the retention
-        // sweep. A journal left listed (blocked, transient blip) keeps its finalize record.
+        // records at generation <= G can retire only after each generation passes its own custody
+        // check. A journal left listed (blocked, transient blip) keeps its finalize record.
         const stillPending = outbox
           .listPendingTerminals()
           .some((p) => p.run_id === entry.run_id && p.claim_generation === gen);
-        if (!stillPending && !(await this.runner.recoveryInventoryPending?.(entry.run_id, gen))) await outbox.retireFinalizesThrough(entry.run_id, gen);
+        if (!stillPending) await outbox.retireFinalizesThrough(entry.run_id, gen,
+          async (runId, generation) => !(await this.runner.recoveryInventoryPending?.(runId, generation)));
       } catch (err) {
         this.log.warn("outbox: boot terminal resolve failed for a run; leaving it listed for a later resolve", {
           run_id: entry.run_id,
@@ -437,7 +438,8 @@ export class Worker {
       const stillPending = outbox
         .listPendingTerminals()
         .some((p) => p.run_id === runId && p.claim_generation === gen);
-      if (!stillPending && !(await this.runner.recoveryInventoryPending?.(runId, gen))) await outbox.retireFinalizesThrough(runId, gen);
+      if (!stillPending) await outbox.retireFinalizesThrough(runId, gen,
+        async (id, generation) => !(await this.runner.recoveryInventoryPending?.(id, generation)));
     } catch (err) {
       this.log.warn("outbox: live terminal resolve failed for a run; leaving it listed for a later resolve", {
         run_id: runId,
@@ -615,16 +617,13 @@ export class Worker {
         this.dindMaintenance?.register(res.register_nonce, this.client.hasFeature("dind_maintenance_v1"));
         onRegistered(res.worker_id);
         // Issue #1742: the api accepted this register, so retire the offered finalize records
-        // (`sentFinalizes`, what the snapshot carried) and any lower-generation records of the same
-        // offered runs. A failed register never reaches here. A
+        // (`sentFinalizes`, what the snapshot carried) and lower-generation records only after each
+        // exact generation passes its custody check. A failed register never reaches here. A
         // retire failure must not turn an accepted register into a retry loop.
         if (sentFinalizes.length > 0) {
           try {
-            const releasable = [];
-            for (const entry of sentFinalizes) {
-              if (!(await this.runner.recoveryInventoryPending?.(entry.run_id, entry.claim_generation))) releasable.push(entry);
-            }
-            await this.outbox?.retireFinalizes(releasable);
+            await this.outbox?.retireFinalizes(sentFinalizes,
+              async (runId, generation) => !(await this.runner.recoveryInventoryPending?.(runId, generation)));
           } catch (err) {
             this.log.warn("register finalize snapshot: retiring the offered records failed", {
               error: errMessage(err),

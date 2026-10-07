@@ -29,6 +29,29 @@ async function rig() {
 const applied = (status = "completed"): StateAck => ({ applied: true, status });
 
 describe("Worker heartbeat terminal sweep (issue #1512)", () => {
+  it("live G2 terminal retirement preserves guarded pending G1 finalize", async () => {
+    const outbox = await rig();
+    let beats = 0;
+    const checked: number[] = [];
+    const w = startSweepWorker({
+      outbox, client: sweepClient({ heartbeat: async () => { beats++; }, reportState: async () => applied() }),
+      runner: { recoveryInventoryPending: async (_runId, generation) => {
+        checked.push(generation);
+        return generation === 1;
+      } },
+    });
+    try {
+      await pollUntil(() => beats >= 3, 3000, "boot completed");
+      await outbox.journalFinalize(RUN, 1);
+      await outbox.journalFinalize(RUN, 2);
+      await outbox.journalTerminal(RUN, 2, "running", 0, { status: "completed" });
+      await pollUntil(() => checked.includes(1) && !outbox.hasPendingTerminal(RUN, 2) &&
+        outbox.listPendingFinalizes().some(e => e.claim_generation === 1), 3000, "exact retirements completed");
+    } finally { await w.stop(); }
+    assert.deepEqual(checked.sort(), [1, 2]);
+    assert.deepEqual(outbox.listPendingFinalizes(), [{ run_id: RUN, claim_generation: 1 }]);
+  });
+
   it("2. a no-spill `completed` journal whose boot send failed is delivered by a later heartbeat", async () => {
     const outbox = await rig();
     await outbox.journalTerminal(RUN, 3, "running", 0, { status: "completed", branch: "agent/issue-1" });

@@ -1690,19 +1690,22 @@ export class Outbox {
   }
 
   /** Issue #1742: retire the given records AND every lower-generation record of the same run (a
-   *  register offers only a run's highest generation, and a lower one is superseded by it). One
-   *  failure never blocks the rest (retireFinalize swallows its own unlink errors). */
-  async retireFinalizes(entries: readonly PendingFinalize[]): Promise<void> {
-    for (const e of entries) await this.retireFinalizesThrough(e.run_id, e.claim_generation);
+   *  register offers only a run's highest generation). mayRetire must authorize
+   *  each exact generation independently; a newer settled generation cannot authorize an older one. */
+  async retireFinalizes(entries: readonly PendingFinalize[], mayRetire: (runId: string, generation: number) => Promise<boolean>): Promise<void> {
+    for (const e of entries) await this.retireFinalizesThrough(e.run_id, e.claim_generation, mayRetire);
   }
 
   /** Issue #1742: retire the run's finalize records at generation <= `claimGeneration`. Records at a
    *  higher generation (a live flight's) are untouched. */
-  async retireFinalizesThrough(runId: string, claimGeneration: number): Promise<void> {
+  async retireFinalizesThrough(runId: string, claimGeneration: number, mayRetire: (runId: string, generation: number) => Promise<boolean>): Promise<void> {
     if (this.disabled) return;
     const gens = new Set<number>([claimGeneration]);
     for (const g of this.runs.get(runId)?.finalizes.keys() ?? []) if (g <= claimGeneration) gens.add(g);
-    for (const g of gens) await this.retireFinalize(runId, g);
+    // The snapshot of stored generations bounds attempts; a refused generation does not
+    // block siblings. A thrown check stops the batch fail closed. Check each exact generation
+    // before its exact retireFinalize call.
+    for (const g of gens) if (await mayRetire(runId, g)) await this.retireFinalize(runId, g);
   }
 
   /** Get an existing in-memory run entry, or create one WITHOUT writing a manifest to disk — a run
