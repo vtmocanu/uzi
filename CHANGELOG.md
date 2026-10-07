@@ -35,7 +35,7 @@ through `[0.52.0]`.)
 ### Changed
 
 - **Ephemeral workers default to M, with chart-configurable sizing ([#2412](https://github.com/vtmocanu/uzi/issues/2412)).**
-  New ephemeral workers reserve 8Gi instead of 14Gi by default; operators can select S, M or L through `workers.ephemeralDefaultSize`. M now matches the earlier L preset: 1/4 CPU, 8Gi/12Gi memory and 25Gi persistent data; ephemeral data retains its separate 20Gi default. Persistent provisioning still preselects L; existing workers keep their stored size and existing M workers receive the CPU changes on their next controller roll, while existing 10Gi data PVCs stay at that size until reprovisioned.
+  New ephemeral workers reserve 8Gi instead of 14Gi by default; operators can select S, M or L through `workers.ephemeralDefaultSize`. M now matches the earlier L preset: 1/4 CPU, 8Gi/12Gi memory and 25Gi persistent data; ephemeral data retains its separate 20Gi default. Persistent provisioning still preselects L; existing workers keep their stored size and existing M workers receive the CPU changes on their next controller roll, while existing 10Gi data PVCs stay at that size until reprovisioned. Upgrade note: an `UZI_EPHEMERAL_DEFAULT_SIZE` set under `api.config` or `api.secretEnv` now fails the render; move it to `workers.ephemeralDefaultSize`.
 
 ## [0.86.0] - 2026-10-06
 

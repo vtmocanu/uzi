@@ -83,14 +83,15 @@ metadata:
   requests.* key is counted but never enforced: a pod declaring nothing for it is
   admitted and contributes zero.
 
-  CPU and memory track the DEFAULT size, now `l` (ADR-2240): 20 workers x 1 CPU
+  CPU and memory track the LARGEST size, `l` (the persistent default, ADR-2240;
+  ephemeral workers default to the smaller `m`, #2412): 20 workers x 1 CPU
   = 20 CPU and 20 x 14Gi = 280Gi requested. Keep requests aligned with deployments
   x the default request, or admission caps the fleet below deployments (issue #1341).
   ResourceQuotas are ceilings, not node-capacity reservations. STORAGE tracks `l`
   too: 20 x (25Gi data + 20Gi nix) = 900Gi of PVC. Requests follow render.go. The rendered-fleet regression
   checks CPU, memory and per-container LimitRange maxima.
 
-  The data term is `l`'s 25Gi, not `m`'s 10Gi, and the nix term is 20Gi, not the 4Gi
+  The data term is 25Gi (`l`, and `m` since #2412), and the nix term is 20Gi, not the 4Gi
   this comment carried until issue #224. Nothing scopes a size to a tier, so any of
   these 20 workers may be an `l`; sizing on `m` capped the tier at 15 of the 20 it
   advertises, and PRD #87's nixSize bump was never followed here at all. The

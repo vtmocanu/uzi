@@ -83,6 +83,10 @@ check() {
     echo "BROKEN: UZI_EPHEMERAL_LEASE was absent from the render for case '$_label'" >&2
     exit 2
   fi
+  if [ -z "$_got" ]; then
+    echo "BROKEN ($_label): render emitted no UZI_EPHEMERAL_DEFAULT_SIZE" >&2
+    exit 2
+  fi
   if [ "$_got" != "$_want" ]; then
     echo "FAIL ($_label): UZI_EPHEMERAL_LEASE is '$_got', expected '$_want'" >&2
     fail=1
@@ -122,13 +126,13 @@ check_size() {
 check_size "default size" "m"
 check_size "explicit small" "s" --set workers.ephemeralDefaultSize=s
 check_size "explicit large" "l" --set workers.ephemeralDefaultSize=l
-check_size "direct size overrides envFrom" "m" --set api.config.UZI_EPHEMERAL_DEFAULT_SIZE=l
+check_size "null secretEnv" "m" --set api.secretEnv=null
 for invalid in unknown M null ''; do
   if helm template uzi "$CHART" --set "workers.ephemeralDefaultSize=$invalid" > "$WORK/invalid.yaml" 2> "$WORK/invalid.err"; then
     echo "FAIL: invalid ephemeral size '$invalid' rendered successfully" >&2
     exit 1
   fi
-  if ! grep -F 'workers.ephemeralDefaultSize must be one of s, m, l' "$WORK/invalid.err"; then
+  if ! grep -qF 'workers.ephemeralDefaultSize must be one of s, m, l' "$WORK/invalid.err"; then
     echo "BROKEN: render failed without the expected size validation diagnostic" >&2
     exit 2
   fi
@@ -137,5 +141,10 @@ if helm template uzi "$CHART" --set api.secretEnv.UZI_EPHEMERAL_DEFAULT_SIZE=ano
   echo "FAIL: secretEnv duplicated the chart-owned ephemeral size" >&2
   exit 1
 fi
-grep -F 'Set UZI_EPHEMERAL_DEFAULT_SIZE through workers.ephemeralDefaultSize, not api.secretEnv' "$WORK/duplicate.err" || exit 2
-echo "OK: ephemeral size defaults to m, accepts s/l, overrides envFrom and rejects invalid or duplicate direct entries"
+grep -qF 'Set UZI_EPHEMERAL_DEFAULT_SIZE through workers.ephemeralDefaultSize, not api.secretEnv' "$WORK/duplicate.err" || exit 2
+if helm template uzi "$CHART" --set api.config.UZI_EPHEMERAL_DEFAULT_SIZE=l > "$WORK/config.yaml" 2> "$WORK/config.err"; then
+  echo "FAIL: api.config set the chart-owned ephemeral size (it would be silently overridden)" >&2
+  exit 1
+fi
+grep -qF 'Set UZI_EPHEMERAL_DEFAULT_SIZE through workers.ephemeralDefaultSize, not api.config' "$WORK/config.err" || exit 2
+echo "OK: ephemeral size defaults to m, accepts s/l, tolerates null secretEnv and rejects invalid values and api.config/secretEnv duplicates"

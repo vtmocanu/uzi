@@ -6,8 +6,11 @@
 {{- if not (has $ephemeralDefaultSize (list "s" "m" "l")) }}
 {{- fail "workers.ephemeralDefaultSize must be one of s, m, l" }}
 {{- end }}
-{{- if hasKey .Values.api.secretEnv "UZI_EPHEMERAL_DEFAULT_SIZE" }}
+{{- if hasKey (.Values.api.secretEnv | default dict) "UZI_EPHEMERAL_DEFAULT_SIZE" }}
 {{- fail "Set UZI_EPHEMERAL_DEFAULT_SIZE through workers.ephemeralDefaultSize, not api.secretEnv" }}
+{{- end }}
+{{- if hasKey (.Values.api.config | default dict) "UZI_EPHEMERAL_DEFAULT_SIZE" }}
+{{- fail "Set UZI_EPHEMERAL_DEFAULT_SIZE through workers.ephemeralDefaultSize, not api.config (the chart value now overrides it)" }}
 {{- end }}
 apiVersion: apps/v1
 kind: Deployment

@@ -708,8 +708,8 @@ workers:
   # worker's CPU/memory still follow its preset (the api's UZI_EPHEMERAL_DEFAULT_SIZE
   # unless the run asks for one), but /data does not, because a run-bound worker holds
   # one clone for one run and its disk need tracks the repository, not the size. So an
-  # ephemeral `s` or `m` worker gets MORE than its preset's /data (5Gi / 10Gi → 20Gi)
-  # and an ephemeral `l` worker gets 20Gi, NOT l's 25Gi. Persistent workers are
+  # ephemeral `s` worker gets MORE than its preset's /data (5Gi → 20Gi) and an
+  # ephemeral `m` or `l` worker gets 20Gi, NOT their 25Gi. Persistent workers are
   # untouched. Motivation: on 2026-09-27 an ephemeral `m` worker (10Gi /data) running a
   # uzi-on-uzi issue run hit 95% during `task gate:api` (Go build cache ~6.6G + module
   # cache ~1.9G).
@@ -766,7 +766,8 @@ workers:
   # Namespace ResourceQuota (Decision 8). Defense in depth under the api's per-user
   # quota: an app-level bug must not noisy-neighbour a shared cluster.
   #
-  # CPU and memory track the DEFAULT size, now `l` (ADR-2240): 20 workers x 1 CPU
+  # CPU and memory track the LARGEST size, `l` (the persistent default, ADR-2240;
+  # ephemeral workers default to the smaller `m`, #2412): 20 workers x 1 CPU
   # = 20 CPU and 20 x 14Gi = 280Gi requested. Keep these ceilings aligned with
   # deployments x the default request, or admission caps the fleet below deployments
   # (issue #1341). ResourceQuotas are ceilings, not node-capacity reservations.
@@ -953,7 +954,8 @@ workers:
     # ephemeral storage.
     #
     # Sized for the 10 workers deployments advertises. CPU and memory track the
-    # DEFAULT size, now `l` (ADR-2240), plus all sidecars from render.go/render_dind.go.
+    # LARGEST size, `l` (persistent default, ADR-2240; ephemeral default `m`, #2412),
+    # plus all sidecars from render.go/render_dind.go.
     # Ten rendered pods need 13.1 CPU / about 143Gi (14640Mi each), rounded to 14 CPU / 144Gi.
     # Keep requests aligned with the rendered fleet, including sidecar overrides,
     # or admission caps it below deployments
@@ -1139,7 +1141,8 @@ workers:
       node: []
     # The lane's own ResourceQuota and LimitRange, the restricted tier's shape. Lane
     # workers are run-bound (one run, then removed). CPU and memory ceilings cover
-    # ten DEFAULT `l` workers from render.go (ADR-2240): 10 x 1 CPU / 14Gi = 10 CPU / 140Gi.
+    # ten worst-case `l` workers from render.go (the ephemeral default is the smaller
+    # `m`, #2412, but a run may ask for `l`): 10 x 1 CPU / 14Gi = 10 CPU / 140Gi.
     # The quota is a ceiling, not a reservation of node capacity.
     quota:
       enabled: true
