@@ -26,6 +26,7 @@ import (
 // ── Fakes ────────────────────────────────────────────────────────────────────
 
 type fakeStore struct {
+	store.Queries
 	inFlight      int64
 	inFlightErr   error
 	capacityCalls int
@@ -549,6 +550,10 @@ func (f *fakeForge) GetMergeRequest(_ context.Context, _ int64, mrIID int64) (fo
 type fakeBuilder struct {
 	f   *fakeForge
 	err error
+}
+
+func (b *fakeBuilder) SetIssueLabel(context.Context, forge.Forge, int64, store.Issue, string, string, bool) (store.Issue, error) {
+	panic("unexpected label removal")
 }
 
 func (b *fakeBuilder) ForgeForConnection(string, string, []byte) (forge.Forge, error) {

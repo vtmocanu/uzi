@@ -9,6 +9,8 @@ import type {
   RunMessage,
   Schedule,
   ScheduleInput,
+  RunNowResponse,
+  LastFireStarted,
   Worker,
   AdminWorker,
   User,
@@ -77,6 +79,8 @@ import messageZero from "../../../fixtures/api-contract/message.zero.json";
 import messageFull from "../../../fixtures/api-contract/message.full.json";
 import scheduleZero from "../../../fixtures/api-contract/schedule.zero.json";
 import scheduleFull from "../../../fixtures/api-contract/schedule.full.json";
+import scheduleRunNowZero from "../../../fixtures/api-contract/schedule_run_now.zero.json";
+import scheduleRunNowFull from "../../../fixtures/api-contract/schedule_run_now.full.json";
 import scheduleInputZero from "../../../fixtures/api-contract/schedule_input.zero.json";
 import scheduleInputFull from "../../../fixtures/api-contract/schedule_input.full.json";
 import workerZero from "../../../fixtures/api-contract/worker.zero.json";
@@ -445,6 +449,21 @@ void _buildInfoFull;
   void _scheduleFull;
 }
 
+// runNowResponse in api/internal/handler/schedules.go allocates run_ids, started,
+// and skips with make(..., 0, n), so the wire always carries arrays. Only the
+// unmapped Go zero fixture has nil slices and needs these ZeroOf exemptions.
+{
+  const missing: never = null as unknown as Exclude<keyof RunNowResponse, keyof typeof scheduleRunNowFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof scheduleRunNowFull, keyof RunNowResponse>;
+  const zero: ZeroOf<RunNowResponse, "run_ids" | "started" | "skips"> = scheduleRunNowZero;
+  const full: Widen<RunNowResponse> = scheduleRunNowFull;
+  const startedMissing: never = null as unknown as Exclude<keyof LastFireStarted, keyof typeof scheduleRunNowFull.started[number]>;
+  const startedExtra: never = null as unknown as Exclude<keyof typeof scheduleRunNowFull.started[number], keyof LastFireStarted>;
+  const persistedMissing: never = null as unknown as Exclude<keyof LastFireStarted, keyof typeof scheduleFull.last_fire.started[number]>;
+  const persistedExtra: never = null as unknown as Exclude<keyof typeof scheduleFull.last_fire.started[number], keyof LastFireStarted>;
+  void [missing, extra, zero, full, startedMissing, startedExtra, persistedMissing, persistedExtra];
+}
+
 // ── ScheduleInput (M2, a REQUEST body) ──────────────────────────────────────
 // The contract that bites here is the Go half's DisallowUnknownFields round-trip (a
 // TS key the Go struct lacks is a runtime 400). For the zero-nullability check the
@@ -460,7 +479,7 @@ void _buildInfoFull;
   const _scheduleInputZero: ZeroOf<
     Omit<
       ScheduleInput,
-      "labels" | "auto_approve" | "wait_on_limit" | "enabled" | "override_subagent_model" | "sibling_group_id" | "capacity_limit" | "capacity_room_needed"
+      "labels" | "auto_approve" | "wait_on_limit" | "enabled" | "override_subagent_model" | "sibling_group_id" | "capacity_limit" | "capacity_room_needed" | "remove_label_on_dispatch"
     >
   > = scheduleInputZero;
   const _scheduleInputFull: Widen<ScheduleInput> = scheduleInputFull;
@@ -1264,6 +1283,7 @@ const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "message", nullable: true },
   { stem: "schedule", nullable: true },
   { stem: "schedule_input", nullable: true },
+  { stem: "schedule_run_now", nullable: true },
   { stem: "worker", nullable: true },
   { stem: "admin_worker", nullable: true },
   { stem: "user", nullable: true },
@@ -1416,6 +1436,16 @@ describe("worker custody decision contract", () => {
     expect(workerZero).not.toHaveProperty("custody_decisions_needed");
     expect(adminWorkerZero).not.toHaveProperty("custody_decisions_needed");
   });
+});
+
+it("records removal flags and selector snapshots in both fire responses", () => {
+  expect(scheduleZero.remove_label_on_dispatch).toBe(false);
+  expect(scheduleFull.remove_label_on_dispatch).toBe(true);
+  expect(scheduleInputFull.remove_label_on_dispatch).toBe(true);
+  expect(scheduleInputZero).not.toHaveProperty("remove_label_on_dispatch");
+  for (const started of [scheduleFull.last_fire.started[0], scheduleRunNowFull.started[0]]) {
+    expect(started).toMatchObject({ selector_label: "x", label_removed: true, label_remove_failed: true });
+  }
 });
 
 

@@ -17,6 +17,7 @@ import (
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/schedsvc"
+	"github.com/vtmocanu/uzi/api/internal/schedtmpl"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -64,6 +65,10 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 
 	m, status, msg := validateScheduleConfig(req, h.clock(), false)
 	if status != 0 {
+		httpx.Error(w, status, msg)
+		return
+	}
+	if status, msg := h.validateScheduleRemoval(r.Context(), m, schedtmpl.SelectorLabel); status != 0 {
 		httpx.Error(w, status, msg)
 		return
 	}
@@ -120,6 +125,7 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 		Guidance:                   guidanceColumn(m),
 		Model:                      modelColumn(m),
 		OutputMode:                 outputModeColumn(m),
+		RemoveLabelOnDispatch:      m.RemoveLabelOnDispatch != nil && *m.RemoveLabelOnDispatch,
 		OverrideSubagentModel:      overrideSubagentModelColumn(m),
 		SiblingGroupID:             siblingGroup,
 		Harness:                    harnessCols.value,
@@ -226,6 +232,10 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, status, msg)
 			return
 		}
+		if status, msg := h.validateScheduleRemoval(r.Context(), m, schedtmpl.SelectorLabel); status != 0 {
+			httpx.Error(w, status, msg)
+			return
+		}
 		nextFire, err := nextFireFor(m, h.clock())
 		if err != nil {
 			httpx.Error(w, http.StatusBadRequest, "could not compute the next fire time")
@@ -280,6 +290,7 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 			Guidance:                   guidanceColumn(m),
 			Model:                      modelColumn(m),
 			OutputMode:                 outputModeColumn(m),
+			RemoveLabelOnDispatch:      m.RemoveLabelOnDispatch != nil && *m.RemoveLabelOnDispatch,
 			OverrideSubagentModel:      overrideSubagentModelColumn(m),
 			Harness:                    harness,
 			CredentialOverrideMode:     credMode,
@@ -430,9 +441,13 @@ func runNowResponse(out schedsvc.FireOutcome) apitypes.RunNowResponse {
 		id := s.RunID.String()
 		runIDs = append(runIDs, id)
 		started = append(started, apitypes.LastFireStarted{
-			IssueIID: s.IssueIID,
-			RunID:    id,
-			Title:    s.Title,
+			LabelRemoved:      s.LabelRemoved,
+			LabelRemoveFailed: s.LabelRemoveFailed,
+			SelectorLabel:     s.SelectorLabel,
+			WebURL:            s.WebURL,
+			IssueIID:          s.IssueIID,
+			RunID:             id,
+			Title:             s.Title,
 		})
 	}
 	skips := make([]apitypes.LastFireSkip, 0, len(out.Skips))

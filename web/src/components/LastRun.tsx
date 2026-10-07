@@ -11,8 +11,15 @@ import { Badge, type BadgeTone, cx } from "./ui";
 import { ChevronDownIcon } from "./icons";
 import { ForgeIssueAnchor } from "./ForgeIssueAnchor";
 import { scheduleSkipReasonLabel } from "../lib/scheduleSkipReasons";
-import type { LastFire, LastFireSkip, Schedule, ScheduleSkipReason } from "../lib/api";
+import type { LastFireStarted, LastFire, LastFireSkip, Schedule, ScheduleSkipReason } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
+
+// Outcomes use the fire-time snapshot, including after the selector has been edited.
+export function labelRemovalOutcome(run: LastFireStarted): string | null {
+  const label = run.selector_label || "label";
+  if (run.label_remove_failed) return `${label} could not be removed (the run started; remove it by hand)`;
+  return run.label_removed ? `${label} removed` : null;
+}
 
 // Skip-reason badge tone, mirroring the mock's semantics: the actionable skips a
 // schedule owner can fix (not eligible, a transient fetch failure) read amber; the
@@ -75,6 +82,9 @@ export function LastRunOutcome({
           ? `space for ${fire.capacity.room} more run${fire.capacity.room === 1 ? "" : "s"}; needs ${fire.capacity.room_needed}`
           : `examined ${fire.matched}`}
       </span>
+      {fire.started.map((run) => labelRemovalOutcome(run) && (
+        <span key={run.run_id} className={cx("text-[11px]", run.label_remove_failed ? "text-warn" : "text-muted")}>{labelRemovalOutcome(run)}</span>
+      ))}
       {/* A DISCLOSURE, not a link (ux-tweaks item 2): it expands the detail row in
           place, so it must not wear the app's link costume (text-info + underline
           promises navigation). Muted text + a chevron is the vocabulary every other
@@ -257,6 +267,7 @@ export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
               <IssueRef issueIID={r.issue_iid} webURL={r.web_url} />
               <div className="min-w-0 flex-1">
                 {r.title && <div className="text-[12.5px] text-muted">{r.title}</div>}
+                {labelRemovalOutcome(r) && <div className={cx("text-[11.5px]", r.label_remove_failed ? "text-warn" : "text-muted")}>{labelRemovalOutcome(r)}</div>}
               </div>
               <Link
                 to={`/runs/${r.run_id}`}

@@ -1474,6 +1474,44 @@ func (q *Queries) ListReposByConnectionForUser(ctx context.Context, arg ListRepo
 	return items, nil
 }
 
+const removeCachedIssueLabel = `-- name: RemoveCachedIssueLabel :one
+UPDATE issues
+SET labels = COALESCE((SELECT jsonb_agg(value ORDER BY ordinal)
+    FROM jsonb_array_elements(labels) WITH ORDINALITY AS item(value, ordinal)
+    WHERE value <> to_jsonb($1::text)), '[]'::jsonb)
+WHERE repo_id = $2 AND forge_issue_iid = $3
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids
+`
+
+type RemoveCachedIssueLabelParams struct {
+	Label         string    `json:"label"`
+	RepoID        uuid.UUID `json:"repo_id"`
+	ForgeIssueIid int64     `json:"forge_issue_iid"`
+}
+
+// Existing cached rows only: remove one label from the current array, preserving
+// concurrent label additions and every non-label column. Array order is retained.
+func (q *Queries) RemoveCachedIssueLabel(ctx context.Context, arg RemoveCachedIssueLabelParams) (Issue, error) {
+	row := q.db.QueryRow(ctx, removeCachedIssueLabel, arg.Label, arg.RepoID, arg.ForgeIssueIid)
+	var i Issue
+	err := row.Scan(
+		&i.ID,
+		&i.RepoID,
+		&i.ForgeIssueIid,
+		&i.Title,
+		&i.State,
+		&i.Labels,
+		&i.WebUrl,
+		&i.Author,
+		&i.HasPrdLink,
+		&i.ForgeUpdatedAt,
+		&i.SyncedAt,
+		&i.BoardPosition,
+		&i.AssigneeIds,
+	)
+	return i, err
+}
+
 const reopenIssueState = `-- name: ReopenIssueState :one
 UPDATE issues
 SET state = 'opened', board_position = NULL, synced_at = now()

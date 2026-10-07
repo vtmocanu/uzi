@@ -122,7 +122,7 @@ func TestCronToPresetCustom(t *testing.T) {
 		"30 2 * 6 *",    // month set
 		"30 2 * * 2",    // Tuesday (not 1, 1-5, or *)
 		"30 2 * * 0,3",  // weekday list
-		"*/15 * * * *",  // minute step, no preset
+		"*/40 * * * *",  // uneven minute step, no preset
 		"0 0 * * 6",     // Saturday
 		"0 */24 * * *",  // interval out of the 1..23 range -> not every_n_hours
 		"5 */6 * * *",   // every_n_hours only fires on minute 0

@@ -64,7 +64,8 @@ func newScheduleResetCmd(env Env, gf *globalFlags) *cobra.Command {
 		Use:   "reset <schedule-id>",
 		Short: "Reset a default schedule's edited fields back to the catalog defaults",
 		Long: "Restore a default-origin schedule's editable fields to the builtin catalog values:\n" +
-			"cron, timezone, model, auto-approve, wait-on-limit, max issues and output mode return\n" +
+			"cron, timezone, model, auto-approve, wait-on-limit, max issues, capacity, selector\n" +
+			"label removal and output mode return\n" +
 			"to the catalog values, apply-model-to-agents is set to false, and MR rework, the\n" +
 			"guidance, the harness pin and the credential override are cleared to inherit. The\n" +
 			"customized flag is cleared and the schedule is re-activated on its catalog cadence\n" +
@@ -268,6 +269,7 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().String("prompt", "", "ad-hoc prompt target: an issue-less repo→MR run (one of --issue/--sweep/--prompt)")
 	create.Flags().StringArray("label", nil, "a label to select for --sweep (repeatable; empty defaults to the uzi label)")
 	create.Flags().Int("max-issues", 10, "issues to send at a time, oldest-first (sweep only)")
+	create.Flags().Bool("remove-label-on-dispatch", false, "remove the selector label after a run starts; pass --remove-label-on-dispatch=false to keep it")
 	create.Flags().Int("capacity-limit", 0, "unfinished runs limit (1..50; requires --room-needed)")
 	create.Flags().Int("room-needed", 0, "room required before sending issues (requires --capacity-limit)")
 	create.Flags().String("guidance", "", "optional owner guidance injected into the run instruction (--issue/--sweep only)")
@@ -441,6 +443,7 @@ func newScheduleEditCmd(env Env, gf *globalFlags) *cobra.Command {
 	edit.Flags().String("harness", "", "change the pinned harness for runs this schedule fires: claude or codex; pass \"\" to clear back to implicit; an unset flag leaves the stored pin unchanged")
 	edit.Flags().String("guidance", "", "change owner guidance injected into the run instruction (issue/sweep targets, or a prompt-target or sweep-target default)")
 	edit.Flags().Int("max-issues", 10, "issues to send at a time, oldest-first (sweep only)")
+	edit.Flags().Bool("remove-label-on-dispatch", false, "set whether the selector label is removed after a run starts")
 	edit.Flags().Int("capacity-limit", 0, "unfinished runs limit (1..50; requires --room-needed)")
 	edit.Flags().Int("room-needed", 0, "room required before sending issues (requires --capacity-limit)")
 	edit.Flags().Bool("clear-capacity", false, "turn off the capacity gate")

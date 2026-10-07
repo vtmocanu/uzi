@@ -839,3 +839,13 @@ WHERE id = @id AND prd_patch_settled_at IS NULL;
 
 -- name: ListEnabledRepoIDs :many
 SELECT id FROM repos WHERE enabled = true;
+
+-- name: RemoveCachedIssueLabel :one
+-- Existing cached rows only: remove one label from the current array, preserving
+-- concurrent label additions and every non-label column. Array order is retained.
+UPDATE issues
+SET labels = COALESCE((SELECT jsonb_agg(value ORDER BY ordinal)
+    FROM jsonb_array_elements(labels) WITH ORDINALITY AS item(value, ordinal)
+    WHERE value <> to_jsonb(@label::text)), '[]'::jsonb)
+WHERE repo_id = @repo_id AND forge_issue_iid = @forge_issue_iid
+RETURNING *;

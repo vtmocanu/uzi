@@ -1,6 +1,6 @@
 # PRD #2344: Remove the sweep label on dispatch, and the on-deck backlog drain
 
-**Status**: Draft (blocked by #2343)
+**Status**: Done — M1 and M2 implemented and verified (#2343 merged as `fc246e2d`)
 **Issue**: [#2344](https://github.com/vtmocanu/uzi/issues/2344) (part of umbrella #2342)
 **Priority**: Medium
 **Design mock**: `prds/mockups/2342-capacity-gated-sweeps-mock.html` (shared with #2343; open it in a browser). This PRD implements the removal toggle and the label-removal last-fire states in frames 1 and 2, the minutes cadence in frame 1, and frame 3.
@@ -43,7 +43,7 @@ Acceptance examples:
 
 ### Outcome, last-fire and run-now contracts
 
-- `Started` gains `LabelRemoved bool` and `LabelRemoveFailed bool`; persisted `last_fire` gains `started[].label_removed` and `started[].label_remove_failed` (omitempty); `handler.runNowResponse` carries both. Mirrors in `apitypes` (`schedule.go`) and `web/src/lib/apiTypes.ts` (`LastFireStarted`, run-now type).
+- `Started` gains `LabelRemoved bool`, `LabelRemoveFailed bool` and an optional `SelectorLabel string` fire-time snapshot; persisted `last_fire` gains `started[].label_removed`, `started[].label_remove_failed` and `started[].selector_label` (omitempty); `handler.runNowResponse` carries all three. Mirrors in `apitypes` (`schedule.go`) and `web/src/lib/apiTypes.ts` (`LastFireStarted`, run-now type). CLI and web history use the snapshot, with generic label wording for legacy records.
 
 ### API
 
@@ -89,15 +89,20 @@ Acceptance examples:
 
 Migration, removal through `forgesvc` (forge then cache), fire-time `uzi` filter, the removal arm of `config_not_supported`, `label_removed`/`label_remove_failed`, validation, default-row edit/clone, CLI flag and render, web toggle and last-fire states, docs plus `docs:sync`.
 
-- Blocked by: #2343 merged
-- Acceptance: examples 1-3 pass with a custom single-label sweep; mock parity for the removal parts of frames 1 and 2.
+- Dependency: #2343 completed in `fc246e2d`.
+- [x] M1 implemented and verified: examples 1-3 pass with a custom single-label sweep; removal parts of mock frames 1 and 2 inspected in Chromium.
+- Evidence: `task gate:api` and `TMPDIR="$PWD/.uzi/scratch" ./e2e/run-store-it.sh` passed (2,207 LiveDB tests, zero skips, including removal and handler cases). `task gate:web` passed (5,612 tests and eight browser tests); `task gate:repo`, `TestEmbeddedDocsMatchSource`, mock build and removal screenshot assertions passed. Required removal mutations failed their intended assertions. Backend, CLI and web commits received read-only reviews; mandatory findings were fixed and re-reviewed.
+- Approved implementation details: the removal-only `RemoveCachedIssueLabel` query filters the current repo/IID-scoped cached row after forge success, preserving unrelated labels and metadata; apply/AutoMove retain their existing paths. Historical label snapshots avoid incorrect text after schedule or catalog edits. Later authoritative sync or same-label re-add remains outside the best-effort guarantee.
 
 ### M2: `ondeck-sweep` default and the minutes cadence
 
 Catalog keys and parse-time validation, `CatalogEntryDTO`, enable/reset persistence of the gate and flag, the `ondeck-sweep` entry, the "Every N minutes" preset (web and Go), Default jobs card, docs plus `docs:sync`.
 
-- Blocked by: M1
-- Acceptance: examples 4 and 5 pass; example 1 passes against an enabled `ondeck-sweep` row in a live-DB test; the card matches mock frame 3.
+- Dependency: M1 completed.
+- [x] M2: examples 4 and 5 pass; example 1 passes against an enabled `ondeck-sweep` row in a live-DB test; cadence control and card match the relevant mock parts.
+- Evidence: `task gate:api` passed. The full `e2e/run-store-it.sh` run passed with 2,208 LiveDB tests and zero skips, including `TestOndeckCatalogEnableRunDrainLiveDB` for enable, drain, edits, exact restoration, reset, stored fire-time controls and repeat enable after a live eligibility-label change. The runner's initial database-readiness failure ran no tests; the retry used `UZI_STORE_IT_PG_WAIT_SECS=240`.
+- Web evidence: the full `task gate:web` passed with 5,648 tests and eight browser tests; shared canonical fixtures prove Go/web minute-preset parity. `task deadcode`, `task gate:repo`, mock build and Chromium screenshot assertions passed. The initial global dead-code run skipped agent Knip; after `cd agent && npm ci`, `task deadcode:agent` executed and passed, closing that coverage gap. The final web gate used `VITEST_MAX_WORKERS=1` after route-import hook timeouts; tests and deadlines were unchanged. A scratch Chromium launcher used a relative scratch temporary path to avoid the Unix-socket path limit while keeping artifacts inside the worktree.
+- Presentation: the On-deck catalog card, all eleven minute choices and `*/40` staying Custom were checked in the rendered mock app and inspected beside reference frames 1 and 3. Standard app cards and select controls preserve the reference behavior; no material mock deviation was necessary. Backend and web fixed commits received read-only review; the repeat-enable defect and the temporary docs-before-web mismatch were resolved and verified.
 
 ## Design mock contract
 

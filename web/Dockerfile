@@ -54,6 +54,9 @@ COPY fixtures/pr-size-line/ /app/fixtures/pr-size-line/
 # Same reason for the grouped findings draft: Findings.test.tsx statically imports
 # `../../../fixtures/finding-group-draft/response.json`, shared with the CLI's draft test.
 COPY fixtures/finding-group-draft/ /app/fixtures/finding-group-draft/
+# Same reason for the shared schedule presets (#2344): schedulePresets.test.ts statically imports
+# `../../../fixtures/schedule-presets/canonical.json`, shared with the Go preset tests.
+COPY fixtures/schedule-presets/ /app/fixtures/schedule-presets/
 RUN npm run build
 
 # --- runtime stage ---

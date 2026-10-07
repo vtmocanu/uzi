@@ -26,7 +26,7 @@ import { browserTimezone } from "../lib/timezone";
 import { JobCatalog, catalogEntryId } from "../components/JobCatalog";
 import type { EnableResult } from "../components/EnableJobDialog";
 import { ScheduleListRow, scheduleNameId } from "../components/ScheduleListRow";
-import { formatStamp } from "../components/LastRun";
+import { formatStamp, labelRemovalOutcome } from "../components/LastRun";
 import { FILTER_ALL_ID, ScheduleFilters } from "../components/ScheduleFilters";
 import {
   NO_FILTER,
@@ -253,10 +253,11 @@ export function Schedules() {
     setError("");
     setNotice("");
     try {
-      const { created } = await api.runScheduleNow(s.id);
+      const { created, started } = await api.runScheduleNow(s.id);
+      const removalOutcomes = (started ?? []).map(labelRemovalOutcome).filter(Boolean);
       setNotice(
         created > 0
-          ? `Started ${created} run${created === 1 ? "" : "s"} from this schedule.`
+          ? `Started ${created} run${created === 1 ? "" : "s"} from this schedule.${removalOutcomes.length ? ` ${removalOutcomes.join("; ")}` : ""}`
           : "Nothing fired — a matching run is already active (skipped by dedup).",
       );
       reload();
