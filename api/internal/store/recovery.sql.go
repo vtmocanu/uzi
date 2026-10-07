@@ -1658,7 +1658,11 @@ WHERE h.id = $6 AND h.run_id = $7 AND h.user_id = $8
   AND h.live_worker_id = $10::uuid AND h.inventory_guarded AND h.state = 'open'
   AND EXISTS (SELECT 1 FROM runs r WHERE r.id = h.run_id AND r.user_id = h.user_id
     AND (r.claim_generation > h.generation OR (r.claim_generation = h.generation AND
-      (r.status IN ('completed', 'failed', 'cancelled') OR r.claim_released_at IS NOT NULL))))
+      (r.status IN ('completed', 'failed', 'cancelled') OR r.claim_released_at IS NOT NULL
+        -- A forge_unreachable pre-clone park keeps its claim; only the worker's settled
+        -- forge_no_output proof (empty inventory) may end that exact generation early.
+        OR (r.status = 'recovery_wait' AND r.recovery_wait_cause = 'forge_unreachable'
+          AND $1::text = 'settled' AND $5::text = 'forge_no_output')))))
   AND (
     ($1::text = 'archive' AND $5::text = 'archive'
       AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.id = $2::uuid

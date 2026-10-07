@@ -271,6 +271,8 @@ export interface RecoveryCoordinatorOptions {
   liveBackoffBaseMs?: number;
   /** issue #1995: the ceiling of the live re-drive's exponential backoff. */
   liveBackoffCapMs?: number;
+  /** Delays between the bounded retries of {@link RecoveryCoordinator.settleUnadoptedGuardedGeneration}. */
+  unadoptedSettleRetryDelaysMs?: readonly number[];
   /** Test seams (never set in production). */
   testHooks?: {
     /** Awaited by {@link RecoveryCoordinator.pin} between its unlocked record observation and
@@ -287,6 +289,11 @@ export interface ResumeLiveOptions {
   authenticatedAtMs: number;
   signal?: AbortSignal;
 }
+
+/** Canonical empty inventory digest from api/internal/recovery/final_inventory.go. */
+const EMPTY_INVENTORY_DIGEST = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+/** Delays before each retry of the unadopted-generation settled release (bounded: len + 1 attempts). */
+const UNADOPTED_SETTLE_RETRY_DELAYS_MS: readonly number[] = [500, 2_000, 8_000];
 
 const LIVE_MAX_PER_PASS = 4;
 const LIVE_BACKOFF_BASE_MS = 30_000;
@@ -592,6 +599,7 @@ export class RecoveryCoordinator {
   private readonly liveBackoffBaseMs: number;
   private readonly liveBackoffCapMs: number;
   private readonly testHooks: RecoveryCoordinatorOptions["testHooks"];
+  private readonly unadoptedSettleRetryDelaysMs: readonly number[];
   /** In-flight passes (the boot sweep, a live pass): {@link resumeLive} is a no-op while non-empty. */
   private readonly passes = new Set<Promise<void>>();
   /** The earliest time the next live pass may run (the coordinator's `now()` clock). */
@@ -618,6 +626,7 @@ export class RecoveryCoordinator {
     this.liveBackoffBaseMs = opts.liveBackoffBaseMs ?? LIVE_BACKOFF_BASE_MS;
     this.liveBackoffCapMs = opts.liveBackoffCapMs ?? LIVE_BACKOFF_CAP_MS;
     this.testHooks = opts.testHooks;
+    this.unadoptedSettleRetryDelaysMs = opts.unadoptedSettleRetryDelaysMs ?? UNADOPTED_SETTLE_RETRY_DELAYS_MS;
     // The MAC key is DERIVED from the (stable) worker join token, so it re-derives
     // identically on restart. A token-less coordinator is disabled.
     this.key = opts.workerToken
@@ -741,8 +750,7 @@ export class RecoveryCoordinator {
       const aggregateRoots = [...new Set([...roots.map(r => r.sha), originalSourceSha])].sort();
       let sourceSha: string, digest: string;
       if (!roots.length && input.settledEvidence) {
-        // Canonical empty inventory digest from api/internal/recovery/final_inventory.go.
-        digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        digest = EMPTY_INVENTORY_DIGEST;
         sourceSha = input.currentSha;
       } else {
         const coverage = await this.git.buildRecoveryCoverage(context.barePath, context, aggregateRoots, input.currentSha);
@@ -781,6 +789,70 @@ export class RecoveryCoordinator {
         return record;
       });
     });
+  }
+
+  /**
+   * issue #1924: settle the EMPTY guarded hold of a generation that adopted no source. A guarded
+   * claim that parked or failed before its clone has no bare, record or pin, so no inventory
+   * freeze ever reaches it, and the api keeps a guarded hold open until a final disposition: it
+   * would count toward the owner's hold limit and block worker deletion forever. This sends the
+   * `settled` final release (empty-inventory digest, `forge_no_output`) for that EXACT generation.
+   *
+   * Fail closed: the release goes out only when "nothing adopted" is positively proven locally:
+   * no journal record (authenticated read) for the generation; the claim repo's bare is either
+   * absent (ENOENT) or verified to hold no owed candidate of this run and no retained clone of
+   * it. Any unreadable, unknown or non-empty answer keeps the hold. The caller must have sent the
+   * park/failure report first: the api refuses the release until the generation has ended. A
+   * refusal or transport failure is retried a bounded number of times (the retry delays), and a
+   * replay after a lost ACK is an idempotent echo. Never throws.
+   */
+  async settleUnadoptedGuardedGeneration(input: {
+    runId: string; generation: number; barePath: string; signal?: AbortSignal;
+  }): Promise<"settled" | "retained"> {
+    const { runId, generation, barePath } = input;
+    if (!this.enabled || !Number.isSafeInteger(generation) || generation <= 0 ||
+        !this.client.hasFeature?.("recovery_inventory_v1")) return "retained";
+    try {
+      if ((await this.checkedRecords(runId)).some(r => r.generation === generation)) return "retained";
+      let bareExists = true;
+      try { await fs.lstat(barePath); }
+      catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") return "retained";
+        bareExists = false;
+      }
+      if (bareExists) {
+        if (!this.git.resolveRecoveryBareDir || !this.git.enumerateOwedCandidates || !this.git.readInventoryCloneHeads ||
+            await this.git.resolveRecoveryBareDir(path.basename(barePath)) !== barePath) return "retained";
+        const owed = await this.git.enumerateOwedCandidates(barePath, runId);
+        if (owed.some(c => c.contexts.some(x => x.runId === runId))) return "retained";
+        const clones = await this.git.readInventoryCloneHeads(barePath, runId);
+        if (clones.kind !== "verified" || clones.clones.length > 0 || clones.heads.length > 0) return "retained";
+      }
+    } catch (err) {
+      this.log.warn("recovery: unadopted-generation proof unavailable; custody retained", { run_id: runId, generation, error: errText(err) });
+      return "retained";
+    }
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const holds = (await this.client.listRecoveryHolds(runId)).holds;
+        const open = holds.filter(h => h.generation === generation && h.inventory_guarded === true);
+        if (open.length === 0) return "settled"; // already closed (a replayed or concurrent settle)
+        if (open.length !== 1) return "retained";
+        const ack = await this.client.releaseRecoveryCustody(runId, generation, "forge_no_output",
+          { kind: "settled", coverage_digest: EMPTY_INVENTORY_DIGEST });
+        if (ack.run_id === runId && ack.generation === generation && ack.released === true &&
+            ack.holds_released === 1 && !ack.retained) return "settled";
+        this.log.warn("recovery: unadopted-generation release not confirmed; custody retained", { run_id: runId, generation });
+        return "retained";
+      } catch (err) {
+        const delay = this.unadoptedSettleRetryDelaysMs[attempt];
+        if (delay === undefined || input.signal?.aborted) {
+          this.log.warn("recovery: unadopted-generation release failed; custody retained", { run_id: runId, generation, error: errText(err) });
+          return "retained";
+        }
+        await new Promise<void>(resolve => { const t = setTimeout(resolve, delay); t.unref?.(); });
+      }
+    }
   }
 
   private async inactiveInventory(record: RecoveryRecord): Promise<boolean> {

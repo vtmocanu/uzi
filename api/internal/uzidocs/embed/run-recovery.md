@@ -236,6 +236,17 @@ identity acknowledgment; the worker verifies ancestry locally, not the server.
 Closed custody does not authorize new archive reservations or uploads, and a
 deleted worker's credentials receive 401 from worker authentication.
 
+A guarded generation that parks (forge unreachable) or fails before its
+repository was ever cloned adopted nothing, yet its hold stays open until a
+final disposition. The worker closes that empty hold itself: after reporting
+the park or failure it sends a settled `forge_no_output` release for exactly
+that generation, with the empty-inventory digest, and retries a few times if
+the API is not ready. It does this only when it can prove nothing was adopted
+locally (no journal record for the generation, no retained pin or clone of
+the run); on any doubt the hold stays open. The API accepts that release for
+a parked run only for a `forge_unreachable` park and only for the settled
+`forge_no_output` class. A parked run that adopted source keeps its hold.
+
 A dirty or unverified source, or an unproven process boundary, retains the
 clone and hold, reports **Needs action**, and uses bounded retries. Boot
 recovery cannot automatically capture dirty source and has no forge PAT.

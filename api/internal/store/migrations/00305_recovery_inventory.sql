@@ -58,7 +58,11 @@ BEGIN
         IF NOT EXISTS (SELECT 1 FROM runs r WHERE r.id = OLD.run_id AND r.user_id = OLD.user_id
             AND (r.claim_generation > OLD.generation OR
                  (r.claim_generation = OLD.generation AND
-                  (r.status IN ('completed', 'failed', 'cancelled') OR r.claim_released_at IS NOT NULL)))) THEN
+                  (r.status IN ('completed', 'failed', 'cancelled') OR r.claim_released_at IS NOT NULL
+                   -- issue #1924: a forge_unreachable pre-clone park keeps its claim; only the
+                   -- worker's settled forge_no_output proof (empty inventory) ends that generation.
+                   OR (r.status = 'recovery_wait' AND r.recovery_wait_cause = 'forge_unreachable'
+                       AND NEW.final_disposition = 'settled' AND NEW.release_evidence = 'forge_no_output'))))) THEN
             RETURN NULL;
         END IF;
         IF NEW.final_disposition = 'archive' AND NEW.release_evidence = 'archive' AND EXISTS (

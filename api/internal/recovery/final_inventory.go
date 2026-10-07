@@ -68,8 +68,9 @@ func (s *Service) releaseFinalInventory(ctx context.Context, wkr store.Worker, r
 	var gen int64
 	var worker pgtype.UUID
 	var released pgtype.Timestamptz
-	err = tx.QueryRow(ctx, "SELECT status, claim_generation, worker_id, claim_released_at FROM runs WHERE id=$1 AND user_id=$2 FOR UPDATE",
-		runID, wkr.UserID).Scan(&status, &gen, &worker, &released)
+	var parkCause pgtype.Text
+	err = tx.QueryRow(ctx, "SELECT status, claim_generation, worker_id, claim_released_at, recovery_wait_cause FROM runs WHERE id=$1 AND user_id=$2 FOR UPDATE",
+		runID, wkr.UserID).Scan(&status, &gen, &worker, &released, &parkCause)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return apitypes.RecoveryReleaseResponse{}, ErrNotAuthorized
@@ -102,7 +103,13 @@ func (s *Service) releaseFinalInventory(ctx context.Context, wkr store.Worker, r
 		uuid.UUID(hold.LiveWorkerID.Bytes) != wkr.ID {
 		return apitypes.RecoveryReleaseResponse{}, ErrNotAuthorized
 	}
-	ended := gen > *req.Generation || (gen == *req.Generation && (released.Valid || custodyRunTerminalStatuses[status]))
+	// A forge_unreachable park is a pre-clone park of a generation that may have adopted nothing:
+	// the parked run keeps its claim, so only a settled forge_no_output release (the worker's
+	// positive no-adopted-source proof, empty digest) may end that exact generation early. An
+	// archive release and a publication release keep the terminal/released/newer-claim gate.
+	forgeParkedEmpty := f.Kind == "settled" && *req.ReleaseEvidence == "forge_no_output" &&
+		status == "recovery_wait" && parkCause.Valid && parkCause.String == "forge_unreachable"
+	ended := gen > *req.Generation || (gen == *req.Generation && (released.Valid || custodyRunTerminalStatuses[status] || forgeParkedEmpty))
 	if !ended {
 		return apitypes.RecoveryReleaseResponse{}, ErrNotAuthorized
 	}

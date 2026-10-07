@@ -225,3 +225,85 @@ func TestRecoveryInventoryForgeParkRetainsAdoptedSourceLiveDB(t *testing.T) {
 		})
 	}
 }
+
+func inventorySettledRelease(gen int64, evidence string) apitypes.RecoveryReleaseRequest {
+	return apitypes.RecoveryReleaseRequest{Generation: &gen, ReleaseEvidence: &evidence,
+		FinalDisposition: &apitypes.RecoveryFinalDisposition{Kind: "settled", CoverageDigest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}}
+}
+
+func (e leaseEnv) openHoldsOfUser(t *testing.T) int {
+	t.Helper()
+	var n int
+	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM recovery_custody_holds WHERE user_id=$1 AND state='open'`, e.userID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// issue #1924: a guarded generation that parks on a forge failure before any clone adopted
+// nothing. The api retains its guarded hold through the park (above), so the worker's settled
+// forge_no_output release for that exact generation is what closes it and frees the owner's hold
+// slot. The same park with an adopted source is never settled by the worker (it sends no
+// release), and the other final dispositions still wait for the generation to end.
+func TestRecoveryInventoryForgeParkPreCloneSettledReleaseLiveDB(t *testing.T) {
+	e := newLeaseEnv(t)
+	svc := e.service(0, e.pool)
+	w, run, _ := e.seedBound(t, "running", 1, false)
+	hold := inventoryLifecycleHold(t, e, w, run, 1, true)
+	worker := e.workerRow(t, w)
+	rs := inventoryLifecycleRecovery(e)
+
+	// Before the park the generation has not ended: the settled release is refused.
+	if _, err := rs.Release(e.ctx, worker, run, inventorySettledRelease(1, "forge_no_output")); !errors.Is(err, recovery.ErrNotAuthorized) {
+		t.Fatalf("release before the park: %v", err)
+	}
+	res := awaitState(t, e.reportAsync(svc, w, run, StateRequest{
+		State: "recovery_wait", RecoveryCause: strPtr("forge_unreachable"), ClaimGeneration: i64Ptr(1),
+	}))
+	if res.err != nil || !res.applied || e.runStatusOf(t, run) != "recovery_wait" {
+		t.Fatalf("forge park: %+v err=%v", res, res.err)
+	}
+	inventoryLifecycleOpen(t, e, hold, w, run)
+	if got := e.openHoldsOfUser(t); got != 1 {
+		t.Fatalf("open holds after park = %d, want 1", got)
+	}
+	// Only the settled forge_no_output proof may end a parked generation: the publication class and
+	// an archive disposition keep the terminal / released / newer-claim gate.
+	if _, err := rs.Release(e.ctx, worker, run, inventorySettledRelease(1, "publication")); !errors.Is(err, recovery.ErrNotAuthorized) {
+		t.Fatalf("publication release on a parked run: %v", err)
+	}
+	cap := inventoryLifecycleReserve(t, e, rs, worker, run, 1, "parked-archive", strings.Repeat("c", 64))
+	inventoryLifecycleUpload(t, e, rs, worker, run, cap)
+	if _, err := rs.Release(e.ctx, worker, run, inventoryLifecycleFinal(1, cap, strings.Repeat("c", 64))); !errors.Is(err, recovery.ErrNotAuthorized) {
+		t.Fatalf("archive release on a parked run: %v", err)
+	}
+	inventoryLifecycleOpen(t, e, hold, w, run)
+
+	ack, err := rs.Release(e.ctx, worker, run, inventorySettledRelease(1, "forge_no_output"))
+	if err != nil || !ack.Released || ack.HoldsReleased != 1 || e.holdState(t, hold) != "released" {
+		t.Fatalf("settled release after the park: %+v %v", ack, err)
+	}
+	if again, err := rs.Release(e.ctx, worker, run, inventorySettledRelease(1, "forge_no_output")); err != nil || !again.Released {
+		t.Fatalf("replayed settled release must echo: %+v %v", again, err)
+	}
+	if got := e.openHoldsOfUser(t); got != 0 {
+		t.Fatalf("hold slot not freed: %d open", got)
+	}
+	if e.runStatusOf(t, run) != "recovery_wait" {
+		t.Fatal("the settled release changed the parked run")
+	}
+}
+
+// An untyped (empty-turn) recovery_wait park is not a pre-clone forge park: the settled release
+// stays refused there, so only the forge park's cause widens the gate.
+func TestRecoveryInventorySettledReleaseRefusedOnUntypedParkLiveDB(t *testing.T) {
+	e := newLeaseEnv(t)
+	w, run, _ := e.seedBound(t, "running", 1, false)
+	hold := inventoryLifecycleHold(t, e, w, run, 1, true)
+	e.exec(`UPDATE runs SET status='recovery_wait', recovery_wait_cause=NULL WHERE id=$1`, run)
+	rs := inventoryLifecycleRecovery(e)
+	if _, err := rs.Release(e.ctx, e.workerRow(t, w), run, inventorySettledRelease(1, "forge_no_output")); !errors.Is(err, recovery.ErrNotAuthorized) {
+		t.Fatalf("release on an untyped park: %v", err)
+	}
+	inventoryLifecycleOpen(t, e, hold, w, run)
+}

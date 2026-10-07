@@ -4303,6 +4303,37 @@ export class RunRunner {
     // report above awaited); settleRecoveryGeneration refuses on its own as well.
     if (reaped && residueQuarantine() === undefined) await this.settleRecoveryGeneration(claim, flight, runLog);
     else if (reaped) flight.preserveRecoveryClone = true;
+    // A guarded claim that failed before any clone has nothing for the settle above to reach
+    // (barePath unset); its empty hold is settled after the terminal report (issue #1924).
+    await this.settleUnadoptedGuardedClaim(claim, flight, runLog);
+  }
+
+  /**
+   * issue #1924 — a guarded claim that parked or failed BEFORE it adopted any source (no clone, no
+   * bare for this flight) still owns an empty guarded hold, which the api keeps until a final
+   * disposition. Send the `settled` forge_no_output release for exactly this generation, AFTER the
+   * park/failure report (the api refuses it until the generation has ended). The coordinator
+   * proves "nothing adopted" from the local journal, pins and retained clones and keeps the hold
+   * on any doubt; this method only gates on the flight never having reached a clone. Best-effort:
+   * it never throws and never changes the run's honest report.
+   */
+  private async settleUnadoptedGuardedClaim(claim: ClaimResponse, flight: RunFlight, runLog: Logger): Promise<void> {
+    if (claim.inventory_guarded !== true || !claim.claim_generation || !this.recovery.enabled ||
+        !isCodePublishingKind(resolveRunKind(claim.kind)) ||
+        flight.barePath !== undefined || flight.worktreePath !== undefined || flight.runnerClone !== undefined) return;
+    try {
+      const outcome = await this.recovery.settleUnadoptedGuardedGeneration({
+        runId: claim.run_id, generation: claim.claim_generation,
+        barePath: this.git.barePathFor(claim.repo.clone_url),
+      });
+      runLog.info("recovery: unadopted guarded generation disposition", {
+        run_id: claim.run_id, generation: claim.claim_generation, outcome,
+      });
+    } catch (err) {
+      runLog.warn("recovery: unadopted guarded generation disposition failed; custody retained", {
+        run_id: claim.run_id, error: errMessage(err),
+      });
+    }
   }
 
   /**
@@ -4350,7 +4381,11 @@ export class RunRunner {
         recovery_cause: "forge_unreachable",
         ...(gen !== undefined ? { claim_generation: gen } : {}),
       };
-      return await this.reportForgeParkAndDispatch(body, claim, flight, reportState, runLog, runHome);
+      const outcome = await this.reportForgeParkAndDispatch(body, claim, flight, reportState, runLog, runHome);
+      // A guarded pre-clone generation adopted nothing, yet the api keeps its hold through the
+      // park: settle that empty hold now that the park report is acknowledged (issue #1924).
+      if (outcome === "parked") await this.settleUnadoptedGuardedClaim(claim, flight, runLog);
+      return outcome;
     }
 
     if (features.includes("recovery_release_exact_echo")) {
