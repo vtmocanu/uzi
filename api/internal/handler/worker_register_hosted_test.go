@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -27,6 +28,10 @@ type registerStore struct {
 	// DIFFERENT value than the authenticated worker's to simulate a rotation
 	// committing mid-request.
 	rotatedHash []byte
+}
+
+func (r *registerStore) GetWorkerByID(_ context.Context, id uuid.UUID) (store.Worker, error) {
+	return store.Worker{ID: id, Kind: r.kind, SnapshotRegisterNonce: pgtype.Text{String: "prior-registration", Valid: true}}, nil
 }
 
 func (r *registerStore) FailWorkerRunsOverCap(context.Context, store.FailWorkerRunsOverCapParams) ([]store.WorkerRecoveryDisposition, error) {

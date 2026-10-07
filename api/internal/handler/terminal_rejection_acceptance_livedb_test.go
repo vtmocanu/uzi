@@ -174,6 +174,9 @@ func TestTerminalRejectionAcceptanceLiveDB(t *testing.T) {
 		t.Fatalf("archives = %d %s", rec.Code, rec.Body.String())
 	}
 
+	if err := os.MkdirAll("../../../.uzi/scratch", 0o700); err != nil {
+		t.Fatal(err)
+	}
 	scratch, err := os.MkdirTemp("../../../.uzi/scratch", "terminal-acceptance.")
 	if err != nil {
 		t.Fatal(err)

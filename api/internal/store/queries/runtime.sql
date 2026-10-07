@@ -10561,12 +10561,13 @@ RETURNING cc.*;
 
 -- name: ResumeWorkerRecoveryEpisode :one
 -- Explicit owner release of an exhaustion hold is the only episode-renewal writer.
--- Keep the wall budget, custody and released incarnation; bank the held interval.
+-- Keep the wall budget, custody and released incarnation; bank the hold only after execution started.
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause = 'worker_requeue_exhausted'
-  AND (runs.started_at IS NULL OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+  AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
+       OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
@@ -10609,7 +10610,9 @@ UPDATE runs SET
     status                = 'queued',
     status_since          = now(),
     budget_paused_seconds = runs.budget_paused_seconds
-        + GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int),
+        + CASE WHEN runs.started_at IS NOT NULL
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
+               ELSE 0 END,
     -- Drop obsolete affinity while preserving the incarnation captured by the park.
     worker_id = CASE WHEN runs.claim_released_at IS NOT NULL THEN NULL ELSE runs.worker_id END,
     hold_reason = NULL,
@@ -10623,8 +10626,10 @@ UPDATE runs SET
     updated_at            = now()
 WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause = 'worker_requeue_exhausted'
-  -- Refuse a resume with no remaining wall budget; extending does not itself release this hold.
-  AND (runs.started_at IS NULL OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+  -- Honor the wall sweep's chat/judge/interactive exemptions; timed runs still need remaining budget.
+  -- Extending does not itself release this hold; checker parent/deadline guards below still apply.
+  AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
+       OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
