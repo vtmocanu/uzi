@@ -111,6 +111,8 @@ type IssueStore interface {
 	// UpsertIssueLabels is the label-only cache-write variant used by AutoMove and
 	// SetIssueLabel: it omits assignee_ids so a racing label mutation cannot clobber
 	// the forge-synced assignees with a stale in-memory snapshot (PRD #767).
+	// Labels seeds INSERT only; AddLabels/RemoveLabels apply to current labels on
+	// conflict, preserving survivors and appending distinct additions in order.
 	UpsertIssueLabels(ctx context.Context, arg store.UpsertIssueLabelsParams) (store.Issue, error)
 	// UpdateIssueState / ReopenIssueState are the narrow state-only cache flips behind
 	// CloseIssue / ReopenIssue (PRD #1034 M2). UpdateIssueState touches only `state`
@@ -501,17 +503,11 @@ func (s *Service) ForgeForConnection(forgeType, baseURL string, tokenCiphertext 
 	return s.ForgeForToken(forge.Type(forgeType), baseURL, string(plain))
 }
 
-// AutoMove applies a single-column move forge-first, then updates the issue
-// cache — the mechanic the board drag and the run-lifecycle automation share
-// (both need the same "one atomic label swap, then snapshot" behavior). It plans
-// the add/remove sets against the repo's column set, calls UpdateIssueLabels once
-// (GitLab makes that atomic, which is what enforces single-column membership),
-// and only on forge success upserts the new label set. A forge error is returned
-// with the cache untouched, so a failed move never desyncs the cache from the
-// forge; the caller decides whether that fails a request (manual drag) or leaves
-// a pending marker for reconciliation (automation). The returned issue is the
-// re-cached row. Guards (closed issue, manual-drag) live in the caller, not here:
-// a manual drag is itself the human's intent and must not be second-guessed.
+// AutoMove plans a column label delta, writes it forge-first, then applies it to
+// the current cached row. Forge errors leave the cache untouched; a driver can
+// partially change remote labels before returning an error. No compensation is
+// attempted. The returned issue is the re-cached row. Caller guards own closed
+// issue and manual-drag policy.
 func (s *Service) AutoMove(ctx context.Context, f forge.Forge, forgeProjectID int64, issue store.Issue, columns []store.BoardColumn, target string) (store.Issue, error) {
 	var current []string
 	if err := json.Unmarshal(issue.Labels, &current); err != nil {
@@ -546,10 +542,12 @@ func (s *Service) AutoMove(ctx context.Context, f forge.Forge, forgeProjectID in
 		return store.Issue{}, err
 	}
 
-	labelsJSON, err := json.Marshal(newLabels)
+	labelsJSON, err := json.Marshal(append([]string{}, newLabels...))
 	if err != nil {
 		return store.Issue{}, err
 	}
+	addJSON, _ := json.Marshal(append([]string{}, add...))
+	removeJSON, _ := json.Marshal(append([]string{}, remove...))
 	// UpsertIssueLabels omits assignee_ids from both its INSERT and its ON CONFLICT
 	// SET, so the DB's forge-synced assignees are preserved from the existing row
 	// rather than re-written from this caller's possibly-stale snapshot (PRD #767).
@@ -559,6 +557,8 @@ func (s *Service) AutoMove(ctx context.Context, f forge.Forge, forgeProjectID in
 		Title:          issue.Title,
 		State:          issue.State,
 		Labels:         labelsJSON,
+		AddLabels:      addJSON,
+		RemoveLabels:   removeJSON,
 		WebUrl:         issue.WebUrl,
 		Author:         issue.Author,
 		HasPrdLink:     issue.HasPrdLink,
@@ -577,13 +577,10 @@ func (s *Service) AutoMove(ctx context.Context, f forge.Forge, forgeProjectID in
 // always sends the forge delta: cached absence does not prove forge absence.
 // Both paths issue one UpdateIssueLabels with a single-element add or remove set.
 //
-// color is the label color to pin when apply auto-creates the label, and is
-// ignored on remove. It is a PARAMETER so the one caller (Promote) supplies the
-// color for the label it applies. Only on forge success does it update the cache. Apply keeps the existing
-// snapshot upsert; removal filters the CURRENT existing row with RemoveCachedIssueLabel,
-// leaving every other label and non-label column untouched. A missing cache row
-// is an error; removal never inserts one. Returns the re-cached row; on a forge error the
-// cache is untouched, so a failed toggle never desyncs the cache from the forge.
+// color pins the project label on apply and is ignored on remove. Only forge
+// success updates the cache: apply uses a current-row delta, removal uses
+// RemoveCachedIssueLabel and never inserts a missing row. A forge error leaves
+// the cache untouched, but remote labels may have partially changed.
 func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProjectID int64, issue store.Issue, label, color string, apply bool) (store.Issue, error) {
 	var current []string
 	if err := json.Unmarshal(issue.Labels, &current); err != nil {
@@ -614,17 +611,14 @@ func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProject
 		return s.q.RemoveCachedIssueLabel(ctx, store.RemoveCachedIssueLabelParams{RepoID: issue.RepoID, ForgeIssueIid: issue.ForgeIssueIid, Label: label})
 	}
 
-	// Apply path, on forge success only: the cache labels are rewritten from the
-	// caller's snapshot (`current`) plus this label via UpsertIssueLabels. Unlike the
-	// remove path above (RemoveCachedIssueLabel, which filters the current row
-	// atomically), this IS an overwrite computed from a possibly-stale snapshot: a
-	// concurrent label change between the caller's read and this write can be lost
-	// until the next sync re-reads the forge.
+	// The snapshot plus label seeds INSERT only; conflict applies the delta.
 	next := append(append([]string{}, current...), label)
 	labelsJSON, err := json.Marshal(next)
 	if err != nil {
 		return store.Issue{}, err
 	}
+	addJSON, _ := json.Marshal(append([]string{}, add...))
+	removeJSON, _ := json.Marshal(append([]string{}, remove...))
 	// UpsertIssueLabels omits assignee_ids from both its INSERT and its ON CONFLICT
 	// SET, so the DB's forge-synced assignees are preserved from the existing row and
 	// never re-written from this caller's possibly-stale snapshot (PRD #767).
@@ -635,6 +629,8 @@ func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProject
 		Title:          issue.Title,
 		State:          issue.State,
 		Labels:         labelsJSON,
+		AddLabels:      addJSON,
+		RemoveLabels:   removeJSON,
 		WebUrl:         issue.WebUrl,
 		Author:         issue.Author,
 		HasPrdLink:     issue.HasPrdLink, // preserved verbatim; this path never re-derives it

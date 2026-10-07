@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -59,13 +60,15 @@ type fakeForge struct {
 
 	// MR-close watcher (PRD #24) scripting. mr/mrErr are the default GetMergeRequest
 	// result; mrByIID/mrErrByIID override per mrIID (for multi-candidate tests).
-	mr          forge.MergeRequest
-	mrErr       error
-	mrByIID     map[int64]forge.MergeRequest
-	mrErrByIID  map[int64]error
-	mrCalls     []int64 // mrIIDs GetMergeRequest was asked for
-	updateErr   error   // makes AutoMove's UpdateIssueLabels fail (forge-move failure)
-	updateCalls []mrUpdateCall
+	mr                  forge.MergeRequest
+	mrErr               error
+	mrByIID             map[int64]forge.MergeRequest
+	mrErrByIID          map[int64]error
+	mrCalls             []int64  // mrIIDs GetMergeRequest was asked for
+	updateErr           error    // makes AutoMove's UpdateIssueLabels fail (forge-move failure)
+	remoteLabels        []string // optional remote state for partial-failure tests
+	removeBeforeFailure bool
+	updateCalls         []mrUpdateCall
 
 	// Pipeline sync (PRD #6) scripting + capture. pipelineByRef keys on a branch
 	// ref, pipelineByMR on an MR iid; a missing key returns ErrNoPipeline (the
@@ -263,6 +266,9 @@ func (f *fakeForge) GetIssue(_ context.Context, _ int64, issueIID int64) (forge.
 }
 func (f *fakeForge) UpdateIssueLabels(_ context.Context, _, _ int64, add, remove []string) error {
 	f.updateCalls = append(f.updateCalls, mrUpdateCall{add: add, remove: remove})
+	if f.removeBeforeFailure {
+		f.remoteLabels = slices.DeleteFunc(f.remoteLabels, func(label string) bool { return slices.Contains(remove, label) })
+	}
 	return f.updateErr
 }
 func (f *fakeForge) GetMergeRequest(_ context.Context, _, mrIID int64) (forge.MergeRequest, error) {
@@ -390,8 +396,37 @@ func (s *fakeStore) RemoveCachedIssueLabel(_ context.Context, arg store.RemoveCa
 
 func (s *fakeStore) UpsertIssueLabels(_ context.Context, arg store.UpsertIssueLabelsParams) (store.Issue, error) {
 	s.labelUpserts = append(s.labelUpserts, arg)
-	// Echo the labels back so AutoMove / SetIssueLabel's re-cache returns the moved row.
-	return store.Issue{RepoID: arg.RepoID, ForgeIssueIid: arg.ForgeIssueIid, State: arg.State, Labels: arg.Labels}, nil
+	row := s.issue
+	labels := arg.Labels // INSERT seed when no current row was supplied
+	if row.RepoID == arg.RepoID && row.ForgeIssueIid == arg.ForgeIssueIid {
+		var current, add, remove []string
+		if err := json.Unmarshal(row.Labels, &current); err != nil {
+			return store.Issue{}, err
+		}
+		if err := json.Unmarshal(arg.AddLabels, &add); err != nil {
+			return store.Issue{}, err
+		}
+		if err := json.Unmarshal(arg.RemoveLabels, &remove); err != nil {
+			return store.Issue{}, err
+		}
+		next := make([]string, 0, len(current)+len(add))
+		for _, label := range current {
+			if !slices.Contains(remove, label) {
+				next = append(next, label)
+			}
+		}
+		for _, label := range add {
+			if !slices.Contains(next, label) {
+				next = append(next, label)
+			}
+		}
+		labels, _ = json.Marshal(next)
+	}
+	row.RepoID, row.ForgeIssueIid, row.Title, row.State = arg.RepoID, arg.ForgeIssueIid, arg.Title, arg.State
+	row.Labels, row.WebUrl, row.Author = labels, arg.WebUrl, arg.Author
+	row.HasPrdLink, row.ForgeUpdatedAt = arg.HasPrdLink, arg.ForgeUpdatedAt
+	s.issue = row
+	return row, nil
 }
 func (s *fakeStore) UpdateIssueState(_ context.Context, arg store.UpdateIssueStateParams) (store.Issue, error) {
 	s.stateUpdates = append(s.stateUpdates, arg)

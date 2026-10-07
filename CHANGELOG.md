@@ -32,6 +32,11 @@ through `[0.52.0]`.)
 - **CI-fix and MR-rework runs stop neutrally when a verified remote branch advance supersedes their work ([#2404](https://github.com/vtmocanu/uzi/issues/2404)).**
   When the worker proves a stable forward remote advance, further publication stops and the upgraded api records the run as cancelled with a branch-moved stop reason, rather than failed; the activity feed and owner API, board, CLI and web views carry the cause and exact observed remote tip. Publication refusals involving other run kinds, rewritten candidate history or unverifiable checks remain failures, with allowlisted code-only reasons rather than untrusted remote or command-error text. Upgrade the api before workers: older servers retain MR-only handling and a static reason, so CI-fix can still appear failed. The proof covers the observed remote interval, not later writes or whether an earlier push applied; recovery uses existing capture and custody, and a reclaimed run gets a new publication baseline. See [Worker setup](docs/worker-setup.md#publication-refusal-and-branch-supersession).
 
+### Fixed
+
+- **Removed dispatch labels stay removed ([#2441](https://github.com/vtmocanu/uzi/issues/2441)).**
+  GitHub sweep dispatches no longer restore a removed selector label during another label write. Stale board moves and label additions keep removed labels absent while preserving unrelated current labels in the issues cache.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed
