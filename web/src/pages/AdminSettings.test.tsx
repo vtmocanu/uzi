@@ -1362,7 +1362,7 @@ describe("DockerAllowlistCard — instance identities", () => {
   });
   function card(value: string, sources: Record<string, Src> = {}) {
     function Harness() {
-      const [resp, setResp] = useState(() => response({ docker_repo_allowlist: value }, {}, sources));
+      const [resp, setResp] = useState<import("../lib/api").SettingsResponse>(() => response({ docker_repo_allowlist: value }, {}, sources));
       return <DockerAllowlistCard settings={resp.settings} sources={resp.sources} onSaved={setResp} />;
     }
     return render(<Harness />);

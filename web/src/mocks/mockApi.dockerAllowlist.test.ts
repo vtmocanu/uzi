@@ -39,7 +39,7 @@ it("resolves stored UUID aliases when retaining disabled repositories", async ()
   const { appSettings } = await import("./mockApi/settings");
   const id = "b2222222-2222-4222-8222-222222222222";
   for (const value of [
-    id.replaceAll("-", ""), "x" + id.toUpperCase() + "y",
+    id.replace(/-/g, ""), "x" + id.toUpperCase() + "y",
     "UrN:UuId:" + id, "\u0085" + id + "\u0085",
   ]) {
     // Seed an already stored spelling; the listing reads current state, independently of writes.
