@@ -1,6 +1,8 @@
 package workersvc_test
 
 import (
+	"bytes"
+	"log/slog"
 	"slices"
 	"testing"
 	"time"
@@ -11,8 +13,7 @@ import (
 )
 
 // applyDelta is a test-local model of the ledger's pending set update: union of the adds,
-// minus the removes. It is deliberately naive; the real merge (cap, ordering) is pinned by the
-// store LiveDB tests.
+// minus the removes, then the keep-oldest cap. The real merge is pinned by the store LiveDB tests.
 func applyDelta(pending []int64, plan workersvc.ReviewPlan) []int64 {
 	set := map[int64]bool{}
 	for _, id := range pending {
@@ -29,6 +30,10 @@ func applyDelta(pending []int64, plan workersvc.ReviewPlan) []int64 {
 		out = append(out, id)
 	}
 	slices.Sort(out)
+	// mr_rework_merge_pending keeps the OLDEST ReviewPendingCap ids.
+	if len(out) > workersvc.ReviewPendingCap {
+		out = out[:workersvc.ReviewPendingCap]
+	}
 	return out
 }
 
@@ -39,31 +44,38 @@ func TestPlanOutsiderFloodKeepsEligibleAuthorsComment(t *testing.T) {
 	trusted := []settings.TrustedBot{{BaseURL: "https://github.com", ForgeUserID: coderabbit}}
 	comments := []forge.MRComment{inline(100, flakyID, "xavier", "real finding", raT0)}
 	for i := int64(0); i < 250; i++ {
-		// every flood author is distinct and its lookup fails, so it stays unknown
-		comments = append(comments, inline(101+i, 1000+i, "flood", "noise", raT0.Add(time.Duration(i+1)*time.Second)))
+		// every flood author is distinct, its lookup fails so it stays unknown, and it posts
+		// three comments: an all-ids pending set would hold 750 ids, one per author holds 250
+		for k := int64(0); k < 3; k++ {
+			comments = append(comments, inline(101+3*i+k, 1000+i, "flood", "noise", raT0.Add(time.Duration(3*i+k+1)*time.Second)))
+		}
 	}
-	comments = append(comments, inline(400, coderabbit, "coderabbitai[bot]", "bot finding", raT0.Add(time.Hour)))
+	comments = append(comments, inline(900, coderabbit, "coderabbitai[bot]", "bot finding", raT0.Add(time.Hour)))
 
 	p := h.params(comments...)
 	p.Trusted = trusted
 	res := h.snapshot(t, p)
 	plan := res.Plan(0, nil)
-	if !plan.HasNew || plan.MaxActionableID != 400 {
-		t.Fatalf("plan = %+v, want the trusted bot to fire at mark 400", plan)
+	if !plan.HasNew || plan.MaxActionableID != 900 {
+		t.Fatalf("plan = %+v, want the trusted bot to fire at mark 900", plan)
 	}
 	if len(plan.PendingAdd) != 251 || !slices.Contains(plan.PendingAdd, 100) {
 		t.Fatalf("pending add has %d ids (contains 100: %t), want one per unverified author (251) including X's 100",
 			len(plan.PendingAdd), slices.Contains(plan.PendingAdd, 100))
 	}
 	pending := applyDelta(nil, plan)
+	if len(pending) != 251 || !slices.Contains(pending, 100) {
+		t.Fatalf("pending after the merge has %d ids (contains 100: %t), want 251 including X's 100",
+			len(pending), slices.Contains(pending, 100))
+	}
 
 	// X resolves eligible: the next tick fires once, with X's comment in the snapshot.
 	h.lookup.answers[flakyID] = forge.AuthorEligible
 	p2 := h.params(comments...)
 	p2.Trusted = trusted
-	p2.HighWater, p2.Pending = 400, pending
+	p2.HighWater, p2.Pending = 900, pending
 	res2 := h.snapshot(t, p2)
-	plan2 := res2.Plan(400, pending)
+	plan2 := res2.Plan(900, pending)
 	if !plan2.HasNew {
 		t.Fatalf("plan = %+v, want X's pending comment to trigger", plan2)
 	}
@@ -74,7 +86,7 @@ func TestPlanOutsiderFloodKeepsEligibleAuthorsComment(t *testing.T) {
 		t.Fatalf("pending remove = %v, want X's 100 consumed", plan2.PendingRemove)
 	}
 	pending = applyDelta(pending, plan2)
-	plan3 := res2.Plan(400, pending)
+	plan3 := res2.Plan(900, pending)
 	if plan3.HasNew {
 		t.Fatalf("plan = %+v, want no second trigger once X's id is consumed", plan3)
 	}
@@ -119,5 +131,65 @@ func TestPlanRepresentativeComesFromTheAcceptedSet(t *testing.T) {
 	}
 	if len(plan.PendingRemove) != 0 {
 		t.Fatalf("pending remove = %v, want the representative kept", plan.PendingRemove)
+	}
+}
+
+// bulkComments returns n unknown-author comments, ids from firstID, one author each.
+func bulkComments(n int, firstID int64) []forge.MRComment {
+	out := make([]forge.MRComment, 0, n)
+	for i := 0; i < n; i++ {
+		id := firstID + int64(i)
+		out = append(out, inline(id, 100000+id, "bulk", "noise", raT0.Add(time.Duration(id)*time.Millisecond)))
+	}
+	return out
+}
+
+// At the cap the merge keeps the OLDEST ids, so X's newer representative can be the one dropped.
+// The older pending id must then stay: X must still have a pending id after the merge.
+func TestPlanAtCapKeepsOlderIDWhenSupersedeCouldLoseTheAuthor(t *testing.T) {
+	h := newHarness()
+	fillers := bulkComments(workersvc.ReviewPendingCap-1, 101) // ids 101..10099
+	comments := append([]forge.MRComment{inline(100, flakyID, "xavier", "x old", raT0)}, fillers...)
+	comments = append(comments,
+		inline(15000, flakyID+1, "yolanda", "outsider", raT0.Add(time.Hour)),
+		inline(20000, flakyID, "xavier", "x new", raT0.Add(time.Hour+time.Second)),
+		inline(30000, coderabbit, "coderabbitai[bot]", "bot finding", raT0.Add(2*time.Hour)), // allowlisted: eligible without a lookup, so it moves the mark
+	)
+	pending := []int64{100}
+	for _, c := range fillers {
+		pending = append(pending, c.ID)
+	}
+	p := h.params(comments...)
+	p.Trusted = []settings.TrustedBot{{BaseURL: "https://github.com", ForgeUserID: coderabbit}}
+	res := h.snapshot(t, p)
+	plan := res.Plan(99, pending)
+	if slices.Contains(plan.PendingRemove, 100) {
+		t.Fatalf("pending remove contains X's 100 although the merged set cannot be guaranteed to fit")
+	}
+	if got := applyDelta(pending, plan); !slices.Contains(got, 100) || len(got) != workersvc.ReviewPendingCap {
+		t.Fatalf("after the capped merge X has no pending id (contains 100: %t, size %d)", slices.Contains(got, 100), len(got))
+	}
+}
+
+// The cap warning counts only genuinely new ids: a full set with nothing new must not warn.
+func TestPlanCapWarningIgnoresAlreadyPendingIDs(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	h := newHarness()
+	comments := bulkComments(workersvc.ReviewPendingCap, 101)
+	pending := make([]int64, 0, len(comments))
+	for _, c := range comments {
+		pending = append(pending, c.ID)
+	}
+	res := h.snapshot(t, h.params(comments...))
+	plan := res.Plan(0, pending)
+	if len(plan.PendingAdd) != workersvc.ReviewPendingCap {
+		t.Fatalf("pending add = %d ids, want every pending id represented", len(plan.PendingAdd))
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("warned although nothing new is added: %s", buf.String())
 	}
 }

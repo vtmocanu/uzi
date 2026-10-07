@@ -710,10 +710,12 @@ func (q *Queries) ListMRReworkCandidates(ctx context.Context, repoID uuid.UUID) 
 const removeMRReworkPendingIDs = `-- name: RemoveMRReworkPendingIDs :exec
 UPDATE mr_rework_ledger
 SET pending_unknown_ids = ARRAY(
-    SELECT p.x
-    FROM unnest(mr_rework_ledger.pending_unknown_ids) AS p(x)
-    WHERE p.x <> ALL (COALESCE($1::bigint[], '{}'::bigint[]))
-    ORDER BY p.x
+    SELECT x FROM (
+        SELECT unnest(mr_rework_ledger.pending_unknown_ids) AS x
+        EXCEPT
+        SELECT r AS x FROM unnest(COALESCE($1::bigint[], '{}'::bigint[])) AS r
+    ) t
+    ORDER BY x
 )
 WHERE repo_id = $2::uuid AND ref = $3
 `

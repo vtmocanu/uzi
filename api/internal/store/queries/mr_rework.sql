@@ -118,10 +118,12 @@ SET attempt_count = mr_rework_ledger.attempt_count + 1,
 -- alone, and no row is created when the ref has none.
 UPDATE mr_rework_ledger
 SET pending_unknown_ids = ARRAY(
-    SELECT p.x
-    FROM unnest(mr_rework_ledger.pending_unknown_ids) AS p(x)
-    WHERE p.x <> ALL (COALESCE(@ids::bigint[], '{}'::bigint[]))
-    ORDER BY p.x
+    SELECT x FROM (
+        SELECT unnest(mr_rework_ledger.pending_unknown_ids) AS x
+        EXCEPT
+        SELECT r AS x FROM unnest(COALESCE(@ids::bigint[], '{}'::bigint[])) AS r
+    ) t
+    ORDER BY x
 )
 WHERE repo_id = @repo_id::uuid AND ref = @ref;
 

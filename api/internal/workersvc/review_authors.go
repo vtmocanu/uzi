@@ -637,8 +637,15 @@ func (res *ReviewSnapshotResult) Plan(highWater int64, pending []int64) ReviewPl
 	for _, id := range plan.PendingAdd {
 		isRep[id] = true
 	}
+	newAdds := 0
+	for _, id := range plan.PendingAdd {
+		if !pendingSet[id] {
+			newAdds++
+		}
+	}
 	plan.PendingRemove = []int64{}
 	plan.PendingEvicted = []int64{}
+	var superseded []int64 // older pending ids of authors whose newer representative is in PendingAdd
 	for _, id := range pending {
 		cl, present := res.class[id]
 		switch {
@@ -650,17 +657,22 @@ func (res *ReviewSnapshotResult) Plan(highWater int64, pending []int64) ReviewPl
 			plan.PendingRemove = append(plan.PendingRemove, id) // evicted by the caps: human review
 			plan.PendingEvicted = append(plan.PendingEvicted, id)
 		case cl == classUnknown:
-			// One id per author across ticks: an older pending id of an author whose newer
-			// representative is being added (or already pending) is superseded. The ledger merge
-			// subtracts removals after the union, so the order of add and remove is safe.
 			if a, ok := res.unknownAuthor[id]; ok && rep[a] != 0 && !isRep[id] {
-				plan.PendingRemove = append(plan.PendingRemove, id)
+				superseded = append(superseded, id)
 			}
 		}
 	}
-	if n := len(pending) + len(plan.PendingAdd) - len(plan.PendingRemove); n > ReviewPendingCap {
+	// One id per author across ticks: an older pending id of an author whose newer representative
+	// is being added (or already pending) is superseded, but only when the merged set is
+	// guaranteed to fit. The ledger merge (mr_rework_merge_pending) keeps the OLDEST
+	// ReviewPendingCap ids, so on a full set the new representative can be the one dropped; the
+	// older id is then kept, and the author never ends up with no pending id.
+	incoming := len(pending) + newAdds - len(plan.PendingRemove)
+	if incoming <= ReviewPendingCap {
+		plan.PendingRemove = append(plan.PendingRemove, superseded...)
+	} else {
 		slog.Warn("workersvc: review pending set would exceed its cap; the ledger keeps the oldest ids",
-			"incoming", n, "cap", ReviewPendingCap)
+			"incoming", incoming, "cap", ReviewPendingCap)
 	}
 	return plan
 }
