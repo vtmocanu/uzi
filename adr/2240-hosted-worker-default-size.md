@@ -42,6 +42,8 @@ the agent workload, not an arbitrary user's build or test suite.
 
 ## Consequences
 
+Figures below are the sizes at the time of this decision; issue #2127 later raised `l` to 14Gi request / 20Gi limit and `m` to 8Gi / 12Gi (`controller/internal/preset/preset.go`).
+
 - CPU requests double from 500m to 1 CPU, and memory requests double from 4Gi
   to 8Gi. Requests reserve node capacity, so fewer new workers fit on a node
   with unchanged resources. Operators must account for that capacity cost.

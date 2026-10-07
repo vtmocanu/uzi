@@ -51,13 +51,13 @@ import (
 // requested 8Gi (limit 12Gi), `m` 4Gi (limit 8Gi), and `s` 2Gi, each above its size's realistic peak,
 // while every size stays Burstable.
 //
-// `l` was later raised to 14Gi request / 20Gi limit (issue #2127): a persistent `l`
-// worker running two concurrent runs was OOMKilled at the 12Gi limit when two
-// whole-program Go analyzers (deadcode and golangci-lint in `task gate:api`, each about
-// 7-7.5 GiB) overlapped. 14Gi covers two such peaks; 20Gi leaves headroom above them.
-// The maintainer accepted the reduced node placement capacity. `m` was raised the same
-// way, to 8Gi request / 12Gi limit (issue #2127): on 2026-10-03 a single run's `deadcode`
-// reached 7.3-7.5 GiB anon RSS at the old 8Gi limit and was OOMKilled twice.
+// `l` was later raised to 14Gi request / 20Gi limit (issue #2127, owner-selected sizing):
+// a persistent `l` worker running two concurrent runs was OOMKilled twice at the 12Gi
+// limit while both runs were inside whole-program Go analyzer gates. The new values are
+// not a measured guarantee of sufficient capacity; the maintainer accepted the reduced
+// node placement capacity. `m` was raised to 8Gi request / 12Gi limit (issue #2127): on
+// 2026-10-03 a single run's `deadcode` reached 7.3-7.5 GiB anon RSS at the old 8Gi limit
+// and was OOMKilled twice.
 //
 // Owner decision (settled 2026-09-14) keeps all three Burstable. Guaranteed
 // (request==limit) was considered and dropped: it would strand a full memory limit per
@@ -114,7 +114,7 @@ func IsUnknown(err error) bool {
 // issue #1341 for the measured figures), and the requests below were recalibrated in
 // issue #1341 above those measured multi-agent peaks.
 //
-// `m` is compose parity at the limit. New hosted workers default to `l` (issue #2240:
+// `m` was compose parity at the limit until issue #2127 (compose still grants 4 GiB). New hosted workers default to `l` (issue #2240:
 // the api's UZI_EPHEMERAL_DEFAULT_SIZE and the web dialog's preselection). The default cap is 1
 // (WORKER_MAX_CONCURRENT_RUNS), so a size still buys headroom for ONE run. That cap
 // is now operator-configurable (chart workers.maxConcurrentRuns → the controller's
