@@ -455,8 +455,8 @@ describe("Dashboard usage cards (PRD #40)", () => {
   const adminUsage = {
     factory: { lifetime: bundle(5_400_000, 53_900_000, 2_400_000, 88.15), last_7_days: zeros(), run_count: 79, outcomes: zeroOutcomeWindows(), lifetime_subscription_run_count: 0, lifetime_unreported_run_count: 0, last7_subscription_run_count: 0, last7_unreported_run_count: 0 },
     users: [
-      { user_id: "a", email: "vlad@example.com", usage: bundle(1_610_000, 16_100_000, 710_000, 26.4), run_count: 23, outcomes: zeroOutcomes(), subscription_run_count: 0, unreported_run_count: 0 },
-      { user_id: "b", email: "maria@example.com", usage: bundle(2_490_000, 21_400_000, 1_020_000, 37.83), run_count: 31, outcomes: zeroOutcomes(), subscription_run_count: 0, unreported_run_count: 0 },
+      { user_id: "a", email: "vlad@example.com", usage: bundle(1_610_000, 16_100_000, 710_000, 26.4), run_count: 23, outcomes: zeroOutcomes(), subscription_run_count: 0, unreported_run_count: 0, last_7_days: zeros(), last7_run_count: 0, last7_outcomes: zeroOutcomes(), last7_subscription_run_count: 0, last7_unreported_run_count: 0 },
+      { user_id: "b", email: "maria@example.com", usage: bundle(2_490_000, 21_400_000, 1_020_000, 37.83), run_count: 31, outcomes: zeroOutcomes(), subscription_run_count: 0, unreported_run_count: 0, last_7_days: zeros(), last7_run_count: 0, last7_outcomes: zeroOutcomes(), last7_subscription_run_count: 0, last7_unreported_run_count: 0 },
     ],
     earliest_run: "2026-05-12T09:00:00Z",
   };
@@ -467,27 +467,33 @@ describe("Dashboard usage cards (PRD #40)", () => {
     });
   };
 
-  it("defaults to seven days and switches both scopes while the embedded table stays all time", async () => {
+  it("defaults to seven days and switches both scopes and the embedded table follows the window", async () => {
     vi.mocked(useAuth).mockReturnValue({ user: { ...user, is_admin: true } } as unknown as ReturnType<typeof useAuth>);
     mockApi.getUsage.mockResolvedValue(selfWithUsage);
-    mockApi.getAdminUsage.mockResolvedValue({ ...adminUsage, factory: { ...adminUsage.factory, last_7_days: bundle(400_000, 800_000, 100_000, 9.25) } });
+    mockApi.getAdminUsage.mockResolvedValue({
+      ...adminUsage, factory: { ...adminUsage.factory, last_7_days: bundle(400_000, 800_000, 100_000, 9.25) },
+      users: adminUsage.users.map((u, i) => ({ ...u, last_7_days: i === 0 ? bundle(400_000, 800_000, 100_000, 9.25) : zeros() })),
+    });
     renderDashboard(); await settle();
     const you = within(screen.getByRole("region", { name: "Your usage" }));
     const factory = within(screen.getByRole("region", { name: "Factory usage" }));
-    const users = within(screen.getByRole("region", { name: "Per-user usage, all time" }));
+    const users = within(screen.getByRole("region", { name: /^Per-user usage,/ }));
     expect(screen.getByRole("button", { name: "Last 7 days" }).getAttribute("aria-pressed")).toBe("true");
     expect(you.getByText("$4.55")).toBeTruthy(); expect(factory.getByText("$9.25")).toBeTruthy();
-    expect(screen.getByText("Per-user figures are all time.")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Per user · last 7 days" })).toBeTruthy();
     const table = users.getByRole("table").textContent;
+    expect(users.getAllByRole("row")[1].textContent).toContain("vlad@example.com");
     fireEvent.click(screen.getByRole("button", { name: "All time" }));
     expect(you.getByText("$26.40")).toBeTruthy(); expect(factory.getByText("$88.15")).toBeTruthy();
-    expect(screen.queryByText("Per-user figures are all time.")).toBeNull();
-    expect(users.getByRole("table").textContent).toBe(table);
+    expect(screen.getByRole("heading", { name: "Per user · all time" })).toBeTruthy();
+    expect(users.getByRole("table").textContent).not.toBe(table);
+    expect(users.getAllByRole("row")[1].textContent).toContain("maria@example.com");
     expect(localStorage.getItem("uzi.usageWindow")).toBe("lifetime");
     cleanup(); renderDashboard(); await settle();
     expect(screen.getByRole("button", { name: "All time" }).getAttribute("aria-pressed")).toBe("true");
     fireEvent.click(screen.getByRole("button", { name: "Last 7 days" }));
     expect(localStorage.getItem("uzi.usageWindow")).toBe("last_7_days");
+    expect(within(screen.getByRole("region", { name: "Per-user usage, last 7 days" })).getByRole("table").textContent).toBe(table);
   });
   it("falls back to seven days on invalid storage", async () => {
     localStorage.setItem("uzi.usageWindow", "unsupported"); renderDashboard(); await settle();
@@ -510,7 +516,7 @@ describe("Dashboard usage cards (PRD #40)", () => {
     mockApi.getUsage.mockResolvedValue(selfWithUsage); renderDashboard(); await settle();
     expect(screen.getByRole("region", { name: "Your usage" })).toBeTruthy();
     expect(screen.queryByRole("region", { name: "Factory usage" })).toBeNull();
-    expect(screen.queryByRole("region", { name: "Per-user usage, all time" })).toBeNull();
+    expect(screen.queryByRole("region", { name: /^Per-user usage,/ })).toBeNull();
     expect(mockApi.getAdminUsage).not.toHaveBeenCalled();
   });
 });

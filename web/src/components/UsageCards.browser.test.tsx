@@ -2,14 +2,21 @@
 import "../index.css";
 import { afterEach, expect, it } from "vitest";
 import { page } from "vitest/browser";
-import { cleanup, render, screen } from "@testing-library/react";
+import { useState } from "react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { UsageCard } from "./UsageCards";
+import { UsageCard, type UsageWindow } from "./UsageCards";
+import type { AdminUsage, SelfUsage } from "../lib/api";
 import { mockApi } from "../mocks/mockApi";
 
 afterEach(cleanup);
 
-async function mount() {
+function Harness({ self, admin }: { self: SelfUsage; admin: AdminUsage }) {
+  const [window, onWindowChange] = useState<UsageWindow>("last_7_days");
+  return <UsageCard self={self} admin={admin} window={window} onWindowChange={onWindowChange} />;
+}
+
+async function mount(older = false) {
   const [self, admin] = await Promise.all([mockApi.getUsage(), mockApi.getAdminUsage()]);
   // Different optional rows exercise the subgrid instead of two identical columns.
   self.outcomes.last_7_days.needs_landing = 0;
@@ -17,7 +24,8 @@ async function mount() {
   const owner = admin.users.find((u) => u.user_id === admin.factory.outcomes.lifetime.last_failed_user_id)!;
   owner.email = "a.very.long.owner.name.that.must.truncate@example.com";
   admin.factory.outcomes.lifetime.last_failed_origin = "agent_failure";
-  render(<div className="p-4"><MemoryRouter><UsageCard self={self} admin={admin} window="last_7_days" onWindowChange={() => {}} /></MemoryRouter></div>);
+  if (older) delete admin.users[0].last7_run_count;
+  render(<div className="p-4"><MemoryRouter><Harness self={self} admin={admin} /></MemoryRouter></div>);
   return {
     personal: screen.getByRole("region", { name: "Your usage" }),
     factory: screen.getByRole("region", { name: "Factory usage" }),
@@ -40,6 +48,41 @@ it("aligns all seven column rows at desktop width despite missing optional lines
   expect(cause.clientWidth).toBeGreaterThanOrEqual(cause.scrollWidth);
   const link = factory.querySelector('a[href^="/runs/"]') as HTMLElement;
   expect(link.clientWidth).toBeGreaterThanOrEqual(link.scrollWidth);
+});
+
+it("switches the per-user table and retains its scrollable nine-column layout", async () => {
+  await page.viewport(375, 900);
+  await mount();
+  const users = within(screen.getByRole("region", { name: "Per-user usage, last 7 days" }));
+  const table = users.getByRole("table");
+  const recent = table.textContent;
+  expect(users.getAllByRole("columnheader")).toHaveLength(9);
+  const scroll = table.parentElement!;
+  expect(getComputedStyle(scroll).overflowX).toBe("auto");
+  expect(table.getBoundingClientRect().width).toBeGreaterThanOrEqual(680);
+  expect(scroll.scrollWidth).toBeGreaterThan(scroll.clientWidth);
+  const names = () => users.getAllByRole("row").slice(1, -1).map((row) => row.querySelector("td")!.textContent);
+  const recentNames = names();
+  fireEvent.click(screen.getByRole("button", { name: "All time" }));
+  expect(screen.getByRole("heading", { name: "Per user · all time" })).toBeTruthy();
+  expect(users.getByRole("table").textContent).not.toBe(recent);
+  expect(names()).not.toEqual(recentNames);
+  expect(users.getAllByRole("columnheader")).toHaveLength(9);
+  fireEvent.click(screen.getByRole("button", { name: "Last 7 days" }));
+  expect(users.getByRole("table").textContent).toBe(recent);
+  expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(375);
+});
+
+it("lets an older API use lifetime while seven-day rows remain unavailable", async () => {
+  await mount(true);
+  const users = within(screen.getByRole("region", { name: "Per-user usage, last 7 days" }));
+  expect(users.getByText(/Seven-day per-user usage is unavailable/)).toBeTruthy();
+  expect(users.queryByRole("table")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "All time" }));
+  expect(users.getByRole("table")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Last 7 days" }));
+  expect(users.queryByRole("table")).toBeNull();
+  expect(users.getByText(/Upgrade the API/)).toBeTruthy();
 });
 
 it("stacks at 375px, uses 44px mobile targets and retains its own keyboard outline", async () => {
