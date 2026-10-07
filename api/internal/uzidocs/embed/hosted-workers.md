@@ -49,12 +49,21 @@ lease](#ephemeral-worker-lease)), is the exception on `/data`: its `/data` is
 its own setting, 20Gi by default and set by the operator, whatever size the
 worker runs at. Its CPU and memory still follow its size.
 
-New persistent and ephemeral hosted workers default to **L** for more build
-and test headroom. Compared with **M**, **L** doubles the CPU request and
-raises the memory request from 8Gi to 14Gi (1 CPU / 14Gi instead of 500m / 8Gi), reserving more node capacity.
-Existing workers keep their stored size. Operators can change the ephemeral
-default through `UZI_EPHEMERAL_DEFAULT_SIZE`; users can choose another size
-when provisioning a persistent worker.
+New ephemeral hosted workers default to **M** (1 CPU / 8Gi memory
+requested, 4 CPU / 12Gi memory limits), saving 6Gi of memory reservation per
+worker compared with **L**. New persistent workers still preselect **L**
+(1 CPU / 14Gi requested, 4 CPU / 20Gi limits) for more memory headroom.
+Both **M** and **L** now allocate 25Gi of persistent `/data`; ephemeral data
+retains its independent 20Gi default. Existing persistent **M** data volumes
+stay at 10Gi until reprovisioned: the controller does not resize existing PVCs.
+Existing workers keep their stored size; existing **M** workers receive the
+1-CPU request and 4-CPU limit when the controller next rolls their pod spec.
+Operators set `workers.ephemeralDefaultSize` in the chart (`s`, `m`, or `l`);
+invalid values fail rendering, and so does setting
+`UZI_EPHEMERAL_DEFAULT_SIZE` in `api.config` or `api.secretEnv` (move it to
+`workers.ephemeralDefaultSize`). Non-chart deployments can set
+`UZI_EPHEMERAL_DEFAULT_SIZE`, which defaults and falls back to `m`.
+Users can choose another size when provisioning a persistent worker.
 
 **Every size costs you the same, 1 of your quota below**; there's
 no personal cost to picking bigger. Size for your actual workload anyway,

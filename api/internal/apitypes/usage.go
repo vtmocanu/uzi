@@ -86,11 +86,18 @@ type UsageTailModelDTO struct {
 // failed are UNCHANGED by it (the dashboard splits the `failed` bar into "failed" and
 // "failed, needs landing" whose widths sum to the same `failed`).
 type RunOutcomesDTO struct {
-	Finished     int64 `json:"finished"`
-	Completed    int64 `json:"completed"`
-	Cancelled    int64 `json:"cancelled"`
-	PlanRejected int64 `json:"plan_rejected"`
-	Failed       int64 `json:"failed"`
+	// Lifetime-only recency (#2399). All are null without a failure and in last_7_days.
+	LastFailedAt     *time.Time `json:"last_failed_at"`
+	LastFailedRunID  *string    `json:"last_failed_run_id"`
+	LastFailedOrigin *string    `json:"last_failed_origin"`
+	// Only the factory aggregate supplies the owner, for admin attribution.
+	LastFailedUserID          *string `json:"last_failed_user_id"`
+	CompletedSinceLastFailure *int64  `json:"completed_since_last_failure"`
+	Finished                  int64   `json:"finished"`
+	Completed                 int64   `json:"completed"`
+	Cancelled                 int64   `json:"cancelled"`
+	PlanRejected              int64   `json:"plan_rejected"`
+	Failed                    int64   `json:"failed"`
 	// NeedsLanding is the sub-cut of Failed whose per-run landing_state is needs_landing
 	// (issue #1418). Always needs_landing <= failed; it does NOT enter the finished total.
 	NeedsLanding int64 `json:"needs_landing"`

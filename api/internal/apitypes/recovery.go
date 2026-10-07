@@ -74,6 +74,7 @@ type RecoveryArchiveSummaryDTO struct {
 // IdempotencyKey is the worker's durable source-journal identity, so a lost ACK re-reserves
 // the SAME capture rather than duplicating it.
 type RecoveryReserveRequest struct {
+	CoverageDigest   string `json:"coverage_digest,omitempty"`
 	RunID            string `json:"run_id"`
 	IdempotencyKey   string `json:"idempotency_key"`
 	SourceSha        string `json:"source_sha"`
@@ -123,8 +124,8 @@ type RecoveryCaptureStatusResponse struct {
 }
 
 // RecoveryReleaseResponse is the release ACK for a run's custody (D3): Released is true
-// when the call transitioned any open hold to released, and HoldsReleased is how many open
-// holds it settled (0 on an idempotent repeat once none remain open).
+// when custody is confirmed released. Legacy repeats can return zero HoldsReleased;
+// an exact guarded FINAL retry confirms its stored identity with HoldsReleased=1.
 type RecoveryReleaseResponse struct {
 	RunID         string `json:"run_id"`
 	Released      bool   `json:"released"`
@@ -136,9 +137,9 @@ type RecoveryReleaseResponse struct {
 	Retained bool   `json:"retained,omitempty"`
 	Reason   string `json:"reason,omitempty"`
 	// Generation is the released generation the server ECHOES back on the v2 exact release path
-	// (PRD #1392 M1), set only when a hold was actually released (n>0) so the worker can confirm
-	// the server settled the exact generation it asked to release. Omitempty and a pointer, so a
-	// v1/idempotent-no-op release marshals nothing.
+	// (PRD #1392 M1), including an exact guarded FINAL retry, so the worker can confirm
+	// the server settled the generation it asked to release. Omitempty and a pointer;
+	// a legacy v1/idempotent-no-op release can marshal nothing.
 	Generation *int64 `json:"generation,omitempty"`
 }
 
@@ -148,7 +149,8 @@ type RecoveryReleaseResponse struct {
 // source it did not inherit; a v1 worker omits it (the server settles by run+worker). The
 // call sites that populate it are M2's — M1 only freezes the shape.
 type RecoveryReleaseRequest struct {
-	Generation *int64 `json:"generation,omitempty"`
+	FinalDisposition *RecoveryFinalDisposition `json:"final_disposition,omitempty"`
+	Generation       *int64                    `json:"generation,omitempty"`
 	// ReleaseEvidence is the worker's DECLARATION of WHY this release is warranted (PRD #1392
 	// M1, D3). UNTRUSTED: the server allowlists it to {"publication","forge_no_output"} — the
 	// two dispositions a worker's release endpoint may legitimately assert — and treats
@@ -262,6 +264,7 @@ type RecoverySettleResponse struct {
 // The worker uses this to decide, per generation, whether its source is already durable
 // before it re-attempts capture/release.
 type RecoveryHoldDTO struct {
+	InventoryGuarded    bool   `json:"inventory_guarded"`
 	HoldID              string `json:"hold_id"`
 	Generation          int64  `json:"generation"`
 	HasAvailableCapture bool   `json:"has_available_capture"`
@@ -298,22 +301,24 @@ type RecoveryHoldsResponse struct {
 // superseding | superseded | settling). All three are absent when the run has no live
 // retention record.
 type RecoveryCustodyHoldDTO struct {
-	TerminalRecordRejection string     `json:"terminal_record_rejection,omitempty"`
-	ID                      string     `json:"id"`
-	RunID                   string     `json:"run_id"`
-	Generation              int64      `json:"generation"`
-	State                   string     `json:"state"`
-	Attention               string     `json:"attention"`
-	WorkerID                string     `json:"worker_id"`
-	WorkerName              string     `json:"worker_name,omitempty"`
-	HasAvailableCapture     bool       `json:"has_available_capture"`
-	CaptureState            string     `json:"capture_state,omitempty"`
-	CreatedAt               time.Time  `json:"created_at"`
-	UpdatedAt               time.Time  `json:"updated_at"`
-	ReleasedAt              *time.Time `json:"released_at,omitempty"`
-	CheckpointRef           string     `json:"checkpoint_ref,omitempty"`
-	CheckpointTip           string     `json:"checkpoint_tip,omitempty"`
-	CheckpointState         string     `json:"checkpoint_state,omitempty"`
+	InventoryGuarded        bool                      `json:"inventory_guarded"`
+	FinalReceipt            *RecoveryFinalDisposition `json:"final_receipt,omitempty"`
+	TerminalRecordRejection string                    `json:"terminal_record_rejection,omitempty"`
+	ID                      string                    `json:"id"`
+	RunID                   string                    `json:"run_id"`
+	Generation              int64                     `json:"generation"`
+	State                   string                    `json:"state"`
+	Attention               string                    `json:"attention"`
+	WorkerID                string                    `json:"worker_id"`
+	WorkerName              string                    `json:"worker_name,omitempty"`
+	HasAvailableCapture     bool                      `json:"has_available_capture"`
+	CaptureState            string                    `json:"capture_state,omitempty"`
+	CreatedAt               time.Time                 `json:"created_at"`
+	UpdatedAt               time.Time                 `json:"updated_at"`
+	ReleasedAt              *time.Time                `json:"released_at,omitempty"`
+	CheckpointRef           string                    `json:"checkpoint_ref,omitempty"`
+	CheckpointTip           string                    `json:"checkpoint_tip,omitempty"`
+	CheckpointState         string                    `json:"checkpoint_state,omitempty"`
 }
 
 // RecoveryCustodyAggregateDTO is the owner-level custody summary the board alert and the
@@ -334,4 +339,13 @@ type RecoveryCustodyAggregateDTO struct {
 type RecoveryCustodyHoldsDTO struct {
 	Aggregate RecoveryCustodyAggregateDTO `json:"aggregate"`
 	Holds     []RecoveryCustodyHoldDTO    `json:"holds"`
+}
+
+// RecoveryFinalDisposition binds a final archive or empty settled inventory to an exact hold.
+// It is also the owner's read-only receipt after worker deletion.
+type RecoveryFinalDisposition struct {
+	Kind           string `json:"kind"`
+	CaptureID      string `json:"capture_id,omitempty"`
+	SourceSha      string `json:"source_sha,omitempty"`
+	CoverageDigest string `json:"coverage_digest"`
 }

@@ -45,6 +45,9 @@ var ErrAmbiguous = errors.New("recovery: ambiguous open custody generation")
 // per-owner) gate a genuinely new capture; a retry of an existing key is exempt. Reserve never
 // touches the runs table.
 func (s *Service) Reserve(ctx context.Context, wkr store.Worker, runID uuid.UUID, req apitypes.RecoveryReserveRequest) (apitypes.RecoveryReserveResponse, error) {
+	if req.CoverageDigest != "" && !validCoverageDigest(req.CoverageDigest) {
+		return apitypes.RecoveryReserveResponse{}, ErrBadRequest
+	}
 	sourceSha, err := validateSha(req.SourceSha, false)
 	if err != nil {
 		return apitypes.RecoveryReserveResponse{}, ErrBadRequest
@@ -75,7 +78,7 @@ func (s *Service) Reserve(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		holdID     uuid.UUID
 		generation int64
 	)
-	if slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV2) && req.Generation != nil {
+	if (slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV2) || slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryInventoryV1)) && req.Generation != nil {
 		generation = *req.Generation
 		err = tx.QueryRow(ctx, `SELECT id FROM recovery_custody_holds
 			WHERE run_id = $1 AND user_id = $2 AND original_worker_id = $3 AND generation = $4 AND state = 'open'
@@ -135,9 +138,13 @@ func (s *Service) Reserve(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		AttemptedHeadSha:       pgconv.TextOrNull(attempted),
 		IdempotencyKey:         key,
 		Generation:             generation,
+		CoverageDigest:         pgconv.TextOrNull(req.CoverageDigest),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			if existing {
+				return apitypes.RecoveryReserveResponse{}, ErrManifestConflict
+			}
 			return apitypes.RecoveryReserveResponse{}, ErrNotAuthorized
 		}
 		return apitypes.RecoveryReserveResponse{}, err
@@ -619,6 +626,7 @@ func (s *Service) ListHoldsForWorkerRun(ctx context.Context, wkr store.Worker, r
 	for _, r := range rows {
 		holds = append(holds, apitypes.RecoveryHoldDTO{
 			HoldID:              r.ID.String(),
+			InventoryGuarded:    r.InventoryGuarded,
 			Generation:          r.Generation,
 			HasAvailableCapture: r.HasAvailableCapture,
 			CaptureState:        r.CaptureState,
@@ -639,6 +647,9 @@ func (s *Service) ListHoldsForWorkerRun(ctx context.Context, wkr store.Worker, r
 // open settles zero (Released=false). It NEVER falls back to a generation-blind run+worker bulk
 // release.
 func (s *Service) Release(ctx context.Context, wkr store.Worker, runID uuid.UUID, req apitypes.RecoveryReleaseRequest) (apitypes.RecoveryReleaseResponse, error) {
+	if req.FinalDisposition != nil {
+		return s.releaseFinalInventory(ctx, wkr, runID, req)
+	}
 	// PRD #1392 M1 (D3): the worker's release-evidence declaration is UNTRUSTED and allowlisted
 	// to the two dispositions a worker's release endpoint may legitimately assert; an unknown
 	// non-nil value is a bad request (never a silently-stamped bogus class). Absent → no
@@ -648,7 +659,7 @@ func (s *Service) Release(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		return apitypes.RecoveryReleaseResponse{}, err
 	}
 	// v2 + explicit generation: settle EXACTLY that generation (fail-safe by rowcount).
-	if slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV2) && req.Generation != nil {
+	if (slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV2) || slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryInventoryV1)) && req.Generation != nil {
 		n, err := store.New(s.pool).ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
 			RunID:           runID,
 			Generation:      *req.Generation,

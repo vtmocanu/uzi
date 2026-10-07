@@ -1,3 +1,4 @@
+import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { afterEach, beforeEach, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -31,7 +32,7 @@ async function setup(): Promise<{ bare: string; clone: string }> {
   return { bare, clone: rc.path };
 }
 async function track(bare: string, clone: string): Promise<void> {
-  await cache.fetchAgentBranch(bare, clone, branch, "scratch-test");
+  await fixtureFetchTracking(cache, bare, clone, branch, "scratch-test");
 }
 beforeEach(() => { fx = makeFixture(); cache = new GitCache(fx.dataDir, nullLogger()); });
 afterEach(() => fx.cleanup());

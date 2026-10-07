@@ -172,6 +172,12 @@ Global flags: `--json`, `--url <url>`, `--quiet`, `--no-color`,
 
 A few worth knowing:
 
+- **`uzi admin usage` includes failure recency.** The factory line and each
+  user's `SINCE` column show time since the last failed run in minutes, hours,
+  or days. A scope with finished runs but no failures shows `no failures`;
+  one with no finished runs shows `-`. These are the same lifetime definitions
+  as Overview: chat, judge, and rejected plans do not count as failures.
+
 - **`--harness` picks the run's execution engine; omit it to let the server
   resolve one.** `run create --harness claude|codex` and `schedule create
   --harness claude|codex` request a specific harness outright; omitting the
@@ -975,8 +981,10 @@ uzi run recovery <run-id> [--json]
 ```
 
 - The per-run view shows each hold's exact id, claim generation, and its attention state — active
-  protection, a capture in flight, an archive ready (which releases automatically), or a
-  capture-less source that needs a decision — plus the latest capture state. A `source_only`
+  protection, a capture in flight, or a ready archive. Legacy holds can release
+  automatically on archive readiness; guarded holds await final inventory acknowledgment.
+  The status also distinguishes a capture-less source that needs a decision and shows
+  the latest capture state. A `source_only`
   hold prints `hold <hold-id>: no recovery archive; custody of worker <name>'s local source is
   retained (export unavailable; it may be the only copy)`, and the same export and discard
   hints as above follow. `--json` prints

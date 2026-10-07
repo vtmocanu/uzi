@@ -830,17 +830,18 @@ func failedFigure(failed, needsLanding int64) string {
 
 // renderAdminUsage prints the factory lifetime totals plus the per-user breakdown.
 // The factory line and the per-user table carry the PRD #1293 failed-run figures
-// (lifetime), mirroring the web column order (D8): Runs · Failed · Fail rate come
+// (lifetime), mirroring the web column order (D8): Runs · Failed · Fail rate · Since last failure come
 // before the token columns. SHARE stays web-only.
 func renderAdminUsage(p *uzicli.Printer, u apitypes.AdminUsageDTO) error {
+	now := time.Now()
 	lt := u.Factory.Lifetime
 	lo := u.Factory.Outcomes.Lifetime
 	// failed carries the needs-landing sub-cut inline (issue #1418): "failed=106" normally,
 	// "failed=106 (3 need landing)" when some failed runs are human-landable — the CLI half of
 	// the dashboard's failed-bar split, terse and appended only when needs_landing > 0.
-	p.Printf("factory (lifetime): input=%d cache_read=%d cache_creation=%d output=%d cost=$%.2f (runs=%d) finished=%d failed=%s fail_rate=%s\n",
+	p.Printf("factory (lifetime): input=%d cache_read=%d cache_creation=%d output=%d cost=$%.2f (runs=%d) finished=%d failed=%s fail_rate=%s since_last_failure=%s\n",
 		lt.InputTokens, lt.CacheReadTokens, lt.CacheCreationTokens, lt.OutputTokens, lt.CostUSD, u.Factory.RunCount,
-		lo.Finished, failedFigure(lo.Failed, lo.NeedsLanding), failRate(lo.Failed, lo.Finished))
+		lo.Finished, failedFigure(lo.Failed, lo.NeedsLanding), failRate(lo.Failed, lo.Finished), sinceLastFailure(lo, now))
 	if len(u.Users) == 0 {
 		return nil
 	}
@@ -854,12 +855,34 @@ func renderAdminUsage(p *uzicli.Printer, u apitypes.AdminUsageDTO) error {
 			// per-user row and the total read the split the same way (no new column).
 			failedFigure(row.Outcomes.Failed, row.Outcomes.NeedsLanding),
 			failRate(row.Outcomes.Failed, row.Outcomes.Finished),
+			sinceLastFailure(row.Outcomes, now),
 			fmt.Sprintf("%d", row.Usage.InputTokens),
 			fmt.Sprintf("%d", row.Usage.OutputTokens),
 			fmt.Sprintf("$%.2f", row.Usage.CostUSD),
 		})
 	}
-	return p.Table([]string{"EMAIL", "RUNS", "FAILED", "FAIL%", "INPUT", "OUTPUT", "COST"}, rows)
+	return p.Table([]string{"EMAIL", "RUNS", "FAILED", "FAIL%", "SINCE", "INPUT", "OUTPUT", "COST"}, rows)
+}
+
+// sinceLastFailure uses the same whole-minute/hour/day boundaries as the Overview.
+func sinceLastFailure(o apitypes.RunOutcomesDTO, now time.Time) string {
+	if o.LastFailedAt == nil {
+		if o.Finished == 0 {
+			return "-"
+		}
+		return "no failures"
+	}
+	minutes := int64(now.Sub(*o.LastFailedAt) / time.Minute)
+	if minutes < 1 {
+		return "<1m"
+	}
+	if minutes < 60 {
+		return fmt.Sprintf("%dm", minutes)
+	}
+	if minutes < 1440 {
+		return fmt.Sprintf("%dh", minutes/60)
+	}
+	return fmt.Sprintf("%dd", minutes/1440)
 }
 
 func vaultCell(locked bool) string {

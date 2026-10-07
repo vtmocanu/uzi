@@ -1,3 +1,4 @@
+import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -169,7 +170,7 @@ async function publishWipParkCheckpoint(
     gitIn(seed.path, ["log", "-1", "--format=%s"]).startsWith(WIP_PARK_COMMIT_PREFIX),
     "the checkpoint tip is a wip(park) marker",
   );
-  await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+  await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
   const packed = await gitA.checkpointPack(bareA, branch);
   assert.ok(packed, "worker A builds a checkpoint pack from its tracking ref");
   assert.strictEqual(packed!.tipOid, marker, "the pack tip is the wip(park) marker");
@@ -206,7 +207,7 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     fs.writeFileSync(path.join(seed.path, ".uzi", "scratch", "worker-A.log"), "private artifact");
     commit(seed.path, "M1.txt");
     const cpTip = commit(seed.path, "M2.txt"); // ≥1 commit strictly ahead of the floor
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
     const packed = await gitA.checkpointPack(bareA, branch);
     assert.ok(packed, "worker A builds a checkpoint pack from its tracking ref");
     assert.strictEqual(packed!.tipOid, cpTip, "the pack tip is the checkpoint tip");
@@ -324,7 +325,7 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     assert.strictEqual(committed, true, "commitWipMarker planted a marker for the dirty tree");
     const markerSubject = gitIn(seed.path, ["log", "-1", "--format=%s"]);
     assert.ok(markerSubject.startsWith(WIP_PARK_COMMIT_PREFIX), "the marker subject is prefixed wip(park):");
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
 
     // THE RESEED (same worker, same run): the tracking ref is owned here and its tip is the
     // marker, so M2's reset --soft fires.
@@ -584,7 +585,7 @@ describe("resume-relaxed checkpoint adoption (PRD #1030 M3)", () => {
     const seed = await gitA.createOrAttachRunnerClone(bareA, issue, noProofReseed, "run-A");
     let tip = gitIn(seed.path, ["rev-parse", "HEAD"]);
     for (const m of milestones) tip = commit(seed.path, m);
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
     const packed = await gitA.checkpointPack(bareA, branch);
     assert.ok(packed, "worker A builds a checkpoint pack from its tracking ref");
     assert.strictEqual(packed!.tipOid, tip, "the pack tip is the committed checkpoint tip");

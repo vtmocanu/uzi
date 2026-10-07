@@ -60,9 +60,10 @@ var serverRecoveryWaitCauses = map[string]bool{
 
 // parkForgeUnreachable is SetState's forge pre-clone park transaction (PRD #1392 M1, D2/D3/D4).
 // A transient forge failure at clone parks the run on 'recovery_wait' with a typed cause,
-// settling its exact-generation custody hold in the SAME locked transaction, or fails it past
-// the forge cap, or — if an owner cancel was stamped during the retries — cancels it (still
-// releasing the hold). It returns (run, rows, err):
+// settling a legacy exact-generation custody hold in the SAME locked transaction while
+// retaining guarded inventory, or fails it past the forge cap, or cancels it when an owner
+// cancel was stamped during the retries. Guarded custody survives each transition.
+// It returns (run, rows, err):
 //
 //   - rows == 1, err == nil: an APPLIED transition (park, cap-fail, or cancel). The committed
 //     run is returned; SetState re-reads it and runs the shared terminal fan-out (the pre-clone
@@ -76,8 +77,8 @@ var serverRecoveryWaitCauses = map[string]bool{
 //
 // Precedence (strict): a claim-generation mismatch is stale_claim, checked FIRST with nothing
 // mutated; then the already-parked idempotent case answers recovery_wait (no reason); then a
-// current, unreleased generation whose exact-hold cardinality or release step cannot settle
-// rolls back as custody_unsettled.
+// current, unreleased generation whose exact-hold cardinality or legacy release step cannot
+// settle rolls back as custody_unsettled. A guarded hold stays open through an applied park.
 func (s *Service) parkForgeUnreachable(ctx context.Context, wkr store.Worker, owned store.Run, req StateRequest, sessionID pgtype.Text) (store.Run, int64, error) {
 	// A forge park report MUST carry the claim generation it holds — it is the #1247 fence the
 	// stale_claim precedence keys on. Absent is a protocol error (400), not a stale claim: a
@@ -144,24 +145,30 @@ func (s *Service) parkForgeUnreachable(ctx context.Context, wkr store.Worker, ow
 	if len(holdIDs) != 1 {
 		return run, 0, ErrForgeParkCustodyUnsettled
 	}
-	released, err := qtx.ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
-		RunID:      run.ID,
-		Generation: *req.ClaimGeneration,
-		WorkerID:   wkr.ID,
-		// D3: a generation that never adopted a source has nothing to prove against the forge.
-		ReleaseEvidence: pgconv.TextOrNull("no_adopted_source"),
-	})
+	hold, err := qtx.GetCustodyHoldForSettle(ctx, store.GetCustodyHoldForSettleParams{HoldID: holdIDs[0], RunID: run.ID})
 	if err != nil {
 		return store.Run{}, 0, err
 	}
-	if released != 1 {
-		return run, 0, ErrForgeParkCustodyUnsettled
+	// A delivered claim can have adopted local sources before reporting a forge failure.
+	// Retain guarded inventory through this park; only the server's pre-delivery
+	// ReleaseClaimCustodyNoAdoptedSource path supplies that final disposition.
+	if !hold.InventoryGuarded {
+		released, err := qtx.ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
+			RunID: run.ID, Generation: *req.ClaimGeneration, WorkerID: wkr.ID,
+			ReleaseEvidence: pgconv.TextOrNull("no_adopted_source"),
+		})
+		if err != nil {
+			return store.Run{}, 0, err
+		}
+		if released != 1 {
+			return run, 0, ErrForgeParkCustodyUnsettled
+		}
 	}
 
 	// A stop verdict may have been stamped concurrently during the clone retries (fact 4: the
 	// stamp has no status guard). If one is present, this is a deliberate wind-down, not a park:
-	// transition to 'cancelled' (the hold is already released above, so the cancelled generation
-	// leaves no open hold) and commit. An owner cancel is the realistic pre-clone verdict; a
+	// transition to 'cancelled' and commit. The legacy hold was released above; guarded
+	// inventory remains in custody pending final disposition. An owner cancel is the realistic pre-clone verdict; a
 	// graceful 'stopped' converges to 'cancelled' the same way the failed arm does
 	// (CancelRunByWorker). Only a run with NO stamped verdict proceeds to park-or-fail.
 	//
@@ -234,7 +241,7 @@ func (s *Service) parkForgeUnreachable(ctx context.Context, wkr store.Worker, ow
 	if perr != nil {
 		if errors.Is(perr, pgx.ErrNoRows) {
 			// The status='running' guard did not match under the lock — impossible given the check
-			// above, but refuse safely rather than commit a partial (released) transaction.
+			// above, but refuse safely rather than commit a partial custody/park transaction.
 			return run, 0, ErrForgeParkCustodyUnsettled
 		}
 		return store.Run{}, 0, perr
@@ -242,23 +249,20 @@ func (s *Service) parkForgeUnreachable(ctx context.Context, wkr store.Worker, ow
 	if err := tx.Commit(ctx); err != nil {
 		return store.Run{}, 0, err
 	}
-	// PRD #1810 D3: the exact hold's release committed with the park. Unlike the cancel and fail
-	// arms above (terminal transitions, where this trigger can settle a real record), THIS arm
-	// leaves the run live: records are written at a terminal transition, so a parked run normally
-	// has none and the settle finds nothing to do. It is wired for parity (every custody release
-	// writer triggers the settle check after its commit) and stays safe if a record exists: the
-	// settle re-reads it under the run's lock and acts only through its own state and open-hold
-	// guards.
+	// PRD #1810 D3: legacy custody release committed with the park; guarded custody remains
+	// open. This arm leaves the run live, so it normally has no terminal retention record.
+	// The post-commit settlement check re-reads any record under the run lock and respects
+	// its state and open-hold guards, including the retained inventory hold.
 	s.SettleRetainedCheckpoint(run.ID)
 	return parked, 1, nil
 }
 
 // failForgeUnsettleable is the fail-safe for a forge_unreachable park report when no
-// transaction beginner is wired (s.txBeginner == nil), so the atomic release+park cannot run
-// (PRD #1392 M1, D3). It MUST NOT do a blind untyped park (that would park while leaking the
-// generation's custody hold), so it takes today's safe FAILED path — the run fails with the
-// coerced/default origin exactly as a pre-#1392 forge clone failure did, and the custody-release
-// reconciler remains the backstop for the still-open hold. In production txBeginner is always
+// transaction beginner is wired (s.txBeginner == nil), so the atomic custody decision and park
+// cannot run (PRD #1392 M1, D3). It MUST NOT do a blind untyped park without validating custody,
+// so it takes the existing FAILED path with the coerced/default origin. The reconciler remains
+// the legacy backstop; guarded custody awaits final disposition or explicit owner discard.
+// In production txBeginner is always
 // wired, so this is the tests/degraded-deployment path.
 func (s *Service) failForgeUnsettleable(ctx context.Context, wkr store.Worker, runID uuid.UUID, harness string, req StateRequest, sessionID pgtype.Text) (int64, error) {
 	failOrigin := "agent_failure"

@@ -607,6 +607,7 @@ type Store interface {
 	// call (checkpoint_publish_attempts, 00267), and the sweeper's attempts arm that reconciles a
 	// push whose outcome the api never learned.
 	RecordCheckpointPublishAttempt(ctx context.Context, arg store.RecordCheckpointPublishAttemptParams) (uuid.UUID, error)
+	MarkCheckpointPublishAttemptReady(ctx context.Context, id uuid.UUID) (int64, error)
 	DeleteCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (int64, error)
 	GetCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (store.CheckpointPublishAttempt, error)
 	RunHasCheckpointPublishAttempt(ctx context.Context, arg store.RunHasCheckpointPublishAttemptParams) (bool, error)
@@ -3053,15 +3054,16 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 		// PRD #1296 M1 (D2/D3/D4): the durable-recovery claim/custody contract.
 		//   - CustodyHoldLimit gates admission: a claim is blocked once the owner holds
 		//     >= this many unresolved (open) custody holds (owner-scoped, never global).
-		//   - RecoveryCapable derives from the worker's advertised recovery_archive_v1
-		//     protocol capability (D9 additive versioned contract): the custody hold is
+		//   - RecoveryCapable derives from the worker's advertised recovery_archive_v1,
+		//     recovery_archive_v2 or recovery_inventory_v1 protocol capability (D9 additive
+		//     versioned contract; any one of the three suffices): the custody hold is
 		//     opened in the claim CTE only for a capable worker on a code-publishing
 		//     profile, so an old worker on a supporting API is honestly unsupported rather
 		//     than falsely promised recovery.
 		//   - WorkerIdentity is the immutable provenance value recorded on the hold for a
 		//     later AAD-authenticated post-terminal recovery retry (never nulled).
 		CustodyHoldLimit: custodyHoldLimit,
-		RecoveryCapable:  slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV1),
+		RecoveryCapable:  (slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV1) || slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV2) || slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryInventoryV1)),
 		WorkerIdentity:   workerIdentity(wkr),
 		// PRD #1390 M3: the three snapshot-dedupe params. @snapshot_fresh_cutoff bounds the
 		// persisted-snapshot freshness test; the request arrays are the claimant's own listed runs

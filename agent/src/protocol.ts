@@ -1193,6 +1193,8 @@ export interface ClaimPlanCrossCheck {
 }
 
 export interface ClaimResponse {
+  /** Protection requires this exact-generation assertion AND recovery_inventory_v1. */
+  inventory_guarded?: boolean;
   cross_check?: ClaimPlanCrossCheck;
   run_id: string;
   /** Run kind (PRD #6). "issue": work issue_iid's card. "ci_fix": diagnose + fix
@@ -2735,6 +2737,7 @@ export interface InputsResponse {
  *  status of a run this worker owns. A 404 (not owned / reclaimed) is signalled by a
  *  thrown RequestError, not by this shape. */
 export interface RunOwnershipResponse {
+  inventory_guarded?: boolean;
   status: string;
   /** PRD #1391 Run B M4: the run's current `claim_generation` (additive on the probe). The run-lane
    *  claim router proceeds to execute ONLY on a `claimed`/`running` row AT the claim's generation; a
@@ -2795,6 +2798,7 @@ export interface RunOrphanClassificationResponse {
  *  is the provenance H' (omitted when no publish was attempted); idempotency_key is the
  *  worker's durable source-journal identity, so a lost ACK re-reserves the SAME capture. */
 export interface RecoveryReserveRequest {
+  coverage_digest?: string;
   run_id: string;
   idempotency_key: string;
   source_sha: string;
@@ -2865,7 +2869,15 @@ export interface RecoveryReleaseResponse {
  *  it names (PRD #1349 M1, D1/D2). A v2 worker sends generation so the server releases only
  *  the hold it took at that claim generation; a v1 worker omits it (settle by run+worker).
  *  The call sites that populate it are M2's — M1 only freezes the shape. */
+export interface RecoveryFinalDisposition {
+  kind: "archive" | "settled";
+  capture_id?: string;
+  source_sha?: string;
+  coverage_digest: string;
+}
+
 export interface RecoveryReleaseRequest {
+  final_disposition?: RecoveryFinalDisposition;
   generation?: number;
   /** PRD #1392 M1/M2 (fact 9): the worker's own evidence class for THIS release, allowlisted
    *  server-side to {publication, forge_no_output} (anything else → 400). A completion release
@@ -2881,6 +2893,7 @@ export interface RecoveryReleaseRequest {
  *  has_available_capture is true when a ready archive already covers this hold's source, and
  *  capture_state is the latest capture's lifecycle state ('' when the hold has no capture). */
 export interface RecoveryHold {
+  inventory_guarded?: boolean;
   hold_id: string;
   generation: number;
   has_available_capture: boolean;

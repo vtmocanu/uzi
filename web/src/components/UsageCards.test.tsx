@@ -1,12 +1,13 @@
 // @vitest-environment jsdom
-import { afterEach, describe, it, expect } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { act, cleanup, render } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { YourUsageCard, FactoryTotalCard, PerUserUsageTable } from "./UsageCards";
 import type { SelfUsage, AdminUsage, RunOutcomes } from "../lib/api";
 import type { ReactNode } from "react";
+import { setDemoMode } from "../lib/demoMode";
 
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.useRealTimers(); setDemoMode(false); });
 
 const bundle = (inp: number, cr: number, out: number, cost: number) => ({
   input_tokens: inp,
@@ -38,7 +39,7 @@ const outcomes = (
   plan_rejected: planRejected,
   failed,
   needs_landing: needsLanding,
-  fail_origins: origins,
+  last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: origins,
 });
 // The empty (nothing-finished) two-window shape, so a fixture that predates PRD #1293 keeps
 // the FailedRunsBlock hidden (finished === 0) and behaves exactly as before.
@@ -226,7 +227,7 @@ describe("FactoryTotalCard + PerUserUsageTable", () => {
 });
 
 describe("FailedRunsBlock (PRD #1293)", () => {
-  it("includes provider policy refusals in causes and failed totals with the same finished denominator", () => {
+  it("includes provider policy refusals in failed totals with the same finished denominator", () => {
     const lifetime = outcomes(10, 5, 1, 1, 3, { provider_policy_refusal: 2, agent_failure: 1 });
     const last7 = outcomes(4, 2, 0, 1, 1, { provider_policy_refusal: 1 });
     const usage: SelfUsage = {
@@ -247,8 +248,6 @@ describe("FailedRunsBlock (PRD #1293)", () => {
     const { container, getByText } = wrap(
       <><YourUsageCard usage={usage} /><PerUserUsageTable admin={admin} /></>,
     );
-    const cause = getByText("provider safety-policy refusal");
-    expect(cause.parentElement?.textContent).toBe("provider safety-policy refusal 2");
     expect(getByText(/finished runs ·/).textContent).toBe(
       "3 of 10 finished runs · 25.0% (1 of 4) last 7d",
     );
@@ -263,13 +262,13 @@ describe("FailedRunsBlock (PRD #1293)", () => {
       expect(cells[2].textContent).toBe("3");
       expect(cells[3].textContent).toBe("30.0%");
       expect(cells[3].getAttribute("title")).toBe("3 of 10 finished runs");
-      expect(cells[4].textContent).toBe("1.0k");
-      expect(cells[6].textContent).toBe("$1.25");
+      expect(cells[5].textContent).toBe("1.0k");
+      expect(cells[7].textContent).toBe("$1.25");
     }
     expect(container.querySelectorAll("tbody tr").length).toBe(2);
   });
 
-  it("renders the rate, counts sentence, four-count legend, top causes, and bar aria-label", () => {
+  it("renders the rate, counts sentence, four-count legend, and bar aria-label", () => {
     const usage: SelfUsage = {
       lifetime: bundle(1_000_000, 0, 200_000, 1.23),
       last_7_days: bundle(100_000, 0, 50_000, 0.5),
@@ -287,8 +286,8 @@ describe("FailedRunsBlock (PRD #1293)", () => {
         last_7_days: outcomes(38, 33, 1, 1, 3, { agent_failure: 2, run_timeout: 1 }),
       },
     };
-    const { container, getByText } = wrap(<YourUsageCard usage={usage} />);
-    expect(getByText("Failed runs")).toBeTruthy();
+    const { container, getByText, getByRole } = wrap(<YourUsageCard usage={usage} />);
+    expect(getByRole("heading", { name: "10.4% failed runs" })).toBeTruthy();
     // Lifetime rate + counts sentence with the 7-day clause, both one decimal.
     expect(container.textContent).toContain("10.4%");
     expect(container.textContent).toContain("106 of 1024 finished runs");
@@ -303,12 +302,6 @@ describe("FailedRunsBlock (PRD #1293)", () => {
     expect(container.textContent).toContain("cancelled 45");
     expect(container.textContent).toContain("plan rejected 12");
     expect(container.textContent).toContain("failed 106");
-    // Top causes: the four largest by count, human-labelled; the 5th (unknown 4) is dropped.
-    expect(container.textContent).toContain("agent failure 48");
-    expect(container.textContent).toContain("run timeout 31");
-    expect(container.textContent).toContain("worker lost 14");
-    expect(container.textContent).toContain("rate limited 9");
-    expect(container.textContent).not.toContain("unknown");
     // The stacked bar carries the same four counts as an accessible sentence.
     const bar = container.querySelector('[role="img"]');
     expect(bar?.getAttribute("aria-label")).toBe(
@@ -324,8 +317,9 @@ describe("FailedRunsBlock (PRD #1293)", () => {
       ...noAggregateCostCounts,
       outcomes: { lifetime: outcomes(0, 0, 0, 0, 0), last_7_days: outcomes(0, 0, 0, 0, 0) },
     };
-    const { container } = wrap(<YourUsageCard usage={usage} />);
-    expect(container.textContent).not.toContain("Failed runs");
+    const { container, getByRole, queryByRole } = wrap(<YourUsageCard usage={usage} />);
+    expect(getByRole("heading", { name: "No finished runs yet" })).toBeTruthy();
+    expect(queryByRole("heading", { name: /failed runs$/ })).toBeNull();
     expect(container.querySelector('[role="img"]')).toBeNull();
   });
 
@@ -346,14 +340,23 @@ describe("FailedRunsBlock (PRD #1293)", () => {
     // The counts sentence and rate keep reading the FULL failed count (10), not the split.
     expect(container.textContent).toContain("10 of 100 finished runs");
     expect(container.textContent).toContain("10.0%");
-    // Legend: the plain failed segment reflects 6, and the needs-landing sub-cut its own 4.
-    expect(container.textContent).toContain("failed 6");
-    expect(container.textContent).toContain("failed, needs landing 4");
-    // The aria-label names the new bucket, with the split counts summing back to failed=10.
+    // The grouped legend agrees with the headline, preserving both swatches.
+    const failedLegend = Array.from(container.querySelectorAll("li")).find((li) => li.textContent?.startsWith("failed"));
+    expect(failedLegend?.textContent).toBe("failed 10 (4 need landing)");
+    const swatches = failedLegend?.querySelectorAll<HTMLElement>('span[aria-hidden="true"]');
+    expect(swatches?.length).toBe(2);
+    expect(swatches?.[0].style.background).toBe("rgb(var(--danger))");
+    expect(swatches?.[1].style.background).toContain("repeating-linear-gradient");
+    // The accessible sentence uses that same grouped failed total.
     const bar = container.querySelector('[role="img"]');
     expect(bar?.getAttribute("aria-label")).toBe(
-      "Finished runs: 85 completed, 3 cancelled, 2 plan rejected, 6 failed, 4 failed, needs landing",
+      "Finished runs: 85 completed, 3 cancelled, 2 plan rejected, 10 failed (4 need landing)",
     );
+    // The visual bar still separates six plain failures and four landable ones.
+    const segments = bar?.querySelectorAll<HTMLElement>(":scope > span");
+    expect(segments?.length).toBe(5);
+    expect(segments?.[3].style.width).toBe("6%");
+    expect(segments?.[4].style.width).toBe("4%");
   });
 
   it("shows no needs-landing segment when needs_landing === 0 (no zero clutter)", () => {
@@ -369,7 +372,9 @@ describe("FailedRunsBlock (PRD #1293)", () => {
     };
     const { container } = wrap(<YourUsageCard usage={usage} />);
     expect(container.textContent).not.toContain("needs landing");
-    // The plain failed segment carries the full failed count when nothing needs landing.
+    // One solid swatch and the full failed total when nothing needs landing.
+    const failedLegend = Array.from(container.querySelectorAll("li")).find((li) => li.textContent?.startsWith("failed"));
+    expect(failedLegend?.querySelectorAll('span[aria-hidden="true"]').length).toBe(1);
     expect(container.textContent).toContain("failed 10");
     const bar = container.querySelector('[role="img"]');
     expect(bar?.getAttribute("aria-label")).toBe(
@@ -399,10 +404,10 @@ describe("PerUserUsageTable failed columns (PRD #1293)", () => {
     earliest_run: null,
   };
 
-  it("orders the header exactly User · Runs · Failed · Fail rate · Tokens · Out · Cost · Share (D8)", () => {
+  it("orders the header exactly User · Runs · Failed · Fail rate · Since last failure · Tokens · Out · Cost · Share (D8)", () => {
     const { container } = wrap(<PerUserUsageTable admin={adminRich} />);
     const headers = Array.from(container.querySelectorAll("thead th")).map((th) => th.textContent);
-    expect(headers).toEqual(["User", "Runs", "Failed", "Fail rate", "Tokens", "Out", "Cost", "Share"]);
+    expect(headers).toEqual(["User", "Runs", "Failed", "Fail rate", "Since last failure", "Tokens", "Out", "Cost", "Share"]);
   });
 
   it("puts the exact fraction on every fail-rate cell's title (D9)", () => {
@@ -500,5 +505,94 @@ describe("FactoryTotalCard + PerUserUsageTable cost disclosure (PRD #1429 D7)", 
     // ...and the total row discloses the factory-wide sum (3 subscription + 1 unreported),
     // not just this one row's count.
     expect(container.textContent).toContain("Cost excludes 3 Codex subscription runs and 1 unreported run");
+  });
+});
+
+describe("failure recency cards and table (#2399)", () => {
+  const usage = (lifetime: RunOutcomes): SelfUsage => ({
+    lifetime: bundle(0, 0, 0, 0), last_7_days: bundle(0, 0, 0, 0), run_count: 0,
+    ...noAggregateCostCounts, outcomes: { lifetime, last_7_days: outcomes(0, 0, 0, 0, 0) },
+  });
+  const failed = (): RunOutcomes => ({
+    ...outcomes(20, 19, 0, 0, 1, { worker_lost: 1 }),
+    last_failed_at: new Date(Date.now() - 6 * 3_600_000).toISOString(),
+    last_failed_run_id: "7c41a2e0-0000-4000-8000-000000000001",
+    last_failed_origin: "worker_lost", completed_since_last_failure: 14,
+  });
+  it("shows recency and a reachable run link even without token usage", () => {
+    const { getByText, getByRole } = wrap(<YourUsageCard usage={usage(failed())} />);
+    expect(getByRole("heading", { name: "6h since last failed run" })).toBeTruthy();
+    expect(getByText("14 completed since")).toBeTruthy();
+    expect(getByText(/last: worker lost/)).toBeTruthy();
+    expect(getByRole("link", { name: /run 7c41a2e0/ }).getAttribute("href")).toBe("/runs/7c41a2e0-0000-4000-8000-000000000001");
+  });
+  it("distinguishes no finished runs from completed runs without failures", () => {
+    const { getByText, getByRole, queryByText, rerender } = wrap(<YourUsageCard usage={usage(outcomes(0, 0, 0, 0, 0))} />);
+    expect(getByRole("heading", { name: "No finished runs yet" })).toBeTruthy();
+    expect(queryByText("0 completed runs, none failed")).toBeNull();
+    rerender(<MemoryRouter><YourUsageCard usage={usage(outcomes(4, 3, 1, 0, 0))} /></MemoryRouter>);
+    expect(getByRole("heading", { name: "No recorded failures" }).classList.contains("text-ok")).toBe(true);
+    expect(getByText("3 completed runs, none failed")).toBeTruthy();
+  });
+  it("advances elapsed time between API refreshes", async () => {
+    vi.useFakeTimers();
+    const row = { ...failed(), last_failed_at: new Date(Date.now() - 59_000).toISOString() };
+    const { getByText } = wrap(<YourUsageCard usage={usage(row)} />);
+    expect(getByText("<1m")).toBeTruthy();
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(getByText("1m")).toBeTruthy();
+  });
+  it("attributes the factory failure and renders all per-user states plus factory total", () => {
+    const row = failed();
+    const admin: AdminUsage = {
+      factory: usage({ ...row, last_failed_user_id: "owner" }), earliest_run: null,
+      users: [
+        { user_id: "owner", email: "owner@example.com", usage: bundle(0, 0, 0, 0), run_count: 0, ...noUserCostCounts, outcomes: row },
+        { user_id: "clean", email: "clean@example.com", usage: bundle(0, 0, 0, 0), run_count: 0, ...noUserCostCounts, outcomes: outcomes(3, 3, 0, 0, 0) },
+        { user_id: "empty", email: "empty@example.com", usage: bundle(0, 0, 0, 0), run_count: 0, ...noUserCostCounts, outcomes: outcomes(0, 0, 0, 0, 0) },
+      ],
+    };
+    const { container, getByText } = wrap(<><FactoryTotalCard admin={admin} /><PerUserUsageTable admin={admin} /></>);
+    const owner = getByText("· owner@example.com");
+    expect(owner.getAttribute("title")).toBe("owner@example.com");
+    expect(owner.className).toContain("min-w-0");
+    expect(owner.className).toContain("truncate");
+    const origin = getByText(/last: worker lost/);
+    expect(origin.getAttribute("title")).toBe("worker lost");
+    expect(origin.className).toContain("truncate");
+    expect(origin.parentElement?.classList.contains("flex-nowrap")).toBe(true);
+    expect(origin.parentElement?.classList.contains("flex-wrap")).toBe(false);
+    expect(getByText("14 completed since").classList.contains("shrink-0")).toBe(true);
+    expect(container.querySelector(`a[href="/runs/${row.last_failed_run_id}"]`)?.classList.contains("shrink-0")).toBe(true);
+    expect(getByText("Since last failure")).toBeTruthy();
+    const rows = container.querySelectorAll("tbody tr");
+    expect(Array.from(rows).map((r) => r.querySelectorAll("td")[4].textContent)).toEqual(["6h", "no failures", "–", "6h"]);
+    act(() => { setDemoMode(true); });
+    expect(getByText("· User").getAttribute("title")).toBe("User");
+    expect(container.textContent).not.toContain("owner@example.com");
+  });
+});
+
+describe("usage cards without the Top causes line (#2399)", () => {
+  it.each(["self", "factory"] as const)("renders the %s failure block and recency without Top causes", (scope) => {
+    const lifetime: RunOutcomes = {
+      ...outcomes(10, 5, 1, 1, 3, { worker_lost: 1, agent_failure: 2 }),
+      last_failed_at: new Date(Date.now() - 3_600_000).toISOString(),
+      last_failed_run_id: "last-failure", last_failed_origin: "worker_lost",
+      completed_since_last_failure: 3,
+    };
+    const usage: SelfUsage = {
+      lifetime: bundle(100, 0, 0, 1), last_7_days: bundle(0, 0, 0, 0),
+      run_count: 5, ...noAggregateCostCounts,
+      outcomes: { lifetime, last_7_days: outcomes(0, 0, 0, 0, 0) },
+    };
+    const admin: AdminUsage = { factory: usage, users: [], earliest_run: null };
+    const { getByText, getByRole, queryByText } = wrap(scope === "self" ?
+      <YourUsageCard usage={usage} /> : <FactoryTotalCard admin={admin} />);
+    // Positive controls: the populated block and last origin still render.
+    expect(getByRole("heading", { name: "30.0% failed runs" })).toBeTruthy();
+    expect(getByRole("img", { name: "Finished runs: 5 completed, 1 cancelled, 1 plan rejected, 3 failed" })).toBeTruthy();
+    expect(getByText(/last: worker lost/)).toBeTruthy();
+    expect(queryByText(/Top causes/)).toBeNull();
   });
 });

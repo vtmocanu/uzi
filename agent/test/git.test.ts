@@ -1,3 +1,4 @@
+import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -449,7 +450,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     const agentSha = gitIn(rc.path, ["rev-parse", "HEAD"]);
 
     // The worker fetches the agent branch BACK into a worker-side tracking ref.
-    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-7", "run-fixture");
+    const ref = await fixtureFetchTracking(git, bare, rc.path, "agent/issue-7", "run-fixture");
     assert.strictEqual(ref, "refs/uzi-runner/agent/issue-7");
     assert.strictEqual(gitIn(bare, ["rev-parse", ref]), agentSha, "fetch-back landed the agent commit in the worker bare");
     // The fetched objects are now in the worker bare (push does not depend on the clone).
@@ -477,7 +478,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     gitIn(rc.path, ["add", "A.txt"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "a"]);
     const shaA = gitIn(rc.path, ["rev-parse", "HEAD"]);
-    await git.fetchAgentBranch(bare, rc.path, "agent/issue-400", "run-fixture");
+    await fixtureFetchTracking(git, bare, rc.path, "agent/issue-400", "run-fixture");
     await git.pushBranch(bare, "agent/issue-400", "", fx.originPath);
     assert.strictEqual(
       gitIn(fx.originPath, ["rev-parse", "refs/heads/agent/issue-400"]),
@@ -503,7 +504,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     gitIn(rc.path, ["add", "LOCAL.txt"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "divergent local commit"]);
     const shaB = gitIn(rc.path, ["rev-parse", "HEAD"]);
-    await git.fetchAgentBranch(bare, rc.path, "agent/issue-400", "run-fixture");
+    await fixtureFetchTracking(git, bare, rc.path, "agent/issue-400", "run-fixture");
     assert.strictEqual(
       gitIn(bare, ["rev-parse", "refs/uzi-runner/agent/issue-400"]),
       shaB,
@@ -584,7 +585,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     gitIn(first.path, ["add", "A.txt"]);
     gitIn(first.path, [...IDENT, "commit", "-m", "a"]);
     const sha1 = gitIn(first.path, ["rev-parse", "HEAD"]);
-    await git.fetchAgentBranch(bare, first.path, "agent/issue-9", "run-fixture");
+    await fixtureFetchTracking(git, bare, first.path, "agent/issue-9", "run-fixture");
     await git.pushBranch(bare, "agent/issue-9", "", fx.originPath);
     await git.removeRunnerClone(first.path);
 
@@ -697,7 +698,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     gitIn(first.path, ["add", "WORK.txt"]);
     gitIn(first.path, [...IDENT, "commit", "-m", "branch work"]);
     const branchTip = gitIn(first.path, ["rev-parse", "HEAD"]);
-    await git.fetchAgentBranch(bare, first.path, "agent/issue-313", "run-fixture");
+    await fixtureFetchTracking(git, bare, first.path, "agent/issue-313", "run-fixture");
     await git.pushBranch(bare, "agent/issue-313", "", fx.originPath);
     await git.removeRunnerClone(first.path);
 
@@ -783,7 +784,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     gitIn(first.path, ["add", "BRANCH.txt"]);
     gitIn(first.path, [...IDENT, "commit", "-m", "branch work"]);
     const branchTip = gitIn(first.path, ["rev-parse", "HEAD"]);
-    await git.fetchAgentBranch(bare, first.path, "agent/issue-3132", "run-fixture");
+    await fixtureFetchTracking(git, bare, first.path, "agent/issue-3132", "run-fixture");
     await git.pushBranch(bare, "agent/issue-3132", "", fx.originPath);
     await git.removeRunnerClone(first.path);
 
@@ -844,7 +845,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     gitIn(first.path, ["add", "WORK.txt"]);
     gitIn(first.path, [...IDENT, "commit", "-m", "branch work"]);
     const branchTip = gitIn(first.path, ["rev-parse", "HEAD"]);
-    await git.fetchAgentBranch(bare, first.path, `agent/issue-${issue}`, "run-fixture");
+    await fixtureFetchTracking(git, bare, first.path, `agent/issue-${issue}`, "run-fixture");
     await git.pushBranch(bare, `agent/issue-${issue}`, "", fx.originPath);
     await git.removeRunnerClone(first.path);
 
@@ -1017,7 +1018,7 @@ describe("branchTip / trackingTip (PRD #122 M6)", { skip: linuxCloneSkip }, () =
 
     // After a fetch-back the tracking ref exists and its tip equals the clone's tip — this
     // is exactly the equality the checkpoint no-op check compares.
-    await git.fetchAgentBranch(bare, rc.path, "agent/issue-7", "run-fixture");
+    await fixtureFetchTracking(git, bare, rc.path, "agent/issue-7", "run-fixture");
     assert.strictEqual(await git.trackingTip(bare, "agent/issue-7"), agentSha);
   });
 
@@ -1046,7 +1047,7 @@ describe("checkpoint reseed candidate (PRD #122 M8)", { skip: linuxCloneSkip }, 
     // bare (as a fetch-back would), and publish it as origin's mirrored checkpoint ref.
     const seed = await git.createOrAttachRunnerClone(bare, 700, noProofReseed, "run-A");
     const cpSha = commit(seed.path, "CP.txt");
-    await git.fetchAgentBranch(bare, seed.path, "agent/issue-700", "run-A");
+    await fixtureFetchTracking(git, bare, seed.path, "agent/issue-700", "run-A");
     gitIn(bare, ["update-ref", "refs/uzi-checkpoints/agent/issue-700", cpSha]);
     // Simulate a DIFFERENT worker: no local refs/uzi-runner/<branch> here.
     gitIn(bare, ["update-ref", "-d", "refs/uzi-runner/agent/issue-700"]);
@@ -1068,7 +1069,7 @@ describe("checkpoint reseed candidate (PRD #122 M8)", { skip: linuxCloneSkip }, 
     // Cycle 1: push agent/issue-701 to origin at commit A.
     const first = await git.createOrAttachRunnerClone(bare, 701, noProofReseed, "run-1");
     const shaA = commit(first.path, "A.txt");
-    await git.fetchAgentBranch(bare, first.path, "agent/issue-701", "run-1");
+    await fixtureFetchTracking(git, bare, first.path, "agent/issue-701", "run-1");
     await git.pushBranch(bare, "agent/issue-701", "", fx.originPath);
     await git.removeRunnerClone(first.path);
     await git.ensureClone(fx.originPath); // refresh origin-tracking so origin/agent/issue-701 exists
@@ -1078,7 +1079,7 @@ describe("checkpoint reseed candidate (PRD #122 M8)", { skip: linuxCloneSkip }, 
     // republished under issue-701's checkpoint ref.
     const sib = await git.createOrAttachRunnerClone(bare, 7011, noProofReseed, "run-sib");
     const cpxSha = commit(sib.path, "CPX.txt");
-    await git.fetchAgentBranch(bare, sib.path, "agent/issue-7011", "run-sib");
+    await fixtureFetchTracking(git, bare, sib.path, "agent/issue-7011", "run-sib");
     gitIn(bare, ["update-ref", "refs/uzi-checkpoints/agent/issue-701", cpxSha]);
     await git.removeRunnerClone(sib.path);
 
@@ -1104,7 +1105,7 @@ describe("checkpoint reseed candidate (PRD #122 M8)", { skip: linuxCloneSkip }, 
     const bare = await git.ensureClone(fx.originPath);
     const rc1 = await git.createOrAttachRunnerClone(bare, 800, noProofReseed, "run-D");
     const shaD = commit(rc1.path, "D.txt");
-    await git.fetchAgentBranch(bare, rc1.path, "agent/issue-800", "run-D"); // tracking owned by run-D
+    await fixtureFetchTracking(git, bare, rc1.path, "agent/issue-800", "run-D"); // tracking owned by run-D
     // A checkpoint that WOULD win the not-ownedHere path (it descends the default floor).
     gitIn(bare, ["update-ref", "refs/uzi-checkpoints/agent/issue-800", shaD]);
     await git.removeRunnerClone(rc1.path);
@@ -1138,7 +1139,7 @@ describe("checkpoint reseed candidate (PRD #122 M8)", { skip: linuxCloneSkip }, 
     // the owner anchor — not the strict-descendant guard — can keep it from being adopted.
     const seed = await git.createOrAttachRunnerClone(bare, 704, noProofReseed, "run-A");
     const cpSha = commit(seed.path, "CP.txt");
-    await git.fetchAgentBranch(bare, seed.path, "agent/issue-704", "run-A");
+    await fixtureFetchTracking(git, bare, seed.path, "agent/issue-704", "run-A");
     gitIn(bare, ["update-ref", "refs/uzi-checkpoints/agent/issue-704", cpSha]);
     gitIn(bare, ["update-ref", "-d", "refs/uzi-runner/agent/issue-704"]); // a DIFFERENT worker
     await git.removeRunnerClone(seed.path);
@@ -1178,7 +1179,7 @@ describe("checkpointPack (PRD #122 M8)", { skip: linuxCloneSkip }, () => {
     fs.writeFileSync(path.join(rc.path, "P.txt"), "p\n");
     gitIn(rc.path, ["add", "P.txt"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "p"]);
-    await git.fetchAgentBranch(bare, rc.path, "agent/issue-900", "run-p");
+    await fixtureFetchTracking(git, bare, rc.path, "agent/issue-900", "run-p");
     const tip = await git.trackingTip(bare, "agent/issue-900");
 
     const packed = await git.checkpointPack(bare, "agent/issue-900");
@@ -1618,7 +1619,7 @@ describe("issue #781 — disjoint-ref seed guard + fetch --prune", () => {
       gitIn(first.path, [...IDENT, "commit", "-m", `work ${f}`]);
     }
     const tip = gitIn(first.path, ["rev-parse", "HEAD"]);
-    await git.fetchAgentBranch(bare, first.path, "agent/issue-66", "run-far"); // tracking owned by run-far
+    await fixtureFetchTracking(git, bare, first.path, "agent/issue-66", "run-far"); // tracking owned by run-far
     await git.removeRunnerClone(first.path);
 
     // Advance origin's main on its OWN line so the tracking ref genuinely diverges (their
@@ -1739,7 +1740,7 @@ describe("issue #887 — fetchAgentBranch clears a D/F-conflicting legacy ancest
 
     // Without the fix this THROWS ("some local refs could not be updated"); with it the
     // ancestor is cleared first and the fetch lands.
-    const ref = await git.fetchAgentBranch(bare, rc.path, branch, runId);
+    const ref = await fixtureFetchTracking(git, bare, rc.path, branch, runId);
 
     assert.strictEqual(ref, `refs/uzi-runner/${branch}`);
     assert.strictEqual(gitIn(bare, ["rev-parse", ref]), agentSha, "the self-improve commit landed in the worker bare");
@@ -1801,15 +1802,15 @@ describe("issue #909 — the owner-stamp reader falls back to the pre-#887 flatt
     gitIn(first.path, ["add", "W.txt"]);
     gitIn(first.path, [...IDENT, "commit", "-m", "unpushed work"]);
     const workSha = gitIn(first.path, ["rev-parse", "HEAD"]);
-    await git.fetchAgentBranch(bare, first.path, branch, runId);
+    // Seed an actual historical bare, before receipt governance existed. A modern fetch
+    // followed by deleting its stamp would instead create inconsistent committed custody.
+    gitIn(bare, ["-c", "protocol.file.allow=user", "fetch", "--no-tags", `file://${first.path}`,
+      `refs/heads/${branch}:refs/uzi-runner/${branch}`]);
     // Simulate a missing checkout in this isolated recovery fixture. Production
     // teardown is covered by the worker-uid tests and deliberately refuses off Linux.
     fs.rmSync(first.path, { recursive: true, force: true });
 
-    // Simulate a PRE-#887 persistent bare: no #887 subsection stamp, only the old FLATTENED
-    // 2-part key (no `.owner`). Drop the new-key stamp fetchAgentBranch just wrote and plant
-    // the legacy flat one in its place.
-    gitIn(bare, ["config", "--local", "--unset", "uzi-trackowner.agent/issue-500.owner"]);
+    // PRE-#887 persistent bare: only the old FLATTENED 2-part key (no `.owner`).
     gitIn(bare, ["config", "--local", "uzi-trackowner.agent-issue-500", runId]);
 
     // No origin/agent/issue-500 (never pushed), so ownedHere alone decides. On unfixed code
@@ -1871,7 +1872,7 @@ describe("issue #909 — the owner-stamp reader falls back to the pre-#887 flatt
     fs.writeFileSync(path.join(rc.path, "SI.txt"), "self-improve\n");
     gitIn(rc.path, ["add", "SI.txt"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "self-improve work"]);
-    await git.fetchAgentBranch(bare, rc.path, branch, runId);
+    await fixtureFetchTracking(git, bare, rc.path, branch, runId);
 
     assert.throws(
       () => gitIn(bare, ["config", "--local", "--get", "uzi-trackowner.uzi-self-improve"]),
@@ -1888,6 +1889,9 @@ describe("issue #909 — the owner-stamp reader falls back to the pre-#887 flatt
     // branch flattens to the SAME token — the exact #887 collision.
     gitIn(bare, ["update-ref", "refs/uzi-runner/uzi/self-improve", mainSha]);
     gitIn(bare, ["update-ref", "refs/uzi-runner/uzi-self-improve", mainSha]);
+    // The ancestor has an unambiguous historical owner; the shared flat key alone
+    // cannot authorize clearing it when a colliding sibling is live.
+    gitIn(bare, ["config", "--local", "uzi-trackowner.uzi/self-improve.owner", "ancestor-run"]);
     // The shared flat stamp (attributable to the live hyphen sibling, not the cleared ancestor).
     gitIn(bare, ["config", "--local", "uzi-trackowner.uzi-self-improve", "sibling-flat-run"]);
 
@@ -1897,7 +1901,7 @@ describe("issue #909 — the owner-stamp reader falls back to the pre-#887 flatt
     fs.writeFileSync(path.join(rc.path, "SI.txt"), "self-improve\n");
     gitIn(rc.path, ["add", "SI.txt"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "self-improve work"]);
-    await git.fetchAgentBranch(bare, rc.path, branch, runId);
+    await fixtureFetchTracking(git, bare, rc.path, branch, runId);
 
     // The ancestor "uzi/self-improve" was cleared, but the flat key is ambiguous (the live
     // hyphen sibling flattens to it), so the new unset must NOT fire and the stamp survives.

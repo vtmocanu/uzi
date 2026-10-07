@@ -1,3 +1,4 @@
+import { mockCommittedTracking } from "./runner-tracking-fixture.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -62,8 +63,7 @@ function makeSwitchExecutor(
       const dirty = verdict === "dirty_fail";
       git.worktreeStatus = (async () => (dirty ? ["M src/impl.ts"] : [])) as typeof git.worktreeStatus;
       git.commitWipMarker = (async () => !dirty) as typeof git.commitWipMarker; // a dirty commit FAILS
-      git.fetchAgentBranch = (async () =>
-        `refs/uzi-runner/${ctx.branch}`) as typeof git.fetchAgentBranch;
+      mockCommittedTracking(git, "cafef00dcafef00dcafef00dcafef00dcafef00d");
       git.verifyRunnerTrackingCovers = (async () => {
         captureAttempts.count++;
         return !dirty; // clean ⇒ verified; dirty never reaches here (WIP commit already failed)
@@ -130,8 +130,7 @@ function makeInPlaceSwitchExecutor(verdict: InPlaceVerdict): InPlaceSwitchProbe 
         marker.headIsMarker = true;
         return true;
       }) as typeof git.commitWipMarker;
-      git.fetchAgentBranch = (async () =>
-        `refs/uzi-runner/${ctx.branch}`) as typeof git.fetchAgentBranch;
+      mockCommittedTracking(git, "cafef00dcafef00dcafef00dcafef00dcafef00d");
       git.verifyRunnerTrackingCovers = (async () => {
         captureAttempts.count++;
         return verifies;

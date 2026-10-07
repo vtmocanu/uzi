@@ -260,7 +260,7 @@ api:
     # opt-in. These env knobs only TUNE an already-enabled feature; leave them
     # unset to use config.go's defaults. Uncomment to override.
     # UZI_EPHEMERAL_MAX_PER_USER: "2"          # per-user concurrent-ephemeral cap
-    # UZI_EPHEMERAL_DEFAULT_SIZE: l            # provision size preset: s|m|l
+    # Provision size is chart-owned: use workers.ephemeralDefaultSize below.
     # UZI_EPHEMERAL_PROVISION_DEADLINE: 10m    # GC deadline for never-booted / idle-stolen workers
     # UZI_EPHEMERAL_SATURATION_DELAY: 90s     # debounce before bursting on a saturated (all capable workers full) fleet
     # Job files and product skill sets (PRD #1909). Unset => config.go's defaults
@@ -598,7 +598,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.86.0-rc.2"
+    tag: "0.86.0-rc.3"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
@@ -708,8 +708,8 @@ workers:
   # worker's CPU/memory still follow its preset (the api's UZI_EPHEMERAL_DEFAULT_SIZE
   # unless the run asks for one), but /data does not, because a run-bound worker holds
   # one clone for one run and its disk need tracks the repository, not the size. So an
-  # ephemeral `s` or `m` worker gets MORE than its preset's /data (5Gi / 10Gi → 20Gi)
-  # and an ephemeral `l` worker gets 20Gi, NOT l's 25Gi. Persistent workers are
+  # ephemeral `s` worker gets MORE than its preset's /data (5Gi → 20Gi) and an
+  # ephemeral `m` or `l` worker gets 20Gi, NOT their 25Gi. Persistent workers are
   # untouched. Motivation: on 2026-09-27 an ephemeral `m` worker (10Gi /data) running a
   # uzi-on-uzi issue run hit 95% during `task gate:api` (Go build cache ~6.6G + module
   # cache ~1.9G).
@@ -736,6 +736,13 @@ workers:
   # This is a DIRECT env entry on the api Deployment, so it OVERRIDES a UZI_EPHEMERAL_LEASE
   # set through api.config (envFrom): set it here, not there.
   ephemeralLease: "2h"
+  # Issue #2412: a run-bound worker needs one run's memory headroom, not a
+  # persistent L worker's two-run budget. M reserves 8Gi instead of 14Gi while
+  # both presets request 1 CPU and can burst to 4 CPU. Valid values: s, m, l; invalid values fail
+  # chart rendering. Existing workers keep their stored size; persistent workers
+  # still preselect L. Set the size only here: the same key in api.config or
+  # api.secretEnv fails the render.
+  ephemeralDefaultSize: m
   # Where the hosted worker's join-token Secret (worker_token + ca.crt) mounts (issue
   # #1761). Empty keeps the default /run/secrets, and then nothing about the worker pod
   # changes. OpenShift/OKD MUST set it (the render fails otherwise when
@@ -759,7 +766,8 @@ workers:
   # Namespace ResourceQuota (Decision 8). Defense in depth under the api's per-user
   # quota: an app-level bug must not noisy-neighbour a shared cluster.
   #
-  # CPU and memory track the DEFAULT size, now `l` (ADR-2240): 20 workers x 1 CPU
+  # CPU and memory track the LARGEST size, `l` (the persistent default, ADR-2240;
+  # ephemeral workers default to the smaller `m`, #2412): 20 workers x 1 CPU
   # = 20 CPU and 20 x 14Gi = 280Gi requested. Keep these ceilings aligned with
   # deployments x the default request, or admission caps the fleet below deployments
   # (issue #1341). ResourceQuotas are ceilings, not node-capacity reservations.
@@ -946,7 +954,8 @@ workers:
     # ephemeral storage.
     #
     # Sized for the 10 workers deployments advertises. CPU and memory track the
-    # DEFAULT size, now `l` (ADR-2240), plus all sidecars from render.go/render_dind.go.
+    # LARGEST size, `l` (persistent default, ADR-2240; ephemeral default `m`, #2412),
+    # plus all sidecars from render.go/render_dind.go.
     # Ten rendered pods need 13.1 CPU / about 143Gi (14640Mi each), rounded to 14 CPU / 144Gi.
     # Keep requests aligned with the rendered fleet, including sidecar overrides,
     # or admission caps it below deployments
@@ -1132,7 +1141,8 @@ workers:
       node: []
     # The lane's own ResourceQuota and LimitRange, the restricted tier's shape. Lane
     # workers are run-bound (one run, then removed). CPU and memory ceilings cover
-    # ten DEFAULT `l` workers from render.go (ADR-2240): 10 x 1 CPU / 14Gi = 10 CPU / 140Gi.
+    # ten worst-case `l` workers from render.go (the ephemeral default is the smaller
+    # `m`, #2412, but a run may ask for `l`): 10 x 1 CPU / 14Gi = 10 CPU / 140Gi.
     # The quota is a ceiling, not a reservation of node capacity.
     quota:
       enabled: true

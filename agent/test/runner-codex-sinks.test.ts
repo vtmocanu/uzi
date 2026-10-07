@@ -1,3 +1,4 @@
+import { mockCommittedTracking } from "./runner-tracking-fixture.js";
 import { after, describe, it } from "node:test";
 import { createServer } from "node:http";
 import { AsyncResource } from "node:async_hooks";
@@ -1224,7 +1225,7 @@ describe("RunRunner issue #1784 - Codex finalize boundary on a hold or wall park
         commitInTree(ctx.worktreePath, "WORK.txt", "work before the hold\n");
         // Deterministic capture verdict (the clone is already seeded), as runner-completion-hold does.
         git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
-        git.fetchAgentBranch = (async () => `refs/uzi-runner/${ctx.branch}`) as typeof git.fetchAgentBranch;
+        mockCommittedTracking(git, HELD_HEAD);
         git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
         git.trackingTip = (async () => HELD_HEAD) as typeof git.trackingTip;
         git.checkpointPack = (async () => null) as typeof git.checkpointPack;
@@ -1618,13 +1619,13 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
     let armed = false;
     let fetchFailures = 0;
     const fetch = git.fetchAgentBranch.bind(git);
-    git.fetchAgentBranch = async (...args) => {
+    git.fetchAgentBranch = (async (...args: Parameters<typeof fetch>) => {
       if (armed && fetchFailures === 0) {
         fetchFailures += 1;
         throw new Error("injected fetch-back failure");
       }
       return fetch(...args);
-    };
+    }) as typeof git.fetchAgentBranch;
     const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "RETRY.txt", "work\n");
       armed = true;
@@ -2459,10 +2460,10 @@ describe("RunRunner #1766 — the park loop's exits after running is confirmed",
     const w = workThenDefer(rig, settle);
     ctxRef = w.ctx;
     const fetch = git.fetchAgentBranch.bind(git);
-    git.fetchAgentBranch = async (...args) => {
+    git.fetchAgentBranch = (async (...args: Parameters<typeof fetch>) => {
       if (w.deferred()) throw new Error("injected fetch-back failure");
       return fetch(...args);
-    };
+    }) as typeof git.fetchAgentBranch;
     const claim = gitlabClaim(1797);
     const { logger, lines } = recordingLogger();
     const runner = runnerWith(() => ({ executor: w.exec }), gitlab, undefined, logger, { recoveryRetryMs: 5 });
@@ -3623,13 +3624,13 @@ describe("RunRunner M2 — unknown refresh sink retries and local recovery", () 
       assert.ok(!statuses(claim.run_id).includes("completed"));
     };
     const fetch = git.fetchAgentBranch.bind(git);
-    git.fetchAgentBranch = async (...args) => {
+    git.fetchAgentBranch = (async (...args: Parameters<typeof fetch>) => {
       if (w.deferred() && captureFailures++ === 0) {
         retained();
         throw new Error("injected capture failure");
       }
       return fetch(...args);
-    };
+    }) as typeof git.fetchAgentBranch;
     const report = client.reportState.bind(client);
     client.reportState = async (runId, body, signal) => {
       if (body.status === "recovery_wait") {

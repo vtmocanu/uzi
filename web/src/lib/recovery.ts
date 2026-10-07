@@ -374,8 +374,9 @@ function attentionView(hold: RecoveryCustodyHold): Omit<CustodyHoldView, "checkp
         group: "attention",
         tone: "warning",
         stateLabel: "Decision required",
-        summary:
-          "No server archive exists. The worker-local source may be the only copy — export is not possible, so choose whether to discard it.",
+        summary: hold.inventory_guarded && hasArchive
+          ? "An earlier recovery archive is available, but final inventory coverage is pending. The worker retains committed work that may be absent from that archive."
+          : "No server archive exists. The worker-local source may be the only copy — export is not possible, so choose whether to discard it.",
         autoReleasing: false,
         needsDecision: true,
         actions: ["discard"],

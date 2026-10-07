@@ -133,24 +133,24 @@ UPDATE recovery_custody_holds
 SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
     release_evidence = @release_evidence,
     released_at = now(), updated_at = now()
-WHERE id = @id AND state = 'open';
+WHERE id = @id AND state = 'open' AND NOT inventory_guarded;
 
--- name: DiscardCaptureForOwner :execrows
+-- name: DiscardCaptureForOwner :one
 -- D7: owner-initiated explicit discard of one capture. Deletes its byte chunks (freeing
 -- storage) and marks the capture 'discarded' in ONE statement — the data-modifying del CTE
 -- always runs to completion, and :execrows reports the capture UPDATE's row count (1 when
 -- owned, 0 for a foreign/absent id). The capture row is retained (audit), only its bytes go.
 WITH owned AS (
-    SELECT rc.id AS capture_id FROM recovery_captures rc
+    SELECT rc.id FROM recovery_captures rc
     WHERE rc.id = @id AND rc.run_id = @run_id AND rc.user_id = @user_id
-),
-del AS (
-    DELETE FROM recovery_capture_chunks
-    WHERE capture_id IN (SELECT owned.capture_id FROM owned)
+    FOR UPDATE
+), discarded AS (
+    UPDATE recovery_captures c SET state = 'discarded', updated_at = now()
+    WHERE c.id IN (SELECT id FROM owned) RETURNING c.id
+), del AS (
+    DELETE FROM recovery_capture_chunks WHERE capture_id IN (SELECT id FROM discarded)
 )
-UPDATE recovery_captures c
-SET state = 'discarded', updated_at = now()
-WHERE c.id = @id AND c.run_id = @run_id AND c.user_id = @user_id;
+SELECT count(*)::bigint FROM discarded;
 
 -- name: ExpireReadyCaptures :execrows
 -- D4: the retention-enforcement sweep. Moves 'available' captures past their expires_at to
@@ -171,6 +171,8 @@ WHERE c.id = @id AND c.run_id = @run_id AND c.user_id = @user_id;
 WITH expiring AS (
     SELECT rc.id AS capture_id FROM recovery_captures rc
     WHERE rc.state = 'available' AND rc.expires_at IS NOT NULL AND rc.expires_at < @now
+      AND rc.local_replica_worker_id IS NULL
+    ORDER BY rc.id FOR UPDATE
 ),
 del AS (
     DELETE FROM recovery_capture_chunks
@@ -178,7 +180,8 @@ del AS (
 )
 UPDATE recovery_captures c
 SET state = 'expired', updated_at = now()
-WHERE c.id IN (SELECT expiring.capture_id FROM expiring);
+WHERE c.id IN (SELECT expiring.capture_id FROM expiring)
+  AND c.state = 'available' AND c.local_replica_worker_id IS NULL AND c.expires_at < @now;
 
 -- name: ExpireStalledUploads :execrows
 -- PRD #1296 D3/D4: the upload-retry-window sweep — the LIVE consumer of
@@ -246,7 +249,7 @@ SELECT h.*,
         ELSE 'archive'
     END::text AS reason
 FROM recovery_custody_holds h
-WHERE h.state = 'open'
+WHERE h.state = 'open' AND NOT h.inventory_guarded
   AND (
       EXISTS (SELECT 1 FROM runs r
                 WHERE r.id = h.run_id
@@ -295,9 +298,9 @@ WHERE live_worker_id = @worker_id::uuid AND user_id = @user_id AND state = 'open
 -- reservation onto this in place of the generation-blind newest-hold ReserveCapture.
 INSERT INTO recovery_captures
     (hold_id, run_id, user_id, original_worker_id, original_worker_identity,
-     source_sha, attempted_head_sha, idempotency_key, state)
+     source_sha, attempted_head_sha, idempotency_key, state, coverage_digest)
 SELECT h.id, @run_id, @user_id, @original_worker_id, @original_worker_identity::text,
-       @source_sha, sqlc.narg('attempted_head_sha'), @idempotency_key, 'preparing'
+       @source_sha, sqlc.narg('attempted_head_sha'), @idempotency_key, 'preparing', sqlc.narg('coverage_digest')::text
 FROM recovery_custody_holds h
 WHERE h.run_id = @run_id
   AND h.user_id = @user_id
@@ -307,6 +310,8 @@ WHERE h.run_id = @run_id
 ORDER BY h.created_at DESC
 LIMIT 1
 ON CONFLICT (hold_id, idempotency_key) DO UPDATE SET updated_at = now()
+WHERE recovery_captures.coverage_digest IS NOT DISTINCT FROM EXCLUDED.coverage_digest
+  AND recovery_captures.source_sha = EXCLUDED.source_sha
 RETURNING *;
 
 -- name: ReleaseCustodyHoldExact :execrows
@@ -333,7 +338,7 @@ SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
 WHERE run_id = @run_id
   AND generation = @generation
   AND live_worker_id = @worker_id::uuid
-  AND state = 'open';
+  AND state = 'open' AND NOT inventory_guarded;
 
 -- name: GetCustodyHoldForSettle :one
 -- Issue #1582 M1: the exact hold the predecessor-settle endpoint names, scoped to its run so a
@@ -390,7 +395,7 @@ WHERE h.id = @hold_id
   AND h.run_id = @run_id
   AND h.generation = @predecessor_generation::bigint
   AND h.original_worker_id = @worker_id::uuid
-  AND h.state = 'open'
+  AND h.state = 'open' AND NOT h.inventory_guarded
   AND h.generation < @successor_generation::bigint
   AND EXISTS (
       SELECT 1 FROM runs r
@@ -467,7 +472,7 @@ WHERE h.id = @hold_id
   AND h.user_id = @user_id::uuid
   AND h.generation = @predecessor_generation::bigint
   AND h.original_worker_id = @worker_id::uuid
-  AND h.state = 'open'
+  AND h.state = 'open' AND NOT h.inventory_guarded
   AND h.generation < @successor_generation::bigint
   AND EXISTS (
       SELECT 1 FROM runs r
@@ -556,6 +561,7 @@ LIMIT 1;
 SELECT
     h.id,
     h.generation,
+    h.inventory_guarded,
     (EXISTS (SELECT 1 FROM recovery_captures c
         WHERE c.hold_id = h.id AND c.state = 'available'))::boolean AS has_available_capture,
     COALESCE((SELECT c.state FROM recovery_captures c
@@ -602,6 +608,11 @@ SELECT
     h.released_at,
     h.original_worker_id,
     h.terminal_record_rejection,
+    h.inventory_guarded,
+    h.final_disposition,
+    h.final_capture_id,
+    h.final_source_sha,
+    h.final_coverage_digest,
     COALESCE(w.name, '')::text AS worker_name,
     (EXISTS (SELECT 1 FROM recovery_captures c
         WHERE c.hold_id = h.id AND c.state = 'available'))::boolean AS has_available_capture,
@@ -797,10 +808,81 @@ SELECT
     COALESCE((SELECT jsonb_agg(jsonb_build_object('id', id, 'generation', generation) ORDER BY id)
       FROM (SELECT * FROM siblings ORDER BY id LIMIT 256) limited), '[]'::jsonb)::jsonb AS sibling_holds;
 
+-- name: ReleaseClaimCustodyNoAdoptedSource :execrows
+-- Only finishRunClaim calls this before it can deliver a payload.
+UPDATE recovery_custody_holds h SET
+    state = 'released', live_worker_id = NULL, live_run_id = NULL,
+    release_evidence = 'no_adopted_source',
+    final_disposition = CASE WHEN h.inventory_guarded THEN 'no_adopted_source' ELSE NULL END,
+    released_at = now(), updated_at = now()
+WHERE h.run_id = @run_id AND h.generation = @generation AND h.live_worker_id = @worker_id::uuid
+  AND h.state = 'open'
+  AND EXISTS (SELECT 1 FROM runs r WHERE r.id = h.run_id AND r.status = 'claimed'
+      AND r.worker_id = @worker_id::uuid AND r.claim_generation = @generation AND r.claim_released_at IS NULL)
+  AND NOT EXISTS (SELECT 1 FROM recovery_captures c WHERE c.hold_id = h.id);
+
+-- name: GetFinalInventoryHold :one
+SELECT * FROM recovery_custody_holds
+WHERE run_id = @run_id AND user_id = @user_id AND original_worker_id = @worker_id::uuid
+  AND generation = @generation
+ORDER BY id LIMIT 1 FOR UPDATE;
+
+-- name: GetFinalInventoryCapture :one
+SELECT * FROM recovery_captures
+WHERE id = @id AND hold_id = @hold_id AND run_id = @run_id AND user_id = @user_id
+  AND original_worker_id = @worker_id::uuid
+FOR UPDATE;
+
+-- name: ProtectFinalInventoryCapture :execrows
+UPDATE recovery_captures c SET local_replica_worker_id = @worker_id::uuid,
+    ready_retention_seconds = @retention_seconds::bigint, updated_at = now()
+WHERE c.id = @id AND c.hold_id = @hold_id AND c.original_worker_id = @worker_id::uuid
+  AND c.source_sha = @source_sha AND c.coverage_digest = @coverage_digest
+  AND c.manifest_bound AND c.state = 'available' AND c.expires_at > clock_timestamp()
+  AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.id = c.hold_id
+    AND h.inventory_guarded AND h.state = 'open' AND h.live_worker_id = @worker_id::uuid);
+
+-- name: ReleaseFinalInventoryHold :execrows
+UPDATE recovery_custody_holds h SET state = 'released', live_worker_id = NULL, live_run_id = NULL,
+    final_disposition = @final_disposition::text, final_capture_id = sqlc.narg('final_capture_id')::uuid,
+    final_source_sha = sqlc.narg('final_source_sha')::text, final_coverage_digest = @final_coverage_digest::text,
+    release_evidence = @release_evidence::text, released_at = now(), updated_at = now()
+WHERE h.id = @id AND h.run_id = @run_id AND h.user_id = @user_id
+  AND h.generation = @generation AND h.original_worker_id = @worker_id::uuid
+  AND h.live_worker_id = @worker_id::uuid AND h.inventory_guarded AND h.state = 'open'
+  AND EXISTS (SELECT 1 FROM runs r WHERE r.id = h.run_id AND r.user_id = h.user_id
+    AND (r.claim_generation > h.generation OR (r.claim_generation = h.generation AND
+      (r.status IN ('completed', 'failed', 'cancelled') OR r.claim_released_at IS NOT NULL
+        -- A forge_unreachable pre-clone park keeps its claim; only the worker's settled
+        -- forge_no_output proof (empty inventory) may end that exact generation early.
+        OR (r.status = 'recovery_wait' AND r.recovery_wait_cause = 'forge_unreachable'
+          AND @final_disposition::text = 'settled' AND @release_evidence::text = 'forge_no_output')))))
+  AND (
+    (@final_disposition::text = 'archive' AND @release_evidence::text = 'archive'
+      AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.id = sqlc.narg('final_capture_id')::uuid
+        AND c.hold_id = h.id AND c.run_id = h.run_id AND c.user_id = h.user_id
+        AND c.original_worker_id = h.original_worker_id AND c.source_sha = sqlc.narg('final_source_sha')::text
+        AND c.coverage_digest = @final_coverage_digest::text
+        AND c.manifest_bound AND c.state = 'available' AND c.expires_at > clock_timestamp()
+        AND c.local_replica_worker_id = h.original_worker_id AND c.ready_retention_seconds > 0))
+    OR (@final_disposition::text = 'settled' AND sqlc.narg('final_capture_id')::uuid IS NULL
+      AND sqlc.narg('final_source_sha')::text IS NULL
+      AND @final_coverage_digest::text = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+      AND (@release_evidence::text = 'forge_no_output' OR
+        (@release_evidence::text = 'publication' AND EXISTS (SELECT 1 FROM runs r
+          WHERE r.id = h.run_id AND r.user_id = h.user_id AND r.status = 'completed'
+            AND r.claim_generation = h.generation AND r.worker_id = h.original_worker_id))))
+  );
+
+-- name: RunHasGuardedInventoryHold :one
+SELECT EXISTS (SELECT 1 FROM recovery_custody_holds
+WHERE run_id = @run_id AND user_id = @user_id AND original_worker_id = @worker_id::uuid
+  AND generation = @generation AND inventory_guarded)::boolean;
+
 -- name: ListOpenCustodyHoldsForWorkers :many
 -- Display-only attention inputs for the authorized workers returned by a list endpoint.
 -- Live custody determines which worker holds the source; original custody is provenance.
-SELECT w.id AS worker_id, h.state,
+SELECT w.id AS worker_id, h.state, h.inventory_guarded,
     (EXISTS (SELECT 1 FROM recovery_captures c
         WHERE c.hold_id = h.id AND c.state = 'available'))::boolean AS has_available_capture,
     COALESCE((SELECT c.state FROM recovery_captures c

@@ -12,10 +12,10 @@ func TestLoadEphemeralDefaultSize(t *testing.T) {
 		unset bool
 		want  string
 	}{
-		{name: "unset", unset: true, want: "l"},
-		{name: "empty", want: "l"},
-		{name: "invalid", value: "unknown", want: "l"},
-		{name: "whitespace-only value uses the default", value: "  ", want: "l"},
+		{name: "unset", unset: true, want: "m"},
+		{name: "empty", want: "m"},
+		{name: "invalid", value: "unknown", want: "m"},
+		{name: "whitespace-only value uses the default", value: "  ", want: "m"},
 		{name: "explicit small", value: "s", want: "s"},
 		{name: "explicit medium", value: "m", want: "m"},
 		{name: "trimmed large", value: " l ", want: "l"},

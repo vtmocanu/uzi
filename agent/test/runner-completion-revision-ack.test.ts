@@ -1,10 +1,11 @@
+import { followSuccessfulPush } from "./publication-fixture.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { nullLogger, recordingLogger } from "./helpers.js";
 import { StubExecutor, type Executor } from "../src/executor.js";
 import {
   api,
-  fakeGitlab,
+  fakeGitlab as rawFakeGitlab,
   git,
   gitlabClaim,
   installHarness,
@@ -21,6 +22,12 @@ installHarness();
 // the latest one any ACK carried and binds the finalize permit to it, ahead of the claim's value.
 // Driven end-to-end through the REAL RunRunner.execute(), like runner-completion-permit.test.ts.
 
+function fakeGitlab(opts: Parameters<typeof rawFakeGitlab>[0] = {}) {
+  const forge = rawFakeGitlab(opts);
+  followSuccessfulPush(git, forge.pr, opts.head === undefined || opts.head === H);
+  return forge;
+}
+
 const H = "1111111111111111111111111111111111111111";
 
 function statuses(runId: string): string[] {
@@ -35,7 +42,7 @@ describe("RunRunner — completion revision off the /state ACK (issue #1626)", (
     // (armed inside the hook, which runs before that report's ACK is sent).
     api.onState(claim.run_id, () => api.setStateAckCompletionRevision(claim.run_id, 1));
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
@@ -50,7 +57,7 @@ describe("RunRunner — completion revision off the /state ACK (issue #1626)", (
     const claim = gitlabClaim(1627, { config: { completion_contract_version: 1, contract_revision: 1 } });
     api.setStateAckCompletionRevision(claim.run_id, 2);
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
@@ -68,7 +75,7 @@ describe("RunRunner — completion revision off the /state ACK (issue #1626)", (
       first = false;
     });
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
@@ -100,7 +107,7 @@ describe("RunRunner — completion revision off the /state ACK (issue #1626)", (
       completionRevision: 9,
     });
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     const stub = new StubExecutor(nullLogger());
     const executor: Executor = {
@@ -128,7 +135,7 @@ describe("RunRunner — completion revision off the /state ACK (issue #1626)", (
     const { gitlab, calls } = fakeGitlab({ head: H });
     const claim = gitlabClaim(1628, { config: { completion_contract_version: 1 } });
     api.setCompletionPermitResponse(true); // armed, but must never be reached
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
       recoveryRetryMs: 1,

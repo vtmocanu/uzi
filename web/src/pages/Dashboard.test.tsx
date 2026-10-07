@@ -6,9 +6,9 @@ import { Dashboard } from "./Dashboard";
 import { api, type ForgeConnection, type Repo, type RunListItem, type SecretMeta, type Worker } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
-// The overview fetches six endpoints on first load and re-polls only listRuns +
-// listWorkers every 10s. Mock the api (keep the real isTerminalRun) and useAuth so
-// this stays offline; drive the poll with fake timers.
+// The overview loads its core endpoints and usage, polls runs/workers every 10s,
+// and refreshes usage independently every 30s. Mock the api (keep the real
+// isTerminalRun) and useAuth so this stays offline; drive polls with fake timers.
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
   return {
@@ -218,7 +218,7 @@ beforeEach(() => {
 const zeros = () => ({ input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, cost_usd: 0, cost_status: "" as const });
 // PRD #1293: zero outcomes keep the failed-runs block hidden (finished===0), so these
 // usage fixtures leave the existing "nothing yet" / card assertions unchanged.
-const zeroOutcomes = () => ({ finished: 0, completed: 0, cancelled: 0, plan_rejected: 0, failed: 0, needs_landing: 0, fail_origins: {} });
+const zeroOutcomes = () => ({ finished: 0, completed: 0, cancelled: 0, plan_rejected: 0, failed: 0, needs_landing: 0, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: {} });
 const zeroOutcomeWindows = () => ({ lifetime: zeroOutcomes(), last_7_days: zeroOutcomes() });
 function emptySelf() {
   // PRD #1429 M1 (D7): the per-window subscription/unreported run counts (0 for empty usage).
@@ -770,5 +770,59 @@ describe("Dashboard — a job row without a repo path (PRD #1908)", () => {
     expect(jobMeta.textContent).toMatch(/^job$/i);
     expect(jobMeta.textContent).not.toContain("vtmocanu/uzi");
     expect(screen.getByRole("link", { name: "Open run: Summarise the incident timeline" })).toBeTruthy();
+  });
+});
+
+describe("Dashboard usage recency refresh (#2399)", () => {
+  const recent = (hours: number, count: number) => ({
+    ...emptySelf(), outcomes: { ...zeroOutcomeWindows(), lifetime: {
+      ...zeroOutcomes(), finished: count + 1, completed: count, failed: 1,
+      fail_origins: { agent_failure: 1 },
+      last_failed_at: new Date(Date.now() - hours * 3_600_000).toISOString(),
+      last_failed_run_id: "recent-failure", last_failed_origin: "agent_failure",
+      completed_since_last_failure: count,
+    } },
+  });
+  const advance = async (ms = 0) => { await act(async () => { await vi.advanceTimersByTimeAsync(ms); }); };
+
+  it("resets the figure on the independent 30s refresh", async () => {
+    vi.useFakeTimers();
+    mockApi.getUsage.mockResolvedValue(recent(6, 14));
+    renderDashboard(); await advance();
+    expect(screen.getByText("6h")).toBeTruthy();
+    mockApi.listRuns.mockRejectedValue(new Error("runs unavailable"));
+    mockApi.getUsage.mockResolvedValue(recent(0, 0));
+    await advance(30_000);
+    expect(screen.getByText("<1m")).toBeTruthy();
+    expect(screen.getByText("0 completed since")).toBeTruthy();
+    expect(mockApi.getUsage).toHaveBeenCalledTimes(2);
+    expect(mockApi.getAdminUsage).not.toHaveBeenCalled();
+  });
+  it.each(["self", "admin"] as const)("retains the failed %s payload while refreshing the other scope", async (failedScope) => {
+    vi.useFakeTimers();
+    vi.mocked(useAuth).mockReturnValue({ user: { ...user, is_admin: true }, refresh: vi.fn(), loading: false } as unknown as ReturnType<typeof useAuth>);
+    mockApi.getUsage.mockResolvedValue(recent(6, 14));
+    mockApi.getAdminUsage.mockResolvedValue({ factory: recent(2, 31), users: [], earliest_run: null });
+    renderDashboard(); await advance();
+    if (failedScope === "self") {
+      mockApi.getUsage.mockRejectedValue(new Error("self blip"));
+      mockApi.getAdminUsage.mockResolvedValue({ factory: recent(0, 0), users: [], earliest_run: null });
+    } else {
+      mockApi.getAdminUsage.mockRejectedValue(new Error("admin blip"));
+      mockApi.getUsage.mockResolvedValue(recent(0, 0));
+    }
+    await advance(30_000);
+    expect(screen.getByText(failedScope === "self" ? "6h" : "2h")).toBeTruthy();
+    expect(screen.getByText("<1m")).toBeTruthy();
+    expect(screen.getByText("Active runs")).toBeTruthy();
+  });
+  it("skips hidden ticks and refreshes when the tab becomes visible", async () => {
+    vi.useFakeTimers(); renderDashboard(); await advance();
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
+    await advance(30_000);
+    expect(mockApi.getUsage).toHaveBeenCalledTimes(1);
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => false });
+    await act(async () => { document.dispatchEvent(new Event("visibilitychange")); });
+    expect(mockApi.getUsage).toHaveBeenCalledTimes(2);
   });
 });

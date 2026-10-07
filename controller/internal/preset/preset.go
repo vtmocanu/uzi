@@ -114,8 +114,10 @@ func IsUnknown(err error) bool {
 // issue #1341 for the measured figures), and the requests below were recalibrated in
 // issue #1341 above those measured multi-agent peaks.
 //
-// Hosted `m` has a larger memory ceiling than compose's 4Gi default. New hosted workers default to `l` (issue #2240:
-// the api's UZI_EPHEMERAL_DEFAULT_SIZE and the web dialog's preselection). The default cap is 1
+// Hosted `m` has a larger memory ceiling than compose's 4Gi default and the same
+// CPU request/limit and persistent data size as the pre-#2127 `l` (issue #2412):
+// 1/4 CPU, 8Gi/12Gi memory and 25Gi data. New ephemeral workers default to `m`;
+// the persistent provision form still preselects `l` (ADR-2240). The default cap is 1
 // (WORKER_MAX_CONCURRENT_RUNS), so a size still buys headroom for ONE run. That cap
 // is now operator-configurable (chart workers.maxConcurrentRuns → the controller's
 // UZI_WORKER_MAX_CONCURRENT_RUNS), and an operator raising it must pick a size that
@@ -133,11 +135,11 @@ var sizes = map[string]Size{
 		DataSize:      resource.MustParse("5Gi"),
 	},
 	"m": {
-		CPURequest:    resource.MustParse("500m"),
-		CPULimit:      resource.MustParse("2"),
+		CPURequest:    resource.MustParse("1"),
+		CPULimit:      resource.MustParse("4"),
 		MemoryRequest: resource.MustParse("8Gi"),
 		MemoryLimit:   resource.MustParse("12Gi"),
-		DataSize:      resource.MustParse("10Gi"),
+		DataSize:      resource.MustParse("25Gi"),
 	},
 	"l": {
 		CPURequest:    resource.MustParse("1"),

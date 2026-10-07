@@ -370,7 +370,6 @@ describe("issue #1742 finalize hardening: runner retirement and crash cuts", () 
     const { root, outbox } = await outboxWithRoot();
     const claim = gitlabClaim(1751, { claim_generation: 2, config: { completion_contract_version: 1, contract_revision: 1 } });
     api.setCompletionPermitResponse(false, { denyReason: "missing_milestones" });
-    git.trackingTip = (async () => "1111111111111111111111111111111111111111") as typeof git.trackingTip;
     const { gitlab } = fakeGitlab();
     await runner(new StubExecutor(nullLogger()), gitlab, undefined, { outbox, ...RUNNER_OPTS, recoveryRetryMs: 1 }).execute(claim);
     assert.equal(api.completionHoldRequests.length, 1, "the run entered the completion hold");

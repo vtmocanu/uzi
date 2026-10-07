@@ -1,6 +1,6 @@
 # ADR-2240: Default new hosted workers to the large preset
 
-**Status**: Accepted
+**Status**: Accepted; ephemeral default superseded by #2412 on 2026-10-07
 **Date**: 2026-10-05
 **Issue**: [#2240](https://github.com/vtmocanu/uzi/issues/2240)
 
@@ -62,3 +62,32 @@ Figures below are the sizes at the time of this decision; issue #2127 later rais
 - Existing workers retain their persisted sizes. Self-run compose workers
   retain their separate deployment settings.
 - The CLI has no hosted-worker creation command or default to change.
+
+## Partial supersession, 2026-10-07 (#2412)
+
+The persistent provision form retains `l`. New ephemeral workers instead default
+to `m`, configured by chart `workers.ephemeralDefaultSize` (`s`, `m`, or `l`).
+The chart rejects invalid values and renders a direct API environment entry;
+setting the same key in `api.config` or `api.secretEnv` fails the render, so an
+older override cannot be silently ignored.
+Non-chart deployments default and fall back to `m` through
+`UZI_EPHEMERAL_DEFAULT_SIZE`. Stored worker sizes remain unchanged.
+
+The `m` preset matches the pre-#2127 `l`: CPU request increases from 500m to
+1 CPU, CPU limit from 2 to 4, memory stays 8Gi requested / 12Gi limit, and new
+persistent data volumes grow from 10Gi to 25Gi. Ephemeral data retains its
+separate 20Gi default. Existing persistent `m` data PVCs keep 10Gi until
+reprovisioned; the controller never patches an existing PVC's size.
+
+Compared with today's `l`, this saves 6Gi of memory reservation per ephemeral
+worker with the same CPU request and burst ceiling. The shipped CPU/storage
+quotas and LimitRange maxima already admit `l`'s 1/4 CPU and 25Gi data.
+Existing `m` workers receive the CPU change through the normal controller
+spec-hash roll and drain rules.
+
+Issue #2325 already added a two-file concurrency floor for 2-CPU agent tests.
+The extra CPU headroom does not guarantee a gate duration or eliminate shared
+CPU contention. A single-run peak measured under #2127 fits the medium memory
+budget, but arbitrary repository workloads may need an explicit larger size.
+
+Decision and hosted acceptance: [#2412](https://github.com/vtmocanu/uzi/issues/2412).

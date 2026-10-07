@@ -70,10 +70,10 @@ describe("recovery capture retry and restart safety (#1197)", () => {
         if (allowCapture) return marker(...args);
         fail(); return false;
       };
-      if (failure === "fetch") git.fetchAgentBranch = async (...args) => {
+      if (failure === "fetch") git.fetchAgentBranch = (async (...args: Parameters<typeof fetch>) => {
         if (allowCapture) return fetch(...args);
         fail(); throw new Error("injected fetch failure");
-      };
+      }) as typeof git.fetchAgentBranch;
       if (failure === "verify") git.verifyRunnerTrackingCovers = async (...args) => {
         if (allowCapture) return verify(...args);
         fail(); return false;

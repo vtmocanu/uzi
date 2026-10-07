@@ -395,11 +395,11 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 func protocolFeatures(activeSnapshotEnabled bool) []string {
 	groups := [][]string{
 		{"dind_maintenance_v1"},
-		{"recovery_park_cause", "recovery_release_exact_echo"}, // PRD #1392 M1
-		{"heartbeat_outbox"},                                   // PRD #1391 M5, Run A
-		{"worker_residue_quarantine"},                          // issue #2213: this api accepts the heartbeat's residue_quarantine member
-		{"claim_generation_fence"},                             // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker
-		{"terminal_fence"},                                     // PRD #1391 Run B M3c: this api fences a terminal transition on messages_through_seq contiguity
+		{"recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1"}, // PRD #1392 M1
+		{"heartbeat_outbox"},          // PRD #1391 M5, Run A
+		{"worker_residue_quarantine"}, // issue #2213: this api accepts the heartbeat's residue_quarantine member
+		{"claim_generation_fence"},    // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker
+		{"terminal_fence"},            // PRD #1391 Run B M3c: this api fences a terminal transition on messages_through_seq contiguity
 		// Issue #1766 M2: this api accepts {status:"recovery_wait", recovery_cause:"vault_locked"}
 		// and stores the cause. Advertised UNCONDITIONALLY (no config gates the park): a worker
 		// must see it before sending the cause, because an older api 400s an unknown recovery_cause.
@@ -1627,7 +1627,12 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 	// PRD #1391 Run B M4: claim_generation rides the same probe (additive) so the run-lane claim
 	// router can proceed ONLY on a claimed/running row AT the claim's generation, and end the
 	// attempt (no report) on a terminal status or a DIFFERENT generation.
-	body := map[string]any{"status": status, "claim_generation": claimGeneration}
+	guarded, err := h.wsvc.RunInventoryGuard(r.Context(), wkr, runID, claimGeneration)
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	body := map[string]any{"status": status, "claim_generation": claimGeneration, "inventory_guarded": guarded}
 	if recoveryRetryNotBefore != nil {
 		body["recovery_retry_not_before"] = recoveryRetryNotBefore
 	}

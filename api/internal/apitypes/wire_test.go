@@ -1041,7 +1041,8 @@ func TestAdminUsageDTOTags(t *testing.T) {
 // server-computed sub-cut of `failed` (needs_landing <= failed), also always present.
 func TestRunOutcomesDTOTags(t *testing.T) {
 	assertTags(t, "RunOutcomesDTO", RunOutcomesDTO{},
-		"finished", "completed", "cancelled", "plan_rejected", "failed", "needs_landing", "fail_origins")
+		"finished", "completed", "cancelled", "plan_rejected", "failed", "needs_landing", "fail_origins",
+		"last_failed_at", "last_failed_run_id", "last_failed_origin", "last_failed_user_id", "completed_since_last_failure")
 }
 
 // TestRunOutcomeWindowsDTOTags pins the two-window wrapper (PRD #1293).
@@ -1311,8 +1312,8 @@ func TestRecoveryWorkerRPCTags(t *testing.T) {
 		"run_id", "idempotency_key", "source_sha")
 	// PRD #1349 M1: generation is *int64 omitempty (a v2 worker names its claim generation;
 	// a v1 worker omits it), so the full case surfaces it beside attempted_head_sha.
-	assertTags(t, "RecoveryReserveRequest(full)", RecoveryReserveRequest{AttemptedHeadSha: "h", Generation: &gen},
-		"run_id", "idempotency_key", "source_sha", "attempted_head_sha", "generation")
+	assertTags(t, "RecoveryReserveRequest(full)", RecoveryReserveRequest{AttemptedHeadSha: "h", Generation: &gen, CoverageDigest: "digest"},
+		"run_id", "idempotency_key", "source_sha", "attempted_head_sha", "generation", "coverage_digest")
 	assertTags(t, "RecoveryReserveResponse", RecoveryReserveResponse{}, "capture_id", "state")
 	assertTags(t, "RecoveryUploadManifest", RecoveryUploadManifest{},
 		"byte_size", "checksum", "chunk_count")
@@ -1333,13 +1334,15 @@ func TestRecoveryWorkerRPCTags(t *testing.T) {
 	// PRD #1349 M1: the worker-facing exact-generation release request (generation is the sole
 	// field, *int64 omitempty — the zero value marshals {} and a v2 caller adds generation).
 	assertTags(t, "RecoveryReleaseRequest", RecoveryReleaseRequest{})
-	assertTags(t, "RecoveryReleaseRequest(full)", RecoveryReleaseRequest{Generation: &gen}, "generation")
+	assertTags(t, "RecoveryReleaseRequest(full)", RecoveryReleaseRequest{Generation: &gen, FinalDisposition: &RecoveryFinalDisposition{Kind: "archive"}}, "generation", "final_disposition")
+	assertTags(t, "RecoveryFinalDisposition", RecoveryFinalDisposition{}, "kind", "coverage_digest")
+	assertTags(t, "RecoveryFinalDisposition(full)", RecoveryFinalDisposition{CaptureID: "capture", SourceSha: "source"}, "kind", "coverage_digest", "capture_id", "source_sha")
 	// PRD #1349 M1: the post-clone hold inventory. capture_state is omitempty (absent when the
 	// hold has no capture yet); hold_id/generation/has_available_capture are always on the wire.
 	assertTags(t, "RecoveryHoldDTO", RecoveryHoldDTO{},
-		"hold_id", "generation", "has_available_capture")
+		"hold_id", "generation", "has_available_capture", "inventory_guarded")
 	assertTags(t, "RecoveryHoldDTO(full)", RecoveryHoldDTO{CaptureState: "preparing"},
-		"hold_id", "generation", "has_available_capture", "capture_state")
+		"hold_id", "generation", "has_available_capture", "inventory_guarded", "capture_state")
 	// holds is NOT omitempty (present-as-null on the zero value; the service normalizes to []).
 	assertTags(t, "RecoveryHoldsResponse", RecoveryHoldsResponse{}, "run_id", "holds")
 	// Issue #1582 M1: the predecessor-settle request carries candidate SHAs only (never an

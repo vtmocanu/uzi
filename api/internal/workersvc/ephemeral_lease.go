@@ -86,17 +86,18 @@ func (s *Service) enterEphemeralLeaseTx(ctx context.Context, tx pgx.Tx, wkr stor
 	}
 	var out terminalLeaseOutcome
 	if run.Status == "completed" {
-		if _, err := sq.ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
+		n, err := sq.ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
 			RunID:           runID,
 			Generation:      generation,
 			WorkerID:        wkr.ID,
 			ReleaseEvidence: pgconv.TextOrNull("publication"),
-		}); err != nil {
+		})
+		if err != nil {
 			slog.Warn("ephemeral lease: release custody in terminal tx", "run", runID, "worker", wkr.ID, "generation", generation, "error", err)
 			_ = sp.Rollback(ctx)
 			return terminalLeaseOutcome{}
 		}
-		out.released = true
+		out.released = n > 0
 	}
 	n, err := sq.EnterEphemeralLease(ctx, store.EnterEphemeralLeaseParams{WorkerID: wkr.ID, RunID: runID})
 	if err != nil {

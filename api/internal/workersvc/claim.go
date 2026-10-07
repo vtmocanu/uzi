@@ -59,8 +59,9 @@ type ClaimPayload struct {
 	// (run_id, claim_generation) so a later claim on the same run cannot adopt this
 	// generation's captured work. Always present (the column is NOT NULL DEFAULT 0); an old
 	// worker ignores the key. Distinct from RequeueCount, which counts requeues, not claims.
-	ClaimGeneration int64   `json:"claim_generation"`
-	PlanMd          *string `json:"plan_md"` // resume: plan already captured
+	ClaimGeneration  int64   `json:"claim_generation"`
+	InventoryGuarded bool    `json:"inventory_guarded,omitempty"`
+	PlanMd           *string `json:"plan_md"` // resume: plan already captured
 	// AutoApprove flags an autopilot run (PRD #19): the worker resolves the plan
 	// gate with an approve verdict instead of parking at awaiting_approval. It is
 	// top-level (read from the runs row), NOT in ClaimConfig — ClaimConfig is

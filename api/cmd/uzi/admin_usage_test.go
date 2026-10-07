@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
@@ -23,7 +24,7 @@ func renderUsageToString(t *testing.T, u apitypes.AdminUsageDTO) string {
 
 // TestRenderAdminUsageOutcomes covers the PRD #1293 M3 CLI additions: the factory
 // line's finished/failed/fail_rate fields and the reordered per-user table columns
-// (EMAIL RUNS FAILED FAIL% INPUT OUTPUT COST), mirroring the web column order (D8).
+// (EMAIL RUNS FAILED FAIL% SINCE INPUT OUTPUT COST), mirroring the web column order (D8).
 func TestRenderAdminUsageOutcomes(t *testing.T) {
 	u := apitypes.AdminUsageDTO{
 		Factory: apitypes.SelfUsageDTO{
@@ -65,9 +66,9 @@ func TestRenderAdminUsageOutcomes(t *testing.T) {
 		}
 	}
 
-	// Table header is exactly EMAIL RUNS FAILED FAIL% INPUT OUTPUT COST in order.
+	// Table header is exactly EMAIL RUNS FAILED FAIL% SINCE INPUT OUTPUT COST in order.
 	header := firstHeaderLine(t, out)
-	wantOrder := []string{"EMAIL", "RUNS", "FAILED", "FAIL%", "INPUT", "OUTPUT", "COST"}
+	wantOrder := []string{"EMAIL", "RUNS", "FAILED", "FAIL%", "SINCE", "INPUT", "OUTPUT", "COST"}
 	if got := strings.Fields(header); !equalStringSlices(got, wantOrder) {
 		t.Errorf("table header = %v, want %v\nheader line: %q", got, wantOrder, header)
 	}
@@ -116,7 +117,7 @@ func TestRenderAdminUsageZeroFinished(t *testing.T) {
 // TestRenderAdminUsageNeedsLanding covers the issue #1418 CLI parity: the needs-landing sub-cut
 // of the `failed` bucket rides inline beside the failed figure — "failed=N (K need landing)" on
 // the factory line and the same parenthetical in the per-user FAILED cell — shown only when the
-// sub-cut is positive, and never as a new column (the header stays EMAIL RUNS FAILED FAIL% ...).
+// sub-cut is positive, and never as a new column (the needs-landing split does not add a column).
 func TestRenderAdminUsageNeedsLanding(t *testing.T) {
 	u := apitypes.AdminUsageDTO{
 		Factory: apitypes.SelfUsageDTO{
@@ -149,11 +150,11 @@ func TestRenderAdminUsageNeedsLanding(t *testing.T) {
 	if !strings.Contains(out, "failed=106 (7 need landing)") {
 		t.Errorf("factory line missing inline needs-landing sub-cut \"failed=106 (7 need landing)\":\n%s", out)
 	}
-	// The header must NOT gain a column — the split rides the FAILED cell, not a new field.
+	// The needs-landing split rides the FAILED cell; recency has its own SINCE column.
 	header := firstHeaderLine(t, out)
-	wantOrder := []string{"EMAIL", "RUNS", "FAILED", "FAIL%", "INPUT", "OUTPUT", "COST"}
+	wantOrder := []string{"EMAIL", "RUNS", "FAILED", "FAIL%", "SINCE", "INPUT", "OUTPUT", "COST"}
 	if got := strings.Fields(header); !equalStringSlices(got, wantOrder) {
-		t.Errorf("table header = %v, want %v (no new column)\nheader line: %q", got, wantOrder, header)
+		t.Errorf("table header = %v, want %v\nheader line: %q", got, wantOrder, header)
 	}
 	// alice's FAILED cell carries the sub-cut; bob's (zero landing) stays a bare count.
 	if alice := lineWith(t, out, "alice@example.com"); !strings.Contains(alice, "40 (3 need landing)") {
@@ -186,4 +187,34 @@ func equalStringSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func TestRenderAdminUsageFailureRecency(t *testing.T) {
+	at := time.Now().Add(-6 * time.Hour)
+	o := apitypes.RunOutcomesDTO{Finished: 20, Failed: 1, LastFailedAt: &at}
+	u := apitypes.AdminUsageDTO{Factory: apitypes.SelfUsageDTO{Outcomes: apitypes.RunOutcomeWindowsDTO{Lifetime: o}}, Users: []apitypes.AdminUserUsageDTO{{Email: "failed@example.com", Outcomes: o}, {Email: "clean@example.com", Outcomes: apitypes.RunOutcomesDTO{Finished: 4}}, {Email: "empty@example.com"}}}
+	out := renderUsageToString(t, u)
+	for _, want := range []string{"since_last_failure=6h", "SINCE"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q: %s", want, out)
+		}
+	}
+	for _, tc := range []struct{ email, want string }{{"failed@example.com", "6h"}, {"clean@example.com", "no failures"}, {"empty@example.com", "-"}} {
+		if line := lineWith(t, out, tc.email); !strings.Contains(line, tc.want) {
+			t.Errorf("row missing %q: %s", tc.want, line)
+		}
+	}
+}
+
+func TestSinceLastFailureBoundaries(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	for _, tc := range []struct {
+		age  time.Duration
+		want string
+	}{{-time.Minute, "<1m"}, {0, "<1m"}, {59 * time.Second, "<1m"}, {time.Minute, "1m"}, {38 * time.Minute, "38m"}, {time.Hour, "1h"}, {6 * time.Hour, "6h"}, {24 * time.Hour, "1d"}, {3 * 24 * time.Hour, "3d"}} {
+		at := now.Add(-tc.age)
+		if got := sinceLastFailure(apitypes.RunOutcomesDTO{LastFailedAt: &at}, now); got != tc.want {
+			t.Errorf("age %s: %s, want %s", tc.age, got, tc.want)
+		}
+	}
 }

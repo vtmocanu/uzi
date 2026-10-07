@@ -1,3 +1,4 @@
+import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -144,7 +145,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     const realTip = commit(seed.path, "M1.txt"); // non-workflow work off the v1-workflow base
     advanceOriginWorkflow(fx, "name: ci\non: push\njobs: {}\n# v2\n"); // main moves its workflow
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
 
     const packed = await gitA.checkpointPack(bareA, branch, ctx());
     assert.ok(packed, "checkpointPack returns a pack");
@@ -188,7 +189,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const bareA = await gitA.ensureClone(fx.originPath);
     const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     const realTip = commit(seed.path, "M1.txt"); // no workflow change; main not advanced
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
 
     const packed = await gitA.checkpointPack(bareA, branch, ctx());
     assert.ok(packed);
@@ -205,7 +206,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     // The branch ITSELF edits a workflow file — the doomed-at-finalize shape.
     const realTip = commit(seed.path, WF, "name: ci\non: push\njobs: {}\n# branch-edit\n");
     advanceOriginWorkflow(fx, "name: ci\non: push\njobs: {}\n# v2\n"); // also behind, so gate-2 passes
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
 
     const packed = await gitA.checkpointPack(bareA, branch, ctx());
     assert.ok(packed);
@@ -225,7 +226,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const seed = await gitA.createOrAttachRunnerClone(bareA, 1037, noProofReseed, "run-A");
     const realTip = commit(seed.path, workflow, "name: branch\n");
     advanceOriginWorkflow(fx, "name: ci\n# v2\n");
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
 
     const packed = await gitA.checkpointPack(bareA, branch, ctx());
     assert.ok(packed);
@@ -246,7 +247,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const marker = gitIn(seed.path, ["rev-parse", "HEAD"]);
     assert.ok(subjectOf(seed.path, marker).startsWith(WIP_PARK_COMMIT_PREFIX));
     advanceOriginWorkflow(fx, "name: ci\non: push\njobs: {}\n# v2\n");
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
 
     const packed = await gitA.checkpointPack(bareA, branch, ctx());
     assert.ok(packed);
@@ -281,9 +282,9 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const floor = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
     const pinnedTip = commit(seed.path, "M1.txt");
     advanceOriginWorkflow(fx, "name: ci\non: push\njobs: {}\n# v2\n");
-    await gitA.fetchAgentBranch(bare, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bare, seed.path, branch, "run-A");
     commit(seed.path, WF, "name: ci\non: push\njobs: {}\n# branch edit\n");
-    await gitA.fetchAgentBranch(bare, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bare, seed.path, branch, "run-A");
 
     const packed = await gitA.checkpointPack(bare, branch, ctx(), { tipSha: pinnedTip, excludeSha: floor });
     assert.ok(packed);
@@ -299,13 +300,13 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     commit(seed.path, "M1.txt");
     advanceOriginWorkflow(fx, "name: ci\non: push\njobs: {}\n# v2\n");
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
     const p1 = await gitA.checkpointPack(bareA, branch, ctx());
     const ov1 = p1!.tipOid;
     assert.ok(subjectOf(bareA, ov1).startsWith(OVERLAY_COMMIT_PREFIX));
 
     const realTip2 = commit(seed.path, "M2.txt"); // more work → a second checkpoint
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
     const p2 = await gitA.checkpointPack(bareA, branch, ctx(ov1));
     const ov2 = p2!.tipOid;
     const parents = parentsOf(bareA, ov2);
@@ -332,11 +333,11 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     commit(seed.path, "M1.txt");
     advanceOriginWorkflow(fx, "name: ci\non: push\njobs: {}\n# v2\n");
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
     const ov1 = (await gitA.checkpointPack(bareA, branch, ctx()))!.tipOid;
 
     const realTip2 = commit(seed.path, "M2.txt");
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
     const p2 = await gitA.checkpointPack(bareA, branch, ctx(ov1));
     const ov2 = p2!.tipOid;
     assert.strictEqual(parentsOf(bareA, ov2).length, 2, "ov2 is a 2-parent chained overlay");
@@ -362,7 +363,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     const realTip = commit(seed.path, "M1.txt"); // realTip still carries the v1 workflow
     deleteOriginWorkflow(fx); // default now has NO .github/workflows tree
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
 
     const packed = await gitA.checkpointPack(bareA, branch, ctx());
     assert.ok(packed);
@@ -379,7 +380,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const bareA = await gitA.ensureClone(fx.originPath);
     const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     const realTip = commit(seed.path, "M1.txt");
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
 
     const packed = await gitA.checkpointPack(bareA, branch, ctx());
     assert.ok(packed);
@@ -394,7 +395,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     commit(seed.path, "M1.txt");
     advanceOriginWorkflow(fx, "name: ci\non: push\njobs: {}\n# v2\n");
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
 
     const a = await gitA.checkpointPack(bareA, branch, ctx());
     const b = await gitA.checkpointPack(bareA, branch, ctx());
@@ -411,7 +412,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     const realTip = commit(seed.path, "M1.txt");
     advanceOriginWorkflow(fx, "name: ci\non: push\njobs: {}\n# v2\n"); // behind, but no overlay asked for
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
 
     const packed = await gitA.checkpointPack(bareA, branch); // no 3rd arg
     assert.ok(packed);
@@ -436,7 +437,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     gitIn(seed.path, [...IDENT, "commit", "-m", `${OVERLAY_COMMIT_PREFIX} forged by the agent`]);
     const forged = gitIn(seed.path, ["rev-parse", "HEAD"]);
     // Stamp the worker-side tracking ref for run-A so the reseed is ownedHere.
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
 
     const rc = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     assert.strictEqual(rc.seededFrom, "tracking", "seeded from the owned tracking ref, not a checkpoint");
@@ -472,7 +473,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     gitIn(seed.path, ["add", "M1.txt"]);
     gitIn(seed.path, [...IDENT, "commit", "-m", `${OVERLAY_COMMIT_PREFIX} forged plain`]);
     const forged = gitIn(seed.path, ["rev-parse", "HEAD"]);
-    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+    await fixtureFetchTracking(gitA, bareA, seed.path, branch, "run-A");
 
     const packed = await gitA.checkpointPack(bareA, branch, ctx());
     assert.ok(packed);

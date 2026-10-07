@@ -61,6 +61,9 @@ through `[0.52.0]`.)
 - **Codex runs provision JavaScript dependencies before implementation ([#1743](https://github.com/vtmocanu/uzi/issues/1743)).**
   Dependency installation overlaps planning, reports installed and failed projects before the first implementation turn, and settles before capture, credential reconciliation and teardown across provider epochs.
 
+- **Ephemeral workers default to M, with chart-configurable sizing ([#2412](https://github.com/vtmocanu/uzi/issues/2412)).**
+  New ephemeral workers reserve 8Gi instead of 14Gi by default; operators can select S, M or L through `workers.ephemeralDefaultSize`. M now matches the earlier L preset: 1/4 CPU, 8Gi/12Gi memory and 25Gi persistent data; ephemeral data retains its separate 20Gi default. Persistent provisioning still preselects L; existing workers keep their stored size and existing M workers receive the CPU changes on their next controller roll, while existing 10Gi data PVCs stay at that size until reprovisioned. Upgrade note: an `UZI_EPHEMERAL_DEFAULT_SIZE` set under `api.config` or `api.secretEnv` now fails the render; move it to `workers.ephemeralDefaultSize`.
+
 ### Added
 
 - **Healthy busy workers no longer show custody attention.**
@@ -89,6 +92,9 @@ through `[0.52.0]`.)
 
 - **Advisory draft plans in run activity ([#2323](https://github.com/vtmocanu/uzi/issues/2323)).**
   The latest valid explicit draft capture appears as Markdown in both activity views, labelled draft, unapproved, possibly incomplete, with a truncation notice when needed; earlier captures remain stored and submitted-plan approval stays separate.
+
+- **Time since the last failed run on Overview ([#2399](https://github.com/vtmocanu/uzi/issues/2399)).**
+  Your usage, Factory total, and the admin per-user breakdown show adaptive elapsed time since the last failed run; the cards also show completed runs since that failure and link to it. The admin usage CLI includes failure recency too; the usage cards omit the Top causes line, group recoverable failures in the legend, align their sections, keep the last-failure detail on one line, and put the value before each summary label.
 
 ### Fixed
 
@@ -163,6 +169,13 @@ through `[0.52.0]`.)
 
 - **A Claude run can Read its own oversized tool output ([#2332](https://github.com/vtmocanu/uzi/issues/2332)).**
   When the SDK spills a large tool result to a file under the run's HOME and tells the agent where, the agent's `Read` of that one file is no longer denied as outside the worktree. Only the run's own current session spill directory qualifies, and only direct-child regular files (no symlinks or nested paths); Write, Edit, Glob, Grep, Bash screening, the secret and `.git` denies, and the chat, isolated, job-runner and Codex lanes are unchanged.
+
+- **Recovery custody retains complete candidate inventories ([#1924](https://github.com/vtmocanu/uzi/issues/1924)).**
+  Workers retain divergent unpublished heads under worker-local refs, distinguish them from durable remote checkpoints in the feed, and freeze a recovery-only aggregate whose ancestry preserves the original heads with one current source tree. Inventory-guarded generations keep custody open despite completion or an earlier available archive until the exact final covering archive or verified empty inventory is acknowledged; an owner-readable receipt identifies the selected capture and coverage digest. The selected archive is protected while its local worker exists, and physical worker deletion renews the configured normal ready-retention window (7 days by default); earlier non-final and legacy captures keep their existing TTL. Dirty or unverified source and pending final acknowledgments retain custody with bounded retries. A guarded claim that parks or fails before its clone closes its own empty hold with a settled release once nothing is proven adopted locally. Older APIs report unguarded generations without promising complete terminal or reclamation protection; local pins alone are not durable recovery. A run retains at most 64 such heads: at the limit the worker keeps the existing pins and the clone and stops the run as a preservation failure instead of letting a rewriting agent grow worker-local pins without bound, and the feed announces each retained head only once.
+
+- **Checkpoint pushes with lost acknowledgements can be confirmed while a run is live ([#2395](https://github.com/vtmocanu/uzi/issues/2395)).**
+  After the broker records an actual advance or a potentially sent push with an unknown outcome, reconciliation can confirm the matching forge tip. Later unchanged-tip retries and restarted claims recognize the durable checkpoint without creating live retention or deletion obligations. Unclassified attempts remain pending competing claims; another run's claims and newer checkpoint or slot state prevent adoption. Broker acknowledgements retain their raw success/rejection markers and have a cumulative 1 MiB response limit.
+  Migration 00306 is additive, leaves legacy attempts pending without backfill, and retains readiness evidence on rollback. A crash before disposition recording can still leave a landed push pending. The existing terminal stalled-sender hazard remains outside this fix (finding 5b641106-d2cf-4767-813f-e29d0692c228).
 
 ## [0.85.2] - 2026-10-05
 

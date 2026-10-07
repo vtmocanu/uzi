@@ -1,3 +1,4 @@
+import { followSuccessfulPush } from "./publication-fixture.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { nullLogger } from "./helpers.js";
@@ -7,7 +8,7 @@ import { StubExecutor } from "../src/executor.js";
 import type { StateRequest } from "../src/protocol.js";
 import {
   api,
-  fakeGitlab,
+  fakeGitlab as rawFakeGitlab,
   git,
   gitlabClaim,
   installHarness,
@@ -20,10 +21,21 @@ installHarness();
 // PRD #1226 M4 (D5): the completion permit + exact-head PR verification, driven end-to-end through
 // the REAL RunRunner.execute() (clone seed → StubExecutor commits real work → phasePublish pushes to
 // origin → interlocked permit/verify block). The StubExecutor commits and returns, so the finalize
-// push really lands; `git.trackingTip` is stubbed to a fixed H so the landed head is deterministic
-// (the push itself never reads trackingTip — pushBranch pushes refs/uzi-runner/<branch> directly —
-// so stubbing it does not disturb the real push). The fake forge answers getMergeRequestHead off its
+// push really lands; the fake forge follows the exact successful push candidate.
+// The fake forge answers getMergeRequestHead off its
 // GET; the FakeApi permit route answers a scripted grant/deny.
+
+let pushedSha = "";
+function fakeGitlab(opts: Parameters<typeof rawFakeGitlab>[0] = {}) {
+  const forge = rawFakeGitlab(opts);
+  const source = followSuccessfulPush(git, forge.pr, opts.head === undefined || opts.head === H);
+  const push = git.pushBranch.bind(git);
+  git.pushBranch = async (...args) => {
+    await push(...args);
+    pushedSha = source();
+  };
+  return forge;
+}
 
 const H = "1111111111111111111111111111111111111111";
 const OTHER = "2222222222222222222222222222222222222222";
@@ -80,13 +92,13 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     const { gitlab, calls, all } = fakeGitlab({ head: H });
     const claim = interlockedClaim(1300);
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
     // The permit was requested with the exact (contract_revision, branch, head=H) identity.
     assert.strictEqual(api.completionPermitRequests.length, 1, "the permit was requested exactly once");
-    assert.strictEqual(api.completionPermitRequests[0]!.body.head, H, "the landed head H rode the permit request");
+    assert.strictEqual(api.completionPermitRequests[0]!.body.head, pushedSha, "the landed head H rode the permit request");
     assert.strictEqual(api.completionPermitRequests[0]!.body.contract_revision, 1);
     assert.strictEqual(api.completionPermitRequests[0]!.body.branch, "agent/issue-1300");
     // The MR was created and the PR head was read back (a GET) to verify it.
@@ -96,7 +108,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     // Completed WITH head H (the permit-bound head rides the terminal report).
     const done = completedBody(claim.run_id);
     assert.ok(done, "the run reported completed");
-    assert.strictEqual(done!.head, H, "the completed report carries the permitted+verified head H");
+    assert.strictEqual(done!.head, pushedSha, "the completed report carries the permitted+verified head H");
     assert.strictEqual(done!.mr_iid, 42);
     // No hold was needed.
     assert.strictEqual(api.completionHoldRequests.length, 0, "a clean interlocked completion never holds");
@@ -121,7 +133,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     const { gitlab, calls, all, pr } = fakeGitlab({ head: H });
     const claim = ownerPartialClaim(1310);
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
@@ -147,7 +159,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     // The run completes (the head verified) and carries head H, like any granted interlocked run.
     const done = completedBody(claim.run_id);
     assert.ok(done, "an owner partial run still completes on a verified head");
-    assert.strictEqual(done!.head, H, "the completed report carries the permitted+verified head H");
+    assert.strictEqual(done!.head, pushedSha, "the completed report carries the permitted+verified head H");
     assert.strictEqual(api.completionHoldRequests.length, 0, "a verified owner partial never holds");
   });
 
@@ -156,7 +168,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     const claim = interlockedClaim(1301);
     api.setCompletionPermitResponse(false, { denyReason: "missing_milestones" });
     // The hold ACK defaults to paused/200, so enterCompletionHold parks the run.
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
       recoveryRetryMs: 1,
@@ -173,7 +185,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     const { gitlab, calls, all } = fakeGitlab({ head: OTHER });
     const claim = interlockedClaim(1302);
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
       recoveryRetryMs: 1,
@@ -199,7 +211,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     const { gitlab, calls, all } = fakeGitlab({ head: H, headStatus: 404 });
     const claim = interlockedClaim(1305);
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
       recoveryRetryMs: 1,
@@ -223,7 +235,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     const claim = interlockedClaim(1303);
     // A PERMANENT error (409) is thrown at once; a transient one is retried (next test).
     api.setCompletionPermitResponse(false, { httpStatus: 409 });
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
@@ -240,7 +252,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     const claim = interlockedClaim(1307);
     // Three 503s (the api down at finalize), then the api answers and grants.
     api.setCompletionPermitResponse(true, { httpStatus: 503, failTimes: 3 });
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
@@ -255,7 +267,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     const { gitlab, calls, all } = fakeGitlab({ head: H, putStatus: 404 });
     const claim = interlockedClaim(1306);
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
       recoveryRetryMs: 1,
@@ -283,17 +295,12 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     // described SHA (the staleness line a moved head changes).
     const prApi = new FakePrDescApi();
     api.prDescription = prApi;
-    const { gitlab, calls, all, pr } = fakeGitlab({
+    const { gitlab, calls, all } = fakeGitlab({
       onWrite: (p, description) => {
         if (/Closes #1307/.test(description)) p.head = OTHER;
       },
     });
-    const tip = git.trackingTip.bind(git);
-    git.trackingTip = (async (bare: string, branch: string) => {
-      const h = await tip(bare, branch);
-      if (h && pr.head !== OTHER) pr.head = h;
-      return h;
-    }) as typeof git.trackingTip;
+
     const claim = interlockedClaim(1307);
     api.setCompletionPermitResponse(true);
 
@@ -325,7 +332,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     const { gitlab, calls } = fakeGitlab({ head: OTHER, putStatus: 403 });
     const claim = interlockedClaim(1308);
     api.setCompletionPermitResponse(true);
-    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
 
     await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
       recoveryRetryMs: 1,
@@ -377,7 +384,7 @@ describe("interlocked capped MR delivery", () => {
       const claim = interlockedClaim(1320);
       const forge = fakeGitlab({ head: H, ...(adopted ? { existing: ["Human notes", REGION_START, "Old size", REGION_END, COMPLETION_START, "Closes #1320", COMPLETION_END].join("\n\n") } : {}) });
       api.setCompletionPermitResponse(true);
-      git.trackingTip = async () => H;
+
       await runner(cappedExecutor(), forge.gitlab).execute(claim);
       assert.equal(api.completionPermitRequests.length, 1);
       assert.equal(api.completionPermitRequests[0]!.body.scope_capped, true);
@@ -391,7 +398,7 @@ describe("interlocked capped MR delivery", () => {
         assert.ok(forge.calls.some((c) => c.method === "PUT"), "the adopted closing line was stripped");
       }
       assert.ok(forge.reads.length > 0, "head verification still runs");
-      assert.equal(completedBody(claim.run_id)?.head, H);
+      assert.equal(completedBody(claim.run_id)?.head, pushedSha);
       assert.equal(completedBody(claim.run_id)?.scope_capped, true);
       assert.equal(api.completionHoldRequests.length, 0);
     });
@@ -402,7 +409,7 @@ describe("interlocked capped MR delivery", () => {
       const claim = interlockedClaim(1321);
       const forge = fakeGitlab({ head: OTHER });
       api.setCompletionPermitResponse(!denied, { denyReason: "scope_cap_not_reached" });
-      git.trackingTip = async () => H;
+
       await runnerWith(() => ({ executor: cappedExecutor() }), forge.gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
       assert.equal(api.completionPermitRequests[0]!.body.scope_capped, true);
       assert.equal(completedBody(claim.run_id), undefined);

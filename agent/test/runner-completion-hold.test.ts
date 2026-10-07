@@ -1,3 +1,4 @@
+import { mockCommittedTracking } from "./runner-tracking-fixture.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -51,8 +52,7 @@ function makeHoldExecutor(verdict: boolean | Array<"throw" | boolean>): HoldProb
     run: async (ctx: RunContext) => {
       // Stub the capture git deterministically (the runner already seeded the real clone).
       git.worktreeStatus = (async () => []) as typeof git.worktreeStatus; // clean tree
-      git.fetchAgentBranch = (async () =>
-        `refs/uzi-runner/${ctx.branch}`) as typeof git.fetchAgentBranch;
+      mockCommittedTracking(git, CAPTURED_HEAD);
       git.verifyRunnerTrackingCovers = (async () => {
         // Count every attempt that reaches the positive-verify step (one per capture attempt).
         const i = captureAttempts.count++;

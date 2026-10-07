@@ -1,3 +1,4 @@
+import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -37,7 +38,7 @@ async function bareWithTwoCommits(): Promise<{ bare: string; mainTip: string; de
   fs.writeFileSync(path.join(rc.path, "impl.ts"), "export const x = 1;\n");
   gitIn(rc.path, ["add", "impl.ts"]);
   gitIn(rc.path, [...IDENT, "commit", "-m", "impl"]);
-  await git.fetchAgentBranch(bare, rc.path, "agent/issue-1", "run-a");
+  await fixtureFetchTracking(git, bare, rc.path, "agent/issue-1", "run-a");
   const descTip = await git.trackingTip(bare, "agent/issue-1");
   assert.ok(descTip && descTip !== mainTip);
   return { bare, mainTip, descTip };

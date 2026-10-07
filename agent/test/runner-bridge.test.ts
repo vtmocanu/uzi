@@ -1,3 +1,4 @@
+import { fixtureFetchTracking, fixtureUpdateTracking, fixtureTrackingOptions } from "./runner-tracking-fixture.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -506,11 +507,15 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     const branch = "feature/refusal-checkpoint";
     const P = publishBranch(branch);
     const bare = await git.ensureClone(fx.originPath);
-    await git.runnerCloneForBranch(bare, branch, "feature-rc", noProofReseed, "R1");
+    const rc = await git.runnerCloneForBranch(bare, branch, "feature-rc", noProofReseed, "R1");
+    await fixtureFetchTracking(git, bare, rc.path, branch, "R1");
     const { logger, lines } = recordingLogger();
     const feed: string[] = [];
     const flight = {
       runId: "R1",
+      claimGeneration: 1,
+      runKind: "issue",
+      owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),
       publishedTip: P,
       checkpointFloor: P,
       lastCheckpointRefTip: "CONFIRMED",
@@ -552,11 +557,15 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     const branch = "feature/refusal-noredactor";
     const P = publishBranch(branch);
     const bare = await git.ensureClone(fx.originPath);
-    await git.runnerCloneForBranch(bare, branch, "feature-rc", noProofReseed, "R1");
+    const rc = await git.runnerCloneForBranch(bare, branch, "feature-rc", noProofReseed, "R1");
+    await fixtureFetchTracking(git, bare, rc.path, branch, "R1");
     const { logger, lines } = recordingLogger();
     const feed: string[] = [];
     const flight = {
       runId: "R1",
+      claimGeneration: 1,
+      runKind: "issue",
+      owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),
       publishedTip: P,
       checkpointFloor: P,
       lastCheckpointRefTip: "CONFIRMED",
@@ -731,7 +740,7 @@ describe("RunRunner — the reseed after a bridge adopts B (PRD #1416 M3, SC2)",
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "--amend", "--no-edit"]);
     const H = gitIn(rc.path, ["rev-parse", "HEAD"]);
-    await git.fetchAgentBranch(bare, rc.path, branch, "R1"); // tracking ref = H (divergent), owner R1
+    await fixtureFetchTracking(git, bare, rc.path, branch, "R1"); // tracking ref = H (divergent), owner R1
 
     // CONTROL — today's behaviour: with the tracking ref left at the divergent H, a reseed sets it
     // aside and seeds from origin, losing the rewritten work.
@@ -742,7 +751,7 @@ describe("RunRunner — the reseed after a bridge adopts B (PRD #1416 M3, SC2)",
     const bridgeResult = await git.bridgeToFloors(bare, H, [P]);
     assert.strictEqual(bridgeResult.kind, "built", "a bridge was built");
     const B = (bridgeResult as { kind: "built"; sha: string }).sha;
-    await git.updateTrackingRef(bare, branch, B);
+    await fixtureUpdateTracking(git, bare, branch, B, "R1");
 
     // Now the reseed adopts B — the run resumes on its rewritten work.
     const after = await git.runnerCloneForBranch(bare, branch, "feature-reseed", noProofReseed, "R1");
@@ -913,9 +922,11 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "--amend", "--no-edit"]);
     const H = gitIn(rc.path, ["rev-parse", "HEAD"]);
-    await git.fetchAgentBranch(bare, rc.path, branch, "R1");
+    await fixtureFetchTracking(git, bare, rc.path, branch, "R1");
 
-    const flight = { runId: "R1", publishedTip: P, checkpointFloor: P };
+    const flight = { runId: "R1", claimGeneration: 1, runKind: "issue",
+        owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),
+        publishedTip: P, checkpointFloor: P };
     const r = runner({ run: async (c) => ({ branch: c.branch }) }, gitlab);
     const outcome = await callBridge(r, bare, branch, flight);
     assert.strictEqual(outcome.kind, "bridged");
@@ -935,10 +946,12 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     fs.writeFileSync(path.join(rc.path, "ontop.ts"), "1\n");
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "clean work on top of P"]);
-    await git.fetchAgentBranch(bare, rc.path, branch, "R1");
+    await fixtureFetchTracking(git, bare, rc.path, branch, "R1");
     const tipBefore = await git.trackingTip(bare, branch);
 
-    const flight = { runId: "R1", publishedTip: P, checkpointFloor: P };
+    const flight = { runId: "R1", claimGeneration: 1, runKind: "issue",
+        owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),
+        publishedTip: P, checkpointFloor: P };
     const r = runner({ run: async (c) => ({ branch: c.branch }) }, gitlab);
     const outcome = await callBridge(r, bare, branch, flight);
     assert.strictEqual(outcome.kind, "clean");
@@ -955,11 +968,14 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     fs.writeFileSync(path.join(rc.path, ".uzi", "scratch", "note"), "local only\n");
     gitIn(rc.path, ["add", "-f", ".uzi/scratch/note"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "scratch checkpoint"]);
-    await git.fetchAgentBranch(bare, rc.path, branch, "R1");
+    await fixtureFetchTracking(git, bare, rc.path, branch, "R1");
     const H = await git.trackingTip(bare, branch);
     const lines: string[] = [];
     const flight = {
       runId: "R1",
+      claimGeneration: 1,
+      runKind: "issue",
+      owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),
       publishedTip: P,
       checkpointFloor: P,
       lastCheckpointRefTip: "CONFIRMED",
@@ -992,13 +1008,15 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     fs.writeFileSync(path.join(rc.path, "REWRITE.md"), "rewrite\n");
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "--amend", "--no-edit"]);
-    await git.fetchAgentBranch(bare, rc.path, branch, "R1");
+    await fixtureFetchTracking(git, bare, rc.path, branch, "R1");
     const tipBefore = await git.trackingTip(bare, branch);
 
     const origAncestry = git.ancestry.bind(git);
     (git as unknown as { ancestry: unknown }).ancestry = async () => "unknown";
     try {
-      const flight = { runId: "R1", publishedTip: P, checkpointFloor: P };
+      const flight = { runId: "R1", claimGeneration: 1, runKind: "issue",
+        owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),
+        publishedTip: P, checkpointFloor: P };
       const r = runner({ run: async (c) => ({ branch: c.branch }) }, gitlab);
       const outcome = await callBridge(r, bare, branch, flight);
       assert.strictEqual(outcome.kind, "unknown");
@@ -1018,7 +1036,7 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "--amend", "--no-edit"]);
     const H = gitIn(rc.path, ["rev-parse", "HEAD"]);
-    await git.fetchAgentBranch(bare, rc.path, branch, "R1"); // tracking ref = divergent H
+    await fixtureFetchTracking(git, bare, rc.path, branch, "R1"); // tracking ref = divergent H
     const tipBefore = await git.trackingTip(bare, branch);
 
     // A malformed "bridge": parents H and P (so BOTH are definitively ancestors) but P's tree, NOT
@@ -1032,7 +1050,9 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
       sha: malformed,
     });
     try {
-      const flight = { runId: "R1", publishedTip: P, checkpointFloor: P };
+      const flight = { runId: "R1", claimGeneration: 1, runKind: "issue",
+        owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),
+        publishedTip: P, checkpointFloor: P };
       const r = runner({ run: async (c) => ({ branch: c.branch }) }, gitlab);
       const outcome = await callBridge(r, bare, branch, flight);
       assert.strictEqual(outcome.kind, "failed", "a tree-mismatched bridge is a definitive failure");
@@ -1051,7 +1071,7 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     fs.writeFileSync(path.join(rc.path, "REWRITE.md"), "rewrite\n");
     gitIn(rc.path, ["add", "."]);
     gitIn(rc.path, [...IDENT, "commit", "--amend", "--no-edit"]);
-    await git.fetchAgentBranch(bare, rc.path, branch, "R1"); // tracking ref = divergent H
+    await fixtureFetchTracking(git, bare, rc.path, branch, "R1"); // tracking ref = divergent H
     const tipBefore = await git.trackingTip(bare, branch);
 
     // The divergence detection + the REAL bridge build both run; only the post-build validation's
@@ -1060,7 +1080,9 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     const origRevParse = git.revParse.bind(git);
     (git as unknown as { revParse: unknown }).revParse = async () => null;
     try {
-      const flight = { runId: "R1", publishedTip: P, checkpointFloor: P };
+      const flight = { runId: "R1", claimGeneration: 1, runKind: "issue",
+        owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),
+        publishedTip: P, checkpointFloor: P };
       const r = runner({ run: async (c) => ({ branch: c.branch }) }, gitlab);
       const outcome = await callBridge(r, bare, branch, flight);
       assert.strictEqual(outcome.kind, "unknown", "a transient validation read maps to unknown, not failed");

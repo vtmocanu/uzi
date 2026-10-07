@@ -28,6 +28,7 @@ import { mrCompletionBlock } from "../src/runner.js";
 import { renderBody, renderRegion } from "../src/pr-description.js";
 import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
 import { api, fakeGitlab, git as harnessGit, gitlabClaim, installHarness, runner } from "./runner-harness.js";
+import { followSuccessfulPush } from "./publication-fixture.js";
 
 // PRD #1798 M1 (D3) — the deterministic size line. The classifier is table-tested per ecosystem path
 // rule and per attribute state; the attribute states come from REAL `git check-attr` runs against a
@@ -814,7 +815,6 @@ describe("RunRunner keeps the size line in the verified-head reconcile (PRD #179
   it("INTERLOCKED run: the post-verify description rewrite (PUT) still carries the **Size:** line", async () => {
     // The completion interlock (PRD #1226 M4) opens the MR, verifies head H, then REWRITES the body
     // via updateMergeRequestDescription to add Closes. That rewrite must keep the size line.
-    const H = "1111111111111111111111111111111111111111";
     const SIZE = [
       "**Size:** 2 files",
       "",
@@ -824,11 +824,11 @@ describe("RunRunner keeps the size line in the verified-head reconcile (PRD #179
       `| Tests | +2 | ${MINUS}0 |`,
       `| **Total** | **+5** | **${MINUS}1** |`,
     ].join("\n");
-    const { gitlab, calls, all } = fakeGitlab({ head: H });
+    const { gitlab, calls, all, pr } = fakeGitlab();
+    const pushedHead = followSuccessfulPush(harnessGit, pr);
     const claim = gitlabClaim(1798, { config: { completion_contract_version: 1, contract_revision: 1 } });
     api.setCompletionPermitResponse(true);
-    harnessGit.trackingTip = (async () => H) as typeof harnessGit.trackingTip;
-    // H is a synthetic landed head, so the size reads are pinned to a deterministic diff.
+    // Keep size reads deterministic while the forge follows the successful real push.
     harnessGit.sizeMergeBase = async () => "d".repeat(40);
     harnessGit.diffNumstatZ = async () => "3\t1\tsrc/a.ts\0" + "2\t0\tsrc/a.test.ts\0";
     harnessGit.checkAttrZ = async (_bare, _head, paths) => new Map(paths.map((p) => [p, {}]));
@@ -841,7 +841,10 @@ describe("RunRunner keeps the size line in the verified-head reconcile (PRD #179
     assert.deepStrictEqual(all.map((c) => c.method), ["POST", "GET", "GET", "GET", "GET", "PUT", "GET", "GET"]);
     const post = JSON.parse(calls.find((c) => c.method === "POST")!.body ?? "{}") as { description: string };
     const put = JSON.parse(calls.find((c) => c.method === "PUT")!.body ?? "{}") as { description: string };
-    const region = `<!-- uzi:description:start v1 -->\n${SIZE}\n\nDescribes \`1111111\` against \`main\`.\n<!-- uzi:description:end -->\n\n`;
+    const H = pushedHead();
+    assert.match(H, /^[0-9a-f]{40}$/);
+    assert.equal(pr.head, H);
+    const region = `<!-- uzi:description:start v1 -->\n${SIZE}\n\nDescribes \`${H.slice(0, 7)}\` against \`main\`.\n<!-- uzi:description:end -->\n\n`;
     assert.ok(post.description.startsWith(region), post.description);
     assert.match(put.description, /Closes #1798/, "the PUT is the verified-head reconcile");
     assert.ok(put.description.startsWith(region), `the reconcile body lost the size line:\n${put.description}`);

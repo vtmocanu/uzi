@@ -1,3 +1,4 @@
+import { mockCommittedTracking } from "./runner-tracking-fixture.js";
 // Issue #1673: the runner holds a resume report behind the applied receipt of the input that
 // caused it. When that receipt keeps failing on the active claim, the run must fail cleanly
 // rather than wait forever or send the resume as if the input were applied.
@@ -158,7 +159,7 @@ describe("RunRunner — input receipts (issue #1673)", () => {
     const executor: Executor = {
       run: async (ctx: RunContext) => {
         git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
-        git.fetchAgentBranch = (async () => `refs/uzi-runner/${ctx.branch}`) as typeof git.fetchAgentBranch;
+        mockCommittedTracking(git, "cafef00dcafef00dcafef00dcafef00dcafef00d");
         git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
         git.trackingTip = (async () => "cafef00dcafef00dcafef00dcafef00dcafef00d") as typeof git.trackingTip;
         git.checkpointPack = (async () => null) as typeof git.checkpointPack;
@@ -216,7 +217,7 @@ describe("RunRunner — input receipts (issue #1673)", () => {
       const executor: Executor = {
         run: async (ctx: RunContext) => {
           git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
-          git.fetchAgentBranch = (async () => `refs/uzi-runner/${ctx.branch}`) as typeof git.fetchAgentBranch;
+          mockCommittedTracking(git, "cafef00dcafef00dcafef00dcafef00dcafef00d");
           git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
           git.trackingTip = (async () => "cafef00dcafef00dcafef00dcafef00dcafef00d") as typeof git.trackingTip;
           git.checkpointPack = (async () => null) as typeof git.checkpointPack;
@@ -256,7 +257,7 @@ describe("RunRunner — input receipts (issue #1673)", () => {
           let marker = false;
           git.worktreeStatus = (async () => ["M src/impl.ts"]) as typeof git.worktreeStatus;
           git.commitWipMarker = (async () => { marker = true; return true; }) as typeof git.commitWipMarker;
-          git.fetchAgentBranch = (async () => `refs/uzi-runner/${ctx.branch}`) as typeof git.fetchAgentBranch;
+          mockCommittedTracking(git, "cafef00dcafef00dcafef00dcafef00dcafef00d");
           git.verifyRunnerTrackingCovers = (async () => false) as typeof git.verifyRunnerTrackingCovers;
           git.trackingTip = (async () => "cafef00dcafef00dcafef00dcafef00dcafef00d") as typeof git.trackingTip;
           git.checkpointPack = (async () => null) as typeof git.checkpointPack;

@@ -1,3 +1,4 @@
+import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -1277,7 +1278,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
     // Commit locally off the fork point and fetch it back (a first park — never pushed).
     const rc = await git.createOrAttachRunnerClone(bare, 210, noProofReseed, RUN);
     const local = commitInTree(rc.path, "LOCAL.txt", "local\n");
-    await git.fetchAgentBranch(bare, rc.path, "agent/issue-210", RUN);
+    await fixtureFetchTracking(git, bare, rc.path, "agent/issue-210", RUN);
     // Simulate a missing checkout in this isolated reseed fixture; worker-uid tests
     // exercise production teardown, which deliberately refuses off Linux.
     fs.rmSync(rc.path, { recursive: true, force: true });
@@ -1319,7 +1320,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
     // Push O1 to origin's agent/issue-211 (this fetch-back stamps the owner = RUN).
     const first = await git.createOrAttachRunnerClone(bare, 211, noProofReseed, RUN);
     const o1 = commitInTree(first.path, "ORIGIN.txt", "origin\n");
-    await git.fetchAgentBranch(bare, first.path, "agent/issue-211", RUN);
+    await fixtureFetchTracking(git, bare, first.path, "agent/issue-211", RUN);
     await git.pushBranch(bare, "agent/issue-211", "", fx.originPath);
     // Simulate a missing checkout in this isolated reseed fixture; worker-uid tests
     // exercise production teardown, which deliberately refuses off Linux.
@@ -1332,7 +1333,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
     // it), so RUN still owns the (now diverged) ref.
     const tmp = await git.createOrAttachRunnerClone(bare, 2110, noProofReseed, "run-tmp");
     const l1 = commitInTree(tmp.path, "LOCAL.txt", "local\n");
-    await git.fetchAgentBranch(bare, tmp.path, "agent/issue-2110", "run-tmp");
+    await fixtureFetchTracking(git, bare, tmp.path, "agent/issue-2110", "run-tmp");
     // Simulate a missing checkout in this isolated reseed fixture; worker-uid tests
     // exercise production teardown, which deliberately refuses off Linux.
     fs.rmSync(tmp.path, { recursive: true, force: true });
@@ -1357,11 +1358,11 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
     const bare = await git.ensureClone(fx.originPath);
     const rc = await git.createOrAttachRunnerClone(bare, 212, noProofReseed, RUN);
     const o1 = commitInTree(rc.path, "O.txt", "o\n");
-    await git.fetchAgentBranch(bare, rc.path, "agent/issue-212", RUN);
+    await fixtureFetchTracking(git, bare, rc.path, "agent/issue-212", RUN);
     await git.pushBranch(bare, "agent/issue-212", "", fx.originPath);
     // Build ON TOP of the pushed tip (descends), fetch that back — do NOT push it.
     const l1 = commitInTree(rc.path, "L.txt", "l\n");
-    await git.fetchAgentBranch(bare, rc.path, "agent/issue-212", RUN);
+    await fixtureFetchTracking(git, bare, rc.path, "agent/issue-212", RUN);
     // Simulate a missing checkout in this isolated reseed fixture; worker-uid tests
     // exercise production teardown, which deliberately refuses off Linux.
     fs.rmSync(rc.path, { recursive: true, force: true });
@@ -1393,7 +1394,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
     // A tracking ref a permanently-dead run (run-dead) left behind, no origin branch.
     const tmp = await git.createOrAttachRunnerClone(bare, 213, noProofReseed, "run-dead");
     commitInTree(tmp.path, "STALE.txt", "stale\n");
-    await git.fetchAgentBranch(bare, tmp.path, "agent/issue-213", "run-dead");
+    await fixtureFetchTracking(git, bare, tmp.path, "agent/issue-213", "run-dead");
     // Simulate a missing checkout in this isolated reseed fixture; worker-uid tests
     // exercise production teardown, which deliberately refuses off Linux.
     fs.rmSync(tmp.path, { recursive: true, force: true });

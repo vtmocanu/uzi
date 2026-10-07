@@ -181,6 +181,19 @@ export function Dashboard() {
     }
   }, []);
   usePollWhileVisible(poll, 10000);
+  // #2399: usage has its own cadence and failure handling. Each successful
+  // endpoint updates immediately; a failure retains only its own last-good data.
+  const pollUsage = useCallback(() => {
+    void api.getUsage().then((selfUsage) => {
+      setData((prev) => prev ? { ...prev, selfUsage } : prev);
+    }).catch(() => {});
+    if (user?.is_admin) {
+      void api.getAdminUsage().then((adminUsage) => {
+        setData((prev) => prev ? { ...prev, adminUsage } : prev);
+      }).catch(() => {});
+    }
+  }, [user?.is_admin]);
+  usePollWhileVisible(pollUsage, 30_000);
   // PRD #1064 M3: a slow clock to age the board cards' "now" line client-side. Declared
   // with the other hooks, above the early return, so the hook order is stable.
   const now = useNow(30_000);
@@ -372,7 +385,7 @@ export function Dashboard() {
           A non-admin never receives factory data, so it can never render. */}
       {data?.selfUsage &&
         (data.adminUsage ? (
-          <div className="grid gap-4 md:grid-cols-2">
+          <div className="grid gap-4 md:grid-cols-2 md:gap-y-0">
             <YourUsageCard usage={data.selfUsage} />
             <FactoryTotalCard admin={data.adminUsage} />
           </div>
