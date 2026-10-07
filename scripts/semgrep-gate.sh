@@ -134,7 +134,7 @@ fi
 # it still says DETECTED -- while the population it attests for has changed. Its
 # green would then be signed by a witness that no longer speaks for anything CI
 # checks out. See scan-secrets.sh's identical guard.
-if ! git ls-files --error-unmatch "$CANARY" >/dev/null 2>&1; then
+if ! git --literal-pathspecs ls-files --error-unmatch -- "$CANARY" >/dev/null 2>&1; then
   echo "semgrep-gate: canary is NOT TRACKED: $CANARY" >&2
   echo "  It is on disk, so semgrep still scans and fires on it -- but a canary" >&2
   echo "  outside the git index attests liveness over a population CI does not" >&2

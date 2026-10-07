@@ -66,7 +66,7 @@ results = [item] if stage == "canary" else []
 errors = []
 rc = 1 if stage == "canary" else 0
 active = case.endswith(stage) or case in ("malformedrules", "stderr", "payload",
-                                          "many", "hold", "hang", "termhang")
+                                          "many", "hold", "closed", "hang", "termhang")
 name = case.removesuffix(stage) if active else ""
 if case == "malformedrules":
     errors = [{"type": "RuleParseError"}]; rc = 2
@@ -133,14 +133,23 @@ if case in ("hang", "termhang"):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     while True:
         time.sleep(0.1)
-if case == "hold":
+if case in ("hold", "closed"):
+    recorded = len(Path(os.environ["OWNED"]).read_text().splitlines())
     pid = os.fork()
     if pid == 0:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         with open(os.environ["OWNED"], "a") as f:
             f.write(str(os.getpid()) + "\n")
+        if case == "closed":
+            os.close(1)
+            os.close(2)
         while True:
             time.sleep(0.1)
+    deadline = time.monotonic() + 2
+    while len(Path(os.environ["OWNED"]).read_text().splitlines()) <= recorded:
+        if time.monotonic() >= deadline:
+            sys.exit(2)
+        time.sleep(0.01)
 print(json.dumps({"results": results, "errors": errors}), flush=True)
 sys.exit(rc)
 ''')
@@ -164,10 +173,12 @@ def records():
     return [json.loads(line) for line in calls.read_text().splitlines()]
 
 
-def gone(pid):
+def gone(pid, proc_root=Path("/proc")):
     # Identity-level check of saved OWNED handles, never enumerate processes.
     try:
-        state = Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1].split()[0]
+        if not (proc_root / "self/stat").is_file():
+            raise RuntimeError("OWNED verification unavailable: procfs required")
+        state = (proc_root / str(pid) / "stat").read_text().split(") ", 1)[1].split()[0]
         return state == "Z"
     except FileNotFoundError:
         return True
@@ -217,6 +228,15 @@ def run(case, expected, count, extra_env=None):
     return output, time.monotonic() - start
 
 
+# Missing procfs cannot turn every recorded live handle into a settled handle.
+try:
+    gone(os.getpid(), scratch / "absent-proc")
+except RuntimeError:
+    print("PASS unavailable procfs verification fails explicitly", flush=True)
+else:
+    raise AssertionError("absent procfs falsely settled a live handle")
+assert not gone(os.getpid()), "current recorded handle must be live"
+
 if baseline:
     # New behavior: exit 1 plus a structured timeout is an instrument failure.
     run("timeouttree", 2, 2)
@@ -249,6 +269,10 @@ for stage in ("canary", "tree"):
 output, elapsed = run("hold", 2, 1)
 assert b"capture_incomplete" in output and b"raw=1" in output
 assert 2 <= elapsed < 5, elapsed
+output, elapsed = run("closed", 0, 2)
+assert elapsed < 5, elapsed
+assert len(owned.read_text().splitlines()) == 4
+print("PASS closed-pipes TERM-resistant descendants settled", flush=True)
 
 # Capture interruption independently tests catchable signals, TERM-resistant
 # direct children, KILL escalation, recorded status, and direct-child settlement.
@@ -333,6 +357,35 @@ assert not list((repo / ".uzi/scratch").iterdir())
 passed += 1
 print("PASS shell interrupt cleanup", flush=True)
 
+# Publishing failure must stop before a clean verdict or second scanner call.
+cat = repo / "bin/cat"
+cat.write_text("#!/bin/sh\nexit 1\n")
+cat.chmod(0o755)
+output, _ = run("clean", 2, 1)
+assert output.strip() == b"semgrep-gate: reason=renderer_failure"
+print("PASS final cat failure status=2 calls=1 cleanup=0", flush=True)
+fixture_wrapper = repo / "scripts/semgrep-gate.sh"
+wrapper_source = fixture_wrapper.read_text()
+guard = '''      if ! cat "$stage_dir/report"; then
+        echo 'semgrep-gate: reason=renderer_failure' >&2
+        return 2
+      fi'''
+assert guard in wrapper_source
+fixture_wrapper.write_text(wrapper_source.replace(guard, '      cat "$stage_dir/report"'))
+try:
+    run("clean", 2, 1)
+except AssertionError as error:
+    assert "expected=2 actual=0" in str(error), error
+    settled()
+    assert len(records()) == 2
+    assert not list((repo / ".uzi/scratch").iterdir())
+    print("PASS sensitivity cat guard mutation RED actual=0 expected=2", flush=True)
+else:
+    raise AssertionError("cat guard mutation escaped regression")
+finally:
+    fixture_wrapper.write_text(wrapper_source)
+    cat.unlink()
+
 # Report seam: bounded input before parse, missing raw evidence, and invalid JSON.
 directory = scratch / "report"
 directory.mkdir(mode=0o700)
@@ -411,6 +464,165 @@ assert 0 < printed <= 20
 assert f"omitted={100 - printed}".encode() in result.stdout
 passed += 1
 print(f"PASS report byte budget bytes={len(result.stdout)} entries={printed}", flush=True)
+# Provider-shaped common credentials are omitted on every rule/path surface.
+# Prefix/body fragments remain separate in source, including npm's 36-char body.
+providers = ["np" + "m_", "xapp-", "xoxe-",
+             *["gl" + family + "-" for family in
+               ("oas", "rt", "cbt", "ptt", "soat", "imt", "agent", "dt")],
+             *["uz" + family + "_" for family in "capfrsw"]]
+for prefix in providers:
+    token = prefix + "a1" * 18
+    token_path = token + ".py"
+    (repo / token_path).write_text("fixture")
+    subprocess.run(["git", "-C", str(repo), "add", "--", token_path],
+                   env=git_env, check=True)
+    (directory / "stdout").write_text(json.dumps({
+        "results": [
+            {"check_id": token, "path": "tracked.py", "start": {"line": 1}},
+            {"check_id": "fixture.rule", "path": token_path, "start": {"line": 1}}],
+        "errors": [
+            {"type": "ParseError", "rule_id": token, "path": token_path},
+            {"type": "ParseError", "location": {"path": token_path}},
+            {"type": "ParseError", "spans": [{"file": token_path}]}]}))
+    result = subprocess.run(["python3", "-B", str(helper), "report", str(directory),
+                             "tree", "scripts/semgrep-canary.txt", "rules"],
+                            cwd=repo, env=env, capture_output=True, timeout=4)
+    assert result.returncode == 2 and token.encode() not in result.stdout, prefix
+    assert b"renderer_failure" not in result.stdout
+    if prefix == providers[0]:
+        # Retiring just npm suppression must fail this exact rule/path fixture.
+        mutant = helper_source.replace("|npm_|", "|")
+        assert mutant != helper_source
+        helper.write_text(mutant)
+        try:
+            leaked = subprocess.run(
+                ["python3", "-B", str(helper), "report", str(directory), "tree",
+                 "scripts/semgrep-canary.txt", "rules"],
+                cwd=repo, env=env, capture_output=True, timeout=4)
+            assert leaked.returncode == 2
+            assert b"rule=" + token.encode() in leaked.stdout
+            assert b"target=" + token_path.encode() in leaked.stdout
+            print("PASS sensitivity npm suppression mutation RED rule/path leaked",
+                  flush=True)
+        finally:
+            helper.write_text(helper_source)
+    passed += 1
+print(f"PASS provider suppression rule/path/error surfaces families={len(providers)}",
+      flush=True)
+
+# Status-only targeted Git checks: no full index capture, even if a whole-list
+# query would emit more than the scanner JSON bound. All subprocess argv is fixed.
+real_git = shutil.which("git", path=os.environ["PATH"])
+git_calls = scratch / "git-calls"
+fake_git = repo / "bin/git"
+fake_git.write_text(r'''#!/usr/bin/env python3
+import json
+import os
+import stat
+import subprocess
+import sys
+import time
+args = sys.argv[1:]
+with open(os.environ["GIT_CALLS"], "a") as output:
+    output.write(json.dumps(args) + "\n")
+if args == ["ls-files", "-z"]:
+    os.write(1, b"tracked.py\0" * 3500000)
+    sys.exit(0)
+assert args[:5] == ["--literal-pathspecs", "ls-files", "--error-unmatch", "--",
+                   args[-1]] and len(args) == 5
+assert stat.S_ISCHR(os.fstat(1).st_mode) and stat.S_ISCHR(os.fstat(2).st_mode)
+mode = os.environ.get("LOOKUP_MODE")
+if mode == "failure":
+    sys.exit(128)
+if mode == "timeout":
+    time.sleep(2)
+sys.exit(subprocess.run([os.environ["REAL_GIT"], *args]).returncode)
+''')
+fake_git.chmod(0o755)
+lookup_env = env | {"GIT_CALLS": str(git_calls), "REAL_GIT": real_git}
+
+
+def lookup_report(data, raw=0, stage="tree", mode=None):
+    git_calls.write_text("")
+    (directory / "status").write_text(json.dumps({"raw_status": raw, "reason": "ok"}))
+    (directory / "stdout").write_text(json.dumps(data))
+    result = subprocess.run(["python3", "-B", str(helper), "report", str(directory),
+                             stage, "scripts/semgrep-canary.txt", "rules"],
+                            cwd=repo, env=lookup_env | ({"LOOKUP_MODE": mode} if mode else {}),
+                            capture_output=True, timeout=6)
+    queries = [json.loads(line) for line in git_calls.read_text().splitlines()]
+    return result, queries
+
+
+clean = {"results": [], "errors": []}
+result, queries = lookup_report(clean)
+assert result.returncode == 0 and len(queries) == 1, (result.stdout, queries)
+assert queries[0][-1] == "scripts/semgrep-canary.txt"
+print("PASS oversized-index clean status=0 targeted queries=1 DEVNULL", flush=True)
+
+# Reintroduce the retired enumeration without depending on Git history (shallow
+# CI clones must run this fixture too). The actual old reporter was also probed
+# during rework; this mutation keeps its unbounded buffering failure reproducible.
+enumeration = '''    root = Path.cwd().resolve()
+    tracked_list = set(subprocess.check_output(
+        ["git", "ls-files", "-z"], stderr=subprocess.DEVNULL
+    ).decode("utf-8").split("\\0"))
+'''
+mutant = helper_source.replace("    root = Path.cwd().resolve()\n", enumeration)
+assert mutant != helper_source
+helper.write_text(mutant)
+try:
+    result, queries = lookup_report(clean)
+    assert result.returncode == 0 and queries[0] == ["ls-files", "-z"], (
+        result.stdout, queries)
+    print("PASS sensitivity enumeration mutation RED full-list buffered >32MiB clean=0",
+          flush=True)
+finally:
+    helper.write_text(helper_source)
+
+for mode in ("failure", "timeout"):
+    result, queries = lookup_report(clean, mode=mode)
+    assert result.returncode == 2 and b"reason=tracked_lookup_failure" in result.stdout
+    assert b"verdict=0" not in result.stdout and len(queries) == 1
+    print(f"PASS lookup {mode} status=2 queries=1", flush=True)
+
+targets = [f"candidate-{index}.py" for index in range(40)]
+for target in targets:
+    (repo / target).write_text("fixture")
+subprocess.run([real_git, "-C", str(repo), "add", "--", *targets],
+               env=git_env, check=True)
+results = [{"check_id": "rules.semgrep-canary", "path": targets[index % 40],
+            "start": {"line": 1}} for index in range(10000)]
+result, queries = lookup_report({"results": results, "errors": []}, 1, "canary")
+assert result.returncode == 2 and len(queries) == 21, (result.stdout, queries)
+assert all(query[-1] in targets[:20] or query[-1] == "scripts/semgrep-canary.txt"
+           for query in queries)
+print("PASS liveness 10000 noncanary targets query cap=21", flush=True)
+errors = [{"type": "ParseError", "path": targets[20 + index],
+           "location": {"path": targets[index]}} for index in range(20)]
+result, queries = lookup_report({"results": results, "errors": errors}, 1)
+assert result.returncode == 2 and len(queries) == 21
+assert all(query[-1] not in targets[20:] for query in queries)
+print("PASS error/result display query cap=21 single selected location", flush=True)
+errors = [{"type": "ParseError", "rule_id": "r" * 160,
+           "location": {"path": long_target, "start": {"line": 10000000}}}] * 20
+result, queries = lookup_report({"results": results, "errors": errors}, 1)
+assert result.returncode == 2 and len(queries) == 2
+assert all(query[-1] in (long_target, "scripts/semgrep-canary.txt") for query in queries)
+assert result.stdout.count(b"  error=") < 20
+print("PASS byte omissions do not expand candidate query population", flush=True)
+
+(repo / "untracked.py").write_text("fixture")
+(repo / "directory").mkdir()
+unsafe = ["untracked.py", "candidate-*.py", ":(glob)candidate-*.py", "directory",
+          "../tracked.py"]
+result, queries = lookup_report({
+    "results": [{"check_id": "fixture.rule", "path": target, "start": {"line": 1}}
+                for target in unsafe], "errors": []}, 1)
+assert result.returncode == 1 and b"target=" not in result.stdout
+assert len(queries) == 2 and queries[-1][-1] == "untracked.py"
+print("PASS untracked omission literal/wildcard/directory path rejection", flush=True)
+fake_git.unlink()
 shutil.rmtree(directory)
 
 # Helper launch, syntax and renderer failures publish only fixed diagnostics.

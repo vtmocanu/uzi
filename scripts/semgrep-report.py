@@ -27,7 +27,8 @@ REASONS = frozenset((
 ))
 # Reject credential-shaped substrings even inside otherwise valid identifiers.
 TOKEN = re.compile(
-    r"(?:glpat-|gh[pousr]_|github_pat_|sk-|xox[baprs]-|AKIA|ASIA)"
+    r"(?:gl(?:pat|oas|rt|cbt|ptt|soat|imt|agent|dt)-|gh[pousr]_|"
+    r"github_pat_|sk-|xox[baprs]-|xoxe-|xapp-|uz[capfrsw]_|npm_|AKIA|ASIA)"
     r"[A-Za-z0-9_-]{8,}", re.I
 )
 IDENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,159}\Z")
@@ -150,7 +151,7 @@ def safe_identifier(value):
             and not TOKEN.search(value))
 
 
-def relative_target(value, root, tracked):
+def relative_target(value, root):
     if not isinstance(value, str) or len(value) > 1024:
         return None
     path = Path(value)
@@ -163,7 +164,7 @@ def relative_target(value, root, tracked):
         value = value[2:]
     if (not TARGET.fullmatch(value) or TOKEN.search(value)
             or any(part in ("", ".", "..") for part in value.split("/"))
-            or value not in tracked):
+            or not (root / value).is_file()):
         return None
     # Tracked symlinks must not make an outside target printable.
     try:
@@ -209,10 +210,32 @@ def report(directory, stage, canary, config):
         print(f"semgrep-gate: stage={stage} raw={raw_label} reason=invalid_json")
         return 2
     results, errors = data["results"], data["errors"]
-    tracked = set(subprocess.check_output(
-        ["git", "ls-files", "-z"], stderr=subprocess.DEVNULL
-    ).decode("utf-8").split("\0"))
-    target = relative_target(canary, root, tracked)
+    # At most the canary plus 20 display targets; failures block publication.
+    # Each independent lookup has one attempt and a one-second timeout.
+    tracked = {}
+
+    def tracked_target(value):
+        path = relative_target(value, root)
+        if path is None:
+            return None
+        if path not in tracked:
+            if len(tracked) >= 21:
+                raise ValueError("tracked_lookup_failure")
+            try:
+                result = subprocess.run(
+                    ["git", "--literal-pathspecs", "ls-files", "--error-unmatch",
+                     "--", path], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                raise ValueError("tracked_lookup_failure") from None
+            if result.returncode not in (0, 1):
+                raise ValueError("tracked_lookup_failure")
+            tracked[path] = result.returncode == 0
+        return path if tracked[path] else None
+
+    target = tracked_target(canary)
+    if target is None:
+        raise ValueError("tracked_lookup_failure")
     # Semgrep prefixes IDs with the config's directory namespace, not arbitrary
     # suffixes. Permit that engine-generated namespace and the unprefixed ID.
     config_path = Path(config).resolve().relative_to(root)
@@ -221,7 +244,7 @@ def report(directory, stage, canary, config):
     live = any(isinstance(item, dict)
                and item.get("check_id") in canary_ids
                and target is not None
-               and relative_target(item.get("path"), root, tracked) == target
+               and relative_target(item.get("path"), root) == target
                for item in results)
     verdict = 2
     if raw_valid and not errors:
@@ -259,28 +282,29 @@ def report(directory, stage, canary, config):
             # CoreError instead supplies Location.path/start. Never recover
             # a location from CliError.message, which can contain source.
             location = item.get("location")
-            path = relative_target(item.get("path"), root, tracked)
+            candidate = item.get("path")
             line = None
             if isinstance(location, dict):
-                path = relative_target(location.get("path"), root, tracked)
+                candidate = location.get("path")
                 start = location.get("start")
                 line = start.get("line") if isinstance(start, dict) else None
             else:
                 spans = item.get("spans")
                 if isinstance(spans, list) and spans and isinstance(spans[0], dict):
-                    path = relative_target(spans[0].get("file"), root, tracked)
+                    candidate = spans[0].get("file")
                     start = spans[0].get("start")
                     line = start.get("line") if isinstance(start, dict) else None
+            path = tracked_target(candidate)
             if path is not None:
                 label += f" target={path}"
                 if type(line) is int and 1 <= line <= 10000000:
                     label += f" line={line}"
         add_entry(label)
-    for item in results[:20 - entries]:
+    for item in results[:max(0, 20 - len(errors))]:
         label = "finding"
         if isinstance(item, dict):
             identifier = item.get("check_id")
-            path = relative_target(item.get("path"), root, tracked)
+            path = tracked_target(item.get("path"))
             start = item.get("start")
             line = start.get("line") if isinstance(start, dict) else None
             if (safe_identifier(identifier) and path is not None
@@ -309,8 +333,10 @@ def main():
             if stage not in ("canary", "tree"):
                 raise ValueError("stage")
             return report(directory, stage, canary, config)
-    except Exception:
-        print("semgrep-gate: reason=renderer_failure")
+    except Exception as error:
+        reason = ("tracked_lookup_failure" if isinstance(error, ValueError)
+                  and str(error) == "tracked_lookup_failure" else "renderer_failure")
+        print(f"semgrep-gate: reason={reason}")
         return 2
     return 2
 
