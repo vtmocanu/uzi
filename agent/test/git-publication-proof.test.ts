@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { GitCache, ScratchPublicationError } from "../src/git.js";
+import { GitCache, ScratchPublicationError, type FetchAgentBranchOptions } from "../src/git.js";
 import { makeFixture } from "./fixture-repo.js";
 import { noProofReseed, nullLogger } from "./helpers.js";
 
@@ -29,7 +29,17 @@ async function fixture() {
   const clone = await cache.createOrAttachRunnerClone(bare, 2404, noProofReseed);
   git(clone.path, "commit", "--allow-empty", "-m", "H");
   const H = git(clone.path, "rev-parse", "HEAD");
-  await cache.fetchAgentBranch(bare, clone.path, branch, "proof");
+  const opts: FetchAgentBranchOptions = { context: {
+    runId: "proof", generation: 1, branch, kind: "issue", barePath: bare,
+    defaultIdentity: { ref: "refs/remotes/origin/main", sha: git(bare, "rev-parse", "refs/remotes/origin/main") },
+  } };
+  const fetch = async (expectedSha: string) => {
+    const result = await cache.fetchAgentBranch(bare, clone.path, branch, "proof", opts);
+    assert.ok(result.kind === "updated", JSON.stringify(result));
+    assert.equal(result.candidateSha, expectedSha);
+    return result;
+  };
+  await fetch(H);
   const advance = () => {
     git(writer, "commit", "--allow-empty", "-m", "R");
     git(writer, "push", "origin", branch);
@@ -37,7 +47,7 @@ async function fixture() {
   };
   const publish = (originalHead = H, candidate = H, floor: import("../src/git.js").PublicationFloor | undefined = clone.publicationFloor) =>
     cache.pushBranch(bare, branch, "", remote, undefined, { floor: floor ?? { kind: "unverified" }, originalHead, candidate });
-  return { fx, remote, writer, cache, bare, clone, P, H, advance, publish };
+  return { fx, remote, writer, cache, bare, clone, P, H, advance, publish, fetch };
 }
 
 it("pins the clone floor independently of recovered base and shared tracking", async () => {
@@ -64,7 +74,7 @@ it("a bridge cannot make rewritten original H eligible for cancellation", async 
     git(f.clone.path, "commit", "--allow-empty", "-m", "rewritten H");
     const H = git(f.clone.path, "rev-parse", "HEAD");
     git(f.clone.path, "branch", "-f", branch, H);
-    await f.cache.fetchAgentBranch(f.bare, f.clone.path, branch, "proof");
+    await f.fetch(H);
     const bridge = await f.cache.bridgeToFloors(f.bare, H, [f.P]);
     assert.equal(bridge.kind, "built");
     if (bridge.kind !== "built") return;
@@ -91,7 +101,7 @@ it("publishes when the candidate already contains the remote tip", async () => {
     git(f.clone.path, "fetch", f.remote, branch);
     git(f.clone.path, "merge", "--no-edit", "FETCH_HEAD");
     const C = git(f.clone.path, "rev-parse", "HEAD");
-    await f.cache.fetchAgentBranch(f.bare, f.clone.path, branch, "proof");
+    await f.fetch(C);
     await f.publish(f.H, C);
     assert.equal(git(f.remote, "rev-parse", branch), C);
     assert.equal(git(f.remote, "merge-base", R, C), R);
@@ -193,7 +203,7 @@ it("movement during local remote preflight invalidates the proof", async () => {
   } finally { f.fx.cleanup(); }
 });
 
-it("candidate retry pins the same C on both wire attempts after shared tracking advances", async () => {
+it("GitCache explicit candidate pins C on both wire attempts after shared tracking advances", async () => {
   const f = await fixture();
   try {
     const seam = f.cache as unknown as { runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string> };
@@ -209,8 +219,9 @@ it("candidate retry pins the same C on both wire attempts after shared tracking 
     await assert.rejects(f.publish(), /transport unavailable/);
     git(f.clone.path, "commit", "--allow-empty", "-m", "later local tracking tip");
     const later = git(f.clone.path, "rev-parse", "HEAD");
-    await f.cache.fetchAgentBranch(f.bare, f.clone.path, branch, "proof");
+    await f.fetch(later);
     assert.equal(await f.cache.trackingTip(f.bare, branch), later);
+    // GitCache accepts the explicit candidate; RunRunner separately rechecks ownership on retry.
     await f.publish();
     assert.deepEqual(pushes, [`${f.H}:refs/heads/${branch}`, `${f.H}:refs/heads/${branch}`]);
     assert.equal(git(f.remote, "rev-parse", branch), f.H);
@@ -224,7 +235,7 @@ it("an unchanged P with a rewritten candidate is divergence rather than superses
     git(f.clone.path, "commit", "--allow-empty", "-m", "candidate without P");
     const C = git(f.clone.path, "rev-parse", "HEAD");
     git(f.clone.path, "branch", "-f", branch, C);
-    await f.cache.fetchAgentBranch(f.bare, f.clone.path, branch, "proof");
+    await f.fetch(C);
     await assert.rejects(f.publish(C, C), (e: unknown) =>
       e instanceof ScratchPublicationError && e.kind === "remote_candidate_diverged");
     assert.equal(git(f.remote, "rev-parse", branch), f.P);
@@ -238,7 +249,7 @@ it("original H descending from P cannot certify a candidate C that lost P", asyn
     git(f.clone.path, "commit", "--allow-empty", "-m", "candidate without P");
     const C = git(f.clone.path, "rev-parse", "HEAD");
     git(f.clone.path, "branch", "-f", branch, C);
-    await f.cache.fetchAgentBranch(f.bare, f.clone.path, branch, "proof");
+    await f.fetch(C);
     const R = f.advance();
     await assert.rejects(f.publish(f.H, C), (e: unknown) =>
       e instanceof ScratchPublicationError && e.kind === "remote_candidate_diverged");

@@ -400,7 +400,7 @@ it("finalize pushes H and completes when a foreign promotion happens after the o
   let bare = "";
   git.pushBranch = async (...args) => {
     bare = args[0];
-    assert.equal(args[5], h);
+    assert.equal(args[5]?.candidate, h);
     f = await promoteForeign(bare, args[1], h);
     await realPush(...args);
   };

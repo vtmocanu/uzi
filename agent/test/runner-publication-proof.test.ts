@@ -6,7 +6,8 @@ import { execFileSync } from "node:child_process";
 import { Readable } from "node:stream";
 import { createHash } from "node:crypto";
 import { StubExecutor } from "../src/executor.js";
-import { api, fx, git, fakeGitlab, gitlabClaim, installHarness, runner } from "./runner-harness.js";
+import { api, fx, git, fakeGitlab, gitlabClaim, installHarness, runner, runnerWith, homeDir } from "./runner-harness.js";
+import type { FetchAgentBranchOptions, PublicationCandidate } from "../src/git.js";
 import { RecoveryCoordinator } from "../src/recovery.js";
 import { FakeRecoveryClient } from "./codex-reap-fixture.js";
 import { nullLogger } from "./helpers.js";
@@ -28,18 +29,25 @@ it("a rewritten run head cannot be replaced by a concurrent shared tracking writ
   const fetch = git.fetchAgentBranch.bind(git);
   let importedH = "";
   git.fetchAgentBranch = async (...args) => {
-    // Rewrite below P just before import, then replace shared tracking after import.
+    // Rewrite below P just before the ownership-aware import.
     cmd(args[1], "reset", "--hard", "main");
     cmd(args[1], "commit", "--allow-empty", "-m", "rewritten H");
     importedH = cmd(args[1], "rev-parse", "HEAD");
     const tracking = await fetch(...args);
-    cmd(args[0], "update-ref", tracking, P);
+    assert.ok(tracking.kind === "updated", JSON.stringify(tracking));
+    assert.equal(tracking.candidateSha, importedH);
+    assert.equal(tracking.trackingRef, `refs/uzi-runner/${branch}`);
     return tracking;
   };
   const push = git.pushBranch.bind(git);
   let provenH = "";
   git.pushBranch = async (...args) => {
     provenH = args[5]?.originalHead ?? "";
+    const promotion = await git.updateTrackingRef(args[0], branch, P, { context: {
+      runId: "foreign-run", generation: 8, branch, kind: "ci_fix", barePath: args[0],
+      defaultIdentity: { ref: "refs/remotes/origin/main", sha: cmd(args[0], "rev-parse", "refs/remotes/origin/main") },
+    } });
+    assert.ok(promotion.kind === "updated", JSON.stringify(promotion));
     cmd(writer, "commit", "--allow-empty", "-m", "R");
     cmd(writer, "push", "origin", branch);
     return push(...args);
@@ -51,6 +59,172 @@ it("a rewritten run head cannot be replaced by a concurrent shared tracking writ
   assert.equal(provenH, importedH, "proof uses the reaped clone's H, not mutable tracking");
   assert.match(terminal.failure_reason ?? "", /remote_candidate_diverged/);
 });
+
+// Each case makes one real transport rejection; the production forge retry waits 1000ms.
+// Promotion is awaited only after pushBranch has rejected and released its bare lock.
+for (const move of ["unchanged", "foreign", "same-generation"] as const) {
+  it(`runner retry ${move} preserves the frozen candidate and checks ownership again`, async () => {
+    const branch = "agent/issue-2404";
+    const remote = path.join(fx.dataDir, "retry-remote.git");
+    cmd(fx.dataDir, "clone", "--bare", fx.originPath, remote);
+    const writer = path.join(fx.dataDir, "retry-writer");
+    cmd(fx.dataDir, "clone", remote, writer);
+    cmd(writer, "checkout", "-b", branch);
+    cmd(writer, "commit", "--allow-empty", "-m", "P");
+    cmd(writer, "push", "origin", branch);
+    const P = cmd(writer, "rev-parse", "HEAD");
+    const claim = gitlabClaim(2404, { kind: "issue", branch, claim_generation: 7,
+      config: { completion_contract_version: 1, contract_revision: 1 },
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: remote } });
+    api.setCompletionPermitResponse(true);
+    const forge = fakeGitlab();
+    const recoveryClient = new FakeRecoveryClient();
+    const recoveryOptions = { client: recoveryClient, git, log: nullLogger(),
+      recoveryRoot: git.recoveryRoot, workerToken: "publication-retry-worker-fixture" };
+    const recovery = new RecoveryCoordinator(recoveryOptions);
+    const marker = path.join(homeDir, "session-marker");
+    fs.writeFileSync(marker, "retained session");
+    let clone = "";
+    let context: FetchAgentBranchOptions["context"] | undefined;
+    const fetch = git.fetchAgentBranch.bind(git);
+    git.fetchAgentBranch = async (...args) => {
+      const result = await fetch(...args);
+      assert.ok(result.kind === "updated", JSON.stringify(result));
+      assert.equal(result.candidateSha, cmd(args[1], "rev-parse", branch));
+      assert.ok(args[4]);
+      context = args[4].context;
+      return result;
+    };
+
+    const order: string[] = [];
+    const retryChecks: Array<{ expected: string | undefined; kind: string }> = [];
+    const ownership = git.committedTrackingOwnership.bind(git);
+    let failedWire = false;
+    let retryObserved = false;
+    git.committedTrackingOwnership = async (...args) => {
+      const result = await ownership(...args);
+      if (args[3] !== undefined) {
+        if (!failedWire) order.push("ownership");
+        else if (!retryObserved) {
+          order.push("retry ownership");
+          retryObserved = true;
+          retryChecks.push({ expected: args[3], kind: result.kind });
+        }
+      }
+      return result;
+    };
+    const seam = git as unknown as {
+      runGit(cwd: string, args: string[], ...rest: unknown[]): Promise<string>;
+    };
+    const wire = seam.runGit.bind(git);
+    const refspecs: string[] = [];
+    let failedAt = 0;
+    seam.runGit = async (cwd, args, ...rest) => {
+      if (args[0] === "push") {
+        refspecs.push(args[2]!);
+        if (refspecs.length === 1) {
+          order.push("failed wire");
+          failedWire = true;
+          failedAt = Date.now();
+          throw new Error("connection reset before send");
+        }
+        order.push("successful wire");
+      }
+      return wire(cwd, args, ...rest);
+    };
+    const push = git.pushBranch.bind(git);
+    const publications: PublicationCandidate[] = [];
+    let D = "";
+    let promotedOwned = false;
+    let expectedRefused = false;
+    git.pushBranch = async (...args) => {
+      assert.ok(args[5]);
+      publications.push(args[5]);
+      try {
+        await push(...args);
+        forge.pr.head = args[5].candidate;
+      } catch (error) {
+        assert.equal(publications.length, 1, "only the first transport is injected");
+        if (move !== "unchanged") {
+          assert.ok(context, "fetch supplied this flight's trusted context");
+          const C = args[5].candidate;
+          const tree = cmd(args[0], "rev-parse", C + "^{tree}");
+          D = cmd(args[0], "commit-tree", tree, "-p", C, "-m", "descendant D");
+          assert.notEqual(D, C);
+          const promoted = await git.updateTrackingRef(args[0], branch, D, { context: move === "foreign"
+            ? { ...context, runId: "foreign-run", generation: 8 } : context });
+          assert.ok(promoted.kind === "updated", JSON.stringify(promoted));
+          assert.equal(promoted.candidateSha, D);
+          order.push("outside-lock promotion");
+          // Observe real ownership independently, without adding to retryChecks.
+          const own = await ownership(args[0], branch, claim.run_id, undefined, 7);
+          promotedOwned = own.kind === "owned" && own.sha === D &&
+            own.context.runId === claim.run_id && own.context.generation === 7;
+          expectedRefused = (await ownership(args[0], branch, claim.run_id, C, 7)).kind === "not_owned";
+        }
+        throw error;
+      }
+    };
+    await runnerWith(() => ({ executor: {
+      run: async ctx => {
+        clone = ctx.worktreePath;
+        return new StubExecutor(nullLogger()).run(ctx);
+      },
+    }, homeDir }), forge.gitlab, undefined, nullLogger(), { recovery }).execute(claim);
+
+    if (move === "same-generation") {
+      assert.equal(publications.length, 1,
+        "same-run/same-generation candidate move must refuse before a SECOND pushBranch invocation");
+    }
+    const publication = publications[0];
+    assert.ok(publication, "the flight reached its first pushBranch boundary");
+    const C = publication.candidate;
+    assert.equal(publication.originalHead, C);
+    assert.deepEqual(publication.floor, { kind: "pinned", oid: P });
+    assert.ok(Object.isFrozen(publication));
+    assert.equal(expectedRefused, move !== "unchanged");
+    assert.equal(promotedOwned, move === "same-generation",
+      "same-run/same-generation D remains OWNED without an expected SHA");
+    assert.ok(retryChecks.some(check => check.expected === C && check.kind ===
+      (move === "unchanged" ? "owned" : "not_owned")), "actual retry ownership check binds frozen C");
+    assert.ok(Date.now() - failedAt >= 1000, "production forge retry uses its real first 1000ms delay");
+    const failedIndex = order.indexOf("failed wire");
+    assert.ok(order.slice(0, failedIndex).includes("ownership"), "ownership precedes first wire");
+    assert.deepEqual(order.slice(failedIndex), move === "unchanged"
+      ? ["failed wire", "retry ownership", "successful wire"]
+      : ["failed wire", "outside-lock promotion", "retry ownership"]);
+    if (move === "unchanged") {
+      assert.equal(publications.length, 2, "two pushBranch callbacks reached the real transport");
+      assert.strictEqual(publications[1], publication, "retry retains the same frozen C/H/P object");
+      assert.deepEqual(refspecs, [`${C}:refs/heads/${branch}`, `${C}:refs/heads/${branch}`]);
+      assert.equal(cmd(remote, "rev-parse", branch), C);
+      assert.equal(api.completionPermitRequests.length, 1);
+      assert.equal(api.completionPermitRequests[0]!.body.head, C);
+      const completed = api.states.find(s => s.runId === claim.run_id && s.body.status === "completed")?.body;
+      assert.ok(completed);
+      assert.equal(completed.head, C);
+    } else {
+      assert.equal(publications.length, 1, "retry refuses before the second pushBranch callback");
+      assert.deepEqual(refspecs, [`${C}:refs/heads/${branch}`], "exactly one failed wire attempt");
+      const terminal = api.states.find(s => s.runId === claim.run_id && s.body.status === "failed")?.body;
+      assert.ok(terminal);
+      assert.match(terminal.failure_reason ?? "", /tracking preservation refused/);
+      assert.equal(terminal.branch_moved, undefined);
+      assert.equal(cmd(remote, "rev-parse", branch), P);
+      assert.equal(api.states.some(s => s.body.status === "completed"), false);
+      assert.equal(api.completionPermitRequests.length, 0, "neither C nor D gets a completion permit");
+      assert.equal(fs.existsSync(clone), true, "preservation refusal retains the clone");
+      assert.equal(fs.readFileSync(marker, "utf8"), "retained session", "per-run HOME session survives");
+      const bare = git.barePathFor(remote);
+      const owed = (await git.enumerateOwedCandidates(bare, claim.run_id)).find(c => c.sha === publication.originalHead);
+      const records = await new RecoveryCoordinator(recoveryOptions).inspect(claim.run_id);
+      assert.ok(owed?.contexts.some(c => c.runId === claim.run_id && c.generation === 7) ||
+        records.some(r => r.generation === 7 && r.sourceSha === publication.originalHead),
+      "positive generation-specific custody preserves original H");
+      assert.deepEqual(recoveryClient.releaseCalls, [], "retained H custody is never released as publication");
+    }
+  });
+}
 
 function cmd(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-C", cwd, "-c", "maintenance.auto=false", "-c", "gc.auto=0",

@@ -133,17 +133,19 @@ describe("issue1924 M2 owed candidates", () => {
     updated(await cache.fetchAgentBranch(bare, clone, BRANCH, "foreign-run", {
       context: { ...positiveContext(), runId: "foreign-run", generation: 2 },
     }));
-    await cache.pushBranch(bare, BRANCH, "fixture-pat", fx.originPath, undefined, proof.sha);
+    await cache.pushBranch(bare, BRANCH, "fixture-pat", fx.originPath, undefined,
+      { floor: { kind: "absent" }, originalHead: h, candidate: proof.sha });
     assert.equal(gitIn(fx.originPath, ["rev-parse", BRANCH]), h);
     assert.equal(tip(), f);
     assert.deepEqual(await pins(), [h]);
   });
 
   it("rejects a nonliteral or nonexistent exact publication source", async () => {
-    root("source validation", [base]); updated(await fetch());
+    const h = root("source validation", [base]); updated(await fetch());
     for (const invalid of [`refs/uzi-runner/${BRANCH}`, "f".repeat(40)]) {
       await assert.rejects(cache.checkpointPack(bare, BRANCH, undefined, undefined, undefined, invalid));
-      await assert.rejects(cache.pushBranch(bare, BRANCH, "fixture-pat", fx.originPath, undefined, invalid));
+      await assert.rejects(cache.pushBranch(bare, BRANCH, "fixture-pat", fx.originPath, undefined,
+        { floor: { kind: "absent" }, originalHead: h, candidate: invalid }));
     }
   });
 
