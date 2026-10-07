@@ -1307,7 +1307,7 @@ export interface FetchAgentBranchOptions {
 export type TrackingUpdateResult =
   | { kind: "updated"; trackingRef: string; candidateSha: string; retainedShas: string[];
       displacedSha?: string; divergence: "none" | "ancestor" | "divergent" | "unknown" | "foreign" }
-  | { kind: "not_updated"; reason: "ownership_unknown" | "preservation_failed" |
+  | { kind: "not_updated"; reason: "ownership_unknown" | "preservation_failed" | "owed_limit" |
       "receipt_pending_failed" | "tracking_update_failed" | "owner_stamp_failed" | "receipt_commit_failed" };
 export interface OwedCandidate {
   sha: string;
@@ -1328,6 +1328,32 @@ type TrackingReceipt = {
 type CheckedTrackingOwner = { runId: string; generation?: number | null; context?: string } | undefined;
 const OWED_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const OWED_OID = /^[0-9a-f]{40}$/;
+
+/**
+ * Hard cap on the heads one run may keep pinned as owed candidates (`refs/uzi-owed/<runId>/<sha>`) in
+ * a worker bare. An untrusted agent that rewrites its branch repeatedly displaces one head per
+ * checkpoint; without a bound the pins (which block `git gc` on the worker PVC), the candidate
+ * metadata, and the feed announcements grow with the rewrite count. 64 is far above what a
+ * well-behaved run holds between two confirmed checkpoints (a confirmed checkpoint releases every
+ * pin it covers) and small enough that the full retained set stays recoverable and announceable in
+ * a handful of feed rows. At the cap `pinOwedUnderLock` refuses a NEW pin; a head that is already
+ * pinned never consumes capacity.
+ */
+export const MAX_OWED_CANDIDATES_PER_RUN = 64;
+
+/** The refusal reason for a failed pin: the cap is distinguished so the runner can stop the run. */
+function preservationReason(cause: unknown): "owed_limit" | "preservation_failed" {
+  return cause instanceof OwedCandidateLimitError ? "owed_limit" : "preservation_failed";
+}
+
+/** Thrown under the bare lock by `pinOwedUnderLock` at {@link MAX_OWED_CANDIDATES_PER_RUN}; every
+ *  pin-producing caller maps it to the `owed_limit` refusal rather than a generic failure. */
+class OwedCandidateLimitError extends Error {
+  constructor() {
+    super("owed candidate limit reached");
+    this.name = "OwedCandidateLimitError";
+  }
+}
 
 export class GitCache {
   private readonly reposRoot: string;
@@ -3515,7 +3541,7 @@ export class GitCache {
         } catch (cause) {
           const abort = this.boundaryAbortError(cause);
           if (abort) throw abort;
-          result = { kind: "not_updated", reason: "preservation_failed" };
+          result = { kind: "not_updated", reason: preservationReason(cause) };
         }
       }
       // A refusal can leave stage as the sole anchor if metadata/pinning failed.
@@ -3525,6 +3551,10 @@ export class GitCache {
           await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
         } else if (result.kind === "updated" &&
             await this.checkedTrackingSha(barePath, branch) === incoming) {
+          await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+        } else if (result.kind === "not_updated" && result.reason === "owed_limit") {
+          // At the cap the incoming head is deliberately unpreserved (the run is stopped and its
+          // clone kept), so its stage must not accumulate one ref per refused attempt.
           await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
         }
       } catch (cause) {
@@ -7774,6 +7804,13 @@ export class GitCache {
     } finally { await fs.rm(temp, { force: true }); }
   }
 
+  private async removeOwedFile(barePath: string, name: string): Promise<void> {
+    const dir = this.owedDirectory(barePath);
+    await fs.unlink(path.join(dir, name));
+    const handle = await fs.open(dir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+    try { await handle.sync(); } finally { await handle.close(); }
+  }
+
   private contextName(c: StoredOwedContext): string {
     const identity = [c.runId, c.branch, c.barePath, c.generation, c.kind,
       c.defaultIdentity?.ref ?? null, c.defaultIdentity?.sha ?? null,
@@ -7813,8 +7850,16 @@ export class GitCache {
     return c;
   }
 
+  /** Caller MUST hold the bare lock: the count-then-pin below is only atomic under it. Every
+   *  pin-producing path (fetchAgentBranch, promoteTrackingUnderLock, clearConflictingAncestorTrackingRefs,
+   *  retainCurrentOwedCandidate) funnels through here. The check precedes every write, so a refusal
+   *  leaves the existing pins, metadata and refs untouched. */
   private async pinOwedUnderLock(c: StoredOwedContext, sha: string): Promise<void> {
     await this.requireOwedCommit(c.barePath, sha);
+    const ref = `refs/uzi-owed/${c.runId}/${sha}`;
+    const held = (await this.runGit(c.barePath, ["for-each-ref", "--format=%(refname)", `refs/uzi-owed/${c.runId}/`]))
+      .split("\n").filter(Boolean);
+    if (!held.includes(ref) && held.length >= MAX_OWED_CANDIDATES_PER_RUN) throw new OwedCandidateLimitError();
     await this.persistOwedContext(c); // Durable discovery precedes the first pin.
     const context = this.contextName(c);
     const name = `candidate-${c.runId}-${sha}-${context.slice(8, -5)}.json`;
@@ -7822,7 +7867,6 @@ export class GitCache {
     const old = await this.readOwedFile(c.barePath, name);
     if (old !== undefined && JSON.stringify(old) !== JSON.stringify(record)) throw new Error("invalid owed candidate record");
     if (old === undefined) await this.writeOwedFile(c.barePath, name, record);
-    const ref = `refs/uzi-owed/${c.runId}/${sha}`;
     await this.runGit(c.barePath, ["update-ref", ref, sha]);
     if (await this.checkedRefSha(c.barePath, ref) !== sha) throw new Error("owed pin readback mismatch");
   }
@@ -7998,7 +8042,7 @@ export class GitCache {
     } catch (cause) {
       const abort = this.boundaryAbortError(cause);
       if (abort) throw abort;
-      return { kind: "not_updated", reason: "preservation_failed" };
+      return { kind: "not_updated", reason: preservationReason(cause) };
     }
     try {
       const key = `uzi-trackowner.${branch}.receiptversion`;
@@ -8017,7 +8061,7 @@ export class GitCache {
     } catch (cause) {
       const abort = this.boundaryAbortError(cause);
       if (abort) throw abort;
-      return { kind: "not_updated", reason: "preservation_failed" };
+      return { kind: "not_updated", reason: preservationReason(cause) };
     }
     const receipt: TrackingReceipt = { version: 1, branch, runId: c.runId, generation: c.generation, context: this.contextName(c),
       trackingSha: incoming, phase: "pending" };
@@ -8182,7 +8226,7 @@ export class GitCache {
       } catch (cause) {
         const abort = this.boundaryAbortError(cause);
         if (abort) throw abort;
-        return { kind: "not_updated", reason: "preservation_failed" };
+        return { kind: "not_updated", reason: preservationReason(cause) };
       }
     });
   }
@@ -8200,6 +8244,13 @@ export class GitCache {
         if (await this.remotelyCovers(barePath, candidate.sha, remotelyConfirmedSha)) {
           await this.runGit(barePath, ["update-ref", "-d", candidate.pinRef, candidate.sha]);
           if (await this.checkedRefSha(barePath, candidate.pinRef) !== undefined) throw new Error("owed pin deletion mismatch");
+          // Ref first, metadata second: a crash between them leaves harmless metadata, never a
+          // pin without discovery metadata. Without this, candidate-*.json would outlive every
+          // released pin and enumerateOwedUnderLock would read them all forever.
+          for (const ctx of candidate.contexts) {
+            const name = `candidate-${runId}-${candidate.sha}-${this.contextName(ctx).slice(8, -5)}.json`;
+            if (await this.readOwedFile(barePath, name) !== undefined) await this.removeOwedFile(barePath, name);
+          }
           removedShas.push(candidate.sha);
         } else retainedShas.push(candidate.sha);
       }

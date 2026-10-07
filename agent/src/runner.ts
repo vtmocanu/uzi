@@ -148,6 +148,7 @@ import {
   type AttemptSeedOptions,
   type CanonicalReseedOptions,
   ScratchPublicationError,
+  MAX_OWED_CANDIDATES_PER_RUN,
 } from "./git.js";
 import {
   buildCheckEnv,
@@ -653,6 +654,9 @@ type CheckpointBodyOutcome =
  *  proceeds anyway (and logs the residual). */
 const SURVIVOR_SINK_WAIT_MS = 2_000;
 
+/** Most runs whose announced-heads ledger a worker remembers (oldest evicted). */
+const OWED_ANNOUNCED_RUNS = 256;
+
 type MidTurnTickOutcome =
   | CheckpointBodyOutcome
   | "git_busy"
@@ -774,9 +778,13 @@ type FetchBackOutcome =
   | { kind: "refused" }
   | { kind: "failed" };
 
+/** Feed announcements already made for one run: retained heads and archive-covered heads are
+ *  tracked apart, so a notice of one kind never suppresses the other. */
+interface OwedAnnounced { heads: Set<string>; archived: Set<string> }
+
 class PreservationRefusedError extends Error {
-  constructor() {
-    super("tracking preservation refused");
+  constructor(message = "tracking preservation refused") {
+    super(message);
     this.name = "PreservationRefusedError";
   }
 }
@@ -1591,6 +1599,11 @@ interface RunFlight {
   owedContext: Promise<OwedCandidateContext> | undefined;
   prepareTerminalInventory: () => Promise<void>;
   owedFeedClosed: boolean;
+  /** Set once the per-run owed-candidate cap refused a pin: the run is stopped through the
+   *  ordinary preservation-failure path ({@link RunRunner.stopForOwedLimit}). */
+  owedLimitStop: PreservationRefusedError | undefined;
+  /** Heads and archive notices this run already announced; shared across claims on this worker. */
+  owedAnnounced: OwedAnnounced;
   inventoryArchiveNotices: Set<string>;
   /** Credential deferral/switch leaves this generation's guarded inventory open for resume. */
   keepGuardedInventoryOpen: boolean;
@@ -2176,6 +2189,9 @@ export class RunRunner {
    *  runner clone exists (there is nothing to fetch back before that) and deregistered
    *  in the terminal finally. */
   private readonly activeRuns = new Map<string, ActiveRun>();
+  /** Per-run announcement ledger, kept across a park/resume on this worker so a resume emits only
+   *  heads it has not announced. Bounded: oldest run evicted past {@link OWED_ANNOUNCED_RUNS}. */
+  private readonly owedAnnouncedByRun = new Map<string, OwedAnnounced>();
   /** Whole-execution ownership, including factory setup, batcher close and every
    * finally cleanup. A promoted claim can arrive before an old park ACK returns. */
   private readonly inventoryReservations = new Set<string>();
@@ -2776,7 +2792,12 @@ export class RunRunner {
       });
     }
     const executionRejection: ExecutionRejection = { rejected: false };
-    const dispatchFailure = async (err: unknown, allowDiskDeferral = false): Promise<void> => {
+    const dispatchFailure = async (failure: unknown, allowDiskDeferral = false): Promise<void> => {
+      // The owed-candidate cap stopped this run by aborting its attempt: report the cap, not the
+      // executor's abort error. A cancel, a shutdown or a stale claim keeps its own arm.
+      const err = flight.owedLimitStop !== undefined && !flight.steering?.isCancelled() &&
+        !flight.active?.shuttingDown && flight.steering?.claimFence() === undefined
+        ? flight.owedLimitStop : failure;
       // PRD #35: a usage-limit death is not an ordinary failure. Handled before the
       // generic path below because that path is terminal in both senses — it reports
       // `failed` and it lets the finally erase the session this run wants to resume from.
@@ -7570,6 +7591,8 @@ export class RunRunner {
       owedDefaultBranch: claim.repo.default_branch?.trim() || undefined,
       owedContext: undefined,
       owedFeedClosed: false,
+      owedLimitStop: undefined,
+      owedAnnounced: this.owedAnnouncedFor(runId),
       inventoryArchiveNotices: new Set(),
       keepGuardedInventoryOpen: false,
       prepareTerminalInventory: async () => {
@@ -8728,6 +8751,13 @@ export class RunRunner {
     // reap:false semantics, its own cancellation signal, and a sub-scope for the 60s secret scan.
     // See the ctx.checkpoint comment for the reap-before-git and best-effort invariants.
     const checkpointBody = async (opts: CheckpointBodyOpts): Promise<CheckpointBodyOutcome> => {
+      try {
+        return await checkpointBodyOnce(opts);
+      } finally {
+        this.stopForOwedLimit(flight);
+      }
+    };
+    const checkpointBodyOnce = async (opts: CheckpointBodyOpts): Promise<CheckpointBodyOutcome> => {
       // `barePath` is the outer `let` (string | undefined); it is set before the run
       // reaches the executor, but narrow it so the closure is honest rather than `!`.
       if (!barePath) return "no_new_work";
@@ -10444,15 +10474,32 @@ export class RunRunner {
     return { context, remotelyConfirmedSha: flight.lastCheckpointRefTip };
   }
 
+  private owedAnnouncedFor(runId: string): OwedAnnounced {
+    let ledger = this.owedAnnouncedByRun.get(runId);
+    if (!ledger) {
+      ledger = { heads: new Set(), archived: new Set() };
+      this.owedAnnouncedByRun.set(runId, ledger);
+      if (this.owedAnnouncedByRun.size > OWED_ANNOUNCED_RUNS) {
+        const oldest = this.owedAnnouncedByRun.keys().next().value;
+        if (oldest !== undefined) this.owedAnnouncedByRun.delete(oldest);
+      }
+    }
+    return ledger;
+  }
+
+  /** Announce only heads this run has not announced yet (`archived` heads are a separate ledger). */
   private announceOwedHeads(flight: RunFlight, shas: string[], archived = false): void {
+    const seen = archived ? flight.owedAnnounced.archived : flight.owedAnnounced.heads;
+    const fresh = [...new Set(shas)].filter(s => /^[0-9a-f]{40}$/.test(s) && !seen.has(s));
+    if (!fresh.length) return;
     if (flight.owedFeedClosed) {
-      flight.runLog.info("recovery: retained heads after feed close", { heads: shas, archived });
+      flight.runLog.info("recovery: retained heads after feed close", { heads: fresh, archived });
       return;
     }
+    for (const s of fresh) seen.add(s);
     // Eight bounded SHA labels per row; the finite inventory determines the row count.
-    for (let i = 0; i < shas.length; i += 8) {
-      const labels = shas.slice(i, i + 8).filter(s => /^[0-9a-f]{40}$/.test(s)).map(s => s.slice(0, 12));
-      if (!labels.length) continue;
+    for (let i = 0; i < fresh.length; i += 8) {
+      const labels = fresh.slice(i, i + 8).map(s => s.slice(0, 12));
       flight.batcher.emit({ kind: "status", agent: "worker", payload: { text:
         archived ? `Earlier recovery archive covers retained heads ${labels.join(", ")}; final custody ACK pending. Use uzi run recovery or uzi run export.`
           : `Retained heads ${labels.join(", ")} are worker-local, not checkpoint durable; recovery needs action. Use uzi run recovery or uzi run export.`,
@@ -10463,6 +10510,11 @@ export class RunRunner {
   private async reconcileConfirmedOwed(flight: RunFlight, barePath: string, confirmedSha: string): Promise<void> {
     try {
       const result = await this.git.reconcileOwedCandidates(barePath, flight.runId, confirmedSha);
+      // Released heads are no longer owed: forget them so the ledger tracks only live pins.
+      for (const sha of result.removedShas) {
+        flight.owedAnnounced.heads.delete(sha);
+        flight.owedAnnounced.archived.delete(sha);
+      }
       this.announceOwedHeads(flight, result.retainedShas);
     } catch (err) {
       flight.runLog.warn("owed reconciliation failed; extra pins retained", { error: errMessage(err) });
@@ -10559,7 +10611,24 @@ export class RunRunner {
     flight.runLog.warn("tracking preservation refused", {
       run_id: flight.runId, reason: sanitizeForLog(reason, 80),
     });
-    return new PreservationRefusedError();
+    if (reason !== "owed_limit") return new PreservationRefusedError();
+    // The per-run owed-candidate cap is permanent for this run: a checkpoint that merely skips
+    // would let the agent keep rewriting unpreserved heads. Remember the stop; the live-executor
+    // checkpoint sites act on it (stopForOwedLimit) and dispatchFailure reports it.
+    flight.owedLimitStop ??= new PreservationRefusedError(
+      `tracking preservation refused: the retained owed-head limit (${MAX_OWED_CANDIDATES_PER_RUN}) was reached; ` +
+      "existing retained heads and the working clone are kept. Use uzi run recovery or uzi run export.");
+    return flight.owedLimitStop;
+  }
+
+  /** Called after every executor-driven checkpoint (mid-turn tick and ctx.checkpoint). A cap
+   *  refusal inside a best-effort checkpoint is swallowed by design ("skips only this
+   *  checkpoint"); this is the single place that turns it into a stop, the same way the
+   *  permanent-failure hook stops a run: abort the attempt so execute() unwinds into dispatchFailure. */
+  private stopForOwedLimit(flight: RunFlight): void {
+    if (flight.owedLimitStop === undefined) return;
+    if (!flight.cancel.signal.aborted) flight.cancel.abort();
+    flight.steering?.abortLifecycle();
   }
 
   private async checkedTrackingSnapshot(flight: RunFlight, barePath: string, branch: string, expectedSha?: string): Promise<string | null> {

@@ -201,6 +201,21 @@ Only containment in a broker-confirmed or claim-confirmed remote head can
 clear a candidate through publication reconciliation; a local tracking ref
 or checkpoint bridge is not that evidence.
 
+**Retention is capped at 64 heads per run.** A run that keeps rewriting its
+branch without a confirmed checkpoint cannot grow its pins (which block
+garbage collection on the worker disk) without bound. At 64 retained heads the
+worker keeps every existing pin and the run's working clone, refuses to
+retain or supersede another head, and stops the run through the normal
+preservation-failure path: the run reports failed with
+"tracking preservation refused: the retained owed-head limit (64) was
+reached", even when the checkpoint that hit the limit was a best-effort one.
+Retaining a head that is already pinned costs nothing, and a confirmed
+checkpoint releases every pin it covers, freeing capacity. Recover the
+retained heads with `uzi run recovery` or `uzi run export`. The feed lists a
+retained head once: a later checkpoint or a resume on the same worker
+announces only heads it has not announced, and archive notices are tracked
+separately from head notices.
+
 ### Guarded inventory and final custody transfer
 
 A claim is inventory-guarded when it has `inventory_guarded: true` and the
