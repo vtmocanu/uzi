@@ -37,10 +37,9 @@ func seedChatRun(t *testing.T, env codexTestEnv, o reevalOwner, status string) u
 // claim_generation — no ErrMissingClaimGeneration (the fail-closed guard is skipped for chat) and
 // no stale rejection. Each is seeded fresh because the transitions change status.
 //
-// MUTATION CHECK: removing ONLY the chat guard at the top of stateUsesGenerationFence reddens every
-// sub-test here — stateUsesGenerationFence then returns true for running/failed and (for a
-// non-interlocked run) completed, so SetState's fail-closed check refuses the unstamped report with
-// ErrMissingClaimGeneration.
+// These omission cases preserve nil-generation compatibility independently of the fence for
+// supplied positive generations. The mismatched-generation test below separately checks
+// generation-zero compatibility.
 func TestSetStateChatExemptFromGenerationFenceLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := fenceSvc(env)
