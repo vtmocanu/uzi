@@ -682,6 +682,12 @@ func TestSanitizePrDescriptionWorstCaseAllocationsBounded(t *testing.T) {
 		for _, s := range append(append([]string{out.Summary}, out.Changes...), out.ReviewPointers...) {
 			assertPrDescInert(t, s)
 		}
+		for _, n := range out.ScopeNotes {
+			assertPrDescInert(t, n.Text)
+		}
+		for _, v := range out.Verification {
+			assertPrDescInert(t, v.Command)
+		}
 	})
 }
 
