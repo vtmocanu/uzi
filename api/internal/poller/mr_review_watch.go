@@ -362,9 +362,9 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	//
 	// This gate reads the ledger taken before the comment listing and is only an early exit:
 	// the authoritative cap check runs under the creation lock (CreateAutoMRReworkRunAndAdvance
-	// refuses with ErrMRReworkCapReached). That recheck judges the cap before freshness, so when the
-	// competing cycle consumed the same comments the next tick exits at the "nothing new" gate;
-	// this halt path runs only once a newer eligible comment remains.
+	// refuses with ErrMRReworkCapReached). This gate sits after the "nothing new" gate above, so
+	// when the competing cycle consumed the same comments the next tick exits there; this halt
+	// path runs only once a newer eligible comment remains.
 	if int(led.AttemptCount) >= capLimit {
 		if !led.HaltNotified {
 			if err := d.notifyHalt(ctx, cand, issueIID, capLimit); err != nil {

@@ -24,9 +24,9 @@ var ErrActiveMRReworkExists = errors.New("an active MR-rework run already exists
 // ErrMRReworkCapReached is returned by CreateAutoMRReworkRunAndAdvance when, under the
 // branch lock, the ledger's attempt_count has already reached the automatic cap (a concurrent
 // cycle spent the last attempt after the caller read its ledger). The watcher skips silently.
-// The recheck judges the cap before freshness, so when that cycle consumed the same comments the
-// next tick exits at the watcher's "nothing new" gate; the halt path runs only once a newer
-// eligible comment remains.
+// The watcher's "nothing new" gate precedes its cap gate, so when that cycle consumed the same
+// comments the next tick exits there; the halt path runs only once a newer eligible comment
+// remains.
 var ErrMRReworkCapReached = errors.New("the automatic MR-rework cap is already reached for this merge request")
 
 // reworkRecheck makes a create re-validate its decision against the CURRENT ledger row under

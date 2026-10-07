@@ -57,7 +57,9 @@ Forgejo keeps its reply-only, inline-only contract.
 **Legacy snapshots.** A snapshot whose version is not 2 predates assessment and
 may hold unvetted bodies. It is replayed as empty with a fixed note and
 authorizes no thread. Runs in flight across the upgrade lose their comments and
-reply/resolve. The version is the review lane's own constant, not an alias of
+reply/resolve; one that already carries a session or a stored plan (context
+written after reading the unvetted bodies) is refused terminally at claim
+(`guardrail_blocked`) rather than resumed. The version is the review lane's own constant, not an alias of
 the issue lane's, so bumping one lane never re-versions the other.
 
 **Pending set.** Unknown actionable comments at or below a new high-water mark

@@ -134,8 +134,12 @@ A run's snapshot taken before this protection existed can't be trusted to
 contain only eligible comments. Such a legacy snapshot is replayed as
 **empty** with a fixed "not available" note, and it authorizes no thread. An
 `mr_rework` run that was already in flight when you upgraded therefore sees
-no review comments and can't reply or resolve; start a fresh
-[rework on demand](#rework-on-demand) to get an assessed snapshot.
+no review comments and can't reply or resolve. If that run had already
+started (it carries a session or a stored plan, both written after reading
+the unvetted comments), its next claim fails instead, with a reason naming
+the source run, so it never resumes from that context. Either way, start a
+fresh [rework on demand](#rework-on-demand) from the source run to get an
+assessed snapshot.
 
 ### Fail closed, and "permission unknown"
 
