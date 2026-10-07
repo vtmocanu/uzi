@@ -104,9 +104,10 @@ it("issue1924 invalid ownership route body network and HTTP failures never FINAL
       assert.ok(record, "a frozen record exists before the error is injected");
       const reserves = f.reserves();
       f.state.ownershipError = error;
-      // Only the ownership-gated resume path is asserted: captureAndUpload is the foreground
-      // disposition-boundary call, which runs after the caller froze under proven ownership and
-      // verifies the open hold itself, so it legitimately sends the FINAL.
+      // Drives the resume path, whose FINAL is gated by inactiveInventory (the ownership read).
+      // captureAndUpload reaches the same gate through finalizeInventory, but it first uploads the
+      // bundle (raising reserves), so asserting an unchanged reserve count would need resumePending
+      // alone; both paths were checked to send no FINAL on each injected error.
       await f.make().resumePending(undefined, [record]).catch(() => undefined);
       assert.equal(f.finals.length, 0, "no FINAL is sent on an invalid ownership answer");
       assert.equal(f.reserves(), reserves);
