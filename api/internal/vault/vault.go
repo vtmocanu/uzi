@@ -162,8 +162,8 @@ func (v *Vault) unlock(ctx context.Context, userID uuid.UUID, password string, a
 
 // clearLockNotice re-arms notices only while the key remains cached. It holds the
 // user's notice mutex, never mu, across the update: a manual Lock either evicts the
-// key before the cache check, so the clear is skipped, or waits in its notice
-// barrier until the clear has finished, so the caller's later pre-ack is preserved.
+// key before the cache check, so the clear is skipped, or waits for the clear to
+// finish before evicting, so the caller's later pre-ack is preserved.
 // Rewrap stays outside so a lock can interrupt a slow migration.
 func (v *Vault) clearLockNotice(ctx context.Context, userID uuid.UUID) error {
 	m := v.noticeMutex(userID)
@@ -286,14 +286,16 @@ func (v *Vault) rewrapMasterSecrets(ctx context.Context, userID uuid.UUID) {
 // guarantee the bytes were not already copied elsewhere by the runtime, so this
 // reduces — does not eliminate — DEK-in-RAM exposure. No-op if already locked.
 //
-// Eviction never waits on I/O. After releasing mu, Lock waits for any in-flight
-// notice clear of this user that saw the key before eviction, so a pre-ack the
-// caller writes after Lock returns cannot be erased by that clear.
+// Lock first waits for any in-flight notice clear of this user, then evicts. Until
+// then the vault still reads unlocked, so the lock-notice reconciler never sees a
+// locked vault whose clear could still erase the caller's later pre-ack. Only this
+// user's eviction waits, at most one bounded notice update; mu is never held across
+// I/O, so other users' Lock, Seal and Open are unaffected.
 func (v *Vault) Lock(userID uuid.UUID) {
-	v.evict(userID)
 	m := v.noticeMutex(userID)
 	m.Lock()
-	m.Unlock() //nolint:staticcheck // SA2001: an ordering barrier, not a critical section
+	defer m.Unlock()
+	v.evict(userID)
 }
 
 func (v *Vault) evict(userID uuid.UUID) {

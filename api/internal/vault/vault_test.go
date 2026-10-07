@@ -697,11 +697,11 @@ func TestSlowNoticeClearDoesNotDelayOtherUsersLock(t *testing.T) {
 	}
 }
 
-// TestLockEvictsBeforeWaitingForSameUserNoticeClear: Lock evicts and wipes the
-// user's DEK at once, even while that user's notice clear is blocked in SQL, and
-// returns only after the clear has finished (the ordering that keeps a later
-// pre-ack from being erased).
-func TestLockEvictsBeforeWaitingForSameUserNoticeClear(t *testing.T) {
+// TestLockWaitsForSameUserNoticeClearThenEvicts: while user A's notice clear is
+// blocked in SQL, Lock(A) waits with A still unlocked (so the lock-notice
+// reconciler cannot see a locked vault whose clear could still erase the later
+// pre-ack), then evicts and wipes A's DEK once the clear finishes.
+func TestLockWaitsForSameUserNoticeClearThenEvicts(t *testing.T) {
 	v, a, _, slow, unlockDone := startBlockedNoticeClear(t, "same-user-notice-pw")
 	v.mu.RLock()
 	dek := v.cache[a]
@@ -711,20 +711,13 @@ func TestLockEvictsBeforeWaitingForSameUserNoticeClear(t *testing.T) {
 	}
 	lockDone := make(chan struct{})
 	go func() { v.Lock(a); close(lockDone) }()
-	deadline := time.Now().Add(2 * time.Second)
-	for v.Unlocked(a) && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if v.Unlocked(a) {
-		t.Fatal("Lock did not evict user A's key while the notice SQL was blocked")
-	}
-	if !bytes.Equal(dek, make([]byte, len(dek))) {
-		t.Error("evicted DEK was not wiped")
-	}
 	select {
 	case <-lockDone:
-		t.Error("Lock returned before the in-flight notice clear finished")
-	default:
+		t.Fatal("Lock returned while the same user's notice clear was blocked")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if !v.Unlocked(a) {
+		t.Error("Lock evicted before the in-flight notice clear finished")
 	}
 	close(slow.release)
 	if err := <-unlockDone; err != nil {
@@ -737,5 +730,8 @@ func TestLockEvictsBeforeWaitingForSameUserNoticeClear(t *testing.T) {
 	}
 	if v.Unlocked(a) {
 		t.Error("user A is unlocked after Lock")
+	}
+	if !bytes.Equal(dek, make([]byte, len(dek))) {
+		t.Error("evicted DEK was not wiped")
 	}
 }
