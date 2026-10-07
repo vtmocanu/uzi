@@ -155,13 +155,17 @@ says the new comments' authors couldn't be verified yet and to try again
 shortly or give guidance. This is a transient state: uzi keeps the unknown
 comment ids on the MR's ledger and fires the rework on a later tick once
 their author checks out as eligible. The ledger keeps **one id per unverified
-author**: that author's newest unknown actionable comment at or below the
-high-water mark, capped at 10,000 entries. On overflow the **oldest** ids are
+author**: that author's newest unknown actionable comment that is above the
+previous high-water mark (and at or below the new one) or already pending,
+capped at 10,000 entries. On overflow the **oldest** ids are
 kept, so a flood that arrives after a finding can't displace it. A comment
 whose author turns out not to be eligible is dropped and never fires. Two
 residuals fall back to a human noticing the comment in review: an author who
 deletes their own newest (representative) comment while older unknown ones
-remain, and an id the snapshot caps push out.
+remain, and an id the snapshot caps push out. A concurrent ledger writer that
+moves the mark past a new representative id can also drop it while the older
+id is superseded; this is narrow and overlaps the scalar-mark limitation under
+[Known limitations](#known-limitations).
 
 ### Fair progress under an outsider flood
 
@@ -176,8 +180,8 @@ is cached for 6 hours (per repository), so the same outsider isn't looked up
 every tick.
 
 What this guarantees, and what it doesn't. An eligible reviewer's finding is
-**not suppressed by an outsider flood below 10,000 distinct unverified
-accounts present at a single fire**, and it is never displaced from the
+**not suppressed by an outsider flood unless the pending set exceeds 10,000
+entries (one per unverified author, accumulated across fires)**, and it is never displaced from the
 agent's context by outsider comments. It can be **delayed**, and the delay is
 bounded only under the conditions below. Let *R*0 be the number of entries
 ahead of a waiting author *X* in the queue that are not eligible (not-eligible
@@ -215,15 +219,15 @@ Ticks that don't count never move anyone ahead of *X*.
 
 > **Pending maintainer confirmation.** The originating issue asked that an
 > outsider flood not delay an eligible finding at all. This design instead
-> guarantees the finding is not suppressed below 10,000 distinct unverified
-> accounts at one fire and is delayed only by the conditional bound above. That departure from the zero-delay criterion is
+> guarantees the finding is not suppressed unless the pending set exceeds 10,000
+> entries and is delayed only by the conditional bound above. That departure from the zero-delay criterion is
 > pending maintainer confirmation before the change merges. The rationale is
 > in [ADR-2347](../adr/2347-review-comment-author-trust.md).
 
 Smaller residuals: an outsider later promoted to collaborator is recognized
 within 6 hours (the cached verdict's lifetime); the cross-type comment-id
 limitation under [Known limitations](#known-limitations) also applies to
-remembered unknown ids; the ledger's 10,000-account cap is a documented residual (displacement needs more distinct unverified accounts than that at one fire); and a stale GitHub collaborator listing can cost a
+remembered unknown ids; the ledger's 10,000-account cap is a documented residual (the pending set accumulates across fires, one entry per unverified author, and displacement needs it to exceed 10,000 entries); and a stale GitHub collaborator listing can cost a
 queue position, which affects fairness only, never who is trusted.
 
 ## Enablement

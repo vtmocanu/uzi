@@ -64,11 +64,12 @@ the issue lane's, so bumping one lane never re-versions the other.
 would be skipped forever once the mark moves. Their ids are kept in
 `mr_rework_ledger.pending_unknown_ids`, merged in SQL, a consumed id never
 re-added, and trigger once their author is eligible. The set holds one id per
-unverified author, that author's newest unknown actionable comment id at or
-below the mark, capped at 10,000 entries; on overflow the oldest ids are kept,
-so a flood arriving after a finding cannot displace it. Displacement needs more
-than 10,000 distinct unverified accounts present at a single fire (documented
-residual). If an author deletes their own representative (newest) comment while
+unverified author, that author's newest unknown actionable comment id that is
+above the previous mark (and at or below the new one) or already pending, capped at 10,000 entries; on overflow the oldest ids are kept,
+so a flood arriving after a finding cannot displace it. The set accumulates across fires, so displacement needs it to exceed 10,000
+entries (one per unverified author; documented residual). A concurrent ledger
+writer that moves the mark past a new representative id can drop it while the
+supersede removes the older id (narrow; overlaps the scalar-mark limitation). If an author deletes their own representative (newest) comment while
 older unknown ones remain, those older ones fall back to human review. An id the
 snapshot caps evict is dropped (human review is the fallback), including on a
 tick that creates no run.
@@ -127,8 +128,8 @@ eligible authors are few.
 ## Departure from the issue's zero-delay acceptance criterion: pending maintainer confirmation
 
 The issue asks that an outsider flood not delay an eligible finding. This design
-does not meet that literally. It guarantees an eligible finding is **not suppressed by an outsider flood below
-10,000 distinct unverified accounts at one fire**, never displaced from the
+does not meet that literally. It guarantees an eligible finding is **not suppressed by an outsider flood unless
+the pending set exceeds 10,000 entries (one per unverified author, accumulated across fires)**, never displaced from the
 snapshot's context by outsider comments, and **delayed only by the conditional
 bound above**, whose assumptions (forge availability, rate
 limit, a few eligible authors ahead) are not under uzi's control. Whether the
