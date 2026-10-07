@@ -331,6 +331,10 @@ type mrwForge struct {
 	// eligible, so the pre-existing tests keep their meaning; lookups records each call.
 	eligibility func(ctx context.Context, authorID int64) (forge.AuthorEligibility, error)
 	lookups     []int64
+
+	// onList, when set, runs while ListMergeRequestComments is "fetching": it stands for a
+	// concurrent writer that updates the ledger during the listing.
+	onList func()
 }
 
 func (f *mrwForge) RepositoryAuthorEligibility(ctx context.Context, _ int64, authorID int64) (forge.AuthorEligibility, error) {
@@ -342,6 +346,9 @@ func (f *mrwForge) RepositoryAuthorEligibility(ctx context.Context, _ int64, aut
 }
 
 func (f *mrwForge) ListMergeRequestComments(context.Context, int64, int64) ([]forge.MRComment, error) {
+	if f.onList != nil {
+		f.onList()
+	}
 	return f.comments, f.commentsErr
 }
 

@@ -171,16 +171,20 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		comments, err := f.ListMergeRequestComments(r.Context(), repo.ForgeProjectID, run.MrIid.Int64)
-		if err != nil {
-			// err is already PAT-redacted by the driver.
-			httpx.Error(w, http.StatusBadGateway, "could not read the merge request comments: "+err.Error())
-			return
-		}
+		// The ledger row is read BEFORE the comment listing: every pending id in it existed before
+		// the list was fetched, so a pending id absent from the list is gone, whatever the forge's
+		// comment-id order. StartMRReworkForRun plans against these values (carried on the
+		// assessment result), never a later re-read.
 		led, err := h.q.GetMRReworkLedger(r.Context(), store.GetMRReworkLedgerParams{RepoID: repo.ID, Ref: run.Branch.String})
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			slog.Error("mr-rework: read ledger", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		comments, err := f.ListMergeRequestComments(r.Context(), repo.ForgeProjectID, run.MrIid.Int64)
+		if err != nil {
+			// err is already PAT-redacted by the driver.
+			httpx.Error(w, http.StatusBadGateway, "could not read the merge request comments: "+err.Error())
 			return
 		}
 		as, err := assessor.Begin(r.Context(), workersvc.ReviewAssessParams{

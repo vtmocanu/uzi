@@ -294,21 +294,3 @@ func TestPlanCapWarningFiresWhenNewIDsExceedTheCap(t *testing.T) {
 		t.Fatalf("no cap warning although a new id overflows the set; log: %q", buf.String())
 	}
 }
-
-// A pending id above the largest fetched id is not provably gone: the fetch may predate it, so
-// the plan leaves it alone (neither removed nor superseded), while an absent id at or below the
-// largest fetched id is gone and removed.
-func TestPlanKeepsPendingIDAboveTheLargestFetchedID(t *testing.T) {
-	h := newHarness()
-	res := h.snapshot(t, h.params(
-		inline(50, memberID, "carol", "old", raT0),
-		inline(60, memberID, "carol", "newer", raT0.Add(time.Second)),
-	))
-	plan := res.Plan(40, []int64{55, 170})
-	if slices.Contains(plan.PendingRemove, 170) || slices.Contains(plan.PendingSuperseded, 170) {
-		t.Fatalf("plan removes or supersedes 170 above the largest fetched id: %+v", plan)
-	}
-	if !slices.Contains(plan.PendingRemove, 55) {
-		t.Fatalf("pending remove = %v, want the gone 55 (absent, below the largest fetched id 60) removed", plan.PendingRemove)
-	}
-}

@@ -158,7 +158,7 @@ their author checks out as eligible. The ledger keeps **one id per unverified
 author**: that author's newest unknown actionable comment that is above the
 previous high-water mark (and at or below the new one) or already pending,
 capped at 10,000 entries. On overflow the **oldest** ids are
-kept, so a flood that arrives after a finding can't displace it. Near the cap, when superseding could not be guaranteed to fit, an author's older id is kept (so an author may briefly hold two entries) rather than risk losing both. An author's older id is replaced only when its newer representative is retained in the same atomic merge, so a stale or capped replacement leaves the older id in place. A comment
+kept, so a flood that arrives after a finding can't displace it. Near the cap, when superseding could not be guaranteed to fit, an author's older id is kept (so an author may briefly hold two entries) rather than risk losing both. An author's older id is dropped only when its newer representative is retained in the same atomic merge (a stale writer whose add is rejected, or whose replacement another writer removed, leaves the older id in place); a retained replacement takes the older id's place in the cap order within that merge. Both the watcher and the on-demand path read the ledger before listing the comments, so a pending id missing from the listing is treated as deleted. A comment
 whose author turns out not to be eligible is dropped and never fires. Two
 residuals fall back to a human noticing the comment in review: an author who
 deletes their own newest (representative) comment while older unknown ones

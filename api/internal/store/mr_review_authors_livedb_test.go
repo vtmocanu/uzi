@@ -681,11 +681,15 @@ func TestMRReworkStaleSupersessionKeepsRepresentativeLiveDB(t *testing.T) {
 			ids = append(ids, i)
 		}
 		upsert(ref, 10000, ids, nil, nil, nil)
-		upsert(ref, 20000, []int64{15000}, nil, []int64{10000}, []int64{15000})
+		// 12000 (another author) and 15000 (the replacement for 10000) both pass the mark filter
+		// (above the prior mark 10000, at or below the new one), so the merged set is 10001 and the
+		// cap cuts one id. The retained replacement takes the older id's slot, so the newer
+		// non-replacement add 12000 is the one cut, although 12000 < 15000.
+		upsert(ref, 20000, []int64{12000, 15000}, nil, []int64{10000}, []int64{15000})
 		got := pending(ref)
-		if len(got) != 10000 || !slices.Contains(got, 15000) || slices.Contains(got, 10000) {
-			t.Fatalf("pending = %d ids (contains 15000: %t, 10000: %t), want 10000 ids with the replacement and not the older id",
-				len(got), slices.Contains(got, 15000), slices.Contains(got, 10000))
+		if len(got) != 10000 || !slices.Contains(got, 15000) || slices.Contains(got, 12000) || slices.Contains(got, 10000) {
+			t.Fatalf("pending = %d ids (contains 15000: %t, 12000: %t, 10000: %t), want 10000 ids with 15000 kept, 12000 cut and 10000 gone",
+				len(got), slices.Contains(got, 15000), slices.Contains(got, 12000), slices.Contains(got, 10000))
 		}
 	})
 

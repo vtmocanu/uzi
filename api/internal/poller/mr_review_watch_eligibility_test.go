@@ -607,21 +607,29 @@ func TestEvictionRunsNextToLedgerReconcile(t *testing.T) {
 	}
 }
 
-// A fetch that predates a pending comment must not remove it: a faster writer stored 170 after
-// reading a fresher comment list, and this tick's list tops out below it. The tick still fires
-// for the new eligible comment, and 170 stays pending.
+// A concurrent writer stores pending id 170 while this tick is listing the comments, so the
+// list lacks it. GitHub and Forgejo number comment types from separate sequences, so the list
+// also holds a LARGER id (190): "absent and below the largest fetched id" cannot tell a gone
+// comment from one the list predates. The ledger is read before the listing, so 170 (absent from
+// the row this tick planned against) is never mistaken for gone.
 func TestStaleFetchLeavesNewerPendingIDAlone(t *testing.T) {
 	e := newEW(t)
 	e.st.ledgers = map[string]store.MrReworkLedger{
-		mrwRef: {RepoID: mrwRepoRow().ID, Ref: mrwRef, HighWater: 150, PendingUnknownIds: []int64{170}},
+		mrwRef: {RepoID: mrwRepoRow().ID, Ref: mrwRef, HighWater: 150},
+	}
+	e.f.onList = func() {
+		cur := e.st.ledgers[mrwRef]
+		cur.PendingUnknownIds = []int64{170}
+		cur.HighWater = 165
+		e.st.ledgers[mrwRef] = cur
 	}
 	old := e.comment(120, outsiderAuthor, "old outsider note")
-	fresh := e.comment(160, memberAuthor, "eligible feedback")
+	fresh := e.comment(190, memberAuthor, "eligible feedback")
 	e.tick(old, fresh)
 	if len(e.runs.calls) != 1 {
 		t.Fatalf("runs = %d, want the eligible comment to fire", len(e.runs.calls))
 	}
 	if got := e.st.ledgers[mrwRef].PendingUnknownIds; !slices.Equal(got, []int64{170}) {
-		t.Fatalf("pending = %v, want 170 kept: the fetch never reached it", got)
+		t.Fatalf("pending = %v, want 170 kept: the listing never saw it", got)
 	}
 }

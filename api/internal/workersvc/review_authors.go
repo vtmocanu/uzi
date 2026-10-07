@@ -501,7 +501,11 @@ type ReviewSnapshotResult struct {
 	unknownAuthor      map[int64]int64 // comment id -> author id, for unknownActionable
 	class              map[int64]reviewClass
 	inSnapshot         map[int64]bool
-	maxFetchedID       int64 // the largest comment id of the fetched list, 0 when it was empty
+	// highWater and pending are the ledger values the assessment was begun with
+	// (ReviewAssessParams.HighWater/Pending), which callers read BEFORE listing the comments.
+	// PlanAssessed plans against exactly these, never a later re-read.
+	highWater int64
+	pending   []int64
 }
 
 // Snapshot finishes the assessment: it looks up the context-only authors (everyone not yet
@@ -532,9 +536,8 @@ func (r *ReviewAssessment) Snapshot(ctx context.Context) *ReviewSnapshotResult {
 		class:            make(map[int64]reviewClass, len(r.kept)),
 		inSnapshot:       map[int64]bool{},
 		unknownAuthor:    map[int64]int64{},
-	}
-	for _, c := range r.p.Comments { // every fetched comment, the bot's own included
-		res.maxFetchedID = max(res.maxFetchedID, c.ID)
+		highWater:        r.p.HighWater,
+		pending:          slices.Clone(r.p.Pending),
 	}
 	snap := &ReviewCommentsSnapshot{Version: ReviewSnapshotVersion, Comments: []ReviewCommentSnapshot{}}
 	var eligible []ReviewCommentSnapshot
@@ -591,9 +594,10 @@ type ReviewPlan struct {
 	PendingRemove []int64
 	// PendingSuperseded and PendingSupersededBy are parallel slices (never nil): an author's
 	// older pending id and that author's newer representative. The ledger merge drops the older
-	// id only when the representative is retained in the same atomic statement, so a stale
-	// writer whose add the high-water filter rejects, or whose set the cap truncates, leaves the
-	// older id in place instead of losing the author.
+	// id only when the representative is retained in the same atomic statement (a retained
+	// representative takes the older id's place in the cap order within that merge). A stale
+	// writer whose add the high-water filter rejects, or whose representative another writer
+	// removed, therefore leaves the older id in place instead of losing the author.
 	PendingSuperseded   []int64
 	PendingSupersededBy []int64
 	// PendingEvicted is the part of PendingRemove that is safe to drop even when no run is
@@ -603,7 +607,16 @@ type ReviewPlan struct {
 	PendingEvicted []int64
 }
 
-// Plan computes the plan against a ledger row's high-water mark and pending set.
+// PlanAssessed plans against the ledger values the assessment began with, which the caller
+// read before listing the comments. A pending id in that set therefore existed before the
+// listing, so one absent from the listing is gone whatever the forge's id order. Callers must
+// not re-read the ledger after the listing and plan against that instead.
+func (res *ReviewSnapshotResult) PlanAssessed() ReviewPlan {
+	return res.Plan(res.highWater, res.pending)
+}
+
+// Plan computes the plan against a ledger row's high-water mark and pending set. The row must
+// have been read before the comments were listed (see PlanAssessed).
 func (res *ReviewSnapshotResult) Plan(highWater int64, pending []int64) ReviewPlan {
 	pendingSet := make(map[int64]bool, len(pending))
 	for _, id := range pending {
@@ -662,10 +675,6 @@ func (res *ReviewSnapshotResult) Plan(highWater int64, pending []int64) ReviewPl
 	for _, id := range pending {
 		cl, present := res.class[id]
 		switch {
-		case !present && id > res.maxFetchedID:
-			// Absent from the fetch but newer than anything it returned: the fetch may predate
-			// the comment (a faster writer stored it after reading a fresher list), so it is not
-			// provably gone. Leave it pending.
 		case !present, cl == classNotEligible:
 			plan.PendingRemove = append(plan.PendingRemove, id) // gone, or its author is now known to be out
 		case cl == classEligible && res.inSnapshot[id]:
@@ -684,9 +693,9 @@ func (res *ReviewSnapshotResult) Plan(highWater int64, pending []int64) ReviewPl
 	// guaranteed to fit. The supersession is NOT a removal: the ledger merge
 	// (mr_rework_merge_pending) applies each (older, representative) pair only when the
 	// representative is retained in the same statement, so a stale writer's rejected add cannot
-	// cost the author its only id. The fit check counts the superseded ids as dropped; when the
-	// set would overflow the pairs are not emitted and the older ids stay (the merge's slot rule
-	// would also keep the representative over a newer author, but we do not rely on it here).
+	// cost the author its only id. The fit check counts the superseded ids as dropped; near the cap,
+	// when the set would overflow, the pairs are withheld and both ids may briefly stay (the next
+	// tick, after the removals, emits them once they fit).
 	incoming := len(pending) + newAdds - len(plan.PendingRemove)
 	if incoming-len(superseded) <= ReviewPendingCap {
 		for _, id := range superseded {

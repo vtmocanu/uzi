@@ -229,23 +229,28 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 		slog.Warn("poller: mr-rework review author queue read", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 		return
 	}
-	comments, err := f.ListMergeRequestComments(ctx, r.ForgeProjectID, mrIID)
-	if err != nil {
-		// Already PAT-redacted by the driver.
-		slog.Warn("poller: mr-rework list comments", "repo", r.PathWithNamespace, "ref", ref, "error", err)
-		return
-	}
-
 	// The ledger row. No row means this MR was never reworked: the generated :one
 	// returns a zero-value struct alongside pgx.ErrNoRows (attempt_count=0,
 	// high_water=0, halt_notified=false, no pending ids), so every gate below keys on those
-	// values, NEVER on row-existence. Read before the assessment: which comments are NEW
-	// (above the mark, or pending) decides which authors are worth a lookup.
+	// values, NEVER on row-existence. Read BEFORE the comment listing (and so before the
+	// assessment): every pending id in it existed before the list was fetched, so a pending id
+	// absent from the list is gone, whatever the forge's comment-id order (GitHub and Forgejo
+	// number comment types from separate sequences, so no id comparison can stand in for this).
+	// Planning against this older row is safe: the ledger merge tolerates it (GREATEST high-water,
+	// the prior_high_water filter, conditional supersession pairs). Which comments are NEW (above
+	// the mark, or pending) decides which authors are worth a lookup.
 	led, err := d.q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: r.ID, Ref: ref})
 	switch {
 	case err == nil, errors.Is(err, pgx.ErrNoRows):
 	default:
 		slog.Error("poller: mr-rework get ledger", "repo", r.PathWithNamespace, "ref", ref, "error", err)
+		return
+	}
+
+	comments, err := f.ListMergeRequestComments(ctx, r.ForgeProjectID, mrIID)
+	if err != nil {
+		// Already PAT-redacted by the driver.
+		slog.Warn("poller: mr-rework list comments", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 		return
 	}
 

@@ -356,23 +356,16 @@ func (s *Service) StartMRReworkForRun(ctx context.Context, userID, runID uuid.UU
 		}
 	}
 
-	// The loop-guard ledger. No row = zero values (never reworked), exactly as the detector
-	// reads it: the generated :one returns a zero-value struct alongside pgx.ErrNoRows.
-	led, err := s.q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repoID, Ref: ref})
-	switch {
-	case err == nil, errors.Is(err, pgx.ErrNoRows):
-	default:
-		return store.Run{}, fmt.Errorf("read mr_rework ledger: %w", err)
-	}
-
-	// What the assessed snapshot means for this ledger row, computed EXACTLY as the detector
-	// does (ReviewSnapshotResult.Plan): only an eligible actionable comment counts, and
+	// What the assessed snapshot means for the ledger row the assessment began with (read by the
+	// handler BEFORE it listed the comments, so a pending id absent from the listing is gone;
+	// re-reading the ledger here would reopen that race), computed EXACTLY as the detector does
+	// (ReviewSnapshotResult.Plan): only an eligible actionable comment counts, and
 	// plan.HasNew is the "there is something the automatic watcher would fire on" test.
 	var snapshot *ReviewCommentsSnapshot
 	var plan ReviewPlan
 	if res != nil {
 		snapshot = res.Snapshot
-		plan = res.Plan(led.HighWater, led.PendingUnknownIds)
+		plan = res.PlanAssessed()
 	}
 
 	// A bare trigger with nothing new and no guidance is refused: there is nothing to do

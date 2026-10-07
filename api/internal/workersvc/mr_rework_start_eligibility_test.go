@@ -260,3 +260,22 @@ func TestStartMRReworkGuidanceRemovesEvictedPendingIDsAtomically(t *testing.T) {
 		t.Fatalf("a separate removal ran next to the atomic create: %+v", fs.pendingRemovals)
 	}
 }
+
+// A concurrent writer stored pending id 170 after the handler read the ledger and before the
+// service ran, and the forge listing lacks it. The plan is made against the row the assessment
+// began with (read before the listing), so 170 is not removed as gone; a re-read here would see
+// it pending, absent from the list, and remove it.
+func TestStartMRReworkPlansAgainstThePreFetchLedger(t *testing.T) {
+	fs, svc, user, runID := reworkFixture(t, 150, []int64{170})
+	res := assessedResult(t, 150, nil, rc(190, eligibleAuthor, "eligible feedback"))
+	if _, err := svc.StartMRReworkForRun(context.Background(), user, runID, "", res); err != nil {
+		t.Fatal(err)
+	}
+	p := fs.mrReworkAndAdvanceParams
+	if p == nil {
+		t.Fatal("no run was created")
+	}
+	if slices.Contains(p.PendingRemove, 170) {
+		t.Fatalf("PendingRemove = %v: 170 was stored after the pre-fetch ledger read and must stay", p.PendingRemove)
+	}
+}

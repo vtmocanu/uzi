@@ -127,6 +127,8 @@ func TestStartMRReworkForRun409Classes(t *testing.T) {
 		name    string
 		mutate  func(*fakeStore)
 		wantErr error
+		// assessedHighWater is the ledger mark the assessment began with; the plan uses it, not a re-read.
+		assessedHighWater int64
 	}{
 		{
 			name:    "run not found",
@@ -173,7 +175,8 @@ func TestStartMRReworkForRun409Classes(t *testing.T) {
 			mutate: func(f *fakeStore) {
 				f.mrReworkLedger = store.MrReworkLedger{Ref: "agent/issue-7", HighWater: 500}
 			},
-			wantErr: ErrReworkNothingNew,
+			assessedHighWater: 500,
+			wantErr:           ErrReworkNothingNew,
 		},
 	}
 
@@ -191,7 +194,9 @@ func TestStartMRReworkForRun409Classes(t *testing.T) {
 
 			// A bare trigger (no guidance) so the nothing-new class fires; the other classes
 			// bail before the guidance check anyway.
-			_, err := svc.StartMRReworkForRun(context.Background(), user, runID, "", reviewResultOf(sampleReviewSnapshot()))
+			res := reviewResultOf(sampleReviewSnapshot())
+			res.highWater = tc.assessedHighWater
+			_, err := svc.StartMRReworkForRun(context.Background(), user, runID, "", res)
 			if err != tc.wantErr {
 				t.Fatalf("err = %v, want %v", err, tc.wantErr)
 			}
