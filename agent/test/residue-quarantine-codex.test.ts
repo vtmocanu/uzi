@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 
 import {
   CodexHarness,
@@ -329,6 +329,50 @@ describe("the Codex advice lane over a real transport (issue #2213)", () => {
       assert.ok(!sent.includes("thread/start") && !sent.includes("turn/start"), sent.join(","));
     } finally {
       rig.close();
+    }
+  });
+});
+
+describe("the real Codex transport rechecks the latch when a queued gated frame is written (issue #2213)", () => {
+  it("a turn/start queued behind backpressure while the worker latches is never written; its promise rejects with the ResidueQuarantinedError; later non-gated frames still go out", async () => {
+    const written: string[] = [];
+    let release: (() => void) | undefined;
+    const outbound = new Writable({
+      highWaterMark: 1,
+      write(chunk: Buffer, _enc, cb) {
+        written.push(chunk.toString("utf8"));
+        // Hold the first write's callback: write() returns false (backpressure) until released.
+        if (release === undefined) release = () => cb();
+        else cb();
+      },
+    });
+    const inbound = new PassThrough();
+    const transport = createCodexTransport({ inbound, outbound });
+    try {
+      void transport.request("initialize", {}).catch(() => undefined);
+      await tick();
+      assert.equal(written.length, 1, "the first frame is written and stalls the stream");
+      const gated = transport.request("turn/start", { x: 1 }, { deadlineMs: 500 });
+      const gatedOutcome = gated.then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+      void transport.request("turn/interrupt", { threadId: "t" }).catch(() => undefined);
+      await tick();
+      assert.equal(written.length, 1, "both later frames are queued behind the backpressure");
+      latch();
+      release?.();
+      await tick();
+      await tick();
+      const err = await gatedOutcome;
+      assert.ok(err instanceof ResidueQuarantinedError, String(err));
+      assert.ok(!(err instanceof CodexTransportError));
+      const methods = written.map((l) => (JSON.parse(l) as { method: string }).method);
+      assert.deepEqual(methods, ["initialize", "turn/interrupt"], "the gated frame never reached the app-server");
+    } finally {
+      await transport.close();
+      inbound.destroy();
+      outbound.destroy();
     }
   });
 });
