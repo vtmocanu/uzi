@@ -13,6 +13,15 @@ import { nullLogger, testGitCacheOptions } from "./helpers.js";
 const H = "a".repeat(40);
 const H2 = "b".repeat(40);
 
+it("review probe: a malformed guarded-hold flag cannot prove no guarded custody", async () => {
+  const f = await fixture();
+  try {
+    clientOf(f).listRecoveryHolds = async () => ({ run_id: "run-1", holds: [{ generation: 7, inventory_guarded: "true" }] });
+    await assert.rejects(f.coordinator.unsettledGuardedGenerations("run-1"),
+      "malformed guarded status must stop pruning rather than discard an unknown hold");
+  } finally { await f.close(); }
+});
+
 it("review probe: an initial guarded pin does not keep an acknowledged generation unsettled", async () => {
   const f = await fixture();
   try {

@@ -839,8 +839,7 @@ export class RecoveryCoordinator {
     }
     for (let attempt = 0; ; attempt++) {
       try {
-        const holds = (await this.client.listRecoveryHolds(runId)).holds;
-        const open = holds.filter(h => h.generation === generation && h.inventory_guarded === true);
+        const open = (await this.guardedHolds(runId)).filter(h => h.generation === generation);
         if (open.length === 0) return "settled"; // already closed (a replayed or concurrent settle)
         if (open.length !== 1) return "retained";
         const ack = await this.client.releaseRecoveryCustody(runId, generation, "forge_no_output",
@@ -877,6 +876,23 @@ export class RecoveryCoordinator {
     return own.claim_generation! > generation ||
       (own.inventory_guarded === true &&
        ["completed", "failed", "cancelled", "paused", "recovery_wait", "limit_wait"].includes(own.status));
+  }
+
+  /** The run's open guarded holds, strictly validated: only a boolean false flag may exclude a hold, so a
+   *  missing or non-boolean flag, a bad generation or a foreign run throws instead of reading as "no
+   *  guarded hold". Callers use it where absence would release or unprotect custody. */
+  private async guardedHolds(runId: string): Promise<Array<{ generation: number }>> {
+    const response = await this.client.listRecoveryHolds(runId);
+    if (!response || response.run_id !== runId || !Array.isArray(response.holds)) throw new Error("malformed recovery holds response");
+    const out: Array<{ generation: number }> = [];
+    for (const h of response.holds as unknown[]) {
+      const hold = h as { inventory_guarded?: unknown; generation?: unknown } | null;
+      if (typeof hold !== "object" || hold === null || typeof hold.inventory_guarded !== "boolean") throw new Error("malformed recovery hold flag");
+      if (hold.inventory_guarded === false) continue;
+      if (typeof hold.generation !== "number" || !Number.isSafeInteger(hold.generation) || hold.generation <= 0) throw new Error("malformed guarded hold generation");
+      out.push({ generation: hold.generation });
+    }
+    return out;
   }
 
   private async openInventoryHold(record: Pick<RecoveryRecord, "runId" | "generation">): Promise<boolean> {
@@ -2229,13 +2245,7 @@ export class RecoveryCoordinator {
     // A missing journal proves nothing: every generation the server still holds open stays
     // protected. One read per call; a failed read throws, so the caller prunes nothing.
     if (this.client.hasFeature?.("recovery_inventory_v1")) {
-      const response = await this.client.listRecoveryHolds(runId);
-      if (response.run_id !== runId || !Array.isArray(response.holds)) throw new Error("malformed recovery holds response");
-      for (const h of response.holds) {
-        if (h.inventory_guarded !== true) continue;
-        if (!Number.isSafeInteger(h.generation) || (h.generation as number) <= 0) throw new Error("malformed guarded hold generation");
-        out.add(h.generation as number);
-      }
+      for (const h of await this.guardedHolds(runId)) out.add(h.generation);
     }
     return out;
   }

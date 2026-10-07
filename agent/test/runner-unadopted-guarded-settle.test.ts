@@ -141,3 +141,14 @@ it("an api that is not ready is retried a bounded number of times, then the hold
   await r.run(9105, async () => { throw PERMANENT(); });
   assert.equal(r.releases.length, 4, "one attempt plus the three configured retries, no more");
 });
+
+it("a malformed hold flag is not read as a closed hold: no settle, no forgotten claim", async () => {
+  const r = rig();
+  const marked = trackSettled();
+  client.listRecoveryHolds = async (id: string) => ({ run_id: id, holds: [
+    { hold_id: "hold", generation: GEN, inventory_guarded: "true", has_available_capture: false },
+  ] } as never);
+  await r.run(9113, async () => { throw PERMANENT(); });
+  assert.deepEqual(r.releases, []);
+  assert.deepEqual(marked, []);
+});
