@@ -376,7 +376,8 @@ type AdminUsagePerUserRow struct {
 }
 
 // Both windows over usage-bearing non-chat runs. Lifetime groups remain present
-// even when their seven-day totals are zero; each window sums to the factory.
+// even when their seven-day totals are zero; at the same snapshot and cutoff,
+// each window sums to the factory.
 func (q *Queries) AdminUsagePerUser(ctx context.Context) ([]AdminUsagePerUserRow, error) {
 	rows, err := q.db.Query(ctx, adminUsagePerUser)
 	if err != nil {
@@ -466,9 +467,9 @@ type AdminUsageTotalsRow struct {
 }
 
 // Factory-wide totals across ALL users' runs (PRD #40 M3, GET /api/admin/usage).
-// Same shape as SelfUsage without the user filter; by construction this equals the
-// SUM of the AdminUsagePerUser rows (both read run_usage_totals joined to non-chat
-// runs), which the handler test asserts.
+// Same shape as SelfUsage without the user filter; at the same snapshot and cutoff
+// this equals the SUM of AdminUsagePerUser rows (both read run_usage_totals joined
+// to non-chat runs). Separate handler reads may observe concurrent changes.
 // PRD #1332 M5A (D2): the factory-wide dollar sums carry subscription/unreported RUN COUNTS
 // for both windows, mirroring SelfUsage, so a partial dollar total can never read as
 // complete. M5A adds no public DTO field for the counts; M5B consumes them.

@@ -164,7 +164,8 @@ type AdminUserUsageDTO struct {
 }
 
 // AdminUsageDTO is the admin factory view: the factory-wide totals plus the
-// per-user breakdown. Each window's per-user aggregates sum to the corresponding factory window.
+// per-user breakdown. At the same snapshot and cutoff, each window's per-user
+// aggregates sum to its factory window; separate handler reads can observe concurrent changes.
 // The subscription/unreported run counts (PRD #1429 M1 / D7) ride here through its two
 // members: the windowed factory counts on Factory (a SelfUsageDTO) and the windowed per-user
 // counts on each Users row (AdminUserUsageDTO), so the admin dashboard shows the counts beside

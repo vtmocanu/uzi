@@ -3609,8 +3609,8 @@ export interface AdminUsageUser {
 }
 
 // AdminUsage is the factory-wide view (GET /api/admin/usage, admin-only): the
-// factory totals plus the per-user breakdown. The per-user rows sum to factory
-// lifetime by construction (the server rollup guarantees it).
+// factory totals plus the per-user breakdown. For the same snapshot and cutoff,
+// each window's per-user rows sum to its factory totals; separate reads may differ.
 export interface AdminUsage {
   factory: SelfUsage;
   users: AdminUsageUser[];

@@ -77,9 +77,21 @@ func TestAdminUsageSevenDayWindowsLiveDB(t *testing.T) {
 		if r.patch {
 			patch = "saved patch"
 		}
-		exec(`INSERT INTO runs (id,user_id,repo_id,issue_iid,issue_title,issue_description,kind,status,fail_origin,preserved_patch,created_at,finished_at)
-   VALUES ($1,$2,$3,$4,'t','d',$5,$6,$7,$8,now()-$9::interval,now())`,
-			ids[i], users[r.user], e.repoID, int64(243900+i), r.kind, r.status, origin, patch, r.age)
+		// Respect each kind's shape, so excluded kinds exercise the real queries.
+		var repo, iid, target, budget any = e.repoID, int64(243900 + i), nil, nil
+		harness, reportOnly := "claude", false
+		if r.kind == "chat" || r.kind == "judge" {
+			repo, iid = nil, nil
+		}
+		if r.kind == "judge" || r.kind == "cross_check" {
+			target = ids[0]
+		}
+		if r.kind == "cross_check" {
+			iid, harness, reportOnly, budget = nil, "codex", true, 60
+		}
+		exec(`INSERT INTO runs (id,user_id,repo_id,issue_iid,issue_title,issue_description,kind,status,fail_origin,preserved_patch,created_at,finished_at,target_run_id,harness,report_only,budget_wall_seconds)
+   VALUES ($1,$2,$3,$4,'t','d',$5,$6,$7,$8,now()-$9::interval,now(),$10,$11,$12,$13)`,
+			ids[i], users[r.user], repo, iid, r.kind, r.status, origin, patch, r.age, target, harness, reportOnly, budget)
 		if r.factor != 0 {
 			cost := int64(0)
 			if r.cost == "metered" {
