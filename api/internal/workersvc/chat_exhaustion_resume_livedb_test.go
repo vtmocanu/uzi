@@ -62,8 +62,21 @@ func TestChatExhaustionResumeLiveDB(t *testing.T) {
 							FailureReason: pgtype.Text{String: "worker requeue budget exhausted", Valid: true},
 							MaxRequeues:   1, FailCutoff: pgconv.Time(time.Now().Add(-time.Minute)),
 						})
-						if err != nil || len(rows) != 1 || rows[0].ID != id {
-							t.Fatalf("stale exhaustion rows=%v err=%v", rows, err)
+						if err != nil {
+							t.Fatalf("stale exhaustion: %v", err)
+						}
+						matches := 0
+						for _, row := range rows {
+							if row.ID != id {
+								continue
+							}
+							matches++
+							if row.Status != "recovery_wait" {
+								t.Fatalf("stale exhaustion run=%s status=%s, want recovery_wait", id, row.Status)
+							}
+						}
+						if matches != 1 {
+							t.Fatalf("stale exhaustion run=%s matches=%d, want 1", id, matches)
 						}
 						if err := tx.Commit(env.ctx); err != nil {
 							t.Fatal(err)

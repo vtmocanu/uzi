@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -50,6 +51,7 @@ func TestWorkerRecoveryResumeClaimEpisodesLiveDB(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=ANY($1::uuid[])", []uuid.UUID{oldWorker, worker}, []string{capability.RecoveryArchiveV1})
 			id := fx.queuedRun([]string{})
 			tip := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 			oldHold := uuid.New()
@@ -79,7 +81,8 @@ func TestWorkerRecoveryResumeClaimEpisodesLiveDB(t *testing.T) {
 				}
 				defer func() { _ = tx.Rollback(fx.ctx) }()
 				q := fx.q.WithTx(tx)
-				if _, err := q.GetWorkerForUpdate(fx.ctx, claimWorker); err != nil {
+				claimant, err := q.GetWorkerForUpdate(fx.ctx, claimWorker)
+				if err != nil {
 					t.Fatal(err)
 				}
 				now := time.Now()
@@ -90,6 +93,7 @@ func TestWorkerRecoveryResumeClaimEpisodesLiveDB(t *testing.T) {
 					HeartbeatCutoff: pgtype.Timestamptz{Time: now.Add(-45 * time.Second), Valid: true},
 					IsDockerWorker:  true, DockerRepoAllowlist: []uuid.UUID{fx.repoID},
 					RecoveryCapable: true, WorkerIdentity: "new incarnation",
+					WorkerProtocolCaps: claimant.ProtocolCapabilities,
 				})
 				if expectBlocked {
 					if !errors.Is(err, pgx.ErrNoRows) {

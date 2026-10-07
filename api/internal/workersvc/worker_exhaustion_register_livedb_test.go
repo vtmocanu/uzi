@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -45,7 +46,7 @@ func TestWorkerExhaustionRegisterSameIncarnationClaimLiveDB(t *testing.T) {
 					if attested {
 						snapshot = finalizeSnap(false, fin(run, 2))
 					}
-					registered, nonce, err := svc.Register(env.ctx, staleAuth, "fixture", "", nil, nil, nil, snapshot)
+					registered, nonce, err := svc.Register(env.ctx, staleAuth, "fixture", "", nil, nil, []string{capability.RecoveryArchiveV1}, snapshot)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -65,11 +66,12 @@ func TestWorkerExhaustionRegisterSameIncarnationClaimLiveDB(t *testing.T) {
 					}
 					defer func() { _ = tx.Rollback(env.ctx) }()
 					q := env.q.WithTx(tx)
-					if _, err = q.GetWorkerForUpdate(env.ctx, worker); err != nil {
+					claimant, err := q.GetWorkerForUpdate(env.ctx, worker)
+					if err != nil {
 						t.Fatal(err)
 					}
 					now := time.Now()
-					claimed, err := q.ClaimRun(env.ctx, store.ClaimRunParams{WorkerID: pgconv.UUID(worker), UserID: user, AffinityCutoff: pgconv.Time(now.Add(-2 * time.Hour)), SpreadCutoff: pgconv.Time(now.Add(-9 * time.Second)), HeartbeatCutoff: pgconv.Time(now.Add(-45 * time.Second)), IsDockerWorker: true, DockerRepoAllowlist: []uuid.UUID{repo}, RecoveryCapable: true, WorkerIdentity: "fixture"})
+					claimed, err := q.ClaimRun(env.ctx, store.ClaimRunParams{WorkerID: pgconv.UUID(worker), UserID: user, AffinityCutoff: pgconv.Time(now.Add(-2 * time.Hour)), SpreadCutoff: pgconv.Time(now.Add(-9 * time.Second)), HeartbeatCutoff: pgconv.Time(now.Add(-45 * time.Second)), IsDockerWorker: true, DockerRepoAllowlist: []uuid.UUID{repo}, RecoveryCapable: true, WorkerProtocolCaps: claimant.ProtocolCapabilities, WorkerIdentity: "fixture"})
 					if err != nil || claimed.ID != run {
 						t.Fatalf("fresh registered B blocked by released nonce: released=%v current=%q claim=%s err=%v", held.ReleasedWorkerNonce, nonce, claimed.ID, err)
 					}
