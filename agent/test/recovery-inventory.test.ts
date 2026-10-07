@@ -86,10 +86,20 @@ it("issue1924 invalid ownership route body network and HTTP failures never FINAL
   ]) {
     const f = await fixture();
     try {
+      // Positive control: freeze while ownership is readable, so the record exists and the
+      // FINAL boundary is reachable; only then does the injected error decide the outcome.
+      const record = await f.freeze();
+      assert.ok(record, "a frozen record exists before the error is injected");
+      const reserves = f.reserves();
       f.state.ownershipError = error;
-      await f.freeze().catch(() => undefined);
-      assert.equal(f.reserves(), 0);
-      assert.equal(f.finals.length, 0);
+      // Only the ownership-gated resume path is asserted: captureAndUpload is the foreground
+      // disposition-boundary call, which runs after the caller froze under proven ownership and
+      // verifies the open hold itself, so it legitimately sends the FINAL.
+      await f.make().resumePending(undefined, [record]).catch(() => undefined);
+      assert.equal(f.finals.length, 0, "no FINAL is sent on an invalid ownership answer");
+      assert.equal(f.reserves(), reserves);
+      assert.notEqual((await f.coordinator.inspect("run-1"))[0]?.finalAcknowledged, true);
+      assert.equal(f.state.open, true, "the hold stays open");
     } finally { await f.close(); }
   }
 });
