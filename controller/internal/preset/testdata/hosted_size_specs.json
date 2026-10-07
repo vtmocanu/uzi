@@ -12,8 +12,8 @@
       "name": "m",
       "cpu_request": "500m",
       "cpu_limit": "2",
-      "memory_request": "4Gi",
-      "memory_limit": "8Gi",
+      "memory_request": "8Gi",
+      "memory_limit": "12Gi",
       "data": "10Gi"
     },
     {

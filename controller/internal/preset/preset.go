@@ -48,14 +48,16 @@ import (
 // peak. Measured on the hosted cluster: an `l` worker's writable set peaked at ~7451Mi
 // (≈7.1 GiB) against its old 4Gi request — the captured eviction — with a web-ux median
 // of ~4.5 GiB; a non-web-ux `m` run peaks ~2.7 GiB, above the old 2Gi request. So `l` now
-// requested 8Gi (limit 12Gi), `m` 4Gi, and `s` 2Gi, each above its size's realistic peak,
+// requested 8Gi (limit 12Gi), `m` 4Gi (limit 8Gi), and `s` 2Gi, each above its size's realistic peak,
 // while every size stays Burstable.
 //
 // `l` was later raised to 14Gi request / 20Gi limit (issue #2127): a persistent `l`
 // worker running two concurrent runs was OOMKilled at the 12Gi limit when two
 // whole-program Go analyzers (deadcode and golangci-lint in `task gate:api`, each about
 // 7-7.5 GiB) overlapped. 14Gi covers two such peaks; 20Gi leaves headroom above them.
-// The maintainer accepted the reduced node placement capacity.
+// The maintainer accepted the reduced node placement capacity. `m` was raised the same
+// way, to 8Gi request / 12Gi limit (issue #2127): on 2026-10-03 a single run's `deadcode`
+// reached 7.3-7.5 GiB anon RSS at the old 8Gi limit and was OOMKilled twice.
 //
 // Owner decision (settled 2026-09-14) keeps all three Burstable. Guaranteed
 // (request==limit) was considered and dropped: it would strand a full memory limit per
@@ -133,8 +135,8 @@ var sizes = map[string]Size{
 	"m": {
 		CPURequest:    resource.MustParse("500m"),
 		CPULimit:      resource.MustParse("2"),
-		MemoryRequest: resource.MustParse("4Gi"),
-		MemoryLimit:   resource.MustParse("8Gi"),
+		MemoryRequest: resource.MustParse("8Gi"),
+		MemoryLimit:   resource.MustParse("12Gi"),
 		DataSize:      resource.MustParse("10Gi"),
 	},
 	"l": {

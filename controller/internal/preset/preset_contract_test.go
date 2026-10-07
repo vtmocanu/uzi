@@ -467,8 +467,8 @@ func TestEveryPresetRequestsMoreMemoryThanTheMeasuredAgentPeak(t *testing.T) {
 // captured. Measured on the hosted cluster (issue #1341): an `l` worker's writable set
 // peaked at ~7451Mi (≈7.1 GiB) against its old 4Gi request — the captured eviction — with
 // a web-ux median of ~4.5 GiB, while a non-web-ux `m` run peaks ~2.7 GiB. Issue #1341
-// recalibrated every request above its size's measured peak (`l` 8Gi at the time, `m` 4Gi, `s` 2Gi),
-// restoring the invariant; `l` was later raised to 14Gi (issue #2127).
+// recalibrated every request above its size's measured peak (`l` 8Gi and `m` 4Gi at the time, `s` 2Gi),
+// restoring the invariant; `l` and `m` were later raised to 14Gi and 8Gi (issue #2127).
 //
 // The thresholds are PER SIZE on purpose: a single global 7.1Gi floor would wrongly fail
 // `s` and `m`, which never carry an `l`'s multi-agent web-ux load. Each size is asserted
@@ -479,7 +479,7 @@ func TestEveryPresetRequestSitsAboveItsSizesMeasuredPeak(t *testing.T) {
 	// size -> {owner-approved request, that size's measured per-run peak from issue #1341}.
 	expected := map[string]struct{ request, peak string }{
 		"s": {request: "2Gi", peak: "676Mi"},   // the measured single-agent SDK peak
-		"m": {request: "4Gi", peak: "2764Mi"},  // ~2.7 GiB, a non-web-ux run's peak
+		"m": {request: "8Gi", peak: "2764Mi"},  // peak ~2.7 GiB, a non-web-ux run's (#1341); request 8Gi per #2127 (deadcode reached 7.3-7.5 GiB)
 		"l": {request: "14Gi", peak: "7451Mi"}, // peak ≈7.1 GiB, the #1341 captured eviction figure; request 14Gi per #2127 (two overlapping ~7.5 GiB Go analyzers)
 	}
 	if len(sizes) == 0 {
