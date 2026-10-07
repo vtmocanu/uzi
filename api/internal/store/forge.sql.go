@@ -12,6 +12,54 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const adminListDockerAllowlistRepos = `-- name: AdminListDockerAllowlistRepos :many
+SELECT r.id, r.path_with_namespace, r.enabled, u.email AS owner_email,
+       r.connection_id, fc.forge_type, fc.base_url
+FROM repos r
+JOIN forge_connections fc ON fc.id = r.connection_id
+JOIN users u ON u.id = fc.user_id
+WHERE r.enabled OR r.id = ANY($1::uuid[])
+ORDER BY u.email, r.path_with_namespace, r.connection_id, r.id
+`
+
+type AdminListDockerAllowlistReposRow struct {
+	ID                uuid.UUID `json:"id"`
+	PathWithNamespace string    `json:"path_with_namespace"`
+	Enabled           bool      `json:"enabled"`
+	OwnerEmail        string    `json:"owner_email"`
+	ConnectionID      uuid.UUID `json:"connection_id"`
+	ForgeType         string    `json:"forge_type"`
+	BaseUrl           string    `json:"base_url"`
+}
+
+func (q *Queries) AdminListDockerAllowlistRepos(ctx context.Context, dockerRepoAllowlist []uuid.UUID) ([]AdminListDockerAllowlistReposRow, error) {
+	rows, err := q.db.Query(ctx, adminListDockerAllowlistRepos, dockerRepoAllowlist)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AdminListDockerAllowlistReposRow{}
+	for rows.Next() {
+		var i AdminListDockerAllowlistReposRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.PathWithNamespace,
+			&i.Enabled,
+			&i.OwnerEmail,
+			&i.ConnectionID,
+			&i.ForgeType,
+			&i.BaseUrl,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const adminListReposWithPrivilege = `-- name: AdminListReposWithPrivilege :many
 SELECT r.id, r.path_with_namespace, r.enabled,
        r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,

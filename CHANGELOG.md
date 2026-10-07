@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Admins can discover repositories across owners for Docker trust ([#2432](https://github.com/vtmocanu/uzi/issues/2432)).**
+  The admin read API lists enabled repositories and disabled repositories retained by the effective Docker allowlist, with owner and forge connection identity so matching paths remain distinguishable.
+
 - **Checkpoint uploads hold remembered secret findings across current-flight publish paths ([#1964](https://github.com/vtmocanu/uzi/issues/1964)).**
   Park, shutdown, pause, recovery and completion-hold checkpoints now withhold publication while the current run remembers a live secret finding, including findings reachable through an overlay. Local captures remain available on that worker, with no new origin durability and a risk of loss if its disk is lost; a fresh pause whose checkpoint is withheld fails and the run continues. These paths still add no scans, and finding memory is lost on reclaim, so previously flagged local work can publish in a later unscanned run before another finding is recorded.
 

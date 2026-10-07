@@ -2,6 +2,7 @@ package settings
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,6 +60,24 @@ func TestValidateRepoAllowlistDoesNotFallThroughToLabelRules(t *testing.T) {
 		t.Fatal("Validate(docker_repo_allowlist, \"PRD\") = nil — the key fell through to " +
 			"ValidateLabel, so a non-UUID would be accepted and then silently read back as " +
 			"an empty (fail-closed) allowlist")
+	}
+}
+
+func TestDockerRepoAllowlistUUIDForms(t *testing.T) {
+	id := uuid.MustParse("abcdef01-2345-6789-abcd-ef0123456789")
+	for _, value := range []string{
+		strings.ToUpper(id.String()), strings.ReplaceAll(id.String(), "-", ""),
+		"{" + id.String() + "}", "urn:uuid:" + id.String(),
+	} {
+		t.Run(value, func(t *testing.T) {
+			if err := Validate(KeyDockerRepoAllowlist, value); err != nil {
+				t.Fatal(err)
+			}
+			got, err := New(&fakeStore{rows: []store.AppSetting{row(KeyDockerRepoAllowlist, value)}}, time.Minute).DockerRepoAllowlist(context.Background())
+			if err != nil || len(got) != 1 || got[0] != id {
+				t.Fatalf("identity = %v, %v; want %s", got, err, id)
+			}
+		})
 	}
 }
 

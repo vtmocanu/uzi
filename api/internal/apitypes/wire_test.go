@@ -1259,6 +1259,12 @@ func TestGuardrailImpactDTOTags(t *testing.T) {
 		"repo_id", "path", "user_id", "connection_id", "blocked", "unevaluable")
 }
 
+func TestAdminDockerAllowlistDTOTags(t *testing.T) {
+	assertTags(t, "AdminDockerAllowlistRepoDTO", AdminDockerAllowlistRepoDTO{},
+		"id", "path_with_namespace", "enabled", "owner_email", "connection_id", "forge_type", "base_url")
+	assertTags(t, "AdminDockerAllowlistReposDTO", AdminDockerAllowlistReposDTO{}, "repos")
+}
+
 func TestAdminBlockedReposDTOTags(t *testing.T) {
 	assertTags(t, "AdminBlockedReposDTO", AdminBlockedReposDTO{}, "repos", "checks_unknown",
 		// PRD #1432: the pending cross-user override-request queue, non-omitempty

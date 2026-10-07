@@ -653,6 +653,22 @@ export interface GuardrailOverrideRequest {
   created_at: string;
 }
 
+// Mirrors apitypes.AdminDockerAllowlistRepoDTO.
+export interface AdminDockerAllowlistRepo {
+  id: string;
+  path_with_namespace: string;
+  enabled: boolean;
+  owner_email: string;
+  connection_id: string;
+  forge_type: string;
+  base_url: string;
+}
+
+// GET /api/admin/docker-allowlist-repos always returns an array.
+export interface AdminDockerAllowlistRepos {
+  repos: AdminDockerAllowlistRepo[];
+}
+
 // AdminBlockedRepos is the GET /api/admin/blocked-repos envelope (PRD #66 M9). When
 // checks_unknown is true at least one connection was never privilege-checked, so an
 // empty list is "unknown", NOT "none blocked" (R1) — the page says so.
