@@ -32,9 +32,15 @@ type reworkForge struct {
 	comments []forge.MRComment
 	answers  map[int64]forge.AuthorEligibility // an id with no answer fails its lookup
 	lookups  atomic.Int64
+	// onList, when set, runs while ListMergeRequestComments is "fetching": it stands for a
+	// concurrent writer that changes the ledger during the listing.
+	onList func()
 }
 
 func (f *reworkForge) ListMergeRequestComments(context.Context, int64, int64) ([]forge.MRComment, error) {
+	if f.onList != nil {
+		f.onList()
+	}
 	return f.comments, nil
 }
 
@@ -200,5 +206,44 @@ func TestOnDemandReworkProceedsWithAnEligibleOnlySnapshotLiveDB(t *testing.T) {
 	}
 	if hw != 121 || len(pending) != 0 {
 		t.Fatalf("ledger high_water %d pending %v, want 121 and none (the unknown id is above the mark)", hw, pending)
+	}
+}
+
+// A concurrent writer stores pending id 170 while the on-demand request is listing the comments,
+// so the list lacks it (and holds a larger eligible id, 190). The ledger is read before the
+// listing, so 170 is absent from the row the request planned against and must survive the create.
+func TestOnDemandReworkLeavesAConcurrentlyStoredPendingIDAloneLiveDB(t *testing.T) {
+	rig := newReworkRig(t, &settingsStore{}, time.Minute)
+	rig.f.answers[11] = forge.AuthorEligible
+	q := store.New(rig.pool)
+	ctx := context.Background()
+	if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
+		RepoID: rig.repoID, Ref: reworkRef, HighWater: 150,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rig.f.onList = func() {
+		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
+			RepoID: rig.repoID, Ref: reworkRef, HighWater: 165, PendingAdd: []int64{170},
+		}); err != nil {
+			t.Error(err)
+		}
+	}
+	rig.f.comments = []forge.MRComment{rcomment(190, 11, "please rename the helper")}
+
+	rec := rig.post(t, `{}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status %d body %s, want 201", rec.Code, rec.Body.String())
+	}
+	var pending []int64
+	if err := rig.pool.QueryRow(ctx, `SELECT pending_unknown_ids FROM mr_rework_ledger WHERE repo_id = $1 AND ref = $2`, rig.repoID, reworkRef).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, id := range pending {
+		found = found || id == 170
+	}
+	if !found {
+		t.Fatalf("pending = %v, want 170 kept: the listing never saw it", pending)
 	}
 }

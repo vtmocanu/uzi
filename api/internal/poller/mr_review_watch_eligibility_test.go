@@ -612,7 +612,7 @@ func TestEvictionRunsNextToLedgerReconcile(t *testing.T) {
 // also holds a LARGER id (190): "absent and below the largest fetched id" cannot tell a gone
 // comment from one the list predates. The ledger is read before the listing, so 170 (absent from
 // the row this tick planned against) is never mistaken for gone.
-func TestStaleFetchLeavesNewerPendingIDAlone(t *testing.T) {
+func TestStaleFetchLeavesConcurrentlyStoredPendingIDAlone(t *testing.T) {
 	e := newEW(t)
 	e.st.ledgers = map[string]store.MrReworkLedger{
 		mrwRef: {RepoID: mrwRepoRow().ID, Ref: mrwRef, HighWater: 150},

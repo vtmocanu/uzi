@@ -307,7 +307,7 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	if !found {
 		return // unreachable while HasTrigger held; never fire an empty eligible snapshot
 	}
-	plan := res.Plan(led.HighWater, led.PendingUnknownIds)
+	plan := res.PlanAssessed()
 
 	// A pending id the snapshot caps evicted falls back to human review: drop it from the
 	// pending set now, even when no run is created below. Left pending it would keep HasTrigger
