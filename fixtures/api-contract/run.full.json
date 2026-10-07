@@ -21,6 +21,7 @@
   "issue_input_reason": "x",
   "plan_cross_check_required": true,
   "plan_cross_check_gate_reason": "x",
+  "plan_cross_check_diff_refusal": "x",
   "plan_cross_check_summary": {
     "round": 1,
     "verdict": "x",

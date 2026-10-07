@@ -83,6 +83,13 @@ func TestPlanCrossCheckGateReasonPersistedOutcomeLiveDB(t *testing.T) {
 			case "planning_diff_refused":
 				req.PlanCrossCheckDiffRefusal = "diff_too_large"
 			}
+			// The diff-refusal sub-code persists with the declaration, survives the
+			// retention replays, and outlives the reason once a revision clears it
+			// (the DTO masks it then; see TestRunToDTOPlanCrossCheckDiffRefusal).
+			wantSub := ""
+			if tc.declaration == "planning_diff_refused" {
+				wantSub = "diff_too_large"
+			}
 			report := func(want string) {
 				t.Helper()
 				_, applied, err := svc.SetState(env.ctx, worker, leadID, req)
@@ -95,6 +102,9 @@ func TestPlanCrossCheckGateReasonPersistedOutcomeLiveDB(t *testing.T) {
 				}
 				if got.PlanCrossCheckGateReason.Valid != (want != "") || got.PlanCrossCheckGateReason.String != want {
 					t.Fatalf("persisted gate reason=%+v, want %q", got.PlanCrossCheckGateReason, want)
+				}
+				if got.PlanCrossCheckDiffRefusal.String != wantSub || got.PlanCrossCheckDiffRefusal.Valid != (wantSub != "") {
+					t.Fatalf("persisted diff refusal=%+v, want %q (reason %q)", got.PlanCrossCheckDiffRefusal, wantSub, want)
 				}
 				if tc.repoCaps && !slices.Equal(got.RequiredCapabilities, []string{capability.Docker}) {
 					t.Fatalf("repository requirement lost: %v", got.RequiredCapabilities)

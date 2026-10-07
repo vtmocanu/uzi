@@ -2758,6 +2758,8 @@ export interface Run {
   plan_cross_check_required: boolean;
   /** Persisted forced-gate reason; optional for older server and mock responses. */
   plan_cross_check_gate_reason?: string | null;
+  /** Planning-diff refusal sub-code; set only while the gate reason is planning_diff_refused. */
+  plan_cross_check_diff_refusal?: string | null;
   /** Owner detail only. Historical findings describe an earlier plan. */
   plan_cross_check_summary?: PlanCrossCheckSummary;
   /** issue #857: what/how/who started the run (manual, autopilot, schedule,

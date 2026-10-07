@@ -194,6 +194,9 @@ type RunDTO struct {
 	// setting at creation. It remains true after the approval gate is decided.
 	PlanCrossCheckRequired   bool    `json:"plan_cross_check_required"`
 	PlanCrossCheckGateReason *string `json:"plan_cross_check_gate_reason"`
+	// PlanCrossCheckDiffRefusal is the planning-diff refusal sub-code. It is set only
+	// while PlanCrossCheckGateReason is planning_diff_refused; otherwise nil.
+	PlanCrossCheckDiffRefusal *string `json:"plan_cross_check_diff_refusal"`
 	// Detail-only, populated only for the authenticated owner; omitted on other surfaces.
 	PlanCrossCheckSummary *PlanCrossCheckSummaryDTO `json:"plan_cross_check_summary,omitempty"`
 	// TriggerSource records what/how/who started the run (issue #857): one of

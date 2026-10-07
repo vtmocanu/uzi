@@ -19,6 +19,7 @@
   "issue_input_reason": null,
   "plan_cross_check_required": false,
   "plan_cross_check_gate_reason": null,
+  "plan_cross_check_diff_refusal": null,
   "trigger_source": "",
   "milestones": null,
   "milestones_candidate": null,

@@ -2135,6 +2135,14 @@ UPDATE runs SET
                 ELSE COALESCE(sqlc.narg('plan_cross_check_gate_reason')::text,
                     CASE WHEN runs.plan_md IS NOT DISTINCT FROM @plan_md THEN plan_cross_check_gate_reason END) END
         ELSE 'interrupted' END,
+    -- #2410: the planning-diff refusal sub-code. The ELSE deliberately keeps the old
+    -- value: a retained planning_diff_refused reason (the approval-race and
+    -- no-cross-check retention branches above) keeps its sub-code. Readers mask the
+    -- column unless the current gate reason is planning_diff_refused.
+    plan_cross_check_diff_refusal = CASE
+        WHEN sqlc.narg('plan_cross_check_gate_reason')::text = 'planning_diff_refused'
+            THEN sqlc.narg('plan_cross_check_diff_refusal')::text
+        ELSE runs.plan_cross_check_diff_refusal END,
     status     = 'awaiting_approval',
     status_since = now(),
     plan_md    = @plan_md,

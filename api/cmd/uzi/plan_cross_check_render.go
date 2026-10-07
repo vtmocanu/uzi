@@ -20,7 +20,13 @@ func planCrossCheckRows(r apitypes.RunDTO) [][]string {
 	var rows [][]string
 	if r.Status == "awaiting_approval" && r.PlanCrossCheckRequired && r.PlanCrossCheckGateReason != nil {
 		if reason := crossCheckPlain(*r.PlanCrossCheckGateReason); strings.TrimSpace(reason) != "" {
-			rows = append(rows, []string{"PLAN_CROSS_CHECK", "plan cross-check: " + strings.ReplaceAll(reason, "_", " ")})
+			text := "plan cross-check: " + strings.ReplaceAll(reason, "_", " ")
+			if reason == "planning_diff_refused" && r.PlanCrossCheckDiffRefusal != nil {
+				if sub := crossCheckPlain(*r.PlanCrossCheckDiffRefusal); strings.TrimSpace(sub) != "" {
+					text += " (" + strings.ReplaceAll(sub, "_", " ") + ")"
+				}
+			}
+			rows = append(rows, []string{"PLAN_CROSS_CHECK", text})
 		}
 	}
 	s := r.PlanCrossCheckSummary

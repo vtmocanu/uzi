@@ -4334,9 +4334,10 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			return owned, false, ErrInvalidState
 		}
 		approvalParams := store.SetRunAwaitingApprovalParams{
-			PlanCrossCheckGateReason: pgconv.TextPtr(req.PlanCrossCheckGateReason),
-			ClaimGeneration:          pgconv.Int8Ptr(req.ClaimGeneration),
-			PlanMd:                   stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+			PlanCrossCheckGateReason:  pgconv.TextPtr(req.PlanCrossCheckGateReason),
+			PlanCrossCheckDiffRefusal: pgconv.TextOrNull(req.PlanCrossCheckDiffRefusal),
+			ClaimGeneration:           pgconv.Int8Ptr(req.ClaimGeneration),
+			PlanMd:                    stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			// Issue #1626: an interlocked run's FIRST plan-bearing report with no milestones is the
 			// explicit `[]` (planMilestonesParam), so the approve freeze builds a criteria:[]
 			// contract. `owned` predates this report's plan_md write, which is what lets

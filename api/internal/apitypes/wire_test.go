@@ -90,7 +90,7 @@ var runDTOKeys = []string{
 	"is_planning",
 	// PRD #122 M1: the FROZEN milestone list, always on the wire (nil ⇒ null ⇒ a run
 	// with no milestones, which is every pre-feature run).
-	"auto_approve", "plan_cross_check_required", "plan_cross_check_gate_reason",
+	"auto_approve", "plan_cross_check_required", "plan_cross_check_gate_reason", "plan_cross_check_diff_refusal",
 	// issue #857: the run's trigger provenance (what/how/who started it), NOT NULL
 	// (DEFAULT 'manual') so always on the wire.
 	"trigger_source",
