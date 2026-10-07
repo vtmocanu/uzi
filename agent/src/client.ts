@@ -97,7 +97,7 @@ export type ClaimResponse = ProtocolClaimResponse & { plan_cross_check_gate_reas
 export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunListItem = ProtocolWorkerRunListItem & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type PlanCrossCheckDiffRefusal = "base_unavailable" | "diff_failed" | "diff_too_large"
-  | "too_many_untracked" | "secret_detected" | "scan_failed";
+  | "too_many_untracked" | "secret_detected" | "scan_failed" | "unsupported_entry";
 export interface PlanCrossCheckCandidate {
   plan_md: string;
   milestones: unknown[];

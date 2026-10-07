@@ -165,6 +165,7 @@ import {
   MAX_OWED_CANDIDATES_PER_RUN,
   RemoteBranchAdvancedError,
   type PublicationFloor,
+  classifyPlanningCaptureError,
 } from "./git.js";
 import {
   buildCheckEnv,
@@ -9695,7 +9696,7 @@ export class RunRunner {
             } else {
               const captured = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, steering.lifecycleSignal(), runLog);
               if ("refusal" in captured) {
-                crossCheckReason = "plan cross-check: planning diff refused";
+                crossCheckReason = `plan cross-check: planning diff refused (${captured.refusal}: ${captured.diagnostic})`;
                 checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "planning_diff_refused",
                   plan_cross_check_diff_refusal: captured.refusal };
                 checkedHuman.onApplied = () => releaseStateBarrier?.();
@@ -14970,32 +14971,31 @@ export class RunRunner {
    *  autopilot short-circuit is unchanged and never returns a revise. */
   private async captureCheckedPlanningDiff(
     clonePath: string, baseCommit: string, signal: AbortSignal, runLog: Logger,
-  ): Promise<{ diff: string } | { refusal: PlanCrossCheckDiffRefusal }> {
-    if (!/^[a-f0-9]{40}$/.test(baseCommit)) return { refusal: "base_unavailable" };
+  ): Promise<{ diff: string } | { refusal: PlanCrossCheckDiffRefusal; diagnostic: string }> {
+    if (!/^[a-f0-9]{40}$/.test(baseCommit)) return { refusal: "base_unavailable", diagnostic: "base_invalid" };
     const scope = new AbortController();
     const ownerSignal = AbortSignal.any([signal, scope.signal]);
     const timer = setTimeout(() => scope.abort(), 60_000);
     const spawner = new TickSpawner({ signal: ownerSignal, log: runLog });
-    let result: { diff: string } | { refusal: PlanCrossCheckDiffRefusal };
+    let result: { diff: string } | { refusal: PlanCrossCheckDiffRefusal; diagnostic: string };
     try {
       result = await this.git.withBoundaryProcessSpawner(spawner.spawn, ownerSignal, async () => {
         let bytes: Buffer;
         try { bytes = await this.git.capturePlanningDiff(clonePath, baseCommit); }
         catch (error) {
           signal.throwIfAborted();
-          const message = errMessage(error);
-          return { refusal: /untracked path cap/.test(message) ? "too_many_untracked" :
-            /patch cap|exceeded 512 KiB|source cap|total source cap/.test(message) ? "diff_too_large" :
-              /base object|base commit|base must|ENOENT/.test(message) ? "base_unavailable" : "diff_failed" };
+          const classified = classifyPlanningCaptureError(errMessage(error));
+          // Fixed vocabularies only: never the raw stderr, stack or a file name.
+          return { refusal: classified.refusal, diagnostic: classified.diagnostic };
         }
-        if (bytes.length > 512 * 1024) return { refusal: "diff_too_large" };
+        if (bytes.length > 512 * 1024) return { refusal: "diff_too_large", diagnostic: "output_cap" };
         const diff = bytes.toString("utf8");
-        if (!Buffer.from(diff, "utf8").equals(bytes)) return { refusal: "diff_failed" };
+        if (!Buffer.from(diff, "utf8").equals(bytes)) return { refusal: "diff_failed", diagnostic: "non_utf8_output" };
         // Scan precisely the UTF-8 bytes that will be uploaded, never a lossy replacement.
         const scan = await this.git.scanPatchForSecrets(diff);
         signal.throwIfAborted();
-        if (!scan.trusted || ownerSignal.aborted) return { refusal: "scan_failed" };
-        if (scan.findings.length) return { refusal: "secret_detected" };
+        if (!scan.trusted || ownerSignal.aborted) return { refusal: "scan_failed", diagnostic: "scan_untrusted" };
+        if (scan.findings.length) return { refusal: "secret_detected", diagnostic: "secret_detected" };
         return { diff };
       });
     } finally {
@@ -15006,6 +15006,9 @@ export class RunRunner {
     signal.throwIfAborted();
     if (spawner.survivors().length)
       throw new Error("plan cross-check: trusted preparation process did not settle");
+    if ("refusal" in result) {
+      runLog.warn("plan cross-check: planning diff refused", { refusal: result.refusal, diagnostic: result.diagnostic });
+    }
     return result;
   }
 

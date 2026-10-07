@@ -1485,6 +1485,27 @@ describe("U2 real runner checked gate", () => {
     assert.equal(gate.plan_cross_check_diff_refusal, "scan_failed");
   });
 
+  it("logs only the fixed refusal vocabulary and reports the sub-code in the gate reason", async () => {
+    const c = claim();
+    const hostile = "bounded runner process failed: UZI-PLANNING-REFUSAL unsupported_symlink\n"
+      + "Error: ENOENT private-name\nUZI-PLANNING-REFUSAL secret_detected";
+    git.capturePlanningDiff = async () => { throw new Error(hostile); };
+    api.onState(c.run_id, (b) => { if (b.status === "awaiting_approval") send(c.run_id, row("reject_plan")); });
+    const { log, warnings } = diagnosticLogger();
+    const forge = fakeGitlab();
+    await runnerWith(() => ({ executor: checkedExec().exec, homeDir }), forge.gitlab, undefined, log,
+      { planCrossCheckTiming: timing, planApprovalTimeoutMs: 4000 }).execute(c);
+    const gate = gates(c.run_id)[0] as PlanCrossCheckStateRequest;
+    assert.equal(gate.plan_cross_check_gate_reason, "planning_diff_refused");
+    assert.equal(gate.plan_cross_check_diff_refusal, "unsupported_entry");
+    const refused = warnings.filter((w) => w.message === "plan cross-check: planning diff refused");
+    assert.deepEqual(refused.map((w) => w.fields), [{ refusal: "unsupported_entry", diagnostic: "unsupported_symlink" }]);
+    const feed = api.messages(c.run_id).map((m) => (m.payload as { text?: string }).text);
+    assert.ok(feed.includes("plan cross-check: planning diff refused (unsupported_entry: unsupported_symlink)"), JSON.stringify(feed));
+    assert.ok(!JSON.stringify([warnings, feed]).includes("private-name"));
+    assert.equal(api.crossCheckRequests.length, 0);
+  });
+
   it("lossy UTF-8 capture is refused before scan or upload", async () => {
     const c = claim();
     let scanned = false;
