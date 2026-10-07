@@ -102,7 +102,8 @@ function recordingSafety(): { safety: CodexExecutionSafety; spawns: BoundaryProc
         child.once("error", () => resolve({ code: -1 }));
         child.once("close", (code) => resolve({ code: code ?? 1 }));
       });
-      return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed };
+      const cancel = async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; };
+      return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, cancel, completed };
     },
     dispose: async () => ({ kind: "disposed" }),
   };
