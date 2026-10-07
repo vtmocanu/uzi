@@ -1227,8 +1227,95 @@ describe("m1 credential-free owner cancel", () => {
     }
   });
 
+  for (const change of ["unchanged-raw-target", "equal-length-target", "link-to-file", "link-to-directory",
+    "file-to-link", "parent-link", "readlink-failure"] as const)
+    it(`real cancel reader ${change}`, { skip: process.platform !== "linux" }, async () => {
+      const fx = makeFixture();
+      const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
+      const name = "nested/deeper/link";
+      const leaf = path.join(fx.originPath, name);
+      const target = Buffer.concat([Buffer.from("../../../absent-"), Buffer.from([0xff])]);
+      let helperCalls = 0;
+      let helperStderr = "";
+      try {
+        await fs.mkdir(path.dirname(leaf), { recursive: true });
+        if (change === "file-to-link") await fs.writeFile(leaf, "regular blob");
+        else await fs.symlink(target, leaf);
+        const originGit = (...args: string[]) => {
+          const result = spawnSync("git", ["-C", fx.originPath, ...args], { env: gitEnv(), encoding: "utf8" });
+          assert.equal(result.status, 0, result.stderr);
+          return result.stdout.trim();
+        };
+        originGit("add", name);
+        originGit("commit", "-m", "seed reader fixture");
+        const head = originGit("rev-parse", "HEAD");
+        const bare = path.join(fx.dataDir, "reader-bare.git");
+        const cloned = spawnSync("git", ["clone", "--bare", fx.originPath, bare], { env: gitEnv(), encoding: "utf8" });
+        assert.equal(cloned.status, 0, cloned.stderr);
+        assert.equal(originGit("status", "--porcelain"), "", "metadata is clean before reader invocation");
+        const result = await git.withBoundaryProcessSpawner(async request => {
+          const argv = [...request.argv];
+          const isHelper = argv[0] === process.execPath && argv[1] === "-e";
+          if (isHelper) {
+            helperCalls++;
+            // Mutate only after the real Git metadata/status observations succeeded.
+            // Each fixture gets one reader invocation; failures do not retry.
+            if (change === "equal-length-target") {
+              await fs.unlink(leaf);
+              const changed = Buffer.from(target);
+              changed[changed.length - 1] = 0xfe;
+              assert.equal(changed.length, target.length);
+              await fs.symlink(changed, leaf);
+            } else if (change === "link-to-file" || change === "link-to-directory" || change === "file-to-link") {
+              await fs.unlink(leaf);
+              if (change === "link-to-file") await fs.writeFile(leaf, target);
+              else if (change === "link-to-directory") await fs.mkdir(leaf);
+              else await fs.symlink("regular blob", leaf);
+            } else if (change === "parent-link") {
+              const parent = path.dirname(leaf);
+              await fs.rename(parent, parent + "-saved");
+              await fs.symlink("deeper-saved", parent);
+            } else if (change === "readlink-failure") {
+              // Permission changes cannot reliably deny readlink. This child-local wrapper
+              // deterministically fails that syscall without altering the production reader.
+              argv[2] = 'require("node:fs").readlinkSync = () => { process.stderr.write("readlink attempted\\n"); throw Error("fixture readlink failure"); };\n' + argv[2];
+            }
+          }
+          const child = spawn(argv[0]!, argv.slice(1), { cwd: request.cwd, env: request.env, stdio: "pipe" });
+          if (isHelper) child.stderr.on("data", chunk => { helperStderr += chunk.toString(); });
+          const completed = new Promise<{ code: number }>((resolve, reject) => {
+            const timer = setTimeout(() => child.kill("SIGKILL"), request.timeoutMs ?? 30000);
+            child.once("error", error => { clearTimeout(timer); reject(error); });
+            child.once("close", code => { clearTimeout(timer); resolve({ code: code ?? -1 }); });
+          });
+          return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed,
+            cancel: async () => { child.kill("SIGKILL"); await completed; } };
+        }, new AbortController().signal, () => git.credentialFreeCancelCleanHead(fx.originPath, bare, head));
+        assert.equal(helperCalls, 1, "actual inline reader invoked after clean metadata/status");
+        assert.equal(result, change === "unchanged-raw-target" ? head : null);
+        if (change === "readlink-failure") assert.equal(helperStderr, "readlink attempted\n");
+        const retainedLeaf = change === "parent-link" ? path.dirname(leaf) + "-saved/link" : leaf;
+        const retained = await fs.lstat(retainedLeaf);
+        if (change === "link-to-file") {
+          assert.equal(retained.isFile(), true);
+          assert.deepEqual(await fs.readFile(leaf), target, "replacement file bytes retained");
+        } else if (change === "link-to-directory") assert.equal(retained.isDirectory(), true);
+        else {
+          assert.equal(retained.isSymbolicLink(), true);
+          const expected = change === "file-to-link" ? Buffer.from("regular blob") : Buffer.from(target);
+          if (change === "equal-length-target") expected[expected.length - 1] = 0xfe;
+          assert.deepEqual(await fs.readlink(retainedLeaf, { encoding: "buffer" }), expected, "raw target bytes retained");
+        }
+        if (change === "parent-link") {
+          assert.equal((await fs.lstat(path.dirname(leaf))).isSymbolicLink(), true);
+          assert.equal(await fs.readlink(path.dirname(leaf)), "deeper-saved");
+        }
+      } finally { fx.cleanup(); }
+    });
+
   const cases = [
-    ...["clean", "dirty", "untracked", "committed", "replace", "forged-stat", "lossy-path", "hidden", "assume", "skip", "filter"].map(work => ({ work })),
+    ...["clean", "dirty", "untracked", "committed", "replace", "forged-stat", "lossy-path", "hidden", "assume", "skip", "filter",
+      "symlink-dangling", "symlink-outside", "symlink-changed", "symlink-file"].map(work => ({ work })),
     ...["wrong", "missing", "retained", "error"].map(release => ({ work: "clean", release })),
     ...["survivors", "unverified", "new-writer"].map(process => ({ work: "clean", process })),
     { work: "clean", docker: "docker_error" },
@@ -1250,7 +1337,7 @@ describe("m1 credential-free owner cancel", () => {
     it(`actual runner owner cancel ${JSON.stringify(scenario)}`, async () => {
       const { work } = scenario;
       // The bounded descriptor reader conservatively refuses unsupported platforms.
-      const shouldRelease = process.platform === "linux" && work === "clean" && !scenario.release && !scenario.process &&
+      const shouldRelease = process.platform === "linux" && ["clean", "symlink-dangling", "symlink-outside"].includes(work) && !scenario.release && !scenario.process &&
         !scenario.trust && !scenario.inspect && !scenario.drain;
       const api = new FakeApi("cancel-worker");
       const url = await api.listen();
@@ -1262,6 +1349,16 @@ describe("m1 credential-free owner cancel", () => {
         await fs.writeFile(rawPath(fx.originPath), "same initial bytes\n");
         await fs.writeFile(path.join(fx.originPath, twinName), "same initial bytes\n");
         for (const args of [["add", "."], ["commit", "-m", "seed distinct raw paths"]]) {
+          const result = spawnSync("git", ["-C", fx.originPath, ...args], { env: gitEnv(), encoding: "utf8" });
+          assert.equal(result.status, 0, result.stderr);
+        }
+      }
+      const linkName = "nested/deeper/link";
+      const linkTarget = work === "symlink-outside" ? fx.originPath + "/README.md" : "../../../absent-target-a";
+      if (work.startsWith("symlink-")) {
+        await fs.mkdir(path.join(fx.originPath, "nested/deeper"), { recursive: true });
+        await fs.symlink(linkTarget, path.join(fx.originPath, linkName));
+        for (const args of [["add", linkName], ["commit", "-m", "seed nested link"]]) {
           const result = spawnSync("git", ["-C", fx.originPath, ...args], { env: gitEnv(), encoding: "utf8" });
           assert.equal(result.status, 0, result.stderr);
         }
@@ -1383,6 +1480,14 @@ describe("m1 credential-free owner cancel", () => {
         assert.equal(await git.anchorRecoveryHead(bare, claim.run_id, 8, startHead), true);
         assert.equal(await git.anchorRecoveryHead(bare, claim.run_id, 7, startHead), true);
         if (scenario.inspect === "head") await fs.rename(path.join(clone, ".git", "HEAD"), path.join(clone, ".git", "HEAD-unreadable"));
+        if (work === "symlink-changed" || work === "symlink-file") {
+          await fs.unlink(path.join(clone, linkName));
+          if (work === "symlink-changed") {
+            const changedTarget = "../../../absent-target-b";
+            assert.equal(Buffer.byteLength(changedTarget), Buffer.byteLength(linkTarget));
+            await fs.symlink(changedTarget, path.join(clone, linkName));
+          } else await fs.writeFile(path.join(clone, linkName), "replacement file bytes");
+        }
         if (work === "dirty") await fs.appendFile(path.join(clone, "README.md"), "changed");
         if (work === "untracked" || work === "hidden") await fs.writeFile(path.join(clone, "NEW.txt"), "unpublished");
         if (work === "hidden") gitInClone("config", "status.showUntrackedFiles", "no");
@@ -1488,6 +1593,18 @@ describe("m1 credential-free owner cancel", () => {
         if (shouldRelease) assert.deepEqual(releases[0], [claim.run_id, 7]);
         else {
           assert.equal((await fs.stat(clone)).isDirectory(), true, "source retained");
+          if (work.startsWith("symlink-")) {
+            const leaf = path.join(clone, linkName);
+            const retained = await fs.lstat(leaf);
+            if (work === "symlink-file") {
+              assert.equal(retained.isFile(), true, "replacement remains a regular file");
+              assert.equal(await fs.readFile(leaf, "utf8"), "replacement file bytes");
+            } else {
+              assert.equal(retained.isSymbolicLink(), true, "retained leaf remains a symlink");
+              assert.deepEqual(await fs.readlink(leaf, { encoding: "buffer" }),
+                Buffer.from(work === "symlink-changed" ? "../../../absent-target-b" : linkTarget));
+            }
+          }
           for (const [name, bytes] of beforeCancel) assert.deepEqual(await fs.readFile(path.join(clone, name)), bytes, `${name} bytes retained exactly`);
           if (rawBeforeCancel !== undefined) {
             assert.ok((await fs.readdir(clone, { encoding: "buffer" })).some(name => name.equals(rawName)), "raw filename retained exactly");

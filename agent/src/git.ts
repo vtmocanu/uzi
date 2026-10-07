@@ -5082,8 +5082,9 @@ export class GitCache {
   /**
    * Owner-cancel inspection only. Clone observations run as the runner uid without optional
    * locks. Status is only a metadata/untracked check: a separate runner-identity reader
-   * hashes actual regular-file bytes against the trusted bare starting tree, never the
-   * clone's index or object store. Unsupported types/platforms and budgets retain custody.
+   * hashes regular-file bytes and raw symlink target bytes against the trusted bare starting
+   * tree, never following targets or trusting the clone's index or object store.
+   * Unsupported types/platforms and budgets retain custody.
    * Ignored files retain ordinary status semantics.
    */
   async credentialFreeCancelCleanHead(cwd: string, barePath: string, trustedStart: string): Promise<string | null> {
@@ -5113,7 +5114,7 @@ export class GitCache {
       let total = 0;
       for (const entry of tree.stdout.split("\0")) {
         if (!entry) continue;
-        const match = /^(100644|100755) blob ([0-9a-f]{40}) +([0-9]+)\t([\s\S]+)$/.exec(entry);
+        const match = /^(100644|100755|120000) blob ([0-9a-f]{40}) +([0-9]+)\t([\s\S]+)$/.exec(entry);
         if (!match) return null;
         // execScoped decodes UTF-8. Refuse replacement characters so distinct raw
         // Git paths cannot collapse to the same runner-reader path.
@@ -7563,8 +7564,9 @@ export class GitCache {
   }
 }
 
-// Trusted cancel reader: Linux pinned descriptors, no Git, config, filters or writes.
-// One failed path aborts the proof. At most 20,000 files, depth 64, 4 MiB/file,
+// Trusted cancel reader: Linux pinned parents, regular-file descriptors and raw readlink
+// bytes; no target traversal, Git, config, filters or writes. One failed path aborts
+// the proof. At most 20,000 entries, depth 64, 4 MiB/entry,
 // 128 MiB total; synchronous reads check a 28s deadline, execScoped caps at 30s.
 const CANCEL_CONTENT_HELPER = String.raw`
 const fs = require("node:fs");
@@ -7605,7 +7607,7 @@ try {
   if (!Array.isArray(manifest) || manifest.length > 20000) throw Error("path cap");
   for (const [name, mode, oid, size] of manifest) {
     check();
-    if (!["100644", "100755"].includes(mode) || !/^[0-9a-f]{40}$/.test(oid) ||
+    if (!["100644", "100755", "120000"].includes(mode) || !/^[0-9a-f]{40}$/.test(oid) ||
         !Number.isSafeInteger(size) || size < 0 || size > 4 * 1024 * 1024) throw Error("unsupported entry");
     total += size;
     if (total > 128 * 1024 * 1024) throw Error("aggregate cap");
@@ -7617,6 +7619,19 @@ try {
         if (!fs.fstatSync(next).isDirectory()) throw Error("non-directory ancestor");
         if (parent !== dir) close(parent);
         parent = next;
+      }
+      if (mode === "120000") {
+        const leaf = fp(parent) + "/" + components.at(-1);
+        const before = fs.lstatSync(leaf, { bigint: true });
+        if (!before.isSymbolicLink() || before.size !== BigInt(size)) throw Error("link type/size");
+        const target = fs.readlinkSync(leaf, { encoding: "buffer" });
+        check();
+        const after = fs.lstatSync(leaf, { bigint: true });
+        if (target.length !== size ||
+            createHash("sha1").update("blob " + size + "\0").update(target).digest("hex") !== oid ||
+            ["dev", "ino", "size", "mode", "mtimeNs", "ctimeNs"].some(k => before[k] !== after[k]))
+          throw Error("content mismatch or unstable link");
+        continue;
       }
       const fd = open(fp(parent) + "/" + components.at(-1), C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
       try {
