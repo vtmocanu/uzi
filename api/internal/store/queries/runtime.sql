@@ -5667,8 +5667,9 @@ ORDER BY runs.id
 FOR UPDATE OF runs;
 
 -- name: failRunsOfStaleWorkersOverCapLocked :many
--- A stale worker's non-terminal run that has already used its re-queue budget →
--- failed instead of re-queued. Stamps move_pending_since (reconcile restores the
+-- A stale worker's non-terminal run that has already used its episode re-queue budget, and that
+-- the #2394 disposition did not hold for the owner (no recorded recovery evidence or unresolved
+-- custody), is failed instead of re-queued. Stamps move_pending_since (reconcile restores the
 -- origin column; the sweep itself never touches the forge — worker-loss recovery
 -- must not wait on a down forge).
 --
@@ -5996,7 +5997,9 @@ FOR UPDATE OF runs;
 
 -- name: failWorkerRunsOverCapLocked :many
 -- On register a worker declares a fresh start, so any run it still holds is
--- orphaned (its execution is gone). Over its re-queue budget → failed. failed →
+-- orphaned (its execution is gone). Over its episode re-queue budget the #2394 disposition holds
+-- it for the owner when recovery evidence or unresolved custody is recorded; otherwise this
+-- writer fails it. failed →
 -- origin restore, applied by the reconcile loop (register does no forge I/O), so
 -- it stamps move_pending_since. RETURNING id so the caller can funnel these
 -- committed-terminal (worker-lost) runs into the judge (PRD #46 Decision 2), exactly
@@ -6702,7 +6705,7 @@ FOR UPDATE OF runs;
 -- plan candidates, completion/follow-up identity) survived the stale requeue untouched (fact 4),
 -- so the gate is restored by status alone. The queued interval is banked into budget_paused_seconds
 -- only for the two approval/input phases (as the stale requeue did for the park). The requeue
--- refund (requeue_count - 1, floored at 0) fires ONLY when stale_requeue_generation = claim_generation
+-- refund (requeue_count - 1, floored at requeue_episode_baseline) fires ONLY when stale_requeue_generation = claim_generation
 -- (D2: the stale requeue charged THIS exact generation); a NULL/mismatched provenance never refunds.
 -- stale_requeue_generation is cleared after. claim_released_at IS NULL is #1247's fence (a run the
 -- credential switch released must not be revived). Held-state content columns are UNTOUCHED here.
