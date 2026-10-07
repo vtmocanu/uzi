@@ -60,14 +60,14 @@ func TestPlanCrossCheckChildBeforeParentBatchLiveDB(t *testing.T) {
 			if lead.Status != "queued" {
 				t.Fatalf("lead=%s want queued", lead.Status)
 			}
-			credit := assertPlanCrossCheckSettled(ctx, t, f, fx.checkerID, 17)
+			credit := assertPlanCrossCheckSettled(ctx, t, f, fx.checkerID, 17, "superseded")
 			if err := requeuePlanCrossCheckBatch(ctx, f.q, f, path); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := f.q.SupersedeExitedPlanCrossChecks(ctx); err != nil {
 				t.Fatal(err)
 			}
-			if again := assertPlanCrossCheckSettled(ctx, t, f, fx.checkerID, 17); again != credit {
+			if again := assertPlanCrossCheckSettled(ctx, t, f, fx.checkerID, 17, "superseded"); again != credit {
 				t.Fatalf("double credit: %d -> %d", credit, again)
 			}
 		})

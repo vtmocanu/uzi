@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -14,6 +15,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -21,6 +24,7 @@ import (
 var ErrCrossCheckRefused = errors.New("plan cross-check refused")
 var ErrCrossCheckInterrupted = fmt.Errorf("%w: interrupted", ErrCrossCheckRefused)
 var ErrCrossCheckNoRow = fmt.Errorf("%w: no candidate", ErrCrossCheckRefused)
+var ErrCrossCheckRevisionsExhausted = fmt.Errorf("%w: revisions exhausted", ErrCrossCheckRefused)
 var ErrCrossCheckUnavailable = fmt.Errorf("%w: checker unavailable", ErrCrossCheckRefused)
 
 // PlanCrossCheckCandidate contains only the fields the checker approves. The caller
@@ -57,7 +61,17 @@ func (c PlanCrossCheckCandidate) Digest() ([]byte, error) {
 	return sum[:], nil
 }
 
-func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64, candidate PlanCrossCheckCandidate) (store.CrossCheck, error) {
+func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64, candidate PlanCrossCheckCandidate, requestedRounds ...int32) (store.CrossCheck, error) {
+	round := int32(1)
+	if len(requestedRounds) > 1 {
+		return store.CrossCheck{}, ErrCrossCheckRefused
+	}
+	if len(requestedRounds) == 1 {
+		round = requestedRounds[0]
+	}
+	if round < 1 || round > config.MaxPlanCrossCheckMaxRevisions+1 {
+		return store.CrossCheck{}, ErrCrossCheckRefused
+	}
 	lead, err := s.runOwnedByWorker(ctx, leadID, worker)
 	if err != nil {
 		return store.CrossCheck{}, ErrCrossCheckRefused
@@ -115,7 +129,7 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 		validateCrossCheckContext(locked.IssueTitle, locked.IssueDescription) != nil {
 		return store.CrossCheck{}, ErrCrossCheckRefused
 	}
-	prior, err := retryQ.GetPlanCrossCheck(ctx, leadID)
+	prior, err := retryQ.GetExactPlanCrossCheck(ctx, store.GetExactPlanCrossCheckParams{LeadRunID: leadID, Round: round})
 	if err == nil {
 		if prior.LeadClaimGeneration != generation || !bytes.Equal(prior.CandidateDigest, digest) {
 			return store.CrossCheck{}, ErrCrossCheckInterrupted
@@ -125,12 +139,18 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 		}
 		return prior, nil
 	}
+
 	if !errors.Is(err, pgx.ErrNoRows) {
+		return store.CrossCheck{}, err
+	}
+	_, _, err = s.preparePlanCrossCheckRound(ctx, retryQ, locked, worker, round)
+	if err != nil {
 		return store.CrossCheck{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.CrossCheck{}, err
 	}
+
 	timeout := s.p.PlanCrossCheckTimeout
 	if timeout == 0 {
 		timeout = 30 * time.Minute
@@ -167,7 +187,7 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 			validateCrossCheckContext(locked.IssueTitle, locked.IssueDescription) != nil {
 			return store.Run{}, ErrCrossCheckRefused
 		}
-		prior, e := txq.GetPlanCrossCheck(ctx, leadID)
+		prior, e := txq.GetExactPlanCrossCheck(ctx, store.GetExactPlanCrossCheckParams{LeadRunID: leadID, Round: round})
 		if e == nil {
 			if prior.LeadClaimGeneration != generation || !bytes.Equal(prior.CandidateDigest, digest) {
 				return store.Run{}, ErrCrossCheckInterrupted
@@ -176,6 +196,10 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 			return store.Run{}, errRetry
 		}
 		if !errors.Is(e, pgx.ErrNoRows) {
+			return store.Run{}, e
+		}
+		enabled, limit, e := s.preparePlanCrossCheckRound(ctx, txq, locked, worker, round)
+		if e != nil {
 			return store.Run{}, e
 		}
 		if resolved.Harness != HarnessCodex {
@@ -189,7 +213,7 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 			return store.Run{}, e
 		}
 		existing, e = txq.InsertPlanCrossCheck(ctx, store.InsertPlanCrossCheckParams{
-			LeadRunID: leadID, LeadClaimGeneration: generation, PlanMd: pgtype.Text{String: candidate.PlanMd, Valid: true},
+			LeadRunID: leadID, LeadClaimGeneration: generation, Round: round, AutomaticRoundsEnabled: enabled, AutomaticRevisionLimit: limit, PlanMd: pgtype.Text{String: candidate.PlanMd, Valid: true},
 			Milestones: candidate.Milestones, RequiredCapabilities: candidate.RequiredCapabilities, RequiredTools: candidate.RequiredTools,
 			SizeClass: pgtype.Text{String: candidate.SizeClass, Valid: true}, BaseCommit: pgtype.Text{String: candidate.BaseCommit, Valid: true},
 			PlanningDiff: pgtype.Text{String: candidate.PlanningDiff, Valid: true}, CandidateDigest: digest,
@@ -218,7 +242,7 @@ func (s *Service) PlanCrossCheckStatus(ctx context.Context, worker store.Worker,
 }
 
 func (s *Service) planCrossCheckStatus(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64, round int32, result *PlanCrossCheckStatusResult) (store.CrossCheck, int32, error) {
-	if round != 1 || s.txBeginner == nil {
+	if round < 1 || round > config.MaxPlanCrossCheckMaxRevisions+1 || s.txBeginner == nil {
 		return store.CrossCheck{}, 0, ErrCrossCheckRefused
 	}
 	tx, err := s.txBeginner.Begin(ctx)
@@ -286,8 +310,10 @@ func (s *Service) planCrossCheckStatus(ctx context.Context, worker store.Worker,
 	if err != nil && !noRow {
 		return cc, 0, err
 	}
-	if !noRow && cc.LeadClaimGeneration != generation {
-		// This response is historical human presentation, never an approval.
+	if !noRow && cc.LeadClaimGeneration != generation && cc.Verdict != "block" &&
+		(cc.Verdict != "failed" || cc.ReasonClass.String == "superseded" || cc.ReasonClass.String == "approved_not_stored") {
+		// Stale approval and recoverable evidence confer no current approval.
+		// Decided BLOCK and checker failures retain their recorded fallback.
 		cc.Verdict = "failed"
 		cc.ReasonClass = pgtype.Text{String: "interrupted", Valid: true}
 	}
@@ -383,7 +409,7 @@ func appendPlanCrossCheckEvent(ctx context.Context, q *store.Queries, lead store
 		id := uuid.UUID(cc.CheckerRunID.Bytes)
 		childID = &id
 	}
-	payload, err := json.Marshal(map[string]any{"stage": "plan", "verdict": cc.Verdict, "reason_class": cc.ReasonClass.String, "findings": json.RawMessage(cc.Findings), "checker_run_id": childID, "findings_author": author})
+	payload, err := json.Marshal(map[string]any{"stage": "plan", "round": cc.Round, "candidate_generation": cc.LeadClaimGeneration, "verdict": cc.Verdict, "reason_class": cc.ReasonClass.String, "findings": json.RawMessage(cc.Findings), "checker_run_id": childID, "findings_author": author})
 	if err != nil {
 		return 0, nil, err
 	}
@@ -425,4 +451,143 @@ func appendPlanCrossCheckEvent(ctx context.Context, q *store.Queries, lead store
 		return 0, nil, ErrCrossCheckRefused
 	}
 	return seq, payload, nil
+}
+
+// preparePlanCrossCheckRound runs under the owning lead lock, before and after
+// credential resolution. Only exact-round retries bypass fresh-round admission.
+func (s *Service) preparePlanCrossCheckRound(ctx context.Context, q *store.Queries, lead store.Run, worker store.Worker, round int32) (bool, int32, error) {
+	caps, err := q.GetPlanCrossCheckClaimingWorkerCaps(ctx, store.GetPlanCrossCheckClaimingWorkerCapsParams{LeadRunID: lead.ID, WorkerID: worker.ID, UserID: worker.UserID, ClaimGeneration: lead.ClaimGeneration})
+	if err != nil {
+		return false, 0, ErrCrossCheckRefused
+	}
+	capable := slices.Contains(caps, capability.CrossCheckRoundsV1)
+	prior, err := q.GetPlanCrossCheck(ctx, lead.ID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if round != 1 || lead.PlanMd.Valid || lead.GateRevision > 0 {
+			return false, 0, ErrCrossCheckRefused
+		}
+		limit := s.p.PlanCrossCheckMaxRevisions
+		if limit < 0 || limit > config.MaxPlanCrossCheckMaxRevisions {
+			return false, 0, ErrCrossCheckRefused
+		}
+		if !capable {
+			limit = 0
+		}
+		return capable, limit, nil
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	if prior.AutomaticRoundsEnabled && prior.Verdict == "approve" && prior.LeadClaimGeneration != lead.ClaimGeneration && !lead.PlanMd.Valid && lead.GateRevision == 0 {
+		prior, err = q.SupersedeUnstoredPlanApproval(ctx, lead.ID)
+		if err != nil {
+			return false, 0, err
+		}
+	}
+	if round != prior.Round+1 || !capable || !prior.AutomaticRoundsEnabled ||
+		lead.PlanMd.Valid || lead.GateRevision > 0 || !eligibleAutomaticPlanRound(prior) {
+		return false, 0, ErrCrossCheckInterrupted
+	}
+	if prior.Round >= prior.AutomaticRevisionLimit+1 {
+		return false, 0, ErrCrossCheckRevisionsExhausted
+	}
+	return prior.AutomaticRoundsEnabled, prior.AutomaticRevisionLimit, nil
+}
+
+func eligibleAutomaticPlanRound(cc store.CrossCheck) bool {
+	switch cc.Verdict {
+	case "revise":
+		return true
+	case "failed":
+		return cc.DecidedAt.Valid && cc.DeadlineAt.Valid && cc.DecidedAt.Time.Before(cc.DeadlineAt.Time) &&
+			(cc.ReasonClass.String == "superseded" || cc.ReasonClass.String == "approved_not_stored")
+	}
+	return false
+}
+
+// PlanCrossCheckLatestMetadata has no candidate, findings or approval proof.
+type PlanCrossCheckLatestMetadata struct {
+	Result                 string `json:"result"`
+	Round                  int32  `json:"round"`
+	CandidateGeneration    int64  `json:"candidate_generation"`
+	AutomaticRevisionLimit int32  `json:"automatic_revision_limit"`
+	AutomaticRoundsEnabled bool   `json:"automatic_rounds_enabled"`
+	NextRound              *int32 `json:"next_round"`
+	NextRoundEligible      bool   `json:"next_round_eligible"`
+	FallbackReason         string `json:"fallback_reason"`
+}
+
+// LatestPlanCrossCheck is side-effect-free, including for expired or old claims.
+func (s *Service) LatestPlanCrossCheck(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64) (PlanCrossCheckLatestMetadata, error) {
+	lead, err := s.runOwnedByWorker(ctx, leadID, worker)
+	if err != nil || lead.UserID != worker.UserID || lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid ||
+		!lead.PlanCrossCheckRequired || (lead.Status != "claimed" && lead.Status != "running" && lead.Status != "awaiting_approval") {
+		return PlanCrossCheckLatestMetadata{}, ErrCrossCheckRefused
+	}
+	q, ok := s.q.(interface {
+		GetPlanCrossCheckMetadata(context.Context, uuid.UUID) (store.GetPlanCrossCheckMetadataRow, error)
+		GetPlanCrossCheckClaimingWorkerCaps(context.Context, store.GetPlanCrossCheckClaimingWorkerCapsParams) ([]string, error)
+	})
+	if !ok {
+		return PlanCrossCheckLatestMetadata{}, ErrCrossCheckRefused
+	}
+	caps, err := q.GetPlanCrossCheckClaimingWorkerCaps(ctx, store.GetPlanCrossCheckClaimingWorkerCapsParams{LeadRunID: leadID, WorkerID: worker.ID, UserID: worker.UserID, ClaimGeneration: generation})
+	if err != nil {
+		return PlanCrossCheckLatestMetadata{}, ErrCrossCheckRefused
+	}
+	row, err := q.GetPlanCrossCheckMetadata(ctx, leadID)
+	result := PlanCrossCheckLatestMetadata{Result: "no_row"}
+	if errors.Is(err, pgx.ErrNoRows) {
+		if lead.AutoApprove && lead.Harness == string(HarnessClaude) && lead.Status != "awaiting_approval" && !lead.PlanMd.Valid && lead.GateRevision == 0 {
+			next := int32(1)
+			result.NextRound = &next
+			result.NextRoundEligible = true
+		}
+		return result, nil
+	}
+	if err != nil {
+		return result, err
+	}
+	result.Result = "latest"
+	result.Round = row.Round
+	result.CandidateGeneration = row.LeadClaimGeneration
+	result.AutomaticRevisionLimit = row.AutomaticRevisionLimit
+	result.AutomaticRoundsEnabled = row.AutomaticRoundsEnabled
+	cc := store.CrossCheck{Verdict: row.Verdict, ReasonClass: row.ReasonClass, DecidedAt: row.DecidedAt, DeadlineAt: row.DeadlineAt}
+	eligible := eligibleAutomaticPlanRound(cc)
+	if row.Verdict == "approve" && row.LeadClaimGeneration != generation && !lead.PlanMd.Valid {
+		eligible = row.DecidedAt.Valid && row.DeadlineAt.Valid && row.DecidedAt.Time.Before(row.DeadlineAt.Time)
+	}
+	result.FallbackReason = row.ReasonClass.String
+	if !row.AutomaticRoundsEnabled && row.Verdict == "approve" && row.LeadClaimGeneration != generation {
+		result.FallbackReason = "interrupted"
+	}
+	if (row.Verdict == "failed" && (row.ReasonClass.String == "superseded" || row.ReasonClass.String == "approved_not_stored") ||
+		row.AutomaticRoundsEnabled && row.Verdict == "approve" && row.LeadClaimGeneration != generation && !lead.PlanMd.Valid) && !eligible {
+		result.FallbackReason = "timed_out"
+	}
+	if row.Verdict == "pending" && !s.now().Before(row.DeadlineAt.Time) {
+		result.FallbackReason = "timed_out"
+	}
+	if row.Verdict == "pending" && row.LeadClaimGeneration != generation {
+		eligible = row.InterruptedAt.Valid && row.DeadlineAt.Valid && row.InterruptedAt.Time.Before(row.DeadlineAt.Time)
+		if !eligible {
+			result.FallbackReason = "timed_out"
+		}
+	}
+	if eligible && row.AutomaticRoundsEnabled && row.Round >= row.AutomaticRevisionLimit+1 {
+		result.FallbackReason = "revisions_exhausted"
+	}
+	if eligible && row.AutomaticRoundsEnabled && row.Round < row.AutomaticRevisionLimit+1 &&
+		slices.Contains(caps, capability.CrossCheckRoundsV1) && lead.AutoApprove && lead.Harness == string(HarnessClaude) &&
+		lead.Status != "awaiting_approval" && !lead.PlanMd.Valid && lead.GateRevision == 0 {
+		next := row.Round + 1
+		result.NextRound = &next
+		result.NextRoundEligible = true
+		result.FallbackReason = ""
+	}
+	if lead.Status == "awaiting_approval" {
+		result.FallbackReason = lead.PlanCrossCheckGateReason.String
+	}
+	return result, nil
 }

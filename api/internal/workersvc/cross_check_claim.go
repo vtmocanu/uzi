@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -26,11 +27,20 @@ type ClaimPlanCrossCheck struct {
 }
 
 func crossCheckClaimInput(cc store.CrossCheck) (*ClaimPlanCrossCheck, error) {
+	if cc.Round > 1 && (!cc.AutomaticRoundsEnabled || cc.Round > cc.AutomaticRevisionLimit+1) {
+		return nil, ErrCrossCheckRefused
+	}
+	return crossCheckCandidateInput(cc)
+}
+
+// crossCheckCandidateInput validates only wire shape and candidate identity.
+// Stored-attempt admission additionally requires the immutable budget snapshot.
+func crossCheckCandidateInput(cc store.CrossCheck) (*ClaimPlanCrossCheck, error) {
 	c := PlanCrossCheckCandidate{PlanMd: cc.PlanMd.String, Milestones: cc.Milestones,
 		RequiredCapabilities: cc.RequiredCapabilities, RequiredTools: cc.RequiredTools,
 		SizeClass: cc.SizeClass.String, BaseCommit: cc.BaseCommit.String, PlanningDiff: cc.PlanningDiff.String}
 	var milestones []json.RawMessage
-	if cc.Stage != "plan" || cc.Round != 1 || !cc.PlanMd.Valid || len(c.PlanMd) == 0 || len(c.PlanMd) > 256*1024 ||
+	if cc.Stage != "plan" || cc.Round < 1 || cc.Round > config.MaxPlanCrossCheckMaxRevisions+1 || !cc.PlanMd.Valid || len(c.PlanMd) == 0 || len(c.PlanMd) > 256*1024 ||
 		len(c.Milestones) > 256*1024 || json.Unmarshal(c.Milestones, &milestones) != nil || milestones == nil || len(milestones) > 64 ||
 		len(c.PlanningDiff) > 512*1024 || len(c.BaseCommit) != 40 || strings.Trim(c.BaseCommit, "0123456789abcdefABCDEF") != "" ||
 		len(c.RequiredCapabilities) > 64 || len(c.RequiredTools) > 64 || !cc.DeadlineAt.Valid {

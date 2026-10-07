@@ -13,7 +13,7 @@ import (
 )
 
 func TestPlanCrossCheckPersistentProvisioningMirrorsLiveDB(t *testing.T) {
-	for _, kind := range []string{"required lead", "Codex required lead", "cross_check child"} {
+	for _, kind := range []string{"required lead", "Codex required lead", "cross_check child", "round-2 cross_check child", "orphan cross_check child"} {
 		for _, tc := range []struct {
 			name      string
 			protocols []string
@@ -22,6 +22,7 @@ func TestPlanCrossCheckPersistentProvisioningMirrorsLiveDB(t *testing.T) {
 			{"released without cross-check protocol", []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, false},
 			{"cross-check without Codex runtime", []string{capability.CodexHarnessV1, capability.CrossCheckV1}, true},
 			{"full protocols", []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CrossCheckV1}, true},
+			{"round-aware protocols", []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CrossCheckV1, capability.CrossCheckRoundsV1}, true},
 		} {
 			t.Run(kind+"/"+tc.name, func(t *testing.T) {
 				fx := newFleetFixture(t)
@@ -39,13 +40,34 @@ func TestPlanCrossCheckPersistentProvisioningMirrorsLiveDB(t *testing.T) {
 					mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET plan_cross_check_required=true,harness='claude' WHERE id=$1`, runID)
 				case "Codex required lead":
 					mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET plan_cross_check_required=true,harness='codex' WHERE id=$1`, runID)
-				case "cross_check child":
+				case "cross_check child", "round-2 cross_check child", "orphan cross_check child":
 					leadID := fx.queuedRun()
-					mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET status='running' WHERE id=$1`, leadID)
+					mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET status='running',claim_generation=1 WHERE id=$1`, leadID)
 					mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET kind='cross_check',issue_iid=NULL,target_run_id=$2,
 						harness='codex',report_only=true,budget_wall_seconds=1800 WHERE id=$1`, runID, leadID)
+					if kind != "orphan cross_check child" {
+						round, limit, enabled := 1, 0, false
+						if kind == "round-2 cross_check child" {
+							round, limit, enabled = 2, 2, true
+							mustExec(fx.ctx, t, fx.pool, `INSERT INTO cross_checks
+                            (lead_run_id,stage,round,lead_claim_generation,plan_md,milestones,size_class,
+                             base_commit,candidate_digest,checker_harness,verdict,reason_class,decided_at,
+                             deadline_at,automatic_rounds_enabled,automatic_revision_limit)
+                            VALUES ($1,'plan',1,1,'plan','[]','s','base',$2,'codex','revise','revise',now(),
+                                    now()+interval '5 minutes',true,2)`, leadID, []byte("placement-first"))
+						}
+						mustExec(fx.ctx, t, fx.pool, `INSERT INTO cross_checks
+                            (lead_run_id,stage,round,lead_claim_generation,plan_md,milestones,size_class,
+                             base_commit,candidate_digest,checker_run_id,checker_harness,deadline_at,
+                             automatic_rounds_enabled,automatic_revision_limit)
+                            VALUES ($1,'plan',$4,1,'plan','[]','s','base',$3,$2,'codex',now()+interval '5 minutes',$5,$6)`,
+							leadID, runID, []byte("placement-digest"), round, enabled, limit)
+					}
 				}
-				placed := tc.placed
+				placed := tc.placed && kind != "orphan cross_check child"
+				if kind == "round-2 cross_check child" && tc.name != "round-aware protocols" {
+					placed = false
+				}
 				if kind != "required lead" && tc.name == "cross-check without Codex runtime" {
 					placed = false
 				}
@@ -88,7 +110,7 @@ func TestPlanCrossCheckPersistentProvisioningMirrorsLiveDB(t *testing.T) {
 }
 
 func TestPlanCrossCheckReleasedWorkerPlacementLiveDB(t *testing.T) {
-	for _, kind := range []string{"required lead", "cross_check child"} {
+	for _, kind := range []string{"required lead", "cross_check child", "round-2 cross_check child"} {
 		t.Run(kind, func(t *testing.T) {
 			fx := newFleetFixture(t)
 			workerID := fx.worker("released worker", capOf(4), false)
@@ -103,14 +125,28 @@ func TestPlanCrossCheckReleasedWorkerPlacementLiveDB(t *testing.T) {
 				mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET kind='cross_check',issue_iid=NULL,target_run_id=$2,
      harness='codex',report_only=true,budget_wall_seconds=300,trigger_source='cross_check',
      auto_approve=true,dispatched_at=now(),priority=2 WHERE id=$1`, runID, leadID)
+				round, limit, enabled := 1, 0, false
+				if kind == "round-2 cross_check child" {
+					round, limit, enabled = 2, 2, true
+					mustExec(fx.ctx, t, fx.pool, `INSERT INTO cross_checks
+     (lead_run_id,stage,round,lead_claim_generation,plan_md,milestones,size_class,
+      base_commit,candidate_digest,checker_harness,verdict,reason_class,decided_at,
+      deadline_at,automatic_rounds_enabled,automatic_revision_limit)
+     VALUES ($1,'plan',1,1,'plan','[]','s',repeat('a',40),$2,'codex','revise','revise',now(),
+             now()+interval '5 minutes',true,2)`, leadID, []byte("first-digest"))
+				}
 				mustExec(fx.ctx, t, fx.pool, `INSERT INTO cross_checks
      (id,lead_run_id,checker_run_id,stage,round,lead_claim_generation,
-      plan_md,milestones,size_class,base_commit,candidate_digest,checker_harness,deadline_at)
-     VALUES ($1,$2,$3,'plan',1,1,'plan','[]'::jsonb,'s',repeat('a',40),
-      $4,'codex',now()+interval '5 minutes')`, uuid.New(), leadID, runID, []byte("test-digest"))
+      plan_md,milestones,size_class,base_commit,candidate_digest,checker_harness,deadline_at,
+      automatic_revision_limit,automatic_rounds_enabled)
+     VALUES ($1,$2,$3,'plan',$5,1,'plan','[]'::jsonb,'s',repeat('a',40),
+      $4,'codex',now()+interval '5 minutes',$6,$7)`, uuid.New(), leadID, runID, []byte("test-digest"), round, limit, enabled)
 			}
 			// All existing Codex protocol requirements pass. Only the new capability is absent.
 			releasedCaps := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}
+			if kind == "round-2 cross_check child" {
+				releasedCaps = append(releasedCaps, capability.CrossCheckV1)
+			}
 			mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET protocol_capabilities=$2 WHERE id=$1`, workerID, releasedCaps)
 			countParams := store.CountOnlineWorkersClaimableForRunParams{RunID: runID,
 				HeartbeatCutoff: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true}}
@@ -126,6 +162,9 @@ func TestPlanCrossCheckReleasedWorkerPlacementLiveDB(t *testing.T) {
 				t.Fatalf("released worker claimed cross-check lane with ordinary capability matching off: %v", err)
 			}
 			capable := append(releasedCaps, capability.CrossCheckV1)
+			if kind == "round-2 cross_check child" {
+				capable = append(releasedCaps, capability.CrossCheckRoundsV1)
+			}
 			mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET protocol_capabilities=$2 WHERE id=$1`, workerID, capable)
 			count, err = fx.q.CountOnlineWorkersClaimableForRun(fx.ctx, countParams)
 			if err != nil || count.Claimable != 1 {

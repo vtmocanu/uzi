@@ -257,29 +257,33 @@ type ControllerReportStatus struct {
 }
 
 type CrossCheck struct {
-	ID                   uuid.UUID          `json:"id"`
-	LeadRunID            uuid.UUID          `json:"lead_run_id"`
-	Stage                string             `json:"stage"`
-	Round                int32              `json:"round"`
-	LeadClaimGeneration  int64              `json:"lead_claim_generation"`
-	PlanMd               pgtype.Text        `json:"plan_md"`
-	Milestones           []byte             `json:"milestones"`
-	RequiredCapabilities []string           `json:"required_capabilities"`
-	RequiredTools        []string           `json:"required_tools"`
-	SizeClass            pgtype.Text        `json:"size_class"`
-	BaseCommit           pgtype.Text        `json:"base_commit"`
-	PlanningDiff         pgtype.Text        `json:"planning_diff"`
-	CandidateDigest      []byte             `json:"candidate_digest"`
-	CheckerRunID         pgtype.UUID        `json:"checker_run_id"`
-	CheckerHarness       pgtype.Text        `json:"checker_harness"`
-	CheckerModel         pgtype.Text        `json:"checker_model"`
-	CheckerEffort        pgtype.Text        `json:"checker_effort"`
-	Verdict              string             `json:"verdict"`
-	ReasonClass          pgtype.Text        `json:"reason_class"`
-	Findings             []byte             `json:"findings"`
-	DecidedAt            pgtype.Timestamptz `json:"decided_at"`
-	DeadlineAt           pgtype.Timestamptz `json:"deadline_at"`
-	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	ID                     uuid.UUID          `json:"id"`
+	LeadRunID              uuid.UUID          `json:"lead_run_id"`
+	Stage                  string             `json:"stage"`
+	Round                  int32              `json:"round"`
+	LeadClaimGeneration    int64              `json:"lead_claim_generation"`
+	PlanMd                 pgtype.Text        `json:"plan_md"`
+	Milestones             []byte             `json:"milestones"`
+	RequiredCapabilities   []string           `json:"required_capabilities"`
+	RequiredTools          []string           `json:"required_tools"`
+	SizeClass              pgtype.Text        `json:"size_class"`
+	BaseCommit             pgtype.Text        `json:"base_commit"`
+	PlanningDiff           pgtype.Text        `json:"planning_diff"`
+	CandidateDigest        []byte             `json:"candidate_digest"`
+	CheckerRunID           pgtype.UUID        `json:"checker_run_id"`
+	CheckerHarness         pgtype.Text        `json:"checker_harness"`
+	CheckerModel           pgtype.Text        `json:"checker_model"`
+	CheckerEffort          pgtype.Text        `json:"checker_effort"`
+	Verdict                string             `json:"verdict"`
+	ReasonClass            pgtype.Text        `json:"reason_class"`
+	Findings               []byte             `json:"findings"`
+	DecidedAt              pgtype.Timestamptz `json:"decided_at"`
+	DeadlineAt             pgtype.Timestamptz `json:"deadline_at"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	AutomaticRevisionLimit int32              `json:"automatic_revision_limit"`
+	AutomaticRoundsEnabled bool               `json:"automatic_rounds_enabled"`
+	InterruptedAt          pgtype.Timestamptz `json:"interrupted_at"`
+	WaitCredited           bool               `json:"wait_credited"`
 }
 
 type CustodyEpisodeNotice struct {

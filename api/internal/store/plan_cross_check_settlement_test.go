@@ -11,7 +11,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-func assertPlanCrossCheckSettled(ctx context.Context, t *testing.T, f *awaitingInputFixture, childID uuid.UUID, minimumCredit int32) int32 {
+func assertPlanCrossCheckSettled(ctx context.Context, t *testing.T, f *awaitingInputFixture, childID uuid.UUID, minimumCredit int32, wantReason string) int32 {
 	t.Helper()
 	var verdict, reason, childStatus string
 	var credit int32
@@ -25,7 +25,7 @@ func assertPlanCrossCheckSettled(ctx context.Context, t *testing.T, f *awaitingI
 		Scan(&verdict, &reason, &childStatus, &credit, &bounded, &released); err != nil {
 		t.Fatal(err)
 	}
-	if verdict != "failed" || reason != "superseded" || childStatus != "cancelled" ||
+	if verdict != "failed" || reason != wantReason || childStatus != "cancelled" ||
 		credit < minimumCredit || !bounded || !released {
 		t.Fatalf("synchronous exit: verdict=%s reason=%s child=%s credit=%d bounded=%v released=%v",
 			verdict, reason, childStatus, credit, bounded, released)
@@ -63,7 +63,7 @@ func TestPlanCrossCheckSynchronousSettlementLiveDB(t *testing.T) {
                 deadline_at = '2020-01-01 00:00:17.25+00' WHERE id = $1`, fx.crossCheckID)
 			mustExec(ctx, t, f.pool, `UPDATE runs SET budget_paused_seconds = 7 WHERE id = $1`, f.runID)
 			mustExec(ctx, t, f.pool, exit.sql, f.runID)
-			credit := assertPlanCrossCheckSettled(ctx, t, f, fx.checkerID, 25)
+			credit := assertPlanCrossCheckSettled(ctx, t, f, fx.checkerID, 25, "timed_out")
 			if credit != 25 {
 				t.Fatalf("wait credit = %d, want existing 7 + rounded wait 18", credit)
 			}
@@ -73,7 +73,7 @@ func TestPlanCrossCheckSynchronousSettlementLiveDB(t *testing.T) {
                 claim_generation = claim_generation + 1 WHERE id = $1`, f.runID)
 			mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'running' WHERE id = $1`, f.runID)
 			mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'queued' WHERE id = $1`, f.runID)
-			again := assertPlanCrossCheckSettled(ctx, t, f, fx.checkerID, 25)
+			again := assertPlanCrossCheckSettled(ctx, t, f, fx.checkerID, 25, "timed_out")
 			if again != credit {
 				t.Fatalf("duplicate wait credit: first=%d second=%d", credit, again)
 			}
@@ -103,7 +103,7 @@ func TestPlanCrossCheckSettlementPreservationLiveDB(t *testing.T) {
 		t.Fatalf("live/noop updates settled check: verdict=%s credit=%d", verdict, credit)
 	}
 	mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'queued' WHERE id = $1`, f.runID)
-	assertPlanCrossCheckSettled(ctx, t, f, fx.checkerID, 7)
+	assertPlanCrossCheckSettled(ctx, t, f, fx.checkerID, 7, "superseded")
 }
 
 func TestPlanCrossCheckSettlementRollbackLiveDB(t *testing.T) {
@@ -144,7 +144,7 @@ func TestPlanCrossCheckSettlementRollbackLiveDB(t *testing.T) {
 			verdict, child, generation, credit)
 	}
 	mustExec(ctx, t, f.pool, `UPDATE runs SET claim_released_at = now() WHERE id = $1`, f.runID)
-	assertPlanCrossCheckSettled(ctx, t, f, fx.checkerID, 7)
+	assertPlanCrossCheckSettled(ctx, t, f, fx.checkerID, 7, "superseded")
 }
 
 func TestPlanCrossCheckSettlementDecidedAndMissingChildLiveDB(t *testing.T) {
@@ -261,5 +261,5 @@ func TestPlanCrossCheckExitVerdictOrderingLiveDB(t *testing.T) {
 	if !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("verdict admitted after committed lead exit: %v", err)
 	}
-	assertPlanCrossCheckSettled(ctx, t, f, fx.checkerID, 0)
+	assertPlanCrossCheckSettled(ctx, t, f, fx.checkerID, 0, "superseded")
 }

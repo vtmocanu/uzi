@@ -76,7 +76,8 @@ func TestPlanCrossCheckPresenceHelpersLiveDB(t *testing.T) {
 		{"settled", "UPDATE cross_checks SET verdict = 'approve', reason_class = 'approve', decided_at = now() WHERE lead_run_id = $1", false, false},
 		{"lead parked", "UPDATE runs SET status = 'paused' WHERE id = $1", false, false},
 		{"released", "UPDATE runs SET claim_released_at = now() WHERE id = $1", false, false},
-		{"other round", "UPDATE cross_checks SET round = 2 WHERE lead_run_id = $1", false, true},
+		{"malformed legacy round", "UPDATE cross_checks SET round = 2 WHERE lead_run_id = $1", false, true},
+		{"capable round 2", "", true, true},
 		{"no check", "DELETE FROM cross_checks WHERE lead_run_id = $1", false, false},
 	}
 	for _, tc := range cases {
@@ -84,6 +85,17 @@ func TestPlanCrossCheckPresenceHelpersLiveDB(t *testing.T) {
 			ctx := context.Background()
 			fx := setupPlanCrossCheckDeletion(ctx, t)
 			f := fx.f
+			if tc.name == "capable round 2" {
+				// Recreate the fixture with its immutable automatic-round snapshot.
+				mustExec(ctx, t, f.pool, `DELETE FROM cross_checks WHERE lead_run_id=$1`, f.runID)
+				mustExec(ctx, t, f.pool, `INSERT INTO cross_checks
+                    (id,lead_run_id,checker_run_id,stage,round,lead_claim_generation,
+                     plan_md,milestones,size_class,base_commit,candidate_digest,checker_harness,
+                     deadline_at,automatic_rounds_enabled,automatic_revision_limit)
+                    VALUES ($1,$2,$3,'plan',2,1,'plan','[]','s',repeat('a',40),$4,'codex',
+                            now()+interval '5 minutes',true,2)`,
+					fx.crossCheckID, f.runID, fx.checkerID, []byte("test-digest"))
+			}
 			if tc.mutation != "" {
 				mustExec(ctx, t, f.pool, tc.mutation, f.runID)
 			}

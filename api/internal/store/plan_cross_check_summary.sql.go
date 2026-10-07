@@ -45,7 +45,7 @@ LEFT JOIN runs checker ON checker.id = cc.checker_run_id
     AND checker.target_run_id = lead.id AND checker.harness = cc.checker_harness
 LEFT JOIN run_usage_totals usage ON usage.run_id = checker.id
 WHERE lead.id = $1 AND lead.user_id = $2
-    AND lead.kind <> 'cross_check' AND cc.stage = 'plan' AND cc.round = 1
+    AND lead.kind <> 'cross_check' AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage)
     AND (cc.findings IS NULL OR octet_length(cc.findings::text) <= 65536)
     AND (cc.checker_model IS NULL OR octet_length(cc.checker_model) <= 512)
     AND (cc.checker_effort IS NULL OR octet_length(cc.checker_effort) <= 512)

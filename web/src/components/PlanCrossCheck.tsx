@@ -12,6 +12,7 @@ const reasons: Record<string, string> = {
   malformed: "Malformed checker response", model_error: "Checker model error",
   confinement_failed: "Checker confinement failed", superseded: "Superseded",
   checker_failed: "Checker failed",
+  approved_not_stored: "Approved plan not stored", revisions_exhausted: "Revisions exhausted",
   codex_lead_unsupported: "Not yet supported for a Codex lead",
   planning_diff_refused: "Planning diff refused", candidate_refused: "Candidate refused",
 };
@@ -48,12 +49,19 @@ function childId(value: unknown): value is string {
   return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }
 
+function safeRound(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 && value <= 5 ? value : undefined;
+}
+
 export function planCheckEventText(payload: unknown, detail?: PlanCrossCheckSummary): string {
   const p = record(payload);
-  // A run has one plan checker, so a historical summary makes every plan event earlier-plan
-  // evidence, even when the deleted checker's id no longer appears in the summary.
-  const earlier = detail?.historical === true;
-  return `Plan cross-check of ${earlier ? "earlier-plan" : "checked"} candidate: ${planCheckOutcome(p.verdict, p.reason_class)}`;
+  const explicitRound = safeRound(p.round);
+  const eventRound = p.round === undefined ? 1 : explicitRound;
+  const latestRound = safeRound(detail?.round);
+  const earlier = eventRound !== undefined && latestRound !== undefined
+    && (eventRound < latestRound || (eventRound === latestRound && detail?.historical === true));
+  const identity = explicitRound === undefined ? "" : ` (round ${explicitRound})`;
+  return `Plan cross-check${identity} of ${earlier ? "earlier-plan" : "checked"} candidate: ${planCheckOutcome(p.verdict, p.reason_class)}`;
 }
 
 // Parsing is capped at 16,384 source characters across at most 20 items.

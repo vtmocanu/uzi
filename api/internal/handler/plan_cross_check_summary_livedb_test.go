@@ -299,11 +299,11 @@ func TestPlanCrossCheckSummaryQueryLiveDB(t *testing.T) {
 		t.Fatalf("SQL findings transfer bound: %+v %v", got, err)
 	}
 	// Reading expiry is observational; settlement remains the lifecycle's job.
-	cliMustExec(t, pool, `UPDATE cross_checks SET verdict='pending',reason_class=NULL,findings=NULL,deadline_at=now()-interval '1 minute' WHERE lead_run_id=$1`, lead)
+	cliMustExec(t, pool, `UPDATE cross_checks SET verdict='pending',reason_class=NULL,findings=NULL,decided_at=NULL,interrupted_at=NULL,wait_credited=false,created_at=now(),deadline_at=now()+interval '1 minute' WHERE lead_run_id=$1`, lead)
 	if got := read(); got.Verdict != "pending" || got.ReasonClass != nil || got.Findings != nil {
 		t.Fatal("read invented expiry result")
 	}
-	cliMustExec(t, pool, `UPDATE runs SET status='running' WHERE id=$1`, lead)
+	cliMustExec(t, pool, `UPDATE runs SET status='running',claim_released_at=NULL,claim_generation=1 WHERE id=$1`, lead)
 	cliMustExec(t, pool, `UPDATE runs SET claim_generation=2 WHERE id=$1`, lead)
 	if got := read(); got.Verdict != "failed" || got.ReasonClass == nil || *got.ReasonClass != "superseded" || !got.Historical {
 		t.Fatalf("actual lifecycle supersession: %+v", got)

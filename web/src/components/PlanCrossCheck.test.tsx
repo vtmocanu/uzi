@@ -26,6 +26,7 @@ const cases: [unknown, unknown, string][] = [
     timed_out: "Timed out (verdict deadline)", model_timeout: "Timed out (checker model timeout)", checker_unavailable: "Checker unavailable",
     interrupted: "Interrupted", malformed: "Malformed checker response", model_error: "Checker model error",
     confinement_failed: "Checker confinement failed", superseded: "Superseded", checker_failed: "Checker failed",
+    approved_not_stored: "Approved plan not stored", revisions_exhausted: "Revisions exhausted",
     codex_lead_unsupported: "Not yet supported for a Codex lead",
     planning_diff_refused: "Planning diff refused", candidate_refused: "Candidate refused",
   }).map(([reason, label]): [unknown, unknown, string] => ["failed", reason, label]),
@@ -128,6 +129,63 @@ describe("M1 plan cross-check outcomes at real sinks", () => {
     const r = render(<MemoryRouter><PlanCrossCheck run={run({ plan_cross_check_summary: summary({ checker_run_id: child }) })} /></MemoryRouter>);
     expect(r.getByRole("link", { name: "Checker run" }).getAttribute("href")).toBe(`/runs/${child}`);
     expect(r.getByText(/Checker cost: Unavailable/)).toBeTruthy();
+  });
+});
+
+describe("plan cross-check rounds at real sinks", () => {
+  it.each([false, true])("compares event rounds with latest summary (historical %s)", (historical) => {
+    const detail = summary({ round: 2, historical });
+    const r = render(<MemoryRouter>
+      {[1, 2, 3].map((round) => <RunEventRow key={round} msg={{
+        seq: round, kind: "cross_check", agent: null, agent_instance: null, agent_label: null, created_at: "",
+        payload: { stage: "plan", round, verdict: round === 1 ? "revise" : "approve",
+          reason_class: round === 1 ? "revise" : "approve" },
+      }} live={false} planCheckDetail={detail} />)}
+    </MemoryRouter>);
+    expect(r.getByText("Plan cross-check (round 1) of earlier-plan candidate: Changes requested")).toBeTruthy();
+    expect(r.getByText(`Plan cross-check (round 2) of ${historical ? "earlier-plan" : "checked"} candidate: Passed`)).toBeTruthy();
+    expect(r.getByText("Plan cross-check (round 3) of checked candidate: Passed")).toBeTruthy();
+  });
+  it("compares a legacy missing round as round 1 without adding a label", () => {
+    const r = render(<RunEventRow msg={{ seq: 1, kind: "cross_check", agent: null,
+      agent_instance: null, agent_label: null, created_at: "",
+      payload: { stage: "plan", verdict: "revise", reason_class: "revise" },
+    }} live={false} planCheckDetail={summary({ round: 2 })} />);
+    expect(r.getByText("Plan cross-check of earlier-plan candidate: Changes requested")).toBeTruthy();
+  });
+  it("displays the protocol's highest valid round", () => {
+    const r = render(<PlanCrossCheckEvent payload={{ round: 5, verdict: "approve", reason_class: "approve" }}
+      detail={summary({ round: 5 })} />);
+    expect(r.getByText("Plan cross-check (round 5) of checked candidate: Passed")).toBeTruthy();
+  });
+  it.each([null, 0, -1, 1.5, 6, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity,
+    "2", "<img>", "2\u202e", {}, []])("rejects unsafe event round %j", (round) => {
+    const r = render(<PlanCrossCheckEvent payload={{ round, verdict: "approve", reason_class: "approve" }}
+      detail={summary({ round: 2, historical: true })} />);
+    expect(r.getByText("Plan cross-check of checked candidate: Passed")).toBeTruthy();
+    expect(r.container.querySelector("img")).toBeNull();
+  });
+  it.each([0, 6, NaN, "2"])("does not infer history from unsafe summary round %j", (round) => {
+    const r = render(<PlanCrossCheckEvent payload={{ round: 1, verdict: "approve", reason_class: "approve" }}
+      detail={summary({ round: round as number, historical: true })} />);
+    expect(r.getByText("Plan cross-check (round 1) of checked candidate: Passed")).toBeTruthy();
+  });
+  it.each([
+    ["approved_not_stored", "Approved plan not stored"],
+    ["revisions_exhausted", "Revisions exhausted"],
+  ])("presents %s in PlanPanel and RunEvent", (reason, label) => {
+    const detail = summary({ round: 2, verdict: "failed", reason_class: reason });
+    const r = render(<MemoryRouter>
+      <PlanPanel run={run({ status: "awaiting_approval", plan_cross_check_summary: detail,
+        plan_cross_check_gate_reason: reason })} busy={false} canSteer={false}
+        onApprove={vi.fn()} onReject={vi.fn()} />
+      <RunEventRow msg={{ seq: 1, kind: "cross_check", agent: null, agent_instance: null,
+        agent_label: null, created_at: "", payload: { stage: "plan", round: 2,
+          verdict: "failed", reason_class: reason } }} live={false} planCheckDetail={detail} />
+    </MemoryRouter>);
+    expect(r.getByText(`Current gate: ${label}`)).toBeTruthy();
+    expect(r.getByText(`Checked candidate: ${label}`)).toBeTruthy();
+    expect(r.getByText(`Plan cross-check (round 2) of checked candidate: ${label}`)).toBeTruthy();
   });
 });
 
