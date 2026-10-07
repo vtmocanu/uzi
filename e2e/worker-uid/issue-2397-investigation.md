@@ -3,6 +3,34 @@
 Cause diagnosis and fix are **not completed**. No flake fix yet; M2/M3 remain
 incomplete. There is no local reproduction or cause regression test.
 
+## Explicit human decision
+
+On 2026-10-07, after the evidence question, the human supplied this decision:
+
+> The detail you asked for does not exist anywhere retrievable.
+>
+> Finish M1 (the diagnostics that make the lane print the failing assertion or cancellation reason), commit it, and signal completion. The PR's own CI run of test-agent-worker-uid is the evidence lane from now on.
+>
+> Do not start M3 and do not claim a cause or fix. The PR must use "Refs #2397", not "Closes".
+
+Milestone disposition under that decision:
+
+- **M1 — diagnostics: completed.** This delivery is diagnostics-only; the quoted
+  instruction records the human decision, not proof of a cause or fix.
+- **M2 — investigation: partial/deferred; original M2 unmet.**
+- **M3 — verified-fix: not started, deferred by explicit instruction; M3 unmet.**
+
+The local environment reached the 900s image-build timeout before worker-UID
+integration tests ran, as recorded below. Per the human/lander check, historical
+JUnit existed only in runner `/tmp`, not in retrievable artifacts.
+
+For #2390, the lander reported `[test:agent:worker-uid] context canceled` after wrapper
+unit tests and before entrypoint output. This observation was absent in the
+passing comparison and the #2377 failure; it does not establish a cause.
+
+#2397 stays open. The PR uses `Refs #2397`; diagnosis and fix are deferred until
+enhanced CI supplies a diagnostic and a controlled reproducer exists.
+
 ## Observed local attempt
 
 At diagnostic-only `752f4c85` atop `d0b98093`:
