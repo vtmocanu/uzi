@@ -13,6 +13,271 @@ import { nullLogger, testGitCacheOptions } from "./helpers.js";
 const H = "a".repeat(40);
 const H2 = "b".repeat(40);
 
+for (const failure of ["none", "bundle", "ack", "pins", "unreadable", "foreign", "uncovered", "attacker-path"] as const) {
+  it(`M2 checked cleanup retains authority on ${failure} and retries without upload`, async t => {
+    const f = await fixture();
+    try {
+      f.state.closeOnRelease = true;
+      await f.coordinator.pin({ runId: "run-1", generation: 7, kind: "issue", branch: "task",
+        sourceSha: H, inventoryGuarded: true });
+      const record = await f.freeze();
+      assert.ok(record);
+      // Capture first with no helper: persisted ACK models a crash before local cleanup.
+      await f.capture(record);
+      const ack = (await f.coordinator.inspect("run-1")).find(r => r.captureId === record.captureId)!;
+      assert.equal(ack.finalAcknowledged, true);
+      assert.ok(ack.bundlePath);
+      const journal = path.join(f.root, "journal", "run-1", ack.captureId + ".json");
+      const saved = await fs.readFile(journal, "utf8");
+      const roots = await f.coordinator.inspect("run-1");
+      const source = roots.find(r => !r.coverageDigest)!;
+      const sourceFile = path.join(f.root, "journal", "run-1", source.captureId + ".json");
+      const sourceSaved = await fs.readFile(sourceFile, "utf8");
+      const sign = async (file: string, payload: RecoveryRecord) => {
+        const key = createHmac("sha256", "local-worker-fixture").update("uzi-recovery-journal-v1").digest();
+        const mac = createHmac("sha256", key).update(canonicalJson(payload)).digest("hex");
+        await fs.writeFile(file, JSON.stringify({ ...payload, mac }));
+      };
+      if (failure === "unreadable") { await fs.unlink(sourceFile); await fs.mkdir(sourceFile); }
+      if (failure === "foreign") await sign(sourceFile, { ...source, runId: "foreign" });
+      if (failure === "uncovered") await sign(sourceFile, { ...source, sourceSha: H2 });
+      const attacker = path.join(f.root, "attacker.bundle");
+      if (failure === "attacker-path") {
+        await fs.writeFile(attacker, "keep");
+        await sign(journal, { ...ack, bundlePath: attacker });
+      }
+      let pins = 0, pinFailure = failure === "pins";
+      Object.assign(f.git, { cleanupRecoveryGeneration: async () => {
+        pins++;
+        if (pinFailure) throw new Error("pin readback failed");
+        return "removed";
+      } });
+      const originalUnlink = fs.unlink;
+      let unlinkFailure = failure === "bundle" || failure === "ack";
+      t.mock.method(fs, "unlink", async (file: Parameters<typeof fs.unlink>[0]) => {
+        if (unlinkFailure && String(file) === (failure === "bundle" ? ack.bundlePath : journal))
+          throw Object.assign(new Error("unlink failure"), { code: "EACCES" });
+        return originalUnlink(file);
+      });
+      const reserves = f.reserves(), uploads = f.state.uploads, finals = f.finals.length;
+      const restarted = f.make();
+      await restarted.resumePending();
+      if (failure !== "none") {
+        assert.equal((await restarted.inspect("run-1")).find(r => r.captureId === ack.captureId)?.finalAcknowledged, true);
+        assert.ok(await fs.stat(journal));
+        if (["unreadable", "foreign", "uncovered", "attacker-path"].includes(failure)) assert.equal(pins, 0);
+        if (failure === "unreadable") await fs.rmdir(sourceFile);
+        if (["unreadable", "foreign", "uncovered"].includes(failure)) await fs.writeFile(sourceFile, sourceSaved);
+        if (failure === "attacker-path") {
+          assert.equal(await fs.readFile(attacker, "utf8"), "keep");
+          await fs.writeFile(journal, saved);
+        }
+        pinFailure = false; unlinkFailure = false;
+        f.state.now += 100_000;
+        await restarted.resumeLive({ authenticatedAtMs: f.state.now, isExecuting: () => false });
+      }
+      assert.deepEqual(await restarted.inspect("run-1"), []);
+      await assert.rejects(fs.stat(path.join(f.root, "journal", "run-1")), { code: "ENOENT" });
+      assert.equal(f.reserves(), reserves);
+      assert.equal(f.state.uploads, uploads);
+      assert.equal(f.finals.length, finals);
+    } finally { await f.close(); }
+  });
+}
+
+for (const protection of ["quarantine", "execution", "during-pins"] as const) {
+  it(`M2 ACK cleanup observes ${protection} source protection`, async () => {
+    const { latchResidueQuarantine, resetResidueQuarantineForTests } = await import("../src/residue-quarantine.js");
+    const f = await fixture();
+    try {
+      f.state.closeOnRelease = true;
+      const record = await f.freeze();
+      assert.ok(record);
+      await f.capture(record);
+      let executing = protection === "execution", calls = 0;
+      Object.assign(f.git, { cleanupRecoveryGeneration: async () => {
+        calls++;
+        if (protection === "during-pins") executing = true;
+        return "removed";
+      } });
+      const live = f.make();
+      if (protection === "quarantine") latchResidueQuarantine({ cause: "cleanup fixture", site: "cleanup" }, nullLogger());
+      await live.resumeLive({ authenticatedAtMs: f.state.now, isExecuting: () => executing });
+      assert.equal((await live.inspect("run-1"))[0]?.finalAcknowledged, true);
+      const ack = (await live.inspect("run-1"))[0]!;
+      assert.ok(await fs.stat(ack.bundlePath!));
+      assert.equal(calls, protection === "during-pins" ? 1 : 0);
+      resetResidueQuarantineForTests();
+      executing = false;
+      Object.assign(f.git, { cleanupRecoveryGeneration: async () => "removed" });
+      f.state.now += 100_000;
+      await live.resumeLive({ authenticatedAtMs: f.state.now, isExecuting: () => executing });
+      assert.deepEqual(await live.inspect("run-1"), []);
+      assert.equal(f.state.uploads, 1);
+      assert.equal(f.finals.length, 1);
+    } finally { resetResidueQuarantineForTests(); await f.close(); }
+  });
+}
+
+it("M2 multiple ACK cleanup keeps one covering authority through every source unlink", async t => {
+  const f = await fixture();
+  try {
+    await f.coordinator.pin({ runId: "run-1", generation: 7, kind: "issue", branch: "task",
+      sourceSha: H, inventoryGuarded: true });
+    const record = await f.freeze();
+    assert.ok(record);
+    await f.capture(record);
+    const ack = (await f.coordinator.inspect("run-1")).find(r => r.finalAcknowledged)!;
+    const copy = { ...ack, captureId: "second-ack",
+      bundlePath: path.join(f.root, "journal", "run-1", "second-ack.bundle") };
+    const dir = path.join(f.root, "journal", "run-1");
+    const key = createHmac("sha256", "local-worker-fixture").update("uzi-recovery-journal-v1").digest();
+    await fs.writeFile(path.join(dir, copy.captureId + ".json"), JSON.stringify({ ...copy,
+      mac: createHmac("sha256", key).update(canonicalJson(copy)).digest("hex") }));
+    Object.assign(f.git, { cleanupRecoveryGeneration: async () => "removed" });
+    const unlink = fs.unlink;
+    let failLast = true;
+    const removed: string[] = [];
+    t.mock.method(fs, "unlink", async (file: Parameters<typeof fs.unlink>[0]) => {
+      if (String(file).endsWith(".json")) {
+        const journals = await f.coordinator.inspect("run-1");
+        assert.ok(journals.some(r => r.finalAcknowledged), "a covering ACK exists before every journal unlink");
+        if (journals.length === 1 && failLast) throw new Error("last ACK unlink interruption");
+        removed.push(String(file));
+      }
+      return unlink(file);
+    });
+    await assert.rejects(f.coordinator.forgetGeneration("run-1", 7), /last ACK unlink/);
+    assert.equal((await f.coordinator.inspect("run-1")).length, 1);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]?.finalAcknowledged, true);
+    assert.ok(!removed[0]!.endsWith(copy.captureId + ".json"), "non-ACK source journal goes first");
+    failLast = false;
+    await f.make().resumePending();
+    assert.deepEqual(await f.coordinator.inspect("run-1"), []);
+  } finally { await f.close(); }
+});
+
+it("M2 live ACK retry obeys pass cap and spacing without reserve or upload", async () => {
+  const f = await fixture();
+  try {
+    const record = await f.freeze();
+    assert.ok(record);
+    await f.capture(record);
+    let attempts = 0;
+    Object.assign(f.git, { cleanupRecoveryGeneration: async () => { attempts++; throw new Error("retry"); } });
+    const live = f.make();
+    await live.resumeLive({ authenticatedAtMs: f.state.now, isExecuting: () => false });
+    assert.equal(attempts, 1);
+    await live.resumeLive({ authenticatedAtMs: f.state.now, isExecuting: () => false });
+    assert.equal(attempts, 1);
+    f.state.now += 100_000;
+    await live.resumeLive({ authenticatedAtMs: f.state.now, isExecuting: () => false });
+    assert.equal(attempts, 2);
+    assert.equal(f.reserves(), 1);
+    assert.equal(f.state.uploads, 1);
+    assert.equal(f.finals.length, 1);
+  } finally { await f.close(); }
+});
+
+it("M2 credential rejection still permits spaced local ACK cleanup", async () => {
+  const f = await fixture();
+  try {
+    f.state.closeOnRelease = true;
+    const record = await f.freeze();
+    assert.ok(record);
+    await f.capture(record);
+    f.state.open = true;
+    f.state.holdGeneration = 8;
+    f.state.ownGeneration = 8;
+    const next = await f.coordinator.freezeInventory({
+      context: { ...f.context, generation: 8 }, currentSha: H, defaultBranch: "main",
+    });
+    assert.ok(next);
+    f.state.reserveError = new RequestError("POST", "/api/worker/recovery", 401, "unauthorized");
+    await f.capture(next);
+    const reserves = f.reserves(), uploads = f.state.uploads, finals = f.finals.length;
+    let attempts = 0;
+    Object.assign(f.git, { cleanupRecoveryGeneration: async () => {
+      attempts++;
+      if (attempts === 1) throw new Error("local interruption");
+      return "removed";
+    } });
+    const opts = { authenticatedAtMs: f.state.now, isExecuting: () => false };
+    await f.coordinator.resumeLive(opts);
+    assert.equal(attempts, 1, "same-age rejected credentials cannot block local ACKs");
+    await f.coordinator.resumeLive(opts);
+    assert.equal(attempts, 1, "local failure retains backoff");
+    f.state.now += 100_000;
+    await f.coordinator.resumeLive(opts);
+    assert.equal(attempts, 2);
+    assert.deepEqual((await f.coordinator.inspect("run-1")).map(r => r.generation), [8]);
+    assert.equal(f.reserves(), reserves);
+    assert.equal(f.state.uploads, uploads);
+    assert.equal(f.finals.length, finals);
+  } finally { await f.close(); }
+});
+
+for (const closure of ["ACK", "discard"] as const) {
+  it(`M2 delayed guarded pin cannot recreate a journal after ${closure}`, async () => {
+    const f = await fixture();
+    try {
+      f.state.closeOnRelease = true;
+      const record = await f.freeze();
+      assert.ok(record);
+      await f.capture(record);
+      let entered!: () => void, release!: () => void;
+      const enteredCleanup = new Promise<void>(resolve => { entered = resolve; });
+      const finishCleanup = new Promise<void>(resolve => { release = resolve; });
+      Object.assign(f.git, { cleanupRecoveryGeneration: async () => {
+        entered();
+        await finishCleanup;
+        return "removed";
+      } });
+      const cleaning = f.coordinator.forgetGeneration("run-1", 7);
+      await enteredCleanup;
+      // This real writer queues behind the generation cycle and observes absence only
+      // after cleanup. No persisted tombstone can rescue its creation re-check.
+      const writer = f.make();
+      const pinning = writer.pin({ runId: "run-1", generation: 7, kind: "issue",
+        branch: "task", sourceSha: H, inventoryGuarded: true });
+      release();
+      await cleaning;
+      assert.equal(await pinning, undefined);
+      if (closure === "discard") {
+        f.state.open = true;
+        assert.ok(await writer.pin({ runId: "run-1", generation: 7, kind: "issue",
+          branch: "task", sourceSha: H, inventoryGuarded: true }));
+        // Owner discard grants no deletion authority, but closes fresh creation authority.
+        f.state.open = false;
+        await writer.forgetGeneration("run-1", 7);
+        assert.equal((await writer.inspect("run-1")).length, 1);
+      }
+      await writer.snapshotOwedInventory();
+      assert.deepEqual(await writer.materializeBootInventory(), []);
+      assert.equal(f.reserves(), 1);
+      assert.equal(f.state.uploads, 1);
+    } finally { await f.close(); }
+  });
+}
+
+it("M2 successful persisted FINAL cleanup preserves sibling generations", async () => {
+  const f = await fixture();
+  try {
+    const record = await f.freeze();
+    assert.ok(record);
+    Object.assign(f.git, { cleanupRecoveryGeneration: async () => "removed" });
+    f.state.holdGeneration = 8;
+    const sibling = await f.coordinator.pin({ runId: "run-1", generation: 8, kind: "issue", branch: "task",
+      sourceSha: H2, inventoryGuarded: true });
+    assert.ok(sibling);
+    f.state.holdGeneration = 7;
+    await f.capture(record);
+    assert.deepEqual((await f.coordinator.inspect("run-1")).map(r => r.captureId), [sibling.captureId]);
+    await assert.rejects(fs.stat(path.join(f.root, "journal", "run-1", record.captureId + ".bundle")), { code: "ENOENT" });
+  } finally { await f.close(); }
+});
+
+
 it("review probe: a history of acknowledged generations does not cause exponential settlement work", async () => {
   const f = await fixture();
   try {
@@ -1084,7 +1349,17 @@ it("restart from persisted divergent owed refs without a journal uploads an impo
     assert.equal(reserves, 1);
     assert.equal(uploads, 1);
     assert.equal(finals, 1);
-    assert.equal((await coordinator.inspect(producer.runId))[0]?.finalAcknowledged, true);
+    assert.deepEqual(await coordinator.inspect(producer.runId), []);
+    await assert.rejects(fs.stat(path.join(recoveryRoot, producer.runId)), { code: "ENOENT" });
+    assert.equal(git(bare, ["for-each-ref", "--format=%(refname)", "refs/uzi-coverage/", "refs/uzi-recovery-pin/", "refs/uzi-owed/"]), "");
+    assert.deepEqual(await restartedCache.enumerateOwedCandidates(bare, producer.runId), []);
+    const freshCache = new GitCache(data, nullLogger(), undefined, testGitCacheOptions());
+    assert.equal((await freshCache.committedTrackingOwnership(bare, producer.branch, producer.runId, h, 1)).kind, "owned",
+      "archive cleanup preserves receipt identity and does not retire publication proof");
+    await coordinator.snapshotOwedInventory();
+    assert.deepEqual(await coordinator.materializeBootInventory(), [], "retained contexts never reopen closed holds");
+    assert.equal(reserves, 1);
+    assert.equal(uploads, 1);
     const bundlePath = path.join(root, "download.bundle");
     await fs.writeFile(bundlePath, uploaded);
     const imported = path.join(root, "import");

@@ -1,4 +1,5 @@
 import { it } from "node:test";
+import { execFileSync } from "node:child_process";
 import { WorkerClient } from "../src/client.js";
 import { nullLogger, makeClaim } from "./helpers.js";
 import { Outbox } from "../src/outbox.js";
@@ -75,6 +76,76 @@ for (const damage of ["mac", "unreadable", "malformed-guard", "dangling-dir", "l
     assert.equal(holdReads, 0, "feature loss never requires unsupported hold reads");
   });
 }
+
+it("M2 normal retirement survives actual cleanup in process and with a genuinely fresh WorkerClient", async t => {
+  const { gitlab } = fakeGitlab();
+  const r = runner({ run: async () => ({ branch: "task" }) }, gitlab, "journal-key");
+  const internals = r as unknown as {
+    client: WorkerClient; recovery: RecoveryCoordinator; outbox: TerminalOutboxDeps["outbox"];
+    terminalDeps(): TerminalOutboxDeps;
+    retireFinalizeRecord(flight: { runId: string; claimGeneration: number }, site: string): Promise<void>;
+  };
+  const runId = "11111111-1111-4111-8111-111111111111", generation = 7;
+  const bare = await git.ensureClone(fx.originPath);
+  const sha = execFileSync("git", ["-C", bare, "rev-parse", "refs/remotes/origin/main"],
+    { encoding: "utf8" }).trim();
+  let open = true;
+  client.hasFeature = name => name === "recovery_inventory_v1";
+  client.getRunOwnership = async () => ({ status: "completed", claim_generation: generation, inventory_guarded: true });
+  client.listRecoveryHolds = async () => ({ run_id: runId, holds: open ? [
+    { hold_id: "hold", generation, inventory_guarded: true, has_available_capture: false },
+  ] : [] });
+  client.releaseRecoveryCustody = async () => {
+    open = false;
+    return { run_id: runId, generation, released: true, holds_released: 1 };
+  };
+  const source = await internals.recovery.pin({ runId, generation, kind: "issue", branch: "task",
+    sourceSha: sha, inventoryGuarded: true });
+  assert.ok(source);
+  const record = await internals.recovery.freezeInventory({
+    context: { runId, generation, kind: "issue", branch: "task", barePath: bare,
+      defaultIdentity: { ref: "refs/remotes/origin/main", sha } },
+    currentSha: sha, defaultBranch: "main", settledEvidence: "publication",
+  });
+  assert.ok(record);
+  await internals.recovery.resumePending(undefined, [record]);
+  assert.deepEqual(await internals.recovery.inspect(runId), []);
+  assert.equal(fs.existsSync(path.join(git.recoveryRoot, runId)), false);
+  t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.endsWith("/register")) return Response.json({
+      worker_id: "22222222-2222-4222-8222-222222222222", protocol_features: ["terminal_rejection_report"],
+    });
+    if (url.endsWith("/ownership")) return Response.json({
+      status: "completed", claim_generation: generation, inventory_guarded: true,
+    });
+    return Response.json({
+      run_id: runId, worker_id: "22222222-2222-4222-8222-222222222222", generation,
+      exact_holds: [{ id: "33333333-3333-4333-8333-333333333333", state: "released" }],
+      sibling_holds: [], exact_count: 1, sibling_count: 0, exact_complete: true, sibling_complete: true,
+      complete: true, outcome: "settled",
+    });
+  });
+  // The in-process transport needs the same real registered identity and negotiated
+  // retirement capability as the reconstructed transport below.
+  delete (client as unknown as { hasFeature?: unknown }).hasFeature;
+  await client.register("test");
+  let terminalRetires = 0, finalizeRetires = 0;
+  internals.outbox = {
+    isDisabled: () => false, retireTerminal: async () => { terminalRetires++; },
+    retireFinalize: async () => { finalizeRetires++; },
+  } as unknown as TerminalOutboxDeps["outbox"];
+  await internals.terminalDeps().outbox.retireTerminal(runId, generation);
+  await internals.retireFinalizeRecord({ runId, claimGeneration: generation }, "M2 same process");
+  assert.equal(terminalRetires, 1);
+  assert.equal(finalizeRetires, 1);
+  internals.client = new WorkerClient("http://retirement.test", "join-token", "test", nullLogger());
+  await internals.client.register("test");
+  await internals.terminalDeps().outbox.retireTerminal(runId, generation);
+  await internals.retireFinalizeRecord({ runId, claimGeneration: generation }, "M2 fresh transport");
+  assert.equal(terminalRetires, 2);
+  assert.equal(finalizeRetires, 2);
+});
 
 it("authenticated pre-generation legacy journal preserves legacy retirement", async () => {
   const { gitlab } = fakeGitlab();
