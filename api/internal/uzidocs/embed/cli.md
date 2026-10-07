@@ -2326,7 +2326,9 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
 - `recovery_wait` — parked to recover from a resumed turn that came back empty
   (no model activity) or hit a transient provider error; the sweep auto-resumes
   it on a capped backoff until it recovers or you cancel it — see [Recovering
-  from a transient interruption](run-recovery-wait.md). A Codex credential
+  from a transient interruption](run-recovery-wait.md). An exhausted worker-death episode also parks here with cause
+  `worker_requeue_exhausted`, requiring explicit owner Resume or Cancel
+  without an automatic timer. A Codex credential
   refresh or release that found the owner's vault locked also parks here
   (cause `vault_locked`); it takes the same capped backoff and no lifetime
   cap. The owner's explicit successful vault unlock best-effort queues an
@@ -2362,8 +2364,9 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
   `run list` shows `paused (credential disabled)`, and the TUI draws it as
   `⊘ cred disabled` in NEEDS YOU.
 
-`limit_wait` and `recovery_wait` auto-resume on their own on a timer — nothing
-to do but wait or cancel; `pool_wait` instead clears only when a token is
+`limit_wait` and timed `recovery_wait` causes auto-resume on a timer.
+`worker_requeue_exhausted` instead requires owner Resume or Cancel; the Codex
+account hold waits for its account. `pool_wait` instead clears only when a token is
 opted into the pool (or on demand with `uzi run resume-now`), so waiting alone
 does not resume it.
 
@@ -2380,6 +2383,41 @@ TUI board and detail header's status chip, and on `admin runs` — so you can
 tell "still proposing work" apart from "actively implementing" at a glance.
 It's still the same `running` value underneath, not an additional status.
 
+### Worker recovery exhaustion
+
+`recovery_wait` with cause `worker_requeue_exhausted` means automatic
+worker-death recovery has stopped and the owner must Resume or Cancel.
+`uzi run get <id>` shows `WORKER_RECOVERY` and `RECOVERY_EVIDENCE` rows:
+the automatic limit (0 or N), episode used/remaining allowance, episode
+number, lifetime charged `requeue_count`, historical checkpoint tip or
+available capture at disposition time, and uncertainty flags. Checkpoint
+and capture observations do not verify current availability or latest edits;
+pending publication/capture, retained custody or unavailable server evidence
+do not guarantee an archive/export. See [Worker recovery exhausted](run-recovery-wait.md#worker-recovery-exhausted)
+for the exact evidence wording and server fallback.
+
+With `--json`, `worker_recovery` is a typed object with `episode`,
+`automatic_requeue_limit`, `episode_used`, `episode_remaining` and
+`evidence`. Evidence has `checkpoint_tip`, `available_capture`,
+`publication_uncertain`, `capture_uncertain`, `custody_uncertain`,
+`unknown` and `recorded_at`; it is historical, not current export availability.
+
+The owner can use `uzi run resume <id>` or the existing
+`uzi run resume-now <id>` to release this exact run hold and queue one
+explicit attempt. A new episode gets the current `RUN_MAX_REQUEUES`
+automatic allowance; 0 grants none. Lifetime charges/readoption refunds and
+the existing wall budget survive. The once-per-run finalize-resume exception
+is initial-episode only and cannot exceed an owner-started episode's cap.
+Timer, credential, vault, account and ordinary input events do not release
+or renew this hold.
+
+A default `uzi run wait <id>` stops on this cause; an explicit `--until`
+retains exactly its selected status set, including when it is the default
+set written explicitly. Ordinary recovery waits continue as before.
+`uzi run logs <id> --follow` reports a change to this cause even when the
+status stays `recovery_wait`. The TUI puts this hold in NEEDS YOU with
+owner actions, counts and historical evidence, without a self-retry countdown.
+
 ### Waiting for a state: `uzi run wait`
 
 `uzi run wait <id>` blocks until the run reaches a state you can act on — the
@@ -2387,11 +2425,13 @@ built-in primitive for driving a gated run headless, replacing the hand-rolled
 `while … run get … sleep` poll loop. With no `--until` it stops on any
 **actionable or terminal** state (`awaiting_approval`, `awaiting_input`,
 `awaiting_followup`, `completed`, `failed`, `cancelled`) and waits through the
-rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`paused`):
-limit and recovery waits retry on a timer, pool waits need an available pooled token,
+rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`paused`),
+except a default wait also stops at `recovery_wait` with cause
+`worker_requeue_exhausted` for an owner decision:
+timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and owner pauses need `uzi run resume`. A bare `run wait` means
-"wait for the plan gate, a clarification, an interactive task's park, **or**
-the end".
+"wait for the plan gate, a clarification, an interactive task's park,
+worker recovery exhaustion, **or** the end".
 
 - It **exits 0** the moment a target state is reached — including if the run is
   already in one when you call it.

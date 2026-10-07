@@ -280,6 +280,9 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 		// two apart at a glance.
 		return "~", "pool wait"
 	case statusRecoveryWait:
+		if len(cause) > 0 && cause[0] == workerRequeueExhaustedCause {
+			return "~", "requeue limit"
+		}
 		// issue #1197: a transient-recovery park that auto-resumes on a capped backoff.
 		// Same wait-family glyph as limit_wait/pool_wait (all non-terminal holds), distinct
 		// word so a user can tell them apart at a glance. PRD #1392 M5: a forge-unreachable

@@ -825,7 +825,8 @@ Serves human: Feature #4 job queue + worker registry + lossless live stream.
   machine `queued → claimed → running → awaiting_approval → running → completed |
   failed | cancelled`, CHECK-constrained. Resume/affinity/liveness columns:
   `worker_id→workers ON DELETE SET NULL` (affinity), `session_id` (SDK resume),
-  `last_seq` (message high-water mark), `requeue_count` (bounded re-queue),
+  `last_seq` (message high-water mark), `requeue_count` (lifetime re-queue history;
+  automatic allowance uses `requeue_count - requeue_episode_baseline` per owner recovery episode),
   `iteration_count` (loop cap), `branch`, `mr_iid`, `failure_reason`, `plan_md`,
   and `claimed_at/started_at/finished_at`.
 - **One-non-terminal-run-per-issue** enforced by a **partial UNIQUE index**
@@ -985,15 +986,24 @@ Serves human: liveness never trusted to the agent; "restart-resilience".
 - **Server sweeper** (goroutine beside the PRD #2 poller; also run once at boot as the
   orphan sweep — bottega): each pass, in order, (1) marks heartbeat-stale workers
   offline; (2) reclaims claimed-but-never-started runs past `ClaimGrace` (fixed 5m,
-  not an env var); (3) fails running runs past `RUN_TIMEOUT`; (4) fails stale-worker
-  runs **over** the re-queue cap; (5) re-queues stale-worker runs **under** the cap
-  (incrementing `requeue_count`). Fail-over-cap runs before re-queue so a run that
-  just hit the cap isn't re-queued.
-- **Bounded re-queue**: `RUN_MAX_REQUEUES` (default 1) caps worker-death re-queues;
-  `0` is supported (fail immediately on worker death).
-- **Register-time orphan recovery**: a re-registering worker has, by definition, just
-  restarted and is executing nothing, so any run it still holds is orphaned — failed
-  over cap, else re-queued **to the same worker** (affinity) for resume. This is what
+  not an env var); (3) fails running runs past `RUN_TIMEOUT`; (4) applies
+  recorded-state disposition to eligible stale-worker runs at or above the episode
+  re-queue cap; (5) re-queues eligible stale-worker runs below the cap (incrementing
+  lifetime `requeue_count`). Exhaustion disposition runs before re-queue so a run
+  that just hit the cap isn't automatically re-queued by the same pass.
+- **Bounded re-queue**: `RUN_MAX_REQUEUES` (default 1) caps automatic worker-death
+  re-queues per owner recovery episode; spend is `requeue_count - requeue_episode_baseline`.
+  At exhaustion, a recorded checkpoint, available capture, unresolved publication,
+  capture or custody, or unknown evidence produces owner-only `recovery_wait` with
+  cause `worker_requeue_exhausted`; without those, the run fails with `worker_lost`.
+  `0` disables automatic re-queues but permits an explicit owner resume attempt from
+  the hold. That resume opens a new episode without resetting lifetime history or
+  `finalize_resume_generation`. The #1742 one-shot finalize-resume allowance requires
+  initial episode 0 and a positive cap; owner resumes do not renew it.
+- **Register-time orphan recovery**: after active-run readoption and attested
+  finalize-resume handling, eligible orphaned runs use the same recorded-state
+  fail-or-owner-hold policy at exhaustion, else are re-queued **to the same worker**
+  (affinity) for resume. This is what
   makes `docker compose down && up` recover: a fresh worker's own restart signal,
   which the server cannot infer from heartbeats (a fresh heartbeat would otherwise
   defeat staleness detection). The sweeper still covers never-returning workers.
@@ -1139,7 +1149,8 @@ Serves human: operability of the run queue + worker liveness.
 
 Server-side (defaults): `RUN_TIMEOUT` 2h, `RUN_IDLE_TIMEOUT` 10m (worker-enforced,
 shipped in the claim), `RUN_MAX_ITERATIONS` 5 (worker-enforced), `RUN_MAX_REQUEUES`
-1 (`0` = never re-queue), `WORKER_HEARTBEAT_INTERVAL` 15s, `WORKER_HEARTBEAT_STALE`
+1 (automatic re-queues per owner recovery episode; `0` disables automatic re-queues
+but permits an explicit owner resume attempt from exhaustion), `WORKER_HEARTBEAT_INTERVAL` 15s, `WORKER_HEARTBEAT_STALE`
 45s, `WORKER_POLL_INTERVAL` 3s, `WORKER_AFFINITY_GRACE` 2m (chat lane), `WORKER_AFFINITY_CEILING`
 2h (run lane, §573). Claimed-never-started
 grace is fixed at 5m in code, not an env var. Invalid numeric/duration values fall
@@ -6197,7 +6208,8 @@ Full Decision Log in `prds/done/49-worker-resource-stats.md`. The load-bearing d
   ignored the heartbeat body before, but every current worker already sends `{"version": ...}` and
   `httpx.DecodeJSON` is strict (`DisallowUnknownFields`). A `struct{ Stats }`-only decode would 400
   every heartbeat from every worker old and new → within `WORKER_HEARTBEAT_STALE` the sweeper marks the
-  whole fleet offline and requeues its runs. So `worker_protocol.go` mirrors register exactly: the
+  whole fleet offline; eligible runs requeue within episode allowance, else follow the
+  recorded-state fail-or-owner-hold policy (§41). So `worker_protocol.go` mirrors register exactly: the
   struct DECLARES `version` (ignored), tolerates empty body via the `io.EOF` check, and — critically —
   decodes `stats` as `json.RawMessage` parsed in a SECOND step whose failure drops the stats and
   nothing else. A literal `float64` field would abort the whole decode on `1e999`/int64-overflow BEFORE
@@ -14180,7 +14192,8 @@ park a run for years, and cannot spend more than its own owner's retry budget.
 - `RUN_LIMIT_MAX_WAITS` (default **5**) caps parks per run via `runs.limit_wait_count`; the next
   limit past it fails the run with "usage-limit retry budget exhausted". Read with a non-negative
   int parser so **`0` is legal and means "never park"** — the operator's off switch back to today's
-  behaviour, mirroring how `RUN_MAX_REQUEUES=0` reads.
+  behaviour. Similarly, `RUN_MAX_REQUEUES=0` disables automatic re-queues, but
+  permits an explicit owner resume attempt from exhaustion.
 - `RUN_LIMIT_MAX_PARK` (default **8d**, not 7d: the longest SDK window is seven days and a reset
   stamped at its far edge needs room for jitter and clock skew) caps how far one park may reach; a
   computed stamp beyond it **fails the run instead of parking**.
@@ -15412,7 +15425,8 @@ than the tail — the tail is not the maximum, and this gate asserts uniqueness 
   awaiting_input_since`, `consumed_at > awaiting_input_since`, and a worker-side
   generation counter — and **all three key the answer to WHEN it arrived relative to a
   park**.
-- **All three are refuted by the requeue re-park.** A worker death re-queues the run;
+- **All three are refuted by the requeue re-park.** When worker-death recovery
+  re-queues the run within its episode allowance or after an explicit owner resume,
   the resume consumes the pending answer within one poll of starting (steering starts
   before the checkout) and only then re-parks. So the honest answer arrives *before*
   the new park and every when-based key rejects it: the user answered correctly, got a
@@ -15514,8 +15528,12 @@ than the tail — the tail is not the maximum, and this gate asserts uniqueness 
   back to the same numbers, so an older server degrades to 5 rather than to unbounded.
 - **🔴 THE DOCUMENTED CEILINGS ARE PER-EXECUTION, AND THE HONEST ONES MULTIPLY.** Both
   the counter and the deadline are worker-in-memory locals of `execute()`, so a requeue
-  restarts them. The true bounds are `QUESTION_MAX × (RUN_MAX_REQUEUES + 1)` and
-  `QUESTION_TIMEOUT × (RUN_MAX_REQUEUES + 1)` — ten questions on defaults, not five.
+  restarts them. Within one owner recovery episode, the bounds are
+  `QUESTION_MAX × (RUN_MAX_REQUEUES + 1)` and
+  `QUESTION_TIMEOUT_SECONDS × (RUN_MAX_REQUEUES + 1)` — ten questions on defaults,
+  not five. Initial episode 0 can use the #1742 one-shot finalize-resume allowance
+  with a positive cap, giving each `× (RUN_MAX_REQUEUES + 2)` instead. Further owner
+  resumes open new episodes, so these settings alone impose no finite lifetime bound.
   **Both caveats must be stated wherever either is**: documenting the timeout's and not
   the cap's is worse than documenting neither, because a reader who finds one
   reasonably infers the other has none.
@@ -22166,8 +22184,10 @@ rationale in the Decision Log of `prds/done/517-interactive-task-runs.md`. <!-- 
   run-scoped input-fetch outage cannot strand the park as a heartbeat-invisible zombie.
 
 - **Checkpoint-push at every park.** On each `signal_done` park the worker best-effort
-  checkpoint-pushes the branch tip (reap-then-git) before blocking, so a dead-worker recovery is
-  a requeue-and-resume, not commit loss. Best-effort by design (PRD Decision 4: "a park that
+  checkpoint-pushes the branch tip (reap-then-git) before blocking. Eligible dead-worker runs
+  requeue within episode allowance; at exhaustion, recorded state determines failure or
+  an owner hold (§41). A successful checkpoint records recovery evidence, without promising
+  latest local work remains available. Best-effort by design (PRD Decision 4: "a park that
   fails is worse than a park that loses work") — the park proceeds even if the push failed, with
   the worker PVC and a later re-push as backstops.
 
@@ -22175,10 +22195,11 @@ rationale in the Decision Log of `prds/done/517-interactive-task-runs.md`. <!-- 
   backstop is `WORKER_TASK_IDLE_TIMEOUT` (default 30m, `parseDuration` in api config), delivered
   on the claim as `task_idle_timeout_seconds` and consumed by the worker's `awaitFollowUp` (with
   a compiled fallback for an older server) → graceful finalize → `completed`. The server-side
-  "requeue a dead-worker park" backstop is the EXISTING `RequeueRunsOfStaleWorkers` (park added
-  to its IN-list), NOT a new park-age `TASK_IDLE_TIMEOUT` sweep — that separate sweep was
-  deliberately NOT built: redundant for a dead worker (the stale-worker requeue already covers
-  it) and unsafe for a live-but-stuck worker (it would race a second worker onto the same run).
+  dead-worker recovery backstop is the EXISTING stale-worker policy (episode requeue or
+  recorded-state fail-or-owner-hold, §41), with `awaiting_followup` in its status lists,
+  NOT a new park-age `TASK_IDLE_TIMEOUT` sweep — that separate sweep was deliberately NOT
+  built: redundant for a dead worker and unsafe for a live-but-stuck worker (it would race
+  a second worker onto the same run).
 
 - **Wall-clock exemption.** Interactive runs are exempted from `SweepRunningTimeout` on their
   KIND (`interactive = false` filter), covering both the park (already `status <> 'running'`) and

@@ -478,6 +478,9 @@ func newRunInputsCmd(env Env, gf *globalFlags) *cobra.Command {
 			if len(list) > 0 {
 				if run, err := c.GetRun(cmd.Context(), args[0]); err == nil {
 					status = run.Status
+					if line := workerExhaustionLine(run); line != "" {
+						_, _ = fmt.Fprintln(env.Stderr, line)
+					}
 					// PRD #1392 M5: carry the recovery cause so a forge-unreachable park's
 					// queue row names the forge rather than a transient empty turn.
 					recoveryCause = strOr(run.RecoveryWaitCause, "")

@@ -811,6 +811,9 @@ func (m tuiModel) renderDetail() string {
 	}
 	// The disk park line (PRD #1809 M5), same slot, ink and shedding as the vault park line: a
 	// data_volume_full park is another recovery_wait cause, so the two never both draw.
+	for _, line := range workerExhaustionTUILines(d.run) {
+		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
+	}
 	if line := fitDiskParkLine(d.run, m.width); line != "" {
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
 	}

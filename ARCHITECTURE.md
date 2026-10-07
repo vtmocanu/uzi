@@ -713,7 +713,7 @@ is a linear state machine:
 ```
 queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiting_approval ⟲ (revise, PRD #41) → running → completed
                                                                                                                    → failed
-   ↳ (worker dies) → re-queued, up to RUN_MAX_REQUEUES → failed
+   ↳ (worker dies) → re-queued within episode allowance → failed (worker_lost) or owner-only recovery_wait, by recorded state
    ↳ (provider usage window, waiting enabled by default) → limit_wait → queued, up to RUN_LIMIT_MAX_WAITS → failed
    ↳ (auto lane, token pool empty) → pool_wait → queued, once a token is pooled (or resume-now)
    ↳ (resumed turn came back empty) → recovery_wait → queued, on a capped backoff, no lifetime cap
@@ -1072,8 +1072,13 @@ chain in the diagram above, with no intervening `running`.
   requeue re-parks on the same question id, so an answer submitted just before a
   crash still resumes and an answer to a superseded question is rejected. Bounds
   are an absolute answer deadline (`QUESTION_TIMEOUT_SECONDS`, default 24h) and a
-  per-run cap (`QUESTION_MAX`, default 5), both worker-in-memory (a requeue resets
-  both, so the honest worst case is each **× (RUN_MAX_REQUEUES + 1)**, or **× (RUN_MAX_REQUEUES + 2)** for a run that used the one-shot finalize-resume allowance, issue #1742). **Only the
+  per-attempt cap (`QUESTION_MAX`, default 5), both worker-in-memory (a requeue
+  resets both). Within one owner recovery episode, each is bounded by
+  **× (RUN_MAX_REQUEUES + 1)**, or **× (RUN_MAX_REQUEUES + 2)** in the initial
+  episode if the one-shot finalize-resume allowance is used with a positive cap
+  (issue #1742).
+  Further owner resumes open new episodes, so these settings alone impose no
+  finite lifetime bound. **Only the
   deadline fails the run closed**; exhausting the cap emits a feed notice and the
   lead proceeds on its own judgment (the one cap-adjacent failure is pre-run-only:
   looping on questions without ever reaching a plan). **Autopilot ordinary
@@ -1221,12 +1226,21 @@ chain in the diagram above, with no intervening `running`.
   its owner to extend or stop it, never failed for the clock alone (PRD #1497,
   see the **running → paused (wall park)** entry above); a worker whose
   heartbeat is stale past `WORKER_HEARTBEAT_STALE`
-  (default 45s) is marked offline and its non-terminal runs re-queued,
-  incrementing `requeue_count` — only after a *second* consecutive stale
-  window is the run failed instead of re-queued again, giving a worker that
-  briefly lost the api time to return (issue #1390). An orphan sweep also
+  (default 45s) is marked offline and its eligible runs re-queued within the
+  owner recovery episode's `RUN_MAX_REQUEUES` allowance, incrementing lifetime
+  history `requeue_count`; episode spend is `requeue_count - requeue_episode_baseline`.
+  Over-cap disposition waits for a second consecutive stale window, preserving
+  the returning worker's readoption opportunity (issue #1390).
+  Exhausted runs fail with `worker_lost` only when recorded state has no checkpoint,
+  available capture, unresolved publication/capture/custody, or unknown evidence;
+  otherwise they hold in owner-only `recovery_wait` with cause
+  `worker_requeue_exhausted`. An explicit owner resume opens a new episode without
+  resetting lifetime history or the #1742 marker; `0` disables automatic requeues
+  but permits that explicit attempt. The #1742 one-shot finalize-resume allowance
+  applies only in initial episode 0 with a positive cap. See
+  [docs/run-recovery-wait.md](docs/run-recovery-wait.md). An orphan sweep also
   runs once at API boot, but its three stale-worker passes (offline-marking,
-  over-cap fail, re-queue) are held off for `SWEEPER_BOOT_GRACE` (default 60s)
+  over-cap disposition, re-queue) are held off for `SWEEPER_BOOT_GRACE` (default 60s)
   after the api's listeners are ready — every other boot pass runs as usual —
   so a worker that only lost the api — not its own health — is not wrongly
   declared dead; on its next

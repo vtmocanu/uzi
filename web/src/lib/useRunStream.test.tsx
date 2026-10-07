@@ -238,19 +238,49 @@ describe("useRunStream steer queue (PRD #95 M3)", () => {
     await waitFor(() => expect(getInputs.mock.calls.length).toBeGreaterThan(afterOpen));
   });
 
+  it("ownership proof stays false pending a read, resets on navigation, and ignores stale replies", async () => {
+    const replies: Array<(v: { inputs: SteerInput[] }) => void> = [];
+    vi.spyOn(api, "getRunInputs").mockImplementation(() => new Promise((resolve) => replies.push(resolve)));
+    const { result, rerender } = renderHook(({ id }) => useRunStream(id), { initialProps: { id: "run-1" } });
+    expect(result.current.canSteer).toBe(true);
+    expect(result.current.confirmedOwner).toBe(false);
+    await act(async () => replies[0]({ inputs: [] }));
+    expect(result.current.confirmedOwner).toBe(true);
+    await act(async () => LiveSocket.last!.open());
+    rerender({ id: "run-2" });
+    expect(result.current.confirmedOwner).toBe(false);
+    await act(async () => replies[1]({ inputs: [] }));
+    expect(result.current.confirmedOwner).toBe(false);
+    await act(async () => replies[2]({ inputs: [] }));
+    expect(result.current.confirmedOwner).toBe(true);
+  });
+
   it("a 404 on /inputs marks the viewer a non-owner (canSteer false) — Decision 8/N2", async () => {
     vi.spyOn(api, "getRunInputs").mockRejectedValue(new ApiError(404, "run not found"));
     const { result } = renderHook(() => useRunStream("run-1"));
     await waitFor(() => expect(result.current.canSteer).toBe(false));
+    expect(result.current.confirmedOwner).toBe(false);
     // Silent: no run-level error banner from the 404.
     expect(result.current.error).toBe("");
     expect(result.current.inputs).toHaveLength(0);
+  });
+
+  it("a later non-owner response revokes confirmed ownership", async () => {
+    vi.spyOn(api, "getRunInputs")
+      .mockResolvedValueOnce({ inputs: [] })
+      .mockRejectedValue(new ApiError(404, "run not found"));
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await waitFor(() => expect(result.current.confirmedOwner).toBe(true));
+    await act(async () => result.current.refreshInputs());
+    expect(result.current.confirmedOwner).toBe(false);
+    expect(result.current.canSteer).toBe(false);
   });
 
   it("a 200-empty response keeps the owner steering (canSteer stays true)", async () => {
     vi.spyOn(api, "getRunInputs").mockResolvedValue({ inputs: [] });
     const { result } = renderHook(() => useRunStream("run-1"));
     await waitFor(() => expect(result.current.run?.id).toBe("run-1"));
+    expect(result.current.confirmedOwner).toBe(true);
     // An empty queue is NOT a non-owner signal; the owner still steers.
     expect(result.current.canSteer).toBe(true);
   });
@@ -263,12 +293,14 @@ describe("useRunStream steer queue (PRD #95 M3)", () => {
     const { result } = renderHook(() => useRunStream("run-1"));
     await waitFor(() => expect(result.current.run?.id).toBe("run-1"));
     expect(result.current.canSteer).toBe(true);
+    expect(result.current.confirmedOwner).toBe(true);
     // The socket opens → a second refetch fires and 500s; canSteer must NOT flip.
     await act(async () => {
       LiveSocket.last!.open();
     });
     await waitFor(() => expect(result.current.connected).toBe(true));
     expect(result.current.canSteer).toBe(true);
+    expect(result.current.confirmedOwner).toBe(true);
   });
 });
 
@@ -362,6 +394,7 @@ describe("useRunStream stale fetch after run change (issue #1430)", () => {
 
     expect(result.current.error).toBe("");
     expect(result.current.canSteer).toBe(true);
+    expect(result.current.confirmedOwner).toBe(true);
   });
 
   it("an old run's submit() resolving after navigation does not fetch and show that run", async () => {

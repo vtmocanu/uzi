@@ -188,6 +188,8 @@ var allRunStatuses = func() map[string]bool {
 // follow-up park, or a terminal — the common "wait for the gate OR the end" case. It also
 // OMITS recovery_wait (issue #1197: a transient-recovery park auto-resumes on a capped
 // backoff, so it is legitimate to wait through, exactly like limit_wait/pool_wait).
+// runWait separately stops a default wait on worker_requeue_exhausted for owner
+// intervention; an explicit --until retains the exact status-set semantics.
 var defaultWaitStates = []string{"awaiting_approval", "awaiting_input", "awaiting_followup", "completed", "failed", "cancelled"}
 
 // run wait poll cadence and transient-blip resilience knobs (PRD #264 D1/D9). Vars,

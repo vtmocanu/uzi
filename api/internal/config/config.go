@@ -419,7 +419,7 @@ type Config struct {
 	CompletionHoldWindowSeconds int
 	RunMaxRequeues              int           // automatic worker-death requeues allowed per owner recovery episode (zero disables automatic requeues)
 	WorkerHeartbeatInterval     time.Duration // how often a worker heartbeats
-	WorkerHeartbeatStale        time.Duration // no heartbeat past this ⇒ worker offline + runs re-queued
+	WorkerHeartbeatStale        time.Duration // no heartbeat past this ⇒ worker offline + eligible runs re-queued within episode allowance, else held or failed by recorded state
 	DiskPressureThreshold       float64       // PRD #837 M4: used/total fraction in (0,1] at/above which a worker's self-reported volume counts as under disk pressure (display/lifecycle-only)
 	SweepInterval               time.Duration // run-liveness sweep cadence; 0 ⇒ sweeper's built-in 15s default
 	// SweeperBootGrace (PRD #1390 M1, D1): the three stale-worker passes
@@ -1067,7 +1067,8 @@ func Load() (Config, error) {
 	// the claim (like RunIdleTimeout). Shorter than chat's 60m because a parked task pins
 	// a git clone/HOME + worker slot; on idle the worker gracefully finalizes (push, MR
 	// iff open_mr) → completed. There is deliberately NO server-side park-age sweep: a
-	// dead-worker park is recovered by the existing stale-worker requeue (M2), not a new
+	// dead-worker park follows stale-worker recovery (episode requeue or recorded-state
+	// owner hold/worker_lost failure), not a new
 	// TASK_IDLE_TIMEOUT completing a run the server cannot push.
 	cfg.WorkerTaskIdleTimeout = parseDuration("WORKER_TASK_IDLE_TIMEOUT", 30*time.Minute)
 	cfg.RunMaxIterations = parseInt("RUN_MAX_ITERATIONS", 5)
@@ -1156,8 +1157,8 @@ func Load() (Config, error) {
 
 	// PRD #35. parseNonNegInt, so RUN_LIMIT_MAX_WAITS=0 is legal and means "never
 	// park" — the deliberate off switch for an operator who wants today's
-	// fail-immediately behaviour, matching how RUN_MAX_REQUEUES=0 means "never
-	// re-queue".
+	// fail-immediately behaviour. RUN_MAX_REQUEUES=0 similarly disables automatic
+	// requeues, but still permits an explicit owner resume attempt from exhaustion.
 	cfg.RunLimitMaxWaits = parseNonNegInt("RUN_LIMIT_MAX_WAITS", 5)
 	cfg.RunLimitMaxPark = parseDuration("RUN_LIMIT_MAX_PARK", 8*24*time.Hour)
 
@@ -2244,7 +2245,8 @@ func parseNonNegDuration(key string, def time.Duration) time.Duration {
 }
 
 // parseNonNegInt is parseInt but accepts 0 (a legitimate value for e.g.
-// RUN_MAX_REQUEUES, meaning "never re-queue"). A negative or malformed value
+// RUN_MAX_REQUEUES, meaning "no automatic requeues"; an explicit owner resume
+// attempt remains allowed from exhaustion). A negative or malformed value
 // falls back to def.
 func parseNonNegInt(key string, def int) int {
 	raw := strings.TrimSpace(os.Getenv(key))

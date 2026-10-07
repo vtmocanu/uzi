@@ -353,6 +353,8 @@ uzi version
   promotes it back to `queued` once past its `retry_not_before`),
   `pool_wait` (an `auto` run held because its token pool is empty — add a token
   to the pool and it resumes), `recovery_wait` (parked after an empty model turn, or
+  because automatic worker-death recovery exhausted — cause
+  `worker_requeue_exhausted`, owner Resume/Cancel only, no timer — or
   because the forge was unreachable at clone — cause `forge_unreachable`, capped by
   `RUN_FORGE_UNREACHABLE_MAX_PARKS`; the sweep retries it on a capped backoff; cause
   `codex_account_unavailable` is held on its Codex account until that account is usable
@@ -389,14 +391,15 @@ uzi version
   task parked awaiting your next follow-up — it does not auto-resume, so a
   bare wait stops there too), `completed`, `failed`, `cancelled` — and keeps
   waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/
-  `recovery_wait`/`paused`: limit and recovery waits retry on a timer, pool waits
+  `recovery_wait`/`paused`, except a default wait stops on recovery cause
+  `worker_requeue_exhausted`: timed limit and recovery waits retry on a timer, pool waits
   need an available pooled token, and owner pauses need `uzi run resume`. A
-  `vault_locked` recovery park is no exception: a bare wait keeps waiting through it
+  `vault_locked` recovery park still waits: a bare wait keeps waiting through it
   until the run owner's explicit unlock queues it and a worker resumes it, or the
   scheduled retry provides the fallback.
   So a bare
   `uzi run wait <id>` is "wait for the plan gate, a clarification, an
-  interactive park, OR the end". It **exits 0** the
+  interactive park, worker recovery exhaustion, OR the end". It **exits 0** the
   moment a target state is reached (including if the run is already in one),
   polls `GET /api/runs/:id` every `--interval` (default 3s) client-side, and
   prints each transition to **stderr**; `--json` prints the final run object (the
@@ -689,14 +692,36 @@ uzi version
   `landing_state` is `needs_landing` carries human-landable work: recover it with
   `uzi run export` when an archive is available, or from the preserved diff
   (`uzi run get <run-id> --field preserved_patch`) when it isn't.
+  Worker-death exhaustion is `recovery_wait` / `worker_requeue_exhausted`:
+  owner `uzi run resume <id>` (or `resume-now`) releases the exact run hold
+  and queues one explicit attempt with the current `RUN_MAX_REQUEUES`
+  automatic allowance per episode. At 0 there are no automatic requeues.
+  Lifetime charged `requeue_count`, generation-proven readoption refunds and
+  the existing wall budget survive; the #1742 extra allowance is initial-episode
+  only and its lifetime marker is never renewed. Timers, credentials, vault,
+  account and ordinary inputs do not release or renew the hold.
+  `run get` shows `WORKER_RECOVERY` and `RECOVERY_EVIDENCE`; JSON
+  `worker_recovery` has `episode`, `automatic_requeue_limit`, `episode_used`,
+  `episode_remaining`, and historical `evidence` (`checkpoint_tip`,
+  `available_capture`, `publication_uncertain`, `capture_uncertain`,
+  `custody_uncertain`, `unknown`, `recorded_at`). This does not certify current
+  availability, latest local edits or exportability. Recorded evidence or
+  uncertainty holds; no recorded recovery evidence or unresolved custody keeps
+  `worker_lost`, without proving absence of unrecorded work.
+  An explicit `run wait --until` retains its status set; ordinary recovery
+  continues as before. `run logs --follow` reports cause changes within the same
+  status, and the TUI places exhaustion in NEEDS YOU without a retry countdown.
   A `terminal_record_rejection` of `mac_failure` is a separate diagnostic:
   "terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody".
   The rejected record is unauthenticated, distinct from a trusted unsent outcome;
   it authorizes no outcome replay, completion, terminal lease renewal, or extra
-  finalize-resume allowance. Ordinary requeue policy still applies; a policy failure
-  keeps `worker_lost` as its origin, with this rejection prose.
+  finalize-resume allowance. Ordinary requeue policy still applies; no recorded recovery evidence or unresolved custody
+  keeps `worker_lost` as its origin, with this rejection prose; it does not prove
+  absence of unrecorded worker work. Recorded evidence or uncertainty at exhaustion
+  instead holds the run at `recovery_wait` / `worker_requeue_exhausted` for owner Resume.
   The originating worker's exact-generation open hold remains in custody. For a terminal
-  run without an available independently verified capture, it reports `source_only`:
+  run or a non-terminal exhaustion hold without an available independently verified
+  capture, it reports `source_only` rather than `active_protected`:
   "no recovery archive; custody of worker `<name>`'s local source is retained (export unavailable; it may be the only copy)".
   Export requires an available independent capture; a verified pin must first be archived.
   Hold discard changes database custody; it does not repair the worker journal.

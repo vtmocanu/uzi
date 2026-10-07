@@ -112,20 +112,26 @@ a `claim_generation` **equal** to `runs.claim_generation` (exact generation, nev
 no live exact-generation `terminal_pending` lease.
 
 - `RequeueAttestedFinalizeRuns` re-queues an attested run when it is **under budget**
-  (`requeue_count < RUN_MAX_REQUEUES`; an ordinary requeue, no allowance mark), or when it is
-  **over budget and the one-shot allowance is available** (`RUN_MAX_REQUEUES > 0` and
+  (episode spend `requeue_count - requeue_episode_baseline < RUN_MAX_REQUEUES`; an ordinary requeue, no allowance mark), or when it is
+  **over budget in initial episode 0 and the one-shot allowance is available**
+  (`worker_recovery_episode = 0`, `RUN_MAX_REQUEUES > 0` and
   `finalize_resume_generation IS NULL`), in which case it also sets `finalize_resume_generation =
   claim_generation`. It sets the same columns as `RequeueWorkerRuns` (except `budget_paused_seconds`, which is omitted
   because the query pins `status = running`) and never decrements
   `requeue_count`, so ADR-1390 D2's refund rule is untouched.
-- `FailAttestedFinalizeRunsOverCap` fails an attested run that is over budget with the allowance
-  unavailable (already used, or `RUN_MAX_REQUEUES=0`), `fail_origin = worker_lost`, exactly like
-  `FailWorkerRunsOverCap`. The two queries are disjoint; failing runs first.
-- Non-attested runs go through the unchanged `FailWorkerRunsOverCap` / `RequeueWorkerRuns`. The
-  requeued run is re-claimed by the same worker (affinity) at G+1 by the unchanged `ClaimRun`, and
-  completes only through the unchanged completion path (the claim-generation fences, plus the
-  completion permit where the run is interlocked).
-- `RUN_MAX_REQUEUES=0` stays "never re-queue": the allowance is off at 0.
+- `FailAttestedFinalizeRunsOverCap` and `FailWorkerRunsOverCap` use the #2394
+  disposition at exhaustion when the allowance is unavailable (already used,
+  owner-started episode, or `RUN_MAX_REQUEUES=0`): recorded recovery evidence,
+  unresolved custody or uncertainty parks at `recovery_wait` /
+  `worker_requeue_exhausted`; no recorded recovery evidence or unresolved
+  custody keeps `fail_origin = worker_lost`, without proving absence of
+  unrecorded worker work. Over-cap disposition precedes ordinary requeues.
+- Non-attested runs use ordinary episode-budget disposition. Re-claim and
+  completion retain the normal claim-generation and released-incarnation fences,
+  plus the completion permit where the run is interlocked; affinity gives the
+  same worker a chance but does not promise local clone availability.
+- `RUN_MAX_REQUEUES=0` means "no automatic requeues": the allowance is off at 0,
+  but owner Resume of an exhaustion hold queues one explicit attempt.
 - The api logs `finalize_resume_offered`, `finalize_requeued`, `finalize_allowance_used` and
   `finalize_failed` on the register commit line ("worker register active snapshot committed"), and
   publishes the transitions post-commit.
@@ -142,7 +148,7 @@ re-claimed while the closure lasts, and no second execution starts over another 
 outcome (the #1393 guarantee stands).
 
 **Why this is not a broad exemption.** It needs a worker-authenticated record for that exact run
-and generation, still `running`, owned by the registering worker. It fires at most once per run and
+and generation, still `running`, owned by the registering worker. It fires only in initial episode 0, at most once per run, and
 is off at `RUN_MAX_REQUEUES=0`. It never considers eviction or infrastructure cause. A lying worker
 holding its own join token gains at most one extra re-queue of a run it already owns.
 
@@ -206,8 +212,12 @@ exist. What happens in each case:
 - **The run resumes** (re-queued, re-claimed at G+1 on the same worker, clone present): the
   existing path verifies the work and captures it under **G+1** (`recovery_wait` park, then
   settle). This is unchanged behaviour.
-- **The run is failed instead** (over budget, allowance spent, or `RUN_MAX_REQUEUES=0`): G's hold
-  reports retained **`source_only`** custody with no available archive.
+- **The run is held for owner Resume** at exhaustion with unresolved source custody
+  (allowance spent, owner-started episode, or `RUN_MAX_REQUEUES=0`): without an
+  available independently verified capture, G's hold reports retained
+  **`source_only`** custody, not `active_protected`, with no available archive.
+  No recorded recovery evidence or unresolved custody instead keeps `worker_lost`;
+  that decision is not proof of absence of unrecorded work.
 - **On a Docker-lane worker** the attempt clone lives on `/data/runner`, an `emptyDir`, and does
   not survive a pod loss; there the work that existed only in the clone is gone (whatever reached
   the worker's bare tracking ref at a checkpoint remains).
@@ -238,8 +248,11 @@ record and logs nothing), `register finalize snapshot` (count and a sample of ge
   still `running`, unreleased, not chat, at the **exact** attested generation, with no live
   exact-generation terminal lease. Widening any of these widens what a worker token can do to a
   budget decision.
-- The allowance is **one-shot per run** through `runs.finalize_resume_generation`, off at
-  `RUN_MAX_REQUEUES=0`, and no path may decrement `requeue_count` for it.
+- The allowance is **one-shot per run**, only in initial episode 0, through
+  `runs.finalize_resume_generation`, off at `RUN_MAX_REQUEUES=0`. Owner Resume
+  never renews the marker; ordinary under-budget requeues never stamp or overwrite
+  it. Owner-started episodes cannot exceed their configured automatic cap.
+  The allowance charge is not a readoption-refund entitlement.
 - Any writer that re-queues a run must keep `ClaimRun`'s worker-level overflow exclusion as the
   gate on the re-claim.
 - The record and the terminal journal are mutually exclusive on the offered list: a run with a
@@ -250,8 +263,10 @@ record and logs nothing), `register finalize snapshot` (count and a sample of ge
 
 - **The residual crash window.** A crash before the record is durable (after the agent's final turn
   but before `executor.run` resolves, or during the record's own write before the link and the
-  directory fsync complete) leaves no record and behaves exactly as before this change: re-queued
-  under budget, failed `worker_lost` over budget. Executor success cannot be proved across that
+  directory fsync complete) leaves no attested proof: ordinary requeue under the
+  episode budget; at exhaustion, hold with recorded recovery evidence, unresolved
+  custody or uncertainty, otherwise `worker_lost`. This is not proof of absence
+  of unrecorded worker work. Executor success cannot be proved across that
   window and this design does not try to.
 - **Ordinary-path retirement invariant.** On the ordinary path (the offered run has no pending
   terminal journal on the worker and no live exact-generation terminal lease at the api), with an
@@ -268,11 +283,17 @@ record and logs nothing), `register finalize snapshot` (count and a sample of ge
 - **The live-lease plus MAC-rejected-journal mixed case** (a live exact-generation terminal lease
   meeting a journal that fails its MAC) belongs to #1974 and is unchanged here.
 - **Restarts slower than the stale windows** are handled by the sweeper before the worker can
-  register: an under-budget run is re-queued, and only an over-budget one is failed. The record
+  register: an under-budget run is re-queued; at exhaustion, recorded evidence,
+  unresolved custody or uncertainty holds it for owner Resume, otherwise it fails
+  `worker_lost` without proving absence of unrecorded work. The record
   cannot help a worker that never comes back in time.
-- **Attempt bounds.** A run that used the allowance has one more attempt than the budget: the
-  honest lifetime bound of the per-attempt question cap and answer deadline becomes `x
-  (RUN_MAX_REQUEUES + 2)` for that run (`x (RUN_MAX_REQUEUES + 1)` otherwise).
+- **Attempt bounds are per episode.** Initial episode 0 has at most
+  `RUN_MAX_REQUEUES + 1` attempts, or `RUN_MAX_REQUEUES + 2` only if the
+  once-per-run allowance is used. Each owner-started episode has at most
+  `RUN_MAX_REQUEUES + 1` attempts. Multiply `QUESTION_MAX` and
+  `QUESTION_TIMEOUT_SECONDS` by those attempt counts for their per-episode
+  bounds. Further owner resumes mean these variables alone impose no finite
+  lifetime bound; the existing wall budget is preserved.
 - **The 256-entry cap** mirrors the api's default `ACTIVE_SNAPSHOT_MAX_ENTRIES`. That limit is
   operator-configurable: an api set below the offered count drops the whole list, and the worker
   still retires the offered records after the accepted register (the retirement-gap limit above).
@@ -365,7 +386,8 @@ that separates "absent" from an exec error, e.g. `kubectl exec <scratch-pod> -c 
 ### Preconditions
 
 - A dedicated scratch hosted worker with persistent `/data`, serving only a scratch repository.
-- The cut stops the scratch worker's heartbeats. The stale sweeper would fail an over-budget run
+- The cut stops the scratch worker's heartbeats. The stale sweeper would dispose of an
+  over-budget run (owner hold with recorded evidence or uncertainty, otherwise `worker_lost`)
   after two stale windows (`WORKER_HEARTBEAT_STALE`, default 45s), so for the duration of the
   check the maintainer raises `WORKER_HEARTBEAT_STALE` on the api and restores it afterwards. This
   is a global api setting, so its restoration is part of cleanup, not an afterthought. Reading the
@@ -579,8 +601,12 @@ abort the attempt (the trap cleans up) and repeat with a new scratch run.
    for B at E before the cut was applied, abort the attempt.** Then run the pre-kill check at E,
    kill the agent process and delete the policy. Never interrupt a capture-only claim as though
    it had run an executor.
-8. Expect for B: `failed` with `fail_origin = worker_lost`; `finalize_resume_generation` still G
-   (the allowance is not reused); and `uzi run recovery <B>` shows either an `archive_ready` hold
+8. Under the #2394 amendment, expect B to hold at `recovery_wait` /
+   `worker_requeue_exhausted` when recorded recovery evidence or unresolved
+   custody exists; no recorded recovery evidence or unresolved custody keeps
+   `failed` / `worker_lost` (not proof that no unrecorded work survives).
+   `finalize_resume_generation` stays G (the allowance is not reused);
+   `uzi run recovery <B>` shows either an `archive_ready` hold
    whose archive `uzi run export` downloads (a finalization-pinned source), or a `source_only` hold
    printed as "no recovery archive; custody ... retained (export unavailable ...)". It must never
    show a silent empty hold.
@@ -589,3 +615,42 @@ abort the attempt (the trap cleans up) and repeat with a new scratch run.
    hold reports `source_only` (D4b).
 10. Let the trap run (or run the explicit restore above), verify both restorations, and record the
     observed outcome on issue #1742.
+
+## Amendment 2026-10-07 — #2394 owner-resumed recovery episodes
+
+The accepted plan approved on 2026-10-07 qualifies the over-cap and
+initial once-per-run allowance claims above. Worker-death exhaustion is
+decided from recorded server state under the existing transition locks,
+without a forge lookup. The over-cap reader uses a fresh snapshot after
+the complete target locks; read failure/savepoint fallback records unknown
+evidence and holds rather than inferring absence. A persisted
+`checkpoint_tip`, available capture, any pending publication attempt,
+`preparing`/`uploading`/`needs_action`/unknown capture, or unsettled source custody
+across the owner/run at any generation holds the run for explicit owner
+Resume. There is no innocent-sibling exemption: registration cannot
+attribute the memory consumer.
+
+The observation remains historical until owner Resume or Cancel. Capture
+expiry cannot fail or auto-promote it; no classifier or background absence
+finalizer reclassifies the hold. Timer, credential, vault, account, extend,
+approval, follow-up and pause inputs neither release nor renew it, and
+custody is never implicitly released. Local source availability is not
+promised; Docker-lane pod loss cannot recover unrecorded clone edits.
+
+Owner Resume releases the exact run hold and queues one explicit attempt
+through normal claim-generation and released-incarnation fences, including
+at `RUN_MAX_REQUEUES=0`. It starts a new episode with the current maximum
+automatic charges. Lifetime charged `requeue_count` and generation-proven
+readoption refunds are preserved; episode spend is count minus baseline,
+not a reset monotonic physical-death count. The wall budget is preserved:
+held time is banked only if its clock already started, and approval/input
+waits are banked at park. The unused finalize-resume allowance is eligible
+only in initial episode 0, with a positive maximum and exhausted allowance;
+owner-started episodes cannot exceed the cap or renew the lifetime marker.
+
+User-facing behavior and exact historical-evidence wording live in
+[Worker recovery exhausted](../docs/run-recovery-wait.md#worker-recovery-exhausted);
+the CLI JSON contract and wait/follow behavior live in
+[CLI worker recovery exhaustion](../docs/cli.md#worker-recovery-exhaustion).
+This amendment changes neither authenticated record format nor terminal
+MAC/lease guards.

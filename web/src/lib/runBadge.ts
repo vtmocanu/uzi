@@ -6,6 +6,7 @@
 import {
   isTerminalRun,
   type LatestRun,
+  type Run,
   type Milestone,
   type MilestoneAgent,
   type RunHealth,
@@ -153,6 +154,7 @@ export function effectiveRunStatus(
     is_revising?: boolean;
     completion_phase?: "checking" | "reworking" | "blocked" | "";
     hold_reason?: string | null;
+    recovery_wait_cause?: string | null;
   },
 ): string {
   if (isPlanningRun(run)) return "planning";
@@ -180,6 +182,7 @@ export function effectiveRunStatus(
   // and the board card's LatestRun (the server's board projection sends hold_reason on every
   // card, so runBadge meets this key too).
   if (run.status === "paused" && run.hold_reason === "credential_disabled") return "credential_disabled";
+  if (run.status === "recovery_wait" && run.recovery_wait_cause === "worker_requeue_exhausted") return "worker_requeue_exhausted";
   return run.status;
 }
 
@@ -308,10 +311,9 @@ export function runStatusTone(
   // other "blocked on something outside the run" holds — never danger: it has not
   // failed and it resumes on its own when a token is pooled (or on demand).
   if (status === "pool_wait") return "warning";
-  // Issue #1197: a transient-recovery park. Warn, like the other self-resuming
-  // holds — never danger: it has not failed and it resumes on its own on a capped
-  // backoff until it recovers or the owner cancels it.
-  if (status === "recovery_wait") return "warning";
+  // Recovery holds use warning: transient recovery and worker exhaustion are
+  // non-terminal, though exhaustion requires an owner decision.
+  if (status === "recovery_wait" || status === "worker_requeue_exhausted") return "warning";
   // PRD #1190: a run its owner paused. INFO, not the warn the involuntary holds carry
   // (D11): a pause is a chosen hold, not something blocking the run. Kept in step with
   // RUN_STATUS_TONES.paused (the runBadge.test.ts tone-agreement loop asserts it).
@@ -484,7 +486,7 @@ function badgeTitle(reason: string | null | undefined): string | undefined {
 
 // runBadge maps a card's latest_run to its primary status pill. nowMs is passed in
 // (not read from Date.now) so the running elapsed is deterministic under test.
-export function runBadge(run: LatestRun, nowMs: number): RunBadge {
+export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause" | "worker_recovery" | "requeue_count">>, nowMs: number): RunBadge {
   // The stopped signal wins over the raw status so a cancel-shaped `failed`
   // never renders as breakage.
   if (isStoppedRun(run.status, run.stop_kind)) {
@@ -626,12 +628,22 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         title:
           "Waiting for a pooled Anthropic token. It resumes automatically once one is added to the pool.",
       };
-    // Issue #1197: a transient-recovery park. STATIC — no countdown and no elapsed,
-    // like the other self-resuming holds: the backoff instant is server-owned and
-    // carries no DTO field the card could count down to, so the only honest thing
-    // the pill says is THAT it is recovering. The label "recovery wait" reads fine
-    // de-underscored, so StatusPill needs no RUN_STATUS_LABELS override to match it.
-    // Warn-toned, never danger: it has not failed and it resumes on its own.
+    // Exhaustion is an owner decision, with no timer or automatic resumption.
+    case "worker_requeue_exhausted":
+      return {
+        kind: "badge",
+        label: "recovery needs decision",
+        tone: "warning",
+        pulse: false,
+        title: [
+          "Automatic worker recovery has stopped. Only the run owner can resume or cancel; there is no scheduled retry.",
+          run.worker_recovery
+            ? `Automatic recovery limit: ${run.worker_recovery.automatic_requeue_limit}. Used: ${run.worker_recovery.episode_used}. Remaining: ${run.worker_recovery.episode_remaining}.`
+            : "Automatic recovery limit, used and remaining: unknown.",
+          `Lifetime automatic requeues: ${run.requeue_count ?? "unknown"}.`,
+        ].join(" "),
+      };
+    // The board projection omits the cause; run details determine the available actions.
     case "recovery_wait":
       return {
         kind: "badge",
@@ -639,7 +651,7 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         tone: "warning",
         pulse: false,
         title:
-          "Paused to recover from a transient interruption — it resumes automatically.",
+          "Recovery is on hold. Open the run page for details and available actions.",
       };
     // PRD #1190: a run its owner paused. Info-toned and STATIC (no elapsed on the badge —
     // the per-card duration token carries `paused <elapsed>` via runDurationLabel). The
@@ -880,6 +892,7 @@ export function needsHumanAttention(status: string): boolean {
   return (
     isAwaitingApproval(status) ||
     isAwaitingInput(status) ||
-    isAwaitingFollowup(status)
+    isAwaitingFollowup(status) ||
+    status === "worker_requeue_exhausted"
   );
 }

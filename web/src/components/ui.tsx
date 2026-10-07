@@ -483,6 +483,7 @@ export const RUN_STATUS_TONES: Record<
    *  wait" de-underscores fine, so the default label already matches runBadge's word
    *  (the ui.test.tsx label-agreement loop over this map asserts the two surfaces agree). */
   recovery_wait: { tone: "warning" },
+  worker_requeue_exhausted: { tone: "warning" },
   /** PRD #1190: a run its OWNER paused. `info` tone (D11), deliberately DISTINCT from
    *  the warning-toned involuntary holds (limit_wait / pool_wait / awaiting_*): those
    *  are something to notice, a pause is something the owner did. NOT pulsing — a paused
@@ -543,6 +544,7 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   // matching "waiting for pool" label (the ui.test.tsx label-agreement loop over
   // RUN_STATUS_TONES asserts the two surfaces print one word).
   pool_wait: "waiting for pool",
+  worker_requeue_exhausted: "recovery needs decision",
   // PRD #1190: the "‖" glyph tells a chosen pause apart from the rate-limit park's "~"
   // (the TUI carries the same distinction). Kept in step with runBadge's matching
   // "‖ paused" label — the ui.test.tsx label-agreement loop over RUN_STATUS_TONES asserts
