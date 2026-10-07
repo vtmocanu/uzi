@@ -4185,6 +4185,10 @@ export class GitCache {
           if (value === "") continue;
           const journal = await this.readRecoveryCapture(barePath, branch, entries);
           if (!journal) throw new Error("unreadable recovery attribution");
+          if (journal.attemptId !== undefined &&
+              (parseAttemptPath(journal.clonePath, path.resolve(this.runnerRoot))?.attemptId ?? "") !== journal.attemptId) {
+            throw new Error("recovery attempt identity disagrees with clone path");
+          }
           if (journal.runId !== runId) { foreignOwners.add(journal.runId); continue; }
           paths.set(journal.clonePath, { branch, runId });
         }
@@ -4198,7 +4202,7 @@ export class GitCache {
         }
         const heads = new Set<string>();
         const clones: Array<{ clonePath: string; branch: string; runId: string }> = [];
-        for (const [clone, owner] of paths) {
+        clonePaths: for (const [clone, owner] of paths) {
           const parsed = parseAttemptPath(clone, path.resolve(this.runnerRoot));
           const key = parsed?.key ?? path.basename(clone);
           if (!parsed && !/^[A-Za-z0-9_-]+$/.test(key)) throw new Error("unknown canonical clone key");
@@ -4208,9 +4212,12 @@ export class GitCache {
           const root = path.resolve(this.runnerRoot);
           if (!path.isAbsolute(clone) || path.resolve(clone) !== clone ||
               path.dirname(path.dirname(clone)) !== root) throw new Error("unsafe clone path");
-          // ENOENT proves no physical clone remains, only after validating all parents.
+          // After attribution validation, probe outer-to-inner: ENOENT skips this clone
+          // without reading descendants; every existing ancestor must be a non-symlink directory.
           for (const dir of [root, path.dirname(clone)]) {
-            const st = await fs.lstat(dir);
+            let st: Stats;
+            try { st = await fs.lstat(dir); }
+            catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue clonePaths; throw err; }
             if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("unsafe clone parent");
           }
           let st: Stats;
