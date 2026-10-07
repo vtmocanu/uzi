@@ -13,6 +13,20 @@ import { nullLogger, testGitCacheOptions } from "./helpers.js";
 const H = "a".repeat(40);
 const H2 = "b".repeat(40);
 
+it("review probe: an initial guarded pin does not keep an acknowledged generation unsettled", async () => {
+  const f = await fixture();
+  try {
+    await f.coordinator.pin({ runId: "run-1", generation: 7, kind: "issue", branch: "task", sourceSha: H, inventoryGuarded: true });
+    const record = await f.freeze();
+    assert.ok(record);
+    await f.capture(record);
+    assert.equal((await f.coordinator.inspect("run-1")).find(r => r.captureId === record.captureId)?.finalAcknowledged, true);
+    assert.equal(await f.coordinator.inventoryCleanupState("run-1", 7), "acknowledged");
+    assert.deepEqual([...await f.coordinator.unsettledGuardedGenerations("run-1")], [],
+      "the covering final ACK settles the generation, including its original pin record");
+  } finally { await f.close(); }
+});
+
 it("review probe: unreadable guarded journal cannot prove its generation settled", async () => {
   const f = await fixture();
   try {

@@ -2011,7 +2011,11 @@ export class RecoveryCoordinator {
 
   /** Cleanup authority requires a complete authenticated physical journal, unlike inspect. */
   async inventoryCleanupState(runId: string, generation: number): Promise<"legacy" | "pending" | "acknowledged"> {
-    const records = await this.checkedRecords(runId);
+    return this.cleanupStateOf(await this.checkedRecords(runId), generation);
+  }
+
+  /** The one settlement rule, shared by cleanup authority and owed-context pruning. */
+  private async cleanupStateOf(records: RecoveryRecord[], generation: number): Promise<"legacy" | "pending" | "acknowledged"> {
     const relevant = records.filter(r => r.generation === generation);
     const guarded = relevant.filter(r => r.inventoryGuarded === true);
     if (guarded.length === 0) return "legacy";
@@ -2203,9 +2207,11 @@ export class RecoveryCoordinator {
    *  uncertainty can never read as an empty protection set. */
   async unsettledGuardedGenerations(runId: string): Promise<Set<number>> {
     const out = new Set<number>();
-    for (const r of await this.checkedRecords(runId)) {
-      if (r.inventoryGuarded && !r.finalAcknowledged && typeof r.generation === "number") out.add(r.generation);
-    }
+    const records = await this.checkedRecords(runId);
+    const guarded = new Set<number>();
+    for (const r of records) if (r.inventoryGuarded && typeof r.generation === "number") guarded.add(r.generation);
+    // Settled exactly when inventoryCleanupState says so (a covering FINAL ACK), per generation.
+    for (const generation of guarded) if (await this.cleanupStateOf(records, generation) !== "acknowledged") out.add(generation);
     return out;
   }
 
