@@ -228,4 +228,51 @@ grep -Fq 'missing' <<<"$OUT" || fail "renum_reword: not named as missing: $OUT"
 mig_scenario renum_wrong 00009
 [ "$RC" -eq 11 ] || fail "renum_wrong: a non-rename number change must stop with exit 11, got $RC: $OUT"
 
-echo "PASS land-prep-changelog-placement: real conflict-free rebase after a release fold stops with exit 11 naming the misplaced bullets; a rebase keeping them under [Unreleased] passes; a bullet changed only by the recorded migration renumber passes, any other edit stops"
+# 7-8. Chained renames (00002 -> 00003 and 00003 -> 00004) map each ORIGINAL number once:
+#      the correct "00003, 00004" passes; "00004, 00004" (a cascading substitution) stops.
+chain_scenario() {  # NAME NEWREFS
+  local d="$WORK/$1" refs="$2"
+  local branch_m=${BRANCH/new fixed desc/new fixed desc (migrations 00002, 00003)}
+  mkdir -p "$d"
+  git init -q --bare "$d/origin.git"
+  git init -q -b main "$d/seed"
+  git -C "$d/seed" config user.name test
+  git -C "$d/seed" config user.email test@example.com
+  printf '%s' "$ANC" > "$d/seed/CHANGELOG.md"
+  mkdir -p "$d/seed/api/internal/store/migrations"
+  printf -- '-- base\n' > "$d/seed/api/internal/store/migrations/00001_base.sql"
+  git -C "$d/seed" add -A
+  git -C "$d/seed" commit -qm base
+  git -C "$d/seed" remote add origin "$d/origin.git"
+  git -C "$d/seed" push -q -u origin main
+  git --git-dir="$d/origin.git" symbolic-ref HEAD refs/heads/main
+  git -C "$d/seed" switch -qc feature
+  printf '%s' "$branch_m" > "$d/seed/CHANGELOG.md"
+  printf -- '-- foo\n' > "$d/seed/api/internal/store/migrations/00002_foo.sql"
+  printf -- '-- bar\n' > "$d/seed/api/internal/store/migrations/00003_bar.sql"
+  git -C "$d/seed" add -A
+  git -C "$d/seed" commit -qm feature
+  git -C "$d/seed" push -q -u origin feature
+  git clone -q "$d/origin.git" "$d/root"
+  git -C "$d/root" config user.name test
+  git -C "$d/root" config user.email test@example.com
+  PR_JSON=$(jq -cn --arg h "$(git -C "$d/seed" rev-parse feature)" '{state:"OPEN",headRefName:"feature",baseRefName:"main",headRefOid:$h,headRepository:{name:"uzi"},headRepositoryOwner:{login:"test"}}')
+  export PR_JSON
+  land "$1"
+  [ "$RC" -eq 0 ] || fail "$1: initial land expected exit 0, got $RC: $OUT"
+  git -C "$d/wt" config user.name test
+  git -C "$d/wt" config user.email test@example.com
+  git -C "$d/wt" mv api/internal/store/migrations/00003_bar.sql api/internal/store/migrations/00004_bar.sql
+  git -C "$d/wt" mv api/internal/store/migrations/00002_foo.sql api/internal/store/migrations/00003_foo.sql
+  sed "s/(migrations 00002, 00003)/(migrations $refs)/" "$d/wt/CHANGELOG.md" > "$d/wt/CHANGELOG.new"
+  mv "$d/wt/CHANGELOG.new" "$d/wt/CHANGELOG.md"
+  git -C "$d/wt" commit -qam 'renumber 00002 -> 00003, 00003 -> 00004'
+  RC=0
+  OUT=$(PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/uzi 77 --repo-root "$d/root" --worktree "$d/wt" --skip-rebase --no-push --gate none 2>&1) || RC=$?
+}
+chain_scenario chain_ok '00003, 00004'
+[ "$RC" -eq 0 ] || fail "chain_ok: correct chained renumber should pass, got $RC: $OUT"
+chain_scenario chain_cascade '00004, 00004'
+[ "$RC" -eq 11 ] || fail "chain_cascade: a cascaded substitution must stop with exit 11, got $RC: $OUT"
+
+echo "PASS land-prep-changelog-placement: real conflict-free rebase after a release fold stops with exit 11 naming the misplaced bullets; a rebase keeping them under [Unreleased] passes; a bullet changed only by the recorded migration renumber passes (chained renames map each original once), any other edit stops"

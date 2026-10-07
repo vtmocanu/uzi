@@ -439,7 +439,8 @@ fi
 # `- ` line plus its indented continuation lines, compared verbatim, with one exception: a
 # migration renumber (a migration file the branch head adds that HEAD carries under the same
 # name with a new number prefix) may change that number inside the branch's own bullet. Only
-# those OLD->NEW pairs are substituted, as whole digit tokens; any other edit still stops.
+# those OLD->NEW pairs are substituted, in one pass over whole digit tokens (chained renames
+# never cascade); any other edit still stops.
 # Each file read gets a trailing blank line so awk sees a first record even when it is empty.
 changelog_placement_guard() {
   local mb gd stray subs lease_m head_m n pfx rest h hp
@@ -465,20 +466,16 @@ changelog_placement_guard() {
     done <<< "$head_m"
   done <<< "$lease_m"
   stray=$(awk -v subs="$subs" '
-    function renum(s,   i, j, np, pr, old, new, out, pre, post) {
+    function renum(s,   j, np, pr, k, M, out, tok) {
       np = split(subs, pr, " ")
-      for (j = 1; j <= np; j++) {
-        old = pr[j]; sub(/:.*/, "", old); new = pr[j]; sub(/^[^:]*:/, "", new)
-        out = ""
-        while ((i = index(s, old)) > 0) {
-          pre = (i > 1) ? substr(s, i - 1, 1) : ""; post = substr(s, i + length(old), 1)
-          if (pre !~ /[0-9]/ && post !~ /[0-9]/) out = out substr(s, 1, i - 1) new
-          else out = out substr(s, 1, i - 1 + length(old))
-          s = substr(s, i + length(old))
-        }
-        s = out s
+      for (j = 1; j <= np; j++) { k = pr[j]; sub(/:.*/, "", k); M[k] = pr[j]; sub(/^[^:]*:/, "", M[k]) }
+      out = ""
+      while (match(s, /[0-9]+/)) {
+        tok = substr(s, RSTART, RLENGTH)
+        out = out substr(s, 1, RSTART - 1) ((tok in M) ? M[tok] : tok)
+        s = substr(s, RSTART + RLENGTH)
       }
-      return s
+      return out s
     }
     function out() { if (cur != "") { if (isu) U[f, cur] = 1; else R[f, cur] = 1; if (isu && f == 2) B[++nb] = cur; cur = "" } }
     FNR == 1 { out(); f++ }
