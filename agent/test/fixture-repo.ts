@@ -108,9 +108,16 @@ export function makeFixture(files: Record<string, string> = {}, opts: { testName
   fs.mkdirSync(originPath);
   fs.mkdirSync(dataDir);
 
-  // Isolate from host/global git config so init.defaultBranch, gpg signing, or a
-  // missing user identity on the runner can't perturb the fixture.
-  const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+  // Fixture construction must own its repo, index, objects and config. Keep the
+  // non-Git environment (including PATH, TMPDIR and the ledger) for local tooling;
+  // never mutate process.env or the environment used by production gitEnv.
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("GIT_")) delete env[key];
+  }
+  env.GIT_CONFIG_GLOBAL = "/dev/null";
+  env.GIT_CONFIG_SYSTEM = "/dev/null";
+  env.GIT_TERMINAL_PROMPT = "0";
   const git = (args: string[]): void => {
     execFileSync("git", ["-C", originPath, ...args], { env, stdio: "pipe" });
   };
