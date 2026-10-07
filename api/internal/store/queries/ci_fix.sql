@@ -23,7 +23,7 @@
 -- Every current caller passes string(HarnessClaude) as a mechanical stopgap.
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
-    pipeline_id, pipeline_ref, failure_snapshot, ci_config_paths, wait_on_limit, auto_approve, required_capabilities, trigger_source, harness
+    pipeline_id, pipeline_ref, failure_snapshot, ci_config_paths, wait_on_limit, auto_approve, required_capabilities, trigger_source, harness, plan_cross_check_required
 ) VALUES (
     -- repo_id is nullable since PRD #39 (chat runs have none); the ::uuid cast keeps
     -- this ci_fix param a non-null uuid.UUID (a ci_fix run always has a repo).
@@ -32,7 +32,8 @@ INSERT INTO runs (
     -- required_capabilities (PRD #84 M2, issue #512 M1): inherit the repo's capability
     -- hint atomically via subquery, reusing the existing @repo_id param so no new Go
     -- struct field is generated. Same expression CreateRun uses.
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'ci_fix', @harness
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'ci_fix', @harness,
+    (@auto_approve AND (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id))
 )
 RETURNING *;
 

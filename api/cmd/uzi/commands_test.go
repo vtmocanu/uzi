@@ -143,12 +143,12 @@ func TestWhoamiJSON(t *testing.T) {
 }
 
 func TestWhoamiTable(t *testing.T) {
-	fc := &uzicli.FakeClient{User: apitypes.UserDTO{ID: "u1", Email: "a@example.com", IsAdmin: true}}
+	fc := &uzicli.FakeClient{User: apitypes.UserDTO{ID: "u1", Email: "a@example.com", IsAdmin: true, PlanCrossCheckEnabled: true}}
 	out, _, code := runCLI(t, fakeEnv(fc), "whoami")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
-	if !strings.Contains(out, "EMAIL") || !strings.Contains(out, "a@example.com") {
+	if !strings.Contains(out, "EMAIL") || !strings.Contains(out, "a@example.com") || !strings.Contains(out, "PLAN CROSS-CHECK") || !strings.Contains(out, "true") {
 		t.Errorf("unexpected table:\n%s", out)
 	}
 }
@@ -1623,9 +1623,9 @@ func TestRunLogsFollowRidesOutALimitWaitPark(t *testing.T) {
 	}
 
 	stderr := errBuf.String()
-	// PRD #1190 D13: the park notice now reads "waiting: Anthropic usage limit …" (reworded
+	// PRD #1190 D13: the park notice now reads "waiting: usage limit …" (reworded
 	// from "paused:"), so the one-shot edge notice is counted by that distinctive prefix.
-	if n := strings.Count(stderr, "waiting: Anthropic usage limit"); n != 1 {
+	if n := strings.Count(stderr, "waiting: usage limit"); n != 1 {
 		t.Errorf("park notice appeared %d times, want exactly 1 — it must fire on the EDGE into the park, not on every poll of a park that lasts hours:\n%s", n, stderr)
 	}
 	if !strings.Contains(stderr, "five_hour") || !strings.Contains(stderr, "resumes in") {

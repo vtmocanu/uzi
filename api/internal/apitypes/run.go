@@ -186,11 +186,19 @@ type RunDTO struct {
 	// run is in its pre-approval PLANNING turn (status running, iteration_count 0, no
 	// persisted plan yet; chat/judge excluded). Derived, not stored — no new column or
 	// status value. A pre-feature api pod omits it; absent reads as not-planning.
-	IsPlanning  bool `json:"is_planning"`
-	AutoApprove bool `json:"auto_approve"`
+	IsPlanning                bool     `json:"is_planning"`
+	AutoApprove               bool     `json:"auto_approve"`
+	AutoApproveBlockedReasons []string `json:"auto_approve_blocked_reasons"`
+	IssueInputReason          *string  `json:"issue_input_reason"`
+	// PlanCrossCheckRequired is the run's snapshot of the owner's plan cross-check
+	// setting at creation. It remains true after the approval gate is decided.
+	PlanCrossCheckRequired   bool    `json:"plan_cross_check_required"`
+	PlanCrossCheckGateReason *string `json:"plan_cross_check_gate_reason"`
+	// Detail-only, populated only for the authenticated owner; omitted on other surfaces.
+	PlanCrossCheckSummary *PlanCrossCheckSummaryDTO `json:"plan_cross_check_summary,omitempty"`
 	// TriggerSource records what/how/who started the run (issue #857): one of
 	// manual, autopilot, schedule, self_improve, ci_fix, mr_rework, chat, task,
-	// task_review, then_fix, judge, judge_rerun, resume. Always set (NOT NULL column,
+	// task_review, then_fix, judge, judge_rerun, resume, cross_check. Always set (NOT NULL column,
 	// DEFAULT 'manual'); historical rows carry a best-effort backfilled value.
 	TriggerSource string `json:"trigger_source"`
 	// Milestones is the run's FROZEN, human-approved milestone list (PRD #122 M1),
@@ -663,12 +671,12 @@ type RunDTO struct {
 	// pre-feature run and every run on an old worker omit it); filled on the single-run detail
 	// read (GetRun) only.
 	UsageEstimatedTail *UsageTailDTO `json:"usage_estimated_tail,omitempty"`
-	// Anthropic usage-limit park (PRD #35). A run that exhausts the owner's
-	// subscription window is parked at status "limit_wait" rather than failed, and
-	// resumes once the window reopens.
+	// Provider usage-limit park (PRDs #35/#2360). With waiting enabled and budget
+	// available, a recognized Claude or Codex subscription usage window parks at
+	// "limit_wait" and resumes after the reset or bounded fallback.
 	//
-	// WaitOnLimit is the run's opt-in, resolved at creation from the owner's default
-	// or an explicit override. It is on the DTO rather than inferred from the status
+	// WaitOnLimit is the run's waiting preference (default on), resolved at creation
+	// from the owner's default or an explicit override. It is on the DTO rather than inferred from the status
 	// because it is meaningful BEFORE any park — it is what a "will retry on limit"
 	// affordance renders, and what a per-run toggle reads back.
 	WaitOnLimit bool `json:"wait_on_limit"`

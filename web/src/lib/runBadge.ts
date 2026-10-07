@@ -300,7 +300,7 @@ export function runStatusTone(
   // PRD #517: an interactive run parked awaiting the owner's next follow-up.
   // Warn, like the other parks — it is a needs-you state, not a failure.
   if (status === "awaiting_followup") return "warning";
-  // PRD #35: a run parked on the owner's Anthropic usage limit. Warn, like the
+  // PRD #35: a run parked on the owner's usage limit. Warn, like the
   // other "blocked on something outside the run" state — never danger: it has not
   // failed and it resumes by itself.
   if (status === "limit_wait") return "warning";
@@ -594,7 +594,7 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         title:
           "Waiting for your next follow-up. Send one to continue the run.",
       };
-    // PRD #35: parked on the owner's Anthropic usage limit. STATIC — no countdown
+    // PRD #35: parked on the owner's usage limit. STATIC — no countdown
     // and no elapsed, unlike the running badge above. LatestRun is a deliberately
     // narrow board projection that carries neither retry_not_before nor
     // limit_resets_at, so the only honest thing this surface can say is THAT the run
@@ -609,7 +609,7 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         tone: "warning",
         pulse: false,
         title:
-          "Paused on an Anthropic usage limit. It resumes on its own when the window reopens.",
+          "Paused on a usage limit. It resumes on its own when the window reopens.",
       };
     // Issue #754: an auto-lane run parked because the owner's token pool is empty.
     // STATIC — no countdown and no elapsed: unlike limit_wait there is no reset

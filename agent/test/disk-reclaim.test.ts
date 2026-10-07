@@ -25,6 +25,7 @@ import type { GitCache } from "../src/git.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { makeClaim, nullLogger, recordingLogger } from "./helpers.js";
 import { realProcfsSkip } from "./real-procfs.js";
+import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 
 // PRD #1809 M3 (D5, D7): the running disk reclaim, its per-run lock and the soft-threshold
 // controller. The reclaim tests drive the real pass against a real data-dir fixture (the real
@@ -881,6 +882,7 @@ describe("runDiskReclaimPass model-pass HOMEs (PRD #1809 D7)", () => {
         yield { type: "result", subtype: "success", is_error: false };
       })()) as unknown as SdkQueryFn;
     const pass = runReadOnlyModelPass({
+      teardownTestDeps: portableTeardownTestDeps,
       token: "tok",
       systemPrompt: "sys",
       prompt: "hi",

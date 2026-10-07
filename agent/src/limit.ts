@@ -51,7 +51,7 @@ export interface RateLimitObservation {
 }
 
 /**
- * A turn that died because the owner's Anthropic usage window is exhausted.
+ * A turn that died because the owner's usage window is exhausted.
  *
  * Distinct from a plain Error so the runner can branch on it without matching on
  * message text — the same discipline the detection itself follows.
@@ -61,7 +61,7 @@ export class LimitReachedError extends Error {
   readonly rateLimitType?: string;
 
   constructor(opts: { resetsAtMs?: number; rateLimitType?: string; detail?: string }) {
-    super(`Anthropic usage limit reached${opts.detail ? `: ${opts.detail}` : ""}`);
+    super(`usage limit reached${opts.detail ? `: ${opts.detail}` : ""}`);
     this.name = "LimitReachedError";
     this.resetsAtMs = opts.resetsAtMs;
     this.rateLimitType = opts.rateLimitType;

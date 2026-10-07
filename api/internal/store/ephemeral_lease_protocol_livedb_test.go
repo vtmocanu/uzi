@@ -26,6 +26,8 @@ func TestEphemeralLeasePlacementProtocolMirrorLiveDB(t *testing.T) {
 		optInEphemeral(fx)
 		if withBusy {
 			busy := fx.worker("persistent", capOf(1), true)
+			mustExec(fx.ctx, fx.t, fx.pool, `UPDATE workers SET protocol_capabilities = $2 WHERE id = $1`,
+				busy, []string{"codex_harness_v1", "codex_runtime_v2", "codex_custom_model_v1"})
 			fx.holdActive(busy, 1)
 		}
 		w := seedLeasedWorker(fx, leaseRun{iid: i64p(iid)}, 0)

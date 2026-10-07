@@ -2,6 +2,7 @@
 import { afterEach, describe, it, expect } from "vitest";
 import { cleanup, render } from "@testing-library/react";
 import { Markdown } from "./Markdown";
+import { MarkdownCore } from "./MarkdownCore";
 
 afterEach(cleanup);
 
@@ -11,6 +12,79 @@ afterEach(cleanup);
 // sanitizer posture is unchanged (fence bodies never become live HTML).
 
 const fence = (lang: string, body: string) => "```" + lang + "\n" + body + "\n```";
+
+describe("Markdown decoded entity policy", () => {
+  it.each(["&#x202e;", "&#8238;", "&lrm;", "&shy;", "&#x200b;", "&#8203;"])(
+    "strips decoded %s from text and string attributes",
+    (entity) => {
+      const { container } = render(
+        <Markdown content={
+          "# Report " + entity + "denied&#x202c;\n\n" +
+          '[before' + entity + 'after](https://example.com/a&amp;b "before' + entity + 'after")\n\n' +
+          '![before' + entity + 'after](https://example.com/a&amp;b.png "before' + entity + 'after")'
+        } />,
+      );
+      expect(container.querySelector("h1")?.textContent).toBe("Report denied");
+      const link = container.querySelector("a")!;
+      expect(link.textContent).toBe("beforeafter");
+      expect(link.getAttribute("title")).toBe("beforeafter");
+      expect(link.getAttribute("href")).toBe("https://example.com/a&b");
+      const image = container.querySelector("img")!;
+      expect(image.getAttribute("alt")).toBe("beforeafter");
+      expect(image.getAttribute("title")).toBe("beforeafter");
+      expect(image.getAttribute("src")).toBe("https://example.com/a&b.png");
+    },
+  );
+
+  it.each([
+    ["&#x202e;", "%E2%80%AE"],
+    ["&#8238;", "%E2%80%AE"],
+    ["&lrm;", "%E2%80%8E"],
+    ["&shy;", "%C2%AD"],
+    ["&#x200b;", "%E2%80%8B"],
+    ["&#8203;", "%E2%80%8B"],
+  ])("keeps URL normalization for encoded %s without raw controls", (entity, encoded) => {
+    const { container } = render(
+      <Markdown content={'[link](https://example.com/a' + entity + 'b)\n\n![image](https://example.com/a' + entity + 'b.png)'} />,
+    );
+    // Markdown normalizes URL controls to percent escapes before the HAST policy.
+    expect(container.querySelector("a")?.getAttribute("href")).toBe("https://example.com/a" + encoded + "b");
+    expect(container.querySelector("img")?.getAttribute("src")).toBe("https://example.com/a" + encoded + "b.png");
+  });
+
+  it("scrubs decoded className arrays while preserving literal fence entities", () => {
+    const { container } = render(
+      <Markdown content={fence("py&#x202e;thon", "before\u202eafter &lrm; &#8238;\n\tend")} />,
+    );
+    expect(container.querySelector("code")?.className).toBe("language-python");
+    expect(container.querySelector("code")?.textContent).toBe("beforeafter &lrm; &#8238;\n\tend\n");
+  });
+
+  it("preserves benign entities, safe Unicode, Markdown and allowed whitespace", () => {
+    const { container } = render(
+      <Markdown content={'# Café 日本語 😀 &amp; &lt;ok&gt;\n\n**bold** &NewLine;middle&Tab;fin\n\n[link](https://example.com/a&amp;b "Café &quot;ok&quot;")'} />,
+    );
+    expect(container.querySelector("h1")?.textContent).toBe("Café 日本語 😀 & <ok>");
+    expect(container.querySelector("strong")?.textContent).toBe("bold");
+    expect(container.textContent).toContain("\nmiddle\tfin");
+    expect(container.querySelector("a")?.getAttribute("title")).toBe('Café "ok"');
+  });
+
+  it("leaves the trusted MarkdownCore default unscrubbed", () => {
+    const { container } = render(<MarkdownCore content={'# before&#x202e;after\n\n[link](https://example.com "before&lrm;after")'} />);
+    expect(container.querySelector("h1")?.textContent).toBe("before\u202eafter");
+    expect(container.querySelector("a")?.getAttribute("title")).toBe("before\u200eafter");
+  });
+
+  it("keeps entity-obfuscated dangerous URLs and raw HTML inert", () => {
+    const { container } = render(
+      <Markdown content={'[bad](java&#x202e;script:alert(1))\n\n![bad](java&lrm;script:alert(1))\n\n<script>alert(1)</script>'} />,
+    );
+    expect(container.querySelector("a")?.getAttribute("href")).toBeNull();
+    expect(container.querySelector("img, script")).toBeNull();
+    expect(container.textContent).toContain("<script>alert(1)</script>");
+  });
+});
 
 describe("Markdown shell-fence parity", () => {
   it("renders a bash fence through highlightShell with the exact text preserved", () => {

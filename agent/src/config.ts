@@ -90,6 +90,7 @@ export interface Config {
    */
   judgeModelTimeoutMs: number;
   reviewModelTimeoutMs: number;
+  crossCheckModelTimeoutMs: number;
   summaryModelTimeoutMs: number;
   /** PRD #1809 D7: the periodic reclaim cadence (UZI_DISK_RECLAIM_INTERVAL, default 10m). */
   diskReclaimIntervalMs: number;
@@ -405,6 +406,14 @@ export function summaryModelTimeoutMs(env: NodeJS.ProcessEnv): number {
 
 /** Parse a margin fraction in [0, 1) (e.g. UZI_DISK_SOFT_MARGIN); blank or anything
  *  outside the range falls back, matching positiveInt's lenient shape. */
+function crossCheckModelTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const ms = duration(env, "CROSS_CHECK_MODEL_TIMEOUT", "15m");
+  if (!Number.isSafeInteger(ms) || ms <= 0 || ms > 2 * 60 * 60_000) {
+    throw new Error("CROSS_CHECK_MODEL_TIMEOUT must be positive and at most 2h");
+  }
+  return ms;
+}
+
 function marginFraction(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
   const raw = env[key]?.trim();
   if (!raw) return fallback;
@@ -543,6 +552,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     diskAdmissionMaxWaitMs: duration(env, "UZI_DISK_ADMISSION_MAX_WAIT", "15m"),
     judgeModelTimeoutMs: 5 * 60_000,
     reviewModelTimeoutMs: 5 * 60_000,
+    crossCheckModelTimeoutMs: crossCheckModelTimeoutMs(env),
     summaryModelTimeoutMs: summaryModelTimeoutMs(env),
     diskReclaimIntervalMs: duration(env, "UZI_DISK_RECLAIM_INTERVAL", "10m"),
     runDiskSampleIntervalMs: duration(env, "UZI_RUN_DISK_SAMPLE_INTERVAL", "10m"),

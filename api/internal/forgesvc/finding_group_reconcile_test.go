@@ -3,6 +3,7 @@ package forgesvc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -56,9 +57,13 @@ type pendingPageDB struct {
 	store.FindingGroupDB
 	ops         []store.FindingGroupClaimOperation
 	statsCtxErr error
+	listErr     error
 }
 
 func (db *pendingPageDB) Query(_ context.Context, _ string, args ...interface{}) (pgx.Rows, error) {
+	if db.listErr != nil {
+		return nil, db.listErr
+	}
 	var after *time.Time
 	if len(args) > 1 {
 		cursor := args[1].(time.Time)
@@ -202,6 +207,8 @@ type markerPageDB struct {
 	url              string
 	candidateQueries int
 	beginErr         error
+	settleErr        map[uuid.UUID]error
+	settleAttempts   map[uuid.UUID]int
 }
 
 func (db *markerPageDB) Query(ctx context.Context, query string, args ...interface{}) (pgx.Rows, error) {
@@ -235,11 +242,10 @@ func (db *markerPageDB) Exec(_ context.Context, _ string, args ...interface{}) (
 	return pgconn.NewCommandTag("UPDATE 1"), nil
 }
 
-// recordedOp is the operation RecordFindingGroupIssue last touched, so the settlement
-// transaction fake answers for the op under test whatever the fixture size.
-func (db *markerPageDB) recordedOp() store.FindingGroupClaimOperation {
+// operation answers the settlement transaction's locked operation by identity.
+func (db *markerPageDB) operation(id uuid.UUID) store.FindingGroupClaimOperation {
 	for _, op := range db.ops {
-		if op.ID == db.recorded {
+		if op.ID == id {
 			return op
 		}
 	}
@@ -256,12 +262,22 @@ func (db *markerPageDB) Begin(context.Context) (pgx.Tx, error) {
 type markerTx struct {
 	pgx.Tx
 	db *markerPageDB
+	op uuid.UUID
 }
 
-func (tx *markerTx) QueryRow(_ context.Context, query string, _ ...interface{}) pgx.Row {
+func (tx *markerTx) QueryRow(_ context.Context, query string, args ...interface{}) pgx.Row {
 	switch {
 	case strings.Contains(query, "SELECT repo_id,issue_iid,issue_url"):
-		return markerRow{values: []any{tx.db.recordedOp().RepoID, tx.db.iid, tx.db.url}}
+		tx.op = args[0].(uuid.UUID)
+		if tx.db.settleAttempts == nil {
+			tx.db.settleAttempts = make(map[uuid.UUID]int)
+		}
+		tx.db.settleAttempts[tx.op]++
+		op := tx.db.operation(tx.op)
+		if op.Phase != "issue_recorded" || op.IssueIID == nil {
+			return markerRow{err: pgx.ErrNoRows}
+		}
+		return markerRow{values: []any{op.RepoID, *op.IssueIID, op.IssueURL}}
 	case strings.Contains(query, "finding_group_members"):
 		return markerRow{values: []any{int64(1)}}
 	default:
@@ -272,9 +288,12 @@ func (tx *markerTx) Exec(_ context.Context, _ string, _ ...interface{}) (pgconn.
 	return pgconn.NewCommandTag("UPDATE 1"), nil
 }
 func (tx *markerTx) Commit(context.Context) error {
-	tx.db.settled = tx.db.recorded
+	if err := tx.db.settleErr[tx.op]; err != nil {
+		return err
+	}
+	tx.db.settled = tx.op
 	for i := range tx.db.ops {
-		if tx.db.ops[i].ID == tx.db.recorded {
+		if tx.db.ops[i].ID == tx.op {
 			tx.db.ops[i].Phase = "settled"
 		}
 	}
@@ -282,9 +301,15 @@ func (tx *markerTx) Commit(context.Context) error {
 }
 func (tx *markerTx) Rollback(context.Context) error { return nil }
 
-type markerRow struct{ values []any }
+type markerRow struct {
+	values []any
+	err    error
+}
 
 func (r markerRow) Scan(dest ...interface{}) error {
+	if r.err != nil {
+		return r.err
+	}
 	for i, value := range r.values {
 		switch d := dest[i].(type) {
 		case *uuid.UUID:
@@ -335,40 +360,115 @@ func TestFullSyncMatchesMarkerOnLaterPageAfterRotation(t *testing.T) {
 	}
 }
 
-func TestIncrementalSyncSettlementFailureHoldsMarks(t *testing.T) {
-	repo, user := uuid.New(), uuid.New()
-	iid := int64(31)
-	db := &markerPageDB{pendingPageDB: &pendingPageDB{ops: []store.FindingGroupClaimOperation{{
-		ID: uuid.New(), UserID: user, RepoID: repo, Phase: "issue_recorded", IssueIID: &iid,
-		IssueURL: "https://example.com/issues/31", CreatedAt: time.Now().Add(-time.Minute),
-	}}}, beginErr: fmt.Errorf("settlement database unavailable")}
-	for i := 0; i < 100; i++ {
-		db.ops = append(db.ops, store.FindingGroupClaimOperation{
-			ID: uuid.New(), UserID: user, RepoID: repo, Phase: "in_flight",
-			CreatedAt: db.ops[0].CreatedAt.Add(time.Duration(i+1) * time.Second),
+func TestSyncRecordedSettlementFailureContinuesIssueSync(t *testing.T) {
+	for _, mode := range []string{"FullSync", "IncrementalSync"} {
+		t.Run(mode, func(t *testing.T) {
+			repo, user := uuid.New(), uuid.New()
+			fixed := time.Date(2026, time.October, 4, 12, 0, 0, 0, time.UTC)
+			first, later := uuid.New(), uuid.New()
+			firstIID, laterIID := int64(31), int64(32)
+			fault := errors.New("settlement database unavailable")
+			db := &markerPageDB{
+				pendingPageDB: &pendingPageDB{ops: []store.FindingGroupClaimOperation{
+					{ID: first, UserID: user, RepoID: repo, Phase: "issue_recorded", IssueIID: &firstIID,
+						IssueURL: "https://example.com/issues/31", CreatedAt: fixed},
+					{ID: later, UserID: user, RepoID: repo, Phase: "issue_recorded", IssueIID: &laterIID,
+						IssueURL: "https://example.com/issues/32", CreatedAt: fixed.Add(time.Second)},
+				}},
+				settleErr: map[uuid.UUID]error{first: fault},
+			}
+			cache := &fakeStore{}
+			svc := newTestService(cache)
+			svc.SetFindingGroupDB(db)
+			cursor := store.FindingGroupCursor{CreatedAt: fixed.Add(-time.Second), ID: uuid.New()}
+			svc.groupCursors = map[uuid.UUID]store.FindingGroupCursor{repo: cursor}
+			want := Marks{PRD: fixed.Add(time.Minute), Open: fixed.Add(2 * time.Minute), Finding: fixed.Add(3 * time.Minute)}
+			start := Marks{PRD: fixed, Open: fixed, Finding: fixed}
+			f := &fakeForge{
+				issues:        []forge.Issue{{IID: 41, Title: "prd", UpdatedAt: want.PRD}},
+				openIssues:    []forge.Issue{{IID: 42, Title: "open", UpdatedAt: want.Open}},
+				findingIssues: []forge.Issue{{IID: 43, Title: "finding", UpdatedAt: want.Finding}},
+			}
+			var output bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&output, nil)))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+			sync := func() (Marks, error) {
+				if mode == "FullSync" {
+					return svc.FullSync(context.Background(), repo, 7, f)
+				}
+				return svc.IncrementalSync(context.Background(), repo, 7, f, start)
+			}
+			for pass := 0; pass < 2; pass++ {
+				output.Reset()
+				got, err := sync()
+				if err != nil || got != want {
+					t.Fatalf("pass %d: marks=%v error=%v, want %v", pass, got, err, want)
+				}
+				writes := cache.upserts[pass*3:]
+				if len(writes) != 3 || writes[0].RepoID != repo ||
+					writes[0].ForgeIssueIid != 41 || writes[0].Title != "prd" ||
+					writes[1].ForgeIssueIid != 42 || writes[1].Title != "open" ||
+					writes[2].ForgeIssueIid != 43 || writes[2].Title != "finding" {
+					t.Fatalf("pass %d: cache writes = %+v", pass, writes)
+				}
+				log := output.String()
+				if strings.Count(log, "finding group reconciliation pending") != 1 ||
+					!strings.Contains(log, "level=WARN") || !strings.Contains(log, "repo_id="+repo.String()) ||
+					!strings.Contains(log, first.String()) || !strings.Contains(log, fault.Error()) {
+					t.Fatalf("pass %d: warning = %q", pass, log)
+				}
+				if db.ops[0].Phase != "issue_recorded" || db.ops[1].Phase != "settled" ||
+					db.settleAttempts[first] != pass+1 || db.settleAttempts[later] != 1 {
+					t.Fatalf("pass %d: operations=%+v attempts=%v", pass, db.ops, db.settleAttempts)
+				}
+				if got, exists := svc.groupCursors[repo]; !exists || got != cursor {
+					t.Fatalf("pass %d: cursor=%+v exists=%v, want %+v", pass, got, exists, cursor)
+				}
+			}
+			delete(db.settleErr, first)
+			if got, err := sync(); err != nil || got != want || db.ops[0].Phase != "settled" || db.settleAttempts[first] != 3 {
+				t.Fatalf("recovery: marks=%v error=%v operation=%+v attempts=%v", got, err, db.ops[0], db.settleAttempts)
+			}
 		})
 	}
-	cache := &fakeStore{}
-	svc := newTestService(cache)
-	svc.SetFindingGroupDB(db)
-	start := Marks{Finding: time.Now().Add(-time.Hour)}
-	for pass := 0; pass < 2; pass++ {
-		got, err := svc.IncrementalSync(context.Background(), repo, 7, &fakeForge{findingIssues: []forge.Issue{{
-			IID: 32, UpdatedAt: time.Now(),
-		}}}, start)
-		if err == nil || got != start || len(cache.upserts) != 0 {
-			t.Fatalf("pass %d: mark=%v error=%v cache writes=%d", pass, got, err, len(cache.upserts))
-		}
-	}
-	if _, advanced := svc.groupCursors[repo]; advanced {
-		t.Fatal("failed settlement advanced the group cursor past the recorded issue")
+}
+
+func TestSyncPendingFindingGroupListingFailureRemainsFatal(t *testing.T) {
+	for _, mode := range []string{"FullSync", "IncrementalSync"} {
+		t.Run(mode, func(t *testing.T) {
+			repo := uuid.New()
+			fault := errors.New("pending page unavailable")
+			db := &markerPageDB{pendingPageDB: &pendingPageDB{listErr: fault}}
+			cache := &fakeStore{}
+			svc := newTestService(cache)
+			svc.SetFindingGroupDB(db)
+			fixed := time.Date(2026, time.October, 4, 12, 0, 0, 0, time.UTC)
+			start := Marks{PRD: fixed, Open: fixed, Finding: fixed}
+			cursor := store.FindingGroupCursor{CreatedAt: fixed, ID: uuid.New()}
+			svc.groupCursors = map[uuid.UUID]store.FindingGroupCursor{repo: cursor}
+			f := &fakeForge{}
+			var got, want Marks
+			var err error
+			if mode == "FullSync" {
+				got, err = svc.FullSync(context.Background(), repo, 7, f)
+			} else {
+				want = start
+				got, err = svc.IncrementalSync(context.Background(), repo, 7, f, start)
+			}
+			if !errors.Is(err, fault) || got != want || len(f.listCalls) != 0 ||
+				len(cache.upserts) != 0 || len(cache.deleteCalls) != 0 || svc.groupCursors[repo] != cursor {
+				t.Fatalf("marks=%v error=%v forge calls=%v writes=%v evictions=%v cursor=%v",
+					got, err, f.listCalls, cache.upserts, cache.deleteCalls, svc.groupCursors[repo])
+			}
+		})
 	}
 }
 
 func TestFullSyncMarkerSettlementFailureRetainsPage(t *testing.T) {
 	repo, user := uuid.New(), uuid.New()
 	db := &markerPageDB{pendingPageDB: &pendingPageDB{}}
-	startTime := time.Now().Add(-time.Hour)
+	startTime := time.Date(2026, time.October, 4, 12, 0, 0, 0, time.UTC)
 	for i := 0; i < 101; i++ {
 		db.ops = append(db.ops, store.FindingGroupClaimOperation{
 			ID: uuid.New(), UserID: user, RepoID: repo, Phase: "in_flight",
@@ -381,12 +481,20 @@ func TestFullSyncMarkerSettlementFailureRetainsPage(t *testing.T) {
 	svc.SetFindingGroupDB(db)
 	marker := "<!-- uzi-finding-group-operation: " + db.ops[0].ID.String() + " -->"
 	for pass := 0; pass < 2; pass++ {
-		got, err := svc.FullSync(context.Background(), repo, 7, &fakeForge{allIssues: []forge.Issue{{
+		carrier := forge.Issue{
 			IID: 44, WebURL: "https://example.com/issues/44", Description: marker,
 			UpdatedAt: startTime.Add(200 * time.Second),
-		}}})
-		if err == nil || got != (Marks{}) || len(cache.upserts) != 0 || len(cache.deleteCalls) != 0 {
-			t.Fatalf("pass %d: marks=%v error=%v writes=%d evictions=%d", pass, got, err, len(cache.upserts), len(cache.deleteCalls))
+		}
+		got, err := svc.FullSync(context.Background(), repo, 7, &fakeForge{
+			allIssues: []forge.Issue{carrier}, findingIssues: []forge.Issue{carrier},
+		})
+		if pass == 0 {
+			if err == nil || got != (Marks{}) || len(cache.upserts) != 0 || len(cache.deleteCalls) != 0 {
+				t.Fatalf("marker pass: marks=%v error=%v writes=%d evictions=%d", got, err, len(cache.upserts), len(cache.deleteCalls))
+			}
+		} else if err != nil || got != (Marks{Finding: carrier.UpdatedAt}) ||
+			len(cache.upserts) != 1 || cache.upserts[0].ForgeIssueIid != 44 || len(cache.deleteCalls) != 1 {
+			t.Fatalf("durable-record pass: marks=%v error=%v writes=%v evictions=%d", got, err, cache.upserts, len(cache.deleteCalls))
 		}
 	}
 	if db.ops[0].Phase != "issue_recorded" || db.candidateQueries != 1 {

@@ -80,7 +80,7 @@ function asString(v: unknown): string | undefined {
   return typeof v === "string" ? v : undefined;
 }
 
-/** The five signalling bare names are exactly the HarnessSignalName members, so a
+/** The signalling bare names are exactly the HarnessSignalName members, so a
  *  qualified `mcp__uzi__<bare>` recognized by isSignalToolName maps back to its
  *  neutral name. The reducer only checks presence; the value keeps it honest. */
 function signalNameOf(name: string | undefined): HarnessSignalName | undefined {
@@ -213,6 +213,7 @@ export interface ClaudeHarnessDeps {
 
 export class ClaudeHarness implements RunHarness {
   readonly kind = "claude" as const;
+  private readonly draftCallIds = new Set<string>();
 
   /** The base SdkOptions and current-child sink set before each turn (see
    *  prepareTurn). The options are ASSEMBLED here from the owner's ClaudeTurnConfig. */
@@ -272,6 +273,7 @@ export class ClaudeHarness implements RunHarness {
    * them per turn (resume/abort/spawn) in startTurn.
    */
   prepareTurn(config: ClaudeTurnConfig, currentChild: { pid?: number }): void {
+    this.draftCallIds.clear();
     // Object reuse: the plan config is reused across both plan turns (first plan +
     // re-plan), so assemble ONCE per distinct config object and reuse the same
     // SdkOptions instance — matching today's "baseOptions is the ONE instance".
@@ -417,6 +419,11 @@ export class ClaudeHarness implements RunHarness {
       // The adapter marks recognized signal tool_uses so the reducer can drop them
       // from persisted output (group-before-filter); results are never marked.
       markSignals(items);
+      for (const item of items) {
+        if (item.kind === "tool" && item.phase === "started" && item.signal === "save_draft_plan" && item.id) {
+          this.draftCallIds.add(JSON.stringify([rec["parent_tool_use_id"] ?? null, item.id]));
+        }
+      }
       const usageObj = assistantUsageOf(msg);
       return {
         kind: "frame",
@@ -438,7 +445,14 @@ export class ClaudeHarness implements RunHarness {
     }
     if (type === "user") {
       const subagent = isSubagentFrame(rec);
-      const items = decodeUserItems(rec);
+      const items = decodeUserItems(rec).filter((item) => {
+        if (item.kind !== "tool" || item.phase !== "finished") return true;
+        // Consume only this invocation's pending ID; sibling/root IDs may coincide.
+        const captured = item.id !== undefined && this.draftCallIds.delete(
+          JSON.stringify([rec["parent_tool_use_id"] ?? null, item.id]),
+        );
+        return !captured && signalNameOf(item.name) !== "save_draft_plan";
+      });
       // A forwarded subagent user frame with no tool_result (its prompt text) never existed before
       // issue #2014's forwardSubagentText: drop it, as above.
       if (subagent && leg && items.length === 0) return undefined;

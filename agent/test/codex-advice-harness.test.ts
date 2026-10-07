@@ -1072,6 +1072,18 @@ describe("CodexAdviceHarness: provider error classification folds into the advic
     return result.end.terminal;
   }
 
+  for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) {
+    it(`classifies ${tag} with the shared policy_refusal category`, async () => {
+      const bits = makeHarness();
+      bits.transport.push(threadStarted()).push(codexError(tag)).push(turnCompleted("failed")).end();
+      const terminal = await terminalOf(bits);
+      const thrown = terminal.failure!.materialize();
+      assert.equal(thrown.failure.category, "policy_refusal");
+      assert.deepEqual(terminal.errors, [`codex turn ended with status: failed (${tag})`]);
+      assert.equal(terminal.policyRefusal, undefined, "advice carries category without run provenance");
+    });
+  }
+
   it("captures a non-retrying scalar codex_error and folds it into the advice terminal (errors + message + category)", async () => {
     const bits = makeHarness();
     bits.transport

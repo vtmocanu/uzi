@@ -229,15 +229,98 @@ describe("unix-socket helpers under a Codex-length TMPDIR", () => {
     }
   });
 
-  it("shortUnixSocket throws for a base too long to fit and leaves no us- directory", () => {
+  it("shortUnixSocket handles an over-long physical and cwd-relative base with owned cleanup", async () => {
     const long = fs.mkdtempSync(path.join(base, "q".repeat(120)));
+    const cwd = process.cwd();
+    let fixture: ReturnType<typeof shortUnixSocket> | undefined;
+    const server = http.createServer((req, res) => {
+      res.writeHead(200);
+      res.end(req.url === "/ping" ? "long-base pong" : "unexpected path");
+    });
     try {
-      assert.throws(() => shortUnixSocket(long), /bytes/);
+      if (process.platform !== "linux") {
+        assert.throws(() => shortUnixSocket(long), /bytes/);
+        assert.deepEqual(usDirs(long), []);
+        return;
+      }
+      fixture = shortUnixSocket(long);
+      const { socket, directoryFd } = fixture;
+      assert.ok(directoryFd !== undefined);
+      assert.ok(socket.startsWith(`/dev/fd/${directoryFd}/`));
+      assert.ok(path.isAbsolute(socket));
+      assert.ok(Buffer.byteLength(socket) <= 103);
+      const physicalDir = fs.realpathSync(path.dirname(socket));
+      const physical = path.join(physicalDir, path.basename(socket));
+      assert.equal(path.dirname(physicalDir), fs.realpathSync(long));
+      assert.ok(path.basename(physicalDir).startsWith("us-"));
+      assert.ok(Buffer.byteLength(physical) > 103);
+      assert.ok(Buffer.byteLength(path.relative(cwd, physical)) > 103);
+      assert.equal(process.cwd(), cwd);
+      await listenUnix(server, socket);
+      assert.equal(fs.realpathSync(socket), physical);
+      assert.ok(fs.lstatSync(physical).isSocket());
+      assert.equal(fs.statSync(socket).ino, fs.statSync(physical).ino);
+      const body = await new Promise<string>((resolve, reject) => {
+        const req = http.get({ socketPath: socket, path: "/ping" }, res => {
+          assert.equal(res.statusCode, 200);
+          let received = "";
+          res.on("data", chunk => received += chunk);
+          res.on("end", () => resolve(received));
+        });
+        req.on("error", reject);
+        req.setTimeout(3000, () => req.destroy(new Error("HTTP timeout")));
+      });
+      assert.equal(body, "long-base pong");
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+      fixture.dispose();
+      fixture.dispose();
+      assert.throws(() => fs.fstatSync(directoryFd), { code: "EBADF" });
+      assert.equal(fs.existsSync(physicalDir), false);
+      assert.equal(fs.existsSync(physical), false);
       assert.deepEqual(usDirs(long), []);
+      assert.equal(process.cwd(), cwd);
     } finally {
-      fs.rmSync(long, { recursive: true, force: true });
+      try {
+        if (server.listening) {
+          server.closeAllConnections();
+          await new Promise<void>(resolve => server.close(() => resolve()));
+        }
+      } finally {
+        fixture?.dispose();
+        fs.rmSync(long, { recursive: true, force: true });
+      }
     }
   });
+
+  if (process.platform === "linux") {
+    it("shortUnixSocket closes its acquired FD and removes its directory when alias verification fails", t => {
+      const long = fs.mkdtempSync(path.join(base, "q".repeat(120)));
+      const realpathSync = fs.realpathSync;
+      const failure = new Error("injected alias verification failure");
+      let openedFd: number | undefined;
+      try {
+        t.mock.method(fs, "realpathSync", (target: fs.PathLike) => {
+          if (typeof target === "string" && target.startsWith("/dev/fd/")) {
+            openedFd = Number(path.basename(target));
+            assert.ok(fs.fstatSync(openedFd).isDirectory(), "the captured FD was actually opened");
+            throw failure;
+          }
+          return realpathSync(target);
+        });
+        assert.throws(() => {
+          const unexpected = shortUnixSocket(long);
+          unexpected.dispose();
+        }, err => err === failure);
+        const directoryFd = openedFd;
+        assert.ok(directoryFd !== undefined);
+        assert.throws(() => fs.fstatSync(directoryFd), { code: "EBADF" });
+        assert.deepEqual(usDirs(long), []);
+      } finally {
+        t.mock.restoreAll();
+        fs.rmSync(long, { recursive: true, force: true });
+      }
+    });
+  }
 
   it("shortUnixSocket under a Codex-length base gives a bindable socket within the bound that round-trips a request", async () => {
     const { socket, dispose } = shortUnixSocket(base);

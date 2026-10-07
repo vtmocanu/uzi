@@ -96,7 +96,7 @@ describe("permit-scoped git output collection", () => {
         stdin: null,
         stdout,
         stderr,
-        completed: Promise.resolve({ code: 0 }),
+        cancel: async () => {}, completed: Promise.resolve({ code: 0 }),
       }),
       signal,
       () => internals.execScoped("git", ["--version"], { env: {}, maxBuffer }),
@@ -927,7 +927,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
 
   // Issue #134 (the production half of #127). Any git that writes into a repo spawns a
   // DETACHED `git maintenance run --auto --detach` that outlives the awaited process and keeps
-  // writing inside `.git`. removeRunnerClone() (runner.ts:454) `fs.rm`s the clone moments after
+  // writing inside `.git`. removeRunnerClone() removes the clone through pinned teardown moments after
   // the agent's last commit and our push, and `force: true` suppresses ENOENT, not ENOTEMPTY.
   // Pinning the CONFIG rather than trying to observe a race: the config is deterministic, the
   // race is not — and #127 spent two agents' effort failing to reproduce the race on demand.
@@ -1806,7 +1806,9 @@ describe("issue #909 — the owner-stamp reader falls back to the pre-#887 flatt
     // followed by deleting its stamp would instead create inconsistent committed custody.
     gitIn(bare, ["-c", "protocol.file.allow=user", "fetch", "--no-tags", `file://${first.path}`,
       `refs/heads/${branch}:refs/uzi-runner/${branch}`]);
-    await git.removeRunnerClone(first.path);
+    // Simulate a missing checkout in this isolated recovery fixture. Production
+    // teardown is covered by the worker-uid tests and deliberately refuses off Linux.
+    fs.rmSync(first.path, { recursive: true, force: true });
 
     // PRE-#887 persistent bare: only the old FLATTENED 2-part key (no `.owner`).
     gitIn(bare, ["config", "--local", "uzi-trackowner.agent-issue-500", runId]);

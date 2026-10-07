@@ -169,6 +169,7 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	r.Group(func(r chi.Router) {
 		r.Use(mw.RequireAuth(h.q, h.cfg))
 		r.Put("/me/autopilot", h.SetAutopilotEnabled)
+		r.Put("/me/cross-check", h.SetCrossCheck)
 		// Current-user run-judge opt-in (PRD #46): per-user consent to spend the
 		// caller's own tokens judging their finished runs. Session-scoped identity
 		// (never the body), like autopilot.

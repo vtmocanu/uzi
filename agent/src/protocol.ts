@@ -143,7 +143,7 @@ export type MessageKind =
   /** PRD #88: the answer that resolved a question (payload `{ question_id, answers }`),
    *  echoed to the feed so the round-trip is auditable, mirroring plan_feedback. */
   | "answer"
-  /** PRD #35 Decision 10: the run is being PARKED until the owner's Anthropic usage
+  /** PRD #35 Decision 10: the run is being PARKED until the provider's usage
    *  window reopens. Payload `{ rate_limit_type?: string, resets_at?: string }` —
    *  both OMITTED rather than null when unknown, so "unknown" has one shape.
    *
@@ -276,7 +276,7 @@ export interface AnswerBody {
  *
  *  RUN_KINDS is mirrored from the DB `runs_kind_check` constraint (in DB CHECK
  *  order); agent/test/run-kind-db-parity.test.ts keeps the two in sync. */
-export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task", "mr_rework", "job"] as const;
+export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task", "mr_rework", "job", "cross_check"] as const;
 export type RunKind = (typeof RUN_KINDS)[number];
 
 /** How a run's plan_md was produced (PRD #209 D4). "agent": the worker's own Phase-1
@@ -1004,20 +1004,25 @@ export interface IterationBudget {
   budgetExhausted?: boolean;
 }
 
-/** One human comment on the worked issue, snapshotted at run creation (PRD #381).
- *  Bodies are UNTRUSTED, attacker-influenceable free text. */
+/** One server-assessed issue comment, snapshotted at run creation.
+ *  Eligible bodies and withheld placeholders remain UNTRUSTED data. */
 export interface IssueCommentSnapshot {
   author_username: string;
   author_forge_user_id: number;
   /** RFC3339. */
   created_at: string;
   body: string;
+  reason?: "author_not_eligible" | "permission_unknown";
 }
 
-/** The bounded, bot/system-filtered snapshot of the issue's human comments carried
- *  on the claim (PRD #381). Absent for a comment-less issue, a non-issue kind, and a
- *  connection with an unknown bot id (D9). `truncated` is set when the thread was clipped. */
+/** Version 2 carries server-filtered comments: only uzi's own bot is excluded by
+ *  identity; other authors are assessed by the API. Empty/unknown threads may be
+ *  present. Missing/unsupported versions render unknown-permission placeholders.
+ *  `truncated` marks clipping after assessment of the complete fetched thread. */
 export interface IssueCommentsSnapshot {
+  version?: number;
+  withheld?: boolean;
+  unknown?: boolean;
   comments: IssueCommentSnapshot[];
   truncated: boolean;
 }
@@ -1144,9 +1149,26 @@ export interface ClaimJob {
  * `plan_md` used to be in that ignored list and no longer is — PRD #35's resume
  * path consumes it, so it is declared below.
  */
+/** Server-stored, bounded plan candidate for one live read-only child claim. */
+export interface ClaimPlanCrossCheck {
+  stage: "plan";
+  lead_run_id: string;
+  round: number;
+  candidate_digest: string;
+  deadline_at: string;
+  plan_md: string;
+  milestones: Milestone[];
+  required_capabilities: string[];
+  required_tools: string[];
+  size_class: string;
+  base_commit: string;
+  planning_diff: string;
+}
+
 export interface ClaimResponse {
   /** Protection requires this exact-generation assertion AND recovery_inventory_v1. */
   inventory_guarded?: boolean;
+  cross_check?: ClaimPlanCrossCheck;
   run_id: string;
   /** Run kind (PRD #6). "issue": work issue_iid's card. "ci_fix": diagnose + fix
    *  the failed `pipeline`. Absent on older servers ⇒ treat as "issue". */
@@ -1216,6 +1238,10 @@ export interface ClaimResponse {
    *  fact. Re-delivered on every resume/requeue of the same run (the server reads
    *  it from the row), so an unattended resume never hangs at the gate. */
   auto_approve?: boolean;
+  /** PRD #2149 M1: this autopilot plan requires an opposite-family cross-check before
+   *  implementation. The M1 worker parks it for human review while the checker is unavailable.
+   *  Omitted by older servers and on runs without the requirement. */
+  plan_cross_check_required?: boolean;
   /** PRD #400 M2: gates whether a TASK run opens a merge request. Meaningful only for
    *  kind="task": a task ALWAYS pushes its branch back (the deliverable is commits the
    *  user pulls), but opens an MR only when this is true (`uzi handoff --mr`). Every
@@ -1891,6 +1917,7 @@ export interface IssueCommentDTO {
   author: string;
   created_at: string;
   body: string;
+  reason?: "author_not_eligible" | "permission_unknown";
 }
 
 /** One issue's detail (GET /worker/runs/:id/forge/issues/:iid). `description` may be
@@ -1908,6 +1935,13 @@ export interface IssueDTO {
   description_truncated: boolean;
   comments: IssueCommentDTO[];
   comments_truncated: boolean;
+  content_reason?: "author_not_eligible" | "permission_unknown";
+  comments_withheld?: boolean;
+  comments_unknown?: boolean;
+  snapshot_comparison?: "changed" | "unchanged" | "unavailable";
+  snapshot_note?: string;
+  content_changed?: boolean;
+  metadata_unavailable?: boolean;
 }
 
 /** A lightweight issue row in a list (no description). */
@@ -2220,6 +2254,8 @@ export type PublishResult =
   | { ok: false; httpStatus: number };
 
 export interface StateRequest {
+  /** Required for an opted-in autopilot plan write; server-computed at submission. */
+  candidate_digest?: string;
   status: RunState;
   /** PRD #1392 M2 (#1247 generation fence): the exact claim generation THIS report is made
    *  against, so the api's park transaction settles only the hold that generation opened. Sent on
@@ -2396,18 +2432,19 @@ export interface StateRequest {
    *  which diverges from it once M2 lands (a re-claim can recover the tree via checkpoint
    *  while the session still breaks). */
   seeded_from_default?: boolean;
-  /** limit_wait (PRD #35): the epoch at which the exhausted Anthropic usage window
-   *  reopens, taken from the SDK's `SDKRateLimitInfo.resetsAt`. That field is a bare
-   *  `number` in the typings with no unit declared, so the WORKER normalizes it
-   *  (< 10^12 ⇒ seconds ⇒ ×1000) before sending and the server re-validates rather
-   *  than trusting the normalization. Absent when the frames carried no usable
-   *  reset — the server then falls back to its exponential park schedule. */
+  /** limit_wait (PRDs #35/#2360): epoch milliseconds when the exhausted provider
+   *  usage window reopens. Claude normalizes SDKRateLimitInfo.resetsAt
+   *  (< 10^12 ⇒ seconds ⇒ ×1000); Codex converts structured per-turn account
+   *  snapshot seconds to milliseconds and selects the latest selected-window reset.
+   *  The server re-validates the value. Absent when no usable reset remains —
+   *  the server then falls back to its exponential park schedule. */
   limit_resets_at?: number;
-  /** limit_wait (PRD #35): the SDK's `rateLimitType` verbatim, e.g. "five_hour".
-   *  Sent unvalidated ON PURPOSE — the server allowlists it against the SDK union
-   *  and coerces anything else to "unknown" before it reaches the DB, the DTO, the
-   *  feed or Slack. Doing the allowlisting here as well would put the authoritative
-   *  copy of the vocabulary on the untrusted side. */
+  /** limit_wait (PRDs #35/#2360): provider window type, e.g. "five_hour" —
+   *  Claude's SDK rateLimitType or Codex's mapped window duration.
+   *  Sent unvalidated ON PURPOSE — the server allowlists the shared vocabulary
+   *  and coerces anything else to "unknown" before it reaches the DB, DTO or Slack.
+   *  Run-message payloads follow a separate worker-authored path; their readers use
+   *  closed lookups. The server owns validation of these state-report fields. */
   rate_limit_type?: string;
   /** failed (PRD #69 M7a): the worker's structured guess at WHY this run is failing,
    *  mapped from the known reason CONSTANT at the report site — e.g.
@@ -2487,6 +2524,17 @@ export interface StateRequest {
   messages_through_seq?: number;
 }
 
+/** Atomic server snapshot. Candidate authority still requires the exact applied running ACK. */
+export interface PlanCrossCheckReconciliation {
+  leadLastSeq: number;
+  claimGeneration: number;
+  planCrossCheckSettled: boolean;
+  gateRevision: number;
+  gatePresentationId?: string;
+  gatePayloadDigest?: string;
+  currentPlanSHA256: string;
+}
+
 /**
  * What the server answered a state report with (PRD #35's park acknowledgement
  * contract). Both the 200 and the 409 path return `{"run": <RunDTO>}`, so the run's
@@ -2509,6 +2557,7 @@ export interface StateRequest {
  * construction. An enumeration would go stale; this cannot.
  */
 export interface StateAck {
+  reconciliation?: PlanCrossCheckReconciliation;
   /** Whether the server applied the transition. Diagnostics and logging only —
    *  see the warning above before branching on it. */
   applied: boolean;

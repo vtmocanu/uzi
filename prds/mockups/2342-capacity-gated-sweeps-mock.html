@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>PRD #2342 mock: capacity-gated label sweeps</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--bg:#080A0F;--surface:#0F121A;--raised:#171B26;--edge:#272D3C;--edge-strong:#3A4256;--fg:#E4E8F0;--muted:#949EB0;--faint:#7A859A;--brand:#FB923C;--on-brand:#1A1008;--ok:#34D399;--warn:#FBBF24;--info:#38BDF8}
+html{background:#05070a}body{margin:0;padding:24px;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--fg)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+h1.page{font-size:22px;margin:0 0 6px}p.note{font-size:13px;color:var(--muted);max-width:980px;margin:0 0 20px;line-height:1.5}
+h2.frame{font-size:16px;margin:30px 0 10px;color:var(--fg)}
+.board{background:var(--bg);border:1px solid var(--edge);border-radius:12px;padding:32px;box-sizing:border-box}
+.modal{max-width:640px;background:var(--surface);border:1px solid var(--edge);border-radius:14px;overflow:hidden}
+.mh{display:flex;justify-content:space-between;align-items:center;padding:18px 24px;border-bottom:1px solid var(--edge)}
+.mb{padding:22px 24px;display:flex;flex-direction:column;gap:20px}
+.mf{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:16px 24px;border-top:1px solid var(--edge);background:#0B0E14}
+.lbl{display:block;font-size:13px;font-weight:500;color:var(--muted);margin:0 0 6px}
+.hint{font-size:11px;color:var(--faint);margin:6px 0 0;line-height:1.5}
+.seg{display:flex;gap:4px;padding:3px;border:1px solid var(--edge);border-radius:8px;background:var(--raised)}
+.seg span{flex:1;text-align:center;font-size:12px;padding:6px 0;border-radius:6px;color:var(--muted)}
+.seg .on{background:rgba(251,146,60,.14);color:var(--brand);border:1px solid rgba(251,146,60,.4)}
+.chip{display:inline-flex;gap:6px;border:1px solid rgba(251,146,60,.4);background:rgba(251,146,60,.1);color:var(--brand);border-radius:6px;padding:2px 8px;font-size:11px}
+.inp{box-sizing:border-box;background:var(--raised);border:1px solid var(--edge);border-radius:8px;color:var(--fg);font:inherit;font-size:13px;padding:8px 10px}
+input.num{width:56px;text-align:center;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;padding:6px 4px;margin:0 4px}
+.tog{width:40px;height:22px;border-radius:999px;border:1px solid var(--brand);background:var(--brand);position:relative;flex:none;padding:0}
+.tog::after{content:"";position:absolute;top:2px;left:20px;width:16px;height:16px;border-radius:50%;background:var(--on-brand)}
+.tog.off{background:var(--raised);border-color:var(--edge-strong)}.tog.off::after{left:2px;background:var(--muted)}
+.row{display:flex;gap:10px;align-items:center}
+fieldset.gate{margin:0;border:1px solid rgba(251,146,60,.45);border-radius:12px;padding:16px 18px 18px;background:rgba(251,146,60,.04)}
+fieldset.gate legend{padding:0 6px;font-size:13px;font-weight:600}
+.new{font-size:10px;font-weight:600;letter-spacing:.06em;color:var(--info);border:1px solid rgba(56,189,248,.45);border-radius:999px;padding:1px 7px;margin-left:8px}
+.sentence{font-size:14px;line-height:2.4}
+.slots{display:flex;gap:6px;margin-top:12px}.slot{flex:1;height:26px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:10px;letter-spacing:.05em;border:1px solid}
+.btn{height:38px;padding:0 16px;border-radius:8px;font:inherit;font-size:13px}
+table{width:100%;border-collapse:collapse}th{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);text-align:left;padding:10px 14px;border-bottom:1px solid var(--edge)}
+td{padding:14px;border-bottom:1px solid var(--edge);vertical-align:top;font-size:12.5px}
+.pill{display:inline-block;font-size:11px;border-radius:999px;padding:2px 9px;border:1px solid}
+.p-warn{color:var(--warn);border-color:rgba(251,191,36,.45);background:rgba(251,191,36,.08)}
+.p-ok{color:var(--ok);border-color:rgba(52,211,153,.45);background:rgba(52,211,153,.08)}
+.p-mute{color:var(--muted);border-color:var(--edge)}.p-brand{color:var(--brand);border-color:rgba(251,146,60,.4)}
+.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+.card{background:var(--surface);border:1px solid var(--edge);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:10px}
+.card p{margin:0}.card .t{font-size:14px;font-weight:600}.card .d{font-size:12.5px;color:var(--muted);line-height:1.5}.card .m{font-size:11.5px;color:var(--faint)}
+a{color:var(--brand)}
+@media (max-width:760px){body{padding:12px}.board{padding:16px}.cards{grid-template-columns:minmax(0,1fr)}.tablewrap{overflow-x:auto}}
+</style></head><body>
+<h1 class="page">PRD #2342: capacity-gated label sweeps (mock)</h1>
+<p class="note">Presentation reference for PRD #2342, in the default ember theme. Frame 1 is interactive: change the numbers to see what the next check would do. Issue numbers, times and counts are placeholders. The PRD text wins where it specifies; this mock governs what the text leaves out.</p>
+
+<h2 class="frame">1. Schedule modal: label sweep with "When to send issues"</h2>
+<div class="board">
+<section class="modal" aria-label="Edit schedule">
+<div class="mh"><div><div style="font-size:17px;font-weight:600">Edit schedule</div><div class="mono" style="font-size:12px;color:var(--faint);margin-top:4px">owner/repo</div></div>
+<button class="btn" aria-label="Close" style="width:36px;padding:0;border:1px solid var(--edge);background:transparent;color:var(--muted)">&#x2715;</button></div>
+<div class="mb">
+<div><span class="lbl">Target</span><div class="seg"><span>Pinned issue</span><span class="on">Label sweep</span><span>Ad-hoc prompt</span></div></div>
+<div><span class="lbl">Labels</span><div class="row" style="flex-wrap:wrap;gap:6px"><span class="chip">on-deck <span aria-hidden="true">&#xd7;</span></span><span class="inp" style="flex:1;min-width:120px;padding:5px 8px;font-size:12px;color:var(--faint)">add label&hellip;</span></div>
+<p class="hint">A selector chooses candidates; a candidate fires only when it also carries the <b style="color:var(--muted);font-weight:500">uzi</b> label or is assigned to the uzi bot.</p></div>
+
+<div id="nstandalone" style="display:none"><label class="lbl" for="n1">Issues to send at a time</label><input class="inp num" id="n1" type="number" min="1" value="1" style="margin:0">
+<p class="hint">Oldest issues first. Each issue gets its own run.</p></div>
+
+<div><div class="row"><button type="button" class="tog" aria-label="Remove the selector label when a run starts" aria-pressed="true"></button><span style="font-size:13px">Remove <b style="color:var(--brand);font-weight:500">on-deck</b> when a run starts</span></div>
+<p class="hint">Removed once the run starts, so each issue is normally tried once. If its run fails, add the label again to retry. Needs a single selector label other than uzi.</p></div>
+
+<fieldset class="gate"><legend>When to send issues<span class="new">NEW</span></legend>
+<div class="row"><button type="button" class="tog" id="gt" aria-label="Limit by unfinished runs" aria-pressed="true"></button><span style="font-size:13px">Only send when I have room</span></div>
+<div id="gatebody">
+<p class="sentence" style="margin:12px 0 0">Use <input class="inp num" id="c" type="number" min="1" max="50" value="4" aria-label="Unfinished-run limit"> unfinished runs as my limit. Wait until there's room for at least <input class="inp num" id="k" type="number" min="1" max="50" value="2" aria-label="Room needed to send"> more, then send up to <input class="inp num" id="n" type="number" min="1" max="50" value="1" aria-label="Issues to send at a time"> issue(s).</p>
+<p class="hint">Counts your unfinished work across all repos, excluding chat and judge runs. Checked every 10 minutes; other activity can exceed this limit.</p>
+<div style="margin-top:16px;border-top:1px dashed var(--edge);padding-top:14px">
+<div class="row" style="justify-content:space-between"><label for="f" style="font-size:12px;color:var(--muted)">Mock-only preview (not to implement): unfinished runs right now</label><input class="inp num" id="f" type="number" min="0" max="50" value="3"></div>
+<div class="slots" id="slots" aria-hidden="true"></div>
+<p id="verdict" style="margin:12px 0 0;font-size:13px"></p>
+</div></div>
+</fieldset>
+
+<div><span class="lbl">Timing</span><div class="seg"><span>One time</span><span class="on">Recurring</span></div></div>
+<div class="row" style="align-items:flex-start;gap:12px"><div style="flex:1"><label class="lbl" for="cad">Cadence</label><div class="inp" id="cad" style="display:flex;justify-content:space-between"><span>Every N minutes</span><span style="color:var(--faint)">&#x25BE;</span></div></div>
+<div style="width:140px"><label class="lbl" for="cadn">Minutes</label><div class="inp mono" id="cadn">10</div></div></div>
+<p class="hint" style="margin-top:-12px">Cron <span class="mono" style="color:var(--muted)">*/10 * * * *</span>. Minute steps that divide 60: 1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30.</p>
+<div class="row"><span class="tog"></span><span style="font-size:13px">Auto-approve the plan</span></div>
+<div class="row" style="margin-top:-10px"><span class="tog"></span><span style="font-size:13px">Wait on usage limit</span></div>
+</div>
+<div class="mf"><span id="footer" style="font-size:12px;color:var(--faint)"></span><div class="row"><button class="btn" style="border:1px solid var(--edge);background:transparent;color:var(--muted)">Cancel</button><button class="btn" style="border:0;background:var(--brand);color:var(--on-brand);font-weight:600">Save</button></div></div>
+</section>
+</div>
+
+<h2 class="frame">2. Schedules list and the last-fire detail</h2>
+<div class="board">
+<div class="tablewrap" style="background:var(--surface);border:1px solid var(--edge);border-radius:12px;overflow:hidden">
+<table><thead><tr><th>Schedule</th><th>Cadence</th><th>Next fire</th><th>Last fire</th><th>Options</th></tr></thead><tbody>
+<tr><td><div style="font-weight:500;font-size:13.5px">On-deck sweep</div><div class="mono" style="color:var(--faint);margin-top:3px">owner/repo &middot; label <span style="color:var(--brand)">on-deck</span></div></td>
+<td><div class="mono">*/10 * * * *</div><div style="color:var(--muted);margin-top:3px">Every 10 min</div></td>
+<td><div style="color:var(--muted)">14:30</div><div style="color:var(--faint);font-size:11px">in 6 min</div></td>
+<td><span class="pill p-warn">Waiting for room</span><div style="color:var(--muted);margin-top:5px">14:20 &middot; space for 1 more run; needs 2</div></td>
+<td><span class="pill p-brand">limit 4 &middot; room 2</span> <span class="pill p-mute">1 at a time</span> <span class="pill p-mute">removes label</span></td></tr>
+<tr><td><div style="font-weight:500;font-size:13.5px">Planned-work sweep</div><div class="mono" style="color:var(--faint);margin-top:3px">owner/repo &middot; label Planned</div></td>
+<td><div class="mono">0 2 * * *</div><div style="color:var(--muted);margin-top:3px">Every day 02:00</div></td>
+<td><div style="color:var(--muted)">Tomorrow 02:00</div></td>
+<td><span class="pill p-ok">Started 3</span><div style="color:var(--muted);margin-top:5px">02:00</div></td>
+<td><span class="pill p-mute">no limit</span> <span class="pill p-mute">3 at a time</span></td></tr>
+</tbody></table></div>
+<div style="margin-top:18px;background:var(--surface);border:1px solid var(--edge);border-radius:12px;padding:16px 18px">
+<div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:10px">Last fire (On-deck sweep), as the detail view shows it</div>
+<div style="font-size:12.5px;line-height:1.9">
+<div><span class="pill p-warn">Waiting for room</span> <span style="color:var(--muted)">fired 14:20 &middot; 3 unfinished runs, limit 4 &middot; space for 1 more run; needs 2 &middot; nothing examined</span></div>
+<div><span class="pill p-ok">Started 1</span> <span style="color:var(--muted)">fired 14:10 &middot; 2 unfinished runs, limit 4 &middot; <a href="#">#1001</a> &rarr; run 0a1b2c3d &middot; on-deck removed</span></div>
+<div><span class="pill p-ok">Started 1</span> <span style="color:var(--muted)">fired 13:50 &middot; 1 unfinished run, limit 4 &middot; <a href="#">#1002</a> &rarr; run 4e5f6a7b &middot; <span style="color:var(--warn)">on-deck could not be removed</span> (the run started; remove it by hand)</span></div>
+</div></div>
+</div>
+
+<h2 class="frame">3. Default jobs: On-deck sweep</h2>
+<div class="board"><div class="cards">
+<div class="card" style="border-color:rgba(251,146,60,.5)"><div class="row" style="justify-content:space-between"><p class="t">On-deck sweep</p><span class="pill" style="color:var(--info);border-color:rgba(56,189,248,.45)">new</span></div>
+<p class="d">Drains a triaged backlog a little at a time. Every 10 minutes it sends the oldest <b style="color:var(--brand);font-weight:500">on-deck</b> issue to uzi while you have room, then removes the label.</p>
+<p class="m mono">label on-deck + uzi &middot; every 10 min<br>1 at a time &middot; limit 4, room 2</p>
+<button class="btn" style="align-self:flex-start;border:0;background:var(--brand);color:var(--on-brand);font-weight:600">Enable</button></div>
+<div class="card"><p class="t">Planned-work sweep</p><p class="d">Daily: starts up to 3 issues labelled <b style="font-weight:500">Planned</b> that also carry <b style="font-weight:500">uzi</b>.</p><p class="m mono">label Planned + uzi &middot; daily 02:00 UTC<br>3 at a time &middot; no limit</p><button class="btn" style="align-self:flex-start;border:1px solid var(--edge);background:transparent;color:var(--muted)">Enabled &middot; Edit</button></div>
+<div class="card"><p class="t">Bug triage</p><p class="d">Daily: works up to 4 <b style="font-weight:500">bug</b> issues that also carry <b style="font-weight:500">uzi</b>.</p><p class="m mono">label bug + uzi &middot; daily 00:00 UTC<br>4 at a time &middot; no limit</p><button class="btn" style="align-self:flex-start;border:1px solid var(--edge);background:transparent;color:var(--muted)">Enabled &middot; Edit</button></div>
+</div>
+<p style="margin:18px 0 0;font-size:12px;color:var(--faint)">"When to send issues" is a setting on every label sweep, so it can be added to any sweep, default or custom.</p>
+</div>
+
+<script>
+(function(){
+  var $=function(id){return document.getElementById(id)};
+  var on=true;
+  function v(id,lo,hi){var x=parseInt($(id).value,10);if(isNaN(x))x=lo;return Math.max(lo,Math.min(hi,x))}
+  function render(){
+    var c=v('c',1,50),k=v('k',1,c),n=v('n',1,50),f=v('f',0,50);
+    var free=Math.max(0,c-f),send=free>=k?Math.min(n,free):0,el=$('slots');
+    el.textContent='';
+    for(var i=0;i<Math.max(c,f);i++){
+      var d=document.createElement('div');d.className='slot';
+      if(i<f){d.textContent=i<c?'BUSY':'OVER';d.style.background='#171B26';d.style.borderColor=i<c?'#3A4256':'#FBBF24';d.style.color=i<c?'#949EB0':'#FBBF24'}
+      else if(i<f+send){d.textContent='SEND';d.style.background='rgba(251,146,60,.16)';d.style.borderColor='rgba(251,146,60,.55)';d.style.color='#FB923C'}
+      else{d.textContent='FREE';d.style.borderColor='#272D3C';d.style.color='#7A859A'}
+      el.appendChild(d);
+    }
+    var vd=$('verdict');
+    if(send>0){vd.textContent='Room for '+free+' more (needs '+k+'): the next check sends '+send+(send===1?' issue.':' issues.');vd.style.color='#34D399'}
+    else{vd.textContent='Waiting for room: space for '+free+' more run'+(free===1?'':'s')+'; needs '+k+'. The next check sends nothing.';vd.style.color='#FBBF24'}
+    $('footer').textContent='Every 10 min · '+n+' at a time'+(on?' · limit '+c+', room '+k:'')+' · auto-approve';
+    $('gatebody').style.display=on?'':'none';
+    $('nstandalone').style.display=on?'none':'';
+  }
+  ['c','k','f'].forEach(function(id){$(id).addEventListener('input',render)});
+  $('n').addEventListener('input',function(){$('n1').value=this.value;render()});
+  $('n1').addEventListener('input',function(){$('n').value=this.value;render()});
+  $('gt').addEventListener('click',function(){on=!on;this.classList.toggle('off',!on);this.setAttribute('aria-pressed',String(on));render()});
+  render();
+})();
+</script>
+</body></html>

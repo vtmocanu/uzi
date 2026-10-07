@@ -100,7 +100,7 @@ func TestWorkerRenderHostileBoundsAndScrolling(t *testing.T) {
 			m.workers.rows[0].workerOwner = nasty + "owner"
 			m.workers.rows[0].pressureText = []string{"data", "nix", "dind"}
 			w.DrainingSince, w.Ephemeral, w.EphemeralLeaseExpiresAt = &w.CreatedAt, true, nil
-			w.RetainingUnpublishedWork = true
+			w.RetainingUnpublishedWork, w.CustodyDecisionsNeeded = true, custodyCount(1)
 			for i := 0; i < 12; i++ {
 				w.ReportedRuns = append(w.ReportedRuns, apitypes.WorkerReportedRunDTO{RunID: fmt.Sprintf("reported-%02d", i), Phase: "running", TerminalPending: true})
 			}

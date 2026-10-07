@@ -429,14 +429,14 @@ func TestLimitFailureReasonOmitsWhatItDoesNotKnow(t *testing.T) {
 	at := time.Date(2026, 7, 27, 16, 0, 0, 0, time.UTC)
 	for name, tc := range map[string]struct{ got, want string }{
 		"both": {
-			limitFailureReason(strPtr("five_hour"), &at, ""),
+			limitFailureReason("claude", strPtr("five_hour"), &at, ""),
 			"Anthropic usage limit (five_hour) reached; resets at 2026-07-27T16:00:00Z",
 		},
-		"type only":  {limitFailureReason(strPtr("seven_day"), nil, ""), "Anthropic usage limit (seven_day) reached"},
-		"reset only": {limitFailureReason(nil, &at, ""), "Anthropic usage limit reached; resets at 2026-07-27T16:00:00Z"},
-		"neither":    {limitFailureReason(nil, nil, ""), "Anthropic usage limit reached"},
+		"type only":  {limitFailureReason("claude", strPtr("seven_day"), nil, ""), "Anthropic usage limit (seven_day) reached"},
+		"reset only": {limitFailureReason("claude", nil, &at, ""), "Anthropic usage limit reached; resets at 2026-07-27T16:00:00Z"},
+		"neither":    {limitFailureReason("claude", nil, nil, ""), "Anthropic usage limit reached"},
 		"detail": {
-			limitFailureReason(strPtr("overage"), nil, "budget spent"),
+			limitFailureReason("claude", strPtr("overage"), nil, "budget spent"),
 			"Anthropic usage limit (overage) reached; budget spent",
 		},
 	} {

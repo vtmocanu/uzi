@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Behavioral regression test for run-store-it.sh's throwaway-Postgres teardown,
+# Behavioral regression tests for run-store-it.sh (teardown and the #2304 TCP readiness probe),
 # driven by a FAKE `docker` on PATH. Proves the EXIT-trap cleanup removes the
 # container's ANONYMOUS DATA VOLUME (docker rm -v), not just the container -- the
 # leak that filled the worker's Docker data-root before this fix. No real docker
@@ -72,6 +72,46 @@ case "$rm_line" in
   *)               printf 'FAIL: teardown did not target uzi-store-it-<pid>: %s\n' "$rm_line"
                    fails=$((fails + 1)) ;;
 esac
+
+# Issue #2304: the readiness probe must use TCP. The fake models the postgres
+# image's startup timeline on a shared tick (one per `docker exec`): tick 1 is
+# initdb's temporary server (Unix socket only), ticks 2-3 its shutdown (nothing
+# answers), tick 4+ the final server (socket and TCP). A socket-only probe passes on
+# tick 1 and its recheck fails on tick 2: the false timeout. A TCP probe waits for
+# tick 4. A fake `go` records that the script got past readiness.
+LOG2="$TMP/docker2.log"
+TICK="$TMP/tick"
+echo 0 > "$TICK"
+FAKEBIN2="$TMP/bin2"
+mkdir -p "$FAKEBIN2"
+cat > "$FAKEBIN2/docker" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> '$LOG2'
+case "\$1" in
+  exec)
+    t=\$((\$(cat '$TICK') + 1)); echo "\$t" > '$TICK'
+    tcp=0; case " \$* " in *" -h 127.0.0.1 "*) tcp=1 ;; esac
+    if [ "\$t" -ge 4 ]; then exit 0; fi
+    if [ "\$t" -eq 1 ] && [ "\$tcp" -eq 0 ]; then exit 0; fi
+    exit 1 ;;
+  *) exit 0 ;;
+esac
+EOF
+cat > "$FAKEBIN2/go" <<EOF
+#!/usr/bin/env bash
+printf 'go %s\n' "\$*" >> '$LOG2'
+EOF
+chmod +x "$FAKEBIN2/docker" "$FAKEBIN2/go"
+
+# The fake go prints no test output, so the script fails later at its skip guard;
+# only whether it reached go matters here.
+out="$(PATH="$FAKEBIN2:$PATH" UZI_STORE_IT_PG_WAIT_SECS=10 bash "$SCRIPT" 2>&1 || true)"
+if grep -q '^go test' "$LOG2" && ! printf '%s' "$out" | grep -q 'never became ready'; then
+  printf 'PASS: readiness waits for the final TCP server, not initdb'"'"'s temporary socket server\n'
+else
+  printf 'FAIL: readiness accepted initdb'"'"'s temporary server and timed out on its shutdown (#2304)\n'
+  fails=$((fails + 1))
+fi
 
 if [ "$fails" -eq 0 ]; then
   printf '\nrun-store-it teardown test: all assertions passed\n'

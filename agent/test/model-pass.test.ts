@@ -6,13 +6,14 @@ import { existsSync } from "node:fs";
 
 import type { Options as SdkOptions } from "@anthropic-ai/claude-agent-sdk";
 
-import { runReadOnlyModelPass, safeReportFailed, type ReadOnlyModelPassOpts } from "../src/model-pass.js";
+import { runReadOnlyModelPass, isLiveModelPassHome, safeReportFailed, type ReadOnlyModelPassOpts } from "../src/model-pass.js";
 import { classifyLimitFailure, LimitReachedError, type RateLimitObservation } from "../src/limit.js";
 import { mapSdkMessage } from "../src/sdk-messages.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import type { WorkerClient } from "../src/client.js";
 import type { StateRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
+import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 
 // A queryFn that records the `options` object the helper built, then yields a scripted
 // stream. The recorded options are what the isolation-shape pin below asserts against.
@@ -41,6 +42,7 @@ function baseOpts(overrides: Partial<ReadOnlyModelPassOpts> = {}): ReadOnlyModel
     queryFn: capturingQueryFn([]).queryFn,
     denyReason: "the reviewer is read-only and runs no tools",
     log: nullLogger(),
+    teardownTestDeps: portableTeardownTestDeps,
     ...overrides,
   };
 }
@@ -235,6 +237,47 @@ function whenAborted(signal: AbortSignal | undefined): Promise<void> {
 }
 
 describe("runReadOnlyModelPass — HOME cleanup vs the aborted CLI (issue #933)", () => {
+  it("keeps its HOME registered until awaited pinned cleanup settles after the query", async () => {
+    const events: string[] = [];
+    let home = "";
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const cleanupEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const queryFn: SdkQueryFn = (() => (async function* () {
+      try {
+        yield assistantText("hello");
+        yield successResult();
+      } finally { events.push("query settled"); }
+    })()) as unknown as SdkQueryFn;
+    const pass = runReadOnlyModelPass(baseOpts({
+      queryFn,
+      teardownTestDeps: {
+        removeTreePinned: async (parent, name) => {
+          home = parent + "/" + name;
+          assert.deepEqual(events, ["query settled"]);
+          assert.equal(isLiveModelPassHome(home), true);
+          entered();
+          await gate;
+          assert.equal(isLiveModelPassHome(home), true);
+          events.push("cleanup settled");
+          throw new Error("refuse");
+        },
+      },
+    }));
+    let settled = false;
+    void pass.then(() => { settled = true; });
+    try {
+      await cleanupEntered;
+      assert.equal(isLiveModelPassHome(home), true);
+      assert.equal(settled, false);
+    } finally { release(); }
+    assert.equal(await pass, "hello");
+    assert.equal(isLiveModelPassHome(home), false);
+    assert.deepEqual(events, ["query settled", "cleanup settled"]);
+    await fs.rm(home, { recursive: true, force: true });
+  });
+
   it("timeout path: aborts the query, rejects, and removes HOME only after the query settles", async () => {
     let capturedHome: string | undefined;
     let homeExistedAtSettle: boolean | undefined;

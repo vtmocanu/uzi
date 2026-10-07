@@ -224,6 +224,7 @@ export class UsageLeg {
     if (this.droppedIds.has(id)) return undefined;
     if (this.byId.size >= USAGE_LEG_MAX_MESSAGES || this.owner.pendingTotal(this) >= USAGE_PENDING_MAX) {
       if (this.droppedIds.size < USAGE_DROPPED_IDS_MAX) this.droppedIds.add(id);
+      this.owner.noteUnconfirmedLoss();
       this.droppedCount++;
       this.touchMarker();
       return undefined;
@@ -294,6 +295,7 @@ export class UsageLeg {
     if (!this.dirty.has(rec)) {
       if (this.owner.pendingTotal(this) >= USAGE_PENDING_MAX) {
         if (!rec.lost) {
+          this.owner.noteUnconfirmedLoss();
           rec.lost = true;
           this.droppedCount++;
           this.touchMarker();
@@ -354,6 +356,7 @@ export class UsageLeg {
   /** @internal The records of this leg a rejected request carried: counted as dropped. */
   countDropped(n: number): void {
     if (n <= 0) return;
+    this.owner.noteUnconfirmedLoss();
     this.droppedCount += n;
     this.touchMarker();
   }
@@ -381,6 +384,15 @@ export class UsageRecorder implements UsageSink {
   private failedAttempts = 0;
   private backoffUntil = 0;
   private stopped = false;
+  private unconfirmedLoss = false;
+  private confirming = false;
+  private strictRetry = false;
+  private retryRequest: ReturnType<UsageRecorder["buildRequest"]>;
+
+  /** @internal Loss remains observable even after a finished leg is pruned. */
+  noteUnconfirmedLoss(): void { this.unconfirmedLoss = true; }
+  /** A missing receipt after refused/abandoned usage cannot be repaired by a later drain. */
+  get hasUnconfirmedLoss(): boolean { return this.unconfirmedLoss; }
   private readonly debounceMs: number;
   private readonly requestTimeoutMs: number;
   private readonly backoffBaseMs: number;
@@ -410,7 +422,8 @@ export class UsageRecorder implements UsageSink {
   }
 
   private schedule(delayMs: number): void {
-    if (this.timer || this.inFlight || this.inactive) return;
+    if (this.timer || this.inFlight || this.inactive || this.confirming ||
+        (this.strictRetry && this.retryRequest)) return;
     const wait = Math.max(delayMs, this.backoffUntil - Date.now());
     this.timer = setTimeout(() => {
       this.timer = undefined;
@@ -485,8 +498,9 @@ export class UsageRecorder implements UsageSink {
       this.schedule(0);
       return;
     }
-    const req = this.buildRequest();
+    const req = this.strictRetry ? this.retryRequest ?? this.buildRequest() : this.buildRequest();
     if (!req) return;
+    this.retryRequest = req;
     const abort = new AbortController();
     const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(this.requestTimeoutMs)]);
     const done = this.send(req, abort, signal);
@@ -506,6 +520,8 @@ export class UsageRecorder implements UsageSink {
     signal: AbortSignal,
   ): Promise<void> {
     const accept = (): void => {
+      this.retryRequest = undefined;
+      if (!this.confirming) this.strictRetry = false;
       for (const leg of new Set([...req.sent.keys(), ...req.markers.keys()])) {
         leg.markSent(req.sent.get(leg) ?? new Map(), req.markers.get(leg));
       }
@@ -553,6 +569,7 @@ export class UsageRecorder implements UsageSink {
       if (err.status >= 400 && err.status < 500 && err.status !== 408 && err.status !== 429) {
         // The api refused this request outright; retrying it would loop. Drop it and count the
         // records so coverage says so.
+        this.noteUnconfirmedLoss();
         log.warn("usage: the api refused a usage report; dropping it", { run_id: runId, status: err.status });
         for (const [leg, m] of req.sent) leg.countDropped(m.size);
         accept();
@@ -583,6 +600,8 @@ export class UsageRecorder implements UsageSink {
   /** Forget everything unsent. The legs stay registered: an open leg keeps recording and a later
    *  change to it posts again (the records dropped here surface as ordinal_gap / leg_not_closed). */
   private abandonUnsent(): void {
+    if (this.hasWork() || this.inFlight) this.noteUnconfirmedLoss();
+    this.retryRequest = undefined;
     for (const leg of this.legs) leg.abandon();
     this.pruneLegs();
   }
@@ -591,13 +610,45 @@ export class UsageRecorder implements UsageSink {
     for (let i = this.legs.length - 1; i >= 0; i--) if (this.legs[i]!.finished) this.legs.splice(i, 1);
   }
 
-  /**
-   * Post everything pending, waiting at most `deadlineMs` (default USAGE_DRAIN_DEADLINE_MS; a
-   * caller's `signal` can shorten it). Past the deadline the unsent records are ABANDONED and the
-   * in-flight request is ABORTED (its AbortSignal fires), not merely left unawaited; the caller
-   * proceeds. Never throws.
+  /** ACK-only settlement. One failure ends this call; replay remains pending.
+   * Cancellation aborts and awaits ownership rather than abandoning the tail.
+   */
+  async drainConfirmed(deadlineMs = USAGE_DRAIN_DEADLINE_MS, signal?: AbortSignal): Promise<boolean> {
+    if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 0)
+      throw new RangeError("confirmed usage deadline must be a nonnegative safe integer");
+    if (this.confirming) return false;
+    this.confirming = true;
+    this.strictRetry = true;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    const expiry = AbortSignal.any([AbortSignal.timeout(Math.max(0, Math.min(deadlineMs, USAGE_DRAIN_DEADLINE_MS))),
+      ...(signal ? [signal] : [])]);
+    const abort = (): void => { this.inFlight?.abort.abort(); };
+    expiry.addEventListener("abort", abort, { once: true });
+    const failed = this.failedAttempts;
+    try {
+      while (!expiry.aborted && !this.inactive && !this.unconfirmedLoss &&
+        this.failedAttempts === failed && (this.inFlight || this.hasWork())) {
+        await (this.inFlight?.done ?? this.pump(true));
+        if (this.inFlight) await Promise.resolve();
+      }
+      if (expiry.aborted) abort();
+      await this.inFlight?.done;
+      return !expiry.aborted && !this.inactive && !this.unconfirmedLoss &&
+        this.failedAttempts === failed && !this.hasWork();
+    } finally {
+      expiry.removeEventListener("abort", abort);
+      this.confirming = false;
+      if (!this.retryRequest) this.strictRetry = false;
+      if (this.hasWork()) this.schedule(0);
+    }
+  }
+
+  /** Post pending usage within the deadline, abandoning unsent records on expiry.
+   * Unlike drainConfirmed, refusal or abandonment can settle this ordinary drain.
    */
   async drain(deadlineMs: number = USAGE_DRAIN_DEADLINE_MS, signal?: AbortSignal): Promise<void> {
+    if (this.confirming) return;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = undefined;

@@ -1,4 +1,11 @@
 import { describe, it } from "node:test";
+import { RunRunner } from "../src/runner.js";
+import { FakeApi } from "./fake-api.js";
+import { makeFixture } from "./fixture-repo.js";
+import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
+import { WorkerClient } from "../src/client.js";
+import { GitCache } from "../src/git.js";
+import type { Executor } from "../src/executor.js";
 import { PassThrough } from "node:stream";
 import { createCodexTransport } from "../src/codex/transport.js";
 import assert from "node:assert/strict";
@@ -22,6 +29,7 @@ import {
 import { CodexUsageAccountant } from "../src/codex/token-accounting.js";
 import { renderCodexRun } from "../src/codex/render.js";
 import { CodexTurnFailedError } from "../src/codex/terminal-normalize.js";
+import { classifyLimitEvidence, LimitReachedError } from "../src/limit.js";
 import { evidencesModelProcessing, type HarnessEvent, type HarnessItem, type HarnessTerminal, type RunTurnRequest } from "../src/harness.js";
 import type { CodexNotification, CodexTransport, CodexUsageBreakdown } from "../src/codex/transport.js";
 import type { Logger } from "../src/log.js";
@@ -2148,6 +2156,46 @@ describe("CodexHarness: terminal provider fields are bounded + redacted", () => 
   });
 });
 
+describe("approved root planning policy refusal through RunRunner (#2321)", () => {
+  it("reports the typed provider origin after successful worker setup", async () => {
+    const api = new FakeApi("policy-test-worker");
+    const url = await api.listen();
+    const fx = makeFixture();
+    let runs = 0;
+    const log = nullLogger();
+    const client = new WorkerClient(url, "policy-test-worker", "test", log, {
+      sleep: async () => {}, terminalRetrySchedule: [1, 1],
+    });
+    const git = new GitCache(fx.dataDir, log, undefined, testGitCacheOptions());
+    const fakeCodexExecutor: Executor = {
+      async run(ctx) {
+        runs++;
+        assert.ok(ctx.worktreePath, "worker setup and clone succeeded before planning");
+        const { harness, transport } = makeHarness();
+        transport.push(threadStarted()).push(turnCompletedWithError("cyberPolicy")).end();
+        const events = await collect(harness.startTurn(makeRequest({ phase: "plan" })).events);
+        const last = events.at(-1)!;
+        assert.equal(last.kind, "turn_finished", "provider turn reached its behavior seam");
+        if (last.kind !== "turn_finished") throw new Error("missing terminal");
+        throw last.terminal.failure!.materialize().original;
+      },
+    };
+    const claim = makeClaim({
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+    });
+    try {
+      await new RunRunner(client, git, () => ({ executor: fakeCodexExecutor }), log, 20, undefined, { pollMs: 5 }).execute(claim);
+      assert.equal(runs, 1, "worker setup succeeded and planning ran once");
+      const failed = api.states.filter(s => s.body.status === "failed").at(-1)?.body;
+      assert.ok(failed);
+      assert.equal(failed.fail_origin, "provider_policy_refusal");
+      assert.equal(failed.failure_reason, "Codex provider safety-policy refusal (cyberPolicy)");
+    } finally {
+      try { await api.close(); } finally { fx.cleanup(); }
+    }
+  });
+});
+
 describe("CodexHarness: provider error classification folds into the terminal (PRD #1534)", () => {
   function terminalOf(events: HarnessEvent[]): HarnessTerminal {
     const last = events.at(-1)!;
@@ -2245,6 +2293,66 @@ describe("CodexHarness: provider error classification folds into the terminal (P
     const thrown = terminal.failure!.materialize();
     assert.match(thrown.failure.message, /codex turn failed: failed \(usageLimitExceeded\)/);
     assert.equal(thrown.failure.category, "rate_limit");
+    assert.ok(thrown.original instanceof CodexTurnFailedError);
+    assert.equal(thrown.original.failOrigin, "rate_limited");
+  });
+
+  it("#2360: only final usageLimitExceeded consumes subscription window evidence", async () => {
+    for (const tag of ["usageLimitExceeded", "rateLimitExceeded", "sessionBudgetExceeded"]) {
+      const { harness, transport } = makeHarness({ authMode: "subscription" });
+      transport.push(threadStarted()).push({
+        kind: "rate_limits_updated", method: "account/rateLimits/updated",
+        rateLimits: { primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: 2000000000 } }, params: {},
+      }).push(turnCompletedWithError(tag)).end();
+      const terminal = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+      const limit = classifyLimitEvidence(terminal.limitEvidence ?? { explicitExhaustion: false }, 1900000000000);
+      const thrown = terminal.failure!.materialize(limit);
+      if (tag === "usageLimitExceeded") {
+        assert.deepEqual(terminal.limitEvidence, { explicitExhaustion: true,
+          latest: { status: "rejected", resetsAtMs: 2000000000000, window: "five_hour" } });
+        assert.ok(thrown.original instanceof LimitReachedError);
+        assert.equal(thrown.original.message, "usage limit reached");
+        assert.deepEqual(thrown.failure.limit, { resetsAtMs: 2000000000000, window: "five_hour" });
+      } else {
+        assert.equal(terminal.limitEvidence, undefined);
+        assert.ok(thrown.original instanceof CodexTurnFailedError);
+        assert.equal(thrown.original.failOrigin, undefined);
+        assert.equal(thrown.failure.limit, undefined);
+      }
+    }
+  });
+
+  it("#2360: a new turn cannot reuse a previous turn snapshot", async () => {
+    const { harness, transport } = makeHarness({ authMode: "subscription" });
+    transport.push(threadStarted()).push({
+      kind: "rate_limits_updated", method: "account/rateLimits/updated",
+      rateLimits: { primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: 2000000000 } }, params: {},
+    }).push(turnCompleted("completed"));
+    const first = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+    assert.equal(first.outcome, "success");
+    assert.equal(first.limitEvidence, undefined);
+    transport.push(turnCompletedWithError("usageLimitExceeded")).end();
+    const second = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+    assert.equal(second.limitEvidence, undefined);
+    const thrown = second.failure!.materialize();
+    assert.ok(thrown.original instanceof CodexTurnFailedError);
+    assert.equal(thrown.original.failOrigin, "rate_limited");
+  });
+
+  it("#2360: undefined auth and api key never admit subscription evidence", async () => {
+    for (const authMode of [undefined, "api_key"] as const) {
+      const { harness, transport } = makeHarness({ authMode });
+      transport.push(threadStarted()).push({
+        kind: "rate_limits_updated", method: "account/rateLimits/updated",
+        rateLimits: { primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: 2000000000 } }, params: {},
+      }).push(turnCompletedWithError("usageLimitExceeded")).end();
+      const terminal = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+      assert.equal(terminal.limitEvidence, undefined);
+      const thrown = terminal.failure!.materialize();
+      assert.ok(thrown.original instanceof CodexTurnFailedError);
+      assert.equal(thrown.original.failOrigin, "rate_limited");
+      assert.equal(thrown.failure.limit, undefined);
+    }
   });
 
   it("issue #2099: the materialized failure is a CodexTurnFailedError carrying the closed classification", async () => {

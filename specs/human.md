@@ -26,6 +26,10 @@ terse and tag each AI edit `(AI-synced YYYY-MM-DD)`.
 
 - Text Read accepts path/file_path and optional one-based positive safe integer offset (default 1), limit 1–2000 (default 200); excerpts preserve UTF-8/BOM and LF/CRLF, cap at 64 KiB, and report size/content/offset/linesReturned/partialLastLine/truncated without duplicate base64 or a cursor. Strict helper validation retains the 1 MiB file ceiling and neutral errors. Invalid UTF-8 or NUL returns exact base64 only without explicit ranges; ranged binary is refused. Root and child replies must fit the existing 4 MiB transport cap. Full contract: [ADR 0296](../adr/0296-codex-bounded-text-reads.md). (AI-synced 2026-10-05)
 
+## Claude SDK spill Read (#2332)
+
+- On the Claude run lane the file-tool path guard lets `Read` (only) open a direct-child regular file of the run's own SDK tool-result spill directory (`<run HOME>/.claude/projects/<P>/<session_id>/tool-results/`), keyed on the SDK-supplied session_id/transcript_path and the worker-supplied HOME; other sessions' or runs' directories, symlinks and nested paths stay denied, and the /proc, secret and `.git` denies are unchanged. Full contract: [ADR 2332](../adr/2332-sdk-spill-read-allowance.md). (AI-synced 2026-10-06)
+
 ## MVP / infrastructure
 
 - Initial MVP is a local laptop demo via docker-compose.
@@ -202,9 +206,9 @@ Tracked as GitLab issue vtmocanu/uzi#19; PRD at `prds/done/19-admin-settings-and
 
 - Generic admin-only instance-settings infrastructure; the PRD label and the autopilot label are its first two configurable keys.
 - Admins can change the PRD label and the autopilot label; the board reflects the new label set after a resync (no code fork).
-- Autopilot: adding the autopilot label (alongside the PRD label) to an issue in GitLab runs it end to end with zero uzi interaction.
+- Autopilot: adding the autopilot label (alongside the run-eligibility label, default `uzi`) to an issue in GitLab normally runs it end to end without uzi interaction. With Plan cross-check enabled, a Claude lead proceeds only after Codex approves the exact plan and the handoff is acknowledged; a non-pass normally requires a human plan decision, and Codex leads park as unsupported. Irrecoverable preparation receipts or human-presentation ACK loss fails terminally; unresolved preparation ACKs after three attempts and an acknowledged forced human gate also fail. Historical findings do not certify a human revision. See [Cross-check](../docs/cross-check.md). (AI-synced 2026-10-06)
 - (AI-synced 2026-08-29) PRD #764 removed the `prd_label` setting (and its special-casing) and added a configurable `uzi_label` (default `uzi`) as the single run-eligibility key; autopilot now rides alongside `uzi`, not `PRD`. The generic admin-settings infrastructure and the configurable `autopilot_label` are unchanged.
-- Progress is visible via the existing board label moves; the user need never open uzi.
+- Progress is visible via the existing board label moves; an opted-in Plan cross-check fallback can require a human gate decision in uzi, the CLI or Slack. (AI-synced 2026-10-06)
 - Outcome returns as one GitLab issue comment: MR link on success; on failure, one comment with a run link.
 - Consent is per-user opt-in, default off — a third party must never be able to spend your Anthropic tokens without your opt-in.
 - Each user self-declares their own forge (human) username on their connection (the mapping autopilot attributes runs to).
@@ -982,6 +986,7 @@ Tracked as GitHub issue vtmocanu/uzi#1593.
 - The existing `awaiting_input` answer deadline (`QUESTION_TIMEOUT_SECONDS`) applies unchanged, and an unanswered attended run timing out is the intended outcome here, not a special case. [user, #1593]
 - An auto-approved (autopilot) run, or any run with no one to ask, never parks: after the nudge it fails closed with the distinct fail_origin `plan_missing` and a fixed `failure_reason`. [user, #1593]
 - Nothing is ever inferred from the lead's prose — it never becomes a plan, a question, or part of a later prompt. [user, #1593]
+- (AI-synced 2026-10-06) Explicit draft captures are advisory activity only, never submission, approval, prompt recovery or automatic adoption; retries require fresh review. [user, #2323]
 
 ## Feature #1598 — Codex command storage no longer accumulates in the writable layer
 
@@ -1124,7 +1129,8 @@ Tracked as GitHub issue vtmocanu/uzi#1906; design in `prds/1906-official-sources
 
 Tracked as GitHub issue vtmocanu/uzi#2099.
 
-- A Codex run turn that fails with a transient provider error (overload, internal-server or flex-capacity failure, or a transport failure with a 408/429/5xx status or none) is retried in place a bounded number of times; if it persists, the run is parked in `recovery_wait` instead of failed. A transport failure with a permanent status, and any non-transport failure (authentication, Codex rate/usage limit, other), fails as before. Cancel, pause and the wall budget keep precedence over the retry. (AI-synced 2026-10-02)
+- A Codex run turn that fails with a transient provider error (overload, internal-server or flex-capacity failure, or a transport failure with a 408/429/5xx status or none) is retried in place a bounded number of times; if it persists, the run is parked in `recovery_wait` instead of failed. A transport failure with a permanent status, authentication and other non-transport failures behave as before, except for the usage-limit requirement superseded by #2360 below. `rateLimitExceeded` and `sessionBudgetExceeded` behavior is unchanged. Cancel, pause and the wall budget keep precedence over the retry. (AI-synced 2026-10-06)
+- #2360 supersedes only #2099’s usage-limit requirement: a subscription Codex turn ending in `usageLimitExceeded` parks at `limit_wait` when accepted structured `account/rateLimits/updated` evidence from that turn identifies a window limit and the existing `wait_on_limit` preference (default on) and budgets permit it. Use the latest reset among exhausted windows, or highest-used ties for `rate_limit_reached` rounding; a missing selected reset or past reset uses bounded fallback. No reset is inferred from prose, account reads or polling. Limits classified as non-window (missing/unaccepted evidence, API-key or undefined authentication, spend-control, credit/quota/plan or unknown rejection evidence) fail as typed `rate_limited` without a reset promise; opt-out reasons are server-composed with the provider and reset when known. Resume keeps the frozen Codex account, without Anthropic pooling, gauge updates or token switching; an unavailable account is refused at claim and held by Sweep at `recovery_wait` / `codex_account_unavailable`. Successful WIP recovery reuses approval; failed capture retains the source clone without promising latest-work durability, and total tree loss keeps the existing re-gating policy. A resolvable non-Docker thread resumes; Docker attempt paths keep fresh-thread lineage breaks with work restored when available. The per-park 8-day default can hold the issue lock and run-bound hosted worker/PVC; fallback and the wait-count budget can exhaust before a weekly reset. See [PRD #2360](../prds/done/2360-codex-usage-limit-park.md); persistent `rateLimitExceeded` remains follow-up #2361. (AI-synced 2026-10-06)
 
 ## Startup admin seed
 

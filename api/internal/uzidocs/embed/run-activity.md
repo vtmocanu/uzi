@@ -48,14 +48,16 @@ plan by accident. A **reject** or **request changes** sent the same way is
 not ignored: it still applies at the run's first gate, the same
 fail-closed handling these two actions have always had.
 
-If a worker cannot re-present a plan gate it previously showed — for
-example after a restart or credential switch that lost track of what was
+For ordinary plan gates, if a worker cannot re-present a gate it previously
+showed — for example after a restart or credential switch that lost track of what was
 on screen — the run parks at `recovery_wait` (see [Recovery
 wait](./run-recovery-wait.md)) rather than showing a gate it can't stand
 behind, and a fresh claim retries. This is bounded: past
 `RUN_GATE_REFUSAL_MAX` such refusals for one run (see
 [Configuration](./configuration.md)), the next one fails the run instead
-of parking it again, with reason `gate_presentation_refused`.
+of parking it again, with reason `gate_presentation_refused`. Cross-check's
+irrecoverable receipt/presentation ACK losses instead fail terminally; see
+[Terminal delivery failures](./cross-check.md#terminal-delivery-failures).
 
 If the planning turn itself wrote anything to the worktree — a file the
 agent created or modified while it was still just planning, which would
@@ -66,9 +68,54 @@ sure you're approving with the full picture. A plan turn that touched
 nothing shows no such list. The same list is available from the terminal
 via `uzi run get` (see [the CLI docs](./cli.md#commands)).
 
-Autopilot runs skip this gate entirely — see [Autopilot](./autopilot.md).
+Autopilot normally skips the human gate. With [Plan cross-check](./cross-check.md),
+a Claude lead proceeds after an exact-plan pass; a non-pass normally forces
+this gate, and Codex leads park as unsupported. See [Autopilot](./autopilot.md).
 A full revision round also works end to end from
 [Slack](./slack.md#using-it), without opening the web UI.
+
+### Plan cross-check evidence
+
+The plan panel and run detail show **Plan cross-check** evidence separately
+from the current human gate: checked-candidate outcome, findings, checker-run
+link, recorded model/effort and reported tokens/cost. The activity feed
+includes plan cross-check events even when there is no agent lane. Pending,
+passed, changes requested, blocked, verdict deadline, checker model timeout,
+malformed/model/confinement failures, interruption and refusal have distinct
+labels; unknown or inconsistent verdict/reason pairs show unavailable.
+
+Findings use hardened Markdown, capped at 16,384 source characters across
+20 items, with a notice when truncated. Metadata is bounded and sanitized;
+missing model/effort is unreported, missing cost unavailable, and subscription
+usage is labelled separately from metered spend. New plan cross-check events
+refresh detail; a failed refresh waits for a later new event rather than
+retrying indefinitely.
+
+After a human revision, the original candidate is **Earlier-plan evidence**
+and does not certify the current plan. The current gate reason can clear
+while those findings remain visible. Decisions still act on the established
+presentation and revision; a status read cannot create or replace that gate.
+No automatic checker revision or fresh check is added by a human revision.
+
+### Advisory draft captures
+
+Before validation and after each revision, the lead can explicitly call
+`save_draft_plan` with its draft Markdown. The exact response is
+"Draft capture requested; this is not plan submission or approval."
+The activity log renders the latest valid capture by sequence number in both
+Timeline and By agent, labelled **draft, unapproved, possibly incomplete**.
+Captures are capped at 32 KiB after redaction; a truncated card shows a notice.
+Earlier captures remain stored and available in raw CLI JSON, even though their
+cards are suppressed in the web presentation. The existing activity display cap
+still applies. Subsequent validator reports remain ordinary messages in Timeline
+sequence order.
+
+Capture uses normal message delivery and best-effort close: a circuit breaker or
+deadline may leave an unacknowledged capture undelivered. The response does not
+promise it was saved. A capture offers no approval controls and never becomes the
+Plan tab's submitted plan. It cannot recover a plan from prose or a later prompt,
+and is never automatically adopted; a retry requires fresh review and ordinary
+plan submission and approval.
 
 ## Answering a question
 
@@ -535,6 +582,57 @@ a status line in the activity feed warns about the error and the run
 continues. The worker rebuilds the plugin each time the run starts or
 resumes, so the warning is posted once per start or resume, not once per
 turn. Codex runs are unaffected.
+
+## When Codex reports a provider safety-policy refusal
+
+A failed Codex turn classified as exactly `cyberPolicy` or
+`misalignmentPolicyViolation` has harness category `policy_refusal`.
+When that root failure determines the run's outcome, the run fails with
+`fail_origin = provider_policy_refusal` (shown as **provider safety-policy
+refusal**). Its failure reason is one of two fixed literals:
+
+- `Codex provider safety-policy refusal (cyberPolicy)`
+- `Codex provider safety-policy refusal (misalignmentPolicyViolation)`
+
+The reason and refusal metadata do not reflect provider messages, details,
+content, or prompts. This records the provider's classification, not an
+independent attestation that the task violated a policy. Unknown and
+non-policy errors keep their existing mapping.
+
+The refused execution is terminal: it does not automatically retry,
+requeue, park, defer for disk recovery, or switch harnesses.
+[Judge eligibility](./judge.md#which-runs-are-judged) is unchanged from
+`agent_failure`; a retrospective may review substantial earlier work,
+but that review does not retry execution.
+
+A dedicated durable worker status event carries
+`event: provider_policy_refusal`, `provider: codex`,
+`category: policy_refusal`, `policy_tag`, `origin: root|child`,
+`phase: planning|implementation`, and `correlation_id`.
+The worker allocates this separate opaque ID at the originating root turn's
+start or child admission; it is bounded to 52 characters. A child also carries
+its admitted, sanitized `role` (1–64 characters from letters, digits,
+`_`, `.`, and `-`) and `parent_correlation_id` pointing to that root.
+These values are captured at admission. Provider call, thread, and turn IDs
+and display projection IDs are excluded; existing display pairing is unchanged.
+
+A refused child returns callback code `child_policy_refused`, preserving
+`policyRefusal` metadata. A root refusal shares that metadata across its
+error, result, and worker diagnostic. A refused child does not force its
+parent to fail: a successful parent stays successful, an unrelated later
+parent failure keeps its own origin, and a later root policy refusal carries
+the root's provenance. The observation is separate from any winning cancel,
+pause, wall-clock, or quiescence outcome.
+
+Failure totals and the failure-origin bucket count run rows once; child
+observations are not run outcomes. Analysis of refusal occurrences should
+deduplicate by run ID, so a child observation and eventual run failure count
+as one run. This adds no public metric or denominator.
+
+The API allowlist and database migration must ship before workers' new origin
+can be accepted. Historical refusals cannot be reconstructed if they were not
+observed or durably recorded. Provenance travels with run-log retrieval and
+is deleted with the run's history.
 
 ## From the CLI
 

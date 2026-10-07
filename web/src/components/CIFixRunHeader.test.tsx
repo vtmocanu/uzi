@@ -24,6 +24,7 @@ function run(over: Partial<Run> = {}): Run {
     requeue_count: 0,
     iteration_count: 0,
     auto_approve: false,
+    plan_cross_check_required: false,
     worker_id: null,
     branch: "ci-fix/pipeline-4200",
     model: null,

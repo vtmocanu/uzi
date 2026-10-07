@@ -21,6 +21,7 @@ fresh() {
   mkdir -p "$d/seed/scripts/lib" "$d/seed/api" "$d/seed/deploy/chart"
   cp "$ROOT/scripts/check-changelog-entry.sh" "$d/seed/scripts/"
   cp "$ROOT/scripts/lib/shipping-paths.sh" "$d/seed/scripts/lib/"
+  cp "$ROOT/scripts/lib/dependency-bump.sh" "$d/seed/scripts/lib/"
   printf '# Changelog\n\n## [Unreleased]\n\n' > "$d/seed/CHANGELOG.md"
   if [ "$#" -gt 1 ]; then printf '%s\n\n' "$2" >> "$d/seed/CHANGELOG.md"; fi
   printf '## [0.1.0] - 2026-01-01\n\n- old\n' >> "$d/seed/CHANGELOG.md"

@@ -88,9 +88,31 @@ The GitHub driver (`github.com/google/go-github/v92`, github.com only, classic P
 
 ### Issue comments as untrusted worker input (PRD #381)
 
-A worker's context is no longer just an issue's title + description: `api/internal/forge`'s `Forge` interface gained a fourth read, `ListIssueComments`, implemented across all three drivers — the GitLab driver drops forge **system** notes (`Note.System`), Forgejo and GitHub have no such notes to drop — and every driver normalizes to **oldest-first** regardless of the forge's native sort. At run creation, `workersvc.createRun` snapshots the issue's comments into a new nullable `runs.issue_comments` JSONB column via `buildIssueCommentsSnapshot` (`api/internal/workersvc/issue_comments.go`), carried structured on the worker claim next to the description. The snapshot excludes **uzi's own bot-authored comments**, matched against the connection's stored `bot_forge_user_id` — an unknown/zero bot id omits comments entirely rather than risk leaking uzi's own status chatter back into the prompt (see the security note below) — and is bounded to 200 newest comments and 32 KiB of body bytes, with a `truncated` flag when the cap clips the thread. The LEAD's plan prompt renders the snapshot in `agent/src/prompt.ts` (`buildIssueCommentsContext`) immediately after `<issue_description>`, under a per-prompt CSPRNG nonce fence — the same discipline the file already applies to cross-run memory and job logs — with uzi-owned `author`/`timestamp` headers and comment bodies as untrusted data; a comment-less run's prompt is byte-for-byte unchanged from before this landed. The live `get_issue` forge tool (`handler/worker_forge.go`, `assembleForgeIssueComments`) applies the same bot/system filtering and oldest-first ordering with its own 200-item/32 KiB cap, so a mid-run agent pull sees the same shape as the initial snapshot. See [prds/done/381-worker-reads-issue-comments.md](prds/done/381-worker-reads-issue-comments.md) for the full design and decision log.
+Issue input is assessed **server-side**, at run creation and on live `get_issue` reads ([#2345](https://github.com/vtmocanu/uzi/issues/2345)). `issueinput.Fetch` (`api/internal/issueinput/projection.go`) captures the raw target issue and uses `ProjectThread` to produce assessed comments; `workersvc.createRun` persists the capture, its creation-time reasons, and the assessed version-2 thread in `runs.issue_comments` JSONB for the structured worker claim. The original comment-read design remains in [PRD #381](prds/done/381-worker-reads-issue-comments.md); [docs/scheduling.md](docs/scheduling.md#issue-input-and-the-approval-gate) describes the scheduled approval behavior.
 
-**Security note.** This widens the injection surface without opening a new trust boundary: a comment body is attacker-influenceable free text exactly like the issue description already was, the multi-author worst case of the same untrusted class. The per-prompt CSPRNG nonce fence defeats the breakout class (no comment body can predict the nonce, so none can forge the block's close delimiter or spoof the uzi-owned author/timestamp header). The numeric forge user id used for the bot filter is read server-side only, never surfaced to the agent, and the bot-exclusion filter with its zero/unknown-id fail-safe is what keeps this from becoming a feedback loop on uzi's own status notes. See [adr/0246-trusted-repo-instructions.md](adr/0246-trusted-repo-instructions.md) for the trust model.
+**Author assessment.** `RepositoryAuthorEligibility` returns eligible, not eligible, or unknown using stable numeric forge identity and effective repository access. These are input thresholds, separate from the label/bot-assignment run-eligibility gate:
+
+| Forge | Eligible evidence | Boundary |
+|---|---|---|
+| GitHub | Effective base `triage`, `push`, `maintain`, or `admin` permission from a complete `affiliation=all` collaborators enumeration, matched by numeric identity. | Custom-role names and issue author associations do not authorize input. |
+| GitLab | Active, unexpired effective inherited membership from `members/all`, at Reporter (20) or above. | Planner (15) and custom Guest roles below 20 do not qualify; extra abilities do not replace the numeric threshold. |
+| Forgejo | Proven personal-repository owner; a direct collaborator, including Read; or effective organization-team Write, Admin, or Owner access, including the Owners team, established through the existing token's collaborator-permission endpoint. | Personal ownership requires positive proof: the repository teams endpoint's HTTP 405 with the exact message `repo is not owned by an organization`. An ordinary Write bot forbidden to look up an arbitrary user's effective access yields unknown, not a guessed team grant. |
+
+The drivers (`github_author.go`, `gitlab_author.go`, `forgejo_author.go`) resolve numeric identity independently and reject incomplete evidence. No new token scopes are required; team-member enumeration, organization membership, assignees, and role/association names are not inferred authorization. Missing identities, lookup errors, incomplete responses, exhausted deadlines, and exhausted author budgets produce `permission_unknown`. The assessment's **30-second child deadline starts before raw capture or the live issue fetch**, and its **200-distinct-author budget and evidence cache belong to one operation**, not the run's lifetime. A valid raw capture can still be persisted under a valid parent context after the child expires during assessment, with unknown reasons and scheduled auto-approval disabled. Failure to capture the raw target fails creation; parent cancellation does not become successful capture.
+
+**Frozen target fields.** Every issue run captures its target title and body once, regardless of the issue author's eligibility. The run stores `issue_title`, `issue_saved_body`, a length-prefixed SHA-256 `issue_raw_digest` of the raw title/body, and `issue_input_reason`; owner guidance is composed separately into the run description and excluded from the digest. Labels and `UpdatedAt` do not participate in change detection. Resume and reclaim retain the capture; a new run captures current fields. In `handler/worker_forge.go`, the handler-owned target projection returns saved title/body even after a forge edit, author promotion, or plan approval. A changed digest produces the fixed note `Issue content changed since capture; saved content retained.`, never the changed text or a diff. Legacy/no-digest captures report comparison unavailable; an upstream failure also leaves saved fields available, with current metadata unavailable and comments unknown. When an issue list includes the run's target, its title is replaced with the saved title; other list summaries are unchanged.
+
+For other issues, or a run without a matching target snapshot, live `get_issue` title/body are exposed only when the **current author** qualifies; otherwise they become fixed withholding placeholders. Comments are assessed on each read. **Residual:** an eligible current author does not establish eligible editors. GitLab assignees and Planner users can edit title/body, so other-issue live fields remain exposed to such edits even when the author qualifies. This implementation has no editor attribution.
+
+**Assessed comments.** The GitLab driver already drops system notes; the remaining comments exclude only uzi's own bot by stable numeric ID before author assessment. Other bots, including third-party issue bots, face the same author threshold as humans. `ProjectThread` assesses the complete fetched thread before retaining the oldest-first tail of at most **200 newest comments / 32 KiB of body bytes**, with a truncation flag. Below-threshold or unknown bodies become fixed `[Issue content withheld]` placeholders carrying author/time and `author_not_eligible` or `permission_unknown`; unauthorized raw comment bodies do not enter newly stored snapshots or worker responses. Author headers strip controls, Unicode Cf/bidi formatting and ANSI sequences and are bounded to 200 runes; prompt timestamp headers are sanitized and bounded too. A zero/unknown bot ID omits comments and marks the assessment unknown. Aggregate withheld/unknown flags survive tail clipping, so an excluded older comment still affects the scheduled gate. MR-review bot handling and review snapshots are unchanged.
+
+**Scheduled approval.** For pinned-issue, label-sweep, and assigned-sweep fires requesting `auto_approve=true`, a below-threshold issue author, withheld comments, or unknown assessment (including a comments-fetch failure) changes the new run's flag to false. `auto_approve_blocked_reasons` stores the applicable bounded codes, `author_not_eligible` and `permission_unknown`, including both when both occurred. The run still queues and plans normally, then parks at `awaiting_approval`; wholly eligible, known input keeps automatic approval. The schedule toggle still defaults ON, including assigned-sweep. Explicit false, manual starts, autopilot, `mr_rework`, self-improve, `ci_fix`, prompt schedules, and job flags keep their existing approval behavior. CLI/web run views show creation-time assessment history, not a failure, health alert, or recovery hold. Later live comments are filtered without changing the stored approval flag; eligible late comments remain available.
+
+**Prompt and upgrade boundary.** `agent/src/prompt.ts` uses `buildIssueContext` for captured title/body and `buildIssueCommentsContext` for eligible comments or fixed placeholders, with fresh CSPRNG nonce fences in Claude and Codex planning context. Approved-plan precedence is preserved. Isolated research uses `buildIssueContext` too; its previously omitted comments are not restored. Old/unclassified comment snapshots become unknown placeholders in upgraded API claims and in the upgraded agent's versionless compatibility path; malformed snapshots are omitted. MR snapshots are untouched. Previously delivered raw text may remain in old SDK transcripts or on old workers: upgrading does not retract it, erase prior approvals, or rewrite existing approval flags. Cancel and start a new run when a clean operational context is needed. Steer a captured task with `uzi run revise` at the plan gate or `uzi run follow-up` during implementation (consumed on the next ordinary turn), rather than editing the forge issue.
+
+**Security note.** Nonce fences and sanitized headers defeat delimiter/header spoofing, but semantic instructions in eligible comments or a frozen outsider-authored title/body can still steer a plan. Human review cannot guarantee detection of injection or prevent planning-time exfiltration. Broad Docker egress and the accepted network residuals remain as described in [ADR-0285](adr/0285-worker-egress-tier-trust-model.md), [PRD #50](prds/50-llm-egress-proxy.md), and [#1651](https://github.com/vtmocanu/uzi/issues/1651); human merges and the four [run-lifecycle guardrail layers](#guardrail-layers-the-primary-directive) remain the main-branch boundary. See [ADR-246](adr/0246-trusted-repo-instructions.md) for the repo-instruction trust model. Until the API and workers are upgraded, turn auto-approve **OFF** for public-repository issue-target schedules as an interim operator mitigation.
+
+**Deferred hardening.** The deadline and distinct-author cap bound time and authorization work, not decoded memory. Existing Forgejo 32 MiB response caps and pagination page/item backstops are unchanged. Oversized or chunked GitHub/GitLab responses can still allocate excessive decoded memory before the final projection bounds apply; decoded-response memory hardening is deferred (auditor evidence against plan base `504d24519860beef43b6c81c8f1f506ebe779647`). This change adds no byte accounting, ETag charging, retry wrappers, or token scope.
 
 ### Bot PATs, encrypted at rest
 
@@ -131,7 +153,7 @@ A `ci_fix` run rides PRD #4's run machinery as a second run **kind** (`runs.kind
 
 **Verification** ("uzi verifies its work"): the pipeline sync stamps a `ci_fix` run's `fix_verdict` — `verified` when its post-fix pipeline passes, `fix_failed` when it fails — keyed on `runs.branch` (the fix branch, not the failed ref, which differ for a default-branch fix) with an `observed pipeline id > snapshot pipeline id` guard so the original failing pipeline never false-stamps. See [docs/configuration.md](docs/configuration.md#ci-status-integration-prd-6) for the env knobs and the documented residual risks (poll-based staleness, third-party secrets in logs, merge-result false-positives).
 
-**Automatic fixes (PRD #71)** extend this with an opt-in per-user trigger (`users.ci_autofix_enabled`, default off): a `CIAutoFix` detector on the same poller tick (after the pipeline sync) auto-queues the identical `ci_fix` run, auto-approved and skipping the plan gate, when a watched **agent-owned MR branch**'s pipeline fails and its owner opted in. `main`, the repo's default branch, and any non-MR ref are never eligible; only a branch an agent run itself produced is. A loop guard bounds retries (a per-branch attempt cap `CI_AUTOFIX_MAX_ATTEMPTS`, plus an early halt on a repeated failure signature), and a fix whose diff touches the CI config (`.gitlab-ci.yml`, `.gitlab/`, the project's configured CI config path) is parked for human approval with a fail-closed worker push guard as backstop. The manual **Fix CI** button remains the escape hatch. See [docs/ci-autofix.md](docs/ci-autofix.md) for the loop-guard rationale, the user-facing behavior, and the knobs.
+**Automatic fixes (PRD #71)** extend this with an opt-in per-user trigger (`users.ci_autofix_enabled`, default off): a `CIAutoFix` detector on the same poller tick (after the pipeline sync) auto-queues the identical `ci_fix` run, auto-approved (subject to the owner's [Plan cross-check](#plan-cross-check) snapshot), when a watched **agent-owned MR branch**'s pipeline fails and its owner opted in. `main`, the repo's default branch, and any non-MR ref are never eligible; only a branch an agent run itself produced is. A loop guard bounds retries (a per-branch attempt cap `CI_AUTOFIX_MAX_ATTEMPTS`, plus an early halt on a repeated failure signature), and a fix whose diff touches the CI config (`.gitlab-ci.yml`, `.gitlab/`, the project's configured CI config path) is parked for human approval with a fail-closed worker push guard as backstop. The manual **Fix CI** button remains the escape hatch. See [docs/ci-autofix.md](docs/ci-autofix.md) for the loop-guard rationale, the user-facing behavior, and the knobs.
 
 ### MR review watcher: auto-rework review comments (PRD #700)
 
@@ -557,6 +579,55 @@ the account it billed afterwards. That record is the attribution join
 `run_usage` (PRD #40) could never make; see
 `prds/done/111-auto-select-anthropic-token.md` for the ranking's rationale.
 
+### Plan cross-check
+
+An owner opts in through the cookie-only Run defaults setting; eligible new
+auto-approved `issue`, `prompt`, `self_improve`, `ci_fix` and `mr_rework` runs
+snapshot the requirement inside their INSERT. Seeded plans and gateless kinds
+are excluded. Required leads and `cross_check` children need a worker with
+`cross_check_v1`; the queued health reason exposes a missing capability.
+
+A Claude lead submits one bounded, normalized candidate with its immutable
+base commit and scanned planning diff. The API stores `cross_checks` and a
+report-only Codex child atomically through existing credential resolution.
+The lead retains its Claude credential, the child its Codex credential and
+usage attribution. The child has its own checkout, ordinary run slot and
+expedite priority; it publishes no branch/MR. The lead retains its slot while
+waiting, with pending wait excluded from its wall budget and banked on
+settlement. The server verdict deadline includes queue time.
+
+`SetRunAutopilotPlan` binds the latest opposite-harness APPROVE to the current
+claim generation, server-computed digest and matching approval-bearing
+fields. Adjacent running/progress/completion guards prevent an unchecked
+plan from being stored or completed through those paths. The worker must obey
+a refusal; server guards cannot prevent arbitrary execution by a worker that
+ignores them. Non-pass and refusal normally force a human gate; Codex leads
+park as unsupported.
+
+Irrecoverable preparation receipts fail with
+`plan cross-check: preparation receipts irrecoverably lost`; unrecoverable
+human presentation ACKs fail with
+`plan cross-check: human-presentation ACK unrecoverable`. After three
+preparation attempts and an acknowledged forced human gate, unresolved ACKs
+fail with `plan cross-check: preparation ACKs unrecoverable`. These paths do
+not enter `recovery_wait`, retry indefinitely or fabricate receipts/approval.
+D16 keeps the established human presentation/revision in execution-local
+context: status proof cannot mint or adopt a gate. Human revisions use the
+existing gate path; original checker findings remain historical evidence.
+
+The checker exposes Read and bounded Search, without shell/patch/delegation,
+and disables automatic repository instruction loading. Both fileop and direct
+provider access use required read-only checkout confinement. Explicit private
+home/Codex/sessions/XDG/tmp grants remain writable; broad shared access and
+escaping sibling/symlink reads are denied. This does not prove network
+isolation. Web and CLI show bounded findings and recorded child metadata,
+with current gate reason separate from historical candidate evidence; Slack
+shows the reason without findings. See [ADR-2149](adr/2149-cross-check.md) for
+confinement/proof limits and [PRD #2149](prds/2149-plan-cross-check.md) for
+rationale, validation provenance and pending hosted acceptance. Dedicated
+slots, automatic checker revision, Codex-lead checking, stage-specific pins
+and Code cross-check remain outside this implementation.
+
 ### Run lifecycle
 
 One `runs` row is the unit of work; an issue can accumulate several over its
@@ -639,7 +710,7 @@ is a linear state machine:
 queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiting_approval ⟲ (revise, PRD #41) → running → completed
                                                                                                                    → failed
    ↳ (worker dies) → re-queued, up to RUN_MAX_REQUEUES → failed
-   ↳ (Anthropic usage limit, opt-in) → limit_wait → queued, up to RUN_LIMIT_MAX_WAITS → failed
+   ↳ (provider usage window, waiting enabled by default) → limit_wait → queued, up to RUN_LIMIT_MAX_WAITS → failed
    ↳ (auto lane, token pool empty) → pool_wait → queued, once a token is pooled (or resume-now)
    ↳ (resumed turn came back empty) → recovery_wait → queued, on a capped backoff, no lifetime cap
    ↳ (interactive task, clean signal_done) → awaiting_followup, no auto-resume — wound down by run stop or idle timeout
@@ -647,14 +718,14 @@ queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiti
    ↳ cancel with no live poller → cancelled directly (server-side)
 ```
 
-The `runs.kind` domain itself (the nine values `issue`/`ci_fix`/`chat`/`judge`/`self_improve`/`prompt`/`task`/`mr_rework`/`job`; sections other than the job one below thread the first eight) has one Go
+The `runs.kind` domain itself (the ten values `issue`/`ci_fix`/`chat`/`judge`/`self_improve`/`prompt`/`task`/`mr_rework`/`job`/`cross_check`) has one Go
 home, `api/internal/runkind` (PRD #983): its constants and `All()` are pinned to the DB
 `runs_kind_check` constraint by a migration-parity test. The decoupled per-side mirrors
 each pin back to a source of truth: the agent's `RUN_KINDS` (`agent/src/protocol.ts`) to
 the same DB migration (`agent/test/run-kind-db-parity.test.ts`), and the web's `RUN_KINDS`
 (`web/src/lib/runKind.ts`) to the shared `fixtures/run-kinds/registry.json` (which the Go
 side pins too). The agent additionally collapses its per-kind behaviour into a
-`RUN_KIND_PROFILES` table (`agent/src/run-kind.ts`). Adding a tenth kind follows the
+`RUN_KIND_PROFILES` table (`agent/src/run-kind.ts`). Adding another kind follows the
 checklist in `api/internal/runkind/doc.go`.
 
 `running ⇄ awaiting_input` can fire twice over — once **pre-run**, ending the
@@ -667,20 +738,30 @@ reported between the answer and the planning turn's next move, and if that
 move is a plan, the run goes straight to `awaiting_approval` — the literal
 chain in the diagram above, with no intervening `running`.
 
-- **running → limit_wait** (PRD #35, opt-in per run or per user) — a run that
-  exhausts the owner's Anthropic usage limit **parks** instead of failing: the
+- **running → limit_wait** (PRDs #35/#2360, waiting on by default with per-user
+  and per-run overrides) — a recognized Claude or Codex subscription usage-window
+  failure **parks** instead of failing, within the wait and per-park budgets: the
   worker's slot is released while its skills plugin dir and per-run SDK home
   stay on disk so a same-worker resume can continue the session. The clone is
   normally removed and reseeded from the captured tracking/checkpoint refs
   (verified 2026-09-08 during issue #1197 review). A sweeper
   promotes it back to `queued` once `retry_not_before` passes (server-timed and
-  server-clamped, never worker-trusted: the earliest moment this user could spend
-  anything across the whole credential pool), and the resume skips the plan gate
-  when the plan was already approved. Two independent guards keep the on-disk
+  server-clamped). For Claude, the server cross-checks the Anthropic gauge and can
+  lower the delay for an auto-bound run when another pooled token is spendable;
+  Codex has no Anthropic gauge or pool input and keeps the frozen Codex account.
+  The updated API atomically revokes the capability at accepted park and refuses
+  late minting in `limit_wait`. An already-started refresh may commit account
+  rotation, but its post-exchange authorization cannot return tokens to that flight.
+  Codex uses accepted structured per-turn account-window evidence, with the latest
+  selected reset or bounded fallback, not provider prose, account reads or polling.
+  If that account is unavailable after promotion, Claim refuses it and Sweep holds
+  it at `recovery_wait` / `codex_account_unavailable`. Recovered approved work
+  resumes without another plan gate. Two independent guards keep the on-disk
   state alive (the runner's teardown carve-out and `home-reclaim`'s
   terminal-status check); losing either loses the transcript. See
   [adr/0035-run-limit-retry.md](adr/0035-run-limit-retry.md) and
-  `prds/done/35-run-limit-retry.md`.
+  `prds/done/35-run-limit-retry.md` and
+  [PRD #2360](prds/done/2360-codex-usage-limit-park.md).
   **Only committed history survives a park by itself**; PRD #759 additionally
   captures uncommitted mid-milestone work as a throwaway `wip(park):` commit that
   the checkpoint broker ([PRD #628](prds/done/628-cross-worker-resume-durability.md))
@@ -690,6 +771,13 @@ chain in the diagram above, with no intervening `running`.
   without re-gating; a total loss re-gates a human-approved run, preserving
   [PRD #209](prds/done/209-seeded-plan-runs.md)'s loss-detection property. See
   [adr/0759-protect-run-work-usage-limit-park.md](adr/0759-protect-run-work-usage-limit-park.md).
+  A failed park sink makes no latest-work checkpoint claim; failed capture retains
+  the source clone for recovery, so durability is conditional on successful capture
+  and publish. Codex resumes a resolvable thread on non-Docker workers; Docker
+  attempt paths keep the existing fresh-thread lineage break with recovered work.
+  `RUN_LIMIT_MAX_PARK` bounds each park (8 days by default), during which the issue
+  lock and a run-bound hosted worker/PVC can remain held. Missing resets use the
+  bounded fallback and can exhaust `RUN_LIMIT_MAX_WAITS` before a weekly reset.
 
 - **claimed → pool_wait** (PRD #754): an `auto`-lane worker's whole opted-in
   token pool is genuinely empty, so the run **holds** rather than reach for
@@ -984,9 +1072,10 @@ chain in the diagram above, with no intervening `running`.
   both, so the honest worst case is each **× (RUN_MAX_REQUEUES + 1)**, or **× (RUN_MAX_REQUEUES + 2)** for a run that used the one-shot finalize-resume allowance, issue #1742). **Only the
   deadline fails the run closed**; exhausting the cap emits a feed notice and the
   lead proceeds on its own judgment (the one cap-adjacent failure is pre-run-only:
-  looping on questions without ever reaching a plan). **Autopilot never parks**:
-  the same `claim.auto_approve` that short-circuits `gatePlan` short-circuits
-  `ask_user`, auto-resolving with the frozen `AUTOPILOT_SENTINEL_ANSWER` constant
+  looping on questions without ever reaching a plan). **Autopilot ordinary
+  questions auto-resolve**: `claim.auto_approve` short-circuits `ask_user`,
+  even though opted-in Plan cross-check can force a human plan gate,
+  auto-resolving with the frozen `AUTOPILOT_SENTINEL_ANSWER` constant
   (asserted byte-for-byte by a test, so do not paraphrase it here). The question
   surfaces on the run view, the owner's opt-in Slack DM, and `uzi run answer`, all
   three deriving it from the run feed rather than a dedicated field. See the PRD's

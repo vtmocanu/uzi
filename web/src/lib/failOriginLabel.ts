@@ -14,6 +14,7 @@ const labels: Record<string, string> = {
   run_timeout: "run timeout",
   worker_lost: "worker lost",
   agent_failure: "agent failure",
+  provider_policy_refusal: "provider safety-policy refusal",
   plan_rejected: "plan rejected",
   auto_stopped: "auto stopped",
   workflow_scope_missing: "workflow scope missing",

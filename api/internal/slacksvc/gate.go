@@ -5,10 +5,37 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/slack-go/slack"
 )
+
+// Sanitize the whole bounded reason before scrubbing, then bound its display.
+// Refuse oversized legacy text rather than exposing a token split at an input
+// cutoff. No findings enter this sink; gateBlocks applies EscapeMrkdwn afterward.
+func gateCrossCheckReason(reason string) string {
+	if len(reason) > 4096 {
+		return "stored reason exceeds display limit"
+	}
+	var b strings.Builder
+	for _, r := range reason {
+		if !unicode.IsControl(r) && !unicode.Is(unicode.Cf, r) {
+			b.WriteRune(r)
+		}
+	}
+	clean := strings.ReplaceAll(ScrubSecrets(b.String()), "_", " ")
+	n := 0
+	b.Reset()
+	for _, r := range clean {
+		if n == 200 {
+			break
+		}
+		b.WriteRune(r)
+		n++
+	}
+	return strings.TrimSpace(b.String())
+}
 
 // Action IDs on the approval-gate buttons (PRD #25 M4). Distinct namespace from
 // the linker's slack_link_* ids, so the InboundMux can fan every action out to
@@ -125,7 +152,7 @@ const maxSlackSectionRunes = 2900
 // Descriptions are NEVER rendered (repo-authored free text); names are
 // IsValidName-validated kebab-case and additionally mrkdwn-escaped as defense in
 // depth.
-func gateBlocks(runID uuid.UUID, base string, repoAgentNames []string, repoAgentFolder string) []slack.Block {
+func gateBlocks(runID uuid.UUID, base string, repoAgentNames []string, repoAgentFolder string, crossCheckReason ...string) []slack.Block {
 	repoAgentFolder = slackRepoAgentFolder(repoAgentFolder)
 	var section *slack.SectionBlock
 	var approveElems []slack.BlockElement
@@ -166,6 +193,12 @@ func gateBlocks(runID uuid.UUID, base string, repoAgentNames []string, repoAgent
 			slack.NewTextBlockObject(slack.PlainTextType, "Cancel", false, false),
 		)
 		approveElems = []slack.BlockElement{approve}
+	}
+
+	if len(crossCheckReason) > 0 {
+		if reason := gateCrossCheckReason(crossCheckReason[0]); reason != "" {
+			section.Text.Text += "\nPlan cross-check: " + EscapeMrkdwn(reason)
+		}
 	}
 
 	// Request changes (PRD #41): the default-styled sibling of Reject — parks the run

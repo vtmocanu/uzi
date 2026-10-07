@@ -25,8 +25,8 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { ensureCodexSharedDirectory } from "../src/codex/codex-executor.js";
@@ -66,11 +66,68 @@ interface Harness {
   script: string;
 }
 
+function selectFixtureScratch(templateEntrypoint: string, runtimeTmp = os.tmpdir()): string {
+  const templates = path.dirname(templateEntrypoint);
+  const agent = path.dirname(templates);
+  if (path.basename(templates) === "templates" && path.basename(agent) === "agent") {
+    return path.join(path.dirname(agent), ".uzi", "scratch");
+  }
+  return path.join(runtimeTmp, ".uzi", "scratch");
+}
+
+function allocateFixture(templateEntrypoint = entrypointPath, runtimeTmp = os.tmpdir()): string {
+  const scratch = selectFixtureScratch(templateEntrypoint, runtimeTmp);
+  fs.mkdirSync(scratch, { recursive: true });
+  return fs.mkdtempSync(path.join(scratch, "uzi-entrypoint-m2-"));
+}
+
+describe("entrypoint fixture scratch selection", () => {
+  it("uses repository scratch for agent/templates", () => {
+    assert.equal(selectFixtureScratch("/repo/agent/templates/entrypoint.sh", "/runtime-tmp"), "/repo/.uzi/scratch");
+  });
+
+  it("uses runtime scratch for flattened image templates", () => {
+    assert.equal(selectFixtureScratch("/app/templates/entrypoint.sh", "/runtime-tmp"), "/runtime-tmp/.uzi/scratch");
+  });
+
+  it("allocates writable image fixtures and cleans only owned roots", () => {
+    const repositoryScratch = selectFixtureScratch(entrypointPath);
+    fs.mkdirSync(repositoryScratch, { recursive: true });
+    const repositoryParent = fs.statSync(repositoryScratch);
+    const runtimeTmp = fs.mkdtempSync(path.join(repositoryScratch, "uzi-image-runtime-"));
+    try {
+      const scratch = path.join(runtimeTmp, ".uzi", "scratch");
+      const roots = [
+        allocateFixture("/app/templates/entrypoint.sh", runtimeTmp),
+        allocateFixture("/app/templates/entrypoint.sh", runtimeTmp),
+      ] as const;
+      assert.notEqual(roots[0], roots[1], "unique fixture roots");
+      for (const root of roots) {
+        assert.equal(path.dirname(root), scratch);
+        fs.writeFileSync(path.join(root, "state"), "fixture-state");
+        assert.equal(fs.readFileSync(path.join(root, "state"), "utf8"), "fixture-state");
+      }
+      const parent = fs.statSync(scratch);
+      fs.rmSync(roots[0], { recursive: true });
+      assert.equal(fs.existsSync(roots[0]), false);
+      assert.equal(fs.readFileSync(path.join(roots[1], "state"), "utf8"), "fixture-state");
+      fs.rmSync(roots[1], { recursive: true });
+      assert.deepEqual(fs.readdirSync(scratch), []);
+      assert.equal(fs.statSync(scratch).ino, parent.ino, "shared scratch parent retained");
+      assert.equal(fs.statSync(scratch).mode, parent.mode, "shared scratch parent mode retained");
+    } finally {
+      fs.rmSync(runtimeTmp, { recursive: true, force: true });
+    }
+    assert.equal(fs.statSync(repositoryScratch).ino, repositoryParent.ino, "repository scratch parent retained");
+    assert.equal(fs.statSync(repositoryScratch).mode, repositoryParent.mode, "repository scratch parent mode retained");
+  });
+});
+
 // tokenViaEnv (issue #1761): leave the entrypoint's TOKEN line as shipped, so the token
 // path can only reach the script through UZI_WORKER_TOKEN_FILE (run() passes it). Proves
 // the posture checks follow the env rather than a /run/secrets literal.
-function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?: boolean } = {}): Harness {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-entrypoint-m2-"));
+function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?: boolean; realChmod?: string[] } = {}): Harness {
+  const root = allocateFixture();
   const data = path.join(root, "data");
   const nix = path.join(root, "nix");
   const token = path.join(root, "token");
@@ -156,6 +213,53 @@ function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?:
       "  *) exit 1 ;;\nesac\n",
   );
 
+  if (opts.realChmod) {
+    // Opt-in filesystem proof: chown stays best-effort and setpriv stays stubbed.
+    // Suppressing chown here also prevents a real ownership change from hiding chmod drift.
+    writeStub(stubDir, "chown", '#!/bin/sh\nprintf "chown %s\\n" "$*" >> "$OPLOG"\n');
+    for (const verb of ["chmod", "mkdir", "rm"]) {
+      writeStub(stubDir, verb, `#!${process.execPath}
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const root = ${JSON.stringify(root)};
+const verb = ${JSON.stringify(verb)};
+const command = ${JSON.stringify(verb === "chmod" ? opts.realChmod : ["/bin/" + verb])};
+const args = process.argv.slice(2);
+const targets = verb === "chmod" ? args.slice(1) : args.filter(a => !a.startsWith("-"));
+if (!targets.length) throw new Error("missing targets");
+function inside(p) {
+  if (p !== root && !p.startsWith(root + path.sep)) throw new Error("outside sandbox: " + p);
+}
+// Validate EVERY batched operand before invoking any mutator. rm may unlink a symlink,
+// while chmod/mkdir must never resolve through one to a witness outside the sandbox.
+for (const target of targets) {
+  const p = path.resolve(target);
+  inside(p);
+  let existing = verb === "rm" ? path.dirname(p) : p;
+  while (!fs.existsSync(existing)) existing = path.dirname(existing);
+  inside(fs.realpathSync(existing));
+}
+fs.appendFileSync(process.env.OPLOG, verb + " " + args.join(" ") + "\\n");
+function snapshot(p) {
+  const st = fs.lstatSync(p);
+  if (!st.isDirectory() || st.isSymbolicLink()) return;
+  fs.appendFileSync(path.join(root, "pre-rm.jsonl"), JSON.stringify({ path: p, mode: st.mode & 0o7777 }) + "\\n");
+  for (const name of fs.readdirSync(p)) snapshot(path.join(p, name));
+}
+if (verb === "rm") {
+  for (const p of targets) if (fs.existsSync(p)) snapshot(p);
+}
+const result = spawnSync(command[0], [...command.slice(1), ...args], { stdio: "inherit", timeout: 10000 });
+if (result.error) throw result.error;
+if (result.status !== 0) process.exit(result.status ?? 1);
+if (verb === "mkdir") {
+  for (const p of targets) fs.appendFileSync(path.join(root, "mkdir.jsonl"), JSON.stringify({ path: p, mode: fs.statSync(p).mode & 0o7777 }) + "\\n");
+}
+`);
+    }
+  }
+
   const script = path.join(root, "entrypoint.sh");
   const patched = entrypointText
     .replace("ID=/usr/bin/id", `ID=${path.join(stubDir, "id")}`)
@@ -181,6 +285,196 @@ function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?:
   return { root, data, nix, token, stubDir, opLog, script };
 }
 
+type ChmodImplementation = { name: string; command: string[] };
+
+// Probe at most the explicit locations plus one candidate per PATH entry, each with a
+// five-second timeout. A failed identity probe does not block the remaining candidates.
+function discoverChmod(name: "GNU" | "BusyBox"): ChmodImplementation | undefined {
+  const candidates = name === "GNU"
+    ? ["/opt/uzi-toolchain/bin/chmod", ...((process.env.PATH ?? "").split(path.delimiter).map(p => path.join(p, "chmod")))]
+    : ["/bin/busybox", "/usr/bin/busybox", ...((process.env.PATH ?? "").split(path.delimiter).map(p => path.join(p, "busybox")))];
+  for (const executable of new Set(candidates)) {
+    const probe = spawnSync(executable, name === "GNU" ? ["--version"] : ["chmod", "--help"], { encoding: "utf8", timeout: 5000 });
+    if (probe.status === 0 && (probe.stdout + probe.stderr).includes(name === "GNU" ? "GNU coreutils" : "BusyBox")) {
+      return { name, command: name === "GNU" ? [executable] : [executable, "chmod"] };
+    }
+  }
+  return undefined;
+}
+
+type ModeSnapshot = { path: string; mode: number };
+function readSnapshots(h: Harness, file: string): ModeSnapshot[] {
+  const p = path.join(h.root, file);
+  return fs.existsSync(p) ? fs.readFileSync(p, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as ModeSnapshot) : [];
+}
+
+function assertPrivateMode(mode: number, name: string): void {
+  assert.equal(mode & MODE_MASK, 0o700, name);
+}
+
+/** Each call owns a fresh fixture; mutation failures must come from actual full metadata. */
+function proveTmpModes(
+  implementation: ChmodImplementation,
+  setgidParent: boolean,
+  kind: "fresh" | "adopted" | "symlink",
+  mutate?: (script: string) => string,
+  rejectedAssertion?: string,
+): void {
+  const h = makeHarness({ realChmod: implementation.command, mutate });
+  const witnessRoot = fs.mkdtempSync(path.join(path.dirname(h.root), "uzi-tmp-witness-"));
+  try {
+    fs.mkdirSync(h.data);
+    fs.mkdirSync(h.nix);
+    fs.chmodSync(h.nix, 0o755);
+    fs.writeFileSync(h.token, "t");
+    const parent = path.join(h.root, "shared-tmp");
+    fs.mkdirSync(parent);
+    // Explicitly set AND clear special bits; inherited sandbox bits are not a precondition.
+    fs.chmodSync(parent, setgidParent ? 0o2775 : 0o775);
+    assert.equal(fs.statSync(parent).mode & MODE_MASK, setgidParent ? 0o2775 : 0o775, "parent full mode precondition");
+    const dirs = ["uzi-worker", "uzi-runner"].map(name => path.join(parent, name));
+    const witnessDir = path.join(witnessRoot, "directory");
+    const witnessFile = path.join(witnessDir, "state");
+    fs.mkdirSync(witnessDir);
+    fs.writeFileSync(witnessFile, "outside-state");
+    fs.chmodSync(witnessDir, 0o2755);
+    fs.chmodSync(witnessFile, 0o640);
+    const witnessModes = [witnessDir, witnessFile].map(p => fs.statSync(p).mode & MODE_MASK);
+    const adopted: string[] = [];
+    if (kind === "adopted") {
+      for (const dir of dirs) {
+        const nested = path.join(dir, "nested");
+        fs.mkdirSync(nested, { recursive: true });
+        for (const p of [dir, nested]) {
+          fs.chmodSync(p, 0o7777);
+          assert.equal(fs.statSync(p).mode & MODE_MASK, 0o7777, "adopted special-bit precondition");
+          adopted.push(p);
+        }
+        fs.writeFileSync(path.join(nested, "disposable"), "scratch");
+        fs.symlinkSync(witnessDir, path.join(nested, "outside-link"));
+        fs.linkSync(witnessFile, path.join(nested, "outside-hardlink"));
+      }
+    } else if (kind === "symlink") {
+      for (const dir of dirs) fs.symlinkSync(witnessDir, dir);
+    }
+    const r = run(h, { TMPDIR: parent });
+    assert.equal(r.status, 0, `script must complete: ${r.stderr}`);
+    assert.equal(r.env.get("TMPDIR"), dirs[0]);
+    assert.equal(r.env.get("UZI_RUNNER_TMPDIR"), dirs[1]);
+    assert.equal(fs.statSync(parent).mode & MODE_MASK, setgidParent ? 0o2775 : 0o775, "parent mode retained");
+    let rejectionSeen = false;
+    function check(mode: number, name: string): void {
+      if (name === rejectedAssertion) {
+        assert.notEqual(mode & 0o7000, 0, "old operand must retain special bits");
+        assert.throws(() => assertPrivateMode(mode, name), (error: unknown) =>
+          error instanceof assert.AssertionError && error.message.startsWith(name) &&
+          error.actual === (mode & MODE_MASK) && error.expected === 0o700);
+        rejectionSeen = true;
+      } else {
+        assertPrivateMode(mode, name);
+      }
+    }
+    const preRm = readSnapshots(h, "pre-rm.jsonl");
+    assert.deepEqual(preRm.map(s => s.path).sort(), adopted.slice().sort(), "required pre-removal snapshot paths (no symlink traversal)");
+    for (const snapshot of preRm) check(snapshot.mode, "adopted full mode before removal");
+    const created = readSnapshots(h, "mkdir.jsonl");
+    for (const [index, dir] of dirs.entries()) {
+      const inherited = created.find(s => s.path === dir);
+      assert.ok(inherited, "created root snapshot required");
+      assert.equal(inherited.mode & 0o7000, setgidParent ? 0o2000 : 0, "mkdir inherited setgid precondition");
+      assert.ok(fs.lstatSync(dir).isDirectory(), "root recreated as a real directory");
+      check(fs.statSync(dir).mode, index === 0 ? "worker final full mode" : "runner final full mode");
+      assert.deepEqual(fs.readdirSync(dir), [], "disposable scratch removed");
+      const mkdir = r.ops.findIndex(o => o.startsWith("mkdir ") && o.includes(dir));
+      const reclaim = r.ops.findIndex((o, i) => i > mkdir && o === `chown 0:0 ${dir}`);
+      const chmod = r.ops.findIndex((o, i) => i > reclaim && o.startsWith("chmod ") && o.endsWith(" " + dir));
+      const handover = r.ops.findIndex((o, i) => i > chmod && o === `chown ${index === 0 ? "worker:worker" : "runner:runner"} ${dir}`);
+      assert.ok(mkdir >= 0 && reclaim > mkdir && chmod > reclaim && handover > chmod, "logged reclaim -> chmod -> handover");
+      const rm = r.ops.findIndex(o => o.startsWith("rm ") && o.includes(dir));
+      assert.ok(rm >= 0 && rm < mkdir, "removal before recreation");
+      if (kind !== "fresh") {
+        const preclaim = r.ops.indexOf(`chown -h 0:0 ${dir}`);
+        assert.ok(preclaim >= 0 && preclaim < rm, "no-follow adoption reclaim before removal");
+      }
+    }
+    assert.equal(fs.readFileSync(witnessFile, "utf8"), "outside-state");
+    assert.deepEqual([witnessDir, witnessFile].map(p => fs.statSync(p).mode & MODE_MASK), witnessModes, "outside symlink/hardlink witness modes retained");
+    if (rejectedAssertion) assert.ok(rejectionSeen, "named metadata assertion must reject mutation");
+  } finally {
+    fs.rmSync(h.root, { recursive: true, force: true });
+    fs.rmSync(witnessRoot, { recursive: true, force: true });
+  }
+}
+
+describe("tmpdir exact private modes (#2269)", () => {
+  for (const name of ["GNU", "BusyBox"] as const) {
+    const implementation = process.platform === "linux" ? discoverChmod(name) : undefined;
+    const skip = process.platform !== "linux" ? "Linux directory special-bit semantics required" : !implementation ? `${name} chmod implementation unavailable` : false;
+    it(`${name}: sandbox validates every batched target and propagates filesystem failures`, { skip }, () => {
+      assert.ok(implementation);
+      const h = makeHarness({ realChmod: implementation.command });
+      const outside = fs.mkdtempSync(path.join(path.dirname(h.root), "uzi-tmp-witness-"));
+      try {
+        const valid = path.join(h.root, "valid");
+        fs.mkdirSync(valid);
+        fs.chmodSync(valid, 0o755);
+        fs.writeFileSync(path.join(valid, "state"), "keep");
+        const invoke = (verb: string, args: string[]) => spawnSync(path.join(h.stubDir, verb), args, {
+          encoding: "utf8", timeout: 10000, env: { OPLOG: h.opLog },
+        });
+        for (const [verb, args] of [
+          ["chmod", ["00700", valid, outside]],
+          ["mkdir", ["-p", path.join(valid, "new"), path.join(outside, "new")]],
+          ["rm", ["-rf", valid, outside]],
+        ] as const) {
+          const r = invoke(verb, [...args]);
+          assert.notEqual(r.status, 0, "outside batched operand must fail");
+          assert.match(r.stderr, /outside sandbox/);
+        }
+        assert.equal(fs.statSync(valid).mode & MODE_MASK, 0o755, "no partial chmod");
+        assert.equal(fs.readFileSync(path.join(valid, "state"), "utf8"), "keep", "no partial rm");
+        assert.ok(!fs.existsSync(path.join(valid, "new")), "no partial mkdir");
+        for (const [verb, args] of [
+          ["chmod", ["00700", path.join(h.root, "missing")]],
+          ["mkdir", ["-p", path.join(valid, "state")]],
+          ["rm", [valid]], // directory without recursive removal must fail
+        ] as const) {
+          const r = invoke(verb, [...args]);
+          assert.notEqual(r.status, 0, "real mutator failure must propagate");
+          assert.ok(r.stderr.length > 0, "real mutator diagnostic retained");
+        }
+      } finally {
+        fs.rmSync(h.root, { recursive: true, force: true });
+        fs.rmSync(outside, { recursive: true, force: true });
+      }
+    });
+    for (const setgidParent of [false, true]) {
+      for (const kind of ["fresh", "adopted", "symlink"] as const) {
+        it(`${name}: ${kind}, ${setgidParent ? "setgid" : "ordinary"} parent`, { skip }, () => {
+          assert.ok(implementation);
+          proveTmpModes(implementation, setgidParent, kind);
+        });
+      }
+    }
+    if (name === "GNU") {
+      const mutations = [
+        { name: "adoption-only", operand: '"$CHMOD" 00700 \'{}\' +', kind: "adopted", assertion: "adopted full mode before removal" },
+        { name: "worker-final-only", operand: '"$CHMOD" 00700 "$WORKER_TMPDIR"', kind: "fresh", assertion: "worker final full mode" },
+        { name: "runner-final-only", operand: '"$CHMOD" 00700 "$RUNNER_TMPDIR"', kind: "fresh", assertion: "runner final full mode" },
+      ] as const;
+      for (const mutation of mutations) {
+        it(`GNU old operand control: ${mutation.name}`, { skip }, () => {
+          assert.ok(implementation);
+          proveTmpModes(implementation, true, mutation.kind, script => {
+            assert.equal(script.split(mutation.operand).length - 1, 1, "exact mutation replacement count");
+            return script.replace(mutation.operand, mutation.operand.replace("00700", "0700"));
+          }, mutation.assertion);
+        });
+      }
+    }
+  }
+});
+
 /** Build a Kubernetes atomic-writer-style symlink chain so h.token is the top symlink. */
 function buildAtomicWriterChain(h: Harness, body = "join-token-body"): void {
   const dir = path.dirname(h.token);
@@ -195,6 +489,7 @@ function buildAtomicWriterChain(h: Harness, body = "join-token-body"): void {
 function run(h: Harness, extraEnv: Record<string, string> = {}): RunResult {
   const r = spawnSync("/bin/sh", [h.script, "npm", "run", "start"], {
     encoding: "utf8",
+    timeout: 30000,
     env: {
       // A minimal env: the entrypoint sets its own PATH in the root branch, so the outer PATH
       // only matters until then; keep the real one so `/bin/sh` and the stubs resolve.
@@ -448,20 +743,20 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
         const rm = r.ops.findIndex((o) => o.startsWith("rm ") && o.includes(dir));
         const mkdir = r.ops.findIndex((o) => o.startsWith("mkdir ") && o.includes(dir));
         const reclaim = r.ops.findIndex((o, i) => i > mkdir && o.startsWith("chown 0:0 ") && o.includes(dir));
-        const chmod0700 = r.ops.findIndex((o, i) => i > reclaim && o.startsWith("chmod 0700 ") && o.includes(dir));
+        const chmod00700 = r.ops.findIndex((o, i) => i > reclaim && o.startsWith("chmod 00700 ") && o.includes(dir));
         const handover = r.ops.findIndex((o) => o.startsWith(`chown ${owner} `) && o.includes(dir));
         assert.ok(
-          preclaim >= 0 && rm >= 0 && mkdir >= 0 && reclaim >= 0 && chmod0700 >= 0 && handover >= 0,
-          `${dir} needs preclaim + rm + mkdir + reclaim + chmod 0700 + hand-over (${owner})`,
+          preclaim >= 0 && rm >= 0 && mkdir >= 0 && reclaim >= 0 && chmod00700 >= 0 && handover >= 0,
+          `${dir} needs preclaim + rm + mkdir + reclaim + chmod 00700 + hand-over (${owner})`,
         );
         assert.ok(preclaim < rm, `${dir}: no-dereference reclaim must precede sticky-parent removal`);
         assert.ok(rm < mkdir, `${dir}: rm must precede mkdir`);
         assert.ok(mkdir < reclaim, `${dir}: mkdir must precede the root reclaim`);
-        assert.ok(reclaim < chmod0700, `${dir}: chown 0:0 must precede chmod 0700`);
-        assert.ok(chmod0700 < handover, `${dir}: chmod 0700 must precede the owner hand-over`);
+        assert.ok(reclaim < chmod00700, `${dir}: chown 0:0 must precede chmod 00700`);
+        assert.ok(chmod00700 < handover, `${dir}: chmod 00700 must precede the owner hand-over`);
       }
       const nestedReclaim = r.ops.findIndex((o) => o.startsWith("chown 0:0 ") && o.includes(nestedSticky));
-      const nestedChmod = r.ops.findIndex((o) => o.startsWith("chmod 0700 ") && o.includes(nestedSticky));
+      const nestedChmod = r.ops.findIndex((o) => o.startsWith("chmod 00700 ") && o.includes(nestedSticky));
       const runnerRm = r.ops.findIndex((o) => o.startsWith("rm ") && o.includes(dirs[1][0]));
       assert.ok(nestedReclaim >= 0 && nestedChmod >= 0, "nested sticky directories must be reclaimed and de-stickied");
       assert.ok(nestedReclaim < nestedChmod && nestedChmod < runnerRm, "nested directory hardening must precede recursive removal");
@@ -571,8 +866,8 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
     try {
       fs.mkdirSync(c.data);
       fs.mkdirSync(c.nix);
-      // CLEAR any setgid the sandbox inherited from a setgid os.tmpdir() (the gate's TMPDIR is
-      // /data/runner at 2777): a compose /nix mount root carries NO setgid (the image bakes it
+      // CLEAR any setgid inherited from the scratch parent: a compose /nix mount root
+      // carries NO setgid (the image bakes it
       // with `chmod -R a+rX`), so the fingerprint must be false and the alignment a no-op.
       fs.chmodSync(c.nix, 0o755);
       fs.writeFileSync(c.token, "t");

@@ -106,6 +106,7 @@ export type HarnessErrorCategory =
   | "timeout"
   | "authentication"
   | "authorization"
+  | "policy_refusal"
   | "rate_limit"
   | "model"
   | "effort"
@@ -142,6 +143,7 @@ export interface HarnessAttribution {
 }
 
 export type HarnessSignalName =
+  | "save_draft_plan"
   | "submit_plan"
   | "signal_done"
   | "ask_user"
@@ -169,6 +171,7 @@ export type HarnessItem =
     };
 
 export interface HarnessTerminal {
+  policyRefusal?: import("./provider-policy-refusal.js").PolicyRefusalPayload;
   outcome: "success" | "failed";
   // Exact uzi display subtype and String-mapped provider error array.
   subtype: string;
@@ -466,7 +469,10 @@ export interface BoundaryProcessHandle {
   readonly stdin: Writable | null;
   readonly stdout: Readable | null;
   readonly stderr: Readable | null;
+  /** Completion includes cleanup of the whole owned root or process group. */
   readonly completed: Promise<{ readonly code: number; readonly softTimedOut?: true }>;
+  /** Idempotently stop only this child and await its whole-root cleanup. */
+  cancel(): Promise<void>;
 }
 
 export interface CodexExecutionSafety {
@@ -495,6 +501,7 @@ export interface CodexExecutionSafety {
 // This facade is owned by uzi, so the adapter does not gain git/workflow policy.
 
 export interface TurnSignals {
+  draftPlans?: string[];
   plan?: string;
   done: boolean;
   prdDonePath?: string;

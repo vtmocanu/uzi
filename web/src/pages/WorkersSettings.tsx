@@ -260,7 +260,14 @@ export function WorkersSettings() {
           mode,
           mode === "pinned" ? choice : null,
         );
-        setWorkers((prev) => prev.map((w) => (w.id === worker.id ? worker : w)));
+        setWorkers((prev) => prev.map((w) => {
+          if (w.id !== worker.id) return w;
+          // Rebind may omit the list's custody sample. Preserve the latest row's
+          // count in that case; an explicit zero from the response is authoritative.
+          return worker.custody_decisions_needed === undefined
+            ? { ...worker, custody_decisions_needed: w.custody_decisions_needed }
+            : worker;
+        }));
         announce(
           // F18's other half. A correct row summary beside a cheerful "now
           // auto-selects from your token pool" would leave the misleading half in the

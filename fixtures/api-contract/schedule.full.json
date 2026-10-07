@@ -1,4 +1,6 @@
 {
+  "capacity_limit": 1,
+  "capacity_room_needed": 1,
   "id": "x",
   "repo_id": "x",
   "repo_path": "x",
@@ -35,6 +37,13 @@
     "2020-01-02T03:04:05Z"
   ],
   "last_fire": {
+    "capacity": {
+      "in_flight": 1,
+      "limit": 1,
+      "room_needed": 1,
+      "room": 1,
+      "blocked": true
+    },
     "fired_at": "2020-01-02T03:04:05Z",
     "matched": 1,
     "capped": true,

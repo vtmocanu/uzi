@@ -82,6 +82,157 @@ function messageStart(id: string, usage: Record<string, unknown> = {}, parent: s
 beforeEach(() => resetUsageRouteStateForTests());
 afterEach(() => resetUsageRouteStateForTests());
 
+describe("ACK-only usage drain", () => {
+  it("waits existing ownership and preserves identical replay after a transient refusal", async () => {
+    const client = new FakeUsageClient();
+    const recorder = makeRecorder(client);
+    const leg = recorder.startLeg();
+    leg.observeAssistant(assistant("confirmed", { input_tokens: 7 }));
+    client.respond = async () => { throw new Error("unknown ACK"); };
+    assert.equal(await recorder.drainConfirmed(), false);
+    const first = client.calls[0]!.body;
+    leg.observeAssistant(assistant("confirmed", { input_tokens: 9 }));
+    client.respond = async () => {};
+    assert.equal(await recorder.drainConfirmed(), true);
+    assert.deepEqual(client.calls[1]!.body, first);
+    assert.equal(client.calls[2]!.body.messages[0]!.input_tokens, 9);
+    recorder.release();
+  });
+
+  it("aborts and settles ownership on deadline without abandoning pending usage", async () => {
+    const client = new FakeUsageClient();
+    const recorder = makeRecorder(client);
+    recorder.startLeg().observeAssistant(assistant("deadline", { input_tokens: 3 }));
+    let aborted = false;
+    client.respond = async (call) => {
+      await hang(call).catch((err: unknown) => { aborted = true; throw err; });
+    };
+    assert.equal(await recorder.drainConfirmed(10), false);
+    assert.equal(aborted, true);
+    client.respond = async () => {};
+    assert.equal(await recorder.drainConfirmed(), true);
+    assert.deepEqual(client.calls[0]!.body, client.calls[1]!.body);
+    recorder.release();
+  });
+
+  it("does not certify dropped/refused usage, even after the leg is pruned", async () => {
+    const client = new FakeUsageClient();
+    const recorder = makeRecorder(client);
+    const leg = recorder.startLeg();
+    leg.observeAssistant(assistant("refused", { input_tokens: 1 }));
+    leg.close();
+    client.respond = async () => { throw new RequestError("POST", "/usage", 400, "refused"); };
+    await recorder.drain();
+    client.respond = async () => {};
+    await recorder.drain();
+    assert.equal(await recorder.drainConfirmed(), false);
+    recorder.release();
+  });
+
+  it("does not certify stale or globally disabled usage", async () => {
+    const client = new FakeUsageClient();
+    const recorder = makeRecorder(client);
+    recorder.startLeg().observeAssistant(assistant("stale", { input_tokens: 1 }));
+    client.respond = async () => { throw new RequestError("POST", "/usage", 409, "stale"); };
+    assert.equal(await recorder.drainConfirmed(), false);
+    recorder.release();
+  });
+});
+
+describe("confirmed usage ownership", () => {
+  it("rejects invalid deadlines before taking ownership", async () => {
+    const recorder = makeRecorder(new FakeUsageClient());
+    for (const value of [NaN, Infinity, -1, 1.5])
+      await assert.rejects(recorder.drainConfirmed(value), RangeError);
+    assert.equal(await recorder.drainConfirmed(), true);
+    recorder.release();
+  });
+
+  it("keeps the second request unchanged after the first ACK and a later ambiguous ACK", async () => {
+    const client = new FakeUsageClient();
+    const recorder = makeRecorder(client, { debounceMs: 1 });
+    const leg = recorder.startLeg();
+    for (let i = 0; i <= USAGE_POST_MAX_RECORDS; i++)
+      leg.observeAssistant(assistant(`batch-${i}`, { input_tokens: 1 }));
+
+    client.respond = async () => {
+      if (client.calls.length === 2) {
+        leg.observeAssistant(assistant(`batch-${USAGE_POST_MAX_RECORDS}`, { input_tokens: 9 }));
+        throw new Error("second ACK lost");
+      }
+
+    };
+    assert.equal(await recorder.drainConfirmed(), false);
+    const original = client.calls[1]!.body;
+    const later = recorder.startLeg();
+    later.observeAssistant(assistant("later-leg", { input_tokens: 2 }));
+    later.close();
+    await sleep(30);
+    assert.equal(client.calls.length, 2, "new legs and updates cannot schedule a retained confirmed retry");
+    assert.equal(await recorder.drainConfirmed(), true);
+    assert.deepEqual(client.calls[2]!.body, original);
+    assert.equal(client.calls[3]!.body.messages[0]!.input_tokens, 9);
+    const acknowledgedCalls = client.calls.length;
+    let debounced!: () => void;
+    const debounce = new Promise<void>((resolve) => { debounced = resolve; });
+    client.respond = async () => { debounced(); };
+    leg.observeAssistant(assistant("after-ACK", { input_tokens: 4 }));
+    await debounce;
+    assert.equal(client.calls.length, acknowledgedCalls + 1, "successful ACK resumes ordinary debounce");
+    recorder.release();
+  });
+
+  it("a provided signal aborts existing ownership and replays its original body after a leg update", async () => {
+    const client = new FakeUsageClient();
+    const recorder = makeRecorder(client, { debounceMs: 0 });
+    const leg = recorder.startLeg();
+    let started!: () => void;
+    const start = new Promise<void>((resolve) => { started = resolve; });
+    let settled = false;
+    client.respond = async (call) => {
+      started();
+      await hang(call).catch((err: unknown) => { settled = true; throw err; });
+    };
+    leg.observeAssistant(assistant("owned", { input_tokens: 1 }));
+    await start;
+    const controller = new AbortController();
+    const confirming = recorder.drainConfirmed(3000, controller.signal);
+    leg.observeAssistant(assistant("owned", { input_tokens: 9 }));
+    controller.abort();
+    assert.equal(await confirming, false);
+    assert.equal(settled, true);
+    client.respond = async () => {};
+    assert.equal(await recorder.drainConfirmed(), true);
+    assert.deepEqual(client.calls[0]!.body, client.calls[1]!.body);
+    assert.equal(client.calls[2]!.body.messages[0]!.input_tokens, 9);
+    recorder.release();
+  });
+
+  it("does not certify bounded drops even after all kept records were acknowledged", async () => {
+    const client = new FakeUsageClient();
+    const recorder = makeRecorder(client);
+    const leg = recorder.startLeg();
+    for (let i = 0; i <= USAGE_PENDING_MAX; i++)
+      leg.observeAssistant(assistant(`drop-${i}`, { input_tokens: 1 }));
+    leg.close();
+    await recorder.drain();
+    assert.equal(await recorder.drainConfirmed(), false);
+    recorder.release();
+  });
+
+  it("does not certify a process-wide disabled route", async () => {
+    const missing = new FakeUsageClient();
+    missing.respond = async () => { throw new RequestError("POST", "/usage", 404, "missing route"); };
+    const recorder = makeRecorder(missing);
+    recorder.startLeg().observeAssistant(assistant("missing", { input_tokens: 1 }));
+    for (let i = 0; i < USAGE_ROUTE_MISSING_LIMIT; i++) await recorder.drain();
+    const healthy = makeRecorder(new FakeUsageClient());
+    assert.equal(await healthy.drainConfirmed(), false);
+    recorder.release();
+    healthy.release();
+  });
+});
+
 describe("UsageLeg records", () => {
   it("keys by message.id: dense ordinals in stream order, duplicate frames merge with GREATEST", async () => {
     const client = new FakeUsageClient();

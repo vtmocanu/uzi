@@ -57,7 +57,11 @@
 // {@link CodexHarnessError} throw (Claude's clean-EOF `exhausted` is unaffected).
 
 import { renderCodexRun } from "./render.js";
+import { CodexRateLimitObserver } from "./rate-limits.js";
+import { LimitReachedError } from "../limit.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
+import { DRAFT_PLAN_ACK } from "../draft-plan.js";
+import { emptyCounts, sanitizeText } from "../sanitize.js";
 import { CODEX_DELEGATE_TOOLS, CODEX_SIGNAL_TOOLS, canonicalizeCodexToolName } from "./broker.js";
 import {
   CodexTurnFailedError,
@@ -102,6 +106,12 @@ import type {
   ToolDisposal,
   TurnSignals,
 } from "../harness.js";
+import {
+  admitPolicyTurn,
+  isPolicyRefusalTag,
+  ProviderPolicyRefusal,
+  validatePolicyRefusal,
+} from "../provider-policy-refusal.js";
 import type { CallbackResult, CodexCallbackBroker } from "./broker.js";
 import type { CodexAppServerAuthMode, CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { ExecutionRegistry, RegisteredRoot } from "./registry.js";
@@ -254,6 +264,7 @@ function asString(v: unknown): string | undefined {
  *  item/tool/call, deltas) carry it in `params.threadId`. Used by the child-sink demux to
  *  decide whether a frame belongs to a delegated child thread. */
 function noteThreadId(note: CodexNotification): string | undefined {
+  if (note.kind === "rate_limits_updated") return undefined;
   if (note.kind !== "activity") return note.threadId;
   const params = asObject(note.params);
   return asString(params?.threadId);
@@ -496,6 +507,7 @@ export class CodexHarness implements RunHarness {
   // PRD #1534: the classification captured from the active turn's final non-retrying
   // provider method:"error" frame, folded into the terminal at decode. Reset per turn.
   private pendingCodexError?: CodexErrorClassification;
+  private rateLimits = new CodexRateLimitObserver();
   // Resolves the current turn's abort race (see runTurn). The owner-aborted signal
   // resolves it via the listener; requestStop()/close() resolve it directly so a turn
   // WEDGED in a pending broker callback (a never-settling model-selected effect) still
@@ -823,6 +835,11 @@ export class CodexHarness implements RunHarness {
     }
   }
 
+  private activePolicyAdmission?: ReturnType<typeof admitPolicyTurn>;
+  get policyAdmission(): ReturnType<typeof admitPolicyTurn> | undefined {
+    return this.activePolicyAdmission;
+  }
+
   startTurn(request: RunTurnRequest): HarnessTurn {
     if (this.closed) {
       throw new CodexHarnessError({ category: "transport", message: "codex harness is closed" });
@@ -833,12 +850,14 @@ export class CodexHarness implements RunHarness {
     // terminal precedence handles it), exactly as the Claude adapter defers query
     // creation.
     const rendered = this.render(request);
+    this.activePolicyAdmission = admitPolicyTurn(request.phase);
     this.turnClosed = false;
     this.terminalEmitted = false;
     this.activeTurnId = undefined;
     this.stopRequested = false;
     this.stopTurn = undefined;
     this.pendingCodexError = undefined;
+    this.rateLimits = new CodexRateLimitObserver();
     this.turnOrdinal += 1;
     this.projectionCounter = 0;
     this.issuedProjectionIds = new Set();
@@ -1106,6 +1125,9 @@ export class CodexHarness implements RunHarness {
         // consumer. An unknown/unregistered thread id is dropped inside record() (never
         // attributed to root). The note still flows on to its normal handling below (a child's
         // routes to its sink; a root's maps to `activity`), so decode behavior is unchanged.
+        // Account snapshots have no thread identity; observe before child demux and
+        // project only liveness, keeping metadata out of the run feed.
+        if (step.value.kind === "rate_limits_updated") this.rateLimits.observe(step.value.rateLimits);
         this.recordUsageNote(step.value);
         await this.deliverIncompleteNotice();
         // CHILD-THREAD DEMUX (part C). A frame carrying a REGISTERED child thread id is a
@@ -1366,6 +1388,8 @@ export class CodexHarness implements RunHarness {
     signal?: AbortSignal,
   ): Promise<HarnessEvent> {
     switch (note.kind) {
+      case "rate_limits_updated":
+        return { kind: "activity", sessionId: this.threadId };
       case "thread_started":
         // The active root's notification is consumed in runTurn because its explicit claim init
         // already carried the same session. Only a child/foreign start reaches here as liveness.
@@ -1514,7 +1538,9 @@ export class CodexHarness implements RunHarness {
       } catch {
         /* projection is best-effort (issue #1583): it never blocks the reply */
       }
-      this.safeRespond(transport, requestId, result);
+      const reply = canonical === "save_draft_plan" && result.ok
+        ? { ok: true as const, output: DRAFT_PLAN_ACK } : result;
+      this.safeRespond(transport, requestId, reply);
       return result;
     };
     const toolName = asString(p.tool);
@@ -1557,7 +1583,14 @@ export class CodexHarness implements RunHarness {
     // scanned}`), which the caller surfaces on a main-origin signals frame. A DENIED signal
     // (result.ok === false) folds nothing; a non-signal effect (shell/file/mcp) is undefined.
     if (isSignal && result.ok) {
-      return { signals: result.output as Readonly<Partial<TurnSignals>> };
+      const signals = result.output as Readonly<Partial<TurnSignals>>;
+      // Scrub accepted drafts with the live runtime-token/claim-secret projection
+      // seam before the reducer emits them. Sanitize the full text first so a
+      // control-split secret matches; MessageBatcher owns the later UTF8 cap.
+      return { signals: signals.draftPlans === undefined ? signals : {
+        ...signals,
+        draftPlans: signals.draftPlans.map((plan) => this.scrubProjected(sanitizeText(plan, emptyCounts()))),
+      } };
     }
     return undefined;
   }
@@ -1597,7 +1630,8 @@ export class CodexHarness implements RunHarness {
       return (result) => {
         let output: string;
         try {
-          output = projectToolOutput(result, this.scrubProjected);
+          output = projectToolOutput(!result.ok && result.policyRefusal
+            ? { ok: true, output: { code: result.code, message: result.message, policyRefusal: result.policyRefusal } } : result, this.scrubProjected);
         } catch {
           output = "[projection failed]";
         }
@@ -1659,7 +1693,8 @@ export class CodexHarness implements RunHarness {
     this.closeOpenChildTools(dispatch);
     let output: string;
     try {
-      output = projectToolOutput(result, this.scrubProjected);
+      output = projectToolOutput(!result.ok && result.policyRefusal
+        ? { ok: true, output: { code: result.code, message: result.message, policyRefusal: result.policyRefusal } } : result, this.scrubProjected);
     } catch {
       output = "[projection failed]";
     }
@@ -1789,7 +1824,8 @@ export class CodexHarness implements RunHarness {
    *  The stable machine `code` and human `message` are already bounded by the broker; a
    *  denial is returned as `success:false` so it lands as a failed tool result. */
   private replyOf(result: CallbackResult): { result: unknown } {
-    const text = result.ok ? this.stringifyOutput(result.output) : result.message;
+    const text = result.ok ? this.stringifyOutput(result.output)
+      : result.policyRefusal ? JSON.stringify({ code: result.code, message: result.message, policyRefusal: result.policyRefusal }) : result.message;
     return { result: { success: result.ok, contentItems: [{ type: "inputText", text }] } };
   }
 
@@ -1929,6 +1965,12 @@ export class CodexHarness implements RunHarness {
     const fromTerminal = normalizeCodexErrorInfo(asObject(turn?.error)?.codexErrorInfo);
     const classification = pickCodexClassification(this.pendingCodexError, fromTerminal);
     const errors = normalizeCodexTerminalErrors(subtype, outcome, classification);
+    const policyRefusal = outcome === "failed" && isPolicyRefusalTag(classification?.classification) && this.policyAdmission
+      ? validatePolicyRefusal({
+        ...this.policyAdmission, event: "provider_policy_refusal", provider: "codex",
+        category: "policy_refusal", origin: "root", policy_tag: classification.classification,
+      })
+      : undefined;
     // PRD #1332 C4a/C4b: attach the per-model token accounting as the result-frame `modelUsage`,
     // now carrying each model's closed `costStatus` (and `costUSD` when metered) projected from
     // the run's auth mode against the D5 price table (C4b). The reducer emits
@@ -1945,10 +1987,14 @@ export class CodexHarness implements RunHarness {
     // The RUN-level cost status: subscription/metered/unreported, folded with D5's unreported
     // dominance. Undefined auth mode leaves it `unreported` (price-free), matching `modelUsage`.
     const cost = this.authMode === undefined ? { kind: "unreported" as const } : deriveCodexRunCost(modelUsage, this.authMode);
+    const usageLimit = outcome === "failed" && classification?.classification === "usageLimitExceeded";
+    const limitEvidence = usageLimit ? this.rateLimits.classify(this.authMode) : undefined;
     return {
       outcome,
       subtype,
       errors,
+      ...(limitEvidence ? { limitEvidence } : {}),
+      ...(policyRefusal ? { policyRefusal } : {}),
       usage,
       metrics: { cost },
       failure: {
@@ -1958,9 +2004,15 @@ export class CodexHarness implements RunHarness {
         // raw provider text (message/additionalDetails/misalignment) is ever retained. When
         // there is no classification the message stays based on the CLOSED subtype alone and
         // the category defaults to "unknown", byte-identical to before #1534.
-        materialize: (_limit): HarnessThrownFailure => {
+        materialize: (limit): HarnessThrownFailure => {
+          if (usageLimit && limit !== undefined) {
+            const original = new LimitReachedError({ resetsAtMs: limit.resetsAtMs, rateLimitType: limit.window });
+            return { failure: { category: "rate_limit", message: original.message, limit }, original };
+          }
           const suffix = classification !== undefined ? ` (${formatCodexClassification(classification)})` : "";
-          const original = new CodexTurnFailedError(`codex turn failed: ${subtype}${suffix}`, classification);
+          const original = policyRefusal
+            ? new ProviderPolicyRefusal(policyRefusal)
+            : new CodexTurnFailedError(usageLimit ? "codex turn failed: failed (usageLimitExceeded)" : `codex turn failed: ${subtype}${suffix}`, classification, usageLimit ? "rate_limited" : undefined);
           const category = classification?.category ?? "unknown";
           return { failure: { category, message: original.message }, original };
         },

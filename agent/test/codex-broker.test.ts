@@ -1,4 +1,5 @@
 import { describe, it } from "node:test";
+import { admitPolicyTurn, type PolicyRefusalPayload } from "../src/provider-policy-refusal.js";
 import assert from "node:assert/strict";
 
 import {
@@ -120,6 +121,32 @@ function assertDenied(r: CallbackResult, code: string): asserts r is { ok: false
   if (r.ok) assert.fail(`expected a denial with code ${code}, got ok`);
   assert.equal(r.code, code, `expected deny code ${code}, got ${r.code}: ${r.message}`);
 }
+
+describe("policy refusal broker injection boundary (#2321)", () => {
+  const parent = admitPolicyTurn("plan");
+  const payload: PolicyRefusalPayload = { ...admitPolicyTurn("plan"), event: "provider_policy_refusal", provider: "codex",
+    category: "policy_refusal", origin: "child", policy_tag: "cyberPolicy", role: "coder", parent_correlation_id: parent.correlation_id };
+  it("preserves validated child code/metadata and replaces injected provider message", async () => {
+    const h = makeBroker({ delegate: async () => ({ ok: false, code: "child_policy_refused", message: "PRIVATE", policyRefusal: payload }) });
+    const r = await h.broker.handleToolCall(rt(), "spawn_agent", { subagent_type: "coder", prompt: "p" }, "root");
+    assert.equal(r.ok, false);
+    if (r.ok) throw new Error("expected failure");
+    assert.equal(r.code, "child_policy_refused");
+    assert.deepEqual(r.policyRefusal, payload);
+    assert.equal(r.message, "Codex provider safety-policy refusal (cyberPolicy)");
+    assert.ok(!JSON.stringify(r).includes("PRIVATE"));
+  });
+  it("rejects malformed, non-child, open and oversized refusal metadata", async () => {
+    for (const p of [undefined, { ...payload, role: "reviewer" }, { ...payload, role: "coder\n" }, { ...payload, message: "PRIVATE" }, { ...payload, correlation_id: "PRIVATE".repeat(1000) },
+      { ...payload, origin: "root" }, { ...payload, parent_correlation_id: "raw-provider-id" }]) {
+      const h = makeBroker({ delegate: async () => ({ ok: false, code: "child_policy_refused", message: "PRIVATE", policyRefusal: p as PolicyRefusalPayload }) });
+      const r = await h.broker.handleToolCall(rt(), "spawn_agent", { subagent_type: "coder", prompt: "p" }, "root");
+      assertDenied(r, "child_failed");
+      assert.ok(!JSON.stringify(r).includes("PRIVATE"));
+      assert.ok(!("policyRefusal" in r));
+    }
+  });
+});
 
 describe("CodexCallbackBroker: ingestion bounds", () => {
   it("exposes the exact byte caps", () => {
@@ -303,6 +330,18 @@ describe("CodexCallbackBroker: file effects through the fileop client", () => {
     const r = await h.broker.handleToolCall(rt(), "Read", { path: "creds.env" }, "root");
     assertDenied(r, "path_denied");
     assert.equal(h.fileop.calls.length, 0);
+  });
+
+  it("a granted child Read of CLAUDE returns only neutral E_SYMLINK denial", async () => {
+    const fileop = new FileopSpy({ ok: false, code: "E_SYMLINK",
+      data: Buffer.from("PRIVATE_RULES_SENTINEL").toString("base64") });
+    const h = makeBroker({ fileop, grants: grants({ isRoot: false, allowedTools: new Set(["Read"]) }) });
+    const r = await h.broker.handleToolCall(rt(), "Read", { path: "CLAUDE.md" }, "child");
+    assert.deepEqual(r, { ok: false, code: "fileop_denied", message: "file operation denied (E_SYMLINK)" });
+    assert.equal(fileop.calls.length, 1);
+    assert.equal(fileop.calls[0]!.path, "CLAUDE.md");
+    assert.equal(h.spawn.calls.length, 0);
+    assert.doesNotMatch(JSON.stringify(r), /AGENTS|PRIVATE_RULES_SENTINEL|data/);
   });
 
   it("maps a fileop error code to a neutral denial", async () => {

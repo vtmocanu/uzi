@@ -1,7 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { deriveCloneKey } from "../src/run-kind.js";
+import { deriveCloneKey, RUN_KIND_PROFILES } from "../src/run-kind.js";
+import type { ClaimResponse } from "../src/protocol.js";
 import { selfImproveBranch } from "../src/self-improve.js";
 
 // Pins deriveCloneKey (agent/src/run-kind.ts) per run kind. This is the SINGLE source of
@@ -92,6 +93,25 @@ describe("deriveCloneKey", () => {
   it("mr_rework fails closed when its branch is missing/empty", () => {
     assert.equal(deriveCloneKey({ kind: "mr_rework", runId: "r", branch: null }), undefined);
     assert.equal(deriveCloneKey({ kind: "mr_rework", runId: "r", branch: "" }), undefined);
+  });
+
+  it("cross_check uses the child run ID, independent of the lead's issue and branch", () => {
+    const childId = "6f1c2c1a-0000-4000-8000-000000000000";
+    const expected = {
+      branch: `uzi/cross-check-${childId}`,
+      slug: `uzi-cross-check-${childId}`,
+    };
+    assert.deepEqual(deriveCloneKey({ kind: "cross_check", runId: childId }), expected);
+    assert.deepEqual(
+      deriveCloneKey({ kind: "cross_check", runId: childId, issueIid: 7, branch: "agent/issue-7" }),
+      expected,
+    );
+    assert.notDeepEqual(deriveCloneKey({ kind: "cross_check", runId: "another-child" }), expected);
+
+    const claim = { kind: "cross_check", run_id: childId, issue_iid: null, branch: null } as ClaimResponse;
+    assert.deepEqual(RUN_KIND_PROFILES.cross_check.cloneBranch?.(claim, childId), expected);
+    assert.equal(RUN_KIND_PROFILES.cross_check.mrTitle, undefined);
+    assert.equal(RUN_KIND_PROFILES.cross_check.completionLine, undefined);
   });
 
   it("job is repo-less: it has no clone key at all (PRD #1908)", () => {

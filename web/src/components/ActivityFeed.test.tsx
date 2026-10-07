@@ -1,3 +1,4 @@
+import { MemoryRouter } from "react-router-dom";
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
@@ -68,6 +69,7 @@ function runFixture(over: Partial<Run> = {}): Run {
     requeue_count: 0,
     iteration_count: 0,
     auto_approve: false,
+    plan_cross_check_required: false,
     worker_id: "w1",
     branch: null,
     model: null,
@@ -115,19 +117,77 @@ function runFixture(over: Partial<Run> = {}): Run {
   };
 }
 
+describe("draft capture presentation", () => {
+  const draft = (seq: number, plan_md: string, over: Record<string, unknown> = {}) =>
+    m(seq, "status", { event: "draft_plan_capture", version: 1,
+      label: "draft, unapproved, possibly incomplete", plan_md, truncated: false, ...over });
+
+  for (const view of ["agent", "timeline"] as const) {
+    it(`latest valid draft wins by seq in ${view}, including an appended revision`, () => {
+      window.localStorage.setItem("uzi.activity.view", JSON.stringify(view));
+      const messages = [
+        draft(4, "# Current draft"), draft(1, "# Earlier draft"),
+        draft(5, "# Future draft", { version: 2 }),
+        draft(6, "# Malformed draft", { truncated: null }),
+        { ...m(7, "text", { text: "Validator report: revise the scope" }, "reviewer"), agent_instance: "validation-review" },
+        m(8, "plan", { plan_md: "# Submitted plan" }),
+        m(9, "status", { text: "Plan status remains ordinary" }),
+      ];
+      const original = JSON.stringify(messages);
+      const props = { run: runFixture(), runningLive: true, connected: true, terminal: false };
+      const r = render(<ActivityFeed messages={messages} {...props} />);
+      fireEvent.click(r.getByText("Expand all"));
+      expect(r.getAllByTestId("draft-plan-capture")).toHaveLength(1);
+      expect(r.getByRole("heading", { name: "Current draft" })).toBeTruthy();
+      expect(r.queryByRole("heading", { name: "Earlier draft" })).toBeNull();
+      expect(r.queryByRole("heading", { name: "Future draft" })).toBeNull();
+      expect(r.queryByRole("heading", { name: "Malformed draft" })).toBeNull();
+      expect(r.getAllByText("status: draft_plan_capture")).toHaveLength(2);
+      expect(r.getByText("Validator report: revise the scope", { selector: "p" })).toBeTruthy();
+      expect(r.getByText("plan submitted (awaiting approval)")).toBeTruthy();
+      expect(r.getAllByText("Plan status remains ordinary").length).toBeGreaterThan(0);
+      const card = r.getByTestId("draft-plan-capture");
+      expect(card.querySelector("button")).toBeNull();
+      if (view === "timeline") {
+        expect(card.compareDocumentPosition(r.getByText("Validator report: revise the scope", { selector: "p" })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      }
+      r.rerender(<ActivityFeed messages={[...messages, draft(10, "# Revised draft")]} {...props} />);
+      expect(r.getAllByTestId("draft-plan-capture")).toHaveLength(1);
+      expect(r.getByRole("heading", { name: "Revised draft" })).toBeTruthy();
+      expect(r.queryByRole("heading", { name: "Current draft" })).toBeNull();
+      expect(r.getByText("Validator report: revise the scope", { selector: "p" })).toBeTruthy();
+      expect(JSON.stringify(messages)).toBe(original);
+    });
+
+    it(`derives from the full stream before the cap in ${view} and retains Show all`, () => {
+      window.localStorage.setItem("uzi.activity.view", JSON.stringify(view));
+      // Highest seq is outside the capped suffix: array order must not select a draft.
+      const messages = [draft(2000, "# Full stream latest"), ...Array.from({ length: 1000 }, (_, i) =>
+        m(i + 2, "status", { text: `ordinary ${i}` })), draft(1, "# Stale suffix")];
+      const original = JSON.stringify(messages);
+      const r = renderFeed(messages);
+      expect(r.queryByTestId("draft-plan-capture")).toBeNull();
+      fireEvent.click(r.getByRole("button", { name: /Show .* earlier messages/i }));
+      expect(r.getByRole("heading", { name: "Full stream latest" })).toBeTruthy();
+      expect(r.queryByRole("heading", { name: "Stale suffix" })).toBeNull();
+      expect(JSON.stringify(messages)).toBe(original);
+    });
+  }
+});
+
 const TERMINAL: RunStatus[] = ["completed", "failed", "cancelled"];
 
 // renderFeed centralizes the now-required `run` prop and keeps runningLive/terminal
 // consistent with status, so a test states only status + health.
 function renderFeed(
   messages: RunMessage[],
-  opts: { status?: RunStatus; health?: RunHealth; connected?: boolean } = {},
+  opts: { status?: RunStatus; health?: RunHealth; connected?: boolean; harness?: Run["harness"] } = {},
 ) {
-  const { status = "running", health = "ok", connected = true } = opts;
+  const { status = "running", health = "ok", connected = true, harness = "claude" } = opts;
   return render(
     <ActivityFeed
       messages={messages}
-      run={runFixture({ status, health })}
+      run={runFixture({ status, health, harness })}
       runningLive={status === "running"}
       connected={connected}
       terminal={TERMINAL.includes(status)}
@@ -1429,5 +1489,48 @@ describe("ActivityFeed lead context-window meter", () => {
     expect(container.textContent).toContain("110%");
     // Over-100 is near-compaction (danger), the fill saturating the channel.
     expect(meter.getAttribute("data-context-state")).toBe("near");
+  });
+});
+
+describe("M1 null-agent plan cross-check narration", () => {
+  it.each(["timeline", "by_agent"])("renders and announces in %s", (view) => {
+    if (view === "timeline") selectTimelineView();
+    const message = { ...m(5, "cross_check", { stage: "plan", verdict: "failed", reason_class: "interrupted", findings: null }), agent: null };
+    const r = render(<MemoryRouter><ActivityFeed run={runFixture()} messages={[message]} connected runningLive={false} terminal={false} /></MemoryRouter>);
+    expect(r.container.querySelector('[aria-live="polite"]')?.textContent).toContain("Plan cross-check of checked candidate: Interrupted");
+    expect(r.container.textContent).toContain("Plan cross-check of checked candidate: Interrupted");
+    const buttons = Array.from(r.container.querySelectorAll("button"));
+    const lane = buttons.find((b) => b.getAttribute("aria-controls")?.startsWith("agent-body"));
+    if (lane?.getAttribute("aria-expanded") === "false") fireEvent.click(lane);
+    expect(r.getByRole("region", { name: "Plan cross-check event" })).toBeTruthy();
+  });
+});
+
+it("M1 historical cross-check announces earlier candidate evidence independently of the current gate", () => {
+  const checker = "11111111-1111-4111-8111-111111111111";
+  const message = { ...m(6, "cross_check", { stage: "plan", verdict: "approve", reason_class: "approve", checker_run_id: checker }), agent: null };
+  const r = render(<MemoryRouter><ActivityFeed run={runFixture({
+    plan_cross_check_gate_reason: "model_error",
+    plan_cross_check_summary: { round: 1, verdict: "approve", reason_class: "approve", findings: null,
+      checker_run_id: checker, checker_model: null, checker_effort: null, usage: null, historical: true },
+  })} messages={[message]} connected runningLive={false} terminal={false} /></MemoryRouter>);
+  expect(r.container.querySelector('[aria-live="polite"]')?.textContent).toBe("Plan cross-check of earlier-plan candidate: Passed");
+});
+
+describe("usage-limit provider regression #2360", () => {
+  it.each(["agent", "timeline"])("threads run context through %s rows and announcements", (view) => {
+    window.localStorage.setItem("uzi.activity.view", JSON.stringify(view));
+    const { container } = renderFeed([m(1, "limit_wait", { harness: "claude", rate_limit_type: "seven_day" }, "worker")], { status: "limit_wait", harness: "codex" });
+    expect(document.querySelector('[aria-live="polite"]')?.textContent).toBe("Run paused on a Codex usage limit");
+    expect(container.textContent).toContain("Codex usage limit reached — paused until it resets");
+    expect(container.textContent).toContain("7-day window");
+    expect(container.textContent).not.toContain("Anthropic usage limit");
+  });
+  it("uses neutral copy for unknown full-run context", () => {
+    const { container } = renderFeed([m(1, "limit_hit", { provider: "payload-provider" }, "worker")], { harness: "unrecognized-provider" as Run["harness"] });
+    expect(document.querySelector('[aria-live="polite"]')?.textContent).toBe("Run hit a usage limit");
+    expect(container.textContent).toContain("Usage limit reached — the run failed here");
+    expect(container.textContent).not.toContain("unrecognized-provider");
+    expect(container.textContent).not.toContain("payload-provider");
   });
 });

@@ -73,10 +73,11 @@ describe("buildDecisionsMemoContext", () => {
 });
 
 describe("buildPlanPrompt decisionsMemo", () => {
-  it("is byte-identical with the memo absent, undefined or empty", () => {
-    const base = buildPlanPrompt(planInput);
-    assert.strictEqual(buildPlanPrompt({ ...planInput, decisionsMemo: undefined }), base);
-    assert.strictEqual(buildPlanPrompt({ ...planInput, decisionsMemo: "" }), base);
+  it("is identical apart from the fresh issue nonce with the memo absent, undefined or empty", () => {
+    const stable = (prompt: string) => prompt.replace(/issue_context_[0-9a-f]+/g, "issue_context_NONCE");
+    const base = stable(buildPlanPrompt(planInput));
+    assert.strictEqual(stable(buildPlanPrompt({ ...planInput, decisionsMemo: undefined })), base);
+    assert.strictEqual(stable(buildPlanPrompt({ ...planInput, decisionsMemo: "" })), base);
     assert.ok(!base.includes("untrusted_decisions_memo"));
   });
 

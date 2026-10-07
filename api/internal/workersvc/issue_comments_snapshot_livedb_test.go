@@ -10,19 +10,26 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
+	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// fakeCommentForge overrides only ListIssueComments (embedding forge.Forge for the
-// rest of the interface), returning a per-issue scripted comment list. The other 20
-// methods are never called on this path — createRun only reads comments.
+// fakeCommentForge supplies raw issue and eligible repository-author evidence.
 type fakeCommentForge struct {
-	forge.Forge
+	forgetest.BaseFake
 	byIID map[int64][]forge.IssueComment
 }
 
 func (f *fakeCommentForge) ListIssueComments(_ context.Context, _ int64, issueIID int64) ([]forge.IssueComment, error) {
 	return f.byIID[issueIID], nil
+}
+
+func (f *fakeCommentForge) GetIssue(_ context.Context, _, iid int64) (forge.Issue, error) {
+	return forge.Issue{IID: iid, Title: "Do X", Description: "actual forge body", AuthorForgeUserID: 42}, nil
+}
+func (f *fakeCommentForge) RepositoryAuthorEligibility(context.Context, int64, int64) (forge.AuthorEligibility, error) {
+	return forge.AuthorEligible, nil
 }
 
 // fakeCommentForges is the ForgeBuilder seam: every connection resolves to the one
@@ -64,11 +71,11 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 			{AuthorForgeUserID: humanID, AuthorUsername: "human", Body: "please guard the budget", CreatedAt: commentTS(1)},
 			{AuthorForgeUserID: botID, AuthorUsername: "uzi-bot", Body: "run started", CreatedAt: commentTS(2)},
 		},
-		// (2) only bot: nothing survives the D1 filter ⇒ NULL.
+		// (2) only bot: nothing survives the D1 filter ⇒ versioned empty thread.
 		12: {
 			{AuthorForgeUserID: botID, AuthorUsername: "uzi-bot", Body: "run started", CreatedAt: commentTS(1)},
 		},
-		// (3) human, but the connection's bot id is unknown (0) ⇒ D9 omits ⇒ NULL.
+		// (3) human, but the connection's bot id is unknown (0) ⇒ D9 yields an unknown empty thread.
 		13: {
 			{AuthorForgeUserID: humanID, AuthorUsername: "human", Body: "context that must not leak the feature", CreatedAt: commentTS(1)},
 		},
@@ -137,6 +144,12 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	if len(snap.Comments) != 1 {
 		t.Fatalf("issue 11: want exactly the human comment, got %d comments", len(snap.Comments))
 	}
+	if snap.Comments[0].Body != "please guard the budget" {
+		t.Fatalf("eligible body lost: %+v", snap)
+	}
+	if run1.IssueSavedBody.String != "actual forge body" {
+		t.Fatalf("raw capture lost: %+v", run1)
+	}
 	if snap.Comments[0].AuthorForgeUserID != humanID {
 		t.Fatalf("issue 11: want the human comment (author %d), got author %d", humanID, snap.Comments[0].AuthorForgeUserID)
 	}
@@ -146,21 +159,28 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 		}
 	}
 
-	// (2) Only bot comments ⇒ stored NULL.
+	// (2) Only bot comments ⇒ versioned empty thread.
 	run2, err := svc.CreateRun(ctx, userID, repoKnown, 12, "desc", &waitFalse, nil, false, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("create run for issue 12: %v", err)
 	}
-	if raw := rawColumn(run2.ID); len(raw) != 0 {
-		t.Fatalf("issue 12: an all-bot thread must store NULL, got %s", raw)
+	assertEmpty := func(id uuid.UUID, unknown bool) {
+		t.Helper()
+		var thread issueinput.Thread
+		raw := rawColumn(id)
+		if err := json.Unmarshal(raw, &thread); err != nil {
+			t.Fatal(err)
+		}
+		if thread.Version != issueinput.SnapshotVersion || thread.Unknown != unknown || len(thread.Comments) != 0 {
+			t.Fatalf("empty thread=%s", raw)
+		}
 	}
+	assertEmpty(run2.ID, false)
 
-	// (3) Human comment but the connection's bot id is 0 ⇒ D9 stores NULL.
+	// (3) Unknown bot identity ⇒ versioned unknown empty thread.
 	run3, err := svc.CreateRun(ctx, userID, repoZero, 13, "desc", &waitFalse, nil, false, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("create run for issue 13: %v", err)
 	}
-	if raw := rawColumn(run3.ID); len(raw) != 0 {
-		t.Fatalf("issue 13: a zero bot id must store NULL (D9), got %s", raw)
-	}
+	assertEmpty(run3.ID, true)
 }

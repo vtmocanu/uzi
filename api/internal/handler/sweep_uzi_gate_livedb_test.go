@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
 	"github.com/vtmocanu/uzi/api/internal/schedsvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -40,20 +41,29 @@ import (
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
 
-// sweepGateForge stubs forge.Forge (nil embed) and answers only GetIssue: the M1
-// eligibility gate reads the CACHED issues.labels jsonb, never the forge, so the fake need
-// only hand back a title/description/web URL for whichever candidate the sweep fetches.
+// sweepGateForge supplies issue capture inputs and author eligibility. The uzi-label
+// gate still reads the cached issues.labels rather than forge labels.
 type sweepGateForge struct {
-	forge.Forge
+	forgetest.BaseFake
 }
 
 func (sweepGateForge) GetIssue(_ context.Context, _ int64, iid int64) (forge.Issue, error) {
 	return forge.Issue{
-		IID:         iid,
-		Title:       fmt.Sprintf("swept issue %d", iid),
-		Description: "do the swept work",
-		WebURL:      fmt.Sprintf("https://forge.example/i/%d", iid),
+		IID:               iid,
+		Title:             fmt.Sprintf("swept issue %d", iid),
+		Description:       "do the swept work",
+		WebURL:            fmt.Sprintf("https://forge.example/i/%d", iid),
+		AuthorForgeUserID: 42,
+		Author:            "eligible-author",
 	}, nil
+}
+
+func (sweepGateForge) RepositoryAuthorEligibility(context.Context, int64, int64) (forge.AuthorEligibility, error) {
+	return forge.AuthorEligible, nil
+}
+
+func (sweepGateForge) ListIssueComments(context.Context, int64, int64) ([]forge.IssueComment, error) {
+	return []forge.IssueComment{}, nil
 }
 
 type sweepGateBuilder struct{ f forge.Forge }
@@ -136,10 +146,10 @@ func TestSweepFiresOnlyUziLabelledCandidateLiveDB(t *testing.T) {
 	}
 
 	// Real workersvc.Service (the real uzi_label gate) and a real Scheduler firing through
-	// it. No forges/repo-guard wired on the service: the create path needs neither, and
-	// guardDefaultBranch is inert without a guard.
+	// it. The scheduler supplies the forge for issue capture; guardDefaultBranch is
+	// inert without a repo guard.
 	wsvc := workersvc.New(q, box, workersvc.Params{})
-	sched := schedsvc.New(q, wsvc, sweepGateBuilder{f: sweepGateForge{}}, sweepGateSettings{}, nil, nil, time.Minute, nil)
+	sched := schedsvc.New(q, wsvc, sweepGateBuilder{f: &sweepGateForge{}}, sweepGateSettings{}, nil, nil, time.Minute, nil)
 
 	tickAt := time.Now()
 	sched.Boot(ctx) // one immediate tick: claim the due sweep, fan out, advance

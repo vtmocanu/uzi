@@ -17,6 +17,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
@@ -176,6 +177,11 @@ func resumePhaseFor(run store.Run, planApproved bool) string {
 // CLAIMING worker, not just the run, because since PRD #104 M3 the credential a
 // run spends can depend on which worker picked it up.
 func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimPayload, error) {
+	if run.Kind == runkind.CrossCheck {
+		if err := validateCrossCheckContext(run.IssueTitle, run.IssueDescription); err != nil {
+			return nil, err
+		}
+	}
 	// Judge lane (PRD #46 Decision 1): a judge run has no repo and no forge
 	// connection, so it MUST fork before GetRunClaimContext (which INNER-JOINs
 	// repos → forge_connections and would treat a repo-less judge run as vanished)
@@ -460,6 +466,38 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		if err := json.Unmarshal(run.IssueComments, &snap); err != nil {
 			slog.Error("workersvc: decode run issue comments", "run_id", run.ID, "error", err)
 		} else {
+			// Legacy snapshots have no permission classification. Never refetch or
+			// unlock their bodies during claim/resume.
+			if snap.Version != issueinput.SnapshotVersion {
+				snap.Unknown = true
+				for i := range snap.Comments {
+					snap.Comments[i].Body = issueinput.Placeholder
+					snap.Comments[i].Reason = issueinput.Unknown
+				}
+			}
+			if len(snap.Comments) > maxIssueCommentsCount {
+				snap.Comments = snap.Comments[len(snap.Comments)-maxIssueCommentsCount:]
+				snap.Truncated = true
+			}
+			total := 0
+			start := len(snap.Comments)
+			for i := len(snap.Comments) - 1; i >= 0; i-- {
+				if total+len(snap.Comments[i].Body) > maxIssueCommentsBytes {
+					if start == len(snap.Comments) {
+						snap.Comments[i].Body = truncateCommentBody(snap.Comments[i].Body)
+						start = i
+					}
+					snap.Truncated = true
+					break
+				}
+				total += len(snap.Comments[i].Body)
+				start = i
+			}
+			snap.Comments = snap.Comments[start:]
+			for i := range snap.Comments {
+				snap.Comments[i].AuthorUsername = issueinput.AuthorName(snap.Comments[i].AuthorUsername)
+			}
+			snap.Version = issueinput.SnapshotVersion
 			issueComments = &snap
 		}
 	}
@@ -613,9 +651,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		RequeueCount:   run.RequeueCount,
 		// PRD #1296 M1 (D2): the claim-lane counter the ClaimRun CTE just incremented, read
 		// straight off the returned run row and returned in the claim payload.
-		ClaimGeneration: run.ClaimGeneration,
-		PlanMd:          textPtr(run.PlanMd),
-		AutoApprove:     run.AutoApprove,
+		ClaimGeneration:          run.ClaimGeneration,
+		PlanMd:                   textPtr(run.PlanMd),
+		AutoApprove:              run.AutoApprove,
+		PlanCrossCheckRequired:   run.PlanCrossCheckRequired,
+		PlanCrossCheckGateReason: textPtr(run.PlanCrossCheckGateReason),
 		// PRD #400 M2: task-run MR gate + source ref. open_mr is a plain bool (false
 		// for every non-task run); base_branch is pgtype.Text (nil for a run that has
 		// none). Both re-read from the row on every claim, like AutoApprove above.
@@ -848,11 +888,23 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		payload.SelfImproveDogfood = rc.FoldImproveUziBacklog
 	}
 
+	if run.Kind == runkind.CrossCheck {
+		if err := s.assemblePlanCrossCheckInput(ctx, wkr, run, payload); err != nil {
+			return nil, crossCheckAssemblyError(payload, err)
+		}
+	}
+
 	// PRD #1906 M3: last, so nothing attached above survives the strip. An unbound run
 	// skips this and its claim is byte-identical to before.
 	if isolated {
 		if err := s.isolateClaim(ctx, run, payload); err != nil {
 			return nil, err
+		}
+	}
+
+	if run.Kind == runkind.CrossCheck {
+		if _, err := MarshalCrossCheckClaim(payload); err != nil {
+			return nil, crossCheckAssemblyError(payload, err)
 		}
 	}
 

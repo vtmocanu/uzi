@@ -285,6 +285,7 @@ tasks:
     cmds:
       - task: lint:shell
       - task: lint:yaml
+      - task: check:skill-triage-render
       - task: lint:formula
       # Workflow linting (actionlint + zizmor). Grouped with the other lint:* checks;
       # like them it fail-open SKIPs when its tools are absent on a laptop and is
@@ -405,6 +406,7 @@ tasks:
       # without one. Its hermetic suite runs first so a gutted check cannot read green.
       - task: test:changelog-entry
       - task: check:changelog-entry
+      - task: test:livedb-skip-guard
       # CI and the baked worker share one SAST engine (#2093): CI installs the
       # worker lock's semgrep, and this fails if CI grows a pin of its own.
       - task: test:semgrep-parity
@@ -957,6 +959,11 @@ tasks:
     cmds:
       - ./scripts/check-changelog-entry.test.sh
 
+  test:livedb-skip-guard:
+    desc: hermetic exit-code contract for the shared LiveDB zero-skip guard (synthetic go test logs, nested skips), tally-guarded
+    cmds:
+      - ./scripts/livedb-skip-guard.test.sh
+
   test:semgrep-parity:
     desc: hermetic CI and worker semgrep parity fixtures, including fail-closed inputs
     cmds:
@@ -1261,6 +1268,16 @@ tasks:
       # No .github/workflows edit: the lint-repo job runs `task gate:repo`, which lists this.
       # See the script header.
       - ./scripts/check-api-v1-compat.sh "{{.OASDIFF_VERSION}}" scripts/api-v1-compat-canary api/openapi/v1.yaml
+
+  check:skill-triage-render:
+    # The sanitizer runs inside jq, so the offline hostile-field suite is required
+    # under bash in CI. Also execute the documented snippets under zsh when present
+    # to catch quoting/word-splitting differences; print a bash-only note if absent.
+    # Local zsh verification is required when editing these workstation snippets.
+    # No forge reads: the regression mocks gh and exercises SKILL.md's real pipelines.
+    desc: reject terminal-control and bidi bytes in issue-triage renderers
+    cmds:
+      - python3 -B .agents/skills/issue-triage/scripts/test-rendering.py
 
   check:skill-size:
     desc: no repo skill's SKILL.md exceeds the 65536-byte runtime cap (over-cap skills are dropped silently at run time), with a canary proving the detector fired
@@ -2253,15 +2270,12 @@ tasks:
       # UZI_DEADCODE_WEB_REQUIRED=1 (see .github/workflows/ci.yml), which turns a missing knip
       # into exit 2, so a skip in CI (image regressed) can never look like a pass.
       #
-      # 🔴 WHAT GATES AND WHAT DOES NOT, because a green here does NOT mean "no
-      # unused exports". `web/knip.jsonc` stages `exports`/`types` and the rest of
-      # that family at `warn`, and WARN-SEVERITY ISSUES ARE PRINTED IN FULL AND DO
-      # NOT SET THE EXIT CODE. As of 2026-08-02 that is 22 findings on this package
-      # (9 exports + 13 exported types), reported on every run and gating nothing;
-      # unused FILES and DEPENDENCIES gate at zero. `--max-issues` is NOT a fallback
-      # for the warn tier - measured, it counts error-severity issues only and exits
-      # 0 with the warn findings printed. Burning the export tier down and promoting
-      # it to `error` is issue #206, not this milestone.
+      # 🔴 WHAT GATES: `web/knip.jsonc` sets every reported rule to `error`, the
+      # `exports`/`types` family included, so a green here DOES mean "no unused
+      # files, dependencies or exports". Only `error` severity sets the exit code; a
+      # rule staged at `warn` would print and gate nothing, and `--max-issues` counts
+      # error-severity issues only. Keep DTO/contract types exported via
+      # `ignoreExportsUsedInFile`, not by lowering a rule to `warn`.
       #
       # 🔴 AND NEVER ADD `--fix`. knip's fix mode edits files in the repo (it strips
       # `export` keywords, and with --allow-remove-files deletes files). Nothing in
@@ -2419,10 +2433,9 @@ tasks:
       # the wrapper cd's into the component so there is no `dir:` here. Two
       # differences specific to this package:
       #
-      #   - the export/type tier here is at `error`, gating at zero: issue #597
-      #     burned down the warn-tier backlog and promoted the six export/type
-      #     rules. web's sibling tier (issue #206) is still staged at `warn`, so
-      #     the two packages' knip staging is no longer symmetric.
+      #   - the export/type tier here is at `error`, gating at zero, as on web:
+      #     issue #597 burned down this package's warn-tier backlog and promoted
+      #     the six export/type rules.
       #   - `agent-browser` is in `ignoreDependencies`, because it is resolved BY
       #     PATH at runtime rather than by an import. `agent/knip.jsonc` states why;
       #     deleting that line makes knip demand the removal of a dependency the
@@ -2633,6 +2646,46 @@ tasks:
     desc: Opt-in Linux supervisor mechanism characterization
     cmds:
       - python3 -B e2e/codex-m0/supervisor-mechanism.test.py
+
+  test:cross-check-confinement:
+    desc: Required plan checker filesystem confinement and packaged provider/fileop proofs
+    env:
+      UZI_UID_SPLIT: "1"
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=vendor -buildvcs=false
+    cmds:
+      - |
+        set -eu
+        if [ "$(uname -s)" != Linux ]; then
+          echo "NOT RUN: cross-check confinement requires Linux" >&2
+          exit 2
+        fi
+        for prerequisite in go node; do
+          if ! command -v "$prerequisite" >/dev/null; then
+            echo "NOT RUN: missing $prerequisite for confinement proof" >&2
+            exit 2
+          fi
+        done
+        if ! (cd agent && node --import tsx -e ""); then
+          echo "NOT RUN: agent test dependencies unavailable" >&2
+          exit 2
+        fi
+        mkdir -p .uzi/scratch
+        proof_dir="$(mktemp -d .uzi/scratch/cross-check-proof.XXXXXX)"
+        chmod 755 "$proof_dir"
+        proof_dir="$(cd "$proof_dir" && pwd)"
+        trap 'rm -rf "$proof_dir"' EXIT
+        go -C agent/codex/supervisor build -o "$proof_dir/sandbox" ./cmdsandbox
+        go -C agent/codex/supervisor build -o "$proof_dir/supervisor" .
+        go -C agent/codex/supervisor build -o "$proof_dir/fileop" ./fileop
+        export UZI_CROSS_CHECK_SANDBOX="$proof_dir/sandbox"
+        export UZI_CROSS_CHECK_SUPERVISOR="$proof_dir/supervisor"
+        export UZI_CROSS_CHECK_FILEOP="$proof_dir/fileop"
+        export UZI_CROSS_CHECK_CONFINEMENT_REQUIRED=1
+        go -C agent/codex/supervisor test -count=1 ./cmdsandbox -run TestCrossCheck
+        node agent/test/cross-check-confinement-probe.mjs
+        cd agent
+        node --import tsx --test --test-concurrency=1 --test-timeout=120000 test/cross-check-confinement-packaged.probe.ts
 
   test:codex-supervisor:
     desc: Opt-in Linux-only gofmt vet and unit tests for the static Codex process supervisor module

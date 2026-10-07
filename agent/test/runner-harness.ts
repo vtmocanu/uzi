@@ -35,6 +35,7 @@ import {
 } from "../src/runner.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { Logger } from "../src/log.js";
+import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 import type { UserInput } from "../src/protocol.js";
 
 export const TOKEN = "tkn-runner-123456";
@@ -58,7 +59,7 @@ export function installHarness(): void {
     baseUrl = await api.listen();
     fx = makeFixture({}, { testName: t.fullName ?? t.name });
     git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
-    homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-runnerhome-"));
+    homeDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "uzi-runnerhome-"));
     client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), {
       sleep: async () => {},
       terminalRetrySchedule: [1, 1],
@@ -273,6 +274,7 @@ export function runnerWith(
     // PRD #1798 M6: no wall-clock wait before the publisher re-reads a PR whose head lags.
     prDescriptionHeadLagMs: 0,
     gitlab,
+    teardownTestDeps: portableTeardownTestDeps,
     // Spread LAST so a test can override checkpointIntervalMs / now (PRD #267) and any
     // other RunnerOptions field. Optional: existing call sites pass nothing.
     ...extra,

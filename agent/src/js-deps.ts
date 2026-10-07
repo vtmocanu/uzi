@@ -79,8 +79,8 @@
 // exactly why their flags are wired now rather than later.
 
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { readdir, readFile } from "node:fs/promises";
+import { constants as fsConstants, existsSync } from "node:fs";
+import fs, { type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 import { killRunnerGroup, runnerCommand } from "./runner-uid.js";
 
@@ -121,6 +121,9 @@ export const DEFAULT_INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
  *  own package.json + lockfile is not a project of this repo, and one `node_modules`
  *  can hold thousands); `.git` is pure walk cost with nothing installable inside. */
 const SKIP_DIRS = new Set(["node_modules", ".git"]);
+
+/** Cap raw manifest bytes, with one extra byte read only to detect growth past the cap. */
+const MAX_MANIFEST_BYTES = 1024 * 1024;
 
 /** The pnpm workspace manifest. Doubles as a workspace-root marker AND, uniquely among
  *  the managers, as evidence of an installable dir with no `package.json` of its own —
@@ -339,15 +342,20 @@ export type InstallExec = (cmd: InstallCommand) => Promise<{ ok: boolean; detail
  * `readdir` + `stat`, or to `readdir(..., { recursive: true })`, would silently reopen
  * it — there is a test pinning this, keep it.
  *
- * Best-effort by construction: an unreadable directory is skipped, never thrown.
+ * Best-effort: unreadable directories are skipped. Cancellation throws a fixed error
+ * between awaited operations; it does not interrupt an in-flight filesystem operation.
  */
-export async function discoverJsProjects(rootPath: string): Promise<JsProjectScan> {
+export async function discoverJsProjects(
+  rootPath: string,
+  opts: { signal?: AbortSignal } = {},
+): Promise<JsProjectScan> {
   const projects: JsProject[] = [];
   const queue: { abs: string; rel: string; depth: number }[] = [{ abs: rootPath, rel: ".", depth: 0 }];
   let scanned = 0;
   let truncated = false;
 
   while (queue.length > 0) {
+    checkDiscoveryCancelled(opts.signal);
     if (projects.length >= MAX_PROJECT_DIRS || scanned >= MAX_SCAN_DIRS) {
       // Stopped with dirs still queued: the list is a prefix, and the caller must know.
       truncated = true;
@@ -358,10 +366,12 @@ export async function discoverJsProjects(rootPath: string): Promise<JsProjectSca
 
     let entries;
     try {
-      entries = await readdir(cur.abs, { withFileTypes: true });
+      entries = await fs.readdir(cur.abs, { withFileTypes: true });
     } catch {
+      checkDiscoveryCancelled(opts.signal);
       continue; // unreadable/vanished dir: skip it, provisioning is best-effort
     }
+    checkDiscoveryCancelled(opts.signal);
 
     // isDirectory() is lstat-based, so a symlink lands here rather than in `subdirs`.
     const files = new Set(entries.filter((e) => !e.isDirectory()).map((e) => e.name));
@@ -371,7 +381,8 @@ export async function discoverJsProjects(rootPath: string): Promise<JsProjectSca
 
     let pruned = false;
     if (hasPkg || (pnpmWorkspace && hit !== undefined)) {
-      const manifest = hasPkg ? await readManifest(cur.abs) : null;
+      const manifest = hasPkg ? await readManifest(cur.abs, opts.signal) : null;
+      checkDiscoveryCancelled(opts.signal);
       const workspaceRoot = hit !== undefined && (pnpmWorkspace || (manifest?.declaresWorkspaces ?? false));
       projects.push({
         dir: cur.rel,
@@ -397,6 +408,7 @@ export async function discoverJsProjects(rootPath: string): Promise<JsProjectSca
     }
   }
 
+  checkDiscoveryCancelled(opts.signal);
   return { projects, truncated };
 }
 
@@ -416,9 +428,9 @@ export async function discoverJsProjects(rootPath: string): Promise<JsProjectSca
  *                 a `process.env` spread; the worker's join token must be absent by
  *                 construction. Passed through verbatim except for the documented
  *                 per-manager hardening overlay (INSTALL_COMMANDS).
- * @param opts.signal aborts the sweep: the in-flight install is killed and every dir not
- *                 yet reached is reported cancelled. Cancelling is still a normal return,
- *                 never a throw — the caller gets the partial results.
+ * @param opts.signal aborts discovery between awaited operations, reported as a discovery
+ *                 failure. After discovery, the in-flight install is killed and every dir
+ *                 not yet reached is reported cancelled. Both return failure records.
  */
 export async function installJsDeps(
   rootPath: string,
@@ -430,10 +442,10 @@ export async function installJsDeps(
 
   let scan: JsProjectScan;
   try {
-    scan = await discoverJsProjects(rootPath);
+    scan = await discoverJsProjects(rootPath, { signal: opts.signal });
   } catch (err) {
-    // discoverJsProjects is already non-throwing; this is the belt to its braces, so a
-    // surprise here degrades to "nothing provisioned" rather than failing the run.
+    // Cancellation and unexpected discovery errors are honest provisioning failures,
+    // rather than an empty successful scan or a truncation caused by a discovery bound.
     return {
       results: [{ dir: ".", manager: "none", ok: false, detail: `discovery failed: ${errText(err)}` }],
       truncated: false,
@@ -628,9 +640,37 @@ export const execInstall: InstallExec = (cmd) =>
  *  yields `null`, which every caller treats as "cannot tell" — never as a positive: not
  *  a workspace root (so we do not prune), and dependencies unknown (so we do not
  *  downgrade a successful install). */
-async function readManifest(absDir: string): Promise<{ declaresWorkspaces: boolean; declaresDependencies: boolean } | null> {
+async function readManifest(
+  absDir: string,
+  signal?: AbortSignal,
+): Promise<{ declaresWorkspaces: boolean; declaresDependencies: boolean } | null> {
+  let handle: FileHandle | undefined;
   try {
-    const raw = await readFile(join(absDir, "package.json"), "utf8");
+    checkDiscoveryCancelled(signal);
+    // Pin stat/read to one inode; reject final-component symlinks and open FIFOs
+    // without waiting for a writer. Parent-component swaps remain possible.
+    handle = await fs.open(
+      join(absDir, "package.json"),
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+    );
+    const stat = await handle.stat();
+    checkDiscoveryCancelled(signal);
+    if (!stat.isFile() || stat.size > MAX_MANIFEST_BYTES) return null;
+
+    // A growing file cannot exceed this allocation or the actual byte budget. Short
+    // reads advance by bytesRead, not the requested length. EOF or cap+1 ends the loop;
+    // cancellation ends it between reads, and read errors affect only this manifest.
+    const buffer = Buffer.alloc(MAX_MANIFEST_BYTES + 1);
+    let total = 0;
+    while (total < buffer.length) {
+      checkDiscoveryCancelled(signal);
+      const { bytesRead } = await handle.read(buffer, total, Math.min(64 * 1024, buffer.length - total), null);
+      total += bytesRead;
+      if (total > MAX_MANIFEST_BYTES) return null;
+      if (bytesRead === 0) break;
+    }
+    checkDiscoveryCancelled(signal);
+    const raw = buffer.subarray(0, total).toString("utf8");
     const parsed = JSON.parse(raw) as {
       workspaces?: unknown;
       dependencies?: unknown;
@@ -648,8 +688,19 @@ async function readManifest(absDir: string): Promise<{ declaresWorkspaces: boole
       ].some((d) => d !== null && typeof d === "object" && Object.keys(d as object).length > 0),
     };
   } catch {
+    checkDiscoveryCancelled(signal);
     return null;
+  } finally {
+    try {
+      await handle?.close();
+    } catch {
+      // Best-effort close must not mask cancellation or a metadata result.
+    }
   }
+}
+
+function checkDiscoveryCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new Error("discovery cancelled");
 }
 
 /** How many workspace patterns a `workspaces` field declares. npm/bun/yarn accept a bare

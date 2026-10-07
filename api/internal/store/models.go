@@ -255,6 +255,32 @@ type ControllerReportStatus struct {
 	ObservedAt pgtype.Timestamptz `json:"observed_at"`
 }
 
+type CrossCheck struct {
+	ID                   uuid.UUID          `json:"id"`
+	LeadRunID            uuid.UUID          `json:"lead_run_id"`
+	Stage                string             `json:"stage"`
+	Round                int32              `json:"round"`
+	LeadClaimGeneration  int64              `json:"lead_claim_generation"`
+	PlanMd               pgtype.Text        `json:"plan_md"`
+	Milestones           []byte             `json:"milestones"`
+	RequiredCapabilities []string           `json:"required_capabilities"`
+	RequiredTools        []string           `json:"required_tools"`
+	SizeClass            pgtype.Text        `json:"size_class"`
+	BaseCommit           pgtype.Text        `json:"base_commit"`
+	PlanningDiff         pgtype.Text        `json:"planning_diff"`
+	CandidateDigest      []byte             `json:"candidate_digest"`
+	CheckerRunID         pgtype.UUID        `json:"checker_run_id"`
+	CheckerHarness       pgtype.Text        `json:"checker_harness"`
+	CheckerModel         pgtype.Text        `json:"checker_model"`
+	CheckerEffort        pgtype.Text        `json:"checker_effort"`
+	Verdict              string             `json:"verdict"`
+	ReasonClass          pgtype.Text        `json:"reason_class"`
+	Findings             []byte             `json:"findings"`
+	DecidedAt            pgtype.Timestamptz `json:"decided_at"`
+	DeadlineAt           pgtype.Timestamptz `json:"deadline_at"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+}
+
 type CustodyEpisodeNotice struct {
 	UserID     uuid.UUID          `json:"user_id"`
 	NotifiedAt pgtype.Timestamptz `json:"notified_at"`
@@ -943,7 +969,13 @@ type Run struct {
 	FinalizeResumeGeneration pgtype.Int8 `json:"finalize_resume_generation"`
 	JobProtocol              pgtype.Int2 `json:"job_protocol"`
 	// Issue #2004: when the run first reached running; stamped once by SetRunRunning and never reset (display anchor). started_at stays the budget/timeout anchor and is reset by resume paths that grant a fresh wall.
-	FirstStartedAt pgtype.Timestamptz `json:"first_started_at"`
+	FirstStartedAt            pgtype.Timestamptz `json:"first_started_at"`
+	PlanCrossCheckRequired    bool               `json:"plan_cross_check_required"`
+	PlanCrossCheckGateReason  pgtype.Text        `json:"plan_cross_check_gate_reason"`
+	IssueRawDigest            pgtype.Text        `json:"issue_raw_digest"`
+	IssueSavedBody            pgtype.Text        `json:"issue_saved_body"`
+	IssueInputReason          pgtype.Text        `json:"issue_input_reason"`
+	AutoApproveBlockedReasons []string           `json:"auto_approve_blocked_reasons"`
 }
 
 type RunCompletionAttempt struct {
@@ -1113,6 +1145,8 @@ type RunSchedule struct {
 	Harness                    pgtype.Text        `json:"harness"`
 	CredentialOverrideMode     pgtype.Text        `json:"credential_override_mode"`
 	CredentialOverrideSecretID pgtype.UUID        `json:"credential_override_secret_id"`
+	CapacityLimit              pgtype.Int4        `json:"capacity_limit"`
+	CapacityRoomNeeded         pgtype.Int4        `json:"capacity_room_needed"`
 }
 
 type RunUsage struct {
@@ -1311,6 +1345,7 @@ type User struct {
 	DefaultCodexModel       pgtype.Text        `json:"default_codex_model"`
 	DefaultCodexEffort      pgtype.Text        `json:"default_codex_effort"`
 	EphemeralDockerEnabled  bool               `json:"ephemeral_docker_enabled"`
+	PlanCrossCheckEnabled   bool               `json:"plan_cross_check_enabled"`
 }
 
 type UserSecret struct {

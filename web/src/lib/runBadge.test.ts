@@ -1285,3 +1285,9 @@ describe("runBadge — board card held on a disabled credential (PRD #1732)", ()
     });
   });
 });
+
+it("usage-limit provider regression #2360: board projection stays neutral", () => {
+  expect(runBadge(run({ status: "limit_wait" }), NOW)).toMatchObject({
+    kind: "badge", title: "Paused on a usage limit. It resumes on its own when the window reopens.",
+  });
+});

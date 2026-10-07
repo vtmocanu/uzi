@@ -21,17 +21,18 @@ import (
 )
 
 type fakeNotifStore struct {
-	rc           store.GetSlackRunContextRow
-	rcErr        error
-	delivery     pgtype.Text
-	deliveryErr  error
-	msg          store.SlackRunMessage
-	msgErr       error
-	upserted     []store.UpsertSlackRunMessageParams
-	gateSet      []store.SetSlackRunGateParams
-	gateSetGen   []store.SetSlackRunGateGenParams
-	planCount    int64
-	planCountErr error
+	rc            store.GetSlackRunContextRow
+	crossCheckRun store.Run
+	rcErr         error
+	delivery      pgtype.Text
+	deliveryErr   error
+	msg           store.SlackRunMessage
+	msgErr        error
+	upserted      []store.UpsertSlackRunMessageParams
+	gateSet       []store.SetSlackRunGateParams
+	gateSetGen    []store.SetSlackRunGateGenParams
+	planCount     int64
+	planCountErr  error
 	// PRD #88 M3: the latest kind='question' payload and the anchor write recording
 	// which question the thread already carries. A nil question with no error models
 	// "no row" the way the generated :one query surfaces it.
@@ -88,6 +89,10 @@ func (f *fakeNotifStore) GetSecretEnablement(_ context.Context, arg store.GetSec
 		return store.GetSecretEnablementRow{}, pgx.ErrNoRows
 	}
 	return *f.secret, nil
+}
+
+func (f *fakeNotifStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
+	return f.crossCheckRun, nil
 }
 
 func (f *fakeNotifStore) GetSlackRunContext(context.Context, uuid.UUID) (store.GetSlackRunContextRow, error) {
@@ -617,6 +622,48 @@ func TestNotifierWaitsForPlanFlushWhenCountZero(t *testing.T) {
 
 // The plan itself is posted into the thread at the gate (PRD #41 Decision 10 — Slack
 // gate parity), keyed to the fresh-gate post, alongside the gate buttons.
+func TestNotifierCrossCheckGateReason(t *testing.T) {
+	for _, tc := range []struct {
+		name, harness, want string
+		required            bool
+		reason              pgtype.Text
+	}{
+		{"actual claude", "claude", "model timeout", true, txt("model_timeout")},
+		{"actual codex", "codex", "revise", true, txt("revise")},
+		{"nil revision", "claude", "", true, pgtype.Text{}},
+		{"cleared revision", "codex", "", true, txt("")},
+		{"ordinary", "claude", "", false, txt("block")},
+		{"unknown hostile", "codex", "future reason&lt;!channel&gt;", true, txt("future_reason\u202e\x1b\n<!channel>")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rc := baseRun("awaiting_approval")
+			fs := &fakeNotifStore{
+				rc:            rc,
+				crossCheckRun: store.Run{ID: rc.ID, PlanCrossCheckRequired: tc.required, Harness: tc.harness, PlanCrossCheckGateReason: tc.reason},
+				delivery:      txt("U1"),
+				msg:           store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+				planCount:     1,
+			}
+			fp := &fakePoster{dmChannel: "D1"}
+			NewNotifier(fs, fp, fixedBase, nil).handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+			if len(fp.blocks) != 1 {
+				t.Fatalf("gate blocks = %+v", fp.blocks)
+			}
+			section := fp.blocks[0].sectionText
+			if tc.want == "" {
+				if strings.Contains(section, "Plan cross-check:") {
+					t.Fatalf("invented gate reason: %q", section)
+				}
+			} else if !strings.Contains(section, "Plan cross-check: "+tc.want) {
+				t.Fatalf("gate blocks = %+v, want cross-check reason %q", fp.blocks, tc.want)
+			}
+			if strings.ContainsAny(section, "\x1b\u202e") || strings.Contains(section, "<!channel>") || strings.Contains(section, "findings") {
+				t.Fatalf("unsafe or excessive cross-check detail: %q", section)
+			}
+		})
+	}
+}
+
 func TestNotifierPostsPlanInThreadAtGate(t *testing.T) {
 	rc := baseRun("awaiting_approval")
 	rc.PlanMd = txt("## Plan\n1. do a thing\n2. do another")

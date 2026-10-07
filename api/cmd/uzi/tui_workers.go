@@ -213,7 +213,7 @@ func workerState(r workerRow) string {
 	switch {
 	case w.Status != "online":
 		return "offline"
-	case w.RetainingUnpublishedWork:
+	case w.CustodyDecisionsNeeded != nil && *w.CustodyDecisionsNeeded > 0:
 		return "holding"
 	case w.DrainingSince != nil && w.ActiveRuns > 0:
 		return "draining"
@@ -311,8 +311,8 @@ func workerAttention(r workerRow, now time.Time) []attnItem {
 		text := fmt.Sprintf("✕ %s %.0f%%", d.label, d.pct)
 		add(sev, text, text+" · visual cue, not a server admission verdict")
 	}
-	if w.RetainingUnpublishedWork {
-		add(1, "⚑ unpublished work", "⚑ holding unpublished work; not spare capacity")
+	if w.CustodyDecisionsNeeded != nil && *w.CustodyDecisionsNeeded > 0 {
+		add(1, "⚑ unpublished work", "⚑ unpublished work needs an owner decision")
 	}
 	for _, run := range w.ReportedRuns {
 		if run.TerminalPending {

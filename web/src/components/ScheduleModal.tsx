@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
+  type CatalogEntry,
   type Harness,
   type Repo,
   type Schedule,
@@ -18,6 +19,7 @@ import {
   type ScheduleTiming,
   type SecretMeta,
 } from "../lib/api";
+import { capacityCadence } from "../lib/scheduleCapacity";
 import { errorMessage } from "../lib/apiError";
 import {
   scheduleCredentialPatch,
@@ -242,6 +244,31 @@ export function ScheduleModal({
   // Sweep-only cap on issues per fire; null = unlimited. New sweeps default to 10
   // (agreeing with the server), an edit reflects the stored value (null included).
   const [maxIssues, setMaxIssues] = useState<number | null>(editing ? editing.max_issues : 10);
+  const [capacityLimit, setCapacityLimit] = useState<number | null>(editing?.capacity_limit ?? null);
+  const [capacityRoom, setCapacityRoom] = useState<number | null>(editing?.capacity_room_needed ?? null);
+  const [catalogEntry, setCatalogEntry] = useState<CatalogEntry | null>(null);
+  useEffect(() => {
+    if (!isDefault || !editing?.catalog_slug) return;
+    let cancelled = false;
+    api.listScheduleCatalog().then(({ entries }) => {
+      if (!cancelled) setCatalogEntry(entries.find((entry) => entry.slug === editing.catalog_slug) ?? null);
+    }).catch(() => {
+      if (!cancelled) setError("Could not load the schedule's selector. Reopen this editor to retry.");
+    });
+    return () => { cancelled = true; };
+  }, [isDefault, editing?.catalog_slug]);
+  const capacitySupported = target === "sweep" && timing === "recurring" &&
+    (!isDefault || (catalogEntry !== null && (catalogEntry.selector_kind ?? "label") === "label"));
+  const capacityOn = capacitySupported && capacityLimit !== null;
+  const clearCapacity = () => { setCapacityLimit(null); setCapacityRoom(null); };
+  const changeTarget = (value: ScheduleTarget) => {
+    if (value !== "sweep") clearCapacity();
+    setTarget(value);
+  };
+  const changeTiming = (value: ScheduleTiming) => {
+    if (value !== "recurring") clearCapacity();
+    setTiming(value);
+  };
   // Optional owner guidance for issue/sweep targets and a prompt-target default;
   // a string in state ("" = none).
   // Steers HOW a run approaches the task — the issue body stays the task.
@@ -507,7 +534,23 @@ export function ScheduleModal({
     setLabelInput("");
   };
 
+  const batchInput = <Input id="sched-max-issues" aria-label="Issues to send at a time"
+    type="number" min={1} max={10000} value={maxIssues ?? ""}
+    className={capacityOn ? "mx-1 inline-block w-20! text-center" : undefined}
+    onChange={(e) => setMaxIssues(e.target.value.trim() === "" ? null : Number(e.target.value))}
+    placeholder={capacityOn ? "room" : "unlimited"} />;
+  const batchField = !capacityOn && (
+    <Field label="Issues to send at a time" htmlFor="sched-max-issues">
+      {batchInput}
+      <p className="mt-1 text-[11px] text-faint">Oldest issues first. Leave blank for unlimited.</p>
+    </Field>
+  );
+
   const canSubmit = (): boolean => {
+    if (isDefault && target === "sweep" && catalogEntry === null) return false;
+    if (capacityOn && !(Number.isInteger(capacityLimit) && Number.isInteger(capacityRoom) &&
+      capacityRoom !== null && capacityLimit !== null && capacityRoom >= 1 &&
+      capacityRoom <= capacityLimit && capacityLimit <= 50)) return false;
     // Edit repoints one repo; create fans out over the multi-select (≥1 required).
     if (isEdit ? !repoId : selectedRepoIds.length === 0) return false;
     // A catalog default is always recurring: only its cron and model gate submit; the
@@ -515,7 +558,7 @@ export function ScheduleModal({
     if (isDefault) {
       if (cron.trim() === "") return false;
       if (modelWarning !== "") return false;
-      if (target === "sweep" && maxIssues != null && !(Number.isInteger(maxIssues) && maxIssues > 0))
+      if (target === "sweep" && maxIssues != null && !(Number.isInteger(maxIssues) && maxIssues > 0 && maxIssues <= 10000))
         return false;
       return true;
     }
@@ -523,7 +566,7 @@ export function ScheduleModal({
     if (target === "prompt" && prompt.trim() === "") return false;
     // Blank max_issues (null) = unlimited and is valid; a set value must be a
     // positive integer. The server validates too.
-    if (target === "sweep" && maxIssues != null && !(Number.isInteger(maxIssues) && maxIssues > 0))
+    if (target === "sweep" && maxIssues != null && !(Number.isInteger(maxIssues) && maxIssues > 0 && maxIssues <= 10000))
       return false;
     if (timing === "recurring" && cron.trim() === "") return false;
     if (timing === "once" && !fromLocalInput(runAtLocal)) return false;
@@ -557,6 +600,8 @@ export function ScheduleModal({
     // to inherit clears any stored override (replace-semantics).
     mr_rework_enabled: mrRework,
     max_issues: target === "sweep" ? maxIssues : undefined,
+    capacity_limit: capacityOn ? capacityLimit : null,
+    capacity_room_needed: capacityOn ? capacityRoom : null,
     model: model.trim() === "" ? null : model,
     // PRD #929 M1: output mode on the prompt target only; explicit null clears to the
     // catalog default. Omitted (undefined) on non-prompt so the server never sees a stray field.
@@ -586,6 +631,8 @@ export function ScheduleModal({
     // Sweep-only cap; send explicit null (not undefined) so clearing the field
     // clears the stored value to unlimited. Omitted on non-sweep targets.
     max_issues: target === "sweep" ? maxIssues : undefined,
+    capacity_limit: capacityOn ? capacityLimit : null,
+    capacity_room_needed: capacityOn ? capacityRoom : null,
     // Owner guidance on issue/sweep only; a blank/cleared textarea sends explicit
     // null (clear to none). Omitted (undefined) on prompt so the server never rejects it.
     guidance:
@@ -877,7 +924,7 @@ export function ScheduleModal({
               <SegmentedControl
                 label="Target"
                 value={target}
-                onChange={setTarget}
+                onChange={changeTarget}
                 options={TARGET_OPTIONS}
                 disabled={!!pinned}
               />
@@ -954,22 +1001,7 @@ export function ScheduleModal({
                       />
                     ))
                   )}
-                  <Field label="Max issues per run" htmlFor="sched-max-issues">
-                    <Input
-                      id="sched-max-issues"
-                      type="number"
-                      min={1}
-                      value={maxIssues ?? ""}
-                      onChange={(e) => {
-                        const v = e.target.value.trim();
-                        setMaxIssues(v === "" ? null : Number(v));
-                      }}
-                      placeholder="unlimited"
-                    />
-                    <p className="mt-1 text-[11px] text-faint">
-                      Oldest issues first. Leave blank for unlimited.
-                    </p>
-                  </Field>
+                  {batchField}
                   {guidanceField}
                 </div>
               )}
@@ -1012,21 +1044,33 @@ export function ScheduleModal({
 
           {/* A default's editable cadence/model/run flags still need max_issues for a
               sweep, since it IS editable on a default (unlike labels/guidance). */}
-          {isDefault && target === "sweep" && (
-            <Field label="Max issues per run" htmlFor="sched-max-issues">
-              <Input
-                id="sched-max-issues"
-                type="number"
-                min={1}
-                value={maxIssues ?? ""}
-                onChange={(e) => {
-                  const v = e.target.value.trim();
-                  setMaxIssues(v === "" ? null : Number(v));
-                }}
-                placeholder="unlimited"
-              />
-              <p className="mt-1 text-[11px] text-faint">Oldest issues first. Leave blank for unlimited.</p>
-            </Field>
+          {isDefault && target === "sweep" && batchField}
+
+          {capacitySupported && (
+            <fieldset className="rounded-xl border border-brand/45 bg-brand/[0.04] p-4">
+              <legend className="px-1.5 text-[13px] font-semibold">When to send issues</legend>
+              <div className="flex items-center gap-2.5">
+                <Toggle checked={capacityOn} label="Limit by unfinished runs"
+                  onChange={(on) => { if (on) { setCapacityLimit(4); setCapacityRoom(2); } else clearCapacity(); }} />
+                <span className="text-[13px]">Only send when I have room</span>
+              </div>
+              {capacityOn && (
+                <>
+                  <p className="mt-3 text-[14px] leading-loose">
+                    Use <Input aria-label="Unfinished-run limit" type="number" min={1} max={50}
+                      className="mx-1 inline-block w-16! text-center" value={Number.isNaN(capacityLimit) ? "" : capacityLimit ?? ""}
+                      onChange={(e) => setCapacityLimit(e.target.value === "" ? NaN : Number(e.target.value))} /> unfinished runs as my limit. Wait until there's room for at least <Input
+                      aria-label="Room needed to send" type="number" min={1} max={capacityLimit ?? 50}
+                      className="mx-1 inline-block w-16! text-center" value={Number.isNaN(capacityRoom) ? "" : capacityRoom ?? ""}
+                      onChange={(e) => setCapacityRoom(e.target.value === "" ? NaN : Number(e.target.value))} /> more, then send up to {batchInput} issue(s).
+                  </p>
+                  <p className="mt-1 text-[11px] text-faint">Leave the issue count blank to send as many as available room allows.</p>
+                  <p className="mt-2 text-[11px] text-faint">
+                    Counts your unfinished work across all repos, excluding chat and judge runs. Checked {capacityCadence(cron, timezone)}; other activity can exceed this limit.
+                  </p>
+                </>
+              )}
+            </fieldset>
           )}
 
           {/* A default prompt job's output mode IS editable (like max_issues for a default
@@ -1052,7 +1096,7 @@ export function ScheduleModal({
           )}
 
           {/* Timing */}
-          <SegmentedControl label="Timing" value={timing} onChange={setTiming} options={TIMING_OPTIONS} />
+          <SegmentedControl label="Timing" value={timing} onChange={changeTiming} options={TIMING_OPTIONS} />
 
           {timing === "recurring" ? (
             <Field label="Cadence" htmlFor="sched-preset">

@@ -330,7 +330,7 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	// advanced" guard reads the column this path leaves behind.
 	for i := range msgs {
 		m := &msgs[i]
-		if m.Seq <= 0 || m.Kind == "" || len(m.Payload) == 0 || !json.Valid(m.Payload) {
+		if m.Seq <= 0 || m.Kind == "" || m.Kind == "cross_check" || len(m.Payload) == 0 || !json.Valid(m.Payload) {
 			return obs, ErrInvalidMessage
 		}
 		// A kind of nothing but NUL escapes passes the emptiness check above — it is
@@ -340,7 +340,7 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 		// what that check exists to reject, and rejecting it here keeps both batch
 		// invariants intact — nothing is written, and nothing is logged as laundered.
 		// The double stripNUL costs one strings.Count on the fast path.
-		if stripped, _ := stripNUL(m.Kind); stripped == "" {
+		if stripped, _ := stripNUL(m.Kind); stripped == "" || stripped == "cross_check" {
 			return obs, ErrInvalidMessage
 		}
 	}

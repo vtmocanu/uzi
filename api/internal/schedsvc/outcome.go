@@ -27,6 +27,15 @@ type Skip struct {
 	WebURL string
 }
 
+// CapacityCheck is the advisory owner-wide snapshot for a gated sweep.
+type CapacityCheck struct {
+	InFlight   int64 `json:"in_flight"`
+	Limit      int   `json:"limit"`
+	RoomNeeded int   `json:"room_needed"`
+	Room       int   `json:"room"`
+	Blocked    bool  `json:"blocked"`
+}
+
 // FireOutcome is the structured result of one schedule fire (PRD #308). It replaces the
 // bare []uuid.UUID the fire path used to return, carrying enough per-candidate detail to
 // render the schedules UI and to persist a last-fire summary in a later milestone.
@@ -36,6 +45,7 @@ type Skip struct {
 // balances (PRD #308 Decision 4). A transient per-candidate sweep failure is a
 // fetch_failed Skip, not a dropped candidate.
 type FireOutcome struct {
+	Capacity *CapacityCheck
 	// Matched is the number of candidates EXAMINED this fire: sweep = candidates the
 	// backfill walk actually attempted (issue #416: the cap counts runs STARTED, so a
 	// slot lost to a skip is refilled from the next eligible candidate, and Matched may
@@ -43,12 +53,12 @@ type FireOutcome struct {
 	// pinned issue is considered), prompt = 1 (the schedule itself is the single candidate
 	// whenever a fire is attempted).
 	Matched int
-	// Capped is set only by a sweep whose max_issues cap is present and the repo has more
+	// Capped is set only by a sweep whose effective cap is present and the repo has more
 	// ELIGIBLE open issues than the SCAN WINDOW (max_issues + backfillHeadroom) reached
 	// (issue #416 widened the fetch, so "truncated" now means "beyond backfill's reach";
 	// issue #1543 filters eligibility before the window), so the "newer issues not
 	// reached" hint can be factual. Always false for issue/prompt and for a sweep with a
-	// NULL cap (a NULL cap fetches everything and can never truncate).
+	// NULL effective cap (an ungated NULL cap fetches everything and cannot truncate).
 	Capped bool
 	// IneligibleMatched is set by label sweeps only (issue #1543): the number of open
 	// issues matching the selector but not eligible (neither carrying the configured uzi

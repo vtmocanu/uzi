@@ -567,15 +567,15 @@ func TestWorkerForgeGetIssueDescriptionTruncated(t *testing.T) {
 	// '世' is 3 bytes; placing it so it starts at byte MaxForgeBodyBytes-1 makes the
 	// cap boundary fall INSIDE the rune.
 	bigDesc := strings.Repeat("a", MaxForgeBodyBytes-1) + "世" + strings.Repeat("b", 2000)
-	h, _ := forgeMockHandler(t, map[string]http.HandlerFunc{
+	h, _ := forgeMockHandler(t, eligibleIssueRoutes(map[string]http.HandlerFunc{
 		"/api/v4/projects/4242/issues/11": func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id": 1001, "iid": 11, "title": "big", "state": "opened",
-				"labels": []string{}, "description": bigDesc,
+				"author": map[string]any{"id": 10, "username": "alice"}, "labels": []string{}, "description": bigDesc,
 				"web_url": "https://gitlab.example.com/grp/repo/-/issues/11",
 			})
 		},
-	})
+	}))
 	rec := httptest.NewRecorder()
 	h.WorkerForgeGetIssue(rec, forgeReq(http.MethodGet, "/x", true,
 		map[string]string{"id": uuid.New().String(), "iid": "11"}))
@@ -602,15 +602,15 @@ func TestWorkerForgeGetIssueDescriptionTruncated(t *testing.T) {
 
 func TestWorkerForgeGetIssueDescriptionUnderCapUnchanged(t *testing.T) {
 	const desc = "a short description with a rune 世 in it"
-	h, _ := forgeMockHandler(t, map[string]http.HandlerFunc{
+	h, _ := forgeMockHandler(t, eligibleIssueRoutes(map[string]http.HandlerFunc{
 		"/api/v4/projects/4242/issues/11": func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id": 1001, "iid": 11, "title": "small", "state": "opened",
-				"labels": []string{}, "description": desc,
+				"author": map[string]any{"id": 10, "username": "alice"}, "labels": []string{}, "description": desc,
 				"web_url": "https://gitlab.example.com/grp/repo/-/issues/11",
 			})
 		},
-	})
+	}))
 	rec := httptest.NewRecorder()
 	h.WorkerForgeGetIssue(rec, forgeReq(http.MethodGet, "/x", true,
 		map[string]string{"id": uuid.New().String(), "iid": "11"}))
@@ -638,7 +638,7 @@ func forgeMockHandlerBot(t *testing.T, botForgeUserID int64, routes map[string]h
 	t.Helper()
 	box := newForgeBox(t)
 	mux := http.NewServeMux()
-	for pattern, h := range routes {
+	for pattern, h := range eligibleIssueRoutes(routes) {
 		mux.HandleFunc(pattern, h)
 	}
 	srv := httptest.NewServer(mux)
@@ -661,6 +661,37 @@ func forgeMockHandlerBot(t *testing.T, botForgeUserID int64, routes map[string]h
 	return newForgeHandler(t, st, box), srv
 }
 
+// eligibleIssueRoutes supplies explicit repository-write evidence for read-cap fixtures.
+func eligibleIssueRoutes(routes map[string]http.HandlerFunc) map[string]http.HandlerFunc {
+	routes["/api/v4/users/"] = func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/api/v4/users/")
+		numericID, err := strconv.ParseInt(id, 10, 64)
+		if err != nil || numericID <= 0 {
+			http.Error(w, "invalid id", http.StatusBadRequest)
+			return
+		}
+		name := "alice"
+		if id == "20" {
+			name = "bob"
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": numericID, "username": name, "state": "active"})
+	}
+	routes["/api/v4/projects/4242/members/all/"] = func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/api/v4/projects/4242/members/all/")
+		numericID, err := strconv.ParseInt(id, 10, 64)
+		if err != nil || numericID <= 0 {
+			http.Error(w, "invalid id", http.StatusBadRequest)
+			return
+		}
+		name := "alice"
+		if id == "20" {
+			name = "bob"
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": numericID, "username": name, "state": "active", "access_level": 30})
+	}
+	return routes
+}
+
 // noteJSON builds one GitLab issue-note object (the shape ListIssueNotes returns).
 func noteJSON(authorID int64, username, body, createdAt string, system bool) map[string]any {
 	return map[string]any{
@@ -678,7 +709,7 @@ func issueAndNotesRoutes(notes []map[string]any) map[string]http.HandlerFunc {
 		"/api/v4/projects/4242/issues/11": func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id": 1001, "iid": 11, "title": "t", "state": "opened",
-				"labels": []string{"PRD"}, "description": "d", "author": map[string]any{"username": "alice"},
+				"labels": []string{"PRD"}, "description": "d", "author": map[string]any{"id": 10, "username": "alice"},
 				"web_url": "https://gitlab.example.com/grp/repo/-/issues/11",
 			})
 		},
@@ -815,7 +846,7 @@ func TestWorkerForgeDTOsHaveNoCoordinates(t *testing.T) {
 			"/api/v4/projects/4242/issues/11": func(w http.ResponseWriter, _ *http.Request) {
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"id": 1001, "iid": 11, "title": "t", "state": "opened",
-					"labels": []string{"PRD"}, "description": "d", "author": map[string]any{"username": "alice"},
+					"labels": []string{"PRD"}, "description": "d", "author": map[string]any{"id": 10, "username": "alice"},
 					"web_url": "https://gitlab.example.com/grp/repo/-/issues/11",
 				})
 			},

@@ -42,6 +42,7 @@
   "claim_generation": 0,
   "plan_md": "# Plan\n",
   "auto_approve": true,
+  "plan_cross_check_gate_reason": null,
   "open_mr": true,
   "interactive": true,
   "stop_pending": true,

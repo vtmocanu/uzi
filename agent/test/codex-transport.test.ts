@@ -76,6 +76,30 @@ function writeFrame(inbound: PassThrough, value: unknown): void {
   inbound.write(`${JSON.stringify(value)}\n`);
 }
 
+describe("codex transport: rate-limit liveness #2360", () => {
+  it("decodes account updates but keeps id-bearing requests generic", async () => {
+    const { inbound, transport } = makePair();
+    const rateLimits = { primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: 2000000000 } };
+    const notes = transport.notifications();
+    try {
+      writeFrame(inbound, { method: "account/rateLimits/updated", params: { rateLimits } });
+      const update = (await notes.next()).value!;
+      assert.equal(update.kind, "rate_limits_updated");
+      if (update.kind === "rate_limits_updated") assert.deepEqual(update.rateLimits, rateLimits);
+      writeFrame(inbound, { id: 77, method: "account/rateLimits/updated", params: { rateLimits } });
+      const request = (await notes.next()).value!;
+      assert.equal(request.kind, "activity");
+      if (request.kind === "activity") assert.equal(request.requestId, 77);
+      writeFrame(inbound, { method: "account/rateLimits/updated", params: {} });
+      const malformed = (await notes.next()).value!;
+      assert.equal(malformed.kind, "rate_limits_updated");
+      if (malformed.kind === "rate_limits_updated") assert.equal(malformed.rateLimits, undefined);
+    } finally {
+      transport.close();
+    }
+  });
+});
+
 describe("codex transport: request/response correlation", () => {
   it("matches out-of-order responses to the right pending request by id", async () => {
     const { inbound, outbound, transport } = makePair();

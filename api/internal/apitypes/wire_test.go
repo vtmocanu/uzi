@@ -46,7 +46,7 @@ func assertTags(t *testing.T, name string, v any, want ...string) {
 func TestUserDTOTags(t *testing.T) {
 	assertTags(t, "UserDTO", UserDTO{},
 		"id", "email", "display_name", "is_admin", "is_active",
-		"autopilot_enabled", "judge_enabled", "ci_autofix_enabled",
+		"autopilot_enabled", "plan_cross_check_enabled", "judge_enabled", "ci_autofix_enabled",
 		// issue #916: the per-user AI-attribution opt-out. Default true (current
 		// behavior); when false the worker suppresses the Co-Authored-By trailer.
 		"attribution_enabled",
@@ -90,7 +90,7 @@ var runDTOKeys = []string{
 	"is_planning",
 	// PRD #122 M1: the FROZEN milestone list, always on the wire (nil ⇒ null ⇒ a run
 	// with no milestones, which is every pre-feature run).
-	"auto_approve",
+	"auto_approve", "plan_cross_check_required", "plan_cross_check_gate_reason",
 	// issue #857: the run's trigger provenance (what/how/who started it), NOT NULL
 	// (DEFAULT 'manual') so always on the wire.
 	"trigger_source",
@@ -277,6 +277,7 @@ var runDTOKeys = []string{
 	// permanently refused the terminal report ({reason} object or null). Non-omitempty,
 	// overlaid on the single-run detail read only.
 	"outcome_pending",
+	"auto_approve_blocked_reasons", "issue_input_reason",
 }
 
 func TestRunDTOTags(t *testing.T) {
@@ -874,9 +875,8 @@ var workerDTOKeys = []string{
 	// each entry a {run_id, phase, claim_generation}. ALWAYS a JSON array, never null — the
 	// list/patch overlay reads it from the DB and the builders seed it to []. Display-only.
 	"reported_runs",
-	// PRD #1296 M4 (D4): true when the worker holds an OPEN durable-recovery custody hold —
-	// it retained committed work a run could not publish. Distinct from busy (a held worker
-	// consumes no run/LLM slot) but still counts against the per-owner hosted quota.
+	// True for ANY open custody hold, healthy live runs included. Independent of busy
+	// and owner decisions; protects deletion, cleanup and hosted-quota safety guards.
 	"retaining_unpublished_work",
 	"template_declared", "template_reported", "version",
 	// PRD #113: derived upgrade health, computed at read time from `version` against

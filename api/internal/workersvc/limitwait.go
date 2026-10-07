@@ -267,6 +267,8 @@ func validReportedReset(ms *int64) (time.Time, bool) {
 // twelve arguments because the decision is PURE and its test fixtures are built by
 // varying one field at a time.
 type limitParkInput struct {
+	// Harness is authoritative run identity, never worker-reported.
+	Harness string
 	// WaitOnLimit is the run's own opt-in, read from the row — never from the report.
 	WaitOnLimit bool
 	// LimitWaitCount is how many times this run has ALREADY parked.
@@ -358,11 +360,11 @@ func decideLimitPark(in limitParkInput) limitParkDecision {
 	}
 
 	if !in.WaitOnLimit {
-		d.Reason = limitFailureReason(d.RateLimitType, d.LimitResetsAt, "")
+		d.Reason = limitFailureReason(in.Harness, d.RateLimitType, d.LimitResetsAt, "")
 		return d
 	}
 	if int(in.LimitWaitCount) >= in.MaxWaits {
-		d.Reason = limitFailureReason(d.RateLimitType, d.LimitResetsAt,
+		d.Reason = limitFailureReason(in.Harness, d.RateLimitType, d.LimitResetsAt,
 			fmt.Sprintf("usage-limit retry budget exhausted after %d attempt(s)", in.LimitWaitCount))
 		return d
 	}
@@ -403,7 +405,7 @@ func decideLimitPark(in limitParkInput) limitParkDecision {
 		retry = floor
 	}
 	if retry.Sub(in.Now) > in.MaxPark {
-		d.Reason = limitFailureReason(d.RateLimitType, d.LimitResetsAt,
+		d.Reason = limitFailureReason(in.Harness, d.RateLimitType, d.LimitResetsAt,
 			fmt.Sprintf("the window reopens further out than the %s maximum park", in.MaxPark))
 		return d
 	}
@@ -499,8 +501,11 @@ func limitWindowFor(rateLimitType *string) limitWindow {
 // Each part is omitted rather than defaulted when it is unknown, so the sentence
 // never claims a fact the server does not have: no type means no parenthetical, no
 // reset means no "resets at" clause.
-func limitFailureReason(rateLimitType *string, resetsAt *time.Time, detail string) string {
+func limitFailureReason(harness string, rateLimitType *string, resetsAt *time.Time, detail string) string {
 	s := "Anthropic usage limit"
+	if harness == "codex" {
+		s = "Codex usage limit"
+	}
 	if rateLimitType != nil {
 		s += " (" + *rateLimitType + ")"
 	}
@@ -582,6 +587,7 @@ func (s *Service) setLimitWait(ctx context.Context, run store.Run, wkr store.Wor
 	}
 
 	d := decideLimitPark(limitParkInput{
+		Harness:         run.Harness,
 		WaitOnLimit:     run.WaitOnLimit,
 		LimitWaitCount:  run.LimitWaitCount,
 		DeadSecretID:    dead,
@@ -600,7 +606,7 @@ func (s *Service) setLimitWait(ctx context.Context, run store.Run, wkr store.Wor
 		rows, err := s.q.SetRunFailed(ctx, store.SetRunFailedParams{
 			FailureReason: pgconv.TextOrNull(d.Reason),
 			// PRD #69 M7a: this failure is definitionally rate-limit-caused — the run hit
-			// an Anthropic usage limit and decided NOT to park (opt-out, or the wait budget
+			// a provider usage limit and decided NOT to park (opt-out, or the wait budget
 			// is spent). Stamp the class as a server-side literal rather than trusting the
 			// worker's fail_origin, since the server owns the fact that this is the limit path.
 			FailOrigin: pgconv.TextOrNull("rate_limited"),
@@ -689,7 +695,7 @@ func (s *Service) setLimitWait(ctx context.Context, run store.Run, wkr store.Wor
 //   - the replacement fires ONLY when the fields are present. Absent, this falls
 //     straight through to sanitizeFailureReason and no other failure path in the
 //     product changes behaviour.
-func limitAwareFailureReason(req StateRequest) pgtype.Text {
+func limitAwareFailureReason(harness string, req StateRequest) pgtype.Text {
 	if req.RateLimitType == nil && req.LimitResetsAt == nil {
 		return sanitizeFailureReason(req.FailureReason)
 	}
@@ -697,7 +703,7 @@ func limitAwareFailureReason(req StateRequest) pgtype.Text {
 	if t, ok := validReportedReset(req.LimitResetsAt); ok {
 		resetsAt = &t
 	}
-	return pgconv.TextOrNull(limitFailureReason(CoerceRateLimitType(req.RateLimitType), resetsAt, ""))
+	return pgconv.TextOrNull(limitFailureReason(harness, CoerceRateLimitType(req.RateLimitType), resetsAt, ""))
 }
 
 // resolveWaitOnLimit answers "does THIS new run park on a usage limit" (PRD #35

@@ -34,7 +34,7 @@ function exitedFirst(seen: Seen[]): BoundaryProcessSpawner {
     const child = spawn(command!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
     const [code] = await once(child, "close") as [number | null];
     for (const s of [child.stdout, child.stderr]) seen.push(snap(s));
-    return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed: Promise.resolve({ code: code ?? 128 }) };
+    return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, cancel: async () => {}, completed: Promise.resolve({ code: code ?? 128 }) };
   };
 }
 
@@ -46,7 +46,7 @@ const realPipes: BoundaryProcessSpawner = async (request) => {
     child.once("error", reject);
     child.once("close", (code) => resolve({ code: code ?? 128 }));
   });
-  return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed };
+  return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; }, completed };
 };
 
 /**
@@ -66,7 +66,7 @@ function supervisorShape(seen: Seen[]): BoundaryProcessSpawner {
       await new Promise((r) => setTimeout(r, 10));
     }
     seen.push(snap(child.stdout), snap(child.stderr));
-    return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed };
+    return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; }, completed };
   };
 }
 
@@ -123,7 +123,7 @@ describe("execScoped boundary collect tells a clean empty EOF from dropped outpu
       const real = await realPipes(request);
       await real.completed;
       return { stdin: new Writable({ write: (_c, _e, cb) => cb() }), stdout: (await endedStream()) as Readable,
-        stderr: (await endedStream()) as Readable, completed: Promise.resolve({ code: 0 }) };
+        stderr: (await endedStream()) as Readable, cancel: async () => {}, completed: Promise.resolve({ code: 0 }) };
     };
     assert.equal((await inBoundary(spawner, () => execQuiet(bare, sha))).stdout, "");
   });
@@ -136,7 +136,7 @@ describe("execScoped boundary collect tells a clean empty EOF from dropped outpu
       stdout.resume();
       await once(stdout, "close");
       const stderr = await endedStream();
-      return { stdin: null, stdout, stderr, completed: Promise.resolve({ code: 0 }) };
+      return { stdin: null, stdout, stderr, cancel: async () => {}, completed: Promise.resolve({ code: 0 }) };
     };
     await assert.rejects(inBoundary(spawner, () => execQuiet(bare, sha)), /subprocess output closed before end/);
   });
@@ -151,7 +151,7 @@ describe("execScoped boundary collect tells a clean empty EOF from dropped outpu
       setImmediate(() => stdout.end("tail\n"));
       const stderr = new PassThrough();
       stderr.end();
-      return { stdin: null, stdout, stderr, completed: Promise.resolve({ code: 0 }) };
+      return { stdin: null, stdout, stderr, cancel: async () => {}, completed: Promise.resolve({ code: 0 }) };
     };
     await assert.rejects(inBoundary(spawner, () => execQuiet(bare, sha)), /subprocess output closed before end/);
   });
@@ -169,7 +169,7 @@ describe("execScoped boundary collect tells a clean empty EOF from dropped outpu
       seen = { ...snap(stdout), errored: stdout.errored !== null };
       const stderr = new PassThrough();
       stderr.end();
-      return { stdin: null, stdout, stderr, completed: Promise.resolve({ code: 0 }) };
+      return { stdin: null, stdout, stderr, cancel: async () => {}, completed: Promise.resolve({ code: 0 }) };
     };
     await assert.rejects(inBoundary(spawner, () => execQuiet(bare, sha)));
     assert.equal(seen?.readableEnded, true);
@@ -189,7 +189,7 @@ describe("execScoped boundary collect tells a clean empty EOF from dropped outpu
       seen = snap(stdout);
       const stderr = new PassThrough();
       stderr.end();
-      return { stdin: null, stdout, stderr, completed: Promise.resolve({ code: 0 }) };
+      return { stdin: null, stdout, stderr, cancel: async () => {}, completed: Promise.resolve({ code: 0 }) };
     };
     await assert.rejects(inBoundary(spawner, () => execQuiet(bare, sha)), /subprocess output closed before end/);
     assert.deepEqual(seen, { destroyed: false, readableEnded: true, readableDidRead: true });
@@ -252,7 +252,7 @@ describe("scratch publication preflight inside a boundary scope", () => {
         const stderr = new PassThrough();
         stdout.end();
         stderr.end();
-        return { stdin: null, stdout, stderr, completed };
+        return { stdin: null, stdout, stderr, cancel: async () => { await completed; }, completed };
       }],
   ];
   for (const [name, message, spawner] of refusals) {

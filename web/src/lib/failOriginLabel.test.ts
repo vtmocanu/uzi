@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 import { failOriginLabel } from "./failOriginLabel";
 
 describe("failOriginLabel", () => {
+  it("labels provider_policy_refusal (issue #2321)", () => {
+    expect(failOriginLabel("provider_policy_refusal")).toBe("provider safety-policy refusal");
+  });
+
   it("labels the plan_missing origin (issue #1593)", () => {
     expect(failOriginLabel("plan_missing")).toBe("plan missing");
   });

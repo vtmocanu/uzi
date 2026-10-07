@@ -101,6 +101,10 @@ export function deriveCloneKey(id: CloneIdentity): { branch: string; slug: strin
       const branch = `uzi/prompt-${id.runId}`;
       return { branch, slug: slugify(branch) };
     }
+    case "cross_check": {
+      const branch = `uzi/cross-check-${id.runId}`;
+      return { branch, slug: slugify(branch) };
+    }
     case "task": {
       const branch = id.branch?.trim();
       if (!branch) return undefined;
@@ -174,6 +178,12 @@ export const RUN_KIND_PROFILES: Record<RunKind, RunKindProfile> = {
     mrTitle: () => "Scheduled prompt run",
     completionLine: () =>
       "Ad-hoc scheduled prompt run (PRD #241) from a schedule's stored prompt. There is no tracking issue, so this PR closes nothing.",
+  },
+
+  // A cross-check is a repo-backed, report-only child. Its profile supplies
+  // only the child's private clone identity.
+  cross_check: {
+    cloneBranch: (_claim, runId) => deriveCloneKey({ kind: "cross_check", runId }),
   },
 
   task: {

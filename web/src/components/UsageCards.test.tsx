@@ -226,6 +226,49 @@ describe("FactoryTotalCard + PerUserUsageTable", () => {
 });
 
 describe("FailedRunsBlock (PRD #1293)", () => {
+  it("includes provider policy refusals in causes and failed totals with the same finished denominator", () => {
+    const lifetime = outcomes(10, 5, 1, 1, 3, { provider_policy_refusal: 2, agent_failure: 1 });
+    const last7 = outcomes(4, 2, 0, 1, 1, { provider_policy_refusal: 1 });
+    const usage: SelfUsage = {
+      lifetime: bundle(1_000, 0, 0, 1.25),
+      last_7_days: bundle(100, 0, 0, 0.25),
+      run_count: 8,
+      ...noAggregateCostCounts,
+      outcomes: { lifetime, last_7_days: last7 },
+    };
+    const admin: AdminUsage = {
+      factory: usage,
+      users: [{
+        user_id: "a", email: "alice@example.com", usage: usage.lifetime,
+        run_count: 8, ...noUserCostCounts, outcomes: lifetime,
+      }],
+      earliest_run: null,
+    };
+    const { container, getByText } = wrap(
+      <><YourUsageCard usage={usage} /><PerUserUsageTable admin={admin} /></>,
+    );
+    const cause = getByText("provider safety-policy refusal");
+    expect(cause.parentElement?.textContent).toBe("provider safety-policy refusal 2");
+    expect(getByText(/finished runs ·/).textContent).toBe(
+      "3 of 10 finished runs · 25.0% (1 of 4) last 7d",
+    );
+    const bar = container.querySelector('[role="img"]');
+    expect(bar?.getAttribute("aria-label")).toBe(
+      "Finished runs: 5 completed, 1 cancelled, 1 plan rejected, 3 failed",
+    );
+    expect((bar?.lastElementChild as HTMLElement | null | undefined)?.style.width).toBe("30%");
+    for (const row of container.querySelectorAll("tbody tr")) {
+      const cells = row.querySelectorAll("td");
+      expect(cells[1].textContent).toBe("8");
+      expect(cells[2].textContent).toBe("3");
+      expect(cells[3].textContent).toBe("30.0%");
+      expect(cells[3].getAttribute("title")).toBe("3 of 10 finished runs");
+      expect(cells[4].textContent).toBe("1.0k");
+      expect(cells[6].textContent).toBe("$1.25");
+    }
+    expect(container.querySelectorAll("tbody tr").length).toBe(2);
+  });
+
   it("renders the rate, counts sentence, four-count legend, top causes, and bar aria-label", () => {
     const usage: SelfUsage = {
       lifetime: bundle(1_000_000, 0, 200_000, 1.23),

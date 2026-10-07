@@ -870,7 +870,7 @@ func parkedRun(now time.Time) apitypes.RunDTO {
 	retry := now.Add(time.Hour)
 	resets := now.Add(90 * time.Minute)
 	return apitypes.RunDTO{
-		ID: "run-1", Kind: "issue", Status: statusLimitWait,
+		ID: "run-1", Kind: "issue", Status: statusLimitWait, Harness: "claude",
 		IssueTitle: "do the thing", ForgeType: "gitlab", Health: "ok",
 		WaitOnLimit: true, RateLimitType: &rlt,
 		RetryNotBefore: &retry, LimitResetsAt: &resets, LimitWaitCount: 2,
@@ -1639,5 +1639,23 @@ func TestRunStatusCellCodexHold(t *testing.T) {
 	}
 	if got := steerState(queuedIn(), statusRecoveryWait, codexAccountUnavailableCause); got != "queued (run held on its Codex account)" {
 		t.Errorf("steerState(codex hold) = %q", got)
+	}
+}
+
+func TestLimitWaitProviderRegression2360(t *testing.T) {
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct{ harness, label string }{
+		{"codex", "Codex usage limit"}, {"claude", "Anthropic usage limit"},
+		{"", "usage limit"}, {"unrecognized-provider", "usage limit"},
+	} {
+		t.Run(tc.harness, func(t *testing.T) {
+			r := parkedRun(now)
+			r.Harness = tc.harness
+			got := limitWaitLine(r, now)
+			want := "waiting: " + tc.label + " (five_hour) · resumes in 1h00m · attempt 2"
+			if got != want {
+				t.Errorf("limitWaitLine = %q, want %q", got, want)
+			}
+		})
 	}
 }

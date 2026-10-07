@@ -21,7 +21,7 @@ import type { ProvisionInput, ProvisionResult } from "../src/provision.js";
 import { restoreTreeWritability } from "../src/rmtree.js";
 import type { PlanVerdict } from "../src/steering.js";
 import { disableAutoMaintenance } from "./fixture-repo.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
 
 // A throwaway git worktree the stub can write its marker into and commit. No
 // origin, no network — run() only makes a LOCAL commit (push + MR is the runner).
@@ -280,6 +280,26 @@ describe("StubExecutor — PRD #1391 M5 outbox-outage sentinel", () => {
 });
 
 describe("StubExecutor — PRD #41 plan gate revision loop", () => {
+  it("refuses checked plan approval because the stub cannot implement canonical prose", async () => {
+    const wt = makeWorktree();
+    let iterations = 0;
+    const { ctx, emitted } = makeCtx({
+      worktreePath: wt.path,
+      claimGeneration: 7,
+      reportIteration: () => { iterations++; },
+      gatePlan: async () => ({
+        kind: "approve", approval: "cross_check", selection: { status: "absent" },
+        canonical: { plan: "canonical", milestones: [], candidate_digest: "a".repeat(64), claimGeneration: 7 },
+      }),
+    });
+    try {
+      await assert.rejects(new StubExecutor(nullLogger(), { planGate: true }).run(ctx), /stub cannot consume checked plan approval/);
+      assert.equal(iterations, 0);
+      assert.ok(!emitted.some((m) => String(m.payload.text).includes("implementing")));
+    } finally {
+      wt.cleanup();
+    }
+  });
   const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
   const revise = (feedback: string): PlanVerdict => ({ kind: "revise", feedback });
 
@@ -473,7 +493,7 @@ describe("StubExecutor — PRD #35 Decision 6b pre-approved resume", () => {
 });
 
 describe("StubExecutor — provision dir cleanup (PRD #1809 M3)", () => {
-  it("removes the run's provision dir after the run even with a read-only (0555) subtree", async (t) => {
+  it("handles the run's provision-dir cleanup after a read-only (0555) install", async (t) => {
     if (process.getuid?.() === 0) {
       t.skip("running as uid 0 — the 0555 part of this fixture is inert for root");
       return;
@@ -497,8 +517,11 @@ describe("StubExecutor — provision dir cleanup (PRD #1809 M3)", () => {
       return { toolEnv: {} };
     }) as unknown as StubExecutorOptions["provision"];
 
-    await new StubExecutor(nullLogger(), { homeDir: path.join(dataDir, "agent-home"), provision }).run(ctx);
+    const { logger, lines } = recordingLogger();
+    await new StubExecutor(logger, { homeDir: path.join(dataDir, "agent-home"), provision }).run(ctx);
 
-    assert.equal(fs.existsSync(path.join(dataDir, "provision", runId)), false, "the provision dir is removed");
+    assert.equal(fs.existsSync(path.join(dataDir, "provision", runId)), process.platform !== "linux",
+      "Linux removes the provision dir; unsupported platforms retain it");
+    if (process.platform !== "linux") assert.ok(lines.some((line) => JSON.stringify(line).includes("provision dir cleanup failed")));
   });
 });

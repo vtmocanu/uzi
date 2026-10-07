@@ -36,6 +36,14 @@
 // wires itself into runner.ts.
 
 import {
+  admitPolicyTurn,
+  isPolicyRefusalTag,
+  policyRefusalMessage,
+  sanitizePolicyRole,
+  validatePolicyRefusal,
+  type PolicyRefusalPayload,
+} from "../provider-policy-refusal.js";
+import {
   CODEX_SIGNAL_TOOLS,
   CodexCallbackBroker,
   canonicalizeCodexToolName,
@@ -124,6 +132,9 @@ export interface ChildThreadController {
 export type StartChildTurnSeam = (spec: StartChildTurnSpec) => Promise<ChildThreadController>;
 
 export interface CodexDelegationRunnerOptions {
+  readonly policyParent?: () => ReturnType<typeof admitPolicyTurn> | undefined;
+  readonly policySink?: (payload: PolicyRefusalPayload) => void | Promise<void>;
+  readonly scrubPolicyRole?: (role: string) => string;
   readonly registry: ExecutionRegistry;
   /** Known delegation targets keyed by role; unset/absent role denies (fail-closed). */
   readonly roles: ReadonlyMap<string, DelegationRole>;
@@ -202,6 +213,7 @@ const denyNestedDelegate = async (): Promise<ChildDelegationResult> => ({
  * broker awaits.
  */
 export class CodexDelegationRunner {
+  private fallbackPolicyParent?: ReturnType<typeof admitPolicyTurn>;
   private readonly registry: ExecutionRegistry;
   private readonly roles: ReadonlyMap<string, DelegationRole>;
   private readonly startChildTurn: StartChildTurnSeam;
@@ -214,7 +226,7 @@ export class CodexDelegationRunner {
   private readonly childTurnDeadlineMs: number;
   private readonly maxChildTextBytes: number;
 
-  constructor(opts: CodexDelegationRunnerOptions) {
+  constructor(private readonly opts: CodexDelegationRunnerOptions) {
     this.registry = opts.registry;
     this.roles = opts.roles;
     this.startChildTurn = opts.startChildTurn;
@@ -243,6 +255,10 @@ export class CodexDelegationRunner {
       return { ok: false, code: "child_denied", message: "unknown or non-subagent delegation role" };
     }
 
+    const parent = this.opts.policyParent?.() ?? (this.fallbackPolicyParent ??= admitPolicyTurn(roleDef.grants.phase));
+    const admission = admitPolicyTurn(parent.phase === "planning" ? "plan" : "implement");
+    const childRole = sanitizePolicyRole(request.role, this.opts.scrubPolicyRole);
+
     // Combined abort: the run/turn signal OR a per-child deadline. `timedOut` lets the
     // outcome distinguish a deadline (child_timeout) from a cancellation (child_aborted).
     const childAbort = new AbortController();
@@ -263,7 +279,7 @@ export class CodexDelegationRunner {
     deadlineTimer.unref?.();
 
     try {
-      return await this.runChild(request, roleDef, childAbort.signal, () => timedOut);
+      return await this.runChild(request, roleDef, childAbort.signal, () => timedOut, admission, parent?.correlation_id, childRole);
     } finally {
       clearTimeout(deadlineTimer);
       if (onParentAbort && parentSignal) parentSignal.removeEventListener("abort", onParentAbort);
@@ -275,6 +291,9 @@ export class CodexDelegationRunner {
     roleDef: DelegationRole,
     signal: AbortSignal,
     wasTimeout: () => boolean,
+    admission: ReturnType<typeof admitPolicyTurn>,
+    parentCorrelation: string | undefined,
+    childRole: string,
   ): Promise<ChildDelegationResult> {
     // A short dispatch description labels the child; use it as instructions only
     // when the parent supplied no dedicated instruction field.
@@ -324,6 +343,7 @@ export class CodexDelegationRunner {
     const pending = new Set<Promise<void>>();
     let text = "";
     let textBytes = 0;
+    let policyRefusal: PolicyRefusalPayload | undefined;
     let terminalOutcome: "success" | "failed" | undefined;
     let terminalClassification: CodexErrorClassification | undefined;
     let pendingCodexError: CodexErrorClassification | undefined;
@@ -384,6 +404,12 @@ export class CodexDelegationRunner {
             pendingCodexError,
             normalizeCodexErrorInfo(asObject(turn?.error)?.codexErrorInfo),
           );
+          if (terminalOutcome === "failed" && isPolicyRefusalTag(terminalClassification?.classification) && parentCorrelation) {
+            policyRefusal = validatePolicyRefusal({ ...admission, event: "provider_policy_refusal", provider: "codex",
+              category: "policy_refusal", policy_tag: terminalClassification.classification, origin: "child",
+              role: childRole, parent_correlation_id: parentCorrelation });
+            if (policyRefusal) await this.opts.policySink?.(policyRefusal);
+          }
           break;
         }
 
@@ -427,6 +453,7 @@ export class CodexDelegationRunner {
       return { ok: true, output: { role: request.role, text } };
     }
     if (terminalOutcome === "failed") {
+      if (policyRefusal) return { ok: false, code: "child_policy_refused", message: policyRefusalMessage(policyRefusal.policy_tag), policyRefusal };
       const suffix = terminalClassification === undefined ? "" : ` (${terminalClassification.category})`;
       return { ok: false, code: "child_failed", message: `the delegated child turn failed${suffix}` };
     }
@@ -503,7 +530,8 @@ export class CodexDelegationRunner {
   /** Map a broker {@link CallbackResult} to the app-server tool reply body (mirrors the
    *  run harness's `replyOf`): `{ success, contentItems:[{type,text}] }`. */
   private replyBody(result: CallbackResult): unknown {
-    const text = result.ok ? this.stringify(result.output) : result.message;
+    const text = result.ok ? this.stringify(result.output) : result.policyRefusal
+      ? JSON.stringify({ code: result.code, message: result.message, policyRefusal: result.policyRefusal }) : result.message;
     return { success: result.ok, contentItems: [{ type: "inputText", text }] };
   }
 

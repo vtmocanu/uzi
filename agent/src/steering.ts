@@ -48,7 +48,7 @@ import { RequestError, type InputReceipt, type WorkerClient } from "./client.js"
 import type { FollowUpOutcome } from "./executor.js";
 import { InclusionReporter } from "./inclusion-reporter.js";
 import type { Logger } from "./log.js";
-import { parseAgentSelection, type AgentSelectionParse, type UserInput } from "./protocol.js";
+import { parseAgentSelection, type AgentSelectionParse, type Milestone, type UserInput } from "./protocol.js";
 import { errMessage, sleep } from "./util.js";
 
 /** The outcome of the plan-approval gate. On approve, `selection` is the parsed
@@ -57,7 +57,20 @@ import { errMessage, sleep } from "./util.js";
  *  (PRD #41) carries the user's feedback: the executor runs a fresh plan turn with it
  *  and re-enters the gate (approve/reject/cancel are terminal; revise is not). */
 export type PlanVerdict =
-  | { kind: "approve"; selection: AgentSelectionParse }
+  | { kind: "approve"; approval?: "human"; selection: AgentSelectionParse }
+  | {
+      kind: "approve";
+      approval: "cross_check";
+      selection: AgentSelectionParse;
+      /** One server-normalized candidate, delivered only after exact approval and durable applied ACK.
+       * Consumers must adopt plan and milestones together; no local candidate fallback. */
+      canonical: {
+        plan: string;
+        milestones: Milestone[];
+        candidate_digest: string;
+        claimGeneration: number;
+      };
+    }
   | { kind: "reject"; reason: string }
   | { kind: "cancel" }
   | { kind: "revise"; feedback: string; inputId?: number };

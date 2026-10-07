@@ -335,6 +335,10 @@ publication refusal guards that case. A repository collision at `.uzi/scratch/`
 fails provisioning instead of replacing repository content.
 
 Direct file-tool paths are limited to the run worktree on Claude and Codex.
+The one exception is on the Claude run lane: `Read` may open a file directly
+inside that run's own SDK tool-result spill directory (the "Output too large ...
+Full output saved to" file); Write, Edit, Glob, Grep and the other lanes keep the
+worktree-only rule (see [ADR 2332](../adr/2332-sdk-spill-read-allowance.md)).
 This is a tool policy, not a promise that every shell command is filesystem
 confined: Claude's Bash guardrail screens commands but does not jail paths;
 Codex also screens the shell working directory, and uses Landlock only when

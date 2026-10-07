@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/schedtmpl"
 	"github.com/vtmocanu/uzi/api/internal/settings"
@@ -25,7 +26,10 @@ import (
 // ── Fakes ────────────────────────────────────────────────────────────────────
 
 type fakeStore struct {
-	due []store.RunSchedule
+	inFlight      int64
+	inFlightErr   error
+	capacityCalls int
+	due           []store.RunSchedule
 
 	advanceCalls []store.AdvanceScheduleParams
 	statusCalls  []store.SetRunScheduleStatusParams
@@ -337,6 +341,7 @@ type promptCall struct {
 }
 
 type fakeRuns struct {
+	inspectM2 func(context.Context, int64, string)
 	autopilot []autopilotCall
 	runs      []runCall
 	prompts   []promptCall
@@ -427,7 +432,7 @@ func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUI
 	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, nil, nil, nil, false, nil, nil})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error) {
+func (f *fakeRuns) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error) {
 	// The auto-approve scheduled path (PRD #274 Decision 1a): recorded in the same
 	// `autopilot` bucket as CreateAutopilotRun so the existing count assertions still
 	// observe it, but it CAPTURES waitOnLimit (which CreateAutopilotRun drops), the
@@ -436,6 +441,9 @@ func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID
 	// so a test can prove all are threaded through.
 	if err := f.effErr(issueIID); err != nil {
 		return store.Run{}, err
+	}
+	if f.inspectM2 != nil {
+		f.inspectM2(ctx, issueIID, description)
 	}
 	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, credOverride, explicit})
 	return store.Run{ID: uuid.New()}, nil
@@ -508,7 +516,18 @@ type fakeForge struct {
 
 func (f *fakeForge) GetIssue(_ context.Context, _ int64, iid int64) (forge.Issue, error) {
 	f.getIID = append(f.getIID, iid)
-	return f.issue, f.err
+	issue := f.issue
+	issue.IID = iid
+	if issue.AuthorForgeUserID == 0 {
+		issue.AuthorForgeUserID = 2
+	}
+	return issue, f.err
+}
+func (f *fakeForge) ListIssueComments(context.Context, int64, int64) ([]forge.IssueComment, error) {
+	return nil, nil
+}
+func (f *fakeForge) RepositoryAuthorEligibility(context.Context, int64, int64) (forge.AuthorEligibility, error) {
+	return forge.AuthorEligible, nil
 }
 func (f *fakeForge) ListIssues(_ context.Context, _ int64, _ forge.ListIssuesOptions) ([]forge.Issue, error) {
 	f.listCount++
@@ -654,6 +673,46 @@ func (h *harness) countKind(kind string) int {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+
+func TestM2SchedulerRawCaptureHandoff(t *testing.T) {
+	for _, target := range []string{"pinned", "label", "assigned"} {
+		t.Run(target, func(t *testing.T) {
+			h := newHarness()
+			h.fb.f.issue.Title = "raw title"
+			h.fb.f.issue.Description = "raw body"
+			s := h.issueSchedule()
+			if target != "pinned" {
+				s = h.sweepSchedule(pgtype.Int4{})
+				if target == "assigned" {
+					s.Origin = "default"
+					s.CatalogSlug = pgtype.Text{String: "assigned-sweep", Valid: true}
+				}
+				h.st.repoRow.BotForgeUserID = 1
+				h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 7}}
+			}
+			s.Guidance = pgtype.Text{String: "OWNER GUIDANCE", Valid: true}
+			inspected := false
+			h.runs.inspectM2 = func(ctx context.Context, iid int64, composed string) {
+				inspected = true
+				c := issueinput.FromContext(ctx, 42, iid)
+				if c == nil || c.Issue.Title != "raw title" || c.Issue.Description != "raw body" || c.Digest != issueinput.Digest("raw title", "raw body") {
+					t.Fatalf("capture=%+v", c)
+				}
+				if !strings.HasPrefix(composed, "raw body") || !strings.Contains(composed, "OWNER GUIDANCE") || c.Digest == issueinput.Digest("raw title", composed) {
+					t.Fatalf("raw/composed separation lost: %q", composed)
+				}
+				if issueinput.FromContext(ctx, 43, iid) != nil {
+					t.Fatal("capture escaped project identity")
+				}
+			}
+			h.st.due = []store.RunSchedule{s}
+			h.sched.Boot(context.Background())
+			if !inspected {
+				t.Fatal("scheduled creation never inspected")
+			}
+		})
+	}
+}
 
 func TestTickIssueScheduleFiresAndAdvances(t *testing.T) {
 	h := newHarness()
@@ -1427,8 +1486,8 @@ func TestSkipReasonForErr(t *testing.T) {
 	// issue #856 added open_mr_exists; PRD #1093 M1 added schedules_paused; PRD #1429 M2 added
 	// codex_override_conflict; a PRD #1429 review fix added no_usable_credential; PRD #1732 added
 	// credential_disabled).
-	if len(AllSkipReasons) != 11 {
-		t.Fatalf("AllSkipReasons has %d reasons, want 11", len(AllSkipReasons))
+	if len(AllSkipReasons) != 12 {
+		t.Fatalf("AllSkipReasons has %d reasons, want 12", len(AllSkipReasons))
 	}
 }
 
@@ -4187,4 +4246,9 @@ func TestTickSelfImproveCapForgeErrorRetriesTransiently(t *testing.T) {
 	if len(h2.st.statusCalls) != 0 {
 		t.Fatalf("transient cap error must NOT park: statusCalls = %+v", h2.st.statusCalls)
 	}
+}
+
+func (s *fakeStore) CountInProgressRunsForUser(context.Context, uuid.UUID) (int64, error) {
+	s.capacityCalls++
+	return s.inFlight, s.inFlightErr
 }

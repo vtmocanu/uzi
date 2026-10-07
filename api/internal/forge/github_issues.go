@@ -248,6 +248,7 @@ func toGitHubIssue(i *gh.Issue) Issue {
 	}
 	if u := i.GetUser(); u != nil {
 		issue.Author = u.GetLogin()
+		issue.AuthorForgeUserID = u.GetID()
 	}
 	return issue
 }

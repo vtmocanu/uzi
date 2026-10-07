@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
-import { commandRootCommand, runnerCommand, uidSplitActive } from "./runner-uid.js";
+import { RUNNER_UID, commandRootCommand, runnerCommand, uidSplitActive } from "./runner-uid.js";
 import { workerSpawnEnv } from "./worker-spawn-mark.js";
 
 const execFileAsync = promisify(execFile);
@@ -723,8 +723,8 @@ function helperFailure(e: HelperExecError): Error {
  *  only when the helper could not be spawned or the worker stopped waiting for it (its
  *  timeout): no exit status is then a verdict. The timeout does NOT stop a helper under the uid
  *  split: the worker has no CAP_KILL over the agent uids, so its kill fails and the helper runs
- *  on until its own in-script budget (`budgetMs`, set {@link HELPER_SLACK_MS} short of the
- *  timeout) ends it. Single-uid the kill lands. The env is minimal and explicit, as in
+ *  on until its cooperative in-script budget (`budgetMs`, set {@link HELPER_SLACK_MS} short of the
+ *  timeout) is checked; a blocked syscall can delay that check. Single-uid the kill lands. The env is minimal and explicit, as in
  *  {@link purgeChildrenAsAgents}. */
 async function runHelper(wrap: CommandWrapper, script: string, args: readonly string[], timeout: number): Promise<number> {
   const wrapped = wrap(process.execPath, ["-e", script, ...args]);
@@ -842,17 +842,63 @@ const SELF_FD = "/proc/self/fd/";
 /** One path component: no separator, not `.`/`..`, not dash-leading (it becomes a bare
  *  `node -e` argument). Run ids and `mkdtemp` names (`uzi-judge-XXXXXX`) all fit. */
 const TREE_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
+const TEARDOWN_COMPONENT_RE = /^(?![.-])[^\p{Cc}/\\]+$/u;
+function isTeardownComponent(name: string): boolean {
+  return TEARDOWN_COMPONENT_RE.test(name);
+}
+function isSkillsPluginTreeName(name: string): boolean {
+  return name.startsWith(".uzi-skills-") && isTeardownComponent(name.slice(".uzi-skills-".length));
+}
 
 /** The worker itself as a helper's uid: the command unchanged. */
 const asWorker: CommandWrapper = (command, args) => ({ command, args: [...args] });
 
+/** Test-only seams for {@link rmTeardownTree}; production always uses the pinned walk. */
+export interface TeardownTestDeps {
+  now?: () => number;
+  removeTreePinned?: typeof rmTreePinned;
+}
+
+/**
+ * Remove a worker-owned teardown tree while sibling runs may still be writing.
+ * One shared 120 s deadline bounds worker waiting across the ordered pinned passes.
+ * Helper entry/time budgets are cooperative: under the uid split the worker cannot
+ * kill a foreign-uid helper blocked in a syscall. Refusals propagate: required setup
+ * aborts, while best-effort disposal warns and retains. There is no path-based
+ * fallback, including on non-Linux hosts.
+ */
+export async function rmTeardownTree(target: string, testDeps: TeardownTestDeps = {}): Promise<void> {
+  if (!path.isAbsolute(target)) throw new Error(`rmTeardownTree: refusing non-absolute path ${target}`);
+  const name = path.basename(target);
+  await (testDeps.removeTreePinned ?? rmTreePinned)(path.dirname(target), name, {
+    deadline: (testDeps.now ?? Date.now)() + 120_000,
+    ...(isSkillsPluginTreeName(name) ? { allowSkillsPluginName: true } : {}),
+  });
+}
+
+/** Runner-owned disposal only: fixed runner owner under the split, current uid otherwise.
+ * Does not open private roots to the group. Inaccessible mixed-private content refuses.
+ * Clone names opt into the same component predicate as skills suffixes; advice UUIDs do not.
+ */
+export async function rmRunnerTeardownTree(target: string, opts: { allowCloneName?: boolean } = {}): Promise<void> {
+  if (!path.isAbsolute(target)) throw new Error(`rmRunnerTeardownTree: refusing non-absolute path ${target}`);
+  await removePinnedTree(path.dirname(target), path.basename(target), { deadline: Date.now() + 120_000 }, {
+    runnerOwned: true,
+    allowCloneName: opts.allowCloneName === true,
+  });
+}
+
 /** Test seams and the caller's deadline for {@link rmTreePinned}. */
 export interface PinnedTreeRemovalOptions {
+  /** Internal teardown opt-in for the fixed .uzi-skills- prefix only.
+   * Disk reclaim keeps its ordinary-name contract unless explicitly opted in. */
+  allowSkillsPluginName?: boolean;
   /** The uids to run the emptying passes as, in order (default: see {@link rmTreePinned}). */
   wrappers?: readonly CommandWrapper[];
   /** Dirents one pass may read before it stops (default {@link REMOVE_MAX_ENTRIES}). */
   maxEntries?: number;
-  /** Epoch ms after which no pass starts and a running one is cut short. */
+  /** Epoch ms after which no pass starts and worker waiting stops. Helper budgets are
+   *  cooperative; the worker cannot kill a blocked foreign-uid helper under the split. */
   deadline?: number;
   /** Whether the PRD #51 uid split is active (default: {@link uidSplitActive}). */
   splitActive?: boolean;
@@ -874,10 +920,12 @@ async function identityOf(pinFd: number): Promise<string> {
  *
  * {@link rmHomeTree} walks by path (`fs.rm`), so a same-uid process that swaps an
  * INTERMEDIATE directory for a symlink mid-walk redirects the deletion outside the tree
- * (an audit's racer deleted 82 files outside `agent-home` that way). The boot sweep and a
- * run's own teardown keep using it; the running disk reclaim cannot, because it deletes
- * while other runs' `runner`/`runner-cmd` processes are live on the same volume. So this
- * is {@link PINNED_SUBTREE_SCRIPT}'s walk:
+ * (an audit's racer deleted outside files that way). Both running disk reclaim and
+ * per-run teardown use the pinned walk: reaping one run does not stop sibling runs'
+ * `runner`/`runner-cmd` writers on the same volume. Startup sweeps retain
+ * {@link rmHomeTree} before claims begin. Other path-based cleanup sites remain
+ * outside issue #1831's four-tree scope; see ADR-1809's residual list. This is
+ * {@link PINNED_SUBTREE_SCRIPT}'s walk:
  *
  *  1. The worker pins `parent`, then `name` inside it through its descriptor with
  *     `O_PATH | O_DIRECTORY | O_NOFOLLOW`, refusing a symlink, a non-directory, and a
@@ -898,8 +946,22 @@ export async function rmTreePinned(
   name: string,
   opts: PinnedTreeRemovalOptions = {},
 ): Promise<"removed" | "absent"> {
+  return removePinnedTree(parent, name, opts);
+}
+
+/** Owner policy is private: callers cannot select an arbitrary production uid. */
+async function removePinnedTree(
+  parent: string,
+  name: string,
+  opts: PinnedTreeRemovalOptions,
+  policy: { runnerOwned?: boolean; allowCloneName?: boolean } = {},
+): Promise<"removed" | "absent"> {
   if (!path.isAbsolute(parent)) throw new Error(`rmTreePinned: refusing non-absolute parent ${parent}`);
-  if (!TREE_NAME_RE.test(name)) throw new Error(`rmTreePinned: refusing ${JSON.stringify(name)}, not one path component`);
+  const cloneName = policy.allowCloneName === true && isTeardownComponent(name);
+  const skillsPluginName = opts.allowSkillsPluginName === true && isSkillsPluginTreeName(name);
+  if (!TREE_NAME_RE.test(name) && !skillsPluginName && !cloneName) {
+    throw new Error(`rmTreePinned: refusing ${JSON.stringify(name)}, not one path component`);
+  }
   if (process.platform !== "linux") throw new Error("rmTreePinned: refusing, no descriptor-pinned walk here");
   const split = opts.splitActive ?? uidSplitActive();
   const target = path.join(parent, name);
@@ -925,14 +987,16 @@ export async function rmTreePinned(
     }
     try {
       const st = await fs.stat(SELF_FD + leafPin.fd);
-      const uid = opts.getuid ? opts.getuid() : process.getuid?.();
-      if (uid !== undefined && st.uid !== uid) {
-        throw Object.assign(new Error(`rmTreePinned: ${target} is not owned by this worker (uid ${st.uid})`), {
+      const uid = policy.runnerOwned
+        ? (split ? RUNNER_UID : process.getuid?.())
+        : (opts.getuid ? opts.getuid() : process.getuid?.());
+      if ((policy.runnerOwned && uid === undefined) || (uid !== undefined && st.uid !== uid)) {
+        throw Object.assign(new Error(`rmTreePinned: ${target} is not owned by ${policy.runnerOwned ? "the runner" : "this worker"} (uid ${st.uid})`), {
           code: "EPERM",
         });
       }
       // chmod follows the magic link to the pinned inode, never a path.
-      if (split) await fs.chmod(SELF_FD + leafPin.fd, (st.mode & 0o7777) | 0o770);
+      if (split && !policy.runnerOwned) await fs.chmod(SELF_FD + leafPin.fd, (st.mode & 0o7777) | 0o770);
       const expect = await identityOf(leafPin.fd);
       const wrappers =
         opts.wrappers ?? (split ? [runnerCommand, commandRootCommand, runnerCommand, asWorker] : [asWorker]);

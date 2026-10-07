@@ -38,8 +38,8 @@ export function shortUnixSocket(base = os.tmpdir()): { socket: string; directory
   };
   let socket = path.join(dir, "d.sock");
   try {
-    if (process.platform === "linux" && Buffer.byteLength(socket) > UNIX_SOCKET_PATH_MAX_BYTES &&
-        Buffer.byteLength(path.relative(process.cwd(), socket)) <= UNIX_SOCKET_PATH_MAX_BYTES) {
+    // The absolute FD alias resolves the owned directory independently of cwd.
+    if (process.platform === "linux" && Buffer.byteLength(socket) > UNIX_SOCKET_PATH_MAX_BYTES) {
       directoryFd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
       socket = `/dev/fd/${directoryFd}/d-${++socketSequence}.sock`;
       if (fs.realpathSync(path.dirname(socket)) !== fs.realpathSync(dir)) {
