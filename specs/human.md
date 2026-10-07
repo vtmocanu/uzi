@@ -317,7 +317,7 @@ Tracked as GitLab issue vtmocanu/uzi#40; PRD at `prds/done/40-token-usage-report
 
 - Report token usage and cost per run, per user, and factory-wide. [user]
 - Run view shows the run's usage, broken down per phase and per agent ("coder used 800k"). [user 2026-07-12]
-- One Usage card has a shared All time / Last 7 days toggle, defaulting to seven days and remembered per viewer in the browser. Personal figures are shown to everyone; factory figures and the embedded per-user breakdown are admin-only. Per-user figures stay all time. [AI-synced 2026-10-07]
+- One Usage card has a shared All time / Last 7 days toggle, defaulting to seven days and remembered per viewer in the browser. Personal figures are shown to everyone; factory figures and the embedded per-user breakdown are admin-only. Personal, factory and per-user figures follow the shared toggle's selected window; failure recency stays lifetime in both windows. [AI-synced 2026-10-07]
 - The dashboard highlights metered cost, failed-run rate and tokens for the selected window. Metered $0 is shown as $0.00; subscription and unreported runs are disclosed separately from cost (#1429 D7). [AI-synced 2026-10-07]
 - Failed and cancelled runs still count their spend. [user]
 - Chat runs are out of scope (not counted). [user]

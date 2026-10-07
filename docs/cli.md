@@ -154,7 +154,8 @@ uzi repo list | remove <id> [--force]
 uzi project-sync status <repo> | resync <repo>
 uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
 uzi ci list [--repo <id>] [--limit <n>] | jobs <run-id> [--repo <id>] | fix <ref> [--repo <id>]
-uzi admin users | runs | workers | usage | rate-limits | cli-tokens | products | guardrail-impact | blocked-repos | review-bots
+uzi admin users | runs | workers | rate-limits | cli-tokens | products | guardrail-impact | blocked-repos | review-bots
+uzi admin usage [--window lifetime|last_7_days]
 uzi admin health [--all] [--strict]
 uzi admin agent-source get | status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category label,label] | stats [--json]
@@ -172,10 +173,23 @@ Global flags: `--json`, `--url <url>`, `--quiet`, `--no-color`,
 
 A few worth knowing:
 
-- **`uzi admin usage` includes failure recency.** The factory line and each
-  user's `SINCE` column show time since the last failed run in minutes, hours,
-  or days. A scope with finished runs but no failures shows `no failures`;
-  one with no finished runs shows `-`. These are the same lifetime definitions
+- **`uzi admin usage --window lifetime|last_7_days` selects the human report's
+  window (default `lifetime`).** The factory summary and per-user rows use
+  the same window for usage-bearing runs, tokens, metered cost, outcomes and
+  recoverable failures. Failure rate is failed runs divided by finished runs,
+  including runs without usage; `RUNS` counts runs with usage. Cost shows
+  `$0.00` for metered zero and discloses subscription/unreported run counts
+  whose costs are excluded. Recoverable work may already have been landed.
+  `--json` returns the complete API response with both windows and additive
+  per-user seven-day fields; the flag selects only the human report. Invalid
+  window values are rejected before a request, including with `--json`.
+  With an older API missing a user's `last_7_days`, the CLI returns an
+  upgrade error before printing a seven-day human report; lifetime and JSON
+  remain usable.
+  The factory's failure recency and each user's `SINCE` column stay lifetime
+  in both windows, showing minutes, hours or days since the last failed run.
+  A scope with lifetime finished runs but no failures shows `no failures`;
+  one with no lifetime finished runs shows `-`. These are the same definitions
   as Overview: chat, judge, and rejected plans do not count as failures.
 
 - **`--harness` picks the run's execution engine; omit it to let the server

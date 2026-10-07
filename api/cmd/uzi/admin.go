@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -186,11 +187,15 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 	health.Flags().BoolVar(&healthAll, "all", false, "list every check, not just the ones needing attention")
 	health.Flags().BoolVar(&healthStrict, "strict", false, "also exit 8 when the overall status is warn or unknown")
 
+	var usageWindow string
 	usage := &cobra.Command{
 		Use:   "usage",
 		Short: "Show token/cost usage across the factory",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if usageWindow != "lifetime" && usageWindow != "last_7_days" {
+				return uzicli.Exitf(uzicli.ExitUsage, "invalid --window %q: choose lifetime or last_7_days", usageWindow)
+			}
 			c, err := env.client(gf)
 			if err != nil {
 				return err
@@ -203,9 +208,10 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(u)
 			}
-			return renderAdminUsage(p, u)
+			return renderAdminUsage(p, u, usageWindow)
 		},
 	}
+	usage.Flags().StringVar(&usageWindow, "window", "lifetime", "human-readable usage window: lifetime|last_7_days (--json returns both)")
 
 	var rlProvider string
 	rateLimits := &cobra.Command{
@@ -823,38 +829,81 @@ func failedFigure(failed, needsLanding int64) string {
 	return fmt.Sprintf("%d", failed)
 }
 
-// renderAdminUsage prints the factory lifetime totals plus the per-user breakdown.
-// The factory line and the per-user table carry the PRD #1293 failed-run figures
-// (lifetime), mirroring the web column order (D8): Runs · Failed · Fail rate · Since last failure come
-// before the token columns. SHARE stays web-only.
-func renderAdminUsage(p *uzicli.Printer, u apitypes.AdminUsageDTO) error {
-	now := time.Now()
+// renderAdminUsage prints selected-window totals; failure recency stays lifetime.
+func renderAdminUsage(p *uzicli.Printer, u apitypes.AdminUsageDTO, window string) error {
+	users := append([]apitypes.AdminUserUsageDTO(nil), u.Users...)
 	lt := u.Factory.Lifetime
 	lo := u.Factory.Outcomes.Lifetime
+	runs := u.Factory.RunCount
+	subscription := u.Factory.LifetimeSubscriptionRunCount
+	unreported := u.Factory.LifetimeUnreportedRunCount
+	if window == "last_7_days" {
+		// Validate every row before printing, including mixed old/new API responses.
+		for _, row := range users {
+			if row.Last7Days == nil {
+				return fmt.Errorf("last_7_days usage requires an API upgrade: per-user seven-day usage is unavailable; use --window lifetime or --json")
+			}
+		}
+		lt, lo = u.Factory.Last7Days, u.Factory.Outcomes.Last7Days
+		subscription, unreported = u.Factory.Last7SubscriptionRunCount, u.Factory.Last7UnreportedRunCount
+		runs = 0
+		for i := range users {
+			row := &users[i]
+			row.Usage = *row.Last7Days
+			row.RunCount = row.Last7RunCount
+			row.SubscriptionRunCount = row.Last7SubscriptionRunCount
+			row.UnreportedRunCount = row.Last7UnreportedRunCount
+			runs += row.RunCount
+		}
+	}
+	sort.Slice(users, func(i, j int) bool {
+		if users[i].Usage.CostUSD != users[j].Usage.CostUSD {
+			return users[i].Usage.CostUSD > users[j].Usage.CostUSD
+		}
+		if users[i].Usage.OutputTokens != users[j].Usage.OutputTokens {
+			return users[i].Usage.OutputTokens > users[j].Usage.OutputTokens
+		}
+		return users[i].UserID < users[j].UserID
+	})
+	now := time.Now()
 	// Match the dashboard's recoverable-work note without claiming a landing backlog.
-	p.Printf("factory (lifetime): input=%d cache_read=%d cache_creation=%d output=%d cost=$%.2f (runs=%d) finished=%d failed=%s fail_rate=%s since_last_failure=%s\n",
-		lt.InputTokens, lt.CacheReadTokens, lt.CacheCreationTokens, lt.OutputTokens, lt.CostUSD, u.Factory.RunCount,
-		lo.Finished, failedFigure(lo.Failed, lo.NeedsLanding), failRate(lo.Failed, lo.Finished), sinceLastFailure(lo, now))
-	if len(u.Users) == 0 {
+	p.Printf("factory (%s): input=%d cache_read=%d cache_creation=%d output=%d cost=%s (runs=%d) finished=%d failed=%s fail_rate=%s since_last_failure=%s\n",
+		window, lt.InputTokens, lt.CacheReadTokens, lt.CacheCreationTokens, lt.OutputTokens, adminUsageCost(lt.CostUSD, subscription, unreported), runs,
+		lo.Finished, failedFigure(lo.Failed, lo.NeedsLanding), failRate(lo.Failed, lo.Finished), sinceLastFailure(u.Factory.Outcomes.Lifetime, now))
+	if len(users) == 0 {
 		return nil
 	}
 	p.Println()
-	rows := make([][]string, 0, len(u.Users))
-	for _, row := range u.Users {
+	rows := make([][]string, 0, len(users))
+	for _, row := range users {
+		outcomes := row.Outcomes
+		if window == "last_7_days" {
+			outcomes = row.Last7Outcomes
+		}
 		rows = append(rows, []string{
 			row.Email,
 			fmt.Sprintf("%d", row.RunCount),
 			// FAILED carries the same inline needs-landing sub-cut as the factory line, so the
 			// per-user row and the total read the split the same way (no new column).
-			failedFigure(row.Outcomes.Failed, row.Outcomes.NeedsLanding),
-			failRate(row.Outcomes.Failed, row.Outcomes.Finished),
+			failedFigure(outcomes.Failed, outcomes.NeedsLanding),
+			failRate(outcomes.Failed, outcomes.Finished),
 			sinceLastFailure(row.Outcomes, now),
 			fmt.Sprintf("%d", row.Usage.InputTokens),
+			fmt.Sprintf("%d", row.Usage.CacheReadTokens),
+			fmt.Sprintf("%d", row.Usage.CacheCreationTokens),
 			fmt.Sprintf("%d", row.Usage.OutputTokens),
-			fmt.Sprintf("$%.2f", row.Usage.CostUSD),
+			adminUsageCost(row.Usage.CostUSD, row.SubscriptionRunCount, row.UnreportedRunCount),
 		})
 	}
-	return p.Table([]string{"EMAIL", "RUNS", "FAILED", "FAIL%", "SINCE", "INPUT", "OUTPUT", "COST"}, rows)
+	return p.Table([]string{"EMAIL", "RUNS", "FAILED", "FAIL%", "SINCE", "INPUT", "CACHE_READ", "CACHE_CREATION", "OUTPUT", "COST"}, rows)
+}
+
+func adminUsageCost(cost float64, subscription, unreported int64) string {
+	value := fmt.Sprintf("$%.2f", cost)
+	if subscription > 0 || unreported > 0 {
+		value += fmt.Sprintf(" (subscription/unreported costs excluded: subscription_runs=%d unreported_runs=%d)", subscription, unreported)
+	}
+	return value
 }
 
 // sinceLastFailure uses the same whole-minute/hour/day boundaries as the Overview.

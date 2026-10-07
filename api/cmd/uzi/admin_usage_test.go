@@ -16,7 +16,7 @@ func renderUsageToString(t *testing.T, u apitypes.AdminUsageDTO) string {
 	t.Helper()
 	var buf bytes.Buffer
 	p := uzicli.NewPrinter(&buf, false, false, true, false) // non-tty, non-json, no colour
-	if err := renderAdminUsage(p, u); err != nil {
+	if err := renderAdminUsage(p, u, "lifetime"); err != nil {
 		t.Fatalf("renderAdminUsage: %v", err)
 	}
 	return buf.String()
@@ -24,7 +24,7 @@ func renderUsageToString(t *testing.T, u apitypes.AdminUsageDTO) string {
 
 // TestRenderAdminUsageOutcomes covers the PRD #1293 M3 CLI additions: the factory
 // line's finished/failed/fail_rate fields and the reordered per-user table columns
-// (EMAIL RUNS FAILED FAIL% SINCE INPUT OUTPUT COST), mirroring the web column order (D8).
+// (EMAIL RUNS FAILED FAIL% SINCE INPUT CACHE_READ CACHE_CREATION OUTPUT COST), mirroring the web column order (D8).
 func TestRenderAdminUsageOutcomes(t *testing.T) {
 	u := apitypes.AdminUsageDTO{
 		Factory: apitypes.SelfUsageDTO{
@@ -66,9 +66,9 @@ func TestRenderAdminUsageOutcomes(t *testing.T) {
 		}
 	}
 
-	// Table header is exactly EMAIL RUNS FAILED FAIL% SINCE INPUT OUTPUT COST in order.
+	// Table header is exactly EMAIL RUNS FAILED FAIL% SINCE INPUT CACHE_READ CACHE_CREATION OUTPUT COST in order.
 	header := firstHeaderLine(t, out)
-	wantOrder := []string{"EMAIL", "RUNS", "FAILED", "FAIL%", "SINCE", "INPUT", "OUTPUT", "COST"}
+	wantOrder := []string{"EMAIL", "RUNS", "FAILED", "FAIL%", "SINCE", "INPUT", "CACHE_READ", "CACHE_CREATION", "OUTPUT", "COST"}
 	if got := strings.Fields(header); !equalStringSlices(got, wantOrder) {
 		t.Errorf("table header = %v, want %v\nheader line: %q", got, wantOrder, header)
 	}
@@ -150,7 +150,7 @@ func TestRenderAdminUsageRecoverable(t *testing.T) {
 	}
 	// The recoverable subset rides the FAILED cell; recency has its own SINCE column.
 	header := firstHeaderLine(t, out)
-	wantOrder := []string{"EMAIL", "RUNS", "FAILED", "FAIL%", "SINCE", "INPUT", "OUTPUT", "COST"}
+	wantOrder := []string{"EMAIL", "RUNS", "FAILED", "FAIL%", "SINCE", "INPUT", "CACHE_READ", "CACHE_CREATION", "OUTPUT", "COST"}
 	if got := strings.Fields(header); !equalStringSlices(got, wantOrder) {
 		t.Errorf("table header = %v, want %v\nheader line: %q", got, wantOrder, header)
 	}
