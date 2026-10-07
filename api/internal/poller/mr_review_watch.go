@@ -248,6 +248,14 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 		slog.Error("poller: mr-rework get ledger", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 		return
 	}
+	// Halted at the cap and already notified: every path below returns without a run for this
+	// MR, so skip the listing and the author assessment (its lookups share the connection
+	// token's rate limit with every other MR). What is skipped is only queue and pending-id
+	// upkeep for a fire that cannot happen while halted. The first halt still runs the full
+	// path, because halt_notified is false until it has notified.
+	if int(led.AttemptCount) >= capLimit && led.HaltNotified {
+		return
+	}
 
 	comments, err := f.ListMergeRequestComments(ctx, r.ForgeProjectID, mrIID)
 	if err != nil {

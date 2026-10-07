@@ -354,6 +354,8 @@ type mrwForge struct {
 	// onList, when set, runs while ListMergeRequestComments is "fetching": it stands for a
 	// concurrent writer that updates the ledger during the listing.
 	onList func()
+	// listCalls counts ListMergeRequestComments calls.
+	listCalls int
 }
 
 func (f *mrwForge) RepositoryAuthorEligibility(ctx context.Context, _ int64, authorID int64) (forge.AuthorEligibility, error) {
@@ -365,6 +367,7 @@ func (f *mrwForge) RepositoryAuthorEligibility(ctx context.Context, _ int64, aut
 }
 
 func (f *mrwForge) ListMergeRequestComments(context.Context, int64, int64) ([]forge.MRComment, error) {
+	f.listCalls++
 	if f.onList != nil {
 		f.onList()
 	}
@@ -662,6 +665,38 @@ func TestMRReworkAtCapHaltsOnceThenSilent(t *testing.T) {
 	if len(f2.notes) != 0 || len(notifier.calls) != 1 || len(st.haltSets) != 1 {
 		t.Fatalf("the halt latch must be silent on the next tick: notes=%d notifs=%d halts=%d",
 			len(f2.notes), len(notifier.calls), len(st.haltSets))
+	}
+}
+
+func TestMRReworkHaltedAndNotifiedSkipsListingAndLookups(t *testing.T) {
+	// At the cap with the halt already notified, no path can start a run, so the tick must not
+	// spend a comment listing or author lookups on the MR (#2347 review). A new comment from an
+	// eligible author would otherwise reach the assessment every tick.
+	st := &mrwStore{
+		candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
+		ledgers:    map[string]store.MrReworkLedger{mrwRef: {Ref: mrwRef, AttemptCount: 5, HighWater: 120, HaltNotified: true}},
+	}
+	runs := &mrwRuns{}
+	notifier := &mrwNotifier{}
+	f := landedForge(mrwComment(200, landed(), mrwHeadSHA))
+	d := newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5})
+
+	d.detect(context.Background(), mrwRepoRow(), f)
+
+	if f.listCalls != 0 || len(f.lookups) != 0 {
+		t.Fatalf("a halted, notified MR must skip the listing and lookups: list=%d lookups=%d", f.listCalls, len(f.lookups))
+	}
+	if len(runs.calls) != 0 || len(f.notes) != 0 || len(notifier.calls) != 0 || len(st.haltSets) != 0 {
+		t.Fatalf("a halted, notified MR must stay silent: runs=%d notes=%d notifs=%d halts=%d",
+			len(runs.calls), len(f.notes), len(notifier.calls), len(st.haltSets))
+	}
+
+	// Raising the cap un-halts it: the next tick lists again and proceeds.
+	d2 := newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 6})
+	f2 := landedForge(mrwComment(200, landed(), mrwHeadSHA))
+	d2.detect(context.Background(), mrwRepoRow(), f2)
+	if f2.listCalls != 1 || len(runs.calls) != 1 {
+		t.Fatalf("under a raised cap the MR must be listed and reworked: list=%d runs=%d", f2.listCalls, len(runs.calls))
 	}
 }
 
