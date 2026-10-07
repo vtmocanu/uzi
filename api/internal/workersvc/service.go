@@ -3273,13 +3273,13 @@ var errRunVanished = errors.New("run vanished before claim assembly")
 // no secret bytes.
 var errCustomModelCapabilityMissing = errors.New("worker lacks codex_custom_model_v1 for a custom Codex root model")
 
-// errGuardrailBlockedClaim marks a claim the #66 default-branch guardrail refused
-// AT CLAIM (D1 layer 3, the security net): the bot can reach the repo's default
-// branch, or that could not be verified (fail-closed). finishRunClaim treats
-// it as TERMINAL (like errCredentialUnavailable, not the transient errVaultLocked
-// requeue), so the run is failed rather than pushing. Its message is safe to store
-// as a run failure reason — it carries only the block finding messages, never any
-// secret bytes.
+// errGuardrailBlockedClaim marks a claim refused AT CLAIM for a terminal, run-level reason:
+// the #66 default-branch guardrail (D1 layer 3, the security net) found the bot can reach the
+// repo's default branch or could not verify it (fail-closed), or a legacy mr_rework run
+// (legacyReviewClaimError, issue #2347) cannot resume. finishRunClaim treats it as TERMINAL
+// (like errCredentialUnavailable, not the transient errVaultLocked requeue), so the run is
+// failed rather than pushing. Its message is safe to store as a run failure reason: it carries
+// only the block finding messages or the legacy refusal text, never any secret bytes.
 var errGuardrailBlockedClaim = errors.New("run refused by the default-branch guardrail at claim")
 
 // errVaultLocked marks a claim that cannot open the owner's DEK-sealed Anthropic

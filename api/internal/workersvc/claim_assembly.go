@@ -514,7 +514,12 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		} else if snap.Version != ReviewSnapshotVersion {
 			// Issue #2347: a snapshot captured before author eligibility reached this lane was
 			// never assessed, so its bodies are not replayed. Version 0 tells the agent a
-			// legacy snapshot was withheld rather than that the MR had no comments.
+			// legacy snapshot was withheld rather than that the MR had no comments. A run that
+			// already carries a transcript or a stored plan was written after reading those
+			// unvetted bodies, and an auto-approved resume would reuse them, so it fails closed.
+			if strings.TrimSpace(run.SessionID.String) != "" || strings.TrimSpace(run.PlanMd.String) != "" {
+				return nil, legacyReviewClaimError{targetRunID: run.TargetRunID}
+			}
 			reviewComments = &ReviewCommentsSnapshot{Comments: []ReviewCommentSnapshot{}}
 		} else {
 			if snap.Comments == nil {
@@ -1150,3 +1155,20 @@ func decodePackageList(raw []byte) []string {
 	}
 	return out
 }
+
+// legacyReviewClaimError refuses a claim for an mr_rework run whose review_comments snapshot
+// predates author assessment and which already carries reusable context (a session or a plan).
+// Unwrap yields errGuardrailBlockedClaim so claimAssemblyOrigin fails the run terminally; the
+// message is its own nonsecret text.
+type legacyReviewClaimError struct{ targetRunID pgtype.UUID }
+
+func (e legacyReviewClaimError) Error() string {
+	msg := "this MR rework was created before review-comment authors were verified and has already run, " +
+		"so it cannot resume; start a new rework with Rework now on the source run's page"
+	if e.targetRunID.Valid {
+		msg += " (run " + uuid.UUID(e.targetRunID.Bytes).String() + ")"
+	}
+	return msg
+}
+
+func (e legacyReviewClaimError) Unwrap() error { return errGuardrailBlockedClaim }

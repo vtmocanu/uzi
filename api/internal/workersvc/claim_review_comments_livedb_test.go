@@ -54,9 +54,57 @@ func TestAssembleClaimReplaysOnlyAssessedReviewSnapshotLiveDB(t *testing.T) {
 		t.Fatalf("a stored null comments array replayed as %s (%v), want \"comments\":[]", raw, err)
 	}
 
+	// A current snapshot keeps its reusable context: the resume payload carries both.
+	env.exec(`UPDATE runs SET plan_md = 'CURRENT-PLAN', session_id = 'sess-current', plan_source = 'agent' WHERE id = $1`, runID)
+	cur, err := svc.assembleClaim(env.ctx, wkr, mustRun(t, env, runID))
+	if err != nil || cur.PlanMd == nil || *cur.PlanMd != "CURRENT-PLAN" || cur.SessionID == nil || *cur.SessionID != "sess-current" {
+		t.Fatalf("a current snapshot run must resume with its plan and session: %+v, %v", cur, err)
+	}
+	env.exec(`UPDATE runs SET plan_md = NULL, session_id = NULL WHERE id = $1`, runID)
+
 	env.exec(`UPDATE runs SET review_comments = NULL WHERE id = $1`, runID)
 	payload, err := svc.assembleClaim(env.ctx, wkr, mustRun(t, env, runID))
 	if err != nil || payload.ReviewComments != nil {
 		t.Fatalf("a run with no snapshot must claim none: %+v, %v", payload.ReviewComments, err)
+	}
+}
+
+// TestLegacyReviewSnapshotWithReusableContextFailsClaimLiveDB drives the REAL
+// assembleAndFinishRunClaim (issue #2347): a legacy, never-assessed review snapshot on a run that
+// already carries a stored plan or a session must not resume (an auto-approved resume would reuse
+// a transcript or plan written after reading the unvetted comment bodies). The claim returns no
+// payload and the run fails terminally as guardrail_blocked with the rework-again guidance.
+func TestLegacyReviewSnapshotWithReusableContextFailsClaimLiveDB(t *testing.T) {
+	const legacy = `{"comments":[{"id":7,"author_username":"mallory","author_forge_user_id":9,"body":"LEGACY-UNVETTED-BODY","reply_id":"r1","resolve_id":"t1","review_state":"inline"}],"truncated":false}`
+	for _, tc := range []struct{ name, set string }{
+		{"plan only", `plan_md = 'LEGACY-PLAN-SENTINEL', session_id = NULL`},
+		{"session only", `plan_md = NULL, session_id = 'legacy-session'`},
+		{"both", `plan_md = 'LEGACY-PLAN-SENTINEL', session_id = 'legacy-session'`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := setupCodexLiveDB(t)
+			userID, workerID, repoID := seedResumeClaimInfra(t, env)
+			sourceID := env.seedCodexRun(t, userID, workerID, repoID)
+			env.exec(`UPDATE runs SET issue_iid = 2, status = 'completed' WHERE id = $1`, sourceID)
+			runID := env.seedCodexRun(t, userID, workerID, repoID)
+			svc := New(env.q, env.box, testParams())
+			svc.SetTxBeginner(env.pool)
+			env.exec(`UPDATE runs SET review_comments = $2::jsonb, auto_approve = true, plan_source = 'agent',
+				target_run_id = $3, `+tc.set+` WHERE id = $1`, runID, legacy, sourceID)
+
+			payload, err := svc.assembleAndFinishRunClaim(env.ctx, store.Worker{ID: workerID, UserID: userID}, mustRun(t, env, runID), false)
+			if err != nil || payload != nil {
+				t.Fatalf("claim = %+v, %v; want no payload and no error (the run fails terminally)", payload, err)
+			}
+			r := mustRun(t, env, runID)
+			if r.Status != "failed" || r.FailOrigin.String != "guardrail_blocked" {
+				t.Fatalf("status=%s origin=%v, want failed/guardrail_blocked", r.Status, r.FailOrigin)
+			}
+			reason := r.FailureReason.String
+			if !strings.Contains(reason, "cannot resume; start a new rework with Rework now") ||
+				!strings.Contains(reason, sourceID.String()) || strings.Contains(reason, "default-branch") {
+				t.Fatalf("failure_reason = %q, want the legacy-rework text naming run %s", reason, sourceID)
+			}
+		})
 	}
 }
