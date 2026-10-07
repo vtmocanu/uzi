@@ -289,8 +289,9 @@ func (v *Vault) rewrapMasterSecrets(ctx context.Context, userID uuid.UUID) {
 // Lock first waits for any in-flight notice clear of this user, then evicts. Until
 // then the vault still reads unlocked, so the lock-notice reconciler never sees a
 // locked vault whose clear could still erase the caller's later pre-ack. Only this
-// user's eviction waits, at most one bounded notice update; mu is never held across
-// I/O, so other users' Lock, Seal and Open are unaffected.
+// user's eviction waits, behind this user's queued notice clears (each bounded by
+// its caller's context); mu is never held across I/O, so other users' Lock, Seal
+// and Open are unaffected.
 func (v *Vault) Lock(userID uuid.UUID) {
 	m := v.noticeMutex(userID)
 	m.Lock()
