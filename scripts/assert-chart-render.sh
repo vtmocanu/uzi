@@ -1045,7 +1045,7 @@ awk '
 # injects it into the API through the SAME ConfigMap. Three independent offline
 # renders cover the API default budget, a raised budget and disabled requeue.
 # Render failures stop the loop; it has exactly three attempts, without retries.
-for budget in 1 3 0; do
+for budget in 3 5 0; do
   REQUEUE_RENDER="$WORK/requeue-$budget.yaml"
   if ! helm template uzi "$STRIPPED" \
        --show-only templates/api-configmap.yaml \
@@ -1109,7 +1109,7 @@ for budget in 1 3 0; do
     }
   ' "$REQUEUE_RENDER" || exit $?
 done
-echo "OK: RUN_MAX_REQUEUES budgets 1/3/0 are quoted exactly in the API ConfigMap and consumed by the API Deployment envFrom"
+echo "OK: RUN_MAX_REQUEUES budgets 3/5/0 are quoted exactly in the API ConfigMap and consumed by the API Deployment envFrom"
 
 DEFAULT_OFF="$WORK/default-off.yaml"
 # Issue #1982: the hosted-worker pin also tells healthsvc to expect a controller.

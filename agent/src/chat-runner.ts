@@ -150,8 +150,10 @@ export class ChatRunner {
     // redactor is wired anyway so the two runner paths cannot drift.
     const batcher = new MessageBatcher(this.client, runId, claim.last_seq, this.batchMs, runLog, redact, redactText, {
       // PRD #1391 M2: chat keeps the message outbox (Run A) — it spills like the run
-      // lane after a sustained transient outage. Generation is always 0: chat has no
-      // claim generation (D6/D10), so nothing is fenced on replay.
+      // lane after a sustained transient outage. The batcher stays unstamped
+      // (generation 0) on purpose, for compatibility with the chat message lane
+      // (D6/D10): nothing is fenced on replay, even though a fresh chat claim
+      // after an exhaustion resume advances the claim generation (#2394).
       ...(this.outbox ? { outbox: this.outbox } : {}),
       generation: 0,
       ...(this.transientTripMs !== undefined ? { transientTripMs: this.transientTripMs } : {}),
@@ -173,7 +175,9 @@ export class ChatRunner {
       if (signal.aborted) cancel.abort();
       else signal.addEventListener("abort", onShutdown, { once: true });
     }
-    // Issue #1673: the chat claim carries its generation for the input receipts (normally 0).
+    // Issue #1673: input receipts use the chat claim's actual generation, which a
+    // fresh claim after an exhaustion resume advances (#2394); only the batcher above
+    // stays unstamped.
     const source = this.makeSource(runId, cancel, runLog, claim.claim_generation ?? 0);
 
     // The uzi tools MCP server (M3): bound to THIS run's client + run id, so
