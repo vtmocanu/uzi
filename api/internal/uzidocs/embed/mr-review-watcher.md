@@ -217,11 +217,11 @@ The bound assumes:
 
 Ticks that don't count never move anyone ahead of *X*.
 
-> **Pending maintainer confirmation.** The originating issue asked that an
+> **Accepted departure.** The originating issue asked that an
 > outsider flood not delay an eligible finding at all. This design instead
 > guarantees the finding is not suppressed unless the pending set exceeds 10,000
-> entries and is delayed only by the conditional bound above. That departure from the zero-delay criterion is
-> pending maintainer confirmation before the change merges. The rationale is
+> entries and is delayed only by the conditional bound above. The maintainer
+> accepted that departure from the zero-delay criterion on 2026-10-07. The rationale is
 > in [ADR-2347](../adr/2347-review-comment-author-trust.md).
 
 Smaller residuals: an outsider later promoted to collaborator is recognized

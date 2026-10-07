@@ -1,6 +1,6 @@
 # ADR-2347: Author trust for MR review comments
 
-**Status**: Proposed (pending maintainer confirmation of the conditional delay bound, which departs from the issue's zero-delay acceptance criterion; see below)
+**Status**: Accepted (the maintainer accepted the conditional delay bound on 2026-10-07, a departure from the issue's zero-delay acceptance criterion; see below)
 **Date**: 2026-10-07
 **Issue**: [#2347](https://github.com/vtmocanu/uzi/issues/2347)
 
@@ -125,7 +125,7 @@ deadline, so a flooded or hanging MR can cost up to about 30 seconds of that
 loop per tick, and the poll interval defaults to 1 minute, `FORGE_POLL_INTERVAL`);
 eligible authors are few.
 
-## Departure from the issue's zero-delay acceptance criterion: pending maintainer confirmation
+## Departure from the issue's zero-delay acceptance criterion: accepted by the maintainer
 
 The issue asks that an outsider flood not delay an eligible finding. This design
 does not meet that literally. It guarantees an eligible finding is **not suppressed by an outsider flood unless
@@ -133,8 +133,9 @@ the pending set exceeds 10,000 entries (one per unverified author, accumulated a
 snapshot's context by outsider comments, and **delayed only by the conditional
 bound above**, whose assumptions (forge availability, rate
 limit, a few eligible authors ahead) are not under uzi's control. Whether the
-conditional bound is acceptable is a maintainer decision; this change must not
-merge as fully satisfying the criterion until it is confirmed.
+conditional bound is acceptable was a maintainer decision: on 2026-10-07 the
+maintainer accepted it (#2347). Under a flood an eligible finding may be delayed by
+this bound but is never dropped or suppressed.
 
 ## Alternatives rejected
 
