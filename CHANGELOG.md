@@ -58,6 +58,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Codex MR rework receives its captured review findings ([#2393](https://github.com/vtmocanu/uzi/issues/2393)).**
+  Planning and ordinary implementation prompts, including cold starts and resumes, carry the shared untrusted review-comment block with the exact reply and resolve identifiers; approved plans retain precedence, and runs without review comments keep their existing prompts.
+
 - **Memory warnings and repository validation are more precise ([#296](https://github.com/vtmocanu/uzi/issues/296)).**
   Memory advisories distinguish direct executable-availability claims from test-rig and feature prose, Git fixture initialization ignores inherited Git redirection and configuration variables, and Semgrep reports bounded sanitized diagnostics from a single scan per stage while rejecting timeouts, inconsistent reports and incomplete captures. Strict scanning and canary verification remain required when the scanner runs.
 
