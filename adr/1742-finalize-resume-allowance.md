@@ -215,7 +215,10 @@ exist. What happens in each case:
 - **The run is held for owner Resume** at exhaustion with unresolved source custody
   (allowance spent, owner-started episode, or `RUN_MAX_REQUEUES=0`): without an
   available independently verified capture, G's hold reports retained
-  **`source_only`** custody, not `active_protected`, with no available archive.
+  **`source_only`** custody, not `active_protected`, with no available archive. An
+  inventory-guarded hold also reports `source_only` while an EARLIER archive is available:
+  that download does not cover the full inventory, so it is neither `archive_ready` nor
+  settled custody.
   No recorded recovery evidence or unresolved custody instead keeps `worker_lost`;
   that decision is not proof of absence of unrecorded work.
 - **On a Docker-lane worker** the attempt clone lives on `/data/runner`, an `emptyDir`, and does
@@ -614,8 +617,9 @@ abort the attempt (the trap cleans up) and repeat with a new scratch run.
    `finalize_resume_generation` stays G (the allowance is not reused);
    `uzi run recovery <B>` shows either an `archive_ready` hold
    whose archive `uzi run export` downloads (a finalization-pinned source), or a `source_only` hold
-   printed as "no recovery archive; custody ... retained (export unavailable ...)". It must never
-   show a silent empty hold.
+   printed as "no recovery archive; custody ... retained (export unavailable ...)", or an
+   inventory-guarded `source_only` hold whose earlier archive is still downloadable (custody
+   stays open; that archive does not settle it). It must never show a silent empty hold.
 9. Optional pod-loss variant (Docker lane): delete the pod instead of killing the process at step
    4. The finalize record on `/data` still drives the allowance. For a cut before fetch-back, G's
    hold reports `source_only` (D4b).

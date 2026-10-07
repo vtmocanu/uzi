@@ -414,7 +414,9 @@ The open hold for that originating worker and exact claim generation G
 stays in custody. For a terminal run or a non-terminal worker-exhaustion hold
 without an available
 independently verified recovery capture, it reports `source_only`, rather than
-`active_protected`. Recorded evidence or uncertainty at exhaustion holds the
+`active_protected`. An inventory-guarded hold also reports `source_only` while an
+earlier archive is downloadable: that archive does not cover the full inventory
+and does not settle custody. Recorded evidence or uncertainty at exhaustion holds the
 run for owner Resume; the MAC rejection grants no extra allowance. Absence of
 recorded evidence does not prove absence of unrecorded worker work:
 

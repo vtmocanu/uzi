@@ -173,3 +173,37 @@ func TestCaptureToDTOHoldID(t *testing.T) {
 		t.Errorf("identity fields wrong: %+v", got)
 	}
 }
+
+// A guarded inventory hold on an exhausted run keeps its earlier archive visible but stays an
+// owner decision, in both the owner listing and the per-worker batch adapter; a capture in
+// flight or one needing action still takes precedence.
+func TestGuardedExhaustedHoldAttention(t *testing.T) {
+	for _, tc := range []struct {
+		name, captureState, want string
+	}{
+		{"earlier archive available", "available", attentionSourceOnly},
+		{"capture preparing", "preparing", attentionCapturing},
+		{"capture uploading", "uploading", attentionCapturing},
+		{"capture needs action", "needs_action", attentionNeedsAction},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			owner := store.ListCustodyHoldsForOwnerRow{
+				State: "open", CaptureState: tc.captureState, RunStatus: "recovery_wait",
+				RecoveryWaitCause:   custodyRecoveryCauseWorkerRequeueExhausted,
+				HasAvailableCapture: true, InventoryGuarded: true,
+			}
+			batch := store.ListOpenCustodyHoldsForWorkersRow{
+				State: owner.State, CaptureState: owner.CaptureState, RunStatus: owner.RunStatus,
+				RecoveryWaitCause:   owner.RecoveryWaitCause,
+				HasAvailableCapture: true, InventoryGuarded: true,
+			}
+			if got := deriveHoldAttention(batchHoldAttentionInput(batch)); got != tc.want {
+				t.Fatalf("batch attention = %q, want %q", got, tc.want)
+			}
+			dto := custodyHoldToDTO(owner)
+			if dto.Attention != tc.want || !dto.HasAvailableCapture || !dto.InventoryGuarded {
+				t.Fatalf("owner dto = %+v, want attention %q with the archive and guard kept", dto, tc.want)
+			}
+		})
+	}
+}
