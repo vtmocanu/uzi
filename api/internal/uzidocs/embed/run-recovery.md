@@ -160,7 +160,7 @@ operator-configurable environment variable on the API:
 | Automatic upload-retry window | 24 hours | How long uzi keeps retrying a stalled upload before it needs your attention. |
 | Captures per claim | 16 | Distinct capture attempts one worker claim can accumulate. |
 | Retained captures per owner | 256 | Total captures you can have on file at once. |
-| Unresolved recovery holds per owner | 8 | At the limit, uzi pauses admitting **new** runs for you until you resolve or discard some. A requeued run that still holds its own unresolved work is still admitted, even past the limit, until that one run alone holds 8. Fixed today, not yet an environment variable. |
+| Admission-counted recovery holds per owner | 8 | Open holds count except at most one per run backing a healthy current claim without an owner decision. Total open custody stays protected. At the admission limit, uzi pauses admitting **new** runs until the counted pressure falls. A requeued run with 1–7 of its own owner-scoped open holds remains exempt; at 8 it loses that exemption. This fixed admission gate is not a strict ceiling: concurrent claims and stale heartbeats can raise pressure past 8. Not yet an environment variable. See [ADR-2445](../adr/2445-custody-admission-accounting.md). |
 
 ### Shared stored-file budget
 
