@@ -79,6 +79,12 @@ func TestFailureRecencyLiveDB(t *testing.T) {
 	} {
 		seed(uuid.New(), owner, tc.status, tc.kind, tc.origin, at.Add(3*time.Hour), false, tc.target)
 	}
+	// Plan cross-check children are excluded from the outcome totals, so a later
+	// failed or completed child must neither replace the failure nor count after it.
+	for _, status := range []string{"failed", "completed"} {
+		exec(`INSERT INTO runs (id,user_id,repo_id,issue_title,issue_description,status,kind,fail_origin,finished_at,status_since,target_run_id,harness,report_only,budget_wall_seconds) VALUES ($1,$2,$3,'t','d',$4,'cross_check',CASE WHEN $4 = 'failed' THEN 'agent_failure' END,$5,$5,$6,'codex',true,600)`,
+			uuid.New(), owner, repo, status, at.Add(3*time.Hour), lower)
+	}
 	self, err := q.SelfRunOutcomes(ctx, store.SelfRunOutcomesParams{UserID: owner})
 	if err != nil {
 		t.Fatal(err)

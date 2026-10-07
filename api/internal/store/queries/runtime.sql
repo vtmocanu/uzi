@@ -7627,7 +7627,7 @@ WITH last_failure AS MATERIALIZED (
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
     WHERE user_id = @user_id AND status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
-      AND kind NOT IN ('chat', 'judge')
+      AND kind NOT IN ('chat', 'judge', 'cross_check')
     ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
 )
 SELECT
@@ -7636,7 +7636,7 @@ SELECT
     COALESCE((SELECT f.origin FROM last_failure f), '')::text AS last_failed_origin,
     COALESCE((SELECT count(*)::bigint
        FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
-       WHERE r3.user_id = @user_id AND r3.status = 'completed' AND r3.kind NOT IN ('chat', 'judge')
+       WHERE r3.user_id = @user_id AND r3.status = 'completed' AND r3.kind NOT IN ('chat', 'judge', 'cross_check')
        GROUP BY f.id), 0)::bigint AS completed_since_last_failure,
     count(*)::bigint                                                                       AS lifetime_finished,
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
@@ -7704,7 +7704,7 @@ WITH last_failure AS MATERIALIZED (
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
     WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
-      AND kind NOT IN ('chat', 'judge')
+      AND kind NOT IN ('chat', 'judge', 'cross_check')
     ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
 )
 SELECT
@@ -7714,7 +7714,7 @@ SELECT
     COALESCE((SELECT f.user_id FROM last_failure f), '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS last_failed_user_id,
     COALESCE((SELECT count(*)::bigint
        FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
-       WHERE r3.status = 'completed' AND r3.kind NOT IN ('chat', 'judge')
+       WHERE r3.status = 'completed' AND r3.kind NOT IN ('chat', 'judge', 'cross_check')
        GROUP BY f.id), 0)::bigint AS completed_since_last_failure,
     count(*)::bigint                                                                       AS lifetime_finished,
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
@@ -7772,7 +7772,7 @@ WITH last_failure AS MATERIALIZED (
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
     WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
-      AND kind NOT IN ('chat', 'judge')
+      AND kind NOT IN ('chat', 'judge', 'cross_check')
     ORDER BY user_id, COALESCE(finished_at, status_since) DESC, id DESC
 )
 SELECT u.id AS user_id, u.email,
@@ -7781,7 +7781,7 @@ SELECT u.id AS user_id, u.email,
     COALESCE((SELECT f.origin FROM last_failure f WHERE f.user_id = u.id), '')::text AS last_failed_origin,
     COALESCE((SELECT count(*)::bigint
        FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
-       WHERE r3.user_id = u.id AND r3.status = 'completed' AND r3.kind NOT IN ('chat', 'judge') AND f.user_id = u.id
+       WHERE r3.user_id = u.id AND r3.status = 'completed' AND r3.kind NOT IN ('chat', 'judge', 'cross_check') AND f.user_id = u.id
        GROUP BY f.id), 0)::bigint AS completed_since_last_failure,
     count(*)::bigint                                                                       AS finished,
     count(*) FILTER (WHERE r.status = 'completed')::bigint                                 AS completed,
