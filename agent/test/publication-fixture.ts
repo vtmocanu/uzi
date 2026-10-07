@@ -30,9 +30,9 @@ export function followSuccessfulPush(git: GitCache, pr: { head: string }, follow
   const push = git.pushBranch.bind(git);
   let source = "";
   git.pushBranch = async (...args) => {
-    assert.match(args[5] ?? "", /^[0-9a-f]{40}$/, "finalize supplies its proved literal source");
+    assert.match(args[5]?.candidate ?? "", /^[0-9a-f]{40}$/, "finalize supplies its proved literal source");
     await push(...args);
-    source = args[5]!;
+    source = args[5]!.candidate;
     if (follow) pr.head = source;
   };
   return () => source;

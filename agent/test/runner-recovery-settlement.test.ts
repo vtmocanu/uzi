@@ -715,7 +715,7 @@ describe("RunRunner — settlement promotion on every terminal path (issue #1582
           const push = git.pushBranch.bind(git);
           git.pushBranch = async (...args) => {
             await push(...args);
-            successfulSource = args[5]!;
+            successfulSource = args[5]!.candidate;
             git.trackingTip = async () => null;
           };
         }

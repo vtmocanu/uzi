@@ -7,10 +7,10 @@ import { Readable } from "node:stream";
 import { createHash } from "node:crypto";
 import { StubExecutor } from "../src/executor.js";
 import { api, fx, git, fakeGitlab, gitlabClaim, installHarness, runner, runnerWith, homeDir } from "./runner-harness.js";
-import type { FetchAgentBranchOptions, PublicationCandidate } from "../src/git.js";
+import type { PositiveOwedCandidateContext, PublicationCandidate } from "../src/git.js";
 import { RecoveryCoordinator } from "../src/recovery.js";
 import { FakeRecoveryClient } from "./codex-reap-fixture.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
 
 installHarness();
 
@@ -78,6 +78,7 @@ for (const move of ["unchanged", "foreign", "same-generation"] as const) {
       repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: remote } });
     api.setCompletionPermitResponse(true);
     const forge = fakeGitlab();
+    const { logger, lines } = recordingLogger();
     const recoveryClient = new FakeRecoveryClient();
     const recoveryOptions = { client: recoveryClient, git, log: nullLogger(),
       recoveryRoot: git.recoveryRoot, workerToken: "publication-retry-worker-fixture" };
@@ -85,14 +86,26 @@ for (const move of ["unchanged", "foreign", "same-generation"] as const) {
     const marker = path.join(homeDir, "session-marker");
     fs.writeFileSync(marker, "retained session");
     let clone = "";
-    let context: FetchAgentBranchOptions["context"] | undefined;
+    let context: PositiveOwedCandidateContext | undefined;
     const fetch = git.fetchAgentBranch.bind(git);
     git.fetchAgentBranch = async (...args) => {
       const result = await fetch(...args);
       assert.ok(result.kind === "updated", JSON.stringify(result));
       assert.equal(result.candidateSha, cmd(args[1], "rev-parse", branch));
       assert.ok(args[4]);
-      context = args[4].context;
+      const fetchedContext = args[4].context;
+      assert.ok(fetchedContext.generation !== null && fetchedContext.legacy === undefined,
+        "generation-7 fetch supplies a positive, non-legacy context");
+      assert.equal(fetchedContext.runId, claim.run_id);
+      assert.equal(fetchedContext.generation, 7);
+      assert.equal(fetchedContext.kind, claim.kind);
+      assert.equal(fetchedContext.branch, branch);
+      assert.equal(fetchedContext.barePath, args[0]);
+      assert.deepEqual(fetchedContext.defaultIdentity, {
+        ref: "refs/remotes/origin/main",
+        sha: cmd(args[0], "rev-parse", "refs/remotes/origin/main"),
+      });
+      context = fetchedContext;
       return result;
     };
 
@@ -102,15 +115,15 @@ for (const move of ["unchanged", "foreign", "same-generation"] as const) {
     let failedWire = false;
     let retryObserved = false;
     git.committedTrackingOwnership = async (...args) => {
-      const result = await ownership(...args);
-      if (args[3] !== undefined) {
-        if (!failedWire) order.push("ownership");
-        else if (!retryObserved) {
-          order.push("retry ownership");
-          retryObserved = true;
-          retryChecks.push({ expected: args[3], kind: result.kind });
-        }
+      const firstRetry = args[3] !== undefined && failedWire && !retryObserved;
+      if (firstRetry) {
+        retryObserved = true;
+        order.push("retry ownership");
+      } else if (args[3] !== undefined && !failedWire) {
+        order.push("ownership");
       }
+      const result = await ownership(...args);
+      if (firstRetry) retryChecks.push({ expected: args[3], kind: result.kind });
       return result;
     };
     const seam = git as unknown as {
@@ -118,14 +131,12 @@ for (const move of ["unchanged", "foreign", "same-generation"] as const) {
     };
     const wire = seam.runGit.bind(git);
     const refspecs: string[] = [];
-    let failedAt = 0;
     seam.runGit = async (cwd, args, ...rest) => {
       if (args[0] === "push") {
         refspecs.push(args[2]!);
         if (refspecs.length === 1) {
           order.push("failed wire");
           failedWire = true;
-          failedAt = Date.now();
           throw new Error("connection reset before send");
         }
         order.push("successful wire");
@@ -170,7 +181,7 @@ for (const move of ["unchanged", "foreign", "same-generation"] as const) {
         clone = ctx.worktreePath;
         return new StubExecutor(nullLogger()).run(ctx);
       },
-    }, homeDir }), forge.gitlab, undefined, nullLogger(), { recovery }).execute(claim);
+    }, homeDir }), forge.gitlab, undefined, logger, { recovery }).execute(claim);
 
     if (move === "same-generation") {
       assert.equal(publications.length, 1,
@@ -187,7 +198,12 @@ for (const move of ["unchanged", "foreign", "same-generation"] as const) {
       "same-run/same-generation D remains OWNED without an expected SHA");
     assert.ok(retryChecks.some(check => check.expected === C && check.kind ===
       (move === "unchanged" ? "owned" : "not_owned")), "actual retry ownership check binds frozen C");
-    assert.ok(Date.now() - failedAt >= 1000, "production forge retry uses its real first 1000ms delay");
+    const retryDelays = lines.filter(line =>
+      (line as { msg?: string }).msg === "transient forge error; retrying push/MR-create")
+      .map(line => ({ attempt: (line as { attempt: number }).attempt,
+        delay: (line as { delay_ms: number }).delay_ms }));
+    assert.deepEqual(retryDelays, [{ attempt: 1, delay: 1000 }],
+      "the production forge retry requests its real first 1000ms delay");
     const failedIndex = order.indexOf("failed wire");
     assert.ok(order.slice(0, failedIndex).includes("ownership"), "ownership precedes first wire");
     assert.deepEqual(order.slice(failedIndex), move === "unchanged"
