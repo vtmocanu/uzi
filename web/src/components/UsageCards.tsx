@@ -148,7 +148,7 @@ function FailedRunsBlock({ lifetime, last7 }: { lifetime: RunOutcomes; last7: Ru
       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
         <h3 className="font-mono text-[26px] font-semibold tabular-nums tracking-tight text-fg">
           <span>{failRate(lifetime)}</span>{" "}
-          <em className="text-sm font-normal not-italic text-muted">failed runs</em>
+          <span className="text-sm font-normal text-muted">failed runs</span>
         </h3>
         <span className="text-xs text-muted">
           <span className="tabular-nums text-fg">{lifetime.failed}</span> of{" "}
@@ -194,14 +194,16 @@ function SinceLastFailedRun({ outcomes, owner }: { outcomes: RunOutcomes; owner?
       {hasFailure || value === "Unavailable" ? (
         <h3 className="font-mono text-[26px] font-semibold tabular-nums tracking-tight text-fg">
           <span>{value}</span>{" "}
-          <em className="text-sm font-normal not-italic text-muted">since last failed run</em>
+          <span className="text-sm font-normal text-muted">since last failed run</span>
         </h3>
       ) : (
         <>
           <h3 className={outcomes.finished === 0 ? "text-lg font-medium text-muted" : "text-lg font-medium text-ok"}>
             {outcomes.finished === 0 ? "No finished runs yet" : "No recorded failures"}
           </h3>
-          <p className="mt-1 text-xs text-muted">{outcomes.completed} completed runs, none failed</p>
+          {outcomes.finished > 0 && (
+            <p className="mt-1 text-xs text-muted">{outcomes.completed} completed runs, none failed</p>
+          )}
         </>
       )}
       {hasFailure && (

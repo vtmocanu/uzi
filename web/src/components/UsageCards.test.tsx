@@ -527,9 +527,9 @@ describe("failure recency cards and table (#2399)", () => {
     expect(getByRole("link", { name: /run 7c41a2e0/ }).getAttribute("href")).toBe("/runs/7c41a2e0-0000-4000-8000-000000000001");
   });
   it("distinguishes no finished runs from completed runs without failures", () => {
-    const { getByText, getByRole, rerender } = wrap(<YourUsageCard usage={usage(outcomes(0, 0, 0, 0, 0))} />);
+    const { getByText, getByRole, queryByText, rerender } = wrap(<YourUsageCard usage={usage(outcomes(0, 0, 0, 0, 0))} />);
     expect(getByRole("heading", { name: "No finished runs yet" })).toBeTruthy();
-    expect(getByText("0 completed runs, none failed")).toBeTruthy();
+    expect(queryByText("0 completed runs, none failed")).toBeNull();
     rerender(<MemoryRouter><YourUsageCard usage={usage(outcomes(4, 3, 1, 0, 0))} /></MemoryRouter>);
     expect(getByRole("heading", { name: "No recorded failures" }).classList.contains("text-ok")).toBe(true);
     expect(getByText("3 completed runs, none failed")).toBeTruthy();
