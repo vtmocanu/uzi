@@ -29,6 +29,19 @@ ALTER TABLE runs ADD CONSTRAINT runs_recovery_wait_cause_check CHECK (
     )
 );
 -- +goose Down
+-- A deliberate schema downgrade removes owner exhaustion Resume. Fall back to
+-- the prior application's terminal worker_lost behavior, preserving recovery
+-- sources, custody and released-claim fences rather than leaving an untimed wait.
+UPDATE runs
+SET status = 'failed',
+    fail_origin = 'worker_lost',
+    failure_reason = 'worker recovery exhaustion hold ended by schema rollback (00308)',
+    finished_at = now(), status_since = now(), updated_at = now(),
+    recovery_wait_cause = NULL, recovery_retry_not_before = NULL
+WHERE status = 'recovery_wait' AND recovery_wait_cause = 'worker_requeue_exhausted';
+-- Outside the hold, only obsolete cause/retry metadata needs clearing.
+UPDATE runs SET recovery_wait_cause = NULL, recovery_retry_not_before = NULL
+WHERE recovery_wait_cause = 'worker_requeue_exhausted';
 ALTER TABLE runs DROP COLUMN worker_recovery_evidence,
     DROP COLUMN requeue_episode_baseline, DROP COLUMN worker_recovery_episode;
 ALTER TABLE runs DROP CONSTRAINT runs_recovery_wait_cause_check;

@@ -417,6 +417,28 @@ episode 0, with a positive maximum, exhausted allowance and unused lifetime
 marker. Charged worker-death retries in owner-started episodes cannot exceed
 their configured cap, and owner Resume cannot renew that marker. See [Configuration](configuration.md) and [ADR-1742](../adr/1742-finalize-resume-allowance.md).
 
+### Deliberate schema downgrade
+
+Before executing migration `00308` Down, stop or replace the newer application:
+its queries require columns that Down drops. The table alterations and constraint
+validation can lock and scan `runs`; plan maintenance around those operations.
+
+This deliberate downgrade converts each `worker_requeue_exhausted` hold in
+`recovery_wait` to a terminal `failed` run with `fail_origin = worker_lost` and
+an explicit schema-rollback failure reason. It clears the obsolete cause and
+retry timestamp, including on rows outside that hold, so the previous application
+does not leave an unrecognized wait without a retry time. Exhausted work is not
+automatically queued. Other wait causes keep their existing behavior.
+
+Checkpoint tips, publication attempts, captures, source custody and released-claim
+fences remain. Terminal checkpoint retention follows the prior recovery lifecycle:
+open custody retains the checkpoint; otherwise it enters settling. Retained sources
+do not preserve owner exhaustion Resume after downgrade. Reapplying Up creates new
+default episode/baseline values and no historical evidence; it neither restores
+the removed history nor reverses terminalization. This exception applies solely to
+an explicit schema downgrade. During normal operation, the owner-only hold and
+historical-evidence rules above remain in force.
+
 ## Other waiting states
 
 - `recovery_wait`: a positively-empty SDK turn or a transient provider error
