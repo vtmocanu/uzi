@@ -1334,6 +1334,12 @@ export type TrackingUpdateResult =
       displacedSha?: string; divergence: "none" | "ancestor" | "divergent" | "unknown" | "foreign" }
   | { kind: "not_updated"; reason: "ownership_unknown" | "preservation_failed" | "owed_limit" |
       "receipt_pending_failed" | "tracking_update_failed" | "owner_stamp_failed" | "receipt_commit_failed" };
+/** One validated read of a bare's owed metadata (see GitCache.readOwedMetadataUnderLock). */
+interface OwedMetadata {
+  names: string[];
+  contexts: Map<string, StoredOwedContext>;
+  records: Array<{ runId: string; sha: string; contextName: string; c: StoredOwedContext }>;
+}
 export interface OwedCandidate {
   sha: string;
   pinRef: string;
@@ -8414,10 +8420,13 @@ export class GitCache {
     }
   }
 
-  private async enumerateOwedUnderLock(barePath: string, runId: string): Promise<OwedCandidate[]> {
+  /** Read and validate EVERY owed context and candidate file once. Callers that enumerate several
+   *  runs of one bare (boot/live discovery) share one result instead of rereading per run or per
+   *  context. Any unreadable or malformed entry throws: nothing here ever skips a bad file. */
+  private async readOwedMetadataUnderLock(barePath: string): Promise<OwedMetadata> {
     const names = await this.owedMetadataNames(barePath);
     const contexts = new Map<string, StoredOwedContext>();
-    const records: Array<{ sha: string; c: StoredOwedContext }> = [];
+    const records: OwedMetadata["records"] = [];
     for (const name of names.filter((n) => n.startsWith("context-"))) {
       const c = await this.parseOwedContext(barePath, await this.readOwedFile(barePath, name));
       if (name !== this.contextName(c)) throw new Error("owed context filename mismatch");
@@ -8431,8 +8440,14 @@ export class GitCache {
           name !== `candidate-${v.runId}-${v.sha}-${v.context.slice(8, -5)}.json`) throw new Error("invalid owed candidate metadata");
       const c = contexts.get(v.context);
       if (!c || c.runId !== v.runId) throw new Error("owed candidate has no discovery context");
-      if (v.runId === runId) records.push({ sha: v.sha, c });
+      records.push({ runId: v.runId, sha: v.sha, contextName: v.context, c });
     }
+    return { names, contexts, records };
+  }
+
+  private async enumerateOwedUnderLock(barePath: string, runId: string, metadata?: OwedMetadata): Promise<OwedCandidate[]> {
+    const loaded = metadata ?? await this.readOwedMetadataUnderLock(barePath);
+    const records = loaded.records.filter((r) => r.runId === runId);
     const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/uzi-owed/${runId}/`]);
     const result: OwedCandidate[] = [];
     for (const line of out.trim().split("\n").filter(Boolean)) {
@@ -8462,15 +8477,20 @@ export class GitCache {
       const bare = path.join(path.resolve(this.reposRoot), name);
       await this.assertOwedBare(bare);
       await this.withLock(bare, async () => {
-        const names = await this.owedMetadataNames(bare);
+        // One metadata read per bare, and one enumeration (git calls) per run, however many
+        // contexts exist: the contexts of a run share its enumeration.
+        const metadata = await this.readOwedMetadataUnderLock(bare);
         const allPins = await this.runGit(bare, ["for-each-ref", "--format=%(refname)", "refs/uzi-owed/"]);
         const runs = new Set<string>();
-        for (const n of names.filter((n) => n.startsWith("context-"))) {
-          const context = await this.parseOwedContext(bare, await this.readOwedFile(bare, n));
-          if (n !== this.contextName(context)) throw new Error("owed discovery filename mismatch");
+        const perRun = new Map<string, OwedCandidate[]>();
+        for (const [n, context] of metadata.contexts) {
           runs.add(context.runId);
-          const candidates = (await this.enumerateOwedUnderLock(bare, context.runId))
-            .filter((candidate) => candidate.contexts.some((c) => this.contextName(c) === n));
+          let enumerated = perRun.get(context.runId);
+          if (!enumerated) {
+            enumerated = await this.enumerateOwedUnderLock(bare, context.runId, metadata);
+            perRun.set(context.runId, enumerated);
+          }
+          const candidates = enumerated.filter((candidate) => candidate.contexts.some((c) => this.contextName(c) === n));
           result.push({ context, candidates });
         }
         for (const ref of allPins.trim().split("\n").filter(Boolean)) {
@@ -8514,7 +8534,8 @@ export class GitCache {
   }
 
   /** Only a server-confirmed full commit and positive ancestry proof release an owed pin. */
-  async reconcileOwedCandidates(barePath: string, runId: string, remotelyConfirmedSha: string):
+  async reconcileOwedCandidates(barePath: string, runId: string, remotelyConfirmedSha: string,
+    keepContext?: OwedCandidateContext):
     Promise<{ removedShas: string[]; retainedShas: string[] }> {
     if (typeof runId !== "string" || !OWED_RUN_ID.test(runId)) throw new Error("invalid owed run ID");
     this.validateConfirmedSha(remotelyConfirmedSha);
@@ -8522,6 +8543,7 @@ export class GitCache {
     return this.withLock(barePath, async () => {
       const candidates = await this.enumerateOwedUnderLock(barePath, runId);
       const removedShas: string[] = [], retainedShas: string[] = [];
+      const releasedContexts = new Set<string>();
       for (const candidate of candidates) {
         if (await this.remotelyCovers(barePath, candidate.sha, remotelyConfirmedSha)) {
           await this.runGit(barePath, ["update-ref", "-d", candidate.pinRef, candidate.sha]);
@@ -8532,12 +8554,45 @@ export class GitCache {
           for (const ctx of candidate.contexts) {
             const name = `candidate-${runId}-${candidate.sha}-${this.contextName(ctx).slice(8, -5)}.json`;
             if (await this.readOwedFile(barePath, name) !== undefined) await this.removeOwedFile(barePath, name);
+            releasedContexts.add(this.contextName(ctx));
           }
           removedShas.push(candidate.sha);
         } else retainedShas.push(candidate.sha);
       }
+      if (releasedContexts.size) {
+        await this.pruneReleasedOwedContexts(barePath, releasedContexts, keepContext ? this.contextName(keepContext) : undefined);
+      }
       return { removedShas, retainedShas };
     });
+  }
+
+  /** Drop the metadata file of a context whose pins were all just released, so discovery stops
+   *  reading and enumerating it on every pass. Best-effort and fail closed: a context stays when any
+   *  remaining candidate file or any tracking receipt still names it, when it is the caller's live
+   *  context, or when any receipt is unreadable or malformed. The pins are already gone, so a failure
+   *  here only leaves harmless metadata. Caller MUST hold the bare lock. */
+  private async pruneReleasedOwedContexts(barePath: string, released: Set<string>, keep: string | undefined): Promise<void> {
+    try {
+      const names = await this.owedMetadataNames(barePath);
+      const stillNamed = new Set<string>();
+      for (const name of names) {
+        const candidate = /^candidate-[A-Za-z0-9_-]+-[0-9a-f]{40}-([0-9a-f]{64})\.json$/.exec(name);
+        if (candidate) stillNamed.add(`context-${candidate[1]}.json`);
+        if (name.startsWith("receipt-")) {
+          const receipt = await this.readOwedFile(barePath, name) as { context?: unknown } | undefined;
+          if (!receipt || typeof receipt.context !== "string" || !/^context-[0-9a-f]{64}\.json$/.test(receipt.context)) return;
+          stillNamed.add(receipt.context);
+        }
+      }
+      for (const name of released) {
+        if (name === keep || stillNamed.has(name) || !names.includes(name)) continue;
+        await this.removeOwedFile(barePath, name);
+      }
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      this.log.warn("owed context metadata not pruned", { error: cause instanceof Error ? cause.message : String(cause) });
+    }
   }
 
   /** Recovery-only aggregate, never a tracking/checkpoint/publication ref.
