@@ -972,6 +972,9 @@ tasks:
 
   test:semgrep-gate:
     desc: hermetic Semgrep capture, sanitized diagnostics and fail-closed verdict fixtures
+    # The suite reads procfs before any case runs, so a macOS `task gate:repo` skips it
+    # rather than failing; CI's lint-repo job runs gate:repo on Linux and still reaches it.
+    platforms: [linux]
     cmds:
       - ./scripts/semgrep-gate.test.sh
 
