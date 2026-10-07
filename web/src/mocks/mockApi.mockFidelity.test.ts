@@ -139,6 +139,10 @@ describe("mockApi — F3 updateSettings accepts the nine missing AppSettings key
     await check("github_project_sync_enabled", { github_project_sync_enabled: "true" }, "true");
     await check("docker_repo_allowlist", { docker_repo_allowlist: VALID_UUID }, VALID_UUID);
     await check("docker_repo_allowlist", { docker_repo_allowlist: "" }, "");
+    // Issue #2347: the trusted review-bot allowlist, empty (no bot trusted) and two entries.
+    await check("mr_review_trusted_bots", { mr_review_trusted_bots: "" }, "");
+    const bots = "https://github.com#136622811,https://gitlab.example.com:8443#42";
+    await check("mr_review_trusted_bots", { mr_review_trusted_bots: bots }, bots);
     // PRD #1189: the extension allowance — 0 (off) and an in-range value.
     await check("run_extension_cap_seconds", { run_extension_cap_seconds: "0" }, "0");
     await check("run_extension_cap_seconds", { run_extension_cap_seconds: "3600" }, "3600");
@@ -163,6 +167,25 @@ describe("mockApi — F3 updateSettings accepts the nine missing AppSettings key
     await expect(api.updateSettings({ docker_repo_allowlist: "not-a-uuid" })).rejects.toMatchObject(
       { status: 400 },
     );
+    // Issue #2347: each rule of the server's validateTrustedBots.
+    for (const bad of [
+      "https://github.com", // no '#<id>'
+      "http://github.com#1", // not https
+      "https://GitHub.com#1", // not lower case
+      "https://github.com/#1", // path (trailing slash)
+      "https://bot@github.com#1", // user info
+      "https://github.com?x=1#1", // query
+      "https://github.com#0", // not positive
+      "https://github.com#007", // leading zeros
+      "https://github.com#coderabbitai", // a login, not an id
+      "https://github.com#9223372036854775808", // past int64
+      "https://github.com#1,https://github.com#1", // duplicate
+      Array.from({ length: 51 }, (_, i) => `https://github.com#${i + 1}`).join(","), // > 50
+    ]) {
+      await expect(api.updateSettings({ mr_review_trusted_bots: bad })).rejects.toMatchObject({
+        status: 400,
+      });
+    }
     // PRD #1189: 3599 is below the extension-allowance floor (3600), a distinct bound from the
     // health-seconds floor (60).
     await expect(api.updateSettings({ run_extension_cap_seconds: "3599" })).rejects.toMatchObject({

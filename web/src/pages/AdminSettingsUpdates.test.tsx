@@ -65,6 +65,7 @@ const settings = (over: Partial<Settings> = {}): Settings => ({
   health_nudge_cooldown_seconds: "1800",
   run_extension_cap_seconds: "57600",
   docker_repo_allowlist: "",
+  mr_review_trusted_bots: "",
   capability_aware_scheduling: "true",
   completion_interlock_rollout: "true",
   github_project_sync_enabled: "false",

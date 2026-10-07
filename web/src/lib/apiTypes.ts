@@ -1012,6 +1012,11 @@ export interface AppSettings {
   // workers are unaffected. The admin UI edits it as a repo multiselect writing the
   // ids — admins pick paths, never paste UUIDs.
   docker_repo_allowlist: string;
+  // Trusted review-bot allowlist (issue #2347): comma-separated `<base_url>#<forge_user_id>`
+  // entries, e.g. `https://github.com#136622811`. MR review comments from non-collaborators
+  // are withheld from automatic MR rework; a listed bot's comments are ingested (still as
+  // untrusted evidence). Empty (the default) trusts no bot. Rules: lib/trustedReviewBots.ts.
+  mr_review_trusted_bots: string;
   // Capability-aware scheduling kill-switch (PRD #84 M2). The text "true"/"false"
   // (default "true"). When on, a run is routed only to a worker that can run it
   // (e.g. a docker-needing run only to a docker worker). Turning it OFF reverts to
