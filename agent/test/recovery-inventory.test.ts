@@ -1112,3 +1112,77 @@ it("physical clones fail closed without runner boundary even when heads are cove
     assert.equal(retained.finalAcknowledged, undefined);
   } finally { await f.close(); }
 });
+
+// issue #2213 / #1924: the guarded FINAL release is a custody release, so a latched worker must not send it.
+type ClientSeam = Record<string, (...args: unknown[]) => Promise<unknown>>;
+const clientOf = (f: Awaited<ReturnType<typeof fixture>>): ClientSeam =>
+  (f.coordinator as unknown as { client: ClientSeam }).client;
+
+it("issue2213 a quarantine latched before finalization holds the guarded FINAL and keeps the evidence", async () => {
+  const { latchResidueQuarantine, resetResidueQuarantineForTests } = await import("../src/residue-quarantine.js");
+  const f = await fixture();
+  try {
+    const client = clientOf(f);
+    const upload = client.uploadRecoveryBundle!.bind(client);
+    client.uploadRecoveryBundle = async (...args) => {
+      const result = await upload(...args);
+      latchResidueQuarantine({ cause: "review fixture", site: "after_upload" }, nullLogger());
+      return result;
+    };
+    const record = await f.freeze();
+    assert.ok(record);
+    await f.capture(record);
+    assert.equal(f.finals.length, 0, "no guarded release while quarantine is latched");
+    const [kept] = await f.coordinator.inspect("run-1");
+    assert.notEqual(kept?.finalAcknowledged, true);
+    assert.equal(kept?.state, "uploaded");
+    resetResidueQuarantineForTests();
+    await f.capture(kept!);
+    assert.equal(f.finals.length, 1, "the retained evidence finalizes once unlatched");
+  } finally { resetResidueQuarantineForTests(); await f.close(); }
+});
+
+it("issue2213 a quarantine during the final status read prevents the guarded FINAL", async () => {
+  const { latchResidueQuarantine, resetResidueQuarantineForTests } = await import("../src/residue-quarantine.js");
+  const f = await fixture();
+  try {
+    const client = clientOf(f);
+    const status = client.getRecoveryCaptureStatus!.bind(client);
+    client.getRecoveryCaptureStatus = async (...args) => {
+      const result = await status(...args);
+      latchResidueQuarantine({ cause: "review fixture", site: "final_status_read" }, nullLogger());
+      return result;
+    };
+    const record = await f.freeze();
+    assert.ok(record);
+    await f.capture(record);
+    assert.equal(f.finals.length, 0, "no new guarded release while quarantine is latched");
+    const [kept] = await f.coordinator.inspect("run-1");
+    assert.equal(kept?.finalRequest, undefined, "no FINAL identity is journaled after the latch");
+  } finally { resetResidueQuarantineForTests(); await f.close(); }
+});
+
+it("issue2213 a quarantine during the FINAL ACK keeps the journal unacknowledged and the bundle local", async () => {
+  const { latchResidueQuarantine, resetResidueQuarantineForTests } = await import("../src/residue-quarantine.js");
+  const f = await fixture();
+  try {
+    const client = clientOf(f);
+    const release = client.releaseRecoveryCustody!.bind(client);
+    client.releaseRecoveryCustody = async (...args) => {
+      const result = await release(...args);
+      latchResidueQuarantine({ cause: "review fixture", site: "final_ack" }, nullLogger());
+      return result;
+    };
+    const released: string[] = [];
+    (f.coordinator as unknown as { onAuthoritativeGenerationReleased?: (run: string, g: number) => void })
+      .onAuthoritativeGenerationReleased = run => { released.push(run); };
+    const record = await f.freeze();
+    assert.ok(record);
+    await f.capture(record);
+    assert.equal(f.finals.length, 1, "the release was already in flight");
+    const [kept] = await f.coordinator.inspect("run-1");
+    assert.notEqual(kept?.finalAcknowledged, true, "a latched worker does not journal the ACK");
+    assert.deepEqual(released, []);
+    await fs.access(kept!.bundlePath!);
+  } finally { resetResidueQuarantineForTests(); await f.close(); }
+});

@@ -810,6 +810,10 @@ export class RecoveryCoordinator {
   async settleUnadoptedGuardedGeneration(input: {
     runId: string; generation: number; barePath: string; signal?: AbortSignal;
   }): Promise<"settled" | "retained"> {
+    // issue #2213: this release is the ADR-2213 "pre-clone park's hold release, where no source
+    // exists" exemption: it is sent only after a positive local proof that the generation adopted
+    // no source (no record, no owed candidate, no clone), so a latched worker loses nothing by it
+    // and refusing it would strand the hold. It stays ungated on purpose.
     const { runId, generation, barePath } = input;
     if (!this.enabled || !Number.isSafeInteger(generation) || generation <= 0 ||
         !this.client.hasFeature?.("recovery_inventory_v1")) return "retained";
@@ -919,6 +923,11 @@ export class RecoveryCoordinator {
 
   private async finalizeInventoryWithinBoundary(snapshot: RecoveryRecord, prove: () => Promise<boolean>): Promise<RecoveryOutcome | void> {
     let record = await this.requireRecord(snapshot);
+    // issue #2213 (ADR-2213 "Nothing is uploaded or released while latched"): the guarded FINAL is a
+    // custody release of an inactive run's inventory. Neither named exemption (a completed run's
+    // release, the pre-clone park's source-less hold release) covers it, so a latched worker holds it
+    // and keeps the record, bundle and pins; the next unlatched pass replays the same request.
+    if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
     if (!record.inventoryGuarded || record.finalAcknowledged || record.reason === "inventory_quiescence_breach" || !record.coverageDigest ||
         !(await this.inactiveInventory(record))) return;
     // Every still-unresolved root must be covered; an earlier archive cannot close a later inventory.
@@ -973,6 +982,8 @@ export class RecoveryCoordinator {
     if (!record.finalRequest) {
       if (record.state !== "uploaded" || !record.serverCaptureId || !(await this.openInventoryHold(record))) return;
       const status = await this.client.getRecoveryCaptureStatus(record.runId, record.serverCaptureId);
+      // issue #2213: a latch that landed during the status read must not mint the immutable FINAL identity.
+      if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
       const expiresAt = Date.parse(status.expires_at ?? "");
       if (status.capture_id !== record.serverCaptureId || status.state !== "available" || !status.manifest_bound ||
           status.checksum !== record.checksum || status.byte_size !== record.byteSize ||
@@ -988,9 +999,18 @@ export class RecoveryCoordinator {
     try {
       if (!this.client.hasFeature?.("recovery_inventory_v1") || !(await this.inactiveInventory(record))) return;
       if (!await prove() || !await this.inactiveInventory(record)) return;
+      // issue #2213: synchronous check immediately before the release (nothing awaited in between).
+      if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
       const ack = await this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition);
       if (ack.run_id !== record.runId || ack.generation !== record.generation || ack.released !== true ||
           ack.holds_released !== 1 || ack.retained) return;
+      // issue #2213: the server release cannot be recalled. A latch that landed while it was in
+      // flight keeps the local evidence unacknowledged; the identical request replays once unlatched.
+      if (residueQuarantine() !== undefined) {
+        this.log.warn("recovery: final inventory release returned while the worker is quarantined; local evidence kept unacknowledged",
+          { run_id: record.runId, generation: record.generation });
+        return quarantinedOutcome(record.captureId);
+      }
       await this.writeExistingRecord(record, cur => ({ ...cur, finalAcknowledged: true }));
       this.onAuthoritativeGenerationReleased?.(record.runId, record.generation!);
     } catch (err) {
@@ -1361,6 +1381,8 @@ export class RecoveryCoordinator {
         if (current.inventoryGuarded) {
           if (!this.client.hasFeature?.("recovery_inventory_v1")) throw new Error("inventory feature unavailable");
           if (!(await this.openInventoryHold(current))) throw new Error("exact guarded open hold unavailable");
+          // issue #2213: a latch that landed during the hold read stops the reserve.
+          if (residueQuarantine() !== undefined) return quarantinedOutcome(current.captureId);
         }
         reserved = await this.client.reserveRecoveryCapture(current.runId, {
           run_id: current.runId,
