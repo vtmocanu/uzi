@@ -2738,6 +2738,22 @@ export interface Run {
   title: string | null;
   resume_of_run_id: string | null;
   status: RunStatus;
+  /** Current episode allowance plus historic exhaustion evidence; no current availability promise. */
+  worker_recovery?: {
+    episode: number;
+    automatic_requeue_limit: number;
+    episode_used: number;
+    episode_remaining: number;
+    evidence: {
+      checkpoint_tip: string | null;
+      available_capture: boolean;
+      publication_uncertain: boolean;
+      capture_uncertain: boolean;
+      custody_uncertain: boolean;
+      unknown: boolean;
+      recorded_at: string;
+    } | null;
+  };
   requeue_count: number;
   iteration_count: number;
   /** issue #321: server-computed planning-phase display flag — true only while a run is

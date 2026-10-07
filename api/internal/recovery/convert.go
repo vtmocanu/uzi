@@ -97,7 +97,7 @@ const (
 	attentionCapturing    = "capturing"     // OPEN, capture in progress (preparing/uploading).
 	attentionArchiveReady = "archive_ready" // OPEN, a ready archive covers it — auto-releases.
 	attentionNeedsAction  = "needs_action"  // OPEN, a stalled/failed capture needs a decision.
-	attentionSourceOnly   = "source_only"   // OPEN, no capture, run terminal — needs a decision.
+	attentionSourceOnly   = "source_only"   // OPEN, no capture, run ended or owner exhaustion hold — needs a decision.
 	attentionReleased     = "released"      // custody settled.
 	attentionDiscarded    = "discarded"     // custody explicitly discarded.
 )
@@ -107,6 +107,10 @@ const (
 // (recovery.go's package doc). It is the notion of "the hold's run has ended", which
 // separates an OPEN capture-less hold that still protects a LIVE run (active) from one whose
 // run has ended and now needs an owner decision (source_only).
+// custodyRecoveryCauseWorkerRequeueExhausted mirrors the server-only workersvc cause.
+// The source parity test pins it without adding a production package dependency.
+const custodyRecoveryCauseWorkerRequeueExhausted = "worker_requeue_exhausted"
+
 var custodyRunTerminalStatuses = map[string]bool{"completed": true, "failed": true, "cancelled": true}
 
 type holdAttentionInput struct {
@@ -115,23 +119,25 @@ type holdAttentionInput struct {
 	InventoryGuarded    bool
 	CaptureState        string
 	RunStatus           string
+	RecoveryWaitCause   string
 }
 
 func ownerHoldAttentionInput(row store.ListCustodyHoldsForOwnerRow) holdAttentionInput {
-	return holdAttentionInput{State: row.State, HasAvailableCapture: row.HasAvailableCapture, InventoryGuarded: row.InventoryGuarded, CaptureState: row.CaptureState, RunStatus: row.RunStatus}
+	return holdAttentionInput{State: row.State, HasAvailableCapture: row.HasAvailableCapture, InventoryGuarded: row.InventoryGuarded, CaptureState: row.CaptureState, RunStatus: row.RunStatus, RecoveryWaitCause: row.RecoveryWaitCause}
 }
 
 func batchHoldAttentionInput(row store.ListOpenCustodyHoldsForWorkersRow) holdAttentionInput {
-	return holdAttentionInput{State: row.State, HasAvailableCapture: row.HasAvailableCapture, InventoryGuarded: row.InventoryGuarded, CaptureState: row.CaptureState, RunStatus: row.RunStatus}
+	return holdAttentionInput{State: row.State, HasAvailableCapture: row.HasAvailableCapture, InventoryGuarded: row.InventoryGuarded, CaptureState: row.CaptureState, RunStatus: row.RunStatus, RecoveryWaitCause: row.RecoveryWaitCause}
 }
 
 // deriveHoldAttention computes a hold's server-derived Attention from its state, capture
 // summary and run status (PRD #1349 M5, D6/D8). Precedence for an OPEN hold: a ready archive
 // on a legacy hold (archive_ready, self-releasing) → a capture in flight (capturing) → a stalled/failed capture
-// (needs_action) → a still-live run (active protection) → otherwise a capture-less hold whose
-// run has ended, or whose run is gone/unknown, needs an owner decision (source_only). A
-// non-open hold reports its terminal disposition directly. A guarded hold retains its full
-// inventory even when an earlier archive is available to download.
+// (needs_action) → an owner exhaustion hold (source_only) → a still-live run (active
+// protection) → otherwise a capture-less hold whose run has ended, or whose run is
+// gone/unknown, needs an owner decision (source_only). A non-open hold reports its terminal
+// disposition directly. A guarded hold retains its full inventory even when an earlier
+// archive is available to download.
 func deriveHoldAttention(row holdAttentionInput) string {
 	switch row.State {
 	case "discarded":
@@ -146,6 +152,8 @@ func deriveHoldAttention(row holdAttentionInput) string {
 		return attentionCapturing
 	case row.CaptureState == "needs_action":
 		return attentionNeedsAction
+	case row.RunStatus == "recovery_wait" && row.RecoveryWaitCause == custodyRecoveryCauseWorkerRequeueExhausted:
+		return attentionSourceOnly
 	case row.RunStatus != "" && !custodyRunTerminalStatuses[row.RunStatus]:
 		return attentionActive
 	default:

@@ -29,10 +29,10 @@ type registerStore struct {
 	rotatedHash []byte
 }
 
-func (r *registerStore) FailWorkerRunsOverCap(context.Context, store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
+func (r *registerStore) FailWorkerRunsOverCap(context.Context, store.FailWorkerRunsOverCapParams) ([]store.WorkerRecoveryDisposition, error) {
 	return nil, nil
 }
-func (r *registerStore) FailAttestedFinalizeRunsOverCap(context.Context, store.FailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error) {
+func (r *registerStore) FailAttestedFinalizeRunsOverCap(context.Context, store.FailAttestedFinalizeRunsOverCapParams) ([]store.WorkerRecoveryDisposition, error) {
 	return nil, nil
 }
 func (r *registerStore) RequeueAttestedFinalizeRuns(context.Context, store.RequeueAttestedFinalizeRunsParams) ([]store.RequeueAttestedFinalizeRunsRow, error) {

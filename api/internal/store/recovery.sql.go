@@ -870,6 +870,7 @@ SELECT
         WHERE c.hold_id = h.id
         ORDER BY c.created_at DESC, c.id DESC
         LIMIT 1), '')::text AS capture_state,
+    COALESCE(r.recovery_wait_cause, '')::text AS recovery_wait_cause,
     COALESCE(r.status, '')::text AS run_status,
     cr.ref AS checkpoint_ref,
     cr.tip AS checkpoint_tip,
@@ -911,6 +912,7 @@ type ListCustodyHoldsForOwnerRow struct {
 	WorkerName              string             `json:"worker_name"`
 	HasAvailableCapture     bool               `json:"has_available_capture"`
 	CaptureState            string             `json:"capture_state"`
+	RecoveryWaitCause       string             `json:"recovery_wait_cause"`
 	RunStatus               string             `json:"run_status"`
 	CheckpointRef           pgtype.Text        `json:"checkpoint_ref"`
 	CheckpointTip           pgtype.Text        `json:"checkpoint_tip"`
@@ -972,6 +974,7 @@ func (q *Queries) ListCustodyHoldsForOwner(ctx context.Context, arg ListCustodyH
 			&i.WorkerName,
 			&i.HasAvailableCapture,
 			&i.CaptureState,
+			&i.RecoveryWaitCause,
 			&i.RunStatus,
 			&i.CheckpointRef,
 			&i.CheckpointTip,
@@ -1059,6 +1062,7 @@ SELECT w.id AS worker_id, h.state, h.inventory_guarded,
         WHERE c.hold_id = h.id
         ORDER BY c.created_at DESC, c.id DESC
         LIMIT 1), '')::text AS capture_state,
+    COALESCE(r.recovery_wait_cause, '')::text AS recovery_wait_cause,
     COALESCE(r.status, '')::text AS run_status
 FROM workers w
 JOIN recovery_custody_holds h ON h.live_worker_id = w.id AND h.user_id = w.user_id
@@ -1072,6 +1076,7 @@ type ListOpenCustodyHoldsForWorkersRow struct {
 	InventoryGuarded    bool      `json:"inventory_guarded"`
 	HasAvailableCapture bool      `json:"has_available_capture"`
 	CaptureState        string    `json:"capture_state"`
+	RecoveryWaitCause   string    `json:"recovery_wait_cause"`
 	RunStatus           string    `json:"run_status"`
 }
 
@@ -1092,6 +1097,7 @@ func (q *Queries) ListOpenCustodyHoldsForWorkers(ctx context.Context, workerIds 
 			&i.InventoryGuarded,
 			&i.HasAvailableCapture,
 			&i.CaptureState,
+			&i.RecoveryWaitCause,
 			&i.RunStatus,
 		); err != nil {
 			return nil, err

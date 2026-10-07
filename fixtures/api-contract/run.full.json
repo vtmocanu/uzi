@@ -1,4 +1,19 @@
 {
+  "worker_recovery": {
+    "episode": 1,
+    "automatic_requeue_limit": 1,
+    "episode_used": 1,
+    "episode_remaining": 1,
+    "evidence": {
+      "checkpoint_tip": "x",
+      "available_capture": true,
+      "publication_uncertain": true,
+      "capture_uncertain": true,
+      "custody_uncertain": true,
+      "unknown": true,
+      "recorded_at": "2020-01-02T03:04:05Z"
+    }
+  },
   "id": "x",
   "repo_id": "x",
   "forge_type": "x",

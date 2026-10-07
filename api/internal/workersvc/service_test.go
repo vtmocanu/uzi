@@ -1302,15 +1302,23 @@ func (f *fakeStore) PromotePoolWaitRun(_ context.Context, arg store.PromotePoolW
 func (f *fakeStore) ConsumeRunInputs(context.Context, uuid.UUID) ([]store.ConsumeRunInputsRow, error) {
 	return f.consumeRows, nil
 }
-func (f *fakeStore) FailWorkerRunsOverCap(_ context.Context, arg store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
+func (f *fakeStore) FailWorkerRunsOverCap(_ context.Context, arg store.FailWorkerRunsOverCapParams) ([]store.WorkerRecoveryDisposition, error) {
 	f.failOverCap = &arg
 	f.callOrder = append(f.callOrder, "fail_over_cap")
-	return f.orphanFailedRuns, nil
+	rows := make([]store.WorkerRecoveryDisposition, 0, len(f.orphanFailedRuns))
+	for _, id := range f.orphanFailedRuns {
+		rows = append(rows, store.WorkerRecoveryDisposition{ID: id, Status: "failed"})
+	}
+	return rows, nil
 }
-func (f *fakeStore) FailAttestedFinalizeRunsOverCap(_ context.Context, arg store.FailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error) {
+func (f *fakeStore) FailAttestedFinalizeRunsOverCap(_ context.Context, arg store.FailAttestedFinalizeRunsOverCapParams) ([]store.WorkerRecoveryDisposition, error) {
 	f.failAttested = &arg
 	f.callOrder = append(f.callOrder, "fail_attested")
-	return f.attestedFailedRuns, nil
+	rows := make([]store.WorkerRecoveryDisposition, 0, len(f.attestedFailedRuns))
+	for _, id := range f.attestedFailedRuns {
+		rows = append(rows, store.WorkerRecoveryDisposition{ID: id, Status: "failed"})
+	}
+	return rows, nil
 }
 func (f *fakeStore) RequeueAttestedFinalizeRuns(_ context.Context, arg store.RequeueAttestedFinalizeRunsParams) ([]store.RequeueAttestedFinalizeRunsRow, error) {
 	f.requeueAttested = &arg

@@ -1433,6 +1433,8 @@ UPDATE runs SET
     -- stale_requeue_generation = claim_generation, so leaving a stale value here could refund a
     -- requeue_count charged against a generation this claim has already replaced.
     stale_requeue_generation = NULL,
+    -- Historical exhaustion evidence describes the released flight, not this fresh claim.
+    worker_recovery_evidence = NULL,
     -- PRD #1809 M6 (D8): a claim starts a new flight, so the previous park's checkpoint-durability
     -- report no longer describes this run. Cleared here AND on every running report
     -- (SetRunRunning) so a later park the worker does not report on (a server-side
@@ -3052,6 +3054,7 @@ FOR UPDATE;
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.status = 'recovery_wait' AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_retry_not_before <= @now
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
@@ -3102,6 +3105,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE runs.status = 'recovery_wait' AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_retry_not_before <= @now
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
@@ -3152,6 +3156,7 @@ WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -3199,6 +3204,7 @@ UPDATE runs SET
     updated_at = now()
 WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
       SELECT 1 FROM locked_checks cc
@@ -5616,7 +5622,7 @@ WITH locked AS (
 ), candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
 WHERE runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND runs.requeue_count >= @max_requeues
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
   AND runs.worker_id IN (SELECT id FROM locked)
   -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
   AND (runs.kind = 'chat'
@@ -5646,7 +5652,7 @@ JOIN parent_mapping mapping ON mapping.run_id = runs.id
 CROSS JOIN parent_lock_set locks
 
 WHERE runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND runs.requeue_count >= @max_requeues
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
   AND runs.worker_id IN (SELECT id FROM locked)
   -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
   AND (runs.kind = 'chat'
@@ -5689,7 +5695,7 @@ WITH locked AS (
 ), candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-      AND runs.requeue_count >= @max_requeues
+      AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
       AND runs.worker_id IN (SELECT id FROM locked)
       AND (runs.kind = 'chat'
            OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
@@ -5722,7 +5728,7 @@ WITH locked AS (
     WHERE runs.id IN (SELECT id FROM candidates)
       AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
       AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-      AND runs.requeue_count >= @max_requeues
+      AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
       AND runs.worker_id IN (SELECT id FROM locked)
       AND (runs.kind = 'chat'
            OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
@@ -5741,7 +5747,7 @@ WITH locked AS (
     SELECT runs.* FROM locked_targets runs CROSS JOIN target_lock_set locks
     WHERE runs.id = ANY(locks.ids)
       AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-      AND runs.requeue_count >= @max_requeues
+      AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
       AND runs.worker_id IN (SELECT id FROM locked)
       AND (runs.kind = 'chat'
            OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
@@ -5769,10 +5775,10 @@ WITH locked AS (
       )
 )
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
-    status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE @failure_reason END,
+    status = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'recovery_wait' ELSE 'failed' END, status_since = now(), failure_reason = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN NULL ELSE CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE @failure_reason END END,
     -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
-    fail_origin = 'worker_lost',
-    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    fail_origin = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN NULL ELSE 'worker_lost' END,
+    move_pending_since = CASE WHEN NOT COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) AND runs.issue_iid IS NOT NULL THEN now() END, finished_at = CASE WHEN NOT COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() END,
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
     milestones_agents = NULL,
@@ -5781,11 +5787,18 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    recovery_wait_cause = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'worker_requeue_exhausted' END,
+    worker_recovery_evidence = @exhaustion_evidence::jsonb->runs.id::text->'evidence',
+    recovery_retry_not_before = NULL, stale_requeue_generation = NULL,
+    claim_released_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.claim_released_at END,
+    released_worker_id = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN runs.worker_id ELSE runs.released_worker_id END,
+    released_worker_nonce = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN (SELECT snapshot_register_nonce FROM workers WHERE id = runs.worker_id) ELSE runs.released_worker_nonce END,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
 FROM eligible_candidates candidate
-WHERE runs.id = candidate.run_id
+WHERE runs.claim_released_at IS NULL AND runs.id = candidate.run_id
   AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND runs.requeue_count >= @max_requeues
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
   AND runs.worker_id IN (SELECT id FROM locked)
   -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
   AND (runs.kind = 'chat'
@@ -5814,7 +5827,7 @@ WITH locked AS (
 ), candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-      AND runs.requeue_count < @max_requeues
+      AND (runs.requeue_count - runs.requeue_episode_baseline) < @max_requeues
       AND runs.worker_id IN (SELECT id FROM locked)
       AND (runs.kind = 'chat'
            OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
@@ -5866,7 +5879,7 @@ WITH locked AS (
           JOIN locked_parents lead ON lead.id = exiting.id
           WHERE cc.checker_run_id = mapping.run_id
             AND lead.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-              AND lead.requeue_count < @max_requeues
+              AND (lead.requeue_count - lead.requeue_episode_baseline) < @max_requeues
               AND lead.worker_id IN (SELECT id FROM locked)
               AND (lead.kind = 'chat'
                      OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
@@ -5901,7 +5914,7 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = runs.re
 FROM eligible_candidates candidate
 WHERE runs.id = candidate.run_id
   AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND runs.requeue_count < @max_requeues
+  AND (runs.requeue_count - runs.requeue_episode_baseline) < @max_requeues
   AND runs.worker_id IN (SELECT id FROM locked)
   -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
   AND (runs.kind = 'chat'
@@ -5928,7 +5941,7 @@ WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
 WHERE runs.worker_id = @worker_id
   AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND runs.requeue_count >= @max_requeues
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
   -- PRD #1390 D11: register's orphan fail honours the terminal-pending lease + pending_overflow
   -- closure exactly as the stale-worker passes do (chat-exempt, D10) — a fresh worker process
   -- must not fail its own run whose outcome is journaled and about to be replayed (#1391).
@@ -5960,7 +5973,7 @@ CROSS JOIN parent_lock_set locks
 
 WHERE runs.worker_id = @worker_id
   AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND runs.requeue_count >= @max_requeues
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
   -- PRD #1390 D11: register's orphan fail honours the terminal-pending lease + pending_overflow
   -- closure exactly as the stale-worker passes do (chat-exempt, D10) — a fresh worker process
   -- must not fail its own run whose outcome is journaled and about to be replayed (#1391).
@@ -5986,7 +5999,7 @@ WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.worker_id = @worker_id
       AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-      AND runs.requeue_count >= @max_requeues
+      AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
       AND (runs.kind = 'chat'
            OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
                            WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
@@ -6019,7 +6032,7 @@ WITH candidates AS MATERIALIZED (
       AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
       AND runs.worker_id = @worker_id
       AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-      AND runs.requeue_count >= @max_requeues
+      AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
       AND (runs.kind = 'chat'
            OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
                            WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
@@ -6038,7 +6051,7 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = ANY(locks.ids)
       AND runs.worker_id = @worker_id
       AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-      AND runs.requeue_count >= @max_requeues
+      AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
       AND (runs.kind = 'chat'
            OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
                            WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
@@ -6065,10 +6078,10 @@ WITH candidates AS MATERIALIZED (
       )
 )
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
-    status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE @failure_reason END,
+    status = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'recovery_wait' ELSE 'failed' END, status_since = now(), failure_reason = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN NULL ELSE CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE @failure_reason END END,
     -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
-    fail_origin = 'worker_lost',
-    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    fail_origin = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN NULL ELSE 'worker_lost' END,
+    move_pending_since = CASE WHEN NOT COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) AND runs.issue_iid IS NOT NULL THEN now() END, finished_at = CASE WHEN NOT COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() END,
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
     milestones_agents = NULL,
@@ -6077,12 +6090,19 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    recovery_wait_cause = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'worker_requeue_exhausted' END,
+    worker_recovery_evidence = @exhaustion_evidence::jsonb->runs.id::text->'evidence',
+    recovery_retry_not_before = NULL, stale_requeue_generation = NULL,
+    claim_released_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.claim_released_at END,
+    released_worker_id = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN runs.worker_id ELSE runs.released_worker_id END,
+    released_worker_nonce = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN (SELECT snapshot_register_nonce FROM workers WHERE id = runs.worker_id) ELSE runs.released_worker_nonce END,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
 FROM eligible_candidates candidate
-WHERE runs.id = candidate.run_id
+WHERE runs.claim_released_at IS NULL AND runs.id = candidate.run_id
   AND runs.worker_id = @worker_id
   AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND runs.requeue_count >= @max_requeues
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
   -- PRD #1390 D11: register's orphan fail honours the terminal-pending lease + pending_overflow
   -- closure exactly as the stale-worker passes do (chat-exempt, D10) — a fresh worker process
   -- must not fail its own run whose outcome is journaled and about to be replayed (#1391).
@@ -6094,7 +6114,7 @@ WHERE runs.id = candidate.run_id
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
   AND runs.id = ANY(@locked_run_ids::uuid[])
-RETURNING runs.id;
+RETURNING runs.id, runs.status;
 
 -- Attested finalize-resume passes (issue #1742) -----------------------------
 --
@@ -6130,8 +6150,8 @@ WITH candidates AS MATERIALIZED (
                   WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                     AND a.terminal_pending_until > now()
                     AND a.claim_generation = runs.claim_generation)
-  AND (runs.requeue_count < @max_requeues
-       OR (runs.requeue_count >= @max_requeues AND @max_requeues > 0 AND runs.finalize_resume_generation IS NULL))
+  AND ((runs.requeue_count - runs.requeue_episode_baseline) < @max_requeues
+       OR ((runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues AND @max_requeues > 0 AND runs.worker_recovery_episode = 0 AND runs.finalize_resume_generation IS NULL))
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -6189,13 +6209,13 @@ WITH candidates AS MATERIALIZED (
                   WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                     AND a.terminal_pending_until > now()
                     AND a.claim_generation = runs.claim_generation)
-  AND (requeue_count < @max_requeues
-       OR (requeue_count >= @max_requeues AND @max_requeues > 0 AND finalize_resume_generation IS NULL)))
+  AND ((requeue_count - requeue_episode_baseline) < @max_requeues
+       OR ((requeue_count - requeue_episode_baseline) >= @max_requeues AND @max_requeues > 0 AND worker_recovery_episode = 0 AND finalize_resume_generation IS NULL)))
             )
       )
 )
 UPDATE runs SET status = 'queued', status_since = now(), requeue_count = runs.requeue_count + 1,
-    finalize_resume_generation = CASE WHEN runs.requeue_count >= @max_requeues
+    finalize_resume_generation = CASE WHEN (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues AND @max_requeues > 0 AND runs.worker_recovery_episode = 0 AND runs.finalize_resume_generation IS NULL
                                       THEN runs.claim_generation
                                       ELSE runs.finalize_resume_generation END,
     health = 'ok', health_reason = NULL, health_since = NULL,
@@ -6213,8 +6233,8 @@ WHERE runs.worker_id = @worker_id
                   WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                     AND a.terminal_pending_until > now()
                     AND a.claim_generation = runs.claim_generation)
-  AND (runs.requeue_count < @max_requeues
-       OR (runs.requeue_count >= @max_requeues AND @max_requeues > 0 AND runs.finalize_resume_generation IS NULL))
+  AND ((runs.requeue_count - runs.requeue_episode_baseline) < @max_requeues
+       OR ((runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues AND @max_requeues > 0 AND runs.worker_recovery_episode = 0 AND runs.finalize_resume_generation IS NULL))
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
       SELECT 1 FROM locked_checks cc
@@ -6223,7 +6243,7 @@ WHERE runs.worker_id = @worker_id
       WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
         AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
   ))
-RETURNING runs.id, (runs.finalize_resume_generation IS NOT NULL AND runs.finalize_resume_generation = runs.claim_generation)::boolean AS allowance_used;
+RETURNING runs.id, (runs.worker_recovery_episode = 0 AND @max_requeues > 0 AND (runs.requeue_count - runs.requeue_episode_baseline) > @max_requeues AND runs.finalize_resume_generation IS NOT NULL AND runs.finalize_resume_generation = runs.claim_generation)::boolean AS allowance_used;
 
 -- name: LockFailAttestedFinalizeRunsOverCap :many
 -- Lock parent leads before checker targets; the separate writer reads a fresh custody snapshot.
@@ -6241,8 +6261,8 @@ WHERE runs.worker_id = @worker_id
                   WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                     AND a.terminal_pending_until > now()
                     AND a.claim_generation = runs.claim_generation)
-  AND runs.requeue_count >= @max_requeues
-  AND NOT (@max_requeues > 0 AND runs.finalize_resume_generation IS NULL)
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
+  AND NOT (@max_requeues > 0 AND runs.worker_recovery_episode = 0 AND runs.finalize_resume_generation IS NULL)
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -6274,8 +6294,8 @@ WHERE runs.worker_id = @worker_id
                   WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                     AND a.terminal_pending_until > now()
                     AND a.claim_generation = runs.claim_generation)
-  AND runs.requeue_count >= @max_requeues
-  AND NOT (@max_requeues > 0 AND runs.finalize_resume_generation IS NULL)
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
+  AND NOT (@max_requeues > 0 AND runs.worker_recovery_episode = 0 AND runs.finalize_resume_generation IS NULL)
   AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
 ORDER BY runs.id
 FOR UPDATE OF runs;
@@ -6295,8 +6315,8 @@ WITH candidates AS MATERIALIZED (
                   WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                     AND a.terminal_pending_until > now()
                     AND a.claim_generation = runs.claim_generation)
-  AND runs.requeue_count >= @max_requeues
-  AND NOT (@max_requeues > 0 AND runs.finalize_resume_generation IS NULL)
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
+  AND NOT (@max_requeues > 0 AND runs.worker_recovery_episode = 0 AND runs.finalize_resume_generation IS NULL)
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -6330,8 +6350,8 @@ WITH candidates AS MATERIALIZED (
                   WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                     AND a.terminal_pending_until > now()
                     AND a.claim_generation = runs.claim_generation)
-  AND runs.requeue_count >= @max_requeues
-  AND NOT (@max_requeues > 0 AND runs.finalize_resume_generation IS NULL)
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
+  AND NOT (@max_requeues > 0 AND runs.worker_recovery_episode = 0 AND runs.finalize_resume_generation IS NULL)
 
     ORDER BY runs.id
     FOR UPDATE OF runs
@@ -6351,8 +6371,8 @@ WITH candidates AS MATERIALIZED (
                   WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                     AND a.terminal_pending_until > now()
                     AND a.claim_generation = runs.claim_generation)
-  AND runs.requeue_count >= @max_requeues
-  AND NOT (@max_requeues > 0 AND runs.finalize_resume_generation IS NULL)
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
+  AND NOT (@max_requeues > 0 AND runs.worker_recovery_episode = 0 AND runs.finalize_resume_generation IS NULL)
 
 ), eligible_parent_exits AS MATERIALIZED (
     -- Shared by parent writes and suppression; 00302 owns cancellation only
@@ -6372,14 +6392,21 @@ WITH candidates AS MATERIALIZED (
       )
 )
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
-    status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE @failure_reason END,
-    fail_origin = 'worker_lost',
-    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    status = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'recovery_wait' ELSE 'failed' END, status_since = now(), failure_reason = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN NULL ELSE CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE @failure_reason END END,
+    fail_origin = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN NULL ELSE 'worker_lost' END,
+    move_pending_since = CASE WHEN NOT COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) AND runs.issue_iid IS NOT NULL THEN now() END, finished_at = CASE WHEN NOT COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() END,
     milestones_in_progress = NULL,
     milestones_agents = NULL,
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     credential_switch_requested_at = NULL, credential_switch_generation = NULL,
     health = 'ok', health_reason = NULL, health_since = NULL,
+    recovery_wait_cause = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'worker_requeue_exhausted' END,
+    worker_recovery_evidence = @exhaustion_evidence::jsonb->runs.id::text->'evidence',
+    recovery_retry_not_before = NULL, stale_requeue_generation = NULL,
+    claim_released_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.claim_released_at END,
+    released_worker_id = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN runs.worker_id ELSE runs.released_worker_id END,
+    released_worker_nonce = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN (SELECT snapshot_register_nonce FROM workers WHERE id = runs.worker_id) ELSE runs.released_worker_nonce END,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
 WHERE runs.worker_id = @worker_id
   AND runs.claim_released_at IS NULL
@@ -6393,11 +6420,11 @@ WHERE runs.worker_id = @worker_id
                   WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
                     AND a.terminal_pending_until > now()
                     AND a.claim_generation = runs.claim_generation)
-  AND runs.requeue_count >= @max_requeues
-  AND NOT (@max_requeues > 0 AND runs.finalize_resume_generation IS NULL)
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
+  AND NOT (@max_requeues > 0 AND runs.worker_recovery_episode = 0 AND runs.finalize_resume_generation IS NULL)
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND runs.id = ANY(@locked_run_ids::uuid[])
-RETURNING runs.id;
+RETURNING runs.id, runs.status;
 
 -- name: RequeueWorkerRuns :many
 -- Within budget → re-queued to this same worker (affinity), which then re-claims
@@ -6410,7 +6437,7 @@ WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.worker_id = @worker_id
       AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-      AND runs.requeue_count < @max_requeues
+      AND (runs.requeue_count - runs.requeue_episode_baseline) < @max_requeues
       AND (runs.kind = 'chat'
            OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
                            WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
@@ -6462,7 +6489,7 @@ WITH candidates AS MATERIALIZED (
           WHERE cc.checker_run_id = mapping.run_id
             AND lead.worker_id = @worker_id
               AND lead.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-              AND lead.requeue_count < @max_requeues
+              AND (lead.requeue_count - lead.requeue_episode_baseline) < @max_requeues
               AND (lead.kind = 'chat'
                      OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
                                      WHERE a.run_id = lead.id AND a.worker_id = lead.worker_id AND a.terminal_pending
@@ -6493,7 +6520,7 @@ FROM eligible_candidates candidate
 WHERE runs.id = candidate.run_id
   AND runs.worker_id = @worker_id
   AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND runs.requeue_count < @max_requeues
+  AND (runs.requeue_count - runs.requeue_episode_baseline) < @max_requeues
   -- PRD #1390 D11: register's orphan requeue honours the terminal-pending lease + pending_overflow
   -- closure exactly as the stale-worker passes do (chat-exempt, D10) — a fresh worker process
   -- must not requeue its own run whose outcome is journaled and about to be replayed (#1391).
@@ -6707,7 +6734,7 @@ UPDATE runs r SET
                THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - r.status_since))::int)
                ELSE 0 END,
     requeue_count = CASE WHEN r.stale_requeue_generation = r.claim_generation
-                         THEN GREATEST(r.requeue_count - 1, 0) ELSE r.requeue_count END,
+                         THEN GREATEST(r.requeue_count - 1, r.requeue_episode_baseline) ELSE r.requeue_count END,
     stale_requeue_generation = NULL,
     updated_at = now()
 FROM worker_active_runs a
@@ -6740,7 +6767,7 @@ WITH candidates AS MATERIALIZED (
   AND runs.status = 'running'
   AND runs.claim_released_at IS NULL
   AND runs.status_since < @missing_cutoff
-  AND runs.requeue_count >= @max_requeues
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
   AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
     AND runs.completion_attempts = 0
     AND runs.started_at < (sqlc.arg('now')::timestamptz
@@ -6783,7 +6810,7 @@ CROSS JOIN parent_lock_set locks
   AND runs.status = 'running'
   AND runs.claim_released_at IS NULL
   AND runs.status_since < @missing_cutoff
-  AND runs.requeue_count >= @max_requeues
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
   AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
     AND runs.completion_attempts = 0
     AND runs.started_at < (sqlc.arg('now')::timestamptz
@@ -6822,7 +6849,7 @@ WITH candidates AS MATERIALIZED (
   AND runs.status = 'running'
   AND runs.claim_released_at IS NULL
   AND runs.status_since < @missing_cutoff
-  AND runs.requeue_count >= @max_requeues
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
   AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
     AND runs.completion_attempts = 0
     AND runs.started_at < (sqlc.arg('now')::timestamptz
@@ -6870,7 +6897,7 @@ WITH candidates AS MATERIALIZED (
   AND runs.status = 'running'
   AND runs.claim_released_at IS NULL
   AND runs.status_since < @missing_cutoff
-  AND runs.requeue_count >= @max_requeues
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
   AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
     AND runs.completion_attempts = 0
     AND runs.started_at < (sqlc.arg('now')::timestamptz
@@ -6904,7 +6931,7 @@ WITH candidates AS MATERIALIZED (
   AND runs.status = 'running'
   AND runs.claim_released_at IS NULL
   AND runs.status_since < @missing_cutoff
-  AND runs.requeue_count >= @max_requeues
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
   AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
     AND runs.completion_attempts = 0
     AND runs.started_at < (sqlc.arg('now')::timestamptz
@@ -6943,21 +6970,28 @@ WITH candidates AS MATERIALIZED (
       )
 )
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
-    status = 'failed', status_since = now(), failure_reason = CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE @failure_reason END,
-    fail_origin = 'worker_lost',
-    move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    status = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'recovery_wait' ELSE 'failed' END, status_since = now(), failure_reason = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN NULL ELSE CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE @failure_reason END END,
+    fail_origin = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN NULL ELSE 'worker_lost' END,
+    move_pending_since = CASE WHEN NOT COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) AND runs.issue_iid IS NOT NULL THEN now() END, finished_at = CASE WHEN NOT COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() END,
     milestones_in_progress = NULL,
     milestones_agents = NULL,
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     credential_switch_requested_at = NULL, credential_switch_generation = NULL,
     health = 'ok', health_reason = NULL, health_since = NULL,
+    recovery_wait_cause = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'worker_requeue_exhausted' END,
+    worker_recovery_evidence = @exhaustion_evidence::jsonb->runs.id::text->'evidence',
+    recovery_retry_not_before = NULL, stale_requeue_generation = NULL,
+    claim_released_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.claim_released_at END,
+    released_worker_id = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN runs.worker_id ELSE runs.released_worker_id END,
+    released_worker_nonce = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN (SELECT snapshot_register_nonce FROM workers WHERE id = runs.worker_id) ELSE runs.released_worker_nonce END,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
 WHERE runs.worker_id = @worker_id
   AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
   AND runs.status = 'running'
   AND runs.claim_released_at IS NULL                        -- #1247 fence
   AND runs.status_since < @missing_cutoff                   -- fence: stale window + one heartbeat interval, D4
-  AND runs.requeue_count >= @max_requeues
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
   AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
     AND runs.completion_attempts = 0
     AND runs.started_at < (sqlc.arg('now')::timestamptz
@@ -6995,7 +7029,7 @@ WITH candidates AS MATERIALIZED (
   AND runs.status = 'running'
   AND runs.claim_released_at IS NULL
   AND runs.status_since < @missing_cutoff
-  AND runs.requeue_count < @max_requeues
+  AND (runs.requeue_count - runs.requeue_episode_baseline) < @max_requeues
   AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
     AND runs.completion_attempts = 0
     AND runs.started_at < (sqlc.arg('now')::timestamptz
@@ -7067,7 +7101,7 @@ WITH candidates AS MATERIALIZED (
   AND runs.status = 'running'
   AND runs.claim_released_at IS NULL
   AND runs.status_since < @missing_cutoff
-  AND runs.requeue_count < @max_requeues
+  AND (runs.requeue_count - runs.requeue_episode_baseline) < @max_requeues
   AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
     AND runs.completion_attempts = 0
     AND runs.started_at < (sqlc.arg('now')::timestamptz
@@ -7103,7 +7137,7 @@ WHERE runs.worker_id = @worker_id
   AND runs.status = 'running'
   AND runs.claim_released_at IS NULL                        -- #1247 fence
   AND runs.status_since < @missing_cutoff                   -- fence: stale window + one heartbeat interval, D4
-  AND runs.requeue_count < @max_requeues
+  AND (runs.requeue_count - runs.requeue_episode_baseline) < @max_requeues
   AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
     AND runs.completion_attempts = 0
     AND runs.started_at < (sqlc.arg('now')::timestamptz
@@ -10492,3 +10526,80 @@ WHERE child.id = cc.checker_run_id AND lead.id = cc.lead_run_id
   AND lead.harness <> cc.checker_harness
   AND cc.stage = 'plan' AND cc.verdict = 'pending' AND now() < cc.deadline_at
 RETURNING cc.*;
+
+-- name: ResumeWorkerRecoveryEpisode :one
+-- Explicit owner release of an exhaustion hold is the only episode-renewal writer.
+-- Keep the wall budget, custody and released incarnation; bank the held interval.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.user_id = @user_id
+  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause = 'worker_requeue_exhausted'
+  AND (runs.started_at IS NULL OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+          - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), locked_checks AS MATERIALIZED (
+    SELECT cc.* FROM cross_checks cc
+    JOIN locked_parents lead ON lead.id = cc.lead_run_id
+    CROSS JOIN parent_lock_set locks
+    WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
+      AND cc.lead_run_id = ANY(locks.ids)
+      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.deadline_at > now()
+      AND lead.status IN ('claimed', 'running')
+      AND lead.claim_released_at IS NULL
+      AND lead.claim_generation = cc.lead_claim_generation
+    ORDER BY cc.lead_run_id
+    FOR UPDATE OF cc
+), checker_lock_set AS MATERIALIZED (
+    SELECT array_agg(checker_run_id) AS ids FROM locked_checks
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
+UPDATE runs SET
+    status                = 'queued',
+    status_since          = now(),
+    budget_paused_seconds = runs.budget_paused_seconds
+        + GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int),
+    -- Drop obsolete affinity while preserving the incarnation captured by the park.
+    worker_id = CASE WHEN runs.claim_released_at IS NOT NULL THEN NULL ELSE runs.worker_id END,
+    hold_reason = NULL,
+    hold_captured_head = NULL,
+    worker_recovery_episode = runs.worker_recovery_episode + 1,
+    requeue_episode_baseline = runs.requeue_count,
+    stale_requeue_generation = NULL, worker_recovery_evidence = NULL,
+    recovery_wait_cause = NULL, recovery_retry_not_before = NULL,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at            = now()
+WHERE runs.id = @id AND runs.user_id = @user_id
+  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause = 'worker_requeue_exhausted'
+  -- Refuse a resume with no remaining wall budget; extending does not itself release this hold.
+  AND (runs.started_at IS NULL OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+          - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  AND (runs.kind <> 'cross_check' OR EXISTS (
+      SELECT 1 FROM locked_checks cc
+      JOIN locked_parents lead ON lead.id = cc.lead_run_id
+      CROSS JOIN checker_lock_set checks
+      WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
+        AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
+  ))
+RETURNING runs.id, runs.user_id, runs.status;

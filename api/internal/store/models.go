@@ -993,6 +993,9 @@ type Run struct {
 	IssueSavedBody            pgtype.Text        `json:"issue_saved_body"`
 	IssueInputReason          pgtype.Text        `json:"issue_input_reason"`
 	AutoApproveBlockedReasons []string           `json:"auto_approve_blocked_reasons"`
+	WorkerRecoveryEpisode     int64              `json:"worker_recovery_episode"`
+	RequeueEpisodeBaseline    int32              `json:"requeue_episode_baseline"`
+	WorkerRecoveryEvidence    []byte             `json:"worker_recovery_evidence"`
 }
 
 type RunCompletionAttempt struct {

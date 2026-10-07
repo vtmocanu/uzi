@@ -417,7 +417,7 @@ type Config struct {
 	// it INSTEAD of QuestionTimeoutSeconds for the completion hold. Shipped in the claim like the
 	// other worker-enforced timers. Default 900s.
 	CompletionHoldWindowSeconds int
-	RunMaxRequeues              int           // worker-death re-queues allowed before a run is failed
+	RunMaxRequeues              int           // automatic worker-death requeues allowed per owner recovery episode (zero disables automatic requeues)
 	WorkerHeartbeatInterval     time.Duration // how often a worker heartbeats
 	WorkerHeartbeatStale        time.Duration // no heartbeat past this ⇒ worker offline + runs re-queued
 	DiskPressureThreshold       float64       // PRD #837 M4: used/total fraction in (0,1] at/above which a worker's self-reported volume counts as under disk pressure (display/lifecycle-only)

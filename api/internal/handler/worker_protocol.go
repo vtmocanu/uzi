@@ -1325,7 +1325,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// refusal cap was reached.
 		if reason, ok := workersvc.GatePresentationRefusalReason(err); ok {
 			httpx.JSON(w, http.StatusConflict, map[string]any{
-				"run":    runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock()),
+				"run":    runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues),
 				"reason": reason,
 			})
 			return
@@ -1342,7 +1342,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// bodies cannot drift or swap; a non-forge-park error returns ok=false and falls through.
 		if reason, ok := forgeParkRefusalReason(err); ok {
 			httpx.JSON(w, http.StatusConflict, map[string]any{
-				"run":    runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock()),
+				"run":    runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues),
 				"reason": reason,
 			})
 			return
@@ -1355,7 +1355,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			// disposition shape) so the worker fills the missing seqs and re-reports. SetState returns
 			// the run alongside the error.
 			httpx.JSON(w, http.StatusConflict, map[string]any{
-				"run":    runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock()),
+				"run":    runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues),
 				"reason": "messages_pending",
 			})
 		case errors.Is(err, workersvc.ErrGapUnrecoverable):
@@ -1375,7 +1375,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			// worker that ignores the extra field still treats it as "changed nothing"); the
 			// disposition is what distinguishes a stale claim from a benign no-op.
 			httpx.JSON(w, http.StatusConflict, map[string]any{
-				"run":         runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock()),
+				"run":         runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues),
 				"disposition": "stale_claim",
 			})
 		case errors.Is(err, workersvc.ErrRunNotOwned):
@@ -1445,7 +1445,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 // the worker may still be holding, so both must carry the switch signal. It is deliberately NOT
 // used for the stale_claim 409 disposition, which already tells the worker to STOP the flight.
 func (h *Handler) workerStateAck(r *http.Request, run store.Run) map[string]any {
-	ack := map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())}
+	ack := map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)}
 	if sig := workersvc.PendingCredentialSwitchSignal(run); sig != nil {
 		ack["credential_switch"] = sig
 	}
@@ -1934,10 +1934,10 @@ func (h *Handler) WorkerRunCompletionHold(w http.ResponseWriter, r *http.Request
 		// The hold's guard refused (wrong status, not interlocked, or no recorded completion
 		// attempt): 409 with the run's REAL status, which the worker reads off the body and
 		// retains the run on (it cleans up ONLY on a `paused` ack).
-		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
+		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)})
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)})
 }
 
 // WorkerRunWallPark is the wall-clock PARK endpoint (PRD #1497 M1, D4/D15): the worker reports it
@@ -1992,10 +1992,10 @@ func (h *Handler) WorkerRunWallPark(w http.ResponseWriter, r *http.Request) {
 	if !applied {
 		// The park was refused (the owner extended in the window, or the run moved on): 409 with the
 		// run's REAL status, which the worker reads off the body to clear the wall mode and restart.
-		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
+		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)})
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)})
 }
 
 // workerMemoryToDTO maps a stored entry to the worker-facing DTO. It carries run_id

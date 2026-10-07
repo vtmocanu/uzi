@@ -1028,13 +1028,13 @@ type Store interface {
 	StampCompletionBudgetExhausted(ctx context.Context, arg store.StampCompletionBudgetExhaustedParams) (int64, error)
 	FailRunsOfStaleWorkersOverCap(ctx context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error)
 	RequeueRunsOfStaleWorkers(ctx context.Context, arg store.RequeueRunsOfStaleWorkersParams) ([]store.RequeueRunsOfStaleWorkersRow, error)
-	FailWorkerRunsOverCap(ctx context.Context, arg store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error)
+	FailWorkerRunsOverCap(ctx context.Context, arg store.FailWorkerRunsOverCapParams) ([]store.WorkerRecoveryDisposition, error)
 	// RequeueWorkerRuns returns the re-queued run ids (PRD #1390 M2a) so Register can publish
 	// each transition post-commit, mirroring the sweeper's RequeueRunsOfStaleWorkers twin.
 	RequeueWorkerRuns(ctx context.Context, arg store.RequeueWorkerRunsParams) ([]uuid.UUID, error)
 	// The attested finalize-resume pair (issue #1742), run by Register before the ordinary orphan
 	// pass for the (run, exact generation) pairs a restarting worker attests.
-	FailAttestedFinalizeRunsOverCap(ctx context.Context, arg store.FailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error)
+	FailAttestedFinalizeRunsOverCap(ctx context.Context, arg store.FailAttestedFinalizeRunsOverCapParams) ([]store.WorkerRecoveryDisposition, error)
 	RequeueAttestedFinalizeRuns(ctx context.Context, arg store.RequeueAttestedFinalizeRunsParams) ([]store.RequeueAttestedFinalizeRunsRow, error)
 
 	// Run-health detector (PRD #47): the per-tick active-run scan, the per-running-run
@@ -2306,12 +2306,13 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	if snapshot != nil {
 		finalizeOffered = len(snapshot.FinalizeResume)
 	}
-	var finalizeFailed, finalizeRequeued []uuid.UUID
+	var finalizeFailed []store.WorkerRecoveryDisposition
+	var finalizeRequeued []uuid.UUID
 	finalizeAllowance := 0
 	// runAttested runs the attested pass on q (the tx-bound or the plain queries). No-op without a
 	// valid list.
 	runAttested := func(q interface {
-		FailAttestedFinalizeRunsOverCap(ctx context.Context, arg store.FailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error)
+		FailAttestedFinalizeRunsOverCap(ctx context.Context, arg store.FailAttestedFinalizeRunsOverCapParams) ([]store.WorkerRecoveryDisposition, error)
 		RequeueAttestedFinalizeRuns(ctx context.Context, arg store.RequeueAttestedFinalizeRunsParams) ([]store.RequeueAttestedFinalizeRunsRow, error)
 	}) error {
 		if !finalizeOK {
@@ -2449,13 +2450,13 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 			"worker_id", wkr.ID.String(), "offered_entries", len(snapshot.Active),
 			"offered_pending_entries", pendingCount, "offered_pending_overflow", snapshot.PendingOverflow,
 			"applied", snapshotApplied, "overflow_lease_applied", snapshotApplied && snapshot.PendingOverflow,
-			"orphan_failed", len(orphanFailed), "orphan_requeued", len(requeued),
+			"orphan_failed", recoveryDispositionCount(orphanFailed, "failed"), "orphan_parked", recoveryDispositionCount(orphanFailed, "recovery_wait"), "orphan_requeued", len(requeued),
 			"finalize_resume_offered", finalizeOffered, "finalize_requeued", len(finalizeRequeued),
-			"finalize_allowance_used", finalizeAllowance, "finalize_failed", len(finalizeFailed))
+			"finalize_allowance_used", finalizeAllowance, "finalize_failed", recoveryDispositionCount(finalizeFailed, "failed"), "finalize_parked", recoveryDispositionCount(finalizeFailed, "recovery_wait"))
 	} else {
 		slog.Info("worker register orphan recovery committed",
 			"worker_id", wkr.ID.String(), "snapshot_offered", false,
-			"orphan_failed", len(orphanFailed), "orphan_requeued", len(requeued))
+			"orphan_failed", recoveryDispositionCount(orphanFailed, "failed"), "orphan_parked", recoveryDispositionCount(orphanFailed, "recovery_wait"), "orphan_requeued", len(requeued))
 	}
 	s.publishRegisterOutcome(ctx, finalizeFailed, orphanFailed, finalizeRequeued, requeued)
 	return store.Worker(row), nonce, nil
@@ -2464,8 +2465,8 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 // publishRegisterOutcome merges the attested finalize-resume transitions with the ordinary orphan
 // pass (failed and requeued separately) and publishes them post-commit; both Register branches
 // (tx and tx-less) call it so the merge is one code path.
-func (s *Service) publishRegisterOutcome(ctx context.Context, finalizeFailed, orphanFailed, finalizeRequeued, requeued []uuid.UUID) {
-	failed := append(append([]uuid.UUID{}, finalizeFailed...), orphanFailed...)
+func (s *Service) publishRegisterOutcome(ctx context.Context, finalizeFailed, orphanFailed []store.WorkerRecoveryDisposition, finalizeRequeued, requeued []uuid.UUID) {
+	failed := append(append([]store.WorkerRecoveryDisposition{}, finalizeFailed...), orphanFailed...)
 	queued := append(append([]uuid.UUID{}, finalizeRequeued...), requeued...)
 	s.publishRegisterSweeps(ctx, failed, queued)
 }
@@ -2475,10 +2476,12 @@ func (s *Service) publishRegisterOutcome(ctx context.Context, finalizeFailed, or
 // register-time requeue/fail reached no live channel — before, only the judge saw the fails)
 // and maybeEnqueueJudgeByID for the committed-terminal fails (PRD #46 Decision 2, the same
 // worker-lost runs the sweeper funnels). Both are best-effort and never fail the register.
-func (s *Service) publishRegisterSweeps(ctx context.Context, failed, requeued []uuid.UUID) {
-	for _, id := range failed {
-		s.publishSwept(id, "failed")
-		s.maybeEnqueueJudgeByID(ctx, id)
+func (s *Service) publishRegisterSweeps(ctx context.Context, failed []store.WorkerRecoveryDisposition, requeued []uuid.UUID) {
+	for _, row := range failed {
+		s.publishSwept(row.ID, row.Status)
+		if row.Status == "failed" {
+			s.maybeEnqueueJudgeByID(ctx, row.ID)
+		}
 	}
 	for _, id := range requeued {
 		s.publishSwept(id, "queued")
@@ -2697,7 +2700,9 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 	}
 	for _, r := range missingFailed {
 		s.publishSwept(r.ID, r.Status)
-		s.maybeEnqueueJudgeByID(ctx, r.ID)
+		if r.Status == "failed" {
+			s.maybeEnqueueJudgeByID(ctx, r.ID)
+		}
 	}
 	for _, r := range missingRequeued {
 		s.publishSwept(r.ID, r.Status)

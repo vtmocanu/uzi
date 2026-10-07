@@ -48,7 +48,11 @@ func (q *Queries) FailRunsOfStaleWorkersOverCap(ctx context.Context, arg FailRun
 		if err != nil {
 			return nil, err
 		}
-		return qtx.failRunsOfStaleWorkersOverCapLocked(ctx, failRunsOfStaleWorkersOverCapLockedParams{FailureReason: arg.FailureReason, MaxRequeues: arg.MaxRequeues, FailCutoff: arg.FailCutoff, LockedRunIds: ids})
+		evidence, err := qtx.classifyWorkerExhaustion(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+		return qtx.failRunsOfStaleWorkersOverCapLocked(ctx, failRunsOfStaleWorkersOverCapLockedParams{FailureReason: arg.FailureReason, MaxRequeues: arg.MaxRequeues, FailCutoff: arg.FailCutoff, LockedRunIds: ids, ExhaustionEvidence: evidence})
 	})
 }
 
@@ -59,8 +63,8 @@ type FailWorkerRunsOverCapParams struct {
 }
 
 // FailWorkerRunsOverCap locks workers before runs and rechecks the failure predicate on a fresh snapshot.
-func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
-	return withWorkerLostLocks(ctx, q, func(qtx *Queries) ([]uuid.UUID, error) {
+func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsOverCapParams) ([]WorkerRecoveryDisposition, error) {
+	return withWorkerLostLocks(ctx, q, func(qtx *Queries) ([]WorkerRecoveryDisposition, error) {
 		if arg.WorkerID.Valid {
 			if _, err := qtx.GetWorkerForUpdate(ctx, uuid.UUID(arg.WorkerID.Bytes)); err != nil {
 				return nil, err
@@ -70,7 +74,20 @@ func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsO
 		if err != nil {
 			return nil, err
 		}
-		return qtx.failWorkerRunsOverCapLocked(ctx, failWorkerRunsOverCapLockedParams{FailureReason: arg.FailureReason, WorkerID: arg.WorkerID, MaxRequeues: arg.MaxRequeues, LockedRunIds: ids})
+		evidence, err := qtx.classifyWorkerExhaustion(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+		rows, err := qtx.failWorkerRunsOverCapLocked(ctx, failWorkerRunsOverCapLockedParams{FailureReason: arg.FailureReason, WorkerID: arg.WorkerID, MaxRequeues: arg.MaxRequeues, LockedRunIds: ids, ExhaustionEvidence: evidence})
+		if err != nil {
+			return nil, err
+		}
+		result := make([]WorkerRecoveryDisposition, 0, len(rows))
+		for _, row := range rows {
+			result = append(result, WorkerRecoveryDisposition{ID: row.ID, Status: row.Status})
+		}
+		return result, nil
+
 	})
 }
 
@@ -83,8 +100,8 @@ type FailAttestedFinalizeRunsOverCapParams struct {
 }
 
 // FailAttestedFinalizeRunsOverCap locks workers before runs and rechecks the failure predicate on a fresh snapshot.
-func (q *Queries) FailAttestedFinalizeRunsOverCap(ctx context.Context, arg FailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error) {
-	return withWorkerLostLocks(ctx, q, func(qtx *Queries) ([]uuid.UUID, error) {
+func (q *Queries) FailAttestedFinalizeRunsOverCap(ctx context.Context, arg FailAttestedFinalizeRunsOverCapParams) ([]WorkerRecoveryDisposition, error) {
+	return withWorkerLostLocks(ctx, q, func(qtx *Queries) ([]WorkerRecoveryDisposition, error) {
 		if arg.WorkerID.Valid {
 			if _, err := qtx.GetWorkerForUpdate(ctx, uuid.UUID(arg.WorkerID.Bytes)); err != nil {
 				return nil, err
@@ -94,7 +111,20 @@ func (q *Queries) FailAttestedFinalizeRunsOverCap(ctx context.Context, arg FailA
 		if err != nil {
 			return nil, err
 		}
-		return qtx.failAttestedFinalizeRunsOverCapLocked(ctx, failAttestedFinalizeRunsOverCapLockedParams{FailureReason: arg.FailureReason, WorkerID: arg.WorkerID, RunIds: arg.RunIds, ClaimGenerations: arg.ClaimGenerations, MaxRequeues: arg.MaxRequeues, LockedRunIds: ids})
+		evidence, err := qtx.classifyWorkerExhaustion(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+		rows, err := qtx.failAttestedFinalizeRunsOverCapLocked(ctx, failAttestedFinalizeRunsOverCapLockedParams{FailureReason: arg.FailureReason, WorkerID: arg.WorkerID, RunIds: arg.RunIds, ClaimGenerations: arg.ClaimGenerations, MaxRequeues: arg.MaxRequeues, LockedRunIds: ids, ExhaustionEvidence: evidence})
+		if err != nil {
+			return nil, err
+		}
+		result := make([]WorkerRecoveryDisposition, 0, len(rows))
+		for _, row := range rows {
+			result = append(result, WorkerRecoveryDisposition{ID: row.ID, Status: row.Status})
+		}
+		return result, nil
+
 	})
 }
 
@@ -121,6 +151,10 @@ func (q *Queries) FailRunsMissingFromSnapshot(ctx context.Context, arg FailRunsM
 		if err != nil {
 			return nil, err
 		}
-		return qtx.failRunsMissingFromSnapshotLocked(ctx, failRunsMissingFromSnapshotLockedParams{FailureReason: arg.FailureReason, WorkerID: arg.WorkerID, MissingCutoff: arg.MissingCutoff, MaxRequeues: arg.MaxRequeues, Now: arg.Now, GlobalTimeoutSeconds: arg.GlobalTimeoutSeconds, LockedRunIds: ids})
+		evidence, err := qtx.classifyWorkerExhaustion(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+		return qtx.failRunsMissingFromSnapshotLocked(ctx, failRunsMissingFromSnapshotLockedParams{FailureReason: arg.FailureReason, WorkerID: arg.WorkerID, MissingCutoff: arg.MissingCutoff, MaxRequeues: arg.MaxRequeues, Now: arg.Now, GlobalTimeoutSeconds: arg.GlobalTimeoutSeconds, LockedRunIds: ids, ExhaustionEvidence: evidence})
 	})
 }

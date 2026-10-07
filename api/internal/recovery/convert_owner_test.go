@@ -45,9 +45,32 @@ func TestDeriveHoldAttention(t *testing.T) {
 		{"capturing beats a terminal run", row("open", "preparing", "completed", false), attentionCapturing},
 		{"needs_action beats a live run", row("open", "needs_action", "running", false), attentionNeedsAction},
 	}
+	for _, tc := range []struct {
+		name string
+		row  store.ListCustodyHoldsForOwnerRow
+		want string
+	}{
+		{"exhausted no archive", row("open", "", "recovery_wait", false), attentionSourceOnly},
+		{"exhausted available wins", row("open", "needs_action", "recovery_wait", true), attentionArchiveReady},
+		{"exhausted preparing wins", row("open", "preparing", "recovery_wait", false), attentionCapturing},
+		{"exhausted uploading wins", row("open", "uploading", "recovery_wait", false), attentionCapturing},
+		{"exhausted needs action wins", row("open", "needs_action", "recovery_wait", false), attentionNeedsAction},
+		{"exhausted released", row("released", "", "recovery_wait", false), attentionReleased},
+		{"exhausted discarded", row("discarded", "", "recovery_wait", false), attentionDiscarded},
+	} {
+		tc.row.RecoveryWaitCause = custodyRecoveryCauseWorkerRequeueExhausted
+		cases = append(cases, tc)
+	}
+	ordinary := row("open", "", "recovery_wait", false)
+	ordinary.RecoveryWaitCause = "worker_restart"
+	cases = append(cases, struct {
+		name string
+		row  store.ListCustodyHoldsForOwnerRow
+		want string
+	}{"ordinary recovery wait", ordinary, attentionActive})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			batch := store.ListOpenCustodyHoldsForWorkersRow{State: tc.row.State, HasAvailableCapture: tc.row.HasAvailableCapture, CaptureState: tc.row.CaptureState, RunStatus: tc.row.RunStatus}
+			batch := store.ListOpenCustodyHoldsForWorkersRow{State: tc.row.State, HasAvailableCapture: tc.row.HasAvailableCapture, CaptureState: tc.row.CaptureState, RunStatus: tc.row.RunStatus, RecoveryWaitCause: tc.row.RecoveryWaitCause}
 			if ownerHoldAttentionInput(tc.row) != batchHoldAttentionInput(batch) {
 				t.Fatal("owner/batch adapter inputs differ")
 			}

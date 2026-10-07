@@ -35,6 +35,11 @@ func TestCustodyDecisionsByWorker(t *testing.T) {
 		{State: "open", RunStatus: "running"},
 		{State: "open", RunStatus: "queued"},
 		{State: "open", RunStatus: "paused"},
+		{State: "open", RunStatus: "recovery_wait", RecoveryWaitCause: "worker_restart"},
+		{State: "open", RunStatus: "recovery_wait", RecoveryWaitCause: custodyRecoveryCauseWorkerRequeueExhausted},
+		{State: "open", RunStatus: "recovery_wait", RecoveryWaitCause: custodyRecoveryCauseWorkerRequeueExhausted, HasAvailableCapture: true},
+		{State: "open", RunStatus: "recovery_wait", RecoveryWaitCause: custodyRecoveryCauseWorkerRequeueExhausted, CaptureState: "preparing"},
+		{State: "open", RunStatus: "recovery_wait", RecoveryWaitCause: custodyRecoveryCauseWorkerRequeueExhausted, CaptureState: "needs_action"},
 		{State: "open", CaptureState: "needs_action", RunStatus: "running"},
 		{State: "open", CaptureState: "needs_action", RunStatus: "failed"},
 		{State: "open", RunStatus: "failed"},
@@ -45,10 +50,10 @@ func TestCustodyDecisionsByWorker(t *testing.T) {
 		{State: "released", CaptureState: "needs_action"},
 		{State: "discarded"},
 	} {
-		st.rows = append(st.rows, store.ListOpenCustodyHoldsForWorkersRow{WorkerID: a, State: input.State, HasAvailableCapture: input.HasAvailableCapture, CaptureState: input.CaptureState, RunStatus: input.RunStatus})
+		st.rows = append(st.rows, store.ListOpenCustodyHoldsForWorkersRow{WorkerID: a, State: input.State, HasAvailableCapture: input.HasAvailableCapture, CaptureState: input.CaptureState, RunStatus: input.RunStatus, RecoveryWaitCause: input.RecoveryWaitCause})
 	}
 	counts, err = svc.CustodyDecisionsByWorker(context.Background(), []uuid.UUID{a, b})
-	if err != nil || !reflect.DeepEqual(counts, map[uuid.UUID]int{a: 4, b: 0}) || st.calls != 1 || !reflect.DeepEqual(st.ids, []uuid.UUID{a, b}) {
+	if err != nil || !reflect.DeepEqual(counts, map[uuid.UUID]int{a: 6, b: 0}) || st.calls != 1 || !reflect.DeepEqual(st.ids, []uuid.UUID{a, b}) {
 		t.Fatalf("batch = %v, %v; calls=%d ids=%v", counts, err, st.calls, st.ids)
 	}
 	st.err = errors.New("partial read failed")

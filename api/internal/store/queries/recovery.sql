@@ -620,6 +620,7 @@ SELECT
         WHERE c.hold_id = h.id
         ORDER BY c.created_at DESC, c.id DESC
         LIMIT 1), '')::text AS capture_state,
+    COALESCE(r.recovery_wait_cause, '')::text AS recovery_wait_cause,
     COALESCE(r.status, '')::text AS run_status,
     cr.ref AS checkpoint_ref,
     cr.tip AS checkpoint_tip,
@@ -889,6 +890,7 @@ SELECT w.id AS worker_id, h.state, h.inventory_guarded,
         WHERE c.hold_id = h.id
         ORDER BY c.created_at DESC, c.id DESC
         LIMIT 1), '')::text AS capture_state,
+    COALESCE(r.recovery_wait_cause, '')::text AS recovery_wait_cause,
     COALESCE(r.status, '')::text AS run_status
 FROM workers w
 JOIN recovery_custody_holds h ON h.live_worker_id = w.id AND h.user_id = w.user_id

@@ -92,10 +92,10 @@ func (p *protocolStore) SetRunCompleted(context.Context, store.SetRunCompletedPa
 
 // Register path: orphan recovery + the online transition. The counts are
 // irrelevant to the wire-decode test, so they return 0/empty.
-func (p *protocolStore) FailWorkerRunsOverCap(context.Context, store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
+func (p *protocolStore) FailWorkerRunsOverCap(context.Context, store.FailWorkerRunsOverCapParams) ([]store.WorkerRecoveryDisposition, error) {
 	return nil, nil
 }
-func (p *protocolStore) FailAttestedFinalizeRunsOverCap(context.Context, store.FailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error) {
+func (p *protocolStore) FailAttestedFinalizeRunsOverCap(context.Context, store.FailAttestedFinalizeRunsOverCapParams) ([]store.WorkerRecoveryDisposition, error) {
 	return nil, nil
 }
 func (p *protocolStore) RequeueAttestedFinalizeRuns(context.Context, store.RequeueAttestedFinalizeRunsParams) ([]store.RequeueAttestedFinalizeRunsRow, error) {
