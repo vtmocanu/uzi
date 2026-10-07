@@ -1315,7 +1315,8 @@ describe("m1 credential-free owner cancel", () => {
 
   const cases = [
     ...["clean", "dirty", "untracked", "committed", "replace", "forged-stat", "lossy-path", "hidden", "assume", "skip", "filter",
-      "symlink-dangling", "symlink-outside", "symlink-changed", "symlink-file"].map(work => ({ work })),
+      "symlink-dangling", "symlink-outside", "symlink-changed", "symlink-file",
+      "info-exclude", "external-excludes", "exclude-comments", "ignored-node-modules"].map(work => ({ work })),
     ...["wrong", "missing", "retained", "error"].map(release => ({ work: "clean", release })),
     ...["survivors", "unverified", "new-writer"].map(process => ({ work: "clean", process })),
     { work: "clean", docker: "docker_error" },
@@ -1337,11 +1338,11 @@ describe("m1 credential-free owner cancel", () => {
     it(`actual runner owner cancel ${JSON.stringify(scenario)}`, async () => {
       const { work } = scenario;
       // The bounded descriptor reader conservatively refuses unsupported platforms.
-      const shouldRelease = process.platform === "linux" && ["clean", "symlink-dangling", "symlink-outside"].includes(work) && !scenario.release && !scenario.process &&
+      const shouldRelease = process.platform === "linux" && ["clean", "symlink-dangling", "symlink-outside", "exclude-comments", "ignored-node-modules"].includes(work) && !scenario.release && !scenario.process &&
         !scenario.trust && !scenario.inspect && !scenario.drain;
       const api = new FakeApi("cancel-worker");
       const url = await api.listen();
-      const fx = makeFixture();
+      const fx = makeFixture(work === "ignored-node-modules" ? { ".gitignore": "node_modules/\n" } : {});
       const rawName = Buffer.concat([Buffer.from("lossy-"), Buffer.from([0xff]), Buffer.from(".txt")]);
       const twinName = "lossy-\uFFFD.txt";
       const rawPath = (root: string) => Buffer.concat([Buffer.from(root + path.sep), rawName]);
@@ -1386,6 +1387,9 @@ describe("m1 credential-free owner cancel", () => {
       let lifecycle: AbortSignal | undefined;
       let boundaryCalls = 0;
       let bare = "";
+      let excludeBeforeCancel: Buffer | undefined;
+      const externalExclude = path.join(path.dirname(fx.dataDir), "external-excludes");
+      const externalExcludeBytes = Buffer.from("NEW.txt\n");
       const ensureClone = git.ensureClone.bind(git);
       git.ensureClone = async (...args) => { bare = await ensureClone(...args); return bare; };
       const observations: string[] = [];
@@ -1445,7 +1449,12 @@ describe("m1 credential-free owner cancel", () => {
         assert.ok(cancelLogs.some(line => rec(line).msg === "owner cancel Docker teardown"), "Docker teardown is logged before restore inspection");
         assert.equal(observations.includes("owner_cancel_after_inspection"), false, "every restore inspection precedes the final scan");
         observations.push("inspect");
-        return inspect(...args);
+        const result = await inspect(...args);
+        if (excludeBeforeCancel !== undefined) {
+          assert.deepEqual(await fs.readFile(path.join(clone, ".git/info/exclude")), excludeBeforeCancel,
+            "cleanliness inspection preserves exclude bytes");
+        }
+        return result;
       };
       if (scenario.drain === "root") rig.root.reap = async () => ({ ok: false, error: { category: "tool", message: "root survives" } });
       const sendState = client.reportState.bind(client);
@@ -1468,6 +1477,7 @@ describe("m1 credential-free owner cancel", () => {
       const gitInClone = (...args: string[]) => {
         const result = spawnSync("git", ["-C", clone, ...args], { env: gitEnv(), encoding: "utf8" });
         assert.equal(result.status, 0, result.stderr);
+        return result.stdout;
       };
       try {
         await waitFor(() => rig.transport.turnStartCount > 0, "runner provider");
@@ -1487,6 +1497,49 @@ describe("m1 credential-free owner cancel", () => {
             assert.equal(Buffer.byteLength(changedTarget), Buffer.byteLength(linkTarget));
             await fs.symlink(changedTarget, path.join(clone, linkName));
           } else await fs.writeFile(path.join(clone, linkName), "replacement file bytes");
+        }
+        if (["info-exclude", "external-excludes", "exclude-comments", "ignored-node-modules"].includes(work)) {
+          const excludePath = path.join(clone, ".git/info/exclude");
+          const provisionedExclude = await fs.readFile(excludePath);
+          if (process.platform === "linux") {
+            assert.ok(provisionedExclude.toString("utf8").split("\n").includes("/.uzi/scratch/"),
+              "real scratch provisioning supplies the baseline exclude rule");
+          }
+          if (work === "info-exclude") await fs.appendFile(excludePath, "NEW.txt\n");
+          if (work === "external-excludes") {
+            assert.equal(path.isAbsolute(externalExclude), true);
+            assert.equal(path.relative(clone, externalExclude).startsWith(".." + path.sep), true,
+              "fixture-owned external excludes file is outside the clone");
+            await fs.writeFile(externalExclude, externalExcludeBytes);
+            gitInClone("config", "--local", "core.excludesFile", externalExclude);
+          }
+          if (work === "exclude-comments") {
+            const comments = provisionedExclude.toString("utf8").split("\n")
+              .filter(line => line.trim() === "" || line.startsWith("#")).join("\n");
+            assert.ok(comments.includes("#"), "default exclude comments remain");
+            await fs.writeFile(excludePath, comments);
+          }
+          if (work === "ignored-node-modules") {
+            await fs.mkdir(path.join(clone, "node_modules/example"), { recursive: true });
+            await fs.writeFile(path.join(clone, "node_modules/example/index.js"), "module.exports = {};\n");
+            await fs.writeFile(path.join(clone, "node_modules/.package-lock.json"), "{}\n");
+            assert.equal(gitInClone("check-ignore", "-v", "node_modules/example/index.js"),
+              ".gitignore:1:node_modules/\tnode_modules/example/index.js\n");
+          }
+          excludeBeforeCancel = await fs.readFile(excludePath);
+          if (work === "external-excludes" || work === "ignored-node-modules") {
+            assert.deepEqual(excludeBeforeCancel, provisionedExclude, "provisioned exclude remains byte-for-byte unchanged");
+          }
+          if (work === "info-exclude" || work === "external-excludes") {
+            await fs.writeFile(path.join(clone, "NEW.txt"), "unpublished");
+            assert.equal(gitInClone("status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"),
+              "", "ordinary status hides unpublished ignored work");
+            const source = work === "info-exclude" ? ".git/info/exclude" : externalExclude;
+            const line = work === "info-exclude" ? excludeBeforeCancel.toString("utf8").split("\n").indexOf("NEW.txt") + 1 : 1;
+            assert.equal(gitInClone("check-ignore", "-v", "NEW.txt"), `${source}:${line}:NEW.txt\tNEW.txt\n`,
+              "ignore provenance names the intended exclude source");
+          }
+          assert.equal(await git.worktreeHead(clone), startHead, "ignore fixture leaves HEAD unchanged");
         }
         if (work === "dirty") await fs.appendFile(path.join(clone, "README.md"), "changed");
         if (work === "untracked" || work === "hidden") await fs.writeFile(path.join(clone, "NEW.txt"), "unpublished");
@@ -1563,7 +1616,8 @@ describe("m1 credential-free owner cancel", () => {
         const beforeCancel = new Map<string, Buffer>();
         for (const name of ["README.md", "NEW.txt", "RECOVERED.txt", ".gitattributes",
           ...(["forged-stat", "lossy-path"].includes(work) ? [".git/index", ".git/config"] : []),
-          ...(work === "lossy-path" ? [twinName] : [])]) {
+          ...(work === "lossy-path" ? [twinName] : []),
+          ...(excludeBeforeCancel !== undefined ? [".git/info/exclude"] : [])]) {
           const bytes = await fs.readFile(path.join(clone, name)).catch(error => {
             if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
             throw error;
@@ -1578,6 +1632,9 @@ describe("m1 credential-free owner cancel", () => {
         assert.equal(rig.client.releaseCalls.length, 1, "cleanup never releases Codex credentials");
         assert.equal(recoveryGit.fetchCalls, 0, "no PAT fetch");
         assert.equal(recoveryClient.reserveCalls.length, 0, "no archive");
+        if (work === "external-excludes") {
+          assert.deepEqual(await fs.readFile(externalExclude), externalExcludeBytes, "external exclude bytes unchanged after cancellation");
+        }
         assert.equal(releases.length, process.platform === "linux" && (shouldRelease || scenario.release) ? 1 : 0);
         assert.equal(boundaryCalls, 0, "no credentialed cleanup boundary");
         assert.equal(openHolds.has(7), !shouldRelease, "proven-empty cancellation leaves no open own hold");
@@ -1593,6 +1650,9 @@ describe("m1 credential-free owner cancel", () => {
         if (shouldRelease) assert.deepEqual(releases[0], [claim.run_id, 7]);
         else {
           assert.equal((await fs.stat(clone)).isDirectory(), true, "source retained");
+          if (work === "info-exclude" || work === "external-excludes") {
+            assert.equal(await git.worktreeHead(clone), startHead, "retained HEAD unchanged");
+          }
           if (work.startsWith("symlink-")) {
             const leaf = path.join(clone, linkName);
             const retained = await fs.lstat(leaf);
