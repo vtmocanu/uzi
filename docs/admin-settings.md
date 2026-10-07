@@ -196,7 +196,7 @@ required PAT scope, and how a repo gets linked.
 
 | Setting | Default | Controls |
 |---|---|---|
-| `mr_review_trusted_bots` | empty (no bot trusted) | Review bots (CodeRabbit, Greptile and similar) whose MR review comments the [MR rework](./mr-review-watcher.md#trusted-review-bots) lane may read although they are not repo collaborators. A comma-separated list of `<base_url>#<forge_user_id>` entries, for example `https://github.com#136622811`: a canonical `https://host` base, then the bot's numeric user id, never its login. No duplicates, at most 50 entries. Allowlisting only lets a bot's comments be ingested; they stay untrusted data, and a bot's summary or walkthrough note never triggers a rework. |
+| `mr_review_trusted_bots` | empty (no bot trusted) | Review bots (CodeRabbit, Greptile and similar) whose MR review comments the [MR rework](./mr-review-watcher.md#trusted-review-bots) lane may read although they are not repo collaborators. A comma-separated list of `<base_url>#<forge_user_id>` entries, for example `https://github.com#136622811`: a canonical `https://host[:port]` base (an explicit `:443` is accepted and treated as absent when matching), then the bot's numeric user id, never its login. No duplicates, at most 50 entries; "no duplicates" is literal, so equivalent spellings such as `:443` versus none are both accepted. Allowlisting only lets a bot's comments be ingested; they stay untrusted data, and a bot's summary or walkthrough note never triggers a rework. |
 
 Edit it in the **Trusted review bots** card on this page, or through
 `PUT /api/admin/settings` (cookie session only). `uzi admin review-bots` lists

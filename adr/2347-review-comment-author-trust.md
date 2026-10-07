@@ -1,6 +1,6 @@
 # ADR-2347: Author trust for MR review comments
 
-**Status**: Accepted, with one open point: the conditional delay bound departs from the issue's zero-delay acceptance criterion and awaits maintainer confirmation (see below)
+**Status**: Proposed (pending maintainer confirmation of the conditional delay bound, which departs from the issue's zero-delay acceptance criterion; see below)
 **Date**: 2026-10-07
 **Issue**: [#2347](https://github.com/vtmocanu/uzi/issues/2347)
 
@@ -50,7 +50,8 @@ something was held back without any of its content.
 only for a thread id present on an included comment of the run's stored
 snapshot. A wholly withheld thread is therefore a 403. A mixed thread is
 allowed through its eligible comment; the accepted consequence is that
-resolving a mixed GitLab discussion resolves the outsider's notes in it too.
+resolving a mixed thread resolves the outsider's notes in it too (the whole
+discussion on GitLab, the whole review thread on GitHub).
 Forgejo keeps its reply-only, inline-only contract.
 
 **Legacy snapshots.** A snapshot whose version is not 2 predates assessment and
@@ -61,8 +62,14 @@ the issue lane's, so bumping one lane never re-versions the other.
 
 **Pending set.** Unknown actionable comments at or below a new high-water mark
 would be skipped forever once the mark moves. Their ids are kept in
-`mr_rework_ledger.pending_unknown_ids` (at most 200), merged in SQL, a consumed
-id never re-added, and trigger once their author is eligible. An id the
+`mr_rework_ledger.pending_unknown_ids`, merged in SQL, a consumed id never
+re-added, and trigger once their author is eligible. The set holds one id per
+unverified author, that author's newest unknown actionable comment id at or
+below the mark, capped at 10,000 entries; on overflow the oldest ids are kept,
+so a flood arriving after a finding cannot displace it. Displacement needs more
+than 10,000 distinct unverified accounts present at a single fire (documented
+residual). If an author deletes their own representative (newest) comment while
+older unknown ones remain, those older ones fall back to human review. An id the
 snapshot caps evict is dropped (human review is the fallback), including on a
 tick that creates no run.
 
@@ -91,32 +98,39 @@ keeps values monotonic in lock order across sessions, which the guard needs;
 30-second, 200-author assessment, so one hanging forge call costs one slot, not
 the tick.
 
-**Shared-evidence condition.** Eligibility evidence such as the GitHub
-collaborator list is shared across lookups. A tick only
+**Shared-evidence condition.** On GitHub, eligibility evidence (the
+repository-wide collaborator list) is shared across lookups. A tick only
 makes progress for the queue when that shared evidence answered within the
 per-lookup timeout; a tick where it did not is uncounted in the bound below.
+GitLab lookups are per-user calls with no shared evidence, so the condition
+does not apply there; only each lookup's own timeout does.
 
-**Conditional delay bound.** For a waiting author X with R_0 not-eligible
-entries ahead, let A_t be the lookups actually attempted on tick t (logged; only
+**Conditional delay bound.** For a waiting author X with R_0 entries ahead that
+are not eligible (not-eligible or permission-unknown), let A_t be the lookups actually attempted on tick t (logged; only
 A_t <= 200 is unconditional) and E_t the eligible authors ahead. A tick counts
 if shared evidence answered in time and A_t - E_t >= 1. X is attempted on the
 first counted tick k where the sum of (A_t - E_t) over counted ticks reaches
 R_0 + 1; with a constant p = A_t - E_t that is ceil((R_0 + 1) / p) counted
 ticks (R_0 = 2, A = 2: tick 2). X fires on that tick if the other gates pass,
 otherwise keeps its front place. Uncounted ticks never move anyone ahead of X.
-Assumptions: forge calls honor context cancellation; locked queue writes
+Assumptions: X's own lookup answers within the per-lookup timeout on the counted
+tick (otherwise X becomes permission-unknown, re-queues at the back, and the
+bound restarts from its new position); forge calls honor context cancellation; locked queue writes
 succeed; shared evidence arrives within the per-lookup timeout; the connection
 token's rate limit (shared with other MRs) is not exhausted; other MRs don't
 touch this MR's queue (they share only the verdict cache, the rate limit and the
-serial detect loop, about 30 seconds plus one timeout per flooded MR per tick);
+repository's serial detect loop; each MR's assessment has its own 30-second
+deadline, so a flooded or hanging MR can cost up to about 30 seconds of that
+loop per tick, and the poll interval defaults to 1 minute, `FORGE_POLL_INTERVAL`);
 eligible authors are few.
 
 ## Departure from the issue's zero-delay acceptance criterion: pending maintainer confirmation
 
 The issue asks that an outsider flood not delay an eligible finding. This design
-does not meet that literally. It guarantees an eligible finding is **never
-suppressed and never displaced from the snapshot's context**, and **delayed only
-by the conditional bound above**, whose assumptions (forge availability, rate
+does not meet that literally. It guarantees an eligible finding is **not suppressed by an outsider flood below
+10,000 distinct unverified accounts at one fire**, never displaced from the
+snapshot's context by outsider comments, and **delayed only by the conditional
+bound above**, whose assumptions (forge availability, rate
 limit, a few eligible authors ahead) are not under uzi's control. Whether the
 conditional bound is acceptable is a maintainer decision; this change must not
 merge as fully satisfying the criterion until it is confirmed.

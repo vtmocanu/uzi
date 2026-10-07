@@ -24,8 +24,9 @@ agent runs — an issue run, or a [scheduled run](./scheduling.md) (an ad-hoc
 it queues a new `mr_rework` run, auto-approved so it starts working right away:
 
 - the MR's head pipeline is **green**,
-- the review has **settled** (the newest comment is a few minutes old and
-  was written against the current head commit, not a superseded one),
+- the review has **settled** (the newest *eligible* comment is a few minutes
+  old and was written against the current head commit, not a superseded one;
+  withheld comments don't move the debounce or the head check),
 - there's at least one **eligible, actionable** review comment uzi hasn't
   already acted on. Eligible means its author has access to the repository, or
   is a [trusted review bot](#trusted-review-bots) (see [The trust
@@ -122,8 +123,9 @@ Because withheld comments aren't in the snapshot, the same rule covers them:
 a thread whose comments were *all* withheld can't be replied to or resolved
 (the server answers 403). A **mixed thread**, one with at least one eligible
 comment, is allowed through that eligible comment. The catch is that
-resolving a mixed GitLab discussion resolves the whole discussion, including
-the outsider's notes in it. On Forgejo and Gitea only inline threads can be
+resolving a mixed thread resolves the whole thread, including the outsider's
+notes in it: on GitLab the whole discussion, on GitHub the whole review
+thread (the resolve anchor). On Forgejo and Gitea only inline threads can be
 replied to, and nothing can be resolved (see [Forge support](#forge-support)).
 
 ### Runs started before the upgrade
@@ -139,7 +141,8 @@ no review comments and can't reply or resolve; start a fresh
 
 Every uncertain state fails closed. If uzi can't read the settings it needs
 (including the trusted-bot list), the watcher skips that poll tick and an
-on-demand rework is refused with a 409. A permission-unknown comment never
+on-demand rework is refused with a 409 (a different read failure, such as the
+queue or verdict store, is a 500 and equally starts nothing). A permission-unknown comment never
 triggers a rework. An empty eligible snapshot never starts an automatic
 rework, and an on-demand one only when you supply
 [guidance](#rework-on-demand), in which case your own text is the trigger.
@@ -150,11 +153,15 @@ permission unknown` with reason `permission_unknown`, the count and how many
 lookups it attempted, and an on-demand rework returns a 409 whose message
 says the new comments' authors couldn't be verified yet and to try again
 shortly or give guidance. This is a transient state: uzi keeps the unknown
-comment ids on the MR's ledger (up to 200) and fires the rework on a later
-tick once their author checks out as eligible. A comment whose author turns
-out not to be eligible is dropped and never fires. If the review has so many
-comments that the snapshot caps push a remembered id out, it is dropped too
-and falls back to a human noticing it in review.
+comment ids on the MR's ledger and fires the rework on a later tick once
+their author checks out as eligible. The ledger keeps **one id per unverified
+author**: that author's newest unknown actionable comment at or below the
+high-water mark, capped at 10,000 entries. On overflow the **oldest** ids are
+kept, so a flood that arrives after a finding can't displace it. A comment
+whose author turns out not to be eligible is dropped and never fires. Two
+residuals fall back to a human noticing the comment in review: an author who
+deletes their own newest (representative) comment while older unknown ones
+remain, and an id the snapshot caps push out.
 
 ### Fair progress under an outsider flood
 
@@ -169,45 +176,54 @@ is cached for 6 hours (per repository), so the same outsider isn't looked up
 every tick.
 
 What this guarantees, and what it doesn't. An eligible reviewer's finding is
-**never suppressed and never displaced from the agent's context** by a flood
-of outsider comments. It can be **delayed**, and the delay is bounded only
-under the conditions below. Let *R*0 be the number of not-eligible entries
-queued ahead of a waiting author *X* when *X* arrives, *A*t the number of
-lookups actually attempted on tick *t* (this is logged; only *A*t up to 200
-is guaranteed), and *E*t the number of eligible authors ahead of *X*. A tick
-**counts** when the shared eligibility evidence answered within the
-per-lookup timeout and *A*t - *E*t is at least 1. *X* is looked up on the
-first counted tick *k* where the running sum of (*A*t - *E*t) reaches *R*0 +
-1. With a constant *p* = *A*t - *E*t that is ceil((*R*0 + 1) / *p*) counted
-ticks. For example, with 2 not-eligible authors ahead and 2 lookups per tick,
-*X* is looked up on tick 2. On that tick the rework fires if the other gates
-pass, otherwise *X* keeps its place at the front.
+**not suppressed by an outsider flood below 10,000 distinct unverified
+accounts present at a single fire**, and it is never displaced from the
+agent's context by outsider comments. It can be **delayed**, and the delay is
+bounded only under the conditions below. Let *R*0 be the number of entries
+ahead of a waiting author *X* in the queue that are not eligible (not-eligible
+or permission-unknown) when *X* arrives, *A*t the number of lookups actually
+attempted on tick *t* (this is logged; only *A*t up to 200 is guaranteed), and
+*E*t the number of eligible authors ahead of *X*. A tick **counts** when the
+shared eligibility evidence answered within the per-lookup timeout and *A*t -
+*E*t is at least 1. *X* is looked up on the first counted tick *k* where the
+running sum of (*A*t - *E*t) reaches *R*0 + 1. With a constant *p* = *A*t -
+*E*t that is ceil((*R*0 + 1) / *p*) counted ticks. For example, with 2
+not-eligible authors ahead and 2 lookups per tick, *X* is looked up on tick 2.
+On that tick the rework fires if the other gates pass, otherwise *X* keeps its
+place at the front.
 
 The bound assumes:
 
+- *X*'s own lookup answers within the per-lookup timeout on the counted tick.
+  Otherwise *X* becomes permission-unknown, goes to the back of the queue, and
+  the bound restarts from *X*'s new position;
 - forge calls honor cancellation, and queue writes succeed;
-- the shared eligibility evidence (for example GitHub's collaborator list)
-  is available within the per-lookup timeout;
+- the shared eligibility evidence is available within the per-lookup timeout.
+  That condition applies to GitHub, where one repository-wide collaborator
+  list serves every lookup. GitLab lookups are per-user calls with no shared
+  evidence, so only each lookup's own timeout matters there;
 - the connection token's rate limit, shared with every other MR on it, isn't
   exhausted;
 - other MRs don't touch this MR's queue. They share only the verdict cache,
-  the rate limit and the single detector loop (about 30 seconds, plus one
-  lookup timeout per flooded MR, per tick);
+  the rate limit and the repository's serial detect loop. Each MR's assessment
+  has its own 30 second deadline, so a flooded or hanging MR can cost up to
+  about 30 seconds of that loop per tick, and the poll interval defaults to 1
+  minute (`FORGE_POLL_INTERVAL`);
 - eligible authors ahead of *X* are few.
 
 Ticks that don't count never move anyone ahead of *X*.
 
 > **Pending maintainer confirmation.** The originating issue asked that an
 > outsider flood not delay an eligible finding at all. This design instead
-> guarantees the finding is never lost or displaced and is delayed only by the
-> conditional bound above. That departure from the zero-delay criterion is
+> guarantees the finding is not suppressed below 10,000 distinct unverified
+> accounts at one fire and is delayed only by the conditional bound above. That departure from the zero-delay criterion is
 > pending maintainer confirmation before the change merges. The rationale is
 > in [ADR-2347](../adr/2347-review-comment-author-trust.md).
 
 Smaller residuals: an outsider later promoted to collaborator is recognized
 within 6 hours (the cached verdict's lifetime); the cross-type comment-id
 limitation under [Known limitations](#known-limitations) also applies to
-remembered unknown ids; and a stale GitHub collaborator listing can cost a
+remembered unknown ids; the ledger's 10,000-account cap is a documented residual (displacement needs more distinct unverified accounts than that at one fire); and a stale GitHub collaborator listing can cost a
 queue position, which affects fairness only, never who is trusted.
 
 ## Enablement
@@ -373,7 +389,9 @@ after the automatic cap is reached.
   guidance it is refused with a 409. When the reason is that the new comments'
   authors couldn't be verified yet, the 409 says so (access could not be
   verified yet; try again shortly or give guidance), which is worth
-  retrying. If the settings can't be read it is a 409 too. With guidance it
+  retrying. If the settings can't be read it is a 409 too; other failures on
+  the way (for example a queue or verdict read error) answer 500 and still
+  fail closed, starting nothing. With guidance it
   always proceeds, and your guidance is the trigger. The assessment shares the
   automatic watcher's 30 second deadline.
 - **Guidance.** You can attach optional guidance to steer the pass — for

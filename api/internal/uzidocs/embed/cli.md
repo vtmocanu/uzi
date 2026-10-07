@@ -774,10 +774,13 @@ A few worth knowing:
   they are not repo collaborators. It is **read-only by design**: edit the list
   from Admin Settings in the web UI or through the cookie-only
   `PUT /api/admin/settings`. The table has `BASE URL`, `FORGE USER ID` and
-  `STATUS` (`ok`, or `malformed` for a hand-edited entry the server would
-  reject); an empty list prints a line saying third-party bots' comments are
+  `STATUS` (`ok`, or `malformed` when the entry is not parseable as
+  `<url>#<id>`; the CLI is lenient, so an entry the server skips can still show
+  `ok`); an empty list prints a line saying third-party bots' comments are
   withheld. `--json` returns `{source, entries[]}`, each entry with
-  `base_url`, `forge_user_id` (a string), `raw` and `malformed`.
+  `base_url`, `forge_user_id` (a string), `raw` and `malformed`. Fields other
+  than `malformed` are omitted when empty: `ok` entries omit `raw`, malformed
+  entries omit `base_url` and `forge_user_id`, and `source` may be absent.
 - **`admin health` is the instance health document** (PRD #1484) — a closed registry
   of checks over what uzi knows about itself (worker rolls, queue and capacity, the
   controller report, background loops, the database, integrations, housekeeping), with an
