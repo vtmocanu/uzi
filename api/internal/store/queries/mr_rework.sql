@@ -99,7 +99,7 @@ WHERE repo_id = @repo_id::uuid AND ref = @ref;
 -- pending_unknown_ids (issue #2347): the permission-unknown comment ids the mark moved past
 -- (@pending_add, kept only when above the mark the row had BEFORE this update) merged with
 -- the existing set, minus @pending_remove (ids consumed, now not-eligible, or gone); the
--- merge keeps the newest 200 (mr_rework_merge_pending).
+-- merge keeps the oldest 10000 (mr_rework_merge_pending).
 INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water, pending_unknown_ids)
 VALUES (@repo_id::uuid, @ref, 1, @high_water,
         mr_rework_merge_pending('{}'::bigint[], @pending_add::bigint[], @pending_remove::bigint[], 0))

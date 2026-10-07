@@ -496,8 +496,9 @@ type ReviewSnapshotResult struct {
 	Attempted        int
 	ContextAttempted int
 
-	eligibleActionable []int64 // ids of actionable comments kept in the (capped) snapshot
-	unknownActionable  []int64 // ids of actionable comments whose author is unknown
+	eligibleActionable []int64         // ids of actionable comments kept in the (capped) snapshot
+	unknownActionable  []int64         // ids of actionable comments whose author is unknown
+	unknownAuthor      map[int64]int64 // comment id -> author id, for unknownActionable
 	class              map[int64]reviewClass
 	inSnapshot         map[int64]bool
 }
@@ -529,6 +530,7 @@ func (r *ReviewAssessment) Snapshot(ctx context.Context) *ReviewSnapshotResult {
 		ContextAttempted: r.ContextAttempted,
 		class:            make(map[int64]reviewClass, len(r.kept)),
 		inSnapshot:       map[int64]bool{},
+		unknownAuthor:    map[int64]int64{},
 	}
 	snap := &ReviewCommentsSnapshot{Version: ReviewSnapshotVersion, Comments: []ReviewCommentSnapshot{}}
 	var eligible []ReviewCommentSnapshot
@@ -546,6 +548,7 @@ func (r *ReviewAssessment) Snapshot(ctx context.Context) *ReviewSnapshotResult {
 			snap.WithheldUnknown++
 			if r.actionable(c) {
 				res.unknownActionable = append(res.unknownActionable, c.ID)
+				res.unknownAuthor[c.ID] = c.AuthorForgeUserID
 			}
 		}
 	}
@@ -564,6 +567,10 @@ func (r *ReviewAssessment) Snapshot(ctx context.Context) *ReviewSnapshotResult {
 	res.Snapshot = snap
 	return res
 }
+
+// ReviewPendingCap is the size the ledger's pending_unknown_ids is bounded to (the CHECK and
+// the LIMIT of mr_rework_merge_pending). On overflow the database keeps the OLDEST ids.
+const ReviewPendingCap = 10000
 
 // ReviewPlan is what a snapshot means for one ledger row.
 type ReviewPlan struct {
@@ -601,14 +608,34 @@ func (res *ReviewSnapshotResult) Plan(highWater int64, pending []int64) ReviewPl
 		}
 	}
 	newMark := max(highWater, plan.MaxActionableID)
-	plan.PendingAdd = []int64{}
+	// One representative pending id per unverified author: that author's NEWEST unknown
+	// actionable id among those the ledger merge will accept (above the old mark and at or below
+	// the new one, or already pending). Newest because capReviewComments keeps the newest tail:
+	// when the author later resolves eligible the firing run's snapshot is rebuilt from the full
+	// comment list, so one id per author is enough to trigger, and the newest is the one the
+	// caps are most likely to keep. A flood of outsider comments therefore costs one slot per
+	// outsider, not one per comment, and cannot push an eligible author's id out of the set.
+	rep := map[int64]int64{} // author id -> newest allowed unknown actionable id
 	for _, id := range res.unknownActionable {
+		allowed := pendingSet[id] || (id > highWater && id <= newMark)
 		if id > highWater || pendingSet[id] {
 			plan.UnknownNew++
 		}
-		if id <= newMark {
-			plan.PendingAdd = append(plan.PendingAdd, id) // the ledger keeps only ids above its old mark
+		if !allowed {
+			continue
 		}
+		if a := res.unknownAuthor[id]; id > rep[a] {
+			rep[a] = id
+		}
+	}
+	plan.PendingAdd = make([]int64, 0, len(rep))
+	for _, id := range rep {
+		plan.PendingAdd = append(plan.PendingAdd, id)
+	}
+	slices.Sort(plan.PendingAdd)
+	isRep := make(map[int64]bool, len(rep))
+	for _, id := range plan.PendingAdd {
+		isRep[id] = true
 	}
 	plan.PendingRemove = []int64{}
 	plan.PendingEvicted = []int64{}
@@ -622,7 +649,18 @@ func (res *ReviewSnapshotResult) Plan(highWater int64, pending []int64) ReviewPl
 		case cl == classEligible:
 			plan.PendingRemove = append(plan.PendingRemove, id) // evicted by the caps: human review
 			plan.PendingEvicted = append(plan.PendingEvicted, id)
+		case cl == classUnknown:
+			// One id per author across ticks: an older pending id of an author whose newer
+			// representative is being added (or already pending) is superseded. The ledger merge
+			// subtracts removals after the union, so the order of add and remove is safe.
+			if a, ok := res.unknownAuthor[id]; ok && rep[a] != 0 && !isRep[id] {
+				plan.PendingRemove = append(plan.PendingRemove, id)
+			}
 		}
+	}
+	if n := len(pending) + len(plan.PendingAdd) - len(plan.PendingRemove); n > ReviewPendingCap {
+		slog.Warn("workersvc: review pending set would exceed its cap; the ledger keeps the oldest ids",
+			"incoming", n, "cap", ReviewPendingCap)
 	}
 	return plan
 }

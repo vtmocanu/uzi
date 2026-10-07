@@ -162,7 +162,7 @@ func TestStartMRReworkGuidanceProceedsWithEligibleOnlySnapshot(t *testing.T) {
 func TestStartMRReworkEligibleProceedsAndRecordsPending(t *testing.T) {
 	fs, svc, user, runID := reworkFixture(t, 10, nil)
 	res := assessedResult(t, 10, nil,
-		rc(5, unknownAuthor, "old unverified"),    // at/below the mark: ledger filters it, not pending-worthy here
+		rc(5, unknownAuthor, "old unverified"),    // at/below the mark and not pending: not accepted by the ledger, never chosen
 		rc(12, unknownAuthor, "unverified"),       // unknown, below the new mark: becomes pending
 		rc(14, eligibleAuthor, "real feedback"),   // eligible and new
 		rc(20, unknownAuthor, "newer unverified"), // unknown above the new mark: not moved past
@@ -177,12 +177,8 @@ func TestStartMRReworkEligibleProceedsAndRecordsPending(t *testing.T) {
 	if p.HighWater != 14 {
 		t.Fatalf("high_water = %d, want 14 (the eligible actionable id)", p.HighWater)
 	}
-	got := map[int64]bool{}
-	for _, id := range p.PendingAdd {
-		got[id] = true
-	}
-	if !got[12] || !got[5] || got[20] || len(p.PendingAdd) != 2 {
-		t.Fatalf("pending add = %v, want the unknown ids at or below the new mark (5 and 12; the ledger drops 5)", p.PendingAdd)
+	if !slices.Equal(p.PendingAdd, []int64{12}) {
+		t.Fatalf("pending add = %v, want the author's single newest accepted id 12 (5 is at/below the old mark, 20 above the new one)", p.PendingAdd)
 	}
 	if p.PendingRemove == nil {
 		t.Fatal("PendingRemove must be a non-nil (empty) array parameter, never NULL")

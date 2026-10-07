@@ -93,7 +93,10 @@ DELETE FROM mr_review_author_queue
 WHERE repo_id = @repo_id::uuid
   AND ref = @ref
   AND queue_seq <= @observed_max_seq::bigint
-  AND forge_user_id <> ALL (@keep_ids::bigint[]);
+  AND NOT EXISTS (
+      SELECT 1 FROM unnest(COALESCE(@keep_ids::bigint[], '{}'::bigint[])) AS k(id)
+      WHERE k.id = mr_review_author_queue.forge_user_id
+  );
 
 -- name: ListStaleReviewAuthorQueueRefs :many
 -- The refs of one repo that hold queue rows untouched for a long time.

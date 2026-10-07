@@ -788,7 +788,7 @@ type UpsertMRReworkLedgerParams struct {
 // pending_unknown_ids (issue #2347): the permission-unknown comment ids the mark moved past
 // (@pending_add, kept only when above the mark the row had BEFORE this update) merged with
 // the existing set, minus @pending_remove (ids consumed, now not-eligible, or gone); the
-// merge keeps the newest 200 (mr_rework_merge_pending).
+// merge keeps the oldest 10000 (mr_rework_merge_pending).
 func (q *Queries) UpsertMRReworkLedger(ctx context.Context, arg UpsertMRReworkLedgerParams) error {
 	_, err := q.db.Exec(ctx, upsertMRReworkLedger,
 		arg.RepoID,

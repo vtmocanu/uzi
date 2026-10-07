@@ -225,7 +225,10 @@ DELETE FROM mr_review_author_queue
 WHERE repo_id = $1::uuid
   AND ref = $2
   AND queue_seq <= $3::bigint
-  AND forge_user_id <> ALL ($4::bigint[])
+  AND NOT EXISTS (
+      SELECT 1 FROM unnest(COALESCE($4::bigint[], '{}'::bigint[])) AS k(id)
+      WHERE k.id = mr_review_author_queue.forge_user_id
+  )
 `
 
 type PruneReviewAuthorQueueParams struct {

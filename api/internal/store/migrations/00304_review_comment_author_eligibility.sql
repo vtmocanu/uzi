@@ -46,14 +46,19 @@ CREATE TABLE mr_review_author_queue (
 );
 
 -- Comment ids whose author was permission-unknown when the high-water mark moved past them.
--- They stay triggerable once their author resolves eligible; bounded to the newest 200.
+-- They stay triggerable once their author resolves eligible. The set holds one representative
+-- id per unverified author (the Go planner, workersvc ReviewPlan, chooses it), so it is bounded
+-- by distinct authors; the cap of 10000 is a backstop, and on overflow the OLDEST ids are kept
+-- so a flood of newer comments can never evict an earlier, possibly eligible author's id.
 ALTER TABLE mr_rework_ledger
     ADD COLUMN pending_unknown_ids bigint[] NOT NULL DEFAULT '{}',
-    ADD CONSTRAINT mr_rework_ledger_pending_unknown_ids_check CHECK (cardinality(pending_unknown_ids) <= 200);
+    ADD CONSTRAINT mr_rework_ledger_pending_unknown_ids_check CHECK (cardinality(pending_unknown_ids) <= 10000);
 
 -- The one definition of the pending-set update, shared by the automatic upsert and the
--- on-demand atomic create: the newest 200 (largest ids) of (existing UNION added ids above
--- the high-water mark the row had BEFORE this update) minus removed ids.
+-- on-demand atomic create: (existing UNION added ids above the high-water mark the row had
+-- BEFORE this update) EXCEPT removed ids, keeping the OLDEST 10000. EXCEPT is a set operation
+-- (hashed or sorted), so a 10000-id removal stays O(n log n) where an ALL(array) comparison
+-- would be quadratic.
 -- +goose StatementBegin
 CREATE FUNCTION mr_rework_merge_pending(
     existing bigint[],
@@ -65,15 +70,15 @@ LANGUAGE sql IMMUTABLE
 AS $$
     SELECT COALESCE(array_agg(t.x ORDER BY t.x), '{}'::bigint[])
     FROM (
-        SELECT u.x
-        FROM (
+        (
             SELECT unnest(COALESCE(existing, '{}'::bigint[])) AS x
             UNION
             SELECT a AS x FROM unnest(COALESCE(added, '{}'::bigint[])) AS a WHERE a > prior_high_water
-        ) u
-        WHERE u.x <> ALL (COALESCE(removed, '{}'::bigint[]))
-        ORDER BY u.x DESC
-        LIMIT 200
+        )
+        EXCEPT
+        SELECT r AS x FROM unnest(COALESCE(removed, '{}'::bigint[])) AS r
+        ORDER BY x ASC
+        LIMIT 10000
     ) t
 $$;
 -- +goose StatementEnd

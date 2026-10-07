@@ -438,7 +438,7 @@ func TestReviewAuthorStaleEvictionLiveDB(t *testing.T) {
 // TestMRReworkPendingUnknownIDsLiveDB pins the pending-set merge shared by UpsertMRReworkLedger
 // and the atomic on-demand create: only ids above the high-water mark the row had BEFORE the
 // update are added (so a stale writer cannot resurrect an id a faster one consumed), removals
-// apply, and only the newest 200 survive within the column's CHECK.
+// apply, and at most the oldest 10000 survive within the column's CHECK.
 func TestMRReworkPendingUnknownIDsLiveDB(t *testing.T) {
 	ctx, pool, q, repo := reviewAuthorEnv(t)
 	user := uuid.New()
@@ -495,16 +495,43 @@ func TestMRReworkPendingUnknownIDsLiveDB(t *testing.T) {
 		}
 	})
 
-	t.Run("newest 200 survive", func(t *testing.T) {
+	t.Run("overflow keeps the oldest ids", func(t *testing.T) {
 		ref := "agent/issue-pending-3"
 		var add []int64
-		for i := int64(1); i <= 250; i++ {
+		for i := int64(1); i <= 10050; i++ {
 			add = append(add, i)
 		}
-		upsert(ref, 250, add, nil)
+		upsert(ref, 10050, add, nil)
 		got := pending(ref)
-		if len(got) != 200 || got[0] != 51 || got[199] != 250 {
-			t.Fatalf("pending = %d ids from %d to %d, want the newest 200 (51..250)", len(got), got[0], got[len(got)-1])
+		if len(got) != 10000 || got[0] != 1 || got[9999] != 10000 {
+			t.Fatalf("pending = %d ids from %d to %d, want the oldest 10000 (1..10000)", len(got), got[0], got[len(got)-1])
+		}
+		// A later flood cannot evict an older id either.
+		upsert(ref, 20000, []int64{15000, 15001}, nil)
+		if got := pending(ref); len(got) != 10000 || got[0] != 1 || got[9999] != 10000 {
+			t.Fatalf("a later add changed the oldest-10000 set: %d ids %d..%d", len(got), got[0], got[len(got)-1])
+		}
+	})
+
+	t.Run("a 10000-id removal is a set operation", func(t *testing.T) {
+		ref := "agent/issue-pending-5"
+		var add []int64
+		for i := int64(1); i <= 10000; i++ {
+			add = append(add, i)
+		}
+		upsert(ref, 10000, add, nil)
+		var remove []int64
+		for i := int64(1); i <= 10000; i += 2 { // the odd ids, 5000 of them, plus the same again as noise
+			remove = append(remove, i, i)
+		}
+		start := time.Now()
+		upsert(ref, 10001, nil, remove)
+		if d := time.Since(start); d > 5*time.Second {
+			t.Fatalf("removing %d ids took %v, want well under 5s", len(remove), d)
+		}
+		got := pending(ref)
+		if len(got) != 5000 || got[0] != 2 || got[4999] != 10000 {
+			t.Fatalf("pending = %d ids from %d to %d, want the 5000 even ids", len(got), got[0], got[len(got)-1])
 		}
 	})
 
