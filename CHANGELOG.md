@@ -28,6 +28,9 @@ through `[0.52.0]`.)
   After the broker records an actual advance or a potentially sent push with an unknown outcome, reconciliation can confirm the matching forge tip. Later unchanged-tip retries and restarted claims recognize the durable checkpoint without creating live retention or deletion obligations. Unclassified attempts remain pending competing claims; another run's claims and newer checkpoint or slot state prevent adoption. Broker acknowledgements retain their raw success/rejection markers and have a cumulative 1 MiB response limit.
   Migration 00306 is additive, leaves legacy attempts pending without backfill, and retains readiness evidence on rollback. A crash before disposition recording can still leave a landed push pending. The existing terminal stalled-sender hazard remains outside this fix (finding 5b641106-d2cf-4767-813f-e29d0692c228).
 
+- **CI-fix and MR-rework runs stop neutrally when a verified remote branch advance supersedes their work ([#2404](https://github.com/vtmocanu/uzi/issues/2404)).**
+  When the worker proves a stable forward remote advance, further publication stops and the upgraded api records the run as cancelled with a branch-moved stop reason, rather than failed; the activity feed and owner API, board, CLI and web views carry the cause and exact observed remote tip. Publication refusals involving other run kinds, rewritten candidate history or unverifiable checks remain failures, with allowlisted code-only reasons rather than untrusted remote or command-error text. Upgrade the api before workers: older servers retain MR-only handling and a static reason, so CI-fix can still appear failed. The proof covers the observed remote interval, not later writes or whether an earlier push applied; recovery uses existing capture and custody, and a reclaimed run gets a new publication baseline. See [Worker setup](docs/worker-setup.md#publication-refusal-and-branch-supersession).
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed
