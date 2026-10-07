@@ -4725,11 +4725,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				FailOrigin:     pgconv.TextOrNull("plan_rejected"),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
-				// PRD #1247 M5a-1 rework (m6): explicit nil. A fenced (non-chat, generation-bearing)
-				// capability report was already generation-checked under the outer FOR UPDATE fence
-				// upstream, so the per-query fence is redundant here; a legacy or chat report carries no
-				// generation (chat is deliberately fence-exempt), so nil is correct there too. Behavior
-				// preserved.
+				// The stamped report was already generation-checked under the outer FOR UPDATE
+				// fence, so the per-query generation guard is redundant. An unstamped report or
+				// generation-zero chat skips that lock and retains the legacy nil guard.
 				ClaimGeneration: pgtype.Int8{},
 			})
 		case req.BranchMoved != nil && *req.BranchMoved && (owned.Kind == runkind.MRRework || owned.Kind == runkind.CIFix):
