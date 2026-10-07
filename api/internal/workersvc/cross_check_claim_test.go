@@ -24,7 +24,7 @@ func TestPlanCrossCheckClaimInputLiveDB(t *testing.T) {
    VALUES ($1,$2,$3,$4,42,'lead issue','lead body','running','claude',true,true,1)`,
 		leadID, f.userID, original.RepoID, f.workerID)
 	env.exec(`UPDATE runs SET kind='cross_check',issue_iid=NULL,target_run_id=$2,report_only=true,
-   budget_wall_seconds=1800,status='claimed',issue_title='lead issue',issue_description='lead body' WHERE id=$1`, f.runID, leadID)
+   budget_wall_seconds=1800,status='claimed',claim_generation=1,issue_title='lead issue',issue_description='lead body' WHERE id=$1`, f.runID, leadID)
 	candidate := PlanCrossCheckCandidate{PlanMd: "Review this plan", Milestones: json.RawMessage(`[]`),
 		RequiredCapabilities: []string{}, RequiredTools: []string{}, SizeClass: "s",
 		BaseCommit: strings.Repeat("a", 40), PlanningDiff: "diff --git a/file b/file"}

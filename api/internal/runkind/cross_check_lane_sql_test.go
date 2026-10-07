@@ -67,7 +67,7 @@ func TestCrossCheckLaneSQLExclusionParity(t *testing.T) {
 		known[d.file+"/"+d.name] = d
 	}
 	seen := map[string]bool{}
-	for file, path := range map[string]string{
+	for file, path := range map[string]string{ // #nosec G101 -- repository SQL paths, not credential values
 		"runtime":             "../store/queries/runtime.sql",
 		"credential_disabled": "../store/queries/credential_disabled.sql",
 	} {
