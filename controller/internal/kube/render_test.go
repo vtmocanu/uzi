@@ -350,7 +350,7 @@ func TestRenderedPriorityClassName(t *testing.T) {
 }
 
 func TestPVCsSizeFromThePresetAndNixIsFlat(t *testing.T) {
-	for _, tc := range []struct{ size, data string }{{"s", "5Gi"}, {"m", "10Gi"}, {"l", "25Gi"}} {
+	for _, tc := range []struct{ size, data string }{{"s", "5Gi"}, {"m", "25Gi"}, {"l", "25Gi"}} {
 		pvcs := RenderPVCs(testConfig(), desired("abc"), testSpec(t, "base", tc.size))
 		if len(pvcs) != 2 {
 			t.Fatalf("%d pvcs, want 2", len(pvcs))
@@ -2696,5 +2696,37 @@ func TestSeedScriptUsesTarNotCp(t *testing.T) {
 	}
 	if !strings.Contains(script, `[ "$WANT" = "$HAVE" ]`) {
 		t.Error("the skip must additionally require the recorded marker to MATCH the image marker, or a stale store is never reseeded")
+	}
+}
+
+// Issue #2412: both persistent and run-bound M workers get four CPUs of burst
+// headroom and the prior L CPU request. Persistent data grows; run-bound data
+// keeps its independent 20Gi default.
+func TestMediumWorkerResourcesForBothLifetimes(t *testing.T) {
+	for _, ephemeral := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ephemeral=%t", ephemeral), func(t *testing.T) {
+			w := desired("medium-resources")
+			w.Ephemeral = ephemeral
+			dep := RenderDeployment(testConfig(), w, testSpec(t, "base", "m"))
+			resources := dep.Spec.Template.Spec.Containers[0].Resources
+			wantData := "25Gi"
+			if ephemeral {
+				wantData = "20Gi"
+			}
+			claims := pvcSizes(t, testConfig(), w, testSpec(t, "base", "m"))
+			data, ok := claims[dataPVCName(w.ID)]
+			if !ok || data.Cmp(resource.MustParse(wantData)) != 0 {
+				t.Errorf("data PVC = %s (present=%t), want %s", data.String(), ok, wantData)
+			}
+			for name, pair := range map[corev1.ResourceName][2]string{
+				corev1.ResourceCPU:    {"1", "4"},
+				corev1.ResourceMemory: {"8Gi", "12Gi"},
+			} {
+				request, limit := resources.Requests[name], resources.Limits[name]
+				if request.Cmp(resource.MustParse(pair[0])) != 0 || limit.Cmp(resource.MustParse(pair[1])) != 0 {
+					t.Errorf("%s request/limit = %s/%s, want %s/%s", name, request.String(), limit.String(), pair[0], pair[1])
+				}
+			}
+		})
 	}
 }

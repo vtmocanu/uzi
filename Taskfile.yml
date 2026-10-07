@@ -1349,7 +1349,7 @@ tasks:
       - ./scripts/assert-ephemeral-docker-render.sh
 
   render:ephemeral-lease-check:
-    desc: assert the api Deployment renders UZI_EPHEMERAL_LEASE (default 2h, null -> 2h, 0 survives, override) (PRD 2006)
+    desc: assert the api Deployment renders ephemeral lease and size defaults, overrides and validation
     cmds:
       # Standalone, NOT wired into gate:repo/gate: the lint job lacks helm. Offline +
       # non-vacuous — see the script header.

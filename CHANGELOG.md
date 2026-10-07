@@ -32,6 +32,11 @@ through `[0.52.0]`.)
 - **Time since the last failed run on Overview ([#2399](https://github.com/vtmocanu/uzi/issues/2399)).**
   Your usage, Factory total, and the admin per-user breakdown show adaptive elapsed time since the last failed run; the cards also show completed runs since that failure and link to it. The admin usage CLI includes failure recency too; the usage cards omit the Top causes line, group recoverable failures in the legend, align their sections, keep the last-failure detail on one line, and put the value before each summary label.
 
+### Changed
+
+- **Ephemeral workers default to M, with chart-configurable sizing ([#2412](https://github.com/vtmocanu/uzi/issues/2412)).**
+  New ephemeral workers reserve 8Gi instead of 14Gi by default; operators can select S, M or L through `workers.ephemeralDefaultSize`. M now matches the earlier L preset: 1/4 CPU, 8Gi/12Gi memory and 25Gi persistent data; ephemeral data retains its separate 20Gi default. Persistent provisioning still preselects L; existing workers keep their stored size and existing M workers receive the CPU changes on their next controller roll, while existing 10Gi data PVCs stay at that size until reprovisioned.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed

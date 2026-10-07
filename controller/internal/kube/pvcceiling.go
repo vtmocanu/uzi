@@ -70,8 +70,8 @@ const ceilingProbeID = "ceiling-probe"
 // place.
 //
 // THE INVARIANT IS A PER-TIER MINIMUM, NOT AN EQUALITY. The two tiers are separate
-// namespaces with separate LimitRanges; they carry the same 20Gi today and nothing
-// requires that to continue. Each tier's claimants are checked against THAT tier's
+// namespaces with separate LimitRanges configured in deploy/chart/values.yaml.
+// Each tier's claimants are checked against THAT tier's
 // ceiling, so a future divergence is handled by construction. Where one value ever
 // serves both tiers, the invariant is `claimant <= min(restricted, docker)` — the min
 // is the fallback shape, and the per-tier check is the general one.

@@ -260,7 +260,7 @@ api:
     # opt-in. These env knobs only TUNE an already-enabled feature; leave them
     # unset to use config.go's defaults. Uncomment to override.
     # UZI_EPHEMERAL_MAX_PER_USER: "2"          # per-user concurrent-ephemeral cap
-    # UZI_EPHEMERAL_DEFAULT_SIZE: l            # provision size preset: s|m|l
+    # Provision size is chart-owned: use workers.ephemeralDefaultSize below.
     # UZI_EPHEMERAL_PROVISION_DEADLINE: 10m    # GC deadline for never-booted / idle-stolen workers
     # UZI_EPHEMERAL_SATURATION_DELAY: 90s     # debounce before bursting on a saturated (all capable workers full) fleet
     # Job files and product skill sets (PRD #1909). Unset => config.go's defaults
@@ -736,6 +736,13 @@ workers:
   # This is a DIRECT env entry on the api Deployment, so it OVERRIDES a UZI_EPHEMERAL_LEASE
   # set through api.config (envFrom): set it here, not there.
   ephemeralLease: "2h"
+  # Issue #2412: a run-bound worker needs one run's memory headroom, not a
+  # persistent L worker's two-run budget. M reserves 8Gi instead of 14Gi while
+  # both presets request 1 CPU and can burst to 4 CPU. Valid values: s, m, l; invalid values fail
+  # chart rendering. Existing workers keep their stored size; persistent workers
+  # still preselect L. This direct API env entry overrides api.config/envFrom;
+  # set the size here, not in api.config or api.secretEnv.
+  ephemeralDefaultSize: m
   # Where the hosted worker's join-token Secret (worker_token + ca.crt) mounts (issue
   # #1761). Empty keeps the default /run/secrets, and then nothing about the worker pod
   # changes. OpenShift/OKD MUST set it (the render fails otherwise when

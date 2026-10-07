@@ -1794,7 +1794,8 @@ docker tier's own privileged-namespace ruling (Q-B) and Decision 3's
 separate-mount-namespace invariant are recorded in
 `prds/done/83-docker-capable-worker.md`.
 
-New persistent and ephemeral workers default to the large preset. The decision,
+New persistent workers preselect the large preset; new ephemeral workers default
+to medium via `workers.ephemeralDefaultSize`. The decision, partial supersession,
 capacity cost, and preservation of existing stored sizes are recorded in
 [ADR-2240](adr/2240-hosted-worker-default-size.md).
 
