@@ -201,7 +201,7 @@ func TestRunToDTOPlanCrossCheckDiffRefusal(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dto := runToDTO(store.Run{ID: uuid.New(), Status: "awaiting_approval",
-				PlanCrossCheckGateReason: tc.reason, PlanCrossCheckDiffRefusal: tc.sub}, "normal", 0, 0, 0, dtoTestNow)
+				PlanCrossCheckGateReason: tc.reason, PlanCrossCheckDiffRefusal: tc.sub}, "normal", 0, 0, 0, dtoTestNow, 0)
 			got := ""
 			if dto.PlanCrossCheckDiffRefusal != nil {
 				got = *dto.PlanCrossCheckDiffRefusal
