@@ -2212,6 +2212,17 @@ export class RecoveryCoordinator {
     for (const r of records) if (r.inventoryGuarded && typeof r.generation === "number") guarded.add(r.generation);
     // Settled exactly when inventoryCleanupState says so (a covering FINAL ACK), per generation.
     for (const generation of guarded) if (await this.cleanupStateOf(records, generation) !== "acknowledged") out.add(generation);
+    // A missing journal proves nothing: every generation the server still holds open stays
+    // protected. One read per call; a failed read throws, so the caller prunes nothing.
+    if (this.client.hasFeature?.("recovery_inventory_v1")) {
+      const response = await this.client.listRecoveryHolds(runId);
+      if (response.run_id !== runId || !Array.isArray(response.holds)) throw new Error("malformed recovery holds response");
+      for (const h of response.holds) {
+        if (h.inventory_guarded !== true) continue;
+        if (!Number.isSafeInteger(h.generation) || (h.generation as number) <= 0) throw new Error("malformed guarded hold generation");
+        out.add(h.generation as number);
+      }
+    }
     return out;
   }
 

@@ -16,6 +16,7 @@ const H2 = "b".repeat(40);
 it("review probe: an initial guarded pin does not keep an acknowledged generation unsettled", async () => {
   const f = await fixture();
   try {
+    f.state.closeOnRelease = true;
     await f.coordinator.pin({ runId: "run-1", generation: 7, kind: "issue", branch: "task", sourceSha: H, inventoryGuarded: true });
     const record = await f.freeze();
     assert.ok(record);
@@ -24,6 +25,24 @@ it("review probe: an initial guarded pin does not keep an acknowledged generatio
     assert.equal(await f.coordinator.inventoryCleanupState("run-1", 7), "acknowledged");
     assert.deepEqual([...await f.coordinator.unsettledGuardedGenerations("run-1")], [],
       "the covering final ACK settles the generation, including its original pin record");
+  } finally { await f.close(); }
+});
+
+it("review probe: an open guarded hold without a journal must keep its discovery context", async () => {
+  const f = await fixture();
+  try {
+    assert.equal(f.state.open, true);
+    assert.deepEqual([...await f.coordinator.unsettledGuardedGenerations("run-1")], [7],
+      "a missing local journal cannot prove the exact server hold closed");
+  } finally { await f.close(); }
+});
+
+it("issue1924 a failed hold read stops pruning instead of reading as no open hold", async () => {
+  const f = await fixture();
+  try {
+    (f.coordinator as unknown as { client: { listRecoveryHolds: () => Promise<never> } }).client.listRecoveryHolds =
+      async () => { throw new Error("api unavailable"); };
+    await assert.rejects(f.coordinator.unsettledGuardedGenerations("run-1"), /api unavailable/);
   } finally { await f.close(); }
 });
 
@@ -134,6 +153,7 @@ it("issue1924 invalid ownership route body network and HTTP failures never FINAL
 it("issue1924 a guarded generation is unsettled until its FINAL is acknowledged", async () => {
   const f = await fixture();
   try {
+    f.state.closeOnRelease = true;
     const record = await f.freeze();
     assert.ok(record);
     assert.deepEqual([...await f.coordinator.unsettledGuardedGenerations("run-1")], [7]);
@@ -224,7 +244,7 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir()) {
     candidates: [{ sha: H, pinRef: "refs/owed/a", contexts: [structuredClone(context)] }] as OwedCandidate[],
     status: "failed", ownGeneration: 7, ownGuarded: true, feature: true, open: true, expires: "2099-01-01T00:00:00Z",
     ownershipError: undefined as Error | undefined,
-    loseAck: false, wrongAck: false, failProduce: false, now: 1000,
+    loseAck: false, wrongAck: false, closeOnRelease: false, failProduce: false, now: 1000,
     reserveError: undefined as Error | undefined,
     finalError: undefined as Error | undefined,
     oversized: false, cloneHeads: [] as string[], cloneReadable: true,
@@ -275,6 +295,7 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir()) {
       finals.push(args);
       if (state.finalError) throw state.finalError;
       if (state.loseAck) { state.open = false; throw new Error("ACK lost"); }
+      if (state.closeOnRelease && !state.wrongAck) state.open = false; // opt-in: a real server closes the hold
       return { run_id: state.wrongAck ? "other-run" : args[0], generation: 7, released: true, holds_released: 1 };
     },
   };
