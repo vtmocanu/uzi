@@ -890,6 +890,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
 	// Worker-authenticated, generation-fenced plan cross-check protocol.
 	{"POST", "/api/worker/runs/{id}/cross-checks", noLimiter},
+	{"GET", "/api/worker/runs/{id}/cross-checks/plan/latest", noLimiter},
 	{"GET", "/api/worker/runs/{id}/cross-checks/plan/{round}", noLimiter},
 	{"POST", "/api/worker/runs/{id}/cross-check-verdict", noLimiter},
 	// PRD #362 M1: the run-lane executor posts its intent/plan summaries back. Worker
