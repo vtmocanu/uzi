@@ -12237,6 +12237,7 @@ export class RunRunner {
   ): Promise<"released" | "retained"> {
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
+    if (residueQuarantine() !== undefined) return "retained";
     const gen = claim.claim_generation;
     const fenced = () => flight.steering.claimFence() !== undefined;
     if (!Number.isSafeInteger(gen) || gen === undefined || gen <= 0 ||
@@ -12247,9 +12248,11 @@ export class RunRunner {
       const settlement = executor.settleForCredentialFreeCapture
         ? await executor.settleForCredentialFreeCapture(this.codexBoundaryDeadlineMs, "cancel")
         : { kind: "incomplete" as const };
+      if (residueQuarantine() !== undefined) return "retained";
       const initial = await this.quiesceRun(flight, executor, {
         mode: "own", site: "owner_cancel", forceProcessScan: true,
       });
+      if (residueQuarantine() !== undefined) return "retained";
       // ADR1783: every Docker state is observed and logged before restore inspection;
       // neither an unconfirmed teardown nor a Docker error blocks a process/Git proof.
       flight.runLog.info("owner cancel Docker teardown", { ...initial.outcome.docker });
@@ -12258,22 +12261,29 @@ export class RunRunner {
       const trusted = flight.trustedPublishedStart;
       if (!trusted || !/^[0-9a-f]{40}$/.test(trusted)) return "retained";
       const head = await this.git.credentialFreeCancelCleanHead(flight.worktreePath!, flight.barePath!, trusted);
+      if (residueQuarantine() !== undefined) return "retained";
       const present = await this.git.revParse(flight.barePath!, `${trusted}^{commit}`);
+      if (residueQuarantine() !== undefined) return "retained";
       // Finish every Git observation before the final process proof. A newly killed writer
       // invalidates the observations even if the scan then reports quiescent.
       const final = await this.quiesceRun(flight, executor, {
         mode: "own", site: "owner_cancel_after_inspection", processOnly: true, forceProcessScan: true,
       });
+      if (residueQuarantine() !== undefined) return "retained";
       if (head !== trusted || present !== trusted || final.blocked ||
           (process.platform === "linux" && final.outcome.process?.state !== "quiescent") ||
           (final.outcome.process?.killed.length ?? 0) > 0 || fenced()) return "retained";
       // ADR1783 accepts Docker's late-create race. No code-capable Git runs between this
       // final process proof and release; historical published start is not fresh forge evidence.
+      if (residueQuarantine() !== undefined) return "retained";
       const ack = await this.client.releaseRecoveryCustody(flight.runId, gen);
+      if (residueQuarantine() !== undefined) return "retained";
       if (fenced() || ack.run_id !== flight.runId || ack.generation !== gen ||
           ack.released !== true || ack.holds_released !== 1 || ack.retained === true) return "retained";
       await this.recovery.forgetGeneration(flight.runId, gen);
+      if (residueQuarantine() !== undefined) return "retained";
       await this.git.deleteRecoveryPin(flight.barePath!, flight.runId, gen);
+      if (residueQuarantine() !== undefined) return "retained";
       flight.preserveRecoveryClone = false;
       flight.preserveSession = false;
       return "released";

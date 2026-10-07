@@ -72,7 +72,7 @@ import { createCodexTransport, CodexTransportError, type CodexNotification, type
 import type { RunContext, EmittedMessage, Executor, WallParkOutcome, SecretRemediationDecision } from "../src/executor.js";
 import { PauseNowSignal } from "../src/steering.js";
 import { makeRecoveryCoordinator, FakeRecoveryClient, FakeRecoveryGit, commitInTree } from "./codex-reap-fixture.js";
-import { ResidueQuarantinedError, latchResidueQuarantine } from "../src/residue-quarantine.js";
+import { ResidueQuarantinedError, latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import { scanSignals } from "../src/signals.js";
 import { detectRepoAgents } from "../src/repoagents.js";
@@ -1411,15 +1411,27 @@ describe("m1 credential-free owner cancel", () => {
       ["clean", "dirty"].map(work => ({ work, route: "recovery", terminal }))),
     { work: "dirty", route: "deferred", terminal: "statusless" },
     { work: "clean", route: "deferred", terminal: "immediate" },
+    ...["before-cancel", "settle", "inspect", "release-ack"].map(quarantine => ({ work: "clean", quarantine })),
   ] as Array<{ work: string; release?: string; process?: string; docker?: string; trust?: string;
-    inspect?: string; drain?: string; terminal?: string; route?: string }>;
+    inspect?: string; drain?: string; terminal?: string; route?: string; quarantine?: string }>;
   for (const scenario of cases.filter(scenario => (HAS_PROCFS || !scenario.process) &&
-      (scenario.work !== "lossy-path" || process.platform === "linux")))
+      (scenario.work !== "lossy-path" || process.platform === "linux") &&
+      (!scenario.quarantine || process.platform === "linux")))
     it(`actual runner owner cancel ${JSON.stringify(scenario)}`, async () => {
       const { work } = scenario;
       // The bounded descriptor reader conservatively refuses unsupported platforms.
       const shouldRelease = process.platform === "linux" && ["clean", "symlink-dangling", "symlink-outside", "exclude-comments", "ignored-node-modules"].includes(work) && !scenario.release && !scenario.process &&
-        !scenario.trust && !scenario.inspect && !scenario.drain;
+        !scenario.trust && !scenario.inspect && !scenario.drain && !scenario.quarantine;
+      // A release ACK closes server custody even when quarantine retains local evidence.
+      const shouldCloseHold = shouldRelease || scenario.quarantine === "release-ack";
+      const quarantineReached = deferred<void>();
+      const quarantineContinue = deferred<void>();
+      let quarantineSeamReached = false;
+      const pauseForQuarantine = async (): Promise<void> => {
+        quarantineSeamReached = true;
+        quarantineReached.resolve();
+        await quarantineContinue.promise;
+      };
       const api = new FakeApi("cancel-worker");
       const url = await api.listen();
       const fx = makeFixture(work === "ignored-node-modules" ? { ".gitignore": "node_modules/\n" } : {});
@@ -1450,12 +1462,20 @@ describe("m1 credential-free owner cancel", () => {
       const rig = makeRig({ responder: quietResponder });
       rig.deps = { ...rig.deps, deferRegistryTeardown: true };
       const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      let settlingCancel = false;
+      let settlementKind: string | undefined;
+      const reap = rig.root.reap.bind(rig.root);
+      rig.root.reap = async (...args) => {
+        if (scenario.quarantine === "settle" && settlingCancel && !quarantineSeamReached) await pauseForQuarantine();
+        return reap(...args);
+      };
       const client = new WorkerClient(url, "cancel-worker", "test", noopLog, { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
       client.protocolFeatures = ["recovery_release_exact_echo"];
       const releases: unknown[][] = [];
       const openHolds = new Set([7, 8]);
       client.releaseRecoveryCustody = async (...args) => {
         releases.push(args);
+        if (scenario.quarantine === "release-ack") await pauseForQuarantine();
         if (scenario.release === "error") throw new Error("lost release ACK");
         if (scenario.release === "missing") return {} as never;
         if (!scenario.release) openHolds.delete(Number(args[1]));
@@ -1501,7 +1521,14 @@ describe("m1 credential-free owner cancel", () => {
           },
           get safety() { return executor.safety; },
           sandboxesCommands: true,
-          settleForCredentialFreeCapture: (ms, purpose) => executor.settleForCredentialFreeCapture(ms, purpose),
+          settleForCredentialFreeCapture: async (ms, purpose) => {
+            settlingCancel = purpose === "cancel";
+            try {
+              const result = await executor.settleForCredentialFreeCapture(ms, purpose);
+              settlementKind = result.kind;
+              return result;
+            } finally { settlingCancel = false; }
+          },
         },
       }), cancelLog, 20, undefined, {
         recovery: recovery.coord, pollMs: 5, recoveryRetryMs: 5,
@@ -1516,6 +1543,40 @@ describe("m1 credential-free owner cancel", () => {
             docker: { state: scenario.docker === "docker_error" ? "docker_error" : "docker_unconfirmed", removed: [], detail: "late-create race" } };
         },
       });
+      // Delegate both private seams: only execute drives the real flight and disposition.
+      type ObservedFlight = { preserveRecoveryClone: boolean; preserveSession: boolean };
+      const runnerSeams = runner as unknown as {
+        buildFlight: (...args: unknown[]) => ObservedFlight;
+        disposeCredentialFreeOwnerCancel: (...args: unknown[]) => Promise<"released" | "retained">;
+      };
+      let realFlight: ObservedFlight | undefined;
+      let dispositionObserved = false;
+      let disposition: string | undefined;
+      let preservationAfterDisposition: ObservedFlight | undefined;
+      if (scenario.quarantine) {
+        const buildFlight = runnerSeams.buildFlight.bind(runner);
+        runnerSeams.buildFlight = (...args) => { realFlight = buildFlight(...args); return realFlight; };
+        const dispose = runnerSeams.disposeCredentialFreeOwnerCancel.bind(runner);
+        runnerSeams.disposeCredentialFreeOwnerCancel = async (...args) => {
+          const result = await dispose(...args);
+          dispositionObserved = true;
+          disposition = result;
+          preservationAfterDisposition = realFlight && {
+            preserveRecoveryClone: realFlight.preserveRecoveryClone,
+            preserveSession: realFlight.preserveSession,
+          };
+          return result;
+        };
+      }
+      let inspectingCancel = false;
+      const gitReadSeam = git as unknown as {
+        runGitAsRunner: (cwd: string | undefined, args: string[], opts?: { timeoutMs?: number }) => Promise<string>;
+      };
+      const readRunnerGit = gitReadSeam.runGitAsRunner.bind(git);
+      gitReadSeam.runGitAsRunner = async (...args) => {
+        if (scenario.quarantine === "inspect" && inspectingCancel && !quarantineSeamReached) await pauseForQuarantine();
+        return readRunnerGit(...args);
+      };
       if (scenario.trust === "missing") git.originBranchTip = async () => null;
       if (scenario.trust === "recovered") {
         const seed = git.runnerCloneForBranch.bind(git);
@@ -1533,7 +1594,11 @@ describe("m1 credential-free owner cancel", () => {
         check(cancelLogs.some(line => rec(line).msg === "owner cancel Docker teardown"), "Docker teardown is logged before restore inspection");
         check(!observations.includes("owner_cancel_after_inspection"), "every restore inspection precedes the final scan");
         observations.push("inspect");
-        const result = await inspect(...args);
+        inspectingCancel = true;
+        let result: string | null;
+        try { result = await inspect(...args); }
+        finally { inspectingCancel = false; }
+        if (scenario.quarantine === "inspect") check(result === args[2], "genuine inspection proves the trusted clean head");
         if (excludeBeforeCancel !== undefined) {
           check((await fs.readFile(path.join(clone, ".git/info/exclude"))).equals(excludeBeforeCancel),
             "cleanliness inspection preserves exclude bytes");
@@ -1724,8 +1789,29 @@ describe("m1 credential-free owner cancel", () => {
           assert.ok(beforeCancel.has(name), `${name} fixture exists and was read before cancellation`);
         }
         const rawBeforeCancel = work === "lossy-path" ? await fs.readFile(rawPath(clone)) : undefined;
+        const latchQuarantine = () => latchResidueQuarantine({
+          cause: "unattributed runner-uid residue", runId: claim.run_id, site: `owner_cancel_${scenario.quarantine}`,
+        }, noopLog);
+        if (scenario.quarantine === "before-cancel") {
+          quarantineSeamReached = true;
+          latchQuarantine();
+        }
         api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+        if (scenario.quarantine && scenario.quarantine !== "before-cancel") {
+          await withTimeout(quarantineReached.promise, 10000, `quarantine ${scenario.quarantine} seam`);
+          latchQuarantine();
+          quarantineContinue.resolve();
+        }
         await withTimeout(execution, 10000, "runner owner cancel");
+        if (scenario.quarantine) {
+          assert.ok(quarantineSeamReached, "requested quarantine timing reached");
+          assert.ok(realFlight, "delegating buildFlight wrapper captured the real flight");
+          assert.ok(dispositionObserved, "genuine owner-cancel disposition returned");
+          if (scenario.quarantine !== "before-cancel") assert.equal(settlementKind, "observed_empty", "genuine cleanup proved empty");
+          assert.deepEqual({ disposition, ...preservationAfterDisposition }, {
+            disposition: "retained", preserveRecoveryClone: true, preserveSession: true,
+          }, "both preservation flags are true immediately after genuine disposition returns");
+        }
         assert.deepEqual(seamViolations, [], "owner-cancel seam invariants (the runner's catch would otherwise swallow them)");
         assert.equal(lifecycle?.aborted, true, "real steering forwards genuine lifecycle abort");
         assert.equal(rig.client.refreshCalls.length, 0, "cleanup never refreshes");
@@ -1735,20 +1821,22 @@ describe("m1 credential-free owner cancel", () => {
         if (work === "external-excludes") {
           assert.deepEqual(await fs.readFile(externalExclude), externalExcludeBytes, "external exclude bytes unchanged after cancellation");
         }
-        assert.equal(releases.length, process.platform === "linux" && (shouldRelease || scenario.release) ? 1 : 0);
+        assert.equal(releases.length, process.platform === "linux" && (shouldCloseHold || scenario.release) ? 1 : 0);
         assert.equal(boundaryCalls, 0, "no credentialed cleanup boundary");
-        assert.equal(openHolds.has(7), !shouldRelease, "proven-empty cancellation leaves no open own hold");
+        assert.equal(openHolds.has(7), !shouldCloseHold, "exact release ACK closes own server hold independently of local retention");
         assert.equal(openHolds.has(8), true, "sibling hold untouched");
         const records = await recovery.coord.inspect(claim.run_id);
         assert.ok(records.some(record => record.generation === 8), "sibling journal untouched");
         assert.equal(records.some(record => record.generation === 7), !shouldRelease, "own journal follows exact release proof");
         assert.equal(await git.revParse(bare, `refs/uzi-recovery-pin/${claim.run_id}/8^{commit}`), startHead, "sibling pin untouched");
         assert.equal(await git.revParse(bare, `refs/uzi-recovery-pin/${claim.run_id}/7^{commit}`), shouldRelease ? null : startHead, "own exact-generation pin follows release proof");
-        assert.ok(observations.includes("owner_cancel"));
-        assert.ok(cancelLogs.some(line => rec(line).msg === "owner cancel Docker teardown"), "every Docker state logged");
-        if (shouldRelease) assert.ok(observations.includes("owner_cancel_after_inspection"));
-        if (shouldRelease) assert.deepEqual(releases[0], [claim.run_id, 7]);
-        else {
+        if (!["before-cancel", "settle"].includes(scenario.quarantine ?? "")) {
+          assert.ok(observations.includes("owner_cancel"));
+          assert.ok(cancelLogs.some(line => rec(line).msg === "owner cancel Docker teardown"), "Docker state logged when initial proof reached");
+        }
+        if (shouldCloseHold) assert.ok(observations.includes("owner_cancel_after_inspection"));
+        if (shouldCloseHold) assert.deepEqual(releases[0], [claim.run_id, 7]);
+        if (!shouldRelease) {
           assert.equal((await fs.stat(clone)).isDirectory(), true, "source retained");
           if (work === "info-exclude" || work === "external-excludes" || ignoredSourcePaths.length > 0) {
             assert.equal(await git.worktreeHead(clone), startHead, "retained HEAD unchanged");
@@ -1773,11 +1861,16 @@ describe("m1 credential-free owner cancel", () => {
         }
         assert.equal(await fs.access(path.join(clone, "FILTER-RAN")).then(() => true, () => false), false);
       } finally {
-        await runner.shutdown();
-        await execution;
-        await api.close();
-        fx.cleanup();
-        await fs.rm(recovery.root, { recursive: true, force: true });
+        quarantineContinue.resolve();
+        try {
+          await runner.shutdown();
+          await execution;
+        } finally {
+          resetResidueQuarantineForTests();
+          await api.close();
+          fx.cleanup();
+          await fs.rm(recovery.root, { recursive: true, force: true });
+        }
       }
     });
 });
