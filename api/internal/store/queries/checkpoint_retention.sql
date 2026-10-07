@@ -477,6 +477,12 @@ INSERT INTO checkpoint_publish_attempts (run_id, branch, ref, tip)
 VALUES (@run_id, @branch::text, @ref::text, @tip::text)
 RETURNING id;
 
+-- name: MarkCheckpointPublishAttemptReady :execrows
+-- Exact existing attempt only; repeated disposition bookkeeping preserves the first stamp.
+UPDATE checkpoint_publish_attempts
+SET reconcile_ready_at = COALESCE(reconcile_ready_at, now())
+WHERE id = @id;
+
 -- name: DeleteCheckpointPublishAttempt :execrows
 -- The push's outcome is accounted for (refused by the forge, or landed and tracked), or the
 -- sweeper reconciled or retired it.
@@ -494,10 +500,9 @@ SELECT EXISTS (
 )::bool AS attempted;
 
 -- name: ListDueCheckpointPublishAttempts :many
--- The sweeper's attempts arm: outstanding attempts, due for a comparison, whose run is TERMINAL
--- (or gone). A live run's own next publish fetches origin and builds on whatever landed; once it
--- is terminal nothing else of the run will. A live run's rows are excluded here, in SQL, so they
--- never occupy the bounded page. A terminal run's rows are listed only once the run has been
+-- The sweeper's attempts arm: due terminal/gone attempts and ready live attempts.
+-- Pending live attempts never occupy the bounded page or acquire live consumption permission.
+-- A terminal run's rows are listed only once the run has been
 -- terminal for @cooling (the supersession cooling period, on the database clock): until then a
 -- push routed while it was live may still be returning and track its own tip. That is a delay
 -- only; the arm's writes are compare-and-set on what it read, so a concurrent publish is never
@@ -507,10 +512,78 @@ SELECT a.* FROM checkpoint_publish_attempts a
 LEFT JOIN runs r ON r.id = a.run_id
 WHERE a.next_check_at <= now()
   AND (r.id IS NULL OR (r.status IN ('completed', 'failed', 'cancelled')
-                        AND r.status_since <= now() - @cooling::interval))
+                        AND r.status_since <= now() - @cooling::interval)
+       OR (r.status NOT IN ('completed', 'failed', 'cancelled')
+           AND a.reconcile_ready_at IS NOT NULL))
   AND (sqlc.narg(only_run_id)::uuid IS NULL OR a.run_id = sqlc.narg(only_run_id)::uuid)
 ORDER BY a.next_check_at, a.id
 LIMIT @max_rows::int;
+
+-- name: LockRunForLiveCheckpointConfirmation :one
+-- Serialize confirmation with the terminal status update and its retention trigger.
+SELECT * FROM runs WHERE id = @id FOR UPDATE;
+
+-- name: LockCheckpointPublishAttemptForConfirmation :one
+SELECT * FROM checkpoint_publish_attempts WHERE id = @id FOR UPDATE;
+
+-- name: LockCheckpointRetentionForConfirmation :one
+SELECT * FROM checkpoint_retentions WHERE run_id = @run_id FOR UPDATE;
+
+-- name: ConfirmLiveCheckpointPublishAttempt :execrows
+-- Dedicated live confirmation: no retention write and no positive ownership from pending rows.
+-- These guards use this UPDATE's statement snapshot, including competing claims committed
+-- while the forge list was in flight. They do not reserve against future competing attempts.
+UPDATE runs r
+SET checkpoint_tip = @tip::text,
+    checkpoint_tip_at = GREATEST(r.checkpoint_tip_at, now())
+WHERE r.id = @run_id
+  AND r.status NOT IN ('completed', 'failed', 'cancelled')
+  AND (r.checkpoint_tip IS NOT DISTINCT FROM sqlc.narg(expected_tip)::text
+       OR r.checkpoint_tip = @tip::text)
+  AND EXISTS (
+      SELECT 1 FROM checkpoint_publish_attempts a
+      WHERE a.id = @attempt_id AND a.run_id = r.id
+        AND a.ref = @ref::text AND a.tip = @tip::text
+        AND a.reconcile_ready_at IS NOT NULL
+        AND (r.checkpoint_tip IS NULL OR r.checkpoint_tip = a.tip
+             OR (r.checkpoint_tip_at IS NOT NULL AND r.checkpoint_tip_at <= a.attempted_at))
+  )
+  AND (
+      (NOT @had_retention::boolean AND NOT EXISTS (
+          SELECT 1 FROM checkpoint_retentions c WHERE c.run_id = r.id
+      ))
+      OR (@had_retention::boolean AND EXISTS (
+          SELECT 1 FROM checkpoint_retentions c
+          WHERE c.run_id = r.id
+            AND c.ref = @observed_ref::text
+            AND c.recovery_ref IS NOT DISTINCT FROM sqlc.narg(observed_recovery_ref)::text
+            AND c.state = @observed_state::text AND c.tip = @observed_record_tip::text
+            AND c.ref = @ref::text AND c.recovery_ref IS NULL
+            AND c.state IN ('retained', 'settling', 'deleted', 'abandoned')
+      ))
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM runs other
+      WHERE other.repo_id = r.repo_id AND other.id <> r.id AND other.checkpoint_tip = @tip::text
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM checkpoint_publish_attempts a JOIN runs other ON other.id = a.run_id
+      WHERE other.repo_id = r.repo_id AND a.run_id <> r.id AND a.tip = @tip::text
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM checkpoint_retentions c
+      WHERE c.repo_id = r.repo_id AND c.run_id <> r.id AND c.tip = @tip::text
+        AND c.state IN ('retained', 'superseding', 'superseded', 'settling')
+  );
+
+-- name: DeleteConfirmedLiveCheckpointPublishAttempt :execrows
+-- Called in the confirmation transaction, with both run and exact attempt already locked.
+DELETE FROM checkpoint_publish_attempts a
+USING runs r
+WHERE a.id = @id AND a.run_id = @run_id AND a.ref = @ref::text AND a.tip = @tip::text
+  AND a.reconcile_ready_at IS NOT NULL
+  AND r.id = a.run_id AND r.status NOT IN ('completed', 'failed', 'cancelled')
+  AND r.checkpoint_tip = a.tip;
 
 -- name: DeferCheckpointPublishAttempt :execrows
 -- The comparison found nothing to reconcile yet (the ref is not at the attempted tip) or could not

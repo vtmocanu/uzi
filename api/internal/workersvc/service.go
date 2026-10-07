@@ -603,6 +603,7 @@ type Store interface {
 	// call (checkpoint_publish_attempts, 00267), and the sweeper's attempts arm that reconciles a
 	// push whose outcome the api never learned.
 	RecordCheckpointPublishAttempt(ctx context.Context, arg store.RecordCheckpointPublishAttemptParams) (uuid.UUID, error)
+	MarkCheckpointPublishAttemptReady(ctx context.Context, id uuid.UUID) (int64, error)
 	DeleteCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (int64, error)
 	GetCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (store.CheckpointPublishAttempt, error)
 	RunHasCheckpointPublishAttempt(ctx context.Context, arg store.RunHasCheckpointPublishAttemptParams) (bool, error)
