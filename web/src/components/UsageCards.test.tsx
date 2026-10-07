@@ -339,14 +339,23 @@ describe("FailedRunsBlock (PRD #1293)", () => {
     // The counts sentence and rate keep reading the FULL failed count (10), not the split.
     expect(container.textContent).toContain("10 of 100 finished runs");
     expect(container.textContent).toContain("10.0%");
-    // Legend: the plain failed segment reflects 6, and the needs-landing sub-cut its own 4.
-    expect(container.textContent).toContain("failed 6");
-    expect(container.textContent).toContain("failed, needs landing 4");
-    // The aria-label names the new bucket, with the split counts summing back to failed=10.
+    // The grouped legend agrees with the headline, preserving both swatches.
+    const failedLegend = Array.from(container.querySelectorAll("li")).find((li) => li.textContent?.startsWith("failed"));
+    expect(failedLegend?.textContent).toBe("failed 10 (4 need landing)");
+    const swatches = failedLegend?.querySelectorAll<HTMLElement>('span[aria-hidden="true"]');
+    expect(swatches?.length).toBe(2);
+    expect(swatches?.[0].style.background).toBe("rgb(var(--danger))");
+    expect(swatches?.[1].style.background).toContain("repeating-linear-gradient");
+    // The accessible sentence uses that same grouped failed total.
     const bar = container.querySelector('[role="img"]');
     expect(bar?.getAttribute("aria-label")).toBe(
-      "Finished runs: 85 completed, 3 cancelled, 2 plan rejected, 6 failed, 4 failed, needs landing",
+      "Finished runs: 85 completed, 3 cancelled, 2 plan rejected, 10 failed (4 need landing)",
     );
+    // The visual bar still separates six plain failures and four landable ones.
+    const segments = bar?.querySelectorAll<HTMLElement>(":scope > span");
+    expect(segments?.length).toBe(5);
+    expect(segments?.[3].style.width).toBe("6%");
+    expect(segments?.[4].style.width).toBe("4%");
   });
 
   it("shows no needs-landing segment when needs_landing === 0 (no zero clutter)", () => {
@@ -362,7 +371,9 @@ describe("FailedRunsBlock (PRD #1293)", () => {
     };
     const { container } = wrap(<YourUsageCard usage={usage} />);
     expect(container.textContent).not.toContain("needs landing");
-    // The plain failed segment carries the full failed count when nothing needs landing.
+    // One solid swatch and the full failed total when nothing needs landing.
+    const failedLegend = Array.from(container.querySelectorAll("li")).find((li) => li.textContent?.startsWith("failed"));
+    expect(failedLegend?.querySelectorAll('span[aria-hidden="true"]').length).toBe(1);
     expect(container.textContent).toContain("failed 10");
     const bar = container.querySelector('[role="img"]');
     expect(bar?.getAttribute("aria-label")).toBe(
@@ -539,12 +550,22 @@ describe("failure recency cards and table (#2399)", () => {
       ],
     };
     const { container, getByText } = wrap(<><FactoryTotalCard admin={admin} /><PerUserUsageTable admin={admin} /></>);
-    expect(getByText("· owner@example.com")).toBeTruthy();
+    const owner = getByText("· owner@example.com");
+    expect(owner.getAttribute("title")).toBe("owner@example.com");
+    expect(owner.className).toContain("min-w-0");
+    expect(owner.className).toContain("truncate");
+    const origin = getByText(/last: worker lost/);
+    expect(origin.getAttribute("title")).toBe("worker lost");
+    expect(origin.className).toContain("truncate");
+    expect(origin.parentElement?.classList.contains("flex-nowrap")).toBe(true);
+    expect(origin.parentElement?.classList.contains("flex-wrap")).toBe(false);
+    expect(getByText("14 completed since").classList.contains("shrink-0")).toBe(true);
+    expect(container.querySelector(`a[href="/runs/${row.last_failed_run_id}"]`)?.classList.contains("shrink-0")).toBe(true);
     expect(getByText("Since last failure")).toBeTruthy();
     const rows = container.querySelectorAll("tbody tr");
     expect(Array.from(rows).map((r) => r.querySelectorAll("td")[4].textContent)).toEqual(["6h", "no failures", "–", "6h"]);
     act(() => { setDemoMode(true); });
-    expect(getByText("· User")).toBeTruthy();
+    expect(getByText("· User").getAttribute("title")).toBe("User");
     expect(container.textContent).not.toContain("owner@example.com");
   });
 });

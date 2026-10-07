@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { failureRecency } from "../lib/failureRecency";
 import { useNow } from "../lib/useNow";
+import { stripUnsafeChars } from "../lib/safeText";
 import type { SelfUsage, AdminUsage, RunUsage, RunOutcomes } from "../lib/api";
 import { formatTokens, formatCost } from "../lib/formatTokens";
 import { failOriginLabel } from "../lib/failOriginLabel";
@@ -137,9 +138,13 @@ function FailedRunsBlock({ lifetime, last7 }: { lifetime: RunOutcomes; last7: Ru
       ? [{ label: "failed, needs landing", count: lifetime.needs_landing, background: NEEDS_LANDING }]
       : []),
   ];
-  const barLabel = "Finished runs: " + segments.map((s) => `${s.count} ${s.label}`).join(", ");
+  // #1418: keep both bar segments, but group their FULL failed total in the
+  // legend and accessible sentence, matching the headline and CLI figure.
+  const legend = [...segments.slice(0, 3), { label: "failed", count: lifetime.failed, background: FAIL }];
+  const landingHint = lifetime.needs_landing > 0 ? ` (${lifetime.needs_landing} need landing)` : "";
+  const barLabel = "Finished runs: " + legend.map((item) => `${item.count} ${item.label}${item.label === "failed" ? landingHint : ""}`).join(", ");
   return (
-    <div className="mt-auto border-t border-edge pt-3.5">
+    <div className="mt-3.5 border-t border-edge pt-3.5">
       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
         <SectionTitle>Failed runs</SectionTitle>
         <span className="font-mono text-[22px] font-semibold tabular-nums tracking-tight text-fg">
@@ -161,10 +166,16 @@ function FailedRunsBlock({ lifetime, last7 }: { lifetime: RunOutcomes; last7: Ru
         ))}
       </div>
       <ul className="mt-2 flex flex-wrap gap-x-3.5 gap-y-1 text-[11.5px] text-muted">
-        {segments.map((s) => (
+        {legend.map((s) => (
           <li key={s.label} className="inline-flex items-center gap-1.5">
-            <span className="inline-block h-[9px] w-[9px] rounded-[2px]" style={{ background: s.background }} />
+            <span className="inline-flex gap-0.5">
+              <span aria-hidden="true" className="inline-block h-[9px] w-[9px] rounded-[2px]" style={{ background: s.background }} />
+              {s.label === "failed" && lifetime.needs_landing > 0 && (
+                <span aria-hidden="true" className="inline-block h-[9px] w-[9px] rounded-[2px]" style={{ background: NEEDS_LANDING }} />
+              )}
+            </span>
             {s.label} <span className="tabular-nums text-fg">{s.count}</span>
+            {s.label === "failed" && landingHint}
           </li>
         ))}
       </ul>
@@ -176,8 +187,10 @@ function SinceLastFailedRun({ outcomes, owner }: { outcomes: RunOutcomes; owner?
   const now = useNow(30_000);
   const value = failureRecency(outcomes, now);
   const hasFailure = outcomes.last_failed_at != null && value !== "Unavailable";
+  const originLabel = stripUnsafeChars(failOriginLabel(outcomes.last_failed_origin ?? "unknown"));
+  const ownerLabel = owner ? stripUnsafeChars(owner) : undefined;
   return (
-    <div className="mt-3 border-t border-edge pt-3">
+    <div className="mt-3 min-w-0 border-t border-edge pt-3">
       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
         <SectionTitle>Since last failed run</SectionTitle>
         {hasFailure ? (
@@ -190,12 +203,14 @@ function SinceLastFailedRun({ outcomes, owner }: { outcomes: RunOutcomes; owner?
         )}
       </div>
       {hasFailure && (
-        <p className="mt-1 flex flex-wrap items-baseline gap-x-1 text-xs text-muted">
-          <span>{outcomes.completed_since_last_failure ?? 0} completed since</span>
-          <span>· last: {failOriginLabel(outcomes.last_failed_origin ?? "unknown")}</span>
-          {owner && <span>· {owner}</span>}
+        <p className="mt-1 flex min-w-0 flex-nowrap items-baseline gap-x-1 whitespace-nowrap text-xs text-muted">
+          <span className="shrink-0">{outcomes.completed_since_last_failure ?? 0} completed since</span>
+          <span className="min-w-0 truncate" title={originLabel}>· last: {originLabel}</span>
+          {/* The owner gets remaining space down to one ellipsis cell; only
+              then does the origin shrink. Figures and the link stay fixed. */}
+          {ownerLabel && <span className="min-w-0 max-w-max grow shrink-0 basis-[1em] truncate" title={ownerLabel}>· {ownerLabel}</span>}
           {outcomes.last_failed_run_id && (
-            <Link className="text-brand hover:underline" to={`/runs/${outcomes.last_failed_run_id}`}>
+            <Link className="shrink-0 whitespace-nowrap text-brand hover:underline" to={`/runs/${outcomes.last_failed_run_id}`}>
               · run {outcomes.last_failed_run_id.slice(0, 8)} →
             </Link>
           )}
@@ -211,25 +226,29 @@ export function YourUsageCard({ usage }: { usage: SelfUsage }) {
   const lifeDisclosure = aggregateDisclosure(usage.lifetime_subscription_run_count, usage.lifetime_unreported_run_count);
   const last7Disclosure = aggregateDisclosure(usage.last7_subscription_run_count, usage.last7_unreported_run_count);
   return (
-    <Card className="flex flex-col">
-      <SectionTitle>Your usage</SectionTitle>
-      {usage.run_count === 0 ? (
-        <p className="mt-2 text-sm text-faint">No usage recorded yet — it appears here once your runs spend tokens.</p>
-      ) : (
-        <>
-          <BigNum tokens={life.total} />
-          <Subrow usage={usage.lifetime} disclosure={lifeDisclosure} />
-          <p className="mt-2.5 text-[11px] text-faint">
-            Across <span className="tabular-nums text-muted">{usage.run_count}</span> run{usage.run_count === 1 ? "" : "s"}, all
-            time · <span className="tabular-nums text-muted">{formatTokens(last7.total)}</span> tok /{" "}
-            <span className="tabular-nums text-muted">{formatCost(last7.cost)}</span> last 7d
-            {last7Disclosure.incomplete && last7Disclosure.text !== lifeDisclosure.text && (
-              <> ({last7Disclosure.text})</>
-            )}
-          </p>
-        </>
-      )}
-      <FailedRunsBlock lifetime={usage.outcomes.lifetime} last7={usage.outcomes.last_7_days} />
+    <Card className="grid min-w-0 grid-cols-1 gap-y-0 md:row-span-3 md:grid-rows-subgrid">
+      <div className="min-w-0">
+        <SectionTitle>Your usage</SectionTitle>
+        {usage.run_count === 0 ? (
+          <p className="mt-2 text-sm text-faint">No usage recorded yet — it appears here once your runs spend tokens.</p>
+        ) : (
+          <>
+            <BigNum tokens={life.total} />
+            <Subrow usage={usage.lifetime} disclosure={lifeDisclosure} />
+            <p className="mt-2.5 text-[11px] text-faint">
+              Across <span className="tabular-nums text-muted">{usage.run_count}</span> run{usage.run_count === 1 ? "" : "s"}, all
+              time · <span className="tabular-nums text-muted">{formatTokens(last7.total)}</span> tok /{" "}
+              <span className="tabular-nums text-muted">{formatCost(last7.cost)}</span> last 7d
+              {last7Disclosure.incomplete && last7Disclosure.text !== lifeDisclosure.text && (
+                <> ({last7Disclosure.text})</>
+              )}
+            </p>
+          </>
+        )}
+      </div>
+      <div>
+        <FailedRunsBlock lifetime={usage.outcomes.lifetime} last7={usage.outcomes.last_7_days} />
+      </div>
       <SinceLastFailedRun outcomes={usage.outcomes.lifetime} />
     </Card>
   );
@@ -245,22 +264,26 @@ export function FactoryTotalCard({ admin }: { admin: AdminUsage }) {
     admin.factory.lifetime_unreported_run_count,
   );
   return (
-    <Card className="flex flex-col">
-      <SectionTitle>Factory total · all users · admin</SectionTitle>
-      {admin.factory.run_count === 0 ? (
-        <p className="mt-2 text-sm text-faint">No usage across the factory yet.</p>
-      ) : (
-        <>
-          <BigNum tokens={f.total} />
-          <Subrow usage={admin.factory.lifetime} disclosure={disclosure} />
-          <p className="mt-2.5 text-[11px] text-faint">
-            <span className="tabular-nums text-muted">{admin.factory.run_count}</span> runs by{" "}
-            <span className="tabular-nums text-muted">{admin.users.length}</span> user{admin.users.length === 1 ? "" : "s"}
-            {formatSince(admin.earliest_run) && <> since {formatSince(admin.earliest_run)}</>}
-          </p>
-        </>
-      )}
-      <FailedRunsBlock lifetime={admin.factory.outcomes.lifetime} last7={admin.factory.outcomes.last_7_days} />
+    <Card className="grid min-w-0 grid-cols-1 gap-y-0 md:row-span-3 md:grid-rows-subgrid">
+      <div className="min-w-0">
+        <SectionTitle>Factory total · all users · admin</SectionTitle>
+        {admin.factory.run_count === 0 ? (
+          <p className="mt-2 text-sm text-faint">No usage across the factory yet.</p>
+        ) : (
+          <>
+            <BigNum tokens={f.total} />
+            <Subrow usage={admin.factory.lifetime} disclosure={disclosure} />
+            <p className="mt-2.5 text-[11px] text-faint">
+              <span className="tabular-nums text-muted">{admin.factory.run_count}</span> runs by{" "}
+              <span className="tabular-nums text-muted">{admin.users.length}</span> user{admin.users.length === 1 ? "" : "s"}
+              {formatSince(admin.earliest_run) && <> since {formatSince(admin.earliest_run)}</>}
+            </p>
+          </>
+        )}
+      </div>
+      <div>
+        <FailedRunsBlock lifetime={admin.factory.outcomes.lifetime} last7={admin.factory.outcomes.last_7_days} />
+      </div>
       <SinceLastFailedRun outcomes={admin.factory.outcomes.lifetime} owner={owner} />
     </Card>
   );

@@ -385,7 +385,7 @@ export function Dashboard() {
           A non-admin never receives factory data, so it can never render. */}
       {data?.selfUsage &&
         (data.adminUsage ? (
-          <div className="grid gap-4 md:grid-cols-2">
+          <div className="grid gap-4 md:grid-cols-2 md:gap-y-0">
             <YourUsageCard usage={data.selfUsage} />
             <FactoryTotalCard admin={data.adminUsage} />
           </div>
