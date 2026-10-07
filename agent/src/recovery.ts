@@ -1915,7 +1915,11 @@ export class RecoveryCoordinator {
       }
       if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe recovery directory");
     }
-    if (await fs.realpath(root) !== root || await fs.realpath(dir) !== path.resolve(dir)) {
+    // The lstat checks above reject a symlinked recovery root or run directory. A symlinked
+    // ANCESTOR of the root (a symlinked data dir) is a legitimate layout every other journal
+    // read already tolerates, so containment compares against the canonical root, not the lexical one.
+    const realRoot = await fs.realpath(root);
+    if (await fs.realpath(dir) !== path.join(realRoot, path.basename(dir))) {
       throw new Error("symlink recovery directory");
     }
     // Disappearance after a positive directory check is unknown, not empty proof.

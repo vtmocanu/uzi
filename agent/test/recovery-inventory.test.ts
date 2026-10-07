@@ -144,8 +144,28 @@ it("issue1924 queue rotation survives repeated discovery so later contexts are n
   } finally { await f.close(); }
 });
 
-async function fixture(sourceBoundary = false) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "inventory-"));
+it("issue1924 a symlinked ancestor of the recovery root still finalizes; a symlinked run directory does not", async () => {
+  const outer = await fs.mkdtemp(path.join(os.tmpdir(), "inventory-link-"));
+  try {
+    await fs.mkdir(path.join(outer, "real"));
+    await fs.symlink(path.join(outer, "real"), path.join(outer, "link"), "dir");
+    const f = await fixture(false, path.join(outer, "link"));
+    try {
+      const record = await f.freeze();
+      assert.ok(record);
+      await f.capture(record);
+      assert.equal(f.finals.length, 1, "FINAL is sent although the data dir is reached through a symlink");
+      assert.equal(await f.coordinator.inventoryCleanupState("run-1", 7), "acknowledged");
+      const runDir = path.join(f.root, "journal", "run-1");
+      await fs.rename(runDir, runDir + "-moved");
+      await fs.symlink(runDir + "-moved", runDir, "dir");
+      await assert.rejects(f.coordinator.inventoryCleanupState("run-1", 7), /unsafe recovery directory/);
+    } finally { await f.close(); }
+  } finally { await fs.rm(outer, { recursive: true, force: true }); }
+});
+
+async function fixture(sourceBoundary = false, rootParent = os.tmpdir()) {
+  const root = await fs.mkdtemp(path.join(rootParent, "inventory-"));
   const context: PositiveOwedCandidateContext = {
     runId: "run-1", generation: 7, kind: "issue", branch: "task",
     barePath: path.join(root, "repo.git"),
