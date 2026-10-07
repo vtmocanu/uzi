@@ -5085,7 +5085,9 @@ export class GitCache {
    * hashes regular-file bytes and raw symlink target bytes against the trusted bare starting
    * tree, never following targets or trusting the clone's index or object store.
    * Unsupported types/platforms and budgets retain custody.
-   * Ignored files retain ordinary status semantics.
+   * Trusted tracked .gitignore semantics remain unchanged. External excludes are disabled;
+   * info/exclude permits only the exact worker-source '/.uzi/scratch/' baseline plus
+   * column-zero comments and empty or ASCII-space-only blanks. Uncertain rules retain custody.
    */
   async credentialFreeCancelCleanHead(cwd: string, barePath: string, trustedStart: string): Promise<string | null> {
     const pins = [
@@ -5099,6 +5101,7 @@ export class GitCache {
       "-c", "core.trustctime=true",
       "-c", "core.fileMode=true",
       "-c", "core.ignoreCase=false",
+      "-c", "core.excludesFile=/dev/null",
     ];
     const read = (args: string[]) => this.runGitAsRunner(cwd, [...pins, ...args]);
     try {
@@ -7601,6 +7604,56 @@ try {
     if (!fs.fstatSync(next).isDirectory()) throw Error("non-directory root");
     close(dir); dir = next;
   }
+  // Fixed metadata traversal is separate from parts(), which forbids manifest .git paths.
+  // One failure aborts the proof; exclude reads stop at 64 KiB plus an overflow sentinel.
+  let metadata = dir;
+  try {
+    for (const component of [".git", "info"]) {
+      let next;
+      try { next = open(fp(metadata) + "/" + component, O_PATH | C.O_NOFOLLOW); }
+      catch (e) { if (component === "info" && e.code === "ENOENT") break; throw e; }
+      if (!fs.fstatSync(next).isDirectory()) throw Error("unsafe exclude ancestor");
+      // O_PATH pins identity but does not prove read authority.
+      const readable = open(fp(next) + "/.", C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW);
+      close(readable);
+      if (metadata !== dir) close(metadata);
+      metadata = next;
+      if (component !== "info") continue;
+      let fd;
+      try { fd = open(fp(metadata) + "/exclude", C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK); }
+      catch (e) { if (e.code === "ENOENT") break; throw e; }
+      try {
+        const before = fs.fstatSync(fd, { bigint: true });
+        if (!before.isFile() || before.size > 65536n) throw Error("exclude type/cap");
+        const bytes = Buffer.alloc(65537);
+        let n = 0;
+        while (n < bytes.length) {
+          check();
+          const got = fs.readSync(fd, bytes, n, bytes.length - n, null);
+          if (!got) break;
+          n += got;
+          if (n > 65536) throw Error("exclude cap");
+        }
+        check();
+        const after = fs.fstatSync(fd, { bigint: true });
+        if (BigInt(n) !== before.size ||
+            ["dev", "ino", "size", "mode", "mtimeNs", "ctimeNs"].some(k => before[k] !== after[k]))
+          throw Error("unstable exclude");
+        const content = bytes.subarray(0, n);
+        if (!require("node:buffer").isUtf8(content) || content.includes(0))
+          throw Error("exclude encoding");
+        const lines = content.toString("utf8").split("\n");
+        for (let i = 0; i < lines.length; i++) {
+          check();
+          const line = i < lines.length - 1 && lines[i].endsWith("\r")
+            ? lines[i].slice(0, -1) : lines[i];
+          if (line.includes("\r") ||
+              !(line.startsWith("#") || /^ *$/.test(line) || line === "/.uzi/scratch/"))
+            throw Error("untrusted exclude rule");
+        }
+      } finally { close(fd); }
+    }
+  } finally { if (metadata !== dir) close(metadata); }
   const input = fs.readFileSync(0);
   if (input.length > 2 * 1024 * 1024) throw Error("manifest cap");
   const manifest = JSON.parse(input.toString("utf8"));

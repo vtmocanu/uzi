@@ -1313,6 +1313,83 @@ describe("m1 credential-free owner cancel", () => {
       } finally { fx.cleanup(); }
     });
 
+  for (const change of ["absent", "absent-info", "crlf-baseline", "space-comment", "escaped-comment",
+    "negation", "invalid-utf8", "nul", "symlink", "fifo", "oversized", "info-symlink", "unreadable-info"] as const)
+    it(`real cancel reader exclude ${change}`, { skip: process.platform !== "linux" }, async () => {
+      const fx = makeFixture();
+      const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
+      const info = path.join(fx.originPath, ".git/info");
+      const exclude = path.join(info, "exclude");
+      let helperCalls = 0;
+      let helperSignal: NodeJS.Signals | null | undefined;
+      let helperStderr = "";
+      try {
+        const headResult = spawnSync("git", ["-C", fx.originPath, "rev-parse", "HEAD"],
+          { env: gitEnv(), encoding: "utf8" });
+        assert.equal(headResult.status, 0, headResult.stderr);
+        const head = headResult.stdout.trim();
+        const bare = path.join(fx.dataDir, "exclude-reader-bare.git");
+        const cloned = spawnSync("git", ["clone", "--bare", fx.originPath, bare],
+          { env: gitEnv(), encoding: "utf8" });
+        assert.equal(cloned.status, 0, cloned.stderr);
+        const result = await git.withBoundaryProcessSpawner(async request => {
+          const argv = [...request.argv];
+          const isHelper = argv[0] === process.execPath && argv[1] === "-e";
+          if (isHelper) {
+            helperCalls++;
+            // Mutate only after actual Git status; unsafe metadata cannot hang that subprocess.
+            await fs.unlink(exclude);
+            if (change === "absent-info") await fs.rmdir(info);
+            else if (change === "info-symlink") {
+              await fs.rename(info, info + "-saved");
+              await fs.symlink("info-saved", info);
+            } else if (change === "symlink") {
+              await fs.writeFile(exclude + "-saved", "/.uzi/scratch/\n");
+              await fs.symlink("exclude-saved", exclude);
+            } else if (change === "fifo") {
+              const made = spawnSync("mkfifo", [exclude], { encoding: "utf8", timeout: 2000 });
+              assert.equal(made.status, 0, made.stderr);
+            } else if (change !== "absent") {
+              const content = change === "crlf-baseline" ? "# comment\r\n\r\n   \r\n/.uzi/scratch/\r\n" :
+                change === "space-comment" ? " #not-a-comment\n" :
+                change === "escaped-comment" ? "\\#not-a-comment\n" :
+                change === "negation" ? "!/.uzi/scratch/\n" :
+                change === "invalid-utf8" ? Buffer.from([0x23, 0xff, 0x0a]) :
+                change === "nul" ? "# comment\0NEW.txt\n" :
+                change === "oversized" ? "#".repeat(65537) : "/.uzi/scratch/\n";
+              await fs.writeFile(exclude, content);
+              if (change === "unreadable-info") {
+                // Deterministically deny lookup in the child, independent of the test uid.
+                argv[2] = 'const fixtureFs = require("node:fs"), fixtureOpen = fixtureFs.openSync;\n' +
+                  'fixtureFs.openSync = (p, flags) => { if (String(p).endsWith("/info")) { ' +
+                  'process.stderr.write("exclude ancestor denied\\n"); ' +
+                  'throw Object.assign(Error("fixture permission denied"), { code: "EACCES" }); } ' +
+                  'return fixtureOpen(p, flags); };\n' + argv[2];
+              }
+            }
+          }
+          const child = spawn(argv[0]!, argv.slice(1), { cwd: request.cwd, env: request.env, stdio: "pipe" });
+          if (isHelper) child.stderr.on("data", chunk => { helperStderr += chunk.toString(); });
+          const completed = new Promise<{ code: number }>((resolve, reject) => {
+            const timer = setTimeout(() => child.kill("SIGKILL"), Math.min(request.timeoutMs ?? 30000, 5000));
+            child.once("error", error => { clearTimeout(timer); reject(error); });
+            child.once("close", (code, signal) => {
+              clearTimeout(timer);
+              if (isHelper) helperSignal = signal;
+              if (signal) reject(new Error(`reader fixture child killed by ${signal}`));
+              else resolve({ code: code ?? -1 });
+            });
+          });
+          return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed,
+            cancel: async () => { child.kill("SIGKILL"); await completed; } };
+        }, new AbortController().signal, () => git.credentialFreeCancelCleanHead(fx.originPath, bare, head));
+        assert.equal(helperCalls, 1, "actual inline reader invoked after clean metadata/status");
+        assert.equal(helperSignal, null, "reader exits naturally rather than reaching its timeout");
+        assert.equal(result, ["absent", "absent-info", "crlf-baseline"].includes(change) ? head : null);
+        if (change === "unreadable-info") assert.equal(helperStderr, "exclude ancestor denied\n");
+      } finally { fx.cleanup(); }
+    });
+
   const cases = [
     ...["clean", "dirty", "untracked", "committed", "replace", "forged-stat", "lossy-path", "hidden", "assume", "skip", "filter",
       "symlink-dangling", "symlink-outside", "symlink-changed", "symlink-file",
