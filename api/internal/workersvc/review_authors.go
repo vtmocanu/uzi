@@ -71,7 +71,7 @@ type ReviewAuthorStore interface {
 // runs fn on the transaction-bound queries, and commits. The lock is held for fn's few SQL
 // statements only: fn must never call the forge or do a lookup. Read-then-write decisions are
 // made by the caller from an unlocked read, which is why the prune is bounded by the sequence
-// value observed at read time (PruneReviewAuthorQueue).
+// value observed BEFORE the caller fetched its comments (ReviewAssessParams.QueueBound).
 func (s *Service) MutateReviewAuthorQueue(ctx context.Context, repoID uuid.UUID, ref string, fn func(ReviewAuthorQueueOps) error) error {
 	if s.txBeginner == nil {
 		return errors.New("review author queue: no transaction beginner wired")
@@ -125,6 +125,21 @@ func (a *ReviewAssessor) timeout() time.Duration {
 	return DefaultReviewLookupTimeout
 }
 
+// QueueBound reads the largest queue_seq of the (repo, ref) queue. Callers take it before they
+// list the MR's comments and pass it as ReviewAssessParams.QueueBound; an error means the
+// queue is unreadable and the tick should be skipped.
+func (a *ReviewAssessor) QueueBound(ctx context.Context, repoID uuid.UUID, ref string) (int64, error) {
+	rows, err := a.Store.ListReviewAuthorQueue(ctx, store.ListReviewAuthorQueueParams{RepoID: repoID, Ref: ref})
+	if err != nil {
+		return 0, err
+	}
+	var bound int64
+	for _, row := range rows {
+		bound = max(bound, row.QueueSeq)
+	}
+	return bound, nil
+}
+
 // ReviewAssessParams is one assessment's input.
 type ReviewAssessParams struct {
 	RepoID         uuid.UUID
@@ -140,6 +155,12 @@ type ReviewAssessParams struct {
 	// HighWater or is in Pending.
 	HighWater int64
 	Pending   []int64
+	// QueueBound is the max queue_seq the caller read (QueueBound) BEFORE it fetched Comments.
+	// The end-of-tick prune only deletes rows at or below it: every such row was admitted before
+	// the comments were fetched, so its candidacy is decided by this very list. A row admitted
+	// by a concurrent assessor after that point has a larger sequence value and survives a keep
+	// set that could not have seen its comment. Zero prunes nothing.
+	QueueBound int64
 }
 
 type reviewClass int
@@ -308,10 +329,6 @@ func (r *ReviewAssessment) begin(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var observedMax int64
-	if n := len(rows); n > 0 {
-		observedMax = rows[n-1].QueueSeq
-	}
 	// Attempt order: ascending queue position. Candidates the read did not show (a concurrent
 	// eviction) follow, in admission order.
 	attemptOrder := make([]int64, 0, len(candidates))
@@ -357,7 +374,7 @@ func (r *ReviewAssessment) begin(ctx context.Context) error {
 				keep = []int64{}
 			}
 			_, err := q.PruneReviewAuthorQueue(ctx, store.PruneReviewAuthorQueueParams{
-				RepoID: p.RepoID, Ref: p.Ref, ObservedMaxSeq: observedMax, KeepIds: keep,
+				RepoID: p.RepoID, Ref: p.Ref, ObservedMaxSeq: p.QueueBound, KeepIds: keep,
 			})
 			return err
 		})
@@ -369,9 +386,9 @@ func (r *ReviewAssessment) begin(ctx context.Context) error {
 	return nil
 }
 
-// admitAndList admits the candidates under the lock and then reads the queue unlocked. The
-// read happens after the admission so the max sequence observed bounds everything the later
-// prune may delete.
+// admitAndList admits the candidates under the lock and then reads the queue unlocked, for the
+// attempt order. The prune is NOT bounded by this read (it follows the admission and the
+// comment fetch): it is bounded by ReviewAssessParams.QueueBound, read before the fetch.
 func (r *ReviewAssessment) admitAndList(ctx context.Context, candidates []int64) ([]store.ListReviewAuthorQueueRow, error) {
 	a, p := r.assessor, r.p
 	if len(candidates) > 0 {
@@ -533,6 +550,9 @@ func (r *ReviewAssessment) Snapshot(ctx context.Context) *ReviewSnapshotResult {
 		}
 	}
 	snap.Comments, snap.Truncated = capReviewComments(eligible)
+	if snap.Comments == nil {
+		snap.Comments = []ReviewCommentSnapshot{} // never "comments":null on the wire
+	}
 	// The caps keep the newest tail, so the kept comments line up with the end of eligible.
 	offset := len(eligible) - len(snap.Comments)
 	for i, c := range snap.Comments {
@@ -558,6 +578,11 @@ type ReviewPlan struct {
 	// PendingAdd and PendingRemove are the ledger's pending_unknown_ids delta.
 	PendingAdd    []int64
 	PendingRemove []int64
+	// PendingEvicted is the part of PendingRemove that is safe to drop even when no run is
+	// created: pending ids whose author is eligible but whose comment the snapshot caps evicted.
+	// They fall back to human review; left pending they would keep HasTrigger true (it ignores
+	// the caps) while HasNew stays false, repeating the full assessment every tick.
+	PendingEvicted []int64
 }
 
 // Plan computes the plan against a ledger row's high-water mark and pending set.
@@ -586,6 +611,7 @@ func (res *ReviewSnapshotResult) Plan(highWater int64, pending []int64) ReviewPl
 		}
 	}
 	plan.PendingRemove = []int64{}
+	plan.PendingEvicted = []int64{}
 	for _, id := range pending {
 		cl, present := res.class[id]
 		switch {
@@ -593,6 +619,9 @@ func (res *ReviewSnapshotResult) Plan(highWater int64, pending []int64) ReviewPl
 			plan.PendingRemove = append(plan.PendingRemove, id) // gone, or its author is now known to be out
 		case cl == classEligible && res.inSnapshot[id]:
 			plan.PendingRemove = append(plan.PendingRemove, id) // consumed by this snapshot
+		case cl == classEligible:
+			plan.PendingRemove = append(plan.PendingRemove, id) // evicted by the caps: human review
+			plan.PendingEvicted = append(plan.PendingEvicted, id)
 		}
 	}
 	return plan

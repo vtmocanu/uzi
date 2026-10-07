@@ -20,7 +20,16 @@ CREATE TABLE mr_review_author_verdicts (
 -- row admitted after the observation always has queue_seq > M, even when every earlier row
 -- was deleted in between. A max(queue_seq) + 1 scheme would restart at 1 after such a delete
 -- and let the stale pruner remove a waiting author.
-CREATE SEQUENCE mr_review_author_queue_seq AS bigint;
+--
+-- The guard needs values that are MONOTONIC IN LOCK ORDER: a mutation that takes the
+-- per-(repo, ref) advisory lock later must draw a larger value than one that took it earlier.
+-- That is why the sequence is pinned CACHE 1 NO CYCLE instead of left to defaults. With a
+-- larger CACHE each session preallocates a private block, so a later lock holder can draw a
+-- value below an earlier holder's (session A caches 1..20, B caches 21..40, B admits at 21,
+-- then A admits at 2) and a pruner that observed 21 would delete the row at 2. NO CYCLE keeps
+-- a wrapped value from ever repeating. Do not raise CACHE or add CYCLE;
+-- TestReviewAuthorQueueStalePruneNeverDeletesReadmittedLiveDB asserts both settings.
+CREATE SEQUENCE mr_review_author_queue_seq AS bigint CACHE 1 NO CYCLE;
 
 -- The fair-progress queue of authors whose eligibility is still to be looked up, one
 -- ordered queue per (repo, ref). Mutations run under the per-(repo, ref) advisory lock

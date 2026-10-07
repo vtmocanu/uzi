@@ -28,6 +28,7 @@ type mrReviewWatchStore interface {
 	ListMRReworkCandidates(ctx context.Context, repoID uuid.UUID) ([]store.ListMRReworkCandidatesRow, error)
 	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.MrReworkLedger, error)
 	UpsertMRReworkLedger(ctx context.Context, arg store.UpsertMRReworkLedgerParams) error
+	RemoveMRReworkPendingIDs(ctx context.Context, arg store.RemoveMRReworkPendingIDsParams) error
 	SetMRReworkHaltNotified(ctx context.Context, arg store.SetMRReworkHaltNotifiedParams) error
 	DeleteMRReworkLedgerNotIn(ctx context.Context, repoID uuid.UUID) (int64, error)
 	// The review-comment author verdict cache and queue reads (issue #2347).
@@ -218,6 +219,16 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	// the listing), then assess their authors. The detector builds the snapshot itself — it
 	// needs the eligible comments to gate on high-water and review-landedness — then passes it
 	// to CreateAutoMRReworkRun, mirroring ci-autofix's BuildFailureSnapshot.
+	//
+	// The queue's prune bound is read BEFORE the listing: a row at or below it was admitted
+	// before the comments were fetched, so this list decides its candidacy; a row a concurrent
+	// assessor admits later sits above the bound and survives this tick's keep set.
+	assessor := d.assessor()
+	queueBound, err := assessor.QueueBound(ctx, r.ID, ref)
+	if err != nil {
+		slog.Warn("poller: mr-rework review author queue read", "repo", r.PathWithNamespace, "ref", ref, "error", err)
+		return
+	}
 	comments, err := f.ListMergeRequestComments(ctx, r.ForgeProjectID, mrIID)
 	if err != nil {
 		// Already PAT-redacted by the driver.
@@ -238,7 +249,7 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 		return
 	}
 
-	as, err := d.assessor().Begin(ctx, workersvc.ReviewAssessParams{
+	as, err := assessor.Begin(ctx, workersvc.ReviewAssessParams{
 		RepoID:         r.ID,
 		Ref:            ref,
 		ProjectID:      r.ForgeProjectID,
@@ -249,6 +260,7 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 		Comments:       comments,
 		HighWater:      led.HighWater,
 		Pending:        led.PendingUnknownIds,
+		QueueBound:     queueBound,
 	})
 	if err != nil {
 		// Fail closed: with the verdicts or the queue unreadable no author is assessed.
@@ -291,6 +303,16 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 		return // unreachable while HasTrigger held; never fire an empty eligible snapshot
 	}
 	plan := res.Plan(led.HighWater, led.PendingUnknownIds)
+
+	// A pending id the snapshot caps evicted falls back to human review: drop it from the
+	// pending set now, even when no run is created below. Left pending it would keep HasTrigger
+	// (which ignores the caps) true while plan.HasNew stays false, so every tick would repeat
+	// the full assessment. Best effort: a failed write is retried by the next tick.
+	if len(plan.PendingEvicted) > 0 {
+		if err := d.q.RemoveMRReworkPendingIDs(ctx, store.RemoveMRReworkPendingIDsParams{RepoID: r.ID, Ref: ref, Ids: plan.PendingEvicted}); err != nil {
+			slog.Warn("poller: mr-rework drop evicted pending ids", "repo", r.PathWithNamespace, "ref", ref, "error", err)
+		}
+	}
 
 	// GATE 2 — REVIEW LANDED (Decision 6). Two sub-gates: a quiet-period debounce (the
 	// review must have settled — the newest comment is older than quietPeriod) AND a

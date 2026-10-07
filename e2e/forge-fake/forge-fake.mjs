@@ -56,6 +56,15 @@ const PROJECTS = [makeProject(1, process.env.FORGE_FAKE_PROJECT || "group/repo")
 if (process.env.FORGE_FAKE_PROJECT2) PROJECTS.push(makeProject(2, process.env.FORGE_FAKE_PROJECT2));
 const PROJECT = PROJECTS[0]; // back-compat alias for the single-project references
 
+// The GitLab accounts this fake knows by id. 1 is the connection's bot (GET /api/v4/user);
+// 2 is the reviewer the mr_rework phase authors its injected notes as (the author_id default
+// of POST /_e2e/mrs/:iid/discussions). GET /users/:id and GET .../members/all/:id answer for
+// exactly these, so a note by id 2 resolves as a project member with repository access.
+const GITLAB_USERS = {
+  1: { username: "uzi-bot", name: "uzi bot" },
+  2: { username: "reviewer", name: "reviewer" },
+};
+
 // resolveProject maps a GitLab `:id` path param — a numeric project id (uzi's
 // client-go) OR a url-encoded path_with_namespace (the worker addresses MRs by
 // encoded path) — to one of PROJECTS. Falls back to the first project, so a
@@ -821,10 +830,14 @@ const server = https.createServer(
     // Append an MR review discussion note (PRD #966 M6). The mr_rework detector
     // reads these via the discussions route (defined below). Body: {id, body, created_at,
     // author_id, system}. author_id DEFAULTS to 2 (NOT 1) because forge-fake's
-    // /api/v4/user returns id 1 (the connection's bot id) and
-    // BuildReviewCommentsSnapshot drops notes whose author.id == the bot id — a
+    // /api/v4/user returns id 1 (the connection's bot id) and the review assessor
+    // (workersvc.ReviewAssessor) drops notes whose author id == the bot id — a
     // bot-authored note is a silent no-fire — so the caller passes a reviewer id
-    // explicitly and the default is safe. E2E-only mutator.
+    // explicitly and the default is safe. The assessor also asks the forge whether the
+    // author may be trusted with the prompt (author eligibility, issue #2347): id 2 is a
+    // GITLAB_USERS member, so GET /users/2 and GET .../members/all/2 answer as an eligible
+    // project member; an author id outside GITLAB_USERS is withheld (permission_unknown).
+    // E2E-only mutator.
     const mrDiscPost = method === "POST" && path.match(/^\/_e2e\/mrs\/(\d+)\/discussions$/);
     if (mrDiscPost) {
       const iid = Number(mrDiscPost[1]);
@@ -1557,6 +1570,17 @@ const server = https.createServer(
       return send(res, 200, []);
     }
 
+    // User by id (issue #2347): the GitLab driver's RepositoryAuthorEligibility
+    // (forge/gitlab_author.go) first resolves the comment author with GET /users/:id and
+    // requires id, username and state. Only the accounts in GITLAB_USERS exist; any other
+    // id is a 404, which the driver degrades to permission_unknown (the comment is withheld).
+    const userById = method === "GET" && path.match(/^\/api\/v4\/users\/(\d+)$/);
+    if (userById) {
+      const u = GITLAB_USERS[Number(userById[1])];
+      if (!u) return send(res, 404, { message: "404 User Not Found" });
+      return send(res, 200, { id: Number(userById[1]), username: u.username, name: u.name, state: "active" });
+    }
+
     // Token introspection (PRD #5 privilege check). Over-privileged iff the PAT
     // itself signals it (contains "overpriv"), so the harness can drive both the
     // compliant seed PAT and a rejected over-privileged one against one fake.
@@ -1652,7 +1676,18 @@ const server = https.createServer(
       // per-user push, so the checker reports least-privilege.
       const memberAll = rest.match(/^\/members\/all\/(\d+)$/);
       if (method === "GET" && memberAll) {
-        return send(res, 200, { id: Number(memberAll[1]), username: "uzi-bot", access_level: 30 });
+        // Shape of an eligible GitLab project member (forge/gitlab_author.go): same id and
+        // username as GET /users/:id, state "active", access_level 30 (Developer), at or above
+        // the driver's Reporter (20) threshold, no expires_at and no membership_state. The
+        // bot (id 1) keeps its original privilege-check answer; an id outside GITLAB_USERS
+        // keeps the historical "uzi-bot" username.
+        const member = GITLAB_USERS[Number(memberAll[1])];
+        return send(res, 200, {
+          id: Number(memberAll[1]),
+          username: member ? member.username : "uzi-bot",
+          state: "active",
+          access_level: 30,
+        });
       }
       const protBranch = rest.match(/^\/protected_branches\/(.+)$/);
       if (method === "GET" && protBranch) {

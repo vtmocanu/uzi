@@ -1,6 +1,8 @@
 package workersvc
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -44,6 +46,12 @@ func TestAssembleClaimReplaysOnlyAssessedReviewSnapshotLiveDB(t *testing.T) {
 	if current == nil || current.Version != ReviewSnapshotVersion || len(current.Comments) != 1 || current.Comments[0].ID != 7 ||
 		!current.Truncated || current.WithheldNotEligible != 3 || current.WithheldUnknown != 1 {
 		t.Fatalf("a current snapshot did not replay as stored: %+v", current)
+	}
+
+	// A stored "comments":null (an all-withheld snapshot from an older build) replays as an array.
+	nullComments := assemble(`{"version":2,"comments":null,"truncated":false,"withheld_not_eligible":2}`)
+	if raw, err := json.Marshal(nullComments); err != nil || !strings.Contains(string(raw), `"comments":[]`) {
+		t.Fatalf("a stored null comments array replayed as %s (%v), want \"comments\":[]", raw, err)
 	}
 
 	env.exec(`UPDATE runs SET review_comments = NULL WHERE id = $1`, runID)

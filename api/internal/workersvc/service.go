@@ -475,6 +475,7 @@ type Store interface {
 	// spending an automatic cycle; UserHasEnabledAnthropicToken is the door-check that the
 	// owner can pay for the run the endpoint would mint.
 	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.MrReworkLedger, error)
+	RemoveMRReworkPendingIDs(ctx context.Context, arg store.RemoveMRReworkPendingIDsParams) error
 	// CreateManualMRReworkRunAndAdvance folds the on-demand run INSERT and the non-counting
 	// high-water advance into ONE atomic statement (PRD #1202, review-finding hardening):
 	// Postgres commits BOTH or NEITHER, so a create can never leave an unadvanced ledger that

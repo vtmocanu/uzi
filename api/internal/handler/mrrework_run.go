@@ -162,6 +162,15 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
+		// The queue's prune bound is read BEFORE the comment listing (see the watcher): rows a
+		// concurrent assessor admits afterwards can never be pruned by this request's keep set.
+		assessor := &workersvc.ReviewAssessor{Store: h.q, Queue: h.wsvc, Timeout: h.reviewLookupTimeout}
+		queueBound, err := assessor.QueueBound(r.Context(), repo.ID, run.Branch.String)
+		if err != nil {
+			slog.Error("mr-rework: read review author queue", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
 		comments, err := f.ListMergeRequestComments(r.Context(), repo.ForgeProjectID, run.MrIid.Int64)
 		if err != nil {
 			// err is already PAT-redacted by the driver.
@@ -174,7 +183,6 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		assessor := &workersvc.ReviewAssessor{Store: h.q, Queue: h.wsvc, Timeout: h.reviewLookupTimeout}
 		as, err := assessor.Begin(r.Context(), workersvc.ReviewAssessParams{
 			RepoID:         repo.ID,
 			Ref:            run.Branch.String,
@@ -186,6 +194,7 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			Comments:       comments,
 			HighWater:      led.HighWater,
 			Pending:        led.PendingUnknownIds,
+			QueueBound:     queueBound,
 		})
 		if err != nil {
 			slog.Error("mr-rework: assess review comment authors", "error", err)

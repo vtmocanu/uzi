@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
-	"github.com/vtmocanu/uzi/api/internal/issueinput"
 )
 
 // ReviewCommentSnapshot is one MR review comment captured for an mr_rework run
@@ -46,8 +45,11 @@ type ReviewCommentsSnapshot struct {
 	WithheldUnknown     int                     `json:"withheld_unknown"`
 }
 
-// ReviewSnapshotVersion is the snapshot version whose comments are author-assessed.
-const ReviewSnapshotVersion = issueinput.SnapshotVersion
+// ReviewSnapshotVersion is the snapshot version whose comments are author-assessed. It is the
+// review lane's own contract (pinned to 2 by TestReviewSnapshotVersionIsPinnedToTwo), not an
+// alias of the issue lane's issueinput.SnapshotVersion: bumping one lane must not silently
+// re-version, and so legacy-withhold, the other's stored snapshots.
+const ReviewSnapshotVersion = 2
 
 // CodeRabbit tags its non-actionable top-level notes with these HTML markers. They
 // are forge-agnostic: on GitLab/Forgejo CodeRabbit posts as an ordinary user (no

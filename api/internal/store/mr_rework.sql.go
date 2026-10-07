@@ -707,6 +707,33 @@ func (q *Queries) ListMRReworkCandidates(ctx context.Context, repoID uuid.UUID) 
 	return items, nil
 }
 
+const removeMRReworkPendingIDs = `-- name: RemoveMRReworkPendingIDs :exec
+UPDATE mr_rework_ledger
+SET pending_unknown_ids = ARRAY(
+    SELECT p.x
+    FROM unnest(mr_rework_ledger.pending_unknown_ids) AS p(x)
+    WHERE p.x <> ALL ($1::bigint[])
+    ORDER BY p.x
+)
+WHERE repo_id = $2::uuid AND ref = $3
+`
+
+type RemoveMRReworkPendingIDsParams struct {
+	Ids    []int64   `json:"ids"`
+	RepoID uuid.UUID `json:"repo_id"`
+	Ref    string    `json:"ref"`
+}
+
+// Drop ids from a ledger row's pending_unknown_ids WITHOUT spending a cycle (issue #2347): the
+// pending ids the snapshot caps evicted (an eligible pending comment that no longer fits the
+// capped snapshot falls back to human review, so it must stop re-triggering the assessment).
+// Array subtraction only: attempt_count, high_water, halt_notified and updated_at are left
+// alone, and no row is created when the ref has none.
+func (q *Queries) RemoveMRReworkPendingIDs(ctx context.Context, arg RemoveMRReworkPendingIDsParams) error {
+	_, err := q.db.Exec(ctx, removeMRReworkPendingIDs, arg.Ids, arg.RepoID, arg.Ref)
+	return err
+}
+
 const setMRReworkHaltNotified = `-- name: SetMRReworkHaltNotified :exec
 INSERT INTO mr_rework_ledger (repo_id, ref, halt_notified)
 VALUES ($1::uuid, $2, true)

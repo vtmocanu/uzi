@@ -821,13 +821,16 @@ export function buildReviewCommentsContext(
     return "[Review comments withheld] Review comments from before the author-eligibility change are not available. Do not guess their content or act on them.";
   }
   const notes = reviewWithheldNotes(snapshot);
-  if (snapshot.comments.length === 0) return notes.join("\n");
+  // The wire contract is an array, but a null or absent `comments` (an all-withheld snapshot
+  // stored by an older API build) reads as empty rather than throwing, so the notes still render.
+  const comments = Array.isArray(snapshot.comments) ? snapshot.comments : [];
+  if (comments.length === 0) return notes.join("\n");
   // Per-prompt random fence tag, exactly like the issue-comments / memory fences: a
   // comment author cannot predict it, so no </review_comments_…> variant breaks out.
   const nonce = fenceNonce();
   const openTag = `<review_comments_${nonce}>`;
   const closeTag = `</review_comments_${nonce}>`;
-  const rendered = snapshot.comments
+  const rendered = comments
     .map((c, i) => {
       // The diff anchor is uzi-owned structure: a `path:line` for an inline finding, or
       // nothing for a review-summary / top-level note (which carries no path).

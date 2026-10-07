@@ -187,6 +187,18 @@ func TestReviewAuthorQueueStalePruneNeverDeletesReadmittedLiveDB(t *testing.T) {
 	ctx, pool, q, repo := reviewAuthorEnv(t)
 	ref := "agent/issue-stale-prune"
 
+	// The prune guard needs values monotonic in lock order: CACHE 1 (no per-session block of
+	// preallocated values that a later lock holder could draw below an earlier holder's) and NO
+	// CYCLE (a wrapped value never repeats). Pin both settings from the catalog.
+	var cacheSize int64
+	var cycle bool
+	if err := pool.QueryRow(ctx, `SELECT cache_size, cycle FROM pg_sequences WHERE sequencename = 'mr_review_author_queue_seq'`).Scan(&cacheSize, &cycle); err != nil {
+		t.Fatalf("read mr_review_author_queue_seq settings: %v", err)
+	}
+	if cacheSize != 1 || cycle {
+		t.Fatalf("mr_review_author_queue_seq cache_size=%d cycle=%v, want 1 and false", cacheSize, cycle)
+	}
+
 	// Draw the sequence up so the observed max is well above 1.
 	admit(ctx, t, pool, repo, ref, 11, 12, 13, 14, 15)
 	observed := maxSeq(queueRows(ctx, t, q, repo, ref)) // the stale pruner's observation
@@ -527,4 +539,49 @@ func TestMRReworkPendingUnknownIDsLiveDB(t *testing.T) {
 			t.Fatalf("a create without lists changed the set: %v", got)
 		}
 	})
+}
+
+// TestRemoveMRReworkPendingIDsLiveDB pins the pending-only removal used when the snapshot caps
+// evict an eligible pending id: array subtraction on the pending set, nothing else changes,
+// and a ref with no ledger row is left without one.
+func TestRemoveMRReworkPendingIDsLiveDB(t *testing.T) {
+	ctx, _, q, repo := reviewAuthorEnv(t)
+	ref := "agent/issue-pending-remove"
+	if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 20, PendingAdd: []int64{5, 9, 12}}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repo, Ref: ref})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(before.PendingUnknownIds, []int64{5, 9, 12}) {
+		t.Fatalf("seed pending = %v", before.PendingUnknownIds)
+	}
+	if err := q.RemoveMRReworkPendingIDs(ctx, store.RemoveMRReworkPendingIDsParams{RepoID: repo, Ref: ref, Ids: []int64{9, 5, 777}}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repo, Ref: ref})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(after.PendingUnknownIds, []int64{12}) {
+		t.Fatalf("pending after removal = %v, want [12]", after.PendingUnknownIds)
+	}
+	if after.AttemptCount != before.AttemptCount || after.HighWater != before.HighWater || after.HaltNotified != before.HaltNotified || !after.UpdatedAt.Time.Equal(before.UpdatedAt.Time) {
+		t.Fatalf("a pending-only removal changed other columns: %+v -> %+v", before, after)
+	}
+	// An empty id list is a no-op, and an unknown ref creates no row.
+	if err := q.RemoveMRReworkPendingIDs(ctx, store.RemoveMRReworkPendingIDsParams{RepoID: repo, Ref: ref, Ids: []int64{}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.RemoveMRReworkPendingIDs(ctx, store.RemoveMRReworkPendingIDsParams{RepoID: repo, Ref: "agent/issue-none", Ids: []int64{1}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repo, Ref: "agent/issue-none"}); err == nil {
+		t.Fatal("removal created a ledger row")
+	}
+	kept, _ := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repo, Ref: ref})
+	if !slices.Equal(kept.PendingUnknownIds, []int64{12}) {
+		t.Fatalf("empty removal changed the set: %v", kept.PendingUnknownIds)
+	}
 }

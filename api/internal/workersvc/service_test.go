@@ -40,6 +40,8 @@ func uziLabels(extra ...string) []byte {
 // fakeStore embeds the Store interface so unimplemented methods panic if a test
 // path reaches them unexpectedly; the tests override only what they exercise.
 type fakeStore struct {
+	// pendingRemovals records the pending-only ledger removals (no run created).
+	pendingRemovals    []store.RemoveMRReworkPendingIDsParams
 	promoteVaultLocked func(context.Context, uuid.UUID) ([]store.PromoteVaultLockedRecoveryWaitRunsRow, error)
 	// reviseErr forces CreateRunReviseInputIfUnderCap to fail (PRD #1795: a 0-row race).
 	reviseErr error
@@ -1659,6 +1661,11 @@ func (f *fakeStore) CreateAutoMRReworkRun(_ context.Context, arg store.CreateAut
 	f.mrReworkRunParams = &arg
 	return f.mrReworkRunResult, f.mrReworkRunErr
 }
+func (f *fakeStore) RemoveMRReworkPendingIDs(_ context.Context, arg store.RemoveMRReworkPendingIDsParams) error {
+	f.pendingRemovals = append(f.pendingRemovals, arg)
+	return nil
+}
+
 func (f *fakeStore) GetMRReworkLedger(_ context.Context, _ store.GetMRReworkLedgerParams) (store.MrReworkLedger, error) {
 	return f.mrReworkLedger, f.mrReworkLedgerErr
 }

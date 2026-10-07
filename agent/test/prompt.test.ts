@@ -544,6 +544,24 @@ describe("buildReviewCommentsContext (PRD #700 M4)", () => {
     }
   });
 
+  it("tolerates a null or absent comments array: no throw, withheld notes still render", () => {
+    // The API once serialized an all-withheld snapshot as "comments":null.
+    for (const comments of [null, undefined]) {
+      const snap = {
+        version: 2, comments, truncated: false,
+        withheld_not_eligible: 2, withheld_unknown: 1,
+      } as unknown as ReviewCommentsSnapshot;
+      const out = buildReviewCommentsContext(snap);
+      assert.match(out, /2 review comments withheld: author not eligible/);
+      assert.match(out, /1 review comment withheld: permission unknown/);
+      assert.doesNotMatch(out, /<review_comments_/);
+      assert.strictEqual(
+        buildReviewCommentsContext({ version: 2, comments, truncated: false } as unknown as ReviewCommentsSnapshot),
+        "",
+      );
+    }
+  });
+
   it("zero, negative, fractional or non-numeric counts render no note", () => {
     const base = { version: 2, comments: [], truncated: false } as ReviewCommentsSnapshot;
     assert.strictEqual(buildReviewCommentsContext({ ...base, withheld_not_eligible: 0, withheld_unknown: 0 }), "");

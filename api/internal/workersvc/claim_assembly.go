@@ -517,6 +517,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// legacy snapshot was withheld rather than that the MR had no comments.
 			reviewComments = &ReviewCommentsSnapshot{Comments: []ReviewCommentSnapshot{}}
 		} else {
+			if snap.Comments == nil {
+				snap.Comments = []ReviewCommentSnapshot{} // a stored "comments":null replays as an array
+			}
 			reviewComments = &snap
 		}
 	}

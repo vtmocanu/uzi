@@ -110,6 +110,21 @@ SET attempt_count = mr_rework_ledger.attempt_count + 1,
     pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, @pending_add::bigint[], @pending_remove::bigint[], mr_rework_ledger.high_water),
     updated_at    = now();
 
+-- name: RemoveMRReworkPendingIDs :exec
+-- Drop ids from a ledger row's pending_unknown_ids WITHOUT spending a cycle (issue #2347): the
+-- pending ids the snapshot caps evicted (an eligible pending comment that no longer fits the
+-- capped snapshot falls back to human review, so it must stop re-triggering the assessment).
+-- Array subtraction only: attempt_count, high_water, halt_notified and updated_at are left
+-- alone, and no row is created when the ref has none.
+UPDATE mr_rework_ledger
+SET pending_unknown_ids = ARRAY(
+    SELECT p.x
+    FROM unnest(mr_rework_ledger.pending_unknown_ids) AS p(x)
+    WHERE p.x <> ALL (@ids::bigint[])
+    ORDER BY p.x
+)
+WHERE repo_id = @repo_id::uuid AND ref = @ref;
+
 -- name: SetMRReworkHaltNotified :exec
 -- The HALT comment-once latch: once the per-MR cap halt has posted its explanatory
 -- comment, set halt_notified so it is never posted again for this ref. Written as an

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -198,5 +199,51 @@ func TestStartMRReworkPendingIDCountsAsNew(t *testing.T) {
 	p := fs.mrReworkAndAdvanceParams
 	if p == nil || len(p.PendingRemove) != 1 || p.PendingRemove[0] != 7 {
 		t.Fatalf("params = %+v, want pending id 7 consumed", p)
+	}
+}
+
+// evictedPendingSnapshot is the reviewer's scenario: eligible pending comment 50 plus ten 4 KiB
+// eligible comments the byte cap keeps instead, with the mark already at 200.
+func evictedPendingSnapshot(t *testing.T) *ReviewSnapshotResult {
+	t.Helper()
+	comments := []forge.MRComment{rc(50, eligibleAuthor, "old")}
+	for id := int64(101); id <= 110; id++ {
+		comments = append(comments, rc(id, eligibleAuthor, strings.Repeat("x", 4096)))
+	}
+	res := assessedResult(t, 200, []int64{50}, comments...)
+	if !res.Snapshot.Truncated {
+		t.Fatal("precondition: the byte cap must clip the snapshot")
+	}
+	return res
+}
+
+// A pending id the caps evict is removed from the pending set even when the on-demand trigger
+// is refused, so the next tick does not repeat the assessment for it.
+func TestStartMRReworkRefusalDropsPendingIDsTheCapsEvicted(t *testing.T) {
+	fs, svc, user, runID := reworkFixture(t, 200, []int64{50})
+	_, err := svc.StartMRReworkForRun(context.Background(), user, runID, "", evictedPendingSnapshot(t))
+	if !errors.Is(err, ErrReworkNothingNew) {
+		t.Fatalf("err = %v, want ErrReworkNothingNew", err)
+	}
+	if len(fs.pendingRemovals) != 1 || len(fs.pendingRemovals[0].Ids) != 1 || fs.pendingRemovals[0].Ids[0] != 50 {
+		t.Fatalf("pending removals = %+v, want one removal of id 50", fs.pendingRemovals)
+	}
+	if fs.mrReworkAndAdvanceParams != nil {
+		t.Fatal("a run was created for an evicted-only trigger")
+	}
+}
+
+// With guidance the run proceeds and the atomic create statement carries the removal.
+func TestStartMRReworkGuidanceRemovesEvictedPendingIDsAtomically(t *testing.T) {
+	fs, svc, user, runID := reworkFixture(t, 200, []int64{50})
+	if _, err := svc.StartMRReworkForRun(context.Background(), user, runID, "tidy up", evictedPendingSnapshot(t)); err != nil {
+		t.Fatal(err)
+	}
+	p := fs.mrReworkAndAdvanceParams
+	if p == nil || !slices.Contains(p.PendingRemove, 50) {
+		t.Fatalf("create params = %+v, want PendingRemove to include 50", p)
+	}
+	if len(fs.pendingRemovals) != 0 {
+		t.Fatalf("a separate removal ran next to the atomic create: %+v", fs.pendingRemovals)
 	}
 }

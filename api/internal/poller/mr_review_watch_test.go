@@ -47,11 +47,13 @@ type mrwStore struct {
 	ledgers map[string]store.MrReworkLedger
 	getErr  error
 
-	upserts   []store.UpsertMRReworkLedgerParams
-	haltSets  []store.SetMRReworkHaltNotifiedParams
-	evicts    []uuid.UUID
-	upsertErr error
-	haltErr   error
+	upserts []store.UpsertMRReworkLedgerParams
+	// pendingRemovals records the pending-only removals (no run created).
+	pendingRemovals []store.RemoveMRReworkPendingIDsParams
+	haltSets        []store.SetMRReworkHaltNotifiedParams
+	evicts          []uuid.UUID
+	upsertErr       error
+	haltErr         error
 
 	ops *[]string
 
@@ -154,6 +156,29 @@ func mergePending(existing, added, removed []int64, priorHighWater int64) []int6
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
+}
+
+// RemoveMRReworkPendingIDs mirrors the SQL: array subtraction on the pending set of an
+// existing row, leaving every other column alone.
+func (s *mrwStore) RemoveMRReworkPendingIDs(_ context.Context, arg store.RemoveMRReworkPendingIDsParams) error {
+	cur, ok := s.ledgers[arg.Ref]
+	if !ok {
+		return nil
+	}
+	s.pendingRemovals = append(s.pendingRemovals, arg)
+	drop := map[int64]bool{}
+	for _, id := range arg.Ids {
+		drop[id] = true
+	}
+	kept := []int64{}
+	for _, id := range cur.PendingUnknownIds {
+		if !drop[id] {
+			kept = append(kept, id)
+		}
+	}
+	cur.PendingUnknownIds = kept
+	s.ledgers[arg.Ref] = cur
+	return nil
 }
 
 func (s *mrwStore) SetMRReworkHaltNotified(_ context.Context, arg store.SetMRReworkHaltNotifiedParams) error {

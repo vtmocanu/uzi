@@ -376,6 +376,11 @@ func (s *Service) StartMRReworkForRun(ctx context.Context, userID, runID uuid.UU
 	// (Decision 3: guidance alone is a valid trigger). When the reason is that the new
 	// comments' authors could not be verified yet, say so: that one is worth retrying.
 	if !plan.HasNew && strings.TrimSpace(guidance) == "" {
+		// Pending ids the caps evicted fall back to human review even though no run is created
+		// (with guidance the create below removes them in its own statement).
+		if err := s.dropEvictedPending(ctx, repoID, ref, plan); err != nil {
+			return store.Run{}, err
+		}
 		if plan.UnknownNew > 0 {
 			return store.Run{}, ErrReworkPermissionUnknown
 		}
@@ -402,4 +407,16 @@ func (s *Service) StartMRReworkForRun(ctx context.Context, userID, runID uuid.UU
 	}
 
 	return run, nil
+}
+
+// dropEvictedPending removes the pending ids the snapshot caps evicted from the ledger's
+// pending set without creating a run or spending a cycle (RemoveMRReworkPendingIDs).
+func (s *Service) dropEvictedPending(ctx context.Context, repoID uuid.UUID, ref string, plan ReviewPlan) error {
+	if len(plan.PendingEvicted) == 0 {
+		return nil
+	}
+	if err := s.q.RemoveMRReworkPendingIDs(ctx, store.RemoveMRReworkPendingIDsParams{RepoID: repoID, Ref: ref, Ids: plan.PendingEvicted}); err != nil {
+		return fmt.Errorf("drop evicted pending review comment ids: %w", err)
+	}
+	return nil
 }
