@@ -691,8 +691,7 @@ export class RecoveryCoordinator {
         // No surviving journal is permission to reopen a closed/discarded guarded hold.
         // Inventory-protocol creation requires a fresh exact open hold. An indeterminate
         // read retains the source without manufacturing a new journal.
-        if ((await this.guardedGeneration(input)) && this.client.hasFeature?.("recovery_inventory_v1") &&
-            !(await this.openInventoryHold(input))) return undefined;
+        if ((await this.guardedGeneration(input)) && !(await this.openInventoryHold(input))) return undefined;
         const record: RecoveryRecord = {
           version: JOURNAL_VERSION,
           runId: input.runId,
@@ -1937,7 +1936,11 @@ export class RecoveryCoordinator {
           (!credentialsBlocked || (r.inventoryGuarded && r.finalAcknowledged)))
         .sort((a, b) => (this.lastAttemptAt.get(a.captureId) ?? 0) - (this.lastAttemptAt.get(b.captureId) ?? 0))
         .slice(0, this.liveMaxPerPass);
+      // A blocked pass with no local ACK work must not delay a newer authenticated heartbeat.
+      if (credentialsBlocked && candidates.length === 0) return;
+      let uploadsStopped = credentialsBlocked;
       for (const snap of candidates) {
+        if (uploadsStopped && !(snap.inventoryGuarded && snap.finalAcknowledged)) continue;
         if (opts.signal?.aborted) break;
         const res = await runCaptureCycle(await this.cycleKey(snap), "skip", () => this.liveStep(snap, opts));
         if (!res.ran) {
@@ -1947,7 +1950,9 @@ export class RecoveryCoordinator {
           continue;
         }
         if (res.value === "transient") transient = true;
-        // A credential failure blocks further uploads, but local ACK siblings still run.
+        // A credential failure blocks further uploads in this pass even if its heartbeat
+        // timestamp is newer than the local clock. Local ACK siblings still run.
+        if (res.value === "credential") uploadsStopped = true;
       }
     } catch (err) {
       this.log.warn("recovery: live re-drive pass failed", { error: errText(err) });
@@ -2026,7 +2031,7 @@ export class RecoveryCoordinator {
    */
   async forgetGeneration(runId: string, generation: number): Promise<void> {
     if (!this.enabled) return;
-    await runCaptureCycle(await this.cycleKey({ runId, captureId: "", generation }), "wait",
+    await runCaptureCycle(await this.cycleKey({ runId, captureId: "", generation, inventoryGuarded: true }), "wait",
       () => this.forgetGenerationWithinCycle(runId, generation));
   }
 
@@ -2035,6 +2040,13 @@ export class RecoveryCoordinator {
    * covering ACK and the bounded boot/live passes retry it independently of upload eligibility. */
   private async forgetGenerationWithinCycle(runId: string, generation: number, isExecuting = this.isExecuting): Promise<void> {
     await this.withJournalLock(runId, async () => {
+      // Keep legacy exact-release cleanup (including opaque sibling retention) unchanged.
+      // Classify under the journal lock and generation cycle so a new guarded writer cannot
+      // slip between classification and removal. Guarded cleanup checks the complete inventory.
+      if (!(await this.guardedGeneration({ runId, generation }))) {
+        await this.removeGenerationRecordsUnlocked(runId, generation, "rmdir_if_empty");
+        return;
+      }
       const records = await this.checkedRecords(runId);
       const selected = records.filter(r => r.generation === generation);
       if (!selected.length) return;

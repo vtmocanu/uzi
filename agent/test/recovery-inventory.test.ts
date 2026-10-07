@@ -217,6 +217,25 @@ it("M2 credential rejection still permits spaced local ACK cleanup", async () =>
   } finally { await f.close(); }
 });
 
+it("M2 feature rollback cannot reopen an ACK-cleaned guarded journal", async () => {
+  const f = await fixture();
+  try {
+    f.state.closeOnRelease = true;
+    const record = await f.freeze();
+    assert.ok(record);
+    Object.assign(f.git, { cleanupRecoveryGeneration: async () => "removed" });
+    await f.capture(record);
+    assert.deepEqual(await f.coordinator.inspect("run-1"), []);
+    f.state.feature = false;
+    const fresh = f.make();
+    assert.equal(await fresh.pin({ runId: "run-1", generation: 7, kind: "issue",
+      branch: "task", sourceSha: H, inventoryGuarded: true }), undefined);
+    assert.deepEqual(await fresh.inspect("run-1"), []);
+    assert.equal(f.reserves(), 1);
+    assert.equal(f.state.uploads, 1);
+  } finally { await f.close(); }
+});
+
 for (const closure of ["ACK", "discard"] as const) {
   it(`M2 delayed guarded pin cannot recreate a journal after ${closure}`, async () => {
     const f = await fixture();
@@ -1379,15 +1398,18 @@ it("restart from persisted divergent owed refs without a journal uploads an impo
 it("a guarded journal never uses the legacy release RPC after feature loss", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "inventory-"));
   const calls: unknown[] = [];
+  let feature = true;
   const coordinator = new RecoveryCoordinator({
     recoveryRoot: root, workerToken: "local-worker-fixture", log: nullLogger(),
     client: {
-      hasFeature: () => false,
+      hasFeature: () => feature,
       releaseRecoveryCustody: async (...args: unknown[]) => {
         calls.push(args);
         return { run_id: "run-1", released: true, holds_released: 1, generation: 7 };
       },
-      listRecoveryHolds: async () => ({ run_id: "run-1", holds: [] }),
+      listRecoveryHolds: async () => ({ run_id: "run-1", holds: [
+        { hold_id: "hold-7", generation: 7, inventory_guarded: true, has_available_capture: false },
+      ] }),
     } as never,
     git: {} as never,
   });
@@ -1396,6 +1418,7 @@ it("a guarded journal never uses the legacy release RPC after feature loss", asy
       runId: "run-1", generation: 7, sourceSha: "a".repeat(40),
       kind: "issue", branch: "task", inventoryGuarded: true,
     });
+    feature = false;
     await coordinator.release("run-1", 7, "publication");
     assert.deepEqual(calls, []);
     assert.equal((await coordinator.inspect("run-1")).length, 1);
