@@ -25,6 +25,44 @@ class CheckerTest(unittest.TestCase):
         for body in ('<failure/>', '<error/>'):
             self.assertTrue(check(self.expected, self.report(self.case(body))))
 
+    def test_local_diagnostics(self):
+        for tag in ("skipped", "failure", "error"):
+            with self.subTest(tag=tag):
+                errors = check(self.expected, self.report(self.case(
+                    f'<{tag} message="cancelled &amp; timed out" type="testTimeoutFailure" '
+                    'stack="frame attribute">Error &lt;fixture&gt;\n at frame.ts:42</' + tag + '>'
+                )))
+                diagnostic = "\n".join(errors)
+                for detail in ("agent/test/example.test.ts: suite > leaf",
+                               f"{tag} from testcase: suite > leaf",
+                               "message=cancelled & timed out", "type=testTimeoutFailure",
+                               "stack=frame attribute", "Error <fixture>", "at frame.ts:42"):
+                    self.assertIn(detail, diagnostic)
+
+    def test_inherited_and_local_provenance(self):
+        expected = [{"file": "agent/test/example.test.ts", "names": ["suite", "nested", "leaf"]}]
+        for tag in ("skipped", "failure", "error"):
+            root = ET.fromstring(
+                f'<testsuites><testsuite name="suite"><{tag} message="parent reason"/>'
+                '<testsuite name="nested"><error>nested stack</error>'
+                + self.case('<failure message="leaf reason"/>')
+                + '</testsuite></testsuite></testsuites>'
+            )
+            diagnostic = "\n".join(check(expected, root))
+            for detail in (f"{tag} from testsuite: suite: message=parent reason",
+                           "error from testsuite: suite > nested: nested stack",
+                           "failure from testcase: suite > nested > leaf: message=leaf reason"):
+                self.assertIn(detail, diagnostic)
+
+    def test_no_reason(self):
+        for tag in ("skipped", "failure", "error"):
+            diagnostic = "\n".join(check(self.expected, self.report(self.case(f'<{tag}/>'))))
+            self.assertIn("no reason supplied", diagnostic)
+
+    def test_duplicate_source_identity(self):
+        self.assertIn("duplicate source leaf identity",
+                      check(self.expected * 2, self.report(self.case())))
+
     def test_skipped_suite_does_not_prove_leaf(self):
         self.assertTrue(check(self.expected, ET.fromstring(
             '<testsuites><testcase name="suite" file="/app/test/example.test.ts"><skipped/></testcase></testsuites>'

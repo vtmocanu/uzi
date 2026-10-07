@@ -334,6 +334,8 @@ tasks:
       # welded onto / bled into a db_psql scalar read is stripped (#1351). Tally-guarded like the two
       # siblings above so a gutted run cannot read green.
       - task: test:e2e-lib
+      # Docker-free diagnostic regressions for the worker UID lane (#2397).
+      - task: test:worker-uid-harness
       # hermetic (~instant): a fake `docker` on PATH, no daemon. Guards that
       # run-store-it.sh's teardown removes the throwaway Postgres ANONYMOUS VOLUME
       # (`docker rm -v`); the missing `-v` leaked one pg volume per run and filled
@@ -2478,10 +2480,17 @@ tasks:
       # PRD 1287 C1 / D7 point 5: M4 runs once after the complete local unit suite.
       - task: test:codex-m4
 
+  test:worker-uid-harness:
+    desc: Docker-free worker UID report checker and shell wrapper regressions
+    cmds:
+      - python3 e2e/worker-uid/check_test.py
+      - python3 e2e/worker-uid/run_test.py
+      - python3 e2e/worker-uid/gate_test.py
+
   test:agent:worker-uid:
     desc: agent - require real worker UID ownership tests inside the base image
     cmds:
-      - python3 e2e/worker-uid/gate_test.py
+      - task: test:worker-uid-harness
       - bash e2e/worker-uid/run.sh
 
   test:agent:shard:

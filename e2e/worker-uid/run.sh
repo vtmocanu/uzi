@@ -4,7 +4,8 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 IMAGE="${WORKER_UID_IMAGE:-wuid-2134-base:local}"
 NAME="wuid-2134-$$"
-REPORT_DIR="$(mktemp -d)"
+mkdir -p "$REPO/.uzi/scratch"
+REPORT_DIR="$(mktemp -d "$REPO/.uzi/scratch/worker-uid.XXXXXX")"
 cleanup() {
   docker rm -f "$NAME" >/dev/null 2>&1 || true
 }
@@ -35,8 +36,11 @@ timeout --kill-after=30s "${WORKER_UID_TIMEOUT:-600}" docker run --rm --network 
 rc=$?
 set -e
 printf 'worker UID reports: %s\n' "$REPORT_DIR"
-python3 e2e/worker-uid/check.py "$REPORT_DIR/expected.json" "$REPORT_DIR/results.xml"
+checker_rc=0
+python3 e2e/worker-uid/check.py "$REPORT_DIR/expected.json" "$REPORT_DIR/results.xml" || checker_rc=$?
 if [ "$rc" -ne 0 ]; then
   printf 'worker UID node/container exit: %s\n' "$rc" >&2
+fi
+if [ "$rc" -ne 0 ] || [ "$checker_rc" -ne 0 ]; then
   exit 1
 fi
