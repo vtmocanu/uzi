@@ -959,9 +959,9 @@ type Store interface {
 	// converging with CancelRunServerSide — rather than being mis-classified as
 	// agent_failure. Worker-scoped because SetState holds a worker, not a user.
 	CancelRunByWorker(ctx context.Context, arg store.CancelRunByWorkerParams) (int64, error)
-	// SupersedeRunByWorker (issue #1117) is the live-worker terminal transition for an
-	// mr_rework run whose finalize push lost to a concurrent same-branch writer: status
-	// 'cancelled', stop_kind='branch_moved', fail_origin NULL, a static stop_reason. Like
+	// SupersedeRunByWorker is the live-worker terminal transition for an mr_rework or
+	// ci_fix run superseded by a concurrent branch advance: status 'cancelled',
+	// stop_kind='branch_moved', NULL failure fields, a server-composed stop_reason. Like
 	// CancelRunByWorker it is worker-scoped and a 0-row no-op onto an already-terminal run.
 	SupersedeRunByWorker(ctx context.Context, arg store.SupersedeRunByWorkerParams) (int64, error)
 	RejectRunServerSide(ctx context.Context, arg store.RejectRunServerSideParams) (int64, error)
@@ -3544,6 +3544,22 @@ const (
 // and the worker's batcher retries a failed batch at head forever (poison loop).
 const maxCostUSD = 999999.999999
 
+// Anchored canonical diagnostics accept one cause and exactly one lowercase SHA-1.
+// Length checking bounds parsing even for hostile worker prose.
+var branchMovedDiagnostic = regexp.MustCompile(`\Abranch_moved: (remote_branch_advanced); superseding_tip=([0-9a-f]{40})\z`)
+
+func branchMovedStopReason(reason *string) string {
+	const generic = "superseded by a concurrent branch advance; further publication stopped."
+	if reason == nil || len(*reason) != len("branch_moved: remote_branch_advanced; superseding_tip=")+40 {
+		return generic
+	}
+	match := branchMovedDiagnostic.FindStringSubmatch(*reason)
+	if match == nil {
+		return generic
+	}
+	return generic + " cause=" + match[1] + "; superseding_tip=" + match[2]
+}
+
 // StateRequest is the worker's report of a run's new state. Only the fields
 // relevant to State are read. The wire key is `status` (matches the runs.status
 // column and the M2 worker client); the Go field stays
@@ -3646,12 +3662,9 @@ type StateRequest struct {
 	// normal completion stay byte-identical on the wire. httpx.DecodeJSON rejects unknown
 	// fields, so this field MUST exist here or a new worker's report 400s.
 	ScopeCapped *bool `json:"scope_capped"`
-	// BranchMoved (issue #1117) is the worker's DECLARATION, on an mr_rework `failed` report,
-	// that the finalize push was rejected non-fast-forward because a concurrent same-branch
-	// writer advanced the MR branch. UNTRUSTED like ScopeCapped: the server honors it ONLY when
-	// the run's own kind is mr_rework (owned.Kind == runkind.MRRework), routing to a
-	// 'cancelled'/'branch_moved' disposition instead of defaulting to 'agent_failure'. Absent/
-	// false on every other report ⇒ byte-identical to before.
+	// BranchMoved declares a concurrent branch advance on a failed report. The server
+	// honors it only for its own mr_rework or ci_fix run kind. FailureReason diagnostics
+	// alone grant no supersession; absent/false retains the ordinary failure path.
 	BranchMoved *bool `json:"branch_moved"`
 	// RepoAgents is the roster the worker parsed from the clone's .claude/agents/
 	// (PRD #37), reported on the first `running` report after checkout. A POINTER to
@@ -4700,15 +4713,10 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				// preserved.
 				ClaimGeneration: pgtype.Int8{},
 			})
-		case req.BranchMoved != nil && *req.BranchMoved && owned.Kind == runkind.MRRework:
-			// Issue #1117: an mr_rework finalize push rejected non-fast-forward because a concurrent
-			// same-branch writer advanced the MR branch is a benign, expected race (the "double-fix
-			// collision" the uzi-watcher warns about), NOT an agent failure. Route to a distinct
-			// 'cancelled'/stop_kind='branch_moved' disposition (fail_origin NULL, not judged — Gate 0)
-			// rather than the agent_failure default. GUARDED on the run's own kind (a server-known fact,
-			// like ScopeCapped's scope_ceiling guard) so an untrusted worker cannot mint the benign
-			// disposition on any other kind. Placed after the operator-stop arms so a concurrent operator
-			// cancel/stop (which pre-stamped owned.StopKind) still wins.
+		case req.BranchMoved != nil && *req.BranchMoved && (owned.Kind == runkind.MRRework || owned.Kind == runkind.CIFix):
+			// The server-owned kind allowlist limits supersession to branch-maintenance runs.
+			// Operator stop arms above retain priority. Diagnostics only decorate this
+			// explicit signal; they cannot prove supersession or whether a push applied.
 			//
 			// PRD #1247 fix round: use the TX-bound q (not s.q). This arm runs under the outer
 			// FOR UPDATE fence (q rebound to qtx), which holds a row lock on runID; issuing the
@@ -4716,7 +4724,8 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// the context deadline, hanging every capability-worker mr_rework branch_moved report.
 			// Every sibling arm uses q for exactly this reason.
 			rows, err = q.SupersedeRunByWorker(ctx, store.SupersedeRunByWorkerParams{
-				ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+				StopReason: branchMovedStopReason(req.FailureReason),
+				ID:         runID, WorkerID: pgconv.UUID(wkr.ID),
 			})
 		default:
 			// PRD #69 M7a: stamp the TRUSTED failure class. The worker-reported origin is

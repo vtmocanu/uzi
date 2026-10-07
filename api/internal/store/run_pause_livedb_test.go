@@ -595,7 +595,7 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 		})
 		t.Run("SupersedeRunByWorker", func(t *testing.T) {
 			id := armedRunning(t, 0, false)
-			if rows, err := q.SupersedeRunByWorker(ctx, store.SupersedeRunByWorkerParams{ID: id, WorkerID: workerID}); err != nil || rows != 1 {
+			if rows, err := q.SupersedeRunByWorker(ctx, store.SupersedeRunByWorkerParams{ID: id, WorkerID: workerID, StopReason: "superseded by a concurrent branch advance; further publication stopped."}); err != nil || rows != 1 {
 				t.Fatalf("SupersedeRunByWorker = (%d,%v), want (1,nil)", rows, err)
 			}
 			assertCleared(t, id, "cancelled")

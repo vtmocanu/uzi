@@ -1617,8 +1617,8 @@ func (f *fakeStore) CancelRunByWorker(_ context.Context, arg store.CancelRunByWo
 	return 1, nil
 }
 
-// SupersedeRunByWorker (issue #1117) records the live-worker branch_moved supersession of an
-// mr_rework run. Returns 1 (applied) like the CancelRunByWorker fake.
+// SupersedeRunByWorker records a live-worker branch_moved supersession and its
+// server-composed reason. Returns 1 (applied) like the CancelRunByWorker fake.
 func (f *fakeStore) SupersedeRunByWorker(_ context.Context, arg store.SupersedeRunByWorkerParams) (int64, error) {
 	f.supersededByWorker = &arg
 	return 1, nil

@@ -19322,7 +19322,7 @@ func (q *Queries) SupersedeExitedPlanCrossChecks(ctx context.Context) ([]uuid.UU
 const supersedeRunByWorker = `-- name: SupersedeRunByWorker :execrows
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
-    WHERE runs.id = $1 AND runs.worker_id = $2
+    WHERE runs.id = $2 AND runs.worker_id = $3
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
   AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
@@ -19352,7 +19352,8 @@ UPDATE runs SET
     plan_cross_check_gate_reason = NULL,
     status             = 'cancelled',
     stop_kind          = 'branch_moved',
-    stop_reason        = 'The MR branch was advanced by a concurrent writer, so this rework was superseded and not applied. The branch and the concurrent commits are intact.',
+    stop_reason        = $1::text,
+    failure_reason     = NULL,
     status_since       = now(),
     fail_origin        = NULL,
     move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END,
@@ -19363,7 +19364,7 @@ UPDATE runs SET
     credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
-WHERE runs.id = $1 AND runs.worker_id = $2
+WHERE runs.id = $2 AND runs.worker_id = $3
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
   AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
@@ -19371,21 +19372,17 @@ WHERE runs.id = $1 AND runs.worker_id = $2
 `
 
 type SupersedeRunByWorkerParams struct {
-	ID       uuid.UUID   `json:"id"`
-	WorkerID pgtype.UUID `json:"worker_id"`
+	StopReason string      `json:"stop_reason"`
+	ID         uuid.UUID   `json:"id"`
+	WorkerID   pgtype.UUID `json:"worker_id"`
 }
 
-// Issue #1117: a LIVE mr_rework worker whose finalize push was rejected non-fast-forward
-// because a concurrent same-branch writer (a human / uzi-watcher landing review fixes)
-// advanced the MR branch under it reports `failed` + branch_moved. SetState's failed arm
-// routes HERE (guarded on kind='mr_rework') instead of SetRunFailed, so a benign, expected
-// race is NOT mis-classified as 'agent_failure' (and is not judged — status 'cancelled',
-// Gate 0). Distinct from CancelRunByWorker in that it STAMPS stop_kind='branch_moved' +
-// a static stop_reason in the same statement (branch_moved has no pre-stamp, unlike a
-// CreateStopVerdictInput cancel). Terminal cleanup mirrors CancelRunByWorker. Its extra
-// hold guard keeps a late failed report from cancelling a wall or completion hold.
+// SetState allowlists mr_rework/ci_fix branch_moved reports and composes the bounded
+// stop_reason server-side. Stamp the cancellation and clear both failure fields together.
+// Terminal cleanup mirrors CancelRunByWorker; ownership, release, terminal and hold
+// guards keep late reports from changing runs they no longer control.
 func (q *Queries) SupersedeRunByWorker(ctx context.Context, arg SupersedeRunByWorkerParams) (int64, error) {
-	result, err := q.db.Exec(ctx, supersedeRunByWorker, arg.ID, arg.WorkerID)
+	result, err := q.db.Exec(ctx, supersedeRunByWorker, arg.StopReason, arg.ID, arg.WorkerID)
 	if err != nil {
 		return 0, err
 	}

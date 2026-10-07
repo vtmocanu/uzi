@@ -2,91 +2,150 @@ package workersvc
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 )
 
-// TestSetStateFailedBranchMovedRoutesToSupersede (issue #1117): an mr_rework worker whose
-// finalize push was rejected non-fast-forward because a concurrent same-branch writer advanced
-// the MR branch reports `failed` + branch_moved:true. The failed arm must route that to
-// SupersedeRunByWorker (status 'cancelled', stop_kind='branch_moved', fail_origin NULL) instead
-// of SetRunFailed — so a benign race is not mis-classified as agent_failure (and is not judged).
-func TestSetStateFailedBranchMovedRoutesToSupersede(t *testing.T) {
-	run := runningRun(false)
-	run.Kind = runkind.MRRework
-	fs, svc, wkr := limitParkFixture(t, run)
+const branchMovedCanonical = "branch_moved: remote_branch_advanced; superseding_tip=0123456789abcdef0123456789abcdef01234567"
+const branchMovedReason = "superseded by a concurrent branch advance; further publication stopped."
+const branchMovedDetailedReason = "superseded by a concurrent branch advance; further publication stopped. cause=remote_branch_advanced; superseding_tip=0123456789abcdef0123456789abcdef01234567"
 
-	moved := true
-	reason := "finalize push rejected non-fast-forward"
-	if _, _, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{
-		State: "failed", FailureReason: &reason, BranchMoved: &moved,
-	}); err != nil {
-		t.Fatalf("SetState: %v", err)
-	}
-	if fs.supersededByWorker == nil {
-		t.Fatal("SupersedeRunByWorker was never called for an mr_rework branch_moved failed report")
-	}
-	if fs.supersededByWorker.ID != run.ID {
-		t.Fatalf("SupersedeRunByWorker id = %v, want %v", fs.supersededByWorker.ID, run.ID)
-	}
-	if fs.setFailed != nil {
-		t.Fatalf("SetRunFailed was called for an mr_rework branch_moved report (should supersede): %+v", fs.setFailed)
+func TestSetStateFailedBranchMovedKindRegistry(t *testing.T) {
+	for _, kind := range append(runkind.All(), "unknown") {
+		t.Run(kind, func(t *testing.T) {
+			run := runningRun(false)
+			run.Kind = kind
+			fs, svc, wkr := limitParkFixture(t, run)
+			moved := true
+			reason := branchMovedCanonical
+			_, _, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{
+				State: "failed", FailureReason: &reason, BranchMoved: &moved,
+			})
+			if kind == runkind.Job {
+				if !errors.Is(err, ErrMissingClaimGeneration) || fs.supersededByWorker != nil {
+					t.Fatalf("job protocol guard: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			allowed := kind == runkind.MRRework || kind == runkind.CIFix
+			if (fs.supersededByWorker != nil) != allowed {
+				t.Fatalf("supersede called=%v, want %v", fs.supersededByWorker != nil, allowed)
+			}
+			if allowed {
+				if fs.setFailed != nil {
+					t.Fatal("supersession called SetRunFailed")
+				}
+			} else if fs.setFailed == nil || fs.setFailed.FailOrigin.String != "agent_failure" {
+				t.Fatalf("ordinary failure missing: %+v", fs.setFailed)
+			}
+		})
 	}
 }
 
-// TestSetStateFailedBranchMovedIgnoredOffMRRework (issue #1117): the branch_moved signal is
-// UNTRUSTED — the server honors it ONLY when the run's own kind is mr_rework. On any other
-// kind the guard holds: the report falls through to the agent_failure default (SetRunFailed),
-// and SupersedeRunByWorker is NOT called, so an untrusted worker cannot mint the benign
-// disposition on, e.g., an ordinary issue run.
-//
-// MUTATION PROOF: drop the `owned.Kind == runkind.MRRework` guard and this issue run would
-// route to SupersedeRunByWorker (fs.supersededByWorker set, fs.setFailed nil).
-func TestSetStateFailedBranchMovedIgnoredOffMRRework(t *testing.T) {
-	run := runningRun(false)
-	run.Kind = runkind.Issue
-	fs, svc, wkr := limitParkFixture(t, run)
-
-	moved := true
-	reason := "boom"
-	if _, _, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{
-		State: "failed", FailureReason: &reason, BranchMoved: &moved,
-	}); err != nil {
-		t.Fatalf("SetState: %v", err)
+func TestSetStateFailedBranchMovedDiagnostics(t *testing.T) {
+	cases := []struct {
+		name   string
+		reason *string
+		want   string
+	}{}
+	add := func(name, reason, want string) {
+		cases = append(cases, struct {
+			name   string
+			reason *string
+			want   string
+		}{name, &reason, want})
 	}
-	if fs.supersededByWorker != nil {
-		t.Fatalf("SupersedeRunByWorker was called for a non-mr_rework run (guard failed): %+v", fs.supersededByWorker)
+	cases = append(cases, struct {
+		name   string
+		reason *string
+		want   string
+	}{"absent", nil, branchMovedReason})
+	add("canonical", branchMovedCanonical, branchMovedDetailedReason)
+	for name, reason := range map[string]string{
+		"legacy":        "finalize push rejected non-fast-forward",
+		"partial":       "branch_moved: remote_branch_advanced",
+		"short":         strings.TrimSuffix(branchMovedCanonical, "7"),
+		"long":          branchMovedCanonical + "0",
+		"uppercase":     strings.Replace(branchMovedCanonical, "abcdef", "ABCDEF", 1),
+		"nonhex":        strings.TrimSuffix(branchMovedCanonical, "7") + "g",
+		"cause":         strings.Replace(branchMovedCanonical, "remote_branch_advanced", "attacker_cause", 1),
+		"prefix":        "hostile prose " + branchMovedCanonical,
+		"suffix":        branchMovedCanonical + "; hostile prose",
+		"newline":       branchMovedCanonical + "\n",
+		"leading_space": " " + branchMovedCanonical,
+		"hostile":       "<script>hostile</script>",
+	} {
+		add(name, reason, branchMovedReason)
 	}
-	if fs.setFailed == nil {
-		t.Fatal("SetRunFailed was never called for a non-mr_rework branch_moved report (should default to agent_failure)")
-	}
-	if got := fs.setFailed.FailOrigin; !got.Valid || got.String != "agent_failure" {
-		t.Fatalf("fail_origin = %+v, want agent_failure", got)
+	for _, kind := range []string{runkind.MRRework, runkind.CIFix} {
+		for _, tc := range cases {
+			t.Run(kind+"/"+tc.name, func(t *testing.T) {
+				run := runningRun(false)
+				run.Kind = kind
+				fs, svc, wkr := limitParkFixture(t, run)
+				moved := true
+				if _, _, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{State: "failed", BranchMoved: &moved, FailureReason: tc.reason}); err != nil {
+					t.Fatal(err)
+				}
+				if fs.supersededByWorker == nil {
+					t.Fatal("supersession missing")
+				}
+				if got := fs.supersededByWorker.StopReason; got != tc.want {
+					t.Fatalf("stop reason=%q, want %q", got, tc.want)
+				}
+			})
+		}
 	}
 }
 
-// TestSetStateFailedBranchMovedAbsentDefaultsAgentFailure (issue #1117): with branch_moved
-// absent, an mr_rework `failed` report is byte-identical to before — it defaults to
-// fail_origin='agent_failure' via SetRunFailed and never touches SupersedeRunByWorker.
-func TestSetStateFailedBranchMovedAbsentDefaultsAgentFailure(t *testing.T) {
-	run := runningRun(false)
-	run.Kind = runkind.MRRework
-	fs, svc, wkr := limitParkFixture(t, run)
+func TestSetStateFailedBranchMovedAbsentOrFalse(t *testing.T) {
+	no := false
+	for _, kind := range []string{runkind.MRRework, runkind.CIFix} {
+		for _, moved := range []*bool{nil, &no} {
+			run := runningRun(false)
+			run.Kind = kind
+			fs, svc, wkr := limitParkFixture(t, run)
+			reason := branchMovedCanonical
+			if _, _, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{State: "failed", BranchMoved: moved, FailureReason: &reason}); err != nil {
+				t.Fatal(err)
+			}
+			if fs.supersededByWorker != nil || fs.setFailed == nil || fs.setFailed.FailOrigin.String != "agent_failure" {
+				t.Fatalf("diagnostics alone changed failure: %+v", fs.setFailed)
+			}
+		}
+	}
+}
 
-	reason := "boom"
-	if _, _, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{
-		State: "failed", FailureReason: &reason,
-	}); err != nil {
-		t.Fatalf("SetState: %v", err)
-	}
-	if fs.supersededByWorker != nil {
-		t.Fatalf("SupersedeRunByWorker was called with branch_moved absent: %+v", fs.supersededByWorker)
-	}
-	if fs.setFailed == nil {
-		t.Fatal("SetRunFailed was never called for a branch_moved-absent failed report")
-	}
-	if got := fs.setFailed.FailOrigin; !got.Valid || got.String != "agent_failure" {
-		t.Fatalf("fail_origin = %+v, want agent_failure", got)
+func TestSetStateFailedBranchMovedStopPrecedence(t *testing.T) {
+	for _, kind := range []string{runkind.MRRework, runkind.CIFix} {
+		for _, stop := range []string{"cancelled", "stopped", "plan_rejected"} {
+			t.Run(kind+"/"+stop, func(t *testing.T) {
+				run := runningRun(false)
+				run.Kind = kind
+				run.StopKind = pgtype.Text{String: stop, Valid: true}
+				fs, svc, wkr := limitParkFixture(t, run)
+				moved := true
+				reason := branchMovedCanonical
+				if _, _, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{State: "failed", BranchMoved: &moved, FailureReason: &reason}); err != nil {
+					t.Fatal(err)
+				}
+				if fs.supersededByWorker != nil {
+					t.Fatal("branch moved overrode operator stop")
+				}
+				if stop != "plan_rejected" && fs.cancelledByWorker == nil {
+					t.Fatal("operator cancellation missing")
+				}
+				if stop == "plan_rejected" && fs.setFailedPlanRejected == nil {
+					t.Fatal("plan rejection missing")
+				}
+			})
+		}
 	}
 }
