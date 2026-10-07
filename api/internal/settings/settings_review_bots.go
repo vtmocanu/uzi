@@ -22,16 +22,21 @@ type TrustedBot struct {
 }
 
 // MrReviewTrustedBots returns the parsed trusted review-bot allowlist. An absent or empty
-// value yields an empty slice. Like DockerRepoAllowlist it is a STRICT read: a store error
-// is returned so the caller can fail closed (the watcher skips the repo's tick, the
-// on-demand rework answers 409) rather than treat an unreadable list as "no bots", which
-// would route every bot comment through the author lookup it is meant to skip. An
-// unparseable entry in a hand-edited row is skipped: write-time validation is the real gate.
+// value yields an empty slice. It is a STRICT read: a store error is returned, including on
+// a warm cache whose refresh failed (no stale-on-error), so the caller fails closed (the
+// watcher skips the repo's tick, the on-demand rework answers 409) instead of trusting a
+// list it could not re-read; an admin's removal of a bot must not outlive a failed refresh.
+// An unparseable entry in a hand-edited row is skipped: write-time validation is the real gate.
 func (c *Cache) MrReviewTrustedBots(ctx context.Context) ([]TrustedBot, error) {
-	v, err := c.get(ctx, KeyMrReviewTrustedBots)
+	if v, ok := c.env[KeyMrReviewTrustedBots]; ok && v != "" {
+		bots, _ := parseTrustedBots(v)
+		return bots, nil
+	}
+	m, err := c.strictSnapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
+	v := c.effective(KeyMrReviewTrustedBots, m)
 	bots, _ := parseTrustedBots(v)
 	return bots, nil
 }

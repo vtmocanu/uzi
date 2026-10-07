@@ -165,3 +165,65 @@ func TestTrustedBotMatchesDefaultHTTPSPort(t *testing.T) {
 		}
 	}
 }
+
+// trustedBotsRefreshStore answers its first fetch with one allowlisted bot, optionally
+// blocking until release, and fails every later fetch.
+type trustedBotsRefreshStore struct {
+	started, release chan struct{}
+	calls            int
+}
+
+func (s *trustedBotsRefreshStore) ListAppSettings(context.Context) ([]store.AppSetting, error) {
+	s.calls++
+	if s.calls == 1 {
+		if s.started != nil {
+			close(s.started)
+			<-s.release
+		}
+		return []store.AppSetting{{Key: KeyMrReviewTrustedBots, Value: "https://example.com#77"}}, nil
+	}
+	return nil, errors.New("settings read unavailable")
+}
+
+// A warm cache whose refresh fails must not keep serving the allowlist (#2347): the read is
+// strict, so the caller fails closed instead of trusting a list it could not re-read.
+func TestMrReviewTrustedBotsExpiredRefreshFailureIsAnError(t *testing.T) {
+	s := &trustedBotsRefreshStore{}
+	c := New(s, time.Minute)
+	now := time.Unix(1_000_000, 0)
+	c.now = func() time.Time { return now }
+
+	bots, err := c.MrReviewTrustedBots(context.Background())
+	if err != nil || len(bots) != 1 || bots[0].ForgeUserID != 77 {
+		t.Fatalf("warm load = %v, %v; want the one allowlisted bot", bots, err)
+	}
+	now = now.Add(2 * time.Minute)
+	if bots, err := c.MrReviewTrustedBots(context.Background()); err == nil {
+		t.Fatalf("an expired cache whose refresh failed returned %v with no error; want the error", bots)
+	}
+}
+
+// A refresh that read the rows before an admin write must not publish them after the write's
+// Invalidate (#2347): otherwise a removed bot is served as trusted until the TTL expires.
+func TestCacheRefreshDoesNotPublishAcrossInvalidate(t *testing.T) {
+	s := &trustedBotsRefreshStore{started: make(chan struct{}), release: make(chan struct{})}
+	c := New(s, time.Hour)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = c.MrReviewTrustedBots(context.Background())
+	}()
+	<-s.started
+	c.Invalidate() // the admin removal commits while that fetch holds the old rows
+	close(s.release)
+	<-done
+
+	bots, err := c.MrReviewTrustedBots(context.Background())
+	if err == nil {
+		t.Fatalf("the pre-invalidation rows were published: got %v with no refetch", bots)
+	}
+	if s.calls != 2 {
+		t.Fatalf("store calls = %d, want 2 (the read after Invalidate must refetch)", s.calls)
+	}
+}
