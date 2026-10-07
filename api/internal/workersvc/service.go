@@ -607,6 +607,7 @@ type Store interface {
 	// call (checkpoint_publish_attempts, 00267), and the sweeper's attempts arm that reconciles a
 	// push whose outcome the api never learned.
 	RecordCheckpointPublishAttempt(ctx context.Context, arg store.RecordCheckpointPublishAttemptParams) (uuid.UUID, error)
+	RecordLiveCheckpointPublishAttempt(ctx context.Context, arg store.RecordLiveCheckpointPublishAttemptParams) (uuid.UUID, error)
 	MarkCheckpointPublishAttemptReady(ctx context.Context, id uuid.UUID) (int64, error)
 	DeleteCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (int64, error)
 	GetCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (store.CheckpointPublishAttempt, error)
@@ -5914,6 +5915,10 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		return s.publishTerminalLocked(ctx, push, tipOid)
 	}
 	push.live = true
+	defer push.clearPreparedAttempt(ctx)
+	if err := push.prepareLiveAttempt(ctx); err != nil {
+		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, nil
+	}
 
 	// PRD #1810 D2: another run's retained record may hold this branch's slot even when this
 	// publish would fast-forward over it (the new run's work descends from the old tip). The slot
@@ -6020,9 +6025,15 @@ func (s *Service) publishTerminalLocked(ctx context.Context, push *checkpointPus
 // forge call, once the pre-push budget has elapsed (the retry comes after a supersession that can
 // take a while), and every push is recorded in checkpoint_publish_attempts before it is sent.
 func (s *Service) pushCheckpoint(ctx context.Context, push *checkpointPush) error {
+	defer push.clearPreparedAttempt(ctx)
 	err := push.pushOnce(ctx)
-	if errors.Is(err, pushbroker.ErrNotDescendant) && s.freeCheckpointSlot(ctx, push.run, push.branch) {
-		err = push.pushOnce(ctx)
+	if errors.Is(err, pushbroker.ErrNotDescendant) {
+		if admissionErr := push.prepareLiveAttempt(ctx); admissionErr != nil {
+			return admissionErr
+		}
+		if s.freeCheckpointSlot(ctx, push.run, push.branch) {
+			err = push.pushOnce(ctx)
+		}
 	}
 	return err
 }

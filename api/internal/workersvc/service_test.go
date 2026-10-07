@@ -216,8 +216,9 @@ type fakeStore struct {
 	activeRunsAllErr error
 
 	// Ownership + messages + state.
-	runOwned    store.Run
-	runOwnedErr error
+	runOwned             store.Run
+	runOwnedErr          error
+	livePublishAttemptID uuid.UUID
 	// Orphan-classification read (issue #1319): orphanParams captures the args so a test
 	// can prove the owner-scope (user_id + the claimant's repo_id, NOT worker_id);
 	// orphanRow/orphanErr drive the return.
@@ -1031,6 +1032,37 @@ func (f *fakeStore) MarkRunFailedByID(_ context.Context, arg store.MarkRunFailed
 	f.markedFailed = &arg
 	return 1, nil
 }
+func (f *fakeStore) RecordLiveCheckpointPublishAttempt(_ context.Context, p store.RecordLiveCheckpointPublishAttemptParams) (uuid.UUID, error) {
+	// Legacy public Publish fixtures omit the owned row ID; configured IDs
+	// still bind admission to that fixture's authorization snapshot.
+	if (f.runOwned.ID != uuid.Nil && p.RunID != f.runOwned.ID) ||
+		p.ExpectedWorkerID != f.runOwned.WorkerID || p.ExpectedClaimGeneration != f.runOwned.ClaimGeneration {
+		return uuid.Nil, pgx.ErrNoRows
+	}
+	if f.livePublishAttemptID == uuid.Nil {
+		f.livePublishAttemptID = uuid.New()
+	}
+	if p.AttemptID != uuid.Nil && p.AttemptID != f.livePublishAttemptID {
+		return uuid.Nil, pgx.ErrNoRows
+	}
+	return f.livePublishAttemptID, nil
+}
+
+func (f *fakeStore) DeleteCheckpointPublishAttempt(_ context.Context, id uuid.UUID) (int64, error) {
+	if id != f.livePublishAttemptID {
+		return 0, pgx.ErrNoRows
+	}
+	f.livePublishAttemptID = uuid.Nil
+	return 1, nil
+}
+
+func (f *fakeStore) MarkCheckpointPublishAttemptReady(_ context.Context, id uuid.UUID) (int64, error) {
+	if id != f.livePublishAttemptID {
+		return 0, pgx.ErrNoRows
+	}
+	return 1, nil
+}
+
 func (f *fakeStore) GetRunOwnedByWorker(context.Context, store.GetRunOwnedByWorkerParams) (store.Run, error) {
 	return f.runOwned, f.runOwnedErr
 }

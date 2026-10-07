@@ -124,6 +124,31 @@ func (q *Queries) BeginCheckpointSupersession(ctx context.Context, arg BeginChec
 	return result.RowsAffected(), nil
 }
 
+const checkLiveCheckpointPublishAdmission = `-- name: CheckLiveCheckpointPublishAdmission :one
+SELECT id FROM runs
+WHERE id = $1
+  AND worker_id = $2::uuid
+  AND claim_generation = $3::bigint
+  AND claim_released_at IS NULL
+  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input',
+                 'awaiting_followup', 'limit_wait', 'pool_wait', 'paused', 'recovery_wait')
+`
+
+type CheckLiveCheckpointPublishAdmissionParams struct {
+	RunID                   uuid.UUID `json:"run_id"`
+	ExpectedWorkerID        uuid.UUID `json:"expected_worker_id"`
+	ExpectedClaimGeneration int64     `json:"expected_claim_generation"`
+}
+
+// Separate statement after GetRunByIDForUpdate: READ COMMITTED observes any
+// exhaustion transition whose run lock the admission transaction waited for.
+func (q *Queries) CheckLiveCheckpointPublishAdmission(ctx context.Context, arg CheckLiveCheckpointPublishAdmissionParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, checkLiveCheckpointPublishAdmission, arg.RunID, arg.ExpectedWorkerID, arg.ExpectedClaimGeneration)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const checkpointTipClaimedByOtherRun = `-- name: CheckpointTipClaimedByOtherRun :one
 SELECT (
     EXISTS (
