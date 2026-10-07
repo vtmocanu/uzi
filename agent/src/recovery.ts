@@ -703,9 +703,10 @@ export class RecoveryCoordinator {
             : {}),
         };
         await this.writeRecordUnlocked(record);
-        this.log.info("recovery: pinned source head at finalization boundary", {
+        this.log.info("recovery: pinned source head", {
           run_id: input.runId,
           capture_id: record.captureId,
+          finalization_pin: record.finalizationPin === true,
         });
         return record;
       });

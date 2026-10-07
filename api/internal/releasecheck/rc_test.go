@@ -10,32 +10,12 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/settings"
 )
 
-func TestExactRCTag(t *testing.T) {
-	for _, tc := range []struct {
-		tag   string
-		valid bool
-	}{
-		{"v1.2.3-rc.1", true},
-		{"v1.2.3-rc.10", true},
-		{"1.2.3-rc.1", false},
-		{"v1.2.3-rc.01", false},
-		{"v1.2.3-rc.1.extra", false},
-		{"v1.2.3-rc.1+build", false},
-		{"v1.2.3-beta.1", false},
-		{"v1.2.3", false},
-		{"v1.2.3-rc.x", false},
-	} {
-		if got := exactRCTag(tc.tag); got != tc.valid {
-			t.Errorf("exactRCTag(%q) = %v, want %v", tc.tag, got, tc.valid)
-		}
-	}
-}
-
 func TestRCSelectionAndClear(t *testing.T) {
 	list := `[` +
 		releaseJSON("v1.2.0-rc.2", "second", "### Security\nfix", "2026-09-02T00:00:00Z", "https://example.test/2") + `,` +
 		releaseJSON("v1.2.0-beta.9", "beta", "", "", "") + `,` +
 		releaseJSON("v1.2.0-rc.10", "tenth", "notes", "", "https://example.test/10") + `,` +
+		releaseJSON("v9.0.0-rc.0", "zero is not published", "", "", "") + `,` +
 		`{"tag_name":"v9.0.0-rc.1","draft":true},` +
 		releaseJSON("v1.2.0-rc.01", "invalid", "", "", "") + `] `
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

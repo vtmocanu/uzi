@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -502,6 +503,99 @@ func TestConcurrentFirstUnlockConsistent(t *testing.T) {
 	}
 }
 
+// blockedNoticeVaultStore pauses the refresh unlock after its DEK is cached.
+// Only that one list call is blocked; the context deadline bounds a failed barrier.
+type blockedNoticeVaultStore struct {
+	*fakeVaultStore
+	entered, release chan struct{}
+	noticeMu         sync.Mutex
+	marked           bool
+}
+
+func (s *blockedNoticeVaultStore) ListMasterSealedSecrets(ctx context.Context, uid uuid.UUID) ([]store.ListMasterSealedSecretsRow, error) {
+	close(s.entered)
+	select {
+	case <-s.release:
+		return s.fakeVaultStore.ListMasterSealedSecrets(ctx, uid)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *blockedNoticeVaultStore) ClearVaultLockNotice(ctx context.Context, uid uuid.UUID) error {
+	err := s.fakeVaultStore.ClearVaultLockNotice(ctx, uid)
+	if err == nil {
+		s.noticeMu.Lock()
+		s.marked = false
+		s.noticeMu.Unlock()
+	}
+	return err
+}
+
+func TestUnlockExistingAfterLockPreservesNotice(t *testing.T) {
+	v, _, st := newTestVaultWithStore(t)
+	uid := uuid.New()
+	const password = "notice-race-password"
+	if err := v.Unlock(context.Background(), uid, password); err != nil {
+		t.Fatal(err)
+	}
+	// Initialize before installing the barrier: this regression targets a refresh.
+	blocked := &blockedNoticeVaultStore{
+		fakeVaultStore: st, entered: make(chan struct{}), release: make(chan struct{}),
+	}
+	v.q = blocked
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	done := make(chan error, 1)
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(blocked.release) }) }
+	joined := false
+	t.Cleanup(func() {
+		cancel()
+		release()
+		if !joined {
+			<-done
+		}
+	})
+	go func() { done <- v.UnlockExisting(ctx, uid, password) }()
+	select {
+	case <-blocked.entered:
+	case <-ctx.Done():
+		t.Fatal("refresh unlock did not reach list barrier")
+	}
+	if !v.Unlocked(uid) {
+		t.Fatal("refresh must cache the DEK before the list barrier")
+	}
+	v.Lock(uid)
+	// Model the manual handler's pre-acknowledgement after it evicts the key.
+	blocked.noticeMu.Lock()
+	blocked.marked = true
+	blocked.noticeMu.Unlock()
+	st.mu.Lock()
+	clearsBefore := len(st.clearNoticeCalls)
+	st.mu.Unlock()
+	release()
+	err := <-done
+	joined = true
+	if err != nil {
+		t.Fatalf("refresh unlock: %v", err)
+	}
+	if v.Unlocked(uid) {
+		t.Error("older unlock must leave the manually locked vault locked")
+	}
+	st.mu.Lock()
+	clearsAfter := len(st.clearNoticeCalls)
+	st.mu.Unlock()
+	if clearsAfter != clearsBefore {
+		t.Errorf("older unlock cleared lock notice after manual lock: calls before=%d after=%d", clearsBefore, clearsAfter)
+	}
+	blocked.noticeMu.Lock()
+	marked := blocked.marked
+	blocked.noticeMu.Unlock()
+	if !marked {
+		t.Error("older unlock erased the manual lock pre-acknowledgement")
+	}
+}
+
 // TestUnlockFiresClearNotice: a successful Unlock re-arms the vault-lock Slack notice
 // (PRD #890 M1) — the ClearVaultLockNotice hook fires for the unlocked user, ending the
 // current lock-episode so a later deploy that locks them again notifies afresh.
@@ -536,5 +630,108 @@ func TestUnlockClearNoticeErrorNonFatal(t *testing.T) {
 	// even if Unlock stopped calling ClearVaultLockNotice entirely.
 	if len(st.clearNoticeCalls) != 1 || st.clearNoticeCalls[0] != uid {
 		t.Fatalf("clearNoticeCalls = %v, want exactly [%v] (the failing clear hook must still have fired)", st.clearNoticeCalls, uid)
+	}
+}
+
+// slowNoticeVaultStore blocks ClearVaultLockNotice, the unlock-time notice SQL,
+// until released. The context deadline bounds a failed barrier.
+type slowNoticeVaultStore struct {
+	*fakeVaultStore
+	entered, release chan struct{}
+}
+
+func (s *slowNoticeVaultStore) ClearVaultLockNotice(ctx context.Context, uid uuid.UUID) error {
+	close(s.entered)
+	select {
+	case <-s.release:
+		return s.fakeVaultStore.ClearVaultLockNotice(ctx, uid)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// startBlockedNoticeClear unlocks a and b, then re-unlocks a with its notice SQL
+// blocked. It returns once a's clear is inside the SQL.
+func startBlockedNoticeClear(t *testing.T, password string) (v *Vault, a, b uuid.UUID, slow *slowNoticeVaultStore, unlockDone chan error) {
+	t.Helper()
+	v, _, st := newTestVaultWithStore(t)
+	a, b = uuid.New(), uuid.New()
+	for _, id := range []uuid.UUID{a, b} {
+		if err := v.Unlock(context.Background(), id, password); err != nil {
+			t.Fatal(err)
+		}
+	}
+	slow = &slowNoticeVaultStore{fakeVaultStore: st, entered: make(chan struct{}), release: make(chan struct{})}
+	v.q = slow
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+	unlockDone = make(chan error, 1)
+	go func() { unlockDone <- v.UnlockExisting(ctx, a, password) }()
+	select {
+	case <-slow.entered:
+	case <-ctx.Done():
+		t.Fatal("notice clear did not start")
+	}
+	return v, a, b, slow, unlockDone
+}
+
+// TestSlowNoticeClearDoesNotDelayOtherUsersLock: a notice clear blocked in SQL for
+// user A must not delay user B's key eviction (the clear once held the global
+// cache mutex across the SQL, so B's Lock and every Seal/Open queued behind it).
+func TestSlowNoticeClearDoesNotDelayOtherUsersLock(t *testing.T) {
+	v, _, b, slow, unlockDone := startBlockedNoticeClear(t, "cross-user-notice-pw")
+	lockDone := make(chan struct{})
+	go func() { v.Lock(b); close(lockDone) }()
+	select {
+	case <-lockDone:
+	case <-time.After(2 * time.Second):
+		t.Error("user B's Lock waited for user A's blocked notice SQL")
+	}
+	close(slow.release)
+	if err := <-unlockDone; err != nil {
+		t.Error(err)
+	}
+	<-lockDone
+	if v.Unlocked(b) {
+		t.Error("user B stayed unlocked")
+	}
+}
+
+// TestLockWaitsForSameUserNoticeClearThenEvicts: while user A's notice clear is
+// blocked in SQL, Lock(A) waits with A still unlocked (so the lock-notice
+// reconciler cannot see a locked vault whose clear could still erase the later
+// pre-ack), then evicts and wipes A's DEK once the clear finishes.
+func TestLockWaitsForSameUserNoticeClearThenEvicts(t *testing.T) {
+	v, a, _, slow, unlockDone := startBlockedNoticeClear(t, "same-user-notice-pw")
+	v.mu.RLock()
+	dek := v.cache[a]
+	v.mu.RUnlock()
+	if len(dek) == 0 {
+		t.Fatal("fixture: user A's DEK is not cached")
+	}
+	lockDone := make(chan struct{})
+	go func() { v.Lock(a); close(lockDone) }()
+	select {
+	case <-lockDone:
+		t.Fatal("Lock returned while the same user's notice clear was blocked")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if !v.Unlocked(a) {
+		t.Error("Lock evicted before the in-flight notice clear finished")
+	}
+	close(slow.release)
+	if err := <-unlockDone; err != nil {
+		t.Error(err)
+	}
+	select {
+	case <-lockDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Lock did not return after the notice clear finished")
+	}
+	if v.Unlocked(a) {
+		t.Error("user A is unlocked after Lock")
+	}
+	if !bytes.Equal(dek, make([]byte, len(dek))) {
+		t.Error("evicted DEK was not wiped")
 	}
 }

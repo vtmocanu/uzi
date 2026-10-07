@@ -48,13 +48,21 @@ import (
 // peak. Measured on the hosted cluster: an `l` worker's writable set peaked at ~7451Mi
 // (≈7.1 GiB) against its old 4Gi request — the captured eviction — with a web-ux median
 // of ~4.5 GiB; a non-web-ux `m` run peaks ~2.7 GiB, above the old 2Gi request. So `l` now
-// requests 8Gi, `m` 4Gi, and `s` 2Gi, each above its size's realistic peak, while every
-// size stays Burstable.
+// requested 8Gi (limit 12Gi), `m` 4Gi (limit 8Gi), and `s` 2Gi, each above its size's realistic peak,
+// while every size stays Burstable.
+//
+// `l` was later raised to 14Gi request / 20Gi limit (issue #2127, owner-selected sizing):
+// a persistent `l` worker running two concurrent runs was OOMKilled twice at the 12Gi
+// limit while both runs were inside whole-program Go analyzer gates. The new values are
+// not a measured guarantee of sufficient capacity; the maintainer accepted the reduced
+// node placement capacity. `m` was raised to 8Gi request / 12Gi limit (issue #2127): on
+// 2026-10-03 a single run's `deadcode` reached 7.3-7.5 GiB anon RSS at the old 8Gi limit
+// and was OOMKilled twice.
 //
 // Owner decision (settled 2026-09-14) keeps all three Burstable. Guaranteed
 // (request==limit) was considered and dropped: it would strand a full memory limit per
-// IDLE worker (~150Mi idle), and a Guaranteed `l` at 12Gi cannot fit beside the system
-// pods on a ~13.58Gi node.
+// IDLE worker (~150Mi idle), and a Guaranteed `l` (12Gi limit at the time, now 20Gi)
+// could not fit beside the system pods on a ~13.58Gi node.
 type Size struct {
 	CPURequest    resource.Quantity
 	CPULimit      resource.Quantity
@@ -106,7 +114,7 @@ func IsUnknown(err error) bool {
 // issue #1341 for the measured figures), and the requests below were recalibrated in
 // issue #1341 above those measured multi-agent peaks.
 //
-// `m` is compose parity at the limit. New hosted workers default to `l` (issue #2240:
+// Hosted `m` has a larger memory ceiling than compose's 4Gi default. New hosted workers default to `l` (issue #2240:
 // the api's UZI_EPHEMERAL_DEFAULT_SIZE and the web dialog's preselection). The default cap is 1
 // (WORKER_MAX_CONCURRENT_RUNS), so a size still buys headroom for ONE run. That cap
 // is now operator-configurable (chart workers.maxConcurrentRuns → the controller's
@@ -127,15 +135,15 @@ var sizes = map[string]Size{
 	"m": {
 		CPURequest:    resource.MustParse("500m"),
 		CPULimit:      resource.MustParse("2"),
-		MemoryRequest: resource.MustParse("4Gi"),
-		MemoryLimit:   resource.MustParse("8Gi"),
+		MemoryRequest: resource.MustParse("8Gi"),
+		MemoryLimit:   resource.MustParse("12Gi"),
 		DataSize:      resource.MustParse("10Gi"),
 	},
 	"l": {
 		CPURequest:    resource.MustParse("1"),
 		CPULimit:      resource.MustParse("4"),
-		MemoryRequest: resource.MustParse("8Gi"),
-		MemoryLimit:   resource.MustParse("12Gi"),
+		MemoryRequest: resource.MustParse("14Gi"),
+		MemoryLimit:   resource.MustParse("20Gi"),
 		DataSize:      resource.MustParse("25Gi"), // issue #1757: was 20Gi; bare clones + tracking refs outgrew it
 	},
 }

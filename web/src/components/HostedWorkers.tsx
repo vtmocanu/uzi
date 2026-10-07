@@ -206,7 +206,7 @@ export function HostedWorkers({
               <Field label="Size">
                 <Select aria-label="Hosted worker size" value={size} onChange={(e) => setSize(e.target.value)}>
                   {WORKER_SIZES.map((s) => (
-                    // "M — up to 2 CPU / 4Gi RAM / 10Gi disk". The quantities are IN the
+                    // "M — up to 2 CPU / 12Gi RAM / 10Gi disk". The quantities are IN the
                     // option, not in a table elsewhere, because the point is to inform the
                     // choice at the moment it is made — before M6 this select offered three
                     // bare letters and a user picking one was picking blind.

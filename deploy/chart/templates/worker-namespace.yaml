@@ -84,7 +84,7 @@ metadata:
   admitted and contributes zero.
 
   CPU and memory track the DEFAULT size, now `l` (ADR-2240): 20 workers x 1 CPU
-  = 20 CPU and 20 x 8Gi = 160Gi requested. Keep requests aligned with deployments
+  = 20 CPU and 20 x 14Gi = 280Gi requested. Keep requests aligned with deployments
   x the default request, or admission caps the fleet below deployments (issue #1341).
   ResourceQuotas are ceilings, not node-capacity reservations. STORAGE tracks `l`
   too: 20 x (25Gi data + 20Gi nix) = 900Gi of PVC. Requests follow render.go. The rendered-fleet regression

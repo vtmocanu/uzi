@@ -51,15 +51,15 @@ export type WorkerSizeSpec = {
  */
 export const WORKER_SIZE_SPECS: Record<WorkerSize, WorkerSizeSpec> = {
   s: { cpuLimit: "1", memoryLimit: "4Gi", data: "5Gi" },
-  m: { cpuLimit: "2", memoryLimit: "8Gi", data: "10Gi" },
-  l: { cpuLimit: "4", memoryLimit: "12Gi", data: "25Gi" },
+  m: { cpuLimit: "2", memoryLimit: "12Gi", data: "10Gi" },
+  l: { cpuLimit: "4", memoryLimit: "20Gi", data: "25Gi" },
 };
 
 /**
  * New hosted workers start at L (#2240), matching the ephemeral provisioning default.
  * Its 4-CPU limit gives build and test commands more concurrency headroom. Compared
- * with M, its CPU/memory requests double (1 CPU / 8Gi versus 500m / 4Gi), reserving
- * more node capacity even while idle. S and M remain explicit choices; existing
+ * with M, its CPU request doubles and its memory request is 1.75x (1 CPU / 14Gi versus
+ * 500m / 8Gi), reserving more node capacity even while idle. S and M remain explicit choices; existing
  * workers keep the size stored at creation. Rationale: ADR-2240.
  */
 export const DEFAULT_WORKER_SIZE: WorkerSize = "l";
@@ -75,7 +75,7 @@ function sizeLabel(size: string): string {
 
 /**
  * One preset's quantities, as a single readable clause for the picker:
- * `up to 2 CPU / 8Gi RAM / 10Gi disk`.
+ * `up to 2 CPU / 12Gi RAM / 10Gi disk`.
  *
  * "up to" qualifies all three honestly: CPU and memory are cgroup ceilings a
  * Burstable pod bursts into, and the disk is a volume of that size — in every case

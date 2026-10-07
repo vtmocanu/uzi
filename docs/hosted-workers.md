@@ -50,8 +50,8 @@ its own setting, 20Gi by default and set by the operator, whatever size the
 worker runs at. Its CPU and memory still follow its size.
 
 New persistent and ephemeral hosted workers default to **L** for more build
-and test headroom. Compared with **M**, **L** doubles the CPU and memory
-requests (1 CPU / 8Gi instead of 500m / 4Gi), reserving more node capacity.
+and test headroom. Compared with **M**, **L** doubles the CPU request and
+raises the memory request from 8Gi to 14Gi (1 CPU / 14Gi instead of 500m / 8Gi), reserving more node capacity.
 Existing workers keep their stored size. Operators can change the ephemeral
 default through `UZI_EPHEMERAL_DEFAULT_SIZE`; users can choose another size
 when provisioning a persistent worker.

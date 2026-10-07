@@ -261,6 +261,8 @@ changes it); trust it over a handover's claim.
    digest; excerpts are cut and say INCOMPLETE), act on it, then ack the version you read:
    `S/ack-comments.sh OWNER/REPO PR ID@DIGEST ...`. An edit before or after the ack re-blocks. Verify each against the current code and label it **real / inherited
    / deliberate / mock-only** (references/coderabbit-triage.md). Before touching the branch,
+   check `uzi run list` for an active `ci_fix` with `pipeline_ref` equal to the branch; let it
+   finish or cancel it before a local fix (`land-prep.sh` refuses with exit 4). Also
    check for an `mr_rework` run and defer if one is coming (references/mr-rework.md; on a
    run created with `--mr-rework=false` none will). Before editing locally or replying to
    skip a finding, DISABLE auto-rework for this PR's run (a finding-thread reply can trigger

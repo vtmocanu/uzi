@@ -1,7 +1,7 @@
 import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { getEventListeners } from "node:events";
 import fs from "node:fs/promises";
 import { symlinkSync } from "node:fs";
@@ -71,7 +71,8 @@ import type { OutgoingMessage } from "../src/protocol.js";
 import { createCodexTransport, CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
 import type { RunContext, EmittedMessage, Executor, WallParkOutcome, SecretRemediationDecision } from "../src/executor.js";
 import { PauseNowSignal } from "../src/steering.js";
-import { ResidueQuarantinedError, latchResidueQuarantine } from "../src/residue-quarantine.js";
+import { makeRecoveryCoordinator, FakeRecoveryClient, FakeRecoveryGit, commitInTree } from "./codex-reap-fixture.js";
+import { ResidueQuarantinedError, latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import { scanSignals } from "../src/signals.js";
 import { detectRepoAgents } from "../src/repoagents.js";
@@ -83,7 +84,7 @@ import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary
 import type { Logger } from "../src/log.js";
 import type { DockerWiring } from "../src/docker-wiring.js";
 import type { AgentTemplate, MilestoneProgress } from "../src/protocol.js";
-import type { BoundaryRequest } from "../src/harness.js";
+import type { BoundaryRequest, BoundaryPermit } from "../src/harness.js";
 import type { CodexExecutionSafetyImpl } from "../src/codex/safety.js";
 import type {
   CacheCleanupResult,
@@ -1122,6 +1123,756 @@ describe("decoded Codex usage limits reach RunRunner #2360", () => {
       }
     });
   }
+});
+
+describe("m1 credential-free owner cancel", () => {
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>(r => { resolve = r; });
+    return { promise, resolve };
+  }
+  const quietResponder: Responder = c => {
+    if (c.method === "thread/start") return { thread: { id: "th-1" } };
+    if (c.method === "turn/start") return { turn: { id: "tn-1" } };
+    return {};
+  };
+  for (const pending of [false, true]) it(`aborted installer cancel cleanup pending=${pending}`, async () => {
+    const rig = makeRig({ responder: quietResponder });
+    const installed = deferred<{ results: []; truncated: false }>();
+    const started = deferred<void>();
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true, installDeps: async () => {
+      started.resolve(); return installed.promise;
+    } };
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const controller = new AbortController();
+    const run = executor.run(makeCtx({ signal: controller.signal }).ctx).catch(() => undefined);
+    try {
+      await withTimeout(started.promise, 3000, "installer start");
+      await waitFor(() => executor.safety !== undefined, "live provider registry");
+      controller.abort(new Error("owner cancel"));
+      if (!pending) installed.resolve({ results: [], truncated: false });
+      const result = await executor.settleForCredentialFreeCapture(100, "cancel");
+      assert.equal(result.kind, pending ? "incomplete" : "observed_empty");
+      assert.equal(rig.client.refreshCalls.length, 0);
+      assert.equal(rig.client.releaseCalls.length, 1, "only startup release");
+    } finally {
+      controller.abort(new Error("fixture cleanup"));
+      installed.resolve({ results: [], truncated: false });
+      await withTimeout(run, 5000, "installer teardown");
+      await executor.safety?.dispose({ boundary: "terminal", deadlineMs: 200 });
+    }
+  });
+
+  for (const state of ["callback", "launch", "disposed", "unsupported"] as const)
+    it(`cancel cleanup refuses ${state} without reconcile`, async () => {
+      const rig = makeRig();
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+      let reconcile = 0;
+      executor.safety = createCodexExecutionSafety(registry, async () => {
+        reconcile++; throw new Error("credential reconcile forbidden");
+      });
+      if (state === "callback") assert.equal(registry.reserveCallback({
+        threadId: "thread", turnId: "turn", callId: "pending", fingerprint: "pending",
+      }).kind, "admitted");
+      if (state === "launch") assert.equal(registry.reserveLaunch("command").kind, "reserved");
+      if (state === "disposed") await registry.disposeTools(200);
+      if (state === "unsupported") executor.safety = { kind: "codex" } as never;
+      assert.equal((await executor.settleForCredentialFreeCapture(20, "cancel")).kind, "incomplete");
+      assert.equal(reconcile, 0);
+      await registry.disposeTools(200);
+    });
+
+  it("cancel cleanup checks a failed outstanding epoch alongside healthy current safety", async () => {
+    const executor = makeExecutor(makeRig(), bindingOf(SUBSCRIPTION));
+    const current = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const failed = new ExecutionRegistry(newLocalExecutionEpoch(2));
+    assert.equal(failed.reserveLaunch("command").kind, "reserved");
+    assert.equal((await failed.settleForCapture(10)).kind, "incomplete");
+    Object.assign(executor, { unverifiedEpochRegistries: new Set([current, failed]) });
+    executor.safety = createCodexExecutionSafety(current, async () => { throw new Error("no roots"); });
+    try {
+      const result = await executor.settleForCredentialFreeCapture(100, "cancel");
+      assert.equal(result.kind, "incomplete", "the older pending launch blocks cancellation");
+      if (result.kind === "incomplete") assert.ok(result.errors.some(e => /launch reservation/.test(e.message)));
+    } finally {
+      await current.disposeTools(200);
+      await failed.disposeTools(200);
+    }
+  });
+
+  it("cancel cleanup accepts healthy multiple epochs after verified abandoned epoch retirement", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "the plan" }, th, tn, "c-plan")).push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("resumed-1", "tn-2", () => undefined),
+    ]);
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const controller = new AbortController();
+    const { ctx } = makeCtx({ signal: controller.signal, planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never) });
+    const run = executor.run(ctx).catch(() => undefined);
+    try {
+      await waitFor(() => rig.epochs[1]!.transport.turnStartCount === 1, "second provider epoch");
+      assert.equal(rig.providerLaunches(), 2);
+      assert.ok(rig.epochs[0]!.disposed() >= 1, "abandoned epoch was disposed");
+      controller.abort(new Error("owner cancel"));
+      await withTimeout(run, 5000, "multi epoch cancellation");
+      assert.deepEqual(await executor.settleForCredentialFreeCapture(200, "cancel"), { kind: "observed_empty" });
+      assert.equal(rig.client.releaseCalls.length, 2, "only startup credential releases");
+    } finally {
+      controller.abort();
+      await withTimeout(run, 5000, "multi epoch cleanup");
+      await executor.safety?.dispose({ boundary: "terminal", deadlineMs: 200 });
+    }
+  });
+
+  for (const change of ["unchanged-raw-target", "equal-length-target", "link-to-file", "link-to-directory",
+    "file-to-link", "parent-link", "readlink-failure"] as const)
+    it(`real cancel reader ${change}`, { skip: process.platform !== "linux" }, async () => {
+      const fx = makeFixture();
+      const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
+      const name = "nested/deeper/link";
+      const leaf = path.join(fx.originPath, name);
+      const target = Buffer.concat([Buffer.from("../../../absent-"), Buffer.from([0xff])]);
+      let helperCalls = 0;
+      let helperStderr = "";
+      try {
+        await fs.mkdir(path.dirname(leaf), { recursive: true });
+        if (change === "file-to-link") await fs.writeFile(leaf, "regular blob");
+        else await fs.symlink(target, leaf);
+        const originGit = (...args: string[]) => {
+          const result = spawnSync("git", ["-C", fx.originPath, ...args], { env: gitEnv(), encoding: "utf8" });
+          assert.equal(result.status, 0, result.stderr);
+          return result.stdout.trim();
+        };
+        originGit("add", name);
+        originGit("commit", "-m", "seed reader fixture");
+        const head = originGit("rev-parse", "HEAD");
+        const bare = path.join(fx.dataDir, "reader-bare.git");
+        const cloned = spawnSync("git", ["clone", "--bare", fx.originPath, bare], { env: gitEnv(), encoding: "utf8" });
+        assert.equal(cloned.status, 0, cloned.stderr);
+        assert.equal(originGit("status", "--porcelain"), "", "metadata is clean before reader invocation");
+        const result = await git.withBoundaryProcessSpawner(async request => {
+          const argv = [...request.argv];
+          const isHelper = argv[0] === process.execPath && argv[1] === "-e";
+          if (isHelper) {
+            helperCalls++;
+            // Mutate only after the real Git metadata/status observations succeeded.
+            // Each fixture gets one reader invocation; failures do not retry.
+            if (change === "equal-length-target") {
+              await fs.unlink(leaf);
+              const changed = Buffer.from(target);
+              changed[changed.length - 1] = 0xfe;
+              assert.equal(changed.length, target.length);
+              await fs.symlink(changed, leaf);
+            } else if (change === "link-to-file" || change === "link-to-directory" || change === "file-to-link") {
+              await fs.unlink(leaf);
+              if (change === "link-to-file") await fs.writeFile(leaf, target);
+              else if (change === "link-to-directory") await fs.mkdir(leaf);
+              else await fs.symlink("regular blob", leaf);
+            } else if (change === "parent-link") {
+              const parent = path.dirname(leaf);
+              await fs.rename(parent, parent + "-saved");
+              await fs.symlink("deeper-saved", parent);
+            } else if (change === "readlink-failure") {
+              // Permission changes cannot reliably deny readlink. This child-local wrapper
+              // deterministically fails that syscall without altering the production reader.
+              argv[2] = 'require("node:fs").readlinkSync = () => { process.stderr.write("readlink attempted\\n"); throw Error("fixture readlink failure"); };\n' + argv[2];
+            }
+          }
+          const child = spawn(argv[0]!, argv.slice(1), { cwd: request.cwd, env: request.env, stdio: "pipe" });
+          if (isHelper) child.stderr.on("data", chunk => { helperStderr += chunk.toString(); });
+          const completed = new Promise<{ code: number }>((resolve, reject) => {
+            const timer = setTimeout(() => child.kill("SIGKILL"), request.timeoutMs ?? 30000);
+            child.once("error", error => { clearTimeout(timer); reject(error); });
+            child.once("close", code => { clearTimeout(timer); resolve({ code: code ?? -1 }); });
+          });
+          return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed,
+            cancel: async () => { child.kill("SIGKILL"); await completed; } };
+        }, new AbortController().signal, () => git.credentialFreeCancelCleanHead(fx.originPath, bare, head));
+        assert.equal(helperCalls, 1, "actual inline reader invoked after clean metadata/status");
+        assert.equal(result, change === "unchanged-raw-target" ? head : null);
+        if (change === "readlink-failure") assert.equal(helperStderr, "readlink attempted\n");
+        const retainedLeaf = change === "parent-link" ? path.dirname(leaf) + "-saved/link" : leaf;
+        const retained = await fs.lstat(retainedLeaf);
+        if (change === "link-to-file") {
+          assert.equal(retained.isFile(), true);
+          assert.deepEqual(await fs.readFile(leaf), target, "replacement file bytes retained");
+        } else if (change === "link-to-directory") assert.equal(retained.isDirectory(), true);
+        else {
+          assert.equal(retained.isSymbolicLink(), true);
+          const expected = change === "file-to-link" ? Buffer.from("regular blob") : Buffer.from(target);
+          if (change === "equal-length-target") expected[expected.length - 1] = 0xfe;
+          assert.deepEqual(await fs.readlink(retainedLeaf, { encoding: "buffer" }), expected, "raw target bytes retained");
+        }
+        if (change === "parent-link") {
+          assert.equal((await fs.lstat(path.dirname(leaf))).isSymbolicLink(), true);
+          assert.equal(await fs.readlink(path.dirname(leaf)), "deeper-saved");
+        }
+      } finally { fx.cleanup(); }
+    });
+
+  for (const change of ["absent", "absent-info", "crlf-baseline", "space-comment", "escaped-comment",
+    "negation", "invalid-utf8", "nul", "symlink", "fifo", "oversized", "info-symlink", "unreadable-info"] as const)
+    it(`real cancel reader exclude ${change}`, { skip: process.platform !== "linux" }, async () => {
+      const fx = makeFixture();
+      const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
+      const info = path.join(fx.originPath, ".git/info");
+      const exclude = path.join(info, "exclude");
+      let helperCalls = 0;
+      let helperSignal: NodeJS.Signals | null | undefined;
+      let helperStderr = "";
+      try {
+        const headResult = spawnSync("git", ["-C", fx.originPath, "rev-parse", "HEAD"],
+          { env: gitEnv(), encoding: "utf8" });
+        assert.equal(headResult.status, 0, headResult.stderr);
+        const head = headResult.stdout.trim();
+        const bare = path.join(fx.dataDir, "exclude-reader-bare.git");
+        const cloned = spawnSync("git", ["clone", "--bare", fx.originPath, bare],
+          { env: gitEnv(), encoding: "utf8" });
+        assert.equal(cloned.status, 0, cloned.stderr);
+        const result = await git.withBoundaryProcessSpawner(async request => {
+          const argv = [...request.argv];
+          const isHelper = argv[0] === process.execPath && argv[1] === "-e";
+          if (isHelper) {
+            helperCalls++;
+            // Mutate only after actual Git status; unsafe metadata cannot hang that subprocess.
+            await fs.unlink(exclude);
+            if (change === "absent-info") await fs.rmdir(info);
+            else if (change === "info-symlink") {
+              await fs.rename(info, info + "-saved");
+              await fs.symlink("info-saved", info);
+            } else if (change === "symlink") {
+              await fs.writeFile(exclude + "-saved", "/.uzi/scratch/\n");
+              await fs.symlink("exclude-saved", exclude);
+            } else if (change === "fifo") {
+              const made = spawnSync("mkfifo", [exclude], { encoding: "utf8", timeout: 2000 });
+              assert.equal(made.status, 0, made.stderr);
+            } else if (change !== "absent") {
+              const content = change === "crlf-baseline" ? "# comment\r\n\r\n   \r\n/.uzi/scratch/\r\n" :
+                change === "space-comment" ? " #not-a-comment\n" :
+                change === "escaped-comment" ? "\\#not-a-comment\n" :
+                change === "negation" ? "!/.uzi/scratch/\n" :
+                change === "invalid-utf8" ? Buffer.from([0x23, 0xff, 0x0a]) :
+                change === "nul" ? "# comment\0NEW.txt\n" :
+                change === "oversized" ? "#".repeat(65537) : "/.uzi/scratch/\n";
+              await fs.writeFile(exclude, content);
+              if (change === "unreadable-info") {
+                // Deterministically deny lookup in the child, independent of the test uid.
+                argv[2] = 'const fixtureFs = require("node:fs"), fixtureOpen = fixtureFs.openSync;\n' +
+                  'fixtureFs.openSync = (p, flags) => { if (String(p).endsWith("/info")) { ' +
+                  'process.stderr.write("exclude ancestor denied\\n"); ' +
+                  'throw Object.assign(Error("fixture permission denied"), { code: "EACCES" }); } ' +
+                  'return fixtureOpen(p, flags); };\n' + argv[2];
+              }
+            }
+          }
+          const child = spawn(argv[0]!, argv.slice(1), { cwd: request.cwd, env: request.env, stdio: "pipe" });
+          if (isHelper) child.stderr.on("data", chunk => { helperStderr += chunk.toString(); });
+          const completed = new Promise<{ code: number }>((resolve, reject) => {
+            const timer = setTimeout(() => child.kill("SIGKILL"), Math.min(request.timeoutMs ?? 30000, 5000));
+            child.once("error", error => { clearTimeout(timer); reject(error); });
+            child.once("close", (code, signal) => {
+              clearTimeout(timer);
+              if (isHelper) helperSignal = signal;
+              if (signal) reject(new Error(`reader fixture child killed by ${signal}`));
+              else resolve({ code: code ?? -1 });
+            });
+          });
+          return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed,
+            cancel: async () => { child.kill("SIGKILL"); await completed; } };
+        }, new AbortController().signal, () => git.credentialFreeCancelCleanHead(fx.originPath, bare, head));
+        assert.equal(helperCalls, 1, "actual inline reader invoked after clean metadata/status");
+        assert.equal(helperSignal, null, "reader exits naturally rather than reaching its timeout");
+        assert.equal(result, ["absent", "absent-info", "crlf-baseline"].includes(change) ? head : null);
+        if (change === "unreadable-info") assert.equal(helperStderr, "exclude ancestor denied\n");
+      } finally { fx.cleanup(); }
+    });
+
+  const cases = [
+    ...["clean", "dirty", "untracked", "committed", "replace", "forged-stat", "lossy-path", "hidden", "assume", "skip", "filter",
+      "symlink-dangling", "symlink-outside", "symlink-changed", "symlink-file",
+      "info-exclude", "external-excludes", "exclude-comments", "ignored-node-modules",
+      "root-gitignore", "nested-gitignore"].map(work => ({ work })),
+    ...["wrong", "missing", "retained", "error"].map(release => ({ work: "clean", release })),
+    ...["survivors", "unverified", "new-writer"].map(process => ({ work: "clean", process })),
+    { work: "clean", docker: "docker_error" },
+    { work: "clean", trust: "missing" },
+    { work: "clean", trust: "recovered" },
+    { work: "clean", inspect: "unreadable" },
+    { work: "clean", inspect: "head" },
+    { work: "clean", drain: "root" },
+    { work: "dirty", terminal: "statusless" },
+    { work: "dirty", terminal: "lost" },
+    ...["immediate", "statusless", "lost"].flatMap(terminal =>
+      ["clean", "dirty"].map(work => ({ work, route: "recovery", terminal }))),
+    { work: "dirty", route: "deferred", terminal: "statusless" },
+    { work: "clean", route: "deferred", terminal: "immediate" },
+    ...["before-cancel", "settle", "inspect", "release-ack"].map(quarantine => ({ work: "clean", quarantine })),
+  ] as Array<{ work: string; release?: string; process?: string; docker?: string; trust?: string;
+    inspect?: string; drain?: string; terminal?: string; route?: string; quarantine?: string }>;
+  for (const scenario of cases.filter(scenario => (HAS_PROCFS || !scenario.process) &&
+      (scenario.work !== "lossy-path" || process.platform === "linux") &&
+      (!scenario.quarantine || process.platform === "linux")))
+    it(`actual runner owner cancel ${JSON.stringify(scenario)}`, async () => {
+      const { work } = scenario;
+      // The bounded descriptor reader conservatively refuses unsupported platforms.
+      const shouldRelease = process.platform === "linux" && ["clean", "symlink-dangling", "symlink-outside", "exclude-comments", "ignored-node-modules"].includes(work) && !scenario.release && !scenario.process &&
+        !scenario.trust && !scenario.inspect && !scenario.drain && !scenario.quarantine;
+      // A release ACK closes server custody even when quarantine retains local evidence.
+      const shouldCloseHold = shouldRelease || scenario.quarantine === "release-ack";
+      const quarantineReached = deferred<void>();
+      const quarantineContinue = deferred<void>();
+      let quarantineSeamReached = false;
+      const pauseForQuarantine = async (): Promise<void> => {
+        quarantineSeamReached = true;
+        quarantineReached.resolve();
+        await quarantineContinue.promise;
+      };
+      const api = new FakeApi("cancel-worker");
+      const url = await api.listen();
+      const fx = makeFixture(work === "ignored-node-modules" ? { ".gitignore": "node_modules/\n" } : {});
+      const rawName = Buffer.concat([Buffer.from("lossy-"), Buffer.from([0xff]), Buffer.from(".txt")]);
+      const twinName = "lossy-\uFFFD.txt";
+      const rawPath = (root: string) => Buffer.concat([Buffer.from(root + path.sep), rawName]);
+      if (work === "lossy-path") {
+        await fs.writeFile(rawPath(fx.originPath), "same initial bytes\n");
+        await fs.writeFile(path.join(fx.originPath, twinName), "same initial bytes\n");
+        for (const args of [["add", "."], ["commit", "-m", "seed distinct raw paths"]]) {
+          const result = spawnSync("git", ["-C", fx.originPath, ...args], { env: gitEnv(), encoding: "utf8" });
+          assert.equal(result.status, 0, result.stderr);
+        }
+      }
+      const linkName = "nested/deeper/link";
+      const linkTarget = work === "symlink-outside" ? fx.originPath + "/README.md" : "../../../absent-target-a";
+      if (work.startsWith("symlink-")) {
+        await fs.mkdir(path.join(fx.originPath, "nested/deeper"), { recursive: true });
+        await fs.symlink(linkTarget, path.join(fx.originPath, linkName));
+        for (const args of [["add", linkName], ["commit", "-m", "seed nested link"]]) {
+          const result = spawnSync("git", ["-C", fx.originPath, ...args], { env: gitEnv(), encoding: "utf8" });
+          assert.equal(result.status, 0, result.stderr);
+        }
+      }
+      const recoveryClient = new FakeRecoveryClient();
+      const recoveryGit = new FakeRecoveryGit();
+      const recovery = makeRecoveryCoordinator(recoveryClient, recoveryGit);
+      const rig = makeRig({ responder: quietResponder });
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      let settlingCancel = false;
+      let settlementKind: string | undefined;
+      const reap = rig.root.reap.bind(rig.root);
+      rig.root.reap = async (...args) => {
+        if (scenario.quarantine === "settle" && settlingCancel && !quarantineSeamReached) await pauseForQuarantine();
+        return reap(...args);
+      };
+      const client = new WorkerClient(url, "cancel-worker", "test", noopLog, { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+      client.protocolFeatures = ["recovery_release_exact_echo"];
+      const releases: unknown[][] = [];
+      const openHolds = new Set([7, 8]);
+      client.releaseRecoveryCustody = async (...args) => {
+        releases.push(args);
+        if (scenario.quarantine === "release-ack") await pauseForQuarantine();
+        if (scenario.release === "error") throw new Error("lost release ACK");
+        if (scenario.release === "missing") return {} as never;
+        if (!scenario.release) openHolds.delete(Number(args[1]));
+        return { run_id: args[0], generation: scenario.release === "wrong" ? 8 : args[1],
+          released: true, holds_released: 1, retained: scenario.release === "retained" };
+      };
+      const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
+      let clone = "";
+      let lifecycle: AbortSignal | undefined;
+      let boundaryCalls = 0;
+      let bare = "";
+      let excludeBeforeCancel: Buffer | undefined;
+      const externalExclude = path.join(path.dirname(fx.dataDir), "external-excludes");
+      const externalExcludeBytes = Buffer.from("NEW.txt\n");
+      const ensureClone = git.ensureClone.bind(git);
+      git.ensureClone = async (...args) => { bare = await ensureClone(...args); return bare; };
+      const observations: string[] = [];
+      // The runner's owner-cancel catch turns a thrown seam assertion into "retained", which the
+      // retain scenarios expect; record seam invariants here and assert them after settlement.
+      const seamViolations: string[] = [];
+      const check = (ok: boolean, msg: string): void => { if (!ok) seamViolations.push(msg); };
+      const { logger: cancelLog, lines: cancelLogs } = recordingLogger();
+      const claim = makeClaim({
+        claim_generation: 7,
+        repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath, default_branch: "main" },
+        secrets: { forge_pat: "pat", codex: SUBSCRIPTION } as never,
+        agents: [{ name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] }],
+        plan_approved: true, plan_source: "seeded", plan_md: "approved plan",
+      });
+      const runner = new RunRunner(client, git, () => ({
+        executor: {
+          run: async ctx => {
+            clone = ctx.worktreePath; lifecycle = ctx.signal;
+            if (scenario.route) {
+              // Let the actual executor see the sticky cancel/lifecycle abort, then route its
+              // unwind through the recovery loop without substituting the live safety facade.
+              try { return await executor.run(ctx); } catch {
+                if (scenario.route === "deferred") throw new CodexCredentialDeferredError();
+                throw new TransientRecoveryError();
+              }
+            }
+            return executor.run(ctx);
+          },
+          get safety() { return executor.safety; },
+          sandboxesCommands: true,
+          settleForCredentialFreeCapture: async (ms, purpose) => {
+            settlingCancel = purpose === "cancel";
+            try {
+              const result = await executor.settleForCredentialFreeCapture(ms, purpose);
+              settlementKind = result.kind;
+              return result;
+            } finally { settlingCancel = false; }
+          },
+        },
+      }), cancelLog, 20, undefined, {
+        recovery: recovery.coord, pollMs: 5, recoveryRetryMs: 5,
+        quiesceRun: async req => {
+          const site = req.site ?? "";
+          observations.push(site);
+          if (site === "owner_cancel_after_inspection") check(observations.includes("inspect"), "final scan follows cleanliness inspection");
+          if (site.startsWith("owner_cancel")) check(req.processes === HAS_PROCFS, `${site} processes=${String(req.processes)}`);
+          const state = site.startsWith("owner_cancel") && scenario.process === "survivors" ? "survivors" :
+            site.startsWith("owner_cancel") && scenario.process === "unverified" ? "unverified" : "quiescent";
+          return { process: HAS_PROCFS ? { state, processes: [], killed: site === "owner_cancel_after_inspection" && scenario.process === "new-writer" ? [101] : [], detail: "cancel fixture process proof" } : undefined,
+            docker: { state: scenario.docker === "docker_error" ? "docker_error" : "docker_unconfirmed", removed: [], detail: "late-create race" } };
+        },
+      });
+      // Delegate both private seams: only execute drives the real flight and disposition.
+      type ObservedFlight = { preserveRecoveryClone: boolean; preserveSession: boolean };
+      const runnerSeams = runner as unknown as {
+        buildFlight: (...args: unknown[]) => ObservedFlight;
+        disposeCredentialFreeOwnerCancel: (...args: unknown[]) => Promise<"released" | "retained">;
+      };
+      let realFlight: ObservedFlight | undefined;
+      let dispositionObserved = false;
+      let disposition: string | undefined;
+      let preservationAfterDisposition: ObservedFlight | undefined;
+      if (scenario.quarantine) {
+        const buildFlight = runnerSeams.buildFlight.bind(runner);
+        runnerSeams.buildFlight = (...args) => { realFlight = buildFlight(...args); return realFlight; };
+        const dispose = runnerSeams.disposeCredentialFreeOwnerCancel.bind(runner);
+        runnerSeams.disposeCredentialFreeOwnerCancel = async (...args) => {
+          const result = await dispose(...args);
+          dispositionObserved = true;
+          disposition = result;
+          preservationAfterDisposition = realFlight && {
+            preserveRecoveryClone: realFlight.preserveRecoveryClone,
+            preserveSession: realFlight.preserveSession,
+          };
+          return result;
+        };
+      }
+      let inspectingCancel = false;
+      const gitReadSeam = git as unknown as {
+        runGitAsRunner: (cwd: string | undefined, args: string[], opts?: { timeoutMs?: number }) => Promise<string>;
+      };
+      const readRunnerGit = gitReadSeam.runGitAsRunner.bind(git);
+      gitReadSeam.runGitAsRunner = async (...args) => {
+        if (scenario.quarantine === "inspect" && inspectingCancel && !quarantineSeamReached) await pauseForQuarantine();
+        return readRunnerGit(...args);
+      };
+      if (scenario.trust === "missing") git.originBranchTip = async () => null;
+      if (scenario.trust === "recovered") {
+        const seed = git.runnerCloneForBranch.bind(git);
+        git.runnerCloneForBranch = async (...args) => {
+          const result = await seed(...args);
+          const head = commitInTree(result.path, "RECOVERED.txt", "prior unpublished work");
+          await git.fetchAgentBranch(args[0], result.path, result.branch, claim.run_id);
+          return { ...result, baseCommit: head };
+        };
+      }
+      if (scenario.inspect === "unreadable") git.credentialFreeCancelCleanHead = async () => null;
+      const inspect = git.credentialFreeCancelCleanHead.bind(git);
+      git.credentialFreeCancelCleanHead = async (...args) => {
+        check(observations.includes("owner_cancel"), "initial scan precedes restore inspection");
+        check(cancelLogs.some(line => rec(line).msg === "owner cancel Docker teardown"), "Docker teardown is logged before restore inspection");
+        check(!observations.includes("owner_cancel_after_inspection"), "every restore inspection precedes the final scan");
+        observations.push("inspect");
+        inspectingCancel = true;
+        let result: string | null;
+        try { result = await inspect(...args); }
+        finally { inspectingCancel = false; }
+        if (scenario.quarantine === "inspect") check(result === args[2], "genuine inspection proves the trusted clean head");
+        if (excludeBeforeCancel !== undefined) {
+          check((await fs.readFile(path.join(clone, ".git/info/exclude"))).equals(excludeBeforeCancel),
+            "cleanliness inspection preserves exclude bytes");
+        }
+        return result;
+      };
+      if (scenario.drain === "root") rig.root.reap = async () => ({ ok: false, error: { category: "tool", message: "root survives" } });
+      const sendState = client.reportState.bind(client);
+      client.reportState = async (...args) => {
+        const ack = await sendState(...args);
+        if (args[1].status === "failed") {
+          if (scenario.terminal === "lost") throw new Error("terminal landed but ACK lost");
+          if (scenario.terminal === "statusless") return { ...ack, status: undefined };
+        }
+        return ack;
+      };
+      api.setOwnershipStatus(claim.run_id, "running", 7);
+      api.onState(claim.run_id, body => {
+        if (body.status === "failed") {
+          api.setOwnershipStatus(claim.run_id, "cancelled", 7);
+          api.overrideStateStatus(claim.run_id, "cancelled");
+        }
+      });
+      const execution = runner.execute(claim);
+      const gitInClone = (...args: string[]) => {
+        const result = spawnSync("git", ["-C", clone, ...args], { env: gitEnv(), encoding: "utf8" });
+        assert.equal(result.status, 0, result.stderr);
+        return result.stdout;
+      };
+      try {
+        await waitFor(() => rig.transport.turnStartCount > 0, "runner provider");
+        const safety = executor.safety!;
+        const boundary = safety.withBoundary.bind(safety);
+        safety.withBoundary = async <T>(request: BoundaryRequest, action: (permit: BoundaryPermit) => Promise<T>) => { boundaryCalls++; return boundary(request, action); };
+        const startHead = await git.worktreeHead(clone);
+        assert.ok(startHead);
+        await recovery.coord.pin({ runId: claim.run_id, sourceSha: startHead, kind: "issue", branch: "agent/issue-1", generation: 8 });
+        assert.equal(await git.anchorRecoveryHead(bare, claim.run_id, 8, startHead), true);
+        assert.equal(await git.anchorRecoveryHead(bare, claim.run_id, 7, startHead), true);
+        if (scenario.inspect === "head") await fs.rename(path.join(clone, ".git", "HEAD"), path.join(clone, ".git", "HEAD-unreadable"));
+        if (work === "symlink-changed" || work === "symlink-file") {
+          await fs.unlink(path.join(clone, linkName));
+          if (work === "symlink-changed") {
+            const changedTarget = "../../../absent-target-b";
+            assert.equal(Buffer.byteLength(changedTarget), Buffer.byteLength(linkTarget));
+            await fs.symlink(changedTarget, path.join(clone, linkName));
+          } else await fs.writeFile(path.join(clone, linkName), "replacement file bytes");
+        }
+        if (["info-exclude", "external-excludes", "exclude-comments", "ignored-node-modules"].includes(work)) {
+          const excludePath = path.join(clone, ".git/info/exclude");
+          const provisionedExclude = await fs.readFile(excludePath);
+          if (process.platform === "linux") {
+            assert.ok(provisionedExclude.toString("utf8").split("\n").includes("/.uzi/scratch/"),
+              "real scratch provisioning supplies the baseline exclude rule");
+          }
+          if (work === "info-exclude") await fs.appendFile(excludePath, "NEW.txt\n");
+          if (work === "external-excludes") {
+            assert.equal(path.isAbsolute(externalExclude), true);
+            assert.equal(path.relative(clone, externalExclude).startsWith(".." + path.sep), true,
+              "fixture-owned external excludes file is outside the clone");
+            await fs.writeFile(externalExclude, externalExcludeBytes);
+            gitInClone("config", "--local", "core.excludesFile", externalExclude);
+          }
+          if (work === "exclude-comments") {
+            const comments = provisionedExclude.toString("utf8").split("\n")
+              .filter(line => line.trim() === "" || line.startsWith("#")).join("\n");
+            assert.ok(comments.includes("#"), "default exclude comments remain");
+            await fs.writeFile(excludePath, comments);
+          }
+          if (work === "ignored-node-modules") {
+            await fs.mkdir(path.join(clone, "node_modules/example"), { recursive: true });
+            await fs.writeFile(path.join(clone, "node_modules/example/index.js"), "module.exports = {};\n");
+            await fs.writeFile(path.join(clone, "node_modules/.package-lock.json"), "{}\n");
+            assert.equal(gitInClone("check-ignore", "-v", "node_modules/example/index.js"),
+              ".gitignore:1:node_modules/\tnode_modules/example/index.js\n");
+          }
+          excludeBeforeCancel = await fs.readFile(excludePath);
+          if (work === "external-excludes" || work === "ignored-node-modules") {
+            assert.deepEqual(excludeBeforeCancel, provisionedExclude, "provisioned exclude remains byte-for-byte unchanged");
+          }
+          if (work === "info-exclude" || work === "external-excludes") {
+            await fs.writeFile(path.join(clone, "NEW.txt"), "unpublished");
+            assert.equal(gitInClone("status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"),
+              "", "ordinary status hides unpublished ignored work");
+            const source = work === "info-exclude" ? ".git/info/exclude" : externalExclude;
+            const line = work === "info-exclude" ? excludeBeforeCancel.toString("utf8").split("\n").indexOf("NEW.txt") + 1 : 1;
+            assert.equal(gitInClone("check-ignore", "-v", "NEW.txt"), `${source}:${line}:NEW.txt\tNEW.txt\n`,
+              "ignore provenance names the intended exclude source");
+          }
+          assert.equal(await git.worktreeHead(clone), startHead, "ignore fixture leaves HEAD unchanged");
+        }
+        const ignoredSourcePaths = work === "root-gitignore" ? [".gitignore", "NEW.ts"] :
+          work === "nested-gitignore" ? ["hidden-source/.gitignore", "hidden-source/NEW.ts"] : [];
+        if (ignoredSourcePaths.length > 0) {
+          const directory = work === "root-gitignore" ? clone : path.join(clone, "hidden-source");
+          await fs.mkdir(directory, { recursive: true });
+          await fs.writeFile(path.join(directory, ".gitignore"), "*\n");
+          await fs.writeFile(path.join(directory, "NEW.ts"), "export const unpublished = true;\n");
+          assert.equal(gitInClone("status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"),
+            "", "ordinary status hides wildcard-ignored unpublished source");
+          assert.equal(await git.worktreeHead(clone), startHead, "wildcard ignore fixture leaves HEAD unchanged");
+        }
+        if (work === "dirty") await fs.appendFile(path.join(clone, "README.md"), "changed");
+        if (work === "untracked" || work === "hidden") await fs.writeFile(path.join(clone, "NEW.txt"), "unpublished");
+        if (work === "hidden") gitInClone("config", "status.showUntrackedFiles", "no");
+        if (work === "committed") {
+          await fs.writeFile(path.join(clone, "NEW.txt"), "unpublished");
+          gitInClone("add", "NEW.txt"); gitInClone("commit", "-m", "unpublished");
+        }
+        if (work === "replace") {
+          const privateHead = commitInTree(clone, "NEW.txt", "committed private bytes");
+          gitInClone("reset", "--soft", startHead);
+          gitInClone("replace", startHead, privateHead);
+          assert.equal(await git.worktreeHead(clone), startHead, "HEAD still reports the trusted original hash");
+          const status = spawnSync("git", ["-C", clone, "status", "--porcelain"], { env: gitEnv(), encoding: "utf8" });
+          assert.equal(status.status, 0, status.stderr);
+          assert.equal(status.stdout, "", "replacement hides the private index/files from ordinary status");
+        }
+        if (work === "assume" || work === "skip") {
+          gitInClone("update-index", work === "assume" ? "--assume-unchanged" : "--skip-worktree", "README.md");
+          await fs.appendFile(path.join(clone, "README.md"), "hidden change");
+        }
+        if (work === "forged-stat" || work === "lossy-path") {
+          gitInClone("config", "index.version", "2");
+          gitInClone("update-index", "--index-version", "2");
+          const file = work === "lossy-path" ? rawPath(clone) : path.join(clone, "README.md");
+          if (work === "lossy-path") {
+            const names = await fs.readdir(clone, { encoding: "buffer" });
+            assert.ok(names.some(name => name.equals(rawName)), "raw invalid UTF-8 filename exists");
+            assert.ok(names.some(name => name.equals(Buffer.from(twinName))), "distinct valid replacement-character twin exists");
+            assert.deepEqual(await fs.readFile(file), await fs.readFile(path.join(clone, twinName)));
+            const tree = spawnSync("git", ["-C", bare, "ls-tree", "-r", "--name-only", "-z", startHead],
+              { env: gitEnv() });
+            assert.equal(tree.status, 0, tree.stderr.toString());
+            assert.ok(tree.stdout.includes(Buffer.concat([rawName, Buffer.from([0])])), "trusted bare contains raw filename");
+            assert.ok(tree.stdout.includes(Buffer.concat([Buffer.from(twinName), Buffer.from([0])])), "trusted bare contains valid twin");
+          }
+          const original = await fs.readFile(file);
+          await fs.writeFile(file, Buffer.alloc(original.length, 120));
+          const past = new Date(Date.now() - 86400000);
+          await fs.utimes(file, past, past);
+          const stat = await fs.stat(file, { bigint: true });
+          const indexPath = path.join(clone, ".git", "index");
+          const index = await fs.readFile(indexPath);
+          const entries = index.readUInt32BE(8);
+          assert.equal(entries, work === "lossy-path" ? 3 : 1, "fixture tracked entry count");
+          const target = work === "lossy-path" ? rawName : Buffer.from("README.md");
+          let offset = 12;
+          let targetOffset: number | undefined;
+          for (let entry = 0; entry < entries; entry++) {
+            const end = index.indexOf(0, offset + 62);
+            assert.ok(end >= offset + 62, "index v2 entry has a terminated raw name");
+            if (index.subarray(offset + 62, end).equals(target)) targetOffset = offset;
+            offset += Math.ceil((end + 1 - offset) / 8) * 8;
+          }
+          assert.notEqual(targetOffset, undefined, "changed raw path found in index");
+          const values = [stat.ctimeNs / 1000000000n, stat.ctimeNs % 1000000000n,
+            stat.mtimeNs / 1000000000n, stat.mtimeNs % 1000000000n,
+            // Git stores a normalized tracked mode, not all filesystem permission bits.
+            stat.dev, stat.ino, BigInt(index.readUInt32BE(targetOffset! + 24)), stat.uid, stat.gid, stat.size];
+          values.forEach((value, i) => index.writeUInt32BE(Number(value & 0xffffffffn), targetOffset! + i * 4));
+          createHash("sha1").update(index.subarray(0, -20)).digest().copy(index, index.length - 20);
+          await fs.writeFile(indexPath, index);
+          const status = spawnSync("git", ["-C", clone, "--no-replace-objects", "status", "--porcelain"],
+            { env: gitEnv(), encoding: "utf8" });
+          assert.equal(status.status, 0, status.stderr);
+          assert.equal(status.stdout, "", "forged stat cache hides changed tracked bytes");
+          assert.notDeepEqual(await fs.readFile(file), original);
+          if (work === "lossy-path") assert.deepEqual(await fs.readFile(path.join(clone, twinName)), original, "only raw invalid path changed");
+        }
+        if (work === "filter") {
+          gitInClone("config", "filter.delayed.clean", "touch FILTER-RAN");
+          await fs.writeFile(path.join(clone, ".gitattributes"), "README.md filter=delayed\n");
+        }
+        const beforeCancel = new Map<string, Buffer>();
+        for (const name of ["README.md", "NEW.txt", "RECOVERED.txt", ".gitattributes",
+          ...ignoredSourcePaths,
+          ...(["forged-stat", "lossy-path"].includes(work) ? [".git/index", ".git/config"] : []),
+          ...(work === "lossy-path" ? [twinName] : []),
+          ...(excludeBeforeCancel !== undefined ? [".git/info/exclude"] : [])]) {
+          const bytes = await fs.readFile(path.join(clone, name)).catch(error => {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+            throw error;
+          });
+          if (bytes !== undefined) beforeCancel.set(name, bytes);
+        }
+        for (const name of ignoredSourcePaths) {
+          assert.ok(beforeCancel.has(name), `${name} fixture exists and was read before cancellation`);
+        }
+        const rawBeforeCancel = work === "lossy-path" ? await fs.readFile(rawPath(clone)) : undefined;
+        const latchQuarantine = () => latchResidueQuarantine({
+          cause: "unattributed runner-uid residue", runId: claim.run_id, site: `owner_cancel_${scenario.quarantine}`,
+        }, noopLog);
+        if (scenario.quarantine === "before-cancel") {
+          quarantineSeamReached = true;
+          latchQuarantine();
+        }
+        api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+        if (scenario.quarantine && scenario.quarantine !== "before-cancel") {
+          await withTimeout(quarantineReached.promise, 10000, `quarantine ${scenario.quarantine} seam`);
+          latchQuarantine();
+          quarantineContinue.resolve();
+        }
+        await withTimeout(execution, 10000, "runner owner cancel");
+        if (scenario.quarantine) {
+          assert.ok(quarantineSeamReached, "requested quarantine timing reached");
+          assert.ok(realFlight, "delegating buildFlight wrapper captured the real flight");
+          assert.ok(dispositionObserved, "genuine owner-cancel disposition returned");
+          if (scenario.quarantine !== "before-cancel") assert.equal(settlementKind, "observed_empty", "genuine cleanup proved empty");
+          assert.deepEqual({ disposition, ...preservationAfterDisposition }, {
+            disposition: "retained", preserveRecoveryClone: true, preserveSession: true,
+          }, "both preservation flags are true immediately after genuine disposition returns");
+        }
+        assert.deepEqual(seamViolations, [], "owner-cancel seam invariants (the runner's catch would otherwise swallow them)");
+        assert.equal(lifecycle?.aborted, true, "real steering forwards genuine lifecycle abort");
+        assert.equal(rig.client.refreshCalls.length, 0, "cleanup never refreshes");
+        assert.equal(rig.client.releaseCalls.length, 1, "cleanup never releases Codex credentials");
+        assert.equal(recoveryGit.fetchCalls, 0, "no PAT fetch");
+        assert.equal(recoveryClient.reserveCalls.length, 0, "no archive");
+        if (work === "external-excludes") {
+          assert.deepEqual(await fs.readFile(externalExclude), externalExcludeBytes, "external exclude bytes unchanged after cancellation");
+        }
+        assert.equal(releases.length, process.platform === "linux" && (shouldCloseHold || scenario.release) ? 1 : 0);
+        assert.equal(boundaryCalls, 0, "no credentialed cleanup boundary");
+        assert.equal(openHolds.has(7), !shouldCloseHold, "exact release ACK closes own server hold independently of local retention");
+        assert.equal(openHolds.has(8), true, "sibling hold untouched");
+        const records = await recovery.coord.inspect(claim.run_id);
+        assert.ok(records.some(record => record.generation === 8), "sibling journal untouched");
+        assert.equal(records.some(record => record.generation === 7), !shouldRelease, "own journal follows exact release proof");
+        assert.equal(await git.revParse(bare, `refs/uzi-recovery-pin/${claim.run_id}/8^{commit}`), startHead, "sibling pin untouched");
+        assert.equal(await git.revParse(bare, `refs/uzi-recovery-pin/${claim.run_id}/7^{commit}`), shouldRelease ? null : startHead, "own exact-generation pin follows release proof");
+        if (!["before-cancel", "settle"].includes(scenario.quarantine ?? "")) {
+          assert.ok(observations.includes("owner_cancel"));
+          assert.ok(cancelLogs.some(line => rec(line).msg === "owner cancel Docker teardown"), "Docker state logged when initial proof reached");
+        }
+        if (shouldCloseHold) assert.ok(observations.includes("owner_cancel_after_inspection"));
+        if (shouldCloseHold) assert.deepEqual(releases[0], [claim.run_id, 7]);
+        if (!shouldRelease) {
+          assert.equal((await fs.stat(clone)).isDirectory(), true, "source retained");
+          if (work === "info-exclude" || work === "external-excludes" || ignoredSourcePaths.length > 0) {
+            assert.equal(await git.worktreeHead(clone), startHead, "retained HEAD unchanged");
+          }
+          if (work.startsWith("symlink-")) {
+            const leaf = path.join(clone, linkName);
+            const retained = await fs.lstat(leaf);
+            if (work === "symlink-file") {
+              assert.equal(retained.isFile(), true, "replacement remains a regular file");
+              assert.equal(await fs.readFile(leaf, "utf8"), "replacement file bytes");
+            } else {
+              assert.equal(retained.isSymbolicLink(), true, "retained leaf remains a symlink");
+              assert.deepEqual(await fs.readlink(leaf, { encoding: "buffer" }),
+                Buffer.from(work === "symlink-changed" ? "../../../absent-target-b" : linkTarget));
+            }
+          }
+          for (const [name, bytes] of beforeCancel) assert.deepEqual(await fs.readFile(path.join(clone, name)), bytes, `${name} bytes retained exactly`);
+          if (rawBeforeCancel !== undefined) {
+            assert.ok((await fs.readdir(clone, { encoding: "buffer" })).some(name => name.equals(rawName)), "raw filename retained exactly");
+            assert.deepEqual(await fs.readFile(rawPath(clone)), rawBeforeCancel, "raw invalid-path bytes retained exactly");
+          }
+        }
+        assert.equal(await fs.access(path.join(clone, "FILTER-RAN")).then(() => true, () => false), false);
+      } finally {
+        quarantineContinue.resolve();
+        try {
+          await runner.shutdown();
+          await execution;
+        } finally {
+          resetResidueQuarantineForTests();
+          await api.close();
+          fx.cleanup();
+          await fs.rm(recovery.root, { recursive: true, force: true });
+        }
+      }
+    });
 });
 
 describe("approved actual CodexExecutor policy flow (#2321)", () => {

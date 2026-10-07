@@ -5591,6 +5591,94 @@ export class GitCache {
   }
 
   /**
+   * Owner-cancel inspection only. Clone observations run as the runner uid without optional
+   * locks. Status is only a metadata/untracked check: a separate runner-identity reader
+   * hashes regular-file bytes and raw symlink target bytes against the trusted bare starting
+   * tree, never following targets or trusting the clone's index or object store.
+   * Unsupported types/platforms and budgets retain custody.
+   * Ignored untracked .gitignore retains custody, even in trusted-ignored directories such as Python virtualenvs.
+   * Trusted tracked .gitignore semantics remain unchanged. External excludes are disabled;
+   * info/exclude permits only the exact worker-source '/.uzi/scratch/' baseline plus
+   * column-zero comments and empty or ASCII-space-only blanks. Uncertain rules retain custody.
+   */
+  async credentialFreeCancelCleanHead(cwd: string, barePath: string, trustedStart: string): Promise<string | null> {
+    const pins = [
+      // Compare the real HEAD tree: runner-owned refs/replace must not hide private bytes.
+      "--no-replace-objects",
+      "--no-optional-locks",
+      "-c", "core.fsmonitor=false",
+      "-c", "core.untrackedCache=false",
+      "-c", "core.ignoreStat=false",
+      "-c", "core.checkStat=default",
+      "-c", "core.trustctime=true",
+      "-c", "core.fileMode=true",
+      "-c", "core.ignoreCase=false",
+      "-c", "core.excludesFile=/dev/null",
+    ];
+    const read = (args: string[]) => this.runGitAsRunner(cwd, [...pins, ...args]);
+    try {
+      if (process.platform !== "linux" || !path.isAbsolute(cwd) ||
+          path.resolve(cwd) !== cwd || !/^[0-9a-f]{40}$/.test(trustedStart)) return null;
+      // Pure worker-side object enumeration: the private clone cannot supply the tree.
+      // Each subprocess has a deadline/output cap; no retries or sibling work.
+      const tree = await this.execScoped(GIT_BIN,
+        withDir(barePath, ["--no-replace-objects", "ls-tree", "-r", "-l", "-z", trustedStart]), {
+          env: workerSpawnEnv(gitEnv()), timeout: 5000, maxBuffer: 2 * 1024 * 1024,
+        });
+      const manifest: Array<[string, string, string, number]> = [];
+      let total = 0;
+      for (const entry of tree.stdout.split("\0")) {
+        if (!entry) continue;
+        const match = /^(100644|100755|120000) blob ([0-9a-f]{40}) +([0-9]+)\t([\s\S]+)$/.exec(entry);
+        if (!match) return null;
+        // execScoped decodes UTF-8. Refuse replacement characters so distinct raw
+        // Git paths cannot collapse to the same runner-reader path.
+        if (match[4]!.includes("\uFFFD")) return null;
+        const size = Number(match[3]);
+        total += size;
+        if (!Number.isSafeInteger(size) || size > 4 * 1024 * 1024 ||
+            total > 128 * 1024 * 1024 || manifest.length >= 20000) return null;
+        manifest.push([match[4]!, match[1]!, match[2]!, size]);
+      }
+      // config/index/ref reads cannot invoke a clean/process filter. Reading all effective
+      // config also sees included config files; any read failure refuses the proof.
+      const config = await read(["config", "--null", "--list"]);
+      for (const entry of config.split("\0")) {
+        const split = entry.indexOf("\n");
+        const key = (split < 0 ? entry : entry.slice(0, split)).toLowerCase();
+        if (/^filter\..*\.(clean|process)$/.test(key) ||
+            key === "core.worktree" || key === "core.sparsecheckout" ||
+            key === "extensions.worktreeconfig") return null;
+      }
+      const flags = await read(["ls-files", "-v", "-z"]);
+      if (flags.split("\0").some(entry => entry && (entry[0] === "S" || /^[a-z]/.test(entry)))) return null;
+      const index = await read(["ls-files", "--stage", "-z"]);
+      const expectedIndex = manifest.map(([name, mode, oid]) => mode + " " + oid + " 0\t" + name + "\0").join("");
+      if (index !== expectedIndex) return null;
+      const before = (await read(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+      if (before !== trustedStart) return null;
+      const status = await read(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"]);
+      if (status.length !== 0) return null;
+      const ignored = await read(["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", ":(glob)**/.gitignore", ":(exclude).uzi/scratch/**"]);
+      if (ignored.split("\0").some(entry => entry && !entry.startsWith(".uzi/scratch/"))) return null;
+      const wrapped = this.boundaryProcesses.getStore()
+        ? { command: process.execPath, args: ["-e", CANCEL_CONTENT_HELPER, cwd] }
+        : runnerCommand(process.execPath, ["-e", CANCEL_CONTENT_HELPER, cwd]);
+      const input = JSON.stringify(manifest);
+      if (Buffer.byteLength(input) > 2 * 1024 * 1024) return null;
+      const proof = await this.execScoped(wrapped.command, wrapped.args, {
+        env: unmarkedSpawnEnv({ ...gitEnv(), PATH: runnerPath() }),
+        cwd, input, timeout: 30000, maxBuffer: 1024,
+      }, "command");
+      if (proof.stdout !== "clean\n") return null;
+      const after = (await read(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+      return status.length === 0 && before === after ? after : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Issue #281 / CodeRabbit #655: the porcelain read for the no-progress detector's
    * worktree fingerprint. Identical git invocation and runner-uid rationale as
    * planChangedFiles, but returns `null` on a failed read instead of `[]`, so an
@@ -8726,6 +8814,156 @@ export class GitCache {
     return result;
   }
 }
+
+// Trusted cancel reader: Linux pinned parents, regular-file descriptors and raw readlink
+// bytes; no target traversal, Git, config, filters or writes. One failed path aborts
+// the proof. At most 20,000 entries, depth 64, 4 MiB/entry,
+// 128 MiB total; synchronous reads check a 28s deadline, execScoped caps at 30s.
+const CANCEL_CONTENT_HELPER = String.raw`
+const fs = require("node:fs");
+const { createHash } = require("node:crypto");
+const C = fs.constants, O_PATH = 0x200000;
+const root = process.argv[1], deadline = Date.now() + 28000;
+const fds = new Set();
+let total = 0;
+function check() { if (Date.now() > deadline) throw Error("content deadline"); }
+function close(fd) { fs.closeSync(fd); fds.delete(fd); }
+function fp(fd) { return "/proc/" + process.pid + "/fd/" + fd; }
+function open(p, flags) {
+  check();
+  const fd = fs.openSync(p, flags);
+  fds.add(fd);
+  return fd;
+}
+function parts(p) {
+  const a = p.split("/");
+  if (!p || a.length > 64 || a.some(x => !x || x === "." || x === ".." || x.toLowerCase() === ".git")
+      || p.includes("\0") || Buffer.from(p).toString() !== p) throw Error("unsafe path");
+  return a;
+}
+try {
+  if (process.platform !== "linux" || !root.startsWith("/") || root.length > 4096 ||
+      root.split("/").length > 64) throw Error("unsupported root");
+  // Pin every absolute ancestor without following a source-controlled symlink.
+  let dir = open("/", O_PATH | C.O_NOFOLLOW);
+  for (const part of root.slice(1).split("/")) {
+    if (!part || part === "." || part === "..") throw Error("unsafe root");
+    const next = open(fp(dir) + "/" + part, O_PATH | C.O_NOFOLLOW);
+    if (!fs.fstatSync(next).isDirectory()) throw Error("non-directory root");
+    close(dir); dir = next;
+  }
+  // Fixed metadata traversal is separate from parts(), which forbids manifest .git paths.
+  // One failure aborts the proof; exclude reads stop at 64 KiB plus an overflow sentinel.
+  let metadata = dir;
+  try {
+    for (const component of [".git", "info"]) {
+      let next;
+      try { next = open(fp(metadata) + "/" + component, O_PATH | C.O_NOFOLLOW); }
+      catch (e) { if (component === "info" && e.code === "ENOENT") break; throw e; }
+      if (!fs.fstatSync(next).isDirectory()) throw Error("unsafe exclude ancestor");
+      // O_PATH pins identity but does not prove read authority.
+      const readable = open(fp(next) + "/.", C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW);
+      close(readable);
+      if (metadata !== dir) close(metadata);
+      metadata = next;
+      if (component !== "info") continue;
+      let fd;
+      try { fd = open(fp(metadata) + "/exclude", C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK); }
+      catch (e) { if (e.code === "ENOENT") break; throw e; }
+      try {
+        const before = fs.fstatSync(fd, { bigint: true });
+        if (!before.isFile() || before.size > 65536n) throw Error("exclude type/cap");
+        const bytes = Buffer.alloc(65537);
+        let n = 0;
+        while (n < bytes.length) {
+          check();
+          const got = fs.readSync(fd, bytes, n, bytes.length - n, null);
+          if (!got) break;
+          n += got;
+          if (n > 65536) throw Error("exclude cap");
+        }
+        check();
+        const after = fs.fstatSync(fd, { bigint: true });
+        if (BigInt(n) !== before.size ||
+            ["dev", "ino", "size", "mode", "mtimeNs", "ctimeNs"].some(k => before[k] !== after[k]))
+          throw Error("unstable exclude");
+        const content = bytes.subarray(0, n);
+        if (!require("node:buffer").isUtf8(content) || content.includes(0))
+          throw Error("exclude encoding");
+        const lines = content.toString("utf8").split("\n");
+        for (let i = 0; i < lines.length; i++) {
+          check();
+          const line = i < lines.length - 1 && lines[i].endsWith("\r")
+            ? lines[i].slice(0, -1) : lines[i];
+          if (line.includes("\r") ||
+              !(line.startsWith("#") || /^ *$/.test(line) || line === "/.uzi/scratch/"))
+            throw Error("untrusted exclude rule");
+        }
+      } finally { close(fd); }
+    }
+  } finally { if (metadata !== dir) close(metadata); }
+  const input = fs.readFileSync(0);
+  if (input.length > 2 * 1024 * 1024) throw Error("manifest cap");
+  const manifest = JSON.parse(input.toString("utf8"));
+  if (!Array.isArray(manifest) || manifest.length > 20000) throw Error("path cap");
+  for (const [name, mode, oid, size] of manifest) {
+    check();
+    if (!["100644", "100755", "120000"].includes(mode) || !/^[0-9a-f]{40}$/.test(oid) ||
+        !Number.isSafeInteger(size) || size < 0 || size > 4 * 1024 * 1024) throw Error("unsupported entry");
+    total += size;
+    if (total > 128 * 1024 * 1024) throw Error("aggregate cap");
+    const components = parts(name);
+    let parent = dir;
+    try {
+      for (const component of components.slice(0, -1)) {
+        const next = open(fp(parent) + "/" + component, O_PATH | C.O_NOFOLLOW);
+        if (!fs.fstatSync(next).isDirectory()) throw Error("non-directory ancestor");
+        if (parent !== dir) close(parent);
+        parent = next;
+      }
+      if (mode === "120000") {
+        const leaf = fp(parent) + "/" + components.at(-1);
+        const before = fs.lstatSync(leaf, { bigint: true });
+        if (!before.isSymbolicLink() || before.size !== BigInt(size)) throw Error("link type/size");
+        const target = fs.readlinkSync(leaf, { encoding: "buffer" });
+        check();
+        const after = fs.lstatSync(leaf, { bigint: true });
+        if (target.length !== size ||
+            createHash("sha1").update("blob " + size + "\0").update(target).digest("hex") !== oid ||
+            ["dev", "ino", "size", "mode", "mtimeNs", "ctimeNs"].some(k => before[k] !== after[k]))
+          throw Error("content mismatch or unstable link");
+        continue;
+      }
+      const fd = open(fp(parent) + "/" + components.at(-1), C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
+      try {
+        const before = fs.fstatSync(fd, { bigint: true });
+        if (!before.isFile() || before.size !== BigInt(size) ||
+            ((before.mode & 0o100n) !== 0n) !== (mode === "100755")) throw Error("file type/size/mode");
+        const hash = createHash("sha1").update("blob " + size + "\0");
+        const buf = Buffer.alloc(65536);
+        let n = 0;
+        while (true) {
+          check();
+          const got = fs.readSync(fd, buf, 0, Math.min(buf.length, size + 1 - n), null);
+          if (!got) break;
+          n += got;
+          if (n > size) throw Error("file grew");
+          hash.update(buf.subarray(0, got));
+        }
+        const after = fs.fstatSync(fd, { bigint: true });
+        if (n !== size || hash.digest("hex") !== oid ||
+            ["dev", "ino", "size", "mode", "mtimeNs", "ctimeNs"].some(k => before[k] !== after[k]))
+          throw Error("content mismatch or unstable file");
+      } finally { close(fd); }
+    } finally { if (parent !== dir) close(parent); }
+  }
+  process.stdout.write("clean\n");
+} catch {
+  process.exitCode = 1;
+} finally {
+  for (const fd of fds) fs.closeSync(fd);
+}
+`;
 
 /**
  * Trusted inline runner program, never loaded from the clone. Linux descriptor

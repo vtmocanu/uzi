@@ -112,7 +112,7 @@ spec:
 {{- /*
   The backstop, never the source: every docker worker pod arrives from the controller
   with explicit requests + limits on every container. `max` must stay >= the largest
-  worker preset's limits (l = 4 CPU / 12Gi) or that preset stops being admissible here.
+  worker preset's limits (l = 4 CPU / 20Gi) or that preset stops being admissible here.
 */}}
 ---
 apiVersion: v1

@@ -47,6 +47,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Hosted worker sizes `l` and `m` get more memory: `l` 14Gi request / 20Gi limit, `m` 8Gi request / 12Gi limit ([#2127](https://github.com/vtmocanu/uzi/issues/2127)).**
+  Workers running whole-program Go analyzer gates were OOMKilled at the old limits; the chart's worker LimitRange ceilings and memory quotas rise to match (CPU and disk are unchanged), at the cost of fewer `l` workers per node.
+
 - **Codex subscription runs can wait out a usage window and resume automatically ([#2360](https://github.com/vtmocanu/uzi/issues/2360)).**
   The existing default-on usage-limit preference now covers recognized Codex window failures using structured evidence from the failed turn, with the latest exhausted-window reset or bounded fallback; Settings and per-run controls use shared Usage limits wording. Resume keeps the same Codex account and restores captured work, with approval reused when recovered; Docker workers retain the existing fresh-thread lineage break. Missing or unaccepted evidence and non-window limits fail as typed `rate_limited` without a reset promise; `rateLimitExceeded` and `sessionBudgetExceeded` are unchanged (#2361 tracks the former). Capture and publish can fail, so latest-work durability is conditional; each park can hold an issue lock and a run-bound hosted worker/PVC for up to the default 8 days, while fallback retries can exhaust the wait budget before a weekly reset.
 
@@ -61,14 +64,23 @@ through `[0.52.0]`.)
 - **Recovery custody retains complete candidate inventories ([#1924](https://github.com/vtmocanu/uzi/issues/1924)).**
   Workers retain divergent unpublished heads under worker-local refs, distinguish them from durable remote checkpoints in the feed, and freeze a recovery-only aggregate whose ancestry preserves the original heads with one current source tree. Inventory-guarded generations keep custody open despite completion or an earlier available archive until the exact final covering archive or verified empty inventory is acknowledged; an owner-readable receipt identifies the selected capture and coverage digest. The selected archive is protected while its local worker exists, and physical worker deletion renews the configured normal ready-retention window (7 days by default); earlier non-final and legacy captures keep their existing TTL. Dirty or unverified source and pending final acknowledgments retain custody with bounded retries. A guarded claim that parks or fails before its clone closes its own empty hold with a settled release once nothing is proven adopted locally. Older APIs report unguarded generations without promising complete terminal or reclamation protection; local pins alone are not durable recovery. A run retains at most 64 such heads: at the limit the worker keeps the existing pins and the clone and stops the run as a preservation failure instead of letting a rewriting agent grow worker-local pins without bound, and the feed announces each retained head only once.
 
+- **Release-candidate update checks share strict tag validation ([#1923](https://github.com/vtmocanu/uzi/issues/1923)).**
+  Server release selection and TUI update prompts reject published `-rc.0` tags; the CLI skew warning still accepts valid build metadata on an RC binary stamp when choosing the upgrade formula.
+
 - **Memory warnings and repository validation are more precise ([#296](https://github.com/vtmocanu/uzi/issues/296)).**
   Memory advisories distinguish direct executable-availability claims from test-rig and feature prose, Git fixture initialization ignores inherited Git redirection and configuration variables, and Semgrep reports bounded sanitized diagnostics from a single scan per stage while rejecting timeouts, inconsistent reports and incomplete captures. Strict scanning and canary verification remain required when the scanner runs.
+
+- **Manual vault locks retain their notification acknowledgement.**
+  An older unlock delayed during secret migration no longer erases a later manual lock’s acknowledgement, preventing unwanted unlock reminders while the vault remains locked.
 
 - **Agent startup reclaims stale terminal journal temps ([#2308](https://github.com/vtmocanu/uzi/issues/2308)).**
   Startup removes canonical regular-file terminal install temps before key loading so interrupted writes no longer pin empty runs; installed journals, unknown entries and live-write retirement protection remain intact.
 
 - **Recorded finding-group settlement errors no longer stop issue sync ([#1946](https://github.com/vtmocanu/uzi/issues/1946)).**
   Board refresh and polling continue updating the issue cache when a recorded finding group cannot settle. The failed group stays claimed, is logged for diagnosis, and is retried on a later pass while other recorded groups on the page still settle.
+
+- **Codex steering cancellation releases exact recovery custody after clean settlement ([#2365](https://github.com/vtmocanu/uzi/issues/2365)).**
+  Clean steering cancellation releases the exact claim generation’s recovery custody; incomplete proof retains local work and custody. Pre-settle reap warnings include validated, redacted Codex boundary diagnostics, and pin logs distinguish stored finalization provenance from early pins.
 
 - **Plan cross-check preserves worker custody during planning ([#2149](https://github.com/vtmocanu/uzi/issues/2149)).**
   Confined planning captures read the immutable baseline without granting writes, and queued transport waits can be cancelled without discarding assigned records. Cross-check migrations now follow the current default schema while retaining worker maintenance and Docker preferences.

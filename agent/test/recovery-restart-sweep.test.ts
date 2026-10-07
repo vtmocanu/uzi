@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { Readable } from "node:stream";
-import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache, RecoveryBundleTooLargeError } from "../src/git.js";
 import { Outbox } from "../src/outbox.js";
 import { canonicalJson, RecoveryCoordinator, type RecoveryArchiveClient, type RecoveryRecord } from "../src/recovery.js";
@@ -174,6 +174,38 @@ async function only(coord: RecoveryCoordinator, runId: string): Promise<Recovery
   assert.equal(records.length, 1);
   return records[0]!;
 }
+
+describe("RecoveryCoordinator.pin — milestone2 provenance logging", () => {
+  for (const c of [
+    { label: "early pin", provenance: {}, finalization: false },
+    { label: "finalization pin", provenance: FIN, finalization: true },
+    { label: "missing bareDir", provenance: { finalizationPin: true, defaultBranch: "main" }, finalization: false },
+    { label: "missing defaultBranch", provenance: { finalizationPin: true, bareDir: BARE_DIR }, finalization: false },
+  ]) {
+    it(c.label, async () => {
+      const { logger, lines } = recordingLogger();
+      const coord = new RecoveryCoordinator({
+        client: new FakeClient(), git: cache, log: logger,
+        recoveryRoot: cache.recoveryRoot, workerToken: TOKEN,
+      });
+      const record = await coord.pin({
+        runId: "pin-log", sourceSha: workSha, kind: "issue", branch: "agent/issue-1",
+        generation: 3, ...c.provenance,
+      });
+      assert.ok(record);
+      const reloaded = await only(coordinator(), "pin-log");
+      assert.equal(reloaded.finalizationPin, c.finalization ? true : undefined);
+      const info = lines.filter((line) =>
+        (line as { msg?: string }).msg === "recovery: pinned source head",
+      );
+      assert.deepEqual(info, [{
+        level: "info", msg: "recovery: pinned source head",
+        run_id: "pin-log", capture_id: record.captureId, finalization_pin: c.finalization,
+      }]);
+      assert.ok(!JSON.stringify(lines).includes("pinned source head at finalization boundary"));
+    });
+  }
+});
 
 describe("RecoveryCoordinator.pin — finalization facts (issue #1742 D4a)", () => {
   it("the finalization pin updates the early record in place and the MAC verifies after reload", async () => {

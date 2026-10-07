@@ -9,6 +9,8 @@
 #   5. a workflow edit on a uzi-owned branch stops before the push (exit 10) unless overridden;
 #   6. a checkout of the PR branch that land-prep did not create is refused (exit 3), at
 #      the default path too, unless --worktree names it.
+#   7. an active ci_fix on this repo/branch stops before worktree creation or push (exit 4);
+#      terminal runs and active runs on another branch or repo do not block.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -63,7 +65,10 @@ for b in agent/issue-9 lander/wf; do
   mkdir -p "$SEED/.github/workflows"; printf 'on: push\n' > "$SEED/.github/workflows/ci.yml"
   git -C "$SEED" add -A && git -C "$SEED" commit -qm "wf on $b"
 done
-git -C "$SEED" push -q origin collide clrm deps agent/issue-9 lander/wf
+mk_branch cifix
+printf 'guard\n' > "$SEED/guard.txt"
+git -C "$SEED" add guard.txt && git -C "$SEED" commit -qm cifix
+git -C "$SEED" push -q origin collide clrm deps agent/issue-9 lander/wf cifix
 git clone -q "$ORIGIN" "$ROOT"
 git -C "$ROOT" config user.name test
 git -C "$ROOT" config user.email test@example.com
@@ -77,7 +82,8 @@ STUB
 cat > "$WORK/bin/uzi" <<'STUB'
 #!/usr/bin/env bash
 set -eu
-if [ "${1:-}" = repo ] && [ "${2:-}" = list ]; then echo '[]'; exit 0; fi
+if [ "${1:-}" = repo ] && [ "${2:-}" = list ]; then printf '%s\n' "$UZI_REPOS_JSON"; exit 0; fi
+if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then printf '%s\n' "$UZI_RUNS_JSON"; exit 0; fi
 echo "unexpected uzi call: $*" >&2; exit 1
 STUB
 # task: records every call; migration:renumber refuses (so a detected collision is exit 6
@@ -104,6 +110,7 @@ mkdir -p node_modules
 STUB
 chmod +x "$WORK/bin/"*
 export TASK_LOG="$WORK/task.log" NPM_LOG="$WORK/npm.log"
+export UZI_REPOS_JSON='[]' UZI_RUNS_JSON='[]'
 : > "$TASK_LOG"; : > "$NPM_LOG"
 
 run() { # branch pr [extra args...] -> sets rc, output in $WORK/out.<pr>
@@ -116,6 +123,37 @@ run() { # branch pr [extra args...] -> sets rc, output in $WORK/out.<pr>
   rc=$?
   set -e
 }
+
+# 7. Record actual push invocations: an unchanged remote SHA alone cannot prove no push.
+REAL_GIT=$(command -v git)
+export PUSH_LOG="$WORK/push.log"
+: > "$PUSH_LOG"
+cat > "$WORK/bin/git" <<STUB
+#!/usr/bin/env bash
+if [ "\$1" = push ]; then printf '%s\n' "\$*" >> "\$PUSH_LOG"; fi
+exec "$REAL_GIT" "\$@"
+STUB
+chmod +x "$WORK/bin/git"
+export UZI_REPOS_JSON='[{"id":"repo-1","path_with_namespace":"test/uzi"}]'
+export UZI_RUNS_JSON='[{"id":"active-cifix","kind":"ci_fix","repo_id":"repo-1","pipeline_ref":"cifix","status":"running"}]'
+run cifix 110 --gate none
+[ "$rc" -eq 4 ] || fail "active ci_fix not stopped, rc=$rc: $(cat "$WORK/out.110")"
+grep -Fq 'active-cifix' "$WORK/out.110" || fail "ci_fix refusal omitted the run id"
+[ ! -s "$PUSH_LOG" ] || fail "push ran despite active ci_fix"
+[ ! -e "$WORK/wt-110" ] || fail "worktree created despite active ci_fix"
+[ "$(git -C "$ROOT" worktree list --porcelain | grep -c '^worktree ')" -eq 1 ] || fail "active ci_fix created a worktree elsewhere"
+# Every terminal status passes, as do active runs on another branch or another repo.
+for status in completed failed cancelled; do
+  UZI_RUNS_JSON=$(jq -cn --arg s "$status" '[{id:"terminal-cifix",kind:"ci_fix",repo_id:"repo-1",pipeline_ref:"cifix",status:$s}]')
+  export UZI_RUNS_JSON
+  run cifix 110 --gate none --no-push
+  [ "$rc" -eq 0 ] || fail "terminal ci_fix ($status) blocked preparation, rc=$rc: $(cat "$WORK/out.110")"
+done
+export UZI_RUNS_JSON='[{"id":"other-branch","kind":"ci_fix","repo_id":"repo-1","pipeline_ref":"other","status":"running"},{"id":"other-repo","kind":"ci_fix","repo_id":"repo-2","pipeline_ref":"cifix","status":"running"}]'
+run cifix 110 --gate none --no-push
+[ "$rc" -eq 0 ] || fail "unrelated active ci_fix blocked preparation, rc=$rc: $(cat "$WORK/out.110")"
+export UZI_REPOS_JSON='[]' UZI_RUNS_JSON='[]'
+rm -f "$WORK/bin/git"
 
 # 1. collision detected: the renumber helper is invoked (it refuses here, so exit 6).
 run collide 101 --no-push --gate none
@@ -253,4 +291,4 @@ grep -q 'land-prep did not create' "$WORK/out.109" || fail "the default-path ref
 [ "$(git -C "$DEFAULT_WT" rev-parse HEAD)" = "$before" ] || fail "the default-path tree's HEAD moved"
 git -C "$ROOT" worktree remove --force "$DEFAULT_WT"
 
-echo "PASS land-prep guards: migration collision under pipefail, CHANGELOG removal stop, node_modules install, lockfile-hash reinstall, workflow edit on a uzi branch, foreign worktree refusal"
+echo "PASS land-prep guards: migration collision under pipefail, CHANGELOG removal stop, node_modules install, lockfile-hash reinstall, workflow edit on a uzi branch, foreign worktree refusal, branch-scoped active ci_fix refusal"

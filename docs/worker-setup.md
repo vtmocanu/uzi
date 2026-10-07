@@ -303,8 +303,9 @@ nothing on that worker can kill or contain it.
 that one finding (the process-quiescence verdict reason `unreadable_unattributed`).
 A worker-wide, credential-free scan runs on every claim before the clone fetch
 (both harnesses, and the review lane before its fetch) and inside the quiescence
-proofs that scan processes. A Codex run's own-mode proof does not scan processes,
-so it neither scans nor latches. Under the [uid split](proc-hardening.md) a worker never
+proofs that scan processes. A Codex run's own-mode proof normally does not scan
+processes, so it neither scans nor latches; the one exception is the owner-cancellation
+cleanup, which forces a process scan and can therefore latch. Under the [uid split](proc-hardening.md) a worker never
 quarantines: the existing solitary-kill path and the uid boundary already contain
 the process. Every other unproven state (a kill that could not be confirmed, a
 HOME reap that left a process, an unreadable status file, a helper failure) keeps
