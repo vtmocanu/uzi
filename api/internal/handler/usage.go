@@ -203,6 +203,7 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 	// a usage row can attach its outcomes.
 	outcomesByUser := map[uuid.UUID]store.AdminRunOutcomesPerUserRow{}
 	originsByUser := map[uuid.UUID]map[string]int64{}
+	last7OriginsByUser := map[uuid.UUID]map[string]int64{}
 	for _, o := range perUserOutcomes {
 		origins, err := decodeFailOrigins(o.FailOrigins)
 		if err != nil {
@@ -210,6 +211,13 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
+		last7Origins, err := decodeFailOrigins(o.Last7FailOrigins)
+		if err != nil {
+			slog.Error("admin seven-day run outcomes per user", "error", err, "user_id", o.UserID)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		last7OriginsByUser[o.UserID] = last7Origins
 		outcomesByUser[o.UserID] = o
 		originsByUser[o.UserID] = origins
 	}
@@ -230,7 +238,16 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 				OutputTokens:        u.OutputTokens,
 				CostUSD:             numericToFloat(u.CostUsd),
 			},
-			RunCount: u.RunCount,
+			Last7Days: &apitypes.UsageDTO{
+				InputTokens: u.Last7InputTokens, CacheReadTokens: u.Last7CacheReadTokens,
+				CacheCreationTokens: u.Last7CacheCreationTokens, OutputTokens: u.Last7OutputTokens,
+				CostUSD: numericToFloat(u.Last7CostUsd),
+			},
+			Last7RunCount:             u.Last7RunCount,
+			Last7SubscriptionRunCount: u.Last7SubscriptionRunCount,
+			Last7UnreportedRunCount:   u.Last7UnreportedRunCount,
+			Last7Outcomes:             runOutcomes(oc.Last7Finished, oc.Last7Completed, oc.Last7Cancelled, oc.Last7PlanRejected, oc.Last7Failed, oc.Last7NeedsLanding, last7OriginsByUser[u.UserID]),
+			RunCount:                  u.RunCount,
 			// PRD #1429 M1 (D7): the user's lifetime subscription/unreported run counts, so the
 			// admin per-user breakdown discloses a non-metered component like the factory total.
 			SubscriptionRunCount: u.SubscriptionRunCount,
@@ -247,10 +264,12 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		users = append(users, apitypes.AdminUserUsageDTO{
-			UserID:   oc.UserID.String(),
-			Email:    oc.Email,
-			Usage:    apitypes.UsageDTO{},
-			RunCount: 0,
+			UserID:        oc.UserID.String(),
+			Email:         oc.Email,
+			Usage:         apitypes.UsageDTO{},
+			Last7Days:     &apitypes.UsageDTO{},
+			Last7Outcomes: runOutcomes(oc.Last7Finished, oc.Last7Completed, oc.Last7Cancelled, oc.Last7PlanRejected, oc.Last7Failed, oc.Last7NeedsLanding, last7OriginsByUser[oc.UserID]),
+			RunCount:      0,
 			// No usage row means no run_usage_totals rows, so both non-metered counts are zero.
 			SubscriptionRunCount: 0,
 			UnreportedRunCount:   0,

@@ -47,6 +47,13 @@ M2 adds the rest of the apitypes hot set: `RepoDTO → Repo`, `MessageDTO → Ru
 recency fields (issue #2399). Its zero-marshal has a null `fail_origins`; the
 handler normalizes that map to `{}` on the real wire.
 
+M1 of issue #2439 adds recorded `AdminUserUsageDTO → AdminUsageUser` and
+`AdminUsageDTO → AdminUsage` pairs. Zero-fixture exceptions are `users:null`
+(`AdminUsage` allocates the slice), nested `fail_origins:null` (`runOutcomes`
+normalizes maps to {}), and per-user `last_7_days:null` (the new handler always
+allocates a usage bundle). Production TypeScript does not accept these fixture-only
+nulls. Nested factory SelfUsage and both outcome windows are checked in these pairs.
+
 ### M2 `ZeroOf` exemptions, each cited (Decision 7)
 
 Every exemption below is a field the TS type says never-null while the Go **mapper**

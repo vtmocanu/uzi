@@ -73,6 +73,7 @@ func TestUsageFailureRecencyMapping(t *testing.T) {
 		t.Fatalf("missing outcome-only user: %+v", admin.Users)
 	}
 	assert(admin.Users[0].Outcomes, false)
+	assertNull(admin.Users[0].Last7Outcomes)
 	// Internal SQL defaults must never become an invented zero-valued streak.
 	st.selfRunOutcomes.LastFailedAt = pgtype.Timestamptz{}
 	rec = httptest.NewRecorder()

@@ -18,6 +18,9 @@ import type {
   SecretMeta,
   RunUsage,
   RunOutcomes,
+  AdminUsageUser,
+  AdminUsage,
+  SelfUsage,
   UserSettings,
   CatalogEntry,
   AdminCliToken,
@@ -94,6 +97,10 @@ import agentMemoryZero from "../../../fixtures/api-contract/agent_memory.zero.js
 import agentMemoryFull from "../../../fixtures/api-contract/agent_memory.full.json";
 import secretZero from "../../../fixtures/api-contract/secret.zero.json";
 import secretFull from "../../../fixtures/api-contract/secret.full.json";
+import adminUserUsageZero from "../../../fixtures/api-contract/admin_user_usage.zero.json";
+import adminUserUsageFull from "../../../fixtures/api-contract/admin_user_usage.full.json";
+import adminUsageZero from "../../../fixtures/api-contract/admin_usage.zero.json";
+import adminUsageFull from "../../../fixtures/api-contract/admin_usage.full.json";
 import usageZero from "../../../fixtures/api-contract/usage.zero.json";
 import usageFull from "../../../fixtures/api-contract/usage.full.json";
 import runOutcomesZero from "../../../fixtures/api-contract/run_outcomes.zero.json";
@@ -605,6 +612,87 @@ void _buildInfoFull;
   const zero: ZeroOf<RunOutcomes, "fail_origins"> = runOutcomesZero;
   const full: Widen<RunOutcomes> = runOutcomesFull;
   void missing; void extra; void zero; void full;
+}
+
+
+// #2439 M1: pin both directions at every usage/outcome envelope and nested window.
+{
+  const value0 = adminUserUsageFull;
+  const missing0: never = null as unknown as Exclude<keyof AdminUsageUser, keyof typeof value0>;
+  const extra0: never = null as unknown as Exclude<keyof typeof value0, keyof AdminUsageUser>;
+  const full0: Widen<AdminUsageUser> = value0;
+  void missing0; void extra0; void full0;
+  const value1 = adminUsageFull;
+  const missing1: never = null as unknown as Exclude<keyof AdminUsage, keyof typeof value1>;
+  const extra1: never = null as unknown as Exclude<keyof typeof value1, keyof AdminUsage>;
+  const full1: Widen<AdminUsage> = value1;
+  void missing1; void extra1; void full1;
+  const value2 = adminUsageFull.factory;
+  const missing2: never = null as unknown as Exclude<keyof SelfUsage, keyof typeof value2>;
+  const extra2: never = null as unknown as Exclude<keyof typeof value2, keyof SelfUsage>;
+  const full2: Widen<SelfUsage> = value2;
+  void missing2; void extra2; void full2;
+  const value3 = adminUsageFull.factory.outcomes;
+  const missing3: never = null as unknown as Exclude<keyof SelfUsage["outcomes"], keyof typeof value3>;
+  const extra3: never = null as unknown as Exclude<keyof typeof value3, keyof SelfUsage["outcomes"]>;
+  const full3: Widen<SelfUsage["outcomes"]> = value3;
+  void missing3; void extra3; void full3;
+  const value4 = adminUserUsageFull.usage;
+  const missing4: never = null as unknown as Exclude<keyof RunUsage, keyof typeof value4>;
+  const extra4: never = null as unknown as Exclude<keyof typeof value4, keyof RunUsage>;
+  const full4: Widen<RunUsage> = value4;
+  void missing4; void extra4; void full4;
+  const value5 = adminUserUsageFull.last_7_days;
+  const missing5: never = null as unknown as Exclude<keyof RunUsage, keyof typeof value5>;
+  const extra5: never = null as unknown as Exclude<keyof typeof value5, keyof RunUsage>;
+  const full5: Widen<RunUsage> = value5;
+  void missing5; void extra5; void full5;
+  const value6 = adminUsageFull.factory.lifetime;
+  const missing6: never = null as unknown as Exclude<keyof RunUsage, keyof typeof value6>;
+  const extra6: never = null as unknown as Exclude<keyof typeof value6, keyof RunUsage>;
+  const full6: Widen<RunUsage> = value6;
+  void missing6; void extra6; void full6;
+  const value7 = adminUsageFull.factory.last_7_days;
+  const missing7: never = null as unknown as Exclude<keyof RunUsage, keyof typeof value7>;
+  const extra7: never = null as unknown as Exclude<keyof typeof value7, keyof RunUsage>;
+  const full7: Widen<RunUsage> = value7;
+  void missing7; void extra7; void full7;
+  const value8 = adminUserUsageFull.outcomes;
+  const missing8: never = null as unknown as Exclude<keyof RunOutcomes, keyof typeof value8>;
+  const extra8: never = null as unknown as Exclude<keyof typeof value8, keyof RunOutcomes>;
+  const full8: Widen<RunOutcomes> = value8;
+  void missing8; void extra8; void full8;
+  const value9 = adminUserUsageFull.last7_outcomes;
+  const missing9: never = null as unknown as Exclude<keyof RunOutcomes, keyof typeof value9>;
+  const extra9: never = null as unknown as Exclude<keyof typeof value9, keyof RunOutcomes>;
+  const full9: Widen<RunOutcomes> = value9;
+  void missing9; void extra9; void full9;
+  const value10 = adminUsageFull.factory.outcomes.lifetime;
+  const missing10: never = null as unknown as Exclude<keyof RunOutcomes, keyof typeof value10>;
+  const extra10: never = null as unknown as Exclude<keyof typeof value10, keyof RunOutcomes>;
+  const full10: Widen<RunOutcomes> = value10;
+  void missing10; void extra10; void full10;
+  const value11 = adminUsageFull.factory.outcomes.last_7_days;
+  const missing11: never = null as unknown as Exclude<keyof RunOutcomes, keyof typeof value11>;
+  const extra11: never = null as unknown as Exclude<keyof typeof value11, keyof RunOutcomes>;
+  const full11: Widen<RunOutcomes> = value11;
+  void missing11; void extra11; void full11;
+  const value12 = adminUsageFull.users[0];
+  const missing12: never = null as unknown as Exclude<keyof AdminUsageUser, keyof typeof value12>;
+  const extra12: never = null as unknown as Exclude<keyof typeof value12, keyof AdminUsageUser>;
+  const full12: Widen<AdminUsageUser> = value12;
+  void missing12; void extra12; void full12;
+  // Fixture-only nulls: AdminUsage allocates users; runOutcomes normalizes origins;
+  // the new per-user handler always allocates last_7_days, even for zero usage.
+  type OutcomeZero = ZeroOf<RunOutcomes, "fail_origins">;
+  type WindowsZero = { lifetime: OutcomeZero; last_7_days: OutcomeZero };
+  type SelfZero = Omit<ZeroOf<SelfUsage>, "outcomes"> & { outcomes: WindowsZero };
+  type UserZero = Omit<ZeroOf<AdminUsageUser, "last_7_days">, "outcomes" | "last7_outcomes"> & {
+    outcomes: OutcomeZero; last7_outcomes: OutcomeZero;
+  };
+  const userZero: UserZero = adminUserUsageZero;
+  const adminZero: Omit<ZeroOf<AdminUsage, "users">, "factory"> & { factory: SelfZero } = adminUsageZero;
+  void userZero; void adminZero;
 }
 
 // ── UserSettings (M2) ───────────────────────────────────────────────────────
@@ -1306,6 +1394,8 @@ const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "secret", nullable: true },
   { stem: "usage", nullable: false },
   { stem: "run_outcomes", nullable: true },
+  { stem: "admin_user_usage", nullable: true },
+  { stem: "admin_usage", nullable: true },
   { stem: "user_settings", nullable: true },
   { stem: "catalog_entry", nullable: true },
   { stem: "cli_token", nullable: true },

@@ -7225,7 +7225,7 @@ func (s *Service) AdminRunOutcomes(ctx context.Context) (store.AdminRunOutcomesR
 	return s.q.AdminRunOutcomes(ctx, AllHumanLandableFailOrigins())
 }
 
-// AdminRunOutcomesPerUser returns the per-user lifetime outcome counts for the admin
+// AdminRunOutcomesPerUser returns the per-user lifetime and seven-day outcome counts for the admin
 // factory breakdown (PRD #1293 M1, D5); joins users so an outcome-only user has an email.
 // needs_landing (issue #1418) keyed on the Go-owned human-landable set.
 func (s *Service) AdminRunOutcomesPerUser(ctx context.Context) ([]store.AdminRunOutcomesPerUserRow, error) {

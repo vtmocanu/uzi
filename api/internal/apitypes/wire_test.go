@@ -1026,6 +1026,7 @@ func TestSelfUsageDTOTags(t *testing.T) {
 
 func TestAdminUserUsageDTOTags(t *testing.T) {
 	assertTags(t, "AdminUserUsageDTO", AdminUserUsageDTO{}, "user_id", "email", "usage", "run_count",
+		"last_7_days", "last7_run_count", "last7_outcomes", "last7_subscription_run_count", "last7_unreported_run_count",
 		// PRD #1293: this user's lifetime failed-run rate aggregate.
 		"outcomes",
 		// PRD #1429 M1 (D7): the user's lifetime subscription/unreported run counts.

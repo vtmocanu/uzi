@@ -212,8 +212,13 @@ SELECT u.id AS user_id, u.email,
     count(*) FILTER (WHERE r.status = 'cancelled')::bigint                                 AS cancelled,
     count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin = 'plan_rejected')::bigint AS plan_rejected,
     count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS failed,
+    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days')::bigint                                                                       AS last7_finished,
+    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'completed')::bigint                                 AS last7_completed,
+    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'cancelled')::bigint                                 AS last7_cancelled,
+    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'failed' AND r.fail_origin = 'plan_rejected')::bigint AS last7_plan_rejected,
+    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS last7_failed,
     -- needs_landing (issue #1418): SUB-CUT of ` + "`" + `failed` + "`" + `; see SelfRunOutcomes for the shape.
-    -- Lifetime-only, matching this query's other lifetime-only counts. The alias here is ` + "`" + `r` + "`" + `,
+    -- The alias here is ` + "`" + `r` + "`" + `,
     -- so the correlated EXISTS resolves to the OUTER ` + "`" + `r` + "`" + ` row (no JOIN — that would corrupt the
     -- sibling per-user counts).
     count(*) FILTER (
@@ -223,6 +228,13 @@ SELECT u.id AS user_id, u.email,
                        WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state = 'available')
                OR r.preserved_patch IS NOT NULL)
     )::bigint AS needs_landing,
+    count(*) FILTER (
+        WHERE r.created_at >= now() - interval '7 days' AND r.status = 'failed'
+          AND r.fail_origin = ANY($1::text[])
+          AND (EXISTS (SELECT 1 FROM recovery_captures c
+                       WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state = 'available')
+               OR r.preserved_patch IS NOT NULL)
+    )::bigint AS last7_needs_landing,
     -- fail_origins (issue #1451): this user's LIFETIME per-origin breakdown of ` + "`" + `failed` + "`" + `, in
     -- this statement (one snapshot => sum(fail_origins) == failed by construction). Correlated
     -- on u.id; an empty group yields '{}'. See SelfRunOutcomes for the shape.
@@ -232,7 +244,14 @@ SELECT u.id AS user_id, u.email,
               WHERE r2.user_id = u.id
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
-              GROUP BY 1) o) AS fail_origins
+              GROUP BY 1) o) AS fail_origins,
+    (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
+        FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
+              FROM runs r2
+              WHERE r2.user_id = u.id AND r2.created_at >= now() - interval '7 days'
+              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
+              GROUP BY 1) o) AS last7_fail_origins
 FROM runs r
 JOIN users u ON u.id = r.user_id
 WHERE r.status IN ('completed', 'failed', 'cancelled')
@@ -253,14 +272,21 @@ type AdminRunOutcomesPerUserRow struct {
 	Cancelled                 int64              `json:"cancelled"`
 	PlanRejected              int64              `json:"plan_rejected"`
 	Failed                    int64              `json:"failed"`
+	Last7Finished             int64              `json:"last7_finished"`
+	Last7Completed            int64              `json:"last7_completed"`
+	Last7Cancelled            int64              `json:"last7_cancelled"`
+	Last7PlanRejected         int64              `json:"last7_plan_rejected"`
+	Last7Failed               int64              `json:"last7_failed"`
 	NeedsLanding              int64              `json:"needs_landing"`
+	Last7NeedsLanding         int64              `json:"last7_needs_landing"`
 	FailOrigins               []byte             `json:"fail_origins"`
+	Last7FailOrigins          []byte             `json:"last7_fail_origins"`
 }
 
-// Per-user LIFETIME outcome counts for the admin factory breakdown (PRD #1293 M1, D5).
+// Per-user lifetime and seven-day outcome counts for the admin factory breakdown (PRD #1293 M1, D5).
 // Joins users so an outcome-only user (every run died before spending, so no usage row)
 // still has an email to render; the handler merges this by user id against the usage
-// rows. Lifetime-only, matching the admin per-user table's lifetime figures.
+// rows. Seven-day counts use runs.created_at and retain lifetime groups.
 func (q *Queries) AdminRunOutcomesPerUser(ctx context.Context, landableOrigins []string) ([]AdminRunOutcomesPerUserRow, error) {
 	rows, err := q.db.Query(ctx, adminRunOutcomesPerUser, landableOrigins)
 	if err != nil {
@@ -282,8 +308,15 @@ func (q *Queries) AdminRunOutcomesPerUser(ctx context.Context, landableOrigins [
 			&i.Cancelled,
 			&i.PlanRejected,
 			&i.Failed,
+			&i.Last7Finished,
+			&i.Last7Completed,
+			&i.Last7Cancelled,
+			&i.Last7PlanRejected,
+			&i.Last7Failed,
 			&i.NeedsLanding,
+			&i.Last7NeedsLanding,
 			&i.FailOrigins,
+			&i.Last7FailOrigins,
 		); err != nil {
 			return nil, err
 		}
@@ -304,7 +337,15 @@ SELECT u.id AS user_id, u.email,
     COALESCE(SUM(t.cost_usd), 0)::numeric              AS cost_usd,
     count(*) FILTER (WHERE t.cost_status = 'subscription')::bigint AS subscription_run_count,
     count(*) FILTER (WHERE t.cost_status = 'unreported')::bigint   AS unreported_run_count,
-    count(t.run_id)::bigint AS run_count
+    count(t.run_id)::bigint AS run_count,
+    count(t.run_id) FILTER (WHERE r.created_at >= now() - interval '7 days')::bigint AS last7_run_count,
+    COALESCE(SUM(t.input_tokens) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::bigint AS last7_input_tokens,
+    COALESCE(SUM(t.cache_read_tokens) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::bigint AS last7_cache_read_tokens,
+    COALESCE(SUM(t.cache_creation_tokens) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::bigint AS last7_cache_creation_tokens,
+    COALESCE(SUM(t.output_tokens) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::bigint AS last7_output_tokens,
+    COALESCE(SUM(t.cost_usd) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
+    count(*) FILTER (WHERE t.cost_status = 'subscription' AND r.created_at >= now() - interval '7 days')::bigint AS last7_subscription_run_count,
+    count(*) FILTER (WHERE t.cost_status = 'unreported' AND r.created_at >= now() - interval '7 days')::bigint AS last7_unreported_run_count
 FROM run_usage_totals t
 JOIN runs r ON r.id = t.run_id
 JOIN users u ON u.id = r.user_id
@@ -314,26 +355,28 @@ ORDER BY cost_usd DESC, output_tokens DESC, u.id
 `
 
 type AdminUsagePerUserRow struct {
-	UserID               uuid.UUID      `json:"user_id"`
-	Email                string         `json:"email"`
-	InputTokens          int64          `json:"input_tokens"`
-	CacheReadTokens      int64          `json:"cache_read_tokens"`
-	CacheCreationTokens  int64          `json:"cache_creation_tokens"`
-	OutputTokens         int64          `json:"output_tokens"`
-	CostUsd              pgtype.Numeric `json:"cost_usd"`
-	SubscriptionRunCount int64          `json:"subscription_run_count"`
-	UnreportedRunCount   int64          `json:"unreported_run_count"`
-	RunCount             int64          `json:"run_count"`
+	UserID                    uuid.UUID      `json:"user_id"`
+	Email                     string         `json:"email"`
+	InputTokens               int64          `json:"input_tokens"`
+	CacheReadTokens           int64          `json:"cache_read_tokens"`
+	CacheCreationTokens       int64          `json:"cache_creation_tokens"`
+	OutputTokens              int64          `json:"output_tokens"`
+	CostUsd                   pgtype.Numeric `json:"cost_usd"`
+	SubscriptionRunCount      int64          `json:"subscription_run_count"`
+	UnreportedRunCount        int64          `json:"unreported_run_count"`
+	RunCount                  int64          `json:"run_count"`
+	Last7RunCount             int64          `json:"last7_run_count"`
+	Last7InputTokens          int64          `json:"last7_input_tokens"`
+	Last7CacheReadTokens      int64          `json:"last7_cache_read_tokens"`
+	Last7CacheCreationTokens  int64          `json:"last7_cache_creation_tokens"`
+	Last7OutputTokens         int64          `json:"last7_output_tokens"`
+	Last7CostUsd              pgtype.Numeric `json:"last7_cost_usd"`
+	Last7SubscriptionRunCount int64          `json:"last7_subscription_run_count"`
+	Last7UnreportedRunCount   int64          `json:"last7_unreported_run_count"`
 }
 
-// Per-user lifetime usage rows for the admin factory breakdown (PRD #40 M3). One row
-// per user WITH usage; the client computes each user's share against the factory
-// total. Ordered heaviest-cost first (output tokens tiebreak). Sums the same
-// run_usage_totals as AdminUsageTotals, so the rows sum to the factory lifetime total.
-// PRD #1332 M5A (D2): each user's lifetime dollar sum carries subscription/unreported RUN
-// COUNTS so a partial dollar total cannot read as complete. Lifetime-only here (this row is
-// the admin per-user lifetime breakdown; the windowed counts live in AdminUsageTotals). M5A
-// adds no public DTO field for the counts; M5B consumes them.
+// Both windows over usage-bearing non-chat runs. Lifetime groups remain present
+// even when their seven-day totals are zero; each window sums to the factory.
 func (q *Queries) AdminUsagePerUser(ctx context.Context) ([]AdminUsagePerUserRow, error) {
 	rows, err := q.db.Query(ctx, adminUsagePerUser)
 	if err != nil {
@@ -354,6 +397,14 @@ func (q *Queries) AdminUsagePerUser(ctx context.Context) ([]AdminUsagePerUserRow
 			&i.SubscriptionRunCount,
 			&i.UnreportedRunCount,
 			&i.RunCount,
+			&i.Last7RunCount,
+			&i.Last7InputTokens,
+			&i.Last7CacheReadTokens,
+			&i.Last7CacheCreationTokens,
+			&i.Last7OutputTokens,
+			&i.Last7CostUsd,
+			&i.Last7SubscriptionRunCount,
+			&i.Last7UnreportedRunCount,
 		); err != nil {
 			return nil, err
 		}
