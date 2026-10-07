@@ -1371,8 +1371,8 @@ describe("DockerAllowlistCard — instance identities", () => {
   const checkbox = () => screen.getByRole("checkbox") as HTMLInputElement;
   const submit = () => fireEvent.submit(save().closest("form")!);
   const aliases = [
-    first, first.toUpperCase(), first.replaceAll("-", ""),
-    first.replaceAll("-", "").toUpperCase(), "urn:uuid:" + first,
+    first, first.toUpperCase(), first.replace(/-/g, ""),
+    first.replace(/-/g, "").toUpperCase(), "urn:uuid:" + first,
     "URN:UUID:" + first.toUpperCase(), "UrN:UuId:" + first,
     "{" + first + "}", "[" + first + "]", "!" + first + "?", "x" + first.toUpperCase() + "y",
     "\u0085" + first + "\u0085",
