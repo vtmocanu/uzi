@@ -1,4 +1,5 @@
-// Client mirror of the server's trusted review-bot allowlist rules (issue #2347,
+// Client-side check of the server's trusted review-bot allowlist rules, stricter than the
+// server in places (never looser) (issue #2347,
 // api/internal/settings/settings_review_bots.go). The stored value of the
 // `mr_review_trusted_bots` setting is a comma-separated list of
 // `<base_url>#<forge_user_id>` entries, e.g. `https://github.com#136622811`.
@@ -29,8 +30,9 @@ export function splitTrustedBots(value: string): string[] {
 // The server normalizes with Go's url.Parse and then demands the input already equal
 // `https://` + lower-cased host: any path (even a trailing slash), query, fragment or
 // user info makes the two differ and is refused. The default port :443 is refused here
-// as well: a connection's base URL never carries it, so an entry written with it would
-// never match a connection.
+// as well, although the server accepts it: a connection can be stored as https://h:443,
+// and the server's match treats the default port as absent on both sides, so the portless
+// https://h this offers matches that connection too.
 export function baseUrlProblem(raw: string): { message: string; fix?: string } | null {
   const v = raw.trim();
   if (v === "") return { message: "Enter the forge's address, for example https://github.com." };
@@ -71,8 +73,8 @@ export function entryKey(baseUrl: string, userId: string): string {
   return `${baseUrl.trim()}#${userId.trim()}`;
 }
 
-// trustedBotsValueError mirrors the server's write-time validateTrustedBots: empty is
-// valid; otherwise every entry must be canonical, unique, and there are at most
+// trustedBotsValueError follows the server's write-time validateTrustedBots (but is
+// stricter, e.g. it refuses :443): empty is valid; otherwise every entry must be canonical, unique, and there are at most
 // MAX_TRUSTED_BOTS of them. Returns the first problem, or null.
 export function trustedBotsValueError(value: string): string | null {
   const seen = new Set<string>();

@@ -946,8 +946,8 @@ export const settingsApi = {
         nonSecret.docker_repo_allowlist = value;
         continue;
       }
-      // mr_review_trusted_bots (issue #2347), mirroring the server's validateTrustedBots
-      // through the same rules the admin card uses. Empty is valid (no bot trusted).
+      // mr_review_trusted_bots (issue #2347), following the server's validateTrustedBots
+      // through the same rules the admin card uses (stricter in places, never looser). Empty is valid (no bot trusted).
       if (key === "mr_review_trusted_bots") {
         const problem = trustedBotsValueError(value);
         if (problem) throw new ApiError(400, `mr_review_trusted_bots: ${problem}`);

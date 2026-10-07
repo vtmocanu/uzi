@@ -131,3 +131,37 @@ func TestTrustedBotMatches(t *testing.T) {
 		t.Error("an empty allowlist matches nothing")
 	}
 }
+
+// A connection stored with the explicit https default port (config.NormalizeForgeBaseURL
+// keeps it) must match an entry written without it, and vice versa; other ports are
+// distinct instances.
+func TestTrustedBotMatchesDefaultHTTPSPort(t *testing.T) {
+	mk := func(entry string) []TrustedBot {
+		bots, err := parseTrustedBots(entry)
+		if err != nil {
+			t.Fatalf("parseTrustedBots(%q): %v", entry, err)
+		}
+		return bots
+	}
+	cases := []struct {
+		name  string
+		entry string
+		base  string
+		id    int64
+		want  bool
+	}{
+		{"entry without port, connection with :443", "https://gitlab.example.com#7", "https://gitlab.example.com:443", 7, true},
+		{"entry with :443, connection without", "https://gitlab.example.com:443#7", "https://gitlab.example.com", 7, true},
+		{"both with :443", "https://gitlab.example.com:443#7", "https://gitlab.example.com:443", 7, true},
+		{"non-default port is not stripped", "https://gitlab.example.com#7", "https://gitlab.example.com:8443", 7, false},
+		{"non-default port entry vs bare connection", "https://gitlab.example.com:8443#7", "https://gitlab.example.com", 7, false},
+		{"other id does not match", "https://gitlab.example.com#7", "https://gitlab.example.com:443", 8, false},
+		{"other instance does not match", "https://gitlab.example.com#7", "https://other.example.com:443", 7, false},
+		{"api.github.com:443 maps to github.com", "https://github.com#7", "https://api.github.com:443", 7, true},
+	}
+	for _, tc := range cases {
+		if got := TrustedBotMatches(mk(tc.entry), tc.base, tc.id); got != tc.want {
+			t.Errorf("%s: got %t, want %t", tc.name, got, tc.want)
+		}
+	}
+}
