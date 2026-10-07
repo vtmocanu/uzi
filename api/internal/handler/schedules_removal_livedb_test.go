@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -81,6 +82,17 @@ func TestScheduleRemovalSettingsFallbackLiveDB(t *testing.T) {
 				t.Fatalf("unrelated selector: %d %+v", code, got)
 			}
 		})
+	}
+}
+
+// A failed settings read must refuse the removal toggle rather than validate against
+// the default label, which could approve removing a custom eligibility label.
+func TestScheduleRemovalSettingsReadErrorLiveDB(t *testing.T) {
+	f := newScheduleFixture(context.Background(), t)
+	f.h.settings = settings.New(&settingsStore{err: errors.New("settings read failed")}, time.Minute)
+	body := `{"target":"sweep","labels":["on-deck"],"timing":"recurring","cron_expr":"0 * * * *","remove_label_on_dispatch":true}`
+	if _, code := f.createSchedule(t, f.owner.ID, f.repoID, body); code != http.StatusServiceUnavailable {
+		t.Fatalf("removal accepted on a failed settings read: %d", code)
 	}
 }
 

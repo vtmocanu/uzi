@@ -21,10 +21,11 @@ import (
 // UpdateSettings) resolve without a database.
 type settingsStore struct {
 	rows []store.AppSetting
+	err  error
 }
 
 func (s *settingsStore) ListAppSettings(context.Context) ([]store.AppSetting, error) {
-	return s.rows, nil
+	return s.rows, s.err
 }
 
 func newSettingsHandler(rows ...store.AppSetting) *Handler {

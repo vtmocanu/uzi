@@ -33,7 +33,12 @@ func (h *Handler) validateScheduleRemoval(ctx context.Context, req apitypes.Sche
 	}
 	uzi := settings.DefaultUziLabel
 	if h.settings != nil {
-		live, _ := h.settings.UziLabel(ctx)
+		live, err := h.settings.UziLabel(ctx)
+		if err != nil {
+			// Fail closed: with the configured label unknown, the default would let a
+			// custom eligibility label be removed on dispatch.
+			return http.StatusServiceUnavailable, "could not read the configured uzi label; try again"
+		}
 		if strings.TrimSpace(live) != "" {
 			uzi = live
 		}
