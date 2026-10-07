@@ -427,8 +427,8 @@ A few worth knowing:
   unattended paths. Run `schedule create --repo <id> --issue <iid> --at <any
   future time> --enabled=false`, then `schedule run-now <schedule-id>`, then
   `schedule delete <schedule-id>`. `run-now` fires a disabled schedule and
-  never consumes a one-shot; leaving the schedule enabled instead fires the
-  issue a second time at `--at`. The run takes the same auto-approve path as a
+  never consumes a one-shot; an enabled one-shot remains scheduled at `--at`
+  and may start another run. The run takes the same auto-approve path as a
   sweep, Plan cross-check included. `--wait-on-limit` also
   defaults **on** for a new schedule — a fired run parks until the Anthropic
   usage window reopens instead of failing — and this now takes effect even on
