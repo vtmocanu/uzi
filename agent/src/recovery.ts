@@ -2198,10 +2198,12 @@ export class RecoveryCoordinator {
   }
 
   /** Generations of a run whose guarded recovery journal is not final-acknowledged. Their owed
-   *  contexts must stay discoverable until the final disposition is acknowledged. */
+   *  contexts must stay discoverable until the final disposition is acknowledged. Reads the
+   *  journal strictly: an unreadable or unauthenticated record throws instead of being skipped, so
+   *  uncertainty can never read as an empty protection set. */
   async unsettledGuardedGenerations(runId: string): Promise<Set<number>> {
     const out = new Set<number>();
-    for (const r of await this.listRecords(runId)) {
+    for (const r of await this.checkedRecords(runId)) {
       if (r.inventoryGuarded && !r.finalAcknowledged && typeof r.generation === "number") out.add(r.generation);
     }
     return out;

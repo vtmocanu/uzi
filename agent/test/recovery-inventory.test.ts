@@ -13,6 +13,18 @@ import { nullLogger, testGitCacheOptions } from "./helpers.js";
 const H = "a".repeat(40);
 const H2 = "b".repeat(40);
 
+it("review probe: unreadable guarded journal cannot prove its generation settled", async () => {
+  const f = await fixture();
+  try {
+    const record = await f.freeze();
+    assert.ok(record);
+    assert.deepEqual([...await f.coordinator.unsettledGuardedGenerations("run-1")], [7]);
+    await fs.writeFile(path.join(f.root, "journal", "run-1", record.captureId + ".json"), "{}");
+    await assert.rejects(f.coordinator.unsettledGuardedGenerations("run-1"),
+      "unreadable journal must stop pruning instead of returning an empty protection set");
+  } finally { await f.close(); }
+});
+
 function ownershipLost() {
   return new RequestError("GET", "/api/worker/runs/" + "run-1/ownership", 404,
     JSON.stringify({ error: "run not found " + "for this worker" }));
