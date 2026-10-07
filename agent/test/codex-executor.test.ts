@@ -43,6 +43,7 @@ import {
 import { WorkerClient, RequestError, CodexRequestFailure } from "../src/client.js";
 import { ProviderPolicyRefusal } from "../src/provider-policy-refusal.js";
 import { RunRunner } from "../src/runner.js";
+import { resolveRunKind } from "../src/run-kind.js";
 import { GitCache } from "../src/git.js";
 import { FakeApi } from "./fake-api.js";
 import { makeFixture } from "./fixture-repo.js";
@@ -1583,7 +1584,17 @@ describe("m1 credential-free owner cancel", () => {
         git.runnerCloneForBranch = async (...args) => {
           const result = await seed(...args);
           const head = commitInTree(result.path, "RECOVERED.txt", "prior unpublished work");
-          await git.fetchAgentBranch(args[0], result.path, result.branch, claim.run_id);
+          // Same owed context the runner derives (RunRunner.owedOptions) for this claim.
+          const defaultBranch = await git.defaultBranchName(args[0]);
+          const defaultTip = defaultBranch ? await git.originBranchTip(args[0], defaultBranch) : null;
+          assert.ok(defaultBranch && defaultTip, "default branch identity for the owed context");
+          await git.fetchAgentBranch(args[0], result.path, result.branch, claim.run_id, {
+            context: {
+              runId: claim.run_id, branch: result.branch, kind: resolveRunKind(claim.kind), barePath: args[0],
+              defaultIdentity: { ref: `refs/remotes/origin/${defaultBranch}`, sha: defaultTip },
+              generation: claim.claim_generation as number,
+            },
+          });
           return { ...result, baseCommit: head };
         };
       }
