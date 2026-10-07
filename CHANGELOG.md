@@ -61,6 +61,9 @@ through `[0.52.0]`.)
 - **Memory warnings and repository validation are more precise ([#296](https://github.com/vtmocanu/uzi/issues/296)).**
   Memory advisories distinguish direct executable-availability claims from test-rig and feature prose, Git fixture initialization ignores inherited Git redirection and configuration variables, and Semgrep reports bounded sanitized diagnostics from a single scan per stage while rejecting timeouts, inconsistent reports and incomplete captures. Strict scanning and canary verification remain required when the scanner runs.
 
+- **Manual vault locks retain their notification acknowledgement.**
+  An older unlock delayed during secret migration no longer erases a later manual lock’s acknowledgement, preventing unwanted unlock reminders while the vault remains locked.
+
 - **Agent startup reclaims stale terminal journal temps ([#2308](https://github.com/vtmocanu/uzi/issues/2308)).**
   Startup removes canonical regular-file terminal install temps before key loading so interrupted writes no longer pin empty runs; installed journals, unknown entries and live-write retirement protection remain intact.
 

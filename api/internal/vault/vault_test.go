@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -499,6 +500,99 @@ func TestConcurrentFirstUnlockConsistent(t *testing.T) {
 	}
 	if !bytes.Equal(opened, secret) {
 		t.Fatalf("mismatch after race: got %q want %q", opened, secret)
+	}
+}
+
+// blockedNoticeVaultStore pauses the refresh unlock after its DEK is cached.
+// Only that one list call is blocked; the context deadline bounds a failed barrier.
+type blockedNoticeVaultStore struct {
+	*fakeVaultStore
+	entered, release chan struct{}
+	noticeMu         sync.Mutex
+	marked           bool
+}
+
+func (s *blockedNoticeVaultStore) ListMasterSealedSecrets(ctx context.Context, uid uuid.UUID) ([]store.ListMasterSealedSecretsRow, error) {
+	close(s.entered)
+	select {
+	case <-s.release:
+		return s.fakeVaultStore.ListMasterSealedSecrets(ctx, uid)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *blockedNoticeVaultStore) ClearVaultLockNotice(ctx context.Context, uid uuid.UUID) error {
+	err := s.fakeVaultStore.ClearVaultLockNotice(ctx, uid)
+	if err == nil {
+		s.noticeMu.Lock()
+		s.marked = false
+		s.noticeMu.Unlock()
+	}
+	return err
+}
+
+func TestUnlockExistingAfterLockPreservesNotice(t *testing.T) {
+	v, _, st := newTestVaultWithStore(t)
+	uid := uuid.New()
+	const password = "notice-race-password"
+	if err := v.Unlock(context.Background(), uid, password); err != nil {
+		t.Fatal(err)
+	}
+	// Initialize before installing the barrier: this regression targets a refresh.
+	blocked := &blockedNoticeVaultStore{
+		fakeVaultStore: st, entered: make(chan struct{}), release: make(chan struct{}),
+	}
+	v.q = blocked
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	done := make(chan error, 1)
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(blocked.release) }) }
+	joined := false
+	t.Cleanup(func() {
+		cancel()
+		release()
+		if !joined {
+			<-done
+		}
+	})
+	go func() { done <- v.UnlockExisting(ctx, uid, password) }()
+	select {
+	case <-blocked.entered:
+	case <-ctx.Done():
+		t.Fatal("refresh unlock did not reach list barrier")
+	}
+	if !v.Unlocked(uid) {
+		t.Fatal("refresh must cache the DEK before the list barrier")
+	}
+	v.Lock(uid)
+	// Model the manual handler's pre-acknowledgement after it evicts the key.
+	blocked.noticeMu.Lock()
+	blocked.marked = true
+	blocked.noticeMu.Unlock()
+	st.mu.Lock()
+	clearsBefore := len(st.clearNoticeCalls)
+	st.mu.Unlock()
+	release()
+	err := <-done
+	joined = true
+	if err != nil {
+		t.Fatalf("refresh unlock: %v", err)
+	}
+	if v.Unlocked(uid) {
+		t.Error("older unlock must leave the manually locked vault locked")
+	}
+	st.mu.Lock()
+	clearsAfter := len(st.clearNoticeCalls)
+	st.mu.Unlock()
+	if clearsAfter != clearsBefore {
+		t.Errorf("older unlock cleared lock notice after manual lock: calls before=%d after=%d", clearsBefore, clearsAfter)
+	}
+	blocked.noticeMu.Lock()
+	marked := blocked.marked
+	blocked.noticeMu.Unlock()
+	if !marked {
+		t.Error("older unlock erased the manual lock pre-acknowledgement")
 	}
 }
 

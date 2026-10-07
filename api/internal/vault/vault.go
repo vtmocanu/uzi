@@ -148,10 +148,23 @@ func (v *Vault) unlock(ctx context.Context, userID uuid.UUID, password string, a
 	// On the SUCCESS tail so both success paths (cacheFromRow and create) reach it. Like
 	// rewrapMasterSecrets it is best-effort and logged: a DB hiccup on the clear must not
 	// fail an otherwise-valid unlock.
-	if err := v.q.ClearVaultLockNotice(ctx, userID); err != nil {
+	if err := v.clearLockNotice(ctx, userID); err != nil {
 		slog.Error("vault: clear lock-notice on unlock", "user", userID, "error", err)
 	}
 	return nil
+}
+
+// clearLockNotice re-arms notices only while the key remains cached. Hold the
+// cache read lock through the update: a manual Lock either evicts the key first
+// and suppresses this clear, or follows it and preserves its later pre-ack.
+// Rewrap stays outside this lock so a lock can interrupt a slow migration.
+func (v *Vault) clearLockNotice(ctx context.Context, userID uuid.UUID) error {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if _, ok := v.cache[userID]; !ok {
+		return nil
+	}
+	return v.q.ClearVaultLockNotice(ctx, userID)
 }
 
 // cacheFromRow derives the KEK from the password + the row's salt, unwraps the
