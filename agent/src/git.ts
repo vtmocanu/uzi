@@ -4091,10 +4091,11 @@ export class GitCache {
         // A legacy canonical path has no attempt identity; it is never reseeded on a wired worker.
         this.log.info("releasing a legacy canonical clone in place (no attempt ledger entry)", { clone: clonePath, state });
       }
+      // issue #2213: recheck right before the clear (the ledger append awaited). It sits OUTSIDE the
+      // try so it surfaces as CloneRetainedByQuarantineError, not a journal-stage AttemptReleaseError;
+      // nothing is awaited between it and the clear's runGit.
+      if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
       try {
-        // issue #2213: recheck right before the clear (the ledger append awaited); the latch read
-        // and the clear are issued with nothing awaited between them.
-        if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
         await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       } catch (err) {
         throw new AttemptReleaseError("journal", err);
@@ -5038,7 +5039,17 @@ export class GitCache {
     const { holding, scratch } = result;
     const protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId);
     // issue #2213: a latch that landed during the protection read keeps the holding and scratch dirs.
-    if (residueQuarantine() !== undefined) return result.disposition;
+    if (residueQuarantine() !== undefined) {
+      if (holding || scratch) {
+        this.log.warn("retireRunnerClone: worker residue quarantine latched after the journal clear; the holding/scratch dirs are retained, not disposed", {
+          run_id: ownerRunId,
+          clone: clonePath,
+          holding,
+          scratch,
+        });
+      }
+      return result.disposition;
+    }
     if (holding && opts.discard && !protectedNow) {
       await fs.rm(holding, { recursive: true, force: true }).catch((e) =>
         this.log.warn("retireRunnerClone: holding dispose failed", {

@@ -1,9 +1,12 @@
-import { afterEach, describe, it } from "node:test";
+import { afterEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { noProofReseed } from "./helpers.js";
+import { mintAttemptId } from "../src/run-quiescence.js";
+import { CloneRetainedByQuarantineError, type AttemptSeedOptions } from "../src/git.js";
 import { fx, git, installHarness } from "./runner-harness.js";
 import { latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 
@@ -12,7 +15,10 @@ import { latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/r
 // journal: the latch is re-read synchronously immediately before each destructive step.
 
 installHarness();
-afterEach(() => resetResidueQuarantineForTests());
+afterEach(() => {
+  mock.restoreAll();
+  resetResidueQuarantineForTests();
+});
 
 const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
 const owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -95,12 +101,85 @@ describe("worker residue quarantine latching inside the git release methods (#22
     assert.ok(fs.existsSync(path.join(s.clonePath, "OWNER.txt")));
   });
 
-  it("releaseAttemptInPlace: a latch during the journal read throws, keeps the journal and records no ledger entry", async () => {
-    const s = await seed(2205);
+  it("retire: a latch during the journal read means the clone is never moved (pre-rename recheck)", async () => {
+    const s = await seed(2206);
+    const renames: string[] = [];
+    const origRename = fsp.rename.bind(fsp);
+    mock.method(fsp, "rename", async (from: string, to: string) => {
+      renames.push(String(from));
+      return origRename(from, to);
+    });
     latchOnRead(1);
-    await assert.rejects(() => git.releaseAttemptInPlace(s.bare, s.clonePath, s.branch, owner, "abandoned"), /residue quarantine latched/);
-    assert.deepEqual(journal(s.bare, s.branch), { runId: owner, clonePath: s.clonePath });
-    assert.deepEqual(config(s.bare, `uzi-attempts.${s.branch}.entry`), []);
+    await assert.rejects(() => git.retireRunnerClone(s.bare, s.clonePath, s.branch, owner, { discard: true }), CloneRetainedByQuarantineError);
+    assert.deepEqual(renames.filter((f) => f === s.clonePath), [], "the clone was never renamed, not even moved and moved back");
     assert.ok(fs.existsSync(path.join(s.clonePath, "OWNER.txt")));
+  });
+
+  it("retire: a latch during the post-lock protection read keeps the holding dir (no disposal)", async () => {
+    const s = await seed(2207);
+    const target = git as unknown as { hasPhysicalTerminalProtection: (id: string) => Promise<boolean> };
+    const orig = target.hasPhysicalTerminalProtection.bind(git);
+    let calls = 0;
+    target.hasPhysicalTerminalProtection = async (id: string) => {
+      const out = await orig(id);
+      // Call 1 is the in-lock check (discard); call 2 is the step-6 disposal check.
+      if (++calls === 2) latch();
+      return out;
+    };
+    const disposition = await git.retireRunnerClone(s.bare, s.clonePath, s.branch, owner, { discard: true });
+    assert.equal(calls, 2);
+    assert.equal(disposition, "quarantined");
+    assert.equal(fs.existsSync(s.clonePath), false);
+    assert.equal(journal(s.bare, s.branch), undefined);
+    const held = holdingEntries();
+    assert.equal(held.length, 1, "the latched worker keeps the holding dir");
+    assert.equal(fs.readFileSync(path.join(holdingRoot(), held[0]!, "OWNER.txt"), "utf8"), "owner bytes\n");
+  });
+
+  /** An attempt-path clone (journal carries the attemptId), as a Docker-wired worker seeds it. */
+  async function seedAttempt(iid: number): Promise<{ bare: string; branch: string; clonePath: string; attemptId: string }> {
+    const bare = await git.ensureClone(fx.originPath);
+    const branch = `agent/issue-${iid}`;
+    const attemptId = mintAttemptId(1);
+    const seedOpts: AttemptSeedOptions = { attemptId, isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true };
+    const clone = await git.createOrAttachRunnerClone(bare, iid, noProofReseed, owner, false, undefined, seedOpts);
+    fs.writeFileSync(path.join(clone.path, "OWNER.txt"), "owner bytes\n");
+    await git.markRecoveryCapture(bare, clone.path, branch, owner, clone.attemptId);
+    assert.equal(clone.attemptId, attemptId);
+    return { bare, branch, clonePath: clone.path, attemptId };
+  }
+  const attemptJournal = (s: { bare: string; branch: string; clonePath: string; attemptId: string }) => ({
+    runId: owner,
+    clonePath: s.clonePath,
+    attemptId: s.attemptId,
+  });
+
+  it("releaseAttemptInPlace: a latch during the journal read throws CloneRetainedByQuarantineError, keeps the journal, writes no ledger entry", async () => {
+    const s = await seedAttempt(2205);
+    const ledgerBefore = config(s.bare, `uzi-attempts.${s.branch}.entry`);
+    latchOnRead(1);
+    await assert.rejects(() => git.releaseAttemptInPlace(s.bare, s.clonePath, s.branch, owner, "abandoned"), CloneRetainedByQuarantineError);
+    assert.deepEqual(journal(s.bare, s.branch), attemptJournal(s));
+    assert.deepEqual(config(s.bare, `uzi-attempts.${s.branch}.entry`), ledgerBefore);
+    assert.equal(ledgerBefore.some((e) => e.includes('"abandoned"')), false);
+    assert.ok(fs.existsSync(path.join(s.clonePath, "OWNER.txt")));
+  });
+
+  it("releaseAttemptInPlace: a latch during the ledger append throws CloneRetainedByQuarantineError (not a journal-stage release error) and keeps the journal", async () => {
+    const s = await seedAttempt(2208);
+    const target = git as unknown as { appendAttemptLedger: (...a: unknown[]) => Promise<void> };
+    const orig = target.appendAttemptLedger.bind(git);
+    target.appendAttemptLedger = async (...a: unknown[]) => {
+      await orig(...a);
+      latch();
+    };
+    await assert.rejects(
+      () => git.releaseAttemptInPlace(s.bare, s.clonePath, s.branch, owner, "abandoned"),
+      (err: unknown) => {
+        assert.ok(err instanceof CloneRetainedByQuarantineError, `got ${String(err)}`);
+        return true;
+      },
+    );
+    assert.deepEqual(journal(s.bare, s.branch), attemptJournal(s));
   });
 });

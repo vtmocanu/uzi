@@ -3592,12 +3592,14 @@ export class RunRunner {
             await this.git.removeRunnerClone(flight.worktreePath, runId);
           }
         } catch (e) {
-          runLog.warn("runner clone cleanup failed", { error: errMessage(e) });
+          runLog.warn(
+            e instanceof CloneRetainedByQuarantineError
+              ? "runner clone kept: worker residue quarantine latched"
+              : "runner clone cleanup failed",
+            { error: errMessage(e) },
+          );
         }
       }
-      // issue #2213: a latch that landed inside the release/retire above made the git method refuse
-      // (or undo its move); keep the retention behaviour for the later steps.
-      if (residueQuarantine() !== undefined) flight.preserveRecoveryClone = true;
       // issue #1783 (R2): this attempt's final reap is done; it is no longer live.
       if (flight.attempt) this.liveAttempts.remove(flight.attempt.marker);
       // PRD #1392 M2: whether to KEEP the two resume artifacts (the sibling skills plugin dir
