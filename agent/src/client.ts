@@ -2,6 +2,7 @@ import { Readable } from "node:stream";
 import { readPlanCrossCheckReconciliation } from "./cross-check-reconciliation.js";
 import type { DindMeterSample } from "./dind-meter.js";
 import type { Logger } from "./log.js";
+import type { ResidueQuarantineState } from "./residue-quarantine.js";
 import type { UsageWireRequest } from "./usage-recorder.js";
 import {
   WORKER_API_PREFIX,
@@ -1118,6 +1119,7 @@ export class WorkerClient {
     outbox?: OutboxHeartbeatEntry[],
     activeSnapshot?: ActiveSnapshot,
     maintenance?: { sample?: DindMeterSample | null; ack?: DindMaintenanceReadyACK },
+    quarantine?: ResidueQuarantineState,
   ): Promise<boolean | undefined> {
     this.latestDindMaintenanceValue = undefined;
     const body: HeartbeatRequest = { version: this.version };
@@ -1149,8 +1151,19 @@ export class WorkerClient {
         body.dind_maintenance_ready_ack = { ...maintenance.ack, register_nonce: this.registerNonce };
       }
     }
+    // issue #2213: the residue quarantine latch rides the heartbeat ONLY while latched and ONLY when
+    // the api advertised `worker_residue_quarantine`, so an older api sees a byte-identical wire.
+    const includeQuarantine = this.hasFeature("worker_residue_quarantine") && quarantine !== undefined;
+    if (includeQuarantine) {
+      body.residue_quarantine = {
+        cause: quarantine.cause,
+        latched_at: quarantine.latchedAt,
+        run_id: quarantine.runId ?? null,
+        site: quarantine.site,
+      };
+    }
     const includeExtension = includeOutbox || includeSnapshot || body.dind_meter !== undefined ||
-      body.dind_maintenance_ready_ack !== undefined;
+      body.dind_maintenance_ready_ack !== undefined || includeQuarantine;
     try {
       try {
         return await this.postHeartbeat(body);
@@ -1166,7 +1179,7 @@ export class WorkerClient {
       // Rollback fallback (PRD #1391 M5, extended by #1390 M2a): a rolled-back api that no
       // longer knows a negotiated heartbeat extension strict-decodes it as an unknown field
       // and answers a generic `invalid request body` 400. Retry the SAME heartbeat ONCE with
-      // EVERY negotiated extension stripped (outbox, snapshot, meter and ACK); if the
+      // EVERY negotiated extension stripped (outbox, snapshot, meter, ACK and quarantine); if the
       // stripped retry SUCCEEDS, clear the WHOLE cached feature set so nothing negotiated is
       // sent again until process restart. A heartbeat must NEVER be lost to a rolled-back api,
       // so a stripped success is the outcome, not the original 400. Deliberately WHOLE-SET, not

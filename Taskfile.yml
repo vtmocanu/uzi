@@ -411,6 +411,7 @@ tasks:
       # worker lock's semgrep, and this fails if CI grows a pin of its own.
       - task: test:semgrep-parity
       - task: check:semgrep-parity
+      - task: test:semgrep-gate
       # Provider-token source-hygiene guard (PRD #1120 M3): an ADDITIONAL, independent
       # check (never a replacement for scan:secrets) that flags a NEWLY-ADDED complete
       # provider-token literal in tracked source EVEN when an inline //gitleaks:allow is
@@ -968,6 +969,14 @@ tasks:
     desc: hermetic CI and worker semgrep parity fixtures, including fail-closed inputs
     cmds:
       - ./scripts/check-semgrep-parity.test.sh
+
+  test:semgrep-gate:
+    desc: hermetic Semgrep capture, sanitized diagnostics and fail-closed verdict fixtures
+    # The suite reads procfs before any case runs, so a macOS `task gate:repo` skips it
+    # rather than failing; CI's lint-repo job runs gate:repo on Linux and still reaches it.
+    platforms: [linux]
+    cmds:
+      - ./scripts/semgrep-gate.test.sh
 
   check:semgrep-parity:
     desc: CI installs the worker lock's semgrep (default x86_64-linux output), never a pin of its own

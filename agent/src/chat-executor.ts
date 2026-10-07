@@ -49,6 +49,7 @@ import type { SdkQueryFn } from "./sdk-executor.js";
 export type { SdkQueryFn };
 import { classifyLimitFailure, describeLimit, RateLimitObserver } from "./limit.js";
 import { errMessage } from "./util.js";
+import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
 
 /** Where the worker image bakes uzi's own source, read-only (PRD #39 Decision 5). */
 export const UZI_SRC_DIR = "/opt/uzi-src";
@@ -487,6 +488,8 @@ export class ChatExecutor {
     const rateLimits = new RateLimitObserver();
     let resultFrame: unknown;
     try {
+      // issue #2213: the last statement before the credential-bearing provider spawn.
+      assertResidueQuarantineOpen("provider_turn");
       const queryInstance = this.queryFn({ prompt: promptStream(userMessage), options });
       let reportedIncluded = false;
       for await (const msg of queryInstance) {

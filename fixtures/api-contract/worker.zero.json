@@ -46,5 +46,7 @@
   "outbox_pending_messages": null,
   "outbox_pending_terminal": null,
   "outbox_stale_retired": null,
-  "outbox_blocked": null
+  "outbox_blocked": null,
+  "residue_quarantined_at": null,
+  "residue_quarantine_cause": null
 }

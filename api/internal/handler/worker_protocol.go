@@ -340,11 +340,11 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	//
 	// protocol_features is the shared negotiation wire (PRD #1392 M1 / #1391 D8 / #1390 M2a):
 	// the worker sends a gated wire extension only when its feature string appears here. A
-	// just-registered worker holds nothing, so overlayOutbox is a no-op, but the register
+	// just-registered worker holds nothing, so the overlay is a no-op, but the register
 	// response is one of the WorkerDTO surfaces and stays uniform with the list/heartbeat
 	// paths.
 	dto := workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
-	h.overlayOutbox(&dto, updated.ID)
+	h.overlayWorkerReports(&dto, updated.ID)
 	// register_nonce (PRD #1390 M2a): the per-registration nonce every subsequent heartbeat and
 	// claim snapshot must echo. Minted + persisted on the worker row inside Register's tx and
 	// returned here. protocol_features gates whether the worker even sends snapshots, but the
@@ -397,6 +397,7 @@ func protocolFeatures(activeSnapshotEnabled bool) []string {
 		{"dind_maintenance_v1"},
 		{"recovery_park_cause", "recovery_release_exact_echo"}, // PRD #1392 M1
 		{"heartbeat_outbox"},                                   // PRD #1391 M5, Run A
+		{"worker_residue_quarantine"},                          // issue #2213: this api accepts the heartbeat's residue_quarantine member
 		{"claim_generation_fence"},                             // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker
 		{"terminal_fence"},                                     // PRD #1391 Run B M3c: this api fences a terminal transition on messages_through_seq contiguity
 		// Issue #1766 M2: this api accepts {status:"recovery_wait", recovery_cause:"vault_locked"}
@@ -486,6 +487,11 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// heartbeat that still carries it is 400'd below — exactly the generic 400 that triggers
 		// the worker's strip-and-retry fallback.
 		ActiveSnapshot json.RawMessage `json:"active_snapshot"`
+		// ResidueQuarantine (issue #2213) is the worker's latched residue quarantine, its
+		// OWN isolated json.RawMessage like Outbox: a malformed member drops the report
+		// without failing the heartbeat's liveness. The worker sends it only while latched
+		// and only after the register response advertised `worker_residue_quarantine`.
+		ResidueQuarantine json.RawMessage `json:"residue_quarantine"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -520,6 +526,9 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	} else {
 		snapshot = parseActiveSnapshot(req.ActiveSnapshot, wkr.ID)
 	}
+	// Recorded on EVERY heartbeat: an absent or invalid member yields nil, which clears
+	// the worker's tracked latch (the worker's own state, tick by tick).
+	h.wsvc.RecordResidueQuarantine(wkr.ID, parseWorkerResidueQuarantine(req.ResidueQuarantine, wkr.ID, h.clock()))
 	updated, err := h.wsvc.Heartbeat(r.Context(), wkr, stats, outbox, snapshot)
 	if err != nil {
 		slog.Error("worker heartbeat", "error", err)
@@ -528,7 +537,7 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	dto := workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
 	h.overlayEphemeralLease(&dto, updated.LeaseSince, updated.DrainingSince)
-	h.overlayOutbox(&dto, updated.ID)
+	h.overlayWorkerReports(&dto, updated.ID)
 	// Custody flag (issue #1759): whether this worker still holds an OPEN durable-recovery
 	// custody hold, i.e. keeps the only local copy of work a run could not publish. The
 	// docker-tier worker reads it off this response to decide whether its allowlisted
@@ -571,6 +580,79 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		response["dind_maintenance"] = maintenance
 	}
 	httpx.JSON(w, http.StatusOK, response)
+}
+
+// Residue-quarantine heartbeat validation bounds (issue #2213). The member is untrusted
+// worker self-report bound for an in-process map and the fleet UI and health page.
+const (
+	// maxResidueQuarantineBytes is the whole-member byte cap; past it the member is dropped.
+	// The agent sends a cause of at most 160 characters, so this is generous.
+	maxResidueQuarantineBytes = 4 << 10
+	// maxResidueQuarantineCauseBytes bounds the sanitized cause (the contract's 200).
+	maxResidueQuarantineCauseBytes = 200
+	// maxResidueQuarantineSiteBytes bounds the sanitized site name.
+	maxResidueQuarantineSiteBytes = 64
+)
+
+// parseWorkerResidueQuarantine is the heartbeat's defensive second-step parse of the
+// isolated `residue_quarantine` member (issue #2213). It NEVER fails the heartbeat: an
+// absent/null member returns nil; an oversized or malformed (non-object) one drops the
+// WHOLE member (nil, with a logged warning), so the worker reads as not latched on this
+// tick and the next valid heartbeat restores it. A member that proves a latch exists but
+// carries a bad field degrades instead, so visibility never fails open: a missing or
+// unparseable `latched_at` keeps the latch stamped with the api receive time (now), and a
+// `run_id` that is neither null nor a UUID drops only run_id. cause and site are sanitized
+// and bounded.
+//
+// A `latched_at` more than a minute ahead of the api clock is clamped to now, so a skewed
+// or hostile worker clock cannot show a latch from the future.
+func parseWorkerResidueQuarantine(raw json.RawMessage, workerID uuid.UUID, now time.Time) *workersvc.ResidueQuarantine {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	drop := func(reason string) *workersvc.ResidueQuarantine {
+		slog.Warn("worker reported invalid residue_quarantine; dropping", "worker_id", workerID.String(), "reason", reason)
+		return nil
+	}
+	if len(raw) > maxResidueQuarantineBytes {
+		return drop("oversized")
+	}
+	var in struct {
+		Cause     string  `json:"cause"`
+		LatchedAt string  `json:"latched_at"`
+		RunID     *string `json:"run_id"`
+		Site      string  `json:"site"`
+	}
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return drop("malformed")
+	}
+	at, err := time.Parse(time.RFC3339Nano, in.LatchedAt)
+	if err != nil {
+		slog.Warn("worker reported invalid residue_quarantine latched_at; using receive time", "worker_id", workerID.String())
+		at = now
+	}
+	if at.After(now.Add(time.Minute)) {
+		at = now
+	}
+	var runID *uuid.UUID
+	if in.RunID != nil {
+		id, perr := uuid.Parse(*in.RunID)
+		if perr != nil {
+			slog.Warn("worker reported invalid residue_quarantine run_id; dropping the field", "worker_id", workerID.String())
+		} else {
+			runID = &id
+		}
+	}
+	cause := sanitizeSelfReported(in.Cause, maxResidueQuarantineCauseBytes)
+	if cause == "" {
+		cause = "unreported"
+	}
+	return &workersvc.ResidueQuarantine{
+		Cause:     cause,
+		LatchedAt: at.UTC(),
+		RunID:     runID,
+		Site:      sanitizeSelfReported(in.Site, maxResidueQuarantineSiteBytes),
+	}
 }
 
 // Outbox heartbeat validation bounds (PRD #1391 M5). The report is untrusted

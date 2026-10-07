@@ -986,6 +986,13 @@ describe("A-unverified: every way the proof can fail is unverified", () => {
     assert.ok(t >= 5000 && t < 5200, "rescans every 100 ms until the 5 s deadline");
   });
 
+  it("issue #2213: a workerWide scan scopes nothing, even for a readable process inside a target path", () => {
+    const procs = { 96: { uid: RUNNER, cwd: CLONE, env: { [RUN_ATTEMPT_ENV]: "run-17:own" } } };
+    const wide = scanOnce(fakeReq({ workerWide: true }), fakeTable(procs), SELF);
+    assert.deepEqual([wide.kill, wide.survivors, wide.unverified], [[], [], []], "not in scope");
+    assert.deepEqual(scanOnce(fakeReq(), fakeTable(procs), SELF).kill.map((p) => p.pid), [96], "control: the same table scopes it without workerWide");
+  });
+
   it("scanOnce signals nothing by itself", () => {
     const res = scanOnce(fakeReq(), fakeTable({ 96: { uid: RUNNER, cwd: CLONE, env: {} } }), SELF);
     assert.deepEqual(res.kill.map((p) => p.pid), [96]);

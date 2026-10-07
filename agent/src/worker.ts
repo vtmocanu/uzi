@@ -24,6 +24,7 @@ import { uidSplitActive } from "./runner-uid.js";
 import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
 import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY } from "./codex/codex-runtime-probe.js";
+import { residueQuarantine } from "./residue-quarantine.js";
 
 /** PRD #1906 M4: the protocol capability proving this image runs the isolated research lane
  *  (the IsolatedRunner, the fetch tool and the fixed tool set). The api's dedicated claim
@@ -675,6 +676,8 @@ export class Worker {
           this.outboxEntries(),
           this.buildActiveSnapshot(),
           { sample: stats.latestDindSample, ack: this.dindMaintenance?.acknowledgement() },
+          // issue #2213: the quarantine latch (the client sends it only when negotiated).
+          residueQuarantine(),
         );
         ok = true;
         // issue #1759 M3: the api's custody flag, stamped here with this heartbeat's SEND
@@ -866,6 +869,7 @@ export class Worker {
     const active = this.runActive;
     const gate = this.dindMaintenance?.gate ?? this.dindPrune?.gate;
     let loggedAtCapacity = false;
+    let loggedQuarantined = false;
     while (!signal.aborted) {
       // PRD #1390 M4 (e2e ONLY): the env-gated drop-execution seam pauses claiming (via the
       // shared registry latch) so a silently-dropped run can be observed sitting `queued`
@@ -885,6 +889,17 @@ export class Worker {
       // never reopen the loop while a terminal journal is still unresolved. A no-op when no outbox /
       // registry is wired (the concurrency unit tests) or nothing is pending.
       if (this.activeRuns?.claimsPausedByPendingOverflow()) {
+        await sleep(this.config.pollIntervalMs, signal);
+        continue;
+      }
+      // issue #2213: a quarantined worker claims nothing (the latch's only release is a container
+      // restart). Heartbeats, the outbox drain, terminal reports and journal sweeps run on their own
+      // loops and keep going. Same sleep-and-continue shape as the gates above; logged once.
+      if (residueQuarantine() !== undefined) {
+        if (!loggedQuarantined) {
+          this.log.warn("worker residue quarantine latched; the run lane claims nothing until the worker restarts");
+          loggedQuarantined = true;
+        }
         await sleep(this.config.pollIntervalMs, signal);
         continue;
       }
@@ -924,6 +939,10 @@ export class Worker {
       try {
         releaseAdmission = await this.terminalRejections?.acquireAdmission(signal);
         if (signal.aborted) continue;
+        // issue #2213: a latch landing while the admission await was pending must still stop this claim;
+        // nothing is awaited between this recheck and claimRun. The finally releases admission and the
+        // next iteration's top-of-loop gate logs and sleeps.
+        if (residueQuarantine() !== undefined) continue;
         // PRD #1390 M2a: carry the active-run snapshot on the claim (built from the SAME
         // monotonic epoch counter the heartbeat draws from) so the api's pre-claim dedupe
         // sees this worker's live runs even before the first post-outage heartbeat lands.
@@ -1067,7 +1086,17 @@ export class Worker {
   private async chatClaimLoop(signal: AbortSignal): Promise<void> {
     const active = this.chatActive;
     const gate = this.dindMaintenance?.gate ?? this.dindPrune?.gate;
+    let loggedQuarantined = false;
     while (!signal.aborted) {
+      // issue #2213: the same quarantine gate as the run lane (see claimLoop).
+      if (residueQuarantine() !== undefined) {
+        if (!loggedQuarantined) {
+          this.log.warn("worker residue quarantine latched; the chat lane claims nothing until the worker restarts");
+          loggedQuarantined = true;
+        }
+        await sleep(this.config.chatPollMs, signal);
+        continue;
+      }
       if (active.size >= this.config.chatSessions) {
         // All chat slots busy: wake when one frees or after a poll, then re-check.
         await Promise.race([...active, sleep(this.config.chatPollMs, signal)]);

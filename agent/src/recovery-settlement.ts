@@ -29,6 +29,7 @@ import { RequestError } from "./client.js";
 import type { Logger } from "./log.js";
 import type { RecoveryLiveSettleRequest, RecoverySettleRequest, RecoverySettleResponse } from "./protocol.js";
 import { canonicalJson } from "./recovery.js";
+import { residueQuarantine } from "./residue-quarantine.js";
 
 /** Local settlement lifecycle.
  *   - `adopted`: the successor adopted the predecessor's work; no pushed head yet (never sent).
@@ -413,6 +414,8 @@ export class PredecessorSettler {
   private readonly holdLocks = new Map<string, Promise<void>>();
   /** At most one hint per active hold; discarded from memory at lock release. */
   private readonly pendingReleaseHints = new Map<string, number>();
+  /** issue #2213: the quarantine skip of a sweep is logged once. */
+  private loggedQuarantineSkip = false;
 
   constructor(opts: PredecessorSettlerOptions) {
     this.journal = opts.journal;
@@ -613,6 +616,16 @@ export class PredecessorSettler {
    *  observed. */
   async sweep(signal?: AbortSignal): Promise<void> {
     if (!this.journal.enabled) return;
+    // issue #2213: a latched worker skips the whole sweep at entry; settleLocked and settleLiveLocked
+    // also re-check the latch immediately before each send, so a latch that lands mid-sweep stops
+    // the remaining records.
+    if (residueQuarantine() !== undefined) {
+      if (!this.loggedQuarantineSkip) {
+        this.loggedQuarantineSkip = true;
+        this.log.warn("recovery settlement: sweep skipped; the worker is quarantined");
+      }
+      return;
+    }
     try {
       const now = this.journal.now();
       for (const rec of await this.journal.listAll()) {
@@ -659,6 +672,9 @@ export class PredecessorSettler {
       adopted_sha: rec.adoptedSha,
     };
     let res: RecoverySettleResponse;
+    // issue #2213: checked synchronously right before the send (every await above has returned), so
+    // a latch that landed while this record waited for its lock or its journal read sends nothing.
+    if (residueQuarantine() !== undefined) return "skipped";
     try {
       res = await this.client.settleRecoveryHold(rec.runId, rec.holdId, req, signal);
     } catch (err) {
@@ -861,6 +877,7 @@ export class PredecessorSettler {
         const rec = await this.journal.get(runId, holdId);
         const leg = rec?.live;
         if (!rec || !leg || !isDue(leg.nextAttemptAt, this.journal.now())) return "skipped";
+        if (residueQuarantine() !== undefined) return "skipped"; // issue #2213: before the write-ahead
         // Write-ahead: once `sent` is persisted, the leg survives every lifecycle transition of
         // the record until an answer resolves it (issue #1751 R1).
         const sentRec: SettlementRecord = leg.sent ? rec : { ...rec, live: { ...leg, sent: true } };
@@ -893,6 +910,8 @@ export class PredecessorSettler {
     const timeout = AbortSignal.timeout(this.liveTimeoutMs);
     const rpcSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
     let res: RecoverySettleResponse;
+    // issue #2213: synchronous check immediately before the send (the write-ahead above awaited).
+    if (residueQuarantine() !== undefined) return "skipped";
     try {
       res = await this.client.settleRecoveryHoldLive!(rec.runId, rec.holdId, req, rpcSignal);
     } catch (err) {

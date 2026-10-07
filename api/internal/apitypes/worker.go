@@ -222,6 +222,17 @@ type WorkerDTO struct {
 	OutboxPendingTerminal *int    `json:"outbox_pending_terminal"`
 	OutboxStaleRetired    *int    `json:"outbox_stale_retired"`
 	OutboxBlocked         *string `json:"outbox_blocked"`
+	// ResidueQuarantinedAt / ResidueQuarantineCause report the worker's residue
+	// quarantine latch (issue #2213): the worker found an unreadable, unattributed
+	// runner-uid process and refuses new claims, forge-credentialed git and provider
+	// turns until its container restarts. Both are null unless the worker's last
+	// heartbeat reported the latch (a heartbeat without it clears them); the api
+	// overlays them from an in-process, restart-losing tracker, never the DB.
+	// ResidueQuarantinedAt is when the worker latched, on the worker's clock. The cause
+	// is UNTRUSTED worker self-report (sanitized and length-bounded by the api): render it as
+	// plain text only.
+	ResidueQuarantinedAt   *time.Time `json:"residue_quarantined_at"`
+	ResidueQuarantineCause *string    `json:"residue_quarantine_cause"`
 }
 
 // AdminWorkerDTO is a worker plus its owner email for the admin Agents-status

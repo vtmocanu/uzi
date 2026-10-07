@@ -156,6 +156,13 @@ except `forge.sync`, whose windows follow the effective forge poll interval.
 | `fleet.capacity` | Owners waiting without a fresh non-draining worker; stored upgrade reasons are confirmed against current composed eligibility | — | genuine wait at least 5 minutes, or confirmed upgrade-wait overlap at least 24 hours | `unknown` when the run-health detector is off/unreadable, the query fails, or a genuine wait has unavailable age unless a valid wait establishes danger |
 | `fleet.disk` | Whether any worker is under sustained disk pressure | any worker with a fresh heartbeat has a disk-pressure streak of 2+ consecutive polls | — | — |
 | `fleet.rundisk` | Whether one run is close to filling its worker's data volume (PRD #1809 M6, D8) | a fresh worker's largest reported run HOME is 40%+ of the data volume's total bytes, or the volume has less than 5% of its inodes free | — | `unknown` when the largest-run-size lookup itself fails |
+| `fleet.quarantine` | Whether any worker has latched a [residue quarantine](worker-setup.md#quarantined-worker) (an unreadable, unattributed runner-uid process was found, so it claims nothing until its container restarts) | any worker with a fresh heartbeat reports a quarantine; the evidence names at most 10 workers (the summary carries the full count), each with how long ago it latched and the run that detected it (the worker's reported cause is not shown here: read `residue_quarantine_cause` in `uzi admin workers --json` or the worker view in `uzi tui`) | — | — |
+
+`fleet.quarantine` reads the worker's own heartbeat report, which the api keeps in
+memory only. A worker without a fresh heartbeat is skipped (`fleet.capacity`
+covers a silent worker), and after an api restart a still-quarantined worker
+reappears here on its next heartbeat. There is no `danger` band: the remedy is
+restarting the worker's container, see [Quarantined worker](worker-setup.md#quarantined-worker).
 
 Worker-roll waiting is informational (`ok`, no warning) while suitable workers finish
 current runs before an upgrade. Each stored upgrade reason is confirmed against current

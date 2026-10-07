@@ -269,10 +269,18 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 // is orthogonal to the cordon annotation, so an ephemeral worker finishing its bound run
 // can legitimately read `online (draining) (ephemeral)`.
 //
-// Like uptimeCell's, every field this reads (Status, DrainingSince, ActiveRuns,
-// Ephemeral) is control-plane-owned (Decision 1), so the cell needs no scrub — it is
-// never worker self-reported. The raw draining_since and ephemeral fields also ride along
-// in `--json` untouched, so scripting keys off them rather than parsing this annotation.
+// A residue-quarantined worker (issue #2213: it found an unreadable, unattributed
+// runner-uid process and claims nothing until its container restarts) reads
+// `online (quarantined)`. The suffix is the fixed text from quarantineMark, never the
+// worker's reported cause.
+//
+// Every field this reads except the quarantine one (Status, DrainingSince, ActiveRuns,
+// Ephemeral) is control-plane-owned (Decision 1), so those need no scrub. The quarantine
+// field is worker self-report, so this reads ONLY whether it is present, never its
+// content; the cause is never put in a table cell. The only renderer of the cause text is
+// the TUI worker view (tui_workers.go, through renderer.Plain). The raw
+// draining_since, ephemeral and residue_quarantine_* fields also ride along in `--json`
+// untouched, so scripting keys off them rather than parsing this annotation.
 func statusCell(w apitypes.WorkerDTO) string {
 	s := w.Status
 	if w.DrainingSince != nil {
@@ -285,6 +293,7 @@ func statusCell(w apitypes.WorkerDTO) string {
 	if w.Ephemeral {
 		s += " (ephemeral)"
 	}
+	s += quarantineMark(w)
 	// PRD #2006: an idle ephemeral worker held for a same-owner/repo/branch follow-up. The
 	// server sets the field only while the lease is live; a past value is skipped here too
 	// so a stale or skewed clock never prints a negative "left". Only the remaining time is
@@ -295,6 +304,16 @@ func statusCell(w apitypes.WorkerDTO) string {
 		}
 	}
 	return s
+}
+
+// quarantineMark is the fixed status suffix for a worker whose heartbeat reports a
+// residue quarantine latch (issue #2213), "" otherwise. It keys on presence only: the
+// reported cause is untrusted worker text and never reaches a status column.
+func quarantineMark(w apitypes.WorkerDTO) string {
+	if w.ResidueQuarantinedAt != nil {
+		return " (quarantined)"
+	}
+	return ""
 }
 
 // uptimeCell renders a worker's continuous-online duration for `uzi worker list`'s

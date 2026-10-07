@@ -14,6 +14,17 @@ vi.mock("./mockApi/shared", async (importOriginal) => ({
 }));
 
 describe("health scenario routing", () => {
+  it("emits fleet.quarantine in the workers group, ok, right after fleet.rundisk", async () => {
+    vi.mocked(mockScenario).mockReturnValue("health-silent");
+    const doc = await healthApi.getAdminHealth();
+    const ids = doc.checks.map((c) => c.id);
+    expect(ids.indexOf("fleet.quarantine")).toBe(ids.indexOf("fleet.rundisk") + 1);
+    expect(doc.checks.find((c) => c.id === "fleet.quarantine")).toMatchObject({
+      scope: "owner", group: "workers", title: "Worker residue quarantine", severity: "ok",
+      summary: "No worker reports a residue quarantine.", doc: "hosted-workers",
+    });
+  });
+
   it("serves owner-only danger without an instance episode", async () => {
     vi.mocked(mockScenario).mockReturnValue("health-owner-only");
     const doc = await healthApi.getAdminHealth();
@@ -45,7 +56,7 @@ describe("health scenario routing", () => {
     expect(doc.blocking).toBe(false);
     expect(doc.episode_id).toBeNull();
     expect(doc.snoozed_until).toBeNull();
-    expect(doc.counts).toEqual({ ok: 15, warn: 0, danger: 0, unknown: 0, na: 0 });
+    expect(doc.counts).toEqual({ ok: 16, warn: 0, danger: 0, unknown: 0, na: 0 });
     expect(doc.checks.find((c) => c.id === "fleet.roll")).toMatchObject({
       scope: "instance", severity: "ok", summary: "All 4 hosted workers are rolling cleanly.",
     });

@@ -1854,6 +1854,11 @@ type Service struct {
 	// is IN-PROCESS, mutex-guarded, capped and TTL-pruned, and restart-losing by
 	// design — see outbox_tracker.go.
 	outbox *outboxTracker
+	// quarantine tracks each worker's last reported residue-quarantine latch (issue
+	// #2213). Same posture as outbox: in-process, mutex-guarded, capped, TTL-pruned and
+	// restart-losing — see quarantine_tracker.go. Nil-safe at every Service accessor so
+	// a struct-literal test service reads as "nothing latched".
+	quarantine *quarantineTracker
 	// forgeBaseURLAllowed is the SSRF gate for the M8 checkpoint-publish path (PRD
 	// #122): it reports whether a run's forge base URL is on the configured
 	// allowlist before the api will fetch/push against it. Set via
@@ -2180,7 +2185,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		p.DispatchGrace = defaultDispatchGrace
 	}
 	return &Service{
-		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), outbox: newOutboxTracker(),
+		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), outbox: newOutboxTracker(), quarantine: newQuarantineTracker(),
 		publishFn:            pushbroker.Publish,
 		deleteCheckpointFn:   pushbroker.Delete,
 		salvageListRefTipsFn: pushbroker.ListRefTips,
@@ -2244,6 +2249,10 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	if err != nil {
 		return store.Worker{}, "", err
 	}
+	// A fresh registration is a fresh process: a latch from the previous process
+	// (issue #2213) no longer applies; a still-latched worker re-reports it on its
+	// next heartbeat.
+	s.quarantine.evictIfSet(wkr.ID)
 	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
 	// template is the worker's self-reported image template (PRD #18); empty →
 	// NULL (older image sends none). Soft signal only; never rejected here.
@@ -2816,6 +2825,27 @@ func diskOverThreshold(stats *WorkerStats, threshold float64) bool {
 		return float64(*used)/float64(*total) >= threshold
 	}
 	return over(stats.DiskNixBytes, stats.DiskNixTotalBytes) || over(stats.DiskDataBytes, stats.DiskDataTotalBytes)
+}
+
+// RecordResidueQuarantine stores the worker's residue-quarantine report from its
+// heartbeat (issue #2213), the sibling of the outbox record in Heartbeat. A nil report
+// CLEARS the worker's entry, so a heartbeat that omits the member (not latched, or an
+// older worker, or an invalid member the handler dropped) clears the state. The handler
+// calls it on every heartbeat, before Heartbeat.
+func (s *Service) RecordResidueQuarantine(workerID uuid.UUID, q *ResidueQuarantine) {
+	if s.quarantine == nil {
+		return
+	}
+	s.quarantine.record(workerID, q, s.now())
+}
+
+// ResidueQuarantineFor returns the worker's last reported residue-quarantine latch, for
+// the DTO overlay and the fleet.quarantine health check.
+func (s *Service) ResidueQuarantineFor(workerID uuid.UUID) (ResidueQuarantine, bool) {
+	if s.quarantine == nil {
+		return ResidueQuarantine{}, false
+	}
+	return s.quarantine.get(workerID)
 }
 
 // OutboxAggregate returns a worker's summed outbox depth (PRD #1391 M5) for the
@@ -6386,6 +6416,7 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 	// removed worker's stale depth does not linger on the fleet view. In-memory and
 	// best-effort — the TTL prune is the backstop for any path that skips this.
 	s.outbox.evict(workerID)
+	s.quarantine.evictIfSet(workerID)
 	return nil
 }
 

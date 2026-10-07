@@ -25,6 +25,10 @@ import {
 import type { RecoveryLiveSettleRequest, RecoverySettleRequest, RecoverySettleResponse } from "../src/protocol.js";
 import { FakeRecoveryClient, FakeRecoveryGit } from "./codex-reap-fixture.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
+import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
+
+resetResidueQuarantineAfterEach();
 
 // issue #1582 M2 — the worker-side ancestry-settlement journal + settle driver, unit level.
 
@@ -353,6 +357,42 @@ describe("PredecessorSettler outcome rules (issue #1582 M2)", () => {
     assert.equal(await settler.settleOne(record({ holdId: HOLD3, state: "pushed" })), "skipped");
     await settler.settleRun(RUN);
     assert.ok(!client.calls.some((c) => c.holdId === HOLD3), "a pushed record is never sent by any path");
+  });
+
+  it("issue #2213: a quarantined worker's sweep sends nothing and cleans nothing; the record stays journaled", async () => {
+    await j.put(record());
+    client.answers = [{ run_id: RUN, hold_id: HOLD, outcome: "released", final_head_sha: PUSHED }];
+    latchResidueQuarantine({ cause: "c", site: "t" }, nullLogger());
+    await settler.sweep();
+    await settler.sweep();
+    assert.equal(client.calls.length, 0, "no settle call");
+    assert.deepEqual(cleanup.calls, [], "no pin or ref cleanup");
+    assert.equal((await j.listRun(RUN)).length, 1, "the record is kept");
+    resetResidueQuarantineForTests();
+    await settler.sweep();
+    assert.deepEqual(client.calls.map((c) => c.holdId), [HOLD], "control: unlatched, the same sweep settles it");
+  });
+
+  it("issue #2213: a latch that lands during the first send stops the sweep: the second due record is not sent and keeps its refs and journal", async () => {
+    await j.put(record());
+    await j.put(record({ holdId: HOLD2, predecessorGeneration: 3, successorGeneration: 4 }));
+    // The first send latches the worker and gets a retryable answer, so the sweep moves on.
+    const send = client.settleRecoveryHold.bind(client);
+    client.settleRecoveryHold = async (runId, holdId, req) => {
+      latchResidueQuarantine({ cause: "c", site: "t" }, nullLogger());
+      return send(runId, holdId, req);
+    };
+    client.answers = [retained("ancestry_unknown")];
+    await settler.sweep();
+    assert.equal(client.calls.length, 1, "only the first record was sent");
+    assert.deepEqual(cleanup.calls, [], "no pin or ref cleanup");
+    assert.deepEqual(
+      (await j.listRun(RUN)).map((r) => r.holdId).sort(),
+      [HOLD, HOLD2].sort(),
+      "both records stay journaled",
+    );
+    assert.equal(await settler.settleOne((await j.listRun(RUN)).find((r) => r.holdId === HOLD2)!), "skipped");
+    assert.equal(client.calls.length, 1, "a direct settleOne on the latched worker sends nothing either");
   });
 
   for (const status of [401, 403]) {
@@ -840,6 +880,26 @@ describe("PredecessorSettler live leg (issue #1751 M2)", () => {
     assert.equal(r.state, "adopted");
     assert.equal(r.live, undefined);
     assert.deepEqual(lg.calls, [`unpin:${RUN}/${HOLD}`]);
+  });
+
+  it("issue #2213: a latch landing during the live leg's write-ahead put sends nothing and cleans nothing", async () => {
+    await j.put(adoptedRecord({ live: liveLeg() }));
+    const put = j.put.bind(j);
+    let puts = 0;
+    j.put = async (rec) => {
+      const ok = await put(rec);
+      puts += 1;
+      latchResidueQuarantine({ cause: "c", site: "t" }, nullLogger());
+      return ok;
+    };
+    await settler.settleLive(RUN);
+    assert.equal(puts, 1, "the write-ahead put ran (the latch landed after the entry check)");
+    assert.deepEqual(client.liveCalls, [], "settleRecoveryHoldLive was not called");
+    assert.deepEqual(cleanup.calls, [], "nothing was cleaned up");
+    assert.equal((await one())!.live!.sent, true, "the write-ahead record stays journaled");
+    resetResidueQuarantineForTests();
+    await settler.settleLive(RUN);
+    assert.equal(client.liveCalls.length, 1, "control: unlatched, the same leg is sent");
   });
 
   it("a released answer naming a DIFFERENT hold never cleans up (backs off)", async () => {

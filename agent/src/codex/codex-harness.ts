@@ -115,7 +115,8 @@ import {
 import type { CallbackResult, CodexCallbackBroker } from "./broker.js";
 import type { CodexAppServerAuthMode, CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { ExecutionRegistry, RegisteredRoot } from "./registry.js";
-import { CodexTransportError, type CodexNotification, type CodexTransport } from "./transport.js";
+import { CodexTransportError, isProviderTurnMethod, type CodexNotification, type CodexTransport } from "./transport.js";
+import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
 import type { RenderedCodexRun } from "./render.js";
 
 // --- typed harness error ------------------------------------------------------
@@ -818,6 +819,15 @@ export class CodexHarness implements RunHarness {
     if (!transport) {
       return Promise.reject(new CodexHarnessError({ category: "protocol", message: "codex provider root is not launched" }));
     }
+    // issue #2213: a delegated child's thread/turn start is a new provider turn. Synchronous,
+    // immediately before the dispatch, as a rejected promise carrying the typed refusal.
+    if (isProviderTurnMethod(method)) {
+      try {
+        assertResidueQuarantineOpen("provider_turn");
+      } catch (err) {
+        return Promise.reject(err);
+      }
+    }
     return transport.request<T>(method, params, opts);
   }
 
@@ -1293,6 +1303,8 @@ export class CodexHarness implements RunHarness {
     rendered: RenderedCodexRun,
     signal: AbortSignal,
   ): Promise<string> {
+    // issue #2213: synchronous, immediately before the provider dispatch (also checked in the transport).
+    assertResidueQuarantineOpen("provider_turn");
     const res = await transport.request<{ thread?: { id?: string } }>(
       "thread/start",
       {
@@ -1325,6 +1337,8 @@ export class CodexHarness implements RunHarness {
   ): Promise<string> {
     const resumeId = request.resumeSessionId;
     let res: { thread?: { id?: string } };
+    // issue #2213: before the try, so the typed refusal is never read by the resume-remap catch.
+    assertResidueQuarantineOpen("provider_turn");
     try {
       res = await transport.request<{ thread?: { id?: string } }>(
         "thread/resume",
@@ -1369,6 +1383,8 @@ export class CodexHarness implements RunHarness {
     };
     if (this.currentModel !== undefined) params.model = this.currentModel;
     if (rendered.lead.modelReasoningEffort !== undefined) params.effort = rendered.lead.modelReasoningEffort;
+    // issue #2213: synchronous, immediately before the provider dispatch (also checked in the transport).
+    assertResidueQuarantineOpen("provider_turn");
     const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal });
     const id = res?.turn?.id;
     if (typeof id !== "string" || id.length === 0) {

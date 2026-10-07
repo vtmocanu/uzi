@@ -17,6 +17,8 @@ import {
   type RecoveryArchiveClient,
   type RecoveryBundleProducer,
 } from "../src/recovery.js";
+import { latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
+import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import type {
   RecoveryCaptureStatusResponse,
   RecoveryHold,
@@ -163,6 +165,8 @@ class PoisonGit implements RecoveryBundleProducer {
 }
 
 let root: string;
+
+resetResidueQuarantineAfterEach();
 
 function makeCoordinator(opts: {
   client?: RecoveryArchiveClient;
@@ -810,5 +814,81 @@ describe("RecoveryCoordinator — exact generation identity end to end (PRD #134
     assert.equal(outcome.state, "needs_action", "a cancelled capture retains (needs_action)");
     assert.equal(client.releaseCalls.length, 0, "a cancelled capture NEVER releases custody");
     assert.equal((await coord.inspect("run-cancel"))[0]!.state, "needs_action", "the source is retained");
+  });
+});
+
+describe("RecoveryCoordinator — the residue quarantine latch at the choke points (issue #2213)", () => {
+  const latchNow = (): void => latchResidueQuarantine({ cause: "c", site: "t" }, nullLogger());
+  const input = (rec: NonNullable<Awaited<ReturnType<RecoveryCoordinator["pin"]>>>) =>
+    ({ record: rec, barePath: "/bare", defaultBranch: "main" }) as const;
+
+  it("captureAndUpload while latched produces, reserves, uploads and releases nothing, and keeps the record unchanged", async () => {
+    const client = new FakeClient();
+    const git = new FakeGit();
+    const coord = makeCoordinator({ client, git });
+    const rec = await coord.pin({ runId: "run-Q1", sourceSha: H, kind: "issue", branch: "b" });
+    const before = await coord.inspect("run-Q1");
+    latchNow();
+    const out = await coord.captureAndUpload(input(rec!));
+    assert.notEqual(out.state, "uploaded");
+    assert.equal(out.reason, "worker_quarantined");
+    assert.equal(git.fetchCalls, 0);
+    assert.equal(git.produceCalls.length, 0);
+    assert.equal(client.reserveCalls.length, 0);
+    assert.equal(client.uploadCalls.length, 0);
+    assert.equal(client.releaseCalls.length, 0);
+    assert.deepEqual(await coord.inspect("run-Q1"), before, "the journal record is untouched");
+  });
+
+  it("a latch set between produceBundle and the upload stops the upload and keeps the journaled bundle", async () => {
+    const client = new FakeClient();
+    const git = new FakeGit();
+    // Latch from inside the producer: the bundle is produced and journaled, then the upload is refused.
+    const produce = git.produceRecoveryBundle.bind(git);
+    git.produceRecoveryBundle = async (...a: Parameters<typeof produce>) => {
+      const r = await produce(...a);
+      latchNow();
+      return r;
+    };
+    const coord = makeCoordinator({ client, git });
+    const rec = await coord.pin({ runId: "run-Q2", sourceSha: H, kind: "issue", branch: "b" });
+    const out = await coord.captureAndUpload(input(rec!));
+    assert.equal(out.state, "needs_action");
+    assert.equal(out.reason, "worker_quarantined");
+    assert.equal(client.reserveCalls.length, 0, "no reserve");
+    assert.equal(client.uploadCalls.length, 0, "no upload");
+    const [kept] = await coord.inspect("run-Q2");
+    assert.ok(kept?.bundlePath && fs.existsSync(kept.bundlePath), "the journaled bytes are kept");
+  });
+
+  it("a fresh-forge already-published proof that finishes after the latch releases nothing and does not report uploaded", async () => {
+    const client = new FakeClient();
+    const git = new FakeGit();
+    git.alreadyPublished = true;
+    const produce = git.produceRecoveryBundle.bind(git);
+    git.produceRecoveryBundle = async (...a: Parameters<typeof produce>) => {
+      const r = await produce(...a);
+      latchNow();
+      return r;
+    };
+    const coord = makeCoordinator({ client, git });
+    const rec = await coord.pin({ runId: "run-Q3", sourceSha: H, kind: "issue", branch: "b" });
+    const out = await coord.captureAndUpload(input(rec!));
+    assert.notEqual(out.state, "uploaded", "the caller must not delete the pin on this outcome");
+    assert.equal(client.releaseCalls.length, 0);
+    assert.equal((await coord.inspect("run-Q3")).length, 1, "the record is kept");
+  });
+
+  it("release while latched makes no releaseRecoveryCustody call and keeps the record; control: unlatched releases", async () => {
+    const client = new FakeClient();
+    const coord = makeCoordinator({ client });
+    await coord.pin({ runId: "run-Q4", sourceSha: H, kind: "issue", branch: "b" });
+    latchNow();
+    await coord.release("run-Q4", 1, "publication");
+    assert.equal(client.releaseCalls.length, 0);
+    assert.equal((await coord.inspect("run-Q4")).length, 1);
+    resetResidueQuarantineForTests();
+    await coord.release("run-Q4", 1, "publication");
+    assert.deepEqual(client.releaseCalls, ["run-Q4"], "control: unlatched, the same release is sent");
   });
 });

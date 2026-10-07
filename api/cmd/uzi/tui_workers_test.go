@@ -24,7 +24,7 @@ func TestWorkersDemoFleet(t *testing.T) {
 		t.Fatal("demo healthy busy worker needs retained source and no owner decisions")
 	}
 	m := workersScene(true, "workers-list-120")
-	want := "workers · 9 · 8 online · 5/12 slots in use +1 ?cap · 1 holding · 1 draining · 6 need attention"
+	want := "workers · 9 · 8 online · 5/12 slots in use +1 ?cap · 1 holding · 1 draining · 7 need attention"
 	if got := stripANSI(m.workersSummary(120)); got != want {
 		t.Fatalf("summary %q", got)
 	}
@@ -35,7 +35,7 @@ func TestWorkersDemoFleet(t *testing.T) {
 	for _, r := range m.workers.visible(time.Now()) {
 		names = append(names, r.w.Name)
 	}
-	if !reflect.DeepEqual(names, []string{"forge-large", "forge-small", "laptop", "forge-docker", "forge-m-2", "recovery", "chat-box", "eph-b20000", "eph-a10000"}) {
+	if !reflect.DeepEqual(names, []string{"chat-box", "forge-large", "forge-small", "laptop", "forge-docker", "forge-m-2", "recovery", "eph-b20000", "eph-a10000"}) {
 		t.Fatal(names)
 	}
 	if len(f.Workers) != 9 || len(f.AdminWorkers) != 10 || !reflect.DeepEqual(f.AdminRuns, f.Runs) {

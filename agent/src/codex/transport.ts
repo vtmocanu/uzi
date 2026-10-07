@@ -32,6 +32,22 @@ import type { Readable, Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 
 import type { HarnessError, HarnessErrorCategory } from "../harness.js";
+import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
+
+/** issue #2213: the JSON-RPC requests that start or authenticate a provider turn. */
+const QUARANTINE_GATED_METHODS: ReadonlySet<string> = new Set([
+  "account/login/start",
+  "thread/start",
+  "thread/resume",
+  "turn/start",
+]);
+
+/** issue #2213: true for a request that starts or authenticates a provider turn (the set the
+ *  transport refuses while the worker is quarantined). Callers that hold a transport DOUBLE assert
+ *  at their own call site with this, so the check never depends on which transport is behind it. */
+export function isProviderTurnMethod(method: string): boolean {
+  return QUARANTINE_GATED_METHODS.has(method);
+}
 
 /** Mirrors e2e/codex-m0/harness.mjs:12 `MAX_BYTES`. Per-line cap, enforced on read. */
 const DEFAULT_MAX_FRAME_BYTES = 4 * 1024 * 1024;
@@ -245,6 +261,9 @@ interface Pending {
 interface QueuedFrame {
   readonly line: string;
   readonly bytes: number;
+  /** issue #2213: set on a request frame of a quarantine-gated method; `drainLoop` rechecks the
+   *  latch for it immediately before the write and settles pending request `id` if latched. */
+  readonly gatedRequestId?: number;
 }
 
 function readStringProp(obj: unknown, key: string): string | undefined {
@@ -399,6 +418,17 @@ class CodexTransportImpl implements CodexTransport {
         reject(fail("aborted", "codex transport request aborted before send"));
         return;
       }
+      // issue #2213: on a quarantined worker no new provider turn is dispatched. The refusal is a
+      // rejected promise carrying the ResidueQuarantinedError itself (never a CodexTransportError,
+      // so no retry or resume-remap treats it as a transport fault), raised before any frame exists.
+      if (QUARANTINE_GATED_METHODS.has(method)) {
+        try {
+          assertResidueQuarantineOpen("provider_turn");
+        } catch (err) {
+          reject(err);
+          return;
+        }
+      }
       const id = this.nextId++;
       let timer: ReturnType<typeof setTimeout> | undefined;
       let onAbort: (() => void) | undefined;
@@ -436,7 +466,10 @@ class CodexTransportImpl implements CodexTransport {
         }
       }
       try {
-        this.enqueueFrame(params === undefined ? { id, method } : { id, method, params });
+        this.enqueueFrame(
+          params === undefined ? { id, method } : { id, method, params },
+          QUARANTINE_GATED_METHODS.has(method) ? id : undefined,
+        );
       } catch (err) {
         // Use the common settlement path so a serialization/queue failure removes
         // the pending entry, timer, and abort listener exactly once.
@@ -508,7 +541,7 @@ class CodexTransportImpl implements CodexTransport {
 
   // --- write side (bounded, backpressure-aware) -------------------------------
 
-  private enqueueFrame(frame: unknown): void {
+  private enqueueFrame(frame: unknown, gatedRequestId?: number): void {
     if (this.sendQueue.length >= this.maxOutbound) {
       throw fail("transport", "codex transport outbound queue is full");
     }
@@ -525,7 +558,7 @@ class CodexTransportImpl implements CodexTransport {
     if (this.sendBytes + bytes > this.maxOutboundBytes) {
       throw fail("transport", "codex transport outbound byte queue is full");
     }
-    this.sendQueue.push({ line, bytes });
+    this.sendQueue.push(gatedRequestId === undefined ? { line, bytes } : { line, bytes, gatedRequestId });
     this.sendBytes += bytes;
     this.kickDrain();
   }
@@ -545,6 +578,19 @@ class CodexTransportImpl implements CodexTransport {
       const queued = this.sendQueue.shift();
       if (queued === undefined) break;
       this.sendBytes -= queued.bytes;
+      if (queued.gatedRequestId !== undefined) {
+        // issue #2213: the latch can flip while this frame waited behind backpressure, so the
+        // enqueue-time check is not enough. Recheck here, synchronously before the write (nothing
+        // awaits between the check and the write). A latched worker refuses with the
+        // ResidueQuarantinedError itself, never a CodexTransportError, and the rest of the queue
+        // (responses, notifications, interrupts) still drains.
+        try {
+          assertResidueQuarantineOpen("provider_turn");
+        } catch (err) {
+          this.pending.get(queued.gatedRequestId)?.onError(err);
+          continue;
+        }
+      }
       if (!this.outbound.write(queued.line)) {
         // Peer is applying backpressure; resume once the buffer drains.
         this.outbound.once("drain", () => {

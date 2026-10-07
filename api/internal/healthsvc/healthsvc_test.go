@@ -658,9 +658,10 @@ func TestEvaluateRollupAndRegistry(t *testing.T) {
 	// The full registry, in a stable order (PRD "Checks in v1" table order), always
 	// present. M2-B added controller.report + loops (control) and forge.ciwatch
 	// (integrations), so it is 14, not 11; PRD #1809 M6 added fleet.rundisk
-	// (workers), and issue #2203 adds forge.sync (integrations), making 16.
+	// (workers), issue #2203 adds forge.sync (integrations), and issue #2213 adds
+	// fleet.quarantine (workers), making 17.
 	wantIDs := []string{
-		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "queue.waiting", "queue.undispatched",
+		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "queue.waiting", "queue.undispatched",
 		"controller.report", "db", "loops", "forge.ciwatch", "forge.sync", "slack.socket",
 		"schedules.paused", "board.drift", "custody.holds", "release.check",
 	}
@@ -1158,4 +1159,75 @@ func TestFleetCapacityMixedOwnersAndAges(t *testing.T) {
 			t.Errorf("%s=%s want=%s", label, values[label], want)
 		}
 	}
+}
+
+// ---- fleet.quarantine ------------------------------------------------------
+
+func TestFleetQuarantine(t *testing.T) {
+	wid := uuid.MustParse("22222222-2222-2222-2222-222222222222")
+	runID := uuid.MustParse("00000000-0000-4000-8000-000000000000")
+	worker := func(name string, hbAgo time.Duration) store.ListAllWorkersRow {
+		return store.ListAllWorkersRow{Worker: store.Worker{
+			ID: wid, Name: name,
+			LastHeartbeatAt: pgtype.Timestamptz{Time: fixedNow.Add(-hbAgo), Valid: true},
+		}}
+	}
+	latched := func(id uuid.UUID) (workersvc.ResidueQuarantine, bool) {
+		if id != wid {
+			return workersvc.ResidueQuarantine{}, false
+		}
+		return workersvc.ResidueQuarantine{Cause: "RAWCAUSE-must-not-render", LatchedAt: fixedNow.Add(-90 * time.Minute), RunID: &runID, Site: "pre_clone"}, true
+	}
+	tests := []struct {
+		name       string
+		lookup     func(uuid.UUID) (workersvc.ResidueQuarantine, bool)
+		worker     store.ListAllWorkersRow
+		wantSev    string
+		wantSubstr string
+	}{
+		{"ok when the seam is unwired", nil, worker("w", time.Second), sevOK, "No worker reports"},
+		{"ok when nothing is latched", func(uuid.UUID) (workersvc.ResidueQuarantine, bool) { return workersvc.ResidueQuarantine{}, false }, worker("w", time.Second), sevOK, "No worker reports"},
+		{"warn on a fresh latched worker", latched, worker("w", time.Second), sevWarn, "1 worker(s) are quarantined"},
+		{"stale heartbeat is skipped", latched, worker("w", 5*time.Minute), sevOK, "No worker reports"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := New(Config{Store: &fakeStore{}, Settings: &fakeSettings{}, Now: func() time.Time { return fixedNow }, HeartbeatStale: 45 * time.Second, ResidueQuarantine: tc.lookup})
+			c := svc.checkFleetQuarantine(fixedNow, []store.ListAllWorkersRow{tc.worker})
+			if c.Severity != tc.wantSev || !strings.Contains(c.Summary, tc.wantSubstr) {
+				t.Fatalf("got %q %q, want %q containing %q", c.Severity, c.Summary, tc.wantSev, tc.wantSubstr)
+			}
+			if c.Scope != "owner" || c.Group != groupWorkers {
+				t.Fatalf("scope/group = %q/%q", c.Scope, c.Group)
+			}
+		})
+	}
+
+	t.Run("evidence names the worker, age and run and never the raw cause", func(t *testing.T) {
+		svc := New(Config{Store: &fakeStore{}, Settings: &fakeSettings{}, Now: func() time.Time { return fixedNow }, HeartbeatStale: 45 * time.Second, ResidueQuarantine: latched})
+		c := svc.checkFleetQuarantine(fixedNow, []store.ListAllWorkersRow{worker("evil\x1b[31m\u202ename\n", time.Second)})
+		if len(c.Evidence) != 1 {
+			t.Fatalf("evidence = %+v", c.Evidence)
+		}
+		v := c.Evidence[0].Value
+		for _, want := range []string{"1h30m", runID.String()} {
+			if !strings.Contains(v, want) {
+				t.Fatalf("evidence %q lacks %q", v, want)
+			}
+		}
+		blob := c.Summary + v
+		for _, bad := range []string{"RAWCAUSE", "\x1b", "\u202e", "\n"} {
+			if strings.Contains(blob, bad) {
+				t.Fatalf("health text %q carries %q", blob, bad)
+			}
+		}
+		if c.Since == nil {
+			t.Fatal("since must carry the oldest latch time")
+		}
+		// The action must name surfaces that actually render the cause: the admin table
+		// never does.
+		if c.Action == nil || !strings.Contains(*c.Action, "uzi admin workers --json") || !strings.Contains(*c.Action, "uzi tui") {
+			t.Fatalf("action = %v, want it to name uzi admin workers --json and uzi tui", c.Action)
+		}
+	})
 }

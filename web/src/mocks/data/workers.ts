@@ -154,8 +154,15 @@ export const mockWorkers: Worker[] = [
     // no percentage bar) and the "worker process only" label.
     // Idle after retaining unpublished committed work: the owner must decide
     // whether to archive or explicitly discard it.
+    // Also latched in a residue quarantine (issue #2213), so it claims nothing until its
+    // container restarts. The cause is untrusted worker self-report: this one is
+    // deliberately hostile-looking (markup plus an ANSI-ish fragment the api left after
+    // stripping the ESC byte) to prove the badge renders it as literal text.
     retaining_unpublished_work: true,
     custody_decisions_needed: 1,
+    residue_quarantined_at: minsAgo(134), // latched ~2h 14m ago
+    residue_quarantine_cause:
+      'unreadable unattributed process pid 31337 (uid 1000): <script>alert("pwned")</script> [31mcomm=??[0m',
     id: "w-nas",
     name: "nas-runner",
     status: "online",

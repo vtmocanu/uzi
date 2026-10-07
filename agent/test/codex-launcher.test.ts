@@ -31,6 +31,11 @@ import { SESSION_SEED_ENTRYPOINT } from "../src/codex/session-seed-cli.js";
 import type { ProvisionSpawnSync } from "../src/codex/launcher.js";
 import { runLaunchCli, type LaunchCliDeps } from "../src/codex/launch-cli.js";
 import { WORKER_SPAWN_ENV, workerRunnerRootPids } from "../src/worker-spawn-mark.js";
+import { ResidueQuarantinedError, latchResidueQuarantine } from "../src/residue-quarantine.js";
+import { nullLogger } from "./helpers.js";
+import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
+
+resetResidueQuarantineAfterEach();
 
 // PRD #1156 (M3a): the isolated per-root launcher uses a fake supervisor.
 // Most privileged steps are injected; the worker-UID regression exercises the
@@ -611,6 +616,28 @@ describe("launchCodexEffectRoot: supervised command identity", () => {
     ]);
     // issue #1783 (R4): a command/effect root runs model-directed work: NO worker spawn mark.
     assert.deepEqual(call.options.env, env);
+  });
+
+  it("issue #2213: a quarantined worker spawns no effect root whose env carries the forge credential", async () => {
+    const fake = newFake({ uid: WORKER_UID });
+    latchResidueQuarantine({ cause: "c", site: "t" }, nullLogger());
+    const spec = {
+      identity: "worker_pat" as const,
+      command: "/usr/bin/git",
+      args: ["fetch"],
+      cwd: "/work/repo",
+      supervisorBin: SUPERVISOR_BIN,
+    };
+    await assert.rejects(
+      launchCodexEffectRoot(
+        { ...spec, env: { PATH: "/usr/bin:/bin", GIT_CONFIG_VALUE_0: "Authorization: Basic ZmFrZTpmYWtl" } },
+        baseDeps(fake, { resolveWorkerUid: () => WORKER_UID }),
+      ),
+      ResidueQuarantinedError,
+    );
+    assert.equal(spawnCalls.length, 0);
+    await launchCodexEffectRoot({ ...spec, env: { PATH: "/usr/bin:/bin" } }, baseDeps(fake, { resolveWorkerUid: () => WORKER_UID }));
+    assert.equal(spawnCalls.length, 1, "a credential-free effect root is untouched");
   });
 });
 

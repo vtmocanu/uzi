@@ -38,8 +38,10 @@ touches). The pre-existing backlog is visible but non-gating via
 
 `scripts/semgrep-gate.sh` is a bring-your-own-on-PATH wrapper, mirroring
 `scripts/lint-yaml.sh`: it fail-open SKIPs (exit 0, banner printed) when
-`semgrep` is absent locally, and is required (exit 2 on absence) whenever
-`CI` or `UZI_SAST_REQUIRED` is set. It is wired into `gate:repo` as
+`semgrep` is absent and `UZI_SAST_REQUIRED` is unset or false. A truthy
+`UZI_SAST_REQUIRED` makes absence an instrument failure (exit 2); `CI` alone
+does not require it. When the scanner is installed, the wrapper runs it in
+either case. It is wired into `gate:repo` as
 `task sast:semgrep`, run last (a whole-tree scan dominates, same as
 `scan:secrets`). Rule files live under `semgrep/`.
 
@@ -48,7 +50,33 @@ cannot tell a clean tree from a scanner that never ran, so the wrapper first
 scans `scripts/semgrep-canary.txt` with the proof rule (`semgrep/canary.yml`)
 and requires it to fire before trusting a 0-findings verdict on the real
 tree — the same discipline `scan:secrets`' gitleaks canary uses. An unfired
-canary is an instrument failure (exit 2), never a clean run.
+canary is an instrument failure (exit 2), never a clean run. Its finding must
+identify the configured `semgrep-canary` rule and the tracked canary target.
+
+Each stage runs once with strict rule loading, a 30-second per-rule/per-file
+timeout and `--timeout-threshold=0`, so repeated timeouts do not abandon the
+remaining rules. The wrapper validates the original JSON report before
+accepting a verdict: clean requires exit 0 with no findings or errors; findings
+require exit 1 with findings and no errors. Any structured scanning error,
+including a timeout alongside findings, is an instrument failure (exit 2).
+Malformed reports, contradictory statuses and diagnostic-rendering failures
+also block the gate.
+
+Diagnostics summarize the stage, scanner status, finding/error counts and
+validated rule identifiers and tracked repository-relative targets with line
+numbers. Free-form messages, source matches, metavariables, raw stderr,
+absolute/outside paths, terminal controls and provider-token-shaped values are
+omitted. Summaries are capped at 20 entries and 8 KiB, with omitted counts.
+Findings are printed from the same report; there is no diagnostic rerun.
+
+The wrapper streams stdout (at most 32 MiB) and stderr (at most 1 MiB) into an
+owned private directory, including its fresh settings file. Overflow,
+interruption or capture failure stops the owned scanner process group and
+fails the gate. After the direct scanner exits, pipes have at most two seconds
+to finish draining; a descendant holding them open triggers cleanup and an
+instrument failure. Unconfirmed process settlement is explicitly a failure.
+Private artifacts are removed on exit, and a capture directory beneath the
+scan root is explicitly excluded from scanning.
 
 ### Adding a new invariant rule
 

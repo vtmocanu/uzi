@@ -93,6 +93,10 @@ export interface ReviewRunnerOptions {
    *  task-review claim (secrets.codex present) drives a REAL Codex review pass instead of
    *  the missing-token fallback. Undefined ⇒ a Codex review claim fails closed. */
   codexAdviceHarnessFactory?: CodexAdviceHarnessFactory;
+  /** issue #2213: the worker-wide residue check that runs before this lane's credentialed fetch
+   *  (wired in main.ts to RunRunner.checkWorkerResidueBeforeFetch). It throws to refuse the fetch;
+   *  the review then falls back to its `failed` post like any other prep failure. Undefined ⇒ none. */
+  preFetchCheck?: (runId: string, site: string) => Promise<void>;
 }
 
 export class ReviewRunner {
@@ -103,6 +107,7 @@ export class ReviewRunner {
   /** PRD #1391 Run B M3b: the terminal-resolve deps, or undefined when no usable outbox is wired. */
   private readonly terminalDeps: TerminalOutboxDeps | undefined;
   private readonly codexAdviceHarnessFactory: CodexAdviceHarnessFactory | undefined;
+  private readonly preFetchCheck: ((runId: string, site: string) => Promise<void>) | undefined;
 
   constructor(
     private readonly client: WorkerClient,
@@ -120,6 +125,7 @@ export class ReviewRunner {
       log: this.log,
     });
     this.codexAdviceHarnessFactory = opts.codexAdviceHarnessFactory;
+    this.preFetchCheck = opts.preFetchCheck;
   }
 
   /** Run one diff-review claim end to end. Never throws — a failure reports the review
@@ -191,6 +197,8 @@ export class ReviewRunner {
       // clone-or-fetch), so both the reviewed branch and its base resolve locally for the
       // diff below — no working-tree checkout is needed (reviewDiff reads the bare's
       // remote-tracking refs, never a checkout). A review pushes NOTHING.
+      // issue #2213: the worker-wide residue check precedes the PAT-bearing fetch.
+      await this.preFetchCheck?.(reviewRunId, "review_pre_fetch");
       const barePath = await this.git.ensureClone(
         claim.repo.clone_url,
         claim.secrets.forge_pat,

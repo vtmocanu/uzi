@@ -418,6 +418,8 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// heartbeating) without a graceful delete has its stale depth age out here, which
 	// is also how the "queued on the worker" health reason clears for an offline worker.
 	s.outbox.prune(now)
+	// Same bound for the residue-quarantine tracker (issue #2213).
+	s.quarantine.prune(now)
 
 	// Run-health detector (PRD #47): flag/clear slow, stalled, looping, stuck-queued,
 	// and approval-idle runs from telemetry already in Postgres. Best-effort and

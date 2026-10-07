@@ -23,6 +23,7 @@ type workerRowText struct {
 	workerName, workerVersion, templateDeclared, templateReported          string
 	upgradeDetail, upgradeTarget, blockingContainer, blockingReason        string
 	outboxBlockedText, tokenLabel, hostedSize, capabilityText, workerOwner string
+	quarantineText                                                         string
 	pressureText                                                           []string
 }
 
@@ -33,7 +34,7 @@ func workerTextOf(r workerRow) workerRowText {
 		templateDeclared: workerString(w.TemplateDeclared), templateReported: workerString(w.TemplateReported),
 		upgradeDetail: workerString(w.UpgradeDetail), upgradeTarget: w.UpgradeTarget,
 		blockingContainer: workerString(w.UpgradeBlockingContainer), blockingReason: workerString(w.UpgradeBlockingReason),
-		outboxBlockedText: workerString(w.OutboxBlocked), tokenLabel: workerString(w.AnthropicSecretLabel),
+		outboxBlockedText: workerString(w.OutboxBlocked), quarantineText: workerString(w.ResidueQuarantineCause), tokenLabel: workerString(w.AnthropicSecretLabel),
 		hostedSize: workerString(w.HostedSize), capabilityText: strings.Join(w.Capabilities, " "),
 		workerOwner: r.workerOwner, pressureText: r.pressureText,
 	}
@@ -295,6 +296,13 @@ func workerAttention(r workerRow, now time.Time) []attnItem {
 	}
 	if w.OutboxBlocked != nil {
 		add(0, "✕ outbox blocked", "✕ outbox blocked: "+renderer.Plain(t.outboxBlockedText, 200))
+	}
+	// Residue quarantine (issue #2213): the worker found an unreadable, unattributed
+	// runner-uid process and claims nothing until its container restarts. The cause is the
+	// worker's own self-report (the api sanitizes it, but it is still untrusted), so it is
+	// drawn only through renderer.Plain.
+	if w.ResidueQuarantinedAt != nil {
+		add(0, "✕ quarantined", "✕ quarantined "+workerAge(w.ResidueQuarantinedAt, now)+" ago · claims nothing until the worker container restarts · cause: "+renderer.Plain(t.quarantineText, 200))
 	}
 	for _, volume := range t.pressureText {
 		text := "✕ pressure: " + renderer.Plain(volume, 200)

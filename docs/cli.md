@@ -2061,6 +2061,14 @@ bound. A run whose outcome stays pending for 60 seconds
 (with the default heartbeat) is flagged stalled; see
 [run health](./run-health.md#what-the-flags-mean).
 
+A worker that has latched a residue quarantine shows `(quarantined)` after its
+status in `uzi worker list` and `uzi admin workers` (for example `online
+(quarantined)`): it claims nothing until its container restarts, see
+[Quarantined worker](worker-setup.md#quarantined-worker). The reported cause is
+never put in the table; read `residue_quarantined_at` and
+`residue_quarantine_cause` in `uzi admin workers --json`, or the worker view in
+`uzi tui`.
+
 `uzi run get` gains four rows, each emitted only when the server has
 something to say:
 

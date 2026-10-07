@@ -1,0 +1,8 @@
+{
+  "residue_quarantine": {
+    "cause": "runner-uid pid 4242 \"ssh-agent\" could not be attributed (env/cwd unreadable)",
+    "latched_at": "2026-10-06T16:42:57.000Z",
+    "run_id": "00000000-0000-4000-8000-000000000000",
+    "site": "pre_clone"
+  }
+}

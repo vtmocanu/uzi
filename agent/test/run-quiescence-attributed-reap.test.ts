@@ -549,6 +549,8 @@ describe("issue #1828: the pre-clone reap", { skip: process.platform !== "linux"
         const reason = String(failed?.failure_reason);
         assert.match(reason, c.reason);
         assert.match(reason, /no clone was fetched/);
+        assert.match(reason, /by the HOME reap before the clone fetch/, "names the check that refused");
+        assert.doesNotMatch(reason, /worker-wide check/, "the worker-wide check never ran at this site");
         assert.doesNotMatch(reason, /kept for inspection/, "no clone exists at this site");
         assert.ok(!statuses(claim.run_id).includes("recovery_wait"), "not classified as a forge-unreachable park");
         assert.equal(mrCalls.length, 0);

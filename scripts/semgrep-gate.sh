@@ -134,7 +134,7 @@ fi
 # it still says DETECTED -- while the population it attests for has changed. Its
 # green would then be signed by a witness that no longer speaks for anything CI
 # checks out. See scan-secrets.sh's identical guard.
-if ! git ls-files --error-unmatch "$CANARY" >/dev/null 2>&1; then
+if ! git --literal-pathspecs ls-files --error-unmatch -- "$CANARY" >/dev/null 2>&1; then
   echo "semgrep-gate: canary is NOT TRACKED: $CANARY" >&2
   echo "  It is on disk, so semgrep still scans and fires on it -- but a canary" >&2
   echo "  outside the git index attests liveness over a population CI does not" >&2
@@ -142,95 +142,96 @@ if ! git ls-files --error-unmatch "$CANARY" >/dev/null 2>&1; then
   exit 2
 fi
 
-# 🔴 SEMGREP NEEDS A WRITABLE SETTINGS PATH OR IT ABORTS. Verified on a live
-# 0.71.0 worker (2026-08-30): the baked binary aborts on first run unless it can
-# write $HOME/.semgrep/settings.yml. Point it at a NON-EXISTENT writable path so
-# semgrep writes a fresh valid file -- a pre-created empty file instead prints a
-# "Bad settings format ... will be overridden" warning. `mktemp -u` yields a name
-# that does not exist yet.
-SEMGREP_SETTINGS_FILE="$(mktemp -u "${TMPDIR:-/tmp}/uzi-semgrep-settings.XXXXXX")" || {
-  echo "semgrep-gate: mktemp -u failed" >&2
+# Capture lives in a private directory, including a settings path which does not
+# yet exist. Explicitly exclude its verified physical path from both scans.
+umask 077
+if ! command -v python3 >/dev/null 2>&1; then
+  echo 'semgrep-gate: reason=missing_capture_tool' >&2
+  exit 2
+fi
+mkdir -p "$ROOT/.uzi/scratch"
+CAPTURE_DIR="$(mktemp -d "$ROOT/.uzi/scratch/semgrep-capture.XXXXXX")" || exit 2
+HELPER_PID=''
+# shellcheck disable=SC2329 # Invoked by the EXIT trap; exercised by the focused suite.
+cleanup() {
+  rm -rf -- "$CAPTURE_DIR"
+}
+# shellcheck disable=SC2329 # Invoked by signal traps; exercised by the focused suite.
+interrupt() {
+  # Python owns scanner-group retirement; wait for it before removing evidence.
+  trap '' INT TERM HUP
+  if [ -n "$HELPER_PID" ]; then
+    kill -TERM "$HELPER_PID" 2>/dev/null || :
+    wait "$HELPER_PID" 2>/dev/null || :
+  fi
+  echo 'semgrep-gate: reason=interrupted' >&2
   exit 2
 }
+trap 'cleanup' EXIT
+trap 'interrupt' INT TERM HUP
+CAPTURE_DIR="$(cd "$CAPTURE_DIR" && pwd -P)" || exit 2
+case "$CAPTURE_DIR" in
+  "$ROOT"/*) CAPTURE_EXCLUDE="${CAPTURE_DIR#"$ROOT"/}" ;;
+  *) echo 'semgrep-gate: reason=invalid_capture_path' >&2; exit 2 ;;
+esac
+chmod 700 "$CAPTURE_DIR"
+SEMGREP_SETTINGS_FILE="$CAPTURE_DIR/settings.yml"
 export SEMGREP_SETTINGS_FILE
-# semgrep MATERIALIZES that path (it writes a fresh settings file even with
-# --metrics=off, verified 2026-08-30), so without this the gate leaks one temp
-# file per run into TMPDIR -- and it runs on every `task gate` and CI job. The
-# EXIT trap removes it on every exit path (clean, findings, or instrument error).
-trap 'rm -f "$SEMGREP_SETTINGS_FILE"' EXIT
-
-# 🔴 SEMGREP ALSO ABORTS BUILDING ITS X509/OTel CLIENT WITHOUT A CA BUNDLE.
-# Verified same session. Only set SSL_CERT_FILE when the caller has not, and only
-# when the standard bundle actually exists (guard both, so this never points
-# semgrep at a path that is not there).
 if [ -z "${SSL_CERT_FILE:-}" ] && [ -f /etc/ssl/certs/ca-certificates.crt ]; then
   export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 fi
-
-CANARY_BASE="${CANARY##*/}"
-
-# 🔴 LIVENESS RUN. Scan ONLY the canary file with the proof rule; it MUST fire.
-# With `--error`, semgrep exits 1 on findings, 0 when clean, >=2 on an instrument
-# error. `--strict` (on every scan below) makes a rule-LOAD error -- a rule file
-# that is valid YAML but has an unsupported/invalid pattern -- FATAL (>=2) instead
-# of a logged warning semgrep skips past. Without it a broken invariant rule would
-# be silently dropped while the distinct canary rule still fired, so the gate would
-# report 0 findings and read green while enforcing fewer invariants than it claims
-# -- the exact vacuous pass the canary exists to prevent, arriving through a
-# different door (rule-load rather than scanner-blind). An exit 0 here means the canary is DEAD -- semgrep did not actually scan,
-# or the proof rule is broken -- which is the vacuous 0-findings pass this canary
-# exists to prevent, so it is an instrument failure (2), not a clean gate.
+REPORTER="$ROOT/scripts/semgrep-report.py"
+if [ ! -f "$REPORTER" ] || [ ! -r "$REPORTER" ]; then
+  echo 'semgrep-gate: reason=renderer_failure' >&2
+  exit 2
+fi
+run_stage() {
+  stage="$1"
+  shift
+  stage_dir="$CAPTURE_DIR/$stage"
+  mkdir "$stage_dir"
+  # One requested argv, no shell interpretation. The helper drains both pipes
+  # concurrently and owns the POSIX process group until cleanup settles.
+  python3 -B "$REPORTER" capture "$stage_dir" -- \
+    semgrep scan --config "$RULES_DIR" --error --strict --metrics=off \
+    --disable-version-check --json --timeout 30 --timeout-threshold=0 \
+    --exclude "$CAPTURE_EXCLUDE" "$@" 2>/dev/null &
+  HELPER_PID=$!
+  capture_rc=0
+  wait "$HELPER_PID" || capture_rc=$?
+  HELPER_PID=''
+  report_rc=0
+  python3 -B "$REPORTER" report "$stage_dir" "$stage" "$CANARY" "$RULES_DIR" \
+    > "$stage_dir/report" 2>/dev/null || report_rc=$?
+  # An interpreter failure can exit 2 just like a structured scanner error.
+  # Require report evidence before accepting any renderer exit status.
+  if [ ! -s "$stage_dir/report" ]; then
+    echo 'semgrep-gate: reason=renderer_failure' >&2
+    return 2
+  fi
+  if [ "$capture_rc" -ne 0 ]; then
+    if [ "$report_rc" -eq 2 ]; then
+      cat "$stage_dir/report"
+    fi
+    echo 'semgrep-gate: reason=capture_failure' >&2
+    return 2
+  fi
+  case "$report_rc" in
+    0|1|2)
+      if ! cat "$stage_dir/report"; then
+        echo 'semgrep-gate: reason=renderer_failure' >&2
+        return 2
+      fi
+      return "$report_rc"
+      ;;
+    *) echo 'semgrep-gate: reason=renderer_failure' >&2; return 2 ;;
+  esac
+}
 rc=0
-semgrep scan --config "$RULES_DIR" --error --strict --metrics=off --disable-version-check \
-  "$CANARY" >/dev/null 2>&1 || rc=$?
-case "$rc" in
-  1) : ;;  # canary fired -- the scanner is live, as required
-  0)
-    echo "semgrep-gate: THE CANARY DID NOT FIRE. THE SCANNER WAS BLIND." >&2
-    echo "  Scanning $CANARY with the rules in $RULES_DIR produced NO finding, so" >&2
-    echo "  semgrep did not actually look (or the proof rule is broken). A" >&2
-    echo "  0-findings gate over the real tree would therefore be vacuous. This is" >&2
-    echo "  an INSTRUMENT failure (exit 2), never a clean run. In order of" >&2
-    echo "  likelihood: the canary token was edited, $RULES_DIR lost the proof" >&2
-    echo "  rule, or its \`paths: include\` no longer names $CANARY." >&2
-    exit 2
-    ;;
-  *)
-    echo "semgrep-gate: semgrep exited $rc scanning the canary $CANARY, which is" >&2
-    echo "  neither findings (1) nor clean (0). This is an INSTRUMENT failure --" >&2
-    echo "  a bad rules dir, an unreadable file, or semgrep itself failing to run." >&2
-    exit 2
-    ;;
-esac
-
-# 🔴 GATE RUN. Scan the whole tree, EXCLUDING the canary file so the proof rule
-# contributes nothing to the gate's verdict. semgrep's default ignores skip
-# node_modules/, dist/, .git/ and friends, so `.` does not walk the JS deps
-# (measured PRD #862 M2). `--error` makes the exit code parser-free: 0 clean,
-# 1 findings, >=2 instrument error.
+run_stage canary "$CANARY" || rc=$?
+if [ "$rc" -ne 0 ]; then
+  exit 2
+fi
 rc=0
-semgrep scan --config "$RULES_DIR" --error --strict --metrics=off --disable-version-check \
-  --exclude "$CANARY_BASE" . >/dev/null 2>&1 || rc=$?
-
-case "$rc" in
-  0)
-    echo "semgrep-gate: clean -- 0 findings under $RULES_DIR (canary $CANARY DETECTED)."
-    echo "semgrep-gate: the canary firing is the positive observation: without it this"
-    echo "semgrep-gate: green would be indistinguishable from a scanner that never looked."
-    exit 0
-    ;;
-  1)
-    echo "semgrep-gate: findings under $RULES_DIR. Re-running to print them:" >&2
-    # Re-run WITHOUT suppressing output so the findings are shown. Its own exit is
-    # ignored (`|| true`): the verdict was already decided by the quiet run above,
-    # and set -eu would otherwise abort on this expected non-zero.
-    semgrep scan --config "$RULES_DIR" --error --strict --metrics=off --disable-version-check \
-      --exclude "$CANARY_BASE" . >&2 || true
-    exit 1
-    ;;
-  *)
-    echo "semgrep-gate: semgrep exited $rc over the tree, which is neither clean (0)" >&2
-    echo "  nor findings (1). This is an INSTRUMENT failure, not a scan result." >&2
-    exit 2
-    ;;
-esac
+run_stage tree --exclude "${CANARY##*/}" . || rc=$?
+exit "$rc"

@@ -306,6 +306,25 @@ describe("RunsList — the admin fleet list surfaces the cordon badge (PRD #496)
   });
 });
 
+describe("RunsList — admin fleet list surfaces the residue quarantine (issue #2213)", () => {
+  it.each([true, false])("latched=%s", async (latched) => {
+    vi.mocked(useAuth).mockReturnValue({ user: { is_admin: true }, vaultUnlocked: true } as unknown as ReturnType<typeof useAuth>);
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({ workers: [{
+      ...healthyFleetWorkers()[0], owner_email: "q@uzi.test",
+      residue_quarantined_at: latched ? "2026-07-05T11:00:00Z" : null,
+      residue_quarantine_cause: latched ? "<b>pid 7</b>" : null,
+    }] });
+    const { container } = renderRuns();
+    await screen.findByText("q@uzi.test");
+    const pill = screen.queryByText("quarantined");
+    expect(Boolean(pill)).toBe(latched);
+    if (latched) expect(pill?.getAttribute("title")).toContain('Reported cause: "<b>pid 7</b>".');
+    expect(container.querySelector("b")).toBeNull();
+  });
+});
+
 describe("RunsList — admin Docker disk cleanup", () => {
   it.each([
     { name: "DinD-only sample", pending: true, sample: true, ephemeral: false },
