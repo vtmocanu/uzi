@@ -217,6 +217,44 @@ func TestRunGetLongToolCallHealth(t *testing.T) {
 	}
 }
 
+// Branch advance diagnostics belong on STOP_REASON beside a neutral cancelled status.
+func TestRunGetBranchAdvanceStopReason(t *testing.T) {
+	const reason = "superseded by a concurrent branch advance; further publication stopped. cause=remote_branch_advanced; superseding_tip=0123456789abcdef0123456789abcdef01234567"
+	for _, kind := range []string{"mr_rework", "ci_fix"} {
+		t.Run(kind, func(t *testing.T) {
+			stopKind, stopReason := "branch_moved", reason
+			fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
+				"advanced": {ID: "advanced", Kind: kind, Status: "cancelled",
+					StopKind: &stopKind, StopReason: &stopReason,
+					FailureReason: nil, FailOrigin: nil},
+			}}
+			out, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "advanced")
+			if code != uzicli.ExitOK || stderr != "" {
+				t.Fatalf("run get exit = %d, stderr = %q", code, stderr)
+			}
+			rows := make(map[string]string)
+			for _, line := range strings.Split(out, "\n") {
+				fields := strings.Fields(line)
+				if len(fields) > 1 {
+					rows[fields[0]] = strings.Join(fields[1:], " ")
+				}
+			}
+			for key, want := range map[string]string{
+				"STATUS": "cancelled", "STOP_KIND": "branch_moved", "STOP_REASON": reason,
+			} {
+				if rows[key] != want {
+					t.Errorf("%s = %q, want %q:\n%s", key, rows[key], want, out)
+				}
+			}
+			for _, key := range []string{"FAILURE_REASON", "FAIL_ORIGIN"} {
+				if _, exists := rows[key]; exists {
+					t.Errorf("neutral cancellation must omit %s:\n%s", key, out)
+				}
+			}
+		})
+	}
+}
+
 // PRD #108 M9b. An auto-stopped run must be distinguishable from a user cancel at
 // the CLI, and the two are IDENTICAL on every other field: both end `failed`, and
 // on the live-poller half the worker's own SetRunFailed overwrites failure_reason

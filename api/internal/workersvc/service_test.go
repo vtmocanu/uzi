@@ -470,8 +470,8 @@ type fakeStore struct {
 	cancelledByWorker     *store.CancelRunByWorkerParams
 	cancelledByWorkerRows int64
 	// supersededByWorker captures the issue #1117 live-worker branch_moved supersession;
-	// SetState's failed arm calls it (instead of SetRunFailed) when an mr_rework run reports
-	// branch_moved. Mirrors cancelledByWorker.
+	// SetState's failed arm calls it (instead of SetRunFailed) when an mr_rework or ci_fix
+	// run reports branch_moved. Mirrors cancelledByWorker.
 	supersededByWorker *store.SupersedeRunByWorkerParams
 	rejected           *store.RejectRunServerSideParams
 	// clearedCaps captures the PRD #84 M4 4c override clear (ClearRunRequiredCapabilities);

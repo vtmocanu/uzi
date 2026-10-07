@@ -2361,7 +2361,7 @@ export interface StateRequest {
    *  "branch_moved: remote_branch_advanced; superseding_tip=<40-lowercase-hex>".
    *  The proof pins the claim floor, original imported head, publication candidate and
    *  superseding remote tip. A lost push response can mean work was already published.
-   *  The current API honors mr_rework; ci_fix API disposition support is a separate milestone.
+   *  The API allowlists mr_rework and ci_fix and validates optional cause/tip diagnostics.
    *  Omitted entirely on other reports; no new wire fields. */
   branch_moved?: boolean;
   /** failed carries a human-readable reason. */

@@ -3227,10 +3227,10 @@ export function RunFailureReason({ run, stopped }: { run: Run; stopped?: boolean
 }
 
 /**
- * The operator's free-text cancel reason (issue #525), shown in the stopped/failed hero
- * beside the failure_reason line. On the live-poller cancel path failure_reason is the
- * generic "run cancelled", so this is the line that actually says WHY. Untrusted free
- * text, same channel as failure_reason — through stripUnsafeChars. Renders nothing when unset.
+ * Optional operator cancel reason or server-composed stop diagnostics, shown in the
+ * stopped/failed hero beside failure_reason. The owner/admin-scoped DTO keeps this private;
+ * branch_moved diagnostics explain the proved advance and superseding tip. Untrusted text,
+ * same channel as failure_reason — through stripUnsafeChars. Renders nothing when unset.
  */
 export function RunStopReason({ run }: { run: Run }) {
   if (!run.stop_reason) return null;

@@ -768,7 +768,7 @@ export interface LatestRun {
   // non-stop run. Read by isStoppedRun, which renders the two HUMAN kinds as a calm
   // "stopped" and deliberately leaves "auto_stopped" looking like the breakage it is.
   stop_kind: StopKind | null;
-  // issue #525: the operator's OPTIONAL free-text cancel reason. Owner-gated on the
+  // Optional operator cancel reason or server-composed stop diagnostics. Owner-gated on the
   // shared board (the server sends it only to the run's owner, like failure_reason;
   // a non-owner viewer gets null). Untrusted free text — render via stripUnsafeChars.
   stop_reason: string | null;
@@ -2516,9 +2516,9 @@ export type RunStatus =
 // directive truncated. PRD #1227 M2: "scope_reduced" is stamped on a completed run whose
 // owner `partial` decision deferred part of its frozen scope. Both land
 // status="completed" (green success), so — like "stopped" — neither is a HUMAN_STOP_KIND.
-// Issue #1117: "branch_moved" is stamped on an mr_rework run whose finalize push was
-// rejected non-fast-forward because a concurrent same-branch writer advanced the MR branch
-// under it (a benign, expected race, not an agent failure). It lands status="cancelled", so
+// "branch_moved" is stamped on ci_fix or mr_rework runs when a concurrent same-branch
+// advance is proved before publication or after a push rejection. This benign supersession
+// lands status="cancelled", so
 // isStoppedRun already renders it calm regardless of stop_kind — it is NOT a HUMAN_STOP_KIND
 // (those govern the status="failed" case only).
 export type StopKind =
@@ -2806,8 +2806,8 @@ export interface Run {
    *  "plan_rejected" (human), "auto_stopped" (server), null otherwise. isStoppedRun
    *  reads this, not failure_reason — and treats only the two human kinds as calm. */
   stop_kind: StopKind | null;
-  /** issue #525: the operator's OPTIONAL free-text cancel reason, stamped beside
-   *  stop_kind on the cancel paths. This DTO is owner/admin-scoped, so it rides
+  /** Optional operator cancel reason or server-composed stop diagnostics, stamped beside
+   *  stop_kind. This DTO is owner/admin-scoped, so it rides
    *  unconditionally (like failure_reason). Untrusted free text — via stripUnsafeChars. */
   stop_reason: string | null;
   /** Run-health flag (PRD #47). This owner-scoped DTO carries health_reason
