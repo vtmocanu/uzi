@@ -69,15 +69,16 @@ func (p *packetObserver) feed(data []byte, packet func([]byte)) {
 }
 
 type rawReport struct {
-	ref      string
-	sideband bool
-	outer    packetObserver
-	inner    packetObserver
-	invalid  bool
-	flushed  bool
-	unpack   string
-	marker   string
-	reason   string
+	ref       string
+	sideband  bool
+	outer     packetObserver
+	inner     packetObserver
+	invalid   bool
+	exhausted bool
+	flushed   bool
+	unpack    string
+	marker    string
+	reason    string
 }
 
 func (r *rawReport) feed(data []byte) {
@@ -159,14 +160,37 @@ func (r *rawReport) complete() bool {
 		r.outer.have == 0 && r.inner.have == 0 && r.flushed
 }
 
+// maxReportResponseBytes caps the actual single-command receive-pack response at
+// 1 MiB, including pkt-line framing and every sideband channel. This bounds the
+// bytes reaching go-git, whose report decoder retains each command status.
+const maxReportResponseBytes = 1 << 20
+
+var errReportResponseLimit = errors.New("pushbroker: receive-pack response byte limit exhausted (1 MiB)")
+
 type rawReportReader struct {
 	reader io.Reader
 	report *rawReport
+	read   int
 }
 
 func (r *rawReportReader) Read(p []byte) (int, error) {
-	n, err := r.reader.Read(p)
+	if len(p) == 0 {
+		return 0, nil
+	}
+	remaining := maxReportResponseBytes - r.read
+	if remaining == 0 {
+		r.report.invalid, r.report.exhausted = true, true
+		return 0, errReportResponseLimit
+	}
+	// Never probe or drain beyond the budget, even to distinguish EOF at the
+	// boundary. Reaching the boundary conservatively invalidates prior evidence.
+	n, err := r.reader.Read(p[:min(len(p), remaining)])
+	r.read += n
 	r.report.feed(p[:n])
+	if r.read == maxReportResponseBytes {
+		r.report.invalid, r.report.exhausted = true, true
+		return n, errors.Join(err, errReportResponseLimit)
+	}
 	return n, err
 }
 

@@ -85,7 +85,8 @@ const (
 	PublishUnclassified PublishDisposition = iota
 	// PublishAdvanced means this command received a successful acknowledgement of the update.
 	PublishAdvanced
-	// PublishOutcomeUnknown means ReceivePack was invoked without a definitive acknowledgement.
+	// PublishOutcomeUnknown means ReceivePack was invoked and the returned failure
+	// leaves the outcome uncertain, including a failure after a successful report.
 	PublishOutcomeUnknown
 )
 
@@ -425,7 +426,7 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	outcome, pushErr := forwardPack(ctx, remote, auth, checkpointRef, checkpointTip, tipHash, o.Pack)
 	disposition := PublishUnclassified
 	if outcome.invoked && !outcome.rejected && (!outcome.success || pushErr != nil) {
-		// Without report evidence for this command, rejection-like error text
+		// Without definitive rejection evidence for this command, rejection-like error text
 		// cannot prove refusal. Keep the outcome unknown and preserve its cause.
 		if pushErr == nil {
 			pushErr = errors.New("missing or incomplete receive-pack acknowledgement")
@@ -1084,6 +1085,11 @@ func receiveObservedPack(ctx context.Context, sess transport.ReceivePackSession,
 	raw.sideband = req.Capabilities.Supports(capability.Sideband64k) || req.Capabilities.Supports(capability.Sideband)
 	outcome := forwardPackResult{invoked: true}
 	_, err := sess.ReceivePack(ctx, req)
+	if raw.exhausted {
+		// ReportStatus.Decode can replace a reader error with "missing flush".
+		// Preserve that returned cause while retaining the bounded reader cause.
+		err = errors.Join(err, errReportResponseLimit)
+	}
 	// ReportStatus discards the command marker. Only the observed, complete raw
 	// report can distinguish "ng <ref> ok" from a successful command.
 	if raw.complete() {

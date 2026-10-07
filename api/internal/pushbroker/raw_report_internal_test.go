@@ -207,8 +207,8 @@ func TestRawReaderPacketStorageBound(t *testing.T) {
 	original := &chunkErrorReader{data: []byte("ffff" + strings.Repeat("x", 1<<20)), chunk: 4096, terminal: io.EOF}
 	report := &rawReport{ref: "refs/uzi-checkpoints/main"}
 	reader := &rawReportReader{reader: original, report: report}
-	if _, err := io.Copy(io.Discard, reader); err != nil {
-		t.Fatal(err)
+	if _, err := io.Copy(io.Discard, reader); !errors.Is(err, errReportResponseLimit) {
+		t.Fatalf("oversized response error = %v, want byte limit", err)
 	}
 	if report.complete() || !report.outer.invalid || cap(report.outer.payload) > 65520 || len(report.reason) > 65520 {
 		t.Fatal("oversized packet retained evidence")

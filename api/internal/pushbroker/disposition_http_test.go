@@ -22,6 +22,7 @@ import (
 // preserves go-git's default capability selection even when sideband is advertised.
 func TestPublishHTTPDisposition(t *testing.T) {
 	const ref = "refs/uzi-checkpoints/main"
+	flood := append([]string{"unpack ok"}, strings.Split(strings.TrimSuffix(strings.Repeat("ok "+ref+"\n", 100000), "\n"), "\n")...)
 	cases := []struct {
 		name         string
 		lines        []string
@@ -35,6 +36,7 @@ func TestPublishHTTPDisposition(t *testing.T) {
 		fatal        bool
 		raw          string
 	}{
+		{name: "response byte budget", lines: flood, flush: true, want: pushbroker.PublishOutcomeUnknown, wantError: true},
 		{name: "acknowledged", lines: []string{"unpack ok", "ok " + ref}, flush: true, want: pushbroker.PublishAdvanced},
 		{name: "rejection reason exactly ok", lines: []string{"unpack ok", "ng " + ref + " ok"}, flush: true, wantError: true},
 		{name: "unfamiliar rejection", lines: []string{"unpack ok", "ng " + ref + " novel policy"}, flush: true, wantError: true},
@@ -152,7 +154,7 @@ func TestPublishHTTPDisposition(t *testing.T) {
 						return
 					}
 					w.Header().Set("Content-Type", "application/x-git-receive-pack-result")
-					if _, err := w.Write(response.Bytes()); err != nil {
+					if _, err := w.Write(response.Bytes()); err != nil && tc.name != "response byte budget" {
 						t.Error(err)
 					}
 					return
@@ -166,6 +168,9 @@ func TestPublishHTTPDisposition(t *testing.T) {
 			})
 			if (err != nil) != tc.wantError {
 				t.Errorf("error = %v, wantError %v", err, tc.wantError)
+			}
+			if tc.name == "response byte budget" && (err == nil || !strings.Contains(err.Error(), "response byte limit")) {
+				t.Errorf("missing budget cause: %v", err)
 			}
 			if tc.mapped != nil && !errors.Is(err, tc.mapped) {
 				t.Errorf("error = %v, want %v", err, tc.mapped)

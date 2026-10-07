@@ -32,6 +32,7 @@ func TestNegotiatedSidebandHTTP(t *testing.T) {
 				rejected   bool
 				wantError  bool
 			}{
+				{"progress byte budget", "ok " + ref, 1, true, false, false, false, true},
 				{"split headers", "ok " + ref, 1, true, true, true, false, false},
 				{"ng reason exactly ok", "ng " + ref + " ok", 1, true, true, false, true, true},
 				{"outer flush only", "ok " + ref, 1, false, false, false, false, true},
@@ -44,6 +45,9 @@ func TestNegotiatedSidebandHTTP(t *testing.T) {
 						inner = inner[:len(inner)-4]
 					}
 					var wire bytes.Buffer
+					if tc.name == "progress byte budget" {
+						wire.WriteString(strings.Repeat("0006\x02x", (1<<20)/6+1))
+					}
 					enc := pktline.NewEncoder(&wire)
 					for _, b := range inner {
 						// Split every inner header across outer packets. Progress
@@ -63,7 +67,7 @@ func TestNegotiatedSidebandHTTP(t *testing.T) {
 						for _, b := range wire.Bytes() {
 							raw.feed([]byte{b})
 						}
-						if raw.complete() != tc.complete {
+						if raw.complete() != (tc.complete || tc.name == "progress byte budget") {
 							t.Fatalf("complete=%v, want %v", raw.complete(), tc.complete)
 						}
 						if tc.complete && (raw.marker != strings.Fields(tc.line)[0] || (tc.rejected && raw.reason != "ok")) {
@@ -104,7 +108,7 @@ func TestNegotiatedSidebandHTTP(t *testing.T) {
 								return
 							}
 							w.Header().Set("Content-Type", "application/x-git-receive-pack-result")
-							if _, err := w.Write(wire.Bytes()); err != nil {
+							if _, err := w.Write(wire.Bytes()); err != nil && tc.name != "progress byte budget" {
 								t.Error(err)
 							}
 						default:
@@ -142,6 +146,9 @@ func TestNegotiatedSidebandHTTP(t *testing.T) {
 					result, err := receiveObservedPack(context.Background(), sess, req, raw)
 					if !result.invoked || result.success != tc.success || result.rejected != tc.rejected || (err != nil) != tc.wantError {
 						t.Fatalf("result=%+v error=%v", result, err)
+					}
+					if tc.name == "progress byte budget" && (err == nil || !strings.Contains(err.Error(), "response byte limit")) {
+						t.Fatalf("missing budget cause: %v", err)
 					}
 					if !raw.sideband || raw.complete() != tc.complete || (tc.rejected && result.reason != "ok") {
 						t.Fatalf("raw=%+v result=%+v", raw, result)
