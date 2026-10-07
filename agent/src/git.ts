@@ -4172,14 +4172,21 @@ export class GitCache {
         const foreignOwners = new Set<string>();
         const config = await this.runGit(barePath, ["config", "--local", "--null", "--list"]);
         const entries = config.split("\0");
+        const journals = new Map<string, string>();
         for (const item of entries) {
           const nl = item.indexOf("\n");
           const match = /^uzi-recovery\.(.+)\.clone$/.exec(item.slice(0, nl));
           if (!match) continue;
-          const journal = await this.readRecoveryCapture(barePath, match[1]!, entries);
+          journals.set(match[1]!, item.slice(nl + 1));
+        }
+        for (const [branch, value] of journals) {
+          // Retirement clears this key to empty. Like readRecoveryCapture, the
+          // latest value is authoritative; nonempty invalid attribution still refuses FINAL.
+          if (value === "") continue;
+          const journal = await this.readRecoveryCapture(barePath, branch, entries);
           if (!journal) throw new Error("unreadable recovery attribution");
           if (journal.runId !== runId) { foreignOwners.add(journal.runId); continue; }
-          paths.set(journal.clonePath, { branch: match[1]!, runId });
+          paths.set(journal.clonePath, { branch, runId });
         }
         // Unlike advisory backup readers, FINAL cannot skip malformed ledger evidence.
         for (const [, raw] of await this.readAllAttemptLedgerRaw(barePath)) {

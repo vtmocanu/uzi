@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Guarded recovery accepts cleared clone journals ([#2458](https://github.com/vtmocanu/uzi/issues/2458)).**
+  Inventory discovery recognizes the latest empty retirement value as no journal, so a cleared entry on another branch does not block finalization. Malformed nonempty attribution, ledger validation, physical-source checks and quiescence requirements remain enforced.
+
 - **Admins can discover repositories across owners for Docker trust ([#2432](https://github.com/vtmocanu/uzi/issues/2432)).**
   Admin Settings now lists enabled repositories across all owners and disabled repositories retained by the effective Docker allowlist, with owner and forge connection labels so matching paths remain distinguishable. Admins can grant or revoke trust from this picker while preserving stored IDs for deleted repositories.
 
