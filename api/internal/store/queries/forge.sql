@@ -398,6 +398,8 @@ RETURNING *;
 -- preserving survivor order and duplicates, then append distinct additions in first
 -- occurrence order unless already surviving. An add/remove overlap wins by adding.
 -- AddLabels and RemoveLabels are JSON arrays, including typed empty [].
+-- Legacy empty moves could store JSON null; treat that current value as an empty
+-- array without a migration. The normalization stays inside the conflict update.
 -- The label-only cache-write variant for the AutoMove and SetIssueLabel paths (PRD
 -- #767). It extends UpsertIssue's board_position preservation (above) to assignee_ids:
 -- BOTH column lists here DELIBERATELY OMIT assignee_ids (and keep board_position
@@ -423,14 +425,14 @@ SET title            = EXCLUDED.title,
         SELECT COALESCE(jsonb_agg(value ORDER BY phase, ord), '[]'::jsonb)
         FROM (
             SELECT value, ord, 0 AS phase
-            FROM jsonb_array_elements(issues.labels) WITH ORDINALITY AS current_label(value, ord)
+            FROM jsonb_array_elements(COALESCE(NULLIF(issues.labels, 'null'::jsonb), '[]'::jsonb)) WITH ORDINALITY AS current_label(value, ord)
             WHERE NOT (sqlc.arg(remove_labels)::jsonb @> jsonb_build_array(value))
             UNION ALL
             SELECT value, min(ord) AS ord, 1 AS phase
             FROM jsonb_array_elements(sqlc.arg(add_labels)::jsonb) WITH ORDINALITY AS added_label(value, ord)
             WHERE NOT EXISTS (
                 SELECT 1
-                FROM jsonb_array_elements(issues.labels) AS survivor(value)
+                FROM jsonb_array_elements(COALESCE(NULLIF(issues.labels, 'null'::jsonb), '[]'::jsonb)) AS survivor(value)
                 WHERE survivor.value = added_label.value
                   AND NOT (sqlc.arg(remove_labels)::jsonb @> jsonb_build_array(survivor.value))
             )

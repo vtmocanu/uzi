@@ -26,6 +26,8 @@ func TestUpsertIssueLabelsDeltasLiveDB(t *testing.T) {
 		want                       []string
 	}{
 		{"empty", "[]", "[]", "[]", []string{}},
+		{"legacy null empty delta", "null", "[]", "[]", []string{}},
+		{"legacy null add", "null", `["new"]`, "[]", []string{"new"}},
 		{"empty delta preserves duplicates", `["b","a","b"]`, "[]", "[]", []string{"b", "a", "b"}},
 		{"add only", `["b","b","a"]`, `["z","a","z","y","y"]`, "[]", []string{"b", "b", "a", "z", "y"}},
 		{"remove only", `["b","a","b","c"]`, "[]", `["b"]`, []string{"a", "c"}},
@@ -105,7 +107,7 @@ func TestUpsertIssueLabelsWaitsForCurrentRowLiveDB(t *testing.T) {
 		defer cancel()
 		_ = tx.Rollback(cleanup)
 	}()
-	holderPID := int32(holder.Conn().PgConn().PID())
+	holderPID := int64(holder.Conn().PgConn().PID())
 	if _, err := tx.Exec(ctx, `UPDATE issues SET labels='["holder","holder","Planned"]'::jsonb WHERE id=$1`, stored.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +116,7 @@ func TestUpsertIssueLabelsWaitsForCurrentRowLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer writer.Release()
-	writerPID := int32(writer.Conn().PgConn().PID())
+	writerPID := int64(writer.Conn().PgConn().PID())
 	type result struct {
 		row store.Issue
 		err error
