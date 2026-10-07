@@ -94,6 +94,56 @@ it("issue1924 invalid ownership route body network and HTTP failures never FINAL
   }
 });
 
+it("issue1924 a discovery that no longer returns a context drops it from the boot queue", async () => {
+  const f = await fixture();
+  try {
+    await f.coordinator.snapshotOwedInventory();
+    let holdReads = 0;
+    Object.defineProperty(f.state, "open", { get: () => { holdReads++; return true; } });
+    await f.coordinator.materializeBootInventory();
+    const visited = holdReads;
+    assert.ok(visited > 0, "the discovered context is visited");
+    f.git.discoverOwedCandidates = async () => [];
+    await f.coordinator.snapshotOwedInventory();
+    await f.coordinator.materializeBootInventory();
+    assert.equal(holdReads, visited, "a context whose pins are gone costs no further hold RPC");
+  } finally { await f.close(); }
+});
+
+it("issue1924 a failed discovery keeps the queued contexts", async () => {
+  const f = await fixture();
+  try {
+    await f.coordinator.snapshotOwedInventory();
+    f.git.discoverOwedCandidates = async () => { throw new Error("unreadable refs"); };
+    await assert.rejects(f.coordinator.snapshotOwedInventory());
+    let holdReads = 0;
+    Object.defineProperty(f.state, "open", { get: () => { holdReads++; return true; } });
+    await f.coordinator.materializeBootInventory();
+    assert.ok(holdReads > 0, "the retained context is still visited");
+  } finally { await f.close(); }
+});
+
+it("issue1924 queue rotation survives repeated discovery so later contexts are not starved", async () => {
+  const f = await fixture();
+  try {
+    const contexts = ["run-1", "run-2", "run-3"].map(runId => ({ ...f.context, runId }));
+    f.git.discoverOwedCandidates = async () => contexts.map(context => ({
+      context, candidates: structuredClone(f.state.candidates) }));
+    const inner = f.coordinator as unknown as {
+      liveMaxPerPass: number; client: { listRecoveryHolds(id: string): Promise<unknown> };
+    };
+    inner.liveMaxPerPass = 1;
+    const visited: string[] = [];
+    const list = inner.client.listRecoveryHolds.bind(inner.client);
+    inner.client.listRecoveryHolds = async (id: string) => { visited.push(id); return list(id); };
+    for (let pass = 0; pass < 3; pass++) {
+      await f.coordinator.snapshotOwedInventory();
+      await f.coordinator.materializeBootInventory();
+    }
+    assert.deepEqual([...new Set(visited)], ["run-1", "run-2", "run-3"]);
+  } finally { await f.close(); }
+});
+
 async function fixture(sourceBoundary = false) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "inventory-"));
   const context: PositiveOwedCandidateContext = {

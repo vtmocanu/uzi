@@ -934,8 +934,17 @@ export class RecoveryCoordinator {
   async snapshotOwedInventory(): Promise<void> {
     if (!this.git.discoverOwedCandidates) throw new Error("inventory discovery unavailable");
     const discovered = await this.git.discoverOwedCandidates();
-    const entries = new Map(this.bootOwed.map(entry => [canonicalJson(entry.context), entry]));
-    for (const entry of discovered) entries.set(canonicalJson(entry.context), entry);
+    const fresh = new Map(discovered.map(entry => [canonicalJson(entry.context), entry]));
+    // A successful discovery is authoritative: a context it no longer returns has no pins left,
+    // so it leaves the queue instead of costing a hold RPC per pass forever. Survivors keep their
+    // queue position (materializeBootInventory rotates the queue to avoid starving later entries).
+    const entries = new Map<string, (typeof discovered)[number]>();
+    for (const entry of this.bootOwed) {
+      const key = canonicalJson(entry.context);
+      const current = fresh.get(key);
+      if (current) entries.set(key, current);
+    }
+    for (const [key, entry] of fresh) if (!entries.has(key)) entries.set(key, entry);
     this.bootOwed = [...entries.values()];
   }
 
