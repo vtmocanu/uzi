@@ -1,7 +1,9 @@
 package workersvc
 
 import (
+	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -13,7 +15,7 @@ import (
 // ledger upsert commit together, a missing ledger row is a zero row (not ErrBranchInUse), and a
 // refused create leaves no ledger row behind. Skipped without UZI_TEST_DATABASE_URL.
 
-func TestCreateAutoMRReworkRunAndAdvanceFirstFireAndAtomicityLiveDB(t *testing.T) {
+func TestCreateAutoMRReworkRunAndAdvanceFirstFireAndRefusalsLiveDB(t *testing.T) {
 	env, svc, userID, repoID := branchSerializeEnv(t)
 	const n int64 = 23471
 	branch := agentIssueBranch(n)
@@ -78,5 +80,51 @@ func TestCreateAutoMRReworkRunAndAdvanceCapUnderLockLiveDB(t *testing.T) {
 	}
 	if _, err := svc.CreateAutoMRReworkRunAndAdvance(env.ctx, userID, repoID, branch, 234720, source, "t", "d", res, 3); err != nil {
 		t.Fatalf("under the cap = %v, want success", err)
+	}
+}
+
+// A ledger upsert that fails INSIDE the create transaction, after the run INSERT succeeded,
+// rolls the run back: no mr_rework run row and no ledger row survive. A BEFORE trigger scoped
+// to this test's repo_id injects the failure so other tests sharing the database are unaffected.
+func TestCreateAutoMRReworkRunAndAdvanceLedgerFailureRollsBackRunLiveDB(t *testing.T) {
+	env, svc, userID, repoID := branchSerializeEnv(t)
+	const n int64 = 23473
+	branch := agentIssueBranch(n)
+	seedEligibleIssue(t, env, repoID, n)
+	source := seedCompletedSourceRun(t, env, userID, repoID, n, 234730)
+	res := reviewResultOf(sampleReviewSnapshot())
+
+	suffix := strings.ReplaceAll(repoID.String(), "-", "")
+	fn := "t2347_fail_fn_" + suffix
+	trg := "t2347_fail_trg_" + suffix
+	env.exec(`CREATE FUNCTION ` + fn + `() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.repo_id = '` + repoID.String() + `'::uuid THEN
+    RAISE EXCEPTION 'injected ledger failure (issue 2347 test)';
+  END IF;
+  RETURN NEW;
+END $$`)
+	t.Cleanup(func() {
+		_, _ = env.pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS `+trg+` ON mr_rework_ledger`)
+		_, _ = env.pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS `+fn+`()`)
+	})
+	env.exec(`CREATE TRIGGER ` + trg + ` BEFORE INSERT OR UPDATE ON mr_rework_ledger FOR EACH ROW EXECUTE FUNCTION ` + fn + `()`)
+
+	_, err := svc.CreateAutoMRReworkRunAndAdvance(env.ctx, userID, repoID, branch, 234730, source, "Rework MR review", "desc", res, 5)
+	if err == nil {
+		t.Fatal("create with a failing ledger upsert succeeded, want an error")
+	}
+	if errors.Is(err, ErrBranchInUse) {
+		t.Fatalf("the injected ledger failure was misreported as ErrBranchInUse: %v", err)
+	}
+	var runs int
+	if qerr := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM runs WHERE kind = 'mr_rework' AND repo_id = $1 AND mr_iid = 234730`, repoID).Scan(&runs); qerr != nil {
+		t.Fatal(qerr)
+	}
+	if runs != 0 {
+		t.Fatalf("%d mr_rework run row(s) survived a failed ledger upsert, want 0 (the create must be atomic)", runs)
+	}
+	if _, lerr := env.q.GetMRReworkLedger(env.ctx, store.GetMRReworkLedgerParams{RepoID: repoID, Ref: branch}); !errors.Is(lerr, pgx.ErrNoRows) {
+		t.Fatalf("ledger row present after a failed create (err=%v)", lerr)
 	}
 }

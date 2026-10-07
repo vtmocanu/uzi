@@ -36,10 +36,12 @@ type mrReviewWatchStore interface {
 
 // MRReworkRunStarter creates an automatic mr_rework run through workersvc's shared
 // create path (PRD #700 M3), together with the cycle's ledger advance in one transaction
-// (issue #2347), after re-validating freshness and the cap under the branch lock. *workersvc.Service satisfies it. Keeping run creation on
-// the workersvc side is what makes the run go through the SAME guards — the
-// one-active-mr_rework-per-MR index and the create-time cross-kind branch guard — so
-// the detector receives ErrActiveMRReworkExists / ErrBranchInUse to swallow on a race.
+// (issue #2347), after re-validating freshness and the cap under the branch lock.
+// *workersvc.Service satisfies it. Keeping run creation on the workersvc side is what makes
+// the run go through the SAME guards — the one-active-mr_rework-per-MR index and the
+// create-time cross-kind branch guard — so the detector receives ErrActiveMRReworkExists /
+// ErrBranchInUse to swallow on a race, and likewise swallows the under-lock refusals
+// ErrMRReworkCapReached, ErrReworkNothingNew and ErrReworkPermissionUnknown.
 type MRReworkRunStarter interface {
 	CreateAutoMRReworkRunAndAdvance(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, res *workersvc.ReviewSnapshotResult, capLimit int) (store.Run, error)
 }
@@ -218,7 +220,7 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	// Fetch the MR review comments first (the assessment's deadline must not be spent on
 	// the listing), then assess their authors. The detector builds the snapshot itself — it
 	// needs the eligible comments to gate on high-water and review-landedness — then passes it
-	// to CreateAutoMRReworkRun, mirroring ci-autofix's BuildFailureSnapshot.
+	// to CreateAutoMRReworkRunAndAdvance, mirroring ci-autofix's BuildFailureSnapshot.
 	//
 	// The queue's prune bound is read BEFORE the listing: a row at or below it was admitted
 	// before the comments were fetched, so this list decides its candidacy; a row a concurrent
@@ -360,8 +362,9 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	//
 	// This gate reads the ledger taken before the comment listing and is only an early exit:
 	// the authoritative cap check runs under the creation lock (CreateAutoMRReworkRunAndAdvance
-	// refuses with ErrMRReworkCapReached), and a refusal there is followed on the next tick by
-	// this halt path.
+	// refuses with ErrMRReworkCapReached). That recheck judges the cap before freshness, so when the
+	// competing cycle consumed the same comments the next tick exits at the "nothing new" gate;
+	// this halt path runs only once a newer eligible comment remains.
 	if int(led.AttemptCount) >= capLimit {
 		if !led.HaltNotified {
 			if err := d.notifyHalt(ctx, cand, issueIID, capLimit); err != nil {

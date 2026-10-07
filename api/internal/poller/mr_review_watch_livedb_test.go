@@ -34,13 +34,15 @@ func (p poolQueue) MutateReviewAuthorQueue(ctx context.Context, repoID uuid.UUID
 	return tx.Commit(ctx)
 }
 
-// startCounter counts the creates a real MRReworkRunStarter accepts.
+// startCounter counts the creates a real MRReworkRunStarter is asked for and the ones it accepts.
 type startCounter struct {
-	inner  MRReworkRunStarter
-	starts int
+	inner    MRReworkRunStarter
+	attempts int // every create call, accepted or refused
+	starts   int // accepted creates only
 }
 
 func (c *startCounter) CreateAutoMRReworkRunAndAdvance(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, res *workersvc.ReviewSnapshotResult, capLimit int) (store.Run, error) {
+	c.attempts++
 	run, err := c.inner.CreateAutoMRReworkRunAndAdvance(ctx, userID, repoID, ref, mrIID, sourceRunID, title, description, res, capLimit)
 	if err == nil {
 		c.starts++
@@ -133,8 +135,8 @@ func TestMRReworkEligibilityRoundTripLiveDB(t *testing.T) {
 			if !reflect.DeepEqual(after, before) {
 				t.Fatalf("ineligible tick changed ledger: before=%+v after=%+v", before, after)
 			}
-			if runs.starts != 1 {
-				t.Fatalf("ineligible tick: starts=%d", runs.starts)
+			if runs.starts != 1 || runs.attempts != 1 {
+				t.Fatalf("ineligible tick: starts=%d attempts=%d, want 1 and 1 (no new create attempt)", runs.starts, runs.attempts)
 			}
 			switch toggle {
 			case "token":
@@ -147,8 +149,8 @@ func TestMRReworkEligibilityRoundTripLiveDB(t *testing.T) {
 			candidates(1)
 			watch.detect(ctx, row, f)
 			ledger(1, 120)
-			if runs.starts != 1 {
-				t.Fatalf("same consumed note duplicated: starts=%d", runs.starts)
+			if runs.starts != 1 || runs.attempts != 1 {
+				t.Fatalf("same consumed note duplicated: starts=%d attempts=%d, want 1 and 1 (no new create attempt)", runs.starts, runs.attempts)
 			}
 			// The first rework run finishes before the next cycle (one active rework per MR).
 			exec("UPDATE runs SET status='completed' WHERE kind='mr_rework' AND target_run_id=$1", source)
