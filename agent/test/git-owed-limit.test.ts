@@ -10,9 +10,10 @@ const ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM:
 const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
 const BRANCH = "agent/issue-1924";
 const RUN = "19241924-aaaa-bbbb-cccc-444444444444";
-const CAP = MAX_OWED_CANDIDATES_PER_RUN;
+const CAP = 6; // the cache under test is built with this cap; the real constant is exercised separately
 let fx: Fixture;
 let cache: GitCache;
+let realCap: GitCache;
 let bare: string;
 let clone: string;
 let base: string;
@@ -46,7 +47,8 @@ const stageRefs = (): string[] => gitIn(bare, ["for-each-ref", "--format=%(refna
 
 beforeEach(async () => {
   fx = makeFixture();
-  cache = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  cache = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ maxOwedCandidates: CAP }));
+  realCap = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
   bare = await cache.ensureClone(fx.originPath);
   base = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
   clone = (await cache.runnerCloneForBranch(bare, BRANCH, "issue-1924", noProofReseed, RUN)).path;
@@ -101,5 +103,16 @@ describe("issue1924 owed candidate cap", { timeout: 300_000 }, () => {
     assert.equal(results.filter((r) => r.kind === "updated").length >= 1, true);
     assert.ok(results.some((r) => r.kind === "not_updated" && r.reason === "owed_limit"), "an attempt past the cap is refused");
     assert.equal((await pinned()).length, CAP, "exactly the cap, never more");
+  });
+  it("the shipped cap is 64, enforced by a default cache", async () => {
+    assert.equal(MAX_OWED_CANDIDATES_PER_RUN, 64);
+    // 64 ref-only pins stand in for 64 retained heads (the cap counts refs under the run's prefix).
+    for (let i = 0; i < MAX_OWED_CANDIDATES_PER_RUN; i++) {
+      gitIn(bare, ["update-ref", `refs/uzi-owed/${RUN}/${String(i).padStart(40, "a")}`, base]);
+    }
+    commitTree("one too many", true);
+    const result = await realCap.fetchAgentBranch(bare, clone, BRANCH, RUN, opts);
+    assert.deepEqual(result, { kind: "not_updated", reason: "owed_limit" });
+    assert.equal(gitIn(bare, ["for-each-ref", `refs/uzi-owed/${RUN}/`]).split("\n").length, MAX_OWED_CANDIDATES_PER_RUN);
   });
 });

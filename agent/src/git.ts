@@ -515,6 +515,9 @@ export interface GitCacheOptions {
    *  absolute `/usr/local/bin/gitleaks` inside one via resolveBoundaryExecutable). A test injects an
    *  absolute path to a shim. */
   gitleaksBin?: string;
+  /** Test-only override of {@link MAX_OWED_CANDIDATES_PER_RUN} so the cap boundary is cheap to
+   *  exercise. Production never passes it. */
+  maxOwedCandidates?: number;
   /** Test-only stand-in for runner-clone scratch provisioning, for the non-Linux dev loop.
    *  Production never passes it, so the real provisioner runs and fails closed off Linux. */
   scratchProvisioner?: (clonePath: string) => Promise<void>;
@@ -1385,6 +1388,7 @@ export class GitCache {
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
   /** issue #1597 M2: the gitleaks executable (see {@link GitCacheOptions.gitleaksBin}). */
   private readonly gitleaksBin: string;
+  private readonly maxOwedCandidates: number;
   /** See {@link GitCacheOptions.scratchProvisioner}; undefined in production. */
   private readonly scratchProvisioner: ((clonePath: string) => Promise<void>) | undefined;
   /** See {@link GitCacheOptions.retentionDelete}; undefined in production. */
@@ -1411,6 +1415,7 @@ export class GitCache {
     opts: GitCacheOptions = {},
   ) {
     this.gitleaksBin = opts.gitleaksBin ?? "gitleaks";
+    this.maxOwedCandidates = opts.maxOwedCandidates ?? MAX_OWED_CANDIDATES_PER_RUN;
     this.scratchProvisioner = opts.scratchProvisioner;
     this.retentionDeleteSeam = opts.retentionDelete;
     this.canonicalFreeSeam = opts.canonicalFree;
@@ -7857,9 +7862,9 @@ export class GitCache {
   private async pinOwedUnderLock(c: StoredOwedContext, sha: string): Promise<void> {
     await this.requireOwedCommit(c.barePath, sha);
     const ref = `refs/uzi-owed/${c.runId}/${sha}`;
-    const held = (await this.runGit(c.barePath, ["for-each-ref", "--format=%(refname)", `refs/uzi-owed/${c.runId}/`]))
-      .split("\n").filter(Boolean);
-    if (!held.includes(ref) && held.length >= MAX_OWED_CANDIDATES_PER_RUN) throw new OwedCandidateLimitError();
+    const held = (await this.runGit(c.barePath, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/uzi-owed/${c.runId}/`]))
+      .split("\n").filter(Boolean).map((line) => line.split(" ")[0]!);
+    if (!held.includes(ref) && held.length >= this.maxOwedCandidates) throw new OwedCandidateLimitError();
     await this.persistOwedContext(c); // Durable discovery precedes the first pin.
     const context = this.contextName(c);
     const name = `candidate-${c.runId}-${sha}-${context.slice(8, -5)}.json`;
