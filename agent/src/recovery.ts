@@ -40,7 +40,7 @@ import type {
   RecoveryUploadManifest,
   RunKind,
 } from "./protocol.js";
-import { RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeError, type RecoveryBundleResult, type PositiveOwedCandidateContext, type OwedCandidate, type RecoveryCoverage, type FetchAgentBranchOptions, type TrackingUpdateResult } from "./git.js";
+import { RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeError, type RecoveryBundleResult, type PositiveOwedCandidateContext, type OwedCandidate, type RecoveryCoverage, type FetchAgentBranchOptions, type TrackingUpdateResult, type GitCache } from "./git.js";
 
 /** The six forge-finalizing run kinds that reach code publication (PRD #1296 In-scope).
  *  `chat` and `judge` never publish code, so they never open a custody hold and never
@@ -182,11 +182,11 @@ export interface RecoveryArchiveClient {
 
 /** The bundle-producer subset {@link RecoveryCoordinator} needs — GitCache satisfies it. */
 export interface RecoveryBundleProducer {
-  readInventoryCloneHeads?: import("./git.js").GitCache["readInventoryCloneHeads"];
-  committedTrackingOwnership?: import("./git.js").GitCache["committedTrackingOwnership"];
-  ancestry?: import("./git.js").GitCache["ancestry"];
+  readInventoryCloneHeads?: GitCache["readInventoryCloneHeads"];
+  committedTrackingOwnership?: GitCache["committedTrackingOwnership"];
+  ancestry?: GitCache["ancestry"];
   enumerateOwedCandidates?(barePath: string, runId: string): Promise<OwedCandidate[]>;
-  discoverOwedCandidates?(): ReturnType<import("./git.js").GitCache["discoverOwedCandidates"]>;
+  discoverOwedCandidates?(): ReturnType<GitCache["discoverOwedCandidates"]>;
   retainCurrentOwedCandidate?(barePath: string, options: FetchAgentBranchOptions): Promise<TrackingUpdateResult>;
   buildRecoveryCoverage?(barePath: string, context: PositiveOwedCandidateContext, roots: string[], currentSha: string): Promise<RecoveryCoverage>;
   produceRecoveryBundle(
