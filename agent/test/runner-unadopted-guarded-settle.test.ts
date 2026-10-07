@@ -61,6 +61,27 @@ function rig(opts: { releaseFails?: boolean } = {}): Rig {
   };
 }
 
+function trackSettled(): Array<[string, number]> {
+  const marked: Array<[string, number]> = [];
+  (client as unknown as { markInventoryGuardedClaimSettled: (r: string, g: number) => void })
+    .markInventoryGuardedClaimSettled = (r, g) => { marked.push([r, g]); };
+  return marked;
+}
+
+it("a confirmed empty settle forgets the remembered guarded claim for exactly that generation", async () => {
+  const r = rig();
+  const marked = trackSettled();
+  const runId = await r.run(9111, async () => { throw PERMANENT(); });
+  assert.deepEqual(marked, [[runId, GEN]]);
+});
+
+it("an unconfirmed empty settle keeps the remembered guarded claim", async () => {
+  const r = rig({ releaseFails: true });
+  const marked = trackSettled();
+  await r.run(9112, async () => { throw PERMANENT(); });
+  assert.deepEqual(marked, []);
+});
+
 for (const [name, fail] of [["forge park", TRANSIENT], ["pre-clone failure", PERMANENT]] as const) {
   it(`${name}: a guarded generation that adopted nothing sends one settled forge_no_output release after the report`, async () => {
     const r = rig();

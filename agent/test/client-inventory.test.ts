@@ -193,3 +193,14 @@ it("final inventory release requires an exact positive safe generation before HT
   }
   assert.equal(requests.length, before);
 });
+
+it("issue1924 a settled empty guarded generation stops reading as pending but keeps its release guards", async () => {
+  await guardedClaim();
+  assert.equal(client.knowsInventoryGuardedClaim(RUN, 7), true);
+  client.markInventoryGuardedClaimSettled(RUN, 8); // never claimed: no effect
+  client.markInventoryGuardedClaimSettled("other-run", 7);
+  assert.equal(client.knowsInventoryGuardedClaim(RUN, 7), true);
+  client.markInventoryGuardedClaimSettled(RUN, 7);
+  assert.equal(client.knowsInventoryGuardedClaim(RUN, 7), false);
+  await assert.rejects(client.releaseRecoveryCustody(RUN, 7), /legacy release refused/);
+});

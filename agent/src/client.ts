@@ -942,10 +942,20 @@ function validDindSample(sample: DindMeterSample | null | undefined): sample is 
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
   private readonly inventoryGuardedClaims = new Set<string>();
+  private readonly settledInventoryGuardedClaims = new Set<string>();
 
-  /** Exact positive server claim evidence survives capability refreshes. */
+  /** Exact positive server claim evidence survives capability refreshes, until that exact
+   *  generation's empty guarded hold was settled by a validated release ACK. The claim stays in
+   *  the downgrade and legacy-release guards; only the "custody still pending" answer ends. */
   knowsInventoryGuardedClaim(runId: string, generation: number): boolean {
-    return this.inventoryGuardedClaims.has(`${runId}:${generation}`);
+    const key = `${runId}:${generation}`;
+    return this.inventoryGuardedClaims.has(key) && !this.settledInventoryGuardedClaims.has(key);
+  }
+
+  /** Record that this exact guarded generation's hold was confirmed released (empty settle). */
+  markInventoryGuardedClaimSettled(runId: string, generation: number): void {
+    const key = `${runId}:${generation}`;
+    if (this.inventoryGuardedClaims.has(key)) this.settledInventoryGuardedClaims.add(key);
   }
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly terminalRetrySchedule: number[];

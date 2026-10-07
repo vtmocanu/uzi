@@ -4331,6 +4331,9 @@ export class RunRunner {
         runId: claim.run_id, generation: claim.claim_generation,
         barePath: this.git.barePathFor(claim.repo.clone_url),
       });
+      // Only a confirmed empty settle (valid ACK, or the exact hold already closed) ends the
+      // remembered claim; "retained" keeps it, so unresolved custody stays protected.
+      if (outcome === "settled") this.client.markInventoryGuardedClaimSettled?.(claim.run_id, claim.claim_generation);
       runLog.info("recovery: unadopted guarded generation disposition", {
         run_id: claim.run_id, generation: claim.claim_generation, outcome,
       });
