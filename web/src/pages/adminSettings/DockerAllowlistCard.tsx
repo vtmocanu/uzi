@@ -10,11 +10,18 @@ import { maskEmail, maskHost, maskRepoPath } from "../../lib/demoMask";
 function uuidIdentity(value: string): string | null {
   let s = value;
   if (s.length === 45 && /^urn:uuid:/i.test(s)) s = s.slice(9);
-  else if (s.length === 38 && /^[\x00-\x7f]$/.test(s[0]) && /^[\x00-\x7f]$/.test(s[37])) s = s.slice(1, 37);
+  else if (s.length === 38 && s.charCodeAt(0) <= 0x7f && s.charCodeAt(37) <= 0x7f) s = s.slice(1, 37);
   if (/^[0-9a-f]{32}$/i.test(s)) {
     s = s.slice(0, 8) + "-" + s.slice(8, 12) + "-" + s.slice(12, 16) + "-" + s.slice(16, 20) + "-" + s.slice(20);
   }
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s) ? s.toLowerCase() : null;
+}
+
+// Cross-user trust labels must expose hidden controls instead of allowing them
+// to reorder the identity an admin sees. This affects presentation, never IDs.
+function displayLabel(value: string): string {
+  return value.replace(/[\p{Cc}\p{Cf}]/gu, (char) =>
+    "\\u{" + char.codePointAt(0)!.toString(16) + "}");
 }
 
 function parseAllowlist(value: string): string[] {
@@ -155,8 +162,8 @@ export function DockerAllowlistCard({
                     onChange={() => toggle(r.id)}
                     className="h-4 w-4 rounded border-edge accent-brand"
                   />
-                  <span className="truncate text-fg">{maskRepoPath(r.path_with_namespace, demo)}</span>{" "}
-                  <span className="text-muted">{maskEmail(r.owner_email, demo)} · {r.forge_type} · {maskHost(r.base_url, demo)}</span>
+                  <span className="truncate text-fg">{maskRepoPath(displayLabel(r.path_with_namespace), demo)}</span>{" "}
+                  <span className="text-muted">{maskEmail(displayLabel(r.owner_email), demo)} · {r.forge_type} · {maskHost(displayLabel(r.base_url), demo)}</span>
                   {!r.enabled && <span className="text-faint">Disabled</span>}
                 </label>
               ))}

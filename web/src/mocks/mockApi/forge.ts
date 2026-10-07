@@ -31,7 +31,7 @@ import { settingsApi } from "./settings";
 function uuidIdentity(value: string): string | null {
   let s = value;
   if (s.length === 45 && /^urn:uuid:/i.test(s)) s = s.slice(9);
-  else if (s.length === 38 && /^[\x00-\x7f]$/.test(s[0]) && /^[\x00-\x7f]$/.test(s[37])) s = s.slice(1, 37);
+  else if (s.length === 38 && s.charCodeAt(0) <= 0x7f && s.charCodeAt(37) <= 0x7f) s = s.slice(1, 37);
   if (/^[0-9a-f]{32}$/i.test(s)) {
     s = s.slice(0, 8) + "-" + s.slice(8, 12) + "-" + s.slice(12, 16) + "-" + s.slice(16, 20) + "-" + s.slice(20);
   }

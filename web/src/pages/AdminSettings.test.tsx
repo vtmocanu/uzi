@@ -1431,6 +1431,24 @@ describe("DockerAllowlistCard — instance identities", () => {
     await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ docker_repo_allowlist: expected }));
   });
 
+  it("shows hidden controls as visible escapes in cross-user checkbox labels, retaining the raw ID", async () => {
+    mockApi.adminListDockerAllowlistRepos.mockResolvedValue({ repos: [row(second, {
+      path_with_namespace: "team/\u202eoper-dev\u202c",
+      owner_email: "dana\u202e@example.com",
+      base_url: "https://forge.example.com/\n\u200b\u{e0001}",
+    })] });
+    mockApi.updateSettings.mockResolvedValue(response({ docker_repo_allowlist: second }));
+    card("");
+    const box = await screen.findByRole("checkbox", { name: /dana\\u\{202e\}@example.com/ });
+    const label = box.closest("label")!.textContent!;
+    expect(label).not.toMatch(/[\p{Cc}\p{Cf}]/u);
+    expect(label).toContain("team/\\u{202e}oper-dev\\u{202c}");
+    expect(label).toContain("https://forge.example.com/\\u{a}\\u{200b}\\u{e0001}");
+    fireEvent.click(box);
+    fireEvent.click(save());
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ docker_repo_allowlist: second }));
+  });
+
   it("masks repo, owner and connection labels in demo mode while saving the raw repo identity", async () => {
     mockApi.adminListDockerAllowlistRepos.mockResolvedValue({ repos: [row(first, {
       path_with_namespace: "private-group/shared", owner_email: "dana.member@private.example",
