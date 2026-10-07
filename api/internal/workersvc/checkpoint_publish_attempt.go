@@ -125,8 +125,8 @@ type checkpointPush struct {
 // past the cooling period) never move runs.checkpoint_tip or the record BACKWARDS over a newer
 // publish, or over the sweeper's attempts arm re-recording a newer late push.
 type publishBase struct {
-	// observed: the base was read (retention wired). Unobserved, the persist is unconditional
-	// (SetRunCheckpointTip), as no record, attempt row or attempts arm exists to race with.
+	// observed: the base was read (retention wired). Unobserved, the persist is
+	// unconditional (SetRunCheckpointTip); live admission still records attempt evidence.
 	observed bool
 	// runTip is runs.checkpoint_tip (invalid: none persisted); recordTip the run's retention
 	// record tip (invalid: no record).
