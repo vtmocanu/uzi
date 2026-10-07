@@ -387,11 +387,13 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	switch {
 	case err == nil:
 		if err := d.q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
-			RepoID:        r.ID,
-			Ref:           ref,
-			HighWater:     plan.MaxActionableID,
-			PendingAdd:    plan.PendingAdd,
-			PendingRemove: plan.PendingRemove,
+			RepoID:              r.ID,
+			Ref:                 ref,
+			HighWater:           plan.MaxActionableID,
+			PendingAdd:          plan.PendingAdd,
+			PendingRemove:       plan.PendingRemove,
+			PendingSuperseded:   plan.PendingSuperseded,
+			PendingSupersededBy: plan.PendingSupersededBy,
 		}); err != nil {
 			// The run is active; the next tick's branch guard keeps it from doubling.
 			slog.Error("poller: mr-rework upsert ledger", "repo", r.PathWithNamespace, "ref", ref, "error", err)

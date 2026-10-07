@@ -501,6 +501,7 @@ type ReviewSnapshotResult struct {
 	unknownAuthor      map[int64]int64 // comment id -> author id, for unknownActionable
 	class              map[int64]reviewClass
 	inSnapshot         map[int64]bool
+	maxFetchedID       int64 // the largest comment id of the fetched list, 0 when it was empty
 }
 
 // Snapshot finishes the assessment: it looks up the context-only authors (everyone not yet
@@ -531,6 +532,9 @@ func (r *ReviewAssessment) Snapshot(ctx context.Context) *ReviewSnapshotResult {
 		class:            make(map[int64]reviewClass, len(r.kept)),
 		inSnapshot:       map[int64]bool{},
 		unknownAuthor:    map[int64]int64{},
+	}
+	for _, c := range r.p.Comments { // every fetched comment, the bot's own included
+		res.maxFetchedID = max(res.maxFetchedID, c.ID)
 	}
 	snap := &ReviewCommentsSnapshot{Version: ReviewSnapshotVersion, Comments: []ReviewCommentSnapshot{}}
 	var eligible []ReviewCommentSnapshot
@@ -585,6 +589,13 @@ type ReviewPlan struct {
 	// PendingAdd and PendingRemove are the ledger's pending_unknown_ids delta.
 	PendingAdd    []int64
 	PendingRemove []int64
+	// PendingSuperseded and PendingSupersededBy are parallel slices (never nil): an author's
+	// older pending id and that author's newer representative. The ledger merge drops the older
+	// id only when the representative is retained in the same atomic statement, so a stale
+	// writer whose add the high-water filter rejects, or whose set the cap truncates, leaves the
+	// older id in place instead of losing the author.
+	PendingSuperseded   []int64
+	PendingSupersededBy []int64
 	// PendingEvicted is the part of PendingRemove that is safe to drop even when no run is
 	// created: pending ids whose author is eligible but whose comment the snapshot caps evicted.
 	// They fall back to human review; left pending they would keep HasTrigger true (it ignores
@@ -645,10 +656,16 @@ func (res *ReviewSnapshotResult) Plan(highWater int64, pending []int64) ReviewPl
 	}
 	plan.PendingRemove = []int64{}
 	plan.PendingEvicted = []int64{}
+	plan.PendingSuperseded = []int64{}
+	plan.PendingSupersededBy = []int64{}
 	var superseded []int64 // older pending ids of authors whose newer representative is in PendingAdd
 	for _, id := range pending {
 		cl, present := res.class[id]
 		switch {
+		case !present && id > res.maxFetchedID:
+			// Absent from the fetch but newer than anything it returned: the fetch may predate
+			// the comment (a faster writer stored it after reading a fresher list), so it is not
+			// provably gone. Leave it pending.
 		case !present, cl == classNotEligible:
 			plan.PendingRemove = append(plan.PendingRemove, id) // gone, or its author is now known to be out
 		case cl == classEligible && res.inSnapshot[id]:
@@ -664,13 +681,18 @@ func (res *ReviewSnapshotResult) Plan(highWater int64, pending []int64) ReviewPl
 	}
 	// One id per author across ticks: an older pending id of an author whose newer representative
 	// is being added (or already pending) is superseded, but only when the merged set is
-	// guaranteed to fit. The ledger merge (mr_rework_merge_pending) subtracts the removed ids
-	// BEFORE it keeps the OLDEST ReviewPendingCap ids, so the fit condition counts the
-	// superseded ids as removed; when the set would still overflow, the new representative can be
-	// the one dropped, so the older id is kept and the author never ends up with no pending id.
+	// guaranteed to fit. The supersession is NOT a removal: the ledger merge
+	// (mr_rework_merge_pending) applies each (older, representative) pair only when the
+	// representative is retained in the same statement, so a stale writer's rejected add cannot
+	// cost the author its only id. The fit check counts the superseded ids as dropped; when the
+	// set would overflow the pairs are not emitted and the older ids stay (the merge's slot rule
+	// would also keep the representative over a newer author, but we do not rely on it here).
 	incoming := len(pending) + newAdds - len(plan.PendingRemove)
 	if incoming-len(superseded) <= ReviewPendingCap {
-		plan.PendingRemove = append(plan.PendingRemove, superseded...)
+		for _, id := range superseded {
+			plan.PendingSuperseded = append(plan.PendingSuperseded, id)
+			plan.PendingSupersededBy = append(plan.PendingSupersededBy, rep[res.unknownAuthor[id]])
+		}
 	} else {
 		slog.Warn("workersvc: review pending set would exceed its cap; the ledger keeps the oldest ids",
 			"incoming", incoming, "cap", ReviewPendingCap)

@@ -619,3 +619,107 @@ func TestRemoveMRReworkPendingIDsLiveDB(t *testing.T) {
 		t.Fatalf("empty removal changed the set: %v", kept.PendingUnknownIds)
 	}
 }
+
+// TestMRReworkStaleSupersessionKeepsRepresentativeLiveDB pins the conditional supersession of
+// mr_rework_merge_pending: an author's older pending id is replaced by its newer representative
+// only when the representative is retained in the same statement. A stale writer whose add the
+// high-water filter rejects, or whose replacement is removed or capped away, must not cost the
+// author its only pending id.
+func TestMRReworkStaleSupersessionKeepsRepresentativeLiveDB(t *testing.T) {
+	ctx, pool, q, repo := reviewAuthorEnv(t)
+	pending := func(ref string) []int64 {
+		t.Helper()
+		led, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repo, Ref: ref})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return led.PendingUnknownIds
+	}
+	upsert := func(ref string, hw int64, add, remove, sup, supBy []int64) {
+		t.Helper()
+		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
+			RepoID: repo, Ref: ref, HighWater: hw, PendingAdd: add, PendingRemove: remove,
+			PendingSuperseded: sup, PendingSupersededBy: supBy,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("a stale writer's rejected replacement keeps the older id", func(t *testing.T) {
+		ref := "agent/issue-stale-1"
+		upsert(ref, 120, []int64{100}, nil, nil, nil)
+		upsert(ref, 300, []int64{100}, nil, nil, nil) // a faster writer moved the mark to 300
+		// The stale writer read the ledger at mark 120: its add of 170 is now at/below the mark.
+		upsert(ref, 180, []int64{170}, nil, []int64{100}, []int64{170})
+		if got := pending(ref); !slices.Contains(got, 100) {
+			t.Fatalf("pending = %v, want 100 kept: the replacement 170 was rejected by the mark", got)
+		}
+	})
+
+	t.Run("an accepted replacement supersedes the older id", func(t *testing.T) {
+		ref := "agent/issue-stale-2"
+		upsert(ref, 120, []int64{100}, nil, nil, nil)
+		upsert(ref, 200, []int64{170}, nil, []int64{100}, []int64{170})
+		if got := pending(ref); !slices.Equal(got, []int64{170}) {
+			t.Fatalf("pending = %v, want [170]", got)
+		}
+	})
+
+	t.Run("a replacement removed in the same call keeps the older id", func(t *testing.T) {
+		ref := "agent/issue-stale-3"
+		upsert(ref, 120, []int64{100}, nil, nil, nil)
+		upsert(ref, 200, []int64{170}, []int64{170}, []int64{100}, []int64{170})
+		if got := pending(ref); !slices.Equal(got, []int64{100}) {
+			t.Fatalf("pending = %v, want [100]", got)
+		}
+	})
+
+	t.Run("at the cap the replacement keeps the older id's slot", func(t *testing.T) {
+		ref := "agent/issue-stale-4"
+		var ids []int64
+		for i := int64(1); i <= 10000; i++ {
+			ids = append(ids, i)
+		}
+		upsert(ref, 10000, ids, nil, nil, nil)
+		upsert(ref, 20000, []int64{15000}, nil, []int64{10000}, []int64{15000})
+		got := pending(ref)
+		if len(got) != 10000 || !slices.Contains(got, 15000) || slices.Contains(got, 10000) {
+			t.Fatalf("pending = %d ids (contains 15000: %t, 10000: %t), want 10000 ids with the replacement and not the older id",
+				len(got), slices.Contains(got, 15000), slices.Contains(got, 10000))
+		}
+	})
+
+	t.Run("the atomic on-demand create applies the same conditional supersession", func(t *testing.T) {
+		var user uuid.UUID
+		if err := pool.QueryRow(ctx, `SELECT user_id FROM forge_connections WHERE id = (SELECT connection_id FROM repos WHERE id = $1)`, repo).Scan(&user); err != nil {
+			t.Fatal(err)
+		}
+		ref := "agent/issue-stale-5"
+		target := uuid.New()
+		if _, err := pool.Exec(ctx, `INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status) VALUES ($1, $2, $3, 'issue', 902, 't', 'd', 'completed')`, target, user, repo); err != nil {
+			t.Fatal(err)
+		}
+		create := func(hw int64, add, sup, supBy []int64) {
+			t.Helper()
+			run, err := q.CreateManualMRReworkRunAndAdvance(ctx, store.CreateManualMRReworkRunAndAdvanceParams{
+				Harness: "claude", UserID: user, RepoID: repo, IssueTitle: "t", IssueDescription: "d",
+				PipelineRef: pgtype.Text{String: ref, Valid: true}, MrIid: pgtype.Int8{Int64: 67, Valid: true},
+				TargetRunID: pgtype.UUID{Bytes: target, Valid: true}, ReviewComments: []byte(`{}`),
+				HighWater: hw, PendingAdd: add, PendingRemove: []int64{},
+				PendingSuperseded: sup, PendingSupersededBy: supBy,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE runs SET status = 'completed' WHERE id = $1`, run.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		upsert(ref, 120, []int64{100}, nil, nil, nil)
+		upsert(ref, 300, []int64{100}, nil, nil, nil)
+		create(180, []int64{170}, []int64{100}, []int64{170})
+		if got := pending(ref); !slices.Contains(got, 100) {
+			t.Fatalf("pending = %v, want 100 kept through the atomic create", got)
+		}
+	})
+}

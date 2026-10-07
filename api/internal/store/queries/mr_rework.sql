@@ -98,16 +98,19 @@ WHERE repo_id = @repo_id::uuid AND ref = @ref;
 -- again.
 -- pending_unknown_ids (issue #2347): the permission-unknown comment ids the mark moved past
 -- (@pending_add, kept only when above the mark the row had BEFORE this update) merged with
--- the existing set, minus @pending_remove (ids consumed, now not-eligible, or gone); the
--- merge keeps the oldest 10000 (mr_rework_merge_pending).
+-- the existing set, minus @pending_remove (ids consumed, now not-eligible, or gone). An author's
+-- older id is replaced by its newer representative only through the parallel
+-- @pending_superseded / @pending_superseded_by pairs, which the merge applies only when the
+-- replacement is retained in the same statement (a stale writer's rejected add leaves the older
+-- id in place); the merge keeps the oldest 10000 slots (mr_rework_merge_pending).
 INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water, pending_unknown_ids)
 VALUES (@repo_id::uuid, @ref, 1, @high_water,
-        mr_rework_merge_pending('{}'::bigint[], @pending_add::bigint[], @pending_remove::bigint[], 0))
+        mr_rework_merge_pending('{}'::bigint[], @pending_add::bigint[], @pending_remove::bigint[], @pending_superseded::bigint[], @pending_superseded_by::bigint[], 0))
 ON CONFLICT (repo_id, ref) DO UPDATE
 SET attempt_count = mr_rework_ledger.attempt_count + 1,
     high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
     halt_notified = false,
-    pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, @pending_add::bigint[], @pending_remove::bigint[], mr_rework_ledger.high_water),
+    pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, @pending_add::bigint[], @pending_remove::bigint[], @pending_superseded::bigint[], @pending_superseded_by::bigint[], mr_rework_ledger.high_water),
     updated_at    = now();
 
 -- name: RemoveMRReworkPendingIDs :exec
@@ -241,7 +244,7 @@ RETURNING *;
 WITH led AS (
     INSERT INTO mr_rework_ledger (repo_id, ref, high_water, pending_unknown_ids)
     SELECT @repo_id::uuid, @pipeline_ref, @high_water,
-           mr_rework_merge_pending('{}'::bigint[], @pending_add::bigint[], @pending_remove::bigint[], 0)
+           mr_rework_merge_pending('{}'::bigint[], @pending_add::bigint[], @pending_remove::bigint[], @pending_superseded::bigint[], @pending_superseded_by::bigint[], 0)
     WHERE NOT EXISTS (
         SELECT 1 FROM runs
         WHERE repo_id = @repo_id::uuid
@@ -252,7 +255,7 @@ WITH led AS (
     ON CONFLICT (repo_id, ref) DO UPDATE
     SET high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
         halt_notified = false,
-        pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, @pending_add::bigint[], @pending_remove::bigint[], mr_rework_ledger.high_water),
+        pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, @pending_add::bigint[], @pending_remove::bigint[], @pending_superseded::bigint[], @pending_superseded_by::bigint[], mr_rework_ledger.high_water),
         updated_at    = now()
 )
 INSERT INTO runs (

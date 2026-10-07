@@ -463,7 +463,7 @@ func TestPlan(t *testing.T) {
 	}
 
 	// A pending id whose author has since become eligible is new again, and is consumed by this
-	// snapshot; a pending id whose comment is gone is dropped; one whose author is still unknown stays.
+	// snapshot; a pending id whose comment is gone (at or below the largest fetched id) is dropped; one whose author is still unknown stays.
 	h2 := newHarness()
 	h2.lookup.answers[flakyID] = forge.AuthorEligible
 	res2 := h2.snapshot(t, h2.params(
@@ -475,8 +475,9 @@ func TestPlan(t *testing.T) {
 		t.Fatalf("plan = %+v, want the pending id to count as new", plan)
 	}
 	slices.Sort(plan.PendingRemove)
-	if !slices.Equal(plan.PendingRemove, []int64{5, 6, 99}) {
-		t.Fatalf("pending remove = %v, want the consumed 5 and the vanished 6 and 99", plan.PendingRemove)
+	// 99 is above the largest fetched id (12): the fetch may predate it, so it is left pending.
+	if !slices.Equal(plan.PendingRemove, []int64{5, 6}) {
+		t.Fatalf("pending remove = %v, want the consumed 5 and the vanished 6 (99 is above the fetch and stays)", plan.PendingRemove)
 	}
 
 	// Pending 5 whose author is an outsider now: removed, and not new.

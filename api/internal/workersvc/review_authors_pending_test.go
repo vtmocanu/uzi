@@ -2,6 +2,7 @@ package workersvc_test
 
 import (
 	"bytes"
+	"cmp"
 	"log/slog"
 	"slices"
 	"testing"
@@ -12,28 +13,65 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// applyDelta is a test-local model of the ledger's pending set update: union of the adds,
-// minus the removes, then the keep-oldest cap. The real merge is pinned by the store LiveDB tests.
+// applyDelta is a test-local model of mr_rework_merge_pending: the union of the pending set and
+// the adds, minus the removes; then each (superseded, superseded-by) pair applies only when both
+// ids survived that step, dropping the older id unless it is itself a replacement; finally the
+// oldest ReviewPendingCap SLOTS are kept, a replacement taking the slot of the smallest id it
+// replaces. The real merge is pinned by the store LiveDB tests.
 func applyDelta(pending []int64, plan workersvc.ReviewPlan) []int64 {
-	set := map[int64]bool{}
+	base := map[int64]bool{}
 	for _, id := range pending {
-		set[id] = true
+		base[id] = true
 	}
 	for _, id := range plan.PendingAdd {
-		set[id] = true
+		base[id] = true
 	}
 	for _, id := range plan.PendingRemove {
-		delete(set, id)
+		delete(base, id)
+	}
+	dropped := map[int64]bool{}
+	replacement := map[int64]bool{}
+	slot := map[int64]int64{}
+	for i, o := range plan.PendingSuperseded {
+		n := plan.PendingSupersededBy[i]
+		if o == n || !base[o] || !base[n] {
+			continue
+		}
+		dropped[o] = true
+		replacement[n] = true
+		if cur, ok := slot[n]; !ok || o < cur {
+			slot[n] = o
+		}
+	}
+	for n := range replacement {
+		delete(dropped, n)
+	}
+	type kept struct{ x, slot int64 }
+	var ks []kept
+	for x := range base {
+		if dropped[x] {
+			continue
+		}
+		sl := x
+		if s, ok := slot[x]; ok {
+			sl = min(s, x)
+		}
+		ks = append(ks, kept{x, sl})
+	}
+	slices.SortFunc(ks, func(a, b kept) int {
+		if a.slot != b.slot {
+			return cmp.Compare(a.slot, b.slot)
+		}
+		return cmp.Compare(a.x, b.x)
+	})
+	if len(ks) > workersvc.ReviewPendingCap {
+		ks = ks[:workersvc.ReviewPendingCap]
 	}
 	out := []int64{}
-	for id := range set {
-		out = append(out, id)
+	for _, k := range ks {
+		out = append(out, k.x)
 	}
 	slices.Sort(out)
-	// mr_rework_merge_pending keeps the OLDEST ReviewPendingCap ids.
-	if len(out) > workersvc.ReviewPendingCap {
-		out = out[:workersvc.ReviewPendingCap]
-	}
 	return out
 }
 
@@ -105,8 +143,11 @@ func TestPlanKeepsOneNewestPendingIDPerAuthor(t *testing.T) {
 	if !slices.Equal(plan.PendingAdd, []int64{170}) {
 		t.Fatalf("pending add = %v, want only the newest id of the author", plan.PendingAdd)
 	}
-	if !slices.Equal(plan.PendingRemove, []int64{100}) {
-		t.Fatalf("pending remove = %v, want the superseded 100", plan.PendingRemove)
+	if len(plan.PendingRemove) != 0 {
+		t.Fatalf("pending remove = %v, want supersession kept out of the unconditional removals", plan.PendingRemove)
+	}
+	if !slices.Equal(plan.PendingSuperseded, []int64{100}) || !slices.Equal(plan.PendingSupersededBy, []int64{170}) {
+		t.Fatalf("superseded = %v by %v, want 100 replaced by 170", plan.PendingSuperseded, plan.PendingSupersededBy)
 	}
 	if got := applyDelta([]int64{100}, plan); !slices.Equal(got, []int64{170}) {
 		t.Fatalf("pending after the delta = %v, want [170]", got)
@@ -163,8 +204,8 @@ func TestPlanAtCapKeepsOlderIDWhenSupersedeCouldLoseTheAuthor(t *testing.T) {
 	p.Trusted = []settings.TrustedBot{{BaseURL: "https://github.com", ForgeUserID: coderabbit}}
 	res := h.snapshot(t, p)
 	plan := res.Plan(99, pending)
-	if slices.Contains(plan.PendingRemove, 100) {
-		t.Fatalf("pending remove contains X's 100 although the merged set cannot be guaranteed to fit")
+	if slices.Contains(plan.PendingRemove, 100) || slices.Contains(plan.PendingSuperseded, 100) {
+		t.Fatalf("X's 100 is removed or superseded although the merged set cannot be guaranteed to fit")
 	}
 	if got := applyDelta(pending, plan); !slices.Contains(got, 100) || len(got) != workersvc.ReviewPendingCap {
 		t.Fatalf("after the capped merge X has no pending id (contains 100: %t, size %d)", slices.Contains(got, 100), len(got))
@@ -214,8 +255,8 @@ func TestPlanSupersedesWhenPostMergeSetFitsTheCap(t *testing.T) {
 	p.Trusted = []settings.TrustedBot{{BaseURL: "https://github.com", ForgeUserID: coderabbit}}
 	res := h.snapshot(t, p)
 	plan := res.Plan(99, pending)
-	if !slices.Contains(plan.PendingRemove, 100) {
-		t.Fatalf("pending remove = %d ids without 100, want A's older id superseded", len(plan.PendingRemove))
+	if !slices.Contains(plan.PendingSuperseded, 100) {
+		t.Fatalf("superseded = %v, want A's older 100 superseded", plan.PendingSuperseded)
 	}
 	got := applyDelta(pending, plan)
 	if len(got) != workersvc.ReviewPendingCap || !slices.Contains(got, 15000) || !slices.Contains(got, 20000) {
@@ -251,5 +292,23 @@ func TestPlanCapWarningFiresWhenNewIDsExceedTheCap(t *testing.T) {
 	}
 	if !bytes.Contains(buf.Bytes(), []byte("would exceed its cap")) {
 		t.Fatalf("no cap warning although a new id overflows the set; log: %q", buf.String())
+	}
+}
+
+// A pending id above the largest fetched id is not provably gone: the fetch may predate it, so
+// the plan leaves it alone (neither removed nor superseded), while an absent id at or below the
+// largest fetched id is gone and removed.
+func TestPlanKeepsPendingIDAboveTheLargestFetchedID(t *testing.T) {
+	h := newHarness()
+	res := h.snapshot(t, h.params(
+		inline(50, memberID, "carol", "old", raT0),
+		inline(60, memberID, "carol", "newer", raT0.Add(time.Second)),
+	))
+	plan := res.Plan(40, []int64{55, 170})
+	if slices.Contains(plan.PendingRemove, 170) || slices.Contains(plan.PendingSuperseded, 170) {
+		t.Fatalf("plan removes or supersedes 170 above the largest fetched id: %+v", plan)
+	}
+	if !slices.Contains(plan.PendingRemove, 55) {
+		t.Fatalf("pending remove = %v, want the gone 55 (absent, below the largest fetched id 60) removed", plan.PendingRemove)
 	}
 }

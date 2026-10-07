@@ -55,36 +55,53 @@ ALTER TABLE mr_rework_ledger
     ADD CONSTRAINT mr_rework_ledger_pending_unknown_ids_check CHECK (cardinality(pending_unknown_ids) <= 10000);
 
 -- The one definition of the pending-set update, shared by the automatic upsert and the
--- on-demand atomic create: (existing UNION added ids above the high-water mark the row had
--- BEFORE this update) EXCEPT removed ids, keeping the OLDEST 10000. EXCEPT is a set operation
--- (hashed or sorted), so a 10000-id removal stays O(n log n) where an ALL(array) comparison
--- would be quadratic.
+-- on-demand atomic create. The base set is (existing UNION added ids above the high-water mark
+-- the row had BEFORE this update) EXCEPT removed ids. Supersession is CONDITIONAL: the parallel
+-- arrays superseded / superseded_by name pairs (an author's older pending id, that author's newer
+-- representative). A pair applies only when BOTH ids are in the base set, i.e. the replacement
+-- survived this statement's own add filter (a stale writer's add can be rejected by
+-- prior_high_water) and was not removed. An older id is dropped only when it is not itself the
+-- replacement of another applied pair. The kept ids are then ranked by SLOT: a replacement
+-- takes the slot of the smallest older id it replaces, so replacing an id never moves its author
+-- to the back of the oldest-first order, and the oldest 10000 slots survive. When the cap cuts,
+-- the replacement is therefore never dropped in favour of keeping the older id, and an older
+-- author is never evicted by a newer one. EXCEPT is a set operation (hashed or sorted), so a
+-- 10000-id removal stays O(n log n) where an ALL(array) comparison would be quadratic.
 -- +goose StatementBegin
 CREATE FUNCTION mr_rework_merge_pending(
     existing bigint[],
     added bigint[],
     removed bigint[],
+    superseded bigint[],
+    superseded_by bigint[],
     prior_high_water bigint
 ) RETURNS bigint[]
 LANGUAGE sql IMMUTABLE
 AS $$
-    SELECT COALESCE(array_agg(t.x ORDER BY t.x), '{}'::bigint[])
-    FROM (
-        (
-            SELECT unnest(COALESCE(existing, '{}'::bigint[])) AS x
-            UNION
-            SELECT a AS x FROM unnest(COALESCE(added, '{}'::bigint[])) AS a WHERE a > prior_high_water
-        )
-        EXCEPT
-        SELECT r AS x FROM unnest(COALESCE(removed, '{}'::bigint[])) AS r
-        ORDER BY x ASC
-        LIMIT 10000
-    ) t
+  WITH base AS (
+    (SELECT unnest(COALESCE(existing,'{}'::bigint[])) AS x
+     UNION
+     SELECT a FROM unnest(COALESCE(added,'{}'::bigint[])) AS a WHERE a > prior_high_water)
+    EXCEPT SELECT r FROM unnest(COALESCE(removed,'{}'::bigint[])) AS r
+  ),
+  pairs AS (
+    SELECT DISTINCT p.o, p.n
+    FROM unnest(COALESCE(superseded,'{}'::bigint[]), COALESCE(superseded_by,'{}'::bigint[])) AS p(o,n)
+    WHERE p.o IS NOT NULL AND p.n IS NOT NULL AND p.o <> p.n
+  ),
+  eff AS (SELECT pairs.o, pairs.n FROM pairs
+          JOIN base bo ON bo.x = pairs.o JOIN base bn ON bn.x = pairs.n),
+  dropped AS (SELECT o AS x FROM eff EXCEPT SELECT n FROM eff),
+  kept AS (SELECT x FROM base EXCEPT SELECT x FROM dropped),
+  slotted AS (SELECT k.x, COALESCE(s.slot, k.x) AS slot FROM kept k
+              LEFT JOIN (SELECT n, min(o) AS slot FROM eff GROUP BY n) s ON s.n = k.x)
+  SELECT COALESCE(array_agg(t.x ORDER BY t.x), '{}'::bigint[])
+  FROM (SELECT x FROM slotted ORDER BY LEAST(slot, x), x LIMIT 10000) t
 $$;
 -- +goose StatementEnd
 
 -- +goose Down
-DROP FUNCTION mr_rework_merge_pending(bigint[], bigint[], bigint[], bigint);
+DROP FUNCTION mr_rework_merge_pending(bigint[], bigint[], bigint[], bigint[], bigint[], bigint);
 ALTER TABLE mr_rework_ledger
     DROP CONSTRAINT mr_rework_ledger_pending_unknown_ids_check,
     DROP COLUMN pending_unknown_ids;

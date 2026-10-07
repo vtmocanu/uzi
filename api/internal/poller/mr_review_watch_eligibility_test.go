@@ -326,6 +326,25 @@ func TestFlood200PlusErroringCandidatesAheadOfOneEligibleAuthor(t *testing.T) {
 	if len(e.runs.calls) != 1 {
 		t.Fatalf("runs = %d after another tick, want no re-fire", len(e.runs.calls))
 	}
+
+	// The OLDEST pending author (comment 100) now resolves eligible: its id must still be pending
+	// after the flood, and it fires on a later tick (the 200-lookup budget spans a few ticks).
+	oldest := failing[0]
+	e.f.eligibility = func(_ context.Context, id int64) (forge.AuthorEligibility, error) {
+		if id == oldest || id == memberAuthor {
+			return forge.AuthorEligible, nil
+		}
+		return forge.AuthorUnknown, errors.New("forge unavailable")
+	}
+	for tick := 1; tick <= 6 && len(e.runs.calls) < 2; tick++ {
+		e.tick(comments...)
+	}
+	if len(e.runs.calls) != 2 {
+		t.Fatalf("runs = %d, want the older pending author's comment to fire once it resolves eligible", len(e.runs.calls))
+	}
+	if got := e.snapshotBodies(); !slices.Contains(got, "SECRET-UNVERIFIED-"+fmt.Sprint(oldest)) {
+		t.Fatalf("the older author's comment never reached a snapshot: %v", got)
+	}
 }
 
 func TestAHangingLookupFiresOnTheFirstTick(t *testing.T) {
@@ -585,5 +604,24 @@ func TestEvictionRunsNextToLedgerReconcile(t *testing.T) {
 	}
 	if q := e.st.ras().Order(repo, "agent/issue-old"); len(q) != 0 {
 		t.Fatalf("a week-old queue row survived the tick: %v", q)
+	}
+}
+
+// A fetch that predates a pending comment must not remove it: a faster writer stored 170 after
+// reading a fresher comment list, and this tick's list tops out below it. The tick still fires
+// for the new eligible comment, and 170 stays pending.
+func TestStaleFetchLeavesNewerPendingIDAlone(t *testing.T) {
+	e := newEW(t)
+	e.st.ledgers = map[string]store.MrReworkLedger{
+		mrwRef: {RepoID: mrwRepoRow().ID, Ref: mrwRef, HighWater: 150, PendingUnknownIds: []int64{170}},
+	}
+	old := e.comment(120, outsiderAuthor, "old outsider note")
+	fresh := e.comment(160, memberAuthor, "eligible feedback")
+	e.tick(old, fresh)
+	if len(e.runs.calls) != 1 {
+		t.Fatalf("runs = %d, want the eligible comment to fire", len(e.runs.calls))
+	}
+	if got := e.st.ledgers[mrwRef].PendingUnknownIds; !slices.Equal(got, []int64{170}) {
+		t.Fatalf("pending = %v, want 170 kept: the fetch never reached it", got)
 	}
 }

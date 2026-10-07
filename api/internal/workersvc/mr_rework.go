@@ -189,18 +189,20 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 		// commit atomically as ONE statement — trigger_source='manual' is hard-coded in the
 		// query, so it is not a param here (PRD #1202 review-finding hardening).
 		return q.CreateManualMRReworkRunAndAdvance(ctx, store.CreateManualMRReworkRunAndAdvanceParams{
-			UserID:           userID,
-			RepoID:           repoID,
-			IssueTitle:       title,
-			IssueDescription: description,
-			PipelineRef:      pgtype.Text{String: ref, Valid: true},
-			MrIid:            pgtype.Int8{Int64: mrIID, Valid: true},
-			TargetRunID:      pgtype.UUID{Bytes: sourceRunID, Valid: true},
-			ReviewComments:   reviewJSON,
-			WaitOnLimit:      waitOnLimit,
-			HighWater:        manual.MaxActionableID,
-			PendingAdd:       nonNilIDs(manual.PendingAdd),
-			PendingRemove:    nonNilIDs(manual.PendingRemove),
+			UserID:              userID,
+			RepoID:              repoID,
+			IssueTitle:          title,
+			IssueDescription:    description,
+			PipelineRef:         pgtype.Text{String: ref, Valid: true},
+			MrIid:               pgtype.Int8{Int64: mrIID, Valid: true},
+			TargetRunID:         pgtype.UUID{Bytes: sourceRunID, Valid: true},
+			ReviewComments:      reviewJSON,
+			WaitOnLimit:         waitOnLimit,
+			HighWater:           manual.MaxActionableID,
+			PendingAdd:          nonNilIDs(manual.PendingAdd),
+			PendingRemove:       nonNilIDs(manual.PendingRemove),
+			PendingSuperseded:   nonNilIDs(manual.PendingSuperseded),
+			PendingSupersededBy: nonNilIDs(manual.PendingSupersededBy),
 			// PRD #1429 M2 (D4): the inherited source-run harness, frozen in-tx.
 			Harness: string(resolved.Harness),
 		})

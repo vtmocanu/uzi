@@ -183,6 +183,9 @@ func TestStartMRReworkEligibleProceedsAndRecordsPending(t *testing.T) {
 	if p.PendingRemove == nil {
 		t.Fatal("PendingRemove must be a non-nil (empty) array parameter, never NULL")
 	}
+	if p.PendingSuperseded == nil || p.PendingSupersededBy == nil {
+		t.Fatal("PendingSuperseded and PendingSupersededBy must be non-nil (empty) array parameters, never NULL")
+	}
 }
 
 func TestStartMRReworkPendingIDCountsAsNew(t *testing.T) {

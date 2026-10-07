@@ -123,7 +123,7 @@ func (s *mrwStore) UpsertMRReworkLedger(_ context.Context, arg store.UpsertMRRew
 		cur.HighWater = arg.HighWater // GREATEST(existing, new): advance-only
 	}
 	cur.HaltNotified = false // a proceed resets the latch
-	cur.PendingUnknownIds = mergePending(cur.PendingUnknownIds, arg.PendingAdd, arg.PendingRemove, priorHighWater)
+	cur.PendingUnknownIds = mergePending(cur.PendingUnknownIds, arg.PendingAdd, arg.PendingRemove, arg.PendingSuperseded, arg.PendingSupersededBy, priorHighWater)
 	s.ledgers[arg.Ref] = cur
 	if s.ops != nil {
 		*s.ops = append(*s.ops, "upsert")
@@ -131,28 +131,68 @@ func (s *mrwStore) UpsertMRReworkLedger(_ context.Context, arg store.UpsertMRRew
 	return nil
 }
 
-// mergePending mirrors mr_rework_merge_pending: the newest 200 of (existing UNION added ids
-// above the prior high-water mark) minus removed ids, ascending.
-func mergePending(existing, added, removed []int64, priorHighWater int64) []int64 {
-	set := map[int64]bool{}
+// mergePending mirrors mr_rework_merge_pending: (existing UNION added ids above the prior
+// high-water mark) minus removed ids; each (superseded, superseded-by) pair applies only when
+// both ids are in that set, dropping the older id unless it is itself a replacement; then the
+// OLDEST ReviewPendingCap slots are kept, a replacement taking the slot of the smallest id it
+// replaces. Ascending.
+func mergePending(existing, added, removed, superseded, supersededBy []int64, priorHighWater int64) []int64 {
+	base := map[int64]bool{}
 	for _, id := range existing {
-		set[id] = true
+		base[id] = true
 	}
 	for _, id := range added {
 		if id > priorHighWater {
-			set[id] = true
+			base[id] = true
 		}
 	}
 	for _, id := range removed {
-		delete(set, id)
+		delete(base, id)
 	}
-	out := make([]int64, 0, len(set))
-	for id := range set {
-		out = append(out, id)
+	dropped := map[int64]bool{}
+	replacement := map[int64]bool{}
+	slot := map[int64]int64{}
+	for i, o := range superseded {
+		if i >= len(supersededBy) {
+			break
+		}
+		n := supersededBy[i]
+		if o == n || !base[o] || !base[n] {
+			continue
+		}
+		dropped[o] = true
+		replacement[n] = true
+		if cur, ok := slot[n]; !ok || o < cur {
+			slot[n] = o
+		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] > out[j] })
-	if len(out) > 200 {
-		out = out[:200]
+	for n := range replacement {
+		delete(dropped, n)
+	}
+	type kept struct{ x, slot int64 }
+	var ks []kept
+	for x := range base {
+		if dropped[x] {
+			continue
+		}
+		sl := x
+		if s, ok := slot[x]; ok {
+			sl = min(s, x)
+		}
+		ks = append(ks, kept{x, sl})
+	}
+	sort.Slice(ks, func(i, j int) bool {
+		if ks[i].slot != ks[j].slot {
+			return ks[i].slot < ks[j].slot
+		}
+		return ks[i].x < ks[j].x
+	})
+	if len(ks) > workersvc.ReviewPendingCap {
+		ks = ks[:workersvc.ReviewPendingCap]
+	}
+	out := make([]int64, 0, len(ks))
+	for _, k := range ks {
+		out = append(out, k.x)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out

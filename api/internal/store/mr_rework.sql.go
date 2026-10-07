@@ -270,7 +270,7 @@ const createManualMRReworkRunAndAdvance = `-- name: CreateManualMRReworkRunAndAd
 WITH led AS (
     INSERT INTO mr_rework_ledger (repo_id, ref, high_water, pending_unknown_ids)
     SELECT $2::uuid, $5, $11,
-           mr_rework_merge_pending('{}'::bigint[], $12::bigint[], $13::bigint[], 0)
+           mr_rework_merge_pending('{}'::bigint[], $12::bigint[], $13::bigint[], $14::bigint[], $15::bigint[], 0)
     WHERE NOT EXISTS (
         SELECT 1 FROM runs
         WHERE repo_id = $2::uuid
@@ -281,7 +281,7 @@ WITH led AS (
     ON CONFLICT (repo_id, ref) DO UPDATE
     SET high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
         halt_notified = false,
-        pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, $12::bigint[], $13::bigint[], mr_rework_ledger.high_water),
+        pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, $12::bigint[], $13::bigint[], $14::bigint[], $15::bigint[], mr_rework_ledger.high_water),
         updated_at    = now()
 )
 INSERT INTO runs (
@@ -306,19 +306,21 @@ RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, statu
 `
 
 type CreateManualMRReworkRunAndAdvanceParams struct {
-	UserID           uuid.UUID   `json:"user_id"`
-	RepoID           uuid.UUID   `json:"repo_id"`
-	IssueTitle       string      `json:"issue_title"`
-	IssueDescription string      `json:"issue_description"`
-	PipelineRef      pgtype.Text `json:"pipeline_ref"`
-	MrIid            pgtype.Int8 `json:"mr_iid"`
-	TargetRunID      pgtype.UUID `json:"target_run_id"`
-	ReviewComments   []byte      `json:"review_comments"`
-	WaitOnLimit      bool        `json:"wait_on_limit"`
-	Harness          string      `json:"harness"`
-	HighWater        int64       `json:"high_water"`
-	PendingAdd       []int64     `json:"pending_add"`
-	PendingRemove    []int64     `json:"pending_remove"`
+	UserID              uuid.UUID   `json:"user_id"`
+	RepoID              uuid.UUID   `json:"repo_id"`
+	IssueTitle          string      `json:"issue_title"`
+	IssueDescription    string      `json:"issue_description"`
+	PipelineRef         pgtype.Text `json:"pipeline_ref"`
+	MrIid               pgtype.Int8 `json:"mr_iid"`
+	TargetRunID         pgtype.UUID `json:"target_run_id"`
+	ReviewComments      []byte      `json:"review_comments"`
+	WaitOnLimit         bool        `json:"wait_on_limit"`
+	Harness             string      `json:"harness"`
+	HighWater           int64       `json:"high_water"`
+	PendingAdd          []int64     `json:"pending_add"`
+	PendingRemove       []int64     `json:"pending_remove"`
+	PendingSuperseded   []int64     `json:"pending_superseded"`
+	PendingSupersededBy []int64     `json:"pending_superseded_by"`
 }
 
 // ATOMIC on-demand (manual) mr_rework create + ledger advance (PRD #1202, review-finding
@@ -354,6 +356,8 @@ func (q *Queries) CreateManualMRReworkRunAndAdvance(ctx context.Context, arg Cre
 		arg.HighWater,
 		arg.PendingAdd,
 		arg.PendingRemove,
+		arg.PendingSuperseded,
+		arg.PendingSupersededBy,
 	)
 	var i Run
 	err := row.Scan(
@@ -762,21 +766,23 @@ func (q *Queries) SetMRReworkHaltNotified(ctx context.Context, arg SetMRReworkHa
 const upsertMRReworkLedger = `-- name: UpsertMRReworkLedger :exec
 INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water, pending_unknown_ids)
 VALUES ($1::uuid, $2, 1, $3,
-        mr_rework_merge_pending('{}'::bigint[], $4::bigint[], $5::bigint[], 0))
+        mr_rework_merge_pending('{}'::bigint[], $4::bigint[], $5::bigint[], $6::bigint[], $7::bigint[], 0))
 ON CONFLICT (repo_id, ref) DO UPDATE
 SET attempt_count = mr_rework_ledger.attempt_count + 1,
     high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
     halt_notified = false,
-    pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, $4::bigint[], $5::bigint[], mr_rework_ledger.high_water),
+    pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, $4::bigint[], $5::bigint[], $6::bigint[], $7::bigint[], mr_rework_ledger.high_water),
     updated_at    = now()
 `
 
 type UpsertMRReworkLedgerParams struct {
-	RepoID        uuid.UUID `json:"repo_id"`
-	Ref           string    `json:"ref"`
-	HighWater     int64     `json:"high_water"`
-	PendingAdd    []int64   `json:"pending_add"`
-	PendingRemove []int64   `json:"pending_remove"`
+	RepoID              uuid.UUID `json:"repo_id"`
+	Ref                 string    `json:"ref"`
+	HighWater           int64     `json:"high_water"`
+	PendingAdd          []int64   `json:"pending_add"`
+	PendingRemove       []int64   `json:"pending_remove"`
+	PendingSuperseded   []int64   `json:"pending_superseded"`
+	PendingSupersededBy []int64   `json:"pending_superseded_by"`
 }
 
 // The PROCEED path: record that a rework cycle was spent and advance the consumed
@@ -789,8 +795,11 @@ type UpsertMRReworkLedgerParams struct {
 // again.
 // pending_unknown_ids (issue #2347): the permission-unknown comment ids the mark moved past
 // (@pending_add, kept only when above the mark the row had BEFORE this update) merged with
-// the existing set, minus @pending_remove (ids consumed, now not-eligible, or gone); the
-// merge keeps the oldest 10000 (mr_rework_merge_pending).
+// the existing set, minus @pending_remove (ids consumed, now not-eligible, or gone). An author's
+// older id is replaced by its newer representative only through the parallel
+// @pending_superseded / @pending_superseded_by pairs, which the merge applies only when the
+// replacement is retained in the same statement (a stale writer's rejected add leaves the older
+// id in place); the merge keeps the oldest 10000 slots (mr_rework_merge_pending).
 func (q *Queries) UpsertMRReworkLedger(ctx context.Context, arg UpsertMRReworkLedgerParams) error {
 	_, err := q.db.Exec(ctx, upsertMRReworkLedger,
 		arg.RepoID,
@@ -798,6 +807,8 @@ func (q *Queries) UpsertMRReworkLedger(ctx context.Context, arg UpsertMRReworkLe
 		arg.HighWater,
 		arg.PendingAdd,
 		arg.PendingRemove,
+		arg.PendingSuperseded,
+		arg.PendingSupersededBy,
 	)
 	return err
 }
