@@ -114,7 +114,7 @@ func IsUnknown(err error) bool {
 // issue #1341 for the measured figures), and the requests below were recalibrated in
 // issue #1341 above those measured multi-agent peaks.
 //
-// `m` was compose parity at the limit until issue #2127 (compose still grants 4 GiB). New hosted workers default to `l` (issue #2240:
+// Hosted `m` has a larger memory ceiling than compose's 4Gi default. New hosted workers default to `l` (issue #2240:
 // the api's UZI_EPHEMERAL_DEFAULT_SIZE and the web dialog's preselection). The default cap is 1
 // (WORKER_MAX_CONCURRENT_RUNS), so a size still buys headroom for ONE run. That cap
 // is now operator-configurable (chart workers.maxConcurrentRuns → the controller's
